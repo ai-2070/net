@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
+use net::adapter::net::behavior::org::OrgRevocationBundle;
 use net::adapter::net::behavior::org_admission::Admitted;
 use net::adapter::net::behavior::CapabilitySet;
 use net::adapter::net::cortex::{
@@ -35,6 +36,7 @@ use net::adapter::net::org_admission_gate::OrgProviderPolicy;
 use net::adapter::net::{ChannelConfigRegistry, MeshNode, MeshNodeConfig};
 use net_sdk::identity::Identity;
 use net_sdk::mesh::Mesh;
+use net_sdk::mesh_rpc::{RequestStreamTyped, ResponseSinkTyped};
 use net_sdk::org::types::*;
 use net_sdk::org::{CoarseAdmissionReason, OrgAccess, OrgCaller, OrgCredentials, OrgSdkError};
 
@@ -297,6 +299,17 @@ impl Attribution {
             && a.provider_org == self.provider_org
             && a.provider == self.provider
             && a.capability == self.capability
+    }
+
+    /// The same five verified facts as seen by a FACADE handler — the
+    /// `OrgCaller` projection. `entity` is the caller's ed25519 entity id
+    /// (verified at admission), never the u64 routing `caller_origin`.
+    fn matches_caller(&self, c: &OrgCaller) -> bool {
+        c.entity == self.caller
+            && c.acting_org == self.acting_org
+            && c.provider_org == self.provider_org
+            && c.provider == self.provider
+            && c.capability == self.capability
     }
 }
 
@@ -1262,6 +1275,274 @@ async fn dropping_org_stream_emits_one_cancel() {
         fold.lock().in_flight_keys().len(),
         1,
         "exactly one record retired — the sibling's is still live"
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Row 3.2 — the facade PROVIDER rows: the handler receives the verified
+//    `OrgCaller` projection (all three shapes), never caller-claimed identity
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handler_receives_verified_org_caller_not_origin() {
+    let a = org_a();
+    let (provider, _p_identity, p_dir) = fast_mesh("s3-prov-provider", &a, None).await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) = fast_mesh("s3-prov-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+
+    let (ss_service, cs_service, dx_service) =
+        ("s3.prov.stream", "s3.prov.upload", "s3.prov.duplex");
+    let served_by = provider.node_id();
+    let (ss_ok, cs_ok, dx_ok) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ss_attr = attribution_for(&c_identity, &provider, ss_service, a.org_id(), a.org_id());
+    let ss_check = ss_ok.clone();
+    let _ss = provider
+        .serve_org_streaming(
+            ss_service,
+            OrgAccess::SameOrg,
+            move |c: OrgCaller, req: Ping, sink: ResponseSinkTyped<Item>| {
+                let (ss_attr, ss_check) = (ss_attr.clone(), ss_check.clone());
+                async move {
+                    // The five verified facts — entity included. The facade
+                    // never shows `caller_origin`, so what the handler sees
+                    // can only be the admission-verified identity (the ed25519
+                    // entity id — never the u64 routing hash).
+                    ss_check.store(ss_attr.matches_caller(&c), Ordering::SeqCst);
+                    sink.send(&Item {
+                        n: req.n,
+                        served_by,
+                    })
+                }
+            },
+        )
+        .expect("serve_org_streaming");
+
+    let cs_attr = attribution_for(&c_identity, &provider, cs_service, a.org_id(), a.org_id());
+    let cs_check = cs_ok.clone();
+    let _cs = provider
+        .serve_org_client_stream(
+            cs_service,
+            OrgAccess::SameOrg,
+            move |c: OrgCaller, mut requests: RequestStreamTyped<Ping>| {
+                let (cs_attr, cs_check) = (cs_attr.clone(), cs_check.clone());
+                async move {
+                    cs_check.store(cs_attr.matches_caller(&c), Ordering::SeqCst);
+                    let mut seen = Vec::new();
+                    while let Some(item) = requests.next().await {
+                        let ping = item.map_err(|e| format!("decode: {e}"))?;
+                        seen.push(ping.n);
+                    }
+                    Ok(UploadSummary {
+                        chunks: seen.len(),
+                        seen,
+                        served_by,
+                    })
+                }
+            },
+        )
+        .expect("serve_org_client_stream");
+
+    let dx_attr = attribution_for(&c_identity, &provider, dx_service, a.org_id(), a.org_id());
+    let dx_check = dx_ok.clone();
+    let _dx = provider
+        .serve_org_duplex(
+            dx_service,
+            OrgAccess::SameOrg,
+            move |c: OrgCaller,
+                  mut requests: RequestStreamTyped<Ping>,
+                  sink: ResponseSinkTyped<Item>| {
+                let (dx_attr, dx_check) = (dx_attr.clone(), dx_check.clone());
+                async move {
+                    dx_check.store(dx_attr.matches_caller(&c), Ordering::SeqCst);
+                    while let Some(item) = requests.next().await {
+                        let ping = item.map_err(|e| format!("decode: {e}"))?;
+                        sink.send(&Item {
+                            n: ping.n,
+                            served_by,
+                        })?;
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .expect("serve_org_duplex");
+
+    let credentials = caller_credentials(&a, &c_identity, None);
+    let org = caller.org(credentials).expect("bind");
+    for service in [ss_service, cs_service, dx_service] {
+        assert!(
+            converge(&provider, &caller, &cap(&format!("nrpc:{service}")), &[], 1).await,
+            "the caller resolved the provider for {service}"
+        );
+    }
+
+    let mut stream = org
+        .call_streaming::<Ping, Item>(ss_service, &Ping { n: 4 })
+        .await
+        .expect("streaming call");
+    assert_eq!(
+        stream.next().await.expect("item").expect("ok"),
+        Item { n: 4, served_by },
+        "streaming round trip"
+    );
+
+    let mut call = org
+        .call_client_stream::<Ping, UploadSummary>(cs_service)
+        .await
+        .expect("client-stream call");
+    call.send(&Ping { n: 5 }).await.expect("send");
+    assert_eq!(
+        call.finish().await.expect("terminal"),
+        UploadSummary {
+            chunks: 1,
+            seen: vec![5],
+            served_by,
+        },
+        "client-stream round trip"
+    );
+
+    let mut dx = org
+        .call_duplex::<Ping, Item>(dx_service)
+        .await
+        .expect("duplex call");
+    dx.send(&Ping { n: 6 }).await.expect("send");
+    dx.finish_sending().await.expect("half-close");
+    assert_eq!(
+        dx.next().await.expect("item").expect("ok"),
+        Item { n: 6, served_by },
+        "duplex round trip"
+    );
+
+    assert!(
+        ss_ok.load(Ordering::SeqCst),
+        "handler_receives_verified_org_caller_not_origin: the streaming \
+         handler's OrgCaller is the admission-verified five-field projection \
+         (the ed25519 entity id — never the caller_origin routing hash)"
+    );
+    assert!(
+        cs_ok.load(Ordering::SeqCst),
+        "the client-streaming handler's OrgCaller is the verified projection"
+    );
+    assert!(
+        dx_ok.load(Ordering::SeqCst),
+        "the duplex handler's OrgCaller is the verified projection"
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+// ---------------------------------------------------------------------------
+// 10. Row 3.2 — a mid-stream revocation surfaces as the stream's FINAL
+//     `AdmissionDenied(Denied)` item (the frozen Revoked → Denied coarse map)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revocation_surfaces_as_final_admission_denied_item() {
+    let a = org_a();
+    let (provider, _p_identity, p_dir) = fast_mesh("s3-revoke-provider", &a, None).await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) = fast_mesh("s3-revoke-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+
+    let service = "s3.revoke";
+    let served_by = provider.node_id();
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran_h = ran.clone();
+    // The handler ticks forever; the retirement force-drops it (§2.2
+    // `forced`) — exactly the contract under test.
+    let _serve = provider
+        .serve_org_streaming(
+            service,
+            OrgAccess::SameOrg,
+            move |_c: OrgCaller, _req: Ping, sink: ResponseSinkTyped<Item>| {
+                let ran = ran_h.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    let mut n: u32 = 0;
+                    loop {
+                        sink.send(&Item { n, served_by })?;
+                        n += 1;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            },
+        )
+        .expect("serve_org_streaming");
+
+    let credentials = caller_credentials(&a, &c_identity, None);
+    let org = caller.org(credentials).expect("bind");
+    assert!(
+        converge(&provider, &caller, &cap(&format!("nrpc:{service}")), &[], 1).await,
+        "the caller resolved the provider"
+    );
+
+    let mut stream = org
+        .call_streaming::<Ping, Item>(service, &Ping { n: 1 })
+        .await
+        .expect("the streaming call is admitted");
+    let first = stream.next().await.expect("item").expect("live item");
+    assert_eq!(
+        first,
+        Item { n: 0, served_by },
+        "precondition: the stream is live and delivering"
+    );
+
+    // Revoke the CALLER mid-stream: its membership is generation 1, so a
+    // floor of 2 revokes it. The raise publishes synchronously through the
+    // provider's REAL store — the active stream retires at the boundary,
+    // before `apply_bundle` returns.
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(c_identity.entity_id().clone(), 2u32);
+    let bundle = OrgRevocationBundle::try_issue(&a, &floors).expect("revocation bundle");
+    provider
+        .node()
+        .org_revocation_store()
+        .expect("installed revocation store")
+        .apply_bundle(&bundle)
+        .expect("apply the raised floor");
+
+    let mut final_item = None;
+    while let Some(item) = stream.next().await {
+        final_item = Some(item);
+    }
+    match final_item {
+        Some(Err(OrgSdkError::AdmissionDenied(CoarseAdmissionReason::Denied))) => {}
+        other => panic!(
+            "revocation_surfaces_as_final_admission_denied_item: the stream \
+             must end as AdmissionDenied(Denied) (Revoked's frozen coarse \
+             byte); got {other:?}"
+        ),
+    }
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "the handler ran once and was retired by the raise"
     );
 
     let _ = std::fs::remove_dir_all(&p_dir);

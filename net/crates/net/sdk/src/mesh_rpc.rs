@@ -825,6 +825,18 @@ pub struct ResponseSinkTyped<Resp> {
     _resp: std::marker::PhantomData<fn(Resp)>,
 }
 
+impl<Resp> ResponseSinkTyped<Resp> {
+    /// Crate-internal construction seam (F-S3.2-1, Main's ruling): wrap an
+    /// already-opened raw sink in the typed veneer. `pub(crate)`.
+    pub(crate) fn from_raw(inner: RpcResponseSink, codec: Codec) -> Self {
+        Self {
+            inner,
+            codec,
+            _resp: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<Resp: Serialize> ResponseSinkTyped<Resp> {
     /// Encode `value` with the captured codec and emit it as one
     /// non-terminal chunk. Returns `Err(message)` if encoding fails;
@@ -855,6 +867,19 @@ pub struct RpcStreamTyped<Resp> {
 }
 
 impl<Resp> RpcStreamTyped<Resp> {
+    /// Crate-internal construction seam (F-S3.2-1, Main's ruling): wrap an
+    /// already-opened raw stream in the typed veneer. `pub(crate)` — the org
+    /// facade's typed verbs construct the typed handles over their byte
+    /// seams; zero public-API change.
+    pub(crate) fn from_raw(inner: RpcStream, codec: Codec) -> Self {
+        Self {
+            inner,
+            codec,
+            done: false,
+            _resp: std::marker::PhantomData,
+        }
+    }
+
     /// Server-assigned `call_id` of the underlying stream — useful
     /// for trace correlation / custom logging.
     pub fn call_id(&self) -> u64 {
@@ -1084,6 +1109,18 @@ pub struct RequestStreamTyped<Req> {
 }
 
 impl<Req> RequestStreamTyped<Req> {
+    /// Crate-internal construction seam (F-S3.2-1, Main's ruling): wrap an
+    /// already-opened raw request stream in the typed veneer. `pub(crate)`.
+    pub(crate) fn from_raw(inner: RequestStream, codec: Codec) -> Self {
+        Self {
+            inner,
+            codec,
+            done: false,
+            seen_first: false,
+            _req: std::marker::PhantomData,
+        }
+    }
+
     /// Convert this flattened stream into a [`ChunkedRequestStream<Req>`]
     /// that distinguishes [`Chunk::Init`] from [`Chunk::Data`].
     /// Same underlying substrate stream — no extra wire traffic,
@@ -1203,6 +1240,19 @@ pub struct ClientStreamCallTyped<Req, Resp> {
     _resp: std::marker::PhantomData<fn() -> Resp>,
 }
 
+impl<Req, Resp> ClientStreamCallTyped<Req, Resp> {
+    /// Crate-internal construction seam (F-S3.2-1, Main's ruling): wrap an
+    /// already-opened raw call in the typed veneer. `pub(crate)`.
+    pub(crate) fn from_raw(inner: ClientStreamCallRaw, codec: Codec) -> Self {
+        Self {
+            inner,
+            codec,
+            _req: std::marker::PhantomData,
+            _resp: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<Req: Serialize, Resp: DeserializeOwned> ClientStreamCallTyped<Req, Resp> {
     /// Encode `value` via the captured codec and publish it as
     /// the next REQUEST / REQUEST_CHUNK frame.
@@ -1250,6 +1300,20 @@ pub struct DuplexCallTyped<Req, Resp> {
     done: bool,
     _req: std::marker::PhantomData<fn(Req)>,
     _resp: std::marker::PhantomData<fn() -> Resp>,
+}
+
+impl<Req, Resp> DuplexCallTyped<Req, Resp> {
+    /// Crate-internal construction seam (F-S3.2-1, Main's ruling): wrap an
+    /// already-opened raw duplex call in the typed veneer. `pub(crate)`.
+    pub(crate) fn from_raw(inner: DuplexCallRaw, codec: Codec) -> Self {
+        Self {
+            inner,
+            codec,
+            done: false,
+            _req: std::marker::PhantomData,
+            _resp: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<Req: Serialize, Resp: DeserializeOwned + Unpin> DuplexCallTyped<Req, Resp> {

@@ -63,8 +63,8 @@ use super::error::{hex32, hex_capability, OrgCredentialError, OrgDiscoveryError,
 use super::types::{CapabilityAuthorityId, OrgCapabilityGrant, OrgProofIntent};
 use super::OrgClient;
 use crate::mesh_rpc::{
-    CallOptionsTyped, ClientStreamCallTyped, Codec, DuplexCallTyped, DuplexSinkTyped,
-    DuplexStreamTyped, RpcStreamTyped,
+    ClientStreamCallTyped, Codec, DuplexCallTyped, DuplexSinkTyped, DuplexStreamTyped,
+    RpcStreamTyped,
 };
 
 /// The wire status a provider's admission denial carries (OA2-E2).
@@ -290,21 +290,20 @@ impl<Req: Serialize, Resp: DeserializeOwned> OrgClientStreamCall<Req, Resp> {
         if self.inner.is_some() {
             return Ok(());
         }
+        // The PINNED opening, never the bytes seam (which plans): this call's
+        // provider was resolved once, at the verb.
         let inner = self
             .pinned
             .client
-            .typed
-            .call_client_stream_typed::<Req, Resp>(
+            .node
+            .call_client_stream(
                 self.pinned.provider.node_id(),
                 &self.pinned.service,
-                CallOptionsTyped {
-                    raw: self.pinned.opening.clone(),
-                    codec: Codec::Json,
-                },
+                self.pinned.opening.clone(),
             )
             .await
             .map_err(map_rpc_error)?;
-        self.inner = Some(inner);
+        self.inner = Some(ClientStreamCallTyped::from_raw(inner, Codec::Json));
         Ok(())
     }
 
@@ -711,21 +710,18 @@ impl OrgClient {
         Req: Serialize,
         Resp: DeserializeOwned + Unpin,
     {
-        let (provider, opening) = self.streaming_opening(service, 0, 0)?;
+        // The typed verb IS the bytes seam plus JSON: one authority path,
+        // one plan (inside the seam), and the codec layer is just marshaling.
+        let body = Codec::Json.encode(request).map_err(|e| RpcError::Codec {
+            direction: net::adapter::net::mesh_rpc::CodecDirection::Encode,
+            message: format!("org call_streaming encode: {e}"),
+        })?;
         let inner = self
-            .typed
-            .call_streaming_typed::<Req, Resp>(
-                provider.node_id(),
-                service,
-                request,
-                CallOptionsTyped {
-                    raw: opening,
-                    codec: Codec::Json,
-                },
-            )
-            .await
-            .map_err(map_rpc_error)?;
-        Ok(OrgStream { inner })
+            .call_streaming_bytes_deadline(service, Bytes::from(body), 0, 0)
+            .await?;
+        Ok(OrgStream {
+            inner: RpcStreamTyped::from_raw(inner, Codec::Json),
+        })
     }
 
     /// [`call_streaming`](Self::call_streaming) without the codec — bytes in,
@@ -841,20 +837,11 @@ impl OrgClient {
         Req: Serialize,
         Resp: DeserializeOwned + Unpin,
     {
-        let (provider, opening) = self.streaming_opening(service, 0, 0)?;
-        let inner = self
-            .typed
-            .call_duplex_typed::<Req, Resp>(
-                provider.node_id(),
-                service,
-                CallOptionsTyped {
-                    raw: opening,
-                    codec: Codec::Json,
-                },
-            )
-            .await
-            .map_err(map_rpc_error)?;
-        Ok(OrgDuplexCall { inner })
+        // The typed verb IS the bytes seam plus JSON (one authority path).
+        let inner = self.call_duplex_bytes_deadline(service, 0, 0).await?;
+        Ok(OrgDuplexCall {
+            inner: DuplexCallTyped::from_raw(inner, Codec::Json),
+        })
     }
 
     /// [`call_duplex`](Self::call_duplex) with execution control at the byte

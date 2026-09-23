@@ -38,19 +38,25 @@
 //! called, which triggers a coherent re-announce. Failing the registration
 //! instead would break valid startup ordering and dynamic grant installation.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use net::adapter::net::behavior::org_admission::Admitted;
+use net::adapter::net::cortex::{
+    RequestStream, RpcClientStreamingHandler, RpcDuplexHandler, RpcResponseSink,
+    RpcStreamingContext, RpcStreamingHandler,
+};
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::MeshNode;
 
 use super::types::{CapabilityAuthorityId, OrgId};
 use crate::mesh::Mesh;
 use crate::mesh_rpc::{
-    Codec, RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus, ServeError,
-    ServeHandle, NRPC_TYPED_BAD_REQUEST, NRPC_TYPED_HANDLER_ERROR,
+    Codec, RequestStreamTyped, ResponseSinkTyped, RpcContext, RpcHandler, RpcHandlerError,
+    RpcResponsePayload, RpcStatus, ServeError, ServeHandle, NRPC_TYPED_BAD_REQUEST,
+    NRPC_TYPED_HANDLER_ERROR,
 };
 
 /// Who may call a protected service — the facade's name for the canonical
@@ -173,7 +179,7 @@ impl Mesh {
         Req: serde::de::DeserializeOwned + Send + Sync + 'static,
         Resp: serde::Serialize + Send + Sync + 'static,
         F: Fn(OrgCaller, Req) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Result<Resp, String>> + Send + 'static,
+        Fut: Future<Output = Result<Resp, String>> + Send + 'static,
     {
         let codec = Codec::Json;
         let inner = Arc::new(handler);
@@ -222,9 +228,183 @@ impl Mesh {
     ) -> Result<ServeHandle, ServeError>
     where
         F: Fn(OrgCaller, Bytes) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
+        Fut: Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
     {
         serve_org_bytes_node(self.node().clone(), service, access, handler)
+    }
+
+    /// Serve a protected, privately-discoverable service whose response is a
+    /// STREAM (OSDK §4; §4.3). The handler receives the provider-verified
+    /// [`OrgCaller`], the decoded request, and a [`ResponseSinkTyped`] it
+    /// emits items through; returning `Err(String)` surfaces as an
+    /// application error, never as an admission denial. Everything else —
+    /// access implies visibility, the trivial proof policy, registration
+    /// before provisioning — is [`serve_org`](Self::serve_org)'s contract,
+    /// unchanged.
+    pub fn serve_org_streaming<Req, Resp, F, Fut>(
+        &self,
+        service: &str,
+        access: OrgAccess,
+        handler: F,
+    ) -> Result<ServeHandle, ServeError>
+    where
+        Req: serde::de::DeserializeOwned + Send + Sync + 'static,
+        Resp: serde::Serialize + Send + Sync + 'static,
+        F: Fn(OrgCaller, Req, ResponseSinkTyped<Resp>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let inner = Arc::new(handler);
+        // The typed verb IS the bytes row plus JSON — one dispatch path, and
+        // the codec layer is provably just marshaling.
+        self.serve_org_streaming_bytes(
+            service,
+            access,
+            move |caller, body: Bytes, sink: RpcResponseSink| {
+                let inner = inner.clone();
+                async move {
+                    let req: Req =
+                        Codec::Json
+                            .decode(&body)
+                            .map_err(|e| OrgHandlerError::Application {
+                                code: NRPC_TYPED_BAD_REQUEST,
+                                message: format!("org streaming handler: bad request body: {e}"),
+                            })?;
+                    let sink = ResponseSinkTyped::from_raw(sink, Codec::Json);
+                    inner(caller, req, sink)
+                        .await
+                        .map_err(|message| OrgHandlerError::Application {
+                            code: NRPC_TYPED_HANDLER_ERROR,
+                            message,
+                        })
+                }
+            },
+        )
+    }
+
+    /// [`serve_org_streaming`](Self::serve_org_streaming) without the codec —
+    /// bytes in, raw sink out (OSDK-L R1). The handler still receives the
+    /// provider-verified [`OrgCaller`].
+    pub fn serve_org_streaming_bytes<F, Fut>(
+        &self,
+        service: &str,
+        access: OrgAccess,
+        handler: F,
+    ) -> Result<ServeHandle, ServeError>
+    where
+        F: Fn(OrgCaller, Bytes, RpcResponseSink) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), OrgHandlerError>> + Send + 'static,
+    {
+        serve_org_streaming_bytes_node(self.node().clone(), service, access, handler)
+    }
+
+    /// Serve a protected, privately-discoverable service with a STREAM OF
+    /// REQUESTS and one typed response (OSDK §4; §4.3). The handler receives
+    /// the provider-verified [`OrgCaller`] and a [`RequestStreamTyped`] to
+    /// drain; its return value is the typed terminal response.
+    pub fn serve_org_client_stream<Req, Resp, F, Fut>(
+        &self,
+        service: &str,
+        access: OrgAccess,
+        handler: F,
+    ) -> Result<ServeHandle, ServeError>
+    where
+        Req: serde::de::DeserializeOwned + Send + Sync + Unpin + 'static,
+        Resp: serde::Serialize + Send + Sync + 'static,
+        F: Fn(OrgCaller, RequestStreamTyped<Req>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Resp, String>> + Send + 'static,
+    {
+        let inner = Arc::new(handler);
+        self.serve_org_client_stream_bytes(
+            service,
+            access,
+            move |caller, requests: RequestStream| {
+                let inner = inner.clone();
+                async move {
+                    let requests = RequestStreamTyped::from_raw(requests, Codec::Json);
+                    let resp = inner(caller, requests).await.map_err(|message| {
+                        OrgHandlerError::Application {
+                            code: NRPC_TYPED_HANDLER_ERROR,
+                            message,
+                        }
+                    })?;
+                    let out = Codec::Json.encode(&resp).map_err(|e| {
+                        OrgHandlerError::Internal(format!(
+                            "org client-stream handler: response encode: {e}"
+                        ))
+                    })?;
+                    Ok(Bytes::from(out))
+                }
+            },
+        )
+    }
+
+    /// [`serve_org_client_stream`](Self::serve_org_client_stream) without the
+    /// codec — raw request stream in, bytes terminal out (OSDK-L R1).
+    pub fn serve_org_client_stream_bytes<F, Fut>(
+        &self,
+        service: &str,
+        access: OrgAccess,
+        handler: F,
+    ) -> Result<ServeHandle, ServeError>
+    where
+        F: Fn(OrgCaller, RequestStream) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
+    {
+        serve_org_client_stream_bytes_node(self.node().clone(), service, access, handler)
+    }
+
+    /// Serve a protected, privately-discoverable service BIDIRECTIONALLY
+    /// (OSDK §4; §4.3): the handler receives the provider-verified
+    /// [`OrgCaller`], a [`RequestStreamTyped`] to drain, and a
+    /// [`ResponseSinkTyped`] to emit through.
+    pub fn serve_org_duplex<Req, Resp, F, Fut>(
+        &self,
+        service: &str,
+        access: OrgAccess,
+        handler: F,
+    ) -> Result<ServeHandle, ServeError>
+    where
+        Req: serde::de::DeserializeOwned + Send + Sync + Unpin + 'static,
+        Resp: serde::Serialize + Send + Sync + 'static,
+        F: Fn(OrgCaller, RequestStreamTyped<Req>, ResponseSinkTyped<Resp>) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let inner = Arc::new(handler);
+        self.serve_org_duplex_bytes(
+            service,
+            access,
+            move |caller, requests: RequestStream, sink: RpcResponseSink| {
+                let inner = inner.clone();
+                async move {
+                    let requests = RequestStreamTyped::from_raw(requests, Codec::Json);
+                    let sink = ResponseSinkTyped::from_raw(sink, Codec::Json);
+                    inner(caller, requests, sink).await.map_err(|message| {
+                        OrgHandlerError::Application {
+                            code: NRPC_TYPED_HANDLER_ERROR,
+                            message,
+                        }
+                    })
+                }
+            },
+        )
+    }
+
+    /// [`serve_org_duplex`](Self::serve_org_duplex) without the codec — raw
+    /// request stream and sink (OSDK-L R1).
+    pub fn serve_org_duplex_bytes<F, Fut>(
+        &self,
+        service: &str,
+        access: OrgAccess,
+        handler: F,
+    ) -> Result<ServeHandle, ServeError>
+    where
+        F: Fn(OrgCaller, RequestStream, RpcResponseSink) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), OrgHandlerError>> + Send + 'static,
+    {
+        serve_org_duplex_bytes_node(self.node().clone(), service, access, handler)
     }
 }
 
@@ -247,7 +427,7 @@ pub fn serve_org_bytes_node<F, Fut>(
 ) -> Result<ServeHandle, ServeError>
 where
     F: Fn(OrgCaller, Bytes) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
+    Fut: Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
 {
     let raw = Arc::new(OrgBytesHandler {
         inner: Arc::new(handler),
@@ -305,7 +485,7 @@ pub(crate) fn auto_register_org_channels(_node: &MeshNode, _service: &str) {
 pub(crate) fn org_bytes_handler<F, Fut>(handler: F) -> Arc<OrgBytesHandler<F>>
 where
     F: Fn(OrgCaller, Bytes) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
+    Fut: Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
 {
     Arc::new(OrgBytesHandler {
         inner: Arc::new(handler),
@@ -328,20 +508,10 @@ pub(crate) struct OrgBytesHandler<F> {
 impl<F, Fut> RpcHandler for OrgBytesHandler<F>
 where
     F: Fn(OrgCaller, Bytes) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
+    Fut: Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
 {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
-        // The gate dispatches a protected registration ONLY after
-        // `verify_org_admission` returned `Admitted`, so `None` here is an
-        // invariant violation, not a caller error. Refuse loudly rather than
-        // panic, and never fabricate attribution to keep going.
-        let Some(admitted) = ctx.org_admission.as_ref() else {
-            return Err(RpcHandlerError::Application {
-                code: NRPC_TYPED_HANDLER_ERROR,
-                message: "org handler reached without verified admission".to_string(),
-            });
-        };
-        let caller = OrgCaller::from(admitted);
+        let caller = project_caller(ctx.org_admission.as_ref())?;
 
         let body = (self.inner)(caller, ctx.payload.body.clone()).await?;
         Ok(RpcResponsePayload {
@@ -349,5 +519,184 @@ where
             headers: vec![],
             body,
         })
+    }
+}
+
+// ===========================================================================
+// OSDK §3 — the streaming provider rows (§4.3's serve rows).
+//
+// One projection, one classification: every bridge here (and the unary one
+// above) calls [`project_caller`] and maps `OrgHandlerError` through the one
+// `From`, so the four shapes cannot drift apart on attribution or failure
+// framing. Each typed verb is its bytes row plus JSON — one dispatch path per
+// shape. The trivial proof policy (`|_| true`) is the facade's in every row:
+// the provider veto stays the caller's extension point on the low-level API.
+// ===========================================================================
+
+/// Project the verified admission facts into the handler-facing type — the
+/// ONE place `Admitted` becomes `OrgCaller`.
+///
+/// The gate dispatches a protected registration ONLY after
+/// `verify_org_admission` returned `Admitted`, so `None` here is an invariant
+/// violation, not a caller error: refuse loudly rather than panic, and never
+/// fabricate attribution to keep going.
+fn project_caller(admitted: Option<&Admitted>) -> Result<OrgCaller, RpcHandlerError> {
+    admitted
+        .map(OrgCaller::from)
+        .ok_or_else(|| RpcHandlerError::Application {
+            code: NRPC_TYPED_HANDLER_ERROR,
+            message: "org handler reached without verified admission".to_string(),
+        })
+}
+
+/// Bridges the facade's `Fn(OrgCaller, Bytes, RpcResponseSink)` closure to
+/// the raw [`RpcStreamingHandler`] trait — the server-streaming row's one
+/// projection point.
+pub(crate) struct OrgStreamingBytesHandler<F> {
+    inner: Arc<F>,
+}
+
+#[async_trait]
+impl<F, Fut> RpcStreamingHandler for OrgStreamingBytesHandler<F>
+where
+    F: Fn(OrgCaller, Bytes, RpcResponseSink) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), OrgHandlerError>> + Send + 'static,
+{
+    async fn call(&self, ctx: RpcContext, sink: RpcResponseSink) -> Result<(), RpcHandlerError> {
+        let caller = project_caller(ctx.org_admission.as_ref())?;
+        (self.inner)(caller, ctx.payload.body.clone(), sink).await?;
+        Ok(())
+    }
+}
+
+/// Bridges the facade's `Fn(OrgCaller, RequestStream)` closure to the raw
+/// [`RpcClientStreamingHandler`] trait — the client-streaming row's one
+/// projection point.
+pub(crate) struct OrgClientStreamBytesHandler<F> {
+    inner: Arc<F>,
+}
+
+#[async_trait]
+impl<F, Fut> RpcClientStreamingHandler for OrgClientStreamBytesHandler<F>
+where
+    F: Fn(OrgCaller, RequestStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
+{
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: RequestStream,
+    ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        let caller = project_caller(ctx.org_admission.as_ref())?;
+        let body = (self.inner)(caller, requests).await?;
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body,
+        })
+    }
+}
+
+/// Bridges the facade's `Fn(OrgCaller, RequestStream, RpcResponseSink)`
+/// closure to the raw [`RpcDuplexHandler`] trait — the duplex row's one
+/// projection point.
+pub(crate) struct OrgDuplexBytesHandler<F> {
+    inner: Arc<F>,
+}
+
+#[async_trait]
+impl<F, Fut> RpcDuplexHandler for OrgDuplexBytesHandler<F>
+where
+    F: Fn(OrgCaller, RequestStream, RpcResponseSink) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), OrgHandlerError>> + Send + 'static,
+{
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: RequestStream,
+        responses: RpcResponseSink,
+    ) -> Result<(), RpcHandlerError> {
+        let caller = project_caller(ctx.org_admission.as_ref())?;
+        (self.inner)(caller, requests, responses).await?;
+        Ok(())
+    }
+}
+
+/// Register a protected streaming service on a NODE — the one implementation
+/// of the server-streaming serve pipeline, mirroring
+/// [`serve_org_bytes_node`] (same discipline: the trivial proof policy,
+/// access implies visibility).
+///
+/// `#[doc(hidden)]` — applications use `mesh.serve_org_streaming(..)`; this
+/// is the binding seam.
+#[doc(hidden)]
+pub fn serve_org_streaming_bytes_node<F, Fut>(
+    node: Arc<MeshNode>,
+    service: &str,
+    access: OrgAccess,
+    handler: F,
+) -> Result<ServeHandle, ServeError>
+where
+    F: Fn(OrgCaller, Bytes, RpcResponseSink) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), OrgHandlerError>> + Send + 'static,
+{
+    let raw = Arc::new(OrgStreamingBytesHandler {
+        inner: Arc::new(handler),
+    });
+    auto_register_org_channels(&node, service);
+    let policy: net::adapter::net::org_admission_gate::OrgProviderPolicy = Arc::new(|_| true);
+    match access {
+        OrgAccess::SameOrg => node.serve_rpc_owner_scoped_streaming(service, raw, policy),
+        OrgAccess::Granted => node.serve_rpc_granted_streaming(service, raw, policy),
+    }
+}
+
+/// [`serve_org_streaming_bytes_node`] for the client-streaming shape.
+///
+/// `#[doc(hidden)]` — the binding seam.
+#[doc(hidden)]
+pub fn serve_org_client_stream_bytes_node<F, Fut>(
+    node: Arc<MeshNode>,
+    service: &str,
+    access: OrgAccess,
+    handler: F,
+) -> Result<ServeHandle, ServeError>
+where
+    F: Fn(OrgCaller, RequestStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
+{
+    let raw = Arc::new(OrgClientStreamBytesHandler {
+        inner: Arc::new(handler),
+    });
+    auto_register_org_channels(&node, service);
+    let policy: net::adapter::net::org_admission_gate::OrgProviderPolicy = Arc::new(|_| true);
+    match access {
+        OrgAccess::SameOrg => node.serve_rpc_owner_scoped_client_stream(service, raw, policy),
+        OrgAccess::Granted => node.serve_rpc_granted_client_stream(service, raw, policy),
+    }
+}
+
+/// [`serve_org_streaming_bytes_node`] for the duplex shape.
+///
+/// `#[doc(hidden)]` — the binding seam.
+#[doc(hidden)]
+pub fn serve_org_duplex_bytes_node<F, Fut>(
+    node: Arc<MeshNode>,
+    service: &str,
+    access: OrgAccess,
+    handler: F,
+) -> Result<ServeHandle, ServeError>
+where
+    F: Fn(OrgCaller, RequestStream, RpcResponseSink) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), OrgHandlerError>> + Send + 'static,
+{
+    let raw = Arc::new(OrgDuplexBytesHandler {
+        inner: Arc::new(handler),
+    });
+    auto_register_org_channels(&node, service);
+    let policy: net::adapter::net::org_admission_gate::OrgProviderPolicy = Arc::new(|_| true);
+    match access {
+        OrgAccess::SameOrg => node.serve_rpc_owner_scoped_duplex(service, raw, policy),
+        OrgAccess::Granted => node.serve_rpc_granted_duplex(service, raw, policy),
     }
 }

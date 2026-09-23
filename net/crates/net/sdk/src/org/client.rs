@@ -23,7 +23,7 @@ use net::adapter::net::behavior::org_grant::CapabilityAuthorityId;
 #[cfg(feature = "cortex")]
 use net::adapter::net::behavior::org_sensing_demand::{OrgSensingFamily, MAX_SENSED_POPULATION};
 use net::adapter::net::identity::EntityKeypair;
-use net::adapter::net::{ChannelConfigRegistry, MeshNode};
+use net::adapter::net::MeshNode;
 
 use super::credentials::OrgCredentials;
 use super::error::{hex32, OrgCredentialError, OrgSdkError};
@@ -792,14 +792,6 @@ pub struct OrgClient {
     /// the nRPC surface.
     #[cfg_attr(not(feature = "cortex"), allow(dead_code))]
     pub(crate) node: Arc<MeshNode>,
-    /// A `Mesh` wrapper over this client's node — the construction surface for
-    /// the typed streaming handles (`Mesh::call_*_typed` builds
-    /// `RpcStreamTyped`/`ClientStreamCallTyped`/`DuplexCallTyped`, which have
-    /// no public constructor). Built at bind from the SAME `Arc<MeshNode>`;
-    /// it holds no authority, no lease and no identity of its own, and every
-    /// verb through it lands on the one node above.
-    #[cfg_attr(not(feature = "cortex"), allow(dead_code))]
-    pub(crate) typed: Arc<Mesh>,
     /// The mesh's durable identity — signs every proof this client mints.
     pub(crate) caller: Arc<EntityKeypair>,
     pub(crate) membership: OrgMembershipCert,
@@ -1232,19 +1224,6 @@ impl OrgClient {
             }
         };
 
-        // The typed streaming verbs need `Mesh::call_*_typed` (the only place
-        // the typed handles are constructed), so bind wraps the SAME node in a
-        // `Mesh` once — never per call. The node's own channel registry rides
-        // along when it has one; a bare node gets an empty registry, which the
-        // call verbs never consult.
-        let typed = Arc::new(Mesh::from_node_arc(
-            node.clone(),
-            node.channel_configs()
-                .cloned()
-                .unwrap_or_else(|| Arc::new(ChannelConfigRegistry::new())),
-            None,
-        ));
-
         Ok(OrgClient {
             caller: node.entity_keypair_arc(),
             membership,
@@ -1257,7 +1236,6 @@ impl OrgClient {
             selected: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cortex")]
             _sensing,
-            typed,
             node,
         })
     }
