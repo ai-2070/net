@@ -164,6 +164,33 @@ source-established label and its receipt per the brief's evidence rules.
   count, the dataforts-ENABLED build of the ungated declarations,
   typecheck:tests/release/check-ts-consumer.sh/CI themselves, non-Windows
   hosts.
+- **2026-09-22, F-S4Vectors-1 mechanism RETRACTED (unprompted
+  self-correction — credited).** `S4Vectors` disowns its own HIGH finding's
+  mechanism after `R4CoreFix`'s instrumented-wheel trace: **there is no
+  core cross-process discovery defect.** The true cause is a consumer-side
+  **serve-handle RAII pitfall in the lane's own harness** —
+  `mixed_pair/provider.py` discarded the `net.serve_org_streaming(…)`
+  return handle, and `ServeHandle`'s Drop (`mesh_rpc.rs:468`)
+  RAII-deregisters the service, so the granted service died before the
+  first announcement (`granted_snapshot()` EMPTY, `SendEmission.scoped`
+  seals nothing → `no authorized provider … (0 private candidate(s)
+  considered)` — the empty snapshot, not a discovery defect). The
+  "process boundary" was correlation: every red run used `provider.py`;
+  every green cell binds its serve handle for the serve lifetime
+  (`test_org_live.py` `handle = …` + finally close; Go `sh, err :=
+  ServeOrg…` + `defer sh.Close()`). **The three named core sites
+  (`mesh.rs:22095`, `org_scoped_store.rs:733`, `mesh.rs:22453`) are
+  innocent — zero core changes needed; the ruling (A)'s waiver fallback
+  is MOOT.** Corrected in place (the F1 precedent — strengthened to the
+  verified property, never silently re-pinned) as a **consumer-side
+  pitfall: bind the serve handle for the serve lifetime
+  (`ServeHandle::Drop` deregisters — RAII).** Fixed in `provider.py` (8656
+  B, sha `e42017e2…`, handle bound + finally close). `R4CoreFix`'s
+  contract converts to: the permanent two-OS-process witness
+  `scoped_discovery_crosses_an_os_process_boundary` (the regression guard
+  the false finding still justifies) + the localization record in
+  `R4COREFIX.md` (the executed trace behind the retraction) + the
+  one-command co-run green (the plan's last named cell).
 - **2026-09-22, S4Vectors delivered (executed)** — Wave 2 lane 3/3, one row
   gated on R4CoreFix. Landed at `5da931259` (the vectors + the
   `gen_org_error_fixtures` generator extension), `8adc9fc86` (the

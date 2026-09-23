@@ -1644,3 +1644,19 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   entry (Go 9; Python 9 + 119; Node 11 + 119; the Rust `--check` "== 120
   rows, 0 failed" step). One plan-named cell remains open behind the
   repair: the mixed non-Rust pair's green.
+
+- 2026-09-22, **F-S4Vectors-1 retracted (unprompted self-correction —
+  credited): NO core defect.** The instrumented-wheel trace (R4CoreFix)
+  localized the mixed-pair failure to the lane's own harness:
+  `provider.py` discarded the serve handle and `ServeHandle`'s Drop
+  (`mesh_rpc.rs:468`, RAII) deregistered the service before the first
+  announcement — "0 private candidate(s) considered" was the empty
+  `granted_snapshot`, not a discovery defect. The three named core sites
+  are innocent; **zero core changes**; the ruling's waiver fallback is
+  moot. Corrected in place (the F1 precedent) as a **consumer-side
+  serve-handle RAII pitfall** (bind the handle for the serve lifetime).
+  The row's green awaits the one-command co-run with the fixed
+  `provider.py` (sha `e42017e2…`); `R4CoreFix` lands the permanent
+  `scoped_discovery_crosses_an_os_process_boundary` witness + the
+  localization record. The plan's last named cell stands one command from
+  green.
