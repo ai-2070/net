@@ -1,0 +1,14 @@
+net/crates/net/leaf/src/wasm.rs
+  h_64425bc75e3f3d 5100-5102,5131-5133,5387-5389,5395,5682-5689,5692-5694,5707-5710,5712-5714,5761-5763,5769
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "22f8b283ad6b1a89d29bc882c1e74f24b86b2e80",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
