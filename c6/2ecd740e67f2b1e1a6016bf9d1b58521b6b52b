@@ -1,0 +1,32 @@
+.claude/skills/net-event-bus/examples/net_org_streaming.c
+  h_64425bc75e3f3d 1-398
+docs/data/examples.yaml
+  h_64425bc75e3f3d 277-328
+net/crates/net/bindings/node/org.ts
+  h_64425bc75e3f3d 42-44,48-64,78-87,101-204,222,269-351,415,429-591
+net/crates/net/bindings/node/src/cortex.rs
+  h_64425bc75e3f3d 611-622,651-653
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  h_64425bc75e3f3d 110-168,755,760-766,783,852,856,858,865-867,911,927,1082,1087,1120-1122,1125-1127,1161,1174-1176,1205-1208,1224,1292,1296,1299,1302,1306,1386,2036,2066,2098
+net/crates/net/bindings/node/src/org.rs
+  h_64425bc75e3f3d 194-330,488-495,504,512-513,516-518,587,608-624,641,700-1396
+net/crates/net/bindings/node/test/consumer/org_streaming_consumer.ts
+  h_64425bc75e3f3d 1-207
+net/crates/net/bindings/node/test/consumer/tsconfig.json
+  h_64425bc75e3f3d 1-18
+net/crates/net/bindings/node/test/consumer_compile.test.ts
+  h_64425bc75e3f3d 1-34
+net/crates/net/bindings/node/test/org_live.test.ts
+  h_64425bc75e3f3d 19,26-36,47,55-61,208-798
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c62ecd740e67f2b1e1a6016bf9d1b58521b6b52b",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
