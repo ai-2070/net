@@ -1,0 +1,23 @@
+docs/internal/spikes/org-streaming/r4corefix-diag-pythonpair.log
+  s_3f3d4c91f992be::t_801414d438c968 1-141
+docs/internal/spikes/org-streaming/r4corefix-row-green.log
+  s_3f3d4c91f992be::t_0047e933207c40 1-8
+net/crates/net/tests/org_scoped_cross_process.rs
+  s_3f3d4c91f992be::t_a685db66b66212 1-559
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2001ff6037e012c59b72c43516b26b0c4ada4b65",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
