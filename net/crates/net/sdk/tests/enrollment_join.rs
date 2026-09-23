@@ -26,6 +26,41 @@ use net_sdk::{Mesh, MeshBuilder};
 const T: Duration = Duration::from_secs(5);
 const PSK: [u8; 32] = [0x5A; 32];
 
+/// A well-formed one-hop subnet credential set (for any subject).
+fn some_subnet_credentials() -> net::adapter::net::subnet::SubnetCredentialSet {
+    use net::adapter::net::identity::EntityKeypair;
+    use net::adapter::net::subnet::{
+        SubnetGrant, SubnetIssuerGrant, SubnetRights, TopologySubnetId,
+    };
+    let root = EntityKeypair::generate();
+    let issuer = EntityKeypair::generate();
+    let issuer_grant = SubnetIssuerGrant::try_issue(
+        &root,
+        root.entity_id().clone(),
+        TopologySubnetId::new(&[3]),
+        0,
+        issuer.entity_id().clone(),
+        SubnetRights::ATTACH,
+        1,
+        now() - 60,
+        3600,
+    )
+    .unwrap();
+    let leaf = SubnetGrant::try_issue(
+        &issuer,
+        root.entity_id().clone(),
+        TopologySubnetId::new(&[3, 7]),
+        0,
+        EntityKeypair::generate().entity_id().clone(),
+        SubnetRights::ATTACH,
+        1,
+        now() - 60,
+        600,
+    )
+    .unwrap();
+    net::adapter::net::subnet::SubnetCredentialSet::OneHop { issuer_grant, leaf }
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -228,6 +263,12 @@ async fn leaving_erases_the_credentials_and_only_an_explicit_rejoin_recovers() {
     assert!(join.bundle().is_none());
     assert!(!join.leave(2_000).unwrap(), "repeated leave is idempotent");
     assert_eq!(join.left_at(), Some(1_000), "the original time is kept");
+    // A subnet leaf renewal completing after leave installs nothing.
+    assert!(matches!(
+        join.replace_subnet_credentials(&some_subnet_credentials()),
+        Err(DeviceJoinError::Left { at: 1_000 })
+    ));
+    assert!(join.bundle().is_none());
     drop(join);
 
     // Restart: still left, credentials gone, redemption fenced.

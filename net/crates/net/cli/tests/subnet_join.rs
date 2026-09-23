@@ -333,3 +333,109 @@ fn a_device_joins_a_subnet_is_admitted_and_removal_takes_effect() {
         node.ready
     );
 }
+
+/// Leaf renewal (V3-2 task 5): the operator issues short-lived leaves; the
+/// joined node renews its own in the background before expiry, renews an
+/// already-expired one at start and is admitted with it, and once removed it
+/// can no longer renew — renewal never re-admits a removed device.
+#[test]
+fn a_joined_node_renews_its_subnet_leaf_and_removal_stops_renewal() {
+    let operator = Fx::new();
+    let keys = operator.tmp.path().join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let (root, root_hex, issuer, grant) = ceremony(&keys);
+
+    let _op = operator.up(&[
+        "--enroll",
+        "--no-port-mapping",
+        "--subnet-issuer-grant",
+        grant.to_str().unwrap(),
+        "--subnet-issuer-key",
+        issuer.to_str().unwrap(),
+        "--subnet-leaf-ttl",
+        "15s",
+    ]);
+    let created = operator.json(&["invite", "create", "--subnet", "3.7"]);
+    let agent = Fx::new();
+    let joined = agent.json(&["join", &token_of(&created), "--yes"]);
+    assert_eq!(joined["subnet"]["credentials"], "installed", "{joined}");
+    let device = joined["device"].as_str().unwrap().to_string();
+
+    // Fresh leaf: admitted as issued, no renewal needed yet.
+    let node = agent.up(&[]);
+    let jsub = &node.ready["joined"]["subnet"];
+    assert_eq!(jsub["admitted"], true, "{}", node.ready);
+    assert_eq!(jsub["renewed"], false, "{}", node.ready);
+    let first = jsub["expires_at"].as_u64().unwrap();
+
+    // Background renewal moves the expiry forward while the node runs.
+    let mut renewed = None;
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(500));
+        let status = agent.json(&["node", "status"]);
+        if let Some(at) = status["subnet_expires_at"]
+            .as_u64()
+            .filter(|&at| at > first)
+        {
+            renewed = Some(at);
+            break;
+        }
+    }
+    let second = renewed.expect("the running node renewed its subnet leaf");
+    drop(node);
+
+    // Stopped past expiry: the next start renews first, then is admitted.
+    // Also past the operator's session lapse: the renewal's nRPC streams
+    // keep the killed node's old session busy (deferring its re-handshake)
+    // for up to the 30 s session timeout.
+    wait_past(second + SESSION_LAPSE);
+    let node = agent.up(&[]);
+    let jsub = &node.ready["joined"]["subnet"];
+    assert_eq!(jsub["renewed"], true, "{}", node.ready);
+    assert_eq!(jsub["admitted"], true, "{}", node.ready);
+    let third = jsub["expires_at"].as_u64().unwrap();
+    drop(node);
+
+    // Removed from 3.7 at the issuing node: renewal is refused as revoked.
+    let removed = operator
+        .base()
+        .args(["--output", "json", "subnet", "remove", "--root-key"])
+        .arg(&root)
+        .args(["--authority", &root_hex, "--scope", "3.7"])
+        .args(["--topology-epoch", "0", "--revision", "1"])
+        .args(["--subject", &device, "--minimum-generation", "2"])
+        .args(["--verifier", "self", "--state-dir"])
+        .arg(operator.state())
+        .output()
+        .unwrap();
+    assert!(removed.status.success(), "{removed:?}");
+    wait_past(third + SESSION_LAPSE);
+    let node = agent.up(&[]);
+    let jsub = &node.ready["joined"]["subnet"];
+    assert_eq!(jsub["renewed"], false, "{}", node.ready);
+    assert!(
+        jsub["renew_error"].as_str().unwrap().contains("revoked"),
+        "{}",
+        node.ready
+    );
+    assert_eq!(jsub["admitted"], false, "{}", node.ready);
+}
+
+/// Seconds past a leaf's expiry by which the operator's session with the
+/// (killed) node that renewed it has lapsed: renewal happens at most 15 s
+/// (the leaf TTL) before expiry, plus the 30 s session timeout.
+const SESSION_LAPSE: u64 = 17;
+
+/// Sleep until the wall clock is past `at` (Unix seconds).
+fn wait_past(at: u64) {
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if now > at {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}

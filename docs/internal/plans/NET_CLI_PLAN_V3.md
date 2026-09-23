@@ -2007,7 +2007,7 @@ the CLI removal journey runs end to end.
 **Still open.**
 - ~~`subnet remove` needs the mesh PSK.~~ Closed by the next receipt.
 - Standalone subnet join by an already-connected device (V3-2 task 3).
-- Leaf renewal before expiry.
+- ~~Leaf renewal before expiry.~~ Closed by the V3-2 task 5 receipt.
 - Organization enrollment.
 
 #### `subnet remove --state-dir`: removal through the operator's own node (receipt, 2026-09-23)
@@ -2049,6 +2049,109 @@ would take a hostile node, and `verify_for`'s binding and signature checks are
 witnessed at unit level (slice 2).
 
 Regressions: `net-cli` 351/351, and `net-cli` clippy is clean.
+
+#### V3-2 task 5 — subnet leaf renewal (receipt, 2026-09-23)
+
+A subnet-joined device holds a delegated leaf that expires (`up
+--subnet-leaf-ttl`, default 24h). It now renews that leaf from the node that
+issued it, over nRPC service `net.enroll.subnet.renew`.
+
+**The request.** `SubnetRenewRequest` (`NMSR`) is signed by the device's own
+identity key over:
+- the signed invite;
+- the device's subject;
+- the issue time (the issuer honours it for ±300 s);
+- a nonce.
+
+**The issuer re-issues only when** (`answer_renewal`):
+- the request is fresh and the signature verifies;
+- the invite carries a subnet offer;
+- the invite is this node's own, and its digest matches the ledger's record;
+- the ledger shows that invite issued to **this same device**. Any other
+  device gets `Conflict`, and a revoked issuance gets `Revoked`.
+
+The serving handler (`serve_subnet_renewal`) also refuses a subject that a
+subject floor at this node removes from the offered scope. A delegated leaf
+never satisfies a floor, so renewal never re-admits a removed device. The
+fresh leaf covers exactly the original offer. The device re-checks it against
+the signed offer (`replace_subnet_credentials`) before persisting it.
+
+**CLI.**
+- The operator's `up --enroll` with a subnet issuer serves renewal.
+- A joined `up` renews at start when a third or less of the leaf's life is
+  left, or when it has already expired, before presenting. It persists the
+  fresh leaf.
+- A background task then renews at the same point, persists the leaf and
+  re-presents it (5 s floor between renewals, 30 s retry after a failure). The
+  task stops at shutdown.
+- The start report gains `expires_at`, `renewed` and `renew_error`.
+  `node status` gains `subnet_expires_at`.
+
+**Leave fence.** `replace_subnet_credentials` refuses a left join
+(`DeviceJoinError::Left`), so a renewal completing after `leave` installs
+nothing. The owner mutex orders it against `leave`. This closes the
+"no renewal exists yet" note in the V3-2B receipt.
+
+**Issuance fix found on the way.** `SubnetLeafIssuer::issue` counted the
+leaf's lifetime from its 60 s back-dated `not_before`. A leaf with a TTL under
+a minute was therefore born expired. The lifetime now runs from `now`. The
+back-dating still covers clock skew, and the renewal point ignores that
+back-dated minute.
+
+**Witnesses.**
+- SDK `only_the_enrolled_device_renews_its_subnet_leaf` covers:
+  - not issued yet;
+  - issued, then renewed for exactly the offer;
+  - another device (`Conflict`);
+  - stale requests, forged signatures, mesh-only invites and foreign invites.
+- SDK `leaving_erases_the_credentials_…` covers renewal after leave → `Left`.
+- CLI `a_joined_node_renews_its_subnet_leaf_and_removal_stops_renewal` runs
+  with a 15 s leaf TTL:
+  - a fresh leaf is admitted with no renewal;
+  - the running node's `subnet_expires_at` moves forward (background renewal);
+  - stopped past expiry, the next start renews first and is admitted;
+  - after `subnet remove --verifier self`, the next start's renewal is refused
+    as revoked and admission is refused.
+
+**Inverse mutations** (all RED):
+- no renewal at start;
+- no background renewal;
+- the handler ignoring subject floors;
+- the leaf lifetime counted from the back-dated start;
+- `answer_renewal` accepting any subject;
+- the request signature not checked;
+- no `Left` check on replace.
+
+**Regressions.**
+- The full SDK suite as CI runs it: 811/811.
+- `net-cli` 352/352.
+- `net-cli` clippy (all targets) is clean.
+- SDK rustdoc (`full`) is clean.
+- The SDK builds with default features and with `--no-default-features
+  --features net`.
+- Two pre-existing SDK `--all-features` lints outside this change
+  (`rtc_bootstrap.rs` `iter_kv_map`, `tests/sensing_consumer.rs`
+  `explicit_auto_deref`) are unchanged.
+
+**Found, not fixed (core policy): a restart after nRPC use is deferred by up
+to `session_timeout`.** nRPC request and reply channels are application
+streams, and they stay open after a call. By the C3 busy gate
+(`routed_rotation_outcome`), the operator therefore defers a crashed-and-
+restarted peer's re-handshake until the old session times out (30 s). The
+joined `up`'s attach wait is 20 s, so a device killed within ~30 s of its last
+renewal (or of any nRPC call) comes back `attached: false`.
+
+This predates renewal; renewal makes every subnet device an nRPC user. The
+CLI test waits past the lapse and says so. Options, for a decision:
+- close or ignore idle nRPC channels in the busy gate;
+- stretch the joined attach wait past `session_timeout`;
+- add background re-attach for a joined `up`.
+
+**Still open.**
+- ~~Leaf renewal before expiry.~~
+- Standalone subnet join by an already-connected device (V3-2 task 3).
+- Organization enrollment.
+- The restart deferral above.
 
 ### V3-2A — channel-scoped invitation, join and credential lifecycle
 

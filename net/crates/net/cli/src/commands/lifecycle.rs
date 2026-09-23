@@ -83,6 +83,100 @@ const MESH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// room for the operator's ~5 s defer of a re-attaching identity (its previous
 /// session, e.g. from `join`, must lapse first).
 const JOIN_ATTACH_WAIT: Duration = Duration::from_secs(20);
+/// Bound on one subnet leaf renewal exchange.
+const SUBNET_RENEW_WAIT: Duration = Duration::from_secs(10);
+/// Retry pause after a failed background renewal.
+const SUBNET_RENEW_RETRY: Duration = Duration::from_secs(30);
+/// Floor between background renewals, whatever the leaf lifetime.
+const SUBNET_RENEW_MIN_INTERVAL: u64 = 5;
+
+/// When to renew a subnet leaf: once a third of its lifetime remains. The
+/// issuer back-dates `not_before` by up to a minute for clock skew; that
+/// minute is not lifetime, or a short-lived leaf would renew continuously.
+fn subnet_renew_at(set: &net::adapter::net::subnet::SubnetCredentialSet) -> u64 {
+    let leaf = set.leaf();
+    let lifetime = leaf.not_after.saturating_sub(leaf.not_before);
+    let lifetime = match lifetime.saturating_sub(60) {
+        0 => lifetime,
+        forward => forward,
+    };
+    leaf.not_after.saturating_sub((lifetime / 3).max(1))
+}
+
+/// Keep a joined node's subnet admission alive: renew the leaf before it
+/// expires (from the node that issued it), persist it through the join
+/// store (which re-checks it against the signed offer), and re-present it.
+fn spawn_subnet_renewal(
+    joined: Arc<parking_lot::Mutex<Option<net_sdk::enrollment::device::DeviceJoin>>>,
+    node: Arc<net::adapter::net::MeshNode>,
+    issuer_node: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let snapshot = {
+                let guard = joined.lock();
+                guard.as_ref().and_then(|j| {
+                    let offer = j.invite().subnet()?.clone();
+                    let set = j.bundle()?.subnet_credentials()?;
+                    Some((
+                        j.identity().clone(),
+                        j.invite().clone(),
+                        offer,
+                        subnet_renew_at(&set),
+                    ))
+                })
+            };
+            let Some((identity, invite, offer, renew_at)) = snapshot else {
+                return;
+            };
+            let wait = renew_at
+                .saturating_sub(now_unix())
+                .max(SUBNET_RENEW_MIN_INTERVAL);
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            let renewed = net_sdk::enrollment::renew::request_subnet_renewal(
+                &node,
+                issuer_node,
+                &identity,
+                &invite,
+                SUBNET_RENEW_WAIT,
+            )
+            .await;
+            let set = match renewed {
+                Ok(set) => set,
+                Err(e) => {
+                    tracing::warn!(error = %e, "subnet leaf renewal failed; retrying");
+                    tokio::time::sleep(SUBNET_RENEW_RETRY).await;
+                    continue;
+                }
+            };
+            let persisted = joined
+                .lock()
+                .as_mut()
+                .map(|j| j.replace_subnet_credentials(&set));
+            match persisted {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "renewed subnet credentials refused; retrying");
+                    tokio::time::sleep(SUBNET_RENEW_RETRY).await;
+                    continue;
+                }
+                None => return,
+            }
+            if let Err(e) = node
+                .present_subnet_credentials(
+                    issuer_node,
+                    &set,
+                    offer.scope.clone(),
+                    offer.rights,
+                    JOIN_ATTACH_WAIT,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "re-presenting renewed subnet credentials failed");
+            }
+        }
+    })
+}
 
 /// `net-mesh up` arguments.
 #[derive(Args, Debug)]
@@ -860,10 +954,21 @@ async fn control_session(
                     )
             }
         },
-        "status" => serde_json::json!({
-            "state": if draining { "draining" } else { "ready" },
-            "node": state.report,
-        }),
+        "status" => {
+            // A joined node's current subnet leaf (it changes on renewal).
+            let subnet_expires_at = state.joined.as_ref().and_then(|j| {
+                j.lock()
+                    .as_ref()
+                    .and_then(|j| j.bundle())
+                    .and_then(|b| b.subnet_credentials())
+                    .map(|set| set.leaf().not_after)
+            });
+            serde_json::json!({
+                "state": if draining { "draining" } else { "ready" },
+                "node": state.report,
+                "subnet_expires_at": subnet_expires_at,
+            })
+        }
         "shutdown" => {
             state.draining.store(true, Ordering::SeqCst);
             serde_json::json!({ "accepted": true, "incarnation": state.report.incarnation })
@@ -1095,7 +1200,7 @@ pub async fn run_up(
         .await
         .map_err(|e| generic(format!("node state task failed: {e}")))??;
     let lifetime_lock = hold_lifetime_lock(&dir)?;
-    let joined = if has_join {
+    let mut joined = if has_join {
         use net_sdk::enrollment::device::{DeviceJoin, DeviceJoinError};
         let join = DeviceJoin::open(&join_dir).map_err(|e| match e {
             DeviceJoinError::Storage(StorageError::Busy) => generic(format!(
@@ -1211,6 +1316,8 @@ pub async fn run_up(
         Some(owner) => Some(owner.start(&mesh, psk_value, subnet_issuer.clone()).await?),
         None => None,
     };
+    // A renewed leaf (at start) to persist once the join is mutable again.
+    let mut renewed_at_start = None;
     let joined_report = match joined.as_ref().and_then(|j| j.bundle().map(|b| (j, b))) {
         Some((join, bundle)) => {
             let c = bundle.contact();
@@ -1223,6 +1330,26 @@ pub async fn run_up(
             // verdict — not inferred from holding credentials.
             let subnet = match (join.invite().subnet(), bundle.subnet_credentials()) {
                 (Some(offer), Some(set)) => {
+                    // Renew first when the leaf is near (or past) expiry.
+                    let mut set = set;
+                    let mut renew_error = None;
+                    if detail.is_none() && now_unix() >= subnet_renew_at(&set) {
+                        match net_sdk::enrollment::renew::request_subnet_renewal(
+                            mesh.node(),
+                            c.node_id,
+                            join.identity(),
+                            join.invite(),
+                            SUBNET_RENEW_WAIT,
+                        )
+                        .await
+                        {
+                            Ok(fresh) => {
+                                set = fresh.clone();
+                                renewed_at_start = Some(fresh);
+                            }
+                            Err(e) => renew_error = Some(e),
+                        }
+                    }
                     let admitted = if detail.is_some() {
                         Err("not attached".to_string())
                     } else {
@@ -1242,6 +1369,9 @@ pub async fn run_up(
                         "rights": super::subnet::format_subnet_rights(offer.rights),
                         "admitted": admitted.is_ok(),
                         "detail": admitted.err(),
+                        "expires_at": set.leaf().not_after,
+                        "renewed": renewed_at_start.is_some(),
+                        "renew_error": renew_error,
                     }))
                 }
                 _ => None,
@@ -1306,7 +1436,26 @@ pub async fn run_up(
     .await?;
     drop(control_text);
 
+    // Persist a leaf renewed at start (re-checked against the signed offer).
+    if let (Some(join), Some(set)) = (joined.as_mut(), renewed_at_start.as_ref()) {
+        if let Err(e) = join.replace_subnet_credentials(set) {
+            tracing::warn!(error = %e, "renewed subnet credentials were not persisted");
+        }
+    }
+    let subnet_issuer_node = joined
+        .as_ref()
+        .filter(|j| j.invite().subnet().is_some())
+        .and_then(|j| j.bundle())
+        .map(|b| b.contact().node_id);
     let joined = joined.map(|j| Arc::new(parking_lot::Mutex::new(Some(j))));
+    let subnet_renewal = match (&joined, subnet_issuer_node) {
+        (Some(joined), Some(issuer_node)) => Some(spawn_subnet_renewal(
+            joined.clone(),
+            mesh.node().clone(),
+            issuer_node,
+        )),
+        _ => None,
+    };
     let state_ctl = Arc::new(ControlState {
         report: report.clone(),
         draining: AtomicBool::new(false),
@@ -1342,6 +1491,9 @@ pub async fn run_up(
     }
     let stopped = tokio::time::timeout(MESH_SHUTDOWN_TIMEOUT, mesh.shutdown()).await;
     let _ = std::fs::remove_file(&control_path);
+    if let Some(task) = subnet_renewal {
+        task.abort();
+    }
     // Release the join's storage lock before the lifetime lock, even if a
     // control session task still holds the shared state for a moment.
     if let Some(joined) = &joined {
@@ -1376,6 +1528,9 @@ struct StatusView {
     node: Option<NodeReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    /// A joined node's current subnet leaf expiry (moves on renewal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subnet_expires_at: Option<u64>,
 }
 
 async fn observe(state: &Path) -> Result<StatusView, CliError> {
@@ -1385,6 +1540,7 @@ async fn observe(state: &Path) -> Result<StatusView, CliError> {
         state_dir: state.display().to_string(),
         node,
         detail: detail.map(str::to_string),
+        subnet_expires_at: None,
     };
     Ok(match probe(&dir)? {
         Liveness::Absent => view(
@@ -1402,7 +1558,10 @@ async fn observe(state: &Path) -> Result<StatusView, CliError> {
             Ok((_, reply)) => {
                 let node = serde_json::from_value::<NodeReport>(reply["node"].clone()).ok();
                 let s = reply["state"].as_str().unwrap_or("unknown").to_string();
-                view(&s, node, None)
+                StatusView {
+                    subnet_expires_at: reply["subnet_expires_at"].as_u64(),
+                    ..view(&s, node, None)
+                }
             }
             Err(ControlError::NoControlFile) => view(
                 "starting",

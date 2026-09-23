@@ -486,7 +486,7 @@ impl SubnetLeafIssuer {
         &self.grant
     }
 
-    fn issue(
+    pub(crate) fn issue(
         &self,
         offer: &super::invite::SubnetOffer,
         subject: &EntityId,
@@ -495,9 +495,15 @@ impl SubnetLeafIssuer {
         if !self.covers(offer) {
             return Err(Refusal::Unavailable);
         }
+        // Back-date the start for clock skew, but count the lifetime from
+        // `now`: a short-lived leaf must not be born (nearly) expired.
         let not_before = now.saturating_sub(60).max(self.grant.not_before);
-        let remaining = self.grant.not_after.saturating_sub(not_before);
-        let duration = self.lifetime_secs.min(remaining);
+        let not_after = now
+            .saturating_add(self.lifetime_secs)
+            .min(self.grant.not_after);
+        let duration = not_after
+            .saturating_sub(not_before)
+            .min(net::adapter::net::subnet::auth::MAX_SUBNET_GRANT_LIFETIME_SECS);
         if duration == 0 {
             return Err(Refusal::Unavailable);
         }

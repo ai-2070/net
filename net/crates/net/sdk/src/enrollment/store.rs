@@ -746,6 +746,18 @@ impl EnrollmentLedger {
         }
     }
 
+    /// The device an invitation was issued to. `NotIssued` before issuance;
+    /// `Revoked` / `Denied` for those terminal states.
+    pub fn issued_subject(&self, invitation: &InvitationId) -> Result<EntityId, LedgerError> {
+        self.fence()?;
+        match &self.records[self.by_invitation(invitation)?].state {
+            State::Issued { claim, .. } => Ok(claim.subject.clone()),
+            State::Offered | State::Claimed { .. } => Err(LedgerError::NotIssued),
+            State::Revoked { .. } => Err(LedgerError::Revoked),
+            State::Denied { .. } => Err(LedgerError::Denied),
+        }
+    }
+
     /// Non-secret status of one offer.
     pub fn status(&self, offer: &OfferId) -> Result<OfferStatus, LedgerError> {
         self.fence()?;

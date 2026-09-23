@@ -294,3 +294,98 @@ fn an_issuer_cannot_exceed_its_grant() {
         SubnetLeafIssuer::new(issuer.grant().clone(), EntityKeypair::generate(), 1, DAY).is_err()
     );
 }
+
+/// Renewal (V3-2 task 5): the issuing node re-issues a fresh leaf for
+/// exactly the original offer, only to the device its ledger issued that
+/// invite to, and only for a fresh request that device signed.
+#[test]
+fn only_the_enrolled_device_renews_its_subnet_leaf() {
+    use net_sdk::enrollment::renew::{answer_renewal, SubnetRenewRequest};
+    use net_sdk::enrollment::service::SharedLedger;
+    use net_sdk::enrollment::store::{EnrollmentLedger, LedgerLimits};
+
+    let operator = Identity::generate();
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger: SharedLedger = std::sync::Arc::new(parking_lot::Mutex::new(
+        EnrollmentLedger::create(
+            &tmp.path().join("ledger"),
+            operator.entity_id().clone(),
+            LedgerLimits::default(),
+        )
+        .unwrap(),
+    ));
+    let sign = |relations, subnet| {
+        let invite = MembershipInvite::sign(&operator, spec(relations, subnet)).unwrap();
+        ledger.lock().offer(invite.offer_spec(), now()).unwrap();
+        invite
+    };
+    let invite = sign(
+        vec![Relation::Mesh, Relation::Subnet],
+        Some(offer(&[3, 7], SubnetRights::ATTACH)),
+    );
+    let device = Identity::generate();
+    let issuer = leaf_issuer();
+
+    // Not issued yet: nothing to renew.
+    let early = SubnetRenewRequest::sign(&device, &invite, now()).unwrap();
+    assert_eq!(
+        answer_renewal(&early.to_bytes(), &ledger, &issuer, now()),
+        Err(Refusal::Invalid)
+    );
+
+    // Issue it to `device` through the ledger, as redemption would.
+    let intent = RedemptionIntent::for_invite(&invite, device.entity_id().clone()).unwrap();
+    {
+        let mut l = ledger.lock();
+        let claimant = intent.claimant();
+        l.claim(&invite.invitation_id(), &claimant, now()).unwrap();
+        l.issue(&invite.invitation_id(), &claimant, b"bundle", now())
+            .unwrap();
+    }
+
+    let fresh = SubnetRenewRequest::sign(&device, &invite, now()).unwrap();
+    let set = answer_renewal(&fresh.to_bytes(), &ledger, &issuer, now()).expect("renewed");
+    assert_eq!(set.leaf().subject, *device.entity_id());
+    assert_eq!(set.leaf().scope, TopologySubnetId::new(&[3, 7]));
+    assert_eq!(set.leaf().rights, SubnetRights::ATTACH);
+
+    // Another device cannot renew someone else's enrollment.
+    let other = SubnetRenewRequest::sign(&Identity::generate(), &invite, now()).unwrap();
+    assert_eq!(
+        answer_renewal(&other.to_bytes(), &ledger, &issuer, now()),
+        Err(Refusal::Conflict)
+    );
+    // Stale requests and tampered signatures are refused.
+    let stale = SubnetRenewRequest::sign(&device, &invite, now() - 10_000).unwrap();
+    assert_eq!(
+        answer_renewal(&stale.to_bytes(), &ledger, &issuer, now()),
+        Err(Refusal::Expired)
+    );
+    let mut forged = fresh.to_bytes();
+    let last = forged.len() - 1;
+    forged[last] ^= 1;
+    assert_eq!(
+        answer_renewal(&forged, &ledger, &issuer, now()),
+        Err(Refusal::Invalid)
+    );
+    // A mesh-only invite, or one this ledger never recorded, renews nothing.
+    let mesh_only = sign(vec![Relation::Mesh], None);
+    let req = SubnetRenewRequest::sign(&device, &mesh_only, now()).unwrap();
+    assert_eq!(
+        answer_renewal(&req.to_bytes(), &ledger, &issuer, now()),
+        Err(Refusal::Invalid)
+    );
+    let foreign = MembershipInvite::sign(
+        &operator,
+        spec(
+            vec![Relation::Mesh, Relation::Subnet],
+            Some(offer(&[3, 7], SubnetRights::ATTACH)),
+        ),
+    )
+    .unwrap();
+    let req = SubnetRenewRequest::sign(&device, &foreign, now()).unwrap();
+    assert_eq!(
+        answer_renewal(&req.to_bytes(), &ledger, &issuer, now()),
+        Err(Refusal::Invalid)
+    );
+}

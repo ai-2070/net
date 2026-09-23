@@ -75,6 +75,8 @@ pub mod portmap;
 
 // PSK-free Noise enrollment session: protocol, responder key and client.
 pub mod redeem;
+// Subnet leaf renewal (V3-2 task 5).
+pub mod renew;
 
 // Enrollment redemption listener over the shared ledger.
 pub mod service;

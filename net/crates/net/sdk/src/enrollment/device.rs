@@ -178,6 +178,35 @@ impl DeviceJoin {
         Ok(())
     }
 
+    /// Replace the installed subnet credentials with a renewed set. The set
+    /// must match the invite's signed offer for this device exactly (the
+    /// same check the original delivery passed); the rest of the bundle is
+    /// unchanged. Persisted before it takes effect.
+    pub fn replace_subnet_credentials(
+        &mut self,
+        set: &net::adapter::net::subnet::SubnetCredentialSet,
+    ) -> Result<(), DeviceJoinError> {
+        // A renewal completing after `leave` must not reinstall anything.
+        if let Some(at) = self.left_at {
+            return Err(DeviceJoinError::Left { at });
+        }
+        let Some(bundle) = &self.bundle else {
+            return Err(DeviceJoinError::Corrupt);
+        };
+        let renewed = bundle.clone().with_subnet_credentials(set);
+        renewed.verify_for(&self.invite, &self.intent)?;
+        let snapshot = encode(
+            &self.identity,
+            &self.invite,
+            &self.intent,
+            Some(&renewed),
+            None,
+        );
+        self.storage.replace(&snapshot)?;
+        self.bundle = Some(renewed);
+        Ok(())
+    }
+
     /// Leave the mesh: durably record the departure at `now` (Unix seconds)
     /// and erase the delivered bundle in the same write. Idempotent: returns
     /// `false` when this join had already left (the original time is kept).

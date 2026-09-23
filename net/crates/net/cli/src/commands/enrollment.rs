@@ -328,6 +328,19 @@ impl EnrollOwner {
         .map_err(|e| {
             connection_failure(format!("enrollment listener on TCP {}: {e}", self.bind))
         })?;
+        // Subnet leaves expire; enrolled devices renew them here, and only
+        // their own (the ledger names the device each invite was issued to).
+        let renewal = match &subnet {
+            Some(issuer) => Some(
+                net_sdk::enrollment::renew::serve_subnet_renewal(
+                    mesh.node(),
+                    self.ledger.clone(),
+                    issuer.clone(),
+                )
+                .map_err(|e| generic(format!("subnet renewal service: {e}")))?,
+            ),
+            None => None,
+        };
         // Relay fallback: register (and keep re-trying) in the background;
         // the node serves direct joiners whether or not the relay is up.
         let relay = match self.plan.relay {
@@ -352,6 +365,7 @@ impl EnrollOwner {
             context,
             tcp_mapping,
             relay,
+            _renewal: renewal,
             port_mapping: self.plan.port_mapping,
             created: self.created,
         })
@@ -548,6 +562,8 @@ pub(crate) struct RunningEnrollment {
     context: Arc<EnrollContext>,
     tcp_mapping: Option<net_sdk::enrollment::portmap::TcpMapping>,
     relay: Option<RelayLink>,
+    /// Serves subnet leaf renewal while this node issues subnet credentials.
+    _renewal: Option<net::adapter::net::mesh_rpc::ServeHandle>,
     port_mapping: bool,
     created: Vec<&'static str>,
 }
