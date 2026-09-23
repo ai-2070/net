@@ -1444,10 +1444,54 @@ Regressions:
   no-default; SDK `full`; `net-cli` all-targets) and rustdoc (root, SDK `full`,
   `net-cli`) are clean.
 
-**Next:** R2 phase 4, the natsim fallback rows:
-1. A relay host on the WAN side; a gateway with no mapping and forced direct
-   failure. Join relayed, with evidence identifying the relayed path.
-2. Relay down, mapping working. Join direct.
+#### R2 phase 4 — natsim fallback rows (receipt)
+
+**Receipt: PASS, `natsim-enroll` run 35808945349.** Both jobs pass. The `direct`
+job (R1c) is unchanged. The new `relay` job runs
+`tests/natsim/enroll/run_enroll_relay.sh`.
+
+**Topology.** The upnp home-router lab, where the gateway forwards nothing by
+itself; `relay serve` on the WAN at 10.99.0.10:3478; the agent at 10.99.0.12.
+Each row uses fresh device and agent state.
+
+| Row | Setup | Result and evidence |
+|---|---|---|
+| B | Relay down, router mapping working | The device starts with `relay_state` = `unavailable` and its token still names the relay. The agent joins with `enroll_path` = `direct` and `attach_path` = `direct`. Relay availability is not a prerequisite. |
+| C | Relay up, mapping working | Still `direct` for both, and the relay's `stopped` row shows `splices` = 0. Direct first. |
+| A | Relay up, direct forced dead (`--no-port-mapping`; the token names the router's public address, which forwards nothing) | `join` shows `enroll_path` = `relay` and `attach_path` = `relay`, and joined `up` shows `joined.path` = `relay`, with no flag on the agent's side. |
+
+Row A's evidence:
+- The relay's counters show `splices ≥ 1`, forwarded packets and an accepted
+  registration.
+- The gateway's conntrack (flushed first, since rows B and C leave DNAT'd direct
+  flows behind) shows:
+  - the device's outbound UDP from its mesh socket (7001 → relay 3478), which
+    is the registration;
+  - the device's outbound TCP to the relay, which is the splice dial-back;
+  - the agent's direct UDP attempt to 11.99.0.2:7001, `[UNREPLIED]`, which
+    proves direct was tried first;
+  - no flow reaching the device directly.
+
+Three iterations, none touching product code:
+1. SIGTERM went to the forked subshell of a backgrounded shell function rather
+   than the relay (now launched through `ip netns exec` directly).
+2. Stale conntrack entries from rows B and C tripped row A's "no direct flow"
+   check.
+3. The unreplied-direct-attempt assertion was added.
+
+`relay serve` now also stops cleanly on SIGTERM and reports
+`registrations_accepted`, `splices` and `splice_bytes` in its `stopped` row.
+
+This completes the user's reachability requirement in the lab:
+- direct operation without application forwarding (R1c);
+- forced direct failure with automatic relay fallback (row A);
+- no dependency on the relay for a viable direct path (rows B and C).
+
+**Next:** R2 phase 5 (later), a relayed-to-direct upgrade using the existing
+hole-punch machinery. Also still open: a deployed project relay to fill
+`DEFAULT_RELAY`; a TCP/443 last-resort tunnel for UDP-blocked networks; and
+the earlier open items (lifecycle fencing, selective subnet semantics, V2
+exact-head acceptance).
 Lifecycle fencing, selective subnet semantics and V2 exact-head acceptance
 remain open.
 
