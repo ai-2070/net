@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Standalone subnet join (NET_CLI_PLAN_V3 V3-2, task 3).
+//! Standalone subnet and organization joins (NET_CLI_PLAN_V3 V3-2, task 3
+//! and the org half).
 //!
 //! A device already on the mesh redeems a subnet-only link (an invite whose
-//! relations are exactly [`Relation::Subnet`]) over its existing session,
+//! relations are exactly [`Relation::Subnet`]) or an org-only link (exactly
+//! [`Relation::Org`]) over its existing session,
 //! instead of the enrollment endpoint: no PSK is delivered and no transport
 //! is set up. The device signs a [`SubnetRedeemRequest`] over the invite, the
 //! destination node and its issue time. The issuing node
@@ -22,14 +24,18 @@
 //! checks the credentials against the signed offer before persisting them.
 //! Renewal ([`super::renew`]) works unchanged for these invites.
 //!
+//! An org-only link delivers the membership certificate the operator signed
+//! for this exact claim at approval ([`super::org`]); the device adopts it.
+//!
 //! [`Relation::Subnet`]: super::invite::Relation::Subnet
+//! [`Relation::Org`]: super::invite::Relation::Org
 
 use std::path::Path;
 
 use net::adapter::net::behavior::enrollment_storage::{EnrollmentStorage, StorageError};
 use net::adapter::net::subnet::SubnetCredentialSet;
 
-use super::bundle::SubnetLeafIssuer;
+use super::bundle::{org_cert_matches, OrgCertSource, SubnetLeafIssuer};
 use super::device::DeviceJoinError;
 use super::invite::{MembershipInvite, RedemptionIntent, Relation, SubnetOffer};
 use super::redeem::Refusal;
@@ -38,8 +44,11 @@ use super::store::ClaimOutcome;
 use super::Reader;
 use crate::identity::{EntityId, Identity};
 
-/// nRPC service the issuing node serves standalone subnet redemption on.
-pub const SUBNET_REDEEM_SERVICE: &str = "net.enroll.subnet.redeem";
+/// nRPC service the issuing node serves standalone (subnet or org)
+/// redemption on.
+pub const STANDALONE_REDEEM_SERVICE: &str = "net.enroll.standalone.redeem";
+/// The same service, under its original name.
+pub const SUBNET_REDEEM_SERVICE: &str = STANDALONE_REDEEM_SERVICE;
 /// A redemption request is answered only within this window of its issue time.
 pub const REDEEM_FRESHNESS_SECS: u64 = 300;
 
@@ -49,6 +58,11 @@ const SIGNATURE_DOMAIN: &[u8] = b"net-mesh standalone subnet join v1";
 /// Whether `invite` is a standalone subnet link (subnet relation only).
 pub fn is_standalone_subnet(invite: &MembershipInvite) -> bool {
     invite.relations() == [Relation::Subnet] && invite.subnet().is_some()
+}
+
+/// Whether `invite` is a standalone organization link (org relation only).
+pub fn is_standalone_org(invite: &MembershipInvite) -> bool {
+    invite.relations() == [Relation::Org] && invite.org().is_some()
 }
 
 /// A device's signed request to redeem a standalone subnet link at one node.
@@ -151,12 +165,14 @@ impl SubnetRedeemRequest {
 pub enum SubnetRedeemReply {
     /// Credentials for exactly the offer, for this device.
     Issued(Box<SubnetCredentialSet>),
+    /// The org membership certificate approved for this device.
+    OrgIssued(Box<net::adapter::net::behavior::org::OrgMembershipCert>),
     /// The link requires operator approval; ask again once approved.
     PendingApproval,
 }
 
 impl SubnetRedeemReply {
-    /// Wire form: `0 ‖ credential set` or `1`.
+    /// Wire form: `0 ‖ credential set`, `1`, or `2 ‖ membership certificate`.
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Self::Issued(set) => {
@@ -165,6 +181,11 @@ impl SubnetRedeemReply {
                 out
             }
             Self::PendingApproval => vec![1u8],
+            Self::OrgIssued(cert) => {
+                let mut out = vec![2u8];
+                out.extend_from_slice(&cert.to_bytes());
+                out
+            }
         }
     }
 
@@ -175,20 +196,48 @@ impl SubnetRedeemReply {
                 .map(|set| Self::Issued(Box::new(set)))
                 .map_err(|e| format!("subnet credentials: {e}")),
             Some((1, [])) => Ok(Self::PendingApproval),
+            Some((2, cert)) => {
+                net::adapter::net::behavior::org::OrgMembershipCert::from_bytes(cert)
+                    .map(|cert| Self::OrgIssued(Box::new(cert)))
+                    .map_err(|e| format!("org membership certificate: {e}"))
+            }
             _ => Err("malformed standalone subnet reply".to_string()),
         }
     }
 }
 
-/// Issuing-node side. `session_subject` is the entity the delivering session
-/// has proven (`None` if it has proven none); `this_node` is this node's id.
-/// The caller must additionally refuse a subject its own floors removed.
+/// Issuing-node side, for a subnet-only link (see [`answer_standalone_redeem`]).
 pub fn answer_subnet_redeem(
     request_bytes: &[u8],
     session_subject: Option<&EntityId>,
     this_node: u64,
     ledger: &SharedLedger,
     issuer: &SubnetLeafIssuer,
+    now: u64,
+) -> Result<SubnetRedeemReply, Refusal> {
+    answer_standalone_redeem(
+        request_bytes,
+        session_subject,
+        this_node,
+        ledger,
+        Some(issuer),
+        None,
+        now,
+    )
+}
+
+/// Issuing-node side. `session_subject` is the entity the delivering session
+/// has proven (`None` if it has proven none); `this_node` is this node's id.
+/// A subnet-only link needs `subnet`; an org-only link needs `org`, which
+/// holds the certificates the operator signed at approval. The caller must
+/// additionally refuse a subject its own floors removed.
+pub fn answer_standalone_redeem(
+    request_bytes: &[u8],
+    session_subject: Option<&EntityId>,
+    this_node: u64,
+    ledger: &SharedLedger,
+    subnet: Option<&SubnetLeafIssuer>,
+    org: Option<&dyn OrgCertSource>,
     now: u64,
 ) -> Result<SubnetRedeemReply, Refusal> {
     let request = SubnetRedeemRequest::from_bytes(request_bytes)?;
@@ -210,10 +259,9 @@ pub fn answer_subnet_redeem(
         return Err(Refusal::Conflict);
     }
     let invite = request.invite()?;
-    if !is_standalone_subnet(&invite) {
+    if !is_standalone_subnet(&invite) && !is_standalone_org(&invite) {
         return Err(Refusal::Invalid);
     }
-    let offer = invite.subnet().ok_or(Refusal::Invalid)?;
     let intent = RedemptionIntent::for_invite(&invite, request.subject.clone())
         .map_err(|_| Refusal::Invalid)?;
     let claimant = intent.claimant();
@@ -225,47 +273,79 @@ pub fn answer_subnet_redeem(
     if ledger.invite_digest(&id).map_err(super::service::refusal)? != invite.digest() {
         return Err(Refusal::Invalid);
     }
+    // What this link delivers, now: fresh subnet credentials, or the
+    // certificate the operator approved for exactly this claim.
+    let deliver = || -> Result<SubnetRedeemReply, Refusal> {
+        if let Some(offer) = invite.subnet() {
+            let issuer = subnet.ok_or(Refusal::Unavailable)?;
+            return issuer
+                .issue(offer, &request.subject, now)
+                .map(|set| SubnetRedeemReply::Issued(Box::new(set)));
+        }
+        let offer = invite.org().ok_or(Refusal::Invalid)?;
+        org.and_then(|source| source.cert_for(&claimant))
+            .filter(|cert| org_cert_matches(offer, &request.subject, cert))
+            .map(|cert| SubnetRedeemReply::OrgIssued(Box::new(cert)))
+            .ok_or(Refusal::Unavailable)
+    };
     match ledger
         .claim(&id, &claimant, now)
         .map_err(super::service::refusal)?
     {
         ClaimOutcome::PendingApproval => Ok(SubnetRedeemReply::PendingApproval),
         ClaimOutcome::Ready => {
-            let set = issuer.issue(offer, &request.subject, now)?;
+            let reply = deliver()?;
+            let payload = match &reply {
+                SubnetRedeemReply::Issued(set) => set.to_bytes(),
+                SubnetRedeemReply::OrgIssued(cert) => cert.to_bytes(),
+                SubnetRedeemReply::PendingApproval => return Err(Refusal::Unavailable),
+            };
             ledger
-                .issue(&id, &claimant, &set.to_bytes(), now)
+                .issue(&id, &claimant, &payload, now)
                 .map_err(super::service::refusal)?;
-            Ok(SubnetRedeemReply::Issued(Box::new(set)))
+            Ok(reply)
         }
         // Issued before (a lost reply, or a restarted device). The ledger
         // answers `AlreadyIssued` only to the identical claimant, so this is
-        // the same device: it gets fresh credentials for the same offer, as
-        // renewal would. Any other claimant was refused by `claim` above.
+        // the same device: it gets fresh subnet credentials for the same
+        // offer (as renewal would), or the same approved certificate. Any
+        // other claimant was refused by `claim` above.
         ClaimOutcome::AlreadyIssued(_) => {
             drop(ledger);
-            issuer
-                .issue(offer, &request.subject, now)
-                .map(|set| SubnetRedeemReply::Issued(Box::new(set)))
+            deliver()
         }
     }
 }
 
-/// Serve standalone subnet redemption on [`SUBNET_REDEEM_SERVICE`]: bind the
-/// request to the entity the delivering session proved, answer with
-/// [`answer_subnet_redeem`], and refuse a subject this node's own floors
-/// removed from the offered scope. Drop the handle to stop serving.
+/// Serve standalone subnet redemption only (see [`serve_standalone_redeem`]).
 #[cfg(feature = "cortex")]
 pub fn serve_subnet_redeem(
     node: &std::sync::Arc<net::adapter::net::MeshNode>,
     ledger: SharedLedger,
     issuer: SubnetLeafIssuer,
 ) -> Result<net::adapter::net::mesh_rpc::ServeHandle, net::adapter::net::mesh_rpc::ServeError> {
+    serve_standalone_redeem(node, ledger, Some(issuer), None)
+}
+
+/// Serve standalone redemption on [`STANDALONE_REDEEM_SERVICE`]: bind the
+/// request to the entity the delivering session proved, answer with
+/// [`answer_standalone_redeem`], and refuse a subject this node's own subnet
+/// floors removed from an offered subnet scope. Subnet-only links need
+/// `subnet`, org-only links `org`. Drop the handle to stop serving.
+#[cfg(feature = "cortex")]
+pub fn serve_standalone_redeem(
+    node: &std::sync::Arc<net::adapter::net::MeshNode>,
+    ledger: SharedLedger,
+    subnet: Option<SubnetLeafIssuer>,
+    org: Option<std::sync::Arc<dyn OrgCertSource>>,
+) -> Result<net::adapter::net::mesh_rpc::ServeHandle, net::adapter::net::mesh_rpc::ServeError> {
     node.serve_rpc(
-        SUBNET_REDEEM_SERVICE,
+        STANDALONE_REDEEM_SERVICE,
         std::sync::Arc::new(RedeemHandler {
             node: std::sync::Arc::downgrade(node),
             ledger,
-            issuer,
+            subnet,
+            org,
         }),
     )
 }
@@ -274,7 +354,8 @@ pub fn serve_subnet_redeem(
 struct RedeemHandler {
     node: std::sync::Weak<net::adapter::net::MeshNode>,
     ledger: SharedLedger,
-    issuer: SubnetLeafIssuer,
+    subnet: Option<SubnetLeafIssuer>,
+    org: Option<std::sync::Arc<dyn OrgCertSource>>,
 }
 
 #[cfg(feature = "cortex")]
@@ -283,30 +364,32 @@ impl RedeemHandler {
         let node = self.node.upgrade().ok_or(Refusal::Unavailable)?;
         let request = SubnetRedeemRequest::from_bytes(body)?;
         let invite = request.invite()?;
-        let offer = invite.subnet().ok_or(Refusal::Invalid)?;
         // A delegated leaf never satisfies a subject floor: a removed device
         // gets nothing it could not use anyway, and nothing it should have.
-        if node.subnet_floor_registry().subject_refuses(
-            &offer.scope.authority,
-            offer.topology_epoch,
-            request.subject(),
-            offer.scope.path,
-            offer.rights,
-            0,
-            true,
-        ) {
-            return Err(Refusal::Revoked);
+        if let Some(offer) = invite.subnet() {
+            if node.subnet_floor_registry().subject_refuses(
+                &offer.scope.authority,
+                offer.topology_epoch,
+                request.subject(),
+                offer.scope.path,
+                offer.rights,
+                0,
+                true,
+            ) {
+                return Err(Refusal::Revoked);
+            }
         }
         let proven = node
             .peer_identity_established(session_peer)
             .then(|| node.peer_entity_id(session_peer))
             .flatten();
-        answer_subnet_redeem(
+        answer_standalone_redeem(
             body,
             proven.as_ref(),
             node.node_id(),
             &self.ledger,
-            &self.issuer,
+            self.subnet.as_ref(),
+            self.org.as_deref(),
             super::now_unix(),
         )
         .map(|reply| reply.to_bytes())

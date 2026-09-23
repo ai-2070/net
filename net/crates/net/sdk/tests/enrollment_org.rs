@@ -229,3 +229,113 @@ fn the_device_accepts_only_a_membership_of_the_offered_org_for_itself() {
         Err(BundleError::Mismatch("org membership"))
     ));
 }
+
+/// O1b: an org-only link redeemed over the device's session. Pending until
+/// the operator approves with a certificate for exactly this claim; then the
+/// device proven on the session gets that certificate (again, on a repeat);
+/// another device, a mesh+org link, or a node holding no approved
+/// certificates gets nothing.
+#[test]
+fn a_standalone_org_link_delivers_the_approved_certificate_over_the_session() {
+    use net_sdk::enrollment::service::SharedLedger;
+    use net_sdk::enrollment::standalone::{
+        answer_standalone_redeem, is_standalone_org, SubnetRedeemReply, SubnetRedeemRequest,
+    };
+
+    const NODE: u64 = 0x0A11_CE01;
+    let operator = Identity::generate();
+    let org = OrgKeypair::generate();
+    let offer = OrgOffer { org: org.org_id() };
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger: SharedLedger = Arc::new(parking_lot::Mutex::new(
+        EnrollmentLedger::create(
+            &tmp.path().join("ledger"),
+            operator.entity_id().clone(),
+            LedgerLimits::default(),
+        )
+        .unwrap(),
+    ));
+    let sign = |relations| {
+        let invite = MembershipInvite::sign(
+            &operator,
+            spec(relations, Some(offer), ApprovalMode::RequireApproval),
+        )
+        .unwrap();
+        let offer_id = ledger.lock().offer(invite.offer_spec(), now()).unwrap();
+        (invite, offer_id)
+    };
+    let (link, offer_id) = sign(vec![Relation::Org]);
+    assert!(is_standalone_org(&link));
+    let stash = OrgCertStash::new(tmp.path().join("org-certs"));
+    let device = Identity::generate();
+    let request = |who: &Identity, invite: &MembershipInvite| {
+        SubnetRedeemRequest::sign(who, invite, NODE, now())
+            .unwrap()
+            .to_bytes()
+    };
+    let answer = |bytes: &[u8], proven: &Identity, source: Option<&OrgCertStash>| {
+        answer_standalone_redeem(
+            bytes,
+            Some(proven.entity_id()),
+            NODE,
+            &ledger,
+            None,
+            source.map(|s| s as &dyn net_sdk::enrollment::bundle::OrgCertSource),
+            now(),
+        )
+    };
+
+    // First ask: pending operator approval.
+    assert_eq!(
+        answer(&request(&device, &link), &device, Some(&stash)),
+        Ok(SubnetRedeemReply::PendingApproval)
+    );
+    // The operator signs for exactly this claim, then approves it.
+    let claimant = ledger.lock().pending_claim(&offer_id).unwrap().unwrap();
+    assert_eq!(&claimant.subject, device.entity_id());
+    ledger.lock().approve(&offer_id, &claimant, now()).unwrap();
+    // A certificate of another org, even for this device, is not delivered.
+    let foreign =
+        OrgMembershipCert::try_issue(&OrgKeypair::generate(), device.entity_id().clone(), 0, YEAR)
+            .unwrap();
+    stash.put(&claimant, &foreign).unwrap();
+    assert_eq!(
+        answer(&request(&device, &link), &device, Some(&stash)),
+        Err(Refusal::Unavailable)
+    );
+    let cert = OrgMembershipCert::try_issue(&org, device.entity_id().clone(), 0, YEAR).unwrap();
+    stash.put(&claimant, &cert).unwrap();
+
+    // A node holding no approved certificates cannot deliver one.
+    assert_eq!(
+        answer(&request(&device, &link), &device, None),
+        Err(Refusal::Unavailable)
+    );
+    let delivered = answer(&request(&device, &link), &device, Some(&stash)).unwrap();
+    assert_eq!(
+        delivered,
+        SubnetRedeemReply::OrgIssued(Box::new(cert.clone()))
+    );
+    // Survives the wire.
+    assert_eq!(
+        SubnetRedeemReply::from_bytes(&delivered.to_bytes()).unwrap(),
+        delivered
+    );
+    // Asked again (a lost reply): the same certificate.
+    assert_eq!(
+        answer(&request(&device, &link), &device, Some(&stash)),
+        Ok(SubnetRedeemReply::OrgIssued(Box::new(cert)))
+    );
+    // Another device, over its own proven session, gets nothing.
+    let other = Identity::generate();
+    assert_eq!(
+        answer(&request(&other, &link), &other, Some(&stash)),
+        Err(Refusal::Conflict)
+    );
+    // A link that also carries the mesh relation is not standalone.
+    let (full, _) = sign(vec![Relation::Mesh, Relation::Org]);
+    assert_eq!(
+        answer(&request(&device, &full), &device, Some(&stash)),
+        Err(Refusal::Invalid)
+    );
+}

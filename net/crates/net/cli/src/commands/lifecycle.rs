@@ -364,6 +364,9 @@ async fn keep_standalone_admitted(
                     Ok(SubnetRedeemReply::PendingApproval) => {
                         entry.detail = Some("awaiting operator approval".to_string());
                     }
+                    Ok(SubnetRedeemReply::OrgIssued(_)) => {
+                        entry.detail = Some("the node answered with an org membership".to_string());
+                    }
                     Err(e) => entry.detail = Some(e),
                 }
                 link.lock().standalone.insert(key, entry);
@@ -1402,6 +1405,9 @@ async fn subnet_join(state: &ControlState, request: &serde_json::Value) -> serde
                     Some(Err(e)) => return error(format!("credentials not installed: {e}")),
                     None => return error("node is draining".to_string()),
                 }
+            }
+            Ok(SubnetRedeemReply::OrgIssued(_)) => {
+                return error("the node answered with an org membership".to_string())
             }
             Err(e) => return error(format!("redemption failed: {e}")),
         },
