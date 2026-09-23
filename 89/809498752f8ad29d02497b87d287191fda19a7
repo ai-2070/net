@@ -1,0 +1,49 @@
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_503cdf8ea5149f 1141,1153-1161,1223-1277
+net/crates/net/src/adapter/net/mesh.rs
+  s_3f3d4c91f992be::t_e965562cda665f 2563-2569,12505-12511,14439-14440,26284-26285,27717-27725,27758-27762,27768-27786
+  s_3f3d4c91f992be::t_af42a4b711592a 27763-27767
+  s_3f3d4c91f992be::t_485670dc772eed 27787,47504-47517,47537,47559,47564-47623
+  s_3f3d4c91f992be::t_baeb976513f980 27788,47503,47624
+net/crates/net/src/adapter/net/traversal/blind_relay.rs
+  s_3f3d4c91f992be::t_485670dc772eed 831-840,846-865
+  s_3f3d4c91f992be::t_096c2df46e9916 798-801,841-845,1240-1329
+  s_3f3d4c91f992be::t_cc4e15d9350938 707-797,802-830
+  s_3f3d4c91f992be::t_10b4f2f13bd73b 952-957
+net/crates/net/cli/src/main.rs
+  s_3f3d4c91f992be::t_abbd6dfd05a1e0 165-168,379
+net/crates/net/cli/src/commands/relay.rs
+  s_3f3d4c91f992be::t_6bdfe9a58a8562 1-62,68-90
+  s_3f3d4c91f992be::t_614fd803c1d139 63-67
+net/crates/net/cli/src/commands/mod.rs
+  s_3f3d4c91f992be::t_614fd803c1d139 37
+net/crates/net/src/adapter/net/transport.rs
+  s_3f3d4c91f992be::t_62147b2733cb69 415-418,421-425,441-447,481-484,523-525
+  s_3f3d4c91f992be::t_10b4f2f13bd73b 419-420
+  s_3f3d4c91f992be::t_f5fdc2c6eda026 526
+net/crates/net/cli/tests/relay_serve.rs
+  s_3f3d4c91f992be::t_d367f599847e30 1-26,35-98
+  s_3f3d4c91f992be::t_614fd803c1d139 27-34
+net/crates/net/src/adapter/net/router.rs
+  s_3f3d4c91f992be::t_29a61d1039a00f 1002-1008,1120-1124,1177-1182,1186
+  s_3f3d4c91f992be::t_917b67f05013cc 1063-1064
+net/crates/net/wire/src/peer_addr.rs
+  s_3f3d4c91f992be::t_00d020228737ac 37-69,108-117,127,148,152-160,165-172,177-179
+  s_3f3d4c91f992be::t_10b4f2f13bd73b 161-164,173-176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "89809498752f8ad29d02497b87d287191fda19a7",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
