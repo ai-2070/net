@@ -395,10 +395,10 @@ fn a_joined_node_renews_its_subnet_leaf_and_removal_stops_renewal() {
     drop(node);
 
     // Stopped past expiry: the next start renews first, then is admitted.
-    // Also past the operator's session lapse: the renewal's nRPC streams
-    // keep the killed node's old session busy (deferring its re-handshake)
-    // for up to the 30 s session timeout.
-    wait_past(second + SESSION_LAPSE);
+    // The renewal's nRPC streams leave the killed node's old session busy
+    // at the operator, but the node no longer speaks on it, so its
+    // re-handshake is not deferred for the whole session timeout.
+    wait_past(second);
     let node = agent.up(&[]);
     let jsub = &node.ready["joined"]["subnet"];
     assert_eq!(jsub["renewed"], true, "{}", node.ready);
@@ -419,7 +419,7 @@ fn a_joined_node_renews_its_subnet_leaf_and_removal_stops_renewal() {
         .output()
         .unwrap();
     assert!(removed.status.success(), "{removed:?}");
-    wait_past(third + SESSION_LAPSE);
+    wait_past(third);
     let node = agent.up(&[]);
     let jsub = &node.ready["joined"]["subnet"];
     assert_eq!(jsub["renewed"], false, "{}", node.ready);
@@ -430,11 +430,6 @@ fn a_joined_node_renews_its_subnet_leaf_and_removal_stops_renewal() {
     );
     assert_eq!(jsub["admitted"], false, "{}", node.ready);
 }
-
-/// Seconds past a leaf's expiry by which the operator's session with the
-/// (killed) node that renewed it has lapsed: renewal happens at most 15 s
-/// (the leaf TTL) before expiry, plus the 30 s session timeout.
-const SESSION_LAPSE: u64 = 17;
 
 /// Sleep until the wall clock is past `at` (Unix seconds).
 fn wait_past(at: u64) {

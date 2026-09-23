@@ -1231,6 +1231,7 @@ impl NetAdapter {
                 if !rx_cipher.try_admit_rx_counter(counter) {
                     return;
                 }
+                session.note_inbound();
                 d
             }
             Err(_) => return,

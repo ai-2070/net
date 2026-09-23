@@ -1954,6 +1954,7 @@ fn routed_rotation_outcome(
     new_static: &[u8; 32],
     new_ephemeral: &[u8; 32],
     session_timeout: Duration,
+    busy_liveness: Duration,
 ) -> RoutedRotationOutcome {
     if existing.remote_static_pub == *new_static {
         // Same peer (by static). Distinguish exact-replay msg1
@@ -1963,15 +1964,20 @@ fn routed_rotation_outcome(
             return RoutedRotationOutcome::DropReplay;
         }
         // Legitimate re-handshake. Normally rotates — but if the
-        // existing session is live (not idle past `session_timeout`)
-        // and busy (open streams or unacked in-flight data), defer:
-        // swapping now would drop that in-flight state (C3). Keying
-        // liveness on `is_timed_out` bounds the deferral to
-        // `session_timeout` — a genuinely dead path (e.g. the peer's
-        // NAT rebound) stops delivering inbound, times out, and the
-        // next re-handshake rotates, so recovery is never blocked
-        // for longer than a fresh-static rotation would be.
-        let live = !existing.session.is_timed_out(session_timeout);
+        // existing session is live and busy (open streams or unacked
+        // in-flight data), defer: swapping now would drop that
+        // in-flight state (C3).
+        //
+        // Live means the PEER has spoken on it recently: an
+        // authenticated inbound packet within `busy_liveness` (a few
+        // heartbeat intervals). Our own sends do not count. A peer
+        // mid-transfer keeps heartbeating, so its transfer stays
+        // protected; a peer that restarted (or whose path died, e.g.
+        // a NAT rebind) abandoned this session and falls silent at
+        // once, so its re-handshake rotates within `busy_liveness`
+        // rather than waiting out the whole `session_timeout` behind
+        // streams it can no longer use.
+        let live = existing.session.heard_within(busy_liveness);
         let busy = session_is_busy(&existing.session);
         if live && busy {
             return RoutedRotationOutcome::DeferBusy;
@@ -2484,6 +2490,10 @@ struct DispatchCtx {
     /// session's keys until the existing session has gone silent for
     /// at least this long. See `routed_rotation_outcome`.
     session_timeout: Duration,
+    /// How recently the peer must have spoken on a busy session for the
+    /// rotation gate to defer its re-handshake (C3): three heartbeat
+    /// intervals, never more than `session_timeout`.
+    busy_liveness: Duration,
     /// Subscriber roster for channel fan-out.
     roster: Arc<SubscriberRoster>,
     /// Channel config registry used to authorize incoming Subscribe.
@@ -19998,7 +20008,7 @@ impl MeshNode {
     pub fn peer_session_is_silent(&self, node_id: u64) -> bool {
         self.peers
             .get(&node_id)
-            .is_some_and(|p| p.session.is_timed_out(self.config.session_timeout))
+            .is_some_and(|p| !p.session.heard_within(self.config.session_timeout))
     }
 
     /// A pending unary call must not outlive its receive incarnation. The
@@ -26716,6 +26726,11 @@ impl MeshNode {
             packet_pool_size: self.config.packet_pool_size,
             default_reliable: self.config.default_reliable,
             session_timeout: self.config.session_timeout,
+            busy_liveness: self
+                .config
+                .heartbeat_interval
+                .saturating_mul(3)
+                .min(self.config.session_timeout),
             roster: self.roster.clone(),
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
@@ -29312,6 +29327,7 @@ impl MeshNode {
                                 &remote_static_pub,
                                 &initiator_ephemeral,
                                 ctx.session_timeout,
+                                ctx.busy_liveness,
                             ) {
                                 RoutedRotationOutcome::DropReplay => {
                                     tracing::warn!(
@@ -29732,6 +29748,7 @@ impl MeshNode {
                 if !rx_cipher.try_admit_rx_counter(counter) {
                     return;
                 }
+                session.note_inbound();
                 d
             }
             Err(_) => return,
@@ -53335,7 +53352,13 @@ mod heartbeat_aead_tests {
             admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         assert_eq!(
-            routed_rotation_outcome(&info, &static_a, &ephemeral_a, Duration::from_secs(30)),
+            routed_rotation_outcome(
+                &info,
+                &static_a,
+                &ephemeral_a,
+                Duration::from_secs(30),
+                Duration::from_secs(30)
+            ),
             RoutedRotationOutcome::DropReplay,
         );
     }
@@ -53364,7 +53387,13 @@ mod heartbeat_aead_tests {
             admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         assert_eq!(
-            routed_rotation_outcome(&info, &static_a, &ephemeral_new, Duration::from_secs(30)),
+            routed_rotation_outcome(
+                &info,
+                &static_a,
+                &ephemeral_new,
+                Duration::from_secs(30),
+                Duration::from_secs(30)
+            ),
             RoutedRotationOutcome::AcceptRotation,
         );
     }
@@ -53394,7 +53423,13 @@ mod heartbeat_aead_tests {
         let new_static = [0xBBu8; 32];
         let new_ephemeral = [0xDDu8; 32];
         assert_eq!(
-            routed_rotation_outcome(&info, &new_static, &new_ephemeral, Duration::from_secs(30),),
+            routed_rotation_outcome(
+                &info,
+                &new_static,
+                &new_ephemeral,
+                Duration::from_secs(30),
+                Duration::from_secs(30)
+            ),
             RoutedRotationOutcome::RefuseFresh,
         );
     }
@@ -53426,7 +53461,13 @@ mod heartbeat_aead_tests {
         let new_static = [0xBBu8; 32];
         let new_ephemeral = [0xDDu8; 32];
         assert_eq!(
-            routed_rotation_outcome(&info, &new_static, &new_ephemeral, Duration::from_millis(1),),
+            routed_rotation_outcome(
+                &info,
+                &new_static,
+                &new_ephemeral,
+                Duration::from_millis(1),
+                Duration::from_millis(1)
+            ),
             RoutedRotationOutcome::AcceptRotation,
         );
     }
@@ -53455,7 +53496,13 @@ mod heartbeat_aead_tests {
         };
         // Same static, fresh ephemeral, live (30 s timeout) + busy.
         assert_eq!(
-            routed_rotation_outcome(&info, &static_a, &[0xDDu8; 32], Duration::from_secs(30)),
+            routed_rotation_outcome(
+                &info,
+                &static_a,
+                &[0xDDu8; 32],
+                Duration::from_secs(30),
+                Duration::from_secs(30)
+            ),
             RoutedRotationOutcome::DeferBusy,
         );
     }
@@ -53488,6 +53535,7 @@ mod heartbeat_aead_tests {
                 &info(session.clone()),
                 &static_a,
                 &[0xDDu8; 32],
+                Duration::from_secs(30),
                 Duration::from_secs(30)
             ),
             RoutedRotationOutcome::AcceptRotation,
@@ -53499,10 +53547,67 @@ mod heartbeat_aead_tests {
                 &info(session),
                 &static_a,
                 &[0xDDu8; 32],
+                Duration::from_secs(30),
                 Duration::from_secs(30)
             ),
             RoutedRotationOutcome::DeferBusy,
             "an application stream still defers",
+        );
+    }
+
+    /// C3 liveness is the PEER speaking, not the session being young: a
+    /// busy session whose peer has gone quiet (it restarted, or its path
+    /// died) rotates on its re-handshake well before `session_timeout`,
+    /// even while this side keeps sending on it; a busy session whose
+    /// peer is still speaking (e.g. mid-transfer, heartbeating) defers.
+    #[test]
+    fn busy_rotation_defers_only_while_the_peer_is_speaking() {
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        session.get_or_create_stream(0xABCD);
+        let static_a = [0xAAu8; 32];
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            transport: PeerTransport::Direct { owned: addr },
+            session: session.clone(),
+            remote_static_pub: static_a,
+            last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
+        };
+        let outcome = || {
+            routed_rotation_outcome(
+                &info,
+                &static_a,
+                &[0xDDu8; 32],
+                Duration::from_secs(30),
+                Duration::from_millis(20),
+            )
+        };
+        assert_eq!(
+            outcome(),
+            RoutedRotationOutcome::DeferBusy,
+            "fresh: speaking"
+        );
+
+        // The peer falls silent; our own sends keep the session from
+        // timing out, but they are not the peer speaking.
+        std::thread::sleep(Duration::from_millis(40));
+        session.touch();
+        assert!(!session.is_timed_out(Duration::from_secs(30)));
+        assert_eq!(
+            outcome(),
+            RoutedRotationOutcome::AcceptRotation,
+            "a silent peer's re-handshake must not wait out session_timeout",
+        );
+
+        // The peer speaks again (an authenticated packet): defer again.
+        session.note_inbound();
+        assert_eq!(
+            outcome(),
+            RoutedRotationOutcome::DeferBusy,
+            "speaking again"
         );
     }
 
@@ -53576,7 +53681,13 @@ mod heartbeat_aead_tests {
         // Let the session go idle past a 1 ms timeout — not live.
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(
-            routed_rotation_outcome(&info, &static_a, &[0xDDu8; 32], Duration::from_millis(1)),
+            routed_rotation_outcome(
+                &info,
+                &static_a,
+                &[0xDDu8; 32],
+                Duration::from_millis(1),
+                Duration::from_millis(1)
+            ),
             RoutedRotationOutcome::AcceptRotation,
         );
     }
