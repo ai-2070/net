@@ -91,9 +91,17 @@ export interface OrgCallOptions {
    * and on wake an overdue call retires with its deadline terminal.
    */
   deadlineMs?: number;
-  /** Initial response-direction flow-control window, bytes. */
+  /**
+   * Initial response-direction flow-control window, **chunk
+   * credits** — the wire header's unit: one credit permits one item
+   * frame, whatever the item's byte size. NOT bytes; a byte count
+   * here reads as a huge credit budget and nothing ever parks.
+   */
   streamWindowInitial?: number;
-  /** Initial request-direction flow-control window, bytes. */
+  /**
+   * Initial request-direction flow-control window, **chunk
+   * credits** (as {@link OrgCallOptions.streamWindowInitial}).
+   */
   requestWindowInitial?: number;
 }
 

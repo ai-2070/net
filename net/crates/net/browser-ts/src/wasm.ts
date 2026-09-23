@@ -224,11 +224,20 @@ export interface LeafWasmOrgCredentials {
 /** `call_org*`'s options object. */
 export interface LeafWasmOrgCallOptions {
   credentials: LeafWasmOrgCredentials;
-  /** Absolute deadline for the call, milliseconds. */
+  /**
+   * The call's deadline, milliseconds.
+   */
   deadlineMs?: number;
-  /** Initial response-direction flow-control window, bytes. */
+  /**
+   * Initial response-direction flow-control window, **chunk
+   * credits** — one credit permits one item frame (the wire header's
+   * unit). NOT bytes.
+   */
   streamWindowInitial?: number;
-  /** Initial request-direction flow-control window, bytes. */
+  /**
+   * Initial request-direction flow-control window, **chunk credits**
+   * (as {@link LeafWasmOrgCallOptions.streamWindowInitial}).
+   */
   requestWindowInitial?: number;
 }
 
