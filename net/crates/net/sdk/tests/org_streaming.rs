@@ -40,6 +40,19 @@ use net_sdk::mesh_rpc::{RequestStreamTyped, ResponseSinkTyped};
 use net_sdk::org::types::*;
 use net_sdk::org::{CoarseAdmissionReason, OrgAccess, OrgCaller, OrgCredentials, OrgSdkError};
 
+// S3_R — the fold-seam drive (the `org_rpc_streaming` s13 idiom) for the
+// deadline witness: `RpcServerStreamingFold::apply_inbound_admitted` takes the
+// §2.1 lifetime inputs DIRECTLY, which is the only way to run a provider whose
+// `default_live` is materially shorter than 300 s (the production bridges pin
+// `StreamLifetimePolicy::q1_defaults()`; see `## 7` of the S1_REPORT).
+use net::adapter::net::behavior::admission_clock::ClockSample;
+use net::adapter::net::cortex::rpc::{
+    encode_rpc_route, RpcAsyncResponseEmitter, RpcInboundEvent, RpcRequestPayload,
+    RpcServerStreamingFold, StreamCallLifetime, StreamDeadlineBound, StreamLifetimePolicy,
+    DISPATCH_RPC_REQUEST,
+};
+use net::adapter::net::cortex::EventMeta;
+
 // ---------------------------------------------------------------------------
 // Message shapes
 // ---------------------------------------------------------------------------
@@ -1543,6 +1556,758 @@ async fn revocation_surfaces_as_final_admission_denied_item() {
         ran.load(Ordering::SeqCst),
         1,
         "the handler ran once and was retired by the raise"
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+// ---------------------------------------------------------------------------
+// 11. S3_R Row 1 (F-S3R-1) — the Granted FACADE serve arms: a granted caller
+//     completes streaming, client-streaming AND duplex through handlers
+//     registered with `OrgAccess::Granted` (exact payloads + four-party
+//     attribution). Each leg carries ITS OWN named assertion, so each of the
+//     three `OrgAccess::Granted` dispatch arms' inverses (→
+//     `serve_rpc_owner_scoped_*`) reddens exactly its own leg.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn granted_facade_streaming_serve_rows_complete_cross_org() {
+    // Three services (a service name holds ONE registration) — and one
+    // DISCOVER|INVOKE grant per capability, provisioned like `granted_fixture`.
+    let (a, b) = (org_a(), org_b());
+    let (provider, _p_identity, p_dir) = fast_mesh("s3r-gf-provider", &b, None).await;
+    let (caller, c_identity, c_dir) = fast_mesh("s3r-gf-caller", &a, None).await;
+    bring_up(&caller, &provider).await;
+    let (ss_service, cs_service, dx_service) = (
+        "customer.read.stream",
+        "customer.read.upload",
+        "customer.read.duplex",
+    );
+    let served_by = provider.node_id();
+    let mut grants = Vec::new();
+    let mut secrets = Vec::new();
+    let mut grant_ids = Vec::new();
+    for service in [ss_service, cs_service, dx_service] {
+        let (grant, secret) = discover_grant(&b, a.org_id(), cap(&format!("nrpc:{service}")), 3600);
+        let provider_secret =
+            OrgAudienceSecret::decode_config(&secret.encode_config()).expect("copy secret");
+        provider
+            .node()
+            .install_provider_grant_audience(grant.clone(), provider_secret)
+            .expect("provider audience");
+        grant_ids.push(grant.grant_id);
+        grants.push(grant);
+        secrets.push(secret);
+    }
+
+    let ss_counters = Counters::default();
+    let ss_attr = attribution_for(&c_identity, &provider, ss_service, a.org_id(), b.org_id());
+    let ss_check = ss_counters.clone();
+    let _ss = provider
+        .serve_org_streaming(
+            ss_service,
+            OrgAccess::Granted,
+            move |_c: OrgCaller, _req: Ping, sink: ResponseSinkTyped<Item>| {
+                let (ss_attr, ss_check) = (ss_attr.clone(), ss_check.clone());
+                async move {
+                    ss_check
+                        .attribution_ok
+                        .store(ss_attr.matches_caller(&_c), Ordering::SeqCst);
+                    ss_check.ran.fetch_add(1, Ordering::SeqCst);
+                    sink.send(&Item { n: 0, served_by })?;
+                    sink.send(&Item { n: 1, served_by })?;
+                    Ok(())
+                }
+            },
+        )
+        .expect("serve_org_streaming(Granted)");
+
+    let cs_counters = Counters::default();
+    let cs_attr = attribution_for(&c_identity, &provider, cs_service, a.org_id(), b.org_id());
+    let cs_check = cs_counters.clone();
+    let _cs = provider
+        .serve_org_client_stream(
+            cs_service,
+            OrgAccess::Granted,
+            move |c: OrgCaller, mut requests: RequestStreamTyped<Ping>| {
+                let (cs_attr, cs_check) = (cs_attr.clone(), cs_check.clone());
+                async move {
+                    cs_check
+                        .attribution_ok
+                        .store(cs_attr.matches_caller(&c), Ordering::SeqCst);
+                    cs_check.ran.fetch_add(1, Ordering::SeqCst);
+                    let mut seen = Vec::new();
+                    while let Some(item) = requests.next().await {
+                        let ping = item.map_err(|e| format!("decode: {e}"))?;
+                        seen.push(ping.n);
+                    }
+                    Ok(UploadSummary {
+                        chunks: seen.len(),
+                        seen,
+                        served_by,
+                    })
+                }
+            },
+        )
+        .expect("serve_org_client_stream(Granted)");
+
+    let dx_counters = Counters::default();
+    let dx_attr = attribution_for(&c_identity, &provider, dx_service, a.org_id(), b.org_id());
+    let dx_check = dx_counters.clone();
+    let _dx = provider
+        .serve_org_duplex(
+            dx_service,
+            OrgAccess::Granted,
+            move |c: OrgCaller,
+                  mut requests: RequestStreamTyped<Ping>,
+                  sink: ResponseSinkTyped<Item>| {
+                let (dx_attr, dx_check) = (dx_attr.clone(), dx_check.clone());
+                async move {
+                    dx_check
+                        .attribution_ok
+                        .store(dx_attr.matches_caller(&c), Ordering::SeqCst);
+                    dx_check.ran.fetch_add(1, Ordering::SeqCst);
+                    while let Some(item) = requests.next().await {
+                        let ping = item.map_err(|e| format!("decode: {e}"))?;
+                        sink.send(&Item {
+                            n: ping.n,
+                            served_by,
+                        })?;
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .expect("serve_org_duplex(Granted)");
+
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let credentials = OrgCredentials::new(cert, dg, grants, secrets).expect("credentials");
+    let org = caller.org(credentials).expect("bind");
+    // Each leg resolves ITS OWN grant plane first and folds that resolution
+    // into its own named assertion — so each `OrgAccess::Granted` arm's
+    // inverse reddens exactly that leg's named assertion, never a shared
+    // precondition.
+
+    // ---- leg 1: server-streaming through the Granted arm ----
+    let resolved = converge(
+        &provider,
+        &caller,
+        &cap(&format!("nrpc:{ss_service}")),
+        &[grant_ids[0]],
+        1,
+    )
+    .await;
+    let mut items: Vec<Item> = Vec::new();
+    let mut failure: Option<String> = None;
+    match org
+        .call_streaming::<Ping, Item>(ss_service, &Ping { n: 3 })
+        .await
+    {
+        Err(e) => failure = Some(format!("opening refused: {e:?}")),
+        Ok(mut stream) => {
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(i) => items.push(i),
+                    Err(e) => failure = Some(format!("stream item error: {e:?}")),
+                }
+            }
+        }
+    }
+    assert_eq!(
+        (
+            resolved,
+            failure.is_none(),
+            &items,
+            ss_counters.attribution_ok.load(Ordering::SeqCst),
+            ss_counters.ran.load(Ordering::SeqCst),
+        ),
+        (
+            true,
+            true,
+            &vec![Item { n: 0, served_by }, Item { n: 1, served_by }],
+            true,
+            1
+        ),
+        "granted_facade_streaming_serve_rows_complete_cross_org: a granted \
+         caller resolves and completes server-streaming through \
+         Mesh::serve_org_streaming (OrgAccess::Granted) — exact payloads and \
+         four-party attribution (S acted for A under B's grant on exact P); \
+         failure {failure:?}"
+    );
+
+    // ---- leg 2: client-streaming through the Granted arm ----
+    let resolved = converge(
+        &provider,
+        &caller,
+        &cap(&format!("nrpc:{cs_service}")),
+        &[grant_ids[1]],
+        1,
+    )
+    .await;
+    let mut failure: Option<String> = None;
+    let mut summary: Option<UploadSummary> = None;
+    match org
+        .call_client_stream::<Ping, UploadSummary>(cs_service)
+        .await
+    {
+        Err(e) => failure = Some(format!("opening refused: {e:?}")),
+        Ok(mut call) => {
+            if let Err(e) = call.send(&Ping { n: 10 }).await {
+                failure = Some(format!("send refused: {e:?}"));
+            } else if let Err(e) = call.send(&Ping { n: 20 }).await {
+                failure = Some(format!("send refused: {e:?}"));
+            } else {
+                match call.finish().await {
+                    Ok(s) => summary = Some(s),
+                    Err(e) => failure = Some(format!("terminal refused: {e:?}")),
+                }
+            }
+        }
+    }
+    assert_eq!(
+        (
+            resolved,
+            failure.is_none(),
+            &summary,
+            cs_counters.attribution_ok.load(Ordering::SeqCst),
+            cs_counters.ran.load(Ordering::SeqCst),
+        ),
+        (
+            true,
+            true,
+            &Some(UploadSummary {
+                chunks: 2,
+                seen: vec![10, 20],
+                served_by,
+            }),
+            true,
+            1,
+        ),
+        "granted_facade_streaming_serve_rows_complete_cross_org: a granted \
+         caller resolves and completes client-streaming through \
+         Mesh::serve_org_client_stream (OrgAccess::Granted) — the exact typed \
+         UploadSummary and four-party attribution (S acted for A under B's \
+         grant on exact P); failure {failure:?}"
+    );
+
+    // ---- leg 3: duplex through the Granted arm ----
+    let resolved = converge(
+        &provider,
+        &caller,
+        &cap(&format!("nrpc:{dx_service}")),
+        &[grant_ids[2]],
+        1,
+    )
+    .await;
+    let mut items: Vec<Item> = Vec::new();
+    let mut failure: Option<String> = None;
+    match org.call_duplex::<Ping, Item>(dx_service).await {
+        Err(e) => failure = Some(format!("opening refused: {e:?}")),
+        Ok(call) => {
+            let (mut sink, mut stream) = call.into_split();
+            if let Err(e) = sink.send(&Ping { n: 8 }).await {
+                failure = Some(format!("send refused: {e:?}"));
+            } else if let Err(e) = sink.send(&Ping { n: 9 }).await {
+                failure = Some(format!("send refused: {e:?}"));
+            } else if let Err(e) = sink.finish_sending().await {
+                failure = Some(format!("half-close refused: {e:?}"));
+            } else {
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(i) => items.push(i),
+                        Err(e) => failure = Some(format!("stream item error: {e:?}")),
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        (
+            resolved,
+            failure.is_none(),
+            &items,
+            dx_counters.attribution_ok.load(Ordering::SeqCst),
+            dx_counters.ran.load(Ordering::SeqCst),
+        ),
+        (
+            true,
+            true,
+            &vec![Item { n: 8, served_by }, Item { n: 9, served_by }],
+            true,
+            1
+        ),
+        "granted_facade_streaming_serve_rows_complete_cross_org: a granted \
+         caller resolves and completes duplex through Mesh::serve_org_duplex \
+         (OrgAccess::Granted) — exact echoed payloads and four-party \
+         attribution (S acted for A under B's grant on exact P); failure \
+         {failure:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+// ---------------------------------------------------------------------------
+// 12. S3_R Row 2 (F-S3R-2) — the Q1 facade default deadline: a facade call
+//     (which passes `deadline_ms == 0`) carries the facade's 300 s default as
+//     an EXPLICIT deadline, and that deadline keeps delivering past a
+//     provider whose `default_live` is materially shorter (400 ms).
+//
+//     The production bridges pin `StreamLifetimePolicy::q1_defaults()` (the
+//     provider knob Q1 names is startup configuration and was not added), so
+//     the short-default provider is driven at the FOLD SEAM (the preserved
+//     `org_rpc_streaming` s13 idiom): the REAL facade call's REQUEST payload —
+//     captured verbatim at the live provider's handler — is admitted under
+//     `default_live_ns = 400 ms`. The named inverse (the `deadline_ms == 0`
+//     arm producing no CallOptions deadline) turns the captured payload's
+//     `deadline_ns` to 0 — the forbidden "none" semantics — and the short
+//     default then retires the call at 400 ms, reddening the named assertion.
+// ---------------------------------------------------------------------------
+
+const S3R_SEC: u64 = 1_000_000_000;
+const S3R_SHORT_MARK: u64 = 777;
+
+/// The live provider for the deadline witness: records the REAL request
+/// payload (the facade verb's own deadline rides it), emits `Item { n: 0 }`
+/// immediately and `Item { n: 1 }` after `gap`, then returns.
+struct S3rCapturingTick {
+    served_by: u64,
+    gap: Duration,
+    captured: std::sync::Arc<parking_lot::Mutex<Option<RpcRequestPayload>>>,
+}
+
+#[async_trait::async_trait]
+impl RpcStreamingHandler for S3rCapturingTick {
+    async fn call(&self, ctx: RpcContext, sink: RpcResponseSink) -> Result<(), RpcHandlerError> {
+        *self.captured.lock() = Some(RpcRequestPayload {
+            service: ctx.payload.service.clone(),
+            deadline_ns: ctx.payload.deadline_ns,
+            flags: ctx.payload.flags,
+            headers: ctx.payload.headers.clone(),
+            body: ctx.payload.body.clone(),
+        });
+        for n in 0..2u32 {
+            if n == 1 {
+                tokio::time::sleep(self.gap).await;
+            }
+            let body = serde_json::to_vec(&Item {
+                n,
+                served_by: self.served_by,
+            })
+            .expect("encode item");
+            sink.send(Bytes::from(body));
+        }
+        Ok(())
+    }
+}
+
+/// The short-default provider's handler: `Item { n: 10 }` immediately,
+/// `Item { n: 11 }` after `gap` (past the 400 ms default), then returns.
+struct S3rDelayedItems {
+    gap: Duration,
+}
+
+#[async_trait::async_trait]
+impl RpcStreamingHandler for S3rDelayedItems {
+    async fn call(&self, _ctx: RpcContext, sink: RpcResponseSink) -> Result<(), RpcHandlerError> {
+        for n in 10..12u32 {
+            if n == 11 {
+                tokio::time::sleep(self.gap).await;
+            }
+            let body = serde_json::to_vec(&Item {
+                n,
+                served_by: S3R_SHORT_MARK,
+            })
+            .expect("encode item");
+            sink.send(Bytes::from(body));
+        }
+        Ok(())
+    }
+}
+
+/// A capturing async emitter (the SS fold's emission seam), in order.
+fn s3r_capturing_emitter() -> (
+    RpcAsyncResponseEmitter,
+    std::sync::Arc<parking_lot::Mutex<Vec<RpcResponsePayload>>>,
+) {
+    let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    let emit: RpcAsyncResponseEmitter = std::sync::Arc::new(move |_from, _origin, _call, resp| {
+        sink.lock().push(resp);
+        Box::pin(async move {})
+    });
+    (emit, captured)
+}
+
+/// One REQUEST-opening frame (`EventMeta` + route + payload), the shape the
+/// folds decode at `RPC_FRAME_BODY_OFFSET`.
+fn s3r_request_frame(origin: u64, call_id: u64, req: &RpcRequestPayload) -> Bytes {
+    let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, origin, call_id, 0);
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&meta.to_bytes());
+    encode_rpc_route(&mut buf, 0);
+    req.encode_into(&mut buf);
+    Bytes::from(buf)
+}
+
+fn s3r_inbound(session_id: u64, from_node: u64, origin: u64, payload: Bytes) -> RpcInboundEvent {
+    RpcInboundEvent {
+        session_id,
+        channel_hash: 0,
+        origin_hash: origin,
+        from_node,
+        payload,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn facade_default_deadline_at_zero_outlives_a_shorter_provider_default() {
+    let a = org_a();
+    let (provider, _p_identity, p_dir) = fast_mesh("s3r-dl-provider", &a, None).await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) = fast_mesh("s3r-dl-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+
+    let service = "s3r.deadline";
+    let served_by = provider.node_id();
+    let captured: std::sync::Arc<parking_lot::Mutex<Option<RpcRequestPayload>>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let _serve = provider
+        .node()
+        .serve_rpc_owner_scoped_streaming(
+            service,
+            std::sync::Arc::new(S3rCapturingTick {
+                served_by,
+                gap: Duration::from_millis(800),
+                captured: captured.clone(),
+            }),
+            policy(),
+        )
+        .expect("serve owner-scoped streaming");
+
+    let credentials = caller_credentials(&a, &c_identity, None);
+    let org = caller.org(credentials).expect("bind");
+    assert!(
+        converge(&provider, &caller, &cap(&format!("nrpc:{service}")), &[], 1).await,
+        "the caller resolved the provider"
+    );
+
+    // ---- the live leg: a facade verb passing `deadline_ms == 0` ----
+    let mut stream = org
+        .call_streaming::<Ping, Item>(service, &Ping { n: 1 })
+        .await
+        .expect("the streaming call is admitted");
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item.expect("live item"));
+    }
+    assert_eq!(
+        items,
+        vec![Item { n: 0, served_by }, Item { n: 1, served_by },],
+        "precondition: the facade call is live and delivering (both arms pass here)"
+    );
+    let facade_request = captured
+        .lock()
+        .clone()
+        .expect("the live handler captured the facade call's REQUEST payload");
+
+    // ---- the short-default provider (default_live = 400 ms, max 3600 s) ----
+    // The facade-issued call's own REQUEST payload is admitted verbatim.
+    let (emit, frames) = s3r_capturing_emitter();
+    let mut fold = RpcServerStreamingFold::new(
+        std::sync::Arc::new(S3rDelayedItems {
+            gap: Duration::from_millis(800),
+        }),
+        emit,
+    );
+    let policy = StreamLifetimePolicy {
+        default_live_ns: 400 * 1_000_000,
+        max_live_ns: 3600 * S3R_SEC,
+    };
+    let clock = ClockSample::now();
+    let lifetime = StreamCallLifetime {
+        policy,
+        credential_ends_ns: &[],
+        clock,
+    };
+    let admitted = Admitted {
+        caller: c_identity.entity_id().clone(),
+        acting_org: a.org_id(),
+        provider_org: a.org_id(),
+        provider: provider.node().entity_id().clone(),
+        capability: cap(&format!("nrpc:{service}")),
+    };
+    let call = fold
+        .apply_inbound_admitted(
+            &s3r_inbound(
+                0x51,
+                0xA,
+                0x1111,
+                s3r_request_frame(0x1111, 42, &facade_request),
+            ),
+            admitted,
+            &lifetime,
+            None,
+        )
+        .expect("the facade call's request admits at the short-default provider");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while call.emission().is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        call.emission().is_some(),
+        "the short-default provider's call reaches its terminal within bounds"
+    );
+    let delivered: Vec<Item> = frames
+        .lock()
+        .iter()
+        .filter_map(|f| serde_json::from_slice::<Item>(&f.body).ok())
+        .collect();
+    assert_eq!(
+        delivered,
+        vec![
+            Item {
+                n: 10,
+                served_by: S3R_SHORT_MARK
+            },
+            Item {
+                n: 11,
+                served_by: S3R_SHORT_MARK
+            },
+        ],
+        "facade_default_deadline_at_zero_outlives_a_shorter_provider_default: \
+         a streaming call issued through a facade verb (deadline_ms == 0 ⇒ \
+         DEFAULT_LIFETIME_MS 300 s) keeps delivering past the provider's \
+         materially shorter default_live (400 ms) — the facade's 300 s \
+         lifetime is in force, never the forbidden \"no deadline\" arm"
+    );
+    assert_eq!(
+        call.deadline_end_ns(),
+        facade_request.deadline_ns,
+        "the effective deadline is the facade's explicit one, honoured verbatim"
+    );
+    assert_eq!(
+        call.deadline_bound(),
+        StreamDeadlineBound::Deadline,
+        "the caller's deadline bound, not the provider default"
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+// ---------------------------------------------------------------------------
+// 13. S3_R Row 3a (F-S3R-3) — `OrgStreamRaw` surfaces midstream errors as
+//     ITEMS: draining the raw stream through a midstream retirement observes
+//     the final `Err(AdmissionDenied(Denied))` item — never a swallowed clean
+//     end (the named inverse: the `Err` arm yielding `Ready(None)`).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn org_stream_raw_surfaces_midstream_errors_as_items() {
+    let a = org_a();
+    let (provider, _p_identity, p_dir) = fast_mesh("s3r-raw-provider", &a, None).await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) = fast_mesh("s3r-raw-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+
+    let service = "s3r.raw";
+    let served_by = provider.node_id();
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran_h = ran.clone();
+    // Ticks forever; the retirement force-drops it (§2.2 `forced`).
+    let _serve = provider
+        .serve_org_streaming(
+            service,
+            OrgAccess::SameOrg,
+            move |_c: OrgCaller, _req: Ping, sink: ResponseSinkTyped<Item>| {
+                let ran = ran_h.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    let mut n: u32 = 0;
+                    loop {
+                        sink.send(&Item { n, served_by })?;
+                        n += 1;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            },
+        )
+        .expect("serve_org_streaming");
+
+    let credentials = caller_credentials(&a, &c_identity, None);
+    let org = caller.org(credentials).expect("bind");
+    assert!(
+        converge(&provider, &caller, &cap(&format!("nrpc:{service}")), &[], 1).await,
+        "the caller resolved the provider"
+    );
+
+    // The RAW bytes verb: `OrgStreamRaw` — `Stream<Item = Result<Bytes, OrgSdkError>>`.
+    let body = Bytes::from(serde_json::to_vec(&Ping { n: 1 }).expect("encode ping"));
+    let mut stream = org
+        .call_streaming_bytes(service, body)
+        .await
+        .expect("the raw streaming call is admitted");
+    let first = stream.next().await.expect("item").expect("live raw item");
+    assert_eq!(
+        first,
+        Bytes::from(serde_json::to_vec(&Item { n: 0, served_by }).expect("encode item")),
+        "precondition: the raw stream is live and delivering exact chunks"
+    );
+
+    // Revoke the caller mid-stream (membership generation 1 → floor 2).
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(c_identity.entity_id().clone(), 2u32);
+    let bundle = OrgRevocationBundle::try_issue(&a, &floors).expect("revocation bundle");
+    provider
+        .node()
+        .org_revocation_store()
+        .expect("installed revocation store")
+        .apply_bundle(&bundle)
+        .expect("apply the raised floor");
+
+    // Drain: every pre-retirement chunk is `Ok`, and the FINAL item is the
+    // typed `Err(AdmissionDenied(Denied))` — an ITEM, never a swallowed end.
+    let mut all = vec![Ok(first)];
+    while let Some(item) = stream.next().await {
+        all.push(item);
+    }
+    let final_item = all.pop();
+    assert!(
+        all.iter().all(|i| i.is_ok()),
+        "every pre-retirement chunk surfaces as Ok bytes; got {all:?}"
+    );
+    match final_item {
+        Some(Err(OrgSdkError::AdmissionDenied(CoarseAdmissionReason::Denied))) => {}
+        other => panic!(
+            "org_stream_raw_surfaces_midstream_errors_as_items: draining \
+             OrgStreamRaw through the midstream retirement must surface the \
+             final Err(AdmissionDenied(Denied)) ITEM — never a swallowed clean \
+             end; got {other:?}"
+        ),
+    }
+    assert!(
+        stream.next().await.is_none(),
+        "the Err item is the stream's terminal item, then end"
+    );
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "the handler ran once and was retired by the raise"
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+// ---------------------------------------------------------------------------
+// 14. S3_R Row 3b (F-S3R-3) — one drive of `call_client_stream_bytes_deadline`
+//     to a typed terminal (the CS bytes seam was behaviourally unexecuted).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_client_stream_bytes_deadline_reaches_a_typed_terminal() {
+    let a = org_a();
+    let (provider, _p_identity, p_dir) = fast_mesh("s3r-cs-provider", &a, None).await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) = fast_mesh("s3r-cs-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+
+    let service = "s3r.csbytes";
+    let served_by = provider.node_id();
+    let counters = Counters::default();
+    let _serve = provider
+        .node()
+        .serve_rpc_owner_scoped_client_stream(
+            service,
+            Arc::new(UploadProvider {
+                served_by,
+                attribution: attribution_for(
+                    &c_identity,
+                    &provider,
+                    service,
+                    a.org_id(),
+                    a.org_id(),
+                ),
+                counters: counters.clone(),
+            }),
+            policy(),
+        )
+        .expect("serve owner-scoped client-streaming");
+
+    let credentials = caller_credentials(&a, &c_identity, None);
+    let org = caller.org(credentials).expect("bind");
+    assert!(
+        converge(&provider, &caller, &cap(&format!("nrpc:{service}")), &[], 1).await,
+        "the caller resolved the provider"
+    );
+
+    // The CS bytes SEAM (`deadline_ms == 0` ⇒ the facade's 300 s default).
+    let mut call = org
+        .call_client_stream_bytes_deadline(service, 0, 0)
+        .await
+        .expect("the CS bytes seam opens against the pinned provider");
+    for n in [10u32, 20u32] {
+        call.send(Bytes::from(
+            serde_json::to_vec(&Ping { n }).expect("encode ping"),
+        ))
+        .await
+        .expect("chunk sent");
+    }
+    // `finish` maps a non-Ok server status to `Err(RpcError::ServerError)`
+    // before returning, so `Ok(reply)` IS the Ok typed terminal.
+    let reply = call
+        .finish()
+        .await
+        .expect("the CS bytes seam reaches its Ok typed terminal");
+    let typed: UploadSummary = serde_json::from_slice(&reply.body)
+        .expect("the terminal body decodes as the typed response");
+    assert_eq!(
+        (
+            typed,
+            counters.ran.load(Ordering::SeqCst),
+            counters.attribution_ok.load(Ordering::SeqCst),
+        ),
+        (
+            UploadSummary {
+                chunks: 2,
+                seen: vec![10, 20],
+                served_by,
+            },
+            1,
+            true,
+        ),
+        "call_client_stream_bytes_deadline_reaches_a_typed_terminal: one \
+         drive of call_client_stream_bytes_deadline (deadline_ms == 0 ⇒ the \
+         facade's 300 s default) reaches the typed terminal — the exact \
+         UploadSummary decoded from the seam's terminal reply, with the \
+         handler's verified attribution"
     );
 
     let _ = std::fs::remove_dir_all(&p_dir);
