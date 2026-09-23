@@ -1,0 +1,14 @@
+docs/internal/plans/ORG_SCOPED_STREAMING_PLAN.md
+  h_64425bc75e3f3d 1511-1531
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d7b992702470b5b1f184f7bb6d527bf92160cf30",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
