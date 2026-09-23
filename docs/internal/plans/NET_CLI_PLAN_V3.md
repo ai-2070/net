@@ -1861,6 +1861,105 @@ Tasks:
   - O2 is `org remove`: a root-signed floor applied to running enforcement
     points with per-node reporting, the same shape as `subnet remove`.
 
+#### V3-2 org O1 — organization join (receipt, 2026-09-24)
+
+A device joins an organization through enrollment. Only the offline org root
+signs membership, at approval, for exactly the claiming device.
+
+**SDK.**
+- **O1a (`06d287b01`).**
+  - `Relation::Org` (tag 3) with a signed `OrgOffer { org }`; relation and
+    offer must agree.
+  - An org invite must be `RequireApproval` (refused otherwise, at sign and
+    at decode).
+  - The bundle carries the `OrgMembershipCert`.
+  - `MembershipIssuer::with_org_certs` delivers only a certificate that is a
+    valid membership of the offered org, for the claimant, taken from an
+    `OrgCertStash` keyed by the exact claim.
+  - The device's `verify_for` accepts only that, and refuses a membership on
+    an invite that offered none.
+- **O1b (`341e48e9d`).**
+  - Standalone redemption is generalized to org-only links:
+    `answer_standalone_redeem` / `serve_standalone_redeem` on
+    `net.enroll.standalone.redeem`.
+  - An org-only link is pending until approved; then the device proven on
+    the session gets the approved certificate (again on a repeat, never
+    re-signed).
+- **O1c fix.** The device-side redeem now proves identity to the issuer
+  first. A mesh-only session had not proven its entity yet: identity proof
+  runs on demand, and subnet admission had been triggering it. The server
+  now answers `Unavailable` when no identity is proven, and `Conflict` only
+  when a different one is.
+
+**CLI (O1c).**
+- **Operator.**
+  - `invite create --org <ORG>` composes the org relation with the mesh
+    (always approval-gated); `org invite <ORG>` creates a standalone link.
+  - Plain `invite approve` refuses an org offer.
+  - `org approve <offer> --subject <device> --org-key <root>`:
+    - fetches the pending claim and its offered org from the node
+      (`invite_org_pending`);
+    - checks the named subject, and refuses a key for another org;
+    - signs the cert **on the operator's machine**, and hands it to the node
+      (`invite_org_approve`), which re-checks org and member, keeps it
+      durably per claim (`<ledger>.org/`), then approves.
+- **Device.**
+  - `join` adopts a delivered membership into `<state>/authority` (the
+    `NodeAuthority` ceremony: validated, one owner org).
+  - `up` installs it before serving, and reports `org` in ready and in
+    `node status`.
+  - `org join <link>` redeems over the session. When pending, the link is
+    kept (`<state>/orgs-pending/`, surviving restart) and the link
+    supervisor asks again every 30 s. Once issued, the membership is adopted
+    and installed live.
+
+**Witnesses.**
+- SDK `enrollment_org` (5 tests):
+  - the invite rules;
+  - delivery of only the approved certificate (foreign org and another
+    device refused);
+  - the device-side check;
+  - standalone org redemption over the session.
+  - **The decisive one:**
+    `an_enrollment_delivered_membership_is_admitted_for_an_org_protected_call`.
+    A certificate delivered by enrollment, adopted and installed from its
+    directory, is admitted by a same-org provider for a real `serve_org`
+    call. The handler sees the device's entity and org.
+- CLI `org_join` (2 tests):
+  - composed join: pending; plain approve refused; wrong org key and wrong
+    subject refused; approve; join adopts; `up` and `node status` report the
+    org;
+  - standalone: a mesh invite refused; pending; the pending link survives a
+    device restart; approve; the running node installs it by itself; a
+    restart re-installs it.
+
+**Inverse mutations** (all RED):
+- SDK (10): org without approval; delivery unfiltered; stash accepting
+  another device; the device skipping the org check; match ignoring the
+  member; match ignoring the org; org links not standalone; pending
+  delivered anyway; no redelivery; delivery unfiltered on the standalone
+  path.
+- CLI (7): join not adopting; `up` not installing; plain approve allowed;
+  both org-key checks skipped; pending never re-asked; the pending link not
+  kept across restart; no identity proof before redeem.
+
+**Regressions.**
+- The SDK suite as CI runs it: 818/818.
+- `net-cli` 357/357.
+- Clippy (`net-cli` all targets, SDK lib and touched targets, SDK `full`) and
+  SDK rustdoc are clean.
+
+**Found, not fixed (pre-existing).** Private org discovery keys on an
+org-wide owner audience. `NodeAuthority::adopt` mints a fresh one per node,
+and nothing distributes it, so two separately adopted members cannot
+discover each other privately. The protected-call witness pre-stages it, as
+the existing live facade test does. Admission itself is unaffected.
+Distribution belongs with the org half's next slices.
+
+**Next: O2 `org remove`.** A root-signed floor applied to running
+enforcement points with per-node reporting; nothing applies floors to a
+running node today.
+
 #### V3-2 task 3: standalone subnet join, decisions (user, 2026-09-24)
 
 A device already on the mesh redeems a subnet-only link (`relations =

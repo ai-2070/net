@@ -339,3 +339,227 @@ fn a_standalone_org_link_delivers_the_approved_certificate_over_the_session() {
         Err(Refusal::Invalid)
     );
 }
+
+#[cfg(feature = "cortex")]
+mod live {
+    use super::*;
+    use net::adapter::net::behavior::capability::CapabilitySet;
+    use net::adapter::net::behavior::org_authority::{NodeAuthority, OwnerAudienceCredential};
+    use net::adapter::net::{ChannelConfigRegistry, MeshNode, MeshNodeConfig};
+    use net_sdk::org::{DispatcherScope, OrgAccess, OrgCaller, OrgCredentials, OrgDispatcherGrant};
+    use net_sdk::Mesh;
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Ping {
+        n: u32,
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+    struct Pong {
+        n: u32,
+    }
+
+    /// A node that re-announces promptly (the scoped envelope rides the
+    /// announce path), with `identity`.
+    async fn node_for(identity: &Identity) -> (Arc<MeshNode>, Arc<ChannelConfigRegistry>) {
+        let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [0x52u8; 32])
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(5));
+        cfg.min_announce_interval = Duration::from_millis(50);
+        cfg.configured_identity = true;
+        let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
+            .await
+            .unwrap();
+        let configs = Arc::new(ChannelConfigRegistry::new());
+        node.set_channel_configs(configs.clone());
+        (Arc::new(node), configs)
+    }
+
+    /// The membership certificate a device receives through enrollment:
+    /// an org invite, claimed, approved with a certificate the operator
+    /// signed for exactly that claim, issued in the bundle, and verified by
+    /// the device against its invite.
+    fn enrolled_membership(org: &OrgKeypair, device: &Identity) -> OrgMembershipCert {
+        let operator = Identity::generate();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = EnrollmentLedger::create(
+            &tmp.path().join("ledger"),
+            operator.entity_id().clone(),
+            LedgerLimits::default(),
+        )
+        .unwrap();
+        let invite = MembershipInvite::sign(
+            &operator,
+            spec(
+                vec![Relation::Mesh, Relation::Org],
+                Some(OrgOffer { org: org.org_id() }),
+                ApprovalMode::RequireApproval,
+            ),
+        )
+        .unwrap();
+        let offer_id = ledger.offer(invite.offer_spec(), now()).unwrap();
+        let intent = RedemptionIntent::for_invite(&invite, device.entity_id().clone()).unwrap();
+        let claimant = intent.claimant();
+        ledger
+            .claim(&invite.invitation_id(), &claimant, now())
+            .unwrap();
+        let stash = Arc::new(OrgCertStash::new(tmp.path().join("org-certs")));
+        stash
+            .put(
+                &claimant,
+                &OrgMembershipCert::try_issue(org, device.entity_id().clone(), 1, YEAR).unwrap(),
+            )
+            .unwrap();
+        ledger.approve(&offer_id, &claimant, now()).unwrap();
+        let bytes = MembershipIssuer::new(operator, Psk::new(PSK), contact())
+            .with_org_certs(stash)
+            .issue(&invite, &intent)
+            .unwrap();
+        let bundle = MembershipBundle::from_bytes(&bytes).unwrap();
+        bundle.verify_for(&invite, &intent).unwrap();
+        bundle.org_membership().unwrap().clone()
+    }
+
+    /// The decisive witness for O1: a membership certificate delivered by
+    /// enrollment, adopted through the production ceremony and installed
+    /// from its directory (the path joined `up` takes), is admitted by a
+    /// provider of that org for an org-protected (same-org) call. The
+    /// dispatcher grant is issued separately (join never emits one).
+    ///
+    /// Private discovery keys on the org's owner audience, which each
+    /// adopting node mints for itself and nothing yet distributes; the
+    /// provider here is pre-staged with the device's audience, as the
+    /// existing live facade test does (§3.4 out-of-band pre-staging).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_enrollment_delivered_membership_is_admitted_for_an_org_protected_call() {
+        let org = OrgKeypair::generate();
+        let device_identity = Identity::generate();
+        let cert = enrolled_membership(&org, &device_identity);
+
+        // Device: adopt the delivered certificate, then install from the dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let device_dir = tmp.path().join("device-authority");
+        NodeAuthority::adopt(
+            &device_dir,
+            cert.clone(),
+            device_identity.entity_id(),
+            0,
+            None,
+        )
+        .unwrap();
+        let (device_node, device_configs) = node_for(&device_identity).await;
+        let device =
+            Mesh::from_node_arc(device_node, device_configs, Some(device_identity.clone()));
+        device.install_org_authority(&device_dir).unwrap();
+
+        // Provider: a member of the same org (the operator's own adoption),
+        // pre-staged with the org's owner audience.
+        let provider_identity = Identity::generate();
+        let provider_dir = tmp.path().join("provider-authority");
+        let adopted = NodeAuthority::adopt(
+            &provider_dir,
+            OrgMembershipCert::try_issue(&org, provider_identity.entity_id().clone(), 1, YEAR)
+                .unwrap(),
+            provider_identity.entity_id(),
+            0,
+            None,
+        )
+        .unwrap();
+        let shared = device
+            .node()
+            .node_authority()
+            .unwrap()
+            .audience
+            .encode_config();
+        let (provider_node, provider_configs) = node_for(&provider_identity).await;
+        provider_node
+            .install_node_authority(Arc::new(NodeAuthority {
+                config: adopted.config.clone(),
+                audience: OwnerAudienceCredential::decode_config(&shared).unwrap(),
+                revocation: adopted.revocation.clone(),
+            }))
+            .unwrap();
+        provider_node.set_owner_cert_emission(true).unwrap();
+        let provider = Mesh::from_node_arc(
+            provider_node,
+            provider_configs,
+            Some(provider_identity.clone()),
+        );
+
+        // Live transport between them.
+        let device_id = device.node_id();
+        let p = provider.node().clone();
+        let accept = tokio::spawn(async move { p.accept(device_id).await });
+        device
+            .connect(
+                &provider.local_addr().to_string(),
+                provider.public_key(),
+                provider.node_id(),
+            )
+            .await
+            .unwrap();
+        accept.await.unwrap().unwrap();
+        device.start();
+        provider.start();
+        for m in [&device, &provider] {
+            m.node()
+                .announce_capabilities(CapabilitySet::new())
+                .await
+                .unwrap();
+        }
+
+        let served_for = Arc::new(parking_lot::Mutex::new(None));
+        let seen = served_for.clone();
+        let _serve = provider
+            .serve_org(
+                "enroll.ping",
+                OrgAccess::SameOrg,
+                move |caller: OrgCaller, req: Ping| {
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock() = Some((caller.entity.clone(), caller.acting_org));
+                        Ok(Pong { n: req.n + 1 })
+                    }
+                },
+            )
+            .unwrap();
+
+        // The device calls with its enrolled membership plus a separately
+        // issued dispatcher grant.
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org,
+            device_identity.entity_id().clone(),
+            DispatcherScope::Any,
+            3600,
+        )
+        .unwrap();
+        let client = device
+            .org(OrgCredentials::new(cert, dispatcher, vec![], vec![]).unwrap())
+            .unwrap();
+        // Retry while the provider's scoped announcement converges; the
+        // call itself is the observation (discovery, then admission).
+        let mut outcome = None;
+        for _ in 0..100 {
+            provider
+                .node()
+                .announce_capabilities(CapabilitySet::new())
+                .await
+                .ok();
+            match client
+                .call::<Ping, Pong>("enroll.ping", &Ping { n: 41 })
+                .await
+            {
+                Ok(pong) => {
+                    outcome = Some(pong);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        let pong = outcome.expect("the org-protected call is admitted");
+        assert_eq!(pong, Pong { n: 42 });
+        let (caller, acting) = served_for.lock().clone().expect("the handler ran");
+        assert_eq!(&caller, device_identity.entity_id());
+        assert_eq!(acting, org.org_id());
+    }
+}

@@ -253,6 +253,7 @@ pub async fn run(
                     addr: None,
                     subnet: Some(args.scope),
                     subnet_rights: args.rights,
+                    org: None,
                     standalone: true,
                 }),
                 output,

@@ -188,6 +188,7 @@ impl EnrollPlan {
                 ledger: Arc::new(parking_lot::Mutex::new(ledger)),
                 bind: SocketAddr::new(bind.ip(), port),
                 created,
+                org: Arc::new(OrgBook::new(ledger_dir.with_extension("org"))),
             },
         ))
     }
@@ -245,6 +246,9 @@ pub(crate) struct EnrollOwner {
     ledger: SharedLedger,
     bind: SocketAddr,
     created: Vec<&'static str>,
+    /// Org membership state beside the ledger: the certificates the operator
+    /// approved per claim, and which org each org invite offers.
+    org: Arc<OrgBook>,
 }
 
 /// How long `up --enroll` waits for the router to answer mapping requests.
@@ -316,6 +320,7 @@ impl EnrollOwner {
             udp_mapped,
             contacts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             subnet: subnet.clone(),
+            org: self.org.clone(),
         });
         let service = EnrollmentService::bind(
             self.bind,
@@ -341,18 +346,17 @@ impl EnrollOwner {
             ),
             None => None,
         };
-        // Standalone subnet links are redeemed over the device's session.
-        let standalone = match &subnet {
-            Some(issuer) => Some(
-                net_sdk::enrollment::standalone::serve_subnet_redeem(
-                    mesh.node(),
-                    self.ledger.clone(),
-                    issuer.clone(),
-                )
-                .map_err(|e| generic(format!("standalone subnet service: {e}")))?,
-            ),
-            None => None,
-        };
+        // Standalone subnet and org links are redeemed over the device's
+        // session.
+        let standalone = Some(
+            net_sdk::enrollment::standalone::serve_standalone_redeem(
+                mesh.node(),
+                self.ledger.clone(),
+                subnet.clone(),
+                Some(self.org.stash.clone()),
+            )
+            .map_err(|e| generic(format!("standalone redemption service: {e}")))?,
+        );
         // Relay fallback: register (and keep re-trying) in the background;
         // the node serves direct joiners whether or not the relay is up.
         let relay = match self.plan.relay {
@@ -371,6 +375,7 @@ impl EnrollOwner {
             trust_domain,
             domain_name: self.plan.domain_name,
             bundles,
+            org: self.org,
         });
         Ok(RunningEnrollment {
             service,
@@ -493,6 +498,50 @@ struct NodeBundles {
     contacts: parking_lot::Mutex<std::collections::HashMap<String, SocketAddr>>,
     /// Delegated subnet leaf issuance, when `up` runs with a subnet issuer.
     subnet: Option<net_sdk::enrollment::bundle::SubnetLeafIssuer>,
+    /// Operator-approved org membership certificates.
+    org: Arc<OrgBook>,
+}
+
+/// Org membership state an enrolling node keeps beside its ledger: the
+/// certificates the operator signed (with the offline org root) at approval,
+/// per exact claim, and the org each org invite offers (the ledger keeps
+/// digests only, and approval must check the operator signed for that org).
+pub(crate) struct OrgBook {
+    stash: Arc<net_sdk::enrollment::org::OrgCertStash>,
+    offers: PathBuf,
+}
+
+impl OrgBook {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            stash: Arc::new(net_sdk::enrollment::org::OrgCertStash::new(
+                dir.join("certs"),
+            )),
+            offers: dir.join("offers"),
+        }
+    }
+
+    fn record_offer(
+        &self,
+        offer: &net_sdk::enrollment::store::OfferId,
+        org: &net::adapter::net::behavior::org::OrgId,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.offers)?;
+        let path = self.offers.join(offer.to_string());
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, hex::encode(org.0))?;
+        std::fs::rename(&tmp, &path)
+    }
+
+    /// The org an offer's invite names, if it is an org invite.
+    fn offered_org(
+        &self,
+        offer: &net_sdk::enrollment::store::OfferId,
+    ) -> Option<net::adapter::net::behavior::org::OrgId> {
+        let text = std::fs::read_to_string(self.offers.join(offer.to_string())).ok()?;
+        let bytes: [u8; 32] = hex::decode(text.trim()).ok()?.try_into().ok()?;
+        Some(net::adapter::net::behavior::org::OrgId(bytes))
+    }
 }
 
 impl NodeBundles {
@@ -536,7 +585,8 @@ impl NodeBundles {
     }
 
     fn issuer_for(&self, contact: MeshContact) -> MembershipIssuer {
-        let issuer = MembershipIssuer::new(self.issuer.clone(), self.psk.clone(), contact);
+        let issuer = MembershipIssuer::new(self.issuer.clone(), self.psk.clone(), contact)
+            .with_org_certs(self.org.stash.clone());
         match &self.subnet {
             Some(subnet) => issuer.with_subnet_issuer(subnet.clone()),
             None => issuer,
@@ -685,6 +735,7 @@ pub(crate) struct EnrollContext {
     trust_domain: TrustDomainId,
     domain_name: String,
     bundles: Arc<NodeBundles>,
+    org: Arc<OrgBook>,
 }
 
 impl EnrollContext {
@@ -696,6 +747,8 @@ impl EnrollContext {
             "invite_revoke" => self.revoke(request),
             "invite_approve" => self.decide(request, true),
             "invite_deny" => self.decide(request, false),
+            "invite_org_pending" => self.org_pending(request),
+            "invite_org_approve" => self.org_approve(request),
             _ => Err("unknown invite operation".to_string()),
         };
         result.unwrap_or_else(|e| json!({ "error": e }))
@@ -738,7 +791,24 @@ impl EnrollContext {
                 .ok_or_else(|| format!("address {} does not resolve", endpoint.as_str()))?;
         }
         let standalone = request["standalone"] == Value::Bool(true);
-        let (relations, subnet) = match request["subnet"].as_str() {
+        let org = match request["org"].as_str() {
+            Some(hex) => Some(net_sdk::enrollment::invite::OrgOffer {
+                org: parse_org_id(hex)?,
+            }),
+            None => None,
+        };
+        if standalone && org.is_some() && request["subnet"].is_string() {
+            return Err("a standalone link carries one relation: a subnet or an org".to_string());
+        }
+        // An org invite always waits for the operator: only the offline org
+        // root can sign the membership, at approval (`org approve`).
+        let mode = if org.is_some() {
+            ApprovalMode::RequireApproval
+        } else {
+            mode
+        };
+        let (mut relations, subnet) = match request["subnet"].as_str() {
+            None if standalone && org.is_some() => (Vec::new(), None),
             None if standalone => return Err("a standalone link needs a subnet".to_string()),
             None => (vec![Relation::Mesh], None),
             Some(path) => {
@@ -779,6 +849,9 @@ impl EnrollContext {
                 }
             }
         };
+        if org.is_some() {
+            relations.push(Relation::Org);
+        }
         let policy = InvitationPolicy::with_options(now, ttl, mode).map_err(|e| e.to_string())?;
         let invite = MembershipInvite::sign(
             &self.issuer,
@@ -789,7 +862,7 @@ impl EnrollContext {
                 relay: self.relay.clone(),
                 enrollment_key: self.key,
                 subnet: subnet.clone(),
-                org: None,
+                org,
                 relations,
                 intended_subject: intended,
                 policy,
@@ -801,6 +874,11 @@ impl EnrollContext {
             .lock()
             .offer(invite.offer_spec(), now)
             .map_err(|e| e.to_string())?;
+        if let Some(offer_org) = &org {
+            self.org
+                .record_offer(&offer, &offer_org.org)
+                .map_err(|e| format!("org offer record: {e}"))?;
+        }
         Ok(json!({
             "token": invite.encode(),
             "offer_id": offer.to_string(),
@@ -814,6 +892,7 @@ impl EnrollContext {
                 "rights": super::subnet::format_subnet_rights(o.rights),
             })),
             "standalone": standalone,
+            "org": org.as_ref().map(|o| hex::encode(o.org.0)),
             "issuer_fingerprint": invite.issuer_fingerprint(),
         }))
     }
@@ -870,6 +949,13 @@ impl EnrollContext {
     /// Approve or deny exactly the pending claim whose subject the operator names.
     fn decide(&self, request: &Value, approve: bool) -> Result<Value, String> {
         let offer = parse_offer(request["offer_id"].as_str().unwrap_or_default())?;
+        if approve && self.org.offered_org(&offer).is_some() {
+            return Err(
+                "this invite offers an org membership, which only the org root can sign: \
+                 approve it with `net-mesh org approve <offer> --subject <entity> --org-key <file>`"
+                    .to_string(),
+            );
+        }
         let subject = parse_entity(request["subject"].as_str().unwrap_or_default())?;
         let mut ledger = self.ledger.lock();
         let claim = ledger
@@ -891,6 +977,83 @@ impl EnrollContext {
             "state": if approve { "approved" } else { "denied" },
         }))
     }
+}
+
+impl EnrollContext {
+    /// `org approve`, step one: the pending claim and the org its invite
+    /// offers, so the operator's CLI can sign for exactly that device.
+    fn org_pending(&self, request: &Value) -> Result<Value, String> {
+        let offer = parse_offer(request["offer_id"].as_str().unwrap_or_default())?;
+        let org = self
+            .org
+            .offered_org(&offer)
+            .ok_or_else(|| "that offer is not an org invite".to_string())?;
+        let claim = self
+            .ledger
+            .lock()
+            .pending_claim(&offer)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "offer has no claim awaiting approval".to_string())?;
+        Ok(json!({
+            "offer_id": offer.to_string(),
+            "org": hex::encode(org.0),
+            "subject": hex::encode(claim.subject.as_bytes()),
+        }))
+    }
+
+    /// `org approve`, step two: keep the certificate the operator signed for
+    /// exactly the pending claim, then approve that claim.
+    fn org_approve(&self, request: &Value) -> Result<Value, String> {
+        let offer = parse_offer(request["offer_id"].as_str().unwrap_or_default())?;
+        let subject = parse_entity(request["subject"].as_str().unwrap_or_default())?;
+        let cert = hex::decode(request["cert"].as_str().unwrap_or_default())
+            .ok()
+            .and_then(|b| net::adapter::net::behavior::org::OrgMembershipCert::from_bytes(&b).ok())
+            .ok_or_else(|| "malformed membership certificate".to_string())?;
+        let org = self
+            .org
+            .offered_org(&offer)
+            .ok_or_else(|| "that offer is not an org invite".to_string())?;
+        if cert.org_id != org {
+            return Err(
+                "the certificate is for a different org than the invite offers".to_string(),
+            );
+        }
+        let mut ledger = self.ledger.lock();
+        let claim = ledger
+            .pending_claim(&offer)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "offer has no claim awaiting approval".to_string())?;
+        if claim.subject != subject || cert.member != subject {
+            return Err("the pending claim is from a different subject".to_string());
+        }
+        // Durable before the claim can be issued against it.
+        self.org
+            .stash
+            .put(&claim, &cert)
+            .map_err(|e| format!("keeping the certificate: {e}"))?;
+        ledger
+            .approve(&offer, &claim, now_unix())
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "offer_id": offer.to_string(),
+            "state": "approved",
+            "org": hex::encode(org.0),
+            "member": hex::encode(subject.as_bytes()),
+            "generation": cert.generation,
+            "not_after": cert.not_after,
+        }))
+    }
+}
+
+pub(crate) fn parse_org_id(
+    hex_id: &str,
+) -> Result<net::adapter::net::behavior::org::OrgId, String> {
+    let bytes: [u8; 32] = hex::decode(hex_id.trim().trim_start_matches("0x"))
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| "an org id is 64 hex characters".to_string())?;
+    Ok(net::adapter::net::behavior::org::OrgId(bytes))
 }
 
 fn approval_name(mode: ApprovalMode) -> &'static str {
@@ -1029,8 +1192,13 @@ pub struct CreateArgs {
     /// Rights for `--subnet` (default `attach`; others only when named).
     #[arg(long, value_name = "RIGHTS", requires = "subnet")]
     pub subnet_rights: Option<String>,
-    /// A standalone subnet link (`subnet invite`): the subnet relation only,
-    /// for a device already on the mesh.
+    /// Also make the device a member of this organization (its 64-hex org
+    /// id). Always approval-gated: `org approve --org-key` signs the
+    /// membership for exactly the claiming device.
+    #[arg(long, value_name = "ORG")]
+    pub org: Option<String>,
+    /// A standalone link (`subnet invite` / `org invite`): one relation
+    /// only, for a device already on the mesh.
     #[arg(skip)]
     pub standalone: bool,
 }
@@ -1075,7 +1243,7 @@ pub struct DecideArgs {
     pub subject: String,
 }
 
-async fn node_request(
+pub(crate) async fn node_request(
     state_dir_arg: Option<PathBuf>,
     profile: &str,
     request: Value,
@@ -1131,6 +1299,10 @@ pub async fn run_invite(
             }
             if args.standalone {
                 request["standalone"] = json!(true);
+            }
+            if let Some(org) = &args.org {
+                parse_org_id(org).map_err(invalid_args)?;
+                request["org"] = json!(org.trim_start_matches("0x"));
             }
             let mut reply = node_request(args.state_dir, profile_name, request).await?;
             if reply["bearer"] == Value::Bool(true) {
@@ -1512,6 +1684,29 @@ pub async fn run_join(
     let contact = bundle.contact().clone();
     let trust_domain = bundle.psk().trust_domain().to_string();
     let enroll_path = join.last_path().map(|p| p.as_str());
+    // An org relation: adopt the delivered membership as this node's owner
+    // org (validated, one owner org per node, durable); `up` installs it.
+    let org = match bundle.org_membership() {
+        Some(cert) => {
+            let (cert, entity, root) = (
+                cert.clone(),
+                join.identity().entity_id().clone(),
+                state.clone(),
+            );
+            let adopted = tokio::task::spawn_blocking(move || {
+                super::lifecycle::adopt_org_membership(&root, cert, &entity)
+            })
+            .await
+            .map_err(|e| generic(format!("org adoption task failed: {e}")))?
+            .map_err(|e| {
+                generic(format!(
+                    "credentials are installed, but adopting the org membership failed: {e}"
+                ))
+            })?;
+            Some(adopted)
+        }
+        None => None,
+    };
     // Installation is credential state; live admission is observed separately.
     let attach_path = match attach_mesh(
         join.identity().clone(),
@@ -1548,6 +1743,7 @@ pub async fn run_join(
                 "rights": super::subnet::format_subnet_rights(o.rights),
                 "credentials": "installed",
             })),
+            "org": org,
             "installed": true,
             "attached": true,
             // `null` when the bundle was already installed before this run.

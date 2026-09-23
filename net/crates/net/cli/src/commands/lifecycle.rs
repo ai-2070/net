@@ -130,6 +130,9 @@ struct JoinedLink {
     /// Standalone subnet memberships (`subnet join`), keyed by membership.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     standalone: std::collections::BTreeMap<String, StandaloneLink>,
+    /// Why the last attempt to complete a pending org link failed, if it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org_detail: Option<String>,
 }
 
 /// One standalone subnet membership's live state.
@@ -153,6 +156,71 @@ type SharedMemberships =
 
 /// Directory (under the state root) holding standalone subnet memberships.
 const SUBNETS_SUBDIR: &str = "subnets";
+/// This node's adopted org authority (under the state root).
+pub(crate) const AUTHORITY_SUBDIR: &str = "authority";
+/// Standalone org links awaiting operator approval (under the state root).
+const ORGS_PENDING_SUBDIR: &str = "orgs-pending";
+/// Clock skew accepted when adopting an org membership.
+const ORG_ADOPT_SKEW_SECS: u64 = 60;
+
+/// Adopt `cert` as this node's org membership in `<state>/authority`: the
+/// org authority ceremony validates it (for this entity, in its window,
+/// signed by its org root), keeps one owner org per node, and persists it.
+/// Returns what was adopted.
+pub(crate) fn adopt_org_membership(
+    state_root: &Path,
+    cert: net::adapter::net::behavior::org::OrgMembershipCert,
+    entity: &net::adapter::net::identity::EntityId,
+) -> Result<serde_json::Value, String> {
+    let dir = state_root.join(AUTHORITY_SUBDIR);
+    let (org, generation, not_after) = (cert.org_id, cert.generation, cert.not_after);
+    net::adapter::net::behavior::org_authority::NodeAuthority::adopt(
+        &dir,
+        cert,
+        entity,
+        ORG_ADOPT_SKEW_SECS,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "org": hex::encode(org.0),
+        "generation": generation,
+        "not_after": not_after,
+        "adopted": true,
+    }))
+}
+
+/// Pending standalone org links, as stored under `<state>/orgs-pending`.
+type PendingOrgs =
+    Arc<parking_lot::Mutex<Vec<(String, net_sdk::enrollment::invite::MembershipInvite)>>>;
+
+fn load_pending_orgs(dir: &Path) -> Vec<(String, net_sdk::enrollment::invite::MembershipInvite)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let key = e.file_name().to_string_lossy().to_string();
+            let bytes = std::fs::read(e.path()).ok()?;
+            let invite = net_sdk::enrollment::invite::MembershipInvite::from_bytes(&bytes).ok()?;
+            Some((key, invite))
+        })
+        .collect()
+}
+
+/// A standalone org link was issued: adopt the membership and install it
+/// on the running node (one owner org; a same-org renewal replaces).
+fn adopt_and_install_org(
+    state_root: &Path,
+    node: &Arc<net::adapter::net::MeshNode>,
+    cert: net::adapter::net::behavior::org::OrgMembershipCert,
+) -> Result<serde_json::Value, String> {
+    let adopted = adopt_org_membership(state_root, cert, node.entity_id())?;
+    net_sdk::org::install_org_authority_node(node, &state_root.join(AUTHORITY_SUBDIR))
+        .map_err(|e| format!("installing the org authority: {e}"))?;
+    Ok(adopted)
+}
 
 /// A membership's directory name and status key: a one-way digest of the
 /// signed link (the invitation id itself is treated as sensitive).
@@ -418,9 +486,12 @@ async fn keep_standalone_admitted(
 ///
 /// Stops when the join is gone (shutdown) or has left: `leave` erases the
 /// bundle, so there is nothing to attach with.
+#[allow(clippy::too_many_arguments)]
 fn spawn_joined_link(
     joined: SharedJoin,
     memberships: SharedMemberships,
+    pending_orgs: PendingOrgs,
+    state_root: PathBuf,
     node: Arc<net::adapter::net::MeshNode>,
     link: Arc<parking_lot::Mutex<JoinedLink>>,
     presented: Option<u64>,
@@ -434,6 +505,7 @@ fn spawn_joined_link(
             renew_retry_at: 0,
         };
         let mut standalone_tracks = std::collections::HashMap::<String, SubnetTrack>::new();
+        let mut org_retry_at = 0u64;
         loop {
             let snapshot = {
                 let guard = joined.lock();
@@ -550,6 +622,18 @@ fn spawn_joined_link(
                 &link,
             )
             .await;
+            if now_unix() >= org_retry_at && !pending_orgs.lock().is_empty() {
+                org_retry_at = now_unix() + SUBNET_RENEW_RETRY.as_secs();
+                keep_pending_orgs(
+                    &node,
+                    contact.node_id,
+                    &identity,
+                    &state_root,
+                    &pending_orgs,
+                    &link,
+                )
+                .await;
+            }
             tokio::time::sleep(LINK_CHECK).await;
         }
     })
@@ -1171,6 +1255,9 @@ struct NodeReport {
     enrollment: Option<super::enrollment::EnrollmentReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     joined: Option<JoinedReport>,
+    /// The org this node is a member of (its installed, adopted authority).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    org: Option<String>,
 }
 
 /// A node started from an installed join: whose mesh it joined and whether the
@@ -1206,6 +1293,10 @@ struct ControlState {
     /// Standalone subnet memberships of a joined node, and where they live.
     memberships: Option<SharedMemberships>,
     subnets_dir: PathBuf,
+    /// The state root (org authority and pending org links live under it).
+    state_root: PathBuf,
+    /// Standalone org links awaiting approval, asked again by the supervisor.
+    pending_orgs: PendingOrgs,
     /// This node's mesh, for operations that reach other nodes.
     node: Arc<net::adapter::net::MeshNode>,
 }
@@ -1284,6 +1375,150 @@ async fn forward_floor_query(
         Ok(a) => serde_json::json!({ "attestation": hex::encode(a.to_bytes()) }),
         Err(SubnetFloorQueryError::Refused(m)) => serde_json::json!({ "refused": m }),
         Err(e) => serde_json::json!({ "no_answer": e.to_string() }),
+    }
+}
+
+/// Control op `org_join`: redeem a standalone org link over this joined
+/// node's session with the node it enrolled with. Pending until the operator
+/// approves (the link is kept, and the link supervisor asks again); once
+/// issued, the membership is adopted and installed live.
+async fn org_join(state: &ControlState, request: &serde_json::Value) -> serde_json::Value {
+    use net_sdk::enrollment::standalone::{
+        is_standalone_org, request_subnet_redeem, SubnetRedeemReply,
+    };
+    let error = |m: String| serde_json::json!({ "error": m });
+    let Some(join) = &state.joined else {
+        return error(
+            "this node did not join a mesh: a standalone org link extends an existing \
+             membership (run `net-mesh join` first)"
+                .to_string(),
+        );
+    };
+    let Some(token) = request["token"].as_str() else {
+        return error("malformed org_join request".to_string());
+    };
+    let invite = match net_sdk::enrollment::invite::MembershipInvite::decode(token) {
+        Ok(invite) => invite,
+        Err(e) => return error(format!("invalid link: {e}")),
+    };
+    if !is_standalone_org(&invite) {
+        return error(
+            "not a standalone org link (a mesh invite is redeemed with `net-mesh join`)"
+                .to_string(),
+        );
+    }
+    let Some(offer) = invite.org().copied() else {
+        return error("not a standalone org link".to_string());
+    };
+    let joined = join.lock().as_ref().and_then(|j| {
+        j.bundle().map(|b| {
+            (
+                j.identity().clone(),
+                j.invite().issuer().clone(),
+                b.contact().node_id,
+            )
+        })
+    });
+    let Some((identity, join_issuer, issuer_node)) = joined else {
+        return error("this node's join holds no credentials".to_string());
+    };
+    if invite.issuer() != &join_issuer {
+        return error(format!(
+            "this link was issued by {}, not by the node this device enrolled with; standalone \
+             links are redeemed only there",
+            invite.issuer_fingerprint()
+        ));
+    }
+    let key = membership_key(&invite);
+    match request_subnet_redeem(
+        &state.node,
+        issuer_node,
+        &identity,
+        &invite,
+        SUBNET_JOIN_REDEEM_WAIT,
+    )
+    .await
+    {
+        Ok(SubnetRedeemReply::PendingApproval) => {
+            let dir = state.state_root.join(ORGS_PENDING_SUBDIR);
+            let kept = std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::write(dir.join(&key), invite.to_bytes()));
+            if let Err(e) = kept {
+                return error(format!("keeping the pending link: {e}"));
+            }
+            let mut pending = state.pending_orgs.lock();
+            if !pending.iter().any(|(k, _)| k == &key) {
+                pending.push((key, invite));
+            }
+            serde_json::json!({
+                "state": "pending_approval",
+                "org": hex::encode(offer.org.0),
+                "device": hex::encode(identity.entity_id().as_bytes()),
+                "next": "the operator approves it with `org approve --org-key`; this node asks again by itself",
+            })
+        }
+        Ok(SubnetRedeemReply::OrgIssued(cert)) => {
+            let (root, node) = (state.state_root.clone(), state.node.clone());
+            let adopted =
+                tokio::task::spawn_blocking(move || adopt_and_install_org(&root, &node, *cert))
+                    .await
+                    .unwrap_or_else(|_| Err("org adoption task failed".to_string()));
+            match adopted {
+                Ok(mut adopted) => {
+                    let _ =
+                        std::fs::remove_file(state.state_root.join(ORGS_PENDING_SUBDIR).join(&key));
+                    state.pending_orgs.lock().retain(|(k, _)| k != &key);
+                    adopted["state"] = serde_json::json!("installed");
+                    adopted["device"] =
+                        serde_json::json!(hex::encode(identity.entity_id().as_bytes()));
+                    adopted
+                }
+                Err(e) => error(format!("the membership was issued but not adopted: {e}")),
+            }
+        }
+        Ok(SubnetRedeemReply::Issued(_)) => {
+            error("the node answered with subnet credentials".to_string())
+        }
+        Err(e) => error(format!("redemption failed: {e}")),
+    }
+}
+
+/// Ask again for every pending standalone org link redeemed at
+/// `issuer_node`; adopt and install any that were issued.
+async fn keep_pending_orgs(
+    node: &Arc<net::adapter::net::MeshNode>,
+    issuer_node: u64,
+    identity: &net_sdk::identity::Identity,
+    state_root: &Path,
+    pending: &PendingOrgs,
+    link: &Arc<parking_lot::Mutex<JoinedLink>>,
+) {
+    use net_sdk::enrollment::standalone::{request_subnet_redeem, SubnetRedeemReply};
+    let snapshot = pending.lock().clone();
+    for (key, invite) in snapshot {
+        match request_subnet_redeem(node, issuer_node, identity, &invite, SUBNET_RENEW_WAIT).await {
+            Ok(SubnetRedeemReply::OrgIssued(cert)) => {
+                let (root, node) = (state_root.to_path_buf(), node.clone());
+                let adopted =
+                    tokio::task::spawn_blocking(move || adopt_and_install_org(&root, &node, *cert))
+                        .await
+                        .unwrap_or_else(|_| Err("org adoption task failed".to_string()));
+                match adopted {
+                    Ok(_) => {
+                        let _ =
+                            std::fs::remove_file(state_root.join(ORGS_PENDING_SUBDIR).join(&key));
+                        pending.lock().retain(|(k, _)| k != &key);
+                        link.lock().org_detail = None;
+                    }
+                    Err(e) => link.lock().org_detail = Some(e),
+                }
+            }
+            Ok(SubnetRedeemReply::PendingApproval) => {}
+            Ok(SubnetRedeemReply::Issued(_)) => {
+                link.lock().org_detail = Some("unexpected subnet credentials".to_string());
+            }
+            Err(e) => link.lock().org_detail = Some(e),
+        }
     }
 }
 
@@ -1518,12 +1753,16 @@ async fn control_session(
                 "node": state.report,
                 "subnet_expires_at": subnet_expires_at,
                 "link": state.link.as_ref().map(|l| l.lock().clone()),
+                "org": state.node.node_authority().map(|a| hex::encode(a.owner_org().0)),
+                "org_pending": state.pending_orgs.lock().len(),
             })
         }
         "shutdown" => {
             state.draining.store(true, Ordering::SeqCst);
             serde_json::json!({ "accepted": true, "incarnation": state.report.incarnation })
         }
+        "org_join" if draining => serde_json::json!({ "error": "node is draining" }),
+        "org_join" => org_join(state, &request).await,
         "subnet_join" if draining => serde_json::json!({ "error": "node is draining" }),
         "subnet_join" => subnet_join(state, &request).await,
         "subnet_floor_query" if draining => serde_json::json!({ "error": "node is draining" }),
@@ -1876,6 +2115,18 @@ pub async fn run_up(
         .await
         .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
     mesh.start();
+    // An adopted org membership (from `join` / `org join`, or `node adopt`
+    // into this state directory) is installed before anything is served.
+    let authority_dir = state.join(AUTHORITY_SUBDIR);
+    let org_owner = if authority_dir.exists() {
+        mesh.install_org_authority(&authority_dir)
+            .map_err(|e| generic(format!("org authority {}: {e}", authority_dir.display())))?;
+        mesh.node()
+            .node_authority()
+            .map(|a| hex::encode(a.owner_org().0))
+    } else {
+        None
+    };
     let _subnet_readback = match &subnet_issuer {
         Some(_) => Some(
             mesh.node()
@@ -1988,6 +2239,7 @@ pub async fn run_up(
         started_at: now_unix(),
         enrollment: enrollment.as_ref().map(|e| e.report()),
         joined: joined_report,
+        org: org_owner,
     };
     let control = ControlFile {
         version: 1,
@@ -2021,6 +2273,9 @@ pub async fn run_up(
     }
     let joined = joined.map(|j| Arc::new(parking_lot::Mutex::new(Some(j))));
     let subnets_dir = state.join(SUBNETS_SUBDIR);
+    let pending_orgs: PendingOrgs = Arc::new(parking_lot::Mutex::new(load_pending_orgs(
+        &state.join(ORGS_PENDING_SUBDIR),
+    )));
     let memberships: Option<SharedMemberships> = match &joined {
         Some(_) => Some(Arc::new(parking_lot::Mutex::new(load_memberships(
             &subnets_dir,
@@ -2037,6 +2292,7 @@ pub async fn run_up(
             reattaches: 0,
             readmissions: 0,
             standalone: Default::default(),
+            org_detail: None,
             subnet_admitted: subnet.and_then(|s| s["admitted"].as_bool()),
             subnet_detail: subnet.and_then(|s| s["detail"].as_str().map(str::to_string)),
         }
@@ -2058,6 +2314,8 @@ pub async fn run_up(
             Some(spawn_joined_link(
                 joined.clone(),
                 memberships.clone(),
+                pending_orgs.clone(),
+                state.clone(),
                 mesh.node().clone(),
                 link.clone(),
                 presented,
@@ -2074,6 +2332,8 @@ pub async fn run_up(
         link: link.clone(),
         memberships: memberships.clone(),
         subnets_dir,
+        state_root: state.clone(),
+        pending_orgs: pending_orgs.clone(),
         node: mesh.node().clone(),
     });
     let (stop_tx, mut stop_rx) = mpsc::channel(1);
@@ -2147,6 +2407,12 @@ struct StatusView {
     /// A joined node's live link to the node it enrolled with.
     #[serde(skip_serializing_if = "Option::is_none")]
     link: Option<serde_json::Value>,
+    /// The org this node is a member of (its installed authority).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org: Option<String>,
+    /// Standalone org links awaiting approval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org_pending: Option<u64>,
 }
 
 async fn observe(state: &Path) -> Result<StatusView, CliError> {
@@ -2158,6 +2424,8 @@ async fn observe(state: &Path) -> Result<StatusView, CliError> {
         detail: detail.map(str::to_string),
         subnet_expires_at: None,
         link: None,
+        org: None,
+        org_pending: None,
     };
     Ok(match probe(&dir)? {
         Liveness::Absent => view(
@@ -2178,6 +2446,8 @@ async fn observe(state: &Path) -> Result<StatusView, CliError> {
                 StatusView {
                     subnet_expires_at: reply["subnet_expires_at"].as_u64(),
                     link: Some(reply["link"].clone()).filter(|l| !l.is_null()),
+                    org: reply["org"].as_str().map(str::to_string),
+                    org_pending: reply["org_pending"].as_u64(),
                     ..view(&s, node, None)
                 }
             }

@@ -77,6 +77,77 @@ pub enum OrgCommand {
     /// DACL on Windows); only its commitment rides in the signed
     /// grant (the raw key never touches the wire).
     GrantCapability(GrantCapabilityArgs),
+    /// Approve a device's pending org invite: sign its membership
+    /// certificate here, with the offline org root, for exactly the device
+    /// that claimed the invite, and hand it to the running enrolling node,
+    /// which delivers it. The root key never reaches a node.
+    Approve(OrgApproveArgs),
+    /// Create a standalone org link: org membership only, for a device
+    /// already on this mesh, redeemed over its session with this node.
+    /// Always approval-gated (`org approve`).
+    Invite(OrgInviteArgs),
+    /// Join an org with a standalone link, through this device's running
+    /// `up`. Until the operator approves, the node keeps asking by itself;
+    /// once issued it adopts the membership and installs it live.
+    Join(OrgJoinArgs),
+}
+
+/// `org approve` arguments.
+#[derive(Args, Debug)]
+pub struct OrgApproveArgs {
+    /// Offer id from `invite create` / `invite status`.
+    pub offer_id: String,
+    /// The full 64-hex device entity you expect to approve; must match the
+    /// pending claim.
+    #[arg(long, value_name = "ENTITY")]
+    pub subject: String,
+    /// The org root key file (`org keygen`); stays on this machine.
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: PathBuf,
+    /// Membership generation (raise it to re-admit after a revocation floor).
+    #[arg(long, default_value_t = 0)]
+    pub generation: u32,
+    /// Membership certificate lifetime in seconds.
+    #[arg(long = "ttl-secs", default_value_t = ORG_CERT_TTL_SECS_RECOMMENDED)]
+    pub ttl_secs: u64,
+    /// Accept a group/world-readable org key file (Unix).
+    #[arg(long)]
+    pub insecure_permissions: bool,
+    /// State directory of the enrolling node (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+}
+
+/// `org invite` arguments.
+#[derive(Args, Debug)]
+pub struct OrgInviteArgs {
+    /// The org (its 64-hex org id).
+    pub org: String,
+    /// State directory of the enrolling node (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Lifetime of the unredeemed link (default 24h).
+    #[arg(long, value_name = "DURATION", value_parser = crate::humantime::parse_duration)]
+    pub ttl: Option<std::time::Duration>,
+    /// Bind the link to one device's full 64-hex entity id.
+    #[arg(long = "for", value_name = "ENTITY")]
+    pub for_subject: Option<String>,
+    /// Write the link to this new owner-only file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    pub out: Option<PathBuf>,
+}
+
+/// `org join` arguments.
+#[derive(Args, Debug)]
+pub struct OrgJoinArgs {
+    /// The standalone org link, or `-` to read it from stdin (then `--yes`).
+    pub token: String,
+    /// State directory of this device's running `net-mesh up`.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Skip the interactive confirmation (scripts and agent tool use).
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -388,7 +459,174 @@ pub async fn run(
         OrgCommand::IssueFloors(args) => run_issue_floors(args, output).await,
         OrgCommand::GrantDispatcher(args) => run_grant_dispatcher(args, output).await,
         OrgCommand::GrantCapability(args) => run_grant_capability(args, output).await,
+        OrgCommand::Approve(args) => run_approve(args, output, profile_name).await,
+        OrgCommand::Invite(args) => {
+            super::enrollment::run_invite(
+                super::enrollment::InviteCommand::Create(super::enrollment::CreateArgs {
+                    state_dir: args.state_dir,
+                    ttl: args.ttl,
+                    require_approval: true,
+                    for_subject: args.for_subject,
+                    out: args.out,
+                    addr: None,
+                    subnet: None,
+                    subnet_rights: None,
+                    org: Some(args.org),
+                    standalone: true,
+                }),
+                output,
+                profile_name,
+            )
+            .await
+        }
+        OrgCommand::Join(args) => run_org_join(args, output, profile_name).await,
     }
+}
+
+/// `org approve`: fetch the pending claim, sign its membership here with the
+/// org root, and hand the certificate to the enrolling node.
+async fn run_approve(
+    args: OrgApproveArgs,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let expected = parse_entity_hex(&args.subject)?;
+    let pending = super::enrollment::node_request(
+        args.state_dir.clone(),
+        profile_name,
+        serde_json::json!({ "op": "invite_org_pending", "offer_id": args.offer_id }),
+    )
+    .await?;
+    let claimed = parse_entity_hex(pending["subject"].as_str().unwrap_or_default())?;
+    if claimed != expected {
+        return Err(invalid_args(format!(
+            "the pending claim is from {}, not the --subject you named",
+            pending["subject"].as_str().unwrap_or_default()
+        )));
+    }
+    let keypair = load_org_key(&args.org_key, args.insecure_permissions).await?;
+    let offered = pending["org"].as_str().unwrap_or_default();
+    if hex::encode(keypair.org_id().as_bytes()) != offered {
+        return Err(invalid_args(format!(
+            "--org-key is the root of org {}, but the invite offers org {offered}",
+            hex::encode(keypair.org_id().as_bytes())
+        )));
+    }
+    let cert = OrgMembershipCert::try_issue(&keypair, claimed, args.generation, args.ttl_secs)
+        .map_err(|e| invalid_args(format!("membership certificate: {e}")))?;
+    drop(keypair);
+    let reply = super::enrollment::node_request(
+        args.state_dir,
+        profile_name,
+        serde_json::json!({
+            "op": "invite_org_approve",
+            "offer_id": args.offer_id,
+            "subject": hex::encode(expected.as_bytes()),
+            "cert": hex::encode(cert.to_bytes()),
+        }),
+    )
+    .await?;
+    emit_value(OutputFormat::resolve_oneshot(output), &reply)
+        .map_err(|e| generic(format!("write result: {e}")))
+}
+
+/// Bound on the `org join` exchange with the running node.
+const ORG_JOIN_CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(28);
+
+/// `org join`: show what is being joined, confirm, and hand the link to the
+/// running node over its authenticated control endpoint.
+async fn run_org_join(
+    args: OrgJoinArgs,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use net_sdk::enrollment::standalone::is_standalone_org;
+    let from_stdin = args.token == "-";
+    if from_stdin && !args.yes {
+        return Err(invalid_args(
+            "reading the link from stdin needs --yes (stdin cannot also answer the prompt)",
+        ));
+    }
+    let token = if from_stdin {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = String::new();
+        tokio::io::stdin()
+            .take(4096)
+            .read_to_string(&mut buf)
+            .await
+            .map_err(|e| generic(format!("read link from stdin: {e}")))?;
+        ScrubbedString::new(buf.trim().to_string())
+    } else {
+        ScrubbedString::new(args.token)
+    };
+    let invite = net_sdk::enrollment::invite::MembershipInvite::decode(token.as_str())
+        .map_err(|e| invalid_args(format!("not a valid link: {e}")))?;
+    let offer = match invite.org() {
+        Some(offer) if is_standalone_org(&invite) => *offer,
+        _ => {
+            return Err(invalid_args(
+                "not a standalone org link (a mesh invite is redeemed with `net-mesh join`)",
+            ))
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now >= invite.policy().expires_at() {
+        return Err(invalid_args("this link has expired; ask for a new one"));
+    }
+    eprintln!(
+        "Joining org {} under issuer {}\n  membership only (no dispatcher or capability right); \
+         the operator approves it with the org root",
+        hex::encode(offer.org.as_bytes()),
+        invite.issuer_fingerprint(),
+    );
+    let tty = {
+        use std::io::IsTerminal as _;
+        std::io::stdin().is_terminal() && !from_stdin
+    };
+    let yes = args.yes;
+    tokio::task::spawn_blocking(move || {
+        super::ice::check_confirm_gate(tty, yes, || {
+            use std::io::{BufRead as _, Write as _};
+            let mut err = std::io::stderr();
+            write!(
+                err,
+                "Confirm the org and issuer are the ones you expect. Type YES to join: "
+            )
+            .and_then(|()| err.flush())
+            .map_err(|e| generic(format!("prompt: {e}")))?;
+            let mut line = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| generic(format!("prompt: {e}")))?;
+            Ok(line.trim() == "YES")
+        })
+    })
+    .await
+    .map_err(|e| generic(format!("confirmation task failed: {e}")))??;
+
+    let node_dir = super::lifecycle::state_dir(args.state_dir, profile_name)?
+        .join(super::lifecycle::NODE_SUBDIR);
+    let (_, reply) = super::lifecycle::control_call_within(
+        &node_dir,
+        serde_json::json!({ "op": "org_join", "token": token.as_str() }),
+        ORG_JOIN_CONTROL_WAIT,
+    )
+    .await
+    .map_err(|e| {
+        crate::error::connection_failure(format!(
+            "this device's node is not reachable ({e:?}); `org join` runs through a running \
+             `net-mesh up`"
+        ))
+    })?;
+    if let Some(e) = reply["error"].as_str() {
+        return Err(generic(e.to_string()));
+    }
+    emit_value(OutputFormat::resolve_oneshot(output), &reply)
+        .map_err(|e| generic(format!("write result: {e}")))
 }
 
 #[derive(Serialize)]

@@ -438,7 +438,7 @@ fn a_standalone_subnet_link_issues_only_to_the_proven_session_entity() {
 
     // The delivering session must have proven this very device.
     let other = Identity::generate();
-    assert_eq!(answer(&fresh(), None), Err(Refusal::Conflict));
+    assert_eq!(answer(&fresh(), None), Err(Refusal::Unavailable));
     assert_eq!(
         answer(&fresh(), Some(other.entity_id())),
         Err(Refusal::Conflict)

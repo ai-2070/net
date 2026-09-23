@@ -254,9 +254,12 @@ pub fn answer_standalone_redeem(
         return Err(Refusal::Invalid);
     }
     // The credential is for the entity proven on the delivering session,
-    // not merely for whoever signed.
-    if session_subject != Some(&request.subject) {
-        return Err(Refusal::Conflict);
+    // not merely for whoever signed: none proven yet is "not now"; a
+    // different one is a conflict.
+    match session_subject {
+        None => return Err(Refusal::Unavailable),
+        Some(proven) if proven != &request.subject => return Err(Refusal::Conflict),
+        Some(_) => {}
     }
     let invite = request.invite()?;
     if !is_standalone_subnet(&invite) && !is_standalone_org(&invite) {
@@ -434,6 +437,11 @@ pub async fn request_subnet_redeem(
     invite: &MembershipInvite,
     timeout: std::time::Duration,
 ) -> Result<SubnetRedeemReply, String> {
+    // The issuer binds the credential to the entity this session has
+    // proven; prove it first (a cheap no-op once established).
+    node.prove_identity_to(issuer_node)
+        .await
+        .map_err(|e| format!("proving this device's identity to the issuer: {e}"))?;
     let request = SubnetRedeemRequest::sign(device, invite, issuer_node, super::now_unix())
         .map_err(|e| e.to_string())?;
     let opts = net::adapter::net::mesh_rpc::CallOptions {
