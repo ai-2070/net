@@ -44,6 +44,7 @@ use crate::rpc_wire::{self, EventMeta, RpcFrame, RpcRequestPayload, RpcStatus};
 use crate::session::{event_frame_bytes, rtc_addr, PendingHandshake, SessionTable};
 use crate::signal::{self, SeenSignals};
 use crate::stream::{stream_id_from_label, Reliability, RxStream, StreamRecord};
+use net_wire::channel::membership::{self, AckReason, MembershipMsg};
 use net_wire::route_codec::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use net_wire::stream_window::{
     StreamReset, StreamWindow, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
@@ -580,6 +581,13 @@ pub struct LeafNode {
     /// and [`Self::resubscribe_served`]; exactly one plane owner per
     /// carrier.
     served_carriers: HashMap<(NodeId, u64), String>,
+    /// `(peer, canonical channel hash)` the peer SUBSCRIBED here — the
+    /// leaf's mirror of core's `SubscriberRoster` for the channels it
+    /// serves. Written by [`Self::handle_membership`]; read by
+    /// [`Self::is_channel_subscriber`]. The leaf's response path is
+    /// peer-addressed `DirectOnly`, so this roster never widens
+    /// delivery — it is membership truth, not a fan-out list.
+    channel_subscribers: std::collections::HashSet<(NodeId, u64)>,
     /// This leaf's entity as the org authority sees it
     /// (`AdmissionContext::provider`).
     org_entity: EntityId,
@@ -632,6 +640,7 @@ impl LeafNode {
             org_calls,
             org_serves,
             served_carriers: HashMap::new(),
+            channel_subscribers: std::collections::HashSet::new(),
             org_entity,
             org_revocation: crate::org::revocation::RevocationFacts::default(),
             org_replay: crate::org::replay::AdmissionReplayGuard::with_defaults(),
@@ -1244,6 +1253,7 @@ impl LeafNode {
             self.reply_subscriptions.retain(|(p, _)| *p != peer);
             self.rpc_reply_carriers.retain(|(p, _)| *p != peer);
             self.served_carriers.retain(|(p, _), _| *p != peer);
+            self.channel_subscribers.retain(|(p, _)| *p != peer);
             self.stream_kinds.retain(|(p, _), _| *p != peer);
         }
         // A fresh session carries no channel roster: every service
@@ -1298,6 +1308,7 @@ impl LeafNode {
         self.org_serves.fail_peer(peer, RetireReason::SessionLost);
         self.stream_kinds.retain(|(p, _), _| *p != peer);
         self.served_carriers.retain(|(p, _), _| *p != peer);
+        self.channel_subscribers.retain(|(p, _)| *p != peer);
         // The anchor's roster entry died with the session, so a
         // reconnect must re-subscribe or its replies strand again.
         self.reply_subscriptions.retain(|(p, _)| *p != peer);
@@ -2007,6 +2018,128 @@ impl LeafNode {
                 self.served_carriers.insert((peer, carrier), service);
             }
         }
+    }
+
+    /// One inbound `Subscribe` / `Unsubscribe` / `Ack` on the
+    /// membership subprotocol — the leaf's mirror of the core's
+    /// `handle_membership_message` arm: authorize, roster, ack.
+    ///
+    /// Failing to answer is not a neutral disposition: the requester's
+    /// `ensure_reply_subscription` blocks on this Ack and dies at its
+    /// membership-ack timeout without it, so every call into a leaf
+    /// provider would fail before its first frame.
+    fn handle_membership(&mut self, peer: NodeId, msg: MembershipMsg) {
+        match msg {
+            MembershipMsg::Subscribe {
+                channel,
+                nonce,
+                // A `PermissionToken` is core-only by the codec's own
+                // dependency note — the leaf verifies none and admits
+                // under [`Self::authorize_subscribe`]'s two rules
+                // either way. The queue-group mode is accepted
+                // unchanged (mode-agnostic auth, as in core) and makes
+                // no difference to a peer-addressed response path.
+                token: _token,
+                queue_group: _queue_group,
+            } => {
+                let hash = Channel::from_name(channel.clone()).canonical();
+                let (accepted, reason) = self.authorize_subscribe(peer, channel.as_str());
+                if accepted {
+                    // Core's `roster.add_with_mode` counterpart.
+                    self.channel_subscribers.insert((peer, hash));
+                }
+                self.send_membership_ack(peer, nonce, accepted, reason, hash);
+            }
+            MembershipMsg::Unsubscribe { channel, nonce } => {
+                let hash = Channel::from_name(channel).canonical();
+                self.channel_subscribers.remove(&(peer, hash));
+                // Unsubscribe is always accepted — idempotent even if
+                // the peer was not subscribed (core's arm).
+                self.send_membership_ack(peer, nonce, true, None, hash);
+            }
+            // A leaf's own subscribes are fire-and-forget (`subscribe`
+            // hands the nonce back but nothing awaits it), so an
+            // inbound Ack completes nothing here. Core correlates
+            // nonces against `pending_membership_acks` with a
+            // from-node binding; when the leaf grows an awaiter, the
+            // same binding belongs with it (an Ack is only the
+            // publisher's to give).
+            MembershipMsg::Ack { .. } => {}
+        }
+    }
+
+    /// The leaf's `authorize_subscribe`: the two rules the leaf CAN
+    /// enforce, at the points core's gate reaches.
+    ///
+    /// 1. **Known channel** (core's `UnknownChannel`): the request and
+    ///    reply channels of a service this leaf SERVES are registered
+    ///    here; anything else is refused, not silently accepted.
+    /// 2. **Origin binding** (the [`crate::channel::reply_channel`]
+    ///    rule): a peer may subscribe only the reply channel carrying
+    ///    its OWN origin. Enforced whenever the peer's entity is
+    ///    pinned; an unpinned peer is ACCEPTED because the leaf's
+    ///    response path is peer-addressed `DirectOnly` — a roster
+    ///    entry can never widen delivery here, where core (whose
+    ///    publish fan-out roster-fans) needs the `DirectOnly`
+    ///    compensation on protected responses instead.
+    ///
+    /// Core's `PermissionToken` verification, channel policy store and
+    /// auth-failure throttle have no leaf analogue; token-bearing
+    /// subscribes fall under the same two rules.
+    fn authorize_subscribe(&self, peer: NodeId, name: &str) -> (bool, Option<AckReason>) {
+        let known = self.org_serves.services().any(|service| {
+            name == format!("{service}.requests")
+                || name
+                    .strip_prefix(&format!("{service}.replies."))
+                    .is_some_and(|origin| origin.len() == 16)
+        });
+        if !known {
+            return (false, Some(AckReason::UnknownChannel));
+        }
+        if let Some(origin_hex) = name.rsplit_once(".replies.").map(|(_, origin)| origin) {
+            if let Some(pinned) = self.peer_entity_id(peer) {
+                let claimed = u64::from_str_radix(origin_hex, 16).ok();
+                if claimed != Some(pinned.origin_hash()) {
+                    return (false, Some(AckReason::Unauthorized));
+                }
+            }
+        }
+        (true, None)
+    }
+
+    /// Core's `send_membership_ack`: echo the nonce back to the
+    /// requester on the membership subprotocol (stream id
+    /// `SUBPROTOCOL_CHANNEL_MEMBERSHIP`, fire-and-forget — the
+    /// requester retries against its own timeout).
+    fn send_membership_ack(
+        &mut self,
+        peer: NodeId,
+        nonce: u64,
+        accepted: bool,
+        reason: Option<AckReason>,
+        channel_hash: u64,
+    ) {
+        let payload = membership::encode(&MembershipMsg::Ack {
+            nonce,
+            accepted,
+            reason,
+        });
+        let _ = self.send_subprotocol(
+            peer,
+            u64::from(SUBPROTOCOL_MEMBERSHIP),
+            SUBPROTOCOL_MEMBERSHIP,
+            channel_hash as u16,
+            &payload,
+            false,
+        );
+    }
+
+    /// Whether `peer` holds a live subscription for `channel` — the
+    /// roster read.
+    pub fn is_channel_subscriber(&self, peer: NodeId, channel: &str) -> bool {
+        Channel::new(channel)
+            .map(|c| self.channel_subscribers.contains(&(peer, c.canonical())))
+            .unwrap_or(false)
     }
 
     /// The unary `call`'s verbatim provider-binding clause (E2.1,
@@ -3179,8 +3312,17 @@ impl LeafNode {
                     reason: StreamFailure::PeerReset,
                 });
             }
-            // A leaf serves no membership requests.
-            Decoded::Membership(_) => {}
+            // A leaf serves few membership requests — but it serves
+            // them truthfully. A caller's `ensure_reply_subscription`
+            // AWAITS the Ack for its `<service>.replies.<origin>`
+            // Subscribe (3 attempts, 5 s apart) before it will send a
+            // REQUEST, so dropping the frame here (the pre-fix
+            // `Decoded::Membership(_) => {}`) killed every org call
+            // whose provider is a leaf at the caller's
+            // membership-ack timeout. The core's
+            // `handle_membership_message` arm is the contract:
+            // authorize, roster, ack.
+            Decoded::Membership(msg) => self.handle_membership(peer, msg),
         }
     }
 

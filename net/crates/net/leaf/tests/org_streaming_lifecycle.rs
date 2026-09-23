@@ -1626,6 +1626,7 @@ mod node_level {
     use net_leaf::identity::LeafIdentity;
     use net_leaf::node::LeafNode;
     use net_leaf::session::{rtc_addr, routing_id};
+    use net_wire::channel::membership::{self, AckReason, MembershipMsg};
     use net_wire::crypto::{handshake_prologue, NoiseHandshake, StaticKeypair};
     use net_wire::parsed_packet::ParsedPacket;
     use net_wire::pool::PacketBuilder;
@@ -1688,6 +1689,46 @@ mod node_level {
         builder.set_channel_hash(channel_hash);
         builder.set_origin_hash(0xFEED_FACE_0000_0001);
         builder.build_subprotocol(stream_id, seq, &events, PacketFlags::RELIABLE, subprotocol_id)
+    }
+
+    /// Decrypt one packet the leaf built, as the peer would.
+    fn decrypt(peer_session: &NetSession, parsed: &ParsedPacket) -> Bytes {
+        let aad = parsed.header.aad();
+        let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().expect("nonce"));
+        peer_session
+            .rx_cipher()
+            .decrypt_to_bytes(counter, &aad, parsed.payload.clone())
+            .expect("the peer decrypts")
+    }
+
+    /// Drain the node's outbound and unwrap every event frame
+    /// (`[len: u32le][data]…`, `net_wire::protocol::EventFrame`).
+    fn drain_events(peer_session: &NetSession, node: &mut LeafNode) -> Vec<Bytes> {
+        let mut events = Vec::new();
+        for out in node.take_outbound() {
+            let Some(parsed) = ParsedPacket::parse(out.packet, rtc_addr(0, 1)) else {
+                continue;
+            };
+            let plaintext = decrypt(peer_session, &parsed);
+            let mut rest = plaintext.as_ref();
+            while rest.len() >= 4 {
+                let len = u32::from_le_bytes(rest[0..4].try_into().expect("len prefix")) as usize;
+                if rest.len() < 4 + len {
+                    break;
+                }
+                events.push(Bytes::copy_from_slice(&rest[4..4 + len]));
+                rest = &rest[4 + len..];
+            }
+        }
+        events
+    }
+
+    /// The Acks among some decoded events, decoded.
+    fn acks(events: &[Bytes]) -> Vec<MembershipMsg> {
+        events
+            .iter()
+            .filter_map(|e| membership::decode(e).ok())
+            .collect()
     }
 
     #[test]
@@ -1810,5 +1851,240 @@ mod node_level {
             None,
             "and completes without retirement"
         );
+    }
+
+    /// The 16-witness matrix blocker: an inbound Subscribe for a served
+    /// call's reply channel must be ACKED (a caller's
+    /// `ensure_reply_subscription` waits on the Ack before it will send
+    /// a REQUEST), rostered, and the reply route must then DELIVER.
+    #[test]
+    fn a_reply_channel_subscribe_is_acked_rostered_and_the_reply_route_delivers() {
+        let world = World::at(clock::now_unix_secs());
+        let peer_ident = peer_identity();
+        let peer = peer_ident.node_id();
+        let (mut node, peer_session) = connected(peer);
+        let signed = net_leaf::announce::build_announcement(
+            &peer_ident,
+            &["test.anchor".to_string()],
+            1,
+            clock::now_unix_nanos(),
+            300,
+        )
+        .expect("announcement");
+        assert!(node.ingest_announcement(&signed));
+
+        let calls: Rc<RefCell<Vec<ServeCall>>> = Rc::new(RefCell::new(Vec::new()));
+        let handler_calls = Rc::clone(&calls);
+        node.org_serve(
+            SERVICE,
+            ServeOptions {
+                shape: RpcCallShape::ServerStreaming,
+                access: ServeAccess::SameOrg,
+                provider_owner_org: world.owner_org,
+                skew_secs: 0,
+                default_live_ns: 300 * 1_000_000_000,
+                max_live_ns: 3600 * 1_000_000_000,
+                policy: None,
+            },
+            Rc::new(move |call| handler_calls.borrow_mut().push(call)),
+        )
+        .expect("serve");
+        let _ = drain_events(&peer_session, &mut node);
+
+        // The caller subscribes its OWN reply channel and waits.
+        let caller_origin = world.caller_entity.origin_hash();
+        let reply_name = format!("{SERVICE}.replies.{caller_origin:016x}");
+        let reply_route = Channel::new(&reply_name).expect("channel").canonical();
+        let subscribe = MembershipMsg::Subscribe {
+            channel: net_wire::channel::name::ChannelName::new(&reply_name).expect("name"),
+            nonce: 77,
+            token: None,
+            queue_group: None,
+        };
+        let packet = peer_packet(
+            &peer_session,
+            u64::from(net_leaf::channel::SUBPROTOCOL_MEMBERSHIP),
+            net_leaf::channel::SUBPROTOCOL_MEMBERSHIP,
+            reply_route as u16,
+            &membership::encode(&subscribe),
+        );
+        node.on_datagram(peer, packet, clock::now());
+        let seen = acks(&drain_events(&peer_session, &mut node));
+        assert!(
+            seen.contains(&MembershipMsg::Ack {
+                nonce: 77,
+                accepted: true,
+                reason: None
+            }),
+            "the Subscribe is ACKED — without this the caller dies at its \
+             membership-ack timeout before the first REQUEST: {seen:?}"
+        );
+        assert!(
+            node.is_channel_subscriber(peer, &reply_name),
+            "and the subscription is rostered"
+        );
+
+        // Unsubscribe is idempotent and always accepted; a re-subscribe
+        // re-admits (core's arm semantics).
+        let unsubscribe = MembershipMsg::Unsubscribe {
+            channel: net_wire::channel::name::ChannelName::new(&reply_name).expect("name"),
+            nonce: 80,
+        };
+        let packet = peer_packet(
+            &peer_session,
+            u64::from(net_leaf::channel::SUBPROTOCOL_MEMBERSHIP),
+            net_leaf::channel::SUBPROTOCOL_MEMBERSHIP,
+            reply_route as u16,
+            &membership::encode(&unsubscribe),
+        );
+        node.on_datagram(peer, packet, clock::now());
+        let seen = acks(&drain_events(&peer_session, &mut node));
+        assert!(seen.contains(&MembershipMsg::Ack {
+            nonce: 80,
+            accepted: true,
+            reason: None
+        }));
+        assert!(!node.is_channel_subscriber(peer, &reply_name));
+        let packet = peer_packet(
+            &peer_session,
+            u64::from(net_leaf::channel::SUBPROTOCOL_MEMBERSHIP),
+            net_leaf::channel::SUBPROTOCOL_MEMBERSHIP,
+            reply_route as u16,
+            &membership::encode(&subscribe),
+        );
+        node.on_datagram(peer, packet, clock::now());
+        let _ = drain_events(&peer_session, &mut node);
+        assert!(node.is_channel_subscriber(peer, &reply_name));
+
+        // THE REPLY ROUTE DELIVERS: a served call's terminal rides
+        // exactly the channel the caller subscribed.
+        let request_route =
+            Channel::from_name(channel::request_channel(SERVICE).expect("c")).canonical();
+        let binding = node.peer_session_binding(peer).expect("session binding");
+        let node_entity = EntityId::from_bytes(*node.identity().entity().entity_id());
+        let intent = world.intent_at(5, node_entity);
+        let mut req = RpcRequestPayload {
+            service: SERVICE.to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_STREAMING_RESPONSE,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"open"),
+        };
+        attach_signed_admission(
+            &mut req,
+            &intent,
+            0x3201,
+            SERVICE,
+            RpcCallShape::ServerStreaming,
+            Some(binding),
+            clock::now_unix_nanos(),
+        )
+        .expect("mint");
+        let frame =
+            rpc_wire::encode_request_frame(caller_origin, 0x3201, request_route, &req).expect("f");
+        let packet = peer_packet(
+            &peer_session,
+            channel::publish_stream_id(request_route),
+            0,
+            request_route as u16,
+            &frame,
+        );
+        node.on_datagram(peer, packet, clock::now());
+        assert_eq!(calls.borrow().len(), 1, "the opening was admitted");
+        let call = calls.borrow()[0].clone();
+        call.send(b"item").expect("send");
+        call.finish(net_leaf::rpc_serve::HandlerResult::Ok);
+        node.tick(clock::now());
+
+        let mut responses = Vec::new();
+        for event in drain_events(&peer_session, &mut node) {
+            if let Ok(Some(rpc_wire::RpcFrame::Response { payload, .. })) =
+                rpc_wire::decode_frame(event.clone())
+            {
+                assert_eq!(
+                    rpc_wire::decode_route(&event),
+                    Some(reply_route),
+                    "every RESPONSE rides exactly the reply route the caller subscribed"
+                );
+                responses.push(payload);
+            }
+        }
+        assert_eq!(
+            responses,
+            vec![
+                super::continue_chunk(b"item"),
+                super::end_terminal(),
+            ],
+            "the items and the one terminal deliver in order on the reply route"
+        );
+    }
+
+    /// The discriminating negatives of `authorize_subscribe`: a peer
+    /// may subscribe only the reply channel carrying its OWN origin,
+    /// and only channels this leaf serves.
+    #[test]
+    fn a_foreign_origin_or_unknown_channel_subscribe_is_refused_typed() {
+        let world = World::at(clock::now_unix_secs());
+        let peer_ident = peer_identity();
+        let peer = peer_ident.node_id();
+        let (mut node, peer_session) = connected(peer);
+        let signed = net_leaf::announce::build_announcement(
+            &peer_ident,
+            &["test.anchor".to_string()],
+            1,
+            clock::now_unix_nanos(),
+            300,
+        )
+        .expect("announcement");
+        assert!(node.ingest_announcement(&signed));
+        node.org_serve(
+            SERVICE,
+            ServeOptions {
+                shape: RpcCallShape::ServerStreaming,
+                access: ServeAccess::SameOrg,
+                provider_owner_org: world.owner_org,
+                skew_secs: 0,
+                default_live_ns: 300 * 1_000_000_000,
+                max_live_ns: 3600 * 1_000_000_000,
+                policy: None,
+            },
+            Rc::new(|_call| {}),
+        )
+        .expect("serve");
+        let _ = drain_events(&peer_session, &mut node);
+
+        let caller_origin = world.caller_entity.origin_hash();
+        let foreign = format!("{SERVICE}.replies.{:016x}", caller_origin ^ 1);
+        let unknown = format!("nosuchsvc.replies.{caller_origin:016x}");
+        for (name, nonce, want) in [
+            (foreign, 78u64, AckReason::Unauthorized),
+            (unknown, 79, AckReason::UnknownChannel),
+        ] {
+            let subscribe = MembershipMsg::Subscribe {
+                channel: net_wire::channel::name::ChannelName::new(&name).expect("name"),
+                nonce,
+                token: None,
+                queue_group: None,
+            };
+            let hash = Channel::new(&name).expect("channel").canonical();
+            let packet = peer_packet(
+                &peer_session,
+                u64::from(net_leaf::channel::SUBPROTOCOL_MEMBERSHIP),
+                net_leaf::channel::SUBPROTOCOL_MEMBERSHIP,
+                hash as u16,
+                &membership::encode(&subscribe),
+            );
+            node.on_datagram(peer, packet, clock::now());
+            let seen = acks(&drain_events(&peer_session, &mut node));
+            assert!(
+                seen.contains(&MembershipMsg::Ack {
+                    nonce,
+                    accepted: false,
+                    reason: Some(want)
+                }),
+                "{name:?} must be refused {want:?}: {seen:?}"
+            );
+            assert!(!node.is_channel_subscriber(peer, &name));
+        }
     }
 }
