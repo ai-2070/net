@@ -1449,3 +1449,30 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   `S3Facade`, one ruled carve: `pub(crate)` `from_raw` constructors in
   `sdk/src/mesh_rpc.rs` for the five typed wrappers — zero public-API
   change, probe-enforced).
+
+- 2026-09-22, **Stage 3 executed** (branch `LZL0/org-streaming`, pinned
+  brief `spikes/org-streaming/S3_BRIEF.md` @`0071fd1fc`; one lane
+  `S3Facade`): rows 3.1–3.3 landed over six commits (`d63e9c615`…
+  `b7aaacdc5`, `S1_REPORT.md` §6). Landed: the §4.3 caller verbs verbatim
+  (`call_streaming`/`call_streaming_bytes`/`call_client_stream`/
+  `call_duplex` + the `*_bytes_deadline` seams; `plan()` reused; provider
+  PINNED per call; `deadline_ms == 0` ⇒ the Q1 facade default 300 s), the
+  serve rows over `serve_org_*_bytes_node` with the `OrgCaller` projection
+  and the `|_| true` policy, and the ORGANIZATIONS.md verb text + the
+  probe's Stage-3 pins. **F-S3.2-1 resolved per Main's ruling:** five
+  `pub(crate)` `from_raw` constructors in `sdk/src/mesh_rpc.rs` (the typed
+  adapters drop `RpcContext`, so the `OrgCaller` projection cannot ride
+  them) — constructors-only, zero field-visibility moves, the probe pin
+  passing UNCHANGED (the no-public-change proof). The REQUIRED 3.1 pin
+  receipt executed: "resolve a second provider mid-call" at
+  `OrgClientStreamCall::send` → red at the named pin assertion, sha-proven
+  restore `bf302b5e…`, re-green. Estate at head: `org_streaming` **10/10**
+  at the plan's named command (CI JUnit roster gate pinned at floor 10 with
+  `--self-test` first), SDK org estate 338/338, `org_rpc_streaming` 42/42
+  unchanged, probe exit 0/0, fmt exit 0. Session record: the third
+  ENOSPC episode (a failed CREATE only; nothing corrupted; the
+  verify-size-after-write rule held). **F-S3.1-2 stated** (the protected
+  handler is not a sound cancel-observer — the retire supervisor may drop
+  the handler future without a final poll; the contract is the retirement
+  observables; no core change) for review adjudication. Stage 3 proceeds to
+  independent review.
