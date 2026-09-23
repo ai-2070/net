@@ -2151,7 +2151,123 @@ CLI test waits past the lapse and says so. Options, for a decision:
 - ~~Leaf renewal before expiry.~~
 - Standalone subnet join by an already-connected device (V3-2 task 3).
 - Organization enrollment.
-- The restart deferral above.
+- ~~The restart deferral above.~~ Closed by the next receipt.
+
+#### Self-healing joined link, stable Noise key, C3 liveness (receipt, 2026-09-23)
+
+This closes the restart deferral found in the renewal receipt, in two
+commits. Writing the re-attach witness also surfaced a larger defect.
+
+**Defect found: the operator's Noise key changed on every restart.**
+`MeshNode::new` always generated a fresh Noise static key. The node id and
+entity key survived a restart; the Noise key did not. Invites and bundles pin
+that key, so after **any** operator restart no enrolled device could ever
+reattach: every handshake silently timed out. The shipped join flow was
+affected, not just subnet joins.
+
+Fix (decision: persisted key file):
+- **Core:** opt-in `MeshNodeConfig::with_static_key(NoiseStaticKey)`. The
+  public half is derived from the private key, `Debug` is redacted and the
+  key is wiped on drop. The default (a fresh key) is unchanged.
+- **SDK:** `MeshBuilder::noise_static_key`.
+- **CLI:** node secrets v3 persist the key. v1 and v2 still read. A missing
+  key is generated and committed before bind. `up` always uses it.
+- **Downgrade note:** an older binary refuses v3 node state, the same as the
+  v1 → v2 step.
+
+**Self-healing link (commit `a115fd8b7`).** A joined `up` supervises its link
+to the node it enrolled with:
+- It re-attaches (direct, then relay, backoff 1–30 s) when the session is
+  gone or silent.
+- It re-presents subnet credentials on every new session, since admission is
+  per session.
+- It renews the leaf, and reports the live link in `node status`
+  (`attached`, `path`, `reattaches`, `subnet_admitted`, `readmissions`).
+- It stops once the join has left or is gone.
+
+"Silent" is the new core `peer_session_is_silent`: no authenticated inbound
+for `session_timeout`. The peer table keeps a dead peer for 30 ×
+`session_timeout`, and the failure detector only says `Failed` after 3 ×, so
+neither was a usable trigger.
+
+**C3 liveness (commit `8baeed7f4`; decision: option 2).**
+- **The problem.** The responder gate deferred a same-static re-handshake
+  while the old session was busy and "live", and it keyed liveness on
+  `is_timed_out(session_timeout)`. Two things made that wrong. Our own sends
+  refresh that timestamp. And a finished nRPC call leaves its channel stream
+  open. So a peer that restarted after any RPC waited out the full 30 s.
+- **The check.** The C3 spec (NAT_TRAVERSAL_V2_PLAN) says "pending unary
+  nRPC calls do not block the swap". Simply ignoring idle nRPC streams was
+  rejected: large and streaming responses are session-bound, and between
+  credit-paced chunks they have no unacked data. Such a stream can look idle
+  mid-transfer.
+- **Fix.** Liveness now means an authenticated inbound packet within 3
+  heartbeat intervals, capped at `session_timeout`. This is what the plan
+  specified: "keys deferral on recent authenticated inbound".
+  - `NetSession::last_inbound` is stamped only after AEAD verification and
+    counter admission, at the mesh receive path, the legacy adapter path and
+    the heartbeat verify.
+  - A live peer mid-transfer keeps heartbeating, so its transfer stays
+    protected.
+  - A restarted peer falls silent at once, so its re-handshake rotates
+    within about 15 s at default settings.
+- `peer_session_is_silent` uses the same inbound-only stamp.
+
+**Witnesses.**
+- CLI `a_joined_node_reattaches_and_is_readmitted_without_being_touched`
+  (operator on a fixed port):
+  - A: the operator restarts under a running device. Its `public_key` is
+    unchanged, and the device reattaches and is re-admitted untouched.
+  - B: a device started while the operator is down comes up unattached, then
+    attaches and is admitted once the operator returns.
+- Core unit tests:
+  - `a_stored_noise_key_is_kept_across_builds`;
+  - `busy_rotation_defers_only_while_the_peer_is_speaking` (our sends do not
+    count; the peer speaking again re-defers).
+- Integration `a_live_peers_rehandshake_does_not_cut_a_streaming_response`
+  (in the pinned `integration_nrpc_streaming`): the C3 responder gate,
+  mid-transfer. The plan listed this witness, but it did not exist.
+- CLI unit test: `node_state_v3_round_trips_and_v1_v2_state_still_reads`.
+- The renewal test restarts right after nRPC use with no session-lapse wait
+  (86 s → 53 s).
+
+**Inverse mutations** (all RED):
+- no re-attach;
+- silence not detected;
+- `up` not using the stored key;
+- no re-present on a new session;
+- v3 decode dropping the key;
+- core ignoring the stored key;
+- liveness back to the whole `session_timeout` (unit test and CLI renewal
+  test);
+- never deferring (unit test and streaming witness);
+- sends counted as the peer speaking;
+- heartbeats not stamped as inbound (streaming witness: heartbeats are what
+  keep a live peer "speaking").
+
+**Regressions.**
+- `cargo tl` 5817/5817.
+- `net-mesh-wire` 276/276.
+- Every integration binary (`cargo t`): 7038/7038.
+- The SDK suite as CI runs it: 811/811.
+- `net-cli` 353/353.
+- Clippy is clean: core (all-features, default and no-default lib/bins; all
+  targets), wire, and `net-cli`.
+- Rustdoc is clean: root, wire (`json`), and SDK (`full`).
+
+**CI along the way.** `f3eeaf82b` fixed two CI-only failures:
+- `subnet_join` wrote its `--psk-from` file with mode 0644, which the CLI
+  refuses on Unix;
+- `nrpc_service_equality`'s positive controls trusted a single 150 ms sleep.
+  They now poll, settle, and assert exactly one hit. With the gate removed,
+  both tests still fail.
+
+**Still open.**
+- ~~The restart deferral after nRPC use.~~
+- Standalone subnet join by an already-connected device (V3-2 task 3).
+- Organization enrollment.
+- The relay path re-registers on restart, but no witness restarts the
+  operator behind a relay yet (the natsim relay job covers first join only).
 
 ### V3-2A — channel-scoped invitation, join and credential lifecycle
 
