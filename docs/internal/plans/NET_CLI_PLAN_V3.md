@@ -265,6 +265,47 @@ The current subnet floor object has no subject field. V3 must therefore either p
 - Persist revocation before reporting committed; integrate with active admission/session checks and caches, not only future credential issuance. Old state or a restarted verifier cannot restore previously acknowledged authority.
 - Repeated removal is idempotent; delayed removal for an old incarnation must not erase a separately authorized newer incarnation. Generation comparisons and identifier exhaustion fail closed.
 
+### 6.1a Decision: subject floor (user-authorized 2026-09-23)
+
+**Mechanism.** A root-signed **subject floor**. It is the only option that
+matches "remove this subject from this scope" without revoking siblings or
+waiting for expiry. The rejected alternatives were a subtree floor bump plus
+reissue to every sibling (collateral revocation), and expiry-only removal
+(residual access until the grant lifetime ends).
+
+**Constraints, all binding on the implementation:**
+
+1. **Exact authority and identity.** The floor is root-signed. It carries an
+   authority-qualified scope, the full subject `EntityId` and explicit covered
+   rights. No routing IDs or other ambiguous identifiers.
+2. **Monotone, durable enforcement.** Accepted floors are persisted before
+   anything reports them committed. Old facts, restarts, renewal and
+   re-enrollment must never lower them.
+3. **Precise scope semantics.** The design must specify how ancestor-scoped and
+   delegated (`SubnetIssuerGrant`) credentials interact with the subject floor.
+   A still-valid alternative credential must not silently defeat the removal
+   the command claims.
+4. **Explicit generation semantics.** Pin which credential generation is
+   compared. Intentional re-admission requires authorized issuance at or above
+   the floor; retrying `join` is not enough.
+5. **Independent rights.** Define whether the command removes ATTACH only or
+   more rights. It must never silently broaden to ROUTE/EXPORT.
+6. **Honest propagation.** An owner commit is not fleet-wide enforcement.
+   Report applied and pending enforcement points separately.
+7. **Mixed-version safety.** An unsupported verifier must not silently ignore
+   the new fact while the CLI reports a successful removal. Verify the wire-kind
+   allocation before reserving a kind (e.g. 5), and update every affected
+   decoder and fixture together.
+8. **Collateral churn is disclosed.** Reusing the authority-wide
+   `subnet_auth_epoch` invalidation can force *sibling* sessions to re-admit.
+   Their grants stay valid, but they are not operationally "untouched". Prefer
+   subject-scoped invalidation where practical; otherwise disclose and test the
+   temporary churn instead of claiming zero collateral disruption.
+
+**Decisive witness.** B loses access with its old credentials, including on a
+real reconnect; C stays authorized in the same subnet; and the result survives
+a verifier restart.
+
 ### 6.2 Honest scope of the result
 
 A removal result separates:
