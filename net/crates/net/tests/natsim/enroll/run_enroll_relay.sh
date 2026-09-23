@@ -101,8 +101,12 @@ start_up() {
 stop_up() { nm "$1" "$2" down > /dev/null || fail "down failed for $2"; }
 
 # start_relay <name>: `relay serve` on the WAN at $RELAY, wait for readiness.
+# Launched through `ip netns exec` directly, not the `in_wan` function: a
+# backgrounded function runs in a forked subshell, so `$!` would be that shell
+# and a signal would never reach the relay. `ip netns exec` and `env` exec, so
+# here `$!` is the relay process itself.
 start_relay() {
-  in_wan env -u NET_MESH_CONFIG -u NET_MESH_PROFILE \
+  ip netns exec nsim_wan env -u NET_MESH_CONFIG -u NET_MESH_PROFILE \
     "$BIN" --output ndjson relay serve --bind "$RELAY" \
     > "$STATE/$1.out" 2> "$STATE/$1.err" &
   RELAY_PID=$!
@@ -118,13 +122,13 @@ start_relay() {
 stop_relay() {
   kill -TERM "$RELAY_PID"
   for _ in $(seq 1 50); do
-    kill -0 "$RELAY_PID" 2>/dev/null || break
+    grep -q '"event":"stopped"' "$STATE/$1.out" 2>/dev/null && break
     sleep 0.1
   done
-  kill -0 "$RELAY_PID" 2>/dev/null && fail "relay did not stop on SIGTERM"
-  RELAY_PID=""
   grep '"event":"stopped"' "$STATE/$1.out" > "$STATE/$1.stopped.json" \
-    || fail "relay wrote no stopped row: $(cat "$STATE/$1.out")"
+    || fail "relay wrote no stopped row on SIGTERM: $(cat "$STATE/$1.out")"
+  wait "$RELAY_PID" 2>/dev/null || true
+  RELAY_PID=""
 }
 
 # join_as <row>: run `join` from the agent, save the result.
