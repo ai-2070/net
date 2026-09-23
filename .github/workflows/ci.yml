@@ -1347,6 +1347,7 @@ jobs:
           --test gang_alloc_witness
           --test chain_discovery
           --test cross_lang_capability_fixtures
+          --test org_scoped_cross_process
           --test cross_lang_wire
           --test migration_integration
           --test migration_target_failure_mid_chunking
@@ -1358,6 +1359,29 @@ jobs:
           --test event_pingwave
           --test route_withdraw
           --test routed_transport_availability
+
+      # === S4: the two-OS-process scoped-discovery witness (R4CoreFix) ===
+      # The step above EXECUTED it (tests/org_scoped_cross_process.rs — the
+      # natsim.rs re-exec idiom: 1 passing witness + 1 #[ignore]
+      # spawned-provider role); this step PINS it: both names must appear
+      # with their verdicts and the floor is 1 passing + 1 ignored (never
+      # 0 passing). It is the permanent regression guard for the property
+      # F-S4Vectors-1 wrongly alleged (scoped discovery DOES cross
+      # OS-process boundaries — proven here, with the handle-discard
+      # mutation as its inverse).
+      - name: Witness floor — org_scoped_cross_process (1 passing + 1 ignored)
+        run: |
+          set -o pipefail
+          out=$(cargo test --test org_scoped_cross_process 2>&1 | tee /dev/stderr)
+          printf '%s\n' "$out" | grep -q '^test scoped_discovery_crosses_an_os_process_boundary \.\.\. ok$' || {
+            echo "::error::the cross-process scoped-discovery witness did not run and pass"
+            exit 1
+          }
+          printf '%s\n' "$out" | grep -q '^test xproc_scoped_provider_child \.\.\. ignored$' || {
+            echo "::error::the spawned-provider role is missing its ignore gate"
+            exit 1
+          }
+          echo "org_scoped_cross_process: 1 passing + 1 ignored (floor held)"
 
   # --- Family B: NAT traversal + port mapping + RedEX ------------------
   integration-nat-redex:

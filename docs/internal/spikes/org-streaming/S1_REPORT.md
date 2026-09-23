@@ -164,6 +164,52 @@ source-established label and its receipt per the brief's evidence rules.
   count, the dataforts-ENABLED build of the ungated declarations,
   typecheck:tests/release/check-ts-consumer.sh/CI themselves, non-Windows
   hosts.
+- **2026-09-22, R4CoreFix verified (executed)** — the F-S4Vectors-1
+  localization record + the permanent witness. Landed at `2001ff603` (the
+  `tests/org_scoped_cross_process.rs` witness + the 4 receipt logs) +
+  `ce0f86cad` (`R4COREFIX.md`, 23096 B, sha `463d4035…`). Verdict
+  executed and coordinator-verified: **zero core changes** (`git diff
+  --stat net/crates/net/src/` empty — my own check `CORE_DIFF_EMPTY_OK` at
+  report time and again at commit time) and the root cause at the exact
+  mechanism level (the provider harness discarded the `ServeHandle`;
+  `ServeHandle::drop` at `mesh_rpc.rs:468-489` RAII-deregisters →
+  `granted_snapshot()` empty → `announce_attempt`'s early arm →
+  `SendEmission.scoped` seals zero envelopes forever → the caller's
+  private plane honestly empty). The 10-probe instrumented-wheel run
+  localized it in ONE run (the `r4corefix-diag-pythonpair.log` receipt:
+  `send_emission_to … scoped=0` on every send, `granted_envelopes` never
+  fired, `capture_cold: grant lookup HIT (installed=1) pinned=true` with 0
+  rows) and was fully reverted. **The permanent witness
+  `scoped_discovery_crosses_an_os_process_boundary`** (the natsim.rs
+  two-OS-process re-exec idiom; also green under the Python-binding node
+  config): the child's granted emission carries the envelope, the parent's
+  private plane considers exactly the child's provider entity, and the
+  protected call is admitted with the exact five-field `Admitted`
+  attribution on both sides. Its inverse receipt (the child discards its
+  `ServeHandle` = the exact pre-fix `provider.py` shape) → the named red
+  (`F-S4Vectors-1: scoped discovery did not cross the OS-process
+  boundary`; `consumer_grants=1 relay_gate=0 intake=[0x8]`) → restored →
+  green 0.46s. **Coordinator spot-check SCRXPROC: the green half verified
+  at my own run (1 passed; 1 ignored; 0.49s) with `CORE_DIFF_EMPTY_OK`;
+  the inverse half (the same handle-discard at the `Ok(h) => h` binding)
+  re-run independently.** Pin roster: `scoped_discovery_crosses_an_os_
+  process_boundary` (1 passing) + `xproc_scoped_provider_child` (1
+  `#[ignore]` spawned-provider role); floor MIN=1 passing + 1 ignored.
+  **Finding 6 (the round-1 exposure — named, open at round 2): the
+  serve-handle teardown race** — the fixed `finally: handle.close()`
+  retires live protected streams by design (§2.2's one CANCEL terminal)
+  while the handler's chunks + eof still drain (`0x0005: server observed
+  CANCEL during streaming handler execution` at the caller's `recv:`);
+  same class as the first defect (registration lifetime vs call lifetime),
+  masked in-process by consume-then-close sequencing. Recorded as a named
+  consumer-side contract (cross-process providers sequence teardown AFTER
+  the caller's drain — the F-S3.1-2 sibling); the round-2 fix is
+  coordinated with `S4Vectors` (the ruled preference: the `DRAINED` stdin
+  handshake), and the row's green (the two-sided PASS signature) closes
+  the plan's last named cell. Also recorded: the audience-secret loader's
+  loud ACL refusal (the Windows parent-DACL trap — `C:\tmp` refused,
+  `%TEMP%` passes) as an operational rule; the lane's informational
+  finding (the caller.py probe mistypes) for `S4Vectors`' cleanup.
 - **2026-09-22, F-S4Vectors-1 mechanism RETRACTED (unprompted
   self-correction — credited).** `S4Vectors` disowns its own HIGH finding's
   mechanism after `R4CoreFix`'s instrumented-wheel trace: **there is no

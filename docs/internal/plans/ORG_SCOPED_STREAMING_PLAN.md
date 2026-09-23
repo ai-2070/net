@@ -1660,3 +1660,20 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   `scoped_discovery_crosses_an_os_process_boundary` witness + the
   localization record. The plan's last named cell stands one command from
   green.
+
+- 2026-09-22, **`R4CoreFix` verified (executed)** at `2001ff603` +
+  `ce0f86cad` (`R4COREFIX.md`): the localization record (10 one-run
+  probes, fully reverted; **zero core changes** — `CORE_DIFF_EMPTY_OK`,
+  coordinator-verified) + the permanent two-OS-process witness
+  `scoped_discovery_crosses_an_os_process_boundary` (green 0.46s incl.
+  under the Python-binding node config) with its inverse receipt (the
+  handle-discard mutation = the exact defect shape → the named red →
+  restored green). Coordinator spot-check: the green half re-run at my own
+  run (1 passed; 1 ignored). **Finding 6 named at round 1: the
+  serve-handle teardown race** (§2.2's retire converts the drain into a
+  `0x0005` CANCEL terminal at the caller's first recv — registration
+  lifetime vs call lifetime, the same class as the retracted finding's
+  true cause; masked in-process by consume-then-close). The round-2 fix
+  (the ruled `DRAINED` stdin handshake, `S4Vectors`' file) + the row
+  re-run close the plan's last named cell; the cross-process teardown
+  ordering joins the consumer-side contract (the F-S3.1-2 sibling).
