@@ -1,0 +1,21 @@
+docs/internal/plans/ORG_SCOPED_STREAMING_PLAN.md
+  s_3f3d4c91f992be::t_c870bf4f1b3bd2 1663-1679
+docs/internal/spikes/org-streaming/S1_REPORT.md
+  s_3f3d4c91f992be::t_d731d4c8c10f85 167-212
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d7c82c41806f31e33eab81773af7e3075979c162",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
