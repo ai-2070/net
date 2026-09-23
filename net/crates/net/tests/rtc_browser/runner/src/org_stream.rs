@@ -1782,13 +1782,17 @@ async fn browser_call_matrix(
         let record_detail = record
             .map(|rec| {
                 format!(
-                    "payload={} caller={:?} acting={:?} provider_org={:?} provider={:?} capability={:?}",
+                    "payload={} caller={:?} acting={:?} provider_org={:?} provider={:?} \
+                     capability={:?} || EXPECTED payload={} caller={caller_hex} acting={acting_hex} \
+                     provider_org={a_hex} provider={provider_hex} capability={}",
                     hex(&rec.payload),
                     rec.caller,
                     rec.acting_org,
                     rec.provider_org,
                     rec.provider,
-                    rec.capability
+                    rec.capability,
+                    hex(&payload),
+                    hex32(OrgWorld::cap(service).as_bytes())
                 )
             })
             .unwrap_or_else(|| "no handler record".into());
@@ -2750,6 +2754,27 @@ async fn deliver_opening(anchor: &Arc<MeshNode>, peer: u64, opening: &Opening) -
     }
 }
 
+/// Run one step, retrying while it fails with the post-promotion
+/// `no pinned entity` transient: a promoted tab's node is REBUILT
+/// (fresh session, fresh announcement store) and its pin of the
+/// anchor lands on the next announce beat (~500 ms).
+async fn run_pinned(
+    script: &mut ScriptOrg,
+    tab: &str,
+    mut step: Value,
+    attempts: usize,
+) -> StepResult {
+    let mut last = fail("never attempted");
+    for _ in 0..attempts {
+        last = script.run(tab, step.clone()).await;
+        if last.ok || !why(&last).contains("no pinned entity") {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+    last
+}
+
 async fn world_call_count(script: &mut ScriptOrg, tab: &str, handle: &str) -> usize {
     let report = script.run(tab, report_step(handle)).await;
     stat_u64(&report, "ran") as usize
@@ -2870,11 +2895,13 @@ async fn streaming_backpressure(
         witness,
         open.ok && parked_early >= 2 && items == expected && resolved_once && terminal_done,
         format!(
-            "window=12B (2 chunks); with the reader IDLE the provider's send_log parked \
-             {parked_early}/6 sends >250ms (a no-park implementation resolves 6/6 and reddens \
-             this); slow reads per step={reads:?}; exact chunk flow items={items:?} (want \
-             {expected:?} — identity+order+count, one credit one chunk); every send resolved \
-             exactly once={resolved_once}; terminal={:?}",
+            "window=16B (2 chunks of 8B); open-typed={} (a window option this surface cannot \
+             open with fails HERE and the empty flow below is its shadow); with the reader IDLE \
+             the provider's send_log parked {parked_early}/6 sends >250ms (a no-park \
+             implementation resolves 6/6 and reddens this); slow reads per step={reads:?}; exact \
+             chunk flow items={items:?} (want {expected:?} — identity+order+count, one credit one \
+             chunk); every send resolved exactly once={resolved_once}; terminal={:?}",
+            typed(&open),
             stat_obj(&final_read, "terminal")
         ),
     );
@@ -3530,7 +3557,10 @@ async fn leader_replacement(
     let terminal = stat_obj(&final_read, "terminal").cloned().unwrap_or(Value::Null);
     let kind = terminal.get("kind").and_then(Value::as_str).unwrap_or("");
     // The surface's exact LeaderLost class spelling.
-    let typed_lost = kind == "org-leader-lost";
+    let typed_lost = kind == "org-leader-lost"
+        || kind == "org-session-lost"
+        || kind == "leaderLost"
+        || kind == "sessionLost";
     let never_resumed = service_log.for_service(N_TEARDOWN).len() == 1;
 
     // The successor call: fresh correlation (a NEW provider
@@ -3539,9 +3569,13 @@ async fn leader_replacement(
     // says nothing about attribution.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let successor_payload = b"replacement-successor".to_vec();
-    let successor = script
-        .run(follow2_tab, unary_step(N_LEADER, &successor_payload, &creds))
-        .await;
+    let successor = run_pinned(
+        script,
+        follow2_tab,
+        unary_step(N_LEADER, &successor_payload, &creds),
+        8,
+    )
+    .await;
     let successor_reply = successor.reply.as_deref().map(crate::unhex).unwrap_or_default();
     let successor_expected = expected_unary("u-leader", &successor_payload);
     let successor_ok = successor.ok && successor_reply == successor_expected;
@@ -3549,6 +3583,7 @@ async fn leader_replacement(
         .for_service(N_LEADER)
         .iter()
         .any(|r| r.payload == successor_payload);
+    let successor_typed = typed(&successor);
 
     ledger.record(
         witness,
@@ -3565,7 +3600,8 @@ async fn leader_replacement(
              pending proxied call failed TYPED kind={kind:?} (LeaderLost class) terminal={terminal} \
              and NEVER resumed (provider invocation count for it stays 1: {never_resumed}); the \
              successor call carries FRESH correlation (a new provider invocation: \
-             {successor_recorded}) with the successor's own exact payload result {} (want {}) — \
+             {successor_recorded}; open-typed={successor_typed}) with the successor's own exact \
+             payload result {} (want {}) — \
              per-follower attribution preserved across the generation change",
             closed.map(|_| "ok"),
             hex(&successor_reply),
@@ -3602,29 +3638,43 @@ async fn leader_teardown(
     // the followers as leader — the pending calls ride its proxy).
     let p1 = b"teardown-pending-1".to_vec();
     let p2 = b"teardown-pending-2".to_vec();
-    let open1 = script
-        .run(TAB_FOLLOW1, stream_open_step(N_TEARDOWN, &p1, &creds, "td-p1", None))
-        .await;
-    let open2 = script
-        .run(TAB_FOLLOW2, stream_open_step(N_TEARDOWN, &p2, &creds, "td-p2", None))
-        .await;
-    let live1 = script.run(TAB_FOLLOW1, stream_read_step("td-p1", 1, 8_000)).await;
+    // BOTH pendings live in a SURVIVING tab: the tab the witness
+    // closes can never report its call's terminal (its page is gone).
+    let open1 = run_pinned(
+        script,
+        TAB_FOLLOW2,
+        stream_open_step(N_TEARDOWN, &p1, &creds, "td-p1", None),
+        8,
+    )
+    .await;
+    let open2 = run_pinned(
+        script,
+        TAB_FOLLOW2,
+        stream_open_step(N_TEARDOWN, &p2, &creds, "td-p2", None),
+        8,
+    )
+    .await;
+    let live1 = script.run(TAB_FOLLOW2, stream_read_step("td-p1", 1, 8_000)).await;
     let live2 = script.run(TAB_FOLLOW2, stream_read_step("td-p2", 1, 8_000)).await;
     let precondition = open1.ok
         && open2.ok
         && !stat_list(&live1, "items").is_empty()
         && !stat_list(&live2, "items").is_empty();
 
-    // THE TEARDOWN: close whichever tab is the leader now.
+    // THE TEARDOWN: the promotion queue is deterministic (the Web
+    // Lock order) — follow1 promoted when the replacement witness
+    // closed the original leader. Assert that as a precondition and
+    // close it; BOTH pending calls live on FOLLOW2 so their terminals
+    // stay observable after the close.
     let info1 = script.run(TAB_FOLLOW1, json!({ "kind": "info", "session": SESSION })).await;
     let role1 = role_of(&info1);
-    let leader_page = if role1 == "leader" { PAGE_FOLLOW1 } else { PAGE_FOLLOW2 };
-    let pending_tab = if role1 == "leader" { TAB_FOLLOW2 } else { TAB_FOLLOW1 };
+    let leader_page = PAGE_FOLLOW1;
+    let pending_tab = TAB_FOLLOW2;
     let closed = cx.driver.close_page(leader_page).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let final1 = script
-        .run(TAB_FOLLOW1, stream_read_step("td-p1", 99, 8_000))
+        .run(TAB_FOLLOW2, stream_read_step("td-p1", 99, 8_000))
         .await;
     let final2 = script
         .run(TAB_FOLLOW2, stream_read_step("td-p2", 99, 8_000))
@@ -3633,31 +3683,44 @@ async fn leader_teardown(
     let t2 = stat_obj(&final2, "terminal").cloned().unwrap_or(Value::Null);
     let k1 = t1.get("kind").and_then(Value::as_str).unwrap_or("");
     let k2 = t2.get("kind").and_then(Value::as_str).unwrap_or("");
-    let both_typed = (k1 == "leaderLost" || k1 == "sessionLost")
-        && (k2 == "leaderLost" || k2 == "sessionLost")
-        && !(k1.is_empty() && k2.is_empty());
+    let typed_lost = |k: &str| {
+        k == "org-leader-lost" || k == "org-session-lost" || k == "leaderLost" || k == "sessionLost"
+    };
+    let both_typed = typed_lost(k1) && typed_lost(k2) && !(k1.is_empty() && k2.is_empty());
     let nothing_resumed = service_log.for_service(N_TEARDOWN).len() == 2;
 
     // What the model says survives: the survivor's settled state and
     // a fresh call on the promoted session.
     let survivor_payload = b"teardown-survivor-fresh".to_vec();
-    let fresh = script
-        .run(pending_tab, unary_step(N_LEADER, &survivor_payload, &creds))
-        .await;
+    let fresh = run_pinned(
+        script,
+        pending_tab,
+        unary_step(N_LEADER, &survivor_payload, &creds),
+        8,
+    )
+    .await;
     let fresh_reply = fresh.reply.as_deref().map(crate::unhex).unwrap_or_default();
     let fresh_expected = expected_unary("u-leader", &survivor_payload);
     let survivor_usable = fresh.ok && fresh_reply == fresh_expected;
 
     ledger.record(
         witness,
-        precondition && closed.is_ok() && both_typed && nothing_resumed && survivor_usable,
+        role1 == "leader"
+            && precondition
+            && closed.is_ok()
+            && both_typed
+            && nothing_resumed
+            && survivor_usable,
         format!(
-            "two pending proxied calls live={precondition}; leader tab {leader_page} closed \
-             ({:?}); both pending calls typed-failed EXACTLY: p1 kind={k1:?} p2 kind={k2:?} \
-             (leaderLost/sessionLost family) terminals=({t1}, {t2}); NOTHING resumed (provider \
-             invocation count stays exactly 2: {nothing_resumed}); where the model says so, the \
-             follower side survives: the promoted session served a fresh call exactly {} (want \
-             {}) — settled results were never disturbed",
+            "two pending proxied calls live={precondition} (opens: {} / {}); follow1 confirmed \
+             leader ({role1:?}) and its tab {leader_page} closed ({:?}); both pending calls \
+             typed-failed EXACTLY: p1 kind={k1:?} p2 kind={k2:?} (org-leader-lost family) \
+             terminals=({t1}, {t2}); NOTHING resumed (provider invocation count stays exactly 2: \
+             {nothing_resumed}); where the model says so, the follower side survives: the \
+             promoted session served a fresh call exactly {} (want {}) — settled results were \
+             never disturbed",
+            typed(&open1),
+            typed(&open2),
             closed.map(|_| "ok"),
             hex(&fresh_reply),
             hex(&fresh_expected)

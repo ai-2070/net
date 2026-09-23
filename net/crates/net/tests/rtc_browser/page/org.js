@@ -408,8 +408,13 @@ async function execute(step) {
               // The terminal reply: the exact concatenation, so a
               // missing/extra upload byte is an identity mismatch.
               const total = collected.reduce((n, h) => n + h.length / 2, 0);
-              const reply = new Uint8Array(total);
-              let off = 0;
+              // The labelled reply (the same contract as the native
+              // client-stream providers): `label:` + the exact upload
+              // concatenation.
+              const prefix = new TextEncoder().encode(step.label + ':');
+              const reply = new Uint8Array(prefix.length + total);
+              reply.set(prefix, 0);
+              let off = prefix.length;
               for (const h of collected) {
                 const bytes = unhex(h);
                 reply.set(bytes, off);
