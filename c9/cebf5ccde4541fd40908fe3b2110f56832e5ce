@@ -1,0 +1,26 @@
+docs/internal/spikes/org-streaming/S4_TSSDK.md
+  h_64425bc75e3f3d 1-323
+net/crates/net/sdk-ts/package.json
+  h_64425bc75e3f3d 15-18
+net/crates/net/sdk-ts/src/index.ts
+  h_64425bc75e3f3d 388-429
+net/crates/net/sdk-ts/src/org/index.ts
+  h_64425bc75e3f3d 1-487
+net/crates/net/sdk-ts/test/org_consumer/org_streaming_consumer.ts
+  h_64425bc75e3f3d 1-782
+net/crates/net/sdk-ts/test/org_consumer/tsconfig.json
+  h_64425bc75e3f3d 1-23
+net/crates/net/sdk-ts/test/org_live.test.ts
+  h_64425bc75e3f3d 1-232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c9cebf5ccde4541fd40908fe3b2110f56832e5ce",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
