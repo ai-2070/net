@@ -3614,6 +3614,31 @@ jobs:
       - name: Run tests
         run: npm test
 
+      # === S4: the Node org facade witnesses (ORG_SCOPED_STREAMING_PLAN) ==
+      # The vitest run above EXECUTED these; this step PINS them (a witness
+      # must not disappear silently): lexical name-existence, fail-closed,
+      # over the two test files (vitest names are literal `it(...)` strings).
+      # Floor/roster: 10 at the S4Node head (9 in org_live + 1 in
+      # consumer_compile); extended in the same commit as new witnesses.
+      - name: Witness roster — Node org facade (Stage 4, 10)
+        run: |
+          set -uo pipefail
+          CHECK=".github/scripts/check-roster.py"
+          python3 "$CHECK" --label org_live.test --mode literal \
+            --source net/crates/net/bindings/node/test/org_live.test.ts \
+            live_same_org_streaming_call_and_serve \
+            live_same_org_client_stream_call_and_serve \
+            live_same_org_duplex_call_and_serve \
+            a_stream_call_against_a_unary_only_provider_is_refused_not_supported \
+            midstream_outcomes_route_through_classify_org_error \
+            live_granted_streaming_call_and_serve \
+            live_granted_client_stream_call_and_serve \
+            live_granted_duplex_call_and_serve \
+            closing_client_and_serve_handle_lets_both_meshes_shut_down_cleanly || exit 1
+          python3 "$CHECK" --label consumer_compile.test --mode literal \
+            --source net/crates/net/bindings/node/test/consumer_compile.test.ts \
+            a_consumer_program_compiles_against_the_shipped_org_surface || exit 1
+
       # The tool-serving cleanup journey needs a real mesh: the property
       # under test is that closing every handle the SDK hands you releases
       # the node's last reference, and a fake `ServeHandle` cannot fail to
