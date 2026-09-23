@@ -207,8 +207,13 @@ function trackedSink(entry, sink) {
       const sentAt = performance.now();
       const index = entry.items.length;
       entry.items.push(hex(chunk));
+      // The ATTEMPT is logged at send-start (resolved_at stays null
+      // while the send is PARKED on credit — a post-resolve log made
+      // parked sends invisible to the backpressure observables).
+      const rec = { i: index, sent_at: sentAt, resolved_at: null };
+      entry.send_log.push(rec);
       await sink.send(chunk);
-      entry.send_log.push({ i: index, sent_at: sentAt, resolved_at: performance.now() });
+      rec.resolved_at = performance.now();
     },
     async close() {
       await sink.close();
@@ -376,15 +381,22 @@ async function execute(step) {
               const entry = recordInvocation(state, 'streaming', caller, hex(request));
               const tracked = trackedSink(entry, sink);
               state.holds.push(entry);
-              for (const chunk of pre) await tracked.send(chunk);
-              if (hold) {
-                await new Promise((resolve) => {
-                  state.release = resolve;
-                });
+              try {
+                for (const chunk of pre) await tracked.send(chunk);
+                if (hold) {
+                  await new Promise((resolve) => {
+                    state.release = resolve;
+                  });
+                }
+                if (deferMs) await sleep(deferMs);
+                for (const chunk of post) await tracked.send(chunk);
+                await tracked.close();
+              } catch (e) {
+                // F-S3.1-2: the handler SEES the typed closed refusal
+                // (`org: the response sink is closed: the call was
+                // retired`) and COMPLETES — its return/late sends are
+                // then discarded by the surface as documented.
               }
-              if (deferMs) await sleep(deferMs);
-              for (const chunk of post) await tracked.send(chunk);
-              await tracked.close();
               entry.completed_at = performance.now();
             },
             opts,
@@ -443,31 +455,36 @@ async function execute(step) {
               state.holds.push(entry);
               let index = 0;
               const received = [];
-              for await (const chunk of requests) {
-                entry.items.push(hex(chunk));
-                received.push(hex(chunk));
-                // Echo each request chunk, content-labelled, so
-                // per-chunk pairing is an exact identity check.
-                const echo = new TextEncoder().encode('e' + index + ':');
-                const out = new Uint8Array(echo.length + chunk.length);
-                out.set(echo, 0);
-                out.set(chunk, echo.length);
-                await tracked.send(out);
-                index += 1;
+              try {
+                for await (const chunk of requests) {
+                  entry.items.push(hex(chunk));
+                  received.push(hex(chunk));
+                  // Echo each request chunk, content-labelled, so
+                  // per-chunk pairing is an exact identity check.
+                  const echo = new TextEncoder().encode('e' + index + ':');
+                  const out = new Uint8Array(echo.length + chunk.length);
+                  out.set(echo, 0);
+                  out.set(chunk, echo.length);
+                  await tracked.send(out);
+                  index += 1;
+                }
+                entry.eof_at = performance.now();
+                // The record's payload identity = the collected request
+                // concatenation (the same contract as the native duplex
+                // providers' records).
+                entry.payload = received.join('');
+                if (hold) {
+                  await new Promise((resolve) => {
+                    state.release = resolve;
+                  });
+                }
+                if (deferMs) await sleep(deferMs);
+                for (const chunk of post) await tracked.send(chunk);
+                await tracked.close();
+              } catch (e) {
+                // F-S3.1-2: the handler SEES the typed closed refusal
+                // and COMPLETES — the surface discards its output.
               }
-              entry.eof_at = performance.now();
-              // The record's payload identity = the collected request
-              // concatenation (the same contract as the native duplex
-              // providers' records).
-              entry.payload = received.join('');
-              if (hold) {
-                await new Promise((resolve) => {
-                  state.release = resolve;
-                });
-              }
-              if (deferMs) await sleep(deferMs);
-              for (const chunk of post) await tracked.send(chunk);
-              await tracked.close();
               entry.completed_at = performance.now();
             },
             opts,
@@ -646,23 +663,23 @@ async function execute(step) {
       let sent = 0;
       for (const payload of step.payloads || []) {
         const sentAt = performance.now();
+        // The ATTEMPT is logged at send-start (resolved_at stays null
+        // while the send is PARKED on credit).
+        const rec = { payload, sent_at: sentAt, resolved_at: null, ok: true };
+        state.send_log.push(rec);
         try {
           await state.upload.send(unhex(payload));
-          state.send_log.push({ payload, sent_at: sentAt, resolved_at: performance.now(), ok: true });
+          rec.resolved_at = performance.now();
           sent += 1;
         } catch (e) {
           // A send AFTER finish() is a typed refusal, and the call
           // must still hold its result — recorded, not thrown.
-          state.send_log.push({
-            payload,
-            sent_at: sentAt,
-            resolved_at: performance.now(),
-            ok: false,
-            error: typedFailure(e),
-          });
+          rec.ok = false;
+          rec.resolved_at = performance.now();
+          rec.error = typedFailure(e);
           return {
             ok: true,
-            stats: { sent, send_log: state.send_log, refused: typedFailure(e) },
+            stats: { sent, send_log: state.send_log, refused: rec.error },
           };
         }
       }
@@ -718,21 +735,21 @@ async function execute(step) {
       let sent = 0;
       for (const payload of step.payloads || []) {
         const sentAt = performance.now();
+        // The ATTEMPT is logged at send-start (resolved_at stays null
+        // while the send is PARKED on credit).
+        const rec = { payload, sent_at: sentAt, resolved_at: null, ok: true };
+        state.send_log.push(rec);
         try {
           await state.call.sink.send(unhex(payload));
-          state.send_log.push({ payload, sent_at: sentAt, resolved_at: performance.now(), ok: true });
+          rec.resolved_at = performance.now();
           sent += 1;
         } catch (e) {
-          state.send_log.push({
-            payload,
-            sent_at: sentAt,
-            resolved_at: performance.now(),
-            ok: false,
-            error: typedFailure(e),
-          });
+          rec.ok = false;
+          rec.resolved_at = performance.now();
+          rec.error = typedFailure(e);
           return {
             ok: true,
-            stats: { sent, send_log: state.send_log, refused: typedFailure(e) },
+            stats: { sent, send_log: state.send_log, refused: rec.error },
           };
         }
       }

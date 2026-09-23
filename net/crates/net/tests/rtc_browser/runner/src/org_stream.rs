@@ -1600,8 +1600,9 @@ fn register_native_services(anchor: &Arc<MeshNode>) -> NativeServices {
                     label: "cs-bp",
                     // A SLOW consumer: 150 ms per chunk, so an
                     // exhausted upload window parks the caller's
-                    // sends somewhere observable.
-                    defer_ms: 150,
+                    // sends somewhere observable: each grant's park
+                    // window must exceed the >250ms parked threshold.
+                    defer_ms: 400,
                     gate: None,
                     log: Arc::clone(&log),
                 }),
@@ -2966,8 +2967,12 @@ async fn streaming_backpressure(
     let parked_early = send_log_early
         .iter()
         .filter(|e| {
-            let parked = e.get("resolved_at").and_then(Value::as_f64).unwrap_or(0.0)
-                - e.get("sent_at").and_then(Value::as_f64).unwrap_or(0.0);
+            // A null resolved_at = STILL PARKED (the attempt-first
+            // log) — parked by definition.
+            let parked = match e.get("resolved_at").and_then(Value::as_f64) {
+                Some(r) => r - e.get("sent_at").and_then(Value::as_f64).unwrap_or(0.0),
+                None => f64::INFINITY,
+            };
             parked > 250.0
         })
         .count();
@@ -3050,9 +3055,12 @@ async fn client_stream_backpressure(
     let parked = send_log
         .iter()
         .filter(|e| {
-            e.get("resolved_at").and_then(Value::as_f64).unwrap_or(0.0)
-                - e.get("sent_at").and_then(Value::as_f64).unwrap_or(0.0)
-                > 250.0
+            // A null resolved_at = STILL PARKED (the attempt-first
+            // log) — parked by definition.
+            match e.get("resolved_at").and_then(Value::as_f64) {
+                Some(r) => r - e.get("sent_at").and_then(Value::as_f64).unwrap_or(0.0) > 250.0,
+                None => true,
+            }
         })
         .count();
     let send2 = script.run(TAB_CALL, upload_send_step("cs-bp", &chunks[4..])).await;
@@ -3084,7 +3092,7 @@ async fn client_stream_backpressure(
         witness,
         open.ok && parked >= 1 && eof_exact && late_refused && collected_exact,
         format!(
-            "upload window=2 CHUNK CREDITS at a SLOW consumer (150 ms/chunk): parked {parked}/4 \
+            "upload window=2 CHUNK CREDITS at a SLOW consumer (400 ms/chunk): parked {parked}/4 \
              early sends >250ms (credit parks the caller's send); half-close EOF delivered the \
              EXACT concatenation reply={} (want {}) so FLAG_END reached the handler; late upload \
              after END: typed refusal={} ({}) — delivers nothing, cancels nothing (the result \
