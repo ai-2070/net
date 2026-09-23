@@ -1592,7 +1592,13 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   core-side finding worth its own witness — not gating. CI: the Q5 pin
   (37 names + floors 95/84 + leaf-native 388 + org suites 22/21/29 + npm
   728) landed at `e684edc48`. The 7 same-subject ICE commits are
-  owner-ruled fine (disclosed, accepted). Coordinator spot-check of R-1
-  pending as its own cycle (the repro anchor delivered). **Wave 1 is
-  closed at 4/4; Wave 2 (pure SDKs per Q6 + the cross-language vectors)
-  is the next dispatch.**
+  owner-ruled fine (disclosed, accepted). **Coordinator spot-check SCR-B
+  reproduced R-1 (executed):** the Reply-arm cross-correlation steal →
+  `payload pairing: false` at the named witness (the round: 37 witnesses,
+  1 failed — only the named one) → restore → `payload pairing: true`, 37
+  witnesses, 0 failed. **Wave 1 is closed at 4/4 — every lane's REQUIRED
+  receipts independently reproduced; Wave 2 (pure SDKs per Q6 +
+  the cross-language vectors) is dispatched at `S4_BRIEF.md` @ `02f2d6c9c`
+  (redistributed verbatim via `local://S4_BRIEF.md` after a worktree-
+  staleness blocker; the brief lives at repo-root `spikes/org-streaming/`,
+  not `docs/internal/spikes/`).**

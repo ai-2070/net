@@ -246,9 +246,21 @@ source-established label and its receipt per the brief's evidence rules.
   single-copy codec extraction into `net-mesh-wire` (F-S4B-5 — the
   in-tree second copy stands, pinned by interop + byte-identity
   instruments); the F-S4B-7 core-side witness; CI's own checks.
-  **Coordinator spot-check of R-1 pending** (the repro anchor delivered:
-  `leaf/src/leader.rs` `ProxyClient::on_message`'s `ProxyBody::Reply` arm,
-  +9/−1 — its cycle runs as its own job).
+  **Coordinator spot-check SCR-B reproduced R-1 (executed):** the
+  `ProxyClient::on_message` `Reply`-arm cross-correlation steal (the
+  lane's delivered anchor) → bundle rebuild (cargo wasm release +
+  wasm-bindgen + npm build) → `--org-only --engine chromium` →
+  **`RTCB FAIL org_leader_proxied_call_preserves_follower_attribution`**
+  at `(payload pairing: false)` — follower-1 holding follower-2's payload
+  under the two-followers concurrent schedule — with the round at
+  **37 witnesses, 1 failed** (only the named one: a precisely
+  discriminating mutation) → restore → rebuild → **`(payload pairing:
+  true)`, 37 witnesses, 0 failed**. Two more harness invocation classes
+  recorded (8 total): `System32\bash.exe` on this host's PATH is the WSL
+  launcher (every "nested bash" failure this session traced to it — the
+  fix is git-bash's absolute path, which also fixes its own PATH for
+  scripts' internal calls); and `.cmd` shims (`npm`) cannot be spawned by
+  CreateProcess directly (use `cmd /c`).
 - **2026-09-22, S4Go verified (executed).** Landed at `14d5b87f3` (impl, the
   one-commit ABI set) + `314b30152` (record; `S4_GO.md` F16-ledgered). The
   §4.4 Go/C surface over the frozen seams: the shared handle module
