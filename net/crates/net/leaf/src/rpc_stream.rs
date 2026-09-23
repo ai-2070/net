@@ -869,10 +869,7 @@ impl StreamCallRegistry {
         if core.pin.owner() != presented || core.terminal.is_some() {
             return false;
         }
-        core.latch(StreamTerminal::Refused {
-            status: RpcStatus::Timeout,
-            body: Bytes::from_static(b"stream deadline_ns exceeded"),
-        });
+        core.latch(timeout_terminal());
         true
     }
 
@@ -903,11 +900,14 @@ impl StreamCallRegistry {
             if core.deadline_ns != 0 && now_unix_ns >= core.deadline_ns {
                 // Tell the server, so it is not left running work
                 // nobody awaits (the unary sweep's rule) — the frame
-                // goes first, latching disarms the drop guard.
+                // goes first, latching disarms the drop guard. The
+                // terminal is the call's OWN deadline terminal: the
+                // `Timeout` class via `stream_terminal_payload`, at the
+                // absolute UNEXTENDED end (§4.5 — a vanished provider
+                // leaves this as the caller's observable, and a frozen
+                // tab's ticker stopping extends nothing).
                 push_cancel(&self.out, core);
-                core.latch(StreamTerminal::Retired {
-                    reason: RetireReason::Timeout,
-                });
+                core.latch(timeout_terminal());
                 continue;
             }
         }
@@ -972,6 +972,19 @@ fn terminal_of(payload: RpcResponsePayload) -> StreamTerminal {
             body: payload.body,
         }
     }
+}
+
+/// The caller's deadline terminal — the `Timeout` class **via
+/// [`rpc_wire::stream_terminal_payload`]**, byte-identical to what a
+/// provider's deadline terminal and a `DEADLINE_EXCEEDED` frame decode
+/// to (§4.5: closure retires ownership "with the same deadline", and
+/// §10.2: the 0x13 frame is "exactly like a Timeout terminal"). The
+/// local sweep and the wire paths are indistinguishable at the
+/// consumer.
+fn timeout_terminal() -> StreamTerminal {
+    terminal_of(rpc_wire::stream_terminal_payload(
+        &rpc_wire::StreamTerminalReason::Timeout,
+    ))
 }
 
 /// Emit one upload `REQUEST_CHUNK` (the caller has checked — and, for

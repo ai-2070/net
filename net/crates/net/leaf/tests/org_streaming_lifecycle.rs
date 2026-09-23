@@ -1583,6 +1583,79 @@ fn wrong_peer_and_old_session_frames_deliver_nothing() {
     drop((handle, handle2));
 }
 
+#[test]
+fn a_vanished_provider_retires_at_the_callers_own_deadline_with_the_timeout_terminal() {
+    // §4.5: closure retires ownership "with the same deadline" — when
+    // the provider dies mid-stream (its session may even survive as a
+    // shared leader's), the caller's observable is the call's OWN
+    // deadline terminal at the absolute UNEXTENDED end: the `Timeout`
+    // class via `stream_terminal_payload`, latched once, never resumed.
+    let mut l = Loop::new();
+    l.serve(RpcCallShape::ServerStreaming, ServeAccess::SameOrg);
+    let intent = l.w.intent(5);
+    let deadline_ns = NOW_NS + 5_000_000_000;
+    let (id, handle) = l.open_ss(
+        StreamOpen {
+            body: Bytes::from_static(b"request"),
+            deadline_ns,
+            ..empty_open()
+        },
+        intent,
+    );
+    // The eager opening goes out and the provider VANISHES: the frames
+    // leave and nothing ever comes back.
+    let up = l.caller_out();
+    assert_eq!(up.len(), 1);
+    l.to_provider(up); // delivered into the void
+    let _ = l.serves.unserve(SERVICE); // the serving side is gone
+    assert_eq!(l.serves.live_calls(), 0);
+
+    // No lease extension: one nanosecond before the end there is no
+    // terminal, and at the end there is exactly one.
+    l.now = deadline_ns - 1;
+    l.caller.advance(l.now);
+    assert_eq!(
+        l.caller.terminal(id),
+        None,
+        "the absolute end is unextended — no early terminal"
+    );
+    l.now = deadline_ns;
+    l.caller.advance(l.now);
+    assert_eq!(
+        l.caller.terminal(id),
+        Some(&StreamTerminal::Refused {
+            status: RpcStatus::Timeout,
+            body: Bytes::from_static(b"stream deadline_ns exceeded")
+        }),
+        "the caller's own deadline terminal — the `Timeout` class via \
+         stream_terminal_payload, byte-identical to the wire timeout"
+    );
+
+    // Latched once: later sweeps and late frames are no-ops.
+    l.caller.advance(l.now + 60_000_000_000);
+    assert_eq!(
+        l.caller.terminal(id),
+        Some(&StreamTerminal::Refused {
+            status: RpcStatus::Timeout,
+            body: Bytes::from_static(b"stream deadline_ns exceeded")
+        })
+    );
+    let payload = RpcResponsePayload {
+        status: RpcStatus::Ok,
+        headers: Vec::new(),
+        body: Bytes::from_static(b"late"),
+    };
+    assert_eq!(l.caller.on_response(l.call_owner(), id, payload), false);
+
+    // Exactly one CANCEL went with the sweep ("tell the server"), and
+    // no automatic resume ever follows.
+    let out = l.caller_out();
+    assert_eq!(out.len(), 1);
+    assert!(matches!(&out[0].frame, RpcFrame::Cancel { call_id } if *call_id == id));
+    assert_eq!(l.caller_out().len(), 0);
+    drop(handle);
+}
+
 // ---------------------------------------------------------------------------
 // (g) handle drop emits exactly one CANCEL
 // ---------------------------------------------------------------------------
