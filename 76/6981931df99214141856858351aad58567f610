@@ -1,0 +1,16 @@
+net/crates/net/leaf/src/node.rs
+  h_64425bc75e3f3d 47,584-590,643,1256,1311,2023-2144,3315-3325
+net/crates/net/leaf/tests/org_streaming_lifecycle.rs
+  h_64425bc75e3f3d 1629,1694-1733,1855-2089
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "766981931df99214141856858351aad58567f610",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
