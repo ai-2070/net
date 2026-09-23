@@ -1,0 +1,12 @@
+warning: Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh v0.36.0 (C:\Users\chief\orca\workspaces\net\org-streaming\net\crates\net)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.78s
+     Running tests\org_scoped_cross_process.rs (target\debug\deps\org_scoped_cross_process-1747f1f72c9735a4.exe)
+
+running 2 tests
+test xproc_scoped_provider_child ... ignored
+test scoped_discovery_crosses_an_os_process_boundary ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.46s
+

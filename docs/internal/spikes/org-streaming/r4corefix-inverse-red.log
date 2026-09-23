@@ -1,0 +1,51 @@
+R4CoreFix — INVERSE RECEIPT (mutate the ASSERTED property → the named red)
+Command: cargo test -p net-mesh --features net,cortex --test org_scoped_cross_process -- --nocapture
+Mutation: tests/org_scoped_cross_process.rs — child DISCARDS the serve handle
+          (let _dropped: () = match provider.serve_rpc_granted(SERVICE, handler, Arc::new(|_| true)) { Ok(_h) => (), … })
+          = the exact pre-fix provider.py shape; ServeHandle::Drop deregisters
+          the granted service before the first announce.
+Expected: the named assertion red at scoped_discovery_crosses_an_os_process_boundary.
+
+=== verbatim output ===
+warning: Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh v0.36.0 (C:\Users\chief\orca\workspaces\net\org-streaming\net\crates\net)
+warning: unused import: `ServeHandle`
+  --> tests\org_scoped_cross_process.rs:55:74
+   |
+55 | use net::adapter::net::mesh_rpc::{CallOptions, OrgProofIntent, RpcReply, ServeHandle};
+   |                                                                          ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: `net-mesh` (test "org_scoped_cross_process") generated 1 warning (run `cargo fix --test "org_scoped_cross_process" -p net-mesh` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.66s
+     Running tests\org_scoped_cross_process.rs (target\debug\deps\org_scoped_cross_process-1747f1f72c9735a4.exe)
+
+running 2 tests
+test xproc_scoped_provider_child ... ignored
+test scoped_discovery_crosses_an_os_process_boundary has been running for over 60 seconds
+xproc scoped discovery RED: candidate never considered; caller (346078164229404973): consumer_grants=1 relay_gate=0 intake=[0, 0, 0, 0, 0, 0, 0, 0]
+
+thread 'scoped_discovery_crosses_an_os_process_boundary' (206548) panicked at tests\org_scoped_cross_process.rs:481:9:
+F-S4Vectors-1: scoped discovery did not cross the OS-process boundary
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test scoped_discovery_crosses_an_os_process_boundary ... FAILED
+
+failures:
+
+failures:
+    scoped_discovery_crosses_an_os_process_boundary
+
+test result: FAILED. 0 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 60.39s
+
+error: test failed, to rerun pass `-p net-mesh --test org_scoped_cross_process`
+Wall time: 79.71 seconds
+=== end verbatim output ===
+
+Reading of the red: consumer_grants=1 (the caller's consumer credential installed),
+relay_gate=0 (not one scoped frame ever reached the relay gate — nothing shipped),
+intake=[0×8] (the ingest never ran: inserted=updated=stale=rejected_public=
+at_capacity=too_many_declarations=verify_refused=race_refused=0). This is the
+pre-fix mixed-pair signature locked at core level: the emission catalog is
+empty because the service registration died with the discarded handle.

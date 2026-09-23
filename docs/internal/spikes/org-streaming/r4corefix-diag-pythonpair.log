@@ -1,0 +1,141 @@
+provider: handshake done, starting mesh + announce loop
+provider: serving, announcing
+[xproc-diag] send_emission_to node=0x2cb5fa683e11dfe1 public=732 scoped=0
+[xproc-diag] send_emission_to node=0x47785a06eb370a63 public=732 scoped=0
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] send_emission_to node=0x2cb5fa683e11dfe1 public=733 scoped=0
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] send_emission_to node=0x47785a06eb370a63 public=733 scoped=0
+[xproc-diag] send_emission_to node=0x2cb5fa683e11dfe1 public=733 scoped=0
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] send_emission_to node=0x47785a06eb370a63 public=733 scoped=0
+[xproc-diag] send_emission_to node=0x2cb5fa683e11dfe1 public=733 scoped=0
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] send_emission_to node=0x2cb5fa683e11dfe1 public=733 scoped=0
+[xproc-diag] send_emission_to node=0x47785a06eb370a63 public=733 scoped=0
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] send_emission_to node=0x2cb5fa683e11dfe1 public=733 scoped=0
+[xproc-diag] send_emission_to node=0x47785a06eb370a63 public=733 scoped=0
+[xproc-diag] send_emission_to node=0x2cb5fa683e11dfe1 public=733 scoped=0
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] send_emission_to node=0x47785a06eb370a63 public=733 scoped=0
+[xproc-diag] send_emission_to node=0x2cb5fa683e11dfe1 public=733 scoped=0
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] capture_cold: grant lookup HIT (installed=1)
+[xproc-diag] capture_cold: granted rows for grant 437a5c57 pinned=true
+[xproc-diag] send_emission_to node=0x2cb5fa683e11dfe1 public=733 scoped=0
+[xproc-diag] send_emission_to node=0x47785a06eb370a63 public=733 scoped=0
+probe: peer_count=<built-in method peer_count of builtins.NetMesh object at 0x000001D9D5AF5520>
+probe: discovered_nodes=1
+probe: find_nodes err TypeError("'str' object is not an instance of 'dict'")
+probe: find_nodes_scoped err TypeError("NetMesh.find_nodes_scoped() missing 1 required positional argument: 'scope'")
+CALLER FAIL the call never converged: OrgDiscoveryError('org:discovery:no_authorized_provider: org discovery: no authorized provider for capability 96dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c209 (0 private candidate(s) considered)')
