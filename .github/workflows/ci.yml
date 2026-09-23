@@ -2416,6 +2416,33 @@ jobs:
           cp "$JUNIT" "$RUNNER_TEMP/sdk-suite-junit.xml"
           exit "$st"
 
+      # === S3: the org_streaming facade lifecycle (ORG_SCOPED_STREAMING_PLAN)
+      #
+      # The step above already EXECUTED this binary (the SDK sweep runs every
+      # test in its own process); this gate PINS its result set — a witness
+      # must not disappear silently. Fail-closed on identity/verdict/retries/
+      # anti-vacuity per the gate contract above; `--self-test` proves the
+      # predicates first. Floor = 10 at the Stage-3 head (rows 3.1-3.3); raised
+      # with each landing, names extended in the same commit as the witnesses.
+      - name: Witness floor — org_streaming (Stage 3 Rust org facade, 10)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          CHECK="$GITHUB_WORKSPACE/.github/scripts/check-witness-results.py"
+          python3 "$CHECK" --self-test || exit 1
+          python3 "$CHECK" --junit "$RUNNER_TEMP/sdk-suite-junit.xml" \
+            --suite org_streaming --min 10 \
+            live_same_org_streaming_through_the_facade \
+            live_same_org_client_stream_through_the_facade \
+            live_same_org_duplex_through_the_facade \
+            live_cross_org_streaming_through_the_facade \
+            live_cross_org_client_stream_through_the_facade \
+            live_cross_org_duplex_through_the_facade \
+            facade_stream_against_unary_only_provider_is_not_supported \
+            dropping_org_stream_emits_one_cancel \
+            handler_receives_verified_org_caller_not_origin \
+            revocation_surfaces_as_final_admission_denied_item || exit 1
+
       # === S1: the CONSUMER observation lifecycle ==========================
       #
       # WHAT THIS GATES, and why it is no longer a per-name re-run loop.

@@ -131,6 +131,32 @@ source-established label and its receipt per the brief's evidence rules.
   `raise_between_reserve_and_install_denies_with_zero_effects` is a **named
   rewrite** (it pinned the mapping the ruling corrected — F1 precedent:
   strengthened to the owner-approved property, never silently re-pinned).
+- **2026-09-22, Stage 3 verified (executed).** Landed over six commits
+  (`d63e9c615`…`b7aaacdc5`, rows 3.1–3.3 pairs; §6). Estate at head:
+  `org_streaming` **10/10** at the plan's named command, SDK org estate
+  338/338, probe exact commands exit 0/0 (`metadata --locked`,
+  `check --locked`), `cargo fmt -p net-mesh-sdk -- --check` exit 0. The
+  REQUIRED 3.1 pin receipt executed: "resolve a second provider mid-call"
+  at `OrgClientStreamCall::send` → red at the named pin assertion (exit 100),
+  sha-proven restore `bf302b5e…` == baseline, re-green 1/1. **F-S3.2-1
+  resolved per the Main ruling:** the five `pub(crate)` `from_raw`
+  constructors landed with zero field-visibility moves and the probe pin
+  passed UNCHANGED at 3.2's head (the no-public-change proof). CI floor
+  pinned: the `org_streaming` JUnit roster gate (floor 10 + the ten names,
+  `--self-test` first) beside the SDK sweep that executes the binary.
+  **F-S3.1-2 stated for review adjudication (source-established + executed
+  with the drop witness):** the protected-path handler cannot be a sound
+  cancel-observer — the retire supervisor may drop the handler future
+  without a final poll; the live contract is the retirement observables, and
+  no core change is proposed or needed. Also recorded: the session's third
+  ENOSPC episode (F16-class) — the casualty was a failed CREATE of
+  `tests/org_streaming.rs` (nothing corrupted; the three pre-failure writes
+  green-verified at `cargo check -p net-mesh-sdk --features "net cortex
+  fixtures"` before the failure and re-checked after), the lane reclaimed
+  regenerable caches under the ruling that junit/floor artifacts are not
+  evidence (`run_binary` regenerates them per run), and the
+  verify-size-after-write rule held throughout. Stage 3 proceeds to
+  independent review.
 - **2026-09-22, S2R repair round verified (executed).** All three
   S2Review ACCEPT findings closed at `1d26bc4ba` (commits `c17572f03` code,
   `1432c6c03` receipts, `1d26bc4ba` record). Row 2's guard landed as the
