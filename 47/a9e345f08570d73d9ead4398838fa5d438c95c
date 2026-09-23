@@ -1,0 +1,16 @@
+docs/internal/spikes/org-streaming/S4_VECTORS.md
+  h_64425bc75e3f3d 246,250,260-276,280-302,317-321,369-373
+go/org_streaming_opening_vectors_test.go
+  h_64425bc75e3f3d 511-520,522
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "47a9e345f08570d73d9ead4398838fa5d438c95c",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
