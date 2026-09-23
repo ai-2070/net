@@ -53,6 +53,14 @@ path = "../../sdk"
 default-features = false
 features = ["net", "cortex"]
 
+# The typed-streaming handles are consumed as `futures::Stream`s — an external
+# consumer pulls `futures` to drain `OrgStream` & friends, and the item type
+# (`Result<_, OrgSdkError>`) is exactly the vocabulary pin Stage 3 adds. The
+# crate is ALREADY in the graph through `net_sdk`, so this edge adds no new
+# lock entries.
+[dependencies]
+futures = "0.3"
+
 [[bin]]
 name = "org_api_probe"
 path = "src/main.rs"

@@ -134,25 +134,50 @@ Faults are explicit rather than swallowed, because production builds abort on
 panic. `org_routing_registry.rs` and `org_grant_registry.rs` hold the lookup
 tables; `org_admission_replay.rs` guards replay.
 
-## The two verbs
+## The verbs
 
-Across Rust, Node, Python, Go and C the surface is two calls:
+Across Rust, Node, Python, Go and C the surface is one bind and four call
+shapes, each with its provider verb:
 
 ```rust
-mesh.org(credentials).call(..)                                   // caller
-mesh.serve_org(service, OrgAccess::{SameOrg, Granted}, handler)  // provider
+let org = mesh.org(credentials)?;                                 // bind
+org.call(service, &req).await?;                                   // unary
+org.call_streaming(service, &req).await?;                         // server-streaming
+org.call_client_stream(service).await?;                           // client-streaming
+org.call_duplex(service).await?;                                  // duplex
+
+mesh.serve_org(service, OrgAccess::{SameOrg, Granted}, handler)?;           // unary
+mesh.serve_org_streaming(service, access, handler)?;                        // server-streaming
+mesh.serve_org_client_stream(service, access, handler)?;                    // client-streaming
+mesh.serve_org_duplex(service, access, handler)?;                           // duplex
 ```
 
-Protected server-streaming landed at the core seam (slice 1.5): a provider
-serves an owner-scoped or granted server-streaming handler through
-`serve_rpc_owner_scoped_streaming(service, handler, provider_policy)` /
-`serve_rpc_granted_streaming(service, handler, provider_policy)`, whose
-openings run the same admission order above with the streaming proof and the
-session fence, and whose responses route `DirectOnly` to the authenticated
-caller (never the reply channel's roster). The caller side mints the streaming
-proof through `call_streaming(.., CallOptions { org_proof_intent, .. })`; the
-language-idiomatic `call_streaming`/`serve_org_streaming` verbs ride the SDK
-release train.
+Every shape runs the same admission order above (the streaming proof kinds
+and the session fence included) and every handle surfaces the same frozen
+error vocabulary item by item: an opening refusal is
+`AdmissionDenied(coarse)`, a midstream revocation is the stream's final
+`AdmissionDenied(Denied)`, and deadline/cancel retirement is
+`Rpc(Timeout)`/`Rpc(Cancelled)`. Dropping a stream handle emits exactly one
+CANCEL; the streaming call handles are `OrgStream` (typed), `OrgStreamRaw`
+(bytes), `OrgClientStreamCall` (`send`/`finish`) and `OrgDuplexCall` (`send`,
+`finish_sending`, `into_split`, `Stream`).
+
+**The deadline rule (Owner Q1).** The binding seams (`call_bytes_deadline`,
+`call_streaming_bytes_deadline`, `call_client_stream_bytes_deadline`,
+`call_duplex_bytes_deadline`) carry `deadline_ms` and a pre-reserved
+`cancel_token` — neither is an authorization input. `deadline_ms == 0` is the
+facade's default protected lifetime, **300 s**, and never "no deadline": a
+protected call's lifetime is finite by contract (an explicit request beyond
+the provider's 3600 s cap is refused at opening). `cancel_token == 0` means
+uncancellable.
+
+The raw byte rows (`call_*_bytes*`, `serve_org_*_bytes(_node)`) exist for
+language bindings: a typed verb is its byte row plus JSON, one dispatch path
+per shape. The provider's trivial proof policy (`|_| true`) keeps the
+application veto at the low-level protected serve API. At the core seam the
+same shapes ride `serve_rpc_{owner_scoped,granted}_{streaming,client_stream,duplex}`
+with the streaming proofs and `DirectOnly` response routing (never the reply
+channel's roster).
 
 Errors use a frozen `org:<domain>:<kind>` vocabulary so a denial means the same
 thing in every binding. CLI provisioning is `net org keygen` / `issue-cert` /

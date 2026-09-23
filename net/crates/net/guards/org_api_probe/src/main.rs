@@ -40,10 +40,15 @@
 //! beside fully type-annotated call expressions, so parameter and return types
 //! ARE pinned (a bare `as *const ()` cast pins only the name).
 
+use futures::StreamExt;
 use net::adapter::net::behavior::org_admission::{AdmissionContext, AdmissionDenied, OrgAdmission};
-use net::adapter::net::cortex::rpc::{RpcCancellationToken, RpcStreamingContext, TraceContext};
+use net::adapter::net::cortex::rpc::{
+    RequestStream, RpcCancellationToken, RpcResponseSink, RpcStreamingContext, TraceContext,
+};
 use net::adapter::net::identity::EntityId;
-use net::adapter::net::mesh_rpc::{CallOptions, RoutingPolicy};
+use net::adapter::net::mesh_rpc::{
+    CallOptions, ClientStreamCallRaw, DuplexCallRaw, RoutingPolicy, RpcStream,
+};
 
 use net_sdk::mesh::Mesh;
 use net_sdk::mesh_rpc::{
@@ -51,8 +56,11 @@ use net_sdk::mesh_rpc::{
     ResponseSinkTyped, RpcError, RpcStreamTyped, ServeError, ServeHandle,
 };
 use net_sdk::org::{
-    CapabilityAuthorityId, CoarseAdmissionReason, OrgAccess, OrgCaller, OrgClient, OrgCredentials,
-    OrgHandlerError, OrgId, OrgProofIntent, OrgRevocationState, OrgSdkError,
+    serve_org_client_stream_bytes_node, serve_org_duplex_bytes_node,
+    serve_org_streaming_bytes_node, CapabilityAuthorityId, CoarseAdmissionReason, OrgAccess,
+    OrgCaller, OrgClient, OrgClientStreamCall, OrgCredentials, OrgDuplexCall, OrgDuplexSink,
+    OrgDuplexStream, OrgHandlerError, OrgId, OrgProofIntent, OrgRevocationState, OrgSdkError,
+    OrgStream, OrgStreamRaw,
 };
 use net_sdk::Bytes;
 
@@ -430,6 +438,180 @@ fn pin_trace_context() -> TraceContext {
     }
 }
 
+// ============================================================================
+// `net_sdk::org` Stage 3 — the streaming verb facade (spec 4.3's rows).
+// ============================================================================
+
+/// `OrgClient::{call_streaming, call_streaming_bytes,
+/// call_streaming_bytes_deadline, call_client_stream,
+/// call_client_stream_bytes_deadline, call_duplex,
+/// call_duplex_bytes_deadline}` — the §4.3 caller rows and their
+/// `*_bytes_deadline` binding seams (`deadline_ms == 0` ⇒ the facade default
+/// 300 s, never "none"). Every handle's shape is pinned by its annotated
+/// return position. Never invoked.
+async fn pin_org_streaming_calls(
+    client: &OrgClient,
+    request: &Req,
+) -> Result<
+    (
+        OrgStream<Resp>,
+        OrgStreamRaw,
+        RpcStream,
+        OrgClientStreamCall<Req, Resp>,
+        ClientStreamCallRaw,
+        OrgDuplexCall<Req, Resp>,
+        DuplexCallRaw,
+    ),
+    OrgSdkError,
+> {
+    let typed: OrgStream<Resp> = client.call_streaming::<Req, Resp>("svc", request).await?;
+    let raw: OrgStreamRaw = client.call_streaming_bytes("svc", Bytes::new()).await?;
+    let raw_stream: RpcStream = client
+        .call_streaming_bytes_deadline("svc", Bytes::new(), 0, 0)
+        .await?;
+    let cs: OrgClientStreamCall<Req, Resp> = client.call_client_stream::<Req, Resp>("svc").await?;
+    let raw_cs: ClientStreamCallRaw = client
+        .call_client_stream_bytes_deadline("svc", 0, 0)
+        .await?;
+    let dx: OrgDuplexCall<Req, Resp> = client.call_duplex::<Req, Resp>("svc").await?;
+    let raw_dx: DuplexCallRaw = client.call_duplex_bytes_deadline("svc", 0, 0).await?;
+    Ok((typed, raw, raw_stream, cs, raw_cs, dx, raw_dx))
+}
+
+/// `Mesh::{serve_org_streaming, serve_org_streaming_bytes,
+/// serve_org_client_stream, serve_org_client_stream_bytes, serve_org_duplex,
+/// serve_org_duplex_bytes}` — the §4.3 serve rows over their byte rows. Each
+/// verb is referenced as a VALUE (name + generic arity pinned) and then
+/// applied with an annotated handler closure: `OrgCaller` FIRST, then the
+/// typed handle or the raw piece — the parameter order is the pin.
+fn pin_org_streaming_serves(
+    mesh: &Mesh,
+) -> Result<
+    (
+        ServeHandle,
+        ServeHandle,
+        ServeHandle,
+        ServeHandle,
+        ServeHandle,
+        ServeHandle,
+    ),
+    ServeError,
+> {
+    let serve_ss = Mesh::serve_org_streaming::<Req, Resp, _, _>;
+    let typed_ss = serve_ss(
+        mesh,
+        "svc.ss",
+        OrgAccess::SameOrg,
+        |_caller: OrgCaller, _req: Req, sink: ResponseSinkTyped<Resp>| async move {
+            sink.send(&0)?;
+            Ok::<(), String>(())
+        },
+    )?;
+    let serve_ss_bytes = Mesh::serve_org_streaming_bytes::<_, _>;
+    let raw_ss = serve_ss_bytes(
+        mesh,
+        "svc.ss.raw",
+        OrgAccess::SameOrg,
+        |_caller: OrgCaller, _body: Bytes, _sink: RpcResponseSink| async move {
+            Ok::<(), OrgHandlerError>(())
+        },
+    )?;
+    let serve_cs = Mesh::serve_org_client_stream::<Req, Resp, _, _>;
+    let typed_cs = serve_cs(
+        mesh,
+        "svc.cs",
+        OrgAccess::Granted,
+        |_caller: OrgCaller, _requests: RequestStreamTyped<Req>| async move { Ok::<Resp, String>(0) },
+    )?;
+    let serve_cs_bytes = Mesh::serve_org_client_stream_bytes::<_, _>;
+    let raw_cs = serve_cs_bytes(
+        mesh,
+        "svc.cs.raw",
+        OrgAccess::SameOrg,
+        |_caller: OrgCaller, _requests: RequestStream| async move {
+            Ok::<Bytes, OrgHandlerError>(Bytes::new())
+        },
+    )?;
+    let serve_dx = Mesh::serve_org_duplex::<Req, Resp, _, _>;
+    let typed_dx = serve_dx(
+        mesh,
+        "svc.dx",
+        OrgAccess::SameOrg,
+        |_caller: OrgCaller, _requests: RequestStreamTyped<Req>, sink: ResponseSinkTyped<Resp>| async move {
+            sink.send(&0)?;
+            Ok::<(), String>(())
+        },
+    )?;
+    let serve_dx_bytes = Mesh::serve_org_duplex_bytes::<_, _>;
+    let raw_dx = serve_dx_bytes(
+        mesh,
+        "svc.dx.raw",
+        OrgAccess::SameOrg,
+        |_caller: OrgCaller, _requests: RequestStream, _sink: RpcResponseSink| async move {
+            Ok::<(), OrgHandlerError>(())
+        },
+    )?;
+    Ok((typed_ss, raw_ss, typed_cs, raw_cs, typed_dx, raw_dx))
+}
+
+/// `net_sdk::org::{serve_org_streaming_bytes_node,
+/// serve_org_client_stream_bytes_node, serve_org_duplex_bytes_node}` — the
+/// binding seams, referenced as values (generic arity pinned) and applied
+/// once each with annotated closures.
+fn pin_org_streaming_node_seams(
+    node: std::sync::Arc<net::adapter::net::MeshNode>,
+) -> Result<(ServeHandle, ServeHandle, ServeHandle), ServeError> {
+    let ss_node = serve_org_streaming_bytes_node::<_, _>;
+    let ss = ss_node(
+        node.clone(),
+        "svc",
+        OrgAccess::SameOrg,
+        |_caller: OrgCaller, _body: Bytes, _sink: RpcResponseSink| async move {
+            Ok::<(), OrgHandlerError>(())
+        },
+    )?;
+    let cs_node = serve_org_client_stream_bytes_node::<_, _>;
+    let cs = cs_node(
+        node.clone(),
+        "svc",
+        OrgAccess::Granted,
+        |_caller: OrgCaller, _requests: RequestStream| async move {
+            Ok::<Bytes, OrgHandlerError>(Bytes::new())
+        },
+    )?;
+    let dx_node = serve_org_duplex_bytes_node::<_, _>;
+    let dx = dx_node(
+        node,
+        "svc",
+        OrgAccess::SameOrg,
+        |_caller: OrgCaller, _requests: RequestStream, _sink: RpcResponseSink| async move {
+            Ok::<(), OrgHandlerError>(())
+        },
+    )?;
+    Ok((ss, cs, dx))
+}
+
+/// The §4.3 wrapping types: `OrgStream`, `OrgStreamRaw`, `OrgClientStreamCall`
+/// and `OrgDuplexCall` (with its `into_split` halves `OrgDuplexSink` /
+/// `OrgDuplexStream`). Their STREAM ITEMS are the frozen error vocabulary
+/// (`Result<_, OrgSdkError>` throughout) and their handle methods are pinned
+/// by annotated awaits. Never invoked.
+async fn pin_org_stream_wrappers(
+    mut typed: OrgStream<Resp>,
+    mut raw: OrgStreamRaw,
+    mut cs: OrgClientStreamCall<Req, Resp>,
+    dx: OrgDuplexCall<Req, Resp>,
+) {
+    let _item: Option<Result<Resp, OrgSdkError>> = typed.next().await;
+    let _raw_item: Option<Result<Bytes, OrgSdkError>> = raw.next().await;
+    let _send: Result<(), OrgSdkError> = cs.send(&Req::new()).await;
+    let _finish: Result<Resp, OrgSdkError> = cs.finish().await;
+    let (mut sink, mut stream): (OrgDuplexSink<Req>, OrgDuplexStream<Resp>) = dx.into_split();
+    let _duplex_item: Option<Result<Resp, OrgSdkError>> = stream.next().await;
+    let _sink_send: Result<(), OrgSdkError> = sink.send(&Req::new()).await;
+    let _sink_close: Result<(), OrgSdkError> = sink.finish_sending().await;
+}
+
 fn main() {
     // Constructed for real, not merely type-checked: no mesh, no runtime, no
     // node. These are the literals ledger rows C1/C3 break.
@@ -454,7 +636,7 @@ fn main() {
     // The verbs that need a live node: named as values, never invoked. The
     // casts pin only the names; the annotated call expressions inside each
     // function are what pin the signatures.
-    let unrun: [*const (); 7] = [
+    let unrun: [*const (); 11] = [
         pin_org_bind as *const (),
         pin_org_calls as *const (),
         pin_org_serve as *const (),
@@ -462,6 +644,10 @@ fn main() {
         pin_org_proof_intent as *const (),
         pin_typed_streaming_serves as *const (),
         pin_typed_streaming_calls as *const (),
+        pin_org_streaming_calls as *const (),
+        pin_org_streaming_serves as *const (),
+        pin_org_streaming_node_seams as *const (),
+        pin_org_stream_wrappers as *const (),
     ];
 
     println!(

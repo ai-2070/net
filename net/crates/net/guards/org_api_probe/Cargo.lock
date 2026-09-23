@@ -874,6 +874,7 @@ dependencies = [
 name = "net-mesh-org-api-probe"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "net-mesh",
  "net-mesh-sdk",
 ]
