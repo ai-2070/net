@@ -164,6 +164,62 @@ source-established label and its receipt per the brief's evidence rules.
   count, the dataforts-ENABLED build of the ungated declarations,
   typecheck:tests/release/check-ts-consumer.sh/CI themselves, non-Windows
   hosts.
+- **2026-09-22, S4Go verified (executed).** Landed at `14d5b87f3` (impl, the
+  one-commit ABI set) + `314b30152` (record; `S4_GO.md` F16-ledgered). The
+  §4.4 Go/C surface over the frozen seams: the shared handle module
+  (`rpc-ffi/src/handles.rs` — `RpcStreamHandleC`/`ClientStreamCallHandleC`/
+  `DuplexCallHandleC` + server-side handles, per-handle error-wire style),
+  the org-ffi verb set (`net_org_call_{streaming,client_stream,duplex}` +
+  the three handler-dispatcher setters + the serve trio,
+  `NET_ORG_ABI_VERSION 0x0002` with the `net_org.h` numeric mirror pinned),
+  `go/org.go` (`Call{Streaming,ClientStream,Duplex}` +
+  `ServeOrg{…}{Bytes,+typed generics}`, three trampolines, `parseOrgError`
+  midstream routing), the F-S3.1-2 handler-drop contract documented at the
+  Go handler surfaces, and the ruled carved C skill example
+  (`net_org_streaming.c` + `docs/data/examples.yaml` — landed at
+  `c62ecd740`'s sweep with its 4 named post-sweep deltas in S4Go's own
+  explicit-path commit per the file-state ruling). Estate: 6/6 live cells
+  (3 shapes × {same-org, granted}, live two-node, verified-caller
+  attribution asserted), `net-org-ffi` 20 units (incl. the ABI mirror),
+  `net-rpc-ffi` 45+1, `exports.baseline` 578 with the 9 new `net_org_*`
+  verbs, the go estate incl. `header_parity` + the FFI-01 roster guard,
+  `check-callback-buffer-ownership` clean over 9 Go FFI files, and the C
+  example compile+link against the single `-lnet`. The REQUIRED inverse
+  receipt (the `NetOrgCaller` projection swap) reddened at the attribution
+  assertion with a byte-identical restore (`b6b86555…`) and restored
+  green. **Coordinator spot-check SCR-GO reproduced it (executed):** the
+  `acting_org` projection field mutated to `[0xEE;32]` → `cargo build -p
+  net-ffi --release` + the test exe rebuilt inside the cycle → **all 6
+  cells FAIL at their named verified-projection assertions** (`org_test.go`
+  "handler saw acting org eee…, want bc7c…/acf1… (verified projection)",
+  per-shape named reds) → restore → rebuild → **6/6 PASS**. **Findings:**
+  F-S4Go-1 (a draining Go handler aborted the process via `spawn_blocking`
+  re-entry — FIXED in-row at `spawn_handler_thread` across all 8 bridges;
+  proof assertions `pong.N != 3` / `len(got) != 2` / echo-order with the
+  verbatim FATAL `10002 B` as the executed inverse, report sha `e0289af8`);
+  F-S4Go-2 (no discovery preflight seam on the binding surface — stated).
+  CI: the Go live-cell roster gate (6 names, lexical, fail-closed) pinned
+  beside `Run Go tests` at `f58cd20ec`. **Spot-check process rules now
+  binding for every binding lane** (learned from six defeated invocation
+  classes, all harness-side, zero code defects): (1) rebuild the artifact
+  inside the cycle — an unbuilt source mutation is non-execution; (2)
+  verify the consumer actually ran — a wrong consumer path is
+  non-execution; (3) Windows DLL search: stage the DLL beside the test exe
+  (the loader's guaranteed location); (4) this harness's bash wrapper
+  cannot execute non-PATH binaries (its resolver reports "command not
+  found" against files its own `ls` just showed) nor nested `bash` (routed
+  to a broken WSL2/Docker service) — run consumer binaries via
+  `subprocess`/CreateProcess from the eval kernel; (5) rebuild the test
+  exe if a prior cycle's cleanup deleted it; (6) **mutate an ASSERTED
+  field** — target the exact assertion the receipt names (an entity-field
+  mutation against `assertCaller`'s acting-org/provider-org/`IsSameOrg`
+  checks is invisible by correct test design, and its `PASS` is not a
+  finding). Limits stated by the lane (never executed there): full
+  skill-examples runner green is CI-ubuntu's — this Windows host cannot
+  green ANY C row (5 pre-existing rows lack `arpa/inet.h`; every compiled
+  row's extensionless binary misses `CreateProcess`), documented with the
+  receipt + the workaround execution (`RESULT ok chunks=3
+  attribution=verified`, `S4_GO.md` §Guard scripts).
 - **2026-09-22, S3R repair round verified (executed).** All three S3Review
   ACCEPT findings closed at `b879ca4f8` (commits `0c580ca46` four witnesses,
   `b5143865c` five receipts as the empty tree-change, `b879ca4f8` record).

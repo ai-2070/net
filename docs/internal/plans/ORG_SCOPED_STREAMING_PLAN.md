@@ -1529,3 +1529,26 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   `6825c1056`. In-row defect found-and-fixed by its own probe (the napi cfg
   trap in shipped `index.d.ts`); its ENOSPC truncation recovered
   byte-exact; the index-sweep attribution corrected (S4Go's carved files).
+
+- 2026-09-22, **Wave 1 lane 2/4 closed: `S4Go` verified (executed)** at
+  `14d5b87f3` + `314b30152` (`S4_GO.md` F16-ledgered): the §4.4 Go/C
+  surface over the frozen seams (the shared handle module, the org-ffi
+  verb trio + dispatcher setters + serve trio at `NET_ORG_ABI_VERSION
+  0x0002` with the `net_org.h` mirror pinned, `go/org.go`'s call/serve
+  verbs + trampolines + midstream `parseOrgError` routing), the F-S3.1-2
+  handler-drop contract at the Go handler surfaces, and the ruled C skill
+  example carve (landed at `c62ecd740` + 4 named deltas in its own
+  explicit-path commit). Estate: 6/6 live cells (3 shapes × {same-org,
+  granted} with verified-caller attribution asserted), net-org-ffi 20 +
+  net-rpc-ffi 45+1 units, 578 exports with the 9 new `net_org_*` verbs,
+  the C example compile+link vs single `-lnet`. REQUIRED receipt
+  (`NetOrgCaller` swap) + coordinator spot-check SCR-GO (the `acting_org`
+  mutation → all 6 cells FAIL at their named verified-projection
+  assertions → restore → 6/6 PASS) both discriminate. F-S4Go-1 (a `spawn_
+  blocking` re-entry process-abort) found-and-fixed in-row at
+  `spawn_handler_thread` across all 8 bridges, with assertion-level proof;
+  F-S4Go-2 (no discovery preflight seam on the binding surface) stated.
+  CI: the 6-name live-cell roster gate pinned beside `Run Go tests` at
+  `f58cd20ec`. Six spot-check invocation classes (all harness-side)
+  resolved into binding-lane rules — chief among them: mutate an ASSERTED
+  field, and rebuild the consumer artifact inside the cycle.
