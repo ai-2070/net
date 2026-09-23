@@ -341,6 +341,18 @@ impl EnrollOwner {
             ),
             None => None,
         };
+        // Standalone subnet links are redeemed over the device's session.
+        let standalone = match &subnet {
+            Some(issuer) => Some(
+                net_sdk::enrollment::standalone::serve_subnet_redeem(
+                    mesh.node(),
+                    self.ledger.clone(),
+                    issuer.clone(),
+                )
+                .map_err(|e| generic(format!("standalone subnet service: {e}")))?,
+            ),
+            None => None,
+        };
         // Relay fallback: register (and keep re-trying) in the background;
         // the node serves direct joiners whether or not the relay is up.
         let relay = match self.plan.relay {
@@ -366,6 +378,7 @@ impl EnrollOwner {
             tcp_mapping,
             relay,
             _renewal: renewal,
+            _standalone: standalone,
             port_mapping: self.plan.port_mapping,
             created: self.created,
         })
@@ -564,6 +577,9 @@ pub(crate) struct RunningEnrollment {
     relay: Option<RelayLink>,
     /// Serves subnet leaf renewal while this node issues subnet credentials.
     _renewal: Option<net::adapter::net::mesh_rpc::ServeHandle>,
+    /// Serves standalone subnet redemption while this node issues subnet
+    /// credentials.
+    _standalone: Option<net::adapter::net::mesh_rpc::ServeHandle>,
     port_mapping: bool,
     created: Vec<&'static str>,
 }
@@ -721,7 +737,9 @@ impl EnrollContext {
                 .contact_addr(endpoint)
                 .ok_or_else(|| format!("address {} does not resolve", endpoint.as_str()))?;
         }
+        let standalone = request["standalone"] == Value::Bool(true);
         let (relations, subnet) = match request["subnet"].as_str() {
+            None if standalone => return Err("a standalone link needs a subnet".to_string()),
             None => (vec![Relation::Mesh], None),
             Some(path) => {
                 let issuer = self.subnet.as_ref().ok_or_else(|| {
@@ -752,7 +770,13 @@ impl EnrollContext {
                         super::subnet::format_subnet_rights(grant.maximum_rights),
                     ));
                 }
-                (vec![Relation::Mesh, Relation::Subnet], Some(offer))
+                if standalone {
+                    // The subnet relation only: for a device already on the
+                    // mesh, redeemed over its session (no PSK is delivered).
+                    (vec![Relation::Subnet], Some(offer))
+                } else {
+                    (vec![Relation::Mesh, Relation::Subnet], Some(offer))
+                }
             }
         };
         let policy = InvitationPolicy::with_options(now, ttl, mode).map_err(|e| e.to_string())?;
@@ -788,6 +812,7 @@ impl EnrollContext {
                 "scope": super::subnet::format_subnet(o.scope.path),
                 "rights": super::subnet::format_subnet_rights(o.rights),
             })),
+            "standalone": standalone,
             "issuer_fingerprint": invite.issuer_fingerprint(),
         }))
     }
@@ -1003,6 +1028,10 @@ pub struct CreateArgs {
     /// Rights for `--subnet` (default `attach`; others only when named).
     #[arg(long, value_name = "RIGHTS", requires = "subnet")]
     pub subnet_rights: Option<String>,
+    /// A standalone subnet link (`subnet invite`): the subnet relation only,
+    /// for a device already on the mesh.
+    #[arg(skip)]
+    pub standalone: bool,
 }
 
 /// `invite inspect` arguments.
@@ -1098,6 +1127,9 @@ pub async fn run_invite(
             if let Some(rights) = &args.subnet_rights {
                 super::subnet::parse_subnet_rights(rights)?;
                 request["subnet_rights"] = json!(rights);
+            }
+            if args.standalone {
+                request["standalone"] = json!(true);
             }
             let mut reply = node_request(args.state_dir, profile_name, request).await?;
             if reply["bearer"] == Value::Bool(true) {
@@ -1221,6 +1253,8 @@ pub(crate) const JOIN_SUBDIR: &str = "join";
 /// contact also names a relay. Without a relay the direct path has the whole
 /// wait.
 const DIRECT_ATTACH_WAIT: Duration = Duration::from_secs(5);
+/// Pause between direct handshake attempts inside one attach budget.
+const DIRECT_RETRY_PAUSE: Duration = Duration::from_millis(500);
 
 /// Attach `mesh` to `contact` via the routed handshake: **direct first**, the
 /// contact's blind relay only if the direct attempt fails. The session
@@ -1239,15 +1273,30 @@ pub(crate) async fn attach_contact(
         } else {
             wait
         };
-        let attempt = tokio::time::timeout(
-            budget,
-            node.connect_via(addr, &contact.noise_pubkey, contact.node_id),
-        )
-        .await;
-        match attempt {
-            Ok(Ok(_)) => return Ok("direct"),
-            Ok(Err(e)) => direct_failure = Some(format!("direct {addr}: {e}")),
-            Err(_) => direct_failure = Some(format!("direct {addr}: timed out")),
+        // Keep trying within the budget: a peer that just restarted can be
+        // refused for a few heartbeats while its old session still looks
+        // busy at the other end (C3), which outlasts one handshake's retries.
+        let direct_deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let attempt = tokio::time::timeout_at(
+                direct_deadline,
+                node.connect_via(addr, &contact.noise_pubkey, contact.node_id),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(_)) => return Ok("direct"),
+                Ok(Err(e)) => direct_failure = Some(format!("direct {addr}: {e}")),
+                Err(_) => {
+                    direct_failure = Some(format!("direct {addr}: timed out"));
+                    break;
+                }
+            }
+            if direct_deadline.saturating_duration_since(tokio::time::Instant::now())
+                < DIRECT_RETRY_PAUSE
+            {
+                break;
+            }
+            tokio::time::sleep(DIRECT_RETRY_PAUSE).await;
         }
     }
     let Some(relay) = &contact.relay else {

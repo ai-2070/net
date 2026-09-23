@@ -76,6 +76,55 @@ pub enum SubnetCommand {
     /// it. Unnamed verifiers are never assumed; `complete` is true only
     /// when every named verifier attested a persisted floor.
     Remove(RemoveArgs),
+    /// Create a standalone subnet link: the subnet relation only, for a
+    /// device already on this mesh. It is redeemed over the device's own
+    /// session with this node (no PSK is delivered). Needs `up --enroll`
+    /// started with a subnet issuer whose grant covers the scope.
+    Invite(SubnetInviteArgs),
+    /// Join a subnet with a standalone link, through this device's running
+    /// `up`: it redeems the link over its session with the node it enrolled
+    /// with, keeps the credentials, and presents them (the verifier's
+    /// verdict is reported). The node renews and re-presents them itself.
+    Join(SubnetJoinArgs),
+}
+
+/// `subnet invite` arguments.
+#[derive(Args, Debug)]
+pub struct SubnetInviteArgs {
+    /// The subnet scope (dotted path) inside this node's issuer grant.
+    pub scope: String,
+    /// Rights to offer (default `attach`; others only when named).
+    #[arg(long, value_name = "RIGHTS")]
+    pub rights: Option<String>,
+    /// Node state directory (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Lifetime of the unredeemed link (default 24h).
+    #[arg(long, value_name = "DURATION", value_parser = crate::humantime::parse_duration)]
+    pub ttl: Option<std::time::Duration>,
+    /// Require an operator decision (`invite approve`) before issuing.
+    #[arg(long)]
+    pub require_approval: bool,
+    /// Bind the link to one device's full 64-hex entity id.
+    #[arg(long = "for", value_name = "ENTITY")]
+    pub for_subject: Option<String>,
+    /// Write the link to this new owner-only file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    pub out: Option<PathBuf>,
+}
+
+/// `subnet join` arguments.
+#[derive(Args, Debug)]
+pub struct SubnetJoinArgs {
+    /// The standalone subnet link, or `-` to read it from stdin (then
+    /// `--yes` is required).
+    pub token: String,
+    /// State directory of this device's running `net-mesh up`.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Skip the interactive confirmation (scripts and agent tool use).
+    #[arg(long)]
+    pub yes: bool,
 }
 
 /// `net-mesh subnet remove` arguments.
@@ -192,7 +241,134 @@ pub async fn run(
             let profile = resolve_profile(config_path, profile_name).await?;
             run_remove(args, profile.psk_hex, profile_name, output).await
         }
+        SubnetCommand::Invite(args) => {
+            parse_subnet_path(&args.scope)?;
+            super::enrollment::run_invite(
+                super::enrollment::InviteCommand::Create(super::enrollment::CreateArgs {
+                    state_dir: args.state_dir,
+                    ttl: args.ttl,
+                    require_approval: args.require_approval,
+                    for_subject: args.for_subject,
+                    out: args.out,
+                    addr: None,
+                    subnet: Some(args.scope),
+                    subnet_rights: args.rights,
+                    standalone: true,
+                }),
+                output,
+                profile_name,
+            )
+            .await
+        }
+        SubnetCommand::Join(args) => run_subnet_join(args, output, profile_name).await,
     }
+}
+
+/// Bound on the whole `subnet join` exchange with the running node (its
+/// redemption and presentation are bounded inside it).
+const SUBNET_JOIN_CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(28);
+
+/// `subnet join`: show what is being joined, confirm, and hand the link to
+/// the running node over its authenticated control endpoint.
+async fn run_subnet_join(
+    args: SubnetJoinArgs,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use net_sdk::enrollment::standalone::is_standalone_subnet;
+    let from_stdin = args.token == "-";
+    if from_stdin && !args.yes {
+        return Err(invalid_args(
+            "reading the link from stdin needs --yes (stdin cannot also answer the prompt)",
+        ));
+    }
+    let token = if from_stdin {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = String::new();
+        tokio::io::stdin()
+            .take(4096)
+            .read_to_string(&mut buf)
+            .await
+            .map_err(|e| generic(format!("read link from stdin: {e}")))?;
+        crate::secret::ScrubbedString::new(buf.trim().to_string())
+    } else {
+        crate::secret::ScrubbedString::new(args.token)
+    };
+    let invite = net_sdk::enrollment::invite::MembershipInvite::decode(token.as_str())
+        .map_err(|e| invalid_args(format!("not a valid link: {e}")))?;
+    let offer = match invite.subnet() {
+        Some(offer) if is_standalone_subnet(&invite) => offer.clone(),
+        _ => {
+            return Err(invalid_args(
+                "not a standalone subnet link (a mesh invite is redeemed with `net-mesh join`)",
+            ))
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now >= invite.policy().expires_at() {
+        return Err(invalid_args("this link has expired; ask for a new one"));
+    }
+    eprintln!(
+        "Joining subnet {} ({}) of authority {} under issuer {}\n  link: {}, expires at unix {}",
+        format_subnet(offer.scope.path),
+        format_subnet_rights(offer.rights),
+        hex::encode(offer.scope.authority.as_bytes()),
+        invite.issuer_fingerprint(),
+        if invite.is_bearer() {
+            "bearer (the first redeemer joins)"
+        } else {
+            "bound to one device"
+        },
+        invite.policy().expires_at(),
+    );
+    let tty = {
+        use std::io::IsTerminal as _;
+        std::io::stdin().is_terminal() && !from_stdin
+    };
+    let yes = args.yes;
+    tokio::task::spawn_blocking(move || {
+        super::ice::check_confirm_gate(tty, yes, || {
+            use std::io::{BufRead as _, Write as _};
+            let mut err = std::io::stderr();
+            write!(
+                err,
+                "Confirm the issuer fingerprint is the one you expect. Type YES to join: "
+            )
+            .and_then(|()| err.flush())
+            .map_err(|e| generic(format!("prompt: {e}")))?;
+            let mut line = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| generic(format!("prompt: {e}")))?;
+            Ok(line.trim() == "YES")
+        })
+    })
+    .await
+    .map_err(|e| generic(format!("confirmation task failed: {e}")))??;
+
+    let node_dir = super::lifecycle::state_dir(args.state_dir, profile_name)?
+        .join(super::lifecycle::NODE_SUBDIR);
+    let (_, reply) = super::lifecycle::control_call_within(
+        &node_dir,
+        serde_json::json!({ "op": "subnet_join", "token": token.as_str() }),
+        SUBNET_JOIN_CONTROL_WAIT,
+    )
+    .await
+    .map_err(|e| {
+        crate::error::connection_failure(format!(
+            "this device's node is not reachable ({e:?}); `subnet join` runs through a running \
+             `net-mesh up`"
+        ))
+    })?;
+    if let Some(e) = reply["error"].as_str() {
+        return Err(generic(e.to_string()));
+    }
+    emit_value(OutputFormat::resolve_oneshot(output), &reply)
+        .map_err(|e| generic(format!("write result: {e}")))
 }
 
 /// One named enforcement point.

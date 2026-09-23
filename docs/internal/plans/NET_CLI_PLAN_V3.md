@@ -2332,6 +2332,95 @@ that cap. This is relay sizing, and it applies to first joins too.
 
 Regressions: `relay_join` 5/5; `net-cli` clippy is clean.
 
+#### V3-2 task 3 — standalone subnet join (receipt, 2026-09-24)
+
+A device already on the mesh joins another subnet with a subnet-only link,
+over its own session.
+
+**Operator.**
+- `net-mesh subnet invite <scope> [--rights] [--require-approval] [--for]
+  [--ttl] [--out]` creates a link with `relations = [Subnet]`, through the
+  node's `invite_create` (the same envelope check as `invite create
+  --subnet`).
+- An `up` with a subnet issuer also serves `net.enroll.subnet.redeem`.
+
+**Device.** `net-mesh subnet join <link|-> [--yes]` shows the scope, rights,
+authority and issuer, then asks for the same YES confirmation as `join`. It
+hands the link to the running `up` over its authenticated control endpoint
+(`subnet_join`). The node:
+- refuses a mesh invite, and a link whose issuer is not the one this device
+  enrolled with (the v1 limit, stated in the error);
+- records the membership (`<state>/subnets/<digest key>`) before redeeming;
+- redeems over its session (SDK `request_subnet_redeem`);
+- installs only credentials that are exactly the signed offer;
+- presents them, and reports the verifier's verdict.
+
+The link supervisor then keeps every membership admitted, through one shared
+helper for the join's own subnet and for standalone memberships:
+- it re-presents on every new session;
+- it renews near expiry;
+- it asks again for an approval-gated membership until it is issued;
+- it reports each membership in `node status` → `link.standalone`.
+
+`leave` records every membership as left, credentials erased, before
+recording the join's own departure.
+
+**SDK (commit `1ea7e1083`).**
+- `SubnetRedeemRequest` is device-signed and binds the destination node and
+  a ±300 s freshness window.
+- `answer_subnet_redeem`:
+  - requires the delivering session to have proven the same entity;
+  - accepts subnet-only invites only, and only this ledger's own;
+  - runs claim → approval → issue.
+  - `AlreadyIssued` re-issues fresh credentials. The ledger returns that
+    only to the identical claimant; an extra subject check there was an
+    equivalent mutant, so it was removed.
+- `serve_subnet_redeem` adds the subject-floor refusal.
+- `SubnetMembership` is the device's per-link store.
+
+**Found on the way.** `attach_contact` now retries the direct handshake
+within its budget. A peer that just restarted can be deferred for a few
+heartbeats (C3), which outlasts one `connect_via`'s own retries. A start
+report can still be the first, unattached attempt right after nRPC traffic;
+the supervisor completes it (measured: attached 0.6 s after the start
+budget).
+
+**Witnesses.**
+- SDK:
+  - `a_standalone_subnet_link_issues_only_to_the_proven_session_entity`
+    covers the session binding, the destination, freshness, the signature,
+    exact-offer issue, re-issue to the same device, a second device refused,
+    mesh+subnet refused, and approval gating.
+  - `a_standalone_membership_installs_only_its_offer_and_leave_fences_it`.
+- CLI `a_joined_device_joins_another_subnet_with_a_standalone_link`:
+  - join with 3.7; `subnet invite 3.8`; a mesh invite refused;
+    `subnet join` → installed, admitted, and the same device entity;
+  - restart → both memberships re-presented by the node;
+  - a second joined device refused ("bound to another claim");
+  - a link from another operator refused;
+  - an approval-gated 3.9 link → `pending_approval`, then `invite approve`,
+    after which the node completes it by itself;
+  - `leave` → both membership stores left, with no credentials.
+
+**Inverse mutations** (all RED):
+- SDK: no session binding; no destination binding; mesh+subnet accepted;
+  pending issued anyway; install without the offer check; no leave fence.
+- CLI: the operator not serving redemption; a standalone link carrying the
+  mesh relation; the foreign-issuer check skipped; the supervisor ignoring
+  memberships; pending memberships never asked again; `leave` skipping
+  memberships.
+
+**Regressions.**
+- The SDK suite as CI runs it: 813/813.
+- `net-cli` 355/355.
+- `net-cli` clippy is clean; SDK clippy (CI features, `full`) is clean apart
+  from the pre-existing `sensing_consumer` lint; SDK rustdoc `full` is clean.
+
+**Not done (v1 limits).**
+- A standalone link from another operator on the mesh. Its node would need
+  to be named in the link, or discovered.
+- Org and channel standalone links.
+
 ### V3-2A — channel-scoped invitation, join and credential lifecycle
 
 **Modify:** `src/adapter/net/mesh.rs` for exact publish-chain/cache lifecycle hooks; `sdk/src/identity.rs` to expose the canonical `TokenChain`; `sdk/src/mesh.rs` for a full-chain subscribe path; shared enrollment/persistence modules; `cli/src/commands/channel.rs`, `main.rs`, `context.rs`, `config.rs`; and the selected durable authority/runtime control owner. Modify `identity/token.rs` or `channel/config.rs` only for a separately source-proven gap.

@@ -531,3 +531,129 @@ fn a_joined_node_reattaches_and_is_readmitted_without_being_touched() {
     });
     drop(node);
 }
+
+/// V3-2 task 3, end to end: a device already joined (with subnet 3.7) joins
+/// a second subnet, 3.8, with a standalone link — over its own session, no
+/// new token ceremony. It is admitted by the verifier; the membership
+/// survives a restart (re-presented by the node itself); the link binds the
+/// device that redeemed it (a second device is refused); a mesh invite, or a
+/// link from a node this device did not enroll with, is refused; and an
+/// approval-gated link completes by itself once the operator approves.
+#[test]
+fn a_joined_device_joins_another_subnet_with_a_standalone_link() {
+    let operator = Fx::new();
+    let keys = operator.tmp.path().join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let (_root, _root_hex, issuer, grant) = ceremony(&keys);
+    let op_args = [
+        "--enroll",
+        "--no-port-mapping",
+        "--subnet-issuer-grant",
+        grant.to_str().unwrap(),
+        "--subnet-issuer-key",
+        issuer.to_str().unwrap(),
+    ];
+    let _op = operator.up(&op_args);
+
+    let created = operator.json(&["invite", "create", "--subnet", "3.7"]);
+    let agent = Fx::new();
+    let joined = agent.json(&["join", &token_of(&created), "--yes"]);
+    let device = joined["device"].as_str().unwrap().to_string();
+    let node = agent.up(&[]);
+    assert_eq!(
+        node.ready["joined"]["subnet"]["admitted"], true,
+        "{}",
+        node.ready
+    );
+
+    // The operator makes a standalone link for 3.8.
+    let link = operator.json(&["subnet", "invite", "3.8"]);
+    assert_eq!(link["standalone"], true, "{link}");
+    assert_eq!(link["subnet"]["scope"], "3.8", "{link}");
+    let link_token = token_of(&link);
+
+    // A mesh invite is not a standalone link.
+    let mesh_invite = operator.json(&["invite", "create"]);
+    let refused = agent.run(&["subnet", "join", &token_of(&mesh_invite), "--yes"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("not a standalone subnet link"),
+        "{refused:?}"
+    );
+
+    // Joined over the session: installed and admitted by the verifier.
+    let sub = agent.json(&["subnet", "join", &link_token, "--yes"]);
+    assert_eq!(sub["state"], "installed", "{sub}");
+    assert_eq!(sub["scope"], "3.8", "{sub}");
+    assert_eq!(sub["admitted"], true, "{sub}");
+    assert_eq!(sub["device"], device.as_str(), "the same proven identity");
+
+    // Restart: the node re-presents both memberships by itself. (Right
+    // after the redemption's nRPC traffic the operator may defer the new
+    // handshake for a few heartbeats, so the start report can be the first,
+    // unattached attempt; the link supervisor completes it.)
+    drop(node);
+    let node = agent.up(&[]);
+    wait_for_link(&agent, "both memberships re-presented", |l| {
+        l["attached"] == true
+            && l["subnet_admitted"] == true
+            && l["standalone"].as_object().is_some_and(|m| {
+                m.values()
+                    .any(|e| e["scope"] == "3.8" && e["admitted"] == true)
+            })
+    });
+
+    // The link binds the device that redeemed it: another joined device,
+    // over its own proven session, gets nothing.
+    let second = Fx::new();
+    let other_invite = operator.json(&["invite", "create", "--subnet", "3.7"]);
+    second.json(&["join", &token_of(&other_invite), "--yes"]);
+    let other_node = second.up(&[]);
+    let stolen = second.run(&["subnet", "join", &link_token, "--yes"]);
+    assert!(!stolen.status.success(), "{stolen:?}");
+    assert!(
+        String::from_utf8_lossy(&stolen.stderr).contains("bound to another claim"),
+        "{stolen:?}"
+    );
+    drop(other_node);
+
+    // A link from a node this device did not enroll with is refused.
+    let elsewhere = Fx::new();
+    let _other_op = elsewhere.up(&op_args);
+    let foreign = elsewhere.json(&["subnet", "invite", "3.8"]);
+    let refused = agent.run(&["subnet", "join", &token_of(&foreign), "--yes"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("not by the node this device enrolled with"),
+        "{refused:?}"
+    );
+
+    // Approval-gated: pending until approved; then the node completes it.
+    let gated = operator.json(&["subnet", "invite", "3.9", "--require-approval"]);
+    let pending = agent.json(&["subnet", "join", &token_of(&gated), "--yes"]);
+    assert_eq!(pending["state"], "pending_approval", "{pending}");
+    let offer_id = gated["offer_id"].as_str().unwrap().to_string();
+    operator.json(&["invite", "approve", &offer_id, "--subject", &device]);
+    wait_for_link(&agent, "approved membership completes", |l| {
+        l["standalone"].as_object().is_some_and(|m| {
+            m.values()
+                .any(|e| e["scope"] == "3.9" && e["state"] == "installed" && e["admitted"] == true)
+        })
+    });
+    // Leave covers the standalone memberships: each store records the
+    // departure and holds no credentials any more.
+    let left = agent.json(&["leave"]);
+    assert_eq!(left["state"], "left", "{left}");
+    drop(node);
+    let subnets = agent.state().join("subnets");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&subnets).unwrap() {
+        let dir = entry.unwrap().path();
+        let membership = net_sdk::enrollment::standalone::SubnetMembership::open(&dir).unwrap();
+        assert!(membership.left_at().is_some(), "{}", dir.display());
+        assert!(membership.credentials().is_none(), "{}", dir.display());
+        seen += 1;
+    }
+    assert_eq!(seen, 2, "the 3.8 and 3.9 memberships");
+}

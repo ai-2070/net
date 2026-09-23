@@ -127,9 +127,280 @@ struct JoinedLink {
     /// Subnet presentations admitted by the supervisor (each new session,
     /// or a renewed leaf) — not counting the start presentation.
     readmissions: u64,
+    /// Standalone subnet memberships (`subnet join`), keyed by membership.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    standalone: std::collections::BTreeMap<String, StandaloneLink>,
+}
+
+/// One standalone subnet membership's live state.
+#[derive(Clone, Debug, Default, Serialize)]
+struct StandaloneLink {
+    scope: String,
+    rights: String,
+    /// `installed` once credentials are held; `pending_approval` until then.
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admitted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
 }
 
 type SharedJoin = Arc<parking_lot::Mutex<Option<net_sdk::enrollment::device::DeviceJoin>>>;
+type SharedMemberships =
+    Arc<parking_lot::Mutex<Vec<net_sdk::enrollment::standalone::SubnetMembership>>>;
+
+/// Directory (under the state root) holding standalone subnet memberships.
+const SUBNETS_SUBDIR: &str = "subnets";
+
+/// A membership's directory name and status key: a one-way digest of the
+/// signed link (the invitation id itself is treated as sensitive).
+fn membership_key(invite: &net_sdk::enrollment::invite::MembershipInvite) -> String {
+    let key = blake3::derive_key(
+        "net-mesh standalone subnet membership dir v1",
+        &invite.digest(),
+    );
+    hex::encode(&key[..12])
+}
+
+fn standalone_entry(
+    offer: &net_sdk::enrollment::invite::SubnetOffer,
+    state: &str,
+) -> StandaloneLink {
+    StandaloneLink {
+        scope: super::subnet::format_subnet(offer.scope.path),
+        rights: super::subnet::format_subnet_rights(offer.rights),
+        state: state.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Open every stored standalone membership (fail closed on a corrupt one).
+fn load_memberships(
+    dir: &Path,
+) -> Result<Vec<net_sdk::enrollment::standalone::SubnetMembership>, CliError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(generic(format!(
+                "subnet memberships {}: {e}",
+                dir.display()
+            )))
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| generic(format!("subnet memberships {}: {e}", dir.display())))?
+            .path();
+        if !path.is_dir() {
+            continue;
+        }
+        let membership = net_sdk::enrollment::standalone::SubnetMembership::open(&path)
+            .map_err(|e| generic(format!("subnet membership {}: {e}", path.display())))?;
+        out.push(membership);
+    }
+    Ok(out)
+}
+
+/// Per-credential bookkeeping for [`keep_subnet_admitted`].
+#[derive(Default)]
+struct SubnetTrack {
+    /// The session these credentials were last admitted on.
+    presented: Option<u64>,
+    present_retry_at: u64,
+    renew_retry_at: u64,
+}
+
+/// What [`keep_subnet_admitted`] did.
+enum Kept {
+    /// The owner of the credentials is gone (shut down or left).
+    Gone,
+    /// Nothing was due.
+    Quiet,
+    /// Credentials were presented; the verifier's verdict.
+    Presented(Result<(), String>),
+}
+
+/// Keep one subnet credential admitted on `session` with `issuer_node`:
+/// renew it when due (persisting through `persist`, which re-checks it
+/// against the signed offer), and present it when it has not been admitted
+/// on this session yet (admission binds to the session).
+#[allow(clippy::too_many_arguments)]
+async fn keep_subnet_admitted(
+    node: &Arc<net::adapter::net::MeshNode>,
+    issuer_node: u64,
+    session: u64,
+    identity: &net_sdk::identity::Identity,
+    invite: &net_sdk::enrollment::invite::MembershipInvite,
+    offer: &net_sdk::enrollment::invite::SubnetOffer,
+    mut set: net::adapter::net::subnet::SubnetCredentialSet,
+    track: &mut SubnetTrack,
+    persist: impl FnOnce(
+        &net::adapter::net::subnet::SubnetCredentialSet,
+    ) -> Option<Result<(), net_sdk::enrollment::device::DeviceJoinError>>,
+) -> Kept {
+    let now = now_unix();
+    let mut fresh = false;
+    if now >= subnet_renew_at(&set) && now >= track.renew_retry_at {
+        track.renew_retry_at = now + SUBNET_RENEW_MIN_INTERVAL;
+        match net_sdk::enrollment::renew::request_subnet_renewal(
+            node,
+            issuer_node,
+            identity,
+            invite,
+            SUBNET_RENEW_WAIT,
+        )
+        .await
+        {
+            Ok(renewed) => match persist(&renewed) {
+                Some(Ok(())) => {
+                    set = renewed;
+                    fresh = true;
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "renewed subnet credentials refused");
+                    track.renew_retry_at = now + SUBNET_RENEW_RETRY.as_secs();
+                }
+                None => return Kept::Gone,
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "subnet leaf renewal failed; retrying");
+                track.renew_retry_at = now + SUBNET_RENEW_RETRY.as_secs();
+            }
+        }
+    }
+    if fresh || (track.presented != Some(session) && now >= track.present_retry_at) {
+        let admitted = node
+            .present_subnet_credentials(
+                issuer_node,
+                &set,
+                offer.scope.clone(),
+                offer.rights,
+                JOIN_ATTACH_WAIT,
+            )
+            .await;
+        return Kept::Presented(match admitted {
+            Ok(_) => {
+                track.presented = Some(session);
+                Ok(())
+            }
+            Err(e) => {
+                track.presented = None;
+                track.present_retry_at = now_unix() + SUBNET_RENEW_RETRY.as_secs();
+                Err(e.to_string())
+            }
+        });
+    }
+    Kept::Quiet
+}
+
+/// Keep every standalone membership redeemed at `issuer_node` admitted on
+/// `session`: ask again for a pending one, renew and present an installed
+/// one. Reported per membership in `link.standalone`.
+#[allow(clippy::too_many_arguments)]
+async fn keep_standalone_admitted(
+    node: &Arc<net::adapter::net::MeshNode>,
+    issuer_node: u64,
+    session: u64,
+    identity: &net_sdk::identity::Identity,
+    memberships: &SharedMemberships,
+    tracks: &mut std::collections::HashMap<String, SubnetTrack>,
+    link: &Arc<parking_lot::Mutex<JoinedLink>>,
+) {
+    use net_sdk::enrollment::standalone::SubnetRedeemReply;
+    let snapshot: Vec<_> = memberships
+        .lock()
+        .iter()
+        .filter(|m| m.left_at().is_none() && m.issuer_node() == issuer_node)
+        .filter_map(|m| {
+            Some((
+                membership_key(m.invite()),
+                m.invite().clone(),
+                m.offer()?.clone(),
+                m.credentials().cloned(),
+            ))
+        })
+        .collect();
+    for (key, invite, offer, credentials) in snapshot {
+        let track = tracks.entry(key.clone()).or_default();
+        let install = |set: &net::adapter::net::subnet::SubnetCredentialSet| {
+            memberships
+                .lock()
+                .iter_mut()
+                .find(|m| membership_key(m.invite()) == key)
+                .map(|m| m.install(set))
+        };
+        match credentials {
+            // Approval-gated and not yet issued: ask again now and then.
+            None => {
+                let now = now_unix();
+                if now < track.renew_retry_at {
+                    continue;
+                }
+                track.renew_retry_at = now + SUBNET_RENEW_RETRY.as_secs();
+                let reply = net_sdk::enrollment::standalone::request_subnet_redeem(
+                    node,
+                    issuer_node,
+                    identity,
+                    &invite,
+                    SUBNET_RENEW_WAIT,
+                )
+                .await;
+                let mut entry = standalone_entry(&offer, "pending_approval");
+                match reply {
+                    Ok(SubnetRedeemReply::Issued(set)) => match install(&set) {
+                        Some(Ok(())) => {
+                            // Present on the next pass.
+                            track.renew_retry_at = 0;
+                            entry.state = "installed".to_string();
+                            entry.expires_at = Some(set.leaf().not_after);
+                        }
+                        Some(Err(e)) => entry.detail = Some(e.to_string()),
+                        None => continue,
+                    },
+                    Ok(SubnetRedeemReply::PendingApproval) => {
+                        entry.detail = Some("awaiting operator approval".to_string());
+                    }
+                    Err(e) => entry.detail = Some(e),
+                }
+                link.lock().standalone.insert(key, entry);
+            }
+            Some(set) => {
+                let kept = keep_subnet_admitted(
+                    node,
+                    issuer_node,
+                    session,
+                    identity,
+                    &invite,
+                    &offer,
+                    set,
+                    track,
+                    install,
+                )
+                .await;
+                let expires_at = memberships
+                    .lock()
+                    .iter()
+                    .find(|m| membership_key(m.invite()) == key)
+                    .and_then(|m| m.credentials().map(|c| c.leaf().not_after));
+                let mut l = link.lock();
+                let entry = l
+                    .standalone
+                    .entry(key.clone())
+                    .or_insert_with(|| standalone_entry(&offer, "installed"));
+                entry.state = "installed".to_string();
+                entry.expires_at = expires_at;
+                if let Kept::Presented(verdict) = kept {
+                    entry.admitted = Some(verdict.is_ok());
+                    entry.detail = verdict.err();
+                }
+            }
+        }
+    }
+}
 
 /// Keep a joined node attached and, for a subnet join, admitted:
 /// - no live session with the enrolling node (never attached, or the
@@ -146,14 +417,20 @@ type SharedJoin = Arc<parking_lot::Mutex<Option<net_sdk::enrollment::device::Dev
 /// bundle, so there is nothing to attach with.
 fn spawn_joined_link(
     joined: SharedJoin,
+    memberships: SharedMemberships,
     node: Arc<net::adapter::net::MeshNode>,
     link: Arc<parking_lot::Mutex<JoinedLink>>,
-    mut presented: Option<u64>,
-    mut present_retry_at: u64,
+    presented: Option<u64>,
+    present_retry_at: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = REATTACH_MIN;
-        let mut renew_retry_at = 0u64;
+        let mut track = SubnetTrack {
+            presented,
+            present_retry_at,
+            renew_retry_at: 0,
+        };
+        let mut standalone_tracks = std::collections::HashMap::<String, SubnetTrack>::new();
         loop {
             let snapshot = {
                 let guard = joined.lock();
@@ -192,6 +469,9 @@ fn spawn_joined_link(
                     if l.subnet_admitted.is_some() {
                         l.subnet_admitted = None;
                     }
+                    for entry in l.standalone.values_mut() {
+                        entry.admitted = None;
+                    }
                 }
                 match super::enrollment::attach_contact(&node, &contact, JOIN_ATTACH_WAIT).await {
                     Ok(path) => {
@@ -201,8 +481,12 @@ fn spawn_joined_link(
                         l.detail = None;
                         l.reattaches += 1;
                         backoff = REATTACH_MIN;
-                        presented = None;
-                        present_retry_at = 0;
+                        track.presented = None;
+                        track.present_retry_at = 0;
+                        for t in standalone_tracks.values_mut() {
+                            t.presented = None;
+                            t.present_retry_at = 0;
+                        }
                     }
                     Err(e) => {
                         link.lock().detail = Some(format!("attach failed: {e}"));
@@ -219,67 +503,50 @@ fn spawn_joined_link(
                     l.detail = None;
                 }
             }
-            if let Some((offer, mut set)) = subnet {
-                let now = now_unix();
-                let mut fresh = false;
-                if now >= subnet_renew_at(&set) && now >= renew_retry_at {
-                    renew_retry_at = now + SUBNET_RENEW_MIN_INTERVAL;
-                    match net_sdk::enrollment::renew::request_subnet_renewal(
-                        &node,
-                        contact.node_id,
-                        &identity,
-                        &invite,
-                        SUBNET_RENEW_WAIT,
-                    )
-                    .await
-                    {
-                        Ok(renewed) => match joined
+            if let Some((offer, set)) = subnet {
+                let kept = keep_subnet_admitted(
+                    &node,
+                    contact.node_id,
+                    session,
+                    &identity,
+                    &invite,
+                    &offer,
+                    set,
+                    &mut track,
+                    |renewed| {
+                        joined
                             .lock()
                             .as_mut()
-                            .map(|j| j.replace_subnet_credentials(&renewed))
-                        {
-                            Some(Ok(())) => {
-                                set = renewed;
-                                fresh = true;
+                            .map(|j| j.replace_subnet_credentials(renewed))
+                    },
+                )
+                .await;
+                match kept {
+                    Kept::Gone => return,
+                    Kept::Quiet => {}
+                    Kept::Presented(verdict) => {
+                        let mut l = link.lock();
+                        l.subnet_admitted = Some(verdict.is_ok());
+                        match verdict {
+                            Ok(()) => {
+                                l.subnet_detail = None;
+                                l.readmissions += 1;
                             }
-                            Some(Err(e)) => {
-                                tracing::warn!(error = %e, "renewed subnet credentials refused");
-                                renew_retry_at = now + SUBNET_RENEW_RETRY.as_secs();
-                            }
-                            None => return,
-                        },
-                        Err(e) => {
-                            tracing::warn!(error = %e, "subnet leaf renewal failed; retrying");
-                            renew_retry_at = now + SUBNET_RENEW_RETRY.as_secs();
-                        }
-                    }
-                }
-                if fresh || (presented != Some(session) && now >= present_retry_at) {
-                    let admitted = node
-                        .present_subnet_credentials(
-                            contact.node_id,
-                            &set,
-                            offer.scope.clone(),
-                            offer.rights,
-                            JOIN_ATTACH_WAIT,
-                        )
-                        .await;
-                    let mut l = link.lock();
-                    l.subnet_admitted = Some(admitted.is_ok());
-                    match admitted {
-                        Ok(_) => {
-                            presented = Some(session);
-                            l.subnet_detail = None;
-                            l.readmissions += 1;
-                        }
-                        Err(e) => {
-                            presented = None;
-                            present_retry_at = now_unix() + SUBNET_RENEW_RETRY.as_secs();
-                            l.subnet_detail = Some(e.to_string());
+                            Err(e) => l.subnet_detail = Some(e),
                         }
                     }
                 }
             }
+            keep_standalone_admitted(
+                &node,
+                contact.node_id,
+                session,
+                &identity,
+                &memberships,
+                &mut standalone_tracks,
+                &link,
+            )
+            .await;
             tokio::time::sleep(LINK_CHECK).await;
         }
     })
@@ -933,6 +1200,9 @@ struct ControlState {
     joined: Option<Arc<parking_lot::Mutex<Option<net_sdk::enrollment::device::DeviceJoin>>>>,
     /// Live link of a joined node (see [`spawn_joined_link`]).
     link: Option<Arc<parking_lot::Mutex<JoinedLink>>>,
+    /// Standalone subnet memberships of a joined node, and where they live.
+    memberships: Option<SharedMemberships>,
+    subnets_dir: PathBuf,
     /// This node's mesh, for operations that reach other nodes.
     node: Arc<net::adapter::net::MeshNode>,
 }
@@ -1012,6 +1282,151 @@ async fn forward_floor_query(
         Err(SubnetFloorQueryError::Refused(m)) => serde_json::json!({ "refused": m }),
         Err(e) => serde_json::json!({ "no_answer": e.to_string() }),
     }
+}
+
+/// Bound on redeeming a standalone subnet link over the session.
+const SUBNET_JOIN_REDEEM_WAIT: Duration = Duration::from_secs(10);
+/// Bound on presenting freshly redeemed standalone credentials.
+const SUBNET_JOIN_PRESENT_WAIT: Duration = Duration::from_secs(10);
+
+/// Control op `subnet_join`: redeem a standalone subnet link over this
+/// joined node's session with the node it enrolled with, persist the
+/// credentials as a membership, and present them (the verifier's verdict is
+/// the admission). The link supervisor keeps it admitted from then on.
+async fn subnet_join(state: &ControlState, request: &serde_json::Value) -> serde_json::Value {
+    use net_sdk::enrollment::standalone::{
+        is_standalone_subnet, request_subnet_redeem, SubnetMembership, SubnetRedeemReply,
+    };
+    let error = |m: String| serde_json::json!({ "error": m });
+    let (Some(join), Some(memberships)) = (&state.joined, &state.memberships) else {
+        return error(
+            "this node did not join a mesh: a standalone subnet link extends an existing              membership (run `net-mesh join` first)"
+                .to_string(),
+        );
+    };
+    let Some(token) = request["token"].as_str() else {
+        return error("malformed subnet_join request".to_string());
+    };
+    let invite = match net_sdk::enrollment::invite::MembershipInvite::decode(token) {
+        Ok(invite) => invite,
+        Err(e) => return error(format!("invalid link: {e}")),
+    };
+    if !is_standalone_subnet(&invite) {
+        return error(
+            "not a standalone subnet link (a mesh invite is redeemed with `net-mesh join`)"
+                .to_string(),
+        );
+    }
+    let Some(offer) = invite.subnet().cloned() else {
+        return error("not a standalone subnet link".to_string());
+    };
+    let joined = join.lock().as_ref().and_then(|j| {
+        j.bundle().map(|b| {
+            (
+                j.identity().clone(),
+                j.invite().issuer().clone(),
+                b.contact().node_id,
+            )
+        })
+    });
+    let Some((identity, join_issuer, issuer_node)) = joined else {
+        return error("this node's join holds no credentials".to_string());
+    };
+    if invite.issuer() != &join_issuer {
+        return error(format!(
+            "this link was issued by {}, not by the node this device enrolled with; standalone              links are redeemed only there",
+            invite.issuer_fingerprint()
+        ));
+    }
+    let key = membership_key(&invite);
+    // Record the intent first (or resume an earlier attempt).
+    let existing = memberships
+        .lock()
+        .iter()
+        .find(|m| membership_key(m.invite()) == key)
+        .map(|m| (m.left_at(), m.credentials().cloned()));
+    let installed = match existing {
+        Some((Some(at), _)) => {
+            return error(format!(
+                "this device left that subnet membership at unix {at}; ask for a new link"
+            ))
+        }
+        Some((None, credentials)) => credentials,
+        None => {
+            let dir = state.subnets_dir.join(&key);
+            let created = std::fs::create_dir_all(&state.subnets_dir)
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    SubnetMembership::begin(
+                        &dir,
+                        &invite,
+                        identity.entity_id().clone(),
+                        issuer_node,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            match created {
+                Ok(m) => memberships.lock().push(m),
+                Err(e) => return error(format!("subnet membership {}: {e}", dir.display())),
+            }
+            None
+        }
+    };
+    let set = match installed {
+        Some(set) => set,
+        None => match request_subnet_redeem(
+            &state.node,
+            issuer_node,
+            &identity,
+            &invite,
+            SUBNET_JOIN_REDEEM_WAIT,
+        )
+        .await
+        {
+            Ok(SubnetRedeemReply::PendingApproval) => {
+                return serde_json::json!({
+                    "state": "pending_approval",
+                    "scope": super::subnet::format_subnet(offer.scope.path),
+                    "rights": super::subnet::format_subnet_rights(offer.rights),
+                    "next": "the operator approves it with `invite approve`; this node asks again by itself",
+                })
+            }
+            Ok(SubnetRedeemReply::Issued(set)) => {
+                let stored = memberships
+                    .lock()
+                    .iter_mut()
+                    .find(|m| membership_key(m.invite()) == key)
+                    .map(|m| m.install(&set));
+                match stored {
+                    Some(Ok(())) => *set,
+                    Some(Err(e)) => return error(format!("credentials not installed: {e}")),
+                    None => return error("node is draining".to_string()),
+                }
+            }
+            Err(e) => return error(format!("redemption failed: {e}")),
+        },
+    };
+    let admitted = state
+        .node
+        .present_subnet_credentials(
+            issuer_node,
+            &set,
+            offer.scope.clone(),
+            offer.rights,
+            SUBNET_JOIN_PRESENT_WAIT,
+        )
+        .await
+        .map(drop)
+        .map_err(|e| e.to_string());
+    serde_json::json!({
+        "state": "installed",
+        "scope": super::subnet::format_subnet(offer.scope.path),
+        "rights": super::subnet::format_subnet_rights(offer.rights),
+        "admitted": admitted.is_ok(),
+        "detail": admitted.err(),
+        "expires_at": set.leaf().not_after,
+        "device": hex::encode(identity.entity_id().as_bytes()),
+    })
 }
 
 async fn serve_control(
@@ -1103,6 +1518,8 @@ async fn control_session(
             state.draining.store(true, Ordering::SeqCst);
             serde_json::json!({ "accepted": true, "incarnation": state.report.incarnation })
         }
+        "subnet_join" if draining => serde_json::json!({ "error": "node is draining" }),
+        "subnet_join" => subnet_join(state, &request).await,
         "subnet_floor_query" if draining => serde_json::json!({ "error": "node is draining" }),
         "subnet_floor_query" => forward_floor_query(&state.node, &request).await,
         "leave" => match (&state.joined, draining) {
@@ -1112,7 +1529,15 @@ async fn control_session(
             }),
             (Some(join), false) => {
                 let (join, now) = (join.clone(), now_unix());
+                let memberships = state.memberships.clone();
                 let recorded = tokio::task::spawn_blocking(move || {
+                    // Standalone subnet memberships go first: a failure here
+                    // leaves the join (and this node) intact to retry.
+                    if let Some(memberships) = &memberships {
+                        for m in memberships.lock().iter_mut() {
+                            m.leave(now).map_err(Some)?;
+                        }
+                    }
                     let mut guard = join.lock();
                     let join = guard.as_mut().ok_or(None)?;
                     join.leave(now)
@@ -1589,6 +2014,13 @@ pub async fn run_up(
         }
     }
     let joined = joined.map(|j| Arc::new(parking_lot::Mutex::new(Some(j))));
+    let subnets_dir = state.join(SUBNETS_SUBDIR);
+    let memberships: Option<SharedMemberships> = match &joined {
+        Some(_) => Some(Arc::new(parking_lot::Mutex::new(load_memberships(
+            &subnets_dir,
+        )?))),
+        None => None,
+    };
     // Seed the live link from the start attempt, then keep it up.
     let start_link = report.joined.as_ref().map(|j| {
         let subnet = j.subnet.as_ref();
@@ -1598,13 +2030,14 @@ pub async fn run_up(
             detail: j.detail.clone(),
             reattaches: 0,
             readmissions: 0,
+            standalone: Default::default(),
             subnet_admitted: subnet.and_then(|s| s["admitted"].as_bool()),
             subnet_detail: subnet.and_then(|s| s["detail"].as_str().map(str::to_string)),
         }
     });
     let link = start_link.map(|l| Arc::new(parking_lot::Mutex::new(l)));
-    let joined_link = match (&joined, &link, &joined_contact_node) {
-        (Some(joined), Some(link), Some(contact_node)) => {
+    let joined_link = match (&joined, &link, &joined_contact_node, &memberships) {
+        (Some(joined), Some(link), Some(contact_node), Some(memberships)) => {
             let admitted = link.lock().subnet_admitted;
             // Presented at start: on the current session if admitted; a
             // refused presentation is retried later, not immediately.
@@ -1618,6 +2051,7 @@ pub async fn run_up(
             };
             Some(spawn_joined_link(
                 joined.clone(),
+                memberships.clone(),
                 mesh.node().clone(),
                 link.clone(),
                 presented,
@@ -1632,6 +2066,8 @@ pub async fn run_up(
         enroll: enrollment.as_ref().map(|e| e.context()),
         joined: joined.clone(),
         link: link.clone(),
+        memberships: memberships.clone(),
+        subnets_dir,
         node: mesh.node().clone(),
     });
     let (stop_tx, mut stop_rx) = mpsc::channel(1);
