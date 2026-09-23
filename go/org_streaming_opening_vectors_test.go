@@ -508,15 +508,18 @@ func TestStreamingOpeningVectors_U64Exact(t *testing.T) {
 // decoder disagreement or callback loss must not become success.
 func TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider(t *testing.T) {
 	skipIfNotEnabled(t)
-	// F-S4Vectors-1: the scoped (private) discovery this call plans against
-	// does not cross OS-process boundaries — public discovery and the session
-	// work (discovered_nodes=1) but the scoped store stays empty ("0 private
-	// candidate(s) considered"), so a two-process pair can never converge
-	// today. The row stays named and executable (fail-closed, never a silent
-	// pass) behind RUN_MIXED_CROSS_PROCESS=1 until the core emission/ingest
-	// side is fixed outside this lane's file set.
+	// The ONE cross-OS-process cell of the estate: it spawns the Python
+	// provider (tests/cross_lang_org/mixed_pair/provider.py). Stay bound
+	// behind RUN_MIXED_CROSS_PROCESS=1 so the default and CI estates never
+	// race a second runtime's build state (Main pins the name as
+	// existing-but-gated). The one red this row ever produced was
+	// CONSUMER-SIDE and is fixed: the provider originally discarded its
+	// serve handle, and ServeHandle's Drop (mesh_rpc.rs:468) RAII-deregisters
+	// the service before the first announcement, so the granted scoped
+	// envelope never sealed. Keep any serve handle bound for the whole serve
+	// lifetime (the rule is stated at provider.py's handler surface).
 	if os.Getenv("RUN_MIXED_CROSS_PROCESS") == "" {
-		t.Skip("the mixed pair crosses OS processes — blocked by F-S4Vectors-1 (scoped discovery does not cross process boundaries); set RUN_MIXED_CROSS_PROCESS=1 to execute it")
+		t.Skip("the mixed pair spawns the Python provider across OS processes — set RUN_MIXED_CROSS_PROCESS=1 to execute it (the cross-run contract)")
 	}
 	v := loadSOV(t)
 	sc := v.Scenarios.MixedPair

@@ -243,11 +243,11 @@ narrowed-id row's discriminating mutation is precluded by construction (the
 shape row pins every `ids` value to 64 hex and the row scans wire displays), so
 its inverse is analytic rather than mutational — stated, not claimed.
 
-### 3.3 The mixed-pair row — executed, RED-attributable (F-S4Vectors-1)
+### 3.3 The mixed-pair row — executed; the red is root-caused and FIXED (consumer-side)
 
 `TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider` (Go caller ↔
 Python provider, `mixed_pair/provider.py`, the fresh `gen_org_scenario` chain)
-executed repeatedly (`logs/go_mixed_pair.log`) and always ends:
+executed repeatedly (`logs/go_mixed_pair.log`) and always ended:
 
 ```
 provider: handshake done, starting mesh + announce loop
@@ -257,61 +257,49 @@ provider: serving, announcing
 ```
 
 The single-variable isolation (`logs/python_cross_process_isolation.log`,
-`mixed_pair/caller.py` ↔ `provider.py`, Python↔Python across OS processes — the
-runtime mix held constant) reproduces it exactly, and the failure probe
-localizes it:
-
-```
-CALLER FAIL the call never converged: OrgDiscoveryError('org:discovery:no_authorized_provider: org discovery: no authorized provider for capability 96dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c209 (0 private candidate(s) considered)')
-provider: handshake done, starting mesh + announce loop
-probe: discovered_nodes=1
-```
-
-The row is named and executable, gated fail-closed behind
-`RUN_MIXED_CROSS_PROCESS=1` with the finding named in its skip message, so the
-default and CI estates stay green while the pair remains one command away after
-the fix. **This is the one acceptance item not green: the mixed-pair green
-receipt needs F-S4Vectors-1 fixed outside this lane's file set.**
+`mixed_pair/caller.py` ↔ `provider.py`, Python↔Python across OS processes)
+reproduced it exactly (`CALLER FAIL the call never converged: … 0 private
+candidate(s) considered`, `probe: discovered_nodes=1`) — and the naive reading
+("the process boundary") is RETRACTED (§4): both red scripts shared
+`provider.py`, which discarded its serve handle, so `ServeHandle::Drop`
+RAII-deregistered the granted service before the first announcement. The
+discriminating trace is `R4CoreFix`'s (`r4corefix-diag-pythonpair.log`:
+`send_emission_to` with `scoped=0` forever, `granted_snapshot()` EMPTY,
+caller-side `capture_cold: grant lookup HIT (installed=1)`). Fixed: the handle
+is now bound for the serve lifetime (`provider.py`, sha `e42017e2…`) with the
+RAII rule stated at the handler surface. The green co-run
+(`cd go && RUN_INTEGRATION_TESTS=1 RUN_MIXED_CROSS_PROCESS=1 go test -run
+'TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider' -v -timeout 15m`)
+executes against `R4CoreFix`'s rebuilt artifacts; its receipt is appended here
+when it lands. The row stays named and executable, gated behind
+`RUN_MIXED_CROSS_PROCESS=1` (the cross-run contract), fail-closed in the
+default estate.
 
 ## 4. Findings
 
-**F-S4Vectors-1 (HIGH, blocks the mixed-pair green receipt): scoped (private)
-discovery does not cross OS-process boundaries.** Public discovery and the
-session work across the boundary (`probe: discovered_nodes=1`; the handshake
-completes on both sides), but the caller's private plane stays empty
-(`0 private candidate(s) considered`) for the whole convergence budget, so a
-protected streaming call can never plan in a two-process deployment.
-
-Evidence and exonerations (each an executed run):
-- Python↔Python **in-process** granted streaming: green (Wave-1
-  `test_org_live.py` cells, re-run at this head's wheel).
-- Python↔Python **cross-process** (same scripts, same generated chain, same
-  secret files): `0 private candidates` × 3 runs.
-- Go↔Python cross-process: identical × 4 runs.
-- Exonerated: `num_shards` mismatch (pinned 4↔4 — still red), serve-registration
-  order (before/after `mesh.start()` — still red), mesh-construction drift
-  (reverted to the `_mesh` recipe — still red), announce hammering (both sides,
-  1 s cadence, 60 s — still red), double-accept arm (the Go side never had one —
-  still red), consumer/credential install order (identical to `setupGrantedLive`
-  line-by-line).
-- Localization: `send_emission_to` ships the public CAP-ANN and the scoped
-  `SUBPROTOCOL_SCOPED_CAPABILITY_ANN` envelopes to the same peer in one call
-  (`mesh.rs:43158-43204`); the public half demonstrably arrives cross-process,
-  so the divergence is in the scoped emission cache
-  (`SendEmission.scoped`, `mesh.rs:5189-5192`; rebuild at `mesh.rs:22095`) or
-  the scoped ingest (`ingest_scoped_announcement` → `verify_refused`
-  "membership, audience or floor", `org_scoped_store.rs:733-736`), or the
-  granted-plane query's consumer-grant lookup
-  (`mesh.rs:22453-22456` `consumer.get(grant_id) else return Vec::new()`).
-  A same-code divergence observable only across process boundaries is
-  [inference]; the three sites above are the whole chain.
-- Impact beyond this lane: every language harness in the repo runs its live
-  cells as two nodes in ONE process (recon confirmed "cross-language is achieved
-  by shared fixture bytes, never by spawning another runtime"), so this gap is
-  invisible to the entire existing estate and blocks any real two-process
-  deployment of protected streaming. Owner ruling needed: fix in the core
-  (outside this lane's frozen file set) or accept the limitation with release
-  notes.
+**F-S4Vectors-1 — RETRACTED (2026-09-23, after `R4CoreFix`'s instrumented-wheel
+trace).** The originally-filed mechanism ("scoped discovery does not cross
+OS-process boundaries", with three named core sites) was **wrong**: the red was
+a consumer-side bug in this lane's own `mixed_pair/provider.py`, which
+discarded the `net.serve_org_streaming(...)` return handle. `ServeHandle`'s
+`Drop` (`mesh_rpc.rs:468`) RAII-deregisters the service
+(`unregister_rpc_inbound` + `rpc_local_services.remove_if` + protected-stream
+retirement), so the granted service was deregistered before the first
+announcement: `granted_snapshot()` stayed empty, `SendEmission.scoped` sealed
+nothing, and the caller planned against an empty private plane forever. The
+"process boundary" correlation was which SCRIPT ran: every red run used
+`provider.py` (the Go row and the Python↔Python isolation both spawn it), while
+every green cell binds its serve handle (`test_org_live.py`'s `handle = …` +
+`finally: handle.close()`; Go's `sh, err := ServeOrgStreamingBytes` + `defer
+sh.Close()`). `R4CoreFix`'s trace is the discriminating evidence (receipt at
+`docs/internal/spikes/org-streaming/r4corefix-diag-pythonpair.log`): every
+`send_emission_to` carried `scoped=0`, the emission build block was never
+entered, and the caller-side `capture_cold` showed `grant lookup HIT
+(installed=1)` with 0 rows — the three named core sites innocent. Fixed in
+`provider.py` (the handle is bound for the serve lifetime with a `finally`
+close; the RAII rule is now stated at the handler surface). **Zero core
+changes required.** The lesson for harness authors: a serve handle is a
+lifetime token — dropping it is a silent unregister.
 
 **F-S4Vectors-2 (informational, already resolved):** the plan's Stage 4 table
 names the fixture `streaming_opening_vectors.json` while the dispatch sketch
@@ -326,9 +314,11 @@ corrected values with the derivation noted.
 
 ## 5. Never executed here (host/toolchain boundaries, exactly)
 
-- **The mixed pair GREEN**: blocked by F-S4Vectors-1 (its executed runs are
-  receipts §3.3, red-attributable). The reverse direction (Python caller ↔ Go
-  provider) and the same-org access mode were not executed.
+- **The mixed pair GREEN**: its red runs (§3.3) were root-caused to a
+  consumer-side serve-handle bug in this lane's harness and fixed; the green
+  co-run against `R4CoreFix`'s rebuilt artifacts is pending their release and
+  its receipt is appended to §3.3 when it lands. The reverse direction (Python
+  caller ↔ Go provider) and the same-org access mode were not executed.
 - **Browser/wasm runtimes**: out of this row (S4Browser's tree).
 - **Pure SDK consumers** (`sdk-ts`, `sdk-py`): other Wave-2 lanes; per the
   cross-lane contract these consumers use ONLY the landed binding surfaces.
@@ -376,3 +366,8 @@ the rosters regenerate with the fixture; the floors pin the counts.
 - Per Main's ruling, consumer files are NEW only (Option A placement); no
   existing file outside `sdk/examples/gen_org_error_fixtures.rs` (this lane's
   granted generator) was edited. `error_vectors.json` regenerates byte-identical.
+- `R4CoreFix` (core-repair lane, dispatched on the since-retracted F-S4Vectors-1)
+  root-caused the mixed-pair red to this lane's own harness bug via an
+  instrumented-wheel trace, and holds the shared consumer artifacts during their
+  rebuild; the one-command co-run contract is recorded verbatim in §3.3. Main
+  received the retraction unprompted at the moment it was established.
