@@ -2624,17 +2624,25 @@ async fn old_session_frames_refused(
     );
     // Warmup: makes the parked call's id 1, so the released response
     // can never collide with Y's fresh id 0 at the replacement.
+    // run_pinned throughout the setup: the shared identity's node is
+    // freshly built at connect — its pin of the anchor lands on the
+    // next announce beat (the same transient class as Y's call).
     let warmup_payload = b"old-session-warmup".to_vec();
-    let warm = script
-        .run(TAB_OLD, unary_step(N_U_SAME, &warmup_payload, &creds))
-        .await;
+    let warm = run_pinned(
+        script,
+        TAB_OLD,
+        unary_step(N_U_SAME, &warmup_payload, &creds),
+        30,
+    )
+    .await;
     let parked_payload = b"old-session-parked".to_vec();
-    let open = script
-        .run(
-            TAB_OLD,
-            stream_open_step(N_HOLD, &parked_payload, &creds, "old-parked", None),
-        )
-        .await;
+    let open = run_pinned(
+        script,
+        TAB_OLD,
+        stream_open_step(N_HOLD, &parked_payload, &creds, "old-parked", None),
+        30,
+    )
+    .await;
     let live = script
         .run(TAB_OLD, stream_read_step("old-parked", 1, 8_000))
         .await;
