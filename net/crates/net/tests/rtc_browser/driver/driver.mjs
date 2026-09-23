@@ -124,14 +124,20 @@ function reply(obj) {
 function seedFirefoxProfile(profileDir, caPemPath, nickname) {
   fs.mkdirSync(profileDir, { recursive: true });
   const db = 'sql:' + profileDir;
+  // `RTCB_CERTUTIL` names the NSS certutil by ABSOLUTE path. On hosts
+  // where a Microsoft `certutil` sits in the system directory (and
+  // shell PATH editing is unreliable across spawn mechanisms), the
+  // tool must be nameable without resolution games. Absent the env
+  // var, plain `certutil` resolves as before.
+  const CERTUTIL = process.env.RTCB_CERTUTIL || 'certutil';
   try {
-    execFileSync('certutil', ['-N', '--empty-password', '-d', db], { stdio: 'ignore' });
+    execFileSync(CERTUTIL, ['-N', '--empty-password', '-d', db], { stdio: 'ignore' });
   } catch {
     // An existing database is fine; a missing tool surfaces below.
   }
   try {
     execFileSync(
-      'certutil',
+      CERTUTIL,
       ['-d', db, '-A', '-t', 'C,,', '-n', nickname, '-i', caPemPath],
       { stdio: 'pipe' },
     );
