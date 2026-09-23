@@ -1801,6 +1801,31 @@ Tasks:
 
 **Exit:** All requested enrollment shapes complete through CLI processes, with joined status only for stages actually verified. Wrong authority and denied policy fail before handler effects; direct and delegated subnet issuers are tested where offered.
 
+#### V3-2 subnet half: decisions (user, 2026-09-23)
+
+- **Order.** Subnet join, with `up` as a subnet verifier, comes first. It closes
+  the V3-4 CLI removal journey end to end.
+- **Admission on the wire.** A session **subprotocol**, reusing
+  `SubnetAuthPresentation`. Today nothing drives admission over the wire:
+  `issue_subnet_challenge` / `admit_subnet_session` are local APIs only.
+  - The device asks; the verifier answers with a session-bound challenge.
+  - The device replies with its presentation and credential set; the verifier
+    replies with a verdict.
+  - Admission therefore rides the session itself, with no application call.
+- **Key custody.** A **delegated issuer**. The subnet root stays offline; `up`
+  holds only an issuer key under a root-signed `SubnetIssuerGrant` bounded by
+  scope, rights and lifetime.
+  - Consequence, per V3-4: delegated leaves never re-admit a removed subject,
+    so re-admission after a removal requires a root-direct grant.
+
+**Slices:**
+1. **S1:** the admission subprotocol in core, with witnesses.
+2. **S2:** the subnet relation in invites and bundles, and delegated leaf
+   issuance.
+3. **S3:** CLI wiring: `up` as verifier and issuer, `invite create --subnet`,
+   `join`, and joined `up` presenting its credentials. The e2e journey runs
+   join → admitted → `subnet remove` → refused on reconnect.
+
 ### V3-2A — channel-scoped invitation, join and credential lifecycle
 
 **Modify:** `src/adapter/net/mesh.rs` for exact publish-chain/cache lifecycle hooks; `sdk/src/identity.rs` to expose the canonical `TokenChain`; `sdk/src/mesh.rs` for a full-chain subscribe path; shared enrollment/persistence modules; `cli/src/commands/channel.rs`, `main.rs`, `context.rs`, `config.rs`; and the selected durable authority/runtime control owner. Modify `identity/token.rs` or `channel/config.rs` only for a separately source-proven gap.
