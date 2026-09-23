@@ -31,6 +31,21 @@
 //! it (`HELLO` and `BIND` are padded), and forwarding is 1:1. Registrations,
 //! channels per registration, total channels and per-registration bind rate are
 //! bounded; idle state expires. Relay state is never authority.
+//!
+//! # Byte-stream splice (TCP, same port number)
+//!
+//! Enrollment is a PSK-free Noise NK session over a byte stream, so the relay
+//! also splices TCP: a joiner connects and sends `[JOIN][registration id]`; the
+//! relay sends a UDP `OFFER { splice id }` to the device's registered endpoint
+//! (resent until answered or [`RelayConfig::splice_accept_wait`] passes); the
+//! device dials back with `[ACCEPT][splice id]`, and the relay answers both
+//! streams with one status byte and copies bytes blindly between them. The
+//! splice id is 128 random bits, sent only to the registered endpoint; the
+//! stream's end-to-end Noise handshake still authenticates the device, so a
+//! party that claimed an offer could not impersonate it. Offers are only ever
+//! sent to a registered device, after a completed TCP handshake, at a bounded
+//! per-registration rate. Splices are bounded in number, bytes per direction and
+//! lifetime.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -39,7 +54,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
 
 use crate::adapter::net::identity::{EntityId, EntityKeypair};
 
@@ -59,8 +76,24 @@ pub mod kind {
     pub const BOUND: u8 = 0x06;
     /// Relay → sender: request refused (see [`super::Refusal`]).
     pub const REFUSED: u8 = 0x07;
+    /// Relay → device: a joiner is waiting on a byte-stream splice.
+    pub const OFFER: u8 = 0x08;
     /// Either side: channel data.
     pub const DATA: u8 = 0x10;
+}
+
+/// The byte-stream splice preamble (TCP, same port number as the relay's UDP
+/// socket): one kind byte and 16 bytes of id, answered with one status byte.
+pub mod splice {
+    /// Joiner → relay: `[JOIN][registration id]`.
+    pub const JOIN: u8 = 0x20;
+    /// Device → relay: `[ACCEPT][splice id]` (from an `OFFER`).
+    pub const ACCEPT: u8 = 0x21;
+    /// Preamble length.
+    pub const PREAMBLE_LEN: usize = 1 + 16;
+    /// Status byte: spliced; everything after it is the peer's bytes. Any
+    /// other status is a [`super::Refusal`] code and the stream closes.
+    pub const OK: u8 = 0;
 }
 
 const REGISTER_DOMAIN: &[u8] = b"net-mesh blind relay register v1";
@@ -83,12 +116,17 @@ pub const BIND_LEN: usize = 1 + 16 + 16;
 pub const BOUND_LEN: usize = 1 + 16 + 4;
 /// `REFUSED` length: kind + code.
 pub const REFUSED_LEN: usize = 2;
+/// `OFFER` length: kind + splice id.
+pub const OFFER_LEN: usize = 1 + 16;
 /// `DATA` header length: kind + channel.
 pub const DATA_HEADER_LEN: usize = 1 + 4;
 const ENDPOINT_LEN: usize = 16 + 2;
 
 /// Registration identifier: derived from the registering entity id.
 pub type RegistrationId = [u8; 16];
+
+/// Splice identifier: random, the capability to claim one pending splice.
+pub type SpliceId = [u8; 16];
 
 /// Derive the registration id an entity registers under.
 pub fn registration_id(entity: &EntityId) -> RegistrationId {
@@ -107,6 +145,8 @@ pub enum Refusal {
     UnknownRegistration = 2,
     /// A capacity or rate limit was hit.
     Capacity = 3,
+    /// The registered device did not answer a splice offer in time.
+    Unreachable = 4,
 }
 
 impl Refusal {
@@ -115,6 +155,7 @@ impl Refusal {
             1 => Self::BadProof,
             2 => Self::UnknownRegistration,
             3 => Self::Capacity,
+            4 => Self::Unreachable,
             _ => return None,
         })
     }
@@ -165,6 +206,11 @@ pub enum Message {
     },
     /// See [`kind::REFUSED`].
     Refused(Refusal),
+    /// See [`kind::OFFER`].
+    Offer {
+        /// The pending splice to claim.
+        splice: SpliceId,
+    },
     /// See [`kind::DATA`].
     Data {
         /// Channel the payload travels on.
@@ -239,6 +285,10 @@ impl Message {
                 out.push(kind::REFUSED);
                 out.push(*r as u8);
             }
+            Self::Offer { splice } => {
+                out.push(kind::OFFER);
+                out.extend_from_slice(splice);
+            }
             Self::Data { channel, payload } => {
                 out.reserve(DATA_HEADER_LEN + payload.len());
                 out.push(kind::DATA);
@@ -279,6 +329,9 @@ impl Message {
                 channel: u32::from_be_bytes(arr(16..20)?.try_into().ok()?),
             },
             kind::REFUSED if fixed(REFUSED_LEN) => Self::Refused(Refusal::from_code(body[0])?),
+            kind::OFFER if fixed(OFFER_LEN) => Self::Offer {
+                splice: arr(0..16)?.try_into().ok()?,
+            },
             kind::DATA if bytes.len() >= DATA_HEADER_LEN => Self::Data {
                 channel: u32::from_be_bytes(arr(0..4)?.try_into().ok()?),
                 payload: body[4..].to_vec(),
@@ -328,6 +381,20 @@ pub struct RelayConfig {
     pub binds_per_window: u32,
     /// Window for the bind rate limit.
     pub bind_window: Duration,
+    /// Maximum splice `JOIN`s per registration per [`Self::bind_window`].
+    pub splices_per_window: u32,
+    /// Maximum splices waiting for their device, in total.
+    pub max_pending_splices: usize,
+    /// Maximum splices waiting or running, in total.
+    pub max_live_splices: usize,
+    /// Maximum open TCP connections (preambles, waiting joiners, splices).
+    pub max_tcp_connections: usize,
+    /// How long a joiner waits for the device to accept an offer.
+    pub splice_accept_wait: Duration,
+    /// Bytes forwarded per direction before a splice is cut.
+    pub splice_max_bytes: u64,
+    /// Lifetime of a running splice.
+    pub splice_lifetime: Duration,
 }
 
 impl Default for RelayConfig {
@@ -340,6 +407,14 @@ impl Default for RelayConfig {
             channel_idle: Duration::from_secs(120),
             binds_per_window: 16,
             bind_window: Duration::from_secs(10),
+            splices_per_window: 4,
+            max_pending_splices: 1_024,
+            max_live_splices: 4_096,
+            max_tcp_connections: 8_192,
+            splice_accept_wait: Duration::from_secs(5),
+            // Enrollment is a handshake, one request and one bundle.
+            splice_max_bytes: 1024 * 1024,
+            splice_lifetime: Duration::from_secs(60),
         }
     }
 }
@@ -359,6 +434,10 @@ pub struct RelayStats {
     pub dropped: AtomicU64,
     /// Requests refused.
     pub refused: AtomicU64,
+    /// Byte-stream splices established.
+    pub splices_opened: AtomicU64,
+    /// Bytes copied by splices (both directions).
+    pub splice_bytes: AtomicU64,
 }
 
 struct Registration {
@@ -368,6 +447,8 @@ struct Registration {
     channels: Vec<u32>,
     window_start: Instant,
     binds_in_window: u32,
+    splice_window_start: Instant,
+    splices_in_window: u32,
 }
 
 struct Channel {
@@ -380,6 +461,8 @@ struct Channel {
 struct State {
     registrations: HashMap<RegistrationId, Registration>,
     channels: HashMap<u32, Channel>,
+    /// Splices waiting for their device: splice id → (registration, opened).
+    pending_splices: HashMap<SpliceId, (RegistrationId, Instant)>,
 }
 
 /// What the relay should send in response to one datagram.
@@ -503,6 +586,8 @@ impl RelayCore {
                         channels: Vec::new(),
                         window_start: now,
                         binds_in_window: 0,
+                        splice_window_start: now,
+                        splices_in_window: 0,
                     });
                 drop(s);
                 self.stats.registrations.fetch_add(1, Ordering::Relaxed);
@@ -582,6 +667,7 @@ impl RelayCore {
         let State {
             registrations,
             channels,
+            ..
         } = &mut *s;
         let target = channels.get_mut(&channel).and_then(|c| {
             let device = registrations
@@ -617,13 +703,75 @@ impl RelayCore {
         }
     }
 
-    /// Expire registrations (and their channels) and idle channels.
+    /// A joiner asks to splice a byte stream to registration `id`: allocate a
+    /// pending splice and return its id and the device endpoint to offer it
+    /// to. Rate-limited per registration and bounded in total.
+    pub fn begin_splice(
+        &self,
+        id: RegistrationId,
+        now: Instant,
+    ) -> Result<(SpliceId, SocketAddr), Refusal> {
+        let mut s = self.state.lock();
+        let pending = s.pending_splices.len();
+        let reg = s
+            .registrations
+            .get_mut(&id)
+            .filter(|r| r.expires > now)
+            .ok_or(Refusal::UnknownRegistration)?;
+        if now.duration_since(reg.splice_window_start) >= self.config.bind_window {
+            reg.splice_window_start = now;
+            reg.splices_in_window = 0;
+        }
+        if reg.splices_in_window >= self.config.splices_per_window
+            || pending >= self.config.max_pending_splices
+        {
+            return Err(Refusal::Capacity);
+        }
+        reg.splices_in_window += 1;
+        let endpoint = reg.endpoint;
+        let mut splice = [0u8; 16];
+        getrandom::fill(&mut splice).map_err(|_| Refusal::Capacity)?;
+        s.pending_splices.insert(splice, (id, now));
+        Ok((splice, endpoint))
+    }
+
+    /// The live endpoint of registration `id` (it may move on NAT rebinding).
+    pub fn device_endpoint(&self, id: &RegistrationId, now: Instant) -> Option<SocketAddr> {
+        self.state
+            .lock()
+            .registrations
+            .get(id)
+            .filter(|r| r.expires > now)
+            .map(|r| r.endpoint)
+    }
+
+    /// The device claims a pending splice. `true` exactly once per splice id,
+    /// and only while it is pending.
+    pub fn claim_splice(&self, splice: &SpliceId) -> bool {
+        self.state.lock().pending_splices.remove(splice).is_some()
+    }
+
+    /// Forget a pending splice (the joiner gave up or it was claimed).
+    pub fn abandon_splice(&self, splice: &SpliceId) {
+        self.state.lock().pending_splices.remove(splice);
+    }
+
+    /// Splices waiting for their device.
+    pub fn pending_splices(&self) -> usize {
+        self.state.lock().pending_splices.len()
+    }
+
+    /// Expire registrations (and their channels), idle channels and stale
+    /// pending splices.
     pub fn sweep(&self, now: Instant) {
         let mut s = self.state.lock();
         let State {
             registrations,
             channels,
+            pending_splices,
         } = &mut *s;
+        let stale = self.config.splice_accept_wait * 2;
+        pending_splices.retain(|_, (_, opened)| now.duration_since(*opened) < stale);
         registrations.retain(|_, r| r.expires > now);
         channels.retain(|_, c| {
             registrations.contains_key(&c.id)
@@ -657,51 +805,235 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// A running blind relay on one UDP socket.
+/// How long a new TCP connection may take to send its preamble.
+const PREAMBLE_WAIT: Duration = Duration::from_secs(5);
+/// Offer resend interval while a joiner waits.
+const OFFER_RESEND: Duration = Duration::from_millis(1_000);
+
+/// A running blind relay: one UDP socket and, on the same port number, the TCP
+/// listener for byte-stream splices.
 pub struct BlindRelay {
+    shared: Arc<Shared>,
+    listener: TcpListener,
+}
+
+struct Shared {
     socket: Arc<UdpSocket>,
     core: Arc<RelayCore>,
+    /// Joiners waiting for their device, by splice id.
+    waiting: Mutex<HashMap<SpliceId, tokio::sync::oneshot::Sender<TcpStream>>>,
+    live_splices: Arc<Semaphore>,
+    connections: Arc<Semaphore>,
 }
 
 impl BlindRelay {
-    /// Bind the relay socket.
+    /// Bind the relay's UDP socket and its TCP listener on the same port. With
+    /// port 0 the TCP port is chosen first and the UDP port follows it: some
+    /// hosts (Windows) exclude TCP-only port ranges that sit inside the UDP
+    /// ephemeral range, so a UDP-chosen port may be unbindable for TCP.
     pub async fn bind(addr: SocketAddr, config: RelayConfig) -> std::io::Result<Self> {
-        Ok(Self {
-            socket: Arc::new(UdpSocket::bind(addr).await?),
-            core: Arc::new(RelayCore::new(config)?),
-        })
+        let attempts = if addr.port() == 0 { 16 } else { 1 };
+        let mut last = None;
+        for _ in 0..attempts {
+            let listener = TcpListener::bind(addr).await?;
+            let port = listener.local_addr()?.port();
+            match UdpSocket::bind(SocketAddr::new(addr.ip(), port)).await {
+                Ok(socket) => {
+                    return Ok(Self {
+                        shared: Arc::new(Shared {
+                            socket: Arc::new(socket),
+                            live_splices: Arc::new(Semaphore::new(config.max_live_splices)),
+                            connections: Arc::new(Semaphore::new(config.max_tcp_connections)),
+                            core: Arc::new(RelayCore::new(config)?),
+                            waiting: Mutex::new(HashMap::new()),
+                        }),
+                        listener,
+                    });
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| std::io::Error::other("relay bind")))
     }
 
-    /// Bound address.
+    /// Bound address (UDP; the TCP listener shares the port number).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.local_addr()
+        self.shared.socket.local_addr()
     }
 
     /// Shared state machine (stats, sizes).
     pub fn core(&self) -> &Arc<RelayCore> {
-        &self.core
+        &self.shared.core
     }
 
     /// Serve until the task is dropped/aborted.
     pub async fn run(&self) {
+        tokio::join!(self.serve_udp(), self.serve_tcp());
+    }
+
+    async fn serve_udp(&self) {
+        let shared = &self.shared;
         let mut buf = vec![0u8; 65_535];
         let mut last_sweep = Instant::now();
         loop {
             let recv =
-                tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf)).await;
+                tokio::time::timeout(Duration::from_secs(5), shared.socket.recv_from(&mut buf))
+                    .await;
             let now = Instant::now();
             if now.duration_since(last_sweep) >= Duration::from_secs(5) {
-                self.core.sweep(now);
+                shared.core.sweep(now);
                 last_sweep = now;
             }
             let Ok(Ok((n, from))) = recv else {
                 continue;
             };
-            if let Action::Send { to, bytes } = self.core.handle(from, &buf[..n], unix_now(), now) {
-                let _ = self.socket.send_to(&bytes, to).await;
+            if let Action::Send { to, bytes } = shared.core.handle(from, &buf[..n], unix_now(), now)
+            {
+                let _ = shared.socket.send_to(&bytes, to).await;
             }
         }
     }
+
+    async fn serve_tcp(&self) {
+        loop {
+            let stream = match self.listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            // Capacity is refused by closing, never by queueing.
+            let Ok(permit) = self.shared.connections.clone().try_acquire_owned() else {
+                self.shared
+                    .core
+                    .stats
+                    .refused
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let shared = self.shared.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                shared.serve_stream(stream).await;
+            });
+        }
+    }
+}
+
+impl Shared {
+    async fn serve_stream(&self, mut stream: TcpStream) {
+        let mut preamble = [0u8; splice::PREAMBLE_LEN];
+        let read = tokio::time::timeout(PREAMBLE_WAIT, stream.read_exact(&mut preamble)).await;
+        if !matches!(read, Ok(Ok(_))) {
+            self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&preamble[1..]);
+        match preamble[0] {
+            splice::JOIN => self.join(stream, id).await,
+            splice::ACCEPT => self.accept(stream, id).await,
+            _ => {
+                self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    async fn refuse(&self, mut stream: TcpStream, why: Refusal) {
+        self.core.stats.refused.fetch_add(1, Ordering::Relaxed);
+        let _ = stream.write_all(&[why as u8]).await;
+        let _ = stream.shutdown().await;
+    }
+
+    /// A joiner's splice: offer it to the device until it dials back or the
+    /// wait expires, then copy bytes between the two streams.
+    async fn join(&self, mut joiner: TcpStream, id: RegistrationId) {
+        let Ok(live) = self.live_splices.clone().try_acquire_owned() else {
+            return self.refuse(joiner, Refusal::Capacity).await;
+        };
+        let (splice_id, mut endpoint) = match self.core.begin_splice(id, Instant::now()) {
+            Ok(v) => v,
+            Err(why) => return self.refuse(joiner, why).await,
+        };
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        self.waiting.lock().insert(splice_id, tx);
+        let offer = Message::Offer { splice: splice_id }.encode();
+        let deadline = tokio::time::Instant::now() + self.core.config.splice_accept_wait;
+        let device = loop {
+            let _ = self.socket.send_to(&offer, endpoint).await;
+            let tick = (tokio::time::Instant::now() + OFFER_RESEND).min(deadline);
+            match tokio::time::timeout_at(tick, &mut rx).await {
+                Ok(Ok(device)) => break Some(device),
+                Ok(Err(_)) => break None,
+                Err(_) if tokio::time::Instant::now() >= deadline => break None,
+                Err(_) => match self.core.device_endpoint(&id, Instant::now()) {
+                    Some(current) => endpoint = current,
+                    None => break None,
+                },
+            }
+        };
+        self.waiting.lock().remove(&splice_id);
+        self.core.abandon_splice(&splice_id);
+        let Some(mut device) = device else {
+            return self.refuse(joiner, Refusal::Unreachable).await;
+        };
+        if joiner.write_all(&[splice::OK]).await.is_err()
+            || device.write_all(&[splice::OK]).await.is_err()
+        {
+            return;
+        }
+        self.core
+            .stats
+            .splices_opened
+            .fetch_add(1, Ordering::Relaxed);
+        let config = &self.core.config;
+        let copied = tokio::time::timeout(
+            config.splice_lifetime,
+            pipe(joiner, device, config.splice_max_bytes),
+        )
+        .await
+        .unwrap_or(0);
+        self.core
+            .stats
+            .splice_bytes
+            .fetch_add(copied, Ordering::Relaxed);
+        drop(live);
+    }
+
+    /// The device claims a pending splice with the id the relay offered it.
+    async fn accept(&self, device: TcpStream, splice_id: SpliceId) {
+        if self.core.claim_splice(&splice_id) {
+            if let Some(joiner) = self.waiting.lock().remove(&splice_id) {
+                let _ = joiner.send(device);
+                return;
+            }
+        }
+        self.refuse(device, Refusal::UnknownRegistration).await;
+    }
+}
+
+/// Copy bytes both ways, each direction capped at `cap`; a finished direction
+/// half-closes its destination. Returns the bytes copied.
+async fn pipe(a: TcpStream, b: TcpStream, cap: u64) -> u64 {
+    let (ar, mut aw) = a.into_split();
+    let (br, mut bw) = b.into_split();
+    let up = async {
+        let n = tokio::io::copy(&mut ar.take(cap), &mut bw)
+            .await
+            .unwrap_or(0);
+        let _ = bw.shutdown().await;
+        n
+    };
+    let down = async {
+        let n = tokio::io::copy(&mut br.take(cap), &mut aw)
+            .await
+            .unwrap_or(0);
+        let _ = aw.shutdown().await;
+        n
+    };
+    let (up, down) = tokio::join!(up, down);
+    up + down
 }
 
 // ---- client side (a mesh node using a relay) ---------------------------------
@@ -715,6 +1047,9 @@ pub enum RelayError {
     /// No answer within the retry budget.
     #[error("relay did not answer")]
     Timeout,
+    /// The relay closed a splice stream without a status.
+    #[error("relay closed the stream")]
+    Eof,
     /// The relay refused the request.
     #[error("relay refused: {0:?}")]
     Refused(Refusal),
@@ -737,6 +1072,8 @@ pub struct RelayClient {
     socket: Arc<crate::adapter::net::transport::NetSocket>,
     replies_tx: tokio::sync::mpsc::Sender<Message>,
     replies: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Message>>,
+    /// Where splice offers go while this node accepts splices.
+    offers: Mutex<Option<tokio::sync::mpsc::Sender<SpliceId>>>,
 }
 
 impl RelayClient {
@@ -748,6 +1085,7 @@ impl RelayClient {
             socket,
             replies_tx,
             replies: tokio::sync::Mutex::new(replies),
+            offers: Mutex::new(None),
         }
     }
 
@@ -756,11 +1094,18 @@ impl RelayClient {
         self.relay
     }
 
-    /// Hand a control datagram received from the relay to a waiting request.
-    /// Data frames are not control and are ignored here.
+    /// Hand a control datagram received from the relay to a waiting request,
+    /// or a splice offer to the acceptor (dropped when not accepting). Data
+    /// frames are not control and are ignored here.
     pub fn deliver(&self, bytes: &[u8]) {
-        if let Some(message) = Message::decode(bytes) {
-            if !matches!(message, Message::Data { .. }) {
+        match Message::decode(bytes) {
+            Some(Message::Data { .. }) | None => {}
+            Some(Message::Offer { splice }) => {
+                if let Some(offers) = self.offers.lock().as_ref() {
+                    let _ = offers.try_send(splice);
+                }
+            }
+            Some(message) => {
                 let _ = self.replies_tx.try_send(message);
             }
         }
@@ -828,22 +1173,122 @@ impl RelayClient {
     }
 }
 
-/// A live registration with a relay. Dropping it stops the refresh; the
-/// relay forgets the registration after its TTL.
+/// Wait for a splice's status byte (the relay may hold a joiner for its whole
+/// offer wait before answering).
+const SPLICE_STATUS_WAIT: Duration = Duration::from_secs(15);
+/// Concurrent splice dial-backs per registration.
+const SPLICE_DIALS: usize = 8;
+/// Recently seen offers remembered to ignore resends.
+const SEEN_OFFERS: usize = 64;
+
+async fn splice_request(
+    relay: SocketAddr,
+    kind: u8,
+    id: [u8; 16],
+) -> Result<TcpStream, RelayError> {
+    let exchange = async {
+        let mut stream = TcpStream::connect(relay).await?;
+        let mut preamble = [0u8; splice::PREAMBLE_LEN];
+        preamble[0] = kind;
+        preamble[1..].copy_from_slice(&id);
+        stream.write_all(&preamble).await?;
+        let mut status = [0u8; 1];
+        match stream.read_exact(&mut status).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(RelayError::Eof),
+            Err(e) => return Err(e.into()),
+        }
+        match status[0] {
+            splice::OK => Ok(stream),
+            code => Err(RelayError::Refused(
+                Refusal::from_code(code).unwrap_or(Refusal::BadProof),
+            )),
+        }
+    };
+    tokio::time::timeout(SPLICE_STATUS_WAIT, exchange)
+        .await
+        .map_err(|_| RelayError::Timeout)?
+}
+
+/// Joiner side: open a byte stream to the device registered as `id` on
+/// `relay`. On `Ok`, the stream carries the device's bytes; it is still
+/// unauthenticated — run the end-to-end handshake over it.
+pub async fn open_splice(relay: SocketAddr, id: RegistrationId) -> Result<TcpStream, RelayError> {
+    splice_request(relay, splice::JOIN, id).await
+}
+
+/// Device side: claim the splice the relay offered.
+pub async fn accept_splice(relay: SocketAddr, splice: SpliceId) -> Result<TcpStream, RelayError> {
+    splice_request(relay, splice::ACCEPT, splice).await
+}
+
+/// A live registration with a relay. Dropping it stops the refresh (and any
+/// splice acceptor); the relay forgets the registration after its TTL.
 pub struct RelayRegistration {
     relay: SocketAddr,
     id: RegistrationId,
+    client: Arc<RelayClient>,
     refresh: tokio::task::JoinHandle<()>,
+    splicer: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RelayRegistration {
-    /// Wrap a registration and the task refreshing it.
+    /// Wrap a registration, its client and the task refreshing it.
     pub fn new(
-        relay: SocketAddr,
+        client: Arc<RelayClient>,
         id: RegistrationId,
         refresh: tokio::task::JoinHandle<()>,
     ) -> Self {
-        Self { relay, id, refresh }
+        Self {
+            relay: client.relay(),
+            id,
+            client,
+            refresh,
+            splicer: None,
+        }
+    }
+
+    /// Accept byte-stream splices joiners open through the relay: each offer
+    /// is dialled back once and the spliced stream (status already read) is
+    /// yielded. Streams are unauthenticated until the caller's handshake.
+    /// Offers arriving while the receiver is full are dropped.
+    pub fn accept_splices(&mut self, capacity: usize) -> tokio::sync::mpsc::Receiver<TcpStream> {
+        let (offers_tx, mut offers) = tokio::sync::mpsc::channel(16);
+        let (out, streams) = tokio::sync::mpsc::channel(capacity.max(1));
+        *self.client.offers.lock() = Some(offers_tx);
+        let relay = self.relay;
+        let dials = Arc::new(Semaphore::new(SPLICE_DIALS));
+        if let Some(old) = self.splicer.take() {
+            old.abort();
+        }
+        self.splicer = Some(tokio::spawn(async move {
+            let mut seen = std::collections::VecDeque::with_capacity(SEEN_OFFERS);
+            while let Some(splice) = offers.recv().await {
+                if seen.contains(&splice) {
+                    continue;
+                }
+                if seen.len() == SEEN_OFFERS {
+                    seen.pop_front();
+                }
+                seen.push_back(splice);
+                let Ok(permit) = dials.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let out = out.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    match accept_splice(relay, splice).await {
+                        Ok(stream) => {
+                            let _ = out.try_send(stream);
+                        }
+                        Err(e) => {
+                            tracing::debug!(%relay, error = %e, "blind relay splice dial-back failed")
+                        }
+                    }
+                });
+            }
+        }));
+        streams
     }
 
     /// The relay's UDP tuple.
@@ -860,6 +1305,10 @@ impl RelayRegistration {
 impl Drop for RelayRegistration {
     fn drop(&mut self) {
         self.refresh.abort();
+        if let Some(splicer) = self.splicer.take() {
+            splicer.abort();
+            *self.client.offers.lock() = None;
+        }
     }
 }
 
@@ -928,6 +1377,8 @@ mod tests {
                 channel: 42,
             },
             Message::Refused(Refusal::Capacity),
+            Message::Refused(Refusal::Unreachable),
+            Message::Offer { splice: [4; 16] },
             Message::Data {
                 channel: 9,
                 payload: b"ciphertext".to_vec(),
@@ -1326,5 +1777,193 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("UnknownRegistration"), "{err}");
         relay_task.abort();
+    }
+
+    fn registered(
+        core: &RelayCore,
+        kp: &EntityKeypair,
+        from: SocketAddr,
+        now: Instant,
+    ) -> RegistrationId {
+        let (_, Message::Registered { id, .. }) = decoded(register(core, kp, from, now)) else {
+            panic!("not registered");
+        };
+        id
+    }
+
+    /// Splices exist only for live registrations, are rate-limited per
+    /// registration and bounded in total, and each id is claimable once.
+    #[test]
+    fn splices_are_bounded_rate_limited_and_claimed_once() {
+        let config = RelayConfig {
+            splices_per_window: 2,
+            max_pending_splices: 3,
+            ..RelayConfig::default()
+        };
+        let core = RelayCore::new(config.clone()).unwrap();
+        let now = Instant::now();
+        let device = addr("198.51.100.7:4000");
+        let a = registered(&core, &EntityKeypair::generate(), device, now);
+        let b = registered(
+            &core,
+            &EntityKeypair::generate(),
+            addr("198.51.100.8:4000"),
+            now,
+        );
+
+        assert_eq!(
+            core.begin_splice([9; 16], now),
+            Err(Refusal::UnknownRegistration)
+        );
+        let (first, endpoint) = core.begin_splice(a, now).unwrap();
+        assert_eq!(endpoint, device, "offers go to the registered endpoint");
+        let (second, _) = core.begin_splice(a, now).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(core.begin_splice(a, now), Err(Refusal::Capacity), "rate");
+        core.begin_splice(b, now).unwrap();
+        assert_eq!(core.begin_splice(b, now), Err(Refusal::Capacity), "total");
+
+        assert!(core.claim_splice(&first));
+        assert!(!core.claim_splice(&first), "claimed twice");
+        core.abandon_splice(&second);
+        assert!(!core.claim_splice(&second), "claimed after abandon");
+        assert!(!core.claim_splice(&[0; 16]), "unknown id");
+
+        let later = now + config.bind_window;
+        core.begin_splice(a, later).unwrap();
+        assert_eq!(core.pending_splices(), 2);
+        core.sweep(later + config.splice_accept_wait * 2);
+        assert_eq!(core.pending_splices(), 0, "stale pending splices expire");
+        assert_eq!(
+            core.begin_splice(a, now + config.registration_ttl),
+            Err(Refusal::UnknownRegistration),
+            "an expired registration takes no splices"
+        );
+    }
+
+    async fn live_relay(
+        config: RelayConfig,
+    ) -> (SocketAddr, Arc<RelayCore>, tokio::task::JoinHandle<()>) {
+        let relay = BlindRelay::bind("127.0.0.1:0".parse().unwrap(), config)
+            .await
+            .unwrap();
+        let addr = relay.local_addr().unwrap();
+        let core = relay.core().clone();
+        (addr, core, tokio::spawn(async move { relay.run().await }))
+    }
+
+    /// A joiner's byte stream reaches the device that registered from its
+    /// mesh socket: the relay offers the splice over UDP, the device dials
+    /// back, and bytes flow both ways through the relay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_byte_stream_is_spliced_to_the_registered_device() {
+        let (relay, core, task) = live_relay(RelayConfig::default()).await;
+        let device = mesh_node().await;
+        device.start();
+        let mut registration = device.relay_register(relay).await.unwrap();
+        let mut streams = registration.accept_splices(4);
+
+        let mut joiner = open_splice(relay, registration.id())
+            .await
+            .expect("spliced");
+        let mut at_device = tokio::time::timeout(Duration::from_secs(5), streams.recv())
+            .await
+            .expect("device got the stream")
+            .unwrap();
+        joiner.write_all(b"to device").await.unwrap();
+        let mut buf = [0u8; 9];
+        at_device.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"to device");
+        at_device.write_all(b"to joiner").await.unwrap();
+        joiner.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"to joiner");
+        assert_eq!(core.stats().splices_opened.load(Ordering::Relaxed), 1);
+        assert_eq!(core.pending_splices(), 0);
+        task.abort();
+    }
+
+    /// A device that does not accept splices leaves the joiner refused as
+    /// unreachable once the offer wait runs out; nothing stays pending.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_splice_the_device_never_accepts_is_refused_as_unreachable() {
+        let (relay, core, task) = live_relay(RelayConfig {
+            splice_accept_wait: Duration::from_millis(1_500),
+            ..RelayConfig::default()
+        })
+        .await;
+        let device = mesh_node().await;
+        device.start();
+        let registration = device.relay_register(relay).await.unwrap();
+        let err = open_splice(relay, registration.id()).await.unwrap_err();
+        assert!(
+            matches!(err, RelayError::Refused(Refusal::Unreachable)),
+            "{err}"
+        );
+        assert_eq!(core.pending_splices(), 0);
+        let err = open_splice(relay, [7; 16]).await.unwrap_err();
+        assert!(
+            matches!(err, RelayError::Refused(Refusal::UnknownRegistration)),
+            "{err}"
+        );
+        task.abort();
+    }
+
+    /// An `ACCEPT` naming no pending splice (guessed, replayed or already
+    /// claimed) is refused and is never spliced to a waiting joiner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_accept_for_no_pending_splice_is_refused() {
+        let (relay, core, task) = live_relay(RelayConfig {
+            splice_accept_wait: Duration::from_millis(1_500),
+            ..RelayConfig::default()
+        })
+        .await;
+        let device = mesh_node().await;
+        device.start();
+        // Registered but not accepting: the joiner waits on its offer.
+        let registration = device.relay_register(relay).await.unwrap();
+        let waiting = tokio::spawn(open_splice(relay, registration.id()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while core.pending_splices() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the joiner is waiting");
+        let err = accept_splice(relay, [0xAB; 16]).await.unwrap_err();
+        assert!(
+            matches!(err, RelayError::Refused(Refusal::UnknownRegistration)),
+            "{err}"
+        );
+        let joiner = waiting.await.unwrap().unwrap_err();
+        assert!(
+            matches!(joiner, RelayError::Refused(Refusal::Unreachable)),
+            "the waiting joiner must not be spliced to a forged accept: {joiner}"
+        );
+        assert_eq!(core.stats().splices_opened.load(Ordering::Relaxed), 0);
+        task.abort();
+    }
+
+    /// Each direction of a splice is cut at the byte cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_splice_is_cut_at_its_byte_cap() {
+        let (relay, _core, task) = live_relay(RelayConfig {
+            splice_max_bytes: 1_024,
+            ..RelayConfig::default()
+        })
+        .await;
+        let device = mesh_node().await;
+        device.start();
+        let mut registration = device.relay_register(relay).await.unwrap();
+        let mut streams = registration.accept_splices(1);
+        let mut joiner = open_splice(relay, registration.id()).await.unwrap();
+        let mut at_device = streams.recv().await.unwrap();
+        joiner.write_all(&[0x55; 4_096]).await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), at_device.read_to_end(&mut got))
+            .await
+            .expect("the capped direction ends")
+            .unwrap();
+        assert_eq!(got.len(), 1_024);
+        task.abort();
     }
 }

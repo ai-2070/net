@@ -47593,16 +47593,17 @@ impl MeshNode {
             .await
             .map_err(|e| AdapterError::Connection(format!("relay {relay}: {e}")))?;
         let refresh = (ttl / 3).max(Duration::from_secs(5));
+        let refresher = client.clone();
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(refresh).await;
-                if let Err(e) = client.register(&keypair).await {
+                if let Err(e) = refresher.register(&keypair).await {
                     tracing::warn!(%relay, error = %e, "blind relay registration refresh failed");
                 }
             }
         });
         Ok(super::traversal::blind_relay::RelayRegistration::new(
-            relay, id, task,
+            client, id, task,
         ))
     }
 

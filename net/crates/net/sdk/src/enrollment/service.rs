@@ -10,7 +10,9 @@
 //! [`BundleIssuer`]) or recover, and answer on the same session.
 //!
 //! Bounded: concurrent sessions, per-session deadline, frame and request sizes.
-//! Excess sessions are closed without a response. The service exposes no
+//! Excess sessions are closed without a response. Streams that arrive another
+//! way — a splice through a blind relay — enter through
+//! [`EnrollmentService::serve_stream`] under the same bounds. The service exposes no
 //! management operation; the owner uses [`EnrollmentService::ledger`] locally.
 //! Stopping the service stops redemption only.
 
@@ -95,6 +97,8 @@ pub struct EnrollmentService {
     local_addr: SocketAddr,
     key: EnrollmentKey,
     ledger: SharedLedger,
+    ctx: Arc<Ctx>,
+    permits: Arc<Semaphore>,
     stop: Arc<Notify>,
     task: Option<JoinHandle<()>>,
 }
@@ -134,16 +138,19 @@ impl EnrollmentService {
             bundles,
             timeout: config.session_timeout,
         });
+        let permits = Arc::new(Semaphore::new(config.max_sessions));
         let task = tokio::spawn(accept_loop(
             listener,
-            ctx,
-            Arc::new(Semaphore::new(config.max_sessions)),
+            ctx.clone(),
+            permits.clone(),
             stop.clone(),
         ));
         Ok(Self {
             local_addr,
             key: key.public(),
             ledger,
+            ctx,
+            permits,
             stop,
             task: Some(task),
         })
@@ -157,6 +164,14 @@ impl EnrollmentService {
     /// Public key this service proves; sign it into invitations.
     pub fn enrollment_key(&self) -> EnrollmentKey {
         self.key
+    }
+
+    /// Serve one session over a stream obtained another way — a byte-stream
+    /// splice through a blind relay — under the same session bound and
+    /// deadline as accepted connections. The stream is untrusted exactly like
+    /// an accepted one. Returns `false` (the stream is closed) at capacity.
+    pub fn serve_stream(&self, stream: TcpStream) -> bool {
+        spawn_session(stream, &self.ctx, &self.permits)
     }
 
     /// The shared ledger, for the local owner's offer/approve/deny/revoke.
@@ -208,17 +223,23 @@ async fn accept_loop(
                 }
             },
         };
-        // Capacity is refused by closing, never by queueing unbounded work.
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            drop(stream);
-            continue;
-        };
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let _ = tokio::time::timeout(ctx.timeout, session(stream, &ctx)).await;
-        });
+        spawn_session(stream, &ctx, &permits);
     }
+}
+
+/// Run one session under a permit and the deadline. Capacity is refused by
+/// closing, never by queueing unbounded work.
+fn spawn_session(stream: TcpStream, ctx: &Arc<Ctx>, permits: &Arc<Semaphore>) -> bool {
+    let Ok(permit) = permits.clone().try_acquire_owned() else {
+        drop(stream);
+        return false;
+    };
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _ = tokio::time::timeout(ctx.timeout, session(stream, &ctx)).await;
+    });
+    true
 }
 
 /// One session. Any protocol or I/O failure closes it without a response.

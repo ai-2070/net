@@ -263,17 +263,47 @@ pub async fn redeem(
         return Err(RedeemError::Intent(InviteError::WrongSubject));
     }
     intent.check_against(invite).map_err(RedeemError::Intent)?;
-    tokio::time::timeout(timeout, redeem_session(invite, device, intent))
+    let session = async {
+        let stream = TcpStream::connect(invite.endpoint().as_str()).await?;
+        redeem_session(stream, invite, device, intent).await
+    };
+    tokio::time::timeout(timeout, session)
         .await
         .map_err(|_| RedeemError::Timeout)?
 }
 
-async fn redeem_session(
+/// [`redeem`] over a byte stream the caller already opened towards the
+/// service, such as a splice through a blind relay. The stream is not
+/// trusted: the responder must still prove the invite's pinned enrollment key,
+/// so a relay (or anyone who claimed the splice) cannot answer for it.
+pub async fn redeem_over<S>(
+    stream: S,
     invite: &MembershipInvite,
     device: &Identity,
     intent: &RedemptionIntent,
-) -> Result<RedeemOutcome, RedeemError> {
-    let mut stream = TcpStream::connect(invite.endpoint().as_str()).await?;
+    timeout: Duration,
+) -> Result<RedeemOutcome, RedeemError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if intent.subject() != device.entity_id() {
+        return Err(RedeemError::Intent(InviteError::WrongSubject));
+    }
+    intent.check_against(invite).map_err(RedeemError::Intent)?;
+    tokio::time::timeout(timeout, redeem_session(stream, invite, device, intent))
+        .await
+        .map_err(|_| RedeemError::Timeout)?
+}
+
+async fn redeem_session<S>(
+    mut stream: S,
+    invite: &MembershipInvite,
+    device: &Identity,
+    intent: &RedemptionIntent,
+) -> Result<RedeemOutcome, RedeemError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut hs = initiator(&invite.enrollment_key()).map_err(|_| RedeemError::Handshake)?;
     let mut buf = vec![0u8; MAX_HANDSHAKE_FRAME];
     let n = hs

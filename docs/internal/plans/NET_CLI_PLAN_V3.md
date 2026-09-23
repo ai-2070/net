@@ -1274,7 +1274,83 @@ Regressions:
 - Clippy (all-features, all-targets, lib/bins default and no-default) and
   rustdoc (root and `net-mesh-wire`) are clean.
 
-**Next:** R2 phase 2, the enrollment splice through the relay.
+#### R2 phase 2 — enrollment splice through the relay (receipt)
+
+**Protocol** (`blind_relay.rs`). The relay's TCP listener shares the UDP
+socket's port number:
+1. A joiner sends `[0x20 JOIN][registration id]`.
+2. The relay allocates a random 128-bit splice id and sends UDP
+   `OFFER { splice id }` (17 bytes) to the device's **registered** endpoint. It
+   resends every 1 s, re-reading the endpoint so a NAT rebinding is followed,
+   until `splice_accept_wait` (5 s) passes.
+3. The device dials back with `[0x21 ACCEPT][splice id]`.
+4. The relay writes one status byte to each stream and copies bytes blindly.
+
+**Bounds:**
+- per-registration splice rate: `splices_per_window` = 4 per `bind_window`;
+- pending splices: 1 024; live splices: 4 096; TCP connections: 8 192;
+- preamble deadline: 5 s;
+- per-direction byte cap: 1 MiB;
+- splice lifetime: 60 s;
+- stale pending splices are swept.
+
+An offer is only ever sent to a registered device, after a completed TCP
+handshake. An unanswered splice is refused `Unreachable`, and an `ACCEPT` for
+no pending id is refused.
+
+**Relay socket order.** `BlindRelay::bind` with port 0 picks the TCP port
+first, then binds UDP on it. Windows excludes TCP-only port ranges that sit
+inside the UDP ephemeral range, and allocates UDP ports roughly in sequence, so
+a UDP-first choice failed every retry with WSAEACCES. This is the same lesson as
+the enrollment port.
+
+**Device side.** `RelayRegistration::accept_splices(capacity)` routes relay
+`OFFER`s (which `RelayClient::deliver` now separates from control replies) to a
+dial-back task. That task ignores resends it has seen, runs at most 8
+concurrent dial-backs, and yields spliced `TcpStream`s. Offers are dropped while
+the node is not accepting.
+
+**SDK.**
+- `EnrollmentService::serve_stream` runs a stream obtained elsewhere under the
+  same session permit and deadline as accepted connections.
+- `redeem::redeem_over(stream, …)` runs the unchanged Noise NK redemption over
+  any byte stream. The responder must still prove the invite-pinned enrollment
+  key, so neither the relay nor anyone who claims a splice can answer for the
+  device.
+
+Witnesses:
+- `blind_relay` units 15/15:
+  - `splices_are_bounded_rate_limited_and_claimed_once`
+  - `a_byte_stream_is_spliced_to_the_registered_device`
+  - `a_splice_the_device_never_accepts_is_refused_as_unreachable`
+  - `an_accept_for_no_pending_splice_is_refused` (a forged `ACCEPT` while a real
+    joiner waits is refused, and the joiner is never spliced to it)
+  - `a_splice_is_cut_at_its_byte_cap`
+  - the `OFFER`/`Unreachable` codec cases
+- `sdk/tests/enrollment_relay.rs` 2/2:
+  - `an_invite_is_redeemed_over_a_blind_relay_splice`: the invite's direct
+    endpoint is unroutable, and the bundle arrives through the splice;
+  - `a_splice_answered_by_another_responder_fails_the_handshake`: the genuine
+    invite stays `Offered`.
+
+Inverse mutations, each caught by its witness and then restored
+byte-identically:
+- an accept that takes any waiting joiner;
+- no per-registration splice rate;
+- no byte cap;
+- the device dropping offers;
+- an unanswered splice left pending.
+
+Regressions:
+- `cargo tl` 5809/5809.
+- SDK enrollment binaries 50/50.
+- `net-cli` 341/341.
+- Clippy (core all-features all-targets, lib/bins all and no-default; SDK
+  `full` all-targets; `net-cli`) and rustdoc (root, SDK `full`) are clean.
+
+**Next:** R2 phase 3. Token and bundle relay locators; direct-first,
+relay-fallback in `join` and joined `up`; `up --enroll` registering with the
+configured relay and feeding `accept_splices` into `serve_stream`.
 Lifecycle fencing, selective subnet semantics and V2 exact-head acceptance
 remain open.
 
