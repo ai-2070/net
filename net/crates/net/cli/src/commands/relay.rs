@@ -68,7 +68,7 @@ async fn serve(args: ServeArgs, output: Option<OutputFormat>) -> Result<(), CliE
 
     tokio::select! {
         _ = relay.run() => {}
-        _ = tokio::signal::ctrl_c() => {}
+        _ = shutdown_signal() => {}
     }
 
     let (registrations, channels) = core.sizes();
@@ -84,7 +84,26 @@ async fn serve(args: ServeArgs, output: Option<OutputFormat>) -> Result<(), CliE
             "forwarded_bytes": stats.forwarded_bytes.load(Ordering::Relaxed),
             "dropped": stats.dropped.load(Ordering::Relaxed),
             "refused": stats.refused.load(Ordering::Relaxed),
+            "registrations_accepted": stats.registrations.load(Ordering::Relaxed),
+            "splices": stats.splices_opened.load(Ordering::Relaxed),
+            "splice_bytes": stats.splice_bytes.load(Ordering::Relaxed),
         }),
     )
     .map_err(|e| generic(format!("write stop event: {e}")))
+}
+
+/// Ctrl-C, or SIGTERM on Unix (how service managers stop a relay).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }

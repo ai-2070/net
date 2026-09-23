@@ -9,6 +9,11 @@
 # PCP / UPnP (miniupnpd), with no relay anywhere in the topology, and must
 # FAIL in the same topology when mapping is disabled (negative control).
 #
+# The `relay` job (R2 phase 4) runs the direct-first, relay-fallback rows in
+# the same lab: relay down with mapping up joins directly; relay up with
+# mapping up still joins directly; direct forced dead with the relay up joins,
+# attaches and runs through the blind relay.
+#
 # Separate from natsim.yml: that job builds the browser matrix (wasm,
 # Playwright) and runs for over an hour; this row needs only net-mesh.
 name: natsim-enroll
@@ -23,7 +28,7 @@ on:
       - "net/crates/net/cli/src/**"
       - "net/crates/net/sdk/src/enrollment/**"
       - "net/crates/net/sdk/src/enrollment.rs"
-      - "net/crates/net/src/adapter/net/traversal/portmap/**"
+      - "net/crates/net/src/adapter/net/traversal/**"
   pull_request:
     paths:
       - ".github/workflows/natsim-enroll.yml"
@@ -33,7 +38,7 @@ on:
       - "net/crates/net/cli/src/**"
       - "net/crates/net/sdk/src/enrollment/**"
       - "net/crates/net/sdk/src/enrollment.rs"
-      - "net/crates/net/src/adapter/net/traversal/portmap/**"
+      - "net/crates/net/src/adapter/net/traversal/**"
   workflow_dispatch:
 
 concurrency:
@@ -91,4 +96,50 @@ jobs:
         with:
           name: natsim-enroll-evidence
           path: /tmp/natsim-enroll.*
+          if-no-files-found: ignore
+
+  relay:
+    name: enrollment relay fallback (direct first, blind relay second)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: net/crates/net
+
+      - name: Install NAT lab tools
+        run: |
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q             nftables iproute2 conntrack jq miniupnpd-nftables
+          sudo systemctl disable --now miniupnpd 2>/dev/null || true
+
+      - name: Build net-mesh
+        working-directory: net/crates/net
+        run: cargo build -p net-cli
+
+      - name: Direct first, relay fallback
+        run: |
+          sudo NET_MESH_BIN="$PWD/net/crates/net/target/debug/net-mesh"             net/crates/net/tests/natsim/enroll/run_enroll_relay.sh
+
+      - name: Show scenario evidence
+        if: ${{ always() }}
+        run: |
+          for f in /tmp/natsim-enroll-relay.*/*; do
+            [ -f "$f" ] || continue
+            echo "=== $f"
+            tail -n 120 "$f" || true
+          done
+
+      - name: Upload scenario evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: natsim-enroll-relay-evidence
+          path: /tmp/natsim-enroll-relay.*
           if-no-files-found: ignore
