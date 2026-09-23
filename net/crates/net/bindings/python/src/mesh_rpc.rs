@@ -199,6 +199,27 @@ fn rpc_error_to_pyerr(err: InnerRpcError) -> PyErr {
     }
 }
 
+/// Which error vocabulary a caller-side handle surfaces failures through.
+///
+/// `false` (every handle the nRPC verbs build): the nRPC exception family via
+/// [`rpc_error_to_pyerr`]. `true` (every handle an org verb builds — the
+/// `OrgClient` / `AsyncOrgClient` streaming verbs): the `org:` wire vocabulary
+/// via `org_err_to_py` (§4.4 — "midstream errors through `org_err_to_py`").
+/// Same classes either way (§4.4: "the existing public stream/sink handle
+/// types, no new stream wrapper per binding") — only the classification of a
+/// terminal/midstream error differs.
+fn handle_error(org_errors: bool, err: InnerRpcError) -> PyErr {
+    #[cfg(feature = "org")]
+    {
+        if org_errors {
+            return crate::org::org_stream_err_to_py(err);
+        }
+    }
+    #[cfg(not(feature = "org"))]
+    let _ = org_errors;
+    rpc_error_to_pyerr(err)
+}
+
 // ============================================================================
 // Cancellable — caller-side cancel token.
 //
@@ -430,11 +451,11 @@ fn extract_cancel_token<'py>(opts: Option<&Bound<'py, PyDict>>) -> PyResult<Opti
 }
 
 /// `True` iff `handler` is a Python `async def` (coroutine
-/// function). Used by `AsyncMeshRpc.serve*` to route async
-/// handlers to the coroutine-driving path and sync handlers to
+/// function). Used by `AsyncMeshRpc.serve*` (and the org serve verbs) to
+/// route async handlers to the coroutine-driving path and sync handlers to
 /// the existing `spawn_blocking` path at register time, so the
 /// branch isn't paid per-invocation.
-fn is_coroutine_function(py: Python<'_>, handler: &Py<PyAny>) -> bool {
+pub(crate) fn is_coroutine_function(py: Python<'_>, handler: &Py<PyAny>) -> bool {
     let Ok(inspect) = py.import("inspect") else {
         return false;
     };
@@ -995,6 +1016,23 @@ impl PyServeHandle {
 pub struct PyRpcStream {
     inner: Arc<Mutex<Option<InnerRpcStream>>>,
     runtime: Arc<GuardedRuntime>,
+    /// Error vocabulary for midstream/terminal failures — see
+    /// [`handle_error`]. Set only by the org verbs' factories.
+    org_errors: bool,
+}
+
+impl PyRpcStream {
+    /// Wrap a raw stream an org facade seam returned (`org` feature only):
+    /// same class as every nRPC stream, but midstream errors classify
+    /// through the `org:` vocabulary (§4.4).
+    #[cfg(feature = "org")]
+    pub(crate) fn from_org_stream(inner: InnerRpcStream, runtime: Arc<GuardedRuntime>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            runtime,
+            org_errors: true,
+        }
+    }
 }
 
 #[pymethods]
@@ -1009,6 +1047,7 @@ impl PyRpcStream {
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let org_errors = self.org_errors;
         let result = py.detach(|| {
             runtime.block_on(async move {
                 // Take the inner stream out of the mutex while we
@@ -1034,7 +1073,7 @@ impl PyRpcStream {
                         // is unnecessary; the server already
                         // terminated us) and surface the error.
                         drop(stream);
-                        Err(rpc_error_to_pyerr(e))
+                        Err(handle_error(org_errors, e))
                     }
                     None => {
                         // Clean EOF — drop the inner stream so the
@@ -1097,6 +1136,28 @@ pub struct PyClientStreamCall {
     /// ``close_notify`` — a Notify permit fires the select branch
     /// in send and the call is dropped (CANCEL fires from Drop).
     close_notify: Arc<tokio::sync::Notify>,
+    /// Error vocabulary — see [`handle_error`].
+    org_errors: bool,
+}
+
+impl PyClientStreamCall {
+    /// Wrap a raw call an org facade seam returned (`org` feature only).
+    #[cfg(feature = "org")]
+    pub(crate) fn from_org_stream(
+        inner: InnerClientStreamCallRaw,
+        runtime: Arc<GuardedRuntime>,
+    ) -> Self {
+        let call_id_cached = inner.call_id();
+        let flow_controlled_cached = inner.flow_controlled();
+        Self {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            runtime,
+            call_id_cached,
+            flow_controlled_cached,
+            close_notify: Arc::new(tokio::sync::Notify::new()),
+            org_errors: true,
+        }
+    }
 }
 
 #[pymethods]
@@ -1112,6 +1173,7 @@ impl PyClientStreamCall {
     fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let org_errors = self.org_errors;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
         let notify = self.close_notify.clone();
         py.detach(|| {
@@ -1136,7 +1198,7 @@ impl PyClientStreamCall {
                     }
                     Err(e) => {
                         drop(call);
-                        Err(rpc_error_to_pyerr(e))
+                        Err(handle_error(org_errors, e))
                     }
                 }
             })
@@ -1148,13 +1210,14 @@ impl PyClientStreamCall {
     fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let org_errors = self.org_errors;
         let result = py.detach(|| {
             runtime.block_on(async move {
                 let call = match inner.lock().take() {
                     Some(c) => c,
                     None => return Err(RpcError::new_err("client-stream call already closed")),
                 };
-                call.finish().await.map_err(rpc_error_to_pyerr)
+                call.finish().await.map_err(|e| handle_error(org_errors, e))
             })
         })?;
         Ok(PyBytes::new(py, result.body.as_ref()))
@@ -1213,6 +1276,25 @@ pub struct PyDuplexCall {
     /// ``close()`` interrupt a pending ``send()`` blocked on
     /// flow-control credit.
     close_notify: Arc<tokio::sync::Notify>,
+    /// Error vocabulary — see [`handle_error`].
+    org_errors: bool,
+}
+
+impl PyDuplexCall {
+    /// Wrap a raw call an org facade seam returned (`org` feature only).
+    #[cfg(feature = "org")]
+    pub(crate) fn from_org_stream(inner: InnerDuplexCallRaw, runtime: Arc<GuardedRuntime>) -> Self {
+        let call_id_cached = inner.call_id();
+        let flow_controlled_cached = inner.flow_controlled();
+        Self {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            runtime,
+            call_id_cached,
+            flow_controlled_cached,
+            close_notify: Arc::new(tokio::sync::Notify::new()),
+            org_errors: true,
+        }
+    }
 }
 
 #[pymethods]
@@ -1224,6 +1306,7 @@ impl PyDuplexCall {
     fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let org_errors = self.org_errors;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
         let notify = self.close_notify.clone();
         py.detach(|| {
@@ -1246,7 +1329,7 @@ impl PyDuplexCall {
                     }
                     Err(e) => {
                         drop(call);
-                        Err(rpc_error_to_pyerr(e))
+                        Err(handle_error(org_errors, e))
                     }
                 }
             })
@@ -1258,6 +1341,7 @@ impl PyDuplexCall {
     fn finish_sending(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let org_errors = self.org_errors;
         py.detach(|| {
             runtime.block_on(async move {
                 let mut call = match inner.lock().take() {
@@ -1266,7 +1350,7 @@ impl PyDuplexCall {
                 };
                 let result = call.finish_sending().await;
                 *inner.lock() = Some(call);
-                result.map_err(rpc_error_to_pyerr)
+                result.map_err(|e| handle_error(org_errors, e))
             })
         })
     }
@@ -1284,6 +1368,7 @@ impl PyDuplexCall {
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let org_errors = self.org_errors;
         let result = py.detach(|| {
             runtime.block_on(async move {
                 let mut call = match inner.lock().take() {
@@ -1298,7 +1383,7 @@ impl PyDuplexCall {
                     }
                     Some(Err(e)) => {
                         drop(call);
-                        Err(rpc_error_to_pyerr(e))
+                        Err(handle_error(org_errors, e))
                     }
                     None => {
                         drop(call);
@@ -1334,11 +1419,13 @@ impl PyDuplexCall {
                 call_id_cached: call_id,
                 flow_controlled_cached: flow_controlled,
                 close_notify: Arc::new(tokio::sync::Notify::new()),
+                org_errors: self.org_errors,
             },
             PyDuplexStream {
                 inner: Arc::new(Mutex::new(Some(stream))),
                 runtime: self.runtime.clone(),
                 call_id_cached: call_id,
+                org_errors: self.org_errors,
             },
         ))
     }
@@ -1386,6 +1473,8 @@ pub struct PyDuplexSink {
     flow_controlled_cached: bool,
     /// Same role as ``PyClientStreamCall::close_notify``.
     close_notify: Arc<tokio::sync::Notify>,
+    /// Error vocabulary — see [`handle_error`].
+    org_errors: bool,
 }
 
 #[pymethods]
@@ -1396,6 +1485,7 @@ impl PyDuplexSink {
     fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let org_errors = self.org_errors;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
         let notify = self.close_notify.clone();
         py.detach(|| {
@@ -1418,7 +1508,7 @@ impl PyDuplexSink {
                     }
                     Err(e) => {
                         drop(sink);
-                        Err(rpc_error_to_pyerr(e))
+                        Err(handle_error(org_errors, e))
                     }
                 }
             })
@@ -1430,13 +1520,16 @@ impl PyDuplexSink {
     fn finish(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let org_errors = self.org_errors;
         py.detach(|| {
             runtime.block_on(async move {
                 let sink = match inner.lock().take() {
                     Some(s) => s,
                     None => return Err(RpcError::new_err("duplex sink already closed")),
                 };
-                sink.finish_sending().await.map_err(rpc_error_to_pyerr)
+                sink.finish_sending()
+                    .await
+                    .map_err(|e| handle_error(org_errors, e))
             })
         })
     }
@@ -1473,6 +1566,8 @@ pub struct PyDuplexStream {
     inner: Arc<Mutex<Option<InnerDuplexStream>>>,
     runtime: Arc<GuardedRuntime>,
     call_id_cached: u64,
+    /// Error vocabulary — see [`handle_error`].
+    org_errors: bool,
 }
 
 #[pymethods]
@@ -1483,6 +1578,7 @@ impl PyDuplexStream {
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let org_errors = self.org_errors;
         let result = py.detach(|| {
             runtime.block_on(async move {
                 let mut stream = match inner.lock().take() {
@@ -1498,7 +1594,7 @@ impl PyDuplexStream {
                     }
                     Some(Err(e)) => {
                         drop(stream);
-                        Err(rpc_error_to_pyerr(e))
+                        Err(handle_error(org_errors, e))
                     }
                     None => {
                         drop(stream);
@@ -1592,6 +1688,34 @@ pub struct PyRequestStreamRecv {
     headers: Arc<Vec<(String, Vec<u8>)>>,
 }
 
+impl PyRequestStreamRecv {
+    /// Wrap a request stream arriving through an ORG serve seam (`org`
+    /// feature only).
+    ///
+    /// The frozen `serve_org_*_bytes_node` seams surface the verified
+    /// `OrgCaller` + the stream and drop `RpcStreamingContext`, so the
+    /// raw-transport diagnostic getters (`caller_origin`, `call_id`,
+    /// `deadline_ns`, `headers`) are UNPOPULATED (0 / empty) on this surface —
+    /// attribution rides the handler's `caller` dict, which is verified and
+    /// supersedes them. The stream half (chunks + the §2.2 retire signal that
+    /// fences iteration to EOF on retirement) is identical to the nRPC
+    /// surface's. Documented at the `serve_org_*` verbs.
+    #[cfg(feature = "org")]
+    pub(crate) fn from_org_request_stream(
+        inner: InnerRequestStream,
+        runtime: Arc<GuardedRuntime>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            runtime,
+            caller_origin: 0,
+            call_id: 0,
+            deadline_ns: 0,
+            headers: Arc::new(Vec::new()),
+        }
+    }
+}
+
 #[pymethods]
 impl PyRequestStreamRecv {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -1664,6 +1788,18 @@ impl PyRequestStreamRecv {
 #[pyclass(name = "ResponseSinkSend", module = "_net")]
 pub struct PyResponseSinkSend {
     inner: Arc<Mutex<Option<InnerRpcResponseSink>>>,
+}
+
+impl PyResponseSinkSend {
+    /// Wrap a response sink arriving through an ORG serve seam (`org`
+    /// feature only) — the same wrapper class the nRPC streaming handlers
+    /// receive.
+    #[cfg(feature = "org")]
+    pub(crate) fn from_org_response_sink(inner: InnerRpcResponseSink) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        }
+    }
 }
 
 #[pymethods]
@@ -2351,6 +2487,7 @@ impl PyMeshRpc {
         Ok(PyRpcStream {
             inner: Arc::new(Mutex::new(Some(inner))),
             runtime: self.runtime.clone(),
+            org_errors: false,
         })
     }
 
@@ -2392,6 +2529,7 @@ impl PyMeshRpc {
         Ok(PyRpcStream {
             inner: Arc::new(Mutex::new(Some(inner))),
             runtime: self.runtime.clone(),
+            org_errors: false,
         })
     }
 
@@ -2435,6 +2573,7 @@ impl PyMeshRpc {
             call_id_cached: call_id,
             flow_controlled_cached: flow_controlled,
             close_notify: Arc::new(tokio::sync::Notify::new()),
+            org_errors: false,
         })
     }
 
@@ -2477,6 +2616,7 @@ impl PyMeshRpc {
             call_id_cached: call_id,
             flow_controlled_cached: flow_controlled,
             close_notify: Arc::new(tokio::sync::Notify::new()),
+            org_errors: false,
         })
     }
 
@@ -2965,6 +3105,7 @@ impl PyAsyncMeshRpc {
                     cancel_token: token,
                     call_id_cached,
                     flow_controlled_cached,
+                    org_errors: false,
                 })
             }
         })
@@ -3003,6 +3144,7 @@ impl PyAsyncMeshRpc {
                     cancel_token: token,
                     call_id_cached,
                     flow_controlled_cached,
+                    org_errors: false,
                 })
             }
         })
@@ -3045,6 +3187,7 @@ impl PyAsyncMeshRpc {
                     closed: Arc::new(AtomicBool::new(false)),
                     mesh: mesh_for_stream,
                     cancel_token: token,
+                    org_errors: false,
                 })
             }
         })
@@ -3083,6 +3226,7 @@ impl PyAsyncMeshRpc {
                     closed: Arc::new(AtomicBool::new(false)),
                     mesh: mesh_for_stream,
                     cancel_token: token,
+                    org_errors: false,
                 })
             }
         })
@@ -3114,6 +3258,26 @@ pub struct PyAsyncRpcStream {
     closed: Arc<AtomicBool>,
     mesh: Arc<MeshNode>,
     cancel_token: u64,
+    /// Error vocabulary — see [`handle_error`].
+    org_errors: bool,
+}
+
+impl PyAsyncRpcStream {
+    /// Wrap a raw stream an org facade seam returned (`org` feature only).
+    #[cfg(feature = "org")]
+    pub(crate) fn from_org_stream(
+        inner: InnerRpcStream,
+        mesh: Arc<MeshNode>,
+        cancel_token: u64,
+    ) -> Self {
+        Self {
+            inner: Arc::new(TokioMutex::new(Some(inner))),
+            closed: Arc::new(AtomicBool::new(false)),
+            mesh,
+            cancel_token,
+            org_errors: true,
+        }
+    }
 }
 
 #[pymethods]
@@ -3124,12 +3288,14 @@ impl PyAsyncRpcStream {
 
     /// Awaitable that resolves to the next chunk as ``bytes``, or
     /// raises ``StopAsyncIteration`` on clean EOF. Mid-stream
-    /// errors raise an :class:`RpcError` subclass.
+    /// errors raise an :class:`RpcError` subclass (or the
+    /// ``org:`` family on handles an org verb opened).
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
+        let org_errors = self.org_errors;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
             let mut guard = inner.lock().await;
             if closed.load(Ordering::Acquire) {
@@ -3145,7 +3311,7 @@ impl PyAsyncRpcStream {
                 ),
                 Some(Err(e)) => {
                     *guard = None;
-                    Err(rpc_error_to_pyerr(e))
+                    Err(handle_error(org_errors, e))
                 }
                 None => {
                     *guard = None;
@@ -3216,6 +3382,30 @@ pub struct PyAsyncClientStreamCall {
     cancel_token: u64,
     call_id_cached: u64,
     flow_controlled_cached: bool,
+    /// Error vocabulary — see [`handle_error`].
+    org_errors: bool,
+}
+
+impl PyAsyncClientStreamCall {
+    /// Wrap a raw call an org facade seam returned (`org` feature only).
+    #[cfg(feature = "org")]
+    pub(crate) fn from_org_stream(
+        inner: InnerClientStreamCallRaw,
+        mesh: Arc<MeshNode>,
+        cancel_token: u64,
+    ) -> Self {
+        let call_id_cached = inner.call_id();
+        let flow_controlled_cached = inner.flow_controlled();
+        Self {
+            inner: Arc::new(TokioMutex::new(Some(inner))),
+            closed: Arc::new(AtomicBool::new(false)),
+            mesh,
+            cancel_token,
+            call_id_cached,
+            flow_controlled_cached,
+            org_errors: true,
+        }
+    }
 }
 
 #[pymethods]
@@ -3233,6 +3423,7 @@ impl PyAsyncClientStreamCall {
         let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
+        let org_errors = self.org_errors;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
             let mut guard = inner.lock().await;
@@ -3247,7 +3438,7 @@ impl PyAsyncClientStreamCall {
                 Ok(()) => Ok::<(), PyErr>(()),
                 Err(e) => {
                     *guard = None;
-                    Err(rpc_error_to_pyerr(e))
+                    Err(handle_error(org_errors, e))
                 }
             }
         })
@@ -3260,6 +3451,7 @@ impl PyAsyncClientStreamCall {
         let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
+        let org_errors = self.org_errors;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
             let mut guard = inner.lock().await;
             if closed.load(Ordering::Acquire) {
@@ -3271,7 +3463,10 @@ impl PyAsyncClientStreamCall {
                 None => return Err(RpcError::new_err("client-stream call already closed")),
             };
             closed.store(true, Ordering::Release);
-            let reply = call.finish().await.map_err(rpc_error_to_pyerr)?;
+            let reply = call
+                .finish()
+                .await
+                .map_err(|e| handle_error(org_errors, e))?;
             Ok::<crate::async_bridge::BytesReply, PyErr>(crate::async_bridge::BytesReply(
                 reply.body,
             ))
@@ -3325,6 +3520,30 @@ pub struct PyAsyncDuplexCall {
     cancel_token: u64,
     call_id_cached: u64,
     flow_controlled_cached: bool,
+    /// Error vocabulary — see [`handle_error`].
+    org_errors: bool,
+}
+
+impl PyAsyncDuplexCall {
+    /// Wrap a raw call an org facade seam returned (`org` feature only).
+    #[cfg(feature = "org")]
+    pub(crate) fn from_org_stream(
+        inner: InnerDuplexCallRaw,
+        mesh: Arc<MeshNode>,
+        cancel_token: u64,
+    ) -> Self {
+        let call_id_cached = inner.call_id();
+        let flow_controlled_cached = inner.flow_controlled();
+        Self {
+            inner: Arc::new(TokioMutex::new(Some(inner))),
+            closed: Arc::new(AtomicBool::new(false)),
+            mesh,
+            cancel_token,
+            call_id_cached,
+            flow_controlled_cached,
+            org_errors: true,
+        }
+    }
 }
 
 #[pymethods]
@@ -3339,6 +3558,7 @@ impl PyAsyncDuplexCall {
         let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
+        let org_errors = self.org_errors;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
             let mut guard = inner.lock().await;
@@ -3353,7 +3573,7 @@ impl PyAsyncDuplexCall {
                 Ok(()) => Ok::<(), PyErr>(()),
                 Err(e) => {
                     *guard = None;
-                    Err(rpc_error_to_pyerr(e))
+                    Err(handle_error(org_errors, e))
                 }
             }
         })
@@ -3366,6 +3586,7 @@ impl PyAsyncDuplexCall {
         let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
+        let org_errors = self.org_errors;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
             let mut guard = inner.lock().await;
             if closed.load(Ordering::Acquire) {
@@ -3375,7 +3596,9 @@ impl PyAsyncDuplexCall {
             let Some(call) = guard.as_mut() else {
                 return Err(RpcError::new_err("duplex call already closed"));
             };
-            call.finish_sending().await.map_err(rpc_error_to_pyerr)
+            call.finish_sending()
+                .await
+                .map_err(|e| handle_error(org_errors, e))
         })
     }
 
@@ -3391,6 +3614,7 @@ impl PyAsyncDuplexCall {
         let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
+        let org_errors = self.org_errors;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
             let mut guard = inner.lock().await;
             if closed.load(Ordering::Acquire) {
@@ -3406,7 +3630,7 @@ impl PyAsyncDuplexCall {
                 ),
                 Some(Err(e)) => {
                     *guard = None;
-                    Err(rpc_error_to_pyerr(e))
+                    Err(handle_error(org_errors, e))
                 }
                 None => {
                     *guard = None;
@@ -3444,6 +3668,7 @@ impl PyAsyncDuplexCall {
                 cancel_token: self.cancel_token,
                 call_id_cached: call_id,
                 flow_controlled_cached: flow_controlled,
+                org_errors: self.org_errors,
             },
             PyAsyncDuplexStream {
                 inner: Arc::new(TokioMutex::new(Some(stream))),
@@ -3451,6 +3676,7 @@ impl PyAsyncDuplexCall {
                 mesh: self.mesh.clone(),
                 cancel_token: self.cancel_token,
                 call_id_cached: call_id,
+                org_errors: self.org_errors,
             },
         ))
     }
@@ -3489,6 +3715,8 @@ pub struct PyAsyncDuplexSink {
     cancel_token: u64,
     call_id_cached: u64,
     flow_controlled_cached: bool,
+    /// Error vocabulary — see [`handle_error`].
+    org_errors: bool,
 }
 
 #[pymethods]
@@ -3502,6 +3730,7 @@ impl PyAsyncDuplexSink {
         let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
+        let org_errors = self.org_errors;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
             let mut guard = inner.lock().await;
@@ -3516,7 +3745,7 @@ impl PyAsyncDuplexSink {
                 Ok(()) => Ok::<(), PyErr>(()),
                 Err(e) => {
                     *guard = None;
-                    Err(rpc_error_to_pyerr(e))
+                    Err(handle_error(org_errors, e))
                 }
             }
         })
@@ -3529,6 +3758,7 @@ impl PyAsyncDuplexSink {
         let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
+        let org_errors = self.org_errors;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
             let mut guard = inner.lock().await;
             if closed.load(Ordering::Acquire) {
@@ -3540,7 +3770,9 @@ impl PyAsyncDuplexSink {
                 None => return Err(RpcError::new_err("duplex sink already closed")),
             };
             closed.store(true, Ordering::Release);
-            sink.finish_sending().await.map_err(rpc_error_to_pyerr)
+            sink.finish_sending()
+                .await
+                .map_err(|e| handle_error(org_errors, e))
         })
     }
 
@@ -3572,6 +3804,8 @@ pub struct PyAsyncDuplexStream {
     mesh: Arc<MeshNode>,
     cancel_token: u64,
     call_id_cached: u64,
+    /// Error vocabulary — see [`handle_error`].
+    org_errors: bool,
 }
 
 #[pymethods]
@@ -3585,6 +3819,7 @@ impl PyAsyncDuplexStream {
         let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
+        let org_errors = self.org_errors;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
             let mut guard = inner.lock().await;
             if closed.load(Ordering::Acquire) {
@@ -3600,7 +3835,7 @@ impl PyAsyncDuplexStream {
                 ),
                 Some(Err(e)) => {
                     *guard = None;
-                    Err(rpc_error_to_pyerr(e))
+                    Err(handle_error(org_errors, e))
                 }
                 None => {
                     *guard = None;

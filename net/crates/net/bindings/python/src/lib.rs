@@ -4078,8 +4078,12 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_class::<org::PyOrgCredentials>()?;
         m.add_class::<org::PyOrgClient>()?;
+        m.add_class::<org::PyAsyncOrgClient>()?;
         m.add_class::<org_serve::PyOrgServeHandle>()?;
         m.add_function(wrap_pyfunction!(org_serve::serve_org, m)?)?;
+        m.add_function(wrap_pyfunction!(org_serve::serve_org_streaming, m)?)?;
+        m.add_function(wrap_pyfunction!(org_serve::serve_org_client_stream, m)?)?;
+        m.add_function(wrap_pyfunction!(org_serve::serve_org_duplex, m)?)?;
         m.add_function(wrap_pyfunction!(org_serve::install_org_authority, m)?)?;
         m.add_function(wrap_pyfunction!(
             org_serve::install_provider_grant_audience,

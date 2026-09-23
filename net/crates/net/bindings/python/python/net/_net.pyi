@@ -4840,6 +4840,47 @@ class OrgClient:
     def bind(mesh: Any, credentials: OrgCredentials) -> "OrgClient": ...
     def call(self, service: str, request: bytes) -> bytes: ...
     def call_exported(self, service: str, request: bytes) -> bytes: ...
+    def call_streaming(
+        self,
+        service: str,
+        request: bytes,
+        deadline_ms: int = ...,
+        cancel_token: int = ...,
+    ) -> "RpcStream":
+        """Call a protected service whose response is a STREAM — one request in,
+        byte chunks out, over the existing :class:`RpcStream` (§4.4). The
+        provider is pinned for the whole stream and the call is never retried;
+        dropping / ``close()``-ing the stream emits exactly one CANCEL.
+        Midstream errors classify through the ``org:`` vocabulary (the
+        :class:`OrgError` family), not the ``RpcError`` family. ``deadline_ms
+        == 0`` is the facade's 300 s default, never "none"; ``cancel_token ==
+        0`` means uncancellable (see :meth:`reserve_cancel_token`)."""
+        ...
+    def call_client_stream(
+        self, service: str, deadline_ms: int = ..., cancel_token: int = ...
+    ) -> "ClientStreamCall":
+        """Call a protected service with a STREAM OF REQUESTS and one terminal
+        response, over the existing :class:`ClientStreamCall` (§4.4). ``send``
+        pushes items (the signed opening rides the first), ``finish`` awaits the
+        terminal response. Same deadline / cancel-token / ``org:`` error
+        semantics as :meth:`call_streaming`."""
+        ...
+    def call_duplex(
+        self, service: str, deadline_ms: int = ..., cancel_token: int = ...
+    ) -> "DuplexCall":
+        """Call a protected service BIDIRECTIONALLY, over the existing
+        :class:`DuplexCall` (§4.4). Same deadline / cancel-token / ``org:``
+        error semantics as :meth:`call_streaming`."""
+        ...
+    def reserve_cancel_token(self) -> int:
+        """Reserve a cancel token for a subsequent streaming call — reserve
+        BEFORE the call, pass it as ``cancel_token=...``, fire it with
+        :meth:`cancel`."""
+        ...
+    def cancel(self, token: int) -> None:
+        """Cancel the one in-flight call bound to ``token``. Idempotent; a
+        no-op for ``0`` or an unused token. Never retries the call."""
+        ...
     @property
     def acting_org(self) -> bytes: ...
     @property
@@ -4848,6 +4889,52 @@ class OrgClient:
     def is_closed(self) -> bool: ...
     def close(self) -> None: ...
     def __enter__(self) -> "OrgClient": ...
+    def __exit__(self, *exc: object) -> bool: ...
+
+class AsyncOrgClient:
+    """The async caller half of the facade (§4.4): the async forms of
+    ``OrgClient``'s streaming verbs, returning awaitables that resolve to the
+    existing ``Async*`` handle classes.
+
+    Same authority semantics as :class:`OrgClient` — one plan per call, the
+    provider pinned, never retried, the facade's finite default lifetime when
+    ``deadline_ms == 0``, and midstream errors through the ``org:``
+    vocabulary. Cancellation is the asyncio story, at its exact levels:
+    ``task.cancel()`` (or ``asyncio.wait_for`` expiry) on any await of the
+    construction or of the returned handle fires the substrate's cancel token
+    — the per-stream cancel watcher tears the call down locally at once (the
+    response side EOFs while the handle lives) — and the WIRE CANCEL that
+    retires the provider-side call rides the handle's ``close()``/drop (the
+    per-shape Drop contract). Cancellation is never a handler-side event (see
+    ``_HANDLER_DROP_CONTRACT``). Deliberately no ``cancel_token`` parameter:
+    the bridge mints and owns the token. Teardown order: ``client.close()`` ->
+    ``serve_handle.close()`` -> ``mesh.shutdown()``."""
+
+    @staticmethod
+    def bind(mesh: Any, credentials: OrgCredentials) -> "AsyncOrgClient": ...
+    async def call_streaming(
+        self, service: str, request: bytes, deadline_ms: int = ...
+    ) -> "AsyncRpcStream":
+        """Await to open a protected streaming-response call."""
+        ...
+    async def call_client_stream(
+        self, service: str, deadline_ms: int = ...
+    ) -> "AsyncClientStreamCall":
+        """Await to open a protected client-streaming call."""
+        ...
+    async def call_duplex(
+        self, service: str, deadline_ms: int = ...
+    ) -> "AsyncDuplexCall":
+        """Await to open a protected duplex call."""
+        ...
+    @property
+    def acting_org(self) -> bytes: ...
+    @property
+    def caller(self) -> bytes: ...
+    @property
+    def is_closed(self) -> bool: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> "AsyncOrgClient": ...
     def __exit__(self, *exc: object) -> bool: ...
 
 class OrgServeHandle:
@@ -4875,6 +4962,80 @@ def serve_org(
     reply before returning an internal error to the caller; ``0`` means
     effectively infinite (no bound). The handler runs on a blocking thread and
     is not interrupted when the wait elapses (same as the nRPC handler)."""
+    ...
+
+_HANDLER_DROP_CONTRACT = """\
+**Handler-drop contract (Specification §2.2 — the F-S3.1-2 level).** A protected
+call runs under a per-call retire supervisor. On retirement — caller CANCEL or
+the caller handle's ``close()``/drop, the call deadline, revocation, session
+replacement, ``serve_handle.close()`` against an in-flight call, or node
+shutdown — the supervisor drops the handler future **without a final poll**.
+Cancellation is observed ONLY through the retirement observables (the request
+input fences to EOF where the shape has one; library-controlled sinks stop
+admitting output) and NEVER as a handler-side event: a ``def`` handler's
+blocking thread cannot be interrupted and runs to whatever point it reaches
+(its return value is discarded, its performed effects are not recalled); an
+``async def`` handler's coroutine MAY see ``asyncio.CancelledError`` at an
+``await`` as best-effort teardown machinery, but it may equally never be
+resumed to observe anything — never rely on it."""
+
+def serve_org_streaming(
+    mesh: Any,
+    service: str,
+    access: str,
+    handler: Callable[[dict, bytes, "ResponseSinkSend"], Any],
+    handler_timeout_ms: Optional[int] = ...,
+) -> OrgServeHandle:
+    """Serve a protected, privately-discoverable service whose response is a
+    STREAM (§4.4). ``access`` is ``"same_org"`` or ``"granted"``. The handler is
+    ``handler(caller: dict, request: bytes, sink: ResponseSinkSend) -> None``
+    (a ``def`` or an ``async def``): ``caller`` carries the five verified fields
+    plus ``is_same_org``, chunks go out through ``sink.send(bytes)``, and the
+    substrate emits the terminal frame at handler return. Raising surfaces as
+    an application error, never as an admission denial. A non-callable handler
+    is refused at registration.
+
+    ``handler_timeout_ms`` is ``serve_org``'s bounded wait (``0`` = effectively
+    infinite); the handler is not interrupted when it elapses.
+
+    """ + _HANDLER_DROP_CONTRACT + """
+
+    Diagnostics level: the ``RequestStreamRecv`` of the streaming org verbs
+    carries chunks + the retire signal only — its raw-transport diagnostic
+    getters (``caller_origin``, ``call_id``, ``deadline_ns``, ``headers``) are
+    unpopulated (0 / empty); attribution rides the verified ``caller`` dict."""
+    ...
+
+def serve_org_client_stream(
+    mesh: Any,
+    service: str,
+    access: str,
+    handler: Callable[[dict, "RequestStreamRecv"], bytes],
+    handler_timeout_ms: Optional[int] = ...,
+) -> OrgServeHandle:
+    """Serve a protected, privately-discoverable service with a STREAM OF
+    REQUESTS and one terminal response (§4.4). The handler is
+    ``handler(caller: dict, stream: RequestStreamRecv) -> bytes`` (a ``def`` or
+    an ``async def``): iterate ``stream`` to drain the upload — it fences to EOF
+    on retirement — and return the terminal response as ``bytes``. Same
+    registration / timeout / handler-drop contract and diagnostics level as
+    :func:`serve_org_streaming` (see ``_HANDLER_DROP_CONTRACT``)."""
+    ...
+
+def serve_org_duplex(
+    mesh: Any,
+    service: str,
+    access: str,
+    handler: Callable[[dict, "RequestStreamRecv", "ResponseSinkSend"], Any],
+    handler_timeout_ms: Optional[int] = ...,
+) -> OrgServeHandle:
+    """Serve a protected, privately-discoverable service BIDIRECTIONALLY
+    (§4.4). The handler is ``handler(caller: dict, stream: RequestStreamRecv,
+    sink: ResponseSinkSend) -> None`` (a ``def`` or an ``async def``): drain
+    ``stream``, emit through ``sink.send(bytes)``; the substrate emits the
+    terminal frame at handler return. Same registration / timeout /
+    handler-drop contract and diagnostics level as
+    :func:`serve_org_streaming` (see ``_HANDLER_DROP_CONTRACT``)."""
     ...
 
 def install_org_authority(mesh: Any, authority_dir: str) -> None:

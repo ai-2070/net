@@ -21,6 +21,14 @@ name = "_net"
 # cdylib; the rlib is a build artifact only.
 crate-type = ["cdylib", "rlib"]
 
+# The same-org live-scenario minter the Python witnesses shell out to
+# (tests/test_org_live.py). `required-features` keeps a featureless
+# `cargo test` from trying to compile it — it only exists over the
+# `org` SDK surface.
+[[example]]
+name = "gen_org_same_scenario"
+required-features = ["org"]
+
 [features]
 # Out-of-the-box `pip install net-mesh-sdk` ships the full
 # distributed-agent stack: mesh transport + NAT traversal +
