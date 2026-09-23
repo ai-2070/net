@@ -1,0 +1,22 @@
+net/crates/net/cli/tests/relay_join.rs
+  s_3f3d4c91f992be::t_901cbecff7327f 98-101,104,328-332,346-357
+  s_3f3d4c91f992be::t_bd6598ddff63f4 293-327,333-345,358
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_8d24895d41c4c0 2269-2303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "45001488ad9d270c8323d4cf4060ece9b1c876d9",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
