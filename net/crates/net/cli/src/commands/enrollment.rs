@@ -691,6 +691,7 @@ impl EnrollContext {
                 endpoint: endpoint.clone(),
                 relay: self.relay.clone(),
                 enrollment_key: self.key,
+                subnet: None,
                 relations: vec![Relation::Mesh],
                 intended_subject: intended,
                 policy,

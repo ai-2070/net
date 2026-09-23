@@ -148,6 +148,7 @@ impl Device {
                     registration: self.registration.id(),
                 }),
                 enrollment_key: self.service.enrollment_key(),
+                subnet: None,
                 relations: vec![Relation::Mesh],
                 intended_subject: None,
                 policy: InvitationPolicy::with_options(

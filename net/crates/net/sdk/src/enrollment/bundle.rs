@@ -220,6 +220,8 @@ pub struct MembershipBundle {
     receipt: MembershipReceipt,
     psk: Psk,
     contact: MeshContact,
+    /// Encoded `SubnetCredentialSet` for [`Relation::Subnet`] invites.
+    subnet: Option<Vec<u8>>,
 }
 
 impl core::fmt::Debug for MembershipBundle {
@@ -229,6 +231,7 @@ impl core::fmt::Debug for MembershipBundle {
             .field("psk", &"<redacted>")
             .field("trust_domain", &self.psk.trust_domain())
             .field("contact", &self.contact)
+            .field("subnet", &self.subnet.is_some())
             .finish()
     }
 }
@@ -240,7 +243,24 @@ impl MembershipBundle {
             receipt,
             psk,
             contact,
+            subnet: None,
         }
+    }
+
+    /// Attach the device's subnet credential set (for a subnet invite).
+    pub fn with_subnet_credentials(
+        mut self,
+        set: &net::adapter::net::subnet::SubnetCredentialSet,
+    ) -> Self {
+        self.subnet = Some(set.to_bytes());
+        self
+    }
+
+    /// The delivered subnet credential set, if this bundle carries one.
+    pub fn subnet_credentials(&self) -> Option<net::adapter::net::subnet::SubnetCredentialSet> {
+        self.subnet
+            .as_deref()
+            .and_then(|b| net::adapter::net::subnet::SubnetCredentialSet::from_bytes(b).ok())
     }
 
     /// Canonical bytes. **Secret** (contains the PSK).
@@ -259,6 +279,13 @@ impl MembershipBundle {
         out.extend_from_slice(&self.contact.noise_pubkey);
         out.extend_from_slice(&self.contact.node_id.to_le_bytes());
         super::invite::put_relay(&mut out, self.contact.relay.as_ref());
+        match &self.subnet {
+            Some(set) => {
+                out.push(1);
+                push_lp(&mut out, set);
+            }
+            None => out.push(0),
+        }
         out
     }
 
@@ -298,6 +325,22 @@ impl MembershipBundle {
         if addr.is_none() && relay.is_none() {
             return Err(BundleError::Malformed("contact has no address or relay"));
         }
+        let subnet = match r
+            .take_arr::<1>()
+            .ok_or(BundleError::Malformed("truncated bundle"))?[0]
+        {
+            0 => None,
+            1 => {
+                let bytes = r
+                    .take_lp()
+                    .ok_or(BundleError::Malformed("truncated bundle"))?
+                    .to_vec();
+                net::adapter::net::subnet::SubnetCredentialSet::from_bytes(&bytes)
+                    .map_err(|_| BundleError::Malformed("bad subnet credentials"))?;
+                Some(bytes)
+            }
+            _ => return Err(BundleError::Malformed("bad subnet flag")),
+        };
         if !r.done() {
             return Err(BundleError::Malformed("trailing bundle bytes"));
         }
@@ -310,6 +353,7 @@ impl MembershipBundle {
                 node_id,
                 relay,
             },
+            subnet,
         })
     }
 
@@ -323,7 +367,39 @@ impl MembershipBundle {
         self.receipt.verify_for(invite, intent)?;
         invite
             .check_trust_domain(self.psk.trust_domain())
-            .map_err(|_| BundleError::TrustDomain)
+            .map_err(|_| BundleError::TrustDomain)?;
+        self.verify_subnet_for(invite, intent)
+    }
+
+    /// The delivered subnet credentials must be exactly what the signed
+    /// offer names, for exactly this device: same authority, scope, epoch
+    /// and rights, subject = the intent's subject. A bundle for a subnet
+    /// invite without them, or one carrying them for any other invite, is
+    /// refused. (The credential chain's signatures are the verifier's to
+    /// check at admission; the device checks it is receiving what it was
+    /// offered.)
+    fn verify_subnet_for(
+        &self,
+        invite: &MembershipInvite,
+        intent: &RedemptionIntent,
+    ) -> Result<(), BundleError> {
+        match (invite.subnet(), self.subnet_credentials(), &self.subnet) {
+            (None, None, None) => Ok(()),
+            (Some(offer), Some(set), Some(_)) => {
+                let leaf = set.leaf();
+                let exact = leaf.authority == offer.scope.authority
+                    && leaf.scope == offer.scope.path
+                    && leaf.topology_epoch == offer.topology_epoch
+                    && leaf.rights == offer.rights
+                    && &leaf.subject == intent.subject();
+                if exact {
+                    Ok(())
+                } else {
+                    Err(BundleError::Mismatch("subnet credentials"))
+                }
+            }
+            _ => Err(BundleError::Mismatch("subnet credentials")),
+        }
     }
 
     /// The signed membership receipt.
@@ -348,6 +424,100 @@ pub struct MembershipIssuer {
     identity: Identity,
     psk: Psk,
     contact: MeshContact,
+    subnet: Option<SubnetLeafIssuer>,
+}
+
+/// Delegated subnet leaf issuance for [`Relation::Subnet`] invites: an
+/// issuer key under a root-signed `SubnetIssuerGrant`. The root never sits
+/// on the enrollment node; a leaf can never exceed the grant's envelope.
+#[derive(Clone)]
+pub struct SubnetLeafIssuer {
+    grant: net::adapter::net::subnet::SubnetIssuerGrant,
+    key: net::adapter::net::identity::EntityKeypair,
+    generation: u32,
+    lifetime_secs: u64,
+}
+
+impl core::fmt::Debug for SubnetLeafIssuer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SubnetLeafIssuer")
+            .field("issuer", &fingerprint(&self.grant.issuer))
+            .field("scope", &self.grant.scope)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl SubnetLeafIssuer {
+    /// Issue leaves as `key` under `grant` (the key must be the grant's
+    /// issuer), at `generation`, each valid for at most `lifetime_secs`
+    /// and never beyond the grant.
+    pub fn new(
+        grant: net::adapter::net::subnet::SubnetIssuerGrant,
+        key: net::adapter::net::identity::EntityKeypair,
+        generation: u32,
+        lifetime_secs: u64,
+    ) -> Result<Self, &'static str> {
+        if key.entity_id() != &grant.issuer {
+            return Err("the issuer key is not the issuer the grant names");
+        }
+        if lifetime_secs == 0 {
+            return Err("leaf lifetime must be positive");
+        }
+        Ok(Self {
+            grant,
+            key,
+            generation,
+            lifetime_secs,
+        })
+    }
+
+    /// Whether `offer` lies inside this issuer's envelope (authority,
+    /// epoch, scope within the grant's subtree, rights within its ceiling).
+    pub fn covers(&self, offer: &super::invite::SubnetOffer) -> bool {
+        offer.scope.authority == self.grant.authority
+            && offer.topology_epoch == self.grant.topology_epoch
+            && self.grant.scope.is_ancestor_or_self_of(offer.scope.path)
+            && self.grant.maximum_rights.contains(offer.rights)
+    }
+
+    /// The issuer grant (for display and status).
+    pub fn grant(&self) -> &net::adapter::net::subnet::SubnetIssuerGrant {
+        &self.grant
+    }
+
+    fn issue(
+        &self,
+        offer: &super::invite::SubnetOffer,
+        subject: &EntityId,
+        now: u64,
+    ) -> Result<net::adapter::net::subnet::SubnetCredentialSet, Refusal> {
+        if !self.covers(offer) {
+            return Err(Refusal::Unavailable);
+        }
+        let not_before = now.saturating_sub(60).max(self.grant.not_before);
+        let remaining = self.grant.not_after.saturating_sub(not_before);
+        let duration = self.lifetime_secs.min(remaining);
+        if duration == 0 {
+            return Err(Refusal::Unavailable);
+        }
+        let leaf = net::adapter::net::subnet::SubnetGrant::try_issue(
+            &self.key,
+            offer.scope.authority.clone(),
+            offer.scope.path,
+            offer.topology_epoch,
+            subject.clone(),
+            offer.rights,
+            self.generation,
+            not_before,
+            duration,
+        )
+        .map_err(|_| Refusal::Unavailable)?;
+        Ok(net::adapter::net::subnet::SubnetCredentialSet::OneHop {
+            issuer_grant: self.grant.clone(),
+            leaf,
+        })
+    }
 }
 
 impl core::fmt::Debug for MembershipIssuer {
@@ -367,7 +537,14 @@ impl MembershipIssuer {
             identity,
             psk,
             contact,
+            subnet: None,
         }
+    }
+
+    /// Also issue subnet credentials for [`Relation::Subnet`] invites.
+    pub fn with_subnet_issuer(mut self, issuer: SubnetLeafIssuer) -> Self {
+        self.subnet = Some(issuer);
+        self
     }
 
     fn check(&self, invite: &MembershipInvite) -> Result<(), Refusal> {
@@ -389,8 +566,16 @@ impl BundleIssuer for MembershipIssuer {
         invite
             .check_trust_domain(self.psk.trust_domain())
             .map_err(|_: InviteError| Refusal::Unavailable)?;
-        let receipt = MembershipReceipt::sign(&self.identity, invite, intent, now_unix());
-        Ok(MembershipBundle::new(receipt, self.psk.clone(), self.contact.clone()).to_bytes())
+        let now = now_unix();
+        let receipt = MembershipReceipt::sign(&self.identity, invite, intent, now);
+        let mut bundle = MembershipBundle::new(receipt, self.psk.clone(), self.contact.clone());
+        if let Some(offer) = invite.subnet() {
+            // A subnet invite without a configured leaf issuer cannot be
+            // honoured; refuse rather than deliver a partial bundle.
+            let issuer = self.subnet.as_ref().ok_or(Refusal::Unavailable)?;
+            bundle = bundle.with_subnet_credentials(&issuer.issue(offer, intent.subject(), now)?);
+        }
+        Ok(bundle.to_bytes())
     }
 
     fn may_recover(

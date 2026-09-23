@@ -1879,6 +1879,55 @@ Regressions:
 - Clippy (all-features all-targets, lib/bins, default; `net-cli`) and rustdoc
   are clean. `large_enum_variant` was fixed by boxing the `Present` payload.
 
+#### V3-2 S2 — the subnet relation and delegated issuance (receipt, 2026-09-23)
+
+**Invite.**
+- New `Relation::Subnet` (tag 2) and a signed `SubnetOffer`: the
+  authority-qualified scope, the topology epoch, and strict rights.
+- The offer exists **exactly** when the relation does; this is checked at
+  signing and at decoding.
+- The format is unreleased and was changed in place.
+
+**Bundle.**
+- Optionally carries the device's encoded `SubnetCredentialSet`.
+- `verify_for` now also requires the delivered leaf to match the offer
+  exactly: authority, scope, epoch, rights, and subject equal to the intent's
+  subject.
+- It refuses missing credentials for a subnet invite, and any credentials for
+  a mesh-only invite.
+- The chain's signatures remain the verifier's to check at admission.
+
+**Issuance.** `SubnetLeafIssuer` holds a root-signed `SubnetIssuerGrant`, the
+issuer key (which must be the issuer the grant names), a generation, and a
+leaf lifetime.
+- `covers(offer)` checks authority, epoch, the subtree and the rights ceiling.
+- `MembershipIssuer::with_subnet_issuer` issues a **one-hop** set for exactly
+  the redeeming device, never valid beyond the grant.
+- A subnet invite without a configured issuer, or outside its envelope, is
+  refused `Unavailable` rather than issued as a partial bundle.
+
+Witnesses, `sdk/tests/enrollment_subnet.rs` 4/4 (the SDK job auto-discovers
+it):
+- The offer is signed; relation and offer must agree; widening the rights
+  breaks the signature.
+- Issuance for exactly this device, whose chain passes the core
+  `verify_credential_set` against the root.
+- The device refuses another scope, another subject, wider rights, missing
+  credentials, and credentials smuggled into a mesh-only bundle.
+- The issuer cannot exceed its grant (subtree, ceiling, key identity).
+
+Inverse mutations, 4 of 4 caught and restored:
+- the device accepting any credentials;
+- the device ignoring the leaf subject;
+- the issuer ignoring its rights ceiling;
+- relation and offer consistency unchecked at signing.
+
+Regressions:
+- The full SDK suite as CI runs it: 810/810.
+- `net-cli` 350/350.
+- Clippy (SDK `full` all-targets, SDK `net` lib, `net-cli`) and SDK rustdoc
+  are clean.
+
 ### V3-2A — channel-scoped invitation, join and credential lifecycle
 
 **Modify:** `src/adapter/net/mesh.rs` for exact publish-chain/cache lifecycle hooks; `sdk/src/identity.rs` to expose the canonical `TokenChain`; `sdk/src/mesh.rs` for a full-chain subscribe path; shared enrollment/persistence modules; `cli/src/commands/channel.rs`, `main.rs`, `context.rs`, `config.rs`; and the selected durable authority/runtime control owner. Modify `identity/token.rs` or `channel/config.rs` only for a separately source-proven gap.

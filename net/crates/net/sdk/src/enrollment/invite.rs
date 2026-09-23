@@ -56,6 +56,7 @@ const SCOPE_DIGEST_CONTEXT: &str = "net-mesh membership invite scope v1";
 const INTENT_DIGEST_CONTEXT: &str = "net-mesh membership redemption intent v1";
 
 const TAG_MESH: u8 = 1;
+const TAG_SUBNET: u8 = 2;
 
 /// Payload-free invite/intent failures. None echoes bearer material.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -111,18 +112,25 @@ pub enum Relation {
     /// Membership-only device association with the issuer's mesh. Grants no
     /// delegation, invocation, management, organization, channel or subnet right.
     Mesh,
+    /// Endpoint attachment to one authority-qualified subnet scope with the
+    /// exact rights of the invite's signed [`SubnetOffer`], delivered as a
+    /// delegated credential set for this device only. Independent of mesh
+    /// membership: it grants nothing outside that scope.
+    Subnet,
 }
 
 impl Relation {
     fn tag(self) -> u8 {
         match self {
             Self::Mesh => TAG_MESH,
+            Self::Subnet => TAG_SUBNET,
         }
     }
 
     fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             TAG_MESH => Some(Self::Mesh),
+            TAG_SUBNET => Some(Self::Subnet),
             _ => None,
         }
     }
@@ -284,6 +292,69 @@ pub(super) fn take_relay(r: &mut Reader<'_>) -> Result<Option<RelayLocator>, Inv
     }))
 }
 
+/// The subnet attachment an invite offers (with [`Relation::Subnet`]):
+/// exactly one authority-qualified scope, its topology epoch and the rights
+/// the delivered credential will carry. Signed with the rest of the invite.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubnetOffer {
+    /// Authority-qualified scope attached to.
+    pub scope: net::adapter::net::subnet::SubnetRef,
+    /// Topology epoch the credential is minted under.
+    pub topology_epoch: u32,
+    /// Rights the credential carries; strict and non-empty.
+    pub rights: net::adapter::net::subnet::SubnetRights,
+}
+
+fn put_subnet_offer(out: &mut Vec<u8>, offer: Option<&SubnetOffer>) {
+    match offer {
+        Some(o) => {
+            out.push(1);
+            out.extend_from_slice(o.scope.authority.as_bytes());
+            out.extend_from_slice(&o.scope.path.raw().to_le_bytes());
+            out.extend_from_slice(&o.topology_epoch.to_le_bytes());
+            out.push(o.rights.bits());
+        }
+        None => out.push(0),
+    }
+}
+
+fn take_subnet_offer(r: &mut Reader<'_>) -> Result<Option<SubnetOffer>, InviteError> {
+    let t = InviteError::Malformed("truncated");
+    match r.take_arr::<1>().ok_or(t.clone())?[0] {
+        0 => Ok(None),
+        1 => {
+            let authority = EntityId::from_bytes(r.take_arr::<32>().ok_or(t.clone())?);
+            let path = u32::from_le_bytes(r.take_arr::<4>().ok_or(t.clone())?);
+            let topology_epoch = u32::from_le_bytes(r.take_arr::<4>().ok_or(t.clone())?);
+            let rights = net::adapter::net::subnet::SubnetRights::try_from_bits(
+                r.take_arr::<1>().ok_or(t)?[0],
+            )
+            .map_err(|_| InviteError::Malformed("bad subnet rights"))?;
+            Ok(Some(SubnetOffer {
+                scope: net::adapter::net::subnet::SubnetRef {
+                    authority,
+                    path: net::adapter::net::subnet::TopologySubnetId::from_raw(path),
+                },
+                topology_epoch,
+                rights,
+            }))
+        }
+        _ => Err(InviteError::Malformed("bad subnet offer flag")),
+    }
+}
+
+/// A subnet offer exists exactly when the relation set names
+/// [`Relation::Subnet`].
+fn check_subnet_offer(
+    relations: &[Relation],
+    offer: Option<&SubnetOffer>,
+) -> Result<(), InviteError> {
+    if relations.contains(&Relation::Subnet) != offer.is_some() {
+        return Err(InviteError::Relations("subnet relation and offer disagree"));
+    }
+    Ok(())
+}
+
 /// X25519 Noise static public key of the enrollment responder. The device runs a
 /// PSK-free Noise handshake that authenticates the responder by this key, so a
 /// clean device can reach the issuer before holding the mesh PSK. Not secret.
@@ -310,6 +381,9 @@ pub struct InviteSpec {
     pub relay: Option<RelayLocator>,
     /// Noise static key the enrollment responder must prove, on either path.
     pub enrollment_key: EnrollmentKey,
+    /// The subnet attachment offered; required exactly when `relations`
+    /// names [`Relation::Subnet`].
+    pub subnet: Option<SubnetOffer>,
     /// Exact authorized relations (canonical order).
     pub relations: Vec<Relation>,
     /// Optional full device identity; `None` makes the link bearer authorization.
@@ -327,6 +401,7 @@ pub struct MembershipInvite {
     endpoint: Option<EnrollmentEndpoint>,
     relay: Option<RelayLocator>,
     enrollment_key: EnrollmentKey,
+    subnet: Option<SubnetOffer>,
     invitation_id: InvitationId,
     policy: InvitationPolicy,
     intended_subject: Option<EntityId>,
@@ -344,6 +419,7 @@ impl core::fmt::Debug for MembershipInvite {
             .field("trust_domain", &self.trust_domain)
             .field("endpoint", &self.endpoint.as_ref().map(|e| e.as_str()))
             .field("relay", &self.relay)
+            .field("subnet", &self.subnet)
             .field("enrollment_key", &self.enrollment_key)
             .field("invitation_id", &"<redacted>")
             .field("policy", &self.policy)
@@ -367,6 +443,7 @@ impl MembershipInvite {
         if spec.endpoint.is_none() && spec.relay.is_none() {
             return Err(InviteError::Endpoint("no direct endpoint or relay"));
         }
+        check_subnet_offer(&spec.relations, spec.subnet.as_ref())?;
         let invitation_id = InvitationId::random().map_err(|_| InviteError::Random)?;
         let mut body = Vec::new();
         body.extend_from_slice(&INVITE_MAGIC);
@@ -375,6 +452,7 @@ impl MembershipInvite {
         body.extend_from_slice(spec.trust_domain.as_bytes());
         put_opt_endpoint(&mut body, spec.endpoint.as_ref());
         put_relay(&mut body, spec.relay.as_ref());
+        put_subnet_offer(&mut body, spec.subnet.as_ref());
         body.extend_from_slice(&spec.enrollment_key.0);
         body.extend_from_slice(invitation_id.as_bytes());
         body.extend_from_slice(&spec.policy.created_at().to_le_bytes());
@@ -403,6 +481,7 @@ impl MembershipInvite {
             endpoint: spec.endpoint,
             relay: spec.relay,
             enrollment_key: spec.enrollment_key,
+            subnet: spec.subnet,
             invitation_id,
             policy: spec.policy,
             intended_subject: spec.intended_subject,
@@ -439,6 +518,7 @@ impl MembershipInvite {
         if endpoint.is_none() && relay.is_none() {
             return Err(InviteError::Endpoint("no direct endpoint or relay"));
         }
+        let subnet = take_subnet_offer(&mut r)?;
         let enrollment_key = EnrollmentKey(r.take_arr::<32>().ok_or(t.clone())?);
         let invitation_id = InvitationId::from_bytes(r.take_arr::<16>().ok_or(t.clone())?);
         let created = r.take_u64().ok_or(t.clone())?;
@@ -456,6 +536,7 @@ impl MembershipInvite {
             _ => return Err(InviteError::Malformed("bad intended-subject flag")),
         };
         let relations = take_relations(&mut r)?;
+        check_subnet_offer(&relations, subnet.as_ref())?;
         if !r.done() {
             return Err(InviteError::Malformed("trailing bytes"));
         }
@@ -471,6 +552,7 @@ impl MembershipInvite {
             endpoint,
             relay,
             enrollment_key,
+            subnet,
             invitation_id,
             policy,
             intended_subject,
@@ -545,6 +627,11 @@ impl MembershipInvite {
     /// Direct redemption endpoint, if the issuer knew one.
     pub fn endpoint(&self) -> Option<&EnrollmentEndpoint> {
         self.endpoint.as_ref()
+    }
+
+    /// The subnet attachment offered, with [`Relation::Subnet`].
+    pub fn subnet(&self) -> Option<&SubnetOffer> {
+        self.subnet.as_ref()
     }
 
     /// Blind relay to fall back to when the direct endpoint is unreachable.

@@ -47,6 +47,7 @@ fn invite_for(
             endpoint: Some(EnrollmentEndpoint::parse(endpoint).unwrap()),
             relay: None,
             enrollment_key: key,
+            subnet: None,
             relations: vec![Relation::Mesh],
             intended_subject: None,
             policy: InvitationPolicy::with_options(
