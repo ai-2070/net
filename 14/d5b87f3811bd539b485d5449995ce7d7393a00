@@ -1,0 +1,34 @@
+.claude/skills/net-event-bus/examples/net_org_streaming.c
+  h_64425bc75e3f3d 58,60,112-120,207-209,211-213,343-346,348,367-375,378-394
+go/mesh_rpc.go
+  h_64425bc75e3f3d 971-984,1108-1114,1286,1586-1588,1673,1713,1766-1768,1846,1868,1898,1943-1947,1951-1955,1981-1983,2008,2035,2055-2057,2090,2565-2654
+go/org.go
+  h_64425bc75e3f3d 133-198,208-220,238-245,809-918,1167-1609
+go/org_test.go
+  h_64425bc75e3f3d 4-9,14,16,18-19,21-22,24,190-799
+net/crates/net/Cargo.lock
+  h_64425bc75e3f3d 3460
+net/crates/net/bindings/go/net-ffi/exports.baseline
+  h_64425bc75e3f3d 4,7,11,271,382-383,385,398-399,403,405-406,408
+net/crates/net/bindings/go/org-ffi/Cargo.toml
+  h_64425bc75e3f3d 62-67
+net/crates/net/bindings/go/org-ffi/src/lib.rs
+  h_64425bc75e3f3d 79,81,87-93,200,202-215,615,664,1206-2012,2485-2492,2494-2499
+net/crates/net/bindings/go/rpc-ffi/src/handles.rs
+  h_64425bc75e3f3d 1-315
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  h_64425bc75e3f3d 63,67-79,455,668,724,1023,1073,1325-1326,1375,1382,1445,1452,1508,1515,1587,1680-1681,1731,1738,1788,1795,1849,1905,1965-1967,2012-2016,2023,2073,2080,2121,2156,2207,2278-2280,2355,2389,2466,2582,2640,2697,2704,2767,2774,2883-2884,2948,3022,3034,3089,3137-3138,3147,3180,3314,3319,3356,4052,4058,4060,4067,4072,4077,4292,4437,4464,4481,4763
+net/crates/net/include/net_org.h
+  h_64425bc75e3f3d 14-16,114-125,177-195,197-202,331-378,423-482,500-518
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "14d5b87f3811bd539b485d5449995ce7d7393a00",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
