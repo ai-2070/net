@@ -518,7 +518,14 @@ def cell_midstream(sc: _Scenario) -> dict:
         def handler(caller: dict, request: bytes, sink) -> None:
             seen["facts"] = caller
             sink.send(b"first")
-            time.sleep(6)  # hold the call past the caller's 1.5 s deadline
+            # Inducement: the handler's own mid-stream failure = the stream's
+            # final error. (The deadline-retirement variant — sleep past the
+            # caller's 1.5 s deadline — is blocked by the F-S4B-7 core gap:
+            # CallOptions::deadline does not terminate an in-flight stream.
+            # Both variants assert the SAME property: a midstream terminal
+            # surfaces as the org:rpc: vocabulary, never a false clean EOF.
+            # Main takeover fix — F-S4PySdk-6.)
+            raise RuntimeError("midstream inducement")
 
         handle = org.serve_org_streaming(pair.provider, svc, sc.kind, handler, None)
         client = _bind(sc, pair.caller)

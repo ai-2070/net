@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="2.543" timestamp="2026-09-24T01:07:09.196296+02:00" hostname="DESKTOP-DBV2TLT"><testcase classname="tests.test_org_streaming" name="test_streaming_midstream_error_surfaces_the_org_vocabulary" time="2.411" /></testsuite></testsuites>

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="3.034" timestamp="2026-09-24T01:14:04.990853+02:00" hostname="DESKTOP-DBV2TLT"><testcase classname="tests.test_org_streaming" name="test_streaming_midstream_error_surfaces_the_org_vocabulary" time="2.396"><failure message="AssertionError: consumer cell 'midstream' (same_org) failed (exit 1)&#10;  --- stdout ---&#10;  &#10;  --- stderr ---&#10;  Traceback (most recent call last):&#10;    File &quot;C:\Users\chief\orca\workspaces\net\org-streaming\net\crates\net\sdk-py\examples\org_streaming_consumer.py&quot;, line 734, in &lt;module&gt;&#10;      sys.exit(main())&#10;    File &quot;C:\Users\chief\orca\workspaces\net\org-streaming\net\crates\net\sdk-py\examples\org_streaming_consumer.py&quot;, line 728, in main&#10;      result = _CELLS[args.cell](sc)&#10;    File &quot;C:\Users\chief\orca\workspaces\net\org-streaming\net\crates\net\sdk-py\examples\org_streaming_consumer.py&quot;, line 548, in cell_midstream&#10;      assert isinstance(exc, org.OrgError), (&#10;  AssertionError: org handles must surface the mirrored org: vocabulary, got OrgError: org:rpc:server_error: rpc: server returned status 0x8001: org streaming handler raised: RuntimeError: midstream inducement&#10;  &#10;assert (1 == 0)&#10; +  where 1 = CompletedProcess(args=['C:\\Users\\chief\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.10_qbz5n2kfra8p0\\python.exe', 'C:\\Users\\chief\\orca\\workspaces\\net\\org-streaming\\net\\crates\\net\\sdk-py\\examples\\org_streaming_consumer.py', '--scenario-dir', 'C:\\Users\\chief\\AppData\\Local\\Temp\\s4pysdk-same_org-7c15ebad7a114ff1b9f3c2917a47a2e5', '--kind', 'same_org', '--cell', 'midstream'], returncode=1, stdout='', stderr='Traceback (most recent call last):\n  File &quot;C:\\Users\\chief\\orca\\workspaces\\net\\org-streaming\\net\\crates\\net\\sdk-py\\examples\\org_streaming_consumer.py&quot;, line 734, in &lt;module&gt;\n    sys.exit(main())\n  File &quot;C:\\Users\\chief\\orca\\workspaces\\net\\org-streaming\\net\\crates\\net\\sdk-py\\examples\\org_streaming_consumer.py&quot;, line 728, in main\n    result = _CELLS[args.cell](sc)\n  File &quot;C:\\Users\\chief\\orca\\workspaces\\net\\org-streaming\\net\\crates\\net\\sdk-py\\examples\\org_streaming_consumer.py&quot;, line 548, in cell_midstream\n    assert isinstance(exc, org.OrgError), (\nAssertionError: org handles must surface the mirrored org: vocabulary, got OrgError: org:rpc:server_error: rpc: server returned status 0x8001: org streaming handler raised: RuntimeError: midstream inducement\n').returncode">scenarios = {'granted': &lt;test_org_streaming._Scenario object at 0x0000028E72DC46A0&gt;, 'same_org': &lt;test_org_streaming._Scenario object at 0x0000028E72DC4700&gt;}
+
+    @pytest.mark.timeout(600)
+    def test_streaming_midstream_error_surfaces_the_org_vocabulary(scenarios) -&gt; None:
+        sc = scenarios["same_org"]
+&gt;       payload = _run_consumer("midstream", sc)
+
+tests\test_org_streaming.py:326: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+cell = 'midstream'
+sc = &lt;test_org_streaming._Scenario object at 0x0000028E72DC4700&gt;
+
+    def _run_consumer(cell: str, sc: _Scenario) -&gt; dict:
+        """Run one live two-mesh cell through the ``net_sdk``-only consumer and
+        return its ``CELL_OK`` payload. The consumer's own named assertions fire
+        first (its traceback is quoted verbatim into the failure below)."""
+        result = subprocess.run(
+            [
+                sys.executable, str(_CONSUMER),
+                "--scenario-dir", sc.outdir,
+                "--kind", sc.kind,
+                "--cell", cell,
+            ],
+            env=_child_env(),
+            capture_output=True,
+            text=True,
+            timeout=540,
+        )
+        ok_lines = [
+            line for line in result.stdout.splitlines() if line.startswith("CELL_OK ")
+        ]
+&gt;       assert result.returncode == 0 and ok_lines, (
+            f"consumer cell {cell!r} ({sc.kind}) failed (exit {result.returncode})\n"
+            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        )
+E       AssertionError: consumer cell 'midstream' (same_org) failed (exit 1)
+E         --- stdout ---
+E         
+E         --- stderr ---
+E         Traceback (most recent call last):
+E           File "C:\Users\chief\orca\workspaces\net\org-streaming\net\crates\net\sdk-py\examples\org_streaming_consumer.py", line 734, in &lt;module&gt;
+E             sys.exit(main())
+E           File "C:\Users\chief\orca\workspaces\net\org-streaming\net\crates\net\sdk-py\examples\org_streaming_consumer.py", line 728, in main
+E             result = _CELLS[args.cell](sc)
+E           File "C:\Users\chief\orca\workspaces\net\org-streaming\net\crates\net\sdk-py\examples\org_streaming_consumer.py", line 548, in cell_midstream
+E             assert isinstance(exc, org.OrgError), (
+E         AssertionError: org handles must surface the mirrored org: vocabulary, got OrgError: org:rpc:server_error: rpc: server returned status 0x8001: org streaming handler raised: RuntimeError: midstream inducement
+E         
+E       assert (1 == 0)
+E        +  where 1 = CompletedProcess(args=['C:\\Users\\chief\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.10_qbz5n2kfra8p0\\python.exe', 'C:\\Users\\chief\\orca\\workspaces\\net\\org-streaming\\net\\crates\\net\\sdk-py\\examples\\org_streaming_consumer.py', '--scenario-dir', 'C:\\Users\\chief\\AppData\\Local\\Temp\\s4pysdk-same_org-7c15ebad7a114ff1b9f3c2917a47a2e5', '--kind', 'same_org', '--cell', 'midstream'], returncode=1, stdout='', stderr='Traceback (most recent call last):\n  File "C:\\Users\\chief\\orca\\workspaces\\net\\org-streaming\\net\\crates\\net\\sdk-py\\examples\\org_streaming_consumer.py", line 734, in &lt;module&gt;\n    sys.exit(main())\n  File "C:\\Users\\chief\\orca\\workspaces\\net\\org-streaming\\net\\crates\\net\\sdk-py\\examples\\org_streaming_consumer.py", line 728, in main\n    result = _CELLS[args.cell](sc)\n  File "C:\\Users\\chief\\orca\\workspaces\\net\\org-streaming\\net\\crates\\net\\sdk-py\\examples\\org_streaming_consumer.py", line 548, in cell_midstream\n    assert isinstance(exc, org.OrgError), (\nAssertionError: org handles must surface the mirrored org: vocabulary, got OrgError: org:rpc:server_error: rpc: server returned status 0x8001: org streaming handler raised: RuntimeError: midstream inducement\n').returncode
+
+tests\test_org_streaming.py:211: AssertionError</failure></testcase></testsuite></testsuites>

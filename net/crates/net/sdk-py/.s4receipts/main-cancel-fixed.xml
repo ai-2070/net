@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="8.331" timestamp="2026-09-24T01:06:18.560731+02:00" hostname="DESKTOP-DBV2TLT"><testcase classname="tests.test_org_streaming" name="test_task_cancel_propagates_to_retirement_observables" time="8.050" /></testsuite></testsuites>

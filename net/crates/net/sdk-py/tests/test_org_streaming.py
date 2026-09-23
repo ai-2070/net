@@ -347,7 +347,11 @@ def test_task_cancel_propagates_to_retirement_observables(scenarios) -> None:
     observability through the ``net_sdk`` facade: all three must arrive."""
     sc = scenarios["same_org"]
     payload = _run_consumer("cancel", sc)
-    assert payload == {
+    # The consumer's CELLOK envelope carries `cell`/`kind` metadata beside the
+    # links (established across every cell); the contract claim is the links
+    # themselves. (Main takeover fix — F-S4PySdk-5: the links-only expectation
+    # against the envelope; the three links matched exactly as designed.)
+    assert {k: v for k, v in payload.items() if k.startswith("link")} == {
         "link1": "CancelledError",
         "link2": "drain_ended",
         "link3": "input_eof",

@@ -256,4 +256,100 @@ should fail-vs-stall under concurrent mesh load is a substrate question
 
 ### 8.5.7 F16 size+sha ledger + delivery notes
 
-PENDING-F16
+PENDING-F16 (superseded by §9 — see the Main-takeover ledger below).
+
+## 9. Main takeover — the remaining run (executed)
+
+*Fills 8.5.3 (witnesses/counts), 8.5.4 (inverse receipts) and 8.5.7 (the F16
+ledger + delivery notes). The owner ordered "do the remaining run"; `S4PySdk`
+stood down with its pin data and its work durable at `46d640fb8`. Everything
+in §9 is Main-executed at the tree head after that commit.*
+
+### 9.1 Witnesses and counts (8.5.3) — 15/15 green
+
+Final acceptance run: **15 passed in 24.13s** (`.s4receipts/main-acceptance-15.xml`,
+`main-acceptance-15.log`). The 15 items = the 6 matrix functions ×
+`[same_org|granted]` + `test_unary_call_and_serve_preserved_through_net_sdk` +
+`test_streaming_midstream_error_surfaces_the_org_vocabulary` +
+`test_task_cancel_propagates_to_retirement_observables` (9 base names; the
+parametrize pair `"same_org"`/`"granted"`). Run history (all xmls durable in
+`.s4receipts/`): `S4PySdk`'s part1B 327/327 + part2 6/6 + batch1 (2 pass + 1
+load-flake re-run isolated green) + its rest12 partial (exit 255 at the
+midstream row); Main's full-15 (12 pass + 3 classified below); the isolated
+classification runs; the three receipt cycles; the acceptance run.
+
+**Findings from the takeover (state, not decide):**
+
+- **F-S4PySdk-4 (confirmed)** — the load-flake: `stream_sync[same_org]` fails
+  under concurrent mesh load with `org:rpc:server_error: rpc: server returned
+  status 0x0006: response pump failed`, passes isolated in 2.58s/15s (twice).
+  Substrate-level; recorded.
+- **F-S4PySdk-5 (fixed here)** — the cancel row's expected dict was
+  links-only (`link1..3`) while the consumer's CELLOK envelope carries
+  `cell`/`kind` metadata (established across every cell). **The three contract
+  links matched exactly as designed** (`CancelledError` → `drain_ended` →
+  `input_eof`); the assertion now pins the links (`{k: v for k, v in
+  payload.items() if k.startswith("link")}`), not the envelope.
+- **F-S4PySdk-6 (fixed here; core-adjacent)** — `cell_midstream`'s
+  inducement was *deadline retirement* (`time.sleep(6)` past the caller's 1.5 s
+  deadline, then await the final error), which hangs because of the recorded
+  **F-S4B-7 core gap** (`CallOptions::deadline` never terminates an in-flight
+  native stream — owner-bound, `R4COREFIX.md` finding 8's sibling). The cell
+  now re-induces via the handler's own mid-stream failure (the SAME asserted
+  property: a midstream terminal surfaces as the `org:rpc:` vocabulary, never a
+  false clean EOF, never an admission denial). The deadline-retirement variant
+  returns when F-S4B-7 is fixed.
+
+### 9.2 Inverse receipts (8.5.4) — three, raw, all executed
+
+Each: mutation applied at the production site → the NAMED row RED verbatim →
+byte-identical restore (backup-copy equality) → the same rows GREEN. The
+production site for these receipts is the **installed** `net_sdk.org`
+(`site-packages/.../net_sdk/org/__init__.py`) — the consumer subprocess
+imports the installed package, not the tree (verified: `import net_sdk` →
+site-packages; an editable install attempt broke the environment and was
+rolled back — `pip uninstall` + `--force-reinstall --no-deps .` → the
+known-good row green again before any receipt ran).
+
+- **R1 — matrix payload** (`call_streaming`'s request forwarding,
+  `:156-158`): `service, request, deadline_ms, cancel_token` → `service,
+  b"MUTATED_R1", ...`. RED: `test_org_streaming_sync_call_and_serve[same_org]`
+  FAILED (the chunk-echo assertion — the handler echoes the request in the
+  chunk names). The async sibling PASSES under the same mutation (its cell
+  does not echo the request — recorded as the receipt's exact scope). GREEN:
+  both rows PASS.
+- **R3 — unary payload** (`call`'s body under the *"…never retries."* docstring
+  tail — the `TypedOrgClient.call` twin shares the body line, so the tail is
+  the disambiguator, as pinned): `self.raw.call(service, request)` →
+  `self.raw.call(service, b"MUTATED_R3")`. RED:
+  `test_unary_call_and_serve_preserved_through_net_sdk` FAILED. GREEN: PASS.
+- **R2 — mirror identity** (the `OrgError` import line `:55`): the import →
+  `OrgError as _RealOrgError` + an EOF-appended `class OrgError(Exception)`
+  lookalike. RED: `test_streaming_midstream_error_surfaces_the_org_vocabulary`
+  FAILED (the class-identity assertion — the raised exception is the binding's
+  class, the check uses the lookalike). GREEN: PASS.
+
+### 9.3 F16 ledger + delivery notes (8.5.7)
+
+Sizes+shas recorded in the `S4PySdk:` commit message for: the two takeover
+edits (`tests/test_org_streaming.py`, `examples/org_streaming_consumer.py`),
+this report, and the `.s4receipts/` xmls (`main-acceptance-15.xml`,
+`main-isolated-{1,2b,3}-*.xml`, `main-r-{r1,r3,r2}-{red,green}.xml`,
+`main-cancel-fixed.xml`, `main-midstream-fixed.xml`, `main-editable.log`,
+`m-{un,re,knowngood}.log`, `installed-org-init.bak`).
+
+Delivery notes: `S4PySdk`'s delivery stands (the facade, the consumer, the
+15-row matrix design, the receipts' pinned sites, the pin data, the F-S4PySdk-4
+discipline) at `46d640fb8` + its receipt xmls; its uncommitted tail (the rows,
+receipts, fills, commits) is this §9, executed by Main under the owner's
+"do the remaining run" order after its stand-down. Pin data for `ci.yml:4112`:
+**15 items / 9 names** (`test_org_streaming_sync_call_and_serve`,
+`test_org_streaming_async_call_and_serve`,
+`test_org_client_stream_sync_call_and_serve`,
+`test_org_client_stream_async_call_and_serve`,
+`test_org_duplex_sync_call_and_serve`,
+`test_org_duplex_async_call_and_serve`,
+`test_unary_call_and_serve_preserved_through_net_sdk`,
+`test_streaming_midstream_error_surfaces_the_org_vocabulary`,
+`test_task_cancel_propagates_to_retirement_observables`;
+parametrize pair `"same_org"`/`"granted"`) + floor 15.
