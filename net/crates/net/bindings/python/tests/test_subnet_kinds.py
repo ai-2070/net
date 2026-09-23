@@ -39,6 +39,7 @@ def test_fixture_has_the_frozen_shape() -> None:
         "gateway_advertisement",
         "export_policy",
         "revocation_floor",
+        "subject_floor",
     ]
     assert f["access"] == ["sameOrg", "granted"]
 

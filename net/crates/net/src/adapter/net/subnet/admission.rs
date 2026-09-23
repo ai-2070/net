@@ -223,6 +223,40 @@ impl SubnetContextStore {
         stale.len()
     }
 
+    /// Drop only `subject`'s contexts under `authority` that a subject
+    /// floor now covers (attachment at/under a floored scope, for a
+    /// right the context holds). Every other peer's context — every
+    /// sibling — is left exactly as it was: no re-admission, no churn.
+    /// Returns how many were dropped.
+    pub fn invalidate_subject(
+        &self,
+        authority: &EntityId,
+        subject: &EntityId,
+        floors: &super::auth::SubnetFloorRegistry,
+    ) -> usize {
+        let stale: Vec<u64> = self
+            .by_peer
+            .iter()
+            .filter(|e| {
+                let c = e.value();
+                &c.authority == authority
+                    && &c.subject == subject
+                    && floors.subject_covers(
+                        authority,
+                        c.topology_epoch,
+                        subject,
+                        c.attachment,
+                        c.rights,
+                    )
+            })
+            .map(|e| *e.key())
+            .collect();
+        for node_id in &stale {
+            self.by_peer.remove(node_id);
+        }
+        stale.len()
+    }
+
     /// Drop contexts minted under a superseded topology epoch.
     /// Reparenting changes what a path means, so old ancestry
     /// authority must not survive it.

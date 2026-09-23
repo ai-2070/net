@@ -98,6 +98,7 @@ pub fn render_stable_kind_fixture() -> String {
         SubnetFactKind::GatewayAdvertisement,
         SubnetFactKind::ExportPolicy,
         SubnetFactKind::RevocationFloor,
+        SubnetFactKind::SubjectFloor,
     ]
     .map(fact_kind_wire);
 
@@ -563,6 +564,10 @@ mod tests {
         assert_eq!(
             fact_kind_wire(SubnetFactKind::RevocationFloor),
             "revocation_floor"
+        );
+        assert_eq!(
+            fact_kind_wire(SubnetFactKind::SubjectFloor),
+            "subject_floor"
         );
     }
 }

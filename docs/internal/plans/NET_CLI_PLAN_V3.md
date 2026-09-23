@@ -1940,6 +1940,105 @@ Tasks:
 
 **Exit:** A command can remove one subject from the named boundary and support its precise claim with real enforcement evidence. Partial propagation remains a first-class result, not false global success.
 
+#### V3-4 slice 1 — subject floor mechanism (receipt, 2026-09-23)
+
+This implements the §6.1a pinned design in core, SDK, the cross-language
+fixtures and the CLI issuance verb.
+
+**Core.**
+- `SubnetSubjectFloor` artifact (126-byte signed payload plus signature,
+  domain `net.subnet.subject-floor.v1`), travelling as control-fact kind 5
+  `subject_floor`.
+- `SubnetFloorRegistry::apply_subject` enforces: root signer only, a strictly
+  higher revision per `(scope, epoch, subject)`, and per-right generations that
+  only rise.
+- Subject floors are checked at admission against the **target** in
+  `verify_admission`; a `OneHop` leaf never satisfies a floor.
+- `SubnetContextStore::invalidate_subject` drops only the removed subject's
+  covered contexts; the authority epoch does not move.
+- New `SubnetAuthError::StateNotPersisted`.
+
+**Durability.**
+- `MeshNodeConfig::with_subnet_floor_store(dir)` enables
+  `subnet/floor_store.rs`: an append-only log, in acceptance order, of every
+  floor fact (subtree and subject) that changed state, kept in
+  `EnrollmentStorage`.
+- Each fact is logged before its apply returns success.
+- `MeshNode::new` replays the log through the root-anchored verifiers before
+  any admission. A corrupt log, or a logged floor that no longer verifies,
+  refuses construction.
+
+**Cross-language.** Updated together in one commit:
+- `stable_kinds.json`, regenerated (`fact_kinds` + `subject_floor`,
+  `auth_kinds` + `state_not_persisted`);
+- the SDK `render_stable_kind_fixture` and its kind test;
+- the Node, Python and Go kind tests;
+- the Go and Node doc comments.
+
+**CLI.** `subnet issue-control-fact subject-floor --subject <64-hex>
+[--rights attach] --minimum-generation N`:
+- The default right is ATTACH; others apply only when named.
+- `--minimum-generation 0` is refused.
+- The receipt carries `enforcement: "pending: signed only; …"`. Issuing signs
+  the artifact and removes nothing by itself.
+
+Witnesses:
+- `tests/subnet_subject_floor.rs` 4/4, pinned in ci.yml beside
+  `subnet_session_auth`:
+  - `b_is_removed_c_is_untouched_across_reconnect_and_restart` (the decisive
+    witness):
+    - B's live context drops, while C keeps the **identical** context and the
+      authority epoch does not move;
+    - B's old credentials are refused on its live session and on a real
+      reconnect (a fresh node, same identity, new session);
+    - after a verifier restart on the same store B is still refused and C is
+      admitted;
+    - a delegated leaf at generation 99 is refused;
+    - a root-direct leaf at the floor re-admits B.
+  - `an_ancestor_scoped_grant_cannot_defeat_the_removal`: refused inside and
+    below S; works outside S.
+  - `rights_are_exact_and_generations_never_lower`: an ATTACH floor leaves
+    ROUTE; a stale revision is a no-op; a lower generation never lowers.
+  - `only_a_root_signs_and_the_wire_kind_is_strict`: a non-root is
+    `IssuerNotAuthorized`; the wire tag is 5; an unknown tag 6 is
+    `InvalidFormat`.
+- `floor_store` unit (round trip, tamper, oversize).
+- CLI `subject_floor_issuance_is_exact_and_reports_enforcement_as_pending`.
+
+Inverse mutations, 9 of 9 caught by their witnesses and then restored
+byte-identically:
+- admission ignoring subject floors;
+- checking the grant scope instead of the target;
+- delegated leaves satisfying the floor by generation;
+- a subject floor moving the authority-wide epoch (sibling churn);
+- floors not persisted;
+- a later fact lowering a generation;
+- stale revisions applying;
+- the floor broadening to every right;
+- a non-root signer accepted.
+
+Regressions:
+- `cargo tl` 5811/5811.
+- All 14 CI-pinned subnet binaries 116/116, and `subnet_auth_e2e` 23/23.
+- SDK subnet and fixture tests 8/8.
+- Python `test_subnet_kinds.py` 5/5.
+- `net-cli` 349/349.
+- Clippy (core all-features all-targets, lib/bins all, default and
+  no-default; SDK `full`; `net-cli`) and rustdoc (root, SDK `full`) are clean.
+- Not run locally: the Node kind test (no vitest installed) and the Go kind
+  test (this box cannot build cgo). CI runs both.
+
+**Still open for V3-4.** Stated, not implied:
+1. **Propagation readback.** No management path lets the CLI learn which
+   verifiers applied a floor. A `subnet remove` verb with dry-run, applied and
+   pending enforcement points, and an `unsupported` report for pre-kind-5
+   verifiers needs that path. Until it exists the CLI reports issuance only.
+2. **`up` is not a subnet verifier.** No CLI-run node configures a subnet
+   authority or a floor store yet. The mechanism is proven in core; the CLI
+   journey follows the subnet enrollment slice (V3-2).
+3. **Organization removal** composes its existing floor separately and is not
+   touched here.
+
 ### V3-5 — public journey, CI and release acceptance
 
 **Modify:** `cli/README.md`, `cli/CHANGELOG.md`, `web/src/content/docs/reference/cli.md`, relevant enrollment/security/subnet docs and `.github/workflows/ci.yml`.

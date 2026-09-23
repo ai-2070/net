@@ -258,6 +258,7 @@ pub fn fact_kind_wire(kind: SubnetFactKind) -> &'static str {
         SubnetFactKind::GatewayAdvertisement => "gateway_advertisement",
         SubnetFactKind::ExportPolicy => "export_policy",
         SubnetFactKind::RevocationFloor => "revocation_floor",
+        SubnetFactKind::SubjectFloor => "subject_floor",
     }
 }
 

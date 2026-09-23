@@ -63,7 +63,7 @@ func TestSubnetKindFixtureShape(t *testing.T) {
 	if len(f.AuthKinds) == 0 || len(f.LocalKinds) == 0 {
 		t.Fatal("fixture must pin at least one auth kind and one local kind")
 	}
-	wantFacts := []string{"descriptor", "gateway_advertisement", "export_policy", "revocation_floor"}
+	wantFacts := []string{"descriptor", "gateway_advertisement", "export_policy", "revocation_floor", "subject_floor"}
 	if len(f.FactKinds) != len(wantFacts) {
 		t.Fatalf("fact_kinds = %v, want %v", f.FactKinds, wantFacts)
 	}

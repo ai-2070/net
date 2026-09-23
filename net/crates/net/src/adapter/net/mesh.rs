@@ -869,7 +869,7 @@ use super::subnet::{
     SubnetAuthPresentation, SubnetAuthorityConfig, SubnetBoundarySet, SubnetChallengeStore,
     SubnetContextStore, SubnetControlFact, SubnetControlOutcome, SubnetControlStore,
     SubnetCredentialSet, SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy,
-    SubnetRevocationFloor, VerifiedGatewayContextSet, VerifiedSubnetContext,
+    SubnetRevocationFloor, SubnetSubjectFloor, VerifiedGatewayContextSet, VerifiedSubnetContext,
 };
 use super::subprotocol::stream_window::{
     StreamAckRanges, StreamNack, StreamReset, StreamWindow, MAX_ACK_RANGES, STREAM_WINDOW_SIZE,
@@ -2651,6 +2651,7 @@ struct DispatchCtx {
     protected_relay_stats: Arc<ProtectedRelayStats>,
     /// Floor state, for the auth epoch a compiled context is pinned to.
     subnet_floors: Arc<SubnetFloorRegistry>,
+    subnet_floor_store: Option<Arc<super::subnet::floor_store::SubnetFloorStore>>,
     /// S5 control-fact store, shared with the node handle so the
     /// channel arrival path and local provisioning apply into one
     /// state.
@@ -3060,6 +3061,14 @@ pub struct MeshNodeConfig {
     /// published it. A channel token may gate readership when facts
     /// are confidential; it never gates fact validity.
     pub subnet_control_channel: Option<ChannelName>,
+    /// Durable log of accepted subnet revocation floors (subtree and
+    /// subject). `Some(dir)`: [`MeshNode::new`] opens it, re-verifies and
+    /// replays every logged floor BEFORE any networking or admission, and
+    /// refuses construction if it is corrupt or a logged floor no longer
+    /// verifies; every later floor that changes state is logged before
+    /// its apply reports success. `None` keeps floors in memory only — a
+    /// restart then forgets them until they are redelivered.
+    pub subnet_floor_store: Option<std::path::PathBuf>,
     /// Visibility applied on publish when a channel has **no**
     /// registered config in the local
     /// [`ChannelConfigRegistry`]. Defaults to
@@ -3411,6 +3420,7 @@ impl MeshNodeConfig {
             subnet_exports: Vec::new(),
             subnet_attachment: None,
             subnet_control_channel: None,
+            subnet_floor_store: None,
             default_visibility: Visibility::Global,
             unregistered_channels: UnregisteredChannelPolicy::default(),
             min_announce_interval: Duration::from_secs(10),
@@ -3772,6 +3782,13 @@ impl MeshNodeConfig {
     /// [`Self::subnet_control_channel`].
     pub fn with_subnet_control_channel(mut self, channel: ChannelName) -> Self {
         self.subnet_control_channel = Some(channel);
+        self
+    }
+
+    /// Persist accepted subnet revocation floors in `dir` — see
+    /// [`Self::subnet_floor_store`].
+    pub fn with_subnet_floor_store(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.subnet_floor_store = Some(dir.into());
         self
     }
 
@@ -12988,6 +13005,7 @@ pub struct MeshNode {
     /// for subnet credentials. Session admission (S3) verifies
     /// against this registry and pins the epoch it saw.
     subnet_floors: Arc<SubnetFloorRegistry>,
+    subnet_floor_store: Option<Arc<super::subnet::floor_store::SubnetFloorStore>>,
     /// Verified subnet control-fact state (S5): descriptors, gateway
     /// advertisements, export policies. Floors flow into
     /// `subnet_floors` instead — one revocation authority, not two.
@@ -14110,6 +14128,25 @@ impl MeshNode {
         let local_subnet = config.subnet;
         let local_subnet_policy = config.subnet_policy.clone();
         let subnet_authorities = Arc::new(config.subnet_authorities.clone());
+        // §6.1a item 2: accepted floors survive restart. Open the log and
+        // replay it through the same root-anchored verifiers BEFORE any
+        // admission can happen; a corrupt log or a logged floor that no
+        // longer verifies refuses construction.
+        let subnet_floors = Arc::new(SubnetFloorRegistry::new());
+        let subnet_floor_store = match &config.subnet_floor_store {
+            Some(dir) => {
+                let (store, replay) =
+                    super::subnet::floor_store::SubnetFloorStore::open_or_create(dir)
+                        .map_err(|e| AdapterError::Fatal(format!("subnet floor store: {e}")))?;
+                for bytes in &replay {
+                    Self::replay_floor(bytes, &subnet_authorities, &subnet_floors).map_err(
+                        |e| AdapterError::Fatal(format!("subnet floor store replay refused: {e}")),
+                    )?;
+                }
+                Some(Arc::new(store))
+            }
+            None => None,
+        };
         let subnet_local_attachment = config.subnet_attachment.unwrap_or(local_subnet);
         // One u64, computed once: the receive path discriminates the
         // control-facts channel by its full publish stream id (63
@@ -14519,7 +14556,8 @@ impl MeshNode {
             local_subnet_policy,
             subnet_authorities,
             subnet_exports,
-            subnet_floors: Arc::new(SubnetFloorRegistry::new()),
+            subnet_floors,
+            subnet_floor_store,
             subnet_control: Arc::new(SubnetControlStore::new()),
             subnet_control_stream_id,
             subnet_challenges,
@@ -19950,7 +19988,13 @@ impl MeshNode {
         let config = self
             .subnet_authority_config(&floor.scope.authority)
             .ok_or(SubnetAuthError::UnknownAuthority)?;
-        Self::apply_floor_with(floor, config, &self.subnet_floors, &self.subnet_contexts)
+        Self::apply_floor_with(
+            floor,
+            config,
+            &self.subnet_floors,
+            &self.subnet_contexts,
+            self.subnet_floor_store.as_deref(),
+        )
     }
 
     /// The floor transition itself — registry apply plus the
@@ -19963,15 +20007,64 @@ impl MeshNode {
         config: &SubnetAuthorityConfig,
         floors: &SubnetFloorRegistry,
         contexts: &SubnetContextStore,
+        store: Option<&super::subnet::floor_store::SubnetFloorStore>,
     ) -> Result<bool, SubnetAuthError> {
         let changed = floors.apply(floor, config)?;
         if changed {
+            if let Some(store) = store {
+                store.append(&SubnetControlFact::RevocationFloor(floor.clone()).to_bytes())?;
+            }
             let epoch = floors.auth_epoch(&floor.scope.authority);
             let dropped = contexts.invalidate_stale_epoch(&floor.scope.authority, epoch);
             tracing::info!(
                 subnet_auth_epoch = epoch,
                 dropped,
                 "subnet: revocation floor accepted; invalidated stale session contexts"
+            );
+        }
+        Ok(changed)
+    }
+
+    /// Apply a signed subject floor (NET_CLI_PLAN_V3 §6.1a): remove one
+    /// subject's named rights inside one subtree. Only that subject's
+    /// covered contexts are dropped; every sibling keeps its admitted
+    /// context and session.
+    pub fn apply_subnet_subject_floor(
+        &self,
+        floor: &SubnetSubjectFloor,
+    ) -> Result<bool, SubnetAuthError> {
+        let config = self
+            .subnet_authority_config(&floor.scope.authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+        Self::apply_subject_floor_with(
+            floor,
+            config,
+            &self.subnet_floors,
+            &self.subnet_contexts,
+            self.subnet_floor_store.as_deref(),
+        )
+    }
+
+    fn apply_subject_floor_with(
+        floor: &SubnetSubjectFloor,
+        config: &SubnetAuthorityConfig,
+        floors: &SubnetFloorRegistry,
+        contexts: &SubnetContextStore,
+        store: Option<&super::subnet::floor_store::SubnetFloorStore>,
+    ) -> Result<bool, SubnetAuthError> {
+        let changed = floors.apply_subject(floor, config)?;
+        if changed {
+            // Durable before anything reports it committed (§6.1a item 2).
+            // On failure the stricter in-memory state stays; the caller
+            // sees `StateNotPersisted`, never success.
+            if let Some(store) = store {
+                store.append(&SubnetControlFact::SubjectFloor(floor.clone()).to_bytes())?;
+            }
+            let dropped =
+                contexts.invalidate_subject(&floor.scope.authority, &floor.subject, floors);
+            tracing::info!(
+                dropped,
+                "subnet: subject floor accepted; dropped only the removed subject's contexts"
             );
         }
         Ok(changed)
@@ -20000,7 +20093,32 @@ impl MeshNode {
             &self.subnet_control,
             &self.subnet_floors,
             &self.subnet_contexts,
+            self.subnet_floor_store.as_deref(),
         )
+    }
+
+    /// Re-apply one logged floor at startup (no contexts exist yet, and
+    /// it is already durable). A floor for an authority no longer
+    /// configured is skipped — nothing could be admitted under it — but a
+    /// floor that fails verification refuses startup.
+    fn replay_floor(
+        bytes: &[u8],
+        authorities: &[SubnetAuthorityConfig],
+        floors: &SubnetFloorRegistry,
+    ) -> Result<(), SubnetAuthError> {
+        let fact = SubnetControlFact::from_bytes(bytes)?;
+        let Some(config) = authorities
+            .iter()
+            .find(|c| c.authority == fact.scope().authority)
+        else {
+            tracing::warn!("subnet: logged floor for an unconfigured authority skipped at startup");
+            return Ok(());
+        };
+        match &fact {
+            SubnetControlFact::RevocationFloor(f) => floors.apply(f, config).map(drop),
+            SubnetControlFact::SubjectFloor(f) => floors.apply_subject(f, config).map(drop),
+            _ => Err(SubnetAuthError::InvalidFormat),
+        }
     }
 
     /// [`Self::apply_subnet_control_fact`] over explicit handles, so
@@ -20012,6 +20130,7 @@ impl MeshNode {
         control: &SubnetControlStore,
         floors: &SubnetFloorRegistry,
         contexts: &SubnetContextStore,
+        store: Option<&super::subnet::floor_store::SubnetFloorStore>,
     ) -> Result<SubnetControlOutcome, SubnetAuthError> {
         let fact = SubnetControlFact::from_bytes(bytes)?;
         let config = authorities
@@ -20020,7 +20139,10 @@ impl MeshNode {
             .ok_or(SubnetAuthError::UnknownAuthority)?;
         let applied = match &fact {
             SubnetControlFact::RevocationFloor(floor) => {
-                Self::apply_floor_with(floor, config, floors, contexts)?
+                Self::apply_floor_with(floor, config, floors, contexts, store)?
+            }
+            SubnetControlFact::SubjectFloor(floor) => {
+                Self::apply_subject_floor_with(floor, config, floors, contexts, store)?
             }
             _ => control.apply(
                 &fact,
@@ -26322,6 +26444,7 @@ impl MeshNode {
             subnet_gateway_authority: self.subnet_gateway_authority.clone(),
             protected_relay_stats: self.protected_relay_stats.clone(),
             subnet_floors: self.subnet_floors.clone(),
+            subnet_floor_store: self.subnet_floor_store.clone(),
             subnet_control: self.subnet_control.clone(),
             subnet_authorities: self.subnet_authorities.clone(),
             subnet_control_stream_id: self.subnet_control_stream_id,
@@ -30611,6 +30734,7 @@ impl MeshNode {
                     &ctx.subnet_control,
                     &ctx.subnet_floors,
                     &ctx.subnet_contexts,
+                    ctx.subnet_floor_store.as_deref(),
                 ) {
                     Ok(outcome) if outcome.applied => tracing::info!(
                         from_node = format!("{from_node:#x}"),

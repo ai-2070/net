@@ -188,6 +188,7 @@ async fn inspect_offline_target(
                 ControlFactKindCommand::GatewayAdvertisement(a) => &a.common,
                 ControlFactKindCommand::ExportPolicy(a) => &a.common,
                 ControlFactKindCommand::RevocationFloor(a) => &a.common,
+                ControlFactKindCommand::SubjectFloor(a) => &a.common,
             };
             if common.inspect_target {
                 Some((
@@ -429,7 +430,7 @@ use net::adapter::net::identity::EntityKeypair;
 use net::adapter::net::subnet::{
     GatewayAdvertisement, SubnetAuthError, SubnetControlFact, SubnetCredentialSet,
     SubnetDescriptor, SubnetExportPolicy, SubnetGrant, SubnetIssuerGrant, SubnetRef,
-    SubnetRevocationFloor, SubnetRights, TopologySubnetId,
+    SubnetRevocationFloor, SubnetRights, SubnetSubjectFloor, TopologySubnetId,
 };
 
 /// Default credential TTL — 7 days, the org-grant cadence; the core
@@ -658,6 +659,9 @@ pub enum ControlFactKindCommand {
     ExportPolicy(FactExportPolicyArgs),
     /// A root-signed revocation floor, distributed as a fact.
     RevocationFloor(FactFloorArgs),
+    /// A root-signed SUBJECT floor: remove one entity's named rights
+    /// inside `--scope`, leaving every other subject untouched.
+    SubjectFloor(FactSubjectFloorArgs),
 }
 
 #[derive(Args, Debug)]
@@ -755,6 +759,28 @@ pub struct FactFloorArgs {
 
     /// Grants scoped to this subtree with generation BELOW this value
     /// are revoked, monotonically.
+    #[arg(long = "minimum-generation")]
+    pub minimum_generation: u32,
+}
+
+#[derive(Args, Debug)]
+pub struct FactSubjectFloorArgs {
+    #[command(flatten)]
+    pub common: FactCommonArgs,
+
+    /// The removed subject's full entity id (64 hex chars) — never a
+    /// routing id.
+    #[arg(long)]
+    pub subject: String,
+
+    /// Rights removed inside the scope. Defaults to `attach` only;
+    /// `route` / `export` are removed only when named here.
+    #[arg(long, default_value = "attach")]
+    pub rights: String,
+
+    /// The subject is re-admitted only by a root-direct grant at or
+    /// above this generation; its older grants, and any delegated
+    /// grant, lose the named rights inside the scope.
     #[arg(long = "minimum-generation")]
     pub minimum_generation: u32,
 }
@@ -1141,6 +1167,28 @@ async fn run_issue_control_fact(
             .map_err(|e| invalid_args(format!("revocation-floor: subnet:{e}")))?;
             (a.common, SubnetControlFact::RevocationFloor(fact))
         }
+        ControlFactKindCommand::SubjectFloor(a) => {
+            let subject = parse_entity_hex(&a.subject)?;
+            let rights = parse_subnet_rights(&a.rights)?;
+            if a.minimum_generation == 0 {
+                return Err(invalid_args(
+                    "--minimum-generation 0 removes nothing; use the generation the subject's                      grants must reach to be re-admitted",
+                ));
+            }
+            let (kp, scope) = fact_prelude(&a.common).await?;
+            let fact = SubnetSubjectFloor::try_issue(
+                &kp,
+                scope,
+                a.common.topology_epoch,
+                subject,
+                rights,
+                a.minimum_generation,
+                a.common.revision,
+                unix_now(),
+            )
+            .map_err(|e| invalid_args(format!("subject-floor: subnet:{e}")))?;
+            (a.common, SubnetControlFact::SubjectFloor(fact))
+        }
     };
 
     publish_wire_artifact(
@@ -1151,6 +1199,10 @@ async fn run_issue_control_fact(
     )
     .await?;
 
+    let subject_floor = match &fact {
+        SubnetControlFact::SubjectFloor(f) => Some(f),
+        _ => None,
+    };
     let summary = IssueFactOutput {
         path: common.out.display().to_string(),
         artifact: "control-fact".to_string(),
@@ -1159,6 +1211,17 @@ async fn run_issue_control_fact(
         scope: format_subnet(fact.scope().path),
         topology_epoch: common.topology_epoch,
         revision: common.revision,
+        subject_hex: subject_floor.map(|f| hex::encode(f.subject.as_bytes())),
+        rights: subject_floor.map(|f| format_subnet_rights(f.rights)),
+        minimum_generation: subject_floor.map(|f| f.minimum_generation),
+        // Issuing signs the artifact; it removes nothing by itself.
+        // Enforcement happens at each verifier that applies it, and a
+        // verifier that predates this fact kind refuses it rather than
+        // enforcing it — so every enforcement point starts pending.
+        enforcement: subject_floor.map(|_| {
+            "pending: signed only; each verifier enforces it once it applies this fact              (verifiers without subject-floor support refuse it)"
+                .to_string()
+        }),
     };
     emit_value(OutputFormat::resolve_oneshot(output), &summary)
         .map_err(|e| generic(format!("write summary: {e}")))?;
@@ -1299,6 +1362,14 @@ struct IssueFactOutput {
     scope: String,
     topology_epoch: u32,
     revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rights: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    minimum_generation: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enforcement: Option<String>,
 }
 
 fn default_subnet_key_path(entity_id_hex: &str) -> Option<PathBuf> {
