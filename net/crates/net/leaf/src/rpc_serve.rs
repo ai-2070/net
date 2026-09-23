@@ -219,6 +219,10 @@ struct ServeShared {
     /// How many request items the handler has consumed (grant pacing).
     consumed: u64,
     output: VecDeque<Bytes>,
+    /// Response-direction credit (§ flow control): `Some(n)` pays one
+    /// per [`ServeCall::send`] (the item takes nothing when `Some(0)`),
+    /// refilled by `STREAM_GRANT`; `None` = unbounded.
+    resp_credit: Option<u32>,
     /// The handler's result, once [`ServeCall::finish`] ran.
     result: Option<StreamHandlerResult>,
     /// Producer-finished gate (§2.2: producer finished is NOT
@@ -273,14 +277,25 @@ impl ServeCall {
     /// Push one response item (SS/DX stream items; the single response
     /// body on CS/unary). [`SinkError::Closed`] is the
     /// `RpcSinkClosed`-class refusal: retired, finished, or the single
-    /// response is already filled.
+    /// response is already filled. On a response-windowed call this is
+    /// core's send-side permit wait in pull form: one credit per item,
+    /// and [`SinkError::WouldBlock`] takes NOTHING — retry after a
+    /// `STREAM_GRANT` arrives (the JS surface keeps its promise
+    /// pending and re-polls), so a `send()` resolves only as grants
+    /// arrive even with an idle reader.
     pub fn send(&self, item: &[u8]) -> Result<(), SinkError> {
         let mut sh = self.inner.borrow_mut();
         if sh.closed || sh.producer_done {
             return Err(SinkError::Closed);
         }
+        if sh.resp_credit == Some(0) {
+            return Err(SinkError::WouldBlock);
+        }
         if sh.output.len() >= MAX_QUEUED_ITEMS {
             return Err(SinkError::ResourceExhausted);
+        }
+        if let Some(credit) = sh.resp_credit.as_mut() {
+            *credit -= 1;
         }
         sh.output.push_back(Bytes::copy_from_slice(item));
         Ok(())
@@ -322,8 +337,6 @@ struct ServeCallState {
     /// Absolute end + which bound produced it (§2.1).
     end_ns: u64,
     bound: DeadlineBound,
-    /// Response-direction credit (`None` = unbounded).
-    output_window: Option<u32>,
     /// Upload window the caller opted into (`None` = unbounded).
     request_window_initial: Option<u32>,
     /// Request grants already emitted (capped at opening window +
@@ -718,6 +731,7 @@ impl ServeRegistry {
             input_ended: matches!(input, InputHalf::Ended | InputHalf::Closed),
             consumed: 0,
             output: VecDeque::new(),
+            resp_credit: output_window,
             result: None,
             producer_done: false,
             closed: false,
@@ -734,7 +748,6 @@ impl ServeRegistry {
                 reply_route,
                 end_ns,
                 bound,
-                output_window,
                 request_window_initial: request_window,
                 request_granted: 0,
                 input,
@@ -809,17 +822,21 @@ impl ServeRegistry {
             if state.terminal.is_some() {
                 return false;
             }
-            let Some(window) = state.output_window.as_mut() else {
+            let mut sh = state.shared.borrow_mut();
+            if sh.resp_credit.is_none() {
                 // Non-flow-controlled: every GRANT is ignored.
                 return false;
-            };
+            }
             if credits == 0 {
                 return false;
             }
-            *window = window.saturating_add(credits);
+            if let Some(credit) = sh.resp_credit.as_mut() {
+                *credit = credit.saturating_add(credits);
+            }
             true
         };
-        // Credit released: parked senders go out now.
+        // Credit released: parked senders may push again, and the pump
+        // runs.
         self.pump_key(key);
         credited
     }
@@ -1110,17 +1127,12 @@ fn pump(out: &mut VecDeque<ServeOutFrame>, state: &mut ServeCallState) {
             emit(out, state, &payload);
             return;
         }
-        // SS/DX: queued items drain as `continue` chunks while credit
-        // permits; the terminal follows the drain.
+        // SS/DX: queued items drain as `continue` chunks in order —
+        // each was PAID its credit at `ServeCall::send`, so the pump
+        // parks only on the queue, never on the window. The terminal
+        // follows the drain.
         if has_item {
-            if state.output_window == Some(0) {
-                // Sender parks without credit.
-                return;
-            }
             let body = state.shared.borrow_mut().output.pop_front().expect("checked");
-            if let Some(window) = state.output_window.as_mut() {
-                *window = window.saturating_sub(1);
-            }
             let payload = RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![(

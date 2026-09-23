@@ -1097,7 +1097,7 @@ fn end_on_one_call_never_touches_a_sibling() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn response_credit_parks_the_pump_and_each_grant_releases_exactly_its_chunks() {
+fn response_credit_parks_the_sender_and_each_grant_releases_exactly_its_chunks() {
     let mut l = Loop::new();
     l.serve(RpcCallShape::ServerStreaming, ServeAccess::SameOrg);
     let intent = l.w.intent(5);
@@ -1113,32 +1113,42 @@ fn response_credit_parks_the_pump_and_each_grant_releases_exactly_its_chunks() {
     l.to_provider(up);
 
     let call = l.served.borrow()[0].clone();
-    for item in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice(), b"d".as_slice(), b"e".as_slice()]
-    {
-        call.send(item).expect("send");
+    // Window 2: two sends RESOLVE and take their items; the rest park
+    // and take NOTHING — with an idle reader, none of them resolve.
+    assert_eq!(call.send(b"a"), Ok(()));
+    assert_eq!(call.send(b"b"), Ok(()));
+    for item in [b"c".as_slice(), b"d".as_slice(), b"e".as_slice()] {
+        assert_eq!(
+            call.send(item),
+            Err(SinkError::WouldBlock),
+            "a creditless send parks; the item was NOT taken"
+        );
     }
-    call.finish(StreamHandlerResult::Ok);
 
-    // Credit 2: exactly two chunks, no terminal — the sender parks.
     let down = l.provider_out();
-    assert_eq!(chunks(&down), 2, "exactly credit-count chunks");
-    assert_eq!(terminals(&down), 0, "a parked drain is not terminal");
     assert_eq!(
         responses(&down),
-        vec![continue_chunk(b"a"), continue_chunk(b"b")]
+        vec![continue_chunk(b"a"), continue_chunk(b"b")],
+        "exactly credit-count chunks"
     );
+    assert_eq!(terminals(&down), 0, "a parked sender is not terminal");
     l.to_caller(down);
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"a")));
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"b")));
 
     // Consuming granted 2 credits (one per consumed chunk): exactly 2
-    // more chunks.
+    // more sends resolve and exactly 2 more chunks go out.
     let up = l.caller_out();
     assert_eq!(up.len(), 2, "one STREAM_GRANT per consumed chunk");
     l.to_provider(up);
+    assert_eq!(call.send(b"c"), Ok(()));
+    assert_eq!(call.send(b"d"), Ok(()));
+    assert_eq!(call.send(b"e"), Err(SinkError::WouldBlock));
     let down = l.provider_out();
-    assert_eq!(chunks(&down), 2);
-    assert_eq!(terminals(&down), 0);
+    assert_eq!(
+        responses(&down),
+        vec![continue_chunk(b"c"), continue_chunk(b"d")]
+    );
     l.to_caller(down);
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"c")));
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"d")));
@@ -1146,9 +1156,14 @@ fn response_credit_parks_the_pump_and_each_grant_releases_exactly_its_chunks() {
     // The last item and the terminal.
     let up = l.caller_out();
     l.to_provider(up);
+    assert_eq!(call.send(b"e"), Ok(()));
+    call.finish(StreamHandlerResult::Ok);
     let down = l.provider_out();
-    assert_eq!(chunks(&down), 1);
-    assert_eq!(terminals(&down), 1);
+    assert_eq!(
+        responses(&down),
+        vec![continue_chunk(b"e"), end_terminal()],
+        "the final chunk then exactly one terminal"
+    );
     l.to_caller(down);
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"e")));
     assert_eq!(
@@ -1395,7 +1410,7 @@ fn success_drains_queued_items_in_order_before_the_end_terminal() {
     let (id, handle) = l.open_ss(
         StreamOpen {
             body: Bytes::from_static(b"r"),
-            stream_window_initial: Some(1),
+            stream_window_initial: Some(3),
             ..empty_open()
         },
         intent,
@@ -1403,34 +1418,29 @@ fn success_drains_queued_items_in_order_before_the_end_terminal() {
     let up = l.caller_out();
     l.to_provider(up);
 
-    // The handler queues everything and finishes BEFORE the drain:
-    // producer finished is not terminal.
+    // The handler queues everything it has credit for and finishes
+    // BEFORE the drain: producer finished is not terminal, and a
+    // creditless send parks (takes nothing) rather than over-queue.
     let call = l.served.borrow()[0].clone();
     for item in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()] {
-        call.send(item).expect("send");
+        assert_eq!(call.send(item), Ok(()));
     }
+    assert_eq!(call.send(b"d"), Err(SinkError::WouldBlock));
     call.finish(StreamHandlerResult::Ok);
 
-    let mut seen = Vec::new();
-    loop {
-        // Each round: carry the caller's grants up FIRST, then pull
-        // whatever the provider's pump released this round.
-        let up = l.caller_out();
-        l.to_provider(up);
-        let down = l.provider_out();
-        if down.is_empty() {
-            break;
-        }
-        seen.extend(responses(&down));
-        l.to_caller(down);
-        // Consume what arrived (auto-granting one credit each).
-        while l.caller.next_item(id).is_some() {}
-    }
+    let down = l.provider_out();
     assert_eq!(
-        seen,
-        vec![continue_chunk(b"a"), continue_chunk(b"b"), continue_chunk(b"c"), end_terminal()],
+        responses(&down),
+        vec![
+            continue_chunk(b"a"),
+            continue_chunk(b"b"),
+            continue_chunk(b"c"),
+            end_terminal()
+        ],
         "F-S1: Completed(_) drains queued items in order BEFORE its terminal"
     );
+    l.to_caller(down);
+    while l.caller.next_item(id).is_some() {}
     assert_eq!(
         l.caller.terminal(id),
         Some(&StreamTerminal::Completed {
