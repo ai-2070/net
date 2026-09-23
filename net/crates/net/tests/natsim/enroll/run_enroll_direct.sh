@@ -193,12 +193,16 @@ jq -e '.joined.attached == true and .psk_source == "joined"' "$STATE/agent.ready
   || fail "joined agent did not attach: $(jq -c .joined "$STATE/agent.ready.json")"
 
 # Direct evidence: the agent's flows crossed the router's DNAT straight to the
-# device's own sockets (reply source = the device's private address).
+# device's own sockets (reply source = the device's private address). The agent
+# is the whole nsim_wan namespace: `join` does not pin a source address, so its
+# flows leave from the namespace's primary 10.99.0.1, the joined `up` from its
+# --bind. No relay or helper process runs anywhere in the topology.
 evidence joined
-grep -E "src=10\.99\.0\.12 .*dst=$PUBLIC_A .*src=192\.168\.101\.2" "$STATE/joined.gw-conntrack.txt" \
-  | grep -q "tcp" || fail "no DNAT'd TCP flow from the agent to the device in conntrack"
-grep -E "src=10\.99\.0\.12 .*dst=$PUBLIC_A .*src=192\.168\.101\.2" "$STATE/joined.gw-conntrack.txt" \
-  | grep -q "udp" || fail "no DNAT'd UDP flow from the agent to the device in conntrack"
+wan_to_device="src=10\.99\.0\.[0-9]+ dst=${PUBLIC_A//./\\.} .* src=192\.168\.101\.2 "
+grep -E "^tcp .*$wan_to_device" "$STATE/joined.gw-conntrack.txt" > /dev/null \
+  || fail "no DNAT'd TCP (enrollment) flow from the WAN to the device in conntrack"
+grep -E "^udp .*$wan_to_device" "$STATE/joined.gw-conntrack.txt" > /dev/null \
+  || fail "no DNAT'd UDP (mesh) flow from the WAN to the device in conntrack"
 log "agent reached the device directly through the router's mapping"
 
 stop_up in_wan "$STATE/agent"
