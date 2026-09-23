@@ -34,6 +34,39 @@ pub enum PeerAddr {
     /// driver owns it in. Only under the `webrtc` feature.
     #[cfg(feature = "webrtc")]
     Rtc(RtcPeerId),
+    /// A peer reached through a **blind UDP relay**: every datagram to or
+    /// from it is framed with [`relay_data_header`] and exchanged with the
+    /// relay's UDP tuple, which forwards it on `channel` without decrypting
+    /// anything. The channel is unique to this peer at that relay, so the
+    /// pair is a sound endpoint key.
+    Relayed {
+        /// The relay's UDP tuple.
+        relay: SocketAddr,
+        /// The channel the relay allocated for this peer.
+        channel: u32,
+    },
+}
+
+/// First byte of a blind-relay data frame (mirrors the core relay's `DATA`).
+pub const RELAY_DATA_KIND: u8 = 0x10;
+/// Length of the blind-relay data frame header: kind + channel.
+pub const RELAY_DATA_HEADER_LEN: usize = 5;
+
+/// The frame header prepended to a datagram sent through a blind relay.
+#[inline]
+pub fn relay_data_header(channel: u32) -> [u8; RELAY_DATA_HEADER_LEN] {
+    let c = channel.to_be_bytes();
+    [RELAY_DATA_KIND, c[0], c[1], c[2], c[3]]
+}
+
+/// Split a relay datagram into `(channel, payload)` when it is a data frame.
+#[inline]
+pub fn split_relay_data(frame: &[u8]) -> Option<(u32, &[u8])> {
+    if frame.len() < RELAY_DATA_HEADER_LEN || frame[0] != RELAY_DATA_KIND {
+        return None;
+    }
+    let channel = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+    Some((channel, &frame[RELAY_DATA_HEADER_LEN..]))
 }
 
 /// Identifies one DataChannel owned by the core's RTC driver.
@@ -72,6 +105,16 @@ impl PeerAddr {
             PeerAddr::Udp(addr) => Some(*addr),
             #[cfg(feature = "webrtc")]
             PeerAddr::Rtc(_) => None,
+            PeerAddr::Relayed { .. } => None,
+        }
+    }
+
+    /// `(relay, channel)` when this endpoint is reached through a blind relay.
+    #[inline]
+    pub fn relayed(&self) -> Option<(SocketAddr, u32)> {
+        match self {
+            PeerAddr::Relayed { relay, channel } => Some((*relay, *channel)),
+            _ => None,
         }
     }
 
@@ -81,7 +124,7 @@ impl PeerAddr {
     pub fn rtc(&self) -> Option<RtcPeerId> {
         match self {
             PeerAddr::Rtc(id) => Some(*id),
-            PeerAddr::Udp(_) => None,
+            PeerAddr::Udp(_) | PeerAddr::Relayed { .. } => None,
         }
     }
 }
@@ -102,6 +145,35 @@ impl std::fmt::Display for PeerAddr {
             PeerAddr::Udp(addr) => write!(f, "{addr}"),
             #[cfg(feature = "webrtc")]
             PeerAddr::Rtc(id) => write!(f, "{id}"),
+            PeerAddr::Relayed { relay, channel } => write!(f, "relay:{relay}#{channel}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_frames_round_trip_and_reject_other_kinds() {
+        let mut frame = relay_data_header(0xDEAD_BEEF).to_vec();
+        frame.extend_from_slice(b"ciphertext");
+        assert_eq!(
+            split_relay_data(&frame),
+            Some((0xDEAD_BEEF, &b"ciphertext"[..]))
+        );
+        assert_eq!(split_relay_data(&frame[..4]), None);
+        frame[0] = 0x04;
+        assert_eq!(split_relay_data(&frame), None);
+        let relayed = PeerAddr::Relayed {
+            relay: "203.0.113.1:3478".parse().unwrap(),
+            channel: 7,
+        };
+        assert_eq!(relayed.udp(), None);
+        assert_eq!(
+            relayed.relayed(),
+            Some(("203.0.113.1:3478".parse().unwrap(), 7))
+        );
+        assert_eq!(relayed.to_string(), "relay:203.0.113.1:3478#7");
     }
 }

@@ -34,6 +34,7 @@ pub mod node;
 pub mod org;
 pub mod peer;
 pub mod port;
+pub mod relay;
 pub mod rpc;
 pub(crate) mod scope;
 pub mod snapshot;

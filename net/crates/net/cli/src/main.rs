@@ -162,6 +162,10 @@ enum Command {
 
     /// Join a mesh from a `netmesh-join_` token (confirm, redeem, install, attach).
     Join(commands::enrollment::JoinArgs),
+
+    /// Run a blind UDP relay (the fallback path for unreachable devices).
+    #[command(subcommand)]
+    Relay(commands::relay::RelayCommand),
     /// Offline previews or temporary-supervisor admin commits (--local).
     #[command(subcommand)]
     Admin(commands::admin::AdminCommand),
@@ -372,6 +376,7 @@ async fn dispatch_inner(cli: Cli, deadline: Option<deadline::Deadline>) -> Resul
             commands::enrollment::run_enrollment(cmd, output, profile).await
         }
         Command::Invite(cmd) => commands::enrollment::run_invite(cmd, output, profile).await,
+        Command::Relay(cmd) => commands::relay::run(cmd, output).await,
         Command::Join(args) => {
             Box::pin(commands::enrollment::run_join(args, output, profile)).await
         }

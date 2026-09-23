@@ -1138,7 +1138,7 @@ re-handshake rule defers rotation of a live, busy session (`DeferBusy`,
 retry. This is deliberate core safety behavior; a clean close of `join`'s
 attach probe would avoid it and is a candidate follow-up.
 
-#### R1c — natsim direct-path row (`14e524808`, CI pending)
+#### R1c — natsim direct-path row (`14e524808`..`cc750bb85`, CI PASS)
 
 `tests/natsim/setup.sh --nat-a upnp` adds a gateway that only masquerades
 outbound and forwards nothing by itself. `tests/natsim/enroll/run_enroll_direct.sh`
@@ -1150,9 +1150,15 @@ requires the mapping to be active and signed into the token, join and joined
 show the agent's TCP and UDP flows DNAT'd straight to the device's private
 address, a negative control (`--no-port-mapping`, public address forced into the
 token) to fail to join, and the mappings to be removed after shutdown. The new
-`natsim-enroll` workflow runs only this row. Written on Windows and not yet run:
-the first CI result decides whether the miniupnpd nftables integration needs
-iteration.
+`natsim-enroll` workflow runs only this row.
+
+**Receipt: PASS, `natsim-enroll` run 35800318087** (`[enroll] PASS`) after three
+lab-only iterations, none touching product code: miniupnpd 2.3.4 does not know
+`ext_allow_private_ipv4` (removed); it refuses an RFC1918 `ext_ip`, so the upnp
+gateway gets a public alias `11.99.0.2/32` (`29706542a`); and `join` does not pin
+a source address, so the conntrack evidence accepts any `10.99.0.x` WAN source
+while still requiring the reply source to be the device's private address
+(`cc750bb85`).
 
 #### R2 — blind relay fallback: design (user-approved 2026-09-23)
 
@@ -1214,8 +1220,61 @@ The core transport is hardened code with a large test surface; each phase runs
 its focused witnesses plus the full relevant CI families, with inverse
 mutations for every authority or path claim.
 
-**Next:** R1c CI result, then R2 phase 1 (relay server + core relayed-peer
-transport).
+#### R2 phase 1 — relay server and relayed-peer transport (receipt)
+
+- **Relay core** (`traversal/blind_relay.rs`, `7846ab57c`): `RelayCore` and the
+  UDP `BlindRelay`. Registration is HELLO → stateless CHALLENGE (keyed MAC over
+  the observed endpoint and time, so the relay holds nothing for unanswered
+  HELLOs) → REGISTER signed by the device's mesh identity key over the nonce and
+  the observed endpoint; the registration id is derived from the EntityId, so
+  only that key can claim it. Joiners BIND → BOUND a channel; DATA is
+  `[0x10][channel u32 BE][payload]`, forwarded opaque. Every reply is no larger
+  than its request (a compile-time assertion), and registrations, channels per
+  registration, bind rate and idle state are bounded.
+- **Wire:** `PeerAddr::Relayed { relay, channel }`, the DATA header helpers and
+  the `relay:{addr}#{channel}` display.
+- **Core transport:** `PeerSink` frames datagrams to a relayed peer in
+  `send`/`try_send`/`send_bounded`. The UDP receive loop's `relay_ingress`
+  unwraps DATA from a relay the node uses and attributes it to the relayed
+  endpoint, and hands anything else to that relay's client. `MeshNode` gains
+  `relay_register` (refreshes every ttl/3, min 5 s, which also keeps the
+  device's NAT mapping open, and stops when the handle drops), `relay_bind` and
+  `connect_via_endpoint`; `connect_via` now delegates to it. All of these sit
+  behind `nat-traversal`.
+- **Explicit limit:** the router's own socket cannot send to a relayed endpoint.
+  `send_to` returns `Unsupported` and the scheduler counts it as dropped (the
+  `dropped` counter is no longer webrtc-gated), so no silent fallback arm
+  swallows it. Scheduled router streams over a relayed path are not supported in
+  phase 1; direct session traffic is.
+- **CLI:** `net-mesh relay serve --bind ADDR [--max-registrations N]
+  [--max-channels-per-registration N]` runs in the foreground, emitting `ready`
+  and `stopped` rows (the second with counters).
+
+Witnesses:
+- `blind_relay` units 10/10, including
+  `a_mesh_session_runs_end_to_end_through_the_blind_relay` (a real NKpsk0
+  handshake plus a channel subscribe/ack through the relay on loopback) and
+  `binding_an_unregistered_device_is_refused`.
+- `cli/tests/relay_serve.rs` 2/2: a mesh session through a real `relay serve`
+  subprocess, and refusal of a non-literal bind.
+
+Inverse mutations, each caught by its witness and then restored:
+- skipping the REGISTER signature check;
+- skipping the challenge-freshness check;
+- forwarding from any endpoint;
+- the channel cap;
+- the bind rate limit;
+- not unwrapping relayed ingress;
+- not framing relayed egress.
+
+Regressions:
+- `cargo tl` 5804/5804.
+- Transport integration families 135/135.
+- `net-cli` suite 341/341.
+- Clippy (all-features, all-targets, lib/bins default and no-default) and
+  rustdoc (root and `net-mesh-wire`) are clean.
+
+**Next:** R2 phase 2, the enrollment splice through the relay.
 Lifecycle fencing, selective subnet semantics and V2 exact-head acceptance
 remain open.
 

@@ -412,6 +412,17 @@ impl PeerSink {
             .map_err(io::Error::from)
     }
 
+    /// Frame `packet` for a blind relay: the data header, then the packet.
+    /// One copy per datagram; relayed traffic is the fallback path.
+    #[inline]
+    fn relay_frame(packet: &[u8], channel: u32) -> Vec<u8> {
+        let mut framed =
+            Vec::with_capacity(net_wire::peer_addr::RELAY_DATA_HEADER_LEN + packet.len());
+        framed.extend_from_slice(&net_wire::peer_addr::relay_data_header(channel));
+        framed.extend_from_slice(packet);
+        framed
+    }
+
     /// The UDP socket this sink submits on.
     ///
     /// For the paths that need the socket itself rather than a submission:
@@ -427,6 +438,13 @@ impl PeerSink {
     pub async fn send(&self, packet: &[u8], to: PeerAddr) -> io::Result<usize> {
         match to {
             PeerAddr::Udp(addr) => self.udp.send_to(packet, addr).await,
+            // Blind relay: the relay's own tuple carries the framed datagram.
+            // The returned length is the caller's packet, not the frame.
+            PeerAddr::Relayed { relay, channel } => self
+                .udp
+                .send_to(&Self::relay_frame(packet, channel), relay)
+                .await
+                .map(|_| packet.len()),
             // RTC: there is nothing to await. Admission is total and
             // the driver owns what it accepts, so the awaited entry
             // point is the synchronous one. `WouldBlock` reaches the
@@ -460,6 +478,10 @@ impl PeerSink {
     pub fn try_send(&self, packet: &[u8], to: PeerAddr) -> io::Result<usize> {
         match to {
             PeerAddr::Udp(addr) => self.udp.try_send_to(packet, addr),
+            PeerAddr::Relayed { relay, channel } => self
+                .udp
+                .try_send_to(&Self::relay_frame(packet, channel), relay)
+                .map(|_| packet.len()),
             #[cfg(feature = "webrtc")]
             PeerAddr::Rtc(id) => self.submit_rtc(packet, id),
             // R5-A: the endpoint type lives in the wire crate, and a
@@ -497,6 +519,10 @@ impl PeerSink {
         match to {
             PeerAddr::Udp(addr) => {
                 bound_datagram_send(self.udp.send_to(packet, addr), to, deadline).await
+            }
+            PeerAddr::Relayed { relay, channel } => {
+                let framed = Self::relay_frame(packet, channel);
+                bound_datagram_send(self.udp.send_to(&framed, relay), to, deadline).await
             }
             // A deadline around a synchronous decision is a no-op by
             // construction; the RTC half cannot block, so there is

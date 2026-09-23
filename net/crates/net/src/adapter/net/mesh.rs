@@ -2560,6 +2560,13 @@ struct DispatchCtx {
             ),
         >,
     >,
+    /// Blind relays this node talks to (by relay UDP tuple). Datagrams
+    /// from these tuples are relay traffic: framed peer data is unwrapped
+    /// and dispatched as `PeerAddr::Relayed`, control replies go to the
+    /// matching client. Empty unless the node registers with or binds
+    /// through a relay.
+    #[cfg(feature = "nat-traversal")]
+    relay_clients: Arc<DashMap<SocketAddr, Arc<super::traversal::blind_relay::RelayClient>>>,
     /// Rendezvous abuse budgets. See the matching field doc on
     /// `MeshNode` (`rendezvous_budgets`).
     #[cfg(feature = "nat-traversal")]
@@ -12495,6 +12502,13 @@ pub struct MeshNode {
     /// matches that id (a wrong-sender packet is left in place, not
     /// consumed), and the punch-scheduler task reacts by emitting a
     /// `PunchAck`.
+    /// Blind relays this node talks to (by relay UDP tuple). Datagrams
+    /// from these tuples are relay traffic: framed peer data is unwrapped
+    /// and dispatched as `PeerAddr::Relayed`, control replies go to the
+    /// matching client. Empty unless the node registers with or binds
+    /// through a relay.
+    #[cfg(feature = "nat-traversal")]
+    relay_clients: Arc<DashMap<SocketAddr, Arc<super::traversal::blind_relay::RelayClient>>>,
     #[cfg(feature = "nat-traversal")]
     punch_observers: Arc<
         DashMap<
@@ -14421,6 +14435,8 @@ impl MeshNode {
             nat_classifying: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "nat-traversal")]
             punch_observers: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            relay_clients: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             rendezvous_budgets: Arc::new(RendezvousBudgets::default()),
             #[cfg(feature = "nat-traversal")]
@@ -26265,6 +26281,8 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             punch_observers: self.punch_observers.clone(),
             #[cfg(feature = "nat-traversal")]
+            relay_clients: self.relay_clients.clone(),
+            #[cfg(feature = "nat-traversal")]
             rendezvous_budgets: self.rendezvous_budgets.clone(),
             #[cfg(feature = "nat-traversal")]
             traversal_config: self.traversal_config.clone(),
@@ -27696,6 +27714,15 @@ impl MeshNode {
                             Ok((data, source)) => {
                                 // The UDP receive loop is a boundary: the
                                 // socket's tuple becomes the peer endpoint here.
+                                // A datagram from a blind relay this node uses
+                                // is relay traffic: a framed peer datagram is
+                                // unwrapped and attributed to its relayed
+                                // endpoint, anything else is a control reply.
+                                #[cfg(feature = "nat-traversal")]
+                                let (data, source) = match Self::relay_ingress(data, source, &ctx) {
+                                    Some(unwrapped) => unwrapped,
+                                    None => continue,
+                                };
                                 Self::dispatch_packet(data, source, &ctx);
                             }
                             // Batched receiver: a ConnectionReset means its recv
@@ -27726,6 +27753,37 @@ impl MeshNode {
                 }
             }
         })
+    }
+
+    /// Blind-relay boundary for one UDP datagram. `Some` passes the
+    /// (possibly unwrapped) packet on to [`Self::dispatch_packet`]; `None`
+    /// means it was a relay control reply, consumed here.
+    #[cfg(feature = "nat-traversal")]
+    #[inline]
+    fn relay_ingress(
+        data: Bytes,
+        source: PeerAddr,
+        ctx: &DispatchCtx,
+    ) -> Option<(Bytes, PeerAddr)> {
+        let PeerAddr::Udp(from) = source else {
+            return Some((data, source));
+        };
+        let Some(client) = ctx.relay_clients.get(&from) else {
+            return Some((data, source));
+        };
+        match net_wire::peer_addr::split_relay_data(&data) {
+            Some((channel, _)) => Some((
+                data.slice(net_wire::peer_addr::RELAY_DATA_HEADER_LEN..),
+                PeerAddr::Relayed {
+                    relay: from,
+                    channel,
+                },
+            )),
+            None => {
+                client.deliver(&data);
+                None
+            }
+        }
     }
 
     /// Dispatch a single received packet.
@@ -47443,6 +47501,21 @@ impl MeshNode {
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
     ) -> Result<u64, AdapterError> {
+        self.connect_via_endpoint(PeerAddr::Udp(relay_addr), dest_pubkey, dest_node_id)
+            .await
+    }
+
+    /// [`Self::connect_via`] through any endpoint kind — in particular a
+    /// channel on a blind relay (`PeerAddr::Relayed`, from
+    /// `Self::relay_bind`), whose datagrams the sink frames for the relay
+    /// and the receive loop unwraps. The session still authenticates the far
+    /// endpoint end-to-end; the relay only forwards ciphertext.
+    pub async fn connect_via_endpoint(
+        &self,
+        via: PeerAddr,
+        dest_pubkey: &[u8; 32],
+        dest_node_id: u64,
+    ) -> Result<u64, AdapterError> {
         // Retry the msg1-send + msg2-await `handshake_retries` times.
         // Routed handshakes ride a UDP relay path that can drop msg1 or
         // msg2 independently; a single packet loss should not surface as
@@ -47461,7 +47534,7 @@ impl MeshNode {
         let keys = loop {
             attempt += 1;
             match self
-                .try_connect_via_once(PeerAddr::Udp(relay_addr), dest_pubkey, dest_node_id)
+                .try_connect_via_once(via, dest_pubkey, dest_node_id)
                 .await
             {
                 Ok(keys) => break keys,
@@ -47483,9 +47556,70 @@ impl MeshNode {
         // intentionally skip the post-install pingwave /
         // failure_detector / announcement push — see `connect`'s wiring
         // for the direct-handshake-only bookkeeping.
-        self.install_routed(dest_node_id, PeerAddr::Udp(relay_addr), keys, None);
+        self.install_routed(dest_node_id, via, keys, None);
 
         Ok(dest_node_id)
+    }
+
+    /// The client for `relay`, created on first use. Its datagrams are
+    /// recognised by the receive loop from then on.
+    #[cfg(feature = "nat-traversal")]
+    fn relay_client(&self, relay: SocketAddr) -> Arc<super::traversal::blind_relay::RelayClient> {
+        self.relay_clients
+            .entry(relay)
+            .or_insert_with(|| {
+                Arc::new(super::traversal::blind_relay::RelayClient::new(
+                    relay,
+                    self.sink.udp_socket().clone(),
+                ))
+            })
+            .clone()
+    }
+
+    /// Register this node with a blind relay, from its own mesh socket, so
+    /// joiners that hold the returned registration id can reach it through
+    /// the relay. The registration — and the NAT mapping it rides — is
+    /// refreshed in the background until the returned handle is dropped.
+    /// The relay never learns the PSK or any credential.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn relay_register(
+        &self,
+        relay: SocketAddr,
+    ) -> Result<super::traversal::blind_relay::RelayRegistration, AdapterError> {
+        let client = self.relay_client(relay);
+        let keypair = self.entity_keypair_arc();
+        let (id, ttl) = client
+            .register(&keypair)
+            .await
+            .map_err(|e| AdapterError::Connection(format!("relay {relay}: {e}")))?;
+        let refresh = (ttl / 3).max(Duration::from_secs(5));
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(refresh).await;
+                if let Err(e) = client.register(&keypair).await {
+                    tracing::warn!(%relay, error = %e, "blind relay registration refresh failed");
+                }
+            }
+        });
+        Ok(super::traversal::blind_relay::RelayRegistration::new(
+            relay, id, task,
+        ))
+    }
+
+    /// Open a channel to registration `id` on `relay`; the returned relayed
+    /// endpoint is used with [`Self::connect_via_endpoint`].
+    #[cfg(feature = "nat-traversal")]
+    pub async fn relay_bind(
+        &self,
+        relay: SocketAddr,
+        id: super::traversal::blind_relay::RegistrationId,
+    ) -> Result<PeerAddr, AdapterError> {
+        let channel = self
+            .relay_client(relay)
+            .bind(id)
+            .await
+            .map_err(|e| AdapterError::Connection(format!("relay {relay}: {e}")))?;
+        Ok(PeerAddr::Relayed { relay, channel })
     }
 
     /// Handshake to `target_addr` and install the resulting session

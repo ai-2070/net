@@ -704,6 +704,165 @@ impl BlindRelay {
     }
 }
 
+// ---- client side (a mesh node using a relay) ---------------------------------
+
+/// Failure talking to a relay.
+#[derive(Debug, thiserror::Error)]
+pub enum RelayError {
+    /// Socket error sending to the relay.
+    #[error("relay transport: {0}")]
+    Io(#[from] std::io::Error),
+    /// No answer within the retry budget.
+    #[error("relay did not answer")]
+    Timeout,
+    /// The relay refused the request.
+    #[error("relay refused: {0:?}")]
+    Refused(Refusal),
+    /// The node stopped listening for this relay.
+    #[error("relay client closed")]
+    Closed,
+}
+
+/// Per-attempt wait for a relay reply.
+const RELAY_REPLY_WAIT: Duration = Duration::from_millis(1_500);
+/// Attempts per request (UDP may drop either direction).
+const RELAY_ATTEMPTS: u32 = 3;
+
+/// A mesh node's handle on one relay. Requests go out on the node's own mesh
+/// socket (so a device's registration holds the same NAT mapping its relayed
+/// traffic uses); the node's receive loop hands relay control replies to
+/// [`Self::deliver`]. Requests are serialized per relay.
+pub struct RelayClient {
+    relay: SocketAddr,
+    socket: Arc<crate::adapter::net::transport::NetSocket>,
+    replies_tx: tokio::sync::mpsc::Sender<Message>,
+    replies: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Message>>,
+}
+
+impl RelayClient {
+    /// A client for `relay` sending on `socket`.
+    pub fn new(relay: SocketAddr, socket: Arc<crate::adapter::net::transport::NetSocket>) -> Self {
+        let (replies_tx, replies) = tokio::sync::mpsc::channel(32);
+        Self {
+            relay,
+            socket,
+            replies_tx,
+            replies: tokio::sync::Mutex::new(replies),
+        }
+    }
+
+    /// The relay's UDP tuple.
+    pub fn relay(&self) -> SocketAddr {
+        self.relay
+    }
+
+    /// Hand a control datagram received from the relay to a waiting request.
+    /// Data frames are not control and are ignored here.
+    pub fn deliver(&self, bytes: &[u8]) {
+        if let Some(message) = Message::decode(bytes) {
+            if !matches!(message, Message::Data { .. }) {
+                let _ = self.replies_tx.try_send(message);
+            }
+        }
+    }
+
+    async fn exchange<R>(
+        &self,
+        request: &Message,
+        accept: impl Fn(&Message) -> Option<R>,
+    ) -> Result<R, RelayError> {
+        let mut replies = self.replies.lock().await;
+        while replies.try_recv().is_ok() {}
+        let bytes = request.encode();
+        for _ in 0..RELAY_ATTEMPTS {
+            self.socket.send_to(&bytes, self.relay).await?;
+            let deadline = tokio::time::Instant::now() + RELAY_REPLY_WAIT;
+            loop {
+                match tokio::time::timeout_at(deadline, replies.recv()).await {
+                    Ok(Some(Message::Refused(why))) => return Err(RelayError::Refused(why)),
+                    Ok(Some(reply)) => {
+                        if let Some(value) = accept(&reply) {
+                            return Ok(value);
+                        }
+                    }
+                    Ok(None) => return Err(RelayError::Closed),
+                    Err(_) => break,
+                }
+            }
+        }
+        Err(RelayError::Timeout)
+    }
+
+    /// Register `keypair`'s entity: challenge, signed proof, registration id
+    /// and the relay's refresh deadline.
+    pub async fn register(
+        &self,
+        keypair: &EntityKeypair,
+    ) -> Result<(RegistrationId, Duration), RelayError> {
+        let hello = Message::Hello {
+            entity: keypair.entity_id().clone(),
+        };
+        let (nonce, observed) = self
+            .exchange(&hello, |m| match m {
+                Message::Challenge { nonce, observed } => Some((*nonce, *observed)),
+                _ => None,
+            })
+            .await?;
+        let expected = registration_id(keypair.entity_id());
+        self.exchange(&sign_register(keypair, nonce, observed), |m| match m {
+            Message::Registered { id, ttl_secs } if *id == expected => {
+                Some((*id, Duration::from_secs(u64::from(*ttl_secs))))
+            }
+            _ => None,
+        })
+        .await
+    }
+
+    /// Open a channel to registration `id`; the relayed endpoint to use.
+    pub async fn bind(&self, id: RegistrationId) -> Result<u32, RelayError> {
+        self.exchange(&Message::Bind { id }, |m| match m {
+            Message::Bound { id: bound, channel } if *bound == id => Some(*channel),
+            _ => None,
+        })
+        .await
+    }
+}
+
+/// A live registration with a relay. Dropping it stops the refresh; the
+/// relay forgets the registration after its TTL.
+pub struct RelayRegistration {
+    relay: SocketAddr,
+    id: RegistrationId,
+    refresh: tokio::task::JoinHandle<()>,
+}
+
+impl RelayRegistration {
+    /// Wrap a registration and the task refreshing it.
+    pub fn new(
+        relay: SocketAddr,
+        id: RegistrationId,
+        refresh: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self { relay, id, refresh }
+    }
+
+    /// The relay's UDP tuple.
+    pub fn relay(&self) -> SocketAddr {
+        self.relay
+    }
+
+    /// The id joiners bind to.
+    pub fn id(&self) -> RegistrationId {
+        self.id
+    }
+}
+
+impl Drop for RelayRegistration {
+    fn drop(&mut self) {
+        self.refresh.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,10 +949,12 @@ mod tests {
 
     #[test]
     fn replies_are_never_larger_than_their_requests() {
-        assert!(CHALLENGE_LEN <= HELLO_LEN);
-        assert!(REGISTERED_LEN <= REGISTER_LEN);
-        assert!(BOUND_LEN <= BIND_LEN);
-        assert!(REFUSED_LEN <= BIND_LEN && REFUSED_LEN <= REGISTER_LEN);
+        const {
+            assert!(CHALLENGE_LEN <= HELLO_LEN);
+            assert!(REGISTERED_LEN <= REGISTER_LEN);
+            assert!(BOUND_LEN <= BIND_LEN);
+            assert!(REFUSED_LEN <= BIND_LEN && REFUSED_LEN <= REGISTER_LEN);
+        }
     }
 
     #[test]
@@ -1075,5 +1236,95 @@ mod tests {
         );
         assert_eq!(core.stats().forwarded_packets.load(Ordering::Relaxed), 2);
         task.abort();
+    }
+
+    fn mesh_config() -> crate::adapter::net::MeshNodeConfig {
+        let mut cfg =
+            crate::adapter::net::MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [0x5Au8; 32])
+                .with_heartbeat_interval(Duration::from_millis(500))
+                .with_session_timeout(Duration::from_secs(5))
+                .with_handshake(3, Duration::from_secs(3));
+        cfg.socket_buffers = crate::adapter::net::SocketBufferConfig {
+            send_buffer_size: 256 * 1024,
+            recv_buffer_size: 256 * 1024,
+        };
+        cfg
+    }
+
+    async fn mesh_node() -> Arc<crate::adapter::net::MeshNode> {
+        Arc::new(
+            crate::adapter::net::MeshNode::new(EntityKeypair::generate(), mesh_config())
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    /// A real mesh session — routed handshake plus a sealed request/ack
+    /// round trip — runs end-to-end through a blind relay: the device only
+    /// registered from its mesh socket, the joiner only bound a channel, and
+    /// every packet between them was forwarded by the relay as opaque data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_mesh_session_runs_end_to_end_through_the_blind_relay() {
+        use crate::adapter::net::{ChannelName, PeerAddr};
+
+        let relay = BlindRelay::bind("127.0.0.1:0".parse().unwrap(), RelayConfig::default())
+            .await
+            .unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let core = relay.core().clone();
+        let relay_task = tokio::spawn(async move { relay.run().await });
+
+        let device = mesh_node().await;
+        let joiner = mesh_node().await;
+        device.start();
+        joiner.start();
+
+        let registration = device.relay_register(relay_addr).await.expect("register");
+        assert_eq!(registration.id(), registration_id(device.entity_id()));
+        let via = joiner
+            .relay_bind(relay_addr, registration.id())
+            .await
+            .expect("bind");
+        assert!(matches!(via, PeerAddr::Relayed { relay, .. } if relay == relay_addr));
+
+        let before = core.stats().forwarded_packets.load(Ordering::Relaxed);
+        joiner
+            .connect_via_endpoint(via, device.public_key(), device.node_id())
+            .await
+            .expect("routed handshake through the relay");
+        let channel = ChannelName::new("relay.e2e").unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            joiner.subscribe_channel(device.node_id(), channel),
+        )
+        .await
+        .expect("the round trip must not hang")
+        .expect("a sealed request and its ack must cross the relay");
+        let forwarded = core.stats().forwarded_packets.load(Ordering::Relaxed) - before;
+        // msg1 + msg2 + request + ack, at least.
+        assert!(forwarded >= 4, "relay forwarded only {forwarded} packets");
+
+        drop(registration);
+        relay_task.abort();
+    }
+
+    /// Without a registration the relay has nothing to bind to, and a joiner
+    /// cannot reach the device through it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn binding_an_unregistered_device_is_refused() {
+        let relay = BlindRelay::bind("127.0.0.1:0".parse().unwrap(), RelayConfig::default())
+            .await
+            .unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move { relay.run().await });
+        let device = mesh_node().await;
+        let joiner = mesh_node().await;
+        joiner.start();
+        let err = joiner
+            .relay_bind(relay_addr, registration_id(device.entity_id()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("UnknownRegistration"), "{err}");
+        relay_task.abort();
     }
 }
