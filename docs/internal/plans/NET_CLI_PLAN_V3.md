@@ -1826,6 +1826,41 @@ Tasks:
    `join`, and joined `up` presenting its credentials. The e2e journey runs
    join → admitted → `subnet remove` → refused on reconnect.
 
+#### V3-2 org half: decisions (user, 2026-09-24)
+
+**Survey facts.**
+- An `OrgMembershipCert` (156 bytes: org, member, window, generation,
+  nonce) is signed only by the offline org root. Org v1 is deliberately
+  one-hop and root-signed, with no delegated issuance.
+- A cert proves belonging only. Protected calls also need a separate
+  dispatcher grant, which join must never emit (E4).
+- Membership is adopted into a `NodeAuthority` directory (one owner org per
+  node), but `net-mesh up` loads no authority directory today.
+- Revocation is per-(org, member) generation floors, root-signed and merged
+  monotonically. They are applied only at adoption (`node adopt --floors`);
+  no path reaches a running node.
+- `Relation` has only `Mesh` and `Subnet`.
+
+**Decisions.**
+- **Signing at approval.** Org links are always approval-gated.
+  - The device redeems and waits.
+  - `org approve <offer> --root-key <org key>` signs a membership cert for
+    exactly that claimant in the CLI process, then hands the cert to the
+    node over the control channel. The root never touches a node.
+  - The node delivers the cert on the device's next ask; the device-side
+    supervisor re-asks by itself.
+  - The admission engine, the cert wire format and the bindings are
+    unchanged.
+  - Cost: one operator action per device. A delegated org issuer stays
+    possible later as its own core-and-bindings slice.
+- **Order.**
+  - O1 is join: an `Org` relation composed with mesh at first join, plus a
+    standalone org link over the session; per-node adoption
+    (`<state>/authority`); `up` loading it; proven by an org-protected
+    call.
+  - O2 is `org remove`: a root-signed floor applied to running enforcement
+    points with per-node reporting, the same shape as `subnet remove`.
+
 #### V3-2 task 3: standalone subnet join, decisions (user, 2026-09-24)
 
 A device already on the mesh redeems a subnet-only link (`relations =
