@@ -2044,26 +2044,65 @@ impl LeaderBackend for NodeBackend {
                 })
             }
             LeaderRequest::OrgSend { call, payload } => {
-                let outcome = relay_stream_call(&self.org, call).map(|id| {
-                    node.backend_org_send(id, &payload)
-                        .map_err(|error| reported(crate::wasm::sink_error(error, "the upload sink")))
-                });
-                match outcome {
-                    Some(Ok(())) => reply.bytes(Bytes::new()),
-                    Some(Err(failure)) => reply.fail(failure),
-                    None => reply.fail(no_such_call(call)),
-                }
+                // Backpressure in pull form: with the upload window
+                // exhausted the push TAKES NOTHING and this reply is
+                // HELD until a REQUEST_GRANT admits it — so the
+                // follower's `send()` promise stays pending and
+                // resolves only as grants arrive.
+                let org = self.org.clone();
+                spawn_fenced(&lease, &ops, async move {
+                    loop {
+                        let Some(id) = relay_stream_call(&org, call) else {
+                            reply.fail(no_such_call(call));
+                            return;
+                        };
+                        match node.backend_org_send(id, &payload) {
+                            Ok(()) => {
+                                reply.bytes(Bytes::new());
+                                return;
+                            }
+                            Err(crate::rpc_stream::SinkError::WouldBlock) => {
+                                gloo_timer_sleep(ORG_PULL_MS).await.ok();
+                            }
+                            Err(error) => {
+                                reply.fail(reported(crate::wasm::sink_error(
+                                    error,
+                                    "the upload sink",
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                })
             }
             LeaderRequest::OrgFinishSending { call } => {
-                let outcome = relay_stream_call(&self.org, call).map(|id| {
-                    node.backend_org_finish_sending(id)
-                        .map_err(|error| reported(crate::wasm::sink_error(error, "the upload sink")))
-                });
-                match outcome {
-                    Some(Ok(())) => reply.bytes(Bytes::new()),
-                    Some(Err(failure)) => reply.fail(failure),
-                    None => reply.fail(no_such_call(call)),
-                }
+                // The end frame pays the same credit and parks the
+                // same way [`LeaderRequest::OrgSend`] does.
+                let org = self.org.clone();
+                spawn_fenced(&lease, &ops, async move {
+                    loop {
+                        let Some(id) = relay_stream_call(&org, call) else {
+                            reply.fail(no_such_call(call));
+                            return;
+                        };
+                        match node.backend_org_finish_sending(id) {
+                            Ok(()) => {
+                                reply.bytes(Bytes::new());
+                                return;
+                            }
+                            Err(crate::rpc_stream::SinkError::WouldBlock) => {
+                                gloo_timer_sleep(ORG_PULL_MS).await.ok();
+                            }
+                            Err(error) => {
+                                reply.fail(reported(crate::wasm::sink_error(
+                                    error,
+                                    "the upload sink",
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                })
             }
             LeaderRequest::OrgNext { call } => {
                 let org = self.org.clone();
@@ -2270,19 +2309,41 @@ impl LeaderBackend for NodeBackend {
                 })
             }
             LeaderRequest::OrgServeSend { call, payload } => {
-                let outcome = {
-                    let relay = self.org.borrow();
-                    relay
-                        .serve_calls
-                        .get(&call)
-                        .map(|(_, serve)| serve.send(&payload))
-                };
-                match outcome {
-                    Some(Ok(())) => reply.bytes(Bytes::new()),
-                    Some(Err(error)) => reply
-                        .fail(reported(crate::wasm::sink_error(error, "the response sink"))),
-                    None => reply.fail(no_such_call(call)),
-                }
+                // The response sink parks the same way the upload
+                // sinks do: a held reply keeps the follower's
+                // `send()` pending until response credit arrives.
+                let org = self.org.clone();
+                spawn_fenced(&lease, &ops, async move {
+                    loop {
+                        let outcome = {
+                            let relay = org.borrow();
+                            relay
+                                .serve_calls
+                                .get(&call)
+                                .map(|(_, serve)| serve.send(&payload))
+                        };
+                        match outcome {
+                            Some(Ok(())) => {
+                                reply.bytes(Bytes::new());
+                                return;
+                            }
+                            Some(Err(crate::rpc_stream::SinkError::WouldBlock)) => {
+                                gloo_timer_sleep(ORG_PULL_MS).await.ok();
+                            }
+                            Some(Err(error)) => {
+                                reply.fail(reported(crate::wasm::sink_error(
+                                    error,
+                                    "the response sink",
+                                )));
+                                return;
+                            }
+                            None => {
+                                reply.fail(no_such_call(call));
+                                return;
+                            }
+                        }
+                    }
+                })
             }
             LeaderRequest::OrgServeFinish {
                 call,

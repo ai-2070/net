@@ -4715,17 +4715,37 @@ fn optional_u64_ms(opts: &JsValue, key: &str, unit: &str) -> Result<Option<u64>,
 /// A flow-control window option — `None` absent, `Some(n >= 1)`, and
 /// `Some(0)` refused exactly as the native seams refuse it: "send
 /// must await a credit that can never arrive".
+///
+/// Both exact spellings the boundary sees are read — the TS type's
+/// whole NUMBER and the boundary's u64-style decimal STRING — and
+/// nothing else. (A string read as `as_f64()` would silently become
+/// absent/zero and turn every windowed open into a `ZeroWindow`
+/// failure, which is exactly the defect this dual read closes.) `0`
+/// is refused loudly in either spelling.
 fn optional_window(opts: &JsValue, key: &str) -> Result<Option<u32>, JsError> {
     let value = js_sys::Reflect::get(opts, &JsValue::from_str(key))
         .map_err(|_| JsError::new(&format!("{key} could not be read")))?;
     if value.is_undefined() || value.is_null() {
         return Ok(None);
     }
-    let Some(number) = value.as_f64() else {
-        let actual = value.js_typeof().as_string().unwrap_or_default();
-        return Err(JsError::new(&format!(
-            "{key} must be a whole number in 1..=4294967295, not a {actual}"
-        )));
+    let number = match value.as_f64() {
+        Some(number) => number,
+        None => match value.as_string() {
+            // The decimal-string spelling.
+            Some(raw) => raw.trim().parse::<f64>().map_err(|_| {
+                JsError::new(&format!(
+                    "{key} must be a whole number in 1..=4294967295 (or its decimal string), \
+                     got {raw:?}"
+                ))
+            })?,
+            None => {
+                let actual = value.js_typeof().as_string().unwrap_or_default();
+                return Err(JsError::new(&format!(
+                    "{key} must be a whole number in 1..=4294967295 (or its decimal string), \
+                     not a {actual}"
+                )));
+            }
+        },
     };
     if !number.is_finite()
         || number.fract() != 0.0
@@ -5067,36 +5087,58 @@ impl OrgCall {
         Ok(got)
     }
 
-    /// Push one upload/response item.
+    /// Push one upload item.
+    ///
+    /// **Backpressure (core's `send().await` permit semantics in
+    /// pull form):** one credit per item frame. With
+    /// `requestWindowInitial` set and no credit the push TAKES
+    /// NOTHING and this promise stays **pending**, retrying on the
+    /// pump cadence as `REQUEST_GRANT`s arrive — it resolves only as
+    /// grants arrive, exactly like the native sink's await.
     pub(crate) async fn send(&self, payload: &[u8], what: &str) -> Result<(), JsError> {
-        match &self.where_ {
-            OrgWhere::Node { inner, call } => {
-                let call_id = call.call_id;
-                let outcome = with_node(inner, |guard| {
-                    guard
-                        .node
-                        .org_call_send(call_id, payload)
-                        .map_err(|e| sink_error(e, what))
-                });
-                outcome
+        loop {
+            let outcome = match &self.where_ {
+                OrgWhere::Node { inner, call } => {
+                    let call_id = call.call_id;
+                    with_node(inner, |guard| guard.node.org_call_send(call_id, payload))
+                }
+                OrgWhere::Proxy(proxy) => {
+                    // The leader's `OrgSend` arm holds its reply
+                    // under the same rule, so this await is the
+                    // pending promise.
+                    return proxy.send(payload, what).await;
+                }
+            };
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(crate::rpc_stream::SinkError::WouldBlock) => {
+                    gloo_timer_sleep(TICK_MS).await.ok();
+                }
+                Err(error) => return Err(sink_error(error, what)),
             }
-            OrgWhere::Proxy(proxy) => proxy.send(payload, what).await,
         }
     }
 
     /// Half-close the upload direction (CS finish, DX `finishSending`).
+    ///
+    /// The end frame is one more item frame: it pays the same credit
+    /// and parks the same way [`Self::send`] does.
     pub(crate) async fn finish_sending(&self, what: &str) -> Result<(), JsError> {
-        match &self.where_ {
-            OrgWhere::Node { inner, call } => {
-                let call_id = call.call_id;
-                with_node(inner, |guard| {
-                    guard
-                        .node
-                        .org_call_finish_sending(call_id)
-                        .map_err(|e| sink_error(e, what))
-                })
+        loop {
+            let outcome = match &self.where_ {
+                OrgWhere::Node { inner, call } => {
+                    let call_id = call.call_id;
+                    with_node(inner, |guard| guard.node.org_call_finish_sending(call_id))
+                }
+                OrgWhere::Proxy(proxy) => return proxy.finish_sending(what).await,
+            };
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(crate::rpc_stream::SinkError::WouldBlock) => {
+                    gloo_timer_sleep(TICK_MS).await.ok();
+                }
+                Err(error) => return Err(sink_error(error, what)),
             }
-            OrgWhere::Proxy(proxy) => proxy.finish_sending(what).await,
         }
     }
 
@@ -5155,6 +5197,11 @@ pub(crate) fn sink_error(error: crate::rpc_stream::SinkError, what: &str) -> JsE
         )),
         crate::rpc_stream::SinkError::Mint(mint) => JsError::new(&format!(
             "org: {what} cannot open: the signed opening was not minted: {mint:?}"
+        )),
+        crate::rpc_stream::SinkError::WouldBlock => JsError::new(&format!(
+            "org: {what} is parked awaiting request credit (requestWindowInitial); the send \
+             retries as REQUEST_GRANTs arrive and this refusal is only for callers outside the \
+             retry loop"
         )),
     }
 }
@@ -5621,12 +5668,19 @@ impl OrgResponseSinkHandle {
         Self { state }
     }
 
-    /// Push one response item. Refuses (typed) after retirement.
+    /// Push one response item. Refuses (typed) after retirement, and
+    /// parks (retries) while the response window has no credit — the
+    /// same permit semantics as the caller-side sinks.
     pub async fn send(&self, payload: Uint8Array) -> Result<(), JsError> {
-        self.state
-            .call
-            .send(&payload.to_vec())
-            .map_err(|e| sink_error(e, "the response sink"))
+        loop {
+            match self.state.call.send(&payload.to_vec()) {
+                Ok(()) => return Ok(()),
+                Err(crate::rpc_stream::SinkError::WouldBlock) => {
+                    gloo_timer_sleep(TICK_MS).await.ok();
+                }
+                Err(error) => return Err(sink_error(error, "the response sink")),
+            }
+        }
     }
 
     /// End the response side successfully. Idempotent: the terminal
