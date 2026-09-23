@@ -70,7 +70,11 @@ const MAX_CONTROL_FRAME: usize = 16 * 1024;
 const CONTROL_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_MAX_SESSIONS: usize = 8;
 const MESH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-const JOIN_ATTACH_WAIT: Duration = Duration::from_secs(10);
+/// Bound on a joined node's first attach. The direct path gets at most
+/// `DIRECT_ATTACH_WAIT` of it when a relay is named; the rest leaves the relay
+/// room for the operator's ~5 s defer of a re-attaching identity (its previous
+/// session, e.g. from `join`, must lapse first).
+const JOIN_ATTACH_WAIT: Duration = Duration::from_secs(20);
 
 /// `net-mesh up` arguments.
 #[derive(Args, Debug)]
@@ -130,6 +134,16 @@ pub struct UpArgs {
     /// Defaults to the profile name.
     #[arg(long, value_name = "NAME", requires = "enroll")]
     pub domain_name: Option<String>,
+
+    /// Blind relay (`host:port`) to register with, so joiners that cannot
+    /// reach this node directly fall back to it; tokens then carry both paths
+    /// and joiners try the direct one first. Defaults to the profile `relay`.
+    #[arg(long, value_name = "HOST:PORT", requires = "enroll")]
+    pub relay: Option<String>,
+
+    /// Do not register with any relay (overrides the profile and default).
+    #[arg(long, requires = "enroll", conflicts_with = "relay")]
+    pub no_relay: bool,
 }
 
 /// `net-mesh down` arguments.
@@ -179,7 +193,7 @@ pub(crate) fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn random<const N: usize>() -> Result<[u8; N], CliError> {
+pub(crate) fn random<const N: usize>() -> Result<[u8; N], CliError> {
     let mut b = [0u8; N];
     getrandom::fill(&mut b).map_err(|_| generic("operating-system CSPRNG unavailable"))?;
     Ok(b)
@@ -633,8 +647,13 @@ struct NodeReport {
 struct JoinedReport {
     issuer_fingerprint: String,
     domain_name: String,
-    contact: String,
+    contact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay: Option<String>,
     attached: bool,
+    /// `direct` or `relay` when attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
 }
@@ -850,8 +869,16 @@ pub async fn run_up(
     let identity_path = args.identity.or_else(|| profile.identity.clone());
     let fmt = OutputFormat::resolve_stream(output);
     let enroll_plan = if args.enroll {
+        let relay = if args.no_relay {
+            None
+        } else {
+            args.relay
+                .or_else(|| profile.relay.clone())
+                .or_else(|| super::enrollment::DEFAULT_RELAY.map(str::to_string))
+        };
         Some(super::enrollment::EnrollPlan::validate(
             args.public_addr,
+            relay,
             args.issuer_identity,
             args.ledger,
             args.domain_name,
@@ -975,21 +1002,18 @@ pub async fn run_up(
     let joined_report = match joined.as_ref().and_then(|j| j.bundle().map(|b| (j, b))) {
         Some((join, bundle)) => {
             let c = bundle.contact();
-            let attached = tokio::time::timeout(
-                JOIN_ATTACH_WAIT,
-                mesh.connect_via(&c.addr.to_string(), &c.noise_pubkey, c.node_id),
-            )
-            .await;
-            let detail = match attached {
-                Ok(Ok(())) => None,
-                Ok(Err(e)) => Some(format!("attach failed: {e}")),
-                Err(_) => Some("attach timed out".to_string()),
-            };
+            let (path, detail) =
+                match super::enrollment::attach_contact(&mesh, c, JOIN_ATTACH_WAIT).await {
+                    Ok(path) => (Some(path.to_string()), None),
+                    Err(e) => (None, Some(format!("attach failed: {e}"))),
+                };
             Some(JoinedReport {
                 issuer_fingerprint: join.invite().issuer_fingerprint(),
                 domain_name: join.invite().trust_domain_name().to_string(),
-                contact: c.addr.to_string(),
+                contact: c.addr.map(|a| a.to_string()),
+                relay: c.relay.as_ref().map(|r| r.endpoint.as_str().to_string()),
                 attached: detail.is_none(),
+                path,
                 detail,
             })
         }

@@ -798,6 +798,13 @@ fn put_endpoint_hash(h: &mut blake3::Hasher, addr: SocketAddr) {
     h.update(&buf);
 }
 
+/// A random port in the IANA dynamic range (49152–65535).
+fn random_dynamic_port() -> std::io::Result<u16> {
+    let mut b = [0u8; 2];
+    getrandom::fill(&mut b).map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(49_152 + u16::from_be_bytes(b) % 16_384)
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -827,15 +834,30 @@ struct Shared {
 }
 
 impl BlindRelay {
-    /// Bind the relay's UDP socket and its TCP listener on the same port. With
-    /// port 0 the TCP port is chosen first and the UDP port follows it: some
-    /// hosts (Windows) exclude TCP-only port ranges that sit inside the UDP
-    /// ephemeral range, so a UDP-chosen port may be unbindable for TCP.
+    /// Bind the relay's UDP socket and its TCP listener on the same port.
+    ///
+    /// With port 0 the OS-chosen TCP port is tried first, then random ports
+    /// from the IANA dynamic range until one binds for both protocols. Some
+    /// hosts (Windows with Hyper-V/WSL) reserve large TCP-only and UDP-only
+    /// port blocks inside the ephemeral range and hand out ephemeral ports
+    /// sequentially, so retrying the OS's choice alone can keep landing in
+    /// the same reserved block.
     pub async fn bind(addr: SocketAddr, config: RelayConfig) -> std::io::Result<Self> {
-        let attempts = if addr.port() == 0 { 16 } else { 1 };
+        let attempts = if addr.port() == 0 { 64 } else { 1 };
         let mut last = None;
-        for _ in 0..attempts {
-            let listener = TcpListener::bind(addr).await?;
+        for attempt in 0..attempts {
+            let candidate = if attempt == 0 {
+                addr
+            } else {
+                SocketAddr::new(addr.ip(), random_dynamic_port()?)
+            };
+            let listener = match TcpListener::bind(candidate).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    last = Some(e);
+                    continue;
+                }
+            };
             let port = listener.local_addr()?.port();
             match UdpSocket::bind(SocketAddr::new(addr.ip(), port)).await {
                 Ok(socket) => {
@@ -1965,5 +1987,34 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1_024);
         task.abort();
+    }
+
+    /// A routed handshake cancelled by its caller (a timeout before a
+    /// fallback path) must not leave its pending entry behind: the next
+    /// attempt to the same peer — here the relay fallback's shape, a fresh
+    /// `connect_via` — succeeds instead of failing "already in flight".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_routed_handshake_does_not_block_the_next_attempt() {
+        let device = mesh_node().await;
+        let joiner = mesh_node().await;
+        device.start();
+        joiner.start();
+        let dead = {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.local_addr().unwrap()
+        };
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(300),
+            joiner.connect_via(dead, device.public_key(), device.node_id()),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the dead path must still be pending");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            joiner.connect_via(device.local_addr(), device.public_key(), device.node_id()),
+        )
+        .await
+        .expect("no hang")
+        .expect("the cancelled attempt must not block this one");
     }
 }

@@ -205,7 +205,7 @@ fn attach(join: &DeviceJoin) -> Result<(), String> {
         let c = bundle.contact();
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            mesh.connect_via(&c.addr.to_string(), &c.noise_pubkey, c.node_id),
+            mesh.connect_via(&c.addr.unwrap().to_string(), &c.noise_pubkey, c.node_id),
         )
         .await;
         let _ = mesh.shutdown().await;
@@ -340,7 +340,7 @@ fn minimal_config_up_enroll_provisions_once_and_a_device_joins() {
     let other = fx.json(&["invite", "create", "--addr", &named]);
     assert_eq!(other["endpoint"], named.as_str());
     let shown = MembershipInvite::decode(other["token"].as_str().unwrap()).unwrap();
-    assert_eq!(shown.endpoint().as_str(), named);
+    assert_eq!(shown.endpoint().unwrap().as_str(), named);
     fx.json(&["down"]);
     drop(second);
 }

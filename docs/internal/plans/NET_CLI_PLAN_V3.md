@@ -78,6 +78,8 @@ The following is **proposed V3 syntax**, not shipped commands. Final parser fact
 | `net-mesh up [--psk-from <SOURCE>] [--enroll]` | Start one real long-lived node under the selected profile/identity. With no source, generate and durably protect a fresh random trust-domain PSK on first start and reuse it for that profile; never use a public, empty or all-zero PSK. Foreground by default; `--detach` explicitly transfers ownership to a managed child only after readiness. `<SOURCE>` is a protected `file:`, `stdin`, or configured `kms:` reference, never a literal PSK on argv. `--enroll` is the explicit opt-in that makes this node the enrollment owner: it loads the selected issuer identity and durable ledger store, taking the ledger's exclusive lock, and opens the PSK-free Noise enrollment listener in the same process. `up --enroll` refuses before binding if the issuer identity or ledger store is missing, invalid or already owned. Without `--enroll` the node mints nothing and exposes no enrollment listener. |
 | `net-mesh down` | Ask the selected locally managed node instance to drain and stop through authenticated owner-only local control, then verify that exact instance exited. It does not revoke enrollment, delete identity, rotate the PSK, or stop unrelated SDK processes. |
 | `net-mesh node status` | Report the selected managed instance, exact incarnation, readiness, bind/public endpoint, identity fingerprint and control-owner state without exposing the PSK or treating a stale PID/metadata file as liveness. |
+| `net-mesh up --enroll [--relay <HOST:PORT> \| --no-relay]` | (R2, implemented.) Register the enrollment node with a blind relay, from the profile `relay` or a project default that stays empty until a relay is deployed. Tokens and bundles then carry the relay as the fallback path; joiners try direct first. Registration is retried in the background, so a relay being unavailable never blocks start-up or direct joins. |
+| `net-mesh relay serve --bind <ADDR>` | (R2, implemented.) Run a blind UDP relay in the foreground, with TCP splices on the same port number. It holds no PSK, issuer key or mesh credential and is not a mesh member. |
 | `net-mesh enrollment stop` / `enrollment start` (optional) | If offered, local control operations on the running `up --enroll` node that close or reopen only its enrollment listener; the node and its ledger ownership stay up. Not a separate process. `start` on a node launched without `--enroll` refuses. |
 | `net-mesh invite create` | Create a mesh invitation through the running `up --enroll` node's local control endpoint, which records it in the ledger it owns before returning the link; optional exact `--subnet` scope. Refuses when no enrolling node is running; never opens the ledger itself. |
 | `net-mesh invite inspect` | Offline, redacted parse/signature/expiry inspection where verifiable; never consumes a nonce or claims current authority. |
@@ -1348,9 +1350,104 @@ Regressions:
 - Clippy (core all-features all-targets, lib/bins all and no-default; SDK
   `full` all-targets; `net-cli`) and rustdoc (root, SDK `full`) are clean.
 
-**Next:** R2 phase 3. Token and bundle relay locators; direct-first,
-relay-fallback in `join` and joined `up`; `up --enroll` registering with the
-configured relay and feeding `accept_splices` into `serve_stream`.
+#### R2 phase 3 — relay locators and direct-first, relay-fallback (receipt)
+
+**Formats** (unreleased, changed in place). The signed invite's direct
+endpoint is now optional, and the invite gains an optional signed
+`RelayLocator { endpoint host:port, registration id }`. A token must name at
+least one of the two. The bundle's `MeshContact` likewise has an optional
+`addr` and an optional `relay`, and is refused when it has neither.
+`invite inspect`, `invite create` and `join` show both.
+
+**Redemption** (`redeem_with_path`, `DeviceJoin::last_path`):
+- The direct endpoint is always tried first.
+- Only a failure to *connect* falls back to the relay splice: refused,
+  unreachable, or no accept within `DIRECT_CONNECT_WAIT` (4 s) when a relay is
+  named. Without a relay, the direct path gets the whole budget.
+- A service answer, including a refusal, is never rerouted.
+- A dead relay never delays a reachable direct endpoint.
+
+**Mesh attach** (`attach_contact`, used by `join` and joined `up`). Direct is
+tried first, bounded by `DIRECT_ATTACH_WAIT` (5 s) only when a relay is named.
+After that the relay is used: `relay_bind`, then `connect_via_endpoint`. The
+path taken is reported: `join` reports `enroll_path` and `attach_path`, and
+joined `up` reports `joined.path`. The joined-`up` attach wait rose to 20 s,
+leaving the relay room for the operator's ~5 s `DeferBusy` on a re-attaching
+identity (measured in R1b).
+
+**Device side.**
+- `up --enroll --relay HOST:PORT` (or the profile `relay`; `--no-relay`
+  overrides both; `DEFAULT_RELAY` is `None` until a relay is deployed) starts a
+  `RelayLink`.
+- The link registers from the mesh socket; the first attempt is bounded at 4 s
+  before readiness, then retries every 15 s in the background. The core refresh
+  re-registers after a relay restart.
+- Spliced streams go through `SessionSink` into the same enrollment service.
+- Readiness reports `relay`, `relay_state` (`registered`/`unavailable`) and
+  `relay_error`.
+- Tokens carry the locator whenever a relay is configured. The registration id
+  is derived from the node's entity id, so it is known even before the first
+  registration succeeds.
+
+**Core fix found by the witness.** A routed handshake cancelled by its caller
+(the direct attempt's timeout) left its `pending_handshakes` entry behind, so
+the relay attempt to the same peer failed "handshake already in flight". The
+new `PendingInitiator` guard closes the attempt's receiver on drop and removes
+the entry only if it is still that attempt's; a newer attempt's entry is never
+touched.
+
+**Port selection on Windows.** Hyper-V/WSL reserve both TCP-only and UDP-only
+blocks inside the ephemeral range (here 63787–65141 for UDP), and Windows
+allocates ephemeral ports roughly sequentially, so neither TCP-first nor
+UDP-first retries escape a block. `BlindRelay::bind` and the CLI's enrollment
+`free_port` now try the OS choice once, then random ports from 49152–65535
+(up to 64 attempts) until both protocols bind.
+
+Witnesses:
+- SDK `enrollment_relay` 6/6:
+  - `a_reachable_direct_endpoint_is_used_before_the_relay` (0 splices);
+  - `an_unreachable_direct_endpoint_falls_back_to_the_relay` (plus a
+    relay-only token);
+  - `a_dead_relay_does_not_block_a_reachable_direct_endpoint` (< 2 s);
+  - `failures_are_not_rerouted_without_cause` (no relay → `Io`; refusal →
+    `Conflict`, 0 splices);
+  - the two phase-2 witnesses.
+- `enrollment_invite`: `a_relay_locator_is_signed_and_the_direct_endpoint_is_optional`
+  (redirecting the registration id fails `BadSignature`; neither path is
+  refused).
+- `enrollment_join`: `a_bundle_contact_carries_its_relay_and_may_omit_the_direct_address`.
+- Core: `a_cancelled_routed_handshake_does_not_block_the_next_attempt`.
+- CLI `relay_join` 4/4, all real subprocesses including `relay serve`:
+  - `a_dead_direct_path_falls_back_to_the_relay` (`enroll_path` = `relay`,
+    `attach_path` = `relay`, joined `up` `path` = `relay`);
+  - `a_live_direct_path_is_used_while_a_relay_is_present` (both `direct`);
+  - `a_dead_relay_does_not_block_the_direct_path` (`relay_state` =
+    `unavailable`, token still carries it, both paths `direct`);
+  - `relay_flags_are_validated_before_any_effect`.
+
+Inverse mutations, each caught by its witness and then restored
+byte-identically:
+- the guard not removing the entry;
+- redeem going relay-first;
+- redeem never falling back;
+- CLI attach going relay-first.
+
+Regressions:
+- `cargo tl` 5810/5810.
+- The `connect_via` integration binaries (channel_identity_readiness,
+  connect_direct, coordinator_selection, direct_upgrade, route_withdraw,
+  routed_transport_availability, sensing_failure_plane,
+  three_node_integration) 116/116.
+- SDK enrollment 56/56.
+- `net-cli` 345/345.
+- Clippy (core all-features all-targets, lib/bins all, default and
+  no-default; SDK `full`; `net-cli` all-targets) and rustdoc (root, SDK `full`,
+  `net-cli`) are clean.
+
+**Next:** R2 phase 4, the natsim fallback rows:
+1. A relay host on the WAN side; a gateway with no mapping and forced direct
+   failure. Join relayed, with evidence identifying the relayed path.
+2. Relay down, mapping working. Join direct.
 Lifecycle fencing, selective subnet semantics and V2 exact-head acceptance
 remain open.
 

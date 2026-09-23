@@ -3976,6 +3976,26 @@ struct PendingHandshake {
     tx: oneshot::Sender<Result<SessionKeys, CryptoError>>,
 }
 
+/// One routed-handshake attempt's claim on its `pending_handshakes` entry.
+/// If the attempt is cancelled — its future dropped, e.g. by a caller's
+/// timeout before the fallback path — the entry would otherwise outlive it
+/// and refuse every later handshake to that peer as "already in flight".
+/// Dropping the guard closes this attempt's receiver and removes the entry
+/// only if it is still this attempt's (its sender sees the closed receiver);
+/// a newer attempt's entry is never touched.
+struct PendingInitiator<'a> {
+    map: &'a DashMap<u64, PendingHandshake>,
+    key: u64,
+    rx: oneshot::Receiver<Result<SessionKeys, CryptoError>>,
+}
+
+impl Drop for PendingInitiator<'_> {
+    fn drop(&mut self) {
+        self.rx.close();
+        self.map.remove_if(&self.key, |_, p| p.tx.is_closed());
+    }
+}
+
 /// 32-bit "routing identity" projection of a `u64` node_id, used as the
 /// key across the routing plane (routing header's `src_id` is `u32`).
 /// Encoded back into a `u64` as the low 32 bits, high bits zero, so the
@@ -47439,6 +47459,11 @@ impl MeshNode {
                 v.insert(PendingHandshake { noise, tx });
             }
         }
+        let mut pending = PendingInitiator {
+            map: &self.pending_handshakes,
+            key: pending_key,
+            rx,
+        };
 
         // Wrap msg1 in a Net handshake packet + routing header and
         // send to the first hop. No session encryption — the handshake
@@ -47458,7 +47483,8 @@ impl MeshNode {
         }
 
         // Wait for the dispatch loop to complete msg2.
-        let keys = match tokio::time::timeout(self.config.handshake_timeout, rx).await {
+        let keys = match tokio::time::timeout(self.config.handshake_timeout, &mut pending.rx).await
+        {
             Ok(Ok(Ok(k))) => k,
             Ok(Ok(Err(e))) => {
                 self.pending_handshakes.remove(&pending_key);

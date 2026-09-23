@@ -134,7 +134,8 @@ fn sign_by(
         InviteSpec {
             trust_domain_name: "test".into(),
             trust_domain: Psk::new([1; 32]).trust_domain(),
-            endpoint: EnrollmentEndpoint::parse(&format!("127.0.0.1:{port}")).unwrap(),
+            endpoint: Some(EnrollmentEndpoint::parse(&format!("127.0.0.1:{port}")).unwrap()),
+            relay: None,
             enrollment_key: key,
             relations: vec![Relation::Mesh],
             intended_subject: None,

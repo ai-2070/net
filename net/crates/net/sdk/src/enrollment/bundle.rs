@@ -15,7 +15,7 @@
 
 use std::net::SocketAddr;
 
-use super::invite::{InviteError, MembershipInvite, RedemptionIntent, Relation};
+use super::invite::{InviteError, MembershipInvite, RedemptionIntent, Relation, RelayLocator};
 use super::redeem::Refusal;
 use super::service::BundleIssuer;
 use super::{fingerprint, now_unix, push_lp, Reader};
@@ -198,16 +198,20 @@ fn signing_message(body: &[u8]) -> Vec<u8> {
     m
 }
 
-/// Where the enrolled device first attaches: a mesh node's socket address,
-/// Noise static public key and routing node id (for `Mesh::connect_via`).
+/// Where the enrolled device first attaches: a mesh node's direct socket
+/// address and/or the blind relay it is registered with, its Noise static
+/// public key and routing node id (for `Mesh::connect_via`). Direct is tried
+/// first; the session authenticates the key end-to-end on either path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MeshContact {
-    /// Reachable mesh socket address.
-    pub addr: SocketAddr,
+    /// Directly reachable mesh socket address, if known.
+    pub addr: Option<SocketAddr>,
     /// The node's mesh Noise static public key.
     pub noise_pubkey: [u8; 32],
     /// The node's routing node id.
     pub node_id: u64,
+    /// Blind relay the node is registered with, if any.
+    pub relay: Option<RelayLocator>,
 }
 
 /// Secret-bearing enrollment result: receipt, trust-domain PSK and first contact.
@@ -241,14 +245,20 @@ impl MembershipBundle {
 
     /// Canonical bytes. **Secret** (contains the PSK).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let addr = self.contact.addr.to_string();
-        let mut out = Vec::with_capacity(4 + 4 + self.receipt.bytes.len() + 32 + 4 + 64 + 40);
+        let mut out = Vec::with_capacity(4 + 4 + self.receipt.bytes.len() + 32 + 5 + 64 + 40);
         out.extend_from_slice(&BUNDLE_MAGIC);
         push_lp(&mut out, &self.receipt.bytes);
         out.extend_from_slice(self.psk.expose_bytes());
-        push_lp(&mut out, addr.as_bytes());
+        match self.contact.addr {
+            Some(addr) => {
+                out.push(1);
+                push_lp(&mut out, addr.to_string().as_bytes());
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&self.contact.noise_pubkey);
         out.extend_from_slice(&self.contact.node_id.to_le_bytes());
+        super::invite::put_relay(&mut out, self.contact.relay.as_ref());
         out
     }
 
@@ -265,16 +275,29 @@ impl MembershipBundle {
         }
         let receipt = MembershipReceipt::from_bytes(r.take(receipt_len).ok_or(t.clone())?)?;
         let psk = Psk::new(r.take_arr::<32>().ok_or(t.clone())?);
-        let addr_len = r.take_u32().ok_or(t.clone())? as usize;
-        if addr_len > MAX_ADDR_BYTES {
-            return Err(BundleError::Malformed("contact address too long"));
-        }
-        let addr = std::str::from_utf8(r.take(addr_len).ok_or(t.clone())?)
-            .ok()
-            .and_then(|s| s.parse::<SocketAddr>().ok())
-            .ok_or(BundleError::Malformed("bad contact address"))?;
+        let addr = match r.take_arr::<1>().ok_or(t.clone())?[0] {
+            0 => None,
+            1 => {
+                let addr_len = r.take_u32().ok_or(t.clone())? as usize;
+                if addr_len > MAX_ADDR_BYTES {
+                    return Err(BundleError::Malformed("contact address too long"));
+                }
+                Some(
+                    std::str::from_utf8(r.take(addr_len).ok_or(t.clone())?)
+                        .ok()
+                        .and_then(|s| s.parse::<SocketAddr>().ok())
+                        .ok_or(BundleError::Malformed("bad contact address"))?,
+                )
+            }
+            _ => return Err(BundleError::Malformed("bad contact address flag")),
+        };
         let noise_pubkey = r.take_arr::<32>().ok_or(t.clone())?;
         let node_id = r.take_u64().ok_or(t)?;
+        let relay = super::invite::take_relay(&mut r)
+            .map_err(|_| BundleError::Malformed("bad contact relay"))?;
+        if addr.is_none() && relay.is_none() {
+            return Err(BundleError::Malformed("contact has no address or relay"));
+        }
         if !r.done() {
             return Err(BundleError::Malformed("trailing bundle bytes"));
         }
@@ -285,6 +308,7 @@ impl MembershipBundle {
                 addr,
                 noise_pubkey,
                 node_id,
+                relay,
             },
         })
     }

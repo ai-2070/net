@@ -21,7 +21,7 @@ use net::adapter::net::behavior::enrollment_storage::{EnrollmentStorage, Storage
 
 use super::bundle::{BundleError, MembershipBundle};
 use super::invite::{InviteError, MembershipInvite, RedemptionIntent};
-use super::redeem::{redeem, RedeemError, RedeemOutcome};
+use super::redeem::{redeem_with_path, RedeemError, RedeemOutcome, RedeemPath};
 use super::store::ReceiptId;
 use super::{fingerprint, Reader};
 use crate::identity::Identity;
@@ -71,6 +71,7 @@ pub struct DeviceJoin {
     invite: MembershipInvite,
     intent: RedemptionIntent,
     bundle: Option<MembershipBundle>,
+    path: Option<RedeemPath>,
 }
 
 impl core::fmt::Debug for DeviceJoin {
@@ -101,6 +102,7 @@ impl DeviceJoin {
             invite: invite.clone(),
             intent,
             bundle: None,
+            path: None,
         })
     }
 
@@ -115,6 +117,7 @@ impl DeviceJoin {
             invite,
             intent,
             bundle,
+            path: None,
         })
     }
 
@@ -124,7 +127,9 @@ impl DeviceJoin {
         if self.bundle.is_some() {
             return Ok(JoinStatus::Installed { receipt_id: None });
         }
-        let outcome = redeem(&self.invite, &self.identity, &self.intent, timeout).await?;
+        let (outcome, path) =
+            redeem_with_path(&self.invite, &self.identity, &self.intent, timeout).await?;
+        self.path = Some(path);
         let (receipt_id, bytes) = match outcome {
             RedeemOutcome::PendingApproval => return Ok(JoinStatus::PendingApproval),
             RedeemOutcome::Issued {
@@ -155,6 +160,12 @@ impl DeviceJoin {
     /// The invite being redeemed.
     pub fn invite(&self) -> &MembershipInvite {
         &self.invite
+    }
+
+    /// The path the last redemption session in this process ran over
+    /// (direct or relayed); `None` before one ran.
+    pub fn last_path(&self) -> Option<RedeemPath> {
+        self.path
     }
 
     /// The installed bundle, once verified and persisted.

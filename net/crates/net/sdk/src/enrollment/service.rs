@@ -174,6 +174,15 @@ impl EnrollmentService {
         spawn_session(stream, &self.ctx, &self.permits)
     }
 
+    /// A cloneable [`Self::serve_stream`] handle for a task that feeds this
+    /// service streams (e.g. a relay splice acceptor).
+    pub fn session_sink(&self) -> SessionSink {
+        SessionSink {
+            ctx: self.ctx.clone(),
+            permits: self.permits.clone(),
+        }
+    }
+
     /// The shared ledger, for the local owner's offer/approve/deny/revoke.
     pub fn ledger(&self) -> &SharedLedger {
         &self.ledger
@@ -194,6 +203,29 @@ impl Drop for EnrollmentService {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+
+/// Feeds streams into a service's sessions; see
+/// [`EnrollmentService::session_sink`].
+#[derive(Clone)]
+pub struct SessionSink {
+    ctx: Arc<Ctx>,
+    permits: Arc<Semaphore>,
+}
+
+impl core::fmt::Debug for SessionSink {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SessionSink")
+            .field("available_sessions", &self.permits.available_permits())
+            .finish()
+    }
+}
+
+impl SessionSink {
+    /// See [`EnrollmentService::serve_stream`].
+    pub fn serve(&self, stream: TcpStream) -> bool {
+        spawn_session(stream, &self.ctx, &self.permits)
     }
 }
 

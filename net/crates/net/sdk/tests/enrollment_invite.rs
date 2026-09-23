@@ -8,7 +8,7 @@ use std::time::Duration;
 use net_sdk::bootstrap_credential::Psk;
 use net_sdk::enrollment::invite::{
     EnrollmentEndpoint, EnrollmentKey, InviteError, InviteSpec, MembershipInvite, RedemptionIntent,
-    Relation, JOIN_TOKEN_PREFIX, MAX_INVITE_BYTES,
+    Relation, RelayLocator, JOIN_TOKEN_PREFIX, MAX_INVITE_BYTES,
 };
 use net_sdk::enrollment::policy::{ApprovalMode, InvitationPolicy};
 use net_sdk::enrollment::store::{ClaimOutcome, EnrollmentLedger, LedgerLimits};
@@ -25,7 +25,8 @@ fn spec(intended: Option<EntityId>, mode: ApprovalMode) -> InviteSpec {
     InviteSpec {
         trust_domain_name: "home-lab".into(),
         trust_domain: psk().trust_domain(),
-        endpoint: EnrollmentEndpoint::parse("enroll.example.net:7443").unwrap(),
+        endpoint: Some(EnrollmentEndpoint::parse("enroll.example.net:7443").unwrap()),
+        relay: None,
         enrollment_key: EnrollmentKey([3; 32]),
         relations: vec![Relation::Mesh],
         intended_subject: intended,
@@ -54,7 +55,7 @@ fn a_signed_link_round_trips_every_bound_field() {
     assert_eq!(back.issuer(), issuer.entity_id());
     assert_eq!(back.trust_domain_name(), "home-lab");
     assert_eq!(back.trust_domain(), psk().trust_domain());
-    assert_eq!(back.endpoint().as_str(), "enroll.example.net:7443");
+    assert_eq!(back.endpoint().unwrap().as_str(), "enroll.example.net:7443");
     assert_eq!(back.enrollment_key(), EnrollmentKey([3; 32]));
     assert_eq!(back.policy().expires_at(), T0 + 86_400);
     assert_eq!(back.policy().approval_mode(), ApprovalMode::Preauthorized);
@@ -289,4 +290,52 @@ fn debug_output_redacts_the_invitation_identifier_and_link() {
     assert!(!text.contains(&body[..24]), "{text}");
     let id = format!("{:?}", invite.invitation_id().as_bytes());
     assert!(!text.contains(&id[1..id.len() - 1]), "{text}");
+}
+
+/// The relay locator is signed with everything else; the direct endpoint may
+/// be omitted when a relay is named, but a token must name at least one.
+#[test]
+fn a_relay_locator_is_signed_and_the_direct_endpoint_is_optional() {
+    let issuer = Identity::generate();
+    let relay = RelayLocator {
+        endpoint: EnrollmentEndpoint::parse("relay.example.net:3478").unwrap(),
+        registration: [0x9C; 16],
+    };
+
+    let mut both = spec(None, ApprovalMode::Preauthorized);
+    both.relay = Some(relay.clone());
+    let back =
+        MembershipInvite::decode(&MembershipInvite::sign(&issuer, both).unwrap().encode()).unwrap();
+    assert_eq!(back.relay(), Some(&relay));
+    assert_eq!(
+        back.endpoint().map(|e| e.as_str()),
+        Some("enroll.example.net:7443")
+    );
+
+    let mut relay_only = spec(None, ApprovalMode::Preauthorized);
+    relay_only.endpoint = None;
+    relay_only.relay = Some(relay.clone());
+    let signed = MembershipInvite::sign(&issuer, relay_only).unwrap();
+    let back = MembershipInvite::decode(&signed.encode()).unwrap();
+    assert_eq!(back.endpoint(), None);
+    assert_eq!(back.relay(), Some(&relay));
+
+    // Redirecting the relay registration breaks the issuer signature.
+    let mut bytes = signed.to_bytes().to_vec();
+    let at = bytes
+        .windows(16)
+        .position(|w| w == [0x9C; 16])
+        .expect("registration id in the signed body");
+    bytes[at] ^= 1;
+    assert_eq!(
+        MembershipInvite::from_bytes(&bytes),
+        Err(InviteError::BadSignature)
+    );
+
+    let mut neither = spec(None, ApprovalMode::Preauthorized);
+    neither.endpoint = None;
+    assert!(matches!(
+        MembershipInvite::sign(&issuer, neither),
+        Err(InviteError::Endpoint(_))
+    ));
 }

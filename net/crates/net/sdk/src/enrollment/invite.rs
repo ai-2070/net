@@ -2,8 +2,9 @@
 //! Signed membership invitation (`netmesh-join_` token) and canonical redemption intent.
 //!
 //! A [`MembershipInvite`] binds, under one issuer signature: the full issuer
-//! identity, a named trust domain and its public [`TrustDomainId`], the TCP
-//! enrollment endpoint and its Noise static key, a random single-use
+//! identity, a named trust domain and its public [`TrustDomainId`], where to
+//! redeem — a direct TCP enrollment endpoint, a blind-relay [`RelayLocator`], or
+//! both (direct is tried first) — and the enrollment Noise static key, a random single-use
 //! [`InvitationId`], the creation-time [`InvitationPolicy`], an optional intended
 //! device identity and the exact authorized [`Relation`] set. It carries **no**
 //! PSK, root key or audience secret, but a subject-unbound link is still bearer
@@ -222,6 +223,67 @@ fn check_host(host: &str) -> Result<(), InviteError> {
     }
 }
 
+/// Where a device that cannot be reached directly is reachable: a blind relay's
+/// `host:port` (UDP for the mesh, TCP on the same port number for enrollment
+/// splices) and the device's registration id there. The relay is blind: it
+/// forwards ciphertext and cannot answer for the device, whose keys are
+/// authenticated end-to-end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayLocator {
+    /// The relay's address.
+    pub endpoint: EnrollmentEndpoint,
+    /// The device's registration id on that relay.
+    pub registration: [u8; 16],
+}
+
+pub(super) fn put_opt_endpoint(out: &mut Vec<u8>, endpoint: Option<&EnrollmentEndpoint>) {
+    match endpoint {
+        Some(e) => {
+            out.push(1);
+            super::push_lp(out, e.as_str().as_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+pub(super) fn take_opt_endpoint(
+    r: &mut Reader<'_>,
+) -> Result<Option<EnrollmentEndpoint>, InviteError> {
+    match r
+        .take_arr::<1>()
+        .ok_or(InviteError::Malformed("truncated"))?[0]
+    {
+        0 => Ok(None),
+        1 => {
+            let s = r
+                .take_lp_string()
+                .ok_or(InviteError::Malformed("bad endpoint"))?;
+            Ok(Some(EnrollmentEndpoint::parse(&s)?))
+        }
+        _ => Err(InviteError::Malformed("bad endpoint flag")),
+    }
+}
+
+pub(super) fn put_relay(out: &mut Vec<u8>, relay: Option<&RelayLocator>) {
+    put_opt_endpoint(out, relay.map(|r| &r.endpoint));
+    if let Some(r) = relay {
+        out.extend_from_slice(&r.registration);
+    }
+}
+
+pub(super) fn take_relay(r: &mut Reader<'_>) -> Result<Option<RelayLocator>, InviteError> {
+    let Some(endpoint) = take_opt_endpoint(r)? else {
+        return Ok(None);
+    };
+    let registration = r
+        .take_arr::<16>()
+        .ok_or(InviteError::Malformed("truncated"))?;
+    Ok(Some(RelayLocator {
+        endpoint,
+        registration,
+    }))
+}
+
 /// X25519 Noise static public key of the enrollment responder. The device runs a
 /// PSK-free Noise handshake that authenticates the responder by this key, so a
 /// clean device can reach the issuer before holding the mesh PSK. Not secret.
@@ -241,9 +303,12 @@ pub struct InviteSpec {
     pub trust_domain_name: String,
     /// Public id of the PSK trust domain the redeemed device will join.
     pub trust_domain: TrustDomainId,
-    /// TCP address of the enrollment listener.
-    pub endpoint: EnrollmentEndpoint,
-    /// Noise static key the listener at `endpoint` must prove.
+    /// Direct TCP address of the enrollment listener, if one is known.
+    pub endpoint: Option<EnrollmentEndpoint>,
+    /// Blind relay the device is registered with, if any. At least one of
+    /// `endpoint` and `relay` is required.
+    pub relay: Option<RelayLocator>,
+    /// Noise static key the enrollment responder must prove, on either path.
     pub enrollment_key: EnrollmentKey,
     /// Exact authorized relations (canonical order).
     pub relations: Vec<Relation>,
@@ -259,7 +324,8 @@ pub struct MembershipInvite {
     issuer: EntityId,
     trust_domain_name: String,
     trust_domain: TrustDomainId,
-    endpoint: EnrollmentEndpoint,
+    endpoint: Option<EnrollmentEndpoint>,
+    relay: Option<RelayLocator>,
     enrollment_key: EnrollmentKey,
     invitation_id: InvitationId,
     policy: InvitationPolicy,
@@ -276,7 +342,8 @@ impl core::fmt::Debug for MembershipInvite {
             .field("issuer", &fingerprint(&self.issuer))
             .field("trust_domain_name", &self.trust_domain_name)
             .field("trust_domain", &self.trust_domain)
-            .field("endpoint", &self.endpoint.as_str())
+            .field("endpoint", &self.endpoint.as_ref().map(|e| e.as_str()))
+            .field("relay", &self.relay)
             .field("enrollment_key", &self.enrollment_key)
             .field("invitation_id", &"<redacted>")
             .field("policy", &self.policy)
@@ -297,13 +364,17 @@ impl MembershipInvite {
     pub fn sign(issuer: &Identity, spec: InviteSpec) -> Result<Self, InviteError> {
         check_trust_domain_name(&spec.trust_domain_name)?;
         check_relations(&spec.relations)?;
+        if spec.endpoint.is_none() && spec.relay.is_none() {
+            return Err(InviteError::Endpoint("no direct endpoint or relay"));
+        }
         let invitation_id = InvitationId::random().map_err(|_| InviteError::Random)?;
         let mut body = Vec::new();
         body.extend_from_slice(&INVITE_MAGIC);
         body.extend_from_slice(issuer.entity_id().as_bytes());
         super::push_lp(&mut body, spec.trust_domain_name.as_bytes());
         body.extend_from_slice(spec.trust_domain.as_bytes());
-        super::push_lp(&mut body, spec.endpoint.as_str().as_bytes());
+        put_opt_endpoint(&mut body, spec.endpoint.as_ref());
+        put_relay(&mut body, spec.relay.as_ref());
         body.extend_from_slice(&spec.enrollment_key.0);
         body.extend_from_slice(invitation_id.as_bytes());
         body.extend_from_slice(&spec.policy.created_at().to_le_bytes());
@@ -330,6 +401,7 @@ impl MembershipInvite {
             trust_domain_name: spec.trust_domain_name,
             trust_domain: spec.trust_domain,
             endpoint: spec.endpoint,
+            relay: spec.relay,
             enrollment_key: spec.enrollment_key,
             invitation_id,
             policy: spec.policy,
@@ -362,10 +434,11 @@ impl MembershipInvite {
             .ok_or(InviteError::Malformed("bad trust-domain name"))?;
         check_trust_domain_name(&name)?;
         let trust_domain = TrustDomainId::from_bytes(r.take_arr::<16>().ok_or(t.clone())?);
-        let endpoint = r
-            .take_lp_string()
-            .ok_or(InviteError::Malformed("bad endpoint"))?;
-        let endpoint = EnrollmentEndpoint::parse(&endpoint)?;
+        let endpoint = take_opt_endpoint(&mut r)?;
+        let relay = take_relay(&mut r)?;
+        if endpoint.is_none() && relay.is_none() {
+            return Err(InviteError::Endpoint("no direct endpoint or relay"));
+        }
         let enrollment_key = EnrollmentKey(r.take_arr::<32>().ok_or(t.clone())?);
         let invitation_id = InvitationId::from_bytes(r.take_arr::<16>().ok_or(t.clone())?);
         let created = r.take_u64().ok_or(t.clone())?;
@@ -396,6 +469,7 @@ impl MembershipInvite {
             trust_domain_name: name,
             trust_domain,
             endpoint,
+            relay,
             enrollment_key,
             invitation_id,
             policy,
@@ -468,9 +542,14 @@ impl MembershipInvite {
         }
     }
 
-    /// Redemption endpoint.
-    pub fn endpoint(&self) -> &EnrollmentEndpoint {
-        &self.endpoint
+    /// Direct redemption endpoint, if the issuer knew one.
+    pub fn endpoint(&self) -> Option<&EnrollmentEndpoint> {
+        self.endpoint.as_ref()
+    }
+
+    /// Blind relay to fall back to when the direct endpoint is unreachable.
+    pub fn relay(&self) -> Option<&RelayLocator> {
+        self.relay.as_ref()
     }
 
     /// Noise static key the enrollment responder must prove.

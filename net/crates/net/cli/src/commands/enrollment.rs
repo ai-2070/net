@@ -17,11 +17,13 @@ use clap::{Args, Subcommand};
 use net_sdk::bootstrap_credential::{Psk, TrustDomainId};
 use net_sdk::enrollment::bundle::{MembershipIssuer, MeshContact};
 use net_sdk::enrollment::invite::{
-    EnrollmentEndpoint, EnrollmentKey, InviteSpec, MembershipInvite, Relation,
+    EnrollmentEndpoint, EnrollmentKey, InviteSpec, MembershipInvite, Relation, RelayLocator,
 };
 use net_sdk::enrollment::policy::{ApprovalMode, InvitationPolicy, DEFAULT_INVITATION_TTL};
 use net_sdk::enrollment::redeem::Refusal;
-use net_sdk::enrollment::service::{BundleIssuer, EnrollmentService, ServiceConfig, SharedLedger};
+use net_sdk::enrollment::service::{
+    BundleIssuer, EnrollmentService, ServiceConfig, SessionSink, SharedLedger,
+};
 use net_sdk::enrollment::store::{
     EnrollmentLedger, LedgerError, LedgerLimits, OfferId, OfferState,
 };
@@ -35,11 +37,17 @@ use crate::prelude::{emit_value, OutputFormat};
 
 const LEDGER_SUBDIR: &str = "ledger";
 
+/// The project-run default relay for `up --enroll`. Deliberately empty until a
+/// relay is actually deployed: an invented address would send every device's
+/// registration to whoever holds it. `--relay` or the profile `relay` apply.
+pub(crate) const DEFAULT_RELAY: Option<&str> = None;
+
 // ---- up --enroll -------------------------------------------------------------
 
 /// Validated `up --enroll` inputs. Built before any filesystem or network effect.
 pub(crate) struct EnrollPlan {
     public: Option<EnrollmentEndpoint>,
+    relay: Option<EnrollmentEndpoint>,
     issuer_path: Option<PathBuf>,
     /// `Some` when the operator named a ledger; it must already exist.
     explicit_ledger: Option<PathBuf>,
@@ -52,6 +60,7 @@ impl EnrollPlan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn validate(
         public_addr: Option<String>,
+        relay: Option<String>,
         issuer_identity: Option<PathBuf>,
         ledger: Option<PathBuf>,
         domain_name: Option<String>,
@@ -63,6 +72,13 @@ impl EnrollPlan {
             Some(raw) => Some(
                 EnrollmentEndpoint::parse(&raw)
                     .map_err(|e| invalid_args(format!("--public-addr: {e}")))?,
+            ),
+            None => None,
+        };
+        let relay = match relay {
+            Some(raw) => Some(
+                EnrollmentEndpoint::parse(&raw)
+                    .map_err(|e| invalid_args(format!("--relay: {e}")))?,
             ),
             None => None,
         };
@@ -87,6 +103,7 @@ impl EnrollPlan {
         }
         Ok(Self {
             public,
+            relay,
             issuer_path: issuer_identity,
             explicit_ledger: ledger,
             default_ledger: state.join(LEDGER_SUBDIR),
@@ -176,13 +193,22 @@ impl EnrollPlan {
     }
 }
 
-/// A port currently free for both UDP and TCP on `ip`. TCP allocates first:
-/// some platforms reserve large TCP-only port ranges (e.g. Windows exclusions)
-/// that sequential UDP ephemeral allocation would keep landing in.
+/// A port currently free for both UDP and TCP on `ip`: the OS-chosen TCP port
+/// first, then random ports from the IANA dynamic range. Some platforms
+/// (Windows with Hyper-V/WSL) reserve large TCP-only and UDP-only blocks inside
+/// the ephemeral range and allocate ephemeral ports sequentially, so retrying
+/// the OS's choice alone can keep landing in the same reserved block.
 fn free_port(ip: std::net::IpAddr) -> Result<u16, CliError> {
-    for _ in 0..32 {
-        let tcp = std::net::TcpListener::bind((ip, 0))
-            .map_err(|e| generic(format!("choose enrollment port: {e}")))?;
+    for attempt in 0..64 {
+        let candidate = if attempt == 0 {
+            0
+        } else {
+            let r: [u8; 2] = super::lifecycle::random()?;
+            49_152 + u16::from_be_bytes(r) % 16_384
+        };
+        let Ok(tcp) = std::net::TcpListener::bind((ip, candidate)) else {
+            continue;
+        };
         let port = tcp
             .local_addr()
             .map_err(|e| generic(format!("choose enrollment port: {e}")))?
@@ -300,11 +326,20 @@ impl EnrollOwner {
         .map_err(|e| {
             connection_failure(format!("enrollment listener on TCP {}: {e}", self.bind))
         })?;
+        // Relay fallback: register (and keep re-trying) in the background;
+        // the node serves direct joiners whether or not the relay is up.
+        let relay = match self.plan.relay {
+            Some(endpoint) => {
+                Some(RelayLink::start(mesh.node().clone(), endpoint, service.session_sink()).await)
+            }
+            None => None,
+        };
         let context = Arc::new(EnrollContext {
             issuer: self.issuer,
             ledger: self.ledger,
             key: service.enrollment_key(),
             default_endpoint,
+            relay: relay.as_ref().map(|r| r.locator.clone()),
             trust_domain,
             domain_name: self.plan.domain_name,
             bundles,
@@ -313,13 +348,111 @@ impl EnrollOwner {
             service,
             context,
             tcp_mapping,
+            relay,
             port_mapping: self.plan.port_mapping,
             created: self.created,
         })
     }
 }
 
-/// Delivers bundles whose mesh contact matches the address each token named.
+/// How long `up --enroll` waits for the first relay registration before it
+/// reports readiness (it keeps retrying in the background either way).
+const RELAY_REGISTER_WAIT: Duration = Duration::from_secs(4);
+/// Pause between relay registration attempts while the relay is unreachable.
+const RELAY_RETRY: Duration = Duration::from_secs(15);
+/// Spliced enrollment streams buffered for the service.
+const RELAY_SPLICE_BACKLOG: usize = 16;
+
+/// This node's registration with its blind relay. Registration is retried in
+/// the background until it succeeds (and then refreshed by the core, which
+/// re-registers after a relay restart); each spliced enrollment stream is
+/// handed to the enrollment service like an accepted connection.
+struct RelayLink {
+    locator: RelayLocator,
+    state: Arc<parking_lot::Mutex<RelayLinkState>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct RelayLinkState {
+    registered: Option<SocketAddr>,
+    error: Option<String>,
+}
+
+impl RelayLink {
+    async fn start(
+        node: Arc<net::adapter::net::MeshNode>,
+        endpoint: EnrollmentEndpoint,
+        sink: SessionSink,
+    ) -> Self {
+        let locator = RelayLocator {
+            endpoint: endpoint.clone(),
+            registration: net::adapter::net::traversal::blind_relay::registration_id(
+                node.entity_id(),
+            ),
+        };
+        let state = Arc::new(parking_lot::Mutex::new(RelayLinkState::default()));
+        let (first_tx, first) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(relay_loop(node, endpoint, sink, state.clone(), first_tx));
+        let _ = tokio::time::timeout(RELAY_REGISTER_WAIT, first).await;
+        Self {
+            locator,
+            state,
+            task,
+        }
+    }
+}
+
+impl Drop for RelayLink {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn relay_loop(
+    node: Arc<net::adapter::net::MeshNode>,
+    endpoint: EnrollmentEndpoint,
+    sink: SessionSink,
+    state: Arc<parking_lot::Mutex<RelayLinkState>>,
+    first: tokio::sync::oneshot::Sender<()>,
+) {
+    let mut first = Some(first);
+    loop {
+        let attempt = async {
+            let addr = tokio::net::lookup_host(endpoint.as_str())
+                .await
+                .map_err(|e| format!("resolve {}: {e}", endpoint.as_str()))?
+                .next()
+                .ok_or_else(|| format!("{} does not resolve", endpoint.as_str()))?;
+            node.relay_register(addr).await.map_err(|e| e.to_string())
+        };
+        match attempt.await {
+            Ok(mut registration) => {
+                *state.lock() = RelayLinkState {
+                    registered: Some(registration.relay()),
+                    error: None,
+                };
+                if let Some(first) = first.take() {
+                    let _ = first.send(());
+                }
+                let mut streams = registration.accept_splices(RELAY_SPLICE_BACKLOG);
+                while let Some(stream) = streams.recv().await {
+                    sink.serve(stream);
+                }
+                return;
+            }
+            Err(e) => {
+                state.lock().error = Some(e);
+                if let Some(first) = first.take() {
+                    let _ = first.send(());
+                }
+                tokio::time::sleep(RELAY_RETRY).await;
+            }
+        }
+    }
+}
+
+/// Delivers bundles whose mesh contact matches the paths each token named.
 struct NodeBundles {
     issuer: Identity,
     psk: Psk,
@@ -351,16 +484,27 @@ impl NodeBundles {
         Some(addr)
     }
 
-    fn issuer_for(&self, contact: SocketAddr) -> MembershipIssuer {
-        MembershipIssuer::new(
-            self.issuer.clone(),
-            self.psk.clone(),
-            MeshContact {
-                addr: contact,
-                noise_pubkey: self.noise_pubkey,
-                node_id: self.node_id,
-            },
-        )
+    /// The mesh contact for a token: the direct UDP address matching its
+    /// enrollment endpoint (if it named one) and the relay it named (if any).
+    fn contact_for(&self, invite: &MembershipInvite) -> Option<MeshContact> {
+        let addr = match invite.endpoint() {
+            Some(endpoint) => Some(self.contact_addr(endpoint)?),
+            None => None,
+        };
+        let relay = invite.relay().cloned();
+        if addr.is_none() && relay.is_none() {
+            return None;
+        }
+        Some(MeshContact {
+            addr,
+            noise_pubkey: self.noise_pubkey,
+            node_id: self.node_id,
+            relay,
+        })
+    }
+
+    fn issuer_for(&self, contact: MeshContact) -> MembershipIssuer {
+        MembershipIssuer::new(self.issuer.clone(), self.psk.clone(), contact)
     }
 }
 
@@ -370,9 +514,7 @@ impl BundleIssuer for NodeBundles {
         invite: &MembershipInvite,
         intent: &net_sdk::enrollment::invite::RedemptionIntent,
     ) -> Result<Vec<u8>, Refusal> {
-        let contact = self
-            .contact_addr(invite.endpoint())
-            .ok_or(Refusal::Unavailable)?;
+        let contact = self.contact_for(invite).ok_or(Refusal::Unavailable)?;
         self.issuer_for(contact).issue(invite, intent)
     }
 
@@ -381,7 +523,12 @@ impl BundleIssuer for NodeBundles {
         invite: &MembershipInvite,
         intent: &net_sdk::enrollment::invite::RedemptionIntent,
     ) -> Result<(), Refusal> {
-        let unspecified = SocketAddr::from(([0, 0, 0, 0], 0));
+        let unspecified = MeshContact {
+            addr: Some(SocketAddr::from(([0, 0, 0, 0], 0))),
+            noise_pubkey: self.noise_pubkey,
+            node_id: self.node_id,
+            relay: None,
+        };
         self.issuer_for(unspecified).may_recover(invite, intent)
     }
 }
@@ -391,6 +538,7 @@ pub(crate) struct RunningEnrollment {
     service: EnrollmentService,
     context: Arc<EnrollContext>,
     tcp_mapping: Option<net_sdk::enrollment::portmap::TcpMapping>,
+    relay: Option<RelayLink>,
     port_mapping: bool,
     created: Vec<&'static str>,
 }
@@ -408,6 +556,14 @@ pub(crate) struct EnrollmentReport {
     issuer: String,
     issuer_fingerprint: String,
     domain_name: String,
+    /// The relay tokens name as the fallback path; `None` when none is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay: Option<String>,
+    /// `registered` or `unavailable` (retrying) when a relay is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     created: Vec<String>,
 }
@@ -432,6 +588,21 @@ impl RunningEnrollment {
             issuer: hex::encode(c.issuer.entity_id().as_bytes()),
             issuer_fingerprint: net_sdk::enrollment::fingerprint(c.issuer.entity_id()),
             domain_name: c.domain_name.clone(),
+            relay: self
+                .relay
+                .as_ref()
+                .map(|r| r.locator.endpoint.as_str().to_string()),
+            relay_state: self.relay.as_ref().map(|r| {
+                if r.state.lock().registered.is_some() {
+                    "registered".to_string()
+                } else {
+                    "unavailable".to_string()
+                }
+            }),
+            relay_error: self
+                .relay
+                .as_ref()
+                .and_then(|r| r.state.lock().error.clone()),
             created: self.created.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -441,6 +612,7 @@ impl RunningEnrollment {
     }
 
     pub(crate) async fn shutdown(self) {
+        drop(self.relay);
         self.service.shutdown().await;
         if let Some(mapping) = self.tcp_mapping {
             mapping.shutdown().await;
@@ -454,6 +626,7 @@ pub(crate) struct EnrollContext {
     ledger: SharedLedger,
     key: EnrollmentKey,
     default_endpoint: Option<EnrollmentEndpoint>,
+    relay: Option<RelayLocator>,
     trust_domain: TrustDomainId,
     domain_name: String,
     bundles: Arc<NodeBundles>,
@@ -489,17 +662,26 @@ impl EnrollContext {
             None => None,
         };
         let endpoint = match request["addr"].as_str() {
-            Some(addr) => EnrollmentEndpoint::parse(addr).map_err(|e| format!("--addr: {e}"))?,
-            None => self.default_endpoint.clone().ok_or_else(|| {
-                "no direct address is known for this node (no --public-addr, no router                  mapping, wildcard bind); pass --addr <host:port> reachable by the joiner"
-                    .to_string()
-            })?,
+            Some(addr) => {
+                Some(EnrollmentEndpoint::parse(addr).map_err(|e| format!("--addr: {e}"))?)
+            }
+            None => self.default_endpoint.clone(),
         };
+        if endpoint.is_none() && self.relay.is_none() {
+            return Err(
+                "no direct address is known for this node (no --public-addr, no router \
+                 mapping, wildcard bind) and no relay is set; pass --addr <host:port> reachable \
+                 by the joiner, or run `up --enroll --relay <host:port>`"
+                    .to_string(),
+            );
+        }
         // Resolve the matching mesh contact now so an unusable address fails
         // here, not at redemption.
-        self.bundles
-            .contact_addr(&endpoint)
-            .ok_or_else(|| format!("address {} does not resolve", endpoint.as_str()))?;
+        if let Some(endpoint) = &endpoint {
+            self.bundles
+                .contact_addr(endpoint)
+                .ok_or_else(|| format!("address {} does not resolve", endpoint.as_str()))?;
+        }
         let policy = InvitationPolicy::with_options(now, ttl, mode).map_err(|e| e.to_string())?;
         let invite = MembershipInvite::sign(
             &self.issuer,
@@ -507,6 +689,7 @@ impl EnrollContext {
                 trust_domain_name: self.domain_name.clone(),
                 trust_domain: self.trust_domain,
                 endpoint: endpoint.clone(),
+                relay: self.relay.clone(),
                 enrollment_key: self.key,
                 relations: vec![Relation::Mesh],
                 intended_subject: intended,
@@ -525,7 +708,8 @@ impl EnrollContext {
             "expires_at": policy.expires_at(),
             "approval": approval_name(mode),
             "bearer": invite.is_bearer(),
-            "endpoint": endpoint.as_str(),
+            "endpoint": endpoint.as_ref().map(|e| e.as_str()),
+            "relay": self.relay.as_ref().map(|r| r.endpoint.as_str()),
             "issuer_fingerprint": invite.issuer_fingerprint(),
         }))
     }
@@ -859,7 +1043,8 @@ pub async fn run_invite(
             emit(&json!({
                 "issuer": hex::encode(invite.issuer().as_bytes()),
                 "issuer_fingerprint": invite.issuer_fingerprint(),
-                "endpoint": invite.endpoint().as_str(),
+                "endpoint": invite.endpoint().map(|e| e.as_str()),
+                "relay": invite.relay().map(|r| r.endpoint.as_str()),
                 "enrollment_key": hex::encode(invite.enrollment_key().0),
                 "domain_name": invite.trust_domain_name(),
                 "trust_domain": invite.trust_domain().to_string(),
@@ -929,24 +1114,92 @@ pub struct JoinArgs {
 
 pub(crate) const JOIN_SUBDIR: &str = "join";
 
-/// Build a mesh as `identity` with `psk` and attach it to `contact` via the
-/// routed handshake. The local socket binds loopback for a loopback contact and
-/// the wildcard otherwise (outbound only).
+/// How long a direct mesh attach may take before the relay fallback, when the
+/// contact also names a relay. Without a relay the direct path has the whole
+/// wait.
+const DIRECT_ATTACH_WAIT: Duration = Duration::from_secs(5);
+
+/// Attach `mesh` to `contact` via the routed handshake: **direct first**, the
+/// contact's blind relay only if the direct attempt fails. The session
+/// authenticates the contact's key end-to-end on either path. Returns the path
+/// used (`"direct"` or `"relay"`).
+pub(crate) async fn attach_contact(
+    mesh: &net_sdk::Mesh,
+    contact: &MeshContact,
+    wait: Duration,
+) -> Result<&'static str, String> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut direct_failure = None;
+    if let Some(addr) = contact.addr {
+        let budget = if contact.relay.is_some() {
+            DIRECT_ATTACH_WAIT.min(wait)
+        } else {
+            wait
+        };
+        let attempt = tokio::time::timeout(
+            budget,
+            mesh.connect_via(&addr.to_string(), &contact.noise_pubkey, contact.node_id),
+        )
+        .await;
+        match attempt {
+            Ok(Ok(())) => return Ok("direct"),
+            Ok(Err(e)) => direct_failure = Some(format!("direct {addr}: {e}")),
+            Err(_) => direct_failure = Some(format!("direct {addr}: timed out")),
+        }
+    }
+    let Some(relay) = &contact.relay else {
+        return Err(direct_failure.unwrap_or_else(|| "the contact names no address".to_string()));
+    };
+    let relayed = tokio::time::timeout_at(deadline, async {
+        let addr = tokio::net::lookup_host(relay.endpoint.as_str())
+            .await
+            .map_err(|e| format!("resolve {}: {e}", relay.endpoint.as_str()))?
+            .next()
+            .ok_or_else(|| format!("{} does not resolve", relay.endpoint.as_str()))?;
+        let via = mesh
+            .node()
+            .relay_bind(addr, relay.registration)
+            .await
+            .map_err(|e| e.to_string())?;
+        mesh.node()
+            .connect_via_endpoint(via, &contact.noise_pubkey, contact.node_id)
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    let relay_failure = match relayed {
+        Ok(Ok(())) => return Ok("relay"),
+        Ok(Err(e)) => format!("relay {}: {e}", relay.endpoint.as_str()),
+        Err(_) => format!("relay {}: timed out", relay.endpoint.as_str()),
+    };
+    Err(match direct_failure {
+        Some(direct) => format!("{direct}; {relay_failure}"),
+        None => relay_failure,
+    })
+}
+
+/// Build a mesh as `identity` with `psk` and attach it to `contact`
+/// ([`attach_contact`]). The local socket binds loopback for a loopback
+/// contact and the wildcard otherwise (outbound only).
 pub(crate) async fn attach_mesh(
     identity: Identity,
     psk: &Psk,
     contact: &MeshContact,
     bind: Option<SocketAddr>,
     wait: Duration,
-) -> Result<net_sdk::Mesh, String> {
-    let bind = bind.unwrap_or_else(|| {
-        if contact.addr.ip().is_loopback() {
-            SocketAddr::new(contact.addr.ip(), 0)
-        } else if contact.addr.is_ipv4() {
-            SocketAddr::from(([0, 0, 0, 0], 0))
-        } else {
-            SocketAddr::from(([0u16; 8], 0))
-        }
+) -> Result<(net_sdk::Mesh, &'static str), String> {
+    let hint = contact.addr.map(|a| a.ip()).or_else(|| {
+        contact
+            .relay
+            .as_ref()
+            .and_then(|r| r.endpoint.as_str().parse::<SocketAddr>().ok())
+            .map(|a| a.ip())
+    });
+    let bind = bind.unwrap_or_else(|| match hint {
+        Some(ip) if ip.is_loopback() => SocketAddr::new(ip, 0),
+        Some(ip) if ip.is_ipv6() => SocketAddr::from(([0u16; 8], 0)),
+        _ => SocketAddr::from(([0, 0, 0, 0], 0)),
     });
     let mesh = net_sdk::MeshBuilder::new(&bind.to_string(), psk.expose_bytes())
         .map_err(|e| e.to_string())?
@@ -955,24 +1208,11 @@ pub(crate) async fn attach_mesh(
         .await
         .map_err(|e| e.to_string())?;
     mesh.start();
-    let attached = tokio::time::timeout(
-        wait,
-        mesh.connect_via(
-            &contact.addr.to_string(),
-            &contact.noise_pubkey,
-            contact.node_id,
-        ),
-    )
-    .await;
-    match attached {
-        Ok(Ok(())) => Ok(mesh),
-        Ok(Err(e)) => {
+    match attach_contact(&mesh, contact, wait).await {
+        Ok(path) => Ok((mesh, path)),
+        Err(e) => {
             let _ = mesh.shutdown().await;
-            Err(e.to_string())
-        }
-        Err(_) => {
-            let _ = mesh.shutdown().await;
-            Err("timed out".to_string())
+            Err(e)
         }
     }
 }
@@ -1011,12 +1251,17 @@ pub async fn run_join(
     }
 
     // Show what is being trusted before anything is written or sent.
+    let direct = invite.endpoint().map_or("none", |e| e.as_str());
+    let enroll_via = match invite.relay() {
+        Some(relay) => format!("{direct} (relay fallback {})", relay.endpoint.as_str()),
+        None => direct.to_string(),
+    };
     eprintln!(
         "Joining trust domain '{}' (id {}) run by issuer {}\n  enrollment address: {}\n  token: {}, expires at unix {}",
         invite.trust_domain_name(),
         invite.trust_domain(),
         invite.issuer_fingerprint(),
-        invite.endpoint().as_str(),
+        enroll_via,
         if invite.is_bearer() {
             "bearer (the first redeemer joins)"
         } else {
@@ -1081,10 +1326,12 @@ pub async fn run_join(
             generic(format!("the issuer refused this join: {r}"))
         }
         DeviceJoinError::Redeem(
-            RedeemError::Io(_) | RedeemError::Timeout | RedeemError::Handshake,
+            RedeemError::Io(_)
+            | RedeemError::Timeout
+            | RedeemError::Handshake
+            | RedeemError::Relay(_),
         ) => connection_failure(format!(
-            "could not complete enrollment with {}: {e}",
-            invite.endpoint().as_str()
+            "could not complete enrollment via {enroll_via}: {e}"
         )),
         other => generic(format!("join failed: {other}")),
     })?;
@@ -1104,18 +1351,27 @@ pub async fn run_join(
     };
     let contact = bundle.contact().clone();
     let trust_domain = bundle.psk().trust_domain().to_string();
+    let enroll_path = join.last_path().map(|p| p.as_str());
     // Installation is credential state; live admission is observed separately.
-    match attach_mesh(join.identity().clone(), bundle.psk(), &contact, None, args.wait).await {
-        Ok(mesh) => {
+    let attach_path = match attach_mesh(
+        join.identity().clone(),
+        bundle.psk(),
+        &contact,
+        None,
+        args.wait,
+    )
+    .await
+    {
+        Ok((mesh, path)) => {
             let _ = mesh.shutdown().await;
+            path
         }
         Err(e) => {
             return Err(connection_failure(format!(
-                "credentials are installed, but the live attach to {} failed: {e}; `net-mesh up` retries it",
-                contact.addr
-            )))
+            "credentials are installed, but the live attach failed ({e}); `net-mesh up` retries it"
+        )))
         }
-    }
+    };
     emit_value(
         fmt,
         &json!({
@@ -1124,9 +1380,13 @@ pub async fn run_join(
             "issuer_fingerprint": invite.issuer_fingerprint(),
             "domain_name": invite.trust_domain_name(),
             "trust_domain": trust_domain,
-            "contact": contact.addr.to_string(),
+            "contact": contact.addr.map(|a| a.to_string()),
+            "relay": contact.relay.as_ref().map(|r| r.endpoint.as_str()),
             "installed": true,
             "attached": true,
+            // `null` when the bundle was already installed before this run.
+            "enroll_path": enroll_path,
+            "attach_path": attach_path,
         }),
     )
     .map_err(|e| generic(format!("write result: {e}")))

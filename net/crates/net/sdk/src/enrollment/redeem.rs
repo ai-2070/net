@@ -244,12 +244,40 @@ pub enum RedeemError {
     /// The service refused the request.
     #[error("enrollment refused: {0}")]
     Refused(Refusal),
+    /// The direct endpoint was unreachable and the relay fallback failed.
+    #[error("enrollment relay: {0}")]
+    Relay(String),
 }
+
+/// The path a redemption session ran over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedeemPath {
+    /// Straight to the invite's direct endpoint.
+    Direct,
+    /// Spliced through the invite's blind relay.
+    Relay,
+}
+
+impl RedeemPath {
+    /// `"direct"` or `"relay"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+        }
+    }
+}
+
+/// How long the direct endpoint gets to accept a connection before the relay
+/// fallback, when the invite also names a relay. Without a relay the direct
+/// endpoint has the whole session budget.
+pub const DIRECT_CONNECT_WAIT: Duration = Duration::from_secs(4);
 
 /// Redeem `invite` for `device` over the PSK-free Noise enrollment session.
 ///
 /// Verifies locally first that `intent` is this device's intent for this invite;
-/// then connects to the invite's endpoint, requires the responder to prove the
+/// then connects — direct endpoint first, the invite's blind relay only if the
+/// direct endpoint cannot be reached — requires the responder to prove the
 /// signed enrollment key, and sends one signed request. Returns the committed
 /// issuance (first or recovered) or a pending-approval answer. Does not install
 /// or interpret the bundle.
@@ -259,17 +287,77 @@ pub async fn redeem(
     intent: &RedemptionIntent,
     timeout: Duration,
 ) -> Result<RedeemOutcome, RedeemError> {
+    redeem_with_path(invite, device, intent, timeout)
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+/// [`redeem`], also reporting which path the session ran over.
+///
+/// **Direct first, relay fallback.** The direct endpoint is always tried
+/// first; only a failure to *connect* to it (refused, unreachable, or no accept
+/// within [`DIRECT_CONNECT_WAIT`]) falls back to the relay. An answer from the
+/// service — including a refusal — is never retried through the relay, and the
+/// relay's availability never delays a reachable direct endpoint.
+pub async fn redeem_with_path(
+    invite: &MembershipInvite,
+    device: &Identity,
+    intent: &RedemptionIntent,
+    timeout: Duration,
+) -> Result<(RedeemOutcome, RedeemPath), RedeemError> {
     if intent.subject() != device.entity_id() {
         return Err(RedeemError::Intent(InviteError::WrongSubject));
     }
     intent.check_against(invite).map_err(RedeemError::Intent)?;
     let session = async {
-        let stream = TcpStream::connect(invite.endpoint().as_str()).await?;
-        redeem_session(stream, invite, device, intent).await
+        let (stream, path) = connect(invite).await?;
+        let outcome = redeem_session(stream, invite, device, intent).await?;
+        Ok((outcome, path))
     };
     tokio::time::timeout(timeout, session)
         .await
         .map_err(|_| RedeemError::Timeout)?
+}
+
+async fn connect(invite: &MembershipInvite) -> Result<(TcpStream, RedeemPath), RedeemError> {
+    let direct_failure = match invite.endpoint() {
+        Some(endpoint) => {
+            let dial = TcpStream::connect(endpoint.as_str());
+            let dialled = if invite.relay().is_some() {
+                tokio::time::timeout(DIRECT_CONNECT_WAIT, dial)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "direct endpoint did not accept",
+                        ))
+                    })
+            } else {
+                dial.await
+            };
+            match dialled {
+                Ok(stream) => return Ok((stream, RedeemPath::Direct)),
+                Err(e) => RedeemError::Io(e),
+            }
+        }
+        None => RedeemError::Protocol("the invite names no direct endpoint"),
+    };
+    #[cfg(feature = "nat-traversal")]
+    if let Some(relay) = invite.relay() {
+        use net::adapter::net::traversal::blind_relay::open_splice;
+        let addr = tokio::net::lookup_host(relay.endpoint.as_str())
+            .await
+            .map_err(|e| RedeemError::Relay(format!("resolve {}: {e}", relay.endpoint.as_str())))?
+            .next()
+            .ok_or_else(|| {
+                RedeemError::Relay(format!("{} does not resolve", relay.endpoint.as_str()))
+            })?;
+        let stream = open_splice(addr, relay.registration)
+            .await
+            .map_err(|e| RedeemError::Relay(format!("{addr}: {e}")))?;
+        return Ok((stream, RedeemPath::Relay));
+    }
+    Err(direct_failure)
 }
 
 /// [`redeem`] over a byte stream the caller already opened towards the

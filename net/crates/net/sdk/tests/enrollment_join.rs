@@ -14,6 +14,7 @@ use net_sdk::enrollment::bundle::{
 use net_sdk::enrollment::device::{DeviceJoin, DeviceJoinError, JoinStatus};
 use net_sdk::enrollment::invite::{
     EnrollmentEndpoint, EnrollmentKey, InviteSpec, MembershipInvite, RedemptionIntent, Relation,
+    RelayLocator,
 };
 use net_sdk::enrollment::policy::{ApprovalMode, InvitationPolicy};
 use net_sdk::enrollment::redeem::{RedeemError, Refusal, ResponderKey};
@@ -43,7 +44,8 @@ fn invite_for(
         InviteSpec {
             trust_domain_name: "lab".into(),
             trust_domain: psk.trust_domain(),
-            endpoint: EnrollmentEndpoint::parse(endpoint).unwrap(),
+            endpoint: Some(EnrollmentEndpoint::parse(endpoint).unwrap()),
+            relay: None,
             enrollment_key: key,
             relations: vec![Relation::Mesh],
             intended_subject: None,
@@ -79,9 +81,10 @@ impl Operator {
             .unwrap();
         mesh.start();
         let contact = MeshContact {
-            addr: mesh.local_addr(),
+            addr: Some(mesh.local_addr()),
             noise_pubkey: *mesh.public_key(),
             node_id: mesh.node_id(),
+            relay: None,
         };
         let ledger = EnrollmentLedger::create(
             &tmp.path().join("ledger"),
@@ -135,7 +138,7 @@ async fn attach(identity: Identity, psk: &Psk, contact: &MeshContact) -> Result<
     match tokio::time::timeout(
         Duration::from_secs(3),
         mesh.connect_via(
-            &contact.addr.to_string(),
+            &contact.addr.unwrap().to_string(),
             &contact.noise_pubkey,
             contact.node_id,
         ),
@@ -293,9 +296,10 @@ impl BundleIssuer for WrongDomainIssuer {
     ) -> Result<Vec<u8>, Refusal> {
         let receipt = MembershipReceipt::sign(&self.0, invite, intent, now());
         let contact = MeshContact {
-            addr: "127.0.0.1:1".parse().unwrap(),
+            addr: Some("127.0.0.1:1".parse().unwrap()),
             noise_pubkey: [0; 32],
             node_id: 1,
+            relay: None,
         };
         Ok(MembershipBundle::new(receipt, Psk::new([0x11; 32]), contact).to_bytes())
     }
@@ -359,11 +363,43 @@ fn fixture() -> (Identity, MembershipInvite, RedemptionIntent, MeshContact) {
     let intent =
         RedemptionIntent::for_invite(&invite, Identity::generate().entity_id().clone()).unwrap();
     let contact = MeshContact {
-        addr: "127.0.0.1:7000".parse().unwrap(),
+        addr: Some("127.0.0.1:7000".parse().unwrap()),
         noise_pubkey: [4; 32],
         node_id: 42,
+        relay: None,
     };
     (issuer, invite, intent, contact)
+}
+
+/// A contact may name only a relay (a device with no known direct address);
+/// the locator round-trips, and a contact with neither is refused.
+#[test]
+fn a_bundle_contact_carries_its_relay_and_may_omit_the_direct_address() {
+    let (issuer, invite, intent, _) = fixture();
+    let relayed = MeshContact {
+        addr: None,
+        noise_pubkey: [4; 32],
+        node_id: 42,
+        relay: Some(RelayLocator {
+            endpoint: EnrollmentEndpoint::parse("relay.example.net:3478").unwrap(),
+            registration: [7; 16],
+        }),
+    };
+    let receipt = MembershipReceipt::sign(&issuer, &invite, &intent, now());
+    let bundle = MembershipBundle::new(receipt.clone(), Psk::new(PSK), relayed.clone());
+    let back = MembershipBundle::from_bytes(&bundle.to_bytes()).unwrap();
+    assert_eq!(back.contact(), &relayed);
+    back.verify_for(&invite, &intent).unwrap();
+
+    let nowhere = MeshContact {
+        relay: None,
+        ..relayed
+    };
+    let bytes = MembershipBundle::new(receipt, Psk::new(PSK), nowhere).to_bytes();
+    assert!(matches!(
+        MembershipBundle::from_bytes(&bytes),
+        Err(BundleError::Malformed(_))
+    ));
 }
 
 #[test]
@@ -429,9 +465,10 @@ fn the_issuer_never_delivers_a_psk_from_another_trust_domain() {
         Identity::generate(),
         Psk::new(PSK),
         MeshContact {
-            addr: "127.0.0.1:1".parse().unwrap(),
+            addr: Some("127.0.0.1:1".parse().unwrap()),
             noise_pubkey: [0; 32],
             node_id: 1,
+            relay: None,
         },
     );
     assert_eq!(stranger.issue(&invite, &intent), Err(Refusal::Invalid));
