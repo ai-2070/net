@@ -2,7 +2,7 @@
 
 > **For Hermes:** After V2 acceptance and explicit implementation authorization, use the subagent-driven-development skill for one accepted slice at a time, with independent review. This document authorizes planning, not production edits or protocol publication.
 
-**Status:** V3 continuation authorized by the user on 2026-09-20. V3-0 source re-survey/design preparation started at `346b4b8bfe74ee8399a5f4191bfc7b86eb7f3a84`; its exit gate is **not passed**. V2's agreed implementation is complete, including generated protected-client coverage, but accepted exact-head CI evidence is still outstanding. The first narrow V3 code slice implements local invitation policy only; no working enrollment service or protocol publication is claimed. See the V3-0 decision record below before implementing wrappers.
+**Status:** V3 continuation authorized by the user on 2026-09-20. V3-0 source re-survey/design preparation started at `346b4b8bfe74ee8399a5f4191bfc7b86eb7f3a84`; its exit gate is **not passed**. V2's agreed implementation is complete, including generated protected-client coverage, and its exact-head acceptance is recorded in §1 (master merge `b525725a5`, all workflows green). The first narrow V3 code slice implements local invitation policy only; no working enrollment service or protocol publication is claimed. See the V3-0 decision record below before implementing wrappers.
 **Goal:** An operator can start and stop a real long-lived Net node with an explicit protected PSK source or with no operator-supplied PSK, send a join link, let a new device join the intended mesh and independently scoped organization, channel and subnet relations, survive restart, voluntarily leave any selected relation, and selectively remove it where an authority-side revocation mechanism exists, with verifiable and honestly scoped enforcement.
 **Architecture:** Thin Rust/Clap commands over reusable SDK enrollment, node-lifecycle and authority mechanisms, backed by an explicitly running node/operator service and durable local state. Enrollment, observation, removal, startup and shutdown refer to real identities, processes and enforcement points; temporary supervisors, inventory records, PID files and credential files never stand in for deployment effects.
 **Tech stack:** Existing `net-cli` / `net-mesh` executable, Tokio, `net-mesh-sdk`, signed organization/subnet credentials, root-anchored channel `TokenChain`s, current native transport and optional bootstrap adapters. No new global control plane.
@@ -19,6 +19,36 @@ Before starting V3:
 - Re-survey affected APIs at that commit; reconcile names, features, and tests below without undoing V2 decisions.
 - Inherit V2's `--inspect-target`, profile precedence, bind validation, explicit execution modes, deadline budget, stdout/stderr framing, confirmation and error-code contracts.
 - Retain temporary-supervisor `--local` warnings for legacy commands. Adding narrow live enrollment operations does not turn every Deck command into remote administration.
+
+### V2 exact-head acceptance (recorded 2026-09-23)
+
+- **Accepted V2 commit:** `b525725a572261fe5a115fd1188197443f13c584`, the
+  master merge of PR #1035 ("Net-CLI V2", head `728714ce5`, merged 2026-09-22
+  15:24 UTC).
+- **Required CI at that exact commit, all success:** CI run 35747146487, plus
+  Skills 35747146495, Web 35747146318, Coverage 35747146510 and Docs API
+  35747146548.
+- **The PR head's own push run was red, and both failures are explained**
+  (`CI` 35707535028 at `728714ce5`). The PR-event runs (natsim, Web, Skills,
+  Coverage, Docs API, CLA) were green. `CI` itself was covered by the push run.
+  1. *Go bindings:* the C-ABI export baseline check reported two exports not in
+     the baseline, `net_blob_ref_hash` and `net_mesh_blob_adapter_publish`.
+     That is a baseline-policy failure, not a test failure, and it was absent
+     at the merge commit.
+  2. *WebRTC feature (native driver):* `enrollment_storage::tests::exclusive_owner_and_restart_preserve_exact_bytes`
+     reopened after `drop(owner)` and got `Busy` (5877 passed, 1 failed).
+     - Cause: the lock is `flock`, owned by the open file description. A child
+       forked by another test thread shares that description until its exec
+       closes the CLOEXEC descriptor, so in the multithreaded test binary the
+       lock can briefly outlive `drop`.
+     - This is a test race, not a storage defect: cross-process ownership and
+       reopen after exit are unaffected.
+     - Fixed on the V3 branch: the test retries `Busy` within a 5 s bound and
+       names the cause. Any other error, or a lock that never frees, still
+       fails.
+- **Master after the merge is not V2 evidence.** Later master CI runs
+  (`e87943452`, `a88b7c301`, `c47fd448a`) are red after unrelated merges; they
+  are outside V2 and are not claimed here.
 
 V2's deferred transfer holder, generic unary RPC, remote Deck, and crash-safe NetDB replacement are **not** prerequisites and are **not** implicitly moved into V3. Organization streaming remains a separate parallel plan; V3 can prove enrollment with unary calls. Neither serverless capability providers nor serverless anchors are required.
 

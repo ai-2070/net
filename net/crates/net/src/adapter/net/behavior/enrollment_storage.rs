@@ -294,7 +294,20 @@ mod tests {
         owner.replace(b"second").unwrap();
         assert_eq!(owner.read().unwrap(), b"second");
         drop(owner);
-        let reopened = EnrollmentStorage::open(&dir).unwrap();
+        // On Unix the lock is `flock`, owned by the open file description. A
+        // child forked by ANOTHER test thread shares that description until
+        // its exec closes the (CLOEXEC) descriptor, so in this multithreaded
+        // test binary the lock can briefly outlive `drop`. Retry `Busy`
+        // within a bound; any other error, or a lock that never frees, fails.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reopened = loop {
+            match EnrollmentStorage::open(&dir) {
+                Err(StorageError::Busy) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => break other.unwrap(),
+            }
+        };
         assert_eq!(reopened.read().unwrap(), b"second");
         assert!(matches!(
             EnrollmentStorage::create(&dir, b"reset"),
