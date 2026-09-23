@@ -1172,12 +1172,16 @@ fn upload_chunks_wait_for_request_grants_and_consumption_grants_one_each() {
         },
         intent,
     );
-    for item in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice(), b"d".as_slice()] {
-        l.caller.send(id, item, l.now).expect("send");
-    }
-    l.caller.finish_sending(id, l.now).expect("finish");
-
-    // Window 2: the opening item and one chunk go out; the rest park.
+    // Window 2: TWO item frames go out (the opening item + one chunk);
+    // the third `send` PARKS and takes NOTHING — core's `send().await`
+    // permit semantics in pull form.
+    assert_eq!(l.caller.send(id, b"a", l.now), Ok(()));
+    assert_eq!(l.caller.send(id, b"b", l.now), Ok(()));
+    assert_eq!(
+        l.caller.send(id, b"c", l.now),
+        Err(SinkError::WouldBlock),
+        "a creditless send parks; the item was NOT taken"
+    );
     let up = l.caller_out();
     assert_eq!(up.len(), 2, "exactly the opening window of item frames");
     l.to_provider(up);
@@ -1185,7 +1189,11 @@ fn upload_chunks_wait_for_request_grants_and_consumption_grants_one_each() {
     let call = l.served.borrow()[0].clone();
     assert_eq!(call.poll_request(), Some(Bytes::from_static(b"a")));
     assert_eq!(call.poll_request(), Some(Bytes::from_static(b"b")));
-    assert_eq!(call.poll_request(), None, "c and d are parked, not lost");
+    assert_eq!(
+        call.poll_request(),
+        None,
+        "c was never sent — it is parked at the caller"
+    );
 
     // Consumption grants exactly one credit per consumed chunk.
     let down = l.provider_out();
@@ -1196,13 +1204,24 @@ fn upload_chunks_wait_for_request_grants_and_consumption_grants_one_each() {
     assert_eq!(grants, 2, "one REQUEST_GRANT per consumed chunk");
     l.to_caller(down);
 
-    // Credit released: the parked uploads go out (c, then d with the
-    // end flag folded onto the last item chunk).
+    // Credit released: the parked sends RESOLVE as grants arrive — and
+    // park again exactly at the window.
+    assert_eq!(l.caller.send(id, b"c", l.now), Ok(()));
+    assert_eq!(l.caller.send(id, b"d", l.now), Ok(()));
+    assert_eq!(l.caller.send(id, b"e", l.now), Err(SinkError::WouldBlock));
+    // The terminal upload frame pays no credit; a parked item does not
+    // block the half-close once its own send was refused.
+    assert_eq!(l.caller.finish_sending(id, l.now), Ok(()));
+    assert_eq!(
+        l.caller.send(id, b"e", l.now),
+        Err(SinkError::Closed),
+        "after finish the upload half is closed"
+    );
     let up = l.caller_out();
-    assert_eq!(up.len(), 2);
-    match &up[1].frame {
+    assert_eq!(up.len(), 3, "CHUNK(c), CHUNK(d), and the FLAG_END frame");
+    match &up[2].frame {
         RpcFrame::RequestChunk(chunk) => {
-            assert_eq!(chunk.body.as_ref(), b"d");
+            assert_eq!(chunk.body.as_ref(), b"");
             assert_eq!(chunk.flags & FLAG_RPC_REQUEST_END, FLAG_RPC_REQUEST_END);
         }
         other => panic!("expected the terminal upload frame, got {other:?}"),
@@ -2086,5 +2105,135 @@ mod node_level {
             );
             assert!(!node.is_channel_subscriber(peer, &name));
         }
+    }
+
+    /// Fix-(1) witness at the NODE VERB (the wasm `callOrgStreaming`
+    /// seam): a windowed server-streaming call OPENS with a real
+    /// `stream_window_initial` (the mint carries the window header and
+    /// the proof over the finalized request), then grants exactly one
+    /// `STREAM_GRANT` per consumed chunk. Together with the
+    /// provider-side `response_credit_parks_the_pump_...` this is the
+    /// end-to-end window property.
+    #[test]
+    fn a_windowed_server_streaming_opens_at_the_node_verb_and_grants_one_credit_per_consumed_chunk() {
+        let world = World::at(clock::now_unix_secs());
+        let peer_ident = peer_identity();
+        let peer = peer_ident.node_id();
+        let (mut node, peer_session) = connected(peer);
+        let signed = net_leaf::announce::build_announcement(
+            &peer_ident,
+            &["test.anchor".to_string()],
+            1,
+            clock::now_unix_nanos(),
+            300,
+        )
+        .expect("announcement");
+        assert!(node.ingest_announcement(&signed));
+
+        // The peer is the PROVIDER here: the intent binds the pinned
+        // provider entity (= the peer's announced entity).
+        let intent = world.intent_at(5, world.caller_entity.clone());
+        let handle = node
+            .call_org_server_stream(
+                peer,
+                SERVICE,
+                StreamOpen {
+                    body: Bytes::from_static(b"request"),
+                    deadline_ns: 0,
+                    stream_window_initial: Some(24),
+                    request_window_initial: None,
+                },
+                intent,
+            )
+            .expect("a windowed SS call MUST open at the verb");
+        let call_id = handle.call_id;
+
+        // The opening frame is a well-formed minted REQUEST carrying
+        // the window header AND exactly one proof header.
+        let request_route =
+            Channel::from_name(channel::request_channel(SERVICE).expect("c")).canonical();
+        // The node's OWN reply channel — the one `ensure_reply_subscription`
+        // registers and the pin's `reply_route` names. (Addressing the
+        // peer's origin here instead lands the frame on the Application
+        // plane — the four-fact `CallOwner` doing its job.)
+        let reply_route =
+            Channel::from_name(channel::reply_channel(SERVICE, node.origin_hash()).expect("c"))
+                .canonical();
+        let mut request = None;
+        for event in drain_events(&peer_session, &mut node) {
+            if let Ok(Some(rpc_wire::RpcFrame::Request(req))) =
+                rpc_wire::decode_frame(event.clone())
+            {
+                assert_eq!(rpc_wire::decode_route(&event), Some(request_route));
+                request = Some(req);
+            }
+        }
+        let request = request.expect("the eager opening goes out");
+        assert_eq!(request.flags, FLAG_RPC_STREAMING_RESPONSE);
+        assert!(
+            request.headers.iter().any(|(n, v)| {
+                n.eq_ignore_ascii_case(HEADER_NRPC_STREAM_WINDOW_INITIAL) && v == b"24"
+            }),
+            "the window header rides the opening verbatim: {:?}",
+            request.headers
+        );
+        assert_eq!(
+            request
+                .headers
+                .iter()
+                .filter(|(n, _)| n == "net-org-admission")
+                .count(),
+            1,
+            "exactly one minted proof header — the window header does \
+             not break the mint/digest path"
+        );
+
+        // The provider streams 2 items + end within the 24-credit
+        // window; consuming them grants exactly one credit each.
+        for (body, terminal) in [(b"one".as_slice(), false), (b"two", false), (b"", true)] {
+            let payload = if terminal {
+                super::end_terminal()
+            } else {
+                super::continue_chunk(body)
+            };
+            let frame =
+                rpc_wire::encode_response_frame(0x5EED, call_id, reply_route, &payload).expect("f");
+            let packet = peer_packet(
+                &peer_session,
+                channel::publish_stream_id(reply_route),
+                0,
+                reply_route as u16,
+                &frame,
+            );
+            node.on_datagram(peer, packet, clock::now());
+        }
+        assert_eq!(
+            node.org_call_next(call_id),
+            Some(Bytes::from_static(b"one"))
+        );
+        assert_eq!(
+            node.org_call_next(call_id),
+            Some(Bytes::from_static(b"two"))
+        );
+        assert_eq!(
+            node.org_call_terminal(call_id),
+            Some(StreamTerminal::Completed {
+                body: Bytes::new()
+            })
+        );
+
+        let mut grants = Vec::new();
+        for event in drain_events(&peer_session, &mut node) {
+            if let Ok(Some(rpc_wire::RpcFrame::StreamGrant { credits, .. })) =
+                rpc_wire::decode_frame(event)
+            {
+                grants.push(credits);
+            }
+        }
+        assert_eq!(
+            grants,
+            vec![1, 1],
+            "exactly one STREAM_GRANT per consumed chunk"
+        );
     }
 }

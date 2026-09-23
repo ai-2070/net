@@ -94,9 +94,6 @@ use crate::rpc_wire::{
 /// with them.
 pub const MAX_IN_FLIGHT_CALLS: usize = crate::rpc::MAX_IN_FLIGHT_CALLS;
 
-/// Bounded item queues, per call, in each direction.
-pub const MAX_QUEUED_ITEMS: usize = 1024;
-
 /// The accumulated `REQUEST_GRANT` ceiling per call, mirroring core's
 /// `REQUEST_GRANT_PER_CALL_CAP`: a misbehaving provider cannot make a
 /// caller's upload credit grow without bound.
@@ -145,11 +142,20 @@ pub enum SinkError {
     /// The sink is closed for further items (retired, finished, or not
     /// an upload sink at all — see [`StreamCallRegistry::send`]).
     Closed,
+    /// No upload credit is available right now and **the item was NOT
+    /// taken**. This is core's `send().await` permit wait in pull
+    /// form: one credit per item frame (`REQUEST` body chunk or
+    /// `REQUEST_CHUNK`), replenished by `REQUEST_GRANT`. Retry after
+    /// a grant arrives — the JS surface keeps its promise pending and
+    /// re-polls on the ticker/grant, so a `send()` resolves only as
+    /// grants arrive.
+    WouldBlock,
     /// The bounded queue is full. A protected call cannot drop an item
     /// and later report success, so this retires the call
     /// ([`RetireReason::ResourceExhausted`]).
     ResourceExhausted,
-    /// The lazy opening could not be minted.
+    /// The lazy opening could not be minted. The call cannot proceed;
+    /// cancel it or let its deadline retire it.
     Mint(MintError),
 }
 
@@ -377,9 +383,10 @@ struct CallCore {
     request_window_initial: Option<u32>,
     /// Upload half (CS/DX).
     upload_open: bool,
-    upload_items: VecDeque<Bytes>,
+    /// The open verb's pre-supplied first item, awaiting the lazy
+    /// opening (its body IS the first chunk).
+    pending_first: Option<Bytes>,
     upload_credit: Option<u32>,
-    end_pending: bool,
     end_sent: bool,
     /// Response half (SS/DX items; CS holds its single response).
     resp_items: VecDeque<Bytes>,
@@ -580,9 +587,8 @@ impl StreamCallRegistry {
             stream_window_initial: open.stream_window_initial,
             request_window_initial: open.request_window_initial,
             upload_open: !eager,
-            upload_items: VecDeque::new(),
+            pending_first: None,
             upload_credit: open.request_window_initial,
-            end_pending: false,
             end_sent: false,
             resp_items: VecDeque::new(),
             terminal: None,
@@ -596,7 +602,7 @@ impl StreamCallRegistry {
             emit_open(&self.out, &mut core, body, false, now_unix_ns)
                 .map_err(CallOpenError::Mint)?;
         } else if !open.body.is_empty() {
-            core.upload_items.push_back(open.body);
+            core.pending_first = Some(open.body);
         }
         let handle = CallHandle {
             call_id,
@@ -616,11 +622,13 @@ impl StreamCallRegistry {
         Ok(handle)
     }
 
-    /// Push one upload item (CS/DX). The item rides the lazy opening's
-    /// `REQUEST` body when nothing has been sent yet; afterwards it
-    /// rides a `REQUEST_CHUNK`. Credit-gated: with a request window the
-    /// frame waits for `REQUEST_GRANT` credit exactly like the core's
-    /// `send().await`.
+    /// Push one upload item (CS/DX) — core's `send().await` permit
+    /// semantics in pull form: ONE item frame per `send`, ONE credit
+    /// per frame. With an upload window and no credit the item is NOT
+    /// taken and [`SinkError::WouldBlock`] comes back; the caller
+    /// retries after a `REQUEST_GRANT` arrives (the JS surface keeps
+    /// its promise pending and re-polls on the ticker/grant), so a
+    /// `send()` resolves only as grants arrive.
     pub fn send(&mut self, call_id: u64, item: &[u8], now_unix_ns: u64) -> Result<(), SinkError> {
         let Some(core) = self.calls.get_mut(&call_id) else {
             return Err(SinkError::Closed);
@@ -634,43 +642,49 @@ impl StreamCallRegistry {
         {
             return Err(SinkError::Closed);
         }
-        if core.upload_items.len() >= MAX_QUEUED_ITEMS {
-            // A protected call never drops an item and later reports
-            // success: the refusal retires the call.
-            push_cancel(&self.out, core);
-            core.latch(StreamTerminal::Retired {
-                reason: RetireReason::ResourceExhausted,
-            });
-            return Err(SinkError::ResourceExhausted);
-        }
-        let body = Bytes::copy_from_slice(item);
         if !core.opened {
             // LAZY opening: the initial REQUEST's body IS the first
-            // chunk — the earliest queued item (the open verb's body,
-            // if any), else this one — minted here so the signed
-            // opening binds it.
-            let (first, rest) = match core.upload_items.pop_front() {
-                Some(queued) => (queued, Some(body)),
-                None => (body, None),
-            };
-            emit_open(&self.out, core, first, false, now_unix_ns).map_err(SinkError::Mint)?;
-            if let Some(rest) = rest {
-                core.upload_items.push_back(rest);
+            // chunk — the open verb's body when it supplied one, else
+            // THIS item — minted here so the signed opening binds it.
+            match core.pending_first.take() {
+                Some(first) => {
+                    if core.upload_credit == Some(0) {
+                        core.pending_first = Some(first);
+                        return Err(SinkError::WouldBlock);
+                    }
+                    emit_open(&self.out, core, first, false, now_unix_ns)
+                        .map_err(SinkError::Mint)?;
+                    // Fall through: `item` is the SECOND chunk.
+                }
+                None => {
+                    if core.upload_credit == Some(0) {
+                        return Err(SinkError::WouldBlock);
+                    }
+                    emit_open(
+                        &self.out,
+                        core,
+                        Bytes::copy_from_slice(item),
+                        false,
+                        now_unix_ns,
+                    )
+                    .map_err(SinkError::Mint)?;
+                    return Ok(());
+                }
             }
-            let out = Rc::clone(&self.out);
-            pump_upload(&out, core);
-            return Ok(());
         }
-        core.upload_items.push_back(body);
+        // One credit per item frame.
+        if core.upload_credit == Some(0) {
+            return Err(SinkError::WouldBlock);
+        }
         let out = Rc::clone(&self.out);
-        pump_upload(&out, core);
-        Ok(())
+        emit_upload_chunk(&out, core, Bytes::copy_from_slice(item), 0, true)
     }
 
-    /// Half-close the upload (DX `finish_sending`) or finish the call's
-    /// upload (CS `finish`). The terminal upload frame carries
-    /// `FLAG_RPC_REQUEST_END`; the zero-item degenerate sends it on an
-    /// empty initial `REQUEST`.
+    /// Half-close the upload (DX `finish_sending`) / finish it (CS
+    /// `finish`). The terminal upload frame carries
+    /// `FLAG_RPC_REQUEST_END` and pays no credit; the zero-item
+    /// degenerate and core's one-item path ride the initial `REQUEST`
+    /// (the one-item frame pays its one credit).
     pub fn finish_sending(&mut self, call_id: u64, now_unix_ns: u64) -> Result<(), SinkError> {
         let Some(core) = self.calls.get_mut(&call_id) else {
             return Err(SinkError::Closed);
@@ -684,20 +698,29 @@ impl StreamCallRegistry {
         {
             return Err(SinkError::Closed);
         }
-        core.upload_open = false;
         if !core.opened {
-            // The initial REQUEST carries the end flag: the zero-item
-            // degenerate (empty body) or core's one-item path, where
-            // the first queued item rides the REQUEST WITH the flag —
-            // one round trip saved.
-            let body = core.upload_items.pop_front().unwrap_or_else(Bytes::new);
+            let body = match core.pending_first.take() {
+                Some(first) => {
+                    if core.upload_credit == Some(0) {
+                        // The one-item opening cannot go out without
+                        // its credit: park the whole finish, item and
+                        // half-close together.
+                        core.pending_first = Some(first);
+                        return Err(SinkError::WouldBlock);
+                    }
+                    first
+                }
+                // Zero-item degenerate: empty body + FLAG_END, no
+                // credit.
+                None => Bytes::new(),
+            };
+            core.upload_open = false;
             emit_open(&self.out, core, body, true, now_unix_ns).map_err(SinkError::Mint)?;
             return Ok(());
         }
-        core.end_pending = true;
+        core.upload_open = false;
         let out = Rc::clone(&self.out);
-        pump_upload(&out, core);
-        Ok(())
+        emit_upload_chunk(&out, core, Bytes::new(), FLAG_RPC_REQUEST_END, false)
     }
 
     /// Pull the next response item. Consuming an item on a
@@ -833,9 +856,6 @@ impl StreamCallRegistry {
             let remaining = REQUEST_GRANT_PER_CALL_CAP.saturating_sub(*credit);
             *credit = credit.saturating_add(credits.min(remaining));
         }
-        // Credit released: parked uploads go out now.
-        let out = Rc::clone(&self.out);
-        pump_upload(&out, core);
         true
     }
 
@@ -890,8 +910,6 @@ impl StreamCallRegistry {
                 });
                 continue;
             }
-            let out = Rc::clone(&self.out);
-            pump_upload(&out, core);
         }
         // Release calls whose handle is gone: their terminal is
         // unobservable and their drop already fired.
@@ -956,61 +974,48 @@ fn terminal_of(payload: RpcResponsePayload) -> StreamTerminal {
     }
 }
 
-/// Emit queued upload frames within credit. The terminal
-/// `FLAG_RPC_REQUEST_END` pays no credit and folds onto the last item
-/// chunk when one is being emitted anyway.
-fn pump_upload(out: &Rc<RefCell<VecDeque<OutFrame>>>, core: &mut CallCore) {
-    if !core.opened {
-        return;
-    }
-    loop {
-        let has_item = !core.upload_items.is_empty();
-        let end_now = core.end_pending && !core.end_sent;
-        if !has_item && !end_now {
-            return;
+/// Emit one upload `REQUEST_CHUNK` (the caller has checked — and, for
+/// `pay_credit`, paid — its credit). `FLAG_RPC_REQUEST_END` rides the
+/// terminal upload frame and pays no credit of its own. An
+/// un-encodable chunk retires the call: it cannot be dropped and the
+/// call still report success.
+fn emit_upload_chunk(
+    out: &Rc<RefCell<VecDeque<OutFrame>>>,
+    core: &mut CallCore,
+    body: Bytes,
+    flags: u16,
+    pay_credit: bool,
+) -> Result<(), SinkError> {
+    let chunk = RpcRequestChunkPayload {
+        call_id: core.call_id,
+        flags,
+        headers: Vec::new(),
+        body,
+    };
+    let frame = match encode_chunk_frame(core.origin_hash, core.pin.request_route, &chunk) {
+        Ok(frame) => frame,
+        Err(_) => {
+            push_cancel(out, core);
+            core.latch(StreamTerminal::Retired {
+                reason: RetireReason::ResourceExhausted,
+            });
+            return Err(SinkError::ResourceExhausted);
         }
-        if has_item && core.upload_credit == Some(0) {
-            // Sender parks without credit.
-            return;
-        }
-        let body = if has_item {
-            core.upload_items.pop_front().expect("checked")
-        } else {
-            Bytes::new()
-        };
-        let last = core.upload_items.is_empty() && core.end_pending && !core.end_sent;
-        let flags = if last { FLAG_RPC_REQUEST_END } else { 0 };
-        if last {
-            core.end_sent = true;
-        }
-        if has_item {
-            if let Some(credit) = core.upload_credit.as_mut() {
-                *credit = credit.saturating_sub(1);
-            }
-        }
-        let chunk = RpcRequestChunkPayload {
-            call_id: core.call_id,
-            flags,
-            headers: Vec::new(),
-            body,
-        };
-        match encode_chunk_frame(core.origin_hash, core.pin.request_route, &chunk) {
-            Ok(frame) => out.borrow_mut().push_back(OutFrame {
-                peer: core.pin.peer,
-                route: core.pin.request_route,
-                frame,
-            }),
-            Err(_) => {
-                // An un-encodable chunk retires the call: it cannot be
-                // dropped and the call still report success.
-                push_cancel(out, core);
-                core.latch(StreamTerminal::Retired {
-                    reason: RetireReason::ResourceExhausted,
-                });
-                return;
-            }
+    };
+    if pay_credit {
+        if let Some(credit) = core.upload_credit.as_mut() {
+            *credit = credit.saturating_sub(1);
         }
     }
+    if flags & FLAG_RPC_REQUEST_END != 0 {
+        core.end_sent = true;
+    }
+    out.borrow_mut().push_back(OutFrame {
+        peer: core.pin.peer,
+        route: core.pin.request_route,
+        frame,
+    });
+    Ok(())
 }
 
 /// Finalize and emit the signed opening `REQUEST`. The proof is minted
