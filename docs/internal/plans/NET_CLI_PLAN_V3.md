@@ -2040,6 +2040,51 @@ Regressions:
 3. **Organization removal** composes its existing floor separately and is not
    touched here.
 
+#### V3-4 slice 2 — authenticated floor readback: design (2026-09-23)
+
+The survey found no existing path that lets a verifier prove what floor it
+applied:
+- nothing reads the floor registry over the wire;
+- control facts are applied with no acknowledgement;
+- org-protected nRPC authenticates the caller, but its replies are unsigned and
+  it cannot target one verifier;
+- `session_peer` is the last hop, not the origin.
+
+Readback is therefore two signed artifacts over ordinary nRPC (service
+`net.subnet.floor`). This is no anti-entropy framework and no unsigned ACK.
+
+- **`FloorStatusRequest`**, signed by an **authority root**:
+  - fields: scope, topology epoch, subject, the **named verifier** entity, a
+    fresh 16-byte nonce, `issued_at`, and optionally the subject-floor fact to
+    apply first (it must name the same scope, epoch and subject);
+  - the verifier answers only its own name, only a configured root, and only
+    within ±300 s.
+- **`FloorStatusAttestation`**, signed by the **verifier's own entity key**
+  over the request digest. It carries:
+  - the apply outcome (`not_requested`, `applied`, `unchanged`, or `refused`
+    with a stable kind);
+  - the subject's per-right generations and revision as that verifier now
+    holds them;
+  - `persisted`: whether its floor store is durable.
+
+  Neither a relay nor a last hop can forge or replay one into a different
+  request.
+- **CLI result per named verifier:**
+  - `applied`: attested, covers the floor, persisted;
+  - `applied_not_persisted`: attested, covers the floor, but the verifier has
+    no durable store;
+  - `refused`: an attested refusal, e.g. `invalid_format` from a verifier that
+    lacks kind 5;
+  - `no_attestation`: unreachable, no service (pre-readback), timeout, or a bad
+    attestation.
+
+  `complete` is true only when every named verifier is `applied`. Verifiers
+  that were not named are reported as not checked, never assumed.
+- **Addressing.** Noise static keys are generated per start, so a verifier is
+  named by a full contact, `ENTITY@HOST:PORT#NOISE_PUBKEY`, with the mesh PSK
+  as in existing remote attach. `--dry-run` queries status without applying.
+
+
 ### V3-5 — public journey, CI and release acceptance
 
 **Modify:** `cli/README.md`, `cli/CHANGELOG.md`, `web/src/content/docs/reference/cli.md`, relevant enrollment/security/subnet docs and `.github/workflows/ci.yml`.
