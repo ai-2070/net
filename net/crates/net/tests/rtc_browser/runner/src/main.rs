@@ -2216,8 +2216,15 @@ async fn run(
     // it runs after the 4b/5/6/7 halves (the tail below). Every
     // other half's witnesses are named `RTCB EXCLUDED` under
     // `--org-only`, so the ledger is never silently short.
-    // ================================================================
-    let cx_org = org_stream::CxOrg {
+    //
+    // `stun` is the run's MEASURED working ICE config — the estate
+    // stages pass exactly this. Under `--org-only` no probe ran and
+    // the value is `None`, which is the measured-working value on the
+    // loopback host anyway (the 4b sweep reads `loopback/anchor-stun:
+    // NO PAIR` with a `stun:127.0.0.1` entry and `loopback/no-stun:
+    // PAIR FORMED in 21 ms` without one) — and `None` means the
+    // anchor-announced default applies, never an empty iceServers.
+    let mk_cx = |stun: Option<String>| org_stream::CxOrg {
         driver: &driver,
         engine,
         anchor: &anchor,
@@ -2227,13 +2234,13 @@ async fn run(
         origin: origin.clone(),
         page_origin: origin.clone(),
         anchor_rtc_addr: anchor_rtc_addr.to_string(),
-        stun: Some(format!("stun:{anchor_rtc_addr}")),
+        stun,
         feed: Arc::clone(&org_feed),
         work: work.to_path_buf(),
         tabs: step_org_tx.clone(),
     };
     if org_only {
-        Box::pin(org_stream::run(cx_org, ledger)).await?;
+        Box::pin(org_stream::run(mk_cx(None), ledger)).await?;
         let excluded: [&[&str]; 4] = [
             &[
                 "enrollment_exchange_promotes_this_session",
@@ -3922,9 +3929,10 @@ async fn run(
     // ================================================================
     // STAGE 4 — the org-scoped streaming witnesses. The full-ledger
     // tail (`--org-only` ran them earlier and returned): same anchor,
-    // same ledger, its own tabs and step vocabulary.
+    // same ledger, its own tabs and step vocabulary. The stun config
+    // is the run's measured-working value, exactly as stage5/6/7.
     // ================================================================
-    Box::pin(org_stream::run(cx_org, ledger)).await?;
+    Box::pin(org_stream::run(mk_cx(stun.clone()), ledger)).await?;
 
     driver.quit().await;
     anchor_listener.shutdown().await;

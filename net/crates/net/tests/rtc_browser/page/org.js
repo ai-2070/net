@@ -236,8 +236,13 @@ async function execute(step) {
       };
       if (step.entity_secret_hex) opts.entitySecretHex = step.entity_secret_hex;
       if (step.noise_secret_hex) opts.noiseSecretHex = step.noise_secret_hex;
+      // ABSENCE, NOT EMPTINESS: when the runner measured no working
+      // stun config it passes no `stun`, and iceServers must then be
+      // ABSENT so the anchor-announced default applies. A present-but-
+      // empty `[{urls: []}]` defeats that substitution (leaf5.js's
+      // exact rule — this page's earlier `else` branch did exactly the
+      // defeating and ICE never paired).
       if (step.stun) opts.iceServers = [{ urls: step.stun }];
-      else if (step.anchor_rtc_addr) opts.iceServers = [{ urls: step.stun_urls || [] }];
       if (step.lock_scope && typeof browserSdk.openSession === 'function') {
         const session = await browserSdk.openSession({
           ...opts,
@@ -316,8 +321,10 @@ async function execute(step) {
       if (!wasm) return { ok: false, error: 'no wasm node under ' + step.session };
       try {
         const method = step.kind;
+        // The raw result is a DIALOG STRING or a raw reading — never
+        // JSON (peer6.js's exact shape: `stats: { dialog: raw }`).
         const raw = await wasm[method](step.peer_hex);
-        return { ok: true, stats: typeof raw === 'string' ? JSON.parse(raw || '{}') : raw, info: raw };
+        return { ok: true, stats: { raw }, info: String(raw) };
       } catch (e) {
         return typedFailure(e);
       }
@@ -384,6 +391,10 @@ async function execute(step) {
               for await (const chunk of requests) {
                 collected.push(hex(chunk));
                 entry.items.push(hex(chunk));
+                // A SLOW CONSUMER: a handler that drains eagerly
+                // grants credit as fast as it arrives and the upload
+                // window can never park a send.
+                if (step.defer_ms) await sleep(step.defer_ms);
               }
               entry.eof_at = performance.now();
               if (deferMs) await sleep(deferMs);
@@ -528,19 +539,32 @@ async function execute(step) {
         !state.terminal &&
         performance.now() < deadline
       ) {
-        const next = await Promise.race([
-          state.stream.next(),
-          sleep(step.timeout_ms || 8000).then(() => 'timeout'),
-        ]);
-        if (next === 'timeout') break;
-        if (next.done) {
+        // TERMINAL ITEM ERRORS THROW through the async iterator (the
+        // surface contract) — a catch here is the typed terminal, not
+        // a step failure.
+        let next;
+        try {
+          next = await Promise.race([
+            state.stream.next(),
+            sleep(step.timeout_ms || 8000).then(() => 'timeout'),
+          ]);
+        } catch (e) {
           state.done = true;
-          state.terminal = { done: true };
+          state.terminal = typedFailure(e);
           break;
         }
+        if (next === 'timeout') break;
+        // ERROR BEFORE DONE: a terminal error item is
+        // `{done: true, error}` on this surface — a done-first order
+        // swallows the typed terminal as a clean end.
         if (next.error) {
           state.done = true;
           state.terminal = typedFailure(next.error);
+          break;
+        }
+        if (next.done) {
+          state.done = true;
+          state.terminal = { done: true };
           break;
         }
         state.items.push(hex(next.value));
@@ -713,19 +737,27 @@ async function execute(step) {
       const want = step.want || 1;
       const deadline = performance.now() + (step.timeout_ms || 8000);
       while (state.items.length < want && !state.terminal && performance.now() < deadline) {
-        const next = await Promise.race([
-          state.call.stream.next(),
-          sleep(step.timeout_ms || 8000).then(() => 'timeout'),
-        ]);
-        if (next === 'timeout') break;
-        if (next.done) {
+        let next;
+        try {
+          next = await Promise.race([
+            state.call.stream.next(),
+            sleep(step.timeout_ms || 8000).then(() => 'timeout'),
+          ]);
+        } catch (e) {
           state.done = true;
-          state.terminal = { done: true };
+          state.terminal = typedFailure(e);
           break;
         }
+        if (next === 'timeout') break;
+        // ERROR BEFORE DONE (see `org_stream_read`).
         if (next.error) {
           state.done = true;
           state.terminal = typedFailure(next.error);
+          break;
+        }
+        if (next.done) {
+          state.done = true;
+          state.terminal = { done: true };
           break;
         }
         state.items.push(hex(next.value));
@@ -771,7 +803,7 @@ async function execute(step) {
 // The step loop. Identical framing to leaf5.js/peer6.js: one long-poll
 // per tab, results on the shared `/harness/result` keyed by step id.
 async function main() {
-  await log(`[org:${TAB}] up`);
+  await log(`[org:${TAB}] up feed=${globalThis.__netOrgControl}`);
   for (;;) {
     let step;
     try {

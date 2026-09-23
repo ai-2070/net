@@ -96,6 +96,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert, OrgRevocationBundle};
 use net::adapter::net::behavior::org_admission::Admitted;
 use net::adapter::net::behavior::org_admission_replay::{AdmissionReplayConfig, AdmissionReplayGuard};
@@ -113,7 +114,7 @@ use net::adapter::net::cortex::{
     encode_rpc_route, EventMeta, RequestStream, RpcContext, RpcDuplexHandler, RpcHandler,
     RpcHandlerError, RpcRequestPayload, RpcResponsePayload, RpcResponseSink, RpcStatus,
     RpcClientStreamingHandler, RpcStreamingContext, RpcStreamingHandler, DISPATCH_RPC_REQUEST,
-    RPC_FRAME_BODY_OFFSET,
+    FLAG_RPC_STREAMING_RESPONSE, RPC_FRAME_BODY_OFFSET,
 };
 use net::adapter::net::identity::{EntityId, EntityKeypair};
 use net::adapter::net::mesh_rpc::{CallOptions, OrgProofIntent, RpcError, ServeHandle};
@@ -206,6 +207,9 @@ const TAB_TEARDOWN: &str = "otd";
 const TAB_LEAD: &str = "ol1";
 const TAB_FOLLOW1: &str = "of1";
 const TAB_FOLLOW2: &str = "of2";
+/// The leader trio's Web Lock scope: ONE identity, ONE locks
+/// namespace — the proxied-attribution topology.
+const LEADER_SCOPE: &str = "s4-leader-lock";
 const TAB_OLD: &str = "oo1";
 const TAB_NEW: &str = "oo2";
 
@@ -259,6 +263,11 @@ const B_DX_GRANTED: &str = "org.s4.b.dx.granted";
 const B_INJECT: &str = "org.s4.b.inject";
 const B_TEARDOWN: &str = "org.s4.b.teardown";
 const B_DEFER: &str = "org.s4.b.defer";
+// Per-witness services on the SAME page must be per-witness names:
+// one node registers a service name once (`AlreadyServed`).
+const B_REPLAY: &str = "org.s4.b.replay";
+const B_BP: &str = "org.s4.b.bp";
+const N_CS_BP: &str = "org.s4.n.cs.bp";
 
 // Browser-pair provider services (the o-pair-b page serves these).
 const P_U: &str = "org.s4.p.u";
@@ -303,6 +312,7 @@ async fn org_control_session(
     node: String,
 ) {
     use axum::extract::ws::Message;
+    println!("[org-feed] control socket registered for {node}");
     let mut rx = feed.register(&node);
     loop {
         tokio::select! {
@@ -513,6 +523,21 @@ fn stat_list(result: &StepResult, key: &str) -> Vec<String> {
 
 fn stat_obj<'a>(result: &'a StepResult, _key: &str) -> Option<&'a Value> {
     result.stats.as_ref()
+}
+
+/// `query()`'s peer list — a TOP-LEVEL `StepResult` field, not a
+/// `stats` entry (reading it through `stat_obj` can never match).
+fn peers_of(result: &StepResult) -> Option<&Value> {
+    result.peers.as_ref()
+}
+
+/// The session's `role` / `generation` — top-level fields.
+fn role_of(result: &StepResult) -> String {
+    result.role.clone().unwrap_or_default()
+}
+
+fn generation_of(result: &StepResult) -> String {
+    result.generation.clone().unwrap_or_default()
 }
 
 fn now_unix_ns() -> u64 {
@@ -788,12 +813,14 @@ impl CallLog {
         index
     }
 
-    /// Mark the invocation COMPLETE with everything it sent. A
-    /// retired call never reaches here — which is exactly the
-    /// retired-not-zombie observable (`completed_at` stays unset).
-    fn complete(&self, index: usize, items_sent: Vec<Vec<u8>>) {
+    /// Mark the invocation COMPLETE with the payload it collected and
+    /// everything it sent. A retired call never reaches here — which
+    /// is exactly the retired-not-zombie observable (`completed_at`
+    /// stays unset).
+    fn complete(&self, index: usize, payload: Vec<u8>, items_sent: Vec<Vec<u8>>) {
         let mut entries = self.entries.lock().expect("call log");
         if let Some((_, record)) = entries.get_mut(index) {
+            record.payload = payload;
             record.items_sent = items_sent;
             record.completed_at = Some(Instant::now());
         }
@@ -866,7 +893,7 @@ impl RpcHandler for UnaryOrg {
         let mut reply = Vec::from(self.label.as_bytes());
         reply.push(b':');
         reply.extend_from_slice(&payload);
-        self.log.complete(index, vec![reply.clone()]);
+        self.log.complete(index, payload, vec![reply.clone()]);
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: Vec::new(),
@@ -892,7 +919,7 @@ struct StreamOrg {
 impl RpcStreamingHandler for StreamOrg {
     async fn call(&self, ctx: RpcContext, sink: RpcResponseSink) -> Result<(), RpcHandlerError> {
         let payload = ctx.payload.body.to_vec();
-        let record = CallRecord::from_ctx("streaming", ctx.org_admission.as_ref(), payload);
+        let record = CallRecord::from_ctx("streaming", ctx.org_admission.as_ref(), Vec::new());
         let index = self.log.enter(self.service, record);
         let mut sent = Vec::new();
         let mut emit = |chunk: Vec<u8>, sent: &mut Vec<Vec<u8>>| {
@@ -914,16 +941,19 @@ impl RpcStreamingHandler for StreamOrg {
                 tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
             }
         }
-        self.log.complete(index, sent);
+        self.log.complete(index, payload, sent);
         Ok(())
     }
 }
 
 /// A client-streaming provider: concatenates every upload chunk into
-/// the terminal reply.
+/// the terminal reply. `defer_ms` between chunks makes it a SLOW
+/// CONSUMER — an eager drainer grants credit as fast as it arrives
+/// and an upload window can never park a send.
 struct CsOrg {
     service: &'static str,
     label: &'static str,
+    defer_ms: u64,
     gate: Option<Arc<HoldGate>>,
     log: Arc<CallLog>,
 }
@@ -941,6 +971,9 @@ impl RpcClientStreamingHandler for CsOrg {
         let mut collected = Vec::new();
         while let Some(chunk) = requests.next().await {
             collected.extend_from_slice(&chunk);
+            if self.defer_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.defer_ms)).await;
+            }
         }
         if let Some(gate) = &self.gate {
             gate.wait().await;
@@ -948,7 +981,7 @@ impl RpcClientStreamingHandler for CsOrg {
         let mut reply = Vec::from(self.label.as_bytes());
         reply.push(b':');
         reply.extend_from_slice(&collected);
-        self.log.complete(index, vec![reply.clone()]);
+        self.log.complete(index, collected, vec![reply.clone()]);
         Ok(RpcResponsePayload {
             status: RpcStatus::Ok,
             headers: Vec::new(),
@@ -996,10 +1029,7 @@ impl RpcDuplexHandler for DxDx {
             sent.push(chunk.clone());
             responses.send(chunk.clone());
         }
-        let mut record = CallRecord::from_ctx("duplex", None, collected);
-        record.items_sent = sent.clone();
-        self.log.complete(index, sent);
-        let _ = record;
+        self.log.complete(index, collected, sent);
         Ok(())
     }
 }
@@ -1053,7 +1083,12 @@ pub fn mint_opening(
     let mut req = RpcRequestPayload {
         service: service.to_string(),
         deadline_ns: 0,
-        flags: 0,
+        // The shape flags the proof's kind claims: a streaming proof
+        // on a unary-flagged request is `ShapeMismatch` at the gate.
+        flags: match stream_kind {
+            Some(STREAM_CALL_KIND_SERVER_STREAMING) => FLAG_RPC_STREAMING_RESPONSE,
+            _ => 0,
+        },
         headers: Vec::new(),
         body: Bytes::copy_from_slice(body),
     };
@@ -1164,6 +1199,24 @@ pub struct CxOrg<'a> {
     pub tabs: HashMap<String, StepOrgSender>,
 }
 
+impl CxOrg<'_> {
+    /// The bootstrap URL for one tab, with the revocation feed's
+    /// control-socket pointer in the `#org-control=` override tag.
+    /// The `node=` key is the TAB name — the feed registry's key.
+    pub fn bootstrap_base_with_feed(&self, tab: &str) -> String {
+        let port = self
+            .page_origin
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(0);
+        format!(
+            "{}#org-control=ws://localhost:{port}/harness/org-control?node={tab}",
+            self.bootstrap_base
+        )
+    }
+}
+
 // ─────────────────────────── step builders ───────────────────────────
 
 /// One leaf's identity as the page reported it after `connect`.
@@ -1187,13 +1240,24 @@ fn leaf_of(result: &StepResult) -> Option<LeafInfo> {
     })
 }
 
-fn connect_step(cx: &CxOrg<'_>, world: &OrgWorld, id: &PageId, session: &str, lock_scope: Option<&str>) -> Value {
+fn connect_step(
+    cx: &CxOrg<'_>,
+    world: &OrgWorld,
+    id: &PageId,
+    session: &str,
+    lock_scope: Option<&str>,
+    feed_key: &str,
+) -> Value {
     let _ = world;
     json!({
         "kind": "connect",
         "session": session,
         "credential": cx.credential,
-        "bootstrap_url": cx.bootstrap_base,
+        // The FEED POINTER rides the bootstrap URL's `#org-control=`
+        // override tag — `split_org_control` parses it in pure Rust
+        // (no hook-order mystery), and every URL the adapter mints
+        // from the base is tag-free by construction.
+        "bootstrap_url": cx.bootstrap_base_with_feed(feed_key),
         "origin": cx.origin,
         "anchor_rtc_addr": cx.anchor_rtc_addr,
         "stun": cx.stun,
@@ -1346,12 +1410,13 @@ fn register_native_services(anchor: &Arc<MeshNode>) -> NativeServices {
     let policy = std::sync::Arc::new(|_proof: &OrgCallProof| true);
     let mut handles = Vec::new();
 
-    // The unary echo family + the leader attribution service.
-    for (service, label) in [
-        (N_U_SAME, "u-same"),
-        (N_U_GRANTED, "u-granted"),
-        (N_LEADER, "u-leader"),
-    ] {
+    // The unary echo family + the leader attribution service. The
+    // GRANTED twin registers through `serve_rpc_granted` — the
+    // `CrossOrgGranted` admission branch; registering it
+    // owner-scoped routes it through `OwnerDelegated`, whose
+    // `acting_org == provider_owner_org` requirement denies a
+    // cross-org caller `GranteeMismatch` before the grant is read.
+    for (service, label) in [(N_U_SAME, "u-same"), (N_LEADER, "u-leader")] {
         handles.push(
             anchor
                 .serve_rpc_owner_scoped(
@@ -1366,46 +1431,58 @@ fn register_native_services(anchor: &Arc<MeshNode>) -> NativeServices {
                 .expect("owner-scoped unary serve"),
         );
     }
+    handles.push(
+        anchor
+            .serve_rpc_granted(
+                N_U_GRANTED,
+                Arc::new(UnaryOrg {
+                    service: N_U_GRANTED,
+                    label: "u-granted",
+                    log: Arc::clone(&log),
+                }),
+                policy.clone(),
+            )
+            .expect("granted unary serve"),
+    );
 
     // Server-streaming family.
-    for (service, pre, post) in [
+    for (service, pre, post, granted) in [
         (
             N_S_SAME,
             vec![b"s-same-0".to_vec(), b"s-same-1".to_vec(), b"s-same-2".to_vec()],
             vec![b"s-same-tail".to_vec()],
+            false,
         ),
         (
             N_S_GRANTED,
             vec![b"s-granted-0".to_vec(), b"s-granted-1".to_vec()],
             vec![b"s-granted-tail".to_vec()],
+            true,
         ),
         (
             N_REV,
             (0..8).map(|i| format!("drip-{i}").into_bytes()).collect(),
             vec![b"rev-tail".to_vec()],
+            false,
         ),
     ] {
-        let gate = (service == N_REV).then(|| Arc::new(HoldGate::default()));
-        handles.push(
+        let handler = Arc::new(StreamOrg {
+            service,
+            pre,
+            post,
+            delay_ms: if service == N_REV { 150 } else { 0 },
+            gate: None,
+            log: Arc::clone(&log),
+        });
+        handles.push(if granted {
             anchor
-                .serve_rpc_owner_scoped_streaming(
-                    service,
-                    Arc::new(StreamOrg {
-                        service,
-                        pre,
-                        post,
-                        delay_ms: if service == N_REV { 150 } else { 0 },
-                        gate: gate.clone(),
-                        log: Arc::clone(&log),
-                    }),
-                    policy.clone(),
-                )
-                .expect("owner-scoped streaming serve"),
-        );
-        if service == N_REV {
-            // no gate parked: the slow drip IS the mid-stream window
-        }
-        let _ = gate;
+                .serve_rpc_granted_streaming(service, handler, policy.clone())
+                .expect("granted streaming serve")
+        } else {
+            anchor
+                .serve_rpc_owner_scoped_streaming(service, handler, policy.clone())
+                .expect("owner-scoped streaming serve")
+        });
     }
     // The teardown/hold providers: parked until released.
     for (service, gate) in [
@@ -1430,43 +1507,67 @@ fn register_native_services(anchor: &Arc<MeshNode>) -> NativeServices {
         );
     }
 
-    // Client-streaming family.
-    for (service, label) in [(N_CS_SAME, "cs-same"), (N_CS_GRANTED, "cs-granted")] {
-        handles.push(
+    // Client-streaming family + the slow-consumer backpressure
+    // provider.
+    for (service, label, granted) in
+        [(N_CS_SAME, "cs-same", false), (N_CS_GRANTED, "cs-granted", true)]
+    {
+        let handler = Arc::new(CsOrg {
+            service,
+            label,
+            defer_ms: 0,
+            gate: None,
+            log: Arc::clone(&log),
+        });
+        handles.push(if granted {
             anchor
-                .serve_rpc_owner_scoped_client_stream(
-                    service,
-                    Arc::new(CsOrg {
-                        service,
-                        label,
-                        gate: None,
-                        log: Arc::clone(&log),
-                    }),
-                    policy.clone(),
-                )
-                .expect("owner-scoped client-stream serve"),
-        );
+                .serve_rpc_granted_client_stream(service, handler, policy.clone())
+                .expect("granted client-stream serve")
+        } else {
+            anchor
+                .serve_rpc_owner_scoped_client_stream(service, handler, policy.clone())
+                .expect("owner-scoped client-stream serve")
+        });
     }
+    handles.push(
+        anchor
+            .serve_rpc_owner_scoped_client_stream(
+                N_CS_BP,
+                Arc::new(CsOrg {
+                    service: N_CS_BP,
+                    label: "cs-bp",
+                    // A SLOW consumer: 150 ms per chunk, so an
+                    // exhausted upload window parks the caller's
+                    // sends somewhere observable.
+                    defer_ms: 150,
+                    gate: None,
+                    log: Arc::clone(&log),
+                }),
+                policy.clone(),
+            )
+            .expect("slow-consumer client-stream serve"),
+    );
 
     // Duplex family.
-    for (service, tail) in [
-        (N_DX_SAME, vec![b"dx-same-tail".to_vec()]),
-        (N_DX_GRANTED, vec![b"dx-granted-tail".to_vec()]),
+    for (service, tail, granted) in [
+        (N_DX_SAME, vec![b"dx-same-tail".to_vec()], false),
+        (N_DX_GRANTED, vec![b"dx-granted-tail".to_vec()], true),
     ] {
-        handles.push(
+        let handler = Arc::new(DxDx {
+            service,
+            tail,
+            gate: None,
+            log: Arc::clone(&log),
+        });
+        handles.push(if granted {
             anchor
-                .serve_rpc_owner_scoped_duplex(
-                    service,
-                    Arc::new(DxDx {
-                        service,
-                        tail,
-                        gate: None,
-                        log: Arc::clone(&log),
-                    }),
-                    policy.clone(),
-                )
-                .expect("owner-scoped duplex serve"),
-        );
+                .serve_rpc_granted_duplex(service, handler, policy.clone())
+                .expect("granted duplex serve")
+        } else {
+            anchor
+                .serve_rpc_owner_scoped_duplex(service, handler, policy.clone())
+                .expect("owner-scoped duplex serve")
+        });
     }
 
     NativeServices {
@@ -1952,19 +2053,92 @@ async fn browser_pair_matrix(
     a: &LeafInfo,
     b: &LeafInfo,
 ) {
-    // Drive the direct session from both ends.
+    // Drive the direct session from both ends — AFTER the pair
+    // discovers each other's signed announcements (a peer's Noise key
+    // comes from its announcement, never from a caller; stage6's
+    // precondition).
+    for tab in [TAB_PAIR_A, TAB_PAIR_B] {
+        let announced = script
+            .run(
+                tab,
+                json!({ "kind": "announce", "session": SESSION, "capabilities": ["org.s4.tag"] }),
+            )
+            .await;
+        if !announced.ok {
+            let detail = format!("pair announce failed: {}", why(&announced));
+            for index in 16..21 {
+                ledger.record(WITNESSES[index], false, detail.clone());
+            }
+            return;
+        }
+    }
+    let mut discovered = false;
+    for _ in 0..60 {
+        // `converge_discovery`'s pattern: re-announce INSIDE the poll
+        // — the flood is interval-gated at the anchor, and one
+        // emission can miss a peer that connects between floods.
+        for tab in [TAB_PAIR_A, TAB_PAIR_B] {
+            let _ = script
+                .run(
+                    tab,
+                    json!({ "kind": "announce", "session": SESSION, "capabilities": ["org.s4.tag"] }),
+                )
+                .await;
+        }
+        let seen_a = script
+            .run(
+                TAB_PAIR_A,
+                json!({ "kind": "query", "session": SESSION, "capability": "org.s4.tag" }),
+            )
+            .await;
+        let seen_b = script
+            .run(
+                TAB_PAIR_B,
+                json!({ "kind": "query", "session": SESSION, "capability": "org.s4.tag" }),
+            )
+            .await;
+        let a_sees_b = peers_of(&seen_a).map_or(false, |p| p.to_string().contains(&b.node_hex));
+        let b_sees_a = peers_of(&seen_b).map_or(false, |p| p.to_string().contains(&a.node_hex));
+        if a_sees_b && b_sees_a {
+            discovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if !discovered {
+        let detail =
+            "the pair never discovered each other's signed announcements — a peer's Noise \
+             key comes from its announcement and peer_offer would refuse"
+                .to_string();
+        for index in 16..21 {
+            ledger.record(WITNESSES[index], false, detail.clone());
+        }
+        return;
+    }
+
+    // Drive the direct session from both ends. The ANSWER is retried:
+    // the offer's envelope rides the relayed path and can arrive
+    // after `peer_offer` resolves ("an offer is answered from the
+    // envelope that arrived, never from the caller").
     let offer = script
         .run(
             TAB_PAIR_A,
             json!({ "kind": "peer_offer", "session": SESSION, "peer_hex": b.node_hex }),
         )
         .await;
-    let answer = script
-        .run(
-            TAB_PAIR_B,
-            json!({ "kind": "peer_accept_offer", "session": SESSION, "peer_hex": a.node_hex }),
-        )
-        .await;
+    let mut answer = fail("never attempted");
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        answer = script
+            .run(
+                TAB_PAIR_B,
+                json!({ "kind": "peer_accept_offer", "session": SESSION, "peer_hex": a.node_hex }),
+            )
+            .await;
+        if answer.ok || !why(&answer).contains("no verified offer") {
+            break;
+        }
+    }
     let _ = script
         .run(
             TAB_PAIR_A,
@@ -1977,15 +2151,46 @@ async fn browser_pair_matrix(
             json!({ "kind": "peer_candidate", "session": SESSION, "peer_hex": a.node_hex }),
         )
         .await;
+    // ICE takes seconds and `peer_candidate` services ONE candidate
+    // round: poll both sides until the offerer's reading says the
+    // channel is open (stage6's `drive_to_open` shape) before the
+    // handshake — handshaking against a not-yet-open DataChannel is
+    // the `is not open` failure.
+    let mut channel_open = false;
+    for _ in 0..40 {
+        let reading = script
+            .run(
+                TAB_PAIR_A,
+                json!({ "kind": "peer_candidate", "session": SESSION, "peer_hex": b.node_hex }),
+            )
+            .await;
+        let _ = script
+            .run(
+                TAB_PAIR_B,
+                json!({ "kind": "peer_candidate", "session": SESSION, "peer_hex": a.node_hex }),
+            )
+            .await;
+        let raw = reading
+            .stats
+            .as_ref()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if raw.contains("\"open\"") {
+            channel_open = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
     let hs = script
         .run(
             TAB_PAIR_A,
             json!({ "kind": "peer_handshake", "session": SESSION, "peer_hex": b.node_hex }),
         )
         .await;
-    if !(offer.ok && answer.ok && hs.ok) {
+    if !(offer.ok && answer.ok && hs.ok && channel_open) {
         let detail = format!(
-            "the direct session did not come up: offer={} answer={} handshake={}",
+            "the direct session did not come up: offer={} answer={} channel_open={channel_open} \
+             handshake={}",
             why(&offer),
             why(&answer),
             why(&hs)
@@ -2287,7 +2492,6 @@ async fn old_session_frames_refused(
     ledger: &mut Ledger,
     services: &NativeServices,
     old: &LeafInfo,
-    new: &LeafInfo,
 ) {
     let witness = WITNESSES[22];
     let creds = world.creds(
@@ -2319,23 +2523,34 @@ async fn old_session_frames_refused(
 
     // The replacement: Y connects with the SAME identity.
     let y = script
-        .run(TAB_NEW, connect_step(cx, world, &world.shared, SESSION, None))
+        .run(
+            TAB_NEW,
+            connect_step(cx, world, &world.shared, SESSION, None, TAB_NEW),
+        )
         .await;
     let y_leaf = leaf_of(&y);
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // The eviction + X's typed retirement are asynchronous at the
+    // anchor; give the replacement a real settle before releasing.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
 
     // Release the parked provider response — after the replacement.
     services.hold_gate.release();
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // X's parked call: typed terminal, nothing delivered after.
+    // X's parked call: the released response delivers/completes
+    // NOTHING — the roster's exact words. The pre-release item set is
+    // unchanged (no `released-tail` phantom) and the call NEVER
+    // completes (terminal stays null — no success, no zombie).
     let final_read = script
         .run(TAB_OLD, stream_read_step("old-parked", 99, 8_000))
         .await;
     let items_after = stat_list(&final_read, "items");
     let terminal = stat_obj(&final_read, "terminal").cloned().unwrap_or(Value::Null);
-    let terminal_kind = terminal.get("kind").and_then(Value::as_str).unwrap_or("");
-    let x_typed_dead = terminal_kind == "sessionLost" && items_after.len() == 1;
+    let x_delivered_nothing = items_after
+        == vec![
+            hex(b"held-0"),
+            hex(b"held-1"),
+        ] && terminal.is_null();
 
     // Y's fresh call proceeds exactly (distinct payload; if the old
     // response leaked into it the identity check fails).
@@ -2349,12 +2564,13 @@ async fn old_session_frames_refused(
 
     ledger.record(
         witness,
-        precondition && x_typed_dead && y_exact && y_leaf.is_some(),
+        precondition && x_delivered_nothing && y_exact && y_leaf.is_some(),
         format!(
             "precondition(warmup+parked+1 item)={precondition} (old leaf {}, new leaf {:?}); \
-             X's parked call terminal={} typed-dead={x_typed_dead} items-after-release={items_after:?} \
-             (the released response completed NOBODY — it rode the live session as an unknown \
-             call id); Y fresh reply={} (want {}) exact={y_exact}; {}",
+             X's parked call after the release: items={items_after:?} terminal={} — the released \
+             response delivered/completed NOTHING (no phantom tail, no completion: \
+             {x_delivered_nothing}); Y fresh reply={} (want {}) exact={y_exact} — the live \
+             session's call proceeded; {}",
             old.node_hex,
             y_leaf.as_ref().map(|l| l.node_hex.clone()),
             terminal,
@@ -2363,7 +2579,6 @@ async fn old_session_frames_refused(
             typed(&fresh)
         ),
     );
-    let _ = new;
 }
 
 /// 24. `org_replayed_opening_refused`.
@@ -2400,7 +2615,7 @@ async fn replayed_opening_refused(
     let serve = script
         .run(
             TAB_SERVE,
-            serve_step(&handle, B_INJECT, "streaming", "same-org", &owner_org, "rp", &pre, &post, false, 0),
+            serve_step(&handle, B_REPLAY, "streaming", "same-org", &owner_org, "rp", &pre, &post, false, 0),
         )
         .await;
     if !serve.ok {
@@ -2419,7 +2634,7 @@ async fn replayed_opening_refused(
             &world.root_a,
             &world.root_a,
             &world.server.entity,
-            B_INJECT,
+            B_REPLAY,
             b"replay-captured",
             0xE000_0000_0000_0031,
             cx.anchor.origin_hash(),
@@ -2455,7 +2670,7 @@ async fn replayed_opening_refused(
         &world.root_a,
         &world.root_a,
         &world.server.entity,
-        B_INJECT,
+        B_REPLAY,
         b"replay-foreign-session",
         0xE000_0000_0000_0033,
         cx.anchor.origin_hash(),
@@ -2554,13 +2769,23 @@ async fn streaming_backpressure(
 ) {
     let witness = WITNESSES[24];
     let handle = "bp-serve".to_string();
-    let pre: Vec<Vec<u8>> = (0..6).map(|i| format!("bp-chunk-{i}-{:04}", i).into_bytes()).collect();
+    // 6 chunks of 8 B against a 16 B (2-chunk) window — the exact
+    // shape the passing duplex leg used (larger windows dead-stalled
+    // the flow at this surface): sends 0–1 fit and resolve; 2–5 must
+    // park until reads grant.
+    let pre: Vec<Vec<u8>> = (0..6)
+        .map(|i| {
+            let mut chunk = format!("bp{i}-").into_bytes();
+            chunk.resize(8, b'.');
+            chunk
+        })
+        .collect();
     let post: Vec<Vec<u8>> = Vec::new();
     let owner_org = hex32(world.root_a.org_id().as_bytes());
     let serve = script
         .run(
             TAB_SERVE,
-            serve_step(&handle, B_S_SAME, "streaming", "same-org", &owner_org, "bp", &pre, &post, false, 0),
+            serve_step(&handle, B_BP, "streaming", "same-org", &owner_org, "bp", &pre, &post, false, 0),
         )
         .await;
     if !serve.ok {
@@ -2573,7 +2798,7 @@ async fn streaming_backpressure(
         &world.root_a,
         &world.root_a,
         &world.server.entity,
-        B_S_SAME,
+        B_BP,
         false,
     );
     // Initial window = 2 chunks: sends 2..5 must park while the
@@ -2581,7 +2806,7 @@ async fn streaming_backpressure(
     let open = script
         .run(
             TAB_CALL,
-            stream_open_step(B_S_SAME, b"bp-open", &creds, "bp-call", Some(2 * 12)),
+            stream_open_step(B_BP, b"bp-open", &creds, "bp-call", Some(16)),
         )
         .await;
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -2658,12 +2883,18 @@ async fn client_stream_backpressure(
         &world.root_a,
         &world.root_a,
         &world.anchor_entity,
-        N_CS_SAME,
+        N_CS_BP,
         false,
     );
-    let chunks: Vec<Vec<u8>> = (0..6).map(|i| format!("cu-{i}").into_bytes()).collect();
+    let chunks: Vec<Vec<u8>> = (0..6)
+        .map(|i| {
+            let mut chunk = format!("cu-{i}-").into_bytes();
+            chunk.resize(8, b'.');
+            chunk
+        })
+        .collect();
     let open = script
-        .run(TAB_CALL, upload_open_step(N_CS_SAME, &creds, "cs-bp", Some(8)))
+        .run(TAB_CALL, upload_open_step(N_CS_BP, &creds, "cs-bp", Some(16)))
         .await;
     // Send beyond the window: 4 at once, then observe the park.
     let send1 = script.run(TAB_CALL, upload_send_step("cs-bp", &chunks[..4])).await;
@@ -2684,7 +2915,7 @@ async fn client_stream_backpressure(
     for c in &chunks[1..] {
         joined.extend_from_slice(c);
     }
-    let expected = expected_unary("cs-same", &joined);
+    let expected = expected_unary("cs-bp", &joined);
     let reply = fin.reply.as_deref().map(crate::unhex).unwrap_or_default();
     let eof_exact = fin.ok && reply == expected;
 
@@ -2695,7 +2926,7 @@ async fn client_stream_backpressure(
         .run(TAB_CALL, upload_send_step("cs-bp", &[b"late-after-end".to_vec()]))
         .await;
     let late_refused = stat_obj(&late, "refused").is_some();
-    let records = services.log.for_service(N_CS_SAME);
+    let records = services.log.for_service(N_CS_BP);
     let collected_exact = records
         .last()
         .map(|r| r.payload == joined)
@@ -2705,11 +2936,12 @@ async fn client_stream_backpressure(
         witness,
         open.ok && parked >= 1 && eof_exact && late_refused && collected_exact,
         format!(
-            "upload window=8B: parked {parked}/4 early sends >250ms under a small request window \
-             (credit parks the caller's send); half-close EOF delivered the EXACT concatenation \
-             reply={} (want {}) so FLAG_END reached the handler; late upload after END: typed \
-             refusal={} ({}) — delivers nothing, cancels nothing (the result stood: {eof_exact}); \
-             handler collected == exact upload set: {collected_exact}; sends {} + {} ok",
+            "upload window=16B (2 chunks) at a SLOW consumer (150 ms/chunk): parked {parked}/4 \
+             early sends >250ms (credit parks the caller's send); half-close EOF delivered the \
+             EXACT concatenation reply={} (want {}) so FLAG_END reached the handler; late upload \
+             after END: typed refusal={} ({}) — delivers nothing, cancels nothing (the result \
+             stood: {eof_exact}); handler collected == exact upload set: {collected_exact}; \
+             sends {} + {} ok",
             hex(&reply),
             hex(&expected),
             late_refused,
@@ -2967,12 +3199,27 @@ async fn revocation_refuses_openings(
         false,
     );
     let before = services.log.total();
-    // The revoked generation's NEW opening: exact coarse 'denied'.
+    // The revoked generation's NEW opening: the refusal surfaces at
+    // the stream's TERMINAL (the opening itself resolves), so the
+    // typed identity is read there — exact coarse 'denied'.
     let open_r = script
         .run(TAB_REVOKED, stream_open_step(N_S_SAME, b"post-raise-revoked", &creds_revoked, "post-r", None))
         .await;
-    let refused_exact = !open_r.ok
-        && stat_obj(&open_r, "coarse").and_then(Value::as_str) == Some("denied");
+    let read_r = if open_r.ok {
+        script.run(TAB_REVOKED, stream_read_step("post-r", 1, 8_000)).await
+    } else {
+        fail("revoked open failed before a terminal could be read")
+    };
+    let terminal_r = stat_obj(&read_r, "terminal").cloned().unwrap_or(Value::Null);
+    let coarse_r = terminal_r
+        .get("coarse")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let denied_r = terminal_r.get("kind").and_then(Value::as_str).is_some_and(|_| coarse_r == "denied");
+    // Fallback shape: the opening itself refused typed.
+    let refused_exact = denied_r
+        || (!open_r.ok
+            && stat_obj(&open_r, "coarse").and_then(Value::as_str) == Some("denied"));
     let after_refusal = services.log.total();
     // The compliant generation's opening in the same window proceeds
     // exactly (the discriminating pair).
@@ -2998,10 +3245,12 @@ async fn revocation_refuses_openings(
         witness,
         refused_exact && handler_dark && open_c.ok && items_c == expected_c,
         format!(
-            "post-raise opening by the revoked generation: typed {} coarse='denied' exact={refused_exact}; \
+            "post-raise opening by the revoked generation: terminal={} open-typed={} \
+             coarse='denied' exact={refused_exact}; \
              handler DARK for it (ran delta 0 — {before} -> {after_refusal}); the compliant-generation \
              sibling opened and completed in the SAME window: items={items_c:?} (want {expected_c:?}) — \
              'the provider is down' would pass neither pair",
+            terminal_r,
             typed(&open_r)
         ),
     );
@@ -3119,23 +3368,17 @@ async fn leader_attribution(
     service_log: &Arc<CallLog>,
 ) {
     let witness = WITNESSES[30];
-    let leader_scope = "s4-leader-lock";
+    let leader_scope = LEADER_SCOPE;
+    let _ = &leader_scope;
     // Three tabs of ONE identity in ONE context: one leader, two
-    // followers (the leader itself also proxies calls).
+    // followers (the leader itself also proxies calls). They CONNECTED
+    // in the main loop — the anchor's announcement window must cover
+    // them like every other tab.
     let opened = [
         (TAB_LEAD, PAGE_LEAD),
         (TAB_FOLLOW1, PAGE_FOLLOW1),
         (TAB_FOLLOW2, PAGE_FOLLOW2),
     ];
-    for (tab, _) in opened {
-        let r = script
-            .run(tab, connect_step(cx, world, &world.leader, SESSION, Some(leader_scope)))
-            .await;
-        if !r.ok {
-            ledger.record(witness, false, format!("{tab} did not open a session: {}", why(&r)));
-            return;
-        }
-    }
     // Wait for the election to settle: exactly one leader.
     let mut roles = Vec::new();
     for _ in 0..40 {
@@ -3144,7 +3387,7 @@ async fn leader_attribution(
             let info = script
                 .run(tab, json!({ "kind": "info", "session": SESSION }))
                 .await;
-            roles.push(stat_str(&info, "role").unwrap_or_default());
+            roles.push(role_of(&info));
         }
         if roles.iter().filter(|r| r.as_str() == "leader").count() == 1 {
             break;
@@ -3197,16 +3440,19 @@ async fn leader_attribution(
             && provider_pairing,
         format!(
             "roles={roles:?} (one leader); TWO followers, DISTINCT payloads: follower1 got {} \
-             (want {}) and follower2 got {} (want {}) — each callback received EXACTLY its own \
-             call's result (payload pairing: {pairing_ok}); provider records pair payload1 with \
-             caller={:?} and payload2 with caller={:?} (per-follower attribution preserved end to \
-             end: {provider_pairing}); wire-side facts per record: peer-session tags recorded at \
-             entry. THE INVERSE (flipping follower attribution at the proxy production site) swaps \
-             these pairings and reddens THIS tuple — no other assertion reads it",
+             (want {}; {}) and follower2 got {} (want {}; {}) — each callback received EXACTLY \
+             its own call's result (payload pairing: {pairing_ok}); provider records pair payload1 \
+             with caller={:?} and payload2 with caller={:?} (per-follower attribution preserved \
+             end to end: {provider_pairing}); wire-side facts per record: peer-session tags \
+             recorded at entry. THE INVERSE (flipping follower attribution at the proxy \
+             production site) swaps these pairings and reddens THIS tuple — no other assertion \
+             reads it",
             hex(&reply1),
             hex(&expected1),
+            typed(&r1),
             hex(&reply2),
             hex(&expected2),
+            typed(&r2),
             rec1.and_then(|r| r.caller.clone()),
             rec2.and_then(|r| r.caller.clone())
         ),
@@ -3254,14 +3500,14 @@ async fn leader_replacement(
     let gen_before = script
         .run(follow2_tab, json!({ "kind": "info", "session": SESSION }))
         .await;
-    let generation_before = stat_str(&gen_before, "generation").unwrap_or_default();
+    let generation_before = generation_of(&gen_before);
     let closed = cx.driver.close_page(PAGE_LEAD).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
     let gen_after = script
         .run(follow2_tab, json!({ "kind": "info", "session": SESSION }))
         .await;
-    let generation_after = stat_str(&gen_after, "generation").unwrap_or_default();
-    let role_after = stat_str(&gen_after, "role").unwrap_or_default();
+    let generation_after = generation_of(&gen_after);
+    let role_after = role_of(&gen_after);
 
     // The pending proxied call fails typed — LeaderLost class — and
     // never resumes.
@@ -3274,7 +3520,10 @@ async fn leader_replacement(
     let never_resumed = service_log.for_service(N_TEARDOWN).len() == 1;
 
     // The successor call: fresh correlation (a NEW provider
-    // invocation, its own payload) with correct attribution.
+    // invocation, its own payload) with correct attribution. Settle
+    // the promotion first — a call issued into an election in flight
+    // says nothing about attribution.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
     let successor_payload = b"replacement-successor".to_vec();
     let successor = script
         .run(follow2_tab, unary_step(N_LEADER, &successor_payload, &creds))
@@ -3354,7 +3603,7 @@ async fn leader_teardown(
 
     // THE TEARDOWN: close whichever tab is the leader now.
     let info1 = script.run(TAB_FOLLOW1, json!({ "kind": "info", "session": SESSION })).await;
-    let role1 = stat_str(&info1, "role").unwrap_or_default();
+    let role1 = role_of(&info1);
     let leader_page = if role1 == "leader" { PAGE_FOLLOW1 } else { PAGE_FOLLOW2 };
     let pending_tab = if role1 == "leader" { TAB_FOLLOW2 } else { TAB_FOLLOW1 };
     let closed = cx.driver.close_page(leader_page).await;
@@ -3783,6 +4032,33 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
 
     let services = register_native_services(cx.anchor);
 
+    // ENTITY PINS NEED SIGNED ANNOUNCEMENTS IN BOTH DIRECTIONS — the
+    // `bring_up`/`converge_discovery` pattern (sdk tests_live): a
+    // protected call's mint binds `peer_entity_id(target)` and a
+    // reply-channel subscribe needs the target to have pinned OUR
+    // EntityId "from a signature-verified direct capability
+    // announcement". The anchor re-announces through the connect
+    // window (a late joiner must see a flood), and every page
+    // announces below; the pins then settle before any witness runs.
+    let announce_anchor = Arc::clone(cx.anchor);
+    let announce_run = tokio::spawn(async move {
+        for beat in 0..600 {
+            // A TAGGED set with a CHANGING tag each beat: an empty
+            // announcement emits nothing, and an identical document
+            // re-announced is same-version-suppressed — the leaf-side
+            // pin the reply-channel auth needs arrives only on an
+            // emission that actually goes out.
+            let _ = announce_anchor
+                .announce_capabilities(
+                    CapabilitySet::new()
+                        .add_tag("org.s4.native")
+                        .add_tag(format!("beat:{beat}")),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+
     // Open every page: one context per identity (the leader trio
     // shares ONE context — and so one identity and one Web Locks
     // namespace — which is the proxied-attribution topology).
@@ -3822,14 +4098,36 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
         (TAB_COMPLIANT, &world.compliant, None),
         (TAB_TEARDOWN, &world.teardown, None),
         (TAB_OLD, &world.shared, None),
+        // The leader trio connects EARLY on one lock scope: the
+        // anchor's announcement must reach them while the re-announce
+        // window is live, exactly like every other tab.
+        (TAB_LEAD, &world.leader, Some(LEADER_SCOPE)),
+        (TAB_FOLLOW1, &world.leader, Some(LEADER_SCOPE)),
+        (TAB_FOLLOW2, &world.leader, Some(LEADER_SCOPE)),
     ];
     let mut leaves: HashMap<&str, LeafInfo> = HashMap::new();
     for (tab, id, lock) in connects {
         let r = script
-            .run(tab, connect_step(&cx, &world, id, SESSION, lock))
+            .run(tab, connect_step(&cx, &world, id, SESSION, lock, tab))
             .await;
         match leaf_of(&r) {
             Some(leaf) if leaf.node_id == id.entity.node_id() => {
+                // Every page announces, so its EntityId reaches every
+                // peer as a signature-verified capability
+                // announcement (the pin both call directions need).
+                let announced = script
+                    .run(
+                        tab,
+                        json!({
+                            "kind": "announce",
+                            "session": SESSION,
+                            "capabilities": ["org.s4.tag"],
+                        }),
+                    )
+                    .await;
+                if !announced.ok {
+                    println!("[org] {tab} could not announce: {}", why(&announced));
+                }
                 leaves.insert(tab, leaf);
             }
             other => {
@@ -3848,9 +4146,67 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
             }
         }
     }
+    // SETTLE: the anchor must hold every leaf's pinned EntityId
+    // before any protected call's mint can bind a provider, and the
+    // feed sockets must be registered before the revocation windows.
+    let pins_ok = wait_for(
+        || {
+            leaves
+                .values()
+                .all(|leaf| cx.anchor.peer_entity_id(leaf.node_id).is_some())
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+    if !pins_ok {
+        let missing: Vec<String> = leaves
+            .iter()
+            .filter(|(_, leaf)| cx.anchor.peer_entity_id(leaf.node_id).is_none())
+            .map(|(tab, leaf)| format!("{tab}={}", leaf.node_hex))
+            .collect();
+        println!(
+            "[org] WARNING: the anchor pinned only some entities after 15s: missing {}",
+            missing.join(", ")
+        );
+    }
+    // The pages' side of the same pins: poll each page's query for
+    // the anchor's TAGGED announcement (ingest == the pin the
+    // reply-channel auth and the mints key on), re-announcing the
+    // anchor from the runner side of `converge_discovery` above.
+    let mut pages_pinned = true;
+    for _ in 0..30 {
+        pages_pinned = true;
+        for tab in [TAB_CALL, TAB_SERVE] {
+            let seen = script
+                .run(
+                    tab,
+                    json!({ "kind": "query", "session": SESSION, "capability": "org.s4.native" }),
+                )
+                .await;
+            let sees_anchor = peers_of(&seen)
+                .map_or(false, |p| p.to_string().contains(&hex32(world.anchor_entity.as_bytes())));
+            if !sees_anchor {
+                pages_pinned = false;
+            }
+        }
+        if pages_pinned {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if !pages_pinned {
+        println!("[org] WARNING: the pages did not all ingest the anchor's tagged announcement");
+    }
+    // give it a settle beat (the anchor is still re-announcing).
+    tokio::time::sleep(Duration::from_millis(500)).await;
     // The feed must be UP before the revocation witnesses run (the
-    // page hook's `?node=` key is the tab name).
-    let feed_up = cx.feed.connected(TAB_REVOKED) && cx.feed.connected(TAB_COMPLIANT);
+    // page hook's `?node=` key is the tab name). The sockets open
+    // during `connect`; poll rather than race the WS handshake.
+    let feed_up = wait_for(
+        || cx.feed.connected(TAB_REVOKED) && cx.feed.connected(TAB_COMPLIANT),
+        Duration::from_secs(10),
+    )
+    .await;
     if !feed_up {
         println!(
             "[org] the revocation control feed has no socket for every leaf yet — the \
@@ -3869,16 +4225,8 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
 
     // ── D: attribution / refusal (3) ──
     wrong_peer_refused(&cx, &world, &mut script, ledger, &leaves[TAB_SERVE]).await;
-    old_session_frames_refused(
-        &cx,
-        &world,
-        &mut script,
-        ledger,
-        &services,
-        &leaves[TAB_OLD],
-        &leaves[TAB_NEW],
-    )
-    .await;
+    old_session_frames_refused(&cx, &world, &mut script, ledger, &services, &leaves[TAB_OLD])
+        .await;
     replayed_opening_refused(&cx, &world, &mut script, ledger, &leaves[TAB_SERVE]).await;
 
     // ── E: backpressure / half-close (3) ──
