@@ -224,6 +224,9 @@ jq -e '.splices == 0' "$STATE/c-relay.stopped.json" > /dev/null \
 log "row C: relay up -> still joined directly; relay spliced nothing"
 
 # ---- row A: relay up, direct forced to fail -> relay -----------------------------
+# Rows B and C left DNAT'd direct flows (TCP TIME_WAIT, live UDP) in the
+# gateway's conntrack table; start row A's evidence from an empty table.
+in_gw conntrack -F > /dev/null 2>&1 || fail "could not flush the gateway conntrack table"
 start_relay a-relay
 start_up a-device in_a "$STATE/a-device" --enroll --no-port-mapping --bind "$DEVICE_BIND" --relay "$RELAY"
 jq -e '.enrollment.port_mapping == "disabled" and .enrollment.relay_state == "registered"' \
@@ -253,6 +256,10 @@ grep -E "^udp .*src=192\.168\.101\.2 dst=10\.99\.0\.10 sport=7001 dport=3478" \
 grep -E "^tcp .*src=192\.168\.101\.2 dst=10\.99\.0\.10 .*dport=3478" \
   "$STATE/relayed.gw-conntrack.txt" > /dev/null \
   || fail "row A: no outbound TCP (splice) flow from the device to the relay"
+# ... the agent DID try the direct path first, and it went unanswered ...
+grep -E "^udp .*src=10\.99\.0\.[0-9]+ dst=${PUBLIC_A//./\\.} .*dport=7001 \[UNREPLIED\]" \
+  "$STATE/relayed.gw-conntrack.txt" > /dev/null \
+  || fail "row A: no unanswered direct UDP attempt from the agent; direct was not tried first"
 # ... and nothing from the agent was DNAT'd to the device.
 if grep -E "dst=${PUBLIC_A//./\\.} .* src=192\.168\.101\.2 " "$STATE/relayed.gw-conntrack.txt" > /dev/null; then
   fail "row A: a flow reached the device directly; the relay row is not isolating the relay path"
