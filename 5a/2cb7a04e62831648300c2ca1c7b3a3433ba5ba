@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/subnet/mod.rs
+  s_3f3d4c91f992be::t_75f03924b84fa8 16
+net/crates/net/tests/subnet_wire_admission.rs
+  s_3f3d4c91f992be::t_d9063472ef70e9 1-240
+  s_3f3d4c91f992be::t_e4a276e6f33bb1 241-257
+.github/workflows/ci.yml
+  s_3f3d4c91f992be::t_a52d919cd8feec 1393
+net/crates/net/docs/SUBPROTOCOLS.md
+  s_3f3d4c91f992be::t_a52d919cd8feec 25-26
+net/crates/net/src/adapter/net/subnet/admission_wire.rs
+  s_3f3d4c91f992be::t_0a5b0c8c0bc5da 1-59,61,63-153,155-158,160-194
+  s_3f3d4c91f992be::t_0693899dc992ce 60,62,154,159
+net/crates/net/src/adapter/net/mesh.rs
+  s_3f3d4c91f992be::t_ebf2770329ab4e 2493-2499,12562-12568,35088-35091,35217-35219,35222,35278-35280
+  s_3f3d4c91f992be::t_e8dc762f5cf55d 35220-35221
+  s_3f3d4c91f992be::t_75f03924b84fa8 2489-2492,2500-2505,12558-12561,12569-12571,14572-14573,26634-26636,30219-30235,35080-35087,35092-35216,35223-35277,35281-35285
+  s_3f3d4c91f992be::t_3b1dae750e7787 35286
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_d6bb6bcbe7b3dc 1829-1881
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5a2cb7a04e62831648300c2ca1c7b3a3433ba5ba",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
