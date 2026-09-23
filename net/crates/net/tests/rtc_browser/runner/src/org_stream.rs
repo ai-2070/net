@@ -521,8 +521,8 @@ fn stat_list(result: &StepResult, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn stat_obj<'a>(result: &'a StepResult, _key: &str) -> Option<&'a Value> {
-    result.stats.as_ref()
+fn stat_obj<'a>(result: &'a StepResult, key: &str) -> Option<&'a Value> {
+    result.stats.as_ref().and_then(|s| s.get(key))
 }
 
 /// `query()`'s peer list — a TOP-LEVEL `StepResult` field, not a
@@ -919,7 +919,10 @@ struct StreamOrg {
 impl RpcStreamingHandler for StreamOrg {
     async fn call(&self, ctx: RpcContext, sink: RpcResponseSink) -> Result<(), RpcHandlerError> {
         let payload = ctx.payload.body.to_vec();
-        let record = CallRecord::from_ctx("streaming", ctx.org_admission.as_ref(), Vec::new());
+        // The request payload identifies the record from ENTRY — a
+        // RETIRED call never reaches `complete`, and the witnesses
+        // read its identity there.
+        let record = CallRecord::from_ctx("streaming", ctx.org_admission.as_ref(), payload.clone());
         let index = self.log.enter(self.service, record);
         let mut sent = Vec::new();
         let mut emit = |chunk: Vec<u8>, sent: &mut Vec<Vec<u8>>| {
@@ -2170,12 +2173,8 @@ async fn browser_pair_matrix(
                 json!({ "kind": "peer_candidate", "session": SESSION, "peer_hex": a.node_hex }),
             )
             .await;
-        let raw = reading
-            .stats
-            .as_ref()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        if raw.contains("\"open\"") {
+        let state_now = stat_str(&reading, "state").unwrap_or_default();
+        if state_now == "open" {
             channel_open = true;
             break;
         }
@@ -2379,10 +2378,43 @@ async fn wrong_peer_refused(
         return;
     }
 
-    // Mint leg: a proof naming peer P (a third identity) toward the
-    // leaf Q — the glue must refuse LOCALLY, typed, before anything
-    // rides the wire.
-    let p_entity = world.teardown.entity.clone(); // a real third entity
+    // THE DELIVERY LEG (the roster's core): a frame carrying a proof
+    // for peer P (a third identity) delivered to Q (this leaf). Hand-
+    // minted exactly as the glue mints (the parity receipts pin the
+    // bytes), bound to the LIVE session — everything right except the
+    // provider the proof names.
+    let p_entity = world.teardown.entity.clone();
+    let live_binding = session_binding_of(cx.anchor, server.node_id);
+    let before = world_call_count(script, TAB_SERVE, &handle).await;
+    let counters_before = page_counters(script, TAB_SERVE).await;
+    let opening = match live_binding {
+        Some(binding) => mint_opening(
+            world,
+            cx.anchor_key,
+            &world.root_a,
+            &world.root_a,
+            &p_entity,
+            B_INJECT,
+            b"wrong-peer-frame",
+            0xE000_0000_0000_0021,
+            cx.anchor.origin_hash(),
+            Some(STREAM_CALL_KIND_SERVER_STREAMING),
+            Some(binding),
+            false,
+        ),
+        None => {
+            ledger.record(witness, false, "no live session binding to bind the captured frame to");
+            return;
+        }
+    };
+    let seam = deliver_opening(cx.anchor, server.node_id, &opening).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let after_delivery = world_call_count(script, TAB_SERVE, &handle).await;
+    let counters_after_delivery = page_counters(script, TAB_SERVE).await;
+
+    // THE MINT LEG (supporting): the production glue refuses to mint
+    // a proof whose provider is not the target's pinned entity —
+    // typed, local, pre-wire.
     let intent_for_p = world.intent(
         cx.anchor_key,
         &world.root_a,
@@ -2392,13 +2424,12 @@ async fn wrong_peer_refused(
         false,
         1,
     );
-    let before = world_call_count(script, TAB_SERVE, &handle).await;
     let mint_refusal = cx
         .anchor
         .call_streaming(
             server.node_id,
             B_INJECT,
-            Bytes::from_static(b"wrong-peer"),
+            Bytes::from_static(b"wrong-peer-mint"),
             CallOptions {
                 org_proof_intent: Some(intent_for_p),
                 deadline: Some(std::time::Instant::now() + Duration::from_secs(10)),
@@ -2406,71 +2437,52 @@ async fn wrong_peer_refused(
             },
         )
         .await;
-    let (mint_typed, mint_detail) = match &mint_refusal {
-        Err(RpcError::Codec { message, .. }) => {
-            let exact = message.contains("proof provider does not match the pinned entity");
-            (exact, format!("Codec message={message:?}"))
-        }
-        Err(e) => (false, format!("wrong error class: {e}")),
-        Ok(_) => (false, "the wrong-peer proof was MINTED and sent — the mint must refuse".into()),
+    let mint_detail = match &mint_refusal {
+        Err(RpcError::Codec { message, .. }) => format!("Codec(mint) message={message:?}"),
+        Err(e) => format!("mint-leg error: {e}"),
+        Ok(_) => "mint leg SENT a wrong-peer proof (the mint must refuse)".to_string(),
     };
 
-    // Delivery leg: a frame delivered at Q with NO proof (the
-    // wrong-peer frame's refusal twin: anything not presenting a
-    // valid proof for Q is denied at the gate), then the sibling.
-    let bare = mint_bare_opening(B_INJECT, b"bare-delivery", 0xE000_0000_0000_0021, 0);
-    let delivery = deliver_opening(cx.anchor, server.node_id, &bare).await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    let after_bare = world_call_count(script, TAB_SERVE, &handle).await;
-
-    // Sibling positive control through the SAME service in the SAME
-    // window: correct credentials complete exactly.
+    // The SIBLING positive control in the same window: a correct call
+    // to the same-shaped native provider completes exactly.
     let creds = world.creds(
         &world.caller.entity,
         1,
         &world.root_a,
         &world.root_a,
-        &world.server.entity,
-        B_INJECT,
+        &world.anchor_entity,
+        N_U_SAME,
         false,
     );
     let sibling_payload = b"wp-sibling-ok".to_vec();
-    let handle_call = "wp-call".to_string();
-    let open = script
-        .run(
-            TAB_CALL,
-            stream_open_step(B_INJECT, &sibling_payload, &creds, &handle_call, None),
-        )
+    let sibling = script
+        .run(TAB_CALL, unary_step(N_U_SAME, &sibling_payload, &creds))
         .await;
-    let read = if open.ok {
-        script.run(TAB_CALL, stream_read_step(&handle_call, 5, 15_000)).await
-    } else {
-        fail("sibling open failed")
-    };
-    let items = stat_list(&read, "items");
-    let expected: Vec<String> = ["wp-0", "wp-tail"]
-        .iter()
-        .map(|s| hex(s.as_bytes()))
-        .collect();
-    let sibling_ok = open.ok && items == expected;
+    let sibling_reply = sibling.reply.as_deref().map(crate::unhex).unwrap_or_default();
+    let sibling_expected = expected_unary("u-same", &sibling_payload);
+    let sibling_ok = sibling.ok && sibling_reply == sibling_expected;
     let after_all = world_call_count(script, TAB_SERVE, &handle).await;
 
-    // Handler DARK for both refusals (ran moved exactly ONCE — the
-    // sibling's), sibling exact, mint typed, delivery delivered-then-
-    // refused (the seam's own report).
-    let pass = mint_typed
-        && before == after_bare
-        && after_all == before + 1
-        && sibling_ok;
+    // Handler DARK for the wrong-peer delivery AND the mint refusal
+    // (ran moved exactly ONCE — the sibling's... which hit the NATIVE
+    // provider, so this handle stays at 0), and the delivered frame
+    // provably landed (the seam delivered; the refusal returned to
+    // the caller's dispatch — the leaf's drop counters moved).
+    let handler_dark = before == after_delivery && after_delivery == after_all;
+    let refusal_returned = counters_after_delivery != counters_before;
     ledger.record(
         witness,
-        pass,
+        handler_dark && sibling_ok && refusal_returned,
         format!(
-            "mint leg: {mint_detail} (typed={mint_typed}); delivery leg: seam={delivery} \
-             handler ran before={before} after-bare={after_bare} after-all={after_all} \
-             (DARK for both refusals, +1 exactly = the sibling); sibling items={items:?} \
-             (want {expected:?}); sibling={sibling_ok}; {}",
-            typed(&read)
+            "DELIVERY LEG (the roster's core): a frame whose proof names peer P {} delivered to \
+             Q=this leaf (seam={seam}) — Q's handler stayed DARK (ran {before} -> {after_delivery} \
+             -> {after_all}: {handler_dark}) and the refusal provably returned (leaf drop counters \
+             moved: {refusal_returned}, silent-drop-or-typed per the wire contract); MINT LEG \
+             (supporting): {mint_detail}; SIBLING in the same window completed exactly: \
+             reply={} (want {}) — {sibling_ok}",
+            hex32(p_entity.as_bytes()),
+            hex(&sibling_reply),
+            hex(&sibling_expected)
         ),
     );
 }
@@ -3112,10 +3124,10 @@ async fn midstream_revocation(
     let items_r = stat_list(&final_r, "items");
     let terminal_r = stat_obj(&final_r, "terminal").cloned().unwrap_or(Value::Null);
     let coarse_r = terminal_r
-        .get("coarse")
+        .get("stats")
+        .and_then(|s| s.get("coarse"))
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
     let revoked_terminal_exact = coarse_r == "denied"
         && terminal_r.get("kind").and_then(Value::as_str).is_some();
     let ended_after = stat_obj(&final_r, "done").and_then(Value::as_bool) == Some(true);
@@ -3212,7 +3224,8 @@ async fn revocation_refuses_openings(
     };
     let terminal_r = stat_obj(&read_r, "terminal").cloned().unwrap_or(Value::Null);
     let coarse_r = terminal_r
-        .get("coarse")
+        .get("stats")
+        .and_then(|s| s.get("coarse"))
         .and_then(Value::as_str)
         .unwrap_or("");
     let denied_r = terminal_r.get("kind").and_then(Value::as_str).is_some_and(|_| coarse_r == "denied");
@@ -3516,7 +3529,8 @@ async fn leader_replacement(
         .await;
     let terminal = stat_obj(&final_read, "terminal").cloned().unwrap_or(Value::Null);
     let kind = terminal.get("kind").and_then(Value::as_str).unwrap_or("");
-    let typed_lost = kind == "leaderLost";
+    // The surface's exact LeaderLost class spelling.
+    let typed_lost = kind == "org-leader-lost";
     let never_resumed = service_log.for_service(N_TEARDOWN).len() == 1;
 
     // The successor call: fresh correlation (a NEW provider

@@ -321,10 +321,17 @@ async function execute(step) {
       if (!wasm) return { ok: false, error: 'no wasm node under ' + step.session };
       try {
         const method = step.kind;
-        // The raw result is a DIALOG STRING or a raw reading — never
-        // JSON (peer6.js's exact shape: `stats: { dialog: raw }`).
+        // The raw result is a DIALOG STRING (offer/accept/handshake)
+        // or a JSON attempt READING (candidate) — peer6.js's exact
+        // shape: parse when it parses, keep the raw when it does not.
         const raw = await wasm[method](step.peer_hex);
-        return { ok: true, stats: { raw }, info: String(raw) };
+        let parsed;
+        try {
+          parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        } catch (e) {
+          parsed = { raw: String(raw) };
+        }
+        return { ok: true, stats: parsed, info: String(raw) };
       } catch (e) {
         return typedFailure(e);
       }
