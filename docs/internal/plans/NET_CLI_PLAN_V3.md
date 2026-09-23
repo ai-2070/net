@@ -2266,8 +2266,10 @@ neither was a usable trigger.
 - ~~The restart deferral after nRPC use.~~
 - Standalone subnet join by an already-connected device (V3-2 task 3).
 - Organization enrollment.
-- The relay path re-registers on restart, but no witness restarts the
-  operator behind a relay yet (the natsim relay job covers first join only).
+- Unverified: re-attach through the relay after an operator restart. The
+  device's bundle holds the relay registration id from issuance; whether it
+  still routes to a restarted operator is untested (the natsim relay job
+  covers first join only, and the re-attach witness is direct).
 
 ### V3-2A — channel-scoped invitation, join and credential lifecycle
 
