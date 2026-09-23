@@ -2673,10 +2673,18 @@ async fn old_session_frames_refused(
 
     // Y's fresh call proceeds exactly (distinct payload; if the old
     // response leaked into it the identity check fails).
+    // run_pinned: the REPLACEMENT session's node is rebuilt (fresh
+    // announcement store) — its pin of the anchor lands on the next
+    // announce beat (the same post-replacement transient class as the
+    // leader successor).
     let fresh_payload = b"new-session-fresh".to_vec();
-    let fresh = script
-        .run(TAB_NEW, unary_step(N_U_SAME, &fresh_payload, &creds))
-        .await;
+    let fresh = run_pinned(
+        script,
+        TAB_NEW,
+        unary_step(N_U_SAME, &fresh_payload, &creds),
+        30,
+    )
+    .await;
     let fresh_reply = fresh.reply.as_deref().map(crate::unhex).unwrap_or_default();
     let fresh_expected = expected_unary("u-same", &fresh_payload);
     let y_exact = fresh.ok && fresh_reply == fresh_expected;
@@ -2976,6 +2984,15 @@ async fn streaming_backpressure(
             parked > 250.0
         })
         .count();
+    // The CREDIT-COUNT identity at the idle snapshot: exactly the
+    // initial 2 credits resolved (a sequential provider parks ONE
+    // send at a time — the next sends cannot start behind the parked
+    // await — so ≥1 parked is the park observation; a no-park surface
+    // resolves 6/6 and reddens the resolved count).
+    let resolved_early = send_log_early
+        .iter()
+        .filter(|e| e.get("resolved_at").and_then(Value::as_f64).is_some())
+        .count();
 
     // Now the slow reader: one item at a time.
     let mut reads = Vec::new();
@@ -3006,13 +3023,19 @@ async fn streaming_backpressure(
 
     ledger.record(
         witness,
-        open.ok && parked_early >= 2 && items == expected && resolved_once && terminal_done,
+        open.ok
+            && parked_early >= 1
+            && resolved_early == 2
+            && items == expected
+            && resolved_once
+            && terminal_done,
         format!(
             "window=2 CHUNK CREDITS (the wire's nrpc-*-window-initial unit); open-typed={}; with \
-             the reader IDLE the provider's \
-             send_log parked {parked_early}/6 sends >250ms (the response window must PARK the \
-             provider's sends and release them on grants — a no-park surface resolves 6/6 and \
-             reddens exactly this clause); slow reads per step={reads:?} (one credit one chunk); \
+             the reader IDLE: resolved exactly {resolved_early}/6 (the CREDIT-COUNT identity — \
+             the initial 2 credits, no more) and the provider's send_log parked {parked_early}/6 \
+             sends >250ms (a sequential provider parks one send at a time — ≥1 parked is the park \
+             observation; a no-park surface resolves 6/6 and reddens the resolved count); slow \
+             reads per step={reads:?} (one credit one chunk); \
              exact chunk flow items={items:?} (want {expected:?} — identity+order+count); every \
              send resolved exactly once={resolved_once}; terminal={:?}",
             typed(&open),
