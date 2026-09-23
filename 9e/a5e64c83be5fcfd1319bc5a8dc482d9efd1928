@@ -1,0 +1,30 @@
+net/crates/net/bindings/python/Cargo.toml
+  h_64425bc75e3f3d 24-31
+net/crates/net/bindings/python/examples/gen_org_same_scenario.rs
+  h_64425bc75e3f3d 1-202
+net/crates/net/bindings/python/python/net/__init__.py
+  h_64425bc75e3f3d 970,982-984,992,1004-1006
+net/crates/net/bindings/python/python/net/_net.pyi
+  h_64425bc75e3f3d 4843-4883,4894-4939,4967-5040
+net/crates/net/bindings/python/src/lib.rs
+  h_64425bc75e3f3d 4081,4084-4086
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  h_64425bc75e3f3d 202-222,454-455,458,1019-1035,1050,1076,1139-1160,1176,1201,1213,1220,1279-1297,1309,1332,1344,1353,1371,1386,1422,1428,1476-1477,1488,1511,1523,1530-1532,1569-1570,1581,1597,1691-1718,1793-1804,2490,2532,2576,2619,3108,3147,3190,3229,3261-3280,3291-3292,3298,3314,3385-3408,3426,3441,3454,3466-3469,3523-3546,3561,3576,3589,3599-3601,3617,3633,3671,3679,3718-3719,3733,3748,3761,3773-3775,3807-3808,3822,3838
+net/crates/net/bindings/python/src/org.rs
+  h_64425bc75e3f3d 38-42,99-103,128-171,330-463,523-709
+net/crates/net/bindings/python/src/org_serve.rs
+  h_64425bc75e3f3d 14-16,267-762
+net/crates/net/bindings/python/tests/test_org_live.py
+  h_64425bc75e3f3d 1-42,47-48,66-73,89-90,98-114,120-174,204-205,207-235,239-410,412-702,712-719
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9ea5e64c83be5fcfd1319bc5a8dc482d9efd1928",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
