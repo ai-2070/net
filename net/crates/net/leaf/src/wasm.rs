@@ -5097,6 +5097,9 @@ impl OrgCall {
     /// grants arrive, exactly like the native sink's await.
     pub(crate) async fn send(&self, payload: &[u8], what: &str) -> Result<(), JsError> {
         loop {
+            if self.settled.get() {
+                return Err(sink_error(crate::rpc_stream::SinkError::Closed, what));
+            }
             let outcome = match &self.where_ {
                 OrgWhere::Node { inner, call } => {
                     let call_id = call.call_id;
@@ -5125,6 +5128,9 @@ impl OrgCall {
     /// and parks the same way [`Self::send`] does.
     pub(crate) async fn finish_sending(&self, what: &str) -> Result<(), JsError> {
         loop {
+            if self.settled.get() {
+                return Err(sink_error(crate::rpc_stream::SinkError::Closed, what));
+            }
             let outcome = match &self.where_ {
                 OrgWhere::Node { inner, call } => {
                     let call_id = call.call_id;
@@ -5378,13 +5384,15 @@ pub(crate) fn caller_json(call: &crate::rpc_serve::ServeCall) -> Result<String, 
     Ok(serde_json::Value::Object(map).to_string())
 }
 
-/// Pull the one request body a unary/streaming handler takes.
+/// Pull the one request body a unary/streaming handler takes. A
+/// retired call settles the pull (empty) rather than hanging the
+/// handler — the F-S3.1-2 level.
 async fn first_request(call: &ServeCallState) -> Result<Vec<u8>, JsError> {
     loop {
         if let Some(body) = call.call.poll_request() {
             return Ok(body.to_vec());
         }
-        if call.call.request_ended() {
+        if call.call.request_ended() || call.call.retired().is_some() {
             return Ok(Vec::new());
         }
         gloo_timer_sleep(TICK_MS).await.ok();
@@ -5671,8 +5679,19 @@ impl OrgResponseSinkHandle {
     /// Push one response item. Refuses (typed) after retirement, and
     /// parks (retries) while the response window has no credit — the
     /// same permit semantics as the caller-side sinks.
+    ///
+    /// # Settling (the F-S3.1-2 level)
+    ///
+    /// Once `retired` resolves this promise SETTLES with the typed
+    /// closed refusal — a post-retirement `send` never hangs the
+    /// handler: it refuses, the handler resolves (or rejects), and
+    /// its return value is discarded because the terminal was
+    /// already sent.
     pub async fn send(&self, payload: Uint8Array) -> Result<(), JsError> {
         loop {
+            if self.state.call.retired().is_some() {
+                return Err(sink_error(crate::rpc_stream::SinkError::Closed, "the response sink"));
+            }
             match self.state.call.send(&payload.to_vec()) {
                 Ok(()) => return Ok(()),
                 Err(crate::rpc_stream::SinkError::WouldBlock) => {
@@ -5685,8 +5704,14 @@ impl OrgResponseSinkHandle {
 
     /// End the response side successfully. Idempotent: the terminal
     /// frame is sent exactly once whether the handler closed the sink
-    /// or simply returned.
+    /// or simply returned. After retirement this SETTLES with the
+    /// typed closed refusal (the F-S3.1-2 level: the promise never
+    /// hangs the handler — the terminal was already sent and the
+    /// handler's return is discarded).
     pub async fn close(&self) -> Result<(), JsError> {
+        if self.state.call.retired().is_some() {
+            return Err(sink_error(crate::rpc_stream::SinkError::Closed, "the response sink"));
+        }
         self.state.finish_once(crate::rpc_wire::StreamHandlerResult::Ok);
         Ok(())
     }
@@ -5733,13 +5758,15 @@ impl OrgRequestStreamHandle {
 
     /// The next request item, or `{ done: true }` at the end of the
     /// upload. There is no error arm: a terminated call is observed
-    /// through `retired`, and an ended upload is a clean `done`.
+    /// through `retired`, and an ended upload is a clean `done`. A
+    /// retired call reports `done` — the pull never hangs the
+    /// handler (the F-S3.1-2 level).
     pub async fn next(&self) -> Result<JsValue, JsError> {
         loop {
             if let Some(body) = self.state.call.poll_request() {
                 return org_stream_item(Uint8Array::from(&body[..]));
             }
-            if self.state.call.request_ended() {
+            if self.state.call.request_ended() || self.state.call.retired().is_some() {
                 return org_stream_end();
             }
             gloo_timer_sleep(TICK_MS).await.ok();
