@@ -1,0 +1,38 @@
+net/crates/net/cli/src/commands/enrollment.rs
+  s_3f3d4c91f992be::t_107eb2891c97c5 282,318,345,467-468,512-516,578-580,619-628,652,708-741,751-752,771-774,982-989,1078-1085,1126-1130,1481-1486
+net/crates/net/src/adapter/net/mesh.rs
+  s_3f3d4c91f992be::t_df3e11841fda94 1914-1922,1926-1938,1975,48479
+  s_3f3d4c91f992be::t_bc83c819442adb 1923-1925,53396-53459
+  s_3f3d4c91f992be::t_846ecdd3e1b87a 53460
+net/crates/net/cli/tests/subnet_join.rs
+  s_3f3d4c91f992be::t_113bb943f1be39 236
+  s_3f3d4c91f992be::t_af44785ba16deb 1-235,237-284
+net/crates/net/cli/src/commands/lifecycle.rs
+  s_3f3d4c91f992be::t_f8cb1e06585d89 1093
+  s_3f3d4c91f992be::t_107eb2891c97c5 147-166,681-683,1066-1079,1083,1085-1092,1094-1097,1102-1109,1112,1123-1149,1151
+net/crates/net/cli/src/commands/subnet.rs
+  s_3f3d4c91f992be::t_107eb2891c97c5 617,1632-1651,1730,1749,1770
+net/crates/net/sdk/src/mesh.rs
+  s_3f3d4c91f992be::t_107eb2891c97c5 123,159,263-270,456-457
+  s_3f3d4c91f992be::t_59f49ce1494488 458
+net/crates/net/wire/src/session.rs
+  s_3f3d4c91f992be::t_df3e11841fda94 1944-1951
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_1c9b35d9a6f6c9 1931-2013
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "15fb5fe5b513747f86491c9afd64edee3c881a06",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
