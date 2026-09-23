@@ -4887,3 +4887,56 @@ CARGO_PROFILE_TEST_DEBUG=0`, from `net/crates/net/`:
   construction while the bridges pin `q1_defaults()` (§7.2's disclosure);
   executed at the fold seam over the facade call's real captured payload.
 - `cargo fmt`/clippy/doc beyond `cargo fmt -p net-mesh-sdk -- --check`.
+
+## 9. Unified release acceptance (the plan's exit gate — assembly)
+
+The gate (plan wording): *"every SDK × shape × role cell executed from a
+packaged or CI-built artifact. A missing cell blocks the release"* — plus
+exact-head CI green, artifact/declaration/header/error parity, and unary
+compatibility. **Current verdict: BLOCKED on 2 named cells** (below). All
+evidence pointers are to executed receipts already in this record.
+
+### 9.1 Facade rows — every shape × call AND serve × same-org AND granted
+
+| SDK / runtime | Shapes covered | Artifact level | Evidence | Cell |
+|---|---|---|---|---|
+| Node binding (`bindings/node`) | unary+SS+CS+DX × call+serve × same+granted | CI-built addon (the `node-tests` feature list) | 10 witnesses + R-S4Node-projection + SCR-NODE (`c62ecd740`/`7efdd56d1`) | ✅ |
+| Python binding (`bindings/python`) | unary+SS+CS+DX × sync+async × call+serve × same+granted | the built wheel (packaged) | 15 witnesses + 2 receipts + SCR-PYTHON (`9ea5e64c8`) | ✅ |
+| Go/C (`go/` + `net-ffi`) | unary+SS+CS+DX × call+serve × same+granted | `libnet` cdylib (CI-built) + the C example link vs single `-lnet` | 6 live cells + R-S4Go + SCR-GO (`14d5b87f3`) | ✅ |
+| Browser/leaf (Q5) | all four shapes × call+serve × same+granted, browser→native + native→browser + browser→browser | the real leaf bundle + `@net-mesh/browser` (packaged) | **37/37 on real Chromium AND Firefox** + R-1 + SCR-B (`92b0fdb55`) | ✅ |
+| Pure SDK TS (Q6) | unary+SS+CS+DX × call+serve × same+granted | the shipped `dist/` staged copies (packaged) | 11 witnesses + R-S4TsSdk-projection + SCR-TSSDK (`c9cebf5cc`) | ✅ |
+| Pure SDK Python (Q6) | unary+SS+CS+DX × call+serve × same+granted | the installed wheel | `S4PySdk` 15 rows — live rows + 3 receipts in flight | ⏳ **cell 1** |
+
+### 9.2 Cross-language rows — each runtime vs Rust in BOTH roles + one mixed pair
+
+| Row | Evidence | Cell |
+|---|---|---|
+| Rust fixture authority (both roles) | `gen_org_error_fixtures --check` == 120 rows, 0 failed | ✅ |
+| Node runtime vs Rust (caller + provider roles) | 119 rows (byte pins + role rows + vocab/grammar + never-success) | ✅ |
+| Python runtime vs Rust (both roles) | 119 rows (the same roster, kebab ids) | ✅ |
+| Go runtime vs Rust (both roles) | 124 rows (byte pins + role rows + rejects + vocab) | ✅ |
+| **Mixed non-Rust pair (Go caller ↔ Python provider)** | round 1 closed F-S4Vectors-1's mechanism; the DRAINED-handshake round-2 fix is in (`provider.py` sha `22ce91e0…`); the two-sided PASS signature (`--- PASS: …` + `RESULT ok calls=1 chunks=3`) awaits the re-run | ⏳ **cell 2** |
+| Inverse receipts (the vectors) | the one-byte-flip RED in all four runtimes → sha-identical restore → green; the four-property cycle | ✅ |
+
+### 9.3 Parity + compatibility rows
+
+| Row | Evidence |
+|---|---|
+| Export/ABI parity | `exports.baseline` 578 (the 9 new `net_org_*` verbs) + `NET_ORG_ABI_VERSION 0x0002` + the `net_org.h` numeric mirror + header parity |
+| Declaration parity | the consumer-compile gates (`skipLibCheck:false` — Node staged dist, sdk-ts shipped pair, the Python `.pyi` + `test_stub_drift`) |
+| Error parity | the single `OrgSdkError::to_wire` vocabulary + `classifyOrgError`/`org_err_to_py`/`parseOrgError` mirrors + the cross-lang vocab/grammar rows + the never-success rows |
+| Unary compatibility | the preserved-unary witnesses in every lane (bindings + both pure SDKs) + the untouched pre-existing estates (606/615 vitest, 1029 pytest, 388 leaf, 728 browser-ts, 567 sdk-ts) |
+| Handler contracts | the F-S3.1-2 handler-drop contract documented at every handler surface (all 7 lanes) + finding 6's cross-process teardown-ordering contract (the round-2 material) |
+
+### 9.4 The two blocking cells — closure path
+
+1. **Cell 1 (sdk-py)**: `S4PySdk`'s live rows + its 3 receipts → its report
+   and commit pair → coordinator spot-check → the sdk-py pin (site mapped,
+   `ci.yml:4112`) → ✅.
+2. **Cell 2 (the mixed pair)**: the round-2 verbatim re-run (one command,
+   `R4CoreFix` holding it) → the two-sided PASS signature → `S4Vectors`'s
+   `round-2` commit with the green receipt + finding 6's named contract →
+   coordinator spot-check → ✅.
+
+Both closures flip this verdict. The never-executed boundaries (per lane,
+§ entries above) become the release notes material verbatim at the verdict.
