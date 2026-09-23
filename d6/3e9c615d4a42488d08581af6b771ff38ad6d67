@@ -1,0 +1,21 @@
+net/crates/net/sdk/src/org.rs
+  s_3f3d4c91f992be::t_9149f054829942 85-88
+net/crates/net/sdk/tests/org_streaming.rs
+  s_3f3d4c91f992be::t_46353524d92646 1-1269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d63e9c615d4a42488d08581af6b771ff38ad6d67",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
