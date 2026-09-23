@@ -203,6 +203,12 @@ fn a_device_joins_a_subnet_is_admitted_and_removal_takes_effect() {
     let (root, root_hex, issuer, grant) = ceremony(&keys);
     let psk = keys.join("mesh.psk");
     std::fs::write(&psk, hex::encode(PSK)).unwrap();
+    // `--psk-from file:` refuses a group- or world-readable secret on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&psk, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     // A second enforcement point: a durable verifier for the same authority,
     // running in this process, connected to nobody yet.
