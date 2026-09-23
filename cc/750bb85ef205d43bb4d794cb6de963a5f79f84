@@ -1,0 +1,19 @@
+net/crates/net/tests/natsim/enroll/run_enroll_direct.sh
+  s_3f3d4c91f992be::t_fe539ecf594baa 196-199,201-205
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cc750bb85ef205d43bb4d794cb6de963a5f79f84",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
