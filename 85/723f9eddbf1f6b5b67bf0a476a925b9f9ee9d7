@@ -1,0 +1,39 @@
+net/crates/net/sdk-py/.s4receipts/main-cancel-fixed.xml
+  s_3f3d4c91f992be::t_c3932526073bc3 1
+net/crates/net/sdk-py/.s4receipts/main-isolated-3-test_task_cancel_propagates_to_retiremen.xml
+  s_3f3d4c91f992be::t_4bc2b43f40db99 1-34
+net/crates/net/sdk-py/.s4receipts/main-midstream-fixed.xml
+  s_3f3d4c91f992be::t_eae5543bc59d59 1
+net/crates/net/sdk-py/.s4receipts/main-r-r1-green.xml
+  s_3f3d4c91f992be::t_c853044c15631c 1
+net/crates/net/sdk-py/.s4receipts/main-r-r1-matrix-payload-green.xml
+  s_3f3d4c91f992be::t_dc31a2ddf8e456 1
+net/crates/net/sdk-py/.s4receipts/main-r-r1-matrix-payload-red.xml
+  s_3f3d4c91f992be::t_1cb87417f71f5c 1
+net/crates/net/sdk-py/examples/org_streaming_consumer.py
+  s_3f3d4c91f992be::t_fa65a86ecd79ef 521-528
+net/crates/net/sdk-py/tests/test_org_streaming.py
+  s_3f3d4c91f992be::t_3a4dfd8ca41f5b 350-354
+net/crates/net/sdk-py/.s4receipts/main-isolated-2b-midstream.xml
+  s_3f3d4c91f992be::t_6c6d705b036fe5 1-51
+net/crates/net/sdk-py/.s4receipts/main-r-r1-red.xml
+  s_3f3d4c91f992be::t_8a7808f6e63d0b 1-55
+net/crates/net/sdk-py/.s4receipts/s4pysdk-part1a-full15.xml
+  s_3f3d4c91f992be::t_6ccd853262352c 1-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "85723f9eddbf1f6b5b67bf0a476a925b9f9ee9d7",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
