@@ -163,6 +163,10 @@ enum Command {
     /// Join a mesh from a `netmesh-join_` token (confirm, redeem, install, attach).
     Join(commands::enrollment::JoinArgs),
 
+    /// Leave the mesh this state directory joined: stop its running node,
+    /// erase the delivered credentials and keep the device identity.
+    Leave(commands::lifecycle::LeaveArgs),
+
     /// Run a blind UDP relay (the fallback path for unreachable devices).
     #[command(subcommand)]
     Relay(commands::relay::RelayCommand),
@@ -380,6 +384,7 @@ async fn dispatch_inner(cli: Cli, deadline: Option<deadline::Deadline>) -> Resul
         Command::Join(args) => {
             Box::pin(commands::enrollment::run_join(args, output, profile)).await
         }
+        Command::Leave(args) => commands::lifecycle::run_leave(args, output, profile).await,
         Command::Admin(cmd) => commands::admin::run(cmd, output, config_path, profile).await,
         Command::Ice(cmd) => commands::ice::run(cmd, output, config_path, profile).await,
         Command::Snapshot(cmd) => commands::snapshot::run(cmd, output, config_path, profile).await,

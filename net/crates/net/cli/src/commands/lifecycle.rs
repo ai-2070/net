@@ -159,6 +159,19 @@ pub struct DownArgs {
     pub wait: Duration,
 }
 
+/// `net-mesh leave` arguments.
+#[derive(Args, Debug)]
+pub struct LeaveArgs {
+    /// State directory of the joined device (as given to `join` and `up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+
+    /// How long to wait for a running joined node to release its lifetime
+    /// lock after it records the departure.
+    #[arg(long, value_name = "DURATION", default_value = "15s", value_parser = crate::humantime::parse_duration)]
+    pub wait: Duration,
+}
+
 /// `net-mesh node status` arguments.
 #[derive(Args, Debug)]
 pub struct StatusArgs {
@@ -662,6 +675,10 @@ struct ControlState {
     report: NodeReport,
     draining: AtomicBool,
     enroll: Option<Arc<super::enrollment::EnrollContext>>,
+    /// The installed join this node runs from, owned (locked) by this process;
+    /// `leave` records the departure through it.
+    /// `None` inside once the node has shut down and released it.
+    joined: Option<Arc<parking_lot::Mutex<Option<net_sdk::enrollment::device::DeviceJoin>>>>,
 }
 
 async fn serve_control(
@@ -741,13 +758,47 @@ async fn control_session(
             state.draining.store(true, Ordering::SeqCst);
             serde_json::json!({ "accepted": true, "incarnation": state.report.incarnation })
         }
+        "leave" => match (&state.joined, draining) {
+            (_, true) => serde_json::json!({ "error": "node is draining" }),
+            (None, false) => serde_json::json!({
+                "error": "this node did not join a mesh; nothing to leave (stop it with `down`)"
+            }),
+            (Some(join), false) => {
+                let (join, now) = (join.clone(), now_unix());
+                let recorded = tokio::task::spawn_blocking(move || {
+                    let mut guard = join.lock();
+                    let join = guard.as_mut().ok_or(None)?;
+                    join.leave(now)
+                        .map(|newly| (newly, join.left_at()))
+                        .map_err(Some)
+                })
+                .await;
+                match recorded {
+                    Ok(Ok((newly, left_at))) => {
+                        // Recorded durably; now stop this runtime.
+                        state.draining.store(true, Ordering::SeqCst);
+                        serde_json::json!({
+                            "left": true,
+                            "newly_left": newly,
+                            "left_at": left_at,
+                            "incarnation": state.report.incarnation,
+                        })
+                    }
+                    Ok(Err(Some(e))) => {
+                        serde_json::json!({ "error": format!("the departure was not recorded: {e}") })
+                    }
+                    Ok(Err(None)) => serde_json::json!({ "error": "node is draining" }),
+                    Err(_) => serde_json::json!({ "error": "the departure was not recorded" }),
+                }
+            }
+        },
         _ => serde_json::json!({ "error": "unknown control operation" }),
     };
     let bytes = crate::secret::ScrubbedBytes::new(
         serde_json::to_vec(&reply).map_err(std::io::Error::other)?,
     );
     write_msg(&mut s, &keys, FROM_NODE, 0, bytes.as_slice()).await?;
-    if op == "shutdown" {
+    if op == "shutdown" || (op == "leave" && reply["left"] == serde_json::Value::Bool(true)) {
         let _ = stop.try_send(());
     }
     Ok(())
@@ -931,6 +982,11 @@ pub async fn run_up(
             )),
             other => generic(format!("join state {}: {other}", join_dir.display())),
         })?;
+        if let Some(at) = join.left_at() {
+            return Err(invalid_args(format!(
+                "this device left the mesh at unix {at}; run `net-mesh join <token> --rejoin` to join again"
+            )));
+        }
         if join.bundle().is_none() {
             return Err(invalid_args(
                 "the join in this state directory is still pending approval; run `net-mesh join` again once approved",
@@ -1066,10 +1122,12 @@ pub async fn run_up(
     .await?;
     drop(control_text);
 
+    let joined = joined.map(|j| Arc::new(parking_lot::Mutex::new(Some(j))));
     let state_ctl = Arc::new(ControlState {
         report: report.clone(),
         draining: AtomicBool::new(false),
         enroll: enrollment.as_ref().map(|e| e.context()),
+        joined: joined.clone(),
     });
     let (stop_tx, mut stop_rx) = mpsc::channel(1);
     let server = tokio::spawn(serve_control(listener, secret, state_ctl.clone(), stop_tx));
@@ -1099,6 +1157,11 @@ pub async fn run_up(
     }
     let stopped = tokio::time::timeout(MESH_SHUTDOWN_TIMEOUT, mesh.shutdown()).await;
     let _ = std::fs::remove_file(&control_path);
+    // Release the join's storage lock before the lifetime lock, even if a
+    // control session task still holds the shared state for a moment.
+    if let Some(joined) = &joined {
+        drop(joined.lock().take());
+    }
     drop(joined);
     drop(lifetime_lock);
     drop(storage);
@@ -1241,6 +1304,101 @@ pub async fn run_down(
         "node incarnation {} accepted shutdown but still holds its lifetime lock after {:?}; state is running or unknown",
         control.incarnation, args.wait
     )))
+}
+
+// ---- leave ---------------------------------------------------------------------
+
+/// Leave the mesh this state directory joined. A running joined node records
+/// the departure through its own control endpoint (it owns the join state) and
+/// then stops; otherwise the join state is opened and updated directly. The
+/// device identity is kept; the delivered PSK and contact are erased.
+pub async fn run_leave(
+    args: LeaveArgs,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use net_sdk::enrollment::device::{DeviceJoin, DeviceJoinError};
+
+    let state = state_dir(args.state_dir, profile_name)?;
+    let join_dir = state.join(super::enrollment::JOIN_SUBDIR);
+    if !join_dir.exists() {
+        return Err(invalid_args(format!(
+            "{} has not joined a mesh (no join state); nothing to leave",
+            state.display()
+        )));
+    }
+    let dir = state.join(NODE_SUBDIR);
+    let (newly, left_at, runtime, incarnation) = if probe(&dir)? == Liveness::Held {
+        let (control, reply) = control_call(&dir, serde_json::json!({ "op": "leave" }))
+            .await
+            .map_err(|e| {
+                connection_failure(format!(
+                    "the node holds its lifetime lock but its control endpoint failed ({e:?}); nothing was changed"
+                ))
+            })?;
+        if let Some(err) = reply["error"].as_str() {
+            return Err(generic(err.to_string()));
+        }
+        if reply["left"] != serde_json::Value::Bool(true)
+            || reply["incarnation"].as_str() != Some(control.incarnation.as_str())
+        {
+            return Err(generic(
+                "the node did not confirm the departure for the recorded incarnation",
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + args.wait;
+        loop {
+            if probe(&dir)? != Liveness::Held {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(timeout(format!(
+                    "the departure is recorded, but node incarnation {} still holds its lifetime lock after {:?}; runtime stop unconfirmed",
+                    control.incarnation, args.wait
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        (
+            reply["newly_left"].as_bool().unwrap_or(false),
+            reply["left_at"].as_u64(),
+            "stopped",
+            Some(control.incarnation),
+        )
+    } else {
+        let jd = join_dir.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            let mut join = DeviceJoin::open(&jd)?;
+            let newly = join.leave(now_unix())?;
+            Ok::<_, DeviceJoinError>((newly, join.left_at()))
+        })
+        .await
+        .map_err(|e| generic(format!("leave task failed: {e}")))?;
+        let (newly, left_at) = recorded.map_err(|e| match e {
+            DeviceJoinError::Storage(StorageError::Busy) => generic(format!(
+                "join state {} is in use by another process (a `join` in progress?); nothing was changed, retry",
+                join_dir.display()
+            )),
+            other => generic(format!("join state {}: {other}", join_dir.display())),
+        })?;
+        (newly, left_at, "not_running", None)
+    };
+    emit_value(
+        OutputFormat::resolve_oneshot(output),
+        &serde_json::json!({
+            "state": "left",
+            "newly_left": newly,
+            "left_at": left_at,
+            "credentials": "erased",
+            "runtime": runtime,
+            "incarnation": incarnation,
+            // What this command cannot know or do, stated rather than implied.
+            "unmanaged_consumers": "unknown: copies of the PSK held by other processes are not tracked",
+            "authority": "not notified: leaving is local; the issuer revokes separately",
+            "rejoin": "net-mesh join <token> --rejoin (the issuer must still authorize it)",
+        }),
+    )
+    .map_err(|e| generic(format!("write result: {e}")))
 }
 
 #[cfg(test)]

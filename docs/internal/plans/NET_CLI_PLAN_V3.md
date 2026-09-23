@@ -1705,6 +1705,87 @@ Tasks:
 
 **Exit:** Local voluntary departure for mesh, organization, channel and subnet relations is usable online/offline and remains in effect across restart, with honest runtime and remote-state reporting. Subscribe unsubscribe, local publish-chain/cache deactivation and copied-token/issuer revocation are distinct; no leave depends on remote approval, removes a successor, or claims stop while an uncontrolled fallback remains.
 
+#### V3-2B mesh relation — `net-mesh leave` (receipt, 2026-09-23)
+
+Scope: the mesh relation, the only relation V3 enrolls so far. Organization,
+channel and subnet leave follow their enrollment slices (V3-2/2A).
+
+**Owner and fencing.** The join store (`DeviceJoin`, protected storage with an
+exclusive owner lock) is the durable owner of the departure.
+- `DeviceJoin::leave(now)` records `left_at` and erases the delivered bundle
+  (PSK and contact) in **one** durable write. It keeps the device identity,
+  invite and intent.
+- The snapshot is now NMDJ v2 (v1 still reads as "not left"). A left snapshot
+  that still carries a bundle is refused as corrupt.
+- A left join refuses `redeem` (`DeviceJoinError::Left`). Only an explicit
+  `rejoin()` clears the state, and the next redeem must go back to the issuer
+  and pass its current authority (recovery). Nothing is reinstalled locally.
+- The owner lock totally orders leave against any in-flight `join` on the same
+  state. No renewal exists yet, so there is no late renewal to fence.
+
+**Runtime.**
+- A running joined `up` owns the join store, so `net-mesh leave` goes through
+  that node's authenticated control endpoint (op `leave`). The node records the
+  departure through the store it owns, replies with its incarnation, and then
+  drains. The CLI verifies the incarnation and waits for the lifetime lock to be
+  released (`runtime: "stopped"`).
+- If the lock is not released in time, leave exits with a timeout stating the
+  departure **is** recorded and the stop is unconfirmed.
+- Without a running node, leave opens the store directly
+  (`runtime: "not_running"`). `Busy` reports a concurrent `join` and changes
+  nothing.
+- At shutdown the node releases the join store (`take()` under its mutex)
+  before its lifetime lock, even if a control session still holds the shared
+  state.
+
+**Receipt fields.** `state`, `newly_left` (repeated leave is idempotent and
+keeps the original time), `left_at`, `credentials: "erased"`, `runtime` and
+`incarnation`, plus two explicit limits:
+- `unmanaged_consumers: "unknown…"`: copies of the PSK held by other processes
+  are not tracked;
+- `authority: "not notified…"`: leaving is local; issuer-side revocation is
+  separate.
+
+**Restart and rejoin.**
+- `up` on a left state refuses before any bind (exit 2, "left the mesh").
+- `join <token>` on a left state refuses unless `--rejoin` is given.
+- `join --rejoin` redeems from the issuer again with the same device identity.
+
+Witnesses:
+- SDK `leaving_erases_the_credentials_and_only_an_explicit_rejoin_recovers`:
+  idempotent leave, a restart that stays left, redeem `Left`, the PSK absent
+  from every file in the join state, and rejoin recovering the same committed
+  PSK.
+- CLI `cli/tests/enrollment_leave.rs` 3/3, all real subprocesses:
+  - `leaving_stops_the_running_joined_node_and_restart_stays_left`: leave
+    through the running node, `stopped` with its incarnation, `up` refused, an
+    idempotent second leave, and the operator's node and ledger untouched;
+  - `an_offline_leave_is_undone_only_by_an_explicit_rejoin`;
+  - `leave_refuses_state_that_never_joined`: a fresh state and an operator node
+    both refuse without effect.
+
+Inverse mutations, each caught by its witness and then restored
+byte-identically:
+- redeem ignoring the departure;
+- leave keeping the credentials;
+- leave not persisted;
+- `up` running a left join;
+- `join` silently undoing the departure;
+- the node recording leave but not stopping.
+
+Regressions:
+- `net-cli` 348/348.
+- SDK enrollment 57/57.
+- `enrollment_storage` units 7/7. The reopen witness was deflaked, see §1.
+- Clippy (core all-features all-targets, SDK `full`, `net-cli`) and SDK rustdoc
+  are clean.
+
+**Not covered (stated, not implied).**
+- Live stop of *unmanaged* processes that copied the PSK.
+- Authority notification.
+- PSK rotation to exclude a departed device. That is issuer-side removal
+  (§6 / V3-4), not leave.
+
 ### V3-3 — live inspection without false completeness
 
 **Modify:** shared enrollment SDK/service and CLI `enrollment.rs`, `org.rs`, `channel.rs`, `subnet.rs`; narrow runtime read interfaces where necessary.

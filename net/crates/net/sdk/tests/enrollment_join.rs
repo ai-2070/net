@@ -208,6 +208,58 @@ async fn a_clean_device_joins_by_link_survives_restart_and_attaches_with_the_del
     .is_err());
 }
 
+/// Leaving erases the delivered credentials durably and fences redemption:
+/// restart stays left, redeem refuses, and only an explicit rejoin goes back
+/// to the issuer (recovering the committed issuance under its current
+/// authority). The device identity survives throughout.
+#[tokio::test]
+async fn leaving_erases_the_credentials_and_only_an_explicit_rejoin_recovers() {
+    let op = Operator::start().await;
+    let invite = MembershipInvite::decode(&op.invite().encode()).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("join");
+    let mut join = DeviceJoin::begin(&dir, &invite, Identity::generate()).unwrap();
+    let device_id = join.identity().entity_id().clone();
+    join.redeem(T).await.unwrap();
+    let psk = *join.bundle().unwrap().psk().expose_bytes();
+
+    assert!(join.leave(1_000).unwrap(), "first leave is new");
+    assert!(join.bundle().is_none());
+    assert!(!join.leave(2_000).unwrap(), "repeated leave is idempotent");
+    assert_eq!(join.left_at(), Some(1_000), "the original time is kept");
+    drop(join);
+
+    // Restart: still left, credentials gone, redemption fenced.
+    let mut join = DeviceJoin::open(&dir).unwrap();
+    assert_eq!(join.identity().entity_id(), &device_id);
+    assert_eq!(join.left_at(), Some(1_000));
+    assert!(join.bundle().is_none());
+    assert!(matches!(
+        join.redeem(T).await,
+        Err(DeviceJoinError::Left { at: 1_000 })
+    ));
+    let raw = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| std::fs::read(e.unwrap().path()).unwrap_or_default())
+        .any(|bytes| bytes.windows(32).any(|w| w == psk));
+    assert!(
+        !raw,
+        "the PSK must not remain in the join state after leaving"
+    );
+
+    // Explicit rejoin: the issuer re-delivers under its current authority.
+    join.rejoin().unwrap();
+    assert_eq!(join.left_at(), None);
+    assert!(matches!(
+        join.redeem(T).await.unwrap(),
+        JoinStatus::Installed {
+            receipt_id: Some(_)
+        }
+    ));
+    assert_eq!(join.bundle().unwrap().psk().expose_bytes(), &psk);
+    drop(op);
+}
+
 #[tokio::test]
 async fn identity_and_intent_are_persisted_before_the_first_redeem_attempt() {
     let issuer = Identity::generate();

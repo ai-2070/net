@@ -1110,6 +1110,10 @@ pub struct JoinArgs {
     /// Bound on the redemption session and on the live attach check.
     #[arg(long, value_name = "DURATION", default_value = "15s", value_parser = crate::humantime::parse_duration)]
     pub wait: Duration,
+    /// Join again after `net-mesh leave`. The credentials are fetched from the
+    /// issuer again and must pass its current authorization.
+    #[arg(long)]
+    pub rejoin: bool,
 }
 
 pub(crate) const JOIN_SUBDIR: &str = "join";
@@ -1308,12 +1312,21 @@ pub async fn run_join(
         other => generic(format!("join state {}: {other}", dir.display())),
     };
     let mut join = if dir.exists() {
-        let join = DeviceJoin::open(&dir).map_err(storage_err)?;
+        let mut join = DeviceJoin::open(&dir).map_err(storage_err)?;
         if join.invite().digest() != invite.digest() {
             return Err(invalid_args(format!(
                 "{} already holds a join from a different token; use another --state-dir",
                 state.display()
             )));
+        }
+        if let Some(at) = join.left_at() {
+            if !args.rejoin {
+                return Err(invalid_args(format!(
+                    "this device left the mesh at unix {at}; pass --rejoin to join again \
+                     (the issuer must still authorize it)"
+                )));
+            }
+            join.rejoin().map_err(storage_err)?;
         }
         join
     } else {

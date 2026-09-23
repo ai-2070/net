@@ -13,6 +13,14 @@
 //! Installed means the credentials are durably held here. It is not proof of
 //! live mesh admission; attach with the bundle's PSK and contact and observe it.
 //! The snapshot is secret-bearing (identity seed, PSK); `Debug` redacts both.
+//!
+//! **Leaving.** [`DeviceJoin::leave`] durably records the departure and erases
+//! the delivered bundle (PSK and contact) in the same write, keeping the device
+//! identity, invite and intent. A left join refuses [`DeviceJoin::redeem`]; the
+//! only way back is an explicit [`DeviceJoin::rejoin`], after which redemption
+//! must go back to the issuer and pass its *current* authorization (recovery),
+//! never a locally retained credential. The storage's exclusive owner lock
+//! orders leave against any in-flight redemption on the same state.
 
 use std::path::Path;
 use std::time::Duration;
@@ -27,7 +35,7 @@ use super::{fingerprint, Reader};
 use crate::identity::Identity;
 
 const MAGIC: [u8; 4] = *b"NMDJ";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const CHECKSUM_CONTEXT: &str = "net-mesh device join snapshot v1";
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
 
@@ -49,6 +57,12 @@ pub enum DeviceJoinError {
     /// The delivered bundle did not verify; nothing was installed.
     #[error(transparent)]
     Bundle(#[from] BundleError),
+    /// This device left the mesh; only an explicit rejoin restores the join.
+    #[error("this device left the mesh at unix {at}; rejoin explicitly to redeem again")]
+    Left {
+        /// When the departure was recorded (Unix seconds).
+        at: u64,
+    },
 }
 
 /// Result of one redemption attempt.
@@ -71,6 +85,7 @@ pub struct DeviceJoin {
     invite: MembershipInvite,
     intent: RedemptionIntent,
     bundle: Option<MembershipBundle>,
+    left_at: Option<u64>,
     path: Option<RedeemPath>,
 }
 
@@ -94,7 +109,7 @@ impl DeviceJoin {
         identity: Identity,
     ) -> Result<Self, DeviceJoinError> {
         let intent = RedemptionIntent::for_invite(invite, identity.entity_id().clone())?;
-        let snapshot = encode(&identity, invite, &intent, None);
+        let snapshot = encode(&identity, invite, &intent, None, None);
         let storage = EnrollmentStorage::create(dir, &snapshot)?;
         Ok(Self {
             storage,
@@ -102,6 +117,7 @@ impl DeviceJoin {
             invite: invite.clone(),
             intent,
             bundle: None,
+            left_at: None,
             path: None,
         })
     }
@@ -110,13 +126,14 @@ impl DeviceJoin {
     /// inconsistent state refuses; it is never reset.
     pub fn open(dir: &Path) -> Result<Self, DeviceJoinError> {
         let storage = EnrollmentStorage::open(dir)?;
-        let (identity, invite, intent, bundle) = decode(&storage.read()?)?;
+        let (identity, invite, intent, bundle, left_at) = decode(&storage.read()?)?;
         Ok(Self {
             storage,
             identity,
             invite,
             intent,
             bundle,
+            left_at,
             path: None,
         })
     }
@@ -124,6 +141,9 @@ impl DeviceJoin {
     /// Redeem (or recover) over the invite's enrollment session and install the
     /// verified bundle. Already installed: returns without network use.
     pub async fn redeem(&mut self, timeout: Duration) -> Result<JoinStatus, DeviceJoinError> {
+        if let Some(at) = self.left_at {
+            return Err(DeviceJoinError::Left { at });
+        }
         if self.bundle.is_some() {
             return Ok(JoinStatus::Installed { receipt_id: None });
         }
@@ -146,10 +166,50 @@ impl DeviceJoin {
     fn install(&mut self, bytes: &[u8]) -> Result<(), DeviceJoinError> {
         let bundle = MembershipBundle::from_bytes(bytes)?;
         bundle.verify_for(&self.invite, &self.intent)?;
-        let snapshot = encode(&self.identity, &self.invite, &self.intent, Some(&bundle));
+        let snapshot = encode(
+            &self.identity,
+            &self.invite,
+            &self.intent,
+            Some(&bundle),
+            None,
+        );
         self.storage.replace(&snapshot)?;
         self.bundle = Some(bundle);
         Ok(())
+    }
+
+    /// Leave the mesh: durably record the departure at `now` (Unix seconds)
+    /// and erase the delivered bundle in the same write. Idempotent: returns
+    /// `false` when this join had already left (the original time is kept).
+    /// Nothing is sent anywhere; the issuer is not notified and copies of the
+    /// PSK held by other processes are not affected.
+    pub fn leave(&mut self, now: u64) -> Result<bool, DeviceJoinError> {
+        if self.left_at.is_some() {
+            return Ok(false);
+        }
+        let snapshot = encode(&self.identity, &self.invite, &self.intent, None, Some(now));
+        self.storage.replace(&snapshot)?;
+        self.bundle = None;
+        self.left_at = Some(now);
+        Ok(true)
+    }
+
+    /// Explicitly restore a left join. Nothing is reinstalled here: the next
+    /// [`Self::redeem`] must obtain the bundle from the issuer again, under
+    /// its current authorization. No-op for a join that has not left.
+    pub fn rejoin(&mut self) -> Result<(), DeviceJoinError> {
+        if self.left_at.is_none() {
+            return Ok(());
+        }
+        let snapshot = encode(&self.identity, &self.invite, &self.intent, None, None);
+        self.storage.replace(&snapshot)?;
+        self.left_at = None;
+        Ok(())
+    }
+
+    /// When this device left the mesh, if it has.
+    pub fn left_at(&self) -> Option<u64> {
+        self.left_at
     }
 
     /// The device identity used for this join (persisted before redemption).
@@ -175,12 +235,14 @@ impl DeviceJoin {
 }
 
 // MAGIC | u16 VERSION | seed[32] | u32 invite | u32 intent | u8 has_bundle
-// [u32 bundle] | blake3 checksum[32] over everything before it.
+// [u32 bundle] | (v2) u8 left [u64 left_at] | blake3 checksum[32] over
+// everything before it. A left join holds no bundle.
 fn encode(
     identity: &Identity,
     invite: &MembershipInvite,
     intent: &RedemptionIntent,
     bundle: Option<&MembershipBundle>,
+    left_at: Option<u64>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
@@ -195,6 +257,13 @@ fn encode(
         }
         None => out.push(0),
     }
+    match left_at {
+        Some(at) => {
+            out.push(1);
+            out.extend_from_slice(&at.to_le_bytes());
+        }
+        None => out.push(0),
+    }
     let sum = blake3::derive_key(CHECKSUM_CONTEXT, &out);
     out.extend_from_slice(&sum);
     out
@@ -205,6 +274,7 @@ type Decoded = (
     MembershipInvite,
     RedemptionIntent,
     Option<MembershipBundle>,
+    Option<u64>,
 );
 
 fn decode(bytes: &[u8]) -> Result<Decoded, DeviceJoinError> {
@@ -218,7 +288,12 @@ fn decode(bytes: &[u8]) -> Result<Decoded, DeviceJoinError> {
         return Err(corrupt());
     }
     let mut r = Reader::new(body);
-    if r.take_arr::<4>() != Some(MAGIC) || r.take_u16() != Some(VERSION) {
+    if r.take_arr::<4>() != Some(MAGIC) {
+        return Err(corrupt());
+    }
+    // v1 snapshots (before leave existed) have no left section.
+    let version = r.take_u16().ok_or_else(corrupt)?;
+    if version != 1 && version != VERSION {
         return Err(corrupt());
     }
     let identity = Identity::from_seed(r.take_arr::<32>().ok_or_else(corrupt)?);
@@ -234,6 +309,18 @@ fn decode(bytes: &[u8]) -> Result<Decoded, DeviceJoinError> {
         ),
         _ => return Err(corrupt()),
     };
+    let left_at = if version == 1 {
+        None
+    } else {
+        match r.take_arr::<1>().ok_or_else(corrupt)?[0] {
+            0 => None,
+            1 => Some(r.take_u64().ok_or_else(corrupt)?),
+            _ => return Err(corrupt()),
+        }
+    };
+    if left_at.is_some() && bundle.is_some() {
+        return Err(corrupt());
+    }
     if !r.done() || intent.subject() != identity.entity_id() {
         return Err(corrupt());
     }
@@ -241,5 +328,5 @@ fn decode(bytes: &[u8]) -> Result<Decoded, DeviceJoinError> {
     if let Some(b) = &bundle {
         b.verify_for(&invite, &intent).map_err(|_| corrupt())?;
     }
-    Ok((identity, invite, intent, bundle))
+    Ok((identity, invite, intent, bundle, left_at))
 }
