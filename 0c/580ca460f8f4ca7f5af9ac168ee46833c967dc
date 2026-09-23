@@ -1,0 +1,20 @@
+net/crates/net/sdk/tests/org_streaming.rs
+  s_3f3d4c91f992be::t_c6324a103ed011 43-55,1564-2296
+  s_3f3d4c91f992be::t_ccacf52dc1b961 2297-2315
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0c580ca460f8f4ca7f5af9ac168ee46833c967dc",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
