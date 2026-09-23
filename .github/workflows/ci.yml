@@ -4284,6 +4284,24 @@ jobs:
           RUN_INTEGRATION_TESTS: "1"
         run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh
 
+      # === S4: the Go org facade live cells (ORG_SCOPED_STREAMING_PLAN) ==
+      # The run above EXECUTED these 6 live cells (3 shapes x {same-org,
+      # granted}, call+serve live two-node with verified-caller attribution
+      # asserted); this step PINS them (a witness must not disappear
+      # silently): lexical name-existence, fail-closed.
+      - name: Witness roster — Go org facade live cells (Stage 4, 6)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label org_test --mode literal \
+            --source org_test.go \
+            TestLiveSameOrgStreamingFromAGeneratedScenario \
+            TestLiveSameOrgClientStreamFromAGeneratedScenario \
+            TestLiveSameOrgDuplexFromAGeneratedScenario \
+            TestLiveGrantedStreamingFromAGeneratedScenario \
+            TestLiveGrantedClientStreamFromAGeneratedScenario \
+            TestLiveGrantedDuplexFromAGeneratedScenario || exit 1
+
       # Run again with `-tags test_helpers` so the test-only files
       # (`groups_testhelpers.go`, `groups_test.go`,
       # `capability_aggregation_e2e_test.go`) compile and execute.
