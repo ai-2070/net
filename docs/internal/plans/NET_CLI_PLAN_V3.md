@@ -1719,8 +1719,9 @@ Last local results:
 - the `connect_via` integration binaries 116/116;
 - clippy and rustdoc clean.
 
-The full CI suite on the pushed head (run 35808941788) was still queued when
-this was recorded; its result is not yet a receipt.
+The full CI suite passed on the pushed R2 heads: run 35807029554 at
+`5b515fc0e` (all R2 product code) and run 35808941788 at `c0cb21b6a` (the
+natsim-fixed head). Both are success.
 
 **Still open.**
 - R2 phase 5, upgrading a relayed session to direct (planned for later).
