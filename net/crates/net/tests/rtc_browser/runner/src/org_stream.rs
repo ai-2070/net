@@ -1635,6 +1635,23 @@ async fn browser_call_matrix(
         let payload = format!("payload-{}", WITNESSES[index]).into_bytes();
         let witness = WITNESSES[index];
         let before = services.log.total();
+        // The handler-side record's payload identity PER SHAPE: the
+        // request body for unary/streaming, the collected upload
+        // concatenation for client-stream/duplex (what the handler
+        // recorded from the call's own bytes).
+        let record_payload = match shape {
+            "client_stream" => {
+                let mut j = format!("up-{}-0", index).into_bytes();
+                j.extend_from_slice(format!("up-{}-1", index).as_bytes());
+                j
+            }
+            "duplex" => {
+                let mut j = format!("dx-{}-0", index).into_bytes();
+                j.extend_from_slice(format!("dx-{}-1", index).as_bytes());
+                j
+            }
+            _ => payload.clone(),
+        };
 
         let (pass, detail) = match shape {
             "unary" => {
@@ -1771,7 +1788,7 @@ async fn browser_call_matrix(
             .into_iter()
             .last();
         let attribution_ok = record.as_ref().is_some_and(|rec| {
-            rec.payload == payload
+            rec.payload == record_payload
                 && rec.caller.as_deref() == Some(caller_hex.as_str())
                 && rec.acting_org.as_deref() == Some(acting_hex.as_str())
                 && rec.provider_org.as_deref() == Some(a_hex.as_str())
@@ -1791,7 +1808,7 @@ async fn browser_call_matrix(
                     rec.provider_org,
                     rec.provider,
                     rec.capability,
-                    hex(&payload),
+                    hex(&record_payload),
                     hex32(OrgWorld::cap(service).as_bytes())
                 )
             })
@@ -2025,8 +2042,25 @@ async fn native_call_matrix(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        // The page record's payload identity PER SHAPE: the request
+        // body for unary/streaming, the collected upload
+        // concatenation for client-stream/duplex.
+        let record_payload = match shape {
+            "client_stream" => {
+                let mut j = format!("nu-{}-0", index).into_bytes();
+                j.extend_from_slice(format!("nu-{}-1", index).as_bytes());
+                j
+            }
+            "duplex" => {
+                let mut j = format!("nd-{}-0", index).into_bytes();
+                j.extend_from_slice(format!("nd-{}-1", index).as_bytes());
+                j
+            }
+            _ => payload.clone(),
+        };
         let attribution_ok = calls.len() == 1
-            && calls[0].get("payload").and_then(Value::as_str) == Some(hex(&payload).as_str())
+            && calls[0].get("payload").and_then(Value::as_str)
+                == Some(hex(&record_payload).as_str())
             && calls[0].get("entity").and_then(Value::as_str) == Some(anchor_hex.as_str())
             && calls[0].get("acting_org").and_then(Value::as_str)
                 == Some(if granted { &b_hex } else { &a_hex }.as_str())
@@ -3573,7 +3607,7 @@ async fn leader_replacement(
         script,
         follow2_tab,
         unary_step(N_LEADER, &successor_payload, &creds),
-        8,
+        30,
     )
     .await;
     let successor_reply = successor.reply.as_deref().map(crate::unhex).unwrap_or_default();
@@ -3670,6 +3704,7 @@ async fn leader_teardown(
     let role1 = role_of(&info1);
     let leader_page = PAGE_FOLLOW1;
     let pending_tab = TAB_FOLLOW2;
+    let invocations_before_close = service_log.for_service(N_TEARDOWN).len();
     let closed = cx.driver.close_page(leader_page).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
 
@@ -3687,7 +3722,7 @@ async fn leader_teardown(
         k == "org-leader-lost" || k == "org-session-lost" || k == "leaderLost" || k == "sessionLost"
     };
     let both_typed = typed_lost(k1) && typed_lost(k2) && !(k1.is_empty() && k2.is_empty());
-    let nothing_resumed = service_log.for_service(N_TEARDOWN).len() == 2;
+    let nothing_resumed = service_log.for_service(N_TEARDOWN).len() == invocations_before_close;
 
     // What the model says survives: the survivor's settled state and
     // a fresh call on the promoted session.

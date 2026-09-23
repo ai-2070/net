@@ -406,6 +406,10 @@ async function execute(step) {
               entry.eof_at = performance.now();
               if (deferMs) await sleep(deferMs);
               // The terminal reply: the exact concatenation, so a
+              // The record's payload identity = the collected upload
+              // concatenation (the same contract as the native
+              // client-stream providers' records).
+              entry.payload = collected.join('');
               // missing/extra upload byte is an identity mismatch.
               const total = collected.reduce((n, h) => n + h.length / 2, 0);
               // The labelled reply (the same contract as the native
@@ -436,8 +440,10 @@ async function execute(step) {
               const tracked = trackedSink(entry, sink);
               state.holds.push(entry);
               let index = 0;
+              const received = [];
               for await (const chunk of requests) {
                 entry.items.push(hex(chunk));
+                received.push(hex(chunk));
                 // Echo each request chunk, content-labelled, so
                 // per-chunk pairing is an exact identity check.
                 const echo = new TextEncoder().encode('e' + index + ':');
@@ -448,6 +454,10 @@ async function execute(step) {
                 index += 1;
               }
               entry.eof_at = performance.now();
+              // The record's payload identity = the collected request
+              // concatenation (the same contract as the native duplex
+              // providers' records).
+              entry.payload = received.join('');
               if (hold) {
                 await new Promise((resolve) => {
                   state.release = resolve;
