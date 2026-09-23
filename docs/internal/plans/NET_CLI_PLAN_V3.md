@@ -2156,6 +2156,10 @@ Regressions:
 - Clippy (core all-features all-targets, lib/bins all, default and
   no-default; SDK `full`; `net-cli`) and rustdoc (root, SDK `full`) are clean.
 
+**Exact-head CI:** full `CI` passed at `952b70190` (run 35858946215), including
+the Node, Python and Go kind tests and the pinned `subnet_subject_floor`
+binary. The subject-floor head `ba4aa1ccd` also passed (run 35854878363).
+
 **Still open (V3-4).**
 - `up` does not yet act as a subnet verifier: no CLI-run node configures an
   authority, floor store or readback service. Operators run verifiers through
