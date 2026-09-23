@@ -131,6 +131,39 @@ source-established label and its receipt per the brief's evidence rules.
   `raise_between_reserve_and_install_denies_with_zero_effects` is a **named
   rewrite** (it pinned the mapping the ruling corrected — F1 precedent:
   strengthened to the owner-approved property, never silently re-pinned).
+- **2026-09-22, S4Node verified (executed).** Landed at `7efdd56d1`
+  (impl `c62ecd740` + record `7efdd56d1`; `S4_NODE.md` F16-ledgered). The
+  §4.4 Node verbs verbatim over the frozen seams; the one `OrgCaller`
+  projection; `classifyOrgError` via the single `OrgSdkError::to_wire`
+  vocabulary; the typed wrappers reusing the existing typed streams; the
+  F-S3.1-2 handler-drop contract documented on all six handler surfaces.
+  Estate: vitest 606 passed / 9 pre-existing skips at exact head; 10 new
+  witnesses (per shape × call+serve × same-org+granted + the coarse mirror
+  pin + the midstream classify pin + strict disposal + the NEW
+  consumer-compile probe with `skipLibCheck:false`). The REQUIRED inverse
+  receipt (the projection substituting `[0xEE;32]` facts) reds the
+  attribution witnesses at their named assertions with four weakenings NONE
+  (the witness file's sha locked across the cycle) and a byte-identical
+  restore. **Coordinator spot-check SCR-NODE reproduced it (executed):** my
+  single-field mutation of `org_caller_js.entity` → `napi build` → **6
+  failed | 4 passed** at the verified-facts assertions → restore → rebuild →
+  **10/10 green**. Process notes: (a) SCR-NODE v1 is INVALID and disclosed —
+  an unbuilt source mutation is NON-EXECUTION (vitest loads the compiled
+  addon); the rebuild belongs inside the cycle — carried as a spot-check
+  rule for every binding lane; (b) the index-sweep disclosure (S4Go's two
+  carved files rode into `c62ecd740`; attribution corrected to S4Go's
+  bounded carve; explicit-path staging noted as the remedy); (c) the
+  in-row found-and-fixed defect (shipped `index.d.ts` naming `dataforts`-
+  gated types — the napi cfg trap, TS2304 under `skipLibCheck:false` —
+  repaired with why-noted ungated declarations); (d) S4Node's own ENOSPC
+  truncation of a test file, restored byte-exact from HEAD and
+  F16-ledgered. CI: the Node witness roster gate (10 names, `--mode
+  literal`) pinned beside the vitest run. Limits stated by the lane
+  (never executed there): the `org:rpc:timeout` midstream rendering at the
+  Node surface, Node-side midstream revocation, a wire-level CANCEL-frame
+  count, the dataforts-ENABLED build of the ungated declarations,
+  typecheck:tests/release/check-ts-consumer.sh/CI themselves, non-Windows
+  hosts.
 - **2026-09-22, S3R repair round verified (executed).** All three S3Review
   ACCEPT findings closed at `b879ca4f8` (commits `0c580ca46` four witnesses,
   `b5143865c` five receipts as the empty tree-change, `b879ca4f8` record).
