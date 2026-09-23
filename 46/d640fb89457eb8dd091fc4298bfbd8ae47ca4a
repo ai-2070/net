@@ -1,0 +1,23 @@
+net/crates/net/sdk-py/.s4receipts/rerun-stream-sync-sameorg.xml
+  s_3f3d4c91f992be::t_2f834674d6675f 1
+docs/internal/spikes/org-streaming/S4_PYSDK.md
+  s_3f3d4c91f992be::t_1d89ef16a8c974 1-259
+net/crates/net/sdk-py/.s4receipts/s4pysdk-part1a-batch1.xml
+  s_3f3d4c91f992be::t_5eb403c5ab9d0b 1-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "46d640fb89457eb8dd091fc4298bfbd8ae47ca4a",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
