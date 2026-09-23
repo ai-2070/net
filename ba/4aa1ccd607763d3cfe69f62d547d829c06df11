@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/subnet/provision.rs
+  s_3f3d4c91f992be::t_75f973af7f9b2d 345
+net/crates/net/sdk/tests/subnet_kind_fixture.rs
+  s_3f3d4c91f992be::t_9b562229410f34 65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ba4aa1ccd607763d3cfe69f62d547d829c06df11",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
