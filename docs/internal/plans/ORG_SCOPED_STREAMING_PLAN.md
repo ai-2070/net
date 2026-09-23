@@ -23,25 +23,26 @@ Rust SDK contracts. No WebSocket, HTTP or cloud runtime is required by this plan
 
 ## Status
 
-**STAGE 1 ACCEPTED 2026-09-22 (independent review round 2.1 at `cc15f4d66`);
-STAGE 2 DISPATCHED AS WRITTEN ON ITS PINNED BRIEF — the F-S1R-2
-terminal-retarget rider was surfaced to the owner and RULED (2026-09-22):
-not included, the plan-as-written governs; the documented limitation
-stands as recorded;
-STAGE 0 ACCEPTED 2026-09-22 (branch `LZL0/org-streaming`); Q1–Q7 RESOLVED;
-STAGE 1 DISPATCH AUTHORIZED ON THAT ACCEPTANCE AND ITS PINNED BRIEF — source
-specification at head `85ecc77c953443bb6ab579ba7a842520bb3fca21` (`master`),
-revised 2026-09-19 after reviewer HOLD (Kyra). Stage 0 changed no production
-wire, behaviour or export: the two models are `#[cfg(test)]`, the bench groups
-are bench-only, and the probe is a guard workspace plus one CI step. Stage 0
-evidence is `docs/internal/spikes/org-streaming/S0_REPORT.md` with
-`S0_RECEIPTS_LIFECYCLE.md` / `S0_RECEIPTS_REGISTRY.md` (findings F1–F16 named
-there) and the independent verdict packet
-`docs/internal/spikes/org-streaming/S0_REVIEW_PACKET.md` (ACCEPT at
-`736469448`: all five slice rows and all ten composition rows pass; three P2/P3
-record-quality findings, all closed in `3dc043c1e`). Stage 1 proceeds only
-through `spikes/org-streaming/S1_BRIEF.md`; Stage 2+ is not authorized by this
-document.**
+**STAGE 2 ACCEPTED 2026-09-22 (independent review at `017e7148a`) AND ITS
+S2R REPAIR ROUND CLOSED (`1d26bc4ba`, verified + CI floor 42);
+STAGE 3 DISPATCHED AS WRITTEN ON ITS PINNED BRIEF
+(`spikes/org-streaming/S3_BRIEF.md` @`0071fd1fc`, lane `S3Facade` in
+flight); STAGE 4 NOT authorized. The owner RULED (2026-09-22) the F-S1R-2
+terminal-retarget rider NOT included — the plan-as-written governs and the
+documented limitation stands. Earlier gates: STAGE 1 ACCEPTED
+(`cc15f4d66`, after one HOLD→repair round), STAGE 0 ACCEPTED
+(`736469448`). Q1–Q7 RESOLVED. Source specification at head
+`85ecc77c953443bb6ab579ba7a842520bb3fca21` (`master`), revised 2026-09-19
+after reviewer HOLD (Kyra). Stage 0 changed no production wire, behaviour
+or export (the two models are `#[cfg(test)]`, the bench groups bench-only,
+the probe a guard workspace plus one CI step); its evidence is `S0_REPORT.md`
+with `S0_RECEIPTS_LIFECYCLE.md` / `S0_RECEIPTS_REGISTRY.md` (findings
+F1–F16) and the verdict packet `S0_REVIEW_PACKET.md` (ACCEPT: all five
+slice rows and all ten composition rows; its three P2/P3 record findings
+closed in `3dc043c1e`). Every stage proceeds ONLY through its pinned brief
+in `spikes/org-streaming/` (`S1_BRIEF`, `S1_R_BRIEF`, `S2_BRIEF`,
+`S2_R_BRIEF`, `S3_BRIEF` — each recorded in the Review log with its
+commits); no stage is authorized by this document alone.**
 
 This revision replaces the older baseline (`3e88e50f…`) with a source trace at
 the current head across six lanes (admission/proof/replay, streaming folds,
@@ -1416,4 +1417,35 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   `unused_mut` at `mesh_rpc.rs:10775` and three rustdoc links in
   `apply_inbound_admitted`'s doc (the code-span remedy), all Stage-2 test/doc
   code, all clippy all-features ×2 + rustdoc ×5 green at re-run
-  (`S2_VALIDATION_B_OK`). Stage 2 proceeds to independent review.
+  `S2_VALIDATION_B_OK`). Stage 2 proceeds to independent review.
+
+- 2026-09-22, **Stage 2 independent review verdict: ACCEPT**
+  (`S2_REVIEW_PACKET.md`, pinned head `017e7148a`, confidence 0.93): the
+  estate reproduced exactly (41/41 roster-matched, 220/220, 134/134,
+  32/32, models 76/76 untouched); every row's witnesses discriminate (nine
+  named inverses re-executed red byte-identical; fresh G2/G4 red); the
+  Stage 2 Exit holds on all three clauses with per-shape independence
+  verified; F-S2.1-3 (reconstructed commit boundary) acceptable on honest
+  history plus the reviewer's own green run at `16cd67e85`; F-S2.4-1
+  correctly overdetermination (R-S2.4c-v2 the true inverse, red verbatim);
+  F-S2.2-5 correct and fail-pre-fix proven but site-family-scoped. **Its
+  three non-blocking findings closed by the S2R repair round** (`1d26bc4ba`
+  over `c17572f03` / `1432c6c03`): **F-S2R-1** — the §2.6
+  late-input-after-early-handler-return disposition witnessed
+  (`early_handler_return_refuses_late_input_without_resource_exhausted`;
+  both required inverse mutations red at its named no-latch assertion) and
+  the §4 F-S2.4-2 overclaim scoped; **F-S2R-2** — the §3 step-5 MANDATED
+  `ConfirmedStreamOpening` Drop guard landed in both CS/DX seams (the
+  inline F-S2.2-5 settlement folded in; R-S2.2c's fail-pre-fix preserved
+  byte-identically via R-S2.2c-v2) with its probe-witness
+  `post_transfer_scope_guard_never_orphans_a_running_record` (red at the
+  reviewer's own orphan outcome, `left: 1 / right: 0`); **F-S2R-3** — the
+  proof-method wording replaced by the normalisation digests. Zero
+  weakenings; one disclosed superseded cycle. Coordinator SCR1 re-executed
+  the Row-2 probe receipt. Estate after S2R: `org_rpc_streaming` **42/42**
+  (CI floor 42 at `636d80d69`, roster-validated), in-source 221/221,
+  preserved + controls 134/134, cross-lang 32/32, models 76/76. Stage 2
+  fully closed; Stage 3 dispatched (`S3_BRIEF.md` @`0071fd1fc`, lane
+  `S3Facade`, one ruled carve: `pub(crate)` `from_raw` constructors in
+  `sdk/src/mesh_rpc.rs` for the five typed wrappers — zero public-API
+  change, probe-enforced).
