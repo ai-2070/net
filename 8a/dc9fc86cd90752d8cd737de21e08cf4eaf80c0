@@ -1,0 +1,22 @@
+go/org_streaming_opening_vectors_test.go
+  h_64425bc75e3f3d 1-701
+net/crates/net/bindings/node/test/org_streaming_opening_vectors.test.ts
+  h_64425bc75e3f3d 1-392
+net/crates/net/bindings/python/tests/test_org_streaming_opening_vectors.py
+  h_64425bc75e3f3d 1-276
+net/crates/net/tests/cross_lang_org/mixed_pair/caller.py
+  h_64425bc75e3f3d 1-185
+net/crates/net/tests/cross_lang_org/mixed_pair/provider.py
+  h_64425bc75e3f3d 1-207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8adc9fc86cd90752d8cd737de21e08cf4eaf80c0",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
