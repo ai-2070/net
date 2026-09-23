@@ -1,0 +1,19 @@
+net/crates/net/tests/org_scoped_cross_process.rs
+  s_3f3d4c91f992be::t_61fe16c1cd6752 246,248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "89b1742a770ccb8df4e25d9130b1faed078e31e0",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
