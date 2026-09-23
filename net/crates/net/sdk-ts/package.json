@@ -12,6 +12,10 @@
     "./tool": {
       "types": "./dist/tool.d.ts",
       "default": "./dist/tool.js"
+    },
+    "./org": {
+      "types": "./dist/org/index.d.ts",
+      "default": "./dist/org/index.js"
     }
   },
   "license": "MIT OR Apache-2.0",

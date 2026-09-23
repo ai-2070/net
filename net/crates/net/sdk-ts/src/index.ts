@@ -385,3 +385,45 @@ export {
   mcp,
   gemini,
 } from './tool';
+
+// Organization capability auth — the protected unary + streaming RPC
+// surface (call AND serve, all four shapes). Detailed shape lives in
+// `./org/`, a thin pass-through over `@net-mesh/core/org`'s typed
+// wrappers (no new stream wrapper). Users who want only the org layer
+// can also import from `'@net-mesh/sdk/org'`.
+export type {
+  OrgCallOptions,
+  OrgCaller,
+  OrgCredentialsOptions,
+  OrgRequest,
+  OrgServeHandle,
+  TypedOrgClientStreamHandler,
+  TypedOrgDuplexHandler,
+  TypedOrgHandler,
+  TypedOrgStreamingHandler,
+} from './org';
+
+export {
+  OrgAccess,
+  OrgAdmissionDeniedError,
+  OrgClient,
+  OrgCredentials,
+  OrgCredentialsError,
+  OrgDiscoveryError,
+  OrgError,
+  OrgUnclassifiedError,
+  TypedClientStreamCall,
+  TypedDuplexSink,
+  TypedDuplexStream,
+  TypedOrgClient,
+  TypedRequestStream,
+  TypedResponseSink,
+  TypedRpcStream,
+  classifyOrgError,
+  installOrgAuthority,
+  installProviderGrantAudience,
+  serveOrg,
+  serveOrgClientStream,
+  serveOrgDuplex,
+  serveOrgStreaming,
+} from './org';
