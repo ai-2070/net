@@ -3955,6 +3955,30 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: pytest -v -s --timeout=30 --timeout-method=thread
 
+      # === S4: the Python org facade witnesses (ORG_SCOPED_STREAMING_PLAN) =
+      # The pytest run above EXECUTED these 15 items (the 6 matrix functions
+      # x [same_org|granted] = 12 cells + 3 standalone: the task-cancel
+      # propagation witness, the midstream org-vocabulary witness, and the
+      # preserved unary cross-org cell); this step PINS their 9 base names
+      # (a witness must not disappear silently): lexical name-existence,
+      # fail-closed, plus the parametrize pair that yields the 12 cells.
+      - name: Witness roster — Python org facade (Stage 4, 15 items / 9 names)
+        run: |
+          set -uo pipefail
+          CHECK=".github/scripts/check-roster.py"
+          python3 "$CHECK" --label test_org_live --mode literal \
+            --source net/crates/net/bindings/python/tests/test_org_live.py \
+            test_org_streaming_sync_call_and_serve \
+            test_org_streaming_async_call_and_serve \
+            test_org_client_stream_sync_call_and_serve \
+            test_org_client_stream_async_call_and_serve \
+            test_org_duplex_sync_call_and_serve \
+            test_org_duplex_async_call_and_serve \
+            test_task_cancel_propagates_to_retirement_observables \
+            test_streaming_midstream_error_surfaces_the_org_vocabulary \
+            test_live_cross_org_call_from_a_generated_scenario \
+            '"same_org"' '"granted"' || exit 1
+
       # The skill examples import `net_sdk`, the ergonomic wrapper, which sits
       # on the binding `maturin develop` just built. This is the only job with
       # both layers: sdk-py-tests installs the wrapper `--no-deps` on purpose
@@ -6121,11 +6145,30 @@ jobs:
           cargo test --features mock-control-plane 2>&1 | tee /tmp/leaf-native.log
           total=$(grep -c '^test .* \.\.\. ok$' /tmp/leaf-native.log || true)
           echo "leaf native tests: $total"
-          if [ "$total" -lt 308 ]; then
-            echo "::error::the leaf's native surface ran $total tests, floor is 308 — \
+          if [ "$total" -lt 388 ]; then
+            echo "::error::the leaf's native surface ran $total tests, floor is 388 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
+          # === S4: the org streaming suite floors (ORG_SCOPED_STREAMING_PLAN)
+          # The three org suites' counts, fail-closed (a suite that silently
+          # shrinks must not read as green). Floor accounting from the source
+          # rosters at the S4Browser head. One documented rename inside
+          # org_streaming_lifecycle:
+          # `response_credit_parks_the_sender_and_each_grant_releases_exactly_its_chunks`
+          # replaced `…the_pump…` when the instrument moved to sender-parking
+          # (strengthened — the property moved with it).
+          for spec in org_authority:22 nrpc_streaming_parity:21 org_streaming_lifecycle:29; do
+            name="${spec%%:*}"; floor="${spec##*:}"
+            out=$(cargo test --features mock-control-plane --test "$name" 2>&1 | tee /dev/stderr)
+            n=$(printf '%s\n' "$out" | grep -oE 'test result: ok\. [0-9]+ passed' | grep -oE '[0-9]+' | head -1)
+            echo "$name: ${n:-0} (floor $floor)"
+            if [ -z "$n" ] || [ "$n" -lt "$floor" ]; then
+              echo "::error::$name ran ${n:-0} tests, floor is $floor — \
+          lower the floor deliberately or restore the witness"
+              exit 1
+            fi
+          done
 
       - name: wasm32 check
         run: cargo check --target wasm32-unknown-unknown --all-targets
@@ -6379,7 +6422,16 @@ jobs:
         run: npm run build
 
       - name: Unit tests
-        run: npm test
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee /tmp/browser-ts-tests.log
+          n=$(grep -oE '^ *Tests +[0-9]+ passed' /tmp/browser-ts-tests.log | grep -oE '[0-9]+' | tail -1)
+          echo "browser-ts tests passed: ${n:-0} (floor 728)"
+          if [ -z "$n" ] || [ "$n" -lt 728 ]; then
+            echo "::error::browser-ts ran ${n:-0} tests, floor is 728 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
 
       # R11: the TS/Rust ABI asserted through the artefacts a page
       # actually loads — the built `dist/` and the wasm-bindgen `pkg`
@@ -6708,6 +6760,43 @@ jobs:
           stage6_a_network_change_drives_exactly_one_re_attempt
           stage6_rtc_stats_uses_the_native_field_names_and_names_what_it_cannot_measure
           stage6_one_node_id_spelling_across_both_signalling_surfaces
+          org_browser_call_unary_same_org
+          org_browser_call_unary_granted
+          org_browser_call_streaming_same_org
+          org_browser_call_streaming_granted
+          org_browser_call_client_stream_same_org
+          org_browser_call_client_stream_granted
+          org_browser_call_duplex_same_org
+          org_browser_call_duplex_granted
+          org_native_call_unary_same_org
+          org_native_call_unary_granted
+          org_native_call_streaming_same_org
+          org_native_call_streaming_granted
+          org_native_call_client_stream_same_org
+          org_native_call_client_stream_granted
+          org_native_call_duplex_same_org
+          org_native_call_duplex_granted
+          org_browser_pair_unary
+          org_browser_pair_streaming
+          org_browser_pair_client_stream
+          org_browser_pair_duplex
+          org_browser_pair_granted
+          org_wrong_peer_frames_refused
+          org_old_session_frames_refused
+          org_replayed_opening_refused
+          org_streaming_backpressure_and_window
+          org_client_stream_backpressure_half_close
+          org_duplex_backpressure_half_close
+          org_midstream_revocation_retires_with_denied
+          org_revocation_refuses_new_openings
+          org_tab_teardown_retires_without_resume
+          org_leader_proxied_call_preserves_follower_attribution
+          org_leader_replacement_preserves_attribution
+          org_leader_teardown_fails_pending_typed
+          org_handler_completion_after_retirement_emits_nothing
+          org_parity_codec_round_trip_both_codecs
+          org_parity_leaf_proof_verifies_under_core
+          org_parity_core_proof_verifies_under_leaf
           "
           # The roster is checked against the harness source before the
           # logs are read: a witness name that the runner never emits
@@ -6719,6 +6808,7 @@ jobs:
             --source net/crates/net/tests/rtc_browser/runner/src/stage5.rs \
             --source net/crates/net/tests/rtc_browser/runner/src/stage6.rs \
             --source net/crates/net/tests/rtc_browser/runner/src/stage7.rs \
+            --source net/crates/net/tests/rtc_browser/runner/src/org_stream.rs \
             $REQUIRED
           # The ELEVEN Stage 7 witnesses, required on the engine that
           # runs them. They carry the plan's B2' composition gate — the
@@ -6751,8 +6841,8 @@ jobs:
             # Floors are PER ENGINE: Chromium runs the store stage,
             # Firefox does not (see the harness step above).
             case "$engine" in
-              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=58; extra="$STAGE7" ;;
-              firefox)  log="$RUNNER_TEMP/rtcb-firefox.log"; floor=47; extra="" ;;
+              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=95; extra="$STAGE7" ;;
+              firefox)  log="$RUNNER_TEMP/rtcb-firefox.log"; floor=84; extra="" ;;
             esac
             # Prove the parser finds a KNOWN line before believing
             # any count, so a changed output format reads as "fix the
