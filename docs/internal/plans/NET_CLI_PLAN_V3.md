@@ -1826,6 +1826,59 @@ Tasks:
    `join`, and joined `up` presenting its credentials. The e2e journey runs
    join → admitted → `subnet remove` → refused on reconnect.
 
+#### V3-2 S1 — subnet admission on the wire (receipt, 2026-09-23)
+
+**Protocol.** Subprotocol `0x0A02`, `SUBPROTOCOL_SUBNET_ADMISSION`, in the auth
+family next to identity proof `0x0A01`. It is now registered in
+`docs/SUBPROTOCOLS.md`, together with the previously unlisted `0x0A01`.
+Codec: `subnet/admission_wire.rs`.
+
+1. The device sends `ChallengeRequest{nonce}`.
+2. The verifier answers `Challenge{nonce, verifier, session_id, challenge}`,
+   where the challenge comes from the existing one-use challenge store.
+3. The device sends `Present{nonce, presentation, credential set}`.
+4. The verifier answers `Verdict{nonce, refusal}`.
+
+**Dispatch and node.**
+- The dispatch arm uses the same §12 provisional gate as identity proof.
+- Replies complete a pending leg only from the node the leg went to.
+- Verifier legs run on the node through `self_weak`, now shared with
+  `DispatchCtx`: at most 64 concurrent, and auth-throttled peers are dropped.
+- The verifier runs the **unchanged** `admit_subnet_session`: credential
+  chain, floors including subject floors, and the routing-id pin.
+- A node without subnet authorities answers `unknown_authority` and mints no
+  challenge.
+- Prover API: `MeshNode::present_subnet_credentials(verifier, set, target,
+  rights, timeout)`. Each leg retransmits the same correlation nonce, and the
+  pending entry is removed on every exit, including cancellation.
+
+Witnesses, `tests/subnet_wire_admission.rs` 3/3 (pinned in ci.yml):
+- `a_device_is_admitted_over_the_wire_and_refused_after_removal`: B and C are
+  admitted over the wire; after a subject floor B is `Revoked`, its context is
+  gone, and C's context is identical.
+- `delegated_credentials_are_admitted_over_the_wire`.
+- `refusals_are_verdicts_and_nothing_is_installed`: unanchored →
+  `unknown_authority`; another entity's leaf → `wrong_subject`, nothing
+  installed; no session → `NoSession`.
+
+Inverse mutations, both caught and restored:
+- the verifier admitting without checking;
+- the prover treating any verdict as admission.
+
+Not witnessed:
+- The "reply only from the addressed node" guard. A forger would have to guess
+  a 64-bit correlation nonce; the guard mirrors identity proof's.
+- The unanchored node minting no challenge state. Admission would still fail
+  at the authority lookup either way.
+
+Regressions:
+- `cargo tl` 5813/5813.
+- 205/205 across the 15 subnet binaries, `channel_identity_readiness`,
+  `connect_direct`, `routed_transport_availability`,
+  `three_node_integration` and `rtc_admission`.
+- Clippy (all-features all-targets, lib/bins, default; `net-cli`) and rustdoc
+  are clean. `large_enum_variant` was fixed by boxing the `Present` payload.
+
 ### V3-2A — channel-scoped invitation, join and credential lifecycle
 
 **Modify:** `src/adapter/net/mesh.rs` for exact publish-chain/cache lifecycle hooks; `sdk/src/identity.rs` to expose the canonical `TokenChain`; `sdk/src/mesh.rs` for a full-chain subscribe path; shared enrollment/persistence modules; `cli/src/commands/channel.rs`, `main.rs`, `context.rs`, `config.rs`; and the selected durable authority/runtime control owner. Modify `identity/token.rs` or `channel/config.rs` only for a separately source-proven gap.

@@ -2486,6 +2486,23 @@ struct DispatchCtx {
     /// the prover minted, valued `(expected peer, reply sender)`.
     /// Same peer-auth discipline as `pending_membership_acks`: only
     /// the node the request went to may answer it.
+    /// In-flight subnet-admission legs (subprotocol `0x0A02`) keyed by
+    /// correlation nonce, valued `(expected verifier, reply sender)`: only
+    /// the node the leg went to may answer it.
+    pending_subnet_admissions: Arc<
+        DashMap<
+            u64,
+            (
+                u64,
+                oneshot::Sender<super::subnet::admission_wire::SubnetAdmissionMsg>,
+            ),
+        >,
+    >,
+    /// Bound on concurrently served verifier-side admission legs.
+    subnet_admission_permits: Arc<tokio::sync::Semaphore>,
+    /// The node itself, for handlers that must run node-owned
+    /// transitions (subnet admission installs a routing-id pin).
+    self_weak: Arc<std::sync::OnceLock<std::sync::Weak<MeshNode>>>,
     pending_identity_proofs: Arc<DashMap<u64, (u64, oneshot::Sender<IdentityProofReply>)>>,
     /// `node_id → session_id` on which that peer PROVED possession of
     /// the entity pinned for it.
@@ -12538,6 +12555,20 @@ pub struct MeshNode {
     /// In-flight identity-proof legs keyed by correlation nonce.
     /// Shared with `DispatchCtx` so the dispatcher can complete the
     /// prover's oneshots.
+    /// In-flight subnet-admission legs (subprotocol `0x0A02`) keyed by
+    /// correlation nonce, valued `(expected verifier, reply sender)`: only
+    /// the node the leg went to may answer it.
+    pending_subnet_admissions: Arc<
+        DashMap<
+            u64,
+            (
+                u64,
+                oneshot::Sender<super::subnet::admission_wire::SubnetAdmissionMsg>,
+            ),
+        >,
+    >,
+    /// Bound on concurrently served verifier-side admission legs.
+    subnet_admission_permits: Arc<tokio::sync::Semaphore>,
     pending_identity_proofs: Arc<DashMap<u64, (u64, oneshot::Sender<IdentityProofReply>)>>,
     /// `node_id → session_id` at which each peer's entity pin was
     /// established. Shared with `DispatchCtx`; see the field of the
@@ -14538,6 +14569,8 @@ impl MeshNode {
             membership_dedupe: Arc::new(DashMap::new()),
             identity_challenges,
             pending_identity_proofs: Arc::new(DashMap::new()),
+            pending_subnet_admissions: Arc::new(DashMap::new()),
+            subnet_admission_permits: Arc::new(tokio::sync::Semaphore::new(64)),
             peer_identity_sessions,
             proven_identity_sessions: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
@@ -26598,6 +26631,9 @@ impl MeshNode {
             membership_dedupe_ttl: self.config.membership_ack_timeout * 2,
             identity_challenges: self.identity_challenges.clone(),
             pending_identity_proofs: self.pending_identity_proofs.clone(),
+            pending_subnet_admissions: self.pending_subnet_admissions.clone(),
+            subnet_admission_permits: self.subnet_admission_permits.clone(),
+            self_weak: self.self_weak.clone(),
             peer_identity_sessions: self.peer_identity_sessions.clone(),
             #[cfg(feature = "nat-traversal")]
             pending_reflex_probes: self.pending_reflex_probes.clone(),
@@ -30176,6 +30212,23 @@ impl MeshNode {
             let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
                 Self::handle_identity_proof_message(&payload, from_node, ctx);
+            }
+            return;
+        }
+
+        // Subnet admission (`0x0A02`, V3-2 S1). Same §12 gate as identity
+        // proof: an unadmitted provisional session gets no challenge state
+        // and installs no pin. `from_node` is the AEAD-resolved peer.
+        if parsed.header.subprotocol_id
+            == super::subnet::admission_wire::SUBPROTOCOL_SUBNET_ADMISSION
+        {
+            #[cfg(feature = "webrtc")]
+            if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
+                return;
+            }
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                Self::handle_subnet_admission_message(&payload, from_node, ctx);
             }
             return;
         }
@@ -35022,6 +35075,213 @@ impl MeshNode {
                 }
             }
         }
+    }
+
+    /// Dispatch one leg of the subnet admission exchange (`0x0A02`).
+    /// Prover legs (`Challenge`, `Verdict`) complete the pending oneshot —
+    /// only from the node the leg went to. Verifier legs
+    /// (`ChallengeRequest`, `Present`) run on the node itself, bounded by
+    /// a permit pool; excess legs are dropped and the prover times out.
+    fn handle_subnet_admission_message(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        use super::subnet::admission_wire::SubnetAdmissionMsg;
+        let Ok(msg) = SubnetAdmissionMsg::decode(payload) else {
+            tracing::debug!(
+                from = format!("{from_node:#x}"),
+                "subnet admission: undecodable leg"
+            );
+            return;
+        };
+        match msg {
+            SubnetAdmissionMsg::Challenge { .. } | SubnetAdmissionMsg::Verdict { .. } => {
+                let nonce = msg.nonce();
+                if let Some((_, (_, tx))) = ctx
+                    .pending_subnet_admissions
+                    .remove_if(&nonce, |_, (expected, _)| *expected == from_node)
+                {
+                    let _ = tx.send(msg);
+                }
+            }
+            SubnetAdmissionMsg::ChallengeRequest { .. } | SubnetAdmissionMsg::Present { .. } => {
+                if Self::is_auth_throttled(from_node, ctx) {
+                    return;
+                }
+                let Some(node) = ctx.self_weak.get().and_then(std::sync::Weak::upgrade) else {
+                    return;
+                };
+                let Ok(permit) = ctx.subnet_admission_permits.clone().try_acquire_owned() else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    node.serve_subnet_admission_leg(from_node, msg).await;
+                });
+            }
+        }
+    }
+
+    /// Verifier side of one admission leg: mint a challenge, or run the
+    /// unchanged `admit_subnet_session` on a presentation, and reply.
+    async fn serve_subnet_admission_leg(
+        &self,
+        from_node: u64,
+        msg: super::subnet::admission_wire::SubnetAdmissionMsg,
+    ) {
+        use super::subnet::admission_wire::{SubnetAdmissionMsg, SUBPROTOCOL_SUBNET_ADMISSION};
+        let reply = match msg {
+            SubnetAdmissionMsg::ChallengeRequest { nonce } => {
+                let issued = if self.subnet_authorities.is_empty() {
+                    None
+                } else {
+                    self.peer_session_id(from_node).and_then(|session_id| {
+                        self.issue_subnet_challenge(from_node)
+                            .map(|challenge| (session_id, challenge))
+                    })
+                };
+                match issued {
+                    Some((session_id, challenge)) => SubnetAdmissionMsg::Challenge {
+                        nonce,
+                        verifier: self.entity_id().clone(),
+                        session_id,
+                        challenge,
+                    },
+                    None => SubnetAdmissionMsg::Verdict {
+                        nonce,
+                        refusal: Some(SubnetAuthError::UnknownAuthority),
+                    },
+                }
+            }
+            SubnetAdmissionMsg::Present {
+                nonce,
+                presentation,
+                set,
+            } => SubnetAdmissionMsg::Verdict {
+                nonce,
+                refusal: self
+                    .admit_subnet_session(from_node, &presentation, &set)
+                    .err(),
+            },
+            // Prover legs never reach here.
+            _ => return,
+        };
+        let _ = self
+            .send_subprotocol_to_node(from_node, SUBPROTOCOL_SUBNET_ADMISSION, &reply.encode())
+            .await;
+    }
+
+    /// Present `set` to `verifier_node` over the session for admission at
+    /// `target` with `rights` (V3-2 S1): request a challenge, sign the
+    /// session-, verifier- and challenge-bound presentation with this
+    /// node's entity key, and return the verifier's verdict. The leaf's
+    /// subject must be this node's entity.
+    pub async fn present_subnet_credentials(
+        &self,
+        verifier_node: u64,
+        set: &super::subnet::SubnetCredentialSet,
+        target: super::subnet::SubnetRef,
+        rights: super::subnet::SubnetRights,
+        timeout: Duration,
+    ) -> Result<(), super::subnet::admission_wire::SubnetAdmissionError> {
+        use super::subnet::admission_wire::{SubnetAdmissionError, SubnetAdmissionMsg};
+        if self.peer_session_id(verifier_node).is_none() {
+            return Err(SubnetAdmissionError::NoSession);
+        }
+        let per_leg = timeout / 2;
+        let challenge = self
+            .subnet_admission_leg(verifier_node, per_leg, |nonce| {
+                SubnetAdmissionMsg::ChallengeRequest { nonce }
+            })
+            .await?;
+        let (verifier, session_id, challenge) = match challenge {
+            SubnetAdmissionMsg::Challenge {
+                verifier,
+                session_id,
+                challenge,
+                ..
+            } => (verifier, session_id, challenge),
+            SubnetAdmissionMsg::Verdict {
+                refusal: Some(e), ..
+            } => return Err(SubnetAdmissionError::Refused(e)),
+            _ => return Err(SubnetAdmissionError::Local("unexpected reply".into())),
+        };
+        let presentation = super::subnet::SubnetAuthPresentation::try_issue(
+            self.entity_keypair(),
+            set.credential_set_hash(),
+            session_id,
+            verifier,
+            challenge,
+            target,
+            rights,
+        )
+        .map_err(|e| SubnetAdmissionError::Local(e.to_string()))?;
+        let verdict = self
+            .subnet_admission_leg(verifier_node, per_leg, |nonce| {
+                SubnetAdmissionMsg::Present {
+                    nonce,
+                    presentation: Box::new(presentation.clone()),
+                    set: Box::new(set.clone()),
+                }
+            })
+            .await?;
+        match verdict {
+            SubnetAdmissionMsg::Verdict { refusal: None, .. } => Ok(()),
+            SubnetAdmissionMsg::Verdict {
+                refusal: Some(e), ..
+            } => Err(SubnetAdmissionError::Refused(e)),
+            _ => Err(SubnetAdmissionError::Local("unexpected reply".into())),
+        }
+    }
+
+    /// One admission leg with retransmission of the same correlation
+    /// nonce (the control plane is fire-and-forget UDP). The pending entry
+    /// is removed on every exit path, including cancellation.
+    async fn subnet_admission_leg(
+        &self,
+        verifier_node: u64,
+        budget: Duration,
+        build: impl Fn(u64) -> super::subnet::admission_wire::SubnetAdmissionMsg,
+    ) -> Result<
+        super::subnet::admission_wire::SubnetAdmissionMsg,
+        super::subnet::admission_wire::SubnetAdmissionError,
+    > {
+        use super::subnet::admission_wire::{
+            SubnetAdmissionError, SubnetAdmissionMsg, SUBPROTOCOL_SUBNET_ADMISSION,
+        };
+        let mut nonce_bytes = [0u8; 8];
+        getrandom::fill(&mut nonce_bytes)
+            .map_err(|e| SubnetAdmissionError::Local(format!("nonce: {e}")))?;
+        let nonce = u64::from_le_bytes(nonce_bytes);
+        let bytes = build(nonce).encode();
+        let (tx, mut rx) = oneshot::channel::<SubnetAdmissionMsg>();
+        struct PendingLeg {
+            map: Arc<DashMap<u64, (u64, oneshot::Sender<SubnetAdmissionMsg>)>>,
+            nonce: u64,
+        }
+        impl Drop for PendingLeg {
+            fn drop(&mut self) {
+                self.map.remove(&self.nonce);
+            }
+        }
+        let _pending = PendingLeg {
+            map: self.pending_subnet_admissions.clone(),
+            nonce,
+        };
+        self.pending_subnet_admissions
+            .insert(nonce, (verifier_node, tx));
+        const ATTEMPTS: u32 = 3;
+        let per_attempt = budget / ATTEMPTS;
+        for _ in 0..ATTEMPTS {
+            self.send_subprotocol_to_node(verifier_node, SUBPROTOCOL_SUBNET_ADMISSION, &bytes)
+                .await
+                .map_err(|e| SubnetAdmissionError::Local(e.to_string()))?;
+            match tokio::time::timeout(per_attempt, &mut rx).await {
+                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Err(_)) => {
+                    return Err(SubnetAdmissionError::Local("reply channel closed".into()))
+                }
+                Err(_) => continue,
+            }
+        }
+        Err(SubnetAdmissionError::Timeout)
     }
 
     /// Dispatch one leg of the identity-proof exchange
