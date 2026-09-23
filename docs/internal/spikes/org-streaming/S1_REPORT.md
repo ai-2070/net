@@ -4307,6 +4307,17 @@ byte-identical since, verified by `git diff --stat` scope), `org_streaming`
 re-run **10/10** at the final head, `cargo fmt -p net-mesh-sdk -- --check`
 exit 0.
 
+**Correction (S3_R; the packet §5 adjudication, applied here).** The exit
+sentence above claims "Real Rust caller AND provider through the public facade
+for all four shapes …, same-org and granted" over the landed 10/10 — but at
+Stage 3's close the granted PROVIDER cells × the three streaming shapes rode
+the CORE seams (`serve_rpc_granted_*`, witnesses 4–6), not the facade serve
+verbs: the matrix held on landed evidence in **13 of 16 cells**, the other
+three capability-proven by the review's probe only (F-S3R-1). §7.2's
+`granted_facade_streaming_serve_rows_complete_cross_org` closes exactly those
+three cells on landed evidence (16/16). Everything else in the paragraph
+stands as written.
+
 **CI floor note (Main pins, never a lane):** `--suite org_streaming` floor =
 **10** with the ten names, and the `org_rpc_streaming` floor stays **42**.
 
@@ -4321,3 +4332,194 @@ contract, §6.1).
 - The probe on any toolchain/OS but this workstation's; the `webrtc`/wasm
   graphs, the benches, and every binding (Stage 4's rows by contract).
 - A wire-level duplicate-CANCEL-frame count (§6.1's stated limit).
+
+## 7. Repair round (S3_R)
+
+**Lane:** S3Repair. **Pinned brief:** `spikes/org-streaming/S3_R_BRIEF.md`
+@`635d31cc1`. The S3Review ACCEPT (`S3_REVIEW_PACKET.md` @`2225de011`)
+**stands**; this round closes its three non-blocking findings (packet §8)
+against their closure properties VERBATIM. Date: 2026-09-23, Windows host
+only. Owner-pending: none. NO stage n+1.
+
+### 7.1 The corrected Row-3 premise (Main's S3R ruling): a PURE WITNESS ROW
+
+The brief's Row 3 authorized "exactly ONE production change —
+`OrgStreamRaw::poll_next`'s `Err` arm surfacing `Ready(Some(Err(_)))`" and
+described "the current `Ready(None)` swallow". **The landed code already
+conforms** (sha-verified): at the pinned head `call.rs`'s sha is
+`04b756081d6997fd5fa6dc4788061752ee8cb9c14fb6f38da800e2fb21933c29` —
+byte-identical to the review's own pristine baseline — and the `Err` arm at
+`call.rs:245-247` reads `Poll::Ready(Some(Err(map_rpc_error(e))))`, the §4.3
+item shape. The packet agrees with the bytes: its §4 audit records "wrappers
+map every surface through the unary `map_rpc_error`", and its §8.3 inverse
+arrow is `Ready(Some(Err(_)))` → `Ready(None)` — **FROM = the landed form**.
+The brief's "swallow" phrase describes the reviewer's **M8 mutation state**,
+not the landed code. Main ruled (S3R, in-round): Row 3 is a pure witness row —
+**no production change**; the named inverse is the M8 swallow itself. This
+round is therefore test-only + record: `call.rs`, `serve.rs`, `error.rs`,
+`mesh_rpc.rs`, and every core file are byte-unchanged from `2225de011`
+(restore-equality verified throughout §7.4).
+
+### 7.2 What landed (executed)
+
+Commit pair + this record:
+
+| commit | content |
+|---|---|
+| `0c580ca46` | the four witnesses in `sdk/tests/org_streaming.rs` (+765/−0) |
+| `b5143865c` | the per-row inverse receipts — an empty tree-change BY CONSTRUCTION (every mutation restored sha-proven); receipts raw in the commit message |
+| (this commit) | the §6 correction + this `## 7` |
+
+**Row 1 — F-S3R-1.** Closure property (packet §8.1, verbatim): "a named
+witness in which a caller holding a cross-org capability grant completes a
+server-streaming call, a client-streaming upload, and a duplex exchange
+through handlers registered via `Mesh::serve_org_streaming` /
+`serve_org_client_stream` / `serve_org_duplex` with `OrgAccess::Granted`,
+asserting exact payloads and the four-party attribution; the inverse — each
+row's `OrgAccess::Granted` arm resolving to `serve_rpc_owner_scoped_*` —
+reddens that witness at its named assertion." Witness
+`granted_facade_streaming_serve_rows_complete_cross_org`: org B's provider,
+org A's caller, three services `customer.read.{stream,upload,duplex}` (a
+service name holds ONE registration — the first attempt at a single service
+red `AlreadyServing("customer.read")`, development-disclosed), one
+DISCOVER|INVOKE grant per capability, provisioned exactly like
+`granted_fixture`; the three facade verbs registered with `OrgAccess::Granted`
+and driven in three legs (streaming → client-streaming → duplex). Each leg
+carries **its own named assertion** over the exact five-tuple
+`(resolved, completed, exact payloads, four-party attribution (S acted for A
+under B's grant on exact P), ran == 1)` — the leg's own grant-plane resolution
+folded in. The packet §5 Exit matrix's three ⚠️ cells (granted-provider × the
+three streaming shapes) now hold on landed evidence: **16/16**.
+
+**Row 2 — F-S3R-2.** Closure property (packet §8.2, verbatim): "a named
+witness in which a streaming call issued through a facade verb (which passes
+`deadline_ms == 0`) against a provider whose `default_live` is materially
+shorter than 300 s keeps delivering past that shorter bound — the facade's
+300 s lifetime in force — and the inverse (the `deadline_ms == 0` arm
+producing no deadline) reddens that witness at its named assertion." Witness
+`facade_default_deadline_at_zero_outlives_a_shorter_provider_default`.
+**Instrument disclosure (source-established + executed).** A provider's
+lifetime policy is NOT configurable on any live wire path: the production
+bridges construct `StreamCallLifetime` with
+`StreamLifetimePolicy::q1_defaults()` at the only two production sites
+(`mesh_rpc.rs:1846`, `:1876` — its own comment: "The provider-configurable
+knob Q1 names is startup configuration; a per-registration lifetime policy
+would be API-addition territory (stated in the report, not added)"), and
+`MeshNodeConfig` carries no lifetime field. The witness fuses the packet
+§8.2's own alternative instrument ("or read the effective deadline directly")
+with the closure's short-bound clause: **(a) live leg** — a real `call_streaming`
+(`deadline_ms == 0`) against a live provider whose handler captures the
+call's REAL `RpcRequestPayload` verbatim (the effective deadline read
+directly at `ctx.payload.deadline_ns`); **(b) short-default leg** — that exact
+captured payload admitted at a provider whose `default_live_ns = 400 ms`
+(`max_live_ns = 3600 s`) via the preserved `org_rpc_streaming` s13 fold idiom
+(`RpcServerStreamingFold::apply_inbound_admitted` takes the §2.1 lifetime
+inputs directly), whose handler emits item 10 at +0 ms and item 11 at +800 ms.
+The named assertion is the closure's clause: item 11 — past the 400 ms bound —
+IS delivered, with `deadline_end_ns() ==` the facade's explicit `deadline_ns`
+verbatim and bound `Deadline` (never the provider default). The named inverse
+reddens exactly there. Executed vs source-established: the `deadline_ms == 0`
+⇒ 300 s mapping and its wire effect are EXECUTED (captured + resolved
+verbatim); "the provider knob was not added" is SOURCE-ESTABLISHED (the
+bridge comment, the construction sites, `MeshNodeConfig`'s field set).
+Limit, stated: clause (b) runs at the fold seam over the facade call's real
+request payload, not over a second live wire call — impossible by
+construction while the bridges pin `q1_defaults()`.
+
+**Row 3 — F-S3R-3 (pure witness row, §7.1).** Closure property (packet §8.3,
+verbatim): "a named witness that drains `OrgStreamRaw` through a midstream
+retirement and observes the final `Err(AdmissionDenied(Denied))` item (never a
+swallowed clean end), plus one drive of `call_client_stream_bytes_deadline` to
+a typed terminal; the inverse (`Ready(Some(Err(_)))` → `Ready(None)` in
+`OrgStreamRaw::poll_next`) reddens the first at its named assertion."
+`org_stream_raw_surfaces_midstream_errors_as_items`: `call_streaming_bytes` →
+`OrgStreamRaw` drained through a real mid-stream floor raise (the frozen
+`Revoked → Denied` byte) — pre-retirement chunks all `Ok` exact bytes, the
+FINAL ITEM `Err(AdmissionDenied(Denied))` at the named match, then end.
+`call_client_stream_bytes_deadline_reaches_a_typed_terminal`: one drive of the
+CS bytes seam (two chunks, `finish()`) to the typed terminal — the exact
+`UploadSummary` decoded from the seam's terminal reply (`finish` maps a non-Ok
+server status to `Err(RpcError::ServerError)` before returning, so `Ok(reply)`
+is the Ok typed terminal).
+
+### 7.3 Counts and rosters (executed)
+
+`org_streaming` **10 → 14** at the plan's named command, exit 0. Roster FROM
+SOURCE (14 `#[tokio::test]` fns) == executed == the ten landed names preserved
+verbatim + the four new: `granted_facade_streaming_serve_rows_complete_cross_org`,
+`facade_default_deadline_at_zero_outlives_a_shorter_provider_default`,
+`org_stream_raw_surfaces_midstream_errors_as_items`,
+`call_client_stream_bytes_deadline_reaches_a_typed_terminal`.
+
+CI floor note (Main pins, never a lane): `--suite org_streaming` floor = **14**.
+Arithmetic note for the re-pin: the brief's "(floor 10 → expected 13)" counts
+three rows; the closure names FOUR witnesses and the goal's acceptance says
+"all four witnesses" — 10 + 4 = **14** in the one binary.
+
+### 7.4 Inverse receipts (executed, raw)
+
+Raw, verbatim, in `b5143865c`'s commit message (the S2R empty-tree-change
+convention). Cycle per receipt: bounded diff at the PRODUCTION site →
+narrowed run (target + control) → named red (an assertion, never a compile
+error) → `git checkout --` restore + sha256 == pristine baseline → restored
+green. Baselines: `call.rs 04b75608…`, `serve.rs e1f7083c…` (identical to the
+packet §7's; never changed by this round).
+
+| receipt | site (+/−) | named red | control (PASS) |
+|---|---|---|---|
+| R1a | `serve.rs:650` +1/−1 | leg 1's own named assert, `org_streaming.rs:1717:5` | `handler_receives_verified_org_caller_not_origin` |
+| R1b | `serve.rs:675` +1/−1 | leg 2's own named assert, `:1768:5` | same |
+| R1c | `serve.rs:700` +1/−1 | leg 3's own named assert, `:1825:5` | same |
+| R2 | `call.rs:185-187` +3/−1 | the Row-2 named assert, `:2076:5` | `live_same_org_streaming_through_the_facade` |
+| R3 | `call.rs:245` +1/−3 | the Row-3a named panic, `:2200:18` | `revocation_surfaces_as_final_admission_denied_item` |
+
+Four weakenings (precondition fixed / window widened / assertion relaxed /
+witness deleted): **NONE** applies to any cycle. Pre-receipt development
+disclosure (strengthening): the Row-1 witness's first instrument kept one
+shared `converge` precondition and R1a's flip reddened that
+(`:1691:9`, "precondition: the grantee privately resolved the B-owned provider
+for customer.read.stream"); before any receipt was taken the instrument was
+tightened — each leg's resolution folded into its own named assertion (scope
+grew; nothing fixed, widened, relaxed, or deleted) — and the suite re-ran
+14/14 green at `0c580ca46`.
+
+### 7.5 §6 corrections required by the reviewer's adjudications
+
+1. **§6.3's stage-exit overstatement — corrected inline above** (the packet
+   §5 matrix: 13/16 landed at Stage 3 close, the three granted-provider ×
+   streaming-shape cells probe-only / F-S3R-1; now 16/16 via §7.2's Row-1
+   witness).
+2. **The `619:5`/`632:5` panic-quote question — no correction required**
+   (packet §7.1: both correct at their stated bases; the reviewer retired the
+   suspicion).
+3. **F-S3.1-2's wording — untouched** (packet §6.1 adjudication: accurate and
+   already executed; the Stage-4 rider stays out of this round's scope).
+
+### 7.6 The estate at this round's head (executed)
+
+All with `--retries 0 --no-tests=fail`, `CARGO_PROFILE_DEV_DEBUG=0
+CARGO_PROFILE_TEST_DEBUG=0`, from `net/crates/net/`:
+
+| leg | command | result |
+|---|---|---|
+| org_streaming | the plan's named command (`-p net-mesh-sdk`, the named SDK feature set, `--test org_streaming`) | **14/14**, exit 0 |
+| SDK org estate | same base, `--lib --test org_exact_sensing` | **338/338**, exit 0 |
+| org_rpc_streaming | `cargo tf --retries 0 --test org_rpc_streaming` | **42/42**, exit 0 |
+| fmt | `cargo fmt -p net-mesh-sdk -- --check` | exit 0 |
+| probe | `cd guards/org_api_probe && cargo metadata --locked --format-version 1` / `cargo check --locked` | exit 0 / 0 (the pin UNCHANGED — Row 3's premise is behavioural, and this round made no production change) |
+
+### 7.7 Never executed here (complete)
+
+- Any host but this Windows workstation; any feature set other than the named
+  SDK set for the org_streaming runs and the `cargo tf` alias set for
+  `org_rpc_streaming`.
+- `ci.yml`/nextest floor re-pins and `check-witness-results.py --self-test` /
+  `check-roster.py` (Main's by contract); CI itself (branch unpushed).
+- The `webrtc`/wasm graphs, the benches, and every binding (Stage 4's rows by
+  contract). The F-S1R-2 rider and the F-S3.1-2 Stage-4 rider (out of scope
+  by the brief).
+- A wire-level duplicate-CANCEL-frame count (§6.1's stated limit, unchanged).
+- Row 2's short-default clause over a second LIVE wire call — impossible by
+  construction while the bridges pin `q1_defaults()` (§7.2's disclosure);
+  executed at the fold seam over the facade call's real captured payload.
+- `cargo fmt`/clippy/doc beyond `cargo fmt -p net-mesh-sdk -- --check`.
