@@ -164,6 +164,91 @@ source-established label and its receipt per the brief's evidence rules.
   count, the dataforts-ENABLED build of the ungated declarations,
   typecheck:tests/release/check-ts-consumer.sh/CI themselves, non-Windows
   hosts.
+- **2026-09-22, S4Python verified (executed).** Landed at `9ea5e64c8`
+  (impl, 9 files, explicit-path staged) + `S4_PYTHON.md` §8.4 (F16 19255 B,
+  sha `5b5a1554…`). The §4.4 Python surface (sync + `AsyncOrgClient` call
+  verbs, serve verbs, `org_err_to_py`), the F-S3.1-2 handler-drop contract
+  documented at every handler surface (incl. the `.pyi`
+  `__HANDLER_DROP_CONTRACT` entry and the `task.cancel()` propagation
+  statement). 15 witnesses in `test_org_live.py`: the 12 shape×form×auth
+  matrix (live two-mesh round trips asserting BOTH call and serve sides
+  with verified-caller attribution) + the task-cancel witness (green at
+  its three contract links) + the midstream org-vocabulary witness + the
+  preserved unary cross-org cell. Suite estate: 1029 items = 1003 passed
+  + 26 environmental skips + 0 failures across the four sub-clamp parts
+  (A=39, B=37, C=881+26 incl. stub_drift + pyi_coverage parity, D=46
+  inline: org_live 15/15 + a2a 3/3 + history 1/1 + paid 27/27); fmt
+  FMT_CHECK_CLEAN. Both REQUIRED inverse receipts closed with
+  byte-identical restores (`1b5b47fb…`/`baf55ea3…`) and verbatim RED lines
+  (§8.4.4). **Coordinator spot-check SCR-PYTHON reproduced Inverse-1
+  (executed):** the `handle_error` org arm weakened to
+  `rpc_error_to_pyerr` → rebuilt extension → **`FAILED
+  test_streaming_midstream_error_surfaces_the_org_vocabulary` (1 failed,
+  2 passed, 22.32s)** → restore → clean rebuild → **3/3 green** (the
+  pytest `-q` progress verdicts `... [100%]`, no failure markers; the
+  summary line lost to the known teardown exit-hang — recorded exactly).
+  CI: the Python roster gate (9 base names + the `[same_org|granted]`
+  parametrize literals = the 15 items) pinned beside the pytest step.
+  **Incidents (self-reported, credited):** (1) F-S4Python-1 — the
+  over-broad `Stop-Process` filter (`*venv*python*`) killed 3 owner
+  hermes-agent processes (PIDs 180852/188612/156196) while clearing a
+  stuck interpreter holding `_net*.pyd` (os error 32); handling correct
+  (immediate self-report, explicit non-restart, filter narrowed to one
+  exact path); coordinator scan: the 3 PIDs gone, 5 pre-incident
+  survivors alive, 3 supervisor-respawned processes confirmed; the
+  lesson recorded as binding (a process-kill filter matches ONE exact
+  executable path); (2) the artifact-loss disclosure (§8.4.6) — a
+  whole-`target` deletion between parts C and D destroyed the junitxml
+  durability copies (the four part xmls + the two inverse-leg xmls);
+  the evidence substance survives verbatim in transcripts + pinned
+  sections; the deletion's actor is unidentified from coordinator-side
+  evidence (facts recorded, no attribution). Delivery-loss adaptation:
+  its background jobs vanished undelivered twice mid-run — receipts made
+  durable in-tree (junitxml) from then on.
+- **2026-09-22, S4Browser verified (executed).** Landed at `92b0fdb55`
+  (44 files, +24728/−110) + its record pair (`S4_BROWSER.md` §8.3 + the
+  harness `RTCB_CERTUTIL` fix). The Q5 matrix over the leaf/wasm/TS
+  surfaces: leaf org authority + streaming codec + four-shape lifecycle +
+  the wasm/TS org surfaces + the leader proxy + the 37-witness browser
+  stage. **Final estate: 37/37 org matrix on REAL Chromium AND REAL
+  Firefox (0 failed each); chromium `--stage7` 95/95 and firefox 84/84
+  (one disclosed estate flake — `stage5_two_tabs_share_one_identity_with-
+  out_eviction` — green on immediate re-run); leaf native 388/388
+  (org_authority 22, nrpc_streaming_parity 21, org_streaming_lifecycle
+  29, lib 236 + unchanged suites); browser-ts 728/728 (44 new); the 3
+  org_parity_* instruments (8/8 codec rows byte-identical both directions
+  + both cross-verify quintuples).** The REQUIRED receipt R-1 landed
+  exact: the leader-proxy attribution flip reddens
+  `org_leader_proxied_call_preserves_follower_attribution` verbatim
+  (`payload pairing: false`, follower-2 holding follower-1's payload
+  under the concurrent schedule) → restored `912d70aa…` → green
+  (`payload pairing: true`); + 6 native inverse receipts + 2 fix
+  receipts + 3 green-under-own-inverse attempts filed as F-S4B-8
+  (closed). Findings F-S4B-1..9 in its report — **F-S4B-7 (the core
+  `CallOptions::deadline` never terminates an in-flight native stream)
+  recorded as a named core-side finding worth its own witness, out of
+  row, not gating**; the receiver-side parking rename
+  (`…each_grant_releases_exactly_its_chunks` replacing `…the_pump…`)
+  documented as strengthened. Root causes found-and-fixed on record (six
+  named fixes): the two ICE config defects; `leaf/src/node.rs:3182`
+  dropping inbound membership Subscribes (16 witnesses blocked, one
+  line); credit-parking; the wasm window-parse + WouldBlock trampolines;
+  the caller deadline sweep; the retirement promise settlement; plus the
+  Firefox certutil regression. A hang (`org_tab_teardown_retires_with-
+  out_resume`) caught by the tail-freeze rule and closed in triage. CI:
+  the Q5 pin landed (37 names + `org_stream.rs` roster source + floors
+  95/84 + leaf-native 388 + org suite floors 22/21/29 + npm 728). The
+  7 same-subject ICE commits are owner-ruled fine (disclosed, accepted).
+  Never-executed boundary (stated by the lane): WebKit and
+  Firefox+`--stage7` (CI-recorded only); routable-topology Chromium; any
+  non-Windows host (`run.sh`/nftables); a wire-level duplicate-CANCEL
+  count (defended at the logical level — exactly one retirement); the
+  single-copy codec extraction into `net-mesh-wire` (F-S4B-5 — the
+  in-tree second copy stands, pinned by interop + byte-identity
+  instruments); the F-S4B-7 core-side witness; CI's own checks.
+  **Coordinator spot-check of R-1 pending** (the repro anchor delivered:
+  `leaf/src/leader.rs` `ProxyClient::on_message`'s `ProxyBody::Reply` arm,
+  +9/−1 — its cycle runs as its own job).
 - **2026-09-22, S4Go verified (executed).** Landed at `14d5b87f3` (impl, the
   one-commit ABI set) + `314b30152` (record; `S4_GO.md` F16-ledgered). The
   §4.4 Go/C surface over the frozen seams: the shared handle module

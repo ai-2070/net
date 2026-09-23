@@ -1552,3 +1552,47 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   `f58cd20ec`. Six spot-check invocation classes (all harness-side)
   resolved into binding-lane rules — chief among them: mutate an ASSERTED
   field, and rebuild the consumer artifact inside the cycle.
+
+- 2026-09-22, **Wave 1 lane 3/4 closed: `S4Python` verified (executed)** at
+  `9ea5e64c8` + `S4_PYTHON.md` §8.4: the §4.4 Python surface (sync +
+  `AsyncOrgClient` call verbs, serve verbs, `org_err_to_py`), the F-S3.1-2
+  contract at every handler surface (incl. the `.pyi` entry + the
+  `task.cancel()` propagation statement), 15 witnesses (the 12
+  shape×form×auth matrix asserting call AND serve with verified-caller
+  attribution + the cancel witness at its three contract links + the
+  midstream org-vocabulary witness + the preserved unary). Suite estate
+  1029 items = 1003 passed + 26 env-skips + 0 failures across the four
+  sub-clamp parts. Both REQUIRED receipts closed (byte-identical restores
+  `1b5b47fb…`/`baf55ea3…`, verbatim RED lines §8.4.4); the coordinator's
+  SCR-PYTHON spot-check reproduced Inverse-1 (the org-arm weakening
+  reddens `test_streaming_midstream_error_surfaces_the_org_vocabulary`
+  explicitly → restored rebuild 3/3 green). CI: the 15-item roster gate
+  pinned beside the pytest step. Findings: F-S4Python-1 (the over-broad
+  process-kill filter killing 3 owner hermes processes — self-reported,
+  handled correct, the exact-path lesson binding) + the artifact-loss
+  disclosure (the junitxml durability copies lost to a whole-`target`
+  deletion between parts C and D; evidence substance survives in
+  transcripts + pinned sections; actor unidentified, facts recorded).
+- 2026-09-22, **Wave 1 lane 4/4 closed: `S4Browser` verified (executed)** at
+  `92b0fdb55` + its record pair: the Q5 matrix over leaf/wasm/TS (the org
+  authority + streaming codec + four-shape lifecycle + the wasm/TS org
+  surfaces + the leader proxy + the 37-witness browser stage). **37/37 org
+  matrix on REAL Chromium AND REAL Firefox (0 failed); chromium --stage7
+  95/95 + firefox 84/84 (one disclosed flake, green on immediate re-run);
+  leaf native 388/388; browser-ts 728/728; the 3 org_parity_* instruments
+  byte-identical both directions.** REQUIRED receipt R-1 landed exact (the
+  leader-proxy attribution flip → `payload pairing: false` verbatim →
+  restored `912d70aa…` → green) + 6 native receipts + 2 fix receipts + 3
+  green-under-own-inverse attempts (F-S4B-8, closed). Six named root-cause
+  fixes on record (the two ICE config defects; `node.rs:3182`'s Subscribe
+  drop — 16 witnesses blocked on one line; credit-parking; the wasm
+  window-parse; the deadline sweep; the retirement promise settlement) +
+  the Firefox certutil repair. F-S4B-7 (the core `CallOptions::deadline`
+  never terminates an in-flight native stream) recorded as a named
+  core-side finding worth its own witness — not gating. CI: the Q5 pin
+  (37 names + floors 95/84 + leaf-native 388 + org suites 22/21/29 + npm
+  728) landed at `e684edc48`. The 7 same-subject ICE commits are
+  owner-ruled fine (disclosed, accepted). Coordinator spot-check of R-1
+  pending as its own cycle (the repro anchor delivered). **Wave 1 is
+  closed at 4/4; Wave 2 (pure SDKs per Q6 + the cross-language vectors)
+  is the next dispatch.**
