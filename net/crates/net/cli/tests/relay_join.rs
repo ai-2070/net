@@ -95,9 +95,13 @@ impl Fx {
     }
 
     fn up(&self, extra: &[&str]) -> Up {
+        self.up_on("127.0.0.1:0", extra)
+    }
+
+    fn up_on(&self, bind: &str, extra: &[&str]) -> Up {
         let mut child = self
             .base()
-            .args(["--output", "ndjson", "up", "--bind", "127.0.0.1:0"])
+            .args(["--output", "ndjson", "up", "--bind", bind])
             .args(extra)
             .arg("--state-dir")
             .arg(self.state())
@@ -285,4 +289,70 @@ fn relay_flags_are_validated_before_any_effect() {
         "--relay requires --enroll: {out:?}"
     );
     assert!(!fx.state().exists());
+}
+
+/// Poll `node status` until the joined node's live link satisfies `done`.
+fn wait_for_link(fx: &Fx, what: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..180 {
+        last = fx.json(&["node", "status"]);
+        if done(&last["link"]) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("{what}: link never got there; last status {last}");
+}
+
+/// Direct dead, relay alive, and the operator restarts — on a NEW port, so
+/// only its fresh relay registration can lead back to it. The running
+/// device notices the old session went silent and reattaches through the
+/// relay by itself: the registration id is derived from the operator's
+/// entity (stable), the relay re-points it at the new endpoint, and the
+/// operator's persisted Noise key still matches the bundle.
+#[test]
+fn a_device_reattaches_through_the_relay_after_the_operator_restarts() {
+    let (_relay, relay) = start_relay();
+    let operator = Fx::new();
+    let op = operator.up(&["--enroll", "--no-port-mapping", "--relay", &relay]);
+    let dead = dead_port();
+    let created = operator.json(&["invite", "create", "--addr", &dead]);
+    let agent = Fx::new();
+    let joined = agent.json(&["join", &token_of(&created), "--yes"]);
+    assert_eq!(joined["attach_path"], "relay", "{joined}");
+    let node = agent.up(&[]);
+    assert_eq!(node.ready["joined"]["path"], "relay", "{}", node.ready);
+
+    let old_bind = op.ready["bind"].clone();
+    drop(op);
+    let moved = format!("127.0.0.1:{}", free_mesh_port());
+    let op = operator.up_on(
+        &moved,
+        &["--enroll", "--no-port-mapping", "--relay", &relay],
+    );
+    assert_ne!(op.ready["bind"], old_bind, "the operator moved");
+    assert_eq!(
+        op.ready["enrollment"]["relay_state"], "registered",
+        "{}",
+        op.ready
+    );
+
+    let status = wait_for_link(&agent, "reattach through the relay", |l| {
+        l["reattaches"].as_u64() >= Some(1) && l["attached"] == true
+    });
+    assert_eq!(status["link"]["path"], "relay", "{status}");
+    drop(node);
+    drop(op);
+}
+
+/// A loopback port free for both UDP (the mesh) and TCP (enrollment, which
+/// shares an explicit bind port).
+fn free_mesh_port() -> u16 {
+    loop {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }

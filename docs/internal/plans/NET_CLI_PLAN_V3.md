@@ -2266,10 +2266,41 @@ neither was a usable trigger.
 - ~~The restart deferral after nRPC use.~~
 - Standalone subnet join by an already-connected device (V3-2 task 3).
 - Organization enrollment.
-- Unverified: re-attach through the relay after an operator restart. The
-  device's bundle holds the relay registration id from issuance; whether it
-  still routes to a restarted operator is untested (the natsim relay job
-  covers first join only, and the re-attach witness is direct).
+- ~~Unverified: re-attach through the relay after an operator restart.~~
+  Closed by the next receipt.
+
+#### Relay re-attach after an operator restart (receipt, 2026-09-24)
+
+A device attached only through the blind relay (the direct contact is dead)
+reattaches by itself after the operator restarts **on a new port**, so only
+the fresh relay registration can lead back to it. Three properties make this
+work:
+- the registration id is derived from the operator's entity, so it is stable;
+- the relay's re-registration re-points the id at the new endpoint, and
+  forwarding resolves the endpoint on every packet;
+- the persisted Noise key still matches the bundle.
+
+No production change was needed: the supervisor's re-attach already tries
+direct, then relay.
+
+Witness: `relay_join::a_device_reattaches_through_the_relay_after_the_operator_restarts`
+(`reattaches >= 1`, `path == "relay"`).
+
+Inverse mutations:
+- The relay keeps the old endpoint on re-registration: RED at the reattach
+  assertion.
+- The supervisor's re-attach drops the relay: RED at the reattach assertion.
+- Not counted: salting the registration id per process, and dropping the
+  relay from `attach_contact` altogether. Both went RED, but at the first
+  `join`, so they do not isolate the restart path. The id's stability is
+  structural: the relay computes it from the entity.
+
+Noted, not changed: the relay allows 64 channels per registration by default
+(`max_channels_per_registration`), and idle channels expire after 120 s. With
+many devices behind one operator, a mass reattach after a restart could hit
+that cap. This is relay sizing, and it applies to first joins too.
+
+Regressions: `relay_join` 5/5; `net-cli` clippy is clean.
 
 ### V3-2A — channel-scoped invitation, join and credential lifecycle
 
