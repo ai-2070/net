@@ -436,6 +436,65 @@ impl ScriptOrg {
             Err(_) => fail(format!("the {tab} page did not answer a step in 60 s")),
         }
     }
+
+    /// Issue TWO steps to two tabs CONCURRENTLY: both are sent before
+    /// either result is awaited, so both calls are live at once — the
+    /// concurrent-schedule requirement (a cross-delivery flip needs
+    /// TWO live pendings to have a reachable forbidden outcome;
+    /// sequentially each tab holds one pending and every such flip is
+    /// green-under-own-inverse).
+    pub async fn run_pair(
+        &mut self,
+        tab_a: &str,
+        mut step_a: Value,
+        tab_b: &str,
+        mut step_b: Value,
+    ) -> (StepResult, StepResult) {
+        let id_a = self.next_id;
+        self.next_id += 1;
+        let id_b = self.next_id;
+        self.next_id += 1;
+        step_a["id"] = json!(id_a);
+        step_b["id"] = json!(id_b);
+        let Some(tx_a) = self.tabs.get(tab_a).cloned() else {
+            return (
+                fail(format!("no such tab {tab_a}")),
+                fail(format!("no such tab {tab_b}")),
+            );
+        };
+        let Some(tx_b) = self.tabs.get(tab_b).cloned() else {
+            return (
+                fail(format!("no such tab {tab_b}")),
+                fail(format!("no such tab {tab_b}")),
+            );
+        };
+        let (done_a, rx_a) = oneshot::channel();
+        let (done_b, rx_b) = oneshot::channel();
+        if tx_a.send((step_a, done_a)).await.is_err() {
+            return (
+                fail(format!("the {tab_a} page queue is gone")),
+                fail(format!("the {tab_b} page queue is gone")),
+            );
+        }
+        if tx_b.send((step_b, done_b)).await.is_err() {
+            return (
+                fail(format!("the {tab_b} page queue is gone")),
+                fail(format!("the {tab_b} page queue is gone")),
+            );
+        }
+        // BOTH are already in flight; only now await either result.
+        let ra = match tokio::time::timeout(Duration::from_secs(60), rx_a).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => fail(format!("the {tab_a} step was dropped")),
+            Err(_) => fail(format!("the {tab_a} page did not answer a step in 60 s")),
+        };
+        let rb = match tokio::time::timeout(Duration::from_secs(60), rx_b).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => fail(format!("the {tab_b} step was dropped")),
+            Err(_) => fail(format!("the {tab_b} page did not answer a step in 60 s")),
+        };
+        (ra, rb)
+    }
 }
 
 /// The ANCHOR's own view of this peer — appended to a connect
@@ -3640,11 +3699,21 @@ async fn leader_attribution(
     );
     let payload1 = b"follower-1-payload".to_vec();
     let payload2 = b"follower-2-payload".to_vec();
-    let r1 = script
-        .run(TAB_FOLLOW1, unary_step(N_LEADER, &payload1, &creds))
-        .await;
-    let r2 = script
-        .run(TAB_FOLLOW2, unary_step(N_LEADER, &payload2, &creds))
+    // THE DISCRIMINATING SCHEDULE: BOTH followers' calls are held IN
+    // FLIGHT CONCURRENTLY — both issued before either result is read,
+    // so the proxy holds two live pendings and a reply landing on the
+    // OTHER pending is REACHABLE (the broadcast cross-delivery swap).
+    // Sequential calls leave each tab holding exactly one pending and
+    // every cross-delivery flip's forbidden outcome is unreachable —
+    // green-under-own-inverse (the witness-discipline failure this
+    // schedule fixes).
+    let (r1, r2) = script
+        .run_pair(
+            TAB_FOLLOW1,
+            unary_step(N_LEADER, &payload1, &creds),
+            TAB_FOLLOW2,
+            unary_step(N_LEADER, &payload2, &creds),
+        )
         .await;
 
     let reply1 = r1.reply.as_deref().map(crate::unhex).unwrap_or_default();
@@ -3671,7 +3740,9 @@ async fn leader_attribution(
             && pairing_ok
             && provider_pairing,
         format!(
-            "roles={roles:?} (one leader); TWO followers, DISTINCT payloads: follower1 got {} \
+            "roles={roles:?} (one leader); TWO followers, DISTINCT payloads held IN FLIGHT \
+             CONCURRENTLY (both issued before either result was read — the discriminating \
+             schedule): follower1 got {} \
              (want {}; {}) and follower2 got {} (want {}; {}) — each callback received EXACTLY \
              its own call's result (payload pairing: {pairing_ok}); provider records pair payload1 \
              with caller={:?} and payload2 with caller={:?} (per-follower attribution preserved \
@@ -4007,9 +4078,19 @@ async fn handler_completion_after_retirement(
         .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
         .unwrap_or_default();
     let late_hex: Vec<String> = vec![hex(b"hr-late-0"), hex(b"hr-late-1")];
-    let late_attempted = late_hex.iter().all(|h| entry_items.contains(h));
+    // At least ONE late send was attempted (the handler reached its
+    // late phase — a handler that never sends late would vacuously
+    // pass the discard clause) and NONE of them were delivered. The
+    // exact late-send count is surface-behavior (a send that never
+    // settles stops the handler at that chunk), not the property.
+    let late_attempted = late_hex.iter().any(|h| entry_items.contains(h));
     let return_discarded = late_hex.iter().all(|h| !items.contains(h));
-    let pre_exact = items == vec![hex(b"hr-0"), hex(b"hr-1")];
+    // The pre-retirement chunk IDENTITIES only (membership, not
+    // equality): how many pre chunks landed before the cancel is
+    // timing, not the property — a late/return chunk here IS.
+    let pre_only = items
+        .iter()
+        .all(|i| i == &hex(b"hr-0") || i == &hex(b"hr-1"));
     let wire_flat = after_pair == mid_pair;
 
     ledger.record(
@@ -4020,7 +4101,7 @@ async fn handler_completion_after_retirement(
             && retirement_first
             && late_attempted
             && return_discarded
-            && pre_exact,
+            && pre_only,
         format!(
             "handler deferred 800ms past its call's retirement (caller cancelled mid-stream: \
              {}); the retirement observable fired ({retired_at:?}) and the handler's completion \
@@ -4030,8 +4111,8 @@ async fn handler_completion_after_retirement(
              retirement' is unreachable until the surface settles send/close on retirement; the \
              handler's late sends were ATTEMPTED ({late_attempted}, entry items={entry_items:?}) \
              and DISCARDED — its return chunks never reached the caller (return-discarded=\
-             {return_discarded}, caller items={items:?} = the exact pre-retirement set: \
-             {pre_exact}); wire capture note: the anchor's per-pair ROUTED counter is flat \
+             {return_discarded}, caller items={items:?} = the pre-retirement set only: \
+             {pre_only}); wire capture note: the anchor's per-pair ROUTED counter is flat \
              throughout ({pair_before} -> {mid_pair} -> {after_pair}) because the org relay rides \
              session streams, not routed transits — the discard's wire-side evidence is the \
              attempted-vs-delivered pair above (the F-S3.1-2 level as an executable \
