@@ -1227,7 +1227,7 @@ const DIRECT_ATTACH_WAIT: Duration = Duration::from_secs(5);
 /// authenticates the contact's key end-to-end on either path. Returns the path
 /// used (`"direct"` or `"relay"`).
 pub(crate) async fn attach_contact(
-    mesh: &net_sdk::Mesh,
+    node: &Arc<net::adapter::net::MeshNode>,
     contact: &MeshContact,
     wait: Duration,
 ) -> Result<&'static str, String> {
@@ -1241,11 +1241,11 @@ pub(crate) async fn attach_contact(
         };
         let attempt = tokio::time::timeout(
             budget,
-            mesh.connect_via(&addr.to_string(), &contact.noise_pubkey, contact.node_id),
+            node.connect_via(addr, &contact.noise_pubkey, contact.node_id),
         )
         .await;
         match attempt {
-            Ok(Ok(())) => return Ok("direct"),
+            Ok(Ok(_)) => return Ok("direct"),
             Ok(Err(e)) => direct_failure = Some(format!("direct {addr}: {e}")),
             Err(_) => direct_failure = Some(format!("direct {addr}: timed out")),
         }
@@ -1259,13 +1259,11 @@ pub(crate) async fn attach_contact(
             .map_err(|e| format!("resolve {}: {e}", relay.endpoint.as_str()))?
             .next()
             .ok_or_else(|| format!("{} does not resolve", relay.endpoint.as_str()))?;
-        let via = mesh
-            .node()
+        let via = node
             .relay_bind(addr, relay.registration)
             .await
             .map_err(|e| e.to_string())?;
-        mesh.node()
-            .connect_via_endpoint(via, &contact.noise_pubkey, contact.node_id)
+        node.connect_via_endpoint(via, &contact.noise_pubkey, contact.node_id)
             .await
             .map(drop)
             .map_err(|e| e.to_string())
@@ -1311,7 +1309,7 @@ pub(crate) async fn attach_mesh(
         .await
         .map_err(|e| e.to_string())?;
     mesh.start();
-    match attach_contact(&mesh, contact, wait).await {
+    match attach_contact(mesh.node(), contact, wait).await {
         Ok(path) => Ok((mesh, path)),
         Err(e) => {
             let _ = mesh.shutdown().await;

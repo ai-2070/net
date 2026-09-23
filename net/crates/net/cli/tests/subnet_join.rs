@@ -101,9 +101,13 @@ impl Fx {
     }
 
     fn up(&self, extra: &[&str]) -> Up {
+        self.up_on("127.0.0.1:0", extra)
+    }
+
+    fn up_on(&self, bind: &str, extra: &[&str]) -> Up {
         let mut child = self
             .base()
-            .args(["--output", "ndjson", "up", "--bind", "127.0.0.1:0"])
+            .args(["--output", "ndjson", "up", "--bind", bind])
             .args(extra)
             .arg("--state-dir")
             .arg(self.state())
@@ -444,4 +448,91 @@ fn wait_past(at: u64) {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// A loopback port free for both UDP (the mesh) and TCP (enrollment, which
+/// shares an explicit bind port), so a restarted operator keeps the address
+/// its bundle contact names.
+fn free_mesh_port() -> u16 {
+    loop {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+/// Poll the device's `node status` until its live link satisfies `done`.
+fn wait_for_link(fx: &Fx, what: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..180 {
+        last = fx.json(&["node", "status"]);
+        if done(&last["link"]) {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!("{what}: link never got there; last status {last}");
+}
+
+/// A joined node keeps itself attached: after the operator restarts, it
+/// reattaches and presents its subnet credentials again (admission is per
+/// session and the restarted verifier holds none); and a node that starts
+/// while the operator is down comes up unattached and attaches once the
+/// operator is back — nobody touches the device in either case.
+#[test]
+fn a_joined_node_reattaches_and_is_readmitted_without_being_touched() {
+    let operator = Fx::new();
+    let keys = operator.tmp.path().join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let (_root, _root_hex, issuer, grant) = ceremony(&keys);
+    let bind = format!("127.0.0.1:{}", free_mesh_port());
+    let op_args = [
+        "--enroll",
+        "--no-port-mapping",
+        "--subnet-issuer-grant",
+        grant.to_str().unwrap(),
+        "--subnet-issuer-key",
+        issuer.to_str().unwrap(),
+    ];
+
+    let op = operator.up_on(&bind, &op_args);
+    let created = operator.json(&["invite", "create", "--subnet", "3.7"]);
+    let agent = Fx::new();
+    let joined = agent.json(&["join", &token_of(&created), "--yes"]);
+    assert_eq!(joined["subnet"]["credentials"], "installed", "{joined}");
+    let node = agent.up(&[]);
+    assert_eq!(
+        node.ready["joined"]["subnet"]["admitted"], true,
+        "{}",
+        node.ready
+    );
+
+    // A: the operator restarts under the running device — with the same
+    // Noise key its bundle pinned, or the device could never reach it.
+    let pinned = op.ready["public_key"].clone();
+    drop(op);
+    let op = operator.up_on(&bind, &op_args);
+    assert_eq!(
+        op.ready["public_key"], pinned,
+        "the Noise key survives restart"
+    );
+    let status = wait_for_link(&agent, "reattach after operator restart", |l| {
+        l["readmissions"].as_u64() >= Some(1)
+            && l["attached"] == true
+            && l["subnet_admitted"] == true
+    });
+    assert_eq!(status["link"]["path"], "direct", "{status}");
+    drop(node);
+
+    // B: the device starts while the operator is down.
+    drop(op);
+    let node = agent.up(&[]);
+    assert_eq!(node.ready["joined"]["attached"], false, "{}", node.ready);
+    let _op = operator.up_on(&bind, &op_args);
+    wait_for_link(&agent, "attach once the operator is back", |l| {
+        l["attached"] == true && l["subnet_admitted"] == true
+    });
+    drop(node);
 }

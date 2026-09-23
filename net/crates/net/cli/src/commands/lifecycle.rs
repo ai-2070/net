@@ -63,7 +63,7 @@ pub(crate) const NODE_SUBDIR: &str = "node";
 const LOCK_FILE: &str = "up.lock";
 const CONTROL_FILE: &str = "control.json";
 const SECRETS_MAGIC: [u8; 4] = *b"NMUP";
-const SECRETS_VERSION: u16 = 2;
+const SECRETS_VERSION: u16 = 3;
 const SECRETS_CHECKSUM: &str = "net-mesh up node secrets v1";
 const CONTROL_MAGIC: [u8; 4] = *b"NMCT";
 const MAX_CONTROL_FRAME: usize = 16 * 1024;
@@ -103,77 +103,184 @@ fn subnet_renew_at(set: &net::adapter::net::subnet::SubnetCredentialSet) -> u64 
     leaf.not_after.saturating_sub((lifetime / 3).max(1))
 }
 
-/// Keep a joined node's subnet admission alive: renew the leaf before it
-/// expires (from the node that issued it), persist it through the join
-/// store (which re-checks it against the signed offer), and re-present it.
-fn spawn_subnet_renewal(
-    joined: Arc<parking_lot::Mutex<Option<net_sdk::enrollment::device::DeviceJoin>>>,
+/// First retry pause after a failed (re-)attach; doubles up to the max.
+const REATTACH_MIN: Duration = Duration::from_secs(1);
+const REATTACH_MAX: Duration = Duration::from_secs(30);
+/// How often the link supervisor looks at the session.
+const LINK_CHECK: Duration = Duration::from_secs(1);
+
+/// Live link of a joined node to the node it enrolled with, as `node
+/// status` reports it. The start report is only the first attempt.
+#[derive(Clone, Debug, Default, Serialize)]
+struct JoinedLink {
+    attached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    /// Successful attaches after the start attempt.
+    reattaches: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subnet_admitted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subnet_detail: Option<String>,
+    /// Subnet presentations admitted by the supervisor (each new session,
+    /// or a renewed leaf) — not counting the start presentation.
+    readmissions: u64,
+}
+
+type SharedJoin = Arc<parking_lot::Mutex<Option<net_sdk::enrollment::device::DeviceJoin>>>;
+
+/// Keep a joined node attached and, for a subnet join, admitted:
+/// - no live session with the enrolling node (never attached, or the
+///   old session went silent, e.g. after that node restarted):
+///   attach again, direct first
+///   then relay, backing off `REATTACH_MIN`..`REATTACH_MAX`;
+/// - a session the subnet credentials were not presented on (admission
+///   binds to the session): present them;
+/// - a leaf near expiry: renew it from the issuing node, persist it through
+///   the join store (which re-checks it against the signed offer) and
+///   present it.
+///
+/// Stops when the join is gone (shutdown) or has left: `leave` erases the
+/// bundle, so there is nothing to attach with.
+fn spawn_joined_link(
+    joined: SharedJoin,
     node: Arc<net::adapter::net::MeshNode>,
-    issuer_node: u64,
+    link: Arc<parking_lot::Mutex<JoinedLink>>,
+    mut presented: Option<u64>,
+    mut present_retry_at: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut backoff = REATTACH_MIN;
+        let mut renew_retry_at = 0u64;
         loop {
             let snapshot = {
                 let guard = joined.lock();
-                guard.as_ref().and_then(|j| {
-                    let offer = j.invite().subnet()?.clone();
-                    let set = j.bundle()?.subnet_credentials()?;
-                    Some((
-                        j.identity().clone(),
-                        j.invite().clone(),
-                        offer,
-                        subnet_renew_at(&set),
-                    ))
-                })
+                guard
+                    .as_ref()
+                    .filter(|j| j.left_at().is_none())
+                    .and_then(|j| {
+                        let bundle = j.bundle()?;
+                        let subnet = j
+                            .invite()
+                            .subnet()
+                            .cloned()
+                            .zip(bundle.subnet_credentials());
+                        Some((
+                            bundle.contact().clone(),
+                            j.identity().clone(),
+                            j.invite().clone(),
+                            subnet,
+                        ))
+                    })
             };
-            let Some((identity, invite, offer, renew_at)) = snapshot else {
+            let Some((contact, identity, invite, subnet)) = snapshot else {
                 return;
             };
-            let wait = renew_at
-                .saturating_sub(now_unix())
-                .max(SUBNET_RENEW_MIN_INTERVAL);
-            tokio::time::sleep(Duration::from_secs(wait)).await;
-            let renewed = net_sdk::enrollment::renew::request_subnet_renewal(
-                &node,
-                issuer_node,
-                &identity,
-                &invite,
-                SUBNET_RENEW_WAIT,
-            )
-            .await;
-            let set = match renewed {
-                Ok(set) => set,
-                Err(e) => {
-                    tracing::warn!(error = %e, "subnet leaf renewal failed; retrying");
-                    tokio::time::sleep(SUBNET_RENEW_RETRY).await;
-                    continue;
+            // A dead peer keeps its table entry for a long while (so a
+            // healed partition recovers without a handshake); a session
+            // silent past the timeout is what says this link is down.
+            let session = node
+                .peer_session_id(contact.node_id)
+                .filter(|_| !node.peer_session_is_silent(contact.node_id));
+            let Some(session) = session else {
+                {
+                    // Admission is per session: none holds without one.
+                    let mut l = link.lock();
+                    l.attached = false;
+                    if l.subnet_admitted.is_some() {
+                        l.subnet_admitted = None;
+                    }
                 }
+                match super::enrollment::attach_contact(&node, &contact, JOIN_ATTACH_WAIT).await {
+                    Ok(path) => {
+                        let mut l = link.lock();
+                        l.attached = true;
+                        l.path = Some(path.to_string());
+                        l.detail = None;
+                        l.reattaches += 1;
+                        backoff = REATTACH_MIN;
+                        presented = None;
+                        present_retry_at = 0;
+                    }
+                    Err(e) => {
+                        link.lock().detail = Some(format!("attach failed: {e}"));
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(REATTACH_MAX);
+                    }
+                }
+                continue;
             };
-            let persisted = joined
-                .lock()
-                .as_mut()
-                .map(|j| j.replace_subnet_credentials(&set));
-            match persisted {
-                Some(Ok(())) => {}
-                Some(Err(e)) => {
-                    tracing::warn!(error = %e, "renewed subnet credentials refused; retrying");
-                    tokio::time::sleep(SUBNET_RENEW_RETRY).await;
-                    continue;
-                }
-                None => return,
-            }
-            if let Err(e) = node
-                .present_subnet_credentials(
-                    issuer_node,
-                    &set,
-                    offer.scope.clone(),
-                    offer.rights,
-                    JOIN_ATTACH_WAIT,
-                )
-                .await
             {
-                tracing::warn!(error = %e, "re-presenting renewed subnet credentials failed");
+                let mut l = link.lock();
+                if !l.attached {
+                    l.attached = true;
+                    l.detail = None;
+                }
             }
+            if let Some((offer, mut set)) = subnet {
+                let now = now_unix();
+                let mut fresh = false;
+                if now >= subnet_renew_at(&set) && now >= renew_retry_at {
+                    renew_retry_at = now + SUBNET_RENEW_MIN_INTERVAL;
+                    match net_sdk::enrollment::renew::request_subnet_renewal(
+                        &node,
+                        contact.node_id,
+                        &identity,
+                        &invite,
+                        SUBNET_RENEW_WAIT,
+                    )
+                    .await
+                    {
+                        Ok(renewed) => match joined
+                            .lock()
+                            .as_mut()
+                            .map(|j| j.replace_subnet_credentials(&renewed))
+                        {
+                            Some(Ok(())) => {
+                                set = renewed;
+                                fresh = true;
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!(error = %e, "renewed subnet credentials refused");
+                                renew_retry_at = now + SUBNET_RENEW_RETRY.as_secs();
+                            }
+                            None => return,
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, "subnet leaf renewal failed; retrying");
+                            renew_retry_at = now + SUBNET_RENEW_RETRY.as_secs();
+                        }
+                    }
+                }
+                if fresh || (presented != Some(session) && now >= present_retry_at) {
+                    let admitted = node
+                        .present_subnet_credentials(
+                            contact.node_id,
+                            &set,
+                            offer.scope.clone(),
+                            offer.rights,
+                            JOIN_ATTACH_WAIT,
+                        )
+                        .await;
+                    let mut l = link.lock();
+                    l.subnet_admitted = Some(admitted.is_ok());
+                    match admitted {
+                        Ok(_) => {
+                            presented = Some(session);
+                            l.subnet_detail = None;
+                            l.readmissions += 1;
+                        }
+                        Err(e) => {
+                            presented = None;
+                            present_retry_at = now_unix() + SUBNET_RENEW_RETRY.as_secs();
+                            l.subnet_detail = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(LINK_CHECK).await;
         }
     })
 }
@@ -334,7 +441,7 @@ pub(crate) fn random<const N: usize>() -> Result<[u8; N], CliError> {
     Ok(b)
 }
 
-// ---- node secrets (generated identity seed + generated PSK) ----------------
+// ---- node secrets (identity seed, PSK, issuer seed, Noise key) -------------
 
 pub(crate) struct NodeSecrets {
     seed: [u8; 32],
@@ -344,6 +451,10 @@ pub(crate) struct NodeSecrets {
     pub(crate) issuer: Option<[u8; 32]>,
     /// Fixed enrollment port chosen on first `up --enroll` with port 0.
     pub(crate) enroll_port: Option<u16>,
+    /// The node's Noise static private key, generated on first start and
+    /// reused: invites and bundles pin its public half, so a fresh key per
+    /// start would strand every node that enrolled here.
+    noise: Option<[u8; 32]>,
 }
 
 impl Drop for NodeSecrets {
@@ -355,15 +466,19 @@ impl Drop for NodeSecrets {
         if let Some(issuer) = self.issuer.as_mut() {
             zeroize_slice(issuer);
         }
+        if let Some(noise) = self.noise.as_mut() {
+            zeroize_slice(noise);
+        }
     }
 }
 
-// v2: MAGIC | u16 2 | seed[32] | u8 has_psk [32] | u8 has_issuer [32] |
-//     u16 enroll_port (0 = none) | blake3 checksum[32].
+// v3: MAGIC | u16 3 | seed[32] | u8 has_psk [32] | u8 has_issuer [32] |
+//     u16 enroll_port (0 = none) | u8 has_noise [32] | blake3 checksum[32].
+// v2 (still read): v3 without the Noise key.
 // v1 (still read): MAGIC | u16 1 | seed[32] | u8 has_psk [32] | checksum[32].
 impl NodeSecrets {
     fn encode(&self) -> ScrubbedBytes {
-        let mut out = Vec::with_capacity(4 + 2 + 32 + 33 + 33 + 2 + 32);
+        let mut out = Vec::with_capacity(4 + 2 + 32 + 33 + 33 + 2 + 33 + 32);
         out.extend_from_slice(&SECRETS_MAGIC);
         out.extend_from_slice(&SECRETS_VERSION.to_le_bytes());
         out.extend_from_slice(&self.seed);
@@ -377,6 +492,13 @@ impl NodeSecrets {
             }
         }
         out.extend_from_slice(&self.enroll_port.unwrap_or(0).to_le_bytes());
+        match &self.noise {
+            Some(bytes) => {
+                out.push(1);
+                out.extend_from_slice(bytes);
+            }
+            None => out.push(0),
+        }
         let sum = blake3::derive_key(SECRETS_CHECKSUM, &out);
         out.extend_from_slice(&sum);
         ScrubbedBytes::new(out)
@@ -400,6 +522,7 @@ impl NodeSecrets {
             psk: None,
             issuer: None,
             enroll_port: None,
+            noise: None,
         };
         secrets.seed.copy_from_slice(&body[6..38]);
         let mut pos = 38;
@@ -422,12 +545,15 @@ impl NodeSecrets {
         secrets.psk = take32(&mut pos).ok_or_else(corrupt)?;
         match version {
             1 => {}
-            2 => {
+            2 | 3 => {
                 secrets.issuer = take32(&mut pos).ok_or_else(corrupt)?;
                 let port = body.get(pos..pos + 2).ok_or_else(corrupt)?;
                 let port = u16::from_le_bytes([port[0], port[1]]);
                 secrets.enroll_port = (port != 0).then_some(port);
                 pos += 2;
+                if version == 3 {
+                    secrets.noise = take32(&mut pos).ok_or_else(corrupt)?;
+                }
             }
             _ => return Err(corrupt()),
         }
@@ -469,6 +595,7 @@ fn acquire(dir: &Path, generate_psk: bool) -> Result<(EnrollmentStorage, NodeSec
                 psk: if generate_psk { Some(random()?) } else { None },
                 issuer: None,
                 enroll_port: None,
+                noise: Some(random()?),
             };
             let storage = EnrollmentStorage::create(dir, secrets.encode().as_slice()).map_err(
                 |e| match e {
@@ -804,6 +931,8 @@ struct ControlState {
     /// `leave` records the departure through it.
     /// `None` inside once the node has shut down and released it.
     joined: Option<Arc<parking_lot::Mutex<Option<net_sdk::enrollment::device::DeviceJoin>>>>,
+    /// Live link of a joined node (see [`spawn_joined_link`]).
+    link: Option<Arc<parking_lot::Mutex<JoinedLink>>>,
     /// This node's mesh, for operations that reach other nodes.
     node: Arc<net::adapter::net::MeshNode>,
 }
@@ -967,6 +1096,7 @@ async fn control_session(
                 "state": if draining { "draining" } else { "ready" },
                 "node": state.report,
                 "subnet_expires_at": subnet_expires_at,
+                "link": state.link.as_ref().map(|l| l.lock().clone()),
             })
         }
         "shutdown" => {
@@ -1200,6 +1330,17 @@ pub async fn run_up(
         .await
         .map_err(|e| generic(format!("node state task failed: {e}")))??;
     let lifetime_lock = hold_lifetime_lock(&dir)?;
+    // State from before v3 has no Noise key: commit one before any bind.
+    let noise_key = match secrets.noise {
+        Some(key) => key,
+        None => {
+            secrets.noise = Some(random()?);
+            storage
+                .replace(secrets.encode().as_slice())
+                .map_err(|e| storage_error(&dir, e))?;
+            secrets.noise.unwrap_or_default()
+        }
+    };
     let mut joined = if has_join {
         use net_sdk::enrollment::device::{DeviceJoin, DeviceJoinError};
         let join = DeviceJoin::open(&join_dir).map_err(|e| match e {
@@ -1286,6 +1427,7 @@ pub async fn run_up(
     zeroize_slice(&mut psk);
     let mut builder = built?
         .identity(identity.clone())
+        .noise_static_key(net::adapter::net::NoiseStaticKey::from_private(noise_key))
         .try_port_mapping(port_mapping);
     if let Some(issuer) = &subnet_issuer {
         let authority = issuer.grant().authority.clone();
@@ -1322,7 +1464,7 @@ pub async fn run_up(
         Some((join, bundle)) => {
             let c = bundle.contact();
             let (path, detail) =
-                match super::enrollment::attach_contact(&mesh, c, JOIN_ATTACH_WAIT).await {
+                match super::enrollment::attach_contact(mesh.node(), c, JOIN_ATTACH_WAIT).await {
                     Ok(path) => (Some(path.to_string()), None),
                     Err(e) => (None, Some(format!("attach failed: {e}"))),
                 };
@@ -1436,24 +1578,52 @@ pub async fn run_up(
     .await?;
     drop(control_text);
 
+    let joined_contact_node = joined
+        .as_ref()
+        .and_then(|j| j.bundle())
+        .map(|b| b.contact().node_id);
     // Persist a leaf renewed at start (re-checked against the signed offer).
     if let (Some(join), Some(set)) = (joined.as_mut(), renewed_at_start.as_ref()) {
         if let Err(e) = join.replace_subnet_credentials(set) {
             tracing::warn!(error = %e, "renewed subnet credentials were not persisted");
         }
     }
-    let subnet_issuer_node = joined
-        .as_ref()
-        .filter(|j| j.invite().subnet().is_some())
-        .and_then(|j| j.bundle())
-        .map(|b| b.contact().node_id);
     let joined = joined.map(|j| Arc::new(parking_lot::Mutex::new(Some(j))));
-    let subnet_renewal = match (&joined, subnet_issuer_node) {
-        (Some(joined), Some(issuer_node)) => Some(spawn_subnet_renewal(
-            joined.clone(),
-            mesh.node().clone(),
-            issuer_node,
-        )),
+    // Seed the live link from the start attempt, then keep it up.
+    let start_link = report.joined.as_ref().map(|j| {
+        let subnet = j.subnet.as_ref();
+        JoinedLink {
+            attached: j.attached,
+            path: j.path.clone(),
+            detail: j.detail.clone(),
+            reattaches: 0,
+            readmissions: 0,
+            subnet_admitted: subnet.and_then(|s| s["admitted"].as_bool()),
+            subnet_detail: subnet.and_then(|s| s["detail"].as_str().map(str::to_string)),
+        }
+    });
+    let link = start_link.map(|l| Arc::new(parking_lot::Mutex::new(l)));
+    let joined_link = match (&joined, &link, &joined_contact_node) {
+        (Some(joined), Some(link), Some(contact_node)) => {
+            let admitted = link.lock().subnet_admitted;
+            // Presented at start: on the current session if admitted; a
+            // refused presentation is retried later, not immediately.
+            let presented = match admitted {
+                Some(true) => mesh.node().peer_session_id(*contact_node),
+                _ => None,
+            };
+            let present_retry_at = match admitted {
+                Some(false) => now_unix() + SUBNET_RENEW_RETRY.as_secs(),
+                _ => 0,
+            };
+            Some(spawn_joined_link(
+                joined.clone(),
+                mesh.node().clone(),
+                link.clone(),
+                presented,
+                present_retry_at,
+            ))
+        }
         _ => None,
     };
     let state_ctl = Arc::new(ControlState {
@@ -1461,6 +1631,7 @@ pub async fn run_up(
         draining: AtomicBool::new(false),
         enroll: enrollment.as_ref().map(|e| e.context()),
         joined: joined.clone(),
+        link: link.clone(),
         node: mesh.node().clone(),
     });
     let (stop_tx, mut stop_rx) = mpsc::channel(1);
@@ -1491,7 +1662,7 @@ pub async fn run_up(
     }
     let stopped = tokio::time::timeout(MESH_SHUTDOWN_TIMEOUT, mesh.shutdown()).await;
     let _ = std::fs::remove_file(&control_path);
-    if let Some(task) = subnet_renewal {
+    if let Some(task) = joined_link {
         task.abort();
     }
     // Release the join's storage lock before the lifetime lock, even if a
@@ -1531,6 +1702,9 @@ struct StatusView {
     /// A joined node's current subnet leaf expiry (moves on renewal).
     #[serde(skip_serializing_if = "Option::is_none")]
     subnet_expires_at: Option<u64>,
+    /// A joined node's live link to the node it enrolled with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link: Option<serde_json::Value>,
 }
 
 async fn observe(state: &Path) -> Result<StatusView, CliError> {
@@ -1541,6 +1715,7 @@ async fn observe(state: &Path) -> Result<StatusView, CliError> {
         node,
         detail: detail.map(str::to_string),
         subnet_expires_at: None,
+        link: None,
     };
     Ok(match probe(&dir)? {
         Liveness::Absent => view(
@@ -1560,6 +1735,7 @@ async fn observe(state: &Path) -> Result<StatusView, CliError> {
                 let s = reply["state"].as_str().unwrap_or("unknown").to_string();
                 StatusView {
                     subnet_expires_at: reply["subnet_expires_at"].as_u64(),
+                    link: Some(reply["link"].clone()).filter(|l| !l.is_null()),
                     ..view(&s, node, None)
                 }
             }
@@ -1750,17 +1926,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn node_state_v2_round_trips_and_v1_state_still_reads() {
-        let v2 = NodeSecrets {
+    fn node_state_v3_round_trips_and_v1_v2_state_still_reads() {
+        let v3 = NodeSecrets {
             seed: [1; 32],
             psk: Some([2; 32]),
             issuer: Some([3; 32]),
             enroll_port: Some(7443),
+            noise: Some([6; 32]),
         };
-        let back = NodeSecrets::decode(v2.encode().as_slice()).unwrap();
+        let back = NodeSecrets::decode(v3.encode().as_slice()).unwrap();
         assert_eq!(
-            (back.seed, back.psk, back.issuer, back.enroll_port),
-            ([1; 32], Some([2; 32]), Some([3; 32]), Some(7443))
+            (
+                back.seed,
+                back.psk,
+                back.issuer,
+                back.enroll_port,
+                back.noise
+            ),
+            (
+                [1; 32],
+                Some([2; 32]),
+                Some([3; 32]),
+                Some(7443),
+                Some([6; 32])
+            )
+        );
+
+        // A v2 snapshot (before the Noise key was kept) still reads, keyless.
+        let mut v2 = SECRETS_MAGIC.to_vec();
+        v2.extend_from_slice(&2u16.to_le_bytes());
+        v2.extend_from_slice(&[7; 32]);
+        v2.push(0);
+        v2.push(1);
+        v2.extend_from_slice(&[8; 32]);
+        v2.extend_from_slice(&9000u16.to_le_bytes());
+        let sum = blake3::derive_key(SECRETS_CHECKSUM, &v2);
+        v2.extend_from_slice(&sum);
+        let old = NodeSecrets::decode(&v2).unwrap();
+        assert_eq!(
+            (old.seed, old.psk, old.issuer, old.enroll_port, old.noise),
+            ([7; 32], None, Some([8; 32]), Some(9000), None)
         );
 
         // A v1 snapshot (before enrollment fields existed) is still accepted.
@@ -1778,7 +1983,7 @@ mod tests {
         );
 
         // Any altered byte is refused rather than repaired.
-        let mut bad = v2.encode().as_slice().to_vec();
+        let mut bad = v3.encode().as_slice().to_vec();
         bad[40] ^= 1;
         assert!(NodeSecrets::decode(&bad).is_err());
     }

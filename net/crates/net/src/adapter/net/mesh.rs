@@ -2882,6 +2882,44 @@ pub(crate) enum IdentityProofReply {
     },
 }
 
+/// A caller-owned Noise static private key (X25519). The public half is
+/// derived from it, so a stored key can never be paired with the wrong
+/// public key. `Debug` is redacted; the bytes are wiped on drop.
+#[derive(Clone)]
+pub struct NoiseStaticKey([u8; 32]);
+
+impl NoiseStaticKey {
+    /// Wrap a stored private key.
+    pub fn from_private(private: [u8; 32]) -> Self {
+        Self(private)
+    }
+
+    /// The public key peers pin (what a contact's `noise_pubkey` names).
+    pub fn public_key(&self) -> [u8; 32] {
+        *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(self.0)).as_bytes()
+    }
+
+    fn keypair(&self) -> StaticKeypair {
+        StaticKeypair::from_keys(self.0, self.public_key())
+    }
+}
+
+impl std::fmt::Debug for NoiseStaticKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NoiseStaticKey(<redacted>)")
+    }
+}
+
+impl Drop for NoiseStaticKey {
+    fn drop(&mut self) {
+        // Volatile writes so the wipe is not optimised away.
+        for byte in self.0.iter_mut() {
+            // SAFETY: `byte` is a valid, aligned, exclusive reference.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+    }
+}
+
 /// Configuration for a MeshNode.
 #[derive(Debug, Clone)]
 pub struct MeshNodeConfig {
@@ -3111,6 +3149,11 @@ pub struct MeshNodeConfig {
     /// its apply reports success. `None` keeps floors in memory only — a
     /// restart then forgets them until they are redelivered.
     pub subnet_floor_store: Option<std::path::PathBuf>,
+    /// The node's Noise static key. `None` (the default) generates a fresh
+    /// one per [`MeshNode::new`]; a node whose key other nodes pin (e.g. an
+    /// enrolling node, whose invites and bundles name it) must supply its
+    /// stored key, or every restart strands the nodes that pinned it.
+    pub static_key: Option<NoiseStaticKey>,
     /// Visibility applied on publish when a channel has **no**
     /// registered config in the local
     /// [`ChannelConfigRegistry`]. Defaults to
@@ -3463,6 +3506,7 @@ impl MeshNodeConfig {
             subnet_attachment: None,
             subnet_control_channel: None,
             subnet_floor_store: None,
+            static_key: None,
             default_visibility: Visibility::Global,
             unregistered_channels: UnregisteredChannelPolicy::default(),
             min_announce_interval: Duration::from_secs(10),
@@ -3831,6 +3875,13 @@ impl MeshNodeConfig {
     /// [`Self::subnet_floor_store`].
     pub fn with_subnet_floor_store(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.subnet_floor_store = Some(dir.into());
+        self
+    }
+
+    /// Use this stored Noise static key instead of a fresh one — see
+    /// [`Self::static_key`].
+    pub fn with_static_key(mut self, key: NoiseStaticKey) -> Self {
+        self.static_key = Some(key);
         self
     }
 
@@ -13472,7 +13523,10 @@ impl MeshNode {
             }
         };
 
-        let static_keypair = StaticKeypair::generate();
+        let static_keypair = match &config.static_key {
+            Some(key) => key.keypair(),
+            None => StaticKeypair::generate(),
+        };
 
         let socket = NetSocket::with_config(config.bind_addr, config.socket_buffers)
             .await
@@ -19932,6 +19986,19 @@ impl MeshNode {
     /// proofs by construction.
     pub fn peer_session_id(&self, node_id: u64) -> Option<u64> {
         self.peers.get(&node_id).map(|p| p.session.session_id())
+    }
+
+    /// Has the session with `node_id` gone without authenticated traffic
+    /// (heartbeats included) for `session_timeout`? `false` when there is no
+    /// session. A failed peer keeps its table entry for a long while (so a
+    /// healed partition recovers without a handshake) and the failure
+    /// detector only declares it failed after several timeouts; this is the
+    /// earlier "the far end has gone quiet" signal a caller that owns the
+    /// link can act on, e.g. by re-handshaking.
+    pub fn peer_session_is_silent(&self, node_id: u64) -> bool {
+        self.peers
+            .get(&node_id)
+            .is_some_and(|p| p.session.is_timed_out(self.config.session_timeout))
     }
 
     /// A pending unary call must not outlive its receive incarnation. The
@@ -53436,6 +53503,33 @@ mod heartbeat_aead_tests {
             ),
             RoutedRotationOutcome::DeferBusy,
             "an application stream still defers",
+        );
+    }
+
+    /// A stored Noise static key survives a rebuild: nodes built from the
+    /// same key present the same public key (what contacts pin); a node
+    /// without one gets a fresh key per build. The key never prints.
+    #[tokio::test]
+    async fn a_stored_noise_key_is_kept_across_builds() {
+        let key = NoiseStaticKey::from_private([0x42; 32]);
+        let build = |key: Option<NoiseStaticKey>| async move {
+            let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [7u8; 32]);
+            if let Some(key) = key {
+                cfg = cfg.with_static_key(key);
+            }
+            MeshNode::new(EntityKeypair::generate(), cfg).await.unwrap()
+        };
+        let first = build(Some(key.clone())).await;
+        let second = build(Some(key.clone())).await;
+        assert_eq!(first.public_key(), &key.public_key());
+        assert_eq!(second.public_key(), first.public_key());
+        let fresh_a = build(None).await;
+        let fresh_b = build(None).await;
+        assert_ne!(fresh_a.public_key(), fresh_b.public_key());
+        assert_eq!(format!("{key:?}"), "NoiseStaticKey(<redacted>)");
+        assert!(
+            !first.peer_session_is_silent(0x1234),
+            "no session, not silent"
         );
     }
 

@@ -121,6 +121,7 @@ pub struct MeshBuilder {
     subnet_attachment: Option<crate::subnet::TopologySubnetId>,
     subnet_control_channel: Option<net::adapter::net::ChannelName>,
     subnet_floor_store: Option<std::path::PathBuf>,
+    static_key: Option<net::adapter::net::NoiseStaticKey>,
     subnet_exports: Vec<crate::subnet::NamedSubnetExport>,
     /// RTC transport for this node (R6): a browser-facing anchor
     /// has to be constructible from the SDK, or the SDK's own
@@ -157,6 +158,7 @@ impl MeshBuilder {
             subnet_attachment: None,
             subnet_control_channel: None,
             subnet_floor_store: None,
+            static_key: None,
             subnet_exports: Vec::new(),
             #[cfg(feature = "webrtc")]
             rtc: None,
@@ -265,6 +267,14 @@ impl MeshBuilder {
     /// verifier can never re-admit a subject it removed.
     pub fn subnet_floor_store(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.subnet_floor_store = Some(dir.into());
+        self
+    }
+
+    /// Keep this node's Noise static key across restarts: nodes that pinned
+    /// it (e.g. from an invite or bundle this node issued) can then reach it
+    /// again. Without it every build generates a fresh key.
+    pub fn noise_static_key(mut self, key: net::adapter::net::NoiseStaticKey) -> Self {
+        self.static_key = Some(key);
         self
     }
 
@@ -455,6 +465,9 @@ impl MeshBuilder {
         }
         if let Some(dir) = self.subnet_floor_store {
             config = config.with_subnet_floor_store(dir);
+        }
+        if let Some(key) = self.static_key {
+            config = config.with_static_key(key);
         }
         // Review-10 P1-6: the checked map is the NODE's, resolved and
         // frozen by `MeshNode::new`. Pushing the entries into the config
