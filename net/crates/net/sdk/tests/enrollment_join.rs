@@ -83,6 +83,7 @@ fn invite_for(
             relay: None,
             enrollment_key: key,
             subnet: None,
+            org: None,
             relations: vec![Relation::Mesh],
             intended_subject: None,
             policy: InvitationPolicy::with_options(

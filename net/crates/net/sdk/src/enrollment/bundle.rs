@@ -222,6 +222,9 @@ pub struct MembershipBundle {
     contact: MeshContact,
     /// Encoded `SubnetCredentialSet` for [`Relation::Subnet`] invites.
     subnet: Option<Vec<u8>>,
+    /// The org-root-signed membership certificate for [`Relation::Org`]
+    /// invites.
+    org: Option<net::adapter::net::behavior::org::OrgMembershipCert>,
 }
 
 impl core::fmt::Debug for MembershipBundle {
@@ -232,6 +235,7 @@ impl core::fmt::Debug for MembershipBundle {
             .field("trust_domain", &self.psk.trust_domain())
             .field("contact", &self.contact)
             .field("subnet", &self.subnet.is_some())
+            .field("org", &self.org.is_some())
             .finish()
     }
 }
@@ -244,7 +248,22 @@ impl MembershipBundle {
             psk,
             contact,
             subnet: None,
+            org: None,
         }
+    }
+
+    /// Attach the device's org membership certificate (for an org invite).
+    pub fn with_org_membership(
+        mut self,
+        cert: net::adapter::net::behavior::org::OrgMembershipCert,
+    ) -> Self {
+        self.org = Some(cert);
+        self
+    }
+
+    /// The delivered org membership certificate, if this bundle carries one.
+    pub fn org_membership(&self) -> Option<&net::adapter::net::behavior::org::OrgMembershipCert> {
+        self.org.as_ref()
     }
 
     /// Attach the device's subnet credential set (for a subnet invite).
@@ -283,6 +302,13 @@ impl MembershipBundle {
             Some(set) => {
                 out.push(1);
                 push_lp(&mut out, set);
+            }
+            None => out.push(0),
+        }
+        match &self.org {
+            Some(cert) => {
+                out.push(1);
+                push_lp(&mut out, &cert.to_bytes());
             }
             None => out.push(0),
         }
@@ -341,6 +367,20 @@ impl MembershipBundle {
             }
             _ => return Err(BundleError::Malformed("bad subnet flag")),
         };
+        let org = match r
+            .take_arr::<1>()
+            .ok_or(BundleError::Malformed("truncated bundle"))?[0]
+        {
+            0 => None,
+            1 => Some(
+                net::adapter::net::behavior::org::OrgMembershipCert::from_bytes(
+                    r.take_lp()
+                        .ok_or(BundleError::Malformed("truncated bundle"))?,
+                )
+                .map_err(|_| BundleError::Malformed("bad org membership certificate"))?,
+            ),
+            _ => return Err(BundleError::Malformed("bad org flag")),
+        };
         if !r.done() {
             return Err(BundleError::Malformed("trailing bundle bytes"));
         }
@@ -354,6 +394,7 @@ impl MembershipBundle {
                 relay,
             },
             subnet,
+            org,
         })
     }
 
@@ -368,7 +409,12 @@ impl MembershipBundle {
         invite
             .check_trust_domain(self.psk.trust_domain())
             .map_err(|_| BundleError::TrustDomain)?;
-        self.verify_subnet_for(invite, intent)
+        self.verify_subnet_for(invite, intent)?;
+        match (invite.org(), &self.org) {
+            (None, None) => Ok(()),
+            (Some(offer), Some(cert)) if org_cert_matches(offer, intent.subject(), cert) => Ok(()),
+            _ => Err(BundleError::Mismatch("org membership")),
+        }
     }
 
     /// The delivered subnet credentials must be exactly what the signed
@@ -425,6 +471,7 @@ pub struct MembershipIssuer {
     psk: Psk,
     contact: MeshContact,
     subnet: Option<SubnetLeafIssuer>,
+    org: Option<std::sync::Arc<dyn OrgCertSource>>,
 }
 
 /// Delegated subnet leaf issuance for [`Relation::Subnet`] invites: an
@@ -544,7 +591,15 @@ impl MembershipIssuer {
             psk,
             contact,
             subnet: None,
+            org: None,
         }
+    }
+
+    /// Deliver operator-approved org membership certificates for
+    /// [`Relation::Org`] invites.
+    pub fn with_org_certs(mut self, source: std::sync::Arc<dyn OrgCertSource>) -> Self {
+        self.org = Some(source);
+        self
     }
 
     /// Also issue subnet credentials for [`Relation::Subnet`] invites.
@@ -559,6 +614,27 @@ impl MembershipIssuer {
         }
         Ok(())
     }
+}
+
+/// Is `cert` a validly signed membership of exactly the offered org, for
+/// exactly `subject`? (Its validity window is the adopting node's to check,
+/// at adoption and at every use.)
+pub fn org_cert_matches(
+    offer: &super::invite::OrgOffer,
+    subject: &EntityId,
+    cert: &net::adapter::net::behavior::org::OrgMembershipCert,
+) -> bool {
+    cert.org_id == offer.org && &cert.member == subject && cert.verify().is_ok()
+}
+
+/// Where an issuing node finds the membership certificate the operator
+/// signed, with the offline org root, when approving one exact claim.
+pub trait OrgCertSource: Send + Sync + 'static {
+    /// The certificate approved for `claimant`, if any.
+    fn cert_for(
+        &self,
+        claimant: &super::store::Claimant,
+    ) -> Option<net::adapter::net::behavior::org::OrgMembershipCert>;
 }
 
 impl BundleIssuer for MembershipIssuer {
@@ -580,6 +656,17 @@ impl BundleIssuer for MembershipIssuer {
             // honoured; refuse rather than deliver a partial bundle.
             let issuer = self.subnet.as_ref().ok_or(Refusal::Unavailable)?;
             bundle = bundle.with_subnet_credentials(&issuer.issue(offer, intent.subject(), now)?);
+        }
+        if let Some(offer) = invite.org() {
+            // Only the org root signs membership; this node merely delivers
+            // what the operator signed for exactly this claim at approval.
+            let cert = self
+                .org
+                .as_ref()
+                .and_then(|source| source.cert_for(&intent.claimant()))
+                .filter(|cert| org_cert_matches(offer, intent.subject(), cert))
+                .ok_or(Refusal::Unavailable)?;
+            bundle = bundle.with_org_membership(cert);
         }
         Ok(bundle.to_bytes())
     }

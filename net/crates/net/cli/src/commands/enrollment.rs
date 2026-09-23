@@ -789,6 +789,7 @@ impl EnrollContext {
                 relay: self.relay.clone(),
                 enrollment_key: self.key,
                 subnet: subnet.clone(),
+                org: None,
                 relations,
                 intended_subject: intended,
                 policy,

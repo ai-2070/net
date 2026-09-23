@@ -57,6 +57,7 @@ const INTENT_DIGEST_CONTEXT: &str = "net-mesh membership redemption intent v1";
 
 const TAG_MESH: u8 = 1;
 const TAG_SUBNET: u8 = 2;
+const TAG_ORG: u8 = 3;
 
 /// Payload-free invite/intent failures. None echoes bearer material.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -104,8 +105,9 @@ impl From<PolicyError> for InviteError {
 
 /// One independently authorized relation an invitation may grant.
 ///
-/// v1 defines only mesh membership; organization, channel and subnet relations
-/// arrive with their own verifiers and tags. Unknown tags are refused.
+/// Mesh membership, subnet attachment and organization membership are
+/// defined; channel relations arrive with their own verifier and tag.
+/// Unknown tags are refused.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Relation {
@@ -117,6 +119,12 @@ pub enum Relation {
     /// delegated credential set for this device only. Independent of mesh
     /// membership: it grants nothing outside that scope.
     Subnet,
+    /// Membership of one organization, named by the invite's signed
+    /// [`OrgOffer`], delivered as an `OrgMembershipCert` signed by that
+    /// org's root for this device only. Proves belonging only: no dispatcher,
+    /// capability or management right. Always operator-approved, because
+    /// only the offline org root can sign the certificate.
+    Org,
 }
 
 impl Relation {
@@ -124,6 +132,7 @@ impl Relation {
         match self {
             Self::Mesh => TAG_MESH,
             Self::Subnet => TAG_SUBNET,
+            Self::Org => TAG_ORG,
         }
     }
 
@@ -131,6 +140,7 @@ impl Relation {
         match tag {
             TAG_MESH => Some(Self::Mesh),
             TAG_SUBNET => Some(Self::Subnet),
+            TAG_ORG => Some(Self::Org),
             _ => None,
         }
     }
@@ -355,6 +365,55 @@ fn check_subnet_offer(
     Ok(())
 }
 
+/// The organization an invite offers membership of (with [`Relation::Org`]).
+/// Signed with the rest of the invite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrgOffer {
+    /// The organization (its root's public key).
+    pub org: net::adapter::net::behavior::org::OrgId,
+}
+
+fn put_org_offer(out: &mut Vec<u8>, offer: Option<&OrgOffer>) {
+    match offer {
+        Some(o) => {
+            out.push(1);
+            out.extend_from_slice(&o.org.0);
+        }
+        None => out.push(0),
+    }
+}
+
+fn take_org_offer(r: &mut Reader<'_>) -> Result<Option<OrgOffer>, InviteError> {
+    let t = InviteError::Malformed("truncated");
+    match r.take_arr::<1>().ok_or(t.clone())?[0] {
+        0 => Ok(None),
+        1 => Ok(Some(OrgOffer {
+            org: net::adapter::net::behavior::org::OrgId(r.take_arr::<32>().ok_or(t)?),
+        })),
+        _ => Err(InviteError::Malformed("bad org offer flag")),
+    }
+}
+
+/// An org offer exists exactly when the relation set names [`Relation::Org`],
+/// and such an invite always requires operator approval: the certificate is
+/// signed by the offline org root at approval, never by the issuing node.
+fn check_org_offer(
+    relations: &[Relation],
+    offer: Option<&OrgOffer>,
+    mode: ApprovalMode,
+) -> Result<(), InviteError> {
+    let org = relations.contains(&Relation::Org);
+    if org != offer.is_some() {
+        return Err(InviteError::Relations("org relation and offer disagree"));
+    }
+    if org && mode != ApprovalMode::RequireApproval {
+        return Err(InviteError::Relations(
+            "an org relation requires operator approval",
+        ));
+    }
+    Ok(())
+}
+
 /// X25519 Noise static public key of the enrollment responder. The device runs a
 /// PSK-free Noise handshake that authenticates the responder by this key, so a
 /// clean device can reach the issuer before holding the mesh PSK. Not secret.
@@ -384,6 +443,9 @@ pub struct InviteSpec {
     /// The subnet attachment offered; required exactly when `relations`
     /// names [`Relation::Subnet`].
     pub subnet: Option<SubnetOffer>,
+    /// The organization offered; required exactly when `relations` names
+    /// [`Relation::Org`].
+    pub org: Option<OrgOffer>,
     /// Exact authorized relations (canonical order).
     pub relations: Vec<Relation>,
     /// Optional full device identity; `None` makes the link bearer authorization.
@@ -402,6 +464,7 @@ pub struct MembershipInvite {
     relay: Option<RelayLocator>,
     enrollment_key: EnrollmentKey,
     subnet: Option<SubnetOffer>,
+    org: Option<OrgOffer>,
     invitation_id: InvitationId,
     policy: InvitationPolicy,
     intended_subject: Option<EntityId>,
@@ -420,6 +483,7 @@ impl core::fmt::Debug for MembershipInvite {
             .field("endpoint", &self.endpoint.as_ref().map(|e| e.as_str()))
             .field("relay", &self.relay)
             .field("subnet", &self.subnet)
+            .field("org", &self.org)
             .field("enrollment_key", &self.enrollment_key)
             .field("invitation_id", &"<redacted>")
             .field("policy", &self.policy)
@@ -444,6 +508,11 @@ impl MembershipInvite {
             return Err(InviteError::Endpoint("no direct endpoint or relay"));
         }
         check_subnet_offer(&spec.relations, spec.subnet.as_ref())?;
+        check_org_offer(
+            &spec.relations,
+            spec.org.as_ref(),
+            spec.policy.approval_mode(),
+        )?;
         let invitation_id = InvitationId::random().map_err(|_| InviteError::Random)?;
         let mut body = Vec::new();
         body.extend_from_slice(&INVITE_MAGIC);
@@ -453,6 +522,7 @@ impl MembershipInvite {
         put_opt_endpoint(&mut body, spec.endpoint.as_ref());
         put_relay(&mut body, spec.relay.as_ref());
         put_subnet_offer(&mut body, spec.subnet.as_ref());
+        put_org_offer(&mut body, spec.org.as_ref());
         body.extend_from_slice(&spec.enrollment_key.0);
         body.extend_from_slice(invitation_id.as_bytes());
         body.extend_from_slice(&spec.policy.created_at().to_le_bytes());
@@ -482,6 +552,7 @@ impl MembershipInvite {
             relay: spec.relay,
             enrollment_key: spec.enrollment_key,
             subnet: spec.subnet,
+            org: spec.org,
             invitation_id,
             policy: spec.policy,
             intended_subject: spec.intended_subject,
@@ -519,6 +590,7 @@ impl MembershipInvite {
             return Err(InviteError::Endpoint("no direct endpoint or relay"));
         }
         let subnet = take_subnet_offer(&mut r)?;
+        let org = take_org_offer(&mut r)?;
         let enrollment_key = EnrollmentKey(r.take_arr::<32>().ok_or(t.clone())?);
         let invitation_id = InvitationId::from_bytes(r.take_arr::<16>().ok_or(t.clone())?);
         let created = r.take_u64().ok_or(t.clone())?;
@@ -537,6 +609,7 @@ impl MembershipInvite {
         };
         let relations = take_relations(&mut r)?;
         check_subnet_offer(&relations, subnet.as_ref())?;
+        check_org_offer(&relations, org.as_ref(), mode)?;
         if !r.done() {
             return Err(InviteError::Malformed("trailing bytes"));
         }
@@ -553,6 +626,7 @@ impl MembershipInvite {
             relay,
             enrollment_key,
             subnet,
+            org,
             invitation_id,
             policy,
             intended_subject,
@@ -632,6 +706,11 @@ impl MembershipInvite {
     /// The subnet attachment offered, with [`Relation::Subnet`].
     pub fn subnet(&self) -> Option<&SubnetOffer> {
         self.subnet.as_ref()
+    }
+
+    /// The organization offered, with [`Relation::Org`].
+    pub fn org(&self) -> Option<&OrgOffer> {
+        self.org.as_ref()
     }
 
     /// Blind relay to fall back to when the direct endpoint is unreachable.
