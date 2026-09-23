@@ -1,0 +1,37 @@
+net/crates/net/sdk/src/enrollment/bundle.rs
+  s_3f3d4c91f992be::t_1c93b4f14c293c 223-224,234,246,250-265,282-288,328-343,356,370-402,427-520,540,544-549,569-578
+net/crates/net/sdk/src/enrollment/invite.rs
+  s_3f3d4c91f992be::t_1c93b4f14c293c 59,115-119,126,133,295-357,384-386,404,422,446,455,484,521,539,555,632-635
+  s_3f3d4c91f992be::t_1cd5ede65f02d4 636
+net/crates/net/sdk/tests/enrollment_join.rs
+  s_3f3d4c91f992be::t_3c686876eb3881 50
+net/crates/net/sdk/tests/enrollment_redeem.rs
+  s_3f3d4c91f992be::t_3c686876eb3881 140
+net/crates/net/sdk/tests/enrollment_subnet.rs
+  s_3f3d4c91f992be::t_25a52e9f240571 15-16,24-25,67-72,119-122,204-205,212-215,232-236,265-272,293-295
+  s_3f3d4c91f992be::t_47943157b3a18e 1-14,17-23,26-66,73-118,123-203,206-211,216-231,237-264,273-292,296
+net/crates/net/sdk/tests/enrollment_invite.rs
+  s_3f3d4c91f992be::t_3c686876eb3881 31
+net/crates/net/cli/src/commands/enrollment.rs
+  s_3f3d4c91f992be::t_3c686876eb3881 694
+net/crates/net/sdk/tests/enrollment_relay.rs
+  s_3f3d4c91f992be::t_3c686876eb3881 151
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_adf1909819083d 1882-1930
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "82f794e33f23a1939d18e0b6344b2e077d7956d7",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
