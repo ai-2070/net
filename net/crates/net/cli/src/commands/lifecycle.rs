@@ -67,7 +67,15 @@ const SECRETS_VERSION: u16 = 2;
 const SECRETS_CHECKSUM: &str = "net-mesh up node secrets v1";
 const CONTROL_MAGIC: [u8; 4] = *b"NMCT";
 const MAX_CONTROL_FRAME: usize = 16 * 1024;
+/// Client-side bound on an ordinary control exchange.
 const CONTROL_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Server-side bound on one control session. Longer than the client's
+/// ordinary bound so an operation that reaches another mesh node (a floor
+/// readback forward) can finish; loopback-only, authenticated, and bounded
+/// by the session permit pool.
+const CONTROL_SERVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound a caller may ask a forwarded floor readback to wait.
+const MAX_FLOOR_FORWARD_WAIT: Duration = Duration::from_secs(20);
 const CONTROL_MAX_SESSIONS: usize = 8;
 const MESH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on a joined node's first attach. The direct path gets at most
@@ -702,6 +710,85 @@ struct ControlState {
     /// `leave` records the departure through it.
     /// `None` inside once the node has shut down and released it.
     joined: Option<Arc<parking_lot::Mutex<Option<net_sdk::enrollment::device::DeviceJoin>>>>,
+    /// This node's mesh, for operations that reach other nodes.
+    node: Arc<net::adapter::net::MeshNode>,
+}
+
+/// Forward one root-signed floor readback request (built and signed by the
+/// CLI; the root key never reaches this node) to the verifier it names:
+/// answered locally when that is this node, otherwise over this node's own
+/// mesh session, connecting first if needed. Returns the raw attestation;
+/// the CLI decodes and verifies it against its own request, so this node
+/// cannot vouch for anything.
+async fn forward_floor_query(
+    node: &Arc<net::adapter::net::MeshNode>,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    use net::adapter::net::subnet::floor_status::FloorStatusRequest;
+    use net::adapter::net::SubnetFloorQueryError;
+    struct Forward {
+        bytes: Vec<u8>,
+        verifier: net::adapter::net::identity::EntityId,
+        contact: Option<(std::net::SocketAddr, [u8; 32])>,
+        wait: Duration,
+    }
+    let parse = || -> Option<Forward> {
+        let bytes = hex::decode(request["request"].as_str()?).ok()?;
+        let entity: [u8; 32] = hex::decode(request["verifier"].as_str()?)
+            .ok()?
+            .try_into()
+            .ok()?;
+        let addr = request["addr"].as_str().and_then(|a| a.parse().ok());
+        let key = request["noise_pubkey"]
+            .as_str()
+            .and_then(|k| hex::decode(k).ok())
+            .and_then(|k| <[u8; 32]>::try_from(k).ok());
+        let wait = Duration::from_millis(request["wait_ms"].as_u64().unwrap_or(10_000))
+            .min(MAX_FLOOR_FORWARD_WAIT);
+        Some(Forward {
+            bytes,
+            verifier: net::adapter::net::identity::EntityId::from_bytes(entity),
+            contact: addr.zip(key),
+            wait,
+        })
+    };
+    let Some(Forward {
+        bytes,
+        verifier,
+        contact,
+        wait,
+    }) = parse()
+    else {
+        return serde_json::json!({ "error": "malformed floor query" });
+    };
+    if &verifier == node.entity_id() {
+        return match node.answer_subnet_floor_status(&bytes, now_unix()) {
+            Ok(a) => serde_json::json!({ "attestation": hex::encode(a.to_bytes()) }),
+            Err(e) => serde_json::json!({ "refused": format!("subnet:{e}") }),
+        };
+    }
+    let Ok(parsed) = FloorStatusRequest::from_bytes(&bytes) else {
+        return serde_json::json!({ "error": "malformed floor query" });
+    };
+    let target = verifier.node_id();
+    let outcome = tokio::time::timeout(wait, async {
+        if node.peer_session_id(target).is_none() {
+            let (addr, key) = contact.ok_or_else(|| {
+                SubnetFloorQueryError::NoAnswer("no session to the verifier and no contact".into())
+            })?;
+            node.connect_via(addr, &key, target)
+                .await
+                .map_err(|e| SubnetFloorQueryError::NoAnswer(e.to_string()))?;
+        }
+        node.query_subnet_floor_status(target, &parsed, wait).await
+    })
+    .await
+    .unwrap_or_else(|_| Err(SubnetFloorQueryError::NoAnswer("timed out".into())));
+    match outcome {
+        Ok(a) => serde_json::json!({ "attestation": hex::encode(a.to_bytes()) }),
+        Err(SubnetFloorQueryError::Refused(m)) => serde_json::json!({ "refused": m }),
+        Err(e) => serde_json::json!({ "no_answer": e.to_string() }),
+    }
 }
 
 async fn serve_control(
@@ -723,7 +810,7 @@ async fn serve_control(
         tokio::spawn(async move {
             let _permit = permit;
             let _ = tokio::time::timeout(
-                CONTROL_SESSION_TIMEOUT,
+                CONTROL_SERVE_TIMEOUT,
                 control_session(stream, secret, &state, &stop),
             )
             .await;
@@ -781,6 +868,8 @@ async fn control_session(
             state.draining.store(true, Ordering::SeqCst);
             serde_json::json!({ "accepted": true, "incarnation": state.report.incarnation })
         }
+        "subnet_floor_query" if draining => serde_json::json!({ "error": "node is draining" }),
+        "subnet_floor_query" => forward_floor_query(&state.node, &request).await,
         "leave" => match (&state.joined, draining) {
             (_, true) => serde_json::json!({ "error": "node is draining" }),
             (None, false) => serde_json::json!({
@@ -859,6 +948,16 @@ pub(crate) async fn control_call(
     dir: &Path,
     request: serde_json::Value,
 ) -> Result<(ControlFile, serde_json::Value), ControlError> {
+    control_call_within(dir, request, CONTROL_SESSION_TIMEOUT).await
+}
+
+/// [`control_call`] with an explicit bound, for operations that reach
+/// other mesh nodes.
+pub(crate) async fn control_call_within(
+    dir: &Path,
+    request: serde_json::Value,
+    bound: Duration,
+) -> Result<(ControlFile, serde_json::Value), ControlError> {
     let control = read_control_file(dir).ok_or(ControlError::NoControlFile)?;
     let mut secret = [0u8; 32];
     let decoded = hex::decode(&control.secret)
@@ -867,7 +966,7 @@ pub(crate) async fn control_call(
         .map(ScrubbedBytes::new)
         .ok_or(ControlError::NoControlFile)?;
     secret.copy_from_slice(decoded.as_slice());
-    let result = tokio::time::timeout(CONTROL_SESSION_TIMEOUT, async {
+    let result = tokio::time::timeout(bound, async {
         let mut s = TcpStream::connect(("127.0.0.1", control.port))
             .await
             .map_err(|_| ControlError::Unreachable)?;
@@ -1213,6 +1312,7 @@ pub async fn run_up(
         draining: AtomicBool::new(false),
         enroll: enrollment.as_ref().map(|e| e.context()),
         joined: joined.clone(),
+        node: mesh.node().clone(),
     });
     let (stop_tx, mut stop_rx) = mpsc::channel(1);
     let server = tokio::spawn(serve_control(listener, secret, state_ctl.clone(), stop_tx));

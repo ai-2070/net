@@ -109,10 +109,18 @@ pub struct RemoveArgs {
     /// An enforcement point: `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`.
     /// Repeat for each verifier; only these are checked.
     #[arg(long = "verifier", value_name = "CONTACT", required = true)]
+    /// With `--state-dir`, `self` names the operator's own node.
     pub verifiers: Vec<String>,
     /// Mesh PSK (64 hex chars); defaults to the profile `psk_hex`.
-    #[arg(long = "psk-hex", value_name = "HEX")]
+    /// Not needed with `--state-dir`.
+    #[arg(long = "psk-hex", value_name = "HEX", conflicts_with = "state_dir")]
     pub psk_hex: Option<String>,
+    /// Reach the verifiers through this operator's running `up` node (its
+    /// state directory) instead of attaching with the PSK. The requests are
+    /// still signed here and the attestations verified here; the node only
+    /// carries them. `--verifier self` names that node.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
     /// Query each verifier's current state without applying anything.
     #[arg(long)]
     pub dry_run: bool,
@@ -182,7 +190,7 @@ pub async fn run(
         SubnetCommand::Inspect(args) => run_inspect(args, output).await,
         SubnetCommand::Remove(args) => {
             let profile = resolve_profile(config_path, profile_name).await?;
-            run_remove(args, profile.psk_hex, output).await
+            run_remove(args, profile.psk_hex, profile_name, output).await
         }
     }
 }
@@ -222,7 +230,6 @@ async fn ask_verifier(
     minimum_generation: u32,
     wait: std::time::Duration,
 ) -> serde_json::Value {
-    use net::adapter::net::subnet::floor_status::FloorApplyOutcome;
     use net::adapter::net::SubnetFloorQueryError;
     let entity = hex::encode(contact.entity.as_bytes());
     let remote = crate::context::RemoteAttach {
@@ -251,6 +258,81 @@ async fn ask_verifier(
     })
     .await
     .unwrap_or_else(|_| Err(SubnetFloorQueryError::NoAnswer("timed out".into())));
+    classify(&entity, outcome, rights, minimum_generation)
+}
+
+/// Ask one verifier through the operator's own `up` node. The node carries
+/// the already-signed request; the attestation is verified HERE against
+/// this exact request, so the node cannot vouch for anything.
+async fn ask_verifier_via_node(
+    node_dir: &Path,
+    contact: Option<&VerifierContact>,
+    request: &net::adapter::net::subnet::floor_status::FloorStatusRequest,
+    rights: SubnetRights,
+    minimum_generation: u32,
+    wait: std::time::Duration,
+) -> serde_json::Value {
+    use net::adapter::net::subnet::floor_status::FloorStatusAttestation;
+    use net::adapter::net::SubnetFloorQueryError;
+    let entity = hex::encode(request.verifier.as_bytes());
+    let mut call = serde_json::json!({
+        "op": "subnet_floor_query",
+        "verifier": entity,
+        "request": hex::encode(request.to_bytes()),
+        "wait_ms": wait.as_millis() as u64,
+    });
+    if let Some(c) = contact {
+        call["addr"] = serde_json::json!(c.addr.to_string());
+        call["noise_pubkey"] = serde_json::json!(hex::encode(c.noise_pubkey));
+    }
+    let outcome = match super::lifecycle::control_call_within(
+        node_dir,
+        call,
+        wait + std::time::Duration::from_secs(5),
+    )
+    .await
+    {
+        Err(e) => Err(SubnetFloorQueryError::NoAnswer(format!(
+            "operator node: {e}"
+        ))),
+        Ok((_, reply)) => {
+            if let Some(hex_a) = reply["attestation"].as_str() {
+                hex::decode(hex_a)
+                    .ok()
+                    .and_then(|b| FloorStatusAttestation::from_bytes(&b).ok())
+                    .ok_or_else(|| SubnetFloorQueryError::BadAttestation("undecodable".into()))
+                    .and_then(|a| {
+                        a.verify_for(request)
+                            .map(|()| a)
+                            .map_err(|e| SubnetFloorQueryError::BadAttestation(e.to_string()))
+                    })
+            } else if let Some(m) = reply["refused"].as_str() {
+                Err(SubnetFloorQueryError::Refused(m.to_string()))
+            } else {
+                Err(SubnetFloorQueryError::NoAnswer(
+                    reply["no_answer"]
+                        .as_str()
+                        .or_else(|| reply["error"].as_str())
+                        .unwrap_or("no answer")
+                        .to_string(),
+                ))
+            }
+        }
+    };
+    classify(&entity, outcome, rights, minimum_generation)
+}
+
+fn classify(
+    entity: &str,
+    outcome: Result<
+        net::adapter::net::subnet::floor_status::FloorStatusAttestation,
+        net::adapter::net::SubnetFloorQueryError,
+    >,
+    rights: SubnetRights,
+    minimum_generation: u32,
+) -> serde_json::Value {
+    use net::adapter::net::subnet::floor_status::FloorApplyOutcome;
+    use net::adapter::net::SubnetFloorQueryError;
     match outcome {
         Ok(a) => {
             let covers = a.covers(rights, minimum_generation);
@@ -289,6 +371,7 @@ async fn ask_verifier(
 async fn run_remove(
     args: RemoveArgs,
     profile_psk: Option<String>,
+    profile_name: &str,
     output: Option<OutputFormat>,
 ) -> Result<(), CliError> {
     use net::adapter::net::subnet::floor_status::FloorStatusRequest;
@@ -297,15 +380,56 @@ async fn run_remove(
     if args.minimum_generation == 0 {
         return Err(invalid_args("--minimum-generation 0 removes nothing"));
     }
-    let contacts = args
-        .verifiers
-        .iter()
-        .map(|v| parse_verifier(v))
-        .collect::<Result<Vec<_>, _>>()?;
-    let psk_raw = args.psk_hex.or(profile_psk).ok_or_else(|| {
-        invalid_args("the mesh PSK is required to reach verifiers: pass --psk-hex or set the profile psk_hex")
-    })?;
-    let psk = crate::context::parse_psk_hex(&psk_raw)?;
+    let node_dir = match &args.state_dir {
+        Some(dir) => Some(
+            super::lifecycle::state_dir(Some(dir.clone()), profile_name)?
+                .join(super::lifecycle::NODE_SUBDIR),
+        ),
+        None => None,
+    };
+    // `self` (with --state-dir) is the operator's own node: its entity from
+    // its authenticated status, answered locally.
+    let self_entity = if node_dir.is_some() && args.verifiers.iter().any(|v| v == "self") {
+        let (_, reply) = super::lifecycle::control_call(
+            node_dir.as_deref().unwrap_or(Path::new(".")),
+            serde_json::json!({ "op": "status" }),
+        )
+        .await
+        .map_err(|e| crate::error::connection_failure(format!("operator node: {e}")))?;
+        Some(parse_entity_hex(
+            reply["node"]["entity_id"].as_str().unwrap_or_default(),
+        )?)
+    } else {
+        None
+    };
+    // Each verifier: a full contact, or `self` (via the node only).
+    let mut targets: Vec<(
+        net::adapter::net::identity::EntityId,
+        Option<VerifierContact>,
+    )> = Vec::new();
+    for v in &args.verifiers {
+        if v == "self" {
+            let entity = self_entity
+                .clone()
+                .ok_or_else(|| invalid_args("--verifier self needs --state-dir"))?;
+            targets.push((entity, None));
+        } else {
+            let contact = parse_verifier(v)?;
+            targets.push((contact.entity.clone(), Some(contact)));
+        }
+    }
+    let psk = match &node_dir {
+        Some(_) => None,
+        None => {
+            let psk_raw = args.psk_hex.clone().or(profile_psk).ok_or_else(|| {
+                invalid_args(
+                    "the mesh PSK is required to reach verifiers: pass --psk-hex, set the \
+                     profile psk_hex, or go through the operator's node with --state-dir",
+                )
+            })?;
+            Some(crate::context::parse_psk_hex(&psk_raw)?)
+        }
+    };
     let root = load_subnet_key(&args.root_key, args.insecure_permissions).await?;
     let scope = SubnetRef {
         authority: parse_entity_hex(&args.authority)?,
@@ -323,8 +447,8 @@ async fn run_remove(
     )
     .map_err(|e| invalid_args(format!("subject-floor: subnet:{e}")))?;
 
-    let mut rows = Vec::with_capacity(contacts.len());
-    for contact in &contacts {
+    let mut rows = Vec::with_capacity(targets.len());
+    for (verifier, contact) in &targets {
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).map_err(|_| generic("operating-system CSPRNG unavailable"))?;
         let request = FloorStatusRequest::try_issue(
@@ -332,23 +456,38 @@ async fn run_remove(
             scope.clone(),
             args.topology_epoch,
             subject.clone(),
-            contact.entity.clone(),
+            verifier.clone(),
             nonce,
             unix_now(),
             (!args.dry_run).then_some(&floor),
         )
         .map_err(|e| generic(format!("readback request: subnet:{e}")))?;
-        rows.push(
-            ask_verifier(
-                contact,
-                &request,
-                psk,
-                rights,
-                args.minimum_generation,
-                args.wait,
-            )
-            .await,
-        );
+        let row = match (&node_dir, contact, psk) {
+            (Some(dir), contact, _) => {
+                ask_verifier_via_node(
+                    dir,
+                    contact.as_ref(),
+                    &request,
+                    rights,
+                    args.minimum_generation,
+                    args.wait,
+                )
+                .await
+            }
+            (None, Some(contact), Some(psk)) => {
+                ask_verifier(
+                    contact,
+                    &request,
+                    psk,
+                    rights,
+                    args.minimum_generation,
+                    args.wait,
+                )
+                .await
+            }
+            _ => return Err(invalid_args("--verifier self needs --state-dir")),
+        };
+        rows.push(row);
     }
     let applied = rows.iter().filter(|r| r["state"] == "applied").count();
     let complete = !args.dry_run && applied == rows.len();
@@ -364,7 +503,7 @@ async fn run_remove(
             "revision": args.revision,
             "verifiers": rows,
             "applied": applied,
-            "pending": contacts.len() - applied,
+            "pending": targets.len() - applied,
             // True only when EVERY named verifier attested a persisted floor.
             "complete": complete,
             "coverage": "only the named verifiers were checked; any other enforcement point is unknown",

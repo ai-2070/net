@@ -2005,11 +2005,50 @@ Regressions:
 the CLI removal journey runs end to end.
 
 **Still open.**
-- `subnet remove` needs the mesh PSK. The operator supplies it with
-  `--psk-from file:` or `--psk-hex`; a generated PSK is not exported.
+- ~~`subnet remove` needs the mesh PSK.~~ Closed by the next receipt.
 - Standalone subnet join by an already-connected device (V3-2 task 3).
 - Leaf renewal before expiry.
 - Organization enrollment.
+
+#### `subnet remove --state-dir`: removal through the operator's own node (receipt, 2026-09-23)
+
+`subnet remove --state-dir DIR` (which conflicts with `--psk-hex`) reaches
+the verifiers through the operator's running `up` node, over its
+authenticated local control endpoint. No PSK is needed: a PSK that `up`
+generated never leaves the node.
+
+**The CLI still does all the trust work.**
+- It signs the floor and every readback request with the root key, which never
+  reaches the node.
+- It decodes and verifies every returned attestation against its own request
+  (`verify_for`), so the node carries bytes and cannot vouch for anything.
+- `--verifier self` resolves to the node's own entity, taken from its
+  authenticated status.
+
+**The node.** Control op `subnet_floor_query`:
+- The node answers locally when it is the named verifier.
+- Otherwise it connects to the verifier's contact if it has no session, then
+  relays over its own mesh, bounded by at most 20 s.
+- It replies `attestation`, `refused` or `no_answer`.
+- The server-side control session bound rose from 5 s to 30 s so a forward can
+  include a connect. Clients keep the 5 s bound for ordinary ops;
+  `control_call_within` sets a longer one.
+
+Witness: `cli/tests/subnet_join.rs`.
+- The operator runs with a PSK file, used only so a second **in-process**
+  durable verifier can share the mesh. The CLI never receives it.
+- `subnet remove --state-dir … --verifier self --verifier <other>` reports
+  both as `applied`.
+- The other verifier's row carries its own entity, reached by the operator's
+  node connecting first.
+
+Inverse mutation: a forward that never connects is caught.
+
+Not witnessed: the CLI refusing an attestation a *lying* node forged. It
+would take a hostile node, and `verify_for`'s binding and signature checks are
+witnessed at unit level (slice 2).
+
+Regressions: `net-cli` 351/351, and `net-cli` clippy is clean.
 
 ### V3-2A — channel-scoped invitation, join and credential lifecycle
 
