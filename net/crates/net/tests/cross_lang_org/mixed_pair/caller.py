@@ -165,6 +165,7 @@ def main() -> None:
         proc.stdin.flush()
 
         result = proc.stdout.readline().strip()
+        print(f"provider: {result}", flush=True)  # the two-sided line (echo for receipts)
         want = f"RESULT ok calls=1 chunks={len(chunks_expected)}"
         if result != want:
             _fail(f"provider verdict {result!r} != {want!r}")

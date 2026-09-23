@@ -275,6 +275,71 @@ when it lands. The row stays named and executable, gated behind
 `RUN_MIXED_CROSS_PROCESS=1` (the cross-run contract), fail-closed in the
 default estate.
 
+#### 3.3.1 GREEN receipt — the two-sided PASS (round 3, after all three fixes)
+
+The defect chain is three CONSUMER-SIDE lifetime bugs in this lane's harness,
+each root-caused with `R4CoreFix`'s instrumentation and fixed in
+`a919a26f0` (the commit message names all three for the release notes):
+
+1. **Serve-handle RAII** — `provider.py` discarded the
+   `net.serve_org_streaming(...)` return handle; `ServeHandle::Drop`
+   (`mesh_rpc.rs:468`) deregisters the service before the first announcement
+   (the `0 private candidate(s)` starve). Fix: bind the handle for the serve
+   lifetime.
+2. **Teardown race** — the handle's Drop retires LIVE protected streams
+   (§2.2/C9: one CANCEL terminal), so a premature close turned the draining
+   chunk queue into `0x0005` instead of eof across a process boundary. Fix:
+   the `DRAINED` two-sided handshake — the provider sequences teardown AFTER
+   the caller's drain (fail-closed watchdog).
+3. **Double-accept arm** — `caller.py` armed a caller-side `accept()` that
+   never completes (the provider never initiates); the silent `join` timeout
+   left `accept_in_flight` at `start()`, whose dispatch loop is then refused
+   warn-only (zero inbound packets processed). Fix: the connect-only
+   `_handshake`/Go-row shape.
+
+The consumer-side **cross-process harness contract set** (release notes; the
+same documentation class as the F-S3.1-2 handler-drop contract): *bind the
+serve handle for the serve lifetime; sequence teardown after the caller's
+drain; never arm an accept() that cannot complete.*
+
+GREEN — `R4CoreFix` round 3 (clean artifacts, probe-free core,
+`git diff --stat net/crates/net/src/` empty; receipt
+`docs/internal/spikes/org-streaming/r4corefix-row-round3-green.log`):
+
+```
+--- PASS: TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider (19.35s)
+PASS
+ok  	github.com/ai-2070/net/go	19.760s
+```
+
+with the provider's two-sided line `RESULT ok calls=1 chunks=3` (exact-matched
+at `go:711-714` — `Fatalf` otherwise) and every row assertion held on the way:
+chunks byte-for-byte vs `chunks_hex`, `expect_terminal` eof, handler facts ==
+`expect_handler`, and the manifest↔vectors id cross-check. Coordinator re-run
+recorded by Main; this lane's own re-run receipt follows below (the verdict
+line now echoes into both orchestrators' logs for exactly this purpose).
+
+GREEN — this lane's own re-run (`logs/go_mixed_pair_green.log`, the same
+verbatim command at this head, the verdict echo live):
+
+```
+=== RUN   TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider
+provider: handshake done, starting mesh + announce loop
+provider: serving, announcing
+provider: awaiting DRAINED
+    org_streaming_opening_vectors_test.go:712: provider verdict: "RESULT ok calls=1 chunks=3"
+--- PASS: TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider (1.06s)
+PASS
+ok  	github.com/ai-2070/net/go	1.448s
+```
+
+The `awaiting DRAINED` marker shows the round-2 teardown handshake firing and
+completing; the `provider verdict` line is the two-sided `RESULT` captured
+explicitly. Final harness hashes at this receipt: `provider.py`
+`22ce91e04413aa95f9cf266b4044dd7e28462171dbc435eef1c1d3a8492df31b`,
+`caller.py` (post-echo) and `go/org_streaming_opening_vectors_test.go`
+(post-echo) as committed alongside this record.
+
 ## 4. Findings
 
 **F-S4Vectors-1 — RETRACTED (2026-09-23, after `R4CoreFix`'s instrumented-wheel
@@ -306,6 +371,15 @@ names the fixture `streaming_opening_vectors.json` while the dispatch sketch
 said `golden_vectors_streaming.json`; Main ruled the plan's name. The lane used
 `streaming_opening_vectors.json` throughout.
 
+**Findings 7–8 (owner-bound per Main's records; not this lane's to fix):** the
+fail-open pair at the core/binding seam — `MeshNode::start()`'s warn-only
+accept-in-flight refusal (`mesh.rs:24335` region: it rolls back and refuses the
+dispatch loop through `tracing::warn!` alone) and the pyo3 `NetMesh.start()`
+returning `Ok(())` while starting nothing. Both made defect 3 undiagnosable
+without probe instrumentation; escalated by `R4CoreFix` to the compatibility
+ledger. The three consumer-side lifetime defects (§3.3.1) are this lane's
+contract set and are fixed.
+
 Roster corrections found by the rows themselves (the conformance rows caught
 two wrong constants in the lane brief — vocab vectors are 24 not 25, and the
 postcard signature field's length prefix is `0x40` not `0x41`): recorded as
@@ -314,11 +388,10 @@ corrected values with the derivation noted.
 
 ## 5. Never executed here (host/toolchain boundaries, exactly)
 
-- **The mixed pair GREEN**: its red runs (§3.3) were root-caused to a
-  consumer-side serve-handle bug in this lane's harness and fixed; the green
-  co-run against `R4CoreFix`'s rebuilt artifacts is pending their release and
-  its receipt is appended to §3.3 when it lands. The reverse direction (Python
-  caller ↔ Go provider) and the same-org access mode were not executed.
+- **The mixed pair GREEN**: EXECUTED (§3.3.1 — `--- PASS:
+  TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider (19.35s)` +
+  `RESULT ok calls=1 chunks=3`). The reverse direction (Python caller ↔ Go
+  provider) and the same-org access mode were not executed.
 - **Browser/wasm runtimes**: out of this row (S4Browser's tree).
 - **Pure SDK consumers** (`sdk-ts`, `sdk-py`): other Wave-2 lanes; per the
   cross-lane contract these consumers use ONLY the landed binding surfaces.

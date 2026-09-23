@@ -709,6 +709,7 @@ func TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider(t *testing.T) 
 	}
 
 	result := readLine("RESULT")
+	t.Logf("provider verdict: %q", result) // the two-sided line (travels the pipe; echo for receipts)
 	if result != "RESULT ok calls=1 chunks="+strconv.Itoa(sc.ChunkCount) {
 		t.Fatalf("python provider did not confirm the vector pins: %q", result)
 	}
