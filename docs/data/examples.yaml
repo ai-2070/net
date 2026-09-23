@@ -274,3 +274,55 @@ examples:
       expect: "paid task ran once: .*charges=1$"
       timeout_s: 120
       not_wired: {}
+
+  # ------------------------------------------------------- org streaming (S4)
+  #
+  # The C consumer-side cell of the org streaming matrix (the plan's Go/C row:
+  # "the C skill example against the single libnet"): one file serving AND
+  # calling a protected streaming service over the C ABI, linked against ONE
+  # library — every net_org_* / net_rpc_* / net_mesh_* symbol resolves out of
+  # the single libnet. It boots a throwaway cross-org issuance chain with the
+  # in-repo scenario generator (credentials are ISSUED material — the example
+  # mints none of its own), then asserts correlated item delivery, explicit
+  # completion, and handler-side attribution of the VERIFIED caller.
+
+  - id: org-streaming
+    skill: net-event-bus
+    title: Protected org streaming, served and called from C
+    route: mint a throwaway org chain · serve a Granted streaming service · call it cross-org · verified caller attribution at the handler · explicit completion
+    dir: .claude/skills/net-event-bus/examples
+    # Executes: a real two-node live call over loopback UDP. The scenario
+    # generator (cargo run --example gen_org_scenario) issues the throwaway
+    # credentials first — without a Rust toolchain the example fails loudly
+    # rather than printing an unearned ok.
+    level: run
+    files:
+      c: net_org_streaming.c
+    absent:
+      rust: >-
+        The Rust tier's org streaming cells live in the SDK's own live suite
+        (sdk/tests/org_streaming.rs, same-org and granted, all four shapes);
+        a skill example there would duplicate a suite that already owns the
+        fixtures. This example exists because C has no binding test suite —
+        the skill-examples runner is C's consumer-side evidence, and the
+        single-libnet link is exactly what it proves.
+      typescript: >-
+        The Node binding's org verbs are exercised live by the binding's own
+        test suite (bindings/node/test/org_live.test.ts); the C example is
+        not the Node row's evidence.
+      python: >-
+        The Python binding's org verbs are exercised live by the binding's
+        own suite (bindings/python/tests/test_org_live.py); the C example is
+        not the Python row's evidence.
+      go: >-
+        The Go row's live cells are go/org_test.go (the same generated
+        scenario, both authority modes, all four shapes) — a Go skill example
+        would duplicate that suite. C is the surface without one.
+    run:
+      # END-ANCHORED: assert_run matches with grep -qE over a substring, so
+      # "chunks=3" must not be satisfied by "chunks=31".
+      expect: "RESULT ok chunks=3 attribution=verified$"
+      # The first run compiles the scenario generator against the fixtures
+      # feature (warm afterwards); the live call itself is seconds.
+      timeout_s: 900
+      not_wired: {}

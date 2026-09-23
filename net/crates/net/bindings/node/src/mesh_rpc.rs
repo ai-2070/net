@@ -107,6 +107,65 @@ fn nrpc_err_from_inner(err: InnerRpcError) -> Error {
     }
 }
 
+/// Map an inner [`InnerRpcError`] to a napi `Error` carrying the **org**
+/// wire vocabulary — the error path for handles opened by the org verbs
+/// (`OrgClient.callStreamingBytes` etc., §4.4).
+///
+/// The `*_bytes_deadline` seams return the EXISTING raw handles ("no new
+/// stream wrapper per binding"), so a midstream error VALUE lands here
+/// rather than in the facade's `map_rpc_error`. This mirrors that mapping
+/// — an admission denial is status `0x0009` carrying the single coarse
+/// reason byte as its body — and renders through the ONE
+/// `OrgSdkError::to_wire()` vocabulary, so the strings an org handle throws
+/// are exactly what `classifyOrgError` and
+/// `tests/cross_lang_org/error_vectors.json` pin. An undecodable coarse
+/// body is the least-informative bucket (`denied`), never an error about an
+/// error.
+///
+/// Local binding-usage refusals (`nrpc:stream_closed`) are not call
+/// outcomes and keep the `nrpc:` usage vocabulary even on an org handle.
+pub(crate) fn org_err_from_inner(err: InnerRpcError) -> Error {
+    /// The wire status a provider's admission denial carries (OA2-E2) —
+    /// the same value the facade's private constant names.
+    const RPC_STATUS_ADMISSION_DENIED: u16 = 0x0009;
+    use net_sdk::org::types::CoarseAdmissionReason;
+    use net_sdk::org::OrgSdkError;
+
+    let denial = match &err {
+        InnerRpcError::ServerError {
+            status, message, ..
+        } if *status == RPC_STATUS_ADMISSION_DENIED => {
+            // The reason rides as a one-byte body, recovered from the
+            // rendered `message` exactly the way the facade's
+            // `admission_reason_of` recovers it.
+            let mut chars = message.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => u8::try_from(u32::from(c))
+                    .ok()
+                    .and_then(CoarseAdmissionReason::from_wire),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let mapped = match denial {
+        Some(coarse) => OrgSdkError::AdmissionDenied(coarse),
+        None => OrgSdkError::Rpc(err),
+    };
+    Error::from_reason(mapped.to_wire())
+}
+
+/// The one error-rendering seam for the caller-side handle classes: org
+/// handles render the `org:` vocabulary, everything else the `nrpc:` one.
+#[inline]
+fn call_err(org_errors: bool, err: InnerRpcError) -> Error {
+    if org_errors {
+        org_err_from_inner(err)
+    } else {
+        nrpc_err_from_inner(err)
+    }
+}
+
 // ============================================================================
 // Cancellation surface.
 //
@@ -693,12 +752,18 @@ pub struct RpcStream {
     /// Improving `grant` requires SDK plumbing to expose a
     /// control handle independent of the polling future — out of
     /// scope for the binding alone.
-    inner: Arc<tokio::sync::Mutex<Option<InnerRpcStream>>>,
+    pub(crate) inner: Arc<tokio::sync::Mutex<Option<InnerRpcStream>>>,
     /// Cached at construction time so `flow_controlled()` doesn't
     /// take the mutex (and thus doesn't block on an in-flight
     /// `next()`). The underlying flow-control mode is fixed at
     /// stream creation, so the cache never goes stale.
-    flow_controlled_cached: bool,
+    pub(crate) flow_controlled_cached: bool,
+    /// `true` when this handle was opened by an org verb: call-outcome
+    /// errors render through [`org_err_from_inner`] (the `org:` wire
+    /// vocabulary) instead of the `nrpc:` one. Set only by
+    /// `OrgClient::call_streaming_bytes`; the public streaming verbs
+    /// construct with `false` and are unchanged.
+    pub(crate) org_errors: bool,
 }
 
 #[napi]
@@ -715,7 +780,7 @@ impl RpcStream {
             .ok_or_else(|| nrpc_err("stream_closed", "stream already closed"))?;
         match stream.next().await {
             Some(Ok(bytes)) => Ok(Some(Buffer::from(bytes.as_ref()))),
-            Some(Err(e)) => Err(nrpc_err_from_inner(e)),
+            Some(Err(e)) => Err(call_err(self.org_errors, e)),
             None => {
                 // Clean EOF — release the inner stream so the
                 // CANCEL-on-drop guard fires immediately. Without
@@ -784,20 +849,22 @@ impl RpcStream {
 /// wasn't reached.
 #[napi]
 pub struct ClientStreamCall {
-    inner: Arc<tokio::sync::Mutex<Option<InnerClientStreamCallRaw>>>,
+    pub(crate) inner: Arc<tokio::sync::Mutex<Option<InnerClientStreamCallRaw>>>,
     /// Captured at construction so `callId()` doesn't take the
     /// mutex (which `send` / `finish` may be holding across an
     /// await).
-    call_id_cached: u64,
+    pub(crate) call_id_cached: u64,
     /// Cached `flow_controlled` flag for the same reason.
-    flow_controlled_cached: bool,
+    pub(crate) flow_controlled_cached: bool,
     /// Lets `close()` interrupt a pending `send()` that's
     /// awaiting flow-control credit. send `select!`s on this; a
     /// concurrent close fires it, the select picks the close arm,
     /// the call is dropped (CANCEL fires from Drop), and the
     /// pending send returns `stream_closed` instead of hanging
     /// forever on credit that will never arrive.
-    close_notify: Arc<tokio::sync::Notify>,
+    pub(crate) close_notify: Arc<tokio::sync::Notify>,
+    /// See [`RpcStream::org_errors`] — same one-bit error-vocabulary seam.
+    pub(crate) org_errors: bool,
 }
 
 #[napi]
@@ -841,7 +908,7 @@ impl ClientStreamCall {
             }
             Err(e) => {
                 drop(call);
-                Err(nrpc_err_from_inner(e))
+                Err(call_err(self.org_errors, e))
             }
         }
     }
@@ -857,7 +924,7 @@ impl ClientStreamCall {
             .ok_or_else(|| nrpc_err("stream_closed", "client-stream call already closed"))?;
         match call.finish().await {
             Ok(reply) => Ok(Buffer::from(reply.body.as_ref())),
-            Err(e) => Err(nrpc_err_from_inner(e)),
+            Err(e) => Err(call_err(self.org_errors, e)),
         }
     }
 
@@ -1012,10 +1079,12 @@ impl DuplexCall {
                 call_id_cached: call_id,
                 flow_controlled_cached: flow_controlled,
                 close_notify: Arc::new(tokio::sync::Notify::new()),
+                org_errors: false,
             },
             DuplexStream {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
                 call_id_cached: call_id,
+                org_errors: false,
             },
         ))
     }
@@ -1048,12 +1117,14 @@ impl DuplexCall {
 /// Send-half of a `DuplexCall` after `intoSplit`.
 #[napi]
 pub struct DuplexSink {
-    inner: Arc<tokio::sync::Mutex<Option<InnerDuplexSink>>>,
-    call_id_cached: u64,
-    flow_controlled_cached: bool,
+    pub(crate) inner: Arc<tokio::sync::Mutex<Option<InnerDuplexSink>>>,
+    pub(crate) call_id_cached: u64,
+    pub(crate) flow_controlled_cached: bool,
     /// Same role as `ClientStreamCall::close_notify` —
     /// interrupts a pending `send()` blocked on credit.
-    close_notify: Arc<tokio::sync::Notify>,
+    pub(crate) close_notify: Arc<tokio::sync::Notify>,
+    /// See [`RpcStream::org_errors`] — same one-bit error-vocabulary seam.
+    pub(crate) org_errors: bool,
 }
 
 #[napi]
@@ -1087,7 +1158,7 @@ impl DuplexSink {
             }
             Err(e) => {
                 drop(sink);
-                Err(nrpc_err_from_inner(e))
+                Err(call_err(self.org_errors, e))
             }
         }
     }
@@ -1100,7 +1171,9 @@ impl DuplexSink {
         let sink = guard
             .take()
             .ok_or_else(|| nrpc_err("stream_closed", "duplex sink already closed"))?;
-        sink.finish_sending().await.map_err(nrpc_err_from_inner)
+        sink.finish_sending()
+            .await
+            .map_err(|e| call_err(self.org_errors, e))
     }
 
     /// Server-assigned `call_id`.
@@ -1129,8 +1202,10 @@ impl DuplexSink {
 /// Receive-half of a `DuplexCall` after `intoSplit`.
 #[napi]
 pub struct DuplexStream {
-    inner: Arc<tokio::sync::Mutex<Option<InnerDuplexStream>>>,
-    call_id_cached: u64,
+    pub(crate) inner: Arc<tokio::sync::Mutex<Option<InnerDuplexStream>>>,
+    pub(crate) call_id_cached: u64,
+    /// See [`RpcStream::org_errors`] — same one-bit error-vocabulary seam.
+    pub(crate) org_errors: bool,
 }
 
 #[napi]
@@ -1146,7 +1221,7 @@ impl DuplexStream {
         use futures::StreamExt;
         match stream.next().await {
             Some(Ok(bytes)) => Ok(Some(Buffer::from(bytes.as_ref()))),
-            Some(Err(e)) => Err(nrpc_err_from_inner(e)),
+            Some(Err(e)) => Err(call_err(self.org_errors, e)),
             None => {
                 let _ = guard.take();
                 Ok(None)
@@ -1214,21 +1289,21 @@ impl DuplexStream {
 /// typically right after the handler returns).
 #[napi]
 pub struct JsRequestStream {
-    inner: Arc<tokio::sync::Mutex<Option<InnerRequestStream>>>,
+    pub(crate) inner: Arc<tokio::sync::Mutex<Option<InnerRequestStream>>>,
     /// Caller's identity hash (peer origin). Surfaced to JS
     /// via the `callerOrigin` getter; 0 on the loopback / no-peer
     /// fast path.
-    caller_origin: u64,
+    pub(crate) caller_origin: u64,
     /// Per-call id (mints from the substrate). JS handlers may
     /// thread it into per-call logging / tracing.
-    call_id: u64,
+    pub(crate) call_id: u64,
     /// Caller's declared deadline as a Unix-nanos absolute
     /// timestamp. `0` means "no deadline declared".
-    deadline_ns: u64,
+    pub(crate) deadline_ns: u64,
     /// Initial-REQUEST headers, name/value pairs. Names are
     /// lowercase per the substrate convention. Empty when the
     /// REQUEST carried no application headers.
-    headers: Arc<Vec<(String, Vec<u8>)>>,
+    pub(crate) headers: Arc<Vec<(String, Vec<u8>)>>,
 }
 
 #[napi]
@@ -1308,7 +1383,7 @@ impl JsRequestStream {
 /// [`JsRequestStream`].
 #[napi]
 pub struct JsResponseSink {
-    inner: Arc<Mutex<Option<InnerRpcResponseSink>>>,
+    pub(crate) inner: Arc<Mutex<Option<InnerRpcResponseSink>>>,
 }
 
 #[napi]
@@ -1958,6 +2033,7 @@ impl MeshRpc {
         Ok(RpcStream {
             inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
             flow_controlled_cached,
+            org_errors: false,
         })
     }
 
@@ -1987,6 +2063,7 @@ impl MeshRpc {
         Ok(RpcStream {
             inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
             flow_controlled_cached,
+            org_errors: false,
         })
     }
 
@@ -2018,6 +2095,7 @@ impl MeshRpc {
             call_id_cached,
             flow_controlled_cached,
             close_notify: Arc::new(tokio::sync::Notify::new()),
+            org_errors: false,
         })
     }
 

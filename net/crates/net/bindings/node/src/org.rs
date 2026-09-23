@@ -191,6 +191,143 @@ impl OrgClient {
         Ok(Buffer::from(reply.to_vec()))
     }
 
+    /// Open a protected STREAMING call — one request in, a stream of
+    /// responses out (§4.4's `callStreamingBytes`). Returns the EXISTING
+    /// `RpcStream` handle, over the frozen
+    /// `call_streaming_bytes_deadline` seam — no second stream type.
+    ///
+    /// Execution control follows the seam contract exactly:
+    /// `deadlineMs == 0` (or omitted) is the facade's default lifetime
+    /// (Owner Q1, 300 s) and NEVER "no deadline"; `cancelToken == 0`
+    /// (or omitted) is uncancellable. Neither argument is an
+    /// authorization input. Reserve a token from the same node's
+    /// `MeshRpc.reserveCancelToken()` and fire `MeshRpc.cancelCall(token)`
+    /// to retire the call midstream.
+    ///
+    /// Errors carry the `org:` wire vocabulary — the opening refusal is
+    /// `org:admission_denied:<coarse>` / `org:discovery:…`, and a midstream
+    /// outcome arrives as the stream's thrown error (`org:rpc:…`, or
+    /// `org:admission_denied:<coarse>` on revocation), classifiable with
+    /// `classifyOrgError`. Drop or `close()` emits one CANCEL.
+    #[napi]
+    pub async fn call_streaming_bytes(
+        &self,
+        service: String,
+        request: Buffer,
+        deadline_ms: Option<u32>,
+        cancel_token: Option<BigInt>,
+    ) -> Result<crate::mesh_rpc::RpcStream> {
+        let client = self.inner.load_full().ok_or_else(|| {
+            Error::from_reason("org:credentials:closed: this OrgClient has been closed")
+        })?;
+        let cancel_token = match cancel_token {
+            Some(t) => crate::common::bigint_u64(t)?,
+            None => 0,
+        };
+        let body = bytes::Bytes::from(request.to_vec());
+        let inner = client
+            .call_streaming_bytes_deadline(
+                &service,
+                body,
+                u64::from(deadline_ms.unwrap_or(0)),
+                cancel_token,
+            )
+            .await
+            .map_err(org_error)?;
+        let flow_controlled_cached = inner.flow_controlled();
+        Ok(crate::mesh_rpc::RpcStream {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+            flow_controlled_cached,
+            org_errors: true,
+        })
+    }
+
+    /// Open a protected CLIENT-STREAMING call — a stream of requests in,
+    /// one terminal response out (§4.4's `callClientStreamBytes`). Returns
+    /// the EXISTING `ClientStreamCall` handle over the frozen
+    /// `call_client_stream_bytes_deadline` seam. The opening is lazy: the
+    /// initial REQUEST flies at the first `send` (or `finish` on the
+    /// degenerate zero-send path), pinned to the provider this verb
+    /// selected. `deadlineMs` / `cancelToken` follow the same seam
+    /// contract as {@link call_streaming_bytes}.
+    #[napi]
+    pub async fn call_client_stream_bytes(
+        &self,
+        service: String,
+        deadline_ms: Option<u32>,
+        cancel_token: Option<BigInt>,
+    ) -> Result<crate::mesh_rpc::ClientStreamCall> {
+        let client = self.inner.load_full().ok_or_else(|| {
+            Error::from_reason("org:credentials:closed: this OrgClient has been closed")
+        })?;
+        let cancel_token = match cancel_token {
+            Some(t) => crate::common::bigint_u64(t)?,
+            None => 0,
+        };
+        let inner = client
+            .call_client_stream_bytes_deadline(
+                &service,
+                u64::from(deadline_ms.unwrap_or(0)),
+                cancel_token,
+            )
+            .await
+            .map_err(org_error)?;
+        let call_id_cached = inner.call_id();
+        let flow_controlled_cached = inner.flow_controlled();
+        Ok(crate::mesh_rpc::ClientStreamCall {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+            call_id_cached,
+            flow_controlled_cached,
+            close_notify: Arc::new(tokio::sync::Notify::new()),
+            org_errors: true,
+        })
+    }
+
+    /// Open a protected DUPLEX call and return its two halves directly as
+    /// `[sink, stream]` — the EXISTING `DuplexSink` + `DuplexStream`
+    /// handles (§4.4's `callDuplexBytes`), split at the verb because
+    /// `intoSplit` is synchronous on the core handle. The opening rides
+    /// the frozen `call_duplex_bytes_deadline` seam; `deadlineMs` /
+    /// `cancelToken` follow the same seam contract as
+    /// {@link call_streaming_bytes}. CANCEL fires only when BOTH halves
+    /// drop without observing the response stream's terminal frame.
+    #[napi]
+    pub async fn call_duplex_bytes(
+        &self,
+        service: String,
+        deadline_ms: Option<u32>,
+        cancel_token: Option<BigInt>,
+    ) -> Result<(crate::mesh_rpc::DuplexSink, crate::mesh_rpc::DuplexStream)> {
+        let client = self.inner.load_full().ok_or_else(|| {
+            Error::from_reason("org:credentials:closed: this OrgClient has been closed")
+        })?;
+        let cancel_token = match cancel_token {
+            Some(t) => crate::common::bigint_u64(t)?,
+            None => 0,
+        };
+        let inner = client
+            .call_duplex_bytes_deadline(&service, u64::from(deadline_ms.unwrap_or(0)), cancel_token)
+            .await
+            .map_err(org_error)?;
+        let call_id_cached = inner.call_id();
+        let flow_controlled_cached = inner.flow_controlled();
+        let (sink, stream) = inner.into_split();
+        Ok((
+            crate::mesh_rpc::DuplexSink {
+                inner: Arc::new(tokio::sync::Mutex::new(Some(sink))),
+                call_id_cached,
+                flow_controlled_cached,
+                close_notify: Arc::new(tokio::sync::Notify::new()),
+                org_errors: true,
+            },
+            crate::mesh_rpc::DuplexStream {
+                inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+                call_id_cached,
+                org_errors: true,
+            },
+        ))
+    }
+
     /// The organization this client acts for, as 32 raw bytes.
     #[napi(getter)]
     pub fn acting_org(&self) -> Result<Buffer> {
@@ -348,6 +485,14 @@ pub(crate) type OrgHandlerTsfn =
 #[napi]
 pub struct OrgServeHandle {
     inner: parking_lot::Mutex<Option<net_sdk::mesh_rpc::ServeHandle>>,
+    /// The runtime the registration ran on, carried forward — exactly the
+    /// role `mesh_rpc::ServeHandle`'s `runtime` field plays (`mesh_rpc.rs`
+    /// "ServeHandle"): `close()` runs on the JS thread with no reactor in
+    /// context, and dropping the inner handle tears down runtime-bound
+    /// resources, so the handle must be able to enter the runtime it
+    /// belongs to. Every org-surface serve registers on
+    /// [`org_serve_runtime`], so that is the runtime captured here.
+    runtime: tokio::runtime::Handle,
 }
 
 impl OrgServeHandle {
@@ -356,6 +501,7 @@ impl OrgServeHandle {
     pub(crate) fn from_handle(handle: net_sdk::mesh_rpc::ServeHandle) -> Self {
         OrgServeHandle {
             inner: parking_lot::Mutex::new(Some(handle)),
+            runtime: org_serve_runtime().handle().clone(),
         }
     }
 }
@@ -363,9 +509,13 @@ impl OrgServeHandle {
 #[napi]
 impl OrgServeHandle {
     /// Unregister the service. Idempotent. In-flight handlers run to
-    /// completion.
+    /// completion (subject to the handler-drop contract on the serve
+    /// verbs — see [`serve_org_streaming`]).
     #[napi]
     pub fn close(&self) {
+        // Enter the registration's runtime before dropping the inner
+        // handle — mirror of `mesh_rpc::ServeHandle::close`.
+        let _enter = self.runtime.enter();
         let _ = self.inner.lock().take();
     }
 }
@@ -434,9 +584,7 @@ pub fn serve_org(
         .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
     };
 
-    Ok(OrgServeHandle {
-        inner: parking_lot::Mutex::new(Some(handle)),
-    })
+    Ok(OrgServeHandle::from_handle(handle))
 }
 
 /// A dedicated multi-thread runtime for the sync `serve_org` registration so the
@@ -457,6 +605,23 @@ pub(crate) fn org_serve_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// The `OrgCaller` projection — ONE place that turns the admission-verified
+/// facade caller into the JS-visible [`OrgCaller`], shared by the unary
+/// bridge and the three streaming bridges so attribution cannot drift per
+/// shape. Every field comes from the verified [`net_sdk::org::OrgCaller`]
+/// (itself a projection of the canonical `Admitted`); none is caller-claimed
+/// and none is derived from routing metadata like `caller_origin`.
+fn org_caller_js(caller: &net_sdk::org::OrgCaller) -> OrgCaller {
+    OrgCaller {
+        entity: Buffer::from(caller.entity.as_bytes().to_vec()),
+        acting_org: Buffer::from(caller.acting_org.as_bytes().to_vec()),
+        provider_org: Buffer::from(caller.provider_org.as_bytes().to_vec()),
+        provider: Buffer::from(caller.provider.as_bytes().to_vec()),
+        capability: Buffer::from(caller.capability.as_bytes().to_vec()),
+        is_same_org: caller.is_same_org(),
+    }
+}
+
 /// The two-stage TSFN bridge, following `mesh_rpc.rs`'s streaming handler
 /// exactly: stage 1 waits for JS to return a Promise, stage 2 awaits it. BOTH
 /// stages share ONE `timeout_at` deadline, so the total handler time can never
@@ -473,14 +638,7 @@ pub(crate) async fn dispatch_to_js(
     timeout: Duration,
 ) -> std::result::Result<bytes::Bytes, net_sdk::org::OrgHandlerError> {
     let arg = OrgRequest {
-        caller: OrgCaller {
-            entity: Buffer::from(caller.entity.as_bytes().to_vec()),
-            acting_org: Buffer::from(caller.acting_org.as_bytes().to_vec()),
-            provider_org: Buffer::from(caller.provider_org.as_bytes().to_vec()),
-            provider: Buffer::from(caller.provider.as_bytes().to_vec()),
-            capability: Buffer::from(caller.capability.as_bytes().to_vec()),
-            is_same_org: caller.is_same_org(),
-        },
+        caller: org_caller_js(&caller),
         request: Buffer::from(body.to_vec()),
     };
 
@@ -538,4 +696,701 @@ pub(crate) async fn dispatch_to_js(
             timeout.as_millis()
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The streaming provider verbs (§4.4) — `serveOrgStreaming` /
+// `serveOrgClientStream` / `serveOrgDuplex`, on `org_serve_runtime()`,
+// composing the [`org_caller_js`] projection with `mesh_rpc.rs`'s
+// `[..]` TSFN argument shape (`StreamingHandlerArgs`' array marshaling).
+//
+// # Handler-drop contract — the §2.2 / F-S3.1-2 level, STATED EXPLICITLY
+//
+// Every handler registered here is polled inside the call's retire
+// supervisor. When the call retires — caller cancel, deadline, revocation,
+// node teardown — the supervisor may DROP the handler future WITHOUT a
+// final poll. A JS handler therefore must NOT assume cancellation is a
+// handler-side event it will observe: its promise may simply never settle,
+// and `try/finally` around the handler body is NOT guaranteed to run.
+// Cooperation is best-effort by contract (§2.2 `forced`).
+//
+// Cancellation is observed through the RETIREMENT OBSERVABLES instead:
+//
+// - the caller's stream terminates — its final `next()` yields the terminal
+//   outcome (`org:rpc:cancelled` / `org:rpc:timeout` / an
+//   `org:admission_denied:<coarse>` on revocation), classifiable with
+//   `classifyOrgError`;
+// - dropping or closing a call handle emits exactly one CANCEL;
+// - the `OrgServeHandle` bounds registration (`close()` unregisters).
+//
+// The response sink / request stream this bridge hands the handler are
+// released by the RUST side the moment the handler's promise settles OR the
+// supervisor drops the future — never on a handler-side `finally`.
+// ---------------------------------------------------------------------------
+
+/// The `[caller, req, sink]` server-streaming handler arguments — the
+/// [`org_caller_js`] projection composed with `mesh_rpc.rs`'s
+/// `StreamingHandlerArgs` array marshaling (§4.4).
+pub struct OrgStreamingHandlerArgs {
+    caller: OrgCaller,
+    req: Buffer,
+    sink: crate::mesh_rpc::JsResponseSink,
+}
+
+impl ToNapiValue for OrgStreamingHandlerArgs {
+    unsafe fn to_napi_value(
+        env: napi::sys::napi_env,
+        val: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        // Build a JS array `[caller, req, sink]`, exactly the manual
+        // per-element marshaling `mesh_rpc.rs`'s `StreamingHandlerArgs`
+        // uses (its `ToNapiValue` comment explains why: hand-written
+        // napi impls need explicit element conversion).
+        let env_wrapper = napi::Env::from_raw(env);
+        let mut arr = env_wrapper.create_array(3)?;
+        let caller_val = unsafe { OrgCaller::to_napi_value(env, val.caller)? };
+        let req_val = unsafe { Buffer::to_napi_value(env, val.req)? };
+        let sink_val = unsafe { crate::mesh_rpc::JsResponseSink::to_napi_value(env, val.sink)? };
+        let caller_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, caller_val)? };
+        let req_unknown = unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, req_val)? };
+        let sink_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, sink_val)? };
+        arr.set(0, caller_unknown)?;
+        arr.set(1, req_unknown)?;
+        arr.set(2, sink_unknown)?;
+        unsafe { napi::bindgen_prelude::Array::to_napi_value(env, arr) }
+    }
+}
+
+/// TSFN for server-streaming org handlers. JS side:
+/// `(args: [OrgCaller, Buffer, JsResponseSink]) => Promise<Buffer>`. The
+/// Promise resolving is the "handler done" signal; the Buffer value is
+/// ignored (the fold emits the terminal frame from the bridge's return).
+type OrgStreamingHandlerTsfn = ThreadsafeFunction<
+    OrgStreamingHandlerArgs,
+    Promise<Buffer>,
+    OrgStreamingHandlerArgs,
+    Status,
+    false,
+>;
+
+/// The `[caller, stream]` client-streaming handler arguments (§4.4).
+pub struct OrgClientStreamHandlerArgs {
+    caller: OrgCaller,
+    stream: crate::mesh_rpc::JsRequestStream,
+}
+
+impl ToNapiValue for OrgClientStreamHandlerArgs {
+    unsafe fn to_napi_value(
+        env: napi::sys::napi_env,
+        val: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        let env_wrapper = napi::Env::from_raw(env);
+        let mut arr = env_wrapper.create_array(2)?;
+        let caller_val = unsafe { OrgCaller::to_napi_value(env, val.caller)? };
+        let stream_val =
+            unsafe { crate::mesh_rpc::JsRequestStream::to_napi_value(env, val.stream)? };
+        let caller_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, caller_val)? };
+        let stream_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, stream_val)? };
+        arr.set(0, caller_unknown)?;
+        arr.set(1, stream_unknown)?;
+        unsafe { napi::bindgen_prelude::Array::to_napi_value(env, arr) }
+    }
+}
+
+/// TSFN for client-streaming org handlers. JS side:
+/// `(args: [OrgCaller, JsRequestStream]) => Promise<Buffer>` — the resolved
+/// Buffer is the terminal response body.
+type OrgClientStreamHandlerTsfn = ThreadsafeFunction<
+    OrgClientStreamHandlerArgs,
+    Promise<Buffer>,
+    OrgClientStreamHandlerArgs,
+    Status,
+    false,
+>;
+
+/// The `[caller, stream, sink]` duplex handler arguments (§4.4).
+pub struct OrgDuplexHandlerArgs {
+    caller: OrgCaller,
+    stream: crate::mesh_rpc::JsRequestStream,
+    sink: crate::mesh_rpc::JsResponseSink,
+}
+
+impl ToNapiValue for OrgDuplexHandlerArgs {
+    unsafe fn to_napi_value(
+        env: napi::sys::napi_env,
+        val: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        let env_wrapper = napi::Env::from_raw(env);
+        let mut arr = env_wrapper.create_array(3)?;
+        let caller_val = unsafe { OrgCaller::to_napi_value(env, val.caller)? };
+        let stream_val =
+            unsafe { crate::mesh_rpc::JsRequestStream::to_napi_value(env, val.stream)? };
+        let sink_val = unsafe { crate::mesh_rpc::JsResponseSink::to_napi_value(env, val.sink)? };
+        let caller_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, caller_val)? };
+        let stream_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, stream_val)? };
+        let sink_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, sink_val)? };
+        arr.set(0, caller_unknown)?;
+        arr.set(1, stream_unknown)?;
+        arr.set(2, sink_unknown)?;
+        unsafe { napi::bindgen_prelude::Array::to_napi_value(env, arr) }
+    }
+}
+
+/// TSFN for duplex org handlers. JS side:
+/// `(args: [OrgCaller, JsRequestStream, JsResponseSink]) => Promise<Buffer>`.
+type OrgDuplexHandlerTsfn =
+    ThreadsafeFunction<OrgDuplexHandlerArgs, Promise<Buffer>, OrgDuplexHandlerArgs, Status, false>;
+
+/// The one JS-throw/promise-rejection mapping for every org handler shape,
+/// mirroring [`dispatch_to_js`]'s: a rejected promise is an APPLICATION
+/// error (`ORG_HANDLER_ERROR`, the typed-RPC handler-error band), never an
+/// admission denial — `0x0009` is the admission engine's word and a handler
+/// cannot counterfeit it. Everything else (a synchronous throw, a dead
+/// channel, a timeout) is `Internal`.
+fn org_handler_rejection(e: napi::Error) -> net_sdk::org::OrgHandlerError {
+    net_sdk::org::OrgHandlerError::Application {
+        code: ORG_HANDLER_ERROR,
+        message: format!("org handler rejected: {e}"),
+    }
+}
+
+/// Two-stage TSFN bridge for the server-streaming shape. Mirrors
+/// [`dispatch_to_js`] (ONE `timeout_at` deadline across both stages) plus
+/// `mesh_rpc.rs`'s `NodeStreamingRpcHandler` sink discipline: the sink slot
+/// is retained by the bridge and dropped the moment the handler's promise
+/// settles OR this future is dropped (the handler-drop contract above) —
+/// never on a V8 GC.
+async fn dispatch_streaming_to_js(
+    tsfn: Arc<OrgStreamingHandlerTsfn>,
+    caller: net_sdk::org::OrgCaller,
+    body: bytes::Bytes,
+    sink: ::net::adapter::net::cortex::RpcResponseSink,
+    timeout: Duration,
+) -> std::result::Result<(), net_sdk::org::OrgHandlerError> {
+    let sink_slot = Arc::new(parking_lot::Mutex::new(Some(sink)));
+    let arg = OrgStreamingHandlerArgs {
+        caller: org_caller_js(&caller),
+        req: Buffer::from(body.to_vec()),
+        sink: crate::mesh_rpc::JsResponseSink {
+            inner: sink_slot.clone(),
+        },
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
+    let status = tsfn.call_with_return_value(
+        arg,
+        ThreadsafeFunctionCallMode::NonBlocking,
+        move |ret: napi::Result<Promise<Buffer>>, _env| {
+            let _ = tx.send(ret);
+            napi::Result::Ok(())
+        },
+    );
+    if status != Status::Ok {
+        // Drop the sink before bailing — no V8-GC-quantized terminal frame.
+        drop(sink_slot.lock().take());
+        return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+            "TSFN enqueue failed: {status:?}"
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let promise = match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(Ok(p))) => p,
+        Ok(Ok(Err(e))) => {
+            drop(sink_slot.lock().take());
+            return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+                "JS org streaming handler threw synchronously: {e}"
+            )));
+        }
+        Ok(Err(_)) => {
+            drop(sink_slot.lock().take());
+            return Err(net_sdk::org::OrgHandlerError::Internal(
+                "JS callback channel disconnected before the org streaming handler responded"
+                    .to_string(),
+            ));
+        }
+        Err(_) => {
+            drop(sink_slot.lock().take());
+            return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+                "JS org streaming handler did not respond within {} ms",
+                timeout.as_millis()
+            )));
+        }
+    };
+    let settled = tokio::time::timeout_at(deadline, promise).await;
+    // The handler is done with the sink the instant its promise settles,
+    // whichever way it settled (see the handler-drop contract).
+    drop(sink_slot.lock().take());
+    match settled {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(org_handler_rejection(e)),
+        Err(_) => Err(net_sdk::org::OrgHandlerError::Internal(format!(
+            "JS org streaming handler promise did not resolve within {} ms",
+            timeout.as_millis()
+        ))),
+    }
+}
+
+/// Build the reused [`crate::mesh_rpc::JsRequestStream`] for an org
+/// handler.
+///
+/// STATED LIMIT, not an accident: the frozen org handler seam
+/// (`Fn(OrgCaller, RequestStream, ..)`) hands the binding only the verified
+/// [`net_sdk::org::OrgCaller`] and the request stream, and the core
+/// `RequestStream` exposes no metadata accessors — so the reused handle's
+/// `callerOrigin` / `callId` / `deadlineNs` / `headers` accessors report
+/// their documented EMPTY values (`0n` / `[]`) on this surface. Handler
+/// attribution rides the `OrgCaller`'s five verified 32-byte facts (which
+/// are exact), never the routing hash.
+fn org_request_stream(
+    requests: ::net::adapter::net::cortex::RequestStream,
+) -> crate::mesh_rpc::JsRequestStream {
+    crate::mesh_rpc::JsRequestStream {
+        inner: Arc::new(tokio::sync::Mutex::new(Some(requests))),
+        caller_origin: 0,
+        call_id: 0,
+        deadline_ns: 0,
+        headers: Arc::new(Vec::new()),
+    }
+}
+
+/// Two-stage TSFN bridge for the client-streaming shape. The resolved
+/// Buffer is the call's terminal response body. Request-stream metadata:
+/// see [`org_request_stream`].
+async fn dispatch_client_stream_to_js(
+    tsfn: Arc<OrgClientStreamHandlerTsfn>,
+    caller: net_sdk::org::OrgCaller,
+    requests: ::net::adapter::net::cortex::RequestStream,
+    timeout: Duration,
+) -> std::result::Result<bytes::Bytes, net_sdk::org::OrgHandlerError> {
+    let arg = OrgClientStreamHandlerArgs {
+        caller: org_caller_js(&caller),
+        stream: org_request_stream(requests),
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
+    let status = tsfn.call_with_return_value(
+        arg,
+        ThreadsafeFunctionCallMode::NonBlocking,
+        move |ret: napi::Result<Promise<Buffer>>, _env| {
+            let _ = tx.send(ret);
+            napi::Result::Ok(())
+        },
+    );
+    if status != Status::Ok {
+        return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+            "TSFN enqueue failed: {status:?}"
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let promise = match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(Ok(p))) => p,
+        Ok(Ok(Err(e))) => {
+            return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+                "JS org client-streaming handler threw synchronously: {e}"
+            )))
+        }
+        Ok(Err(_)) => return Err(net_sdk::org::OrgHandlerError::Internal(
+            "JS callback channel disconnected before the org client-streaming handler responded"
+                .to_string(),
+        )),
+        Err(_) => {
+            return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+                "JS org client-streaming handler did not respond within {} ms",
+                timeout.as_millis()
+            )))
+        }
+    };
+    match tokio::time::timeout_at(deadline, promise).await {
+        Ok(Ok(buf)) => Ok(bytes::Bytes::from(buf.to_vec())),
+        Ok(Err(e)) => Err(org_handler_rejection(e)),
+        Err(_) => Err(net_sdk::org::OrgHandlerError::Internal(format!(
+            "JS org client-streaming handler promise did not resolve within {} ms",
+            timeout.as_millis()
+        ))),
+    }
+}
+
+/// Two-stage TSFN bridge for the duplex shape — [`dispatch_streaming_to_js`]'s
+/// sink discipline plus [`dispatch_client_stream_to_js`]'s response body
+/// handling (duplex returns `Result<(), _>`; the Buffer value is ignored).
+async fn dispatch_duplex_to_js(
+    tsfn: Arc<OrgDuplexHandlerTsfn>,
+    caller: net_sdk::org::OrgCaller,
+    requests: ::net::adapter::net::cortex::RequestStream,
+    sink: ::net::adapter::net::cortex::RpcResponseSink,
+    timeout: Duration,
+) -> std::result::Result<(), net_sdk::org::OrgHandlerError> {
+    let sink_slot = Arc::new(parking_lot::Mutex::new(Some(sink)));
+    let arg = OrgDuplexHandlerArgs {
+        caller: org_caller_js(&caller),
+        stream: org_request_stream(requests),
+        sink: crate::mesh_rpc::JsResponseSink {
+            inner: sink_slot.clone(),
+        },
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
+    let status = tsfn.call_with_return_value(
+        arg,
+        ThreadsafeFunctionCallMode::NonBlocking,
+        move |ret: napi::Result<Promise<Buffer>>, _env| {
+            let _ = tx.send(ret);
+            napi::Result::Ok(())
+        },
+    );
+    if status != Status::Ok {
+        drop(sink_slot.lock().take());
+        return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+            "TSFN enqueue failed: {status:?}"
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let promise = match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(Ok(p))) => p,
+        Ok(Ok(Err(e))) => {
+            drop(sink_slot.lock().take());
+            return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+                "JS org duplex handler threw synchronously: {e}"
+            )));
+        }
+        Ok(Err(_)) => {
+            drop(sink_slot.lock().take());
+            return Err(net_sdk::org::OrgHandlerError::Internal(
+                "JS callback channel disconnected before the org duplex handler responded"
+                    .to_string(),
+            ));
+        }
+        Err(_) => {
+            drop(sink_slot.lock().take());
+            return Err(net_sdk::org::OrgHandlerError::Internal(format!(
+                "JS org duplex handler did not respond within {} ms",
+                timeout.as_millis()
+            )));
+        }
+    };
+    let settled = tokio::time::timeout_at(deadline, promise).await;
+    drop(sink_slot.lock().take());
+    match settled {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(org_handler_rejection(e)),
+        Err(_) => Err(net_sdk::org::OrgHandlerError::Internal(format!(
+            "JS org duplex handler promise did not resolve within {} ms",
+            timeout.as_millis()
+        ))),
+    }
+}
+
+fn org_access(access: OrgAccess) -> net_sdk::org::OrgAccess {
+    match access {
+        OrgAccess::SameOrg => net_sdk::org::OrgAccess::SameOrg,
+        OrgAccess::Granted => net_sdk::org::OrgAccess::Granted,
+    }
+}
+
+fn org_handler_timeout(handler_timeout_ms: Option<u32>) -> Duration {
+    // 0 disables the cap, matching `MeshRpc.serve`'s contract.
+    match handler_timeout_ms {
+        Some(0) => Duration::from_secs(u64::from(u32::MAX)),
+        Some(ms) => Duration::from_millis(u64::from(ms)),
+        None => Duration::from_secs(60),
+    }
+}
+
+/// Serve a protected, privately-discoverable service whose response is a
+/// STREAM (§4.4's `serveOrgStreaming`), on [`org_serve_runtime`] over the
+/// frozen `serve_org_streaming_bytes_node` seam.
+///
+/// The handler receives `[caller, req, sink]`: the admission-verified
+/// [`OrgCaller`], the raw request body, and the reused
+/// `JsResponseSink` to push chunks into. The Promise resolving is the
+/// "handler done" signal — the fold emits the terminal frame then (the
+/// Buffer value is ignored). Returning a rejected promise surfaces as an
+/// application error, never as an admission denial.
+///
+/// **Handler-drop contract (§2.2 / F-S3.1-2, stated level):** the retire
+/// supervisor may drop the handler future WITHOUT a final poll on
+/// cancellation/deadline/revocation — do not assume a handler-side
+/// cancellation event or a `finally`. Cancellation is observed through the
+/// retirement observables (the caller's terminal stream outcome, the one
+/// CANCEL from a dropped call handle, this handle's `close()`). The sink is
+/// released by Rust when the handler settles or the future drops.
+///
+/// Requires an installed node authority; `access` selects who may call AND
+/// how the service is announced (the unary {@link serveOrg}'s contract,
+/// unchanged).
+#[napi(
+    ts_args_type = "mesh: NetMesh, service: string, access: OrgAccess, handler: (args: [OrgCaller, Buffer, JsResponseSink]) => Promise<Buffer>, handlerTimeoutMs?: number"
+)]
+pub fn serve_org_streaming(
+    mesh: &crate::NetMesh,
+    service: String,
+    access: OrgAccess,
+    handler: Function<'_, OrgStreamingHandlerArgs, Promise<Buffer>>,
+    handler_timeout_ms: Option<u32>,
+) -> Result<OrgServeHandle> {
+    let node = mesh.node_arc_clone()?;
+    let tsfn: OrgStreamingHandlerTsfn = handler
+        .build_threadsafe_function()
+        .callee_handled::<false>()
+        .build()?;
+    let tsfn = Arc::new(tsfn);
+    let timeout = org_handler_timeout(handler_timeout_ms);
+    let access = org_access(access);
+    let handle = {
+        let _rt_guard = org_serve_runtime().enter();
+        net_sdk::org::serve_org_streaming_bytes_node(
+            node,
+            &service,
+            access,
+            move |caller: net_sdk::org::OrgCaller,
+                  body: bytes::Bytes,
+                  sink: ::net::adapter::net::cortex::RpcResponseSink| {
+                let tsfn = tsfn.clone();
+                async move { dispatch_streaming_to_js(tsfn, caller, body, sink, timeout).await }
+            },
+        )
+        .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
+    };
+    Ok(OrgServeHandle::from_handle(handle))
+}
+
+/// Serve a protected, privately-discoverable service with a STREAM OF
+/// REQUESTS and one terminal response (§4.4's `serveOrgClientStream`), on
+/// [`org_serve_runtime`] over the frozen `serve_org_client_stream_bytes_node`
+/// seam.
+///
+/// The handler receives `[caller, stream]` and returns (a Promise of) the
+/// terminal response body. Drain `stream.next()` until `null` (clean
+/// EOF/half-close). The request stream's `callerOrigin`/`callId`/
+/// `deadlineNs`/`headers` accessors report their documented EMPTY values on
+/// this surface — see [`org_request_stream`]; attribution rides the
+/// verified [`OrgCaller`].
+///
+/// **Handler-drop contract (§2.2 / F-S3.1-2, stated level):** see
+/// [`serve_org_streaming`] — the retire supervisor may drop the handler
+/// future without a final poll; cancellation is observed through the
+/// retirement observables, never assumed as a handler-side event.
+#[napi(
+    ts_args_type = "mesh: NetMesh, service: string, access: OrgAccess, handler: (args: [OrgCaller, JsRequestStream]) => Promise<Buffer>, handlerTimeoutMs?: number"
+)]
+pub fn serve_org_client_stream(
+    mesh: &crate::NetMesh,
+    service: String,
+    access: OrgAccess,
+    handler: Function<'_, OrgClientStreamHandlerArgs, Promise<Buffer>>,
+    handler_timeout_ms: Option<u32>,
+) -> Result<OrgServeHandle> {
+    let node = mesh.node_arc_clone()?;
+    let tsfn: OrgClientStreamHandlerTsfn = handler
+        .build_threadsafe_function()
+        .callee_handled::<false>()
+        .build()?;
+    let tsfn = Arc::new(tsfn);
+    let timeout = org_handler_timeout(handler_timeout_ms);
+    let access = org_access(access);
+    let handle = {
+        let _rt_guard = org_serve_runtime().enter();
+        net_sdk::org::serve_org_client_stream_bytes_node(
+            node,
+            &service,
+            access,
+            move |caller: net_sdk::org::OrgCaller,
+                  requests: ::net::adapter::net::cortex::RequestStream| {
+                let tsfn = tsfn.clone();
+                async move { dispatch_client_stream_to_js(tsfn, caller, requests, timeout).await }
+            },
+        )
+        .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
+    };
+    Ok(OrgServeHandle::from_handle(handle))
+}
+
+/// Serve a protected, privately-discoverable DUPLEX service (§4.4's
+/// `serveOrgDuplex`), on [`org_serve_runtime`] over the frozen
+/// `serve_org_duplex_bytes_node` seam.
+///
+/// The handler receives `[caller, stream, sink]`; the Promise resolving is
+/// the "handler done" signal (the Buffer value is ignored). Both directions
+/// are independent — emit before/after/while draining. The request stream's
+/// metadata accessors report their documented EMPTY values on this surface
+/// — see [`org_request_stream`].
+///
+/// **Handler-drop contract (§2.2 / F-S3.1-2, stated level):** see
+/// [`serve_org_streaming`] — the retire supervisor may drop the handler
+/// future without a final poll; cancellation is observed through the
+/// retirement observables, never assumed as a handler-side event. The sink
+/// is released by Rust when the handler settles or the future drops.
+#[napi(
+    ts_args_type = "mesh: NetMesh, service: string, access: OrgAccess, handler: (args: [OrgCaller, JsRequestStream, JsResponseSink]) => Promise<Buffer>, handlerTimeoutMs?: number"
+)]
+pub fn serve_org_duplex(
+    mesh: &crate::NetMesh,
+    service: String,
+    access: OrgAccess,
+    handler: Function<'_, OrgDuplexHandlerArgs, Promise<Buffer>>,
+    handler_timeout_ms: Option<u32>,
+) -> Result<OrgServeHandle> {
+    let node = mesh.node_arc_clone()?;
+    let tsfn: OrgDuplexHandlerTsfn = handler
+        .build_threadsafe_function()
+        .callee_handled::<false>()
+        .build()?;
+    let tsfn = Arc::new(tsfn);
+    let timeout = org_handler_timeout(handler_timeout_ms);
+    let access = org_access(access);
+    let handle = {
+        let _rt_guard = org_serve_runtime().enter();
+        net_sdk::org::serve_org_duplex_bytes_node(
+            node,
+            &service,
+            access,
+            move |caller: net_sdk::org::OrgCaller,
+                  requests: ::net::adapter::net::cortex::RequestStream,
+                  sink: ::net::adapter::net::cortex::RpcResponseSink| {
+                let tsfn = tsfn.clone();
+                async move { dispatch_duplex_to_js(tsfn, caller, requests, sink, timeout).await }
+            },
+        )
+        .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
+    };
+    Ok(OrgServeHandle::from_handle(handle))
+}
+
+// ---------------------------------------------------------------------------
+// Test-only provisioning (`test-helpers`) — the same-org live scenario.
+//
+// The Rust-minted fixtures (`gen_org_scenario`) cover the GRANTED
+// (cross-org) cell only; a same-org streaming live test needs two nodes in
+// ONE org sharing §3.4's out-of-band owner audience, which no generator
+// writes. This minter is the Node row's equivalent of the Rust live
+// fixture's `fast_mesh(.., shared_audience)` provisioning — adoption (the
+// operator ceremony) plus the shared audience staging — reachable only from
+// a `--features test-helpers` build (the vitest build), exactly like
+// `NetMesh::test_inject_synthetic_peer`. It is NOT exported to production
+// consumers.
+// ---------------------------------------------------------------------------
+
+/// The provider node's identity seed (hex in the manifest) — `EntityKeypair`
+/// semantics so `NetMesh.create({ identitySeed })` reconstructs the exact
+/// entity the certs name.
+#[cfg(feature = "test-helpers")]
+const TEST_PROVIDER_SEED: [u8; 32] = [0x41u8; 32];
+/// The caller node's identity seed.
+#[cfg(feature = "test-helpers")]
+const TEST_CALLER_SEED: [u8; 32] = [0x42u8; 32];
+/// The single organization both nodes belong to.
+#[cfg(feature = "test-helpers")]
+const TEST_ORG_SEED: [u8; 32] = [0xA4u8; 32];
+/// Validity window for every minted cert/grant — fresh per run.
+#[cfg(feature = "test-helpers")]
+const TEST_TTL_SECS: u64 = 3600;
+
+#[cfg(feature = "test-helpers")]
+fn test_to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Mint a complete same-org scenario into `outdir` and return its manifest
+/// as JSON: two adopted node authorities in ONE org sharing one owner
+/// audience (the §3.4 out-of-band pre-staging, without which owner-private
+/// discovery could never open the other side's envelopes), plus the caller's
+/// membership + wide-open dispatcher grant (no capability grants — same-org
+/// admission is `OwnerDelegated`).
+///
+/// The shared audience is staged by rewriting the caller authority
+/// directory's `owner-audience.key` with the provider's adopted audience
+/// AFTER both adoptions (adoption mints one when absent and preserves an
+/// existing same-org one, but a pre-existing audience would flip its
+/// provisioning expectation; the post-adopt rewrite is the exact file state
+/// `NodeAuthority::open` — i.e. `installOrgAuthority` — loads).
+#[cfg(feature = "test-helpers")]
+#[napi]
+pub fn test_mint_same_org_scenario(outdir: String) -> Result<String> {
+    use net_sdk::org::types::{
+        DispatcherScope, NodeAuthority, OrgDispatcherGrant, OrgKeypair, OrgMembershipCert,
+        OWNER_AUDIENCE_FILE,
+    };
+
+    let outdir = std::path::PathBuf::from(outdir);
+    let org = OrgKeypair::from_bytes(TEST_ORG_SEED);
+    let provider_kp = ::net::adapter::net::identity::EntityKeypair::from_bytes(TEST_PROVIDER_SEED);
+    let caller_kp = ::net::adapter::net::identity::EntityKeypair::from_bytes(TEST_CALLER_SEED);
+    let provider_entity = provider_kp.entity_id().clone();
+    let caller_entity = caller_kp.entity_id().clone();
+
+    let provider_dir = outdir.join("provider");
+    let caller_dir = outdir.join("caller");
+    let provider_auth = provider_dir.join("authority");
+    let caller_auth = caller_dir.join("authority");
+    std::fs::create_dir_all(&provider_dir).map_err(|e| Error::from_reason(e.to_string()))?;
+    std::fs::create_dir_all(&caller_dir).map_err(|e| Error::from_reason(e.to_string()))?;
+
+    // The adoption ceremony (`net node adopt`'s exact shape) for both nodes.
+    let provider_cert =
+        OrgMembershipCert::try_issue(&org, provider_entity.clone(), 1, TEST_TTL_SECS)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+    NodeAuthority::adopt(&provider_auth, provider_cert, &provider_entity, 0, None)
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+    let caller_cert = OrgMembershipCert::try_issue(&org, caller_entity.clone(), 1, TEST_TTL_SECS)
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+    NodeAuthority::adopt(&caller_auth, caller_cert.clone(), &caller_entity, 0, None)
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+
+    // Stage the ONE per-organization owner audience across both authority
+    // dirs: read the provider's adopted audience and install it as the
+    // caller's (the caller's minted one is replaced). The file already
+    // exists owner-only from the adopt above, so a truncating rewrite keeps
+    // its checked permissions.
+    let shared = NodeAuthority::open(&provider_auth, &provider_entity)
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+    let audience_bytes = shared.audience.encode_config();
+    std::fs::write(caller_auth.join(OWNER_AUDIENCE_FILE), audience_bytes)
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+
+    // The caller's credentials — membership + a wide-open dispatcher grant
+    // (no capability grants: same-org is OwnerDelegated).
+    let dispatcher = OrgDispatcherGrant::try_issue(
+        &org,
+        caller_entity.clone(),
+        DispatcherScope::Any,
+        TEST_TTL_SECS,
+    )
+    .map_err(|e| Error::from_reason(e.to_string()))?;
+    std::fs::write(caller_dir.join("membership.bin"), caller_cert.to_bytes())
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+    std::fs::write(caller_dir.join("dispatcher.bin"), dispatcher.to_bytes())
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+
+    let manifest = serde_json::json!({
+        "version": 1,
+        "description": "test-helpers same-org streaming scenario: provider and \
+                        caller in ONE org sharing one owner audience. GENERATED \
+                        fresh per run (certs expire) — do not commit.",
+        "org_id_hex": test_to_hex(org.org_id().as_bytes()),
+        "provider": {
+            "seed_hex": test_to_hex(&TEST_PROVIDER_SEED),
+            "entity_id_hex": test_to_hex(provider_entity.as_bytes()),
+            "authority_dir": "provider/authority",
+        },
+        "caller": {
+            "seed_hex": test_to_hex(&TEST_CALLER_SEED),
+            "entity_id_hex": test_to_hex(caller_entity.as_bytes()),
+            "authority_dir": "caller/authority",
+            "membership_path": "caller/membership.bin",
+            "dispatcher_path": "caller/dispatcher.bin",
+        },
+    });
+    let json =
+        serde_json::to_string_pretty(&manifest).map_err(|e| Error::from_reason(e.to_string()))?;
+    std::fs::write(outdir.join("manifest.json"), &json)
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+    Ok(json)
 }
