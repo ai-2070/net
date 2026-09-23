@@ -2810,7 +2810,8 @@ async fn run_pinned(
     let mut last = fail("never attempted");
     for _ in 0..attempts {
         last = script.run(tab, step.clone()).await;
-        if last.ok || !why(&last).contains("no pinned entity") {
+        let w = why(&last);
+        if last.ok || (!w.contains("no pinned entity") && !w.contains("no session with")) {
             return last;
         }
         tokio::time::sleep(Duration::from_millis(700)).await;
@@ -2849,10 +2850,9 @@ async fn streaming_backpressure(
 ) {
     let witness = WITNESSES[24];
     let handle = "bp-serve".to_string();
-    // 6 chunks of 8 B against a 16 B (2-chunk) window — the exact
-    // shape the passing duplex leg used (larger windows dead-stalled
-    // the flow at this surface): sends 0–1 fit and resolve; 2–5 must
-    // park until reads grant.
+    // 6 chunks against a 2-CREDIT window (the wire's chunk-credit
+    // unit: `nrpc-*-window-initial` counts item frames, not bytes) —
+    // sends 0-1 fit and resolve; 2-5 must park until reads grant.
     let pre: Vec<Vec<u8>> = (0..6)
         .map(|i| {
             let mut chunk = format!("bp{i}-").into_bytes();
@@ -2887,12 +2887,12 @@ async fn streaming_backpressure(
         B_BP,
         false,
     );
-    // Initial window = 2 chunks: sends 2..5 must park while the
-    // reader idles.
+    // Initial window = 2 CHUNK CREDITS: sends 2..5 must park while
+    // the reader idles.
     let open = script
         .run(
             TAB_PAIR_A,
-            stream_open_step(B_BP, b"bp-open", &creds, "bp-call", Some(16)),
+            stream_open_step(B_BP, b"bp-open", &creds, "bp-call", Some(2)),
         )
         .await;
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -2944,7 +2944,8 @@ async fn streaming_backpressure(
         witness,
         open.ok && parked_early >= 2 && items == expected && resolved_once && terminal_done,
         format!(
-            "window=16B (2 chunks of 8B); open-typed={}; with the reader IDLE the provider's \
+            "window=2 CHUNK CREDITS (the wire's nrpc-*-window-initial unit); open-typed={}; with \
+             the reader IDLE the provider's \
              send_log parked {parked_early}/6 sends >250ms (the response window must PARK the \
              provider's sends and release them on grants — a no-park surface resolves 6/6 and \
              reddens exactly this clause); slow reads per step={reads:?} (one credit one chunk); \
@@ -2982,7 +2983,7 @@ async fn client_stream_backpressure(
         })
         .collect();
     let open = script
-        .run(TAB_CALL, upload_open_step(N_CS_BP, &creds, "cs-bp", Some(16)))
+        .run(TAB_CALL, upload_open_step(N_CS_BP, &creds, "cs-bp", Some(2)))
         .await;
     // Send beyond the window: 4 at once, then observe the park.
     let send1 = script.run(TAB_CALL, upload_send_step("cs-bp", &chunks[..4])).await;
@@ -3024,7 +3025,7 @@ async fn client_stream_backpressure(
         witness,
         open.ok && parked >= 1 && eof_exact && late_refused && collected_exact,
         format!(
-            "upload window=16B (2 chunks) at a SLOW consumer (150 ms/chunk): parked {parked}/4 \
+            "upload window=2 CHUNK CREDITS at a SLOW consumer (150 ms/chunk): parked {parked}/4 \
              early sends >250ms (credit parks the caller's send); half-close EOF delivered the \
              EXACT concatenation reply={} (want {}) so FLAG_END reached the handler; late upload \
              after END: typed refusal={} ({}) — delivers nothing, cancels nothing (the result \
@@ -3088,7 +3089,7 @@ async fn duplex_backpressure(
         witness,
         open.ok && fin.ok && mid_items.len() == 2 && items == expected && terminal_done,
         format!(
-            "both directions paced (windows 16B/8B): echoes arrived while input OPEN \
+            "both directions paced (window credits 16/8): echoes arrived while input OPEN \
              (mid={mid_items:?} — the response side is independent); finishSending delivered EOF \
              and the tail AFTER EOF still completed: items={items:?} (want {expected:?}) \
              terminal={:?} — half-close never cancelled the response half",
@@ -3377,65 +3378,120 @@ async fn tab_teardown(
             serve_step(&handle, B_TEARDOWN, "streaming", "same-org", &owner_org, "td", &pre, &post, true, 0),
         )
         .await;
-    // The anchor calls the browser provider; the handler parks.
-    let intent = world.intent(
-        cx.anchor_key,
+    // E0.3 (adjudicated): protected org RPC is DIRECT-SESSION-ONLY —
+    // the proof binds the RECEIVING session's hash. Drive the §9
+    // four-method session between the caller (pair-a) and the
+    // provider (teardown) BEFORE opening; §4.5 then governs what the
+    // provider's death does to the OPEN call: its OWN 4s deadlineMs
+    // sweep carries the contract-form Timeout terminal UNEXTENDED.
+    let td_hex = format!("{:016x}", world.teardown.entity.node_id());
+    let pa_hex = format!("{:016x}", world.pair_a.entity.node_id());
+    let mut discovered = false;
+    for _ in 0..40 {
+        let seen_a = script
+            .run(
+                TAB_PAIR_A,
+                json!({ "kind": "query", "session": SESSION, "capability": "org.s4.tag" }),
+            )
+            .await;
+        let seen_td = script
+            .run(
+                TAB_TEARDOWN,
+                json!({ "kind": "query", "session": SESSION, "capability": "org.s4.tag" }),
+            )
+            .await;
+        if peers_of(&seen_a).map_or(false, |p| p.to_string().contains(&td_hex))
+            && peers_of(&seen_td).map_or(false, |p| p.to_string().contains(&pa_hex))
+        {
+            discovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let offer = script
+        .run(
+            TAB_PAIR_A,
+            json!({ "kind": "peer_offer", "session": SESSION, "peer_hex": td_hex }),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut answer = fail("never attempted");
+    for _ in 0..10 {
+        answer = script
+            .run(
+                TAB_TEARDOWN,
+                json!({ "kind": "peer_accept_offer", "session": SESSION, "peer_hex": pa_hex }),
+            )
+            .await;
+        if answer.ok || !why(&answer).contains("no verified offer") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    for _ in 0..20 {
+        let _ = script
+            .run(
+                TAB_PAIR_A,
+                json!({ "kind": "peer_candidate", "session": SESSION, "peer_hex": td_hex }),
+            )
+            .await;
+        let _ = script
+            .run(
+                TAB_TEARDOWN,
+                json!({ "kind": "peer_candidate", "session": SESSION, "peer_hex": pa_hex }),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let hs = script
+        .run(
+            TAB_PAIR_A,
+            json!({ "kind": "peer_handshake", "session": SESSION, "peer_hex": td_hex }),
+        )
+        .await;
+    let drive_summary = format!(
+        "discovered={discovered} offer={} answer={} hs={}",
+        typed(&offer),
+        typed(&answer),
+        typed(&hs)
+    );
+    let creds = world.creds(
+        &world.pair_a.entity,
+        1,
         &world.root_a,
         &world.root_a,
         &world.teardown.entity,
         B_TEARDOWN,
         false,
-        1,
     );
-    let call = tokio::spawn({
-        let anchor = Arc::clone(cx.anchor);
-        let target = world.teardown.entity.node_id();
-        async move {
-            match anchor
-                .call_streaming(
-                    target,
-                    B_TEARDOWN,
-                    Bytes::from_static(b"td-call"),
-                    CallOptions {
-                        org_proof_intent: Some(intent),
-                        deadline: Some(std::time::Instant::now() + Duration::from_secs(30)),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(mut stream) => {
-                    use futures::StreamExt as _;
-                    let mut items = Vec::new();
-                    loop {
-                        // BOUNDED: a surface whose retirement terminal
-                        // never reaches the caller must redden this
-                        // witness, not hang the ledger.
-                        match tokio::time::timeout(Duration::from_secs(15), stream.next()).await {
-                            Ok(Some(Ok(chunk))) => items.push(chunk.to_vec()),
-                            Ok(Some(Err(e))) => return (items, format!("ERR {e}")),
-                            Ok(None) => return (items, "done".to_string()),
-                            Err(_) => {
-                                return (
-                                    items,
-                                    "TIMEOUT(the retirement terminal never reached the caller \
-                                     within 15 s of the serving tab's close)"
-                                        .to_string(),
-                                )
-                            }
-                        }
-                    }
-                }
-                Err(e) => (Vec::new(), format!("OPEN-ERR {e}")),
-            }
-        }
-    });
+    let mut open_step = stream_open_step(B_TEARDOWN, b"td-call", &creds, "td-call", None);
+    open_step["deadline_ms"] = json!(4000);
+    let call_started = std::time::Instant::now();
+    let open = run_pinned(script, TAB_PAIR_A, open_step, 30).await;
+    let _live = script.run(TAB_PAIR_A, stream_read_step("td-call", 1, 8_000)).await;
     tokio::time::sleep(Duration::from_millis(700)).await;
 
     // THE TEARDOWN: destroy the serving tab.
     let closed = cx.driver.close_page(PAGE_TEARDOWN).await;
-    let (items, terminal) = call.await.expect("call task");
-    let typed_dead = terminal.starts_with("ERR");
+    let final_read = script.run(TAB_PAIR_A, stream_read_step("td-call", 99, 8_000)).await;
+    let elapsed = call_started.elapsed();
+    // The caller's stream state accumulates across reads.
+    let items = stat_list(&final_read, "items");
+    let terminal = stat_obj(&final_read, "terminal").cloned().unwrap_or(Value::Null);
+    let kind = terminal
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // §4.5 (adjudicated): the caller sees the call's OWN deadline
+    // terminal (Timeout class) at its UNEXTENDED deadline — a fast
+    // sessionLost at the close, or a terminal before/long after the
+    // deadline, is not the contract form.
+    let deadline_terminal = open.ok
+        && (kind.contains("timeout") || kind.contains("deadline"))
+        && elapsed >= Duration::from_millis(3_000)
+        && elapsed <= Duration::from_secs(7);
+    let items_exact = items == vec![hex(b"td-0")];
 
     // No resume: re-opening the SAME service needs a fresh serving
     // tab — and that call is a FRESH call whose effect legitimately
@@ -3507,16 +3563,21 @@ async fn tab_teardown(
         && fresh_payload_exact;
     ledger.record(
         witness,
-        serve.ok && closed.is_ok() && typed_dead,
+        serve.ok && closed.is_ok() && deadline_terminal && items_exact && fresh_ok,
         format!(
-            "serving tab closed mid-call (driver close={:?}); the in-flight call's terminal was \
-             {terminal:?} — the roster demands the EXACT typed terminal (sessionLost/leader-loss \
-             family) here and a TIMEOUT means that terminal NEVER reached the caller (the \
-             closure-contract gap); items-before-death={items:?}; ownership retired with the SAME \
-             deadline (the call's own 30s deadline was never extended) and NOTHING resumed — a re-opened \
-             call is a fresh call and may repeat effects (asserted as: the dead call delivered no \
-             further items after the close). fresh-marker={fresh_ok}",
-            closed.map(|_| "ok")
+            "serving tab closed mid-call at t+700ms (driver close={:?}, open-typed={}; \
+             drive={drive_summary}); the \
+             call's OWN 4s \
+             deadline terminal arrived at t+{elapsed:?} UNEXTENDED ({deadline_terminal}, \
+             terminal={terminal:?} — the Timeout-class terminal at the call's deadline is the \
+             §4.5 contract form; a fast sessionLost at the close or a hung stream is not it); \
+             items-before-death={items:?} exactly the pre-close set ({items_exact}) and NOTHING \
+             after — the ownership retirement never resumed; where the model says so, a \
+             re-opened call is FRESH and may repeat effects: {fresh_ok} (its own new provider \
+             record with its own payload {} — served on a fresh tab, completed independently)",
+            closed.map(|_| "ok"),
+            typed(&open),
+            hex(b"td-fresh-call")
         ),
     );
 }
