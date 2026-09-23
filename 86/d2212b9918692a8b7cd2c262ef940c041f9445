@@ -1,0 +1,21 @@
+docs/internal/spikes/org-streaming/R4COREFIX.md
+  s_3f3d4c91f992be::t_bbb16ab7b7ab3f 294-335,380-428,448-457,459
+docs/internal/spikes/org-streaming/r4corefix-diag-round3.log
+  s_3f3d4c91f992be::t_7edb895b8cd637 1-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "86d2212b9918692a8b7cd2c262ef940c041f9445",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
