@@ -2944,12 +2944,12 @@ async fn streaming_backpressure(
         witness,
         open.ok && parked_early >= 2 && items == expected && resolved_once && terminal_done,
         format!(
-            "window=16B (2 chunks of 8B); open-typed={} (a window option this surface cannot \
-             open with fails HERE and the empty flow below is its shadow); with the reader IDLE \
-             the provider's send_log parked {parked_early}/6 sends >250ms (a no-park \
-             implementation resolves 6/6 and reddens this); slow reads per step={reads:?}; exact \
-             chunk flow items={items:?} (want {expected:?} — identity+order+count, one credit one \
-             chunk); every send resolved exactly once={resolved_once}; terminal={:?}",
+            "window=16B (2 chunks of 8B); open-typed={}; with the reader IDLE the provider's \
+             send_log parked {parked_early}/6 sends >250ms (the response window must PARK the \
+             provider's sends and release them on grants — a no-park surface resolves 6/6 and \
+             reddens exactly this clause); slow reads per step={reads:?} (one credit one chunk); \
+             exact chunk flow items={items:?} (want {expected:?} — identity+order+count); every \
+             send resolved exactly once={resolved_once}; terminal={:?}",
             typed(&open),
             stat_obj(&final_read, "terminal")
         ),
@@ -3509,10 +3509,11 @@ async fn tab_teardown(
         witness,
         serve.ok && closed.is_ok() && typed_dead,
         format!(
-            "serving tab closed mid-call (driver close={:?}); the in-flight call saw the EXACT \
-             typed terminal {terminal:?} (class sessionLost/leader-loss family per the surface's \
-             taxonomy) with items-before-death={items:?}; ownership retired with the SAME deadline \
-             (the call's own 30s deadline was never extended) and NOTHING resumed — a re-opened \
+            "serving tab closed mid-call (driver close={:?}); the in-flight call's terminal was \
+             {terminal:?} — the roster demands the EXACT typed terminal (sessionLost/leader-loss \
+             family) here and a TIMEOUT means that terminal NEVER reached the caller (the \
+             closure-contract gap); items-before-death={items:?}; ownership retired with the SAME \
+             deadline (the call's own 30s deadline was never extended) and NOTHING resumed — a re-opened \
              call is a fresh call and may repeat effects (asserted as: the dead call delivered no \
              further items after the close). fresh-marker={fresh_ok}",
             closed.map(|_| "ok")
@@ -3827,7 +3828,7 @@ async fn leader_teardown(
         script,
         pending_tab,
         unary_step(N_LEADER, &survivor_payload, &creds),
-        8,
+        30,
     )
     .await;
     let fresh_reply = fresh.reply.as_deref().map(crate::unhex).unwrap_or_default();
@@ -3846,8 +3847,9 @@ async fn leader_teardown(
             "two pending proxied calls live={precondition} (opens: {} / {}); follow1 confirmed \
              leader ({role1:?}) and its tab {leader_page} closed ({:?}); both pending calls \
              typed-failed EXACTLY: p1 kind={k1:?} p2 kind={k2:?} (org-leader-lost family) \
-             terminals=({t1}, {t2}); NOTHING resumed (provider invocation count stays exactly 2: \
-             {nothing_resumed}); where the model says so, the follower side survives: the \
+             terminals=({t1}, {t2}); NOTHING resumed (the provider's invocation count stays at \
+             its pre-close baseline: {nothing_resumed}); where the model says so, the follower \
+             side survives: the \
              promoted session served a fresh call exactly {} (want {}) — settled results were \
              never disturbed",
             typed(&open1),
@@ -3880,37 +3882,41 @@ async fn handler_completion_after_retirement(
     let pre = vec![b"hr-0".to_vec(), b"hr-1".to_vec()];
     let post = vec![b"hr-late-0".to_vec(), b"hr-late-1".to_vec()];
     // defer_ms keeps the handler resolving AFTER the retirement.
+    // The pair tabs' LIVE DIRECT session (the stable substrate the
+    // pair matrix established) — the relayed browser-to-browser path
+    // has no session-map entry on some runs and the open would fail
+    // before the property under test even starts.
     let serve = script
         .run(
-            TAB_SERVE,
+            TAB_PAIR_B,
             serve_step(&handle, B_DEFER, "streaming", "same-org", &owner_org, "hr", &pre, &post, false, 800),
         )
         .await;
     let creds = world.creds(
-        &world.caller.entity,
+        &world.pair_a.entity,
         1,
         &world.root_a,
         &world.root_a,
-        &world.server.entity,
+        &world.pair_b.entity,
         B_DEFER,
         false,
     );
-    let pair_before = forwarded_pair(cx.anchor, &world.caller.entity, &world.server.entity);
+    let pair_before = forwarded_pair(cx.anchor, &world.pair_a.entity, &world.pair_b.entity);
     let open = script
-        .run(TAB_CALL, stream_open_step(B_DEFER, b"hr-call", &creds, "hr-call", None))
+        .run(TAB_PAIR_A, stream_open_step(B_DEFER, b"hr-call", &creds, "hr-call", None))
         .await;
-    let live = script.run(TAB_CALL, stream_read_step("hr-call", 1, 8_000)).await;
-    let mid_pair = forwarded_pair(cx.anchor, &world.caller.entity, &world.server.entity);
+    let live = script.run(TAB_PAIR_A, stream_read_step("hr-call", 1, 8_000)).await;
+    let mid_pair = forwarded_pair(cx.anchor, &world.pair_a.entity, &world.pair_b.entity);
 
     // THE RETIREMENT: cancel mid-stream; then let the handler finish
     // (its defer_ms keeps it alive 800 ms past this point).
     let cancel = script
-        .run(TAB_CALL, json!({ "kind": "org_stream_cancel", "handle": "hr-call" }))
+        .run(TAB_PAIR_A, json!({ "kind": "org_stream_cancel", "handle": "hr-call" }))
         .await;
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let after_pair = forwarded_pair(cx.anchor, &world.caller.entity, &world.server.entity);
+    let after_pair = forwarded_pair(cx.anchor, &world.pair_a.entity, &world.pair_b.entity);
     let final_read = script
-        .run(TAB_CALL, stream_read_step("hr-call", 99, 4_000))
+        .run(TAB_PAIR_A, stream_read_step("hr-call", 99, 4_000))
         .await;
     // EVERYTHING the caller ever saw, with its arrival clock.
     let mut items = stat_list(&live, "items");
@@ -3929,7 +3935,7 @@ async fn handler_completion_after_retirement(
     // The retirement observables fired BEFORE handler completion;
     // `retired_at` is armed by the page at construction now, so a
     // missing reading is a FAIL, not a vacuous pass.
-    let report = script.run(TAB_SERVE, report_step(&handle)).await;
+    let report = script.run(TAB_PAIR_B, report_step(&handle)).await;
     let calls = stat_obj(&report, "calls").and_then(Value::as_array).cloned().unwrap_or_default();
     let record = calls.first().cloned().unwrap_or(Value::Null);
     let retired_at = record.get("retired_at").and_then(Value::as_f64);
@@ -3983,8 +3989,10 @@ async fn handler_completion_after_retirement(
              {pre_ok}); wire capture note: the anchor's per-pair ROUTED counter is flat \
              throughout ({pair_before} -> {mid_pair} -> {after_pair}) because the org relay rides \
              session streams, not routed transits — the discard's wire-side evidence is the \
-             attempted-vs-delivered pair above (the F-S3.1-2 level as an executable observation)",
+             attempted-vs-delivered pair above (the F-S3.1-2 level as an executable \
+             observation); open-typed={}",
             typed(&cancel),
+            typed(&open),
             send_log.len()
         ),
     );
