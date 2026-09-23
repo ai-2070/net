@@ -1,0 +1,14 @@
+.github/workflows/ci.yml
+  h_64425bc75e3f3d 3617-3641
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6825c1056087a38b7431410e9f3ce2a946a80f14",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
