@@ -1508,3 +1508,24 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   closed; **Stage 4 Wave 1 dispatched** (`S4_BRIEF.md` @`0f2f2d69c`:
   `S4Node` / `S4Python` / `S4Go` / `S4Browser` concurrent; Wave 2 — the
   pure SDKs per Q6 and the cross-language vectors — gated on Wave 1).
+
+- 2026-09-22, **Wave 1 lane 1/4 closed: `S4Node` verified (executed)** at
+  `7efdd56d1` (impl `c62ecd740` + record; `S4_NODE.md` F16-ledgered): the
+  §4.4 Node verbs verbatim over the frozen seams (no new stream wrapper),
+  the one `OrgCaller` projection, the `classifyOrgError` mirror over the
+  single `OrgSdkError::to_wire` vocabulary, the typed wrappers reusing the
+  existing typed streams, and the stage-4-named rider (the §2.2 handler-drop
+  contract) documented on all six handler surfaces. Vitest 606 passed / 9
+  pre-existing skips at exact head; 10 new witnesses (per shape × call+serve
+  × same-org+granted + the coarse mirror + midstream classify + disposal +
+  the NEW consumer-compile probe with `skipLibCheck:false`); the REQUIRED
+  projection receipt reddening the attribution witnesses at their named
+  assertions (four weakenings NONE, witness sha locked, byte-identical
+  restore) — coordinator spot-check SCR-NODE v2 reproduced it with the napi
+  rebuild inside the cycle (mutation → 6 failed | 4 passed → restore →
+  rebuild → 10/10 green; v1 of that spot-check is INVALID and disclosed —
+  an unbuilt source mutation is non-execution). CI: the Node witness roster
+  gate (10 names, lexical, fail-closed) pinned beside the vitest run at
+  `6825c1056`. In-row defect found-and-fixed by its own probe (the napi cfg
+  trap in shipped `index.d.ts`); its ENOSPC truncation recovered
+  byte-exact; the index-sweep attribution corrected (S4Go's carved files).
