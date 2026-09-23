@@ -24,7 +24,6 @@ import os
 import socket
 import subprocess
 import sys
-import threading
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +91,7 @@ def main() -> None:
             "--vectors", args.vectors,
             "--caller-node-id", str(mesh.node_id),
         ],
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=sys.stderr,
         text=True,
@@ -103,21 +103,13 @@ def main() -> None:
             _fail(f"bad READY line: {ready!r}")
         provider_addr, provider_pub, provider_node = fields[1], fields[2], int(fields[3])
 
-        errors: list = []
-
-        def _accept() -> None:
-            try:
-                mesh.accept(provider_node)
-            except Exception as e:  # noqa: BLE001
-                errors.append(e)
-
-        t = threading.Thread(target=_accept, daemon=True)
-        t.start()
-        time.sleep(0.05)
+        # The CALLER only connects (the `_handshake` / Go-row shape: the
+        # acceptor accepts, the connector connects). A caller-side accept()
+        # arm that never completes (the provider never initiates) leaves
+        # `accept_in_flight` at `start()`, and the core then refuses to spawn
+        # the dispatch loop — warn-only, so the caller would silently process
+        # ZERO inbound packets (the discovery starve this harness hit once).
         mesh.connect(provider_addr, provider_pub, provider_node)
-        t.join(timeout=10)
-        if errors:
-            _fail(f"accept: {errors[0]!r}")
         mesh.start()
 
         request = bytes.fromhex(sc["request_hex"])
@@ -164,6 +156,13 @@ def main() -> None:
 
         if chunks != chunks_expected:
             _fail(f"chunks {chunks!r} != pinned {chunks_expected!r}")
+
+        # Lifetime contract: the provider sequences its teardown AFTER this
+        # drain confirmation — its serve handle's Drop retires live protected
+        # streams (a premature close becomes a 0x0005 CANCEL terminal instead
+        # of the clean eof across a process boundary).
+        proc.stdin.write("DRAINED\n")
+        proc.stdin.flush()
 
         result = proc.stdout.readline().strip()
         want = f"RESULT ok calls=1 chunks={len(chunks_expected)}"

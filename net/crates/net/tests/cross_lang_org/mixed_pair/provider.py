@@ -7,16 +7,22 @@ language serving a caller in ANOTHER, end to end over a real mesh. The Go
 orchestrator (``go/org_streaming_opening_vectors_test.go``) spawns this script
 and calls it.
 
-Protocol with the orchestrator (stdout):
+Protocol with the orchestrator (stdout / stdin):
 
 * ``READY <local_addr> <public_key_hex> <node_id>`` once the mesh node is
   built, the handler registered and ``accept(caller_node_id)`` is armed.
-* ``RESULT ok calls=<n>`` after one call served and every vector-pinned
-  assertion held, then the process exits 0.
+* ``DRAINED`` (stdin, from the orchestrator) once the caller's stream has
+  drained to the clean eof — the serve handle's Drop retires LIVE protected
+  streams (``ServeHandle::drop``, ``mesh_rpc.rs:487``), so teardown must wait
+  for the caller's drain or the terminal becomes ``0x0005`` CANCEL instead of
+  eof across a process boundary.
+* ``RESULT ok calls=<n>`` after one call served, every vector-pinned assertion
+  held AND ``DRAINED`` arrived; then the process exits 0.
 * ``RESULT fail <detail>`` on any mismatch (exit 1) — a decoder disagreement
   must not become success.
 * ``RESULT fail callback-loss`` (exit 2) if no call arrives before the
-  watchdog — callback loss must not become success.
+  watchdog, or ``DRAINED`` never arrives — callback loss must not become
+  success.
 
 The handler below is the lane's handler surface, so the F-S3.1-2 level is
 stated at it:
@@ -35,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import socket
 import sys
 import threading
@@ -109,6 +116,7 @@ def main() -> None:
     )
     served: dict = {}
     done = threading.Event()
+    handle = None
 
     def handler(caller: dict, request_got: bytes, sink) -> None:
         """The org server-streaming handler (see the handler-drop contract in
@@ -141,6 +149,15 @@ def main() -> None:
 
         pk = mesh.public_key
         pk_hex = pk if isinstance(pk, str) else bytes(pk).hex()
+
+        drained: queue.Queue = queue.Queue()
+
+        def _stdin_watch() -> None:
+            for raw in sys.stdin:
+                drained.put(raw.strip())
+            drained.put(None)  # EOF
+
+        threading.Thread(target=_stdin_watch, daemon=True).start()
         print(
             f"READY {mesh.local_addr} {pk_hex} {mesh.node_id}",
             flush=True,
@@ -157,7 +174,12 @@ def main() -> None:
         # `runStreamingLive` and Python `test_org_live` both serve on an
         # already-started pair): the scoped-emission cache is built at
         # registration and must see the running node.
-        net.serve_org_streaming(mesh, sc["service"], "granted", handler, None)
+        #
+        # The handle MUST stay bound for the serve lifetime: its Drop
+        # unregisters the service (RAII), so a discarded handle deregisters
+        # before the first announcement and the granted scoped envelope never
+        # seals — the service must outlive every call it serves.
+        handle = net.serve_org_streaming(mesh, sc["service"], "granted", handler, None)
         print("provider: serving, announcing", file=sys.stderr, flush=True)
 
         def _announce() -> None:
@@ -195,8 +217,25 @@ def main() -> None:
         if served.get("calls", 0) != 1:
             _fail(f"calls={served.get('calls', 0)} want exactly 1")
 
+        # Lifetime rule: the serve handle's Drop retires LIVE protected
+        # streams, and the chunk queue crossing a process boundary can still
+        # be draining here — wait for the caller's drain confirmation before
+        # any teardown (the 0x0005-lesson of the protocol's DRAINED line).
+        print("provider: awaiting DRAINED", file=sys.stderr, flush=True)
+        try:
+            line = drained.get(timeout=WATCHDOG_SECS)
+        except queue.Empty:
+            _fail("callback-loss: no DRAINED confirmation from the orchestrator", code=2)
+        if line != "DRAINED":
+            _fail(f"unexpected stdin line before teardown: {line!r}")
+
         print(f"RESULT ok calls=1 chunks={len(chunks)}", flush=True)
     finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             mesh.shutdown()
         except Exception:  # noqa: BLE001

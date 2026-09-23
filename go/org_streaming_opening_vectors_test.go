@@ -609,6 +609,10 @@ func TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start python provider: %v", err)
 	}
@@ -694,6 +698,14 @@ func TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider(t *testing.T) 
 	}
 	if sc.ExpectTerminal != "eof" {
 		t.Fatalf("expect_terminal = %q", sc.ExpectTerminal)
+	}
+
+	// Lifetime contract (finding 6): the provider sequences its teardown AFTER
+	// this drain confirmation — its serve handle's Drop retires live protected
+	// streams, and a chunk queue still draining across a process boundary
+	// becomes a 0x0005 CANCEL terminal instead of the clean eof.
+	if _, err := stdin.Write([]byte("DRAINED\n")); err != nil {
+		t.Fatalf("write DRAINED: %v", err)
 	}
 
 	result := readLine("RESULT")
