@@ -117,6 +117,7 @@ export {
   OrgSessionLostError,
   OrgStreamError,
   OrgTimeoutError,
+  ORG_SINK_CLOSED_REFUSAL,
   coarseAdmissionReason,
   orgRetireError,
   orgRetireReason,

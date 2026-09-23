@@ -31,10 +31,10 @@
 
 import {
   fromWasmError,
-  orgRetireError,
   orgRetireReason,
   orgTerminalError,
   OrgCancelledError,
+  ORG_SINK_CLOSED_REFUSAL,
   UnknownLeafError,
   type OrgRetireReason,
   type OrgStreamError,
@@ -189,9 +189,10 @@ export interface OrgDuplexHandles {
  * observed through the retirement observables (the terminal item, the
  * sink's typed closed refusal, and `retired`), never assumed as a
  * handler-side event; a detached observer holding `retired` observes
- * the signal. After retirement `send`/`close` refuse typed
- * ({@link orgRetireError} of the verdict) and a handler return value
- * is discarded.
+ * the signal. After retirement `send`/`close` refuse typed with THE
+ * closed refusal ({@link ORG_SINK_CLOSED_REFUSAL} — one text whatever
+ * the verdict, matching the leaf's own hardening byte for byte) and a
+ * handler return value is discarded.
  */
 export interface OrgResponseSink {
   send(payload: Uint8Array): Promise<void>;
@@ -572,7 +573,7 @@ export class OrgSink implements OrgResponseSink {
   }
 
   async send(payload: Uint8Array): Promise<void> {
-    if (this.verdict !== null) throw orgRetireError(this.verdict);
+    if (this.verdict !== null) throw new OrgCancelledError(ORG_SINK_CLOSED_REFUSAL);
     try {
       await this.inner.send(payload);
     } catch (error) {
@@ -582,7 +583,7 @@ export class OrgSink implements OrgResponseSink {
 
   /** Half-close the response direction: the call's normal ending. */
   async close(): Promise<void> {
-    if (this.verdict !== null) throw orgRetireError(this.verdict);
+    if (this.verdict !== null) throw new OrgCancelledError(ORG_SINK_CLOSED_REFUSAL);
     try {
       await this.inner.close();
     } catch (error) {

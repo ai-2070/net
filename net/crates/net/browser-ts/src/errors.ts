@@ -464,6 +464,14 @@ export type OrgRetireReason =
   | 'node-closed'
   | 'replaced';
 
+/**
+ * THE typed closed refusal of a handler-side sink after retirement —
+ * one text whatever the verdict, so the wrapper's belt (its own
+ * short-circuit) and the leaf's hardening (its rejection) are the
+ * same observable. The verdict itself is what `retired` reports.
+ */
+export const ORG_SINK_CLOSED_REFUSAL = 'org: the response sink is closed: the call was retired';
+
 const ORG_WIRE_PREFIX = 'org:';
 
 /** The three coarse buckets' wire tokens (`OrgSdkError::to_wire`). */
@@ -588,6 +596,11 @@ export function orgRetireReason(raw: string): OrgRetireReason {
  * conditions.
  */
 export function parseOrgError(message: string): OrgStreamError | null {
+  // The handler-side sink's typed closed refusal comes first: it
+  // starts with the wire prefix but is prose, not `org:<domain>:<kind>`.
+  if (message.startsWith('org: the response sink is closed:')) {
+    return new OrgCancelledError(message);
+  }
   if (message.startsWith(ORG_WIRE_PREFIX)) {
     const rest = message.slice(ORG_WIRE_PREFIX.length);
     const firstColon = rest.indexOf(':');

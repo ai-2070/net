@@ -24,6 +24,7 @@ import {
   OrgSessionLostError,
   OrgStreamError,
   OrgTimeoutError,
+  ORG_SINK_CLOSED_REFUSAL,
   orgRetireError,
   orgRetireReason,
   orgTerminalError,
@@ -398,10 +399,27 @@ describe('the handler surface (F-S3.1-2, C9)', () => {
     fake.emitRetired('timeout');
     // The verdict lands WITH the retirement observable; once it is
     // observed, every sink verb refuses typed — the "typed closed
-    // refusal" half of the F-S3.1-2 observables.
+    // refusal" half of the F-S3.1-2 observables. ONE text whatever
+    // the verdict (the verdict is `retired`'s report), matching the
+    // leaf's own hardening byte for byte.
     expect(await sink.retired).toBe('timeout');
-    await expect(sink.send(new Uint8Array([1]))).rejects.toBeInstanceOf(OrgTimeoutError);
-    await expect(sink.close()).rejects.toBeInstanceOf(OrgTimeoutError);
+    const sent = await sink.send(new Uint8Array([1])).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(sent).toBeInstanceOf(OrgCancelledError);
+    expect((sent as OrgCancelledError).message).toBe(ORG_SINK_CLOSED_REFUSAL);
+    const closed = await sink.close().then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(closed).toBeInstanceOf(OrgCancelledError);
+    expect((closed as OrgCancelledError).message).toBe(ORG_SINK_CLOSED_REFUSAL);
+    // And the same refusal crossing from a hardened leaf re-types
+    // identically — one observable on both paths.
+    const crossed = fromWasmError(new Error(ORG_SINK_CLOSED_REFUSAL));
+    expect(crossed).toBeInstanceOf(OrgCancelledError);
+    expect(crossed.message).toBe(ORG_SINK_CLOSED_REFUSAL);
     // The refusal never reached the boundary — the retirement record
     // is enough, and the handler's return value is discarded.
     expect(fake.sent).toHaveLength(0);
