@@ -1,0 +1,43 @@
+net/crates/net/cli/src/commands/org.rs
+  s_3f3d4c91f992be::t_2103c35221e990 80-150,462-626,628-629
+net/crates/net/cli/src/commands/enrollment.rs
+  s_3f3d4c91f992be::t_35e21d867901f2 191,249-251,323,349-359,378,501-544,588-589,738,750-751,794-811,852-854,865,877-881,895,952-958,982-1058,1195-1201,1303-1305
+  s_3f3d4c91f992be::t_6bc0a0bdb000a1 1687-1709,1746
+  s_3f3d4c91f992be::t_2103c35221e990 1246
+  s_3f3d4c91f992be::t_f2bbe884f34bd3 1306
+net/crates/net/sdk/src/enrollment/standalone.rs
+  s_3f3d4c91f992be::t_0195e47e951eba 257-262,440-444
+net/crates/net/cli/src/commands/lifecycle.rs
+  s_3f3d4c91f992be::t_cfda59ff412ab9 1258-1260,2118-2129,2242
+  s_3f3d4c91f992be::t_6bc0a0bdb000a1 133-135,159-223,489,493-494,508,625-636,1296-1299,1381-1524,1756-1757,1764-1765,2276-2278,2295,2317-2318,2335-2336
+  s_3f3d4c91f992be::t_0195e47e951eba 2410-2415,2427-2428,2449-2450
+net/crates/net/cli/src/commands/subnet.rs
+  s_3f3d4c91f992be::t_35e21d867901f2 256
+net/crates/net/cli/tests/org_join.rs
+  s_3f3d4c91f992be::t_cd5019188ad594 1-308,314-334
+  s_3f3d4c91f992be::t_9b2a8e6fb15c9d 309-313
+net/crates/net/sdk/tests/enrollment_subnet.rs
+  s_3f3d4c91f992be::t_0195e47e951eba 441
+net/crates/net/sdk/tests/enrollment_org.rs
+  s_3f3d4c91f992be::t_9b2a8e6fb15c9d 556
+  s_3f3d4c91f992be::t_7d10744f998798 349,539-541,548-550,552-555,559
+  s_3f3d4c91f992be::t_d35aac7ff65159 342-348,350-538,542-547,551,557-558,560-565
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_fefc52ce7fa922 1864-1962
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8c255a5369d7a4224ca5bffa2d2e6dd0f5ab2c9e",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
