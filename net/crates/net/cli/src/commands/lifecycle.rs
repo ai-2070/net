@@ -144,6 +144,26 @@ pub struct UpArgs {
     /// Do not register with any relay (overrides the profile and default).
     #[arg(long, requires = "enroll", conflicts_with = "relay")]
     pub no_relay: bool,
+
+    /// Root-signed subnet issuer grant (from `subnet issue-issuer`). With
+    /// `--subnet-issuer-key`, this node verifies subnet admission for the
+    /// grant's authority (floors persisted, readback served) and issues
+    /// delegated subnet credentials to devices joining with a subnet invite.
+    /// The subnet root key never sits on this node.
+    #[arg(long, value_name = "PATH", requires_all = ["enroll", "subnet_issuer_key"])]
+    pub subnet_issuer_grant: Option<PathBuf>,
+
+    /// The issuer key file named by `--subnet-issuer-grant`.
+    #[arg(long, value_name = "PATH", requires = "subnet_issuer_grant")]
+    pub subnet_issuer_key: Option<PathBuf>,
+
+    /// Lifetime of each delegated subnet credential (never beyond the grant).
+    #[arg(long, value_name = "DURATION", default_value = "24h", value_parser = crate::humantime::parse_duration)]
+    pub subnet_leaf_ttl: Duration,
+
+    /// Generation stamped on delegated subnet credentials.
+    #[arg(long, default_value_t = 1)]
+    pub subnet_generation: u32,
 }
 
 /// `net-mesh down` arguments.
@@ -658,6 +678,9 @@ struct NodeReport {
 /// live attach to that issuer's node succeeded.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct JoinedReport {
+    /// The joined subnet attachment, when the join carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subnet: Option<serde_json::Value>,
     issuer_fingerprint: String,
     domain_name: String,
     contact: Option<String>,
@@ -1040,19 +1063,53 @@ pub async fn run_up(
     };
     drop(secrets);
 
+    // A subnet issuer makes this node the subnet verifier too: it trusts the
+    // grant's authority, persists accepted floors and serves readback.
+    let subnet_issuer = match (&args.subnet_issuer_grant, &args.subnet_issuer_key) {
+        (Some(grant), Some(key)) => Some(
+            super::subnet::load_subnet_leaf_issuer(
+                grant,
+                key,
+                args.subnet_leaf_ttl,
+                args.subnet_generation,
+            )
+            .await?,
+        ),
+        _ => None,
+    };
     let built = net_sdk::MeshBuilder::new(&bind.to_string(), &psk)
         .map_err(|e| invalid_args(format!("mesh bind {bind}: {e}")));
     zeroize_slice(&mut psk);
-    let mesh = built?
+    let mut builder = built?
         .identity(identity.clone())
-        .try_port_mapping(port_mapping)
+        .try_port_mapping(port_mapping);
+    if let Some(issuer) = &subnet_issuer {
+        let authority = issuer.grant().authority.clone();
+        builder = builder
+            .subnet_authority(net_sdk::subnet::SubnetAuthorityConfig {
+                authority: authority.clone(),
+                roots: vec![authority],
+                maximum_grant_lifetime_secs:
+                    net::adapter::net::subnet::auth::MAX_SUBNET_GRANT_LIFETIME_SECS,
+            })
+            .subnet_floor_store(dir.join("subnet-floors"));
+    }
+    let mesh = builder
         .build()
         .await
         .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
     mesh.start();
+    let _subnet_readback = match &subnet_issuer {
+        Some(_) => Some(
+            mesh.node()
+                .serve_subnet_floor_status()
+                .map_err(|e| generic(format!("subnet floor readback: {e}")))?,
+        ),
+        None => None,
+    };
 
     let enrollment = match enroll_owner {
-        Some(owner) => Some(owner.start(&mesh, psk_value).await?),
+        Some(owner) => Some(owner.start(&mesh, psk_value, subnet_issuer.clone()).await?),
         None => None,
     };
     let joined_report = match joined.as_ref().and_then(|j| j.bundle().map(|b| (j, b))) {
@@ -1063,7 +1120,35 @@ pub async fn run_up(
                     Ok(path) => (Some(path.to_string()), None),
                     Err(e) => (None, Some(format!("attach failed: {e}"))),
                 };
+            // Subnet admission is proven on the session, by the verifier's
+            // verdict — not inferred from holding credentials.
+            let subnet = match (join.invite().subnet(), bundle.subnet_credentials()) {
+                (Some(offer), Some(set)) => {
+                    let admitted = if detail.is_some() {
+                        Err("not attached".to_string())
+                    } else {
+                        mesh.node()
+                            .present_subnet_credentials(
+                                c.node_id,
+                                &set,
+                                offer.scope.clone(),
+                                offer.rights,
+                                JOIN_ATTACH_WAIT,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())
+                    };
+                    Some(serde_json::json!({
+                        "scope": super::subnet::format_subnet(offer.scope.path),
+                        "rights": super::subnet::format_subnet_rights(offer.rights),
+                        "admitted": admitted.is_ok(),
+                        "detail": admitted.err(),
+                    }))
+                }
+                _ => None,
+            };
             Some(JoinedReport {
+                subnet,
                 issuer_fingerprint: join.invite().issuer_fingerprint(),
                 domain_name: join.invite().trust_domain_name().to_string(),
                 contact: c.addr.map(|a| a.to_string()),

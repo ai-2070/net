@@ -120,6 +120,7 @@ pub struct MeshBuilder {
     subnet_authorities: Vec<crate::subnet::SubnetAuthorityConfig>,
     subnet_attachment: Option<crate::subnet::TopologySubnetId>,
     subnet_control_channel: Option<net::adapter::net::ChannelName>,
+    subnet_floor_store: Option<std::path::PathBuf>,
     subnet_exports: Vec<crate::subnet::NamedSubnetExport>,
     /// RTC transport for this node (R6): a browser-facing anchor
     /// has to be constructible from the SDK, or the SDK's own
@@ -155,6 +156,7 @@ impl MeshBuilder {
             subnet_authorities: Vec::new(),
             subnet_attachment: None,
             subnet_control_channel: None,
+            subnet_floor_store: None,
             subnet_exports: Vec::new(),
             #[cfg(feature = "webrtc")]
             rtc: None,
@@ -255,6 +257,14 @@ impl MeshBuilder {
     /// should not rely on.
     pub fn subnet_attachment(mut self, path: crate::subnet::TopologySubnetId) -> Self {
         self.subnet_attachment = Some(path);
+        self
+    }
+
+    /// Persist accepted subnet revocation floors (subtree and subject) in
+    /// `dir`, replayed before any admission on restart — so a restarted
+    /// verifier can never re-admit a subject it removed.
+    pub fn subnet_floor_store(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.subnet_floor_store = Some(dir.into());
         self
     }
 
@@ -442,6 +452,9 @@ impl MeshBuilder {
         }
         if let Some(channel) = self.subnet_control_channel {
             config = config.with_subnet_control_channel(channel);
+        }
+        if let Some(dir) = self.subnet_floor_store {
+            config = config.with_subnet_floor_store(dir);
         }
         // Review-10 P1-6: the checked map is the NODE's, resolved and
         // frozen by `MeshNode::new`. Pushing the entries into the config

@@ -1941,6 +1941,14 @@ impl NetSession {
         !self.streams.is_empty()
     }
 
+    /// `true` if any open stream's id satisfies `counts`. Lets a caller
+    /// that knows which ids are control-plane (subprotocol frames ride a
+    /// stream whose id is the subprotocol id) ask about application
+    /// streams only.
+    pub fn has_open_streams_where(&self, counts: impl Fn(u64) -> bool) -> bool {
+        self.streams.iter().any(|entry| counts(*entry.key()))
+    }
+
     /// `true` if any stream on this session has unacked in-flight
     /// reliable data (a non-empty retransmit window). Walks the live
     /// streams and short-circuits on the first with pending packets.

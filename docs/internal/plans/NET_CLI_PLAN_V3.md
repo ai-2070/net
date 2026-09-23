@@ -1928,6 +1928,89 @@ Regressions:
 - Clippy (SDK `full` all-targets, SDK `net` lib, `net-cli`) and SDK rustdoc
   are clean.
 
+#### V3-2 S3 — CLI subnet join, `up` as verifier, and the removal journey (receipt, 2026-09-23)
+
+**CLI.**
+- `up --enroll --subnet-issuer-grant G --subnet-issuer-key K
+  [--subnet-leaf-ttl 24h] [--subnet-generation 1]` loads the root-signed issuer
+  grant and the issuer key; the root stays offline.
+- With that, the node:
+  - trusts the grant's authority;
+  - persists floors at `<state>/node/subnet-floors`;
+  - serves floor readback;
+  - issues one-hop leaves through `NodeBundles`.
+- Readiness reports `enrollment.subnet {authority, issuer_scope, max_rights,
+  topology_epoch, verifier: true}`.
+- `invite create --subnet PATH [--subnet-rights R]` builds the signed offer
+  and refuses anything outside the issuer grant **at creation**. `invite
+  inspect` shows the offer.
+- `join` reports `subnet.credentials: "installed"`.
+- Joined `up` presents the credentials over `0x0A02` after attaching and
+  reports `joined.subnet {scope, rights, admitted, detail}` from the
+  verifier's verdict, never from holding the credentials.
+- SDK: `MeshBuilder::subnet_floor_store`.
+
+**Core defect found and fixed** (user-approved direction: ignore control
+streams).
+- The routed-handshake and direct-upgrade busy gate
+  (`has_open_streams() || has_unacked()`) counted **every** stream. That
+  included the fire-and-forget control-plane subprotocol streams, whose id is
+  the subprotocol id, and those entries never go away.
+- So after any capability announcement, identity proof or subnet admission, a
+  **restarted** peer's re-handshake was deferred (`DeferBusy`) until the old
+  session timed out (30 s). That is longer than joined `up`'s 20 s attach.
+- An operator serving nRPC always triggered it, because it announces
+  capabilities to every peer.
+- The gate is now `session_is_busy`: unacked reliable data on any stream, or
+  an open stream whose id is not in `CONTROL_SUBPROTOCOL_STREAM_IDS` (every
+  registered subprotocol id). New wire method: `has_open_streams_where`.
+- This matches the gate's documented intent, and `has_open_streams`' own doc
+  ("control-plane traffic … is not counted").
+- In-flight reliable data still defers. The existing witnesses (application
+  ids `1` and `0xABCD`) keep their meaning.
+
+Witnesses:
+- Unit: `routed_rotation_ignores_control_plane_streams` (control-only →
+  `AcceptRotation`; plus an application stream → `DeferBusy`) and
+  `control_stream_list_covers_the_core_subprotocols`.
+- CLI `cli/tests/subnet_join.rs`, the full journey as real subprocesses in
+  about 11 s, stable across repeated runs:
+  1. The offline ceremony (root key, issuer key, issuer grant over `3`).
+  2. `up --enroll` with a PSK file and the subnet issuer.
+  3. An out-of-grant invite (`4.1`) is refused at creation.
+  4. `invite create --subnet 3.7`; `join` installs the credentials.
+  5. Joined `up` shows `admitted: true`.
+  6. `subnet remove` against the operator is attested `applied`, with
+     `complete: true`.
+  7. The device's next start shows `admitted: false`, detail `revoked`.
+
+Inverse mutations, 5 of 5 caught and restored:
+- the busy gate counting control streams again;
+- `0x0A02` left out of the control list;
+- joined `up` reporting admission without presenting;
+- `invite create` skipping the envelope check;
+- the `up` verifier keeping floors only in memory.
+
+Regressions:
+- `cargo tl` 5815/5815.
+- `net-mesh-wire` 276/276.
+- **Every** integration binary (`cargo t`): 7035/7035.
+- The full SDK suite as CI runs it: 810/810.
+- `net-cli` 351/351.
+- Clippy (core all-features all-targets, lib/bins all, default and
+  no-default; SDK `full`; `net-cli`) and rustdoc (root, `net-mesh-wire`, SDK
+  `full`) are clean.
+
+**V3-4 open items closed by this slice.** `up` is now a subnet verifier, and
+the CLI removal journey runs end to end.
+
+**Still open.**
+- `subnet remove` needs the mesh PSK. The operator supplies it with
+  `--psk-from file:` or `--psk-hex`; a generated PSK is not exported.
+- Standalone subnet join by an already-connected device (V3-2 task 3).
+- Leaf renewal before expiry.
+- Organization enrollment.
+
 ### V3-2A — channel-scoped invitation, join and credential lifecycle
 
 **Modify:** `src/adapter/net/mesh.rs` for exact publish-chain/cache lifecycle hooks; `sdk/src/identity.rs` to expose the canonical `TokenChain`; `sdk/src/mesh.rs` for a full-chain subscribe path; shared enrollment/persistence modules; `cli/src/commands/channel.rs`, `main.rs`, `context.rs`, `config.rs`; and the selected durable authority/runtime control owner. Modify `identity/token.rs` or `channel/config.rs` only for a separately source-proven gap.

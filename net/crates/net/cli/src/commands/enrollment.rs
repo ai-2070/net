@@ -279,6 +279,7 @@ impl EnrollOwner {
         self,
         mesh: &net_sdk::Mesh,
         psk: Psk,
+        subnet: Option<net_sdk::enrollment::bundle::SubnetLeafIssuer>,
     ) -> Result<RunningEnrollment, CliError> {
         let (tcp_mapping, udp_mapped) = if self.plan.port_mapping {
             let udp = async {
@@ -314,6 +315,7 @@ impl EnrollOwner {
             tcp_mapped,
             udp_mapped,
             contacts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            subnet: subnet.clone(),
         });
         let service = EnrollmentService::bind(
             self.bind,
@@ -340,6 +342,7 @@ impl EnrollOwner {
             key: service.enrollment_key(),
             default_endpoint,
             relay: relay.as_ref().map(|r| r.locator.clone()),
+            subnet,
             trust_domain,
             domain_name: self.plan.domain_name,
             bundles,
@@ -461,6 +464,8 @@ struct NodeBundles {
     tcp_mapped: Option<SocketAddr>,
     udp_mapped: Option<SocketAddr>,
     contacts: parking_lot::Mutex<std::collections::HashMap<String, SocketAddr>>,
+    /// Delegated subnet leaf issuance, when `up` runs with a subnet issuer.
+    subnet: Option<net_sdk::enrollment::bundle::SubnetLeafIssuer>,
 }
 
 impl NodeBundles {
@@ -504,7 +509,11 @@ impl NodeBundles {
     }
 
     fn issuer_for(&self, contact: MeshContact) -> MembershipIssuer {
-        MembershipIssuer::new(self.issuer.clone(), self.psk.clone(), contact)
+        let issuer = MembershipIssuer::new(self.issuer.clone(), self.psk.clone(), contact);
+        match &self.subnet {
+            Some(subnet) => issuer.with_subnet_issuer(subnet.clone()),
+            None => issuer,
+        }
     }
 }
 
@@ -566,6 +575,9 @@ pub(crate) struct EnrollmentReport {
     relay_error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     created: Vec<String>,
+    /// The subnet this node verifies and issues for, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subnet: Option<serde_json::Value>,
 }
 
 impl RunningEnrollment {
@@ -604,6 +616,16 @@ impl RunningEnrollment {
                 .as_ref()
                 .and_then(|r| r.state.lock().error.clone()),
             created: self.created.iter().map(|s| s.to_string()).collect(),
+            subnet: c.subnet.as_ref().map(|s| {
+                let g = s.grant();
+                serde_json::json!({
+                    "authority": hex::encode(g.authority.as_bytes()),
+                    "issuer_scope": super::subnet::format_subnet(g.scope),
+                    "max_rights": super::subnet::format_subnet_rights(g.maximum_rights),
+                    "topology_epoch": g.topology_epoch,
+                    "verifier": true,
+                })
+            }),
         }
     }
 
@@ -627,6 +649,7 @@ pub(crate) struct EnrollContext {
     key: EnrollmentKey,
     default_endpoint: Option<EnrollmentEndpoint>,
     relay: Option<RelayLocator>,
+    subnet: Option<net_sdk::enrollment::bundle::SubnetLeafIssuer>,
     trust_domain: TrustDomainId,
     domain_name: String,
     bundles: Arc<NodeBundles>,
@@ -682,6 +705,40 @@ impl EnrollContext {
                 .contact_addr(endpoint)
                 .ok_or_else(|| format!("address {} does not resolve", endpoint.as_str()))?;
         }
+        let (relations, subnet) = match request["subnet"].as_str() {
+            None => (vec![Relation::Mesh], None),
+            Some(path) => {
+                let issuer = self.subnet.as_ref().ok_or_else(|| {
+                    "this node has no subnet issuer; start it with --subnet-issuer-grant and \
+                     --subnet-issuer-key"
+                        .to_string()
+                })?;
+                let path = super::subnet::parse_subnet_path(path).map_err(|e| e.to_string())?;
+                let rights = super::subnet::parse_subnet_rights(
+                    request["subnet_rights"].as_str().unwrap_or("attach"),
+                )
+                .map_err(|e| e.to_string())?;
+                let grant = issuer.grant();
+                let offer = net_sdk::enrollment::invite::SubnetOffer {
+                    scope: net::adapter::net::subnet::SubnetRef {
+                        authority: grant.authority.clone(),
+                        path,
+                    },
+                    topology_epoch: grant.topology_epoch,
+                    rights,
+                };
+                if !issuer.covers(&offer) {
+                    return Err(format!(
+                        "subnet {} with {} is outside this node's issuer grant ({} with at most {})",
+                        super::subnet::format_subnet(path),
+                        super::subnet::format_subnet_rights(rights),
+                        super::subnet::format_subnet(grant.scope),
+                        super::subnet::format_subnet_rights(grant.maximum_rights),
+                    ));
+                }
+                (vec![Relation::Mesh, Relation::Subnet], Some(offer))
+            }
+        };
         let policy = InvitationPolicy::with_options(now, ttl, mode).map_err(|e| e.to_string())?;
         let invite = MembershipInvite::sign(
             &self.issuer,
@@ -691,8 +748,8 @@ impl EnrollContext {
                 endpoint: endpoint.clone(),
                 relay: self.relay.clone(),
                 enrollment_key: self.key,
-                subnet: None,
-                relations: vec![Relation::Mesh],
+                subnet: subnet.clone(),
+                relations,
                 intended_subject: intended,
                 policy,
             },
@@ -711,6 +768,10 @@ impl EnrollContext {
             "bearer": invite.is_bearer(),
             "endpoint": endpoint.as_ref().map(|e| e.as_str()),
             "relay": self.relay.as_ref().map(|r| r.endpoint.as_str()),
+            "subnet": subnet.as_ref().map(|o| json!({
+                "scope": super::subnet::format_subnet(o.scope.path),
+                "rights": super::subnet::format_subnet_rights(o.rights),
+            })),
             "issuer_fingerprint": invite.issuer_fingerprint(),
         }))
     }
@@ -918,6 +979,14 @@ pub struct CreateArgs {
     /// node's default direct address for this token.
     #[arg(long, value_name = "HOST:PORT")]
     pub addr: Option<String>,
+    /// Also attach the device to this subnet scope (dotted path), with a
+    /// delegated credential issued at redemption. Needs `up` started with a
+    /// subnet issuer whose grant covers it.
+    #[arg(long, value_name = "PATH")]
+    pub subnet: Option<String>,
+    /// Rights for `--subnet` (default `attach`; others only when named).
+    #[arg(long, value_name = "RIGHTS", requires = "subnet")]
+    pub subnet_rights: Option<String>,
 }
 
 /// `invite inspect` arguments.
@@ -1006,6 +1075,14 @@ pub async fn run_invite(
                 EnrollmentEndpoint::parse(addr).map_err(|e| invalid_args(format!("--addr: {e}")))?;
                 request["addr"] = json!(addr);
             }
+            if let Some(subnet) = &args.subnet {
+                super::subnet::parse_subnet_path(subnet)?;
+                request["subnet"] = json!(subnet);
+            }
+            if let Some(rights) = &args.subnet_rights {
+                super::subnet::parse_subnet_rights(rights)?;
+                request["subnet_rights"] = json!(rights);
+            }
             let mut reply = node_request(args.state_dir, profile_name, request).await?;
             if reply["bearer"] == Value::Bool(true) {
                 eprintln!(
@@ -1046,6 +1123,11 @@ pub async fn run_invite(
                 "issuer_fingerprint": invite.issuer_fingerprint(),
                 "endpoint": invite.endpoint().map(|e| e.as_str()),
                 "relay": invite.relay().map(|r| r.endpoint.as_str()),
+                "subnet": invite.subnet().map(|o| json!({
+                    "authority": hex::encode(o.scope.authority.as_bytes()),
+                    "scope": super::subnet::format_subnet(o.scope.path),
+                    "rights": super::subnet::format_subnet_rights(o.rights),
+                })),
                 "enrollment_key": hex::encode(invite.enrollment_key().0),
                 "domain_name": invite.trust_domain_name(),
                 "trust_domain": invite.trust_domain().to_string(),
@@ -1396,6 +1478,12 @@ pub async fn run_join(
             "trust_domain": trust_domain,
             "contact": contact.addr.map(|a| a.to_string()),
             "relay": contact.relay.as_ref().map(|r| r.endpoint.as_str()),
+            // Credentials installed; admission is proven by joined `up`.
+            "subnet": invite.subnet().map(|o| json!({
+                "scope": super::subnet::format_subnet(o.scope.path),
+                "rights": super::subnet::format_subnet_rights(o.rights),
+                "credentials": "installed",
+            })),
             "installed": true,
             "attached": true,
             // `null` when the bundle was already installed before this run.

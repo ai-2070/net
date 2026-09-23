@@ -614,7 +614,7 @@ async fn run_tree(
 /// Render a `SubnetId` for operator-facing output. Stable string
 /// that round-trips through human inspection (e.g. `"3.7.2"` for
 /// `SubnetId::new(&[3, 7, 2])`, `"global"` for `SubnetId::GLOBAL`).
-fn format_subnet(subnet: SubnetId) -> String {
+pub(crate) fn format_subnet(subnet: SubnetId) -> String {
     subnet.to_string()
 }
 
@@ -1629,6 +1629,26 @@ fn default_subnet_key_dir() -> Option<PathBuf> {
 /// interpolated: `toml::de::Error` embeds the offending source line,
 /// i.e. the seed), and a hand-edited `entity_id_hex` that disagrees
 /// with the seed refuses.
+/// Load the delegated subnet issuer `up --enroll` signs device leaves with:
+/// the root-signed issuer grant (the wire bytes `subnet issue-issuer`
+/// writes) and the issuer's key file, which must be the issuer the grant
+/// names.
+pub(crate) async fn load_subnet_leaf_issuer(
+    grant: &Path,
+    key: &Path,
+    lifetime: std::time::Duration,
+    generation: u32,
+) -> Result<net_sdk::enrollment::bundle::SubnetLeafIssuer, CliError> {
+    let bytes = tokio::fs::read(grant)
+        .await
+        .map_err(|e| invalid_args(format!("--subnet-issuer-grant {}: {e}", grant.display())))?;
+    let grant = SubnetIssuerGrant::from_bytes(&bytes)
+        .map_err(|e| invalid_args(format!("--subnet-issuer-grant: subnet:{e}")))?;
+    let key = load_subnet_key(key, false).await?;
+    net_sdk::enrollment::bundle::SubnetLeafIssuer::new(grant, key, generation, lifetime.as_secs())
+        .map_err(|e| invalid_args(format!("subnet issuer: {e}")))
+}
+
 async fn load_subnet_key(
     path: &Path,
     insecure_permissions: bool,
@@ -1707,7 +1727,7 @@ async fn publish_wire_artifact(
 /// Parse a dotted subnet path (`3.9.1`) or `global` into the compact
 /// hierarchy id — the inverse of [`format_subnet`], through the core's
 /// strict constructor.
-fn parse_subnet_path(raw: &str) -> Result<TopologySubnetId, CliError> {
+pub(crate) fn parse_subnet_path(raw: &str) -> Result<TopologySubnetId, CliError> {
     if raw.eq_ignore_ascii_case("global") {
         return Ok(TopologySubnetId::GLOBAL);
     }
@@ -1726,7 +1746,7 @@ fn parse_subnet_path(raw: &str) -> Result<TopologySubnetId, CliError> {
 }
 
 /// Parse comma-separated rights names into the strict core mask.
-fn parse_subnet_rights(raw: &str) -> Result<SubnetRights, CliError> {
+pub(crate) fn parse_subnet_rights(raw: &str) -> Result<SubnetRights, CliError> {
     let mut bits: u8 = 0;
     for part in raw.split(',') {
         let part = part.trim();
@@ -1747,7 +1767,7 @@ fn parse_subnet_rights(raw: &str) -> Result<SubnetRights, CliError> {
 }
 
 /// Render a rights mask as the canonical comma-separated names.
-fn format_subnet_rights(rights: SubnetRights) -> String {
+pub(crate) fn format_subnet_rights(rights: SubnetRights) -> String {
     let mut parts = Vec::new();
     if rights.contains(SubnetRights::ATTACH) {
         parts.push("attach");

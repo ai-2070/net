@@ -1911,6 +1911,31 @@ enum RoutedRotationOutcome {
     AcceptRotation,
 }
 
+/// Stream ids that carry only control-plane subprotocol frames: a
+/// subprotocol frame rides the stream whose id is its subprotocol id
+/// (`docs/SUBPROTOCOLS.md`). Such a stream holds no application state, so
+/// its mere existence must not make a session "busy" — otherwise any
+/// capability announcement, identity proof or subnet admission would
+/// leave the session busy for its whole life, and a peer that restarts
+/// could not re-handshake until the old session timed out. Unacked
+/// reliable data on any stream, these included, still counts as busy.
+const CONTROL_SUBPROTOCOL_STREAM_IDS: &[u16] = &[
+    0x0400, 0x0401, 0x0500, 0x0600, 0x0700, 0x0701, 0x0702, 0x0800, 0x0801, 0x0900, 0x0A00, 0x0A01,
+    0x0A02, 0x0B00, 0x0C00, 0x0C01, 0x0C02, 0x0C03, 0x0C04, 0x0D00, 0x0D01, 0x0D02, 0x0E00, 0x0F00,
+    0x1000, 0x1100,
+];
+
+fn is_control_stream_id(stream_id: u64) -> bool {
+    u16::try_from(stream_id).is_ok_and(|id| CONTROL_SUBPROTOCOL_STREAM_IDS.contains(&id))
+}
+
+/// The C3 busy gate: open APPLICATION streams, or unacked in-flight
+/// reliable data on any stream. Control-plane subprotocol streams alone
+/// do not make a session busy (see [`CONTROL_SUBPROTOCOL_STREAM_IDS`]).
+fn session_is_busy(session: &NetSession) -> bool {
+    session.has_unacked() || session.has_open_streams_where(|id| !is_control_stream_id(id))
+}
+
 /// Decide whether an inbound routed handshake is allowed to install
 /// new session keys for `peer_node_id`.
 ///
@@ -1947,7 +1972,7 @@ fn routed_rotation_outcome(
         // next re-handshake rotates, so recovery is never blocked
         // for longer than a fresh-static rotation would be.
         let live = !existing.session.is_timed_out(session_timeout);
-        let busy = existing.session.has_open_streams() || existing.session.has_unacked();
+        let busy = session_is_busy(&existing.session);
         if live && busy {
             return RoutedRotationOutcome::DeferBusy;
         }
@@ -48451,7 +48476,7 @@ impl MeshNode {
                 v.addr(),
                 v.session.session_id(),
                 v.remote_static_pub,
-                v.session.has_open_streams() || v.session.has_unacked(),
+                session_is_busy(&v.session),
             )
         }) else {
             return;
@@ -53366,6 +53391,71 @@ mod heartbeat_aead_tests {
             routed_rotation_outcome(&info, &static_a, &[0xDDu8; 32], Duration::from_secs(30)),
             RoutedRotationOutcome::DeferBusy,
         );
+    }
+
+    /// Control-plane subprotocol streams alone never make a session
+    /// busy: a peer that restarted after exchanging announcements, an
+    /// identity proof or a subnet admission re-handshakes at once. An
+    /// application stream beside them still defers.
+    #[test]
+    fn routed_rotation_ignores_control_plane_streams() {
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        for id in [0x0C00u64, 0x0A01, 0x0A02, 0x0B00] {
+            session.get_or_create_stream(id);
+        }
+        assert!(session.has_open_streams(), "control streams exist");
+        let static_a = [0xAAu8; 32];
+        let info = |session: Arc<NetSession>| PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            transport: PeerTransport::Direct { owned: addr },
+            session,
+            remote_static_pub: static_a,
+            last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
+        };
+        assert_eq!(
+            routed_rotation_outcome(
+                &info(session.clone()),
+                &static_a,
+                &[0xDDu8; 32],
+                Duration::from_secs(30)
+            ),
+            RoutedRotationOutcome::AcceptRotation,
+            "control-plane streams alone must not defer a rotation",
+        );
+        session.get_or_create_stream(0xABCD);
+        assert_eq!(
+            routed_rotation_outcome(
+                &info(session),
+                &static_a,
+                &[0xDDu8; 32],
+                Duration::from_secs(30)
+            ),
+            RoutedRotationOutcome::DeferBusy,
+            "an application stream still defers",
+        );
+    }
+
+    /// Every always-compiled subprotocol id is in the control-stream list,
+    /// so a new control subprotocol cannot silently make sessions busy.
+    #[test]
+    fn control_stream_list_covers_the_core_subprotocols() {
+        for id in [
+            crate::adapter::net::identity::SUBPROTOCOL_IDENTITY_PROOF,
+            crate::adapter::net::subnet::admission_wire::SUBPROTOCOL_SUBNET_ADMISSION,
+            crate::adapter::net::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN,
+            crate::adapter::net::behavior::broadcast::SUBPROTOCOL_ROUTE_WITHDRAW,
+            crate::adapter::net::behavior::broadcast::SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
+            crate::adapter::net::subprotocol::SUBPROTOCOL_NEGOTIATION,
+        ] {
+            assert!(is_control_stream_id(u64::from(id)), "{id:#06x} missing");
+        }
+        assert!(!is_control_stream_id(0xABCD));
+        assert!(!is_control_stream_id(1));
+        assert!(!is_control_stream_id(u64::from(u16::MAX) + 0x0400));
     }
 
     /// The DeferBusy liveness bound: a busy session that has gone idle
