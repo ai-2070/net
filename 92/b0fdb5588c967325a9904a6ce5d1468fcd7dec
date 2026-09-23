@@ -1,0 +1,100 @@
+docs/internal/spikes/org-streaming/S4_BROWSER.md
+  h_64425bc75e3f3d 1-179
+net/crates/net/browser-ts/src/errors.ts
+  h_64425bc75e3f3d 37-46,261-640,729-734
+net/crates/net/browser-ts/src/index.ts
+  h_64425bc75e3f3d 42-77,109-123,125,137,139-140
+net/crates/net/browser-ts/src/leader/session.ts
+  h_64425bc75e3f3d 30-59,161-166,180-182,193,195,418-800,848-851
+net/crates/net/browser-ts/src/leader/wasm.ts
+  h_64425bc75e3f3d 15-25,73-118
+net/crates/net/browser-ts/src/node.ts
+  h_64425bc75e3f3d 20-44,345-350,486-788,1087-1095
+net/crates/net/browser-ts/src/org.ts
+  h_64425bc75e3f3d 1-800
+net/crates/net/browser-ts/src/wasm.ts
+  h_64425bc75e3f3d 191-351,377-426
+net/crates/net/browser-ts/test/fake-leader-wasm.ts
+  h_64425bc75e3f3d 19-24,27-38,124-131,293-456
+net/crates/net/browser-ts/test/fake-wasm.ts
+  h_64425bc75e3f3d 27-41,160-167,198-234,404-505,560-762
+net/crates/net/browser-ts/test/org.test.ts
+  h_64425bc75e3f3d 1-620
+net/crates/net/leaf/Cargo.lock
+  h_64425bc75e3f3d 40-45,57-65,102-114,139-144,214-228,247-252,409-420,525-533,546-559,648,656-657,778-790,999-1013
+net/crates/net/leaf/Cargo.toml
+  h_64425bc75e3f3d 95-103
+net/crates/net/leaf/src/anchor_control_plane.rs
+  h_64425bc75e3f3d 14,18-36,49-52,134-138,161-164,188-201,213,216-260,317,323,507-566
+net/crates/net/leaf/src/control_plane.rs
+  h_64425bc75e3f3d 269-290
+net/crates/net/leaf/src/dispatch.rs
+  h_64425bc75e3f3d 142-178,275-287
+net/crates/net/leaf/src/leader.rs
+  h_64425bc75e3f3d 567-743,2133-2171,2298-2402,2491-2554
+net/crates/net/leaf/src/leader_session.rs
+  h_64425bc75e3f3d 44,1872-1874,1891-1899,1969-2365,2534,3150-4013
+net/crates/net/leaf/src/lib.rs
+  h_64425bc75e3f3d 69-77,83-84
+net/crates/net/leaf/src/mock_control_plane.rs
+  h_64425bc75e3f3d 80-85,102,107-110,118,153-157,182,212-265,512-520,736-789
+net/crates/net/leaf/src/node.rs
+  h_64425bc75e3f3d 34-36,38-43,569-590,599-604,632-637,1233-1239,1246,1249-1251,1269-1276,1297-1298,1300,1320-1327,1364-1372,1949-2414,3247-3258,3260-3277,3333-3380,3534-3552
+net/crates/net/leaf/src/org/admission.rs
+  h_64425bc75e3f3d 1-694
+net/crates/net/leaf/src/org/cert.rs
+  h_64425bc75e3f3d 1-812
+net/crates/net/leaf/src/org/digest.rs
+  h_64425bc75e3f3d 1-77
+net/crates/net/leaf/src/org/entity.rs
+  h_64425bc75e3f3d 1-161
+net/crates/net/leaf/src/org/grant.rs
+  h_64425bc75e3f3d 1-1105
+net/crates/net/leaf/src/org/mod.rs
+  h_64425bc75e3f3d 1-96
+net/crates/net/leaf/src/org/proof.rs
+  h_64425bc75e3f3d 1-682
+net/crates/net/leaf/src/org/replay.rs
+  h_64425bc75e3f3d 1-842
+net/crates/net/leaf/src/org/revocation.rs
+  h_64425bc75e3f3d 1-74
+net/crates/net/leaf/src/rpc.rs
+  h_64425bc75e3f3d 218-234,247-249
+net/crates/net/leaf/src/rpc_serve.rs
+  h_64425bc75e3f3d 1-1257
+net/crates/net/leaf/src/rpc_stream.rs
+  h_64425bc75e3f3d 1-1220
+net/crates/net/leaf/src/rpc_wire.rs
+  h_64425bc75e3f3d 1-2,19-23,29-30,32,39-41,43-45,77-106,122-139,145-146,302-308,310,315-327,342-403,419-444,475-616,648-733,737-740,747-751,757-768,771-772,774-783,785-828,831,840-1009,1028-1058,1073-1078
+net/crates/net/leaf/src/wasm.rs
+  h_64425bc75e3f3d 396,398-411,1487,1563-1564,3794-3811,4121,4127-4140,4152-4154,4503-6388
+net/crates/net/leaf/tests/nrpc_streaming_parity.rs
+  h_64425bc75e3f3d 1-886
+net/crates/net/leaf/tests/org_authority.rs
+  h_64425bc75e3f3d 1-931
+net/crates/net/leaf/tests/org_streaming_lifecycle.rs
+  h_64425bc75e3f3d 1-1814
+net/crates/net/tests/rtc_browser/page/org.html
+  h_64425bc75e3f3d 1-11
+net/crates/net/tests/rtc_browser/page/org.js
+  h_64425bc75e3f3d 1-812
+net/crates/net/tests/rtc_browser/runner/Cargo.lock
+  h_64425bc75e3f3d 141-149,339-344,547-552,1179-1187,1214-1227,1665-1688,2005,2257,2259,2544,2712-2714,2726-2731,3195-3204
+net/crates/net/tests/rtc_browser/runner/Cargo.toml
+  h_64425bc75e3f3d 29,34-39
+net/crates/net/tests/rtc_browser/runner/src/main.rs
+  h_64425bc75e3f3d 174,217,610-615,709-710,715-716,765-790,1392-1397,1400,1402,1407,1470-1473,1512-1513,1576-1580,1584,1587,1591,1823-1824,1881,1992-2003,2011-2012,2211-2267,3922-3928
+net/crates/net/tests/rtc_browser/runner/src/org_stream.rs
+  h_64425bc75e3f3d 1-3914
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "92b0fdb5588c967325a9904a6ce5d1468fcd7dec",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
