@@ -1476,3 +1476,35 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   the handler future without a final poll; the contract is the retirement
   observables; no core change) for review adjudication. Stage 3 proceeds to
   independent review.
+
+- 2026-09-22, **Stage 3 independent review verdict: ACCEPT**
+  (`S3_REVIEW_PACKET.md`, pinned head `2225de011`, confidence 0.9): the
+  estate reproduced exactly (10/10 roster-matched, 338/338, 42/42, probe
+  0/0 at head and pre-S3.3), the **§4.3 verb table holds VERBATIM
+  line-by-line**, the frozen type list gains nothing (`mesh_rpc.rs` +64/−0 =
+  exactly the five ruled `pub(crate)` constructors), the REQUIRED pin
+  receipt reproduced verbatim, and the Stage 3 Exit holds in 13 of 16
+  shape×mode×role cells. F-S3.1-2 adjudicated a **documented limitation**
+  with a Stage-4-named rider (the §2.2 handler-drop contract; the cancel
+  witness's observation level matches the logical-exactly-once promise).
+  **Its three non-blocking findings closed by the S3R repair round**
+  (`b879ca4f8` over `0c580ca46` / `b5143865c`): **F-S3R-1** — the Granted
+  facade serve arms witnessed (`granted_facade_streaming_serve_rows_complete_cross_org`;
+  the per-arm flips each red at its own leg's named assertion — closing the
+  Stage-4 dispatch-through-arms hazard); **F-S3R-2** — the Q1 facade default
+  deadline witnessed (`facade_default_deadline_at_zero_outlives_a_shorter_provider_default`,
+  the short-`default_live` discriminator); **F-S3R-3** — the bytes rows
+  witnessed (`org_stream_raw_surfaces_midstream_errors_as_items`,
+  `call_client_stream_bytes_deadline_reaches_a_typed_terminal`) with the
+  **premise corrected** (the landed `Err` arm already surfaces items per
+  §4.3 — the packet's "swallow" was the M8 mutation state; Row 3 is a pure
+  witness row; zero production change). Five receipts (R1a/b/c, R2, R3),
+  zero weakenings; the coordinator re-executed R3 (the M8 swallow red at the
+  Row-3a assertion; two coordinator-side anchor/formatting attempts
+  guard-caught and disclosed). Arithmetic correction on record: the floor is
+  **14** (the closure names four witnesses), not the brief's "expected 13" —
+  the lane's count governs. Estate after S3R: `org_streaming` **14/14** (CI
+  JUnit floor 14), 338/338, 42/42, probe 0/0 unchanged. Stage 3 fully
+  closed; **Stage 4 Wave 1 dispatched** (`S4_BRIEF.md` @`0f2f2d69c`:
+  `S4Node` / `S4Python` / `S4Go` / `S4Browser` concurrent; Wave 2 — the
+  pure SDKs per Q6 and the cross-language vectors — gated on Wave 1).

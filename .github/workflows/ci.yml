@@ -2422,16 +2422,18 @@ jobs:
       # test in its own process); this gate PINS its result set — a witness
       # must not disappear silently. Fail-closed on identity/verdict/retries/
       # anti-vacuity per the gate contract above; `--self-test` proves the
-      # predicates first. Floor = 10 at the Stage-3 head (rows 3.1-3.3); raised
-      # with each landing, names extended in the same commit as the witnesses.
-      - name: Witness floor — org_streaming (Stage 3 Rust org facade, 10)
+      # predicates first. Floor = 14 at the S3R head (the 10-roster + the four
+      # S3R closure witnesses: the Granted-arm rows, the Q1 default deadline,
+      # the OrgStreamRaw error items, the CS-seam typed terminal); raised with
+      # each landing, names extended in the same commit as the witnesses.
+      - name: Witness floor — org_streaming (Stage 3 facade + S3R, 14)
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
           CHECK="$GITHUB_WORKSPACE/.github/scripts/check-witness-results.py"
           python3 "$CHECK" --self-test || exit 1
           python3 "$CHECK" --junit "$RUNNER_TEMP/sdk-suite-junit.xml" \
-            --suite org_streaming --min 10 \
+            --suite org_streaming --min 14 \
             live_same_org_streaming_through_the_facade \
             live_same_org_client_stream_through_the_facade \
             live_same_org_duplex_through_the_facade \
@@ -2441,7 +2443,11 @@ jobs:
             facade_stream_against_unary_only_provider_is_not_supported \
             dropping_org_stream_emits_one_cancel \
             handler_receives_verified_org_caller_not_origin \
-            revocation_surfaces_as_final_admission_denied_item || exit 1
+            revocation_surfaces_as_final_admission_denied_item \
+            granted_facade_streaming_serve_rows_complete_cross_org \
+            facade_default_deadline_at_zero_outlives_a_shorter_provider_default \
+            org_stream_raw_surfaces_midstream_errors_as_items \
+            call_client_stream_bytes_deadline_reaches_a_typed_terminal || exit 1
 
       # === S1: the CONSUMER observation lifecycle ==========================
       #

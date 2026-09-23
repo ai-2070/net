@@ -131,6 +131,27 @@ source-established label and its receipt per the brief's evidence rules.
   `raise_between_reserve_and_install_denies_with_zero_effects` is a **named
   rewrite** (it pinned the mapping the ruling corrected — F1 precedent:
   strengthened to the owner-approved property, never silently re-pinned).
+- **2026-09-22, S3R repair round verified (executed).** All three S3Review
+  ACCEPT findings closed at `b879ca4f8` (commits `0c580ca46` four witnesses,
+  `b5143865c` five receipts as the empty tree-change, `b879ca4f8` record).
+  **Premise correction accepted (the lane's, credited):** the landed
+  `OrgStreamRaw` `Err` arm already surfaces `Ready(Some(Err(_)))` per §4.3 —
+  the packet's "swallow" describes the M8 mutation state; Row 3 is a PURE
+  WITNESS row with zero production change (verified: `call.rs`/`serve.rs`
+  baselines untouched, probe pin unchanged). Receipts: R1a/b/c (the three
+  Granted-arm flips, each red at its own leg's named assertion), R2 (the
+  0-arm deadline inverse), R3 (the M8 swallow → the Row-3a named panic) —
+  zero weakenings; one disclosed pre-receipt Row-1 instrument tightening.
+  Coordinator spot-check SCR3 reproduced R3 (the swallow red at
+  `org_stream_raw_surfaces_midstream_errors_as_items`, `git checkout`
+  restored clean) — with two coordinator-side anchor/formatting attempts
+  first (the 4× shared-arm shape; a missing match-arm comma), both
+  guard-caught with clean restores and zero writes, disclosed per the
+  receipt discipline. **Arithmetic correction (the lane's count governs):**
+  the floor is **14** — the closure names FOUR witnesses (Row 3 names two),
+  not the brief's "expected 13". Estate after S3R: `org_streaming` 14/14
+  (CI JUnit floor 14), 338/338, 42/42, probe 0/0 (zero public change).
+  Stage 3 is fully closed; Stage 4 Wave 1 is dispatched.
 - **2026-09-22, Stage 3 verified (executed).** Landed over six commits
   (`d63e9c615`…`b7aaacdc5`, rows 3.1–3.3 pairs; §6). Estate at head:
   `org_streaming` **10/10** at the plan's named command, SDK org estate
