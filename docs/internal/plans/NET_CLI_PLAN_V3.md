@@ -306,6 +306,91 @@ reissue to every sibling (collateral revocation), and expiry-only removal
 real reconnect; C stays authorized in the same subnet; and the result survives
 a verifier restart.
 
+**Pinned design (source-surveyed 2026-09-23, before any code).** Each item
+answers the constraint with the same number above.
+
+1. **Artifact.** `SubnetSubjectFloor` v1, signed over the domain
+   `net.subnet.subject-floor.v1`. Fields:
+   - `authority` + `path`: the authority-qualified scope S;
+   - `topology_epoch`;
+   - `issuer`: must be a configured **root**; delegated issuers cannot sign it;
+   - `subject`: the full 32-byte `EntityId`;
+   - `rights`: strict, non-empty mask;
+   - `minimum_generation`;
+   - `revision`: ordering per `(scope, subject)`;
+   - `issued_at`.
+
+   It travels as control-fact kind **5** (`subject_floor`). The allocation was
+   verified before reserving: `SubnetFactKind` uses 1..=4, nothing uses 5, and
+   the only other subnet tag space (`SubnetCredentialSet` 1/2) is a separate
+   decoder, told apart by exact length.
+2. **Monotone and durable.**
+   - The registry keeps one generation per
+     `(authority, topology epoch, path, subject, right bit)`. It is **never
+     lowered**.
+   - A fact applies only with a strictly higher revision for its
+     `(scope, subject)`. A replayed or reordered fact is an `applied: false`
+     no-op.
+   - Accepted floors of both kinds (subtree and subject) are persisted in a
+     node-owned protected store (`EnrollmentStorage`: atomic replace, exclusive
+     owner). The store holds the latest signed bytes per key.
+   - It is written **before** `apply` returns `Ok(applied: true)`. If the write
+     fails, the in-memory registry keeps the stricter state, since floors only
+     remove authority, and `apply` returns `Err`, so nothing reports it
+     committed.
+   - At start-up the store is loaded, every fact is re-verified against the
+     configured roots and re-applied **before** any admission. A corrupt store
+     refuses start.
+3. **Scope semantics.**
+   - The floor is checked against the **admitted target (attachment) path**,
+     not the grant's scope. A subject floor at S therefore applies to any B
+     session attaching inside S, whichever grant it presents, including a grant
+     scoped at an ancestor of S. An ancestor-scoped alternative credential
+     cannot defeat the removal.
+   - Delegated credentials: a `OneHop` leaf (issued through a
+     `SubnetIssuerGrant`) is refused for a floored right inside S **regardless
+     of its generation**.
+   - Re-admission is therefore only through a root-direct grant (item 4).
+     Holding an issuer grant does not let B re-issue itself back in.
+   - B's authority outside S is untouched.
+4. **Generation.** The **leaf** grant's `generation` (the subject's own
+   credential) is compared with the floor's per-right generation. B is
+   re-admitted to S only by a root-direct leaf with
+   `generation ≥ minimum_generation`. Retrying `join` presents the old leaf and
+   is refused.
+5. **Rights.**
+   - The floor covers exactly the rights it names. Admission is refused when B
+     requests any covered right inside S.
+   - Issuance defaults to **ATTACH only**. ROUTE and EXPORT are covered only
+     when named explicitly. Nothing broadens silently.
+   - Peer contexts are consulted at their attachment (the relay reads
+     ingress/egress attachment; forwarding rights come from the gateway's own
+     credentials). So the floor governs where B may be admitted, and says
+     nothing about the gateway's own forwarding authority.
+6. **Propagation.**
+   - Apply returns `{kind, applied}` to the local caller only. On the channel
+     path an old or unreachable verifier is silent.
+   - No remote readback path exists yet. The CLI therefore reports
+     **issued / signed**, not "removed", and names enforcement as `pending`
+     until a verifier's own apply result is observed.
+   - A management readback verb is a follow-up; this slice does not claim
+     fleet-wide enforcement.
+7. **Mixed versions.**
+   - A pre-kind-5 verifier decodes tag 5 as `InvalidFormat`. On the API path
+     that is an error returned to the caller (reported as `unsupported`). On
+     the channel path it is dropped and logged, which is why item 6 never
+     reports it as applied.
+   - The fixture and every decoder are updated in one commit:
+     `stable_kinds.json` `fact_kinds`, SDK `render_stable_kind_fixture`,
+     `fact_kind_wire`, the DTO, and the Node, Python and Go kind tests.
+8. **Invalidation is subject-scoped.** Applying a subject floor does **not**
+   advance the authority-wide `subnet_auth_epoch`. It drops only the contexts
+   whose `subject` is B, whose authority is A, whose attachment lies inside S,
+   whose requested rights intersect the covered rights, and whose leaf fails
+   the generation rule. Siblings keep their contexts and sessions; the witness
+   asserts C's **same** context survives, not a re-admission. Subtree floors
+   keep their existing authority-wide behaviour.
+
 ### 6.2 Honest scope of the result
 
 A removal result separates:
