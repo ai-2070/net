@@ -213,12 +213,14 @@ function trackedSink(entry, sink) {
     async close() {
       await sink.close();
     },
-    get retired() {
-      return sink.retired.then((reason) => {
-        entry.retired_at = performance.now();
-        return reason;
-      });
-    },
+    // ARMED at construction: the retirement observable must record
+    // its clock reading whether or not the handler awaits it (a lazy
+    // getter nobody touches silently leaves `retired_at` null and the
+    // F-S3.1-2 witnesses read it).
+    retired: sink.retired.then((reason) => {
+      entry.retired_at = performance.now();
+      return reason;
+    }),
   };
 }
 

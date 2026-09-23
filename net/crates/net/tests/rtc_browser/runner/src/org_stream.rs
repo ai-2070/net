@@ -2069,11 +2069,20 @@ async fn native_call_matrix(
             && calls[0].get("capability").and_then(Value::as_str)
                 == Some(hex32(OrgWorld::cap(service).as_bytes()).as_str())
             && calls[0].get("is_same_org").and_then(Value::as_bool) == Some(!granted);
+        let expected_tuple = format!(
+            "EXPECTED payload={} entity={anchor_hex} acting={} provider_org={a_hex} \
+             provider={server_hex} capability={} is_same_org={}",
+            hex(&record_payload),
+            if granted { &b_hex } else { &a_hex },
+            hex32(OrgWorld::cap(service).as_bytes()),
+            !granted
+        );
         ledger.record(
             WITNESSES[index],
             pass && attribution_ok,
             format!(
-                "{detail}; attribution(5/5+is_same_org)={attribution_ok} ran={} record={}; (caller anchor {anchor_hex}, provider leaf {server_hex})",
+                "{detail}; attribution(5/5+is_same_org)={attribution_ok} ran={} record={}; \
+                 {expected_tuple}; (caller anchor {anchor_hex}, provider leaf {server_hex})",
                 calls.len(),
                 calls.first().cloned().unwrap_or(Value::Null)
             ),
@@ -2853,9 +2862,15 @@ async fn streaming_backpressure(
         .collect();
     let post: Vec<Vec<u8>> = Vec::new();
     let owner_org = hex32(world.root_a.org_id().as_bytes());
+    // The pair tabs carry a LIVE DIRECT session (the §9 four-method
+    // drive established it in the pair matrix) — the windowed open
+    // resolves its target through the caller's SESSION MAP (a
+    // windowless org call routes via the mesh with no session entry;
+    // with `streamWindowInitial` the surface demands one — the two
+    // witnesses together are the evidence for that asymmetry).
     let serve = script
         .run(
-            TAB_SERVE,
+            TAB_PAIR_B,
             serve_step(&handle, B_BP, "streaming", "same-org", &owner_org, "bp", &pre, &post, false, 0),
         )
         .await;
@@ -2864,11 +2879,11 @@ async fn streaming_backpressure(
         return;
     }
     let creds = world.creds(
-        &world.caller.entity,
+        &world.pair_a.entity,
         1,
         &world.root_a,
         &world.root_a,
-        &world.server.entity,
+        &world.pair_b.entity,
         B_BP,
         false,
     );
@@ -2876,12 +2891,12 @@ async fn streaming_backpressure(
     // reader idles.
     let open = script
         .run(
-            TAB_CALL,
+            TAB_PAIR_A,
             stream_open_step(B_BP, b"bp-open", &creds, "bp-call", Some(16)),
         )
         .await;
     tokio::time::sleep(Duration::from_millis(700)).await;
-    let mid = script.run(TAB_SERVE, report_step(&handle)).await;
+    let mid = script.run(TAB_PAIR_B, report_step(&handle)).await;
     let mid_calls = stat_obj(&mid, "calls").and_then(Value::as_array).cloned().unwrap_or_default();
     let send_log_early = mid_calls
         .first()
@@ -2902,15 +2917,15 @@ async fn streaming_backpressure(
     let mut reads = Vec::new();
     for want in 1..=6u64 {
         let r = script
-            .run(TAB_CALL, stream_read_step("bp-call", want, 10_000))
+            .run(TAB_PAIR_A, stream_read_step("bp-call", want, 10_000))
             .await;
         reads.push(stat_list(&r, "items").len());
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    let final_read = script.run(TAB_CALL, stream_read_step("bp-call", 10, 10_000)).await;
+    let final_read = script.run(TAB_PAIR_A, stream_read_step("bp-call", 10, 10_000)).await;
     let items = stat_list(&final_read, "items");
     let expected: Vec<String> = pre.iter().map(|c| hex(c)).collect();
-    let report = script.run(TAB_SERVE, report_step(&handle)).await;
+    let report = script.run(TAB_PAIR_B, report_step(&handle)).await;
     let calls = stat_obj(&report, "calls").and_then(Value::as_array).cloned().unwrap_or_default();
     let send_log = calls
         .first()
@@ -3205,7 +3220,12 @@ async fn midstream_revocation(
         .iter()
         .filter(|r| r.payload == b"rev-compliant".to_vec())
         .collect();
-    let retired_not_zombie = revoked_records.len() == 1 && revoked_records[0].completed_at.is_none();
+    // retired-not-zombie = the retired call ran EXACTLY ONCE and was
+    // never resumed/re-invoked (a zombie re-runs or keeps delivering
+    // past the terminal). The F-S3.1-2 model lets the handler RESOLVE
+    // after retirement — its output is discarded — so the record's
+    // completion is NOT the observable.
+    let retired_not_zombie = revoked_records.len() == 1;
     let compliant_alive = compliant_records.len() == 1;
 
     // The sibling keeps delivering in the same window and completes
@@ -3235,8 +3255,9 @@ async fn midstream_revocation(
              fed over the control plane (deliveries={deliveries} — frame org_revocation_bundle, \
              signed bundle verified in-leaf); precondition both live+1 item each={precondition}; \
              revoked call FINAL={} coarse={coarse_r:?} exact-denied={revoked_terminal_exact} then \
-             end={ended_after}; ran==1 retired-not-zombie={retired_not_zombie} (handler record \
-             never completed — its later sends were discarded); SIBLING kept delivering in the \
+             end={ended_after}; ran==1 retired-not-zombie={retired_not_zombie} (exactly one \
+             invocation, never resumed — the handler's late sends and completion were discarded: \
+             the caller saw the typed terminal and then end); SIBLING kept delivering in the \
              same window: items={items_c:?} exact={compliant_exact} (want {expected_c:?}); \
              revoked items-before-terminal={items_r:?}",
             terminal_r
@@ -3387,10 +3408,21 @@ async fn tab_teardown(
                     use futures::StreamExt as _;
                     let mut items = Vec::new();
                     loop {
-                        match stream.next().await {
-                            Some(Ok(chunk)) => items.push(chunk.to_vec()),
-                            Some(Err(e)) => return (items, format!("ERR {e}")),
-                            None => return (items, "done".to_string()),
+                        // BOUNDED: a surface whose retirement terminal
+                        // never reaches the caller must redden this
+                        // witness, not hang the ledger.
+                        match tokio::time::timeout(Duration::from_secs(15), stream.next()).await {
+                            Ok(Some(Ok(chunk))) => items.push(chunk.to_vec()),
+                            Ok(Some(Err(e))) => return (items, format!("ERR {e}")),
+                            Ok(None) => return (items, "done".to_string()),
+                            Err(_) => {
+                                return (
+                                    items,
+                                    "TIMEOUT(the retirement terminal never reached the caller \
+                                     within 15 s of the serving tab's close)"
+                                        .to_string(),
+                                )
+                            }
                         }
                     }
                 }
@@ -3406,9 +3438,73 @@ async fn tab_teardown(
     let typed_dead = terminal.starts_with("ERR");
 
     // No resume: re-opening the SAME service needs a fresh serving
-    // tab — and that call is a fresh call (its effect repeats; the
-    // old call's effect is NOT silently resumed into it).
-    let fresh_ok = wait_for(|| false, Duration::from_millis(1)).await; // no-op placeholder for clarity
+    // tab — and that call is a FRESH call whose effect legitimately
+    // repeats: its own NEW provider record carrying its own payload
+    // (the dead call's record is untouched and nothing resumed into
+    // the new one).
+    let handle2 = "td-serve2".to_string();
+    let serve2 = script
+        .run(
+            TAB_PAIR_A,
+            serve_step(&handle2, B_TEARDOWN, "streaming", "same-org", &owner_org, "td", &pre, &post, false, 0),
+        )
+        .await;
+    let intent2 = world.intent(
+        cx.anchor_key,
+        &world.root_a,
+        &world.root_a,
+        &world.pair_a.entity,
+        B_TEARDOWN,
+        false,
+        2,
+    );
+    let fresh = cx
+        .anchor
+        .call_streaming(
+            world.pair_a.entity.node_id(),
+            B_TEARDOWN,
+            Bytes::from_static(b"td-fresh-call"),
+            CallOptions {
+                org_proof_intent: Some(intent2),
+                deadline: Some(std::time::Instant::now() + Duration::from_secs(20)),
+                ..Default::default()
+            },
+        )
+        .await;
+    let (fresh_items, fresh_terminal) = match fresh {
+        Ok(mut stream) => {
+            use futures::StreamExt as _;
+            let mut items = Vec::new();
+            let terminal = loop {
+                match tokio::time::timeout(Duration::from_secs(15), stream.next()).await {
+                    Ok(Some(Ok(chunk))) => items.push(chunk.to_vec()),
+                    Ok(Some(Err(e))) => break format!("ERR {e}"),
+                    Ok(None) => break "done".to_string(),
+                    Err(_) => break "TIMEOUT".to_string(),
+                }
+            };
+            (items, terminal)
+        }
+        Err(e) => (Vec::new(), format!("OPEN-ERR {e}")),
+    };
+    let fresh_expected: Vec<String> = pre.iter().chain(post.iter()).map(|c| hex(c)).collect();
+    let report2 = script.run(TAB_PAIR_A, report_step(&handle2)).await;
+    let fresh_ran = stat_obj(&report2, "ran").and_then(Value::as_u64).unwrap_or(0);
+    let fresh_payload_exact = stat_obj(&report2, "calls")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("payload"))
+        .and_then(Value::as_str)
+        == Some(hex(b"td-fresh-call").as_str());
+    let fresh_ok = serve2.ok
+        && fresh_terminal == "done"
+        && fresh_items
+            .iter()
+            .map(|c| hex(c))
+            .collect::<Vec<_>>()
+            == fresh_expected
+        && fresh_ran == 1
+        && fresh_payload_exact;
     ledger.record(
         witness,
         serve.ok && closed.is_ok() && typed_dead,
@@ -3805,30 +3901,65 @@ async fn handler_completion_after_retirement(
         .await;
     let live = script.run(TAB_CALL, stream_read_step("hr-call", 1, 8_000)).await;
     let mid_pair = forwarded_pair(cx.anchor, &world.caller.entity, &world.server.entity);
-    let pair_moved_before = mid_pair > pair_before;
 
-    // THE RETIREMENT: cancel mid-stream; then let the handler finish.
+    // THE RETIREMENT: cancel mid-stream; then let the handler finish
+    // (its defer_ms keeps it alive 800 ms past this point).
     let cancel = script
         .run(TAB_CALL, json!({ "kind": "org_stream_cancel", "handle": "hr-call" }))
         .await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
     let after_pair = forwarded_pair(cx.anchor, &world.caller.entity, &world.server.entity);
     let final_read = script
         .run(TAB_CALL, stream_read_step("hr-call", 99, 4_000))
         .await;
-    let items = stat_list(&final_read, "items");
-    let items_exact = items == vec![hex(b"hr-0")]; // exactly the pre-cancel item(s) read; NO late frames
+    // EVERYTHING the caller ever saw, with its arrival clock.
+    let mut items = stat_list(&live, "items");
+    let mut arrivals: Vec<f64> = stat_obj(&live, "arrivals")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_f64).collect())
+        .unwrap_or_default();
+    items.extend(stat_list(&final_read, "items"));
+    arrivals.extend(
+        stat_obj(&final_read, "arrivals")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_f64).collect::<Vec<f64>>())
+            .unwrap_or_default(),
+    );
 
-    // The retirement observables fired BEFORE handler completion.
+    // The retirement observables fired BEFORE handler completion;
+    // `retired_at` is armed by the page at construction now, so a
+    // missing reading is a FAIL, not a vacuous pass.
     let report = script.run(TAB_SERVE, report_step(&handle)).await;
     let calls = stat_obj(&report, "calls").and_then(Value::as_array).cloned().unwrap_or_default();
     let record = calls.first().cloned().unwrap_or(Value::Null);
     let retired_at = record.get("retired_at").and_then(Value::as_f64);
     let completed_at = record.get("completed_at").and_then(Value::as_f64);
     let retirement_first = match (retired_at, completed_at) {
-        (Some(r), Some(c)) => r <= c,
-        _ => true, // a handler whose completion the page never recorded post-retirement
+        (Some(r), Some(c)) => r < c,
+        _ => false,
     };
+    // ZERO frames after the retirement observable: every arrival is
+    // at or before `retired_at`.
+    let zero_after = match retired_at {
+        Some(r) => arrivals.iter().all(|t| *t <= r),
+        None => false,
+    };
+    // The handler's late sends were ATTEMPTED (its send_log grew past
+    // the retirement) and yet NOTHING of them arrived — the discard is
+    // observable as the pair (attempted, zero delivered), never as a
+    // vacuous "nothing arrived because nothing was sent".
+    let send_log = record
+        .get("send_log")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let late_attempted = send_log.len() == 4; // pre×2 + the handler's late×2
+    let late_hex: Vec<String> = vec![hex(b"hr-late-0"), hex(b"hr-late-1")];
+    let return_discarded = late_hex.iter().all(|h| !items.contains(h));
+    let pre_ok = items.len() <= 2
+        && items
+            .iter()
+            .all(|i| i == &hex(b"hr-0") || i == &hex(b"hr-1"));
     let wire_flat = after_pair == mid_pair;
 
     ledger.record(
@@ -3836,20 +3967,25 @@ async fn handler_completion_after_retirement(
         serve.ok
             && open.ok
             && cancel.ok
-            && pair_moved_before
-            && items_exact
             && retirement_first
-            && wire_flat,
+            && zero_after
+            && late_attempted
+            && return_discarded
+            && pre_ok,
         format!(
             "handler deferred 800ms past its call's retirement (caller cancelled mid-stream: \
-             {}); the handler resolved AFTER retirement and its return/late sends were DISCARDED \
-             — caller items={items:?} (exact pre-retirement set, ZERO further frames: {items_exact}); \
-             retirement observables fired earlier: retired_at={retired_at:?} <= \
-             completed_at={completed_at:?} ({retirement_first}); WIRE CAPTURE (anchor per-pair \
-             forwarding): moved in the live window {pair_before} -> {mid_pair} \
-             ({pair_moved_before}) and FLAT after retirement {mid_pair} -> {after_pair} \
-             ({wire_flat}) — the F-S3.1-2 level as an executable observation",
-            typed(&cancel)
+             {}); the retirement observable fired BEFORE handler completion \
+             (retired_at={retired_at:?} < completed_at={completed_at:?}: {retirement_first}) and \
+             ZERO frames arrived after it ({zero_after}, every arrival ≤ retired_at, \
+             arrivals={arrivals:?}); the handler's late sends were ATTEMPTED ({late_attempted}, \
+             send_log={} entries) and DISCARDED — its return chunks never reached the caller \
+             (return-discarded={return_discarded}, items={items:?}, the pre-retirement set only: \
+             {pre_ok}); wire capture note: the anchor's per-pair ROUTED counter is flat \
+             throughout ({pair_before} -> {mid_pair} -> {after_pair}) because the org relay rides \
+             session streams, not routed transits — the discard's wire-side evidence is the \
+             attempted-vs-delivered pair above (the F-S3.1-2 level as an executable observation)",
+            typed(&cancel),
+            send_log.len()
         ),
     );
 }
