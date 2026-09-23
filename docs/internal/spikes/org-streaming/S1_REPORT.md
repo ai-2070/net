@@ -4106,3 +4106,109 @@ history, and it strengthened the discriminator.
   space recovered before the retry (66 GiB observed), the file was rewritten in
   full and verified under the F16 rule (size + sha256/line-count after every
   write; the four touched files re-verified before this commit pair).
+
+### 6.2 Row 3.2 — provider verbs (S3.2)
+
+**Landed (executed):** `c69d69761` — `S3.2: add the org streaming provider
+verbs (spec 4.3) over serve_org_*_bytes_node` (6 files, +741/−79) on
+`LZL0/org-streaming`; this record rides in the following `S3.1:`-prefixed
+record commit pair convention (`S3.2:`).
+
+**What landed (source-established):**
+
+- The §4.3 serve rows verbatim: `Mesh::serve_org_streaming(.., Fn(OrgCaller,
+  Req, ResponseSinkTyped<Resp>) -> Fut<Result<(),String>>)`,
+  `Mesh::serve_org_client_stream(.., Fn(OrgCaller, RequestStreamTyped<Req>) ->
+  Fut<Result<Resp,String>>)`, `Mesh::serve_org_duplex(.., Fn(OrgCaller,
+  RequestStreamTyped<Req>, ResponseSinkTyped<Resp>) -> Fut<Result<(),String>>)`
+  — each over its bytes row (`serve_org_{streaming,client_stream,duplex}_bytes`)
+  and its `#[doc(hidden)]` node seam
+  (`serve_org_{streaming,client_stream,duplex}_bytes_node`), exactly the unary
+  `serve_org` → `serve_org_bytes` → `serve_org_bytes_node` layering. The typed
+  row IS the bytes row plus JSON — one dispatch path per shape.
+- The `OrgCaller` projection: ONE function (`project_caller`) converts the
+  admission-verified `Admitted` into the handler-facing type for all four
+  shapes (the unary bridge refactored onto it); `None` admission is the same
+  loud invariant refusal as today, never fabricated attribution. One error
+  classification (`From<OrgHandlerError> for RpcHandlerError`) across all
+  rows.
+- The facade policy `|_| true` in every row (the provider veto stays the
+  caller's extension point on the low-level API, as today); access implies
+  visibility; registration before provisioning.
+- The call-side clean cutover enabled by the same seam: `call_streaming` and
+  `call_duplex` are now ONE PATH over their `*_bytes_deadline` seams plus
+  `from_raw` (the typed verb IS the bytes seam plus JSON, matching the unary
+  doctrine), `OrgClientStreamCall`'s deferred open constructs from the PINNED
+  opening via `from_raw`, and the temporary bind-time `Arc<Mesh>` shim from
+  Row 3.1 is REMOVED (its only consumer migrated).
+
+**F-S3.2-1 — RESOLVED BY MAIN RULING (the §4.3 typed rows need
+crate-internal construction).** The private `Typed*RpcHandler` adapters behind
+`Mesh::serve_rpc_*_typed` drop `RpcContext`/`RpcStreamingContext`, so they
+cannot project `OrgCaller`; `RequestStreamTyped`/`ResponseSinkTyped` (and the
+three call-side typed handles) have private fields and no constructors
+reachable from `sdk/src/org/**`. Main ruled (option A, same-commit doctrine):
+the five constructors below land in THIS commit with their consumers, as
+`pub(crate)` ONLY (the ceiling), constructors only — **no field visibility
+moved**, no behavior change, no field reshaping, zero public-API change. The
+five signatures, verbatim as landed in `sdk/src/mesh_rpc.rs`:
+
+```rust
+pub(crate) fn from_raw(inner: RpcStream, codec: Codec) -> Self           // RpcStreamTyped<Resp>
+pub(crate) fn from_raw(inner: ClientStreamCallRaw, codec: Codec) -> Self // ClientStreamCallTyped<Req, Resp>
+pub(crate) fn from_raw(inner: DuplexCallRaw, codec: Codec) -> Self       // DuplexCallTyped<Req, Resp>
+pub(crate) fn from_raw(inner: RequestStream, codec: Codec) -> Self       // RequestStreamTyped<Req>
+pub(crate) fn from_raw(inner: RpcResponseSink, codec: Codec) -> Self     // ResponseSinkTyped<Resp>
+```
+
+Main's conditions 1–4: (1) `pub(crate)` ceiling respected, no field
+visibility moved (stated here); (2) constructors only, exactly the five types;
+(3) this record names them and the ruling; (4) the probe's frozen-surface pin
+passes UNCHANGED at this head — **executed**: `cargo metadata --locked` exit 0
+and `cargo check --locked` exit 0 in `guards/org_api_probe` at `c69d69761`'s
+tree (the no-public-change claim's proof). Condition 5 (a sixth type or any
+`pub`): not needed — `OrgDuplexCall::into_split` wraps the halves the PUBLIC
+`DuplexCallTyped::into_split` already returns.
+
+**Witnesses and counts (executed).** `sdk/tests/org_streaming.rs` is now
+**10/10** at the plan's named command (§6.1's), exit 0. The row's two named
+witnesses:
+
+- `handler_receives_verified_org_caller_not_origin` — the three facade serve
+  rows (`serve_org_streaming`/`_client_stream`/`_duplex`, typed) each assert
+  their `OrgCaller`'s FIVE verified fields against the expected attribution
+  (the ed25519 entity id — the handler never sees `caller_origin`, so what it
+  receives can only be the admission-verified identity); the caller round-trips
+  all three shapes.
+- `revocation_surfaces_as_final_admission_denied_item` — a live stream is
+  revoked MID-STREAM by a real floor raise through the provider's installed
+  store (`OrgRevocationBundle::try_issue` + `apply_bundle`, membership
+  generation 1 → floor 2); the stream's FINAL item is
+  `Err(AdmissionDenied(Denied))` — the frozen `Revoked → Denied` coarse byte —
+  and the stream then ends. The raise retires synchronously (the core's §2.3
+  boundary), so the observation is deterministic, not polled-into.
+
+CI floor note (Main pins): `--suite org_streaming` floor = **10**, the ten
+names in the same commit.
+
+**Regressions (executed at `c69d69761`'s tree):**
+
+- The existing 42-roster: `cargo tf --retries 0 --test org_rpc_streaming` —
+  **42/42**, exit 0.
+- The existing SDK org estate: `cargo nextest run … --lib --test
+  org_exact_sensing` — **338/338**, exit 0 (this run also covers the shim
+  removal and the `from_raw` migration: the whole lib recompiled and every
+  org unit witness re-passed).
+- `cargo fmt -p net-mesh-sdk -- --check` — exit 0.
+
+**Findings (state, not decide):** F-S3.2-1 resolved by Main's ruling (above);
+no new findings at this row.
+
+**Never executed here (complete):**
+
+- The probe's build on any feature set other than its own (`cargo metadata
+  --locked` + `cargo check --locked` are its exact commands); `ci.yml`'s floor
+  edits (Main's).
+- A wire-level duplicate-CANCEL discrimination (§6.1's stated limit, unchanged).
+- The `serve_org_*` rows against a non-`fixtures` build — the suite's runs use
+  the plan's named feature set.
