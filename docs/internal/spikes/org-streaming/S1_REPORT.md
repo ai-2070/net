@@ -4893,8 +4893,19 @@ CARGO_PROFILE_TEST_DEBUG=0`, from `net/crates/net/`:
 The gate (plan wording): *"every SDK × shape × role cell executed from a
 packaged or CI-built artifact. A missing cell blocks the release"* — plus
 exact-head CI green, artifact/declaration/header/error parity, and unary
-compatibility. **Current verdict: BLOCKED on 2 named cells** (below). All
-evidence pointers are to executed receipts already in this record.
+compatibility. **Current verdict: BLOCKED on 1 named cell (cell 1, sdk-py);
+cell 2 (the mixed non-Rust pair) is EXECUTED GREEN** — the verbatim row
+`--- PASS: TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider`
+with the two-sided `RESULT ok calls=1 chunks=3` (exact-matched at
+`go:711-714`, Fatalf otherwise), chunks byte-for-byte + eof terminal +
+`expect_handler` facts held; receipted 3-deep (R4CoreFix round-3
+`r4corefix-row-round3-green.log` + the coordinator re-run + S4Vectors'
+receipt-append). The three-defect consumer-side harness chain that gated
+it is closed at its owners (serve-handle RAII, the DRAINED
+drain-sequenced teardown, the connect-only handshake — `a919a26f0`).
+Finding 8 (`MeshNode::start()`'s fail-open refusal) rides the release
+notes as an owner-bound known limitation. All evidence pointers are to
+executed receipts already in this record.
 
 ### 9.1 Facade rows — every shape × call AND serve × same-org AND granted
 
@@ -4915,7 +4926,7 @@ evidence pointers are to executed receipts already in this record.
 | Node runtime vs Rust (caller + provider roles) | 119 rows (byte pins + role rows + vocab/grammar + never-success) | ✅ |
 | Python runtime vs Rust (both roles) | 119 rows (the same roster, kebab ids) | ✅ |
 | Go runtime vs Rust (both roles) | 124 rows (byte pins + role rows + rejects + vocab) | ✅ |
-| **Mixed non-Rust pair (Go caller ↔ Python provider)** | round 1 closed F-S4Vectors-1's mechanism; the DRAINED-handshake round-2 fix is in (`provider.py` sha `22ce91e0…`); the two-sided PASS signature (`--- PASS: …` + `RESULT ok calls=1 chunks=3`) awaits the re-run | ⏳ **cell 2** |
+| **Mixed non-Rust pair (Go caller ↔ Python provider)** | **GREEN** — `--- PASS: TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider` + `RESULT ok calls=1 chunks=3` (exact-matched at `go:711-714`); chunks byte-for-byte + eof + `expect_handler` held; 3-deep receipted (R4CoreFix round-3 + the coordinator re-run + S4Vectors' receipt-append `a919a26f0`-chain) | ✅ **cell 2 CLOSED** |
 | Inverse receipts (the vectors) | the one-byte-flip RED in all four runtimes → sha-identical restore → green; the four-property cycle | ✅ |
 
 ### 9.3 Parity + compatibility rows
@@ -4933,10 +4944,14 @@ evidence pointers are to executed receipts already in this record.
 1. **Cell 1 (sdk-py)**: `S4PySdk`'s live rows + its 3 receipts → its report
    and commit pair → coordinator spot-check → the sdk-py pin (site mapped,
    `ci.yml:4112`) → ✅.
-2. **Cell 2 (the mixed pair)**: the round-2 verbatim re-run (one command,
-   `R4CoreFix` holding it) → the two-sided PASS signature → `S4Vectors`'s
-   `round-2` commit with the green receipt + finding 6's named contract →
-   coordinator spot-check → ✅.
+2. ~~**Cell 2 (the mixed pair)**~~ **CLOSED** — the three-defect
+   harness chain fixed at its owners (`S4Vectors` `a919a26f0`: serve-handle
+   RAII + the DRAINED teardown handshake + the connect-only handshake),
+   the verbatim row green 3-deep (R4CoreFix round-3 + the coordinator
+   re-run + S4Vectors' receipt-append), and the consumer-side
+   cross-process harness contract set named for the release notes.
+   Finding 8 (`start()`'s fail-open surface) rides as the owner-bound
+   known limitation.
 
 Both closures flip this verdict. The never-executed boundaries (per lane,
 § entries above) become the release notes material verbatim at the verdict.

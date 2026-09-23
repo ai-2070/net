@@ -1677,3 +1677,21 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   (the ruled `DRAINED` stdin handshake, `S4Vectors`' file) + the row
   re-run close the plan's last named cell; the cross-process teardown
   ordering joins the consumer-side contract (the F-S3.1-2 sibling).
+
+- 2026-09-22, **The mixed non-Rust pair is EXECUTED GREEN — the plan's
+  last named cell closes.** The verbatim row:
+  `--- PASS: TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider`
+  with the two-sided `RESULT ok calls=1 chunks=3` (exact-matched at
+  `go:711-714`, Fatalf otherwise); chunks byte-for-byte vs `chunks_hex`,
+  eof terminal, and `expect_handler` facts all held. Receipted 3-deep:
+  `R4CoreFix` round-3 (`r4corefix-row-round3-green.log`), the coordinator
+  re-run (the `awaiting DRAINED` handshake visible in the transcript),
+  and `S4Vectors`' receipt-append. The three-defect consumer-side harness
+  chain is closed at its owners (`a919a26f0` — serve-handle RAII, the
+  DRAINED drain-sequenced teardown, the connect-only handshake); finding
+  8 (`MeshNode::start()`'s warn-only refusal + the pyo3 `NetMesh.start()`
+  `Ok(())`-while-starting-nothing fail-open surface) is owner-bound
+  compatibility-ledger material with two alternatives laid out. **The
+  unified release acceptance stands at ONE blocking cell (sdk-py —
+  `S4PySdk`'s live rows + receipts); the verdict flips green at its
+  close.**
