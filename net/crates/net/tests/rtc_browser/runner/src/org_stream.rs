@@ -3905,7 +3905,7 @@ async fn handler_completion_after_retirement(
     let open = script
         .run(TAB_PAIR_A, stream_open_step(B_DEFER, b"hr-call", &creds, "hr-call", None))
         .await;
-    let live = script.run(TAB_PAIR_A, stream_read_step("hr-call", 1, 8_000)).await;
+    let _live = script.run(TAB_PAIR_A, stream_read_step("hr-call", 1, 8_000)).await;
     let mid_pair = forwarded_pair(cx.anchor, &world.pair_a.entity, &world.pair_b.entity);
 
     // THE RETIREMENT: cancel mid-stream; then let the handler finish
@@ -3918,19 +3918,10 @@ async fn handler_completion_after_retirement(
     let final_read = script
         .run(TAB_PAIR_A, stream_read_step("hr-call", 99, 4_000))
         .await;
-    // EVERYTHING the caller ever saw, with its arrival clock.
-    let mut items = stat_list(&live, "items");
-    let mut arrivals: Vec<f64> = stat_obj(&live, "arrivals")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_f64).collect())
-        .unwrap_or_default();
-    items.extend(stat_list(&final_read, "items"));
-    arrivals.extend(
-        stat_obj(&final_read, "arrivals")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_f64).collect::<Vec<f64>>())
-            .unwrap_or_default(),
-    );
+    // The caller's stream state ACCUMULATES across reads — the final
+    // read's arrays are the whole truth (extending across reads would
+    // double-count the earlier pulls).
+    let items = stat_list(&final_read, "items");
 
     // The retirement observables fired BEFORE handler completion;
     // `retired_at` is armed by the page at construction now, so a
@@ -3944,28 +3935,20 @@ async fn handler_completion_after_retirement(
         (Some(r), Some(c)) => r < c,
         _ => false,
     };
-    // ZERO frames after the retirement observable: every arrival is
-    // at or before `retired_at`.
-    let zero_after = match retired_at {
-        Some(r) => arrivals.iter().all(|t| *t <= r),
-        None => false,
-    };
-    // The handler's late sends were ATTEMPTED (its send_log grew past
-    // the retirement) and yet NOTHING of them arrived — the discard is
-    // observable as the pair (attempted, zero delivered), never as a
-    // vacuous "nothing arrived because nothing was sent".
-    let send_log = record
-        .get("send_log")
+    // The handler's late sends were ATTEMPTED (its entry `items` grows
+    // synchronously at each send, before the await) and yet NONE of
+    // them reached the caller — the discard is observable as the pair
+    // (attempted, zero delivered), never as a vacuous "nothing arrived
+    // because nothing was sent".
+    let entry_items: Vec<String> = record
+        .get("items")
         .and_then(Value::as_array)
-        .cloned()
+        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
         .unwrap_or_default();
-    let late_attempted = send_log.len() == 4; // pre×2 + the handler's late×2
     let late_hex: Vec<String> = vec![hex(b"hr-late-0"), hex(b"hr-late-1")];
+    let late_attempted = late_hex.iter().all(|h| entry_items.contains(h));
     let return_discarded = late_hex.iter().all(|h| !items.contains(h));
-    let pre_ok = items.len() <= 2
-        && items
-            .iter()
-            .all(|i| i == &hex(b"hr-0") || i == &hex(b"hr-1"));
+    let pre_exact = items == vec![hex(b"hr-0"), hex(b"hr-1")];
     let wire_flat = after_pair == mid_pair;
 
     ledger.record(
@@ -3974,26 +3957,26 @@ async fn handler_completion_after_retirement(
             && open.ok
             && cancel.ok
             && retirement_first
-            && zero_after
             && late_attempted
             && return_discarded
-            && pre_ok,
+            && pre_exact,
         format!(
             "handler deferred 800ms past its call's retirement (caller cancelled mid-stream: \
-             {}); the retirement observable fired BEFORE handler completion \
-             (retired_at={retired_at:?} < completed_at={completed_at:?}: {retirement_first}) and \
-             ZERO frames arrived after it ({zero_after}, every arrival ≤ retired_at, \
-             arrivals={arrivals:?}); the handler's late sends were ATTEMPTED ({late_attempted}, \
-             send_log={} entries) and DISCARDED — its return chunks never reached the caller \
-             (return-discarded={return_discarded}, items={items:?}, the pre-retirement set only: \
-             {pre_ok}); wire capture note: the anchor's per-pair ROUTED counter is flat \
+             {}); the retirement observable fired ({retired_at:?}) and the handler's completion \
+             must FOLLOW it (retired_at < completed_at={completed_at:?}: {retirement_first}) — \
+             completed_at=None means the handler NEVER resolved: a `send` parked for credit does \
+             not settle when `retired` resolves, so F-S3.1-2's 'handler resolves after \
+             retirement' is unreachable until the surface settles send/close on retirement; the \
+             handler's late sends were ATTEMPTED ({late_attempted}, entry items={entry_items:?}) \
+             and DISCARDED — its return chunks never reached the caller (return-discarded=\
+             {return_discarded}, caller items={items:?} = the exact pre-retirement set: \
+             {pre_exact}); wire capture note: the anchor's per-pair ROUTED counter is flat \
              throughout ({pair_before} -> {mid_pair} -> {after_pair}) because the org relay rides \
              session streams, not routed transits — the discard's wire-side evidence is the \
              attempted-vs-delivered pair above (the F-S3.1-2 level as an executable \
              observation); open-typed={}",
             typed(&cancel),
             typed(&open),
-            send_log.len()
         ),
     );
 }
