@@ -1826,6 +1826,36 @@ Tasks:
    `join`, and joined `up` presenting its credentials. The e2e journey runs
    join → admitted → `subnet remove` → refused on reconnect.
 
+#### V3-2 task 3: standalone subnet join, decisions (user, 2026-09-24)
+
+A device already on the mesh redeems a subnet-only link (`relations =
+[Subnet]`; the invite format already allows it).
+
+- **Transport: nRPC on the existing session.** A new service
+  `net.enroll.subnet.redeem` runs on the issuing node.
+  - The request is signed by the device and binds the destination node and a
+    freshness window.
+  - The issuer additionally requires that the session which delivered it has
+    proven that same entity (`peer_identity_established` and
+    `peer_entity_id`). This is E5: bind the same proven identity.
+  - It reuses the ledger's claim, approval (`invite approve`), issue and
+    recovery steps.
+  - It returns only subnet credentials: no PSK is re-delivered and no TCP or
+    relay path is involved.
+  - Renewal already runs this way and works unchanged for such invites.
+- **Device side: through the running node.** `net-mesh subnet join <token>`
+  asks the running `up` over its authenticated control endpoint. The node:
+  - redeems on its session;
+  - persists the credentials in a per-invite store
+    (`<state>/subnets/<invitation-id>`);
+  - presents them at once, and its link supervisor re-presents and renews
+    each membership on every session.
+  - A device may hold several memberships, and `leave` covers them.
+- **v1 limit.** A standalone link is redeemable only from the node this
+  device enrolled with: its issuer must be the join's issuer, which supplies
+  the node to call. A link from another operator is refused with a clear
+  error.
+
 #### V3-2 S1 — subnet admission on the wire (receipt, 2026-09-23)
 
 **Protocol.** Subprotocol `0x0A02`, `SUBPROTOCOL_SUBNET_ADMISSION`, in the auth

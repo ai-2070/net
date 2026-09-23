@@ -389,3 +389,232 @@ fn only_the_enrolled_device_renews_its_subnet_leaf() {
         Err(Refusal::Invalid)
     );
 }
+
+/// V3-2 task 3: a standalone subnet link (subnet relation only) is redeemed
+/// over the device's existing session. Credentials go only to the entity the
+/// delivering session proved, for exactly the offer, through the ledger's
+/// claim, approval and issue; a redemption repeated by the same device gets
+/// fresh credentials, another device gets nothing.
+#[test]
+fn a_standalone_subnet_link_issues_only_to_the_proven_session_entity() {
+    use net_sdk::enrollment::service::SharedLedger;
+    use net_sdk::enrollment::standalone::{
+        answer_subnet_redeem, is_standalone_subnet, SubnetRedeemReply, SubnetRedeemRequest,
+    };
+    use net_sdk::enrollment::store::{EnrollmentLedger, LedgerLimits};
+
+    const NODE: u64 = 0x0A11_CE00;
+    let operator = Identity::generate();
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger: SharedLedger = std::sync::Arc::new(parking_lot::Mutex::new(
+        EnrollmentLedger::create(
+            &tmp.path().join("ledger"),
+            operator.entity_id().clone(),
+            LedgerLimits::default(),
+        )
+        .unwrap(),
+    ));
+    let sign = |relations, subnet, approval| {
+        let mut s = spec(relations, subnet);
+        s.policy =
+            InvitationPolicy::with_options(now(), Duration::from_secs(3600), approval).unwrap();
+        let invite = MembershipInvite::sign(&operator, s).unwrap();
+        let offer_id = ledger.lock().offer(invite.offer_spec(), now()).unwrap();
+        (invite, offer_id)
+    };
+    let issuer = leaf_issuer();
+    let device = Identity::generate();
+    let (link, _) = sign(
+        vec![Relation::Subnet],
+        Some(offer(&[3, 7], SubnetRights::ATTACH)),
+        ApprovalMode::Preauthorized,
+    );
+    assert!(is_standalone_subnet(&link));
+    let answer = |req: &SubnetRedeemRequest, proven: Option<&net_sdk::identity::EntityId>| {
+        answer_subnet_redeem(&req.to_bytes(), proven, NODE, &ledger, &issuer, now())
+    };
+    let fresh = || SubnetRedeemRequest::sign(&device, &link, NODE, now()).unwrap();
+
+    // The delivering session must have proven this very device.
+    let other = Identity::generate();
+    assert_eq!(answer(&fresh(), None), Err(Refusal::Conflict));
+    assert_eq!(
+        answer(&fresh(), Some(other.entity_id())),
+        Err(Refusal::Conflict)
+    );
+    // Bound to its destination node, fresh, and signed by the device.
+    let elsewhere = SubnetRedeemRequest::sign(&device, &link, NODE + 1, now()).unwrap();
+    assert_eq!(
+        answer(&elsewhere, Some(device.entity_id())),
+        Err(Refusal::Invalid)
+    );
+    let stale = SubnetRedeemRequest::sign(&device, &link, NODE, now() - 10_000).unwrap();
+    assert_eq!(
+        answer(&stale, Some(device.entity_id())),
+        Err(Refusal::Expired)
+    );
+    let mut forged = fresh().to_bytes();
+    let last = forged.len() - 1;
+    forged[last] ^= 1;
+    assert_eq!(
+        answer_subnet_redeem(
+            &forged,
+            Some(device.entity_id()),
+            NODE,
+            &ledger,
+            &issuer,
+            now()
+        ),
+        Err(Refusal::Invalid)
+    );
+
+    // Issued: exactly the offer, for this device.
+    let set = match answer(&fresh(), Some(device.entity_id())).unwrap() {
+        SubnetRedeemReply::Issued(set) => set,
+        other => panic!("expected issued, got {other:?}"),
+    };
+    assert_eq!(set.leaf().subject, *device.entity_id());
+    assert_eq!(set.leaf().scope, TopologySubnetId::new(&[3, 7]));
+    assert_eq!(set.leaf().rights, SubnetRights::ATTACH);
+    // Asked again (a lost reply): the same device gets fresh credentials.
+    assert!(matches!(
+        answer(&fresh(), Some(device.entity_id())),
+        Ok(SubnetRedeemReply::Issued(_))
+    ));
+    // Another device, even over its own proven session, gets nothing.
+    let theirs = SubnetRedeemRequest::sign(&other, &link, NODE, now()).unwrap();
+    assert_eq!(
+        answer(&theirs, Some(other.entity_id())),
+        Err(Refusal::Conflict)
+    );
+
+    // A link that also carries the mesh relation is not standalone: it
+    // belongs to the enrollment endpoint (it delivers the PSK).
+    let (full, _) = sign(
+        vec![Relation::Mesh, Relation::Subnet],
+        Some(offer(&[3, 8], SubnetRights::ATTACH)),
+        ApprovalMode::Preauthorized,
+    );
+    let req = SubnetRedeemRequest::sign(&device, &full, NODE, now()).unwrap();
+    assert_eq!(
+        answer(&req, Some(device.entity_id())),
+        Err(Refusal::Invalid)
+    );
+
+    // Approval-gated: pending until the operator approves this claimant.
+    let (gated, gated_offer) = sign(
+        vec![Relation::Subnet],
+        Some(offer(&[3, 9], SubnetRights::ATTACH)),
+        ApprovalMode::RequireApproval,
+    );
+    let req = || SubnetRedeemRequest::sign(&device, &gated, NODE, now()).unwrap();
+    assert_eq!(
+        answer(&req(), Some(device.entity_id())),
+        Ok(SubnetRedeemReply::PendingApproval)
+    );
+    let claimant = ledger.lock().pending_claim(&gated_offer).unwrap().unwrap();
+    ledger
+        .lock()
+        .approve(&gated_offer, &claimant, now())
+        .unwrap();
+    assert!(matches!(
+        answer(&req(), Some(device.entity_id())),
+        Ok(SubnetRedeemReply::Issued(_))
+    ));
+}
+
+/// The device's per-link membership store: persists only credentials that
+/// are exactly the signed offer for this device, survives reopen, and once
+/// left holds no credentials and installs none (a late renewal included).
+#[test]
+fn a_standalone_membership_installs_only_its_offer_and_leave_fences_it() {
+    use net_sdk::enrollment::device::DeviceJoinError;
+    use net_sdk::enrollment::standalone::SubnetMembership;
+
+    let operator = Identity::generate();
+    let link = MembershipInvite::sign(
+        &operator,
+        spec(
+            vec![Relation::Subnet],
+            Some(offer(&[3, 7], SubnetRights::ATTACH)),
+        ),
+    )
+    .unwrap();
+    let device = Identity::generate();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("subnets")).unwrap();
+    let dir = tmp.path().join("subnets").join("one");
+    let mut membership =
+        SubnetMembership::begin(&dir, &link, device.entity_id().clone(), 42).unwrap();
+    assert!(membership.credentials().is_none());
+
+    // A mesh+subnet invite is not a standalone link.
+    let full = MembershipInvite::sign(
+        &operator,
+        spec(
+            vec![Relation::Mesh, Relation::Subnet],
+            Some(offer(&[3, 7], SubnetRights::ATTACH)),
+        ),
+    )
+    .unwrap();
+    assert!(SubnetMembership::begin(
+        &tmp.path().join("subnets").join("two"),
+        &full,
+        device.entity_id().clone(),
+        42
+    )
+    .is_err());
+
+    // Credentials minted by the real issuer for a given offer and subject.
+    let issuer = leaf_issuer();
+    let issue = |path: &[u8], rights, subject: &Identity| {
+        let invite = MembershipInvite::sign(
+            &operator,
+            spec(
+                vec![Relation::Mesh, Relation::Subnet],
+                Some(offer(path, rights)),
+            ),
+        )
+        .unwrap();
+        let intent = RedemptionIntent::for_invite(&invite, subject.entity_id().clone()).unwrap();
+        let bundle = MembershipIssuer::new(operator.clone(), Psk::new(PSK), contact())
+            .with_subnet_issuer(issuer.clone())
+            .issue(&invite, &intent)
+            .unwrap();
+        MembershipBundle::from_bytes(&bundle)
+            .unwrap()
+            .subnet_credentials()
+            .unwrap()
+    };
+    // Wrong scope, wrong rights, wrong subject: refused, nothing installed.
+    for wrong in [
+        issue(&[3, 8], SubnetRights::ATTACH, &device),
+        issue(
+            &[3, 7],
+            SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+            &device,
+        ),
+        issue(&[3, 7], SubnetRights::ATTACH, &Identity::generate()),
+    ] {
+        assert!(membership.install(&wrong).is_err());
+        assert!(membership.credentials().is_none());
+    }
+    let right = issue(&[3, 7], SubnetRights::ATTACH, &device);
+    membership.install(&right).unwrap();
+    drop(membership);
+
+    let mut membership = SubnetMembership::open(&dir).unwrap();
+    assert_eq!(membership.credentials(), Some(&right));
+    assert_eq!(membership.issuer_node(), 42);
+    assert!(membership.leave(1_000).unwrap());
+    assert!(!membership.leave(2_000).unwrap(), "leave is idempotent");
+    assert!(membership.credentials().is_none());
+    assert!(matches!(
+        membership.install(&right),
+        Err(DeviceJoinError::Left { at: 1_000 })
+    ));
+    drop(membership);
+    let membership = SubnetMembership::open(&dir).unwrap();
+    assert_eq!(membership.left_at(), Some(1_000));
+    assert!(membership.credentials().is_none());
+}

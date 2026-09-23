@@ -77,6 +77,8 @@ pub mod portmap;
 pub mod redeem;
 // Subnet leaf renewal (V3-2 task 5).
 pub mod renew;
+// Standalone subnet join over an existing session (V3-2 task 3).
+pub mod standalone;
 
 // Enrollment redemption listener over the shared ledger.
 pub mod service;

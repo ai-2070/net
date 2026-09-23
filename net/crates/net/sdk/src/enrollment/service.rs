@@ -361,7 +361,7 @@ fn decide(ctx: &Ctx, hh: &[u8; 32], plain: &[u8]) -> Result<RedeemOutcome, Refus
     }
 }
 
-fn refusal(e: LedgerError) -> Refusal {
+pub(crate) fn refusal(e: LedgerError) -> Refusal {
     match e {
         LedgerError::UnknownInvitation => Refusal::Invalid,
         LedgerError::Policy(PolicyError::Expired | PolicyError::NotYetValid) => Refusal::Expired,
