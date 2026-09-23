@@ -1,0 +1,63 @@
+net/crates/net/sdk/src/enrollment/redeem.rs
+  s_3f3d4c91f992be::t_5a8914031073b4 247-249,252-275,279-280,290-307,313-315,322-361
+  s_3f3d4c91f992be::t_a33047d030e3e1 362
+net/crates/net/sdk/src/enrollment/bundle.rs
+  s_3f3d4c91f992be::t_29f9d9b6e875ae 18,201-204,207-208,213-214,248,252-258,261,278-293,296-300,311
+net/crates/net/sdk/tests/enrollment_join.rs
+  s_3f3d4c91f992be::t_7ab0df97deda62 47-48,84,87,141,299,302,366,369,468,471
+  s_3f3d4c91f992be::t_34c8330e30317c 17,374-402
+  s_3f3d4c91f992be::t_59106ff446d815 403-404
+net/crates/net/cli/src/commands/enrollment.rs
+  s_3f3d4c91f992be::t_7c855567f5c60f 80-81,427,602-605,671-672,675-676,1334,1356-1365,1367,1371,1374
+  s_3f3d4c91f992be::t_782860e5d1ce1f 20,24-26,40-44,50,63,78-79,82-84,106,329-336,342,351,358-426,428-455,487-507,517,526-531,541,559-566,591-601,615,629,665-668,670,673-674,677,680-684,692,711-712,1046-1047,1117-1184,1191-1202,1211-1213,1215,1254-1258,1264,1329-1332,1354,1383-1384,1387-1389
+  s_3f3d4c91f992be::t_5f1c5fc3580a8f 196-200,202-211,1372
+net/crates/net/src/adapter/net/mesh.rs
+  s_3f3d4c91f992be::t_639c128bd7eba6 3979-3998,47462-47466,47486-47487
+net/crates/net/cli/src/commands/lifecycle.rs
+  s_3f3d4c91f992be::t_782860e5d1ce1f 137-146,650-652,654-656,872-878,881,1005-1009,1013-1014,1016
+  s_3f3d4c91f992be::t_fa086314e1da86 73-77
+  s_3f3d4c91f992be::t_5f1c5fc3580a8f 196
+net/crates/net/cli/tests/enrollment_lifecycle.rs
+  s_3f3d4c91f992be::t_0283a062ef5969 208,343
+net/crates/net/sdk/tests/enrollment_relay.rs
+  s_3f3d4c91f992be::t_34c8330e30317c 20,23-25,135-139,145-149,241-338
+net/crates/net/sdk/src/enrollment/service.rs
+  s_3f3d4c91f992be::t_782860e5d1ce1f 177-185,209-230
+  s_3f3d4c91f992be::t_29e7b8deca4e72 231
+net/crates/net/sdk/src/enrollment/device.rs
+  s_3f3d4c91f992be::t_5a8914031073b4 24,74,105,120,130-132,165-168
+  s_3f3d4c91f992be::t_b2250e6d5fa4aa 169-170
+net/crates/net/sdk/tests/enrollment_redeem.rs
+  s_3f3d4c91f992be::t_7ab0df97deda62 137-138
+net/crates/net/cli/src/config.rs
+  s_3f3d4c91f992be::t_782860e5d1ce1f 120-125
+net/crates/net/sdk/src/enrollment/invite.rs
+  s_3f3d4c91f992be::t_29f9d9b6e875ae 5-7,226-286,306-311,327-328,345-346,367-369,376-377,404,437-441,472,545-552
+net/crates/net/cli/tests/relay_join.rs
+  s_3f3d4c91f992be::t_dd334341c5ebed 1-288
+net/crates/net/src/adapter/net/traversal/blind_relay.rs
+  s_3f3d4c91f992be::t_8a54d878170a77 1991-2019
+  s_3f3d4c91f992be::t_5f1c5fc3580a8f 801-807,837-844,846,848-860
+net/crates/net/sdk/tests/enrollment_invite.rs
+  s_3f3d4c91f992be::t_7ab0df97deda62 28-29,58
+  s_3f3d4c91f992be::t_34c8330e30317c 11,294-340
+  s_3f3d4c91f992be::t_9a579c6b05ab7d 341
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_e4908ba2647937 81-82,1353-1450
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e7cb2220359aeda2a78a570034f222437bb2fb7b",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
