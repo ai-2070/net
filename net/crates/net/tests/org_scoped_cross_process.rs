@@ -243,9 +243,9 @@ async fn provider_child_main() {
     });
     let calls = handler.calls.clone();
     let attribution_ok = handler.attribution_ok.clone();
-    let _dropped: () =
+    let _serve: ServeHandle =
         match provider.serve_rpc_granted(SERVICE, handler, Arc::new(|_| true)) {
-            Ok(_h) => (),
+            Ok(h) => h,
             Err(e) => fail(format!("granted serve: {e:?}")),
         };
 
