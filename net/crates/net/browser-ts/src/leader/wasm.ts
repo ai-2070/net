@@ -12,6 +12,17 @@
 import type {
   LeafWasmConnectOptions,
   LeafWasmModule,
+  LeafWasmOrgAccess,
+  LeafWasmOrgCallOptions,
+  LeafWasmOrgClientStreamHandler,
+  LeafWasmOrgDuplexHandler,
+  LeafWasmOrgServeHandle,
+  LeafWasmOrgServeOptions,
+  LeafWasmOrgStreamingHandler,
+  LeafWasmOrgUnaryHandler,
+  LeafWasmOrgUploadCallHandle,
+  LeafWasmOrgByteStreamHandle,
+  LeafWasmOrgDuplexCallHandle,
   LeafWasmProxyStream,
   LeafWasmStreamOptions,
 } from '../wasm.js';
@@ -59,6 +70,52 @@ export interface LeafWasmSession {
   /** The measured handoff for a promoted tab; `undefined` on the first leader. */
   interruption_ms(): number | undefined;
   call(service: string, payload: Uint8Array, timeout_ms?: number): Promise<Uint8Array>;
+  // ── The eight org verbs (plan §4.5) ──
+  //
+  // Identical names and handle types to `LeafWasmNode`'s — a
+  // follower's calls ride the transparent proxy envelope of the same
+  // nRPC frame bytes, and the handles are the same objects backed by
+  // the leader tab's node. Correlation is the follower's self-minted
+  // id plus its gate generation: on a generation move every pending
+  // call fails typed `LeaderLost` and is NEVER resumed.
+  call_org(service: string, payload: Uint8Array, options: LeafWasmOrgCallOptions): Promise<Uint8Array>;
+  call_org_streaming(
+    service: string,
+    payload: Uint8Array,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgByteStreamHandle>;
+  call_org_client_stream(
+    service: string,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgUploadCallHandle>;
+  call_org_duplex(
+    service: string,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgDuplexCallHandle>;
+  serve_org(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgUnaryHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle;
+  serve_org_streaming(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgStreamingHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle;
+  serve_org_client_stream(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgClientStreamHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle;
+  serve_org_duplex(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgDuplexHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle;
   subscribe(channel: string): Promise<void>;
   /**
    * Release this tab's claim on a channel. The membership survives

@@ -39,6 +39,42 @@ export type {
 export { LeafStream } from './stream.js';
 export type { OpenStreamOptions } from './stream.js';
 
+// Organization-scoped streaming (plan §4.5): the eight org verbs'
+// handle types and their handler vocabulary. `BrowserNode` and
+// `MeshSession` both expose `callOrg*` / `serveOrg*`; these are what
+// those verbs hand back and take.
+export {
+  OrgDuplex,
+  OrgHandleRegistry,
+  OrgRequests,
+  OrgServe,
+  OrgSink,
+  OrgStream,
+  OrgUpload,
+  parseOrgCaller,
+  toWasmOrgCallOptions,
+  toWasmOrgServeOptions,
+} from './org.js';
+export type {
+  OrgAccess,
+  OrgByteStream,
+  OrgCallCredentials,
+  OrgCallHandle,
+  OrgCallOptions,
+  OrgCaller,
+  OrgClientStreamHandler,
+  OrgDuplexHandler,
+  OrgDuplexHandles,
+  OrgDuplexSink,
+  OrgRequestStream,
+  OrgResponseSink,
+  OrgServeHandle,
+  OrgServeOptions,
+  OrgStreamingHandler,
+  OrgUnaryHandler,
+  OrgUploadCall,
+} from './org.js';
+
 export {
   EventHub,
   fromBase64,
@@ -70,7 +106,23 @@ export {
   isUdpBlocked,
   LeafError,
   NotLeaderError,
+  OrgAdmissionDeniedError,
+  OrgCancelledError,
+  OrgIndeterminateError,
+  OrgInternalError,
+  OrgLeaderLostError,
+  OrgMalformedError,
+  OrgRefusedError,
+  OrgRevokedError,
+  OrgSessionLostError,
+  OrgStreamError,
+  OrgTimeoutError,
+  coarseAdmissionReason,
+  orgRetireError,
+  orgRetireReason,
+  orgTerminalError,
   parseLeafError,
+  parseOrgError,
   parseRpcFailure,
   parseRtcFailure,
   RpcError,
@@ -82,7 +134,10 @@ export {
   fromWasmError,
 } from './errors.js';
 export type {
+  CoarseAdmissionReason,
   LeafErrorKind,
+  OrgErrorKind,
+  OrgRetireReason,
   RpcErrorFailure,
   RtcErrorFailure,
   UdpBlockedEvidence,

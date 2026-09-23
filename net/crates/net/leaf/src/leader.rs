@@ -564,6 +564,183 @@ pub enum LeaderRequest {
     IsEnrolled,
     /// The leaf's counters.
     Counters,
+
+    // ───────── org-scoped calls and serves (Stage 4) ─────────
+    //
+    // The org transport is a **transparent envelope over the
+    // existing bytes/stream envelope variants**: the request bodies,
+    // response items and terminal diagnostics these ops carry are
+    // the same bytes the nRPC frames carry, and every one of the four
+    // call shapes resolves through `ProxyValue::Bytes` /
+    // `ProxyFailure` — a new call shape costs zero proxy vocabulary.
+    //
+    // **Attribution, stated once and enforced everywhere below.**
+    // Per-call correlation is the FOLLOWER's self-minted `call` id
+    // (`correlation_seed()`-derived, monotonic across generations:
+    // never a wire id, never an incarnation — a stream's resolved
+    // identity comes back in `ProxyValue::Stream` and is not a
+    // correlation). The gate generation rides every envelope
+    // (`ProxyEnvelope::generation`) and a generation move fails every
+    // pending correlation typed `LeaderLost`, never resumed; a
+    // successor generation's calls carry fresh, higher ids so a late
+    // reply to a dead generation's call can never land on a live one.
+    // Per-follower attribution is the follower's own handle — its
+    // `call` id — and the backend keys its relay state by exactly
+    // that; delivering a call's items under another follower's
+    // handle is the REQUIRED witness inverse and must fail.
+
+    /// Follower → leader: open one org-protected call.
+    ///
+    /// The proof material crosses as opaque credential wire bytes;
+    /// the leader's node mints the signed opening (the entity key
+    /// never leaves the node). `shape` is `unary`,
+    /// `server-streaming`, `client-streaming` or `duplex`.
+    OrgCall {
+        /// The follower's self-minted call id — the per-call
+        /// correlation, never reused across generations.
+        call: u64,
+        /// The call shape.
+        shape: String,
+        /// The service name.
+        service: String,
+        /// The request body (SS) or first upload item (CS/DX).
+        body: Bytes,
+        /// The membership certificate wire bytes.
+        membership: Bytes,
+        /// The dispatcher grant wire bytes.
+        dispatcher: Bytes,
+        /// The capability grant wire bytes, for granted calls.
+        capability_grant: Option<Bytes>,
+        /// The acting org id, 64 hex.
+        acting_org: String,
+        /// The provider's owner org id, 64 hex.
+        provider_org: String,
+        /// The pinned provider entity id, 64 hex.
+        provider: String,
+        /// Proof TTL in seconds (`1..=30`).
+        ttl_secs: u64,
+        /// Absolute deadline, unix nanoseconds (`0` = none at this
+        /// layer; the caller-side applies its facade default first).
+        deadline_ns: u64,
+        /// The unary call deadline, milliseconds.
+        timeout_ms: Option<u32>,
+        /// Response-direction window (SS/DX).
+        stream_window_initial: Option<u32>,
+        /// Upload-direction window (CS/DX).
+        request_window_initial: Option<u32>,
+    },
+    /// Follower → leader: push one upload item (CS/DX).
+    OrgSend {
+        /// The per-call correlation.
+        call: u64,
+        /// The item bytes.
+        payload: Bytes,
+    },
+    /// Follower → leader: half-close the upload (CS finish / DX
+    /// `finishSending`).
+    OrgFinishSending {
+        /// The per-call correlation.
+        call: u64,
+    },
+    /// Follower → leader: **long-pull** for the next response item.
+    ///
+    /// The reply is a transparent envelope in
+    /// [`ProxyValue::Bytes`]: `0x00 ‖ item` for an item, `0x01 ‖
+    /// body` for the success terminal (the CS aggregate or the empty
+    /// `end` marker). A typed terminal answers [`ProxyBody::Failed`]
+    /// with the frozen vocabulary. The pull is held until an item,
+    /// a terminal, or the generation moves — and a generation move
+    /// settles it `LeaderLost`, never resumed.
+    OrgNext {
+        /// The per-call correlation.
+        call: u64,
+    },
+    /// Follower → leader: cancel the call (exactly one CANCEL on the
+    /// mesh; the terminal is latched).
+    OrgCancel {
+        /// The per-call correlation.
+        call: u64,
+    },
+
+    // ───────── serve-through-leader ─────────
+    //
+    // A follower's service registration rides the proxy registry:
+    // the registration is declared to whichever tab holds the lock
+    // and re-declared on every generation this follower has not yet
+    // declared under (the `Attach` re-declare discipline). Inbound
+    // calls dispatch to the REGISTERING follower — the registration
+    // id is the follower's own handle — and teardown follows the
+    // existing retire discipline: `ProxyServer::retire`
+    // fence → shutdown → `LeaderLost`, and nothing here is ever
+    // resurrected.
+
+    /// Follower → leader: register one org service whose handler
+    /// runs in this follower.
+    OrgServeRegister {
+        /// The follower's self-minted registration id.
+        registration: u64,
+        /// The service name.
+        service: String,
+        /// `same-org` or `granted`.
+        access: String,
+        /// The provider's owner org id, 64 hex.
+        owner_org: String,
+        /// The served shape (as [`Self::OrgCall`]'s `shape`).
+        shape: String,
+    },
+    /// Follower → leader: **long-pull** for the next admitted call on
+    /// this registration.
+    ///
+    /// The reply is `0x03 ‖ <JSON>` carrying `{ call, caller }` —
+    /// the per-call correlation and the verified `OrgCaller`
+    /// projection. Admitted calls are dispatched to the registering
+    /// follower's handle and to no other.
+    OrgServeAccept {
+        /// The registration this pull waits on.
+        registration: u64,
+    },
+    /// Follower → leader: **long-pull** for the next request item of
+    /// one served call (`0x00 ‖ item`, then `0x01` at EOF).
+    OrgServeRequest {
+        /// The served call's correlation.
+        call: u64,
+    },
+    /// Follower → leader: push one response item for a served call.
+    OrgServeSend {
+        /// The served call's correlation.
+        call: u64,
+        /// The item bytes.
+        payload: Bytes,
+    },
+    /// Follower → leader: complete one served call.
+    ///
+    /// `status` is the terminal `RpcStatus` wire value (`0` = `Ok`,
+    /// whose terminal is the `end` marker); `message` is the
+    /// diagnostic body for a non-`Ok` terminal.
+    OrgServeFinish {
+        /// The served call's correlation.
+        call: u64,
+        /// The terminal status.
+        status: u16,
+        /// The diagnostic body (ignored for `Ok`).
+        message: String,
+    },
+    /// Follower → leader: **long-pull** for one served call's
+    /// retirement signal (`0x02 ‖ <reason>` with the frozen
+    /// `OrgRetireReason` string).
+    OrgServeRetired {
+        /// The served call's correlation.
+        call: u64,
+    },
+    /// Follower → leader: close a registration (C9's protected
+    /// split — its live calls retire with their exact terminals and
+    /// new openings are refused).
+    OrgServeUnregister {
+        /// The registration.
+        registration: u64,
+        /// The service name (the leader unregisters by name).
+        service: String,
+    },
 }
 
 /// What the leader answers a request with.
@@ -1953,6 +2130,45 @@ fn unb64(value: &Value, key: &str) -> Result<Bytes> {
         .map_err(|e| LeafError::ControlPlane(format!("proxy field {key} is not base64: {e}")))
 }
 
+/// Transparent-envelope tags for the org transport's
+/// [`ProxyValue::Bytes`] payloads.
+///
+/// The envelope is deliberately the wire's own byte grammar — request
+/// items, response items and terminal diagnostics ride the proxy
+/// **verbatim** ("a transparent envelope of the same nRPC frame
+/// bytes"), so a new call shape adds no `ProxyBody`/`ProxyValue`
+/// variant. Typed terminals do not ride the envelope at all: they
+/// answer [`ProxyBody::Failed`] with the frozen
+/// [`crate::error::LeafError`] vocabulary.
+pub const ORG_ENVELOPE_ITEM: u8 = 0x00;
+/// The success terminal: `0x01 ‖ body` (the CS aggregate; empty for
+/// the SS/DX `end` marker).
+pub const ORG_ENVELOPE_END: u8 = 0x01;
+/// A retirement signal: `0x02 ‖ <reason>` with the frozen
+/// `OrgRetireReason` string.
+pub const ORG_ENVELOPE_RETIRED: u8 = 0x02;
+/// An admitted serve call: `0x03 ‖ <JSON { call, caller }>`.
+pub const ORG_ENVELOPE_ADMITTED: u8 = 0x03;
+
+/// An optional `u32` in the `timeout_ms` spelling: decimal string or
+/// null.
+fn opt_u32(value: &Option<u32>) -> Value {
+    match value {
+        Some(n) => Value::from(n.to_string()),
+        None => Value::Null,
+    }
+}
+
+/// Read an [`opt_u32`] field back.
+fn opt_u32_field(value: &Value, key: &str) -> Result<Option<u32>> {
+    match field(value, key)? {
+        Value::Null => Ok(None),
+        _ => Ok(Some(u64_field(value, key)?.try_into().map_err(|_| {
+            LeafError::ControlPlane(format!("proxy field {key} does not fit a u32"))
+        })?)),
+    }
+}
+
 fn encode_request(request: &LeaderRequest) -> Value {
     let mut map = Map::new();
     match request {
@@ -2079,6 +2295,111 @@ fn encode_request(request: &LeaderRequest) -> Value {
         LeaderRequest::IsEnrolled => {
             map.insert("op".into(), Value::from("is_enrolled"));
         }
+        LeaderRequest::OrgCall {
+            call,
+            shape,
+            service,
+            body,
+            membership,
+            dispatcher,
+            capability_grant,
+            acting_org,
+            provider_org,
+            provider,
+            ttl_secs,
+            deadline_ns,
+            timeout_ms,
+            stream_window_initial,
+            request_window_initial,
+        } => {
+            map.insert("op".into(), Value::from("org_call"));
+            map.insert("call".into(), Value::from(call.to_string()));
+            map.insert("shape".into(), Value::from(shape.clone()));
+            map.insert("service".into(), Value::from(service.clone()));
+            map.insert("body".into(), b64(body));
+            map.insert("membership".into(), b64(membership));
+            map.insert("dispatcher".into(), b64(dispatcher));
+            map.insert(
+                "capability_grant".into(),
+                capability_grant
+                    .as_ref()
+                    .map_or(Value::Null, |grant| b64(grant.as_ref())),
+            );
+            map.insert("acting_org".into(), Value::from(acting_org.clone()));
+            map.insert("provider_org".into(), Value::from(provider_org.clone()));
+            map.insert("provider".into(), Value::from(provider.clone()));
+            map.insert("ttl_secs".into(), Value::from(ttl_secs.to_string()));
+            map.insert("deadline_ns".into(), Value::from(deadline_ns.to_string()));
+            map.insert("timeout_ms".into(), opt_u32(timeout_ms));
+            map.insert("stream_window_initial".into(), opt_u32(stream_window_initial));
+            map.insert("request_window_initial".into(), opt_u32(request_window_initial));
+        }
+        LeaderRequest::OrgSend { call, payload } => {
+            map.insert("op".into(), Value::from("org_send"));
+            map.insert("call".into(), Value::from(call.to_string()));
+            map.insert("payload".into(), b64(payload));
+        }
+        LeaderRequest::OrgFinishSending { call } => {
+            map.insert("op".into(), Value::from("org_finish_sending"));
+            map.insert("call".into(), Value::from(call.to_string()));
+        }
+        LeaderRequest::OrgNext { call } => {
+            map.insert("op".into(), Value::from("org_next"));
+            map.insert("call".into(), Value::from(call.to_string()));
+        }
+        LeaderRequest::OrgCancel { call } => {
+            map.insert("op".into(), Value::from("org_cancel"));
+            map.insert("call".into(), Value::from(call.to_string()));
+        }
+        LeaderRequest::OrgServeRegister {
+            registration,
+            service,
+            access,
+            owner_org,
+            shape,
+        } => {
+            map.insert("op".into(), Value::from("org_serve_register"));
+            map.insert("registration".into(), Value::from(registration.to_string()));
+            map.insert("service".into(), Value::from(service.clone()));
+            map.insert("access".into(), Value::from(access.clone()));
+            map.insert("owner_org".into(), Value::from(owner_org.clone()));
+            map.insert("shape".into(), Value::from(shape.clone()));
+        }
+        LeaderRequest::OrgServeAccept { registration } => {
+            map.insert("op".into(), Value::from("org_serve_accept"));
+            map.insert("registration".into(), Value::from(registration.to_string()));
+        }
+        LeaderRequest::OrgServeRequest { call } => {
+            map.insert("op".into(), Value::from("org_serve_request"));
+            map.insert("call".into(), Value::from(call.to_string()));
+        }
+        LeaderRequest::OrgServeSend { call, payload } => {
+            map.insert("op".into(), Value::from("org_serve_send"));
+            map.insert("call".into(), Value::from(call.to_string()));
+            map.insert("payload".into(), b64(payload));
+        }
+        LeaderRequest::OrgServeFinish {
+            call,
+            status,
+            message,
+        } => {
+            map.insert("op".into(), Value::from("org_serve_finish"));
+            map.insert("call".into(), Value::from(call.to_string()));
+            map.insert("status".into(), Value::from(status.to_string()));
+            map.insert("message".into(), Value::from(message.clone()));
+        }
+        LeaderRequest::OrgServeRetired { call } => {
+            map.insert("op".into(), Value::from("org_serve_retired"));
+            map.insert("call".into(), Value::from(call.to_string()));
+        }
+        LeaderRequest::OrgServeUnregister {
+            registration,
+            service,
+        } => {
+            map.insert("op".into(), Value::from("org_serve_unregister"));
+            map.insert("registration".into(), Value::from(registration.to_string()));
+            map.insert("service".into(), Value::from(service.clone()));
+        }
     }
     Value::Object(map)
 }
@@ -2167,6 +2488,70 @@ fn decode_request(value: &Value) -> Result<LeaderRequest> {
         "counters" => LeaderRequest::Counters,
         "enroll" => LeaderRequest::Enroll,
         "is_enrolled" => LeaderRequest::IsEnrolled,
+        "org_call" => LeaderRequest::OrgCall {
+            call: u64_field(value, "call")?,
+            shape: str_field(value, "shape")?.to_string(),
+            service: str_field(value, "service")?.to_string(),
+            body: unb64(value, "body")?,
+            membership: unb64(value, "membership")?,
+            dispatcher: unb64(value, "dispatcher")?,
+            capability_grant: match field(value, "capability_grant")? {
+                Value::Null => None,
+                _ => Some(unb64(value, "capability_grant")?),
+            },
+            acting_org: str_field(value, "acting_org")?.to_string(),
+            provider_org: str_field(value, "provider_org")?.to_string(),
+            provider: str_field(value, "provider")?.to_string(),
+            ttl_secs: u64_field(value, "ttl_secs")?,
+            deadline_ns: u64_field(value, "deadline_ns")?,
+            timeout_ms: opt_u32_field(value, "timeout_ms")?,
+            stream_window_initial: opt_u32_field(value, "stream_window_initial")?,
+            request_window_initial: opt_u32_field(value, "request_window_initial")?,
+        },
+        "org_send" => LeaderRequest::OrgSend {
+            call: u64_field(value, "call")?,
+            payload: unb64(value, "payload")?,
+        },
+        "org_finish_sending" => LeaderRequest::OrgFinishSending {
+            call: u64_field(value, "call")?,
+        },
+        "org_next" => LeaderRequest::OrgNext {
+            call: u64_field(value, "call")?,
+        },
+        "org_cancel" => LeaderRequest::OrgCancel {
+            call: u64_field(value, "call")?,
+        },
+        "org_serve_register" => LeaderRequest::OrgServeRegister {
+            registration: u64_field(value, "registration")?,
+            service: str_field(value, "service")?.to_string(),
+            access: str_field(value, "access")?.to_string(),
+            owner_org: str_field(value, "owner_org")?.to_string(),
+            shape: str_field(value, "shape")?.to_string(),
+        },
+        "org_serve_accept" => LeaderRequest::OrgServeAccept {
+            registration: u64_field(value, "registration")?,
+        },
+        "org_serve_request" => LeaderRequest::OrgServeRequest {
+            call: u64_field(value, "call")?,
+        },
+        "org_serve_send" => LeaderRequest::OrgServeSend {
+            call: u64_field(value, "call")?,
+            payload: unb64(value, "payload")?,
+        },
+        "org_serve_finish" => LeaderRequest::OrgServeFinish {
+            call: u64_field(value, "call")?,
+            status: u64_field(value, "status")?.try_into().map_err(|_| {
+                LeafError::ControlPlane("proxy status does not fit a u16".into())
+            })?,
+            message: str_field(value, "message")?.to_string(),
+        },
+        "org_serve_retired" => LeaderRequest::OrgServeRetired {
+            call: u64_field(value, "call")?,
+        },
+        "org_serve_unregister" => LeaderRequest::OrgServeUnregister {
+            registration: u64_field(value, "registration")?,
+            service: str_field(value, "service")?.to_string(),
+        },
         other => {
             return Err(LeafError::ControlPlane(format!(
                 "unknown proxy request op {other:?}"

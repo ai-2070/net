@@ -393,8 +393,22 @@ struct Subscription {
 /// The shared interior. One per node; the transport's inbound
 /// closure holds a `Weak` to it, so a closed node's callbacks cannot
 /// resurrect it.
-struct Inner {
+pub(crate) struct Inner {
     node: crate::node::LeafNode,
+    /// The entity keypair shared with every org proof mint.
+    ///
+    /// The proofs are signed node-side — the secret never crosses
+    /// the JS boundary — and each mint needs the keypair by value, so
+    /// one `Rc` is built at connect beside the identity's own copy.
+    org_keypair: Rc<EntityKeypair>,
+    /// Admitted org calls waiting for their JS handler.
+    ///
+    /// The serve trampoline files here and dispatches with no borrow
+    /// held — the [`dispatch_events`] discipline, one queue over. A
+    /// callback may re-enter the node, which is the whole reason the
+    /// handler is never invoked from inside the pump that admitted
+    /// the call.
+    serve_queue: Rc<RefCell<VecDeque<PendingServe>>>,
     transport: RtcLeafTransport,
     anchor: NodeId,
     /// The boundary. Every exchange that is not a Net packet goes
@@ -1470,7 +1484,7 @@ impl LeafNode {
         let bootstrap_url = optional_string(&opts, "bootstrapUrl")
             .unwrap_or_else(|| credential.bootstrap_url.clone());
         let caller_ice_servers = parse_ice_servers(&opts)?;
-        let identity = identity_from(&opts)?;
+        let (identity, org_keypair) = identity_from(&opts)?;
         let node_id = identity.node_id();
 
         // Layer 0 step 1 lives inside `attach`: the live anchor info
@@ -1546,6 +1560,8 @@ impl LeafNode {
 
         let inner = Rc::new(RefCell::new(Inner {
             node,
+            org_keypair,
+            serve_queue: Rc::new(RefCell::new(VecDeque::new())),
             transport: RtcLeafTransport::new(Rc::new(|_, _| {})),
             anchor,
             control,
@@ -3775,6 +3791,24 @@ async fn service_control_plane(inner: &Rc<RefCell<Inner>>) -> Result<(), LeafErr
         }
     }
 
+    // The revocation feed (S4): signed bundles a carrier delivered
+    // are applied here, one at a time. The node verifies each bundle
+    // in-leaf (issuer signature, canonical floors) before any floor
+    // moves, and the merge is raise-only — so this is a feed of
+    // signed facts, never a trust-the-carrier setter. The trait's
+    // default is empty, so a carrier that delivers none changes
+    // nothing. Application failures are logged and skipped: one bad
+    // bundle must not stop the pump from delivering the good ones,
+    // and a refused bundle raises no floor to undo.
+    {
+        let mut guard = inner.borrow_mut();
+        for bundle in guard.control.take_revocation_bundles() {
+            if let Err(e) = guard.node.ingest_org_revocation_bundle(&bundle) {
+                console_error(&format!("net-mesh-leaf: revocation bundle refused: {e}"));
+            }
+        }
+    }
+
     match ended {
         Some(reason) => Err(LeafError::ControlPlane(reason)),
         None => Ok(()),
@@ -4084,13 +4118,26 @@ fn drive_retries(inner: &Rc<RefCell<Inner>>) {
 /// through to `generate()` is what made a dropped option look like a
 /// leaf ignoring custody, and "two tabs sharing one identity" is an
 /// exit criterion nobody can check if the fallback is silent.
-fn identity_from(opts: &JsValue) -> Result<LeafIdentity, JsError> {
+fn identity_from(opts: &JsValue) -> Result<(LeafIdentity, Rc<EntityKeypair>), JsError> {
     let entity_hex = optional_string(opts, "entitySecretHex")
         .or_else(|| optional_string(opts, "entity_secret_hex"));
     let noise_hex = optional_string(opts, "noiseSecretHex")
         .or_else(|| optional_string(opts, "noise_secret_hex"));
     match (entity_hex, noise_hex) {
-        (None, None) => LeafIdentity::generate().map_err(js),
+        (None, None) => {
+            // The same two CSPRNG draws `LeafIdentity::generate`
+            // makes, taken here because the org proof mint needs the
+            // entity keypair SHARED (`Rc`) across every call while
+            // `LeafIdentity` owns its own and offers no way to read a
+            // scalar back out. One extra keypair per connect; never a
+            // second secret.
+            let entity = random32().map_err(js)?;
+            let noise = random32().map_err(js)?;
+            Ok((
+                LeafIdentity::from_secrets(EntityKeypair::from_secret(entity), noise),
+                Rc::new(EntityKeypair::from_secret(entity)),
+            ))
+        }
         (None, Some(_)) => Err(JsError::new(
             "noiseSecretHex was supplied without entitySecretHex: the Noise static \
              is not an identity, and generating the entity half beside an injected \
@@ -4102,9 +4149,9 @@ fn identity_from(opts: &JsValue) -> Result<LeafIdentity, JsError> {
                 Some(hex) => secret32(&hex, "noiseSecretHex")?,
                 None => random32().map_err(js)?,
             };
-            Ok(LeafIdentity::from_secrets(
-                EntityKeypair::from_secret(entity),
-                noise,
+            Ok((
+                LeafIdentity::from_secrets(EntityKeypair::from_secret(entity), noise),
+                Rc::new(EntityKeypair::from_secret(entity)),
             ))
         }
     }
@@ -4451,6 +4498,1892 @@ pub(crate) fn parse_dialog_id(raw: &str) -> Result<u64, JsError> {
 fn parse_u64(raw: &str) -> Result<u64, JsError> {
     crate::bootstrap::parse_node_id(raw)
         .ok_or_else(|| JsError::new(&format!("{raw:?} is not a u64 (decimal or 0x-hex)")))
+}
+
+// ───────────── org-scoped calls and serves (Stage 4) ─────────────────
+
+/// The default protected call lifetime, in nanoseconds (Owner Q1).
+///
+/// Used when the caller supplies no deadline — and a protected call's
+/// lifetime is finite by contract: `deadlineMs` absent means THIS,
+/// never "no deadline".
+pub(crate) const ORG_DEFAULT_LIVE_NS: u64 = 300 * 1_000_000_000;
+
+/// The provider's maximum protected call lifetime, in nanoseconds
+/// (Owner Q1). An explicit request beyond it is refused at opening,
+/// never clamped.
+pub(crate) const ORG_MAX_LIVE_NS: u64 = 3600 * 1_000_000_000;
+
+/// The credential clock-skew ceiling, in seconds — the same 300 s
+/// `MAX_TOKEN_CLOCK_SKEW_SECS` the org authority enforces.
+pub(crate) const ORG_SKEW_SECS: u64 = 300;
+
+/// The eight org verbs, at the boundary.
+///
+/// `callOrg` / `callOrgStreaming` / `callOrgClientStream` /
+/// `callOrgDuplex` and `serveOrg` / `serveOrgStreaming` /
+/// `serveOrgClientStream` / `serveOrgDuplex` on [`LeafNode`] and
+/// [`crate::leader_session::MeshSession`], identical names on both.
+/// Every call shape runs the same admission (the streaming proof
+/// kinds and the session fence included) and every handle surfaces
+/// the same frozen error vocabulary item by item: an opening refusal
+/// is `admission-denied` with its coarse reason, a midstream
+/// revocation is the stream's final `admission-denied` (`denied`),
+/// and deadline/cancel retirement is `timeout` / `cancelled`.
+///
+/// ## The suspension and closure contract
+///
+/// Deadlines are **absolute** (`deadline_ns` is stamped at opening):
+/// a frozen tab gets no lease extension, and on wake an overdue call
+/// retires with its deadline terminal. There is **no automatic
+/// resume** — a retired call is never transparently re-opened;
+/// re-opening is a fresh call with a fresh proof and MAY repeat
+/// effects. Node or tab close retires ownership: pending calls fail
+/// typed, and dropping one caller handle emits exactly one CANCEL.
+///
+/// ## Errors across this boundary
+///
+/// Rejections carry [`crate::error::LeafError`]'s `Display` text; an
+/// admission denial is `rpc: refused (9): <coarse>` where `<coarse>`
+/// is exactly `denied`, `not-supported` or `unavailable`. Stream
+/// terminals cross as a final **item** (`done` with an `error`
+/// object: `kind`, `message`, and `coarse` on `admission-denied`),
+/// and the TypeScript wrapper throws that typed error at the
+/// terminal item — idiomatic `for await`.
+pub(crate) struct OrgCallCredentials {
+    /// The caller's membership certificate wire bytes (156).
+    pub(crate) membership: Vec<u8>,
+    /// The dispatcher grant wire bytes (185).
+    pub(crate) dispatcher: Vec<u8>,
+    /// The capability grant wire bytes (318), when the call is
+    /// granted rather than same-org.
+    pub(crate) capability_grant: Option<Vec<u8>>,
+    /// The org the caller acts for, 64 hex.
+    pub(crate) acting_org: String,
+    /// The provider's owner org, 64 hex.
+    pub(crate) provider_owner_org: String,
+    /// The provider's **entity id**, 64 hex.
+    ///
+    /// The provider is pinned by entity, and the transport peer is
+    /// the R1 derivation [`crate::org::EntityId::node_id`] of it —
+    /// never a separately-supplied node id, which would unpin the
+    /// provider the call binding signs for.
+    pub(crate) provider: String,
+    /// The proof's own validity, seconds from now. The credential
+    /// windows may shorten the call further.
+    pub(crate) proof_ttl_secs: Option<u64>,
+}
+
+/// Everything the four call verbs read from their options object.
+///
+/// One struct and one reader for all four verbs and both surfaces,
+/// the [`StreamOptions`] discipline: a supplied option of the wrong
+/// type is refused loudly, never defaulted past.
+pub(crate) struct OrgCallOptions {
+    /// The proofs and the provider pin.
+    pub(crate) credentials: OrgCallCredentials,
+    /// The caller's deadline in milliseconds from now. Absent is
+    /// [`ORG_DEFAULT_LIVE_NS`], never "none"; an explicit request
+    /// beyond [`ORG_MAX_LIVE_NS`] is refused at opening.
+    pub(crate) deadline_ms: Option<u64>,
+    /// The response-direction flow-control window (SS/DX).
+    /// `Some(0)` is refused — it deadlocks the response pump.
+    pub(crate) stream_window_initial: Option<u32>,
+    /// The upload-direction flow-control window (CS/DX). `Some(0)`
+    /// is refused — it deadlocks `send`.
+    pub(crate) request_window_initial: Option<u32>,
+}
+
+impl OrgCallOptions {
+    /// The absolute deadline these options resolve to.
+    ///
+    /// Absolute unix nanoseconds, stamped ONCE here: a frozen tab's
+    /// call keeps this deadline through the whole suspension — the
+    /// suspension/closure contract above, at the one place it can be
+    /// honoured.
+    pub(crate) fn deadline_ns(&self) -> u64 {
+        let span_ns = self
+            .deadline_ms
+            .map(|ms| ms.saturating_mul(1_000_000))
+            .unwrap_or(ORG_DEFAULT_LIVE_NS);
+        clock::now_unix_nanos().saturating_add(span_ns)
+    }
+
+    /// Whether the requested lifetime is inside the provider's cap.
+    ///
+    /// Refused, never clamped: a caller that asked for a year gets an
+    /// error, not a silently shorter call.
+    pub(crate) fn within_provider_cap(&self) -> Result<(), JsError> {
+        let span_ns = self
+            .deadline_ms
+            .map(|ms| ms.saturating_mul(1_000_000))
+            .unwrap_or(ORG_DEFAULT_LIVE_NS);
+        if span_ns > ORG_MAX_LIVE_NS {
+            return Err(JsError::new(&format!(
+                "deadlineMs asks for {span_ns}ns of protected call lifetime; the provider cap \
+                 is {ORG_MAX_LIVE_NS}ns and an explicit request beyond it is refused, not clamped"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Everything the four serve verbs read from their options object.
+pub(crate) struct OrgServeOptions {
+    /// This node's owner org, 64 hex — the org whose members are
+    /// `same-org` callers.
+    pub(crate) owner_org: String,
+}
+
+/// Read `{ credentials: {...}, deadlineMs?, streamWindowInitial?,
+/// requestWindowInitial? }`.
+pub(crate) fn org_call_options(opts: &JsValue) -> Result<OrgCallOptions, JsError> {
+    let credentials = js_sys::Reflect::get(opts, &JsValue::from_str("credentials"))
+        .map_err(|_| JsError::new("credentials could not be read"))?;
+    if !credentials.is_object() {
+        return Err(JsError::new("credentials is required and must be an object"));
+    }
+    let credentials = OrgCallCredentials {
+        membership: byte_field(&credentials, "membership", true)?.unwrap_or_default(),
+        dispatcher: byte_field(&credentials, "dispatcher", true)?.unwrap_or_default(),
+        capability_grant: byte_field(&credentials, "capabilityGrant", false)?,
+        acting_org: require_string(&credentials, "actingOrg")?,
+        provider_owner_org: require_string(&credentials, "providerOwnerOrg")?,
+        provider: require_string(&credentials, "provider")?,
+        proof_ttl_secs: optional_u64_ms(&credentials, "proofTtlSecs", "seconds")?,
+    };
+    Ok(OrgCallOptions {
+        credentials,
+        deadline_ms: optional_u64_ms(opts, "deadlineMs", "milliseconds")?,
+        stream_window_initial: optional_window(opts, "streamWindowInitial")?,
+        request_window_initial: optional_window(opts, "requestWindowInitial")?,
+    })
+}
+
+/// Read `{ ownerOrg }`.
+pub(crate) fn org_serve_options(opts: &JsValue) -> Result<OrgServeOptions, JsError> {
+    Ok(OrgServeOptions {
+        owner_org: require_string(opts, "ownerOrg")?,
+    })
+}
+
+/// A `Uint8Array` option — or a loud refusal.
+///
+/// Byte fields are the proofs themselves: a string here is a
+/// different wire object, and the [`parse_ice_servers`] lesson says
+/// a silently-ignored caller input is worse than an error.
+fn byte_field(opts: &JsValue, key: &str, required: bool) -> Result<Option<Vec<u8>>, JsError> {
+    let value = js_sys::Reflect::get(opts, &JsValue::from_str(key))
+        .map_err(|_| JsError::new(&format!("{key} could not be read")))?;
+    if value.is_undefined() || value.is_null() {
+        return if required {
+            Err(JsError::new(&format!("{key} is required and must be a Uint8Array")))
+        } else {
+            Ok(None)
+        };
+    }
+    let actual = value.js_typeof().as_string().unwrap_or_default();
+    let array = value.dyn_into::<js_sys::Uint8Array>().map_err(|_| {
+        JsError::new(&format!("{key} must be a Uint8Array, not a {actual}"))
+    })?;
+    Ok(Some(array.to_vec()))
+}
+
+/// A whole-number option in `0..`, or a loud refusal — the
+/// [`optional_u16`] discipline at a wider bound.
+fn optional_u64_ms(opts: &JsValue, key: &str, unit: &str) -> Result<Option<u64>, JsError> {
+    let value = js_sys::Reflect::get(opts, &JsValue::from_str(key))
+        .map_err(|_| JsError::new(&format!("{key} could not be read")))?;
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let Some(number) = value.as_f64() else {
+        let actual = value.js_typeof().as_string().unwrap_or_default();
+        return Err(JsError::new(&format!(
+            "{key} must be a whole number of {unit}, not a {actual}"
+        )));
+    };
+    if !number.is_finite() || number.fract() != 0.0 || number < 0.0 {
+        return Err(JsError::new(&format!(
+            "{key} must be a whole number of {unit}, got {number}"
+        )));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(Some(number as u64))
+}
+
+/// A flow-control window option — `None` absent, `Some(n >= 1)`, and
+/// `Some(0)` refused exactly as the native seams refuse it: "send
+/// must await a credit that can never arrive".
+fn optional_window(opts: &JsValue, key: &str) -> Result<Option<u32>, JsError> {
+    let value = js_sys::Reflect::get(opts, &JsValue::from_str(key))
+        .map_err(|_| JsError::new(&format!("{key} could not be read")))?;
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let Some(number) = value.as_f64() else {
+        let actual = value.js_typeof().as_string().unwrap_or_default();
+        return Err(JsError::new(&format!(
+            "{key} must be a whole number in 1..=4294967295, not a {actual}"
+        )));
+    };
+    if !number.is_finite()
+        || number.fract() != 0.0
+        || number < 1.0
+        || number > 4_294_967_295.0
+    {
+        return Err(JsError::new(&format!(
+            "{key} must be a whole number in 1..=4294967295, got {number}; absent means \
+             unbounded and 0 would deadlock the peer awaiting a credit"
+        )));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(Some(number as u32))
+}
+
+/// A 32-byte identity or org id from 64 hex — or a loud refusal.
+fn hex32(raw: &str, what: &str) -> Result<[u8; 32], JsError> {
+    let bytes = crate::identity::unhex(raw)
+        .map_err(|e| JsError::new(&format!("{what} is not hex: {e}")))?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        JsError::new(&format!(
+            "{what} must be 32 bytes (64 hex digits), got {} bytes",
+            bytes.len()
+        ))
+    })
+}
+
+/// The `same-org` | `granted` access selector, or a loud refusal.
+fn org_access(raw: &str) -> Result<crate::rpc_serve::ServeAccess, JsError> {
+    match raw {
+        "same-org" => Ok(crate::rpc_serve::ServeAccess::SameOrg),
+        "granted" => Ok(crate::rpc_serve::ServeAccess::Granted),
+        other => Err(JsError::new(&format!(
+            "access must be \"same-org\" or \"granted\", got {other:?}"
+        ))),
+    }
+}
+
+/// The coarse reason an `admission-denied` terminal carries, spelled
+/// exactly as the TypeScript `OrgAdmissionDeniedError.coarse` type.
+///
+/// The wire body is the one-byte [`crate::org::CoarseAdmissionReason`]
+/// (0 denied, 1 not-supported, 2 unavailable) — "denial is not a
+/// credential oracle", so nothing finer crosses. An undecodable byte
+/// fails to `denied`, the restrictive reading.
+pub(crate) fn coarse_text(body: &[u8]) -> &'static str {
+    match body.first() {
+        Some(1) => "not-supported",
+        Some(2) => "unavailable",
+        _ => "denied",
+    }
+}
+
+/// The error object of a terminal **item**, or `None` for a
+/// completion.
+///
+/// Frozen `kind` vocabulary: `admission-denied` (with `coarse`),
+/// `timeout`, `cancelled`, `revoked`, `leader-lost`, `session-lost`,
+/// `indeterminate`, `refused` (with `status`), `internal`,
+/// `malformed`. `message` is always the [`LeafError`] `Display`
+/// spelling the TS wrapper's `parseRpcFailure` already knows.
+pub(crate) fn terminal_error_json(terminal: &crate::rpc_stream::StreamTerminal) -> Option<String> {
+    use crate::rpc_stream::{RetireReason, StreamTerminal};
+    use crate::rpc_wire::RpcStatus;
+    use serde_json::Value;
+    let mut map = serde_json::Map::new();
+    match terminal {
+        StreamTerminal::Completed { .. } => return None,
+        StreamTerminal::Refused { status, body } => {
+            let status = *status;
+            let coarse = status == RpcStatus::AdmissionDenied;
+            let message = if coarse {
+                format!("rpc: refused ({}): {}", status.to_wire(), coarse_text(body))
+            } else {
+                format!(
+                    "rpc: refused ({}): {}",
+                    status.to_wire(),
+                    String::from_utf8_lossy(body)
+                )
+            };
+            let kind = match status {
+                RpcStatus::AdmissionDenied => "admission-denied",
+                RpcStatus::Timeout => "timeout",
+                RpcStatus::Cancelled => "cancelled",
+                RpcStatus::Internal => "internal",
+                RpcStatus::UnknownVersion => "malformed",
+                _ => "refused",
+            };
+            // The follower-armed deadline's one spelling (the
+            // `errors.ts` indeterminate class pins this text): the
+            // work may already have executed and was not retried.
+            let mut kind = kind;
+            let mut message = message;
+            let mut deadline_ms = None;
+            if kind == "timeout" {
+                let text = String::from_utf8_lossy(body);
+                if let Some(rest) = text.strip_prefix("the local deadline of ") {
+                    if let Some((millis, _)) = rest.split_once("ms elapsed") {
+                        if let Ok(millis) = millis.parse::<u64>() {
+                            kind = "indeterminate";
+                            message = format!("rpc: {text}");
+                            deadline_ms = Some(millis);
+                        }
+                    }
+                }
+            }
+            map.insert("kind".into(), Value::from(kind));
+            map.insert("message".into(), Value::from(message));
+            if coarse {
+                map.insert("coarse".into(), Value::from(coarse_text(body)));
+            }
+            if kind == "refused" {
+                map.insert("status".into(), Value::from(status.to_wire()));
+            }
+            if let Some(millis) = deadline_ms {
+                map.insert("deadlineMs".into(), Value::from(millis));
+            }
+        }
+        StreamTerminal::Retired { reason } => {
+            let reason = *reason;
+            // §4.3 governs the wire; this arm is the LOCAL retirement
+            // observable. `NodeClosed` and `Replaced` retire as
+            // `cancelled` (their wire mapping); `ResourceExhausted`
+            // is the byte-budget retirement whose precise observable
+            // is `admission-denied` / `unavailable`.
+            let (kind, message) = match reason {
+                RetireReason::Timeout => (
+                    "timeout",
+                    "rpc: the call's deadline elapsed".to_string(),
+                ),
+                RetireReason::Cancelled => (
+                    "cancelled",
+                    "rpc: the call was cancelled".to_string(),
+                ),
+                RetireReason::Revoked => (
+                    "revoked",
+                    "org: the call's credentials were revoked".to_string(),
+                ),
+                RetireReason::SessionLost => (
+                    "session-lost",
+                    "rpc: the session carrying the call went away".to_string(),
+                ),
+                RetireReason::LeaderLost => (
+                    "leader-lost",
+                    "rpc: the leader holding the call was replaced".to_string(),
+                ),
+                RetireReason::NodeClosed => (
+                    "cancelled",
+                    "rpc: the node running the call was closed".to_string(),
+                ),
+                RetireReason::Replaced => (
+                    "cancelled",
+                    "rpc: the peer session was replaced".to_string(),
+                ),
+                RetireReason::ResourceExhausted => (
+                    "admission-denied",
+                    "rpc: refused (9): unavailable".to_string(),
+                ),
+            };
+            map.insert("kind".into(), Value::from(kind));
+            map.insert("message".into(), Value::from(message));
+            if reason == RetireReason::ResourceExhausted {
+                map.insert("coarse".into(), Value::from("unavailable"));
+            }
+        }
+    }
+    Some(Value::Object(map).to_string())
+}
+
+/// The `retired` promise's resolution: one of the frozen
+/// [`OrgRetireReason`] strings, exactly.
+///
+/// `timeout` | `cancelled` | `revoked` | `session-lost` |
+/// `leader-lost` | `node-closed` | `replaced`. A byte-budget
+/// retirement (`resource-exhausted`) delivers `cancelled`; its
+/// precise observable is the terminal item (`admission-denied`,
+/// coarse `unavailable`).
+pub(crate) fn retire_reason_text(reason: crate::rpc_stream::RetireReason) -> &'static str {
+    use crate::rpc_stream::RetireReason;
+    match reason {
+        RetireReason::Timeout => "timeout",
+        RetireReason::Cancelled => "cancelled",
+        RetireReason::Revoked => "revoked",
+        RetireReason::SessionLost => "session-lost",
+        RetireReason::LeaderLost => "leader-lost",
+        RetireReason::NodeClosed => "node-closed",
+        RetireReason::Replaced => "replaced",
+        RetireReason::ResourceExhausted => "cancelled",
+    }
+}
+
+// ──────────── org handles, verbs, and handler trampolines ────────────
+
+/// One admitted call parked for its JS handler.
+struct PendingServe {
+    /// Which JS handler this call's service registered.
+    handler: js_sys::Function,
+    /// How many arguments the handler takes and what it resolves.
+    shape: HandlerShape,
+    /// The admitted call, shared with the sink/stream handles the
+    /// handler receives.
+    call: Rc<ServeCallState>,
+}
+
+/// How one serve verb's JS handler is invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandlerShape {
+    /// `(caller, request) -> Promise<Uint8Array>`.
+    Unary,
+    /// `(caller, request, sink) -> Promise<void>`.
+    Streaming,
+    /// `(caller, requests) -> Promise<Uint8Array>`.
+    ClientStream,
+    /// `(caller, requests, sink) -> Promise<void>`.
+    Duplex,
+}
+
+/// One admitted serve call plus its once-only completion flag.
+///
+/// The flag exists because two parties may complete the same call —
+/// the handler's returned promise and the sink's `close()` — and the
+/// terminal frame is sent exactly once.
+pub(crate) struct ServeCallState {
+    /// The lifecycle's handle: zero node-state borrows, so it is safe
+    /// to hold across the JS callbacks this side schedules.
+    call: Rc<dyn OrgServeCall>,
+    /// Whether a `finish` has been issued.
+    finished: Cell<bool>,
+}
+
+impl ServeCallState {
+    /// Complete the call once; the second completion is dropped.
+    fn finish_once(&self, result: crate::rpc_wire::StreamHandlerResult) {
+        if !self.finished.replace(true) {
+            let _ = self.call.finish(result);
+        }
+    }
+}
+
+/// Where a caller-side org call's bytes flow.
+pub(crate) enum OrgWhere {
+    /// The node in this tab.
+    Node {
+        /// The node's shared interior.
+        inner: Rc<RefCell<Inner>>,
+        /// The sans-IO call guard. Its `Drop` emits exactly one
+        /// CANCEL unless the exactly-once flag already fired (an
+        /// explicit `cancel`, or a typed retirement at node close).
+        call: crate::rpc_stream::CallHandle,
+    },
+    /// A call proxied through the tab that holds the lock.
+    Proxy(crate::leader_session::ProxyOrgCall),
+}
+
+/// One org call's JS-side state: its drive target, its latched
+/// terminal and its settled flag.
+pub(crate) struct OrgCall {
+    /// Where the bytes flow.
+    pub(crate) where_: OrgWhere,
+    /// The terminal, latched at the source exactly once and held so
+    /// `finish` and `next` on a shared duplex handle agree on it.
+    terminal: RefCell<Option<crate::rpc_stream::StreamTerminal>>,
+    /// Whether a terminal has been delivered to a consumer.
+    settled: Cell<bool>,
+}
+
+/// What one poll of an org call produced.
+pub(crate) enum OrgPoll {
+    /// One response item.
+    Item(Bytes),
+    /// The call's terminal, delivered exactly once.
+    Terminal(crate::rpc_stream::StreamTerminal),
+    /// Nothing yet — poll again after the next pump.
+    Pending,
+}
+
+impl OrgCall {
+    /// Wrap a direct node call.
+    pub(crate) fn direct(inner: Rc<RefCell<Inner>>, call: crate::rpc_stream::CallHandle) -> Self {
+        Self {
+            where_: OrgWhere::Node { inner, call },
+            terminal: RefCell::new(None),
+            settled: Cell::new(false),
+        }
+    }
+
+    /// Wrap a proxied call.
+    pub(crate) fn proxied(call: crate::leader_session::ProxyOrgCall) -> Self {
+        Self {
+            where_: OrgWhere::Proxy(call),
+            terminal: RefCell::new(None),
+            settled: Cell::new(false),
+        }
+    }
+
+    /// The wire call id, where one is minted locally.
+    #[allow(dead_code)]
+    pub(crate) fn call_id(&self) -> Option<u64> {
+        match &self.where_ {
+            OrgWhere::Node { call, .. } => Some(call.call_id),
+            OrgWhere::Proxy(_) => None,
+        }
+    }
+
+    /// Poll for the next item or the terminal.
+    ///
+    /// The pull discipline the sans-IO lifecycle is built on: polled
+    /// right after each pump and on the ticker as the backstop. The
+    /// terminal is latched here on first sight.
+    pub(crate) async fn next_outcome(&self) -> Result<OrgPoll, JsError> {
+        if self.settled.get() {
+            // The terminal was delivered once already; an over-poll
+            // sees a benign completion rather than hanging.
+            return Ok(OrgPoll::Terminal(crate::rpc_stream::StreamTerminal::Completed {
+                body: Bytes::new(),
+            }));
+        }
+        if let Some(t) = self.terminal.borrow().clone() {
+            return Ok(OrgPoll::Terminal(t));
+        }
+        let got = match &self.where_ {
+            OrgWhere::Node { inner, call } => {
+                let call_id = call.call_id;
+                with_node(inner, |guard| {
+                    if let Some(body) = guard.node.org_call_next(call_id) {
+                        OrgPoll::Item(body)
+                    } else if let Some(terminal) = guard.node.org_call_terminal(call_id) {
+                        OrgPoll::Terminal(terminal)
+                    } else {
+                        OrgPoll::Pending
+                    }
+                })
+            }
+            OrgWhere::Proxy(proxy) => proxy.poll().await?,
+        };
+        if let OrgPoll::Terminal(terminal) = &got {
+            *self.terminal.borrow_mut() = Some(terminal.clone());
+        }
+        Ok(got)
+    }
+
+    /// Push one upload/response item.
+    pub(crate) async fn send(&self, payload: &[u8], what: &str) -> Result<(), JsError> {
+        match &self.where_ {
+            OrgWhere::Node { inner, call } => {
+                let call_id = call.call_id;
+                let outcome = with_node(inner, |guard| {
+                    guard
+                        .node
+                        .org_call_send(call_id, payload)
+                        .map_err(|e| sink_error(e, what))
+                });
+                outcome
+            }
+            OrgWhere::Proxy(proxy) => proxy.send(payload, what).await,
+        }
+    }
+
+    /// Half-close the upload direction (CS finish, DX `finishSending`).
+    pub(crate) async fn finish_sending(&self, what: &str) -> Result<(), JsError> {
+        match &self.where_ {
+            OrgWhere::Node { inner, call } => {
+                let call_id = call.call_id;
+                with_node(inner, |guard| {
+                    guard
+                        .node
+                        .org_call_finish_sending(call_id)
+                        .map_err(|e| sink_error(e, what))
+                })
+            }
+            OrgWhere::Proxy(proxy) => proxy.finish_sending(what).await,
+        }
+    }
+
+    /// Cancel the call: exactly one CANCEL on the wire, a terminal
+    /// `Retired { Cancelled }` latched locally.
+    pub(crate) fn cancel(&self) {
+        self.settled.set(true);
+        match &self.where_ {
+            OrgWhere::Node { inner, call } => {
+                let call_id = call.call_id;
+                with_node(inner, |guard| {
+                    guard.node.org_call_cancel(call_id);
+                });
+            }
+            OrgWhere::Proxy(proxy) => proxy.cancel(),
+        }
+    }
+
+    /// Mark the terminal delivered.
+    pub(crate) fn settle(&self) {
+        self.settled.set(true);
+    }
+}
+
+/// The typed rejection for a call-level nRPC failure.
+///
+/// The admission coarse is rendered as the pinned token
+/// (`denied` / `not-supported` / `unavailable`) whether it arrived
+/// as the wire's one-byte body or already as text, so the direct and
+/// proxied surfaces reject **byte-identically** and the TS parser
+/// classifies one spelling.
+pub(crate) fn rpc_error_rejection(error: crate::error::RpcError) -> JsError {
+    if let crate::error::RpcError::Refused { status, message } = &error {
+        if *status == crate::rpc_wire::RpcStatus::AdmissionDenied.to_wire() {
+            return JsError::new(&format!(
+                "rpc: refused (9): {}",
+                coarse_text(message.as_bytes())
+            ));
+        }
+    }
+    js(LeafError::Rpc(error))
+}
+
+/// The `SinkError` refusals, as the boundary spells them.
+///
+/// `Closed` is "the sink's typed closed refusal" of the handler-drop
+/// contract: after retirement every push refuses here rather than
+/// landing on a call that is already terminal.
+pub(crate) fn sink_error(error: crate::rpc_stream::SinkError, what: &str) -> JsError {
+    match error {
+        crate::rpc_stream::SinkError::Closed => {
+            JsError::new(&format!("org: {what} is closed: the call was retired"))
+        }
+        crate::rpc_stream::SinkError::ResourceExhausted => JsError::new(&format!(
+            "org: {what} is closed: the call's byte budget refused the item and retired the call"
+        )),
+        crate::rpc_stream::SinkError::Mint(mint) => JsError::new(&format!(
+            "org: {what} cannot open: the signed opening was not minted: {mint:?}"
+        )),
+    }
+}
+
+/// The `next()`/`finish()` item objects, as plain JS objects.
+fn org_stream_item(value: Uint8Array) -> Result<JsValue, JsError> {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(&object, &JsValue::from_str("done"), &JsValue::from_bool(false))
+        .map_err(|_| JsError::new("done could not be set"))?;
+    js_sys::Reflect::set(&object, &JsValue::from_str("value"), &value)
+        .map_err(|_| JsError::new("value could not be set"))?;
+    Ok(object.into())
+}
+
+/// `{ done: true }` — a clean end-of-stream.
+fn org_stream_end() -> Result<JsValue, JsError> {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(&object, &JsValue::from_str("done"), &JsValue::from_bool(true))
+        .map_err(|_| JsError::new("done could not be set"))?;
+    Ok(object.into())
+}
+
+/// `{ done: true, value }` — a terminal that carries a final body.
+fn org_stream_end_value(value: &[u8]) -> Result<JsValue, JsError> {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(&object, &JsValue::from_str("done"), &JsValue::from_bool(true))
+        .map_err(|_| JsError::new("done could not be set"))?;
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("value"),
+        &Uint8Array::from(value),
+    )
+    .map_err(|_| JsError::new("value could not be set"))?;
+    Ok(object.into())
+}
+
+/// `{ done: true, error: {...} }` — the typed terminal error item.
+fn org_stream_end_error(error_json: &str) -> Result<JsValue, JsError> {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(&object, &JsValue::from_str("done"), &JsValue::from_bool(true))
+        .map_err(|_| JsError::new("done could not be set"))?;
+    let error = js_sys::JSON::parse(error_json)
+        .map_err(|_| JsError::new("the terminal error did not encode"))?;
+    js_sys::Reflect::set(&object, &JsValue::from_str("error"), &error)
+        .map_err(|_| JsError::new("error could not be set"))?;
+    Ok(object.into())
+}
+
+/// Turn a terminal into the `next()` item — or `None` for the body
+/// carriers (`finish`, and a stream's final value).
+fn terminal_stream_item(
+    terminal: &crate::rpc_stream::StreamTerminal,
+) -> Option<Result<JsValue, JsError>> {
+    use crate::rpc_stream::StreamTerminal;
+    match terminal {
+        StreamTerminal::Completed { .. } => None,
+        other => {
+            let json =
+                terminal_error_json(other).unwrap_or_else(|| r#"{"kind":"internal","message":"rpc: the call ended without a terminal"}"#.to_string());
+            Some(org_stream_end_error(&json))
+        }
+    }
+}
+
+/// The typed rejection a terminal produces for `finish()`.
+pub(crate) fn terminal_js_error(terminal: &crate::rpc_stream::StreamTerminal) -> JsError {
+    let json = terminal_error_json(terminal).unwrap_or_default();
+    let message = serde_json::from_str::<serde_json::Value>(&json)
+        .ok()
+        .and_then(|value| value.get("message").and_then(|m| m.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "rpc: the call ended without a terminal".to_string());
+    JsError::new(&message)
+}
+
+/// The result of a JS handler's promise, mapped to the wire's
+/// handler-result vocabulary.
+fn handler_refusal(message: &str) -> crate::rpc_wire::StreamHandlerResult {
+    use crate::rpc_wire::{RpcStatus, StreamHandlerResult};
+    // `refused (<status>): <message>` is the leaf taxonomy's own
+    // `Display` spelling for a typed refusal — the handler may refuse
+    // in those words and the caller sees exactly that status.
+    if let Some(rest) = message.strip_prefix("refused (") {
+        if let Some((status, text)) = rest.split_once("): ") {
+            if let Ok(status) = status.parse::<u16>() {
+                return StreamHandlerResult::Err(RpcStatus::from_wire(status), text.to_string());
+            }
+        }
+    }
+    StreamHandlerResult::Err(RpcStatus::Internal, message.to_string())
+}
+
+/// File admitted calls and schedule their dispatch.
+///
+/// The trampoline **defers**: this closure runs inside the pump that
+/// admitted the call, and the [`with_node`] rule says a JS callback
+/// runs with no borrow held. The spawned drain is that gap.
+fn serve_trampoline(
+    handler: js_sys::Function,
+    shape: HandlerShape,
+    queue: Rc<RefCell<VecDeque<PendingServe>>>,
+) -> Rc<dyn Fn(crate::rpc_serve::ServeCall)> {
+    Rc::new(move |call| {
+        let state = Rc::new(ServeCallState {
+            call: {
+                let shared: Rc<dyn OrgServeCall> = Rc::new(call);
+                shared
+            },
+            finished: Cell::new(false),
+        });
+        queue.borrow_mut().push_back(PendingServe {
+            handler: handler.clone(),
+            shape,
+            call: state,
+        });
+        let queue = queue.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            drain_serve_queue(queue);
+        });
+    })
+}
+
+/// Invoke every parked handler with no borrow held.
+fn drain_serve_queue(queue: Rc<RefCell<VecDeque<PendingServe>>>) {
+    let pending: Vec<PendingServe> = queue.borrow_mut().drain(..).collect();
+    for pending in pending {
+        wasm_bindgen_futures::spawn_local(async move {
+            run_handler(pending).await;
+        });
+    }
+}
+
+/// The text of a thrown `JsError`.
+///
+/// `JsError` exposes no `message` accessor (wasm-bindgen 0.2.128),
+/// so the text comes back off the thrown value.
+fn error_text(error: JsError) -> String {
+    let value = JsValue::from(error);
+    js_sys::Reflect::get(&value, &JsValue::from_str("message"))
+        .ok()
+        .and_then(|value| value.as_string())
+        .unwrap_or_else(|| "the handler could not be prepared".to_string())
+}
+
+/// The `OrgCaller` projection, as the to_json string the boundary
+/// hands to JS: `{ entity, actingOrg, providerOrg, provider,
+/// capability, isSameOrg }`, every id 64 lowercase hex.
+pub(crate) fn caller_json(call: &crate::rpc_serve::ServeCall) -> Result<String, JsError> {
+    let admitted = call.caller();
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "entity".into(),
+        serde_json::Value::from(crate::identity::hex_lower(admitted.caller.as_bytes())),
+    );
+    map.insert(
+        "actingOrg".into(),
+        serde_json::Value::from(crate::identity::hex_lower(admitted.acting_org.as_bytes())),
+    );
+    map.insert(
+        "providerOrg".into(),
+        serde_json::Value::from(crate::identity::hex_lower(admitted.provider_org.as_bytes())),
+    );
+    map.insert(
+        "provider".into(),
+        serde_json::Value::from(crate::identity::hex_lower(admitted.provider.as_bytes())),
+    );
+    map.insert(
+        "capability".into(),
+        serde_json::Value::from(crate::identity::hex_lower(admitted.capability.as_bytes())),
+    );
+    map.insert(
+        "isSameOrg".into(),
+        serde_json::Value::from(admitted.acting_org == admitted.provider_org),
+    );
+    Ok(serde_json::Value::Object(map).to_string())
+}
+
+/// Pull the one request body a unary/streaming handler takes.
+async fn first_request(call: &ServeCallState) -> Result<Vec<u8>, JsError> {
+    loop {
+        if let Some(body) = call.call.poll_request() {
+            return Ok(body.to_vec());
+        }
+        if call.call.request_ended() {
+            return Ok(Vec::new());
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+}
+
+/// Run one JS handler to its terminal.
+///
+/// # The handler-drop contract (F-S3.1-2)
+///
+/// The retire supervisor may drop the handler future without a final
+/// poll — cancellation is observed through the retirement
+/// observables (the terminal item, the sink's typed closed refusal,
+/// and `retired`), never assumed as a handler-side event; a detached
+/// observer holding `retired` observes the signal. After retirement
+/// the handler sees typed refusals and its return value is discarded:
+/// the terminal was already sent.
+async fn run_handler(pending: PendingServe) {
+    let PendingServe {
+        handler,
+        shape,
+        call,
+    } = pending;
+    let caller = match call.call.caller_json() {
+        Ok(json) => JsValue::from_str(&json),
+        Err(error) => {
+            call.finish_once(handler_refusal(&error_text(error)));
+            return;
+        }
+    };
+    let invoked = match shape {
+        HandlerShape::Unary => {
+            let request = match first_request(&call).await {
+                Ok(request) => request,
+                Err(error) => {
+                    call.finish_once(handler_refusal(&error_text(error)));
+                    return;
+                }
+            };
+            handler.call2(
+                &JsValue::NULL,
+                &caller,
+                &Uint8Array::from(request.as_slice()),
+            )
+        }
+        HandlerShape::Streaming => {
+            let request = match first_request(&call).await {
+                Ok(request) => request,
+                Err(error) => {
+                    call.finish_once(handler_refusal(&error_text(error)));
+                    return;
+                }
+            };
+            let sink = OrgResponseSinkHandle::for_call(call.clone());
+            handler.call3(
+                &JsValue::NULL,
+                &caller,
+                &Uint8Array::from(request.as_slice()),
+                &sink.into(),
+            )
+        }
+        HandlerShape::ClientStream => {
+            let requests = OrgRequestStreamHandle::for_call(call.clone());
+            handler.call2(&JsValue::NULL, &caller, &requests.into())
+        }
+        HandlerShape::Duplex => {
+            let requests = OrgRequestStreamHandle::for_call(call.clone());
+            let sink = OrgResponseSinkHandle::for_call(call.clone());
+            handler.call3(&JsValue::NULL, &caller, &requests.into(), &sink.into())
+        }
+    };
+    let settled = match invoked {
+        Ok(value) => wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(value)).await,
+        Err(threw) => Err(threw),
+    };
+    match settled {
+        Ok(resolved) => match shape {
+            HandlerShape::Unary | HandlerShape::ClientStream => {
+                // The handler's response body rides `send` + the
+                // terminal — the one RESPONSE a unary/CS call emits.
+                match resolved.dyn_into::<Uint8Array>() {
+                    Ok(body) => {
+                        if call.call.send(&body.to_vec()).is_err() {
+                            call.finish_once(handler_refusal(
+                                "org: the response sink is closed: the call was retired",
+                            ));
+                            return;
+                        }
+                        call.finish_once(crate::rpc_wire::StreamHandlerResult::Ok);
+                    }
+                    Err(_) => call.finish_once(handler_refusal(
+                        "the handler must resolve with a Uint8Array response body",
+                    )),
+                }
+            }
+            HandlerShape::Streaming | HandlerShape::Duplex => {
+                call.finish_once(crate::rpc_wire::StreamHandlerResult::Ok);
+            }
+        },
+        Err(rejected) => {
+            // A rejected handler promise is the handler's typed
+            // refusal: `refused (<status>): <text>` carries its
+            // status, anything else is an internal handler failure.
+            let message = rejected.as_string().unwrap_or_else(|| {
+                js_sys::Reflect::get(&rejected, &JsValue::from_str("message"))
+                    .ok()
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_else(|| "the handler rejected".to_string())
+            });
+            call.finish_once(handler_refusal(&message));
+        }
+    }
+}
+
+/// One org-scoped response stream as JavaScript sees it.
+///
+/// `next()` resolves `{ done: false, value }`, `{ done: true }` (or
+/// `{ done: true, value }` when the terminal carries a final body),
+/// or `{ done: true, error }` with the typed terminal error — which
+/// the TypeScript wrapper throws at the terminal item, so `for
+/// await` sees a typed rejection. `cancel()` emits exactly one
+/// CANCEL. Deadlines are absolute: a frozen tab gets no lease
+/// extension and an overdue call retires with its deadline terminal;
+/// nothing here ever resumes a retired call.
+#[wasm_bindgen]
+pub struct OrgByteStreamHandle {
+    call: Rc<OrgCall>,
+}
+
+#[wasm_bindgen]
+impl OrgByteStreamHandle {
+    /// Wrap a direct or proxied call.
+    pub(crate) fn from_call(call: Rc<OrgCall>) -> Self {
+        Self { call }
+    }
+
+    /// The next item, the end of the stream, or the typed terminal
+    /// error item.
+    pub async fn next(&self) -> Result<JsValue, JsError> {
+        loop {
+            match self.call.next_outcome().await? {
+                OrgPoll::Item(body) => return org_stream_item(Uint8Array::from(&body[..])),
+                OrgPoll::Terminal(terminal) => {
+                    self.call.settle();
+                    return match &terminal {
+                        crate::rpc_stream::StreamTerminal::Completed { body } => {
+                            if body.is_empty() {
+                                org_stream_end()
+                            } else {
+                                org_stream_end_value(body)
+                            }
+                        }
+                        other => match terminal_stream_item(other) {
+                            Some(item) => item,
+                            None => org_stream_end(),
+                        },
+                    };
+                }
+                OrgPoll::Pending => {
+                    gloo_timer_sleep(TICK_MS).await.ok();
+                }
+            }
+        }
+    }
+
+    /// Cancel the call. Exactly one CANCEL reaches the provider, and
+    /// the terminal is latched locally — dropping this handle later
+    /// emits nothing (the exactly-once guard already fired).
+    pub fn cancel(&self) {
+        self.call.cancel();
+    }
+}
+
+/// One org-scoped client-streaming call as JavaScript sees it.
+#[wasm_bindgen]
+pub struct OrgUploadCallHandle {
+    call: Rc<OrgCall>,
+}
+
+#[wasm_bindgen]
+impl OrgUploadCallHandle {
+    /// Wrap a direct or proxied call.
+    pub(crate) fn from_call(call: Rc<OrgCall>) -> Self {
+        Self { call }
+    }
+
+    /// Push one upload item.
+    pub async fn send(&self, payload: Uint8Array) -> Result<(), JsError> {
+        self.call.send(&payload.to_vec(), "the upload sink").await
+    }
+
+    /// Half-close the upload and await the response body.
+    ///
+    /// Resolves the terminal body; rejects with the typed terminal
+    /// error's `Display` text (an admission denial is
+    /// `rpc: refused (9): <coarse>`).
+    pub async fn finish(&self) -> Result<Uint8Array, JsError> {
+        self.call.finish_sending("the upload sink").await?;
+        loop {
+            match self.call.next_outcome().await? {
+                OrgPoll::Item(body) => return Ok(Uint8Array::from(&body[..])),
+                OrgPoll::Terminal(terminal) => {
+                    self.call.settle();
+                    return match terminal {
+                        crate::rpc_stream::StreamTerminal::Completed { body } => {
+                            Ok(Uint8Array::from(&body[..]))
+                        }
+                        other => Err(terminal_js_error(&other)),
+                    };
+                }
+                OrgPoll::Pending => {
+                    gloo_timer_sleep(TICK_MS).await.ok();
+                }
+            }
+        }
+    }
+
+    /// Cancel the call (one CANCEL, terminal latched).
+    pub fn cancel(&self) {
+        self.call.cancel();
+    }
+}
+
+/// One org-scoped duplex call as JavaScript sees it: an inline
+/// upload sink and a response stream over the same call.
+#[wasm_bindgen]
+pub struct OrgDuplexCallHandle {
+    call: Rc<OrgCall>,
+}
+
+#[wasm_bindgen]
+impl OrgDuplexCallHandle {
+    /// Wrap a direct or proxied call.
+    pub(crate) fn from_call(call: Rc<OrgCall>) -> Self {
+        Self { call }
+    }
+
+    /// Push one upload item.
+    pub async fn send(&self, payload: Uint8Array) -> Result<(), JsError> {
+        self.call.send(&payload.to_vec(), "the upload sink").await
+    }
+
+    /// Half-close the upload direction. The response side stays
+    /// open — this is `finishSending`, not a completion.
+    pub async fn finish_sending(&self) -> Result<(), JsError> {
+        self.call.finish_sending("the upload sink").await
+    }
+
+    /// Cancel the call (one CANCEL, terminal latched).
+    pub fn cancel(&self) {
+        self.call.cancel();
+    }
+
+    /// The response half of this call.
+    pub fn stream(&self) -> OrgByteStreamHandle {
+        OrgByteStreamHandle::from_call(self.call.clone())
+    }
+}
+
+/// The handler-facing response sink of a streaming or duplex serve.
+///
+/// # The handler-drop contract (F-S3.1-2)
+///
+/// The retire supervisor may drop the handler future without a final
+/// poll — cancellation is observed through the retirement
+/// observables (the terminal item, the sink's typed closed refusal
+/// below, and `retired`), never assumed as a handler-side event; a
+/// detached observer holding `retired` observes the signal. After
+/// retirement `send` and `close` refuse with the typed closed text
+/// and the handler's return value is discarded — the terminal was
+/// already sent.
+#[wasm_bindgen]
+pub struct OrgResponseSinkHandle {
+    state: Rc<ServeCallState>,
+}
+
+#[wasm_bindgen]
+impl OrgResponseSinkHandle {
+    /// Wrap one admitted call's response sink.
+    pub(crate) fn for_call(state: Rc<ServeCallState>) -> Self {
+        Self { state }
+    }
+
+    /// Push one response item. Refuses (typed) after retirement.
+    pub async fn send(&self, payload: Uint8Array) -> Result<(), JsError> {
+        self.state
+            .call
+            .send(&payload.to_vec())
+            .map_err(|e| sink_error(e, "the response sink"))
+    }
+
+    /// End the response side successfully. Idempotent: the terminal
+    /// frame is sent exactly once whether the handler closed the sink
+    /// or simply returned.
+    pub async fn close(&self) -> Result<(), JsError> {
+        self.state.finish_once(crate::rpc_wire::StreamHandlerResult::Ok);
+        Ok(())
+    }
+
+    /// The retirement signal: resolves with one of `timeout`,
+    /// `cancelled`, `revoked`, `session-lost`, `leader-lost`,
+    /// `node-closed`, `replaced` exactly when the call retires. A
+    /// call that completes normally never retires, so this promise
+    /// stays pending — it is the retirement observable, not a
+    /// completion signal.
+    pub async fn retired(&self) -> Result<JsValue, JsError> {
+        loop {
+            if let Some(reason) = self.state.call.retired() {
+                return Ok(JsValue::from_str(retire_reason_text(reason)));
+            }
+            gloo_timer_sleep(TICK_MS).await.ok();
+        }
+    }
+}
+
+/// The handler-facing request stream of a client-streaming or duplex
+/// serve.
+///
+/// # The handler-drop contract (F-S3.1-2)
+///
+/// The retire supervisor may drop the handler future without a final
+/// poll — cancellation is observed through the retirement
+/// observables (the terminal item, the sink's typed closed refusal,
+/// and `retired`), never assumed as a handler-side event; a detached
+/// observer holding `retired` observes the signal. After retirement
+/// `next` yields nothing more and the handler's return value is
+/// discarded — the terminal was already sent.
+#[wasm_bindgen]
+pub struct OrgRequestStreamHandle {
+    state: Rc<ServeCallState>,
+}
+
+#[wasm_bindgen]
+impl OrgRequestStreamHandle {
+    /// Wrap one admitted call's request stream.
+    pub(crate) fn for_call(state: Rc<ServeCallState>) -> Self {
+        Self { state }
+    }
+
+    /// The next request item, or `{ done: true }` at the end of the
+    /// upload. There is no error arm: a terminated call is observed
+    /// through `retired`, and an ended upload is a clean `done`.
+    pub async fn next(&self) -> Result<JsValue, JsError> {
+        loop {
+            if let Some(body) = self.state.call.poll_request() {
+                return org_stream_item(Uint8Array::from(&body[..]));
+            }
+            if self.state.call.request_ended() {
+                return org_stream_end();
+            }
+            gloo_timer_sleep(TICK_MS).await.ok();
+        }
+    }
+
+    /// The retirement signal — same contract and vocabulary as
+    /// [`OrgResponseSinkHandle::retired`].
+    pub async fn retired(&self) -> Result<JsValue, JsError> {
+        loop {
+            if let Some(reason) = self.state.call.retired() {
+                return Ok(JsValue::from_str(retire_reason_text(reason)));
+            }
+            gloo_timer_sleep(TICK_MS).await.ok();
+        }
+    }
+}
+
+/// A registration of one org service.
+#[wasm_bindgen]
+pub struct OrgServeHandle {
+    /// The service name this handle registered.
+    service: String,
+    /// Where unregistration goes.
+    where_: OrgServeWhere,
+}
+
+/// Where a serve registration lives.
+pub(crate) enum OrgServeWhere {
+    /// The node in this tab.
+    Node {
+        /// The node's shared interior.
+        inner: Rc<RefCell<Inner>>,
+    },
+    /// A registration proxied through the tab that holds the lock.
+    Proxy(crate::leader_session::ProxyOrgServe),
+}
+
+#[wasm_bindgen]
+impl OrgServeHandle {
+    /// Wrap a serve registration that lives behind the proxy.
+    pub(crate) fn proxied(service: String, proxy: crate::leader_session::ProxyOrgServe) -> Self {
+        Self {
+            service,
+            where_: OrgServeWhere::Proxy(proxy),
+        }
+    }
+
+    /// The service name.
+    pub fn service(&self) -> String {
+        self.service.clone()
+    }
+
+    /// Close the registration.
+    ///
+    /// **The protected-path split (C9):** closing an ORG serve
+    /// handle retires its live protected calls — each with its exact
+    /// retirement terminal — and refuses new openings. This is NOT
+    /// the public-path "let existing calls finish" behaviour.
+    pub fn close(&self) {
+        match &self.where_ {
+            OrgServeWhere::Node { inner } => {
+                let service = self.service.clone();
+                with_node(inner, |guard| {
+                    guard.node.org_unserve(&service);
+                });
+            }
+            OrgServeWhere::Proxy(proxy) => proxy.close(),
+        }
+    }
+}
+
+impl LeafNode {
+    /// Build the proof intent from the boundary's byte options.
+    ///
+    /// Proofs are minted node-side — the entity key never crosses
+    /// the JS boundary — from the decoded credential wire objects.
+    fn org_intent(
+        &self,
+        service: &str,
+        options: &OrgCallOptions,
+    ) -> Result<crate::rpc_stream::OrgCallIntent, JsError> {
+        let credentials = &options.credentials;
+        let membership =
+            crate::org::cert::OrgMembershipCert::from_bytes(&credentials.membership)
+                .map_err(|e| JsError::new(&format!("membership did not decode: {e}")))?;
+        let dispatcher_grant =
+            crate::org::grant::OrgDispatcherGrant::from_bytes(&credentials.dispatcher)
+                .map_err(|e| JsError::new(&format!("dispatcher did not decode: {e}")))?;
+        let capability_grant = credentials
+            .capability_grant
+            .as_deref()
+            .map(|bytes| {
+                crate::org::grant::OrgCapabilityGrant::from_bytes(bytes)
+                    .map_err(|e| JsError::new(&format!("capabilityGrant did not decode: {e}")))
+            })
+            .transpose()?;
+        let acting_org =
+            crate::org::cert::OrgId::from_bytes(hex32(&credentials.acting_org, "actingOrg")?);
+        let provider_org = crate::org::cert::OrgId::from_bytes(hex32(
+            &credentials.provider_owner_org,
+            "providerOwnerOrg",
+        )?);
+        let provider =
+            crate::org::entity::EntityId::from_bytes(hex32(&credentials.provider, "provider")?);
+        let ttl_secs = credentials.proof_ttl_secs.unwrap_or(30);
+        if !(1..=30).contains(&ttl_secs) {
+            return Err(JsError::new(&format!(
+                "proofTtlSecs must be in 1..=30, got {ttl_secs}"
+            )));
+        }
+        Ok(crate::rpc_stream::OrgCallIntent {
+            keypair: self.inner.borrow().org_keypair.clone(),
+            membership,
+            dispatcher_grant,
+            capability_grant,
+            acting_org,
+            provider_org,
+            provider,
+            // The capability is the service's canonical tag — the
+            // mint refuses any other spelling (`CapabilityMismatch`).
+            capability: crate::org::grant::CapabilityAuthorityId::for_tag(&format!(
+                "nrpc:{service}"
+            )),
+            ttl_secs,
+        })
+    }
+
+    /// The peer an org call addresses: the R1 derivation of the
+    /// pinned provider entity, never a separately-supplied node id.
+    fn org_peer(options: &OrgCallOptions) -> Result<u64, JsError> {
+        let entity = hex32(&options.credentials.provider, "provider")?;
+        Ok(crate::identity::node_id_for_entity(&entity))
+    }
+
+    /// Register one serve verb and wrap its handle.
+    fn org_serve_with(
+        &self,
+        service: &str,
+        access: &str,
+        handler: js_sys::Function,
+        opts: JsValue,
+        shape: HandlerShape,
+        wire_shape: crate::org::proof::RpcCallShape,
+    ) -> Result<OrgServeHandle, JsError> {
+        let access = org_access(access)?;
+        let serve = org_serve_options(&opts)?;
+        let provider_owner_org =
+            crate::org::cert::OrgId::from_bytes(hex32(&serve.owner_org, "ownerOrg")?);
+        with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let queue = guard.serve_queue.clone();
+            guard.node.org_serve(
+                service,
+                crate::rpc_serve::ServeOptions {
+                    shape: wire_shape,
+                    access,
+                    provider_owner_org,
+                    skew_secs: ORG_SKEW_SECS,
+                    default_live_ns: ORG_DEFAULT_LIVE_NS,
+                    max_live_ns: ORG_MAX_LIVE_NS,
+                    // No provider policy hook crosses the JS
+                    // boundary: admit on the merits.
+                    policy: None,
+                },
+                serve_trampoline(handler, shape, queue),
+            )?;
+            guard.pump();
+            Ok::<_, LeafError>(())
+        })
+        .map_err(js)?;
+        Ok(OrgServeHandle {
+            service: service.to_string(),
+            where_: OrgServeWhere::Node {
+                inner: self.inner.clone(),
+            },
+        })
+    }
+}
+
+#[wasm_bindgen]
+impl LeafNode {
+    /// One org-scoped unary call.
+    ///
+    /// The call runs the full admission (the org proof kinds and the
+    /// session fence included) and resolves the response body.
+    /// Opening refusal rejects `admission-denied` with its coarse
+    /// reason (`rpc: refused (9): <coarse>`); a midstream revocation
+    /// is the same denial as the terminal.
+    ///
+    /// The deadline is **absolute** and defaults to 300 s (`deadlineMs`
+    /// absent is never "no deadline"); a frozen tab gets no lease
+    /// extension and on wake an overdue call retires with its
+    /// deadline terminal. Nothing here ever resumes a retired call —
+    /// re-opening is a fresh call with a fresh proof and MAY repeat
+    /// effects. Node or tab close retires ownership: pending calls
+    /// fail typed.
+    pub async fn call_org(
+        &self,
+        service: String,
+        payload: Uint8Array,
+        opts: JsValue,
+    ) -> Result<Uint8Array, JsError> {
+        let options = org_call_options(&opts)?;
+        options.within_provider_cap()?;
+        let intent = self.org_intent(&service, &options)?;
+        let peer = Self::org_peer(&options)?;
+        let timeout_ms = Some(options.deadline_ms.unwrap_or(ORG_DEFAULT_LIVE_NS / 1_000_000));
+        let receiver = with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let receiver = guard.node.call_org_unary(
+                peer,
+                &service,
+                &payload.to_vec(),
+                &intent,
+                timeout_ms,
+            )?;
+            guard.pump();
+            Ok::<_, LeafError>(receiver)
+        })
+        .map_err(js)?;
+        match receiver.await {
+            Ok(Ok(body)) => Ok(Uint8Array::from(&body[..])),
+            Ok(Err(e)) => Err(rpc_error_rejection(e)),
+            Err(_) => Err(js(LeafError::Rpc(crate::error::RpcError::Malformed(
+                "the call was cancelled locally".into(),
+            )))),
+        }
+    }
+
+    /// One org-scoped server-streaming call. See [`Self::call_org`]
+    /// for the deadline, suspension and closure contract — it holds
+    /// for every shape. The typed terminal error arrives as the
+    /// stream's final `next()` item, and dropping/cancelling the
+    /// handle emits exactly one CANCEL.
+    pub async fn call_org_streaming(
+        &self,
+        service: String,
+        payload: Uint8Array,
+        opts: JsValue,
+    ) -> Result<OrgByteStreamHandle, JsError> {
+        let options = org_call_options(&opts)?;
+        options.within_provider_cap()?;
+        let intent = self.org_intent(&service, &options)?;
+        let peer = Self::org_peer(&options)?;
+        let open = crate::rpc_stream::StreamOpen {
+            body: Bytes::copy_from_slice(&payload.to_vec()),
+            deadline_ns: options.deadline_ns(),
+            stream_window_initial: options.stream_window_initial,
+            request_window_initial: options.request_window_initial,
+        };
+        let call = with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let call = guard
+                .node
+                .call_org_server_stream(peer, &service, open, intent)?;
+            guard.pump();
+            Ok::<_, LeafError>(call)
+        })
+        .map_err(js)?;
+        Ok(OrgByteStreamHandle::from_call(Rc::new(OrgCall::direct(
+            self.inner.clone(),
+            call,
+        ))))
+    }
+
+    /// One org-scoped client-streaming call. `send` pushes items,
+    /// `finish` half-closes and resolves the response body. See
+    /// [`Self::call_org`] for the deadline, suspension and closure
+    /// contract.
+    pub async fn call_org_client_stream(
+        &self,
+        service: String,
+        opts: JsValue,
+    ) -> Result<OrgUploadCallHandle, JsError> {
+        let options = org_call_options(&opts)?;
+        options.within_provider_cap()?;
+        let intent = self.org_intent(&service, &options)?;
+        let peer = Self::org_peer(&options)?;
+        let open = crate::rpc_stream::StreamOpen {
+            body: Bytes::new(),
+            deadline_ns: options.deadline_ns(),
+            stream_window_initial: options.stream_window_initial,
+            request_window_initial: options.request_window_initial,
+        };
+        let call = with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let call = guard
+                .node
+                .call_org_client_stream(peer, &service, open, intent)?;
+            guard.pump();
+            Ok::<_, LeafError>(call)
+        })
+        .map_err(js)?;
+        Ok(OrgUploadCallHandle::from_call(Rc::new(OrgCall::direct(
+            self.inner.clone(),
+            call,
+        ))))
+    }
+
+    /// One org-scoped duplex call. See [`Self::call_org`] for the
+    /// deadline, suspension and closure contract.
+    pub async fn call_org_duplex(
+        &self,
+        service: String,
+        opts: JsValue,
+    ) -> Result<OrgDuplexCallHandle, JsError> {
+        let options = org_call_options(&opts)?;
+        options.within_provider_cap()?;
+        let intent = self.org_intent(&service, &options)?;
+        let peer = Self::org_peer(&options)?;
+        let open = crate::rpc_stream::StreamOpen {
+            body: Bytes::new(),
+            deadline_ns: options.deadline_ns(),
+            stream_window_initial: options.stream_window_initial,
+            request_window_initial: options.request_window_initial,
+        };
+        let call = with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let call = guard.node.call_org_duplex(peer, &service, open, intent)?;
+            guard.pump();
+            Ok::<_, LeafError>(call)
+        })
+        .map_err(js)?;
+        Ok(OrgDuplexCallHandle::from_call(Rc::new(OrgCall::direct(
+            self.inner.clone(),
+            call,
+        ))))
+    }
+
+    /// Serve one org-scoped unary service: `handler(caller, request)`
+    /// resolves the response body.
+    ///
+    /// # The handler-drop contract (F-S3.1-2)
+    ///
+    /// The retire supervisor may drop the handler future without a
+    /// final poll — cancellation is observed through the retirement
+    /// observables (the terminal item, the sink's typed closed
+    /// refusal, and `retired`), never assumed as a handler-side
+    /// event; a detached observer holding `retired` observes the
+    /// signal. After retirement the handler sees typed refusals and
+    /// its return value is discarded — the terminal was already
+    /// sent.
+    ///
+    /// Closing the returned handle retires this registration's live
+    /// protected calls with their exact terminals and refuses new
+    /// openings (C9's protected split).
+    pub fn serve_org(
+        &self,
+        service: String,
+        access: String,
+        handler: js_sys::Function,
+        opts: JsValue,
+    ) -> Result<OrgServeHandle, JsError> {
+        self.org_serve_with(
+            &service,
+            &access,
+            handler,
+            opts,
+            HandlerShape::Unary,
+            crate::org::proof::RpcCallShape::Unary,
+        )
+    }
+
+    /// Serve one org-scoped server-streaming service:
+    /// `handler(caller, request, sink)` pushes through `sink` and
+    /// ends with `sink.close()` or by returning. See
+    /// [`Self::serve_org`] for the handler-drop contract and the
+    /// close semantics.
+    pub fn serve_org_streaming(
+        &self,
+        service: String,
+        access: String,
+        handler: js_sys::Function,
+        opts: JsValue,
+    ) -> Result<OrgServeHandle, JsError> {
+        self.org_serve_with(
+            &service,
+            &access,
+            handler,
+            opts,
+            HandlerShape::Streaming,
+            crate::org::proof::RpcCallShape::ServerStreaming,
+        )
+    }
+
+    /// Serve one org-scoped client-streaming service:
+    /// `handler(caller, requests)` resolves the response body. See
+    /// [`Self::serve_org`] for the handler-drop contract and the
+    /// close semantics.
+    pub fn serve_org_client_stream(
+        &self,
+        service: String,
+        access: String,
+        handler: js_sys::Function,
+        opts: JsValue,
+    ) -> Result<OrgServeHandle, JsError> {
+        self.org_serve_with(
+            &service,
+            &access,
+            handler,
+            opts,
+            HandlerShape::ClientStream,
+            crate::org::proof::RpcCallShape::ClientStreaming,
+        )
+    }
+
+    /// Serve one org-scoped duplex service:
+    /// `handler(caller, requests, sink)` pulls requests and pushes
+    /// responses. See [`Self::serve_org`] for the handler-drop
+    /// contract and the close semantics.
+    pub fn serve_org_duplex(
+        &self,
+        service: String,
+        access: String,
+        handler: js_sys::Function,
+        opts: JsValue,
+    ) -> Result<OrgServeHandle, JsError> {
+        self.org_serve_with(
+            &service,
+            &access,
+            handler,
+            opts,
+            HandlerShape::Duplex,
+            crate::org::proof::RpcCallShape::Duplex,
+        )
+    }
+
+    /// Apply one signed revocation bundle from the control-plane
+    /// feed, and say how many floors it raised.
+    ///
+    /// The landing point of the revocation feed: signed
+    /// `OrgRevocationBundle` wire bytes, verified **in-leaf** by the
+    /// node's own org authority before any floor moves. This is
+    /// never a trust-the-JS setter — a forged bundle is refused here
+    /// exactly as it is refused on the carrier's other paths — and
+    /// the raise-only merge means an old but validly signed bundle
+    /// can never roll floors back.
+    pub fn apply_org_revocation_bundle(&self, bundle_hex: &str) -> Result<u32, JsError> {
+        let bytes = crate::identity::unhex(bundle_hex)
+            .map_err(|e| JsError::new(&format!("the bundle is not hex: {e}")))?;
+        with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let raised = guard
+                .node
+                .ingest_org_revocation_bundle(&bytes)
+                .map_err(js)?;
+            guard.pump();
+            Ok::<_, JsError>(u32::try_from(raised).unwrap_or(u32::MAX))
+        })
+    }
+}
+
+// ─────────── org: the shared serve-call surface + backend ───────────
+
+/// One served call's driving surface — direct or proxied.
+///
+/// The JS trampoline ([`run_handler`]) is identical on both
+/// surfaces: the direct arm wraps [`crate::rpc_serve::ServeCall`],
+/// and the leader-proxy arm wraps the follower-side mirror that
+/// drives the registering tab's handle through the proxy. Same
+/// handler-drop contract either way (F-S3.1-2, quoted at
+/// [`run_handler`]).
+pub(crate) trait OrgServeCall {
+    /// The `OrgCaller` projection as the to_json string JS parses.
+    fn caller_json(&self) -> Result<String, JsError>;
+    /// The next request item, if one is queued.
+    fn poll_request(&self) -> Option<Bytes>;
+    /// Whether the upload half has ended (EOF once the queue drains).
+    fn request_ended(&self) -> bool;
+    /// Push one response item.
+    fn send(&self, payload: &[u8]) -> core::result::Result<(), crate::rpc_stream::SinkError>;
+    /// Complete the call (first completion wins).
+    fn finish(&self, result: crate::rpc_wire::StreamHandlerResult);
+    /// The retirement signal, once the call retires.
+    fn retired(&self) -> Option<crate::rpc_stream::RetireReason>;
+}
+
+impl OrgServeCall for crate::rpc_serve::ServeCall {
+    fn caller_json(&self) -> Result<String, JsError> {
+        caller_json(self)
+    }
+    fn poll_request(&self) -> Option<Bytes> {
+        crate::rpc_serve::ServeCall::poll_request(self)
+    }
+    fn request_ended(&self) -> bool {
+        crate::rpc_serve::ServeCall::request_ended(self)
+    }
+    fn send(&self, payload: &[u8]) -> core::result::Result<(), crate::rpc_stream::SinkError> {
+        crate::rpc_serve::ServeCall::send(self, payload)
+    }
+    fn finish(&self, result: crate::rpc_wire::StreamHandlerResult) {
+        crate::rpc_serve::ServeCall::finish(self, result);
+    }
+    fn retired(&self) -> Option<crate::rpc_stream::RetireReason> {
+        crate::rpc_serve::ServeCall::retired(self)
+    }
+}
+
+/// Dispatch one admitted call to a JS handler on the **proxied**
+/// surface. The call is a follower-side mirror; the trampoline,
+/// handler shapes and drop contract are the direct surface's, verbatim.
+pub(crate) fn dispatch_proxied_handler(
+    handler: js_sys::Function,
+    shape: HandlerShape,
+    call: Rc<dyn OrgServeCall>,
+) {
+    let state = Rc::new(ServeCallState {
+        call,
+        finished: Cell::new(false),
+    });
+    wasm_bindgen_futures::spawn_local(async move {
+        run_handler(PendingServe {
+            handler,
+            shape,
+            call: state,
+        })
+        .await;
+    });
+}
+
+/// One backend-driven org call — the leader proxy's server side,
+/// running the same node machinery the direct verbs drive.
+pub(crate) enum OrgBackendCall {
+    /// A unary call's completion receiver.
+    Unary(crate::rpc::CallResult),
+    /// A streaming call's guard. Held by the backend's relay table:
+    /// dropping it emits exactly one CANCEL.
+    Streaming(crate::rpc_stream::CallHandle),
+}
+
+impl LeafNode {
+    /// Decode the JS-supplied credential wire bytes into a proof
+    /// intent. Shared by the direct verbs and the backend.
+    pub(crate) fn build_intent(
+        &self,
+        service: &str,
+        membership: &[u8],
+        dispatcher: &[u8],
+        capability_grant: Option<&[u8]>,
+        acting_org: &str,
+        provider_org: &str,
+        provider: &str,
+        ttl_secs: u64,
+    ) -> Result<crate::rpc_stream::OrgCallIntent, JsError> {
+        let membership = crate::org::cert::OrgMembershipCert::from_bytes(membership)
+            .map_err(|e| JsError::new(&format!("membership did not decode: {e}")))?;
+        let dispatcher_grant = crate::org::grant::OrgDispatcherGrant::from_bytes(dispatcher)
+            .map_err(|e| JsError::new(&format!("dispatcher did not decode: {e}")))?;
+        let capability_grant = capability_grant
+            .map(|bytes| {
+                crate::org::grant::OrgCapabilityGrant::from_bytes(bytes)
+                    .map_err(|e| JsError::new(&format!("capabilityGrant did not decode: {e}")))
+            })
+            .transpose()?;
+        let acting_org = crate::org::cert::OrgId::from_bytes(hex32(acting_org, "actingOrg")?);
+        let provider_org =
+            crate::org::cert::OrgId::from_bytes(hex32(provider_org, "providerOwnerOrg")?);
+        let provider = crate::org::entity::EntityId::from_bytes(hex32(provider, "provider")?);
+        if !(1..=30).contains(&ttl_secs) {
+            return Err(JsError::new(&format!(
+                "proofTtlSecs must be in 1..=30, got {ttl_secs}"
+            )));
+        }
+        Ok(crate::rpc_stream::OrgCallIntent {
+            keypair: self.inner.borrow().org_keypair.clone(),
+            membership,
+            dispatcher_grant,
+            capability_grant,
+            acting_org,
+            provider_org,
+            provider,
+            // The capability is the service's canonical tag — the
+            // mint refuses any other spelling (`CapabilityMismatch`).
+            capability: crate::org::grant::CapabilityAuthorityId::for_tag(&format!(
+                "nrpc:{service}"
+            )),
+            ttl_secs,
+        })
+    }
+
+    /// Open one org call on behalf of a proxied follower. The shape
+    /// string is the `LeaderRequest::OrgCall` spelling.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn backend_org_open(
+        &self,
+        service: &str,
+        shape: &str,
+        body: &[u8],
+        intent: crate::rpc_stream::OrgCallIntent,
+        peer: u64,
+        deadline_ns: u64,
+        timeout_ms: Option<u64>,
+        stream_window_initial: Option<u32>,
+        request_window_initial: Option<u32>,
+    ) -> Result<(OrgBackendCall, u64), LeafError> {
+        with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let opened = match shape {
+                "unary" => {
+                    let receiver =
+                        guard
+                            .node
+                            .call_org_unary(peer, service, body, &intent, timeout_ms)?;
+                    (OrgBackendCall::Unary(receiver), 0)
+                }
+                other => {
+                    let open = crate::rpc_stream::StreamOpen {
+                        body: Bytes::copy_from_slice(body),
+                        deadline_ns,
+                        stream_window_initial,
+                        request_window_initial,
+                    };
+                    let handle = match other {
+                        "server-streaming" => {
+                            guard
+                                .node
+                                .call_org_server_stream(peer, service, open, intent)?
+                        }
+                        "client-streaming" => {
+                            guard
+                                .node
+                                .call_org_client_stream(peer, service, open, intent)?
+                        }
+                        "duplex" => guard.node.call_org_duplex(peer, service, open, intent)?,
+                        unknown => {
+                            return Err(LeafError::Session(format!(
+                                "unknown org call shape {unknown:?}"
+                            )))
+                        }
+                    };
+                    let call_id = handle.call_id;
+                    (OrgBackendCall::Streaming(handle), call_id)
+                }
+            };
+            guard.pump();
+            Ok(opened)
+        })
+    }
+
+    /// Push one upload item for a backend-driven call.
+    pub(crate) fn backend_org_send(
+        &self,
+        call_id: u64,
+        item: &[u8],
+    ) -> core::result::Result<(), crate::rpc_stream::SinkError> {
+        with_node(&self.inner, |guard| guard.node.org_call_send(call_id, item))
+    }
+
+    /// Half-close a backend-driven call's upload.
+    pub(crate) fn backend_org_finish_sending(
+        &self,
+        call_id: u64,
+    ) -> core::result::Result<(), crate::rpc_stream::SinkError> {
+        with_node(&self.inner, |guard| {
+            guard.node.org_call_finish_sending(call_id)
+        })
+    }
+
+    /// The next response item of a backend-driven call.
+    pub(crate) fn backend_org_next(&self, call_id: u64) -> Option<Bytes> {
+        with_node(&self.inner, |guard| guard.node.org_call_next(call_id))
+    }
+
+    /// The latched terminal of a backend-driven call.
+    pub(crate) fn backend_org_terminal(&self, call_id: u64) -> Option<crate::rpc_stream::StreamTerminal> {
+        self.inner.borrow().node.org_call_terminal(call_id)
+    }
+
+    /// Cancel a backend-driven call (exactly one CANCEL).
+    pub(crate) fn backend_org_cancel(&self, call_id: u64) {
+        with_node(&self.inner, |guard| {
+            guard.node.org_call_cancel(call_id);
+        });
+    }
+
+    /// Serve one service with a proxied handler hook.
+    pub(crate) fn backend_org_serve(
+        &self,
+        service: &str,
+        opts: crate::rpc_serve::ServeOptions,
+        handler: crate::rpc_serve::ServeHandler,
+    ) -> Result<(), LeafError> {
+        with_node(&self.inner, |guard| {
+            guard.admit()?;
+            guard.node.org_serve(service, opts, handler)?;
+            guard.pump();
+            Ok(())
+        })
+    }
+
+    /// Stop serving a service (C9's protected split: live calls
+    /// retire with their exact terminals).
+    pub(crate) fn backend_org_unserve(&self, service: &str) {
+        with_node(&self.inner, |guard| {
+            guard.node.org_unserve(service);
+        });
+    }
 }
 
 // ─────────────────────────── witnesses ──────────────────────────────

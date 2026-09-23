@@ -11,8 +11,28 @@
 //! | [`ControlPlane::signal`] | **no route** — typed refusal |
 //! | [`ControlPlane::end_attempt`] | closing that socket |
 //! | [`ControlPlane::drain_events`] | frames arriving on it |
+//! | [`ControlPlane::take_revocation_bundles`] | `org_revocation_bundle` frames (see below) |
 //! | [`ControlPlane::publish_announcement`] | **no route** — typed refusal |
 //! | [`ControlPlane::query_capability`] | **no route** — typed refusal |
+//!
+//! # The revocation feed
+//!
+//! The feed's frame is `{"type":"org_revocation_bundle","bundle":"<base64>"}` —
+//! the anchor-protocol vocabulary plus ONE frame type, carrying an
+//! organization root's signed revocation bundle **opaque**: this
+//! adapter parses the envelope and queues the bytes;
+//! [`ControlPlane::take_revocation_bundles`] hands them out in
+//! arrival order and the leaf's org module does the verifying and the
+//! raise-only merge. "Verified by the leaf, not by the transport",
+//! exactly as [`ControlEvent::Announcement`].
+//!
+//! The frame is recognised on the trickle socket AND on a dedicated
+//! org-control socket ([`Self::open_org_control`]), because the Stage
+//! 4b listener's trickle handler originates exactly one frame and
+//! cannot be extended from here — a harness that must FEED floors
+//! serves the same frame vocabulary on a socket of its own, and the
+//! bootstrap URL's `#org-control=<ws-url>` override tag points this
+//! adapter at it. Neither socket nor URL crosses the trait.
 //!
 //! `GET /rtc/anchor` is not a trait method: it is `Self::attach`,
 //! because what it exists for is the **pinned-key refusal** and that
@@ -26,9 +46,10 @@
 //! # What crosses the boundary, and what does not
 //!
 //! Out of this module the leaf receives node ids, `Sdp`,
-//! `IceCandidate`, `DialogId`, `SignalEnvelope`, `SignedAnnouncement`
-//! and `[u8; 32]` keys. It never receives a `PeerAddr`, an anchor
-//! handle, a `Response`, a `WebSocket`, or a Net packet.
+//! `IceCandidate`, `DialogId`, `SignalEnvelope`, `SignedAnnouncement`,
+//! `[u8; 32]` keys and org-revocation bundle bytes. It never receives
+//! a `PeerAddr`, an anchor handle, a `Response`, a `WebSocket`, or a
+//! Net packet.
 //! `tests/control_plane_boundary.rs` asserts that from the outside.
 //!
 //! The credential goes the other way: it is a *leaf* input (the page
@@ -110,6 +131,11 @@ struct State {
     pending_flush: Rc<RefCell<Vec<String>>>,
     /// What arrived on it, waiting for `drain_events`.
     events: Rc<RefCell<VecDeque<ControlEvent>>>,
+    /// Org-revocation bundles that arrived on the trickle or
+    /// org-control socket, waiting for `take_revocation_bundles`.
+    /// Verbatim bytes in arrival order: the envelope is parsed, the
+    /// bundle never is.
+    revocation: Rc<RefCell<VecDeque<Vec<u8>>>>,
     /// The socket's handlers, kept alive for the socket's lifetime.
     handlers: RefCell<Vec<JsValue>>,
 }
@@ -132,7 +158,10 @@ impl AnchorControlPlane {
         credential: Credential,
         self_node: NodeId,
     ) -> Result<Self> {
-        let info = AnchorInfo::from_json(&http_get(&format!("{bootstrap_url}/rtc/anchor")).await?)?;
+        // The fetch goes to the listener proper; the `#org-control=`
+        // override tag (if any) is not part of its URL.
+        let (base, _) = split_org_control(&bootstrap_url);
+        let info = AnchorInfo::from_json(&http_get(&format!("{base}/rtc/anchor")).await?)?;
         Self::bind(bootstrap_url, credential, self_node, &info)
     }
 
@@ -156,7 +185,20 @@ impl AnchorControlPlane {
         info: &AnchorInfo,
     ) -> Result<Self> {
         info.check_pinned_key(&credential)?;
-        Ok(Self {
+        // The override tag is consumed HERE so no URL this adapter
+        // mints (`/rtc/anchor`, `/rtc/offer`, `/rtc/trickle`) can
+        // inherit it. Failing that, the page-published feed pointer
+        // (`globalThis.__netOrgControl`) — the `window.__netChangeArmed`
+        // precedent, a page hook the leaf reads.
+        let (bootstrap_url, org_control) = split_org_control(&bootstrap_url);
+        let org_control = org_control.or_else(|| {
+            let window = web_sys::window()?;
+            js_sys::Reflect::get(&window, &JsValue::from_str("__netOrgControl"))
+                .ok()?
+                .as_string()
+                .filter(|url| !url.is_empty())
+        });
+        let control = Self {
             state: Rc::new(State {
                 bootstrap_url,
                 credential,
@@ -168,9 +210,54 @@ impl AnchorControlPlane {
                 trickle: RefCell::new(None),
                 pending_flush: Rc::new(RefCell::new(Vec::new())),
                 events: Rc::new(RefCell::new(VecDeque::new())),
+                revocation: Rc::new(RefCell::new(VecDeque::new())),
                 handlers: RefCell::new(Vec::new()),
             }),
-        })
+        };
+        // A named feed socket that will not open is a FEED THIS
+        // CONNECTION WILL NEVER GET, and every revocation witness
+        // behind it would silently measure a leaf with floor 0. So
+        // this fails loud instead of degrading.
+        if let Some(url) = org_control {
+            control.open_org_control(url)?;
+        }
+        Ok(control)
+    }
+
+    /// Open the dedicated org-control socket at `url`, carrying the
+    /// anchor protocol's `org_revocation_bundle` frame vocabulary.
+    ///
+    /// Why a second socket exists at all: `GET /rtc/trickle`'s server
+    /// (`sdk/src/rtc_bootstrap.rs`) originates exactly one frame — the
+    /// anchor's first candidate — so a harness that must FEED
+    /// revocation facts needs a socket its own anchor side can send
+    /// on. Same protocol, one frame type, and
+    /// [`ControlPlane::take_revocation_bundles`] cannot tell which
+    /// socket a bundle arrived on — which is the point: the feed's
+    /// transport is the carrier's business; the bytes and their order
+    /// are the contract.
+    ///
+    /// [`Self::bind`] opens this automatically when the bootstrap URL
+    /// carries the `#org-control=<ws-url>` override tag; this method
+    /// is the additive seam for a caller that learns the URL some
+    /// other way. Leaks nothing: the URL is an opaque string in,
+    /// typed success or refusal out.
+    pub fn open_org_control(&self, url: String) -> Result<()> {
+        let socket = WebSocket::new(&url)
+            .map_err(|e| refused(&format!("the org-control socket did not open: {e:?}")))?;
+        let dialog = self.state.dialog.get().unwrap_or(0);
+        let events = Rc::clone(&self.state.events);
+        let revocation = Rc::clone(&self.state.revocation);
+        let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
+            let Some(text) = event.data().as_string() else {
+                // Binary frames are not part of this protocol.
+                return;
+            };
+            route_frame(&text, dialog, &events, &revocation);
+        }) as Box<dyn FnMut(MessageEvent)>);
+        socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        self.state.handlers.borrow_mut().push(on_message.into_js_value());
+        Ok(())
     }
 
     /// The anchor's node id.
@@ -227,14 +314,13 @@ impl AnchorControlPlane {
                 .map_err(|e| refused(&format!("the trickle socket did not open: {e:?}")))?;
 
         let events = Rc::clone(&state.events);
+        let revocation = Rc::clone(&state.revocation);
         let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
             let Some(text) = event.data().as_string() else {
                 // Binary frames are not part of this protocol.
                 return;
             };
-            if let Some(event) = parse_trickle_frame(&text, dialog) {
-                events.borrow_mut().push_back(event);
-            }
+            route_frame(&text, dialog, &events, &revocation);
         }) as Box<dyn FnMut(MessageEvent)>);
         socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
@@ -417,6 +503,66 @@ impl ControlPlane for AnchorControlPlane {
 
     fn drain_events(&self) -> Vec<ControlEvent> {
         self.state.events.borrow_mut().drain(..).collect()
+    }
+
+    fn take_revocation_bundles(&mut self) -> Vec<Vec<u8>> {
+        self.state.revocation.borrow_mut().drain(..).collect()
+    }
+}
+
+/// Route one inbound anchor-protocol frame: the revocation feed's
+/// bundle first, then the trickle vocabulary.
+///
+/// One router for both sockets, so a bundle is a bundle no matter
+/// which socket carried it and the two paths cannot drift into
+/// disagreeing about what a frame means.
+fn route_frame(
+    text: &str,
+    dialog: DialogId,
+    events: &RefCell<VecDeque<ControlEvent>>,
+    revocation: &RefCell<VecDeque<Vec<u8>>>,
+) {
+    if let Some(bundle) = parse_revocation_frame(text) {
+        revocation.borrow_mut().push_back(bundle);
+        return;
+    }
+    if let Some(event) = parse_trickle_frame(text, dialog) {
+        events.borrow_mut().push_back(event);
+    }
+}
+
+/// The revocation feed's one control frame.
+///
+/// `{"type":"org_revocation_bundle","bundle":"<standard base64>"}` —
+/// the trickle vocabulary plus one frame type, carrying an org root's
+/// signed revocation bundle. The bytes stay opaque: this parses the
+/// envelope, never the bundle, and the signature check stays with the
+/// leaf's org module (`ControlPlane`'s "verified by the leaf, not by
+/// the transport" rule). Anything else returns `None`, so the trickle
+/// parser still decides what any other frame means.
+fn parse_revocation_frame(text: &str) -> Option<Vec<u8>> {
+    let document: serde_json::Value = serde_json::from_str(text).ok()?;
+    if document.get("type").and_then(|v| v.as_str()) != Some("org_revocation_bundle") {
+        return None;
+    }
+    let encoded = document.get("bundle").and_then(|v| v.as_str())?;
+    base64::engine::general_purpose::STANDARD.decode(encoded).ok()
+}
+
+/// Split the `#org-control=<ws-url>` override tag off a bootstrap
+/// URL.
+///
+/// The tag is how a harness tells [`Self::AnchorControlPlane`] where
+/// its anchor-side revocation feed lives without a second connect
+/// parameter: the Stage 4b listener's trickle handler originates
+/// exactly one frame, so the runner serves the same frame vocabulary
+/// on a socket of its own and the bootstrap URL carries the pointer.
+/// Everything else about the URL is unchanged; a URL with no tag is
+/// `(whole, None)`.
+fn split_org_control(bootstrap_url: &str) -> (String, Option<String>) {
+    match bootstrap_url.split_once("#org-control=") {
+        Some((base, url)) if !url.is_empty() => (base.to_string(), Some(url.to_string())),
+        _ => (bootstrap_url.to_string(), None),
     }
 }
 

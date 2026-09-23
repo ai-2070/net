@@ -171,6 +171,7 @@
 //! **anchor** endpoint the page talks to is the real HTTPS listener.
 
 mod browser;
+mod org_stream;
 mod stage5;
 mod stage6;
 mod stage7;
@@ -213,6 +214,7 @@ use net_sdk::identity::Identity;
 use net_sdk::rtc_bootstrap::{serve_bootstrap, BootstrapConfig, BootstrapTls};
 
 use browser::{Driver, Engine, LaunchSpec};
+use org_stream::{StepOrgQueue, StepOrgSender};
 use stage5::{Bundle, Step5Queue, Step5Sender};
 use stage6::{Step6Queue, Step6Sender};
 
@@ -605,6 +607,12 @@ struct PageState {
     /// page — so a Stage 5 step delivered there would be an unknown
     /// kind, and one of its steps delivered to `leaf5.js` likewise.
     steps6: Arc<HashMap<String, Step6Queue>>,
+    /// The Stage 4 org tabs' queues (`page/org.js` — its own
+    /// vocabulary of the eight org verbs).
+    steps_org: Arc<HashMap<String, StepOrgQueue>>,
+    /// The revocation facts feed's WS endpoint registry — the
+    /// runner's side of the control-plane feed.
+    org_feed: Arc<org_stream::OrgControlFeed>,
     pending: Pending,
 }
 
@@ -698,10 +706,14 @@ async fn serve_page(
         .route("/leaf5.js", get(leaf5_js))
         .route("/peer6.html", get(peer6_html))
         .route("/peer6.js", get(peer6_js))
+        .route("/org.html", get(org_html))
+        .route("/org.js", get(org_js))
         .route("/browser/{*path}", get(browser_asset))
         .route("/harness/step", get(next_step))
         .route("/harness/step5", get(next_step5))
         .route("/harness/step6", get(next_step6))
+        .route("/harness/stepOrg", get(next_step_org))
+        .route("/harness/org-control", get(org_stream::org_control_socket))
         .route("/harness/result", post(step_result))
         .route("/harness/log", post(browser_log))
         .with_state(state);
@@ -749,6 +761,32 @@ async fn peer6_html(State(s): State<PageState>) -> Response {
 }
 async fn peer6_js(State(s): State<PageState>) -> Response {
     file_response(&s.page.join("peer6.js"), "text/javascript; charset=utf-8")
+}
+async fn org_html(State(s): State<PageState>) -> Response {
+    file_response(&s.page.join("org.html"), "text/html; charset=utf-8")
+}
+async fn org_js(State(s): State<PageState>) -> Response {
+    file_response(&s.page.join("org.js"), "text/javascript; charset=utf-8")
+}
+
+/// The Stage 4 org tabs' queues. `page/org.js` speaks its own step
+/// vocabulary (the eight org verbs), so a Stage 5 step delivered
+/// there would be an unknown kind and one of its steps delivered to
+/// `leaf5.js` likewise.
+async fn next_step_org(State(s): State<PageState>, Query(q): Query<TabQuery>) -> Response {
+    let idle = || Json(serde_json::json!({ "kind": "idle", "id": 0, "millis": 50 }));
+    let Some(queue) = s.steps_org.get(&q.tab) else {
+        return idle().into_response();
+    };
+    let mut rx = queue.lock().await;
+    match tokio::time::timeout(Duration::from_secs(25), rx.recv()).await {
+        Ok(Some((step, reply))) => {
+            let id = step.get("id").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            s.pending.lock().await.insert(id, reply);
+            Json(step).into_response()
+        }
+        _ => idle().into_response(),
+    }
 }
 
 /// Serve `@net-mesh/browser`'s built bundle under one prefix, so the
@@ -1351,15 +1389,22 @@ fn unhex(s: &str) -> Vec<u8> {
 // ===================================================================
 
 async fn spawn_node(rtc: Option<RtcConfig>) -> Arc<MeshNode> {
+    spawn_node_identity(rtc).await.0
+}
+
+/// [`spawn_node`], keeping the signing keypair: the org stage's
+/// native callers sign admission proofs with it (`OrgProofIntent`).
+async fn spawn_node_identity(rtc: Option<RtcConfig>) -> (Arc<MeshNode>, Arc<EntityKeypair>) {
     let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), PSK);
     cfg.rtc = rtc;
+    let key = Arc::new(EntityKeypair::generate());
     let node = Arc::new(
-        MeshNode::new(EntityKeypair::generate(), cfg)
+        MeshNode::new((*key).clone(), cfg)
             .await
             .expect("MeshNode::new"),
     );
     node.start();
-    node
+    (node, key)
 }
 
 fn anchor_rtc(bind: SocketAddr) -> RtcConfig {
@@ -1422,6 +1467,10 @@ async fn main() {
     let mut engine_arg_bad: Option<String> = None;
     let mut stage5 = true;
     let mut stage7 = false;
+    // Run ONLY the Stage 4 org witness stage (37 witnesses),
+    // skipping the 4b/5/6/7 halves (each still named `RTCB
+    // EXCLUDED`, so the ledger is never silently short).
+    let mut org_only = false;
     let mut inverse = String::new();
     // **Off by default on Windows.** Binding the host's routable
     // IPv4 — which the anchor's and the impostor's RTC sockets do
@@ -1460,6 +1509,8 @@ async fn main() {
             // reason once — the browser ↔ browser join was not
             // answered — and that reason is gone.
             "--stage7" => stage7 = true,
+            // Run ONLY the Stage 4 org witness stage.
+            "--org-only" => org_only = true,
             // Opt in to the routable-interface topology on Windows,
             // accepting the Windows Firewall prompt the non-loopback
             // binds raise. Needed for the mDNS
@@ -1522,17 +1573,22 @@ async fn main() {
     let _ = std::fs::create_dir_all(&work);
 
     let mut ledger = Ledger::default();
-    let outcome = run(
+    // BOXED: `run` is a multi-thousand-line async fn and its state
+    // machine (with every awaited stage inlined) is far past the
+    // default 1 MB thread stack in debug builds — the future itself
+    // goes on the heap, which is what a stack overflow here means.
+    let outcome = Box::pin(run(
         &root,
         &work,
         engine,
-        browser_path,
+        browser_path.clone(),
         stage5,
         stage7,
+        org_only,
         &inverse,
         routable,
         &mut ledger,
-    )
+    ))
     .await;
     let code = match outcome {
         Ok(()) => {
@@ -1764,6 +1820,8 @@ async fn run(
     stage5: bool,
     // Opt-in: the Stage 7 store witnesses (see `--stage7`).
     stage7: bool,
+    // Run ONLY the Stage 4 org witness stage (see `--org-only`).
+    org_only: bool,
     inverse: &str,
     routable: bool,
     ledger: &mut Ledger,
@@ -1820,7 +1878,7 @@ async fn run(
             }
         );
     }
-    let anchor = spawn_node(Some(anchor_rtc(anchor_bind))).await;
+    let (anchor, anchor_key) = spawn_node_identity(Some(anchor_rtc(anchor_bind))).await;
     let loop_anchor = spawn_node(Some(anchor_rtc("127.0.0.1:0".parse().expect("addr")))).await;
     // The impostor sits on the SAME interface as the real anchor.
     // Its whole point is a different Noise static key under the same
@@ -1931,6 +1989,18 @@ async fn run(
         step6_tx.insert(tab.to_string(), tx);
         step6_rx.insert(tab.to_string(), Arc::new(Mutex::new(rx)));
     }
+    // The Stage 4 org tabs are a fourth script on a fourth route:
+    // their page is `org.js` and their steps are the eight org verbs.
+    let mut step_org_tx: HashMap<String, StepOrgSender> = HashMap::new();
+    let mut step_org_rx: HashMap<String, StepOrgQueue> = HashMap::new();
+    for tab in org_stream::TABS {
+        let (tx, rx) = mpsc::channel(4);
+        step_org_tx.insert(tab.to_string(), tx);
+        step_org_rx.insert(tab.to_string(), Arc::new(Mutex::new(rx)));
+    }
+    // The revocation facts feed's WS endpoint (the runner side of the
+    // control-plane feed).
+    let org_feed = Arc::new(org_stream::OrgControlFeed::default());
     let page_state = PageState {
         dist,
         page: root.join("page"),
@@ -1938,6 +2008,8 @@ async fn run(
         steps: Arc::new(Mutex::new(step_rx)),
         steps5: Arc::new(step5_rx),
         steps6: Arc::new(step6_rx),
+        steps_org: Arc::new(step_org_rx),
+        org_feed: Arc::clone(&org_feed),
         pending: Arc::new(Mutex::new(HashMap::new())),
     };
     let (page_addr, _page_task) = serve_page(page_state)
@@ -2136,6 +2208,63 @@ async fn run(
     // formed with the obfuscation DISABLED can never satisfy the
     // mDNS-on verdict.
     let mdns_on_for_measurement = !measure_with_mdns_off;
+
+    // ================================================================
+    // STAGE 4 — the org-scoped streaming witness stage.
+    //
+    // With `--org-only` it runs HERE and returns; in the full ledger
+    // it runs after the 4b/5/6/7 halves (the tail below). Every
+    // other half's witnesses are named `RTCB EXCLUDED` under
+    // `--org-only`, so the ledger is never silently short.
+    // ================================================================
+    let cx_org = org_stream::CxOrg {
+        driver: &driver,
+        engine,
+        anchor: &anchor,
+        anchor_key: &anchor_key,
+        credential: anchor_cred.clone(),
+        bootstrap_base: anchor_base.clone(),
+        origin: origin.clone(),
+        page_origin: origin.clone(),
+        anchor_rtc_addr: anchor_rtc_addr.to_string(),
+        stun: Some(format!("stun:{anchor_rtc_addr}")),
+        feed: Arc::clone(&org_feed),
+        work: work.to_path_buf(),
+        tabs: step_org_tx.clone(),
+    };
+    if org_only {
+        Box::pin(org_stream::run(cx_org, ledger)).await?;
+        let excluded: [&[&str]; 4] = [
+            &[
+                "enrollment_exchange_promotes_this_session",
+                "enrolled_without_authority_is_still_denied",
+                "provisional_announcement_is_refused",
+                "provisional_subscribe_to_an_unrelated_channel_is_refused",
+                "provisional_call_to_another_service_is_refused",
+                "provisional_transit_is_refused",
+                "local_envelope_accepted_redirected_denied",
+                "mitm_anchor_fails_the_handshake_and_installs_nothing",
+                "browser_enrollment_survives_replacement",
+                "browser_session_bounds_are_enforced",
+                "mdns_candidate_pair_measured",
+                "mdns_on_pair_formed",
+            ],
+            &stage5::WITNESSES,
+            &stage6::WITNESSES,
+            &stage7::WITNESSES,
+        ];
+        for name in excluded.into_iter().flatten() {
+            println!("RTCB EXCLUDED {name} — --org-only was passed");
+        }
+        // The same teardown the tail performs: the early return must
+        // not leave the driver process or the listeners behind.
+        driver.quit().await;
+        anchor_listener.shutdown().await;
+        loop_listener.shutdown().await;
+        impostor_listener.shutdown().await;
+        let _ = std::fs::remove_dir_all(&authority_dir);
+        return Ok(());
+    }
     println!(
         "[harness] {} {} launched; host-address obfuscation {}; CA trust: {}",
         engine.as_str(),
@@ -3789,6 +3918,13 @@ async fn run(
             println!("RTCB EXCLUDED {name} — --no-stage5 was passed");
         }
     }
+
+    // ================================================================
+    // STAGE 4 — the org-scoped streaming witnesses. The full-ledger
+    // tail (`--org-only` ran them earlier and returned): same anchor,
+    // same ledger, its own tabs and step vocabulary.
+    // ================================================================
+    Box::pin(org_stream::run(cx_org, ledger)).await?;
 
     driver.quit().await;
     anchor_listener.shutdown().await;

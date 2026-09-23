@@ -41,7 +41,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
@@ -1869,6 +1869,9 @@ struct NodeBackend {
     /// same lease the server stamps its replies with.
     lease: GenerationLease,
     ops: Rc<OpRegistry>,
+    /// The org relay: follower calls and serve bridges, keyed by the
+    /// follower's own handles (see [`OrgRelay`]).
+    org: Rc<RefCell<OrgRelay>>,
 }
 
 impl LeaderBackend for NodeBackend {
@@ -1885,6 +1888,15 @@ impl LeaderBackend for NodeBackend {
         // resurrected, so the handles go with the node rather than
         // becoming a table a successor could be addressed through.
         drop(self.streams.drain());
+        // The org relay goes with the generation: each dropped
+        // caller handle emits exactly one CANCEL (the shared
+        // exactly-once guard), and every serve bridge dies typed.
+        {
+            let mut relay = self.org.borrow_mut();
+            relay.calls.clear();
+            relay.serve_calls.clear();
+            relay.accepts.clear();
+        }
         let failed = self.node.retire(generation);
         if cancelled > 0 {
             report(&format!(
@@ -1954,6 +1966,403 @@ impl LeaderBackend for NodeBackend {
                 }
             }),
             LeaderRequest::Counters => reply.text(node.counters_json()),
+            LeaderRequest::OrgCall {
+                call,
+                shape,
+                service,
+                body,
+                membership,
+                dispatcher,
+                capability_grant,
+                acting_org,
+                provider_org,
+                provider,
+                ttl_secs,
+                deadline_ns,
+                timeout_ms,
+                stream_window_initial,
+                request_window_initial,
+            } => {
+                // The signed opening is minted HERE, node-side: the
+                // entity key never crosses the channel — only the
+                // credential wire bytes do. The relay entry is keyed
+                // by the FOLLOWER's self-minted id: the per-follower
+                // handle the required inverse flips.
+                let org = self.org.clone();
+                spawn_fenced(&lease, &ops, async move {
+                    let opened = node
+                        .build_intent(
+                            &service,
+                            &membership,
+                            &dispatcher,
+                            capability_grant.as_deref(),
+                            &acting_org,
+                            &provider_org,
+                            &provider,
+                            ttl_secs,
+                        )
+                        .map_err(reported)
+                        .and_then(|intent| {
+                            let peer =
+                                crate::identity::node_id_for_entity(intent.provider.as_bytes());
+                            node.backend_org_open(
+                                &service,
+                                &shape,
+                                &body,
+                                intent,
+                                peer,
+                                deadline_ns,
+                                timeout_ms.map(u64::from),
+                                stream_window_initial,
+                                request_window_initial,
+                            )
+                            .map_err(ProxyFailure::Typed)
+                        });
+                    match opened {
+                        Ok((crate::wasm::OrgBackendCall::Unary(receiver), _)) => {
+                            match receiver.await {
+                                Ok(Ok(result)) => reply
+                                    .bytes(envelope(crate::leader::ORG_ENVELOPE_END, &result)),
+                                Ok(Err(error)) => {
+                                    reply.fail(ProxyFailure::Typed(LeafError::Rpc(error)))
+                                }
+                                Err(_) => reply.fail(ProxyFailure::Typed(LeafError::Rpc(
+                                    RpcError::SessionLost,
+                                ))),
+                            }
+                        }
+                        Ok((crate::wasm::OrgBackendCall::Streaming(handle), _)) => {
+                            org.borrow_mut()
+                                .calls
+                                .insert(call, crate::wasm::OrgBackendCall::Streaming(handle));
+                            // Opened (eager SS has its opening on the
+                            // wire already; CS/DX stay lazy).
+                            reply.bytes(envelope(crate::leader::ORG_ENVELOPE_END, b""));
+                        }
+                        Err(failure) => reply.fail(failure),
+                    }
+                })
+            }
+            LeaderRequest::OrgSend { call, payload } => {
+                let outcome = relay_stream_call(&self.org, call).map(|id| {
+                    node.backend_org_send(id, &payload)
+                        .map_err(|error| reported(crate::wasm::sink_error(error, "the upload sink")))
+                });
+                match outcome {
+                    Some(Ok(())) => reply.bytes(Bytes::new()),
+                    Some(Err(failure)) => reply.fail(failure),
+                    None => reply.fail(no_such_call(call)),
+                }
+            }
+            LeaderRequest::OrgFinishSending { call } => {
+                let outcome = relay_stream_call(&self.org, call).map(|id| {
+                    node.backend_org_finish_sending(id)
+                        .map_err(|error| reported(crate::wasm::sink_error(error, "the upload sink")))
+                });
+                match outcome {
+                    Some(Ok(())) => reply.bytes(Bytes::new()),
+                    Some(Err(failure)) => reply.fail(failure),
+                    None => reply.fail(no_such_call(call)),
+                }
+            }
+            LeaderRequest::OrgNext { call } => {
+                let org = self.org.clone();
+                spawn_fenced(&lease, &ops, async move {
+                    loop {
+                        // The attribution check first: a handle this
+                        // relay never minted owns nothing.
+                        let Some(call_id) = relay_stream_call(&org, call) else {
+                            reply.fail(no_such_call(call));
+                            return;
+                        };
+                        // The pull discipline: poll after each pump
+                        // (the node's own ticker runs it) with this
+                        // loop as the backstop.
+                        let polled = match node.backend_org_next(call_id) {
+                            Some(item) => Some(Ok(item)),
+                            None => node.backend_org_terminal(call_id).map(Err),
+                        };
+                        match polled {
+                            Some(Ok(item)) => {
+                                reply.bytes(envelope(crate::leader::ORG_ENVELOPE_ITEM, &item));
+                                return;
+                            }
+                            Some(Err(StreamTerminal::Completed { body })) => {
+                                reply.bytes(envelope(crate::leader::ORG_ENVELOPE_END, &body));
+                                return;
+                            }
+                            Some(Err(StreamTerminal::Retired { reason })) => {
+                                reply.bytes(envelope(
+                                    crate::leader::ORG_ENVELOPE_RETIRED,
+                                    crate::wasm::retire_reason_text(reason).as_bytes(),
+                                ));
+                                return;
+                            }
+                            Some(Err(StreamTerminal::Refused { status, body })) => {
+                                reply.fail(ProxyFailure::Typed(LeafError::Rpc(RpcError::Refused {
+                                    status: status.to_wire(),
+                                    message: String::from_utf8_lossy(&body).into_owned(),
+                                })));
+                                return;
+                            }
+                            None => {
+                                gloo_timer_sleep(ORG_PULL_MS).await.ok();
+                            }
+                        }
+                    }
+                })
+            }
+            LeaderRequest::OrgCancel { call } => {
+                if let Some(id) = relay_stream_call(&self.org, call) {
+                    node.backend_org_cancel(id);
+                }
+                // Idempotent: cancelling an unknown or dead call is a
+                // no-op — never another call's CANCEL.
+                reply.bytes(Bytes::new());
+            }
+            LeaderRequest::OrgServeRegister {
+                registration,
+                service,
+                access,
+                owner_org,
+                shape,
+            } => {
+                use crate::rpc_serve::{ServeAccess, ServeOptions};
+                use crate::org::proof::RpcCallShape;
+                let wire_shape = match shape.as_str() {
+                    "unary" => RpcCallShape::Unary,
+                    "server-streaming" => RpcCallShape::ServerStreaming,
+                    "client-streaming" => RpcCallShape::ClientStreaming,
+                    "duplex" => RpcCallShape::Duplex,
+                    other => {
+                        reply.fail(reported(JsError::new(&format!(
+                            "unknown org call shape {other:?}"
+                        ))));
+                        return;
+                    }
+                };
+                let serve_access = match access.as_str() {
+                    "same-org" => ServeAccess::SameOrg,
+                    "granted" => ServeAccess::Granted,
+                    other => {
+                        reply.fail(reported(JsError::new(&format!(
+                            "access must be \"same-org\" or \"granted\", got {other:?}"
+                        ))));
+                        return;
+                    }
+                };
+                let owner = match crate::identity::unhex(&owner_org)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                {
+                    Some(bytes) => crate::org::cert::OrgId::from_bytes(bytes),
+                    None => {
+                        reply.fail(reported(JsError::new(
+                            "ownerOrg must be 32 bytes (64 hex digits)",
+                        )));
+                        return;
+                    }
+                };
+                let opts = ServeOptions {
+                    shape: wire_shape,
+                    access: serve_access,
+                    provider_owner_org: owner,
+                    skew_secs: crate::wasm::ORG_SKEW_SECS,
+                    default_live_ns: crate::wasm::ORG_DEFAULT_LIVE_NS,
+                    max_live_ns: crate::wasm::ORG_MAX_LIVE_NS,
+                    policy: None,
+                };
+                // Every admitted call parks here under a fresh
+                // bridge-call id and is handed to the REGISTERING
+                // follower's accept pull — its own handle, and no
+                // other follower's.
+                let org = self.org.clone();
+                let handler: crate::rpc_serve::ServeHandler = Rc::new(move |serve_call| {
+                    let mut relay = org.borrow_mut();
+                    relay.next_serve_call += 1;
+                    let id = relay.next_serve_call;
+                    relay.serve_calls.insert(id, (registration, serve_call));
+                    relay
+                        .accepts
+                        .entry(registration)
+                        .or_default()
+                        .push_back(id);
+                });
+                match node.backend_org_serve(&service, opts, handler) {
+                    Ok(()) => reply.bytes(Bytes::new()),
+                    Err(error) => reply.fail(ProxyFailure::Typed(error)),
+                }
+            }
+            LeaderRequest::OrgServeAccept { registration } => {
+                let org = self.org.clone();
+                spawn_fenced(&lease, &ops, async move {
+                    loop {
+                        let admitted = {
+                            let mut relay = org.borrow_mut();
+                            let id = relay
+                                .accepts
+                                .get_mut(&registration)
+                                .and_then(|queue| queue.pop_front());
+                            id.and_then(|id| {
+                                relay
+                                    .serve_calls
+                                    .get(&id)
+                                    .map(|(_, call)| (id, crate::wasm::caller_json(call)))
+                            })
+                        };
+                        match admitted {
+                            Some((id, Ok(caller))) => {
+                                let mut doc = serde_json::Map::new();
+                                doc.insert("call".into(), serde_json::Value::from(id.to_string()));
+                                doc.insert(
+                                    "caller".into(),
+                                    serde_json::from_str::<serde_json::Value>(&caller)
+                                        .unwrap_or(serde_json::Value::Null),
+                                );
+                                let json = serde_json::Value::Object(doc).to_string();
+                                reply.bytes(envelope(
+                                    crate::leader::ORG_ENVELOPE_ADMITTED,
+                                    json.as_bytes(),
+                                ));
+                                return;
+                            }
+                            Some((_, Err(error))) => {
+                                reply.fail(reported(error));
+                                return;
+                            }
+                            None => {
+                                gloo_timer_sleep(ORG_PULL_MS).await.ok();
+                            }
+                        }
+                    }
+                })
+            }
+            LeaderRequest::OrgServeRequest { call } => {
+                let org = self.org.clone();
+                spawn_fenced(&lease, &ops, async move {
+                    loop {
+                        if !org.borrow().serve_calls.contains_key(&call) {
+                            reply.fail(no_such_call(call));
+                            return;
+                        }
+                        let polled = {
+                            let relay = org.borrow();
+                            relay.serve_calls.get(&call).and_then(|(_, serve)| {
+                                serve.poll_request().map(Ok).or_else(|| {
+                                    serve.request_ended().then_some(Err(()))
+                                })
+                            })
+                        };
+                        match polled {
+                            Some(Ok(item)) => {
+                                reply.bytes(envelope(crate::leader::ORG_ENVELOPE_ITEM, &item));
+                                return;
+                            }
+                            Some(Err(())) => {
+                                reply.bytes(envelope(crate::leader::ORG_ENVELOPE_END, b""));
+                                return;
+                            }
+                            None => {
+                                gloo_timer_sleep(ORG_PULL_MS).await.ok();
+                            }
+                        }
+                    }
+                })
+            }
+            LeaderRequest::OrgServeSend { call, payload } => {
+                let outcome = {
+                    let relay = self.org.borrow();
+                    relay
+                        .serve_calls
+                        .get(&call)
+                        .map(|(_, serve)| serve.send(&payload))
+                };
+                match outcome {
+                    Some(Ok(())) => reply.bytes(Bytes::new()),
+                    Some(Err(error)) => reply
+                        .fail(reported(crate::wasm::sink_error(error, "the response sink"))),
+                    None => reply.fail(no_such_call(call)),
+                }
+            }
+            LeaderRequest::OrgServeFinish {
+                call,
+                status,
+                message,
+            } => {
+                use crate::rpc_wire::{RpcStatus, StreamHandlerResult};
+                let result = if status == RpcStatus::Ok.to_wire() {
+                    StreamHandlerResult::Ok
+                } else {
+                    StreamHandlerResult::Err(RpcStatus::from_wire(status), message)
+                };
+                let known = {
+                    let relay = self.org.borrow();
+                    match relay.serve_calls.get(&call) {
+                        Some((_, serve)) => {
+                            // First completion wins; a result
+                            // delivered after retirement is discarded
+                            // by the serve side, exactly as the
+                            // handler-drop contract says.
+                            serve.finish(result);
+                            true
+                        }
+                        None => false,
+                    }
+                };
+                if known {
+                    reply.bytes(Bytes::new());
+                } else {
+                    reply.fail(no_such_call(call));
+                }
+            }
+            LeaderRequest::OrgServeRetired { call } => {
+                let org = self.org.clone();
+                spawn_fenced(&lease, &ops, async move {
+                    loop {
+                        if !org.borrow().serve_calls.contains_key(&call) {
+                            reply.fail(no_such_call(call));
+                            return;
+                        }
+                        let retired = {
+                            let relay = org.borrow();
+                            relay
+                                .serve_calls
+                                .get(&call)
+                                .and_then(|(_, serve)| serve.retired())
+                        };
+                        match retired {
+                            Some(reason) => {
+                                // The frozen `OrgRetireReason`
+                                // string, identical to the direct
+                                // surface's `retired` vocabulary.
+                                reply.bytes(envelope(
+                                    crate::leader::ORG_ENVELOPE_RETIRED,
+                                    crate::wasm::retire_reason_text(reason).as_bytes(),
+                                ));
+                                return;
+                            }
+                            None => {
+                                gloo_timer_sleep(ORG_PULL_MS).await.ok();
+                            }
+                        }
+                    }
+                })
+            }
+            LeaderRequest::OrgServeUnregister {
+                registration,
+                service,
+            } => {
+                // C9's protected split: the node's unserve retires
+                // this registration's live calls with their exact
+                // terminals and refuses new openings.
+                node.backend_org_unserve(&service);
+                {
+                    let mut relay = self.org.borrow_mut();
+                    relay.serve_calls.retain(|_, (seen, _)| *seen != registration);
+                    relay.accepts.remove(&registration);
+                }
+                reply.bytes(Bytes::new());
+            }
             LeaderRequest::IsEnrolled => reply.flag(node.is_enrolled()),
             LeaderRequest::Enroll => spawn_fenced(&lease, &ops, async move {
                 match node.enroll().await {
@@ -2122,6 +2531,7 @@ fn node_factory() -> BackendFactory {
                 streams: Rc::new(StreamOwnership::default()),
                 lease,
                 ops: Rc::new(OpRegistry::default()),
+                org: Rc::new(RefCell::new(OrgRelay::default())),
             });
             Ok(backend)
         }) as BackendFuture
@@ -2735,6 +3145,870 @@ fn follower_id() -> Result<u64> {
 /// reuse a predecessor's ids.
 fn correlation_seed() -> Result<u64> {
     follower_id()
+}
+
+// ───────── org-scoped calls and serves through the proxy (S4) ─────────
+//
+// # Attribution invariants (enforced here; the browser lane's witness
+// # inverse flips exactly these)
+//
+// Per-call correlation is the **follower's self-minted `call` id**
+// plus the gate generation it opened under — never a wire id, never
+// an incarnation (a stream's resolved identity comes back in
+// `ProxyValue::Stream` and is not a correlation). The id namespace is
+// process-monotonic and never reset (the `GenerationGate` rule one
+// level down): a successor generation's calls carry fresh, higher
+// ids, so a late reply to a dead generation's call can never land on
+// a live one. A generation move fails every pending proxied call
+// typed `LeaderLost` (`ProxyClient::fail_pending`) and is NEVER
+// resumed. Per-follower callback attribution is the follower's own
+// handle: the leader's relay keys every call by exactly the id the
+// follower minted, so delivering a call's items under another
+// follower's handle — the REQUIRED witness inverse — must fail.
+//
+// # Suspension and closure (§4.5)
+//
+// Deadlines are absolute (`deadline_ns` stamped at opening): a frozen
+// tab gets no lease extension, and on wake an overdue call retires
+// with its deadline terminal. There is NO automatic resume: a retired
+// call is never transparently re-opened; re-opening is a fresh call
+// with a fresh proof and MAY repeat effects. Session or tab close
+// retires ownership (pending calls fail typed; dropping one caller
+// handle emits exactly one CANCEL).
+//
+// # The handler-drop level (F-S3.1-2)
+//
+// The serve verbs below state the contract at the JS handler surface,
+// verbatim: "the retire supervisor may drop the handler future
+// without a final poll — cancellation is observed through the
+// retirement observables (the terminal item, the sink's typed closed
+// refusal, and `retired`), never assumed as a handler-side event; a
+// detached observer holding `retired` observes the signal."
+
+use crate::rpc_stream::{RetireReason, StreamTerminal};
+
+/// How often a pending org long-pull re-checks its queue.
+const ORG_PULL_MS: i32 = 50;
+
+// The follower's self-minted org correlation namespace. Monotonic
+// and never reset — see the attribution note above.
+thread_local! {
+    static NEXT_ORG_ID: Cell<u64> = Cell::new(0);
+}
+
+/// The next self-minted org correlation id.
+fn next_org_id() -> Result<u64> {
+    NEXT_ORG_ID.with(|next| {
+        if next.get() == 0 {
+            next.set(correlation_seed()?);
+        }
+        let id = next.get().wrapping_add(1);
+        next.set(id);
+        Ok(id)
+    })
+}
+
+/// Wrap bytes in the transparent envelope (`leader.rs`'s tags).
+fn envelope(tag: u8, payload: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(1 + payload.len());
+    out.push(tag);
+    out.extend_from_slice(payload);
+    Bytes::from(out)
+}
+
+/// Read one transparent envelope back.
+fn decode_org_envelope(envelope: &[u8]) -> Result<crate::wasm::OrgPoll, JsError> {
+    use crate::leader::{ORG_ENVELOPE_END, ORG_ENVELOPE_ITEM, ORG_ENVELOPE_RETIRED};
+    let (&tag, rest) = envelope
+        .split_first()
+        .ok_or_else(|| JsError::new("an empty org envelope is not an item"))?;
+    match tag {
+        ORG_ENVELOPE_ITEM => Ok(crate::wasm::OrgPoll::Item(Bytes::copy_from_slice(rest))),
+        ORG_ENVELOPE_END => Ok(crate::wasm::OrgPoll::Terminal(StreamTerminal::Completed {
+            body: Bytes::copy_from_slice(rest),
+        })),
+        ORG_ENVELOPE_RETIRED => {
+            let reason = String::from_utf8(rest.to_vec())
+                .map_err(|_| JsError::new("an org retire reason is not UTF-8"))?;
+            Ok(crate::wasm::OrgPoll::Terminal(StreamTerminal::Retired {
+                reason: reason_from_str(&reason),
+            }))
+        }
+        other => Err(JsError::new(&format!("unknown org envelope tag {other}"))),
+    }
+}
+
+/// The `OrgRetireReason` strings back to the typed reason.
+fn reason_from_str(text: &str) -> RetireReason {
+    match text {
+        "timeout" => RetireReason::Timeout,
+        "cancelled" => RetireReason::Cancelled,
+        "revoked" => RetireReason::Revoked,
+        "session-lost" => RetireReason::SessionLost,
+        "leader-lost" => RetireReason::LeaderLost,
+        "node-closed" => RetireReason::NodeClosed,
+        "replaced" => RetireReason::Replaced,
+        "resource-exhausted" => RetireReason::ResourceExhausted,
+        _ => RetireReason::Cancelled,
+    }
+}
+
+/// A proxied typed failure, as the terminal the JS surface sees.
+///
+/// Round-trips the frozen vocabulary: a `Refused` terminal crossed as
+/// `LeafError::Rpc(Refused { .. })` and comes back byte-identical;
+/// lifecycle failures map onto the retirement reasons (a generation
+/// move is `LeaderLost`, a closed session is `NodeClosed`).
+fn terminal_from_failure(failure: &ProxyFailure) -> StreamTerminal {
+    match failure.typed() {
+        Some(LeafError::Rpc(RpcError::Refused { status, message })) => StreamTerminal::Refused {
+            status: crate::rpc_wire::RpcStatus::from_wire(*status),
+            body: Bytes::from(message.clone().into_bytes()),
+        },
+        Some(LeafError::Rpc(RpcError::Timeout)) => StreamTerminal::Refused {
+            status: crate::rpc_wire::RpcStatus::Timeout,
+            body: Bytes::from_static(b"the call's deadline elapsed"),
+        },
+        Some(LeafError::Rpc(RpcError::Indeterminate { deadline_ms })) => StreamTerminal::Refused {
+            status: crate::rpc_wire::RpcStatus::Timeout,
+            // The one spelling the `errors.ts` indeterminate class
+            // pins, so the proxied surface classifies exactly like a
+            // follower-armed direct one.
+            body: Bytes::from(format!(
+                "the local deadline of {deadline_ms}ms elapsed before the tab running the node \
+                 answered; the remote operation may still have executed (it was not retried)"
+            )),
+        },
+        Some(LeafError::Rpc(RpcError::LeaderLost { .. })) | Some(LeafError::NotLeader { .. }) => {
+            StreamTerminal::Retired {
+                reason: RetireReason::LeaderLost,
+            }
+        }
+        Some(LeafError::Rpc(RpcError::SessionLost)) => StreamTerminal::Retired {
+            reason: RetireReason::SessionLost,
+        },
+        Some(LeafError::Session(_)) => StreamTerminal::Retired {
+            reason: RetireReason::NodeClosed,
+        },
+        _ => StreamTerminal::Refused {
+            status: crate::rpc_wire::RpcStatus::Internal,
+            body: Bytes::from(failure.message().into_bytes()),
+        },
+    }
+}
+
+/// A proxied typed failure, as the rejection a call-level verb
+/// throws (the admission coarse normalized by the shared helper).
+fn failure_rejection(failure: &ProxyFailure) -> JsError {
+    match failure.typed() {
+        Some(LeafError::Rpc(error)) => crate::wasm::rpc_error_rejection(error.clone()),
+        _ => JsError::new(&failure.message()),
+    }
+}
+
+/// One org call driven through whichever tab holds the lock.
+#[derive(Clone)]
+pub(crate) struct ProxyOrgCall {
+    lifecycle: Lifecycle,
+    /// The follower's self-minted call id — the per-call correlation.
+    call: u64,
+    /// The generation this call opened under.
+    generation: u64,
+}
+
+impl ProxyOrgCall {
+    /// The retained handle for one proxied org call.
+    pub(crate) fn new(lifecycle: Lifecycle, call: u64) -> Self {
+        let generation = lifecycle.generation();
+        Self {
+            lifecycle,
+            call,
+            generation,
+        }
+    }
+
+    /// The generation stamp — `ProxyStream::still_ours`, one type
+    /// over: a handle that carried only the id would address
+    /// whatever a successor opened under it.
+    fn still_ours(&self) -> Result<()> {
+        let current = self.lifecycle.generation();
+        if current != self.generation {
+            return Err(LeafError::NotLeader {
+                presented: self.generation,
+                current: Some(current),
+            });
+        }
+        Ok(())
+    }
+
+    /// One proxied operation for this call.
+    async fn pull(&self, request: LeaderRequest) -> core::result::Result<ProxyOutcome, JsError> {
+        self.still_ours().map_err(js)?;
+        Ok(self.lifecycle.request(request).await)
+    }
+
+    /// The next response item (long-pull: the leader holds the pull
+    /// until an item, a terminal, or the generation moves).
+    pub(crate) async fn poll(&self) -> Result<crate::wasm::OrgPoll, JsError> {
+        match self.pull(LeaderRequest::OrgNext { call: self.call }).await? {
+            Ok(ProxyValue::Bytes(payload)) => decode_org_envelope(&payload),
+            Ok(other) => Err(JsError::new(&format!(
+                "org_next answered an unexpected value: {other:?}"
+            ))),
+            Err(failure) => Ok(crate::wasm::OrgPoll::Terminal(terminal_from_failure(
+                &failure,
+            ))),
+        }
+    }
+
+    /// Push one upload item.
+    pub(crate) async fn send(&self, payload: &[u8], _what: &str) -> Result<(), JsError> {
+        match self
+            .pull(LeaderRequest::OrgSend {
+                call: self.call,
+                payload: Bytes::copy_from_slice(payload),
+            })
+            .await?
+        {
+            Ok(_) => Ok(()),
+            Err(failure) => Err(failure_rejection(&failure)),
+        }
+    }
+
+    /// Half-close the upload direction.
+    pub(crate) async fn finish_sending(&self, _what: &str) -> Result<(), JsError> {
+        match self
+            .pull(LeaderRequest::OrgFinishSending { call: self.call })
+            .await?
+        {
+            Ok(_) => Ok(()),
+            Err(failure) => Err(failure_rejection(&failure)),
+        }
+    }
+
+    /// Cancel: exactly one `OrgCancel`, fire-and-forget (the terminal
+    /// is latched at the leader and this handle is settled locally
+    /// before the request goes out).
+    pub(crate) fn cancel(&self) {
+        if self.still_ours().is_err() {
+            return;
+        }
+        let lifecycle = self.lifecycle.clone();
+        let call = self.call;
+        spawn_local(async move {
+            let _ = lifecycle.request(LeaderRequest::OrgCancel { call }).await;
+        });
+    }
+}
+
+/// The follower-side mirror of one served call.
+///
+/// The JS handler drives this exactly like a direct
+/// [`crate::rpc_serve::ServeCall`]; every hook crosses the proxy to
+/// the bridge the registering follower's accept loop owns. The
+/// handle is the leader-assigned bridge-call id delivered in THIS
+/// registration's accept envelope — the follower's own handle — and
+/// no other follower's accept loop can ever receive it.
+pub(crate) struct ProxyServeCall {
+    lifecycle: Lifecycle,
+    /// The bridge-call id.
+    call: u64,
+    /// The verified caller projection, verbatim from the accept
+    /// envelope (built by the leader from `ServeCall::caller()`).
+    caller: String,
+    /// Request items the background pull loop queued.
+    input: RefCell<VecDeque<Bytes>>,
+    /// Whether the upload half has ended.
+    ended: Cell<bool>,
+    /// The retirement signal, when it fires.
+    retired: Cell<Option<RetireReason>>,
+    /// Whether a finish has been issued.
+    finished: Cell<bool>,
+}
+
+impl ProxyServeCall {
+    /// Build the mirror and start its background pulls.
+    fn start(lifecycle: Lifecycle, call: u64, caller: String) -> Rc<Self> {
+        let state = Rc::new(Self {
+            lifecycle: lifecycle.clone(),
+            call,
+            caller,
+            input: RefCell::new(VecDeque::new()),
+            ended: Cell::new(false),
+            retired: Cell::new(None),
+            finished: Cell::new(false),
+        });
+        let requests = state.clone();
+        spawn_local(async move {
+            loop {
+                match requests
+                    .lifecycle
+                    .request(LeaderRequest::OrgServeRequest { call })
+                    .await
+                {
+                    Ok(ProxyValue::Bytes(payload)) => match decode_org_envelope(&payload) {
+                        Ok(crate::wasm::OrgPoll::Item(item)) => {
+                            requests.input.borrow_mut().push_back(item);
+                        }
+                        Ok(crate::wasm::OrgPoll::Terminal(StreamTerminal::Retired { reason })) => {
+                            if requests.retired.get().is_none() {
+                                requests.retired.set(Some(reason));
+                            }
+                            break;
+                        }
+                        _ => {
+                            requests.ended.set(true);
+                            break;
+                        }
+                    },
+                    Err(failure) => {
+                        if let StreamTerminal::Retired { reason } = terminal_from_failure(&failure)
+                        {
+                            if requests.retired.get().is_none() {
+                                requests.retired.set(Some(reason));
+                            }
+                        }
+                        requests.ended.set(true);
+                        break;
+                    }
+                    Ok(_) => {
+                        requests.ended.set(true);
+                        break;
+                    }
+                }
+            }
+        });
+        let retirement = state.clone();
+        spawn_local(async move {
+            loop {
+                if retirement.retired.get().is_some() {
+                    return;
+                }
+                match retirement
+                    .lifecycle
+                    .request(LeaderRequest::OrgServeRetired { call })
+                    .await
+                {
+                    Ok(ProxyValue::Bytes(payload)) => {
+                        if let Ok(crate::wasm::OrgPoll::Terminal(StreamTerminal::Retired {
+                            reason,
+                        })) = decode_org_envelope(&payload)
+                        {
+                            if retirement.retired.get().is_none() {
+                                retirement.retired.set(Some(reason));
+                            }
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        // The leader went away: the generation
+                        // failure IS the retirement.
+                        if retirement.retired.get().is_none() {
+                            retirement.retired.set(Some(RetireReason::LeaderLost));
+                        }
+                        return;
+                    }
+                    Ok(_) => return,
+                }
+            }
+        });
+        state
+    }
+}
+
+impl crate::wasm::OrgServeCall for ProxyServeCall {
+    fn caller_json(&self) -> Result<String, JsError> {
+        Ok(self.caller.clone())
+    }
+    fn poll_request(&self) -> Option<Bytes> {
+        self.input.borrow_mut().pop_front()
+    }
+    fn request_ended(&self) -> bool {
+        self.ended.get() && self.input.borrow().is_empty()
+    }
+    fn send(&self, payload: &[u8]) -> core::result::Result<(), crate::rpc_stream::SinkError> {
+        if self.finished.get() || self.retired.get().is_some() {
+            return Err(crate::rpc_stream::SinkError::Closed);
+        }
+        let lifecycle = self.lifecycle.clone();
+        let call = self.call;
+        let payload = Bytes::copy_from_slice(payload);
+        spawn_local(async move {
+            let _ = lifecycle
+                .request(LeaderRequest::OrgServeSend { call, payload })
+                .await;
+        });
+        Ok(())
+    }
+    fn finish(&self, result: crate::rpc_wire::StreamHandlerResult) {
+        if self.finished.replace(true) {
+            return;
+        }
+        use crate::rpc_wire::{RpcStatus, StreamHandlerResult};
+        let (status, message) = match result {
+            StreamHandlerResult::Ok => (RpcStatus::Ok.to_wire(), String::new()),
+            StreamHandlerResult::Err(status, message) => (status.to_wire(), message),
+        };
+        let lifecycle = self.lifecycle.clone();
+        let call = self.call;
+        spawn_local(async move {
+            let _ = lifecycle
+                .request(LeaderRequest::OrgServeFinish {
+                    call,
+                    status,
+                    message,
+                })
+                .await;
+        });
+    }
+    fn retired(&self) -> Option<RetireReason> {
+        self.retired.get()
+    }
+}
+
+/// A serve registration that lives behind the proxy.
+#[derive(Clone)]
+pub(crate) struct ProxyOrgServe {
+    lifecycle: Lifecycle,
+    /// The follower's self-minted registration id.
+    registration: u64,
+    service: String,
+    /// Set by `close()`: stops the re-declare/accept loop.
+    closed: Rc<Cell<bool>>,
+}
+
+impl ProxyOrgServe {
+    /// Register one service and start its accept loop.
+    ///
+    /// The registration re-declares itself on every generation this
+    /// follower has not yet declared under (the `Attach` re-declare
+    /// discipline) — a successor restores the CURRENT intent, and
+    /// teardown (`ProxyServer::retire`) never resurrects anything
+    /// behind this handle's back.
+    pub(crate) fn start(
+        lifecycle: Lifecycle,
+        registration: u64,
+        service: &str,
+        access: &str,
+        owner_org: &str,
+        shape: crate::wasm::HandlerShape,
+        handler: Function,
+    ) -> Self {
+        let closed = Rc::new(Cell::new(false));
+        let service_name = service.to_string();
+        let access = access.to_string();
+        let owner_org = owner_org.to_string();
+        let wire_shape = shape_tag(shape);
+        let stop = closed.clone();
+        let loop_lifecycle = lifecycle.clone();
+        let loop_service = service_name.clone();
+        spawn_local(async move {
+            while !stop.get() {
+                let registered = loop_lifecycle
+                    .request(LeaderRequest::OrgServeRegister {
+                        registration,
+                        service: loop_service.clone(),
+                        access: access.clone(),
+                        owner_org: owner_org.clone(),
+                        shape: wire_shape.to_string(),
+                    })
+                    .await;
+                if registered.is_err() {
+                    gloo_timer_sleep(ORG_PULL_MS).await.ok();
+                    continue;
+                }
+                loop {
+                    if stop.get() {
+                        return;
+                    }
+                    match loop_lifecycle
+                        .request(LeaderRequest::OrgServeAccept { registration })
+                        .await
+                    {
+                        Ok(ProxyValue::Bytes(payload)) => {
+                            if let Some((call, caller)) = decode_admitted(&payload) {
+                                let mirror =
+                                    ProxyServeCall::start(loop_lifecycle.clone(), call, caller);
+                                crate::wasm::dispatch_proxied_handler(
+                                    handler.clone(),
+                                    shape,
+                                    mirror,
+                                );
+                            }
+                        }
+                        // The generation moved (or the registration
+                        // died): re-declare under the new one.
+                        Err(_) => {
+                            gloo_timer_sleep(ORG_PULL_MS).await.ok();
+                            break;
+                        }
+                        Ok(_) => break,
+                    }
+                }
+            }
+        });
+        Self {
+            lifecycle,
+            registration,
+            service: service_name,
+            closed,
+        }
+    }
+
+    /// Close the registration (C9's protected split: its live calls
+    /// retire with their exact terminals; new openings are refused).
+    pub(crate) fn close(&self) {
+        self.closed.set(true);
+        let lifecycle = self.lifecycle.clone();
+        let registration = self.registration;
+        let service = self.service.clone();
+        spawn_local(async move {
+            let _ = lifecycle
+                .request(LeaderRequest::OrgServeUnregister {
+                    registration,
+                    service,
+                })
+                .await;
+        });
+    }
+}
+
+/// The shape tag a registration rides.
+fn shape_tag(shape: crate::wasm::HandlerShape) -> &'static str {
+    match shape {
+        crate::wasm::HandlerShape::Unary => "unary",
+        crate::wasm::HandlerShape::Streaming => "server-streaming",
+        crate::wasm::HandlerShape::ClientStream => "client-streaming",
+        crate::wasm::HandlerShape::Duplex => "duplex",
+    }
+}
+
+/// Read the `0x03 ‖ { call, caller }` accept envelope.
+fn decode_admitted(payload: &[u8]) -> Option<(u64, String)> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let call = value.get("call")?.as_str()?.parse::<u64>().ok()?;
+    let caller = value.get("caller")?.to_string();
+    Some((call, caller))
+}
+
+/// The leader-side relay for proxied org calls and serves.
+///
+/// Attribution, enforced here: every entry is keyed by the
+/// FOLLOWER's self-minted id — the per-follower handle — and a
+/// request for an id this relay never minted owns nothing ("no org
+/// call for handle N", never another follower's call under the same
+/// id). That is exactly the required witness inverse.
+#[derive(Default)]
+pub(crate) struct OrgRelay {
+    /// The node-side guards for follower calls (streaming shapes).
+    calls: HashMap<u64, crate::wasm::OrgBackendCall>,
+    /// Served calls a follower's handler drives: bridge-call id →
+    /// (registration, the real [`crate::rpc_serve::ServeCall`]).
+    serve_calls: HashMap<u64, (u64, crate::rpc_serve::ServeCall)>,
+    /// Per-registration queues of admitted calls awaiting an accept.
+    accepts: HashMap<u64, VecDeque<u64>>,
+    /// The next bridge-call id. Monotonic, never reused.
+    next_serve_call: u64,
+}
+
+/// The node-side call id behind a follower's streaming handle, if it
+/// is live here.
+fn relay_stream_call(org: &Rc<RefCell<OrgRelay>>, call: u64) -> Option<u64> {
+    match org.borrow().calls.get(&call) {
+        Some(crate::wasm::OrgBackendCall::Streaming(handle)) => Some(handle.call_id),
+        _ => None,
+    }
+}
+
+/// The typed "your call is closed" failure for an unknown handle —
+/// "no org call for handle N", never another call's.
+fn no_such_call(call: u64) -> ProxyFailure {
+    ProxyFailure::Typed(LeafError::Session(format!(
+        "no org call for handle {call}"
+    )))
+}
+
+#[wasm_bindgen]
+impl MeshSession {
+    /// One org-scoped unary call through the shared session.
+    ///
+    /// Identical contract to [`crate::wasm::LeafNode::call_org`] —
+    /// the deadline is absolute, a frozen tab gets no lease
+    /// extension, and nothing here ever resumes a retired call. On a
+    /// follower the request crosses the proxy with the caller's
+    /// proofs as opaque credential bytes (the leader's node mints the
+    /// signed opening — the entity key never leaves a node); a
+    /// generation move mid-call fails typed `LeaderLost` and is never
+    /// resumed, and a retained handle from an older generation
+    /// refuses rather than addressing a successor's call.
+    pub async fn call_org(
+        &self,
+        service: String,
+        payload: Uint8Array,
+        opts: JsValue,
+    ) -> Result<Uint8Array, JsError> {
+        let options = crate::wasm::org_call_options(&opts)?;
+        options.within_provider_cap()?;
+        let call = next_org_id().map_err(js)?;
+        let request = org_call_request("unary", call, &service, &payload.to_vec(), &options);
+        match self.lifecycle.request(request).await {
+            Ok(ProxyValue::Bytes(payload)) => {
+                match decode_org_envelope(&payload)? {
+                    crate::wasm::OrgPoll::Terminal(StreamTerminal::Completed { body }) => {
+                        Ok(Uint8Array::from(&body[..]))
+                    }
+                    crate::wasm::OrgPoll::Terminal(other) => {
+                        Err(crate::wasm::terminal_js_error(&other))
+                    }
+                    _ => Err(JsError::new("the unary reply arrived as an item")),
+                }
+            }
+            Ok(_) => Err(JsError::new("org_call answered an unexpected value")),
+            Err(failure) => Err(failure_rejection(&failure)),
+        }
+    }
+
+    /// One org-scoped server-streaming call through the shared
+    /// session. See [`Self::call_org`] for the deadline, suspension
+    /// and closure contract. An opening denial REJECTS this promise;
+    /// the typed terminal error arrives as the stream's final
+    /// `next()` item.
+    pub async fn call_org_streaming(
+        &self,
+        service: String,
+        payload: Uint8Array,
+        opts: JsValue,
+    ) -> Result<crate::wasm::OrgByteStreamHandle, JsError> {
+        let options = crate::wasm::org_call_options(&opts)?;
+        options.within_provider_cap()?;
+        let call = next_org_id().map_err(js)?;
+        let request =
+            org_call_request("server-streaming", call, &service, &payload.to_vec(), &options);
+        self.open_proxy_call(request, call).await
+    }
+
+    /// One org-scoped client-streaming call through the shared
+    /// session. See [`Self::call_org`] for the contract.
+    pub async fn call_org_client_stream(
+        &self,
+        service: String,
+        opts: JsValue,
+    ) -> Result<crate::wasm::OrgUploadCallHandle, JsError> {
+        let options = crate::wasm::org_call_options(&opts)?;
+        options.within_provider_cap()?;
+        let call = next_org_id().map_err(js)?;
+        let request = org_call_request("client-streaming", call, &service, &[], &options);
+        self.open_proxy_call(request, call).await
+    }
+
+    /// One org-scoped duplex call through the shared session. See
+    /// [`Self::call_org`] for the contract.
+    pub async fn call_org_duplex(
+        &self,
+        service: String,
+        opts: JsValue,
+    ) -> Result<crate::wasm::OrgDuplexCallHandle, JsError> {
+        let options = crate::wasm::org_call_options(&opts)?;
+        options.within_provider_cap()?;
+        let call = next_org_id().map_err(js)?;
+        let request = org_call_request("duplex", call, &service, &[], &options);
+        self.open_proxy_call(request, call).await
+    }
+
+    /// Serve one org-scoped unary service through the shared
+    /// session: `handler(caller, request)` resolves the response
+    /// body. The registration rides the proxy registry and its
+    /// inbound calls dispatch to THIS follower's handle and no other.
+    ///
+    /// # The handler-drop contract (F-S3.1-2)
+    ///
+    /// The retire supervisor may drop the handler future without a
+    /// final poll — cancellation is observed through the retirement
+    /// observables (the terminal item, the sink's typed closed
+    /// refusal, and `retired`), never assumed as a handler-side
+    /// event; a detached observer holding `retired` observes the
+    /// signal. After retirement the handler sees typed refusals and
+    /// its return value is discarded — the terminal was already
+    /// sent. Closing the returned handle retires this registration's
+    /// live protected calls with their exact terminals and refuses
+    /// new openings (C9's protected split).
+    pub fn serve_org(
+        &self,
+        service: String,
+        access: String,
+        handler: Function,
+        opts: JsValue,
+    ) -> Result<crate::wasm::OrgServeHandle, JsError> {
+        self.serve_org_with(
+            &service,
+            &access,
+            handler,
+            opts,
+            crate::wasm::HandlerShape::Unary,
+        )
+    }
+
+    /// Serve one org-scoped server-streaming service through the
+    /// shared session. See [`Self::serve_org`] for the handler-drop
+    /// contract and the close semantics.
+    pub fn serve_org_streaming(
+        &self,
+        service: String,
+        access: String,
+        handler: Function,
+        opts: JsValue,
+    ) -> Result<crate::wasm::OrgServeHandle, JsError> {
+        self.serve_org_with(
+            &service,
+            &access,
+            handler,
+            opts,
+            crate::wasm::HandlerShape::Streaming,
+        )
+    }
+
+    /// Serve one org-scoped client-streaming service through the
+    /// shared session. See [`Self::serve_org`] for the handler-drop
+    /// contract and the close semantics.
+    pub fn serve_org_client_stream(
+        &self,
+        service: String,
+        access: String,
+        handler: Function,
+        opts: JsValue,
+    ) -> Result<crate::wasm::OrgServeHandle, JsError> {
+        self.serve_org_with(
+            &service,
+            &access,
+            handler,
+            opts,
+            crate::wasm::HandlerShape::ClientStream,
+        )
+    }
+
+    /// Serve one org-scoped duplex service through the shared
+    /// session. See [`Self::serve_org`] for the handler-drop
+    /// contract and the close semantics.
+    pub fn serve_org_duplex(
+        &self,
+        service: String,
+        access: String,
+        handler: Function,
+        opts: JsValue,
+    ) -> Result<crate::wasm::OrgServeHandle, JsError> {
+        self.serve_org_with(
+            &service,
+            &access,
+            handler,
+            opts,
+            crate::wasm::HandlerShape::Duplex,
+        )
+    }
+}
+
+impl MeshSession {
+    /// Open a proxied streaming call and wrap its handle.
+    async fn open_proxy_call<T: ProxyCallHandle>(
+        &self,
+        request: LeaderRequest,
+        call: u64,
+    ) -> Result<T, JsError> {
+        match self.lifecycle.request(request).await {
+            Ok(ProxyValue::Bytes(_)) => {
+                let proxy = ProxyOrgCall::new(self.lifecycle.clone(), call);
+                Ok(T::wrap(Rc::new(crate::wasm::OrgCall::proxied(proxy))))
+            }
+            Ok(_) => Err(JsError::new("org_call answered an unexpected value")),
+            Err(failure) => Err(failure_rejection(&failure)),
+        }
+    }
+
+    /// Register one serve verb and wrap its handle.
+    fn serve_org_with(
+        &self,
+        service: &str,
+        access: &str,
+        handler: Function,
+        opts: JsValue,
+        shape: crate::wasm::HandlerShape,
+    ) -> Result<crate::wasm::OrgServeHandle, JsError> {
+        let serve = crate::wasm::org_serve_options(&opts)?;
+        let registration = next_org_id().map_err(js)?;
+        let proxy = ProxyOrgServe::start(
+            self.lifecycle.clone(),
+            registration,
+            service,
+            access,
+            &serve.owner_org,
+            shape,
+            handler,
+        );
+        Ok(crate::wasm::OrgServeHandle::proxied(
+            service.to_string(),
+            proxy,
+        ))
+    }
+}
+
+/// The three caller-side streaming handle constructors, for
+/// [`MeshSession::open_proxy_call`]'s generic return.
+pub(crate) trait ProxyCallHandle {
+    /// Wrap the shared call state.
+    fn wrap(call: Rc<crate::wasm::OrgCall>) -> Self;
+}
+
+impl ProxyCallHandle for crate::wasm::OrgByteStreamHandle {
+    fn wrap(call: Rc<crate::wasm::OrgCall>) -> Self {
+        crate::wasm::OrgByteStreamHandle::from_call(call)
+    }
+}
+
+impl ProxyCallHandle for crate::wasm::OrgUploadCallHandle {
+    fn wrap(call: Rc<crate::wasm::OrgCall>) -> Self {
+        crate::wasm::OrgUploadCallHandle::from_call(call)
+    }
+}
+
+impl ProxyCallHandle for crate::wasm::OrgDuplexCallHandle {
+    fn wrap(call: Rc<crate::wasm::OrgCall>) -> Self {
+        crate::wasm::OrgDuplexCallHandle::from_call(call)
+    }
+}
+
+/// The `OrgCall` request for one proxied call.
+fn org_call_request(
+    shape: &str,
+    call: u64,
+    service: &str,
+    body: &[u8],
+    options: &crate::wasm::OrgCallOptions,
+) -> LeaderRequest {
+    let credentials = &options.credentials;
+    LeaderRequest::OrgCall {
+        call,
+        shape: shape.to_string(),
+        service: service.to_string(),
+        body: Bytes::copy_from_slice(body),
+        membership: Bytes::copy_from_slice(&credentials.membership),
+        dispatcher: Bytes::copy_from_slice(&credentials.dispatcher),
+        capability_grant: credentials
+            .capability_grant
+            .as_deref()
+            .map(Bytes::copy_from_slice),
+        acting_org: credentials.acting_org.clone(),
+        provider_org: credentials.provider_owner_org.clone(),
+        provider: credentials.provider.clone(),
+        ttl_secs: credentials.proof_ttl_secs.unwrap_or(30),
+        deadline_ns: options.deadline_ns(),
+        timeout_ms: u32::try_from(
+            options
+                .deadline_ms
+                .unwrap_or(crate::wasm::ORG_DEFAULT_LIVE_NS / 1_000_000),
+        )
+        .ok(),
+        stream_window_initial: options.stream_window_initial,
+        request_window_initial: options.request_window_initial,
+    }
 }
 
 fn now_ms() -> f64 {

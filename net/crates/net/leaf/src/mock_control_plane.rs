@@ -77,6 +77,12 @@ pub enum CarriedKind {
     /// A signed `0x0D02` envelope: an offer, an answer, one
     /// candidate, or a reject.
     Signal(SignalKind),
+    /// An organization root's signed revocation-floor bundle, carried
+    /// verbatim to one leaf. Signed control material like an
+    /// announcement — the carrier cannot forge one and the leaf
+    /// verifies it — which is why it is signalling and the tripwire
+    /// below still applies to its bytes.
+    Revocation,
     /// **A tripwire hit.** Something that parses as a Net packet was
     /// handed to the mock to carry. It was refused, and it is in the
     /// ledger so the refusal cannot be swallowed silently.
@@ -93,12 +99,15 @@ impl CarriedKind {
             Self::Signal(SignalKind::Answer) => "signal:answer",
             Self::Signal(SignalKind::Candidate) => "signal:candidate",
             Self::Signal(SignalKind::Reject) => "signal:reject",
+            Self::Revocation => "revocation",
             Self::RefusedNetPacket => "REFUSED-NET-PACKET",
         }
     }
 
-    /// Whether this kind is signalling — i.e. one of the four things
-    /// a control plane is allowed to carry.
+    /// Whether this kind is signalling — i.e. one of the things a
+    /// control plane is allowed to carry: the four `0x0D02` kinds,
+    /// announcements and their query replies, and the org-root-signed
+    /// revocation facts feed.
     ///
     /// The assertion a test makes over
     /// [`MockMesh::carried_kinds`]. [`Self::RefusedNetPacket`] is
@@ -106,7 +115,7 @@ impl CarriedKind {
     pub const fn is_signalling(self) -> bool {
         matches!(
             self,
-            Self::Announcement | Self::QueryReply | Self::Signal(_)
+            Self::Announcement | Self::QueryReply | Self::Signal(_) | Self::Revocation
         )
     }
 }
@@ -141,6 +150,11 @@ struct MeshState {
     /// is told, because the publisher hands it over separately. The
     /// bytes themselves are never parsed here.
     store: RefCell<Vec<(NodeId, SignedAnnouncement)>>,
+    /// Per-node revocation-facts queues, drained by
+    /// `take_revocation_bundles`. Verbatim bytes: the carrier never
+    /// reads inside a bundle, exactly as it never reads inside an
+    /// announcement.
+    revocations: RefCell<HashMap<NodeId, VecDeque<Vec<u8>>>>,
     /// The ledger.
     log: RefCell<Vec<Carried>>,
 }
@@ -165,6 +179,7 @@ impl MockMesh {
                 admitted: RefCell::new(HashMap::new()),
                 inboxes: RefCell::new(HashMap::new()),
                 store: RefCell::new(Vec::new()),
+                revocations: RefCell::new(HashMap::new()),
                 log: RefCell::new(Vec::new()),
             }),
         }
@@ -192,6 +207,60 @@ impl MockMesh {
     /// The ledger, in order.
     pub fn carried(&self) -> Vec<Carried> {
         self.state.log.borrow().clone()
+    }
+
+    /// Carry one org-root-signed revocation bundle to `to`, verbatim,
+    /// exactly as the anchor's control socket would.
+    ///
+    /// The carrier is the org operator's feed endpoint here: the
+    /// bundle arrives already signed by the organization root and the
+    /// leaf verifies it — the mock carries and accounts, and can
+    /// therefore no more forge a floor than it can forge an
+    /// announcement. A Net-packet-shaped bundle hits the same tripwire
+    /// every other carry does: the feed's payload is control material
+    /// or it is refused, and the refusal is on the ledger.
+    pub fn deliver_revocation(&self, to: NodeId, bundle: Vec<u8>) -> Result<()> {
+        if !self.state.admitted.borrow().contains_key(&to) {
+            return Err(refused(&format!(
+                "{to:#018x} was never admitted to this mesh — every member is \
+                 provisioned explicitly by the test"
+            )));
+        }
+        if looks_like_a_net_packet(&bundle) {
+            let mut log = self.state.log.borrow_mut();
+            let seq = log.len() + 1;
+            log.push(Carried {
+                seq,
+                kind: CarriedKind::RefusedNetPacket,
+                from: None,
+                to: Some(to),
+                bytes: bundle.len(),
+            });
+            return Err(refused(
+                "that is a Net packet. A control plane carries signalling — SDP, \
+                 candidates, signed announcements, signed envelopes, signed \
+                 revocation bundles — and a control plane that forwarded packets \
+                 would be a relay wearing a trait",
+            ));
+        }
+        {
+            let mut log = self.state.log.borrow_mut();
+            let seq = log.len() + 1;
+            log.push(Carried {
+                seq,
+                kind: CarriedKind::Revocation,
+                from: None,
+                to: Some(to),
+                bytes: bundle.len(),
+            });
+        }
+        self.state
+            .revocations
+            .borrow_mut()
+            .entry(to)
+            .or_default()
+            .push_back(bundle);
+        Ok(())
     }
 
     /// The distinct kinds that crossed.
@@ -440,6 +509,15 @@ impl ControlPlane for MockControlPlane {
             .map(|queue| queue.drain(..).collect())
             .unwrap_or_default()
     }
+
+    fn take_revocation_bundles(&mut self) -> Vec<Vec<u8>> {
+        self.state
+            .revocations
+            .borrow_mut()
+            .get_mut(&self.node)
+            .map(|queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Does this blob start with a Net packet header?
@@ -653,6 +731,60 @@ mod tests {
         assert!(table.contains("signal:candidate"), "{table}");
         assert!(table.contains("A -> B"), "{table}");
         assert_eq!(mesh.carried_bytes(), encoded.len());
+    }
+
+    #[test]
+    fn a_revocation_bundle_is_carried_verbatim_accounted_and_takeable_once() {
+        let mesh = MockMesh::new();
+        let mut a = mesh.admit(A, "A");
+        mesh.admit(B, "B");
+        let bundle = vec![0x51, 0x52, 0x53, 0x99];
+        mesh.deliver_revocation(A, bundle.clone()).expect("carry");
+        assert_eq!(
+            a.take_revocation_bundles(),
+            vec![bundle],
+            "exact bytes, in arrival order"
+        );
+        assert_eq!(
+            a.take_revocation_bundles(),
+            Vec::<Vec<u8>>::new(),
+            "taken once — the feed is a take, not a peek"
+        );
+        let carried = mesh.carried();
+        assert_eq!(carried.len(), 1, "one leg crossed");
+        assert_eq!(carried[0].kind, CarriedKind::Revocation);
+        assert_eq!(carried[0].to, Some(A));
+        assert_eq!(carried[0].bytes, 4, "the ledger counts exactly what crossed");
+        assert!(
+            carried[0].kind.is_signalling(),
+            "a signed facts feed is control material, not a packet"
+        );
+    }
+
+    #[test]
+    fn a_net_packet_cannot_be_fed_as_a_revocation_bundle() {
+        let mesh = MockMesh::new();
+        let mut a = mesh.admit(A, "A");
+        let mut packet = vec![0u8; net_wire::protocol::HEADER_SIZE];
+        packet[0..2].copy_from_slice(&net_wire::protocol::MAGIC.to_le_bytes());
+        packet[2] = net_wire::protocol::VERSION;
+        let error = mesh
+            .deliver_revocation(A, packet)
+            .expect_err("the tripwire fires on the feed too");
+        assert!(
+            matches!(error, LeafError::ControlPlane(_)),
+            "typed refusal: {error}"
+        );
+        assert_eq!(
+            a.take_revocation_bundles(),
+            Vec::<Vec<u8>>::new(),
+            "nothing was queued for a refused carry"
+        );
+        assert_eq!(
+            mesh.carried_kinds(),
+            BTreeSet::from([CarriedKind::RefusedNetPacket]),
+            "the refusal is on the ledger and nothing else crossed"
+        );
     }
 
     /// Every future this type returns is already complete, so a test

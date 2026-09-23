@@ -16,8 +16,26 @@
  */
 
 import { streamDataEvent } from './leaf-abi.js';
+import {
+  FakeOrgByteStreamHandle,
+  FakeOrgDuplexCallHandle,
+  FakeOrgServeHandle,
+  FakeOrgUploadCallHandle,
+} from './fake-wasm.js';
 import type {
   LeafWasmStreamOptions,
+  LeafWasmOrgAccess,
+  LeafWasmOrgByteStreamHandle,
+  LeafWasmOrgCallOptions,
+  LeafWasmOrgClientStreamHandler,
+  LeafWasmOrgDuplexCallHandle,
+  LeafWasmOrgDuplexHandler,
+  LeafWasmOrgResponseSinkHandle,
+  LeafWasmOrgStreamingHandler,
+  LeafWasmOrgUnaryHandler,
+  LeafWasmOrgUploadCallHandle,
+  LeafWasmOrgServeHandle,
+  LeafWasmOrgServeOptions,
   LeafWasmProxyStream,
   StreamCallbackPayload,
 } from '../src/wasm.js';
@@ -103,6 +121,14 @@ export interface FakeSessionBehaviour {
   enrollError?: unknown;
   streamError?: unknown;
   streamSendError?: unknown;
+  // ── The eight org verbs ──
+  /** Thrown by `call_org`, as `wasm-bindgen` would: an `Error` with Display text. */
+  orgCallError?: unknown;
+  orgCallReply?: Uint8Array;
+  /** Thrown by the three stream openers. */
+  orgOpenError?: unknown;
+  /** Thrown by the four serve registrations. */
+  orgServeError?: unknown;
 }
 
 export class FakeSession implements LeafWasmSession {
@@ -262,6 +288,170 @@ export class FakeSession implements LeafWasmSession {
     const stream = new FakeProxyStream(options, this.behaviour.streamSendError ?? null);
     this.streams.push(stream);
     return stream;
+  }
+
+  // ── The eight org verbs (plan §4.5) ──
+  //
+  // Faked at the Rust shape, and parked like a follower's proxy round
+  // trip so a test can move the generation while an open is in
+  // flight — the leader-replacement disposition under test.
+  readonly orgCalls: Array<{ service: string; payload: Uint8Array; options: LeafWasmOrgCallOptions }> = [];
+  readonly orgStreamOpens: Array<{ service: string; payload: Uint8Array; options: LeafWasmOrgCallOptions }> = [];
+  readonly orgUploadOpens: Array<{ service: string; options: LeafWasmOrgCallOptions }> = [];
+  readonly orgDuplexOpens: Array<{ service: string; options: LeafWasmOrgCallOptions }> = [];
+  readonly orgStreamHandles: FakeOrgByteStreamHandle[] = [];
+  readonly orgUploadHandles: FakeOrgUploadCallHandle[] = [];
+  readonly orgDuplexCallHandles: FakeOrgDuplexCallHandle[] = [];
+  readonly orgServeHandles: FakeOrgServeHandle[] = [];
+  readonly orgUnaryServes: Array<{
+    service: string;
+    access: LeafWasmOrgAccess;
+    handler: LeafWasmOrgUnaryHandler;
+    options: LeafWasmOrgServeOptions;
+    handle: FakeOrgServeHandle;
+  }> = [];
+  readonly orgStreamingServes: Array<{
+    service: string;
+    access: LeafWasmOrgAccess;
+    handler: LeafWasmOrgStreamingHandler;
+    options: LeafWasmOrgServeOptions;
+    handle: FakeOrgServeHandle;
+  }> = [];
+  readonly orgClientStreamServes: Array<{
+    service: string;
+    access: LeafWasmOrgAccess;
+    handler: LeafWasmOrgClientStreamHandler;
+    options: LeafWasmOrgServeOptions;
+    handle: FakeOrgServeHandle;
+  }> = [];
+  readonly orgDuplexServes: Array<{
+    service: string;
+    access: LeafWasmOrgAccess;
+    handler: LeafWasmOrgDuplexHandler;
+    options: LeafWasmOrgServeOptions;
+    handle: FakeOrgServeHandle;
+  }> = [];
+  /**
+   * Held by the next org open or call, so a test can have one in
+   * flight across a generation move.
+   */
+  private orgOpenBarrier: Promise<void> | null = null;
+
+  /** Park the next org call/open the way a proxied round trip parks. */
+  parkNextOrgOpen(): () => void {
+    let release = (): void => {};
+    this.orgOpenBarrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return release;
+  }
+
+  async call_org(
+    service: string,
+    payload: Uint8Array,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<Uint8Array> {
+    this.orgCalls.push({ service, payload, options });
+    await this.awaitOrgOpen();
+    if (this.behaviour.orgCallError !== undefined) throw this.behaviour.orgCallError;
+    return this.behaviour.orgCallReply ?? new Uint8Array([7]);
+  }
+
+  async call_org_streaming(
+    service: string,
+    payload: Uint8Array,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgByteStreamHandle> {
+    this.orgStreamOpens.push({ service, payload, options });
+    await this.awaitOrgOpen();
+    if (this.behaviour.orgOpenError !== undefined) throw this.behaviour.orgOpenError;
+    const handle = new FakeOrgByteStreamHandle();
+    this.orgStreamHandles.push(handle);
+    return handle;
+  }
+
+  async call_org_client_stream(
+    service: string,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgUploadCallHandle> {
+    this.orgUploadOpens.push({ service, options });
+    await this.awaitOrgOpen();
+    if (this.behaviour.orgOpenError !== undefined) throw this.behaviour.orgOpenError;
+    const handle = new FakeOrgUploadCallHandle();
+    this.orgUploadHandles.push(handle);
+    return handle;
+  }
+
+  async call_org_duplex(
+    service: string,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgDuplexCallHandle> {
+    this.orgDuplexOpens.push({ service, options });
+    await this.awaitOrgOpen();
+    if (this.behaviour.orgOpenError !== undefined) throw this.behaviour.orgOpenError;
+    const handle = new FakeOrgDuplexCallHandle();
+    this.orgDuplexCallHandles.push(handle);
+    return handle;
+  }
+
+  serve_org(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgUnaryHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle {
+    if (this.behaviour.orgServeError !== undefined) throw this.behaviour.orgServeError;
+    const handle = new FakeOrgServeHandle(service);
+    this.orgUnaryServes.push({ service, access, handler, options, handle });
+    this.orgServeHandles.push(handle);
+    return handle;
+  }
+
+  serve_org_streaming(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgStreamingHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle {
+    if (this.behaviour.orgServeError !== undefined) throw this.behaviour.orgServeError;
+    const handle = new FakeOrgServeHandle(service);
+    this.orgStreamingServes.push({ service, access, handler, options, handle });
+    this.orgServeHandles.push(handle);
+    return handle;
+  }
+
+  serve_org_client_stream(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgClientStreamHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle {
+    if (this.behaviour.orgServeError !== undefined) throw this.behaviour.orgServeError;
+    const handle = new FakeOrgServeHandle(service);
+    this.orgClientStreamServes.push({ service, access, handler, options, handle });
+    this.orgServeHandles.push(handle);
+    return handle;
+  }
+
+  serve_org_duplex(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgDuplexHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle {
+    if (this.behaviour.orgServeError !== undefined) throw this.behaviour.orgServeError;
+    const handle = new FakeOrgServeHandle(service);
+    this.orgDuplexServes.push({ service, access, handler, options, handle });
+    this.orgServeHandles.push(handle);
+    return handle;
+  }
+
+  /** Release the parked round trip, if one is armed. */
+  private async awaitOrgOpen(): Promise<void> {
+    const parked = this.orgOpenBarrier;
+    if (!parked) return;
+    this.orgOpenBarrier = null;
+    await parked;
   }
 
   on_event(callback: (json: string) => void): void {

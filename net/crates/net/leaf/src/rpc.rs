@@ -215,8 +215,23 @@ impl CallTable {
         presented: CallOwner,
         counters: &LeafCounters,
     ) -> bool {
-        let call_id = match &frame {
-            RpcFrame::Response { call_id, .. } | RpcFrame::DeadlineExceeded { call_id } => *call_id,
+        // Only a RESPONSE or a DEADLINE_EXCEEDED completes a unary
+        // call. The streaming dispatches (CANCEL, STREAM_GRANT,
+        // REQUEST_CHUNK, REQUEST_GRANT) and a REQUEST are not replies
+        // for this table — the per-shape tables in [`crate::rpc_stream`]
+        // and [`crate::rpc_serve`] own those — so they neither complete
+        // a call nor take its slot, whatever `call_id` they carry.
+        let (call_id, reply) = match frame {
+            RpcFrame::Response { call_id, payload } => (call_id, Some(payload)),
+            RpcFrame::DeadlineExceeded { call_id } => (call_id, None),
+            RpcFrame::Request(_)
+            | RpcFrame::Cancel { .. }
+            | RpcFrame::StreamGrant { .. }
+            | RpcFrame::RequestChunk(_)
+            | RpcFrame::RequestGrant(_) => {
+                counters.drop_for(DropReason::UnknownCall);
+                return false;
+            }
         };
         match self.pending.get(&call_id) {
             Some(pending) if pending.owner == presented => {}
@@ -229,9 +244,9 @@ impl CallTable {
             counters.drop_for(DropReason::UnknownCall);
             return false;
         };
-        let outcome = match frame {
-            RpcFrame::DeadlineExceeded { .. } => Err(RpcError::Timeout),
-            RpcFrame::Response { payload, .. } => {
+        let outcome = match reply {
+            None => Err(RpcError::Timeout),
+            Some(payload) => {
                 if payload.status.is_ok() {
                     Ok(payload.body)
                 } else {

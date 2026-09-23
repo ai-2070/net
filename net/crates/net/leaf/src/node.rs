@@ -31,8 +31,16 @@ use crate::establish::{
 };
 use crate::frame::{PieceMeta, Reassembler};
 use crate::identity::{unhex, LeafIdentity};
+use crate::org::cert::OrgRevocationBundle;
+use crate::org::entity::EntityId;
+use crate::org::proof::RpcCallShape;
 use crate::rpc::{CallOwner, CallResult, CallTable, DEFAULT_CALL_TIMEOUT_MS};
-use crate::rpc_wire::{self, RpcRequestPayload};
+use crate::rpc_serve::{ServeAdmission, ServeHandler, ServeOptions, ServePeer};
+use crate::rpc_stream::{
+    attach_signed_admission, CallHandle, CallOpenError, CallPin, OrgCallIntent,
+    RetireReason, SinkError, StreamOpen, StreamTerminal,
+};
+use crate::rpc_wire::{self, EventMeta, RpcFrame, RpcRequestPayload, RpcStatus};
 use crate::session::{event_frame_bytes, rtc_addr, PendingHandshake, SessionTable};
 use crate::signal::{self, SeenSignals};
 use crate::stream::{stream_id_from_label, Reliability, RxStream, StreamRecord};
@@ -558,6 +566,28 @@ pub struct LeafNode {
     /// [`Self::open_stream`] clears the id, and the reopened
     /// consumer resumes at the peer's next sequence.
     rx_closed: std::collections::HashSet<(u64, u64)>,
+    /// The org-scoped streaming **caller** half: one sans-IO state
+    /// machine per shape, its frames pumped onto the event plane
+    /// beside the unary call table ([`crate::rpc_stream`]).
+    org_calls: crate::rpc_stream::StreamCallRegistry,
+    /// The org-scoped streaming **provider** half: served services and
+    /// every live protected call keyed `(peer, incarnation, call_id)`
+    /// ([`crate::rpc_serve`]).
+    org_serves: crate::rpc_serve::ServeRegistry,
+    /// `(peer, request-channel stream id)` → the service it serves:
+    /// the SERVED plane's carrier registry, beside
+    /// [`Self::rpc_reply_carriers`]. Written only by [`Self::org_serve`]
+    /// and [`Self::resubscribe_served`]; exactly one plane owner per
+    /// carrier.
+    served_carriers: HashMap<(NodeId, u64), String>,
+    /// This leaf's entity as the org authority sees it
+    /// (`AdmissionContext::provider`).
+    org_entity: EntityId,
+    /// The merged raise-only revocation view admission consults; fed
+    /// by [`Self::ingest_org_revocation_bundle`].
+    org_revocation: crate::org::revocation::RevocationFacts,
+    /// The replay guard (insert-or-deny at admission step 10).
+    org_replay: crate::org::replay::AdmissionReplayGuard,
 }
 
 impl LeafNode {
@@ -566,6 +596,12 @@ impl LeafNode {
     /// `call_id_seed` seeds the call table — see
     /// [`CallTable::with_seed`] for why it is not zero.
     pub fn new(identity: LeafIdentity, call_id_seed: u64) -> Self {
+        let org_entity = EntityId::from_bytes(*identity.entity().entity_id());
+        let org_calls = crate::rpc_stream::StreamCallRegistry::new(
+            identity.origin_hash(),
+            call_id_seed,
+        );
+        let org_serves = crate::rpc_serve::ServeRegistry::new(identity.origin_hash());
         Self {
             identity,
             sessions: SessionTable::new(),
@@ -593,6 +629,12 @@ impl LeafNode {
             recv_failed: std::collections::HashSet::new(),
             rx_closed: std::collections::HashSet::new(),
             delegation_chain: None,
+            org_calls,
+            org_serves,
+            served_carriers: HashMap::new(),
+            org_entity,
+            org_revocation: crate::org::revocation::RevocationFacts::default(),
+            org_replay: crate::org::replay::AdmissionReplayGuard::with_defaults(),
         }
     }
 
@@ -1188,14 +1230,25 @@ impl LeafNode {
     fn install_session(&mut self, peer: NodeId, session: crate::session::LeafSession) {
         let replaced = self.sessions.install(session);
         if let Some(old) = replaced {
+            // A superseded incarnation retires `Replaced` — typed, and
+            // first writer wins over the teardown reason inside
+            // `retire_incarnation`.
+            self.org_calls
+                .fail_incarnation(old.incarnation(), RetireReason::Replaced);
+            self.org_serves
+                .fail_incarnation(old.incarnation(), RetireReason::Replaced);
             self.retire_incarnation(old.incarnation());
             // The peer's roster entry went with the old session, so
             // a reply channel subscribed on it is not subscribed on
             // this one.
             self.reply_subscriptions.retain(|(p, _)| *p != peer);
             self.rpc_reply_carriers.retain(|(p, _)| *p != peer);
+            self.served_carriers.retain(|(p, _), _| *p != peer);
             self.stream_kinds.retain(|(p, _), _| *p != peer);
         }
+        // A fresh session carries no channel roster: every service
+        // this leaf serves must re-claim its request carrier on it.
+        self.resubscribe_served(peer);
         self.events.push(LeafEvent::Connected {
             node_id: self.identity.node_id(),
             peer_node: peer,
@@ -1213,6 +1266,14 @@ impl LeafNode {
         self.rx_closed.retain(|(i, _)| *i != incarnation);
         self.reassembler.retire(incarnation);
         self.calls.fail_incarnation(incarnation);
+        // The org-scoped halves retire with the incarnation exactly
+        // once (first writer wins: a supersession's `Replaced` reason
+        // outranks this teardown's `SessionLost` when both run).
+        self.org_calls
+            .fail_incarnation(incarnation, RetireReason::SessionLost);
+        self.org_serves
+            .fail_incarnation(incarnation, RetireReason::SessionLost);
+        self.pump_org_frames();
     }
 
     /// Tear down the session with `peer`.
@@ -1233,7 +1294,10 @@ impl LeafNode {
         // incarnation to retire it; the peer is still the right key
         // for those.
         self.calls.fail_peer(peer);
+        self.org_calls.fail_peer(peer, RetireReason::SessionLost);
+        self.org_serves.fail_peer(peer, RetireReason::SessionLost);
         self.stream_kinds.retain(|(p, _), _| *p != peer);
+        self.served_carriers.retain(|(p, _), _| *p != peer);
         // The anchor's roster entry died with the session, so a
         // reconnect must re-subscribe or its replies strand again.
         self.reply_subscriptions.retain(|(p, _)| *p != peer);
@@ -1253,7 +1317,14 @@ impl LeafNode {
     /// §8's disposition rule: the caller is told which generation
     /// owned the call and decides. Nothing is re-issued.
     pub fn fail_calls_on_leader_loss(&mut self, generation: u64) -> usize {
-        self.calls.fail_all(RpcError::LeaderLost { generation })
+        let unary = self.calls.fail_all(RpcError::LeaderLost { generation });
+        // Typed failures, no CANCELs: the transport is gone with the
+        // identity (§4.3's handle-drop contract is for live handles on
+        // live transports only).
+        let streaming = self.org_calls.fail_all(RetireReason::LeaderLost);
+        let serving = self.org_serves.fail_all(RetireReason::LeaderLost);
+        self.pump_org_frames();
+        unary + streaming + serving
     }
 
     /// Periodic work: expire call deadlines and stale reassemblies,
@@ -1290,6 +1361,15 @@ impl LeafNode {
         self.sweep_reassemblies(now);
         self.sweep_provisional(now);
         self.drive_reliability();
+        // The org-scoped halves sweep their ABSOLUTE deadlines on the
+        // wall clock (§4.5: a frozen tab's ticker stopping extends
+        // nothing — the first sweep after wake retires everything
+        // overdue with its deadline terminal), then pump their queued
+        // frames. There is no automatic resume, ever.
+        let now_unix_ns = clock::now_unix_nanos();
+        self.org_calls.advance(now_unix_ns);
+        self.org_serves.advance(now_unix_ns);
+        self.pump_org_frames();
         expired.len()
     }
 
@@ -1864,6 +1944,472 @@ impl LeafNode {
     /// call to `service` can be answered.
     pub fn reply_channel_for(&self, service: &str) -> Result<String> {
         reply_channel(service, self.identity.origin_hash()).map(|c| c.as_str().to_string())
+    }
+
+    /// The TOFU-pinned entity of `peer`, from the verified announcement
+    /// this leaf holds (signature and R1 node-id binding verified at
+    /// ingest) — the AEAD-authenticated attribution fact the org paths
+    /// key on, never a wire claim.
+    pub fn peer_entity_id(&self, peer: NodeId) -> Option<EntityId> {
+        let announcement = self.announcements.get(peer)?;
+        let bytes = unhex(&announcement.entity_id).ok()?;
+        let array: [u8; 32] = bytes.as_slice().try_into().ok()?;
+        Some(EntityId::from_bytes(array))
+    }
+
+    /// The receiving session's full Noise handshake hash — the §1.3
+    /// session binding a streaming proof signs (the core's
+    /// `MeshNode::peer_session_binding` seam). `None` for a hand-built
+    /// session, which can never admit a protected stream.
+    pub fn peer_session_binding(&self, peer: NodeId) -> Option<[u8; 32]> {
+        self.sessions.get(peer).map(|s| *s.handshake_hash())
+    }
+
+    /// Flush both org registries' outbound queues onto the event plane.
+    /// Every frame rides its channel's publish stream, reliable, exactly
+    /// like the unary path — this is what makes browser ↔ native
+    /// interop work.
+    fn pump_org_frames(&mut self) {
+        for frame in self.org_calls.take_outbound() {
+            let _ = self.send_event_plane(
+                frame.peer,
+                route_stream_id(frame.route),
+                frame.route as u16,
+                &frame.frame,
+                true,
+            );
+        }
+        for frame in self.org_serves.take_outbound() {
+            let _ = self.send_event_plane(
+                frame.peer,
+                route_stream_id(frame.route),
+                frame.route as u16,
+                &frame.frame,
+                true,
+            );
+        }
+    }
+
+    /// A fresh session carries no channel roster: re-claim every served
+    /// service's request carrier on it.
+    fn resubscribe_served(&mut self, peer: NodeId) {
+        let services: Vec<String> = self.org_serves.services().map(str::to_string).collect();
+        for service in services {
+            let Ok(request) = request_channel(&service) else {
+                continue;
+            };
+            let channel = Channel::from_name(request);
+            let carrier = route_stream_id(channel.canonical());
+            if self.stream_kinds.get(&(peer, carrier)) == Some(&StreamKind::Stream) {
+                continue;
+            }
+            if self.subscribe(peer, channel.name()).is_ok() {
+                self.served_carriers.insert((peer, carrier), service);
+            }
+        }
+    }
+
+    /// The unary `call`'s verbatim provider-binding clause (E2.1,
+    /// Kyra #47 tail): the proof binds EXACTLY ONE provider (P), and a
+    /// leaf refuses to publish it to a transport target that is not P —
+    /// publishing an A-bound proof to provider B would DISCLOSE the
+    /// credential to the wrong peer. An unpinned target is refused too.
+    fn check_provider_binding(&mut self, peer: NodeId, provider: &EntityId) -> Result<()> {
+        match self.peer_entity_id(peer) {
+            Some(pinned) if pinned == *provider => Ok(()),
+            Some(_) => Err(LeafError::Rpc(RpcError::Malformed(format!(
+                "org admission: proof provider does not match the pinned entity of target {peer:#x}"
+            )))),
+            None => Err(LeafError::Rpc(RpcError::Malformed(format!(
+                "org admission: target {peer:#x} has no pinned entity to bind the proof to"
+            )))),
+        }
+    }
+
+    /// An org-protected UNARY call: the existing [`Self::call`] path
+    /// plus the shared signed-opening mint. The proof binds the
+    /// finalized request and exactly one provider; the call never
+    /// retries.
+    pub fn call_org_unary(
+        &mut self,
+        peer: NodeId,
+        service: &str,
+        payload: &[u8],
+        intent: &OrgCallIntent,
+        timeout_ms: Option<u64>,
+    ) -> Result<CallResult> {
+        self.check_provider_binding(peer, &intent.provider)?;
+        let request = Channel::from_name(request_channel(service)?);
+        let route = request.canonical();
+        self.ensure_reply_subscription(peer, service)?;
+        let incarnation = self
+            .sessions
+            .get(peer)
+            .ok_or_else(|| LeafError::Session(format!("no session with {peer:#x}")))?
+            .incarnation();
+        let reply_route =
+            Channel::from_name(reply_channel(service, self.identity.origin_hash())?).canonical();
+        let carrier_stream_id = route_stream_id(reply_route);
+        let timeout_ms = timeout_ms.unwrap_or(DEFAULT_CALL_TIMEOUT_MS);
+        let (call_id, receiver) = self
+            .calls
+            .register(
+                CallOwner {
+                    peer,
+                    incarnation,
+                    reply_route,
+                    carrier_stream_id,
+                },
+                route,
+                timeout_ms,
+            )
+            .map_err(LeafError::Rpc)?;
+        let deadline_ns =
+            clock::now_unix_nanos().saturating_add(timeout_ms.saturating_mul(1_000_000));
+        let mut req =
+            RpcRequestPayload::unary(service, deadline_ns, Bytes::copy_from_slice(payload));
+        if let Err(e) = attach_signed_admission(
+            &mut req,
+            intent,
+            call_id,
+            service,
+            RpcCallShape::Unary,
+            None,
+            clock::now_unix_nanos(),
+        ) {
+            self.calls.take(call_id);
+            return Err(LeafError::Rpc(RpcError::Malformed(format!(
+                "org admission mint: {e:?}"
+            ))));
+        }
+        let frame = rpc_wire::encode_request_frame(
+            self.identity.origin_hash(),
+            call_id,
+            route,
+            &req,
+        )?;
+        if let Err(e) = self.send_event_plane(
+            peer,
+            request.publish_stream_id(),
+            request.wire_hash(),
+            &frame,
+            true,
+        ) {
+            self.calls.take(call_id);
+            return Err(e);
+        }
+        Ok(receiver)
+    }
+
+    /// Open an org-protected SERVER-STREAMING call (eager: the signed
+    /// `REQUEST` is on the wire before this returns).
+    pub fn call_org_server_stream(
+        &mut self,
+        peer: NodeId,
+        service: &str,
+        open: StreamOpen,
+        intent: OrgCallIntent,
+    ) -> Result<CallHandle> {
+        self.open_org_stream_call(peer, service, open, intent, RpcCallShape::ServerStreaming)
+    }
+
+    /// Open an org-protected CLIENT-STREAMING call (lazy: nothing is
+    /// sent until the first `org_call_send` / `org_call_finish_sending`).
+    pub fn call_org_client_stream(
+        &mut self,
+        peer: NodeId,
+        service: &str,
+        open: StreamOpen,
+        intent: OrgCallIntent,
+    ) -> Result<CallHandle> {
+        self.open_org_stream_call(peer, service, open, intent, RpcCallShape::ClientStreaming)
+    }
+
+    /// Open an org-protected DUPLEX call (lazy, independent halves).
+    pub fn call_org_duplex(
+        &mut self,
+        peer: NodeId,
+        service: &str,
+        open: StreamOpen,
+        intent: OrgCallIntent,
+    ) -> Result<CallHandle> {
+        self.open_org_stream_call(peer, service, open, intent, RpcCallShape::Duplex)
+    }
+
+    fn open_org_stream_call(
+        &mut self,
+        peer: NodeId,
+        service: &str,
+        open: StreamOpen,
+        intent: OrgCallIntent,
+        shape: RpcCallShape,
+    ) -> Result<CallHandle> {
+        self.check_provider_binding(peer, &intent.provider)?;
+        let request = Channel::from_name(request_channel(service)?);
+        let route = request.canonical();
+        self.ensure_reply_subscription(peer, service)?;
+        let incarnation = self
+            .sessions
+            .get(peer)
+            .ok_or_else(|| LeafError::Session(format!("no session with {peer:#x}")))?
+            .incarnation();
+        let reply_route =
+            Channel::from_name(reply_channel(service, self.identity.origin_hash())?).canonical();
+        let pin = CallPin {
+            peer,
+            incarnation,
+            provider: intent.provider.clone(),
+            request_route: route,
+            reply_route,
+            carrier_stream_id: route_stream_id(reply_route),
+        };
+        // §1.3: the proof binds the RECEIVING session's handshake hash;
+        // a hand-built session (`None`) fails the mint locally.
+        let session_binding = self.sessions.get(peer).map(|s| *s.handshake_hash());
+        let now = clock::now_unix_nanos();
+        let opened = match shape {
+            RpcCallShape::ServerStreaming => self.org_calls.open_server_streaming(
+                pin,
+                service,
+                open,
+                intent,
+                session_binding,
+                now,
+            ),
+            RpcCallShape::ClientStreaming => self.org_calls.open_client_streaming(
+                pin,
+                service,
+                open,
+                intent,
+                session_binding,
+                now,
+            ),
+            RpcCallShape::Duplex => {
+                self.org_calls
+                    .open_duplex(pin, service, open, intent, session_binding, now)
+            }
+            RpcCallShape::Unary => unreachable!("unary rides call_org_unary"),
+        };
+        let handle = opened.map_err(map_open_error)?;
+        self.pump_org_frames();
+        Ok(handle)
+    }
+
+    /// Push one upload item (CS/DX).
+    pub fn org_call_send(&mut self, call_id: u64, item: &[u8]) -> core::result::Result<(), SinkError> {
+        let outcome = self.org_calls.send(call_id, item, clock::now_unix_nanos());
+        self.pump_org_frames();
+        outcome
+    }
+
+    /// Half-close the upload (DX) / finish it (CS).
+    pub fn org_call_finish_sending(
+        &mut self,
+        call_id: u64,
+    ) -> core::result::Result<(), SinkError> {
+        let outcome = self
+            .org_calls
+            .finish_sending(call_id, clock::now_unix_nanos());
+        self.pump_org_frames();
+        outcome
+    }
+
+    /// Pull the next response item (consuming auto-grants one credit on
+    /// window-issuing calls).
+    pub fn org_call_next(&mut self, call_id: u64) -> Option<Bytes> {
+        let item = self.org_calls.next_item(call_id);
+        self.pump_org_frames();
+        item
+    }
+
+    /// Explicitly grant response-direction credit.
+    pub fn org_call_grant(&mut self, call_id: u64, credits: u32) {
+        self.org_calls.grant(call_id, credits);
+        self.pump_org_frames();
+    }
+
+    /// Explicitly cancel a call: exactly one `CANCEL` (shared guard
+    /// with handle drop) and a latched `Cancelled` terminal.
+    pub fn org_call_cancel(&mut self, call_id: u64) -> bool {
+        let fired = self.org_calls.cancel(call_id);
+        self.pump_org_frames();
+        fired
+    }
+
+    /// The latched terminal, if any (exactly one is ever produced).
+    pub fn org_call_terminal(&self, call_id: u64) -> Option<StreamTerminal> {
+        self.org_calls.terminal(call_id).cloned()
+    }
+
+    /// Release a finished call's state.
+    pub fn org_call_forget(&mut self, call_id: u64) -> bool {
+        self.org_calls.forget(call_id)
+    }
+
+    /// Serve one service org-protected (all four shapes). Reserves the
+    /// `<service>.requests` carrier per session — exactly one plane
+    /// owner per carrier — and subscribes so an anchor forwards the
+    /// service's requests here.
+    pub fn org_serve(
+        &mut self,
+        service: &str,
+        opts: ServeOptions,
+        handler: ServeHandler,
+    ) -> Result<()> {
+        let request = Channel::from_name(request_channel(service)?);
+        let carrier = route_stream_id(request.canonical());
+        let peers: Vec<NodeId> = self.sessions.peers().collect();
+        for peer in &peers {
+            if self.stream_kinds.get(&(*peer, carrier)) == Some(&StreamKind::Stream)
+                || self.rpc_reply_carriers.contains(&(*peer, carrier))
+            {
+                return Err(LeafError::Session(format!(
+                    "the request carrier for {service:?} on the session with {peer:#x} is already \
+                     owned by another plane; close it or serve a service whose request channel \
+                     does not collide"
+                )));
+            }
+        }
+        self.org_serves
+            .serve(service, opts, handler)
+            .map_err(|e| LeafError::Session(format!("serve {service:?}: {e:?}")))?;
+        for peer in peers {
+            self.subscribe(peer, request.name())?;
+            self.served_carriers
+                .insert((peer, carrier), service.to_string());
+        }
+        Ok(())
+    }
+
+    /// Stop serving a service; its live calls retire typed, exactly
+    /// one terminal each.
+    pub fn org_unserve(&mut self, service: &str) -> usize {
+        let retired = self.org_serves.unserve(service);
+        self.served_carriers.retain(|_, s| s != service);
+        self.pump_org_frames();
+        retired
+    }
+
+    /// Node close: every org-scoped call fails typed (no CANCELs — the
+    /// transport is gone), and the drop guards are disarmed.
+    pub fn org_fail_all(&mut self, reason: RetireReason) -> usize {
+        let a = self.org_calls.fail_all(reason);
+        let b = self.org_serves.fail_all(reason);
+        self.pump_org_frames();
+        a + b
+    }
+
+    /// The revocation feed: decode and STRICTLY verify a signed
+    /// `OrgRevocationBundle` (org-root signature), merge its floors
+    /// into the node's raise-only view (a lower floor never rolls back
+    /// a higher one) with an epoch bump, and retire every live
+    /// protected call whose membership generation is now below its
+    /// floor — each with its exact terminal (`Revoked` → the frozen
+    /// `AdmissionDenied(Denied)` + `&[0]` byte), first-writer-wins
+    /// latching respected. A compliant sibling call is untouched.
+    /// Returns the number of floors actually raised.
+    pub fn ingest_org_revocation_bundle(&mut self, bundle_bytes: &[u8]) -> Result<usize> {
+        let bundle = OrgRevocationBundle::from_bytes(bundle_bytes)
+            .map_err(|e| LeafError::Wire(format!("revocation bundle: {e}")))?;
+        bundle
+            .verify()
+            .map_err(|e| LeafError::Wire(format!("revocation bundle: {e}")))?;
+        let raised = self
+            .org_revocation
+            .merge_floors(bundle.org_id, bundle.floors());
+        if raised > 0 {
+            self.org_serves.raise_floors(&self.org_revocation);
+            self.pump_org_frames();
+        }
+        Ok(raised)
+    }
+
+    /// A frame on a carrier the SERVED plane owns: an opening REQUEST
+    /// or one of its control frames. Attribution is the AEAD-
+    /// authenticated `(peer, incarnation)` plus the call id — a frame
+    /// from another peer or session with the same call id neither
+    /// delivers nor completes anything — and the call id comes from
+    /// `EventMeta.seq_or_ts` (a REQUEST carries no in-payload one).
+    fn handle_served_plane(
+        &mut self,
+        peer: NodeId,
+        incarnation: u64,
+        record: &StreamRecord,
+        payload: Bytes,
+    ) {
+        let Some(meta) = EventMeta::from_bytes(&payload) else {
+            self.drop_counted(DropReason::Unparsable);
+            return;
+        };
+        // Route discipline, as on the caller plane: the frame must name
+        // its own carrier.
+        if rpc_wire::decode_route(&payload)
+            .filter(|route| route_stream_id(*route) == record.stream_id)
+            .is_none()
+        {
+            self.drop_counted(DropReason::UnknownCall);
+            return;
+        }
+        let Ok(Some(frame)) = rpc_wire::decode_frame(payload) else {
+            self.drop_counted(DropReason::UnknownCall);
+            return;
+        };
+        let Some(caller) = self.peer_entity_id(peer) else {
+            // No pinned entity ⇒ no authenticated caller ⇒ nothing
+            // org-protected can be admitted here.
+            self.drop_counted(DropReason::UnknownCall);
+            return;
+        };
+        let session_binding = self.sessions.get(peer).map(|s| *s.handshake_hash());
+        let from = ServePeer {
+            peer,
+            incarnation,
+            caller,
+            session_binding,
+        };
+        let Some(service) = self.served_carriers.get(&(peer, record.stream_id)).cloned() else {
+            self.drop_counted(DropReason::UnknownCall);
+            return;
+        };
+        match frame {
+            RpcFrame::Request(req) => {
+                let _outcome = self.org_serves.on_request(
+                    &from,
+                    &service,
+                    meta.seq_or_ts,
+                    req,
+                    clock::now_unix_nanos(),
+                    &ServeAdmission {
+                        provider: &self.org_entity,
+                        facts: &self.org_revocation,
+                        replay: &self.org_replay,
+                    },
+                );
+            }
+            RpcFrame::RequestChunk(chunk) => {
+                if chunk.call_id != meta.seq_or_ts {
+                    self.drop_counted(DropReason::UnknownCall);
+                    return;
+                }
+                if !self.org_serves.on_chunk(&from, chunk) {
+                    self.drop_counted(DropReason::UnknownCall);
+                }
+            }
+            RpcFrame::StreamGrant { call_id, credits } => {
+                let _ = self.org_serves.on_stream_grant(&from, call_id, credits);
+            }
+            RpcFrame::Cancel { call_id } => {
+                let _ = self.org_serves.on_cancel(&from, call_id);
+            }
+            // Provider-bound planes never carry these.
+            RpcFrame::Response { .. }
+            | RpcFrame::RequestGrant(_)
+            | RpcFrame::DeadlineExceeded { .. } => {
+                self.drop_counted(DropReason::UnknownCall);
+                return;
+            }
+        }
+        self.pump_org_frames();
     }
 
     /// **The enrollment exchange** — the nRPC client's first caller,
@@ -2698,25 +3244,37 @@ impl LeafNode {
         record: &StreamRecord,
         payload: Bytes,
     ) {
-        if !self.rpc_reply_carriers.contains(&(peer, record.stream_id)) {
-            // No RPC plane owns this carrier, so these are
-            // application bytes — and which surface they belong to
-            // is the stream's business, not the payload's.
-            match self.classify(peer, record.stream_id) {
-                StreamKind::Stream => self.events.push(LeafEvent::StreamData {
-                    peer_node: peer,
-                    incarnation,
-                    stream_id: record.stream_id,
-                    seq: record.seq,
-                    payload,
-                }),
-                StreamKind::Channel => self.events.push(LeafEvent::ChannelMessage {
-                    channel_hash: record.channel_hash,
-                    origin_hash: record.origin_hash,
-                    payload,
-                }),
+        // Which plane owns this carrier is settled BEFORE the payload
+        // is read (`dispatch::plane_for`): application bytes, the
+        // caller's nRPC replies, or the nRPC traffic of a service this
+        // leaf SERVES. Exactly one owner per carrier, registered at
+        // subscription time.
+        match dispatch::plane_for(
+            self.rpc_reply_carriers.contains(&(peer, record.stream_id)),
+            self.served_carriers.contains_key(&(peer, record.stream_id)),
+        ) {
+            dispatch::Plane::ServedRpc => {
+                self.handle_served_plane(peer, incarnation, record, payload);
+                return;
             }
-            return;
+            dispatch::Plane::Application => {
+                match self.classify(peer, record.stream_id) {
+                    StreamKind::Stream => self.events.push(LeafEvent::StreamData {
+                        peer_node: peer,
+                        incarnation,
+                        stream_id: record.stream_id,
+                        seq: record.seq,
+                        payload,
+                    }),
+                    StreamKind::Channel => self.events.push(LeafEvent::ChannelMessage {
+                        channel_hash: record.channel_hash,
+                        origin_hash: record.origin_hash,
+                        payload,
+                    }),
+                }
+                return;
+            }
+            dispatch::Plane::CallerRpc => {}
         }
         let reply = match rpc_wire::decode_reply_frame(payload.clone()) {
             Ok(Some(frame)) => rpc_wire::decode_route(&payload)
@@ -2772,16 +3330,54 @@ impl LeafNode {
         // within. Re-reading the table here would answer the same
         // question twice and give the wrong answer if it ever
         // stopped agreeing.
-        if !self.calls.deliver(
-            frame,
-            CallOwner {
-                peer,
-                incarnation,
-                reply_route,
-                carrier_stream_id: record.stream_id,
-            },
-            &self.counters,
-        ) {
+        let presented = CallOwner {
+            peer,
+            incarnation,
+            reply_route,
+            carrier_stream_id: record.stream_id,
+        };
+        // The streaming caller's per-shape tables first — a routing
+        // peek, then the matched-before-removal re-check inside
+        // `on_*` — and the unary table second. The two tables draw
+        // from opposite half-spaces of the id space
+        // (`StreamCallRegistry::new`), so the peek cannot misroute a
+        // sibling table's call.
+        let streaming_call_id = match &frame {
+            RpcFrame::Response { call_id, .. } | RpcFrame::DeadlineExceeded { call_id } => {
+                Some(*call_id)
+            }
+            RpcFrame::RequestGrant(grant) => Some(grant.call_id),
+            RpcFrame::Request(_)
+            | RpcFrame::Cancel { .. }
+            | RpcFrame::StreamGrant { .. }
+            | RpcFrame::RequestChunk(_) => None,
+        };
+        if let Some(call_id) = streaming_call_id {
+            if self.org_calls.owns(presented, call_id) {
+                let delivered = match frame {
+                    RpcFrame::Response { payload, .. } => {
+                        self.org_calls.on_response(presented, call_id, payload)
+                    }
+                    RpcFrame::DeadlineExceeded { .. } => {
+                        self.org_calls.on_deadline_frame(presented, call_id)
+                    }
+                    RpcFrame::RequestGrant(grant) => {
+                        self.org_calls.on_grant(presented, grant.call_id, grant.credits)
+                    }
+                    RpcFrame::Request(_)
+                    | RpcFrame::Cancel { .. }
+                    | RpcFrame::StreamGrant { .. }
+                    | RpcFrame::RequestChunk(_) => false,
+                };
+                if delivered {
+                    self.pump_org_frames();
+                } else {
+                    self.drop_counted(DropReason::UnknownCall);
+                }
+                return;
+            }
+        }
+        if !self.calls.deliver(frame, presented, &self.counters) {
             // `deliver` owns the counter; this is the event half
             // of the same refusal.
             self.events.push(LeafEvent::Dropped {
@@ -2933,6 +3529,25 @@ impl LeafNode {
 /// The stream id an nRPC frame for `route` rides.
 fn route_stream_id(route: u64) -> u64 {
     crate::channel::publish_stream_id(route)
+}
+
+/// Map a streaming-open refusal to the leaf's typed errors, keeping
+/// the core's verbatim guard messages where they exist.
+fn map_open_error(e: CallOpenError) -> LeafError {
+    match e {
+        CallOpenError::ZeroWindow => LeafError::Rpc(RpcError::Malformed(
+            "stream_window_initial/request_window_initial must be None or >= 1; Some(0) deadlocks \
+             the pump"
+                .to_string(),
+        )),
+        CallOpenError::TooManyCalls => LeafError::Rpc(RpcError::Refused {
+            status: RpcStatus::Backpressure.to_wire(),
+            message: "this leaf already holds its streaming calls in flight".to_string(),
+        }),
+        CallOpenError::Mint(err) => LeafError::Rpc(RpcError::Malformed(format!(
+            "org admission mint: {err:?}"
+        ))),
+    }
 }
 
 /// Standard padded base64, which is what the TS wrapper decodes.

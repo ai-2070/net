@@ -24,6 +24,21 @@ import type {
   LeafWasmConnectOptions,
   LeafWasmModule,
   LeafWasmNode,
+  LeafWasmOrgAccess,
+  LeafWasmOrgByteItem,
+  LeafWasmOrgByteStreamHandle,
+  LeafWasmOrgCallOptions,
+  LeafWasmOrgClientStreamHandler,
+  LeafWasmOrgDuplexCallHandle,
+  LeafWasmOrgDuplexHandler,
+  LeafWasmOrgRequestItem,
+  LeafWasmOrgRequestStreamHandle,
+  LeafWasmOrgResponseSinkHandle,
+  LeafWasmOrgServeHandle,
+  LeafWasmOrgServeOptions,
+  LeafWasmOrgStreamingHandler,
+  LeafWasmOrgUnaryHandler,
+  LeafWasmOrgUploadCallHandle,
   LeafWasmStream,
   LeafWasmStreamOptions,
   StreamCallbackPayload,
@@ -142,6 +157,14 @@ export interface FakeNodeBehaviour {
   rtcStatsJson?: string;
   retryReportJson?: string;
   armNetworkRetryError?: unknown;
+  // ── The eight org verbs ──
+  /** Thrown by `call_org`, as `wasm-bindgen` would: an `Error` with Display text. */
+  orgCallError?: unknown;
+  orgCallReply?: Uint8Array;
+  /** Thrown by the three stream openers. */
+  orgOpenError?: unknown;
+  /** Thrown by the four serve registrations. */
+  orgServeError?: unknown;
 }
 
 export class FakeNode implements LeafWasmNode {
@@ -172,6 +195,43 @@ export class FakeNode implements LeafWasmNode {
    */
   readonly teardown: string[] = [];
   private sink: ((json: string) => void) | null = null;
+  // ── The eight org verbs (plan §4.5) ──
+  readonly orgCalls: Array<{ service: string; payload: Uint8Array; options: LeafWasmOrgCallOptions }> = [];
+  readonly orgStreamOpens: Array<{ service: string; payload: Uint8Array; options: LeafWasmOrgCallOptions }> = [];
+  readonly orgUploadOpens: Array<{ service: string; options: LeafWasmOrgCallOptions }> = [];
+  readonly orgDuplexOpens: Array<{ service: string; options: LeafWasmOrgCallOptions }> = [];
+  readonly orgStreamHandles: FakeOrgByteStreamHandle[] = [];
+  readonly orgUploadHandles: FakeOrgUploadCallHandle[] = [];
+  readonly orgDuplexCallHandles: FakeOrgDuplexCallHandle[] = [];
+  readonly orgServeHandles: FakeOrgServeHandle[] = [];
+  readonly orgUnaryServes: Array<{
+    service: string;
+    access: LeafWasmOrgAccess;
+    handler: LeafWasmOrgUnaryHandler;
+    options: LeafWasmOrgServeOptions;
+    handle: FakeOrgServeHandle;
+  }> = [];
+  readonly orgStreamingServes: Array<{
+    service: string;
+    access: LeafWasmOrgAccess;
+    handler: LeafWasmOrgStreamingHandler;
+    options: LeafWasmOrgServeOptions;
+    handle: FakeOrgServeHandle;
+  }> = [];
+  readonly orgClientStreamServes: Array<{
+    service: string;
+    access: LeafWasmOrgAccess;
+    handler: LeafWasmOrgClientStreamHandler;
+    options: LeafWasmOrgServeOptions;
+    handle: FakeOrgServeHandle;
+  }> = [];
+  readonly orgDuplexServes: Array<{
+    service: string;
+    access: LeafWasmOrgAccess;
+    handler: LeafWasmOrgDuplexHandler;
+    options: LeafWasmOrgServeOptions;
+    handle: FakeOrgServeHandle;
+  }> = [];
 
   constructor(private readonly behaviour: FakeNodeBehaviour = {}) {}
 
@@ -341,6 +401,108 @@ export class FakeNode implements LeafWasmNode {
     );
   }
 
+  // ── The eight org verbs (plan §4.5) ──
+  //
+  // Faked at the Rust shape: options objects cross verbatim (so a
+  // test can assert the marshalling), rejections throw Display text
+  // the way `wasm-bindgen` does, and every handle is one of the
+  // scriptable fakes appended to this file.
+  async call_org(
+    service: string,
+    payload: Uint8Array,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<Uint8Array> {
+    this.orgCalls.push({ service, payload, options });
+    if (this.behaviour.orgCallError !== undefined) throw this.behaviour.orgCallError;
+    return this.behaviour.orgCallReply ?? new Uint8Array([7]);
+  }
+
+  async call_org_streaming(
+    service: string,
+    payload: Uint8Array,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgByteStreamHandle> {
+    this.orgStreamOpens.push({ service, payload, options });
+    if (this.behaviour.orgOpenError !== undefined) throw this.behaviour.orgOpenError;
+    const handle = new FakeOrgByteStreamHandle();
+    this.orgStreamHandles.push(handle);
+    return handle;
+  }
+
+  async call_org_client_stream(
+    service: string,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgUploadCallHandle> {
+    this.orgUploadOpens.push({ service, options });
+    if (this.behaviour.orgOpenError !== undefined) throw this.behaviour.orgOpenError;
+    const handle = new FakeOrgUploadCallHandle();
+    this.orgUploadHandles.push(handle);
+    return handle;
+  }
+
+  async call_org_duplex(
+    service: string,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgDuplexCallHandle> {
+    this.orgDuplexOpens.push({ service, options });
+    if (this.behaviour.orgOpenError !== undefined) throw this.behaviour.orgOpenError;
+    const handle = new FakeOrgDuplexCallHandle();
+    this.orgDuplexCallHandles.push(handle);
+    return handle;
+  }
+
+  serve_org(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgUnaryHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle {
+    if (this.behaviour.orgServeError !== undefined) throw this.behaviour.orgServeError;
+    const handle = new FakeOrgServeHandle(service);
+    this.orgUnaryServes.push({ service, access, handler, options, handle });
+    this.orgServeHandles.push(handle);
+    return handle;
+  }
+
+  serve_org_streaming(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgStreamingHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle {
+    if (this.behaviour.orgServeError !== undefined) throw this.behaviour.orgServeError;
+    const handle = new FakeOrgServeHandle(service);
+    this.orgStreamingServes.push({ service, access, handler, options, handle });
+    this.orgServeHandles.push(handle);
+    return handle;
+  }
+
+  serve_org_client_stream(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgClientStreamHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle {
+    if (this.behaviour.orgServeError !== undefined) throw this.behaviour.orgServeError;
+    const handle = new FakeOrgServeHandle(service);
+    this.orgClientStreamServes.push({ service, access, handler, options, handle });
+    this.orgServeHandles.push(handle);
+    return handle;
+  }
+
+  serve_org_duplex(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgDuplexHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle {
+    if (this.behaviour.orgServeError !== undefined) throw this.behaviour.orgServeError;
+    const handle = new FakeOrgServeHandle(service);
+    this.orgDuplexServes.push({ service, access, handler, options, handle });
+    this.orgServeHandles.push(handle);
+    return handle;
+  }
+
   close(): void {
     this.closed = true;
     this.teardown.push('node');
@@ -394,4 +556,207 @@ export function failingModule(error: unknown): LeafWasmModule {
       },
     },
   };
+}
+
+// ── The eight org verbs' handles, at the Rust shape ──────────────────────
+//
+// Scriptable from a test: `deliver`/`fail` drive one pull the way the
+// real handle's future resolves or rejects, `retired()` hands back a
+// deferred the test settles with one of the frozen verdict strings.
+
+/** A fake `OrgByteStreamHandle`: pull-based, driven item by item. */
+export class FakeOrgByteStreamHandle implements LeafWasmOrgByteStreamHandle {
+  cancels = 0;
+  private readonly pending: Array<{
+    resolve: (item: LeafWasmOrgByteItem) => void;
+    reject: (error: unknown) => void;
+  }> = [];
+  private readonly buffered: Array<{ item?: LeafWasmOrgByteItem; error?: unknown }> = [];
+
+  next(): Promise<LeafWasmOrgByteItem> {
+    const { promise, resolve, reject } = Promise.withResolvers<LeafWasmOrgByteItem>();
+    const buffered = this.buffered.shift();
+    if (buffered !== undefined) {
+      if ('error' in buffered) reject(buffered.error);
+      else resolve(buffered.item as LeafWasmOrgByteItem);
+      return promise;
+    }
+    this.pending.push({ resolve, reject });
+    return promise;
+  }
+
+  cancel(): void {
+    this.cancels += 1;
+  }
+
+  /** Drive one item from the test, the way the real future resolves. */
+  deliver(item: LeafWasmOrgByteItem): void {
+    const waiter = this.pending.shift();
+    if (waiter !== undefined) waiter.resolve(item);
+    else this.buffered.push({ item });
+  }
+
+  /** Drive one boundary rejection, the way `wasm-bindgen` throws. */
+  fail(error: unknown): void {
+    const waiter = this.pending.shift();
+    if (waiter !== undefined) waiter.reject(error);
+    else this.buffered.push({ error });
+  }
+}
+
+/** A fake `OrgUploadCallHandle` with a drivable `finish`. */
+export class FakeOrgUploadCallHandle implements LeafWasmOrgUploadCallHandle {
+  cancels = 0;
+  readonly sent: Uint8Array[] = [];
+  /** When set, `finish` settles with it (a rejection unless it is bytes). */
+  finishOutcome: Uint8Array | unknown | null = null;
+  private readonly parked: Array<{
+    resolve: (body: Uint8Array) => void;
+    reject: (error: unknown) => void;
+  }> = [];
+
+  async send(payload: Uint8Array): Promise<void> {
+    this.sent.push(payload);
+  }
+
+  finish(): Promise<Uint8Array> {
+    const { promise, resolve, reject } = Promise.withResolvers<Uint8Array>();
+    const outcome = this.finishOutcome;
+    if (outcome instanceof Uint8Array) resolve(outcome);
+    else if (outcome !== null) reject(outcome);
+    else this.parked.push({ resolve, reject });
+    return promise;
+  }
+
+  cancel(): void {
+    this.cancels += 1;
+  }
+
+  /** Settle parked `finish` calls with the reply. */
+  complete(reply: Uint8Array): void {
+    for (const waiter of this.parked.splice(0)) waiter.resolve(reply);
+  }
+
+  /** Fail parked `finish` calls the way a typed terminal crosses. */
+  failFinish(error: unknown): void {
+    for (const waiter of this.parked.splice(0)) waiter.reject(error);
+  }
+}
+
+/** A fake `OrgDuplexCallHandle`: inline sink verbs plus one stream. */
+export class FakeOrgDuplexCallHandle implements LeafWasmOrgDuplexCallHandle {
+  cancels = 0;
+  readonly sent: Uint8Array[] = [];
+  finishSendingCalls = 0;
+  readonly streamHandle = new FakeOrgByteStreamHandle();
+
+  async send(payload: Uint8Array): Promise<void> {
+    this.sent.push(payload);
+  }
+
+  async finish_sending(): Promise<void> {
+    this.finishSendingCalls += 1;
+  }
+
+  cancel(): void {
+    this.cancels += 1;
+  }
+
+  stream(): LeafWasmOrgByteStreamHandle {
+    return this.streamHandle;
+  }
+}
+
+/** A fake `OrgResponseSinkHandle` with a deferred `retired()`. */
+export class FakeOrgResponseSinkHandle implements LeafWasmOrgResponseSinkHandle {
+  readonly sent: Uint8Array[] = [];
+  closes = 0;
+  retiredCalls = 0;
+  sendError: unknown = null;
+  closeError: unknown = null;
+  private readonly retireWaiters: Array<(reason: string) => void> = [];
+  private retireVerdict: string | null = null;
+
+  async send(payload: Uint8Array): Promise<void> {
+    if (this.sendError !== null) throw this.sendError;
+    this.sent.push(payload);
+  }
+
+  async close(): Promise<void> {
+    if (this.closeError !== null) throw this.closeError;
+    this.closes += 1;
+  }
+
+  retired(): Promise<string> {
+    this.retiredCalls += 1;
+    const { promise, resolve } = Promise.withResolvers<string>();
+    const settled = this.retireVerdict;
+    if (settled !== null) resolve(settled);
+    else this.retireWaiters.push(resolve);
+    return promise;
+  }
+
+  /** Retire from the test with one of the frozen verdict strings. */
+  emitRetired(verdict: string): void {
+    this.retireVerdict = verdict;
+    for (const waiter of this.retireWaiters.splice(0)) waiter(verdict);
+  }
+}
+
+/**
+ * A fake `OrgRequestStreamHandle`: the handler-side shape — no error
+ * arm on `next()`, termination through `retired()` only.
+ */
+export class FakeOrgRequestStreamHandle implements LeafWasmOrgRequestStreamHandle {
+  private readonly pending: Array<(item: LeafWasmOrgRequestItem) => void> = [];
+  private readonly buffered: LeafWasmOrgRequestItem[] = [];
+  private readonly retireWaiters: Array<(reason: string) => void> = [];
+  private retireVerdict: string | null = null;
+
+  next(): Promise<LeafWasmOrgRequestItem> {
+    const { promise, resolve } = Promise.withResolvers<LeafWasmOrgRequestItem>();
+    const buffered = this.buffered.shift();
+    if (buffered !== undefined) {
+      resolve(buffered);
+      return promise;
+    }
+    this.pending.push(resolve);
+    return promise;
+  }
+
+  retired(): Promise<string> {
+    const { promise, resolve } = Promise.withResolvers<string>();
+    const settled = this.retireVerdict;
+    if (settled !== null) resolve(settled);
+    else this.retireWaiters.push(resolve);
+    return promise;
+  }
+
+  /** Drive one request item from the test. */
+  deliver(item: LeafWasmOrgRequestItem): void {
+    const waiter = this.pending.shift();
+    if (waiter !== undefined) waiter(item);
+    else this.buffered.push(item);
+  }
+
+  /** Retire from the test with one of the frozen verdict strings. */
+  emitRetired(verdict: string): void {
+    this.retireVerdict = verdict;
+    for (const waiter of this.retireWaiters.splice(0)) waiter(verdict);
+  }
+}
+
+/** A fake `LeafWasmOrgServeHandle` that counts its C9 close. */
+export class FakeOrgServeHandle implements LeafWasmOrgServeHandle {
+  closes = 0;
+
+  constructor(private readonly serviceName: string) {}
+
+  service(): string {
+    return this.serviceName;
+  }
+
+  close(): void {
+    this.closes += 1;
+  }
 }
