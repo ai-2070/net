@@ -3917,3 +3917,192 @@ anywhere. Four weakenings on every recorded cycle: **NONE** — no
 precondition fixed, no window widened, no assertion relaxed, no witness
 deleted (both witnesses are additions; the restructure strengthened red
 placement only).
+
+## 6. Stage 3
+
+**Lane:** S3Facade (one lane). **Pinned brief:** `spikes/org-streaming/S3_BRIEF.md`
+@`0071fd1fc`. **Base:** `0071fd1fc` (Stage 2 accepted at `017e7148a`; S2R
+closure verified at `1d26bc4ba`/`636d80d69`). Rows 3.1 → 3.3 in order, each
+landed green before the next. Owner-pending: none.
+
+### 6.1 Row 3.1 — caller verbs (S3.1)
+
+**Landed (executed):** `d63e9c615` — `S3.1: add the org streaming caller verbs
+(spec 4.3) with live facade witnesses` (4 files, +1789/−3) on
+`LZL0/org-streaming`; this record rides in the following `S3.1:` commit.
+
+**What landed (source-established, line numbers pristine-at-`d63e9c615`):**
+
+- The §4.3 caller rows verbatim: `call_streaming<Req,Resp>(service, &Req) ->
+  Result<OrgStream<Resp>, OrgSdkError>` (`OrgStream<Resp>: Stream<Item =
+  Result<Resp, OrgSdkError>>`, wrapping `RpcStreamTyped`);
+  `call_streaming_bytes -> OrgStreamRaw`; `call_client_stream<Req,Resp>(service)
+  -> OrgClientStreamCall<Req,Resp>` (`send(&Req)`, `finish(self) ->
+  Result<Resp,_>`); `call_duplex<Req,Resp>(service) -> OrgDuplexCall<Req,Resp>`
+  (`send`, `finish_sending`, `into_split`, `Stream` — the split halves
+  `OrgDuplexSink<Req>`/`OrgDuplexStream<Resp>` wrap the typed halves the public
+  `DuplexCallTyped::into_split` returns). All four wrapping types map every
+  error surface through the unary verb's own `map_rpc_error`.
+- The three `*_bytes_deadline` binding seams (`#[doc(hidden)]`), the same seam
+  contract as `call_bytes_deadline` (neither argument is an authorization
+  input): `deadline_ms == 0` ⇒ `DEFAULT_LIFETIME_MS = 300_000` (Owner Q1),
+  **never "no deadline"** — D3's finite-lifetime rule; `cancel_token == 0` ⇒
+  uncancellable. **Interpretation, stated:** §4.3 pins the seam NAMES without
+  return types; they return the EXISTING raw handles (`RpcStream`,
+  `ClientStreamCallRaw`, `DuplexCallRaw`) per §4.4's binding rule ("over the
+  `*_bytes_deadline` seams and the existing public stream/sink handle types —
+  no new stream wrapper per binding"), and the public `call_streaming_bytes ->
+  OrgStreamRaw` wraps the seam's stream in the facade error vocabulary.
+- The pin, structural: `streaming_opening` runs ONE `plan()` per call (the
+  unary instrumentation block records `last_selected_provider`), and the call
+  rides `intent.provider.node_id()` only. CS's core handle opens at the first
+  `send`/`finish` — core's own lazy-initial-REQUEST contract — against the
+  verb's PINNED opening (`PinnedOpening`); DX opens at the verb because
+  `into_split`/`Stream` are synchronous.
+- `OrgClient` gains ONE crate-internal field (`typed: Arc<Mesh>`, built at bind
+  over the SAME `Arc<MeshNode>` via the public `Mesh::from_node_arc`):
+  `Mesh::call_*_typed` is the only constructor of the typed streaming handles
+  before Row 3.2's `from_raw` seam lands (F-S3.2-1's ruling); it is removed the
+  moment that seam takes over the construction. The frozen type list
+  (`OrgCaller`/`OrgSdkError`/`OrgHandlerError`/`OrgAccess`/
+  `CoarseAdmissionReason`/`OrgProofIntent`/`CallOptions`) gains NOTHING; the
+  unary/public surfaces are unchanged (verified by the existing probe build +
+  the regression legs below).
+
+**Witnesses and counts (executed).** NEW suite `sdk/tests/org_streaming.rs`
+(the fixture shape of `src/org/tests_live.rs:176-273`): **8/8**, exit 0, at the
+plan's named command —
+
+```sh
+cargo nextest run --no-fail-fast --no-tests=fail --retries 0 -p net-mesh-sdk \
+  --features "net cortex dataforts testing compute nat-traversal port-mapping \
+aggregator tool macros fixtures" --test org_streaming
+```
+
+Roster FROM SOURCE (8 `#[tokio::test]` fns):
+`live_same_org_streaming_through_the_facade`,
+`live_same_org_client_stream_through_the_facade` (**the pin witness**),
+`live_same_org_duplex_through_the_facade`,
+`live_cross_org_streaming_through_the_facade`,
+`live_cross_org_client_stream_through_the_facade`,
+`live_cross_org_duplex_through_the_facade`,
+`facade_stream_against_unary_only_provider_is_not_supported`,
+`dropping_org_stream_emits_one_cancel`.
+
+CI floor note (Main pins, never a lane): `--suite org_streaming` floor = **8**,
+the eight names above in the same commit.
+
+**Inverse receipt (executed, raw) — R-S3.1-pin, at the production site.**
+Baseline at `d63e9c615`'s tree: `sha256 bf302b5e0a23c29b2645c4e5d94d993939ed20c4948bea33450d4d7b53c9587a
+sdk/src/org/call.rs`. The applied inverse is the brief's verbatim — **resolve a
+second provider mid-call** — a bounded diff at `OrgClientStreamCall::send`
+(delta +11/−1 to `call.rs`, 0 to the test file):
+
+```diff
+     pub async fn send(&mut self, value: &Req) -> Result<(), OrgSdkError> {
++        // S3.1 PIN MUTATION: resolve a SECOND provider mid-call and re-open
++        // against it instead of reusing the pinned plan.
++        let (fresh_provider, fresh_opening) =
++            self.pinned
++                .client
++                .streaming_opening(&self.pinned.service, 0, 0)?;
++        self.pinned.provider = fresh_provider;
++        self.pinned.opening = fresh_opening;
++        self.inner = None;
+         self.ensure_opened().await?;
+```
+
+(The pin witness's scenario resolves its second provider mid-call by design:
+only the pinned provider is resolvable at the verb; after chunk one, the
+lower-entity-id provider — which wins EVERY fresh deterministic selection —
+joins and converges.)
+
+Run: `cargo nextest run --no-fail-fast --no-tests=fail --retries 0 -p
+net-mesh-sdk --features "net cortex dataforts testing compute nat-traversal
+port-mapping aggregator tool macros fixtures" --test org_streaming -E
+'test(=live_same_org_client_stream_through_the_facade)'` — **exit 100** (two
+runs, identical red). Verbatim:
+
+```
+thread 'live_same_org_client_stream_through_the_facade' (192516) panicked at sdk\tests\org_streaming.rs:619:5:
+assertion `left == right` failed: the provider is pinned per call: chunk two and the terminal land on the planned provider even though a second provider resolved mid-call
+  left: UploadSummary { chunks: 1, seen: [20], served_by: 13883170235434775928 }
+ right: UploadSummary { chunks: 2, seen: [10, 20], served_by: 5999853971703539794 }
+```
+
+The NAMED pin assertion is the red and the forbidden outcome is exactly the
+brief's: under the mutation the send re-resolved mid-call, the second provider
+won the fresh selection, and chunk two + the terminal landed there
+(`chunks: 1, seen: [20]`, the second provider's node id) instead of the
+planned provider. Restore: reverse edit; sha256 `bf302b5e…` == baseline
+(byte-identical). Restored green: exit 0, 1/1. Four weakenings: **NONE** — no
+precondition fixed, no window widened, no assertion relaxed, no witness
+deleted.
+
+**`dropping_org_stream_emits_one_cancel` — disclosure and the observable
+contract (executed + source-established).** First draft asserted the HANDLER's
+`ctx.cancellation` observation count and red (`left: 0, right: 1`). The reason
+is source-established at `cortex/rpc.rs` `run_stream_call_supervisor`: on
+the protected path the handler future is polled INSIDE the retire supervisor
+and is dropped at scope end on a `forced` retirement ("The owned handler
+future drops at scope end"), so a handler-side `cancelled()` observation is
+RACY there — the public-path house witness (`rpc_streaming_drop_cancels_handler`)
+spawns the handler as its own task, which is why it can observe. Cooperation is
+best-effort by contract (§2.2 `forced`). The handler-counter assertion was
+therefore REMOVED as an unsound instrument and replaced with STRICTER direct
+observables (this is a pre-landing development restructure, not a re-pin of a
+landed witness): the drop's ONE cancel retires EXACTLY the one dropped call
+(the fold's `in_flight_keys()` goes 2 → 1 and stays 1), that call's emission
+freezes (no zombie producer), and the sibling keeps producing and delivering
+(a stray cancel reaching it would freeze it and drain its record). Known limit,
+stated: a DUPLICATE wire CANCEL frame is indistinguishable at these seams (the
+protected record's retire is exactly-once and the token latches), so "one" is
+defended at the live level as "exactly one call retired, once, and only that
+call"; the double-emit failure mode is not discriminated here. The second
+draft's first run red was the draft's own mistimed production sample (a queued
+chunk satisfies `next()` instantly); the sample window was widened to span
+several tick periods BEFORE landing — the only window change in this row's
+history, and it strengthened the discriminator.
+
+**Regressions (executed at `d63e9c615`'s tree):**
+
+- The existing 42-roster: `cargo tf --retries 0 --test org_rpc_streaming` —
+  **42/42**, exit 0.
+- The existing SDK org estate: `cargo nextest run --no-fail-fast
+  --no-tests=fail --retries 0 -p net-mesh-sdk --features "…" --lib --test
+  org_exact_sensing` — **338/338**, exit 0.
+- `cargo fmt -p net-mesh-sdk -- --check` — exit 0.
+
+**Findings (state, not decide):**
+
+- **F-S3.2-1 — the §4.3 typed serve rows need crate-internal construction of
+  `RequestStreamTyped`/`ResponseSinkTyped` (source-established; RESOLVED BY
+  MAIN RULING).** Those types' fields are private to `sdk/src/mesh_rpc.rs` and
+  the only construction sites are the private `Typed*RpcHandler` adapters
+  behind `Mesh::serve_rpc_*_typed`, which drop `RpcContext`/
+  `RpcStreamingContext` — so they cannot project `OrgCaller`, and
+  `sdk/src/org/**` alone cannot produce the verbatim handler signatures. Main
+  ruled (option A): five `pub(crate) fn from_raw(inner, codec) -> Self`
+  constructors (`RpcStreamTyped`, `ClientStreamCallTyped`, `DuplexCallTyped`,
+  `RequestStreamTyped`, `ResponseSinkTyped`) land in S3.2's commit with their
+  consumer (same-commit doctrine), `pub(crate)` as the ceiling, constructors
+  only, zero public-API change, the probe's frozen-surface pin to still pass
+  unchanged.
+- **F-S3.1-2 — the protected-path handler cannot be a cancel-observer
+  (source-established, executed above).** Stated with the drop witness: the
+  retire supervisor may drop the handler future without a final poll. No core
+  change proposed or needed — the live contract is the retirement observables.
+
+**Never executed here (complete):**
+
+- The `org_streaming` suite on any feature set other than the plan's named one;
+  any other host/OS (all runs: this workstation, Windows).
+- The `webrtc`/wasm graphs, the benches, the bindings, `guards/org_api_probe`'s
+  rebuild (Row 3.3's named witness), `ci.yml`/nextest floors (Main's).
+- A wire-level CANCEL-frame COUNT (no seam exposes frame counts; see the drop
+  witness's stated limit).
+- Disclosure (disk): one `write` of `sdk/tests/org_streaming.rs` failed mid-work
+  with ENOSPC (detected and broadcast immediately per the hazard rule); free
+  space recovered before the retry (66 GiB observed), the file was rewritten in
+  full and verified under the F16 rule (size + sha256/line-count after every
+  write; the four touched files re-verified before this commit pair).
