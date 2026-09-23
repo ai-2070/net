@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/enrollment_storage.rs
+  s_3f3d4c91f992be::t_aa86323cb64575 297-310
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_f601a6a36286b0 5,23-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "465e331e8c492daa31e9677d19e1dbbc4c811d42",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
