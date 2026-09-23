@@ -1492,6 +1492,86 @@ hole-punch machinery. Also still open: a deployed project relay to fill
 `DEFAULT_RELAY`; a TCP/443 last-resort tunnel for UDP-blocked networks; and
 the earlier open items (lifecycle fencing, selective subnet semantics, V2
 exact-head acceptance).
+
+#### R2 status summary (2026-09-23)
+
+**Outcome.** Relay fallback works end to end. A device the agent cannot reach
+directly enrolls and attaches through a blind relay automatically, with no flag
+on the agent's side. When the direct path is viable, it is used first; the relay
+is never a prerequisite. The natsim lab confirms this (`natsim-enroll` run
+35808945349, both jobs pass). This meets the reachability requirement recorded
+under "Primary use case and reachability requirement".
+
+**What each phase added.**
+
+| Phase | Commit | Added |
+|---|---|---|
+| 1 | `898094987` | The core carries mesh sessions through a relay (`PeerAddr::Relayed`), and `net-mesh relay serve` runs one. The relay forwards ciphertext only: it never holds the PSK or any mesh credential and cannot join the mesh. |
+| 2 | `08c151d88` | Enrollment works through the relay (TCP splice). The joiner's stream is handed to the device, and the Noise NK handshake still proves the invite-pinned enrollment key, so neither the relay nor anyone who claims a splice can answer for the device. |
+| 3 | `e7cb22203` | See below. |
+| 4 | `5b515fc0e`..`b1d1c52fa` | The natsim rows below. |
+
+Phase 3 added:
+- Tokens and bundles carry an optional signed relay locator alongside an
+  optional direct address; at least one is required.
+- `join` and joined `up` try direct first and use the relay only if direct
+  cannot be reached. A refusal from the device is never rerouted.
+- `up --enroll --relay HOST:PORT` (or the profile `relay` key; `--no-relay`
+  turns it off) registers in the background, so a relay that is down never
+  blocks start-up.
+- `join` reports `enroll_path` and `attach_path`; joined `up` reports
+  `joined.path`.
+
+**natsim rows** (run 35808945349):
+
+| Setup | Result |
+|---|---|
+| Relay down, router mapping working | Joins directly |
+| Relay and mapping both up | Still joins directly; `splices` = 0 |
+| Direct path forced dead | `join`, the attach and joined `up` all go through the relay |
+
+In the forced-dead row, the gateway's conntrack shows the agent's direct attempt
+unanswered, only the device's outbound flows to the relay, and nothing reaching
+the device directly. The relay's own counters confirm the relayed session.
+
+**Defects the witnesses found (fixed).**
+- **Core handshake:** a routed handshake cut off by its caller's timeout left
+  its pending entry behind, so the relay attempt to the same peer failed
+  "handshake already in flight". The `PendingInitiator` guard now removes only
+  that attempt's own entry.
+- **Windows port selection:** Windows reserves TCP-only and UDP-only port
+  blocks and hands out ephemeral ports roughly in sequence, so retrying the
+  OS's pick kept failing. The relay bind and the enrollment `free_port` now fall
+  back to random dynamic-range ports until one binds for both protocols.
+- **Joined-`up` attach wait:** raised from 10 s to 20 s. After a dead direct
+  attempt (5 s), the device still defers a re-attaching identity for about 5 s.
+- **`relay serve`:** now stops cleanly on SIGTERM and reports its splice
+  counters.
+
+The three natsim reruns fixed scenario-script problems only (a signal sent to a
+forked subshell, and stale conntrack entries from earlier rows). None touched
+product code.
+
+**Verification.** Every change has witnesses, and each protection was checked
+by breaking it in place, confirming its witness fails, and restoring it
+byte-identically.
+
+Last local results:
+- lib 5810/5810;
+- SDK enrollment 56/56;
+- `net-cli` 345/345;
+- the `connect_via` integration binaries 116/116;
+- clippy and rustdoc clean.
+
+The full CI suite on the pushed head (run 35808941788) was still queued when
+this was recorded; its result is not yet a receipt.
+
+**Still open.**
+- R2 phase 5, upgrading a relayed session to direct (planned for later).
+- `DEFAULT_RELAY` stays empty until a relay is actually deployed.
+- A TCP/443 last-resort tunnel for networks that block UDP entirely.
+- The earlier V3 open items: lifecycle fencing, selective subnet semantics,
+  and V2 exact-head acceptance.
 Lifecycle fencing, selective subnet semantics and V2 exact-head acceptance
 remain open.
 
