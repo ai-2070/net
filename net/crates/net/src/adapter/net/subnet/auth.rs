@@ -1304,6 +1304,27 @@ impl SubnetFloorRegistry {
         false
     }
 
+    /// The subject floor held exactly at `(authority, topology_epoch,
+    /// path, subject)`: its revision and per-right generations (ATTACH,
+    /// ROUTE, EXPORT), or zeros when none is held. Readback only.
+    pub fn subject_floor_state(
+        &self,
+        authority: &EntityId,
+        topology_epoch: u32,
+        path: TopologySubnetId,
+        subject: &EntityId,
+    ) -> (u64, [u32; 3]) {
+        self.subject_floors
+            .get(&(
+                *authority.as_bytes(),
+                topology_epoch,
+                path.raw(),
+                *subject.as_bytes(),
+            ))
+            .map(|e| (e.revision, e.generations))
+            .unwrap_or((0, [0; 3]))
+    }
+
     /// Whether any subject floor for `subject` covers `target` (or an
     /// ancestor) with a non-zero generation for a right in `rights` —
     /// the conservative test used to drop live contexts on apply;

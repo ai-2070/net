@@ -434,3 +434,166 @@ async fn only_a_root_signs_and_the_wire_kind_is_strict() {
         "an unknown kind fails closed"
     );
 }
+
+/// Readback (V3-4 slice 2): each named verifier answers for itself with a
+/// signature over the exact request, so the caller can report applied,
+/// applied-but-not-persisted, refused, and no-answer separately — and an
+/// owner cannot be told "applied" by anyone but the verifier.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readback_reports_each_verifier_separately_and_cannot_be_forged() {
+    use net::adapter::net::subnet::floor_status::{FloorApplyOutcome, FloorStatusRequest};
+    use net::adapter::net::SubnetFloorQueryError;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let operator = node(&EntityKeypair::generate()).await;
+    // Durable verifier, volatile verifier, an older node with no readback
+    // service, and a verifier that does not recognise this authority.
+    let durable = Arc::new(
+        MeshNode::new(
+            EntityKeypair::generate(),
+            verifier_config(Some(&tmp.path().join("floors"))),
+        )
+        .await
+        .unwrap(),
+    );
+    let volatile = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), verifier_config(None))
+            .await
+            .unwrap(),
+    );
+    let older = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), verifier_config(None))
+            .await
+            .unwrap(),
+    );
+    let stranger = node(&EntityKeypair::generate()).await;
+    let _serving = [
+        durable.serve_subnet_floor_status().unwrap(),
+        volatile.serve_subnet_floor_status().unwrap(),
+        stranger.serve_subnet_floor_status().unwrap(),
+    ];
+    for v in [&durable, &volatile, &older, &stranger] {
+        handshake(&operator, v).await;
+    }
+
+    let b = EntityKeypair::generate();
+    let floor = subject_floor(&b, SubnetRights::ATTACH, 2, 1);
+    let request_for = |v: &Arc<MeshNode>, apply: bool, signer: &EntityKeypair| {
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        FloorStatusRequest::try_issue(
+            signer,
+            scope(S),
+            0,
+            b.entity_id().clone(),
+            v.entity_id().clone(),
+            nonce,
+            unix_now_secs(),
+            apply.then_some(&floor),
+        )
+        .unwrap()
+    };
+    let t = Duration::from_secs(3);
+
+    let a = operator
+        .query_subnet_floor_status(durable.node_id(), &request_for(&durable, true, &root()), t)
+        .await
+        .expect("durable verifier attests");
+    assert_eq!(a.apply, FloorApplyOutcome::Applied);
+    assert!(a.persisted && a.covers(SubnetRights::ATTACH, 2));
+    assert_eq!(a.verifier, *durable.entity_id());
+
+    let a = operator
+        .query_subnet_floor_status(
+            volatile.node_id(),
+            &request_for(&volatile, true, &root()),
+            t,
+        )
+        .await
+        .expect("volatile verifier attests");
+    assert_eq!(a.apply, FloorApplyOutcome::Applied);
+    assert!(!a.persisted, "no floor store: applied, but not durable");
+
+    let err = operator
+        .query_subnet_floor_status(older.node_id(), &request_for(&older, true, &root()), t)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SubnetFloorQueryError::NoAnswer(_)),
+        "a verifier without readback yields no attestation: {err:?}"
+    );
+
+    let err = operator
+        .query_subnet_floor_status(
+            stranger.node_id(),
+            &request_for(&stranger, true, &root()),
+            t,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        SubnetFloorQueryError::Refused("subnet:unknown_authority".into())
+    );
+
+    // A non-root cannot drive or read a verifier.
+    let err = operator
+        .query_subnet_floor_status(
+            durable.node_id(),
+            &request_for(&durable, false, &EntityKeypair::generate()),
+            t,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        SubnetFloorQueryError::Refused("subnet:issuer_not_authorized".into())
+    );
+
+    // Status-only readback reflects the held floor; re-applying is a no-op.
+    let a = operator
+        .query_subnet_floor_status(durable.node_id(), &request_for(&durable, false, &root()), t)
+        .await
+        .unwrap();
+    assert_eq!(a.apply, FloorApplyOutcome::NotRequested);
+    assert_eq!((a.revision, a.generations), (1, [2, 0, 0]));
+    let a = operator
+        .query_subnet_floor_status(durable.node_id(), &request_for(&durable, true, &root()), t)
+        .await
+        .unwrap();
+    assert_eq!(a.apply, FloorApplyOutcome::Unchanged);
+
+    // A stale request is refused: the answer must be fresh.
+    let stale = FloorStatusRequest::try_issue(
+        &root(),
+        scope(S),
+        0,
+        b.entity_id().clone(),
+        durable.entity_id().clone(),
+        [7; 16],
+        unix_now_secs() - 10_000,
+        None,
+    )
+    .unwrap();
+    let err = operator
+        .query_subnet_floor_status(durable.node_id(), &stale, t)
+        .await
+        .unwrap_err();
+    assert_eq!(err, SubnetFloorQueryError::Refused("subnet:expired".into()));
+
+    // A request addressed to one verifier is refused by another, so an
+    // attestation can never be obtained under someone else's name.
+    let err = operator
+        .query_subnet_floor_status(
+            volatile.node_id(),
+            &request_for(&durable, false, &root()),
+            t,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        SubnetFloorQueryError::Refused("subnet:wrong_verifier".into())
+    );
+}

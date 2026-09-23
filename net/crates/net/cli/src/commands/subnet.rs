@@ -70,6 +70,58 @@ pub enum SubnetCommand {
     /// issuer grant, or control fact) WITHOUT private material.
     /// Exits non-zero for malformed or non-canonical data.
     Inspect(InspectArgs),
+    /// Remove one subject's named rights inside one scope: sign a subject
+    /// floor, hand it to each named verifier, and report — per verifier,
+    /// from its own signed attestation — whether it applied and persisted
+    /// it. Unnamed verifiers are never assumed; `complete` is true only
+    /// when every named verifier attested a persisted floor.
+    Remove(RemoveArgs),
+}
+
+/// `net-mesh subnet remove` arguments.
+#[derive(Args, Debug)]
+pub struct RemoveArgs {
+    /// Path to the AUTHORITY ROOT key file.
+    #[arg(long = "root-key", value_name = "PATH")]
+    pub root_key: PathBuf,
+    /// The authority id (64 hex chars).
+    #[arg(long)]
+    pub authority: String,
+    /// The scope the subject is removed from: dotted path or `global`.
+    #[arg(long)]
+    pub scope: String,
+    /// Topology epoch (explicit).
+    #[arg(long = "topology-epoch")]
+    pub topology_epoch: u32,
+    /// Subject-floor revision for `(scope, subject)`; must exceed any
+    /// earlier one for the verifiers to apply it.
+    #[arg(long)]
+    pub revision: u64,
+    /// The removed subject's full entity id (64 hex chars).
+    #[arg(long)]
+    pub subject: String,
+    /// Rights removed. Defaults to `attach` only.
+    #[arg(long, default_value = "attach")]
+    pub rights: String,
+    /// Only a root-direct grant at or above this generation re-admits.
+    #[arg(long = "minimum-generation")]
+    pub minimum_generation: u32,
+    /// An enforcement point: `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`.
+    /// Repeat for each verifier; only these are checked.
+    #[arg(long = "verifier", value_name = "CONTACT", required = true)]
+    pub verifiers: Vec<String>,
+    /// Mesh PSK (64 hex chars); defaults to the profile `psk_hex`.
+    #[arg(long = "psk-hex", value_name = "HEX")]
+    pub psk_hex: Option<String>,
+    /// Query each verifier's current state without applying anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Per-verifier bound on connecting and answering.
+    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = crate::humantime::parse_duration)]
+    pub wait: std::time::Duration,
+    /// Allow permissive root-key file modes on Unix.
+    #[arg(long)]
+    pub insecure_permissions: bool,
 }
 
 #[derive(Args, Debug)]
@@ -128,7 +180,197 @@ pub async fn run(
         SubnetCommand::IssueDelegated(args) => run_issue_delegated(args, output).await,
         SubnetCommand::IssueControlFact(args) => run_issue_control_fact(args, output).await,
         SubnetCommand::Inspect(args) => run_inspect(args, output).await,
+        SubnetCommand::Remove(args) => {
+            let profile = resolve_profile(config_path, profile_name).await?;
+            run_remove(args, profile.psk_hex, output).await
+        }
     }
+}
+
+/// One named enforcement point.
+struct VerifierContact {
+    entity: net::adapter::net::identity::EntityId,
+    addr: std::net::SocketAddr,
+    noise_pubkey: [u8; 32],
+}
+
+fn parse_verifier(raw: &str) -> Result<VerifierContact, CliError> {
+    let bad = || {
+        invalid_args(format!(
+            "--verifier `{raw}`: expected ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX"
+        ))
+    };
+    let (entity, rest) = raw.split_once('@').ok_or_else(bad)?;
+    let (addr, pubkey) = rest.split_once('#').ok_or_else(bad)?;
+    let entity = parse_entity_hex(entity)?;
+    let addr = addr.parse().map_err(|_| bad())?;
+    let noise_pubkey = crate::parsers::hex_decode_32(pubkey).map_err(|_| bad())?;
+    Ok(VerifierContact {
+        entity,
+        addr,
+        noise_pubkey,
+    })
+}
+
+/// Ask one verifier, over its own attached session, and classify the
+/// answer from its signed attestation only.
+async fn ask_verifier(
+    contact: &VerifierContact,
+    request: &net::adapter::net::subnet::floor_status::FloorStatusRequest,
+    psk: [u8; 32],
+    rights: SubnetRights,
+    minimum_generation: u32,
+    wait: std::time::Duration,
+) -> serde_json::Value {
+    use net::adapter::net::subnet::floor_status::FloorApplyOutcome;
+    use net::adapter::net::SubnetFloorQueryError;
+    let entity = hex::encode(contact.entity.as_bytes());
+    let remote = crate::context::RemoteAttach {
+        bind: if contact.addr.ip().is_loopback() {
+            std::net::SocketAddr::new(contact.addr.ip(), 0)
+        } else if contact.addr.is_ipv4() {
+            std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            std::net::SocketAddr::from(([0u16; 8], 0))
+        },
+        addr: contact.addr,
+        public_key: contact.noise_pubkey,
+        node_id: contact.entity.node_id(),
+        psk,
+    };
+    let outcome = tokio::time::timeout(wait, async {
+        let mesh = crate::context::build_attached_mesh(None, &remote)
+            .await
+            .map_err(|e| SubnetFloorQueryError::NoAnswer(e.to_string()))?;
+        let result = mesh
+            .node()
+            .query_subnet_floor_status(contact.entity.node_id(), request, wait)
+            .await;
+        let _ = mesh.shutdown().await;
+        result
+    })
+    .await
+    .unwrap_or_else(|_| Err(SubnetFloorQueryError::NoAnswer("timed out".into())));
+    match outcome {
+        Ok(a) => {
+            let covers = a.covers(rights, minimum_generation);
+            let state = match (a.apply, covers, a.persisted) {
+                (FloorApplyOutcome::Refused(_), _, _) => "refused",
+                (_, true, true) => "applied",
+                (_, true, false) => "applied_not_persisted",
+                (_, false, _) => "not_applied",
+            };
+            serde_json::json!({
+                "verifier": entity,
+                "state": state,
+                "apply": a.apply.as_str(),
+                "reason": match a.apply {
+                    FloorApplyOutcome::Refused(e) => Some(format!("subnet:{e}")),
+                    _ => None,
+                },
+                "revision": a.revision,
+                "generations": { "attach": a.generations[0], "route": a.generations[1], "export": a.generations[2] },
+                "persisted": a.persisted,
+                "attested": true,
+            })
+        }
+        Err(e) => serde_json::json!({
+            "verifier": entity,
+            "state": match e {
+                SubnetFloorQueryError::Refused(_) => "request_refused",
+                _ => "no_attestation",
+            },
+            "reason": e.to_string(),
+            "attested": false,
+        }),
+    }
+}
+
+async fn run_remove(
+    args: RemoveArgs,
+    profile_psk: Option<String>,
+    output: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    use net::adapter::net::subnet::floor_status::FloorStatusRequest;
+    let subject = parse_entity_hex(&args.subject)?;
+    let rights = parse_subnet_rights(&args.rights)?;
+    if args.minimum_generation == 0 {
+        return Err(invalid_args("--minimum-generation 0 removes nothing"));
+    }
+    let contacts = args
+        .verifiers
+        .iter()
+        .map(|v| parse_verifier(v))
+        .collect::<Result<Vec<_>, _>>()?;
+    let psk_raw = args.psk_hex.or(profile_psk).ok_or_else(|| {
+        invalid_args("the mesh PSK is required to reach verifiers: pass --psk-hex or set the profile psk_hex")
+    })?;
+    let psk = crate::context::parse_psk_hex(&psk_raw)?;
+    let root = load_subnet_key(&args.root_key, args.insecure_permissions).await?;
+    let scope = SubnetRef {
+        authority: parse_entity_hex(&args.authority)?,
+        path: parse_subnet_path(&args.scope)?,
+    };
+    let floor = SubnetSubjectFloor::try_issue(
+        &root,
+        scope.clone(),
+        args.topology_epoch,
+        subject.clone(),
+        rights,
+        args.minimum_generation,
+        args.revision,
+        unix_now(),
+    )
+    .map_err(|e| invalid_args(format!("subject-floor: subnet:{e}")))?;
+
+    let mut rows = Vec::with_capacity(contacts.len());
+    for contact in &contacts {
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).map_err(|_| generic("operating-system CSPRNG unavailable"))?;
+        let request = FloorStatusRequest::try_issue(
+            &root,
+            scope.clone(),
+            args.topology_epoch,
+            subject.clone(),
+            contact.entity.clone(),
+            nonce,
+            unix_now(),
+            (!args.dry_run).then_some(&floor),
+        )
+        .map_err(|e| generic(format!("readback request: subnet:{e}")))?;
+        rows.push(
+            ask_verifier(
+                contact,
+                &request,
+                psk,
+                rights,
+                args.minimum_generation,
+                args.wait,
+            )
+            .await,
+        );
+    }
+    let applied = rows.iter().filter(|r| r["state"] == "applied").count();
+    let complete = !args.dry_run && applied == rows.len();
+    emit_value(
+        OutputFormat::resolve_oneshot(output),
+        &serde_json::json!({
+            "action": if args.dry_run { "dry_run" } else { "remove" },
+            "subject_hex": hex::encode(subject.as_bytes()),
+            "authority_hex": hex::encode(scope.authority.as_bytes()),
+            "scope": format_subnet(scope.path),
+            "rights": format_subnet_rights(rights),
+            "minimum_generation": args.minimum_generation,
+            "revision": args.revision,
+            "verifiers": rows,
+            "applied": applied,
+            "pending": contacts.len() - applied,
+            // True only when EVERY named verifier attested a persisted floor.
+            "complete": complete,
+            "coverage": "only the named verifiers were checked; any other enforcement point is unknown",
+        }),
+    )
+    .map_err(|e| generic(format!("write result: {e}")))
 }
 
 /// Resolve only offline artifact selections; never decode grants or sign facts.

@@ -2084,6 +2084,85 @@ Readback is therefore two signed artifacts over ordinary nRPC (service
   named by a full contact, `ENTITY@HOST:PORT#NOISE_PUBKEY`, with the mesh PSK
   as in existing remote attach. `--dry-run` queries status without applying.
 
+#### V3-4 slice 2 — receipt (2026-09-23)
+
+**Core.**
+- `subnet/floor_status.rs` defines `FloorStatusRequest` (root-signed, bound to
+  one verifier, a nonce and `issued_at`, optionally carrying a subject floor
+  for the same scope, epoch and subject) and `FloorStatusAttestation`
+  (verifier-signed over the request digest).
+- `MeshNode::answer_subnet_floor_status` refuses a request that is:
+  - addressed to another verifier (`wrong_verifier`);
+  - signed by a non-root (`issuer_not_authorized`);
+  - stale or future-dated beyond ±300 s (`expired` / `not_yet_valid`).
+
+  It applies a carried floor through the normal (persisting) path and signs
+  what it now holds, including `persisted`.
+- `serve_subnet_floor_status` (opt-in) serves service `net.subnet.floor`.
+- `query_subnet_floor_status` accepts an answer only when `verify_for` passes.
+  A missing service (`NotFound`) or no route is `NoAnswer`, never `Refused`.
+
+**CLI.** `net-mesh subnet remove --root-key … --authority … --scope …
+--topology-epoch … --revision … --subject … [--rights attach]
+--minimum-generation N --verifier ENTITY@HOST:PORT#PUBKEY … [--psk-hex]
+[--dry-run] [--wait]`:
+- It signs the floor once and attaches to each named verifier over its own
+  session.
+- It reports each verifier's `state`: `applied`, `applied_not_persisted`,
+  `not_applied`, `refused` (attested), `request_refused`, or
+  `no_attestation`.
+- It reports `applied` and `pending` counts, `complete` (true only when every
+  named verifier attested a persisted floor; never on a dry run), and
+  `coverage` ("only the named verifiers were checked").
+
+Witnesses:
+- Unit `floor_status` 2/2: a round trip; the attestation is bound to its exact
+  request (another nonce gives `WrongChallenge`); a foreign signer gives
+  `WrongVerifier`; tampering gives `InvalidSignature`; a request cannot carry
+  another subject's floor.
+- Core `readback_reports_each_verifier_separately_and_cannot_be_forged`:
+  - durable → `Applied` and persisted;
+  - volatile → `Applied`, not persisted;
+  - older (no service) → `NoAnswer`;
+  - stranger authority → `Refused(unknown_authority)`;
+  - non-root → `Refused(issuer_not_authorized)`;
+  - stale → `Refused(expired)`;
+  - status-only → `NotRequested` with the held `(1, [2,0,0])`;
+  - re-apply → `Unchanged`;
+  - a request for durable sent to volatile → `Refused(wrong_verifier)`.
+- CLI `cli/tests/subnet_remove.rs`, with a real subprocess against in-process
+  verifiers:
+  - a dry run is `not_requested` and never complete;
+  - a removal gives durable `applied`, volatile `applied_not_persisted`, older
+    `no_attestation`, 1 applied / 2 pending, not complete;
+  - B's old grant is then refused at the durable verifier;
+  - naming only the durable verifier re-runs as `unchanged` and complete.
+
+Inverse mutations, 7 of 7 caught by their witnesses and then restored
+byte-identically:
+- the verifier answering any signer;
+- the verifier answering a request for another verifier;
+- the verifier answering stale requests;
+- the verifier claiming persistence it lacks;
+- the caller accepting an attestation for another request;
+- the CLI counting a volatile floor as applied;
+- the CLI reporting complete with verifiers pending.
+
+Regressions:
+- `cargo tl` 5813/5813.
+- The 14 CI-pinned subnet binaries 117/117, and `subnet_auth_e2e` 23/23.
+- The full SDK suite as CI runs it: 806/806.
+- `net-cli` 350/350.
+- Clippy (core all-features all-targets, lib/bins all, default and
+  no-default; SDK `full`; `net-cli`) and rustdoc (root, SDK `full`) are clean.
+
+**Still open (V3-4).**
+- `up` does not yet act as a subnet verifier: no CLI-run node configures an
+  authority, floor store or readback service. Operators run verifiers through
+  the SDK/core until subnet enrollment (V3-2) wires them.
+- Discovering enforcement points: the caller names them. Gateway
+  advertisements could seed that list later.
+- Organization removal is unchanged.
 
 ### V3-5 — public journey, CI and release acceptance
 

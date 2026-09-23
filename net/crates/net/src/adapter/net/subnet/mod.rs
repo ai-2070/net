@@ -19,6 +19,7 @@ mod assignment;
 pub mod auth;
 pub mod control;
 mod error;
+pub mod floor_status;
 pub mod floor_store;
 mod gateway;
 mod id;

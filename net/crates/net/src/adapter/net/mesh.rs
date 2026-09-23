@@ -3993,6 +3993,68 @@ struct PendingHandshake {
     tx: oneshot::Sender<Result<SessionKeys, CryptoError>>,
 }
 
+/// Why a floor readback produced no usable attestation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SubnetFloorQueryError {
+    /// No answer: unreachable, no such service (a verifier that predates
+    /// readback), or the deadline passed.
+    #[error("no attestation: {0}")]
+    NoAnswer(String),
+    /// The verifier refused the request itself (e.g. not a configured
+    /// root, stale, not addressed to it); the message is its reason.
+    #[error("request refused: {0}")]
+    Refused(String),
+    /// An answer arrived but was not a valid attestation from the named
+    /// verifier for this exact request.
+    #[error("invalid attestation: {0}")]
+    BadAttestation(String),
+}
+
+#[cfg(feature = "cortex")]
+struct SubnetFloorStatusHandler {
+    node: std::sync::Weak<MeshNode>,
+}
+
+#[cfg(feature = "cortex")]
+#[async_trait::async_trait]
+impl super::cortex::rpc::RpcHandler for SubnetFloorStatusHandler {
+    async fn call(
+        &self,
+        ctx: super::cortex::rpc::RpcContext,
+    ) -> Result<super::cortex::rpc::RpcResponsePayload, super::cortex::rpc::RpcHandlerError> {
+        use super::cortex::rpc::{RpcResponsePayload, RpcStatus};
+        let Some(node) = self.node.upgrade() else {
+            return Ok(RpcResponsePayload {
+                status: RpcStatus::Internal,
+                headers: Vec::new(),
+                body: Bytes::from_static(b"node is shutting down"),
+            });
+        };
+        let body = ctx.payload.body.clone();
+        let answered = tokio::task::spawn_blocking(move || {
+            node.answer_subnet_floor_status(&body, super::subnet::admission::unix_now_secs())
+        })
+        .await;
+        Ok(match answered {
+            Ok(Ok(attestation)) => RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: Vec::new(),
+                body: Bytes::from(attestation.to_bytes()),
+            },
+            Ok(Err(e)) => RpcResponsePayload {
+                status: RpcStatus::Unauthorized,
+                headers: Vec::new(),
+                body: Bytes::from(format!("subnet:{e}")),
+            },
+            Err(_) => RpcResponsePayload {
+                status: RpcStatus::Internal,
+                headers: Vec::new(),
+                body: Bytes::from_static(b"floor readback failed"),
+            },
+        })
+    }
+}
+
 /// One routed-handshake attempt's claim on its `pending_handshakes` entry.
 /// If the attempt is cancelled — its future dropped, e.g. by a caller's
 /// timeout before the fallback path — the entry would otherwise outlive it
@@ -20068,6 +20130,129 @@ impl MeshNode {
             );
         }
         Ok(changed)
+    }
+
+    /// Answer one authenticated floor readback request (V3-4 slice 2): it
+    /// must name THIS node as verifier, be signed by one of the
+    /// authority's configured roots, and be fresh. A carried subject floor
+    /// is applied first (through the same path as any other arrival, so
+    /// it is persisted before it counts). The answer is signed with this
+    /// node's entity key over the request digest. A malformed, foreign or
+    /// stale request is refused with no attestation.
+    pub fn answer_subnet_floor_status(
+        &self,
+        request_bytes: &[u8],
+        now_secs: u64,
+    ) -> Result<super::subnet::floor_status::FloorStatusAttestation, SubnetAuthError> {
+        use super::subnet::floor_status::{
+            FloorApplyOutcome, FloorStatusAttestation, FloorStatusRequest,
+            FLOOR_STATUS_FRESHNESS_SECS,
+        };
+        let request = FloorStatusRequest::from_bytes(request_bytes)?;
+        if &request.verifier != self.entity_id() {
+            return Err(SubnetAuthError::WrongVerifier);
+        }
+        let config = self
+            .subnet_authority_config(&request.scope.authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+        if !config.roots.contains(&request.signer) {
+            return Err(SubnetAuthError::IssuerNotAuthorized);
+        }
+        request.verify_signature()?;
+        if request.issued_at > now_secs.saturating_add(FLOOR_STATUS_FRESHNESS_SECS) {
+            return Err(SubnetAuthError::NotYetValid);
+        }
+        if now_secs
+            > request
+                .issued_at
+                .saturating_add(FLOOR_STATUS_FRESHNESS_SECS)
+        {
+            return Err(SubnetAuthError::Expired);
+        }
+        let apply = match request.apply_fact()? {
+            None => FloorApplyOutcome::NotRequested,
+            Some(floor) => match self.apply_subnet_subject_floor(&floor) {
+                Ok(true) => FloorApplyOutcome::Applied,
+                Ok(false) => FloorApplyOutcome::Unchanged,
+                Err(e) => FloorApplyOutcome::Refused(e),
+            },
+        };
+        let (revision, generations) = self.subnet_floors.subject_floor_state(
+            &request.scope.authority,
+            request.topology_epoch,
+            request.scope.path,
+            &request.subject,
+        );
+        FloorStatusAttestation::sign(
+            self.entity_keypair(),
+            request.digest(),
+            apply,
+            revision,
+            generations,
+            self.subnet_floor_store.is_some(),
+        )
+    }
+
+    /// Serve floor readback on [`FLOOR_STATUS_SERVICE`]. Opt-in: a
+    /// verifier that does not serve it is reported by callers as having
+    /// given no attestation, never as having applied anything.
+    ///
+    /// [`FLOOR_STATUS_SERVICE`]: super::subnet::floor_status::FLOOR_STATUS_SERVICE
+    #[cfg(feature = "cortex")]
+    pub fn serve_subnet_floor_status(
+        self: &Arc<Self>,
+    ) -> Result<super::mesh_rpc::ServeHandle, super::mesh_rpc::ServeError> {
+        self.serve_rpc(
+            super::subnet::floor_status::FLOOR_STATUS_SERVICE,
+            Arc::new(SubnetFloorStatusHandler {
+                node: Arc::downgrade(self),
+            }),
+        )
+    }
+
+    /// Ask `verifier_node` for its floor state (and, if the request
+    /// carries one, to apply a subject floor), accepting the answer only
+    /// if it is signed by the verifier the request names and answers
+    /// exactly this request.
+    #[cfg(feature = "cortex")]
+    pub async fn query_subnet_floor_status(
+        self: &Arc<Self>,
+        verifier_node: u64,
+        request: &super::subnet::floor_status::FloorStatusRequest,
+        timeout: Duration,
+    ) -> Result<super::subnet::floor_status::FloorStatusAttestation, SubnetFloorQueryError> {
+        use super::subnet::floor_status::{FloorStatusAttestation, FLOOR_STATUS_SERVICE};
+        let opts = super::mesh_rpc::CallOptions {
+            deadline: Some(Instant::now() + timeout),
+            ..Default::default()
+        };
+        let reply = self
+            .call(
+                verifier_node,
+                FLOOR_STATUS_SERVICE,
+                Bytes::from(request.to_bytes()),
+                opts,
+            )
+            .await
+            .map_err(|e| match e {
+                // No such service: a verifier that predates readback. It
+                // gave no attestation; it did not refuse anything.
+                super::mesh_rpc::RpcError::ServerError {
+                    status, message, ..
+                } if status == super::cortex::rpc::RpcStatus::NotFound.to_wire() => {
+                    SubnetFloorQueryError::NoAnswer(message)
+                }
+                super::mesh_rpc::RpcError::ServerError { message, .. } => {
+                    SubnetFloorQueryError::Refused(message)
+                }
+                other => SubnetFloorQueryError::NoAnswer(other.to_string()),
+            })?;
+        let attestation = FloorStatusAttestation::from_bytes(&reply.body)
+            .map_err(|e| SubnetFloorQueryError::BadAttestation(e.to_string()))?;
+        attestation
+            .verify_for(request)
+            .map_err(|e| SubnetFloorQueryError::BadAttestation(e.to_string()))?;
+        Ok(attestation)
     }
 
     /// Verify and apply one wire-form subnet control fact
