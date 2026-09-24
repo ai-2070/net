@@ -3930,6 +3930,33 @@ Slices, in order:
 
 Then the remaining test-only rows: E4, E5, E9, E11, E12 and E25.
 
+**S1 receipt: E23 (2026-09-25).**
+- **`invite create --channel`** reports, next to the invitation's own
+  redemption `expires_at`:
+  - `channel.credential_expires_at`: the grant's `not_after`, which every
+    device leaf inherits;
+  - `channel.delegation: none…`;
+  - `channel.publisher`: this node for a subscribe right, "none: publish is
+    local" for publish.
+- **`join`** reports the delivered leaf's own `credential_expires_at` and
+  the delegation limit.
+- **Overrides.**
+  - The CLI has no lifetime, depth or publisher override flags, so each is
+    refused as an unknown argument.
+  - The `invite_create` control op refuses `channel_ttl`,
+    `channel_depth` and `channel_publisher` rather than ignoring them. This
+    is defense in depth: the CLI never sends them, so no subprocess witness
+    reaches it.
+- **Witness:** `channel_join::a_device_joins_with_a_channel_credential_minted_from_an_offline_grant`:
+  - the created and joined credential expiry each equal the grant's
+    `not_after`;
+  - the credential expiry differs from the redemption expiry;
+  - the delegation limit and publisher are shown;
+  - the three override flags are refused.
+- **Inverse mutations, RED (2):** the create-side expiry replaced, and the
+  join-side expiry dropped.
+- **Gates:** CLI clippy `--all-targets`; CLI 370/370.
+
 **Still open against the matrix (disclosed, not claimed):**
 
 | Row | Open item |

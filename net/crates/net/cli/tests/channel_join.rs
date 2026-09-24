@@ -303,6 +303,37 @@ fn a_device_joins_with_a_channel_credential_minted_from_an_offline_grant() {
     assert_eq!(created["channel"]["channel"], CHANNEL, "{created}");
     assert_eq!(created["channel"]["rights"], "subscribe");
     assert_eq!(created["channel"]["root"], root_hex.as_str());
+    // E23: the credential lives exactly as long as the grant — distinct from
+    // when the invitation stops being redeemable — cannot delegate, and names
+    // this node as publisher.
+    assert_eq!(
+        created["channel"]["credential_expires_at"], issued["not_after"],
+        "{created}"
+    );
+    assert_ne!(
+        created["channel"]["credential_expires_at"],
+        created["expires_at"]
+    );
+    assert!(created["channel"]["delegation"]
+        .as_str()
+        .unwrap()
+        .starts_with("none"));
+    assert_eq!(created["channel"]["publisher"], "this node (the issuer)");
+    // Lifetime, depth and publisher overrides do not exist; asking for one
+    // is refused, never silently ignored.
+    for flag in ["--channel-ttl", "--channel-depth", "--channel-publisher"] {
+        let refused = operator.run(&[
+            "invite",
+            "create",
+            "--channel",
+            CHANNEL,
+            "--channel-rights",
+            "subscribe",
+            flag,
+            "1",
+        ]);
+        assert!(!refused.status.success(), "{flag} must be refused");
+    }
     let token = created["token"].as_str().unwrap().to_string();
     let inspected = operator.json_stateless(&["invite", "inspect", &token]);
     assert_eq!(inspected["channel"]["channel"], CHANNEL, "{inspected}");
@@ -318,6 +349,10 @@ fn a_device_joins_with_a_channel_credential_minted_from_an_offline_grant() {
     assert_eq!(joined["state"], "joined", "{joined}");
     assert_eq!(joined["channel"]["credential"], "stored", "{joined}");
     assert_eq!(joined["channel"]["rights"], "subscribe");
+    assert_eq!(
+        joined["channel"]["credential_expires_at"], issued["not_after"],
+        "{joined}"
+    );
 
     // A publish link needs no serving here (the device's runtime must trust
     // the root itself).

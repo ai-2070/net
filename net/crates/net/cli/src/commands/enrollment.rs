@@ -499,6 +499,9 @@ async fn relay_loop(
     }
 }
 
+/// What a device's channel credential may delegate: nothing.
+const CHANNEL_DELEGATION: &str = "none: the device's credential cannot delegate further";
+
 fn channel_json(o: &net_sdk::enrollment::invite::ChannelOffer) -> Value {
     json!({
         "channel": o.channel.as_str(),
@@ -924,6 +927,25 @@ impl EnrollContext {
         if org.is_some() {
             relations.push(Relation::Org);
         }
+        // The link shape is {channel, root, rights}: lifetime is the grant's,
+        // the leaf never delegates and the publisher is this node. Overrides
+        // are refused, never ignored.
+        for unsupported in ["channel_ttl", "channel_depth", "channel_publisher"] {
+            if !request[unsupported].is_null() {
+                return Err(format!(
+                    "{unsupported} is not supported: a channel credential lives exactly as long                      as this node's grant, cannot delegate, and names this node as publisher"
+                ));
+            }
+        }
+        let channel_expiry = request["channel"]
+            .as_str()
+            .and_then(|n| net::adapter::net::channel::ChannelName::new(n).ok())
+            .and_then(|n| {
+                self.channels
+                    .iter()
+                    .find(|(c, _)| c == &n)
+                    .map(|(_, i)| i.not_after())
+            });
         let channel = match request["channel"].as_str() {
             None => None,
             Some(_) if standalone => {
@@ -994,7 +1016,19 @@ impl EnrollContext {
             })),
             "standalone": standalone,
             "org": org.as_ref().map(|o| hex::encode(o.org.0)),
-            "channel": channel.as_ref().map(channel_json),
+            "channel": channel.as_ref().map(|o| {
+                let mut v = channel_json(o);
+                // Redemption expiry is `expires_at` above; this is the
+                // credential's, fixed by the grant.
+                v["credential_expires_at"] = json!(channel_expiry);
+                v["delegation"] = json!(CHANNEL_DELEGATION);
+                v["publisher"] = json!(if o.rights.contains(net::adapter::net::identity::TokenScope::SUBSCRIBE) {
+                    "this node (the issuer)"
+                } else {
+                    "none: publish is local to the device"
+                });
+                v
+            }),
             "issuer_fingerprint": invite.issuer_fingerprint(),
         }))
     }
@@ -1938,6 +1972,9 @@ pub async fn run_join(
     };
     let contact = bundle.contact().clone();
     let trust_domain = bundle.psk().trust_domain().to_string();
+    let channel_expires_at = bundle
+        .channel_chain()
+        .and_then(|chain| chain.tokens.last().map(|leaf| leaf.not_after));
     let enroll_path = join.last_path().map(|p| p.as_str());
     // An org relation: adopt the delivered membership as this node's owner
     // org (validated, one owner org per node, durable); `up` installs it.
@@ -2011,6 +2048,10 @@ pub async fn run_join(
             "channel": invite.channel().map(|o| {
                 let mut v = channel_json(o);
                 v["credential"] = json!("stored");
+                // The credential's own lifetime (the grant's), distinct from
+                // when the invitation stopped being redeemable.
+                v["credential_expires_at"] = json!(channel_expires_at);
+                v["delegation"] = json!(CHANNEL_DELEGATION);
                 v
             }),
             "org": org,
