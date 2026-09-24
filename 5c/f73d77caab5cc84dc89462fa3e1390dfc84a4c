@@ -1,0 +1,50 @@
+net/crates/net/sdk/tests/enrollment_org.rs
+  s_3f3d4c91f992be::t_61639aee91dfb9 208-219,221-228,348-355,357-358,360-361,363-374
+  s_3f3d4c91f992be::t_5d81a4da720a42 338-341,359,429-435,466-468,476-481,490-493,498-499,501-502,505,511,519-520,523,530,539
+  s_3f3d4c91f992be::t_9e1d0cbd57b2c9 220
+net/crates/net/sdk/src/enrollment/bundle.rs
+  s_3f3d4c91f992be::t_e0d4dbe37f2140 242-245,264-267,273-279,428-431,472-476,705-708
+  s_3f3d4c91f992be::t_d61d06e89a35f0 228-230,259,263,268-272,280-281,342-348,418-427,432-435,450,467-471,477-479,701-704,709-710,743-750
+net/crates/net/cli/src/commands/lifecycle.rs
+  s_3f3d4c91f992be::t_a2959a04da4532 174,176,179-191,198,227,229-230,235-238,454,1539,1580,1725
+  s_3f3d4c91f992be::t_e730486b57c918 231-234,1541-1545,1582-1586
+net/crates/net/cli/src/commands/node.rs
+  s_3f3d4c91f992be::t_e730486b57c918 260-281
+  s_3f3d4c91f992be::t_a2959a04da4532 78-82
+net/crates/net/sdk/src/enrollment/org.rs
+  s_3f3d4c91f992be::t_d61d06e89a35f0 65-96,110,115,118
+  s_3f3d4c91f992be::t_e0d4dbe37f2140 111-114,116-117
+net/crates/net/cli/src/commands/org.rs
+  s_3f3d4c91f992be::t_c0fe7b4b43ca80 775-777,783-800,802-804,810
+  s_3f3d4c91f992be::t_e730486b57c918 750-753,756-758
+  s_3f3d4c91f992be::t_a2959a04da4532 80-84,139-152,168-172,525,714-726,736,744-749,754-755,759-774,778-782,801,805-809,811-812
+  s_3f3d4c91f992be::t_bc70e21e29a852 813
+net/crates/net/cli/tests/org_join.rs
+  s_3f3d4c91f992be::t_2c16340271e3e3 243-244,254,263-264,268,276-282,382-390,412-413,417-426
+  s_3f3d4c91f992be::t_a9b9f49dfef9f9 245-253
+net/crates/net/sdk/src/enrollment/standalone.rs
+  s_3f3d4c91f992be::t_4e3bf0f92a2327 168-175,181-182,191,193-200,213-238,325-327,329-337,348
+net/crates/net/cli/src/commands/enrollment.rs
+  s_3f3d4c91f992be::t_a2959a04da4532 1030-1040,1046-1051,1062,1709,1713,1716
+net/crates/net/src/adapter/net/behavior/org_authority.rs
+  s_3f3d4c91f992be::t_f0f3c433c46c13 3044-3085
+  s_3f3d4c91f992be::t_9e6a253a4dae26 487-494,625-631,768-810,968-979
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_0eb322ecc1a0f5 2047,2052-2115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5cf73d77caab5cc84dc89462fa3e1390dfc84a4c",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
