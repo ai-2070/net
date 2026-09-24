@@ -31,19 +31,19 @@
 
 use net::adapter::net::behavior::org::{OrgError, OrgKeypair, OrgMembershipCert};
 use net::adapter::net::behavior::org_call::{
-    OrgCallProof, OrgStreamCallProof, MAX_ORG_CALL_PROOF_BYTES, ORG_CALL_BINDING_CONTEXT,
-    ORG_STREAM_CALL_BINDING_CONTEXT, STREAM_CALL_KIND_CLIENT_STREAMING, STREAM_CALL_KIND_DUPLEX,
+    MAX_ORG_CALL_PROOF_BYTES, ORG_CALL_BINDING_CONTEXT, ORG_STREAM_CALL_BINDING_CONTEXT,
+    OrgCallProof, OrgStreamCallProof, STREAM_CALL_KIND_CLIENT_STREAMING, STREAM_CALL_KIND_DUPLEX,
     STREAM_CALL_KIND_SERVER_STREAMING,
 };
-use net_sdk::org::parse_org_wire;
 use net::adapter::net::behavior::org_grant::{
     CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope, OrgCapabilityGrant,
     OrgDispatcherGrant,
 };
 use net::adapter::net::identity::EntityKeypair;
+use net_sdk::org::parse_org_wire;
 
 use base64::Engine as _;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 // ===========================================================================
 // The frozen identity seeds — the SAME four-party shape as the live X2
@@ -284,11 +284,19 @@ fn opening_vector(frozen: &Frozen, kind: u8, kind_name: &str, access: Access) ->
     let (unary, stream) = build_proofs(frozen, access, kind);
     let unary_wire = unary.encode().expect("encode unary");
     let wire = stream.encode().expect("encode stream");
-    assert_eq!(wire.len(), unary_wire.len() + STREAM_SUFFIX, "suffix arithmetic");
+    assert_eq!(
+        wire.len(),
+        unary_wire.len() + STREAM_SUFFIX,
+        "suffix arithmetic"
+    );
     let pre_sig_len = wire.len() - STREAM_SUFFIX - SIG_WIRE;
     assert_eq!(pre_sig_len, unary_wire.len() - SIG_WIRE);
     let pre_sig = wire[..pre_sig_len].to_vec();
-    assert_eq!(pre_sig[..], unary_wire[..pre_sig_len], "the pre-signature prefix is shared");
+    assert_eq!(
+        pre_sig[..],
+        unary_wire[..pre_sig_len],
+        "the pre-signature prefix is shared"
+    );
 
     json!({
         "id": format!("opening.{kind_name}.{}", access.name()),
@@ -349,7 +357,8 @@ fn pinned_vocabulary() -> Value {
                     .iter()
                     .map(|v| {
                         let mut item = v.as_object().expect("object").clone();
-                        let wire: Vec<u8> = item["wire"].as_str().expect("wire").as_bytes().to_vec();
+                        let wire: Vec<u8> =
+                            item["wire"].as_str().expect("wire").as_bytes().to_vec();
                         item.insert("wire_base64".into(), json!(b64(&wire)));
                         item.insert("wire_len".into(), json!(wire.len()));
                         Value::Object(item)
@@ -388,7 +397,8 @@ fn render_streaming_opening_vectors() -> String {
     // Decoder rejections — §1.1's strict full-consumption decode. Every one
     // must be refused with the one `invalid wire format` error.
     let base_id = "opening.server_streaming.granted";
-    let (_, base_stream) = build_proofs(&frozen, Access::Granted, STREAM_CALL_KIND_SERVER_STREAMING);
+    let (_, base_stream) =
+        build_proofs(&frozen, Access::Granted, STREAM_CALL_KIND_SERVER_STREAMING);
     let base = base_stream.encode().expect("encode base");
     let mut rejects = Vec::new();
 
@@ -402,9 +412,21 @@ fn render_streaming_opening_vectors() -> String {
         trailing,
     ));
     for (id, cut, mutation) in [
-        ("reject.truncated_len_minus_1", 1usize, "cut the final byte (mid suffix)"),
-        ("reject.truncated_len_minus_17", 17, "cut 17 bytes (mid suffix)"),
-        ("reject.truncated_len_minus_33", 33, "cut the whole 33-byte suffix"),
+        (
+            "reject.truncated_len_minus_1",
+            1usize,
+            "cut the final byte (mid suffix)",
+        ),
+        (
+            "reject.truncated_len_minus_17",
+            17,
+            "cut 17 bytes (mid suffix)",
+        ),
+        (
+            "reject.truncated_len_minus_33",
+            33,
+            "cut the whole 33-byte suffix",
+        ),
     ] {
         rejects.push(reject_vector(
             id,
@@ -445,7 +467,10 @@ fn render_streaming_opening_vectors() -> String {
     let mut sig_flipped = base.clone();
     let sig_at = sig_flipped.len() - STREAM_SUFFIX - SIG_WIRE + 1; // past the 0x41 length byte
     sig_flipped[sig_at] ^= 0xFF;
-    let (_, flipped_proof) = ((), OrgStreamCallProof::decode(&sig_flipped).expect("decodes"));
+    let (_, flipped_proof) = (
+        (),
+        OrgStreamCallProof::decode(&sig_flipped).expect("decodes"),
+    );
     let verify_err = flipped_proof
         .binding_for_stream_verify(
             org_b().org_id(),
@@ -576,7 +601,8 @@ fn row(name: &str, detail: Result<(), String>) -> Row {
 
 fn check_streaming_opening_vectors() -> Vec<Row> {
     let path = fixture_path("streaming_opening_vectors.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let mut rows = Vec::new();
 
     rows.push(row(
@@ -609,11 +635,31 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
                 ));
             }};
         }
-        credential_row!("membership_a", OrgMembershipCert::from_bytes, &f.membership_a);
-        credential_row!("dispatcher_a", OrgDispatcherGrant::from_bytes, &f.dispatcher_a);
-        credential_row!("grant_b_to_a", OrgCapabilityGrant::from_bytes, &f.grant_b_to_a);
-        credential_row!("membership_b", OrgMembershipCert::from_bytes, &f.membership_b);
-        credential_row!("dispatcher_b", OrgDispatcherGrant::from_bytes, &f.dispatcher_b);
+        credential_row!(
+            "membership_a",
+            OrgMembershipCert::from_bytes,
+            &f.membership_a
+        );
+        credential_row!(
+            "dispatcher_a",
+            OrgDispatcherGrant::from_bytes,
+            &f.dispatcher_a
+        );
+        credential_row!(
+            "grant_b_to_a",
+            OrgCapabilityGrant::from_bytes,
+            &f.grant_b_to_a
+        );
+        credential_row!(
+            "membership_b",
+            OrgMembershipCert::from_bytes,
+            &f.membership_b
+        );
+        credential_row!(
+            "dispatcher_b",
+            OrgDispatcherGrant::from_bytes,
+            &f.dispatcher_b
+        );
     }
 
     let doc: Value = serde_json::from_str(&text).expect("fixture parses");
@@ -637,9 +683,16 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
             ));
         }
     }
-    for v in doc["error_vocabulary"]["vectors"].as_array().expect("vocab") {
+    for v in doc["error_vocabulary"]["vectors"]
+        .as_array()
+        .expect("vocab")
+    {
         let wire = v["wire"].as_str().expect("wire");
-        let name = format!("{}.{}", v["domain"].as_str().expect("domain"), v["kind"].as_str().expect("kind"));
+        let name = format!(
+            "{}.{}",
+            v["domain"].as_str().expect("domain"),
+            v["kind"].as_str().expect("kind")
+        );
         rows.push(row(
             &format!("bytes.vocab.{name}"),
             (|| {
@@ -693,7 +746,11 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
             &format!("round_trip.{id}"),
             match proof.encode() {
                 Ok(re) if re == wire => Ok(()),
-                Ok(re) => Err(format!("re-encode differs ({} vs {} bytes)", re.len(), wire.len())),
+                Ok(re) => Err(format!(
+                    "re-encode differs ({} vs {} bytes)",
+                    re.len(),
+                    wire.len()
+                )),
                 Err(e) => Err(format!("re-encode failed: {e}")),
             },
         ));
@@ -704,7 +761,9 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
                 if proof.kind != want_kind {
                     return Err(format!("kind {} != {want_kind}", proof.kind));
                 }
-                if hex(&proof.session_binding) != v["expect"]["session_binding_hex"].as_str().expect("sb") {
+                if hex(&proof.session_binding)
+                    != v["expect"]["session_binding_hex"].as_str().expect("sb")
+                {
                     return Err("session_binding differs".into());
                 }
                 if proof.proof_expires_at_unix_ns.to_string()
@@ -712,7 +771,8 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
                 {
                     return Err("proof_expires_at_unix_ns differs".into());
                 }
-                if hex(&proof.call_binding_sig) != v["call_binding_sig_hex"].as_str().expect("sig") {
+                if hex(&proof.call_binding_sig) != v["call_binding_sig_hex"].as_str().expect("sig")
+                {
                     return Err("call_binding_sig differs".into());
                 }
                 let access = v["access"].as_str().expect("access");
@@ -723,23 +783,20 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
                 Ok(())
             })(),
         ));
-        rows.push(row(
-            &format!("verify.{id}"),
-            {
-                let access = v["access"].as_str().expect("access");
-                let provider_org = org_b().org_id();
-                proof
-                    .binding_for_stream_verify(
-                        provider_org,
-                        provider_entity(),
-                        CALL_ID,
-                        CapabilityAuthorityId::for_tag(CAPABILITY_TAG),
-                        REQUEST_DIGEST,
-                    )
-                    .verify(&proof.call_binding_sig)
-                    .map_err(|e| format!("{access} chain refused its own binding: {e}"))
-            },
-        ));
+        rows.push(row(&format!("verify.{id}"), {
+            let access = v["access"].as_str().expect("access");
+            let provider_org = org_b().org_id();
+            proof
+                .binding_for_stream_verify(
+                    provider_org,
+                    provider_entity(),
+                    CALL_ID,
+                    CapabilityAuthorityId::for_tag(CAPABILITY_TAG),
+                    REQUEST_DIGEST,
+                )
+                .verify(&proof.call_binding_sig)
+                .map_err(|e| format!("{access} chain refused its own binding: {e}"))
+        }));
         rows.push(row(
             &format!("prefix.{id}"),
             (|| {
@@ -748,8 +805,11 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
                 }
                 let pre_sig_len = wire.len() - STREAM_SUFFIX - SIG_WIRE;
                 let want_pre = unhex(v["pre_sig_prefix_hex"].as_str().expect("pre_sig"));
-                if wire[..pre_sig_len] != want_pre[..] || unary_wire[..pre_sig_len] != want_pre[..] {
-                    return Err("the pre-signature prefix is not shared with the unary encoding".into());
+                if wire[..pre_sig_len] != want_pre[..] || unary_wire[..pre_sig_len] != want_pre[..]
+                {
+                    return Err(
+                        "the pre-signature prefix is not shared with the unary encoding".into(),
+                    );
                 }
                 if wire[wire.len() - STREAM_SUFFIX] != proof.kind {
                     return Err("the suffix kind byte is not at len-33".into());
@@ -778,7 +838,10 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
                 if proof.call_binding_sig
                     == unhex(v["unary_call_binding_sig_hex"].as_str().expect("usig"))[..]
                 {
-                    return Err("the stream transcript signed the same bytes as the unary transcript".into());
+                    return Err(
+                        "the stream transcript signed the same bytes as the unary transcript"
+                            .into(),
+                    );
                 }
                 let unary = OrgCallProof::decode(&unary_wire).map_err(|e| e.to_string())?;
                 unary
@@ -799,17 +862,16 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
     for v in doc["decoder_rejects"].as_array().expect("rejects") {
         let id = v["id"].as_str().expect("id").to_string();
         let wire = unhex(v["wire_hex"].as_str().expect("wire_hex"));
-        rows.push(row(
-            &format!("reject.{id}"),
-            {
-                let want = v["expect_error_display"].as_str().expect("expect");
-                match OrgStreamCallProof::decode(&wire) {
-                    Err(e) if e.to_string() == want => Ok(()),
-                    Err(e) => Err(format!("refused with {e:?}, want {want}")),
-                    Ok(_) => Err("decoded successfully — decoder disagreement must not become success".into()),
-                }
-            },
-        ));
+        rows.push(row(&format!("reject.{id}"), {
+            let want = v["expect_error_display"].as_str().expect("expect");
+            match OrgStreamCallProof::decode(&wire) {
+                Err(e) if e.to_string() == want => Ok(()),
+                Err(e) => Err(format!("refused with {e:?}, want {want}")),
+                Ok(_) => Err(
+                    "decoded successfully — decoder disagreement must not become success".into(),
+                ),
+            }
+        }));
     }
 
     // Signature rejection: decode OK, binding verify refuses.
@@ -834,16 +896,26 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
                 {
                     Err(e) if e.to_string() == want => Ok(()),
                     Err(e) => Err(format!("verify refused with {e:?}, want {want}")),
-                    Ok(()) => Err("verified successfully — a flipped signature must not become success".into()),
+                    Ok(()) => Err(
+                        "verified successfully — a flipped signature must not become success"
+                            .into(),
+                    ),
                 }
             })(),
         ));
     }
 
     // The frozen vocabulary parses back to exactly what it declares.
-    for v in doc["error_vocabulary"]["vectors"].as_array().expect("vocab") {
+    for v in doc["error_vocabulary"]["vectors"]
+        .as_array()
+        .expect("vocab")
+    {
         let wire = v["wire"].as_str().expect("wire");
-        let name = format!("{}.{}", v["domain"].as_str().expect("domain"), v["kind"].as_str().expect("kind"));
+        let name = format!(
+            "{}.{}",
+            v["domain"].as_str().expect("domain"),
+            v["kind"].as_str().expect("kind")
+        );
         rows.push(row(
             &format!("vocab.{name}"),
             (|| {
@@ -892,11 +964,16 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
     }
 
     // Layout constants come from the codec itself — a rename or resize is loud.
-    rows.push(row("layout.max_proof_bytes", if MAX_ORG_CALL_PROOF_BYTES == 1024 {
-        Ok(())
-    } else {
-        Err(format!("MAX_ORG_CALL_PROOF_BYTES is {MAX_ORG_CALL_PROOF_BYTES}, fixture pins 1024"))
-    }));
+    rows.push(row(
+        "layout.max_proof_bytes",
+        if MAX_ORG_CALL_PROOF_BYTES == 1024 {
+            Ok(())
+        } else {
+            Err(format!(
+                "MAX_ORG_CALL_PROOF_BYTES is {MAX_ORG_CALL_PROOF_BYTES}, fixture pins 1024"
+            ))
+        },
+    ));
     rows.push(row("layout.kind_values", {
         let l = &doc["layout"]["kind_values"];
         if l["server_streaming"].as_u64() == Some(STREAM_CALL_KIND_SERVER_STREAMING.into())
@@ -948,19 +1025,17 @@ fn run_check() -> i32 {
         }
     }
     println!("== {} rows, {} failed", rows.len(), failed);
-    if failed > 0 {
-        1
-    } else {
-        0
-    }
+    if failed > 0 { 1 } else { 0 }
 }
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
         None => {
             let error_path = fixture_path("error_vectors.json");
-            std::fs::create_dir_all(error_path.parent().expect("parent")).expect("create fixture dir");
-            std::fs::write(&error_path, net_sdk::org::render_error_vectors()).expect("write error fixture");
+            std::fs::create_dir_all(error_path.parent().expect("parent"))
+                .expect("create fixture dir");
+            std::fs::write(&error_path, net_sdk::org::render_error_vectors())
+                .expect("write error fixture");
             println!("wrote {}", error_path.display());
             let streaming_path = fixture_path("streaming_opening_vectors.json");
             std::fs::write(&streaming_path, render_streaming_opening_vectors())
