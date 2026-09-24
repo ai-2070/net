@@ -1,0 +1,27 @@
+net/crates/net/cli/tests/node_lifecycle.rs
+  s_3f3d4c91f992be::t_d43d0ab55dfa27 391-423,446-480,485-506
+  s_3f3d4c91f992be::t_c338cda4ddaf92 481-484
+  s_3f3d4c91f992be::t_a8afa7676a24f1 424-445
+net/crates/net/sdk/tests/enrollment_redeem.rs
+  s_3f3d4c91f992be::t_a8516d75b8cc9a 478-515
+net/crates/net/cli/tests/enrollment_workflow.rs
+  s_3f3d4c91f992be::t_809e8d1da543e6 549-581
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_845bae6a130300 3814-3871
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5f782a3d55eb7d712770b22c642a48fab22581e6",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
