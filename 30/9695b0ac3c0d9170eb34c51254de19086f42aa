@@ -1,0 +1,34 @@
+net/crates/net/leaf/src/anchor_control_plane.rs
+  h_64425bc75e3f3d 30-31
+net/crates/net/leaf/src/dispatch.rs
+  h_64425bc75e3f3d 143
+net/crates/net/leaf/src/leader.rs
+  h_64425bc75e3f3d 865-871,1030,1661,1686,1712,1719,1959,3127,3130,3162,3166,3170,3174,3178,3180,3184,3187,3191,3193,3197,3199,3203,3212,3216,3222,3226,3230,3235,3239,3243,3250,3253,3257,3260,3264,3437,3439,3480,3484,3570,3601
+net/crates/net/leaf/src/leader_session.rs
+  h_64425bc75e3f3d 1993-2001,2003,3259
+net/crates/net/leaf/src/org/admission.rs
+  h_64425bc75e3f3d 408
+net/crates/net/leaf/src/org/digest.rs
+  h_64425bc75e3f3d 1-2
+net/crates/net/leaf/src/org/mod.rs
+  h_64425bc75e3f3d 30,43
+net/crates/net/leaf/src/rpc_serve.rs
+  h_64425bc75e3f3d 666,996,1119
+net/crates/net/leaf/src/wasm.rs
+  h_64425bc75e3f3d 4553-4557,4560,4562,4565,4654-4656,4984,5874,5878-5882,5885,6008,6050,6084,6116
+net/crates/net/leaf/tests/org_streaming_lifecycle.rs
+  h_64425bc75e3f3d 51,310,343,369-370,540,625,649,696,710,1032,1046-1047,1083,1091,1136,1158,1166,1175,1181,1190,1223,1241,1265,1355,1375,1394,1400,1424,1443,1466,1488,1511,1535,1557-1558,1561-1562,1565-1566,1577,1604-1605,1642,1681
+net/crates/net/leaf/tests/wasm_leader.rs
+  h_64425bc75e3f3d 1351,1355
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "309695b0ac3c0d9170eb34c51254de19086f42aa",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
