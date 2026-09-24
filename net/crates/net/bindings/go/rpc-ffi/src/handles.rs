@@ -131,8 +131,8 @@ impl ClientStreamCallHandleC {
 /// Mirrors [`RpcStreamHandleC`]` shape: the two halves behind mutexes, with a
 /// captured `call_id` and a `done` latch.
 ///
-/// **Auto-split.** The combined `DuplexCallRaw` is split into a `DuplexSink`
-/// + `DuplexStream` at construction so concurrent send + recv from Go (the
+/// **Auto-split.** The combined `DuplexCallRaw` is split at construction into
+/// a `DuplexSink` and a `DuplexStream`, so concurrent send + recv from Go (the
 /// primary duplex use case) do NOT contend on the same mutex. Both halves
 /// share the underlying `Arc<DuplexInner>`, so CANCEL-on-Drop semantics are
 /// preserved: the wire CANCEL fires only after both halves have been dropped
