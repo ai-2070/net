@@ -1,0 +1,18 @@
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  h_64425bc75e3f3d 1796-1801,1803-1812
+net/crates/net/bindings/python/src/org_serve.rs
+  h_64425bc75e3f3d 440,445,454-461,492,517,528,537-541
+net/crates/net/bindings/python/tests/test_org_live.py
+  h_64425bc75e3f3d 522-592
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "15484b9852effce056a291637726967df38a2e14",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
