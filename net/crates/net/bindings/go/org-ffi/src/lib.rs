@@ -1423,7 +1423,7 @@ pub extern "C" fn net_org_call_duplex(
 /// `RpcStreamingHandlerFn` plus the leading verified caller.
 ///
 /// Called once per admitted server-streaming REQUEST. The Go side emits
-/// response chunks via [`net_rpc_response_sink_send`] and returns
+/// response chunks via [`net_rpc::net_rpc_response_sink_send`] and returns
 /// `NET_ORG_OK` on clean close. The terminal frame is the substrate fold's,
 /// emitted after the handler returns. To signal a typed application status,
 /// write an `nrpc:app_error:0x<code>:<body>` message to `out_err`.
@@ -1441,7 +1441,7 @@ pub type NetOrgStreamingHandlerFn = unsafe extern "C" fn(
 /// `RpcClientStreamingHandlerFn` plus the leading verified caller.
 ///
 /// Called once per admitted client-streaming REQUEST. The Go side drains the
-/// request stream via [`net_rpc_request_stream_next`] and returns one
+/// request stream via [`net_rpc::net_rpc_request_stream_next`] and returns one
 /// terminal response body (Go-`malloc`'d; released through the registered
 /// deallocator) or an error.
 pub type NetOrgClientStreamingHandlerFn = unsafe extern "C" fn(
