@@ -4061,12 +4061,20 @@ jobs:
       # preserved unary cross-org cell); this step PINS their 9 base names
       # (a witness must not disappear silently): lexical name-existence,
       # fail-closed, plus the parametrize pair that yields the 12 cells.
-      - name: Witness roster — Python org facade (Stage 4, 15 items / 9 names)
+      #
+      # The second `--source` is the teardown witness: a live org handler at
+      # runtime-drop time must not wedge the interpreter — the GIL-held
+      # blocking drop that hung this job and the wheel job to their job
+      # ceilings instead of failing. It is its own file (the property is a
+      # teardown one), so it is pinned here rather than in a suite that does
+      # not name it.
+      - name: Witness roster — Python org facade (Stage 4, 15 items / 9 names + teardown)
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_live --mode decl \
             --source net/crates/net/bindings/python/tests/test_org_live.py \
+            --source net/crates/net/bindings/python/tests/test_runtime_teardown_no_deadlock.py \
             test_org_streaming_sync_call_and_serve \
             test_org_streaming_async_call_and_serve \
             test_org_client_stream_sync_call_and_serve \
@@ -4076,6 +4084,7 @@ jobs:
             test_task_cancel_propagates_to_retirement_observables \
             test_streaming_midstream_error_surfaces_the_org_vocabulary \
             test_live_cross_org_call_from_a_generated_scenario \
+            test_teardown_with_a_live_handler_does_not_deadlock \
             same_org granted || exit 1
 
       # === S4: the Python cross-language vectors rows (S4Vectors) =======
