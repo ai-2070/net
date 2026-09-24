@@ -3849,6 +3849,87 @@ Inverse mutations:
 - Gates: CLI clippy `--all-targets`; SDK clippy for the CI feature test
   target; `node_lifecycle` + `enrollment_workflow` 11/11.
 
+#### V3 decisions of 2026-09-25 (user) and the resulting slices
+
+Decisions:
+1. **Device-to-device tool calls.** Implement discovery replay and relayed
+   session establishment.
+   - Replay only currently valid announcements the new peer may see.
+     Origin authentication, expiry and withdrawal are preserved, and replay
+     never refreshes stale authority.
+   - Session establishment lives in the reusable SDK path, and MCP consumes
+     it.
+   - Direct first, relay as fallback: "no session" does not prove that
+     direct is impossible.
+   - The session through the hub is endpoint-authenticated caller to
+     provider. Nothing is ever invoked under the operator's identity.
+   - Witness: B publishes before C attaches. C then discovers B and calls
+     it with its own authority, while an unauthorized C stays denied.
+2. **Standalone channel enrollment** (`channel invite` / `channel join` for
+   an already-connected device). It uses the shared ledger and the existing
+   identity. Adding a channel, or rejoining after a leave, never repeats
+   mesh enrollment, and an explicit rejoin fences delayed work from the
+   previous incarnation.
+3. **Leave stays local.** There is no issuer-notification queue. Real
+   protocol cleanup (unsubscribe, verifier withdrawal) stays. The completed
+   local departure and unconfirmed remote cleanup are separate states. E18
+   is amended.
+4. **The channel link stays `{channel, root, rights}`.**
+   - The redemption expiry and the credential expiry are distinguished and
+     both shown.
+   - The effective lifetime and delegation limits are shown.
+   - Unsupported lifetime, depth or publisher overrides are refused.
+   - Every canonical-identity, root, subject and rights check stays.
+   - E23 is amended.
+5. **`--detach` is deferred** (OS supervision instead). E20 keeps its
+   readiness, duplicate-start, exact-incarnation, startup-failure-cleanup
+   and stale-metadata requirements.
+6. **`kms:` is deferred.** Only protected `file:`, `stdin` and the generated
+   default exist. Unsupported schemes fail before bind. E21 is amended.
+7. **Ledger crash injection.** Deterministic fault hooks sit at the real
+   durable-write transitions, and the test stops a subprocess and restarts
+   it against the resulting disk state.
+   - Cover issuance commit, receipt recovery and profile publication.
+   - If the hooks are gated behind `fixtures`, the owning CI job enables
+     that feature and requires nonzero witness discovery.
+8. **One active subnet attachment per peer and verifier in V3,** made
+   deterministic:
+   - supervisors never flip one admission with another;
+   - a conflicting activation refuses unless a switch is explicitly
+     requested;
+   - status separates stored membership from active attachment;
+   - leaving an inactive relation never withdraws the active one;
+   - no multi-attachment redesign.
+9. **Infrastructure.**
+   - R2 phase 5 comes next: relayed → direct, keeping identity and
+     authority, with no duplicated operations, and a failed upgrade keeps
+     the relay.
+   - TCP/443 fallback follows as its own bounded slice. It is not
+     advertised as traversing every proxy.
+   - The default relay is project-operated, keeping the self-hosted
+     override and `--no-relay`. `DEFAULT_RELAY` stays empty until a real
+     endpoint is deployed and externally verified; hosting spend is a
+     separate operational authorization.
+
+**Standing rule:** no security or recovery witness is weakened to finish
+the matrix. The optional features are narrowed; the pairing lifecycle is
+completed.
+
+Slices, in order:
+
+| Slice | Item | Content |
+|---|---|---|
+| **S1** | 4 | Channel-link lifetime display and override refusal (E23) |
+| **S2** | 8 | Deterministic single active subnet attachment |
+| **S3** | 2 | Standalone channel invite/join with incarnation fencing |
+| **S4** | 3 | Leave witnesses (E17 / E18 / E19 / E26, including stop-unconfirmed) |
+| **S5** | 7 | Crash-injection hooks |
+| **S6** | 1 | Device-to-device discovery replay and relayed sessions |
+| **S7** | 9 | R2 phase 5 |
+| **S8** | 9 | TCP/443 |
+
+Then the remaining test-only rows: E4, E5, E9, E11, E12 and E25.
+
 **Still open against the matrix (disclosed, not claimed):**
 
 | Row | Open item |
@@ -3892,12 +3973,12 @@ All rows are required unless explicitly marked feature-conditional; narrow slice
 | E15 | V2 target/framing/deadline/confirmation/typegen/journey regressions pass; service startup timeout does not kill a successfully started listener. |
 | E16 | Public CLI journey proves a provider-side accepted effect, an acknowledged full-chain channel subscription, a caller-requested publish accepted by the local production channel gate (and subscriber receipt where the fixture requests end-to-end evidence), actual unauthorized gate denials, selective removal, restart and cleanup. Optional bootstrap adapters require their own feature-enabled tests. |
 | E17 | Mesh/org/channel/subnet leave disables the exact relation, stops controlled live use and automatic renewal/rejoin/re-subscribe across restart, preserving identity, unrelated authority and data; unmanaged live use is stop-unconfirmed. |
-| E18 | Offline leave completes locally with notification pending; retries are idempotent; notification never implies revocation and cannot target another identity. |
+| E18 | *(Amended 2026-09-25: leave is local, with no issuer-notification queue.)* An offline leave durably disables the selected local relation. Retries are idempotent, and neither restart nor a delayed renewal can undo it. Unconfirmed remote cleanup (unsubscribe, verifier withdrawal) is reported separately from the completed local departure. Leave never implies issuer-side revocation. |
 | E19 | Concurrent join/renew/subscription completion cannot undo leave; delayed old leave/notification cannot revoke or deactivate an explicitly authorized successor; rejoin preserves floors and the single-owner guard. |
-| E20 | `up` starts one production node for the selected profile and reports ready only after bind, identity/config install and runtime-loop start. Duplicate startup, parent/child failure and stale metadata cannot produce false readiness or an unreported live child. |
-| E21 | With no supplied PSK, first start generates and durably protects one random profile PSK and restart reuses it; corruption/insecurity refuses rather than regenerating. `file:` and `stdin`, plus each advertised feature-enabled `kms:` adapter, supply the exact runtime secret without argv/environment/output leakage. Malformed, insecure, unsupported or unavailable sources fail before bind; changing a source while live does not silently rotate the node. |
+| E20 | *(Amended 2026-09-25: `--detach` is deferred. `up` stays in the foreground and compatible with systemd, launchd and Windows service supervision.)* `up` starts one production node for the selected profile. It reports ready only after bind, identity/config install and runtime-loop start. Duplicate startup, startup failure and stale metadata cannot produce false readiness. Ownership is exact to the incarnation, and a failed start cleans up after itself. |
+| E21 | *(Amended 2026-09-25: `kms:` is deferred. There are no placeholder adapters, and every unsupported scheme fails before bind.)* With no supplied PSK, first start generates and durably protects one random profile PSK and restart reuses it; corruption/insecurity refuses rather than regenerating. `file:` and `stdin`, supply the exact runtime secret without argv/environment/output leakage. Malformed, insecure, unsupported or unavailable sources fail before bind; changing a source while live does not silently rotate the node. |
 | E22 | `down` authenticates the exact local incarnation, drains and stops it, and verifies termination while leaving another profile/node untouched. Timeout/unknown/forced termination and already-stopped states remain distinct; shutdown never claims authority revocation or secure erasure. |
-| E23 | `channel invite` computes and binds canonical name plus `u64 ChannelHash`, configured root, explicit rights, TTL and delegation depth. `SUBSCRIBE` additionally binds intended publisher metadata and derived route only after the controlled publisher config proves the root is trusted; `PUBLISH` has no remote publisher target and never auto-installs a root. A `u16` input, canonical name/`u64` mismatch, wrong route/root/subject/action, empty/delegate-only rights, `ADMIN`, wildcard or widening is refused. Two names sharing a `u16` hint remain separate and both can work without authority swap. |
+| E23 | *(Amended 2026-09-25: the link shape is `{channel, root, rights}`. The issuing node is the supported subscription publisher, and the leaf expiry is inherited from the grant; there is no per-device expiry variant in V3. Invitation redemption expiry and issued-credential expiry are distinct and are both shown. The effective credential lifetime and delegation limits are shown. Unsupported lifetime, depth or publisher overrides are refused, never ignored.)* A channel link computes and binds the canonical name plus the `u64 ChannelHash`, the configured root and explicit rights. `SUBSCRIBE` binds the issuing node as publisher only after its own config proves the root is trusted; `PUBLISH` has no remote publisher target and never auto-installs a root. A `u16` input, canonical name/`u64` mismatch, wrong route/root/subject/action, empty/delegate-only rights, `ADMIN`, wildcard or widening is refused. Two names sharing a `u16` hint remain separate and both can work without authority swap. |
 | E24 | One valid channel link has one durable subject-bound `TokenChain` result. Same-identity crash/lost-response recovery returns that result; a second identity cannot redeem it; link inspection and failed proof do not consume it; no token bytes or authority private key appear in output/logs. |
 | E25 | The SDK carries a delegated multi-link `TokenChain` without flattening. `SUBSCRIBE` reports live only after core full-chain ACK and re-presents that chain to regain ACK on reconnect/restart; intended `EntityId` metadata is not called authenticated. `PUBLISH` reports credential-ready only when the subject's local config trusts the root and live-active only after real `publish`/`publish_many` clears that local gate. Self-issued/untrusted, expired, revoked or attenuated chains fail at their respective production gates. |
 | E26 | Subscribe leave durably disables exact target/channel/incarnation use before acknowledged unsubscribe. Publish leave conditionally removes only its exact managed profile/channel chain and targeted cache authority; stale leave cannot remove a successor, conflicting same-channel install refuses, and cache/unmanaged fallback yields stop-unconfirmed. Both survive restart, preserve unrelated relations and report copied-token validity/issuer revocation separately. Same-root cross-publisher portability remains disclosed. |
