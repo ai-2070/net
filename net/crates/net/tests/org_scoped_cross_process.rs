@@ -504,7 +504,7 @@ async fn scoped_discovery_crosses_an_os_process_boundary() {
         acting_org: org_a.org_id(),
         provider_owner_org: org_b.org_id(),
         provider: provider_entity.clone(),
-        capability: capability,
+        capability,
         proof_ttl_secs: 30,
     };
     let reply: RpcReply = caller

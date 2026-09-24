@@ -122,7 +122,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "odd hex length");
+    assert!(s.len().is_multiple_of(2), "odd hex length");
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
@@ -248,8 +248,8 @@ fn build_proofs(frozen: &Frozen, access: Access, kind: u8) -> (OrgCallProof, Org
         membership.clone(),
         dispatcher.clone(),
         grant.clone(),
-        acting_org.clone(),
-        provider_org.clone(),
+        acting_org,
+        provider_org,
         provider_entity(),
         CALL_ID,
         CapabilityAuthorityId::for_tag(CAPABILITY_TAG),
@@ -725,7 +725,7 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
         ));
         rows.push(row(
             &format!("verify.{id}"),
-            (|| {
+            {
                 let access = v["access"].as_str().expect("access");
                 let provider_org = org_b().org_id();
                 proof
@@ -738,7 +738,7 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
                     )
                     .verify(&proof.call_binding_sig)
                     .map_err(|e| format!("{access} chain refused its own binding: {e}"))
-            })(),
+            },
         ));
         rows.push(row(
             &format!("prefix.{id}"),
@@ -801,14 +801,14 @@ fn check_streaming_opening_vectors() -> Vec<Row> {
         let wire = unhex(v["wire_hex"].as_str().expect("wire_hex"));
         rows.push(row(
             &format!("reject.{id}"),
-            (|| {
+            {
                 let want = v["expect_error_display"].as_str().expect("expect");
                 match OrgStreamCallProof::decode(&wire) {
                     Err(e) if e.to_string() == want => Ok(()),
                     Err(e) => Err(format!("refused with {e:?}, want {want}")),
                     Ok(_) => Err("decoded successfully — decoder disagreement must not become success".into()),
                 }
-            })(),
+            },
         ));
     }
 

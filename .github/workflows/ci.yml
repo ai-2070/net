@@ -3661,10 +3661,10 @@ jobs:
       # Floor/roster: 10 at the S4Node head (9 in org_live + 1 in
       # consumer_compile); extended in the same commit as new witnesses.
       - name: Witness roster — Node org facade (Stage 4, 10)
+        working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
-          CHECK=".github/scripts/check-roster.py"
-          python3 "$CHECK" --label org_live.test --mode literal \
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label org_live.test --mode literal \
             --source net/crates/net/bindings/node/test/org_live.test.ts \
             live_same_org_streaming_call_and_serve \
             live_same_org_client_stream_call_and_serve \
@@ -3702,7 +3702,7 @@ jobs:
             'narrowed ids never match a full id' \
             'u64 strings round-trip exactly' || exit 1
           out=$(npx vitest run test/org_streaming_opening_vectors.test.ts 2>&1 | tee /dev/stderr)
-          n=$(printf '%s\n' "$out" | grep -oE '^ *Tests +[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          n=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g' | grep -oE '^ *Tests +[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
           echo "node cross-lang vectors: ${n:-0} (floor 119)"
           if [ -z "$n" ] || [ "$n" -lt 119 ]; then
             echo "::error::the node cross-lang vectors ran ${n:-0} rows, floor is 119 — \
@@ -3871,7 +3871,7 @@ jobs:
         run: |
           set -o pipefail
           npm test 2>&1 | tee /tmp/sdk-ts-tests.log
-          n=$(grep -oE '^ *Tests +[0-9]+ passed' /tmp/sdk-ts-tests.log | grep -oE '[0-9]+' | tail -1)
+          n=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/sdk-ts-tests.log | grep -oE '^ *Tests +[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
           echo "sdk-ts tests passed: ${n:-0} (floor 567)"
           if [ -z "$n" ] || [ "$n" -lt 567 ]; then
             echo "::error::sdk-ts ran ${n:-0} tests, floor is 567 — \
@@ -3885,7 +3885,7 @@ jobs:
           # name-existence, fail-closed.
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label org_live.test --mode literal \
-            --source net/crates/net/sdk-ts/test/org_live.test.ts \
+            --source test/org_live.test.ts \
             consumer_program_compiles_against_the_shipped_org_surface \
             same_org_unary_call_and_serve \
             same_org_streaming_call_and_serve \
@@ -4062,10 +4062,10 @@ jobs:
       # (a witness must not disappear silently): lexical name-existence,
       # fail-closed, plus the parametrize pair that yields the 12 cells.
       - name: Witness roster — Python org facade (Stage 4, 15 items / 9 names)
+        working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
-          CHECK=".github/scripts/check-roster.py"
-          python3 "$CHECK" --label test_org_live --mode literal \
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_live --mode literal \
             --source net/crates/net/bindings/python/tests/test_org_live.py \
             test_org_streaming_sync_call_and_serve \
             test_org_streaming_async_call_and_serve \
@@ -4085,9 +4085,10 @@ jobs:
       # u64 exactness); this step PINS them: the 9 function names lexically
       # (fail-closed) plus the scoped count floor (the run itself).
       - name: Witness roster + floor — Python cross-lang vectors (119)
+        working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
-          python3 ".github/scripts/check-roster.py" --label test_org_streaming_opening_vectors --mode literal \
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_streaming_opening_vectors --mode literal \
             --source net/crates/net/bindings/python/tests/test_org_streaming_opening_vectors.py \
             test_fixture_has_the_expected_shape \
             test_wire_bytes_pin \
@@ -4241,8 +4242,8 @@ jobs:
       - name: Witness roster + floor — sdk-py org facade (15)
         run: |
           set -uo pipefail
-          python3 ".github/scripts/check-roster.py" --label test_org_streaming --mode literal \
-            --source net/crates/net/sdk-py/tests/test_org_streaming.py \
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_streaming --mode literal \
+            --source tests/test_org_streaming.py \
             test_org_streaming_sync_call_and_serve \
             test_org_streaming_async_call_and_serve \
             test_org_client_stream_sync_call_and_serve \
@@ -4253,8 +4254,7 @@ jobs:
             test_streaming_midstream_error_surfaces_the_org_vocabulary \
             test_task_cancel_propagates_to_retirement_observables \
             '"same_org"' '"granted"' || exit 1
-          out=$(cd net/crates/net/sdk-py && python -m pytest -q \
-                  tests/test_org_streaming.py 2>&1 | tee /dev/stderr)
+          out=$(python -m pytest -q tests/test_org_streaming.py 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
           echo "sdk-py org facade: ${n:-0} (floor 15)"
           if [ -z "$n" ] || [ "$n" -lt 15 ]; then
@@ -6607,7 +6607,7 @@ jobs:
         run: |
           set -o pipefail
           npm test 2>&1 | tee /tmp/browser-ts-tests.log
-          n=$(grep -oE '^ *Tests +[0-9]+ passed' /tmp/browser-ts-tests.log | grep -oE '[0-9]+' | tail -1)
+          n=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/browser-ts-tests.log | grep -oE '^ *Tests +[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
           echo "browser-ts tests passed: ${n:-0} (floor 728)"
           if [ -z "$n" ] || [ "$n" -lt 728 ]; then
             echo "::error::browser-ts ran ${n:-0} tests, floor is 728 — \

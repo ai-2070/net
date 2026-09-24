@@ -11,6 +11,15 @@
 //! Fixture shape from `src/org/tests_live.rs:176-273` (`fast_mesh`), with the
 //! grant/audience ceremony of `live_cross_org_call_through_the_facade`.
 //!
+//! Compiled only where its `#[doc(hidden)]` seam exists: `OrgClient::`
+//! `last_selected_provider` is `#[cfg(all(feature = "cortex", any(test,
+//! feature = "fixtures")))]` (`src/org/client.rs`), and an integration test
+//! builds the lib WITHOUT `cfg(test)` — so this file gates on the same pair
+//! (the `org_exact_sensing.rs` pattern). The `rust-sdk-tests` floor pins
+//! these witnesses by name, so a set that drops them reads as a floor
+//! failure, never as silence.
+#![cfg(all(feature = "cortex", feature = "fixtures"))]
+//!
 //! `live_same_org_client_stream_through_the_facade` is THE PIN WITNESS: its
 //! scenario resolves a second provider MID-CALL, and the 3.1 pin receipt's
 //! mutation (the send re-resolving instead of reusing the pinned plan) must

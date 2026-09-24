@@ -1094,6 +1094,55 @@ fn strip_public_admission_header(inbound: &RpcInboundEvent) -> Option<RpcInbound
     })
 }
 
+/// §2.4a v0.4 compatibility: a legacy fire-and-forget publish carries
+/// `flags: 0` — an OMITTED shape. The streaming folds' contract-4 check
+/// (`ss_request_flags_ok` and the CS/DX twins) refuses a flag-less REQUEST on
+/// a streaming registration, so the legacy bridge normalizes an omitted shape
+/// to the REGISTRATION's own shape before the fold drive. An explicit
+/// non-zero `flags` is left untouched (the fold's own shape refusal is then
+/// the correct answer), and a unary registration never rewrites.
+/// Re-encodes exactly like [`strip_public_admission_header`]: the frame
+/// prefix (EventMeta + route) verbatim, only the request body re-encoded.
+fn normalize_omitted_stream_flags(
+    inbound: RpcInboundEvent,
+    shape: crate::adapter::net::behavior::org_call::RpcCallShape,
+) -> RpcInboundEvent {
+    use crate::adapter::net::behavior::org_call::RpcCallShape;
+    use crate::adapter::net::cortex::rpc::{
+        FLAG_RPC_CLIENT_STREAMING_REQUEST, FLAG_RPC_STREAMING_RESPONSE,
+    };
+    if matches!(shape, RpcCallShape::Unary) || inbound.payload.len() < RPC_FRAME_BODY_OFFSET {
+        return inbound;
+    }
+    if EventMeta::from_bytes(&inbound.payload[..EVENT_META_SIZE])
+        .is_none_or(|m| m.dispatch != DISPATCH_RPC_REQUEST)
+    {
+        return inbound;
+    }
+    let Ok(mut req) = RpcRequestPayload::decode(inbound.payload.slice(RPC_FRAME_BODY_OFFSET..))
+    else {
+        return inbound;
+    };
+    if req.flags != 0 {
+        return inbound;
+    }
+    req.flags = match shape {
+        RpcCallShape::ServerStreaming => FLAG_RPC_STREAMING_RESPONSE,
+        RpcCallShape::ClientStreaming => FLAG_RPC_CLIENT_STREAMING_REQUEST,
+        RpcCallShape::Duplex => FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE,
+        RpcCallShape::Unary => 0,
+    };
+    let mut buf = inbound.payload[..RPC_FRAME_BODY_OFFSET].to_vec();
+    req.encode_into(&mut buf);
+    RpcInboundEvent {
+        session_id: inbound.session_id,
+        channel_hash: inbound.channel_hash,
+        origin_hash: inbound.origin_hash,
+        from_node: inbound.from_node,
+        payload: Bytes::from(buf),
+    }
+}
+
 /// The E1.2 protected admission gate for ONE inbound frame on a protected unary
 /// service, run on the captured immutable [`RegisteredRpcService`]. On the
 /// initial REQUEST it runs, in order: the shared origin check, direct-session
@@ -1147,13 +1196,12 @@ pub enum ProtectedOpeningOutcome {
         /// clamps the resolved deadline with these.
         credential_ends_ns: Vec<Option<u64>>,
     },
-    /// Review-7 RED negative-control seam ONLY (its `#[cfg(test)]` caller
-    /// is compiled out of production): dispatched WITHOUT the
+    /// Review-7 RED negative-control seam ONLY: dispatched WITHOUT the
     /// org-admission engine, with synthetic attribution and no registry
     /// record.
     #[cfg(test)]
     EngineBypassed {
-        /// Synthetic attribution — deliberately not a verified `Admitted`.
+        /// Synthetic attribution (not a verified `Admitted`).
         admitted: crate::adapter::net::behavior::org_admission::Admitted,
     },
 }
@@ -1289,7 +1337,6 @@ pub fn admit_protected_opening(
         };
         return Ok(ProtectedOpeningOutcome::EngineBypassed { admitted });
     }
-
     // §6 — throttle BEFORE the signature work, not after.
     if !mesh
         .admission_rate_limiter()
@@ -5230,8 +5277,22 @@ impl MeshNode {
                             &metrics_for_bridge,
                         ) {
                             BridgePreflight::Proceed(frame) => {
-                                // AV-1 item 1: authenticated-peer-bound fold drive, on
-                                // the preflight's stripped frame (E1.6 / §8).
+                                // AV-1 item 1: authenticated-peer-bound fold
+                                // drive, on the preflight's stripped frame
+                                // (E1.6 / §8). §2.4a v0.4 compatibility: a
+                                // legacy fire-and-forget publish is flag-less
+                                // (`flags: 0`) and the folds' contract-4
+                                // shape check refuses a flag-less REQUEST on
+                                // a streaming registration — normalize an
+                                // OMITTED shape to the registration's own
+                                // shape on the legacy path only (an org
+                                // call's shape stays strict — C4
+                                // `ShapeMismatch`). This is the
+                                // `rtc_admission` R1 regression's fix: the
+                                // flag-less publish was refused before the
+                                // handler spawn.
+                                let frame =
+                                    normalize_omitted_stream_flags(frame, shape);
                                 if let Err(e) = fold.lock().apply_inbound(&frame) {
                                     tracing::warn!(
                                         error = %e,

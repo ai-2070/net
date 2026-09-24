@@ -1,10 +1,10 @@
 # Exported symbol set of the single libnet cdylib (bindings/go/net-ffi).
 # Checked by .github/scripts/check-ffi-exports.py; regenerate with --update
 # ONLY for an intended C-ABI change, and say so in that commit.
-# generated-at: c5f2820717f7582c9c05c97a5e672fa307b1c27a
+# generated-at: d4981f94fe7865da526b66b7625c4dc2be3dc6e0
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi --features net-ffi/test-helpers
-# count: 578
+# count: 581
 net_blob_adapter_registered
 net_blob_free_buffer
 net_blob_publish
@@ -92,6 +92,8 @@ net_compute_standby_group_spawn
 net_compute_standby_group_standby_count
 net_compute_standby_group_sync_standbys
 net_compute_start_migration
+net_compute_test_inject_synthetic_peer
+net_compute_test_inject_synthetic_peer_with_tags
 net_compute_unregister_placement_filter
 net_deck_admin_clear_avoid_list
 net_deck_admin_cordon
@@ -313,6 +315,7 @@ net_mesh_stream_free
 net_mesh_stream_stats
 net_mesh_subscribe_channel
 net_mesh_subscribe_channel_with_token
+net_mesh_test_send_refusal_attribution
 net_mesh_traversal_stats
 net_mesh_traversal_stats_v2
 net_mesh_unsubscribe_channel
