@@ -1,0 +1,42 @@
+net/crates/net/leaf/src/anchor_control_plane.rs
+  h_64425bc75e3f3d 200-202,263-266,556-558
+net/crates/net/leaf/src/leader.rs
+  h_64425bc75e3f3d 2332-2339,2547-2549
+net/crates/net/leaf/src/leader_session.rs
+  h_64425bc75e3f3d 2024-2026,2142-2147,2173,2227,2289-2292,2422-2424,3416-3419,3792,3819-3821,3823-3827,3847-3853
+net/crates/net/leaf/src/mock_control_plane.rs
+  h_64425bc75e3f3d 757-760
+net/crates/net/leaf/src/node.rs
+  h_64425bc75e3f3d 40-41,608-609,2216-2217,2326-2330,2337,3502-3503,3685-3687
+net/crates/net/leaf/src/org/cert.rs
+  h_64425bc75e3f3d 90
+net/crates/net/leaf/src/org/grant.rs
+  h_64425bc75e3f3d 958-960
+net/crates/net/leaf/src/org/mod.rs
+  h_64425bc75e3f3d 67,72-73,78-81,91-94
+net/crates/net/leaf/src/org/replay.rs
+  h_64425bc75e3f3d 186-189,703-704
+net/crates/net/leaf/src/rpc_serve.rs
+  h_64425bc75e3f3d 597-602,604-605,682-687,731-738,966,1087,1143-1148,1185-1186
+net/crates/net/leaf/src/rpc_stream.rs
+  h_64425bc75e3f3d 425-429,1096-1097
+net/crates/net/leaf/src/wasm.rs
+  h_64425bc75e3f3d 4644-4646,4682-4684,4690-4692,4754,4875-4878,5058-5060,5214-5219,5228-5233,5240-5245,5258-5263,5280-5283,5294-5299,5712-5715,5735-5738,5740-5741,5879-5880,6002-6006,6399-6401,6412-6417,6459-6462
+net/crates/net/leaf/tests/nrpc_streaming_parity.rs
+  h_64425bc75e3f3d 99-101,163-164,201,358-360,380-383,465,568-570,592-594,598-600,709-713,829-830
+net/crates/net/leaf/tests/org_authority.rs
+  h_64425bc75e3f3d 31-32,347-349,372-373,400-401,439-448,475-484,508-517,540-549,578-587,612-621,659-668,694-703,726-735,739-748,771-780,802-811,813-822,845-854,868-877,907-916,974-977
+net/crates/net/leaf/tests/org_streaming_lifecycle.rs
+  h_64425bc75e3f3d 42,44-45,221-225,573,578-580,598-602,610-614,627-631,731,746-748,798-801,815-818,838-841,961-964,1017-1020,1062-1066,1206,1342-1345,1482,1581-1585,1768,1811-1812,1832-1838,2161,2243-2244,2346
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "01b817acfc400d666ccdc1ef462e3db1cb94be37",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
