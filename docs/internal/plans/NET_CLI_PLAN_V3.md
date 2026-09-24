@@ -3957,6 +3957,66 @@ Then the remaining test-only rows: E4, E5, E9, E11, E12 and E25.
   join-side expiry dropped.
 - **Gates:** CLI clippy `--all-targets`; CLI 370/370.
 
+**S2 receipt: one active subnet attachment per verifier, deterministic (2026-09-25).**
+
+A new module, `cli/src/commands/subnet_active.rs`, keeps a durable record,
+`<state>/subnet.active.json` (verifier node → scope). A corrupt record
+fails `up` closed.
+
+How a relation becomes active:
+- It takes its verifier's slot by itself only when the slot is vacant. At
+  start, the join's own relation claims a vacant slot first.
+- Replacing an active attachment is always explicit:
+  - `subnet join --switch` refuses without the flag, before redemption, so
+    the link is not consumed;
+  - `subnet activate <scope>` records the new choice first, then withdraws
+    the previous attachment (`previous_withdrawal`), then reports the
+    supervisor's verdict.
+
+The supervisor:
+- presents only the active relation. Stored ones are renewed but never
+  presented, and are reported `active: false` with no admission claimed.
+- withdraws again any presentation that raced a switch away.
+- never switches when an approval-gated membership completes: it stays
+  stored while another attachment is active.
+
+Leave: `subnet leave` of a stored relation withdraws nothing
+(`was_active: false`, `withdrawal: not_active`). Leaving the active one
+withdraws it and vacates the slot.
+
+Witness: `subnet_join::a_joined_device_joins_another_subnet_with_a_standalone_link`,
+rewritten. The old version asserted 3.7 and 3.8 both admitted, the flipping
+false claim this decision removes. It now proves:
+1. A non-switch join is refused.
+2. `--switch` makes 3.8 active, 3.7 is withdrawn, and the operator's own
+   observation shows exactly `[3.8]`.
+3. After a restart only 3.8 is presented, and three samples over ~4.5 s
+   show no flipping.
+4. `subnet activate 3.7` switches back, confirmed by the operator's
+   observation, and a repeat is a no-op.
+5. A stolen link is still refused, and so is a foreign issuer.
+6. An approved gated 3.9 completes stored.
+7. Leaving 3.9 leaves 3.7 attached.
+
+Inverse mutations, all RED (5):
+
+| # | Mutation |
+|---|---|
+| 1 | A stored standalone relation presented anyway |
+| 2 | The join relation presented while stored |
+| 3 | A conflicting join not refused |
+| 4 | Leaving a stored relation withdraws |
+| 5 | A switch leaves the previous attachment standing |
+
+Limits:
+- Scopes are keyed by path per verifier; one authority per verifier is
+  assumed.
+- A `--switch` given with an approval-gated link is not kept for its later
+  completion. The completion stays stored, and `subnet activate` finishes
+  the switch.
+
+Gates: CLI clippy `--all-targets`; CLI 370/370.
+
 **Still open against the matrix (disclosed, not claimed):**
 
 | Row | Open item |

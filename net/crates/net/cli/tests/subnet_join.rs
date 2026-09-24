@@ -581,27 +581,75 @@ fn a_joined_device_joins_another_subnet_with_a_standalone_link() {
         "{refused:?}"
     );
 
-    // Joined over the session: installed and admitted by the verifier.
-    let sub = agent.json(&["subnet", "join", &link_token, "--yes"]);
+    // One active attachment per verifier: 3.7 is active, so joining 3.8 at
+    // the same verifier is a switch, and a switch is explicit. The refusal
+    // precedes redemption, so the link is not consumed.
+    let refused = agent.run(&["subnet", "join", &link_token, "--yes"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--switch"),
+        "{refused:?}"
+    );
+    let sub = agent.json(&["subnet", "join", &link_token, "--yes", "--switch"]);
     assert_eq!(sub["state"], "installed", "{sub}");
     assert_eq!(sub["scope"], "3.8", "{sub}");
+    assert_eq!(sub["active"], true, "{sub}");
+    assert_eq!(sub["previous"], "3.7", "{sub}");
+    assert_eq!(sub["previous_withdrawal"], "confirmed", "{sub}");
     assert_eq!(sub["admitted"], true, "{sub}");
     assert_eq!(sub["device"], device.as_str(), "the same proven identity");
 
-    // Restart: the node re-presents both memberships by itself. (Right
-    // after the redemption's nRPC traffic the operator may defer the new
-    // handshake for a few heartbeats, so the start report can be the first,
-    // unattached attempt; the link supervisor completes it.)
+    // The verifier's own view: the device is attached at exactly one scope.
+    let attached_at = |fx: &Fx| -> Vec<String> {
+        fx.json(&["subnet", "members", "3"])["observed"]["admitted_here"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["subject"] == device.as_str())
+            .map(|r| r["attachment"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(attached_at(&operator), vec!["3.8".to_string()]);
+
+    // Restart: the node presents only the active attachment, deterministically
+    // — the stored 3.7 is reported stored, and no supervisor flips them.
     drop(node);
     let node = agent.up(&[]);
-    wait_for_link(&agent, "both memberships re-presented", |l| {
+    assert_eq!(
+        node.ready["joined"]["subnet"]["active"], false,
+        "{}",
+        node.ready
+    );
+    wait_for_link(&agent, "only the active attachment re-presented", |l| {
         l["attached"] == true
-            && l["subnet_admitted"] == true
+            && l["subnet_active"] == false
+            && l.get("subnet_admitted").is_none()
             && l["standalone"].as_object().is_some_and(|m| {
                 m.values()
-                    .any(|e| e["scope"] == "3.8" && e["admitted"] == true)
+                    .any(|e| e["scope"] == "3.8" && e["active"] == true && e["admitted"] == true)
             })
     });
+    for _ in 0..3 {
+        assert_eq!(
+            attached_at(&operator),
+            vec!["3.8".to_string()],
+            "no flipping"
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+
+    // The explicit switch back.
+    let switched = agent.json(&["subnet", "activate", "3.7"]);
+    assert_eq!(switched["changed"], true, "{switched}");
+    assert_eq!(switched["previous"], "3.8", "{switched}");
+    assert_eq!(switched["previous_withdrawal"], "confirmed", "{switched}");
+    assert_eq!(switched["admitted"], true, "{switched}");
+    assert_eq!(attached_at(&operator), vec!["3.7".to_string()]);
+    assert_eq!(
+        agent.json(&["subnet", "activate", "3.7"])["changed"],
+        false,
+        "activating the active attachment is a no-op"
+    );
 
     // The link binds the device that redeemed it: another joined device,
     // over its own proven session, gets nothing.
@@ -609,7 +657,7 @@ fn a_joined_device_joins_another_subnet_with_a_standalone_link() {
     let other_invite = operator.json(&["invite", "create", "--subnet", "3.7"]);
     second.json(&["join", &token_of(&other_invite), "--yes"]);
     let other_node = second.up(&[]);
-    let stolen = second.run(&["subnet", "join", &link_token, "--yes"]);
+    let stolen = second.run(&["subnet", "join", &link_token, "--yes", "--switch"]);
     assert!(!stolen.status.success(), "{stolen:?}");
     assert!(
         String::from_utf8_lossy(&stolen.stderr).contains("bound to another claim"),
@@ -629,18 +677,26 @@ fn a_joined_device_joins_another_subnet_with_a_standalone_link() {
         "{refused:?}"
     );
 
-    // Approval-gated: pending until approved; then the node completes it.
+    // Approval-gated: pending until approved; the node completes it by
+    // itself and, 3.7 being active, keeps it STORED (a completion never
+    // switches).
     let gated = operator.json(&["subnet", "invite", "3.9", "--require-approval"]);
-    let pending = agent.json(&["subnet", "join", &token_of(&gated), "--yes"]);
+    let pending = agent.json(&["subnet", "join", &token_of(&gated), "--yes", "--switch"]);
     assert_eq!(pending["state"], "pending_approval", "{pending}");
     let offer_id = gated["offer_id"].as_str().unwrap().to_string();
     operator.json(&["invite", "approve", &offer_id, "--subject", &device]);
-    wait_for_link(&agent, "approved membership completes", |l| {
+    wait_for_link(&agent, "approved membership completes, stored", |l| {
         l["standalone"].as_object().is_some_and(|m| {
             m.values()
-                .any(|e| e["scope"] == "3.9" && e["state"] == "installed" && e["admitted"] == true)
+                .any(|e| e["scope"] == "3.9" && e["state"] == "installed" && e["active"] == false)
         })
     });
+    assert_eq!(attached_at(&operator), vec!["3.7".to_string()]);
+    // Leaving a stored relation withdraws nothing: 3.7 stays attached.
+    let left = agent.json(&["subnet", "leave", "3.9"]);
+    assert_eq!(left["was_active"], false, "{left}");
+    assert_eq!(left["withdrawal"], "not_active", "{left}");
+    assert_eq!(attached_at(&operator), vec!["3.7".to_string()]);
     // Leave covers the standalone memberships: each store records the
     // departure and holds no credentials any more.
     let left = agent.json(&["leave"]);

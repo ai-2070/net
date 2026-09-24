@@ -41,6 +41,7 @@ pub mod rpc;
 pub(crate) mod scope;
 pub mod snapshot;
 pub mod subnet;
+pub(crate) mod subnet_active;
 pub mod transfer;
 pub mod typegen;
 pub mod version;

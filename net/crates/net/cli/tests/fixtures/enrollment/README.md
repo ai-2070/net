@@ -90,6 +90,15 @@ net-mesh up                              # on the device
 A device already on the mesh adds a relation with a standalone link:
 `subnet invite` then `subnet join`, or `org invite` then `org join`.
 
+A device holds any number of subnet relations, but only ONE is the active
+attachment at a given verifier, and only the active one is presented:
+- Joining a second scope at the same verifier is refused unless
+  `subnet join --switch` is given.
+- `subnet activate <scope>` switches explicitly. The previous attachment
+  is withdrawn there and stays stored.
+- Status separates `active` from stored.
+- Leaving a stored relation leaves the active one alone.
+
 ## 4. Publish through the device's own gate
 
 ```sh

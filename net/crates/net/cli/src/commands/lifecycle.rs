@@ -90,6 +90,8 @@ const CHANNEL_UNSUBSCRIBE_WAIT: Duration = Duration::from_secs(3);
 /// The durable record that this device left its join's own subnet relation
 /// (under the state root); the mesh membership is untouched.
 const SUBNET_LEFT_FILE: &str = "subnet.left";
+/// How long `subnet activate` waits for the supervisor's verdict.
+const SUBNET_ACTIVATE_WAIT: Duration = Duration::from_secs(15);
 /// Bound on one subnet leaf renewal exchange.
 const SUBNET_RENEW_WAIT: Duration = Duration::from_secs(10);
 /// Retry pause after a failed background renewal.
@@ -127,6 +129,10 @@ struct JoinedLink {
     detail: Option<String>,
     /// Successful attaches after the start attempt.
     reattaches: u64,
+    /// Whether the join's own subnet relation is the ACTIVE attachment at
+    /// its verifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subnet_active: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     subnet_admitted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,6 +155,10 @@ struct StandaloneLink {
     rights: String,
     /// `installed` once credentials are held; `pending_approval` until then.
     state: String,
+    /// Whether this is the ACTIVE attachment at its verifier (only the
+    /// active one is presented; the others are stored).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     admitted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -357,22 +367,151 @@ async fn subnet_leave(state: &ControlState, request: &serde_json::Value) -> serd
             entry.admitted = None;
         }
     }
-    let withdrawn = state
-        .node
-        .withdraw_own_subnet_admission(verifier, &target, CHANNEL_UNSUBSCRIBE_WAIT)
-        .await;
+    // Only the active attachment is presented, so only it is withdrawn; a
+    // stored relation leaves without touching the active one.
+    let was_active = state.attachments.lock().is_active(verifier, &scope_text);
+    let withdrawn = if was_active {
+        let w = state
+            .node
+            .withdraw_own_subnet_admission(verifier, &target, CHANNEL_UNSUBSCRIBE_WAIT)
+            .await
+            .map_err(|e| e.to_string());
+        if let Err(e) = state.attachments.lock().clear_if(verifier, &scope_text) {
+            tracing::warn!(error = %e, "the active attachment record was not cleared");
+        }
+        Some(w)
+    } else {
+        None
+    };
     serde_json::json!({
         "left": true,
         "newly_left": newly,
         "scope": scope_text,
         "relation": relation,
+        "was_active": was_active,
         // Confirmed only on the verifier's acknowledgement that no
         // admission of this device remains there on this session.
-        "withdrawal": if withdrawn.is_ok() { "confirmed" } else { "unconfirmed" },
-        "withdrawal_detail": withdrawn.as_ref().err().map(|e| e.to_string()),
-        "dropped": withdrawn.ok(),
+        "withdrawal": match &withdrawn {
+            None => "not_active",
+            Some(Ok(_)) => "confirmed",
+            Some(Err(_)) => "unconfirmed",
+        },
+        "withdrawal_detail": withdrawn.as_ref().and_then(|w| w.as_ref().err().cloned()),
+        "dropped": withdrawn.and_then(|w| w.ok()),
         "credentials": if relation == "join" { "disabled: kept in the join, never presented or renewed" } else { "erased" },
         "credential_validity": "unchanged: valid until it expires or the operator runs `subnet remove`",
+    })
+}
+
+/// The installed, not-left subnet relation of this device at `path`: its
+/// authority-qualified scope and the verifier node it is presented to.
+fn installed_subnet_relation(
+    state: &ControlState,
+    path: net::adapter::net::subnet::TopologySubnetId,
+) -> Option<(net::adapter::net::subnet::SubnetRef, u64)> {
+    if let Some(join) = &state.joined {
+        let guard = join.lock();
+        if let Some(j) = guard.as_ref().filter(|j| j.left_at().is_none()) {
+            if let (Some(offer), Some(bundle)) = (j.invite().subnet(), j.bundle()) {
+                if offer.scope.path == path
+                    && bundle.subnet_credentials().is_some()
+                    && !state.subnet_left.load(Ordering::SeqCst)
+                {
+                    return Some((offer.scope.clone(), bundle.contact().node_id));
+                }
+            }
+        }
+    }
+    let memberships = state.memberships.as_ref()?;
+    let ms = memberships.lock();
+    ms.iter()
+        .filter(|m| m.left_at().is_none() && m.credentials().is_some())
+        .find_map(|m| {
+            m.offer()
+                .filter(|o| o.scope.path == path)
+                .map(|o| (o.scope.clone(), m.issuer_node()))
+        })
+}
+
+/// Control op `subnet_activate`: make one stored subnet relation the ACTIVE
+/// attachment at its verifier — the explicit switch. The new choice is
+/// recorded first; the previous active attachment is then withdrawn at the
+/// verifier (acknowledged or reported unconfirmed); the node's supervisor
+/// presents the new one, and its verdict is what `admitted` reports.
+async fn subnet_activate(state: &ControlState, request: &serde_json::Value) -> serde_json::Value {
+    let Ok(path) = super::subnet::parse_subnet_path(request["scope"].as_str().unwrap_or_default())
+    else {
+        return serde_json::json!({ "error": "malformed scope" });
+    };
+    let scope_text = super::subnet::format_subnet(path);
+    let Some((_, verifier)) = installed_subnet_relation(state, path) else {
+        return serde_json::json!({
+            "error": format!("this device holds no installed subnet relation at {scope_text}")
+        });
+    };
+    let previous = state
+        .attachments
+        .lock()
+        .active(verifier)
+        .map(str::to_string);
+    if previous.as_deref() == Some(scope_text.as_str()) {
+        return serde_json::json!({ "scope": scope_text, "active": true, "changed": false });
+    }
+    if let Err(e) = state.attachments.lock().set(verifier, &scope_text) {
+        return serde_json::json!({ "error": format!("the switch was not recorded: {e}") });
+    }
+    let withdrawal = match &previous {
+        Some(old) => {
+            let old_ref = super::subnet::parse_subnet_path(old)
+                .ok()
+                .and_then(|p| installed_subnet_relation(state, p))
+                .map(|(r, _)| r);
+            match old_ref {
+                Some(r) => Some(
+                    match state
+                        .node
+                        .withdraw_own_subnet_admission(verifier, &r, CHANNEL_UNSUBSCRIBE_WAIT)
+                        .await
+                    {
+                        Ok(_) => "confirmed".to_string(),
+                        Err(e) => format!("unconfirmed: {e}"),
+                    },
+                ),
+                None => Some("not held".to_string()),
+            }
+        }
+        None => None,
+    };
+    // The supervisor presents the new active attachment; report its verdict.
+    let is_join_relation = state
+        .joined
+        .as_ref()
+        .and_then(|j| j.lock().as_ref().and_then(|j| j.invite().subnet().cloned()))
+        .is_some_and(|o| o.scope.path == path);
+    let mut admitted = None;
+    for _ in 0..(SUBNET_ACTIVATE_WAIT.as_millis() / 250) {
+        admitted = state.link.as_ref().and_then(|link| {
+            let l = link.lock();
+            if is_join_relation {
+                return l.subnet_admitted.filter(|_| l.subnet_active == Some(true));
+            }
+            l.standalone
+                .values()
+                .find(|e| e.scope == scope_text && e.active == Some(true))
+                .and_then(|e| e.admitted)
+        });
+        if admitted.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    serde_json::json!({
+        "scope": scope_text,
+        "active": true,
+        "changed": true,
+        "previous": previous,
+        "previous_withdrawal": withdrawal,
+        "admitted": admitted,
     })
 }
 
@@ -505,6 +644,7 @@ async fn keep_subnet_admitted(
     persist: impl FnOnce(
         &net::adapter::net::subnet::SubnetCredentialSet,
     ) -> Option<Result<(), net_sdk::enrollment::device::DeviceJoinError>>,
+    present: bool,
 ) -> Kept {
     let now = now_unix();
     let mut fresh = false;
@@ -536,7 +676,8 @@ async fn keep_subnet_admitted(
             }
         }
     }
-    if fresh || (track.presented != Some(session) && now >= track.present_retry_at) {
+    // Only the ACTIVE attachment is presented; a stored one is renewed only.
+    if present && (fresh || (track.presented != Some(session) && now >= track.present_retry_at)) {
         let admitted = node
             .present_subnet_credentials(
                 issuer_node,
@@ -573,6 +714,7 @@ async fn keep_standalone_admitted(
     memberships: &SharedMemberships,
     tracks: &mut std::collections::HashMap<String, SubnetTrack>,
     link: &Arc<parking_lot::Mutex<JoinedLink>>,
+    attachments: &super::subnet_active::SharedAttachments,
 ) {
     use net_sdk::enrollment::standalone::SubnetRedeemReply;
     let snapshot: Vec<_> = memberships
@@ -636,6 +778,11 @@ async fn keep_standalone_admitted(
                 link.lock().standalone.insert(key, entry);
             }
             Some(set) => {
+                let scope_text = super::subnet::format_subnet(offer.scope.path);
+                let active = attachments
+                    .lock()
+                    .activate_if_vacant(issuer_node, &scope_text)
+                    .unwrap_or(false);
                 let kept = keep_subnet_admitted(
                     node,
                     issuer_node,
@@ -646,8 +793,22 @@ async fn keep_standalone_admitted(
                     set,
                     track,
                     install,
+                    active,
                 )
                 .await;
+                // A presentation that raced a switch away is withdrawn.
+                if matches!(kept, Kept::Presented(Ok(())))
+                    && !attachments.lock().is_active(issuer_node, &scope_text)
+                {
+                    let _ = node
+                        .withdraw_own_subnet_admission(
+                            issuer_node,
+                            &offer.scope,
+                            CHANNEL_UNSUBSCRIBE_WAIT,
+                        )
+                        .await;
+                    track.presented = None;
+                }
                 let expires_at = memberships
                     .lock()
                     .iter()
@@ -660,7 +821,14 @@ async fn keep_standalone_admitted(
                     .or_insert_with(|| standalone_entry(&offer, "installed"));
                 entry.state = "installed".to_string();
                 entry.expires_at = expires_at;
-                if let Kept::Presented(verdict) = kept {
+                entry.active = Some(active);
+                if !active {
+                    // Stored: no admission is claimed for it.
+                    entry.admitted = None;
+                    entry.detail = Some(format!(
+                        "stored, not the active attachment at this verifier (`subnet activate                          {scope_text}` switches)"
+                    ));
+                } else if let Kept::Presented(verdict) = kept {
                     entry.admitted = Some(verdict.is_ok());
                     entry.detail = verdict.err();
                 }
@@ -694,6 +862,7 @@ fn spawn_joined_link(
     present_retry_at: u64,
     channel: Option<(JoinedChannel, Option<u64>)>,
     subnet_left: Arc<AtomicBool>,
+    attachments: super::subnet_active::SharedAttachments,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = REATTACH_MIN;
@@ -787,6 +956,24 @@ fn spawn_joined_link(
                 }
             }
             if let Some((offer, set)) = subnet {
+                // Active only if it holds (or takes a vacant) slot at this
+                // verifier; never displacing another attachment by itself.
+                let scope_text = super::subnet::format_subnet(offer.scope.path);
+                let active = attachments
+                    .lock()
+                    .activate_if_vacant(contact.node_id, &scope_text)
+                    .unwrap_or(false);
+                {
+                    let mut l = link.lock();
+                    l.subnet_active = Some(active);
+                    if !active {
+                        l.subnet_admitted = None;
+                        l.subnet_detail = Some(format!(
+                            "stored, not the active attachment at this verifier (`subnet \
+                             activate {scope_text}` switches)"
+                        ));
+                    }
+                }
                 let kept = keep_subnet_admitted(
                     &node,
                     contact.node_id,
@@ -808,11 +995,16 @@ fn spawn_joined_link(
                         }
                         Some(join.replace_subnet_credentials(renewed))
                     },
+                    active,
                 )
                 .await;
-                // A presentation that raced `subnet leave` is withdrawn
-                // again rather than left standing.
-                if matches!(kept, Kept::Presented(Ok(()))) && subnet_left.load(Ordering::SeqCst) {
+                // A presentation that raced `subnet leave`, or a switch to
+                // another attachment, is withdrawn again rather than left
+                // standing.
+                if matches!(kept, Kept::Presented(Ok(())))
+                    && (subnet_left.load(Ordering::SeqCst)
+                        || !attachments.lock().is_active(contact.node_id, &scope_text))
+                {
                     let _ = node
                         .withdraw_own_subnet_admission(
                             contact.node_id,
@@ -846,6 +1038,7 @@ fn spawn_joined_link(
                 &memberships,
                 &mut standalone_tracks,
                 &link,
+                &attachments,
             )
             .await;
             if let Some((c, track)) = channel.as_mut() {
@@ -1555,6 +1748,8 @@ struct ControlState {
     channel: Option<JoinedChannel>,
     /// Set once `subnet leave` recorded leaving the join's subnet relation.
     subnet_left: Arc<AtomicBool>,
+    /// The active subnet attachment at each verifier.
+    attachments: super::subnet_active::SharedAttachments,
 }
 
 /// Forward one root-signed floor readback request (built and signed by the
@@ -2093,6 +2288,23 @@ async fn subnet_join(state: &ControlState, request: &serde_json::Value) -> serde
             invite.issuer_fingerprint()
         ));
     }
+    // One active attachment per verifier: joining a second scope there is a
+    // switch, and a switch is explicit.
+    let new_scope = super::subnet::format_subnet(offer.scope.path);
+    let active_now = state
+        .attachments
+        .lock()
+        .active(issuer_node)
+        .map(str::to_string);
+    let switching = active_now.as_ref().is_some_and(|a| a != &new_scope);
+    if switching && request["switch"] != serde_json::Value::Bool(true) {
+        return error(format!(
+            "{} is the active subnet attachment at this verifier; `subnet join --switch` makes \
+             {new_scope} active instead ({} stays stored)",
+            active_now.as_deref().unwrap_or_default(),
+            active_now.as_deref().unwrap_or_default()
+        ));
+    }
     let key = membership_key(&invite);
     // Record the intent first (or resume an earlier attempt).
     let existing = memberships
@@ -2164,6 +2376,42 @@ async fn subnet_join(state: &ControlState, request: &serde_json::Value) -> serde
             Err(e) => return error(format!("redemption failed: {e}")),
         },
     };
+    // Take the slot (vacant, or the explicit switch), then withdraw what it
+    // replaced before presenting.
+    let recorded = if switching {
+        state.attachments.lock().set(issuer_node, &new_scope)
+    } else {
+        state
+            .attachments
+            .lock()
+            .activate_if_vacant(issuer_node, &new_scope)
+            .map(drop)
+    };
+    if let Err(e) = recorded {
+        return error(format!("the active attachment was not recorded: {e}"));
+    }
+    let previous_withdrawal = match active_now.as_ref().filter(|_| switching) {
+        Some(old) => {
+            let old_ref = super::subnet::parse_subnet_path(old)
+                .ok()
+                .and_then(|p| installed_subnet_relation(state, p))
+                .map(|(r, _)| r);
+            match old_ref {
+                Some(r) => Some(
+                    match state
+                        .node
+                        .withdraw_own_subnet_admission(issuer_node, &r, CHANNEL_UNSUBSCRIBE_WAIT)
+                        .await
+                    {
+                        Ok(_) => "confirmed".to_string(),
+                        Err(e) => format!("unconfirmed: {e}"),
+                    },
+                ),
+                None => Some("not held".to_string()),
+            }
+        }
+        None => None,
+    };
     let admitted = state
         .node
         .present_subnet_credentials(
@@ -2180,6 +2428,9 @@ async fn subnet_join(state: &ControlState, request: &serde_json::Value) -> serde
         "state": "installed",
         "scope": super::subnet::format_subnet(offer.scope.path),
         "rights": super::subnet::format_subnet_rights(offer.rights),
+        "active": true,
+        "previous": active_now.filter(|_| switching),
+        "previous_withdrawal": previous_withdrawal,
         "admitted": admitted.is_ok(),
         "detail": admitted.err(),
         "expires_at": set.leaf().not_after,
@@ -2323,6 +2574,8 @@ async fn control_session(
         }
         "subnet_leave" if draining => serde_json::json!({ "error": "node is draining" }),
         "subnet_leave" => subnet_leave(state, &request).await,
+        "subnet_activate" if draining => serde_json::json!({ "error": "node is draining" }),
+        "subnet_activate" => subnet_activate(state, &request).await,
         "channel_serve" if draining => serde_json::json!({ "error": "node is draining" }),
         "channel_serve" => {
             let (node, root, request) = (
@@ -2807,6 +3060,11 @@ pub async fn run_up(
     let mut renewed_at_start = None;
     // The channel credential's start state, handed to the supervisor.
     let mut channel_start = None;
+    // One active subnet attachment per verifier; a corrupt record fails
+    // closed rather than re-resolving to another attachment.
+    let attachments: super::subnet_active::SharedAttachments = Arc::new(parking_lot::Mutex::new(
+        super::subnet_active::Attachments::load(&state).map_err(generic)?,
+    ));
     let joined_report = match joined.as_ref().and_then(|j| j.bundle().map(|b| (j, b))) {
         Some((join, bundle)) => {
             let c = bundle.contact();
@@ -2825,6 +3083,11 @@ pub async fn run_up(
                     "state": "left",
                 })),
                 (Some(offer), Some(set)) => {
+                    let scope_text = super::subnet::format_subnet(offer.scope.path);
+                    let active = attachments
+                        .lock()
+                        .activate_if_vacant(c.node_id, &scope_text)
+                        .map_err(|e| generic(format!("subnet attachment record: {e}")))?;
                     // Renew first when the leaf is near (or past) expiry.
                     let mut set = set;
                     let mut renew_error = None;
@@ -2845,7 +3108,12 @@ pub async fn run_up(
                             Err(e) => renew_error = Some(e),
                         }
                     }
-                    let admitted = if detail.is_some() {
+                    let admitted = if !active {
+                        Err(format!(
+                            "stored, not the active attachment at this verifier (`subnet activate \
+                             {scope_text}` switches)"
+                        ))
+                    } else if detail.is_some() {
                         Err("not attached".to_string())
                     } else {
                         mesh.node()
@@ -2862,7 +3130,9 @@ pub async fn run_up(
                     Some(serde_json::json!({
                         "scope": super::subnet::format_subnet(offer.scope.path),
                         "rights": super::subnet::format_subnet_rights(offer.rights),
-                        "admitted": admitted.is_ok(),
+                        "active": active,
+                        // Admission is claimed only for the active attachment.
+                        "admitted": active.then_some(admitted.is_ok()),
                         "detail": admitted.err(),
                         "expires_at": set.leaf().not_after,
                         "renewed": renewed_at_start.is_some(),
@@ -2985,6 +3255,7 @@ pub async fn run_up(
             readmissions: 0,
             standalone: Default::default(),
             org_detail: None,
+            subnet_active: subnet.and_then(|s| s["active"].as_bool()),
             subnet_admitted: subnet.and_then(|s| s["admitted"].as_bool()),
             subnet_detail: subnet.and_then(|s| s["detail"].as_str().map(str::to_string)),
         }
@@ -3031,6 +3302,7 @@ pub async fn run_up(
                 present_retry_at,
                 joined_channel.clone(),
                 subnet_left.clone(),
+                attachments.clone(),
             ))
         }
         _ => None,
@@ -3048,6 +3320,7 @@ pub async fn run_up(
         node: mesh.node().clone(),
         channel: joined_channel.map(|(c, _)| c),
         subnet_left: subnet_left.clone(),
+        attachments: attachments.clone(),
     });
     let (stop_tx, mut stop_rx) = mpsc::channel(1);
     let server = tokio::spawn(serve_control(listener, secret, state_ctl.clone(), stop_tx));

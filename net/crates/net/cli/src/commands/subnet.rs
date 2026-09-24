@@ -96,6 +96,10 @@ pub enum SubnetCommand {
     /// session to drop this device's admission there (acknowledged or
     /// reported unconfirmed). The credential is not revoked.
     Leave(SubnetLeaveArgs),
+    /// Make one stored subnet relation of this device the ACTIVE attachment
+    /// at its verifier (one is active per verifier; only it is presented).
+    /// The previous one is withdrawn there and stays stored.
+    Activate(SubnetLeaveArgs),
 }
 
 /// `subnet leave` arguments.
@@ -172,6 +176,11 @@ pub struct SubnetJoinArgs {
     /// Skip the interactive confirmation (scripts and agent tool use).
     #[arg(long)]
     pub yes: bool,
+    /// Make this subnet the ACTIVE attachment at the verifier even though
+    /// another is active there (that one stays stored). Without it, joining
+    /// a second scope at the same verifier is refused.
+    #[arg(long)]
+    pub switch: bool,
 }
 
 /// `net-mesh subnet remove` arguments.
@@ -311,6 +320,27 @@ pub async fn run(
             .await
         }
         SubnetCommand::Join(args) => run_subnet_join(args, output, profile_name).await,
+        SubnetCommand::Activate(args) => {
+            parse_subnet_path(&args.scope)?;
+            let node_dir = super::lifecycle::state_dir(args.state_dir, profile_name)?
+                .join(super::lifecycle::NODE_SUBDIR);
+            let (_, reply) = super::lifecycle::control_call_within(
+                &node_dir,
+                serde_json::json!({ "op": "subnet_activate", "scope": args.scope }),
+                std::time::Duration::from_secs(25),
+            )
+            .await
+            .map_err(|e| {
+                crate::error::connection_failure(format!(
+                    "{e}; is this device's `net-mesh up` running?"
+                ))
+            })?;
+            if let Some(err) = reply["error"].as_str() {
+                return Err(generic(err.to_string()));
+            }
+            emit_value(OutputFormat::resolve_oneshot(output), &reply)
+                .map_err(|e| generic(format!("write result: {e}")))
+        }
         SubnetCommand::Leave(args) => {
             parse_subnet_path(&args.scope)?;
             let node_dir = super::lifecycle::state_dir(args.state_dir, profile_name)?
@@ -447,7 +477,7 @@ async fn run_subnet_join(
         .join(super::lifecycle::NODE_SUBDIR);
     let (_, reply) = super::lifecycle::control_call_within(
         &node_dir,
-        serde_json::json!({ "op": "subnet_join", "token": token.as_str() }),
+        serde_json::json!({ "op": "subnet_join", "token": token.as_str(), "switch": args.switch }),
         SUBNET_JOIN_CONTROL_WAIT,
     )
     .await
