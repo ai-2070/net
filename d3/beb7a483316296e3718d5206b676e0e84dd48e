@@ -1,0 +1,14 @@
+net/crates/net/browser-ts/tests/kyra_review.mjs
+  h_64425bc75e3f3d 68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d3beb7a483316296e3718d5206b676e0e84dd48e",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
