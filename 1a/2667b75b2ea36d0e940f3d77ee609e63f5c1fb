@@ -1,0 +1,18 @@
+.github/workflows/ci.yml
+  h_64425bc75e3f3d 4770,4793,4941,4955
+net/crates/net/bindings/node/src/lib.rs
+  h_64425bc75e3f3d 45-53,55,1610,2588
+net/crates/net/bindings/node/src/subnet.rs
+  h_64425bc75e3f3d 93,110,232-238,251,275,305
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1a2667b75b2ea36d0e940f3d77ee609e63f5c1fb",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
