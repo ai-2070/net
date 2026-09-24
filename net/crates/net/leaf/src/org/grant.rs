@@ -955,7 +955,9 @@ impl OrgCapabilityGrant {
             GrantRights::try_from_bits(u32::from_le_bytes(data[128..132].try_into().unwrap()))?;
         let target_bytes: [u8; 32] = data[133..165].try_into().unwrap();
         let target_scope = match data[132] {
-            TARGET_TAG_EXACT_NODE => GrantTargetScope::ExactNode(EntityId::from_bytes(target_bytes)),
+            TARGET_TAG_EXACT_NODE => {
+                GrantTargetScope::ExactNode(EntityId::from_bytes(target_bytes))
+            }
             TARGET_TAG_ANY_NODE_OWNED_BY => {
                 GrantTargetScope::AnyNodeOwnedBy(OrgId::from_bytes(target_bytes))
             }

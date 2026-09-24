@@ -4641,7 +4641,9 @@ pub(crate) fn org_call_options(opts: &JsValue) -> Result<OrgCallOptions, JsError
     let credentials = js_sys::Reflect::get(opts, &JsValue::from_str("credentials"))
         .map_err(|_| JsError::new("credentials could not be read"))?;
     if !credentials.is_object() {
-        return Err(JsError::new("credentials is required and must be an object"));
+        return Err(JsError::new(
+            "credentials is required and must be an object",
+        ));
     }
     let credentials = OrgCallCredentials {
         membership: byte_field(&credentials, "membership", true)?.unwrap_or_default(),
@@ -4677,15 +4679,17 @@ fn byte_field(opts: &JsValue, key: &str, required: bool) -> Result<Option<Vec<u8
         .map_err(|_| JsError::new(&format!("{key} could not be read")))?;
     if value.is_undefined() || value.is_null() {
         return if required {
-            Err(JsError::new(&format!("{key} is required and must be a Uint8Array")))
+            Err(JsError::new(&format!(
+                "{key} is required and must be a Uint8Array"
+            )))
         } else {
             Ok(None)
         };
     }
     let actual = value.js_typeof().as_string().unwrap_or_default();
-    let array = value.dyn_into::<js_sys::Uint8Array>().map_err(|_| {
-        JsError::new(&format!("{key} must be a Uint8Array, not a {actual}"))
-    })?;
+    let array = value
+        .dyn_into::<js_sys::Uint8Array>()
+        .map_err(|_| JsError::new(&format!("{key} must be a Uint8Array, not a {actual}")))?;
     Ok(Some(array.to_vec()))
 }
 
@@ -4747,11 +4751,7 @@ fn optional_window(opts: &JsValue, key: &str) -> Result<Option<u32>, JsError> {
             }
         },
     };
-    if !number.is_finite()
-        || number.fract() != 0.0
-        || number < 1.0
-        || number > 4_294_967_295.0
-    {
+    if !number.is_finite() || number.fract() != 0.0 || number < 1.0 || number > 4_294_967_295.0 {
         return Err(JsError::new(&format!(
             "{key} must be a whole number in 1..=4294967295, got {number}; absent means \
              unbounded and 0 would deadlock the peer awaiting a credit"
@@ -4872,14 +4872,10 @@ pub(crate) fn terminal_error_json(terminal: &crate::rpc_stream::StreamTerminal) 
             // is the byte-budget retirement whose precise observable
             // is `admission-denied` / `unavailable`.
             let (kind, message) = match reason {
-                RetireReason::Timeout => (
-                    "timeout",
-                    "rpc: the call's deadline elapsed".to_string(),
-                ),
-                RetireReason::Cancelled => (
-                    "cancelled",
-                    "rpc: the call was cancelled".to_string(),
-                ),
+                RetireReason::Timeout => {
+                    ("timeout", "rpc: the call's deadline elapsed".to_string())
+                }
+                RetireReason::Cancelled => ("cancelled", "rpc: the call was cancelled".to_string()),
                 RetireReason::Revoked => (
                     "revoked",
                     "org: the call's credentials were revoked".to_string(),
@@ -5059,9 +5055,9 @@ impl OrgCall {
         if self.settled.get() {
             // The terminal was delivered once already; an over-poll
             // sees a benign completion rather than hanging.
-            return Ok(OrgPoll::Terminal(crate::rpc_stream::StreamTerminal::Completed {
-                body: Bytes::new(),
-            }));
+            return Ok(OrgPoll::Terminal(
+                crate::rpc_stream::StreamTerminal::Completed { body: Bytes::new() },
+            ));
         }
         if let Some(t) = self.terminal.borrow().clone() {
             return Ok(OrgPoll::Terminal(t));
@@ -5215,8 +5211,12 @@ pub(crate) fn sink_error(error: crate::rpc_stream::SinkError, what: &str) -> JsE
 /// The `next()`/`finish()` item objects, as plain JS objects.
 fn org_stream_item(value: Uint8Array) -> Result<JsValue, JsError> {
     let object = js_sys::Object::new();
-    js_sys::Reflect::set(&object, &JsValue::from_str("done"), &JsValue::from_bool(false))
-        .map_err(|_| JsError::new("done could not be set"))?;
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("done"),
+        &JsValue::from_bool(false),
+    )
+    .map_err(|_| JsError::new("done could not be set"))?;
     js_sys::Reflect::set(&object, &JsValue::from_str("value"), &value)
         .map_err(|_| JsError::new("value could not be set"))?;
     Ok(object.into())
@@ -5225,16 +5225,24 @@ fn org_stream_item(value: Uint8Array) -> Result<JsValue, JsError> {
 /// `{ done: true }` — a clean end-of-stream.
 fn org_stream_end() -> Result<JsValue, JsError> {
     let object = js_sys::Object::new();
-    js_sys::Reflect::set(&object, &JsValue::from_str("done"), &JsValue::from_bool(true))
-        .map_err(|_| JsError::new("done could not be set"))?;
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("done"),
+        &JsValue::from_bool(true),
+    )
+    .map_err(|_| JsError::new("done could not be set"))?;
     Ok(object.into())
 }
 
 /// `{ done: true, value }` — a terminal that carries a final body.
 fn org_stream_end_value(value: &[u8]) -> Result<JsValue, JsError> {
     let object = js_sys::Object::new();
-    js_sys::Reflect::set(&object, &JsValue::from_str("done"), &JsValue::from_bool(true))
-        .map_err(|_| JsError::new("done could not be set"))?;
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("done"),
+        &JsValue::from_bool(true),
+    )
+    .map_err(|_| JsError::new("done could not be set"))?;
     js_sys::Reflect::set(
         &object,
         &JsValue::from_str("value"),
@@ -5247,8 +5255,12 @@ fn org_stream_end_value(value: &[u8]) -> Result<JsValue, JsError> {
 /// `{ done: true, error: {...} }` — the typed terminal error item.
 fn org_stream_end_error(error_json: &str) -> Result<JsValue, JsError> {
     let object = js_sys::Object::new();
-    js_sys::Reflect::set(&object, &JsValue::from_str("done"), &JsValue::from_bool(true))
-        .map_err(|_| JsError::new("done could not be set"))?;
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("done"),
+        &JsValue::from_bool(true),
+    )
+    .map_err(|_| JsError::new("done could not be set"))?;
     let error = js_sys::JSON::parse(error_json)
         .map_err(|_| JsError::new("the terminal error did not encode"))?;
     js_sys::Reflect::set(&object, &JsValue::from_str("error"), &error)
@@ -5265,8 +5277,10 @@ fn terminal_stream_item(
     match terminal {
         StreamTerminal::Completed { .. } => None,
         other => {
-            let json =
-                terminal_error_json(other).unwrap_or_else(|| r#"{"kind":"internal","message":"rpc: the call ended without a terminal"}"#.to_string());
+            let json = terminal_error_json(other).unwrap_or_else(|| {
+                r#"{"kind":"internal","message":"rpc: the call ended without a terminal"}"#
+                    .to_string()
+            });
             Some(org_stream_end_error(&json))
         }
     }
@@ -5277,7 +5291,12 @@ pub(crate) fn terminal_js_error(terminal: &crate::rpc_stream::StreamTerminal) ->
     let json = terminal_error_json(terminal).unwrap_or_default();
     let message = serde_json::from_str::<serde_json::Value>(&json)
         .ok()
-        .and_then(|value| value.get("message").and_then(|m| m.as_str()).map(str::to_string))
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| "rpc: the call ended without a terminal".to_string());
     JsError::new(&message)
 }
@@ -5690,7 +5709,10 @@ impl OrgResponseSinkHandle {
     pub async fn send(&self, payload: Uint8Array) -> Result<(), JsError> {
         loop {
             if self.state.call.retired().is_some() {
-                return Err(sink_error(crate::rpc_stream::SinkError::Closed, "the response sink"));
+                return Err(sink_error(
+                    crate::rpc_stream::SinkError::Closed,
+                    "the response sink",
+                ));
             }
             match self.state.call.send(&payload.to_vec()) {
                 Ok(()) => return Ok(()),
@@ -5710,9 +5732,13 @@ impl OrgResponseSinkHandle {
     /// handler's return is discarded).
     pub async fn close(&self) -> Result<(), JsError> {
         if self.state.call.retired().is_some() {
-            return Err(sink_error(crate::rpc_stream::SinkError::Closed, "the response sink"));
+            return Err(sink_error(
+                crate::rpc_stream::SinkError::Closed,
+                "the response sink",
+            ));
         }
-        self.state.finish_once(crate::rpc_wire::StreamHandlerResult::Ok);
+        self.state
+            .finish_once(crate::rpc_wire::StreamHandlerResult::Ok);
         Ok(())
     }
 
@@ -5850,9 +5876,8 @@ impl LeafNode {
         options: &OrgCallOptions,
     ) -> Result<crate::rpc_stream::OrgCallIntent, JsError> {
         let credentials = &options.credentials;
-        let membership =
-            crate::org::cert::OrgMembershipCert::from_bytes(&credentials.membership)
-                .map_err(|e| JsError::new(&format!("membership did not decode: {e}")))?;
+        let membership = crate::org::cert::OrgMembershipCert::from_bytes(&credentials.membership)
+            .map_err(|e| JsError::new(&format!("membership did not decode: {e}")))?;
         let dispatcher_grant =
             crate::org::grant::OrgDispatcherGrant::from_bytes(&credentials.dispatcher)
                 .map_err(|e| JsError::new(&format!("dispatcher did not decode: {e}")))?;
@@ -5974,7 +5999,11 @@ impl LeafNode {
         options.within_provider_cap()?;
         let intent = self.org_intent(&service, &options)?;
         let peer = Self::org_peer(&options)?;
-        let timeout_ms = Some(options.deadline_ms.unwrap_or(ORG_DEFAULT_LIVE_NS / 1_000_000));
+        let timeout_ms = Some(
+            options
+                .deadline_ms
+                .unwrap_or(ORG_DEFAULT_LIVE_NS / 1_000_000),
+        );
         let receiver = with_node(&self.inner, |guard| {
             guard.admit()?;
             let receiver = guard.node.call_org_unary(
@@ -6367,10 +6396,9 @@ impl LeafNode {
             guard.admit()?;
             let opened = match shape {
                 "unary" => {
-                    let receiver =
-                        guard
-                            .node
-                            .call_org_unary(peer, service, body, &intent, timeout_ms)?;
+                    let receiver = guard
+                        .node
+                        .call_org_unary(peer, service, body, &intent, timeout_ms)?;
                     (OrgBackendCall::Unary(receiver), 0)
                 }
                 other => {
@@ -6381,16 +6409,12 @@ impl LeafNode {
                         request_window_initial,
                     };
                     let handle = match other {
-                        "server-streaming" => {
-                            guard
-                                .node
-                                .call_org_server_stream(peer, service, open, intent)?
-                        }
-                        "client-streaming" => {
-                            guard
-                                .node
-                                .call_org_client_stream(peer, service, open, intent)?
-                        }
+                        "server-streaming" => guard
+                            .node
+                            .call_org_server_stream(peer, service, open, intent)?,
+                        "client-streaming" => guard
+                            .node
+                            .call_org_client_stream(peer, service, open, intent)?,
                         "duplex" => guard.node.call_org_duplex(peer, service, open, intent)?,
                         unknown => {
                             return Err(LeafError::Session(format!(
@@ -6432,7 +6456,10 @@ impl LeafNode {
     }
 
     /// The latched terminal of a backend-driven call.
-    pub(crate) fn backend_org_terminal(&self, call_id: u64) -> Option<crate::rpc_stream::StreamTerminal> {
+    pub(crate) fn backend_org_terminal(
+        &self,
+        call_id: u64,
+    ) -> Option<crate::rpc_stream::StreamTerminal> {
         self.inner.borrow().node.org_call_terminal(call_id)
     }
 

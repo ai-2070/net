@@ -28,8 +28,8 @@ use net_leaf::org::cert::{OrgError, OrgId, OrgKeypair, OrgMembershipCert, OrgRev
 use net_leaf::org::digest::org_request_digest;
 use net_leaf::org::entity::EntityId;
 use net_leaf::org::grant::{
-    audience_key_commitment, CapabilityAuthorityId, DispatcherScope, GrantedDiscoveryBinding,
-    GrantRights, GrantTargetScope, OrgAudienceSecret, OrgCapabilityGrant, OrgDispatcherGrant,
+    audience_key_commitment, CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope,
+    GrantedDiscoveryBinding, OrgAudienceSecret, OrgCapabilityGrant, OrgDispatcherGrant,
 };
 use net_leaf::org::proof::{
     OrgCallProof, OrgStreamCallProof, RpcCallShape, ORG_ADMISSION_HEADER,
@@ -344,7 +344,9 @@ fn golden_capability_authority_id_matches() {
     let id = CapabilityAuthorityId::for_tag("nrpc:oa2-echo");
     assert_eq!(hex_lower(id.as_bytes()), GOLDEN_CAPABILITY_ID_HEX);
     assert_eq!(
-        CapabilityAuthorityId::from_bytes(unhex(GOLDEN_CAPABILITY_ID_HEX).unwrap().try_into().unwrap()),
+        CapabilityAuthorityId::from_bytes(
+            unhex(GOLDEN_CAPABILITY_ID_HEX).unwrap().try_into().unwrap()
+        ),
         id
     );
 }
@@ -367,7 +369,8 @@ fn golden_dispatcher_grant_wire_bytes_match() {
         0x1122_3344_5566_7788,
     );
     assert_eq!(hex_lower(&grant.to_bytes()), GOLDEN_DISPATCHER_GRANT_HEX);
-    let decoded = OrgDispatcherGrant::from_bytes(&unhex(GOLDEN_DISPATCHER_GRANT_HEX).unwrap()).unwrap();
+    let decoded =
+        OrgDispatcherGrant::from_bytes(&unhex(GOLDEN_DISPATCHER_GRANT_HEX).unwrap()).unwrap();
     assert_eq!(decoded, grant);
     assert_eq!(decoded.to_bytes(), grant.to_bytes());
     decoded.verify().unwrap();
@@ -394,7 +397,8 @@ fn golden_capability_grant_wire_bytes_match() {
         0x8877_6655_4433_2211,
     );
     assert_eq!(hex_lower(&grant.to_bytes()), GOLDEN_CAPABILITY_GRANT_HEX);
-    let decoded = OrgCapabilityGrant::from_bytes(&unhex(GOLDEN_CAPABILITY_GRANT_HEX).unwrap()).unwrap();
+    let decoded =
+        OrgCapabilityGrant::from_bytes(&unhex(GOLDEN_CAPABILITY_GRANT_HEX).unwrap()).unwrap();
     assert_eq!(decoded, grant);
     assert_eq!(decoded.to_bytes(), grant.to_bytes());
     decoded.verify().unwrap();
@@ -432,9 +436,16 @@ fn owner_delegated_admission_admits_a_valid_same_org_call() {
         digest,
         &facts,
     );
-    let admitted =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap();
+    let admitted = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap();
     assert_eq!(admitted.caller, caller_id);
     assert_eq!(admitted.acting_org, owner().org_id());
     assert_eq!(admitted.provider_org, owner().org_id());
@@ -461,9 +472,16 @@ fn cross_org_granted_admission_admits_a_valid_granted_call() {
         digest,
         &facts,
     );
-    let admitted =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap();
+    let admitted = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap();
     assert_eq!(admitted.acting_org, grantee().org_id());
     assert_eq!(admitted.provider_org, owner().org_id());
 }
@@ -487,9 +505,16 @@ fn expired_proof_is_refused_as_proof_expired() {
         digest,
         &facts,
     );
-    let err =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     assert_eq!(err, AdmissionDenied::ProofExpired);
 }
 
@@ -512,9 +537,16 @@ fn proof_ttl_beyond_the_ceiling_is_refused_as_proof_expired() {
         digest,
         &facts,
     );
-    let err =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     // The TTL ceiling is a merits refusal, surfaced under the same
     // typed reason as expiry (core's step 8 mapping).
     assert_eq!(err, AdmissionDenied::ProofExpired);
@@ -543,9 +575,16 @@ fn grant_capability_mismatch_is_refused_as_capability_mismatch() {
         digest,
         &facts,
     );
-    let err =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     assert_eq!(err, AdmissionDenied::CapabilityMismatch);
 }
 
@@ -570,9 +609,16 @@ fn grant_target_not_covering_the_provider_is_refused_as_target_not_covered() {
         digest,
         &facts,
     );
-    let err =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     assert_eq!(err, AdmissionDenied::TargetNotCovered);
 }
 
@@ -610,9 +656,16 @@ fn grant_from_a_foreign_org_is_refused_as_foreign_issuer() {
         digest,
         &facts,
     );
-    let err =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     assert_eq!(err, AdmissionDenied::ForeignIssuer);
 }
 
@@ -638,9 +691,16 @@ fn tampered_request_body_is_refused_as_binding_invalid() {
         tampered_digest,
         &facts,
     );
-    let err =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     assert_eq!(err, AdmissionDenied::BindingInvalid);
 }
 
@@ -663,15 +723,29 @@ fn stream_session_binding_mismatch_is_refused() {
         Some([0xEE; 32]),
         &facts,
     );
-    let err =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     assert_eq!(err, AdmissionDenied::SessionBindingMismatch);
     // …and a hand-built session (`None`) can never admit a stream.
     let ctx = stream_ctx(&caller_id, &provider_id, 7, digest, None, &facts);
-    let err =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     assert_eq!(err, AdmissionDenied::SessionBindingMismatch);
 }
 
@@ -694,9 +768,16 @@ fn stream_kind_mismatch_is_refused_as_shape_mismatch() {
         Some(SESSION_BINDING),
         &facts,
     );
-    let err =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     assert_eq!(err, AdmissionDenied::ShapeMismatch);
 }
 
@@ -718,11 +799,27 @@ fn replayed_call_id_is_refused_as_replay() {
         digest,
         &facts,
     );
-    verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true).unwrap();
+    verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap();
     // The SAME proof re-presented within its retention window.
-    let err =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     assert_eq!(err, AdmissionDenied::Replay);
 }
 
@@ -745,7 +842,16 @@ fn live_call_id_reuse_with_a_new_binding_is_refused_as_call_id_collision() {
         digest,
         &facts,
     );
-    verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true).unwrap();
+    verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap();
     // A DIFFERENT binding under the SAME live call_id — a caller bug
     // or forged reuse, distinguishable from a replay.
     let proof2 = same_org_proof(tampered_digest, 7, NOW_NS + 10_000_000_000);
@@ -759,9 +865,16 @@ fn live_call_id_reuse_with_a_new_binding_is_refused_as_call_id_collision() {
         tampered_digest,
         &facts,
     );
-    let err =
-        verify_org_admission(&ctx2, &[&header2], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx2,
+        &[&header2],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     assert_eq!(err, AdmissionDenied::CallIdCollision);
 }
 
@@ -791,9 +904,16 @@ fn revocation_floor_above_the_generation_is_refused_as_membership_revoked() {
         digest,
         &facts,
     );
-    let err =
-        verify_org_admission(&ctx, &[&header], &guard, NOW_NS, NOW_MONO_MS, || true, |_| true)
-            .unwrap_err();
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
     assert_eq!(err, AdmissionDenied::MembershipRevoked);
 }
 
@@ -851,7 +971,10 @@ fn unary_decode_tolerates_the_streaming_suffix_and_round_trips_the_prefix() {
     // fields encode byte-identically in both proofs.
     assert_eq!(stream_bytes.len(), unary_bytes.len() + 33);
     assert_eq!(&stream_bytes[..unary_bytes.len()], &unary_bytes[..]);
-    assert_eq!(stream_bytes[unary_bytes.len()], STREAM_CALL_KIND_SERVER_STREAMING);
+    assert_eq!(
+        stream_bytes[unary_bytes.len()],
+        STREAM_CALL_KIND_SERVER_STREAMING
+    );
     assert_eq!(&stream_bytes[unary_bytes.len() + 1..], &SESSION_BINDING[..]);
 
     // The unary decoder consumes the prefix and IGNORES the suffix —

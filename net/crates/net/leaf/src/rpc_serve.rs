@@ -594,10 +594,15 @@ impl ServeRegistry {
         // while the live call keeps its own single terminal.
         let key = (from.peer, from.incarnation, call_id);
         if self.calls.contains_key(&key) || self.openings.contains(&key) {
-            return self
-                .refuse_denied(from, served_service, call_id, AdmissionDenied::ActiveCallOwned);
+            return self.refuse_denied(
+                from,
+                served_service,
+                call_id,
+                AdmissionDenied::ActiveCallOwned,
+            );
         }
-        let Ok(reply_name) = crate::channel::reply_channel(served_service, from.caller.origin_hash())
+        let Ok(reply_name) =
+            crate::channel::reply_channel(served_service, from.caller.origin_hash())
         else {
             return self.refuse_malformed(from, served_service, call_id, "bad reply channel");
         };
@@ -674,8 +679,12 @@ impl ServeRegistry {
         // them, this extracts what the lifecycle layer needs.
         let Some(facts) = extract_proof_facts(opts.shape, proof_headers.first().copied()) else {
             self.openings.remove(&key);
-            return self
-                .refuse_denied(from, served_service, call_id, AdmissionDenied::MalformedProof);
+            return self.refuse_denied(
+                from,
+                served_service,
+                call_id,
+                AdmissionDenied::MalformedProof,
+            );
         };
 
         // §2.1 — the effective deadline: three distinct bounds.
@@ -719,7 +728,14 @@ impl ServeRegistry {
                 if !payload.body.is_empty() || !end {
                     items.push(payload.body);
                 }
-                (if end { InputHalf::Ended } else { InputHalf::Open }, items)
+                (
+                    if end {
+                        InputHalf::Ended
+                    } else {
+                        InputHalf::Open
+                    },
+                    items,
+                )
             }
         };
         let shared = Rc::new(RefCell::new(ServeShared {
@@ -947,11 +963,7 @@ impl ServeRegistry {
             }
             // Whether retired now or earlier, a committed terminal
             // means the entry is no longer live.
-            if self
-                .calls
-                .get(key)
-                .is_some_and(|s| s.terminal.is_some())
-            {
+            if self.calls.get(key).is_some_and(|s| s.terminal.is_some()) {
                 self.calls.remove(key);
             }
         }
@@ -1072,11 +1084,7 @@ fn retire_into(
         sh.closed = true;
         sh.retired = Some(retire_reason_of(&reason));
     }
-    emit(
-        out,
-        state,
-        &stream_terminal_payload(&reason),
-    );
+    emit(out, state, &stream_terminal_payload(&reason));
     true
 }
 
@@ -1132,7 +1140,12 @@ fn pump(out: &mut VecDeque<ServeOutFrame>, state: &mut ServeCallState) {
         // parks only on the queue, never on the window. The terminal
         // follows the drain.
         if has_item {
-            let body = state.shared.borrow_mut().output.pop_front().expect("checked");
+            let body = state
+                .shared
+                .borrow_mut()
+                .output
+                .pop_front()
+                .expect("checked");
             let payload = RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![(
@@ -1169,7 +1182,8 @@ fn emit_request_grants(out: &mut VecDeque<ServeOutFrame>, state: &mut ServeCallS
     let cap = u64::from(initial) + u64::from(REQUEST_GRANT_PER_CALL_CAP);
     while state.request_granted < consumed && state.request_granted < cap {
         state.request_granted += 1;
-        let frame = encode_request_grant_frame(state.origin_hash, state.key.2, state.reply_route, 1);
+        let frame =
+            encode_request_grant_frame(state.origin_hash, state.key.2, state.reply_route, 1);
         out.push_back(ServeOutFrame {
             peer: state.key.0,
             route: state.reply_route,

@@ -96,7 +96,9 @@ fn request_payload_round_trips_an_empty_body_and_empty_header_values() {
     // Core accepts empty header VALUES (only names are 1..); the
     // mirror must accept the same set — §12 is about refusing exactly
     // what core refuses, no more and no less.
-    payload.headers.push(("empty-value".to_string(), Vec::new()));
+    payload
+        .headers
+        .push(("empty-value".to_string(), Vec::new()));
     round_trip_request(&payload);
 }
 
@@ -158,11 +160,8 @@ fn request_codec_refuses_an_empty_header_name_at_encode_and_decode() {
 #[test]
 fn request_codec_refuses_over_cap_fields_at_encode_and_decode() {
     // Encode side: every length prefix refuses instead of truncating.
-    let over_service = RpcRequestPayload::unary(
-        "s".repeat(MAX_RPC_SERVICE_NAME_LEN + 1),
-        0,
-        Bytes::new(),
-    );
+    let over_service =
+        RpcRequestPayload::unary("s".repeat(MAX_RPC_SERVICE_NAME_LEN + 1), 0, Bytes::new());
     assert_eq!(
         refuse(over_service.validate_wire_bounds()),
         "service is 256 bytes, over the 255-byte wire limit"
@@ -199,11 +198,7 @@ fn request_codec_refuses_over_cap_fields_at_encode_and_decode() {
         "header value is 4097 bytes, over the 4096-byte wire limit"
     );
 
-    let over_body = RpcRequestPayload::unary(
-        "svc",
-        0,
-        Bytes::from(vec![0; MAX_RPC_BODY_LEN + 1]),
-    );
+    let over_body = RpcRequestPayload::unary("svc", 0, Bytes::from(vec![0; MAX_RPC_BODY_LEN + 1]));
     assert_eq!(
         refuse(over_body.validate_wire_bounds()),
         "body is 4194305 bytes, over the 4194304-byte wire limit"
@@ -360,7 +355,9 @@ fn request_chunk_payload_round_trips_and_mirrors_the_request_refusals() {
         "empty header name"
     );
     assert_eq!(
-        refuse(RpcRequestChunkPayload::decode(Bytes::from_static(&[0u8; 7]))),
+        refuse(RpcRequestChunkPayload::decode(Bytes::from_static(
+            &[0u8; 7]
+        ))),
         "call_id"
     );
     let mut wire = 1u64.to_le_bytes().to_vec();
@@ -380,7 +377,10 @@ fn request_chunk_payload_round_trips_and_mirrors_the_request_refusals() {
 #[test]
 fn stream_grant_is_a_four_byte_big_endian_credit() {
     assert_eq!(encode_stream_grant(5), vec![0x00, 0x00, 0x00, 0x05]);
-    assert_eq!(encode_stream_grant(0x0102_0304), vec![0x01, 0x02, 0x03, 0x04]);
+    assert_eq!(
+        encode_stream_grant(0x0102_0304),
+        vec![0x01, 0x02, 0x03, 0x04]
+    );
     assert_eq!(decode_stream_grant(&[0x00, 0x00, 0x00, 0x05]), Some(5));
     assert_eq!(
         decode_stream_grant(&[0x01, 0x02, 0x03, 0x04]),
@@ -462,9 +462,7 @@ fn request_grant_frame_is_the_pinned_forty_four_bytes() {
     assert_eq!(decode_route(&frame), Some(0xCAFE));
     assert_eq!(
         &frame[RPC_FRAME_BODY_OFFSET..],
-        &[
-            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00, 0x05,
-        ]
+        &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00, 0x05,]
     );
     assert_eq!(
         decode_frame(Bytes::from(frame)).expect("decodes"),
@@ -567,7 +565,9 @@ fn decode_frame_names_the_exact_malformed_field() {
     );
 
     // A payload-carrying dispatch without the route discriminator.
-    let mut frame = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, 1, 2, 0).to_bytes().to_vec();
+    let mut frame = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, 1, 2, 0)
+        .to_bytes()
+        .to_vec();
     frame.extend_from_slice(&[0u8; 7]); // 31 bytes: one short
     assert_eq!(
         refuse(decode_frame(Bytes::from(frame))),
@@ -589,11 +589,15 @@ fn decode_frame_names_the_exact_malformed_field() {
     );
 
     // Truncated payloads name their missing field.
-    let mut frame = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 1, 2, 0).to_bytes().to_vec();
+    let mut frame = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 1, 2, 0)
+        .to_bytes()
+        .to_vec();
     frame.extend_from_slice(&3u64.to_le_bytes()); // route, no payload
     assert_eq!(refuse(decode_frame(Bytes::from(frame))), "service length");
 
-    let mut frame = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, 1, 2, 0).to_bytes().to_vec();
+    let mut frame = EventMeta::new(DISPATCH_RPC_RESPONSE, 0, 1, 2, 0)
+        .to_bytes()
+        .to_vec();
     frame.extend_from_slice(&3u64.to_le_bytes());
     frame.push(0x00); // one byte cannot carry the status
     assert_eq!(refuse(decode_frame(Bytes::from(frame))), "status");
@@ -702,7 +706,11 @@ fn stream_terminal_payload_maps_every_reason_byte_for_byte() {
         payload
             .encode_into(&mut buf)
             .expect("a terminal always encodes");
-        assert_eq!(buf, wire(status.to_wire(), marker, body), "bytes for {reason:?}");
+        assert_eq!(
+            buf,
+            wire(status.to_wire(), marker, body),
+            "bytes for {reason:?}"
+        );
     }
 
     assert_terminal(
@@ -818,9 +826,8 @@ fn classify_streaming_chunk_follows_the_marker_rules() {
             body: Bytes::new(),
         }
     }
-    let marker = |name: &str, value: &[u8]| -> Vec<RpcHeader> {
-        vec![(name.to_string(), value.to_vec())]
-    };
+    let marker =
+        |name: &str, value: &[u8]| -> Vec<RpcHeader> { vec![(name.to_string(), value.to_vec())] };
 
     assert_eq!(
         classify_streaming_chunk(&ok(vec![])),

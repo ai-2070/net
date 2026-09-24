@@ -87,8 +87,7 @@ impl OrgId {
     pub fn verify(&self, message: &[u8], signature: &[u8; 64]) -> Result<(), OrgError> {
         // Classify a malformed key distinctly from a bad signature,
         // as core's `verifying_key()` step does.
-        ed25519_dalek::VerifyingKey::from_bytes(&self.0)
-            .map_err(|_| OrgError::InvalidPublicKey)?;
+        ed25519_dalek::VerifyingKey::from_bytes(&self.0).map_err(|_| OrgError::InvalidPublicKey)?;
         verify_entity_signature(&self.0, message, signature).map_err(|_| OrgError::InvalidSignature)
     }
 }

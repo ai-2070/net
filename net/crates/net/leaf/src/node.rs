@@ -37,8 +37,8 @@ use crate::org::proof::RpcCallShape;
 use crate::rpc::{CallOwner, CallResult, CallTable, DEFAULT_CALL_TIMEOUT_MS};
 use crate::rpc_serve::{ServeAdmission, ServeHandler, ServeOptions, ServePeer};
 use crate::rpc_stream::{
-    attach_signed_admission, CallHandle, CallOpenError, CallPin, OrgCallIntent,
-    RetireReason, SinkError, StreamOpen, StreamTerminal,
+    attach_signed_admission, CallHandle, CallOpenError, CallPin, OrgCallIntent, RetireReason,
+    SinkError, StreamOpen, StreamTerminal,
 };
 use crate::rpc_wire::{self, EventMeta, RpcFrame, RpcRequestPayload, RpcStatus};
 use crate::session::{event_frame_bytes, rtc_addr, PendingHandshake, SessionTable};
@@ -605,10 +605,8 @@ impl LeafNode {
     /// [`CallTable::with_seed`] for why it is not zero.
     pub fn new(identity: LeafIdentity, call_id_seed: u64) -> Self {
         let org_entity = EntityId::from_bytes(*identity.entity().entity_id());
-        let org_calls = crate::rpc_stream::StreamCallRegistry::new(
-            identity.origin_hash(),
-            call_id_seed,
-        );
+        let org_calls =
+            crate::rpc_stream::StreamCallRegistry::new(identity.origin_hash(), call_id_seed);
         let org_serves = crate::rpc_serve::ServeRegistry::new(identity.origin_hash());
         Self {
             identity,
@@ -2215,12 +2213,8 @@ impl LeafNode {
                 "org admission mint: {e:?}"
             ))));
         }
-        let frame = rpc_wire::encode_request_frame(
-            self.identity.origin_hash(),
-            call_id,
-            route,
-            &req,
-        )?;
+        let frame =
+            rpc_wire::encode_request_frame(self.identity.origin_hash(), call_id, route, &req)?;
         if let Err(e) = self.send_event_plane(
             peer,
             request.publish_stream_id(),
@@ -2329,17 +2323,18 @@ impl LeafNode {
     }
 
     /// Push one upload item (CS/DX).
-    pub fn org_call_send(&mut self, call_id: u64, item: &[u8]) -> core::result::Result<(), SinkError> {
+    pub fn org_call_send(
+        &mut self,
+        call_id: u64,
+        item: &[u8],
+    ) -> core::result::Result<(), SinkError> {
         let outcome = self.org_calls.send(call_id, item, clock::now_unix_nanos());
         self.pump_org_frames();
         outcome
     }
 
     /// Half-close the upload (DX) / finish it (CS).
-    pub fn org_call_finish_sending(
-        &mut self,
-        call_id: u64,
-    ) -> core::result::Result<(), SinkError> {
+    pub fn org_call_finish_sending(&mut self, call_id: u64) -> core::result::Result<(), SinkError> {
         let outcome = self
             .org_calls
             .finish_sending(call_id, clock::now_unix_nanos());
@@ -3504,7 +3499,8 @@ impl LeafNode {
                         self.org_calls.on_deadline_frame(presented, call_id)
                     }
                     RpcFrame::RequestGrant(grant) => {
-                        self.org_calls.on_grant(presented, grant.call_id, grant.credits)
+                        self.org_calls
+                            .on_grant(presented, grant.call_id, grant.credits)
                     }
                     RpcFrame::Request(_)
                     | RpcFrame::Cancel { .. }
@@ -3686,9 +3682,9 @@ fn map_open_error(e: CallOpenError) -> LeafError {
             status: RpcStatus::Backpressure.to_wire(),
             message: "this leaf already holds its streaming calls in flight".to_string(),
         }),
-        CallOpenError::Mint(err) => LeafError::Rpc(RpcError::Malformed(format!(
-            "org admission mint: {err:?}"
-        ))),
+        CallOpenError::Mint(err) => {
+            LeafError::Rpc(RpcError::Malformed(format!("org admission mint: {err:?}")))
+        }
     }
 }
 

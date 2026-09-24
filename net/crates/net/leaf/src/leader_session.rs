@@ -2021,8 +2021,9 @@ impl LeaderBackend for NodeBackend {
                     match opened {
                         Ok((crate::wasm::OrgBackendCall::Unary(receiver), _)) => {
                             match receiver.await {
-                                Ok(Ok(result)) => reply
-                                    .bytes(envelope(crate::leader::ORG_ENVELOPE_END, &result)),
+                                Ok(Ok(result)) => {
+                                    reply.bytes(envelope(crate::leader::ORG_ENVELOPE_END, &result))
+                                }
                                 Ok(Err(error)) => {
                                     reply.fail(ProxyFailure::Typed(LeafError::Rpc(error)))
                                 }
@@ -2138,10 +2139,12 @@ impl LeaderBackend for NodeBackend {
                                 return;
                             }
                             Some(Err(StreamTerminal::Refused { status, body })) => {
-                                reply.fail(ProxyFailure::Typed(LeafError::Rpc(RpcError::Refused {
-                                    status: status.to_wire(),
-                                    message: String::from_utf8_lossy(&body).into_owned(),
-                                })));
+                                reply.fail(ProxyFailure::Typed(LeafError::Rpc(
+                                    RpcError::Refused {
+                                        status: status.to_wire(),
+                                        message: String::from_utf8_lossy(&body).into_owned(),
+                                    },
+                                )));
                                 return;
                             }
                             None => {
@@ -2166,8 +2169,8 @@ impl LeaderBackend for NodeBackend {
                 owner_org,
                 shape,
             } => {
-                use crate::rpc_serve::{ServeAccess, ServeOptions};
                 use crate::org::proof::RpcCallShape;
+                use crate::rpc_serve::{ServeAccess, ServeOptions};
                 let wire_shape = match shape.as_str() {
                     "unary" => RpcCallShape::Unary,
                     "server-streaming" => RpcCallShape::ServerStreaming,
@@ -2221,11 +2224,7 @@ impl LeaderBackend for NodeBackend {
                     relay.next_serve_call += 1;
                     let id = relay.next_serve_call;
                     relay.serve_calls.insert(id, (registration, serve_call));
-                    relay
-                        .accepts
-                        .entry(registration)
-                        .or_default()
-                        .push_back(id);
+                    relay.accepts.entry(registration).or_default().push_back(id);
                 });
                 match node.backend_org_serve(&service, opts, handler) {
                     Ok(()) => reply.bytes(Bytes::new()),
@@ -2287,9 +2286,10 @@ impl LeaderBackend for NodeBackend {
                         let polled = {
                             let relay = org.borrow();
                             relay.serve_calls.get(&call).and_then(|(_, serve)| {
-                                serve.poll_request().map(Ok).or_else(|| {
-                                    serve.request_ended().then_some(Err(()))
-                                })
+                                serve
+                                    .poll_request()
+                                    .map(Ok)
+                                    .or_else(|| serve.request_ended().then_some(Err(())))
                             })
                         };
                         match polled {
@@ -2419,7 +2419,9 @@ impl LeaderBackend for NodeBackend {
                 node.backend_org_unserve(&service);
                 {
                     let mut relay = self.org.borrow_mut();
-                    relay.serve_calls.retain(|_, (seen, _)| *seen != registration);
+                    relay
+                        .serve_calls
+                        .retain(|_, (seen, _)| *seen != registration);
                     relay.accepts.remove(&registration);
                 }
                 reply.bytes(Bytes::new());
@@ -3411,7 +3413,10 @@ impl ProxyOrgCall {
     /// The next response item (long-pull: the leader holds the pull
     /// until an item, a terminal, or the generation moves).
     pub(crate) async fn poll(&self) -> Result<crate::wasm::OrgPoll, JsError> {
-        match self.pull(LeaderRequest::OrgNext { call: self.call }).await? {
+        match self
+            .pull(LeaderRequest::OrgNext { call: self.call })
+            .await?
+        {
             Ok(ProxyValue::Bytes(payload)) => decode_org_envelope(&payload),
             Ok(other) => Err(JsError::new(&format!(
                 "org_next answered an unexpected value: {other:?}"
@@ -3784,9 +3789,7 @@ fn relay_stream_call(org: &Rc<RefCell<OrgRelay>>, call: u64) -> Option<u64> {
 /// The typed "your call is closed" failure for an unknown handle —
 /// "no org call for handle N", never another call's.
 fn no_such_call(call: u64) -> ProxyFailure {
-    ProxyFailure::Typed(LeafError::Session(format!(
-        "no org call for handle {call}"
-    )))
+    ProxyFailure::Typed(LeafError::Session(format!("no org call for handle {call}")))
 }
 
 #[wasm_bindgen]
@@ -3813,17 +3816,15 @@ impl MeshSession {
         let call = next_org_id().map_err(js)?;
         let request = org_call_request("unary", call, &service, &payload.to_vec(), &options);
         match self.lifecycle.request(request).await {
-            Ok(ProxyValue::Bytes(payload)) => {
-                match decode_org_envelope(&payload)? {
-                    crate::wasm::OrgPoll::Terminal(StreamTerminal::Completed { body }) => {
-                        Ok(Uint8Array::from(&body[..]))
-                    }
-                    crate::wasm::OrgPoll::Terminal(other) => {
-                        Err(crate::wasm::terminal_js_error(&other))
-                    }
-                    _ => Err(JsError::new("the unary reply arrived as an item")),
+            Ok(ProxyValue::Bytes(payload)) => match decode_org_envelope(&payload)? {
+                crate::wasm::OrgPoll::Terminal(StreamTerminal::Completed { body }) => {
+                    Ok(Uint8Array::from(&body[..]))
                 }
-            }
+                crate::wasm::OrgPoll::Terminal(other) => {
+                    Err(crate::wasm::terminal_js_error(&other))
+                }
+                _ => Err(JsError::new("the unary reply arrived as an item")),
+            },
             Ok(_) => Err(JsError::new("org_call answered an unexpected value")),
             Err(failure) => Err(failure_rejection(&failure)),
         }
@@ -3843,8 +3844,13 @@ impl MeshSession {
         let options = crate::wasm::org_call_options(&opts)?;
         options.within_provider_cap()?;
         let call = next_org_id().map_err(js)?;
-        let request =
-            org_call_request("server-streaming", call, &service, &payload.to_vec(), &options);
+        let request = org_call_request(
+            "server-streaming",
+            call,
+            &service,
+            &payload.to_vec(),
+            &options,
+        );
         self.open_proxy_call(request, call).await
     }
 

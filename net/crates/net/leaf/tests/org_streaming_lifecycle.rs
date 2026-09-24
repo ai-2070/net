@@ -39,10 +39,10 @@ use net_leaf::rpc_stream::{
 };
 use net_leaf::rpc_wire::{
     self, classify_streaming_chunk, EventMeta, RpcFrame, RpcRequestChunkPayload, RpcRequestPayload,
-    RpcResponsePayload, RpcStatus, StreamingChunkKind, StreamHandlerResult,
+    RpcResponsePayload, RpcStatus, StreamHandlerResult, StreamingChunkKind,
     FLAG_RPC_CLIENT_STREAMING_REQUEST, FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE,
-    HEADER_NRPC_STREAM_WINDOW_INITIAL, HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_CONTINUE,
-    HEADER_NRPC_STREAMING_END,
+    HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_CONTINUE, HEADER_NRPC_STREAMING_END,
+    HEADER_NRPC_STREAM_WINDOW_INITIAL,
 };
 
 const SERVICE: &str = "svc.loop";
@@ -218,7 +218,11 @@ impl Loop {
             policy: None,
         };
         self.serves
-            .serve(SERVICE, opts, Rc::new(move |call| calls.borrow_mut().push(call)))
+            .serve(
+                SERVICE,
+                opts,
+                Rc::new(move |call| calls.borrow_mut().push(call)),
+            )
             .expect("serve");
     }
 
@@ -566,14 +570,14 @@ fn server_streaming_delivers_every_item_in_order_then_exactly_one_end_terminal()
     );
     assert_eq!(
         l.caller.terminal(id),
-        Some(&StreamTerminal::Completed {
-            body: Bytes::new()
-        })
+        Some(&StreamTerminal::Completed { body: Bytes::new() })
     );
     drop(handle);
     let after = l.caller_out();
     assert!(
-        after.iter().all(|o| !matches!(o.frame, RpcFrame::Cancel { .. })),
+        after
+            .iter()
+            .all(|o| !matches!(o.frame, RpcFrame::Cancel { .. })),
         "a completed call's handle drop emits no CANCEL"
     );
 }
@@ -591,7 +595,11 @@ fn client_streaming_binds_the_first_chunk_into_the_opening_and_returns_one_respo
     l.caller.send(id, b"beta", l.now).expect("send");
     l.caller.finish_sending(id, l.now).expect("finish");
     let up = l.caller_out();
-    assert_eq!(up.len(), 3, "REQUEST(first) + chunk(second) + terminal upload");
+    assert_eq!(
+        up.len(),
+        3,
+        "REQUEST(first) + chunk(second) + terminal upload"
+    );
     match &up[0].frame {
         RpcFrame::Request(req) => {
             assert_eq!(
@@ -599,7 +607,11 @@ fn client_streaming_binds_the_first_chunk_into_the_opening_and_returns_one_respo
                 b"alpha",
                 "the REQUEST body IS the first chunk"
             );
-            assert_eq!(req.flags & FLAG_RPC_REQUEST_END, 0, "more items were to come");
+            assert_eq!(
+                req.flags & FLAG_RPC_REQUEST_END,
+                0,
+                "more items were to come"
+            );
         }
         other => panic!("expected the opening REQUEST, got {other:?}"),
     }
@@ -612,7 +624,11 @@ fn client_streaming_binds_the_first_chunk_into_the_opening_and_returns_one_respo
     }
     match &up[2].frame {
         RpcFrame::RequestChunk(chunk) => {
-            assert_eq!(chunk.body.as_ref(), b"", "the terminal upload frame is empty");
+            assert_eq!(
+                chunk.body.as_ref(),
+                b"",
+                "the terminal upload frame is empty"
+            );
             assert_eq!(chunk.flags & FLAG_RPC_REQUEST_END, FLAG_RPC_REQUEST_END);
         }
         other => panic!("expected the terminal upload frame, got {other:?}"),
@@ -712,9 +728,7 @@ fn duplex_keeps_its_upload_and_response_halves_independent() {
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"d2")));
     assert_eq!(
         l.caller.terminal(id),
-        Some(&StreamTerminal::Completed {
-            body: Bytes::new()
-        }),
+        Some(&StreamTerminal::Completed { body: Bytes::new() }),
         "exactly one terminal after the items"
     );
     drop(handle);
@@ -729,7 +743,9 @@ fn unary_round_trip_resolves_with_the_aggregate_body() {
     // The unary caller: the existing CallTable path + the shared mint.
     let mut table = CallTable::with_seed(1);
     let owner = l.call_owner();
-    let (call_id, mut rx) = table.register(owner, l.request_route, 30_000).expect("register");
+    let (call_id, mut rx) = table
+        .register(owner, l.request_route, 30_000)
+        .expect("register");
     let raw = l.craft_request(
         call_id,
         0,
@@ -779,7 +795,10 @@ fn a_missing_proof_is_missing_header_and_garbage_is_malformed_proof() {
         OpenOutcome::Denied(AdmissionDenied::MissingHeader)
     );
     let down = l.provider_out();
-    assert_eq!(responses(&down), vec![denied(CoarseAdmissionReason::Denied)]);
+    assert_eq!(
+        responses(&down),
+        vec![denied(CoarseAdmissionReason::Denied)]
+    );
 
     let raw = l.craft_request(
         0x2002,
@@ -793,7 +812,10 @@ fn a_missing_proof_is_missing_header_and_garbage_is_malformed_proof() {
         OpenOutcome::Denied(AdmissionDenied::MalformedProof)
     );
     let down = l.provider_out();
-    assert_eq!(responses(&down), vec![denied(CoarseAdmissionReason::Denied)]);
+    assert_eq!(
+        responses(&down),
+        vec![denied(CoarseAdmissionReason::Denied)]
+    );
 }
 
 #[test]
@@ -813,7 +835,10 @@ fn a_wrong_capability_tag_is_capability_mismatch() {
         OpenOutcome::Denied(AdmissionDenied::CapabilityMismatch)
     );
     let down = l.provider_out();
-    assert_eq!(responses(&down), vec![denied(CoarseAdmissionReason::Denied)]);
+    assert_eq!(
+        responses(&down),
+        vec![denied(CoarseAdmissionReason::Denied)]
+    );
 }
 
 #[test]
@@ -933,7 +958,10 @@ fn flag_shape_mismatch_is_not_supported_and_proof_kind_mismatch_is_shape_mismatc
         OpenOutcome::Denied(AdmissionDenied::ShapeMismatch)
     );
     let down = l.provider_out();
-    assert_eq!(responses(&down), vec![denied(CoarseAdmissionReason::Denied)]);
+    assert_eq!(
+        responses(&down),
+        vec![denied(CoarseAdmissionReason::Denied)]
+    );
 }
 
 #[test]
@@ -986,7 +1014,10 @@ fn live_call_id_reuse_is_active_call_owned_with_exactly_one_refusal() {
     );
     let down = l.provider_out();
     assert_eq!(terminals(&down), 1, "exactly one refusal terminal");
-    assert_eq!(responses(&down), vec![denied(CoarseAdmissionReason::Denied)]);
+    assert_eq!(
+        responses(&down),
+        vec![denied(CoarseAdmissionReason::Denied)]
+    );
     assert_eq!(l.serves.live_calls(), 1, "the live call is untouched");
 
     // And it still ends with its OWN single terminal afterwards.
@@ -1028,7 +1059,11 @@ fn request_end_is_eof_and_a_late_chunk_delivers_and_cancels_nothing() {
         false,
         "a late chunk delivers nothing"
     );
-    assert_eq!(call.poll_request(), None, "and never reopens the input half");
+    assert_eq!(
+        call.poll_request(),
+        None,
+        "and never reopens the input half"
+    );
     let down = l.provider_out();
     assert_eq!(down.len(), 0, "and cancels nothing");
     assert_eq!(l.caller.terminal(id), None, "the call is still live");
@@ -1168,9 +1203,7 @@ fn response_credit_parks_the_sender_and_each_grant_releases_exactly_its_chunks()
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"e")));
     assert_eq!(
         l.caller.terminal(id),
-        Some(&StreamTerminal::Completed {
-            body: Bytes::new()
-        })
+        Some(&StreamTerminal::Completed { body: Bytes::new() })
     );
     drop(handle);
 }
@@ -1306,7 +1339,10 @@ fn zero_windows_are_refused_at_open_and_at_admission() {
         OpenOutcome::Denied(AdmissionDenied::ProviderPolicyRejected)
     );
     let down = l.provider_out();
-    assert_eq!(responses(&down), vec![denied(CoarseAdmissionReason::Denied)]);
+    assert_eq!(
+        responses(&down),
+        vec![denied(CoarseAdmissionReason::Denied)]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1443,9 +1479,7 @@ fn success_drains_queued_items_in_order_before_the_end_terminal() {
     while l.caller.next_item(id).is_some() {}
     assert_eq!(
         l.caller.terminal(id),
-        Some(&StreamTerminal::Completed {
-            body: Bytes::new()
-        })
+        Some(&StreamTerminal::Completed { body: Bytes::new() })
     );
     drop(handle);
 }
@@ -1544,7 +1578,11 @@ fn wrong_peer_and_old_session_frames_deliver_nothing() {
     );
     assert_eq!(l.serves.on_cancel(&wrong_peer, id), false);
     assert_eq!(l.serves.on_stream_grant(&wrong_peer, id, 10), false);
-    assert_eq!(call.poll_request(), None, "the spoofed chunk was not queued");
+    assert_eq!(
+        call.poll_request(),
+        None,
+        "the spoofed chunk was not queued"
+    );
     assert_eq!(l.provider_out().len(), 0, "and nothing was emitted");
 
     // The real call is unaffected.
@@ -1727,7 +1765,7 @@ mod node_level {
     use net_leaf::clock;
     use net_leaf::identity::LeafIdentity;
     use net_leaf::node::LeafNode;
-    use net_leaf::session::{rtc_addr, routing_id};
+    use net_leaf::session::{routing_id, rtc_addr};
     use net_wire::channel::membership::{self, AckReason, MembershipMsg};
     use net_wire::crypto::{handshake_prologue, NoiseHandshake, StaticKeypair};
     use net_wire::parsed_packet::ParsedPacket;
@@ -1770,7 +1808,8 @@ mod node_level {
         let msg2_packet = PacketBuilder::new(&[0u8; 32], 0).build_handshake(&msg2);
 
         node.set_peer_rtc_addr(peer, Some("198.51.100.7:4433".into()));
-        node.complete_handshake(peer, &msg2_packet).expect("install");
+        node.complete_handshake(peer, &msg2_packet)
+            .expect("install");
         let keys = responder.into_session_keys().expect("keys");
         (node, NetSession::new(keys, rtc_addr(1, 1), 2, false))
     }
@@ -1790,7 +1829,13 @@ mod node_level {
         let mut builder = peer_session.thread_local_pool().get();
         builder.set_channel_hash(channel_hash);
         builder.set_origin_hash(0xFEED_FACE_0000_0001);
-        builder.build_subprotocol(stream_id, seq, &events, PacketFlags::RELIABLE, subprotocol_id)
+        builder.build_subprotocol(
+            stream_id,
+            seq,
+            &events,
+            PacketFlags::RELIABLE,
+            subprotocol_id,
+        )
     }
 
     /// Decrypt one packet the leaf built, as the peer would.
@@ -2113,10 +2158,7 @@ mod node_level {
         }
         assert_eq!(
             responses,
-            vec![
-                super::continue_chunk(b"item"),
-                super::end_terminal(),
-            ],
+            vec![super::continue_chunk(b"item"), super::end_terminal(),],
             "the items and the one terminal deliver in order on the reply route"
         );
     }
@@ -2198,7 +2240,8 @@ mod node_level {
     /// provider-side `response_credit_parks_the_pump_...` this is the
     /// end-to-end window property.
     #[test]
-    fn a_windowed_server_streaming_opens_at_the_node_verb_and_grants_one_credit_per_consumed_chunk() {
+    fn a_windowed_server_streaming_opens_at_the_node_verb_and_grants_one_credit_per_consumed_chunk()
+    {
         let world = World::at(clock::now_unix_secs());
         let peer_ident = peer_identity();
         let peer = peer_ident.node_id();
@@ -2300,9 +2343,7 @@ mod node_level {
         );
         assert_eq!(
             node.org_call_terminal(call_id),
-            Some(StreamTerminal::Completed {
-                body: Bytes::new()
-            })
+            Some(StreamTerminal::Completed { body: Bytes::new() })
         );
 
         let mut grants = Vec::new();

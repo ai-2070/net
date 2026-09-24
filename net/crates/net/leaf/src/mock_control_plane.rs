@@ -754,7 +754,10 @@ mod tests {
         assert_eq!(carried.len(), 1, "one leg crossed");
         assert_eq!(carried[0].kind, CarriedKind::Revocation);
         assert_eq!(carried[0].to, Some(A));
-        assert_eq!(carried[0].bytes, 4, "the ledger counts exactly what crossed");
+        assert_eq!(
+            carried[0].bytes, 4,
+            "the ledger counts exactly what crossed"
+        );
         assert!(
             carried[0].kind.is_signalling(),
             "a signed facts feed is control material, not a packet"

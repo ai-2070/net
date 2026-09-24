@@ -197,9 +197,9 @@ impl AnchorControlPlane {
                 .ok()?
                 .as_string()
                 .filter(|url| !url.is_empty());
-            web_sys::console::warn_1(
-                &JsValue::from_str(&format!("[org-feed] bind read hook={value:?}")),
-            );
+            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                "[org-feed] bind read hook={value:?}"
+            )));
             value
         });
         let control = Self {
@@ -260,7 +260,10 @@ impl AnchorControlPlane {
             route_frame(&text, dialog, &events, &revocation);
         }) as Box<dyn FnMut(MessageEvent)>);
         socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-        self.state.handlers.borrow_mut().push(on_message.into_js_value());
+        self.state
+            .handlers
+            .borrow_mut()
+            .push(on_message.into_js_value());
         Ok(())
     }
 
@@ -550,7 +553,9 @@ fn parse_revocation_frame(text: &str) -> Option<Vec<u8>> {
         return None;
     }
     let encoded = document.get("bundle").and_then(|v| v.as_str())?;
-    base64::engine::general_purpose::STANDARD.decode(encoded).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()
 }
 
 /// Split the `#org-control=<ws-url>` override tag off a bootstrap

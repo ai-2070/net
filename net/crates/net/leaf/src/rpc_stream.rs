@@ -422,7 +422,11 @@ fn push_cancel(out: &Rc<RefCell<VecDeque<OutFrame>>>, core: &CallCore) {
     out.borrow_mut().push_back(OutFrame {
         peer: core.pin.peer,
         route: core.pin.request_route,
-        frame: rpc_wire::encode_cancel_frame(core.origin_hash, core.call_id, core.pin.request_route),
+        frame: rpc_wire::encode_cancel_frame(
+            core.origin_hash,
+            core.call_id,
+            core.pin.request_route,
+        ),
     });
 }
 
@@ -1089,9 +1093,8 @@ fn emit_open(
         pending.session_binding,
         now_unix_ns,
     )?;
-    let frame =
-        encode_request_frame(core.origin_hash, core.call_id, core.pin.request_route, &req)
-            .map_err(|e| MintError::Encode(format!("request frame: {e}")))?;
+    let frame = encode_request_frame(core.origin_hash, core.call_id, core.pin.request_route, &req)
+        .map_err(|e| MintError::Encode(format!("request frame: {e}")))?;
     out.borrow_mut().push_back(OutFrame {
         peer: core.pin.peer,
         route: core.pin.request_route,

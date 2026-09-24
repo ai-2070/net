@@ -588,7 +588,6 @@ pub enum LeaderRequest {
     // `call` id — and the backend keys its relay state by exactly
     // that; delivering a call's items under another follower's
     // handle is the REQUIRED witness inverse and must fail.
-
     /// Follower → leader: open one org-protected call.
     ///
     /// The proof material crosses as opaque credential wire bytes;
@@ -673,7 +672,6 @@ pub enum LeaderRequest {
     // existing retire discipline: `ProxyServer::retire`
     // fence → shutdown → `LeaderLost`, and nothing here is ever
     // resurrected.
-
     /// Follower → leader: register one org service whose handler
     /// runs in this follower.
     OrgServeRegister {
@@ -2331,8 +2329,14 @@ fn encode_request(request: &LeaderRequest) -> Value {
             map.insert("ttl_secs".into(), Value::from(ttl_secs.to_string()));
             map.insert("deadline_ns".into(), Value::from(deadline_ns.to_string()));
             map.insert("timeout_ms".into(), opt_u32(timeout_ms));
-            map.insert("stream_window_initial".into(), opt_u32(stream_window_initial));
-            map.insert("request_window_initial".into(), opt_u32(request_window_initial));
+            map.insert(
+                "stream_window_initial".into(),
+                opt_u32(stream_window_initial),
+            );
+            map.insert(
+                "request_window_initial".into(),
+                opt_u32(request_window_initial),
+            );
         }
         LeaderRequest::OrgSend { call, payload } => {
             map.insert("op".into(), Value::from("org_send"));
@@ -2540,9 +2544,9 @@ fn decode_request(value: &Value) -> Result<LeaderRequest> {
         },
         "org_serve_finish" => LeaderRequest::OrgServeFinish {
             call: u64_field(value, "call")?,
-            status: u64_field(value, "status")?.try_into().map_err(|_| {
-                LeafError::ControlPlane("proxy status does not fit a u16".into())
-            })?,
+            status: u64_field(value, "status")?
+                .try_into()
+                .map_err(|_| LeafError::ControlPlane("proxy status does not fit a u16".into()))?,
             message: str_field(value, "message")?.to_string(),
         },
         "org_serve_retired" => LeaderRequest::OrgServeRetired {

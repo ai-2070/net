@@ -183,7 +183,10 @@ impl core::fmt::Display for ReplayConfigError {
                 "replay owner_reserved_entries ({reserved}) must be < max_entries ({global}); \
                  a reserve at or above the global cap leaves external callers nothing"
             ),
-            Self::PerExternalOrgAboveExternalPool { per_org, external_pool } => write!(
+            Self::PerExternalOrgAboveExternalPool {
+                per_org,
+                external_pool,
+            } => write!(
                 f,
                 "replay max_entries_per_external_org ({per_org}) must be <= the external pool \
                  ({external_pool} = max_entries - owner_reserved_entries)"
@@ -697,7 +700,8 @@ impl AdmissionReplayGuard {
             st.reclaim_caller(caller, now);
             let caller_live = st.by_caller.get(caller).map_or(0, HashMap::len);
             if caller_live >= self.config.max_entries_per_caller {
-                self.per_caller_denials.set(self.per_caller_denials.get() + 1);
+                self.per_caller_denials
+                    .set(self.per_caller_denials.get() + 1);
                 return ReplayOutcome::PerCallerCapacityExhausted;
             }
         }
