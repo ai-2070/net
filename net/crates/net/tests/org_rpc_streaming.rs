@@ -5393,14 +5393,18 @@ async fn early_handler_return_refuses_late_input_without_resource_exhausted() {
     );
     // Never delivered, never retained: the handler's aggregate is exactly
     // the opening body — the late chunk is nowhere.
-    let seen_bodies = seen.lock();
-    let delivered: Vec<&[u8]> = seen_bodies.iter().map(|b| b.as_ref()).collect();
+    // Scope the guard to the collection: a `MutexGuard` must never cross
+    // the awaits below (clippy::await_holding_lock), and a borrow-tied
+    // `Vec<&[u8]>` keeps the loan alive past its visible use.
+    let delivered: Vec<Vec<u8>> = {
+        let seen_bodies = seen.lock();
+        seen_bodies.iter().map(|b| b.to_vec()).collect()
+    };
     assert_eq!(
         delivered,
-        vec![b"ER-req-1".as_slice()],
+        vec![b"ER-req-1".to_vec()],
         "the late chunk is refused/discarded — never delivered, never retained",
     );
-    drop(seen_bodies);
     s15::assert_stays_empty(
         &caller_seen,
         Duration::from_millis(200),

@@ -5291,8 +5291,7 @@ impl MeshNode {
                                 // `rtc_admission` R1 regression's fix: the
                                 // flag-less publish was refused before the
                                 // handler spawn.
-                                let frame =
-                                    normalize_omitted_stream_flags(frame, shape);
+                                let frame = normalize_omitted_stream_flags(frame, shape);
                                 if let Err(e) = fold.lock().apply_inbound(&frame) {
                                     tracing::warn!(
                                         error = %e,

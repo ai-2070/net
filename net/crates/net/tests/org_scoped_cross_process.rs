@@ -85,7 +85,8 @@ fn node_config() -> MeshNodeConfig {
     // in-process green recipe and the cross-process red ones. The witness must
     // run where the defect runs.
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
-    let mut cfg = MeshNodeConfig::new(addr, PSK).with_heartbeat_interval(Duration::from_millis(200));
+    let mut cfg =
+        MeshNodeConfig::new(addr, PSK).with_heartbeat_interval(Duration::from_millis(200));
     cfg.configured_identity = true;
     cfg
 }
@@ -243,11 +244,11 @@ async fn provider_child_main() {
     });
     let calls = handler.calls.clone();
     let attribution_ok = handler.attribution_ok.clone();
-    let _serve: ServeHandle =
-        match provider.serve_rpc_granted(SERVICE, handler, Arc::new(|_| true)) {
-            Ok(h) => h,
-            Err(e) => fail(format!("granted serve: {e:?}")),
-        };
+    let _serve: ServeHandle = match provider.serve_rpc_granted(SERVICE, handler, Arc::new(|_| true))
+    {
+        Ok(h) => h,
+        Err(e) => fail(format!("granted serve: {e:?}")),
+    };
 
     // Announce loop + emission instrumentation: the `SendEmission.scoped`
     // cache site, observed from the provider side and reported on the RESULT
@@ -255,7 +256,10 @@ async fn provider_child_main() {
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut emitted = 0usize;
     while Instant::now() < deadline {
-        provider.announce_capabilities(CapabilitySet::new()).await.ok();
+        provider
+            .announce_capabilities(CapabilitySet::new())
+            .await
+            .ok();
         emitted = provider.announcement_scoped_for_send_for_test().len();
         if calls.load(Ordering::SeqCst) > 0 {
             break;
@@ -348,9 +352,14 @@ async fn scoped_discovery_crosses_an_os_process_boundary() {
     );
     let caller_cert =
         OrgMembershipCert::try_issue(&org_a, caller_entity.clone(), 1, 3600).expect("c cert");
-    let caller_authority =
-        NodeAuthority::adopt(&dir.join("caller_authority"), caller_cert, &caller_entity, 0, None)
-            .expect("adopt caller authority");
+    let caller_authority = NodeAuthority::adopt(
+        &dir.join("caller_authority"),
+        caller_cert,
+        &caller_entity,
+        0,
+        None,
+    )
+    .expect("adopt caller authority");
     caller
         .install_node_authority(Arc::new(caller_authority))
         .expect("install caller authority");
@@ -474,12 +483,14 @@ async fn scoped_discovery_crosses_an_os_process_boundary() {
             caller.org_scoped_ingest_counts(),
         );
         let _ = child.kill();
-        panic!(
-            "F-S4Vectors-1: scoped discovery did not cross the OS-process boundary"
-        );
+        panic!("F-S4Vectors-1: scoped discovery did not cross the OS-process boundary");
     }
     let providers = caller.granted_capability_providers(&grant.grant_id);
-    assert_eq!(providers.len(), 1, "exactly the one granted provider considered");
+    assert_eq!(
+        providers.len(),
+        1,
+        "exactly the one granted provider considered"
+    );
     assert_eq!(
         providers[0].provider, provider_entity,
         "the considered candidate is the child process's provider entity",
