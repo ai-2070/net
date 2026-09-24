@@ -452,17 +452,6 @@ fn decode_request(raw: Vec<u8>) -> (u64, RpcRequestPayload) {
     (meta.seq_or_ts, req)
 }
 
-/// Count the `continue` chunks in a decoded batch.
-fn chunks(frames: &[Outgoing]) -> usize {
-    frames
-        .iter()
-        .filter(|o| {
-            matches!(&o.frame, RpcFrame::Response { payload, .. }
-                if classify_streaming_chunk(payload) == StreamingChunkKind::Continue)
-        })
-        .count()
-}
-
 /// Count the terminal-shaped responses in a decoded batch.
 fn terminals(frames: &[Outgoing]) -> usize {
     frames
