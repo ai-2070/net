@@ -59,10 +59,19 @@
 //! [`Runtime::shutdown_background`], which detaches the worker threads
 //! and returns immediately; tokio provides it for exactly this case.
 //!
+//! There is a second context where blocking is unsafe for the same
+//! reason: **the calling thread already holds the GIL**. Dropping a
+//! runtime joins its blocking pool, and a Python handler runs on that
+//! pool under `Python::attach` (the org and nRPC handler bridges), so it
+//! must re-acquire the GIL to return. Blocking while holding the GIL
+//! deadlocks the process, and no other Python thread can break it —
+//! pytest-timeout's watchdog included, which is why the symptom was a
+//! silent hang rather than a named timeout. The guard detaches there too.
+//!
 //! The asymmetry is deliberate. `shutdown_background` does not wait for
 //! tasks, so making it the unconditional path would turn every ordinary
 //! shutdown into a detach and leak threads. It is used only where the
-//! alternative is a panic.
+//! alternative is a panic or a deadlock.
 
 use std::ops::Deref;
 
@@ -104,12 +113,30 @@ impl Drop for GuardedRuntime {
         let Some(rt) = self.inner.take() else {
             return;
         };
-        if Handle::try_current().is_ok() {
-            // We are on a thread owned by *some* runtime — very likely
-            // this one, via a GC that ran inside a pyo3 callback.
-            // Dropping here would block, which tokio refuses: it
-            // panics, and under `panic = "abort"` that ends the host
-            // process. Detach instead.
+        // Blocking here is safe only when nothing on this runtime can still
+        // need the GIL. Two contexts forbid it:
+        //
+        //  * inside an async context, where tokio refuses to block (the
+        //    original defect this guard exists for; without the detach it
+        //    panics, and under `panic = "abort"` that ends the host process);
+        //  * on a thread that already HOLDS the GIL — every Python thread,
+        //    including a CPython GC deallocating the last `Arc` as we speak.
+        //
+        // Dropping a `Runtime` joins its blocking pool (tokio's own docs:
+        // "dropping a runtime will block indefinitely for spawned blocking
+        // tasks to complete"). A Python handler runs on that pool under
+        // `Python::attach` — see `org_serve::run_py_org_handler` and the
+        // nRPC handler bridge — so to return it must re-acquire the GIL.
+        // Blocking on it while holding the GIL deadlocks the process; and
+        // because the GIL is never released, no other Python thread can
+        // break the deadlock, not even pytest-timeout's watchdog. That is a
+        // silent CI hang until the job ceiling, not a named timeout.
+        //
+        // This is the same class of bug as the async-context panic, and it
+        // reaches the same conclusion: detach.
+        if Handle::try_current().is_ok() || thread_holds_the_gil() {
+            // The work this runtime was still doing is being discarded
+            // anyway, and the alternative is a wedged process.
             rt.shutdown_background();
         } else {
             // The ordinary path: block until the workers are done, so
@@ -117,6 +144,25 @@ impl Drop for GuardedRuntime {
             drop(rt);
         }
     }
+}
+
+/// Whether the calling thread currently holds the CPython GIL.
+///
+/// `PyGILState_Check` is the only non-blocking way to ask. `Python::try_attach`
+/// cannot be used here: on a thread that does not already hold the GIL it
+/// *acquires* it, which is itself a blocking wait — on the very thread this
+/// guard must not stall.
+///
+/// `Py_IsInitialized` gates the check because `PyGILState_Check`'s behaviour
+/// before interpreter initialization is undefined (pyo3's own test initializes
+/// first, for exactly this reason); this module's unit tests build and drop a
+/// `GuardedRuntime` with no interpreter running.
+fn thread_holds_the_gil() -> bool {
+    // SAFETY: `Py_IsInitialized` is safe to call before initialization and
+    // after finalization. Only once it reports the interpreter is up do we
+    // call `PyGILState_Check`, which reads this thread's GIL state and takes
+    // no arguments.
+    unsafe { pyo3::ffi::Py_IsInitialized() != 0 && pyo3::ffi::PyGILState_Check() == 1 }
 }
 
 #[cfg(test)]
