@@ -1,0 +1,24 @@
+net/crates/net/cli/tests/channel_join.rs
+  s_3f3d4c91f992be::t_59828c0c626a60 313-316
+  s_3f3d4c91f992be::t_889d4a21b929e3 306-312,317-336,352-355
+net/crates/net/cli/src/commands/enrollment.rs
+  s_3f3d4c91f992be::t_743be8d12edc8b 502-504,930-948,1019-1031,1975-1977,2051-2054
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_f00c87234487bc 3933-3959
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b5eda3f6e5ac75a4a2209f82dfa9c3b65cdfe56e",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
