@@ -103,7 +103,7 @@ jobs:
       - name: Run unit tests (all in-source units, full feature set)
         run: cargo test --lib --features "$UNIT_FEATURES"
 
-      # Stage 2 moved seven modules (and the routing-envelope codec)
+      # Seven modules moved (and the routing-envelope codec)
       # into `net-mesh-wire`, taking their `#[cfg(test)] mod`s with
       # them. `--lib` above is the ROOT crate only, and no other job
       # executes this suite — clippy compiles it, the wasm job runs
@@ -948,7 +948,7 @@ jobs:
           cargo test -p net-deck --bins 2>&1 | tee /tmp/deck.log
           ran=$(grep -c '^test .* \.\.\. ok$' /tmp/deck.log || true)
           echo "deck unit tests: $ran"
-          # Stage 6 added the ICE column's ledger + rollup tests.
+          # The ICE column's ledger + rollup tests were added.
           if [ "$ran" -lt 31 ]; then
             echo "::error::net-deck ran $ran tests, floor is 31 — \
           lower the floor deliberately or restore the witness"
@@ -1360,7 +1360,7 @@ jobs:
           --test route_withdraw
           --test routed_transport_availability
 
-      # === S4: the two-OS-process scoped-discovery witness (R4CoreFix) ===
+      # === the two-OS-process scoped-discovery witness (R4CoreFix) ===
       # The step above EXECUTED it (tests/org_scoped_cross_process.rs — the
       # natsim.rs re-exec idiom: 1 passing witness + 1 #[ignore]
       # spawned-provider role); this step PINS it: both names must appear
@@ -1758,9 +1758,9 @@ jobs:
             relay_reauthors_org_provider_under_its_own_membership \
             a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown || exit 1
 
-          # ORG_SCOPED_STREAMING_PLAN Stages 1-2 — protected server-streaming
+          # Protected server-streaming
           # (binary tests/org_rpc_streaming.rs). Floor = the count the binary
-          # reports at the pinned head (41 after Stage 2: the 30-roster
+          # reports at the pinned head (41: the 30-roster
           # preserved verbatim + 11 CS/DX + duplex-flow + half-close
           # witnesses). Raised with each slice that lands witnesses;
           # REQUIRED names extended in the same commit as the witnesses.
@@ -1860,7 +1860,7 @@ jobs:
           # lockfile drifts every time the workspace gains or bumps a
           # dependency the probe also reaches — and `--locked` then
           # fails BEFORE either leg runs, which reads as "the guard
-          # broke" rather than "the lockfile is stale". Stage 5's
+          # broke" rather than "the lockfile is stale". A
           # `wasm-bindgen` pin did it for the second time (the first
           # was 64b0256c9). Say so precisely, and only when it is
           # actually the cause.
@@ -1871,7 +1871,7 @@ jobs:
           fi
 
       # === The org + streaming API probe (external consumer) ===============
-      # `ORG_SCOPED_STREAMING_PLAN.md` changes public org and streaming types
+      # The org-scoped streaming plan changes public org and streaming types
       # (Compatibility ledger C1/C3/C4). Every in-workspace caller of those
       # types is edited in the same commit as the type itself, so no test in
       # this repository fails when a DOWNSTREAM build would. This probe is
@@ -1889,7 +1889,7 @@ jobs:
       #     what makes a stale lockfile read as "regenerate the lockfile"
       #     instead of surfacing as an unexplained failure of the compile
       #     leg, which is `--locked` too.
-      #   * `cargo check --locked` must COMPILE. When Stage 1 lands C1/C3/C4
+      #   * `cargo check --locked` must COMPILE. When C1/C3/C4 land
       #     it will stop compiling - that failure IS the named source break,
       #     and `guards/org_api_probe` is updated in the same commit, which
       #     is exactly the review signal the ledger asks for.
@@ -2366,7 +2366,7 @@ jobs:
       #   - tool_macro              — `#[tool]` proc-macro
       #     expansion + serve-helper round-trip. Gated on
       #     `feature = "macros" + "cortex"`.
-      #   - sensing_provider        — S1 capability-sensing provider
+      #   - sensing_provider        — capability-sensing provider
       #     lifecycle: registration ownership, the publication fence
       #     (an in-flight evaluation released after a close or a
       #     replacement), state-edge notification, and terminal
@@ -2388,7 +2388,7 @@ jobs:
       # reads `.config/nextest.toml` and fails if either ever drops out — the
       # override is a filter expression, so it would otherwise stop matching
       # silently.
-      #   - sensing_consumer        — S1 capability-sensing CONSUMER
+      #   - sensing_consumer        — capability-sensing CONSUMER
       #     lifecycle for own-organization exact providers: signed
       #     readiness into one snapshot, a state edge waking a parked
       #     watcher, a change placed INSIDE a capture not being lost,
@@ -2398,7 +2398,7 @@ jobs:
       #     `feature = "net" + "cortex" + "fixtures"` (owner-scoped
       #     service discovery, plus the refresh-schedule and
       #     authority-clearing observations).
-      #   - org_exact_sensing       — OA-6 production organization
+      #   - org_exact_sensing       — production organization
       #     exact-sensing call edge (14 tests). Needs the SDK's own
       #     `fixtures` feature, which is what gates `OrgClient`'s
       #     test-only sensing observation accessors; without it the
@@ -2440,17 +2440,17 @@ jobs:
           cp "$JUNIT" "$RUNNER_TEMP/sdk-suite-junit.xml"
           exit "$st"
 
-      # === S3: the org_streaming facade lifecycle (ORG_SCOPED_STREAMING_PLAN)
+      # === the org_streaming facade lifecycle
       #
       # The step above already EXECUTED this binary (the SDK sweep runs every
       # test in its own process); this gate PINS its result set — a witness
       # must not disappear silently. Fail-closed on identity/verdict/retries/
       # anti-vacuity per the gate contract above; `--self-test` proves the
-      # predicates first. Floor = 14 at the S3R head (the 10-roster + the four
-      # S3R closure witnesses: the Granted-arm rows, the Q1 default deadline,
+      # predicates first. Floor = 14 (the 10-roster + the four
+      # closure witnesses: the Granted-arm rows, the Q1 default deadline,
       # the OrgStreamRaw error items, the CS-seam typed terminal); raised with
       # each landing, names extended in the same commit as the witnesses.
-      - name: Witness floor — org_streaming (Stage 3 facade + S3R, 14)
+      - name: Witness floor — org_streaming (14)
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2473,7 +2473,7 @@ jobs:
             org_stream_raw_surfaces_midstream_errors_as_items \
             call_client_stream_bytes_deadline_reaches_a_typed_terminal || exit 1
 
-      # === S1: the CONSUMER observation lifecycle ==========================
+      # === the CONSUMER observation lifecycle ==========================
       #
       # WHAT THIS GATES, and why it is no longer a per-name re-run loop.
       #
@@ -2516,7 +2516,7 @@ jobs:
       # and `the_population_floor_wakes_a_quiet_parked_consumer` holds the
       # default-floor liveness statement the control no longer makes, since it
       # widens the floor to qualify its negative window.
-      - name: Sensing — consumer observation lifecycle (S1)
+      - name: Sensing — consumer observation lifecycle
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2556,9 +2556,9 @@ jobs:
           the_population_floor_wakes_a_quiet_parked_consumer
           REQUIRED
 
-      # === OA-6: the PRODUCTION organization exact-sensing call edge =======
+      # === the PRODUCTION organization exact-sensing call edge =======
       #
-      # Same shape and same reasoning as S1 above: the suite step already ran
+      # Same shape and same reasoning as the gate above: the suite step already ran
       # this binary, one process per test, so this gate verifies that run's
       # result set instead of re-invoking the runner 22 more times. The
       # `<flakyFailure>` rejection matters here in particular — the
@@ -2571,7 +2571,7 @@ jobs:
       # `fixtures`, so this step is NOT a fixtures-off proof. The production
       # path's independence from that feature is the separate lib-only build
       # below, which compiles no dev-dependencies.
-      - name: Sensing — organization exact production call edge (OA-6)
+      - name: Sensing — organization exact production call edge
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2609,11 +2609,11 @@ jobs:
       # dev-dependencies, and the SDK's own `[dependencies]` entry for net-mesh
       # enables no features - so if the sensed call path ever reached a
       # fixtures-gated seam, this step is what fails.
-      # The in-crate half of the OA-6 evidence: the sensed step inside the
+      # The in-crate half of the evidence: the sensed step inside the
       # authority window, the Granted-mode mapping and selection under an
       # actual reordering, and the reconciliation trigger's decision table.
       # Named because a `--lib` run would otherwise absorb a rename silently.
-      - name: Sensing — organization exact planning unit witnesses (OA-6)
+      - name: Sensing — organization exact planning unit witnesses
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2647,7 +2647,7 @@ jobs:
           org::tests_call::a_refused_wave_paces_but_a_restored_authority_does_not_wait
           REQUIRED
 
-      # === A2A paid admission (WS-C) =======================================
+      # === A2A paid admission =======================================
       #
       # Same discipline as the two steps above, same reason: the
       # auto-discovery run has already executed this binary, so this step
@@ -2669,7 +2669,7 @@ jobs:
       # `a_revoked_preflight_without_headers_is_an_unpaid_rejection_and_keeps_the_reservation`
       # is the control that keeps the first from passing for a provider that
       # simply reconciles everything.
-      - name: A2A — paid admission witnesses (WS-C)
+      - name: A2A — paid admission witnesses
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2726,7 +2726,7 @@ jobs:
             || { echo "::error::expected at least 43 paid admission witnesses executed, saw $listed"; exit 1; }
           echo "A2A paid admission: $listed executed, $pinned pinned by name, all green"
 
-      # === A2A admission journal (WS-C) ====================================
+      # === A2A admission journal ====================================
       #
       # The durability half: the lifetime-exclusive `.owner` lock (including
       # the cross-process probe that re-execs this binary), the CAS
@@ -2734,7 +2734,7 @@ jobs:
       # retention classes, and the successor owner's recovery reading. These
       # are what stop a second charge or a second run after a crash, so the
       # roster is pinned rather than left to auto-discovery.
-      - name: A2A — admission journal durability (WS-C)
+      - name: A2A — admission journal durability
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2971,11 +2971,11 @@ jobs:
       # does inside a workspace dev build: it forwards core's own `fixtures`
       # seam, and a dev-dependency used to hide the missing forwarding. This is
       # the configuration the Go FFI jobs build, and the one that broke.
-      - name: Sensing — the fixtures observers build standalone (OA-6)
+      - name: Sensing — the fixtures observers build standalone
         if: ${{ !cancelled() }}
         run: cargo check --lib --features "net cortex fixtures"
 
-      - name: Sensing — the production call path needs no fixtures seam (OA-6)
+      - name: Sensing — the production call path needs no fixtures seam
         if: ${{ !cancelled() }}
         run: cargo check --lib --features "net cortex"
 
@@ -2992,7 +2992,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --doc --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
 
-      # === S4: the streaming-opening fixture authority (S4Vectors) ======
+      # === the streaming-opening fixture authority ======
       # The generator IS the Rust-side conformance verifier for
       # tests/cross_lang_org/streaming_opening_vectors.json (--check:
       # deterministic-regeneration drift guard + all 120 conformance rows).
@@ -3008,7 +3008,7 @@ jobs:
             exit 1
           }
 
-      # === Stage 4a: the SDK's RTC enrollment binary ======================
+      # === the SDK's RTC enrollment binary ======================
       #
       # `enrollment_over_rtc` is gated on the SDK's OWN `webrtc` feature,
       # which forwards to `net-mesh/webrtc`. Every step above runs with a
@@ -3046,14 +3046,14 @@ jobs:
           done
           echo "SDK RTC enrollment: both witnesses green"
 
-      # === Stage 4b: the bootstrap listener's witnesses ===================
+      # === the bootstrap listener's witnesses ===================
       #
       # `rtc_bootstrap_listener` needs the SDK's `rtc-bootstrap`
       # feature (axum + rustls), which no other step turns on, so
       # without this step the whole binary compiles to nothing —
       # the same silent-skip hazard the RTC step above exists for.
       #
-      # The six `kyra_*` names are the Stage 4b review's probes,
+      # The six `kyra_*` names are the review's probes,
       # landed verbatim. They reproduced 0/6 before the repairs and
       # are pinned individually: a repair that regresses must fail
       # here by name, not shrink the roster.
@@ -3119,7 +3119,7 @@ jobs:
 
       # The SDK's `webrtc` surface under the same lint bar as the rest of
       # the crate, and its rustdoc — neither was reachable from any step's
-      # feature list before Stage 4a.
+      # feature list before that step.
       - name: Lint and document the SDK's WebRTC surface
         if: ${{ !cancelled() }}
         run: |
@@ -3231,7 +3231,7 @@ jobs:
             || { echo "::error::expected at least 16 rows in review_round4_disposition, saw $listed"; exit 1; }
           echo "round-4b disposition probe: $listed executed, the named one green"
 
-      # === A2A caller purchase + task redeem (WS-B) =========================
+      # === A2A caller purchase + task redeem =========================
       #
       # The step above ran both binaries by auto-discovery. These two exist so
       # the roster cannot shrink silently, and because this is the money half:
@@ -3263,7 +3263,7 @@ jobs:
       # filterset carries no `--test` token, and `--no-tests=fail` is the
       # stronger guarantee anyway: a `binary()` that matches nothing FAILS
       # here at run time, where the guard's check is only lexical.
-      - name: A2A — caller purchase store witnesses (WS-B)
+      - name: A2A — caller purchase store witnesses
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
         run: |
@@ -3309,7 +3309,7 @@ jobs:
             || { echo "::error::expected at least 23 caller purchase witnesses executed, saw $listed"; exit 1; }
           echo "A2A caller purchase: $listed executed, $pinned pinned by name, all green"
 
-      - name: A2A — task redeem witnesses (WS-B)
+      - name: A2A — task redeem witnesses
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
         run: |
@@ -3348,7 +3348,7 @@ jobs:
       # unserved service fails fast with no-route instead, which is NOT the
       # defect) and requires a retryable verdict, which is what drives a
       # durable attempt to `Unknown` rather than to a false "did not happen".
-      - name: A2A — payment channel deadline (WS-B)
+      - name: A2A — payment channel deadline
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
         run: |
@@ -3482,7 +3482,7 @@ jobs:
             || { echo "::error::expected at least 15 caller identity witnesses executed, saw $listed"; exit 1; }
           echo "A2A caller identity: $listed executed, $pinned pinned by name, all green"
 
-      # === A2A paid end to end (WS-D) ======================================
+      # === A2A paid end to end ======================================
       #
       # The whole slice against the REAL engine rather than a scripted gate:
       # provider = `PaymentEngine` + mock facilitator + the engine-backed
@@ -3493,7 +3493,7 @@ jobs:
       #
       # Floor 6 is the count the binary reports (`6 tests run: 6 passed`).
       # All six are platform-independent (loopback UDP + tempdirs).
-      - name: A2A — paid end to end with the real engine (WS-D)
+      - name: A2A — paid end to end with the real engine
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
         run: |
@@ -3654,13 +3654,13 @@ jobs:
       - name: Run tests
         run: npm test
 
-      # === S4: the Node org facade witnesses (ORG_SCOPED_STREAMING_PLAN) ==
+      # === the Node org facade witnesses ==
       # The vitest run above EXECUTED these; this step PINS them (a witness
       # must not disappear silently): lexical name-existence, fail-closed,
       # over the two test files (vitest names are literal `it(...)` strings).
-      # Floor/roster: 10 at the S4Node head (9 in org_live + 1 in
+      # Floor/roster: 10 (9 in org_live + 1 in
       # consumer_compile); extended in the same commit as new witnesses.
-      - name: Witness roster — Node org facade (Stage 4, 10)
+      - name: Witness roster — Node org facade (10)
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
@@ -3679,7 +3679,7 @@ jobs:
             --source net/crates/net/bindings/node/test/consumer_compile.test.ts \
             a_consumer_program_compiles_against_the_shipped_org_surface || exit 1
 
-      # === S4: the Node cross-language vectors rows (S4Vectors) =========
+      # === the Node cross-language vectors rows =========
       # The npm test run above EXECUTED these 119 rows; this step runs the
       # file scoped (it is native-free) and PINS it: the count floor + the
       # structural roster (the describe, the seven it.each family anchors,
@@ -3878,7 +3878,7 @@ jobs:
           lower the floor deliberately or restore the witness"
             exit 1
           fi
-          # === S4: the sdk-ts org facade witnesses (ORG_SCOPED_STREAMING_PLAN)
+          # === the sdk-ts org facade witnesses
           # The vitest run above EXECUTED these 11 (the executable consumer
           # + 8 shape x authority cells over all four shapes + the midstream
           # org-vocabulary pin + strict disposal); this step PINS them: lexical
@@ -4054,7 +4054,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: pytest -v -s --timeout=30 --timeout-method=thread
 
-      # === S4: the Python org facade witnesses (ORG_SCOPED_STREAMING_PLAN) =
+      # === the Python org facade witnesses =
       # The pytest run above EXECUTED these 15 items (the 6 matrix functions
       # x [same_org|granted] = 12 cells + 3 standalone: the task-cancel
       # propagation witness, the midstream org-vocabulary witness, and the
@@ -4068,7 +4068,7 @@ jobs:
       # ceilings instead of failing. It is its own file (the property is a
       # teardown one), so it is pinned here rather than in a suite that does
       # not name it.
-      - name: Witness roster — Python org facade (Stage 4, 15 items / 9 names + teardown)
+      - name: Witness roster — Python org facade (15 items / 9 names + teardown)
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
@@ -4087,7 +4087,7 @@ jobs:
             test_teardown_with_a_live_handler_does_not_deadlock \
             same_org granted || exit 1
 
-      # === S4: the Python cross-language vectors rows (S4Vectors) =======
+      # === the Python cross-language vectors rows =======
       # The pytest run above EXECUTED these (119 items: the byte pins, the
       # opening role rows, the reject-reality rows, the vocabulary
       # declaration + grammar rows, the never-success rows, narrowed ids,
@@ -4126,7 +4126,7 @@ jobs:
       - name: Install the sdk-py wrapper
         run: pip install --no-deps -e ../../sdk-py
 
-      # === S4: the sdk-py org facade witnesses (Stage 4 Wave 2, Q6) =====
+      # === the sdk-py org facade witnesses (Q6) =====
       # PINS the 9 base names of the 6 matrix functions, the parametrize
       # pair that yields their 12 cells, and the count floor (fail-closed)
       # — AND RUNS them: the step is here, not in `sdk-py-tests`, because
@@ -4378,7 +4378,7 @@ jobs:
       # Every Go, Python and C consumer links this one artifact, so a symbol
       # that appears or disappears breaks all of them at once — and until this
       # step nothing compared the export table against anything, so the
-      # browser-native WebRTC plan's Stage 1 guarantee ("default build's
+      # browser-native WebRTC plan's guarantee ("default build's
       # exported symbol set unchanged" across a ~50-site endpoint refactor)
       # was unfalsifiable. The baseline is pinned to the pre-refactor head in
       # its header and regenerated only for an intended ABI change, in the
@@ -4484,12 +4484,12 @@ jobs:
           RUN_INTEGRATION_TESTS: "1"
         run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh
 
-      # === S4: the Go org facade live cells (ORG_SCOPED_STREAMING_PLAN) ==
+      # === the Go org facade live cells ==
       # The run above EXECUTED these 6 live cells (3 shapes x {same-org,
       # granted}, call+serve live two-node with verified-caller attribution
       # asserted); this step PINS them (a witness must not disappear
       # silently): lexical name-existence, fail-closed.
-      - name: Witness roster — Go org facade live cells (Stage 4, 6)
+      - name: Witness roster — Go org facade live cells (6)
         working-directory: go
         run: |
           set -uo pipefail
@@ -4502,14 +4502,14 @@ jobs:
             TestLiveGrantedClientStreamFromAGeneratedScenario \
             TestLiveGrantedDuplexFromAGeneratedScenario || exit 1
 
-      # === S4: the Go cross-language vectors rows (S4Vectors) ===========
+      # === the Go cross-language vectors rows ===========
       # The go test run above EXECUTED the 8 TestStreamingOpeningVectors_*
       # funcs (124 rows: byte pins, opening roles, rejects, vocabulary,
       # unclassified, narrowed ids, u64 exact — plus the mixed-pair row
       # skip-gated fail-closed behind RUN_MIXED_CROSS_PROCESS=1,
       # F-S4Vectors-1); this step PINS them: lexical name-existence,
       # fail-closed.
-      - name: Witness roster — Go cross-lang vectors (Stage 4 Wave 2, 9)
+      - name: Witness roster — Go cross-lang vectors (9)
         working-directory: go
         run: |
           set -uo pipefail
@@ -4656,7 +4656,7 @@ jobs:
           shared-key: clippy
           workspaces: net/crates/net -> target
 
-      # Stage 4 of PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md: production
+      # PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md: production
       # code (lib + bins) is denied for the four panic-hygiene + unsafe
       # lints declared in `Cargo.toml`'s `[lints.clippy]` table. This
       # step has no `-A` overrides — any new `.unwrap()` /
@@ -4857,7 +4857,7 @@ jobs:
             features: ""
           - name: wire
             # `net-mesh-wire` is the tokio-free wire layer the core
-            # depends on (Stage 2 of
+            # depends on (
             # BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md). `json` is the
             # only feature and is what the core turns on, so linting
             # with it matches the surface every native consumer
@@ -5244,7 +5244,7 @@ jobs:
           cargo test --lib ${{ matrix.crate.features }}
           cargo test --doc ${{ matrix.crate.features }}
 
-      # org-ffi is the one FFI crate with INTEGRATION targets — the S4 C
+      # org-ffi is the one FFI crate with INTEGRATION targets — the C
       # live cell, which drives the real C ABI end to end (net_mesh_new
       # from JSON, net_mesh_arc_clone per consuming call, the net_subnet_*
       # admin + serve entry points, net_org_credentials_new / _bind /
@@ -5257,7 +5257,7 @@ jobs:
       # silent-skip failure mode the "Integration test pin guard" job exists
       # to catch for the core crate's by-name pins. Nothing to enforce if
       # nothing is pinned by name.
-      - name: Run integration tests (org-ffi — the S4 C ABI live cell)
+      - name: Run integration tests (org-ffi — the C ABI live cell)
         if: matrix.crate.name == 'go-org-ffi'
         working-directory: ${{ matrix.crate.path }}
         run: cargo test --test '*'
@@ -5629,7 +5629,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
       # `net-mesh-wire` is the tokio-free wire layer the core depends
-      # on (Stage 2 of BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md). It
+      # on (BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md). It
       # denies `missing_docs`, and every type the core re-exports is
       # documented there rather than in `adapter/net` now, so its
       # rustdoc IS the wire-surface documentation.
@@ -5649,14 +5649,14 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   wasm-wire:
-    # Stage 2 of BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md: `net-mesh-wire`
+    # BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md: `net-mesh-wire`
     # is the tokio-free wire layer, and the whole point of extracting it
     # is that a browser leaf can run it. This job is the only place that
     # is enforced.
     #
     # Two steps, and the second is NOT redundant. `cargo check --target
     # wasm32-unknown-unknown` catches a native type leaking into the wire
-    # crate, but it CANNOT catch the failure S0a found: on
+    # crate, but it CANNOT catch the failure described below: on
     # `wasm32-unknown-unknown`, `std::time::Instant::now()` and
     # `SystemTime::now()` compile fine and then panic at runtime ("time
     # not implemented on this platform"). `session.rs` and
@@ -5713,7 +5713,7 @@ jobs:
           }
 
       # A wire-only wasm build pays ~260 KB of `wasm-bindgen` describe
-      # metadata for `getrandom`'s browser backend (S0a §5). Fine for a
+      # metadata for `getrandom`'s browser backend. Fine for a
       # test job; it is the `net-leaf` bundle, not this one, that has to
       # care. Cached with the target dir so it is paid once.
       - name: Install wasm-bindgen-test-runner
@@ -5817,7 +5817,7 @@ jobs:
           exit $status
 
   webrtc-feature:
-    # Stage 3 of BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md. The `webrtc`
+    # BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md. The `webrtc`
     # feature is OFF by default and is the only feature in this crate
     # with a C build-time dependency: `str0m`'s `rust-crypto` stack
     # pulls `aws-lc-rs`/`aws-lc-sys`, which needs cmake and a C
@@ -5851,7 +5851,7 @@ jobs:
           workspaces: net/crates/net -> target
 
       # Recorded separately so the aws-lc-sys cost stays visible: if
-      # it grows, the decision to accept it (S3 report, option a) can
+      # it grows, the decision to accept it (option a) can
       # be revisited against a number rather than a memory.
       - name: Build the feature's dependency tree (aws-lc-sys cost)
         run: |
@@ -5894,7 +5894,7 @@ jobs:
         with:
           tool: nextest
 
-      # The Stage 3 harnesses, pinned by name like every other
+      # The harnesses, pinned by name like every other
       # integration binary (the pin-guard job scrapes these flags).
       #
       # `--retries 0` overrides the profile default of 2: these are
@@ -6127,7 +6127,7 @@ jobs:
         run: cargo clippy -p net-mesh-wire --features "json webrtc" --all-targets -- -D warnings
 
   leaf-wasm:
-    # Stage 5: the `net-mesh-leaf` crate. Its own job for the same
+    # The `net-mesh-leaf` crate. Its own job for the same
     # reason `webrtc-browser` is one — it pays for a wasm32
     # toolchain, a bindgen CLI, a browser and a chromedriver, and it
     # builds a crate that is deliberately NOT a member of the mesh
@@ -6140,7 +6140,7 @@ jobs:
     # *clippy* — which is the only thing that catches a `RefCell`
     # borrow held across an await, and did — and the executed wasm
     # tests, because `Instant::now()` COMPILES on wasm32 and panics
-    # at runtime, so a check job alone cannot guard that seam (S0a).
+    # at runtime, so a check job alone cannot guard that seam.
     name: Leaf crate + wasm test runner
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -6185,7 +6185,7 @@ jobs:
       # `wasm-bindgen-test-runner` drives a real browser over
       # WebDriver, and chromedriver refuses a Chrome whose major
       # version differs from its own. `install-chromedriver: true`
-      # alone did NOT keep them in step on the Stage 5 candidate -
+      # alone did NOT keep them in step on the candidate -
       # it paired ChromeDriver 153 with Chrome 152 and every wasm
       # test failed before it ran. Pin ONE version for both, from
       # Chrome-for-Testing, and then assert the two majors match:
@@ -6239,7 +6239,7 @@ jobs:
       - name: Formatting
         run: cargo fmt -- --check
 
-      # Kyra's Stage 5 review probes, landed VERBATIM (assertions
+      # Kyra's review probes, landed VERBATIM (assertions
       # untouched) and pinned by name. They reproduced 12 failures
       # out of 15 when they landed; a repair that regresses one must
       # fail here by name rather than shrink the roster.
@@ -6349,10 +6349,10 @@ jobs:
           lower the floor deliberately or restore the witness"
             exit 1
           fi
-          # === S4: the org streaming suite floors (ORG_SCOPED_STREAMING_PLAN)
+          # === the org streaming suite floors
           # The three org suites' counts, fail-closed (a suite that silently
           # shrinks must not read as green). Floor accounting from the source
-          # rosters at the S4Browser head. One documented rename inside
+          # rosters at the pinned head. One documented rename inside
           # org_streaming_lifecycle:
           # `response_credit_parks_the_sender_and_each_grant_releases_exactly_its_chunks`
           # replaced `…the_pump…` when the instrument moved to sender-parking
@@ -6476,7 +6476,7 @@ jobs:
               wasm_leaf)       floor=16 ;;
               wasm_leader)     floor=29 ;;
               wasm_anchorless) floor=2  ;;
-              # S6-06's leaf half. `leaf/src/rtc.rs` is
+              # The leaf half. `leaf/src/rtc.rs` is
               # `#![cfg(target_arch = "wasm32")]` in its entirety, so
               # a native test could only re-implement `PeerLink` and
               # assert the copy — and the claim is precisely "every
@@ -6493,7 +6493,7 @@ jobs:
               exit 1
             fi
           done
-          # The LIB target, which nothing here ran until S6-02/03/04.
+          # The LIB target, which nothing here ran until recently.
           #
           # The loop above passes `--test <name>`, so it reaches only
           # `leaf/tests/*.rs`. `wasm.rs`'s own `#[cfg(test)]` child
@@ -6537,7 +6537,7 @@ jobs:
               exit 1
             }
           done
-          # E1 (Kyra, Stage 5 round 2): `wasm_leader` had a floor of 6
+          # E1 (Kyra, round 2): `wasm_leader` had a floor of 6
           # against 18 witnesses and pinned none of them by name, so
           # twelve lifecycle tests could vanish and the job would stay
           # green. Every name is pinned, exactly as the leaf and
@@ -6567,7 +6567,7 @@ jobs:
           fi
 
   browser-package:
-    # Stage 5: `@net-mesh/browser`. A sibling package to
+    # `@net-mesh/browser`. A sibling package to
     # `@net-mesh/sdk` precisely because the SDK's graph contains the
     # napi addon; this job therefore never touches `bindings/node`.
     name: "@net-mesh/browser"
@@ -6634,7 +6634,7 @@ jobs:
 
       # R11: the TS/Rust ABI asserted through the artefacts a page
       # actually loads — the built `dist/` and the wasm-bindgen `pkg`
-      # beside it. Stage 5's unit suite was green against a test
+      # beside it. The unit suite was green against a test
       # double written from the hand-maintained declarations, so
       # every place those declarations were wrong the double was
       # wrong identically. Pinned by name: a probe that stops running
@@ -6706,7 +6706,7 @@ jobs:
         run: node scripts/size.mjs --assert --require-leaf
 
   webrtc-browser:
-    # Stage 4b exit criterion 1: the six §12 admission witnesses, the
+    # Exit criterion 1: the six §12 admission witnesses, the
     # MITM witness and the mDNS measurement, against a REAL Chromium
     # and a REAL native anchor served by the production bootstrap
     # listener. 4a could only witness §12 with a native stand-in;
@@ -6737,7 +6737,7 @@ jobs:
       # target add` from the repo root, install into the STABLE
       # installation — but every cargo command here runs under
       # `net/crates/net`, whose `rust-toolchain.toml` pins 1.98.1,
-      # a separate installation with its own target set. The Stage 5
+      # a separate installation with its own target set. The
       # candidate hit exactly that: `E0463: can't find crate for
       # 'core'` when building the leaf bundle. Add the target FROM
       # the pinned directory, and assert it, as the wasm-wire job
@@ -6746,8 +6746,8 @@ jobs:
         run: |
           set -o pipefail
           # THREE directories build for wasm32 in this job and they do
-          # not all resolve the same toolchain: the Stage 5 leaf and
-          # the Stage 4b harness leaf sit under `net/crates/net`
+          # not all resolve the same toolchain: the leaf and
+          # the harness leaf sit under `net/crates/net`
           # (pinned by `rust-toolchain.toml`), while anything the
           # runner spawns from the repo root gets `stable`. The
           # candidate installed the target for one of them and then
@@ -6779,10 +6779,10 @@ jobs:
       - name: Install libnss3-tools (certutil)
         run: sudo apt-get update && sudo apt-get install -y libnss3-tools
 
-      # Chromium from Playwright's cache, the same build S0b measured
+      # Chromium from Playwright's cache, the same build measured
       # against. `--with-deps` pulls the shared libraries headless
       # Chromium needs on a bare runner.
-      # Both GATE engines. Stage 5 owns the matrix, and Firefox is a
+      # Both GATE engines. This job owns the matrix, and Firefox is a
       # gate rather than a courtesy: it is the only engine here that
       # is not Chromium, and the leaf's transport assumptions are
       # engine-visible.
@@ -6793,7 +6793,7 @@ jobs:
         with:
           node-version: "24"
 
-      # The Stage 5 half of the runner drives `@net-mesh/browser`
+      # The first half of the runner drives `@net-mesh/browser`
       # over the real leaf bundle; both are built here so a witness
       # can never run against a stale artefact.
       - name: Install the Playwright driver's dependencies
@@ -6875,7 +6875,7 @@ jobs:
       # `--stage7` on the leg above and a Firefox floor of 55 — on the
       # first green run. If it is NOT green, the log says what the
       # engine does differently, which is the point.
-      - name: Browser harness — Firefox + Stage 7 (recorded, not a gate)
+      - name: Browser harness — Firefox (recorded, not a gate)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         continue-on-error: true
@@ -6903,7 +6903,7 @@ jobs:
       # what makes that impossible, and what makes a witness being
       # renamed or dropped a failure rather than a quiet shrink.
       #
-      # Same parser self-check as the Stage 3 inventory: prove the
+      # Same parser self-check as the earlier inventory: prove the
       # grep finds a KNOWN line before believing any count, so a
       # changed output format reads as "fix the parser", never as
       # "all clear" or "the witnesses are gone".
@@ -7009,7 +7009,7 @@ jobs:
             --source net/crates/net/tests/rtc_browser/runner/src/stage7.rs \
             --source net/crates/net/tests/rtc_browser/runner/src/org_stream.rs \
             $REQUIRED
-          # The ELEVEN Stage 7 witnesses, required on the engine that
+          # The ELEVEN witnesses, required on the engine that
           # runs them. They carry the plan's B2' composition gate — the
           # store's chunker on the REAL stream transport, under
           # injected loss and reorder — the property that a
@@ -7072,18 +7072,18 @@ jobs:
                 exit 1
               fi
             done
-            # Chromium also carries the Stage 7 store witnesses;
+            # Chromium also carries the store witnesses;
             # Firefox does not gate them (see the harness step).
             echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 15 Stage 6 \
           (+ 11 Stage 7 on chromium)"
           done
 
-      # The recorded Firefox + Stage 7 leg, PRINTED and never gated.
+      # The recorded Firefox leg, PRINTED and never gated.
       # These numbers are what a promotion decision reads — a
       # `--stage7` on the Firefox harness step and a Firefox floor of
       # 55 — and no floor consults them today. A missing log is not a
       # failure: the step above is `continue-on-error`.
-      - name: Firefox + Stage 7 evidence (recorded, no floor)
+      - name: Firefox evidence (recorded, no floor)
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -7158,7 +7158,7 @@ jobs:
           if-no-files-found: warn
 
   browser-demo:
-    # Stage 6's runnable artefact: two real browser tabs whose pages
+    # The runnable artefact: two real browser tabs whose pages
     # find each other, go direct, and exchange 60 Hz positions over
     # the PUBLIC `@net-mesh/browser` surface — no harness hooks, no
     # private methods. It gates because a demo that has rotted is
