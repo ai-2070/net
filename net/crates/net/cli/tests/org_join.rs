@@ -240,6 +240,18 @@ fn a_device_joins_an_org_only_with_the_operators_root_signed_approval() {
     assert!(!wrong_device.status.success(), "{wrong_device:?}");
 
     // The operator signs, here, for exactly this device.
+    // The org's shared audience, minted once, rides along with the approval.
+    let audience = keys.join("org.audience");
+    let minted = Command::new(env!("CARGO_BIN_EXE_net-mesh"))
+        .args(["--output", "json", "org", "audience-keygen", "--org-key"])
+        .arg(&org_key)
+        .arg("--out")
+        .arg(&audience)
+        .output()
+        .unwrap();
+    assert!(minted.status.success(), "{minted:?}");
+    let minted: Value = serde_json::from_slice(&minted.stdout).unwrap();
+    assert_eq!(minted["org"], org.as_str(), "{minted}");
     let approved = operator.json(&[
         "org",
         "approve",
@@ -248,15 +260,25 @@ fn a_device_joins_an_org_only_with_the_operators_root_signed_approval() {
         &device,
         "--org-key",
         org_key.to_str().unwrap(),
+        "--audience",
+        audience.to_str().unwrap(),
     ]);
     assert_eq!(approved["state"], "approved", "{approved}");
     assert_eq!(approved["member"], device.as_str());
+    assert_eq!(approved["audience"], true, "{approved}");
 
     // The device's join now completes and adopts the membership.
     let joined = agent.json(&["join", &token_of(&created), "--yes"]);
     assert_eq!(joined["state"], "joined", "{joined}");
     assert_eq!(joined["org"]["org"], org.as_str(), "{joined}");
     assert_eq!(joined["org"]["adopted"], true, "{joined}");
+
+    // The device adopted the org's audience, byte for byte.
+    assert_eq!(joined["org"]["audience"], "org", "{joined}");
+    assert_eq!(
+        std::fs::read(agent.state().join("authority").join("owner-audience.key")).unwrap(),
+        std::fs::read(&audience).unwrap()
+    );
 
     // Its `up` installs the membership; status reports it live.
     let node = agent.up(&[]);
@@ -357,6 +379,15 @@ fn org_remove_applies_a_root_signed_floor_at_each_named_node() {
     let keys = operator.tmp.path().join("keys");
     std::fs::create_dir_all(&keys).unwrap();
     let (org_key, org) = org_keygen(&keys, "org.toml");
+    let audience = keys.join("org.audience");
+    let minted = Command::new(env!("CARGO_BIN_EXE_net-mesh"))
+        .args(["org", "audience-keygen", "--org-key"])
+        .arg(&org_key)
+        .arg("--out")
+        .arg(&audience)
+        .output()
+        .unwrap();
+    assert!(minted.status.success(), "{minted:?}");
 
     // The operator's node becomes an org member itself: first start to learn
     // its entity, then issue and adopt its membership, then start again.
@@ -378,9 +409,21 @@ fn org_remove_applies_a_root_signed_floor_at_each_named_node() {
         .arg(&cert)
         .args(["--entity", &op_entity, "--authority-dir"])
         .arg(operator.state().join("authority"))
+        .arg("--audience")
+        .arg(&audience)
         .output()
         .unwrap();
     assert!(adopted.status.success(), "{adopted:?}");
+    assert_eq!(
+        std::fs::read(
+            operator
+                .state()
+                .join("authority")
+                .join("owner-audience.key")
+        )
+        .unwrap(),
+        std::fs::read(&audience).unwrap()
+    );
     let op = operator.up(&["--enroll", "--no-port-mapping"]);
     assert_eq!(op.ready["org"], org.as_str(), "{}", op.ready);
 

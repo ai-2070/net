@@ -75,6 +75,11 @@ pub struct AdoptArgs {
     /// `net-mesh org issue-floors`) to merge during adoption.
     #[arg(long, value_name = "PATH")]
     pub floors: Option<PathBuf>,
+    /// The org's shared owner audience (`org audience-keygen`), installed
+    /// instead of a node-local one so this node can discover other members'
+    /// private services.
+    #[arg(long, value_name = "PATH")]
+    pub audience: Option<PathBuf>,
 
     /// Clock-skew tolerance (seconds) for the certificate window
     /// check. Strict by default, mirroring the token module;
@@ -252,13 +257,28 @@ async fn run_adopt(
     // floors durably, and publishes membership last. Sync file I/O
     // on a oneshot CLI path; the same pattern as `identity
     // revoke`'s store write.
-    let authority = NodeAuthority::adopt(
-        &dir,
-        cert_file.cert,
-        &entity,
-        args.skew_secs,
-        floors_bundle.as_ref(),
-    )
+    let audience = match &args.audience {
+        Some(path) => Some(super::org::load_org_audience(path, false).await?),
+        None => None,
+    };
+    let authority = match &audience {
+        // The org's shared audience rather than a node-local one.
+        Some(audience) => NodeAuthority::adopt_with_audience(
+            &dir,
+            cert_file.cert,
+            &entity,
+            args.skew_secs,
+            floors_bundle.as_ref(),
+            audience,
+        ),
+        None => NodeAuthority::adopt(
+            &dir,
+            cert_file.cert,
+            &entity,
+            args.skew_secs,
+            floors_bundle.as_ref(),
+        ),
+    }
     .map_err(|e| sdk(format!("adopt refused: {e}")))?;
 
     let summary = AdoptOutput {

@@ -171,22 +171,31 @@ pub(crate) fn adopt_org_membership(
     state_root: &Path,
     cert: net::adapter::net::behavior::org::OrgMembershipCert,
     entity: &net::adapter::net::identity::EntityId,
+    audience: Option<&net::adapter::net::behavior::org_authority::OwnerAudienceCredential>,
 ) -> Result<serde_json::Value, String> {
+    use net::adapter::net::behavior::org_authority::NodeAuthority;
     let dir = state_root.join(AUTHORITY_SUBDIR);
     let (org, generation, not_after) = (cert.org_id, cert.generation, cert.not_after);
-    net::adapter::net::behavior::org_authority::NodeAuthority::adopt(
-        &dir,
-        cert,
-        entity,
-        ORG_ADOPT_SKEW_SECS,
-        None,
-    )
+    match audience {
+        // The org's shared audience: this member can open (and be found in)
+        // the org's private announcements.
+        Some(audience) => NodeAuthority::adopt_with_audience(
+            &dir,
+            cert,
+            entity,
+            ORG_ADOPT_SKEW_SECS,
+            None,
+            audience,
+        ),
+        None => NodeAuthority::adopt(&dir, cert, entity, ORG_ADOPT_SKEW_SECS, None),
+    }
     .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({
         "org": hex::encode(org.0),
         "generation": generation,
         "not_after": not_after,
         "adopted": true,
+        "audience": if audience.is_some() { "org" } else { "node-local (no private discovery with other members)" },
     }))
 }
 
@@ -215,8 +224,18 @@ fn adopt_and_install_org(
     state_root: &Path,
     node: &Arc<net::adapter::net::MeshNode>,
     cert: net::adapter::net::behavior::org::OrgMembershipCert,
+    audience: Option<Vec<u8>>,
 ) -> Result<serde_json::Value, String> {
-    let adopted = adopt_org_membership(state_root, cert, node.entity_id())?;
+    let audience = match audience {
+        Some(bytes) => Some(
+            net::adapter::net::behavior::org_authority::OwnerAudienceCredential::decode_config(
+                &bytes,
+            )
+            .map_err(|e| format!("org audience: {e}"))?,
+        ),
+        None => None,
+    };
+    let adopted = adopt_org_membership(state_root, cert, node.entity_id(), audience.as_ref())?;
     net_sdk::org::install_org_authority_node(node, &state_root.join(AUTHORITY_SUBDIR))
         .map_err(|e| format!("installing the org authority: {e}"))?;
     Ok(adopted)
@@ -432,7 +451,7 @@ async fn keep_standalone_admitted(
                     Ok(SubnetRedeemReply::PendingApproval) => {
                         entry.detail = Some("awaiting operator approval".to_string());
                     }
-                    Ok(SubnetRedeemReply::OrgIssued(_)) => {
+                    Ok(SubnetRedeemReply::OrgIssued { .. }) => {
                         entry.detail = Some("the node answered with an org membership".to_string());
                     }
                     Err(e) => entry.detail = Some(e),
@@ -1517,12 +1536,13 @@ async fn org_join(state: &ControlState, request: &serde_json::Value) -> serde_js
                 "next": "the operator approves it with `org approve --org-key`; this node asks again by itself",
             })
         }
-        Ok(SubnetRedeemReply::OrgIssued(cert)) => {
+        Ok(SubnetRedeemReply::OrgIssued { cert, audience }) => {
             let (root, node) = (state.state_root.clone(), state.node.clone());
-            let adopted =
-                tokio::task::spawn_blocking(move || adopt_and_install_org(&root, &node, *cert))
-                    .await
-                    .unwrap_or_else(|_| Err("org adoption task failed".to_string()));
+            let adopted = tokio::task::spawn_blocking(move || {
+                adopt_and_install_org(&root, &node, *cert, audience)
+            })
+            .await
+            .unwrap_or_else(|_| Err("org adoption task failed".to_string()));
             match adopted {
                 Ok(mut adopted) => {
                     let _ =
@@ -1557,12 +1577,13 @@ async fn keep_pending_orgs(
     let snapshot = pending.lock().clone();
     for (key, invite) in snapshot {
         match request_subnet_redeem(node, issuer_node, identity, &invite, SUBNET_RENEW_WAIT).await {
-            Ok(SubnetRedeemReply::OrgIssued(cert)) => {
+            Ok(SubnetRedeemReply::OrgIssued { cert, audience }) => {
                 let (root, node) = (state_root.to_path_buf(), node.clone());
-                let adopted =
-                    tokio::task::spawn_blocking(move || adopt_and_install_org(&root, &node, *cert))
-                        .await
-                        .unwrap_or_else(|_| Err("org adoption task failed".to_string()));
+                let adopted = tokio::task::spawn_blocking(move || {
+                    adopt_and_install_org(&root, &node, *cert, audience)
+                })
+                .await
+                .unwrap_or_else(|_| Err("org adoption task failed".to_string()));
                 match adopted {
                     Ok(_) => {
                         let _ =
@@ -1701,7 +1722,7 @@ async fn subnet_join(state: &ControlState, request: &serde_json::Value) -> serde
                     None => return error("node is draining".to_string()),
                 }
             }
-            Ok(SubnetRedeemReply::OrgIssued(_)) => {
+            Ok(SubnetRedeemReply::OrgIssued { .. }) => {
                 return error("the node answered with an org membership".to_string())
             }
             Err(e) => return error(format!("redemption failed: {e}")),

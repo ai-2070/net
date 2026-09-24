@@ -1027,11 +1027,28 @@ impl EnrollContext {
         if claim.subject != subject || cert.member != subject {
             return Err("the pending claim is from a different subject".to_string());
         }
+        // The org's shared audience, if the operator supplied it.
+        let audience = match request["audience"].as_str() {
+            Some(hex_a) => {
+                let bytes = hex::decode(hex_a).map_err(|_| "malformed org audience".to_string())?;
+                Some(
+                    net::adapter::net::behavior::org_authority::OwnerAudienceCredential::decode_config(&bytes)
+                        .map_err(|e| format!("org audience: {e}"))?,
+                )
+            }
+            None => None,
+        };
         // Durable before the claim can be issued against it.
         self.org
             .stash
             .put(&claim, &cert)
             .map_err(|e| format!("keeping the certificate: {e}"))?;
+        if let Some(audience) = &audience {
+            self.org
+                .stash
+                .put_audience(&claim, &org, audience)
+                .map_err(|e| format!("keeping the org audience: {e}"))?;
+        }
         ledger
             .approve(&offer, &claim, now_unix())
             .map_err(|e| e.to_string())?;
@@ -1042,6 +1059,7 @@ impl EnrollContext {
             "member": hex::encode(subject.as_bytes()),
             "generation": cert.generation,
             "not_after": cert.not_after,
+            "audience": audience.is_some(),
         }))
     }
 }
@@ -1688,13 +1706,14 @@ pub async fn run_join(
     // org (validated, one owner org per node, durable); `up` installs it.
     let org = match bundle.org_membership() {
         Some(cert) => {
-            let (cert, entity, root) = (
+            let (cert, entity, root, audience) = (
                 cert.clone(),
                 join.identity().entity_id().clone(),
                 state.clone(),
+                bundle.org_audience(),
             );
             let adopted = tokio::task::spawn_blocking(move || {
-                super::lifecycle::adopt_org_membership(&root, cert, &entity)
+                super::lifecycle::adopt_org_membership(&root, cert, &entity, audience.as_ref())
             })
             .await
             .map_err(|e| generic(format!("org adoption task failed: {e}")))?

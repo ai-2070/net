@@ -62,6 +62,38 @@ impl OrgCertStash {
         std::fs::rename(&tmp, &path)
     }
 
+    /// Record the org's shared owner audience for `claimant` (supplied with
+    /// its approval). Refused unless it names `org`. Owner-only on Unix.
+    pub fn put_audience(
+        &self,
+        claimant: &Claimant,
+        org: &net::adapter::net::behavior::org::OrgId,
+        audience: &net::adapter::net::behavior::org_authority::OwnerAudienceCredential,
+    ) -> std::io::Result<()> {
+        if &audience.owner_org != org {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the audience belongs to a different org",
+            ));
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.path_for(claimant).with_extension("audience");
+        let tmp = path.with_extension("audience-tmp");
+        {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
+            f.write_all(&audience.encode_config())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)
+    }
+
     /// The directory this stash writes to.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -74,5 +106,14 @@ impl OrgCertSource for OrgCertStash {
         OrgMembershipCert::from_bytes(&bytes)
             .ok()
             .filter(|cert| cert.member == claimant.subject)
+    }
+
+    fn audience_for(
+        &self,
+        claimant: &Claimant,
+    ) -> Option<net::adapter::net::behavior::org_authority::OwnerAudienceCredential> {
+        let bytes = std::fs::read(self.path_for(claimant).with_extension("audience")).ok()?;
+        net::adapter::net::behavior::org_authority::OwnerAudienceCredential::decode_config(&bytes)
+            .ok()
     }
 }

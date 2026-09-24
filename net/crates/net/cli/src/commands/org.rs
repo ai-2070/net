@@ -77,6 +77,11 @@ pub enum OrgCommand {
     /// DACL on Windows); only its commitment rides in the signed
     /// grant (the raw key never touches the wire).
     GrantCapability(GrantCapabilityArgs),
+    /// Mint the org's shared owner audience once: the key every member uses
+    /// to open (and be found in) the org's private announcements. Written
+    /// owner-only; keep it with the org root. `org approve --audience` and
+    /// `node adopt --audience` hand it to members.
+    AudienceKeygen(OrgAudienceKeygenArgs),
     /// Approve a device's pending org invite: sign its membership
     /// certificate here, with the offline org root, for exactly the device
     /// that claimed the invite, and hand it to the running enrolling node,
@@ -131,6 +136,20 @@ pub struct OrgRemoveArgs {
     pub insecure_permissions: bool,
 }
 
+/// `org audience-keygen` arguments.
+#[derive(Args, Debug)]
+pub struct OrgAudienceKeygenArgs {
+    /// The org root key file (names the org the audience belongs to).
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: PathBuf,
+    /// Where to write the audience (a new owner-only file).
+    #[arg(long, value_name = "PATH")]
+    pub out: PathBuf,
+    /// Accept a group/world-readable org key file (Unix).
+    #[arg(long)]
+    pub insecure_permissions: bool,
+}
+
 /// `org approve` arguments.
 #[derive(Args, Debug)]
 pub struct OrgApproveArgs {
@@ -146,6 +165,11 @@ pub struct OrgApproveArgs {
     /// Membership generation (raise it to re-admit after a revocation floor).
     #[arg(long, default_value_t = 0)]
     pub generation: u32,
+    /// The org's shared owner audience (`org audience-keygen`), delivered
+    /// with the membership so the device can discover other members'
+    /// private services. Without it the device's audience is node-local.
+    #[arg(long, value_name = "PATH")]
+    pub audience: Option<PathBuf>,
     /// Membership certificate lifetime in seconds.
     #[arg(long = "ttl-secs", default_value_t = ORG_CERT_TTL_SECS_RECOMMENDED)]
     pub ttl_secs: u64,
@@ -498,6 +522,7 @@ pub async fn run(
         OrgCommand::IssueFloors(args) => run_issue_floors(args, output).await,
         OrgCommand::GrantDispatcher(args) => run_grant_dispatcher(args, output).await,
         OrgCommand::GrantCapability(args) => run_grant_capability(args, output).await,
+        OrgCommand::AudienceKeygen(args) => run_audience_keygen(args, output).await,
         OrgCommand::Approve(args) => run_approve(args, output, profile_name).await,
         OrgCommand::Invite(args) => {
             super::enrollment::run_invite(
@@ -686,6 +711,19 @@ async fn run_approve(
     }
     let cert = OrgMembershipCert::try_issue(&keypair, claimed, args.generation, args.ttl_secs)
         .map_err(|e| invalid_args(format!("membership certificate: {e}")))?;
+    let audience = match &args.audience {
+        Some(path) => {
+            let audience = load_org_audience(path, args.insecure_permissions).await?;
+            if audience.owner_org != keypair.org_id() {
+                return Err(invalid_args(format!(
+                    "{} is the audience of another org",
+                    path.display()
+                )));
+            }
+            Some(ScrubbedString::new(hex::encode(audience.encode_config())))
+        }
+        None => None,
+    };
     drop(keypair);
     let reply = super::enrollment::node_request(
         args.state_dir,
@@ -695,11 +733,82 @@ async fn run_approve(
             "offer_id": args.offer_id,
             "subject": hex::encode(expected.as_bytes()),
             "cert": hex::encode(cert.to_bytes()),
+            "audience": audience.as_ref().map(|a| a.as_str()),
         }),
     )
     .await?;
     emit_value(OutputFormat::resolve_oneshot(output), &reply)
         .map_err(|e| generic(format!("write result: {e}")))
+}
+
+/// `org audience-keygen`: mint the org's shared owner audience, owner-only.
+async fn run_audience_keygen(
+    args: OrgAudienceKeygenArgs,
+    output: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    if args.out.exists() {
+        return Err(invalid_args(format!(
+            "{} already exists",
+            args.out.display()
+        )));
+    }
+    let keypair = load_org_key(&args.org_key, args.insecure_permissions).await?;
+    let audience = net::adapter::net::behavior::org_authority::OwnerAudienceCredential::generate(
+        keypair.org_id(),
+    );
+    drop(keypair);
+    let encoded = ScrubbedBytes::new(audience.encode_config().to_vec());
+    let tmp = args.out.with_extension("tmp-netmesh-audience");
+    crate::commands::identity::write_identity_atomically(&tmp, &args.out, encoded.as_slice())
+        .await?;
+    emit_value(
+        OutputFormat::resolve_oneshot(output),
+        &serde_json::json!({
+            "org": hex::encode(audience.owner_org.as_bytes()),
+            "audience_handle": hex::encode(audience.audience_handle),
+            "file": args.out.display().to_string(),
+        }),
+    )
+    .map_err(|e| generic(format!("write result: {e}")))
+}
+
+/// Read an org owner-audience file (`org audience-keygen`) through the
+/// secret-file gate (regular file, owned by this user, owner-only, checked
+/// on the opened descriptor), then decode exactly one credential.
+pub(crate) async fn load_org_audience(
+    path: &Path,
+    insecure_permissions: bool,
+) -> Result<net::adapter::net::behavior::org_authority::OwnerAudienceCredential, CliError> {
+    use net::adapter::net::behavior::org_authority::OwnerAudienceCredential;
+    use std::io::Read as _;
+    let owned = path.to_path_buf();
+    let read = tokio::task::spawn_blocking(move || {
+        let mut file =
+            net::adapter::net::secret_file::open_secret_file(&owned, insecure_permissions)
+                .map_err(|e| e.to_string())?;
+        let mut bytes = Vec::with_capacity(OwnerAudienceCredential::ENCODED_SIZE + 1);
+        (&mut file)
+            .take(OwnerAudienceCredential::ENCODED_SIZE as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>(ScrubbedBytes::new(bytes))
+    })
+    .await
+    .map_err(|e| generic(format!("org audience {}: {e}", path.display())))?
+    .map_err(|e| {
+        invalid_args(format!(
+            "org audience {}: {e}; or pass --insecure-permissions to override",
+            path.display()
+        ))
+    })?;
+    if read.as_slice().len() != OwnerAudienceCredential::ENCODED_SIZE {
+        return Err(invalid_args(format!(
+            "org audience {} is not an org audience file",
+            path.display()
+        )));
+    }
+    OwnerAudienceCredential::decode_config(read.as_slice())
+        .map_err(|e| invalid_args(format!("org audience {}: {e}", path.display())))
 }
 
 /// Bound on the `org join` exchange with the running node.

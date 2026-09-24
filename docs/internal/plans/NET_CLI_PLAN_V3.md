@@ -2044,11 +2044,74 @@ What was missing, and is now added:
   the touched test target) and SDK rustdoc are clean.
 
 **Still open (org).**
-- Distributing the org owner audience, so members can privately discover
-  each other.
+- ~~Distributing the org owner audience.~~ Closed by the next receipt.
 - Floors reach only the nodes named. There is no inventory of enforcement
   points; `org members` is a later slice.
 - `org leave`.
+
+#### V3-2 org O3 — the org's shared audience (receipt, 2026-09-24)
+
+Decision (user, 2026-09-24): an **explicit audience file**.
+
+**The gap.** Private discovery of owner-scoped services keys on one org-wide
+owner audience, but every adopting node minted its own. Enrolled members
+could be admitted, yet could not find each other privately.
+
+**Core.** `NodeAuthority::adopt_with_audience` is the same adoption ceremony
+(the same lock and checks), installing a supplied org audience through the
+ceremony's own owner-only atomic writer. It replaces a node-local audience,
+since rotation is config management. A new variant, `AudienceForeignOrg`,
+refuses an audience naming another org.
+
+**SDK.**
+- `OrgCertSource::audience_for` (default `None`), and
+  `OrgCertStash::put_audience` (owner-only; refused for another org).
+- The bundle carries the audience as secret material, redacted in `Debug`.
+  The device accepts it only beside a membership of the same org
+  (`Mismatch("org audience")` otherwise).
+- The standalone reply is now `OrgIssued { cert, audience }`.
+
+**CLI.**
+- `org audience-keygen --org-key K --out F` mints it (owner-only, bound to
+  the org id).
+- `org approve --audience F` sends it with the certificate; the node keeps
+  it per claim.
+- The device adopts with it at `join` and `org join`; the adoption report
+  names `audience: org`.
+- `node adopt --audience F` covers existing members.
+- The audience file is read through the secret-file gate: owner, type and
+  mode are checked on the opened descriptor. The repo's
+  `no_seed_loader_reimplements_the_permission_check` guard caught a
+  hand-rolled mode check first.
+
+**Witnesses.**
+- Core `adopt_with_audience_installs_the_org_audience`.
+- SDK: the protected-call witness now runs with **no pre-staging**. The
+  device adopts the audience delivered by enrollment, the provider adopts
+  the same file, and the device discovers the provider privately and is
+  admitted.
+- SDK: bundle audience refusal, wire round-trip and `Debug` redaction; the
+  standalone reply carrying the audience; the stash refusing a foreign
+  audience.
+- CLI `org_join`: the device's `owner-audience.key` equals the operator's
+  file byte for byte; `node adopt --audience` does the same for the
+  operator.
+
+**Inverse mutations** (all RED):
+- core: the supplied audience not written (the real protected call then
+  fails); a foreign-org audience accepted;
+- SDK: the issuer dropping the audience; the device skipping the org check;
+  the standalone reply dropping it;
+- CLI: approve not sending it; `node adopt` ignoring it; `join` adopting
+  without it.
+
+**Regressions.**
+- `cargo tl` 5818/5818.
+- Every integration binary: 7039/7039.
+- The SDK suite as CI runs it: 820/820.
+- `net-cli` 358/358.
+- Clippy (core strict and all-targets, CLI, SDK) and rustdoc (root, SDK) are
+  clean.
 
 
 #### V3-2 task 3: standalone subnet join, decisions (user, 2026-09-24)

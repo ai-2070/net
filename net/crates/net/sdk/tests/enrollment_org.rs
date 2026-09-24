@@ -205,6 +205,27 @@ fn the_device_accepts_only_a_membership_of_the_offered_org_for_itself() {
     let right = OrgMembershipCert::try_issue(&org, device.entity_id().clone(), 0, YEAR).unwrap();
     let good = base().with_org_membership(right.clone());
     good.verify_for(&invite, &intent).unwrap();
+    // The org audience rides along only when it is the offered org's.
+    use net::adapter::net::behavior::org_authority::OwnerAudienceCredential;
+    let audience = OwnerAudienceCredential::generate(org.org_id());
+    let with_audience = base()
+        .with_org_membership(right.clone())
+        .with_org_audience(&audience);
+    with_audience.verify_for(&invite, &intent).unwrap();
+    let back = MembershipBundle::from_bytes(&with_audience.to_bytes()).unwrap();
+    assert_eq!(
+        back.org_audience().unwrap().encode_config(),
+        audience.encode_config()
+    );
+    assert!(format!("{back:?}").contains(r#"org_audience: Some("<redacted>")"#));
+    let foreign = OwnerAudienceCredential::generate(OrgKeypair::generate().org_id());
+    assert!(matches!(
+        base()
+            .with_org_membership(right.clone())
+            .with_org_audience(&foreign)
+            .verify_for(&invite, &intent),
+        Err(BundleError::Mismatch("org audience"))
+    ));
     // Survives the wire.
     let back = MembershipBundle::from_bytes(&good.to_bytes()).unwrap();
     assert_eq!(back.org_membership(), Some(&right));
@@ -314,18 +335,43 @@ fn a_standalone_org_link_delivers_the_approved_certificate_over_the_session() {
     let delivered = answer(&request(&device, &link), &device, Some(&stash)).unwrap();
     assert_eq!(
         delivered,
-        SubnetRedeemReply::OrgIssued(Box::new(cert.clone()))
+        SubnetRedeemReply::OrgIssued {
+            cert: Box::new(cert.clone()),
+            audience: None,
+        }
     );
     // Survives the wire.
     assert_eq!(
         SubnetRedeemReply::from_bytes(&delivered.to_bytes()).unwrap(),
         delivered
     );
-    // Asked again (a lost reply): the same certificate.
+    // Asked again (a lost reply): the same certificate — now with the org
+    // audience the operator supplied, which also survives the wire.
+    let audience =
+        net::adapter::net::behavior::org_authority::OwnerAudienceCredential::generate(org.org_id());
+    stash
+        .put_audience(&claimant, &org.org_id(), &audience)
+        .unwrap();
+    let again = answer(&request(&device, &link), &device, Some(&stash)).unwrap();
     assert_eq!(
-        answer(&request(&device, &link), &device, Some(&stash)),
-        Ok(SubnetRedeemReply::OrgIssued(Box::new(cert)))
+        again,
+        SubnetRedeemReply::OrgIssued {
+            cert: Box::new(cert),
+            audience: Some(audience.encode_config().to_vec()),
+        }
     );
+    assert_eq!(
+        SubnetRedeemReply::from_bytes(&again.to_bytes()).unwrap(),
+        again
+    );
+    // The stash refuses another org's audience.
+    let foreign_audience =
+        net::adapter::net::behavior::org_authority::OwnerAudienceCredential::generate(
+            OrgKeypair::generate().org_id(),
+        );
+    assert!(stash
+        .put_audience(&claimant, &org.org_id(), &foreign_audience)
+        .is_err());
     // Another device, over its own proven session, gets nothing.
     let other = Identity::generate();
     assert_eq!(
@@ -380,7 +426,13 @@ mod live {
     /// an org invite, claimed, approved with a certificate the operator
     /// signed for exactly that claim, issued in the bundle, and verified by
     /// the device against its invite.
-    fn enrolled_membership(org: &OrgKeypair, device: &Identity) -> OrgMembershipCert {
+    /// The membership (and the org's audience) a device receives through
+    /// enrollment with `org approve --audience`.
+    fn enrolled_membership(
+        org: &OrgKeypair,
+        device: &Identity,
+        audience: &OwnerAudienceCredential,
+    ) -> (OrgMembershipCert, OwnerAudienceCredential) {
         let operator = Identity::generate();
         let tmp = tempfile::tempdir().unwrap();
         let mut ledger = EnrollmentLedger::create(
@@ -411,6 +463,9 @@ mod live {
                 &OrgMembershipCert::try_issue(org, device.entity_id().clone(), 1, YEAR).unwrap(),
             )
             .unwrap();
+        stash
+            .put_audience(&claimant, &org.org_id(), audience)
+            .unwrap();
         ledger.approve(&offer_id, &claimant, now()).unwrap();
         let bytes = MembershipIssuer::new(operator, Psk::new(PSK), contact())
             .with_org_certs(stash)
@@ -418,7 +473,12 @@ mod live {
             .unwrap();
         let bundle = MembershipBundle::from_bytes(&bytes).unwrap();
         bundle.verify_for(&invite, &intent).unwrap();
-        bundle.org_membership().unwrap().clone()
+        (
+            bundle.org_membership().unwrap().clone(),
+            bundle
+                .org_audience()
+                .expect("the org audience was delivered"),
+        )
     }
 
     /// The decisive witness for O1: a membership certificate delivered by
@@ -427,25 +487,28 @@ mod live {
     /// provider of that org for an org-protected (same-org) call. The
     /// dispatcher grant is issued separately (join never emits one).
     ///
-    /// Private discovery keys on the org's owner audience, which each
-    /// adopting node mints for itself and nothing yet distributes; the
-    /// provider here is pre-staged with the device's audience, as the
-    /// existing live facade test does (§3.4 out-of-band pre-staging).
+    /// Private discovery keys on the org's shared owner audience: the
+    /// operator mints it once (`org audience-keygen`), the device receives
+    /// it through enrollment, and the provider adopted with the same file —
+    /// no out-of-band pre-staging.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_enrollment_delivered_membership_is_admitted_for_an_org_protected_call() {
         let org = OrgKeypair::generate();
         let device_identity = Identity::generate();
-        let cert = enrolled_membership(&org, &device_identity);
+        let org_audience = OwnerAudienceCredential::generate(org.org_id());
+        let (cert, delivered) = enrolled_membership(&org, &device_identity, &org_audience);
 
-        // Device: adopt the delivered certificate, then install from the dir.
+        // Device: adopt the delivered certificate and audience, then install
+        // from the dir (the path joined `up` takes).
         let tmp = tempfile::tempdir().unwrap();
         let device_dir = tmp.path().join("device-authority");
-        NodeAuthority::adopt(
+        NodeAuthority::adopt_with_audience(
             &device_dir,
             cert.clone(),
             device_identity.entity_id(),
             0,
             None,
+            &delivered,
         )
         .unwrap();
         let (device_node, device_configs) = node_for(&device_identity).await;
@@ -453,39 +516,27 @@ mod live {
             Mesh::from_node_arc(device_node, device_configs, Some(device_identity.clone()));
         device.install_org_authority(&device_dir).unwrap();
 
-        // Provider: a member of the same org (the operator's own adoption),
-        // pre-staged with the org's owner audience.
+        // Provider: a member of the same org, adopted with the org's
+        // audience file (`node adopt --audience`).
         let provider_identity = Identity::generate();
         let provider_dir = tmp.path().join("provider-authority");
-        let adopted = NodeAuthority::adopt(
+        NodeAuthority::adopt_with_audience(
             &provider_dir,
             OrgMembershipCert::try_issue(&org, provider_identity.entity_id().clone(), 1, YEAR)
                 .unwrap(),
             provider_identity.entity_id(),
             0,
             None,
+            &OwnerAudienceCredential::decode_config(&org_audience.encode_config()).unwrap(),
         )
         .unwrap();
-        let shared = device
-            .node()
-            .node_authority()
-            .unwrap()
-            .audience
-            .encode_config();
         let (provider_node, provider_configs) = node_for(&provider_identity).await;
-        provider_node
-            .install_node_authority(Arc::new(NodeAuthority {
-                config: adopted.config.clone(),
-                audience: OwnerAudienceCredential::decode_config(&shared).unwrap(),
-                revocation: adopted.revocation.clone(),
-            }))
-            .unwrap();
-        provider_node.set_owner_cert_emission(true).unwrap();
         let provider = Mesh::from_node_arc(
             provider_node,
             provider_configs,
             Some(provider_identity.clone()),
         );
+        provider.install_org_authority(&provider_dir).unwrap();
 
         // Live transport between them.
         let device_id = device.node_id();

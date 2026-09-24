@@ -225,6 +225,9 @@ pub struct MembershipBundle {
     /// The org-root-signed membership certificate for [`Relation::Org`]
     /// invites.
     org: Option<net::adapter::net::behavior::org::OrgMembershipCert>,
+    /// The org's shared owner audience (encoded), when the operator supplied
+    /// it at approval. **Secret**: it opens the org's private announcements.
+    org_audience: Option<Vec<u8>>,
 }
 
 impl core::fmt::Debug for MembershipBundle {
@@ -236,6 +239,10 @@ impl core::fmt::Debug for MembershipBundle {
             .field("contact", &self.contact)
             .field("subnet", &self.subnet.is_some())
             .field("org", &self.org.is_some())
+            .field(
+                "org_audience",
+                &self.org_audience.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -249,7 +256,27 @@ impl MembershipBundle {
             contact,
             subnet: None,
             org: None,
+            org_audience: None,
         }
+    }
+
+    /// Attach the org's shared owner audience (with an org membership).
+    pub fn with_org_audience(
+        mut self,
+        audience: &net::adapter::net::behavior::org_authority::OwnerAudienceCredential,
+    ) -> Self {
+        self.org_audience = Some(audience.encode_config().to_vec());
+        self
+    }
+
+    /// The delivered org owner audience, if the bundle carries one.
+    pub fn org_audience(
+        &self,
+    ) -> Option<net::adapter::net::behavior::org_authority::OwnerAudienceCredential> {
+        self.org_audience.as_deref().and_then(|b| {
+            net::adapter::net::behavior::org_authority::OwnerAudienceCredential::decode_config(b)
+                .ok()
+        })
     }
 
     /// Attach the device's org membership certificate (for an org invite).
@@ -309,6 +336,13 @@ impl MembershipBundle {
             Some(cert) => {
                 out.push(1);
                 push_lp(&mut out, &cert.to_bytes());
+            }
+            None => out.push(0),
+        }
+        match &self.org_audience {
+            Some(audience) => {
+                out.push(1);
+                push_lp(&mut out, audience);
             }
             None => out.push(0),
         }
@@ -381,6 +415,24 @@ impl MembershipBundle {
             ),
             _ => return Err(BundleError::Malformed("bad org flag")),
         };
+        let org_audience = match r
+            .take_arr::<1>()
+            .ok_or(BundleError::Malformed("truncated bundle"))?[0]
+        {
+            0 => None,
+            1 => {
+                let bytes = r
+                    .take_lp()
+                    .ok_or(BundleError::Malformed("truncated bundle"))?
+                    .to_vec();
+                net::adapter::net::behavior::org_authority::OwnerAudienceCredential::decode_config(
+                    &bytes,
+                )
+                .map_err(|_| BundleError::Malformed("bad org audience"))?;
+                Some(bytes)
+            }
+            _ => return Err(BundleError::Malformed("bad org audience flag")),
+        };
         if !r.done() {
             return Err(BundleError::Malformed("trailing bundle bytes"));
         }
@@ -395,6 +447,7 @@ impl MembershipBundle {
             },
             subnet,
             org,
+            org_audience,
         })
     }
 
@@ -411,9 +464,19 @@ impl MembershipBundle {
             .map_err(|_| BundleError::TrustDomain)?;
         self.verify_subnet_for(invite, intent)?;
         match (invite.org(), &self.org) {
-            (None, None) => Ok(()),
-            (Some(offer), Some(cert)) if org_cert_matches(offer, intent.subject(), cert) => Ok(()),
-            _ => Err(BundleError::Mismatch("org membership")),
+            (None, None) => {}
+            (Some(offer), Some(cert)) if org_cert_matches(offer, intent.subject(), cert) => {}
+            _ => return Err(BundleError::Mismatch("org membership")),
+        }
+        // An audience only with a membership, and only the offered org's.
+        match (
+            invite.org(),
+            self.org_audience.is_some(),
+            self.org_audience(),
+        ) {
+            (_, false, _) => Ok(()),
+            (Some(offer), true, Some(audience)) if audience.owner_org == offer.org => Ok(()),
+            _ => Err(BundleError::Mismatch("org audience")),
         }
     }
 
@@ -635,6 +698,16 @@ pub trait OrgCertSource: Send + Sync + 'static {
         &self,
         claimant: &super::store::Claimant,
     ) -> Option<net::adapter::net::behavior::org::OrgMembershipCert>;
+
+    /// The org's shared owner audience the operator supplied with that
+    /// approval, if any. Delivered with the certificate so the member can
+    /// open (and be found in) the org's private announcements.
+    fn audience_for(
+        &self,
+        _claimant: &super::store::Claimant,
+    ) -> Option<net::adapter::net::behavior::org_authority::OwnerAudienceCredential> {
+        None
+    }
 }
 
 impl BundleIssuer for MembershipIssuer {
@@ -667,6 +740,14 @@ impl BundleIssuer for MembershipIssuer {
                 .filter(|cert| org_cert_matches(offer, intent.subject(), cert))
                 .ok_or(Refusal::Unavailable)?;
             bundle = bundle.with_org_membership(cert);
+            let audience = self
+                .org
+                .as_ref()
+                .and_then(|source| source.audience_for(&intent.claimant()))
+                .filter(|a| a.owner_org == offer.org);
+            if let Some(audience) = audience {
+                bundle = bundle.with_org_audience(&audience);
+            }
         }
         Ok(bundle.to_bytes())
     }

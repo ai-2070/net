@@ -165,14 +165,21 @@ impl SubnetRedeemRequest {
 pub enum SubnetRedeemReply {
     /// Credentials for exactly the offer, for this device.
     Issued(Box<SubnetCredentialSet>),
-    /// The org membership certificate approved for this device.
-    OrgIssued(Box<net::adapter::net::behavior::org::OrgMembershipCert>),
+    /// The org membership certificate approved for this device, with the
+    /// org's shared owner audience (encoded) when the operator supplied one.
+    OrgIssued {
+        /// The approved membership certificate.
+        cert: Box<net::adapter::net::behavior::org::OrgMembershipCert>,
+        /// The org's owner audience (**secret**), if supplied.
+        audience: Option<Vec<u8>>,
+    },
     /// The link requires operator approval; ask again once approved.
     PendingApproval,
 }
 
 impl SubnetRedeemReply {
-    /// Wire form: `0 ‖ credential set`, `1`, or `2 ‖ membership certificate`.
+    /// Wire form: `0 ‖ credential set`, `1`, or
+    /// `2 ‖ lp(membership certificate) ‖ u8 has_audience [‖ audience]`.
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Self::Issued(set) => {
@@ -181,9 +188,16 @@ impl SubnetRedeemReply {
                 out
             }
             Self::PendingApproval => vec![1u8],
-            Self::OrgIssued(cert) => {
+            Self::OrgIssued { cert, audience } => {
                 let mut out = vec![2u8];
-                out.extend_from_slice(&cert.to_bytes());
+                super::push_lp(&mut out, &cert.to_bytes());
+                match audience {
+                    Some(a) => {
+                        out.push(1);
+                        out.extend_from_slice(a);
+                    }
+                    None => out.push(0),
+                }
                 out
             }
         }
@@ -196,10 +210,32 @@ impl SubnetRedeemReply {
                 .map(|set| Self::Issued(Box::new(set)))
                 .map_err(|e| format!("subnet credentials: {e}")),
             Some((1, [])) => Ok(Self::PendingApproval),
-            Some((2, cert)) => {
-                net::adapter::net::behavior::org::OrgMembershipCert::from_bytes(cert)
-                    .map(|cert| Self::OrgIssued(Box::new(cert)))
-                    .map_err(|e| format!("org membership certificate: {e}"))
+            Some((2, rest)) => {
+                let bad = || "malformed org membership reply".to_string();
+                let mut r = Reader::new(rest);
+                let cert = net::adapter::net::behavior::org::OrgMembershipCert::from_bytes(
+                    r.take_lp().ok_or_else(bad)?,
+                )
+                .map_err(|e| format!("org membership certificate: {e}"))?;
+                let audience = match r.take_arr::<1>().ok_or_else(bad)?[0] {
+                    0 => None,
+                    1 => {
+                        let a = r
+                            .take(net::adapter::net::behavior::org_authority::OwnerAudienceCredential::ENCODED_SIZE)
+                            .ok_or_else(bad)?
+                            .to_vec();
+                        net::adapter::net::behavior::org_authority::OwnerAudienceCredential::decode_config(&a).map_err(|_| bad())?;
+                        Some(a)
+                    }
+                    _ => return Err(bad()),
+                };
+                if !r.done() {
+                    return Err(bad());
+                }
+                Ok(Self::OrgIssued {
+                    cert: Box::new(cert),
+                    audience,
+                })
             }
             _ => Err("malformed standalone subnet reply".to_string()),
         }
@@ -286,10 +322,19 @@ pub fn answer_standalone_redeem(
                 .map(|set| SubnetRedeemReply::Issued(Box::new(set)));
         }
         let offer = invite.org().ok_or(Refusal::Invalid)?;
-        org.and_then(|source| source.cert_for(&claimant))
+        let source = org.ok_or(Refusal::Unavailable)?;
+        let cert = source
+            .cert_for(&claimant)
             .filter(|cert| org_cert_matches(offer, &request.subject, cert))
-            .map(|cert| SubnetRedeemReply::OrgIssued(Box::new(cert)))
-            .ok_or(Refusal::Unavailable)
+            .ok_or(Refusal::Unavailable)?;
+        let audience = source
+            .audience_for(&claimant)
+            .filter(|a| a.owner_org == offer.org)
+            .map(|a| a.encode_config().to_vec());
+        Ok(SubnetRedeemReply::OrgIssued {
+            cert: Box::new(cert),
+            audience,
+        })
     };
     match ledger
         .claim(&id, &claimant, now)
@@ -300,7 +345,7 @@ pub fn answer_standalone_redeem(
             let reply = deliver()?;
             let payload = match &reply {
                 SubnetRedeemReply::Issued(set) => set.to_bytes(),
-                SubnetRedeemReply::OrgIssued(cert) => cert.to_bytes(),
+                SubnetRedeemReply::OrgIssued { cert, .. } => cert.to_bytes(),
                 SubnetRedeemReply::PendingApproval => return Err(Refusal::Unavailable),
             };
             ledger
