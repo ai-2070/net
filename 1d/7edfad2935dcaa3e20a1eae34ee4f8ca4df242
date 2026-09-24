@@ -1,0 +1,33 @@
+net/crates/net/cli/Cargo.toml
+  s_3f3d4c91f992be::t_9c9a866ac6da10 33-36
+net/crates/net/src/adapter/net/behavior/enrollment_storage.rs
+  s_3f3d4c91f992be::t_927d1dff6a0799 201-203
+  s_3f3d4c91f992be::t_7e557ea0de3143 198-200,204-205
+  s_3f3d4c91f992be::t_9c9a866ac6da10 165-166,168-172,184-197,206-221
+  s_3f3d4c91f992be::t_170f63523fc1fd 222-224
+.github/workflows/ci.yml
+  s_3f3d4c91f992be::t_e2a3e889a83900 5094-5110
+net/crates/net/cli/tests/enrollment_crash.rs
+  s_3f3d4c91f992be::t_b62a2200615230 1-70,75-123,125-187,191-200,206-210,215-224,226-228,233-236,241-242,247-262,266-277,282-284
+  s_3f3d4c91f992be::t_927d1dff6a0799 71-74,201-205,211-214,229-232,237-240,243-246,278-281
+  s_3f3d4c91f992be::t_9a973c30ca1d55 124
+  s_3f3d4c91f992be::t_6abf5b90801e15 188-190,225,263-265
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_7efb232ff02ac9 4156-4206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1d7edfad2935dcaa3e20a1eae34ee4f8ca4df242",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
