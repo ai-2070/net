@@ -3646,6 +3646,69 @@ Tasks:
 
 **Exit:** Cumulative acceptance below is complete, exact-head required CI is green, and the public instructions work without manual credential surgery or repository-internal knowledge.
 
+#### V3-5 evidence audit and slices (2026-09-24)
+
+A read-only audit mapped E1–E26 to the witnesses that exist.
+- **Covered:** E1, E6, E13 and E15. E15 needs an exact-head re-run.
+- **Missing:** E16.
+- **Partial:** every other row.
+
+Gaps the audit found:
+- `enrollment_workflow` / `enrollment_status` / `enrollment_removal` and
+  the fixtures do not exist.
+- No V3 command appears in `cli/README.md`, `cli/CHANGELOG.md` or the web
+  CLI reference.
+- The CLI had no channel publish verb.
+- The two-node MCP journeys (`capability_workflow`) run on `--psk-hex`,
+  not on an enrolled identity.
+- No V3 CLI test asserts a platform permission property. The Windows job
+  does run the whole CLI suite.
+- There are no barrier races of join, renew or subscribe after leave, and
+  no concurrent-redeem test.
+- **Design deviation from E23, by user decision:** the channel offer is
+  `{channel, root, rights}`. TTL is the grant's, depth is fixed, and the
+  publisher is the issuer.
+
+Slices:
+
+| Slice | Content |
+|---|---|
+| **W1** | `channel publish` |
+| **W2** | `cli/tests/enrollment_workflow.rs`: three participants on one runner (operator, B, C). Covers joins, a subscribe ACK, a gated publish, an enrolled-identity provider effect, removal of B while C keeps working, leave, restart and cleanup. |
+| **W3** | Public docs and fixtures. |
+| **W4** | Gap witnesses, prioritized by claim risk: E2 inspect leaves the ledger untouched; E21 corrupt/insecure PSK store; E22 an unrelated node stays untouched; E3 concurrent redeem. |
+
+**W1 receipt: `channel publish <name> --data <text>` (2026-09-24).**
+- It is a control op, `channel_publish`, on the running node. It performs
+  one real `MeshNode::publish`, so the node's own production gate decides.
+- The reply has three outcomes:
+  - `gate: passed` on a gated channel;
+  - `open: this node does not gate the channel` when no gated config
+    exists here, so it is never presented as credential evidence;
+  - an error carrying `gate: denied` and the gate's own reason (`publish
+    denied by channel ACL`).
+- `attempted` / `delivered` / `failed` are this node's sends, not
+  subscriber receipts. The payload is capped at 16 KiB.
+- When a joined device's managed chain is installed and the gate passed,
+  the channel link records `published_at`. That is live-active evidence,
+  distinct from `publish_ready`.
+
+Witness: `channel_join::a_publishing_device_is_ready_only_under_its_own_trust_and_leaves_exactly`.
+1. Ungated: `open`, and no `published_at`.
+2. Stranger root served: a real gate denial.
+3. Right root: `passed` and `published_at` set.
+4. After `channel leave`: denied again, so no fallback credential remains.
+
+Inverse mutations, all RED (3):
+
+| # | Mutation |
+|---|---|
+| 1 | Ungated reported passed |
+| 2 | Live-active recorded without the gate |
+| 3 | Denial reported as success |
+
+Gates: CLI clippy `--all-targets`; CLI 365/365.
+
 ## 8. Cumulative acceptance matrix
 
 All rows are required unless explicitly marked feature-conditional; narrow slices can be accepted independently without calling the entire plan complete.

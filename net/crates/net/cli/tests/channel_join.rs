@@ -619,6 +619,13 @@ fn a_publishing_device_is_ready_only_under_its_own_trust_and_leaves_exactly() {
     assert_eq!(ch["publish_installed"], true, "{}", node.ready);
     assert_eq!(ch["publish_ready"], false, "no local trust yet");
     assert!(ch.get("subscribed").is_none(), "publish only");
+    let publish = |fx: &Fx| fx.run(&["channel", "publish", CHANNEL, "--data", "reading 42"]);
+    // Ungated here: the publish is reported open, not credential evidence.
+    let open: Value = serde_json::from_slice(&publish(&agent).stdout).unwrap();
+    assert!(open["gate"].as_str().unwrap().starts_with("open"), "{open}");
+    assert!(agent.json(&["channel", "status"])["joined"]
+        .get("published_at")
+        .is_none());
 
     // Trusting some other root for the channel is not trusting this one.
     agent.json(&[
@@ -631,10 +638,27 @@ fn a_publishing_device_is_ready_only_under_its_own_trust_and_leaves_exactly() {
     std::thread::sleep(Duration::from_millis(2500));
     let status = agent.json(&["channel", "status"]);
     assert_eq!(status["joined"]["publish_ready"], false, "{status}");
+    // A real denial at the local production gate.
+    let denied = publish(&agent);
+    assert!(!denied.status.success());
+    assert!(
+        stderr_of(&denied).contains("publish denied by channel ACL"),
+        "{}",
+        stderr_of(&denied)
+    );
     agent.json(&["channel", "serve", CHANNEL, "--token-root", &root_hex]);
     wait_for_channel(&agent, "publish ready under local trust", |j| {
         j["publish_ready"] == true
     });
+    // A caller-requested publish clears the gate with the managed chain:
+    // live-active, distinct from ready.
+    let passed = agent.json(&["channel", "publish", CHANNEL, "--data", "reading 42"]);
+    assert_eq!(passed["gate"], "passed", "{passed}");
+    let status = agent.json(&["channel", "status"]);
+    assert!(
+        status["joined"]["published_at"].as_u64().is_some(),
+        "{status}"
+    );
 
     let left = agent.json(&["channel", "leave"]);
     assert_eq!(left["publish_removed"], true, "{left}");
@@ -642,6 +666,8 @@ fn a_publishing_device_is_ready_only_under_its_own_trust_and_leaves_exactly() {
     let status = agent.json(&["channel", "status"]);
     assert_eq!(status["joined"]["publish_installed"], false, "{status}");
     assert_eq!(status["joined"]["publish_ready"], false, "{status}");
+    // After leave the gate denies again: no fallback credential remains.
+    assert!(stderr_of(&publish(&agent)).contains("publish denied by channel ACL"));
     // Serving the channel is independent of holding the credential.
     assert_eq!(status["served"][0]["channel"], CHANNEL, "{status}");
     drop(node);

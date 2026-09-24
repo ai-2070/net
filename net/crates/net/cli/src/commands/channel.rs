@@ -57,7 +57,28 @@ pub enum ChannelCommand {
     /// then an acknowledged unsubscribe and removal of exactly the installed
     /// publish credential. The mesh membership is untouched.
     Leave(NodeDirArgs),
+    /// Publish one payload on a channel from the running node: the node's
+    /// own local channel gate decides (`gate: passed`), or denies it; an
+    /// ungated channel is reported `gate: open`. Delivery counts are this
+    /// node's sends, not subscriber receipts.
+    Publish(PublishArgs),
 }
+
+/// `channel publish` arguments.
+#[derive(Args, Debug)]
+pub struct PublishArgs {
+    /// The canonical channel name.
+    pub channel: String,
+    /// The payload (UTF-8 text, at most 16 KiB).
+    #[arg(long)]
+    pub data: String,
+    /// Node state directory (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+}
+
+/// Largest payload `channel publish` sends.
+const MAX_PUBLISH_BYTES: usize = 16 * 1024;
 
 /// Arguments naming a running node.
 #[derive(Args, Debug)]
@@ -165,6 +186,21 @@ pub async fn run(
                 args.state_dir,
                 profile_name,
                 json!({ "op": "channel_leave" }),
+                output,
+            )
+            .await
+        }
+        ChannelCommand::Publish(args) => {
+            parse_channel_name(&args.channel)?;
+            if args.data.len() > MAX_PUBLISH_BYTES {
+                return Err(invalid_args(format!(
+                    "--data is larger than {MAX_PUBLISH_BYTES} bytes"
+                )));
+            }
+            node_op(
+                args.state_dir,
+                profile_name,
+                json!({ "op": "channel_publish", "channel": args.channel, "data": args.data }),
                 output,
             )
             .await
@@ -385,6 +421,46 @@ pub(crate) fn serve_op(
         }))
     })();
     result.unwrap_or_else(|e| json!({ "error": e }))
+}
+
+/// Control op `channel_publish`: one real publish through this node's own
+/// production path, so its local channel gate decides. Returns the gate
+/// verdict and this node's send counts, and whether the channel is gated
+/// here at all.
+pub(crate) async fn publish_op(node: &net::adapter::net::MeshNode, request: &Value) -> Value {
+    let name = request["channel"].as_str().unwrap_or_default();
+    let Ok(channel) = ChannelName::new(name) else {
+        return json!({ "error": format!("channel `{name}` is not a canonical name") });
+    };
+    let data = request["data"].as_str().unwrap_or_default();
+    if data.len() > MAX_PUBLISH_BYTES {
+        return json!({ "error": "payload too large" });
+    }
+    let gated = node.channel_configs().is_some_and(|registry| {
+        registry
+            .get_by_name(channel.as_str())
+            .is_some_and(|c| c.token_required() || c.publish_caps.is_some())
+    });
+    let publisher = net::adapter::net::ChannelPublisher::new(
+        channel.clone(),
+        net::adapter::net::PublishConfig::default(),
+    );
+    match node
+        .publish(&publisher, net_sdk::Bytes::copy_from_slice(data.as_bytes()))
+        .await
+    {
+        Ok(report) => json!({
+            "channel": channel.as_str(),
+            "gate": if gated { "passed" } else { "open: this node does not gate the channel" },
+            "attempted": report.attempted,
+            "delivered": report.delivered,
+            "failed": report.errors.len(),
+        }),
+        Err(e) => json!({
+            "error": format!("publish on {} refused: {e}", channel.as_str()),
+            "gate": if gated { "denied" } else { "open" },
+        }),
+    }
 }
 
 /// One control request to the running node, its reply emitted.

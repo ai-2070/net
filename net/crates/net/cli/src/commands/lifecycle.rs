@@ -2308,6 +2308,19 @@ async fn control_session(
                 .await
             }
         },
+        "channel_publish" if draining => serde_json::json!({ "error": "node is draining" }),
+        "channel_publish" => {
+            let reply = super::channel::publish_op(&state.node, &request).await;
+            if reply["gate"] == "passed" && reply.get("error").is_none() {
+                if let Some(c) = &state.channel {
+                    super::channel_link::published(
+                        &c.link,
+                        request["channel"].as_str().unwrap_or_default(),
+                    );
+                }
+            }
+            reply
+        }
         "subnet_leave" if draining => serde_json::json!({ "error": "node is draining" }),
         "subnet_leave" => subnet_leave(state, &request).await,
         "channel_serve" if draining => serde_json::json!({ "error": "node is draining" }),

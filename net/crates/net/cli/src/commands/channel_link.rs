@@ -94,6 +94,11 @@ pub(crate) struct ChannelLink {
     pub publish_ready: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publish_detail: Option<String>,
+    /// When a caller-requested publish last cleared this node's local gate
+    /// with this credential installed (`channel publish`): live-active
+    /// evidence, as opposed to readiness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<u64>,
 }
 
 pub(crate) type SharedChannel = Arc<parking_lot::Mutex<ChannelLink>>;
@@ -290,6 +295,14 @@ pub(crate) async fn keep(
                 l.subscribe_detail = Some(e);
             }
         }
+    }
+}
+
+/// A caller-requested publish on `channel` cleared the local gate.
+pub(crate) fn published(link: &SharedChannel, channel: &str) {
+    let mut l = link.lock();
+    if l.channel == channel && l.state == "active" && l.publish_installed == Some(true) {
+        l.published_at = Some(now_unix());
     }
 }
 
