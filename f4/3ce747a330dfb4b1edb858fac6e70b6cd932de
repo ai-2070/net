@@ -1,0 +1,25 @@
+net/crates/net/bindings/go/net-ffi/exports.baseline
+  s_3f3d4c91f992be::t_e1932469e44c1d 4,7,95-96,318
+net/crates/net/sdk/tests/org_streaming.rs
+  s_3f3d4c91f992be::t_1a422b3cbb0e34 14-22
+net/crates/net/sdk/tests/sensing_consumer.rs
+  s_3f3d4c91f992be::t_7b8abe1092ff6f 1969
+net/crates/net/tests/org_scoped_cross_process.rs
+  s_3f3d4c91f992be::t_15da189b9891b5 507
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f43ce747a330dfb4b1edb858fac6e70b6cd932de",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
