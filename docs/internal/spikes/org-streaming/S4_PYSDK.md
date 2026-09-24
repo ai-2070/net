@@ -284,6 +284,21 @@ classification runs; the three receipt cycles; the acceptance run.
   under concurrent mesh load with `org:rpc:server_error: rpc: server returned
   status 0x0006: response pump failed`, passes isolated in 2.58s/15s (twice).
   Substrate-level; recorded.
+  *Second observation (CI, 2026-09-24 — recorded so the finding is not lost
+  to a rerun):* the shipped-profile job
+  (`python-wheel-acceptance`, run 35957789025 job 107499682745, revision
+  `a869e7a3b`) completed its suite for the first time — 6m43s, no hang, after
+  the GIL-held runtime-drop deadlock was fixed — and hit the SAME terminal in
+  a different cell × authority: `test_org_live.py::test_org_duplex_async_call_and_serve[same_org]`
+  failed at `async for chunk in down` with `0x0006: response pump failed`
+  (1 failed, 1122 passed, 26 skipped). The debug-profile job ran the same
+  cell in the same commit and passed it
+  (`test_org_live.py::test_org_duplex_async_call_and_serve[same_org] PASSED`,
+  bindings job of the same run), so this is the load/timing sensitivity this
+  finding names, not a cell defect — and it is the mechanism
+  `R4COREFIX.md` finding 9 diagnosed (the biased select's `pump_done` break
+  shadowing a ready handler arm once the sink's mpsc sender drops at
+  blocking-task end), still unfixed there.
 - **F-S4PySdk-5 (fixed here)** — the cancel row's expected dict was
   links-only (`link1..3`) while the consumer's CELLOK envelope carries
   `cell`/`kind` metadata (established across every cell). **The three contract
