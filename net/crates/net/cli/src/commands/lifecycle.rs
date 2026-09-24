@@ -87,6 +87,9 @@ const JOIN_ATTACH_WAIT: Duration = Duration::from_secs(20);
 /// inside the caller's control session bound, so a silent publisher yields
 /// an unconfirmed result, not a lost reply.
 const CHANNEL_UNSUBSCRIBE_WAIT: Duration = Duration::from_secs(3);
+/// The durable record that this device left its join's own subnet relation
+/// (under the state root); the mesh membership is untouched.
+const SUBNET_LEFT_FILE: &str = "subnet.left";
 /// Bound on one subnet leaf renewal exchange.
 const SUBNET_RENEW_WAIT: Duration = Duration::from_secs(10);
 /// Retry pause after a failed background renewal.
@@ -257,6 +260,120 @@ fn owner_org_on_disk(authority_dir: &Path) -> Option<String> {
     let bytes = std::fs::read(authority_dir.join("owner-membership.json")).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     v["owner_org"].as_str().map(str::to_string)
+}
+
+/// The recorded departure from the join's own subnet relation, if any.
+fn read_subnet_left(state_root: &Path) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(state_root.join(SUBNET_LEFT_FILE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn record_subnet_left(state_root: &Path, scope: &str, at: u64) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = state_root.join(SUBNET_LEFT_FILE);
+    let tmp = path.with_extension("left-tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(
+            serde_json::json!({ "scope": scope, "left_at": at })
+                .to_string()
+                .as_bytes(),
+        )?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)
+}
+
+/// Control op `subnet_leave`: leave one subnet relation of this device —
+/// the join's own, or a standalone membership — at the named scope.
+/// Recorded durably first (and fenced: never presented or renewed again),
+/// then the verifier is asked over the session to drop this device's
+/// admission there. The credential itself is not revoked.
+async fn subnet_leave(state: &ControlState, request: &serde_json::Value) -> serde_json::Value {
+    let Ok(path) = super::subnet::parse_subnet_path(request["scope"].as_str().unwrap_or_default())
+    else {
+        return serde_json::json!({ "error": "malformed scope" });
+    };
+    let now = now_unix();
+    let scope_text = super::subnet::format_subnet(path);
+    // (target at the verifier, verifier node, newly left, relation kind)
+    let mut found = None;
+    if let Some(join) = &state.joined {
+        let guard = join.lock();
+        if let Some(j) = guard.as_ref().filter(|j| j.left_at().is_none()) {
+            if let (Some(offer), Some(bundle)) = (j.invite().subnet(), j.bundle()) {
+                if offer.scope.path == path {
+                    let newly = read_subnet_left(&state.state_root).is_none();
+                    if newly {
+                        // Recorded and fenced under the join lock, so a
+                        // renewal cannot slip in between.
+                        if let Err(e) = record_subnet_left(&state.state_root, &scope_text, now) {
+                            return serde_json::json!({
+                                "error": format!("the departure was not recorded: {e}")
+                            });
+                        }
+                        state.subnet_left.store(true, Ordering::SeqCst);
+                    }
+                    found = Some((offer.scope.clone(), bundle.contact().node_id, newly, "join"));
+                }
+            }
+        }
+    }
+    if found.is_none() {
+        if let Some(memberships) = &state.memberships {
+            let mut ms = memberships.lock();
+            if let Some(m) = ms
+                .iter_mut()
+                .find(|m| m.offer().is_some_and(|o| o.scope.path == path))
+            {
+                let target = m.offer().map(|o| o.scope.clone());
+                let newly = match m.leave(now) {
+                    Ok(newly) => newly,
+                    Err(e) => {
+                        return serde_json::json!({
+                            "error": format!("the departure was not recorded: {e}")
+                        })
+                    }
+                };
+                if let Some(target) = target {
+                    found = Some((target, m.issuer_node(), newly, "standalone"));
+                }
+            }
+        }
+    }
+    let Some((target, verifier, newly, relation)) = found else {
+        return serde_json::json!({
+            "error": format!("this device holds no subnet relation at {scope_text}")
+        });
+    };
+    if let Some(link) = &state.link {
+        let mut l = link.lock();
+        if relation == "join" {
+            l.subnet_admitted = None;
+            l.subnet_detail = Some("left".to_string());
+        }
+        for entry in l.standalone.values_mut().filter(|e| e.scope == scope_text) {
+            entry.state = "left".to_string();
+            entry.admitted = None;
+        }
+    }
+    let withdrawn = state
+        .node
+        .withdraw_own_subnet_admission(verifier, &target, CHANNEL_UNSUBSCRIBE_WAIT)
+        .await;
+    serde_json::json!({
+        "left": true,
+        "newly_left": newly,
+        "scope": scope_text,
+        "relation": relation,
+        // Confirmed only on the verifier's acknowledgement that no
+        // admission of this device remains there on this session.
+        "withdrawal": if withdrawn.is_ok() { "confirmed" } else { "unconfirmed" },
+        "withdrawal_detail": withdrawn.as_ref().err().map(|e| e.to_string()),
+        "dropped": withdrawn.ok(),
+        "credentials": if relation == "join" { "disabled: kept in the join, never presented or renewed" } else { "erased" },
+        "credential_validity": "unchanged: valid until it expires or the operator runs `subnet remove`",
+    })
 }
 
 /// Pending standalone org links, as stored under `<state>/orgs-pending`.
@@ -576,6 +693,7 @@ fn spawn_joined_link(
     presented: Option<u64>,
     present_retry_at: u64,
     channel: Option<(JoinedChannel, Option<u64>)>,
+    subnet_left: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = REATTACH_MIN;
@@ -598,11 +716,14 @@ fn spawn_joined_link(
                     .filter(|j| j.left_at().is_none())
                     .and_then(|j| {
                         let bundle = j.bundle()?;
+                        // A left subnet relation is never presented or
+                        // renewed again.
                         let subnet = j
                             .invite()
                             .subnet()
                             .cloned()
-                            .zip(bundle.subnet_credentials());
+                            .zip(bundle.subnet_credentials())
+                            .filter(|_| !subnet_left.load(Ordering::SeqCst));
                         Some((
                             bundle.contact().clone(),
                             j.identity().clone(),
@@ -676,13 +797,31 @@ fn spawn_joined_link(
                     set,
                     &mut track,
                     |renewed| {
-                        joined
-                            .lock()
-                            .as_mut()
-                            .map(|j| j.replace_subnet_credentials(renewed))
+                        // A renewal completing after `subnet leave` (which
+                        // records under this same lock) installs nothing.
+                        let mut guard = joined.lock();
+                        let join = guard.as_mut()?;
+                        if subnet_left.load(Ordering::SeqCst) {
+                            return Some(Err(net_sdk::enrollment::device::DeviceJoinError::Left {
+                                at: now_unix(),
+                            }));
+                        }
+                        Some(join.replace_subnet_credentials(renewed))
                     },
                 )
                 .await;
+                // A presentation that raced `subnet leave` is withdrawn
+                // again rather than left standing.
+                if matches!(kept, Kept::Presented(Ok(()))) && subnet_left.load(Ordering::SeqCst) {
+                    let _ = node
+                        .withdraw_own_subnet_admission(
+                            contact.node_id,
+                            &offer.scope,
+                            CHANNEL_UNSUBSCRIBE_WAIT,
+                        )
+                        .await;
+                    continue;
+                }
                 match kept {
                     Kept::Gone => return,
                     Kept::Quiet => {}
@@ -1414,6 +1553,8 @@ struct ControlState {
     node: Arc<net::adapter::net::MeshNode>,
     /// A joined device's channel credential, when its join carried one.
     channel: Option<JoinedChannel>,
+    /// Set once `subnet leave` recorded leaving the join's subnet relation.
+    subnet_left: Arc<AtomicBool>,
 }
 
 /// Forward one root-signed floor readback request (built and signed by the
@@ -2167,6 +2308,8 @@ async fn control_session(
                 .await
             }
         },
+        "subnet_leave" if draining => serde_json::json!({ "error": "node is draining" }),
+        "subnet_leave" => subnet_leave(state, &request).await,
         "channel_serve" if draining => serde_json::json!({ "error": "node is draining" }),
         "channel_serve" => {
             let (node, root, request) = (
@@ -2661,7 +2804,13 @@ pub async fn run_up(
                 };
             // Subnet admission is proven on the session, by the verifier's
             // verdict — not inferred from holding credentials.
+            let subnet_was_left = read_subnet_left(&state).is_some();
             let subnet = match (join.invite().subnet(), bundle.subnet_credentials()) {
+                (Some(offer), Some(_)) if subnet_was_left => Some(serde_json::json!({
+                    "scope": super::subnet::format_subnet(offer.scope.path),
+                    "rights": super::subnet::format_subnet_rights(offer.rights),
+                    "state": "left",
+                })),
                 (Some(offer), Some(set)) => {
                     // Renew first when the leaf is near (or past) expiry.
                     let mut set = set;
@@ -2828,6 +2977,7 @@ pub async fn run_up(
         }
     });
     let link = start_link.map(|l| Arc::new(parking_lot::Mutex::new(l)));
+    let subnet_left = Arc::new(AtomicBool::new(read_subnet_left(&state).is_some()));
     let joined_channel = channel_start.map(|(cred, link, left, publisher)| {
         // Subscribed at start: on the current session.
         let on = match link.subscribed {
@@ -2867,6 +3017,7 @@ pub async fn run_up(
                 presented,
                 present_retry_at,
                 joined_channel.clone(),
+                subnet_left.clone(),
             ))
         }
         _ => None,
@@ -2883,6 +3034,7 @@ pub async fn run_up(
         pending_orgs: pending_orgs.clone(),
         node: mesh.node().clone(),
         channel: joined_channel.map(|(c, _)| c),
+        subnet_left: subnet_left.clone(),
     });
     let (stop_tx, mut stop_rx) = mpsc::channel(1);
     let server = tokio::spawn(serve_control(listener, secret, state_ctl.clone(), stop_tx));

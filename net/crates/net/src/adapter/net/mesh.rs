@@ -35292,7 +35292,9 @@ impl MeshNode {
             return;
         };
         match msg {
-            SubnetAdmissionMsg::Challenge { .. } | SubnetAdmissionMsg::Verdict { .. } => {
+            SubnetAdmissionMsg::Challenge { .. }
+            | SubnetAdmissionMsg::Verdict { .. }
+            | SubnetAdmissionMsg::Withdrawn { .. } => {
                 let nonce = msg.nonce();
                 if let Some((_, (_, tx))) = ctx
                     .pending_subnet_admissions
@@ -35301,7 +35303,9 @@ impl MeshNode {
                     let _ = tx.send(msg);
                 }
             }
-            SubnetAdmissionMsg::ChallengeRequest { .. } | SubnetAdmissionMsg::Present { .. } => {
+            SubnetAdmissionMsg::ChallengeRequest { .. }
+            | SubnetAdmissionMsg::Present { .. }
+            | SubnetAdmissionMsg::Withdraw { .. } => {
                 if Self::is_auth_throttled(from_node, ctx) {
                     return;
                 }
@@ -35359,6 +35363,20 @@ impl MeshNode {
                 refusal: self
                     .admit_subnet_session(from_node, &presentation, &set)
                     .err(),
+            },
+            // Self-withdrawal: `from_node` is the session peer, so it can
+            // drop only its own admission, and only the one it names.
+            SubnetAdmissionMsg::Withdraw {
+                nonce,
+                authority,
+                attachment,
+            } => SubnetAdmissionMsg::Withdrawn {
+                nonce,
+                dropped: self.subnet_contexts.forget_if_at(
+                    from_node,
+                    &authority,
+                    super::subnet::TopologySubnetId::from_raw(attachment),
+                ),
             },
             // Prover legs never reach here.
             _ => return,
@@ -35427,6 +35445,40 @@ impl MeshNode {
             SubnetAdmissionMsg::Verdict {
                 refusal: Some(e), ..
             } => Err(SubnetAdmissionError::Refused(e)),
+            _ => Err(SubnetAdmissionError::Local("unexpected reply".into())),
+        }
+    }
+
+    /// Withdraw this node's own admission at exactly `target` from
+    /// `verifier_node` (V3-2B subnet leave). `Ok(dropped)` is the verifier's
+    /// acknowledgement that no admission of this node remains there on this
+    /// session (`dropped` says whether one was held). Advisory: it revokes
+    /// nothing, and a verifier that predates withdrawal answers nothing
+    /// ([`SubnetAdmissionError::Timeout`]).
+    ///
+    /// [`SubnetAdmissionError::Timeout`]: super::subnet::admission_wire::SubnetAdmissionError::Timeout
+    pub async fn withdraw_own_subnet_admission(
+        &self,
+        verifier_node: u64,
+        target: &super::subnet::SubnetRef,
+        timeout: Duration,
+    ) -> Result<bool, super::subnet::admission_wire::SubnetAdmissionError> {
+        use super::subnet::admission_wire::{SubnetAdmissionError, SubnetAdmissionMsg};
+        if self.peer_session_id(verifier_node).is_none() {
+            return Err(SubnetAdmissionError::NoSession);
+        }
+        let (authority, attachment) = (target.authority.clone(), target.path.raw());
+        let reply = self
+            .subnet_admission_leg(verifier_node, timeout, |nonce| {
+                SubnetAdmissionMsg::Withdraw {
+                    nonce,
+                    authority: authority.clone(),
+                    attachment,
+                }
+            })
+            .await?;
+        match reply {
+            SubnetAdmissionMsg::Withdrawn { dropped, .. } => Ok(dropped),
             _ => Err(SubnetAdmissionError::Local("unexpected reply".into())),
         }
     }

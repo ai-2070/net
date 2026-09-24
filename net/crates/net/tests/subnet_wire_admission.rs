@@ -255,3 +255,65 @@ async fn refusals_are_verdicts_and_nothing_is_installed() {
         Err(SubnetAdmissionError::NoSession)
     );
 }
+
+/// V3-2B subnet leave: a device withdraws its OWN admission at exactly the
+/// attachment it names. Another scope or authority drops nothing, a
+/// sibling's admission is untouched, and repeating is acknowledged with
+/// nothing held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_withdraws_only_its_own_named_admission() {
+    let v = node(&EntityKeypair::generate(), true).await;
+    let (b_kp, c_kp) = (EntityKeypair::generate(), EntityKeypair::generate());
+    let (b, c) = (node(&b_kp, false).await, node(&c_kp, false).await);
+    connect(&b, &v).await;
+    connect(&c, &v).await;
+    for (n, kp) in [(&b, &b_kp), (&c, &c_kp)] {
+        n.present_subnet_credentials(
+            v.node_id(),
+            &direct(kp, 1),
+            scope(),
+            SubnetRights::ATTACH,
+            T,
+        )
+        .await
+        .expect("admitted");
+    }
+    let c_ctx = v.subnet_context_for(c_kp.node_id()).expect("C's context");
+
+    let elsewhere = SubnetRef {
+        authority: root().entity_id().clone(),
+        path: TopologySubnetId::new(&[4, 3]),
+    };
+    let other_authority = SubnetRef {
+        authority: EntityKeypair::generate().entity_id().clone(),
+        path: TopologySubnetId::new(S),
+    };
+    for target in [&elsewhere, &other_authority] {
+        assert_eq!(
+            b.withdraw_own_subnet_admission(v.node_id(), target, T)
+                .await,
+            Ok(false)
+        );
+        assert!(v.subnet_context_for(b_kp.node_id()).is_some());
+    }
+    assert_eq!(
+        b.withdraw_own_subnet_admission(v.node_id(), &scope(), T)
+            .await,
+        Ok(true)
+    );
+    assert!(v.subnet_context_for(b_kp.node_id()).is_none());
+    assert_eq!(v.subnet_context_for(c_kp.node_id()), Some(c_ctx));
+    assert_eq!(
+        b.withdraw_own_subnet_admission(v.node_id(), &scope(), T)
+            .await,
+        Ok(false),
+        "repeated: acknowledged, nothing held"
+    );
+    // No session: nothing is claimed.
+    let lone = node(&EntityKeypair::generate(), false).await;
+    assert_eq!(
+        lone.withdraw_own_subnet_admission(v.node_id(), &scope(), T)
+            .await,
+        Err(SubnetAdmissionError::NoSession)
+    );
+}

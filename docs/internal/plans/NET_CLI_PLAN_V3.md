@@ -3150,6 +3150,101 @@ Regressions:
 - PSK rotation to exclude a departed device. That is issuer-side removal
   (§6 / V3-4), not leave.
 
+#### V3-2B relation coverage (2026-09-24)
+
+| Relation | Where it landed |
+|---|---|
+| Mesh | Above |
+| Org | O4 (`org leave`) |
+| Channel | V3-2A C3 (`channel leave`, plus the whole `leave` withdrawing a subscription) |
+| Subnet | This slice (user decision: withdrawal over the session) |
+
+#### V3-2B subnet relation — `net-mesh subnet leave <scope>` (receipt, 2026-09-24)
+
+**Core: self-withdrawal on the admission subprotocol (`0x0A02`).**
+- New legs `Withdraw { nonce, authority, attachment }` and
+  `Withdrawn { nonce, dropped }`.
+- The verifier calls `SubnetContextStore::forget_if_at`. It drops the
+  sender's context only when that context is exactly the named attachment
+  under the named authority. It acknowledges either way; `dropped: false`
+  means nothing was held there.
+- The sender is the AEAD-resolved session peer, so a node can withdraw only
+  itself. The withdrawal is advisory and revokes nothing.
+- The prover side is `MeshNode::withdraw_own_subnet_admission` (retrying
+  leg). With no session it returns `NoSession`. A verifier that predates the
+  message gives `Timeout`.
+
+**CLI.** `subnet leave <scope>` runs through the device's running `up`
+(control op `subnet_leave`). It resolves the join's own subnet relation or a
+standalone membership at that scope.
+
+1. **Records durably first.**
+   - Join relation: `<state>/subnet.left` is written under the join lock and
+     the runtime's `subnet_left` flag is set.
+   - Standalone membership: `SubnetMembership::leave`, which erases the
+     credentials and already fences `install`.
+2. **Fences the supervisor.**
+   - A left relation is filtered out of every pass, so it is never presented
+     or renewed again.
+   - A renewal in flight is refused at persist, under the same lock.
+   - A presentation that raced the leave is withdrawn again.
+3. **Withdraws at the verifier.** `withdrawal` is `confirmed` only on the
+   acknowledgement, otherwise `unconfirmed` with a detail.
+
+The receipt also states:
+- `credentials`: `disabled` (join relation) or `erased` (standalone);
+- `credential_validity: unchanged`, because leave is not `subnet remove`.
+
+`up` on a left relation reports `state: left` and uses nothing. The mesh
+membership stays attached. Repeating is idempotent, and an unknown scope is
+refused.
+
+Witnesses:
+- **Core:** `tests/subnet_wire_admission.rs`
+  `a_device_withdraws_only_its_own_named_admission`, already pinned in CI:
+  - another scope or authority drops nothing;
+  - the named admission drops, and a sibling's is untouched;
+  - a repeat is acknowledged as `false`;
+  - with no session the result is `NoSession`.
+- **CLI:** `cli/tests/subnet_join.rs`
+  `a_device_leaves_its_subnet_relation_and_is_withdrawn_at_the_verifier`:
+  - the leave is confirmed with `dropped`;
+  - the operator's own observation (`subnet members …
+    observed.admitted_here`) shows the device gone;
+  - it is idempotent, and an unknown scope is refused;
+  - a 15 s leaf passes its renewal point and `subnet_expires_at` is
+    unchanged, with no re-admission;
+  - after a restart it is still `left`, still attached, and still not
+    admitted.
+
+Inverse mutations, all RED (7):
+
+| # | Mutation |
+|---|---|
+| 1 | Withdrawal ignores the named scope |
+| 2 | Verifier ignores withdrawal (RED in both the core and CLI witnesses) |
+| 3 | Disabled intent bypassed |
+| 4 | Intent bypassed **and** a late renewal installs (task 5) |
+| 5 | Leave not recorded |
+| 6 | Start ignores the marker |
+| 7 | Withdrawal skipped but reported confirmed |
+
+Gates:
+- fmt; core clippy, strict and all-targets; root rustdoc; CLI clippy
+  `--all-targets`;
+- `cargo tl` 5818/5818; `cargo t` 7040/7040; SDK 829/829; CLI 365/365.
+
+**Limits:**
+- The verifier keeps one admission context per peer. A device with the
+  join's own relation and a standalone membership at the same verifier is
+  admitted at only one of them at a time. This is pre-existing and is not
+  changed here.
+- The post-present re-withdraw covers the join relation. A standalone
+  membership relies on `leave` fencing `install` and the supervisor
+  filtering left memberships.
+- Other verifiers the device never presented to hold nothing, so no
+  withdrawal is needed there.
+
 ### V3-3 — live inspection without false completeness
 
 **Modify:** shared enrollment SDK/service and CLI `enrollment.rs`, `org.rs`, `channel.rs`, `subnet.rs`; narrow runtime read interfaces where necessary.

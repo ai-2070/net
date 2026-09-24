@@ -834,3 +834,70 @@ fn subnet_members_separates_issued_from_admitted_here() {
         .starts_with("unknown"));
     drop(node);
 }
+
+/// V3-2B subnet leave: a device leaves its join's subnet relation through
+/// its running `up`. The verifier acknowledges dropping exactly that
+/// admission (its own observation shows the device gone). The relation is
+/// never presented or renewed again (a short leaf passes its renewal point
+/// untouched), it stays left across restart while the mesh attachment
+/// remains, and repeating is idempotent.
+#[test]
+fn a_device_leaves_its_subnet_relation_and_is_withdrawn_at_the_verifier() {
+    let operator = Fx::new();
+    let keys = operator.tmp.path().join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let (_root, _root_hex, issuer, grant) = ceremony(&keys);
+    let _op = operator.up(&[
+        "--enroll",
+        "--no-port-mapping",
+        "--subnet-issuer-grant",
+        grant.to_str().unwrap(),
+        "--subnet-issuer-key",
+        issuer.to_str().unwrap(),
+        "--subnet-leaf-ttl",
+        "15s",
+    ]);
+    let created = operator.json(&["invite", "create", "--subnet", "3.7"]);
+    let agent = Fx::new();
+    agent.json(&["join", &token_of(&created), "--yes"]);
+    let node = agent.up(&[]);
+    let jsub = &node.ready["joined"]["subnet"];
+    assert_eq!(jsub["admitted"], true, "{}", node.ready);
+    let first = jsub["expires_at"].as_u64().unwrap();
+    let admitted_here =
+        |fx: &Fx| fx.json(&["subnet", "members", "3.7"])["observed"]["admitted_here"].clone();
+    assert_eq!(admitted_here(&operator).as_array().unwrap().len(), 1);
+
+    let left = agent.json(&["subnet", "leave", "3.7"]);
+    assert_eq!(left["newly_left"], true, "{left}");
+    assert_eq!(left["relation"], "join", "{left}");
+    assert_eq!(left["withdrawal"], "confirmed", "{left}");
+    assert_eq!(left["dropped"], true, "{left}");
+    assert!(
+        admitted_here(&operator).as_array().unwrap().is_empty(),
+        "the verifier no longer admits the device"
+    );
+    assert_eq!(agent.json(&["subnet", "leave", "3.7"])["newly_left"], false);
+    assert!(!agent.run(&["subnet", "leave", "3.9"]).status.success());
+
+    // Past the renewal point (a third of the life before expiry): nothing
+    // was renewed or presented again.
+    wait_past(first.saturating_sub(3));
+    let status = agent.json(&["node", "status"]);
+    assert_eq!(status["subnet_expires_at"], first, "{status}");
+    assert!(status["link"].get("subnet_admitted").is_none(), "{status}");
+    assert!(admitted_here(&operator).as_array().unwrap().is_empty());
+
+    // Restart: still left, still attached to the mesh.
+    drop(node);
+    let node = agent.up(&[]);
+    assert_eq!(
+        node.ready["joined"]["subnet"]["state"], "left",
+        "{}",
+        node.ready
+    );
+    assert_eq!(node.ready["joined"]["attached"], true, "{}", node.ready);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(admitted_here(&operator).as_array().unwrap().is_empty());
+    drop(node);
+}

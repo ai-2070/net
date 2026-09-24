@@ -14,6 +14,15 @@
 //! 2. device → verifier `Present { nonce, presentation, credential set }`;
 //!    verifier → device `Verdict { nonce, refusal }`.
 //!
+//! A device may also WITHDRAW its own admission (V3-2B subnet leave):
+//! device → verifier `Withdraw { nonce, authority, attachment }`;
+//! verifier → device `Withdrawn { nonce, dropped }`. The verifier drops the
+//! sender's context only if it is the named attachment under the named
+//! authority — never another scope's admission — and acknowledges either way
+//! (`dropped: false` means none was held there). The sender is the
+//! AEAD-resolved session peer, so a node can withdraw only itself. This is
+//! advisory self-withdrawal, not revocation: the credentials stay valid.
+//!
 //! `nonce` only correlates a leg with its reply; the security binding is
 //! the verifier's challenge, consumed on first use, and the session the
 //! frames ride. The verifier runs the unchanged `admit_subnet_session`
@@ -32,6 +41,8 @@ const TAG_CHALLENGE_REQUEST: u8 = 1;
 const TAG_CHALLENGE: u8 = 2;
 const TAG_PRESENT: u8 = 3;
 const TAG_VERDICT: u8 = 4;
+const TAG_WITHDRAW: u8 = 5;
+const TAG_WITHDRAWN: u8 = 6;
 
 /// One leg of the subnet admission exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +79,23 @@ pub enum SubnetAdmissionMsg {
         /// Why admission was refused, if it was.
         refusal: Option<SubnetAuthError>,
     },
+    /// Device withdraws its own admission at exactly this attachment.
+    Withdraw {
+        /// Correlation id chosen by the device.
+        nonce: u64,
+        /// The authority the admission is under.
+        authority: EntityId,
+        /// The exact admitted attachment (raw topology path).
+        attachment: u32,
+    },
+    /// Verifier's acknowledgement: no admission of the sender remains at
+    /// that attachment; `dropped` says whether one was held.
+    Withdrawn {
+        /// Echoed correlation id.
+        nonce: u64,
+        /// Whether a matching admission was dropped.
+        dropped: bool,
+    },
 }
 
 impl SubnetAdmissionMsg {
@@ -77,7 +105,9 @@ impl SubnetAdmissionMsg {
             Self::ChallengeRequest { nonce }
             | Self::Challenge { nonce, .. }
             | Self::Present { nonce, .. }
-            | Self::Verdict { nonce, .. } => *nonce,
+            | Self::Verdict { nonce, .. }
+            | Self::Withdraw { nonce, .. }
+            | Self::Withdrawn { nonce, .. } => *nonce,
         }
     }
 
@@ -125,6 +155,21 @@ impl SubnetAdmissionMsg {
                         .unwrap_or(0xFE),
                 });
             }
+            Self::Withdraw {
+                nonce,
+                authority,
+                attachment,
+            } => {
+                out.push(TAG_WITHDRAW);
+                out.extend_from_slice(&nonce.to_le_bytes());
+                out.extend_from_slice(authority.as_bytes());
+                out.extend_from_slice(&attachment.to_le_bytes());
+            }
+            Self::Withdrawn { nonce, dropped } => {
+                out.push(TAG_WITHDRAWN);
+                out.extend_from_slice(&nonce.to_le_bytes());
+                out.push(u8::from(*dropped));
+            }
         }
         out
     }
@@ -169,6 +214,15 @@ impl SubnetAdmissionMsg {
                     0xFF => None,
                     i => Some(*SubnetAuthError::ALL.get(i as usize).ok_or(bad)?),
                 },
+            },
+            TAG_WITHDRAW if body.len() == 32 + 4 => Self::Withdraw {
+                nonce,
+                authority: EntityId::from_bytes(body[..32].try_into().map_err(|_| bad)?),
+                attachment: u32::from_le_bytes(body[32..36].try_into().map_err(|_| bad)?),
+            },
+            TAG_WITHDRAWN if body.len() == 1 && body[0] <= 1 => Self::Withdrawn {
+                nonce,
+                dropped: body[0] == 1,
             },
             _ => return Err(bad),
         })

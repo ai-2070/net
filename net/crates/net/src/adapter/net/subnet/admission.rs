@@ -207,6 +207,22 @@ impl SubnetContextStore {
         self.by_peer.remove(&node_id);
     }
 
+    /// Drop `node_id`'s context only if it is the admission at exactly
+    /// `attachment` under `authority` (a peer's self-withdrawal names one
+    /// admission; any other stays). Returns whether one was dropped.
+    pub fn forget_if_at(
+        &self,
+        node_id: u64,
+        authority: &EntityId,
+        attachment: super::TopologySubnetId,
+    ) -> bool {
+        self.by_peer
+            .remove_if(&node_id, |_, ctx| {
+                &ctx.authority == authority && ctx.attachment == attachment
+            })
+            .is_some()
+    }
+
     /// Drop contexts whose authority auth epoch is behind `current` —
     /// the off-path invalidation an accepted revocation floor
     /// triggers. Returns how many were dropped.

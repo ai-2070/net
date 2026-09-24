@@ -90,6 +90,22 @@ pub enum SubnetCommand {
     /// and which peers are admitted to it at that node right now — explicitly
     /// not a claim about other verifiers.
     Members(SubnetMembersArgs),
+    /// Leave one subnet relation of this device (the join's own, or a
+    /// standalone membership) through its running `up`: recorded durably,
+    /// never presented or renewed again, and the verifier asked over the
+    /// session to drop this device's admission there (acknowledged or
+    /// reported unconfirmed). The credential is not revoked.
+    Leave(SubnetLeaveArgs),
+}
+
+/// `subnet leave` arguments.
+#[derive(Args, Debug)]
+pub struct SubnetLeaveArgs {
+    /// The scope (dotted path) of the relation to leave.
+    pub scope: String,
+    /// State directory of this device's running `net-mesh up`.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
 }
 
 /// `subnet members` arguments.
@@ -295,6 +311,26 @@ pub async fn run(
             .await
         }
         SubnetCommand::Join(args) => run_subnet_join(args, output, profile_name).await,
+        SubnetCommand::Leave(args) => {
+            parse_subnet_path(&args.scope)?;
+            let node_dir = super::lifecycle::state_dir(args.state_dir, profile_name)?
+                .join(super::lifecycle::NODE_SUBDIR);
+            let (_, reply) = super::lifecycle::control_call(
+                &node_dir,
+                serde_json::json!({ "op": "subnet_leave", "scope": args.scope }),
+            )
+            .await
+            .map_err(|e| {
+                crate::error::connection_failure(format!(
+                    "{e}; is this device's `net-mesh up` running?"
+                ))
+            })?;
+            if let Some(err) = reply["error"].as_str() {
+                return Err(generic(err.to_string()));
+            }
+            emit_value(OutputFormat::resolve_oneshot(output), &reply)
+                .map_err(|e| generic(format!("write result: {e}")))
+        }
         SubnetCommand::Members(args) => {
             parse_subnet_path(&args.scope)?;
             let remote = match (&args.root_key, args.verifiers.is_empty()) {
