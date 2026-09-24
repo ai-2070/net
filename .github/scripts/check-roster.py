@@ -51,8 +51,21 @@ Usage:
 
 Modes:
     fn       the name appears as `fn <name>(` in some source file.
+    decl     the name appears as a `fn` / `func` / `def` declaration
+             (`fn <name>(`, `func <name>(`, `def <name>(`) or as a
+             quoted string. The Go and Python rosters need both in one
+             pass: the test functions are pinned by declaration, and
+             the parametrize ids (`"same_org"`, `"granted"`) only ever
+             appear as literals.
     literal  the name appears as a quoted string in some source file
              (harness witnesses, which are emitted by name at runtime).
+    text     the name appears VERBATIM anywhere in the source. For pins
+             that are code shapes rather than names — `it.each(byteRows)`
+             in a vitest file, the unquoted keys of a scenario table —
+             this is the only lexical form there is. The cost, stated
+             plainly: a mention in a comment satisfies it too. Prefer
+             `fn` / `decl` / `literal` wherever the source offers one of
+             those forms.
 """
 
 from __future__ import annotations
@@ -66,7 +79,7 @@ from pathlib import Path
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True, help="roster name, for the error text")
-    ap.add_argument("--mode", choices=("fn", "literal"), default="fn")
+    ap.add_argument("--mode", choices=("fn", "decl", "literal", "text"), default="fn")
     ap.add_argument(
         "--source",
         action="append",
@@ -93,6 +106,19 @@ def main() -> int:
     def declared(name: str) -> bool:
         if args.mode == "fn":
             pattern = re.compile(rf"\bfn\s+{re.escape(name)}\s*\(")
+        elif args.mode == "text":
+            # Verbatim, wherever it appears — see the mode's note in the
+            # module docstring for what that costs.
+            return any(name in text for text in texts.values())
+        elif args.mode == "decl":
+            # `fn` (Rust), `func` (Go), `def` (Python) declarations, or the
+            # name as a quoted literal — see the mode's note in the module
+            # docstring for why the Go/Python rosters pin both.
+            decl = re.compile(rf"\b(?:fn|func|def)\s+{re.escape(name)}\s*\(")
+            quoted = re.compile(
+                rf"""(?:"{re.escape(name)}"|'{re.escape(name)}'|`{re.escape(name)}`)"""
+            )
+            return any(decl.search(text) or quoted.search(text) for text in texts.values())
         else:
             # Rust uses `"name"`, JavaScript uses `'name'` or a
             # template literal. Accepting only one of them would fail

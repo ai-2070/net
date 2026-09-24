@@ -3688,7 +3688,7 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: |
           set -o pipefail
-          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label org_streaming_opening_vectors --mode literal \
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label org_streaming_opening_vectors --mode text \
             --source test/org_streaming_opening_vectors.test.ts \
             'org streaming opening vectors (cross-language fixture)' \
             'loads the fixture with the expected shape' \
@@ -3884,7 +3884,7 @@ jobs:
           # org-vocabulary pin + strict disposal); this step PINS them: lexical
           # name-existence, fail-closed.
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
-            --label org_live.test --mode literal \
+            --label org_live.test --mode text \
             --source test/org_live.test.ts \
             consumer_program_compiles_against_the_shipped_org_surface \
             same_org_unary_call_and_serve \
@@ -4065,7 +4065,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
-          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_live --mode literal \
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_live --mode decl \
             --source net/crates/net/bindings/python/tests/test_org_live.py \
             test_org_streaming_sync_call_and_serve \
             test_org_streaming_async_call_and_serve \
@@ -4076,7 +4076,7 @@ jobs:
             test_task_cancel_propagates_to_retirement_observables \
             test_streaming_midstream_error_surfaces_the_org_vocabulary \
             test_live_cross_org_call_from_a_generated_scenario \
-            '"same_org"' '"granted"' || exit 1
+            same_org granted || exit 1
 
       # === S4: the Python cross-language vectors rows (S4Vectors) =======
       # The pytest run above EXECUTED these (119 items: the byte pins, the
@@ -4088,7 +4088,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
-          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_streaming_opening_vectors --mode literal \
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_streaming_opening_vectors --mode decl \
             --source net/crates/net/bindings/python/tests/test_org_streaming_opening_vectors.py \
             test_fixture_has_the_expected_shape \
             test_wire_bytes_pin \
@@ -4242,7 +4242,7 @@ jobs:
       - name: Witness roster + floor — sdk-py org facade (15)
         run: |
           set -uo pipefail
-          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_streaming --mode literal \
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_streaming --mode decl \
             --source tests/test_org_streaming.py \
             test_org_streaming_sync_call_and_serve \
             test_org_streaming_async_call_and_serve \
@@ -4253,7 +4253,7 @@ jobs:
             test_unary_call_and_serve_preserved_through_net_sdk \
             test_streaming_midstream_error_surfaces_the_org_vocabulary \
             test_task_cancel_propagates_to_retirement_observables \
-            '"same_org"' '"granted"' || exit 1
+            same_org granted || exit 1
           out=$(python -m pytest -q tests/test_org_streaming.py 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
           echo "sdk-py org facade: ${n:-0} (floor 15)"
@@ -4476,7 +4476,7 @@ jobs:
         working-directory: go
         run: |
           set -uo pipefail
-          python3 ../.github/scripts/check-roster.py --label org_test --mode literal \
+          python3 ../.github/scripts/check-roster.py --label org_test --mode decl \
             --source org_test.go \
             TestLiveSameOrgStreamingFromAGeneratedScenario \
             TestLiveSameOrgClientStreamFromAGeneratedScenario \
@@ -4496,7 +4496,7 @@ jobs:
         working-directory: go
         run: |
           set -uo pipefail
-          python3 ../.github/scripts/check-roster.py --label org_streaming_opening_vectors --mode literal \
+          python3 ../.github/scripts/check-roster.py --label org_streaming_opening_vectors --mode decl \
             --source org_streaming_opening_vectors_test.go \
             TestStreamingOpeningVectors_Shape \
             TestStreamingOpeningVectors_BytePins \
