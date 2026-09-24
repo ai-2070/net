@@ -4905,10 +4905,10 @@ class AsyncOrgClient:
     — the per-stream cancel watcher tears the call down locally at once (the
     response side EOFs while the handle lives) — and the WIRE CANCEL that
     retires the provider-side call rides the handle's ``close()``/drop (the
-    per-shape Drop contract). Cancellation is never a handler-side event (see
-    ``_HANDLER_DROP_CONTRACT``). Deliberately no ``cancel_token`` parameter:
-    the bridge mints and owns the token. Teardown order: ``client.close()`` ->
-    ``serve_handle.close()`` -> ``mesh.shutdown()``."""
+    per-shape Drop contract). Cancellation is never a handler-side event (the
+    full contract text is embedded in :func:`serve_org_streaming`). Deliberately
+    no ``cancel_token`` parameter: the bridge mints and owns the token. Teardown
+    order: ``client.close()`` -> ``serve_handle.close()`` -> ``mesh.shutdown()``."""
 
     @staticmethod
     def bind(mesh: Any, credentials: OrgCredentials) -> "AsyncOrgClient": ...
@@ -4964,21 +4964,6 @@ def serve_org(
     is not interrupted when the wait elapses (same as the nRPC handler)."""
     ...
 
-_HANDLER_DROP_CONTRACT = """\
-**Handler-drop contract (Specification §2.2 — the F-S3.1-2 level).** A protected
-call runs under a per-call retire supervisor. On retirement — caller CANCEL or
-the caller handle's ``close()``/drop, the call deadline, revocation, session
-replacement, ``serve_handle.close()`` against an in-flight call, or node
-shutdown — the supervisor drops the handler future **without a final poll**.
-Cancellation is observed ONLY through the retirement observables (the request
-input fences to EOF where the shape has one; library-controlled sinks stop
-admitting output) and NEVER as a handler-side event: a ``def`` handler's
-blocking thread cannot be interrupted and runs to whatever point it reaches
-(its return value is discarded, its performed effects are not recalled); an
-``async def`` handler's coroutine MAY see ``asyncio.CancelledError`` at an
-``await`` as best-effort teardown machinery, but it may equally never be
-resumed to observe anything — never rely on it."""
-
 def serve_org_streaming(
     mesh: Any,
     service: str,
@@ -4998,7 +4983,19 @@ def serve_org_streaming(
     ``handler_timeout_ms`` is ``serve_org``'s bounded wait (``0`` = effectively
     infinite); the handler is not interrupted when it elapses.
 
-    """ + _HANDLER_DROP_CONTRACT + """
+    **Handler-drop contract (Specification §2.2 — the F-S3.1-2 level).** A protected
+    call runs under a per-call retire supervisor. On retirement — caller CANCEL or
+    the caller handle's ``close()``/drop, the call deadline, revocation, session
+    replacement, ``serve_handle.close()`` against an in-flight call, or node
+    shutdown — the supervisor drops the handler future **without a final poll**.
+    Cancellation is observed ONLY through the retirement observables (the request
+    input fences to EOF where the shape has one; library-controlled sinks stop
+    admitting output) and NEVER as a handler-side event: a ``def`` handler's
+    blocking thread cannot be interrupted and runs to whatever point it reaches
+    (its return value is discarded, its performed effects are not recalled); an
+    ``async def`` handler's coroutine MAY see ``asyncio.CancelledError`` at an
+    ``await`` as best-effort teardown machinery, but it may equally never be
+    resumed to observe anything — never rely on it.
 
     Diagnostics level: the ``RequestStreamRecv`` of the streaming org verbs
     carries chunks + the retire signal only — its raw-transport diagnostic
@@ -5019,7 +5016,7 @@ def serve_org_client_stream(
     an ``async def``): iterate ``stream`` to drain the upload — it fences to EOF
     on retirement — and return the terminal response as ``bytes``. Same
     registration / timeout / handler-drop contract and diagnostics level as
-    :func:`serve_org_streaming` (see ``_HANDLER_DROP_CONTRACT``)."""
+    :func:`serve_org_streaming`, which embeds the full contract text."""
     ...
 
 def serve_org_duplex(
@@ -5035,7 +5032,7 @@ def serve_org_duplex(
     ``stream``, emit through ``sink.send(bytes)``; the substrate emits the
     terminal frame at handler return. Same registration / timeout /
     handler-drop contract and diagnostics level as
-    :func:`serve_org_streaming` (see ``_HANDLER_DROP_CONTRACT``)."""
+    :func:`serve_org_streaming`, which embeds the full contract text."""
     ...
 
 def install_org_authority(mesh: Any, authority_dir: str) -> None:
