@@ -193,7 +193,7 @@ fn streaming_options(intent: OrgProofIntent, deadline_ms: u64, cancel_token: u64
 /// facade's error vocabulary — `Stream<Item = Result<Resp, OrgSdkError>>`.
 ///
 /// Wraps [`RpcStreamTyped`] (the facade's JSON codec decodes each chunk) and
-/// maps every wire error through the unary verb's own [`map_rpc_error`]: an
+/// maps every wire error through the unary verb's own `map_rpc_error`: an
 /// opening refusal arrives as `Err(AdmissionDenied(coarse))`, a midstream
 /// revocation as the stream's final `Err(AdmissionDenied(Denied))`, and
 /// deadline/cancel retirement as `Err(Rpc(Timeout))` / `Err(Rpc(Cancelled))`.
@@ -275,8 +275,8 @@ struct PinnedOpening {
 /// `finish` closes the upload and awaits the typed terminal response.
 ///
 /// Wraps [`ClientStreamCallTyped`]; every error surface maps through
-/// [`map_rpc_error`]. The provider is pinned at the verb (see
-/// [`PinnedOpening`]) — each `send` writes into the one pinned call and never
+/// `map_rpc_error`. The provider is pinned at the verb (see
+/// `PinnedOpening`) — each `send` writes into the one pinned call and never
 /// re-resolves anything.
 pub struct OrgClientStreamCall<Req, Resp> {
     pinned: PinnedOpening,
@@ -339,7 +339,7 @@ impl<Req: Serialize, Resp: DeserializeOwned> OrgClientStreamCall<Req, Resp> {
 /// typed halves, and the handle itself is the response `Stream`.
 ///
 /// Wraps [`DuplexCallTyped`]; every error surface maps through
-/// [`map_rpc_error`]. Opened at the verb (`into_split` and `Stream` are
+/// `map_rpc_error`. Opened at the verb (`into_split` and `Stream` are
 /// synchronous) against the pinned provider.
 pub struct OrgDuplexCall<Req, Resp> {
     inner: DuplexCallTyped<Req, Resp>,
