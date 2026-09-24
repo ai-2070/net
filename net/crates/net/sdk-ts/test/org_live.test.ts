@@ -159,10 +159,24 @@ beforeAll(async () => {
   rmSync(join(work, 'node_modules', '@net-mesh', 'core'), { recursive: true, force: true })
   rmSync(join(work, 'node_modules', '@net-mesh', 'sdk'), { recursive: true, force: true })
   mkdirSync(join(work, 'node_modules', '@net-mesh'), { recursive: true })
-  copyTree(
-    resolve(pkgRoot, '..', 'bindings', 'node'),
-    join(work, 'node_modules', '@net-mesh', 'core'),
+  // The staged `@net-mesh/core` must be a COMPLETE package. Its
+  // hand-written TS modules (`errors`, `org`, `subnet`, `mesh_rpc`,
+  // `meshdb`, `aggregator`, `tool`, `transport`) are compiled IN PLACE
+  // to CJS `.js` + `.d.ts` beside their sources by the core's own
+  // `build:ts`, and those artifacts are untracked build outputs:
+  // `napi build` emits only `index.js` / `index.d.ts`, and CI's sdk-ts
+  // job never runs the core's `build:ts` (only the Node-bindings job
+  // does). A fresh checkout therefore stages a package with no
+  // `subnet.js`, and the consumer program dies on MODULE_NOT_FOUND.
+  // Compile it here with the core's own TypeScript — the same
+  // rebuild-before-consume rule (1) applies to the SDK's `dist`.
+  const coreRoot = resolve(pkgRoot, '..', 'bindings', 'node')
+  execFileSync(
+    process.execPath,
+    [join(coreRoot, 'node_modules', 'typescript', 'bin', 'tsc'), '-p', 'tsconfig.build.json'],
+    { cwd: coreRoot, stdio: 'pipe', encoding: 'utf8', timeout: 180_000 },
   )
+  copyTree(coreRoot, join(work, 'node_modules', '@net-mesh', 'core'))
   const sdkDst = join(work, 'node_modules', '@net-mesh', 'sdk')
   mkdirSync(sdkDst, { recursive: true })
   copyTree(join(pkgRoot, 'dist'), join(sdkDst, 'dist'))
