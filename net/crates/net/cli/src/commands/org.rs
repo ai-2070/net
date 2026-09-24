@@ -102,6 +102,22 @@ pub enum OrgCommand {
     /// named node attested the floor applied and persisted. Nodes not named
     /// are never assumed.
     Remove(OrgRemoveArgs),
+    /// Leave this device's org: record it durably, then stop the running
+    /// node; its next `up` runs on the mesh without the org. Local only —
+    /// the org still accepts this device's certificate until `org remove`.
+    /// Rejoining takes a new link approved with the org root.
+    Leave(OrgLeaveArgs),
+}
+
+/// `org leave` arguments.
+#[derive(Args, Debug)]
+pub struct OrgLeaveArgs {
+    /// State directory of this device (as given to `join` and `up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// How long to wait for a running node to stop after recording.
+    #[arg(long, value_name = "DURATION", default_value = "15s", value_parser = crate::humantime::parse_duration)]
+    pub wait: std::time::Duration,
 }
 
 /// `org remove` arguments.
@@ -545,6 +561,9 @@ pub async fn run(
         }
         OrgCommand::Join(args) => run_org_join(args, output, profile_name).await,
         OrgCommand::Remove(args) => run_remove(args, output, profile_name).await,
+        OrgCommand::Leave(args) => {
+            super::lifecycle::run_org_leave(args.state_dir, args.wait, output, profile_name).await
+        }
     }
 }
 

@@ -1704,7 +1704,14 @@ pub async fn run_join(
     let enroll_path = join.last_path().map(|p| p.as_str());
     // An org relation: adopt the delivered membership as this node's owner
     // org (validated, one owner org per node, durable); `up` installs it.
+    let authority_dir = state.join(super::lifecycle::AUTHORITY_SUBDIR);
     let org = match bundle.org_membership() {
+        // Left: re-running the original token must not restore membership;
+        // only a new link approved with the org root does.
+        Some(_) if super::lifecycle::read_org_left(&authority_dir).is_some() => Some(json!({
+            "state": "left",
+            "detail": "this device left the org; a new approved org link (`org join`) rejoins",
+        })),
         Some(cert) => {
             let (cert, entity, root, audience) = (
                 cert.clone(),

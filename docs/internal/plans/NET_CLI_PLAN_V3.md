@@ -2047,7 +2047,7 @@ What was missing, and is now added:
 - ~~Distributing the org owner audience.~~ Closed by the next receipt.
 - Floors reach only the nodes named. There is no inventory of enforcement
   points; `org members` is a later slice.
-- `org leave`.
+- ~~`org leave`.~~ See the O4 receipt.
 
 #### V3-2 org O3 — the org's shared audience (receipt, 2026-09-24)
 
@@ -2113,6 +2113,53 @@ refuses an audience naming another org.
 - Clippy (core strict and all-targets, CLI, SDK) and rustdoc (root, SDK) are
   clean.
 
+
+#### V3-2 org O4 — `org leave` (receipt, 2026-09-24)
+
+Decision (user, 2026-09-24): **record, then restart**. A live core uninstall
+of the org authority was weighed and deferred: it touches the fence-heavy
+install path, and a device can afford a brief restart.
+
+**Behavior.** `net-mesh org leave [--state-dir] [--wait]`:
+- **Running node** (control op `org_leave`):
+  - durably records `<state>/authority.left` (the org and the time; written,
+    synced, then renamed);
+  - drops pending standalone links to that org;
+  - drains and stops the node, and the CLI waits for the lifetime lock
+    (`runtime: stopped`).
+  - A node already running without the org, after an earlier leave, is left
+    alone (`runtime: unchanged`).
+- **Offline:** the departure is recorded directly (`runtime: not running`).
+- **Next start:** `up` skips the org authority and reports `org_state: left`.
+  The mesh relation is unaffected.
+- **Kept:** the authority files, including the revocation floors, for a
+  later rejoin.
+- **Stated in the output:** the org is not notified (it accepts the
+  device's certificate until `org remove`), and how to rejoin.
+- **Rejoin needs fresh authorization:**
+  - re-running the original join token does **not** re-adopt; `join`
+    reports `org: left`;
+  - only an approved adoption clears the record: `org join` with a new
+    link, or `node adopt`.
+
+**Witness.** CLI
+`org_join::org_leave_holds_until_an_approved_rejoin`:
+- join the org → `org leave` stops the node;
+- the next `up` stays on the mesh without the org;
+- the original token does not restore it;
+- a new approved `org join` reinstalls it live and holds across restart;
+- an offline `org leave` holds at the next start.
+
+**Inverse mutations** (all RED): `up` ignoring the record; a running leave
+not recorded; the node kept running as a member; the original token
+re-adopting; rejoin not ending the leave; an offline leave not recorded.
+
+**Regressions:** `net-cli` 359/359; `net-cli` clippy (all targets, bins) is
+clean.
+
+**Still open (org).** `org members` (an inventory of enforcement points).
+A live authority uninstall (no restart) remains possible as its own core
+slice.
 
 #### V3-2 task 3: standalone subnet join, decisions (user, 2026-09-24)
 

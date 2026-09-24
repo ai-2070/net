@@ -533,3 +533,80 @@ fn org_remove_applies_a_root_signed_floor_at_each_named_node() {
     assert_eq!(again["verifiers"][0]["floor"], 1, "{again}");
     assert_eq!(again["complete"], true, "{again}");
 }
+
+/// `org leave`: recorded durably, then the running node stops; its next
+/// start runs on the mesh without the org (reported `left`). Re-running the
+/// original join token does not restore the membership; a new link approved
+/// with the org root does, live, and it holds across restart. Offline, the
+/// departure is recorded directly.
+#[test]
+fn org_leave_holds_until_an_approved_rejoin() {
+    let operator = Fx::new();
+    let keys = operator.tmp.path().join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let (org_key, org) = org_keygen(&keys, "org.toml");
+    let _op = operator.up(&["--enroll", "--no-port-mapping"]);
+    let approve = |offer: &str, device: &str| {
+        operator.json(&[
+            "org",
+            "approve",
+            offer,
+            "--subject",
+            device,
+            "--org-key",
+            org_key.to_str().unwrap(),
+        ])
+    };
+
+    let created = operator.json(&["invite", "create", "--org", &org]);
+    let agent = Fx::new();
+    let pending = agent.json(&["join", &token_of(&created), "--yes"]);
+    let device = pending["device"].as_str().unwrap().to_string();
+    approve(created["offer_id"].as_str().unwrap(), &device);
+    agent.json(&["join", &token_of(&created), "--yes"]);
+    let node = agent.up(&[]);
+    assert_eq!(node.ready["org"], org.as_str(), "{}", node.ready);
+
+    // Leave: recorded, and the running node stops.
+    let left = agent.json(&["org", "leave"]);
+    assert_eq!(left["state"], "left", "{left}");
+    assert_eq!(left["newly_left"], true, "{left}");
+    assert_eq!(left["org"], org.as_str(), "{left}");
+    assert_eq!(left["runtime"], "stopped", "{left}");
+    assert_eq!(agent.json(&["node", "status"])["state"], "stopped");
+    drop(node);
+
+    // The next start: on the mesh, without the org.
+    let node = agent.up(&[]);
+    assert!(node.ready["org"].is_null(), "{}", node.ready);
+    assert_eq!(node.ready["org_state"]["state"], "left", "{}", node.ready);
+    assert_eq!(node.ready["joined"]["attached"], true, "{}", node.ready);
+    drop(node);
+
+    // Re-running the original token does not restore the membership.
+    let again = agent.json(&["join", &token_of(&created), "--yes"]);
+    assert_eq!(again["org"]["state"], "left", "{again}");
+    let node = agent.up(&[]);
+    assert!(node.ready["org"].is_null(), "{}", node.ready);
+
+    // A new link, approved with the org root, rejoins — live.
+    let link = operator.json(&["org", "invite", &org]);
+    let rejoin = agent.json(&["org", "join", &token_of(&link), "--yes"]);
+    assert_eq!(rejoin["state"], "pending_approval", "{rejoin}");
+    approve(link["offer_id"].as_str().unwrap(), &device);
+    wait_for_status(&agent, "rejoined org installed", |s| {
+        s["org"] == org.as_str()
+    });
+    drop(node);
+    let node = agent.up(&[]);
+    assert_eq!(node.ready["org"], org.as_str(), "{}", node.ready);
+    drop(node);
+
+    // Offline: the departure is recorded directly, and holds at the next start.
+    let offline = agent.json(&["org", "leave"]);
+    assert_eq!(offline["runtime"], "not running", "{offline}");
+    assert_eq!(offline["newly_left"], true, "{offline}");
+    let node = agent.up(&[]);
+    assert_eq!(node.ready["org_state"]["state"], "left", "{}", node.ready);
+    drop(node);
+}

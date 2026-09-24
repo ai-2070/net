@@ -190,6 +190,8 @@ pub(crate) fn adopt_org_membership(
         None => NodeAuthority::adopt(&dir, cert, entity, ORG_ADOPT_SKEW_SECS, None),
     }
     .map_err(|e| e.to_string())?;
+    // A fresh, authorized adoption is the rejoin; it ends a recorded leave.
+    clear_org_left(&dir);
     Ok(serde_json::json!({
         "org": hex::encode(org.0),
         "generation": generation,
@@ -197,6 +199,49 @@ pub(crate) fn adopt_org_membership(
         "adopted": true,
         "audience": if audience.is_some() { "org" } else { "node-local (no private discovery with other members)" },
     }))
+}
+
+/// The durable record that this node LEFT its org (`org leave`), kept beside
+/// the authority directory (`<authority>.left`) so the authority files —
+/// revocation floors included — stay intact for a later authorized rejoin.
+pub(crate) fn org_left_marker(authority_dir: &Path) -> PathBuf {
+    authority_dir.with_extension("left")
+}
+
+/// The recorded departure, if this node left its org.
+pub(crate) fn read_org_left(authority_dir: &Path) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(org_left_marker(authority_dir)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Record the departure durably (written, synced, renamed into place).
+fn record_org_left(authority_dir: &Path, org: &str, at: u64) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = org_left_marker(authority_dir);
+    let tmp = path.with_extension("left-tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(
+            serde_json::json!({ "org": org, "left_at": at })
+                .to_string()
+                .as_bytes(),
+        )?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)
+}
+
+/// A fresh, authorized adoption ends a recorded departure.
+pub(crate) fn clear_org_left(authority_dir: &Path) {
+    let _ = std::fs::remove_file(org_left_marker(authority_dir));
+}
+
+/// The org an authority directory's membership names (hex), read from its
+/// membership file without loading the authority.
+fn owner_org_on_disk(authority_dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(authority_dir.join("owner-membership.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v["owner_org"].as_str().map(str::to_string)
 }
 
 /// Pending standalone org links, as stored under `<state>/orgs-pending`.
@@ -1457,6 +1502,62 @@ async fn forward_floor_query(
     }
 }
 
+/// Control op `org_leave`: durably record that this node leaves its org, drop
+/// its pending links to that org, then stop the node so its next start runs
+/// on the mesh without the org. Nothing is sent to the org: the org still
+/// accepts this node's certificate until the operator runs `org remove`.
+async fn org_leave(state: &ControlState) -> serde_json::Value {
+    let dir = state.state_root.join(AUTHORITY_SUBDIR);
+    let installed = state
+        .node
+        .node_authority()
+        .map(|a| hex::encode(a.owner_org().0));
+    if let Some(left) = read_org_left(&dir) {
+        if installed.is_none() {
+            // Already left, and this runtime runs without the org.
+            return serde_json::json!({
+                "left": true,
+                "newly_left": false,
+                "org": left["org"],
+                "left_at": left["left_at"],
+                "stopping": false,
+                "incarnation": state.report.incarnation,
+            });
+        }
+    }
+    let Some(org) = installed.or_else(|| owner_org_on_disk(&dir)) else {
+        return serde_json::json!({ "error": "this node is not an org member; nothing to leave" });
+    };
+    let now = now_unix();
+    let (d, o) = (dir.clone(), org.clone());
+    let recorded = tokio::task::spawn_blocking(move || record_org_left(&d, &o, now))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()));
+    if let Err(e) = recorded {
+        return serde_json::json!({ "error": format!("the departure was not recorded: {e}") });
+    }
+    // A pending link to the org just left must not complete later.
+    let pending_dir = state.state_root.join(ORGS_PENDING_SUBDIR);
+    state.pending_orgs.lock().retain(|(key, invite)| {
+        let same = invite.org().is_some_and(|o| hex::encode(o.org.0) == org);
+        if same {
+            let _ = std::fs::remove_file(pending_dir.join(key));
+        }
+        !same
+    });
+    // Recorded durably; stop this runtime so nothing keeps acting as a member.
+    state.draining.store(true, Ordering::SeqCst);
+    serde_json::json!({
+        "left": true,
+        "newly_left": true,
+        "org": org,
+        "left_at": now,
+        "stopping": true,
+        "incarnation": state.report.incarnation,
+    })
+}
+
 /// Control op `org_join`: redeem a standalone org link over this joined
 /// node's session with the node it enrolled with. Pending until the operator
 /// approves (the link is kept, and the link supervisor asks again); once
@@ -1842,6 +1943,8 @@ async fn control_session(
             state.draining.store(true, Ordering::SeqCst);
             serde_json::json!({ "accepted": true, "incarnation": state.report.incarnation })
         }
+        "org_leave" if draining => serde_json::json!({ "error": "node is draining" }),
+        "org_leave" => org_leave(state).await,
         "org_join" if draining => serde_json::json!({ "error": "node is draining" }),
         "org_join" => org_join(state, &request).await,
         "subnet_join" if draining => serde_json::json!({ "error": "node is draining" }),
@@ -1898,7 +2001,10 @@ async fn control_session(
         serde_json::to_vec(&reply).map_err(std::io::Error::other)?,
     );
     write_msg(&mut s, &keys, FROM_NODE, 0, bytes.as_slice()).await?;
-    if op == "shutdown" || (op == "leave" && reply["left"] == serde_json::Value::Bool(true)) {
+    if op == "shutdown"
+        || (op == "leave" && reply["left"] == serde_json::Value::Bool(true))
+        || (op == "org_leave" && reply["stopping"] == serde_json::Value::Bool(true))
+    {
         let _ = stop.try_send(());
     }
     Ok(())
@@ -2204,7 +2310,20 @@ pub async fn run_up(
     // A membership that has ENDED (revoked by a floor, or expired) leaves the
     // node running without it — removal from an org is not removal from the
     // mesh. Anything else wrong with the directory fails closed.
-    let (org_owner, org_ended) = if authority_dir.exists() {
+    let left = read_org_left(&authority_dir);
+    let (org_owner, org_ended) = if let Some(left) = &left {
+        (
+            None,
+            Some((
+                "left",
+                format!(
+                    "left org {} at unix {}; a new approved org link rejoins",
+                    left["org"].as_str().unwrap_or("?"),
+                    left["left_at"].as_u64().unwrap_or(0)
+                ),
+            )),
+        )
+    } else if authority_dir.exists() {
         use net::adapter::net::behavior::org_authority::OrgAuthorityError;
         match mesh.install_org_authority(&authority_dir) {
             Ok(()) => (
@@ -2651,6 +2770,101 @@ pub async fn run_down(
 /// the departure through its own control endpoint (it owns the join state) and
 /// then stops; otherwise the join state is opened and updated directly. The
 /// device identity is kept; the delivered PSK and contact are erased.
+/// `net-mesh org leave`: record that this device leaves its org and stop its
+/// running node (its next `up` runs on the mesh without the org). Offline,
+/// the departure is recorded directly.
+pub async fn run_org_leave(
+    state_dir_arg: Option<PathBuf>,
+    wait: Duration,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let state = state_dir(state_dir_arg, profile_name)?;
+    let authority = state.join(AUTHORITY_SUBDIR);
+    let dir = state.join(NODE_SUBDIR);
+    let (org, newly, left_at, runtime, incarnation) = if probe(&dir)? == Liveness::Held {
+        let (control, reply) = control_call(&dir, serde_json::json!({ "op": "org_leave" }))
+            .await
+            .map_err(|e| {
+                connection_failure(format!(
+                    "the node holds its lifetime lock but its control endpoint failed ({e:?}); nothing was changed"
+                ))
+            })?;
+        if let Some(err) = reply["error"].as_str() {
+            return Err(generic(err.to_string()));
+        }
+        if reply["left"] != serde_json::Value::Bool(true)
+            || reply["incarnation"].as_str() != Some(control.incarnation.as_str())
+        {
+            return Err(generic(
+                "the node did not confirm the departure for the recorded incarnation",
+            ));
+        }
+        let runtime = if reply["stopping"] == serde_json::Value::Bool(true) {
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                if probe(&dir)? != Liveness::Held {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(timeout(format!(
+                        "the departure is recorded, but node incarnation {} still holds its lifetime lock after {wait:?}; runtime stop unconfirmed",
+                        control.incarnation
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            "stopped"
+        } else {
+            "unchanged (already running without the org)"
+        };
+        (
+            reply["org"].as_str().unwrap_or_default().to_string(),
+            reply["newly_left"].as_bool().unwrap_or(false),
+            reply["left_at"].as_u64(),
+            runtime,
+            Some(control.incarnation),
+        )
+    } else {
+        let a = authority.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            if let Some(left) = read_org_left(&a) {
+                return Ok((
+                    left["org"].as_str().unwrap_or_default().to_string(),
+                    false,
+                    left["left_at"].as_u64(),
+                ));
+            }
+            let org = owner_org_on_disk(&a)
+                .ok_or_else(|| "this device is not an org member; nothing to leave".to_string())?;
+            let now = now_unix();
+            record_org_left(&a, &org, now)
+                .map_err(|e| format!("the departure was not recorded: {e}"))?;
+            Ok::<_, String>((org, true, Some(now)))
+        })
+        .await
+        .map_err(|e| generic(format!("org leave task failed: {e}")))?
+        .map_err(generic)?;
+        (recorded.0, recorded.1, recorded.2, "not running", None)
+    };
+    emit_value(
+        OutputFormat::resolve_oneshot(output),
+        &serde_json::json!({
+            "state": "left",
+            "org": org,
+            "newly_left": newly,
+            "left_at": left_at,
+            "runtime": runtime,
+            "incarnation": incarnation,
+            // What this command does not do, stated rather than implied.
+            "mesh": "unaffected: `net-mesh up` runs on the mesh without the org",
+            "authority": "not notified: the org still accepts this device's certificate until the operator runs `org remove`",
+            "rejoin": "a new link approved with the org root (`org join`)",
+        }),
+    )
+    .map_err(|e| generic(format!("write result: {e}")))
+}
+
 pub async fn run_leave(
     args: LeaveArgs,
     output: Option<OutputFormat>,

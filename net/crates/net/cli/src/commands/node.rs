@@ -280,6 +280,8 @@ async fn run_adopt(
         ),
     }
     .map_err(|e| sdk(format!("adopt refused: {e}")))?;
+    // An explicit, authorized adoption ends a recorded `org leave`.
+    super::lifecycle::clear_org_left(&dir);
 
     let summary = AdoptOutput {
         authority_dir: dir.display().to_string(),
