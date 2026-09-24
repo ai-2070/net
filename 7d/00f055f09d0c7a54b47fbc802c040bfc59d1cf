@@ -1,0 +1,14 @@
+net/crates/net/leaf/src/wasm_witnesses.rs
+  h_64425bc75e3f3d 102-111,114,164-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7d00f055f09d0c7a54b47fbc802c040bfc59d1cf",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
