@@ -3780,6 +3780,37 @@ E16 coverage from this receipt:
 Subscriber receipt of the published payload is not requested by this
 fixture.
 
+**W3 receipt: public instructions (2026-09-24).**
+- **`cli/tests/fixtures/enrollment/README.md`.** The
+  operator/joiner/provider walkthrough, in the harness's own command order.
+  It covers:
+  - terminal ownership;
+  - offline authority;
+  - the operator node;
+  - composed join links;
+  - publishing through the device's own gate;
+  - selective removal;
+  - the enrolled tool call;
+  - leave, restart and cleanup.
+
+  It spells out credential installation versus live
+  subscribe/publish evidence, local leave versus revocation, the hub
+  invocation limit, and loopback-only evidence.
+- **`cli/README.md`.** A "Managed nodes, join links and leave" section,
+  with the command-table rows added or updated (`up`/`down`, `invite`,
+  `join`/`leave`, `enrollment`, `relay`, `org`, `node`, `subnet`,
+  `channel`, `wrap`/`mcp --joined`).
+- **`cli/CHANGELOG.md`.** An "Unreleased — managed nodes, join links,
+  relations and leave" entry.
+- **Web CLI reference.** A matching section and command table.
+- **Top-level help.** The stale help strings for `org`, `node`, `subnet`
+  and `channel` now describe their current verbs.
+
+Every flag named in these docs was checked against the binary's `--help`.
+Checks:
+- `npm run check` (web): 180 docs, links, release sync and types all pass;
+- CLI `readme_commands` + `help` + `help_is_self_contained`: 10/10.
+
 ## 8. Cumulative acceptance matrix
 
 All rows are required unless explicitly marked feature-conditional; narrow slices can be accepted independently without calling the entire plan complete.

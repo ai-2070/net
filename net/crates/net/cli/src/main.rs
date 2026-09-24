@@ -200,24 +200,26 @@ enum Command {
     /// NetDB local KV adapters (Cortex-backed tasks + memories).
     #[command(subcommand)]
     Netdb(commands::netdb::NetdbCommand),
-    /// Organization root authority authoring (keygen / issue-cert
-    /// / issue-floors) — OA-1.
+    /// Organization authority: offline root tools, org links (invite /
+    /// approve / join), removal, leave and member standing.
     #[command(subcommand)]
     Org(commands::org::OrgCommand),
-    /// Node ownership provisioning (`adopt`) — OA-1.
+    /// This profile's running node (`status`) and org ownership (`adopt`).
     #[command(subcommand)]
     Node(commands::node::NodeCommand),
     /// Browser-facing anchor surface: bootstrap credentials
     /// (plan §5 Layer 0, Stage 4b).
     #[command(subcommand)]
     Anchor(commands::anchor::AnchorCommand),
-    /// Temporary topology reads (--local) or offline subnet authority tools.
+    /// Subnet authority: offline issuance, subnet links (invite / join),
+    /// removal, leave and members; temporary topology reads (--local).
     #[command(subcommand)]
     Subnet(commands::subnet::SubnetCommand),
     /// Temporary gateway reads (--local); export is unsupported.
     #[command(subcommand)]
     Gateway(commands::gateway::GatewayCommand),
-    /// Temporary channel registry reads (--local).
+    /// Channel credentials: offline grants, serving, status, publish and
+    /// leave on the running node; temporary registry reads (--local).
     #[command(subcommand)]
     Channel(commands::channel::ChannelCommand),
     /// Temporary inspection (--local) or explicitly targeted aggregator RPC.

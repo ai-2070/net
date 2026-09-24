@@ -39,6 +39,48 @@ ICE script migration: replace `jq -s '.[1].commit_id'` with `jq '.commit.commit_
 
 `--no-color` is global. `$NO_COLOR` is honored per [the convention](https://no-color.org): color is disabled when the variable is **present and non-empty**, whatever its value — `NO_COLOR=1`, `NO_COLOR=x`, and `NO_COLOR=false` all disable it, and only absent or empty leaves it on.
 
+## Managed nodes, join links and leave
+
+`up` runs one long-lived node per profile in the foreground, and `down`
+drains and stops exactly that node. `node status` reports it, verified
+through its lifetime lock and authenticated control endpoint. The mesh PSK
+is generated and kept on first start, or supplied with `--psk-from
+file:<path>` or `stdin`, never on the command line.
+
+With `up --enroll` the node hands out `netmesh-join_` links (bearer secrets
+unless bound with `--for`). A clean device runs `join <token>` and then
+`up`. It attaches direct first and falls back to a relay started with
+`relay serve`.
+
+| Command | What it does |
+|---|---|
+| `invite create [--subnet <path>] [--org <org>] [--channel <name> --channel-rights <rights>]` | One link carrying mesh membership plus each named relation, each authorized on its own. |
+| `invite inspect / status / revoke / approve / deny` | Offline inspection; the ledger view; operator decisions for `--require-approval` links. |
+| `join <token>` / `leave` | Redeem and install a link; leave the whole mesh (local and durable, not revocation). |
+| `subnet invite / join / leave / remove / members` | Standalone subnet links; leave one relation; remove one subject (per-verifier attestations); issued vs observed members. |
+| `org invite / approve / join / leave / remove / members` | Org links (always approved with the offline org root); leave; remove one member; member standing. |
+| `channel issue-grant` | Offline: the channel root delegates publish/subscribe on one channel to the enrolling node (`up --channel-grant`). |
+| `channel serve / status / publish / leave` | Gate a channel on the running node; credential state, subscribe ACK and publish readiness; one publish through the node's own gate; leave the channel relation. |
+| `wrap --joined <dir>` / `mcp serve --joined <dir>` | Run a provider or consumer as the enrolled device. `up` must be stopped. An explicit `--node-addr/--node-pubkey/--node-id` names the peer. |
+
+Every root stays offline:
+- `subnet issue-issuer` and `channel issue-grant` delegate bounded issuance
+  to the node;
+- `org approve` signs memberships;
+- `subnet remove` and `org remove` sign floors.
+
+What the reports mean:
+- Admission, subscription and publish are reported from the live session
+  and the node's own gate, not implied by holding credentials. The node
+  re-establishes admission and subscription after every reconnect.
+- Removal is reported per named node from its own signed attestation.
+- Leaving is recorded first and survives restart. It is not revocation.
+
+The runnable three-participant
+[enrollment journey](https://github.com/ai-2070/net/blob/master/net/crates/net/cli/tests/fixtures/enrollment/README.md)
+lists every command in order. It is one machine on loopback, not off-host or
+NAT evidence.
+
 ## `net-mesh aggregator ls`
 
 ```sh
