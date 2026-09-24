@@ -128,6 +128,21 @@ pub(crate) fn read_left(state_root: &Path) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Record the join relation's channel departure (see [`read_left`]):
+/// `Some(prior)` if it was already recorded.
+pub(crate) fn record_join_left(
+    state_root: &Path,
+    channel: &str,
+    at: u64,
+) -> Result<Option<u64>, String> {
+    if let Some(prior) = read_left(state_root) {
+        return Ok(Some(prior["left_at"].as_u64().unwrap_or(0)));
+    }
+    record_left(state_root, channel, at)
+        .map(|()| None)
+        .map_err(|e| e.to_string())
+}
+
 fn record_left(state_root: &Path, channel: &str, at: u64) -> std::io::Result<()> {
     use std::io::Write as _;
     let path = state_root.join(CHANNEL_LEFT_FILE);
@@ -318,21 +333,25 @@ pub(crate) fn lost_session(track: &mut ChannelTrack, link: &SharedChannel) {
 
 /// Control op `channel_leave`: record the departure durably, then stop both
 /// uses of the credential and report what was confirmed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn leave(
     node: &MeshNode,
-    state_root: &Path,
     cred: &ChannelCred,
     publisher: u64,
     left: &AtomicBool,
     link: &SharedChannel,
     wait: Duration,
+    record: impl FnOnce(u64) -> Result<Option<u64>, String>,
 ) -> Value {
-    if let Some(prior) = read_left(state_root) {
-        return json!({ "left": true, "newly_left": false, "left_at": prior["left_at"] });
-    }
     let at = now_unix();
-    if let Err(e) = record_left(state_root, cred.offer.channel.as_str(), at) {
-        return json!({ "error": format!("the departure was not recorded: {e}") });
+    // The durable owner records the departure first: `Some(prior)` when it
+    // had already been recorded (idempotent), `None` when recorded now.
+    match record(at) {
+        Ok(Some(prior)) => {
+            return json!({ "left": true, "newly_left": false, "left_at": prior });
+        }
+        Ok(None) => {}
+        Err(e) => return json!({ "error": format!("the departure was not recorded: {e}") }),
     }
     left.store(true, Ordering::SeqCst);
     let mut reply = json!({

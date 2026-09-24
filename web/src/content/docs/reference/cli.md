@@ -60,6 +60,7 @@ unless bound with `--for`). A clean device runs `join <token>` and then
 | `subnet invite / join / leave / remove / members` | Standalone subnet links; leave one relation; remove one subject (per-verifier attestations); issued vs observed members. |
 | `org invite / approve / join / leave / remove / members` | Org links (always approved with the offline org root); leave; remove one member; member standing. |
 | `channel issue-grant` | Offline: the channel root delegates publish/subscribe on one channel to the enrolling node (`up --channel-grant`). |
+| `channel invite / join` | Standalone channel links for a device already on the mesh (one active credential per channel; a rejoin takes a fresh link). |
 | `channel serve / status / publish / leave` | Gate a channel on the running node; credential state, subscribe ACK and publish readiness; one publish through the node's own gate; leave the channel relation. |
 | `wrap --joined <dir>` / `mcp serve --joined <dir>` | Run a provider or consumer as the enrolled device. `up` must be stopped. An explicit `--node-addr/--node-pubkey/--node-id` names the peer. |
 

@@ -144,7 +144,15 @@ fn the_channel_offer_is_signed_canonical_and_must_match_its_relation() {
     };
     assert!(refused(vec![Relation::Mesh, Relation::Channel], None));
     assert!(refused(vec![Relation::Mesh], Some(o.clone())));
-    assert!(refused(vec![Relation::Channel], Some(o.clone())));
+    // A channel relation alone is the standalone form (for a device already
+    // on the mesh); with anything but mesh membership it is refused.
+    assert!(
+        MembershipInvite::sign(&operator, spec(vec![Relation::Channel], Some(o.clone()))).is_ok()
+    );
+    assert!(refused(
+        vec![Relation::Subnet, Relation::Channel],
+        Some(o.clone())
+    ));
     for bad in [
         TokenScope::NONE,
         TokenScope::ADMIN,
@@ -365,4 +373,124 @@ fn names_sharing_a_wire_hint_never_stand_in_for_each_other() {
         .unwrap()
         .verify_for(&invite, &intent)
         .unwrap();
+}
+
+/// V3 S3: a standalone channel link (channel relation only) is redeemed over
+/// the device's existing session. The chain goes only to the entity the
+/// session proved, for exactly the offer; a retry by the same device gets back
+/// the COMMITTED chain (byte-identical, never re-minted); another device gets
+/// nothing; and the device's membership store refuses any chain after leave.
+#[test]
+fn a_standalone_channel_link_issues_one_chain_and_recovers_it_exactly() {
+    use net_sdk::enrollment::service::SharedLedger;
+    use net_sdk::enrollment::standalone::{
+        answer_standalone_redeem, is_standalone_channel, ChannelMembership, SubnetRedeemReply,
+        SubnetRedeemRequest,
+    };
+    use net_sdk::enrollment::store::{EnrollmentLedger, LedgerLimits};
+
+    const NODE: u64 = 0x0C4A_0001;
+    let operator = Identity::generate();
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger: SharedLedger = std::sync::Arc::new(parking_lot::Mutex::new(
+        EnrollmentLedger::create(
+            &tmp.path().join("ledger"),
+            operator.entity_id().clone(),
+            LedgerLimits::default(),
+        )
+        .unwrap(),
+    ));
+    let link = MembershipInvite::sign(
+        &operator,
+        spec(
+            vec![Relation::Channel],
+            Some(offer(CHANNEL, TokenScope::SUBSCRIBE)),
+        ),
+    )
+    .unwrap();
+    assert!(is_standalone_channel(&link));
+    ledger.lock().offer(link.offer_spec(), now()).unwrap();
+    let issuers = vec![leaf_issuer(&operator, CHANNEL, TokenScope::SUBSCRIBE)];
+    let device = Identity::generate();
+    let answer = |who: &Identity, proven: &Identity| {
+        answer_standalone_redeem(
+            &SubnetRedeemRequest::sign(who, &link, NODE, now())
+                .unwrap()
+                .to_bytes(),
+            Some(proven.entity_id()),
+            NODE,
+            &ledger,
+            None,
+            None,
+            &issuers,
+            now(),
+        )
+    };
+
+    let first = answer(&device, &device).unwrap();
+    let chain = first.channel_chain().expect("a channel chain");
+    assert!(net_sdk::enrollment::bundle::channel_chain_matches(
+        link.channel().unwrap(),
+        device.entity_id(),
+        &chain
+    ));
+    // Lost reply: the same device gets exactly the committed bytes back.
+    std::thread::sleep(Duration::from_millis(1100));
+    let again = answer(&device, &device).unwrap();
+    assert_eq!(again, first, "recovered, not re-minted");
+    // Another device, even over its own proven session, gets nothing.
+    let other = Identity::generate();
+    assert_eq!(answer(&other, &other), Err(Refusal::Conflict));
+    // The session must have proven the requesting device.
+    assert_eq!(answer(&device, &other), Err(Refusal::Conflict));
+    // No grant for the channel at this node: the link cannot be honoured.
+    let late = MembershipInvite::sign(
+        &operator,
+        spec(
+            vec![Relation::Channel],
+            Some(offer("fleet.other", TokenScope::SUBSCRIBE)),
+        ),
+    )
+    .unwrap();
+    ledger.lock().offer(late.offer_spec(), now()).unwrap();
+    assert_eq!(
+        answer_standalone_redeem(
+            &SubnetRedeemRequest::sign(&device, &late, NODE, now())
+                .unwrap()
+                .to_bytes(),
+            Some(device.entity_id()),
+            NODE,
+            &ledger,
+            None,
+            None,
+            &issuers,
+            now(),
+        ),
+        Err(Refusal::Unavailable)
+    );
+    assert!(matches!(
+        SubnetRedeemReply::from_bytes(&first.to_bytes()),
+        Ok(SubnetRedeemReply::ChannelIssued(_))
+    ));
+
+    // Device side: the store installs only the offered chain for itself, and
+    // after leave it installs nothing again (a delayed delivery cannot
+    // reinstate the departed incarnation).
+    let dir = tmp.path().join("membership");
+    let mut membership =
+        ChannelMembership::begin(&dir, &link, device.entity_id().clone(), NODE).unwrap();
+    let foreign = issuers[0]
+        .issue(other.entity_id(), TokenScope::SUBSCRIBE)
+        .unwrap();
+    assert!(membership.install(&foreign).is_err());
+    membership.install(&chain).unwrap();
+    drop(membership);
+    let mut membership = ChannelMembership::open(&dir).unwrap();
+    assert!(membership.chain().is_some(), "survives reopen");
+    assert!(membership.leave(now()).unwrap());
+    assert!(!membership.leave(now()).unwrap(), "idempotent");
+    assert!(membership.install(&chain).is_err(), "fenced after leave");
+    drop(membership);
+    let reopened = ChannelMembership::open(&dir).unwrap();
+    assert!(reopened.chain().is_none() && reopened.left_at().is_some());
 }

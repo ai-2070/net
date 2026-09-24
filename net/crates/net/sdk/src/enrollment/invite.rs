@@ -128,8 +128,8 @@ pub enum Relation {
     /// Publish and/or subscribe on one canonical channel, named by the
     /// invite's signed [`ChannelOffer`], delivered as a token chain
     /// `root → issuing node → device` minted for this device only. In v1 it
-    /// rides with [`Relation::Mesh`] (the device needs the mesh to use it),
-    /// and a subscribe right names the issuing node as the publisher.
+    /// rides with [`Relation::Mesh`], or stands alone for a device already on
+    /// the mesh; a subscribe right names the issuing node as the publisher.
     Channel,
 }
 
@@ -497,7 +497,8 @@ fn take_channel_offer(r: &mut Reader<'_>) -> Result<Option<ChannelOffer>, Invite
 }
 
 /// A channel offer exists exactly when the relation set names
-/// [`Relation::Channel`]; in v1 it rides with [`Relation::Mesh`], and its
+/// [`Relation::Channel`]. It rides with [`Relation::Mesh`], or stands alone
+/// (a standalone channel link, for a device already on the mesh); its
 /// rights are publish and/or subscribe only.
 fn check_channel_offer(
     relations: &[Relation],
@@ -509,9 +510,9 @@ fn check_channel_offer(
             "channel relation and offer disagree",
         ));
     }
-    if channel && !relations.contains(&Relation::Mesh) {
+    if channel && !relations.contains(&Relation::Mesh) && relations != [Relation::Channel] {
         return Err(InviteError::Relations(
-            "a channel relation rides with mesh membership",
+            "a channel relation rides with mesh membership or stands alone",
         ));
     }
     if offer.is_some_and(|o| !ChannelOffer::rights_are_channel_link(o.rights)) {

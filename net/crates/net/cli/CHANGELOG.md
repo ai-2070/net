@@ -34,7 +34,9 @@ and output shape.
 
 **Channels**
 - New `channel serve` (persisted gating), `channel status`,
-  `channel publish` and `channel leave`.
+  `channel publish` and `channel leave [<name>]`.
+- New `channel invite` / `channel join`: add a channel to an already-joined
+  device with a standalone link.
 - Subscription and publish readiness are reported from the live session and
   the node's own gate, never implied by holding a credential.
 
@@ -44,6 +46,8 @@ and output shape.
     `complete` holds only when all of them persisted it.
   - Members are listed as "issued" versus "observed here", never a global
     roster.
+- One active subnet attachment per verifier. `subnet join --switch` and
+  `subnet activate <scope>` switch it explicitly.
 - New `subnet leave`, `org leave` and `channel leave`. Each is local and
   durable, and survives restart. None of them revokes.
 

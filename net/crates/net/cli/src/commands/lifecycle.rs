@@ -90,6 +90,8 @@ const CHANNEL_UNSUBSCRIBE_WAIT: Duration = Duration::from_secs(3);
 /// The durable record that this device left its join's own subnet relation
 /// (under the state root); the mesh membership is untouched.
 const SUBNET_LEFT_FILE: &str = "subnet.left";
+/// Bound on a standalone channel join's first subscribe.
+const CHANNEL_JOIN_WAIT: Duration = Duration::from_secs(10);
 /// How long `subnet activate` waits for the supervisor's verdict.
 const SUBNET_ACTIVATE_WAIT: Duration = Duration::from_secs(15);
 /// Bound on one subnet leaf renewal exchange.
@@ -178,7 +180,39 @@ struct JoinedChannel {
     left: Arc<AtomicBool>,
     /// The publisher (the node the device enrolled with).
     publisher: u64,
+    /// Which durable store owns this credential.
+    source: ChannelSource,
+    /// The session the start subscribe was ACKed on, if any.
+    initial_on: Option<u64>,
 }
+
+/// Where a channel credential came from, and so who records its departure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ChannelSource {
+    /// The join's own channel relation (`<state>/channel.left`).
+    Join,
+    /// A standalone channel membership (`<state>/channels/<key>`).
+    Standalone(String),
+}
+
+impl JoinedChannel {
+    /// A stable key for this incarnation (a rejoin is a new membership, so a
+    /// new key: delayed work for the old one never lands on the new one).
+    fn id(&self) -> String {
+        match &self.source {
+            ChannelSource::Join => "join".to_string(),
+            ChannelSource::Standalone(key) => key.clone(),
+        }
+    }
+}
+
+/// Every channel credential this device holds, live and left.
+type SharedChannels = Arc<parking_lot::Mutex<Vec<JoinedChannel>>>;
+/// The standalone channel memberships and where they live.
+type SharedChannelMemberships =
+    Arc<parking_lot::Mutex<Vec<net_sdk::enrollment::standalone::ChannelMembership>>>;
+/// Directory (under the state root) holding standalone channel memberships.
+const CHANNELS_SUBDIR: &str = "channels";
 type SharedMemberships =
     Arc<parking_lot::Mutex<Vec<net_sdk::enrollment::standalone::SubnetMembership>>>;
 
@@ -515,6 +549,314 @@ async fn subnet_activate(state: &ControlState, request: &serde_json::Value) -> s
     })
 }
 
+/// A standalone channel membership's directory name: a one-way digest of
+/// the signed link (the invitation id itself is treated as sensitive).
+fn channel_membership_key(invite: &net_sdk::enrollment::invite::MembershipInvite) -> String {
+    let key = blake3::derive_key(
+        "net-mesh standalone channel membership dir v1",
+        &invite.digest(),
+    );
+    hex::encode(&key[..12])
+}
+
+/// Open every stored standalone channel membership (fail closed on a
+/// corrupt one).
+fn load_channel_memberships(
+    dir: &Path,
+) -> Result<Vec<net_sdk::enrollment::standalone::ChannelMembership>, CliError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(generic(format!(
+                "channel memberships {}: {e}",
+                dir.display()
+            )))
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| generic(format!("channel memberships {}: {e}", dir.display())))?
+            .path();
+        if !path.is_dir() {
+            continue;
+        }
+        out.push(
+            net_sdk::enrollment::standalone::ChannelMembership::open(&path)
+                .map_err(|e| generic(format!("channel membership {}: {e}", path.display())))?,
+        );
+    }
+    Ok(out)
+}
+
+/// The join's own channel relation, as status reports it.
+fn joined_channel_link(state: &ControlState) -> Option<super::channel_link::ChannelLink> {
+    state
+        .channels
+        .lock()
+        .iter()
+        .find(|c| c.source == ChannelSource::Join)
+        .map(|c| c.link.lock().clone())
+}
+
+/// The standalone channel memberships, as status reports them.
+fn standalone_channel_links(state: &ControlState) -> Vec<super::channel_link::ChannelLink> {
+    state
+        .channels
+        .lock()
+        .iter()
+        .filter(|c| c.source != ChannelSource::Join)
+        .map(|c| c.link.lock().clone())
+        .collect()
+}
+
+/// Control op `channel_leave`: leave one channel relation — named, or the
+/// only active one. The durable owner records it first (the join's marker,
+/// or the membership store, which then refuses any later install).
+async fn channel_leave(state: &ControlState, request: &serde_json::Value) -> serde_json::Value {
+    let wanted = request["channel"].as_str();
+    let active: Vec<JoinedChannel> = state
+        .channels
+        .lock()
+        .iter()
+        .filter(|c| !c.left.load(Ordering::SeqCst))
+        .filter(|c| wanted.is_none_or(|w| c.cred.offer.channel.as_str() == w))
+        .cloned()
+        .collect();
+    let target = match active.as_slice() {
+        [one] => one.clone(),
+        [] => {
+            // Nothing active: a repeat of a completed leave is idempotent.
+            let prior = state
+                .channels
+                .lock()
+                .iter()
+                .find(|c| wanted.is_none_or(|w| c.cred.offer.channel.as_str() == w))
+                .cloned();
+            return match prior {
+                Some(c) => {
+                    let mut reply = serde_json::json!({
+                        "left": true,
+                        "newly_left": false,
+                        "channel": c.cred.offer.channel.as_str(),
+                    });
+                    if c.source == ChannelSource::Join {
+                        reply["left_at"] = super::channel_link::read_left(&state.state_root)
+                            .map(|v| v["left_at"].clone())
+                            .unwrap_or_default();
+                    }
+                    reply
+                }
+                None => serde_json::json!({
+                    "error": "this node holds no channel credential to leave"
+                }),
+            };
+        }
+        _ => {
+            return serde_json::json!({
+                "error": "several channel relations are active; name one (`channel leave <name>`)"
+            })
+        }
+    };
+    let (root, memberships) = (state.state_root.clone(), state.channel_memberships.clone());
+    let channel = target.cred.offer.channel.as_str().to_string();
+    let source = target.source.clone();
+    let record = move |at: u64| -> Result<Option<u64>, String> {
+        match source {
+            ChannelSource::Join => super::channel_link::record_join_left(&root, &channel, at),
+            ChannelSource::Standalone(key) => {
+                let mut ms = memberships.lock();
+                let m = ms
+                    .iter_mut()
+                    .find(|m| channel_membership_key(m.invite()) == key)
+                    .ok_or("the membership store is gone")?;
+                match m.leave(at) {
+                    Ok(true) => Ok(None),
+                    Ok(false) => Ok(Some(m.left_at().unwrap_or(at))),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        }
+    };
+    super::channel_link::leave(
+        &state.node,
+        &target.cred,
+        target.publisher,
+        &target.left,
+        &target.link,
+        CHANNEL_UNSUBSCRIBE_WAIT,
+        record,
+    )
+    .await
+}
+
+/// Control op `channel_join`: redeem a standalone channel link over this
+/// device's session with the node it enrolled with, install the chain in a
+/// new membership store, and start using it (subscribe / install publish).
+/// One active credential per channel: a second is refused until the active
+/// one is left, and a rejoin after leave is a new link and a new
+/// incarnation.
+async fn channel_join(state: &ControlState, request: &serde_json::Value) -> serde_json::Value {
+    use net_sdk::enrollment::standalone::{
+        is_standalone_channel, request_subnet_redeem, ChannelMembership, SubnetRedeemReply,
+    };
+    let error = |m: String| serde_json::json!({ "error": m });
+    let Some(join) = &state.joined else {
+        return error(
+            "this node did not join a mesh: a standalone channel link extends an existing \
+             membership (run `net-mesh join` first)"
+                .to_string(),
+        );
+    };
+    let Some(token) = request["token"].as_str() else {
+        return error("malformed channel_join request".to_string());
+    };
+    let invite = match net_sdk::enrollment::invite::MembershipInvite::decode(token) {
+        Ok(invite) => invite,
+        Err(e) => return error(format!("invalid link: {e}")),
+    };
+    if !is_standalone_channel(&invite) {
+        return error(
+            "not a standalone channel link (a mesh invite is redeemed with `net-mesh join`)"
+                .to_string(),
+        );
+    }
+    let Some(offer) = invite.channel().cloned() else {
+        return error("not a standalone channel link".to_string());
+    };
+    let joined = join.lock().as_ref().and_then(|j| {
+        j.bundle().map(|b| {
+            (
+                j.identity().clone(),
+                j.invite().issuer().clone(),
+                b.contact().node_id,
+            )
+        })
+    });
+    let Some((identity, join_issuer, issuer_node)) = joined else {
+        return error("this node's join holds no credentials".to_string());
+    };
+    if invite.issuer() != &join_issuer {
+        return error(format!(
+            "this link was issued by {}, not by the node this device enrolled with; standalone \
+             links are redeemed only there",
+            invite.issuer_fingerprint()
+        ));
+    }
+    let key = channel_membership_key(&invite);
+    let already = state.channels.lock().iter().any(|c| {
+        !c.left.load(Ordering::SeqCst)
+            && c.cred.offer.channel == offer.channel
+            && c.source != ChannelSource::Standalone(key.clone())
+    });
+    if already {
+        return error(format!(
+            "this device already holds an active credential for {}; leave it first \
+             (`channel leave {}`)",
+            offer.channel.as_str(),
+            offer.channel.as_str()
+        ));
+    }
+    // Record the intent first (or resume an earlier attempt of this link).
+    let existing = state
+        .channel_memberships
+        .lock()
+        .iter()
+        .find(|m| channel_membership_key(m.invite()) == key)
+        .map(|m| (m.left_at(), m.chain().cloned()));
+    let installed = match existing {
+        Some((Some(at), _)) => {
+            return error(format!(
+                "this device left that channel membership at unix {at}; ask for a new link"
+            ))
+        }
+        Some((None, chain)) => chain,
+        None => {
+            let dir = state.channels_dir.join(&key);
+            let created = std::fs::create_dir_all(&state.channels_dir)
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    ChannelMembership::begin(
+                        &dir,
+                        &invite,
+                        identity.entity_id().clone(),
+                        issuer_node,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            match created {
+                Ok(m) => state.channel_memberships.lock().push(m),
+                Err(e) => return error(format!("channel membership {}: {e}", dir.display())),
+            }
+            None
+        }
+    };
+    let chain = match installed {
+        Some(chain) => chain,
+        None => match request_subnet_redeem(
+            &state.node,
+            issuer_node,
+            &identity,
+            &invite,
+            SUBNET_JOIN_REDEEM_WAIT,
+        )
+        .await
+        {
+            Ok(SubnetRedeemReply::PendingApproval) => {
+                return serde_json::json!({
+                    "state": "pending_approval",
+                    "channel": offer.channel.as_str(),
+                    "next": "the operator approves it with `invite approve`; then run `channel join` again",
+                })
+            }
+            Ok(reply @ SubnetRedeemReply::ChannelIssued(_)) => {
+                let Some(chain) = reply.channel_chain() else {
+                    return error("the node answered with a malformed chain".to_string());
+                };
+                let stored = state
+                    .channel_memberships
+                    .lock()
+                    .iter_mut()
+                    .find(|m| channel_membership_key(m.invite()) == key)
+                    .map(|m| m.install(&chain));
+                match stored {
+                    Some(Ok(())) => chain,
+                    Some(Err(e)) => return error(format!("chain not installed: {e}")),
+                    None => return error("node is draining".to_string()),
+                }
+            }
+            Ok(_) => return error("the node answered with another relation".to_string()),
+            Err(e) => return error(format!("redemption failed: {e}")),
+        },
+    };
+    let cred = super::channel_link::ChannelCred { offer, chain };
+    let link = super::channel_link::start(
+        &state.node,
+        &cred,
+        false,
+        Some(issuer_node),
+        CHANNEL_JOIN_WAIT,
+    )
+    .await;
+    let on = match link.subscribed {
+        Some(true) => state.node.peer_session_id(issuer_node),
+        _ => None,
+    };
+    let report = serde_json::to_value(&link).unwrap_or_default();
+    state.channels.lock().push(JoinedChannel {
+        cred,
+        link: Arc::new(parking_lot::Mutex::new(link)),
+        left: Arc::new(AtomicBool::new(false)),
+        publisher: issuer_node,
+        source: ChannelSource::Standalone(key),
+        initial_on: on,
+    });
+    let mut reply = report;
+    reply["device"] = serde_json::json!(hex::encode(identity.entity_id().as_bytes()));
+    reply
+}
+
 /// Pending standalone org links, as stored under `<state>/orgs-pending`.
 type PendingOrgs =
     Arc<parking_lot::Mutex<Vec<(String, net_sdk::enrollment::invite::MembershipInvite)>>>;
@@ -770,8 +1112,10 @@ async fn keep_standalone_admitted(
                     Ok(SubnetRedeemReply::PendingApproval) => {
                         entry.detail = Some("awaiting operator approval".to_string());
                     }
-                    Ok(SubnetRedeemReply::OrgIssued { .. }) => {
-                        entry.detail = Some("the node answered with an org membership".to_string());
+                    Ok(
+                        SubnetRedeemReply::OrgIssued { .. } | SubnetRedeemReply::ChannelIssued(_),
+                    ) => {
+                        entry.detail = Some("the node answered with another relation".to_string());
                     }
                     Err(e) => entry.detail = Some(e),
                 }
@@ -860,16 +1204,15 @@ fn spawn_joined_link(
     link: Arc<parking_lot::Mutex<JoinedLink>>,
     presented: Option<u64>,
     present_retry_at: u64,
-    channel: Option<(JoinedChannel, Option<u64>)>,
+    channels: SharedChannels,
     subnet_left: Arc<AtomicBool>,
     attachments: super::subnet_active::SharedAttachments,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = REATTACH_MIN;
-        let mut channel = channel.map(|(c, on)| {
-            let track = super::channel_link::ChannelTrack::new(on, c.left.clone());
-            (c, track)
-        });
+        // Per-incarnation tracks: a rejoined channel gets a fresh one.
+        let mut channel_tracks =
+            std::collections::HashMap::<String, super::channel_link::ChannelTrack>::new();
         let mut track = SubnetTrack {
             presented,
             present_retry_at,
@@ -922,7 +1265,10 @@ fn spawn_joined_link(
                         entry.admitted = None;
                     }
                 }
-                if let Some((c, track)) = channel.as_mut() {
+                for c in channels.lock().iter() {
+                    let track = channel_tracks.entry(c.id()).or_insert_with(|| {
+                        super::channel_link::ChannelTrack::new(c.initial_on, c.left.clone())
+                    });
                     super::channel_link::lost_session(track, &c.link);
                 }
                 match super::enrollment::attach_contact(&node, &contact, JOIN_ATTACH_WAIT).await {
@@ -1041,10 +1387,14 @@ fn spawn_joined_link(
                 &attachments,
             )
             .await;
-            if let Some((c, track)) = channel.as_mut() {
+            let held: Vec<JoinedChannel> = channels.lock().clone();
+            for c in held {
+                let track = channel_tracks.entry(c.id()).or_insert_with(|| {
+                    super::channel_link::ChannelTrack::new(c.initial_on, c.left.clone())
+                });
                 super::channel_link::keep(
                     &node,
-                    contact.node_id,
+                    c.publisher,
                     session,
                     &c.cred,
                     track,
@@ -1744,8 +2094,12 @@ struct ControlState {
     pending_orgs: PendingOrgs,
     /// This node's mesh, for operations that reach other nodes.
     node: Arc<net::adapter::net::MeshNode>,
-    /// A joined device's channel credential, when its join carried one.
-    channel: Option<JoinedChannel>,
+    /// A joined device's channel credentials: the join's own and standalone.
+    channels: SharedChannels,
+    /// The standalone channel memberships (durable owners of their leave).
+    channel_memberships: SharedChannelMemberships,
+    /// Where standalone channel memberships live.
+    channels_dir: PathBuf,
     /// Set once `subnet leave` recorded leaving the join's subnet relation.
     subnet_left: Arc<AtomicBool>,
     /// The active subnet attachment at each verifier.
@@ -2187,8 +2541,8 @@ async fn org_join(state: &ControlState, request: &serde_json::Value) -> serde_js
                 Err(e) => error(format!("the membership was issued but not adopted: {e}")),
             }
         }
-        Ok(SubnetRedeemReply::Issued(_)) => {
-            error("the node answered with subnet credentials".to_string())
+        Ok(SubnetRedeemReply::Issued(_) | SubnetRedeemReply::ChannelIssued(_)) => {
+            error("the node answered with another relation".to_string())
         }
         Err(e) => error(format!("redemption failed: {e}")),
     }
@@ -2226,8 +2580,8 @@ async fn keep_pending_orgs(
                 }
             }
             Ok(SubnetRedeemReply::PendingApproval) => {}
-            Ok(SubnetRedeemReply::Issued(_)) => {
-                link.lock().org_detail = Some("unexpected subnet credentials".to_string());
+            Ok(SubnetRedeemReply::Issued(_) | SubnetRedeemReply::ChannelIssued(_)) => {
+                link.lock().org_detail = Some("unexpected answer: another relation".to_string());
             }
             Err(e) => link.lock().org_detail = Some(e),
         }
@@ -2370,8 +2724,8 @@ async fn subnet_join(state: &ControlState, request: &serde_json::Value) -> serde
                     None => return error("node is draining".to_string()),
                 }
             }
-            Ok(SubnetRedeemReply::OrgIssued { .. }) => {
-                return error("the node answered with an org membership".to_string())
+            Ok(SubnetRedeemReply::OrgIssued { .. } | SubnetRedeemReply::ChannelIssued(_)) => {
+                return error("the node answered with another relation".to_string())
             }
             Err(e) => return error(format!("redemption failed: {e}")),
         },
@@ -2523,7 +2877,8 @@ async fn control_session(
                 "link": state.link.as_ref().map(|l| l.lock().clone()),
                 "org": state.node.node_authority().map(|a| hex::encode(a.owner_org().0)),
                 "org_pending": state.pending_orgs.lock().len(),
-                "channel": state.channel.as_ref().map(|c| c.link.lock().clone()),
+                "channel": joined_channel_link(state),
+                "channels": standalone_channel_links(state),
             })
         }
         "shutdown" => {
@@ -2539,35 +2894,24 @@ async fn control_session(
         "channel_status" => serde_json::json!({
             "served": super::channel::read_served(&state.state_root)
                 .unwrap_or_else(|e| vec![super::channel::Served { channel: format!("<unreadable: {e}>"), roots: Vec::new() }]),
-            "joined": state.channel.as_ref().map(|c| c.link.lock().clone()),
+            "joined": joined_channel_link(state),
+            "standalone": standalone_channel_links(state),
         }),
+        "channel_join" if draining => serde_json::json!({ "error": "node is draining" }),
+        "channel_join" => channel_join(state, &request).await,
         "channel_leave" if draining => serde_json::json!({ "error": "node is draining" }),
-        "channel_leave" => match &state.channel {
-            None => serde_json::json!({
-                "error": "this node holds no channel credential from a join; nothing to leave"
-            }),
-            Some(c) => {
-                super::channel_link::leave(
-                    &state.node,
-                    &state.state_root,
-                    &c.cred,
-                    c.publisher,
-                    &c.left,
-                    &c.link,
-                    CHANNEL_UNSUBSCRIBE_WAIT,
-                )
-                .await
-            }
-        },
+        "channel_leave" => channel_leave(state, &request).await,
         "channel_publish" if draining => serde_json::json!({ "error": "node is draining" }),
         "channel_publish" => {
             let reply = super::channel::publish_op(&state.node, &request).await;
             if reply["gate"] == "passed" && reply.get("error").is_none() {
-                if let Some(c) = &state.channel {
-                    super::channel_link::published(
-                        &c.link,
-                        request["channel"].as_str().unwrap_or_default(),
-                    );
+                for c in state.channels.lock().iter() {
+                    if !c.left.load(Ordering::SeqCst) {
+                        super::channel_link::published(
+                            &c.link,
+                            request["channel"].as_str().unwrap_or_default(),
+                        );
+                    }
                 }
             }
             reply
@@ -2601,13 +2945,18 @@ async fn control_session(
             (Some(join), false) => {
                 let (join, now) = (join.clone(), now_unix());
                 let memberships = state.memberships.clone();
+                let channel_memberships = state.channel_memberships.clone();
                 let recorded = tokio::task::spawn_blocking(move || {
-                    // Standalone subnet memberships go first: a failure here
-                    // leaves the join (and this node) intact to retry.
+                    // Standalone subnet and channel memberships go first: a
+                    // failure here leaves the join (and this node) intact to
+                    // retry.
                     if let Some(memberships) = &memberships {
                         for m in memberships.lock().iter_mut() {
                             m.leave(now).map_err(Some)?;
                         }
+                    }
+                    for m in channel_memberships.lock().iter_mut() {
+                        m.leave(now).map_err(Some)?;
                     }
                     let mut guard = join.lock();
                     let join = guard.as_mut().ok_or(None)?;
@@ -2621,26 +2970,27 @@ async fn control_session(
                         // Recorded durably; now stop this runtime. A live
                         // channel subscription is withdrawn first (the
                         // publisher acknowledges), not left to time out.
-                        let unsubscribed = match &state.channel {
-                            Some(c)
-                                if c.link.lock().subscribed == Some(true)
-                                    && !c.left.load(Ordering::SeqCst) =>
+                        let held: Vec<JoinedChannel> = state.channels.lock().clone();
+                        let mut unsubscribed = None;
+                        for c in held {
+                            if c.link.lock().subscribed != Some(true)
+                                || c.left.swap(true, Ordering::SeqCst)
                             {
-                                c.left.store(true, Ordering::SeqCst);
-                                Some(matches!(
-                                    tokio::time::timeout(
-                                        CHANNEL_UNSUBSCRIBE_WAIT,
-                                        state.node.unsubscribe_channel(
-                                            c.publisher,
-                                            c.cred.offer.channel.clone(),
-                                        ),
-                                    )
-                                    .await,
-                                    Ok(Ok(()))
-                                ))
+                                continue;
                             }
-                            _ => None,
-                        };
+                            let acked = matches!(
+                                tokio::time::timeout(
+                                    CHANNEL_UNSUBSCRIBE_WAIT,
+                                    state.node.unsubscribe_channel(
+                                        c.publisher,
+                                        c.cred.offer.channel.clone()
+                                    ),
+                                )
+                                .await,
+                                Ok(Ok(()))
+                            );
+                            unsubscribed = Some(unsubscribed.unwrap_or(true) && acked);
+                        }
                         state.draining.store(true, Ordering::SeqCst);
                         serde_json::json!({
                             "left": true,
@@ -3262,22 +3612,63 @@ pub async fn run_up(
     });
     let link = start_link.map(|l| Arc::new(parking_lot::Mutex::new(l)));
     let subnet_left = Arc::new(AtomicBool::new(read_subnet_left(&state).is_some()));
-    let joined_channel = channel_start.map(|(cred, link, left, publisher)| {
+    let mut held_channels = Vec::new();
+    if let Some((cred, link, left, publisher)) = channel_start {
         // Subscribed at start: on the current session.
         let on = match link.subscribed {
             Some(true) => mesh.node().peer_session_id(publisher),
             _ => None,
         };
-        (
-            JoinedChannel {
-                cred,
-                link: Arc::new(parking_lot::Mutex::new(link)),
-                left: Arc::new(AtomicBool::new(left)),
-                publisher,
+        held_channels.push(JoinedChannel {
+            cred,
+            link: Arc::new(parking_lot::Mutex::new(link)),
+            left: Arc::new(AtomicBool::new(left)),
+            publisher,
+            source: ChannelSource::Join,
+            initial_on: on,
+        });
+    }
+    // Standalone channel memberships (fail closed on a corrupt one).
+    let channels_dir = state.join(CHANNELS_SUBDIR);
+    let channel_memberships = load_channel_memberships(&channels_dir)?;
+    for m in &channel_memberships {
+        let Some(offer) = m.offer().cloned() else {
+            continue;
+        };
+        let cred = match m.chain() {
+            Some(chain) => super::channel_link::ChannelCred {
+                offer,
+                chain: chain.clone(),
             },
-            on,
+            // Left (or never issued): reported, never used.
+            None => continue,
+        };
+        let publisher = m.issuer_node();
+        let attached = mesh.node().peer_session_id(publisher).is_some();
+        let link = super::channel_link::start(
+            mesh.node(),
+            &cred,
+            m.left_at().is_some(),
+            attached.then_some(publisher),
+            JOIN_ATTACH_WAIT,
         )
-    });
+        .await;
+        let on = match link.subscribed {
+            Some(true) => mesh.node().peer_session_id(publisher),
+            _ => None,
+        };
+        held_channels.push(JoinedChannel {
+            cred,
+            link: Arc::new(parking_lot::Mutex::new(link)),
+            left: Arc::new(AtomicBool::new(m.left_at().is_some())),
+            publisher,
+            source: ChannelSource::Standalone(channel_membership_key(m.invite())),
+            initial_on: on,
+        });
+    }
+    let channels: SharedChannels = Arc::new(parking_lot::Mutex::new(held_channels));
+    let channel_memberships: SharedChannelMemberships =
+        Arc::new(parking_lot::Mutex::new(channel_memberships));
     let joined_link = match (&joined, &link, &joined_contact_node, &memberships) {
         (Some(joined), Some(link), Some(contact_node), Some(memberships)) => {
             let admitted = link.lock().subnet_admitted;
@@ -3300,7 +3691,7 @@ pub async fn run_up(
                 link.clone(),
                 presented,
                 present_retry_at,
-                joined_channel.clone(),
+                channels.clone(),
                 subnet_left.clone(),
                 attachments.clone(),
             ))
@@ -3318,7 +3709,9 @@ pub async fn run_up(
         state_root: state.clone(),
         pending_orgs: pending_orgs.clone(),
         node: mesh.node().clone(),
-        channel: joined_channel.map(|(c, _)| c),
+        channels: channels.clone(),
+        channel_memberships: channel_memberships.clone(),
+        channels_dir,
         subnet_left: subnet_left.clone(),
         attachments: attachments.clone(),
     });

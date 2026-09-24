@@ -364,6 +364,7 @@ impl EnrollOwner {
                 self.ledger.clone(),
                 subnet.clone(),
                 Some(self.org.stash.clone()),
+                channels.iter().map(|(_, i)| i.clone()).collect(),
             )
             .map_err(|e| generic(format!("standalone redemption service: {e}")))?,
         );
@@ -872,8 +873,13 @@ impl EnrollContext {
             }),
             None => None,
         };
-        if standalone && org.is_some() && request["subnet"].is_string() {
-            return Err("a standalone link carries one relation: a subnet or an org".to_string());
+        let standalone_relations = usize::from(org.is_some())
+            + usize::from(request["subnet"].is_string())
+            + usize::from(request["channel"].is_string());
+        if standalone && standalone_relations > 1 {
+            return Err(
+                "a standalone link carries one relation: a subnet, an org or a channel".to_string(),
+            );
         }
         // An org invite always waits for the operator: only the offline org
         // root can sign the membership, at approval (`org approve`).
@@ -883,8 +889,12 @@ impl EnrollContext {
             mode
         };
         let (mut relations, subnet) = match request["subnet"].as_str() {
-            None if standalone && org.is_some() => (Vec::new(), None),
-            None if standalone => return Err("a standalone link needs a subnet".to_string()),
+            None if standalone && (org.is_some() || request["channel"].is_string()) => {
+                (Vec::new(), None)
+            }
+            None if standalone => {
+                return Err("a standalone link needs a subnet, an org or a channel".to_string())
+            }
             None => (vec![Relation::Mesh], None),
             Some(path) => {
                 let issuer = self.subnet.as_ref().ok_or_else(|| {
@@ -948,9 +958,8 @@ impl EnrollContext {
             });
         let channel = match request["channel"].as_str() {
             None => None,
-            Some(_) if standalone => {
-                return Err("a channel link rides with mesh membership, not standalone".to_string())
-            }
+            // Standalone: the channel relation alone, for a device already on
+            // the mesh (redeemed over its session); otherwise with mesh.
             Some(name) => {
                 let offer = self.channel_offer(name, request["channel_rights"].as_str())?;
                 relations.push(Relation::Channel);

@@ -60,6 +60,11 @@ pub fn is_standalone_subnet(invite: &MembershipInvite) -> bool {
     invite.relations() == [Relation::Subnet] && invite.subnet().is_some()
 }
 
+/// Whether `invite` is a standalone channel link (channel relation only).
+pub fn is_standalone_channel(invite: &MembershipInvite) -> bool {
+    invite.relations() == [Relation::Channel] && invite.channel().is_some()
+}
+
 /// Whether `invite` is a standalone organization link (org relation only).
 pub fn is_standalone_org(invite: &MembershipInvite) -> bool {
     invite.relations() == [Relation::Org] && invite.org().is_some()
@@ -175,11 +180,16 @@ pub enum SubnetRedeemReply {
     },
     /// The link requires operator approval; ask again once approved.
     PendingApproval,
+    /// The channel chain (`root → issuer → device`) minted for exactly this
+    /// claim, as its canonical bytes: on a retry, the committed chain, never
+    /// a new one. Decode with [`Self::channel_chain`].
+    ChannelIssued(Vec<u8>),
 }
 
 impl SubnetRedeemReply {
-    /// Wire form: `0 ‖ credential set`, `1`, or
-    /// `2 ‖ lp(membership certificate) ‖ u8 has_audience [‖ audience]`.
+    /// Wire form: `0 ‖ credential set`, `1`,
+    /// `2 ‖ lp(membership certificate) ‖ u8 has_audience [‖ audience]`, or
+    /// `3 ‖ token chain`.
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Self::Issued(set) => {
@@ -200,6 +210,21 @@ impl SubnetRedeemReply {
                 }
                 out
             }
+            Self::ChannelIssued(chain) => {
+                let mut out = vec![3u8];
+                out.extend_from_slice(chain);
+                out
+            }
+        }
+    }
+
+    /// The delivered channel chain, for [`Self::ChannelIssued`].
+    pub fn channel_chain(&self) -> Option<net::adapter::net::identity::TokenChain> {
+        match self {
+            Self::ChannelIssued(bytes) => {
+                net::adapter::net::identity::TokenChain::from_bytes(bytes).ok()
+            }
+            _ => None,
         }
     }
 
@@ -237,6 +262,9 @@ impl SubnetRedeemReply {
                     audience,
                 })
             }
+            Some((3, chain)) => net::adapter::net::identity::TokenChain::from_bytes(chain)
+                .map(|_| Self::ChannelIssued(chain.to_vec()))
+                .map_err(|e| format!("channel chain: {e}")),
             _ => Err("malformed standalone subnet reply".to_string()),
         }
     }
@@ -258,6 +286,7 @@ pub fn answer_subnet_redeem(
         ledger,
         Some(issuer),
         None,
+        &[],
         now,
     )
 }
@@ -265,8 +294,10 @@ pub fn answer_subnet_redeem(
 /// Issuing-node side. `session_subject` is the entity the delivering session
 /// has proven (`None` if it has proven none); `this_node` is this node's id.
 /// A subnet-only link needs `subnet`; an org-only link needs `org`, which
-/// holds the certificates the operator signed at approval. The caller must
+/// holds the certificates the operator signed at approval; a channel-only
+/// link needs a grant in `channels` covering its offer. The caller must
 /// additionally refuse a subject its own floors removed.
+#[allow(clippy::too_many_arguments)]
 pub fn answer_standalone_redeem(
     request_bytes: &[u8],
     session_subject: Option<&EntityId>,
@@ -274,6 +305,7 @@ pub fn answer_standalone_redeem(
     ledger: &SharedLedger,
     subnet: Option<&SubnetLeafIssuer>,
     org: Option<&dyn OrgCertSource>,
+    channels: &[crate::channel_issuer::ChannelLeafIssuer],
     now: u64,
 ) -> Result<SubnetRedeemReply, Refusal> {
     let request = SubnetRedeemRequest::from_bytes(request_bytes)?;
@@ -298,7 +330,10 @@ pub fn answer_standalone_redeem(
         Some(_) => {}
     }
     let invite = request.invite()?;
-    if !is_standalone_subnet(&invite) && !is_standalone_org(&invite) {
+    if !is_standalone_subnet(&invite)
+        && !is_standalone_org(&invite)
+        && !is_standalone_channel(&invite)
+    {
         return Err(Refusal::Invalid);
     }
     let intent = RedemptionIntent::for_invite(&invite, request.subject.clone())
@@ -315,6 +350,15 @@ pub fn answer_standalone_redeem(
     // What this link delivers, now: fresh subnet credentials, or the
     // certificate the operator approved for exactly this claim.
     let deliver = || -> Result<SubnetRedeemReply, Refusal> {
+        if let Some(offer) = invite.channel() {
+            let chain = channels
+                .iter()
+                .find(|issuer| issuer.covers(offer))
+                .ok_or(Refusal::Unavailable)?
+                .issue(&request.subject, offer.rights)
+                .map_err(|_| Refusal::Unavailable)?;
+            return Ok(SubnetRedeemReply::ChannelIssued(chain.to_bytes()));
+        }
         if let Some(offer) = invite.subnet() {
             let issuer = subnet.ok_or(Refusal::Unavailable)?;
             return issuer
@@ -346,6 +390,7 @@ pub fn answer_standalone_redeem(
             let payload = match &reply {
                 SubnetRedeemReply::Issued(set) => set.to_bytes(),
                 SubnetRedeemReply::OrgIssued { cert, .. } => cert.to_bytes(),
+                SubnetRedeemReply::ChannelIssued(chain) => chain.clone(),
                 SubnetRedeemReply::PendingApproval => return Err(Refusal::Unavailable),
             };
             ledger
@@ -358,6 +403,16 @@ pub fn answer_standalone_redeem(
         // the same device: it gets fresh subnet credentials for the same
         // offer (as renewal would), or the same approved certificate. Any
         // other claimant was refused by `claim` above.
+        // A channel link is recovered, not re-minted: the device gets back
+        // exactly the chain committed at issuance (one link, one chain).
+        ClaimOutcome::AlreadyIssued(_) if invite.channel().is_some() => {
+            let recovered = ledger
+                .recover(&id, &claimant, now)
+                .map_err(super::service::refusal)?;
+            net::adapter::net::identity::TokenChain::from_bytes(&recovered.payload)
+                .map(|_| SubnetRedeemReply::ChannelIssued(recovered.payload.clone()))
+                .map_err(|_| Refusal::Unavailable)
+        }
         ClaimOutcome::AlreadyIssued(_) => {
             drop(ledger);
             deliver()
@@ -372,7 +427,7 @@ pub fn serve_subnet_redeem(
     ledger: SharedLedger,
     issuer: SubnetLeafIssuer,
 ) -> Result<net::adapter::net::mesh_rpc::ServeHandle, net::adapter::net::mesh_rpc::ServeError> {
-    serve_standalone_redeem(node, ledger, Some(issuer), None)
+    serve_standalone_redeem(node, ledger, Some(issuer), None, Vec::new())
 }
 
 /// Serve standalone redemption on [`STANDALONE_REDEEM_SERVICE`]: bind the
@@ -386,6 +441,7 @@ pub fn serve_standalone_redeem(
     ledger: SharedLedger,
     subnet: Option<SubnetLeafIssuer>,
     org: Option<std::sync::Arc<dyn OrgCertSource>>,
+    channels: Vec<crate::channel_issuer::ChannelLeafIssuer>,
 ) -> Result<net::adapter::net::mesh_rpc::ServeHandle, net::adapter::net::mesh_rpc::ServeError> {
     node.serve_rpc(
         STANDALONE_REDEEM_SERVICE,
@@ -394,6 +450,7 @@ pub fn serve_standalone_redeem(
             ledger,
             subnet,
             org,
+            channels,
         }),
     )
 }
@@ -404,6 +461,7 @@ struct RedeemHandler {
     ledger: SharedLedger,
     subnet: Option<SubnetLeafIssuer>,
     org: Option<std::sync::Arc<dyn OrgCertSource>>,
+    channels: Vec<crate::channel_issuer::ChannelLeafIssuer>,
 }
 
 #[cfg(feature = "cortex")]
@@ -438,6 +496,7 @@ impl RedeemHandler {
             &self.ledger,
             self.subnet.as_ref(),
             self.org.as_deref(),
+            &self.channels,
             super::now_unix(),
         )
         .map(|reply| reply.to_bytes())
@@ -745,6 +804,238 @@ fn decode(bytes: &[u8]) -> Result<Decoded, DeviceJoinError> {
         return Err(DeviceJoinError::Corrupt);
     }
     Ok((invite, subject, issuer_node, set, left_at))
+}
+
+// ---- device-side channel membership store ----------------------------------
+
+const CHANNEL_STORE_MAGIC: [u8; 4] = *b"NMCM";
+const CHANNEL_STORE_VERSION: u16 = 1;
+const CHANNEL_STORE_CHECKSUM: &str = "net-mesh standalone channel membership v1";
+
+/// One standalone channel membership held by a device: the signed link, the
+/// node it was redeemed at, and (once issued) its chain. Durable and
+/// owner-locked; a left membership keeps its record but no chain, and never
+/// installs one again — a rejoin is a new link, a new membership.
+pub struct ChannelMembership {
+    storage: EnrollmentStorage,
+    invite: MembershipInvite,
+    subject: EntityId,
+    issuer_node: u64,
+    chain: Option<net::adapter::net::identity::TokenChain>,
+    left_at: Option<u64>,
+}
+
+impl ChannelMembership {
+    /// Record the intent to redeem `invite` (a standalone channel link) at
+    /// `issuer_node` as `subject`, before any redemption attempt.
+    pub fn begin(
+        dir: &Path,
+        invite: &MembershipInvite,
+        subject: EntityId,
+        issuer_node: u64,
+    ) -> Result<Self, DeviceJoinError> {
+        if !is_standalone_channel(invite) {
+            return Err(DeviceJoinError::Corrupt);
+        }
+        let storage = EnrollmentStorage::create(
+            dir,
+            &encode_channel(invite, &subject, issuer_node, None, None),
+        )?;
+        Ok(Self {
+            storage,
+            invite: invite.clone(),
+            subject,
+            issuer_node,
+            chain: None,
+            left_at: None,
+        })
+    }
+
+    /// Open and validate a stored membership (taking its owner lock).
+    pub fn open(dir: &Path) -> Result<Self, DeviceJoinError> {
+        let storage = EnrollmentStorage::open(dir)?;
+        let (invite, subject, issuer_node, chain, left_at) = decode_channel(&storage.read()?)?;
+        if let Some(chain) = &chain {
+            let offer = invite.channel().ok_or(DeviceJoinError::Corrupt)?;
+            if !super::bundle::channel_chain_matches(offer, &subject, chain) {
+                return Err(DeviceJoinError::Corrupt);
+            }
+        }
+        Ok(Self {
+            storage,
+            invite,
+            subject,
+            issuer_node,
+            chain,
+            left_at,
+        })
+    }
+
+    /// Install the delivered chain after checking it is exactly the signed
+    /// offer's, for this device. Refused once the membership was left, so a
+    /// delayed delivery can never reinstate a departed incarnation.
+    pub fn install(
+        &mut self,
+        chain: &net::adapter::net::identity::TokenChain,
+    ) -> Result<(), DeviceJoinError> {
+        if let Some(at) = self.left_at {
+            return Err(DeviceJoinError::Left { at });
+        }
+        let offer = self.invite.channel().ok_or(DeviceJoinError::Corrupt)?;
+        if !super::bundle::channel_chain_matches(offer, &self.subject, chain) {
+            return Err(DeviceJoinError::Bundle(
+                super::bundle::BundleError::Mismatch("channel chain"),
+            ));
+        }
+        self.storage.replace(&encode_channel(
+            &self.invite,
+            &self.subject,
+            self.issuer_node,
+            Some(chain),
+            None,
+        ))?;
+        self.chain = Some(chain.clone());
+        Ok(())
+    }
+
+    /// Leave: durably erase the chain and record the departure. Idempotent;
+    /// returns `false` if already left.
+    pub fn leave(&mut self, now: u64) -> Result<bool, DeviceJoinError> {
+        if self.left_at.is_some() {
+            return Ok(false);
+        }
+        self.storage.replace(&encode_channel(
+            &self.invite,
+            &self.subject,
+            self.issuer_node,
+            None,
+            Some(now),
+        ))?;
+        self.chain = None;
+        self.left_at = Some(now);
+        Ok(true)
+    }
+
+    /// The signed standalone link.
+    pub fn invite(&self) -> &MembershipInvite {
+        &self.invite
+    }
+
+    /// The channel offer the link carries.
+    pub fn offer(&self) -> Option<&super::invite::ChannelOffer> {
+        self.invite.channel()
+    }
+
+    /// The node the link is redeemed at (and, for subscribe, the publisher).
+    pub fn issuer_node(&self) -> u64 {
+        self.issuer_node
+    }
+
+    /// The installed chain, if issued and not left.
+    pub fn chain(&self) -> Option<&net::adapter::net::identity::TokenChain> {
+        self.chain.as_ref()
+    }
+
+    /// When the membership was left, if it was.
+    pub fn left_at(&self) -> Option<u64> {
+        self.left_at
+    }
+}
+
+impl std::fmt::Debug for ChannelMembership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelMembership")
+            .field(
+                "channel",
+                &self
+                    .invite
+                    .channel()
+                    .map(|o| o.channel.as_str().to_string()),
+            )
+            .field("issuer_node", &self.issuer_node)
+            .field("installed", &self.chain.is_some())
+            .field("left_at", &self.left_at)
+            .finish()
+    }
+}
+
+// MAGIC | u16 VERSION | lp invite | subject[32] | u64 issuer_node |
+// u8 has_chain [lp chain] | u8 left [u64 left_at] | blake3 checksum[32].
+fn encode_channel(
+    invite: &MembershipInvite,
+    subject: &EntityId,
+    issuer_node: u64,
+    chain: Option<&net::adapter::net::identity::TokenChain>,
+    left_at: Option<u64>,
+) -> Vec<u8> {
+    let mut out = CHANNEL_STORE_MAGIC.to_vec();
+    out.extend_from_slice(&CHANNEL_STORE_VERSION.to_le_bytes());
+    super::push_lp(&mut out, invite.to_bytes());
+    out.extend_from_slice(subject.as_bytes());
+    out.extend_from_slice(&issuer_node.to_le_bytes());
+    match chain {
+        Some(chain) => {
+            out.push(1);
+            super::push_lp(&mut out, &chain.to_bytes());
+        }
+        None => out.push(0),
+    }
+    match left_at {
+        Some(at) => {
+            out.push(1);
+            out.extend_from_slice(&at.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+    let sum = blake3::derive_key(CHANNEL_STORE_CHECKSUM, &out);
+    out.extend_from_slice(&sum);
+    out
+}
+
+type ChannelDecoded = (
+    MembershipInvite,
+    EntityId,
+    u64,
+    Option<net::adapter::net::identity::TokenChain>,
+    Option<u64>,
+);
+
+fn decode_channel(bytes: &[u8]) -> Result<ChannelDecoded, DeviceJoinError> {
+    let corrupt = || DeviceJoinError::Corrupt;
+    let body_len = bytes.len().checked_sub(32).ok_or_else(corrupt)?;
+    let (body, sum) = bytes.split_at(body_len);
+    if blake3::derive_key(CHANNEL_STORE_CHECKSUM, body) != sum {
+        return Err(corrupt());
+    }
+    let mut r = Reader::new(body);
+    if r.take_arr::<4>() != Some(CHANNEL_STORE_MAGIC) || r.take_u16() != Some(CHANNEL_STORE_VERSION)
+    {
+        return Err(corrupt());
+    }
+    let invite =
+        MembershipInvite::from_bytes(r.take_lp().ok_or_else(corrupt)?).map_err(|_| corrupt())?;
+    if !is_standalone_channel(&invite) {
+        return Err(corrupt());
+    }
+    let subject = EntityId::from_bytes(r.take_arr::<32>().ok_or_else(corrupt)?);
+    let issuer_node = r.take_u64().ok_or_else(corrupt)?;
+    let chain = match r.take_arr::<1>().ok_or_else(corrupt)? {
+        [0] => None,
+        [1] => Some(
+            net::adapter::net::identity::TokenChain::from_bytes(r.take_lp().ok_or_else(corrupt)?)
+                .map_err(|_| corrupt())?,
+        ),
+        _ => return Err(corrupt()),
+    };
+    let left_at = match r.take_arr::<1>().ok_or_else(corrupt)? {
+        [0] => None,
+        [1] => Some(r.take_u64().ok_or_else(corrupt)?),
+        _ => return Err(corrupt()),
+    };
+    if !r.done() || (chain.is_some() && left_at.is_some()) {
+        return Err(corrupt());
+    }
+    Ok((invite, subject, issuer_node, chain, left_at))
 }
 
 /// Opening a store refuses one whose storage layer reports it busy; exposed

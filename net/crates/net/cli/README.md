@@ -163,7 +163,7 @@ script has to do differently. Temporary-supervisor scripts must now add
 | `node`        | `status` of this profile's node; ownership provisioning (`adopt`).             |
 | `subnet`      | Offline authority issuance; subnet links (`invite` / `join`), `remove`, `leave`, `members`; temporary topology reads. |
 | `gateway`     | Temporary-context reads; `export` refuses without a live gateway. |
-| `channel`     | Offline `issue-grant`; `serve`, `status`, `publish`, `leave` on the running node; registry reads (`visibility`, `ls`). |
+| `channel`     | Offline `issue-grant`; standalone links (`invite` / `join`); `serve`, `status`, `publish`, `leave` on the running node; registry reads (`visibility`, `ls`). |
 | `aggregator`  | Temporary inspect/list with `--local`; remote query/spawn/scale and list selected by flags or profile. Remote verbs and `ls` support `--inspect-target`. |
 | `transfer`    | Receive/admin via mesh; send computes references or stages local content, not hosting or publication. |
 | `wrap`        | Wrap a local stdio MCP server as owner-only mesh capabilities (`--joined` runs as an enrolled device). |

@@ -168,14 +168,28 @@ fn read_row(stdout: &mut BufReader<ChildStdout>, child: &mut Child) -> Value {
     })
 }
 
-/// A port currently free for both UDP and TCP on loopback (TCP first: see the
-/// CLI's own port picker for why).
+/// A port currently free for both UDP and TCP on loopback. Tried from both
+/// sides: an OS-assigned TCP port can sit in a range Windows excludes for UDP
+/// (and the reverse), which made a TCP-only picker run dry on a Windows
+/// runner while parallel tests held other ports.
 fn free_port() -> u16 {
-    for _ in 0..50 {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
-            return port;
+    for attempt in 0..1000 {
+        if attempt % 2 == 0 {
+            let Ok(udp) = std::net::UdpSocket::bind("127.0.0.1:0") else {
+                continue;
+            };
+            let port = udp.local_addr().unwrap().port();
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        } else {
+            let Ok(tcp) = std::net::TcpListener::bind("127.0.0.1:0") else {
+                continue;
+            };
+            let port = tcp.local_addr().unwrap().port();
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
         }
     }
     panic!("no free port");

@@ -707,3 +707,109 @@ fn a_publishing_device_is_ready_only_under_its_own_trust_and_leaves_exactly() {
     assert_eq!(status["served"][0]["channel"], CHANNEL, "{status}");
     drop(node);
 }
+
+/// V3 S3: a device already on the mesh adds a channel with a standalone link
+/// (redeemed over its session — no mesh enrollment repeated), holds one
+/// active credential per channel, keeps it across restart, leaves it, and
+/// rejoins with a FRESH link as a new incarnation (the old link stays
+/// spent). Its mesh attachment is untouched throughout.
+#[test]
+fn a_joined_device_adds_leaves_and_rejoins_a_channel_with_standalone_links() {
+    let operator = Fx::new();
+    let (op_args, root_hex) = operator_with_grant(&operator);
+    let _op = operator.up(&strs(&op_args));
+    operator.json(&["channel", "serve", CHANNEL, "--token-root", &root_hex]);
+    let agent = Fx::new();
+    let mesh_only = operator.json(&["invite", "create"]);
+    agent.json(&["join", mesh_only["token"].as_str().unwrap(), "--yes"]);
+    let node = agent.up(&[]);
+    assert!(
+        node.ready["joined"].get("channel").is_none(),
+        "{}",
+        node.ready
+    );
+
+    let link = |fx: &Fx| {
+        let created = fx.json(&["channel", "invite", CHANNEL, "--rights", "subscribe"]);
+        assert_eq!(created["standalone"], true, "{created}");
+        created["token"].as_str().unwrap().to_string()
+    };
+    let first = link(&operator);
+    let inspected = operator.json_stateless(&["invite", "inspect", &first]);
+    assert_eq!(
+        inspected["relations"],
+        serde_json::json!(["channel"]),
+        "{inspected}"
+    );
+    // `channel join` needs an explicit confirmation.
+    assert!(!agent.run(&["channel", "join", &first]).status.success());
+
+    let joined = agent.json(&["channel", "join", &first, "--yes"]);
+    assert_eq!(joined["state"], "active", "{joined}");
+    assert_eq!(joined["subscribed"], true, "{joined}");
+    // One active credential per channel.
+    let second = link(&operator);
+    let refused = agent.run(&["channel", "join", &second, "--yes"]);
+    assert!(!refused.status.success());
+    assert!(stderr_of(&refused).contains("already holds an active credential"));
+
+    // Durable: the restarted node holds and uses it again by itself.
+    drop(node);
+    let node = agent.up(&[]);
+    wait_for_channel_list(
+        &agent,
+        "standalone channel resubscribed after restart",
+        |l| l.len() == 1 && l[0]["subscribed"] == true && l[0]["state"] == "active",
+    );
+
+    let left = agent.json(&["channel", "leave"]);
+    assert_eq!(left["newly_left"], true, "{left}");
+    assert_eq!(left["unsubscribed"], true, "{left}");
+    // The spent link cannot restore the departed incarnation.
+    let spent = agent.run(&["channel", "join", &first, "--yes"]);
+    assert!(
+        stderr_of(&spent).contains("left that channel membership"),
+        "{}",
+        stderr_of(&spent)
+    );
+
+    // A fresh link rejoins as a new incarnation.
+    let rejoined = agent.json(&["channel", "join", &second, "--yes"]);
+    assert_eq!(rejoined["subscribed"], true, "{rejoined}");
+    let status = agent.json(&["channel", "status"]);
+    let states: Vec<&str> = status["standalone"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["state"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        states.iter().filter(|s| **s == "left").count(),
+        1,
+        "{status}"
+    );
+    assert_eq!(
+        states.iter().filter(|s| **s == "active").count(),
+        1,
+        "{status}"
+    );
+    // Leave now targets the one active incarnation; a repeat is idempotent.
+    assert_eq!(agent.json(&["channel", "leave"])["newly_left"], true);
+    assert_eq!(agent.json(&["channel", "leave"])["newly_left"], false);
+    // The mesh relation was never touched.
+    assert_eq!(agent.json(&["node", "status"])["link"]["attached"], true);
+    drop(node);
+}
+
+/// Poll `channel status` until its standalone credentials satisfy `done`.
+fn wait_for_channel_list(fx: &Fx, what: &str, done: impl Fn(&Vec<Value>) -> bool) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..120 {
+        last = fx.json(&["channel", "status"]);
+        if last["standalone"].as_array().is_some_and(&done) {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!("{what}: never got there; last status {last}");
+}

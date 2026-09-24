@@ -4017,6 +4017,91 @@ Limits:
 
 Gates: CLI clippy `--all-targets`; CLI 370/370.
 
+**S3 receipt: standalone channel enrollment (2026-09-25).**
+
+SDK:
+- **The link.** `Relation::Channel` may stand alone
+  (`is_standalone_channel`): a channel link for a device already on the
+  mesh. Any other pairing without mesh membership is refused.
+- **The standalone redemption service** (`net.enroll.standalone.redeem`,
+  now taking the node's channel grants) answers these links with
+  `SubnetRedeemReply::ChannelIssued`:
+  - the chain goes only to the entity the delivering session proved, for
+    exactly the offer, through the ledger's claim, approval and issue;
+  - a retry by the same device gets **the committed chain back from the
+    ledger** (byte-identical, never re-minted; E24);
+  - another device gets `Conflict`;
+  - a node with no grant for the channel answers `Unavailable`.
+- **The device store.** A new `ChannelMembership` (`NMCM`, owner-locked,
+  checksummed) holds each link's chain. It installs only the offered chain
+  for this device, and once left it installs nothing again: a delayed
+  delivery cannot reinstate a departed incarnation.
+
+CLI:
+- `channel invite <name> --rights …` creates the standalone link (relations
+  `[channel]`).
+- `channel join <token> --yes` redeems it over the session with the enrolled
+  node, installs it in `<state>/channels/<key>`, and starts using it:
+  subscribe per session, and install the publish chain.
+- **One active credential per channel.** A second is refused until the
+  active one is left.
+- **A rejoin is a fresh link, a new membership and a new incarnation.** The
+  spent link is refused with "left that channel membership". Supervisor
+  tracks are per incarnation, and the publish chain is removed exactly by
+  fingerprint, so delayed work from the old incarnation never lands on the
+  new one.
+- **The runtime holds a list of channel credentials:** the join's own plus
+  standalone memberships.
+  - `up` reloads standalone memberships from disk and fails closed on a
+    corrupt one.
+  - `channel leave [<name>]` targets the named or only active credential
+    and records through its own durable owner (the join marker, or the
+    membership store); a repeat is idempotent.
+  - A whole `leave` also leaves the channel memberships and withdraws every
+    subscription.
+  - `channel status` reports `joined` plus `standalone`.
+- **Limit:** an approval-gated channel link completes when `channel join` is
+  run again after `invite approve`; the supervisor does not poll for it.
+
+Witnesses:
+- `sdk/enrollment_channel::a_standalone_channel_link_issues_one_chain_and_recovers_it_exactly`.
+- `cli/channel_join::a_joined_device_adds_leaves_and_rejoins_a_channel_with_standalone_links`,
+  in order:
+  1. A mesh-only device adds the channel, and `--yes` is required.
+  2. The link inspects as `[channel]`.
+  3. The device is ACKed.
+  4. A second active credential is refused.
+  5. After a restart it resubscribes by itself.
+  6. Leave is acknowledged.
+  7. The spent link is refused.
+  8. A fresh link rejoins.
+  9. Status shows one left and one active.
+  10. Leave targets the new incarnation, and a repeat is idempotent.
+  11. The mesh relation stays attached.
+- The earlier relation witness was updated: `[channel]` alone is now the
+  standalone form, and `[subnet, channel]` is refused.
+
+Inverse mutations, all RED (5):
+
+| # | Mutation |
+|---|---|
+| 1 | Recovery re-mints |
+| 2 | Install not fenced after leave |
+| 3 | A second active credential allowed |
+| 4 | Memberships not loaded at start |
+| 5 | A standalone leave not recorded |
+
+Gates:
+- SDK clippy (`full` and default) and SDK rustdoc `full`;
+- CLI clippy `--all-targets`;
+- SDK 831/831; CLI 371/371.
+
+Also fixed: `enrollment_lifecycle`'s `free_port`. It tried only 50
+TCP-first ports, which ran dry on the Windows runner ("no free port").
+It now alternates UDP-first and TCP-first up to 1000 times. Its remaining
+pick-then-bind window is disclosed; the Linux "Address already in use" flake
+came from it.
+
 **Still open against the matrix (disclosed, not claimed):**
 
 | Row | Open item |

@@ -88,7 +88,11 @@ net-mesh up                              # on the device
   itself after every reconnect.
 
 A device already on the mesh adds a relation with a standalone link:
-`subnet invite` then `subnet join`, or `org invite` then `org join`.
+`subnet invite` then `subnet join`, `org invite` then `org join`, or
+`channel invite <name> --rights …` then `channel join <token> --yes`.
+- The device holds one active credential per channel.
+- Rejoining after `channel leave` takes a fresh link; the spent one stays
+  spent.
 
 A device holds any number of subnet relations, but only ONE is the active
 attachment at a given verifier, and only the active one is presented:

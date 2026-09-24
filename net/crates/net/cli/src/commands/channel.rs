@@ -53,10 +53,19 @@ pub enum ChannelCommand {
     /// channel credential: subscribe ACK and publish readiness. Never a
     /// roster of other members.
     Status(NodeDirArgs),
-    /// Leave the channel relation of this device's join: recorded durably,
-    /// then an acknowledged unsubscribe and removal of exactly the installed
-    /// publish credential. The mesh membership is untouched.
-    Leave(NodeDirArgs),
+    /// Leave one channel relation of this device (named, or the only active
+    /// one): recorded durably, then an acknowledged unsubscribe and removal
+    /// of exactly the installed publish credential. The mesh membership is
+    /// untouched; rejoining takes a new link.
+    Leave(ChannelLeaveArgs),
+    /// Create a standalone channel link on the running `up --enroll` node:
+    /// the channel relation only, for a device already on this mesh,
+    /// redeemed over its session. Needs a `--channel-grant` for the channel.
+    Invite(ChannelInviteArgs),
+    /// Join a channel with a standalone link, through this device's running
+    /// `up`: it redeems the link over its session with the node it enrolled
+    /// with, keeps the chain and starts using it (subscribe / publish).
+    Join(ChannelJoinArgs),
     /// Publish one payload on a channel from the running node: the node's
     /// own local channel gate decides (`gate: passed`), or denies it; an
     /// ungated channel is reported `gate: open`. Delivery counts are this
@@ -79,6 +88,55 @@ pub struct PublishArgs {
 
 /// Largest payload `channel publish` sends.
 const MAX_PUBLISH_BYTES: usize = 16 * 1024;
+
+/// `channel leave` arguments.
+#[derive(Args, Debug)]
+pub struct ChannelLeaveArgs {
+    /// The channel to leave (needed when several are active).
+    pub channel: Option<String>,
+    /// Node state directory (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+}
+
+/// `channel invite` arguments.
+#[derive(Args, Debug)]
+pub struct ChannelInviteArgs {
+    /// The canonical channel name.
+    pub channel: String,
+    /// `publish`, `subscribe` or `publish,subscribe`.
+    #[arg(long)]
+    pub rights: String,
+    /// Node state directory (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Lifetime of the unredeemed link (default 24h). The credential's own
+    /// lifetime is the grant's.
+    #[arg(long, value_name = "DURATION", value_parser = crate::humantime::parse_duration)]
+    pub ttl: Option<std::time::Duration>,
+    /// Require an operator decision (`invite approve`) before issuing.
+    #[arg(long)]
+    pub require_approval: bool,
+    /// Bind the link to one device's full 64-hex entity id.
+    #[arg(long = "for", value_name = "ENTITY")]
+    pub for_subject: Option<String>,
+    /// Write the token to this new owner-only file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    pub out: Option<PathBuf>,
+}
+
+/// `channel join` arguments.
+#[derive(Args, Debug)]
+pub struct ChannelJoinArgs {
+    /// The standalone channel link.
+    pub token: String,
+    /// State directory of this device's running `net-mesh up`.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Skip the interactive confirmation (scripts and agent tool use).
+    #[arg(long)]
+    pub yes: bool,
+}
 
 /// Arguments naming a running node.
 #[derive(Args, Debug)]
@@ -182,10 +240,46 @@ pub async fn run(
             .await
         }
         ChannelCommand::Leave(args) => {
+            let mut request = json!({ "op": "channel_leave" });
+            if let Some(name) = &args.channel {
+                parse_channel_name(name)?;
+                request["channel"] = json!(name);
+            }
+            node_op(args.state_dir, profile_name, request, output).await
+        }
+        ChannelCommand::Invite(args) => {
+            parse_channel_name(&args.channel)?;
+            parse_channel_rights(&args.rights)?;
+            super::enrollment::run_invite(
+                super::enrollment::InviteCommand::Create(super::enrollment::CreateArgs {
+                    state_dir: args.state_dir,
+                    ttl: args.ttl,
+                    require_approval: args.require_approval,
+                    for_subject: args.for_subject,
+                    out: args.out,
+                    addr: None,
+                    subnet: None,
+                    subnet_rights: None,
+                    org: None,
+                    channel: Some(args.channel),
+                    channel_rights: Some(args.rights),
+                    standalone: true,
+                }),
+                output,
+                profile_name,
+            )
+            .await
+        }
+        ChannelCommand::Join(args) => {
+            if !args.yes {
+                return Err(invalid_args(
+                    "channel join redeems the link for this device; confirm with --yes                      (inspect it first with `invite inspect`)",
+                ));
+            }
             node_op(
                 args.state_dir,
                 profile_name,
-                json!({ "op": "channel_leave" }),
+                json!({ "op": "channel_join", "token": args.token.trim() }),
                 output,
             )
             .await

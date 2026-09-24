@@ -303,6 +303,7 @@ fn a_standalone_org_link_delivers_the_approved_certificate_over_the_session() {
             &ledger,
             None,
             source.map(|s| s as &dyn net_sdk::enrollment::bundle::OrgCertSource),
+            &[],
             now(),
         )
     };
