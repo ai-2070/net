@@ -2938,9 +2938,80 @@ of `--state-dir`:
 - `net-cli` 360/360.
 - Clippy (core strict, CLI all targets) and root rustdoc are clean.
 
-**Next in V3-3.** Signed observations from named remote enforcement points,
-and channel status (credential state vs live ACK / publish-gate
-observation; never a roster).
+**Next in V3-3.** ~~Signed observations from named remote enforcement
+points~~ (see the next receipt), and channel status.
+
+#### V3-3 slice 2 — signed observations from named nodes (receipt, 2026-09-24)
+
+Decision (user, 2026-09-24): **root-signed requests**. Only a holder of the
+authority reads a node's inventory; the root stays on the operator's
+machine.
+
+**SDK `net_sdk::members`.**
+- `MembersRequest` targets either a subnet scope (with its subtree) under an
+  authority, or the standing of named members in an org. It names exactly
+  one node, and carries a nonce and a ±300 s freshness window.
+  - It is signed by a subnet root the node trusts for that authority, or by
+    the org root itself (the org key as an `EntityKeypair` over the same
+    seed, so it verifies under the org id).
+- `answer_members` refuses a stale request, one naming another node, a bad
+  signature, and a signer without that authority. It answers with a
+  `MembersObservation` signed by the node's entity key over the exact
+  request digest:
+  - `observed`: for a subnet, the admitted peers in scope (live sessions
+    only, through `admitted_subnet_peers`); for an org, each named member's
+    floor there;
+  - `not_verifier` / `not_member`: the node enforces nothing for that
+    authority, which reveals nothing.
+- Service `net.members.observe`, served by every `up`.
+
+**CLI.**
+- `subnet members <scope> --verifier self|CONTACT … --root-key K --authority
+  A` and `org members <org> --verifier … --org-key K` sign one request per
+  node on the operator's machine, and carry each through the operator's node
+  (`members_forward`).
+- The CLI verifies every observation against its own request and adds
+  `remote` rows:
+  - `observed` / `not_verifier` / `not_member` / `refused` / `no_answer` /
+    `bad_observation`;
+  - for subnets, the admitted peers; for orgs, each member's floor and
+    standing (`revoked_there` / `admissible_there`, judged against the
+    generation the operator approved).
+- The completeness note: only the named nodes were asked, each at its own
+  `observed_at`, and an unanswered node is unknown, not empty.
+
+**Witnesses.**
+- SDK `members_observe` (2 tests):
+  - the subnet root reads, and a stranger, another node, a stale request or
+    a tampered signature is refused;
+  - another authority gets `not_verifier`;
+  - the observation binds its request and its signature;
+  - only the org root reads org standing; a non-member gets `not_member`, a
+    member reports floors.
+- CLI subnet: the operator's node observes the connected device in 3.7; the
+  device's node is `not_verifier`; 3.8 is observed empty; the issuer key
+  (not the root) is `refused`.
+- CLI org, after `org remove`: the operator's node and the device's node are
+  both `revoked_there` at floor 1; the bystander is `not_member`.
+
+**Inverse mutations** (all RED):
+- any signer reading a subnet (SDK and CLI);
+- any signer reading an org;
+- a request for another node answered;
+- an observation not bound to its request;
+- the remote view ignoring the scope;
+- remote standing ignoring floors;
+- the request signature unchecked.
+
+**Regressions.**
+- The SDK suite as CI runs it: 822/822.
+- `net-cli` 360/360.
+- SDK clippy (default, `full`, CI features on the new target), `net-cli`
+  clippy and SDK rustdoc are clean.
+
+**Next in V3-3.** Channel status: installed credential state vs live ACK /
+publish-gate observation, never a roster. It builds on V3-2A (the channel
+lifecycle), which has not started.
 
 ### V3-4 — selective removal with durable enforcement
 

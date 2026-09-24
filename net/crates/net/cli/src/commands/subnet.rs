@@ -100,6 +100,23 @@ pub struct SubnetMembersArgs {
     /// State directory of the node to ask (as given to `net-mesh up`).
     #[arg(long, value_name = "DIR")]
     pub state_dir: Option<PathBuf>,
+    /// Also ask these nodes for their signed observations: `self` or
+    /// `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`. Needs `--root-key` and
+    /// `--authority`: only the subnet authority may read its inventory.
+    #[arg(long = "verifier", value_name = "NODE", requires_all = ["root_key", "authority"])]
+    pub verifiers: Vec<String>,
+    /// The subnet authority root key that signs the requests (stays here).
+    #[arg(long, value_name = "PATH")]
+    pub root_key: Option<PathBuf>,
+    /// The subnet authority (64-hex entity id).
+    #[arg(long, value_name = "HEX")]
+    pub authority: Option<String>,
+    /// How long to wait for each node's answer.
+    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = crate::humantime::parse_duration)]
+    pub wait: std::time::Duration,
+    /// Accept a group/world-readable root key file (Unix).
+    #[arg(long)]
+    pub insecure_permissions: bool,
 }
 
 /// `subnet invite` arguments.
@@ -278,10 +295,22 @@ pub async fn run(
         SubnetCommand::Join(args) => run_subnet_join(args, output, profile_name).await,
         SubnetCommand::Members(args) => {
             parse_subnet_path(&args.scope)?;
+            let remote = match (&args.root_key, args.verifiers.is_empty()) {
+                (Some(key), false) => Some(super::lifecycle::RemoteMembers {
+                    root: load_subnet_key(key, args.insecure_permissions).await?,
+                    authority: Some(parse_entity_hex(
+                        args.authority.as_deref().unwrap_or_default(),
+                    )?),
+                    verifiers: args.verifiers.clone(),
+                    wait: args.wait,
+                }),
+                _ => None,
+            };
             super::lifecycle::run_members(
                 "subnet",
                 args.scope,
                 args.state_dir,
+                remote,
                 output,
                 profile_name,
             )

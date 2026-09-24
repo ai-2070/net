@@ -175,6 +175,10 @@ pub mod operator;
 // ORG_CAPABILITY_AUTH_PLAN.md.
 #[cfg(feature = "net")]
 pub mod org;
+
+// Signed membership observations from named nodes (NET_CLI_PLAN_V3 V3-3).
+#[cfg(feature = "net")]
+pub mod members;
 // Live enrollment over the mesh (Hermes V2 Phase 1 Slice B2b) — `mesh.join` /
 // `mesh.serve_enrollment` via direct-addressed nRPC. Needs `cortex` for the
 // nRPC surface, so gated net+cortex (the `operator` facade above is

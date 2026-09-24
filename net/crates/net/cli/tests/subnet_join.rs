@@ -668,7 +668,7 @@ fn subnet_members_separates_issued_from_admitted_here() {
     let operator = Fx::new();
     let keys = operator.tmp.path().join("keys");
     std::fs::create_dir_all(&keys).unwrap();
-    let (_root, _root_hex, issuer, grant) = ceremony(&keys);
+    let (root, root_hex, issuer, grant) = ceremony(&keys);
     let _op = operator.up(&[
         "--enroll",
         "--no-port-mapping",
@@ -711,6 +711,64 @@ fn subnet_members_separates_issued_from_admitted_here() {
     assert_eq!(here.len(), 1, "{members}");
     assert_eq!(here[0]["subject"], device.as_str());
     assert_eq!(here[0]["attachment"], "3.7");
+
+    // Signed observations from named nodes, asked with the authority root:
+    // the operator's node (a verifier) observes the device; the device's own
+    // node verifies for no subnet authority.
+    let device_contact = format!(
+        "{}@{}#{}",
+        node.ready["entity_id"].as_str().unwrap(),
+        node.ready["bind"].as_str().unwrap(),
+        node.ready["public_key"].as_str().unwrap()
+    );
+    let remote = |key: &std::path::Path| {
+        operator.json(&[
+            "subnet",
+            "members",
+            "3.7",
+            "--verifier",
+            "self",
+            "--verifier",
+            &device_contact,
+            "--root-key",
+            key.to_str().unwrap(),
+            "--authority",
+            &root_hex,
+        ])
+    };
+    let asked = remote(&root);
+    let rows = asked["remote"].as_array().unwrap();
+    assert_eq!(rows[0]["state"], "observed", "{asked}");
+    assert_eq!(
+        rows[0]["admitted"][0]["subject"],
+        device.as_str(),
+        "{asked}"
+    );
+    assert_eq!(rows[0]["admitted"][0]["attachment"], "3.7", "{asked}");
+    assert_eq!(rows[1]["state"], "not_verifier", "{asked}");
+    // Another scope, same verifier: observed, and nothing admitted there.
+    let eight = operator.json(&[
+        "subnet",
+        "members",
+        "3.8",
+        "--verifier",
+        "self",
+        "--root-key",
+        root.to_str().unwrap(),
+        "--authority",
+        &root_hex,
+    ]);
+    assert_eq!(eight["remote"][0]["state"], "observed", "{eight}");
+    assert!(
+        eight["remote"][0]["admitted"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{eight}"
+    );
+    // A key that is not the authority's root cannot read it.
+    let denied = remote(&issuer);
+    assert_eq!(denied["remote"][0]["state"], "refused", "{denied}");
     assert!(members["completeness"]["observed"]
         .as_str()
         .unwrap()

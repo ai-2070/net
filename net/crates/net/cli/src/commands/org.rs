@@ -121,6 +121,20 @@ pub struct OrgMembersArgs {
     /// State directory of the node to ask (as given to `net-mesh up`).
     #[arg(long, value_name = "DIR")]
     pub state_dir: Option<PathBuf>,
+    /// Also ask these nodes for each issued member's standing there (signed
+    /// observations): `self` or `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`.
+    /// Needs `--org-key`: only the org may read its inventory.
+    #[arg(long = "verifier", value_name = "NODE", requires = "org_key")]
+    pub verifiers: Vec<String>,
+    /// The org root key file that signs the requests (stays here).
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: Option<PathBuf>,
+    /// How long to wait for each node's answer.
+    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = crate::humantime::parse_duration)]
+    pub wait: std::time::Duration,
+    /// Accept a group/world-readable org key file (Unix).
+    #[arg(long)]
+    pub insecure_permissions: bool,
 }
 
 /// `org leave` arguments.
@@ -577,10 +591,32 @@ pub async fn run(
         OrgCommand::Remove(args) => run_remove(args, output, profile_name).await,
         OrgCommand::Members(args) => {
             let org = super::enrollment::parse_org_id(&args.org).map_err(invalid_args)?;
+            let remote = match (&args.org_key, args.verifiers.is_empty()) {
+                (Some(key), false) => {
+                    let keypair = load_org_key(key, args.insecure_permissions).await?;
+                    if keypair.org_id() != org {
+                        return Err(invalid_args("--org-key is the root of a different org"));
+                    }
+                    // The org root's key, as the signer the nodes verify
+                    // against the org id.
+                    let root = net::adapter::net::identity::EntityKeypair::from_bytes(
+                        *keypair.secret_bytes(),
+                    );
+                    drop(keypair);
+                    Some(super::lifecycle::RemoteMembers {
+                        root,
+                        authority: None,
+                        verifiers: args.verifiers.clone(),
+                        wait: args.wait,
+                    })
+                }
+                _ => None,
+            };
             super::lifecycle::run_members(
                 "org",
                 hex::encode(org.0),
                 args.state_dir,
+                remote,
                 output,
                 profile_name,
             )

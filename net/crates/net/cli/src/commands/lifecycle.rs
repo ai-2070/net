@@ -1502,6 +1502,56 @@ async fn forward_floor_query(
     }
 }
 
+/// Control op `members_forward`: carry one already-signed members request to
+/// its named node (this node answers itself; another is reached over the
+/// mesh, connecting first when needed) and return that node's signed
+/// observation. The caller verifies it; this node only carries bytes.
+async fn forward_members(
+    node: &Arc<net::adapter::net::MeshNode>,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    use net_sdk::members::{answer_members, request_members, MembersRequest};
+    let parsed = (|| {
+        let bytes = hex::decode(request["request"].as_str()?).ok()?;
+        let members = MembersRequest::from_bytes(&bytes).ok()?;
+        let addr: Option<std::net::SocketAddr> =
+            request["addr"].as_str().and_then(|a| a.parse().ok());
+        let key = request["noise_pubkey"]
+            .as_str()
+            .and_then(|k| hex::decode(k).ok())
+            .and_then(|k| <[u8; 32]>::try_from(k).ok());
+        let wait = Duration::from_millis(request["wait_ms"].as_u64().unwrap_or(10_000))
+            .min(MAX_FLOOR_FORWARD_WAIT);
+        Some((bytes, members, addr.zip(key), wait))
+    })();
+    let Some((bytes, members, contact, wait)) = parsed else {
+        return serde_json::json!({ "error": "malformed members request" });
+    };
+    if members.verifier() == node.entity_id() {
+        return match answer_members(&bytes, node, now_unix()) {
+            Ok(o) => serde_json::json!({ "observation": hex::encode(o.to_bytes()) }),
+            Err(e) => serde_json::json!({ "refused": e }),
+        };
+    }
+    let target = members.verifier().node_id();
+    let outcome = tokio::time::timeout(wait, async {
+        if node.peer_session_id(target).is_none() {
+            let (addr, key) =
+                contact.ok_or_else(|| "no session to that node and no contact".to_string())?;
+            node.connect_via(addr, &key, target)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        request_members(node, target, &members, wait).await
+    })
+    .await
+    .unwrap_or_else(|_| Err("timed out".to_string()));
+    match outcome {
+        Ok(o) => serde_json::json!({ "observation": hex::encode(o.to_bytes()) }),
+        Err(e) => serde_json::json!({ "no_answer": e }),
+    }
+}
+
 /// Control op `members`: what this node ISSUED for an org or subnet scope
 /// (when it enrolls), and what it OBSERVES right now — never a claim about
 /// other nodes. Org admission is per call (no session state), so for org
@@ -2041,6 +2091,7 @@ async fn control_session(
             serde_json::json!({ "accepted": true, "incarnation": state.report.incarnation })
         }
         "members" => members(state, &request).await,
+        "members_forward" => forward_members(&state.node, &request).await,
         "org_leave" if draining => serde_json::json!({ "error": "node is draining" }),
         "org_leave" => org_leave(state).await,
         "org_join" if draining => serde_json::json!({ "error": "node is draining" }),
@@ -2446,6 +2497,9 @@ pub async fn run_up(
     } else {
         (None, None)
     };
+    // Any node may be asked, by a holder of the authority, what it observes.
+    let _members = net_sdk::members::serve_members(mesh.node())
+        .map_err(|e| generic(format!("members service: {e}")))?;
     // Any node may be asked to apply a root-signed org floor (and attest).
     let _org_floor = net_sdk::org::floors::serve_org_floor(mesh.node())
         .map_err(|e| generic(format!("org floor service: {e}")))?;
@@ -2877,11 +2931,12 @@ pub async fn run_members(
     kind: &str,
     target: String,
     state_dir_arg: Option<PathBuf>,
+    remote: Option<RemoteMembers>,
     output: Option<OutputFormat>,
     profile_name: &str,
 ) -> Result<(), CliError> {
     let dir = state_dir(state_dir_arg, profile_name)?.join(NODE_SUBDIR);
-    let (_, reply) = control_call(
+    let (_, mut reply) = control_call(
         &dir,
         serde_json::json!({ "op": "members", "kind": kind, "target": target }),
     )
@@ -2894,8 +2949,162 @@ pub async fn run_members(
     if let Some(e) = reply["error"].as_str() {
         return Err(generic(e.to_string()));
     }
+    if let Some(remote) = remote {
+        reply["remote"] = ask_remote_members(&dir, kind, &target, &reply, remote).await?;
+        reply["completeness"]["remote"] = serde_json::json!(
+            "only the named nodes, each at its own observed_at; an unanswered node is unknown, not empty"
+        );
+    }
     emit_value(OutputFormat::resolve_oneshot(output), &reply)
         .map_err(|e| generic(format!("write result: {e}")))
+}
+
+/// Named remote enforcement points to ask, and the root to sign with.
+pub(crate) struct RemoteMembers {
+    /// The subnet authority root, or the org root (as an entity keypair).
+    pub(crate) root: net::adapter::net::identity::EntityKeypair,
+    /// The subnet authority (subnet queries only).
+    pub(crate) authority: Option<net::adapter::net::identity::EntityId>,
+    /// `self` or `ENTITY@HOST:PORT#NOISE_PUBKEY`.
+    pub(crate) verifiers: Vec<String>,
+    /// Per-node answer bound.
+    pub(crate) wait: Duration,
+}
+
+/// Sign one request per named node, carry each through this node, verify
+/// each observation against its own request, and report per node.
+async fn ask_remote_members(
+    node_dir: &Path,
+    kind: &str,
+    target: &str,
+    local: &serde_json::Value,
+    remote: RemoteMembers,
+) -> Result<serde_json::Value, CliError> {
+    use net_sdk::members::{MembersObservation, MembersOutcome, MembersRequest, MembersTarget};
+    let parse_entity = |hex_id: &str| -> Option<net::adapter::net::identity::EntityId> {
+        let bytes: [u8; 32] = hex::decode(hex_id).ok()?.try_into().ok()?;
+        Some(net::adapter::net::identity::EntityId::from_bytes(bytes))
+    };
+    let target_of = || -> Result<MembersTarget, CliError> {
+        if kind == "subnet" {
+            Ok(MembersTarget::Subnet {
+                authority: remote
+                    .authority
+                    .clone()
+                    .ok_or_else(|| invalid_args("--authority is required with --verifier"))?,
+                scope: super::subnet::parse_subnet_path(target)?,
+            })
+        } else {
+            let bytes: [u8; 32] = hex::decode(target)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| invalid_args("bad org id"))?;
+            let mut subjects: Vec<net::adapter::net::identity::EntityId> = local["issued"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r["subject"].as_str().and_then(parse_entity))
+                .collect();
+            subjects.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            subjects.dedup();
+            Ok(MembersTarget::Org {
+                org: net::adapter::net::behavior::org::OrgId(bytes),
+                subjects,
+            })
+        }
+    };
+    let generation_of = |subject: &str| -> Option<u64> {
+        local["issued"]
+            .as_array()?
+            .iter()
+            .find(|r| r["subject"].as_str() == Some(subject))
+            .and_then(|r| r["approved_generation"].as_u64())
+    };
+    let mut rows = Vec::new();
+    for v in &remote.verifiers {
+        let (entity, contact) = if v == "self" {
+            let entity = local["responder"]
+                .as_str()
+                .and_then(parse_entity)
+                .ok_or_else(|| generic("the node did not name itself"))?;
+            (entity, None)
+        } else {
+            let c = super::subnet::parse_verifier(v)?;
+            (c.entity.clone(), Some(c))
+        };
+        let request =
+            MembersRequest::sign(target_of()?, entity.clone(), &remote.root).map_err(generic)?;
+        let mut call = serde_json::json!({
+            "op": "members_forward",
+            "request": hex::encode(request.to_bytes()),
+            "wait_ms": remote.wait.as_millis() as u64,
+        });
+        if let Some(c) = &contact {
+            call["addr"] = serde_json::json!(c.addr.to_string());
+            call["noise_pubkey"] = serde_json::json!(hex::encode(c.noise_pubkey));
+        }
+        let who = hex::encode(entity.as_bytes());
+        let row = match control_call_within(node_dir, call, remote.wait + Duration::from_secs(5))
+            .await
+        {
+            Err(e) => {
+                serde_json::json!({ "verifier": who, "state": "no_answer", "detail": format!("{e:?}") })
+            }
+            Ok((_, reply)) => match reply["observation"].as_str() {
+                None => serde_json::json!({
+                    "verifier": who,
+                    "state": if reply["refused"].is_string() { "refused" } else { "no_answer" },
+                    "detail": reply["refused"].as_str().or_else(|| reply["no_answer"].as_str()),
+                }),
+                Some(hex_o) => match hex::decode(hex_o)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| MembersObservation::from_bytes(&b))
+                    .and_then(|o| o.verify_for(&request).map(|()| o))
+                {
+                    Err(e) => {
+                        serde_json::json!({ "verifier": who, "state": "bad_observation", "detail": e })
+                    }
+                    Ok(o) => {
+                        let admitted: Vec<serde_json::Value> = o
+                            .admitted
+                            .iter()
+                            .map(|p| {
+                                serde_json::json!({
+                                    "subject": hex::encode(p.subject.as_bytes()),
+                                    "attachment": super::subnet::format_subnet(p.attachment),
+                                    "rights": super::subnet::format_subnet_rights(p.rights),
+                                    "generation": p.generation,
+                                    "expires_at": p.expires_at,
+                                })
+                            })
+                            .collect();
+                        let standing: Vec<serde_json::Value> = o
+                            .floors
+                            .iter()
+                            .map(|(s, floor)| {
+                                let subject = hex::encode(s.as_bytes());
+                                let standing = match generation_of(&subject) {
+                                    Some(g) if u64::from(*floor) > g => "revoked_there",
+                                    Some(_) => "admissible_there",
+                                    None => "unknown_generation",
+                                };
+                                serde_json::json!({ "subject": subject, "floor": floor, "standing": standing })
+                            })
+                            .collect();
+                        serde_json::json!({
+                            "verifier": who,
+                            "state": o.outcome.as_str(),
+                            "observed_at": o.observed_at,
+                            "admitted": if o.outcome == MembersOutcome::Observed && kind == "subnet" { Some(admitted) } else { None },
+                            "standing": if o.outcome == MembersOutcome::Observed && kind == "org" { Some(standing) } else { None },
+                        })
+                    }
+                },
+            },
+        };
+        rows.push(row);
+    }
+    Ok(serde_json::Value::Array(rows))
 }
 
 pub async fn run_org_leave(

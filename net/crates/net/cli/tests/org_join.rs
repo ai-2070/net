@@ -518,6 +518,35 @@ fn org_remove_applies_a_root_signed_floor_at_each_named_node() {
     assert_eq!(rows[2]["state"], "not_member", "{removed}");
     assert_eq!(removed["applied"], 2, "{removed}");
     assert_eq!(removed["complete"], false, "the bystander enforces nothing");
+    // Signed observations, asked with the org root: the operator's node and
+    // the device's own node both hold the floor now; the bystander enforces
+    // no org.
+    let observed = operator.json(&[
+        "org",
+        "members",
+        &org,
+        "--verifier",
+        "self",
+        "--verifier",
+        &contact_of(&node.ready),
+        "--verifier",
+        &contact_of(&other.ready),
+        "--org-key",
+        org_key.to_str().unwrap(),
+    ]);
+    let rows = observed["remote"].as_array().unwrap();
+    assert_eq!(rows[0]["state"], "observed", "{observed}");
+    assert_eq!(
+        rows[0]["standing"][0]["standing"], "revoked_there",
+        "{observed}"
+    );
+    assert_eq!(rows[0]["standing"][0]["floor"], 1, "{observed}");
+    assert_eq!(rows[1]["state"], "observed", "{observed}");
+    assert_eq!(
+        rows[1]["standing"][0]["standing"], "revoked_there",
+        "{observed}"
+    );
+    assert_eq!(rows[2]["state"], "not_member", "{observed}");
     // After removal: still issued, but revoked here (floor above the
     // generation the operator signed).
     let members = operator.json(&["org", "members", &org]);
