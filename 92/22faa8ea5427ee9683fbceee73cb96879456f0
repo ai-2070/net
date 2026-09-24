@@ -1,0 +1,14 @@
+net/crates/net/sdk/examples/gen_org_error_fixtures.rs
+  h_64425bc75e3f3d 34-35,43,46,287-291,295-299,360-361,400-401,415-429,470-473,604-605,638-662,686-689,691-695,749-753,764-766,774-775,786-799,808-812,841-844,865-874,899-902,909-912,914-918,967-976,1028,1035-1038
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9222faa8ea5427ee9683fbceee73cb96879456f0",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
