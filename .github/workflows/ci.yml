@@ -3675,7 +3675,7 @@ jobs:
             live_granted_client_stream_call_and_serve \
             live_granted_duplex_call_and_serve \
             closing_client_and_serve_handle_lets_both_meshes_shut_down_cleanly || exit 1
-          python3 "$CHECK" --label consumer_compile.test --mode literal \
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label consumer_compile.test --mode literal \
             --source net/crates/net/bindings/node/test/consumer_compile.test.ts \
             a_consumer_program_compiles_against_the_shipped_org_surface || exit 1
 
@@ -3688,7 +3688,7 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: |
           set -o pipefail
-          python3 ../../../.github/scripts/check-roster.py --label org_streaming_opening_vectors --mode literal \
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label org_streaming_opening_vectors --mode literal \
             --source test/org_streaming_opening_vectors.test.ts \
             'org streaming opening vectors (cross-language fixture)' \
             'loads the fixture with the expected shape' \
