@@ -516,6 +516,12 @@ impl PyOrgClient {
     /// the audience lease and the node reference alive for as long as the
     /// A2A surface holds it, so a `close()` that lands afterwards cannot
     /// tear a call in flight.
+    ///
+    /// Only the A2A callers need it (`NetMesh.set_a2a_org_caller`,
+    /// `CapabilityGateway.set_a2a_org_caller`, both `a2a`-gated), so the
+    /// gate keeps an `org`-only build — the one the test harnesses build —
+    /// free of a dead method.
+    #[cfg(feature = "a2a")]
     pub(crate) fn shared(&self) -> Option<Arc<net_sdk::org::OrgClient>> {
         self.inner.load_full()
     }
