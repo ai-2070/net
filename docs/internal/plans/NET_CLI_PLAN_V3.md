@@ -3709,6 +3709,77 @@ Inverse mutations, all RED (3):
 
 Gates: CLI clippy `--all-targets`; CLI 365/365.
 
+**W2 receipt: the three-participant journey and `--joined` (2026-09-24).**
+
+`wrap` and `mcp serve` gain `--joined <state-dir>` (user decision).
+- **What it loads.** It opens the join store and holds it for the
+  consumer's lifetime, then loads the enrolled device's identity, mesh PSK
+  and contact. It attaches to the contact direct first, then the relay.
+- **Refusals:**
+  - `up` running on that state (the store is `in use`);
+  - `--psk-hex`;
+  - a partially named peer;
+  - a state that never joined;
+  - a device that left.
+- **Peer override (user decision).** An explicit
+  `--node-addr/--node-pubkey/--node-id` names another peer of the same mesh
+  to attach to, still as the enrolled device with the enrolled PSK.
+- **Found while building W2, now disclosed.** Two devices attached only to
+  the operator cannot invoke each other's tools:
+  - announcements flood through the hub only when they are sent, so a
+    device that attaches after the provider announced never sees it;
+  - nRPC needs a direct or relayed session to the provider, which neither
+    `mcp serve` nor the gateway opens.
+
+  Invoking across the hub remains future work.
+
+Witness `cli/tests/enrollment_workflow.rs` (auto-discovered): all real
+subprocesses on loopback, `--no-port-mapping`.
+- `three_participants_join_publish_are_selectively_removed_and_invoke_as_enrolled_devices`:
+  1. **Offline ceremonies.** The subnet root and issuer grant, then the
+     channel root (an operator identity) and a grant to the learned
+     enrollment issuer. Neither root reaches the node.
+  2. **Operator.** `up --enroll --subnet-issuer-grant … --channel-grant …`,
+     then `channel serve`.
+  3. **Joins.** B and C each join with one composed link (mesh + subnet 3.7
+     + channel). Both `up`s are admitted to the subnet and ACKed on the
+     channel.
+  4. **Publish.** B's `channel publish` is `open` while ungated, denied at
+     its gate under a stranger root, then `passed`.
+  5. **Selective removal.** `subnet remove` of B with `--verifier self`
+     completes. B's restart is refused admission (`revoked`) while C's is
+     admitted, and the operator observes only C at 3.7.
+  6. **Enrolled tool call.** B runs `wrap --joined` with `--allow` for C's
+     origin. C runs `mcp serve --joined` attached to B. C discovers the
+     tool. The consent gate refuses with no provider effect. After a pin
+     approval exactly one call leaves exactly one provider-side record.
+  7. **Leave and cleanup.** C `leave`s with `channel_unsubscribed: true`.
+     C's next `up` is refused, and the operator goes `down`.
+- `joined_consumers_refuse_what_they_cannot_honour`: the five refusals
+  above.
+
+Inverse mutations, all RED (4):
+
+| # | Mutation |
+|---|---|
+| 1 | Ephemeral identity instead of the enrolled one (the provider's owner scope refuses) |
+| 2 | A left join is not refused |
+| 3 | Peer override ignored |
+| 4 | `--psk-hex` accepted |
+
+Gates: CLI clippy `--all-targets`; CLI 367/367. The journey runs in ~44 s.
+
+E16 coverage from this receipt:
+- an acknowledged full-chain subscription;
+- a caller-requested publish accepted by the local production gate;
+- actual gate denials: the channel ACL, the consent gate and subnet
+  revocation;
+- a provider-side accepted effect under enrolled identities;
+- selective removal, restart and cleanup.
+
+Subscriber receipt of the published payload is not requested by this
+fixture.
+
 ## 8. Cumulative acceptance matrix
 
 All rows are required unless explicitly marked feature-conditional; narrow slices can be accepted independently without calling the entire plan complete.
