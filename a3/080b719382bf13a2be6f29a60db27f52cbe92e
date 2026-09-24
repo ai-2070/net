@@ -1,0 +1,39 @@
+net/crates/net/cli/src/commands/subnet.rs
+  s_3f3d4c91f992be::t_5d2eada3d540c7 103-119,298-308,313
+net/crates/net/cli/tests/org_join.rs
+  s_3f3d4c91f992be::t_fa309c6f7dd38d 521-549
+net/crates/net/cli/tests/subnet_join.rs
+  s_3f3d4c91f992be::t_fa309c6f7dd38d 671,714-748,769-771
+  s_3f3d4c91f992be::t_02dd4bb591220b 749-768
+net/crates/net/sdk/src/lib.rs
+  s_3f3d4c91f992be::t_69568ff9398477 178-181
+net/crates/net/sdk/tests/members_observe.rs
+  s_3f3d4c91f992be::t_8e7d60e9d28404 8,53-54,62-67,97-98,121-122
+  s_3f3d4c91f992be::t_f3b0f9ceefa907 1-7,9-52,55-61,68-96,99-120,123-150
+net/crates/net/sdk/src/members.rs
+  s_3f3d4c91f992be::t_a187215953476f 1-174,178-344,347-354,360-560
+  s_3f3d4c91f992be::t_69568ff9398477 175-177,345-346,355-359
+net/crates/net/cli/src/commands/lifecycle.rs
+  s_3f3d4c91f992be::t_5d2eada3d540c7 1505-1554,2094,2500-2502,2934,2939,2952-2957,2962-3108
+  s_3f3d4c91f992be::t_d352b71e9f6078 3109
+net/crates/net/cli/src/commands/org.rs
+  s_3f3d4c91f992be::t_5d2eada3d540c7 124-137,594-614,619
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_4744eeeaa70578 2941-3014
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a3080b719382bf13a2be6f29a60db27f52cbe92e",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
