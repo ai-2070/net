@@ -240,6 +240,17 @@ pub async fn run(
             .await
         }
         ChannelCommand::Leave(args) => {
+            let root = super::lifecycle::state_dir(args.state_dir.clone(), profile_name)?;
+            // No node running: record the departure offline.
+            if !super::lifecycle::node_running(&root)? {
+                if let Some(name) = &args.channel {
+                    parse_channel_name(name)?;
+                }
+                let reply =
+                    super::lifecycle::offline_channel_leave(&root, args.channel.as_deref())?;
+                return emit_value(OutputFormat::resolve_oneshot(output), &reply)
+                    .map_err(|e| generic(format!("write result: {e}")));
+            }
             let mut request = json!({ "op": "channel_leave" });
             if let Some(name) = &args.channel {
                 parse_channel_name(name)?;

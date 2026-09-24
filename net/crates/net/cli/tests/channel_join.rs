@@ -813,3 +813,47 @@ fn wait_for_channel_list(fx: &Fx, what: &str, done: impl Fn(&Vec<Value>) -> bool
     }
     panic!("{what}: never got there; last status {last}");
 }
+
+/// E18/E19 (channel): with no node running, `channel leave` completes
+/// locally — recorded durably by the owning store — while the publisher-side
+/// unsubscribe is reported unconfirmed, not claimed. It is idempotent, and
+/// the next `up` does not subscribe again.
+#[test]
+fn an_offline_channel_leave_completes_locally_and_restart_honours_it() {
+    let operator = Fx::new();
+    let (op_args, root_hex) = operator_with_grant(&operator);
+    let _op = operator.up(&strs(&op_args));
+    operator.json(&["channel", "serve", CHANNEL, "--token-root", &root_hex]);
+    let created = operator.json(&[
+        "invite",
+        "create",
+        "--channel",
+        CHANNEL,
+        "--channel-rights",
+        "subscribe",
+    ]);
+    let agent = Fx::new();
+    agent.json(&["join", created["token"].as_str().unwrap(), "--yes"]);
+    let node = agent.up(&[]);
+    assert_eq!(node.ready["joined"]["channel"]["subscribed"], true);
+    drop(node);
+
+    let left = agent.json(&["channel", "leave"]);
+    assert_eq!(left["runtime"], "not_running", "{left}");
+    assert_eq!(left["newly_left"], true, "{left}");
+    assert_eq!(left["unsubscribed"], false, "{left}");
+    assert!(
+        left["unsubscribe_detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("unconfirmed"),
+        "{left}"
+    );
+    assert_eq!(agent.json(&["channel", "leave"])["newly_left"], false);
+
+    let node = agent.up(&[]);
+    let ch = &node.ready["joined"]["channel"];
+    assert_eq!(ch["state"], "left", "{}", node.ready);
+    assert!(ch.get("subscribed").is_none(), "{}", node.ready);
+    drop(node);
+}

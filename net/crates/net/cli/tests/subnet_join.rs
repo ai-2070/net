@@ -957,3 +957,60 @@ fn a_device_leaves_its_subnet_relation_and_is_withdrawn_at_the_verifier() {
     assert!(admitted_here(&operator).as_array().unwrap().is_empty());
     drop(node);
 }
+
+/// E18/E19 (subnet): with no node running, `subnet leave` completes locally —
+/// recorded durably, the active record released — while the verifier-side
+/// cleanup is reported unconfirmed, not claimed. It is idempotent, and the
+/// next `up` neither presents nor renews the relation.
+#[test]
+fn an_offline_subnet_leave_completes_locally_and_restart_honours_it() {
+    let operator = Fx::new();
+    let keys = operator.tmp.path().join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let (_root, _root_hex, issuer, grant) = ceremony(&keys);
+    let _op = operator.up(&[
+        "--enroll",
+        "--no-port-mapping",
+        "--subnet-issuer-grant",
+        grant.to_str().unwrap(),
+        "--subnet-issuer-key",
+        issuer.to_str().unwrap(),
+    ]);
+    let created = operator.json(&["invite", "create", "--subnet", "3.7"]);
+    let agent = Fx::new();
+    agent.json(&["join", &token_of(&created), "--yes"]);
+    let node = agent.up(&[]);
+    assert_eq!(node.ready["joined"]["subnet"]["admitted"], true);
+    drop(node);
+
+    let left = agent.json(&["subnet", "leave", "3.7"]);
+    assert_eq!(left["runtime"], "not_running", "{left}");
+    assert_eq!(left["newly_left"], true, "{left}");
+    assert_eq!(left["was_active"], true, "{left}");
+    assert!(
+        left["withdrawal"]
+            .as_str()
+            .unwrap()
+            .starts_with("unconfirmed"),
+        "{left}"
+    );
+    assert_eq!(agent.json(&["subnet", "leave", "3.7"])["newly_left"], false);
+
+    let node = agent.up(&[]);
+    assert_eq!(
+        node.ready["joined"]["subnet"]["state"], "left",
+        "{}",
+        node.ready
+    );
+    assert_eq!(node.ready["joined"]["attached"], true, "{}", node.ready);
+    std::thread::sleep(Duration::from_secs(2));
+    let members = operator.json(&["subnet", "members", "3.7"]);
+    assert!(
+        members["observed"]["admitted_here"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{members}"
+    );
+    drop(node);
+}

@@ -4102,6 +4102,57 @@ It now alternates UDP-first and TCP-first up to 1000 times. Its remaining
 pick-then-bind window is disclosed; the Linux "Address already in use" flake
 came from it.
 
+**S4 receipt: leave contract, E17/E18/E19/E26 (2026-09-25).**
+
+**Offline relation leave.** `subnet leave <scope>` and
+`channel leave [<name>]` also work with no node running. The CLI probes the
+lifetime lock; a held lock goes through the running node as before.
+- **The departure is recorded durably by the owning store:**
+  - the join relation's marker (`subnet.left` / `channel.left`), or
+  - the standalone membership store (`SubnetMembership` /
+    `ChannelMembership::leave`, which erases and fences).
+
+  Subnet leave also releases the active-attachment record when that
+  relation was active.
+- **Local departure and remote cleanup are separate fields:**
+  - `runtime: not_running` with `newly_left`;
+  - subnet `withdrawal: unconfirmed…` (was active) or `not_active`;
+  - channel `unsubscribed: false`, with `unsubscribe_detail: unconfirmed…`;
+  - `publish_stop: confirmed`, because no runtime holds the credential.
+- **It is idempotent.** A left join, or a state that never joined, is
+  refused.
+
+**Stop-unconfirmed (E17/E26).** The in-source unit test
+`channel_link::tests::publish_stop_is_unconfirmed_while_another_publish_source_remains`
+runs against a real SDK mesh:
+- with a direct root PUBLISH token cached next to the managed chain, leave
+  removes exactly the chain but reports `publish_stop: unconfirmed`;
+- without it, the stop is `confirmed`.
+
+Witnesses:
+- `subnet_join::an_offline_subnet_leave_completes_locally_and_restart_honours_it`:
+  1. With the node stopped, the offline leave is recorded, `was_active`,
+     with the withdrawal unconfirmed.
+  2. A repeat is idempotent.
+  3. The next `up` reports `left` and stays attached.
+  4. The operator observes no admission.
+- `channel_join::an_offline_channel_leave_completes_locally_and_restart_honours_it`:
+  the same shape for a subscribe credential, with the unsubscribe
+  unconfirmed. The next `up` does not subscribe.
+- The earlier E19 witnesses stand: the subnet late-renewal fence (a
+  mutation plus the 15 s leaf) and the channel membership install fence.
+
+Inverse mutations, all RED (4):
+
+| # | Mutation |
+|---|---|
+| 1 | Another publish source ignored |
+| 2 | Offline subnet leave not recorded |
+| 3 | Offline channel leave not recorded |
+| 4 | Offline withdrawal claimed confirmed |
+
+Gates: CLI clippy `--all-targets`; CLI 374/374.
+
 **Still open against the matrix (disclosed, not claimed):**
 
 | Row | Open item |

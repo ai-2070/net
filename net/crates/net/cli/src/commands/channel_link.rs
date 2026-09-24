@@ -408,3 +408,94 @@ pub(crate) async fn leave(
     }
     reply
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use net::adapter::net::identity::{EntityKeypair, PermissionToken};
+    use net_sdk::channel_issuer::ChannelLeafIssuer;
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    /// E17/E26: publish leave removes exactly its managed chain and evicts
+    /// its tokens; if another PUBLISH credential for this node remains in
+    /// the cache (a source this runtime does not manage), the stop is
+    /// reported `unconfirmed`, never `confirmed`.
+    #[tokio::test]
+    async fn publish_stop_is_unconfirmed_while_another_publish_source_remains() {
+        for other_source in [false, true] {
+            let root = EntityKeypair::generate();
+            let operator = net_sdk::identity::Identity::generate();
+            let device = net_sdk::identity::Identity::generate();
+            let channel = net::adapter::net::channel::ChannelName::new("fleet.telemetry").unwrap();
+            let grant = PermissionToken::try_issue(
+                &root,
+                operator.entity_id().clone(),
+                TokenScope::PUBLISH.union(TokenScope::DELEGATE),
+                channel.hash(),
+                DAY,
+                1,
+            )
+            .unwrap();
+            let issuer = ChannelLeafIssuer::new(grant, (**operator.keypair()).clone()).unwrap();
+            let chain = issuer
+                .issue(device.entity_id(), TokenScope::PUBLISH)
+                .unwrap();
+            if other_source {
+                // A direct root grant for this device, cached next to the chain.
+                device
+                    .install_token(
+                        PermissionToken::try_issue(
+                            &root,
+                            device.entity_id().clone(),
+                            TokenScope::PUBLISH,
+                            channel.hash(),
+                            DAY,
+                            0,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let mesh = net_sdk::MeshBuilder::new("127.0.0.1:0", &[0x51; 32])
+                .unwrap()
+                .identity(device.clone())
+                .build()
+                .await
+                .unwrap();
+            let cred = ChannelCred {
+                offer: ChannelOffer {
+                    channel: channel.clone(),
+                    root: root.entity_id().clone(),
+                    rights: TokenScope::PUBLISH,
+                },
+                chain,
+            };
+            let link = start(mesh.node(), &cred, false, None, Duration::from_secs(1)).await;
+            assert_eq!(link.publish_installed, Some(true));
+            let link: SharedChannel = Arc::new(parking_lot::Mutex::new(link));
+            let left = AtomicBool::new(false);
+            let reply = leave(
+                mesh.node(),
+                &cred,
+                0,
+                &left,
+                &link,
+                Duration::from_secs(1),
+                |_| Ok(None),
+            )
+            .await;
+            assert_eq!(reply["publish_removed"], true, "{reply}");
+            assert_eq!(
+                reply["publish_stop"],
+                if other_source {
+                    "unconfirmed"
+                } else {
+                    "confirmed"
+                },
+                "{reply}"
+            );
+            assert!(left.load(Ordering::SeqCst));
+        }
+    }
+}

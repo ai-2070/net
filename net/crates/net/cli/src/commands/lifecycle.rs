@@ -1795,6 +1795,201 @@ enum Liveness {
     Held,
 }
 
+/// Whether a node holds the lifetime lock of `state_root` right now.
+pub(crate) fn node_running(state_root: &Path) -> Result<bool, CliError> {
+    Ok(probe(&state_root.join(NODE_SUBDIR))? == Liveness::Held)
+}
+
+/// Open this state's join for an offline relation leave (no node running).
+fn open_join_offline(
+    state_root: &Path,
+) -> Result<net_sdk::enrollment::device::DeviceJoin, CliError> {
+    use net_sdk::enrollment::device::{DeviceJoin, DeviceJoinError};
+    let join_dir = state_root.join(super::enrollment::JOIN_SUBDIR);
+    if !join_dir.exists() {
+        return Err(invalid_args(format!(
+            "{} has not joined a mesh; nothing to leave",
+            state_root.display()
+        )));
+    }
+    let join = DeviceJoin::open(&join_dir).map_err(|e| match e {
+        DeviceJoinError::Storage(StorageError::Busy) => generic(format!(
+            "join state {} is in use by another process; nothing was changed, retry",
+            join_dir.display()
+        )),
+        other => generic(format!("join state {}: {other}", join_dir.display())),
+    })?;
+    if let Some(at) = join.left_at() {
+        return Err(invalid_args(format!(
+            "this device left the mesh at unix {at}; its relations went with it"
+        )));
+    }
+    Ok(join)
+}
+
+/// `subnet leave` with no node running: the departure is recorded durably
+/// (the join relation's marker, or the membership store) and the active
+/// record released. Nothing runs, so nothing is presented or renewed; the
+/// verifier's admission ended with the node's session, which this command
+/// cannot confirm — reported, not claimed.
+pub(crate) fn offline_subnet_leave(
+    state_root: &Path,
+    scope: &str,
+) -> Result<serde_json::Value, CliError> {
+    let path = super::subnet::parse_subnet_path(scope)?;
+    let scope_text = super::subnet::format_subnet(path);
+    let join = open_join_offline(state_root)?;
+    let now = now_unix();
+    let joined = join
+        .invite()
+        .subnet()
+        .filter(|o| o.scope.path == path)
+        .zip(join.bundle().filter(|b| b.subnet_credentials().is_some()));
+    let (verifier, newly, relation) = match joined {
+        Some((_, bundle)) => {
+            let newly = read_subnet_left(state_root).is_none();
+            if newly {
+                record_subnet_left(state_root, &scope_text, now)
+                    .map_err(|e| generic(format!("the departure was not recorded: {e}")))?;
+            }
+            (bundle.contact().node_id, newly, "join")
+        }
+        None => {
+            let mut memberships = load_memberships(&state_root.join(SUBNETS_SUBDIR))?;
+            let m = memberships
+                .iter_mut()
+                .find(|m| m.offer().is_some_and(|o| o.scope.path == path))
+                .ok_or_else(|| {
+                    invalid_args(format!(
+                        "this device holds no subnet relation at {scope_text}"
+                    ))
+                })?;
+            let newly = m
+                .leave(now)
+                .map_err(|e| generic(format!("the departure was not recorded: {e}")))?;
+            (m.issuer_node(), newly, "standalone")
+        }
+    };
+    drop(join);
+    let mut attachments = super::subnet_active::Attachments::load(state_root).map_err(generic)?;
+    let was_active = attachments.is_active(verifier, &scope_text);
+    if was_active {
+        attachments
+            .clear_if(verifier, &scope_text)
+            .map_err(|e| generic(format!("the active attachment record: {e}")))?;
+    }
+    Ok(serde_json::json!({
+        "left": true,
+        "newly_left": newly,
+        "scope": scope_text,
+        "relation": relation,
+        "runtime": "not_running",
+        "was_active": was_active,
+        "withdrawal": if was_active {
+            "unconfirmed: no node is running; its admission ended with its session, which this command cannot observe"
+        } else {
+            "not_active"
+        },
+        "credentials": if relation == "join" { "disabled: kept in the join, never presented or renewed" } else { "erased" },
+        "credential_validity": "unchanged: valid until it expires or the operator runs `subnet remove`",
+    }))
+}
+
+/// `channel leave` with no node running: recorded durably by the owning
+/// store. Nothing runs, so no publish credential is held locally (confirmed);
+/// the publisher dropped any subscription with the node's session, which
+/// this command cannot observe (unconfirmed).
+pub(crate) fn offline_channel_leave(
+    state_root: &Path,
+    wanted: Option<&str>,
+) -> Result<serde_json::Value, CliError> {
+    let join = open_join_offline(state_root)?;
+    let now = now_unix();
+    let matches = |name: &str| wanted.is_none_or(|w| w == name);
+    let join_channel = join
+        .invite()
+        .channel()
+        .cloned()
+        .filter(|_| join.bundle().is_some_and(|b| b.channel_chain().is_some()))
+        .filter(|o| matches(o.channel.as_str()));
+    drop(join);
+    let mut memberships = load_channel_memberships(&state_root.join(CHANNELS_SUBDIR))?;
+    let join_active = join_channel
+        .as_ref()
+        .filter(|_| super::channel_link::read_left(state_root).is_none());
+    let standalone_active: Vec<usize> = memberships
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.left_at().is_none() && m.chain().is_some())
+        .filter(|(_, m)| m.offer().is_some_and(|o| matches(o.channel.as_str())))
+        .map(|(i, _)| i)
+        .collect();
+    let (offer, newly) = match (join_active, standalone_active.as_slice()) {
+        (Some(offer), []) => {
+            let newly =
+                super::channel_link::record_join_left(state_root, offer.channel.as_str(), now)
+                    .map_err(|e| generic(format!("the departure was not recorded: {e}")))?
+                    .is_none();
+            (offer.clone(), newly)
+        }
+        (None, [i]) => {
+            let m = &mut memberships[*i];
+            let offer = m
+                .offer()
+                .cloned()
+                .ok_or_else(|| generic("corrupt membership"))?;
+            let newly = m
+                .leave(now)
+                .map_err(|e| generic(format!("the departure was not recorded: {e}")))?;
+            (offer, newly)
+        }
+        (None, []) => {
+            // Nothing active: a repeat of a completed leave is idempotent.
+            let known = join_channel.is_some()
+                || memberships
+                    .iter()
+                    .any(|m| m.offer().is_some_and(|o| matches(o.channel.as_str())));
+            if known {
+                return Ok(
+                    serde_json::json!({ "left": true, "newly_left": false, "runtime": "not_running" }),
+                );
+            }
+            return Err(invalid_args(
+                "this device holds no channel credential to leave",
+            ));
+        }
+        _ => {
+            return Err(invalid_args(
+                "several channel relations are active; name one (`channel leave <name>`)",
+            ))
+        }
+    };
+    let mut reply = serde_json::json!({
+        "left": true,
+        "newly_left": newly,
+        "channel": offer.channel.as_str(),
+        "runtime": "not_running",
+    });
+    if offer
+        .rights
+        .contains(net::adapter::net::identity::TokenScope::SUBSCRIBE)
+    {
+        reply["unsubscribed"] = serde_json::json!(false);
+        reply["unsubscribe_detail"] = serde_json::json!(
+            "unconfirmed: no node is running; the publisher dropped the subscription with its session, which this command cannot observe"
+        );
+    }
+    if offer
+        .rights
+        .contains(net::adapter::net::identity::TokenScope::PUBLISH)
+    {
+        reply["publish_stop"] = serde_json::json!("confirmed");
+        reply["publish_stop_detail"] =
+            serde_json::json!("no runtime holds the credential; it is never installed again");
+    }
+    Ok(reply)
+}
+
 /// Probe the lifetime lock without creating anything.
 fn probe(dir: &Path) -> Result<Liveness, CliError> {
     let file = match File::open(dir.join(LOCK_FILE)) {

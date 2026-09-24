@@ -343,6 +343,13 @@ pub async fn run(
         }
         SubnetCommand::Leave(args) => {
             parse_subnet_path(&args.scope)?;
+            let root = super::lifecycle::state_dir(args.state_dir.clone(), profile_name)?;
+            // No node running: record the departure offline.
+            if !super::lifecycle::node_running(&root)? {
+                let reply = super::lifecycle::offline_subnet_leave(&root, &args.scope)?;
+                return emit_value(OutputFormat::resolve_oneshot(output), &reply)
+                    .map_err(|e| generic(format!("write result: {e}")));
+            }
             let node_dir = super::lifecycle::state_dir(args.state_dir, profile_name)?
                 .join(super::lifecycle::NODE_SUBDIR);
             let (_, reply) = super::lifecycle::control_call(
