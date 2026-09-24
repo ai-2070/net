@@ -31,8 +31,8 @@
 
 use net::adapter::net::behavior::org::{OrgError, OrgKeypair, OrgMembershipCert};
 use net::adapter::net::behavior::org_call::{
-    MAX_ORG_CALL_PROOF_BYTES, ORG_CALL_BINDING_CONTEXT, ORG_STREAM_CALL_BINDING_CONTEXT,
-    OrgCallProof, OrgStreamCallProof, STREAM_CALL_KIND_CLIENT_STREAMING, STREAM_CALL_KIND_DUPLEX,
+    OrgCallProof, OrgStreamCallProof, MAX_ORG_CALL_PROOF_BYTES, ORG_CALL_BINDING_CONTEXT,
+    ORG_STREAM_CALL_BINDING_CONTEXT, STREAM_CALL_KIND_CLIENT_STREAMING, STREAM_CALL_KIND_DUPLEX,
     STREAM_CALL_KIND_SERVER_STREAMING,
 };
 use net::adapter::net::behavior::org_grant::{
@@ -43,7 +43,7 @@ use net::adapter::net::identity::EntityKeypair;
 use net_sdk::org::parse_org_wire;
 
 use base64::Engine as _;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 // ===========================================================================
 // The frozen identity seeds — the SAME four-party shape as the live X2
@@ -1025,7 +1025,11 @@ fn run_check() -> i32 {
         }
     }
     println!("== {} rows, {} failed", rows.len(), failed);
-    if failed > 0 { 1 } else { 0 }
+    if failed > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 fn main() {
