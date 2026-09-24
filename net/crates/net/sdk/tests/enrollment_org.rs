@@ -345,6 +345,7 @@ mod live {
     use super::*;
     use net::adapter::net::behavior::capability::CapabilitySet;
     use net::adapter::net::behavior::org_authority::{NodeAuthority, OwnerAudienceCredential};
+    use net::adapter::net::identity::EntityKeypair;
     use net::adapter::net::{ChannelConfigRegistry, MeshNode, MeshNodeConfig};
     use net_sdk::org::{DispatcherScope, OrgAccess, OrgCaller, OrgCredentials, OrgDispatcherGrant};
     use net_sdk::Mesh;
@@ -561,5 +562,236 @@ mod live {
         let (caller, acting) = served_for.lock().clone().expect("the handler ran");
         assert_eq!(&caller, device_identity.entity_id());
         assert_eq!(acting, org.org_id());
+    }
+
+    /// Connect `caller` to `provider` and wait until both pin each other's
+    /// entity (org admission binds the caller's membership to it).
+    async fn link_up(caller: &Mesh, provider: &Mesh) {
+        let caller_id = caller.node_id();
+        caller
+            .node()
+            .connect_via(
+                provider.local_addr(),
+                provider.public_key(),
+                provider.node_id(),
+            )
+            .await
+            .unwrap();
+        for m in [caller, provider] {
+            m.node()
+                .announce_capabilities(CapabilitySet::new())
+                .await
+                .unwrap();
+        }
+        for _ in 0..100 {
+            if caller.node().peer_entity_id(provider.node_id()).is_some()
+                && provider.node().peer_entity_id(caller_id).is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("entity pins were not established");
+    }
+
+    /// A member mesh: adopted into `org` at generation 1 (in `dir`), with
+    /// the org's shared owner audience pre-staged when given.
+    async fn member(
+        org: &OrgKeypair,
+        identity: &Identity,
+        dir: &std::path::Path,
+        audience: Option<&[u8]>,
+    ) -> Mesh {
+        let adopted = NodeAuthority::adopt(
+            dir,
+            OrgMembershipCert::try_issue(org, identity.entity_id().clone(), 1, YEAR).unwrap(),
+            identity.entity_id(),
+            0,
+            None,
+        )
+        .unwrap();
+        let (node, configs) = node_for(identity).await;
+        let authority = match audience {
+            None => adopted,
+            Some(bytes) => NodeAuthority {
+                config: adopted.config.clone(),
+                audience: OwnerAudienceCredential::decode_config(bytes).unwrap(),
+                revocation: adopted.revocation.clone(),
+            },
+        };
+        node.install_node_authority(Arc::new(authority)).unwrap();
+        node.set_owner_cert_emission(true).unwrap();
+        let mesh = Mesh::from_node_arc(node, configs, Some(identity.clone()));
+        mesh.start();
+        mesh
+    }
+
+    /// A provider serving `org.ping` to same-org callers.
+    fn serve_ping(provider: &Mesh) -> net_sdk::mesh_rpc::ServeHandle {
+        provider
+            .serve_org(
+                "org.ping",
+                OrgAccess::SameOrg,
+                |_caller: OrgCaller, req: Ping| async move { Ok(Pong { n: req.n + 1 }) },
+            )
+            .unwrap()
+    }
+
+    /// Call `org.ping` as `caller` (retrying while discovery converges);
+    /// `Ok` when admitted, the last error otherwise.
+    async fn ping(
+        caller: &Mesh,
+        provider: &Mesh,
+        org: &OrgKeypair,
+        who: &Identity,
+    ) -> Result<(), String> {
+        let dispatcher =
+            OrgDispatcherGrant::try_issue(org, who.entity_id().clone(), DispatcherScope::Any, 3600)
+                .unwrap();
+        let cert = OrgMembershipCert::try_issue(org, who.entity_id().clone(), 1, YEAR).unwrap();
+        let client = caller
+            .org(OrgCredentials::new(cert, dispatcher, vec![], vec![]).unwrap())
+            .map_err(|e| e.to_string())?;
+        let mut last = String::new();
+        for _ in 0..60 {
+            provider
+                .node()
+                .announce_capabilities(CapabilitySet::new())
+                .await
+                .ok();
+            match client.call::<Ping, Pong>("org.ping", &Ping { n: 1 }).await {
+                Ok(_) => return Ok(()),
+                Err(e) => last = e.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(last)
+    }
+
+    /// O2's decisive witness. A root-signed floor applied at the provider
+    /// (through the attested floor service) revokes member B: B's calls with
+    /// its old certificate are refused, while member C of the same org is
+    /// still admitted; the provider's attestation, signed over the exact
+    /// request, reports the floor applied; and after the provider restarts
+    /// (a new node reopening its persisted authority) B is still refused and
+    /// C still admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_floor_revokes_one_member_at_the_provider_and_survives_its_restart() {
+        use net::adapter::net::behavior::org::OrgRevocationBundle;
+        use net_sdk::org::floors::{
+            request_org_floor, serve_org_floor, OrgFloorOutcome, OrgFloorRequest,
+        };
+
+        let org = OrgKeypair::generate();
+        let tmp = tempfile::tempdir().unwrap();
+        let (p_id, b_id, c_id) = (
+            Identity::generate(),
+            Identity::generate(),
+            Identity::generate(),
+        );
+        let provider = member(&org, &p_id, &tmp.path().join("p"), None).await;
+        let audience = provider
+            .node()
+            .node_authority()
+            .unwrap()
+            .audience
+            .encode_config();
+        let b = member(&org, &b_id, &tmp.path().join("b"), Some(&audience)).await;
+        let c = member(&org, &c_id, &tmp.path().join("c"), Some(&audience)).await;
+        let _floor_service = serve_org_floor(provider.node()).unwrap();
+        let _ping = serve_ping(&provider);
+        link_up(&b, &provider).await;
+        link_up(&c, &provider).await;
+        ping(&b, &provider, &org, &b_id)
+            .await
+            .expect("B admitted before removal");
+        ping(&c, &provider, &org, &c_id)
+            .await
+            .expect("C admitted before removal");
+
+        // Remove B: floor 2 kills B's generation-1 certificate. Delivered by
+        // C's node here — any peer may carry a root-signed floor.
+        let mut floors = std::collections::BTreeMap::new();
+        floors.insert(b_id.entity_id().clone(), 2u32);
+        let bundle = OrgRevocationBundle::try_issue(&org, &floors).unwrap();
+        let request = OrgFloorRequest::new(&bundle, p_id.entity_id().clone()).unwrap();
+        let attestation = request_org_floor(
+            c.node(),
+            provider.node_id(),
+            &request,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        attestation.verify_for(&request).unwrap();
+        assert_eq!(attestation.outcome, OrgFloorOutcome::Applied);
+        assert_eq!(attestation.floor_of(b_id.entity_id()), Some(2));
+        // An attestation does not verify against any other request.
+        let other = OrgFloorRequest::new(&bundle, p_id.entity_id().clone()).unwrap();
+        assert!(attestation.verify_for(&other).is_err());
+
+        assert!(
+            ping(&b, &provider, &org, &b_id).await.is_err(),
+            "B's old membership is refused"
+        );
+        ping(&c, &provider, &org, &c_id)
+            .await
+            .expect("C still admitted");
+
+        // The provider restarts: a new node reopening its persisted authority.
+        drop(_ping);
+        drop(_floor_service);
+        let p_node_dir = tmp.path().join("p");
+        provider.shutdown().await.unwrap();
+        let (node, configs) = node_for(&p_id).await;
+        let restarted = Mesh::from_node_arc(node, configs, Some(p_id.clone()));
+        restarted.install_org_authority(&p_node_dir).unwrap();
+        restarted.start();
+        assert_eq!(
+            restarted
+                .node()
+                .node_authority()
+                .unwrap()
+                .revocation
+                .floor_for(&org.org_id(), b_id.entity_id()),
+            2,
+            "the floor was persisted"
+        );
+        let _ping = serve_ping(&restarted);
+        link_up(&b, &restarted).await;
+        link_up(&c, &restarted).await;
+        assert!(
+            ping(&b, &restarted, &org, &b_id).await.is_err(),
+            "B stays refused across the provider's restart"
+        );
+        ping(&c, &restarted, &org, &c_id)
+            .await
+            .expect("C still admitted after restart");
+    }
+
+    /// A node that holds no org authority attests that it enforces nothing;
+    /// a request naming another node is refused outright.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_without_org_authority_attests_not_member() {
+        use net::adapter::net::behavior::org::OrgRevocationBundle;
+        use net_sdk::org::floors::{answer_org_floor, OrgFloorOutcome, OrgFloorRequest};
+        let org = OrgKeypair::generate();
+        let node = EntityKeypair::generate();
+        let mut floors = std::collections::BTreeMap::new();
+        floors.insert(Identity::generate().entity_id().clone(), 2u32);
+        let bundle = OrgRevocationBundle::try_issue(&org, &floors).unwrap();
+        let request = OrgFloorRequest::new(&bundle, node.entity_id().clone()).unwrap();
+        let attestation = answer_org_floor(&request.to_bytes(), &node, None, now()).unwrap();
+        attestation.verify_for(&request).unwrap();
+        assert_eq!(attestation.outcome, OrgFloorOutcome::NotMember);
+        // A tampered attestation does not verify.
+        let mut forged = attestation.to_bytes();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        let forged = net_sdk::org::floors::OrgFloorAttestation::from_bytes(&forged).unwrap();
+        assert!(forged.verify_for(&request).is_err());
+        let elsewhere =
+            OrgFloorRequest::new(&bundle, EntityKeypair::generate().entity_id().clone()).unwrap();
+        assert!(answer_org_floor(&elsewhere.to_bytes(), &node, None, now()).is_err());
     }
 }

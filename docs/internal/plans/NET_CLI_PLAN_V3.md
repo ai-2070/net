@@ -1956,9 +1956,100 @@ discover each other privately. The protected-call witness pre-stages it, as
 the existing live facade test does. Admission itself is unaffected.
 Distribution belongs with the org half's next slices.
 
-**Next: O2 `org remove`.** A root-signed floor applied to running
-enforcement points with per-node reporting; nothing applies floors to a
-running node today.
+**O2 `org remove`:** see the next receipt.
+
+#### V3-2 org O2 — `org remove` (receipt, 2026-09-24)
+
+Decisions (user, 2026-09-24):
+- floors are delivered **over the mesh, attested**, the same shape as
+  `subnet remove`;
+- the generation is **explicit and required** (`--minimum-generation`).
+
+**Mechanism: reused, not replaced.** A floor is the existing root-signed
+`OrgRevocationBundle`. `NodeAuthority.revocation.apply_bundle` merges it
+monotonically, persists it before publishing the live view, and reloads it at
+restart. Admission checks `floor_for(org, member)` against that live view.
+What was missing, and is now added:
+- a way to put a floor onto a *running* node;
+- proof that it landed.
+
+**SDK `net_sdk::org::floors`.**
+- `OrgFloorRequest`: the bundle, the named node and a nonce, with a ±300 s
+  freshness window.
+- `answer_org_floor`:
+  - applies the bundle to the node's installed authority;
+  - signs an `OrgFloorAttestation` with the node's entity key over the exact
+    request digest;
+  - the attestation carries the outcome (`applied` / `not_member` /
+    `uncertain` / `refused`) and the node's effective floor per named member;
+  - `DurabilityUncertain` is never reported as success;
+  - a request naming another node is refused.
+- `serve_org_floor` (`net.org.floor.apply`, applied off the async runtime)
+  and `request_org_floor`.
+- A floor authenticates itself (root-signed, can only raise), so any peer
+  may carry one.
+
+**CLI.**
+- `net-mesh org remove <member> --org-key K --minimum-generation N
+  --verifier self|ENTITY@HOST:PORT#PUBKEY … [--dry-run] [--wait]`:
+  - signs the floor **on the operator's machine**;
+  - carries it through the operator's node (control op `org_floor_forward`:
+    answers locally, or connects and forwards);
+  - verifies every attestation against its own request;
+  - reports per node; `complete` only when every named node attested
+    applied at ≥ N;
+  - states the scope: transport and other grants are untouched, and nodes
+    not named were not asked.
+- Every `up` serves floor application.
+- A node whose adopted membership has ended keeps running without the org:
+  - revoked by a floor → `org_state: revoked`;
+  - expired or invalid → `invalid`.
+  - Removal from an org is not removal from the mesh. A *corrupt* authority
+    directory still fails closed.
+
+**Witnesses.**
+- SDK `a_floor_revokes_one_member_at_the_provider_and_survives_its_restart`
+  is the decisive one:
+  - members B and C both make real org-protected calls to provider P;
+  - a floor for B, delivered through C's node, is attested `applied` with
+    floor 2;
+  - B's calls are refused and C's are admitted;
+  - P restarts (a new node reopening its persisted authority): the floor
+    holds, B is still refused, C still admitted.
+- SDK `a_node_without_org_authority_attests_not_member` covers the
+  `not_member` outcome, a tampered attestation, and a request for another
+  node.
+- CLI `org_remove_applies_a_root_signed_floor_at_each_named_node`:
+  - the operator (itself a member via `node adopt`) removes an enrolled
+    device;
+  - self and the device attest `applied`, a mesh-only bystander
+    `not_member`, so `complete` is false;
+  - `--dry-run` has no effect;
+  - the device restarts running, with its org `revoked`;
+  - a corrupt authority directory refuses to start;
+  - after the operator restarts, its persisted floor is re-attested.
+
+**Inverse mutations** (all RED):
+- SDK: floor not applied but reported applied; attestation not bound to its
+  request; signature unchecked; a request for another node answered; a
+  non-member claiming applied.
+- CLI: any outcome counted as applied; a revoked membership failing
+  startup; a corrupt authority tolerated; the node not serving floor
+  application.
+
+**Regressions.**
+- The SDK suite as CI runs it: 820/820.
+- `net-cli` 358/358.
+- Clippy (`net-cli` all targets; SDK lib default, CI features and `full`;
+  the touched test target) and SDK rustdoc are clean.
+
+**Still open (org).**
+- Distributing the org owner audience, so members can privately discover
+  each other.
+- Floors reach only the nodes named. There is no inventory of enforcement
+  points; `org members` is a later slice.
+- `org leave`.
+
 
 #### V3-2 task 3: standalone subnet join, decisions (user, 2026-09-24)
 

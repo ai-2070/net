@@ -373,13 +373,13 @@ async fn run_subnet_join(
 }
 
 /// One named enforcement point.
-struct VerifierContact {
-    entity: net::adapter::net::identity::EntityId,
-    addr: std::net::SocketAddr,
-    noise_pubkey: [u8; 32],
+pub(crate) struct VerifierContact {
+    pub(crate) entity: net::adapter::net::identity::EntityId,
+    pub(crate) addr: std::net::SocketAddr,
+    pub(crate) noise_pubkey: [u8; 32],
 }
 
-fn parse_verifier(raw: &str) -> Result<VerifierContact, CliError> {
+pub(crate) fn parse_verifier(raw: &str) -> Result<VerifierContact, CliError> {
     let bad = || {
         invalid_args(format!(
             "--verifier `{raw}`: expected ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX"

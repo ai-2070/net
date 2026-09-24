@@ -332,3 +332,161 @@ fn a_device_already_on_the_mesh_joins_an_org_with_a_standalone_link() {
     assert_eq!(node.ready["org"], org.as_str(), "{}", node.ready);
     drop(node);
 }
+
+/// `ENTITY@HOST:PORT#NOISE_PUBKEY` for a running node's ready row.
+fn contact_of(ready: &Value) -> String {
+    format!(
+        "{}@{}#{}",
+        ready["entity_id"].as_str().unwrap(),
+        ready["bind"].as_str().unwrap(),
+        ready["public_key"].as_str().unwrap()
+    )
+}
+
+/// O2 end to end: the operator (itself an org member, adopted with
+/// `node adopt`) removes an enrolled device with `org remove`. Each named node
+/// answers with its own signed attestation: the operator's node and the
+/// device's apply the floor; a mesh-only bystander attests it enforces no org
+/// (so `complete` is false: nothing is claimed for it). The device keeps
+/// running on the mesh without the org across restart (its membership is
+/// reported revoked, not a startup failure), and the operator's floor
+/// survives its own restart.
+#[test]
+fn org_remove_applies_a_root_signed_floor_at_each_named_node() {
+    let operator = Fx::new();
+    let keys = operator.tmp.path().join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let (org_key, org) = org_keygen(&keys, "org.toml");
+
+    // The operator's node becomes an org member itself: first start to learn
+    // its entity, then issue and adopt its membership, then start again.
+    let op = operator.up(&["--enroll", "--no-port-mapping"]);
+    let op_entity = op.ready["entity_id"].as_str().unwrap().to_string();
+    drop(op);
+    let cert = keys.join("operator-cert.json");
+    let issued = Command::new(env!("CARGO_BIN_EXE_net-mesh"))
+        .args(["org", "issue-cert", "--org-key"])
+        .arg(&org_key)
+        .args(["--member", &op_entity, "--out"])
+        .arg(&cert)
+        .output()
+        .unwrap();
+    assert!(issued.status.success(), "{issued:?}");
+    let adopted = operator
+        .base()
+        .args(["node", "adopt", "--cert"])
+        .arg(&cert)
+        .args(["--entity", &op_entity, "--authority-dir"])
+        .arg(operator.state().join("authority"))
+        .output()
+        .unwrap();
+    assert!(adopted.status.success(), "{adopted:?}");
+    let op = operator.up(&["--enroll", "--no-port-mapping"]);
+    assert_eq!(op.ready["org"], org.as_str(), "{}", op.ready);
+
+    // An enrolled member device.
+    let created = operator.json(&["invite", "create", "--org", &org]);
+    let offer = created["offer_id"].as_str().unwrap().to_string();
+    let agent = Fx::new();
+    let pending = agent.json(&["join", &token_of(&created), "--yes"]);
+    let device = pending["device"].as_str().unwrap().to_string();
+    operator.json(&[
+        "org",
+        "approve",
+        &offer,
+        "--subject",
+        &device,
+        "--org-key",
+        org_key.to_str().unwrap(),
+    ]);
+    agent.json(&["join", &token_of(&created), "--yes"]);
+    let node = agent.up(&[]);
+    assert_eq!(node.ready["org"], org.as_str(), "{}", node.ready);
+
+    // A mesh-only bystander.
+    let bystander = Fx::new();
+    bystander.json(&[
+        "join",
+        &token_of(&operator.json(&["invite", "create"])),
+        "--yes",
+    ]);
+    let other = bystander.up(&[]);
+
+    let remove = |verifiers: &[String]| {
+        let mut args: Vec<String> = [
+            "org",
+            "remove",
+            &device,
+            "--org-key",
+            org_key.to_str().unwrap(),
+            "--minimum-generation",
+            "1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for v in verifiers {
+            args.push("--verifier".into());
+            args.push(v.clone());
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        operator.json(&refs)
+    };
+
+    // A dry run signs and sends nothing.
+    let dry = operator.json(&[
+        "org",
+        "remove",
+        &device,
+        "--org-key",
+        org_key.to_str().unwrap(),
+        "--minimum-generation",
+        "1",
+        "--verifier",
+        "self",
+        "--dry-run",
+    ]);
+    assert_eq!(dry["dry_run"], true, "{dry}");
+
+    let removed = remove(&[
+        "self".to_string(),
+        contact_of(&node.ready),
+        contact_of(&other.ready),
+    ]);
+    let rows = removed["verifiers"].as_array().unwrap();
+    assert_eq!(rows[0]["state"], "applied", "{removed}");
+    assert_eq!(rows[0]["floor"], 1, "{removed}");
+    assert_eq!(rows[1]["state"], "applied", "{removed}");
+    assert_eq!(rows[2]["state"], "not_member", "{removed}");
+    assert_eq!(removed["applied"], 2, "{removed}");
+    assert_eq!(removed["complete"], false, "the bystander enforces nothing");
+
+    // The device runs on without the org: revoked, not a startup failure.
+    drop(node);
+    let node = agent.up(&[]);
+    assert!(node.ready["org"].is_null(), "{}", node.ready);
+    assert_eq!(
+        node.ready["org_state"]["state"], "revoked",
+        "{}",
+        node.ready
+    );
+    drop(node);
+    // An ended membership is tolerated; a corrupt authority is not.
+    let membership = agent
+        .state()
+        .join("authority")
+        .join("owner-membership.json");
+    std::fs::write(&membership, b"{ not json").unwrap();
+    let broken = agent.run(&["up", "--bind", "127.0.0.1:0"]);
+    assert!(!broken.status.success(), "{broken:?}");
+    assert!(stderr_of(&broken).contains("org authority"), "{broken:?}");
+    drop(other);
+
+    // The operator's floor was persisted: after its restart it still holds.
+    drop(op);
+    let _op = operator.up(&["--enroll", "--no-port-mapping"]);
+    let again = remove(&["self".to_string()]);
+    assert_eq!(again["verifiers"][0]["state"], "applied", "{again}");
+    assert_eq!(again["verifiers"][0]["floor"], 1, "{again}");
+    assert_eq!(again["complete"], true, "{again}");
+}

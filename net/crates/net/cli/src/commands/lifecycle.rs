@@ -1258,6 +1258,10 @@ struct NodeReport {
     /// The org this node is a member of (its installed, adopted authority).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     org: Option<String>,
+    /// Why an adopted membership was not installed: `revoked` (below its
+    /// org's floor) or `invalid` (e.g. expired), with the reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    org_state: Option<serde_json::Value>,
 }
 
 /// A node started from an installed join: whose mesh it joined and whether the
@@ -1307,6 +1311,62 @@ struct ControlState {
 /// mesh session, connecting first if needed. Returns the raw attestation;
 /// the CLI decodes and verifies it against its own request, so this node
 /// cannot vouch for anything.
+/// Control op `org_floor_forward`: carry one already-built org floor request
+/// to its named node (this node answers itself; another node is reached over
+/// the mesh, connecting first when needed) and return that node's signed
+/// attestation. The caller verifies it; this node only carries bytes.
+async fn forward_org_floor(
+    node: &Arc<net::adapter::net::MeshNode>,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    use net_sdk::org::floors::{answer_org_floor, request_org_floor, OrgFloorRequest};
+    let parsed = (|| {
+        let bytes = hex::decode(request["request"].as_str()?).ok()?;
+        let floor = OrgFloorRequest::from_bytes(&bytes).ok()?;
+        let addr: Option<std::net::SocketAddr> =
+            request["addr"].as_str().and_then(|a| a.parse().ok());
+        let key = request["noise_pubkey"]
+            .as_str()
+            .and_then(|k| hex::decode(k).ok())
+            .and_then(|k| <[u8; 32]>::try_from(k).ok());
+        let wait = Duration::from_millis(request["wait_ms"].as_u64().unwrap_or(10_000))
+            .min(MAX_FLOOR_FORWARD_WAIT);
+        Some((bytes, floor, addr.zip(key), wait))
+    })();
+    let Some((bytes, floor, contact, wait)) = parsed else {
+        return serde_json::json!({ "error": "malformed org floor request" });
+    };
+    if floor.verifier() == node.entity_id() {
+        let (keypair, authority) = (node.entity_keypair_arc(), node.node_authority());
+        let answered = tokio::task::spawn_blocking(move || {
+            answer_org_floor(&bytes, &keypair, authority.as_deref(), now_unix())
+        })
+        .await
+        .unwrap_or_else(|_| Err("org floor task failed".to_string()));
+        return match answered {
+            Ok(a) => serde_json::json!({ "attestation": hex::encode(a.to_bytes()) }),
+            Err(e) => serde_json::json!({ "refused": e }),
+        };
+    }
+    let target = floor.verifier().node_id();
+    let outcome = tokio::time::timeout(wait, async {
+        if node.peer_session_id(target).is_none() {
+            let (addr, key) =
+                contact.ok_or_else(|| "no session to that node and no contact".to_string())?;
+            node.connect_via(addr, &key, target)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        request_org_floor(node, target, &floor, wait).await
+    })
+    .await
+    .unwrap_or_else(|_| Err("timed out".to_string()));
+    match outcome {
+        Ok(a) => serde_json::json!({ "attestation": hex::encode(a.to_bytes()) }),
+        Err(e) => serde_json::json!({ "no_answer": e }),
+    }
+}
+
 async fn forward_floor_query(
     node: &Arc<net::adapter::net::MeshNode>,
     request: &serde_json::Value,
@@ -1765,6 +1825,8 @@ async fn control_session(
         "org_join" => org_join(state, &request).await,
         "subnet_join" if draining => serde_json::json!({ "error": "node is draining" }),
         "subnet_join" => subnet_join(state, &request).await,
+        "org_floor_forward" if draining => serde_json::json!({ "error": "node is draining" }),
+        "org_floor_forward" => forward_org_floor(&state.node, &request).await,
         "subnet_floor_query" if draining => serde_json::json!({ "error": "node is draining" }),
         "subnet_floor_query" => forward_floor_query(&state.node, &request).await,
         "leave" => match (&state.joined, draining) {
@@ -2118,15 +2180,37 @@ pub async fn run_up(
     // An adopted org membership (from `join` / `org join`, or `node adopt`
     // into this state directory) is installed before anything is served.
     let authority_dir = state.join(AUTHORITY_SUBDIR);
-    let org_owner = if authority_dir.exists() {
-        mesh.install_org_authority(&authority_dir)
-            .map_err(|e| generic(format!("org authority {}: {e}", authority_dir.display())))?;
-        mesh.node()
-            .node_authority()
-            .map(|a| hex::encode(a.owner_org().0))
+    // A membership that has ENDED (revoked by a floor, or expired) leaves the
+    // node running without it — removal from an org is not removal from the
+    // mesh. Anything else wrong with the directory fails closed.
+    let (org_owner, org_ended) = if authority_dir.exists() {
+        use net::adapter::net::behavior::org_authority::OrgAuthorityError;
+        match mesh.install_org_authority(&authority_dir) {
+            Ok(()) => (
+                mesh.node()
+                    .node_authority()
+                    .map(|a| hex::encode(a.owner_org().0)),
+                None,
+            ),
+            Err(net_sdk::org::OrgProvisionError::Authority(
+                e @ OrgAuthorityError::CertBelowFloor { .. },
+            )) => (None, Some(("revoked", e.to_string()))),
+            Err(net_sdk::org::OrgProvisionError::Authority(
+                e @ OrgAuthorityError::CertInvalid(_),
+            )) => (None, Some(("invalid", e.to_string()))),
+            Err(e) => {
+                return Err(generic(format!(
+                    "org authority {}: {e}",
+                    authority_dir.display()
+                )))
+            }
+        }
     } else {
-        None
+        (None, None)
     };
+    // Any node may be asked to apply a root-signed org floor (and attest).
+    let _org_floor = net_sdk::org::floors::serve_org_floor(mesh.node())
+        .map_err(|e| generic(format!("org floor service: {e}")))?;
     let _subnet_readback = match &subnet_issuer {
         Some(_) => Some(
             mesh.node()
@@ -2240,6 +2324,8 @@ pub async fn run_up(
         enrollment: enrollment.as_ref().map(|e| e.report()),
         joined: joined_report,
         org: org_owner,
+        org_state: org_ended
+            .map(|(state, detail)| serde_json::json!({ "state": state, "detail": detail })),
     };
     let control = ControlFile {
         version: 1,

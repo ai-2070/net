@@ -90,6 +90,45 @@ pub enum OrgCommand {
     /// `up`. Until the operator approves, the node keeps asking by itself;
     /// once issued it adopts the membership and installs it live.
     Join(OrgJoinArgs),
+    /// Remove one member: sign a floor here with the org root (every
+    /// membership certificate of that member below `--minimum-generation`
+    /// is revoked) and have each named node apply it. Reported per node
+    /// from that node's own signed attestation; `complete` only when every
+    /// named node attested the floor applied and persisted. Nodes not named
+    /// are never assumed.
+    Remove(OrgRemoveArgs),
+}
+
+/// `org remove` arguments.
+#[derive(Args, Debug)]
+pub struct OrgRemoveArgs {
+    /// The member's full 64-hex entity id.
+    pub member: String,
+    /// The org root key file (`org keygen`); stays on this machine.
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: PathBuf,
+    /// Revoke every certificate of the member below this generation.
+    /// Re-admission later needs `org approve --generation` at or above it.
+    #[arg(long, value_name = "N")]
+    pub minimum_generation: u32,
+    /// A node to apply the floor at: `self` (the node of `--state-dir`) or
+    /// `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`. Repeat for each enforcement
+    /// point.
+    #[arg(long = "verifier", value_name = "NODE", required = true)]
+    pub verifiers: Vec<String>,
+    /// State directory of the operator's running node, which carries the
+    /// requests (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// How long to wait for each node's answer.
+    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = crate::humantime::parse_duration)]
+    pub wait: std::time::Duration,
+    /// Show what would be signed and asked, without signing or sending.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Accept a group/world-readable org key file (Unix).
+    #[arg(long)]
+    pub insecure_permissions: bool,
 }
 
 /// `org approve` arguments.
@@ -480,7 +519,140 @@ pub async fn run(
             .await
         }
         OrgCommand::Join(args) => run_org_join(args, output, profile_name).await,
+        OrgCommand::Remove(args) => run_remove(args, output, profile_name).await,
     }
+}
+
+/// `org remove`: sign the floor here, carry it through the operator's node to
+/// each named node, and report each node's verified attestation.
+async fn run_remove(
+    args: OrgRemoveArgs,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use net_sdk::org::floors::{OrgFloorAttestation, OrgFloorOutcome, OrgFloorRequest};
+    let member = parse_entity_hex(&args.member)?;
+    if args.minimum_generation == 0 {
+        return Err(invalid_args(
+            "--minimum-generation 0 revokes nothing (a floor n revokes certificates below n)",
+        ));
+    }
+    let node_dir = super::lifecycle::state_dir(args.state_dir.clone(), profile_name)?
+        .join(super::lifecycle::NODE_SUBDIR);
+    let fmt = OutputFormat::resolve_oneshot(output);
+    if args.dry_run {
+        return emit_value(
+            fmt,
+            &serde_json::json!({
+                "dry_run": true,
+                "member": hex::encode(member.as_bytes()),
+                "minimum_generation": args.minimum_generation,
+                "verifiers": args.verifiers,
+                "effect": "none: nothing was signed or sent",
+            }),
+        )
+        .map_err(|e| generic(format!("write result: {e}")));
+    }
+    // `self` is the operator's node: its entity from its authenticated status.
+    let mut targets = Vec::new();
+    for v in &args.verifiers {
+        if v == "self" {
+            let (_, status) =
+                super::lifecycle::control_call(&node_dir, serde_json::json!({ "op": "status" }))
+                    .await
+                    .map_err(|e| {
+                        crate::error::connection_failure(format!("operator node: {e:?}"))
+                    })?;
+            let entity =
+                parse_entity_hex(status["node"]["entity_id"].as_str().unwrap_or_default())?;
+            targets.push((entity, None));
+        } else {
+            let contact = super::subnet::parse_verifier(v)?;
+            targets.push((contact.entity.clone(), Some(contact)));
+        }
+    }
+    let keypair = load_org_key(&args.org_key, args.insecure_permissions).await?;
+    let mut floors = BTreeMap::new();
+    floors.insert(member.clone(), args.minimum_generation);
+    let bundle = OrgRevocationBundle::try_issue(&keypair, &floors)
+        .map_err(|e| invalid_args(format!("floor: {e}")))?;
+    let org = hex::encode(keypair.org_id().as_bytes());
+    drop(keypair);
+
+    let mut rows = Vec::with_capacity(targets.len());
+    let mut applied = 0usize;
+    for (verifier, contact) in &targets {
+        let request = OrgFloorRequest::new(&bundle, verifier.clone()).map_err(generic)?;
+        let mut call = serde_json::json!({
+            "op": "org_floor_forward",
+            "request": hex::encode(request.to_bytes()),
+            "wait_ms": args.wait.as_millis() as u64,
+        });
+        if let Some(c) = contact {
+            call["addr"] = serde_json::json!(c.addr.to_string());
+            call["noise_pubkey"] = serde_json::json!(hex::encode(c.noise_pubkey));
+        }
+        let entity = hex::encode(verifier.as_bytes());
+        let row = match super::lifecycle::control_call_within(
+            &node_dir,
+            call,
+            args.wait + std::time::Duration::from_secs(5),
+        )
+        .await
+        {
+            Err(e) => serde_json::json!({
+                "verifier": entity, "state": "no_answer", "detail": format!("operator node: {e:?}"),
+            }),
+            Ok((_, reply)) => match reply["attestation"].as_str() {
+                Some(hex_a) => match hex::decode(hex_a)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| OrgFloorAttestation::from_bytes(&b))
+                    .and_then(|a| a.verify_for(&request).map(|()| a))
+                {
+                    Ok(a) => {
+                        let floor = a.floor_of(&member);
+                        let done = a.outcome == OrgFloorOutcome::Applied
+                            && floor.is_some_and(|f| f >= args.minimum_generation);
+                        if done {
+                            applied += 1;
+                        }
+                        serde_json::json!({
+                            "verifier": entity,
+                            "state": if done { "applied" } else { a.outcome.as_str() },
+                            "floor": floor,
+                        })
+                    }
+                    Err(e) => serde_json::json!({
+                        "verifier": entity, "state": "bad_attestation", "detail": e,
+                    }),
+                },
+                None => serde_json::json!({
+                    "verifier": entity,
+                    "state": if reply["refused"].is_string() { "refused" } else { "no_answer" },
+                    "detail": reply["refused"]
+                        .as_str()
+                        .or_else(|| reply["no_answer"].as_str())
+                        .or_else(|| reply["error"].as_str()),
+                }),
+            },
+        };
+        rows.push(row);
+    }
+    emit_value(
+        fmt,
+        &serde_json::json!({
+            "org": org,
+            "member": hex::encode(member.as_bytes()),
+            "minimum_generation": args.minimum_generation,
+            "verifiers": rows,
+            "applied": applied,
+            "pending": targets.len() - applied,
+            "complete": applied == targets.len(),
+            // What removal does not do, stated rather than implied.
+            "scope": "membership only: the member's transport (the mesh PSK) and any independently granted access are unaffected; nodes not named here were not asked",
+        }),
+    )
+    .map_err(|e| generic(format!("write result: {e}")))
 }
 
 /// `org approve`: fetch the pending claim, sign its membership here with the
