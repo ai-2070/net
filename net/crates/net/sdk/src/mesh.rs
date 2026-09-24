@@ -92,7 +92,7 @@ use crate::error::{Result, SdkError};
 ///     .subscribe_channel_with(
 ///         publisher.node_id(),
 ///         &channel,
-///         SubscribeOptions { token: Some(token) },
+///         SubscribeOptions { token: Some(token), ..Default::default() },
 ///     )
 ///     .await?;
 /// # Ok(())
@@ -105,6 +105,11 @@ pub struct SubscribeOptions {
     /// `ChannelConfig::can_subscribe`, so a matching token
     /// satisfies `require_token` channels end-to-end.
     pub token: Option<net::adapter::net::PermissionToken>,
+    /// A full delegated chain (root → … → this node) to present instead of
+    /// a single token. The publisher verifies every link against its
+    /// `token_roots`; the chain is never flattened. Set at most one of
+    /// `token` and `chain`.
+    pub chain: Option<net::adapter::net::identity::TokenChain>,
 }
 
 /// Builder for configuring a [`Mesh`] node.
@@ -983,13 +988,23 @@ impl Mesh {
         channel: &ChannelName,
         opts: SubscribeOptions,
     ) -> Result<()> {
-        let result = match opts.token {
-            Some(token) => {
+        let result = match (opts.token, opts.chain) {
+            (Some(_), Some(_)) => {
+                return Err(SdkError::Config(
+                    "subscribe with a token or a chain, not both".to_string(),
+                ))
+            }
+            (None, Some(chain)) => {
+                self.node
+                    .subscribe_channel_with_chain(publisher_node_id, channel.clone(), chain)
+                    .await
+            }
+            (Some(token), None) => {
                 self.node
                     .subscribe_channel_with_token(publisher_node_id, channel.clone(), token)
                     .await
             }
-            None => {
+            (None, None) => {
                 self.node
                     .subscribe_channel(publisher_node_id, channel.clone())
                     .await
@@ -999,6 +1014,31 @@ impl Mesh {
             Ok(()) => Ok(()),
             Err(e) => Err(adapter_to_channel_error(e)),
         }
+    }
+
+    /// Install this node's managed publish chain for `channel` (a delegated
+    /// chain whose leaf is this node). One per channel: a different chain
+    /// already installed is refused, never overwritten. Returns its
+    /// fingerprint, the key for [`Self::remove_publish_chain_if`]. Publishing
+    /// still requires this node's own `ChannelConfig` to trust the root.
+    pub fn install_publish_chain(
+        &self,
+        channel: &ChannelName,
+        chain: net::adapter::net::identity::TokenChain,
+    ) -> std::result::Result<[u8; 32], net::adapter::net::PublishChainConflict> {
+        self.node.install_publish_chain(channel, chain)
+    }
+
+    /// The fingerprint of the publish chain held for `channel`, if any.
+    pub fn publish_chain_fingerprint(&self, channel: &ChannelName) -> Option<[u8; 32]> {
+        self.node.publish_chain_fingerprint(channel)
+    }
+
+    /// Remove the publish chain for `channel` only if it is exactly the
+    /// incarnation `fingerprint` names (never a successor), evicting its
+    /// tokens from the token cache so no fallback keeps authorizing it.
+    pub fn remove_publish_chain_if(&self, channel: &ChannelName, fingerprint: &[u8; 32]) -> bool {
+        self.node.remove_publish_chain_if(channel, fingerprint)
     }
 
     /// Mirror of [`Self::subscribe_channel`]. Idempotent on the

@@ -237,8 +237,9 @@ pub use mesh::SensingOffLockObservation;
 pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
     ControlPlaneStats, MeshNode, MeshNodeConfig, NoiseStaticKey, PartitionFilter,
-    SensingLeaseReleaseRefused, SensingReadinessOverlay, SensingRegistrationError,
-    SubnetFloorQueryError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
+    PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay,
+    SensingRegistrationError, SubnetFloorQueryError, UnregisteredChannelPolicy,
+    ACK_RANGES_CAPABILITY_TAG,
 };
 /// Exported only so the fixtures-gated ordered-egress accessors have nameable
 /// types in integration tests; each is `#[doc(hidden)]` at its definition and

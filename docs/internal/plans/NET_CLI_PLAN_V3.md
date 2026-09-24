@@ -2813,6 +2813,69 @@ Tasks:
   config trusts the root; both leave modes; channel status (credential state
   vs ACK / publish-gate observation, never a roster).
 
+**C1 receipt (2026-09-24).**
+
+What shipped:
+- **Core `identity/token.rs`:**
+  - `TokenChain::fingerprint` (blake3 over the canonical chain bytes);
+  - `TokenCache::evict_exact`, which removes exactly one token's bytes from
+    its `(subject, channel | wildcard)` slot.
+- **Core `mesh.rs`:**
+  - `install_publish_chain` allows one managed chain per channel. The
+    identical chain is a no-op; a different chain gets
+    `PublishChainConflict { installed }` and nothing is overwritten.
+  - `publish_chain_fingerprint`.
+  - `remove_publish_chain_if(channel, fingerprint)` is a DashMap
+    `remove_if` on the exact incarnation. It also evicts that chain's tokens
+    from the `TokenCache`, so the cache fallback cannot bypass a leave.
+- **SDK:**
+  - `SubscribeOptions.chain` delegates to `subscribe_channel_with_chain`
+    unflattened; passing a token and a chain together is `SdkError::Config`.
+  - `Mesh` wrappers for install, fingerprint and removal.
+  - `net_sdk::channel_issuer::ChannelLeafIssuer`. It checks that the grant
+    names the issuer's key, carries no ADMIN or WILDCARD, is DELEGATE with
+    depth > 0, and verifies. `issue` mints `[grant, leaf]`: PUBLISH and/or
+    SUBSCRIBE only, never empty, never beyond the grant, and never ADMIN,
+    WILDCARD or DELEGATE.
+
+Witness: `sdk/tests/channel_delegated.rs` (3 tests; auto-discovered by the SDK
+job).
+- The publisher trusts only the root:
+  - the full chain subscribes;
+  - the leaf alone is refused, and so is another device's chain.
+- Publish:
+  - passes the local gate only while the managed chain is installed;
+  - a conflicting install is refused;
+  - wrong-fingerprint removal is a no-op;
+  - exact removal re-closes the gate and evicts the leaf from the cache;
+  - a stale removal spares the successor.
+
+Inverse mutations: each was applied, run against the witness, and reverted. All 7 went RED:
+
+| # | Mutation |
+|---|---|
+| 1 | Removal ignores the fingerprint |
+| 2 | Install overwrites a different chain |
+| 3 | Removal skips cache eviction |
+| 4 | SDK flattens the chain to its leaf |
+| 5 | Leaves may carry DELEGATE |
+| 6 | Rights beyond the grant |
+| 7 | ADMIN grant accepted |
+
+Mutation 5 was first GREEN, because the rights check also refused DELEGATE.
+The witness now pins the `Forbidden` variant, and the mutation goes RED.
+
+Gates:
+- fmt; core clippy, strict and all-targets;
+- SDK clippy: default, `full` and the CI feature set;
+- rustdoc: root `--all-features` and SDK `full`;
+- `cargo tl` 5818/5818; `cargo t` 7039/7039; SDK suite 825/825; CLI 360/360.
+
+**Honest limit:** a leaf's expiry is the grant's (`delegate` copies
+`not_after`). Per-device lifetimes shorter than the grant would need a new
+core delegation variant, which is not in scope. Revoking one device is by
+revocation, not by expiry.
+
 ### V3-2B — voluntary leave through the same lifecycle
 
 **Modify:** shared SDK enrollment/persistence/lifecycle modules selected in V3-1/2A; CLI `enrollment.rs`, `org.rs`, `channel.rs`, `subnet.rs`, `config.rs` and relevant runtime adapters.

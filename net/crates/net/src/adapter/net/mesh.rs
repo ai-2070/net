@@ -2930,6 +2930,25 @@ impl Drop for NoiseStaticKey {
     }
 }
 
+/// [`MeshNode::install_publish_chain`] refused: a different managed chain
+/// is already installed for that channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishChainConflict {
+    /// The fingerprint of the chain already installed.
+    pub installed: [u8; 32],
+}
+
+impl std::fmt::Display for PublishChainConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a different publish chain is already installed for this channel; remove it first"
+        )
+    }
+}
+
+impl std::error::Error for PublishChainConflict {}
+
 /// Configuration for a MeshNode.
 #[derive(Debug, Clone)]
 pub struct MeshNodeConfig {
@@ -34403,6 +34422,62 @@ impl MeshNode {
     /// revoked held chain fails closed like any other.
     pub fn set_publish_chain(&self, channel: &ChannelName, chain: TokenChain) {
         self.published_chains.insert(channel.hash(), chain);
+    }
+
+    /// Install a MANAGED publish chain for `channel`: one per channel.
+    /// Installing the identical chain again is a no-op; a DIFFERENT chain
+    /// already installed is refused (never silently overwritten), so a
+    /// lifecycle owner always knows which incarnation it holds. Returns the
+    /// installed chain's fingerprint, the key for
+    /// [`Self::remove_publish_chain_if`].
+    pub fn install_publish_chain(
+        &self,
+        channel: &ChannelName,
+        chain: TokenChain,
+    ) -> Result<[u8; 32], PublishChainConflict> {
+        let fingerprint = chain.fingerprint();
+        match self.published_chains.entry(channel.hash()) {
+            dashmap::mapref::entry::Entry::Occupied(existing) => {
+                let installed = existing.get().fingerprint();
+                if installed == fingerprint {
+                    Ok(fingerprint)
+                } else {
+                    Err(PublishChainConflict { installed })
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(chain);
+                Ok(fingerprint)
+            }
+        }
+    }
+
+    /// The fingerprint of the publish chain held for `channel`, if any.
+    pub fn publish_chain_fingerprint(&self, channel: &ChannelName) -> Option<[u8; 32]> {
+        self.published_chains
+            .get(&channel.hash())
+            .map(|c| c.fingerprint())
+    }
+
+    /// Remove the publish chain for `channel` only if it is exactly the
+    /// incarnation `fingerprint` names — a stale removal never removes a
+    /// successor. Also evicts that chain's tokens from this node's token
+    /// cache, so the publish path's cache fallback cannot keep authorizing
+    /// what was removed. Returns whether it removed anything.
+    pub fn remove_publish_chain_if(&self, channel: &ChannelName, fingerprint: &[u8; 32]) -> bool {
+        let removed = self
+            .published_chains
+            .remove_if(&channel.hash(), |_, chain| {
+                &chain.fingerprint() == fingerprint
+            });
+        if let Some((_, chain)) = &removed {
+            if let Some(cache) = &self.token_cache {
+                for token in &chain.tokens {
+                    cache.evict_exact(token);
+                }
+            }
+        }
+        removed.is_some()
     }
 
     /// Subscribe in the named queue group: every published event is
