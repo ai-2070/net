@@ -119,12 +119,11 @@ use net::adapter::net::cortex::{
 use net::adapter::net::identity::{EntityId, EntityKeypair};
 use net::adapter::net::mesh_rpc::{CallOptions, OrgProofIntent, RpcError, ServeHandle};
 use net::adapter::net::MeshNode;
-use futures::StreamExt as _;
 use net_leaf::org as leaf_org;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::browser::{Driver, Engine};
+use crate::browser::Driver;
 use crate::{hex, wait_for, Ledger, StepResult};
 
 // ─────────────────────────── roster + topology ───────────────────────────
@@ -637,7 +636,6 @@ pub struct OrgWorld {
     pub root_b: OrgKeypair,
     pub anchor_entity: EntityId,
     pub anchor_store: Arc<OrgRevocationStore>,
-    pub anchor_authority_dir: PathBuf,
     pub caller: PageId,
     pub server: PageId,
     pub pair_a: PageId,
@@ -646,8 +644,6 @@ pub struct OrgWorld {
     pub compliant: PageId,
     pub teardown: PageId,
     pub leader: PageId,
-    pub follow1: PageId,
-    pub follow2: PageId,
     /// `old` and `new` share ONE identity on purpose: the session
     /// replacement witnesses need two sessions of the same node id.
     pub shared: PageId,
@@ -708,7 +704,6 @@ impl OrgWorld {
             root_b,
             anchor_entity,
             anchor_store,
-            anchor_authority_dir: dir,
             caller: PageId::generate(),
             server: PageId::generate(),
             pair_a: PageId::generate(),
@@ -717,8 +712,6 @@ impl OrgWorld {
             compliant: PageId::generate(),
             teardown: PageId::generate(),
             leader: PageId::generate(),
-            follow1: PageId::generate(),
-            follow2: PageId::generate(),
             shared: PageId::generate(),
         }
     }
@@ -826,29 +819,25 @@ impl OrgWorld {
 /// from `RpcContext::org_admission` — none of them caller-claimed.
 #[derive(Debug, Clone)]
 pub struct CallRecord {
-    pub shape: &'static str,
     pub payload: Vec<u8>,
     pub caller: Option<String>,
     pub acting_org: Option<String>,
     pub provider_org: Option<String>,
     pub provider: Option<String>,
     pub capability: Option<String>,
-    pub entered_at: Instant,
     pub items_sent: Vec<Vec<u8>>,
     pub completed_at: Option<Instant>,
 }
 
 impl CallRecord {
-    fn from_ctx(shape: &'static str, ctx_admitted: Option<&Admitted>, payload: Vec<u8>) -> Self {
+    fn from_ctx(ctx_admitted: Option<&Admitted>, payload: Vec<u8>) -> Self {
         Self {
-            shape,
             payload,
             caller: ctx_admitted.map(|a| hex32(a.caller.as_bytes())),
             acting_org: ctx_admitted.map(|a| hex32(a.acting_org.as_bytes())),
             provider_org: ctx_admitted.map(|a| hex32(a.provider_org.as_bytes())),
             provider: ctx_admitted.map(|a| hex32(a.provider.as_bytes())),
             capability: ctx_admitted.map(|a| hex32(a.capability.as_bytes())),
-            entered_at: Instant::now(),
             items_sent: Vec::new(),
             completed_at: None,
         }
@@ -925,10 +914,6 @@ impl HoldGate {
         }
     }
 
-    pub fn parked(&self) -> usize {
-        *self.parked.lock().expect("gate")
-    }
-
     pub fn release(&self) {
         *self.released.lock().expect("gate") = true;
         self.wake.notify_waiters();
@@ -947,7 +932,7 @@ struct UnaryOrg {
 impl RpcHandler for UnaryOrg {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
         let payload = ctx.payload.body.to_vec();
-        let record = CallRecord::from_ctx("unary", ctx.org_admission.as_ref(), payload.clone());
+        let record = CallRecord::from_ctx(ctx.org_admission.as_ref(), payload.clone());
         let index = self.log.enter(self.service, record);
         let mut reply = Vec::from(self.label.as_bytes());
         reply.push(b':');
@@ -981,10 +966,10 @@ impl RpcStreamingHandler for StreamOrg {
         // The request payload identifies the record from ENTRY — a
         // RETIRED call never reaches `complete`, and the witnesses
         // read its identity there.
-        let record = CallRecord::from_ctx("streaming", ctx.org_admission.as_ref(), payload.clone());
+        let record = CallRecord::from_ctx(ctx.org_admission.as_ref(), payload.clone());
         let index = self.log.enter(self.service, record);
         let mut sent = Vec::new();
-        let mut emit = |chunk: Vec<u8>, sent: &mut Vec<Vec<u8>>| {
+        let emit = |chunk: Vec<u8>, sent: &mut Vec<Vec<u8>>| {
             sent.push(chunk.clone());
             sink.send(chunk);
         };
@@ -1028,7 +1013,7 @@ impl RpcClientStreamingHandler for CsOrg {
         mut requests: RequestStream,
     ) -> Result<RpcResponsePayload, RpcHandlerError> {
         use futures::StreamExt;
-        let mut record = CallRecord::from_ctx("client_stream", ctx.org_admission.as_ref(), Vec::new());
+        let record = CallRecord::from_ctx(ctx.org_admission.as_ref(), Vec::new());
         let index = self.log.enter(self.service, record);
         let mut collected = Vec::new();
         while let Some(chunk) = requests.next().await {
@@ -1071,7 +1056,7 @@ impl RpcDuplexHandler for DxDx {
         responses: RpcResponseSink,
     ) -> Result<(), RpcHandlerError> {
         use futures::StreamExt;
-        let record = CallRecord::from_ctx("duplex", ctx.org_admission.as_ref(), Vec::new());
+        let record = CallRecord::from_ctx(ctx.org_admission.as_ref(), Vec::new());
         let index = self.log.enter(self.service, record);
         let mut sent = Vec::new();
         let mut collected = Vec::new();
@@ -1109,7 +1094,6 @@ impl RpcDuplexHandler for DxDx {
 pub struct Opening {
     pub frame: Vec<u8>,
     pub stream_id: u64,
-    pub channel_hash: u16,
     pub call_id: u64,
 }
 
@@ -1200,38 +1184,6 @@ pub fn mint_opening(
     Opening {
         frame: buf,
         stream_id: 0x0001_0000_0000_0000 | u64::from(hash),
-        channel_hash: hash as u16,
-        call_id,
-    }
-}
-
-/// The same frame with NO proof header — the negative shape whose
-/// refusal class (`MissingHeader`) is the control for the wrong-peer
-/// refusals above.
-pub fn mint_bare_opening(
-    service: &str,
-    body: &[u8],
-    call_id: u64,
-    origin_hash: u64,
-) -> Opening {
-    let channel = request_channel_of(service);
-    let hash = channel.hash();
-    let req = RpcRequestPayload {
-        service: service.to_string(),
-        deadline_ns: 0,
-        flags: 0,
-        headers: Vec::new(),
-        body: Bytes::copy_from_slice(body),
-    };
-    let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, origin_hash, call_id, 0);
-    let mut buf = Vec::with_capacity(RPC_FRAME_BODY_OFFSET + req.encoded_len());
-    buf.extend_from_slice(&meta.to_bytes());
-    encode_rpc_route(&mut buf, hash);
-    req.encode_into(&mut buf);
-    Opening {
-        frame: buf,
-        stream_id: 0x0001_0000_0000_0000 | u64::from(hash),
-        channel_hash: hash as u16,
         call_id,
     }
 }
@@ -1247,7 +1199,6 @@ fn session_binding_of(anchor: &MeshNode, peer: u64) -> Option<[u8; 32]> {
 
 pub struct CxOrg<'a> {
     pub driver: &'a Driver,
-    pub engine: Engine,
     pub anchor: &'a Arc<MeshNode>,
     pub anchor_key: &'a Arc<EntityKeypair>,
     pub credential: String,
@@ -1286,7 +1237,6 @@ impl CxOrg<'_> {
 pub struct LeafInfo {
     pub node_id: u64,
     pub node_hex: String,
-    pub origin_hash: String,
 }
 
 fn leaf_of(result: &StepResult) -> Option<LeafInfo> {
@@ -1298,7 +1248,6 @@ fn leaf_of(result: &StepResult) -> Option<LeafInfo> {
     Some(LeafInfo {
         node_id,
         node_hex,
-        origin_hash: result.origin_hash.clone().unwrap_or_default(),
     })
 }
 
@@ -1656,7 +1605,7 @@ fn expected_unary(label: &str, payload: &[u8]) -> Vec<u8> {
 /// against the expected identity tuple.
 #[expect(clippy::too_many_arguments, reason = "one linear witness script")]
 async fn browser_call_matrix(
-    cx: &CxOrg<'_>,
+    _cx: &CxOrg<'_>,
     world: &OrgWorld,
     script: &mut ScriptOrg,
     ledger: &mut Ledger,
@@ -1970,7 +1919,7 @@ async fn native_call_matrix(
             "streaming" => {
                 use futures::StreamExt as _;
                 let mut items = Vec::new();
-                let mut terminal = "none".to_string();
+                let terminal;
                 match cx
                     .anchor
                     .call_streaming(server.node_id, service, Bytes::copy_from_slice(&payload), opts)
@@ -2056,7 +2005,7 @@ async fn native_call_matrix(
                             );
                         }
                         let mut items = Vec::new();
-                        let mut terminal = "none".to_string();
+                        let terminal;
                         loop {
                             match call.next().await {
                                 Some(Ok(chunk)) => items.push(chunk.to_vec()),
@@ -2880,7 +2829,7 @@ async fn deliver_opening(anchor: &Arc<MeshNode>, peer: u64, opening: &Opening) -
 async fn run_pinned(
     script: &mut ScriptOrg,
     tab: &str,
-    mut step: Value,
+    step: Value,
     attempts: usize,
 ) -> StepResult {
     let mut last = fail("never attempted");
@@ -2919,7 +2868,7 @@ async fn page_counters(script: &mut ScriptOrg, tab: &str) -> String {
 /// list (identity + order + count — the credit-count accounting) and
 /// every send resolves exactly once.
 async fn streaming_backpressure(
-    cx: &CxOrg<'_>,
+    _cx: &CxOrg<'_>,
     world: &OrgWorld,
     script: &mut ScriptOrg,
     ledger: &mut Ledger,
@@ -3054,7 +3003,7 @@ async fn streaming_backpressure(
 
 /// 26. `org_client_stream_backpressure_half_close`.
 async fn client_stream_backpressure(
-    cx: &CxOrg<'_>,
+    _cx: &CxOrg<'_>,
     world: &OrgWorld,
     script: &mut ScriptOrg,
     ledger: &mut Ledger,
@@ -3141,7 +3090,7 @@ async fn client_stream_backpressure(
 
 /// 27. `org_duplex_backpressure_half_close`.
 async fn duplex_backpressure(
-    cx: &CxOrg<'_>,
+    _cx: &CxOrg<'_>,
     world: &OrgWorld,
     script: &mut ScriptOrg,
     ledger: &mut Ledger,
@@ -3244,8 +3193,8 @@ async fn midstream_revocation(
     script: &mut ScriptOrg,
     ledger: &mut Ledger,
     services: &NativeServices,
-    revoked: &LeafInfo,
-    compliant: &LeafInfo,
+    _revoked: &LeafInfo,
+    _compliant: &LeafInfo,
 ) {
     let witness = WITNESSES[27];
     let creds_revoked = world.creds(
@@ -3366,7 +3315,7 @@ async fn midstream_revocation(
 
 /// 29. `org_revocation_refuses_new_openings`.
 async fn revocation_refuses_openings(
-    cx: &CxOrg<'_>,
+    _cx: &CxOrg<'_>,
     world: &OrgWorld,
     script: &mut ScriptOrg,
     ledger: &mut Ledger,
@@ -3691,7 +3640,7 @@ async fn tab_teardown(
 /// attribution at the proxy production site swaps the pairings and
 /// reddens this witness; nothing else in the run reads them.
 async fn leader_attribution(
-    cx: &CxOrg<'_>,
+    _cx: &CxOrg<'_>,
     world: &OrgWorld,
     script: &mut ScriptOrg,
     ledger: &mut Ledger,
@@ -4130,7 +4079,6 @@ async fn handler_completion_after_retirement(
     let pre_only = items
         .iter()
         .all(|i| i == &hex(b"hr-0") || i == &hex(b"hr-1"));
-    let wire_flat = after_pair == mid_pair;
 
     ledger.record(
         witness,
@@ -4461,7 +4409,7 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
     // window (a late joiner must see a flood), and every page
     // announces below; the pins then settle before any witness runs.
     let announce_anchor = Arc::clone(cx.anchor);
-    let announce_run = tokio::spawn(async move {
+    tokio::spawn(async move {
         for beat in 0..600 {
             // A TAGGED set with a CHANGING tag each beat: an empty
             // announcement emits nothing, and an identical document

@@ -2226,7 +2226,6 @@ async fn run(
     // anchor-announced default applies, never an empty iceServers.
     let mk_cx = |stun: Option<String>| org_stream::CxOrg {
         driver: &driver,
-        engine,
         anchor: &anchor,
         anchor_key: &anchor_key,
         credential: anchor_cred.clone(),
