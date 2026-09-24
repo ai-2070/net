@@ -1793,12 +1793,23 @@ pub struct PyResponseSinkSend {
 impl PyResponseSinkSend {
     /// Wrap a response sink arriving through an ORG serve seam (`org`
     /// feature only) — the same wrapper class the nRPC streaming handlers
-    /// receive.
+    /// receive. Returns the wrapper plus its holder — a LIVENESS token the
+    /// bridge MUST retain until its handler future resolves: the wrapper
+    /// alone drops the sink (and thus the response pump's sender) at
+    /// Python's teardown of the arguments, which precedes the handler
+    /// result and races the response pump's exit (`0x0006: response pump
+    /// failed`).
     #[cfg(feature = "org")]
-    pub(crate) fn from_org_response_sink(inner: InnerRpcResponseSink) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Some(inner))),
-        }
+    pub(crate) fn from_org_response_sink(
+        inner: InnerRpcResponseSink,
+    ) -> (Self, Arc<Mutex<Option<InnerRpcResponseSink>>>) {
+        let holder = Arc::new(Mutex::new(Some(inner)));
+        (
+            Self {
+                inner: Arc::clone(&holder),
+            },
+            holder,
+        )
     }
 }
 

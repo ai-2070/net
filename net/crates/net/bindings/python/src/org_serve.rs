@@ -437,11 +437,12 @@ async fn run_py_org_streaming_handler(
     sink: ::net::adapter::net::cortex::RpcResponseSink,
     timeout: Duration,
 ) -> std::result::Result<(), net_sdk::org::OrgHandlerError> {
+    let (sink_wrap, sink_liveness) = PyResponseSinkSend::from_org_response_sink(sink);
     let build = move |py: Python<'_>| -> HandlerResult<Py<pyo3::types::PyTuple>> {
         let caller_obj = caller_dict(py, &caller)
             .map_err(|e| (false, format!("failed to build caller: {e}")))?;
         let req = PyBytes::new(py, &body);
-        let sink_obj = Py::new(py, PyResponseSinkSend::from_org_response_sink(sink))
+        let sink_obj = Py::new(py, sink_wrap)
             .map_err(|e| (false, format!("failed to build response sink: {e}")))?
             .into_bound(py)
             .into_any();
@@ -450,7 +451,14 @@ async fn run_py_org_streaming_handler(
             .map_err(|e| (false, format!("failed to build args: {e}")))
     };
     let finish = |_py: Python<'_>, _ret: Py<PyAny>| -> HandlerResult<()> { Ok(()) };
-    org_handler_outcome(drive_handler(drive, callable, build, finish, timeout, "streaming").await)
+    let outcome = drive_handler(drive, callable, build, finish, timeout, "streaming").await;
+    // The response pump's sender must outlive the handler's completion
+    // until this future resolves: dropped earlier (at Python's argument
+    // teardown), the pump's exit races `handler_returned` to the terminal
+    // and the client sees `0x0006: response pump failed` (R4COREFIX
+    // finding 9 / F-S4PySdk-4).
+    drop(sink_liveness);
+    org_handler_outcome(outcome)
 }
 
 /// The client-streaming bridge: `handler(caller: dict, stream:
@@ -481,7 +489,7 @@ async fn run_py_org_client_stream_handler(
     let finish = |py: Python<'_>, ret: Py<PyAny>| -> HandlerResult<bytes::Bytes> {
         ret.into_bound(py)
             .extract::<Vec<u8>>()
-            .map(|b| bytes::Bytes::from(b))
+            .map(bytes::Bytes::from)
             .map_err(|e| {
                 (
                     false,
@@ -506,6 +514,7 @@ async fn run_py_org_duplex_handler(
     runtime: Arc<GuardedRuntime>,
     timeout: Duration,
 ) -> std::result::Result<(), net_sdk::org::OrgHandlerError> {
+    let (sink_wrap, sink_liveness) = PyResponseSinkSend::from_org_response_sink(sink);
     let build = move |py: Python<'_>| -> HandlerResult<Py<pyo3::types::PyTuple>> {
         let caller_obj = caller_dict(py, &caller)
             .map_err(|e| (false, format!("failed to build caller: {e}")))?;
@@ -516,7 +525,7 @@ async fn run_py_org_duplex_handler(
         .map_err(|e| (false, format!("failed to build request stream: {e}")))?
         .into_bound(py)
         .into_any();
-        let sink_obj = Py::new(py, PyResponseSinkSend::from_org_response_sink(sink))
+        let sink_obj = Py::new(py, sink_wrap)
             .map_err(|e| (false, format!("failed to build response sink: {e}")))?
             .into_bound(py)
             .into_any();
@@ -525,7 +534,11 @@ async fn run_py_org_duplex_handler(
             .map_err(|e| (false, format!("failed to build args: {e}")))
     };
     let finish = |_py: Python<'_>, _ret: Py<PyAny>| -> HandlerResult<()> { Ok(()) };
-    org_handler_outcome(drive_handler(drive, callable, build, finish, timeout, "duplex").await)
+    let outcome = drive_handler(drive, callable, build, finish, timeout, "duplex").await;
+    // Same liveness ordering as the streaming bridge: the pump's sender
+    // lives until this future resolves (R4COREFIX finding 9).
+    drop(sink_liveness);
+    org_handler_outcome(outcome)
 }
 
 /// Resolve the handler drive at registration — `def` → [`HandlerDrive::Sync`],

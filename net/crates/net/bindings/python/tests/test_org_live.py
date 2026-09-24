@@ -520,6 +520,77 @@ def test_org_duplex_async_call_and_serve(scenarios, access) -> None:
 
 
 # =========================================================================
+# The response-pump terminal race (R4COREFIX finding 9 / F-S4PySdk-4):
+# `0x0006: response pump failed` must never replace a genuine completion.
+#
+# A handler returning `_SlowDrop` forces the handler-result delivery to lag
+# the response sink's teardown by ~1 s (`__del__` runs between the two) —
+# the exact ordering the blocking bridge used to produce, where the pump's
+# exit raced `handler_returned` to the terminal. Deterministic: a 1 s gap
+# beats any scheduler.
+# =========================================================================
+
+
+class _SlowDrop:
+    def __del__(self) -> None:
+        time.sleep(1.0)
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("access", ["same_org", "granted"])
+def test_org_streaming_terminal_is_not_raced_by_the_response_pump(scenarios, access) -> None:
+    sc = scenarios[access]
+    svc = sc.service("stream")
+    with _live_pair(sc) as pair:
+
+        def handler(caller: dict, request: bytes, sink) -> None:
+            sink.send(b"one:" + request)
+            return _SlowDrop()
+
+        handle = net.serve_org_streaming(pair.provider, svc, access, handler, None)
+        client = _bind(sc, pair.caller)
+        stream = None
+        try:
+            stream = _converge(pair, sc, svc, lambda: client.call_streaming(svc, b"hi"))
+            chunks = list(stream)
+        finally:
+            if stream is not None:
+                stream.close()
+            client.close()
+            handle.close()
+        assert chunks == [b"one:hi"]
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("access", ["same_org", "granted"])
+def test_org_duplex_terminal_is_not_raced_by_the_response_pump(scenarios, access) -> None:
+    sc = scenarios[access]
+    svc = sc.service("mirror")
+    with _live_pair(sc) as pair:
+
+        def handler(caller: dict, stream, sink) -> None:
+            for chunk in stream:
+                sink.send(b"echo:" + chunk)
+            return _SlowDrop()
+
+        handle = net.serve_org_duplex(pair.provider, svc, access, handler, None)
+        client = _bind(sc, pair.caller)
+        call = None
+        try:
+            call = _converge(pair, sc, svc, lambda: client.call_duplex(svc))
+            for part in (b"a", b"b"):
+                call.send(part)
+            call.finish_sending()
+            echoed = list(call)
+        finally:
+            if call is not None:
+                call.close()
+            client.close()
+            handle.close()
+        assert echoed == [b"echo:a", b"echo:b"]
+
+
+# =========================================================================
 # The `task.cancel()` propagation witness (the F-S3.1-2 named item).
 # =========================================================================
 
