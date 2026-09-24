@@ -107,6 +107,20 @@ pub enum OrgCommand {
     /// the org still accepts this device's certificate until `org remove`.
     /// Rejoining takes a new link approved with the org root.
     Leave(OrgLeaveArgs),
+    /// What the node of `--state-dir` issued for this org (when it enrolls)
+    /// and each member's standing against its own floors — explicitly not a
+    /// claim about other nodes or about activity.
+    Members(OrgMembersArgs),
+}
+
+/// `org members` arguments.
+#[derive(Args, Debug)]
+pub struct OrgMembersArgs {
+    /// The org (its 64-hex org id).
+    pub org: String,
+    /// State directory of the node to ask (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
 }
 
 /// `org leave` arguments.
@@ -561,6 +575,17 @@ pub async fn run(
         }
         OrgCommand::Join(args) => run_org_join(args, output, profile_name).await,
         OrgCommand::Remove(args) => run_remove(args, output, profile_name).await,
+        OrgCommand::Members(args) => {
+            let org = super::enrollment::parse_org_id(&args.org).map_err(invalid_args)?;
+            super::lifecycle::run_members(
+                "org",
+                hex::encode(org.0),
+                args.state_dir,
+                output,
+                profile_name,
+            )
+            .await
+        }
         OrgCommand::Leave(args) => {
             super::lifecycle::run_org_leave(args.state_dir, args.wait, output, profile_name).await
         }

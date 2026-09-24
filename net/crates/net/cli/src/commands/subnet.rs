@@ -86,6 +86,20 @@ pub enum SubnetCommand {
     /// with, keeps the credentials, and presents them (the verifier's
     /// verdict is reported). The node renews and re-presents them itself.
     Join(SubnetJoinArgs),
+    /// What the node of `--state-dir` issued for this scope (and inside it)
+    /// and which peers are admitted to it at that node right now — explicitly
+    /// not a claim about other verifiers.
+    Members(SubnetMembersArgs),
+}
+
+/// `subnet members` arguments.
+#[derive(Args, Debug)]
+pub struct SubnetMembersArgs {
+    /// The subnet scope (dotted path); its subtree is included.
+    pub scope: String,
+    /// State directory of the node to ask (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
 }
 
 /// `subnet invite` arguments.
@@ -262,6 +276,17 @@ pub async fn run(
             .await
         }
         SubnetCommand::Join(args) => run_subnet_join(args, output, profile_name).await,
+        SubnetCommand::Members(args) => {
+            parse_subnet_path(&args.scope)?;
+            super::lifecycle::run_members(
+                "subnet",
+                args.scope,
+                args.state_dir,
+                output,
+                profile_name,
+            )
+            .await
+        }
     }
 }
 

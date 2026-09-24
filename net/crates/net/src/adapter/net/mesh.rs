@@ -20158,6 +20158,22 @@ impl MeshNode {
         Ok(ctx)
     }
 
+    /// Every peer admitted to a subnet at this node right now, with the
+    /// context it was admitted under — each checked exactly as
+    /// [`Self::subnet_context_for`] checks it (current session incarnation,
+    /// unexpired, current epochs) — and whose session is still live (the
+    /// peer has spoken within `session_timeout`; a dead peer keeps its
+    /// table entry, and its context, long after it stopped). An observation
+    /// at call time, not a roster: a peer that disconnects or expires drops
+    /// out.
+    pub fn admitted_subnet_peers(&self) -> Vec<(u64, VerifiedSubnetContext)> {
+        let ids: Vec<u64> = self.peers.iter().map(|entry| *entry.key()).collect();
+        ids.into_iter()
+            .filter(|id| !self.peer_session_is_silent(*id))
+            .filter_map(|id| self.subnet_context_for(id).map(|ctx| (id, ctx)))
+            .collect()
+    }
+
     /// The compiled context for `from_node`, iff it was compiled on
     /// that peer's CURRENT session incarnation and is still current
     /// with respect to expiry and both epochs. This is the read the

@@ -657,3 +657,122 @@ fn a_joined_device_joins_another_subnet_with_a_standalone_link() {
     }
     assert_eq!(seen, 2, "the 3.8 and 3.9 memberships");
 }
+
+/// V3-3 (subnet): `subnet members` separates what the operator's node
+/// ISSUED for a scope from which peers are admitted to it at that node RIGHT
+/// NOW. An issued device that is not connected is issued-but-absent (not
+/// removed); a device of another scope is in neither; a node that does not
+/// enroll says its issuer inventory is unknown.
+#[test]
+fn subnet_members_separates_issued_from_admitted_here() {
+    let operator = Fx::new();
+    let keys = operator.tmp.path().join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let (_root, _root_hex, issuer, grant) = ceremony(&keys);
+    let _op = operator.up(&[
+        "--enroll",
+        "--no-port-mapping",
+        "--subnet-issuer-grant",
+        grant.to_str().unwrap(),
+        "--subnet-issuer-key",
+        issuer.to_str().unwrap(),
+    ]);
+
+    // One device in 3.7 (connected), one in 3.8.
+    let in_scope = Fx::new();
+    let joined = in_scope.json(&[
+        "join",
+        &token_of(&operator.json(&["invite", "create", "--subnet", "3.7"])),
+        "--yes",
+    ]);
+    let device = joined["device"].as_str().unwrap().to_string();
+    let node = in_scope.up(&[]);
+    assert_eq!(
+        node.ready["joined"]["subnet"]["admitted"], true,
+        "{}",
+        node.ready
+    );
+    let elsewhere = Fx::new();
+    let other = elsewhere.json(&[
+        "join",
+        &token_of(&operator.json(&["invite", "create", "--subnet", "3.8"])),
+        "--yes",
+    ]);
+    let other_device = other["device"].as_str().unwrap().to_string();
+
+    let members = operator.json(&["subnet", "members", "3.7"]);
+    let issued = members["issued"].as_array().unwrap();
+    assert_eq!(issued.len(), 1, "{members}");
+    assert_eq!(issued[0]["subject"], device.as_str(), "{members}");
+    assert_eq!(issued[0]["state"], "issued", "{members}");
+    assert_eq!(issued[0]["subnet"]["scope"], "3.7", "{members}");
+    assert_eq!(members["unrecorded_offers"], 0, "{members}");
+    let here = members["observed"]["admitted_here"].as_array().unwrap();
+    assert_eq!(here.len(), 1, "{members}");
+    assert_eq!(here[0]["subject"], device.as_str());
+    assert_eq!(here[0]["attachment"], "3.7");
+    assert!(members["completeness"]["observed"]
+        .as_str()
+        .unwrap()
+        .contains("other verifiers were not asked"));
+    // The subtree query includes both; 3.8's device is issued, not connected.
+    let all = operator.json(&["subnet", "members", "3"]);
+    let subjects: Vec<&str> = all["issued"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["subject"].as_str())
+        .collect();
+    assert!(subjects.contains(&device.as_str()) && subjects.contains(&other_device.as_str()));
+    assert_eq!(
+        all["observed"]["admitted_here"].as_array().unwrap().len(),
+        1
+    );
+    // The 3.8 view: its device is issued there, but nothing is admitted there.
+    let eight = operator.json(&["subnet", "members", "3.8"]);
+    assert_eq!(
+        eight["issued"][0]["subject"],
+        other_device.as_str(),
+        "{eight}"
+    );
+    assert!(
+        eight["observed"]["admitted_here"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{eight}"
+    );
+
+    // Stopped: still issued, no longer admitted here once its session is
+    // silent — absent, not removed.
+    drop(node);
+    let mut last = Value::Null;
+    let mut gone = false;
+    for _ in 0..120 {
+        last = operator.json(&["subnet", "members", "3.7"]);
+        if last["observed"]["admitted_here"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        gone,
+        "a stopped device must drop out of admitted_here: {last}"
+    );
+    assert_eq!(last["issued"][0]["state"], "issued", "{last}");
+
+    // A node that does not enroll: its issuer inventory is unknown.
+    let node = elsewhere.up(&[]);
+    let theirs = elsewhere.json(&["subnet", "members", "3.8"]);
+    assert!(theirs["issued"].is_null(), "{theirs}");
+    assert!(theirs["completeness"]["issued"]
+        .as_str()
+        .unwrap()
+        .starts_with("unknown"));
+    drop(node);
+}

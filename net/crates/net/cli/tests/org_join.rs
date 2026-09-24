@@ -491,6 +491,21 @@ fn org_remove_applies_a_root_signed_floor_at_each_named_node() {
     ]);
     assert_eq!(dry["dry_run"], true, "{dry}");
 
+    // Before removal: the device is issued, and admissible at the operator.
+    let members = operator.json(&["org", "members", &org]);
+    assert_eq!(
+        members["issued"][0]["subject"],
+        device.as_str(),
+        "{members}"
+    );
+    assert_eq!(members["issued"][0]["state"], "issued", "{members}");
+    assert_eq!(members["issued"][0]["approved_generation"], 0, "{members}");
+    assert_eq!(members["observed"]["enforces_this_org"], true, "{members}");
+    assert_eq!(
+        members["observed"]["standing"][0]["standing"], "admissible_here",
+        "{members}"
+    );
+
     let removed = remove(&[
         "self".to_string(),
         contact_of(&node.ready),
@@ -503,6 +518,18 @@ fn org_remove_applies_a_root_signed_floor_at_each_named_node() {
     assert_eq!(rows[2]["state"], "not_member", "{removed}");
     assert_eq!(removed["applied"], 2, "{removed}");
     assert_eq!(removed["complete"], false, "the bystander enforces nothing");
+    // After removal: still issued, but revoked here (floor above the
+    // generation the operator signed).
+    let members = operator.json(&["org", "members", &org]);
+    assert_eq!(members["issued"][0]["state"], "issued", "{members}");
+    assert_eq!(
+        members["observed"]["standing"][0]["floor_here"], 1,
+        "{members}"
+    );
+    assert_eq!(
+        members["observed"]["standing"][0]["standing"], "revoked_here",
+        "{members}"
+    );
 
     // The device runs on without the org: revoked, not a startup failure.
     drop(node);

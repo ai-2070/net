@@ -2157,7 +2157,7 @@ re-adopting; rejoin not ending the leave; an offline leave not recorded.
 **Regressions:** `net-cli` 359/359; `net-cli` clippy (all targets, bins) is
 clean.
 
-**Still open (org).** `org members` (an inventory of enforcement points).
+**Still open (org).** ~~`org members`~~, closed by the V3-3 first-slice receipt.
 A live authority uninstall (no restart) remains possible as its own core
 slice.
 
@@ -2880,6 +2880,67 @@ Tasks:
 4. Exercise empty-but-reachable, unreachable, unauthorized, truncated/bounded inventory, stale receiver and a second independent admitted device. Redact all secret fields.
 
 **Exit:** The user can answer “what was issued, what is currently admitted here, and what is unknown?” without source inspection. Never relabel old `subnet ls --local` output as live state.
+
+#### V3-3 (first slice) — `org members` / `subnet members` (receipt, 2026-09-24)
+
+Decision (user, 2026-09-24): **the issuer inventory plus this node's
+observations**. Remote enforcement points come in a later slice.
+
+These commands answer "what was issued, what is admitted here, and what is
+unknown?" for one org or one subnet scope (with its subtree), from the node
+of `--state-dir`:
+- **`issued`** (when that node enrolls). Every offer it created whose
+  recorded relation matches, with its ledger state (`offered` /
+  `pending_approval` / `approved` / `issued` / `revoked_offer` / `denied`),
+  subject, `issued_at`, relation and scope, and, for org offers, the
+  generation `org approve` signed.
+  - Relations are now recorded per offer at `invite create`
+    (`<ledger>.org/relations/`), because the ledger keeps digests only.
+  - Older offers are counted in `unrecorded_offers`, never guessed.
+- **`observed`**, this node only:
+  - **Subnet:** the peers admitted to the scope at this node right now,
+    through a new core read `MeshNode::admitted_subnet_peers`. Each context
+    is checked as `subnet_context_for` checks it, **and** the session must be
+    live.
+    - Found while writing the witness: a dead peer keeps its table entry,
+      and its context, for 30 × `session_timeout`. Without the liveness
+      filter a killed device would still be listed as admitted.
+  - **Org:** each issued member's standing against this node's floors
+    (`admissible_here` / `revoked_here`, with `floor_here`), only when this
+    node enforces that org. Org admission is per call, so activity is
+    reported as unknown, never implied.
+- **`completeness`** states the boundary in words:
+  - a node that does not enroll reports its issuer inventory as `unknown`;
+  - other verifiers were not asked;
+  - a member not connected here is absent, not removed.
+
+**Witnesses.**
+- CLI `subnet_join::subnet_members_separates_issued_from_admitted_here`:
+  - a connected 3.7 device is issued and admitted;
+  - a 3.8 device is issued there, and admitted nowhere;
+  - the subtree view covers both;
+  - stopping the device drops it from `admitted_here` (still `issued`);
+  - a non-enrolling node reports `issued: unknown`.
+- CLI `org_join::org_remove_…`, extended: before removal the device is
+  `issued` with generation 0 and `admissible_here`; after `org remove` it is
+  `revoked_here` with `floor_here` 1.
+
+**Inverse mutations** (all RED):
+- dead sessions still reported admitted;
+- the admitted view ignoring the scope;
+- the issued view ignoring the scope;
+- standing ignoring floors;
+- relations not recorded;
+- the approved generation not recorded.
+
+**Regressions.**
+- `cargo tl` 5818/5818.
+- `net-cli` 360/360.
+- Clippy (core strict, CLI all targets) and root rustdoc are clean.
+
+**Next in V3-3.** Signed observations from named remote enforcement points,
+and channel status (credential state vs live ACK / publish-gate
+observation; never a roster).
 
 ### V3-4 — selective removal with durable enforcement
 

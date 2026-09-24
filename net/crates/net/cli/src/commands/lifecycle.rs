@@ -1502,6 +1502,103 @@ async fn forward_floor_query(
     }
 }
 
+/// Control op `members`: what this node ISSUED for an org or subnet scope
+/// (when it enrolls), and what it OBSERVES right now — never a claim about
+/// other nodes. Org admission is per call (no session state), so for org
+/// members this node reports standing against its own floors, not activity;
+/// subnet admission is per session, so this node lists the peers admitted
+/// to the scope at this moment.
+async fn members(state: &ControlState, request: &serde_json::Value) -> serde_json::Value {
+    let kind = request["kind"].as_str().unwrap_or_default().to_string();
+    let wanted = request["target"].as_str().unwrap_or_default().to_string();
+    if !matches!(kind.as_str(), "org" | "subnet") || wanted.is_empty() {
+        return serde_json::json!({ "error": "malformed members request" });
+    }
+    let issued = match &state.enroll {
+        Some(ctx) => {
+            let (ctx, k, w) = (ctx.clone(), kind.clone(), wanted.clone());
+            match tokio::task::spawn_blocking(move || ctx.issued_inventory(&k, &w)).await {
+                Ok(Ok(v)) => Some(v),
+                Ok(Err(e)) => return serde_json::json!({ "error": e }),
+                Err(_) => return serde_json::json!({ "error": "inventory task failed" }),
+            }
+        }
+        None => None,
+    };
+    let node = &state.node;
+    let observed = if kind == "org" {
+        let authority = node.node_authority();
+        let same_org = authority
+            .as_ref()
+            .is_some_and(|a| hex::encode(a.owner_org().0) == wanted);
+        let standing: Vec<serde_json::Value> = issued
+            .as_ref()
+            .and_then(|i| i["issued"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| {
+                let subject = row["subject"].as_str()?;
+                let authority = authority.as_ref().filter(|_| same_org)?;
+                let bytes: [u8; 32] = hex::decode(subject).ok()?.try_into().ok()?;
+                let entity = net::adapter::net::identity::EntityId::from_bytes(bytes);
+                let floor = authority
+                    .revocation
+                    .floor_for(&authority.owner_org(), &entity);
+                let standing = match row["approved_generation"].as_u64() {
+                    Some(g) if u64::from(floor) > g => "revoked_here",
+                    Some(_) => "admissible_here",
+                    None => "unknown_generation",
+                };
+                Some(serde_json::json!({ "subject": subject, "floor_here": floor, "standing": standing }))
+            })
+            .collect();
+        serde_json::json!({
+            "enforces_this_org": same_org,
+            "standing": standing,
+        })
+    } else {
+        let admitted: Vec<serde_json::Value> = node
+            .admitted_subnet_peers()
+            .into_iter()
+            .filter_map(|(peer, ctx)| {
+                let at = super::subnet::format_subnet(ctx.attachment);
+                (at == wanted || at.starts_with(&format!("{wanted}."))).then(|| {
+                    serde_json::json!({
+                        "peer_node": format!("0x{peer:016x}"),
+                        "subject": hex::encode(ctx.subject.as_bytes()),
+                        "attachment": at,
+                        "rights": super::subnet::format_subnet_rights(ctx.rights),
+                        "generation": ctx.generation,
+                        "expires_at": ctx.expires_at,
+                    })
+                })
+            })
+            .collect();
+        serde_json::json!({ "admitted_here": admitted })
+    };
+    serde_json::json!({
+        "kind": kind,
+        "target": wanted,
+        "responder": hex::encode(node.entity_id().as_bytes()),
+        "observed_at": now_unix(),
+        "issued": issued.as_ref().map(|i| i["issued"].clone()),
+        "unrecorded_offers": issued.as_ref().map(|i| i["unrecorded_offers"].clone()),
+        "observed": observed,
+        "completeness": {
+            "issued": if issued.is_some() {
+                "offers this node created that carry a relation record; older offers are counted in unrecorded_offers"
+            } else {
+                "unknown: this node does not enroll (run it with `up --enroll`)"
+            },
+            "observed": if kind == "org" {
+                "standing against THIS node's floors only; org admission is per call, so whether a member is active is unknown; other nodes were not asked"
+            } else {
+                "sessions admitted at THIS node at observed_at; other verifiers were not asked; a member that is not connected here is absent, not removed"
+            },
+        },
+    })
+}
+
 /// Control op `org_leave`: durably record that this node leaves its org, drop
 /// its pending links to that org, then stop the node so its next start runs
 /// on the mesh without the org. Nothing is sent to the org: the org still
@@ -1943,6 +2040,7 @@ async fn control_session(
             state.draining.store(true, Ordering::SeqCst);
             serde_json::json!({ "accepted": true, "incarnation": state.report.incarnation })
         }
+        "members" => members(state, &request).await,
         "org_leave" if draining => serde_json::json!({ "error": "node is draining" }),
         "org_leave" => org_leave(state).await,
         "org_join" if draining => serde_json::json!({ "error": "node is draining" }),
@@ -2773,6 +2871,33 @@ pub async fn run_down(
 /// `net-mesh org leave`: record that this device leaves its org and stop its
 /// running node (its next `up` runs on the mesh without the org). Offline,
 /// the departure is recorded directly.
+/// `org members` / `subnet members`: ask the node of `--state-dir` what it
+/// issued and what it observes for one org or subnet scope.
+pub async fn run_members(
+    kind: &str,
+    target: String,
+    state_dir_arg: Option<PathBuf>,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let dir = state_dir(state_dir_arg, profile_name)?.join(NODE_SUBDIR);
+    let (_, reply) = control_call(
+        &dir,
+        serde_json::json!({ "op": "members", "kind": kind, "target": target }),
+    )
+    .await
+    .map_err(|e| {
+        connection_failure(format!(
+            "no running node answered ({e:?}); inventory is read from a running `net-mesh up`"
+        ))
+    })?;
+    if let Some(e) = reply["error"].as_str() {
+        return Err(generic(e.to_string()));
+    }
+    emit_value(OutputFormat::resolve_oneshot(output), &reply)
+        .map_err(|e| generic(format!("write result: {e}")))
+}
+
 pub async fn run_org_leave(
     state_dir_arg: Option<PathBuf>,
     wait: Duration,

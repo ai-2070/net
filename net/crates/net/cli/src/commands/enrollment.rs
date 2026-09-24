@@ -509,6 +509,9 @@ struct NodeBundles {
 pub(crate) struct OrgBook {
     stash: Arc<net_sdk::enrollment::org::OrgCertStash>,
     offers: PathBuf,
+    /// What each invite grants (relations and scopes), per offer: the ledger
+    /// keeps digests only, and the member inventory needs the relation.
+    relations: PathBuf,
 }
 
 impl OrgBook {
@@ -518,7 +521,26 @@ impl OrgBook {
                 dir.join("certs"),
             )),
             offers: dir.join("offers"),
+            relations: dir.join("relations"),
         }
+    }
+
+    /// Record (or amend) what `offer` grants. Written, then renamed.
+    fn record_relations(
+        &self,
+        offer: &net_sdk::enrollment::store::OfferId,
+        record: &Value,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.relations)?;
+        let path = self.relations.join(format!("{offer}.json"));
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, record.to_string())?;
+        std::fs::rename(&tmp, &path)
+    }
+
+    fn relations_of(&self, offer: &net_sdk::enrollment::store::OfferId) -> Option<Value> {
+        let bytes = std::fs::read(self.relations.join(format!("{offer}.json"))).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     fn record_offer(
@@ -879,6 +901,22 @@ impl EnrollContext {
                 .record_offer(&offer, &offer_org.org)
                 .map_err(|e| format!("org offer record: {e}"))?;
         }
+        self.org
+            .record_relations(
+                &offer,
+                &json!({
+                    "relations": invite.relations().iter().map(|r| format!("{r:?}").to_lowercase()).collect::<Vec<_>>(),
+                    "org": org.as_ref().map(|o| hex::encode(o.org.0)),
+                    "subnet": subnet.as_ref().map(|o| json!({
+                        "authority": hex::encode(o.scope.authority.as_bytes()),
+                        "scope": super::subnet::format_subnet(o.scope.path),
+                        "rights": super::subnet::format_subnet_rights(o.rights),
+                        "topology_epoch": o.topology_epoch,
+                    })),
+                    "standalone": standalone,
+                }),
+            )
+            .map_err(|e| format!("offer relation record: {e}"))?;
         Ok(json!({
             "token": invite.encode(),
             "offer_id": offer.to_string(),
@@ -1052,6 +1090,11 @@ impl EnrollContext {
         ledger
             .approve(&offer, &claim, now_unix())
             .map_err(|e| e.to_string())?;
+        // The generation signed, for the inventory's standing check.
+        if let Some(mut record) = self.org.relations_of(&offer) {
+            record["approved_generation"] = json!(cert.generation);
+            let _ = self.org.record_relations(&offer, &record);
+        }
         Ok(json!({
             "offer_id": offer.to_string(),
             "state": "approved",
@@ -1061,6 +1104,56 @@ impl EnrollContext {
             "not_after": cert.not_after,
             "audience": audience.is_some(),
         }))
+    }
+}
+
+impl EnrollContext {
+    /// Issuer inventory: every offer this node created whose recorded
+    /// relation matches `wanted` (`org` = hex org id; `subnet` = an
+    /// authority-local dotted scope, matching that scope and everything
+    /// inside it), with its ledger state and subject. Offers created before
+    /// relation records existed are counted, not guessed.
+    pub(crate) fn issued_inventory(&self, kind: &str, wanted: &str) -> Result<Value, String> {
+        let statuses = self.ledger.lock().statuses().map_err(|e| e.to_string())?;
+        let mut issued = Vec::new();
+        let mut unrecorded = 0usize;
+        for status in statuses {
+            let Some(record) = self.org.relations_of(&status.offer_id) else {
+                unrecorded += 1;
+                continue;
+            };
+            let matches = match kind {
+                "org" => record["org"].as_str() == Some(wanted),
+                _ => record["subnet"]["scope"].as_str().is_some_and(|scope| {
+                    scope == wanted || scope.starts_with(&format!("{wanted}."))
+                }),
+            };
+            if !matches {
+                continue;
+            }
+            use net_sdk::enrollment::store::OfferState as S;
+            let (state, subject, issued_at) = match &status.state {
+                S::Offered => ("offered", None, None),
+                S::PendingApproval { subject } => ("pending_approval", Some(subject), None),
+                S::Ready { subject } => ("approved", Some(subject), None),
+                S::Issued {
+                    subject, issued_at, ..
+                } => ("issued", Some(subject), Some(*issued_at)),
+                S::Revoked { subject } => ("revoked_offer", subject.as_ref(), None),
+                S::Denied { subject } => ("denied", Some(subject), None),
+            };
+            issued.push(json!({
+                "offer_id": status.offer_id.to_string(),
+                "state": state,
+                "subject": subject.map(|s| hex::encode(s.as_bytes())),
+                "issued_at": issued_at,
+                "relations": record["relations"],
+                "subnet": record["subnet"],
+                "approved_generation": record["approved_generation"],
+                "standalone": record["standalone"],
+            }));
+        }
+        Ok(json!({ "issued": issued, "unrecorded_offers": unrecorded }))
     }
 }
 
