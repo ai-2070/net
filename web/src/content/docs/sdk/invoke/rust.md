@@ -53,6 +53,27 @@ There is no `with_deadline` builder on `CallOptions`.
 `_h` matters as much here as on the announce page — the handle deregisters on
 drop, so binding it to `_` unserves the handler immediately.
 
+### The protected variant
+
+An organization-scoped call is the same typed shape behind a different facade. The
+caller binds a credential set once and calls the three streaming verbs beside the
+unary one:
+
+```rust
+let org = mesh.org(credentials)?;          // bind once
+let resp: SummarizeResp = org.call("summarize", &req).await?;
+let mut stream = org.call_streaming::<Req, Resp>("summarize", &req).await?;
+let mut call = org.call_client_stream::<Req, Resp>("summarize").await?;
+let call = org.call_duplex::<Req, Resp>("cdr").await?;
+```
+
+The provider side registers with `serve_org` (unary) or
+`serve_org_streaming` / `serve_org_client_stream` / `serve_org_duplex`. The
+lifetime rule differs from the `Instant` deadline above — the streaming verbs
+substitute the facade's own default when no deadline is given rather than "no
+deadline," and a request past the provider's policy is refused at opening. See
+[Protected streaming](/docs/guides/protected-streaming).
+
 ### Let the mesh pick the provider
 
 ```rust

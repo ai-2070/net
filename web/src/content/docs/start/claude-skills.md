@@ -14,7 +14,7 @@ source inspection or tests for the exact mechanism being changed.
 
 ## The two skills
 
-**`net-event-bus`** — Net as an event bus: pub/sub over the mesh, nRPC request/response, the MCP bridge (`net-mesh wrap` / `net-mesh mcp serve`), [organization capability auth](/docs/guides/private-capabilities) (`serve_org` / `mesh.org(..).call`), the gang-claim scheduler, and the RedEX / CortEX / Dataforts layers on top.
+**`net-event-bus`** — Net as an event bus: pub/sub over the mesh, nRPC request/response (all four shapes — unary, server-streaming, client-streaming, duplex), the MCP bridge (`net-mesh wrap` / `net-mesh mcp serve`), [organization capability auth](/docs/guides/private-capabilities) (`serve_org` / `mesh.org(..).call`, plus the protected streaming verbs `serve_org_streaming` / `call_streaming` / `call_client_stream` / `call_duplex`), the gang-claim scheduler, and the RedEX / CortEX / Dataforts layers on top.
 
 **`net-payments`** — x402-native payments: pricing a capability at discovery, signed quotes, the provider lifecycle engine (quote → verify → settle → bill), the caller-side pay-to-invoke flow, tiered on-chain verification, and spend policy.
 
@@ -108,7 +108,7 @@ Skills load automatically when a request matches. To see one fire, ask for somet
 >
 > _"Price a Net capability with x402 and charge callers to invoke it."_
 
-`net-event-bus` triggers on imports of `@net-mesh/sdk` or `net-sdk` and on phrases like _pub/sub with Net_, _nRPC_, _mesh RPC_, _RedEX_, _CortEX_, _Dataforts_, _gang scheduler_, _net-mesh wrap_, _serve_org_. `net-payments` triggers on `net-payments` / `net_payments` imports and on _price a capability_, _pay to invoke_, _x402_, _settle on Base/Solana/XRPL_, _spend limit_.
+`net-event-bus` triggers on imports of `@net-mesh/sdk` or `net-sdk` and on phrases like _pub/sub with Net_, _nRPC_, _mesh RPC_, _streaming RPC_, _server-streaming_, _duplex call_, _RedEX_, _CortEX_, _Dataforts_, _gang scheduler_, _net-mesh wrap_, _serve_org_, _call_streaming_. `net-payments` triggers on `net-payments` / `net_payments` imports and on _price a capability_, _pay to invoke_, _x402_, _settle on Base/Solana/XRPL_, _spend limit_.
 
 ## Opensrc
 

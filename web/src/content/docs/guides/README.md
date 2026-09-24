@@ -9,7 +9,8 @@ Guides show how to complete a specific task with Net. Choose the page closest to
 what you are building:
 
 - Discover and invoke work: [Discover and invoke](/docs/guides/discover-and-invoke),
-  [nRPC](/docs/guides/nrpc), and [Private capabilities](/docs/guides/private-capabilities).
+  [nRPC](/docs/guides/nrpc), [Private capabilities](/docs/guides/private-capabilities),
+  and [Protected streaming](/docs/guides/protected-streaming).
 - Connect agent tools: [Wrap an MCP server](/docs/guides/wrap-mcp-server),
   [Expose Net as MCP](/docs/guides/expose-net-as-mcp), and
   [Agent-to-agent](/docs/guides/agent-to-agent).

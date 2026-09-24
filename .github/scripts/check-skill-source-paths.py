@@ -78,6 +78,13 @@ ROOTS = [
     "net/crates/net/payments/",  # payments crate: src/, tests/
     "net/crates/net/payments/src/",  # payments modules: core/, x402/, engine/, flow/
     "net/crates/net/cli/src/",  # `net-mesh` command tree: commands/
+    # The leaf crate's own org subsystem and the TypeScript SDK's org facade.
+    # Both are published as roots in `source-access.md`'s table, and this list
+    # is the other half of that contract — a shorthand the page advertises has
+    # to resolve here too, or a reader following the page writes a citation the
+    # checker rejects.
+    "net/crates/net/leaf/src/org/",  # browser/leaf org port: proof.rs, admission.rs
+    "net/crates/net/sdk-ts/src/org/",  # TypeScript org surface: index.ts
     "net/crates/net/bindings/",  # go/rpc-ffi/, node/src/, python/src/
     "net/crates/net/bindings/python/",  # pytest suites under tests/
     "net/crates/net/tests/cross_lang_payments/",  # x402 conformance fixtures

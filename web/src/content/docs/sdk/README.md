@@ -33,3 +33,10 @@ need explicit treatment.
 Most applications should begin with a language SDK. Use the lower-level event bus
 when embedding the bus, writing an adapter, or controlling ingestion and
 consumption directly.
+
+Alongside the public capability path, every language surface also carries
+**organization capability auth** — an audience-scoped, admission-proof path with
+its own four call shapes and a frozen `org:` error vocabulary. See
+[Organizations](/docs/concepts/organizations) and
+[Protected streaming](/docs/guides/protected-streaming); each language landing page
+names that binding's verbs.

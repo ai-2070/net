@@ -34,7 +34,7 @@ API-surface counts the companions depend on:
 If a count moves, the SDK has churned underneath this doc — re-verify from
 source. **The SDK source is ground truth; this skill is a shadow copy of it.**
 
-## The five surfaces (do not skip)
+## The surfaces (do not skip)
 
 Choosing the wrong one is the most expensive mistake available here, and it is
 made before any code is written. Note that the first two are *both* called
@@ -48,6 +48,7 @@ the split.
 | **Raw typed firehose** (`node.emit(struct)` → `node.subscribe()`) | One stream of typed events. Consumers receive everything and discriminate on the receive side. | Rust, TypeScript, Python |
 | **Raw poll** (`bus.IngestRaw` → `bus.Poll(cursor)`) | Push JSON in, poll JSON out with a cursor. No async, no channels. | Go, C |
 | **nRPC** (`TypedMeshRpc.serve` + `TypedMeshRpc.call`) | Typed call → typed reply, with deadlines, retries, hedging and response streaming. **A different surface from this file** — see `nrpc.md`. | all five |
+| **Organization-scoped service** (`mesh.org(credentials).call(..)` → `serve_org(.., OrgAccess::{SameOrg,Granted}, ..)`) | A gated nRPC service whose unit of authority is an **organization**: discovery is sealed to an encrypted audience, so an outsider sees no service rather than a refused one. Four call shapes (`call` / `call_streaming` / `call_client_stream` / `call_duplex`) over the matching provider verbs. | all five |
 
 Three decisions follow directly:
 
@@ -59,6 +60,12 @@ Three decisions follow directly:
 - **Wants request/response — a call that returns a value?** Stop here and read
   `nrpc.md`. The bus surface has no return-value mechanism, and building one out
   of two channels is a well-worn way to reinvent nRPC badly.
+- **Wants only some organizations to call it — a tenant-private or partner-only
+  service?** That is organization capability auth: the caller binds
+  `mesh.org(credentials)` and calls it, the provider serves it under
+  `OrgAccess::{SameOrg,Granted}`, and the service stays invisible to everyone
+  else. Read `org.md` — the four shapes, offline issuance, and the frozen
+  `org:<domain>:<kind>` errors.
 
 ## Cross-SDK gotchas
 
@@ -113,6 +120,10 @@ Out of scope for the companions — read these from source or their own chapter:
   identity keys) — `mesh.md`.
 - **Subnets and capability tags** — set at construction; they affect channel
   visibility. `capabilities.md`.
+- **Organization capability auth** — a tenant-private or partner-only service,
+  unary through duplex, invisible rather than refused on every shape. `org.md`.
+- **Subnet authority** — exporting one service across a protected subnet
+  boundary while the enclave stays sealed. `subnet-auth.md`.
 - **Capability discovery** — `mesh.find_nodes(filter)` /
   `find_nodes_scoped(filter, scope)` / `find_best_node(req)` for picking a peer
   by hardware, model or tag. Reserved `scope:tenant:*` / `scope:region:*` /

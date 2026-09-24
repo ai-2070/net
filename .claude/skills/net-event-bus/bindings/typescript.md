@@ -16,7 +16,8 @@ import { NetNode } from '@net-mesh/sdk';
 **Two packages, and the split matters.** `@net-mesh/sdk` is the ergonomic
 wrapper; `@net-mesh/core` is the napi binding underneath it. Several surfaces
 are reachable *only* from `@net-mesh/core` — payments is entirely there, and
-`bindings/coverage.md` marks each one `core-only`. If an import from
+`bindings/coverage.md` marks each one `core-only`. But not every one: org has an
+SDK-level facade too (see **Protected services (org)** below). If an import from
 `@net-mesh/sdk` does not resolve, check the matrix before concluding the feature
 is missing.
 
@@ -113,6 +114,32 @@ you like and drop them by letting them go out of scope. What *does* need
 stopping is a live subscription: call `stream.stop()` on any `subscribe()` /
 `subscribeRaw()` iterator you are not draining, or the polling loop keeps
 running against a shut-down bus.
+
+## Protected services (org)
+
+Org capability auth is reachable at **two layers** — and it is the
+counter-example to the "only from `@net-mesh/core`" rule above, because it also
+has an SDK-level wrapper:
+
+| Layer | Import | Client |
+|---|---|---|
+| napi + typed wrapper | `@net-mesh/core/org` | `TypedOrgClient` |
+| ergonomic facade | `@net-mesh/sdk/org` | `OrgClient` |
+
+Both expose the same four call shapes — `call`, `callStreaming`,
+`callClientStream`, `callDuplex` — over the same `OrgAccess`, under
+layer-specific names: bind with `TypedOrgClient.bind(mesh, credentials)` and
+serve with `serveOrgTyped` / `serveOrgStreamingTyped` /
+`serveOrgClientStreamTyped` / `serveOrgDuplexTyped` from `@net-mesh/core/org`,
+or with `OrgClient.bind(mesh, credentials)` and `serveOrg` /
+`serveOrgStreaming` / `serveOrgClientStream` / `serveOrgDuplex` from
+`@net-mesh/sdk/org`. (`@net-mesh/core/org` deliberately re-exports neither the
+untyped `OrgClient` nor the untyped `serveOrg*` names — the raw napi ones live
+on the bare `@net-mesh/core` entry point.)
+
+An unset deadline in `OrgCallOptions` — and this is a **streaming**-verb control,
+which `call` does not take — means the facade's **300 s** protected-streaming
+lifetime, never "no deadline". Full contract: `org.md`.
 
 ## Gaps
 

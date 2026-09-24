@@ -202,6 +202,8 @@ cargo run -p net-mesh-sdk --features net,cortex,fixtures --example gen_org_error
 
 Test the **error domain**, not the message. `org:<domain>:<kind>[: <detail>]` is frozen and fixture-pinned; the detail is human-facing and will change. Asserting on it is the org equivalent of asserting on a timestamp.
 
+The streaming half has its own fixtures and suites. Two fixtures pin the streaming openings every binding parses — `net/crates/net/tests/cross_lang_org/streaming_opening_vectors.json` and its `net/crates/net/tests/cross_lang_org/streaming_opening_frozen_credentials.json` companion — with per-binding suites at `net/crates/net/bindings/node/test/org_streaming_opening_vectors.test.ts`, `net/crates/net/bindings/python/tests/test_org_streaming_opening_vectors.py`, and `go/org_streaming_opening_vectors_test.go`; the mixed-pair harness is `net/crates/net/tests/cross_lang_org/mixed_pair/` — `provider.py`, the Python provider the Go opening-vectors suite drives cross-process, and `caller.py`, the standalone Python caller that spawns it. The live Rust suite is `net/crates/net/sdk/tests/org_streaming.rs`; the live binding suites are `net/crates/net/bindings/node/test/org_live.test.ts`, `net/crates/net/bindings/python/tests/test_org_live.py`, and `go/org_test.go`; the leaf lifecycle suite is `net/crates/net/leaf/tests/org_streaming_lifecycle.rs`.
+
 Two setup mistakes produce a confusing "service not found" rather than an auth error, so check them first: a `Granted` provider that never called `install_provider_grant_audience` registers fine but stays encrypted and undiscoverable, and a mesh built without an explicit identity seed is refused at bind with `persistent_identity_required`. Full model: `org.md`.
 
 ## CI-specific gotchas

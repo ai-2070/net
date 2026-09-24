@@ -108,6 +108,16 @@ Note that the **bus** `emit` does not throw under backpressure — it returns `n
 | `GatewayError` | Capability gateway, including payment refusals |
 | `ToolCallParseError` | A tool descriptor or call payload that will not parse |
 
+### Organization failure domains
+
+Organization-scoped calls throw `OrgError` subclasses; `classifyOrgError` maps a raw
+thrown value to the right one, and `OrgError.isLocal` says whether anything left the
+process (`credentials` / `discovery` are local; `admission_denied` / `rpc` /
+`unknown` are remote). A streaming call can fail **midstream**: the stream's `next()`
+routes errors through `classifyOrgError`, so an `OrgAdmissionDeniedError` on
+revocation (or an `OrgError` on deadline/cancel retirement) arrives from the handle,
+not from the opening.
+
 ### Recover a call
 
 ```typescript

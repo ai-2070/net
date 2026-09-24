@@ -53,6 +53,28 @@ a standby possible.
 The deadline is `deadlineMs` — plain milliseconds, unlike Rust's absolute
 `Instant`. `opts.signal` accepts an `AbortSignal` for caller-side cancellation.
 
+### The protected variant
+
+Organization-scoped calls live on the `@net-mesh/sdk/org` facade and carry an
+admission proof. The caller binds once and uses the four verbs; the server
+registers the matching three streaming shapes beside the unary one:
+
+```typescript
+import { OrgAccess, OrgClient, serveOrgStreaming } from '@net-mesh/sdk/org';
+
+const org = OrgClient.bind(node, credentials);  // bind once, consumes the set
+const opts = { deadlineMs: 500 };
+const stream = await org.callStreaming<Req, Resp>('summarize', req, opts);
+const call = await org.callClientStream<Req, Resp>('upload', opts);
+const [sink, responses] = await org.callDuplex<Req, Resp>('chat', opts);
+
+const handle = serveOrgStreaming(node, 'summarize', OrgAccess.SameOrg, handler);
+```
+
+`0` / omitted `deadlineMs` is the facade's own default, never "no deadline," and a
+request past the provider's policy is refused at opening. Failures route through
+`classifyOrgError`. See [Protected streaming](/docs/guides/protected-streaming).
+
 ### A request that will not decode
 
 The handler's request decode failure is not your exception to catch — it is

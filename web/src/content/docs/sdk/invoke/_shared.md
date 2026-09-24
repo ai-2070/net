@@ -47,6 +47,26 @@ time. Make the operation idempotent, or carry an idempotency key, or accept the
 duplicate. This is not a Net peculiarity; it is what a network deadline means
 everywhere, stated here because the typed API makes it easy to forget.
 
+### A protected call reuses the deadline names, not the rule
+
+An organization-scoped call takes the same `deadline` / `deadlineMs` /
+`deadline_ms` / context-deadline naming as above, but the rule underneath it is
+materially different:
+
+- **On a streaming call, `0` or omitted is a default, never "no deadline".** The
+  streaming verbs substitute the facade's own 300 s default when the caller names
+  none; the unary verb instead sets no deadline at all.
+- **A request beyond the provider's policy is refused at opening.** An explicit
+  deadline past the provider's maximum protected lifetime (3600 s) is a coarse
+  `denied` at opening — not a clamped wait.
+- **There is no retry underneath, and a second attempt is a fresh proof.** The
+  facade sends one signed opening; retrying is your decision, with the same
+  ambiguous-execution cost as any other call. The nRPC retry layer does not cover
+  organization-scoped calls.
+
+See [Protected streaming](/docs/guides/protected-streaming) for the four shapes and
+the admission proof they carry.
+
 ## Provider admission happens at invocation
 
 Seeing a capability does not grant the right to invoke it. Discovery may itself be

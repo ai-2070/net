@@ -145,6 +145,35 @@ their next operation. Nothing hangs and nothing needs draining first. See
 Call `flush()` before `shutdown()` if you cannot tolerate losing in-flight
 batches.
 
+## Protected services (org)
+
+Org capability auth is a second, independent surface: a service reachable by
+**only some organizations**, sealed to an encrypted audience so an outsider
+sees no service at all. It needs the `net` + `cortex` feature bundle — there is
+no org-specific feature flag — and binding is `mesh.org(credentials)?` →
+`OrgClient`:
+
+```rust
+let org = mesh.org(credentials)?;                 // bind (consumes the set)
+org.call(service, &req).await?;                   // unary
+org.call_streaming(service, &req).await?;         // server-streaming → OrgStream
+org.call_client_stream(service).await?;           // client-streaming
+org.call_duplex(service).await?;                  // duplex
+
+mesh.serve_org(service, OrgAccess::SameOrg, handler)?;                    // unary
+mesh.serve_org_streaming(service, OrgAccess::Granted, handler)?;
+mesh.serve_org_client_stream(service, OrgAccess::Granted, handler)?;
+mesh.serve_org_duplex(service, OrgAccess::Granted, handler)?;
+```
+
+Streaming call handles are `OrgStream` (typed), `OrgStreamRaw` (bytes),
+`OrgClientStreamCall` (`send` / `finish`) and `OrgDuplexCall` (`send`,
+`finish_sending`, `into_split`). The facade owns the streaming deadline: on the
+three streaming verbs an unset deadline is **300 s**, never "no deadline", while
+the unary `call` is unbounded — it carries no deadline at all. The full contract —
+issuance, admission order, the frozen `org:<domain>:<kind>` errors — is in
+`org.md`.
+
 ## Gaps
 
 - **No `node.channel()` API on the bus.** For splitting topics *within one

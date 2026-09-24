@@ -73,7 +73,8 @@ its built `dist` directory — compiled JS plus `.d.ts` — so reading
 1. **Anything newer than the last release.** The checkout is the *published* tag,
    not `master`. This skill's frontmatter carries the version it documents; when
    that is ahead of the published one, surfaces added in between are simply
-   absent. Currently that includes the org-capability-auth module
+   absent. Currently that includes the org **streaming** half — the streaming
+   call verbs, the `net_org.h` ABI `0x0002` delta, and the Go streaming verbs
    (`net/crates/net/sdk/src/org/`, `go/org.go`). Pin explicitly if you need an
    older one: `opensrc path crates:net-mesh-sdk@0.32.0`.
 
@@ -99,9 +100,11 @@ The `…` marks where the citation continues — prepend everything to its left.
 | Root | Holds | A citation that needs it |
 |---|---|---|
 | *(none — repo root)* | the majority | `net/crates/net/sdk/src/mesh.rs` |
-| `net/crates/net/…` | `sdk/`, `sdk-ts/`, `sdk-py/`, `bindings/`, `include/`, `tests/` | `bindings/python/src/lib.rs` |
+| `net/crates/net/…` | `sdk/`, `sdk-ts/`, `sdk-py/`, `bindings/`, `include/`, `tests/`, `leaf/` | `bindings/python/src/lib.rs` |
 | `net/crates/net/src/…` | core internals | `bus.rs`, `config.rs`, `adapter/noop.rs` |
 | `net/crates/net/src/adapter/net/…` | mesh behaviour | `behavior/fold/island.rs`, `channel/config.rs`, `cortex/workflow/` |
+| `net/crates/net/leaf/src/org/…` | the browser/leaf org port (proof, admission, cert, replay) | `proof.rs`, `admission.rs`, `mod.rs` |
+| `net/crates/net/sdk-ts/src/org/…` | the TypeScript org surface (npm publishes only `dist`) | `index.ts` |
 | `net/crates/net/cli/src/…` | the `net-mesh` command tree | `commands/node.rs` |
 | `net/crates/net/payments/src/…` | payments modules | `core/quote.rs`, `x402/mod.rs` |
 | `net/crates/net/bindings/…` | FFI layers | `python/src/lib.rs`, `node/src/payment_provider.rs` |

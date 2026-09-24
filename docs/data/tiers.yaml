@@ -21,7 +21,7 @@
 #   - Rust-native reference pages                -> sdk_native (nav owner only;
 #     D7 keeps their physical path and canonical URL unchanged)
 #
-# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=13 universal=89, total=137
+# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=13 universal=90, total=138
 #
 # Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
 
@@ -106,6 +106,7 @@ pages:
   guides/netdb-queries: adaptive_pending
   guides/nrpc: adaptive_pending
   guides/private-capabilities: adaptive_pending
+  guides/protected-streaming: universal
   guides/production-deployment: adaptive_pending
   guides/recover-failed-workflow: adaptive_pending
   guides/submitted-is-not-completed: universal

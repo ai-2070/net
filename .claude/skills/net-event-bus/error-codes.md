@@ -112,7 +112,7 @@ surface + retries/hedging in `nrpc.md`.
 
 ### Org capability auth — the `org:<domain>:<kind>` wire vocabulary
 
-From `mesh.org(..)`, `OrgClient::call`, and every binding's equivalent. Unlike the rest of this file, this is a **frozen cross-language string vocabulary** — single-sourced from Rust's `OrgSdkError::to_wire`, pinned by `net/crates/net/tests/cross_lang_org/error_vectors.json`, and re-parsed identically by Node, Python, Go, and C.
+From all four org call shapes — `call`, `call_streaming`, `call_client_stream`, `call_duplex` — on both sides of every stream, and midstream from a stream handle. An org stream never speaks the bare nRPC `<kind>:` shape, so one parser classifies an opening refusal and a midstream retirement alike. Unlike the rest of this file, this is a **frozen cross-language string vocabulary** — single-sourced from Rust's `OrgSdkError::to_wire`, pinned by `net/crates/net/tests/cross_lang_org/error_vectors.json` with the streaming openings pinned alongside by `tests/cross_lang_org/streaming_opening_vectors.json` and its `streaming_opening_frozen_credentials.json` companion, and re-parsed identically by Node, Python, Go, and C.
 
 Shape: `org:<domain>:<kind>[: <detail>]`. **The detail is human-facing and must never be parsed for semantics.**
 
