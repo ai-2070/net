@@ -1,0 +1,14 @@
+net/crates/net/bindings/python/src/runtime_guard.rs
+  h_64425bc75e3f3d 62-70,74,116-139,149-167
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ef7c7195a7974f1b6fd9f9754dcbd3eaa305cee3",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
