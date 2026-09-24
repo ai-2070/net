@@ -546,3 +546,36 @@ fn joined_consumers_refuse_what_they_cannot_honour() {
     device.json(&["leave"]);
     assert!(serve(&[]).contains("left the mesh"));
 }
+
+/// E2: inspecting a link (and listing the ledger) leaves the enrollment
+/// ledger byte-for-byte untouched and consumes nothing — the same link still
+/// redeems afterwards, and that redemption does change the ledger (so the
+/// comparison is sensitive).
+#[test]
+fn inspection_leaves_the_ledger_untouched_and_the_link_redeemable() {
+    let operator = Fx::new();
+    let _op = operator.up(&["--enroll", "--no-port-mapping", "--no-relay"]);
+    let created = operator.json(&["invite", "create"]);
+    let token = created["token"].as_str().unwrap().to_string();
+    let ledger = operator.state().join("ledger").join("enrollment.snapshot");
+    let before = std::fs::read(&ledger).unwrap();
+    for _ in 0..2 {
+        let inspected = operator.json_stateless(&["invite", "inspect", &token]);
+        assert_eq!(inspected["relations"], json!(["mesh"]), "{inspected}");
+        let status = operator.json(&["invite", "status"]);
+        assert!(status.to_string().contains("offered"), "{status}");
+    }
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        before,
+        "inspection wrote nothing"
+    );
+    let device = Fx::new();
+    let joined = device.json(&["join", &token, "--yes"]);
+    assert_eq!(joined["state"], "joined", "{joined}");
+    assert_ne!(
+        std::fs::read(&ledger).unwrap(),
+        before,
+        "redemption is recorded"
+    );
+}

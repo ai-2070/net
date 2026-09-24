@@ -475,3 +475,41 @@ async fn shutdown_stops_accepting_new_sessions() {
         "{err:?}"
     );
 }
+
+/// E3: many devices racing one bearer link — released together by a barrier
+/// right before redemption — produce exactly one bound identity and one
+/// issuance; every other redeemer is refused as a conflict, and the ledger
+/// names the winner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_redeemers_of_one_link_bind_exactly_one_identity() {
+    let fx = Fixture::start(ServiceConfig::default()).await;
+    let invite = fx.invite(ApprovalMode::Preauthorized);
+    const RACERS: usize = 6;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(RACERS));
+    let mut tasks = Vec::new();
+    for _ in 0..RACERS {
+        let (invite, barrier) = (invite.clone(), barrier.clone());
+        tasks.push(tokio::spawn(async move {
+            let device = Identity::generate();
+            barrier.wait().await;
+            (device.entity_id().clone(), join(&invite, &device).await)
+        }));
+    }
+    let mut winners = Vec::new();
+    for task in tasks {
+        let (entity, outcome) = task.await.unwrap();
+        match outcome {
+            Ok(RedeemOutcome::Issued {
+                recovered: false, ..
+            }) => winners.push(entity),
+            Err(RedeemError::Refused(Refusal::Conflict)) => {}
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+    assert_eq!(winners.len(), 1, "exactly one bound identity");
+    assert_eq!(fx.bundles.issued.load(Ordering::SeqCst), 1);
+    match fx.state(&invite) {
+        OfferState::Issued { subject, .. } => assert_eq!(subject, winners[0]),
+        other => panic!("expected issued, got {other:?}"),
+    }
+}

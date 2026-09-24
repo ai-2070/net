@@ -3811,6 +3811,64 @@ Checks:
 - `npm run check` (web): 180 docs, links, release sync and types all pass;
 - CLI `readme_commands` + `help` + `help_is_self_contained`: 10/10.
 
+**W4 receipt: gap witnesses (2026-09-24).**
+
+- **E2** — `enrollment_workflow::inspection_leaves_the_ledger_untouched_and_the_link_redeemable`:
+  - two rounds of `invite inspect` and `invite status` leave the ledger
+    snapshot byte-for-byte unchanged;
+  - the same link then redeems;
+  - the redemption does change the ledger, which shows the comparison is
+    sensitive.
+- **E3** — `sdk/enrollment_redeem::concurrent_redeemers_of_one_link_bind_exactly_one_identity`:
+  six devices race one bearer link, released together by a barrier right
+  before redemption. Exactly one is issued; the rest get `Conflict`. There
+  is one issuance, and the ledger names the winner.
+- **E21** — `node_lifecycle::a_corrupt_node_store_refuses_rather_than_regenerating_and_a_live_node_never_rotates`:
+  - a second `up` with another PSK source while the node is live is
+    refused, and the live trust domain is unchanged;
+  - a corrupted node store refuses to start (bounded), and nothing is
+    written over it;
+  - the original bytes restored start the same trust domain.
+- **E21 on Unix** — `insecure_node_state_and_psk_files_are_refused_on_unix`:
+  a 0644 node snapshot and a 0644 `--psk-from file:` are refused, the
+  latter before any state exists. It is `#[cfg(unix)]`, so it runs in the
+  Linux CLI job; the Windows job cannot compile it.
+- **E22** — `node_lifecycle::down_stops_only_its_own_node`: `down` of A
+  leaves B running with the same incarnation.
+
+Inverse mutations:
+
+| # | Mutation | Result |
+|---|---|---|
+| 1 | Node-store checksum ignored | RED: the bounded start panics "up started over a corrupt node store" |
+| 2 | Only the claim/issue conflict checks disabled | GREEN: a racer arriving after issuance is refused by the later state's check |
+| 2b | All six claimant-binding checks disabled | RED: a second device "recovers" the winner's bundle, and `a_second_device_cannot_redeem_a_claimed_bearer_link` fails too |
+
+- The E2 comparison carries no separate mutation. Its sensitivity is shown
+  inside the test.
+- Gates: CLI clippy `--all-targets`; SDK clippy for the CI feature test
+  target; `node_lifecycle` + `enrollment_workflow` 11/11.
+
+**Still open against the matrix (disclosed, not claimed):**
+
+| Row | Open item |
+|---|---|
+| E3 | Crash-point injection at the ledger (no seam exists) |
+| E4 | Explicit join-time denials of INVOKE / DELEGATE / dispatch / ROUTE / EXPORT, beyond the positive controls and channel refusals |
+| E5 | A four-relation link (the journey composes mesh+subnet+channel) and standalone channel links |
+| E7 | CLI fault injection for partial issuance and profile interruption |
+| E9 | `no_answer` / stale observation rows in a CLI test |
+| E11 | The removal-path delayed-old-incarnation race |
+| E12 | The export-path witness |
+| E17 / E26 | The `publish_stop: unconfirmed` branch |
+| E18 | A "notification pending" state: leave notifies no one, by design |
+| E19 | Barrier-driven join/renew/subscribe-after-leave races. The subnet-leave late-renewal fence is covered by mutation only. |
+| E20 | `--detach`, which does not exist |
+| E21 | `kms:` adapters, which do not exist |
+| E23 | The offer shape is `{channel, root, rights}` by user decision |
+| E24 | Channel-specific crash recovery; the generic ledger recovery covers it |
+| E25 | Expired and revoked chains at the gates, in a CLI test |
+
 ## 8. Cumulative acceptance matrix
 
 All rows are required unless explicitly marked feature-conditional; narrow slices can be accepted independently without calling the entire plan complete.

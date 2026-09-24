@@ -388,3 +388,119 @@ fn the_control_endpoint_refuses_a_client_that_cannot_prove_the_secret() {
     fx.json(&["down"]);
     drop(up);
 }
+
+/// E21: the generated PSK lives only in the protected node store. A corrupt
+/// store refuses to start — it never silently generates a new PSK — and the
+/// untouched bytes restored start the same trust domain. A second start
+/// with another PSK source while the node is live is refused, and the live
+/// node's trust domain does not change.
+#[test]
+fn a_corrupt_node_store_refuses_rather_than_regenerating_and_a_live_node_never_rotates() {
+    let fx = Fx::new();
+    let first = fx.up(&[]);
+    let trust_domain = first.ready["trust_domain"].clone();
+
+    let psk_file = fx.tmp.path().join("other.hex");
+    std::fs::write(&psk_file, "43".repeat(32)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&psk_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let source = format!("file:{}", psk_file.display());
+    let live = fx.run(&["up", "--bind", "127.0.0.1:0", "--psk-from", &source]);
+    assert!(!live.status.success());
+    assert!(String::from_utf8_lossy(&live.stderr).contains("already running"));
+    assert_eq!(fx.status()["node"]["trust_domain"], trust_domain);
+    fx.json(&["down"]);
+    drop(first);
+
+    let snapshot = fx.state().join("node").join("enrollment.snapshot");
+    let original = std::fs::read(&snapshot).unwrap();
+    let mut corrupt = original.clone();
+    let mid = corrupt.len() / 2;
+    corrupt[mid] ^= 0x5A;
+    std::fs::write(&snapshot, &corrupt).unwrap();
+    // Bounded: a node that wrongly starts over the corrupt store would run
+    // until killed.
+    let mut child = fx
+        .cmd(&["--output", "json", "up", "--bind", "127.0.0.1:0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut exited = None;
+    for _ in 0..200 {
+        if let Some(status) = child.try_wait().unwrap() {
+            exited = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if exited.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("up started over a corrupt node store");
+    }
+    assert!(!exited.unwrap().success(), "a corrupt store must not start");
+    assert_eq!(
+        std::fs::read(&snapshot).unwrap(),
+        corrupt,
+        "nothing was regenerated over the corrupt store"
+    );
+
+    std::fs::write(&snapshot, &original).unwrap();
+    let restored = fx.up(&[]);
+    assert_eq!(restored.ready["trust_domain"], trust_domain);
+    fx.json(&["down"]);
+}
+
+/// E21 on Unix: a node store readable by others, and a group/world-readable
+/// `--psk-from file:`, are refused before bind.
+#[cfg(unix)]
+#[test]
+fn insecure_node_state_and_psk_files_are_refused_on_unix() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fx::new();
+    let first = fx.up(&[]);
+    fx.json(&["down"]);
+    drop(first);
+    let snapshot = fx.state().join("node").join("enrollment.snapshot");
+    std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let refused = fx.run(&["up", "--bind", "127.0.0.1:0"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let other = Fx::new();
+    let psk_file = other.tmp.path().join("psk.hex");
+    std::fs::write(&psk_file, "42".repeat(32)).unwrap();
+    std::fs::set_permissions(&psk_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let source = format!("file:{}", psk_file.display());
+    let refused = other.run(&["up", "--bind", "127.0.0.1:0", "--psk-from", &source]);
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    assert!(
+        !other.state().exists(),
+        "refused before any state is created"
+    );
+}
+
+/// E22: `down` stops exactly its own node; another profile's node keeps
+/// running with the same incarnation.
+#[test]
+fn down_stops_only_its_own_node() {
+    let a = Fx::new();
+    let b = Fx::new();
+    let a_up = a.up(&[]);
+    let b_up = b.up(&[]);
+    let b_incarnation = b_up.ready["incarnation"].clone();
+    let down = a.json(&["down"]);
+    assert_eq!(down["was_running"], true, "{down}");
+    assert_eq!(down["incarnation"], a_up.ready["incarnation"]);
+    assert_eq!(a.status()["state"], "stopped");
+    let still = b.status();
+    assert_eq!(still["state"], "ready", "{still}");
+    assert_eq!(still["node"]["incarnation"], b_incarnation);
+    b.json(&["down"]);
+    drop(a_up);
+    drop(b_up);
+}
