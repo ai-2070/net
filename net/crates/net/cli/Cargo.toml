@@ -30,6 +30,10 @@ rtc-bootstrap = ["webrtc", "net-sdk/rtc-bootstrap"]
 # `set-value` subcommand is always present; without this feature it returns a
 # clear "rebuild with --features keychain" error instead of silently missing.
 keychain = ["net-mesh-mcp/keychain"]
+# TEST ONLY: compiles the core's crash-injection points at the enrollment
+# storage's durable-write transitions (`NET_MESH_FIXTURE_CRASH`), exercised by
+# `tests/enrollment_crash.rs`. Never enable it in a shipped build.
+fixtures = ["net/fixtures"]
 
 [dependencies]
 # The low-level core crate, for the OFFLINE subnet issuance verbs (SSDK

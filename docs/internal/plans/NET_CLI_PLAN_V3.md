@@ -4153,6 +4153,57 @@ Inverse mutations, all RED (4):
 
 Gates: CLI clippy `--all-targets`; CLI 374/374.
 
+**S5 receipt: crash injection at the real durable-write transitions (2026-09-25).**
+
+The hook:
+- **Location.** `EnrollmentStorage::replace_using` in the core, compiled
+  only with `net/fixtures`. It is exposed as `net-cli`'s test-only
+  `fixtures` feature, never enabled in a shipped build.
+- **Arming.** `NET_MESH_FIXTURE_CRASH=<before_replace|after_replace>:<store>:<nth>`
+  aborts the process at the nth transition of the store whose directory is
+  named `<store>` (`ledger`, `join`, `node`).
+  - `before_replace`: nothing of that write is on disk.
+  - `after_replace`: the snapshot is durable and nothing after it ran.
+- **Tracing.** `NET_MESH_FIXTURE_TRACE` prints every transition. The
+  ordinals below were read off it: an operator's ledger does a startup
+  write, then offer, claim and issue (issue = 4th); the device's join does
+  its intent, then the bundle install (2nd).
+
+`cli/tests/enrollment_crash.rs` (`#![cfg(feature = "fixtures")]`, real
+subprocesses restarted against the resulting disk state):
+
+| Test | Crash | Proves |
+|---|---|---|
+| `an_operator_crash_after_the_issuance_commit_is_recovered_not_reissued` | The operator aborts right after the issuance commit, before replying | After restart there is exactly one issued record. The device's retry joins with the committed receipt: recovered, no second issuance. |
+| `an_operator_crash_before_the_issuance_commit_issues_exactly_once_on_retry` | The operator aborts before the issuance write | Nothing is issued. A second device cannot take the committed claim. The first device's retry is issued once. |
+| `a_device_crash_after_installing_its_bundle_resumes_without_redeeming_again` | The device aborts right after its join store installed the bundle, before attach or output | Re-running `join` resumes from the installed state with the same identity, `enroll_path: null` (no redemption ran), and still one issuance. |
+
+The third test is the "profile publication" transition: in V3 the profile
+is the protected join store.
+
+**CI.** The "Net CLI tests" job gains a `--features fixtures --test
+enrollment_crash` step that pins all three by name. The default runs
+compile the binary to zero tests, so without this step it would be
+silently skipped.
+
+Inverse mutations, all RED (3):
+
+| # | Mutation |
+|---|---|
+| 1 | The crash point never fires |
+| 2 | A committed issuance is not recoverable |
+| 3 | An installed join redeems again |
+
+Gates:
+- core clippy `--all-features`, strict, and root rustdoc;
+- CLI clippy, default and `--features fixtures`, all-targets;
+- `enrollment_storage` units 7/7; CLI 374/374.
+
+**Limit:** the crash-before-issue case recovers because the committed
+claim resumes. Crash points inside `write_atomic_phased`, between the temp
+write and the rename, are covered by the existing storage phase unit tests,
+not by a subprocess.
+
 **Still open against the matrix (disclosed, not claimed):**
 
 | Row | Open item |

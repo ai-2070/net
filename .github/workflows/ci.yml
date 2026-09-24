@@ -5091,6 +5091,23 @@ jobs:
               echo "::error::$t did not run"; exit 1; }
           done
 
+      # Crash recovery at the real durable-write transitions (NET_CLI_PLAN_V3
+      # decision 7). `tests/enrollment_crash.rs` is `#![cfg(feature =
+      # "fixtures")]`: the `fixtures` feature compiles the core's crash points
+      # into `EnrollmentStorage` replacement, and no other run here enables
+      # it — so without this step the binary compiles to zero tests and every
+      # run above is silently green without it. Scoped to that one binary (a
+      # feature set is a full rebuild; see the keychain step's cost note), and
+      # each witness is pinned by name: a rename must fail here, not vanish.
+      - name: Run net-cli crash-recovery witnesses (fixtures)
+        run: |
+          set -o pipefail
+          cargo test -p net-cli --features fixtures --test enrollment_crash             2>&1 | tee /tmp/cli_crash.log
+          for t in an_operator_crash_after_the_issuance_commit_is_recovered_not_reissued                    an_operator_crash_before_the_issuance_commit_issues_exactly_once_on_retry                    a_device_crash_after_installing_its_bundle_resumes_without_redeeming_again; do
+            grep -q "test $t ... ok" /tmp/cli_crash.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
+
   aggregator-daemon-tests:
     # `net-aggregator-daemon` is a lib + bin crate. The lib hosts
     # the `boot` / `run` entry points + config parsing + template
