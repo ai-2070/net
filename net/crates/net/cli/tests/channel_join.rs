@@ -438,3 +438,211 @@ fn a_grant_for_another_node_is_refused_at_start() {
         .unwrap();
     assert!(err.contains("not for the channel it names"), "{err}");
 }
+
+fn free_mesh_port() -> u16 {
+    loop {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+impl Fx {
+    fn up_on(&self, bind: &str, extra: &[&str]) -> Up {
+        let mut child = self
+            .base()
+            .args(["--output", "ndjson", "up", "--bind", bind])
+            .args(extra)
+            .arg("--state-dir")
+            .arg(self.state())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let ready = read_row(&mut stdout, &mut child);
+        assert_eq!(ready["event"], "ready", "{ready}");
+        Up { child, ready }
+    }
+}
+
+/// The operator's offline ceremony and start arguments: a channel root, the
+/// grant to this operator's enrollment issuer, and `up` flags carrying it.
+fn operator_with_grant(operator: &Fx) -> (Vec<String>, String) {
+    let keys = operator.tmp.path().join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let (root, root_hex) = channel_root(operator, &keys);
+    let first = operator.up(&["--enroll", "--no-port-mapping", "--no-relay"]);
+    let node_hex = first.ready["enrollment"]["issuer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(first);
+    let grant = keys.join("fleet.grant");
+    operator.json_stateless(&[
+        "channel",
+        "issue-grant",
+        "--root-identity",
+        root.to_str().unwrap(),
+        "--issuer",
+        &node_hex,
+        "--channel",
+        CHANNEL,
+        "--out",
+        grant.to_str().unwrap(),
+    ]);
+    let args = [
+        "--enroll",
+        "--no-port-mapping",
+        "--no-relay",
+        "--channel-grant",
+        grant.to_str().unwrap(),
+    ]
+    .map(str::to_string)
+    .to_vec();
+    (args, root_hex)
+}
+
+fn strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+/// Poll the device's `channel status` until its credential state satisfies
+/// `done`.
+fn wait_for_channel(fx: &Fx, what: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..180 {
+        last = fx.json(&["channel", "status"]);
+        if done(&last["joined"]) {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!("{what}: never got there; last status {last}");
+}
+
+/// Subscribe is the publisher's ACK of the FULL chain on each session: the
+/// device is ACKed at start, re-subscribes by itself after the operator
+/// restarts, and `channel leave` records the departure, is acknowledged by
+/// the publisher, and survives the device's restart. A plain `leave` of a
+/// subscribed device withdraws the subscription before it stops.
+#[test]
+fn a_subscribing_device_is_acked_resubscribes_and_leaves() {
+    let operator = Fx::new();
+    let (op_args, root_hex) = operator_with_grant(&operator);
+    let bind = format!("127.0.0.1:{}", free_mesh_port());
+    let op = operator.up_on(&bind, &strs(&op_args));
+    operator.json(&["channel", "serve", CHANNEL, "--token-root", &root_hex]);
+    let invite = |fx: &Fx| {
+        let created = fx.json(&[
+            "invite",
+            "create",
+            "--channel",
+            CHANNEL,
+            "--channel-rights",
+            "subscribe",
+        ]);
+        created["token"].as_str().unwrap().to_string()
+    };
+
+    let agent = Fx::new();
+    agent.json(&["join", &invite(&operator), "--yes"]);
+    let node = agent.up(&[]);
+    let ch = &node.ready["joined"]["channel"];
+    assert_eq!(ch["state"], "active", "{}", node.ready);
+    assert_eq!(ch["subscribed"], true, "{}", node.ready);
+    assert_eq!(ch["rights"], "subscribe");
+    assert_eq!(ch["root"], root_hex.as_str());
+    assert!(ch.get("publish_installed").is_none(), "subscribe only");
+
+    // The operator restarts (its served channel is re-applied from state):
+    // the device re-attaches and presents its chain again, untouched.
+    drop(op);
+    let op = operator.up_on(&bind, &strs(&op_args));
+    wait_for_channel(&agent, "resubscribe after operator restart", |j| {
+        j["resubscribes"].as_u64() >= Some(1) && j["subscribed"] == true
+    });
+
+    // Channel-only leave: recorded, acknowledged, idempotent, durable.
+    let left = agent.json(&["channel", "leave"]);
+    assert_eq!(left["newly_left"], true, "{left}");
+    assert_eq!(left["unsubscribed"], true, "{left}");
+    let status = agent.json(&["channel", "status"]);
+    assert_eq!(status["joined"]["state"], "left", "{status}");
+    assert!(status["joined"].get("subscribed").is_none(), "{status}");
+    assert_eq!(agent.json(&["channel", "leave"])["newly_left"], false);
+    drop(node);
+    let node = agent.up(&[]);
+    let ch = &node.ready["joined"]["channel"];
+    assert_eq!(ch["state"], "left", "{}", node.ready);
+    assert!(ch.get("subscribed").is_none(), "{}", node.ready);
+    // The mesh membership is untouched by a channel leave.
+    assert_eq!(node.ready["joined"]["attached"], true, "{}", node.ready);
+    drop(node);
+
+    // A whole-mesh leave of a subscribed device withdraws the subscription.
+    let second = Fx::new();
+    second.json(&["join", &invite(&operator), "--yes"]);
+    let running = second.up(&[]);
+    assert_eq!(running.ready["joined"]["channel"]["subscribed"], true);
+    let gone = second.json(&["leave"]);
+    assert_eq!(gone["state"], "left", "{gone}");
+    assert_eq!(gone["channel_unsubscribed"], true, "{gone}");
+    drop(running);
+    drop(op);
+}
+
+/// Publish is local: the chain is installed as the device's managed publish
+/// credential, ready only once the device's OWN config trusts the root (no
+/// root is installed implicitly), and `channel leave` removes exactly that
+/// credential with the stop confirmed.
+#[test]
+fn a_publishing_device_is_ready_only_under_its_own_trust_and_leaves_exactly() {
+    let operator = Fx::new();
+    let (op_args, root_hex) = operator_with_grant(&operator);
+    let _op = operator.up(&strs(&op_args));
+    let created = operator.json(&[
+        "invite",
+        "create",
+        "--channel",
+        CHANNEL,
+        "--channel-rights",
+        "publish",
+    ]);
+    let agent = Fx::new();
+    agent.json(&["join", created["token"].as_str().unwrap(), "--yes"]);
+    let node = agent.up(&[]);
+    let ch = &node.ready["joined"]["channel"];
+    assert_eq!(ch["publish_installed"], true, "{}", node.ready);
+    assert_eq!(ch["publish_ready"], false, "no local trust yet");
+    assert!(ch.get("subscribed").is_none(), "publish only");
+
+    // Trusting some other root for the channel is not trusting this one.
+    agent.json(&[
+        "channel",
+        "serve",
+        CHANNEL,
+        "--token-root",
+        &"33".repeat(32),
+    ]);
+    std::thread::sleep(Duration::from_millis(2500));
+    let status = agent.json(&["channel", "status"]);
+    assert_eq!(status["joined"]["publish_ready"], false, "{status}");
+    agent.json(&["channel", "serve", CHANNEL, "--token-root", &root_hex]);
+    wait_for_channel(&agent, "publish ready under local trust", |j| {
+        j["publish_ready"] == true
+    });
+
+    let left = agent.json(&["channel", "leave"]);
+    assert_eq!(left["publish_removed"], true, "{left}");
+    assert_eq!(left["publish_stop"], "confirmed", "{left}");
+    let status = agent.json(&["channel", "status"]);
+    assert_eq!(status["joined"]["publish_installed"], false, "{status}");
+    assert_eq!(status["joined"]["publish_ready"], false, "{status}");
+    // Serving the channel is independent of holding the credential.
+    assert_eq!(status["served"][0]["channel"], CHANNEL, "{status}");
+    drop(node);
+}

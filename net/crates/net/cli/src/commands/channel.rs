@@ -49,6 +49,22 @@ pub enum ChannelCommand {
     /// Gate a channel on the running node: only chains anchored at the
     /// given token root may subscribe (persisted; re-applied on `up`).
     Serve(ServeArgs),
+    /// Show the channels this node serves and, for a joined device, its
+    /// channel credential: subscribe ACK and publish readiness. Never a
+    /// roster of other members.
+    Status(NodeDirArgs),
+    /// Leave the channel relation of this device's join: recorded durably,
+    /// then an acknowledged unsubscribe and removal of exactly the installed
+    /// publish credential. The mesh membership is untouched.
+    Leave(NodeDirArgs),
+}
+
+/// Arguments naming a running node.
+#[derive(Args, Debug)]
+pub struct NodeDirArgs {
+    /// Node state directory (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
 }
 
 /// `channel issue-grant` arguments.
@@ -135,6 +151,24 @@ pub async fn run(
         ChannelCommand::Ls(args) => run_ls(args, output, config_path, profile_name).await,
         ChannelCommand::IssueGrant(args) => run_issue_grant(args, output).await,
         ChannelCommand::Serve(args) => run_serve(args, output, profile_name).await,
+        ChannelCommand::Status(args) => {
+            node_op(
+                args.state_dir,
+                profile_name,
+                json!({ "op": "channel_status" }),
+                output,
+            )
+            .await
+        }
+        ChannelCommand::Leave(args) => {
+            node_op(
+                args.state_dir,
+                profile_name,
+                json!({ "op": "channel_leave" }),
+                output,
+            )
+            .await
+        }
     }
 }
 
@@ -351,6 +385,25 @@ pub(crate) fn serve_op(
         }))
     })();
     result.unwrap_or_else(|e| json!({ "error": e }))
+}
+
+/// One control request to the running node, its reply emitted.
+async fn node_op(
+    state_dir: Option<PathBuf>,
+    profile_name: &str,
+    request: Value,
+    output: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    let dir =
+        super::lifecycle::state_dir(state_dir, profile_name)?.join(super::lifecycle::NODE_SUBDIR);
+    let (_, reply) = super::lifecycle::control_call(&dir, request)
+        .await
+        .map_err(|e| connection_failure(format!("{e}; is `net-mesh up` running?")))?;
+    if let Some(err) = reply["error"].as_str() {
+        return Err(generic(err.to_string()));
+    }
+    emit_value(OutputFormat::resolve_oneshot(output), &reply)
+        .map_err(|e| generic(format!("write result: {e}")))
 }
 
 async fn run_serve(

@@ -17,6 +17,7 @@ pub mod audit;
 pub mod blob;
 pub mod cap;
 pub mod channel;
+pub(crate) mod channel_link;
 pub mod completion;
 pub mod daemon;
 pub mod db;

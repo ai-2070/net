@@ -83,6 +83,10 @@ const MESH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// room for the operator's ~5 s defer of a re-attaching identity (its previous
 /// session, e.g. from `join`, must lapse first).
 const JOIN_ATTACH_WAIT: Duration = Duration::from_secs(20);
+/// How long a leave waits for the publisher to acknowledge an unsubscribe:
+/// inside the caller's control session bound, so a silent publisher yields
+/// an unconfirmed result, not a lost reply.
+const CHANNEL_UNSUBSCRIBE_WAIT: Duration = Duration::from_secs(3);
 /// Bound on one subnet leaf renewal exchange.
 const SUBNET_RENEW_WAIT: Duration = Duration::from_secs(10);
 /// Retry pause after a failed background renewal.
@@ -151,6 +155,17 @@ struct StandaloneLink {
 }
 
 type SharedJoin = Arc<parking_lot::Mutex<Option<net_sdk::enrollment::device::DeviceJoin>>>;
+
+/// A joined device's channel credential and its live state.
+#[derive(Clone)]
+struct JoinedChannel {
+    cred: super::channel_link::ChannelCred,
+    link: super::channel_link::SharedChannel,
+    /// Set once `channel leave` recorded the departure.
+    left: Arc<AtomicBool>,
+    /// The publisher (the node the device enrolled with).
+    publisher: u64,
+}
 type SharedMemberships =
     Arc<parking_lot::Mutex<Vec<net_sdk::enrollment::standalone::SubnetMembership>>>;
 
@@ -560,9 +575,14 @@ fn spawn_joined_link(
     link: Arc<parking_lot::Mutex<JoinedLink>>,
     presented: Option<u64>,
     present_retry_at: u64,
+    channel: Option<(JoinedChannel, Option<u64>)>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = REATTACH_MIN;
+        let mut channel = channel.map(|(c, on)| {
+            let track = super::channel_link::ChannelTrack::new(on, c.left.clone());
+            (c, track)
+        });
         let mut track = SubnetTrack {
             presented,
             present_retry_at,
@@ -611,6 +631,9 @@ fn spawn_joined_link(
                     for entry in l.standalone.values_mut() {
                         entry.admitted = None;
                     }
+                }
+                if let Some((c, track)) = channel.as_mut() {
+                    super::channel_link::lost_session(track, &c.link);
                 }
                 match super::enrollment::attach_contact(&node, &contact, JOIN_ATTACH_WAIT).await {
                     Ok(path) => {
@@ -686,6 +709,18 @@ fn spawn_joined_link(
                 &link,
             )
             .await;
+            if let Some((c, track)) = channel.as_mut() {
+                super::channel_link::keep(
+                    &node,
+                    contact.node_id,
+                    session,
+                    &c.cred,
+                    track,
+                    &c.link,
+                    JOIN_ATTACH_WAIT,
+                )
+                .await;
+            }
             if now_unix() >= org_retry_at && !pending_orgs.lock().is_empty() {
                 org_retry_at = now_unix() + SUBNET_RENEW_RETRY.as_secs();
                 keep_pending_orgs(
@@ -1342,6 +1377,9 @@ struct JoinedReport {
     /// The joined subnet attachment, when the join carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subnet: Option<serde_json::Value>,
+    /// The channel credential's first use, when the join carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel: Option<serde_json::Value>,
     issuer_fingerprint: String,
     domain_name: String,
     contact: Option<String>,
@@ -1374,6 +1412,8 @@ struct ControlState {
     pending_orgs: PendingOrgs,
     /// This node's mesh, for operations that reach other nodes.
     node: Arc<net::adapter::net::MeshNode>,
+    /// A joined device's channel credential, when its join carried one.
+    channel: Option<JoinedChannel>,
 }
 
 /// Forward one root-signed floor readback request (built and signed by the
@@ -2091,6 +2131,7 @@ async fn control_session(
                 "link": state.link.as_ref().map(|l| l.lock().clone()),
                 "org": state.node.node_authority().map(|a| hex::encode(a.owner_org().0)),
                 "org_pending": state.pending_orgs.lock().len(),
+                "channel": state.channel.as_ref().map(|c| c.link.lock().clone()),
             })
         }
         "shutdown" => {
@@ -2103,6 +2144,29 @@ async fn control_session(
         "org_leave" => org_leave(state).await,
         "org_join" if draining => serde_json::json!({ "error": "node is draining" }),
         "org_join" => org_join(state, &request).await,
+        "channel_status" => serde_json::json!({
+            "served": super::channel::read_served(&state.state_root)
+                .unwrap_or_else(|e| vec![super::channel::Served { channel: format!("<unreadable: {e}>"), roots: Vec::new() }]),
+            "joined": state.channel.as_ref().map(|c| c.link.lock().clone()),
+        }),
+        "channel_leave" if draining => serde_json::json!({ "error": "node is draining" }),
+        "channel_leave" => match &state.channel {
+            None => serde_json::json!({
+                "error": "this node holds no channel credential from a join; nothing to leave"
+            }),
+            Some(c) => {
+                super::channel_link::leave(
+                    &state.node,
+                    &state.state_root,
+                    &c.cred,
+                    c.publisher,
+                    &c.left,
+                    &c.link,
+                    CHANNEL_UNSUBSCRIBE_WAIT,
+                )
+                .await
+            }
+        },
         "channel_serve" if draining => serde_json::json!({ "error": "node is draining" }),
         "channel_serve" => {
             let (node, root, request) = (
@@ -2145,13 +2209,36 @@ async fn control_session(
                 .await;
                 match recorded {
                     Ok(Ok((newly, left_at))) => {
-                        // Recorded durably; now stop this runtime.
+                        // Recorded durably; now stop this runtime. A live
+                        // channel subscription is withdrawn first (the
+                        // publisher acknowledges), not left to time out.
+                        let unsubscribed = match &state.channel {
+                            Some(c)
+                                if c.link.lock().subscribed == Some(true)
+                                    && !c.left.load(Ordering::SeqCst) =>
+                            {
+                                c.left.store(true, Ordering::SeqCst);
+                                Some(matches!(
+                                    tokio::time::timeout(
+                                        CHANNEL_UNSUBSCRIBE_WAIT,
+                                        state.node.unsubscribe_channel(
+                                            c.publisher,
+                                            c.cred.offer.channel.clone(),
+                                        ),
+                                    )
+                                    .await,
+                                    Ok(Ok(()))
+                                ))
+                            }
+                            _ => None,
+                        };
                         state.draining.store(true, Ordering::SeqCst);
                         serde_json::json!({
                             "left": true,
                             "newly_left": newly,
                             "left_at": left_at,
                             "incarnation": state.report.incarnation,
+                            "channel_unsubscribed": unsubscribed,
                         })
                     }
                     Ok(Err(Some(e))) => {
@@ -2562,6 +2649,8 @@ pub async fn run_up(
     };
     // A renewed leaf (at start) to persist once the join is mutable again.
     let mut renewed_at_start = None;
+    // The channel credential's start state, handed to the supervisor.
+    let mut channel_start = None;
     let joined_report = match joined.as_ref().and_then(|j| j.bundle().map(|b| (j, b))) {
         Some((join, bundle)) => {
             let c = bundle.contact();
@@ -2620,8 +2709,27 @@ pub async fn run_up(
                 }
                 _ => None,
             };
+            // The channel credential: installed / subscribed once here, then
+            // kept by the supervisor on every new session.
+            let channel = match super::channel_link::ChannelCred::of(join) {
+                Some(cred) => {
+                    let left = super::channel_link::read_left(&state).is_some();
+                    let link = super::channel_link::start(
+                        mesh.node(),
+                        &cred,
+                        left,
+                        detail.is_none().then_some(c.node_id),
+                        JOIN_ATTACH_WAIT,
+                    )
+                    .await;
+                    channel_start = Some((cred, link.clone(), left, c.node_id));
+                    Some(serde_json::to_value(&link).unwrap_or_default())
+                }
+                None => None,
+            };
             Some(JoinedReport {
                 subnet,
+                channel,
                 issuer_fingerprint: join.invite().issuer_fingerprint(),
                 domain_name: join.invite().trust_domain_name().to_string(),
                 contact: c.addr.map(|a| a.to_string()),
@@ -2720,6 +2828,22 @@ pub async fn run_up(
         }
     });
     let link = start_link.map(|l| Arc::new(parking_lot::Mutex::new(l)));
+    let joined_channel = channel_start.map(|(cred, link, left, publisher)| {
+        // Subscribed at start: on the current session.
+        let on = match link.subscribed {
+            Some(true) => mesh.node().peer_session_id(publisher),
+            _ => None,
+        };
+        (
+            JoinedChannel {
+                cred,
+                link: Arc::new(parking_lot::Mutex::new(link)),
+                left: Arc::new(AtomicBool::new(left)),
+                publisher,
+            },
+            on,
+        )
+    });
     let joined_link = match (&joined, &link, &joined_contact_node, &memberships) {
         (Some(joined), Some(link), Some(contact_node), Some(memberships)) => {
             let admitted = link.lock().subnet_admitted;
@@ -2742,6 +2866,7 @@ pub async fn run_up(
                 link.clone(),
                 presented,
                 present_retry_at,
+                joined_channel.clone(),
             ))
         }
         _ => None,
@@ -2757,6 +2882,7 @@ pub async fn run_up(
         state_root: state.clone(),
         pending_orgs: pending_orgs.clone(),
         node: mesh.node().clone(),
+        channel: joined_channel.map(|(c, _)| c),
     });
     let (stop_tx, mut stop_rx) = mpsc::channel(1);
     let server = tokio::spawn(serve_control(listener, secret, state_ctl.clone(), stop_tx));
@@ -3259,6 +3385,9 @@ pub async fn run_leave(
         )));
     }
     let dir = state.join(NODE_SUBDIR);
+    // A running joined node withdraws its channel subscription (acknowledged
+    // by the publisher, or not) before it stops.
+    let mut channel_unsubscribed = serde_json::Value::Null;
     let (newly, left_at, runtime, incarnation) = if probe(&dir)? == Liveness::Held {
         let (control, reply) = control_call(&dir, serde_json::json!({ "op": "leave" }))
             .await
@@ -3277,6 +3406,7 @@ pub async fn run_leave(
                 "the node did not confirm the departure for the recorded incarnation",
             ));
         }
+        channel_unsubscribed = reply["channel_unsubscribed"].clone();
         let deadline = tokio::time::Instant::now() + args.wait;
         loop {
             if probe(&dir)? != Liveness::Held {
@@ -3323,6 +3453,7 @@ pub async fn run_leave(
             "credentials": "erased",
             "runtime": runtime,
             "incarnation": incarnation,
+            "channel_unsubscribed": channel_unsubscribed,
             // What this command cannot know or do, stated rather than implied.
             "unmanaged_consumers": "unknown: copies of the PSK held by other processes are not tracked",
             "authority": "not notified: leaving is local; the issuer revokes separately",

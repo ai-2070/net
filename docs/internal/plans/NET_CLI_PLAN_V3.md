@@ -2962,6 +2962,99 @@ Gates:
 - SDK suite 829/829; CLI 362/362.
 - Core is unchanged in C2.
 
+**C3 receipt (2026-09-24).**
+
+`cli/src/commands/channel_link.rs` owns a joined device's channel
+credential at runtime. Status keeps the two real paths apart:
+
+- **Subscribe.**
+  - At `up`, and again by the link supervisor on every new session, the
+    device presents the full chain with `subscribe_channel_with_chain` to the
+    node it enrolled with.
+  - `subscribed: true` is that publisher's ACK on the current session;
+    `resubscribes` counts later sessions. With no live session nothing is
+    claimed.
+- **Publish.**
+  - The chain is installed as the node's managed publish chain
+    (`install_publish_chain`), shown as `publish_installed`.
+  - `publish_ready` is recomputed on every supervisor pass. It is true only
+    while this node's own config for exactly that channel trusts the chain's
+    root (`channel serve` on the device). No root is installed implicitly.
+- **Expiry.** An expired credential is reported `expired` and never used.
+
+Leave:
+- `channel leave` (control op `channel_leave`) works in this order:
+  1. It records `<state>/channel.left` durably.
+  2. It sets the runtime's left flag, so a racing supervisor subscribe
+     cannot win.
+  3. It sends an unsubscribe, bounded wait, and reports `unsubscribed`
+     true/false.
+  4. It removes exactly the installed chain incarnation by fingerprint,
+     evicting its tokens (`publish_removed`).
+  5. It reports `publish_stop: confirmed` only when no publish chain and no
+     cached PUBLISH token for the device remain. Otherwise it reports
+     `unconfirmed`.
+- The departure is idempotent and survives restart: `up` reports `left`
+  and uses nothing. Mesh membership is untouched.
+- A whole-mesh `leave` of a subscribed device withdraws the subscription
+  first and reports `channel_unsubscribed`.
+
+Status: `channel status` returns the served channels and the joined
+credential, never a roster. `node status` carries `channel`.
+
+Witnesses in `cli/tests/channel_join.rs` (4 tests):
+- **Subscribe test:**
+  - ACKed at start; subscribe only;
+  - resubscribes by itself after the operator restarts (served channel
+    re-applied from state);
+  - channel leave is acknowledged and idempotent, survives the device's
+    restart, and leaves the device attached;
+  - a whole `leave` of a second subscribed device reports
+    `channel_unsubscribed: true`.
+- **Publish test:**
+  - installed but not ready without local trust, and not ready when a
+    different root is trusted;
+  - ready under the right root;
+  - channel leave removes exactly the chain with the stop confirmed;
+  - serving stays independent of holding the credential.
+
+Inverse mutations, all RED (9):
+
+| # | Mutation |
+|---|---|
+| 1 | Subscribe flattens the chain to its leaf |
+| 2 | Supervisor never resubscribes |
+| 3 | Readiness ignores the root |
+| 4 | Ready = installed |
+| 5 | Channel leave not recorded |
+| 6 | Leave keeps the publish chain |
+| 7 | Leave skips the unsubscribe |
+| 8 | Whole leave keeps subscribing |
+| 9 | Start ignores the left marker |
+
+Gates: fmt, CLI clippy `--all-targets`, net-cli rustdoc, CLI 364/364.
+
+**V3-2A closure, and what stays open (honest limits):**
+- A subscribe link's publisher is the issuing node, reached at the
+  bundle's contact. Its ACK is a routing fact, not a proof of its full
+  identity.
+- Same-root portability to other publishers is possible, since the chain
+  anchors at the root, but the CLI does not automate it.
+- Leaf expiry equals the grant's (C1). Per-device revocation is by
+  revocation floor.
+- A channel link rides with mesh membership. A standalone channel link for
+  an already-joined device, and rejoining a channel after a channel leave,
+  need a fresh link and are not offered yet.
+- `publish_ready` is credential readiness. Whether an application's publish
+  cleared the gate is that application's observation, and the CLI has no
+  publish verb.
+- The `publish_stop: unconfirmed` branch is reachable only when another
+  credential source exists. No witness exercises it.
+- CI on the C1 head (f9aff9287) failed on two unrelated issues:
+  - an `enrollment_lifecycle` free-port bind race
+    (`Address already in use`);
+  - the known browser-matrix signalling flake.
+
 ### V3-2B — voluntary leave through the same lifecycle
 
 **Modify:** shared SDK enrollment/persistence/lifecycle modules selected in V3-1/2A; CLI `enrollment.rs`, `org.rs`, `channel.rs`, `subnet.rs`, `config.rs` and relevant runtime adapters.
