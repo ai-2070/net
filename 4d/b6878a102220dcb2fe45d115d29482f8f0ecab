@@ -1,0 +1,14 @@
+net/crates/net/bindings/go/org-ffi/src/lib.rs
+  h_64425bc75e3f3d 1426,1444
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4db6878a102220dcb2fe45d115d29482f8f0ecab",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
