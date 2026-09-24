@@ -60,7 +60,7 @@ getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
 # than the 0.11 `net` pins: 0.11 moved to aead 0.6's `InOutBuf` API,
 # and 0.10.1 is already in the tree under snow's default resolver, so
 # picking it dedups instead of linking a second ChaCha20-Poly1305.
-chacha20poly1305 = "0.10.1"
+chacha20poly1305 = "0.11.0"
 
 [profile.release]
 opt-level = "z"
