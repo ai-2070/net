@@ -83,6 +83,36 @@ packet path.
 per-packet authorization in under 10 ns. See
 [Security model](/docs/concepts/security-model).
 
+**Organization / `OrgId`** — an organization is an Ed25519 root keypair; `OrgId`
+is its self-certifying 32-byte public key. The root stays offline, so a node
+consumes signed artifacts rather than the signing key. See
+[Organizations](/docs/concepts/organizations).
+
+**Membership certificate** — a root-signed statement that one exact entity
+belongs to the organization. It proves membership, never invocation authority.
+
+**Dispatcher grant** — a root-signed statement that one exact entity may act
+*for* the organization over a bounded capability scope. One hop only — there are
+no delegation chains.
+
+**Capability grant** — a provider organization's root-signed grant of `DISCOVER`
+and/or `INVOKE` rights to another organization over an exact capability and
+provider scope. The grantee cannot manufacture it.
+
+**Protected call / `OrgAccess`** — an invocation admitted by provider-side,
+per-service organization admission; the caller presents a proof composing a
+membership, dispatcher authority, and (cross-org) a capability grant. `OrgAccess`
+(`SameOrg` / `Granted`) picks who may call and how the service is announced.
+
+**`org:<domain>:<kind>`** — the frozen cross-language org error vocabulary. The
+domain (`credentials | discovery | admission_denied | rpc | unknown`) says where
+the refusal happened; `is_local` is true only for `credentials` and `discovery`.
+
+**Session binding** — the full 32-byte Noise handshake hash of a session's
+establishment, stored beside its keys. A protected streaming opening commits it,
+so a captured opening cannot ride a later session; a session with no binding
+fails closed.
+
 ## Scheduling
 
 **Island** — a co-located pool of exclusive **units** (a GPU NVLink domain being

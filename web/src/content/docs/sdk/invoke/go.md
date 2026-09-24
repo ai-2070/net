@@ -75,6 +75,35 @@ resp, err := net.TypedCall[SummarizeReq, SummarizeResp](
 capability index, which is what makes failover to a standby possible. `CallTool`
 is a thin wrapper over `TypedCallService`.
 
+### The protected variant
+
+Organization-scoped calls bind a credential set once and carry an admission proof.
+The caller uses `CallBytes` (unary) or the three streaming methods, which return
+the shared nRPC handles; the provider registers the matching serve verbs:
+
+```go
+client, err := net.NewOrgClient(node, creds)   // bind once, consumes creds
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close()
+
+resp, err := client.CallBytes(ctx, "summarize", req)          // unary
+stream, err := client.CallStreaming(ctx, "summarize", req)     // server-stream
+call, err := client.CallClientStream(ctx, "upload")            // client-stream
+duplex, err := client.CallDuplex(ctx, "chat")                  // duplex
+
+handle, err := net.ServeOrgStreaming(node, "summarize",
+    net.OrgAccessSameOrg, handler)
+```
+
+`ctx` is still the deadline and cancellation path: on the streaming calls an
+omitted deadline is the facade's own default, never "no deadline," and a context
+watcher fires the pre-reserved token so cancelling `ctx` drops the in-flight call. Failures are
+`*net.OrgError` — branch on `.Kind`, or `.IsLocal()` for "did anything leave this
+process" — except a cancellation you initiated, which surfaces as `ctx.Err()`. See
+[Protected streaming](/docs/guides/protected-streaming).
+
 ### A typed application error
 
 ```go

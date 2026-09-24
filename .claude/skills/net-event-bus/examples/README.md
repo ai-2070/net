@@ -4,7 +4,8 @@ Each file in this directory is a **minimal, runnable** example. Use these as the
 
 The two install-check routes (`hello.*`, `observe.*`) use the **memory
 transport** — no network, no peers needed — and run in a single process. The
-third route, `a2a_paid.*`, does not: see below.
+other routes here do not: `a2a_paid.*` stands up live mesh nodes, and so does
+`net_org_streaming.c`. See below.
 
 **Memory transport does not deliver events, and that is by design.** It selects
 the Noop adapter, which counts batches and discards them — `adapter/noop.rs`
@@ -20,8 +21,9 @@ without needing a broker or a second host. To actually receive events you need
 an adapter that retains them: Redis, JetStream, or the mesh transport between
 two nodes. See `mesh.md`.
 
-Three routes. The first two are in all five bindings; the third is in the two
-that have the surface at all.
+Four routes. The first two are in all five bindings; `a2a_paid.*` is in the two
+that have the paid surface; `net_org_streaming.c` is C-only, because C is the
+one binding without its own org test suite.
 
 **`hello.*` — construct · publish · subscribe · shutdown.** The install check.
 
@@ -126,6 +128,40 @@ The route's point is what nRPC buys that a `host:port` does not: the caller neve
 - **The retry helper is Rust-only, so four ports write the loop by hand.** `call_service_typed_with_retry` (attempts, backoff, a retry predicate) exists in the Rust SDK and nowhere else. `failover.ts`, `failover.py`, `failover.go` and `failover.c` each carry a bounded loop of six attempts at 250 ms under a 500 ms call deadline, and each says so in a comment. The loop is not decoration: the roster still lists the dead provider until the capability fold converges, so the first attempt after the kill may be spent on a corpse. If your binding has no retry helper, that loop — not just the call — is the thing you are missing.
 - **The dropped gang-claim route — a measured negative, and worth more than the route.** `claim_island` / `reserve_island` / `match_islands` / `find_islands` are typed in all five bindings, so "two nodes contend for one mutually-exclusive resource" looked like a natural third route. It does not hold on the flat SDK: **no exclusion is observable.** Measured directly on one mesh — two nodes each `claim_island` the *same* island and **both** get `Some`; `reserve_island` on an island a peer already holds also returns `Some`; and a node holding an island still appears in its own `match_islands` candidate list. The exclusion lives one layer down, in the quorum promotion to the `Active` state, which is core-only and unreachable from the bindings. So a `lock` example would have taught a mutex that is not one — a reader would ship mutual exclusion they never had. Recorded, not shipped.
 - **The dropped subprotocol route.** Custom-subprotocol registration has no typed exposure in any of the five SDKs — the registry is not a binding-level surface — so an example there would be Rust-and-core only, which this grid does not run. Recorded, not shipped.
+
+### Wave 4 — protected org streaming
+
+One route, and it is **C-only**. `net_org_streaming.c` serves *and* calls a
+protected streaming service from one file, linked against the single `libnet`:
+it boots a throwaway cross-org issuance chain with the in-repo scenario
+generator (credentials are issued material — the example mints none of its
+own), serves a `Granted` streaming service, calls it cross-org, and asserts
+that every item the handler emitted arrived (handler-sent and caller-received
+counts agree), explicit completion, and handler-side attribution of the
+**verified** caller.
+
+| File | Bindings | Route | Expected line |
+|---|---|---|---|
+| `net_org_streaming.c` | C only — see below | mint a throwaway org chain · serve a `Granted` streaming service · call it cross-org · verified caller attribution at the handler · explicit completion | `RESULT ok chunks=3 attribution=verified` |
+
+The other four bindings are absent **with a reason, not unwritten** — the
+manifest's words, verbatim in substance:
+
+- **Rust** — its org streaming cells live in the SDK's own live suite
+  (`sdk/tests/org_streaming.rs`, same-org and granted, all four shapes); a skill
+  example would duplicate a suite that already owns the fixtures.
+- **TypeScript** — the Node binding exercises its org verbs live in
+  `bindings/node/test/org_live.test.ts`.
+- **Python** — likewise, in `bindings/python/tests/test_org_live.py`.
+- **Go** — `go/org_test.go` covers the same generated scenario, both authority
+  modes, all four shapes. C is the surface without a binding test suite, so this
+  route *is* C's consumer-side evidence — including that every `net_org_*` /
+  `net_rpc_*` / `net_mesh_*` symbol resolves out of the one `libnet`.
+
+It runs at `level: run` with a 900 s timeout: the first run compiles the
+scenario generator against the fixtures feature; the live call itself is
+seconds. Without a Rust toolchain the example fails loudly rather than printing
+an unearned `ok`.
 
 ### Binding gaps found while porting
 

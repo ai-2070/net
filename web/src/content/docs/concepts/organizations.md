@@ -151,6 +151,63 @@ proof binds a particular call and payload. Net does not automatically replay it
 after denial, timeout, authority movement, or ambiguous transport failure.
 Application policy decides whether a fresh call is safe.
 
+## A protected call has one of four shapes
+
+An organization-protected capability is invoked in one of four shapes, each with
+a caller verb and a matching provider verb:
+
+| Shape | Caller verb | Provider verb |
+| --- | --- | --- |
+| unary | `call` | `serve_org` |
+| server-streaming | `call_streaming` | `serve_org_streaming` |
+| client-streaming | `call_client_stream` | `serve_org_client_stream` |
+| duplex | `call_duplex` | `serve_org_duplex` |
+
+Admission is shape-aware. A streaming frame arriving at a unary registration is
+refused as unsupported; a streaming registration whose frame flags disagree with
+the registered shape, or whose opening proof names a different shape, is denied
+on the merits. Either way the remote reason stays coarse.
+
+A streaming opening is bound to two things beyond its credentials:
+
+- **Its shape.** The opening proof carries a kind that must equal both the
+  registered shape and the observed one.
+- **Its transport session.** The proof commits the full 32-byte Noise handshake
+  hash of the session it rides. A captured opening cannot be replayed on a later
+  session, and a session with no binding never admits a protected stream.
+
+## Lifetimes are finite, and every retirement is observable
+
+A protected call's lifetime is finite by contract. The streaming verbs request no
+deadline, so a zero deadline resolves to the facade's **300 s default** — never
+"no deadline". A provider caps an explicitly requested deadline at **3600 s** and
+**refuses** a request beyond the cap rather than clamping it: the caller is told
+it asked for something the provider does not offer, not silently given less. (The
+unary verb is the exception: with no deadline it sets none.)
+
+How a live call ends, and what the caller sees, depends on its shape:
+
+- an **opening refusal** is the coarse admission denial (`denied`,
+  `not_supported`, or `unavailable`) on every shape;
+- a **midstream revocation** is the stream's final item, a coarse
+  `AdmissionDenied(Denied)`;
+- on a **unary** call, a deadline that passes is `org:rpc:timeout` and a caller
+  cancel is `org:rpc:cancelled`;
+- on a **server-streaming** or **duplex** call the deadline is the provider's, so
+  its final item is `org:rpc:server_error` carrying the timeout status — *not*
+  `org:rpc:timeout` — and a caller cancel simply ends the stream, after which the
+  dropped handle sends the one CANCEL;
+- on a **client-streaming** call either class can arrive, depending on whether
+  the client's own timer or the provider's terminal fires first.
+
+A **local** deadline is a class of its own, distinct from a provider-side
+timeout. On the browser and leaf port a follower tab can reach its own deadline
+on a call the leader node owns, and the outcome is stated as indeterminate: the
+remote operation may still have executed, and it is never retried.
+
+Only a credential-validity clamp or the next opening can stop a call already
+running on a grant (see the floor limitation above).
+
 ## Secrets that never enter your process
 
 A capability grant with `DISCOVER` rights creates an audience secret used to
@@ -164,13 +221,21 @@ language runtimes never receive the raw secret as an ordinary byte buffer.
 
 ## Revocation uses monotonic floors
 
-Membership and capability artifacts carry generations and bounded validity
-windows. A signed revocation floor invalidates older generations for an exact
-subject or scope. Nodes merge floors monotonically: stale state cannot lower the
-current floor and make an old credential valid again.
+Membership certificates carry generations and bounded validity windows. A signed
+revocation floor invalidates older certificate generations for an exact subject.
+Nodes merge floors monotonically: stale state cannot lower the current floor and
+make an older certificate valid again.
 
 Renewal is re-issuance under a current generation, not extension of an accepted
-session. Providers re-evaluate the live floors on protected calls.
+session. On every protected call the provider re-checks the presented
+credentials — signatures, validity windows, and the current membership floors.
+
+**Floors cover membership certificates only.** Cross-organization capability
+grants and dispatcher grants have no floor mechanism, so their revocation is not
+enforced while a call runs. A grant revoked mid-call stops at its `not_after`, or
+at the next opening — never in flight. What bounds a granted call is the grant's
+own validity end, clamped into the call's effective deadline, plus provider
+policy at opening. This is a documented limitation, not continuous enforcement.
 
 ## Organizations federate; they do not merge
 
@@ -211,7 +276,9 @@ Application code normally:
    as distinct outcomes.
 
 See [Private capabilities](/docs/guides/private-capabilities) for the ordinary
-same-org and granted workflow.
+same-org and granted workflow, and
+[Protected streaming](/docs/guides/protected-streaming) for the four call shapes
+and their lifetimes.
 
 ## Where to read next
 
@@ -220,4 +287,5 @@ same-org and granted workflow.
 - [Capabilities](/docs/concepts/capabilities)
 - [Security model](/docs/concepts/security-model)
 - [Private capabilities](/docs/guides/private-capabilities)
+- [Protected streaming](/docs/guides/protected-streaming)
 - [Error codes](/docs/reference/error-codes)

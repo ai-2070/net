@@ -62,6 +62,31 @@ The other headers add their own ranges — `NET_ERR_REDEX` and friends in
 `net_cortex.h`, the MeshDB codes in `net_meshdb.h`. Each header declares the
 codes for its own surface; they all resolve out of the same `libnet`.
 
+## The `NET_ORG_ERR_*` family
+
+`net_org.h` uses its **own** small negative namespace, not the base `NET_ERR_*`
+codes — an organization outcome classified from `NET_ERR_*` is a misclassification.
+The four call domains map to distinct codes so you can branch without parsing, and
+the full `org:<domain>:<kind>` wire string is written to `out_err`:
+
+| Name | Value | Domain |
+|---|---|---|
+| `NET_ORG_OK` | 0 | Success |
+| `NET_ORG_ERR_CREDENTIALS` | -3 | `org:credentials:` — local, nothing was sent |
+| `NET_ORG_ERR_DISCOVERY` | -4 | `org:discovery:` — local, nothing was sent |
+| `NET_ORG_ERR_ADMISSION_DENIED` | -5 | `org:admission_denied:` — remote, a coarse reason only |
+| `NET_ORG_ERR_RPC` | -6 | `org:rpc:` — remote, transport or non-admission server error |
+| `NET_ORG_ERR_UNCLASSIFIED` | -8 | `org:unknown:` — parser / ABI fallback |
+| `NET_ORG_ERR_PROVISION` | -12 | Provisioning failure — a plain message, not a call domain |
+| `NET_ORG_ERR_SUBNET` | -13 | `subnet:<kind>` — see `net_subnet.h` |
+
+The remaining codes are handle and registration state (`NET_ORG_ERR_NULL`,
+`_INVALID_UTF8`, `_CLOSED`, `_NO_DISPATCHER`, `_ALREADY_SERVING`, `_SERVE`), which
+is why the negative space is domain codes plus a few sentinels rather than one flat
+enum. A streaming call's **midstream** failures arrive through the handle
+operations' `out_err` in the same `org:` vocabulary — never the bare nRPC `<kind>:`
+shape — so one parser classifies both the opening and everything after it.
+
 ## Beyond the bus
 
 Recovery strategies (retry, hedge, failover) and the agentic loop are available

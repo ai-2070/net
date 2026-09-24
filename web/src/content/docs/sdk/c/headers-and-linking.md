@@ -33,7 +33,7 @@ Every other header has its own guard and composes freely.
 | `net_meshdb.h` | `NET_MESHDB_H` | Federated query layer over capability queries + CortEX folds | `libnet` |
 | `net_meshos.h` | `NET_MESHOS_H` | Daemon-author SDK — operator handle + control-event channel | `libnet` |
 | `net_deck.h` | `NET_DECK_H` | Deck operator-side SDK | `libnet` |
-| `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet` |
+| `net_org.h` | `NET_ORG_H` | Organization capability auth — own `NET_ORG_ABI_VERSION`; pair with `net_rpc.h` for the streaming verbs | `libnet` |
 | `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve + gateway provisioning | `libnet` |
 | `net_mcp.h` | `NET_MCP_H` | MCP bridge helpers, graduated consent / pin surface | `libnet` |
 
@@ -52,6 +52,16 @@ of the table — it is the whole shipping model, and the reason is in
 `net_subnet.h` shares `net_org.h`'s error namespace (`NET_ORG_ERR_SUBNET`) and
 handle model, and `#include`s it. The subnet-exported *caller* verb, `net_org_call_exported`, is declared
 in `net_org.h` because it takes the org client handle.
+
+`net_org.h` carries its own ABI stamp, versioned independently of `net_rpc.h`:
+`NET_ORG_ABI_VERSION` is `0x0002`. Call
+`net_org_check_abi_version(NET_ORG_ABI_VERSION)` at init and hard-fail on a
+mismatch — the check is exact equality, so a consumer built against an older
+expectation is refused rather than waved on and must be rebuilt against the current
+headers. Include `net_rpc.h` beside `net_org.h` when you use the org streaming
+verbs (`net_org_call_streaming` / `net_org_call_client_stream` / `net_org_call_duplex`):
+they hand out and drive the shared nRPC handle types, so code that drains a public
+stream drains an org stream unchanged.
 
 ## Building the library
 

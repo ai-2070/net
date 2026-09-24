@@ -14,7 +14,11 @@ read the limits section before the guarantees section.
 **Transport.** Peer links are Noise `NKpsk0` sessions: ChaCha20-Poly1305 frames
 over a handshake authenticated by a pre-shared key _and_ the responder's static
 public key. Every frame is encrypted and authenticated; a passive observer
-learns traffic patterns, not contents.
+learns traffic patterns, not contents. The full 32-byte Noise handshake hash is
+the session **binding**: stored on the session, readable per peer
+(`MeshNode::peer_session_binding`), absent on hand-built sessions, and re-derived
+on every re-handshake. A protected streaming opening binds a proof to that value,
+so a proof captured from one session cannot be replayed onto another.
 
 **Identity.** An `EntityId` is a 32-byte ed25519 public key. Every other
 identifier is derived from it by domain-separated BLAKE2s-MAC — a 4-byte
@@ -81,6 +85,31 @@ verifications, billing events) and never touches value. Settlement signing goes
 through a seam that takes a _typed document_ and returns a signature, with no
 raw-bytes path. Net cannot move funds because it never holds the ability to.
 
+## What a protected call does not buy
+
+An organization-scoped call carries an admission proof the provider verifies
+before the handler runs. Four limits are worth stating before you lean on it:
+
+- **Direct session only.** The proof binds the caller to the peer on the channel
+  it arrived on, and a protected streaming opening binds the full 32-byte session
+  binding above. A proof replayed from another peer, or from another session, is
+  refused at opening.
+- **No retry underneath.** One attempt, one signed opening. A second attempt is a
+  fresh proof, never a silent re-send — so the caller decides whether retrying is
+  safe, with the usual ambiguous-execution cost. The nRPC retry layer does not
+  cover organization-scoped calls.
+- **A finite lifetime by contract.** The streaming verbs substitute a deadline
+  when the caller names none — the facade's 300 s default, never "no deadline".
+  (The unary verb sets none when no deadline is given.)
+- **Revocation is not continuous.** Membership floors are checked at admission,
+  but cross-org capability grants and dispatcher grants have no floor mechanism,
+  so a grant revoked mid-call stops at its validity end or the next opening —
+  never in flight.
+
+The audience model behind these limits — invisible rather than merely refused — is
+in [Organizations](/docs/concepts/organizations); the call shapes are in
+[Protected streaming](/docs/guides/protected-streaming).
+
 ## What Net does not do
 
 - **No confidentiality against a mesh participant.** Encryption is hop-to-hop
@@ -99,10 +128,8 @@ raw-bytes path. Net cannot move funds because it never holds the ability to.
 ## Reporting a vulnerability
 
 Security issues should go to the maintainers privately rather than through a
-public issue. Internal security audits of the core crate and the channel-auth
-path live under
-[`docs/internal/misc/`](https://github.com/ai-2070/net/tree/master/net/crates/net/docs/misc)
-in the repository.
+public issue. Internal audits of the core crate and the channel-auth path are
+kept in the repository rather than republished on this site.
 
 ## See also
 

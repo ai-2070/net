@@ -44,14 +44,23 @@ variants. The CLI is optional.
 
 ## Protected services
 
-`net_org.h` carries organization capability auth, including the subnet-exported
-caller verb `net_org_call_exported`. Its companion `net_subnet.h` (same
-library — everything is in `libnet`) carries the provider and
-gateway side: `net_subnet_serve_exported` against a NAMED export, plus
-`net_subnet_install_gateway_credentials`, `net_subnet_declare_boundaries`, and
-`net_subnet_apply_control_fact`. Subnet failures return `NET_ORG_ERR_SUBNET`
-with the stable `subnet:<kind>` wire string on `out_err`
-([reference](/docs/reference/error-codes)).
+`net_org.h` carries organization capability auth. Its call verbs are
+`net_org_call` (unary) and `net_org_call_streaming` / `net_org_call_client_stream` /
+`net_org_call_duplex` for the three streaming shapes, plus the subnet-exported
+caller verb `net_org_call_exported`. The provider side registers with
+`net_org_serve` (unary) or `net_org_serve_streaming` / `net_org_serve_client_stream`
+/ `net_org_serve_duplex`. The org surface carries its own ABI stamp —
+`NET_ORG_ABI_VERSION` is `0x0002` — so call
+`net_org_check_abi_version(NET_ORG_ABI_VERSION)` at init and hard-fail on a
+mismatch, and `#include "net_rpc.h"` beside `net_org.h`, because the streaming
+verbs hand out and drive the shared nRPC handle types.
+
+Its companion `net_subnet.h` (the same library — everything is in `libnet`)
+carries the provider and gateway side: `net_subnet_serve_exported` against a NAMED
+export, plus `net_subnet_install_gateway_credentials`,
+`net_subnet_declare_boundaries`, and `net_subnet_apply_control_fact`. Subnet
+failures return `NET_ORG_ERR_SUBNET` with the stable `subnet:<kind>` wire string on
+`out_err` ([reference](/docs/reference/error-codes)).
 
 C application code constructs no authority objects: the export name is resolved
 against the checked map the node holds, and trust anchors, attachment, control

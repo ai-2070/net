@@ -19,7 +19,7 @@ wrong; picking the wrong library is not a mistake you can make.
 | `net_meshdb.h` | `NET_MESHDB_H` | Federated queries | `libnet` |
 | `net_meshos.h` | `NET_MESHOS_H` | Daemon authoring | `libnet` |
 | `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet` |
-| `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet` |
+| `net_org.h` | `NET_ORG_H` | Organization capability auth, unary through duplex (own ABI stamp `NET_ORG_ABI_VERSION` `0x0002`) | `libnet` |
 | `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve, gateway provisioning | `libnet` |
 | `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet` |
 
@@ -110,6 +110,26 @@ Two boundary guarantees worth knowing: panics do not unwind into your process
 error rather than undefined behaviour. `net_poll` rejects buffers under 256
 bytes with `NET_ERR_BUFFER_TOO_SMALL` **without advancing the cursor** — size for
 4 KB and stop thinking about it. The structured `net_poll_ex` path is unaffected.
+
+## Protected services (org)
+
+The org surface carries its **own ABI stamp**, `NET_ORG_ABI_VERSION`
+(`0x0002`), independent of `net_rpc.h`'s, checked with
+`net_org_check_abi_version(NET_ORG_ABI_VERSION)`. Pin it at init and hard-fail
+on a mismatch: the check is exact-equality, so a consumer built against an older
+header is refused, never waved on — rebuild against the current headers.
+
+The four shapes are `net_org_call` (unary) plus `net_org_call_streaming` /
+`net_org_call_client_stream` / `net_org_call_duplex`, with the provider verbs
+`net_org_serve` / `net_org_serve_streaming` / `net_org_serve_client_stream` /
+`net_org_serve_duplex`. **The streaming verbs force a second header:**
+`net_org.h`'s handles are the *shared* `net_rpc.h` types (`RpcStreamHandleC`,
+`ClientStreamCallHandleC`, `DuplexCallHandleC`, and the handler-side
+`RpcRequestStreamHandleC` / `RpcResponseSinkHandleC`), so include both
+`net_org.h` and `net_rpc.h` — and still link one `-lnet`. On the streaming verbs
+a `deadline_ms` of `0` means the facade's **300 s** protected-call lifetime,
+never "no deadline"; unary `net_org_call` stays unbounded at `0`. Full contract:
+`org.md`.
 
 ## Gaps
 

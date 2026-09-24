@@ -35,9 +35,13 @@ to the compiler and at runtime; see the [Go install guide](/docs/start/install/g
 
 ## Protected services
 
-Organization auth ([concepts](/docs/concepts/organizations)) is at parity:
-`net.ServeOrg[Req, Resp]` / `net.OrgCall[Req, Resp]` over `libnet_org`. The
-subnet authority plane ([concepts](/docs/concepts/subnets)) adds
+Organization auth ([concepts](/docs/concepts/organizations)) is at parity, all in
+the one `libnet`: the provider registers with `net.ServeOrg[Req, Resp]` for unary or
+`net.ServeOrgStreaming` / `net.ServeOrgClientStream` / `net.ServeOrgDuplex`, and the
+caller binds with `net.NewOrgClient(node, creds)` and uses `client.CallBytes` beside
+`client.CallStreaming` / `client.CallClientStream` / `client.CallDuplex`, or the
+typed `net.OrgCall[Req, Resp]`. The subnet authority plane
+([concepts](/docs/concepts/subnets)) adds
 `net.ServeSubnetExported[Req, Resp](node, service, exportName, handler)` for a
 provider inside a protected subnet (`exportName` resolves against
 `MeshConfig.SubnetExports`), `net.CallExported[Req, Resp](ctx, client, service,

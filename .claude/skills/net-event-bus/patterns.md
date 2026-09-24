@@ -106,17 +106,31 @@ for await (const chunk of stream) { /* decoded chunk */ }
 // stream.close() emits CANCEL; stream.grant(n) issues explicit credit.
 ```
 
-Same shape in Rust / Python / Go. Auto-grant covers the common case (1 credit per delivered chunk); explicit `grant(window/2)` cadence is preferable for uniform-sized chunks where you want fewer round-trips. Read `nrpc.md` for the full streaming contract.
+Same shape in Rust / Python / Go / C. Auto-grant covers the common case (1 credit per delivered chunk); explicit `grant(window/2)` cadence is preferable for uniform-sized chunks where you want fewer round-trips. Read `nrpc.md` for the full streaming contract.
+
+The other two shapes are the same surface. **Client-streaming** — `call_client_stream` pushes request items with `send(&chunk).await?` and then calls `finish().await?` for one terminal reply; the provider registers it with `serve_rpc_client_stream_typed`. **Duplex** — `call_duplex` gives `(sink, stream)` via `call.into_split()`, with `sink.finish_sending().await` half-closing the request direction; the provider registers it with `serve_rpc_duplex_typed`. In both, a request chunk that fails to decode terminates the stream with a codec error instead of being skipped, and the request-direction window mirror bounds the upload exactly as `streamWindow` bounds the response.
+
+## "Only one organization may call this service"
+
+**Recipe:** org capability auth (`org.md`). Register with `serve_org(service, OrgAccess::{SameOrg, Granted}, handler)` instead of `serve_rpc_typed`. The service becomes *invisible*, not merely refused, to every peer outside the audience: `serve_org` implies an encrypted-only announcement (`OwnerScoped` for the node's own org, `GrantedAudience` for orgs holding a DISCOVER grant), sealed to the audience key on a separate subprotocol. An unauthorized caller therefore sees nothing at all and `find_nodes` returns empty — that empty set is the expected result, not a bug.
+
+The caller binds a credential set with `mesh.org(credentials)?` and calls `org.call(service, &req)`. Provisioning is a separate offline ceremony — `net-mesh org keygen` / `issue-cert` / `grant-dispatcher` / `grant-capability`, then `net-mesh node adopt`. A `Granted` provider that never installed its grant audience (`install_provider_grant_audience`) registers fine but stays encrypted and undiscoverable, which is the most common cause of a confusing "service not found". Org calls never retry (see below).
+
+## "A partner org should call my streaming service"
+
+**Recipe:** `serve_org_streaming` / `serve_org_client_stream` / `serve_org_duplex` with `OrgAccess::Granted`, called by the partner's `org.call_streaming` / `call_client_stream` / `call_duplex`. Admission runs the same ordered checks as unary — proof decode, TOFU member binding, mode and grant checks, replay guard — plus the streaming proof's binding to the receiving Noise session. The handler gets the provider-verified `OrgCaller`. Failures use the frozen `org:<domain>:<kind>` vocabulary on both sides of the stream, and a midstream revocation arrives as the stream's final admission-denied item rather than an abrupt close. Full model: `org.md`.
 
 ## "I want retry / hedging / circuit-breaker for my RPC calls"
 
 **Recipe:** the resilience helpers ship in every binding alongside the typed surface.
 
-- `RetryPolicy` + `callWithRetry` — exponential backoff with jitter; default predicate retries `no_route` + `transport`, skips terminal `server_error` / `codec_*`.
+- `RetryPolicy` + `callWithRetry` — exponential backoff with jitter; the default predicate retries `Timeout`, `Transport`, and a server-side transient `ServerError` (`Internal` / `Backpressure` / `Timeout`), and deliberately does **not** retry `no_route` (nobody serves it — retrying the same instant cannot change that), nor the terminal `codec_*` / application-status / `capability_denied` kinds. `nrpc.md` § Resilience helpers has the verbatim table.
 - `HedgePolicy` + `callWithHedgeTo` — fans out parallel attempts on a delay; first success wins, losers cancelled.
 - `CircuitBreaker` — closed → open → half-open with a configurable failure predicate. Open breakers reject calls outright with `BreakerOpenError` (carries `nrpc:breaker_open:` prefix).
 
 Stack them: `breaker.call(() => callWithRetry(...))` is the typical "give up fast on a wedged target, but tolerate single retries" combo. **Don't** retry `codec_*` errors (caller bugs). **Don't** install a breaker that opens on `no_route` alone (flaps before any handshake). See `nrpc.md` § Resilience helpers for the full guidance.
+
+**Org calls never retry at all.** A signed proof is never resent, and the org facade makes exactly one attempt per call — the replay guard is keyed on `(caller, call_id)`, so a second attempt requires a fresh call id and a fresh signature. Don't wrap `callWithRetry` around `mesh.org(..).call(..)`; cross-call idempotency is the application's.
 
 ## "I want a publisher to also see its own events"
 
@@ -218,6 +232,8 @@ Need a typed reply / RPC semantics?
     ├── Direct-addressed (you know the target node id)? → TypedMeshRpc.call
     ├── Service-discovery (any node advertising the service)? → TypedMeshRpc.callService
     ├── Streaming response from one request? → TypedMeshRpc.callStreaming
+    ├── Stream of requests, or both directions at once? → callClientStream / callDuplex
+    ├── Only one organization may call it (invisible to everyone else)? → org facade (`org.md`)
     └── Need deadline + retries / hedging? → callWithRetry / callWithHedge / CircuitBreaker
 ```
 

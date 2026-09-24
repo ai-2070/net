@@ -277,14 +277,14 @@ examples:
 
   # ------------------------------------------------------- org streaming (S4)
   #
-  # The C consumer-side cell of the org streaming matrix (the plan's Go/C row:
-  # "the C skill example against the single libnet"): one file serving AND
+  # The C consumer-side cell of the org streaming matrix: one file serving AND
   # calling a protected streaming service over the C ABI, linked against ONE
   # library — every net_org_* / net_rpc_* / net_mesh_* symbol resolves out of
   # the single libnet. It boots a throwaway cross-org issuance chain with the
   # in-repo scenario generator (credentials are ISSUED material — the example
-  # mints none of its own), then asserts correlated item delivery, explicit
-  # completion, and handler-side attribution of the VERIFIED caller.
+  # mints none of its own), then asserts that the handler emitted and the
+  # caller received the same item count, that the stream completed explicitly,
+  # and that the handler's attribution is of the VERIFIED caller.
 
   - id: org-streaming
     skill: net-event-bus

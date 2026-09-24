@@ -75,9 +75,11 @@ Announcing does not make a capability visible to every participant or open to
 invocation.
 
 Visibility and invocability are separate decisions. Organization-scoped discovery
-can hide or encrypt a descriptor for callers outside its audience. The provider
+can hide or encrypt a descriptor for callers outside its audience, and the provider
 then makes the final admission decision when a caller invokes it. See
-[Invoke](/docs/sdk/invoke) and [Errors](/docs/sdk/errors).
+[Organizations](/docs/concepts/organizations) and
+[Protected streaming](/docs/guides/protected-streaming) for the audience model, the
+admission proof, and the four protected call shapes.
 
 The full tag and axis model — hardware, software, model, tool, resource-limit
 projections — is in [Capabilities](/docs/concepts/capabilities) and
