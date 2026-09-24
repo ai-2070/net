@@ -203,3 +203,4 @@ thing in every binding. CLI provisioning is `net org keygen` / `issue-cert` /
 - [`BEHAVIOR.md`](BEHAVIOR.md) — the plane this is part of
 - [`IDENTITY.md`](IDENTITY.md) — entity identity and permission tokens underneath
 - [`CHANNELS.md`](CHANNELS.md) — channel-level authorization
+<!-- bisect trigger r2 (inert) -->
