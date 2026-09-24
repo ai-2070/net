@@ -1,0 +1,14 @@
+net/crates/net/bindings/python/python/net/_net.pyi
+  h_64425bc75e3f3d 4908-4911,4986-4998,5019,5035
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "43668bddb652dd310b9b4e01b3909871d21f9af7",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
