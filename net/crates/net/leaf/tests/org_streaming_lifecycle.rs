@@ -48,7 +48,7 @@ use net_leaf::rpc_wire::{
 const SERVICE: &str = "svc.loop";
 const NOW_SECS: u64 = 1_700_000_000;
 const NOW_NS: u64 = 1_700_000_000_000_000_000;
-const CALLER_NODE: NodeId = 0xC0FFEE_0000_0001;
+const CALLER_NODE: NodeId = 0x00C0_FFEE_0000_0001;
 const PROVIDER_NODE: NodeId = 0xBEEF_0000_0002;
 const INC: u64 = 7;
 const OLD_INC: u64 = 6;
@@ -307,7 +307,7 @@ impl Loop {
             .collect()
     }
 
-    fn to_provider(&mut self, frames: Vec<Outgoing>) {
+    fn feed_provider(&mut self, frames: Vec<Outgoing>) {
         for Outgoing { call_id, frame } in frames {
             let peer = self.serve_peer();
             match frame {
@@ -340,7 +340,7 @@ impl Loop {
         }
     }
 
-    fn to_caller(&mut self, frames: Vec<Outgoing>) {
+    fn feed_caller(&mut self, frames: Vec<Outgoing>) {
         for Outgoing { call_id, frame } in frames {
             let owner = self.call_owner();
             match frame {
@@ -366,8 +366,8 @@ impl Loop {
             if up.is_empty() && down.is_empty() {
                 break;
             }
-            self.to_provider(up);
-            self.to_caller(down);
+            self.feed_provider(up);
+            self.feed_caller(down);
         }
     }
 
@@ -537,7 +537,7 @@ fn server_streaming_delivers_every_item_in_order_then_exactly_one_end_terminal()
     let up = l.caller_out();
     assert_eq!(up.len(), 1, "eager opening queues exactly one REQUEST");
     assert!(matches!(&up[0].frame, RpcFrame::Request(req) if req.body.as_ref() == b"request"));
-    l.to_provider(up);
+    l.feed_provider(up);
     assert_eq!(l.outcomes.last(), Some(&OpenOutcome::Admitted));
 
     let call = l.served.borrow()[0].clone();
@@ -622,7 +622,7 @@ fn client_streaming_binds_the_first_chunk_into_the_opening_and_returns_one_respo
         }
         other => panic!("expected the terminal upload frame, got {other:?}"),
     }
-    l.to_provider(up);
+    l.feed_provider(up);
 
     let call = l.served.borrow()[0].clone();
     let uploaded: Vec<Bytes> = (0..8).map_while(|_| call.poll_request()).collect();
@@ -646,7 +646,7 @@ fn client_streaming_binds_the_first_chunk_into_the_opening_and_returns_one_respo
         }],
         "the handler's own response is the terminal, verbatim"
     );
-    l.to_caller(down);
+    l.feed_caller(down);
     assert_eq!(
         l.caller.terminal(id),
         Some(&StreamTerminal::Completed {
@@ -693,7 +693,7 @@ fn duplex_keeps_its_upload_and_response_halves_independent() {
     l.caller.send(id, b"u2", l.now).expect("send");
     l.caller.finish_sending(id, l.now).expect("half-close");
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
 
     let call = l.served.borrow()[0].clone();
     let uploaded: Vec<Bytes> = (0..8).map_while(|_| call.poll_request()).collect();
@@ -707,7 +707,7 @@ fn duplex_keeps_its_upload_and_response_halves_independent() {
     // keeps producing — independent halves under one record.
     call.send(b"d1").expect("respond");
     let down = l.provider_out();
-    l.to_caller(down);
+    l.feed_caller(down);
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"d1")));
     assert_eq!(l.caller.terminal(id), None, "the output half is not done");
 
@@ -1029,7 +1029,7 @@ fn request_end_is_eof_and_a_late_chunk_delivers_and_cancels_nothing() {
     l.caller.send(id, b"only", l.now).expect("send");
     l.caller.finish_sending(id, l.now).expect("finish");
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
 
     let call = l.served.borrow()[0].clone();
     assert_eq!(call.poll_request(), Some(Bytes::from_static(b"only")));
@@ -1043,9 +1043,8 @@ fn request_end_is_eof_and_a_late_chunk_delivers_and_cancels_nothing() {
         body: Bytes::from_static(b"late"),
     };
     let peer = l.serve_peer();
-    assert_eq!(
-        l.serves.on_chunk(&peer, late),
-        false,
+    assert!(
+        !l.serves.on_chunk(&peer, late),
         "a late chunk delivers nothing"
     );
     assert_eq!(
@@ -1081,7 +1080,7 @@ fn end_on_one_call_never_touches_a_sibling() {
     l.caller.send(b_id, b"b1", l.now).expect("send");
     l.caller.finish_sending(a_id, l.now).expect("end A");
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
 
     let calls = l.served.borrow().clone();
     assert_eq!(calls.len(), 2);
@@ -1089,7 +1088,7 @@ fn end_on_one_call_never_touches_a_sibling() {
     l.caller.send(b_id, b"b2", l.now).expect("B still sends");
     l.caller.finish_sending(b_id, l.now).expect("end B");
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
 
     let a_items: Vec<Bytes> = (0..8).map_while(|_| calls[0].poll_request()).collect();
     let b_items: Vec<Bytes> = (0..8).map_while(|_| calls[1].poll_request()).collect();
@@ -1134,7 +1133,7 @@ fn response_credit_parks_the_sender_and_each_grant_releases_exactly_its_chunks()
         intent,
     );
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
 
     let call = l.served.borrow()[0].clone();
     // Window 2: two sends RESOLVE and take their items; the rest park
@@ -1156,7 +1155,7 @@ fn response_credit_parks_the_sender_and_each_grant_releases_exactly_its_chunks()
         "exactly credit-count chunks"
     );
     assert_eq!(terminals(&down), 0, "a parked sender is not terminal");
-    l.to_caller(down);
+    l.feed_caller(down);
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"a")));
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"b")));
 
@@ -1164,7 +1163,7 @@ fn response_credit_parks_the_sender_and_each_grant_releases_exactly_its_chunks()
     // more sends resolve and exactly 2 more chunks go out.
     let up = l.caller_out();
     assert_eq!(up.len(), 2, "one STREAM_GRANT per consumed chunk");
-    l.to_provider(up);
+    l.feed_provider(up);
     assert_eq!(call.send(b"c"), Ok(()));
     assert_eq!(call.send(b"d"), Ok(()));
     assert_eq!(call.send(b"e"), Err(SinkError::WouldBlock));
@@ -1173,13 +1172,13 @@ fn response_credit_parks_the_sender_and_each_grant_releases_exactly_its_chunks()
         responses(&down),
         vec![continue_chunk(b"c"), continue_chunk(b"d")]
     );
-    l.to_caller(down);
+    l.feed_caller(down);
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"c")));
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"d")));
 
     // The last item and the terminal.
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
     assert_eq!(call.send(b"e"), Ok(()));
     call.finish(StreamHandlerResult::Ok);
     let down = l.provider_out();
@@ -1188,7 +1187,7 @@ fn response_credit_parks_the_sender_and_each_grant_releases_exactly_its_chunks()
         vec![continue_chunk(b"e"), end_terminal()],
         "the final chunk then exactly one terminal"
     );
-    l.to_caller(down);
+    l.feed_caller(down);
     assert_eq!(l.caller.next_item(id), Some(Bytes::from_static(b"e")));
     assert_eq!(
         l.caller.terminal(id),
@@ -1221,7 +1220,7 @@ fn upload_chunks_wait_for_request_grants_and_consumption_grants_one_each() {
     );
     let up = l.caller_out();
     assert_eq!(up.len(), 2, "exactly the opening window of item frames");
-    l.to_provider(up);
+    l.feed_provider(up);
 
     let call = l.served.borrow()[0].clone();
     assert_eq!(call.poll_request(), Some(Bytes::from_static(b"a")));
@@ -1239,7 +1238,7 @@ fn upload_chunks_wait_for_request_grants_and_consumption_grants_one_each() {
         .filter(|o| matches!(o.frame, RpcFrame::RequestGrant(_)))
         .count();
     assert_eq!(grants, 2, "one REQUEST_GRANT per consumed chunk");
-    l.to_caller(down);
+    l.feed_caller(down);
 
     // Credit released: the parked sends RESOLVE as grants arrive — and
     // park again exactly at the window.
@@ -1263,7 +1262,7 @@ fn upload_chunks_wait_for_request_grants_and_consumption_grants_one_each() {
         }
         other => panic!("expected the terminal upload frame, got {other:?}"),
     }
-    l.to_provider(up);
+    l.feed_provider(up);
     assert_eq!(call.poll_request(), Some(Bytes::from_static(b"c")));
     assert_eq!(call.poll_request(), Some(Bytes::from_static(b"d")));
     assert!(call.request_ended());
@@ -1353,7 +1352,7 @@ fn deadline_expiry_emits_the_timeout_terminal_and_latches_once() {
         intent,
     );
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
     assert_eq!(l.serves.live_calls(), 1);
 
     // A frozen tab's ticker stopping extends nothing: the first sweep
@@ -1373,7 +1372,7 @@ fn deadline_expiry_emits_the_timeout_terminal_and_latches_once() {
 
     // A second retirement is a no-op: no second terminal, ever.
     let peer = l.serve_peer();
-    assert_eq!(l.serves.on_cancel(&peer, id), false);
+    assert!(!l.serves.on_cancel(&peer, id));
     l.now += 10_000_000_000;
     assert_eq!(l.provider_out().len(), 0, "exactly one terminal latched");
     drop(handle);
@@ -1392,13 +1391,13 @@ fn cancel_emits_the_cancelled_terminal_verbatim() {
         intent,
     );
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
 
     let call = l.served.borrow()[0].clone();
     call.send(b"streaming").expect("send");
 
     let peer = l.serve_peer();
-    assert_eq!(l.serves.on_cancel(&peer, id), true);
+    assert!(l.serves.on_cancel(&peer, id));
     assert_eq!(
         l.provider_out(),
         vec![Outgoing {
@@ -1422,7 +1421,7 @@ fn cancel_emits_the_cancelled_terminal_verbatim() {
         "the sink's typed closed refusal is the handler-side observable"
     );
     // A second cancel cannot produce a second terminal.
-    assert_eq!(l.serves.on_cancel(&peer, id), false);
+    assert!(!l.serves.on_cancel(&peer, id));
     assert_eq!(l.provider_out().len(), 0);
     drop(handle);
 }
@@ -1441,7 +1440,7 @@ fn success_drains_queued_items_in_order_before_the_end_terminal() {
         intent,
     );
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
 
     // The handler queues everything it has credit for and finishes
     // BEFORE the drain: producer finished is not terminal, and a
@@ -1464,7 +1463,7 @@ fn success_drains_queued_items_in_order_before_the_end_terminal() {
         ],
         "F-S1: Completed(_) drains queued items in order BEFORE its terminal"
     );
-    l.to_caller(down);
+    l.feed_caller(down);
     while l.caller.next_item(id).is_some() {}
     assert_eq!(
         l.caller.terminal(id),
@@ -1486,7 +1485,7 @@ fn a_floor_raise_retires_the_stale_call_with_denied_and_the_coarse_zero_byte() {
         intent,
     );
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
     let call = l.served.borrow()[0].clone();
     call.send(b"before").expect("send");
 
@@ -1509,7 +1508,7 @@ fn a_floor_raise_retires_the_stale_call_with_denied_and_the_coarse_zero_byte() {
     );
     assert_eq!(call.retired(), Some(RetireReason::Revoked));
     assert_eq!(call.send(b"after"), Err(SinkError::Closed));
-    l.to_caller(down);
+    l.feed_caller(down);
     assert_eq!(
         l.caller.terminal(id),
         Some(&StreamTerminal::Refused {
@@ -1533,7 +1532,7 @@ fn wrong_peer_and_old_session_frames_deliver_nothing() {
     let (id, handle) = l.open_cs(empty_open(), intent);
     l.caller.send(id, b"mine", l.now).expect("send");
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
     let call = l.served.borrow()[0].clone();
     assert_eq!(call.poll_request(), Some(Bytes::from_static(b"mine")));
 
@@ -1555,18 +1554,16 @@ fn wrong_peer_and_old_session_frames_deliver_nothing() {
         caller: l.w.caller_entity.clone(),
         session_binding: Some(l.w.binding),
     };
-    assert_eq!(
-        l.serves.on_chunk(&wrong_peer, spoofed.clone()),
-        false,
+    assert!(
+        !l.serves.on_chunk(&wrong_peer, spoofed.clone()),
         "another peer with the same call id delivers nothing"
     );
-    assert_eq!(
-        l.serves.on_chunk(&old_session, spoofed),
-        false,
+    assert!(
+        !l.serves.on_chunk(&old_session, spoofed),
         "an old session with the same call id delivers nothing"
     );
-    assert_eq!(l.serves.on_cancel(&wrong_peer, id), false);
-    assert_eq!(l.serves.on_stream_grant(&wrong_peer, id, 10), false);
+    assert!(!l.serves.on_cancel(&wrong_peer, id));
+    assert!(!l.serves.on_stream_grant(&wrong_peer, id, 10));
     assert_eq!(
         call.poll_request(),
         None,
@@ -1577,7 +1574,7 @@ fn wrong_peer_and_old_session_frames_deliver_nothing() {
     // The real call is unaffected.
     l.caller.finish_sending(id, l.now).expect("finish");
     let up = l.caller_out();
-    l.to_provider(up);
+    l.feed_provider(up);
     assert!(call.request_ended());
     call.send(b"fine").expect("respond");
     call.finish(StreamHandlerResult::Ok);
@@ -1604,9 +1601,8 @@ fn wrong_peer_and_old_session_frames_deliver_nothing() {
     };
     let intent2 = l.w.intent(5);
     let (id2, handle2) = l.open_cs(empty_open(), intent2);
-    assert_eq!(
-        l.caller.on_response(wrong_owner, id2, payload.clone()),
-        false,
+    assert!(
+        !l.caller.on_response(wrong_owner, id2, payload.clone()),
         "an old-session response neither delivers nor completes"
     );
     assert_eq!(l.caller.terminal(id2), None);
@@ -1643,7 +1639,7 @@ fn a_vanished_provider_retires_at_the_callers_own_deadline_with_the_timeout_term
     // leave and nothing ever comes back.
     let up = l.caller_out();
     assert_eq!(up.len(), 1);
-    l.to_provider(up); // delivered into the void
+    l.feed_provider(up); // delivered into the void
     let _ = l.serves.unserve(SERVICE); // the serving side is gone
     assert_eq!(l.serves.live_calls(), 0);
 
@@ -1682,7 +1678,7 @@ fn a_vanished_provider_retires_at_the_callers_own_deadline_with_the_timeout_term
         headers: Vec::new(),
         body: Bytes::from_static(b"late"),
     };
-    assert_eq!(l.caller.on_response(l.call_owner(), id, payload), false);
+    assert!(!l.caller.on_response(l.call_owner(), id, payload));
 
     // Exactly one CANCEL went with the sweep ("tell the server"), and
     // no automatic resume ever follows.

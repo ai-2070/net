@@ -27,7 +27,7 @@
 //! 3. **Revocation arrives as facts.** Core's
 //!    `org_revocation.rs` is a filesystem store with `Condvar`s; the
 //!    verify-time query surface it actually serves the admission
-//!    engine is [`revocation::RevocationFacts`] — merged raise-only
+//!    engine is [`crate::org::revocation::RevocationFacts`] — merged raise-only
 //!    floors plus the publish epoch and store health, fed over the
 //!    leaf's control channel.
 //! 4. **Single-threaded interior mutability.** The replay guard and
@@ -40,7 +40,7 @@
 //! signs through [`crate::identity::EntityKeypair`] and verifies
 //! through [`crate::identity::verify_entity_signature`] (`verify_strict`
 //! — the lax `verify` admits the malleable `(R, S + L)` variant).
-//! The [`entity::EntityId`] layer wraps those; it re-implements no
+//! The [`crate::org::entity::EntityId`] layer wraps those; it re-implements no
 //! cryptography.
 
 /// The hard clock-skew ceiling, in seconds (300 = 5 minutes).

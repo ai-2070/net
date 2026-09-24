@@ -27,7 +27,8 @@
 //! exactly as [`ControlEvent::Announcement`].
 //!
 //! The frame is recognised on the trickle socket AND on a dedicated
-//! org-control socket ([`Self::open_org_control`]), because the Stage
+//! org-control socket
+//! ([`crate::anchor_control_plane::AnchorControlPlane::open_org_control`]), because the Stage
 //! 4b listener's trickle handler originates exactly one frame and
 //! cannot be extended from here — a harness that must FEED floors
 //! serves the same frame vocabulary on a socket of its own, and the

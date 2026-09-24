@@ -140,7 +140,7 @@ pub enum Decoded {
 }
 
 /// Which plane owns an event-plane carrier — the decision
-/// [`crate::node::LeafNode::handle_event_plane`] makes before it
+/// `LeafNode::handle_event_plane` makes before it
 /// touches a payload.
 ///
 /// One event-plane subprotocol carries three kinds of traffic:

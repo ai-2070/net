@@ -1,4 +1,5 @@
-//! The canonical request digest an [`OrgCallProof`] binds.
+//! The canonical request digest an
+//! [`OrgCallProof`](crate::org::proof::OrgCallProof) binds.
 //!
 //! Core's `org_admission_gate.rs::org_request_digest`, verbatim
 //! against the leaf's own [`RpcRequestPayload`] codec — one shared

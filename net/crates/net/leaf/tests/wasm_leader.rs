@@ -1348,11 +1348,11 @@ async fn a_superseded_session_is_refused_by_the_leader_and_by_storage() {
         from: net_leaf::leader::ProxySide::Follower(0xFEED),
         body: net_leaf::leader::ProxyBody::Request {
             correlation: 1,
-            request: LeaderRequest::Call {
+            request: Box::new(LeaderRequest::Call {
                 service: "stale".into(),
                 payload: Bytes::new(),
                 timeout_ms: None,
-            },
+            }),
         },
     }
     .to_json();

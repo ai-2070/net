@@ -486,7 +486,6 @@ impl StreamCallBinding {
 /// consumes the prefix and ignores the suffix — the §1.4
 /// mixed-version argument), followed by `kind: u8` and
 /// `session_binding: [u8; 32]`.
-
 ///
 /// Unlike [`OrgCallProof::decode`], [`Self::decode`] consumes the
 /// ENTIRE bounded value: unknown kinds, truncated suffixes and extra

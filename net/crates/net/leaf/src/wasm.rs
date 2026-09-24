@@ -4550,14 +4550,19 @@ pub(crate) const ORG_SKEW_SECS: u64 = 300;
 /// object: `kind`, `message`, and `coarse` on `admission-denied`),
 /// and the TypeScript wrapper throws that typed error at the
 /// terminal item — idiomatic `for await`.
+///
+/// One credential set, two readers: the four call verbs read it from
+/// their options object, and a leader mints for a proxied follower
+/// from the credential wire bytes the follower sent over the proxy
+/// channel.
 pub(crate) struct OrgCallCredentials {
     /// The caller's membership certificate wire bytes (156).
-    pub(crate) membership: Vec<u8>,
+    pub(crate) membership: Bytes,
     /// The dispatcher grant wire bytes (185).
-    pub(crate) dispatcher: Vec<u8>,
+    pub(crate) dispatcher: Bytes,
     /// The capability grant wire bytes (318), when the call is
     /// granted rather than same-org.
-    pub(crate) capability_grant: Option<Vec<u8>>,
+    pub(crate) capability_grant: Option<Bytes>,
     /// The org the caller acts for, 64 hex.
     pub(crate) acting_org: String,
     /// The provider's owner org, 64 hex.
@@ -4646,9 +4651,9 @@ pub(crate) fn org_call_options(opts: &JsValue) -> Result<OrgCallOptions, JsError
         ));
     }
     let credentials = OrgCallCredentials {
-        membership: byte_field(&credentials, "membership", true)?.unwrap_or_default(),
-        dispatcher: byte_field(&credentials, "dispatcher", true)?.unwrap_or_default(),
-        capability_grant: byte_field(&credentials, "capabilityGrant", false)?,
+        membership: Bytes::from(byte_field(&credentials, "membership", true)?.unwrap_or_default()),
+        dispatcher: Bytes::from(byte_field(&credentials, "dispatcher", true)?.unwrap_or_default()),
+        capability_grant: byte_field(&credentials, "capabilityGrant", false)?.map(Bytes::from),
         acting_org: require_string(&credentials, "actingOrg")?,
         provider_owner_org: require_string(&credentials, "providerOwnerOrg")?,
         provider: require_string(&credentials, "provider")?,
@@ -4976,7 +4981,7 @@ impl ServeCallState {
     /// Complete the call once; the second completion is dropped.
     fn finish_once(&self, result: crate::rpc_wire::StreamHandlerResult) {
         if !self.finished.replace(true) {
-            let _ = self.call.finish(result);
+            self.call.finish(result);
         }
     }
 }
@@ -5866,16 +5871,19 @@ impl OrgServeHandle {
 }
 
 impl LeafNode {
-    /// Build the proof intent from the boundary's byte options.
+    /// Build the proof intent from one credential set.
     ///
     /// Proofs are minted node-side — the entity key never crosses
     /// the JS boundary — from the decoded credential wire objects.
-    fn org_intent(
+    /// Shared by both surfaces: a direct verb reads its options
+    /// object into [`OrgCallCredentials`], and a leader mints for a
+    /// proxied follower from the credential wire bytes that follower
+    /// sent over the proxy channel.
+    pub(crate) fn org_intent(
         &self,
         service: &str,
-        options: &OrgCallOptions,
+        credentials: &OrgCallCredentials,
     ) -> Result<crate::rpc_stream::OrgCallIntent, JsError> {
-        let credentials = &options.credentials;
         let membership = crate::org::cert::OrgMembershipCert::from_bytes(&credentials.membership)
             .map_err(|e| JsError::new(&format!("membership did not decode: {e}")))?;
         let dispatcher_grant =
@@ -5997,7 +6005,7 @@ impl LeafNode {
     ) -> Result<Uint8Array, JsError> {
         let options = org_call_options(&opts)?;
         options.within_provider_cap()?;
-        let intent = self.org_intent(&service, &options)?;
+        let intent = self.org_intent(&service, &options.credentials)?;
         let peer = Self::org_peer(&options)?;
         let timeout_ms = Some(
             options
@@ -6039,7 +6047,7 @@ impl LeafNode {
     ) -> Result<OrgByteStreamHandle, JsError> {
         let options = org_call_options(&opts)?;
         options.within_provider_cap()?;
-        let intent = self.org_intent(&service, &options)?;
+        let intent = self.org_intent(&service, &options.credentials)?;
         let peer = Self::org_peer(&options)?;
         let open = crate::rpc_stream::StreamOpen {
             body: Bytes::copy_from_slice(&payload.to_vec()),
@@ -6073,7 +6081,7 @@ impl LeafNode {
     ) -> Result<OrgUploadCallHandle, JsError> {
         let options = org_call_options(&opts)?;
         options.within_provider_cap()?;
-        let intent = self.org_intent(&service, &options)?;
+        let intent = self.org_intent(&service, &options.credentials)?;
         let peer = Self::org_peer(&options)?;
         let open = crate::rpc_stream::StreamOpen {
             body: Bytes::new(),
@@ -6105,7 +6113,7 @@ impl LeafNode {
     ) -> Result<OrgDuplexCallHandle, JsError> {
         let options = org_call_options(&opts)?;
         options.within_provider_cap()?;
-        let intent = self.org_intent(&service, &options)?;
+        let intent = self.org_intent(&service, &options.credentials)?;
         let peer = Self::org_peer(&options)?;
         let open = crate::rpc_stream::StreamOpen {
             body: Bytes::new(),
@@ -6328,55 +6336,6 @@ pub(crate) enum OrgBackendCall {
 }
 
 impl LeafNode {
-    /// Decode the JS-supplied credential wire bytes into a proof
-    /// intent. Shared by the direct verbs and the backend.
-    pub(crate) fn build_intent(
-        &self,
-        service: &str,
-        membership: &[u8],
-        dispatcher: &[u8],
-        capability_grant: Option<&[u8]>,
-        acting_org: &str,
-        provider_org: &str,
-        provider: &str,
-        ttl_secs: u64,
-    ) -> Result<crate::rpc_stream::OrgCallIntent, JsError> {
-        let membership = crate::org::cert::OrgMembershipCert::from_bytes(membership)
-            .map_err(|e| JsError::new(&format!("membership did not decode: {e}")))?;
-        let dispatcher_grant = crate::org::grant::OrgDispatcherGrant::from_bytes(dispatcher)
-            .map_err(|e| JsError::new(&format!("dispatcher did not decode: {e}")))?;
-        let capability_grant = capability_grant
-            .map(|bytes| {
-                crate::org::grant::OrgCapabilityGrant::from_bytes(bytes)
-                    .map_err(|e| JsError::new(&format!("capabilityGrant did not decode: {e}")))
-            })
-            .transpose()?;
-        let acting_org = crate::org::cert::OrgId::from_bytes(hex32(acting_org, "actingOrg")?);
-        let provider_org =
-            crate::org::cert::OrgId::from_bytes(hex32(provider_org, "providerOwnerOrg")?);
-        let provider = crate::org::entity::EntityId::from_bytes(hex32(provider, "provider")?);
-        if !(1..=30).contains(&ttl_secs) {
-            return Err(JsError::new(&format!(
-                "proofTtlSecs must be in 1..=30, got {ttl_secs}"
-            )));
-        }
-        Ok(crate::rpc_stream::OrgCallIntent {
-            keypair: self.inner.borrow().org_keypair.clone(),
-            membership,
-            dispatcher_grant,
-            capability_grant,
-            acting_org,
-            provider_org,
-            provider,
-            // The capability is the service's canonical tag — the
-            // mint refuses any other spelling (`CapabilityMismatch`).
-            capability: crate::org::grant::CapabilityAuthorityId::for_tag(&format!(
-                "nrpc:{service}"
-            )),
-            ttl_secs,
-        })
-    }
-
     /// Open one org call on behalf of a proxied follower. The shape
     /// string is the `LeaderRequest::OrgCall` spelling.
     #[allow(clippy::too_many_arguments)]

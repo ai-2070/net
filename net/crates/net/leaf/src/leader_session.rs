@@ -1990,17 +1990,17 @@ impl LeaderBackend for NodeBackend {
                 // handle the required inverse flips.
                 let org = self.org.clone();
                 spawn_fenced(&lease, &ops, async move {
+                    let credentials = crate::wasm::OrgCallCredentials {
+                        membership,
+                        dispatcher,
+                        capability_grant,
+                        acting_org,
+                        provider_owner_org: provider_org,
+                        provider,
+                        proof_ttl_secs: Some(ttl_secs),
+                    };
                     let opened = node
-                        .build_intent(
-                            &service,
-                            &membership,
-                            &dispatcher,
-                            capability_grant.as_deref(),
-                            &acting_org,
-                            &provider_org,
-                            &provider,
-                            ttl_secs,
-                        )
+                        .org_intent(&service, &credentials)
                         .map_err(reported)
                         .and_then(|intent| {
                             let peer =
@@ -3256,7 +3256,7 @@ const ORG_PULL_MS: i32 = 50;
 // The follower's self-minted org correlation namespace. Monotonic
 // and never reset — see the attribution note above.
 thread_local! {
-    static NEXT_ORG_ID: Cell<u64> = Cell::new(0);
+    static NEXT_ORG_ID: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The next self-minted org correlation id.

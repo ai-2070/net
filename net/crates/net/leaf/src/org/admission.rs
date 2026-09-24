@@ -405,7 +405,7 @@ impl<'a> AdmissionContext<'a> {
 /// decision can neither run the handler nor burn the correlation id.
 ///
 /// `provider_policy` is the application veto, run LAST — it sees the
-/// verified proof (for a stream: its [`OrgCallProof::unary_prefix`])
+/// verified proof (for a stream: its [`OrgStreamCallProof::unary_prefix`])
 /// and returns `true` to admit.
 ///
 /// Returns the four-party [`Admitted`] attribution on success, or a

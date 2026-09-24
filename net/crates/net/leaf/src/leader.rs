@@ -862,7 +862,13 @@ pub enum ProxyBody {
         /// The follower's correlation id.
         correlation: u64,
         /// What to do.
-        request: LeaderRequest,
+        ///
+        /// Boxed: `LeaderRequest` is itself the largest thing this
+        /// channel carries (`OrgCall` alone holds every credential
+        /// and the request body), and an unboxed one would make every
+        /// `ProxyBody` — replies and broadcasts included — pay its
+        /// ~300 bytes.
+        request: Box<LeaderRequest>,
     },
     /// Leader → all: "I hold the lock at this generation."
     Leadership {
@@ -1021,7 +1027,7 @@ impl ProxyEnvelope {
             "detach" => ProxyBody::Detach,
             "request" => ProxyBody::Request {
                 correlation: u64_field(&value, "correlation")?,
-                request: decode_request(field(&value, "request")?)?,
+                request: Box::new(decode_request(field(&value, "request")?)?),
             },
             "leadership" => ProxyBody::Leadership {
                 node_id: u64_field(&value, "node_id")?,
@@ -1652,7 +1658,7 @@ impl<B: LeaderBackend> ProxyServer<B> {
                 // are that follower's standing intent, and a successor
                 // that only learned the operations would restore the
                 // channels and quietly narrow the announcement.
-                if let LeaderRequest::Subscribe { channel } = &request {
+                if let LeaderRequest::Subscribe { channel } = &*request {
                     self.followers.declare(follower, channel);
                 }
                 // A release is bookkeeping HERE and a decision
@@ -1677,7 +1683,7 @@ impl<B: LeaderBackend> ProxyServer<B> {
                 // What the follower is told is the outcome of the real
                 // decision, not a success for an operation nobody
                 // made.
-                if let LeaderRequest::Unsubscribe { channel } = &request {
+                if let LeaderRequest::Unsubscribe { channel } = &*request {
                     self.followers.release(follower, channel);
                     let reply = self.replier(correlation);
                     self.pending_releases.push((channel.clone(), reply));
@@ -1703,14 +1709,14 @@ impl<B: LeaderBackend> ProxyServer<B> {
                 // was never the one published. A retirement that
                 // drops these repliers settles each of them typed,
                 // like any other admitted operation.
-                if let LeaderRequest::Announce { capabilities } = &request {
+                if let LeaderRequest::Announce { capabilities } = &*request {
                     self.followers.declare_capabilities(follower, capabilities);
                     let reply = self.replier(correlation);
                     self.pending_announcements.push(reply);
                     return Ok(());
                 }
                 let reply = self.replier(correlation);
-                self.backend.perform(request, reply);
+                self.backend.perform(*request, reply);
                 Ok(())
             }
             // A follower does not send these.
@@ -1950,7 +1956,7 @@ impl ProxyClient {
         self.pending.insert(correlation, tx);
         self.post(ProxyBody::Request {
             correlation,
-            request,
+            request: Box::new(request),
         });
         (Some(correlation), rx)
     }
@@ -3118,10 +3124,10 @@ mod tests {
             ProxySide::Follower(big),
             ProxyBody::Request {
                 correlation: big,
-                request: LeaderRequest::StreamSend {
+                request: Box::new(LeaderRequest::StreamSend {
                     handle: big,
                     payload: Bytes::from_static(b"x"),
-                },
+                }),
             },
         );
         assert!(
@@ -3153,48 +3159,48 @@ mod tests {
             ProxyBody::Detach,
             ProxyBody::Request {
                 correlation: 9,
-                request: LeaderRequest::Call {
+                request: Box::new(LeaderRequest::Call {
                     service: "svc".into(),
                     payload: Bytes::from_static(b"body"),
                     timeout_ms: Some(1500),
-                },
+                }),
             },
             ProxyBody::Request {
                 correlation: 10,
-                request: LeaderRequest::Call {
+                request: Box::new(LeaderRequest::Call {
                     service: "svc".into(),
                     payload: Bytes::new(),
                     timeout_ms: None,
-                },
+                }),
             },
             ProxyBody::Request {
                 correlation: 11,
-                request: LeaderRequest::Subscribe {
+                request: Box::new(LeaderRequest::Subscribe {
                     channel: "chan".into(),
-                },
+                }),
             },
             ProxyBody::Request {
                 correlation: 12,
-                request: LeaderRequest::Publish {
+                request: Box::new(LeaderRequest::Publish {
                     channel: "chan".into(),
                     payload: Bytes::from_static(b"p"),
-                },
+                }),
             },
             ProxyBody::Request {
                 correlation: 13,
-                request: LeaderRequest::Announce {
+                request: Box::new(LeaderRequest::Announce {
                     capabilities: vec!["cap".into()],
-                },
+                }),
             },
             ProxyBody::Request {
                 correlation: 14,
-                request: LeaderRequest::Query {
+                request: Box::new(LeaderRequest::Query {
                     capability: "cap".into(),
-                },
+                }),
             },
             ProxyBody::Request {
                 correlation: 15,
-                request: LeaderRequest::StreamOpen {
+                request: Box::new(LeaderRequest::StreamOpen {
                     label: "app".into(),
                     reliability: Reliability::FireAndForget,
                     stream_id: Some(77),
@@ -3203,59 +3209,59 @@ mod tests {
                     // to survive the round trip or a follower's
                     // stream silently addresses the anchor instead.
                     peer: Some(0xDEAD_BEEF_0000_0001),
-                },
+                }),
             },
             ProxyBody::Request {
                 correlation: 16,
-                request: LeaderRequest::StreamOpen {
+                request: Box::new(LeaderRequest::StreamOpen {
                     label: "app".into(),
                     reliability: Reliability::Reliable,
                     stream_id: None,
                     channel_hash: None,
                     peer: None,
-                },
+                }),
             },
             ProxyBody::Request {
                 correlation: 17,
-                request: LeaderRequest::StreamClose { handle: 5 },
+                request: Box::new(LeaderRequest::StreamClose { handle: 5 }),
             },
             ProxyBody::Request {
                 correlation: 18,
-                request: LeaderRequest::Signal {
+                request: Box::new(LeaderRequest::Signal {
                     peer: 0xAAAA,
                     dialog: 7,
                     kind: "offer".into(),
                     payload: Bytes::from_static(b"v=0"),
-                },
+                }),
             },
             ProxyBody::Request {
                 correlation: 23,
-                request: LeaderRequest::PeerOffer { peer: 0xAB },
+                request: Box::new(LeaderRequest::PeerOffer { peer: 0xAB }),
             },
             ProxyBody::Request {
                 correlation: 24,
-                request: LeaderRequest::PeerAcceptOffer { peer: 0xAC },
+                request: Box::new(LeaderRequest::PeerAcceptOffer { peer: 0xAC }),
             },
             ProxyBody::Request {
                 correlation: 25,
                 // The dialog has to survive the round trip: a proxied
                 // poll that lost it would be applied to whichever
                 // attempt is live when the leader got to it.
-                request: LeaderRequest::PeerCandidate {
+                request: Box::new(LeaderRequest::PeerCandidate {
                     peer: 0xAD,
                     dialog: 0x5109,
-                },
+                }),
             },
             ProxyBody::Request {
                 correlation: 26,
-                request: LeaderRequest::PeerHandshake {
+                request: Box::new(LeaderRequest::PeerHandshake {
                     peer: 0xAE,
                     dialog: 0x510A,
-                },
+                }),
             },
             ProxyBody::Request {
                 correlation: 19,
-                request: LeaderRequest::Counters,
+                request: Box::new(LeaderRequest::Counters),
             },
             ProxyBody::Leadership { node_id: 0x1234 },
             ProxyBody::Reply {
@@ -3428,9 +3434,9 @@ mod tests {
                 ProxySide::Follower(1),
                 ProxyBody::Request {
                     correlation: 1,
-                    request: LeaderRequest::Query {
+                    request: Box::new(LeaderRequest::Query {
                         capability: "cap".into(),
-                    },
+                    }),
                 },
             ))
             .expect("served");
@@ -3471,11 +3477,11 @@ mod tests {
                     ProxySide::Follower(1),
                     ProxyBody::Request {
                         correlation: 1,
-                        request: LeaderRequest::Call {
+                        request: Box::new(LeaderRequest::Call {
                             service: "svc".into(),
                             payload: Bytes::new(),
                             timeout_ms: None,
-                        },
+                        }),
                     },
                 ))
                 .expect_err("a foreign generation must be refused");
@@ -3561,7 +3567,7 @@ mod tests {
                 ProxySide::Follower(1),
                 ProxyBody::Request {
                     correlation: 8,
-                    request: LeaderRequest::Counters,
+                    request: Box::new(LeaderRequest::Counters),
                 },
             ))
             .expect_err("a closed leader must refuse");
@@ -3592,7 +3598,7 @@ mod tests {
                 ProxySide::Follower(1),
                 ProxyBody::Request {
                     correlation: 4,
-                    request: LeaderRequest::Counters,
+                    request: Box::new(LeaderRequest::Counters),
                 },
             ))
             .expect("served");

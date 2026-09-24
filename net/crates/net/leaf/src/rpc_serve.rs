@@ -663,7 +663,7 @@ impl ServeRegistry {
                     && !poisoned_at_reserve
                     && !admission.facts.poisoned
             },
-            |proof| policy.as_ref().map_or(true, |p| p(proof)),
+            |proof| policy.as_ref().is_none_or(|p| p(proof)),
         ) {
             Ok(admitted) => admitted,
             Err(reason) => {
@@ -993,7 +993,7 @@ impl ServeRegistry {
         call_id: u64,
         reason: AdmissionDenied,
     ) -> OpenOutcome {
-        let wire = reason.clone().coarse().to_wire();
+        let wire = reason.coarse().to_wire();
         let payload = RpcResponsePayload {
             status: RpcStatus::AdmissionDenied,
             headers: Vec::new(),
@@ -1116,7 +1116,7 @@ fn pump(out: &mut VecDeque<ServeOutFrame>, state: &mut ServeCallState) {
             }
             let body = {
                 let mut sh = state.shared.borrow_mut();
-                let body = sh.output.pop_front().unwrap_or_else(Bytes::new);
+                let body = sh.output.pop_front().unwrap_or_default();
                 sh.output.clear();
                 body
             };
