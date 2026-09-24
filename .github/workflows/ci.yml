@@ -4767,7 +4767,7 @@ jobs:
             # transfer / traversal NAPI surfaces would otherwise go
             # unlinted — that gap hid a dead-code lint on the transfer
             # stream-id helpers).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers,dataforts,nat-traversal,port-mapping
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers,dataforts,nat-traversal,port-mapping,org
           - name: python
             path: net/crates/net/bindings/python
             # The widest service-free pyo3 surface. `meshdb` /
@@ -4790,7 +4790,7 @@ jobs:
             # this job lints an empty surface while reporting success — the
             # same silent-coverage shape the comments above describe. The
             # `python-tests` build set carries both.
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a,payments,payments-http
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a,payments,payments-http,org
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             # Default features only — the cdylib production build
@@ -4938,7 +4938,7 @@ jobs:
         crate:
           - name: node
             path: net/crates/net/bindings/node
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers,org
           - name: python
             path: net/crates/net/bindings/python
             # `a2a` and `publish` join `payments` here so the paid-A2A
@@ -4952,7 +4952,7 @@ jobs:
             # reported as 17 never-used items (measured). All three together
             # are warning-clean and give the in-crate `#[cfg(test)]` blocks
             # in `src/a2a.rs` / `src/a2a_paid.rs` something to run against.
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,payments,a2a,publish
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,payments,a2a,publish,org
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             features: ""

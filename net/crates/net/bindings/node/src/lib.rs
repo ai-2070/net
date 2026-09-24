@@ -42,7 +42,17 @@ mod cortex;
 // `net_sdk::delegation`; needs the SDK's `net` feature.
 #[cfg(feature = "delegation")]
 mod delegation;
+// napi-rs emits its registration shims under `#[cfg(not(test))]`, so in
+// the lib-test target every `#[napi]`-rooted chain in this module reads
+// as dead (41 dead-code errors with the ffi-clippy row's `org` on). The
+// LIB target's own dead-code pass is the load-bearing gate — it shares
+// this build's reachability except for registration, and it is clean —
+// so every item here is rooted by a real `#[napi]` export. The TS
+// surface is witnessed by `test/org_live.test.ts` (Node bindings job).
+// Scoped to this one module: the ffi-clippy dead-code check stays armed
+// for every other.
 #[cfg(feature = "org")]
+#[cfg_attr(test, allow(dead_code))]
 mod org;
 // Device enrollment (Hermes V2 Phase 1): the invite → join → approve handshake
 // + the operator device-lifecycle facade. Thin wrappers over
@@ -1597,6 +1607,7 @@ mod mesh_bindings {
         /// its `Arc<MeshNode>`, exactly as the plan orders. Empty when
         /// no `subnetExports` were configured.
         #[cfg(feature = "org")]
+        #[cfg_attr(test, allow(dead_code))]
         subnet_exports: Arc<net_sdk::subnet::NamedSubnetExports>,
     }
 
@@ -2574,6 +2585,7 @@ mod mesh_bindings {
         /// (SSDK §3.3) — consumed by `serve_subnet_exported` in
         /// `subnet.rs`. Immutable after construction.
         #[cfg(feature = "org")]
+        #[cfg_attr(test, allow(dead_code))]
         pub(crate) fn subnet_exports_arc(&self) -> Arc<net_sdk::subnet::NamedSubnetExports> {
             self.subnet_exports.clone()
         }
