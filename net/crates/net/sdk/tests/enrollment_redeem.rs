@@ -139,6 +139,7 @@ fn sign_by(
             enrollment_key: key,
             subnet: None,
             org: None,
+            channel: None,
             relations: vec![Relation::Mesh],
             intended_subject: None,
             policy: InvitationPolicy::with_options(now(), Duration::from_secs(3600), mode).unwrap(),

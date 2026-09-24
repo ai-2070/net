@@ -285,6 +285,8 @@ pub async fn run(
                     subnet: Some(args.scope),
                     subnet_rights: args.rights,
                     org: None,
+                    channel: None,
+                    channel_rights: None,
                     standalone: true,
                 }),
                 output,

@@ -791,6 +791,13 @@ pub struct UpArgs {
     /// Generation stamped on delegated subnet credentials.
     #[arg(long, default_value_t = 1)]
     pub subnet_generation: u32,
+
+    /// Root-signed channel grant (from `channel issue-grant`) naming this
+    /// node's enrollment issuer; repeat for several channels. Devices joining with a
+    /// `--channel` invite receive a chain `root → this node → device`
+    /// minted from it. The channel root never sits on this node.
+    #[arg(long = "channel-grant", value_name = "PATH", requires = "enroll")]
+    pub channel_grants: Vec<PathBuf>,
 }
 
 /// `net-mesh down` arguments.
@@ -2096,6 +2103,17 @@ async fn control_session(
         "org_leave" => org_leave(state).await,
         "org_join" if draining => serde_json::json!({ "error": "node is draining" }),
         "org_join" => org_join(state, &request).await,
+        "channel_serve" if draining => serde_json::json!({ "error": "node is draining" }),
+        "channel_serve" => {
+            let (node, root, request) = (
+                state.node.clone(),
+                state.state_root.clone(),
+                request.clone(),
+            );
+            tokio::task::spawn_blocking(move || super::channel::serve_op(&node, &root, &request))
+                .await
+                .unwrap_or_else(|_| serde_json::json!({ "error": "channel serve failed" }))
+        }
         "subnet_join" if draining => serde_json::json!({ "error": "node is draining" }),
         "subnet_join" => subnet_join(state, &request).await,
         "org_floor_forward" if draining => serde_json::json!({ "error": "node is draining" }),
@@ -2453,6 +2471,28 @@ pub async fn run_up(
         .await
         .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
     mesh.start();
+    // Channels served from this state directory (`channel serve`) are gated
+    // again before anything is served; an unreadable record fails closed.
+    for served in super::channel::read_served(&state).map_err(generic)? {
+        super::channel::register_served(mesh.node(), &served)
+            .map_err(|e| generic(format!("served channel {}: {e}", served.channel)))?;
+    }
+    let mut channel_issuers = Vec::new();
+    for path in &args.channel_grants {
+        // `--channel-grant` requires `--enroll`, so the owner exists.
+        let Some(owner) = &enroll_owner else { break };
+        let (name, issuer) = super::channel::load_channel_issuer(path, owner.issuer()).await?;
+        if channel_issuers
+            .iter()
+            .any(|(n, _): &(net::adapter::net::channel::ChannelName, _)| n == &name)
+        {
+            return Err(invalid_args(format!(
+                "two --channel-grant files name channel {}",
+                name.as_str()
+            )));
+        }
+        channel_issuers.push((name, issuer));
+    }
     // An adopted org membership (from `join` / `org join`, or `node adopt`
     // into this state directory) is installed before anything is served.
     let authority_dir = state.join(AUTHORITY_SUBDIR);
@@ -2513,7 +2553,11 @@ pub async fn run_up(
     };
 
     let enrollment = match enroll_owner {
-        Some(owner) => Some(owner.start(&mesh, psk_value, subnet_issuer.clone()).await?),
+        Some(owner) => Some(
+            owner
+                .start(&mesh, psk_value, subnet_issuer.clone(), channel_issuers)
+                .await?,
+        ),
         None => None,
     };
     // A renewed leaf (at start) to persist once the join is mutable again.

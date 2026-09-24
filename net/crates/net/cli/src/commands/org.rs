@@ -580,6 +580,8 @@ pub async fn run(
                     subnet: None,
                     subnet_rights: None,
                     org: Some(args.org),
+                    channel: None,
+                    channel_rights: None,
                     standalone: true,
                 }),
                 output,

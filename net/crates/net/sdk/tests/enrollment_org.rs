@@ -43,6 +43,7 @@ fn spec(relations: Vec<Relation>, org: Option<OrgOffer>, mode: ApprovalMode) -> 
         enrollment_key: EnrollmentKey([5; 32]),
         subnet: None,
         org,
+        channel: None,
         relations,
         intended_subject: None,
         policy: InvitationPolicy::with_options(now(), Duration::from_secs(3600), mode).unwrap(),

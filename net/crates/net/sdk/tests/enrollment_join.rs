@@ -84,6 +84,7 @@ fn invite_for(
             enrollment_key: key,
             subnet: None,
             org: None,
+            channel: None,
             relations: vec![Relation::Mesh],
             intended_subject: None,
             policy: InvitationPolicy::with_options(

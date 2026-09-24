@@ -63,6 +63,7 @@ fn spec(relations: Vec<Relation>, subnet: Option<SubnetOffer>) -> InviteSpec {
         enrollment_key: EnrollmentKey([5; 32]),
         subnet,
         org: None,
+        channel: None,
         relations,
         intended_subject: None,
         policy: InvitationPolicy::with_options(

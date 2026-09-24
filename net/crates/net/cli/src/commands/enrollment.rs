@@ -251,6 +251,14 @@ pub(crate) struct EnrollOwner {
     org: Arc<OrgBook>,
 }
 
+impl EnrollOwner {
+    /// The enrollment issuer identity: it signs invites and receipts, and a
+    /// channel grant (`channel issue-grant --issuer`) must name it.
+    pub(crate) fn issuer(&self) -> &Identity {
+        &self.issuer
+    }
+}
+
 /// How long `up --enroll` waits for the router to answer mapping requests.
 const MAPPING_WAIT: Duration = Duration::from_secs(4);
 
@@ -284,6 +292,7 @@ impl EnrollOwner {
         mesh: &net_sdk::Mesh,
         psk: Psk,
         subnet: Option<net_sdk::enrollment::bundle::SubnetLeafIssuer>,
+        channels: Vec<ChannelIssuer>,
     ) -> Result<RunningEnrollment, CliError> {
         let (tcp_mapping, udp_mapped) = if self.plan.port_mapping {
             let udp = async {
@@ -320,6 +329,7 @@ impl EnrollOwner {
             udp_mapped,
             contacts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             subnet: subnet.clone(),
+            channels: channels.iter().map(|(_, i)| i.clone()).collect(),
             org: self.org.clone(),
         });
         let service = EnrollmentService::bind(
@@ -372,6 +382,8 @@ impl EnrollOwner {
             default_endpoint,
             relay: relay.as_ref().map(|r| r.locator.clone()),
             subnet,
+            channels,
+            channel_configs: mesh.node().channel_configs().cloned(),
             trust_domain,
             domain_name: self.plan.domain_name,
             bundles,
@@ -487,6 +499,15 @@ async fn relay_loop(
     }
 }
 
+fn channel_json(o: &net_sdk::enrollment::invite::ChannelOffer) -> Value {
+    json!({
+        "channel": o.channel.as_str(),
+        "canonical_hash": format!("{:#018x}", o.channel.hash()),
+        "root": hex::encode(o.root.as_bytes()),
+        "rights": super::channel::format_channel_rights(o.rights),
+    })
+}
+
 /// Delivers bundles whose mesh contact matches the paths each token named.
 struct NodeBundles {
     issuer: Identity,
@@ -498,6 +519,8 @@ struct NodeBundles {
     contacts: parking_lot::Mutex<std::collections::HashMap<String, SocketAddr>>,
     /// Delegated subnet leaf issuance, when `up` runs with a subnet issuer.
     subnet: Option<net_sdk::enrollment::bundle::SubnetLeafIssuer>,
+    /// Delegated channel chain issuance (`up --channel-grant`).
+    channels: Vec<net_sdk::channel_issuer::ChannelLeafIssuer>,
     /// Operator-approved org membership certificates.
     org: Arc<OrgBook>,
 }
@@ -608,7 +631,8 @@ impl NodeBundles {
 
     fn issuer_for(&self, contact: MeshContact) -> MembershipIssuer {
         let issuer = MembershipIssuer::new(self.issuer.clone(), self.psk.clone(), contact)
-            .with_org_certs(self.org.stash.clone());
+            .with_org_certs(self.org.stash.clone())
+            .with_channel_issuers(self.channels.clone());
         match &self.subnet {
             Some(subnet) => issuer.with_subnet_issuer(subnet.clone()),
             None => issuer,
@@ -682,6 +706,9 @@ pub(crate) struct EnrollmentReport {
     /// The subnet this node verifies and issues for, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subnet: Option<serde_json::Value>,
+    /// The channels this node mints device chains for (`--channel-grant`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    channels: Vec<serde_json::Value>,
 }
 
 impl RunningEnrollment {
@@ -730,6 +757,18 @@ impl RunningEnrollment {
                     "verifier": true,
                 })
             }),
+            channels: c
+                .channels
+                .iter()
+                .map(|(name, issuer)| {
+                    serde_json::json!({
+                        "channel": name.as_str(),
+                        "root": hex::encode(issuer.root().as_bytes()),
+                        "rights": super::channel::format_channel_rights(issuer.grantable()),
+                        "not_after": issuer.not_after(),
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -746,6 +785,12 @@ impl RunningEnrollment {
     }
 }
 
+/// One channel grant this node issues from, with the channel it names.
+pub(crate) type ChannelIssuer = (
+    net::adapter::net::channel::ChannelName,
+    net_sdk::channel_issuer::ChannelLeafIssuer,
+);
+
 /// State the node's control endpoint uses for `invite_*` operations.
 pub(crate) struct EnrollContext {
     issuer: Identity,
@@ -754,6 +799,11 @@ pub(crate) struct EnrollContext {
     default_endpoint: Option<EnrollmentEndpoint>,
     relay: Option<RelayLocator>,
     subnet: Option<net_sdk::enrollment::bundle::SubnetLeafIssuer>,
+    /// Channel grants this node mints device chains from.
+    channels: Vec<ChannelIssuer>,
+    /// The live node's channel registry (a subscribe invite needs the
+    /// channel served here, trusting the grant's root).
+    channel_configs: Option<Arc<net::adapter::net::channel::ChannelConfigRegistry>>,
     trust_domain: TrustDomainId,
     domain_name: String,
     bundles: Arc<NodeBundles>,
@@ -874,6 +924,17 @@ impl EnrollContext {
         if org.is_some() {
             relations.push(Relation::Org);
         }
+        let channel = match request["channel"].as_str() {
+            None => None,
+            Some(_) if standalone => {
+                return Err("a channel link rides with mesh membership, not standalone".to_string())
+            }
+            Some(name) => {
+                let offer = self.channel_offer(name, request["channel_rights"].as_str())?;
+                relations.push(Relation::Channel);
+                Some(offer)
+            }
+        };
         let policy = InvitationPolicy::with_options(now, ttl, mode).map_err(|e| e.to_string())?;
         let invite = MembershipInvite::sign(
             &self.issuer,
@@ -885,6 +946,7 @@ impl EnrollContext {
                 enrollment_key: self.key,
                 subnet: subnet.clone(),
                 org,
+                channel: channel.clone(),
                 relations,
                 intended_subject: intended,
                 policy,
@@ -914,6 +976,7 @@ impl EnrollContext {
                         "topology_epoch": o.topology_epoch,
                     })),
                     "standalone": standalone,
+                    "channel": channel.as_ref().map(channel_json),
                 }),
             )
             .map_err(|e| format!("offer relation record: {e}"))?;
@@ -931,8 +994,73 @@ impl EnrollContext {
             })),
             "standalone": standalone,
             "org": org.as_ref().map(|o| hex::encode(o.org.0)),
+            "channel": channel.as_ref().map(channel_json),
             "issuer_fingerprint": invite.issuer_fingerprint(),
         }))
+    }
+
+    /// The channel offer for `invite create --channel`: this node must hold a
+    /// grant for exactly that canonical channel covering the rights, and a
+    /// subscribe right needs the channel served HERE trusting the grant's
+    /// root (this node is the publisher a subscribing device is sent to).
+    /// A publish right installs nothing here: the device's own runtime must
+    /// trust the root before it can publish.
+    fn channel_offer(
+        &self,
+        name: &str,
+        rights: Option<&str>,
+    ) -> Result<net_sdk::enrollment::invite::ChannelOffer, String> {
+        let channel = net::adapter::net::channel::ChannelName::new(name)
+            .map_err(|e| format!("channel `{name}`: {e}"))?;
+        let rights = super::channel::parse_channel_rights(
+            rights.ok_or("--channel needs --channel-rights (publish and/or subscribe)")?,
+        )
+        .map_err(|e| e.to_string())?;
+        let (_, issuer) = self
+            .channels
+            .iter()
+            .find(|(n, _)| n == &channel)
+            .ok_or_else(|| {
+                format!(
+                    "this node has no grant for channel {}; start it with --channel-grant \
+                     (from `channel issue-grant`)",
+                    channel.as_str()
+                )
+            })?;
+        let offer = net_sdk::enrollment::invite::ChannelOffer {
+            channel: channel.clone(),
+            root: issuer.root().clone(),
+            rights,
+        };
+        if !issuer.covers(&offer) {
+            return Err(format!(
+                "{} on {} is outside this node's grant (at most {})",
+                super::channel::format_channel_rights(rights),
+                channel.as_str(),
+                super::channel::format_channel_rights(issuer.grantable()),
+            ));
+        }
+        if rights.contains(net::adapter::net::identity::TokenScope::SUBSCRIBE) {
+            let served = self.channel_configs.as_ref().is_some_and(|registry| {
+                registry
+                    .get_by_name(channel.as_str())
+                    .is_some_and(|config| {
+                        config.channel_id.name() == &channel
+                            && config.token_roots.contains(issuer.root())
+                    })
+            });
+            if !served {
+                return Err(format!(
+                    "a subscribe link needs {} served here trusting root {}; run \
+                     `net-mesh channel serve {} --token-root {}` first",
+                    channel.as_str(),
+                    hex::encode(issuer.root().as_bytes()),
+                    channel.as_str(),
+                    hex::encode(issuer.root().as_bytes()),
+                ));
+            }
+        }
+        Ok(offer)
     }
 
     fn status(&self, request: &Value) -> Result<Value, String> {
@@ -1308,6 +1436,15 @@ pub struct CreateArgs {
     /// membership for exactly the claiming device.
     #[arg(long, value_name = "ORG")]
     pub org: Option<String>,
+    /// Also give the device a credential on this canonical channel, minted
+    /// at redemption from this node's `--channel-grant` for it.
+    #[arg(long, value_name = "NAME", requires = "channel_rights")]
+    pub channel: Option<String>,
+    /// Rights for `--channel`: `publish`, `subscribe` or `publish,subscribe`.
+    /// Subscribe sends the device to THIS node as the publisher, so the
+    /// channel must be served here (`channel serve`) trusting the root.
+    #[arg(long, value_name = "RIGHTS", requires = "channel")]
+    pub channel_rights: Option<String>,
     /// A standalone link (`subnet invite` / `org invite`): one relation
     /// only, for a device already on the mesh.
     #[arg(skip)]
@@ -1415,6 +1552,12 @@ pub async fn run_invite(
                 parse_org_id(org).map_err(invalid_args)?;
                 request["org"] = json!(org.trim_start_matches("0x"));
             }
+            if let (Some(channel), Some(rights)) = (&args.channel, &args.channel_rights) {
+                super::channel::parse_channel_name(channel)?;
+                super::channel::parse_channel_rights(rights)?;
+                request["channel"] = json!(channel);
+                request["channel_rights"] = json!(rights);
+            }
             let mut reply = node_request(args.state_dir, profile_name, request).await?;
             if reply["bearer"] == Value::Bool(true) {
                 eprintln!(
@@ -1460,6 +1603,7 @@ pub async fn run_invite(
                     "scope": super::subnet::format_subnet(o.scope.path),
                     "rights": super::subnet::format_subnet_rights(o.rights),
                 })),
+                "channel": invite.channel().map(channel_json),
                 "enrollment_key": hex::encode(invite.enrollment_key().0),
                 "domain_name": invite.trust_domain_name(),
                 "trust_domain": invite.trust_domain().to_string(),
@@ -1862,6 +2006,13 @@ pub async fn run_join(
                 "rights": super::subnet::format_subnet_rights(o.rights),
                 "credentials": "installed",
             })),
+            // Stored; the device's runtime uses it from `up` (subscribe
+            // needs the publisher's ACK, publish needs local trust).
+            "channel": invite.channel().map(|o| {
+                let mut v = channel_json(o);
+                v["credential"] = json!("stored");
+                v
+            }),
             "org": org,
             "installed": true,
             "attached": true,

@@ -58,6 +58,7 @@ const INTENT_DIGEST_CONTEXT: &str = "net-mesh membership redemption intent v1";
 const TAG_MESH: u8 = 1;
 const TAG_SUBNET: u8 = 2;
 const TAG_ORG: u8 = 3;
+const TAG_CHANNEL: u8 = 4;
 
 /// Payload-free invite/intent failures. None echoes bearer material.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -105,9 +106,8 @@ impl From<PolicyError> for InviteError {
 
 /// One independently authorized relation an invitation may grant.
 ///
-/// Mesh membership, subnet attachment and organization membership are
-/// defined; channel relations arrive with their own verifier and tag.
-/// Unknown tags are refused.
+/// Mesh membership, subnet attachment, organization membership and channel
+/// credentials are defined. Unknown tags are refused.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Relation {
@@ -125,6 +125,12 @@ pub enum Relation {
     /// capability or management right. Always operator-approved, because
     /// only the offline org root can sign the certificate.
     Org,
+    /// Publish and/or subscribe on one canonical channel, named by the
+    /// invite's signed [`ChannelOffer`], delivered as a token chain
+    /// `root → issuing node → device` minted for this device only. In v1 it
+    /// rides with [`Relation::Mesh`] (the device needs the mesh to use it),
+    /// and a subscribe right names the issuing node as the publisher.
+    Channel,
 }
 
 impl Relation {
@@ -133,6 +139,7 @@ impl Relation {
             Self::Mesh => TAG_MESH,
             Self::Subnet => TAG_SUBNET,
             Self::Org => TAG_ORG,
+            Self::Channel => TAG_CHANNEL,
         }
     }
 
@@ -141,6 +148,7 @@ impl Relation {
             TAG_MESH => Some(Self::Mesh),
             TAG_SUBNET => Some(Self::Subnet),
             TAG_ORG => Some(Self::Org),
+            TAG_CHANNEL => Some(Self::Channel),
             _ => None,
         }
     }
@@ -414,6 +422,106 @@ fn check_org_offer(
     Ok(())
 }
 
+/// The channel credential an invite offers (with [`Relation::Channel`]):
+/// one canonical channel, the token root its chain anchors at, and the
+/// rights the device's leaf will carry (publish and/or subscribe, never
+/// more). Signed with the rest of the invite.
+///
+/// The encoding carries the canonical `u64` channel hash next to the name;
+/// decoding refuses a hash that is not the name's, so a policy is never
+/// keyed by the name's `u16` wire hint or by a hash the name does not own.
+/// With a subscribe right the publisher is the issuing node (the invite's
+/// issuer, reached at the bundle's contact): the subscribe ACK is a routing
+/// fact about that node, not a proof of its full identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelOffer {
+    /// The canonical channel.
+    pub channel: net::adapter::net::channel::ChannelName,
+    /// The token root the delivered chain anchors at.
+    pub root: EntityId,
+    /// Rights the device's leaf carries: a non-empty subset of
+    /// publish/subscribe.
+    pub rights: net::adapter::net::identity::TokenScope,
+}
+
+impl ChannelOffer {
+    /// Whether `rights` is a non-empty subset of publish/subscribe.
+    pub fn rights_are_channel_link(rights: net::adapter::net::identity::TokenScope) -> bool {
+        rights.bits() != 0 && crate::channel_issuer::CHANNEL_LINK_RIGHTS.contains(rights)
+    }
+}
+
+fn put_channel_offer(out: &mut Vec<u8>, offer: Option<&ChannelOffer>) {
+    match offer {
+        Some(o) => {
+            out.push(1);
+            super::push_lp(out, o.channel.as_str().as_bytes());
+            out.extend_from_slice(&o.channel.hash().to_le_bytes());
+            out.extend_from_slice(o.root.as_bytes());
+            // Bounded: channel-link rights fit in the low byte.
+            out.push(o.rights.bits() as u8);
+        }
+        None => out.push(0),
+    }
+}
+
+fn take_channel_offer(r: &mut Reader<'_>) -> Result<Option<ChannelOffer>, InviteError> {
+    let t = InviteError::Malformed("truncated");
+    match r.take_arr::<1>().ok_or(t.clone())?[0] {
+        0 => Ok(None),
+        1 => {
+            let name = r
+                .take_lp_string()
+                .ok_or(InviteError::Malformed("bad channel name"))?;
+            let channel = net::adapter::net::channel::ChannelName::new(&name)
+                .map_err(|_| InviteError::Malformed("bad channel name"))?;
+            let hash = u64::from_le_bytes(r.take_arr::<8>().ok_or(t.clone())?);
+            if hash != channel.hash() {
+                return Err(InviteError::Malformed("channel hash is not the name's"));
+            }
+            let root = EntityId::from_bytes(r.take_arr::<32>().ok_or(t.clone())?);
+            let rights = net::adapter::net::identity::TokenScope::from_bits(u32::from(
+                r.take_arr::<1>().ok_or(t)?[0],
+            ));
+            if !ChannelOffer::rights_are_channel_link(rights) {
+                return Err(InviteError::Malformed("bad channel rights"));
+            }
+            Ok(Some(ChannelOffer {
+                channel,
+                root,
+                rights,
+            }))
+        }
+        _ => Err(InviteError::Malformed("bad channel offer flag")),
+    }
+}
+
+/// A channel offer exists exactly when the relation set names
+/// [`Relation::Channel`]; in v1 it rides with [`Relation::Mesh`], and its
+/// rights are publish and/or subscribe only.
+fn check_channel_offer(
+    relations: &[Relation],
+    offer: Option<&ChannelOffer>,
+) -> Result<(), InviteError> {
+    let channel = relations.contains(&Relation::Channel);
+    if channel != offer.is_some() {
+        return Err(InviteError::Relations(
+            "channel relation and offer disagree",
+        ));
+    }
+    if channel && !relations.contains(&Relation::Mesh) {
+        return Err(InviteError::Relations(
+            "a channel relation rides with mesh membership",
+        ));
+    }
+    if offer.is_some_and(|o| !ChannelOffer::rights_are_channel_link(o.rights)) {
+        return Err(InviteError::Relations(
+            "channel rights are publish and/or subscribe",
+        ));
+    }
+    Ok(())
+}
+
 /// X25519 Noise static public key of the enrollment responder. The device runs a
 /// PSK-free Noise handshake that authenticates the responder by this key, so a
 /// clean device can reach the issuer before holding the mesh PSK. Not secret.
@@ -446,6 +554,9 @@ pub struct InviteSpec {
     /// The organization offered; required exactly when `relations` names
     /// [`Relation::Org`].
     pub org: Option<OrgOffer>,
+    /// The channel credential offered; required exactly when `relations`
+    /// names [`Relation::Channel`].
+    pub channel: Option<ChannelOffer>,
     /// Exact authorized relations (canonical order).
     pub relations: Vec<Relation>,
     /// Optional full device identity; `None` makes the link bearer authorization.
@@ -465,6 +576,7 @@ pub struct MembershipInvite {
     enrollment_key: EnrollmentKey,
     subnet: Option<SubnetOffer>,
     org: Option<OrgOffer>,
+    channel: Option<ChannelOffer>,
     invitation_id: InvitationId,
     policy: InvitationPolicy,
     intended_subject: Option<EntityId>,
@@ -484,6 +596,7 @@ impl core::fmt::Debug for MembershipInvite {
             .field("relay", &self.relay)
             .field("subnet", &self.subnet)
             .field("org", &self.org)
+            .field("channel", &self.channel)
             .field("enrollment_key", &self.enrollment_key)
             .field("invitation_id", &"<redacted>")
             .field("policy", &self.policy)
@@ -513,6 +626,7 @@ impl MembershipInvite {
             spec.org.as_ref(),
             spec.policy.approval_mode(),
         )?;
+        check_channel_offer(&spec.relations, spec.channel.as_ref())?;
         let invitation_id = InvitationId::random().map_err(|_| InviteError::Random)?;
         let mut body = Vec::new();
         body.extend_from_slice(&INVITE_MAGIC);
@@ -523,6 +637,7 @@ impl MembershipInvite {
         put_relay(&mut body, spec.relay.as_ref());
         put_subnet_offer(&mut body, spec.subnet.as_ref());
         put_org_offer(&mut body, spec.org.as_ref());
+        put_channel_offer(&mut body, spec.channel.as_ref());
         body.extend_from_slice(&spec.enrollment_key.0);
         body.extend_from_slice(invitation_id.as_bytes());
         body.extend_from_slice(&spec.policy.created_at().to_le_bytes());
@@ -553,6 +668,7 @@ impl MembershipInvite {
             enrollment_key: spec.enrollment_key,
             subnet: spec.subnet,
             org: spec.org,
+            channel: spec.channel,
             invitation_id,
             policy: spec.policy,
             intended_subject: spec.intended_subject,
@@ -591,6 +707,7 @@ impl MembershipInvite {
         }
         let subnet = take_subnet_offer(&mut r)?;
         let org = take_org_offer(&mut r)?;
+        let channel = take_channel_offer(&mut r)?;
         let enrollment_key = EnrollmentKey(r.take_arr::<32>().ok_or(t.clone())?);
         let invitation_id = InvitationId::from_bytes(r.take_arr::<16>().ok_or(t.clone())?);
         let created = r.take_u64().ok_or(t.clone())?;
@@ -610,6 +727,7 @@ impl MembershipInvite {
         let relations = take_relations(&mut r)?;
         check_subnet_offer(&relations, subnet.as_ref())?;
         check_org_offer(&relations, org.as_ref(), mode)?;
+        check_channel_offer(&relations, channel.as_ref())?;
         if !r.done() {
             return Err(InviteError::Malformed("trailing bytes"));
         }
@@ -627,6 +745,7 @@ impl MembershipInvite {
             enrollment_key,
             subnet,
             org,
+            channel,
             invitation_id,
             policy,
             intended_subject,
@@ -711,6 +830,11 @@ impl MembershipInvite {
     /// The organization offered, with [`Relation::Org`].
     pub fn org(&self) -> Option<&OrgOffer> {
         self.org.as_ref()
+    }
+
+    /// The channel credential offered, with [`Relation::Channel`].
+    pub fn channel(&self) -> Option<&ChannelOffer> {
+        self.channel.as_ref()
     }
 
     /// Blind relay to fall back to when the direct endpoint is unreachable.

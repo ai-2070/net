@@ -2876,6 +2876,92 @@ Gates:
 core delegation variant, which is not in scope. Revoking one device is by
 revocation, not by expiry.
 
+**C2 receipt (2026-09-24).**
+
+SDK:
+- **`Relation::Channel` (tag 4)** carries a signed `ChannelOffer { channel,
+  root, rights }`. The wire form holds the canonical name, its `u64` hash,
+  the root and a rights byte.
+  - Decode refuses a hash that is not the name's.
+  - The rights are a non-empty subset of publish/subscribe.
+  - The relation and the offer come together or not at all.
+  - In v1 it rides with `Relation::Mesh`; a standalone channel link is not
+    offered yet.
+- **`MembershipBundle` carries the chain.** `verify_for` goes through
+  `channel_chain_matches`. The chain must be anchored at the offered root,
+  verify link by link for every offered right on the offered channel, and
+  have a leaf with exactly the offered rights for the intent's subject.
+  Otherwise the bundle is refused: a missing chain, a stray chain, the leaf
+  alone, a wider leaf, or another device's chain.
+- **Minting.** `MembershipIssuer::with_channel_issuers` mints only from an
+  issuer that `covers` the offer (same root, same `u64` channel, rights
+  within the grant); otherwise the result is `Refusal::Unavailable`. The
+  committed bundle is what lost-response recovery returns, so a retry gets
+  the same chain.
+
+CLI:
+- `channel issue-grant --root-identity <operator identity> --issuer <enrollment
+  issuer> --channel <name> [--rights] [--ttl] --out` runs offline. It writes
+  `{kind: channel-grant, channel, grant_hex}`. There is no secret in it, and
+  it refuses to overwrite without `--force`.
+- `up --enroll --channel-grant <file>` (repeatable) loads the grant for the
+  **enrollment issuer**. That key is distinct from the node's mesh
+  identity, so the chain is `root → enrollment issuer → device`.
+  - Start is refused when the grant names another identity, or when the file's
+    name does not match its signed hash.
+  - `up` reports `enrollment.channels`.
+- `channel serve <name> --token-root <ENTITY>…` is a control op
+  (`channel_serve`). It persists `<state>/channels.json` and registers the
+  gated config live. Every `up` re-registers it. A corrupt record fails the
+  start closed.
+- `invite create --channel <name> --channel-rights publish|subscribe|both`:
+  - requires a grant for exactly that canonical channel covering the rights;
+  - for subscribe, also requires the channel to be served here with that
+    exact name and the grant's root among its token roots, because this
+    node is the publisher the device is sent to;
+  - publish installs nothing here.
+- `invite inspect` and `join` report the channel. `join` reports
+  `credential: stored`, because live use is C3.
+
+Witnesses:
+- `sdk/tests/enrollment_channel.rs` (4 tests):
+  - the offer is signed and canonical (hash swap, rights widening,
+    relation/mesh rules);
+  - redemption mints exactly the offered chain;
+  - the device accepts only the offered chain for itself;
+  - two names sharing a `u16` wire hint never stand in for each other.
+- `cli/tests/channel_join.rs` (2 tests; auto-discovered by the CLI job):
+  - the full ceremony: learn the issuer, grant offline, grant loaded;
+  - subscribe is refused until served under the right root;
+  - no grant for another channel; rights are explicit;
+  - the device joins with a verified chain; publish needs no serving;
+  - serving survives a restart; a corrupt record fails closed;
+  - a grant for another identity, or with an edited channel name, is
+    refused at start.
+
+Inverse mutations, all RED (11):
+
+| # | Mutation |
+|---|---|
+| 1 | Decode skips the hash check |
+| 2 | Channel without mesh |
+| 3 | Device accepts any chain |
+| 4 | Leaf rights not exact |
+| 5 | Issuer ignores `covers` |
+| 6 | `covers` ignores the channel |
+| 7 | Subscribe needs no serve |
+| 8 | Serve check ignores the root |
+| 9 | Corrupt served record ignored |
+| 10 | Served channels not re-registered at `up` |
+| 11 | Grant name not checked |
+
+Gates:
+- CLI clippy `--all-targets`;
+- SDK clippy: default, `full` and the CI features;
+- rustdoc: SDK `full` and net-cli;
+- SDK suite 829/829; CLI 362/362.
+- Core is unchanged in C2.
+
 ### V3-2B — voluntary leave through the same lifecycle
 
 **Modify:** shared SDK enrollment/persistence/lifecycle modules selected in V3-1/2A; CLI `enrollment.rs`, `org.rs`, `channel.rs`, `subnet.rs`, `config.rs` and relevant runtime adapters.

@@ -30,6 +30,7 @@ fn spec(intended: Option<EntityId>, mode: ApprovalMode) -> InviteSpec {
         enrollment_key: EnrollmentKey([3; 32]),
         subnet: None,
         org: None,
+        channel: None,
         relations: vec![Relation::Mesh],
         intended_subject: intended,
         policy: InvitationPolicy::with_options(T0, Duration::from_secs(86_400), mode).unwrap(),

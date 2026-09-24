@@ -150,6 +150,7 @@ impl Device {
                 enrollment_key: self.service.enrollment_key(),
                 subnet: None,
                 org: None,
+                channel: None,
                 relations: vec![Relation::Mesh],
                 intended_subject: None,
                 policy: InvitationPolicy::with_options(

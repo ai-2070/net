@@ -228,6 +228,9 @@ pub struct MembershipBundle {
     /// The org's shared owner audience (encoded), when the operator supplied
     /// it at approval. **Secret**: it opens the org's private announcements.
     org_audience: Option<Vec<u8>>,
+    /// Encoded `TokenChain` (root → issuing node → device) for
+    /// [`Relation::Channel`] invites.
+    channel: Option<Vec<u8>>,
 }
 
 impl core::fmt::Debug for MembershipBundle {
@@ -243,6 +246,7 @@ impl core::fmt::Debug for MembershipBundle {
                 "org_audience",
                 &self.org_audience.as_ref().map(|_| "<redacted>"),
             )
+            .field("channel", &self.channel.is_some())
             .finish()
     }
 }
@@ -257,7 +261,21 @@ impl MembershipBundle {
             subnet: None,
             org: None,
             org_audience: None,
+            channel: None,
         }
+    }
+
+    /// Attach the device's channel token chain (for a channel invite).
+    pub fn with_channel_chain(mut self, chain: &net::adapter::net::identity::TokenChain) -> Self {
+        self.channel = Some(chain.to_bytes());
+        self
+    }
+
+    /// The delivered channel token chain, if this bundle carries one.
+    pub fn channel_chain(&self) -> Option<net::adapter::net::identity::TokenChain> {
+        self.channel
+            .as_deref()
+            .and_then(|b| net::adapter::net::identity::TokenChain::from_bytes(b).ok())
     }
 
     /// Attach the org's shared owner audience (with an org membership).
@@ -343,6 +361,13 @@ impl MembershipBundle {
             Some(audience) => {
                 out.push(1);
                 push_lp(&mut out, audience);
+            }
+            None => out.push(0),
+        }
+        match &self.channel {
+            Some(chain) => {
+                out.push(1);
+                push_lp(&mut out, chain);
             }
             None => out.push(0),
         }
@@ -433,6 +458,22 @@ impl MembershipBundle {
             }
             _ => return Err(BundleError::Malformed("bad org audience flag")),
         };
+        let channel = match r
+            .take_arr::<1>()
+            .ok_or(BundleError::Malformed("truncated bundle"))?[0]
+        {
+            0 => None,
+            1 => {
+                let bytes = r
+                    .take_lp()
+                    .ok_or(BundleError::Malformed("truncated bundle"))?
+                    .to_vec();
+                net::adapter::net::identity::TokenChain::from_bytes(&bytes)
+                    .map_err(|_| BundleError::Malformed("bad channel chain"))?;
+                Some(bytes)
+            }
+            _ => return Err(BundleError::Malformed("bad channel flag")),
+        };
         if !r.done() {
             return Err(BundleError::Malformed("trailing bundle bytes"));
         }
@@ -448,6 +489,7 @@ impl MembershipBundle {
             subnet,
             org,
             org_audience,
+            channel,
         })
     }
 
@@ -463,6 +505,7 @@ impl MembershipBundle {
             .check_trust_domain(self.psk.trust_domain())
             .map_err(|_| BundleError::TrustDomain)?;
         self.verify_subnet_for(invite, intent)?;
+        self.verify_channel_for(invite, intent)?;
         match (invite.org(), &self.org) {
             (None, None) => {}
             (Some(offer), Some(cert)) if org_cert_matches(offer, intent.subject(), cert) => {}
@@ -511,6 +554,28 @@ impl MembershipBundle {
         }
     }
 
+    /// The delivered channel chain must be exactly what the signed offer
+    /// names, for exactly this device: anchored at the offered root, scoped
+    /// to the offered channel, verifying link by link for every offered
+    /// right, and with a leaf carrying exactly the offered rights for the
+    /// intent's subject. A channel invite's bundle without one, or a chain
+    /// on any other invite, is refused.
+    fn verify_channel_for(
+        &self,
+        invite: &MembershipInvite,
+        intent: &RedemptionIntent,
+    ) -> Result<(), BundleError> {
+        match (invite.channel(), self.channel_chain(), &self.channel) {
+            (None, None, None) => Ok(()),
+            (Some(offer), Some(chain), Some(_))
+                if channel_chain_matches(offer, intent.subject(), &chain) =>
+            {
+                Ok(())
+            }
+            _ => Err(BundleError::Mismatch("channel chain")),
+        }
+    }
+
     /// The signed membership receipt.
     pub fn receipt(&self) -> &MembershipReceipt {
         &self.receipt
@@ -535,6 +600,7 @@ pub struct MembershipIssuer {
     contact: MeshContact,
     subnet: Option<SubnetLeafIssuer>,
     org: Option<std::sync::Arc<dyn OrgCertSource>>,
+    channels: Vec<crate::channel_issuer::ChannelLeafIssuer>,
 }
 
 /// Delegated subnet leaf issuance for [`Relation::Subnet`] invites: an
@@ -655,7 +721,18 @@ impl MembershipIssuer {
             contact,
             subnet: None,
             org: None,
+            channels: Vec::new(),
         }
+    }
+
+    /// Also mint channel chains for [`Relation::Channel`] invites, from
+    /// these root grants (one per channel).
+    pub fn with_channel_issuers(
+        mut self,
+        issuers: Vec<crate::channel_issuer::ChannelLeafIssuer>,
+    ) -> Self {
+        self.channels = issuers;
+        self
     }
 
     /// Deliver operator-approved org membership certificates for
@@ -689,6 +766,44 @@ pub fn org_cert_matches(
 ) -> bool {
     cert.org_id == offer.org && &cert.member == subject && cert.verify().is_ok()
 }
+
+/// Is `chain` exactly the offered channel credential for `subject`: it
+/// anchors at the offered root, verifies link by link for every offered
+/// right on the offered channel, and its leaf carries exactly the offered
+/// rights (no more, no less) for `subject`?
+pub fn channel_chain_matches(
+    offer: &super::invite::ChannelOffer,
+    subject: &EntityId,
+    chain: &net::adapter::net::identity::TokenChain,
+) -> bool {
+    use net::adapter::net::identity::{RevocationRegistry, TokenScope};
+    let Some(leaf) = chain.tokens.last() else {
+        return false;
+    };
+    if &leaf.subject != subject || leaf.scope != offer.rights {
+        return false;
+    }
+    let revocation = RevocationRegistry::new();
+    let roots = [offer.root.clone()];
+    [TokenScope::PUBLISH, TokenScope::SUBSCRIBE]
+        .into_iter()
+        .filter(|right| offer.rights.contains(*right))
+        .all(|right| {
+            chain
+                .verify_authorizes(
+                    right,
+                    offer.channel.hash(),
+                    subject,
+                    &roots,
+                    &revocation,
+                    CHANNEL_CLOCK_SKEW_SECS,
+                )
+                .is_ok()
+        })
+}
+
+/// Clock skew tolerated when a device checks a freshly minted chain.
+const CHANNEL_CLOCK_SKEW_SECS: u64 = 60;
 
 /// Where an issuing node finds the membership certificate the operator
 /// signed, with the offline org root, when approving one exact claim.
@@ -748,6 +863,18 @@ impl BundleIssuer for MembershipIssuer {
             if let Some(audience) = audience {
                 bundle = bundle.with_org_audience(&audience);
             }
+        }
+        if let Some(offer) = invite.channel() {
+            // Minted only under a root grant covering exactly this offer;
+            // without one the invite cannot be honoured.
+            let chain = self
+                .channels
+                .iter()
+                .find(|issuer| issuer.covers(offer))
+                .ok_or(Refusal::Unavailable)?
+                .issue(intent.subject(), offer.rights)
+                .map_err(|_| Refusal::Unavailable)?;
+            bundle = bundle.with_channel_chain(&chain);
         }
         Ok(bundle.to_bytes())
     }

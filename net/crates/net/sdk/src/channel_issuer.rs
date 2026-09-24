@@ -95,6 +95,15 @@ impl ChannelLeafIssuer {
         self.grant.scope.intersect(CHANNEL_LINK_RIGHTS)
     }
 
+    /// Whether this issuer can mint exactly `offer`: the same root and
+    /// canonical channel, and rights within the grant.
+    pub fn covers(&self, offer: &crate::enrollment::invite::ChannelOffer) -> bool {
+        &offer.root == self.root()
+            && offer.channel.hash() == self.channel_hash()
+            && crate::enrollment::invite::ChannelOffer::rights_are_channel_link(offer.rights)
+            && self.grantable().contains(offer.rights)
+    }
+
     /// When every leaf expires (the grant's own expiry).
     pub fn not_after(&self) -> u64 {
         self.grant.not_after
