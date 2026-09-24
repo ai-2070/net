@@ -44,7 +44,7 @@ The reply-channel-per-caller convention keeps subscriptions cheap: a server hold
 
 If both ends are in your control AND you want a return value, pick nRPC. The bus has no return-value mechanism — folding it in via "two channels + correlation id" is exactly what nRPC does, except already implemented with deadlines, cancellation, and resilience helpers.
 
-**If only certain organizations may call the service**, you want `serve_org` / `mesh.org(..).call(..)` rather than `serve_rpc` plus a hand-rolled gate — same nRPC transport, but with an offline-issued per-call admission proof and an announcement encrypted to an audience. Read `org.md` before writing that yourself. **And if the provider additionally sits inside a protected subnet** and must be reachable from outside its boundary, that is `serve_subnet_exported` / `org.call_exported` — still nRPC underneath, still org admission, plus a live gateway-authority check on the exported crossing. Read `subnet-auth.md`.
+**If only certain organizations may call the service**, you want `serve_org` / `mesh.org(..).call(..)` rather than `serve_rpc` plus a hand-rolled gate — same nRPC transport, but with an offline-issued per-call admission proof and an announcement encrypted to an audience. The protected facade carries the same four shapes: `call_streaming` / `call_client_stream` / `call_duplex` against `serve_org_streaming` / `serve_org_client_stream` / `serve_org_duplex` (`OrgStream` / `OrgClientStreamCall` / `OrgDuplexCall` handles). Beyond the shared proof, a protected **streaming** call has a distinct lifetime rule — its deadline is finite by contract, and `deadline_ms == 0` means the facade's 300 s default rather than "no deadline" (the unary verb is unbounded at `0`) — and a streaming proof additionally binds the exact receiving Noise session, so an opening captured on one session cannot be replayed on another. Read `org.md` before writing that yourself. **And if the provider additionally sits inside a protected subnet** and must be reachable from outside its boundary, that is `serve_subnet_exported` / `org.call_exported` — still nRPC underneath, still org admission, plus a live gateway-authority check on the exported crossing. Read `subnet-auth.md`.
 
 ---
 
@@ -86,7 +86,7 @@ Each binding ships a `classifyError(e)` / `classify_error(e)` helper that maps a
 
 ## The four call shapes
 
-One wire, one typed surface, four shapes. The skill's examples below are unary; the other three layer on the same primitive and ship across Rust, Node, Python (sync + async), and Go with the same wire contract.
+One wire, one typed surface, four shapes. The skill's examples below are unary; the other three layer on the same primitive and ship across Rust, Node, Python (sync + async), Go, and C with the same wire contract.
 
 | Shape | Serve | Call | When |
 |---|---|---|---|
@@ -591,7 +591,7 @@ True subprocess-based interop (Node caller → Rust server, Python caller → Ru
 - **Go C-ABI** — `net/crates/net/bindings/go/rpc-ffi/src/lib.rs` (cdylib), `net/crates/net/bindings/go/net/mesh_rpc.go` (reference cgo wrapper), `net/crates/net/bindings/go/net/resilience.go` (pure-Go resilience helpers).
 - **Cross-binding contract** — `net/crates/net/tests/cross_lang_nrpc/golden_vectors.json` (shared fixture), the three binding compat tests (paths above).
 - **Tool discovery + `tool.watch`** — `net/crates/net/sdk/src/tool.rs` (`list_tools` / `watch_tools` / `serve_tool_watch`), `net/crates/net/src/adapter/net/cortex/tool.rs` (`TOOL_WATCH_SERVICE`, `WatchToolsRequest`, `ToolWatchFrame`).
-- **Org-protected calls** — `net_sdk::mesh_rpc::OrgProofIntent` on `CallOptions` is the low-level seam under `mesh.org(..).call(..)`; use it when you need an exact provider, a specific grant, or an unusual proof TTL. See `org.md`.
+- **Org-protected calls** — `net_sdk::mesh_rpc::OrgProofIntent` on `CallOptions` is the low-level seam under `mesh.org(..).call(..)` (the unary verb); under the streaming verbs the seam is the streaming proof value, which carries the call kind and the session binding rather than the unary proof's shape-agnostic fields. The session binding is a precondition there, not a knob: a streaming opening is only admitted when the proof's binding equals the Noise handshake hash of the receiving session, so a hand-built session admits no protected stream at all. Use either seam when you need an exact provider, a specific grant, or an unusual proof TTL. See `org.md`.
 - **READMEs** — `README.md` § nRPC (top-level concept + cross-binding spec); per-binding READMEs each have an `## nRPC` section with language-idiomatic examples.
 
 ## Further reading

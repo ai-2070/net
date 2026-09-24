@@ -58,7 +58,7 @@ All multi-byte integers are little-endian. The total header is 68 bytes; the pay
 | `SUBPROTOCOL_ID`  | 2     | u16     | Identifies how the payload is interpreted. See [subprotocol-ids](/docs/reference/subprotocol-ids). |
 | `CHANNEL_HASH`    | 2     | u16     | xxh3-truncated hash of the channel name. Used for wire-speed authz.           |
 | `NONCE`           | 12    | bytes   | AEAD nonce (counter-based).                                                   |
-| `SESSION_ID`      | 8     | u64     | Identifies the encrypted session.                                             |
+| `SESSION_ID`      | 8     | u64     | The session *name* — the first eight bytes of the Noise handshake hash.       |
 | `STREAM_ID`       | 8     | u64     | Identifies the stream within the session.                                     |
 | `SEQUENCE`        | 8     | u64     | Per-stream sequence number.                                                   |
 | `ORIGIN_HASH`     | 8     | u64     | Full 64-bit BLAKE2s-MAC of sender's ed25519 pubkey (`EntityKeypair::origin_hash()`). Maps unambiguously to the publisher's `NodeId` via `origin_hash_to_node` — even under adversarial collision-grinding (~2^32 work per target). |
@@ -109,17 +109,36 @@ When two peers can't talk directly, `MeshNode::connect_via(relay_addr, dest_pubk
 
 ## Session keys
 
-After a successful handshake, each direction has its own key:
+After a successful handshake, each direction has its own key, plus the session's
+name and the material for the route-hop keys:
 
 ```rust
 pub struct SessionKeys {
     pub tx_key: [u8; 32],
     pub rx_key: [u8; 32],
     pub session_id: u64,
+    pub remote_static_pub: [u8; 32],
+    pub route_hop_tx_key: [u8; 32],
+    pub route_hop_rx_key: [u8; 32],
 }
 ```
 
-`PacketCipher` wraps the AEAD primitive with the per-session monotonic counter for nonce generation.
+`session_id` is the first eight bytes of the Noise handshake hash — a session
+*name*, not a binding, and it is what the header's `SESSION_ID` field carries. The
+**full** 32-byte handshake hash is the session binding: it is security-relevant,
+and it is kept beside the keys rather than discarded. `into_session_keys_with_binding`
+returns it before the handshake state is consumed (the older `into_session_keys` is
+a compatible wrapper that drops it), `NetSession::with_binding(keys, hash)` stores
+it on the session, and `NetSession::handshake_binding()` /
+`MeshNode::peer_session_binding(node_id)` read it back per peer. Hand-built sessions
+(`NetSession::new`) carry no binding and read as `None`, so anything that requires
+an established-session binding must fail closed on them. A re-handshake always
+produces a different binding, so state signed for one establishment cannot ride the
+next — which is what lets a protected streaming opening bind its proof to the exact
+session it arrived on.
+
+`PacketCipher` wraps the AEAD primitive with the per-session monotonic counter for
+nonce generation.
 
 ## Fragmentation
 

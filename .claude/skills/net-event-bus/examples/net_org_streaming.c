@@ -7,8 +7,9 @@
  * verified net_org_caller_t), and invokes it from the other with
  * net_org_call_streaming — whose stream is the SHARED handle type, drained
  * through the very net_rpc_stream_next a public stream uses (ABI 0x0002:
- * one libnet, one handle vocabulary). It then checks the attribution the
- * handler observed against the generated manifest's org ids.
+ * one libnet, one handle vocabulary). It then checks the two properties it
+ * exists for: that every item the handler emitted arrived at the caller, and
+ * that the handler observed a verified cross-org caller.
  *
  * # Why this links against ONE library
  *
@@ -36,16 +37,18 @@
  * crosses as a file PATH, never as bytes — the one rule that shapes
  * net_org.h).
  *
- * # Handler-drop contract (spec §2.2)
+ * # Handler-drop contract
  *
  * The retire supervisor may drop the handler future WITHOUT a final poll.
  * At this callback boundary: the handler receives NO cancellation callback
  * and NO final-polled notification when a deadline / cancel / revocation /
- * teardown retires the call. Retirement is observed ONLY through the
- * retirement observables — net_rpc_response_sink_send (and, for the other
- * shapes, net_rpc_request_stream_next) returning NET_RPC_ERR_STREAM_DONE —
- * and the handler MUST exit cooperatively when they fire. The handler below
- * does exactly that.
+ * teardown retires the call. For the shapes with an input side, retirement
+ * is observed through net_rpc_request_stream_next returning
+ * NET_RPC_ERR_STREAM_DONE. A response sink is NOT a retirement signal:
+ * RpcResponseSink::send is a lossy, non-blocking try_send, so
+ * net_rpc_response_sink_send returns NET_RPC_OK on a live handle even after
+ * the call is retired. This server-streaming handler therefore has no
+ * retirement observable at all — it emits its bounded batch and returns.
  */
 #include "net.go.h"  /* mesh bring-up: net_mesh_new / accept / connect / start */
 #include "net_rpc.h" /* the shared streaming handles + net_rpc_stream_next    */
@@ -144,14 +147,14 @@ static int serve_handler(uint64_t handler_id,
         int n = snprintf(body, sizeof body, "{\"n\":%d,\"servedBy\":\"c-s4\"}", i);
         int rc = net_rpc_response_sink_send(sink, (const uint8_t*)body, (size_t)n);
         if (rc != 0) {
-            /* THE RETIREMENT OBSERVABLE (spec §2.2 handler-drop contract):
-             * the retire supervisor may drop this handler's future without a
-             * final poll — there is no cancellation callback and no
-             * guaranteed final poll. Retirement is observed HERE, and the
-             * handler exits cooperatively. */
+            /* NOT a retirement observable — a live sink reports success even
+             * for a retired call (RpcResponseSink::send is a lossy try_send),
+             * and -6 here means the handle was torn down or consumed. The
+             * retire supervisor may still drop this handler without a final
+             * poll, so the batch below is deliberately bounded. */
             if (out_err) {
                 *out_err = (char*)malloc(32);
-                if (*out_err) snprintf(*out_err, 32, "sink retired at %d", i);
+                if (*out_err) snprintf(*out_err, 32, "sink send failed at %d", i);
             }
             return -1;
         }
@@ -410,9 +413,9 @@ int main(void) {
     }
     net_rpc_stream_free(stream);
 
-    /* 9. Assert the two properties this example exists for: correlated item
-     *    delivery + explicit completion, and handler-side attribution of the
-     *    VERIFIED caller. */
+    /* 9. Assert the two properties this example exists for: delivery +
+     *    explicit completion (every emitted item arrived, counts match), and
+     *    handler-side attribution of the VERIFIED caller. */
     if (received != 3 || g_chunks != 3) {
         fprintf(stderr, "net_org_streaming: received=%d handler-sent=%d, want 3\n",
                 received, g_chunks);

@@ -163,7 +163,7 @@ Subcommands may also emit a JSON `{"error": …, "detail": …}` line to **stder
 - `dataforts.md` — the blob/dir model behind `transfer` (`BlobRef`, content-addressing, `store_dir`/`fetch_dir`, gravity).
 - `nrpc.md` — the discovered-tool / typed-call surface `typegen` generates against.
 - `capabilities.md` — the `ai-tool:*` capability tags `typegen` discovers.
-- `org.md` — what the `net-mesh org` artifacts mean, the startup-side `install_org_authority` / `install_provider_grant_audience` calls that consume them, and the `org:<domain>:<kind>` errors.
+- `org.md` — what the `net-mesh org` artifacts mean, the startup-side `install_org_authority` / `install_provider_grant_audience` calls that consume them, and the `org:<domain>:<kind>` errors. The artifacts authorize all four protected call shapes — nothing in this command tree changed for streaming — and a `Granted` streaming provider needs the same `install_provider_grant_audience` call as a unary one, staying encrypted and undiscoverable until it lands.
 - `subnet-auth.md` — what the `net-mesh subnet` artifacts mean, the runtime admin surface that installs them (`install_gateway_credentials` / `declare_boundaries` / `apply_control_fact`), and the `subnet:<kind>` errors.
 
 ## Further reading

@@ -152,7 +152,7 @@ There is no `NoServer` / `NoMatchingServer` / `Panic` variant — a handler that
 
 ### Organization errors (the `org:` vocabulary)
 
-Returned from `mesh.org(..)` and `OrgClient::call` — see [Private capabilities](/docs/guides/private-capabilities). Unlike every other error on this page, this one is a **string vocabulary rather than a Rust enum**, because it has to survive four FFI boundaries unchanged. It is single-sourced from `OrgSdkError::to_wire`, pinned by `net/crates/net/tests/cross_lang_org/error_vectors.json`, and re-parsed identically by the Node, Python, Go, and C bindings.
+Returned from every organization-scoped call shape — `mesh.org(..)?.call`, `call_streaming`, `call_client_stream`, and `call_duplex` — and from the handles the streaming shapes return, so a midstream failure arrives as an `org:` item from the handle (`next` on an `OrgStream` or `OrgStreamRaw`, `send`/`finish` on an `OrgClientStreamCall`, the sink/stream halves of an `OrgDuplexCall`) rather than from the call that opened it. See [Private capabilities](/docs/guides/private-capabilities) and [Protected streaming](/docs/guides/protected-streaming). Unlike every other error on this page, this one is a **string vocabulary rather than a Rust enum**, because it has to survive four FFI boundaries unchanged. It is single-sourced from `OrgSdkError::to_wire`, pinned by `net/crates/net/tests/cross_lang_org/error_vectors.json`, and re-parsed identically by the Node, Python, Go, and C bindings.
 
 The shape is `org:<domain>:<kind>[: <detail>]`. The detail is human-facing and **must not be parsed for semantics**.
 
@@ -164,13 +164,21 @@ The shape is `org:<domain>:<kind>[: <detail>]`. The detail is human-facing and *
 | `rpc`              | no     | Transport, or a server error that is not an admission denial                |
 | `unknown`          | no     | Parser / ABI fallback — this binding's vocabulary disagrees with the build   |
 
-The domain is the load-bearing fact, and `is_local` is the question it exists to answer: *did anything leave this process?* Every binding exposes it directly — `domain.is_local()` in Rust, `ParsedOrgError.is_local` in Python, `OrgError.IsLocal()` in Go, and distinct negative return codes in C — so you never have to re-parse the message to find out.
+The domain is the load-bearing fact, and `is_local` is the question it exists to answer: *did anything leave this process?* Every binding exposes it directly and none asks you to re-parse the message — Rust `OrgErrorDomain::is_local()`, TypeScript `OrgError.isLocal` (with `classifyOrgError` to classify a raw thrown value), Python `ParsedOrgError.is_local` (from `parse_org_error` or `classify_org_error`), Go `OrgError.IsLocal()`, and in C the negative `NET_ORG_ERR_*` return codes, refined by the `org:` wire string in `out_err`. The individual local kinds are not enumerated here — they are pinned in the frozen fixture (`net/crates/net/tests/cross_lang_org/error_vectors.json`) that every binding is generated to parse.
 
 Two properties of this vocabulary are deliberate and worth understanding before you write code against it.
 
 **A binding that cannot classify a string reports `unknown`, never one of the four canonical domains.** Reporting `admission_denied` for an unparsed string would assert that a request reached a provider and that provider's admission engine ran — a claim the binding is in no position to make. `unknown` appearing in your logs means a version skew between a binding and the build it is talking to, not an authorization problem.
 
-**Remote denials are coarse on purpose.** `admission_denied` carries exactly one of `denied`, `not_supported`, or `unavailable`, with no detail at all. A precise remote reason would be a credential oracle — an attacker could walk it to learn which part of a credential set was wrong. The detailed reason is recorded provider-side for audit and never crosses the wire. Do not write caller logic that branches on a finer remote reason; there isn't one.
+**Remote denials are coarse on purpose.** `admission_denied` carries exactly one of `denied`, `not_supported`, or `unavailable`, with no detail at all — it is the one domain rendered *reasonlessly*, so the wire form is exactly `org:admission_denied:denied`, `…:not_supported`, or `…:unavailable`, never with a trailing detail segment. A precise remote reason would be a credential oracle — an attacker could walk it to learn which part of a credential set was wrong. The detailed reason is recorded provider-side for audit and never crosses the wire. Do not write caller logic that branches on a finer remote reason; there isn't one.
+
+**The streaming shapes add refusals the unary shape cannot produce**, and each maps into the same coarse buckets:
+
+- A streaming opening against a service registered **unary** is refused `not_supported` — a unary registration never admits streaming flags.
+- An opening whose frame flags or proof kind disagree with the **registered** shape is coarse `denied`: the caller was authorized for the service and asked for the wrong shape, which is a denial on the merits rather than an unsupported surface.
+- An opening whose explicitly requested deadline exceeds the provider's maximum protected lifetime is refused at opening, and so is an opening whose proof session-binding does not equal the receiving session's Noise handshake hash. Both are coarse `denied`; the binding check is what makes a proof captured from one session unusable on another.
+- A refusal because the provider cannot admit *right now* — its protected-stream capacity is spent, or an item it could not deliver latched `ResourceExhausted` — is coarse `unavailable`. It is the one bucket worth retrying.
+- A revocation that lands while a stream is live is not an opening refusal at all — it retires the call, and the stream delivers one final `denied` item before it ends.
 
 The `org:rpc:` kinds reuse the `RpcError` vocabulary above (`timeout`, `no_route`, `cancelled`, `server_error`, `transport`, `codec_encode`, `codec_decode`, `capability_denied`) rather than minting second names for the same conditions.
 

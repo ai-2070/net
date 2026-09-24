@@ -103,6 +103,20 @@ let resp: SummarizeResp = caller.call_typed(
 The call is typed on both ends, deadlined, and cancellable; there is no separate
 RPC broker, sidecar, or IDL step.
 
+### Protected services are absent, not filtered
+
+An organization-scoped capability is not a public fold entry with the wrong
+audience filter — it never enters the public fold at all. Its announcement is
+sealed to exactly one audience's discovery key, so a caller outside that audience
+cannot see the descriptor, let alone the provider. *Invisible, not refused* is the
+whole design ([Organizations](/docs/concepts/organizations)). To invoke one, a
+caller binds a credential set and uses the org facade's four shapes — `call` /
+`call_streaming` / `call_client_stream` / `call_duplex` — against a service a
+provider registered with `serve_org` / `serve_org_streaming` /
+`serve_org_client_stream` / `serve_org_duplex`. The admission proof those carry,
+and the lifetime rule that comes with it, are in
+[Protected streaming](/docs/guides/protected-streaming).
+
 ### Discovering tools from other languages
 
 The discovery half of the loop has a first-class surface in every binding. Same

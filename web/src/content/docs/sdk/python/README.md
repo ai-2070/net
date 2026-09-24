@@ -28,9 +28,14 @@ the ergonomic path and identify the places that require the native handle.
 
 ## Protected services
 
-Both authority surfaces live on the native `net` package: organization auth
-(`serve_org_typed`, `TypedOrgClient` — [concepts](/docs/concepts/organizations))
-and the subnet authority plane ([concepts](/docs/concepts/subnets)) —
+Both authority surfaces live on the native `net` package, with the organization
+half also wrapped by `net_sdk.org` (`OrgClient` / `AsyncOrgClient`,
+`serve_org`). Organization auth is `serve_org_typed` / `serve_org_streaming` /
+`serve_org_client_stream` / `serve_org_duplex` on the provider, and `OrgClient`
+with `call` / `call_streaming` / `call_client_stream` / `call_duplex` on the
+caller — `AsyncOrgClient` carries the three streaming verbs, not the unary `call`
+([concepts](/docs/concepts/organizations)). The subnet
+authority plane ([concepts](/docs/concepts/subnets)) —
 `mesh.serve_subnet_exported(service, export_name, handler)`
 for a provider inside a protected subnet, `client.call_exported(service,
 request)` for the caller, and `net.subnet.admin.*` for runtime gateway

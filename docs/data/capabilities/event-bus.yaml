@@ -357,6 +357,27 @@ operations:
     C:
       status: supported
       anchor: net_org_call
+# The streaming half of the org surface, recorded separately from the unary row
+# above because the anchors are disjoint: a binding can have `serve_org` and no
+# streaming verb (a frozen pre-streaming provider), which is exactly the
+# NotSupported case the admission engine names.
+- operation: Organization-scoped streaming RPC
+  bindings:
+    Rust:
+      status: supported
+      anchor: call_streaming
+    Node / TS:
+      status: supported
+      anchor: callStreaming
+    Python:
+      status: supported
+      anchor: call_streaming
+    Go:
+      status: supported
+      anchor: CallStreaming
+    C:
+      status: supported
+      anchor: net_org_call_streaming
 - operation: Subnet gateway provisioning
   bindings:
     Rust:

@@ -119,6 +119,15 @@ raising. `MeshNode.send_with_retry(...)` retries `BackpressureError` for you wit
 `MigrationError` and `GroupError` are **flat** in Python, where TypeScript nests
 both under `DaemonError`. Catch them individually here.
 
+### Organization failure domains
+
+Organization-scoped calls raise `OrgError` subclasses. `parse_org_error` and
+`classify_org_error` map a message or exception to `ParsedOrgError`, whose `is_local`
+says whether anything left the process (`credentials` / `discovery` are local;
+`admission_denied` / `rpc` / `unknown` are remote). A streaming call can fail
+**midstream**, from the handle's `next`/`send`/`finish` rather than from the opening,
+and classifies through the same `org:` vocabulary — never the `RpcError` family.
+
 ### Recover a call
 
 `call_with_retry` and `call_with_hedge_to` are methods on `TypedMeshRpc`. The

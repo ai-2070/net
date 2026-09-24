@@ -9,6 +9,13 @@ The event bus fans events out to whoever is subscribed. Sometimes you want the
 opposite: a direct, typed stream to **one specific peer**, with an explicit
 reliability mode and a bounded in-flight window. That's a mesh stream.
 
+This page's "mesh streams" are credit-bounded, point-to-point bytes on a live
+session (`open_stream`) — one flow to one peer, with a byte window before
+backpressure. They are **not** request/response streaming; for the four typed call
+shapes (unary, server-streaming, client-streaming, duplex) see
+[Typed RPC with nRPC](/docs/guides/nrpc) and
+[Protected streaming](/docs/guides/protected-streaming).
+
 ## Opening one
 
 ```rust
