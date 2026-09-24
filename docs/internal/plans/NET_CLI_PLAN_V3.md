@@ -2773,6 +2773,46 @@ Tasks:
 
 **Exit:** The new owner can create a one-time channel link and a clean subject can recover a protected, subject-bound, root-anchored full chain. Subscribe and publish use their distinct real paths: full-chain remote ACK on every (re)connect versus local publish-gate acceptance. Same-`u16` names never swap authority; canonical mismatches fail. Publish leave conditionally removes only its exact managed chain/cache incarnation and cannot remove a successor or fall back silently. No reciprocal publisher-identity proof, remote publish acceptor, implicit root installation, organization/subnet/invocation authority, `ADMIN` or wildcard is invented. Residual portability and stop uncertainty are explicit.
 
+#### V3-2A decisions and slices (user, 2026-09-24)
+
+**Survey.**
+- Core already has the pieces: `TokenChain` (root → leaf, depth ≤ 8,
+  attenuating delegation); `ChannelConfig.token_roots` with fail-closed
+  gates; `subscribe_channel_with_chain`, which retains the chain for
+  per-publish re-checks; and `set_publish_chain`.
+- Gaps:
+  - the SDK subscribes with a single token only;
+  - nothing re-subscribes after a reconnect;
+  - `published_chains` has no removal API, and `TokenCache` evicts only
+    expired entries;
+  - the subscribe ACK is an unsigned node-id check (no publisher entity
+    proof);
+  - the CLI can only read the channel registry.
+
+**Decisions.**
+- **Root custody: a delegated issuer.** An offline channel root signs one
+  DELEGATE token (PUBLISH/SUBSCRIBE, bounded depth and lifetime) to the
+  operator node's issuer identity. The node mints device leaves from it, so
+  chains are root → node → device, and a leaf never outlives the grant.
+- **Channel configuration: `net-mesh channel serve <name> --token-root …`.**
+  It registers the gated config on the running node and persists it for
+  restart. `invite create --channel` refuses unless the root is configured.
+  The device side uses the same command, so publish readiness is never
+  implied by a trust root being installed.
+
+**Slices.**
+- **C1 (core + SDK primitives):** chain subscribe in the SDK; publish-chain
+  install, and exact conditional removal by fingerprint; targeted
+  `TokenCache` eviction; the delegated channel issuer; witnesses for
+  delegated multi-link subscribe and publish, and for exact removal.
+- **C2 (issuance):** `Relation::Channel` in invites and bundles; the node
+  mints the leaf at redemption; `channel serve` with persistence; the offline
+  `channel issue-grant`.
+- **C3 (device):** join installs the chain; `up` subscribes with the full
+  chain on every (re)connect; the publish stage is ready only when local
+  config trusts the root; both leave modes; channel status (credential state
+  vs ACK / publish-gate observation, never a roster).
+
 ### V3-2B — voluntary leave through the same lifecycle
 
 **Modify:** shared SDK enrollment/persistence/lifecycle modules selected in V3-1/2A; CLI `enrollment.rs`, `org.rs`, `channel.rs`, `subnet.rs`, `config.rs` and relevant runtime adapters.
