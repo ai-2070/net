@@ -758,7 +758,8 @@ promised release-notes statement written from the FILED ruling (the additive
 Status vocabulary: **FIXED** = closure implemented + witness red-pre-fix;
 **FIXED (contract update)** = the closure required re-pinning a test that held
 the old contract (scenario kept — listed below the table); **IN FLIGHT** =
-repair still running when this ledger was written.
+repair still running when this ledger was written (none remain — the pass
+is complete).
 
 | Findings | Status | Landmark | Notes |
 |---|---|---|---|
@@ -783,7 +784,7 @@ repair still running when this ledger was written.
 | PY-1, PY-2 | FIXED | `4668c3ae0` | stale-wheel gate reachable and per-name — a stale wheel fails loudly, never skips; nRPC sync bridges retain the sink holder until the handler future resolves (the SS cell reddens the 0x0006 misfile; the DX cell is masked by the fold's join ordering, noted) |
 | BROWSER-2, VEC-8, VEC-9, §11 drift | FIXED | `a9178e580` | every `sink_error` closed-refusal text re-types into `OrgStreamError`; `parseOrgError` classifies the full frozen kind set; fixtures regenerated at their source (`samples()`), 130 rows; generator comment corrected; layout metadata derived/checked |
 | BROWSER-5, BROWSER-6, BROWSER-7 | FIXED | `9da2d2405` | read-loop timer race gone (red proof: the dropped `sd-1` item); the backpressure witness exhausts a window and asserts a real park; stale caveat removed — real-Chromium org stage 38/38 |
-| LEAF-7, LEAF-17, LEAF-18, LEAF-19 | FIXED | `9a8fc891b` | step-level denial matrix (21 new witnesses), parameterized scope/rights arms, digest header-order/value/deadline binding, lower-floor + replay-capacity asserts |
+| LEAF-7, LEAF-17, LEAF-18, LEAF-19 | FIXED | `9a8fc891b` | step-level denial matrix (21 new witnesses), parameterized scope/rights arms, digest header-order/value/deadline binding, lower-floor + replay-capacity asserts. Claim narrowed to 33/37: the four leaf-unmintable variants (`ActiveStreamCapacity`, `Revoked`, `ResourceExhausted`, `ProviderAuthorityUnavailable`) have zero construction sites in net-mesh-leaf and are named in `org_authority.rs`'s gap comment per §10's alternative closure |
 | LEAF-7 (deadline arm), LEAF-20, LEAF-24 | FIXED | `c9df98d77` | deadline-gate witness, forged-bundle negative witness, dead allows removed |
 | LEAF-25 | FIXED | `cca6cac94` | parity header names the round-trip exception |
 | LEAF-15 | FIXED | in tree | the refusal witness pins the typed variant, not prose; the message reflect reads the real error object (receipt comments in `wasm_leader.rs`) |
@@ -807,6 +808,6 @@ Pre-existing cleanups riding the pass: the node test typecheck-drift bundle
 **Not addressable:** the count table's 79 includes three IDs that appear
 nowhere in this document or the tree — `SDK-4`, `BROWSER-3`, `LEAF-16`
 (numbering gaps or findings retracted before filing; counts kept as filed).
-All 76 named findings are accounted for above.
+All 76 named findings are FIXED above; the pass is complete.
 
 — Repair pass, 2026-09-25.
