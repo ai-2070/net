@@ -3,20 +3,28 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![codecov](https://codecov.io/gh/ai-2070/net/graph/badge.svg?token=AOBMOF6LE4)](https://codecov.io/gh/ai-2070/net)
 
-**Net connects agents, services, and devices into a capability mesh.**
+**Net connects agents, services, and devices into a programmable mesh.**
 
-Discover what another machine can do, invoke it through typed RPC, and move artifacts between
-participants while resource owners keep control of access. Underneath is a latency-first
-encrypted mesh — identity, discovery, channels, typed RPC, durable logs, folded state, and
-artifacts share one substrate, and the same substrate runs vehicular, industrial, robotics, and
-edge workloads.
+You find what another machine can do, call it through typed RPC, and move artifacts between
+participants — while whoever owns a resource keeps control of access. Identity, discovery,
+channels, typed RPC, durable logs, folded state, and artifacts are one substrate, so the same
+mesh runs vehicular, industrial, robotics, and edge workloads.
+
+**How the mesh works**
+
+- **Capability announcements.** A node says what it can do, so you find peers by capability, not address.
+- **Pingwaves.** Small heartbeat frames carry who a node is, what it offers, and how far away it is.
+- **Proximity graphs.** Each peer keeps a latency-weighted map of the mesh and can route to the nearest capable node.
+- **Drop instead of queue.** Buffers are fixed-size, so load is dropped rather than queued or blocked; a node that can't keep up goes quiet and the mesh routes around it.
+- **End-to-end encrypted forwarding.** Relays forward ciphertext they cannot read — there is no trusted middle.
+- **Latency-first.** Transport, routing, and placement all prefer the fastest path available.
+
+**What that gives you**
 
 - **No broker, no registry, no coordinator.** Peers find each other by what they can do.
-- **Work runs where the resource lives.** A credential never leaves the machine that holds it;
-  the caller invokes a capability, not a host.
-- **One identity, several authority planes.** A node is its keypair, and that identity signs what
-  it advertises. Who may reach a capability is decided by permission tokens and organization
-  grants issued under it; subnet membership is derived from the published tags.
+- **Identity outlives a path.** A node is its keypair; addresses and routes change underneath it.
+- **Work runs where the resource lives.** A credential never leaves the machine that holds it; the caller invokes a capability, not a host.
+- **One identity, several authority planes.** Permission tokens and organization grants decide who may reach a capability; subnet membership comes from a node's published tags.
 
 ## Install
 
