@@ -53,6 +53,24 @@ Published names and source imports differ on purpose: the crates/registries use
 [SDKs](#sdks). Full per-language setup:
 [Install](https://ai2070.net/docs/start/install), [Quickstart](https://ai2070.net/docs/start/quickstart).
 
+## Claude Code Skill
+
+An agent working from surface familiarity will write integration code that runs and is quietly
+wrong. Install the skills first:
+
+```bash
+npx skills add ai-2070/net-claude-skill -g     # drop -g for the current project only
+```
+
+Pair them with [`opensrc`](https://github.com/vercel-labs/opensrc) so the agent can read Net's
+real source instead of guessing a signature — one fetch covers all five bindings:
+
+```bash
+npx -y opensrc@latest path ai-2070/net
+```
+
+Full install options: [Claude Skills](https://ai2070.net/docs/start/claude-skills).
+
 ## Hello, mesh
 
 Start a node and put one event on it.
@@ -331,24 +349,6 @@ behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/m
 
 `✓` supported · `core-only` reachable only through the low-level binding (`@net-mesh/core`,
 `net`) · `partial` · `–` not exposed.
-
-## Claude Code Skill
-
-An agent working from surface familiarity will write integration code that runs and is quietly
-wrong. Install the skills first:
-
-```bash
-npx skills add ai-2070/net-claude-skill -g     # drop -g for the current project only
-```
-
-Pair them with [`opensrc`](https://github.com/vercel-labs/opensrc) so the agent can read Net's
-real source instead of guessing a signature — one fetch covers all five bindings:
-
-```bash
-npx -y opensrc@latest path ai-2070/net
-```
-
-Full install options: [Claude Skills](https://ai2070.net/docs/start/claude-skills).
 
 ## Origin
 
