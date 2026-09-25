@@ -1,0 +1,18 @@
+net/crates/net/guards/org_api_probe/Cargo.lock
+  h_64425bc75e3f3d 793,795,837,885,1270,1272,1337,1339,1346,1348
+net/crates/net/guards/org_api_probe/MANIFEST
+  h_64425bc75e3f3d 67-74
+net/crates/net/guards/org_api_probe/src/main.rs
+  h_64425bc75e3f3d 615-618,671-965
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d9e4107f88518bc0d8dc11846670c22e64c7e925",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
