@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_d8b00bedd146e9::t_2e5aaf2d1df56b 511-517
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_3696ff3cdb0940 3101-3103,3111-3112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "171b0ec9977a3bdce19c484cc1a59dc11d3f6a43",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
