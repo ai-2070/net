@@ -1,0 +1,23 @@
+net/crates/net/Cargo.toml
+  s_4a0f4aa1c8ef20::t_de67f1b00d81b3 312
+net/crates/net/sdk/Cargo.toml
+  s_4a0f4aa1c8ef20::t_de67f1b00d81b3 164
+net/crates/net/Cargo.lock
+  s_4a0f4aa1c8ef20::t_63148c9225f59a 151,162,1530,1722,2662,2664,3666,4853,4919,5416,5458,5460,5611,5624,6540
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4a98529f2c5d2bfccc148b228b17bdfd6de2e329",
+  "prompts": {},
+  "sessions": {
+    "s_4a0f4aa1c8ef20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "767c9b95-1bc5-40c2-b2e6-0ae35590ef7c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
