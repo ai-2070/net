@@ -26,7 +26,8 @@ hold (see the receipts below). The counts are kept as filed. However, the
 spot-check recommends re-grading LEAF-4/5/6 to P2 once the leader-proxy trust
 model is settled (owner question 4). It also found that SDK-2's root is a
 pre-existing core nRPC behavior, so its fix belongs in core. The HOLD stands
-either way.
+either way. **The repair pass landed after this review — per-finding status in
+§22.**
 
 ---
 
@@ -105,6 +106,7 @@ later. These are still lane claims.
 19. [Owner questions](#19--owner-questions)
 20. [What holds up](#20--what-holds-up)
 21. [Disposition](#21--disposition)
+22. [Repair status ledger (2026-09-25)](#22--repair-status-ledger-2026-09-25)
 
 ---
 
@@ -736,3 +738,75 @@ the review session (`agent://CoreBehaviorReview`, `agent://WireSessionBindingRev
 `agent://FfiAbiReview`, `agent://NodeBindingsReview`, `agent://PythonBindingsReview`,
 `agent://CrossLangVectorsReview`, `agent://BrowserSurfaceReview`,
 `agent://CiPinsReview`, `agent://DocsCorpusReview`).
+
+---
+
+## 22 — Repair status ledger (2026-09-25)
+
+The repair pass for this review ran after the spot-check, on branch
+`org-nrpc-merge` (coordinator + delegated lane slices; every production fix
+carries a regression witness that reddens the pre-fix code, proven by mutation
+or inverse run). Owner decisions taken while repairing — **Q1**: fix the folds
++ core; the documented typed vocabulary stands (`Timeout`/`Cancelled` reachable
+on every shape). **Q2/Q4**: LEAF-3/4/5/6 repaired as one change (4/5/6 as P2
+hardening under the same-origin trust model the spot-check established).
+**Q3**: prune `.s4receipts/` and the `r4corefix-*.log` dumps; move the stage
+BRIEFs under `docs/internal/spikes/org-streaming/`. **`start()` fail-open**: the
+promised release-notes statement written from the FILED ruling (the additive
+`try_start()`/`start_with_report()` API stays owner-approval territory).
+
+Status vocabulary: **FIXED** = closure implemented + witness red-pre-fix;
+**FIXED (contract update)** = the closure required re-pinning a test that held
+the old contract (scenario kept — listed below the table); **IN FLIGHT** =
+repair still running when this ledger was written.
+
+| Findings | Status | Landmark | Notes |
+|---|---|---|---|
+| WIRE-1 | FIXED | `31fab08d7` | one atomic carrying-incarnation snapshot; stale incarnation refused `AuthorityChanged` before any record exists; `session_generation` armed |
+| SDK-1 | FIXED | `31fab08d7` | `classify_stream_terminal`: one deterministic variant per retirement cause; `map_rpc_error` stays a typed pass-through (genuine remote 0x0003/0x0005 remain `ServerError`) |
+| SDK-2 | FIXED | `31fab08d7` | `cancel_locally` delivers the typed cancellation terminal; SS/DX folds end `Err(Cancelled)`, CS `finish` classifies cancelled. **Follow-up in flight** (regression the python retirement-observable cell caught): consuming the synthesized terminal must still fire the wire CANCEL — `clean_close` latched it away on the DX and CS twins |
+| LEAF-1 | FIXED | `0ccdd7bf1` | the latch is the single over-poll answer; `cancel()` latches `Retired{Cancelled}` |
+| LEAF-2 (+ core twin) | FIXED | `e48851321` | `ReplayState::retarget` moves quota across the expired overwrite; `external_total` saturates; identical at both sites |
+| BROWSER-1 | FIXED | `70503b7df`, `e7eb3cff9` | done-arm `value` surfaced at `byteItem` and before iterator end; Rust-generated `org-abi.json` fixture pin |
+| BROWSER-4 | FIXED | `70503b7df` | pull waiters splice as they settle |
+| CORE-1, CORE-2, CORE-3, CORE-4, CORE-7 | FIXED | `9d0f5d4b6` | handler re-poll before pump-exit classification (behavior + cortex mirror in lockstep); publish barrier linearized under the retire lock — zero items after a retirement terminal; real discard accounting; oversized witness drives the real seam; `Disposition::InputEnded` |
+| CORE-5 | FIXED | `1beeff1f3` | stay-gated-plus-mirror status restated above the model modules |
+| CORE-6 | FIXED | `93ba0873a` | step-4(c)/9b witnesses at their own step |
+| LEAF-3, LEAF-4, LEAF-5, LEAF-6 | FIXED | `11efcbf23` | strict `0x03` accept codec dispatching exactly one handler; caller projection resolved leader-side via `OrgServeCaller`, never an envelope claim; sender-bound owner-scoped relay, unguessable bridge ids, collision-refusing inserts; unregister touches only its own registration (`PROXY_VERSION` 2→3). Residual recorded: a same-origin forger answering both hops stays inside the acknowledged trust model (§7/§9 spot-check) |
+| LEAF-12, LEAF-13, LEAF-14 | FIXED | `11efcbf23` | bounded at-most-once dedup window; call entries release at terminal; permanent refusals surface typed without a retry storm |
+| SDK-3 | FIXED | `b309615e4` | application-band clamp at the single `From` classification point (all four verbs) + the core unary mint mirror; sibling core folds keep verbatim pass-through by pinned contract (`s2.rs` `EarlyReturnDX`) |
+| SDK-5 | FIXED | `c066eb848` | citation names `plan`/`intent_for` |
+| DOCS-1..4 | FIXED | `8d5384e66` | refusal seams named (terminal item / `finish()` / local-only verb failure); per-cause vocabulary reconciled across both guides, `concepts/organizations.md`, and `ORGANIZATIONS.md`; the C sample's double-free trap removed |
+| FFI-1 | FIXED | `bb506e4bf` | header + Go texts state the deliberate exact-equality ABI contract |
+| LEAF-8, LEAF-9, LEAF-10, LEAF-11, LEAF-21, LEAF-22 | FIXED | `2af0c4ee5` | failure limiter wired (throttle before the verify CPU); grants pace per consumed chunk unboundedly; retention projection rounds past the horizon so it strictly dominates acceptance; second single-response send typed `Closed`; one terminal per call_id — widened to EVERY live-key refusal; wrong-flags map `ShapeMismatch` like core |
+| NODE-1..5 | FIXED | `5c78e5218` | typed-cancel pin (contract update); undecodable 0x0009 → `AdmissionDenied(Denied)` at every seam; `JsHandleRelease` drop-guard across six bridges + live witness; manifest fields declared; the S4 gate keys on real exports (all nine witnesses run on a plain build+test) |
+| PY-1, PY-2 | FIXED | in tree (commit landing) | stale-wheel gate reachable and per-name — a stale wheel fails loudly, never skips; nRPC sync bridges retain the sink holder until the handler future resolves (the SS cell reddens the 0x0006 misfile; the DX cell is masked by the fold's join ordering, noted) |
+| BROWSER-2, VEC-8, VEC-9, §11 drift | FIXED | `a9178e580` | every `sink_error` closed-refusal text re-types into `OrgStreamError`; `parseOrgError` classifies the full frozen kind set; fixtures regenerated at their source (`samples()`), 130 rows; generator comment corrected; layout metadata derived/checked |
+| BROWSER-5, BROWSER-6, BROWSER-7 | FIXED | `9da2d2405` | read-loop timer race gone (red proof: the dropped `sd-1` item); the backpressure witness exhausts a window and asserts a real park; stale caveat removed — real-Chromium org stage 38/38 |
+| LEAF-7, LEAF-17, LEAF-18, LEAF-19 | FIXED | `9a8fc891b` | step-level denial matrix (21 new witnesses), parameterized scope/rights arms, digest header-order/value/deadline binding, lower-floor + replay-capacity asserts |
+| LEAF-7 (deadline arm), LEAF-20, LEAF-24 | FIXED | `c9df98d77` | deadline-gate witness, forged-bundle negative witness, dead allows removed |
+| LEAF-25 | FIXED | `cca6cac94` | parity header names the round-trip exception |
+| LEAF-15 | FIXED | in tree | the refusal witness pins the typed variant, not prose; the message reflect reads the real error object (receipt comments in `wasm_leader.rs`) |
+| TESTS-1..7 | FIXED | `dfe53978c`, `cb23b89f9`, `0d0c9b892`, `d9e4107f8` | frozen-chain admit/deny halves, extraction-hash provenance, `[[test]]` feature gates (both targets), bounded cross-process harness, measured marker count, MANIFEST↔probe binding + an executed behavioral claim |
+| CI-1, CI-2, CI-3 | FIXED | `ee3ad9117`, `0d0c9b892` | pins count reality (rosters catch up with the estate), `org_scoped_cross_process` pinned `retries = 0`, floor comment corrected |
+| VEC-1..7, VEC-10 | IN FLIGHT | — | narrowed-ID rule parity across Go/Node/Python, unary wire triple pins, mixed_pair watchdog + bounded reads + probe signatures |
+| PY-3, DOCS-5, LEAF-23 | FIXED | `239dea825`, `093be643a`, `7c4de170c` | receipt artifacts and raw probe dumps deleted; the org-feed URL is no longer logged at bind |
+| Owner Q3 (litter) | DONE | `888178cbe`, `cf292137d` | stage BRIEFs moved under `docs/internal/spikes/org-streaming/`, citations updated |
+| §12 `start()` statement | DONE | `3f278d74a` | release-notes known-limitation statement (incl. the pyo3 `NetMesh.start()` half and the §14 cross-org floor fail-open) |
+| Integration verification | IN FLIGHT | — | pre-push checklist run from a verify worktree (`org-nrpc-merge-2-verify`) |
+
+**Contract updates made deliberately** (owner Q1; each keeps its scenario and
+re-pins only the observable): the four cancel pins in
+`tests/integration_mesh_cancel.rs` (clean-EOF/any-error → typed terminal),
+CORE-7's `end_is_idempotent…` disposition pin, LEAF-22's wrong-flags test
+renamed to `ShapeMismatch`, NODE-1's `org_live.test.ts` clean-EOF pin, and the
+sdk-py cancel-cell link-2 (clean `async for` end → typed `org:rpc:cancelled`).
+Pre-existing cleanups riding the pass: the node test typecheck-drift bundle
+(`3cb8384a2`) and an `expect` removal in the `test_install_session` seam.
+
+**Not addressable:** the count table's 79 includes three IDs that appear
+nowhere in this document or the tree — `SDK-4`, `BROWSER-3`, `LEAF-16`
+(numbering gaps or findings retracted before filing; counts kept as filed).
+All 76 named findings are accounted for above.
+
+— Repair pass, 2026-09-25.
