@@ -1,0 +1,18 @@
+net/crates/net/Cargo.toml
+  h_64425bc75e3f3d 473-483
+net/crates/net/tests/org_rpc_streaming.rs
+  h_64425bc75e3f3d 456-532
+net/crates/net/tests/org_rpc_streaming/frozen_85ecc77c9.rs
+  h_64425bc75e3f3d 44-294
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "dfe53978cec76f177bb909e59c4f355b7d1e60bb",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
