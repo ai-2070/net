@@ -131,7 +131,7 @@ use crate::{hex, wait_for, Ledger, StepResult};
 /// Every Stage 4 org witness name, in ledger order. CI pins these
 /// exactly; the list lives here so a rename is one edit and a drop is
 /// impossible to do quietly.
-pub const WITNESSES: [&str; 37] = [
+pub const WITNESSES: [&str; 38] = [
     "org_browser_call_unary_same_org",
     "org_browser_call_unary_granted",
     "org_browser_call_streaming_same_org",
@@ -166,6 +166,7 @@ pub const WITNESSES: [&str; 37] = [
     "org_leader_replacement_preserves_attribution",
     "org_leader_teardown_fails_pending_typed",
     "org_handler_completion_after_retirement_emits_nothing",
+    "org_read_timeout_never_drops_items",
     "org_parity_codec_round_trip_both_codecs",
     "org_parity_leaf_proof_verifies_under_core",
     "org_parity_core_proof_verifies_under_leaf",
@@ -181,10 +182,10 @@ const PARITY: [&str; 3] = [
     "org_parity_core_proof_verifies_under_leaf",
 ];
 
-/// The 34 real-browser witnesses (`WITNESSES[..BROWSER_WITNESSES]`);
+/// The 35 real-browser witnesses (`WITNESSES[..BROWSER_WITNESSES]`);
 /// the parity instruments run engine-independent and are NEVER
 /// re-recorded by a harness-level sweep.
-const BROWSER_WITNESSES: usize = 34;
+const BROWSER_WITNESSES: usize = 35;
 
 /// The tabs this stage drives. Each has its own `/harness/stepOrg`
 /// queue except where one context deliberately hosts several tabs
@@ -267,6 +268,8 @@ const B_DEFER: &str = "org.s4.b.defer";
 const B_REPLAY: &str = "org.s4.b.replay";
 const B_BP: &str = "org.s4.b.bp";
 const N_CS_BP: &str = "org.s4.n.cs.bp";
+const N_DX_BP: &str = "org.s4.n.dx.bp";
+const N_SD: &str = "org.s4.n.sd";
 
 // Browser-pair provider services (the o-pair-b page serves these).
 const P_U: &str = "org.s4.p.u";
@@ -1043,6 +1046,11 @@ impl RpcClientStreamingHandler for CsOrg {
 struct DxDx {
     service: &'static str,
     tail: Vec<Vec<u8>>,
+    /// An inter-chunk delay on the REQUEST loop — the SLOW CONSUMER
+    /// that makes an exhausted upload window park a send somewhere
+    /// observable (an eager drainer grants credit as fast as it
+    /// arrives and a window can never park a send).
+    defer_ms: u64,
     gate: Option<Arc<HoldGate>>,
     log: Arc<CallLog>,
 }
@@ -1068,6 +1076,9 @@ impl RpcDuplexHandler for DxDx {
             sent.push(echo.clone());
             responses.send(echo);
             index_echo += 1;
+            if self.defer_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.defer_ms)).await;
+            }
         }
         if let Some(gate) = &self.gate {
             gate.wait().await;
@@ -1495,6 +1506,26 @@ fn register_native_services(anchor: &Arc<MeshNode>) -> NativeServices {
                 .expect("owner-scoped streaming serve")
         });
     }
+    // The slow-drip provider behind the read-timeout witness
+    // (BROWSER-5): `sd-0` at once, then one chunk per second — a
+    // short read times out racing the pull for `sd-1`.
+    handles.push(
+        anchor
+            .serve_rpc_owner_scoped_streaming(
+                N_SD,
+                Arc::new(StreamOrg {
+                    service: N_SD,
+                    pre: vec![b"sd-0".to_vec(), b"sd-1".to_vec(), b"sd-2".to_vec()],
+                    post: Vec::new(),
+                    delay_ms: 1_000,
+                    gate: None,
+                    log: Arc::clone(&log),
+                }),
+                policy.clone(),
+            )
+            .expect("slow-drip streaming serve"),
+    );
+
     // The teardown/hold providers: parked until released.
     for (service, gate) in [
         (N_TEARDOWN, Arc::clone(&teardown_gate)),
@@ -1568,6 +1599,7 @@ fn register_native_services(anchor: &Arc<MeshNode>) -> NativeServices {
         let handler = Arc::new(DxDx {
             service,
             tail,
+            defer_ms: 0,
             gate: None,
             log: Arc::clone(&log),
         });
@@ -1581,6 +1613,23 @@ fn register_native_services(anchor: &Arc<MeshNode>) -> NativeServices {
                 .expect("owner-scoped duplex serve")
         });
     }
+    // The slow-consumer duplex backpressure provider (BROWSER-7's
+    // park needs a consumer slower than the sends).
+    handles.push(
+        anchor
+            .serve_rpc_owner_scoped_duplex(
+                N_DX_BP,
+                Arc::new(DxDx {
+                    service: N_DX_BP,
+                    tail: vec![b"dx-bp-tail".to_vec()],
+                    defer_ms: 400,
+                    gate: None,
+                    log: Arc::clone(&log),
+                }),
+                policy.clone(),
+            )
+            .expect("slow-consumer duplex serve"),
+    );
 
     NativeServices {
         log,
@@ -3089,6 +3138,14 @@ async fn client_stream_backpressure(
 }
 
 /// 27. `org_duplex_backpressure_half_close`.
+///
+/// BOTH halves of the name are real (BROWSER-7): the upload window is
+/// EXHAUSTED — request window 2, six sequential sends at a 400
+/// ms/chunk slow-consumer echo — and the park is ASSERTED from the
+/// attempt-first `send_log` (a surface with no flow control resolves
+/// every send instantly and reddens the park count) — and then
+/// half-close still never cancels the response half (the tail
+/// completes after EOF).
 async fn duplex_backpressure(
     _cx: &CxOrg<'_>,
     world: &OrgWorld,
@@ -3102,24 +3159,40 @@ async fn duplex_backpressure(
         &world.root_a,
         &world.root_a,
         &world.anchor_entity,
-        N_DX_SAME,
+        N_DX_BP,
         false,
     );
-    let sends = vec![b"dx-bp-0".to_vec(), b"dx-bp-1".to_vec(), b"dx-bp-2".to_vec()];
+    let chunks: Vec<Vec<u8>> = (0..6).map(|i| format!("dx-bp-{i}").into_bytes()).collect();
+    // Response window 8; upload window 2 — the upload window is the
+    // one this witness exhausts.
     let open = script
-        .run(TAB_CALL, duplex_open_step(N_DX_SAME, &creds, "dx-bp", Some(16), Some(8)))
+        .run(TAB_CALL, duplex_open_step(N_DX_BP, &creds, "dx-bp", Some(8), Some(2)))
         .await;
-    let _ = script.run(TAB_CALL, duplex_send_step("dx-bp", &sends[..2])).await;
+    // Send beyond the window: 4 at once, then observe the park (the
+    // same attempt-first send_log discipline as the CS witness).
+    let send1 = script.run(TAB_CALL, duplex_send_step("dx-bp", &chunks[..4])).await;
+    let send_log = stat_obj(&send1, "send_log").and_then(Value::as_array).cloned().unwrap_or_default();
+    let parked = send_log
+        .iter()
+        .filter(|e| {
+            // A null resolved_at = STILL PARKED (the attempt-first
+            // log) — parked by definition.
+            match e.get("resolved_at").and_then(Value::as_f64) {
+                Some(r) => r - e.get("sent_at").and_then(Value::as_f64).unwrap_or(0.0) > 250.0,
+                None => true,
+            }
+        })
+        .count();
+    let send2 = script.run(TAB_CALL, duplex_send_step("dx-bp", &chunks[4..])).await;
     // Read while the input half is still open: echoes arrive
     // independently of half-close.
-    let mid = script.run(TAB_CALL, duplex_read_step("dx-bp", 2, 8_000)).await;
+    let mid = script.run(TAB_CALL, duplex_read_step("dx-bp", 2, 15_000)).await;
     let mid_items = stat_list(&mid, "items");
     // Half-close; the response side keeps completing (tail AFTER EOF).
-    let _ = script.run(TAB_CALL, duplex_send_step("dx-bp", &sends[2..])).await;
     let fin = script.run(TAB_CALL, duplex_finish_step("dx-bp")).await;
-    let read = script.run(TAB_CALL, duplex_read_step("dx-bp", 10, 10_000)).await;
+    let read = script.run(TAB_CALL, duplex_read_step("dx-bp", 10, 15_000)).await;
     let items = stat_list(&read, "items");
-    let mut expected: Vec<String> = sends
+    let mut expected: Vec<String> = chunks
         .iter()
         .enumerate()
         .map(|(i, c)| {
@@ -3128,19 +3201,30 @@ async fn duplex_backpressure(
             hex(&echo)
         })
         .collect();
-    expected.push(hex(b"dx-same-tail"));
+    expected.push(hex(b"dx-bp-tail"));
     let terminal_done =
         stat_obj(&read, "terminal").and_then(|t| t.get("done")).and_then(Value::as_bool) == Some(true);
 
     ledger.record(
         witness,
-        open.ok && fin.ok && mid_items.len() == 2 && items == expected && terminal_done,
+        open.ok
+            && fin.ok
+            && parked >= 1
+            && mid_items.len() == 2
+            && items == expected
+            && terminal_done,
         format!(
-            "both directions paced (window credits 16/8): echoes arrived while input OPEN \
-             (mid={mid_items:?} — the response side is independent); finishSending delivered EOF \
-             and the tail AFTER EOF still completed: items={items:?} (want {expected:?}) \
-             terminal={:?} — half-close never cancelled the response half",
-            stat_obj(&read, "terminal")
+            "the upload window is EXHAUSTED and the park OBSERVED (BROWSER-7): request window 2, \
+             six sends at a 400 ms/chunk slow consumer — parked {parked}/4 early sends >250ms \
+             (≥1 parked is the park observation; a surface with no flow control resolves every \
+             send instantly and reddens this count); both directions paced (response window 8): \
+             echoes arrived while input OPEN (mid={mid_items:?} — the response side is \
+             independent); finishSending delivered EOF and the tail AFTER EOF still completed: \
+             items={items:?} (want {expected:?}) terminal={:?} — half-close never cancelled the \
+             response half; sends {} + {} ok",
+            stat_obj(&read, "terminal"),
+            stat_u64(&send1, "sent"),
+            stat_u64(&send2, "sent")
         ),
     );
 }
@@ -4093,9 +4177,10 @@ async fn handler_completion_after_retirement(
             "handler deferred 800ms past its call's retirement (caller cancelled mid-stream: \
              {}); the retirement observable fired ({retired_at:?}) and the handler's completion \
              must FOLLOW it (retired_at < completed_at={completed_at:?}: {retirement_first}) — \
-             completed_at=None means the handler NEVER resolved: a `send` parked for credit does \
-             not settle when `retired` resolves, so F-S3.1-2's 'handler resolves after \
-             retirement' is unreachable until the surface settles send/close on retirement; the \
+             completed_at=None means the handler NEVER resolved — since 22f8b283a the surface \
+             settles send/close on retirement (post-retirement sends refuse typed, pulls end), so \
+             F-S3.1-2's 'handler resolves after retirement' is REACHABLE and a missing completion \
+             here is a regression of that settle, not the retired parked-send behavior; the \
              handler's late sends were ATTEMPTED ({late_attempted}, entry items={entry_items:?}) \
              and DISCARDED — its return chunks never reached the caller (return-discarded=\
              {return_discarded}, caller items={items:?} = the pre-retirement set only: \
@@ -4118,9 +4203,65 @@ fn forwarded_pair(anchor: &MeshNode, a: &EntityId, b: &EntityId) -> u64 {
     anchor.forwarded_app_packets(ra, b.node_id()) + anchor.forwarded_app_packets(rb, a.node_id())
 }
 
+// ─────────────────────────── read-loop timer (BROWSER-5) ───────────────────────────
+
+/// 35. `org_read_timeout_never_drops_items`.
+///
+/// BROWSER-5: a read whose timer wins the race against its pull must
+/// drop NOTHING. The slow-drip provider emits `sd-0` at once and one
+/// chunk per second after; a 400 ms read lands `sd-0` and times out
+/// racing the pull for `sd-1`. The NEXT read must deliver `sd-1` (the
+/// retained pull) — pre-fix the timed-out read abandoned its pull and
+/// the late item was pulled-and-dropped, so the re-read skipped
+/// straight to `sd-2`.
+async fn read_timeout_never_drops_items(
+    _cx: &CxOrg<'_>,
+    world: &OrgWorld,
+    script: &mut ScriptOrg,
+    ledger: &mut Ledger,
+) {
+    let witness = WITNESSES[34];
+    let creds = world.creds(
+        &world.caller.entity,
+        1,
+        &world.root_a,
+        &world.root_a,
+        &world.anchor_entity,
+        N_SD,
+        false,
+    );
+    let open = script
+        .run(TAB_CALL, stream_open_step(N_SD, b"sd", &creds, "sd", None))
+        .await;
+    // A SHORT read: `sd-0` lands immediately; the 400 ms timer wins
+    // the race for `sd-1` (the drip delivers it at ~1s).
+    let first = script.run(TAB_CALL, stream_read_step("sd", 2, 400)).await;
+    let first_items = stat_list(&first, "items");
+    // Let the drip deliver the late item into the retained pull.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let second = script.run(TAB_CALL, stream_read_step("sd", 10, 8_000)).await;
+    let items = stat_list(&second, "items");
+    let terminal_done =
+        stat_obj(&second, "terminal").and_then(|t| t.get("done")).and_then(Value::as_bool) == Some(true);
+    let expected = vec![hex(b"sd-0"), hex(b"sd-1"), hex(b"sd-2")];
+
+    ledger.record(
+        witness,
+        open.ok && first_items == vec![hex(b"sd-0")] && items == expected && terminal_done,
+        format!(
+            "a timed-out read drops NOTHING (BROWSER-5): the first read (400ms timer vs the 1s \
+             drip) landed exactly {first_items:?} (want [sd-0]) and timed out racing the pull for \
+             sd-1; the next read delivered the RETAINED pull's item — items={items:?} (want \
+             {expected:?}: identity+order+count ACROSS the timeout; pre-fix the abandoned pull \
+             consumed sd-1 and the re-read skipped to sd-2); terminal={:?}",
+            stat_obj(&second, "terminal")
+        ),
+    );
+}
+
 // ─────────────────────────── parity instruments (I) ───────────────────────────
 
-/// 35. `org_parity_codec_round_trip_both_codecs`.
+/// 36. `org_parity_codec_round_trip_both_codecs`.
 ///
 /// leaf `rpc_wire` and core `cortex::rpc` encode/decode each other's
 /// request frames byte-identically for all four payload shapes
@@ -4227,7 +4368,7 @@ fn core_decodes_identically(payload: &[u8], want: &RpcRequestPayload) -> bool {
     }
 }
 
-/// 36. `org_parity_leaf_proof_verifies_under_core`.
+/// 37. `org_parity_leaf_proof_verifies_under_core`.
 ///
 /// A leaf-minted proof header (via `net_leaf::org`) passes CORE's
 /// `verify_org_admission` against a real `AdmissionContext`.
@@ -4297,7 +4438,7 @@ fn parity_leaf_proof_under_core(world: &OrgWorld) -> (bool, String) {
     }
 }
 
-/// 37. `org_parity_core_proof_verifies_under_leaf`.
+/// 38. `org_parity_core_proof_verifies_under_leaf`.
 ///
 /// A core-minted proof (the exact `sign_for_call` the frozen glue
 /// calls) passes `net_leaf::org`'s verify.
@@ -4623,6 +4764,9 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
 
     // ── H: handler level (1) ──
     handler_completion_after_retirement(&cx, &world, &mut script, ledger).await;
+
+    // ── read-loop timer (BROWSER-5) ──
+    read_timeout_never_drops_items(&cx, &world, &mut script, ledger).await;
 
     let _ = script.run(TAB_CALL, json!({ "kind": "done" })).await;
     tokio::time::sleep(Duration::from_millis(200)).await;

@@ -556,6 +556,7 @@ async function execute(step) {
         const state = {
           kind: 'stream',
           stream,
+          pull: null,
           items: [],
           arrivals: [],
           terminal: null,
@@ -583,18 +584,37 @@ async function execute(step) {
         // TERMINAL ITEM ERRORS THROW through the async iterator (the
         // surface contract) — a catch here is the typed terminal, not
         // a step failure.
+        // The pull is RETAINED across a timeout win (BROWSER-5): a
+        // timed-out read parks its pull in `state.pull`, so the late
+        // item is re-delivered to the next read instead of being
+        // dropped on the floor — and the race timer is cleared
+        // whichever side wins.
+        if (!state.pull) {
+          state.pull = state.stream.next();
+          // A retained rejection is consumed by a later read; keep it
+          // from surfacing as an unhandled rejection in between.
+          state.pull.catch(() => {});
+        }
+        let timer = null;
         let next;
         try {
           next = await Promise.race([
-            state.stream.next(),
-            sleep(step.timeout_ms || 8000).then(() => 'timeout'),
+            state.pull.then((value) => ({ value })),
+            new Promise((resolve) => {
+              timer = setTimeout(() => resolve('timeout'), step.timeout_ms || 8000);
+            }),
           ]);
         } catch (e) {
+          clearTimeout(timer);
+          state.pull = null;
           state.done = true;
           state.terminal = typedFailure(e);
           break;
         }
+        clearTimeout(timer);
         if (next === 'timeout') break;
+        state.pull = null;
+        next = next.value;
         // ERROR BEFORE DONE: a terminal error item is
         // `{done: true, error}` on this surface — a done-first order
         // swallows the typed terminal as a clean end.
@@ -713,6 +733,7 @@ async function execute(step) {
         const state = {
           kind: 'duplex',
           call,
+          pull: null,
           items: [],
           arrivals: [],
           send_log: [],
@@ -778,18 +799,33 @@ async function execute(step) {
       const want = step.want || 1;
       const deadline = performance.now() + (step.timeout_ms || 8000);
       while (state.items.length < want && !state.terminal && performance.now() < deadline) {
+        // The pull is RETAINED across a timeout win (BROWSER-5, the
+        // duplex half): see `org_stream_read` — the late item lands in
+        // `state.pull` and the timer is cleared, never dropped.
+        if (!state.pull) {
+          state.pull = state.call.stream.next();
+          state.pull.catch(() => {});
+        }
+        let timer = null;
         let next;
         try {
           next = await Promise.race([
-            state.call.stream.next(),
-            sleep(step.timeout_ms || 8000).then(() => 'timeout'),
+            state.pull.then((value) => ({ value })),
+            new Promise((resolve) => {
+              timer = setTimeout(() => resolve('timeout'), step.timeout_ms || 8000);
+            }),
           ]);
         } catch (e) {
+          clearTimeout(timer);
+          state.pull = null;
           state.done = true;
           state.terminal = typedFailure(e);
           break;
         }
+        clearTimeout(timer);
         if (next === 'timeout') break;
+        state.pull = null;
+        next = next.value;
         // ERROR BEFORE DONE (see `org_stream_read`).
         if (next.error) {
           state.done = true;
