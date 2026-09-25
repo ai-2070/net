@@ -1,0 +1,14 @@
+net/crates/net/src/adapter/net/behavior/org_admission.rs
+  h_64425bc75e3f3d 955,989,994-995,998-1003,1242-1349,1840-1845
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "93ba0873a0defb945477917f47018702ec3cc257",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
