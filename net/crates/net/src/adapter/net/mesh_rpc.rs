@@ -508,11 +508,13 @@ impl Drop for ServeHandle {
         // registration (protected unary records included), synchronously,
         // before this returns. Idempotent with the `retire_all` above
         // (first writer wins on each record).
-        crate::adapter::net::cortex::rpc::protected_call_registry_for(self.mesh.protected_call_registry_key())
-            .retire_registration(
-                self.registration_id,
-                StreamTerminalReason::ServeHandleDropped,
-            );
+        crate::adapter::net::cortex::rpc::protected_call_registry_for(
+            self.mesh.protected_call_registry_key(),
+        )
+        .retire_registration(
+            self.registration_id,
+            StreamTerminalReason::ServeHandleDropped,
+        );
     }
 }
 

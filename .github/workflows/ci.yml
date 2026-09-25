@@ -3098,7 +3098,9 @@ jobs:
       # === the streaming-opening fixture authority ======
       # The generator IS the Rust-side conformance verifier for
       # tests/cross_lang_org/streaming_opening_vectors.json (--check:
-      # deterministic-regeneration drift guard + all 120 conformance rows).
+      # deterministic-regeneration drift guard + all 130 conformance rows;
+      # a9178e580's VEC-8/VEC-9 repair regenerated the fixture from
+      # `samples()` at 130 and left this pin at 120 -- §23 audit).
       # A fixture that stops regenerating identically or a row that stops
       # conforming fails here — the authority every other runtime consumes.
       - name: streaming-opening fixture authority (cross-lang vectors)
@@ -3106,8 +3108,8 @@ jobs:
           set -o pipefail
           out=$(cargo run -p net-mesh-sdk --features net,cortex,fixtures \
                   --example gen_org_error_fixtures -- --check 2>&1 | tee /dev/stderr)
-          printf '%s\n' "$out" | grep -q "== 120 rows, 0 failed" || {
-            echo "::error::the streaming-opening fixture authority did not report 120 rows 0 failed"
+          printf '%s\n' "$out" | grep -q "== 130 rows, 0 failed" || {
+            echo "::error::the streaming-opening fixture authority did not report 130 rows 0 failed"
             exit 1
           }
 
