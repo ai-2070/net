@@ -113,6 +113,8 @@ pub(crate) async fn attach(
     crate::secret::zeroize_slice(&mut psk);
     let mesh = built?
         .identity(join.identity().clone())
+        // Reachable by peers that learn of it through the hub.
+        .announce_noise_key(true)
         .build()
         .await
         .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;

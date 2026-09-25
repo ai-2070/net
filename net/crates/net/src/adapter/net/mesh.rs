@@ -743,7 +743,7 @@ async fn emit_control_chunks(
     sink: &PeerSink,
     builder: &mut super::pool::ThreadLocalPooledBuilder<'_>,
     session: &NetSession,
-    addr: PeerAddr,
+    route: WireRoute,
     events: &[Bytes],
     subprotocol_id: u16,
     packets_ctr: &AtomicU64,
@@ -759,7 +759,7 @@ async fn emit_control_chunks(
             PacketFlags::NONE,
             subprotocol_id,
         );
-        if sink.send(&packet, addr).await.is_ok() {
+        if sink.send(&route.frame(&packet), route.addr).await.is_ok() {
             ControlPlaneStats::record_packet(packets_ctr, events_ctr, chunk.len());
         }
     }
@@ -2677,6 +2677,11 @@ struct DispatchCtx {
     /// ann.node_id` on the direct path, so there's only one peer
     /// that can produce one).
     seen_announcements: Arc<DashMap<(u64, u64, bool), std::time::Instant>>,
+    /// The latest signature-verified announcement of each OTHER origin,
+    /// as this node forwards it (hop count already incremented), so a peer
+    /// that attaches later is not blind to what was flooded before it
+    /// arrived. See [`MeshNode::relay_announcements`].
+    relay_announcements: Arc<DashMap<u64, CapabilityAnnouncement>>,
     /// Whether inbound `CapabilityAnnouncement` packets without a
     /// signature are dropped. Validity is not enforced yet.
     require_signed_capabilities: bool,
@@ -3104,6 +3109,14 @@ pub struct MeshNodeConfig {
     /// (the SDK / FFI path) — re-broadcasting needs an owned `Arc`. A bare
     /// [`MeshNode::start`] omits it.
     pub capability_reannounce_interval: Duration,
+    /// Carry this node's Noise static public key in its signed
+    /// capability announcement, so a peer that learns of it through a
+    /// hub can open an endpoint-authenticated session to it (the key is
+    /// signed by this node's entity). OFF by default: a peer that
+    /// predates the field verifies a different transcript and would drop
+    /// the announcement, so the default stays wire-invisible (Stage 4a);
+    /// managed nodes opt in. An `rtc` node announces it regardless.
+    pub announce_noise_key: bool,
     /// Emit positive SACK-range ACKs (`StreamAckRanges`) to peers that
     /// advertise [`ACK_RANGES_CAPABILITY_TAG`], and merge that tag
     /// into this node's own capability announcements
@@ -3527,6 +3540,7 @@ impl MeshNodeConfig {
             admission_replay: super::behavior::org_admission_replay::AdmissionReplayConfig::default(
             ),
             capability_reannounce_interval: Duration::from_secs(150),
+            announce_noise_key: false,
             enable_stream_ack_ranges: true,
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
@@ -3689,6 +3703,13 @@ impl MeshNodeConfig {
     /// the loop.
     pub fn with_capability_reannounce_interval(mut self, interval: Duration) -> Self {
         self.capability_reannounce_interval = interval;
+        self
+    }
+
+    /// Announce this node's Noise static public key (see
+    /// [`Self::announce_noise_key`]).
+    pub fn with_announce_noise_key(mut self, announce: bool) -> Self {
+        self.announce_noise_key = announce;
         self
     }
 
@@ -4006,6 +4027,16 @@ enum PeerTransport {
     Routed {
         relay: PeerAddr,
         adjacent_relay_identity: Option<u64>,
+        /// The session crosses a real relay hop: the routed handshake that
+        /// installed it arrived with `hop_count > 0`. Then per-peer frames
+        /// must ride a routing header addressed to the peer, or the relay
+        /// — which holds no session for this end-to-end session id — drops
+        /// them. `false` for the degenerate single-hop attach (the "relay"
+        /// is the peer itself) and for a blind UDP relay, which forward
+        /// bare frames. FRAMING ONLY: never read by an adjacency, ownership
+        /// or protected-forwarding predicate (an unauthenticated hop count
+        /// can at worst make a relay drop frames it could drop anyway).
+        transit: bool,
     },
 }
 
@@ -4035,6 +4066,12 @@ impl PeerTransport {
     #[inline]
     fn is_direct(&self) -> bool {
         matches!(self, Self::Direct { .. })
+    }
+
+    /// Whether frames to this peer must ride a routing header (see
+    /// `Routed::transit`).
+    fn needs_routing_header(&self) -> bool {
+        matches!(self, Self::Routed { transit: true, .. })
     }
 }
 
@@ -4099,7 +4136,49 @@ impl PeerInfo {
     fn is_direct(&self) -> bool {
         self.transport.is_direct()
     }
+
+    /// How a per-peer packet goes on the wire (see [`WireRoute`]).
+    fn wire_route(&self, local_node_id: u64) -> WireRoute {
+        WireRoute {
+            addr: self.transport.send_addr(),
+            header: self
+                .transport
+                .needs_routing_header()
+                .then(|| RoutingHeader::new(self.node_id, local_node_id as u32, TRANSIT_TTL)),
+        }
+    }
 }
+
+/// Where a per-peer packet goes and how it is framed: bare to the peer's
+/// send address, or — when the session crosses a relay hop — behind a
+/// routing header addressed to the peer, so the relay's forward arm
+/// carries it (the relay holds no session for the end-to-end session id,
+/// and drops a bare frame). The inner packet stays sealed end to end.
+/// Link-local frames (heartbeats, pingwaves, traversal probes) never use
+/// this: they are about the hop, not the far endpoint.
+#[derive(Clone, Copy, Debug)]
+struct WireRoute {
+    addr: PeerAddr,
+    header: Option<RoutingHeader>,
+}
+
+impl WireRoute {
+    /// `packet` as it goes on the wire to [`Self::addr`].
+    fn frame<'a>(&self, packet: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        match &self.header {
+            None => std::borrow::Cow::Borrowed(packet),
+            Some(header) => {
+                let mut framed = Vec::with_capacity(ROUTING_HEADER_SIZE + packet.len());
+                framed.extend_from_slice(&header.to_bytes());
+                framed.extend_from_slice(packet);
+                std::borrow::Cow::Owned(framed)
+            }
+        }
+    }
+}
+
+/// TTL of the routing header per-peer frames ride across a relay hop.
+const TRANSIT_TTL: u8 = 8;
 
 /// In-flight initiator handshake. The dispatch loop consumes this when a
 /// routed msg2 arrives for `peer_node_id`: it pulls the Noise state out,
@@ -4112,7 +4191,9 @@ impl PeerInfo {
 /// look up by that. The full `u64` is stored here for peer registration.
 struct PendingHandshake {
     noise: NoiseHandshake,
-    tx: oneshot::Sender<Result<SessionKeys, CryptoError>>,
+    /// The derived keys, and the `hop_count` msg2 arrived with (> 0: the
+    /// session crosses a relay hop).
+    tx: oneshot::Sender<Result<(SessionKeys, u8), CryptoError>>,
 }
 
 /// Why a floor readback produced no usable attestation.
@@ -4187,7 +4268,7 @@ impl super::cortex::rpc::RpcHandler for SubnetFloorStatusHandler {
 struct PendingInitiator<'a> {
     map: &'a DashMap<u64, PendingHandshake>,
     key: u64,
-    rx: oneshot::Receiver<Result<SessionKeys, CryptoError>>,
+    rx: oneshot::Receiver<Result<(SessionKeys, u8), CryptoError>>,
 }
 
 impl Drop for PendingInitiator<'_> {
@@ -10533,6 +10614,26 @@ fn snapshot_peers(peers: &DashMap<u64, PeerInfo>, exclude: Option<u64>) -> Vec<P
         .collect()
 }
 
+/// When a hub replays held announcements to a newly attached peer (after
+/// the peer has had time to install the session, then once more).
+const REPLAY_SETTLE: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(2)];
+
+/// The most [`MeshNode::ensure_session`] spends on a direct attempt before
+/// falling back to the relay.
+#[cfg(feature = "nat-traversal")]
+const DIRECT_ATTEMPT_MAX: Duration = Duration::from_secs(3);
+
+/// How [`MeshNode::ensure_session`] found (or made) a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionPath {
+    /// A live session was already held.
+    Existing,
+    /// A direct handshake to an address the target announced.
+    Direct,
+    /// A routed handshake relayed through the hop toward the target.
+    Relayed,
+}
+
 /// Send ONE datagram under [`DATAGRAM_SEND_DEADLINE`].
 ///
 /// Every send on a caller-facing path goes through here, so the bound is a
@@ -12912,6 +13013,13 @@ pub struct MeshNode {
     /// ann.node_id` on the direct path, so there's only one peer
     /// that can produce one).
     seen_announcements: Arc<DashMap<(u64, u64, bool), std::time::Instant>>,
+    /// The latest signature-verified announcement of each other origin,
+    /// in its forwarded form, replayed to every newly attached peer
+    /// (never refreshed: only while still unexpired by its origin's own
+    /// signed timestamp, and receivers bound a forwarded announcement's
+    /// lifetime by that timestamp too). Origin authentication is the
+    /// origin's signature, untouched by replay.
+    relay_announcements: Arc<DashMap<u64, CapabilityAnnouncement>>,
     /// Origin-side announce rate-limit state. Compared against
     /// `config.min_announce_interval` on every `announce_capabilities_with`
     /// call; within-window calls coalesce to a local self-index
@@ -14734,6 +14842,7 @@ impl MeshNode {
                 std::collections::HashSet::new(),
             )),
             seen_announcements: Arc::new(DashMap::new()),
+            relay_announcements: Arc::new(DashMap::new()),
             announce_mu: parking_lot::Mutex::new(()),
             announce_gate: Arc::new(parking_lot::Mutex::new(AnnounceGate {
                 last_broadcast_at: None,
@@ -23869,6 +23978,7 @@ impl MeshNode {
             installed_session_id,
         );
         self.push_local_announcement(peer_node_id).await;
+        self.spawn_relay_replay(peer_node_id);
         // RT-4: a new session is a topology change - flood our
         // pingwave now so third parties learn the new edge at
         // flood speed, not on the next heartbeat tick. Session open
@@ -23940,6 +24050,7 @@ impl MeshNode {
             installed_session_id,
         );
         self.push_local_announcement(peer_node_id).await;
+        self.spawn_relay_replay(peer_node_id);
         self.emit_event_pingwave(true);
         Ok(peer_node_id)
     }
@@ -24407,6 +24518,7 @@ impl MeshNode {
         relay_addr: PeerAddr,
         keys: SessionKeys,
         expected_prior_session_id: Option<u64>,
+        transit: bool,
     ) -> PeerTransitionOutcome {
         // Attribute the relay only when a DIRECT session already owns
         // that address. An unclaimed address is left unattributed
@@ -24424,6 +24536,7 @@ impl MeshNode {
             PeerTransport::Routed {
                 relay: relay_addr,
                 adjacent_relay_identity,
+                transit,
             },
             keys,
             PriorSession::from_option(expected_prior_session_id),
@@ -24888,6 +25001,7 @@ impl MeshNode {
 
         // See the matching comment in `connect`.
         self.push_local_announcement(peer_node_id).await;
+        self.spawn_relay_replay(peer_node_id);
         // RT-4: a new session is a topology change - flood our
         // pingwave now so third parties learn the new edge at
         // flood speed, not on the next heartbeat tick. Session open
@@ -26799,6 +26913,7 @@ impl MeshNode {
             #[cfg(feature = "dataforts")]
             capability_set_cache: self.capability_set_cache.clone(),
             seen_announcements: self.seen_announcements.clone(),
+            relay_announcements: self.relay_announcements.clone(),
             require_signed_capabilities: self.config.require_signed_capabilities,
             local_subnet: self.local_subnet,
             local_subnet_policy: self.local_subnet_policy.clone(),
@@ -29163,7 +29278,7 @@ impl MeshNode {
                 noise.read_message(&parsed.payload)?;
                 noise.into_session_keys()
             })();
-            let _ = tx.send(result);
+            let _ = tx.send(result.map(|keys| (keys, routing_header.hop_count)));
             return;
         }
 
@@ -29442,6 +29557,7 @@ impl MeshNode {
                                                 .get(&source)
                                                 .map(|e| *e.value())
                                                 .filter(|nid| *nid != peer_node_id),
+                                            transit: routing_header.hop_count > 0,
                                         },
                                         session,
                                         remote_static_pub,
@@ -29478,6 +29594,7 @@ impl MeshNode {
                                         .get(&source)
                                         .map(|e| *e.value())
                                         .filter(|nid| *nid != peer_node_id),
+                                    transit: routing_header.hop_count > 0,
                                 },
                                 session,
                                 remote_static_pub,
@@ -29605,6 +29722,11 @@ impl MeshNode {
             routing_registry: ctx.routing_registry.clone(),
             peer_entity_ids: ctx.peer_entity_ids.clone(),
         };
+        let (relay, replay_peers, replay_sink) = (
+            ctx.relay_announcements.clone(),
+            ctx.peers.clone(),
+            ctx.sink.clone(),
+        );
         tokio::spawn(async move {
             match sink.send(&payload, next_hop).await {
                 Ok(_) => {
@@ -29613,6 +29735,16 @@ impl MeshNode {
                     // place, and the guard's own references are
                     // released.
                     guard.commit();
+                    // A peer that attached through a routed handshake
+                    // (a device reaching its hub) gets the announcements
+                    // flooded before it arrived.
+                    Self::replay_relay_announcements(
+                        peer_node_id,
+                        relay,
+                        replay_peers,
+                        replay_sink,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -30181,11 +30313,21 @@ impl MeshNode {
             }
             if !packets.is_empty() {
                 let sink = ctx.sink.clone();
-                let dest = parsed.source;
+                // Resend along the peer's own route: across a relay hop
+                // the repair rides a routing header like everything else.
+                let route = ctx
+                    .peers
+                    .get(&from_node)
+                    .map(|p| p.wire_route(ctx.local_node_id))
+                    .filter(|r| r.addr == parsed.source)
+                    .unwrap_or(WireRoute {
+                        addr: parsed.source,
+                        header: None,
+                    });
                 let control_stats = ctx.control_stats.clone();
                 tokio::spawn(async move {
                     for p in packets {
-                        if sink.send(&p, dest).await.is_ok() {
+                        if sink.send(&route.frame(&p), route.addr).await.is_ok() {
                             control_stats
                                 .retransmit_packets_sent
                                 .fetch_add(1, Ordering::Relaxed);
@@ -31866,6 +32008,8 @@ impl MeshNode {
     /// needs.
     fn spawn_stream_grant_drainer_loop(&self) -> JoinHandle<()> {
         let sink = self.sink.clone();
+        let peers = self.peers.clone();
+        let local_id = self.node_id;
         let partition_filter = self.partition_filter.clone();
         let pending = self.pending_stream_grants.clone();
         let notify = self.pending_stream_grants_notify.clone();
@@ -31915,6 +32059,16 @@ impl MeshNode {
                     if partition_filter.contains(&peer_addr) {
                         continue;
                     }
+                    // Per-peer framing: a session that crosses a relay
+                    // hop needs its grants behind a routing header.
+                    let route = session_id_to_node
+                        .get(&session_id)
+                        .and_then(|n| peers.get(&*n).map(|p| p.wire_route(local_id)))
+                        .filter(|r| r.addr == peer_addr)
+                        .unwrap_or(WireRoute {
+                            addr: peer_addr,
+                            header: None,
+                        });
                     // R-5: resolve the peer's SACK-range support once
                     // per session per cycle (cached; see
                     // `peer_supports_ack_ranges`).
@@ -31950,7 +32104,7 @@ impl MeshNode {
                             PacketFlags::NONE,
                             SUBPROTOCOL_STREAM_WINDOW,
                         );
-                        if let Err(e) = sink.send(&packet, peer_addr).await {
+                        if let Err(e) = sink.send(&route.frame(&packet), route.addr).await {
                             tracing::debug!(error = %e, "StreamWindow grant send failed");
                             continue;
                         }
@@ -31977,7 +32131,7 @@ impl MeshNode {
                         &sink,
                         &mut builder,
                         &session,
-                        peer_addr,
+                        route,
                         &nack_events,
                         SUBPROTOCOL_STREAM_NACK,
                         &control_stats.nack_packets_sent,
@@ -31988,7 +32142,7 @@ impl MeshNode {
                         &sink,
                         &mut builder,
                         &session,
-                        peer_addr,
+                        route,
                         &ack_events,
                         SUBPROTOCOL_STREAM_ACK,
                         &control_stats.ack_range_packets_sent,
@@ -32009,6 +32163,7 @@ impl MeshNode {
     /// past `max_retries` are dropped from the window by `get_timed_out`.
     fn spawn_retransmit_loop(&self) -> JoinHandle<()> {
         let peers = self.peers.clone();
+        let local_id = self.node_id;
         let sink = self.sink.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
@@ -32035,14 +32190,18 @@ impl MeshNode {
                 // below (that could deadlock against a concurrent peer
                 // insert/remove on the same shard).
                 let mut work: Vec<(
-                    PeerAddr,
+                    WireRoute,
                     Arc<NetSession>,
                     Vec<Arc<super::RetransmitDescriptor>>,
                 )> = Vec::new();
                 for peer in peers.iter() {
                     let due = peer.value().session.collect_timed_out_retransmits();
                     if !due.is_empty() {
-                        work.push((peer.value().addr(), peer.value().session.clone(), due));
+                        work.push((
+                            peer.value().wire_route(local_id),
+                            peer.value().session.clone(),
+                            due,
+                        ));
                     }
                 }
                 for (addr, session, due) in work {
@@ -32056,7 +32215,7 @@ impl MeshNode {
                             builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
                         }
                         let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
-                        if sink.send(&packet, addr).await.is_ok() {
+                        if sink.send(&addr.frame(&packet), addr.addr).await.is_ok() {
                             control_stats
                                 .retransmit_packets_sent
                                 .fetch_add(1, Ordering::Relaxed);
@@ -32076,7 +32235,7 @@ impl MeshNode {
                 // leave the SENDER waiting on data it has already
                 // discarded its copy of. One egress, one frame type:
                 // the peer's read fails fast either way.
-                let mut resets: Vec<(PeerAddr, Arc<NetSession>, Vec<u64>)> = Vec::new();
+                let mut resets: Vec<(WireRoute, Arc<NetSession>, Vec<u64>)> = Vec::new();
                 for peer in peers.iter() {
                     let mut failed = peer.value().session.take_failed_stream_ids();
                     for stream_id in peer.value().session.take_receive_terminals() {
@@ -32085,7 +32244,11 @@ impl MeshNode {
                         }
                     }
                     if !failed.is_empty() {
-                        resets.push((peer.value().addr(), peer.value().session.clone(), failed));
+                        resets.push((
+                            peer.value().wire_route(local_id),
+                            peer.value().session.clone(),
+                            failed,
+                        ));
                     }
                 }
                 for (addr, session, failed) in resets {
@@ -32129,7 +32292,7 @@ impl MeshNode {
                 // NACKs are harmless (`on_nack` resends are bounded by
                 // `max_retries` and deduped by the receiver).
                 struct TickGaps {
-                    addr: PeerAddr,
+                    addr: WireRoute,
                     session: Arc<NetSession>,
                     reports: Vec<super::session::GapReport>,
                 }
@@ -32149,7 +32312,7 @@ impl MeshNode {
                     let reports = session.collect_gap_reports(want_ranges, MAX_ACK_RANGES);
                     if !reports.is_empty() {
                         work.push(TickGaps {
-                            addr: peer.value().addr(),
+                            addr: peer.value().wire_route(local_id),
                             session: session.clone(),
                             reports,
                         });
@@ -33165,13 +33328,14 @@ impl MeshNode {
         // This path is worse than the subprotocol one it shares the defect
         // with: it awaits once per MTU-sized chunk, so a large batch held the
         // peer shard across a whole sequence of sends.
-        let (peer_addr, session) = {
+        let (route, session) = {
             let peer = self
                 .peers
                 .get(&node_id)
                 .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
-            (peer.addr(), peer.session.clone())
+            (peer.wire_route(self.node_id), peer.session.clone())
         };
+        let peer_addr = route.addr;
         // Partition filter: silently drop sends to blocked peers
         if self.partition_filter.contains(&peer_addr) {
             return Ok(());
@@ -33206,7 +33370,7 @@ impl MeshNode {
                     PacketFlags::NONE
                 };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
-                send_datagram(&self.sink, &packet, peer_addr).await?;
+                send_datagram(&self.sink, &route.frame(&packet), peer_addr).await?;
 
                 current_batch.clear();
                 current_size = 0;
@@ -33227,7 +33391,7 @@ impl MeshNode {
                 PacketFlags::NONE
             };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
-            send_datagram(&self.sink, &packet, peer_addr).await?;
+            send_datagram(&self.sink, &route.frame(&packet), peer_addr).await?;
         }
 
         // builder is dropped here — auto-released back to the pool
@@ -35841,7 +36005,8 @@ impl MeshNode {
         let Some(peer_entry) = ctx.peers.get(&to_node) else {
             return;
         };
-        let dest_addr = peer_entry.value().addr();
+        let route = peer_entry.value().wire_route(ctx.local_node_id);
+        let dest_addr = route.addr;
         if ctx.partition_filter.contains(&dest_addr) {
             return;
         }
@@ -35866,7 +36031,7 @@ impl MeshNode {
                 PacketFlags::NONE,
                 SUBPROTOCOL_IDENTITY_PROOF,
             );
-            let _ = sink.send(&packet, dest_addr).await;
+            let _ = sink.send(&route.frame(&packet), dest_addr).await;
         });
     }
 
@@ -40693,6 +40858,22 @@ impl MeshNode {
             // signature remains valid because `signed_payload()`
             // zeros `hop_count` on verify.
             let fwd_bytes = forwarded.to_bytes();
+            // Only a signature-verified announcement is kept for replay:
+            // replay must carry origin authentication, not a forwarder's
+            // say-so. A newer version supersedes (withdrawal is a newer
+            // announcement without the capability).
+            if signature_verified {
+                match ctx.relay_announcements.entry(ann.node_id) {
+                    dashmap::mapref::entry::Entry::Occupied(mut held) => {
+                        if held.get().version < forwarded.version {
+                            held.insert(forwarded);
+                        }
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(slot) => {
+                        slot.insert(forwarded);
+                    }
+                }
+            }
             Self::forward_capability_announcement(fwd_bytes, ann.node_id, from_node, ctx);
         }
 
@@ -40982,6 +41163,80 @@ impl MeshNode {
                 session.touch();
             }
         });
+    }
+
+    /// Replay every held announcement of another origin to `peer` (a
+    /// session just established): each still unexpired by its origin's
+    /// own signed timestamp, sent exactly as this node forwards it, so
+    /// the origin's signature is what authenticates it. The peer's own
+    /// announcement is never echoed back to it.
+    async fn replay_relay_announcements(
+        peer: u64,
+        relay: Arc<DashMap<u64, CapabilityAnnouncement>>,
+        peers: Arc<DashMap<u64, PeerInfo>>,
+        sink: PeerSink,
+    ) {
+        // The peer installs the session only once it has processed the
+        // handshake reply; frames that overtake that are dropped. Replay
+        // after a short settle, and once more later — the receiver dedups
+        // on (origin, version), so the second pass costs it nothing.
+        for settle in REPLAY_SETTLE {
+            tokio::time::sleep(settle).await;
+            Self::replay_relay_announcements_once(peer, &relay, &peers, &sink).await;
+        }
+    }
+
+    async fn replay_relay_announcements_once(
+        peer: u64,
+        relay: &DashMap<u64, CapabilityAnnouncement>,
+        peers: &DashMap<u64, PeerInfo>,
+        sink: &PeerSink,
+    ) {
+        let held: Vec<Vec<u8>> = relay
+            .iter()
+            .filter(|e| *e.key() != peer && !e.value().is_expired())
+            .map(|e| e.value().to_bytes())
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        let Some(recipient) = peers.get(&peer).map(|p| PeerRecipient {
+            addr: p.addr(),
+            session: p.session.clone(),
+        }) else {
+            return;
+        };
+        for payload in held {
+            let session = &recipient.session;
+            let stream_id = SUBPROTOCOL_CAPABILITY_ANN as u64;
+            let pool = session.thread_local_pool();
+            let mut builder = pool.get();
+            let events = vec![Bytes::from(payload)];
+            let debit = outbound_subprotocol_tx_seq(
+                session,
+                stream_id,
+                SUBPROTOCOL_CAPABILITY_ANN,
+                &events,
+            );
+            let packet = builder.build_subprotocol(
+                stream_id,
+                debit.seq(),
+                &events,
+                PacketFlags::NONE,
+                SUBPROTOCOL_CAPABILITY_ANN,
+            );
+            if send_datagram(sink, &packet, recipient.addr).await.is_ok() {
+                debit.commit();
+            }
+            drop(builder);
+            session.touch();
+        }
+    }
+
+    /// The announcements this node holds for replay to newly attached
+    /// peers, by origin node id (tests / diagnostics).
+    pub fn relay_announcements_len(&self) -> usize {
+        self.relay_announcements.len()
     }
 
     /// Coordinator-side handler for a `PunchRequest` from peer A
@@ -42533,7 +42788,8 @@ impl MeshNode {
         let Some(peer_entry) = ctx.peers.get(&to_node) else {
             return;
         };
-        let dest_addr = peer_entry.value().addr();
+        let route = peer_entry.value().wire_route(ctx.local_node_id);
+        let dest_addr = route.addr;
         if ctx.partition_filter.contains(&dest_addr) {
             return;
         }
@@ -42568,7 +42824,7 @@ impl MeshNode {
             // A discarded send error is still a send that did not
             // happen: commit only on acceptance, and let the drop
             // give the ack's bytes back otherwise.
-            if sink.send(&packet, dest_addr).await.is_ok() {
+            if sink.send(&route.frame(&packet), dest_addr).await.is_ok() {
                 debit.commit();
             }
         });
@@ -43149,8 +43405,12 @@ impl MeshNode {
         events: &[Bytes],
         fragment_session: Option<u64>,
     ) -> PeerPublishOutcome {
-        let (dest_addr, session) = match self.peers.get(&peer_node_id) {
-            Some(p) => (p.value().addr(), p.value().session.clone()),
+        let (dest_addr, session, route) = match self.peers.get(&peer_node_id) {
+            Some(p) => (
+                p.value().addr(),
+                p.value().session.clone(),
+                p.value().wire_route(self.node_id),
+            ),
             None => return PeerPublishOutcome::NoSession,
         };
 
@@ -43296,13 +43556,20 @@ impl MeshNode {
             stream_id, seq, events, flags, 0, /* subprotocol_id 0 = event-plane */
         );
 
-        let next_hop = self
-            .router
-            .routing_table()
-            .lookup(peer_node_id)
-            .unwrap_or(dest_addr);
+        // A session that crosses a relay hop rides a routing header to its
+        // relay; otherwise the legacy next-hop choice stands.
+        let (wire, next_hop) = if route.header.is_some() {
+            (route.frame(&packet), route.addr)
+        } else {
+            let next_hop = self
+                .router
+                .routing_table()
+                .lookup(peer_node_id)
+                .unwrap_or(dest_addr);
+            (std::borrow::Cow::Borrowed(&packet[..]), next_hop)
+        };
 
-        if let Err(e) = self.sink.send(&packet, next_hop).await {
+        if let Err(e) = self.sink.send(&wire, next_hop).await {
             return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                 "publish send failed: {}",
                 e
@@ -43595,13 +43862,14 @@ impl MeshNode {
         // and on the FFI announce path (`net_mesh_announce_capabilities`,
         // which `block_on`s this fan-out) it wedges the calling C / cgo
         // thread with it.
-        let (peer_addr, session) = {
+        let (route, session) = {
             let peer = self
                 .peers
                 .get(&node_id)
                 .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
-            (peer.addr(), Arc::clone(&peer.session))
+            (peer.wire_route(self.node_id), Arc::clone(&peer.session))
         };
+        let peer_addr = route.addr;
         if self.partition_filter.contains(&peer_addr) {
             return Ok(());
         }
@@ -43646,7 +43914,7 @@ impl MeshNode {
             subprotocol_id,
         );
 
-        send_datagram(&self.sink, &packet, peer_addr).await?;
+        send_datagram(&self.sink, &route.frame(&packet), peer_addr).await?;
         debit.commit();
 
         drop(builder);
@@ -44260,6 +44528,9 @@ impl MeshNode {
             {
                 broadcast_ann = broadcast_ann.with_reflex_addr(reflex_snapshot);
             }
+            if self.config.announce_noise_key {
+                broadcast_ann = broadcast_ann.with_noise_pubkey(Some(*self.public_key()));
+            }
             // Stage 4a §5 Layer 1: the RTC discovery fields, each
             // emitted only when the operator configured the thing it
             // describes. A node without `rtc` sets none of them and
@@ -44302,6 +44573,9 @@ impl MeshNode {
                     #[cfg(feature = "nat-traversal")]
                     {
                         a = a.with_reflex_addr(reflex_snapshot);
+                    }
+                    if self.config.announce_noise_key {
+                        a = a.with_noise_pubkey(Some(*self.public_key()));
                     }
                     #[cfg(feature = "webrtc")]
                     {
@@ -45789,7 +46063,6 @@ impl MeshNode {
     /// The peer's announced Noise static key, if it published one
     /// (plan §5 Layer 1) — the key `connect_via` needs and a
     /// browser has no out-of-band way to obtain.
-    #[cfg(feature = "webrtc")]
     pub fn peer_announced_noise_pubkey(&self, peer_node_id: u64) -> Option<[u8; 32]> {
         self.capability_fold.with_state(|state| {
             let keys = state.by_node.get(&peer_node_id)?;
@@ -46973,6 +47246,22 @@ impl MeshNode {
     /// side effect of the capability plane; see
     /// `ensure_reply_subscription` for how the H3 origin binding gets
     /// the pin it needs instead.
+    /// Replay held announcements of other origins to a newly attached
+    /// peer, off the caller's path (see [`Self::replay_relay_announcements`]).
+    fn spawn_relay_replay(&self, peer_node_id: u64) {
+        let (relay, peers, sink) = (
+            self.relay_announcements.clone(),
+            self.peers.clone(),
+            self.sink.clone(),
+        );
+        tokio::spawn(Self::replay_relay_announcements(
+            peer_node_id,
+            relay,
+            peers,
+            sink,
+        ));
+    }
+
     async fn push_local_announcement(&self, peer_node_id: u64) {
         // Serialized through the epoch-checked path (review-9
         // addendum): a late joiner must receive what this node's
@@ -48246,7 +48535,7 @@ impl MeshNode {
         relay_addr: PeerAddr,
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
-    ) -> Result<SessionKeys, AdapterError> {
+    ) -> Result<(SessionKeys, u8), AdapterError> {
         // Build msg1. Prologue uses *routing-identity* (32-bit) versions
         // of (self, dest) — that's what a malicious relay could see and
         // rewrite in the routing header, so binding those bits into the
@@ -48403,7 +48692,8 @@ impl MeshNode {
         // intentionally skip the post-install pingwave /
         // failure_detector / announcement push — see `connect`'s wiring
         // for the direct-handshake-only bookkeeping.
-        self.install_routed(dest_node_id, via, keys, None);
+        let (keys, hops) = keys;
+        self.install_routed(dest_node_id, via, keys, None, hops > 0);
 
         Ok(dest_node_id)
     }
@@ -48511,10 +48801,17 @@ impl MeshNode {
             }
         };
         let expected = Some(expected_prior_session_id);
+        let (keys, hops) = keys;
         let outcome = if direct {
             self.install_direct(dest_node_id, PeerAddr::Udp(target_addr), keys, expected)
         } else {
-            self.install_routed(dest_node_id, PeerAddr::Udp(target_addr), keys, expected)
+            self.install_routed(
+                dest_node_id,
+                PeerAddr::Udp(target_addr),
+                keys,
+                expected,
+                hops > 0,
+            )
         };
         Ok(outcome.owned)
     }
@@ -49026,6 +49323,58 @@ impl MeshNode {
                 }
             }
         })
+    }
+
+    /// Make sure this node holds a live, endpoint-authenticated session
+    /// with `target` before talking to it (V3 decision 1): a node learned
+    /// through a hub is reachable even though no session was ever opened.
+    ///
+    /// - A live session already held: [`SessionPath::Existing`].
+    /// - Otherwise the target's Noise static key is read from ITS OWN
+    ///   signed capability announcement (see
+    ///   [`MeshNodeConfig::announce_noise_key`]); without one there is
+    ///   nothing to authenticate the session against, and this fails.
+    /// - Direct first: when the target announced an address this node can
+    ///   dial (its reflex address), a direct handshake is tried with half
+    ///   the budget — "no session" is not proof that direct is impossible.
+    /// - Relay fallback: a routed handshake through the hop the target's
+    ///   forwarded announcement installed ([`Self::connect_routed`]).
+    ///
+    /// Either way the handshake authenticates the target's static key end
+    /// to end; the hub relays opaque frames. Nothing is invoked here, and
+    /// nothing runs under the hub's identity.
+    pub async fn ensure_session(
+        &self,
+        target: u64,
+        budget: Duration,
+    ) -> Result<SessionPath, AdapterError> {
+        if self.peers.contains_key(&target) && !self.peer_session_is_silent(target) {
+            return Ok(SessionPath::Existing);
+        }
+        let key = self.peer_announced_noise_pubkey(target).ok_or_else(|| {
+            AdapterError::Connection(format!(
+                "no session with {target:#x} and it announced no Noise key to open one with"
+            ))
+        })?;
+        let deadline = tokio::time::Instant::now() + budget;
+        #[cfg(feature = "nat-traversal")]
+        if let Some(addr) = self.peer_reflex_addr(target) {
+            // A bounded slice: an unreachable announced address must not
+            // spend the budget the relay fallback needs.
+            let direct = (budget / 2).min(DIRECT_ATTEMPT_MAX);
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(direct, self.connect_via(addr, &key, target)).await
+            {
+                return Ok(SessionPath::Direct);
+            }
+        }
+        match tokio::time::timeout_at(deadline, self.connect_routed(&key, target)).await {
+            Ok(Ok(_)) => Ok(SessionPath::Relayed),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(AdapterError::Connection(format!(
+                "no session with {target:#x} within {budget:?}"
+            ))),
+        }
     }
 
     /// Connect to a peer by node id, using the routing table to pick the
@@ -52464,6 +52813,7 @@ mod heartbeat_aead_tests {
                 transport: PeerTransport::Routed {
                     relay,
                     adjacent_relay_identity: None,
+                    transit: false,
                 },
                 session: fresh_session,
                 remote_static_pub: [0u8; 32],
@@ -52562,6 +52912,7 @@ mod heartbeat_aead_tests {
                 transport: PeerTransport::Routed {
                     relay,
                     adjacent_relay_identity: None,
+                    transit: false,
                 },
                 session,
                 remote_static_pub: [0u8; 32],
@@ -52763,14 +53114,14 @@ mod heartbeat_aead_tests {
         let relay_addr: PeerAddr = PeerAddr::Udp("10.9.9.9:9100".parse().unwrap());
         let (relay_keys, _) = make_session_keys();
         let relay_session_id = relay_keys.session_id;
-        node.install_routed(peer_id, relay_addr, relay_keys, None);
+        node.install_routed(peer_id, relay_addr, relay_keys, None, false);
 
         // A racing rotation installs a DIFFERENT session for the peer
         // (simulated by a plain install). The upgrade below still holds
         // the OLD session_id as its expectation.
         let (raced_keys, _) = make_session_keys();
         let raced_session_id = raced_keys.session_id;
-        node.install_routed(peer_id, relay_addr, raced_keys, None);
+        node.install_routed(peer_id, relay_addr, raced_keys, None, false);
 
         // Upgrade tries to install a punched session but expects the
         // pre-race session_id → CAS must refuse.
@@ -52950,7 +53301,7 @@ mod heartbeat_aead_tests {
         let dest_id = 0x0DE5_7000u64;
         let relay_addr: PeerAddr = PeerAddr::Udp("10.8.8.8:9100".parse().unwrap());
         let (keys, _) = make_session_keys();
-        node.install_routed(dest_id, relay_addr, keys, None);
+        node.install_routed(dest_id, relay_addr, keys, None, false);
 
         assert_eq!(
             node.router.routing_table().lookup(dest_id),

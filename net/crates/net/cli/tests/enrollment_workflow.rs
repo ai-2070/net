@@ -409,15 +409,9 @@ async fn three_participants_join_publish_are_selectively_removed_and_invoke_as_e
         .arg(c.state())
         .args(["--bind", "127.0.0.1:0", "--pin-store"])
         .arg(&pins)
-        // C attaches directly to B's provider node, as its enrolled self.
-        .args([
-            "--node-addr",
-            wrapped["connection"]["bind"].as_str().unwrap(),
-            "--node-pubkey",
-            wrapped["connection"]["node_pubkey"].as_str().unwrap(),
-            "--node-id",
-            provider_node,
-        ])
+        // C attaches to the node it enrolled with — the hub — only. It
+        // learns of B from the hub's replay (B announced before C attached)
+        // and reaches B through a session the SDK opens on demand.
         .spawn()
         .unwrap();
     let mut mcp = client::Client::new(caller.stdin.take().unwrap(), caller.stdout.take().unwrap());
@@ -444,7 +438,7 @@ async fn three_participants_join_publish_are_selectively_removed_and_invoke_as_e
     .await;
     assert!(
         discovered.is_ok(),
-        "C discovers B's tool across the mesh; last search: {}",
+        "C discovers B's tool through the hub; last search: {}",
         last
     );
     let call = json!({"cap_id": cap_id, "arguments": {"message": "calibrate"}});
@@ -471,6 +465,62 @@ async fn three_participants_join_publish_are_selectively_removed_and_invoke_as_e
         serde_json::from_str::<Value>(&records).unwrap(),
         json!({"message": "calibrate"})
     );
+    // D is enrolled too, but B never allowed it. Knowing the capability id
+    // and pinning it locally changes nothing: B's own owner scope refuses
+    // the call over D's own session — a local pin is not provider
+    // authority, and the hub lends none.
+    let d = Fx::new();
+    let d_link = operator.json(&["invite", "create"]);
+    d.json(&["join", d_link["token"].as_str().unwrap(), "--yes"]);
+    let d_pins = d.tmp.path().join("pins.json");
+    let mut stranger = d
+        .async_base()
+        .args(["--timeout", "30s", "mcp", "serve", "--joined"])
+        .arg(d.state())
+        .args(["--bind", "127.0.0.1:0", "--pin-store"])
+        .arg(&d_pins)
+        .spawn()
+        .unwrap();
+    let mut d_mcp = client::Client::new(
+        stranger.stdin.take().unwrap(),
+        stranger.stdout.take().unwrap(),
+    );
+    d_mcp.initialize().await;
+    // B's owner scope gates its catalog too: D's search does not list the
+    // tool (a denied describe makes the provider invisible to D).
+    let found = d_mcp
+        .tool("net_search_capabilities", json!({"query": "journey_echo"}))
+        .await;
+    assert!(
+        !client::text(&found).contains(&cap_id),
+        "an unauthorized device does not discover the tool: {found}"
+    );
+    let approved = d
+        .base()
+        .args(["mcp", "pin", "approve", &cap_id, "--pin-store"])
+        .arg(&d_pins)
+        .output()
+        .unwrap();
+    assert!(approved.status.success(), "{approved:?}");
+    let denied = d_mcp
+        .tool(
+            "net_invoke_capability",
+            json!({"cap_id": cap_id, "arguments": {"message": "not allowed"}}),
+        )
+        .await;
+    assert_eq!(denied["isError"], true, "{denied}");
+    assert!(
+        client::text(&denied).contains("Denied"),
+        "refused by B's owner scope: {denied}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&audit).unwrap().lines().count(),
+        1,
+        "the refusal precedes any provider effect"
+    );
+    drop(d_mcp);
+    let _ = tokio::time::timeout(Duration::from_secs(15), stranger.wait()).await;
+
     control.write_all(b"stop").await.unwrap();
     drop(mcp);
     let _ = tokio::time::timeout(Duration::from_secs(15), caller.wait()).await;

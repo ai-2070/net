@@ -237,7 +237,7 @@ pub use mesh::SensingOffLockObservation;
 pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
     ControlPlaneStats, MeshNode, MeshNodeConfig, NoiseStaticKey, PartitionFilter,
-    PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay,
+    PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay, SessionPath,
     SensingRegistrationError, SubnetFloorQueryError, UnregisteredChannelPolicy,
     ACK_RANGES_CAPABILITY_TAG,
 };

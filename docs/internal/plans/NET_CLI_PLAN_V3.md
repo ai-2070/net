@@ -3731,7 +3731,10 @@ Gates: CLI clippy `--all-targets`; CLI 365/365.
   - nRPC needs a direct or relayed session to the provider, which neither
     `mcp serve` nor the gateway opens.
 
-  Invoking across the hub remains future work.
+  Invoking across the hub remains future work. **Resolved by S6**: the hub
+  replays held announcements to late attachers, and the gateway opens an
+  endpoint-authenticated session (direct first, relay fallback) before
+  calling. The peer override remains available but is no longer needed.
 
 Witness `cli/tests/enrollment_workflow.rs` (auto-discovered): all real
 subprocesses on loopback, `--no-port-mapping`.
@@ -4223,6 +4226,120 @@ not by a subprocess.
 | E23 | The offer shape is `{channel, root, rights}` by user decision |
 | E24 | Channel-specific crash recovery; the generic ledger recovery covers it |
 | E25 | Expired and revoked chains at the gates, in a CLI test |
+
+**S6 receipt: device-to-device calls through the hub (decision 1, 2026-09-25).**
+
+Two gaps blocked the call, and fixing them exposed a third.
+
+1. **Discovery replay (core `MeshNode`).**
+   - What is cached: each forwarder keeps the latest *signature-verified*
+     announcement of every other origin, in its forwarded form, keyed by
+     origin and superseded only by a higher version. A withdrawal is a newer
+     version without the capability, so it supersedes too.
+   - When it is replayed: to every newly established session. That covers
+     `connect`, `accept` and the routed-handshake responder, after short
+     settle delays so the peer has installed its session first.
+   - What is filtered out: anything already expired by the origin's own
+     signed `timestamp_ns`, and the peer's own announcement.
+   - Authentication: the bytes are exactly as forwarded, so the origin's
+     signature is what authenticates them. Replay adds no authority.
+2. **No lifetime refresh.** A receiver now bounds a forwarded announcement
+   (`hop_count > 0`) by its origin's timestamp. `effective_ttl_secs` is
+   `ttl - max(0, age - 30s skew)`, so neither forwarding nor replay can
+   extend stale authority. A directly received announcement keeps its full
+   TTL, as before.
+3. **Session establishment in the SDK.**
+   - API: `MeshNode::ensure_session`, exposed as `Mesh::ensure_session`,
+     returns `SessionPath::{Existing, Direct, Relayed}`.
+   - Key source: the target's Noise static key comes from its own signed
+     announcement. It is opt-in via `MeshNodeConfig::announce_noise_key`,
+     off by default because older peers verify a different transcript.
+     `up` and `--joined` turn it on.
+   - Order: a direct attempt to the announced reflex address with
+     `min(budget/2, 3s)`, then a routed handshake through the hop the
+     forwarded announcement installed.
+   - Authentication: the Noise handshake authenticates the provider's key
+     end to end. The hub relays opaque frames, and nothing runs under the
+     operator's identity.
+   - MCP consumer: the gateway's `call_once` calls `ensure_session` with at
+     most half the call timeout, capped at 5s, before invoking.
+4. **Relay transit (root cause found while witnessing 3).**
+   - The bug: every per-peer sender addressed `peer.addr()`. For a routed
+     session that is the relay's address, and the relay has no session for
+     frames addressed to it, so it dropped them. The handshake worked; the
+     first RPC did not.
+   - The fix: `PeerTransport::Routed` gains `transit`. The responder sets
+     it from the arriving `routing_header.hop_count > 0`; the initiator
+     takes it from msg2's hop count, carried out of the handshake with the
+     keys. `PeerInfo::wire_route` yields a `WireRoute { addr, header }`
+     that frames a packet in a `RoutingHeader` (dest, src, TTL 8) only for
+     a transit session.
+   - Sites that use it:
+     - subprotocol send;
+     - membership ACK and identity-proof frames;
+     - control chunks;
+     - the grant drainer;
+     - retransmit and NACK resend;
+     - `send_to_peer_node`;
+     - the stream publish path.
+   - Heartbeats are not wrapped: they stay hop-local, per the approved
+     design.
+   - Unchanged: a direct session, or a routed session the relay terminates
+     itself, keeps the bare framing.
+5. **Removed as redundant.** An extra identity proof over the new session
+   was dropped: its mutation (skipping it) stayed GREEN, because the Noise
+   handshake against the announced key already binds the endpoint.
+
+Witnesses (`tests/capability_multihop.rs`, already pinned):
+
+| Test | Proves |
+|---|---|
+| `a_late_attacher_discovers_and_reaches_a_provider_through_its_hub` | B announces before C attaches; C still discovers B through the hub's replay |
+| `forwarding_or_replay_never_refreshes_an_announcement_lifetime` | A forwarded or replayed announcement expires on its origin's clock |
+| `devices_attached_to_a_hub_by_routed_handshakes_reach_each_other` | Two hub-attached devices open a relayed session to each other |
+| `a_call_to_a_provider_crosses_the_hub_over_the_relayed_session` | An nRPC call and its reply cross a relayed session |
+| `a_call_crosses_a_hub_the_endpoints_are_directly_attached_to` | The same, when both endpoints hold direct sessions only to the hub |
+| `membership_crosses_a_two_hop_relayed_session` | Membership and control frames cross the relay (the grant drainer and ACK sites) |
+
+CLI journey (`cli/tests/enrollment_workflow.rs`, `three_participants`):
+- C's `mcp serve --joined` attaches only to the operator, with no peer
+  override, and calls B's tool.
+- Device D is enrolled mesh-only and is not in B's allow list:
+  - B's tool does not appear in D's `net_search_capabilities`;
+  - after a local pin, invoking the known `cap_id` is refused ("Denied"),
+    with no provider record.
+
+Inverse mutations, all RED (6):
+
+| # | Mutation |
+|---|---|
+| Z1 | No replay to new sessions |
+| Z2 | A forwarded announcement's lifetime is refreshed |
+| Z3 | Per-peer sends skip the routing header |
+| Z5 | The gateway does not open a session (journey) |
+| Z6 | The responder ignores the arriving hop count |
+| Z7 | The noise key is never announced |
+
+Z4 (skip the extra identity proof) stayed GREEN, so the proof was removed
+(item 5).
+
+**Compatibility.** `announce_noise_key` defaults to off, so the default
+announcement is byte-identical to before; the `rtc_signalling` wire-compat
+test is unchanged. `transit` affects only sessions established through a
+relay hop.
+
+**Limit.** The direct attempt needs `nat-traversal`, where the reflex
+address is announced. Without it `ensure_session` goes straight to the
+relay.
+
+Gates:
+- core clippy strict (all, default, no-default features) and all-targets;
+- root and SDK rustdoc `-D warnings`;
+- SDK, MCP and CLI clippy;
+- `cargo tl` 5818/5818 and `cargo t` 7046/7046;
+- SDK 831/831, MCP adapter 275/275 (`dependency_boundary` included), CLI
+  374/374 (journey included); `capability_multihop` 13/13.
+
 
 ## 8. Cumulative acceptance matrix
 

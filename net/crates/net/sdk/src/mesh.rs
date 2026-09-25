@@ -140,6 +140,7 @@ pub struct MeshBuilder {
     reflex_override: Option<SocketAddr>,
     #[cfg(feature = "port-mapping")]
     try_port_mapping: bool,
+    announce_noise_key: bool,
     #[cfg(feature = "nat-traversal")]
     auto_direct_upgrade: bool,
 }
@@ -173,6 +174,7 @@ impl MeshBuilder {
             reflex_override: None,
             #[cfg(feature = "port-mapping")]
             try_port_mapping: false,
+            announce_noise_key: false,
             #[cfg(feature = "nat-traversal")]
             auto_direct_upgrade: true,
         })
@@ -402,6 +404,16 @@ impl MeshBuilder {
         self
     }
 
+    /// Carry this node's Noise static public key in its signed capability
+    /// announcements, so a peer that learns of it through a hub can open an
+    /// endpoint-authenticated session to it ([`Mesh::ensure_session`]).
+    /// Off by default: a peer predating the field would drop the
+    /// announcement.
+    pub fn announce_noise_key(mut self, announce: bool) -> Self {
+        self.announce_noise_key = announce;
+        self
+    }
+
     /// Enable the background direct-path upgrade: once a session
     /// to a peer is established via a relay, the mesh
     /// opportunistically re-handshakes over a direct path and
@@ -497,6 +509,9 @@ impl MeshBuilder {
         #[cfg(feature = "nat-traversal")]
         if let Some(external) = self.reflex_override {
             config = config.with_reflex_override(external);
+        }
+        if self.announce_noise_key {
+            config = config.with_announce_noise_key(true);
         }
         #[cfg(feature = "port-mapping")]
         if self.try_port_mapping {
@@ -739,6 +754,19 @@ impl Mesh {
     /// the routed-handshake protocol — the initiator's full
     /// `node_id` rides inside the Noise msg1 payload, so the
     /// responder learns it on demand. No pre-`accept` needed.
+    /// Make sure a live, endpoint-authenticated session with `node_id`
+    /// exists before talking to it: an existing one, a direct handshake to
+    /// an address it announced, or a routed one through the hop its
+    /// forwarded announcement installed — using the Noise key it signed
+    /// into its own announcement. See the core `MeshNode::ensure_session`.
+    pub async fn ensure_session(
+        &self,
+        node_id: u64,
+        budget: std::time::Duration,
+    ) -> Result<net::adapter::net::SessionPath> {
+        Ok(self.node.ensure_session(node_id, budget).await?)
+    }
+
     pub async fn connect_via(
         &self,
         relay_addr: &str,

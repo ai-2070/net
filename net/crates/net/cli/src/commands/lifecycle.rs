@@ -3495,7 +3495,10 @@ pub async fn run_up(
     let mut builder = built?
         .identity(identity.clone())
         .noise_static_key(net::adapter::net::NoiseStaticKey::from_private(noise_key))
-        .try_port_mapping(port_mapping);
+        .try_port_mapping(port_mapping)
+        // Managed nodes announce their Noise key, so a peer that learns of
+        // them through a hub can reach them (`ensure_session`).
+        .announce_noise_key(true);
     if let Some(issuer) = &subnet_issuer {
         let authority = issuer.grant().authority.clone();
         builder = builder

@@ -7026,6 +7026,7 @@ fn seed_peer(node: &MeshNode, node_id: u64, direct: bool) -> u64 {
                 PeerTransport::Routed {
                     relay: addr,
                     adjacent_relay_identity: None,
+                    transit: false,
                 }
             },
             session,
@@ -7895,6 +7896,7 @@ fn flip_peer_transport(node: &MeshNode, node_id: u64) -> bool {
         PeerTransport::Direct { .. } => PeerTransport::Routed {
             relay: addr,
             adjacent_relay_identity: None,
+            transit: false,
         },
         PeerTransport::Routed { .. } => PeerTransport::Direct { owned: addr },
     };
