@@ -10,7 +10,7 @@
 
 **Net is what the internet would look like if it were built today** — the Net inspired by the Cyberpunk
 universe, built for real machines. A flat, latency-first, end-to-end encrypted mesh where every
-agent, service, and device is an equal node: no clients, no servers, no coordinators. The mesh
+computer, device, app, and agent is an equal node: no clients, no servers, no coordinators. The mesh
 propagates state, not connections.
 
 You find what another machine can do, call it through typed RPC, and move artifacts between
