@@ -1,0 +1,22 @@
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  h_64425bc75e3f3d 1933-1943,1989-1992,2108-2114,2140-2143
+net/crates/net/bindings/python/tests/test_org_live.py
+  h_64425bc75e3f3d 54,64-95,97-118,641-726,744-751,828-842,942-1020
+net/crates/net/bindings/python/tests/test_runtime_teardown_no_deadlock.py
+  h_64425bc75e3f3d 49-99
+net/crates/net/sdk-py/examples/org_streaming_consumer.py
+  h_64425bc75e3f3d 583-590,668-689,706-710
+net/crates/net/sdk-py/tests/test_org_streaming.py
+  h_64425bc75e3f3d 90-116,119-121,377-380,383,386-479
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4668c3ae0592587798a05e384957b718d1db8974",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
