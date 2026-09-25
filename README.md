@@ -212,16 +212,17 @@ The rest of the surface, one line each; every entry links to the page that goes 
 
 | Surface | One line | Read |
 |---|---|---|
+| Organizations | Cross-org authority: memberships, grants and revocation floors over one identity | [Organizations](https://ai2070.net/docs/concepts/organizations) |
 | Subnets | Boundaries derived from capability tags, enforced at the channel — not VLANs | [Subnets](https://ai2070.net/docs/concepts/subnets) |
-| MeshDB | Federated queries across nodes over the same facade | [Federated queries](https://ai2070.net/docs/guides/netdb-queries#federated-queries-meshdb) |
-| Scheduler | Atomic gang-claim of a contended resource, with a task lifecycle on top | [Gang scheduler](https://ai2070.net/docs/guides/gang-scheduler), [Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle) |
-| MCP bridge | Wrap a stdio MCP server into mesh capabilities, or serve the mesh as MCP | [Wrap MCP](https://ai2070.net/docs/guides/wrap-mcp-server), [Expose as MCP](https://ai2070.net/docs/guides/expose-net-as-mcp) |
-| Payments | x402 pricing, quotes, settlement, spend policy — signed facts around a call | [Net payments](https://ai2070.net/docs/payments/what-net-payments-is) |
-| A2A | Hand a long job to an agent that doesn't share your memory | [Agent to agent](https://ai2070.net/docs/guides/agent-to-agent) |
 | Subprotocols | Opaque forwarding, version negotiation, a protocol runtime not a fixed protocol | [Subprotocol IDs](https://ai2070.net/docs/reference/subprotocol-ids) |
-| Delegation | Child seeds and revocation for delegated identity | [Agent identity](https://ai2070.net/docs/concepts/agent-identity) |
-| Operator surface | MeshOS supervision and the Deck TUI | [Deck](https://ai2070.net/docs/reference/deck) |
-| Security | No plaintext on relays, no clock dependency, no trusted intermediary | [Security model](https://ai2070.net/docs/concepts/security-model) |
+| RedEX & CortEX | Durable append-only logs, and the folded state built on them | [Storage stack](https://ai2070.net/docs/concepts/storage-stack), [Durable logs](https://ai2070.net/docs/guides/durable-logs), [Folds](https://ai2070.net/docs/guides/cortex-folds) |
+| MeshOS | Long-running stateful daemons, placement and lifecycle | [Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement) |
+| Scheduler | Atomic gang-claim of a contended resource, with a task lifecycle on top | [Gang scheduler](https://ai2070.net/docs/guides/gang-scheduler), [Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle) |
+| CLI | `net-mesh` — managed nodes, join links, capability hosting, typegen, local stores | [CLI reference](https://ai2070.net/docs/reference/cli) |
+| Deck TUI | Operator TUI over the substrate | [Deck](https://ai2070.net/docs/reference/deck) |
+| A2A | Hand a long job to an agent that doesn't share your memory | [Agent to agent](https://ai2070.net/docs/guides/agent-to-agent) |
+| Payments | x402 pricing, quotes, settlement, spend policy — signed facts around a call | [Net payments](https://ai2070.net/docs/payments/what-net-payments-is) |
+| MCP bridge | Wrap a stdio MCP server into mesh capabilities, or serve the mesh as MCP | [Wrap MCP](https://ai2070.net/docs/guides/wrap-mcp-server), [Expose as MCP](https://ai2070.net/docs/guides/expose-net-as-mcp) |
 
 ## Performance
 
