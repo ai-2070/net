@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="1" failures="0" skipped="0" tests="1" time="0.949" timestamp="2026-09-23T16:52:08.204853+02:00" hostname="DESKTOP-DBV2TLT"><testcase classname="" name="tests.test_packaging_metadata" time="0.000"><error message="collection failure">ImportError while importing test module 'C:\Users\chief\orca\workspaces\net\org-streaming\net\crates\net\sdk-py\tests\test_packaging_metadata.py'.
-Hint: make sure your test modules/packages have valid Python names.
-Traceback:
-C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.10_3.10.3056.0_x64__qbz5n2kfra8p0\lib\importlib\__init__.py:126: in import_module
-    return _bootstrap._gcd_import(name[level:], package, level)
-tests\test_packaging_metadata.py:17: in &lt;module&gt;
-    import tomllib
-E   ModuleNotFoundError: No module named 'tomllib'</error></testcase></testsuite></testsuites>

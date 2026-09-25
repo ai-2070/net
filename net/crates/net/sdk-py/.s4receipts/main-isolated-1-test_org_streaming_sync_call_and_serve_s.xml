@@ -1,1 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="4.365" timestamp="2026-09-24T00:27:41.913445+02:00" hostname="DESKTOP-DBV2TLT"><testcase classname="tests.test_org_streaming" name="test_org_streaming_sync_call_and_serve[same_org]" time="4.247" /></testsuite></testsuites>

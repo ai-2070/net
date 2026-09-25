@@ -1,1 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="1.672" timestamp="2026-09-24T01:13:55.238300+02:00" hostname="DESKTOP-DBV2TLT"><testcase classname="tests.test_org_streaming" name="test_unary_call_and_serve_preserved_through_net_sdk" time="1.556" /></testsuite></testsuites>
