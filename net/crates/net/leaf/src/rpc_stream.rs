@@ -200,6 +200,27 @@ impl RetireReason {
         }
     }
 
+    /// Decode [`Self::as_str`] back, exactly — the proxy envelope's
+    /// retire reason. A call terminal crosses the leader→follower proxy
+    /// as its PRECISE reason, never the frozen `retired()` vocabulary
+    /// (which folds `ResourceExhausted` into `cancelled`: the follower
+    /// then rendered `cancelled` where a direct call renders
+    /// `admission-denied` / `unavailable` — §23 audit). An unknown text
+    /// is `Cancelled`.
+    pub fn from_proxy_text(text: &str) -> Self {
+        match text {
+            "timeout" => Self::Timeout,
+            "cancelled" => Self::Cancelled,
+            "revoked" => Self::Revoked,
+            "session-lost" => Self::SessionLost,
+            "leader-lost" => Self::LeaderLost,
+            "node-closed" => Self::NodeClosed,
+            "replaced" => Self::Replaced,
+            "resource-exhausted" => Self::ResourceExhausted,
+            _ => Self::Cancelled,
+        }
+    }
+
     /// The wire terminal vocabulary this retirement maps onto.
     pub fn wire_reason(self) -> rpc_wire::StreamTerminalReason {
         use rpc_wire::StreamTerminalReason as W;
@@ -1259,4 +1280,33 @@ pub fn attach_signed_admission(
     req.validate_wire_bounds()
         .map_err(|e| MintError::WireBounds(format!("{e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod retire_reason_tests {
+    use super::RetireReason;
+
+    /// Every retirement crosses the leader→follower proxy as ITSELF, so a
+    /// follower's terminal item matches a direct call's (§23 audit: the
+    /// envelope used the frozen `retired()` text, and `ResourceExhausted`
+    /// arrived as `Cancelled`).
+    #[test]
+    fn every_retire_reason_round_trips_through_its_proxy_text() {
+        for reason in [
+            RetireReason::Timeout,
+            RetireReason::Cancelled,
+            RetireReason::Revoked,
+            RetireReason::SessionLost,
+            RetireReason::LeaderLost,
+            RetireReason::NodeClosed,
+            RetireReason::Replaced,
+            RetireReason::ResourceExhausted,
+        ] {
+            assert_eq!(
+                RetireReason::from_proxy_text(reason.as_str()),
+                reason,
+                "{reason:?}"
+            );
+        }
+    }
 }

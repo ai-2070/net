@@ -602,6 +602,21 @@ fn stat_obj<'a>(result: &'a StepResult, key: &str) -> Option<&'a Value> {
     result.stats.as_ref().and_then(|s| s.get(key))
 }
 
+/// The thrown class of a recorded `typedFailure` object (the page's
+/// `{ kind, message, stats: { coarse, error_class } }` shape) — how a
+/// refusal the page RECORDED rather than returned is typed.
+fn recorded_class(refusal: Option<&Value>) -> Option<&str> {
+    refusal?.get("stats")?.get("error_class")?.as_str()
+}
+
+/// The recorded refusal's verbatim message, for the ledger line.
+fn recorded_message(refusal: Option<&Value>) -> &str {
+    refusal
+        .and_then(|r| r.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("-")
+}
+
 /// `query()`'s peer list — a TOP-LEVEL `StepResult` field, not a
 /// `stats` entry (reading it through `stat_obj` can never match).
 fn peers_of(result: &StepResult) -> Option<&Value> {
@@ -3301,7 +3316,14 @@ async fn client_stream_backpressure(
             upload_send_step("cs-bp", &[b"late-after-end".to_vec()]),
         )
         .await;
-    let late_refused = stat_obj(&late, "refused").is_some();
+    // The refusal is RECORDED under `stats.refused` (the step itself
+    // reports ok — the call still holds its result), so its typed
+    // class lives there, not in the step's own `stats.error_class`.
+    // A send after END is the upload sink's typed closed refusal:
+    // exactly `OrgCancelledError`, never an untyped/unknown failure.
+    let late_refusal = stat_obj(&late, "refused");
+    let late_class = recorded_class(late_refusal);
+    let late_refused = late_class == Some("OrgCancelledError");
     let records = services.log.for_service(N_CS_BP);
     let collected_exact = records.last().map(|r| r.payload == joined).unwrap_or(false);
 
@@ -3312,13 +3334,14 @@ async fn client_stream_backpressure(
             "upload window=2 CHUNK CREDITS at a SLOW consumer (400 ms/chunk): parked {parked}/4 \
              early sends >250ms (credit parks the caller's send); half-close EOF delivered the \
              EXACT concatenation reply={} (want {}) so FLAG_END reached the handler; late upload \
-             after END: typed refusal={} ({}) — delivers nothing, cancels nothing (the result \
-             stood: {eof_exact}); handler collected == exact upload set: {collected_exact}; \
-             sends {} + {} ok",
+             after END: typed refusal={} (class={} want OrgCancelledError, message={:?}) — \
+             delivers nothing, cancels nothing (the result stood: {eof_exact}); handler \
+             collected == exact upload set: {collected_exact}; sends {} + {} ok",
             hex(&reply),
             hex(&expected),
             late_refused,
-            typed(&late),
+            late_class.unwrap_or("-"),
+            recorded_message(late_refusal),
             stat_u64(&send1, "sent"),
             stat_u64(&send2, "sent")
         ),
@@ -4475,6 +4498,12 @@ async fn handler_completion_after_retirement(
     let pre_only = items
         .iter()
         .all(|i| i == &hex(b"hr-0") || i == &hex(b"hr-1"));
+    // The handler's post-retirement send REFUSED TYPED: the page
+    // records what the sink threw, and it must be the closed refusal's
+    // class — `OrgCancelledError` — not merely "something was thrown".
+    let handler_refusal = record.get("refused");
+    let handler_class = recorded_class(handler_refusal);
+    let refused_typed = handler_class == Some("OrgCancelledError");
 
     ledger.record(
         witness,
@@ -4484,7 +4513,8 @@ async fn handler_completion_after_retirement(
             && retirement_first
             && late_attempted
             && return_discarded
-            && pre_only,
+            && pre_only
+            && refused_typed,
         format!(
             "handler deferred 800ms past its call's retirement (caller cancelled mid-stream: \
              {}); the retirement observable fired ({retired_at:?}) and the handler's completion \
@@ -4500,8 +4530,11 @@ async fn handler_completion_after_retirement(
              throughout ({pair_before} -> {mid_pair} -> {after_pair}) because the org relay rides \
              session streams, not routed transits — the discard's wire-side evidence is the \
              attempted-vs-delivered pair above (the F-S3.1-2 level as an executable \
-             observation); open-typed={}",
+             observation); the handler's sink refusal after retirement: class={} (want \
+             OrgCancelledError: {refused_typed}) message={:?}; open-typed={}",
             typed(&cancel),
+            handler_class.unwrap_or("-"),
+            recorded_message(handler_refusal),
             typed(&open),
         ),
     );

@@ -469,6 +469,13 @@ export class OrgMalformedError extends OrgStreamError {
  * outcomes; both arrive at the terminal vocabulary as `cancelled`
  * (the frozen retire → terminal map), and the raw string is what tells
  * them apart.
+ *
+ * `resource-exhausted` is the leaf's byte-budget retirement
+ * (`RetireReason::ResourceExhausted`'s spelling). Its precise
+ * observable is the `admission-denied` / `unavailable` denial — the
+ * same class the byte-budget send refusal on that call re-types as
+ * ({@link ORG_SINK_BUDGET_REFUSAL}) — never a cancel and never a
+ * teardown verdict.
  */
 export type OrgRetireReason =
   | 'timeout'
@@ -477,7 +484,8 @@ export type OrgRetireReason =
   | 'session-lost'
   | 'leader-lost'
   | 'node-closed'
-  | 'replaced';
+  | 'replaced'
+  | 'resource-exhausted';
 
 /**
  * THE typed closed refusal of a handler-side sink after retirement —
@@ -554,6 +562,11 @@ export function orgRetireError(reason: OrgRetireReason): OrgStreamError {
     case 'node-closed':
     case 'replaced':
       return new OrgCancelledError();
+    case 'resource-exhausted':
+      // The byte-budget retirement: the leaf's frozen map sends it as
+      // `admission-denied` / `unavailable`, and the send refused on
+      // the same call re-types as exactly that denial.
+      return new OrgAdmissionDeniedError('unavailable');
   }
 }
 
@@ -617,6 +630,7 @@ export function orgRetireReason(raw: string): OrgRetireReason {
     case 'leader-lost':
     case 'node-closed':
     case 'replaced':
+    case 'resource-exhausted':
       return raw;
     default:
       return 'replaced';

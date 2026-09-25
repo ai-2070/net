@@ -2288,7 +2288,7 @@ impl LeaderBackend for NodeBackend {
                                     StreamTerminal::Retired { reason } => {
                                         reply.bytes(envelope(
                                             crate::leader::ORG_ENVELOPE_RETIRED,
-                                            crate::wasm::retire_reason_text(reason).as_bytes(),
+                                            reason.as_str().as_bytes(),
                                         ));
                                     }
                                     StreamTerminal::Refused { status, body } => {
@@ -3515,19 +3515,10 @@ fn decode_org_envelope(envelope: &[u8]) -> Result<crate::wasm::OrgPoll, JsError>
     }
 }
 
-/// The `OrgRetireReason` strings back to the typed reason.
+/// The `OrgRetireReason` strings back to the typed reason
+/// ([`RetireReason::from_proxy_text`]).
 fn reason_from_str(text: &str) -> RetireReason {
-    match text {
-        "timeout" => RetireReason::Timeout,
-        "cancelled" => RetireReason::Cancelled,
-        "revoked" => RetireReason::Revoked,
-        "session-lost" => RetireReason::SessionLost,
-        "leader-lost" => RetireReason::LeaderLost,
-        "node-closed" => RetireReason::NodeClosed,
-        "replaced" => RetireReason::Replaced,
-        "resource-exhausted" => RetireReason::ResourceExhausted,
-        _ => RetireReason::Cancelled,
-    }
+    RetireReason::from_proxy_text(text)
 }
 
 /// A proxied typed failure, as the terminal the JS surface sees.

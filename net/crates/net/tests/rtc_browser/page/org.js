@@ -196,6 +196,10 @@ function recordInvocation(state, phase, caller, requestHex) {
     retired_at: null,
     completed_at: null,
     result_hex: null,
+    // The typed refusal the handler's sink threw after retirement
+    // (`typedFailure` shape), so the runner asserts its CLASS rather
+    // than only that something was thrown.
+    refused: null,
   };
   state.calls.push(entry);
   return entry;
@@ -396,6 +400,7 @@ async function execute(step) {
                 // (`org: the response sink is closed: the call was
                 // retired`) and COMPLETES — its return/late sends are
                 // then discarded by the surface as documented.
+                entry.refused = typedFailure(e);
               }
               entry.completed_at = performance.now();
             },
@@ -484,6 +489,7 @@ async function execute(step) {
               } catch (e) {
                 // F-S3.1-2: the handler SEES the typed closed refusal
                 // and COMPLETES — the surface discards its output.
+                entry.refused = typedFailure(e);
               }
               entry.completed_at = performance.now();
             },

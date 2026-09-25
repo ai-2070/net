@@ -207,8 +207,8 @@ export interface OrgResponseSink {
   /** Half-close the response direction: the call's normal ending. */
   close(): Promise<void>;
   /**
-   * THE retirement signal. Resolves with exactly one of
-   * {@link OrgRetireReason}'s seven verdicts when — and only when —
+   * THE retirement signal. Resolves with exactly
+   * one of {@link OrgRetireReason}'s verdicts when — and only when —
    * this sink is retired before its call completed. On normal
    * completion the call's own terminal settles every consumer and
    * this promise stays pending: hold it as a signal, not a completion

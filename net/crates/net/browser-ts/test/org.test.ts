@@ -58,6 +58,7 @@ import {
   fakeModule,
 } from './fake-wasm.js';
 import type { FakeNodeBehaviour } from './fake-wasm.js';
+import orgErrorVectors from '../../tests/cross_lang_org/error_vectors.json';
 import { FakeSession, fakeSessionModule } from './fake-leader-wasm.js';
 import type { FakeSessionBehaviour } from './fake-leader-wasm.js';
 import { ORG_END_ITEMS, orgCompletionBody, orgEndItem } from './leaf-abi.js';
@@ -204,37 +205,55 @@ describe('the org terminal vocabulary (plan §4.3)', () => {
   });
 
   it('classifies the FULL frozen org:rpc kind set (§11 cross-language drift)', () => {
-    // The exact `wire` strings `error_vectors.json` pins for the rpc
-    // domain — the frozen nRPC kind vocabulary. Classification is by
-    // TOKEN ONLY (the detail is human-facing), and the detail travels
-    // verbatim in `message`. Pre-drift-fix these six frozen kinds
-    // returned null and fell through to `UnknownLeafError` while
-    // node's `classifyOrgError` typed every one of them.
-    const rows: Array<[string, OrgErrorKind]> = [
-      ['org:rpc:timeout: rpc: timeout after 5000ms', 'org-timeout'],
-      ['org:rpc:cancelled: rpc: call cancelled by caller', 'org-cancelled'],
-      [
-        'org:rpc:server_error: rpc: server returned status 0x0006: the handler failed',
-        'org-refused',
-      ],
-      [
-        'org:rpc:capability_denied: rpc: capability denied: target 0xdead does not authorize nrpc:customer.read',
-        'org-refused',
-      ],
-      ['org:rpc:codec_encode: rpc: codec (Encode): the request did not serialize', 'org-malformed'],
-      ['org:rpc:codec_decode: rpc: codec (Decode): the reply did not deserialize', 'org-malformed'],
-      ['org:rpc:no_route: rpc: no route to target 0xdead: no path', 'org-internal'],
-      [
-        'org:rpc:transport: rpc: transport: connection error: the peer session dropped',
-        'org-internal',
-      ],
-    ];
-    for (const [wire, kind] of rows) {
+    // Driven by the shared cross-language fixture
+    // (`tests/cross_lang_org/error_vectors.json`) — the exact `wire`
+    // strings Rust emits for the rpc domain, the frozen nRPC kind
+    // vocabulary. A kind added to the fixture is covered here with no
+    // edit, and a kind this table does not name reddens by name
+    // rather than passing unexamined. Classification is by TOKEN ONLY
+    // (the detail is human-facing), and the detail travels verbatim
+    // in `message`. Pre-drift-fix six of these frozen kinds returned
+    // null and fell through to `UnknownLeafError` while node's
+    // `classifyOrgError` typed every one of them.
+    const expected: Record<string, OrgErrorKind> = {
+      timeout: 'org-timeout',
+      cancelled: 'org-cancelled',
+      server_error: 'org-refused',
+      capability_denied: 'org-refused',
+      codec_encode: 'org-malformed',
+      codec_decode: 'org-malformed',
+      no_route: 'org-internal',
+      transport: 'org-internal',
+    };
+    const rows = orgErrorVectors.vectors.filter((v) => v.domain === 'rpc');
+    // A fixture that lost its rpc rows must not pass vacuously.
+    expect(rows.length).toBeGreaterThanOrEqual(Object.keys(expected).length);
+    for (const { wire, kind: wireKind } of rows) {
+      const kind = expected[wireKind];
+      expect(kind, `fixture kind ${wireKind} has no expected class here`).toBeDefined();
+      expect(wire.startsWith(`org:rpc:${wireKind}`), wire).toBe(true);
       const typed = parseOrgError(wire);
       expect(typed, wire).toBeInstanceOf(OrgStreamError);
       expect(typed?.kind, wire).toBe(kind);
       // The doctrine of this taxonomy: `message` is the boundary's
       // own text, verbatim.
+      expect(typed?.message, wire).toBe(wire);
+    }
+    // Every expected kind is still in the fixture — a kind dropped
+    // from it is a vocabulary change, not a silent shrink.
+    const seen = new Set(rows.map((v) => v.kind));
+    for (const wireKind of Object.keys(expected)) {
+      expect(seen.has(wireKind), `fixture lost rpc kind ${wireKind}`).toBe(true);
+    }
+  });
+
+  it('the admission_denied fixture rows classify with their coarse bucket', () => {
+    const rows = orgErrorVectors.vectors.filter((v) => v.domain === 'admission_denied');
+    expect(rows.length).toBeGreaterThanOrEqual(3);
+    for (const { wire, kind: token } of rows) {
+      const typed = parseOrgError(wire);
+      expect(typed, wire).toBeInstanceOf(OrgAdmissionDeniedError);
+      expect((typed as OrgAdmissionDeniedError).coarse, wire).toBe(token.replace('_', '-'));
       expect(typed?.message, wire).toBe(wire);
     }
   });
@@ -282,10 +301,36 @@ describe('the org terminal vocabulary (plan §4.3)', () => {
       // apart.
       ['node-closed', 'org-cancelled'],
       ['replaced', 'org-cancelled'],
+      // The byte-budget retirement is a denial, not a cancel.
+      ['resource-exhausted', 'org-admission-denied'],
     ];
     for (const [verdict, kind] of rows) {
       expect(orgRetireError(verdict).kind, verdict).toBe(kind);
     }
+  });
+
+  it('a byte-budget retirement is reported as resource-exhausted, typed as its send refusal is', () => {
+    // `RetireReason::ResourceExhausted`'s leaf spelling. Pre-fix it
+    // fell through to the unknown-verdict arm and `retired` reported
+    // `replaced` — a teardown verdict for a budget refusal.
+    expect(orgRetireReason('resource-exhausted')).toBe('resource-exhausted');
+    const retired = orgRetireError(orgRetireReason('resource-exhausted'));
+    // The same class the byte-budget send refusal on that call
+    // re-types as: `admission-denied` / `unavailable`.
+    const sendRefusal = fromWasmError(new Error(ORG_SINK_BUDGET_REFUSAL));
+    expect(retired).toBeInstanceOf(OrgAdmissionDeniedError);
+    expect(sendRefusal).toBeInstanceOf(OrgAdmissionDeniedError);
+    expect((retired as OrgAdmissionDeniedError).coarse).toBe('unavailable');
+    expect((retired as OrgAdmissionDeniedError).coarse).toBe(
+      (sendRefusal as OrgAdmissionDeniedError).coarse,
+    );
+  });
+
+  it('a request stream settles resource-exhausted from the boundary verbatim', async () => {
+    const fake = new FakeOrgRequestStreamHandle();
+    const requests = new OrgRequests(fake);
+    fake.emitRetired('resource-exhausted');
+    expect(await requests.retired).toBe('resource-exhausted');
   });
 
   it('an unrecognized retire verdict is reported as replaced, never guessed', () => {
