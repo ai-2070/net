@@ -17,8 +17,10 @@
 //!
 //! Asserted, fail-closed, in this order:
 //!
-//! 1. the child's EMISSION actually carries the granted envelope
-//!    (`RESULT ok calls=1 emitted=<n>` — the `SendEmission.scoped` cache site);
+//! 1. the child's EMISSION actually carries the granted envelope and its
+//!    handler dispatched EXACTLY ONCE (`RESULT ok calls=<measured, pinned to 1>
+//!    emitted=<n>` — the `SendEmission.scoped` cache site; the count is read
+//!    from the `AttributingHandler`'s counter, never a literal (TESTS-3));
 //! 2. the parent's private plane CONSIDERS the child's provider entity as a
 //!    granted candidate (`granted_capability_providers` — the scoped ingest +
 //!    consumer-grant lookup sites), with the intake counters printed on a red
@@ -65,6 +67,99 @@ use net::adapter::net::{MeshNode, MeshNodeConfig};
 
 const ENV_DIR: &str = "R4_XPROC_DIR";
 const ENV_CALLER_NODE: &str = "R4_XPROC_CALLER_NODE";
+
+/// Bounds for the three formerly-unbounded waits in this harness (TESTS-2):
+/// the parent's READY/RESULT pulls and the child's `accept`. Generous against
+/// CI saturation (the child's own call deadline is 90 s), but finite — a
+/// wedged side becomes a named red, never a hung job.
+const CHILD_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(60);
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// TESTS-2: the spawned provider child must not outlive ANY parent verdict.
+/// The success path hands the exit status over via [`Self::wait_clean`]; every
+/// other path — including an `assert!` panic unwinding out of the test — drops
+/// this guard, which kills AND `wait()`s the child. `kill` without `wait`
+/// leaves the process object unreaped; neither leaves a live orphan serving
+/// against a red parent.
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn spawn(cmd: &mut Command) -> Self {
+        Self(Some(cmd.spawn().expect("spawn provider child process")))
+    }
+
+    /// The child's captured stdout (taken exactly once, at spawn).
+    fn stdout(&mut self) -> std::process::ChildStdout {
+        self.0
+            .as_mut()
+            .expect("child not yet reaped")
+            .stdout
+            .take()
+            .expect("child stdout")
+    }
+
+    /// The green path: reap the child WITHOUT killing it first.
+    fn wait_clean(mut self) -> std::process::ExitStatus {
+        self.0
+            .take()
+            .expect("child not yet reaped")
+            .wait()
+            .expect("child exit")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// TESTS-2: the child's stdout on a pump thread, so every parent pull can be
+/// bounded. The pump forwards lines until EOF (child exit) or until the parent
+/// stops listening; a `read_line` here can block forever only while the child
+/// lives — and the `ChildGuard` reaps the child on every parent exit.
+fn pump_child_stdout(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver<String> {
+    use std::io::BufRead;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if tx.send(line.clone()).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// TESTS-2: one bounded pull of a child-protocol line. `Disconnected` means
+/// the child closed its stdout (it exited); `Timeout` means it wedged. Both
+/// panic — the `ChildGuard` reaps the child as the panic unwinds.
+fn next_child_line(
+    rx: &std::sync::mpsc::Receiver<String>,
+    deadline: Instant,
+    what: &str,
+) -> String {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(remaining) {
+        Ok(line) => line,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("child exited before {what} (its stdout closed)")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("child produced no {what} within {CHILD_PROTOCOL_TIMEOUT:?} (bounded read)")
+        }
+    }
+}
 
 const PSK: [u8; 32] = [0x5C; 32];
 const SERVICE: &str = "customer.read";
@@ -211,6 +306,11 @@ async fn provider_child_main() {
 
     // Arm the accept BEFORE announcing readiness (the node refuses an accept
     // once started and refuses a start while an accept is in flight).
+    //
+    // TESTS-2: the accept is BOUNDED. A parent that dies between spawn and
+    // connect (or never connects at all) must not leave this child parked in
+    // `accept` forever — the harness idiom re-executes this exact binary, so
+    // an orphan blocks the `--test-threads=1` run it was spawned into.
     let accept_node = provider.clone();
     let accept = tokio::spawn(async move { accept_node.accept(caller_node).await });
 
@@ -221,8 +321,15 @@ async fn provider_child_main() {
         provider.node_id()
     );
 
-    if let Err(e) = accept.await.expect("accept task") {
-        fail(format!("accept: {e}"));
+    match tokio::time::timeout(ACCEPT_TIMEOUT, accept).await {
+        Ok(joined) => {
+            if let Err(e) = joined.expect("accept task") {
+                fail(format!("accept: {e}"));
+            }
+        }
+        Err(_) => fail(format!(
+            "accept: no inbound session within {ACCEPT_TIMEOUT:?} (bounded accept)"
+        )),
     }
     provider.start();
 
@@ -279,7 +386,11 @@ async fn provider_child_main() {
         println!("RESULT fail attribution emitted={emitted}");
         std::process::exit(1);
     }
-    println!("RESULT ok calls=1 emitted={emitted}");
+    // TESTS-3: the MEASURED dispatch count, never a literal. The parent pins
+    // `calls=1` on this marker; a duplicate dispatch (calls=2) must surface
+    // here instead of hiding behind a hard-coded `1`.
+    let observed = calls.load(Ordering::SeqCst);
+    println!("RESULT ok calls={observed} emitted={emitted}");
     std::process::exit(0);
 }
 
@@ -373,37 +484,41 @@ async fn scoped_discovery_crosses_an_os_process_boundary() {
         .expect("install consumer grant audience");
 
     // ---- spawn the provider as a SECOND OS PROCESS ----
+    //
+    // TESTS-2: the child is wrapped in `ChildGuard` the moment it exists, so
+    // EVERY parent verdict below — including a plain `assert!` panic — kills
+    // AND `wait()`s it on the way out (a bare `kill` without `wait` leaves the
+    // process object unreaped; a panic without either orphans a child that
+    // keeps running against a parent that is already red).
     let exe = std::env::current_exe().expect("current_exe");
-    let mut child = Command::new(exe)
-        .args([
-            "--ignored",
-            "--exact",
-            "xproc_scoped_provider_child",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(ENV_DIR, &dir)
-        .env(ENV_CALLER_NODE, caller.node_id().to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn provider child process");
-    use std::io::BufRead;
-    let stdout = child.stdout.take().expect("child stdout");
-    let mut reader = std::io::BufReader::new(stdout);
+    let mut child = ChildGuard::spawn(
+        Command::new(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "xproc_scoped_provider_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ENV_DIR, &dir)
+            .env(ENV_CALLER_NODE, caller.node_id().to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit()),
+    );
+    let line_rx = pump_child_stdout(child.stdout());
 
     // READY handshake with the child. The spawned binary is a libtest harness,
     // so its own output precedes the child's protocol lines — and its
     // `test <name> ... ` progress line carries NO trailing newline, so the
     // child's first println CONCATENATES onto it. Scan for the READY marker
     // anywhere in a line and slice from there; fail closed on a terminal
-    // RESULT before it.
+    // RESULT before it. Every pull is bounded (TESTS-2): the pump thread owns
+    // the pipe, and `recv_timeout` is what turns a wedged child into a named
+    // red instead of a hung job.
     let ready_line = {
-        let mut line = String::new();
+        let ready_deadline = Instant::now() + CHILD_PROTOCOL_TIMEOUT;
         loop {
-            line.clear();
-            let n = reader.read_line(&mut line).expect("read child stdout");
-            assert!(n > 0, "child exited before READY");
+            let line = next_child_line(&line_rx, ready_deadline, "READY");
             let trimmed = line.trim();
             if let Some(idx) = trimmed.find("READY ") {
                 break trimmed[idx..].to_string();
@@ -482,7 +597,8 @@ async fn scoped_discovery_crosses_an_os_process_boundary() {
             caller.scoped_relay_gate_len_for_test(),
             caller.org_scoped_ingest_counts(),
         );
-        let _ = child.kill();
+        // No manual `kill` here (TESTS-2): the `ChildGuard` kills AND reaps
+        // the child as this panic unwinds, on this and every other red path.
         panic!("F-S4Vectors-1: scoped discovery did not cross the OS-process boundary");
     }
     let providers = caller.granted_capability_providers(&grant.grant_id);
@@ -535,22 +651,23 @@ async fn scoped_discovery_crosses_an_os_process_boundary() {
 
     // The child's own verdict — its handler-side attribution + emission count
     // (both sides pin; a silent drop must never read as success). Same harness
-    // noise tolerance as the READY scan.
+    // noise tolerance as the READY scan, same bounded pull (TESTS-2).
     let result_line = {
-        let mut line = String::new();
+        let result_deadline = Instant::now() + CHILD_PROTOCOL_TIMEOUT;
         loop {
-            line.clear();
-            let n = reader.read_line(&mut line).expect("read child RESULT");
-            assert!(n > 0, "child exited before RESULT");
+            let line = next_child_line(&line_rx, result_deadline, "RESULT");
             let trimmed = line.trim();
             if let Some(idx) = trimmed.find("RESULT ") {
                 break trimmed[idx..].to_string();
             }
         }
     };
+    // `calls=1` is pinned against the child's MEASURED dispatch count
+    // (TESTS-3): a duplicated dispatch prints `calls=2` and reddens here.
     assert!(
         result_line.trim().starts_with("RESULT ok calls=1 emitted="),
-        "the provider child verified its own handler attribution + emission; got {result_line:?}"
+        "the provider child verified its own handler attribution + emission \
+         with exactly one handler dispatch (duplicate dispatch must not pass); got {result_line:?}"
     );
     let emitted: usize = result_line
         .trim()
@@ -564,7 +681,7 @@ async fn scoped_discovery_crosses_an_os_process_boundary() {
         "the child's SendEmission.scoped carried the granted envelope (got {emitted})"
     );
 
-    let status = child.wait().expect("child exit");
+    let status = child.wait_clean();
     assert!(status.success(), "provider child exited cleanly");
     let _ = std::fs::remove_dir_all(&dir);
 }
