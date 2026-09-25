@@ -161,7 +161,7 @@ rcgen = { version = "0.14", optional = true, default-features = false, features 
 ] }
 # The candidate string the anchor trickles is str0m's own SDP form;
 # building it here rather than re-implementing the grammar.
-str0m = { version = "0.23.1", optional = true, default-features = false, features = [
+str0m = { version = "0.24.0", optional = true, default-features = false, features = [
     "rust-crypto",
 ] }
 

@@ -15,6 +15,6 @@ s0a-wire = { path = "../../s0a-wire" }
 
 # The pinned configuration from the plan's §Dependencies. Defaults
 # (aws-lc-rs + examples) are deliberately NOT used.
-str0m = { version = "0.23.1", default-features = false, features = ["rust-crypto"] }
+str0m = { version = "0.24.0", default-features = false, features = ["rust-crypto"] }
 bytes = "1.12.1"
 parking_lot = "0.12.5"
