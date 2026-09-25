@@ -54,7 +54,7 @@ snow = { version = "0.10.0", default-features = false, features = [
 # in under `ring` / `snow` / `curve25519-dalek`. Without these lines
 # the build stops at a `compile_error!` inside getrandom 0.2 —
 # nothing in the copied Net code is wrong. See the report.
-getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom = { version = "0.4.0", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
 # Packet AEAD for wasm32. 0.11 (aead 0.6, `AeadInOut`), matching
 # `net`. Default features OFF: the default `getrandom` feature pulls

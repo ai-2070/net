@@ -76,7 +76,7 @@ snow = { version = "0.10.0", default-features = false, features = [
 # Both getrandom majors reachable from this dependency graph need the
 # browser opt-in of their own major, or the build stops at a
 # `compile_error!` inside getrandom itself. (S0a §6.2.)
-getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom = { version = "0.4.0", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
 # Packet AEAD for wasm32: 0.11 (aead 0.6, `AeadInOut`), the same major
 # the core pins. Default features OFF: the default `getrandom` feature
