@@ -222,14 +222,10 @@ impl AnchorControlPlane {
         let (bootstrap_url, org_control) = split_org_control(&bootstrap_url);
         let org_control = org_control.or_else(|| {
             let global = js_sys::global();
-            let value = js_sys::Reflect::get(&global, &JsValue::from_str("__netOrgControl"))
+            js_sys::Reflect::get(&global, &JsValue::from_str("__netOrgControl"))
                 .ok()?
                 .as_string()
-                .filter(|url| !url.is_empty());
-            web_sys::console::warn_1(&JsValue::from_str(&format!(
-                "[org-feed] bind read hook={value:?}"
-            )));
-            value
+                .filter(|url| !url.is_empty())
         });
         let control = Self {
             state: Rc::new(State {
