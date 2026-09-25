@@ -930,3 +930,63 @@ HOLD stands. The merge gate adds, in order:
    same-origin trust model.
 
 — Ledger audit, 2026-09-25.
+
+### 23.4 — Repair status (2026-09-26)
+
+The audit's open rows were repaired on `org-nrpc-merge`. "Red" below means the
+witness was run against the pre-repair behaviour, reintroduced as a temporary
+mutation or by checking out the previous implementation, and failed, then
+passed with the fix. Local verification ran on Windows. The wasm suites ran
+in headless Chrome 153 with a matching chromedriver: `wasm_leader` passed
+38/38. Node, Python and TypeScript were not built locally, so those rows are
+confirmed only by syntax checks and a standalone probe run until CI runs them.
+
+| Row | Status | Commit | Closure | Witness / verification |
+|---|---|---|---|---|
+| §23.1 CI failures | FIXED | `4dff62e6b`, `171b0ec99` | fmt, disallowed `std::Mutex`, `field_reassign_with_default`, sdk-ts same-org fixture ported to `gen_subnet_scenario`, `frozen_85ecc77c9::` witness path, the fixture-authority pin (120 → 130 rows) | CI on `4dff62e6b`: Coverage green (the `subnet_auth_e2e` registry defect: 9 failures reproduced locally, then 23/23 in one process) |
+| CORE-1 regression | FIXED | `c9935110a` | a pump `JoinError` retires `PumpFailed`; the single non-blocking re-poll is replaced by a wait bounded by `HANDLER_DEPOSIT_GRACE` (1 s; retire and deadline keep priority); both copies | pump panic → `PumpFailed`; late result → `Completed(Ok)` in cortex and behavior; grace bound. **Red** (3/3) |
+| CORE-2 | FIXED (model) / RESTATED (cortex) | `c9935110a` | behavior: check and count in one critical section. cortex: the record lock already linearizes the publish *decision*; the comment now says so, and says the emit may complete after the commit but always precedes the terminal on the wire | existing CORE-2 witnesses |
+| CORE lockstep | RECORDED | `c9935110a` | cortex counts no barrier discards: the metrics snapshot is C-ABI surface, and a counter is an ABI change | — |
+| WIRE-1 residual | FIXED | `eb5d12ab2` | `retire_session` tombstones the session (bounded FIFO, 1024) under the registry lock; `reserve` refuses a tombstoned session there, with no record created; one reserve point serves both unary and streaming | `an_opening_whose_session_retired_before_reserve_is_refused`. **Red** |
+| SDK-3 | FIXED | `eb5d12ab2` | one core `handler_application_status` for every shape (out-of-band → `Internal`); the SDK facades still pre-clamp to `0x8001`. Contract update: `EarlyReturnDX` 0x007E → 0x807E, same scenario | `a_streaming_handler_cannot_mint_an_engine_status` (0x0009/0x0003/0x0005 → `Internal`) |
+| SDK-1 wording | RESOLVED | `eb5d12ab2`, `c9935110a` | with every shape clamped, a 0x0003/0x0005 on the wire can only be engine-minted, so the by-code mapping is sound; the `ci.yml` attribution is corrected | — |
+| LEAF-13 (served calls) | FIXED | `f5ad64c76` | `ServeCall::settled()`. The retired-watcher answers `END` for a completed call (pre-repair it never answered one: one spinning leader task plus one pending follower request per completed call), and the leader releases a settled call as it answers. The follower watcher is now a single long-poll. `PROXY_VERSION` 3 → 4 | `a_settled_served_call_is_released_by_its_owner_only`. **Red** |
+| Bridge ids | FIXED | `f5ad64c76` | a fresh CSPRNG draw per served call (never 0, never live) | `consecutive_bridge_handles_are_not_sequential`. **Red** |
+| LEAF-1 concurrent | FIXED | `f5ad64c76` | `next_outcome` re-reads the latch after the proxy await; items still deliver | wasm `concurrent_consumers_both_observe_the_one_latched_terminal`. **Red** (the loser saw `cancelled`) |
+| LEAF-2 residual | FIXED | `acd2c2654` | a *moving* expired overwrite is a new admission for quota purposes: reclaim, then every limit check; a same-domain overwrite stays in place; `retarget` removed; leaf and core identical | `a_moving_expired_overwrite_is_bounded_by_the_trust_domain_quotas` (full org, full pool), both copies. **Red** against the previous implementation |
+| LEAF-12 residual | FIXED | `acd2c2654` | request correlations and follower org call/registration ids are fresh CSPRNG draws; `ProxyClient::new` loses its seed parameter (leaf-internal) | `consecutive_request_correlations_are_not_sequential` |
+| LEAF-13 minor (accept strand) | FIXED | `1caf725a9` | a genuine accept whose caller cannot resolve is finished typed (`Internal`); the finish is sender-bound, so a foreign handle is untouched | wasm `an_accept_whose_caller_cannot_resolve_is_settled_not_stranded`. **Red** |
+| PY-1 gap | FIXED | `1caf725a9` | the sdk-py probe skips only when the native extension is absent or unloadable; a package that ships its extension but fails to import exits 4 and fails loudly | `test_a_facade_that_fails_to_import_fails_the_gate`; the old probe answered 1 (skip), the new one answers 4, run standalone |
+| TESTS-3 | FIXED | `c9935110a` | the child keeps serving for `DUPLICATE_DISPATCH_GRACE` (1 s) before reading its dispatch count | compile-checked; CI |
+| CI-1 | FIXED | `c9935110a` | the Python org roster reads the primary run's JUnit; the whole live suite is no longer re-run under the 20-minute ceiling without the thread watchdog; floors equal real row counts | the checker was exercised on a real pytest JUnit; CI |
+| Unpinned witnesses | FIXED | `c9935110a`, `f5ad64c76`, `1caf725a9` | Node forced-drop; Python PY-1/PY-2 and the org pump-race rows; the two new wasm witnesses (`wasm_leader` floor 38); the sdk-py broken-facade row (floor 18) | — |
+
+**Still open:**
+
+- **`wasm_anchorless`: `two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_packets`.**
+  Red on every branch CI run since `e865df329`, the merge of master. It passes
+  on master, and none of the repair or audit commits caused it.
+  - **Cause.** Commit `766981931` (S4Browser) made a leaf answer inbound
+    reply-channel subscribes, and refuse any channel it does not serve
+    (`authorize_subscribe`). The witness's B answers A's call by hand, without
+    serving `echo`. B therefore refuses A's reply subscription. A drops its
+    reply carrier on the refusal, and B's reply is classified as application
+    data. The call ends `Timeout`.
+  - **Diagnosis.** Reproduced and instrumented locally (`MembershipRefused`,
+    then the reply surfaced as a `ChannelMessage`).
+  - **Decision needed.** Either rewrite the witness around a real
+    `org_serve` responder, or reconsider refusing (versus master's silence)
+    for unknown reply channels. Separately, a caller whose reply subscription
+    is refused should probably fail its pending calls on that carrier typed,
+    instead of waiting out the deadline.
+- **NODE-3 witness breadth.** Only the org duplex bridge has a live witness
+  for `JsHandleRelease`; the other five bridges have none.
+- **BROWSER-1 minor.** A zero-length final body is indistinguishable from a
+  plain end. This is a wire-shape property, left as is.
+- **LEAF-5.** The follower id in the envelope is still sender-claimed; this is
+  inside the same-origin trust model. The per-request, per-call and per-bridge
+  ids are now unpredictable, which removes the prediction attacks built on it.
+- **Not re-audited** (unchanged from §23.2): DOCS-*, FFI-1, VEC-*,
+  BROWSER-2/4–7, LEAF-7..11, LEAF-15, LEAF-17..25, CORE-5/6, SDK-5.
+
+— Audit repair, 2026-09-26.
