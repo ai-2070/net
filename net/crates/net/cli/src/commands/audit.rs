@@ -19,6 +19,9 @@ pub enum AuditCommand {
 
 #[derive(Args, Debug)]
 pub struct RecentArgs {
+    #[command(flatten)]
+    pub scope: super::scope::InspectableLocalScope,
+
     /// Maximum number of records to return.
     #[arg(short = 'n', long, default_value_t = 100)]
     pub limit: usize,
@@ -50,6 +53,9 @@ pub struct RecentArgs {
 
 #[derive(Args, Debug)]
 pub struct StreamArgs {
+    #[command(flatten)]
+    pub scope: super::scope::InspectableLocalScope,
+
     #[arg(long)]
     pub by_operator: Option<u64>,
 
@@ -84,7 +90,18 @@ async fn run_recent(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::validate_local(args.scope.local, "audit recent")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "audit recent")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
 
     let deck = ctx.deck();
@@ -113,7 +130,18 @@ async fn run_stream(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::validate_local(args.scope.local, "audit stream")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "audit stream")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
 
     let deck = ctx.deck();

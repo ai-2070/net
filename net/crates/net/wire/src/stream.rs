@@ -38,15 +38,18 @@ pub enum Reliability {
     /// nothing in flight is unrecoverable). Guarantees **gap-free
     /// eventual delivery** of every byte.
     ///
-    /// **Ordering contract (H-8):** the substrate does NOT reorder for
+    /// **Ordering contract (H-8):** the receive path reorders for
     /// you. Accepted packets — including out-of-order arrivals and
-    /// retransmits — are delivered to the inbound queue in **arrival
-    /// order**, each tagged with its monotonic `seq`. A consumer that
-    /// needs strict in-order bytes must reassemble by `seq` itself (the
-    /// blob-transfer engine's per-stream reorder buffer is the reference
-    /// example). Consumers that frame their own ordering (nRPC streaming
+    /// retransmits — are held until the sequences before them land,
+    /// then delivered to the inbound queue in **sequence order** (FIFO
+    /// within the stream), each tagged with its monotonic `seq`. A
+    /// consumer that needs strict in-order bytes takes them as
+    /// delivered (`InOrderBuffer` in `session.rs` is the substrate's
+    /// per-stream reorder buffer); it must not reassemble by `seq`
+    /// itself. Consumers that frame their own ordering (nRPC streaming
     /// keys on `EventMeta`/`call_id`) or tolerate reordering need do
-    /// nothing. Reliable here means "no loss", not "delivered in order".
+    /// nothing. Reliable here means "no loss", and delivery is
+    /// in-order.
     Reliable,
 }
 

@@ -48,6 +48,9 @@ pub mod meshos;
 // it needs both gates.
 pub mod admission_clock;
 pub mod caller_identity;
+/// Workspace-internal enrollment persistence boundary; not a credential verifier.
+#[doc(hidden)]
+pub mod enrollment_storage;
 pub mod metadata;
 pub mod org;
 pub mod org_admission;

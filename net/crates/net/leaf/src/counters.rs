@@ -115,6 +115,14 @@ pub enum DropReason {
     /// rather than that a packet arrived for a peer this leaf does
     /// not know.
     EstablishmentUnproven,
+    /// An anchor-side `0x0A00` **Ack refused** a Subscribe or
+    /// Unsubscribe this leaf sent. The wire said "no", and saying so
+    /// is the whole point of correlating Acks: a refusal that lands
+    /// nowhere is indistinguishable from admission, and the local
+    /// registration then claims a membership the anchor never
+    /// granted. A refused Subscribe rolls that claim back where this
+    /// is counted.
+    MembershipRefused,
 }
 
 impl DropReason {
@@ -141,12 +149,13 @@ impl DropReason {
             Self::StreamFailed => "stream_failed",
             Self::StreamClosed => "stream_closed",
             Self::EstablishmentUnproven => "establishment_unproven",
+            Self::MembershipRefused => "membership_refused",
         }
     }
 
     /// Every reason, in declaration order. Used by the snapshot so a
     /// new variant appears in the JSON without a second edit.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::NotAddressedToUs,
         Self::RoutingExpired,
         Self::UnknownSubprotocol,
@@ -167,6 +176,7 @@ impl DropReason {
         Self::StreamFailed,
         Self::StreamClosed,
         Self::EstablishmentUnproven,
+        Self::MembershipRefused,
     ];
 }
 
@@ -185,6 +195,7 @@ pub struct LeafCounters {
     udp_blocked: Cell<u64>,
     credit_grants_sent: Cell<u64>,
     credit_grants_received: Cell<u64>,
+    membership_admitted: Cell<u64>,
 }
 
 impl LeafCounters {
@@ -344,6 +355,22 @@ impl LeafCounters {
         self.credit_grants_received.get()
     }
 
+    /// A `0x0A00` **Ack admitted** a Subscribe or Unsubscribe this
+    /// leaf sent. The other half of
+    /// [`DropReason::MembershipRefused`]: a refusal is counted as a
+    /// drop, an admission here, so a field report can reconcile
+    /// membership outcomes against the nonces that were issued.
+    #[inline]
+    pub fn membership_admitted(&self) {
+        bump(&self.membership_admitted);
+    }
+
+    /// How many membership requests the anchor admitted.
+    #[inline]
+    pub fn membership_admissions(&self) -> u64 {
+        self.membership_admitted.get()
+    }
+
     /// Every counter as a JSON object. u64s are decimal **strings**:
     /// these are counters a page may render, and `JSON.parse` rounds
     /// integers above 2^53.
@@ -371,6 +398,10 @@ impl LeafCounters {
         out.push_str(&format!(
             ",\"credit_grants_received\":\"{}\"",
             self.credit_grants_received.get()
+        ));
+        out.push_str(&format!(
+            ",\"membership_admitted\":\"{}\"",
+            self.membership_admitted.get()
         ));
         out.push_str(",\"drops\":{");
         for (i, reason) in DropReason::ALL.iter().enumerate() {

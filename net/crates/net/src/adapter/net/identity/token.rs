@@ -780,6 +780,13 @@ pub struct TokenChain {
 }
 
 impl TokenChain {
+    /// A collision-resistant fingerprint of the chain's canonical bytes —
+    /// the exact-incarnation key for conditional removal (a successor chain,
+    /// even for the same channel and subject, has a different fingerprint).
+    pub fn fingerprint(&self) -> [u8; 32] {
+        *blake3::hash(&self.to_bytes()).as_bytes()
+    }
+
     /// Wrap a single token as a one-link chain (no delegation). The
     /// token's `issuer` is both the root and the direct grantor; the
     /// channel config must name that issuer as a root for the chain to
@@ -1425,6 +1432,27 @@ impl TokenCache {
             }
         }
         None
+    }
+
+    /// Remove exactly `token` (same subject, channel slot and canonical
+    /// bytes) if it is cached. Returns whether it was. Other tokens in the
+    /// slot — a successor, or another scope — are untouched.
+    pub fn evict_exact(&self, token: &PermissionToken) -> bool {
+        let slot_hash = if token.scope.contains(TokenScope::WILDCARD) {
+            0
+        } else {
+            token.channel_hash
+        };
+        let key = (*token.subject.as_bytes(), slot_hash);
+        let wanted = token.to_bytes();
+        let mut removed = false;
+        if let Some(mut slot) = self.tokens.get_mut(&key) {
+            let before = slot.len();
+            slot.retain(|t| t.to_bytes() != wanted);
+            removed = slot.len() != before;
+        }
+        self.tokens.remove_if(&key, |_, slot| slot.is_empty());
+        removed
     }
 
     /// Remove expired tokens.

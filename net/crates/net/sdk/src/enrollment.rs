@@ -62,6 +62,39 @@ use serde::{Deserialize, Serialize};
 use crate::delegation::DelegationChain;
 use crate::identity::{EntityId, Identity, TokenError, TOKEN_CLOCK_SKEW_SECS_RECOMMENDED};
 
+/// Membership-only invitation policy for the V3 enrollment path under construction.
+/// Does not change the legacy delegation-based enrollment APIs in this module.
+pub mod policy;
+
+// Signed membership invite (`netmesh-join_` token) and canonical redemption intent.
+pub mod invite;
+
+// Router TCP port mapping for the enrollment listener (UPnP / NAT-PMP / PCP).
+#[cfg(feature = "port-mapping")]
+pub mod portmap;
+
+// PSK-free Noise enrollment session: protocol, responder key and client.
+pub mod redeem;
+// Subnet leaf renewal (V3-2 task 5).
+pub mod renew;
+// Standalone subnet join over an existing session (V3-2 task 3).
+pub mod standalone;
+// Organization membership in enrollment: approval-time certificates.
+pub mod org;
+
+// Enrollment redemption listener over the shared ledger.
+pub mod service;
+
+// Membership-only bundle (signed receipt + PSK + contact) and its issuer.
+pub mod bundle;
+
+// Device-side durable join: persist, redeem, verify, install.
+pub mod device;
+
+// Durable, issuer-bound invitation ledger for the same V3 path; not a verifier.
+// (Outer `///` docs here would resolve the module's intra-doc links in this scope.)
+pub mod store;
+
 // Re-export the anchor type so `net_sdk::enrollment` is a complete surface.
 pub use crate::delegation::RevocationRegistry;
 
@@ -212,7 +245,7 @@ pub(crate) fn now_unix() -> u64 {
 /// leaked invite lets someone submit a [`JoinRequest`] for a few minutes,
 /// visibly (the operator sees the request) and deniably (they still can't be
 /// admitted without approval) — that's the whole blast radius.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InviteToken {
     /// The mesh root this invite admits into — the full ed25519 public key, so
     /// the joining device can anchor-verify the delegation it receives.
@@ -226,6 +259,28 @@ pub struct InviteToken {
     /// Unix-seconds expiry. Short by design (minutes) — the invite is a
     /// pre-auth to ask, not a standing credential.
     pub expires_at: u64,
+}
+
+/// Redacting `Debug` (MR#16's class), mirroring `leaf/src/enroll.rs`'s
+/// `Invite`.
+///
+/// `nonce` is proof-of-invite for a single-use invite: anyone holding
+/// it can `JoinRequest::create` echoing the stolen nonce, root under
+/// their own device key and redeem first — and the authority's
+/// single-use accounting then burns the victim's only attempt. The
+/// derived `Debug` printed it in cleartext straight through
+/// `BrowserBootstrapCredential`'s own *redacting* `Debug`, one field
+/// below the redaction. `root` is the mesh root public key and
+/// `expires_at` / `rendezvous` are not secret, so those stay visible.
+impl core::fmt::Debug for InviteToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InviteToken")
+            .field("root", &hex_lower(self.root.as_bytes()))
+            .field("rendezvous", &self.rendezvous)
+            .field("nonce", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl InviteToken {

@@ -216,8 +216,29 @@ pub const CHANNEL_LABEL: &str = "net";
 /// What the transport hands back for each inbound message.
 pub type InboundSink = Rc<dyn Fn(NodeId, Bytes)>;
 
+/// One filed ICE loss observation: the peer whose link walked
+/// `disconnected` → `failed`, and the identity of the channel whose
+/// watcher filed it.
+///
+/// The channel identity is load-bearing, not decoration. A loss
+/// report is a fact about ONE channel — the link whose ICE gave up —
+/// and a peer id cannot express which one: across a re-attempt there
+/// are two, and the predecessor's report can arrive after the
+/// successor's handshake installed. Whoever drains these
+/// (`crate::wasm::Inner::harvest_ice_failures`) must fence the
+/// report on the channel that made it, or a predecessor's dying words
+/// remove a successor's live session.
+pub type IceLoss = (NodeId, u64);
+
 /// One peer's connection.
 struct PeerLink {
+    /// This link's identity within the transport.
+    ///
+    /// Minted when the link is created and captured by the ICE state
+    /// watcher, so a loss report names the channel that saw the loss
+    /// rather than whichever link happens to hold the peer when the
+    /// report is drained. See [`IceLoss`].
+    channel_id: u64,
     connection: RtcPeerConnection,
     channel: Option<RtcDataChannel>,
     /// Retained packets accepted at admission but not yet written.
@@ -286,9 +307,24 @@ impl Drop for PeerLink {
             self.retained.clear();
             self.retained_bytes = 0;
         }
+        // **Detach before the fields drop.** The handler `Closure`s
+        // below die with this struct, and an event task already
+        // queued against the channel or the connection would then
+        // dispatch into a dropped closure: wasm-bindgen throws
+        // "closure invoked recursively or after being dropped" as an
+        // uncaught handler error on every link replacement and close,
+        // and the payload the handler carried is lost with it.
+        // Clearing the slots first means a late event finds no
+        // handler to call. Order matters within each half: detach,
+        // then close.
         if let Some(channel) = &self.channel {
+            channel.set_onmessage(None);
+            channel.set_onbufferedamountlow(None);
             channel.close();
         }
+        self.connection.set_onicecandidate(None);
+        self.connection.set_oniceconnectionstatechange(None);
+        self.connection.set_ondatachannel(None);
         self.connection.close();
     }
 }
@@ -309,10 +345,16 @@ pub struct RtcLeafTransport {
     /// to the control plane.
     local_candidates: Rc<RefCell<VecDeque<(NodeId, IceCandidate)>>>,
     next_slot: Rc<core::cell::Cell<u32>>,
+    /// The identity the next created link takes. Monotonic, never
+    /// reused: a channel identity has to outlive the channel far
+    /// enough for its loss report to still name it after a successor
+    /// replaced it ([`IceLoss`]).
+    next_channel: Rc<core::cell::Cell<u64>>,
     /// The transport's own `RtcStats`, in the native field names.
     stats: Rc<RtcLinkCounters>,
     /// Peers whose ICE walked `disconnected` → `failed`, filed for
-    /// the caller to drain.
+    /// the caller to drain — each with the identity of the channel
+    /// whose watcher saw it ([`IceLoss`]).
     ///
     /// A queue rather than a call into the node, for the reason
     /// `local_candidates` is one: this is written from inside a JS
@@ -322,7 +364,7 @@ pub struct RtcLeafTransport {
     /// `online` source reach ONE owner
     /// ([`crate::retry::RetryPolicy`]) rather than deciding for
     /// themselves.
-    ice_failures: Rc<RefCell<VecDeque<NodeId>>>,
+    ice_failures: Rc<RefCell<VecDeque<IceLoss>>>,
 }
 
 impl RtcLeafTransport {
@@ -333,6 +375,7 @@ impl RtcLeafTransport {
             inbound,
             local_candidates: Rc::new(RefCell::new(VecDeque::new())),
             next_slot: Rc::new(core::cell::Cell::new(0)),
+            next_channel: Rc::new(core::cell::Cell::new(0)),
             stats: Rc::new(RtcLinkCounters::default()),
             ice_failures: Rc::new(RefCell::new(VecDeque::new())),
         }
@@ -357,10 +400,41 @@ impl RtcLeafTransport {
         self.stats.snapshot(retained)
     }
 
-    /// Take the peers whose ICE walked `disconnected` → `failed`
+    /// Take the ICE `disconnected` → `failed` observations filed
     /// since the last call.
-    pub fn take_ice_failures(&self) -> Vec<NodeId> {
+    ///
+    /// Each report names the channel that made it ([`IceLoss`]): the
+    /// observation is a fact about one link, and across a re-attempt
+    /// the link that died and the link that holds the peer now are
+    /// different ones. A consumer that ignores the channel identity
+    /// lets a predecessor's late report act on a successor's session.
+    pub fn take_ice_failures(&self) -> Vec<IceLoss> {
         self.ice_failures.borrow_mut().drain(..).collect()
+    }
+
+    /// The identity of `peer`'s current channel, when this transport
+    /// has one.
+    ///
+    /// The value [`Self::take_ice_failures`]'s reports are fenced
+    /// against: whoever installs a session over this channel records
+    /// this number with the incarnation it installed, so a loss
+    /// report is actionable exactly when it names THIS channel.
+    pub fn channel_id(&self, peer: NodeId) -> Option<u64> {
+        self.peers.borrow().get(&peer).map(|link| link.channel_id)
+    }
+
+    /// File one ICE loss observation, exactly as
+    /// [`Self::install_ice_state_handler`] does when the link it
+    /// watches walks `disconnected` → `failed`.
+    ///
+    /// Test seam only. The production filing happens inside a JS
+    /// event callback holding a `Weak` (see that handler), which no
+    /// test can steer a real engine's `iceConnectionState` through;
+    /// this exists so a witness can park a report naming a chosen
+    /// channel and then drive the drain.
+    #[cfg(test)]
+    pub(crate) fn report_ice_loss(&self, peer: NodeId, channel_id: u64) {
+        self.ice_failures.borrow_mut().push_back((peer, channel_id));
     }
 
     /// `peer`'s live `iceConnectionState`, as the engine spells it.
@@ -391,6 +465,18 @@ impl RtcLeafTransport {
         slot
     }
 
+    /// The identity a newly created link takes.
+    ///
+    /// Separate from [`Self::next_slot`] on purpose: that one numbers
+    /// wire-visible `PeerAddr::Rtc` handles and its values are seen
+    /// by peers, while this one is purely local bookkeeping — the
+    /// token a loss report carries ([`IceLoss`]).
+    fn next_channel_id(&self) -> u64 {
+        let channel = self.next_channel.get();
+        self.next_channel.set(channel.wrapping_add(1));
+        channel
+    }
+
     /// Create the connection and the channel for `peer`, and produce
     /// the local offer.
     ///
@@ -418,7 +504,8 @@ impl RtcLeafTransport {
             &channel,
         );
         let ice = self.install_ice_handler(peer, &connection);
-        let ice_state = self.install_ice_state_handler(peer, &connection);
+        let channel_id = self.next_channel_id();
+        let ice_state = self.install_ice_state_handler(peer, channel_id, &connection);
         let low = low_water_handler(
             Rc::downgrade(&self.peers),
             Rc::clone(&self.stats),
@@ -435,6 +522,7 @@ impl RtcLeafTransport {
         let replaced = self.peers.borrow_mut().insert(
             peer,
             PeerLink {
+                channel_id,
                 connection: connection.clone(),
                 channel: Some(channel),
                 retained: VecDeque::new(),
@@ -489,7 +577,8 @@ impl RtcLeafTransport {
     ) -> Result<Sdp> {
         let connection = new_connection(ice_servers)?;
         let ice = self.install_ice_handler(peer, &connection);
-        let ice_state = self.install_ice_state_handler(peer, &connection);
+        let channel_id = self.next_channel_id();
+        let ice_state = self.install_ice_state_handler(peer, channel_id, &connection);
 
         // **`Weak`.** The handler lives in the `PeerLink` this map
         // holds, so a strong clone here would be a cycle — map →
@@ -533,6 +622,7 @@ impl RtcLeafTransport {
         let replaced = self.peers.borrow_mut().insert(
             peer,
             PeerLink {
+                channel_id,
                 connection: connection.clone(),
                 channel: None,
                 retained: VecDeque::new(),
@@ -786,6 +876,7 @@ impl RtcLeafTransport {
     fn install_ice_state_handler(
         &self,
         peer: NodeId,
+        channel_id: u64,
         connection: &RtcPeerConnection,
     ) -> Closure<dyn FnMut(JsValue)> {
         let failures = Rc::downgrade(&self.ice_failures);
@@ -808,7 +899,10 @@ impl RtcLeafTransport {
                 return;
             }
             if let Some(failures) = failures.upgrade() {
-                failures.borrow_mut().push_back(peer);
+                // Carries THIS link's identity: the report is a fact
+                // about the channel that died, and by the time the
+                // drain reads it a successor may hold the peer ([`IceLoss`]).
+                failures.borrow_mut().push_back((peer, channel_id));
             }
         }) as Box<dyn FnMut(JsValue)>);
         connection.set_oniceconnectionstatechange(Some(closure.as_ref().unchecked_ref()));

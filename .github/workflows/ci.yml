@@ -20,14 +20,23 @@ on:
       # green. `skills.yml` fires on the same files for the compile floor.
       - ".claude/skills/net-event-bus/examples/**"
       - "docs/data/examples.yaml"
-      - ".github/scripts/run-skill-examples.sh"
-      - ".github/scripts/skill_examples.py"
-      # `go-tests` runs the C-surface text guards before its toolchains.
-      # Editing a checker itself has to re-run it, or a loosened pattern
-      # lands green. Their other roots (`.claude/skills/`,
-      # `web/src/content/docs/`) are covered by the copies in `web.yml`.
-      - ".github/scripts/check-one-library-docs.py"
-      - ".github/scripts/check-header-count.py"
+      # Every script under `.github/scripts/` is executed by a step of this
+      # workflow — the skill-example runners (`run-skill-examples.sh`,
+      # `skill_examples.py`), the C-surface text guards
+      # (`check-one-library-docs.py`, `check-header-count.py`), the
+      # witness/roster/ABI checkers, and the rest. Editing one must re-run
+      # the step that executes it, or a loosened predicate lands green.
+      # The WHOLE directory is watched rather than an enumerated list: the
+      # list rots (it once omitted ten of the scripts these steps run —
+      # `check-ffi-exports.py`, `check-callback-buffer-ownership.py`,
+      # `check-rpc-abi-parity.py`, `go-test-with-native-stacks.sh`,
+      # `check-script-permissions.py`, `check-npm-peer-range.py`,
+      # `check-npm-platform-packages.py`, `check-ts-consumer.sh`,
+      # `check-skill-example-ts.sh`, `check-python-wheel-features.py`)
+      # and over-firing is free. The checkers' other roots
+      # (`.claude/skills/`, `web/src/content/docs/`) are covered by the
+      # copies in `web.yml`.
+      - ".github/scripts/**"
 
 env:
   CARGO_TERM_COLOR: always
@@ -129,7 +138,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=196
+          MIN=275
           out=$(cargo test --locked -p net-mesh-wire --features json 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
                 | grep -oE 'test result: ok\. [0-9]+ passed' \
@@ -322,8 +331,19 @@ jobs:
           a_captured_stamp_compares_the_revocation_floor_generation
           a_cold_capture_cannot_observe_the_pre_publication_window
           a_torn_authority_vector_cannot_compare_current"
+          # The pin is the witness's OWN libtest run record —
+          # `test [<module>::…::]<name> ... ok`, the name as the final
+          # module segment — not the bare name anywhere in the output.
+          # Must-fail matrix (all rejected): a line that merely PRINTS the
+          # name (an error echo, a panic message),
+          # `test <name>::helper ... ok` (the name is a module segment,
+          # not the test), `test <name>_extra ... ok`, `test x<name>
+          # ... ok`. Must-pass: the run record itself, with or without its
+          # module path. The old token regex
+          # `(^|[^A-Za-z0-9_])<name>([^A-Za-z0-9_]|$)` accepted the first
+          # two.
           for required in $REQUIRED; do
-            if ! printf "%s" "$out" | grep -q "$required"; then
+            if ! printf "%s" "$out" | grep -qE "^test ([A-Za-z0-9_]+::)*${required} \.\.\. ok$"; then
               echo "::error::required routing witness missing: $required"
               exit 1
             fi
@@ -371,8 +391,11 @@ jobs:
           cancelling_the_supervisor_drops_the_incarnation_and_frees_the_lease
           a_closed_watch_without_shutdown_is_loud_and_terminal
           a_sustained_superseded_streak_backs_off_and_reports_degraded"
+          # Same run-record anchor and must-fail matrix as the wiring
+          # step's pin above: printed names and
+          # `test <name>::helper ... ok` must fail it.
           for required in $REQUIRED; do
-            if ! printf "%s" "$out" | grep -q "$required"; then
+            if ! printf "%s" "$out" | grep -qE "^test ([A-Za-z0-9_]+::)*${required} \.\.\. ok$"; then
               echo "::error::required routing supervisor witness missing: $required"
               exit 1
             fi
@@ -470,8 +493,11 @@ jobs:
           no_reader_can_observe_a_pool_beside_foreign_facts
           an_authority_deadline_with_zero_providers_retires_both_planes_and_rearms
           the_two_hundred_fifty_seventh_slot_can_publish_no_pool"
+          # Same run-record anchor and must-fail matrix as the wiring
+          # step's pin above: printed names and
+          # `test <name>::helper ... ok` must fail it.
           for required in $REQUIRED; do
-            if ! printf "%s" "$reg" | grep -q "$required"; then
+            if ! printf "%s" "$reg" | grep -qE "^test ([A-Za-z0-9_]+::)*${required} \.\.\. ok$"; then
               echo "::error::required org_routing_registry witness missing: $required"
               exit 1
             fi
@@ -515,8 +541,11 @@ jobs:
           two_snapshots_at_one_revision_are_refused_as_an_invariant_breach
           unrelated_newer_movement_advances_freshness_without_churn
           dropping_the_state_releases_every_demand"
+          # Same run-record anchor and must-fail matrix as the wiring
+          # step's pin above: printed names and
+          # `test <name>::helper ... ok` must fail it.
           for required in $REQUIRED_STATE; do
-            if ! printf "%s" "$state" | grep -q "$required"; then
+            if ! printf "%s" "$state" | grep -qE "^test ([A-Za-z0-9_]+::)*${required} \.\.\. ok$"; then
               echo "::error::required org_routing_state witness missing: $required"
               exit 1
             fi
@@ -601,7 +630,7 @@ jobs:
       #     28 baseline + 1 (dispatch ordering) + 6 (local org lease egress)
       #     + 4 (lease-egress hold repair) + 10 (transition order, release
       #     coherence, phase-2 coverage, currentness fence)
-      #     + 3 (release-through-fence, rollback plane, provenance ordering)
+      #     + 2 (release-through-fence, provenance ordering)
       #     + 3 (acquisition transaction: partitioned-tightening restoration,
       #     the partition-to-restoration authority race, the refused
       #     remote-provider inverse)
@@ -613,9 +642,12 @@ jobs:
       #     + 1 (exact-head THIRD-review repair: post-abort cancellation
       #     recovered and retired exactly once, split off the drain-cancellation
       #     leg it used to share)
-      #     net of 3 retired: the two manual-wrapper guard witnesses replaced by
-      #     production-observed ones, and the cached-floor "rollback plane"
-      #     witness replaced by the two destructive-partition witnesses above
+      #     The three RETIRED witnesses are already netted out of the groups
+      #     above: the two manual-wrapper guard witnesses (replaced by the
+      #     production-observed ones) and the cached-floor "rollback plane"
+      #     witness (replaced by the two destructive-partition witnesses in the
+      #     acquisition-transaction line). The groups sum to 67 = MESH_MIN; keep
+      #     it that way when editing.
       # The mesh line previously read 35 while MESH_MIN read 39 — the arithmetic
       # drifted from the pin. Re-derive both from `--list` when you change them.
       #
@@ -948,9 +980,23 @@ jobs:
           cargo test -p net-deck --bins 2>&1 | tee /tmp/deck.log
           ran=$(grep -c '^test .* \.\.\. ok$' /tmp/deck.log || true)
           echo "deck unit tests: $ran"
-          # The ICE column's ledger + rollup tests were added.
-          if [ "$ran" -lt 31 ]; then
-            echo "::error::net-deck ran $ran tests, floor is 31 — \
+          # Floor = what THIS command reports (33), with net-deck's
+          # `default = []` (deck/Cargo.toml). The tree carries 35 test
+          # attributes (the ICE column's ledger + rollup tests
+          # among them); two of the 35 are feature-gated out of this
+          # command by design and are excluded from the floor deliberately
+          # and by name:
+          #   * `the_rollup_the_anchor_column_renders_carries_an_ingested_anchor`
+          #     — app.rs, `#[cfg(feature = "webrtc")]` ("off by default");
+          #   * `demo_boots_and_logs_appear` — demo/spawn.rs via `mod demo`,
+          #     `#[cfg(feature = "demo")]` in main.rs ("dev-only").
+          # A floor the pinned command cannot reach (35) false-reds every
+          # run and guards nothing; the floor's real purpose — a suite that
+          # silently shrinks — is served only by the measured count. Floors
+          # follow measured counts: re-measure this exact command
+          # and its exact `grep -c` shape when tests move.
+          if [ "$ran" -lt 33 ]; then
+            echo "::error::net-deck ran $ran tests, floor is 33 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
@@ -1086,11 +1132,13 @@ jobs:
                 function crate_of_dir(dir) {
                   if (dir == "net/crates/net") return "root"
                   if (dir == "net/crates/net/sdk") return "sdk"
+                  if (dir == "net/crates/net/cli") return "cli"
                   return "dir:" (dir == "" ? "<repo root>" : dir)
                 }
                 function crate_of_pkg(pkg) {
                   if (pkg == "net-mesh") return "root"
                   if (pkg == "net-mesh-sdk") return "sdk"
+                  if (pkg == "net-cli") return "cli"
                   return "pkg:" pkg
                 }
                 function package_on(line) {
@@ -1153,17 +1201,24 @@ jobs:
             | sort -u > /tmp/pinned_root.txt
           awk -F'\t' '$1 == "sdk" { print $2 }' /tmp/pinned_by_crate.txt \
             | sort -u > /tmp/pinned_sdk.txt
-          awk -F'\t' '$1 != "root" && $1 != "sdk" { print $1 ": " $2 }' \
+          awk -F'\t' '$1 == "cli" { print $2 }' /tmp/pinned_by_crate.txt \
+            | sort -u > /tmp/pinned_cli.txt
+          awk -F'\t' '$1 != "root" && $1 != "sdk" && $1 != "cli" { print $1 ": " $2 }' \
             /tmp/pinned_by_crate.txt | sort -u > /tmp/pinned_foreign.txt
           printf '%s\n' "$UNPINNED_OK" | awk '{print $1}' | grep -v '^$' | sort -u > /tmp/allowed.txt
           # One inventory per crate. The root crate's `tests/` are the ones
-          # that MUST be pinned (the `integration-*` jobs pin explicitly); the
-          # SDK's `tests/` are auto-discovered by `rust-sdk-tests`, so they are
-          # NOT required to appear here — but an SDK pin still has to name a
-          # real SDK test, which is what stops this guard from failing on an
-          # SDK test that exists and runs.
+          # that MUST be pinned (the `integration-*` jobs pin explicitly). The
+          # SDK's `tests/` (`rust-sdk-tests`) and net-cli's (`cli-tests`) are
+          # auto-discovered whole-crate, so they are NOT required to appear
+          # here — but a pin against either must still name a real test of
+          # that crate. That is what lets a scoped run like the keychain
+          # step's `--test local_target_inspection` exist without leaving a
+          # silent hole behind it: rename that binary and this guard names
+          # the break instead of cargo. The next crate that needs a scoped
+          # pin joins here and in the two crate maps above.
           ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present_root.txt
           ls sdk/tests/*.rs | sed 's|sdk/tests/||; s|\.rs$||' | sort -u > /tmp/present_sdk.txt
+          ls cli/tests/*.rs | sed 's|cli/tests/||; s|\.rs$||' | sort -u > /tmp/present_cli.txt
           # UNATTRIBUTABLE pins first, because they are the CAUSE of any
           # inventory verdict below: a pin this read cannot resolve to a crate
           # covers nothing, so the tests it was meant to cover would otherwise
@@ -1198,6 +1253,7 @@ jobs:
           stale=$(
             comm -13 /tmp/present_root.txt /tmp/pinned_root.txt | sed 's/^/root: /'
             comm -13 /tmp/present_sdk.txt /tmp/pinned_sdk.txt | sed 's/^/sdk: /'
+            comm -13 /tmp/present_cli.txt /tmp/pinned_cli.txt | sed 's/^/cli: /'
             cat /tmp/pinned_foreign.txt
           )
           if [ -n "$stale" ]; then
@@ -1205,7 +1261,7 @@ jobs:
             printf '%s\n' "$stale" | sed 's/^/  /'
             exit 1
           fi
-          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk test files; $(wc -l < /tmp/pinned_root.txt) root pin(s) + $(wc -l < /tmp/pinned_sdk.txt) sdk pin(s), each attributed to its own crate."
+          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk + $(wc -l < /tmp/present_cli.txt) cli test files; $(wc -l < /tmp/pinned_root.txt) root pin(s) + $(wc -l < /tmp/pinned_sdk.txt) sdk pin(s) + $(wc -l < /tmp/pinned_cli.txt) cli pin(s), each attributed to its own crate."
 
   # --- Family A: bare bus/FFI + net mesh -------------------------------
   integration-net-core:
@@ -1333,6 +1389,8 @@ jobs:
           --test subnet_assign_alloc
           --test subnet_session_auth
           --test subnet_control_facts
+          --test subnet_subject_floor
+          --test subnet_wire_admission
           --test integration_placement_filter_callback
           --test capability_broadcast
           --test capability_multihop
@@ -2399,7 +2457,7 @@ jobs:
       #     service discovery, plus the refresh-schedule and
       #     authority-clearing observations).
       #   - org_exact_sensing       — production organization
-      #     exact-sensing call edge (14 tests). Needs the SDK's own
+      #     exact-sensing call edge (22 tests). Needs the SDK's own
       #     `fixtures` feature, which is what gates `OrgClient`'s
       #     test-only sensing observation accessors; without it the
       #     binary does not compile, which is loud rather than silent.
@@ -2430,13 +2488,20 @@ jobs:
           JUNIT="$(cargo metadata --format-version 1 --no-deps \
             | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/nextest/default/junit.xml"
           rm -f "$JUNIT"
+          st=0
           cargo nextest run --no-fail-fast --no-tests=fail \
             --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures" \
-            -E 'not test(=review_aborted_startup_writer_cannot_outlive_its_owner)'
-          st=$?
+            -E 'not test(=review_aborted_startup_writer_cannot_outlive_its_owner)' \
+            || st=$?
           # PRESERVE this run's result set before any later step's run
           # overwrites it. The named-witness steps below verify against this
           # artifact instead of re-executing each witness by name.
+          #
+          # `|| st=$?`, never a bare invocation followed by `st=$?`: this
+          # block runs under the runner's `bash -e`, which ABORTS at the
+          # failing run and skips this copy entirely — a red run then reads
+          # downstream as "no JUnit artifact ... the run did not produce
+          # results" instead of as the result set it actually produced.
           cp "$JUNIT" "$RUNNER_TEMP/sdk-suite-junit.xml"
           exit "$st"
 
@@ -2652,8 +2717,8 @@ jobs:
       # Same discipline as the two steps above, same reason: the
       # auto-discovery run has already executed this binary, so this step
       # exists to keep the roster from shrinking silently. The floor is the
-      # count the binary reports (`cargo nextest list` said 41 when it
-      # landed), and the pinned names are the ones carrying a financial or
+      # count the binary reports (`cargo nextest list` lists 43; the floor
+      # below is `>= 43`), and the pinned names carry a financial or
       # once-only property outright — cardinality cannot say WHICH witness
       # vanished.
       #
@@ -4034,7 +4099,7 @@ jobs:
         working-directory: net/crates/net
         run: |
           # `--tests`, not `--test review_python_seed`: the integration-test
-          # pin guard inventories only the root and SDK crates, so a
+          # pin guard inventories only the root, SDK and net-cli crates, so a
           # `--test <name>` naming a payments target is a pin it cannot
           # attribute and refuses to guess at. Selecting the executable out
           # of cargo's JSON by target name does the same job without
@@ -4286,6 +4351,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history: the ABI-commit guard below diffs every commit of
+          # the pushed range (`github.event.before..github.sha`), which a
+          # depth-1 clone does not contain.
+          fetch-depth: 0
 
       # The text half of "Assert the Go binding links exactly one net::ffi"
       # below. That step guards the CODE — no sibling cdylib, no second `-l`
@@ -4311,6 +4381,21 @@ jobs:
           python3 .github/scripts/check-one-library-docs.py --self-test
           python3 .github/scripts/check-header-count.py
           python3 .github/scripts/check-header-count.py --self-test
+
+      # The one-commit ABI rule, enforced over THIS push's commits. A `NET_*`
+      # constant or `extern "C"` change landing without its Rust + both
+      # headers + a Go ABI test in the SAME commit is how -117 straddled
+      # three commits (3c9fa8bde -> 70b008909 -> 0aa63e69f): `header_parity_test.go`
+      # was red in between and a bisect inside the window yields a header
+      # pair that silently drifts. Text and git only, so it runs before the
+      # toolchains like its neighbours above.
+      - name: Guard — ABI changes land atomically
+        if: ${{ !cancelled() }}
+        env:
+          BASE_SHA: ${{ github.event.before }}
+        run: |
+          python3 .github/scripts/check-abi-commit.py --self-test
+          python3 .github/scripts/check-abi-commit.py --range "$BASE_SHA..$GITHUB_SHA"
 
       # Also pure text, also before the toolchains. A `libc::free` on a
       # Go-allocated callback buffer is a wrong-heap free on Windows —
@@ -4375,9 +4460,10 @@ jobs:
 
       # The cdylib's exported C-ABI symbol set is pinned, name for name.
       #
-      # Every Go, Python and C consumer links this one artifact, so a symbol
-      # that appears or disappears breaks all of them at once — and until this
-      # step nothing compared the export table against anything, so the
+      # Every Go and C consumer links this one artifact (the Python and Node
+      # bindings compile the `net` crate in-process and never load it), so a
+      # symbol that appears or disappears breaks them all at once — and until
+      # this step nothing compared the export table against anything, so the
       # browser-native WebRTC plan's guarantee ("default build's
       # exported symbol set unchanged" across a ~50-site endpoint refactor)
       # was unfalsifiable. The baseline is pinned to the pre-refactor head in
@@ -4552,7 +4638,19 @@ jobs:
         working-directory: go
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
-        run: go test -v -tags abi_stability -run TestABIStabilityU64FFIRoundTrip ./...
+        run: |
+          set -o pipefail
+          go test -v -tags abi_stability -run TestABIStabilityU64FFIRoundTrip ./... \
+            2>&1 | tee /tmp/abi_stability_cgo.log
+          # `-run` exits 0 when the filter matches NOTHING ("no tests to
+          # run"), so the test's own PASS line must appear in the output —
+          # the silent-skip shape this repo has been bitten by twice. The
+          # trailing space keeps `<name>Extended` or a subtest of it from
+          # satisfying the grep.
+          grep -q -- '^--- PASS: TestABIStabilityU64FFIRoundTrip ' /tmp/abi_stability_cgo.log || {
+            echo "::error::TestABIStabilityU64FFIRoundTrip did not run and pass — the -run filter matched nothing"
+            exit 1
+          }
 
       # With CGO_ENABLED=0 — the default on a Go install with no C compiler
       # on PATH — the toolchain drops every cgo file in this package and
@@ -5284,7 +5382,10 @@ jobs:
     #   tests/dry_run.rs             — admin verb `--dry-run` envelope
     name: Net CLI tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Two full net-cli runs (~9 min each: default and rtc-bootstrap), the
+    # keychain branch, then the crash-recovery step's own `fixtures` build.
+    # 20 minutes cancelled that last step mid-compile (V3 S5/S6 heads).
+    timeout-minutes: 35
     defaults:
       run:
         working-directory: net/crates/net
@@ -5314,10 +5415,22 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install mypy + pydantic
-        run: python -m pip install --upgrade mypy pydantic
+        run: python -m pip install --upgrade mypy "pydantic>=2,<3"
 
       - name: Run net-cli tests
-        run: cargo test -p net-cli
+        run: |
+          set -o pipefail
+          cargo test -p net-cli 2>&1 | tee /tmp/cli_default.log
+          # MCP uses two CLI mesh nodes; the native leg uses SDK nodes and a
+          # sequential capture CLI. Neither is two-computer evidence. Pin
+          # authorization + contract witnesses so they cannot silently vanish.
+          for t in two_node_mcp_consent_then_authorized_invocation \
+                   two_node_mcp_pin_does_not_override_provider_owner_scope \
+                   native_typed_call_and_generated_consumer_reuse_captured_contract_offline \
+                   two_node_protected_native_denial_then_authorized_typed_call; do
+            grep -q "test $t ... ok" /tmp/cli_default.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
 
       # `cargo test -p net-cli` above builds default features, so the
       # anchor-directory witness (`#![cfg(feature = "rtc-bootstrap")]`)
@@ -5325,7 +5438,7 @@ jobs:
       # feature, and name the two tests: a filter that matches nothing
       # still exits 0, which is the silent-skip hazard this repo has
       # been bitten by twice. No `--test` pin — the integration-test
-      # guard inventories the root crate's `tests/`, and `net-cli` is
+      # guard requires pins only for the root crate's `tests/`, and `net-cli` is
       # auto-discovered by design.
       - name: Run net-cli tests with rtc-bootstrap
         run: |
@@ -5334,6 +5447,83 @@ jobs:
           for t in anchor_ls_lists_a_live_announcing_anchor_and_not_a_plain_peer \
                    anchor_ls_without_a_daemon_refuses_rather_than_printing_nothing; do
             grep -q "test $t ... ok" /tmp/cli_rtc.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
+
+      # `keychain` (the OS-keychain secret value store) is explicitly
+      # non-default — `cli/Cargo.toml`: "NOT a default: it pulls the `keyring`
+      # dependency" — and it CHANGES THE ARGUMENT SURFACE: `forwarding
+      # set-value --inspect-target` exists only under
+      # `#[cfg(feature = "keychain")]`. So `if cfg!(feature = "keychain")` in
+      # `policy_and_pin_execution_use_inspected_paths_and_defaults_stay_distinct`
+      # is never true in either step above, its `else` branch is all that ever
+      # executes, and half the witness is silently dropped on every run: wrong
+      # `keychain_service` / `keychain_account`, wrong stdin provenance, a
+      # flipped `ignored_profile_remote_defaults`, or `forwarding set-value`
+      # accepting an invalid keychain account all pass today. This step runs the
+      # gated branch; the default run above covers the `else` branch, so both
+      # halves execute.
+      #
+      # Scoped to `--test local_target_inspection` — the binary that owns the
+      # gated branch — rather than a whole-crate sweep like the `rtc-bootstrap`
+      # step above. Deliberate and narrower, not an oversight. Checked and NOT
+      # the reason: a whole-crate run would very likely stay green —
+      # `readme_commands` extracts only fenced commands (README's keychain
+      # example is prose) and `help_is_self_contained` asserts repo-file and
+      # installed-binary-name hygiene, not flag sets. The real grounds are cost
+      # and verifiability: cargo fingerprints per feature set, so this is a full
+      # rebuild either way, but an unscoped `cargo test -p net-cli` additionally
+      # LINKS every integration-test binary — ~40 large executables plus PDBs —
+      # which produced `LNK1180: insufficient disk space to complete link` on a
+      # workstation and is a material extra cost inside this job's 20-minute
+      # budget. Raise the scope only together with the job timeout.
+      #
+      # The name pin is the same silent-skip guard used for the four journey
+      # witnesses above: `cargo test -- <filter>` exits 0 when it matches
+      # nothing, so a rename would turn an unpinned run into a green no-op.
+      #
+      # Headless-safe: `forwarding set-value --inspect-target` returns before
+      # any `KeychainSecretBackend` is built (`cli/src/commands/forwarding.rs`),
+      # so it is inspect-only and never opens a keyring. `net-mesh-mcp`'s
+      # `keychain` path is pure Rust on Linux (kernel keyutils; no libdbus), so
+      # no system library is needed here.
+      - name: Run net-cli keychain inspection branch
+        run: |
+          set -o pipefail
+          cargo test -p net-cli --features keychain --test local_target_inspection \
+            2>&1 | tee /tmp/cli_keychain.log
+          for t in policy_and_pin_execution_use_inspected_paths_and_defaults_stay_distinct; do
+            grep -q "test $t ... ok" /tmp/cli_keychain.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
+
+      # Crash recovery at the real durable-write transitions (NET_CLI_PLAN_V3
+      # decision 7). `tests/enrollment_crash.rs` is `#![cfg(feature =
+      # "fixtures")]`: the `fixtures` feature compiles the core's crash points
+      # into `EnrollmentStorage` replacement, and no other run here enables
+      # it — so without this step the binary compiles to zero tests and every
+      # run above is silently green without it. Scoped to that one binary (a
+      # feature set is a full rebuild; see the keychain step's cost note), and
+      # each witness is pinned by name: a rename must fail here, not vanish.
+      - name: Run net-cli crash-recovery witnesses (fixtures)
+        run: |
+          set -o pipefail
+          cargo test -p net-cli --features fixtures --test enrollment_crash             2>&1 | tee /tmp/cli_crash.log
+          for t in an_operator_crash_after_the_issuance_commit_is_recovered_not_reissued                    an_operator_crash_before_the_issuance_commit_issues_exactly_once_on_retry                    a_device_crash_after_installing_its_bundle_resumes_without_redeeming_again; do
+            grep -q "test $t ... ok" /tmp/cli_crash.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
+
+      # The relay TCP-tunnel fallback through real subprocesses (NET_CLI_PLAN_V3
+      # S8). The UDP block on `relay serve` is a `fixtures` seam, so the witness
+      # is `#[cfg(feature = "fixtures")]` and only this step runs it; the same
+      # build as the step above, so no extra feature-set rebuild.
+      - name: Run net-cli relay TCP-tunnel witness (fixtures)
+        run: |
+          set -o pipefail
+          cargo test -p net-cli --features fixtures --test relay_join             2>&1 | tee /tmp/cli_relay_tcp.log
+          for t in a_relay_whose_udp_is_blocked_is_reached_over_its_tcp_tunnel; do
+            grep -q "test $t ... ok" /tmp/cli_relay_tcp.log || {
               echo "::error::$t did not run"; exit 1; }
           done
 
@@ -5501,15 +5691,60 @@ jobs:
       #     pinned to a step" guard in the integration job exists to prevent.
       #     That guard was never applied to its own neighbour. `--no-tests=fail`
       #     closes it natively: an empty filterset is an error, not a pass.
+      #     It is RUN-WIDE, though, so the two surfaces below run as TWO
+      #     invocations — a union would hide one arm's empty filterset behind
+      #     the other arm's tests, which is exactly how `org_admission_gate`
+      #     got silently excluded in the first place.
+      #
+      # `enrollment_storage` is split into its own step below for the same
+      # reason, instead of riding as a third arm of a union: `--no-tests=fail`
+      # fires only when the WHOLE filter selects nothing, so a rename or
+      # feature-gating of `enrollment_storage` alone would drop that arm to
+      # zero while the other surfaces still matched and the step stayed green.
+      # Isolated, its disappearance is loud.
       - name: Org + authority unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo nextest run --features net --lib --no-tests=fail \
+            -E 'test(/^adapter::net::behavior::org/)'
+          cargo nextest run --features net --lib --no-tests=fail \
+            -E 'test(/^adapter::net::org_admission_gate/)'
+
+      # Enrollment storage: the protected snapshot owner's type boundary
+      # (private fields, non-Clone, `&mut self` writes, `Busy` on second
+      # ownership) and FS boundary (`ensure_secure_authority_dir`,
+      # uid/mode/nlink/ACL checks, `open_regular_nofollow`, atomic publish
+      # with `Uncertain` fencing on post-rename failure).
+      # `.config/nextest.toml` already pins these `retries = 0` as
+      # security-critical; a SOLO `--no-tests=fail` filter is what turns a
+      # module rename or a silent gating-out into a red step rather than a
+      # green no-op. No count floor needed — an empty filterset is the error.
+      - name: Enrollment storage unit tests
+        if: ${{ !cancelled() }}
         run: >
           cargo nextest run --features net --lib --no-tests=fail
-          -E 'test(/^adapter::net::behavior::org/) + test(/^adapter::net::org_admission_gate/)'
+          -E 'test(/^adapter::net::behavior::enrollment_storage::/)'
 
       # The CLI's Windows witnesses: the DACL warning on `--discover`, and the
       # case-variant no-clobber guard (NTFS is case-insensitive, so a
       # case-variant `--out` names the SAME file as the org key — the exact
       # aliasing the lexical guard cannot catch).
+      # This full-crate run includes the journey witnesses, and two of them
+      # REQUIRE Python + Pydantic v2 on PATH rather than skipping when it is
+      # missing: `native_contract_workflow` and `protected_native_workflow`
+      # assert `import pydantic; major == 2` before doing anything. The ubuntu
+      # `cli-tests` job installs both; windows-latest's preinstalled Python
+      # does not carry pydantic, so without this step the Windows run is red.
+      # mypy additionally stops `typegen_downstream_python` from silently
+      # self-skipping here.
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install mypy + pydantic
+        run: python -m pip install --upgrade mypy "pydantic>=2,<3"
+
       - name: Net CLI tests
         run: cargo nextest run -p net-cli --no-tests=fail
 
@@ -6325,7 +6560,7 @@ jobs:
             --source tests/establishment_identity.rs \
             $REQUIRED
           # No `--test` form: the integration-test pin guard
-          # inventories the root crate's `tests/`, and the leaf is
+          # inventories only the root, SDK and net-cli crates, and the leaf is
           # its own workspace, so a `--test kyra_review` pin reads to
           # that guard as a pin naming a crate it cannot attribute.
           # Running the whole crate covers the same binary, and the
@@ -6548,7 +6783,7 @@ jobs:
               exit 1
             }
           done
-          echo "leader lifecycle: 27 witnesses executed in headless Chromium"
+          echo "leader lifecycle: 29 witnesses executed in headless Chromium"
 
       # Exit criterion: the shipped bundle stays under 1.5 MB gzipped.
       - name: Bundle size
@@ -6676,8 +6911,16 @@ jobs:
             --label "browser package ABI" --mode literal \
             --source tests/abi_real_package.mjs $REQUIRED
           node tests/abi_real_package.mjs | tee /tmp/abi-real.log
+          # The pin is the probe's own JSON run record — the `"name"`
+          # field of a `records` entry, exactly the shape
+          # `JSON.stringify({…, records}, null, 2)` prints — at least as
+          # tight as the quoted grep (`grep -q "\"$required\""`) this was
+          # once replaced by the looser token regex with. Must-fail matrix
+          # (all rejected): a bare print of the name, the name inside the
+          # evidence text, the name inside an `error` message. Must-pass:
+          # `      "name": "<name>",`.
           for required in $REQUIRED; do
-            grep -q "\"$required\"" /tmp/abi-real.log || {
+            grep -qE "^[[:space:]]*\"name\": \"${required}\",?\$" /tmp/abi-real.log || {
               echo "::error::ABI probe $required did not run"; exit 1; }
           done
           if grep -q '"pass": false' /tmp/abi-real.log; then
@@ -6726,7 +6969,14 @@ jobs:
     # deployment can rely on.
     name: Browser matrix (Chromium + Firefox)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The job budget is the SUM of its steps, not less. The four engine legs
+    # carry 20+20+20+15 = 75 minutes of step caps on top of the
+    # browser/toolchain/build preamble and the evidence steps; at 45 one slow
+    # (or hung, running out its step cap) engine pushed the cumulative over
+    # the job cap and the VM died with the completed engines' logs still
+    # un-uploaded — the evidence loss this job exists to prevent. 75 + ~25
+    # preamble + the evidence tail = 105.
+    timeout-minutes: 105
     steps:
       - uses: actions/checkout@v7
 
@@ -6908,7 +7158,10 @@ jobs:
       # changed output format reads as "fix the parser", never as
       # "all clear" or "the witnesses are gone".
       - name: Browser witness inventory (both gate engines)
-        if: ${{ !cancelled() }}
+        # Unconditional on purpose: a cancelled or timed-out run still
+        # verifies whatever evidence exists and NAMES what is missing —
+        # `!cancelled()` let a dying job skip its own floor check.
+        if: ${{ always() }}
         run: |
           set -euo pipefail
           REQUIRED="
@@ -7074,7 +7327,7 @@ jobs:
             done
             # Chromium also carries the store witnesses;
             # Firefox does not gate them (see the harness step).
-            echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 15 Stage 6 \
+            echo "[$engine] inventory complete: 12 Stage 4b + 20 Stage 5 + 15 Stage 6 \
           (+ 11 Stage 7 on chromium)"
           done
 
@@ -7141,8 +7394,11 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload harness logs (every engine, gating or not)
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        # Unconditional on purpose: the logs of the engines that DID finish
+        # are the evidence for a run that died later, and a cancelled job
+        # must not take them with it.
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
         with:
           name: rtc-browser-harness-log
           # Firefox is a GATE, so its log is evidence, not a curiosity —
@@ -7296,7 +7552,7 @@ jobs:
 
       - name: Upload the demo log
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: browser-demo-log
           path: ${{ runner.temp }}/demo.log
@@ -7446,8 +7702,16 @@ jobs:
                   --test acme_cold_start 2>&1) \
             || { printf '%s\n' "$out"; echo "::error::the cold-start ACME witness did not pass"; exit 1; }
           printf '%s\n' "$out" | tail -5
+          # The pin is the witness's own nextest run record —
+          # `PASS [time] <binary-id> <name>`, the name at end of line — not
+          # the bare name anywhere in the output. Must-fail matrix (all
+          # rejected): a line that merely PRINTS the name,
+          # `PASS [time] <id> <name>::helper`, `PASS [time] <id>
+          # <name>_extra`. Must-pass: the run record itself; `FAIL`/`SKIP`
+          # lines end the same way and are excluded by the `PASS` anchor
+          # (a failing run already exits nonzero above).
           printf '%s\n' "$out" \
-            | grep -q 'a_cold_cache_orders_a_certificate_and_then_serves_tls' \
+            | grep -qE '^ *PASS \[.* [^ ]+ a_cold_cache_orders_a_certificate_and_then_serves_tls$' \
             || { echo "::error::the cold-start witness did not run"; exit 1; }
 
       - name: Pebble log

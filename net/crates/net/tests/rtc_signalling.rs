@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net::adapter::net::rtc::{
-    RtcConfig, RtcRejectReason, RtcSignalMsg, MAX_DIALOGS_PER_PEER, MAX_FRAMES_PER_WINDOW,
+    connect_rtc_loopback, RtcConfig, RtcRejectReason, RtcSignalMsg, MAX_DIALOGS_PER_PEER,
+    MAX_FRAMES_PER_WINDOW,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
 use net::adapter::Adapter;
@@ -643,10 +644,16 @@ async fn the_full_section_9_sequence_with_the_three_part_witness() {
          left half-working"
     );
     let b_a = a.node_id();
+    // B's own cleanup, asserted instead of disjoined with its own
+    // negation — the previous `is_none() || is_some()` was true by
+    // construction, leaving "B eventually cleans up" with no witness
+    // at all while the roster implied the whole sequence was checked.
+    // The window is the FAILURE budget, not the expected latency: the
+    // RTC driver reports a dead channel to the mesh on close (R3-E),
+    // so a healthy run settles this in milliseconds.
     assert!(
-        wait_for(|| b.peer_endpoint(b_a).is_none(), Duration::from_secs(10)).await
-            || b.peer_endpoint(b_a).is_some(),
-        "B's own cleanup is timeout-driven; either state is acceptable here"
+        wait_for(|| b.peer_endpoint(b_a).is_none(), Duration::from_secs(60)).await,
+        "B must eventually clean its own side up after the direct loss"
     );
 
     // Phase 4 — routed reconnection, and the counter moves again.
@@ -790,6 +797,10 @@ async fn a_reject_for_our_own_offer_correlates_and_releases() {
     // was allowed to create an owner, so the slot came back and
     // stayed at 1 for ever. Ordering decided whether the run was
     // green; here the late frame is delivered explicitly.
+    // Captured BEFORE the send it bounds: a refusal counted between
+    // the send and the capture would otherwise make the `>` below a
+    // false red.
+    let unknown_before = a.rtc_stats().signal_unknown_dialog();
     b.send_rtc_signal(
         a.node_id(),
         &RtcSignalMsg::Candidate {
@@ -800,7 +811,6 @@ async fn a_reject_for_our_own_offer_correlates_and_releases() {
     )
     .await
     .expect("send a late candidate for the retired dialog");
-    let unknown_before = a.rtc_stats().signal_unknown_dialog();
     assert!(
         wait_for(
             || a.rtc_stats().signal_unknown_dialog() > unknown_before,
@@ -1015,7 +1025,7 @@ async fn kyra_unknown_candidates_cannot_own_dialog_budget() {
     );
     assert_eq!(
         slots, 0,
-        "ignored unknown candidates have no engine owner but retain reservations"
+        "ignored unknown candidates have no engine owner and must not retain reservations"
     );
 }
 #[test]
@@ -1191,6 +1201,282 @@ async fn one_attempt_is_charged_one_terminal_term_whichever_owner_claims_it() {
 
     // Released: two live RTC drivers doing real ICE for the rest of
     // the binary is load every other witness here pays for.
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}
+
+/// A REAL offer SDP from `node`'s driver — a malformed SDP is a
+/// failed allocation, which holds no reservation and measures
+/// nothing (same rule as `the_dialog_bound_holds_…` states inline).
+async fn real_offer(node: &Arc<MeshNode>) -> String {
+    node.rtc_driver()
+        .expect("driver")
+        .create_offer()
+        .await
+        .expect("offer")
+        .1
+}
+
+/// **#10.** A duplicate `Offer` for a live dialog leaves its fresh
+/// per-attempt budget key exactly where it started: every paired
+/// `admit_signal_frame` take either reaches a named terminal owner
+/// or is released before returning. Before, the duplicate's
+/// `Ignored` released nothing — one `SenderState.dialogs` slot per
+/// repeat that no terminal path could ever `end_dialog` (the expiry
+/// sweep's `rtc_attempt_keys` lookup cannot see a key this path
+/// never inserted), pruned only by `forget` on session close.
+///
+/// Trigger: an honest Offer retry after a lost HTTP response, or a
+/// replay — same `(claimed_node_id, dialog)`, new attempt key.
+///
+/// Inverse: drop the release from the `Ignored` arm of
+/// `accept_bootstrap_offer_keyed` — `open_signal_dialogs(dup_key)`
+/// reads 1 against the expected 0 and the second assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_duplicate_bootstrap_offer_releases_its_fresh_attempt_reservation() {
+    let (a, b) = unhurried_pair().await;
+    let claim = 0x5152_0000_0001u64;
+    let dialog = 0x00D1_A106_u64;
+    let sdp = real_offer(&b).await;
+
+    let first_key = 0xF100_0000_0000_0001u64;
+    a.accept_bootstrap_offer_keyed(first_key, claim, dialog, sdp.clone())
+        .await
+        .expect("the first offer is accepted");
+    assert_eq!(
+        a.open_signal_dialogs(first_key),
+        1,
+        "the live attempt holds exactly one reservation, charged to its own key"
+    );
+
+    // The retry/replay: same (claim, dialog), a fresh per-attempt key.
+    let dup_key = 0xF100_0000_0000_0002u64;
+    let before = a.open_signal_dialogs(dup_key);
+    let duplicate = a
+        .accept_bootstrap_offer_keyed(dup_key, claim, dialog, sdp.clone())
+        .await;
+    assert!(
+        duplicate.is_err(),
+        "a duplicate Offer for a live dialog is Ignored, not accepted: {duplicate:?}"
+    );
+    assert_eq!(
+        a.open_signal_dialogs(dup_key),
+        before,
+        "the duplicate must leave its fresh attempt budget where it started"
+    );
+    assert_eq!(
+        a.open_signal_dialogs(first_key),
+        1,
+        "and must not disturb the live attempt's own reservation"
+    );
+    assert!(
+        a.holds_bootstrap_dialog(claim, dialog).await,
+        "the live dialog row survives the duplicate untouched"
+    );
+
+    // The live attempt's terminal owner releases its reservation —
+    // the full pairing: one take, one release, per key.
+    a.end_bootstrap_dialog(claim, dialog).await;
+    assert_eq!(
+        a.open_signal_dialogs(first_key),
+        0,
+        "the named terminal owner gives the live attempt's slot back"
+    );
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}
+
+/// **#2.** The lost-claim restore in `spawn_dialog_completion` must
+/// not displace a row installed across it. The completion parks at
+/// the restore seam **while holding the dialog-table lock**; a
+/// duplicate Offer for the same `(peer, dialog)` queued across the
+/// remove-and-restore must be refused as a duplicate — never
+/// accepted into a row the restore then silently replaces (the
+/// displaced `Option` dropped, its ICE session leaked and its
+/// attempt stranded with no dialog row, so `ice_pending()` stays
+/// above zero for the process lifetime).
+///
+/// Inverse: move the restore out of the claim's lock hold — the
+/// defect shape, `remove` under one acquisition and a bare `insert`
+/// under the next — and the racing Offer is ACCEPTED (the key is
+/// vacant in the two-lock window) instead of refused: the first
+/// assertion fails on `raced`, and the displaced-and-stranded
+/// attempt then also fails the final ledger identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_lost_claim_restore_cannot_displace_a_row_installed_in_the_window() {
+    let (a, b) = unhurried_pair().await;
+    let b_id = b.node_id();
+
+    // 1. Attempt 1's completion parks before its claim (the S6-06
+    //    seam), so the row can be retired and replaced underneath it.
+    a.rtc_dialog_claim_pause().arm_once();
+    let dialog = a.offer_direct_path(b_id).await.expect("offer sent");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        a.rtc_dialog_claim_pause().wait_until_reached(),
+    )
+    .await
+    .expect("the completion must reach the claim seam, i.e. its channel opened");
+
+    // 2. The attempt's own terminal owner takes the row …
+    a.end_bootstrap_dialog(b_id, dialog).await;
+    // 3. … and a successor attempt reuses the dialog id (ids are
+    //    peer-chosen and reusable once a row dies). Its row is the
+    //    one the parked completion must NOT displace.
+    let successor_key = 0xF200_0000_0000_0001u64;
+    let sdp = real_offer(&b).await;
+    a.accept_bootstrap_offer_keyed(successor_key, b_id, dialog, sdp.clone())
+        .await
+        .expect("the successor offer is accepted into the vacant id");
+    assert!(
+        a.holds_bootstrap_dialog(b_id, dialog).await,
+        "precondition: the successor's row is live"
+    );
+
+    // 4. Arm the restore seam and wake the parked completion: it
+    //    claims (and loses — the row is the successor's), pausing
+    //    INSIDE the claim's lock hold.
+    a.rtc_dialog_restore_pause().arm_once();
+    a.rtc_dialog_claim_pause().release();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        a.rtc_dialog_restore_pause().wait_until_reached(),
+    )
+    .await
+    .expect("the completion must reach the restore seam");
+
+    // 5. The competing duplicate lands exactly across the
+    //    remove-and-restore.
+    let racer_key = 0xF200_0000_0000_0002u64;
+    let before_delivered = a.rtc_stats().signal_delivered();
+    let racer = tokio::spawn({
+        let a = Arc::clone(&a);
+        async move {
+            a.accept_bootstrap_offer_keyed(racer_key, b_id, dialog, sdp)
+                .await
+        }
+    });
+    // It must have passed the ingress charge and be waiting on (or
+    // already done with) the dialog-table lock before the restore
+    // resumes — the interleaving this witness pins.
+    assert!(
+        wait_for(
+            || a.rtc_stats().signal_delivered() > before_delivered,
+            Duration::from_secs(10)
+        )
+        .await,
+        "the racing offer must reach the ingress"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    a.rtc_dialog_restore_pause().release();
+    let raced = tokio::time::timeout(Duration::from_secs(30), racer)
+        .await
+        .expect("the racing offer settles")
+        .expect("join");
+    assert!(
+        raced.is_err(),
+        "a duplicate Offer racing the lost-claim restore must be refused as a \
+         duplicate, never accepted into a row the restore then displaces: {raced:?}"
+    );
+    assert_eq!(
+        a.open_signal_dialogs(racer_key),
+        0,
+        "the refused racing offer leaves its fresh attempt budget where it started"
+    );
+    assert!(
+        a.holds_bootstrap_dialog(b_id, dialog).await,
+        "the successor's live row survives the restore"
+    );
+
+    // 6. One attempt, one terminal ending — nothing displaced and
+    //    stranded may be left without a terminal owner.
+    a.end_bootstrap_dialog(b_id, dialog).await;
+    let settled = a.rtc_stats().ice_snapshot();
+    assert_eq!(
+        (
+            settled.attempted,
+            settled.direct + settled.relayed + settled.failed,
+            settled.pending()
+        ),
+        (2, 2, 0),
+        "offer + successor = two attempts, two endings, nothing in flight: {settled:?}"
+    );
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}
+
+/// **#7.** A forced direct loss must be cleaned up on BOTH sides.
+///
+/// The closer's side is event-driven: the R3-E close notification
+/// settles in milliseconds. The FAR side has no event at all — the
+/// closer's `RtcSignal::Close` drops its `str0m::Rtc` with no wire
+/// teardown, and str0m's `is_alive()` is "not Closed", which ICE
+/// disconnection never sets — so the documented dead-peer timeout is
+/// its only non-shutdown removal path, and it must fire within
+/// budget. Two things make it fire: the responder's install arms the
+/// failure detector (without that, `failed_nodes()` never names the
+/// peer and the sweep is structurally inert), and a direct channel's
+/// inactivity budget is the detector's own, not the 30× partition
+/// grace.
+///
+/// Inverse: drop the `heartbeat_for_incarnation` call from
+/// `accept_rtc` — B's `peer_endpoint(a)` stays `Some` past the
+/// budget and the second assertion fails; restore the 30× gate for
+/// RTC and the same assertion fails on the wall clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_forced_direct_loss_is_cleaned_up_on_the_far_side_too() {
+    // `session_timeout` 2 s: the detector's budget is 3 misses ≈ 6 s
+    // and the direct-channel dead-peer gate one more detector budget
+    // — seconds, so this witness is about the mechanism, not the
+    // wall clock. Ten heartbeat windows per miss keeps setup well
+    // clear of a false failure.
+    let mk = || {
+        let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), PSK)
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(2));
+        cfg.socket_buffers = SocketBufferConfig::for_testing();
+        cfg.rtc = Some(RtcConfig {
+            ice_deadline: Duration::from_secs(2),
+            ..RtcConfig::new().with_bind_addr("127.0.0.1:0".parse().expect("addr"))
+        });
+        cfg
+    };
+    let a = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), mk())
+            .await
+            .expect("node a"),
+    );
+    let b = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), mk())
+            .await
+            .expect("node b"),
+    );
+    a.start();
+    b.start();
+    let (id_a, _id_b) = connect_rtc_loopback(&a, &b)
+        .await
+        .expect("DataChannel + Noise");
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+
+    a.rtc_driver()
+        .expect("driver")
+        .close(id_a)
+        .await
+        .expect("close");
+    assert!(
+        wait_for(|| a.peer_endpoint(b_id).is_none(), Duration::from_secs(10)).await,
+        "the closer's own side is removed event-driven (R3-E), in milliseconds"
+    );
+    assert!(
+        wait_for(|| b.peer_endpoint(a_id).is_none(), Duration::from_secs(30)).await,
+        "the FAR side must go too: the responder's install arms the failure \
+         detector, so the documented dead-peer timeout retires the lost direct \
+         session within budget"
+    );
+
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");
 }

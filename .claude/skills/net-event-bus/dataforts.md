@@ -86,7 +86,7 @@ redex.enableGreedyDataforts(mesh, {
 ### Operational notes
 
 - **Admission rejections are one counter with a `reason` label**, not a counter per reason: `dataforts_greedy_admit_rejected_total{reason="scope|intent|colocation|capacity|bandwidth"}`. Watch the label, not a metric name per cause.
-- **`reason` does not cleanly separate "NIC saturated" from "cache full."** The admission gate's bandwidth axis bumps `reason="bandwidth"` (a mis-set `nic_peak_bytes_per_s` looks like a reject storm there), but a *post-admission* bandwidth-budget refusal is `BandwidthExhausted`, which bumps the **`capacity`** reason. So `capacity` mixes cache-full with budget-exhausted. Correlate with `bandwidth_budget_fraction` and the NIC-peak override before concluding the cache is full.
+- **`reason` separates "NIC saturated" from "cache full" at the labels the runtime emits.** The admission gate's bandwidth axis and the *post-admission* bandwidth-budget refusal both bump `reason="bandwidth"` (`BandwidthExhausted` increments `AdmitRejectReason::Bandwidth`, `runtime.rs:793-795`; its witness pins `admit_rejected_bandwidth_total == 1` with `admit_rejected_capacity_total == 0`), so a mis-set `nic_peak_bytes_per_s` looks like a reject storm on the same label as budget exhaustion. `reason="capacity"` is disjoint: admission would have landed but the cluster cap refused the write. Correlate `bandwidth` with `bandwidth_budget_fraction` and the NIC-peak override before concluding the NIC is the limit.
 - **Cluster-cap eviction withdraws chain announcements inline.** Peers see the `causal:<hex>` advertisement drop in the same tick.
 - **`upsert` on reopen subtracts old bytes from `total_bytes`.** The cluster-cap budget stays accurate across reopens.
 - **`observer_inflight_cap` is the spawn fan-out bound.** A flooding peer can't pile up unbounded outstanding tasks; on saturation the event drops and the counter bumps.
@@ -161,10 +161,10 @@ Content-addressed reference whose bytes live in the caller's existing storage (S
 
 ```text
 [0xB0, 0xB1, 0xB2, 0xB3]  // 4-byte magic
-version: u8               // currently 1
+version: u8               // 0x01 V1, 0x02 V2_MANIFEST, 0x03 V3_TREE; chunked send-blob / send-dir refs encode 2
 hash:    [u8; 32]         // BLAKE3
 size:    u64              // bytes; bounded by BLOB_REF_MAX_SIZE = 16 GiB
-uri:     [u8]             // length-prefixed; adapter dispatch key
+uri:     [u8]             // to end of ref, no length prefix (the enclosing event payload is already framed); adapter dispatch key
 ```
 
 Adapter dispatch is **URI-scheme keyed**, not channel-config keyed. `BlobAdapter::accepted_schemes() -> &[&str]` declares which URI schemes an adapter handles (`["s3", "s3+https"]`, `["file"]`, etc.); the registry routes by scheme. Because the channel config does not select the adapter, an attacker who can write to a channel can't route their `BlobRef` URI through an arbitrary registered adapter.
@@ -173,7 +173,7 @@ Adapter dispatch is **URI-scheme keyed**, not channel-config keyed. `BlobAdapter
 
 - **Hash-verify on store.** `FileSystemAdapter::store(blob_ref, &bytes)` BLAKE3-hashes the supplied bytes and rejects mismatch.
 - **`fsync` of temp + parent dir** lands in the FS store path. Power loss between rename and OS flush doesn't leave zero-length files in the addressable space.
-- **Unique tmp suffixes.** `<hash>.<pid>.<atomic>.<nanos>.tmp` — concurrent stores on the same hash don't race or fail on Windows-rename, and idempotent re-stores hash-verify.
+- **Unique tmp suffixes.** `.{pid}-{counter}-{nanos}.tmp` appended to the hash filename — concurrent stores on the same hash don't race or fail on Windows-rename, and idempotent re-stores hash-verify.
 - **Streaming hooks.** `fetch_stream` / `store_stream` ship as required methods on `BlobAdapter` with default implementations that route through `fetch` / `store`; adapters wanting real streaming override. FS adapter chunks at 256 KiB.
 - **`BLOB_REF_MAX_SIZE = 16 GiB` cap** (a free constant in `blob_ref.rs`, not an associated const on `BlobRef`). Decode rejects larger sizes. There is **no config knob that lifts it** — a site needing more validates on construction and reaches for the `BlobAdapter` streaming hooks instead.
 - **Per-channel registry override.** `RedexFileConfig::with_blob_adapter_registry(Some(arc))` for multi-tenant isolation; default-tenant path uses the global singleton.
@@ -215,7 +215,7 @@ Each binding lets you write adapters in the host language:
 
 - **Python** — `register_blob_adapter(id, instance)` where `instance` implements `fetch` / `store` (sync or `async def`). Async adapters run on a binding-owned event loop on a dedicated thread (no fresh `asyncio.run` per call). An `aiobotocore` / `httpx.AsyncClient` / SQLAlchemy async engine inside the adapter is safe.
 - **Node** — `registerBlobAdapter(id, instance)` (sync TSFN bridge) or `registerAsyncBlobAdapter(id, instance)` (Promise-returning TSFN bridge).
-- **C / cgo** — `NetBlobAdapterVtable` with per-field null-check at registration; partial vtables return `NET_ERR_BLOB_VTABLE_INVALID`.
+- **C / cgo** — no host-language adapter registration is exposed. The C headers (`include/net.h`, `include/net_transport.h`) and `go/` reach only the substrate-owned adapter over the opaque `net_mesh_blob_adapter_t` (`net_mesh_blob_adapter_new/store/publish/fetch/exists`, plus `net_blob_ref_hash` and the transfer surface in `net_transport.h`). The vtable registration — `net_blob_register_callback_adapter` with `NetBlobAdapterVtable`, per-field null-check at registration, partial vtables returning `NET_ERR_BLOB_BACKEND` — is **Rust FFI only** (`src/ffi/blob.rs`) and is declared in no C header.
 
 ---
 
@@ -242,9 +242,9 @@ This composes with `BlobRef`: `store_dir` writes chunks **into** a `BlobAdapter`
 | store a dir → manifest ref | `store_dir(adapter, &root) -> BlobRef` | `mesh.storeDir(adapter, root) -> BlobRef` | `store_dir(mesh, adapter, root) -> BlobRef` |
 | fetch a dir | `fetch_dir(&mesh, source, &ref, dest, concurrency) -> DirStats` | `mesh.fetchDir(sourceId, ref, dest) -> {files, bytes}` | `fetch_dir(mesh, source_id, ref, dest) -> (files, bytes)` |
 
-`DirStats { files: usize, bytes: u64 }`. `concurrency = 0` → `DEFAULT_FETCH_CONCURRENCY = 16` leaf files in flight. `BlobRef::Small` is one chunk; `BlobRef::Manifest` is its ordered chunk list; **`BlobRef::Tree` is not supported by the transport wrappers** (use the substrate tree walk). The SDK stays thin — no retry policy, no rollback machinery beyond `fetch_dir`'s atomic rename, no directory-sync primitives; applications compose policy above.
+Rust `DirStats` is `{ files: usize, dirs: usize, symlinks: usize, bytes: u64 }` — the Node `{files, bytes}` / Python `(files, bytes)` rows above project to those two fields. `concurrency = 0` → `DEFAULT_FETCH_CONCURRENCY = 16` leaf files in flight. `BlobRef::Small` is one chunk; `BlobRef::Manifest` is its ordered chunk list; **`BlobRef::Tree` is not supported by the transport wrappers** (use the substrate tree walk). The SDK stays thin — no retry policy, no rollback machinery beyond `fetch_dir`'s atomic rename, no directory-sync primitives; applications compose policy above.
 
-**Go / C:** the FFI symbols ship in `src/ffi/transport.rs` (`net_serve_blob_transfer`, `net_fetch_blob`, `net_fetch_blob_discovered`, `net_store_dir`, `net_fetch_dir`, `net_dir_manifest_read`) and Go binds them over cgo. Note: they are **not declared in `include/net.h`** — a C consumer declares the prototypes against the exported symbols directly. The ergonomic wrappers are Rust / Node / Python, with the C ABI present but the header not yet regenerated.
+**Go / C:** the FFI symbols ship in `src/ffi/transport.rs` (`net_serve_blob_transfer`, `net_fetch_blob`, `net_fetch_blob_discovered`, `net_store_dir`, `net_fetch_dir`, `net_dir_manifest_read`) and Go binds them over cgo. C consumers: `#include <net_transport.h>` — the prototypes and the `NET_TRANSPORT_OK` / `NET_ERR_TRANSFER_*` / `NET_ERR_DIR_*` codes are declared there; do not hand-declare them. The ergonomic wrappers are Rust / Node / Python.
 
 ### Rust
 
@@ -283,17 +283,17 @@ files, n = _net.fetch_dir(mesh, source_id, manifest_ref, "/dest")
 
 ### Operator CLI — `net-mesh transfer`
 
-When a `MeshNode` is reachable through the standard `CliContext`, the operator CLI (`net-mesh` binary) moves blobs without writing code:
+The `net-mesh` CLI (crate `net-cli`) moves blobs without writing code. **Receive and administration verbs are mesh clients**: they require an explicit remote attach (`--node-addr`, `--node-pubkey`, `--node-id`, `--psk-hex`, each defaultable from the profile). Send verbs are local.
 
 | Command | Does |
 |---|---|
-| `net-mesh transfer send-blob <path> [--store]` | chunk a file (or stdin via `-`), optionally persist each chunk, print the `BlobRef` hex |
-| `net-mesh transfer recv-blob <source> <ref> --out <path>` | fetch one blob from a peer, stream to disk (temp-and-rename) |
-| `net-mesh transfer send-dir <path>` | walk + hash a directory, print the root manifest `BlobRef` hex |
-| `net-mesh transfer recv-dir <source> <root-ref> --dest <path>` | materialize a directory tree **atomically** |
-| `net-mesh transfer ls` / `status <id>` / `cancel <id>` | list / inspect / abort in-flight transfers |
+| `net-mesh transfer send-blob <path\|-> [--store <dir>]` | chunk a file (or stdin via `-`), optionally stage chunks locally, print the `BlobRef` hex |
+| `net-mesh transfer recv-blob --blob-ref <ref> --out <path> [--from <node>] [REMOTE FLAGS]` | fetch one blob from a peer, stream to disk (temp-and-rename) |
+| `net-mesh transfer send-dir <path> [--store <dir>]` | walk + hash a directory, print the root manifest `BlobRef` hex |
+| `net-mesh transfer recv-dir --remote-ref <ref> --out <path> [--from <node>] [--concurrency N] [REMOTE FLAGS]` | materialize a directory tree **atomically** |
+| `net-mesh transfer ls` / `status <id>` / `cancel <id>` `[REMOTE FLAGS]` | query the **target's requester-side in-flight fetches** (what it is fetching), not a completed-transfer history |
 
-The verbs compose with the shell (pipe into `send-blob`, redirect `recv-blob` to stdout) and render a determinate byte-progress bar for sized fetches. They ship behind the `cli` feature flag. **Full flag surface, atomic-write / exit-code semantics, and scripting notes: `cli.md`.**
+`--from <node>` selects a content holder other than the handshaken target; it is not a relay flag. `send-*` **stages** bytes locally (with `--store`) for a separately running holder to serve — it does not push, host, or publish. Sized fetches render a determinate byte-progress bar on stderr. **Full flag surface, staging-vs-hosting semantics, atomic-write behavior, exit codes, and scripting notes: `cli.md`.**
 
 ---
 
@@ -355,7 +355,7 @@ if err := tasks.WaitForSeq(seq, 250*time.Millisecond); err != nil { /* … */ }
 ## Common gotchas
 
 - **`dataforts` feature must be on.** Builds without it surface typed `RedexError` stubs from every `enable_*` entry point: `"requires the 'dataforts' feature; rebuild with --features dataforts"`. Pre-built artifacts ship with the feature enabled.
-- **Greedy admission rejection has five reasons** (`AdmitRejectReason::{Scope, Intent, Colocation, Capacity, Bandwidth}`) — there is no `Proximity` variant. Each has its own Prometheus counter — disambiguate "why isn't this chain being cached?" by checking which counter bumped.
+- **Greedy admission rejection has five reasons** (`AdmitRejectReason::{Scope, Intent, Colocation, Capacity, Bandwidth}`) — there is no `Proximity` variant. All five bump ONE Prometheus counter with a `reason` label (`dataforts_greedy_admit_rejected_total{reason="scope|intent|colocation|capacity|bandwidth"}`), not one counter per reason — disambiguate "why isn't this chain being cached?" by reading the `reason` label.
 - **Gravity without greedy is allowed.** A node with `enable_gravity_for_greedy` but no `enable_greedy_dataforts` is the "drift-only" quadrant — already-placed replicas emit heat, but the node doesn't speculatively cache.
 - **`Redex::greedy_cache_for(channel) -> Option<RedexFile>`** returns the cache file if greedy admitted that chain; the caller falls back to a network fetch / substrate read path on `None`. The substrate doesn't auto-route reads through the cache — it's an explicit lookup.
 - **Blob refs aren't transactionally tied to the bus.** A `BlobRef` riding on a published event references bytes that the adapter must have stored *before* the event was published; if the consumer reads the event before the adapter persists the bytes, `blob_resolve` fails until the persist completes.

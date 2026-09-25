@@ -48,6 +48,9 @@ pub enum IdentityCommand {
 
 #[derive(Args, Debug)]
 pub struct GenerateArgs {
+    /// Inspect the output selection without generating an identity or writing it.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Output path. Defaults to
     /// `$XDG_CONFIG_HOME/net/identities/operator-<id>.toml`.
     #[arg(long)]
@@ -64,6 +67,9 @@ pub struct GenerateArgs {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
+    /// Inspect the source path without reading the identity file.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to the identity file.
     pub path: PathBuf,
 
@@ -77,6 +83,9 @@ pub struct ShowArgs {
 
 #[derive(Args, Debug)]
 pub struct FingerprintArgs {
+    /// Inspect the source path without reading the identity file.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to the identity file.
     pub path: PathBuf,
 
@@ -87,6 +96,9 @@ pub struct FingerprintArgs {
 
 #[derive(Args, Debug)]
 pub struct RevokeArgs {
+    /// Inspect the issuer/store selection without reading or raising any floor.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// The issuer entity-id to revoke (32-byte ed25519 pubkey, 64 hex chars,
     /// optional `0x`). To revoke a machine's gateway (and its subagents), pass
     /// the *machine* identity's entity-id — the issuer of the machine→gateway
@@ -105,7 +117,78 @@ pub struct RevokeArgs {
     pub revocation_store: Option<PathBuf>,
 }
 
-pub async fn run(cmd: IdentityCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
+pub async fn run(
+    cmd: IdentityCommand,
+    output: Option<OutputFormat>,
+    config_path: Option<&Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let inspect = match &cmd {
+        IdentityCommand::Generate(args) => args.inspect_target,
+        IdentityCommand::Show(args) => args.inspect_target,
+        IdentityCommand::Fingerprint(args) => args.inspect_target,
+        IdentityCommand::Revoke(args) => args.inspect_target,
+    };
+    if inspect {
+        let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+        let mut view = crate::target::TargetInspection::local(
+            &profile,
+            if matches!(cmd, IdentityCommand::Revoke(_)) {
+                "persistent_store"
+            } else {
+                "offline"
+            },
+        );
+        match &cmd {
+            IdentityCommand::Generate(args) => {
+                view.destination = args.out.clone();
+                if args.out.is_none() {
+                    view.destination_pattern = Some(
+                        default_identity_dir()
+                            .ok_or_else(|| {
+                                invalid_args(
+                                    "cannot resolve the platform config directory; pass --out",
+                                )
+                            })?
+                            .join("operator-<generated-operator-id>.toml"),
+                    );
+                }
+                view.provenance(
+                    "destination",
+                    if args.out.is_some() {
+                        "flag"
+                    } else {
+                        "runtime"
+                    },
+                );
+                view.provenance("identity", "runtime");
+                view.unavailable_identity("execution generates a new identity; its default filename is not known until then");
+            }
+            IdentityCommand::Show(args) => {
+                view.source = Some(args.path.clone());
+                view.provenance("source", "argument");
+            }
+            IdentityCommand::Fingerprint(args) => {
+                view.source = Some(args.path.clone());
+                view.provenance("source", "argument");
+            }
+            IdentityCommand::Revoke(args) => {
+                let issuer = parse_entity_hex(&args.issuer)?;
+                view.subject_fingerprint =
+                    Some(crate::target::public_fingerprint(issuer.as_bytes()));
+                view.store = Some(resolve_revocation_store(args.revocation_store.as_deref())?);
+                view.provenance(
+                    "store",
+                    if args.revocation_store.is_some() {
+                        "flag"
+                    } else {
+                        "default"
+                    },
+                );
+            }
+        }
+        return view.emit(output);
+    }
     match cmd {
         IdentityCommand::Generate(args) => run_generate(args, output).await,
         IdentityCommand::Show(args) => run_show(args, output).await,
@@ -297,14 +380,7 @@ async fn run_fingerprint(
 
 async fn run_revoke(args: RevokeArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
     let issuer = parse_entity_hex(&args.issuer)?;
-    let path = args
-        .revocation_store
-        .or_else(net_sdk::revocation::default_revocation_store_path)
-        .ok_or_else(|| {
-            invalid_args(
-                "no revocation-store path could be resolved; pass --revocation-store <PATH>",
-            )
-        })?;
+    let path = resolve_revocation_store(args.revocation_store.as_deref())?;
     let floor = net_sdk::revocation::RevocationStore::revoke_below(&path, &issuer, args.generation)
         .map_err(|e| sdk(format!("revoke failed: {e}")))?;
     let info = RevokeOutput {
@@ -316,6 +392,17 @@ async fn run_revoke(args: RevokeArgs, output: Option<OutputFormat>) -> Result<()
     emit_value(OutputFormat::resolve_oneshot(output), &info)
         .map_err(|e| generic(format!("write revoke: {e}")))?;
     Ok(())
+}
+
+fn resolve_revocation_store(override_path: Option<&Path>) -> Result<PathBuf, CliError> {
+    override_path
+        .map(Path::to_path_buf)
+        .or_else(net_sdk::revocation::default_revocation_store_path)
+        .ok_or_else(|| {
+            invalid_args(
+                "no revocation-store path could be resolved; pass --revocation-store <PATH>",
+            )
+        })
 }
 
 /// Parse an issuer entity-id: 64 hex chars (optional `0x`) → 32-byte
@@ -667,12 +754,11 @@ pub(crate) async fn read_secret_key_file(
 /// the same argument applies at least as strongly here, and `config.rs` already
 /// used the `Option` pattern — it simply was not propagated.
 fn default_identity_path(operator_id: u64) -> Option<PathBuf> {
-    Some(
-        dirs::config_dir()?
-            .join("net-mesh")
-            .join("identities")
-            .join(format!("operator-0x{operator_id:016x}.toml")),
-    )
+    Some(default_identity_dir()?.join(format!("operator-0x{operator_id:016x}.toml")))
+}
+
+fn default_identity_dir() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("net-mesh").join("identities"))
 }
 
 pub(crate) fn now_iso8601() -> String {

@@ -143,6 +143,9 @@ pub enum CredentialCommand {
 
 #[derive(Args, Debug)]
 pub struct MintArgs {
+    /// Inspect signer, PSK source and output without reading the PSK or minting.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// The mesh root entity id (64 hex chars, optional `0x`) — the
     /// key a joining browser anchor-verifies its grant against.
     #[arg(long, value_name = "HEX")]
@@ -206,6 +209,9 @@ pub struct MintArgs {
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
+    /// Inspect input selection without reading or decoding the credential.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// The credential string, or `@PATH` to read it from a file.
     #[arg(long, value_name = "STRING|@PATH")]
     pub credential: String,
@@ -342,18 +348,66 @@ const ICE_CAVEAT: &str = "Reported, never gated. NOT a success rate for sessions
 pub async fn run(
     cmd: AnchorCommand,
     output: Option<OutputFormat>,
-    #[cfg_attr(
-        not(any(feature = "webrtc", feature = "rtc-bootstrap")),
-        allow(unused_variables)
-    )]
     config_path: Option<&std::path::Path>,
-    #[cfg_attr(
-        not(any(feature = "webrtc", feature = "rtc-bootstrap")),
-        allow(unused_variables)
-    )]
     profile_name: &str,
 ) -> Result<(), CliError> {
     match cmd {
+        AnchorCommand::Credential(CredentialCommand::Mint(args)) if args.inspect_target => {
+            let psk_source = psk_source(&args)?;
+            let issuer = load_credential_issuer(&args).await?;
+            let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+            let mut target = crate::target::TargetInspection::local(&profile, "offline");
+            target.configured_identity(issuer.entity_id().as_bytes());
+            target.source = Some(args.issuer_identity);
+            target.destination = args.out;
+            target.provenance("identity", "flag");
+            target.provenance("source", "flag");
+            target.provenance(
+                "destination",
+                if target.destination.is_some() {
+                    "flag"
+                } else {
+                    "stdout"
+                },
+            );
+            target.provenance("psk", psk_source);
+            emit_value(
+                OutputFormat::resolve_oneshot(output),
+                &CredentialTargetInspection {
+                    target,
+                    psk_source,
+                    psk_file: args.psk_file,
+                    credential_stdout_on_execution: true,
+                },
+            )
+            .map_err(|e| generic(format!("write inspection: {e}")))
+        }
+        AnchorCommand::Credential(CredentialCommand::Inspect(args)) if args.inspect_target => {
+            let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+            let mut target = crate::target::TargetInspection::local(&profile, "offline");
+            if let Some(path) = args.credential.strip_prefix('@') {
+                target.source = Some(PathBuf::from(path));
+                target.provenance("source", "file");
+            } else {
+                target.provenance("source", "inline");
+            }
+            let psk_source = if args.psk_hex.is_some() {
+                "inline"
+            } else {
+                "unused"
+            };
+            target.provenance("psk", psk_source);
+            emit_value(
+                OutputFormat::resolve_oneshot(output),
+                &CredentialTargetInspection {
+                    target,
+                    psk_source,
+                    psk_file: None,
+                    credential_stdout_on_execution: false,
+                },
+            )
+            .map_err(|e| generic(format!("write inspection: {e}")))
+        }
         AnchorCommand::Credential(CredentialCommand::Mint(args)) => run_mint(args, output).await,
         AnchorCommand::Credential(CredentialCommand::Inspect(args)) => {
             run_inspect(args, output).await
@@ -367,6 +421,34 @@ pub async fn run(
     }
 }
 
+#[derive(Serialize)]
+struct CredentialTargetInspection {
+    #[serde(flatten)]
+    target: crate::target::TargetInspection,
+    psk_source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    psk_file: Option<PathBuf>,
+    /// Mint's normal report includes the secret credential even with --out.
+    credential_stdout_on_execution: bool,
+}
+
+fn psk_source(args: &MintArgs) -> Result<&'static str, CliError> {
+    match (&args.psk_file, &args.psk_hex) {
+        (Some(_), _) => Ok("file"),
+        (None, Some(_)) => Ok("inline"),
+        (None, None) => Err(invalid_args(
+            "one of --psk-hex or --psk-file is required: the credential IS the PSK plus an invite",
+        )),
+    }
+}
+
+async fn load_credential_issuer(args: &MintArgs) -> Result<net_sdk::identity::Identity, CliError> {
+    let issuer_file = read_identity_file(&args.issuer_identity, args.insecure_permissions).await?;
+    let seed = hex_decode_32(&issuer_file.seed_hex)
+        .map_err(|e| invalid_args(format!("--issuer-identity: seed_hex: {e}")))?;
+    Ok(net_sdk::identity::Identity::from_seed(seed))
+}
+
 #[cfg(feature = "rtc-bootstrap")]
 async fn run_ls(
     args: LsArgs,
@@ -374,7 +456,7 @@ async fn run_ls(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    use crate::context::{resolve_profile, resolve_remote_attach, CliContext};
+    use crate::context::{require_remote_attach, resolve_profile, CliContext};
 
     let profile = resolve_profile(config_path, profile_name).await?;
     // **R6: the rows come from a live mesh.** The in-process Deck
@@ -382,27 +464,21 @@ async fn run_ls(
     // structurally empty — the listing could never show an anchor no
     // matter how many announced. Attaching to the daemon is the same
     // path every other cross-node listing uses.
-    let remote_node_id = args
-        .remote
-        .remote_node_id
-        .clone()
-        .or_else(|| profile.node_id.clone())
-        .ok_or_else(|| {
-            invalid_args("anchor ls needs --node-id (or a profile default) to address the daemon")
-        })?;
-    let remote = resolve_remote_attach(
-        &profile,
-        args.remote.node_addr.as_deref(),
-        args.remote.node_pubkey.as_deref(),
-        args.remote.remote_node_id.as_deref(),
-        args.remote.psk_hex.as_deref(),
-    )?
-    .ok_or_else(|| {
-        invalid_args(
-            "anchor ls reads announcements from a live mesh: pass --node-addr / \
-             --node-pubkey / --node-id / --psk-hex, or set them in your profile",
-        )
+    let remote = require_remote_attach(&profile, &args.remote, || {
+        invalid_args("anchor ls needs a live mesh target: pass --node-addr/--node-pubkey/--node-id/--psk-hex or set profile defaults")
     })?;
+    if args.remote.inspect_target {
+        return crate::target::inspect(
+            &profile,
+            &args.remote,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?
+        .emit(output);
+    }
+    let target = remote.node_id;
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
             .await?;
@@ -413,8 +489,6 @@ async fn run_ls(
     // listing used to be structurally empty. The anchor answers for
     // itself over `net.mesh.anchors`.
     let mesh = ctx.require_mesh()?;
-    let target = crate::parsers::parse_u64_flexible(remote_node_id.as_str())
-        .map_err(|e| invalid_args(format!("--node-id: {e}")))?;
     let raw = tokio::time::timeout(
         std::time::Duration::from_secs(args.wait_secs.max(1)),
         mesh.call_raw_bytes(
@@ -462,42 +536,28 @@ async fn run_stats(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    use crate::context::{resolve_profile, resolve_remote_attach, CliContext};
+    use crate::context::{require_remote_attach, resolve_profile, CliContext};
 
     let profile = resolve_profile(config_path, profile_name).await?;
-    let remote_node_id = args
-        .remote
-        .remote_node_id
-        .clone()
-        .or_else(|| profile.node_id.clone())
-        .ok_or_else(|| {
-            invalid_args(
-                "anchor stats reads an ICE attempt ledger from the node that owns it, and a \
-                 ledger is never announced — so there is nothing local to fall back on: pass \
-                 --node-id (or set a profile default) to address the anchor",
-            )
-        })?;
-    let remote = resolve_remote_attach(
-        &profile,
-        args.remote.node_addr.as_deref(),
-        args.remote.node_pubkey.as_deref(),
-        args.remote.remote_node_id.as_deref(),
-        args.remote.psk_hex.as_deref(),
-    )?
-    .ok_or_else(|| {
-        invalid_args(
-            "an ICE attempt ledger belongs to the node that owns it and is never \
-             announced, so anchor stats has nothing local to read: pass \
-             --node-addr / --node-pubkey / --node-id / --psk-hex, or set them in \
-             your profile",
-        )
+    let remote = require_remote_attach(&profile, &args.remote, || {
+        invalid_args("anchor stats needs a live mesh target: pass --node-addr/--node-pubkey/--node-id/--psk-hex or set profile defaults")
     })?;
+    if args.remote.inspect_target {
+        return crate::target::inspect(
+            &profile,
+            &args.remote,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?
+        .emit(output);
+    }
+    let target = remote.node_id;
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
             .await?;
     let mesh = ctx.require_mesh()?;
-    let target = crate::parsers::parse_u64_flexible(remote_node_id.as_str())
-        .map_err(|e| invalid_args(format!("--node-id: {e}")))?;
     let raw = tokio::time::timeout(
         Duration::from_secs(args.wait_secs.max(1)),
         mesh.call_raw_bytes(
@@ -578,10 +638,7 @@ async fn run_mint(args: MintArgs, output: Option<OutputFormat>) -> Result<(), Cl
         ));
     }
 
-    let issuer_file = read_identity_file(&args.issuer_identity, args.insecure_permissions).await?;
-    let seed = hex_decode_32(&issuer_file.seed_hex)
-        .map_err(|e| invalid_args(format!("--issuer-identity: seed_hex: {e}")))?;
-    let issuer = net_sdk::identity::Identity::from_seed(seed);
+    let issuer = load_credential_issuer(&args).await?;
     let invite = InviteToken::mint(
         &root,
         args.url.clone(),
@@ -685,6 +742,7 @@ async fn run_inspect(args: InspectArgs, output: Option<OutputFormat>) -> Result<
 /// order. Exactly one is required: minting without a PSK would
 /// produce a credential no browser could handshake with.
 async fn read_psk(args: &MintArgs) -> Result<[u8; 32], CliError> {
+    psk_source(args)?;
     let hex = match (args.psk_file.as_ref(), args.psk_hex.as_ref()) {
         (Some(path), _) => tokio::fs::read_to_string(path)
             .await
@@ -722,18 +780,21 @@ fn hex_string(bytes: &[u8]) -> String {
 #[cfg(feature = "rtc-bootstrap")]
 #[derive(Args, Debug)]
 pub struct ServeArgs {
-    /// Mesh bind address for the node itself.
-    #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:0")]
-    pub bind: String,
+    /// Resolve listeners/TLS paths without reading PSK/TLS files or starting services.
+    #[arg(long)]
+    pub inspect_target: bool,
+    /// Mesh bind address for the node itself (default: 0.0.0.0:0).
+    #[arg(long, value_name = "ADDR")]
+    pub bind: Option<String>,
 
     /// The transport trust domain's PSK (64 hex chars), read from a
     /// file. The same PSK the credentials were minted against.
     #[arg(long = "psk-file", value_name = "PATH")]
     pub psk_file: PathBuf,
 
-    /// Address for the HTTPS bootstrap listener.
-    #[arg(long = "listen", value_name = "ADDR", default_value = "0.0.0.0:8443")]
-    pub listen: String,
+    /// Address for the HTTPS bootstrap listener (default: 0.0.0.0:8443).
+    #[arg(long = "listen", value_name = "ADDR")]
+    pub listen: Option<String>,
 
     /// The externally reachable base URL of that listener. It is
     /// published as `rtc_bootstrap` on the announcement, so it must
@@ -908,21 +969,27 @@ fn rtc_config_from_args(args: &ServeArgs) -> Result<net::adapter::net::rtc::RtcC
 }
 
 #[cfg(feature = "rtc-bootstrap")]
-async fn run_serve(
-    args: ServeArgs,
-    output: Option<OutputFormat>,
-    _config_path: Option<&std::path::Path>,
-    _profile_name: &str,
-) -> Result<(), CliError> {
-    use net_sdk::rtc_bootstrap::{
-        serve_bootstrap, AcmeConfig, AcmeState, BootstrapConfig, BootstrapTls,
-    };
-    use net_sdk::Mesh;
-
-    let psk_hex = tokio::fs::read_to_string(&args.psk_file)
-        .await
-        .map_err(|e| invalid_args(format!("--psk-file {}: {e}", args.psk_file.display())))?;
-    let psk = hex_decode_32(psk_hex.trim()).map_err(|e| invalid_args(format!("psk: {e}")))?;
+fn resolve_serve(args: &ServeArgs) -> Result<ResolvedServe, CliError> {
+    use net_sdk::rtc_bootstrap::{AcmeConfig, BootstrapTls};
+    let bind: std::net::SocketAddr = args
+        .bind
+        .as_deref()
+        .unwrap_or("0.0.0.0:0")
+        .parse()
+        .map_err(|e| invalid_args(format!("--bind: {e}")))?;
+    let listen = args
+        .listen
+        .as_deref()
+        .unwrap_or("0.0.0.0:8443")
+        .parse()
+        .map_err(|e| invalid_args(format!("--listen: {e}")))?;
+    let issuer = parse_entity_hex(&args.credential_issuer)?;
+    let challenge = args
+        .acme_challenge_addr
+        .as_deref()
+        .unwrap_or("0.0.0.0:80")
+        .parse()
+        .map_err(|e| invalid_args(format!("--acme-challenge-addr: {e}")))?;
 
     let tls = match (&args.tls_cert, &args.tls_key, &args.acme_directory) {
         (Some(cert), Some(key), None) => BootstrapTls::Operator {
@@ -959,11 +1026,153 @@ async fn run_serve(
         }
     };
 
-    let rtc = rtc_config_from_args(&args)?;
+    let mut rtc = rtc_config_from_args(args)?;
+    // Resolve the documented RTC default once, rather than having inspection
+    // invent an address separately from the config consumed by the builder.
+    rtc.bind_addr
+        .get_or_insert_with(|| std::net::SocketAddr::new(bind.ip(), 0));
+    if rtc.stun_public_addr.is_some() && rtc.stun_addr.is_none() {
+        return Err(invalid_args(
+            "--rtc-stun-public-addr requires --rtc-stun-bind",
+        ));
+    }
+    Ok(ResolvedServe {
+        bind,
+        listen,
+        issuer,
+        challenge,
+        tls,
+        rtc,
+    })
+}
 
-    let mesh = Mesh::builder(&args.bind, &psk)
+#[cfg(feature = "rtc-bootstrap")]
+struct ResolvedServe {
+    bind: std::net::SocketAddr,
+    listen: std::net::SocketAddr,
+    issuer: net_sdk::identity::EntityId,
+    challenge: std::net::SocketAddr,
+    tls: net_sdk::rtc_bootstrap::BootstrapTls,
+    rtc: net::adapter::net::rtc::RtcConfig,
+}
+
+#[cfg(feature = "rtc-bootstrap")]
+#[derive(Serialize)]
+struct ServeInspection {
+    #[serde(flatten)]
+    target: crate::target::TargetInspection,
+    listen: std::net::SocketAddr,
+    rtc_bind: Option<std::net::SocketAddr>,
+    rtc_public_addr: Option<std::net::SocketAddr>,
+    rtc_stun_bind: Option<std::net::SocketAddr>,
+    rtc_stun_public_addr: Option<std::net::SocketAddr>,
+    tls: &'static str,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    acme_cache: Option<PathBuf>,
+    acme_challenge_bind: Option<std::net::SocketAddr>,
+    credential_issuer_fingerprint: String,
+}
+
+#[cfg(feature = "rtc-bootstrap")]
+async fn run_serve(
+    args: ServeArgs,
+    output: Option<OutputFormat>,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use net_sdk::rtc_bootstrap::{serve_bootstrap, AcmeState, BootstrapConfig, BootstrapTls};
+    use net_sdk::Mesh;
+    let resolved = resolve_serve(&args)?;
+    if args.inspect_target {
+        let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+        let mut target = crate::target::TargetInspection::standalone_service(
+            &profile,
+            resolved.bind.to_string(),
+        );
+        for (name, explicit) in [
+            ("bind", args.bind.is_some()),
+            ("listen", args.listen.is_some()),
+            ("rtc_bind", args.rtc_bind.is_some()),
+        ] {
+            target.provenance(name, if explicit { "flag" } else { "default" });
+        }
+        target.provenance("psk", "flag");
+        target.provenance("credential_issuer", "flag");
+        target.provenance("tls", "flag");
+        target.provenance(
+            "rtc_public_addr",
+            if args.rtc_public_addr.is_some() {
+                "flag"
+            } else {
+                "runtime"
+            },
+        );
+        target.provenance(
+            "rtc_stun_bind",
+            if args.rtc_stun_bind.is_some() {
+                "flag"
+            } else {
+                "unused"
+            },
+        );
+        let (tls, tls_cert, tls_key, acme_cache) = match &resolved.tls {
+            BootstrapTls::Operator { cert_pem, key_pem } => (
+                "operator",
+                Some(cert_pem.clone()),
+                Some(key_pem.clone()),
+                None,
+            ),
+            BootstrapTls::Acme(config) => ("acme", None, None, Some(config.cache_dir.clone())),
+        };
+        for (name, explicit) in [
+            ("acme_cache", args.acme_cache.is_some()),
+            ("acme_challenge_bind", args.acme_challenge_addr.is_some()),
+        ] {
+            target.provenance(
+                name,
+                if tls != "acme" {
+                    "unused"
+                } else if explicit {
+                    "flag"
+                } else {
+                    "default"
+                },
+            );
+        }
+        return emit_value(
+            OutputFormat::resolve_oneshot(output),
+            &ServeInspection {
+                target,
+                listen: resolved.listen,
+                rtc_bind: resolved.rtc.bind_addr,
+                rtc_public_addr: resolved.rtc.public_addr,
+                rtc_stun_bind: resolved.rtc.stun_addr,
+                rtc_stun_public_addr: resolved.rtc.stun_public_addr,
+                tls,
+                tls_cert,
+                tls_key,
+                acme_cache,
+                acme_challenge_bind: if tls == "acme" {
+                    Some(resolved.challenge)
+                } else {
+                    None
+                },
+                credential_issuer_fingerprint: crate::target::public_fingerprint(
+                    resolved.issuer.as_bytes(),
+                ),
+            },
+        )
+        .map_err(|e| generic(format!("write anchor target inspection: {e}")));
+    }
+    let psk_hex = tokio::fs::read_to_string(&args.psk_file)
+        .await
+        .map_err(|e| invalid_args(format!("--psk-file {}: {e}", args.psk_file.display())))?;
+    let psk = hex_decode_32(psk_hex.trim()).map_err(|e| invalid_args(format!("psk: {e}")))?;
+
+    let mesh = Mesh::builder(&resolved.bind.to_string(), &psk)
         .map_err(|e| generic(format!("mesh builder: {e}")))?
-        .rtc(rtc)
+        .rtc(resolved.rtc)
         .build()
         .await
         .map_err(|e| generic(format!("starting the anchor: {e}")))?;
@@ -971,12 +1180,10 @@ async fn run_serve(
 
     let sdk_psk = Psk::new(psk);
     let mut listener_config = BootstrapConfig::new(
-        args.listen
-            .parse()
-            .map_err(|e| invalid_args(format!("--listen: {e}")))?,
+        resolved.listen,
         sdk_psk.clone(),
-        parse_entity_hex(&args.credential_issuer)?,
-        tls,
+        resolved.issuer,
+        resolved.tls,
         args.allow_origin
             .first()
             .cloned()
@@ -985,11 +1192,7 @@ async fn run_serve(
     listener_config.allowed_origins = args.allow_origin.clone();
     listener_config.ws_allowed_origins = args.allow_origin.clone();
     listener_config.acme = AcmeState::new();
-    if let Some(addr) = args.acme_challenge_addr.as_ref() {
-        listener_config.acme_challenge_addr = addr
-            .parse()
-            .map_err(|e| invalid_args(format!("--acme-challenge-addr: {e}")))?;
-    }
+    listener_config.acme_challenge_addr = resolved.challenge;
     if let Some(limit) = args.offers_per_minute {
         listener_config.offers_per_ip_per_minute = limit;
     }

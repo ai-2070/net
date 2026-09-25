@@ -131,7 +131,7 @@ export interface LeafWasmSession {
   enroll(): Promise<void>;
   /** A promise, where `LeafNode.is_enrolled` is synchronous. */
   is_enrolled(): Promise<boolean>;
-  signal(peer_hex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void>;
+  signal(peer_hex: string, dialog_hex: string, kind: string, payload: Uint8Array): Promise<void>;
   /**
    * The four peer-attempt primitives, proxied. `peer_candidate` and
    * `peer_handshake` take the dialog because the leaf requires it:

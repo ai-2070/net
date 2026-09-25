@@ -845,3 +845,237 @@ async fn successful_upgrade_stops_further_attempts() {
         "an upgraded peer must drop out of the scan loop's candidate set",
     );
 }
+
+// ---- R2 phase 5: a blind-relayed session upgrades to direct (V3 S7) ----
+
+/// A node whose id is lower (or higher) than `than`, so a test can pin
+/// which end of a pair C1 names.
+async fn build_node_ordered(than: Option<u64>, lower: bool) -> Arc<MeshNode> {
+    loop {
+        let kp = EntityKeypair::generate();
+        let ok = match than {
+            None => true,
+            Some(other) => (kp.node_id() < other) == lower,
+        };
+        if ok {
+            return Arc::new(
+                MeshNode::new(kp, base_config())
+                    .await
+                    .expect("MeshNode::new"),
+            );
+        }
+    }
+}
+
+struct RelayedPair {
+    operator: Arc<MeshNode>,
+    device: Arc<MeshNode>,
+    core: Arc<net::adapter::net::traversal::blind_relay::RelayCore>,
+    channel: net::adapter::net::ChannelName,
+    _registration: net::adapter::net::traversal::blind_relay::RelayRegistration,
+    relay_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RelayedPair {
+    fn drop(&mut self) {
+        self.relay_task.abort();
+    }
+}
+
+impl RelayedPair {
+    fn relay_forwarded(&self) -> u64 {
+        self.core
+            .stats()
+            .forwarded_packets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn publish_once(&self) -> net::adapter::net::PublishReport {
+        use net::adapter::net::{ChannelPublisher, PublishConfig};
+        let publisher = ChannelPublisher::new(self.channel.clone(), PublishConfig::default());
+        self.operator
+            .publish(&publisher, bytes::Bytes::from_static(b"after"))
+            .await
+            .expect("publish")
+    }
+}
+
+/// The R2 shape with no other peers, so neither end can classify its NAT:
+/// an operator registered with a blind relay and announcing `hint` (its
+/// own bind by default) as its direct address, and a device that reached
+/// it only through the relay and subscribed to one of its channels over
+/// that session.
+async fn relayed_pair(operator_lower: bool, hint: Option<SocketAddr>) -> RelayedPair {
+    use net::adapter::net::traversal::blind_relay::{BlindRelay, RelayConfig};
+    let relay = BlindRelay::bind("127.0.0.1:0".parse().unwrap(), RelayConfig::default())
+        .await
+        .unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let core = relay.core().clone();
+    let relay_task = tokio::spawn(async move { relay.run().await });
+    let operator = build_node_ordered(None, true).await;
+    let device = build_node_ordered(Some(operator.node_id()), !operator_lower).await;
+    operator.start();
+    device.start();
+    operator
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("operator announce");
+    let hint = hint.unwrap_or_else(|| operator.local_addr());
+    operator.set_direct_hint(Some(hint)).await.expect("hint");
+    let registration = operator.relay_register(relay_addr).await.expect("register");
+    let via = device
+        .relay_bind(relay_addr, registration.id())
+        .await
+        .expect("bind");
+    device
+        .connect_via_endpoint(via, operator.public_key(), operator.node_id())
+        .await
+        .expect("device attaches through the blind relay");
+    let channel = net::adapter::net::ChannelName::new("r2.upgrade").unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        device.subscribe_channel(operator.node_id(), channel.clone()),
+    )
+    .await
+    .expect("no hang")
+    .expect("subscribed over the relayed session");
+    // The operator's own announcement (with its hint) reaches the device
+    // over the relayed session, not only at the next re-announce.
+    let (d, op_id) = (device.clone(), operator.node_id());
+    assert!(
+        wait_for(Duration::from_secs(5), || d.peer_reflex_addr(op_id)
+            == Some(hint))
+        .await,
+        "the device learns the operator's announced direct address over the relay",
+    );
+    assert!(
+        !device.peer_is_direct(operator.node_id()),
+        "precondition: relayed"
+    );
+    RelayedPair {
+        operator,
+        device,
+        core,
+        channel,
+        _registration: registration,
+        relay_task,
+    }
+}
+
+/// The device (which announces no address) is the one end that initiates,
+/// whichever id is lower; the background loop moves the session to the
+/// operator's announced address. Identity, the subscription the operator
+/// granted over the relay, and exactly-once delivery all survive the swap,
+/// and the relay carries nothing afterwards.
+async fn upgrade_case(operator_lower: bool) {
+    let pair = relayed_pair(operator_lower, None).await;
+    let (op, dev) = (&pair.operator, &pair.device);
+    let (op_id, dev_id) = (op.node_id(), dev.node_id());
+    assert!(
+        dev.upgrade_initiates_for_test(op_id),
+        "the device initiates (operator lower: {operator_lower})"
+    );
+    assert!(
+        !op.upgrade_initiates_for_test(dev_id),
+        "exactly one end initiates (operator lower: {operator_lower})"
+    );
+    let d = dev.clone();
+    assert!(
+        wait_for(Duration::from_secs(25), || d.peer_is_direct(op_id)).await,
+        "the upgrade loop moves the device's session to the direct path; stats {:?}",
+        dev.traversal_stats(),
+    );
+    assert_eq!(dev.peer_addr(op_id), Some(op.local_addr()));
+    assert_eq!(
+        dev.peer_entity_id(op_id).as_ref(),
+        Some(op.entity_id()),
+        "the same authenticated identity"
+    );
+    assert_eq!(
+        op.traversal_stats().upgrades_attempted,
+        0,
+        "the operator never dialled"
+    );
+    // Let the responder's end settle onto the direct path, then prove the
+    // relay is out of the data plane.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ch_id = net::adapter::net::ChannelId::new(pair.channel.clone());
+    assert_eq!(
+        op.roster().members(&ch_id),
+        vec![dev_id],
+        "the subscription granted over the relay is kept, once, without re-subscribing"
+    );
+    let before = pair.relay_forwarded();
+    let report = pair.publish_once().await;
+    assert_eq!(
+        (report.attempted, report.delivered),
+        (1, 1),
+        "{:?}",
+        report.errors
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        pair.relay_forwarded(),
+        before,
+        "after the upgrade nothing rides the relay"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blind_relayed_device_upgrades_when_its_operator_is_the_lower_id() {
+    upgrade_case(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blind_relayed_device_upgrades_when_it_is_the_lower_id() {
+    upgrade_case(false).await;
+}
+
+/// An announced address that does not answer: the upgrade is attempted,
+/// fails, and the relayed session keeps serving — the same session, the
+/// same subscription, delivery through the relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_upgrade_keeps_the_blind_relayed_session() {
+    let dead = {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.local_addr().unwrap()
+    };
+    let pair = relayed_pair(EntityKeypair::generate().node_id() & 1 == 0, Some(dead)).await;
+    let (op, dev) = (&pair.operator, &pair.device);
+    let op_id = op.node_id();
+    let session = dev
+        .peer_session_for_test(op_id)
+        .expect("session")
+        .session_id();
+    let d = dev.clone();
+    assert!(
+        wait_for(Duration::from_secs(25), || {
+            d.upgrade_failure_count_for_test(op_id).unwrap_or(0) >= 1
+        })
+        .await,
+        "the upgrade to the dead address is attempted and fails; stats {:?}",
+        dev.traversal_stats(),
+    );
+    assert!(dev.traversal_stats().upgrades_attempted >= 1);
+    assert_eq!(dev.traversal_stats().upgrades_succeeded, 0);
+    assert!(!dev.peer_is_direct(op_id), "still relayed");
+    assert_eq!(
+        dev.peer_session_for_test(op_id).map(|s| s.session_id()),
+        Some(session),
+        "the relayed session was not replaced"
+    );
+    let before = pair.relay_forwarded();
+    let report = pair.publish_once().await;
+    assert_eq!(
+        (report.attempted, report.delivered),
+        (1, 1),
+        "{:?}",
+        report.errors
+    );
+    let p = &pair;
+    assert!(
+        wait_for(Duration::from_secs(3), || p.relay_forwarded() > before).await,
+        "delivery still rides the relay"
+    );
+}

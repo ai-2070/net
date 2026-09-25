@@ -92,7 +92,7 @@ use crate::error::{Result, SdkError};
 ///     .subscribe_channel_with(
 ///         publisher.node_id(),
 ///         &channel,
-///         SubscribeOptions { token: Some(token) },
+///         SubscribeOptions { token: Some(token), ..Default::default() },
 ///     )
 ///     .await?;
 /// # Ok(())
@@ -105,6 +105,11 @@ pub struct SubscribeOptions {
     /// `ChannelConfig::can_subscribe`, so a matching token
     /// satisfies `require_token` channels end-to-end.
     pub token: Option<net::adapter::net::PermissionToken>,
+    /// A full delegated chain (root → … → this node) to present instead of
+    /// a single token. The publisher verifies every link against its
+    /// `token_roots`; the chain is never flattened. Set at most one of
+    /// `token` and `chain`.
+    pub chain: Option<net::adapter::net::identity::TokenChain>,
 }
 
 /// Builder for configuring a [`Mesh`] node.
@@ -120,6 +125,8 @@ pub struct MeshBuilder {
     subnet_authorities: Vec<crate::subnet::SubnetAuthorityConfig>,
     subnet_attachment: Option<crate::subnet::TopologySubnetId>,
     subnet_control_channel: Option<net::adapter::net::ChannelName>,
+    subnet_floor_store: Option<std::path::PathBuf>,
+    static_key: Option<net::adapter::net::NoiseStaticKey>,
     subnet_exports: Vec<crate::subnet::NamedSubnetExport>,
     /// RTC transport for this node (R6): a browser-facing anchor
     /// has to be constructible from the SDK, or the SDK's own
@@ -133,6 +140,7 @@ pub struct MeshBuilder {
     reflex_override: Option<SocketAddr>,
     #[cfg(feature = "port-mapping")]
     try_port_mapping: bool,
+    announce_noise_key: bool,
     #[cfg(feature = "nat-traversal")]
     auto_direct_upgrade: bool,
 }
@@ -155,6 +163,8 @@ impl MeshBuilder {
             subnet_authorities: Vec::new(),
             subnet_attachment: None,
             subnet_control_channel: None,
+            subnet_floor_store: None,
+            static_key: None,
             subnet_exports: Vec::new(),
             #[cfg(feature = "webrtc")]
             rtc: None,
@@ -164,6 +174,7 @@ impl MeshBuilder {
             reflex_override: None,
             #[cfg(feature = "port-mapping")]
             try_port_mapping: false,
+            announce_noise_key: false,
             #[cfg(feature = "nat-traversal")]
             auto_direct_upgrade: true,
         })
@@ -255,6 +266,22 @@ impl MeshBuilder {
     /// should not rely on.
     pub fn subnet_attachment(mut self, path: crate::subnet::TopologySubnetId) -> Self {
         self.subnet_attachment = Some(path);
+        self
+    }
+
+    /// Persist accepted subnet revocation floors (subtree and subject) in
+    /// `dir`, replayed before any admission on restart — so a restarted
+    /// verifier can never re-admit a subject it removed.
+    pub fn subnet_floor_store(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.subnet_floor_store = Some(dir.into());
+        self
+    }
+
+    /// Keep this node's Noise static key across restarts: nodes that pinned
+    /// it (e.g. from an invite or bundle this node issued) can then reach it
+    /// again. Without it every build generates a fresh key.
+    pub fn noise_static_key(mut self, key: net::adapter::net::NoiseStaticKey) -> Self {
+        self.static_key = Some(key);
         self
     }
 
@@ -377,6 +404,16 @@ impl MeshBuilder {
         self
     }
 
+    /// Carry this node's Noise static public key in its signed capability
+    /// announcements, so a peer that learns of it through a hub can open an
+    /// endpoint-authenticated session to it ([`Mesh::ensure_session`]).
+    /// Off by default: a peer predating the field would drop the
+    /// announcement.
+    pub fn announce_noise_key(mut self, announce: bool) -> Self {
+        self.announce_noise_key = announce;
+        self
+    }
+
     /// Enable the background direct-path upgrade: once a session
     /// to a peer is established via a relay, the mesh
     /// opportunistically re-handshakes over a direct path and
@@ -443,6 +480,12 @@ impl MeshBuilder {
         if let Some(channel) = self.subnet_control_channel {
             config = config.with_subnet_control_channel(channel);
         }
+        if let Some(dir) = self.subnet_floor_store {
+            config = config.with_subnet_floor_store(dir);
+        }
+        if let Some(key) = self.static_key {
+            config = config.with_static_key(key);
+        }
         // Review-10 P1-6: the checked map is the NODE's, resolved and
         // frozen by `MeshNode::new`. Pushing the entries into the config
         // rather than building a second map here is what keeps Rust,
@@ -466,6 +509,9 @@ impl MeshBuilder {
         #[cfg(feature = "nat-traversal")]
         if let Some(external) = self.reflex_override {
             config = config.with_reflex_override(external);
+        }
+        if self.announce_noise_key {
+            config = config.with_announce_noise_key(true);
         }
         #[cfg(feature = "port-mapping")]
         if self.try_port_mapping {
@@ -708,6 +754,19 @@ impl Mesh {
     /// the routed-handshake protocol — the initiator's full
     /// `node_id` rides inside the Noise msg1 payload, so the
     /// responder learns it on demand. No pre-`accept` needed.
+    /// Make sure a live, endpoint-authenticated session with `node_id`
+    /// exists before talking to it: an existing one, a direct handshake to
+    /// an address it announced, or a routed one through the hop its
+    /// forwarded announcement installed — using the Noise key it signed
+    /// into its own announcement. See the core `MeshNode::ensure_session`.
+    pub async fn ensure_session(
+        &self,
+        node_id: u64,
+        budget: std::time::Duration,
+    ) -> Result<net::adapter::net::SessionPath> {
+        Ok(self.node.ensure_session(node_id, budget).await?)
+    }
+
     pub async fn connect_via(
         &self,
         relay_addr: &str,
@@ -957,13 +1016,23 @@ impl Mesh {
         channel: &ChannelName,
         opts: SubscribeOptions,
     ) -> Result<()> {
-        let result = match opts.token {
-            Some(token) => {
+        let result = match (opts.token, opts.chain) {
+            (Some(_), Some(_)) => {
+                return Err(SdkError::Config(
+                    "subscribe with a token or a chain, not both".to_string(),
+                ))
+            }
+            (None, Some(chain)) => {
+                self.node
+                    .subscribe_channel_with_chain(publisher_node_id, channel.clone(), chain)
+                    .await
+            }
+            (Some(token), None) => {
                 self.node
                     .subscribe_channel_with_token(publisher_node_id, channel.clone(), token)
                     .await
             }
-            None => {
+            (None, None) => {
                 self.node
                     .subscribe_channel(publisher_node_id, channel.clone())
                     .await
@@ -973,6 +1042,31 @@ impl Mesh {
             Ok(()) => Ok(()),
             Err(e) => Err(adapter_to_channel_error(e)),
         }
+    }
+
+    /// Install this node's managed publish chain for `channel` (a delegated
+    /// chain whose leaf is this node). One per channel: a different chain
+    /// already installed is refused, never overwritten. Returns its
+    /// fingerprint, the key for [`Self::remove_publish_chain_if`]. Publishing
+    /// still requires this node's own `ChannelConfig` to trust the root.
+    pub fn install_publish_chain(
+        &self,
+        channel: &ChannelName,
+        chain: net::adapter::net::identity::TokenChain,
+    ) -> std::result::Result<[u8; 32], net::adapter::net::PublishChainConflict> {
+        self.node.install_publish_chain(channel, chain)
+    }
+
+    /// The fingerprint of the publish chain held for `channel`, if any.
+    pub fn publish_chain_fingerprint(&self, channel: &ChannelName) -> Option<[u8; 32]> {
+        self.node.publish_chain_fingerprint(channel)
+    }
+
+    /// Remove the publish chain for `channel` only if it is exactly the
+    /// incarnation `fingerprint` names (never a successor), evicting its
+    /// tokens from the token cache so no fallback keeps authorizing it.
+    pub fn remove_publish_chain_if(&self, channel: &ChannelName, fingerprint: &[u8; 32]) -> bool {
+        self.node.remove_publish_chain_if(channel, fingerprint)
     }
 
     /// Mirror of [`Self::subscribe_channel`]. Idempotent on the

@@ -95,7 +95,13 @@ window.nextGeneration = async () => {
       const current = get.result === undefined ? 0 : Number(get.result);
       const next = current + 1;
       const put = store.put(String(next), 'generation');
-      put.onsuccess = () => ok(next);
+      put.onsuccess = () => {
+        // This tab's own belief, readable from the tab itself after a
+        // freeze/resume cycle — the probe must not be the one
+        // remembering it.
+        window.myGeneration = next;
+        ok(next);
+      };
       put.onerror = () => bad(put.error);
     };
     get.onerror = () => bad(get.error);
@@ -140,6 +146,12 @@ async function lifecycle(page, state) {
   try {
     await session.send('Page.enable');
     await session.send('Page.setWebLifecycleState', { state });
+    // The command's acknowledgement is not the effect: a no-op
+    // freeze used to sail straight on to a verdict below. Read the
+    // lifecycle state back and report it, and nothing is concluded
+    // from an unverified freeze.
+    const read = await session.send('Page.getWebLifecycleState');
+    return read.state === state;
   } finally {
     await session.detach().catch(() => {});
   }
@@ -161,27 +173,57 @@ try {
     window.takeLock(true),
   );
 
-  // 3. Freeze the leader, then ask again. THE question.
-  await lifecycle(leader, 'frozen');
+  // 3. Freeze the leader, then ask again. THE question. The freeze
+  //    is VERIFIED (the lifecycle state read back off the page) — a
+  //    no-op freeze must not reach a verdict at all.
+  findings.leaderFreezeVerified = await lifecycle(leader, 'frozen');
   await new Promise((r) => setTimeout(r, 500));
   findings.followerAfterLeaderFrozen = await follower.evaluate(() => window.takeLock(true));
 
-  // 4. Resume the leader. It still believes it holds generation 1.
-  await lifecycle(leader, 'active');
-  findings.resumedLeaderBelievesGeneration = findings.leaderGeneration;
+  // 4. Resume the leader (verified the same way), and read what IT
+  //    believes FROM THE TAB — not an echo of the probe's own
+  //    pre-freeze reading, which was true by construction.
+  findings.leaderResumeVerified = await lifecycle(leader, 'active');
+  findings.resumedLeaderBelievesGeneration = await leader.evaluate(() => window.myGeneration);
   findings.generationInStorageAfterResume = await follower.evaluate(() =>
     window.currentGeneration(),
   );
 
-  // 5. And if the successor had taken over, the resumed tab's
-  //    generation is below the stored one — which is the fence.
+  // 5. The successor has acted — in its own right and in its own
+  //    step: the read-increment-write the new leader performs. The
+  //    fence row below performs NO write at all, so the store move it
+  //    measures is an independent writer's act, observed post-hoc —
+  //    not a delta the fence row caused and then read back one line
+  //    later, where the compared values agree by construction and
+  //    the row can never report anything else.
   findings.successorGeneration = await follower.evaluate(() => window.nextGeneration());
-  findings.resumedTabIsStale =
-    findings.resumedLeaderBelievesGeneration < findings.successorGeneration;
 
-  findings.verdict = findings.followerAfterLeaderFrozen.granted
-    ? 'a frozen tab RELEASES its Web Lock on this engine'
-    : 'a frozen tab KEEPS its Web Lock on this engine — the lock alone cannot fence it';
+  // 6. The fence — asserted strictly as what it measures: the
+  //    tab-side bookkeeping the generation fence rests on, that the
+  //    resumed tab's cached generation LAGS the counter in storage.
+  //    Both sides are read fresh after the successor's move, and
+  //    neither is the successor's increment result (which is above
+  //    every prior reading by construction). It can fail on
+  //    staleness: a resumed tab whose belief tracked the store — a
+  //    vault that re-read the counter on resume — reads equal here
+  //    and this row reports false, refuting the staleness claim.
+  findings.generationInStorageNow = await follower.evaluate(() => window.currentGeneration());
+  findings.resumedTabBelievesNow = await leader.evaluate(() => window.myGeneration);
+  findings.resumedTabIsStale =
+    findings.resumedTabBelievesNow < findings.generationInStorageNow;
+  // The control, the same predicate applied to the tab that produced
+  // the move: false, because a writer is current with what it just
+  // wrote. This pair is what makes `resumedTabIsStale` a staleness
+  // reading rather than a tautology — the predicate demonstrably
+  // does report false for a tab that is not stale.
+  findings.successorTabIsStale =
+    findings.successorGeneration < findings.generationInStorageNow;
+
+  findings.verdict = !findings.leaderFreezeVerified
+    ? 'INCONCLUSIVE on this engine: the freeze never took effect'
+    : findings.followerAfterLeaderFrozen.granted
+      ? 'a frozen tab RELEASES its Web Lock on this engine'
+      : 'a frozen tab KEEPS its Web Lock on this engine — the lock alone cannot fence it';
 
   console.log(JSON.stringify(findings, null, 2));
 } finally {

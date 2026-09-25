@@ -25,6 +25,8 @@ The space is 16 bits — 65,536 IDs. The substrate has carved out the first `0x2
 | `0x0801`           | Log reconciliation                                         |
 | `0x0900`           | Replica group coordination (reserved, not active)          |
 | `0x0A00`           | Channel membership                                         |
+| `0x0A01`           | Identity proof (`SUBPROTOCOL_IDENTITY_PROOF`)              |
+| `0x0A02`           | Subnet admission (`SUBPROTOCOL_SUBNET_ADMISSION`): ChallengeRequest / Challenge / Present / Verdict |
 | `0x0B00`           | Stream-window flow control (24-byte payload, carries `ack_seq` for ack-driven retransmit pruning) |
 | `0x0B01`           | Stream NACK — reliable-stream retransmit signaling         |
 | `0x0B02`           | Stream RESET — reliable-stream hard-failure signal         |

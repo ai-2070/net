@@ -643,6 +643,68 @@ async fn https_request(
     Ok(String::from_utf8_lossy(&buf[..n]).to_string())
 }
 
+/// One hand-written WebSocket upgrade request — the exact headers a
+/// browser sends, including the attempt token presented as the
+/// `net-bootstrap-attempt.<token>` subprotocol (R1).
+fn ws_upgrade_request(
+    addr: std::net::SocketAddr,
+    dialog: u64,
+    node: u64,
+    token: Option<&str>,
+) -> String {
+    let protocol = token
+        .map(|token| format!("Sec-WebSocket-Protocol: net-bootstrap-attempt.{token}\r\n"))
+        .unwrap_or_default();
+    format!(
+        "GET /rtc/trickle?dialog={dialog}&node_id={node} HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         Connection: Upgrade\r\n\
+         Upgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: AQEBAQEBAQEBAQEBAQEBAQ==\r\n\
+         {protocol}\
+         Origin: {ORIGIN}\r\n\r\n"
+    )
+}
+
+/// Read one response's header block off a raw socket (a 101 leaves
+/// the stream open, so this stops at the blank line, not at EOF).
+async fn read_http_headers(socket: &mut tokio::net::TcpStream) -> String {
+    let mut headers = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !headers.ends_with(b"\r\n\r\n") && headers.len() < 8192 {
+            headers.push(socket.read_u8().await.unwrap());
+        }
+    })
+    .await
+    .expect("response headers");
+    String::from_utf8_lossy(&headers).into_owned()
+}
+
+/// One masked client→server WebSocket frame (RFC 6455 §5.3): the
+/// hand-rolled client MUST mask, and this witness is about the exact
+/// bytes a browser sends. `opcode` is `0x1` text, `0x8` close.
+fn ws_client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    const MASK: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+    let mut frame = vec![0x80 | opcode];
+    let len = payload.len();
+    assert!(len < 65_536, "the probe frames fit the 16-bit length form");
+    if len < 126 {
+        frame.push(0x80 | len as u8);
+    } else {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(len as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(&MASK);
+    frame.extend(
+        payload
+            .iter()
+            .zip(MASK.iter().cycle())
+            .map(|(byte, mask)| byte ^ mask),
+    );
+    frame
+}
+
 // ===================================================================
 // Kyra's Stage 4b probes, landed VERBATIM (assertions untouched).
 //
@@ -729,10 +791,11 @@ async fn kyra_uncredentialed_websocket_cannot_retire_another_offer() {
     assert_eq!(anchor.open_signal_dialogs(offerer.node_id()), 1);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let serve_router = router.clone();
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            serve_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await
         .unwrap();
@@ -874,6 +937,7 @@ async fn kyra_bootstrap_candidates_must_keep_the_native_frame_budget() {
     );
     let start = tokio::time::Instant::now();
     let mut bootstrap_ok = 0;
+    let mut native_ok = 0;
     let mut native_refused = 0;
     for _ in 0..=MAX_FRAMES_PER_WINDOW {
         let msg = RtcSignalMsg::Candidate {
@@ -881,11 +945,9 @@ async fn kyra_bootstrap_candidates_must_keep_the_native_frame_budget() {
             candidate: candidate.clone(),
             mid: "0".into(),
         };
-        if matches!(
-            native.admit(offerer.node_id(), &msg, now),
-            SignalAdmit::Refused(_)
-        ) {
-            native_refused += 1;
+        match native.admit(offerer.node_id(), &msg, now) {
+            SignalAdmit::Refused(_) => native_refused += 1,
+            _ => native_ok += 1,
         }
         if anchor
             .apply_bootstrap_candidate(offerer.node_id(), 72, candidate.clone(), "0".into())
@@ -906,10 +968,20 @@ async fn kyra_bootstrap_candidates_must_keep_the_native_frame_budget() {
         native_refused > 0,
         "native positive control must reach refusal"
     );
-    eprintln!("kyra_candidate_budget: bootstrap_accepted={bootstrap_ok} native_refused={native_refused} elapsed_ms={}",elapsed.as_millis());
+    eprintln!("kyra_candidate_budget: bootstrap_accepted={bootstrap_ok} native_ok={native_ok} native_refused={native_refused} elapsed_ms={}",elapsed.as_millis());
     assert!(
         bootstrap_ok < MAX_FRAMES_PER_WINDOW,
-        "bootstrap hook applied every candidate beyond the shared64-frame limit"
+        "bootstrap hook applied every candidate beyond the shared 64-frame limit"
+    );
+    // The admission SIDE of the same claim: the bootstrap ingress
+    // must admit exactly what the native frame budget admits. The
+    // upper bound alone passed at `bootstrap_ok == 0` — an
+    // over-refusing or unwired `admit_signal_frame` kept this
+    // witness green while legitimate trickling was dead.
+    assert_eq!(
+        bootstrap_ok, native_ok,
+        "the bootstrap ingress must admit exactly what the native frame \
+         budget admits — one bound, two callers"
     );
 }
 
@@ -941,6 +1013,10 @@ async fn the_attempt_token_holder_can_trickle_and_abandon_its_own_attempt() {
     let offered: OfferResponse = serde_json::from_slice(&body).expect("offer response");
     assert_eq!(offered.attempt_token.len(), 64, "32 random bytes, hex");
     assert_eq!(anchor.open_signal_dialogs(offerer.node_id()), 1);
+    let node = offerer.node_id();
+    let key = anchor
+        .bootstrap_attempt_key(node, offered.dialog)
+        .expect("the attempt's accounting key");
 
     // The token upgrades where the probe's tokenless socket did not.
     let upgrade = |token: Option<String>, dialog: u64| {
@@ -968,14 +1044,8 @@ async fn the_attempt_token_holder_can_trickle_and_abandon_its_own_attempt() {
         }
     };
 
-    // 426 = the origin layer and the token check both passed and the
-    // upgrade extractor is what a `oneshot` harness cannot complete.
-    assert_eq!(
-        upgrade(Some(offered.attempt_token.clone()), offered.dialog).await,
-        StatusCode::UPGRADE_REQUIRED,
-        "the token holder reaches the upgrade"
-    );
-    // …and every way of not holding it is refused BEFORE the upgrade.
+    // Every way of not holding the token is refused BEFORE the
+    // upgrade; the token holder's own socket drives for real below.
     assert_eq!(upgrade(None, offered.dialog).await, StatusCode::FORBIDDEN);
     assert_eq!(
         upgrade(Some("00".repeat(32)), offered.dialog).await,
@@ -988,6 +1058,189 @@ async fn the_attempt_token_holder_can_trickle_and_abandon_its_own_attempt() {
         "a real token for a different dialog is as good as no token"
     );
 
+    // A REAL upgrade over real TCP: the token holder's socket
+    // completes the handshake (`101`) — the part the old body never
+    // reached, its `oneshot` harness being unable to complete an
+    // upgrade.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_router = router.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            serve_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket
+        .write_all(
+            ws_upgrade_request(addr, offered.dialog, node, Some(&offered.attempt_token)).as_bytes(),
+        )
+        .await
+        .unwrap();
+    let headers = read_http_headers(&mut socket).await;
+    assert!(
+        headers.starts_with("HTTP/1.1 101"),
+        "the token holder's socket upgrades for real: {headers}"
+    );
+
+    // TRICKLE: a candidate sent over the socket reaches the shared
+    // signalling ingress (`admit_signal_frame`) exactly once — the
+    // frame the old body never trickled.
+    let delivered = anchor.rtc_driver().unwrap().stats().signal_delivered();
+    let candidate = serde_json::json!({
+        "type": "candidate",
+        "candidate": offerer.bootstrap_host_candidate().unwrap(),
+        "mid": "0",
+    })
+    .to_string();
+    socket
+        .write_all(&ws_client_frame(0x1, candidate.as_bytes()))
+        .await
+        .unwrap();
+    let until = tokio::time::Instant::now() + Duration::from_secs(2);
+    while anchor.rtc_driver().unwrap().stats().signal_delivered() == delivered
+        && tokio::time::Instant::now() < until
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        anchor.rtc_driver().unwrap().stats().signal_delivered(),
+        delivered + 1,
+        "the trickled candidate must reach the shared signalling ingress — once"
+    );
+
+    // ABANDON: the holder closes its socket, and its close retires
+    // its own attempt — the dialog ends, the accounting is released,
+    // and the token stops authorizing.
+    socket.write_all(&ws_client_frame(0x8, &[])).await.unwrap();
+    drop(socket);
+    let until = tokio::time::Instant::now() + Duration::from_secs(2);
+    while anchor.open_signal_dialogs(node) == 1 && tokio::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        anchor.open_signal_dialogs(node),
+        0,
+        "the holder's close retires its own attempt"
+    );
+    assert!(
+        !anchor.bootstrap_attempt_is_live(node, offered.dialog, key),
+        "and releases the attempt's accounting"
+    );
+    assert_eq!(
+        upgrade(Some(offered.attempt_token.clone()), offered.dialog).await,
+        StatusCode::NOT_FOUND,
+        "a retired attempt's token stops authorizing"
+    );
+
+    server.abort();
+    let _ = server.await;
+    anchor.shutdown().await.expect("shutdown");
+    offerer.shutdown().await.expect("shutdown");
+}
+
+/// R1, the second repair: a stale trickle socket's delayed close
+/// must not end its successor's live attempt. The token RE-UPGRADES
+/// — a reconnecting browser reopens the same attempt over a new
+/// socket — so "whoever retires the token first" let the old socket's
+/// delayed TCP close kill the very attempt its successor was
+/// trickling into. Inverse: without the socket generation, the first
+/// close below retires the shared token and ends the dialog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_trickle_socket_cannot_end_its_successors_attempt() {
+    let anchor = kyra_long_lived_anchor().await;
+    let offerer = offerer().await;
+    let router = bootstrap_router(Arc::clone(&anchor), &config(PSK));
+    let credential = credential_for(PSK, Duration::from_secs(600));
+    let node = offerer.node_id();
+    let sdp = offerer
+        .rtc_driver()
+        .expect("driver")
+        .create_offer()
+        .await
+        .expect("offer")
+        .1;
+    let (status, body) = post_offer(&router, &credential, node, &sdp).await;
+    assert_eq!(status, StatusCode::OK);
+    let offered: OfferResponse = serde_json::from_slice(&body).expect("offer response");
+    let key = anchor
+        .bootstrap_attempt_key(node, offered.dialog)
+        .expect("the attempt's accounting key");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_router = router.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            serve_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    // The FIRST socket holds the attempt…
+    let mut first = tokio::net::TcpStream::connect(addr).await.unwrap();
+    first
+        .write_all(
+            ws_upgrade_request(addr, offered.dialog, node, Some(&offered.attempt_token)).as_bytes(),
+        )
+        .await
+        .unwrap();
+    let headers = read_http_headers(&mut first).await;
+    assert!(
+        headers.starts_with("HTTP/1.1 101"),
+        "the first socket upgrades: {headers}"
+    );
+
+    // …and the browser's RECONNECT re-upgrades with the same token.
+    let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+    second
+        .write_all(
+            ws_upgrade_request(addr, offered.dialog, node, Some(&offered.attempt_token)).as_bytes(),
+        )
+        .await
+        .unwrap();
+    let headers = read_http_headers(&mut second).await;
+    assert!(
+        headers.starts_with("HTTP/1.1 101"),
+        "the reconnecting socket re-upgrades with the same token: {headers}"
+    );
+
+    // The STALE socket goes away first: its close must not reach the
+    // successor's attempt.
+    first.write_all(&ws_client_frame(0x8, &[])).await.unwrap();
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        anchor.open_signal_dialogs(node),
+        1,
+        "a stale socket's close must not end its successor's live attempt"
+    );
+    assert!(
+        anchor.bootstrap_attempt_is_live(node, offered.dialog, key),
+        "the attempt is still live for its successor"
+    );
+
+    // The CURRENT socket's close does end it.
+    second.write_all(&ws_client_frame(0x8, &[])).await.unwrap();
+    drop(second);
+    let until = tokio::time::Instant::now() + Duration::from_secs(2);
+    while anchor.open_signal_dialogs(node) == 1 && tokio::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        anchor.open_signal_dialogs(node),
+        0,
+        "the current socket's close retires the attempt"
+    );
+    assert!(!anchor.bootstrap_attempt_is_live(node, offered.dialog, key));
+
+    server.abort();
+    let _ = server.await;
     anchor.shutdown().await.expect("shutdown");
     offerer.shutdown().await.expect("shutdown");
 }

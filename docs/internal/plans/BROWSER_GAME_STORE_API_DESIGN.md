@@ -17,7 +17,9 @@ Three entry points, proposed at the existing `@net-mesh/browser` root:
 - `joinStore(...)`: obtain a subscribed local replica from an explicit owner.
 
 A store instance is identified by **(authority identity, definition id,
-version, application key)**. The key can name a ship, room or region. There
+version, store name)**. The store name can name a ship, room or region; the
+`key` a joiner presents is its own opaque join token — two callers of one
+store carry different ones — and only the owner's policy reads it. There
 is no global world authority, global registry or mandatory anchor data hop.
 A browser can host one ship and join another store. A store owner is the
 application endpoint, not an extra relay inserted between two endpoints.
@@ -88,18 +90,19 @@ interface StoreReader<S extends object> {
   subscribeStatus(listener: (status: StoreStatus, previous: StoreStatus) => void): Cancel;
 }
 
-interface OperationOptions { readonly timeoutMs?: number; readonly signal?: AbortSignal }
 type InputDisposition =
   | { readonly type: 'queued' | 'replaced' }
   | { readonly type: 'dropped'; readonly reason: 'not-ready' | 'capacity' };
 
-interface JoinedStore<S extends object, A extends ActionSpec, I extends InputSpec>
+interface JoinedStoreHandle<S extends object, A extends ActionSpec, I extends InputSpec>
   extends StoreReader<S> {
-  readonly actions: { readonly [K in keyof A]: (
-    input: A[K]['input'], options?: OperationOptions,
-  ) => Promise<A[K]['output']> };
-  readonly inputs: { readonly [K in keyof I]: (input: I[K]) => InputDisposition };
-  setAudience(names: readonly string[], options?: OperationOptions): Promise<void>;
+  /** Resolves when a consistent view is installed. */
+  ready(): Promise<void>;
+  act<K extends keyof A & string>(name: K, input: A[K]['input']): Promise<A[K]['output']>;
+  input<K extends keyof I & string>(name: K, value: I[K]): InputDisposition;
+  setAudience(names: readonly string[]): Promise<void>;
+  /** The session was replaced: resume on the new one. */
+  reconnect(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -120,43 +123,37 @@ type AccessRequest<A extends ActionSpec, I extends InputSpec> =
       readonly type: 'input'; readonly peer: string; readonly name: K; readonly input: I[K];
     } }[keyof I];
 
-interface HostedStore<S extends object> extends StoreReader<S> {
+interface HostedStoreHandle<S extends object> extends StoreReader<S> {
   readonly authority: string;
-  setState(update: StateUpdate<S>): void;
+  setState(next: S): void;
+  counts(): { readonly handles: number; readonly ledgers: number; readonly deferred: number };
+  counters(): Readonly<Record<string, number>>;
   close(): Promise<void>;
 }
 
-interface StoreLimits {
-  readonly maxSnapshotBytes?: number;
-  readonly maxMessageBytes?: number;
-  readonly maxPendingActions?: number;
-  readonly maxAudiences?: number;
-}
-
 declare function hostStore<S extends object, A extends ActionSpec, I extends InputSpec>(options: {
-  session: MeshSession;
+  transport: MeshSession;
   definition: StoreDefinition<S, A, I>;
-  key: string;
+  store?: string;
   initialState: S;
+  maxEventBytes: number;
   authorize: (request: AccessRequest<A, I>) => boolean;
   project: (state: ReadonlyState<S>, context: {
     readonly peer: string; readonly audience: readonly string[];
   }) => S;
   actions: { [K in keyof A]: (input: A[K]['input'], context: ActionContext<S>) => A[K]['output'] };
   inputs: { [K in keyof I]: (input: I[K], context: ActionContext<S>) => undefined };
-  limits?: StoreLimits;
-}): Promise<HostedStore<S>>;
+}): HostedStoreHandle<S>;
 
 declare function joinStore<S extends object, A extends ActionSpec, I extends InputSpec>(options: {
-  session: MeshSession;
+  transport: MeshSession;
   definition: StoreDefinition<S, A, I>;
-  authority: string;
+  host: string;
+  store?: string;
   key: string;
   audience: readonly string[];
-  timeoutMs?: number;
-  signal?: AbortSignal;
-  limits?: StoreLimits;
-}): Promise<JoinedStore<S, A, I>>;
+  maxEventBytes: number;
+}): JoinedStoreHandle<S, A, I>;
 
 type StoreErrorCode = 'invalid-data' | 'version-mismatch' | 'forbidden' |
   'not-ready' | 'capacity' | 'timeout' | 'aborted' | 'indeterminate' |
@@ -180,9 +177,10 @@ declare class StoreError extends Error {
   possession of a shared transport PSK does not silently grant store access.
 - One state object may contain nested records keyed by entity id. The
   developer need not adopt an ECS, schema DSL or a second entity registry.
-- Both creators are promises: success means the host is listening or the
-  replica has a validated initial snapshot and live subscription. A failed
-  join leaves no retained handle or hidden background reconnect loop.
+- Both creators return synchronously: `hostStore` hands back a host that is
+  already listening, and `joinStore` a handle whose `ready()` resolves once
+  the replica has a validated initial snapshot and live subscription. A
+  failed join leaves no retained handle or hidden background reconnect loop.
 - **Projections must represent absence explicitly** (reviewer disposition,
   2026-09-17). `project` keeps returning a **validated `S`** — not
   `Partial<S>`, which would weaken the schema and leave nested visibility
@@ -276,7 +274,8 @@ const ship = defineStore<ShipState, ShipActions, ShipInputs>({
 ```typescript
 async function startShip(session: MeshSession, crew: ReadonlySet<string>, captain: string) {
   return hostStore({
-    session, definition: ship, key: 'black-petrel',
+    transport: session, definition: ship, store: 'black-petrel',
+    maxEventBytes: 8108,
     initialState: { ship: { heading: 0, sail: 0, shots: 0 } },
     authorize(request) {
       if (!crew.has(request.peer)) return false;
@@ -312,10 +311,12 @@ async function startShip(session: MeshSession, crew: ReadonlySet<string>, captai
 }
 ```
 
-An owner simulation can call `host.setState(state => ({ ...changedFields }))`
-from its tick. One call is one immutable shallow-merge transaction; nested
-records are replaced explicitly with structural sharing. No Immer dependency,
-path-string setter, automatic diff of a Three.js scene or deep-merge surprise.
+An owner simulation can call `host.setState(next)` from its tick, handing over
+the whole next state — the host handle full-replaces (shallow-merge patches
+are handler-side `ActionContext.setState`). One call is one immutable
+replacement commit; nested records are replaced explicitly with structural
+sharing. No Immer dependency, path-string setter, automatic diff of a Three.js
+scene or deep-merge surprise.
 
 ### Player code: reads, selectors, actions and fresh input
 
@@ -323,10 +324,12 @@ path-string setter, automatic diff of a Three.js scene or deep-merge surprise.
 async function boardShip(
   session: MeshSession,
   authority: string,
+  invite: string,
   renderHeading: (n: number | null) => void,
 ) {
-  const store = await joinStore({
-    session, definition: ship, authority, key: 'black-petrel', audience: ['crew'],
+  const store = joinStore({
+    transport: session, definition: ship, host: authority,
+    store: 'black-petrel', key: invite, audience: ['crew'], maxEventBytes: 8108,
   });
 
   // `null` reaches the renderer as "no visible ship" — the selector never
@@ -342,17 +345,17 @@ async function boardShip(
   return {
     store,
     readForFrame: () => store.getState(),
-    steer: (degrees: number) => store.inputs.helm({ heading: degrees }),
-    firePort: () => store.actions.fire({ cannon: 'port' }),
+    steer: (degrees: number) => store.input('helm', { heading: degrees }),
+    firePort: () => store.act('fire', { cannon: 'port' }),
     leave: async () => { stop(); stopStatus(); await store.close(); },
   };
 }
 ```
 
 A Three.js loop reads `store.getState()` synchronously and applies numbers
-to its scene objects. `inputs.helm(...)` does not allocate a network promise
+to its scene objects. `input('helm', ...)` does not allocate a network promise
 for every frame: it updates a bounded latest-value slot. A fire button uses
-`await store.actions.fire(...)` and can distinguish refusal from an unknown
+`await store.act('fire', ...)` and can distinguish refusal from an unknown
 outcome. No network listener directly mutates Three.js objects behind the
 application's back.
 
@@ -369,10 +372,10 @@ no public reference-counting puzzle of `join`/`leave` calls for game code.
 | `getState()` | Synchronous immutable local snapshot. Reference is stable until an observable state change; unchanged subtrees retain identity. Never initiates I/O. Before readiness there is no joined handle. After disconnect it returns the last snapshot marked stale by status; after close it is frozen and stale. |
 | `subscribe(listener)` | Notify once per applied transaction with next/previous root. No initial notification. Returns an idempotent disposer. |
 | `subscribe(selector, listener, options)` | Default equality `Object.is`; optional explicit comparator, not implicit deep equality. `fireImmediately` calls once with current value as both arguments. Unrelated changes do not fire. Exceptions in one listener are reported through the existing callback-error convention and do not prevent other listeners or cleanup. |
-| Owner `setState(partialOrFunction)` | Synchronous owner-only immutable shallow merge. Validate before commit; no state publication on failure. Empty/unchanged updates do not create notifications or revisions. Cannot be called on a joined replica. |
-| `actions.name(input, options)` | Validate, authorize, execute once within the current deduplication session, return validated result. Resolving means the owner committed its in-memory state transition and sent the result, not disk durability or that all replicas rendered it. The caller's projection may catch up later. No silent retry. |
-| `inputs.name(input)` | Validate and enqueue/coalesce locally; synchronous disposition is not remote acceptance. One pending value per input name per caller, at most one in-flight send plus one replacement. Superseded values are dropped, not replayed. Disconnected/syncing/closed stores return `dropped/not-ready`. Invalid data still throws `StoreError`. |
-| `setAudience(names, options)` | Replace the desired audience set. Resolve after the owner authorized it and installed the matching snapshot/live boundary locally. Equal canonical sets are a no-op only when installed and ready; an equal pending request awaits that transition, while an equal failed request starts a fresh generation. A different newer request supersedes an older pending request; it is aborted, never reported successful by a late callback. |
+| Host `setState(next)` | Synchronous owner-only full replacement: the handle takes the whole next state (shallow-merge patches are handler-side `ActionContext.setState`). Validate before commit; no state publication on failure. Empty/unchanged updates do not create notifications or revisions. Cannot be called on a joined replica. |
+| `act(name, input)` | Validate, authorize, execute once within the current deduplication session, return validated result. Resolving means the owner committed its in-memory state transition and sent the result, not disk durability or that all replicas rendered it. The caller's projection may catch up later. No silent retry. |
+| `input(name, value)` | Validate and enqueue/coalesce locally; synchronous disposition is not remote acceptance. One pending value per input name per caller, at most one in-flight send plus one replacement. Superseded values are dropped, not replayed. Disconnected/syncing/closed stores return `dropped/not-ready`. Invalid data still throws `StoreError`. |
+| `setAudience(names)` | Replace the desired audience set. Resolve after the owner authorized it and installed the matching snapshot/live boundary locally. Equal canonical sets are a no-op only when installed and ready; an equal pending request awaits that transition, while an equal failed request starts a fresh generation. A different newer request supersedes an older pending request; it is aborted, never reported successful by a late callback. |
 | Replay of a retired sequence | Refused as `result-expired`, which means exactly: **this request cannot execute again, and its original result is unavailable.** It is *not* a success receipt and does not assert that the original attempt committed — a retired sequence may have been rejected, aborted before commit, or fenced without executing. Report "committed, result unavailable" only where retained evidence actually establishes the commit; otherwise the original outcome remains unknown. |
 | `getStatus` / `subscribeStatus` | Transport/readiness state kept out of game state. Stable status object until a transition; no initial subscription callback. Reconnecting means retained game state is stale, not an empty world or successful recovery. |
 | `close()` | Immediately fence new work; settle actions appropriately, clear latest inputs, remove listeners and release this handle's network subscriptions/streams. Idempotent promise resolves after local cleanup; no indefinite wait for an unreachable peer. It does not close the caller-owned `MeshSession`. |
@@ -381,9 +384,9 @@ There is no `store.setState` on replicas, no implicit optimistic write, no
 `flush()` that pretends delivery proves execution, and no React hook required
 in v1. The read/subscribe surface can support a later thin React adapter.
 
-Equal pending audience calls share the transition, not their cancellation
-ownership: each waiter has its own deadline/signal. Canceling one removes
-only that waiter; if none remain, fence the transition and stay non-ready.
+Equal pending audience calls share the transition, not their outcome: each
+call runs to its own request deadline. A timed-out call removes only that
+waiter; if none remain, fence the transition and stay non-ready.
 A different requested set supersedes the transition and rejects all of its
 waiters. No aborted promise can later resolve from a snapshot callback.
 
@@ -402,7 +405,7 @@ waiters. No aborted promise can later resolve from a snapshot callback.
   that subscription and clears its local projection; it cannot erase data a
   previously authorized user has already copied.
 - Only the configured owner can emit accepted replica state. Another peer
-  advertising the same definition/key cannot take it over. Include owner,
+  advertising the same definition/store cannot take it over. Include owner,
   store incarnation, schema version, subscription generation and revision in
   validation. Transport session replacement does not itself authorize a new
   application owner or reset a live store's action ledger.

@@ -272,6 +272,13 @@ export class Assembly {
  * same pair replaces it rather than accumulating — and a total byte
  * ceiling across handles, because a count bound alone is not a memory
  * bound (§2).
+ *
+ * **The deadline is the HOLDER's to drive.** Nothing inside this class
+ * reads a clock: a host holding its own table MUST call {@link
+ * AssemblyTable.sweep} from its own. The store's own replica needs no
+ * such call — it enforces the assembly deadline in its `tick`, where
+ * an expired assembly is abandoned and re-asked for rather than
+ * silently dropped, and clears the table through `reclaimHandle`.
  */
 export class AssemblyTable {
   private readonly live = new Map<string, Assembly>();
@@ -322,18 +329,26 @@ export class AssemblyTable {
       return reject('manifest-bytes', true, 'capacity');
     }
     const key = AssemblyTable.key(manifest.h, manifest.g);
-    // One in-flight per pair. A replacement manifest for the same pair
-    // reclaims the predecessor rather than leaving it to a deadline.
-    this.live.get(key)?.reclaim();
-    this.live.delete(key);
     // Against RESERVATIONS, not arrivals. Testing the ceiling against
     // bytes already admitted admitted every concurrent manifest —
     // each one measured while the others were still empty — and the
     // table then filled to many times its bound. The reservation is
     // released when the assembly is reclaimed, completed or swept.
-    if (this.bytesReserved + declared > this.maxTotalBytes) {
+    //
+    // Checked BEFORE the predecessor is touched, with its reservation
+    // excluded from the sum: a replacement for the same pair counts
+    // without its predecessor, but a refusal must not be destructive —
+    // reclaiming first meant `assembly-too-large` destroyed the very
+    // assembly it then refused to replace.
+    const predecessor = this.live.get(key);
+    const replaced = predecessor?.bytesReserved ?? 0;
+    if (this.bytesReserved - replaced + declared > this.maxTotalBytes) {
       return reject('assembly-too-large', true, 'capacity');
     }
+    // One in-flight per pair. A replacement manifest for the same pair
+    // reclaims the predecessor rather than leaving it to a deadline.
+    predecessor?.reclaim();
+    this.live.delete(key);
     const assembly = new Assembly(manifest, now);
     this.live.set(key, assembly);
     return assembly;
@@ -359,7 +374,14 @@ export class AssemblyTable {
     }
   }
 
-  /** Reclaim everything past its deadline. Returns how many went. */
+  /**
+   * Reclaim everything past its deadline. Returns how many went.
+   *
+   * The one deadline enforcer for a table this module does not drive:
+   * a host holding its own `AssemblyTable` must call this from its own
+   * clock (see the class note), or its assemblies hold their
+   * reservations for ever.
+   */
   sweep(now: number): number {
     let swept = 0;
     for (const [key, assembly] of [...this.live]) {

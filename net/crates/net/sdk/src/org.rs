@@ -97,6 +97,8 @@ pub use serve::{
 // one OrgCaller-projecting handler bridge. Crate-internal only.
 #[cfg(feature = "cortex")]
 pub(crate) use serve::{auto_register_org_channels, org_bytes_handler};
+// Removing members at running enforcement points: attested floor application.
+pub mod floors;
 #[cfg(feature = "cortex")]
 mod provision;
 #[cfg(feature = "cortex")]

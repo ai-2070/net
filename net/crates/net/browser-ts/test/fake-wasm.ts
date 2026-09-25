@@ -173,7 +173,7 @@ export class FakeNode implements LeafWasmNode {
   readonly announced: string[][] = [];
   readonly calls: Array<{ service: string; payload: Uint8Array; timeoutMs?: number }> = [];
   readonly streams: FakeStream[] = [];
-  readonly signals: Array<{ peerHex: string; dialog: number; kind: string; payload: Uint8Array }> = [];
+  readonly signals: Array<{ peerHex: string; dialog: string; kind: string; payload: Uint8Array }> = [];
   readonly peerOffers: string[] = [];
   readonly peerAccepts: string[] = [];
   readonly peerCandidates: string[] = [];
@@ -291,9 +291,30 @@ export class FakeNode implements LeafWasmNode {
     return this.behaviour.originHashHex ?? '00000000000000bb';
   }
 
-  async signal(peer_hex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void> {
-    if (this.behaviour.signalError !== undefined) throw this.behaviour.signalError;
+  /**
+   * What each `signal` call's two ids parsed to — the fixture is the
+   * seam's parse (see {@link parseSeamId}), so "the two spellings
+   * name the same id" is an observation and not an inference.
+   */
+  readonly parsedSignals: Array<{ peer: bigint; dialog: bigint }> = [];
+
+  /**
+   * The `String` seam exactly, both halves of it. A non-string dies
+   * in the marshaling the way the real glue does (finding #52's
+   * repro), and a string is parsed here and refused by name on any
+   * other shape. What parses is recorded verbatim beside the id it
+   * parsed to, and `signalError` — the carrier's own refusal (R14) —
+   * lands after, as `LeafNode::signal` orders it: parse, sign, hand
+   * to the carrier.
+   */
+  async signal(peer_hex: string, dialog: string, kind: string, payload: Uint8Array): Promise<void> {
+    // Peer first — `LeafNode::signal`'s parse order — so a call with
+    // two bad arguments is told about the peer.
+    const peer = seamId(peer_hex, 'peer');
+    const dialogId = seamId(dialog, 'dialog');
     this.signals.push({ peerHex: peer_hex, dialog, kind, payload });
+    this.parsedSignals.push({ peer, dialog: dialogId });
+    if (this.behaviour.signalError !== undefined) throw this.behaviour.signalError;
   }
 
   // ── §9, the four peer methods ──
@@ -759,4 +780,44 @@ export class FakeOrgServeHandle implements LeafWasmOrgServeHandle {
   close(): void {
     this.closes += 1;
   }
+}
+
+/**
+ * One id argument as the wasm seam treats it — both halves of it.
+ *
+ * A non-string models `wasm-bindgen`'s `passStringToWasm0`, which
+ * corrupts on one: a JS number for `dialog_hex` panics
+ * `assert!(old_size > 0)` in `__wbindgen_realloc` and kills the call
+ * before any parser runs — finding #52's repro, on every peer
+ * spelling alike. A string reaches {@link parseSeamId}.
+ */
+export function seamId(value: unknown, name: 'peer' | 'dialog'): bigint {
+  if (typeof value !== 'string') {
+    throw new Error(
+      `RuntimeError: unreachable (the real seam dies here: passStringToWasm0 → ` +
+        `__wbindgen_realloc panicked assert!(old_size > 0); a ${name} id arrived as ` +
+        `${typeof value}, not a string)`,
+    );
+  }
+  return parseSeamId(value, name);
+}
+
+/**
+ * `parse_peer_id` / `parse_dialog_id` (`leaf/src/wasm.rs`), mirrored
+ * — trim, optional `0x`, exactly 16 hex digits, named refusal — so a
+ * unit witness can read the spellings table off a parse rather than
+ * off a recording. The refusal text IS the contract: the page
+ * classifies refusals by "is not a peer id" / "is not a dialog id",
+ * and those names are pinned against the Rust readers'.
+ */
+function parseSeamId(raw: string, name: 'peer' | 'dialog'): bigint {
+  const trimmed = raw.trim();
+  const hex = trimmed.startsWith('0x') || trimmed.startsWith('0X') ? trimmed.slice(2) : trimmed;
+  if (hex.length !== 16 || !/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new Error(
+      `${JSON.stringify(raw)} is not a ${name} id: a ${name} id crosses this boundary as 16 hex ` +
+        `digits, the spelling \`node_id_hex()\` produces`,
+    );
+  }
+  return BigInt(`0x${hex}`);
 }

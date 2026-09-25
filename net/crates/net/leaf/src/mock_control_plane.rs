@@ -60,8 +60,8 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::control_plane::{
-    BootstrapAccepted, ControlEvent, ControlPlane, DialogId, IceCandidate, NodeId, Sdp,
-    SignalEnvelope, SignalKind, SignedAnnouncement,
+    BootstrapAccepted, ControlEvent, ControlPlane, DialogId, IceCandidate, NodeId,
+    RevocationBundle, Sdp, SignalEnvelope, SignalKind, SignedAnnouncement,
 };
 use crate::error::{LeafError, Result};
 use crate::signal;
@@ -510,12 +510,12 @@ impl ControlPlane for MockControlPlane {
             .unwrap_or_default()
     }
 
-    fn take_revocation_bundles(&mut self) -> Vec<Vec<u8>> {
+    fn take_revocation_bundles(&mut self) -> Vec<RevocationBundle> {
         self.state
             .revocations
             .borrow_mut()
             .get_mut(&self.node)
-            .map(|queue| queue.drain(..).collect())
+            .map(|queue| queue.drain(..).map(RevocationBundle).collect())
             .unwrap_or_default()
     }
 }
@@ -742,12 +742,12 @@ mod tests {
         mesh.deliver_revocation(A, bundle.clone()).expect("carry");
         assert_eq!(
             a.take_revocation_bundles(),
-            vec![bundle],
+            vec![RevocationBundle(bundle)],
             "exact bytes, in arrival order"
         );
         assert_eq!(
             a.take_revocation_bundles(),
-            Vec::<Vec<u8>>::new(),
+            Vec::<RevocationBundle>::new(),
             "taken once — the feed is a take, not a peek"
         );
         let carried = mesh.carried();
@@ -780,7 +780,7 @@ mod tests {
         );
         assert_eq!(
             a.take_revocation_bundles(),
-            Vec::<Vec<u8>>::new(),
+            Vec::<RevocationBundle>::new(),
             "nothing was queued for a refused carry"
         );
         assert_eq!(

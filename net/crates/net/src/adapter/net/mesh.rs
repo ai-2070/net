@@ -743,7 +743,7 @@ async fn emit_control_chunks(
     sink: &PeerSink,
     builder: &mut super::pool::ThreadLocalPooledBuilder<'_>,
     session: &NetSession,
-    addr: PeerAddr,
+    route: WireRoute,
     events: &[Bytes],
     subprotocol_id: u16,
     packets_ctr: &AtomicU64,
@@ -759,7 +759,7 @@ async fn emit_control_chunks(
             PacketFlags::NONE,
             subprotocol_id,
         );
-        if sink.send(&packet, addr).await.is_ok() {
+        if sink.send(&route.frame(&packet), route.addr).await.is_ok() {
             ControlPlaneStats::record_packet(packets_ctr, events_ctr, chunk.len());
         }
     }
@@ -869,7 +869,7 @@ use super::subnet::{
     SubnetAuthPresentation, SubnetAuthorityConfig, SubnetBoundarySet, SubnetChallengeStore,
     SubnetContextStore, SubnetControlFact, SubnetControlOutcome, SubnetControlStore,
     SubnetCredentialSet, SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy,
-    SubnetRevocationFloor, VerifiedGatewayContextSet, VerifiedSubnetContext,
+    SubnetRevocationFloor, SubnetSubjectFloor, VerifiedGatewayContextSet, VerifiedSubnetContext,
 };
 use super::subprotocol::stream_window::{
     StreamAckRanges, StreamNack, StreamReset, StreamWindow, MAX_ACK_RANGES, STREAM_WINDOW_SIZE,
@@ -1911,6 +1911,31 @@ enum RoutedRotationOutcome {
     AcceptRotation,
 }
 
+/// Stream ids that carry only control-plane subprotocol frames: a
+/// subprotocol frame rides the stream whose id is its subprotocol id
+/// (`docs/SUBPROTOCOLS.md`). Such a stream holds no application state, so
+/// its mere existence must not make a session "busy" — otherwise any
+/// capability announcement, identity proof or subnet admission would
+/// leave the session busy for its whole life, and a peer that restarts
+/// could not re-handshake until the old session timed out. Unacked
+/// reliable data on any stream, these included, still counts as busy.
+const CONTROL_SUBPROTOCOL_STREAM_IDS: &[u16] = &[
+    0x0400, 0x0401, 0x0500, 0x0600, 0x0700, 0x0701, 0x0702, 0x0800, 0x0801, 0x0900, 0x0A00, 0x0A01,
+    0x0A02, 0x0B00, 0x0C00, 0x0C01, 0x0C02, 0x0C03, 0x0C04, 0x0D00, 0x0D01, 0x0D02, 0x0E00, 0x0F00,
+    0x1000, 0x1100,
+];
+
+fn is_control_stream_id(stream_id: u64) -> bool {
+    u16::try_from(stream_id).is_ok_and(|id| CONTROL_SUBPROTOCOL_STREAM_IDS.contains(&id))
+}
+
+/// The C3 busy gate: open APPLICATION streams, or unacked in-flight
+/// reliable data on any stream. Control-plane subprotocol streams alone
+/// do not make a session busy (see [`CONTROL_SUBPROTOCOL_STREAM_IDS`]).
+fn session_is_busy(session: &NetSession) -> bool {
+    session.has_unacked() || session.has_open_streams_where(|id| !is_control_stream_id(id))
+}
+
 /// Decide whether an inbound routed handshake is allowed to install
 /// new session keys for `peer_node_id`.
 ///
@@ -1929,6 +1954,7 @@ fn routed_rotation_outcome(
     new_static: &[u8; 32],
     new_ephemeral: &[u8; 32],
     session_timeout: Duration,
+    busy_liveness: Duration,
 ) -> RoutedRotationOutcome {
     if existing.remote_static_pub == *new_static {
         // Same peer (by static). Distinguish exact-replay msg1
@@ -1938,16 +1964,21 @@ fn routed_rotation_outcome(
             return RoutedRotationOutcome::DropReplay;
         }
         // Legitimate re-handshake. Normally rotates — but if the
-        // existing session is live (not idle past `session_timeout`)
-        // and busy (open streams or unacked in-flight data), defer:
-        // swapping now would drop that in-flight state (C3). Keying
-        // liveness on `is_timed_out` bounds the deferral to
-        // `session_timeout` — a genuinely dead path (e.g. the peer's
-        // NAT rebound) stops delivering inbound, times out, and the
-        // next re-handshake rotates, so recovery is never blocked
-        // for longer than a fresh-static rotation would be.
-        let live = !existing.session.is_timed_out(session_timeout);
-        let busy = existing.session.has_open_streams() || existing.session.has_unacked();
+        // existing session is live and busy (open streams or unacked
+        // in-flight data), defer: swapping now would drop that
+        // in-flight state (C3).
+        //
+        // Live means the PEER has spoken on it recently: an
+        // authenticated inbound packet within `busy_liveness` (a few
+        // heartbeat intervals). Our own sends do not count. A peer
+        // mid-transfer keeps heartbeating, so its transfer stays
+        // protected; a peer that restarted (or whose path died, e.g.
+        // a NAT rebind) abandoned this session and falls silent at
+        // once, so its re-handshake rotates within `busy_liveness`
+        // rather than waiting out the whole `session_timeout` behind
+        // streams it can no longer use.
+        let live = existing.session.heard_within(busy_liveness);
+        let busy = session_is_busy(&existing.session);
         if live && busy {
             return RoutedRotationOutcome::DeferBusy;
         }
@@ -2056,6 +2087,83 @@ pub(crate) enum ScopedIngestDisposition {
     Retryable,
 }
 
+/// **#11: the endpoint-unresolvable refusal is counted — its own
+/// counter, per §12 gate family.**
+///
+/// A frame refused because its sender (or destination) has no
+/// installed `PeerInfo` — the eviction race `ingress_admission`
+/// documents — used to move NO counter at all: the fail-closed
+/// conversions `return`ed before the admission counters ran, while a
+/// policy refusal on the same arm was counted. `AdmissionRefusal`'s
+/// rule is that a refusal nobody can count is a refusal nobody can
+/// operate on, and the two causes must be attributable in both
+/// directions ("endpoint unresolvable" versus "policy refusal"), so
+/// this is the unresolvable-endpoint reason label with one counter
+/// per gate family — plumbed exactly like the sibling
+/// `note_admission_refused_*` seams on [`super::rtc::RtcStats`], and
+/// held here (mirroring router.rs's no-transport-drop counter)
+/// because every fail-closed `return` lives in this file.
+///
+/// Boundary: the operator surfaces consume `super::rtc::RtcStats`;
+/// promoting these three into `RtcStats` (and its leaf JSON mirror)
+/// is the documented follow-up, see the repair-pass report.
+#[cfg(feature = "webrtc")]
+#[derive(Debug, Default)]
+struct UnresolvableEndpointRefusals {
+    /// Gate 1 family: forwarding (scoped/capability announcement
+    /// re-flood, rendezvous relay) refused for an unresolvable
+    /// sender or destination.
+    forward: AtomicU64,
+    /// Gate 3: subscription mutation from an unresolvable sender.
+    subscribe: AtomicU64,
+    /// Gate 4: announcement ingest from an unresolvable sender.
+    announce: AtomicU64,
+}
+
+#[cfg(feature = "webrtc")]
+impl UnresolvableEndpointRefusals {
+    /// Forwarding refused because the sender or destination has no
+    /// peer entry to gate on (§12 gate 1, the eviction race).
+    #[inline]
+    fn note_admission_refused_unresolvable_forward(&self) {
+        self.forward.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [`Self::note_admission_refused_unresolvable_forward`]'s counter.
+    /// Witness-read, like `holds_bootstrap_dialog`; the operator
+    /// surface promotion is a documented boundary follow-up.
+    #[cfg(test)]
+    fn admission_refused_unresolvable_forward(&self) -> u64 {
+        self.forward.load(Ordering::Relaxed)
+    }
+
+    /// Subscription mutation refused because the sender has no peer
+    /// entry to gate on (§12 gate 3, the eviction race).
+    #[inline]
+    fn note_admission_refused_unresolvable_subscribe(&self) {
+        self.subscribe.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [`Self::note_admission_refused_unresolvable_subscribe`]'s counter.
+    #[cfg(test)]
+    fn admission_refused_unresolvable_subscribe(&self) -> u64 {
+        self.subscribe.load(Ordering::Relaxed)
+    }
+
+    /// Announcement ingest refused because the sender has no peer
+    /// entry to gate on (§12 gate 4, the eviction race).
+    #[inline]
+    fn note_admission_refused_unresolvable_announce(&self) {
+        self.announce.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [`Self::note_admission_refused_unresolvable_announce`]'s counter.
+    #[cfg(test)]
+    fn admission_refused_unresolvable_announce(&self) -> u64 {
+        self.announce.load(Ordering::Relaxed)
+    }
+}
+
 /// outlives the dispatch call that scheduled it, so it cannot
 /// borrow.
 #[derive(Clone)]
@@ -2083,6 +2191,11 @@ struct DispatchCtx {
     rtc_signal_tx: Option<tokio::sync::mpsc::Sender<(u64, super::rtc::RtcSignalMsg)>>,
     #[cfg(feature = "webrtc")]
     rtc_stats: Option<Arc<super::rtc::RtcStats>>,
+    /// **#11:** the endpoint-unresolvable refusals of every §12 gate
+    /// family, counted where the fail-closed `return` lives. See
+    /// [`UnresolvableEndpointRefusals`].
+    #[cfg(feature = "webrtc")]
+    endpoint_unresolvable_refusals: Arc<UnresolvableEndpointRefusals>,
     #[cfg(feature = "webrtc")]
     forwarded_app_packets: Arc<DashMap<(u32, u64), u64>>,
     #[cfg(feature = "webrtc")]
@@ -2377,6 +2490,10 @@ struct DispatchCtx {
     /// session's keys until the existing session has gone silent for
     /// at least this long. See `routed_rotation_outcome`.
     session_timeout: Duration,
+    /// How recently the peer must have spoken on a busy session for the
+    /// rotation gate to defer its re-handshake (C3): three heartbeat
+    /// intervals, never more than `session_timeout`.
+    busy_liveness: Duration,
     /// Subscriber roster for channel fan-out.
     roster: Arc<SubscriberRoster>,
     /// Channel config registry used to authorize incoming Subscribe.
@@ -2404,6 +2521,23 @@ struct DispatchCtx {
     /// the prover minted, valued `(expected peer, reply sender)`.
     /// Same peer-auth discipline as `pending_membership_acks`: only
     /// the node the request went to may answer it.
+    /// In-flight subnet-admission legs (subprotocol `0x0A02`) keyed by
+    /// correlation nonce, valued `(expected verifier, reply sender)`: only
+    /// the node the leg went to may answer it.
+    pending_subnet_admissions: Arc<
+        DashMap<
+            u64,
+            (
+                u64,
+                oneshot::Sender<super::subnet::admission_wire::SubnetAdmissionMsg>,
+            ),
+        >,
+    >,
+    /// Bound on concurrently served verifier-side admission legs.
+    subnet_admission_permits: Arc<tokio::sync::Semaphore>,
+    /// The node itself, for handlers that must run node-owned
+    /// transitions (subnet admission installs a routing-id pin).
+    self_weak: Arc<std::sync::OnceLock<std::sync::Weak<MeshNode>>>,
     pending_identity_proofs: Arc<DashMap<u64, (u64, oneshot::Sender<IdentityProofReply>)>>,
     /// `node_id → session_id` on which that peer PROVED possession of
     /// the entity pinned for it.
@@ -2478,6 +2612,13 @@ struct DispatchCtx {
             ),
         >,
     >,
+    /// Blind relays this node talks to (by relay UDP tuple). Datagrams
+    /// from these tuples are relay traffic: framed peer data is unwrapped
+    /// and dispatched as `PeerAddr::Relayed`, control replies go to the
+    /// matching client. Empty unless the node registers with or binds
+    /// through a relay.
+    #[cfg(feature = "nat-traversal")]
+    relay_clients: Arc<DashMap<SocketAddr, Arc<super::traversal::blind_relay::RelayClient>>>,
     /// Rendezvous abuse budgets. See the matching field doc on
     /// `MeshNode` (`rendezvous_budgets`).
     #[cfg(feature = "nat-traversal")]
@@ -2536,6 +2677,11 @@ struct DispatchCtx {
     /// ann.node_id` on the direct path, so there's only one peer
     /// that can produce one).
     seen_announcements: Arc<DashMap<(u64, u64, bool), std::time::Instant>>,
+    /// The latest signature-verified announcement of each OTHER origin,
+    /// as this node forwards it (hop count already incremented), so a peer
+    /// that attaches later is not blind to what was flooded before it
+    /// arrived. See [`MeshNode::relay_announcements`].
+    relay_announcements: Arc<DashMap<u64, CapabilityAnnouncement>>,
     /// Whether inbound `CapabilityAnnouncement` packets without a
     /// signature are dropped. Validity is not enforced yet.
     require_signed_capabilities: bool,
@@ -2562,6 +2708,7 @@ struct DispatchCtx {
     protected_relay_stats: Arc<ProtectedRelayStats>,
     /// Floor state, for the auth epoch a compiled context is pinned to.
     subnet_floors: Arc<SubnetFloorRegistry>,
+    subnet_floor_store: Option<Arc<super::subnet::floor_store::SubnetFloorStore>>,
     /// S5 control-fact store, shared with the node handle so the
     /// channel arrival path and local provisioning apply into one
     /// state.
@@ -2750,6 +2897,63 @@ pub(crate) enum IdentityProofReply {
     },
 }
 
+/// A caller-owned Noise static private key (X25519). The public half is
+/// derived from it, so a stored key can never be paired with the wrong
+/// public key. `Debug` is redacted; the bytes are wiped on drop.
+#[derive(Clone)]
+pub struct NoiseStaticKey([u8; 32]);
+
+impl NoiseStaticKey {
+    /// Wrap a stored private key.
+    pub fn from_private(private: [u8; 32]) -> Self {
+        Self(private)
+    }
+
+    /// The public key peers pin (what a contact's `noise_pubkey` names).
+    pub fn public_key(&self) -> [u8; 32] {
+        *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(self.0)).as_bytes()
+    }
+
+    fn keypair(&self) -> StaticKeypair {
+        StaticKeypair::from_keys(self.0, self.public_key())
+    }
+}
+
+impl std::fmt::Debug for NoiseStaticKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NoiseStaticKey(<redacted>)")
+    }
+}
+
+impl Drop for NoiseStaticKey {
+    fn drop(&mut self) {
+        // Volatile writes so the wipe is not optimised away.
+        for byte in self.0.iter_mut() {
+            // SAFETY: `byte` is a valid, aligned, exclusive reference.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+    }
+}
+
+/// [`MeshNode::install_publish_chain`] refused: a different managed chain
+/// is already installed for that channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishChainConflict {
+    /// The fingerprint of the chain already installed.
+    pub installed: [u8; 32],
+}
+
+impl std::fmt::Display for PublishChainConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a different publish chain is already installed for this channel; remove it first"
+        )
+    }
+}
+
+impl std::error::Error for PublishChainConflict {}
+
 /// Configuration for a MeshNode.
 #[derive(Debug, Clone)]
 pub struct MeshNodeConfig {
@@ -2905,6 +3109,14 @@ pub struct MeshNodeConfig {
     /// (the SDK / FFI path) — re-broadcasting needs an owned `Arc`. A bare
     /// [`MeshNode::start`] omits it.
     pub capability_reannounce_interval: Duration,
+    /// Carry this node's Noise static public key in its signed
+    /// capability announcement, so a peer that learns of it through a
+    /// hub can open an endpoint-authenticated session to it (the key is
+    /// signed by this node's entity). OFF by default: a peer that
+    /// predates the field verifies a different transcript and would drop
+    /// the announcement, so the default stays wire-invisible (Stage 4a);
+    /// managed nodes opt in. An `rtc` node announces it regardless.
+    pub announce_noise_key: bool,
     /// Emit positive SACK-range ACKs (`StreamAckRanges`) to peers that
     /// advertise [`ACK_RANGES_CAPABILITY_TAG`], and merge that tag
     /// into this node's own capability announcements
@@ -2971,6 +3183,19 @@ pub struct MeshNodeConfig {
     /// published it. A channel token may gate readership when facts
     /// are confidential; it never gates fact validity.
     pub subnet_control_channel: Option<ChannelName>,
+    /// Durable log of accepted subnet revocation floors (subtree and
+    /// subject). `Some(dir)`: [`MeshNode::new`] opens it, re-verifies and
+    /// replays every logged floor BEFORE any networking or admission, and
+    /// refuses construction if it is corrupt or a logged floor no longer
+    /// verifies; every later floor that changes state is logged before
+    /// its apply reports success. `None` keeps floors in memory only — a
+    /// restart then forgets them until they are redelivered.
+    pub subnet_floor_store: Option<std::path::PathBuf>,
+    /// The node's Noise static key. `None` (the default) generates a fresh
+    /// one per [`MeshNode::new`]; a node whose key other nodes pin (e.g. an
+    /// enrolling node, whose invites and bundles name it) must supply its
+    /// stored key, or every restart strands the nodes that pinned it.
+    pub static_key: Option<NoiseStaticKey>,
     /// Visibility applied on publish when a channel has **no**
     /// registered config in the local
     /// [`ChannelConfigRegistry`]. Defaults to
@@ -3315,6 +3540,7 @@ impl MeshNodeConfig {
             admission_replay: super::behavior::org_admission_replay::AdmissionReplayConfig::default(
             ),
             capability_reannounce_interval: Duration::from_secs(150),
+            announce_noise_key: false,
             enable_stream_ack_ranges: true,
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
@@ -3322,6 +3548,8 @@ impl MeshNodeConfig {
             subnet_exports: Vec::new(),
             subnet_attachment: None,
             subnet_control_channel: None,
+            subnet_floor_store: None,
+            static_key: None,
             default_visibility: Visibility::Global,
             unregistered_channels: UnregisteredChannelPolicy::default(),
             min_announce_interval: Duration::from_secs(10),
@@ -3475,6 +3703,13 @@ impl MeshNodeConfig {
     /// the loop.
     pub fn with_capability_reannounce_interval(mut self, interval: Duration) -> Self {
         self.capability_reannounce_interval = interval;
+        self
+    }
+
+    /// Announce this node's Noise static public key (see
+    /// [`Self::announce_noise_key`]).
+    pub fn with_announce_noise_key(mut self, announce: bool) -> Self {
+        self.announce_noise_key = announce;
         self
     }
 
@@ -3686,6 +3921,20 @@ impl MeshNodeConfig {
         self
     }
 
+    /// Persist accepted subnet revocation floors in `dir` — see
+    /// [`Self::subnet_floor_store`].
+    pub fn with_subnet_floor_store(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.subnet_floor_store = Some(dir.into());
+        self
+    }
+
+    /// Use this stored Noise static key instead of a fresh one — see
+    /// [`Self::static_key`].
+    pub fn with_static_key(mut self, key: NoiseStaticKey) -> Self {
+        self.static_key = Some(key);
+        self
+    }
+
     /// Override the visibility applied to publishes on channels
     /// that have **no** registered config. Defaults to
     /// [`Visibility::Global`] — messages flow unrestricted when
@@ -3778,6 +4027,16 @@ enum PeerTransport {
     Routed {
         relay: PeerAddr,
         adjacent_relay_identity: Option<u64>,
+        /// The session crosses a real relay hop: the routed handshake that
+        /// installed it arrived with `hop_count > 0`. Then per-peer frames
+        /// must ride a routing header addressed to the peer, or the relay
+        /// — which holds no session for this end-to-end session id — drops
+        /// them. `false` for the degenerate single-hop attach (the "relay"
+        /// is the peer itself) and for a blind UDP relay, which forward
+        /// bare frames. FRAMING ONLY: never read by an adjacency, ownership
+        /// or protected-forwarding predicate (an unauthenticated hop count
+        /// can at worst make a relay drop frames it could drop anyway).
+        transit: bool,
     },
 }
 
@@ -3807,6 +4066,12 @@ impl PeerTransport {
     #[inline]
     fn is_direct(&self) -> bool {
         matches!(self, Self::Direct { .. })
+    }
+
+    /// Whether frames to this peer must ride a routing header (see
+    /// `Routed::transit`).
+    fn needs_routing_header(&self) -> bool {
+        matches!(self, Self::Routed { transit: true, .. })
     }
 }
 
@@ -3871,7 +4136,55 @@ impl PeerInfo {
     fn is_direct(&self) -> bool {
         self.transport.is_direct()
     }
+
+    /// How a per-peer packet goes on the wire (see [`WireRoute`]).
+    fn wire_route(&self, local_node_id: u64) -> WireRoute {
+        WireRoute {
+            addr: self.transport.send_addr(),
+            header: self
+                .transport
+                .needs_routing_header()
+                .then(|| RoutingHeader::new(self.node_id, local_node_id as u32, TRANSIT_TTL)),
+        }
+    }
 }
+
+/// Where a per-peer packet goes and how it is framed: bare to the peer's
+/// send address, or — when the session crosses a relay hop — behind a
+/// routing header addressed to the peer, so the relay's forward arm
+/// carries it (the relay holds no session for the end-to-end session id,
+/// and drops a bare frame). The inner packet stays sealed end to end.
+/// Link-local frames (heartbeats, pingwaves, traversal probes) never use
+/// this: they are about the hop, not the far endpoint.
+#[derive(Clone, Copy, Debug)]
+struct WireRoute {
+    addr: PeerAddr,
+    header: Option<RoutingHeader>,
+}
+
+impl WireRoute {
+    /// `packet` as it goes on the wire to [`Self::addr`].
+    fn frame<'a>(&self, packet: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        match &self.header {
+            None => std::borrow::Cow::Borrowed(packet),
+            Some(header) => {
+                let mut framed = Vec::with_capacity(ROUTING_HEADER_SIZE + packet.len());
+                framed.extend_from_slice(&header.to_bytes());
+                framed.extend_from_slice(packet);
+                std::borrow::Cow::Owned(framed)
+            }
+        }
+    }
+}
+
+/// TTL of the routing header per-peer frames ride across a relay hop.
+const TRANSIT_TTL: u8 = 8;
+
+/// A routed handshake's outcome, as the dispatch loop hands it to the
+/// waiting initiator: the derived keys, the Noise handshake hash binding
+/// them, and the `hop_count` msg2 arrived with (> 0: the session crosses
+/// a relay hop).
+type RoutedHandshakeOutcome = Result<(SessionKeys, [u8; 32], u8), CryptoError>;
 
 /// In-flight initiator handshake. The dispatch loop consumes this when a
 /// routed msg2 arrives for `peer_node_id`: it pulls the Noise state out,
@@ -3884,7 +4197,89 @@ impl PeerInfo {
 /// look up by that. The full `u64` is stored here for peer registration.
 struct PendingHandshake {
     noise: NoiseHandshake,
-    tx: oneshot::Sender<Result<(SessionKeys, [u8; 32]), CryptoError>>,
+    tx: oneshot::Sender<RoutedHandshakeOutcome>,
+}
+
+/// Why a floor readback produced no usable attestation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SubnetFloorQueryError {
+    /// No answer: unreachable, no such service (a verifier that predates
+    /// readback), or the deadline passed.
+    #[error("no attestation: {0}")]
+    NoAnswer(String),
+    /// The verifier refused the request itself (e.g. not a configured
+    /// root, stale, not addressed to it); the message is its reason.
+    #[error("request refused: {0}")]
+    Refused(String),
+    /// An answer arrived but was not a valid attestation from the named
+    /// verifier for this exact request.
+    #[error("invalid attestation: {0}")]
+    BadAttestation(String),
+}
+
+#[cfg(feature = "cortex")]
+struct SubnetFloorStatusHandler {
+    node: std::sync::Weak<MeshNode>,
+}
+
+#[cfg(feature = "cortex")]
+#[async_trait::async_trait]
+impl super::cortex::rpc::RpcHandler for SubnetFloorStatusHandler {
+    async fn call(
+        &self,
+        ctx: super::cortex::rpc::RpcContext,
+    ) -> Result<super::cortex::rpc::RpcResponsePayload, super::cortex::rpc::RpcHandlerError> {
+        use super::cortex::rpc::{RpcResponsePayload, RpcStatus};
+        let Some(node) = self.node.upgrade() else {
+            return Ok(RpcResponsePayload {
+                status: RpcStatus::Internal,
+                headers: Vec::new(),
+                body: Bytes::from_static(b"node is shutting down"),
+            });
+        };
+        let body = ctx.payload.body.clone();
+        let answered = tokio::task::spawn_blocking(move || {
+            node.answer_subnet_floor_status(&body, super::subnet::admission::unix_now_secs())
+        })
+        .await;
+        Ok(match answered {
+            Ok(Ok(attestation)) => RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: Vec::new(),
+                body: Bytes::from(attestation.to_bytes()),
+            },
+            Ok(Err(e)) => RpcResponsePayload {
+                status: RpcStatus::Unauthorized,
+                headers: Vec::new(),
+                body: Bytes::from(format!("subnet:{e}")),
+            },
+            Err(_) => RpcResponsePayload {
+                status: RpcStatus::Internal,
+                headers: Vec::new(),
+                body: Bytes::from_static(b"floor readback failed"),
+            },
+        })
+    }
+}
+
+/// One routed-handshake attempt's claim on its `pending_handshakes` entry.
+/// If the attempt is cancelled — its future dropped, e.g. by a caller's
+/// timeout before the fallback path — the entry would otherwise outlive it
+/// and refuse every later handshake to that peer as "already in flight".
+/// Dropping the guard closes this attempt's receiver and removes the entry
+/// only if it is still this attempt's (its sender sees the closed receiver);
+/// a newer attempt's entry is never touched.
+struct PendingInitiator<'a> {
+    map: &'a DashMap<u64, PendingHandshake>,
+    key: u64,
+    rx: oneshot::Receiver<RoutedHandshakeOutcome>,
+}
+
+impl Drop for PendingInitiator<'_> {
+    fn drop(&mut self) {
+        self.rx.close();
+        self.map.remove_if(&self.key, |_, p| p.tx.is_closed());
+    }
 }
 
 /// 32-bit "routing identity" projection of a `u64` node_id, used as the
@@ -10223,6 +10618,26 @@ fn snapshot_peers(peers: &DashMap<u64, PeerInfo>, exclude: Option<u64>) -> Vec<P
         .collect()
 }
 
+/// When a hub replays held announcements to a newly attached peer (after
+/// the peer has had time to install the session, then once more).
+const REPLAY_SETTLE: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(2)];
+
+/// The most [`MeshNode::ensure_session`] spends on a direct attempt before
+/// falling back to the relay.
+#[cfg(feature = "nat-traversal")]
+const DIRECT_ATTEMPT_MAX: Duration = Duration::from_secs(3);
+
+/// How [`MeshNode::ensure_session`] found (or made) a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionPath {
+    /// A live session was already held.
+    Existing,
+    /// A direct handshake to an address the target announced.
+    Direct,
+    /// A routed handshake relayed through the hop toward the target.
+    Relayed,
+}
+
 /// Send ONE datagram under [`DATAGRAM_SEND_DEADLINE`].
 ///
 /// Every send on a caller-facing path goes through here, so the bound is a
@@ -11490,6 +11905,11 @@ pub struct MeshNode {
     /// key from here and releases the reservation that was actually
     /// taken.
     rtc_attempt_keys: Arc<DashMap<(u64, u64), u64>>,
+    /// **#11:** the endpoint-unresolvable refusals of every §12 gate
+    /// family, counted where the fail-closed `return` lives. See
+    /// [`UnresolvableEndpointRefusals`].
+    #[cfg(feature = "webrtc")]
+    endpoint_unresolvable_refusals: Arc<UnresolvableEndpointRefusals>,
     /// H3 witness seam: hold the RTC close-notification consumer, so
     /// the bounded channel can actually fill.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -11515,6 +11935,13 @@ pub struct MeshNode {
     /// race.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     rtc_claim_pause: Arc<super::rtc::RtcInstallPause>,
+    /// **#2's witness seam:** park one dialog claim while it holds the
+    /// dialog-table lock, so a witness can queue a competing Offer
+    /// exactly across the claim's remove-and-restore and observe that
+    /// the restore displaces nothing. See
+    /// [`MeshNode::rtc_restore_pause_point`].
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_restore_pause: Arc<super::rtc::RtcInstallPause>,
     /// §10 part 2: packets this node forwarded per `(src, dst)`
     /// pair, **excluding signalling**. A globally flat forward
     /// counter is not the direct-path witness — signalling,
@@ -11603,6 +12030,18 @@ pub struct MeshNode {
     /// awaiting future.
     #[cfg(feature = "cortex")]
     rpc_client_pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
+    /// Node-wide logical response pumps ([`Self::LARGE_RESPONSE_PUMP_SLOTS`]
+    /// of them), with no fragment queue.
+    #[cfg(feature = "cortex")]
+    rpc_large_response_slots: Arc<tokio::sync::Semaphore>,
+    /// Test-only publish park (review finding 1): when armed for a
+    /// `stream_id`, `publish_to_peer` signals `arrived` and parks forever,
+    /// so a test can deterministically drop a call future INSIDE its
+    /// request-publish await — the gap between `RpcClientPending::
+    /// register_large` and the `UnaryCallGuard` cleanup. Production builds
+    /// carry no field and no check (`#[cfg(test)]`).
+    #[cfg(test)]
+    publish_park: parking_lot::Mutex<Option<(u64, Arc<tokio::sync::Notify>)>>,
     /// Independent fetch_add counter used by `RoutingPolicy::
     /// RoundRobin` and `Random` to pick the next target node.
     /// Sequential is correct here — the cursor is local-only and
@@ -12326,6 +12765,20 @@ pub struct MeshNode {
     /// In-flight identity-proof legs keyed by correlation nonce.
     /// Shared with `DispatchCtx` so the dispatcher can complete the
     /// prover's oneshots.
+    /// In-flight subnet-admission legs (subprotocol `0x0A02`) keyed by
+    /// correlation nonce, valued `(expected verifier, reply sender)`: only
+    /// the node the leg went to may answer it.
+    pending_subnet_admissions: Arc<
+        DashMap<
+            u64,
+            (
+                u64,
+                oneshot::Sender<super::subnet::admission_wire::SubnetAdmissionMsg>,
+            ),
+        >,
+    >,
+    /// Bound on concurrently served verifier-side admission legs.
+    subnet_admission_permits: Arc<tokio::sync::Semaphore>,
     pending_identity_proofs: Arc<DashMap<u64, (u64, oneshot::Sender<IdentityProofReply>)>>,
     /// `node_id → session_id` at which each peer's entity pin was
     /// established. Shared with `DispatchCtx`; see the field of the
@@ -12389,6 +12842,21 @@ pub struct MeshNode {
     /// matches that id (a wrong-sender packet is left in place, not
     /// consumed), and the punch-scheduler task reacts by emitting a
     /// `PunchAck`.
+    /// Blind relays this node talks to (by relay UDP tuple). Datagrams
+    /// from these tuples are relay traffic: framed peer data is unwrapped
+    /// and dispatched as `PeerAddr::Relayed`, control replies go to the
+    /// matching client. Empty unless the node registers with or binds
+    /// through a relay.
+    #[cfg(feature = "nat-traversal")]
+    relay_clients: Arc<DashMap<SocketAddr, Arc<super::traversal::blind_relay::RelayClient>>>,
+    /// Where this node's relay TCP tunnels hand received datagrams; drained
+    /// by the task `start` spawns (`spawn_relay_tunnel_ingress`), never by
+    /// the UDP receive loop, which stays exactly as it is.
+    #[cfg(feature = "nat-traversal")]
+    relay_tunnel_ingress: super::traversal::blind_relay::TunnelIngress,
+    #[cfg(feature = "nat-traversal")]
+    relay_tunnel_rx:
+        Arc<parking_lot::Mutex<Option<super::traversal::blind_relay::TunnelIngressRx>>>,
     #[cfg(feature = "nat-traversal")]
     punch_observers: Arc<
         DashMap<
@@ -12450,6 +12918,15 @@ pub struct MeshNode {
     /// announce-capabilities path.
     #[cfg(feature = "nat-traversal")]
     reflex_override_active: Arc<std::sync::atomic::AtomicBool>,
+    /// An address this node is known to be reachable at directly, set by
+    /// its owner (an enrollment node: the address its tokens name). It is
+    /// announced in the signed reflex field ONLY while no reflex has been
+    /// observed or overridden, as an upgrade target for a relayed peer
+    /// (R2 phase 5). It never changes the NAT class: it claims
+    /// reachability at one address, not openness, and a wrong hint only
+    /// fails an authenticated handshake while the relay keeps serving.
+    #[cfg(feature = "nat-traversal")]
+    direct_hint: Arc<ArcSwapOption<SocketAddr>>,
     /// Publication barrier held briefly during any code path
     /// that touches more than one of `nat_class`, `reflex_addr`,
     /// and `reflex_override_active` as a group. The three atomics
@@ -12557,6 +13034,13 @@ pub struct MeshNode {
     /// ann.node_id` on the direct path, so there's only one peer
     /// that can produce one).
     seen_announcements: Arc<DashMap<(u64, u64, bool), std::time::Instant>>,
+    /// The latest signature-verified announcement of each other origin,
+    /// in its forwarded form, replayed to every newly attached peer
+    /// (never refreshed: only while still unexpired by its origin's own
+    /// signed timestamp, and receivers bound a forwarded announcement's
+    /// lifetime by that timestamp too). Origin authentication is the
+    /// origin's signature, untouched by replay.
+    relay_announcements: Arc<DashMap<u64, CapabilityAnnouncement>>,
     /// Origin-side announce rate-limit state. Compared against
     /// `config.min_announce_interval` on every `announce_capabilities_with`
     /// call; within-window calls coalesce to a local self-index
@@ -12848,6 +13332,7 @@ pub struct MeshNode {
     /// for subnet credentials. Session admission (S3) verifies
     /// against this registry and pins the epoch it saw.
     subnet_floors: Arc<SubnetFloorRegistry>,
+    subnet_floor_store: Option<Arc<super::subnet::floor_store::SubnetFloorStore>>,
     /// Verified subnet control-fact state (S5): descriptors, gateway
     /// advertisements, export policies. Floors flow into
     /// `subnet_floors` instead — one revocation authority, not two.
@@ -13196,13 +13681,18 @@ impl MeshNode {
             }
         };
 
-        let static_keypair = StaticKeypair::generate();
+        let static_keypair = match &config.static_key {
+            Some(key) => key.keypair(),
+            None => StaticKeypair::generate(),
+        };
 
         let socket = NetSocket::with_config(config.bind_addr, config.socket_buffers)
             .await
             .map_err(|e| AdapterError::Connection(format!("bind failed: {}", e)))?;
         let socket = Arc::new(socket);
         let sink = PeerSink::new(socket.clone());
+        #[cfg(feature = "nat-traversal")]
+        let (relay_tunnel_ingress, relay_tunnel_rx) = tokio::sync::mpsc::channel(4_096);
 
         // RTC: a dedicated socket and one driver task, only when the
         // operator asked for it. `rtc: None` (the default) leaves
@@ -13970,6 +14460,25 @@ impl MeshNode {
         let local_subnet = config.subnet;
         let local_subnet_policy = config.subnet_policy.clone();
         let subnet_authorities = Arc::new(config.subnet_authorities.clone());
+        // §6.1a item 2: accepted floors survive restart. Open the log and
+        // replay it through the same root-anchored verifiers BEFORE any
+        // admission can happen; a corrupt log or a logged floor that no
+        // longer verifies refuses construction.
+        let subnet_floors = Arc::new(SubnetFloorRegistry::new());
+        let subnet_floor_store = match &config.subnet_floor_store {
+            Some(dir) => {
+                let (store, replay) =
+                    super::subnet::floor_store::SubnetFloorStore::open_or_create(dir)
+                        .map_err(|e| AdapterError::Fatal(format!("subnet floor store: {e}")))?;
+                for bytes in &replay {
+                    Self::replay_floor(bytes, &subnet_authorities, &subnet_floors).map_err(
+                        |e| AdapterError::Fatal(format!("subnet floor store replay refused: {e}")),
+                    )?;
+                }
+                Some(Arc::new(store))
+            }
+            None => None,
+        };
         let subnet_local_attachment = config.subnet_attachment.unwrap_or(local_subnet);
         // One u64, computed once: the receive path discriminates the
         // control-facts channel by its full publish stream id (63
@@ -14043,6 +14552,8 @@ impl MeshNode {
             rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
             #[cfg(feature = "webrtc")]
             rtc_attempt_keys: Arc::new(DashMap::new()),
+            #[cfg(feature = "webrtc")]
+            endpoint_unresolvable_refusals: Arc::new(UnresolvableEndpointRefusals::default()),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_close_consumer_paused: Arc::new(AtomicBool::new(false)),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -14051,6 +14562,8 @@ impl MeshNode {
             rtc_install_pause: Arc::new(super::rtc::RtcInstallPause::default()),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_claim_pause: Arc::new(super::rtc::RtcInstallPause::default()),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_restore_pause: Arc::new(super::rtc::RtcInstallPause::default()),
             #[cfg(feature = "webrtc")]
             forwarded_app_packets: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
@@ -14074,6 +14587,12 @@ impl MeshNode {
             rpc_registration_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
             rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
+            #[cfg(feature = "cortex")]
+            rpc_large_response_slots: Arc::new(tokio::sync::Semaphore::new(
+                Self::LARGE_RESPONSE_PUMP_SLOTS,
+            )),
+            #[cfg(test)]
+            publish_park: parking_lot::Mutex::new(None),
             #[cfg(feature = "cortex")]
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
@@ -14289,6 +14808,8 @@ impl MeshNode {
             membership_dedupe: Arc::new(DashMap::new()),
             identity_challenges,
             pending_identity_proofs: Arc::new(DashMap::new()),
+            pending_subnet_admissions: Arc::new(DashMap::new()),
+            subnet_admission_permits: Arc::new(tokio::sync::Semaphore::new(64)),
             peer_identity_sessions,
             proven_identity_sessions: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
@@ -14305,6 +14826,12 @@ impl MeshNode {
             nat_classifying: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "nat-traversal")]
             punch_observers: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            relay_clients: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            relay_tunnel_ingress: relay_tunnel_ingress.clone(),
+            #[cfg(feature = "nat-traversal")]
+            relay_tunnel_rx: Arc::new(parking_lot::Mutex::new(Some(relay_tunnel_rx))),
             #[cfg(feature = "nat-traversal")]
             rendezvous_budgets: Arc::new(RendezvousBudgets::default()),
             #[cfg(feature = "nat-traversal")]
@@ -14327,6 +14854,8 @@ impl MeshNode {
                 initial_reflex_override.is_some(),
             )),
             #[cfg(feature = "nat-traversal")]
+            direct_hint: Arc::new(ArcSwapOption::empty()),
+            #[cfg(feature = "nat-traversal")]
             traversal_publish_mu: Arc::new(parking_lot::Mutex::new(())),
             #[cfg(feature = "nat-traversal")]
             traversal_config: super::traversal::TraversalConfig::default(),
@@ -14342,6 +14871,7 @@ impl MeshNode {
                 std::collections::HashSet::new(),
             )),
             seen_announcements: Arc::new(DashMap::new()),
+            relay_announcements: Arc::new(DashMap::new()),
             announce_mu: parking_lot::Mutex::new(()),
             announce_gate: Arc::new(parking_lot::Mutex::new(AnnounceGate {
                 last_broadcast_at: None,
@@ -14367,7 +14897,8 @@ impl MeshNode {
             local_subnet_policy,
             subnet_authorities,
             subnet_exports,
-            subnet_floors: Arc::new(SubnetFloorRegistry::new()),
+            subnet_floors,
+            subnet_floor_store,
             subnet_control: Arc::new(SubnetControlStore::new()),
             subnet_control_stream_id,
             subnet_challenges,
@@ -19636,6 +20167,30 @@ impl MeshNode {
             .and_then(|p| p.session.handshake_binding())
     }
 
+    /// Has the session with `node_id` gone without authenticated traffic
+    /// (heartbeats included) for `session_timeout`? `false` when there is no
+    /// session. A failed peer keeps its table entry for a long while (so a
+    /// healed partition recovers without a handshake) and the failure
+    /// detector only declares it failed after several timeouts; this is the
+    /// earlier "the far end has gone quiet" signal a caller that owns the
+    /// link can act on, e.g. by re-handshaking.
+    pub fn peer_session_is_silent(&self, node_id: u64) -> bool {
+        self.peers
+            .get(&node_id)
+            .is_some_and(|p| !p.session.heard_within(self.config.session_timeout))
+    }
+
+    /// A pending unary call must not outlive its receive incarnation. The
+    /// table can retain a retired session (notably on shutdown), so identity
+    /// alone is insufficient. Advisory inactivity is deliberately not a fence.
+    pub(super) fn rpc_session_is_live(&self, node_id: u64, session_id: u64) -> bool {
+        !self.is_shutdown()
+            && self.peers.get(&node_id).is_some_and(|peer| {
+                peer.session.session_id() == session_id
+                    && !peer.session.is_receive_lifetime_retired()
+            })
+    }
+
     /// Topology epoch this node evaluates subnet authority against.
     pub fn subnet_topology_epoch(&self) -> u32 {
         self.subnet_topology_epoch.load(Ordering::Acquire)
@@ -19772,6 +20327,22 @@ impl MeshNode {
         Ok(ctx)
     }
 
+    /// Every peer admitted to a subnet at this node right now, with the
+    /// context it was admitted under — each checked exactly as
+    /// [`Self::subnet_context_for`] checks it (current session incarnation,
+    /// unexpired, current epochs) — and whose session is still live (the
+    /// peer has spoken within `session_timeout`; a dead peer keeps its
+    /// table entry, and its context, long after it stopped). An observation
+    /// at call time, not a roster: a peer that disconnects or expires drops
+    /// out.
+    pub fn admitted_subnet_peers(&self) -> Vec<(u64, VerifiedSubnetContext)> {
+        let ids: Vec<u64> = self.peers.iter().map(|entry| *entry.key()).collect();
+        ids.into_iter()
+            .filter(|id| !self.peer_session_is_silent(*id))
+            .filter_map(|id| self.subnet_context_for(id).map(|ctx| (id, ctx)))
+            .collect()
+    }
+
     /// The compiled context for `from_node`, iff it was compiled on
     /// that peer's CURRENT session incarnation and is still current
     /// with respect to expiry and both epochs. This is the read the
@@ -19799,7 +20370,13 @@ impl MeshNode {
         let config = self
             .subnet_authority_config(&floor.scope.authority)
             .ok_or(SubnetAuthError::UnknownAuthority)?;
-        Self::apply_floor_with(floor, config, &self.subnet_floors, &self.subnet_contexts)
+        Self::apply_floor_with(
+            floor,
+            config,
+            &self.subnet_floors,
+            &self.subnet_contexts,
+            self.subnet_floor_store.as_deref(),
+        )
     }
 
     /// The floor transition itself — registry apply plus the
@@ -19812,9 +20389,13 @@ impl MeshNode {
         config: &SubnetAuthorityConfig,
         floors: &SubnetFloorRegistry,
         contexts: &SubnetContextStore,
+        store: Option<&super::subnet::floor_store::SubnetFloorStore>,
     ) -> Result<bool, SubnetAuthError> {
         let changed = floors.apply(floor, config)?;
         if changed {
+            if let Some(store) = store {
+                store.append(&SubnetControlFact::RevocationFloor(floor.clone()).to_bytes())?;
+            }
             let epoch = floors.auth_epoch(&floor.scope.authority);
             let dropped = contexts.invalidate_stale_epoch(&floor.scope.authority, epoch);
             tracing::info!(
@@ -19824,6 +20405,174 @@ impl MeshNode {
             );
         }
         Ok(changed)
+    }
+
+    /// Apply a signed subject floor (NET_CLI_PLAN_V3 §6.1a): remove one
+    /// subject's named rights inside one subtree. Only that subject's
+    /// covered contexts are dropped; every sibling keeps its admitted
+    /// context and session.
+    pub fn apply_subnet_subject_floor(
+        &self,
+        floor: &SubnetSubjectFloor,
+    ) -> Result<bool, SubnetAuthError> {
+        let config = self
+            .subnet_authority_config(&floor.scope.authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+        Self::apply_subject_floor_with(
+            floor,
+            config,
+            &self.subnet_floors,
+            &self.subnet_contexts,
+            self.subnet_floor_store.as_deref(),
+        )
+    }
+
+    fn apply_subject_floor_with(
+        floor: &SubnetSubjectFloor,
+        config: &SubnetAuthorityConfig,
+        floors: &SubnetFloorRegistry,
+        contexts: &SubnetContextStore,
+        store: Option<&super::subnet::floor_store::SubnetFloorStore>,
+    ) -> Result<bool, SubnetAuthError> {
+        let changed = floors.apply_subject(floor, config)?;
+        if changed {
+            // Durable before anything reports it committed (§6.1a item 2).
+            // On failure the stricter in-memory state stays; the caller
+            // sees `StateNotPersisted`, never success.
+            if let Some(store) = store {
+                store.append(&SubnetControlFact::SubjectFloor(floor.clone()).to_bytes())?;
+            }
+            let dropped =
+                contexts.invalidate_subject(&floor.scope.authority, &floor.subject, floors);
+            tracing::info!(
+                dropped,
+                "subnet: subject floor accepted; dropped only the removed subject's contexts"
+            );
+        }
+        Ok(changed)
+    }
+
+    /// Answer one authenticated floor readback request (V3-4 slice 2): it
+    /// must name THIS node as verifier, be signed by one of the
+    /// authority's configured roots, and be fresh. A carried subject floor
+    /// is applied first (through the same path as any other arrival, so
+    /// it is persisted before it counts). The answer is signed with this
+    /// node's entity key over the request digest. A malformed, foreign or
+    /// stale request is refused with no attestation.
+    pub fn answer_subnet_floor_status(
+        &self,
+        request_bytes: &[u8],
+        now_secs: u64,
+    ) -> Result<super::subnet::floor_status::FloorStatusAttestation, SubnetAuthError> {
+        use super::subnet::floor_status::{
+            FloorApplyOutcome, FloorStatusAttestation, FloorStatusRequest,
+            FLOOR_STATUS_FRESHNESS_SECS,
+        };
+        let request = FloorStatusRequest::from_bytes(request_bytes)?;
+        if &request.verifier != self.entity_id() {
+            return Err(SubnetAuthError::WrongVerifier);
+        }
+        let config = self
+            .subnet_authority_config(&request.scope.authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+        if !config.roots.contains(&request.signer) {
+            return Err(SubnetAuthError::IssuerNotAuthorized);
+        }
+        request.verify_signature()?;
+        if request.issued_at > now_secs.saturating_add(FLOOR_STATUS_FRESHNESS_SECS) {
+            return Err(SubnetAuthError::NotYetValid);
+        }
+        if now_secs
+            > request
+                .issued_at
+                .saturating_add(FLOOR_STATUS_FRESHNESS_SECS)
+        {
+            return Err(SubnetAuthError::Expired);
+        }
+        let apply = match request.apply_fact()? {
+            None => FloorApplyOutcome::NotRequested,
+            Some(floor) => match self.apply_subnet_subject_floor(&floor) {
+                Ok(true) => FloorApplyOutcome::Applied,
+                Ok(false) => FloorApplyOutcome::Unchanged,
+                Err(e) => FloorApplyOutcome::Refused(e),
+            },
+        };
+        let (revision, generations) = self.subnet_floors.subject_floor_state(
+            &request.scope.authority,
+            request.topology_epoch,
+            request.scope.path,
+            &request.subject,
+        );
+        FloorStatusAttestation::sign(
+            self.entity_keypair(),
+            request.digest(),
+            apply,
+            revision,
+            generations,
+            self.subnet_floor_store.is_some(),
+        )
+    }
+
+    /// Serve floor readback on [`FLOOR_STATUS_SERVICE`]. Opt-in: a
+    /// verifier that does not serve it is reported by callers as having
+    /// given no attestation, never as having applied anything.
+    ///
+    /// [`FLOOR_STATUS_SERVICE`]: super::subnet::floor_status::FLOOR_STATUS_SERVICE
+    #[cfg(feature = "cortex")]
+    pub fn serve_subnet_floor_status(
+        self: &Arc<Self>,
+    ) -> Result<super::mesh_rpc::ServeHandle, super::mesh_rpc::ServeError> {
+        self.serve_rpc(
+            super::subnet::floor_status::FLOOR_STATUS_SERVICE,
+            Arc::new(SubnetFloorStatusHandler {
+                node: Arc::downgrade(self),
+            }),
+        )
+    }
+
+    /// Ask `verifier_node` for its floor state (and, if the request
+    /// carries one, to apply a subject floor), accepting the answer only
+    /// if it is signed by the verifier the request names and answers
+    /// exactly this request.
+    #[cfg(feature = "cortex")]
+    pub async fn query_subnet_floor_status(
+        self: &Arc<Self>,
+        verifier_node: u64,
+        request: &super::subnet::floor_status::FloorStatusRequest,
+        timeout: Duration,
+    ) -> Result<super::subnet::floor_status::FloorStatusAttestation, SubnetFloorQueryError> {
+        use super::subnet::floor_status::{FloorStatusAttestation, FLOOR_STATUS_SERVICE};
+        let opts = super::mesh_rpc::CallOptions {
+            deadline: Some(Instant::now() + timeout),
+            ..Default::default()
+        };
+        let reply = self
+            .call(
+                verifier_node,
+                FLOOR_STATUS_SERVICE,
+                Bytes::from(request.to_bytes()),
+                opts,
+            )
+            .await
+            .map_err(|e| match e {
+                // No such service: a verifier that predates readback. It
+                // gave no attestation; it did not refuse anything.
+                super::mesh_rpc::RpcError::ServerError {
+                    status, message, ..
+                } if status == super::cortex::rpc::RpcStatus::NotFound.to_wire() => {
+                    SubnetFloorQueryError::NoAnswer(message)
+                }
+                super::mesh_rpc::RpcError::ServerError { message, .. } => {
+                    SubnetFloorQueryError::Refused(message)
+                }
+                other => SubnetFloorQueryError::NoAnswer(other.to_string()),
+            })?;
+        let attestation = FloorStatusAttestation::from_bytes(&reply.body)
+            .map_err(|e| SubnetFloorQueryError::BadAttestation(e.to_string()))?;
+        attestation
+            .verify_for(request)
+            .map_err(|e| SubnetFloorQueryError::BadAttestation(e.to_string()))?;
+        Ok(attestation)
     }
 
     /// Verify and apply one wire-form subnet control fact
@@ -19849,7 +20598,32 @@ impl MeshNode {
             &self.subnet_control,
             &self.subnet_floors,
             &self.subnet_contexts,
+            self.subnet_floor_store.as_deref(),
         )
+    }
+
+    /// Re-apply one logged floor at startup (no contexts exist yet, and
+    /// it is already durable). A floor for an authority no longer
+    /// configured is skipped — nothing could be admitted under it — but a
+    /// floor that fails verification refuses startup.
+    fn replay_floor(
+        bytes: &[u8],
+        authorities: &[SubnetAuthorityConfig],
+        floors: &SubnetFloorRegistry,
+    ) -> Result<(), SubnetAuthError> {
+        let fact = SubnetControlFact::from_bytes(bytes)?;
+        let Some(config) = authorities
+            .iter()
+            .find(|c| c.authority == fact.scope().authority)
+        else {
+            tracing::warn!("subnet: logged floor for an unconfigured authority skipped at startup");
+            return Ok(());
+        };
+        match &fact {
+            SubnetControlFact::RevocationFloor(f) => floors.apply(f, config).map(drop),
+            SubnetControlFact::SubjectFloor(f) => floors.apply_subject(f, config).map(drop),
+            _ => Err(SubnetAuthError::InvalidFormat),
+        }
     }
 
     /// [`Self::apply_subnet_control_fact`] over explicit handles, so
@@ -19861,6 +20635,7 @@ impl MeshNode {
         control: &SubnetControlStore,
         floors: &SubnetFloorRegistry,
         contexts: &SubnetContextStore,
+        store: Option<&super::subnet::floor_store::SubnetFloorStore>,
     ) -> Result<SubnetControlOutcome, SubnetAuthError> {
         let fact = SubnetControlFact::from_bytes(bytes)?;
         let config = authorities
@@ -19869,7 +20644,10 @@ impl MeshNode {
             .ok_or(SubnetAuthError::UnknownAuthority)?;
         let applied = match &fact {
             SubnetControlFact::RevocationFloor(floor) => {
-                Self::apply_floor_with(floor, config, floors, contexts)?
+                Self::apply_floor_with(floor, config, floors, contexts, store)?
+            }
+            SubnetControlFact::SubjectFloor(floor) => {
+                Self::apply_subject_floor_with(floor, config, floors, contexts, store)?
             }
             _ => control.apply(
                 &fact,
@@ -23253,6 +24031,7 @@ impl MeshNode {
             installed_session_id,
         );
         self.push_local_announcement(peer_node_id).await;
+        self.spawn_relay_replay(peer_node_id);
         // RT-4: a new session is a topology change - flood our
         // pingwave now so third parties learn the new edge at
         // flood speed, not on the next heartbeat tick. Session open
@@ -23331,6 +24110,7 @@ impl MeshNode {
             installed_session_id,
         );
         self.push_local_announcement(peer_node_id).await;
+        self.spawn_relay_replay(peer_node_id);
         self.emit_event_pingwave(true);
         Ok(peer_node_id)
     }
@@ -23438,6 +24218,35 @@ impl MeshNode {
         }
         // R-B, responder half: same post-publish re-read.
         self.confirm_rtc_install_or_evict(peer_node_id, outcome.session_id, &fence)?;
+        // **#7: the responder's failure-detector arming — the exact
+        // statement `connect`, `accept` and `connect_rtc` all run in
+        // their post-install block and this arm omitted.** Without it
+        // the RESPONDER of a direct RTC session never enters the
+        // failure detector, so `check_all` never reaches a Failed
+        // verdict for the peer, the dead-peer sweep (which walks
+        // `failed_nodes()`) is structurally inert for it, and a
+        // remote-side channel loss — which cannot even be signalled:
+        // a closer's `RtcSignal::Close` drops its `str0m::Rtc` with no
+        // wire teardown, and str0m's `is_alive()` is "not Closed",
+        // which ICE disconnection never sets — leaves the peer entry
+        // installed for the node's lifetime. That is B never cleaning
+        // up after A's forced direct loss, while A's own side settled
+        // in milliseconds through R3-E's close notification.
+        //
+        // The session id is read BACK from the installed entry (the
+        // same rule as `connect`'s block): a concurrent install must
+        // be what the detector stamps, not whatever this call
+        // happened to create.
+        let installed_session_id = self
+            .peers
+            .get(&peer_node_id)
+            .map(|p| p.value().session.session_id())
+            .unwrap_or(0);
+        self.failure_detector.heartbeat_for_incarnation(
+            peer_node_id,
+            peer_addr,
+            installed_session_id,
+        );
         Ok(peer_node_id)
     }
 
@@ -23670,6 +24479,20 @@ impl MeshNode {
         &self.rtc_claim_pause
     }
 
+    /// #2's restore-window pause: armed, the next dialog claim parks
+    /// while it holds the dialog-table lock.
+    #[cfg(feature = "webrtc")]
+    async fn rtc_restore_pause_point(&self) {
+        #[cfg(any(test, feature = "fixtures"))]
+        self.rtc_restore_pause.wait_if_armed().await;
+    }
+
+    /// The dialog-restore pause the #2 displacement witness drives.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn rtc_dialog_restore_pause(&self) -> &Arc<super::rtc::RtcInstallPause> {
+        &self.rtc_restore_pause
+    }
+
     /// Hold (or release) the RTC close-notification consumer, so a
     /// witness can fill the bounded channel (H3).
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -23767,6 +24590,7 @@ impl MeshNode {
         keys: SessionKeys,
         handshake_hash: Option<[u8; 32]>,
         expected_prior_session_id: Option<u64>,
+        transit: bool,
     ) -> PeerTransitionOutcome {
         // Attribute the relay only when a DIRECT session already owns
         // that address. An unclaimed address is left unattributed
@@ -23784,6 +24608,7 @@ impl MeshNode {
             PeerTransport::Routed {
                 relay: relay_addr,
                 adjacent_relay_identity,
+                transit,
             },
             keys,
             handshake_hash,
@@ -24281,6 +25106,7 @@ impl MeshNode {
 
         // See the matching comment in `connect`.
         self.push_local_announcement(peer_node_id).await;
+        self.spawn_relay_replay(peer_node_id);
         // RT-4: a new session is a topology change - flood our
         // pingwave now so third parties learn the new edge at
         // flood speed, not on the next heartbeat tick. Session open
@@ -24387,6 +25213,8 @@ impl MeshNode {
         }
 
         let recv_handle = self.spawn_receive_loop();
+        #[cfg(feature = "nat-traversal")]
+        self.spawn_relay_tunnel_ingress();
         // R3-E: the driver's close notifications drive the ordinary
         // peer-removal transaction. Spawned here, next to the receive
         // loop, because it is the same lifecycle: it exits with the
@@ -26154,6 +26982,11 @@ impl MeshNode {
             packet_pool_size: self.config.packet_pool_size,
             default_reliable: self.config.default_reliable,
             session_timeout: self.config.session_timeout,
+            busy_liveness: self
+                .config
+                .heartbeat_interval
+                .saturating_mul(3)
+                .min(self.config.session_timeout),
             roster: self.roster.clone(),
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
@@ -26161,6 +26994,9 @@ impl MeshNode {
             membership_dedupe_ttl: self.config.membership_ack_timeout * 2,
             identity_challenges: self.identity_challenges.clone(),
             pending_identity_proofs: self.pending_identity_proofs.clone(),
+            pending_subnet_admissions: self.pending_subnet_admissions.clone(),
+            subnet_admission_permits: self.subnet_admission_permits.clone(),
+            self_weak: self.self_weak.clone(),
             peer_identity_sessions: self.peer_identity_sessions.clone(),
             #[cfg(feature = "nat-traversal")]
             pending_reflex_probes: self.pending_reflex_probes.clone(),
@@ -26170,6 +27006,8 @@ impl MeshNode {
             pending_punch_acks: self.pending_punch_acks.clone(),
             #[cfg(feature = "nat-traversal")]
             punch_observers: self.punch_observers.clone(),
+            #[cfg(feature = "nat-traversal")]
+            relay_clients: self.relay_clients.clone(),
             #[cfg(feature = "nat-traversal")]
             rendezvous_budgets: self.rendezvous_budgets.clone(),
             #[cfg(feature = "nat-traversal")]
@@ -26182,6 +27020,7 @@ impl MeshNode {
             #[cfg(feature = "dataforts")]
             capability_set_cache: self.capability_set_cache.clone(),
             seen_announcements: self.seen_announcements.clone(),
+            relay_announcements: self.relay_announcements.clone(),
             require_signed_capabilities: self.config.require_signed_capabilities,
             local_subnet: self.local_subnet,
             local_subnet_policy: self.local_subnet_policy.clone(),
@@ -26190,6 +27029,7 @@ impl MeshNode {
             subnet_gateway_authority: self.subnet_gateway_authority.clone(),
             protected_relay_stats: self.protected_relay_stats.clone(),
             subnet_floors: self.subnet_floors.clone(),
+            subnet_floor_store: self.subnet_floor_store.clone(),
             subnet_control: self.subnet_control.clone(),
             subnet_authorities: self.subnet_authorities.clone(),
             subnet_control_stream_id: self.subnet_control_stream_id,
@@ -26202,6 +27042,8 @@ impl MeshNode {
             subscriber_chains: self.subscriber_chains.clone(),
             auth_guard: self.auth_guard.clone(),
             auth_failures: self.auth_failures.clone(),
+            #[cfg(feature = "webrtc")]
+            endpoint_unresolvable_refusals: self.endpoint_unresolvable_refusals.clone(),
             max_auth_failures_per_window: self.config.max_auth_failures_per_window,
             auth_failure_window: self.config.auth_failure_window,
             auth_throttle_duration: self.config.auth_throttle_duration,
@@ -26452,8 +27294,10 @@ impl MeshNode {
             .unwrap_or_else(|| Duration::from_secs(10));
         // The same size bound and the same per-sender budget an
         // over-the-mesh frame spends — one function, two callers
-        // (R2) — charged to `budget_key`.
-        self.admit_signal_frame(
+        // (R2) — charged to `budget_key`. The classification is kept
+        // (#10): it is what lets a non-terminal outcome release
+        // exactly the reservation THIS call took, and no other.
+        let admitted = self.admit_signal_frame_classified(
             budget_key,
             &super::rtc::RtcSignalMsg::Offer {
                 dialog,
@@ -26494,9 +27338,45 @@ impl MeshNode {
                     "the offer was refused: {reason:?}"
                 )))
             }
-            other => Err(AdapterError::Connection(format!(
-                "unexpected outcome for a bootstrap offer: {other:?}"
-            ))),
+            super::rtc::SignalOutcome::Ignored => {
+                // #10: a duplicate Offer for a live dialog. The
+                // reservation THIS call's charge pushed under its
+                // fresh per-attempt `budget_key` is released before
+                // returning: every paired `admit_signal_frame` take
+                // either reaches a named terminal owner (the
+                // completion owner above, the `Reject` arm) or is
+                // released here — so a duplicate Offer leaves
+                // `open_dialogs(key)` at its pre-call value instead
+                // of one leaked slot per repeat.
+                self.release_bootstrap_offer_take(admitted, budget_key, dialog);
+                Err(AdapterError::Connection(
+                    "duplicate offer for a live dialog".into(),
+                ))
+            }
+            other => {
+                self.release_bootstrap_offer_take(admitted, budget_key, dialog);
+                Err(AdapterError::Connection(format!(
+                    "unexpected outcome for a bootstrap offer: {other:?}"
+                )))
+            }
+        }
+    }
+
+    /// Release exactly the dialog slot THIS call's
+    /// [`Self::admit_signal_frame`] take booked — and only that one
+    /// (#10). `SignalAdmit::NewDialog` pushed one slot and gets one
+    /// `end_dialog` back; `OpenDialog` booked no slot (the id was
+    /// already in this key's budget), so releasing one there would
+    /// end the LIVE attempt's reservation.
+    #[cfg(feature = "webrtc")]
+    fn release_bootstrap_offer_take(
+        &self,
+        admitted: super::rtc::SignalAdmit,
+        budget_key: u64,
+        dialog: u64,
+    ) {
+        if matches!(admitted, super::rtc::SignalAdmit::NewDialog) {
+            self.rtc_signal_budget.lock().end_dialog(budget_key, dialog);
         }
     }
 
@@ -26519,6 +27399,22 @@ impl MeshNode {
         budget_key: u64,
         msg: &super::rtc::RtcSignalMsg,
     ) -> Result<(), AdapterError> {
+        self.admit_signal_frame_classified(budget_key, msg)
+            .map(|_| ())
+    }
+
+    /// [`Self::admit_signal_frame`], reporting what the budget DID
+    /// (#10): `NewDialog` means this call pushed a dialog slot under
+    /// `budget_key` and owns its release; `OpenDialog` took no slot
+    /// and must release none. The bootstrap offer path needs the
+    /// distinction to release exactly its own take on a
+    /// non-terminal outcome.
+    #[cfg(feature = "webrtc")]
+    fn admit_signal_frame_classified(
+        &self,
+        budget_key: u64,
+        msg: &super::rtc::RtcSignalMsg,
+    ) -> Result<super::rtc::SignalAdmit, AdapterError> {
         let stats = self.rtc_stats_opt().cloned();
         if let Err(e) = msg.validate_size() {
             if let Some(stats) = stats.as_ref() {
@@ -26552,7 +27448,7 @@ impl MeshNode {
                     "signalling frame over budget: {e}"
                 )))
             }
-            _ => Ok(()),
+            _ => Ok(admitted),
         }
     }
 
@@ -26727,11 +27623,20 @@ impl MeshNode {
         // channel opened, which is `ice_failed` and not
         // `ice_relayed`: the attempt did not run out of time, it
         // lost its peer.
-        if let (Some(entry), Some(driver)) = (entry, self.rtc_driver.as_ref()) {
-            driver.stats().note_ice_failed();
-            let _ = driver.close(entry.peer).await;
+        //
+        // The budget release is part of that same terminal: it runs
+        // ONLY when this call removed the row. A late close finding
+        // nothing used to `release_signal_budget` anyway — releasing
+        // a reservation the completion owner (or a successor socket
+        // on the same attempt) still owns, and ending the dialog in
+        // the frame budget while its install was in flight.
+        if let Some(entry) = entry {
+            if let Some(driver) = self.rtc_driver.as_ref() {
+                driver.stats().note_ice_failed();
+                let _ = driver.close(entry.peer).await;
+            }
+            self.release_signal_budget(claimed_node_id, dialog);
         }
-        self.release_signal_budget(claimed_node_id, dialog);
     }
 
     /// The §12 global provisional bound this anchor was configured
@@ -27074,31 +27979,61 @@ impl MeshNode {
             //    live attempt and answered 404 — which a page can
             //    only read as a bare `1006`. The attempt is retired
             //    below, when it is genuinely terminal.
-            let claimed = {
+            let (claimed_mine, displaced) = {
                 let mut table = dialogs.lock().await;
-                table.remove(peer_node_id, dialog)
-            };
-            match claimed {
-                Some(entry) if entry.peer == peer => {}
-                other => {
-                    // Lost the claim. `other` is `None` (another
-                    // terminal owner took the row) or a successor's
-                    // endpoint under the same dialog id — and a
-                    // successor's row must go back, because it is
-                    // still live and its own owner will claim it.
-                    if let Some(entry) = other {
-                        let mut table = dialogs.lock().await;
-                        table.insert(peer_node_id, dialog, entry);
+                let claimed = table.remove(peer_node_id, dialog);
+                // **#2's witness seam.** Armed, THIS claim parks while
+                // still holding the dialog-table lock — which is the
+                // point: a witness can queue a competing Offer exactly
+                // across the remove-and-restore below and observe that
+                // it cannot be displaced. Unarmed — every production
+                // path — one relaxed load.
+                node.rtc_restore_pause_point().await;
+                match claimed {
+                    Some(entry) if entry.peer == peer => (true, None),
+                    other => {
+                        // Lost the claim. `other` is `None` (another
+                        // terminal owner took the row) or a successor's
+                        // endpoint under the same dialog id — and a
+                        // successor's row must go back, because it is
+                        // still live and its own owner will claim it.
+                        //
+                        // **The restore shares THIS lock hold with the
+                        // `remove` above (#2).** Across two acquisitions
+                        // an `Offer` for the same `(peer, dialog)` could
+                        // land in between, see no row, mint a session and
+                        // install its row — which the re-insert then
+                        // silently displaced: the displaced `Option`
+                        // dropped, its ICE session leaked and its attempt
+                        // stranded with no dialog row, so `ice_pending()`
+                        // stayed above zero for the process lifetime. One
+                        // hold makes the key provably vacant at the
+                        // insert, so no row can be displaced.
+                        (
+                            false,
+                            other.and_then(|entry| table.insert(peer_node_id, dialog, entry)),
+                        )
                     }
-                    tracing::debug!(
-                        peer = format!("{peer_node_id:#x}"),
-                        "rtc upgrade: the attempt was already terminal elsewhere; \
-                         not installing and not charging a second terminal term"
-                    );
-                    // This endpoint is ours and nothing will use it.
-                    let _ = driver.close(peer).await;
-                    return;
                 }
+            };
+            if let Some(displaced) = displaced {
+                // Unreachable while the restore shares the claim's lock
+                // hold — but a displaced row is a LIVE attempt, never an
+                // `Option` to drop (#2): its endpoint is closed and its
+                // attempt terminal-charged here, so no attempt can be
+                // left with no terminal owner.
+                driver.stats().note_ice_failed();
+                let _ = driver.close(displaced.peer).await;
+            }
+            if !claimed_mine {
+                tracing::debug!(
+                    peer = format!("{peer_node_id:#x}"),
+                    "rtc upgrade: the attempt was already terminal elsewhere; \
+                     not installing and not charging a second terminal term"
+                );
+                // This endpoint is ours and nothing will use it.
+                let _ = driver.close(peer).await;
+                return;
             }
             // 3. Noise over it, in this dialog's role. The offerer
             //    initiates, so both sides do not send msg1.
@@ -27507,6 +28442,15 @@ impl MeshNode {
                             Ok((data, source)) => {
                                 // The UDP receive loop is a boundary: the
                                 // socket's tuple becomes the peer endpoint here.
+                                // A datagram from a blind relay this node uses
+                                // is relay traffic: a framed peer datagram is
+                                // unwrapped and attributed to its relayed
+                                // endpoint, anything else is a control reply.
+                                #[cfg(feature = "nat-traversal")]
+                                let (data, source) = match Self::relay_ingress(data, source, &ctx) {
+                                    Some(unwrapped) => unwrapped,
+                                    None => continue,
+                                };
                                 Self::dispatch_packet(data, source, &ctx);
                             }
                             // Batched receiver: a ConnectionReset means its recv
@@ -27537,6 +28481,69 @@ impl MeshNode {
                 }
             }
         })
+    }
+
+    /// Drain datagrams that arrive over this node's relay TCP tunnels into the
+    /// same relay boundary a UDP datagram from the relay crosses
+    /// ([`Self::relay_ingress`], attributed to the relay's address) and on to
+    /// dispatch. A separate task, so the UDP receive loop — the hot path — is
+    /// untouched; it parks on an empty channel while no tunnel exists. Exits
+    /// with the node (`shutdown`), since the context it holds reaches the
+    /// relay clients that hold the channel's senders.
+    #[cfg(feature = "nat-traversal")]
+    fn spawn_relay_tunnel_ingress(&self) {
+        let Some(mut rx) = self.relay_tunnel_rx.lock().take() else {
+            return;
+        };
+        let ctx = self.dispatch_ctx();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        tokio::spawn(async move {
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    frame = rx.recv() => {
+                        let Some((data, relay)) = frame else { break };
+                        if let Some((data, source)) =
+                            Self::relay_ingress(Bytes::from(data), PeerAddr::Udp(relay), &ctx)
+                        {
+                            Self::dispatch_packet(data, source, &ctx);
+                        }
+                    }
+                    _ = shutdown_notify.notified() => break,
+                }
+            }
+        });
+    }
+
+    /// Blind-relay boundary for one UDP datagram. `Some` passes the
+    /// (possibly unwrapped) packet on to [`Self::dispatch_packet`]; `None`
+    /// means it was a relay control reply, consumed here.
+    #[cfg(feature = "nat-traversal")]
+    #[inline]
+    fn relay_ingress(
+        data: Bytes,
+        source: PeerAddr,
+        ctx: &DispatchCtx,
+    ) -> Option<(Bytes, PeerAddr)> {
+        let PeerAddr::Udp(from) = source else {
+            return Some((data, source));
+        };
+        let Some(client) = ctx.relay_clients.get(&from) else {
+            return Some((data, source));
+        };
+        match net_wire::peer_addr::split_relay_data(&data) {
+            Some((channel, _)) => Some((
+                data.slice(net_wire::peer_addr::RELAY_DATA_HEADER_LEN..),
+                PeerAddr::Relayed {
+                    relay: from,
+                    channel,
+                },
+            )),
+            None => {
+                client.deliver(&data);
+                None
+            }
+        }
     }
 
     /// Dispatch a single received packet.
@@ -28410,7 +29417,10 @@ impl MeshNode {
                 noise.read_message(&parsed.payload)?;
                 noise.into_session_keys_with_binding()
             })();
-            let _ = tx.send(result);
+            let _ = tx
+                .send(result.map(|(keys, handshake_hash)| {
+                    (keys, handshake_hash, routing_header.hop_count)
+                }));
             return;
         }
 
@@ -28609,6 +29619,7 @@ impl MeshNode {
                                 &remote_static_pub,
                                 &initiator_ephemeral,
                                 ctx.session_timeout,
+                                ctx.busy_liveness,
                             ) {
                                 RoutedRotationOutcome::DropReplay => {
                                     tracing::warn!(
@@ -28689,6 +29700,7 @@ impl MeshNode {
                                                 .get(&source)
                                                 .map(|e| *e.value())
                                                 .filter(|nid| *nid != peer_node_id),
+                                            transit: routing_header.hop_count > 0,
                                         },
                                         session,
                                         remote_static_pub,
@@ -28726,6 +29738,7 @@ impl MeshNode {
                                         .get(&source)
                                         .map(|e| *e.value())
                                         .filter(|nid| *nid != peer_node_id),
+                                    transit: routing_header.hop_count > 0,
                                 },
                                 session,
                                 remote_static_pub,
@@ -28853,6 +29866,25 @@ impl MeshNode {
             routing_registry: ctx.routing_registry.clone(),
             peer_entity_ids: ctx.peer_entity_ids.clone(),
         };
+        let (relay, replay_peers, replay_sink) = (
+            ctx.relay_announcements.clone(),
+            ctx.peers.clone(),
+            ctx.sink.clone(),
+        );
+        // Replay only to a peer that attached to THIS node (the routed
+        // handshake crossed no mesh hop). A peer behind a mesh relay
+        // (`hop_count > 0`) already receives the flood through that relay,
+        // and replaying over its session opens a capability stream there
+        // that keeps the session non-quiescent, which the RTC install fence
+        // then refuses for good (natsim `rtc_anchor_direct`, since S6).
+        let replay = routing_header.hop_count == 0;
+        // Only across a BLIND relay (not a mesh member, so nothing floods
+        // between the two ends); a mesh relay floods both announcements.
+        let this = if matches!(source, PeerAddr::Relayed { .. }) {
+            ctx.self_weak.get().cloned()
+        } else {
+            None
+        };
         tokio::spawn(async move {
             match sink.send(&payload, next_hop).await {
                 Ok(_) => {
@@ -28861,6 +29893,27 @@ impl MeshNode {
                     // place, and the guard's own references are
                     // released.
                     guard.commit();
+                    // This node's own announcement too, as `accept` pushes
+                    // it on a direct session (R2 phase 5: a blind-relayed
+                    // peer learns this node's direct hint without waiting
+                    // for the next re-announce).
+                    if let Some(node) = this.and_then(|w| w.upgrade()) {
+                        // Only schedules (a `Weak`-holding task); the strong
+                        // ref drops at the end of this block.
+                        node.spawn_routed_announcement_push(peer_node_id);
+                    }
+                    // A peer that attached through a routed handshake
+                    // (a device reaching its hub) gets the announcements
+                    // flooded before it arrived.
+                    if replay {
+                        Self::replay_relay_announcements(
+                            peer_node_id,
+                            relay,
+                            replay_peers,
+                            replay_sink,
+                        )
+                        .await;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -29031,6 +30084,7 @@ impl MeshNode {
                 if !rx_cipher.try_admit_rx_counter(counter) {
                     return;
                 }
+                session.note_inbound();
                 d
             }
             Err(_) => return,
@@ -29428,11 +30482,21 @@ impl MeshNode {
             }
             if !packets.is_empty() {
                 let sink = ctx.sink.clone();
-                let dest = parsed.source;
+                // Resend along the peer's own route: across a relay hop
+                // the repair rides a routing header like everything else.
+                let route = ctx
+                    .peers
+                    .get(&from_node)
+                    .map(|p| p.wire_route(ctx.local_node_id))
+                    .filter(|r| r.addr == parsed.source)
+                    .unwrap_or(WireRoute {
+                        addr: parsed.source,
+                        header: None,
+                    });
                 let control_stats = ctx.control_stats.clone();
                 tokio::spawn(async move {
                     for p in packets {
-                        if sink.send(&p, dest).await.is_ok() {
+                        if sink.send(&route.frame(&p), route.addr).await.is_ok() {
                             control_stats
                                 .retransmit_packets_sent
                                 .fetch_add(1, Ordering::Relaxed);
@@ -29580,9 +30644,46 @@ impl MeshNode {
         // field — every identity decision below keys on it. Each event
         // is one independent leg, so iterating the frame is safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_IDENTITY_PROOF {
+            // **§12: denied before effects for a provisional
+            // session** — the same gate and the same reason as the
+            // `0x0D02` arm's R1. `BootstrapAction` models no
+            // identity-proof frame and this arm used to run UNGATED:
+            // a provisional session's `ChallengeRequest` allocated
+            // challenge state and minted a signed `Challenge`, and a
+            // `Proof` installed `peer_entity_ids[from_node]` — the
+            // pinned identity the §12 invariant says cannot exist
+            // (gate 4 keeps a provisional peer from installing one),
+            // which then WINS over the session-bound origin in
+            // `provisional_reply_origin`, breaking one-session-one-
+            // identity. Identity proof is what an ADMITTED peer uses
+            // to bind its entity to its session; an unenrolled one
+            // has no business minting pins. (The gate is the `webrtc`
+            // admission layer: without the feature there is no
+            // provisional class to refuse.)
+            #[cfg(feature = "webrtc")]
+            if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
+                return;
+            }
             let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
                 Self::handle_identity_proof_message(&payload, from_node, ctx);
+            }
+            return;
+        }
+
+        // Subnet admission (`0x0A02`, V3-2 S1). Same §12 gate as identity
+        // proof: an unadmitted provisional session gets no challenge state
+        // and installs no pin. `from_node` is the AEAD-resolved peer.
+        if parsed.header.subprotocol_id
+            == super::subnet::admission_wire::SUBPROTOCOL_SUBNET_ADMISSION
+        {
+            #[cfg(feature = "webrtc")]
+            if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
+                return;
+            }
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                Self::handle_subnet_admission_message(&payload, from_node, ctx);
             }
             return;
         }
@@ -30326,6 +31427,7 @@ impl MeshNode {
                     &ctx.subnet_control,
                     &ctx.subnet_floors,
                     &ctx.subnet_contexts,
+                    ctx.subnet_floor_store.as_deref(),
                 ) {
                     Ok(outcome) if outcome.applied => tracing::info!(
                         from_node = format!("{from_node:#x}"),
@@ -31075,6 +32177,8 @@ impl MeshNode {
     /// needs.
     fn spawn_stream_grant_drainer_loop(&self) -> JoinHandle<()> {
         let sink = self.sink.clone();
+        let peers = self.peers.clone();
+        let local_id = self.node_id;
         let partition_filter = self.partition_filter.clone();
         let pending = self.pending_stream_grants.clone();
         let notify = self.pending_stream_grants_notify.clone();
@@ -31124,6 +32228,16 @@ impl MeshNode {
                     if partition_filter.contains(&peer_addr) {
                         continue;
                     }
+                    // Per-peer framing: a session that crosses a relay
+                    // hop needs its grants behind a routing header.
+                    let route = session_id_to_node
+                        .get(&session_id)
+                        .and_then(|n| peers.get(&*n).map(|p| p.wire_route(local_id)))
+                        .filter(|r| r.addr == peer_addr)
+                        .unwrap_or(WireRoute {
+                            addr: peer_addr,
+                            header: None,
+                        });
                     // R-5: resolve the peer's SACK-range support once
                     // per session per cycle (cached; see
                     // `peer_supports_ack_ranges`).
@@ -31159,7 +32273,7 @@ impl MeshNode {
                             PacketFlags::NONE,
                             SUBPROTOCOL_STREAM_WINDOW,
                         );
-                        if let Err(e) = sink.send(&packet, peer_addr).await {
+                        if let Err(e) = sink.send(&route.frame(&packet), route.addr).await {
                             tracing::debug!(error = %e, "StreamWindow grant send failed");
                             continue;
                         }
@@ -31186,7 +32300,7 @@ impl MeshNode {
                         &sink,
                         &mut builder,
                         &session,
-                        peer_addr,
+                        route,
                         &nack_events,
                         SUBPROTOCOL_STREAM_NACK,
                         &control_stats.nack_packets_sent,
@@ -31197,7 +32311,7 @@ impl MeshNode {
                         &sink,
                         &mut builder,
                         &session,
-                        peer_addr,
+                        route,
                         &ack_events,
                         SUBPROTOCOL_STREAM_ACK,
                         &control_stats.ack_range_packets_sent,
@@ -31218,6 +32332,7 @@ impl MeshNode {
     /// past `max_retries` are dropped from the window by `get_timed_out`.
     fn spawn_retransmit_loop(&self) -> JoinHandle<()> {
         let peers = self.peers.clone();
+        let local_id = self.node_id;
         let sink = self.sink.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
@@ -31244,14 +32359,18 @@ impl MeshNode {
                 // below (that could deadlock against a concurrent peer
                 // insert/remove on the same shard).
                 let mut work: Vec<(
-                    PeerAddr,
+                    WireRoute,
                     Arc<NetSession>,
                     Vec<Arc<super::RetransmitDescriptor>>,
                 )> = Vec::new();
                 for peer in peers.iter() {
                     let due = peer.value().session.collect_timed_out_retransmits();
                     if !due.is_empty() {
-                        work.push((peer.value().addr(), peer.value().session.clone(), due));
+                        work.push((
+                            peer.value().wire_route(local_id),
+                            peer.value().session.clone(),
+                            due,
+                        ));
                     }
                 }
                 for (addr, session, due) in work {
@@ -31265,7 +32384,7 @@ impl MeshNode {
                             builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
                         }
                         let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
-                        if sink.send(&packet, addr).await.is_ok() {
+                        if sink.send(&addr.frame(&packet), addr.addr).await.is_ok() {
                             control_stats
                                 .retransmit_packets_sent
                                 .fetch_add(1, Ordering::Relaxed);
@@ -31285,7 +32404,7 @@ impl MeshNode {
                 // leave the SENDER waiting on data it has already
                 // discarded its copy of. One egress, one frame type:
                 // the peer's read fails fast either way.
-                let mut resets: Vec<(PeerAddr, Arc<NetSession>, Vec<u64>)> = Vec::new();
+                let mut resets: Vec<(WireRoute, Arc<NetSession>, Vec<u64>)> = Vec::new();
                 for peer in peers.iter() {
                     let mut failed = peer.value().session.take_failed_stream_ids();
                     for stream_id in peer.value().session.take_receive_terminals() {
@@ -31294,7 +32413,11 @@ impl MeshNode {
                         }
                     }
                     if !failed.is_empty() {
-                        resets.push((peer.value().addr(), peer.value().session.clone(), failed));
+                        resets.push((
+                            peer.value().wire_route(local_id),
+                            peer.value().session.clone(),
+                            failed,
+                        ));
                     }
                 }
                 for (addr, session, failed) in resets {
@@ -31338,7 +32461,7 @@ impl MeshNode {
                 // NACKs are harmless (`on_nack` resends are bounded by
                 // `max_retries` and deduped by the receiver).
                 struct TickGaps {
-                    addr: PeerAddr,
+                    addr: WireRoute,
                     session: Arc<NetSession>,
                     reports: Vec<super::session::GapReport>,
                 }
@@ -31358,7 +32481,7 @@ impl MeshNode {
                     let reports = session.collect_gap_reports(want_ranges, MAX_ACK_RANGES);
                     if !reports.is_empty() {
                         work.push(TickGaps {
-                            addr: peer.value().addr(),
+                            addr: peer.value().wire_route(local_id),
                             session: session.clone(),
                             reports,
                         });
@@ -31511,6 +32634,23 @@ impl MeshNode {
         // it's 9 s, still comfortably longer than typical test
         // partition-heal windows).
         let dead_peer_timeout = self.config.session_timeout.saturating_mul(30);
+        // **#7: a direct RTC endpoint runs on its own dead-peer
+        // budget — the failure detector's** (`miss_threshold` is 3,
+        // the value `MeshNode::new` builds the detector with, so this
+        // is one full detector budget of no observed traffic past the
+        // last packet). The 30× UDP grace is a partition-heal story —
+        // "the SAME session resumes when the partition heals, so keep
+        // the keys warm". A `PeerAddr::Rtc` endpoint is a CHANNEL, and
+        // a lost channel cannot even be signalled (see `accept_rtc`'s
+        // #7 note): this sweep and the local close notifier are its
+        // only removal paths, and 30× (150 s at the §9 harness's 5 s
+        // `session_timeout`) is past any failure budget a lost direct
+        // session may hold its peer entry — a stale entry being
+        // exactly the eviction race §12's gates must distrust. Any
+        // received packet still recovers the detector (and refreshes
+        // activity), so a partition that heals before the budget ends
+        // keeps its entry, as below.
+        let rtc_dead_peer_timeout = self.config.session_timeout.saturating_mul(3);
         // Stream lifecycle: drop idle streams past `stream_idle_timeout`
         // and enforce `max_streams` cap via LRU.
         let stream_idle_timeout = self.config.stream_idle_timeout;
@@ -32147,12 +33287,39 @@ impl MeshNode {
                         let failed = failure_detector.failed_nodes();
                         for node_id in failed {
                             // Capture WHICH incarnation looked dead, not
-                            // merely that one did.
+                            // merely that one did. The inactivity budget
+                            // is per endpoint class (#7): a direct RTC
+                            // endpoint gets the failure detector's own
+                            // budget, everything else the partition-heal
+                            // grace above.
                             let observed = match peers.get(&node_id) {
-                                Some(e) if e.value().session.is_timed_out(dead_peer_timeout) => {
-                                    Some(e.value().session.session_id())
+                                Some(e) => {
+                                    let info = e.value();
+                                    // `PeerAddr::Rtc` exists only under
+                                    // `webrtc`; a non-webrtc build has
+                                    // only the grace budget (and the
+                                    // `let _ =` keeps that graph
+                                    // warning-free).
+                                    let timeout = {
+                                        #[cfg(feature = "webrtc")]
+                                        {
+                                            if matches!(info.addr(), PeerAddr::Rtc(_)) {
+                                                rtc_dead_peer_timeout
+                                            } else {
+                                                dead_peer_timeout
+                                            }
+                                        }
+                                        #[cfg(not(feature = "webrtc"))]
+                                        {
+                                            let _ = rtc_dead_peer_timeout;
+                                            dead_peer_timeout
+                                        }
+                                    };
+                                    info.session
+                                        .is_timed_out(timeout)
+                                        .then(|| info.session.session_id())
                                 }
-                                _ => None,
+                                None => None,
                             };
                             let Some(observed_session_id) = observed else {
                                 continue;
@@ -32348,13 +33515,14 @@ impl MeshNode {
         // This path is worse than the subprotocol one it shares the defect
         // with: it awaits once per MTU-sized chunk, so a large batch held the
         // peer shard across a whole sequence of sends.
-        let (peer_addr, session) = {
+        let (route, session) = {
             let peer = self
                 .peers
                 .get(&node_id)
                 .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
-            (peer.addr(), peer.session.clone())
+            (peer.wire_route(self.node_id), peer.session.clone())
         };
+        let peer_addr = route.addr;
         // Partition filter: silently drop sends to blocked peers
         if self.partition_filter.contains(&peer_addr) {
             return Ok(());
@@ -32389,7 +33557,7 @@ impl MeshNode {
                     PacketFlags::NONE
                 };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
-                send_datagram(&self.sink, &packet, peer_addr).await?;
+                send_datagram(&self.sink, &route.frame(&packet), peer_addr).await?;
 
                 current_batch.clear();
                 current_size = 0;
@@ -32410,7 +33578,7 @@ impl MeshNode {
                 PacketFlags::NONE
             };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
-            send_datagram(&self.sink, &packet, peer_addr).await?;
+            send_datagram(&self.sink, &route.frame(&packet), peer_addr).await?;
         }
 
         // builder is dropped here — auto-released back to the pool
@@ -32670,6 +33838,42 @@ impl MeshNode {
             }
             None => false,
         }
+    }
+
+    /// Node-wide bound on concurrently admitted large-unary-response
+    /// pumps (review finding 9). Eight is the deliberately small
+    /// backpressure containment: every admitted pump owns one complete
+    /// response and runs its per-fragment sends inline (there is no
+    /// fragment queue), so one slow peer can stall at most this many
+    /// logical responses and the ninth is refused up front — before any
+    /// fragment is emitted — rather than queued behind a stalled
+    /// transfer. Sized in the same order as the node-global reassembly
+    /// budget (`AGGREGATE = 8 * MAX` in `cortex/rpc/large_response`),
+    /// so worst-case in-flight response bytes stay bounded together.
+    /// Not configurable: a larger bound re-opens the stall-all-pumps
+    /// contention the cap exists to contain.
+    #[cfg(feature = "cortex")]
+    pub(crate) const LARGE_RESPONSE_PUMP_SLOTS: usize = 8;
+
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_large_response_slots(&self) -> Arc<tokio::sync::Semaphore> {
+        self.rpc_large_response_slots.clone()
+    }
+
+    /// Test seam for the drop-during-publish case: park `publish_to_peer`
+    /// for `stream_id` and hand back the arrival signal to await on.
+    #[cfg(test)]
+    pub(crate) fn arm_publish_park(&self, stream_id: u64) -> Arc<tokio::sync::Notify> {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        *self.publish_park.lock() = Some((stream_id, Arc::clone(&arrived)));
+        arrived
+    }
+
+    /// Release the publish park so later publishes — including the
+    /// `UnaryCallGuard` Drop's CANCEL — flow again.
+    #[cfg(test)]
+    pub(crate) fn disarm_publish_park(&self) {
+        *self.publish_park.lock() = None;
     }
 
     /// Per-Mesh shared `RpcClientPending` — accessor for the
@@ -33571,6 +34775,62 @@ impl MeshNode {
         self.published_chains.insert(channel.hash(), chain);
     }
 
+    /// Install a MANAGED publish chain for `channel`: one per channel.
+    /// Installing the identical chain again is a no-op; a DIFFERENT chain
+    /// already installed is refused (never silently overwritten), so a
+    /// lifecycle owner always knows which incarnation it holds. Returns the
+    /// installed chain's fingerprint, the key for
+    /// [`Self::remove_publish_chain_if`].
+    pub fn install_publish_chain(
+        &self,
+        channel: &ChannelName,
+        chain: TokenChain,
+    ) -> Result<[u8; 32], PublishChainConflict> {
+        let fingerprint = chain.fingerprint();
+        match self.published_chains.entry(channel.hash()) {
+            dashmap::mapref::entry::Entry::Occupied(existing) => {
+                let installed = existing.get().fingerprint();
+                if installed == fingerprint {
+                    Ok(fingerprint)
+                } else {
+                    Err(PublishChainConflict { installed })
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(chain);
+                Ok(fingerprint)
+            }
+        }
+    }
+
+    /// The fingerprint of the publish chain held for `channel`, if any.
+    pub fn publish_chain_fingerprint(&self, channel: &ChannelName) -> Option<[u8; 32]> {
+        self.published_chains
+            .get(&channel.hash())
+            .map(|c| c.fingerprint())
+    }
+
+    /// Remove the publish chain for `channel` only if it is exactly the
+    /// incarnation `fingerprint` names — a stale removal never removes a
+    /// successor. Also evicts that chain's tokens from this node's token
+    /// cache, so the publish path's cache fallback cannot keep authorizing
+    /// what was removed. Returns whether it removed anything.
+    pub fn remove_publish_chain_if(&self, channel: &ChannelName, fingerprint: &[u8; 32]) -> bool {
+        let removed = self
+            .published_chains
+            .remove_if(&channel.hash(), |_, chain| {
+                &chain.fingerprint() == fingerprint
+            });
+        if let Some((_, chain)) = &removed {
+            if let Some(cache) = &self.token_cache {
+                for token in &chain.tokens {
+                    cache.evict_exact(token);
+                }
+            }
+        }
+        removed.is_some()
+    }
+
     /// Subscribe in the named queue group: every published event is
     /// delivered to exactly ONE member of the group, distributed
     /// round-robin across members. The publisher's roster carries
@@ -34214,7 +35474,25 @@ impl MeshNode {
         // channel, bare — a wildcard, a token, a queue group or
         // anyone else's channel is refused, not ignored.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 3 FAILS CLOSED when the peer entry is gone. The
+            // endpoint is unresolvable exactly when there is no installed
+            // `PeerInfo` — the state `ingress_admission` documents as
+            // reachable ("frames still queued behind a peer that has
+            // already been removed") and deliberately answers `Denied`.
+            // Guarding this with `if let Some(...)` SKIPPED the gate
+            // entirely in that state, so a Subscribe dispatched
+            // concurrently with the peer-map eviction (deterministic at
+            // the provisional reclaim) landed past §12 and was judged only
+            // by the ordinary ACL. Gate 5 is source-keyed and already
+            // refused here; this is its endpoint-keyed sibling. Counted
+            // under its own reason (#11) — "endpoint unresolvable" must
+            // not share a counter with the policy refusal below.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_subscribe();
+                return;
+            };
             let action = match &msg {
                 MembershipMsg::Subscribe {
                     channel,
@@ -34348,6 +35626,265 @@ impl MeshNode {
                 }
             }
         }
+    }
+
+    /// Dispatch one leg of the subnet admission exchange (`0x0A02`).
+    /// Prover legs (`Challenge`, `Verdict`) complete the pending oneshot —
+    /// only from the node the leg went to. Verifier legs
+    /// (`ChallengeRequest`, `Present`) run on the node itself, bounded by
+    /// a permit pool; excess legs are dropped and the prover times out.
+    fn handle_subnet_admission_message(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        use super::subnet::admission_wire::SubnetAdmissionMsg;
+        let Ok(msg) = SubnetAdmissionMsg::decode(payload) else {
+            tracing::debug!(
+                from = format!("{from_node:#x}"),
+                "subnet admission: undecodable leg"
+            );
+            return;
+        };
+        match msg {
+            SubnetAdmissionMsg::Challenge { .. }
+            | SubnetAdmissionMsg::Verdict { .. }
+            | SubnetAdmissionMsg::Withdrawn { .. } => {
+                let nonce = msg.nonce();
+                if let Some((_, (_, tx))) = ctx
+                    .pending_subnet_admissions
+                    .remove_if(&nonce, |_, (expected, _)| *expected == from_node)
+                {
+                    let _ = tx.send(msg);
+                }
+            }
+            SubnetAdmissionMsg::ChallengeRequest { .. }
+            | SubnetAdmissionMsg::Present { .. }
+            | SubnetAdmissionMsg::Withdraw { .. } => {
+                if Self::is_auth_throttled(from_node, ctx) {
+                    return;
+                }
+                let Some(node) = ctx.self_weak.get().and_then(std::sync::Weak::upgrade) else {
+                    return;
+                };
+                let Ok(permit) = ctx.subnet_admission_permits.clone().try_acquire_owned() else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    node.serve_subnet_admission_leg(from_node, msg).await;
+                });
+            }
+        }
+    }
+
+    /// Verifier side of one admission leg: mint a challenge, or run the
+    /// unchanged `admit_subnet_session` on a presentation, and reply.
+    async fn serve_subnet_admission_leg(
+        &self,
+        from_node: u64,
+        msg: super::subnet::admission_wire::SubnetAdmissionMsg,
+    ) {
+        use super::subnet::admission_wire::{SubnetAdmissionMsg, SUBPROTOCOL_SUBNET_ADMISSION};
+        let reply = match msg {
+            SubnetAdmissionMsg::ChallengeRequest { nonce } => {
+                let issued = if self.subnet_authorities.is_empty() {
+                    None
+                } else {
+                    self.peer_session_id(from_node).and_then(|session_id| {
+                        self.issue_subnet_challenge(from_node)
+                            .map(|challenge| (session_id, challenge))
+                    })
+                };
+                match issued {
+                    Some((session_id, challenge)) => SubnetAdmissionMsg::Challenge {
+                        nonce,
+                        verifier: self.entity_id().clone(),
+                        session_id,
+                        challenge,
+                    },
+                    None => SubnetAdmissionMsg::Verdict {
+                        nonce,
+                        refusal: Some(SubnetAuthError::UnknownAuthority),
+                    },
+                }
+            }
+            SubnetAdmissionMsg::Present {
+                nonce,
+                presentation,
+                set,
+            } => SubnetAdmissionMsg::Verdict {
+                nonce,
+                refusal: self
+                    .admit_subnet_session(from_node, &presentation, &set)
+                    .err(),
+            },
+            // Self-withdrawal: `from_node` is the session peer, so it can
+            // drop only its own admission, and only the one it names.
+            SubnetAdmissionMsg::Withdraw {
+                nonce,
+                authority,
+                attachment,
+            } => SubnetAdmissionMsg::Withdrawn {
+                nonce,
+                dropped: self.subnet_contexts.forget_if_at(
+                    from_node,
+                    &authority,
+                    super::subnet::TopologySubnetId::from_raw(attachment),
+                ),
+            },
+            // Prover legs never reach here.
+            _ => return,
+        };
+        let _ = self
+            .send_subprotocol_to_node(from_node, SUBPROTOCOL_SUBNET_ADMISSION, &reply.encode())
+            .await;
+    }
+
+    /// Present `set` to `verifier_node` over the session for admission at
+    /// `target` with `rights` (V3-2 S1): request a challenge, sign the
+    /// session-, verifier- and challenge-bound presentation with this
+    /// node's entity key, and return the verifier's verdict. The leaf's
+    /// subject must be this node's entity.
+    pub async fn present_subnet_credentials(
+        &self,
+        verifier_node: u64,
+        set: &super::subnet::SubnetCredentialSet,
+        target: super::subnet::SubnetRef,
+        rights: super::subnet::SubnetRights,
+        timeout: Duration,
+    ) -> Result<(), super::subnet::admission_wire::SubnetAdmissionError> {
+        use super::subnet::admission_wire::{SubnetAdmissionError, SubnetAdmissionMsg};
+        if self.peer_session_id(verifier_node).is_none() {
+            return Err(SubnetAdmissionError::NoSession);
+        }
+        let per_leg = timeout / 2;
+        let challenge = self
+            .subnet_admission_leg(verifier_node, per_leg, |nonce| {
+                SubnetAdmissionMsg::ChallengeRequest { nonce }
+            })
+            .await?;
+        let (verifier, session_id, challenge) = match challenge {
+            SubnetAdmissionMsg::Challenge {
+                verifier,
+                session_id,
+                challenge,
+                ..
+            } => (verifier, session_id, challenge),
+            SubnetAdmissionMsg::Verdict {
+                refusal: Some(e), ..
+            } => return Err(SubnetAdmissionError::Refused(e)),
+            _ => return Err(SubnetAdmissionError::Local("unexpected reply".into())),
+        };
+        let presentation = super::subnet::SubnetAuthPresentation::try_issue(
+            self.entity_keypair(),
+            set.credential_set_hash(),
+            session_id,
+            verifier,
+            challenge,
+            target,
+            rights,
+        )
+        .map_err(|e| SubnetAdmissionError::Local(e.to_string()))?;
+        let verdict = self
+            .subnet_admission_leg(verifier_node, per_leg, |nonce| {
+                SubnetAdmissionMsg::Present {
+                    nonce,
+                    presentation: Box::new(presentation.clone()),
+                    set: Box::new(set.clone()),
+                }
+            })
+            .await?;
+        match verdict {
+            SubnetAdmissionMsg::Verdict { refusal: None, .. } => Ok(()),
+            SubnetAdmissionMsg::Verdict {
+                refusal: Some(e), ..
+            } => Err(SubnetAdmissionError::Refused(e)),
+            _ => Err(SubnetAdmissionError::Local("unexpected reply".into())),
+        }
+    }
+
+    /// Withdraw this node's own admission at exactly `target` from
+    /// `verifier_node` (V3-2B subnet leave). `Ok(dropped)` is the verifier's
+    /// acknowledgement that no admission of this node remains there on this
+    /// session (`dropped` says whether one was held). Advisory: it revokes
+    /// nothing, and a verifier that predates withdrawal answers nothing
+    /// ([`SubnetAdmissionError::Timeout`]).
+    ///
+    /// [`SubnetAdmissionError::Timeout`]: super::subnet::admission_wire::SubnetAdmissionError::Timeout
+    pub async fn withdraw_own_subnet_admission(
+        &self,
+        verifier_node: u64,
+        target: &super::subnet::SubnetRef,
+        timeout: Duration,
+    ) -> Result<bool, super::subnet::admission_wire::SubnetAdmissionError> {
+        use super::subnet::admission_wire::{SubnetAdmissionError, SubnetAdmissionMsg};
+        if self.peer_session_id(verifier_node).is_none() {
+            return Err(SubnetAdmissionError::NoSession);
+        }
+        let (authority, attachment) = (target.authority.clone(), target.path.raw());
+        let reply = self
+            .subnet_admission_leg(verifier_node, timeout, |nonce| {
+                SubnetAdmissionMsg::Withdraw {
+                    nonce,
+                    authority: authority.clone(),
+                    attachment,
+                }
+            })
+            .await?;
+        match reply {
+            SubnetAdmissionMsg::Withdrawn { dropped, .. } => Ok(dropped),
+            _ => Err(SubnetAdmissionError::Local("unexpected reply".into())),
+        }
+    }
+
+    /// One admission leg with retransmission of the same correlation
+    /// nonce (the control plane is fire-and-forget UDP). The pending entry
+    /// is removed on every exit path, including cancellation.
+    async fn subnet_admission_leg(
+        &self,
+        verifier_node: u64,
+        budget: Duration,
+        build: impl Fn(u64) -> super::subnet::admission_wire::SubnetAdmissionMsg,
+    ) -> Result<
+        super::subnet::admission_wire::SubnetAdmissionMsg,
+        super::subnet::admission_wire::SubnetAdmissionError,
+    > {
+        use super::subnet::admission_wire::{
+            SubnetAdmissionError, SubnetAdmissionMsg, SUBPROTOCOL_SUBNET_ADMISSION,
+        };
+        let mut nonce_bytes = [0u8; 8];
+        getrandom::fill(&mut nonce_bytes)
+            .map_err(|e| SubnetAdmissionError::Local(format!("nonce: {e}")))?;
+        let nonce = u64::from_le_bytes(nonce_bytes);
+        let bytes = build(nonce).encode();
+        let (tx, mut rx) = oneshot::channel::<SubnetAdmissionMsg>();
+        struct PendingLeg {
+            map: Arc<DashMap<u64, (u64, oneshot::Sender<SubnetAdmissionMsg>)>>,
+            nonce: u64,
+        }
+        impl Drop for PendingLeg {
+            fn drop(&mut self) {
+                self.map.remove(&self.nonce);
+            }
+        }
+        let _pending = PendingLeg {
+            map: self.pending_subnet_admissions.clone(),
+            nonce,
+        };
+        self.pending_subnet_admissions
+            .insert(nonce, (verifier_node, tx));
+        const ATTEMPTS: u32 = 3;
+        let per_attempt = budget / ATTEMPTS;
+        for _ in 0..ATTEMPTS {
+            self.send_subprotocol_to_node(verifier_node, SUBPROTOCOL_SUBNET_ADMISSION, &bytes)
+                .await
+                .map_err(|e| SubnetAdmissionError::Local(e.to_string()))?;
+            match tokio::time::timeout(per_attempt, &mut rx).await {
+                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Err(_)) => {
+                    return Err(SubnetAdmissionError::Local("reply channel closed".into()))
+                }
+                Err(_) => continue,
+            }
+        }
+        Err(SubnetAdmissionError::Timeout)
     }
 
     /// Dispatch one leg of the identity-proof exchange
@@ -34655,7 +36192,8 @@ impl MeshNode {
         let Some(peer_entry) = ctx.peers.get(&to_node) else {
             return;
         };
-        let dest_addr = peer_entry.value().addr();
+        let route = peer_entry.value().wire_route(ctx.local_node_id);
+        let dest_addr = route.addr;
         if ctx.partition_filter.contains(&dest_addr) {
             return;
         }
@@ -34680,7 +36218,7 @@ impl MeshNode {
                 PacketFlags::NONE,
                 SUBPROTOCOL_IDENTITY_PROOF,
             );
-            let _ = sink.send(&packet, dest_addr).await;
+            let _ = sink.send(&route.frame(&packet), dest_addr).await;
         });
     }
 
@@ -37911,6 +39449,57 @@ impl MeshNode {
             .map_err(|e| AdapterError::Connection(format!("transit probe failed: {e}")))
     }
 
+    /// Test-only: a transit probe whose INNER is sealed with the
+    /// session this node shares with `dest_node_id` (#20's leg (d)).
+    ///
+    /// [`Self::send_transit_probe_for_test`] seals with the VIA
+    /// session, so a relayed probe is undecryptable at the third
+    /// party and "an acted-on transit probe is relayed" has no
+    /// RECEIPT observable there. This form keeps the identical
+    /// routed shape — sent over the `via_node_id` session's address,
+    /// `dest_node_id` in the routing header — but seals the inner
+    /// with the destination session, so an acted-on relay produces a
+    /// real third-party receipt the witness can assert, and refute.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub async fn send_deliverable_transit_probe_for_test(
+        &self,
+        via_node_id: u64,
+        dest_node_id: u64,
+    ) -> Result<(), AdapterError> {
+        let addr = self
+            .peers
+            .get(&via_node_id)
+            .map(|e| e.value().addr())
+            .ok_or_else(|| AdapterError::Connection("no session with the anchor".into()))?;
+        let session = self
+            .peers
+            .get(&dest_node_id)
+            .map(|e| e.value().session.clone())
+            .ok_or_else(|| AdapterError::Connection("no session with the destination".into()))?;
+        let stream_id = 0x0F00u64;
+        let seq = {
+            let stream = session.get_or_create_stream(stream_id);
+            stream.next_tx_seq()
+        };
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
+        let inner = builder.build(
+            stream_id,
+            seq,
+            &[Bytes::from_static(b"transit")],
+            PacketFlags::NONE,
+        );
+        let routing = RoutingHeader::new(dest_node_id, self.node_id as u32, 8);
+        let mut routed = bytes::BytesMut::with_capacity(ROUTING_HEADER_SIZE + inner.len());
+        routed.extend_from_slice(&routing.to_bytes());
+        routed.extend_from_slice(&inner);
+        self.sink
+            .send(&routed, addr)
+            .await
+            .map(|_| ())
+            .map_err(|e| AdapterError::Connection(format!("transit probe failed: {e}")))
+    }
+
     /// Test-only view of the corrective-announce claim, so the
     /// §12 witness can assert the guard rather than the flood.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -37989,10 +39578,7 @@ impl MeshNode {
             else {
                 return true;
             };
-            budget
-                .charge_enroll_request()
-                .and_then(|()| budget.reserve_enrollment())
-                .is_err()
+            budget.admit_enroll_request().is_err()
         };
         if refused {
             if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
@@ -39154,7 +40740,19 @@ impl MeshNode {
         // and publish discovery state for a peer that has not
         // enrolled — S0e §3 row 12.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 4 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate.
+            // Skipping it let an announcement dispatched concurrently with
+            // the peer-map eviction be ingested and re-flooded mesh-wide,
+            // reinstating the TOFU identity pin the eviction had just
+            // cleared: gate 4's exact prohibition. Counted under its own
+            // reason (#11).
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_announce();
+                return;
+            };
             if !Self::admission_gate_announce(&endpoint, ctx) {
                 return;
             }
@@ -39447,6 +41045,22 @@ impl MeshNode {
             // signature remains valid because `signed_payload()`
             // zeros `hop_count` on verify.
             let fwd_bytes = forwarded.to_bytes();
+            // Only a signature-verified announcement is kept for replay:
+            // replay must carry origin authentication, not a forwarder's
+            // say-so. A newer version supersedes (withdrawal is a newer
+            // announcement without the capability).
+            if signature_verified {
+                match ctx.relay_announcements.entry(ann.node_id) {
+                    dashmap::mapref::entry::Entry::Occupied(mut held) => {
+                        if held.get().version < forwarded.version {
+                            held.insert(forwarded);
+                        }
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(slot) => {
+                        slot.insert(forwarded);
+                    }
+                }
+            }
             Self::forward_capability_announcement(fwd_bytes, ann.node_id, from_node, ctx);
         }
 
@@ -39602,7 +41216,19 @@ impl MeshNode {
         // v1 browser scope, but the forwarding gate is not selective
         // about which announcement kind it refuses to carry.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 1 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate: an
+            // unresolvable endpoint is the eviction race, and skipping the
+            // gate is exactly what the gate exists to prevent. The refusal
+            // is counted under its own reason (#11): a frame refused here
+            // and a frame refused by the policy below are different
+            // operational facts.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_forward();
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
@@ -39656,7 +41282,20 @@ impl MeshNode {
         // Gate 4 already refuses to ingest it; this refuses to be
         // its megaphone.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(sender_node_id, ctx) {
+        {
+            // §12 gate 1 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate: an
+            // unresolvable endpoint is the eviction race, and skipping the
+            // gate is exactly what the gate exists to prevent. A sender
+            // entry vanishing between gate 4's `endpoint_of` and this
+            // flood gate's lookup must not re-flood the announcement to
+            // every peer (§12 F5's megaphone). Counted under its own
+            // reason (#11).
+            let Some(endpoint) = Self::endpoint_of(sender_node_id, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_forward();
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
@@ -39713,6 +41352,80 @@ impl MeshNode {
         });
     }
 
+    /// Replay every held announcement of another origin to `peer` (a
+    /// session just established): each still unexpired by its origin's
+    /// own signed timestamp, sent exactly as this node forwards it, so
+    /// the origin's signature is what authenticates it. The peer's own
+    /// announcement is never echoed back to it.
+    async fn replay_relay_announcements(
+        peer: u64,
+        relay: Arc<DashMap<u64, CapabilityAnnouncement>>,
+        peers: Arc<DashMap<u64, PeerInfo>>,
+        sink: PeerSink,
+    ) {
+        // The peer installs the session only once it has processed the
+        // handshake reply; frames that overtake that are dropped. Replay
+        // after a short settle, and once more later — the receiver dedups
+        // on (origin, version), so the second pass costs it nothing.
+        for settle in REPLAY_SETTLE {
+            tokio::time::sleep(settle).await;
+            Self::replay_relay_announcements_once(peer, &relay, &peers, &sink).await;
+        }
+    }
+
+    async fn replay_relay_announcements_once(
+        peer: u64,
+        relay: &DashMap<u64, CapabilityAnnouncement>,
+        peers: &DashMap<u64, PeerInfo>,
+        sink: &PeerSink,
+    ) {
+        let held: Vec<Vec<u8>> = relay
+            .iter()
+            .filter(|e| *e.key() != peer && !e.value().is_expired())
+            .map(|e| e.value().to_bytes())
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        let Some(recipient) = peers.get(&peer).map(|p| PeerRecipient {
+            addr: p.addr(),
+            session: p.session.clone(),
+        }) else {
+            return;
+        };
+        for payload in held {
+            let session = &recipient.session;
+            let stream_id = SUBPROTOCOL_CAPABILITY_ANN as u64;
+            let pool = session.thread_local_pool();
+            let mut builder = pool.get();
+            let events = vec![Bytes::from(payload)];
+            let debit = outbound_subprotocol_tx_seq(
+                session,
+                stream_id,
+                SUBPROTOCOL_CAPABILITY_ANN,
+                &events,
+            );
+            let packet = builder.build_subprotocol(
+                stream_id,
+                debit.seq(),
+                &events,
+                PacketFlags::NONE,
+                SUBPROTOCOL_CAPABILITY_ANN,
+            );
+            if send_datagram(sink, &packet, recipient.addr).await.is_ok() {
+                debit.commit();
+            }
+            drop(builder);
+            session.touch();
+        }
+    }
+
+    /// The announcements this node holds for replay to newly attached
+    /// peers, by origin node id (tests / diagnostics).
+    pub fn relay_announcements_len(&self) -> usize {
+        self.relay_announcements.len()
+    }
+
     /// Coordinator-side handler for a `PunchRequest` from peer A
     /// (who wants to punch to target B).
     ///
@@ -39746,7 +41459,19 @@ impl MeshNode {
         // the requester. A provisional session does not get to ask
         // this anchor to introduce it to anybody.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 1 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate: an
+            // unresolvable endpoint is the eviction race, and skipping the
+            // gate is exactly what the gate exists to prevent. The refusal
+            // is counted under its own reason (#11): a frame refused here
+            // and a frame refused by the policy below are different
+            // operational facts.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_forward();
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
@@ -40382,15 +42107,36 @@ impl MeshNode {
         // always checked `from_node`; the two arms are now
         // equivalent.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 1 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate: an
+            // unresolvable endpoint is the eviction race, and skipping the
+            // gate is exactly what the gate exists to prevent. The refusal
+            // is counted under its own reason (#11): a frame refused here
+            // and a frame refused by the policy below are different
+            // operational facts.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_forward();
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
         }
         // The destination's own admission still applies: an
-        // unenrolled peer is not a relay *target* either.
+        // unenrolled peer is not a relay *target* either — and an
+        // entry-absent-at-check/present-at-get destination must not
+        // become a relay to a just-installed unenrolled target, so
+        // this arm FAILS CLOSED exactly like the sender arm above
+        // (#1). Counted under its own reason (#11).
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(ack.to_peer, ctx) {
+        {
+            let Some(endpoint) = Self::endpoint_of(ack.to_peer, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_forward();
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
@@ -41229,7 +42975,8 @@ impl MeshNode {
         let Some(peer_entry) = ctx.peers.get(&to_node) else {
             return;
         };
-        let dest_addr = peer_entry.value().addr();
+        let route = peer_entry.value().wire_route(ctx.local_node_id);
+        let dest_addr = route.addr;
         if ctx.partition_filter.contains(&dest_addr) {
             return;
         }
@@ -41264,7 +43011,7 @@ impl MeshNode {
             // A discarded send error is still a send that did not
             // happen: commit only on acceptance, and let the drop
             // give the ack's bytes back otherwise.
-            if sink.send(&packet, dest_addr).await.is_ok() {
+            if sink.send(&route.frame(&packet), dest_addr).await.is_ok() {
                 debit.commit();
             }
         });
@@ -41778,6 +43525,18 @@ impl MeshNode {
         reliable: bool,
         events: &[Bytes],
     ) -> Result<(), AdapterError> {
+        // Test-only park point (see `arm_publish_park`): this await is the
+        // gap the `register_large` cleanup guard must survive.
+        #[cfg(test)]
+        {
+            let parked = self.publish_park.lock().clone();
+            if let Some((park_stream, arrived)) = parked {
+                if park_stream == stream_id {
+                    arrived.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
         match self
             .try_publish_to_peer(peer_node_id, channel_hash, stream_id, reliable, events)
             .await
@@ -41811,10 +43570,47 @@ impl MeshNode {
         reliable: bool,
         events: &[Bytes],
     ) -> PeerPublishOutcome {
-        let (dest_addr, session) = match self.peers.get(&peer_node_id) {
-            Some(p) => (p.value().addr(), p.value().session.clone()),
+        self.try_publish_to_peer_bound(
+            peer_node_id,
+            channel_hash,
+            stream_id,
+            reliable,
+            events,
+            None,
+        )
+        .await
+    }
+
+    /// Fragment sends may wait for credit, but must stay on the request's session.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn try_publish_to_peer_bound(
+        &self,
+        peer_node_id: u64,
+        channel_hash: ChannelHash,
+        stream_id: u64,
+        reliable: bool,
+        events: &[Bytes],
+        fragment_session: Option<u64>,
+    ) -> PeerPublishOutcome {
+        let (dest_addr, session, route) = match self.peers.get(&peer_node_id) {
+            Some(p) => (
+                p.value().addr(),
+                p.value().session.clone(),
+                p.value().wire_route(self.node_id),
+            ),
             None => return PeerPublishOutcome::NoSession,
         };
+
+        // This path builds ONE packet, unlike the batching/fragmenting stream
+        // sender. Refuse before opening a stream or charging credit: otherwise
+        // the socket can report success for a datagram the peer cannot receive.
+        let payload_bytes: usize = events.iter().map(|e| EventFrame::LEN_SIZE + e.len()).sum();
+        if payload_bytes > protocol::MAX_PAYLOAD_SIZE {
+            return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                "publish payload of {payload_bytes} bytes exceeds the {}-byte single-packet limit; nothing was sent",
+                protocol::MAX_PAYLOAD_SIZE,
+            )));
+        }
 
         if self.partition_filter.contains(&dest_addr) {
             return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
@@ -41833,32 +43629,65 @@ impl MeshNode {
         // about to build. The `TxSlotGuard` refunds on Drop unless
         // we `commit()` after a successful socket send, so a failed
         // send doesn't strand credit.
-        let payload_bytes: usize = events.iter().map(|e| EventFrame::LEN_SIZE + e.len()).sum();
         let needed = wire_bytes_for_payload(payload_bytes);
-        let (guard, seq) = match session.try_acquire_tx_credit_guard(stream_id, needed) {
-            TxAdmit::Acquired { guard, seq } => (guard, seq),
-            TxAdmit::WindowFull => {
-                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                    "publish: stream {:#x} backpressured",
-                    stream_id
-                )));
+        let credit_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        // Bounded exponential backoff between credit attempts (review
+        // finding 9). This replaces a 1 ms fixed poll: per fragment that
+        // was up to 1 s of 1 ms wakeups while the caller holds one of the
+        // node-wide [`MeshNode::LARGE_RESPONSE_PUMP_SLOTS`] response
+        // pumps. Real credit-available notification is the review's
+        // preferred closure but needs a wake hook inside `StreamState`'s
+        // credit ledger (`net-mesh-wire`'s `wire/src/session.rs`:
+        // `refund_tx_credit` / `apply_authoritative_grant` /
+        // `refund_control_debit` are the only places credit grows, and
+        // that crate is outside this change's ownership) — recorded as a
+        // named follow-up. The cap keeps worst-case resume latency at one
+        // backoff interval; `fragment_wait_resumes_after_credit_refund`'s
+        // 300 ms bound fails any larger cap.
+        const BACKOFF_CAP: Duration = Duration::from_millis(32);
+        let mut credit_backoff = Duration::from_millis(1);
+        let (guard, seq) = loop {
+            if fragment_session.is_some_and(|expected| {
+                session.session_id() != expected
+                    || session.is_receive_lifetime_retired()
+                    || !self.rpc_session_is_live(peer_node_id, expected)
+            }) {
+                return PeerPublishOutcome::SendFailed(AdapterError::Connection(
+                    "RPC response session retired".into(),
+                ));
             }
-            TxAdmit::StreamClosed => {
-                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                    "publish: stream {:#x} closed",
-                    stream_id
-                )));
-            }
-            // `try_acquire_tx_credit_guard` carries no handle and so
-            // no incarnation to mismatch: the publish path resolved
-            // this `session` itself moments ago. Unreachable, and
-            // reported as the closed stream it effectively is rather
-            // than silently treated as success.
-            TxAdmit::SessionSuperseded => {
-                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                    "publish: stream {:#x} belongs to a superseded session",
-                    stream_id
-                )));
+            match session.try_acquire_tx_credit_guard(stream_id, needed) {
+                TxAdmit::Acquired { guard, seq } => break (guard, seq),
+                TxAdmit::WindowFull
+                    if fragment_session.is_some()
+                        && tokio::time::Instant::now() < credit_deadline =>
+                {
+                    tokio::time::sleep(credit_backoff).await;
+                    credit_backoff = (credit_backoff * 2).min(BACKOFF_CAP);
+                }
+                TxAdmit::WindowFull => {
+                    return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                        "publish: stream {:#x} backpressured",
+                        stream_id
+                    )));
+                }
+                TxAdmit::StreamClosed => {
+                    return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                        "publish: stream {:#x} closed",
+                        stream_id
+                    )));
+                }
+                // `try_acquire_tx_credit_guard` carries no handle and so
+                // no incarnation to mismatch: the publish path resolved
+                // this `session` itself moments ago. Unreachable, and
+                // reported as the closed stream it effectively is rather
+                // than silently treated as success.
+                TxAdmit::SessionSuperseded => {
+                    return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                        "publish: stream {:#x} belongs to a superseded session",
+                        stream_id
+                    )));
+                }
             }
         };
 
@@ -41914,13 +43743,20 @@ impl MeshNode {
             stream_id, seq, events, flags, 0, /* subprotocol_id 0 = event-plane */
         );
 
-        let next_hop = self
-            .router
-            .routing_table()
-            .lookup(peer_node_id)
-            .unwrap_or(dest_addr);
+        // A session that crosses a relay hop rides a routing header to its
+        // relay; otherwise the legacy next-hop choice stands.
+        let (wire, next_hop) = if route.header.is_some() {
+            (route.frame(&packet), route.addr)
+        } else {
+            let next_hop = self
+                .router
+                .routing_table()
+                .lookup(peer_node_id)
+                .unwrap_or(dest_addr);
+            (std::borrow::Cow::Borrowed(&packet[..]), next_hop)
+        };
 
-        if let Err(e) = self.sink.send(&packet, next_hop).await {
+        if let Err(e) = self.sink.send(&wire, next_hop).await {
             return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                 "publish send failed: {}",
                 e
@@ -42213,13 +44049,14 @@ impl MeshNode {
         // and on the FFI announce path (`net_mesh_announce_capabilities`,
         // which `block_on`s this fan-out) it wedges the calling C / cgo
         // thread with it.
-        let (peer_addr, session) = {
+        let (route, session) = {
             let peer = self
                 .peers
                 .get(&node_id)
                 .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
-            (peer.addr(), Arc::clone(&peer.session))
+            (peer.wire_route(self.node_id), Arc::clone(&peer.session))
         };
+        let peer_addr = route.addr;
         if self.partition_filter.contains(&peer_addr) {
             return Ok(());
         }
@@ -42264,7 +44101,7 @@ impl MeshNode {
             subprotocol_id,
         );
 
-        send_datagram(&self.sink, &packet, peer_addr).await?;
+        send_datagram(&self.sink, &route.frame(&packet), peer_addr).await?;
         debit.commit();
 
         drop(builder);
@@ -42819,7 +44656,11 @@ impl MeshNode {
                 let _g = self.traversal_publish_mu.lock();
                 let class =
                     NatClass::from_u8(self.nat_class.load(std::sync::atomic::Ordering::Acquire));
-                let reflex = self.reflex_addr.load_full().map(|arc| *arc);
+                let reflex = self
+                    .reflex_addr
+                    .load_full()
+                    .or_else(|| self.direct_hint.load_full())
+                    .map(|arc| *arc);
                 // Strip any prior `nat:*` tags before adding the fresh
                 // one so a reclassification doesn't leave a stale tag
                 // behind when the class transitions. Phase A.5.N.2:
@@ -42878,6 +44719,9 @@ impl MeshNode {
             {
                 broadcast_ann = broadcast_ann.with_reflex_addr(reflex_snapshot);
             }
+            if self.config.announce_noise_key {
+                broadcast_ann = broadcast_ann.with_noise_pubkey(Some(*self.public_key()));
+            }
             // Stage 4a §5 Layer 1: the RTC discovery fields, each
             // emitted only when the operator configured the thing it
             // describes. A node without `rtc` sets none of them and
@@ -42920,6 +44764,9 @@ impl MeshNode {
                     #[cfg(feature = "nat-traversal")]
                     {
                         a = a.with_reflex_addr(reflex_snapshot);
+                    }
+                    if self.config.announce_noise_key {
+                        a = a.with_noise_pubkey(Some(*self.public_key()));
                     }
                     #[cfg(feature = "webrtc")]
                     {
@@ -44407,7 +46254,6 @@ impl MeshNode {
     /// The peer's announced Noise static key, if it published one
     /// (plan §5 Layer 1) — the key `connect_via` needs and a
     /// browser has no out-of-band way to obtain.
-    #[cfg(feature = "webrtc")]
     pub fn peer_announced_noise_pubkey(&self, peer_node_id: u64) -> Option<[u8; 32]> {
         self.capability_fold.with_state(|state| {
             let keys = state.by_node.get(&peer_node_id)?;
@@ -45591,6 +47437,41 @@ impl MeshNode {
     /// side effect of the capability plane; see
     /// `ensure_reply_subscription` for how the H3 origin binding gets
     /// the pin it needs instead.
+    /// Replay held announcements of other origins to a newly attached
+    /// peer, off the caller's path (see [`Self::replay_relay_announcements`]).
+    fn spawn_relay_replay(&self, peer_node_id: u64) {
+        let (relay, peers, sink) = (
+            self.relay_announcements.clone(),
+            self.peers.clone(),
+            self.sink.clone(),
+        );
+        tokio::spawn(Self::replay_relay_announcements(
+            peer_node_id,
+            relay,
+            peers,
+            sink,
+        ));
+    }
+
+    /// [`Self::push_local_announcement`] for a session installed by a
+    /// routed handshake across a blind relay, after the settle a routed peer needs to install
+    /// its end (frames that overtake it are dropped). Needs a started
+    /// node; a bare one waits for the re-announce instead. The task holds
+    /// only a `Weak` across the settle, never a strong ref: a node its
+    /// owner drops must not outlive that drop (the same contract as the
+    /// background loops).
+    fn spawn_routed_announcement_push(&self, peer_node_id: u64) {
+        let Some(weak) = self.self_weak.get().cloned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(REPLAY_SETTLE[0]).await;
+            if let Some(node) = weak.upgrade() {
+                node.push_local_announcement(peer_node_id).await;
+            }
+        });
+    }
+
     async fn push_local_announcement(&self, peer_node_id: u64) {
         // Serialized through the epoch-checked path (review-9
         // addendum): a late joiner must receive what this node's
@@ -46864,7 +48745,7 @@ impl MeshNode {
         relay_addr: PeerAddr,
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
-    ) -> Result<(SessionKeys, [u8; 32]), AdapterError> {
+    ) -> Result<(SessionKeys, [u8; 32], u8), AdapterError> {
         // Build msg1. Prologue uses *routing-identity* (32-bit) versions
         // of (self, dest) — that's what a malicious relay could see and
         // rewrite in the routing header, so binding those bits into the
@@ -46898,6 +48779,11 @@ impl MeshNode {
                 v.insert(PendingHandshake { noise, tx });
             }
         }
+        let mut pending = PendingInitiator {
+            map: &self.pending_handshakes,
+            key: pending_key,
+            rx,
+        };
 
         // Wrap msg1 in a Net handshake packet + routing header and
         // send to the first hop. No session encryption — the handshake
@@ -46917,21 +48803,22 @@ impl MeshNode {
         }
 
         // Wait for the dispatch loop to complete msg2.
-        let established = match tokio::time::timeout(self.config.handshake_timeout, rx).await {
-            Ok(Ok(Ok(k))) => k,
-            Ok(Ok(Err(e))) => {
-                self.pending_handshakes.remove(&pending_key);
-                return Err(AdapterError::Fatal(format!("handshake failed: {}", e)));
-            }
-            Ok(Err(_)) => {
-                self.pending_handshakes.remove(&pending_key);
-                return Err(AdapterError::Connection("handshake channel dropped".into()));
-            }
-            Err(_) => {
-                self.pending_handshakes.remove(&pending_key);
-                return Err(AdapterError::Connection("handshake timeout".into()));
-            }
-        };
+        let established =
+            match tokio::time::timeout(self.config.handshake_timeout, &mut pending.rx).await {
+                Ok(Ok(Ok(k))) => k,
+                Ok(Ok(Err(e))) => {
+                    self.pending_handshakes.remove(&pending_key);
+                    return Err(AdapterError::Fatal(format!("handshake failed: {}", e)));
+                }
+                Ok(Err(_)) => {
+                    self.pending_handshakes.remove(&pending_key);
+                    return Err(AdapterError::Connection("handshake channel dropped".into()));
+                }
+                Err(_) => {
+                    self.pending_handshakes.remove(&pending_key);
+                    return Err(AdapterError::Connection("handshake timeout".into()));
+                }
+            };
         Ok(established)
     }
 
@@ -46960,6 +48847,21 @@ impl MeshNode {
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
     ) -> Result<u64, AdapterError> {
+        self.connect_via_endpoint(PeerAddr::Udp(relay_addr), dest_pubkey, dest_node_id)
+            .await
+    }
+
+    /// [`Self::connect_via`] through any endpoint kind — in particular a
+    /// channel on a blind relay (`PeerAddr::Relayed`, from
+    /// `Self::relay_bind`), whose datagrams the sink frames for the relay
+    /// and the receive loop unwraps. The session still authenticates the far
+    /// endpoint end-to-end; the relay only forwards ciphertext.
+    pub async fn connect_via_endpoint(
+        &self,
+        via: PeerAddr,
+        dest_pubkey: &[u8; 32],
+        dest_node_id: u64,
+    ) -> Result<u64, AdapterError> {
         // Retry the msg1-send + msg2-await `handshake_retries` times.
         // Routed handshakes ride a UDP relay path that can drop msg1 or
         // msg2 independently; a single packet loss should not surface as
@@ -46975,10 +48877,10 @@ impl MeshNode {
         // `accept()`, which stops listening after its first success, so
         // there a fresh `msg1` asks a question nobody will answer.
         let mut attempt = 0;
-        let (keys, handshake_hash) = loop {
+        let (keys, handshake_hash, hops) = loop {
             attempt += 1;
             match self
-                .try_connect_via_once(PeerAddr::Udp(relay_addr), dest_pubkey, dest_node_id)
+                .try_connect_via_once(via, dest_pubkey, dest_node_id)
                 .await
             {
                 Ok(established) => break established,
@@ -47002,13 +48904,94 @@ impl MeshNode {
         // for the direct-handshake-only bookkeeping.
         self.install_routed(
             dest_node_id,
-            PeerAddr::Udp(relay_addr),
+            via,
             keys,
             Some(handshake_hash),
             None,
+            hops > 0,
         );
+        // A peer behind a BLIND relay learns this node's own announcement
+        // (its direct hint included) now rather than at the next
+        // re-announce: the relay is not a mesh member, so nothing floods
+        // between the two ends. A mesh relay floods it already, and pushing
+        // there too was found to stall the RTC upgrade dialog
+        // (`rtc_classifier::an_ice_pair_schedules_the_upgrade_attempt`).
+        if matches!(via, PeerAddr::Relayed { .. }) {
+            self.spawn_routed_announcement_push(dest_node_id);
+        }
 
         Ok(dest_node_id)
+    }
+
+    /// The client for `relay`, created on first use. Its datagrams are
+    /// recognised by the receive loop from then on.
+    #[cfg(feature = "nat-traversal")]
+    fn relay_client(&self, relay: SocketAddr) -> Arc<super::traversal::blind_relay::RelayClient> {
+        self.relay_clients
+            .entry(relay)
+            .or_insert_with(|| {
+                Arc::new(super::traversal::blind_relay::RelayClient::new(
+                    relay,
+                    self.sink.udp_socket().clone(),
+                    self.sink.relay_tunnels().clone(),
+                    self.relay_tunnel_ingress.clone(),
+                ))
+            })
+            .clone()
+    }
+
+    /// Register this node with a blind relay, from its own mesh socket, so
+    /// joiners that hold the returned registration id can reach it through
+    /// the relay. The registration — and the NAT mapping it rides — is
+    /// refreshed in the background until the returned handle is dropped.
+    /// The relay never learns the PSK or any credential.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn relay_register(
+        &self,
+        relay: SocketAddr,
+    ) -> Result<super::traversal::blind_relay::RelayRegistration, AdapterError> {
+        let client = self.relay_client(relay);
+        let keypair = self.entity_keypair_arc();
+        let (id, ttl) = client
+            .register(&keypair)
+            .await
+            .map_err(|e| AdapterError::Connection(format!("relay {relay}: {e}")))?;
+        let refresh = (ttl / 3).max(Duration::from_secs(5));
+        let refresher = client.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(refresh).await;
+                if let Err(e) = refresher.register(&keypair).await {
+                    tracing::warn!(%relay, error = %e, "blind relay registration refresh failed");
+                }
+            }
+        });
+        Ok(super::traversal::blind_relay::RelayRegistration::new(
+            client, id, task,
+        ))
+    }
+
+    /// Whether this node reaches `relay` through a TCP tunnel right now (its
+    /// UDP to the relay went unanswered).
+    #[cfg(feature = "nat-traversal")]
+    pub fn relay_tunneled(&self, relay: SocketAddr) -> bool {
+        self.sink.relay_tunnels().contains(&relay)
+    }
+
+    /// Open a channel to registration `id` on `relay`; the returned relayed
+    /// endpoint is used with [`Self::connect_via_endpoint`].
+    #[cfg(feature = "nat-traversal")]
+    pub async fn relay_bind(
+        &self,
+        relay: SocketAddr,
+        id: super::traversal::blind_relay::RegistrationId,
+    ) -> Result<PeerAddr, AdapterError> {
+        let channel = self
+            .relay_client(relay)
+            .bind(id)
+            .await
+            .map_err(|e| AdapterError::Connection(format!("relay {relay}: {e}")))?;
+        Ok(PeerAddr::Relayed { relay, channel })
     }
 
     /// Handshake to `target_addr` and install the resulting session
@@ -47037,7 +49020,7 @@ impl MeshNode {
         direct: bool,
     ) -> Result<bool, AdapterError> {
         let mut attempt = 0;
-        let (keys, handshake_hash) = loop {
+        let (keys, handshake_hash, hops) = loop {
             attempt += 1;
             match self
                 .try_connect_via_once(PeerAddr::Udp(target_addr), dest_pubkey, dest_node_id)
@@ -47067,6 +49050,7 @@ impl MeshNode {
                 keys,
                 Some(handshake_hash),
                 expected,
+                hops > 0,
             )
         };
         Ok(outcome.owned)
@@ -47256,7 +49240,7 @@ impl MeshNode {
                 v.addr(),
                 v.session.session_id(),
                 v.remote_static_pub,
-                v.session.has_open_streams() || v.session.has_unacked(),
+                session_is_busy(&v.session),
             )
         }) else {
             return;
@@ -47425,8 +49409,7 @@ impl MeshNode {
     /// redundant `peers.get` shard-lookup on the map it is iterating.
     #[cfg(feature = "nat-traversal")]
     fn upgrade_is_loop_candidate_at(&self, peer_id: u64, addr: PeerAddr) -> bool {
-        // C1: only the lower-node-id end initiates.
-        if self.node_id >= peer_id {
+        if !self.upgrade_initiates_for(peer_id) {
             return false;
         }
         // Relay-routed only — a direct session has nothing to upgrade.
@@ -47434,6 +49417,41 @@ impl MeshNode {
             return false;
         }
         self.upgrade_should_attempt(peer_id)
+    }
+
+    /// C1, made total: exactly one end of a pair initiates its upgrade,
+    /// decided from the same two announcements at both ends.
+    ///
+    /// The higher node id CLAIMS the upgrade when it announces no address
+    /// itself (so the lower end has nothing to dial), the lower end
+    /// announced one, and the pair's action is a plain direct connect: an
+    /// enrolled device behind a NAT dialling its operator's announced
+    /// address. Otherwise the lower node id initiates, as before (C1).
+    /// Both ends evaluate the same claim (the pair matrix is symmetric),
+    /// so they disagree only while an announcement is in flight, and the
+    /// compare-and-swap install (C2) settles that race.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_initiates_for(&self, peer_id: u64) -> bool {
+        use super::traversal::classify::PairAction;
+        let mine = self.announced_reflex().is_some();
+        let theirs = self.peer_reflex_addr(peer_id).is_some();
+        let lower = self.node_id < peer_id;
+        let (higher_announced, lower_announced) = if lower {
+            (theirs, mine)
+        } else {
+            (mine, theirs)
+        };
+        let higher_claims = !higher_announced
+            && lower_announced
+            && self.pair_action_for(peer_id) == PairAction::Direct;
+        lower != higher_claims
+    }
+
+    /// Test hook for [`Self::upgrade_initiates_for`].
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn upgrade_initiates_for_test(&self, peer_id: u64) -> bool {
+        self.upgrade_initiates_for(peer_id)
     }
 
     /// Test hook for [`Self::upgrade_is_loop_candidate`] — lets
@@ -47579,6 +49597,58 @@ impl MeshNode {
                 }
             }
         })
+    }
+
+    /// Make sure this node holds a live, endpoint-authenticated session
+    /// with `target` before talking to it (V3 decision 1): a node learned
+    /// through a hub is reachable even though no session was ever opened.
+    ///
+    /// - A live session already held: [`SessionPath::Existing`].
+    /// - Otherwise the target's Noise static key is read from ITS OWN
+    ///   signed capability announcement (see
+    ///   [`MeshNodeConfig::announce_noise_key`]); without one there is
+    ///   nothing to authenticate the session against, and this fails.
+    /// - Direct first: when the target announced an address this node can
+    ///   dial (its reflex address), a direct handshake is tried with half
+    ///   the budget — "no session" is not proof that direct is impossible.
+    /// - Relay fallback: a routed handshake through the hop the target's
+    ///   forwarded announcement installed ([`Self::connect_routed`]).
+    ///
+    /// Either way the handshake authenticates the target's static key end
+    /// to end; the hub relays opaque frames. Nothing is invoked here, and
+    /// nothing runs under the hub's identity.
+    pub async fn ensure_session(
+        &self,
+        target: u64,
+        budget: Duration,
+    ) -> Result<SessionPath, AdapterError> {
+        if self.peers.contains_key(&target) && !self.peer_session_is_silent(target) {
+            return Ok(SessionPath::Existing);
+        }
+        let key = self.peer_announced_noise_pubkey(target).ok_or_else(|| {
+            AdapterError::Connection(format!(
+                "no session with {target:#x} and it announced no Noise key to open one with"
+            ))
+        })?;
+        let deadline = tokio::time::Instant::now() + budget;
+        #[cfg(feature = "nat-traversal")]
+        if let Some(addr) = self.peer_reflex_addr(target) {
+            // A bounded slice: an unreachable announced address must not
+            // spend the budget the relay fallback needs.
+            let direct = (budget / 2).min(DIRECT_ATTEMPT_MAX);
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(direct, self.connect_via(addr, &key, target)).await
+            {
+                return Ok(SessionPath::Direct);
+            }
+        }
+        match tokio::time::timeout_at(deadline, self.connect_routed(&key, target)).await {
+            Ok(Ok(_)) => Ok(SessionPath::Relayed),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(AdapterError::Connection(format!(
+                "no session with {target:#x} within {budget:?}"
+            ))),
+        }
     }
 
     /// Connect to a peer by node id, using the routing table to pick the
@@ -48345,6 +50415,30 @@ impl MeshNode {
         self.invalidate_broadcast_window();
     }
 
+    /// Set (or clear) this node's direct-path hint (see the `direct_hint`
+    /// field) and republish the current capability baseline so peers see
+    /// it. The hint is announced only while no reflex was observed or
+    /// overridden; the NAT class is untouched.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn set_direct_hint(&self, hint: Option<SocketAddr>) -> Result<(), AdapterError> {
+        {
+            let _g = self.traversal_publish_mu.lock();
+            self.direct_hint.store(hint.map(Arc::new));
+            self.invalidate_broadcast_window();
+        }
+        self.reannounce_current_capabilities().await
+    }
+
+    /// The address this node currently announces as its reflex: an
+    /// observed or overridden reflex, else its direct hint.
+    #[cfg(feature = "nat-traversal")]
+    fn announced_reflex(&self) -> Option<SocketAddr> {
+        self.reflex_addr
+            .load_full()
+            .or_else(|| self.direct_hint.load_full())
+            .map(|arc| *arc)
+    }
+
     /// Drop a previously-installed runtime reflex override. The
     /// classifier sweep resumes on its normal cadence; the next
     /// sweep repopulates `reflex_addr` and `nat_class` from real
@@ -48916,14 +51010,21 @@ impl Adapter for MeshNode {
         // Send to the first connected peer. For a real mesh, this should
         // use the routing table to pick the right peer based on the
         // event's destination. For now, round-robin or first-match.
-        let peer_addr = self
+        //
+        // By NODE ID, through the total `PeerAddr` match — not by a
+        // `udp()` address. After the `PeerAddr` refactor `.udp()` is
+        // `None` for RTC and routed-RTC peers, and DashMap iteration
+        // order is unspecified, so picking by `udp()` failed this
+        // publish flakically ("no peers connected" with peers on the
+        // map) and could never deliver to an RTC peer at all.
+        let node = self
             .peers
             .iter()
             .next()
-            .and_then(|e| e.value().addr().udp())
+            .map(|e| *e.key())
             .ok_or_else(|| AdapterError::Connection("no peers connected".into()))?;
 
-        self.send_to_peer(peer_addr, &batch).await
+        self.send_to_peer_node(node, &batch).await
     }
 
     async fn flush(&self) -> Result<(), AdapterError> {
@@ -51021,6 +53122,7 @@ mod heartbeat_aead_tests {
                 transport: PeerTransport::Routed {
                     relay,
                     adjacent_relay_identity: None,
+                    transit: false,
                 },
                 session: fresh_session,
                 remote_static_pub: [0u8; 32],
@@ -51119,6 +53221,7 @@ mod heartbeat_aead_tests {
                 transport: PeerTransport::Routed {
                     relay,
                     adjacent_relay_identity: None,
+                    transit: false,
                 },
                 session,
                 remote_static_pub: [0u8; 32],
@@ -51320,14 +53423,14 @@ mod heartbeat_aead_tests {
         let relay_addr: PeerAddr = PeerAddr::Udp("10.9.9.9:9100".parse().unwrap());
         let (relay_keys, _) = make_session_keys();
         let relay_session_id = relay_keys.session_id;
-        node.install_routed(peer_id, relay_addr, relay_keys, None, None);
+        node.install_routed(peer_id, relay_addr, relay_keys, None, None, false);
 
         // A racing rotation installs a DIFFERENT session for the peer
         // (simulated by a plain install). The upgrade below still holds
         // the OLD session_id as its expectation.
         let (raced_keys, _) = make_session_keys();
         let raced_session_id = raced_keys.session_id;
-        node.install_routed(peer_id, relay_addr, raced_keys, None, None);
+        node.install_routed(peer_id, relay_addr, raced_keys, None, None, false);
 
         // Upgrade tries to install a punched session but expects the
         // pre-race session_id → CAS must refuse.
@@ -51513,7 +53616,7 @@ mod heartbeat_aead_tests {
         let dest_id = 0x0DE5_7000u64;
         let relay_addr: PeerAddr = PeerAddr::Udp("10.8.8.8:9100".parse().unwrap());
         let (keys, _) = make_session_keys();
-        node.install_routed(dest_id, relay_addr, keys, None, None);
+        node.install_routed(dest_id, relay_addr, keys, None, None, false);
 
         assert_eq!(
             node.router.routing_table().lookup(dest_id),
@@ -52058,7 +54161,13 @@ mod heartbeat_aead_tests {
             admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         assert_eq!(
-            routed_rotation_outcome(&info, &static_a, &ephemeral_a, Duration::from_secs(30)),
+            routed_rotation_outcome(
+                &info,
+                &static_a,
+                &ephemeral_a,
+                Duration::from_secs(30),
+                Duration::from_secs(30)
+            ),
             RoutedRotationOutcome::DropReplay,
         );
     }
@@ -52087,7 +54196,13 @@ mod heartbeat_aead_tests {
             admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         assert_eq!(
-            routed_rotation_outcome(&info, &static_a, &ephemeral_new, Duration::from_secs(30)),
+            routed_rotation_outcome(
+                &info,
+                &static_a,
+                &ephemeral_new,
+                Duration::from_secs(30),
+                Duration::from_secs(30)
+            ),
             RoutedRotationOutcome::AcceptRotation,
         );
     }
@@ -52117,7 +54232,13 @@ mod heartbeat_aead_tests {
         let new_static = [0xBBu8; 32];
         let new_ephemeral = [0xDDu8; 32];
         assert_eq!(
-            routed_rotation_outcome(&info, &new_static, &new_ephemeral, Duration::from_secs(30),),
+            routed_rotation_outcome(
+                &info,
+                &new_static,
+                &new_ephemeral,
+                Duration::from_secs(30),
+                Duration::from_secs(30)
+            ),
             RoutedRotationOutcome::RefuseFresh,
         );
     }
@@ -52149,7 +54270,13 @@ mod heartbeat_aead_tests {
         let new_static = [0xBBu8; 32];
         let new_ephemeral = [0xDDu8; 32];
         assert_eq!(
-            routed_rotation_outcome(&info, &new_static, &new_ephemeral, Duration::from_millis(1),),
+            routed_rotation_outcome(
+                &info,
+                &new_static,
+                &new_ephemeral,
+                Duration::from_millis(1),
+                Duration::from_millis(1)
+            ),
             RoutedRotationOutcome::AcceptRotation,
         );
     }
@@ -52178,9 +54305,165 @@ mod heartbeat_aead_tests {
         };
         // Same static, fresh ephemeral, live (30 s timeout) + busy.
         assert_eq!(
-            routed_rotation_outcome(&info, &static_a, &[0xDDu8; 32], Duration::from_secs(30)),
+            routed_rotation_outcome(
+                &info,
+                &static_a,
+                &[0xDDu8; 32],
+                Duration::from_secs(30),
+                Duration::from_secs(30)
+            ),
             RoutedRotationOutcome::DeferBusy,
         );
+    }
+
+    /// Control-plane subprotocol streams alone never make a session
+    /// busy: a peer that restarted after exchanging announcements, an
+    /// identity proof or a subnet admission re-handshakes at once. An
+    /// application stream beside them still defers.
+    #[test]
+    fn routed_rotation_ignores_control_plane_streams() {
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        for id in [0x0C00u64, 0x0A01, 0x0A02, 0x0B00] {
+            session.get_or_create_stream(id);
+        }
+        assert!(session.has_open_streams(), "control streams exist");
+        let static_a = [0xAAu8; 32];
+        let info = |session: Arc<NetSession>| PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            transport: PeerTransport::Direct { owned: addr },
+            session,
+            remote_static_pub: static_a,
+            last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
+        };
+        assert_eq!(
+            routed_rotation_outcome(
+                &info(session.clone()),
+                &static_a,
+                &[0xDDu8; 32],
+                Duration::from_secs(30),
+                Duration::from_secs(30)
+            ),
+            RoutedRotationOutcome::AcceptRotation,
+            "control-plane streams alone must not defer a rotation",
+        );
+        session.get_or_create_stream(0xABCD);
+        assert_eq!(
+            routed_rotation_outcome(
+                &info(session),
+                &static_a,
+                &[0xDDu8; 32],
+                Duration::from_secs(30),
+                Duration::from_secs(30)
+            ),
+            RoutedRotationOutcome::DeferBusy,
+            "an application stream still defers",
+        );
+    }
+
+    /// C3 liveness is the PEER speaking, not the session being young: a
+    /// busy session whose peer has gone quiet (it restarted, or its path
+    /// died) rotates on its re-handshake well before `session_timeout`,
+    /// even while this side keeps sending on it; a busy session whose
+    /// peer is still speaking (e.g. mid-transfer, heartbeating) defers.
+    #[test]
+    fn busy_rotation_defers_only_while_the_peer_is_speaking() {
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
+        let (init_keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
+        session.get_or_create_stream(0xABCD);
+        let static_a = [0xAAu8; 32];
+        let info = PeerInfo {
+            node_id: 0xBEEF_BEEFu64,
+            transport: PeerTransport::Direct { owned: addr },
+            session: session.clone(),
+            remote_static_pub: static_a,
+            last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
+        };
+        let outcome = || {
+            routed_rotation_outcome(
+                &info,
+                &static_a,
+                &[0xDDu8; 32],
+                Duration::from_secs(30),
+                Duration::from_millis(20),
+            )
+        };
+        assert_eq!(
+            outcome(),
+            RoutedRotationOutcome::DeferBusy,
+            "fresh: speaking"
+        );
+
+        // The peer falls silent; our own sends keep the session from
+        // timing out, but they are not the peer speaking.
+        std::thread::sleep(Duration::from_millis(40));
+        session.touch();
+        assert!(!session.is_timed_out(Duration::from_secs(30)));
+        assert_eq!(
+            outcome(),
+            RoutedRotationOutcome::AcceptRotation,
+            "a silent peer's re-handshake must not wait out session_timeout",
+        );
+
+        // The peer speaks again (an authenticated packet): defer again.
+        session.note_inbound();
+        assert_eq!(
+            outcome(),
+            RoutedRotationOutcome::DeferBusy,
+            "speaking again"
+        );
+    }
+
+    /// A stored Noise static key survives a rebuild: nodes built from the
+    /// same key present the same public key (what contacts pin); a node
+    /// without one gets a fresh key per build. The key never prints.
+    #[tokio::test]
+    async fn a_stored_noise_key_is_kept_across_builds() {
+        let key = NoiseStaticKey::from_private([0x42; 32]);
+        let build = |key: Option<NoiseStaticKey>| async move {
+            let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [7u8; 32]);
+            if let Some(key) = key {
+                cfg = cfg.with_static_key(key);
+            }
+            MeshNode::new(EntityKeypair::generate(), cfg).await.unwrap()
+        };
+        let first = build(Some(key.clone())).await;
+        let second = build(Some(key.clone())).await;
+        assert_eq!(first.public_key(), &key.public_key());
+        assert_eq!(second.public_key(), first.public_key());
+        let fresh_a = build(None).await;
+        let fresh_b = build(None).await;
+        assert_ne!(fresh_a.public_key(), fresh_b.public_key());
+        assert_eq!(format!("{key:?}"), "NoiseStaticKey(<redacted>)");
+        assert!(
+            !first.peer_session_is_silent(0x1234),
+            "no session, not silent"
+        );
+    }
+
+    /// Every always-compiled subprotocol id is in the control-stream list,
+    /// so a new control subprotocol cannot silently make sessions busy.
+    #[test]
+    fn control_stream_list_covers_the_core_subprotocols() {
+        for id in [
+            crate::adapter::net::identity::SUBPROTOCOL_IDENTITY_PROOF,
+            crate::adapter::net::subnet::admission_wire::SUBPROTOCOL_SUBNET_ADMISSION,
+            crate::adapter::net::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN,
+            crate::adapter::net::behavior::broadcast::SUBPROTOCOL_ROUTE_WITHDRAW,
+            crate::adapter::net::behavior::broadcast::SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
+            crate::adapter::net::subprotocol::SUBPROTOCOL_NEGOTIATION,
+        ] {
+            assert!(is_control_stream_id(u64::from(id)), "{id:#06x} missing");
+        }
+        assert!(!is_control_stream_id(0xABCD));
+        assert!(!is_control_stream_id(1));
+        assert!(!is_control_stream_id(u64::from(u16::MAX) + 0x0400));
     }
 
     /// The DeferBusy liveness bound: a busy session that has gone idle
@@ -52207,7 +54490,13 @@ mod heartbeat_aead_tests {
         // Let the session go idle past a 1 ms timeout — not live.
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(
-            routed_rotation_outcome(&info, &static_a, &[0xDDu8; 32], Duration::from_millis(1)),
+            routed_rotation_outcome(
+                &info,
+                &static_a,
+                &[0xDDu8; 32],
+                Duration::from_millis(1),
+                Duration::from_millis(1)
+            ),
             RoutedRotationOutcome::AcceptRotation,
         );
     }
@@ -52412,45 +54701,112 @@ mod heartbeat_aead_tests {
         );
     }
 
-    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #7:
-    /// `publish_to_peer` was the only sender call site that
-    /// hard-coded `PacketFlags::NONE` instead of computing
-    /// `if reliable { PacketFlags::RELIABLE } else { PacketFlags::NONE }`.
-    /// Today the dispatch path doesn't consult `is_reliable()` (per-
-    /// stream reliability is set at open), so the inconsistency is
-    /// latent — but receiver-side code already consults the packet
-    /// flag for `is_priority` / `is_control`, and `is_reliable` is
-    /// the obvious next addition. This source-level pin ensures the
-    /// fix doesn't get reverted before the dispatch path catches up.
-    ///
-    /// R2-6 moved the packet-build body into the atomic
-    /// [`MeshNode::try_publish_to_peer`] delegate (`publish_to_peer` is
-    /// now a thin `Result`-flattening wrapper), so the pin scans there —
-    /// that is where the wire packet, and thus the `reliable` flag, is
-    /// built.
-    #[test]
-    fn publish_to_peer_propagates_reliable_to_packet_flags() {
-        let src = include_str!("mesh.rs");
-        let start = src
-            .find("async fn try_publish_to_peer(")
-            .expect("try_publish_to_peer must exist");
-        // Round down to a char boundary — the source has multibyte
-        // box-drawing characters in doc comments, and a fixed-byte
-        // window can land mid-UTF-8 sequence after edits to the
-        // surrounding code shift offsets.
-        let mut scan_end = (start + 6000).min(src.len());
-        while scan_end < src.len() && !src.is_char_boundary(scan_end) {
-            scan_end += 1;
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #7, behavioral form
+    /// (review finding 18): the `reliable` flag handed to the publish
+    /// path must reach the wire packet's flags — asserted at the
+    /// RECEIVING session, where a `PacketFlags::RELIABLE` packet is what
+    /// makes the receive-side stream reliable (the session's
+    /// `default_reliable` is false for this config, and the second
+    /// assertion proves it). Pre-fix `publish_to_peer` hard-coded
+    /// `PacketFlags::NONE`; the source-text scan this replaces could not
+    /// distinguish dead code or a computed-and-dropped flag from real
+    /// propagation.
+    #[tokio::test]
+    async fn publish_to_peer_propagates_reliable_to_packet_flags() {
+        async fn node() -> Arc<MeshNode> {
+            Arc::new(
+                MeshNode::new(
+                    EntityKeypair::generate(),
+                    MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [0x24; 32]),
+                )
+                .await
+                .unwrap(),
+            )
         }
-        let body = &src[start..scan_end];
+        let sender = node().await;
+        let receiver = node().await;
+        let accept = {
+            let receiver = receiver.clone();
+            let sender_id = sender.node_id();
+            tokio::spawn(async move { receiver.accept(sender_id).await.unwrap() })
+        };
+        sender
+            .connect(
+                receiver.local_addr(),
+                receiver.public_key(),
+                receiver.node_id(),
+            )
+            .await
+            .unwrap();
+        accept.await.unwrap();
+        sender.start();
+        receiver.start();
+
+        const RELIABLE_STREAM: u64 = 0xE1;
+        const UNRELIABLE_STREAM: u64 = 0xE0;
+        let event = Bytes::from_static(b"reliable-flag-probe");
+        assert!(
+            sender
+                .publish_to_peer(
+                    receiver.node_id(),
+                    0xA11CE,
+                    RELIABLE_STREAM,
+                    /* reliable */ true,
+                    std::slice::from_ref(&event),
+                )
+                .await
+                .is_ok(),
+            "reliable probe must publish"
+        );
+        assert!(
+            sender
+                .publish_to_peer(
+                    receiver.node_id(),
+                    0xB0B,
+                    UNRELIABLE_STREAM,
+                    /* reliable */ false,
+                    std::slice::from_ref(&event),
+                )
+                .await
+                .is_ok(),
+            "unreliable probe must publish"
+        );
+
+        // Both packets must land on the receiving session before the
+        // stream-mode asserts read it — the awaits above return at the
+        // SENDER's socket, not at the receiver's dispatch.
+        let session = receiver
+            .peers
+            .get(&sender.node_id())
+            .unwrap()
+            .session
+            .clone();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if session.try_stream(RELIABLE_STREAM).is_some()
+                    && session.try_stream(UNRELIABLE_STREAM).is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both probe packets must reach the receiving session");
 
         assert!(
-            body.contains("if reliable") && body.contains("PacketFlags::RELIABLE"),
-            "regression: publish_to_peer must thread `reliable` into the packet \
-             header — pre-fix it hard-coded PacketFlags::NONE while only \
-             feeding `reliable` into open_stream_with, leaving every other \
-             sender call site (send_to_peer, send_routed, send_on_stream) \
-             inconsistent."
+            session.try_stream(RELIABLE_STREAM).unwrap().reliable_mode(),
+            "a reliable publish must arrive RELIABLE-flagged: the receiving \
+             stream becomes reliable only from the packet flag"
+        );
+        assert!(
+            !session
+                .try_stream(UNRELIABLE_STREAM)
+                .unwrap()
+                .reliable_mode(),
+            "an unreliable publish must arrive unflagged — and proves the \
+             receiving session's default_reliable is false, so the assert \
+             above can discriminate the flag"
         );
     }
 
@@ -59804,6 +62160,46 @@ mod membership_failure_tests {
         })
     }
 
+    /// A **resolvable** sender: the peer entry the membership
+    /// witnesses are now required to model (#8). The §12 gate-3
+    /// fail-closed arm refuses an entry-less sender's message — that
+    /// state is the documented eviction race — while these
+    /// witnesses' claims (per-request charge dedupe; accepted
+    /// reprocess-not-replay) are about the membership logic BELOW
+    /// the gate and must be witnessed against a sender the gate
+    /// admits. A legacy UDP endpoint: admission is invisible to
+    /// native peers, in both feature graphs.
+    fn install_resolvable_peer(ctx: &DispatchCtx, peer: u64) {
+        use crate::adapter::net::crypto::SessionKeys;
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        ctx.peers.insert(
+            peer,
+            PeerInfo {
+                node_id: peer,
+                transport: PeerTransport::Direct {
+                    owned: PeerAddr::Udp(addr),
+                },
+                session: Arc::new(NetSession::new(
+                    SessionKeys {
+                        tx_key: [0x11u8; 32],
+                        rx_key: [0x22u8; 32],
+                        session_id: peer,
+                        remote_static_pub: [0x33u8; 32],
+                        route_hop_tx_key: [0x44u8; 32],
+                        route_hop_rx_key: [0x55u8; 32],
+                    },
+                    PeerAddr::Udp(addr),
+                    4,
+                    false,
+                )),
+                remote_static_pub: [0x33u8; 32],
+                last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
+            },
+        );
+    }
+
     fn failures_for(ctx: &DispatchCtx, node: u64) -> u16 {
         ctx.auth_failures.get(&node).map_or(0, |e| e.failures)
     }
@@ -59823,6 +62219,11 @@ mod membership_failure_tests {
 
         let (node, channel) = node_with_gated_channel().await;
         let ctx = node.dispatch_ctx();
+        // #8: the sender models a RESOLVABLE peer — the bare 0xBEEF
+        // with no peer entry is the §12 gate-3 fail-closed arm's
+        // eviction race, which refuses before the ACL and would make
+        // this witness about the gate rather than its claim.
+        install_resolvable_peer(&ctx, PEER);
         let payload = subscribe_bytes(&channel, 0x1234_5678);
 
         MeshNode::handle_membership_message(&payload, PEER, &ctx);
@@ -59870,6 +62271,9 @@ mod membership_failure_tests {
             .await
             .expect("MeshNode::new");
         let ctx = node.dispatch_ctx();
+        // #8: the sender models a RESOLVABLE peer — see the note in
+        // `retransmitted_subscribe_is_charged_to_the_auth_budget_once`.
+        install_resolvable_peer(&ctx, PEER);
         let channel = ChannelName::new("open/plain").unwrap();
         let id = ChannelId::new(channel.clone());
         let payload = subscribe_bytes(&channel, 0xAAAA);
@@ -59887,6 +62291,69 @@ mod membership_failure_tests {
         assert!(
             ctx.membership_dedupe.is_empty(),
             "accepted requests must not occupy the rejection cache"
+        );
+    }
+
+    /// **#8's gate contract, pinned.** A membership message from a
+    /// sender with NO peer entry is refused at §12 gate 3's
+    /// fail-closed arm — the documented eviction race — AND counted
+    /// under its own reason (#11); it never lands in the roster and
+    /// never charges the sender's auth-failure budget. The positive
+    /// control is the same payload from the same sender once it has
+    /// a resolvable peer entry: the same path then succeeds, so the
+    /// refusal is the entry absence and nothing else.
+    ///
+    /// Inverse: guard the gate with `if let Some(…)` (skip shape)
+    /// and the entry-less Subscribe lands in the roster while its
+    /// counter stays at zero — the first assertion fails on the
+    /// count, the second on the roster.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_membership_message_from_an_entry_less_sender_is_refused_and_counted() {
+        const PEER: u64 = 0xDEAD;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        let channel = ChannelName::new("open/plain").unwrap();
+        let id = ChannelId::new(channel.clone());
+        let payload = subscribe_bytes(&channel, 0x1234_5678);
+
+        MeshNode::handle_membership_message(&payload, PEER, &ctx);
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_subscribe(),
+            1,
+            "the entry-less refusal must move its own counter (#11): a refusal that \
+             is not counted is a refusal nobody can operate on"
+        );
+        assert!(
+            !ctx.roster.is_subscribed(PEER, &id),
+            "an entry-less sender's Subscribe must never land in the roster"
+        );
+        assert_eq!(
+            failures_for(&ctx, PEER),
+            0,
+            "and must not charge the auth-failure budget — the request never \
+             reached the ACL"
+        );
+
+        // Positive control: the SAME path and sender with a
+        // resolvable peer entry — the refusal above is the entry
+        // absence, not a broken subscribe path.
+        install_resolvable_peer(&ctx, PEER);
+        MeshNode::handle_membership_message(&payload, PEER, &ctx);
+        assert!(
+            ctx.roster.is_subscribed(PEER, &id),
+            "with a resolvable peer entry the same Subscribe lands"
+        );
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_subscribe(),
+            1,
+            "a landed Subscribe is not an unresolvable refusal"
         );
     }
 
@@ -60617,6 +63084,10 @@ mod exported_discovery_pin_coherence_tests {
     }
 }
 
+#[cfg(all(test, feature = "cortex"))]
+#[path = "mesh_rpc_large_response_tests.rs"]
+mod rpc_large_response_lifecycle_tests;
+
 /// R1 (Kyra's HOLD on `b6e522bb5`): the `Stream` handle's config and
 /// the session's retransmit bookkeeping cannot disagree.
 ///
@@ -61324,6 +63795,208 @@ mod lifecycle_regression_tests {
             node.pending_identity_proofs.is_empty(),
             "a dropped leg must release its nonce — otherwise a cancelled \
              or retried caller grows this map for the node's lifetime"
+        );
+    }
+}
+
+// NOTE: like `membership_failure_tests`, kept at the END of the file
+// on purpose — see that module's header note about the heartbeat
+// drift check's production/test boundary scan.
+/// **#1 / #11: the §12 gate-1 and gate-4 fail-closed refusals, and
+/// their counters.** On every gate-1/3/4 path an unresolvable
+/// endpoint REFUSES (and is counted under its own reason) instead of
+/// skipping: no announcement frame is flooded and no punch relay is
+/// emitted for a sender or destination with no peer entry at any
+/// check on that path.
+#[cfg(test)]
+mod unresolvable_endpoint_gate_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    /// A resolvable, admitted peer seated at `addr`, with a real
+    /// session the forwarding paths can build packets on.
+    fn install_peer_at(ctx: &DispatchCtx, peer: u64, addr: SocketAddr) {
+        use crate::adapter::net::crypto::SessionKeys;
+        ctx.peers.insert(
+            peer,
+            PeerInfo {
+                node_id: peer,
+                transport: PeerTransport::Direct {
+                    owned: PeerAddr::Udp(addr),
+                },
+                session: Arc::new(NetSession::new(
+                    SessionKeys {
+                        tx_key: [0x11u8; 32],
+                        rx_key: [0x22u8; 32],
+                        session_id: peer,
+                        remote_static_pub: [0x33u8; 32],
+                        route_hop_tx_key: [0x44u8; 32],
+                        route_hop_rx_key: [0x55u8; 32],
+                    },
+                    PeerAddr::Udp(addr),
+                    4,
+                    false,
+                )),
+                remote_static_pub: [0x33u8; 32],
+                last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
+            },
+        );
+    }
+
+    async fn node_ctx() -> MeshNode {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        MeshNode::new(
+            EntityKeypair::generate(),
+            MeshNodeConfig::new(addr, [0x61u8; 32]),
+        )
+        .await
+        .expect("MeshNode::new")
+    }
+
+    /// **#1's first site + #11 (forward and announce families).**
+    /// `forward_capability_announcement` FAILS CLOSED for an
+    /// unresolvable sender: before, the `if let Some(…)` skip
+    /// re-flooded the announcement to every peer — §12 F5's
+    /// megaphone — for exactly the eviction-race state the gate
+    /// exists to stop. Gate 4's sibling refusal counts on its own
+    /// family's counter.
+    ///
+    /// Inverse: convert the sender gate back to the skip shape — the
+    /// flood ARRIVES at the target's socket (first assertion fails)
+    /// and the unresolvable counter stays at zero (second fails).
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn an_unresolvable_sender_floods_no_announcement_and_is_counted() {
+        const SENDER: u64 = 0x5EED;
+        const TARGET: u64 = 0x7A26;
+        let node = node_ctx().await;
+        let ctx = node.dispatch_ctx();
+        let rx = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let target_addr = rx.local_addr().expect("local_addr");
+        install_peer_at(&ctx, TARGET, target_addr);
+
+        // The refusal: an entry-less sender's announcement must not
+        // become the megaphone's hand.
+        MeshNode::forward_capability_announcement(b"ann".to_vec(), 0x0A, SENDER, &ctx);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut buf = [0u8; 2048];
+        assert!(
+            rx.try_recv(&mut buf).is_err(),
+            "no announcement frame may be flooded on behalf of an unresolvable sender"
+        );
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_forward(),
+            1,
+            "the flood-gate refusal is counted under its own reason (#11)"
+        );
+
+        // Gate 4's sibling on the same state: the announce family's
+        // own counter, so the two causes stay attributable.
+        MeshNode::handle_capability_announcement(b"ann", 0x0C, &ctx);
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_announce(),
+            1,
+            "gate 4's unresolvable refusal moves the announce family's own counter"
+        );
+
+        // Positive control: a resolvable sender's announcement IS
+        // flooded to the target — the observable above is a real
+        // flood path, not a dead one — and no unresolvable refusal
+        // is counted for it.
+        install_peer_at(&ctx, SENDER, "127.0.0.1:9".parse().unwrap());
+        MeshNode::forward_capability_announcement(b"ann".to_vec(), 0x0B, SENDER, &ctx);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv(&mut buf))
+                .await
+                .is_ok(),
+            "a resolvable sender's announcement floods to the target"
+        );
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_forward(),
+            1,
+            "a resolvable sender is not an unresolvable refusal"
+        );
+    }
+
+    /// **#1's second site + #11 (forward family, destination arm).**
+    /// `forward_punch_ack` FAILS CLOSED for an unresolvable
+    /// destination: the skip shape let an
+    /// entry-absent-at-check/present-at-get destination become a
+    /// relay to a just-installed unenrolled target, and the
+    /// entry-absent-at-get case fell to a silent drop that moved no
+    /// counter at all.
+    ///
+    /// Inverse: convert the destination gate back to the skip shape
+    /// — the unresolvable counter stays at zero and the first
+    /// assertion fails.
+    #[cfg(all(feature = "webrtc", feature = "nat-traversal"))]
+    #[tokio::test]
+    async fn an_unresolvable_punch_ack_destination_relays_nothing_and_is_counted() {
+        use crate::adapter::net::traversal::rendezvous::PunchAck;
+        const SENDER: u64 = 0x5EED;
+        const DEST: u64 = 0xDE57;
+        let node = node_ctx().await;
+        let ctx = node.dispatch_ctx();
+        let rx = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let dest_addr = rx.local_addr().expect("local_addr");
+        // The SENDER is resolvable, so only the destination gate can
+        // refuse this relay.
+        install_peer_at(&ctx, SENDER, "127.0.0.1:9".parse().unwrap());
+
+        MeshNode::forward_punch_ack(
+            PunchAck {
+                from_peer: SENDER,
+                to_peer: DEST,
+                punch_id: 0,
+            },
+            SENDER,
+            &ctx,
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut buf = [0u8; 2048];
+        assert!(
+            rx.try_recv(&mut buf).is_err(),
+            "no punch relay may be emitted for an unresolvable destination"
+        );
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_forward(),
+            1,
+            "the destination-gate refusal is counted under its own reason (#11)"
+        );
+
+        // Positive control: a resolvable, admitted destination IS
+        // relayed the ack.
+        install_peer_at(&ctx, DEST, dest_addr);
+        MeshNode::forward_punch_ack(
+            PunchAck {
+                from_peer: SENDER,
+                to_peer: DEST,
+                punch_id: 0,
+            },
+            SENDER,
+            &ctx,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv(&mut buf))
+                .await
+                .is_ok(),
+            "a resolvable destination gets the relay"
+        );
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_forward(),
+            1,
+            "a resolvable destination is not an unresolvable refusal"
         );
     }
 }

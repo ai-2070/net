@@ -21,7 +21,7 @@
 #   - Rust-native reference pages                -> sdk_native (nav owner only;
 #     D7 keeps their physical path and canonical URL unchanged)
 #
-# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=13 universal=90, total=138
+# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=19 universal=90, total=144
 #
 # Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
 
@@ -46,6 +46,7 @@ pages:
   concepts/storage-stack: universal
   concepts/subnets: universal
   concepts/tool-federation: universal
+  concepts/webrtc-transport: universal
   releases/RELEASE_v0.10_HEX: universal
   releases/RELEASE_v0.11_BLACK_DIAMOND: universal
   releases/RELEASE_v0.12_FIRESTARTER: universal
@@ -166,6 +167,16 @@ pages:
   # The lens sections keep their READMEs — nav owners for the composed pages.
   sdk/rust: sdk_native
   sdk/typescript: sdk_native
+  # The browser surface is TypeScript over a WebAssembly leaf — a different
+  # runtime from `@net-mesh/sdk`, and organised by what a page does with it
+  # rather than by the announce/discover/invoke spine. It is its own sdk_native
+  # section rather than a projection, because it has no universal body to share.
+  sdk/browser: sdk_native
+  sdk/browser/errors: sdk_native
+  sdk/browser/quickstart: sdk_native
+  sdk/browser/session: sdk_native
+  sdk/browser/store: sdk_native
+  sdk/browser/three: sdk_native
   sdk/python: sdk_native
   sdk/go: sdk_native
   sdk/c: boundary_native

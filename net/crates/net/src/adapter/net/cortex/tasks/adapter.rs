@@ -51,6 +51,22 @@ struct TasksSnapshotPayload {
     inner: Vec<u8>,
 }
 
+/// Which store the `(state_bytes, last_seq)` pair passed to
+/// [`TasksAdapter::open_snapshot`] describes — the identity
+/// discriminator for replay, never sequence arithmetic.
+#[derive(Clone, Copy)]
+enum StateProvenance {
+    /// The pair came from THIS store's own checkpoint file
+    /// (`checkpoint::load`, whose version/origin check is the
+    /// identity gate). `last_seq` is a position in THIS log and
+    /// covers its prefix.
+    OwnCheckpoint,
+    /// The pair is a caller-supplied snapshot of ANOTHER store
+    /// (`open_from_snapshot`). `last_seq` is a position in the SOURCE
+    /// store's log and claims no coverage here.
+    ForeignSnapshot,
+}
+
 /// Typed wrapper around `CortexAdapter<TasksState>` that exposes
 /// domain-level operations (`create`, `rename`, `complete`, `delete`)
 /// and hides the `EventMeta` + postcard plumbing.
@@ -71,6 +87,43 @@ pub struct TasksAdapter {
 }
 
 impl TasksAdapter {
+    /// Validate a snapshot payload WITHOUT opening a store: the
+    /// envelope, the `last_seq` position check, and the EMBEDDED
+    /// adapter state (review finding 10).
+    #[cfg(feature = "netdb")]
+    pub(crate) fn validate_snapshot(
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+    ) -> Result<(), CortexAdapterError> {
+        let payload = Self::decode_snapshot(state_bytes, last_seq)?;
+        // The nested check lives HERE, once. `decode_snapshot` returns
+        // the payload after the position check only: the open path
+        // hands `payload.inner` to `CortexAdapter::open_from_snapshot`,
+        // which decodes it as `TasksState` anyway — decoding it in
+        // `decode_snapshot` too parsed and allocated the entire
+        // adapter state twice on every checkpointed restart.
+        let _: TasksState = postcard::from_bytes(&payload.inner)
+            .map_err(|e| RedexError::Decode(format!("tasks snapshot state: {e}")))?;
+        Ok(())
+    }
+
+    /// Unwrap the envelope and check the position sentinel. Does NOT
+    /// decode the embedded state — see [`Self::validate_snapshot`] for
+    /// where that check lives and why it is not repeated here.
+    fn decode_snapshot(
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+    ) -> Result<TasksSnapshotPayload, CortexAdapterError> {
+        if last_seq == Some(u64::MAX) {
+            return Err(
+                RedexError::Decode("snapshot last_seq at u64::MAX; cannot resume".into()).into(),
+            );
+        }
+        let payload: TasksSnapshotPayload = postcard::from_bytes(state_bytes)
+            .map_err(|e| RedexError::Decode(format!("tasks snapshot unwrap: {e}")))?;
+        Ok(payload)
+    }
+
     /// Open the tasks adapter against a `Redex` manager.
     ///
     /// Uses [`TASKS_CHANNEL`] (`"cortex/tasks"`). Replays the full
@@ -89,6 +142,8 @@ impl TasksAdapter {
 
     /// Like [`Self::open`] but with a caller-supplied `RedexFileConfig`
     /// (useful for `persistent: true` or custom retention).
+    /// Persistent opens first recover any local restore checkpoint. Such
+    /// checkpoints require the same origin used when they were restored.
     pub async fn open_with_config(
         redex: &Redex,
         origin_hash: u64,
@@ -99,6 +154,19 @@ impl TasksAdapter {
                 e.to_string(),
             ))
         })?;
+        if let Some(checkpoint) =
+            super::super::checkpoint::load(redex, &name, &redex_config, origin_hash)?
+        {
+            return Self::open_snapshot(
+                redex,
+                origin_hash,
+                redex_config,
+                &checkpoint.state,
+                checkpoint.last_seq,
+                StateProvenance::OwnCheckpoint,
+            )
+            .await;
+        }
         let app_seq = Arc::new(AtomicU64::new(0));
         let fold = WatermarkingFold::new(TasksFold, app_seq.clone(), origin_hash);
         let inner = CortexAdapter::open(
@@ -355,8 +423,12 @@ impl TasksAdapter {
         Ok((bytes, last_seq))
     }
 
-    /// Open the tasks adapter from a snapshot, skipping replay of
-    /// events up through `last_seq`.
+    /// Open the tasks adapter from another store's snapshot.
+    ///
+    /// `last_seq` describes the SOURCE store's log and claims no
+    /// coverage of this one: every event of THIS log folds onto the
+    /// restored state (the documented restore semantic: "a fold, not
+    /// a replace"). The `Some(u64::MAX)` sentinel is still refused.
     ///
     /// See [`Self::open`] for why this is `async`.
     pub async fn open_from_snapshot(
@@ -377,6 +449,8 @@ impl TasksAdapter {
 
     /// Like [`Self::open_from_snapshot`] but with a caller-supplied
     /// `RedexFileConfig` (e.g. for `persistent: true`).
+    /// Persistent restoration publishes a local checkpoint for ordinary
+    /// future opens. Restore offline; concurrent writers are unsupported.
     pub async fn open_from_snapshot_with_config(
         redex: &Redex,
         origin_hash: u64,
@@ -384,11 +458,57 @@ impl TasksAdapter {
         state_bytes: &[u8],
         last_seq: Option<u64>,
     ) -> Result<Self, CortexAdapterError> {
-        let payload: TasksSnapshotPayload = postcard::from_bytes(state_bytes).map_err(|e| {
-            CortexAdapterError::Redex(RedexError::Encode(format!("tasks snapshot unwrap: {}", e)))
-        })?;
+        Self::open_snapshot(
+            redex,
+            origin_hash,
+            redex_config,
+            state_bytes,
+            last_seq,
+            StateProvenance::ForeignSnapshot,
+        )
+        .await
+    }
+
+    async fn open_snapshot(
+        redex: &Redex,
+        origin_hash: u64,
+        redex_config: RedexFileConfig,
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+        provenance: StateProvenance,
+    ) -> Result<Self, CortexAdapterError> {
+        let payload = Self::decode_snapshot(state_bytes, last_seq)?;
         let name = ChannelName::new(TASKS_CHANNEL)
             .map_err(|e| CortexAdapterError::Redex(RedexError::Channel(e.to_string())))?;
+
+        // Force-restore merge fix: `last_seq` is a position in the
+        // log of the store the pair came from. An `OwnCheckpoint`
+        // pair comes from THIS store's own checkpoint file
+        // (identity-gated by `checkpoint::load`'s version/origin
+        // check), so its position covers this log's prefix and
+        // replay may skip it. A `ForeignSnapshot` pair is ANOTHER
+        // store's snapshot: its position covers NOTHING here, so
+        // every destination frame must fold onto the incoming state
+        // (the documented restore semantic: "a fold, not a replace")
+        // and the published checkpoint claims no coverage (`store`'s
+        // clamp maps `None` to `None`, keeping later appends
+        // replayable).
+        let resume = match provenance {
+            StateProvenance::OwnCheckpoint => last_seq,
+            StateProvenance::ForeignSnapshot => None,
+        };
+        let last_seq = if matches!(provenance, StateProvenance::ForeignSnapshot) {
+            super::super::checkpoint::store(
+                redex,
+                &name,
+                &redex_config,
+                origin_hash,
+                state_bytes,
+                resume,
+            )?
+        } else {
+            resume
+        };
 
         // Pre-load the snapshot's persisted counter into the
         // shared atomic. The wrapper fold then advances the
@@ -528,6 +648,33 @@ impl std::fmt::Debug for TasksAdapter {
 mod tests {
     use super::*;
     use crate::adapter::net::redex::Redex;
+
+    /// Review finding 10 behaviour witness: `validate_snapshot` — the
+    /// API that promises to validate embedded adapter state WITHOUT
+    /// opening a store — must reject a well-formed envelope wrapping
+    /// corrupt state bytes (the loud failure the moved nested check
+    /// provides). Inverse: removing the nested check from
+    /// `validate_snapshot` reddens this — after finding 10 nothing
+    /// else on the validate path performs it. (The companion property
+    /// "the nested state is parsed exactly once per checkpointed
+    /// restart" is structural: `decode_snapshot` no longer touches
+    /// `payload.inner`, leaving `CortexAdapter::open_from_snapshot`'s
+    /// decode as the single parse site — this witness pins the
+    /// behaviour, not the parse count.)
+    #[cfg(feature = "netdb")]
+    #[test]
+    fn validate_snapshot_rejects_corrupt_embedded_state() {
+        let payload = TasksSnapshotPayload {
+            app_seq: 3,
+            inner: vec![0xFF; 32],
+        };
+        let bytes = postcard::to_allocvec(&payload).unwrap();
+        let result = TasksAdapter::validate_snapshot(&bytes, Some(0));
+        assert!(
+            result.is_err(),
+            "validate_snapshot must reject corrupt embedded adapter state, got: {result:?}"
+        );
+    }
 
     /// Cross-origin aliasing protection on the RYW surface. A
     /// `WriteToken` is `(origin_hash, seq)`; if the adapter accepted

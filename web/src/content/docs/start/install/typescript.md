@@ -33,6 +33,19 @@ silently.
 **Errors throw, they do not return null.** `emit` and `emitRaw` throw on failure;
 the fire-and-forget variants return a boolean instead.
 
+### In a browser
+
+`@net-mesh/sdk` is Node-only: every one of its entry points resolves
+`@net-mesh/core`, the napi addon, and a browser bundle that walked that graph
+would fail on a `.node` file. A page uses **`@net-mesh/browser`** instead —
+TypeScript over a WebAssembly leaf, with a WebRTC DataChannel to a native anchor
+and no native binding anywhere in its dependency graph.
+
+It is **not on npm yet**, so it is built from the repository: two commands, listed
+in [Browser SDK](/docs/sdk/browser#build-it), the first of which builds the leaf's
+WebAssembly. Then start at the
+[Browser quickstart](/docs/sdk/browser/quickstart).
+
 ### Verify it worked
 
 ```ts

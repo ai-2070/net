@@ -111,7 +111,7 @@ pub struct SubnetBoundaryDeclarationJs {
 #[napi(object)]
 pub struct SubnetControlOutcomeJs {
     /// `"descriptor" | "gateway_advertisement" | "export_policy" |
-    /// "revocation_floor"`.
+    /// "revocation_floor" | "subject_floor"`.
     pub kind: String,
     /// Whether any state changed.
     pub applied: bool,

@@ -347,7 +347,10 @@ fn the_enrollment_request_replays_inside_wasm() {
 /// `std::time::Instant::now()` panics.
 #[wasm_bindgen_test]
 fn every_clock_read_the_leaf_makes_works_in_a_browser() {
-    let first = clock::now();
+    // The `now()` reads are the claim themselves — on this target a
+    // clock read that returns at all is the property — so they are
+    // kept as reads and not dressed up as an assertion.
+    let _first = clock::now();
     let unix_secs = clock::now_unix_secs();
     let unix_nanos = clock::now_unix_nanos();
     assert!(
@@ -356,8 +359,7 @@ fn every_clock_read_the_leaf_makes_works_in_a_browser() {
     );
     assert!(unix_nanos / 1_000_000_000 >= unix_secs - 1);
 
-    let second = clock::now();
-    assert!(second.duration_since(first).as_nanos() < u128::MAX);
+    let _second = clock::now();
 
     // The deadline arithmetic the call table and the reassembler use.
     let deadline = clock::Deadline::in_ms(50);

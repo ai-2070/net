@@ -236,8 +236,9 @@ pub use mesh::SensingOffLockObservation;
 #[cfg(feature = "nat-traversal")]
 pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
-    ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, SensingLeaseReleaseRefused,
-    SensingReadinessOverlay, SensingRegistrationError, UnregisteredChannelPolicy,
+    ControlPlaneStats, MeshNode, MeshNodeConfig, NoiseStaticKey, PartitionFilter,
+    PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay,
+    SensingRegistrationError, SessionPath, SubnetFloorQueryError, UnregisteredChannelPolicy,
     ACK_RANGES_CAPABILITY_TAG,
 };
 /// Exported only so the fixtures-gated ordered-egress accessors have nameable
@@ -1232,6 +1233,7 @@ impl NetAdapter {
                 if !rx_cipher.try_admit_rx_counter(counter) {
                     return;
                 }
+                session.note_inbound();
                 d
             }
             Err(_) => return,

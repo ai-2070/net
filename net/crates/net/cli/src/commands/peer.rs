@@ -21,6 +21,9 @@ use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Args, Debug)]
 pub struct LsArgs {
+    #[command(flatten)]
+    pub scope: super::scope::InspectableLocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -34,7 +37,18 @@ pub async fn run_ls(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::validate_local(args.scope.local, "peer ls")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "peer ls")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();
     let rows: Vec<PeerRow> = snapshot

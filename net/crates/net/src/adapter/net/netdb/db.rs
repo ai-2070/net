@@ -30,6 +30,19 @@ impl NetDbSnapshot {
     pub fn decode(bytes: &[u8]) -> Result<Self, NetDbError> {
         postcard::from_bytes(bytes).map_err(|e| NetDbError::Snapshot(e.to_string()))
     }
+
+    /// Validate embedded adapter state and replay positions without opening
+    /// a store. Use before destructive restoration; envelope decoding alone
+    /// does not validate the nested task and memory snapshots.
+    pub fn validate(&self) -> Result<(), NetDbError> {
+        if let Some((bytes, seq)) = &self.tasks {
+            TasksAdapter::validate_snapshot(bytes, *seq)?;
+        }
+        if let Some((bytes, seq)) = &self.memories {
+            MemoriesAdapter::validate_snapshot(bytes, *seq)?;
+        }
+        Ok(())
+    }
 }
 
 /// Unified NetDB handle.
@@ -277,6 +290,10 @@ impl NetDbBuilder {
     /// opened from scratch via the normal open path (equivalent to
     /// [`Self::build`] for that model).
     ///
+    /// Persistent typed adapters publish an origin-bound local checkpoint.
+    /// Ordinary opens recover it and replay the remaining destination log.
+    /// Publication across models is not transactional; restore offline.
+    ///
     /// Same failure-atomicity guarantee as [`Self::build`] — a
     /// second-adapter failure closes the first before the error
     /// propagates. See `build`'s docs for the caveat that the
@@ -284,6 +301,16 @@ impl NetDbBuilder {
     pub async fn build_from_snapshot(self, snapshot: &NetDbSnapshot) -> Result<NetDb, NetDbError> {
         if !self.want_tasks && !self.want_memories {
             return Err(NetDbError::NoModelsEnabled);
+        }
+        if self.want_tasks {
+            if let Some((bytes, seq)) = &snapshot.tasks {
+                TasksAdapter::validate_snapshot(bytes, *seq)?;
+            }
+        }
+        if self.want_memories {
+            if let Some((bytes, seq)) = &snapshot.memories {
+                MemoriesAdapter::validate_snapshot(bytes, *seq)?;
+            }
         }
         let cfg = self.redex_config();
 

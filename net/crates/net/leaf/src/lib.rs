@@ -117,8 +117,8 @@ pub use announce::{AnnouncementStore, VerifiedAnnouncement};
 pub use channel::Channel;
 pub use clock::Deadline;
 pub use control_plane::{
-    BootstrapAccepted, ControlEvent, ControlPlane, DialogId, IceCandidate, NodeId, Sdp,
-    SignalEnvelope, SignalKind, SignedAnnouncement,
+    BootstrapAccepted, ControlEvent, ControlPlane, DialogId, IceCandidate, NodeId,
+    RevocationBundle, Sdp, SignalEnvelope, SignalKind, SignedAnnouncement,
 };
 pub use counters::{DropReason, LeafCounters};
 pub use dispatch::{Decoded, Subprotocol};

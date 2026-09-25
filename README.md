@@ -72,6 +72,20 @@ and local-first collaboration. Built end to end:
 [Event-sourced service](https://ai2070.net/docs/tutorials/event-sourced-service),
 [Fleet telemetry](https://ai2070.net/docs/tutorials/fleet-telemetry).
 
+## Setting up your own mesh
+
+**A few commands, two machines.** One machine runs a node and hands out a join link. The other
+uses the link and runs its own node. `up` makes the mesh key for you, so nothing secret is copied
+by hand.
+
+```bash
+npm install -g @net-mesh/cli                   # installs the `net-mesh` binary
+
+net-mesh up --enroll                           # operator: runs the node, stays in the foreground
+net-mesh invite create                         # prints a `netmesh-join_` token — keep it secret
+net-mesh join <TOKEN> --yes && net-mesh up     # device: use the link, then run its own node
+```
+
 ## One system, end to end
 
 An intersection has no line of sight: a building hides the cross traffic from the vehicle

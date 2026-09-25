@@ -41,7 +41,7 @@ pub mod natpmp;
 pub mod sequential;
 pub mod upnp;
 
-pub use sequential::{sequential_mapper_from_os, SequentialMapper};
+pub use sequential::{sequential_mapper_from_os, sequential_mapper_from_os_for, SequentialMapper};
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -77,6 +77,27 @@ impl Protocol {
         match self {
             Protocol::NatPmp => "nat-pmp",
             Protocol::Upnp => "upnp",
+        }
+    }
+}
+
+/// Which transport a mapping forwards. A mapper instance is bound to one
+/// transport; the mesh's own mapping task always uses [`MapTransport::Udp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum MapTransport {
+    /// Forward UDP (the mesh transport). The default.
+    #[default]
+    Udp,
+    /// Forward TCP (e.g. a stream-based enrollment listener on the same port).
+    Tcp,
+}
+
+impl MapTransport {
+    /// Stable string form for logs / dashboards.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MapTransport::Udp => "udp",
+            MapTransport::Tcp => "tcp",
         }
     }
 }

@@ -494,6 +494,17 @@ function channelRows() {
 // trap keeps the prototype, the statics and `instanceof` exactly as
 // they were.
 const connections = [];
+const trickleSockets = [];
+(function trackTrickleSockets() {
+  const Real = globalThis.WebSocket;
+  globalThis.WebSocket = new Proxy(Real, {
+    construct(target, args) {
+      const socket = Reflect.construct(target, args, target);
+      if (String(args[0]).includes('/rtc/trickle')) trickleSockets.push(socket);
+      return socket;
+    },
+  });
+})();
 /// A one-shot fault on `setRemoteDescription`, which is the browser
 /// call `connect()` makes to install the anchor's ANSWER
 /// (`RtcLeafTransport::accept_answer`).
@@ -511,19 +522,11 @@ const connections = [];
 /// this tab must be unaffected, including the control the witness
 /// runs next.
 ///
-/// `delayMs` holds the rejection for a bounded moment first. Not a
-/// tolerance: the anchor registers its accepted attempt when it
-/// ANSWERS the offer, but the thing that retires it is the trickle
-/// socket's own handler, which only exists once that socket has
-/// finished its WebSocket upgrade (`sdk/src/rtc_bootstrap.rs` — a
-/// socket closed while still CONNECTING never reaches the anchor's
-/// handler at all). Rejecting a few milliseconds after `POST
-/// /rtc/offer` returns therefore fails BEFORE the attempt is fully
-/// established, and the handback would have nothing to act on for a
-/// reason that has nothing to do with the guard. The delay puts the
-/// failure after establishment; the witness asserts establishment
-/// separately rather than trusting the delay.
-const rtcFault = { failSetRemoteDescription: false, fired: 0, delayMs: 0 };
+/// `delayMs` gives the runner time to observe the accepted dialog.
+/// It does NOT prove the trickle socket has upgraded: Firefox can
+/// still be CONNECTING then. Record that state at rejection; production
+/// handback must allow a bounded upgrade window before closing it.
+const rtcFault = { failSetRemoteDescription: false, fired: 0, delayMs: 0, trickleState: null };
 
 (function trackPeerConnections() {
   if (typeof RTCPeerConnection === 'undefined') return;
@@ -537,10 +540,12 @@ const rtcFault = { failSetRemoteDescription: false, fired: 0, delayMs: 0 };
       // throw here would trap the wasm module instead of reaching
       // the leaf's `JsFuture` — which is a crash, not the failure
       // interval this fault exists to open.
-      const reject = () =>
-        Promise.reject(
+      const reject = () => {
+        rtcFault.trickleState = trickleSockets.at(-1)?.readyState ?? null;
+        return Promise.reject(
           new Error('leaf5 injected fault: setRemoteDescription refused this answer'),
         );
+      };
       const delay = rtcFault.delayMs;
       if (delay > 0) {
         return sleep(delay).then(reject);
@@ -1256,6 +1261,7 @@ async function execute(step) {
           channels: channelRows(),
           fault_armed: rtcFault.failSetRemoteDescription,
           fault_fired: rtcFault.fired,
+          fault_trickle_state: rtcFault.trickleState,
           fault_delay_ms: rtcFault.delayMs,
           wire_messages: wire.messages,
         },
@@ -1826,7 +1832,14 @@ async function execute(step) {
       const node = nodes.get(step.session);
       if (!node) return { ok: false, error: 'no such session ' + step.session };
       try {
-        await node.signal(step.peer_hex, 0, 'offer', new Uint8Array([]));
+        // The dialog is the reserved no-attempt sentinel 0 in the
+        // seam's 16-hex spelling: this call asserts the PEER parse
+        // and drives no attempt. It was the bare NUMBER 0 — the
+        // f64-seam shape — which `wasm-bindgen`'s String marshaling
+        // cannot carry (it panics `assert!(old_size > 0)` in
+        // `passStringToWasm0`, killing the call before any parser
+        // runs, for every peer spelling alike).
+        await node.signal(step.peer_hex, '0000000000000000', 'offer', new Uint8Array([]));
         return { ok: true, stats: { parsed: true, detail: '' } };
       } catch (e) {
         const out = typedFailure(e);

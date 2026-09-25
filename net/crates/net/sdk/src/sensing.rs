@@ -899,13 +899,25 @@ mod tests {
     #[test]
     fn the_sensing_witness_binaries_are_excluded_from_retries() {
         let config = include_str!("../../.config/nextest.toml");
-        let override_block = config
+        // EVERY zero-retry override block, not the first. The config
+        // legitimately carries several (enrollment storage, the security
+        // races, the RTC witnesses), and a `find` over the first bound this
+        // check to whichever block sat at the top: the enrollment-storage
+        // rule shadowed the security block and these binaries read as
+        // uncovered while they were in it all along. The claim is
+        // membership in the zero-retry set, not position in the file.
+        // `retries = 0` is matched as a whole assignment line so a comment
+        // mentioning the key cannot stand in for the setting.
+        let zero_retry: Vec<&str> = config
             .split("[[profile.default.overrides]]")
-            .find(|block| block.contains("retries = 0"))
-            .expect("a zero-retry override block must exist");
+            .filter(|block| block.lines().any(|line| line.trim() == "retries = 0"))
+            .collect();
+        assert!(!zero_retry.is_empty(), "a zero-retry override must exist");
         for binary in ["sensing_provider", "sensing_consumer"] {
             assert!(
-                override_block.contains(&format!("binary({binary})")),
+                zero_retry
+                    .iter()
+                    .any(|block| block.contains(&format!("binary({binary})"))),
                 "sdk/tests/{binary}.rs must be in the zero-retry override — its \
                  ownership, wake and state-edge witnesses must not be retried \
                  into green",

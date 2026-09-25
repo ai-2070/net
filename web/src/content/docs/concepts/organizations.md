@@ -237,6 +237,36 @@ at the next opening — never in flight. What bounds a granted call is the grant
 own validity end, clamped into the call's effective deadline, plus provider
 policy at opening. This is a documented limitation, not continuous enforcement.
 
+## Membership is issued here and observed here
+
+Org enrollment runs through the same operator tooling as the offline
+artifacts. Under [`net-mesh org`](/docs/reference/cli), `invite` and `join`
+add the org relation to a device already on the mesh, `approve` signs a
+pending device's membership certificate, `remove` signs floors, `leave`
+withdraws the device locally, and `members` reports standing. The org root
+never reaches a node: `org approve` signs the membership in the operator's
+process and hands the certificate to the enrolling node, which delivers it,
+and `org remove` signs the floor on the operator's machine.
+
+`org members` keeps two distinct facts apart and never presents one as a
+global roster:
+
+- **issued** — the offers this node created, with the ledger's own state,
+  subject and scope;
+- **observed** — each issued member's standing against this node's current
+  floors, and only while this node enforces that org. Org admission is
+  evaluated per call, so member activity is reported as unknown, never
+  implied.
+
+A member not connected here is absent from the observation, not removed, and
+verifiers that were not asked are outside the claim.
+
+`org leave` is the device's own departure. It is recorded durably and
+survives restart, but it is local: it is not revocation, and the org keeps
+accepting the device's certificate until `org remove` raises a floor.
+Rejoining is re-issued under fresh authorization, not extension of an accepted
+membership.
+
 ## Organizations federate; they do not merge
 
 Organizations are the horizontal federation plane. Each participant retains its

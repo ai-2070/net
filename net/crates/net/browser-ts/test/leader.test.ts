@@ -164,8 +164,19 @@ describe('MeshSession', () => {
     expect(fake.published).toEqual([{ channel: 'chan', payload: new Uint8Array([7]) }]);
     await session.announce(['cap:one']);
     expect(fake.announced).toEqual([['cap:one']]);
-    await session.signal('00000000deadbeef', 3, 'offer', new Uint8Array([1]));
-    expect(fake.signalled).toEqual([{ peerHex: '00000000deadbeef', dialog: 3, kind: 'offer' }]);
+    await session.signal('00000000deadbeef', '0000000000000003', 'offer', new Uint8Array([1]));
+    // …and one whose u64 is NOT f64-representable
+    // ('0123456789abcdef' = 81985529216486895: `as f64 as u64` rounds
+    // it to …896, re-spelling the dialog `…abcdf0`): a spelling that
+    // would visibly round through a `Number` → re-pad hop, asserted
+    // verbatim through the proxy all the way to the leaf. (The
+    // review's suggested `0011223344556677` is itself f64-exact —
+    // 4822678189205111 < 2^53 — and proves nothing.)
+    await session.signal('00000000deadbeef', '0123456789abcdef', 'offer', new Uint8Array([2]));
+    expect(fake.signalled).toEqual([
+      { peerHex: '00000000deadbeef', dialog: '0000000000000003', kind: 'offer' },
+      { peerHex: '00000000deadbeef', dialog: '0123456789abcdef', kind: 'offer' },
+    ]);
 
     const descriptors = await session.query('cap:one');
     expect(descriptors).toHaveLength(1);
@@ -407,5 +418,65 @@ describe('the lifecycle events', () => {
     const next = await iterator.next();
     expect(next.value).toEqual({ type: 'leader_changed', generation: '5' });
     await iterator.return?.();
+  });
+});
+
+/**
+ * The node-id seam on the LEADER-PROXIED surface: the same table
+ * `node.test.ts` holds against `BrowserNode.signal`, because the
+ * browser witness's contract is that BOTH signalling surfaces read
+ * one spelling
+ * (`stage6_one_node_id_spelling_across_both_signalling_surfaces`) and
+ * a fix that reached only the direct one would re-open the drift that
+ * witness closes. `MeshSession.signal` marshals ids exactly as
+ * `BrowserNode.signal` does (finding #52: a JS number for the dialog
+ * died in `wasm-bindgen`'s String marshaling before any parser ran).
+ */
+describe('node-id spellings across the proxied signal seam', () => {
+  /** The five spellings the browser witness drives. */
+  const FIVE: ReadonlyArray<readonly [spelling: string, parses: boolean]> = [
+    ['00000000deadbeef', true],
+    ['0x00000000deadbeef', true],
+    ['2', false],
+    ['0x9', false],
+    ['nine', false],
+  ];
+  /** No `f64` holds it exactly (`as f64 as u64` re-spells it …abcdf0). */
+  const DIALOG = '0123456789abcdef';
+
+  it('reads the five spellings one way on the proxied surface too', async () => {
+    const { session, fake } = await opened();
+    const refused: string[] = [];
+    for (const [spelling, parses] of FIVE) {
+      const call = session.signal(spelling, DIALOG, 'offer', new Uint8Array());
+      if (parses) {
+        await expect(call).resolves.toBeUndefined();
+      } else {
+        await expect(call).rejects.toMatchObject({
+          message: expect.stringContaining('is not a peer id'),
+        });
+        refused.push(spelling);
+      }
+    }
+    expect(refused).toEqual(['2', '0x9', 'nine']);
+    // Two spellings, one node; the dialog exact and verbatim.
+    expect(fake.parsedSignals.map((s) => s.peer)).toEqual([0x00000000deadbeefn, 0x00000000deadbeefn]);
+    expect(fake.signalled.map((s) => s.dialog)).toEqual([DIALOG, DIALOG]);
+    expect(fake.parsedSignals.map((s) => s.dialog)).toEqual([0x0123456789abcdefn, 0x0123456789abcdefn]);
+  });
+
+  it('refuses a non-string id by name, before the wasm seam', async () => {
+    const { session, fake } = await opened();
+    // The finding #52 call shape: the bare NUMBER 0 where the seam
+    // takes a 16-hex dialog string.
+    await expect(
+      session.signal('00000000deadbeef', 0 as unknown as string, 'offer', new Uint8Array()),
+    ).rejects.toMatchObject({ message: expect.stringContaining('is not a dialog id') });
+    // Peer first, as `LeafNode::signal` parses.
+    await expect(
+      session.signal(2 as unknown as string, 0 as unknown as string, 'offer', new Uint8Array()),
+    ).rejects.toMatchObject({ message: expect.stringContaining('is not a peer id') });
+    expect(fake.signalled).toEqual([]);
+    expect(fake.parsedSignals).toEqual([]);
   });
 });

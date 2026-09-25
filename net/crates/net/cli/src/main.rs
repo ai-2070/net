@@ -25,11 +25,13 @@
 mod commands;
 mod config;
 mod context;
+mod deadline;
 mod error;
 mod output;
 mod parsers;
 mod prelude;
 mod secret;
+mod target;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -64,14 +66,9 @@ struct Cli {
     #[arg(long, global = true, env = "NET_MESH_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Named profile within the config file.
-    #[arg(
-        long,
-        global = true,
-        env = "NET_MESH_PROFILE",
-        default_value = "default"
-    )]
-    profile: String,
+    /// Named profile within the config file (default: default).
+    #[arg(long, global = true, env = "NET_MESH_PROFILE")]
+    profile: Option<String>,
 
     /// Read the profile even when it is group/world-accessible or
     /// owned by another user.
@@ -126,10 +123,13 @@ struct Cli {
     #[arg(long, global = true)]
     no_color: bool,
 
-    /// Global per-call timeout. Subcommand-specific timeouts
-    /// override this when explicitly set.
-    #[arg(long, global = true, value_parser = humantime::parse_duration, default_value = "30s")]
-    timeout: std::time::Duration,
+    /// Total budget for remote aggregator ls/query/spawn/scale, transfer
+    /// ls/status/cancel, recv-blob network acquisition, and live typegen
+    /// acquisition (not output writes), plus mcp serve/wrap startup (not lifetime).
+    /// Unsupported combinations fail before execution.
+    /// Omitting this retains the command's existing limits.
+    #[arg(long, global = true, value_parser = humantime::parse_duration)]
+    timeout: Option<std::time::Duration>,
 
     #[command(subcommand)]
     command: Command,
@@ -145,57 +145,84 @@ enum Command {
     /// Operator identity authoring + inspection.
     #[command(subcommand)]
     Identity(commands::identity::IdentityCommand),
-    /// Signed admin-chain commits (9 verbs).
+
+    /// Start one long-lived production node for this profile (foreground).
+    Up(commands::lifecycle::UpArgs),
+
+    /// Ask this profile's running node to drain and stop, and verify it did.
+    Down(commands::lifecycle::DownArgs),
+
+    /// Enrollment ledger setup for `up --enroll`.
+    #[command(subcommand)]
+    Enrollment(commands::enrollment::EnrollmentCommand),
+
+    /// Create, inspect and manage join tokens on the running `up --enroll` node.
+    #[command(subcommand)]
+    Invite(commands::enrollment::InviteCommand),
+
+    /// Join a mesh from a `netmesh-join_` token (confirm, redeem, install, attach).
+    Join(commands::enrollment::JoinArgs),
+
+    /// Leave the mesh this state directory joined: stop its running node,
+    /// erase the delivered credentials and keep the device identity.
+    Leave(commands::lifecycle::LeaveArgs),
+
+    /// Run a blind UDP relay (the fallback path for unreachable devices).
+    #[command(subcommand)]
+    Relay(commands::relay::RelayCommand),
+    /// Offline previews or temporary-supervisor admin commits (--local).
     #[command(subcommand)]
     Admin(commands::admin::AdminCommand),
-    /// Break-glass ICE operator surface (simulate → commit).
+    /// Temporary-supervisor ICE simulation/commit (--local).
     #[command(subcommand)]
     Ice(commands::ice::IceCommand),
-    /// `MeshOsSnapshot` reads (one-shot).
+    /// Temporary-supervisor snapshot reads (--local).
     #[command(subcommand)]
     Snapshot(commands::snapshot::SnapshotCommand),
-    /// Read-only operator-audit queries.
+    /// Temporary-supervisor audit reads/streams (--local).
     #[command(subcommand)]
     Audit(commands::audit::AuditCommand),
-    /// Substrate log stream.
+    /// Temporary-supervisor log stream (--local).
     #[command(subcommand)]
     Log(LogCommand),
-    /// Substrate failure stream.
+    /// Temporary-supervisor failure stream (--local).
     #[command(subcommand)]
     Failures(FailuresCommand),
-    /// Capability advertisement + discovery.
+    /// Temporary capability reads (--local) or offline announcement authoring.
     #[command(subcommand)]
     Cap(commands::cap::CapCommand),
-    /// Peer + NAT-traversal helpers.
+    /// Temporary-supervisor peer listing (--local).
     #[command(subcommand)]
     Peer(PeerCommand),
-    /// Per-daemon listing.
+    /// Temporary-supervisor daemon listing (--local).
     #[command(subcommand)]
     Daemon(DaemonCommand),
     /// NetDB local KV adapters (Cortex-backed tasks + memories).
     #[command(subcommand)]
     Netdb(commands::netdb::NetdbCommand),
-    /// Organization root authority authoring (keygen / issue-cert
-    /// / issue-floors) — OA-1.
+    /// Organization authority: offline root tools, org links (invite /
+    /// approve / join), removal, leave and member standing.
     #[command(subcommand)]
     Org(commands::org::OrgCommand),
-    /// Node ownership provisioning (`adopt`) — OA-1.
+    /// This profile's running node (`status`) and org ownership (`adopt`).
     #[command(subcommand)]
     Node(commands::node::NodeCommand),
     /// Browser-facing anchor surface: bootstrap credentials
     /// (plan §5 Layer 0, Stage 4b).
     #[command(subcommand)]
     Anchor(commands::anchor::AnchorCommand),
-    /// Hierarchical subnet inspection (`show|ls|tree`).
+    /// Subnet authority: offline issuance, subnet links (invite / join),
+    /// removal, leave and members; temporary topology reads (--local).
     #[command(subcommand)]
     Subnet(commands::subnet::SubnetCommand),
-    /// `SubnetGateway` stats + export-table operator surface.
+    /// Temporary gateway reads (--local); export is unsupported.
     #[command(subcommand)]
     Gateway(commands::gateway::GatewayCommand),
-    /// `ChannelConfigRegistry` inspection (`visibility|ls`).
+    /// Channel credentials: offline grants, serving, status, publish and
+    /// leave on the running node; temporary registry reads (--local).
     #[command(subcommand)]
     Channel(commands::channel::ChannelCommand),
-    /// `AggregatorDaemon` inspection + remote query.
+    /// Temporary inspection (--local) or explicitly targeted aggregator RPC.
     #[command(subcommand)]
     Aggregator(commands::aggregator::AggregatorCommand),
     /// Blob + directory transfer (recv/send/ls/status/cancel).
@@ -282,13 +309,84 @@ async fn main() -> ExitCode {
 }
 
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
+    if let Some(timeout) = cli.timeout {
+        use commands::aggregator::AggregatorCommand;
+        use commands::transfer::TransferCommand;
+        use commands::typegen::TypegenCommand;
+        let supported = match &cli.command {
+            Command::Aggregator(AggregatorCommand::Query(a)) => !a.attach.inspect_target,
+            Command::Aggregator(AggregatorCommand::Spawn(a)) => !a.attach.inspect_target,
+            Command::Aggregator(AggregatorCommand::Scale(a)) => !a.attach.inspect_target,
+            Command::Aggregator(AggregatorCommand::Ls(a)) => {
+                !a.scope.local && !a.attach.inspect_target
+            }
+            Command::Transfer(TransferCommand::Ls(a)) => !a.attach.inspect_target,
+            Command::Transfer(TransferCommand::Status(a)) => !a.attach.inspect_target,
+            Command::Transfer(TransferCommand::Cancel(a)) => !a.attach.inspect_target,
+            Command::Transfer(TransferCommand::RecvBlob(a)) => !a.attach.inspect_target,
+            Command::Typegen(TypegenCommand::Generate(a)) => {
+                a.from_snapshot.is_none() && !a.attach.inspect_target
+            }
+            Command::Typegen(TypegenCommand::Snapshot(a)) => !a.attach.inspect_target,
+            Command::Mcp(commands::mcp::McpCommand::Serve(a)) => !a.remote.inspect_target,
+            Command::Wrap(a) => !a.remote.inspect_target,
+            _ => false,
+        };
+        if !supported {
+            return Err(error::invalid_args("--timeout is not supported for this command/mode; supported for remote aggregator ls/query/spawn/scale, transfer ls/status/cancel/recv-blob, live typegen acquisition and mcp serve/wrap startup. Remove --timeout to use the command's existing limits"));
+        }
+        let deadline = deadline::Deadline::after(timeout)?;
+        // These commands bound acquisition internally without cancelling writes.
+        if matches!(
+            &cli.command,
+            Command::Typegen(_)
+                | Command::Transfer(TransferCommand::RecvBlob(_))
+                | Command::Mcp(commands::mcp::McpCommand::Serve(_))
+                | Command::Wrap(_)
+        ) {
+            return Box::pin(dispatch_inner(cli, Some(deadline))).await;
+        }
+        return deadline.run(Box::pin(dispatch_inner(cli, None))).await;
+    }
+    // Each branch otherwise embeds the entire command tree's future in this
+    // frame, overflowing the Windows main stack in optional-feature builds.
+    Box::pin(dispatch_inner(cli, None)).await
+}
+
+async fn dispatch_inner(cli: Cli, deadline: Option<deadline::Deadline>) -> Result<(), CliError> {
     let output = cli.output;
     let config_path = cli.config.as_deref();
-    let profile = cli.profile.as_str();
+    let profile = cli.profile.as_deref().unwrap_or("default");
+    // Explicit selectors (including environment selections and an explicit
+    // "default") are never silently ignored by offline/utility commands.
+    // Do not load implicit configuration here: commands that do not use it
+    // remain independent of unrelated default configuration and credentials.
+    if cli.config.is_some() || cli.profile.is_some() {
+        deadline::run_optional(deadline, context::resolve_profile(config_path, profile)).await?;
+    }
     let quiet = cli.quiet;
     match cli.command {
         Command::Version => commands::version::run(output).await,
-        Command::Identity(cmd) => commands::identity::run(cmd, output).await,
+        Command::Identity(cmd) => commands::identity::run(cmd, output, config_path, profile).await,
+        Command::Up(args) => {
+            Box::pin(commands::lifecycle::run_up(
+                args,
+                output,
+                config_path,
+                profile,
+            ))
+            .await
+        }
+        Command::Down(args) => commands::lifecycle::run_down(args, output, profile).await,
+        Command::Enrollment(cmd) => {
+            commands::enrollment::run_enrollment(cmd, output, profile).await
+        }
+        Command::Invite(cmd) => commands::enrollment::run_invite(cmd, output, profile).await,
+        Command::Relay(cmd) => commands::relay::run(cmd, output).await,
+        Command::Join(args) => {
+            Box::pin(commands::enrollment::run_join(args, output, profile)).await
+        }
+        Command::Leave(args) => commands::lifecycle::run_leave(args, output, profile).await,
         Command::Admin(cmd) => commands::admin::run(cmd, output, config_path, profile).await,
         Command::Ice(cmd) => commands::ice::run(cmd, output, config_path, profile).await,
         Command::Snapshot(cmd) => commands::snapshot::run(cmd, output, config_path, profile).await,
@@ -307,8 +405,8 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             commands::daemon::run_ls(args, output, config_path, profile).await
         }
         Command::Netdb(cmd) => commands::netdb::run(cmd, output, config_path, profile).await,
-        Command::Org(cmd) => commands::org::run(cmd, output).await,
-        Command::Node(cmd) => commands::node::run(cmd, output).await,
+        Command::Org(cmd) => commands::org::run(cmd, output, config_path, profile).await,
+        Command::Node(cmd) => commands::node::run(cmd, output, config_path, profile).await,
         Command::Anchor(cmd) => commands::anchor::run(cmd, output, config_path, profile).await,
         Command::Subnet(cmd) => commands::subnet::run(cmd, output, config_path, profile).await,
         Command::Gateway(cmd) => commands::gateway::run(cmd, output, config_path, profile).await,
@@ -317,14 +415,51 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             commands::aggregator::run(cmd, output, config_path, profile).await
         }
         Command::Transfer(cmd) => {
-            commands::transfer::run(cmd, output, config_path, profile, quiet).await
+            Box::pin(commands::transfer::run(
+                cmd,
+                output,
+                config_path,
+                profile,
+                quiet,
+                deadline,
+            ))
+            .await
         }
-        Command::Wrap(args) => commands::wrap::run(args, output, config_path, profile).await,
-        Command::Mcp(cmd) => commands::mcp::run(cmd, output, config_path, profile).await,
+        Command::Wrap(args) => {
+            Box::pin(commands::wrap::run(
+                args,
+                output,
+                config_path,
+                profile,
+                deadline,
+            ))
+            .await
+        }
+        Command::Mcp(cmd) => {
+            Box::pin(commands::mcp::run(
+                cmd,
+                output,
+                config_path,
+                profile,
+                deadline,
+            ))
+            .await
+        }
         Command::Forwarding(cmd) => {
             commands::forwarding::run(cmd, output, config_path, profile).await
         }
-        Command::Typegen(cmd) => commands::typegen::run(cmd, output, config_path, profile).await,
+        Command::Typegen(cmd) => {
+            // Keep acquisition's nested timeout futures off the dispatch stack,
+            // including for unrelated commands on Windows' smaller main stack.
+            Box::pin(commands::typegen::run(
+                cmd,
+                output,
+                config_path,
+                profile,
+                deadline,
+            ))
+            .await
+        }
         Command::Completion(args) => commands::completion::run::<Cli>(args),
         Command::Man => commands::man::run::<Cli>(),
     }

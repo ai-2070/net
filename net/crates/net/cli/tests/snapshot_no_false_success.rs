@@ -147,7 +147,9 @@ fn local_still_says_the_runtime_was_created_by_this_command() {
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     assert!(
-        stderr.contains("not a view of a running deployment"),
+        stderr.contains(
+            "Starts a temporary supervisor for this command; does not inspect a running node."
+        ),
         "`--local` produced no caveat on stderr:\n{stderr}"
     );
 }

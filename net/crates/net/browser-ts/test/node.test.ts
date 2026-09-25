@@ -282,9 +282,33 @@ describe('BrowserNode', () => {
   it('sends a session-independent signalling envelope', async () => {
     const inner = new FakeNode();
     const node = await connected(inner);
-    await node.signal('beefcafe00000002', 4, 'offer', new Uint8Array([1, 2]));
+    // The dialog is the 16-hex spelling, passed through verbatim: a
+    // numeric dialog is a `u64` through a JS number, and one round
+    // trip through `as f64 as u64` rounds ~511 of every 512 minted
+    // ids into a dialog that names no attempt.
+    await node.signal('beefcafe00000002', '0000000000000004', 'offer', new Uint8Array([1, 2]));
+    // …and one whose u64 is NOT f64-representable
+    // ('0123456789abcdef' = 81985529216486895: `as f64 as u64` rounds
+    // it to …896, re-spelling the dialog `…abcdf0`). The fixture
+    // above re-encodes identically through any `Number` → re-pad hop,
+    // so the verbatim property is only proven end to end on a
+    // spelling that would visibly round. (The review's suggested
+    // `0011223344556677` is itself f64-exact — 4822678189205111 <
+    // 2^53 — and proves nothing.)
+    await node.signal('beefcafe00000002', '0123456789abcdef', 'offer', new Uint8Array([3]));
     expect(inner.signals).toEqual([
-      { peerHex: 'beefcafe00000002', dialog: 4, kind: 'offer', payload: new Uint8Array([1, 2]) },
+      {
+        peerHex: 'beefcafe00000002',
+        dialog: '0000000000000004',
+        kind: 'offer',
+        payload: new Uint8Array([1, 2]),
+      },
+      {
+        peerHex: 'beefcafe00000002',
+        dialog: '0123456789abcdef',
+        kind: 'offer',
+        payload: new Uint8Array([3]),
+      },
     ]);
   });
 
@@ -824,6 +848,95 @@ describe('peer attempts', () => {
     expect(() => peerIdHex('00366d403ce19dac')).toThrow(TypeError);
     expect(() => peerIdHex('0x7b')).toThrow(TypeError);
     expect(() => peerIdHex('18446744073709551616')).toThrow(TypeError);
+  });
+});
+
+/**
+ * The node-id seam, page → binding → parse: the unit-level half of
+ * `stage6_one_node_id_spelling_across_both_signalling_surfaces`.
+ *
+ * Under test is the BINDING SHAPE with a fixture that reaches the
+ * parse (`FakeNode.signal` mirrors `parse_peer_id` / `parse_dialog_id`
+ * and models the glue in front of them): `node.signal(peer, …)`
+ * carries each of the five spellings VERBATIM to the parse, reads two
+ * as ONE id and three as the named refusal "is not a peer id",
+ * carries a dialog no `f64` holds exactly, and refuses a non-string
+ * id BY NAME before the wasm seam. The seam is where finding #52
+ * died: the browser witness passed the dialog as the bare NUMBER 0,
+ * `wasm-bindgen`'s String marshaling corrupted on it (panic
+ * `assert!(old_size > 0)` in `passStringToWasm0`), and the call was
+ * killed before any parser ran — for every peer spelling alike.
+ * `parse_peer_id`'s own witness is the wasm runner's
+ * (`id_parse_witnesses` in `leaf/src/wasm.rs`).
+ */
+describe('node-id spellings across the signal seam', () => {
+  /** The five spellings the browser witness drives. */
+  const FIVE: ReadonlyArray<readonly [spelling: string, parses: boolean]> = [
+    ['00366d403ce19dac', true],
+    ['0x00366d403ce19dac', true],
+    ['2', false],
+    ['0x9', false],
+    ['nine', false],
+  ];
+  /**
+   * A dialog u64 no `f64` holds: `as f64 as u64` re-spells
+   * `…89abcdef` as `…abcdf0`, so this spelling survives only if the
+   * boundary carries it verbatim.
+   */
+  const DIALOG = '0123456789abcdef';
+
+  it('reads the five spellings one way: two parse to the same id, three are refused by name', async () => {
+    const inner = new FakeNode();
+    const node = await connected(inner);
+    const refused: string[] = [];
+    for (const [spelling, parses] of FIVE) {
+      const call = node.signal(spelling, DIALOG, 'offer', new Uint8Array());
+      if (parses) {
+        await expect(call).resolves.toBeUndefined();
+      } else {
+        // `parsed` is read off the refusal TEXT in the browser
+        // witness — "is not a peer id" is the parser — so the text is
+        // the contract, not decoration.
+        await expect(call).rejects.toMatchObject({
+          message: expect.stringContaining('is not a peer id'),
+        });
+        refused.push(spelling);
+      }
+    }
+    expect(refused).toEqual(['2', '0x9', 'nine']);
+    // The bare and prefixed spellings name the SAME node …
+    expect(inner.parsedSignals.map((s) => s.peer)).toEqual([0x00366d403ce19dacn, 0x00366d403ce19dacn]);
+    // … and the dialog crossed verbatim and exact, alongside: no
+    // numeric coercion, no f64 rounding.
+    expect(inner.signals.map((s) => s.dialog)).toEqual([DIALOG, DIALOG]);
+    expect(inner.parsedSignals.map((s) => s.dialog)).toEqual([0x0123456789abcdefn, 0x0123456789abcdefn]);
+  });
+
+  it('refuses a non-string id by name, before the wasm seam — the finding #52 call shape', async () => {
+    const inner = new FakeNode();
+    const node = await connected(inner);
+    for (const bad of [0, 1.5, 81985529216486895n, null, undefined, {}]) {
+      // The bare NUMBER 0 is the stale f64-seam dialog the browser
+      // witness passed; the rest are the other shapes a JS caller can
+      // mean by "an id". None may reach the seam.
+      await expect(
+        node.signal('00366d403ce19dac', bad as unknown as string, 'offer', new Uint8Array()),
+      ).rejects.toMatchObject({ message: expect.stringContaining('is not a dialog id') });
+    }
+    await expect(
+      node.signal(2 as unknown as string, '0000000000000000', 'offer', new Uint8Array()),
+    ).rejects.toMatchObject({ message: expect.stringContaining('is not a peer id') });
+    // Two bad arguments name the peer first — `LeafNode::signal`'s
+    // parse order.
+    await expect(
+      node.signal(2 as unknown as string, 0 as unknown as string, 'offer', new Uint8Array()),
+    ).rejects.toMatchObject({ message: expect.stringContaining('is not a peer id') });
+    // Nothing reached the seam: the call died at the binding with a
+    // named refusal, never in the wasm marshaling (which is what #52
+    // observed — a marshaling death kills the call before any
+    // parser).
+    expect(inner.signals).toEqual([]);
+    expect(inner.parsedSignals).toEqual([]);
   });
 });
 

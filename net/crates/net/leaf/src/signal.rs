@@ -14,7 +14,8 @@
 //!    would make the carrier trusted.
 //! 2. **The window and the seen-set.** `not_after` bounds replay to
 //!    an interval, and [`SeenSignals`] refuses a second
-//!    `(from, dialog, kind)` inside it. Without the seen-set an
+//!    `(from, dialog, kind, payload digest)` inside it — only a
+//!    byte-identical re-send is a replay. Without the seen-set an
 //!    observer could re-offer a still-valid envelope and restart a
 //!    dialog the sender had abandoned.
 //!
@@ -212,7 +213,7 @@ pub enum SignalAdmission {
 
 /// The exact-replay set for the signalling window.
 ///
-/// **Keyed by payload digest as well as dialog and kind** (R8). The
+/// **Keyed by `(from, dialog, kind, payload digest)`** (R8). The
 /// old `(from, dialog, kind)` key made the SECOND legitimate ICE
 /// candidate of a dialog a replay of the first — every dialog was
 /// limited to one candidate per kind, which is not a property
@@ -420,7 +421,7 @@ mod tests {
         assert!(seen.admit(&env, 1_000), "first admission");
         assert!(
             !seen.admit(&env, 1_000),
-            "the same (from, dialog, kind) must be refused inside the window"
+            "the same (from, dialog, kind, payload digest) must be refused inside the window"
         );
 
         // A different kind on the same dialog is a different message.

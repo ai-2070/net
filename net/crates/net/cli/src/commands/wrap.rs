@@ -2,7 +2,8 @@
 //! as owner-only mesh capabilities (`MCP_BRIDGE_PLAN.md` Phase 1, supply side).
 //!
 //! Builds a mesh node under the operator's identity, joins the mesh via a
-//! remote-attach peer, then hands the wrapped server to
+//! remote-attach peer (or listens independently with `--listen`), then hands
+//! the wrapped server to
 //! [`net_mcp::wrap::ServerPublisher::publish_server`] which discovers its
 //! tools, announces them, and serves an owner-scoped nRPC handler per tool.
 //! The process stays up serving until Ctrl-C; on server exit the publication
@@ -29,9 +30,9 @@ use tokio::sync::broadcast;
 
 use crate::commands::aggregator::RemoteAttachArgs;
 use crate::context::{
-    build_attached_mesh, load_operator_identity, require_remote_attach, resolve_profile,
+    build_attached_mesh, load_operator_identity, require_remote_attach_with_bind, resolve_profile,
 };
-use crate::error::{generic, invalid_args, sdk, CliError};
+use crate::error::{connection_failure, generic, invalid_args, sdk, CliError};
 use crate::output::{emit_stream_row, OutputFormat};
 use crate::parsers::parse_u64_flexible;
 
@@ -45,6 +46,8 @@ enum WrapEvent<'a> {
     /// The initial report: served + skipped tools, the announced
     /// visibility/scope, and any explicitly-widened caller origins.
     Wrapped {
+        /// Live UDP bind, identity and Noise key. Never includes the PSK or seed.
+        connection: ConnectionInfo,
         name: &'a str,
         tools: &'a [String],
         skipped: &'a [String],
@@ -75,10 +78,23 @@ enum WrapEvent<'a> {
     ServerExited,
 }
 
+#[derive(serde::Serialize)]
+struct ConnectionInfo {
+    bind: String,
+    node_id: String,
+    node_pubkey: String,
+    origin_hash: String,
+}
+
 #[derive(Args, Debug)]
 pub struct WrapArgs {
     /// A short label for this wrapped server (shown in output; not a tool id).
     pub name: String,
+
+    /// Start a standalone publisher without joining a peer. Requires a PSK;
+    /// defaults to loopback bind. Rejects remote peer settings, including profile defaults.
+    #[arg(long)]
+    pub listen: bool,
 
     /// Force credential status to `credentialed` (upward — always allowed).
     #[arg(long, conflicts_with = "no_credentials")]
@@ -128,6 +144,13 @@ pub struct WrapArgs {
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
+    /// Run as the device enrolled in this state directory (as given to
+    /// `join` / `up`): its identity, mesh PSK and the node it enrolled with,
+    /// instead of `--identity` and a remote peer. `up` must not be running
+    /// on it.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["identity", "listen"])]
+    pub joined: Option<PathBuf>,
+
     /// The mesh peer to join.
     #[command(flatten)]
     pub remote: RemoteAttachArgs,
@@ -142,36 +165,122 @@ pub async fn run(
     output: Option<OutputFormat>,
     config_path: Option<&Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
-    let profile = resolve_profile(config_path, profile_name).await?;
+    let profile =
+        crate::deadline::run_optional(deadline, resolve_profile(config_path, profile_name)).await?;
 
-    // The mesh peer to join. `net-mesh wrap` must join a mesh to be reachable.
-    let remote = require_remote_attach(&profile, &args.remote, || {
-        invalid_args(
-            "net-mesh wrap needs a mesh peer to join. Pass \
+    let joined_peer = match &args.joined {
+        Some(_) => crate::commands::joined::peer_override(&args.remote)?,
+        None => None,
+    };
+    let listener = if args.listen {
+        Some(resolve_listener(&profile, &args.remote)?)
+    } else {
+        None
+    };
+    let remote = if args.listen || args.joined.is_some() {
+        None
+    } else {
+        Some(require_remote_attach_with_bind(
+            &profile,
+            &args.remote,
+            crate::context::DEFAULT_SERVICE_BIND,
+            || {
+                invalid_args(
+                    "net-mesh wrap needs a mesh peer to join. Pass \
              --node-addr/--node-pubkey/--node-id/--psk-hex (or set them in your \
-             profile) pointing at a running mesh node.",
-        )
-    })?;
+             profile) pointing at a running mesh node, or use --listen with --psk-hex.",
+                )
+            },
+        )?)
+    };
 
-    // Operator identity — owner-only keys on this node's origin.
-    let identity_path = args
-        .identity
-        .as_deref()
-        .or(profile.identity.as_deref())
-        .ok_or_else(|| {
-            invalid_args(
-                "net-mesh wrap needs an operator identity: pass --identity <PATH> or set \
-                 `identity = \"...\"` in your profile. Owner-only scoping keys on it, \
-                 so an ephemeral key would admit nobody.",
+    if args.remote.inspect_target {
+        let mut view = crate::target::inspect(
+            &profile,
+            &args.remote,
+            args.identity.as_deref(),
+            remote.as_ref(),
+            "hosted_service",
+        )
+        .await?;
+        if let Some((bind, _)) = &listener {
+            view.listener_bind(
+                bind.to_string(),
+                if args.remote.bind.is_some() {
+                    "flag"
+                } else if profile.bind.is_some() {
+                    "profile"
+                } else {
+                    "default"
+                },
+                if args.remote.psk_hex.is_some() {
+                    "flag"
+                } else {
+                    "profile"
+                },
+            );
+        }
+        return view.emit(output);
+    }
+
+    // Operator identity — owner-only keys on this node's origin. An enrolled
+    // device (`--joined`) runs as its enrolled identity instead.
+    let identity = match &args.joined {
+        Some(_) => None,
+        None => {
+            let identity_path = args
+                .identity
+                .as_deref()
+                .or(profile.identity.as_deref())
+                .ok_or_else(|| {
+                    invalid_args(
+                        "net-mesh wrap needs an operator identity: pass --identity <PATH> or set \
+                         `identity = \"...\"` in your profile. Owner-only scoping keys on it, \
+                         so an ephemeral key would admit nobody.",
+                    )
+                })?;
+            Some(
+                crate::deadline::run_optional(deadline, load_operator_identity(identity_path))
+                    .await?,
             )
-        })?;
-    let identity = load_operator_identity(identity_path).await?;
+        }
+    };
+    let joined_bind = args
+        .remote
+        .bind
+        .clone()
+        .or(profile.bind.clone())
+        .unwrap_or_else(|| crate::context::DEFAULT_SERVICE_BIND.to_string());
 
     // Build a mesh under that identity and join via the peer. `Arc` because
     // the publisher (and each publication) holds the mesh alongside us.
-    let mesh =
-        std::sync::Arc::new(build_attached_mesh("0.0.0.0:0", Some(identity), &remote).await?);
+    let (mesh, _joined_guard) = crate::deadline::run_optional(deadline, async {
+        if let Some(dir) = &args.joined {
+            let (mesh, path, guard) =
+                crate::commands::joined::attach(dir, &joined_bind, joined_peer.clone()).await?;
+            eprintln!("net-mesh wrap: running as the enrolled device ({path} attach)");
+            return Ok((mesh, Some(guard)));
+        }
+        let identity = identity.ok_or_else(|| invalid_args("wrap needs an operator identity"))?;
+        if let Some((bind, psk)) = listener {
+            let mesh = net_sdk::MeshBuilder::new(&bind.to_string(), &psk)
+                .map_err(|e| connection_failure(format!("listener configuration: {e}")))?
+                .identity(identity)
+                .build()
+                .await
+                .map_err(|e| connection_failure(format!("listener startup: {e}")))?;
+            mesh.start();
+            Ok((mesh, None))
+        } else if let Some(remote) = remote.as_ref() {
+            Ok((build_attached_mesh(Some(identity), remote).await?, None))
+        } else {
+            Err(invalid_args("wrap needs --listen or a remote peer"))
+        }
+    })
+    .await?;
+    let mesh = std::sync::Arc::new(mesh);
 
     // Parse the rest of the operator's intent.
     let (program, prog_args) = args
@@ -241,10 +350,15 @@ pub async fn run(
     }
 
     let publisher = ServerPublisher::new(std::sync::Arc::clone(&mesh));
-    let mut publication = publisher
-        .publish_server(program, prog_args, &envs, config)
-        .await
-        .map_err(|e| sdk(format!("wrap failed: {e}")))?;
+    // Expiry drops the in-progress client (kill_on_drop child) and any local
+    // serve handles. Do not apply this startup budget to refresh or lifetime.
+    let mut publication = crate::deadline::run_optional(deadline, async {
+        publisher
+            .publish_server(program, prog_args, &envs, config)
+            .await
+            .map_err(|e| sdk(format!("wrap failed: {e}")))
+    })
+    .await?;
 
     // Report what was wrapped through the `--output` pipeline. Wrap streams
     // (report + lifecycle events), so it resolves the stream format.
@@ -252,6 +366,12 @@ pub async fn run(
     emit_stream_row(
         fmt,
         &WrapEvent::Wrapped {
+            connection: ConnectionInfo {
+                bind: mesh.local_addr().to_string(),
+                node_id: format!("0x{:016x}", mesh.node_id()),
+                node_pubkey: hex::encode(mesh.public_key()),
+                origin_hash: format!("0x{:016x}", mesh.origin_hash()),
+            },
             name: &args.name,
             tools: publication.tools(),
             skipped: publication.skipped_tools(),
@@ -330,6 +450,39 @@ pub async fn run(
 
 // Identity loading and mesh attachment are shared with `net-mesh mcp serve` — see
 // `context::load_operator_identity` and `context::build_attached_mesh`.
+
+fn resolve_listener(
+    profile: &crate::config::Profile,
+    args: &RemoteAttachArgs,
+) -> Result<(std::net::SocketAddr, [u8; 32]), CliError> {
+    crate::context::validate_endpoint(profile)?;
+    if args.node_addr.is_some()
+        || args.node_pubkey.is_some()
+        || args.remote_node_id.is_some()
+        || profile.node_addr.is_some()
+        || profile.node_pubkey.is_some()
+        || profile.node_id.is_some()
+    {
+        return Err(invalid_args("--listen conflicts with remote peer settings; use a profile without node_addr/node_pubkey/node_id"));
+    }
+    // Bind and PSK literals parse through the same helpers as the attach
+    // path (`context::parse_bind_literal` / `context::parse_psk_hex`): one
+    // malformed literal is one exit-code class on every verb (review
+    // finding 7 — these used to be a second copy and had drifted).
+    let bind = crate::context::parse_bind_literal(
+        args.bind
+            .as_deref()
+            .or(profile.bind.as_deref())
+            .unwrap_or("127.0.0.1:0"),
+    )?;
+    let psk = crate::context::parse_psk_hex(
+        args.psk_hex
+            .as_deref()
+            .or(profile.psk_hex.as_deref())
+            .ok_or_else(|| invalid_args("--listen requires --psk-hex or profile psk_hex"))?,
+    )?;
+    Ok((bind, psk))
+}
 
 /// Parse `KEY=VALUE` env pairs.
 fn parse_env_pairs(raw: &[String]) -> Result<Vec<(String, String)>, CliError> {
@@ -442,6 +595,7 @@ mod tests {
         let tools = vec!["echo".to_string()];
         let skipped: Vec<String> = Vec::new();
         serde_json::to_value(WrapEvent::Wrapped {
+            connection: test_connection(),
             name: "gh",
             tools: &tools,
             skipped: &skipped,
@@ -459,6 +613,7 @@ mod tests {
         let skipped: Vec<String> = Vec::new();
         let root_hex = "aa".repeat(32);
         let v = serde_json::to_value(WrapEvent::Wrapped {
+            connection: test_connection(),
             name: "gh",
             tools: &tools,
             skipped: &skipped,
@@ -490,5 +645,14 @@ mod tests {
         // No `--allow`: an empty list is the honest "same-root only" case.
         let v = wrapped_event(&[]);
         assert_eq!(v["allowed_origins"], serde_json::json!([]));
+    }
+
+    fn test_connection() -> ConnectionInfo {
+        ConnectionInfo {
+            bind: "127.0.0.1:1234".into(),
+            node_id: "0x01".into(),
+            node_pubkey: "ab".repeat(32),
+            origin_hash: "0x02".into(),
+        }
     }
 }

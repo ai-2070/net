@@ -318,12 +318,59 @@ async function opOpen(req) {
   page = await live.context.newPage();
   page.on('console', (m) => log(`[page] ${m.type()}: ${m.text()}`));
   page.on('pageerror', (e) => log(`[page] ERROR ${e && e.message}`));
-  // `domcontentloaded`, not `load`: the page's own work starts on
-  // module evaluation and the runner drives it over HTTP from there.
-  // Waiting for `load` would block on whatever the page is already
-  // doing.
-  await page.goto(req.url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  await navigateUntilBooted(page, req.url);
   return { url: page.url(), media };
+}
+
+// A document that loaded and a PAGE that booted are two different
+// facts, and until this function existed the driver could only observe
+// the first.
+//
+// `waitUntil: 'domcontentloaded'` resolves when the HTML is parsed. The
+// page is not usable then: the runner drives it over HTTP and every
+// step arrives through `main` in `/matrix.js`, so a module graph that
+// never evaluated leaves the tab inert with no `page up` — and the row
+// dies as a bare scenario timeout that names nothing. Measured in run
+// 35540607054: `browser_cone_symmetric` and
+// `browser_symmetric_symmetric_nomedia` were the only two rows where a
+// tab failed to boot, the only two where any `net::ERR_NETWORK_CHANGED`
+// appeared, and the only two whose evidence was missing a `page up`
+// from one tab. Every other row that run booted both tabs.
+//
+// The cause is a Chromium startup race, not the page, the page server
+// or ICE: the network service reports an interface change as it settles
+// the interface list and fails any request in flight when the
+// navigation wins that race. It is per-tab and random — one tab of the
+// row booted, `real` enumeration was present, the same topology passed
+// minutes earlier — which is why it is retried rather than diagnosed
+// further; there is nothing above the browser left to instrument.
+//
+// The retry is bounded, logged, and decided by the page's OWN boot
+// flag (`matrix.js` sets `globalThis.__natsimBooted` once its imports
+// have evaluated), so a tab that genuinely cannot boot still fails the
+// row — now naming the engine's own console errors instead of a
+// timeout. A successful retry is recorded too: a row that needed two
+// attempts must not read like a row that needed one.
+async function navigateUntilBooted(page, url) {
+  const attempts = 3;
+  // `domcontentloaded` on this page is served from `localhost` and is
+  // instant; if the module graph has not evaluated in five seconds it
+  // is not going to, and the three attempts must fit inside the
+  // scenario's 120 s budget beside a real ICE deadline.
+  const bootTimeoutMs = 5_000;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await page.waitForFunction(() => globalThis.__natsimBooted === true, null, {
+        timeout: bootTimeoutMs,
+      });
+      log(`page booted (attempt ${attempt}/${attempts})`);
+      return;
+    } catch (e) {
+      log(`page navigate attempt ${attempt}/${attempts} did not boot: ${(e && e.message) || e}`);
+      if (attempt === attempts) throw e;
+    }
+  }
 }
 
 // What the port allocator enumerated, as a value the runner can

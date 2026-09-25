@@ -18,6 +18,8 @@
 //! - **CortEX / NetDB** (outside this crate) query that state.
 
 mod adapter;
+#[cfg(feature = "cortex")]
+mod checkpoint;
 mod config;
 mod envelope;
 mod error;

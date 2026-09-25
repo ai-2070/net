@@ -39,6 +39,7 @@ describe('subnet stable-kind fixture (native-free)', () => {
       'gateway_advertisement',
       'export_policy',
       'revocation_floor',
+      'subject_floor',
     ])
     expect(fixture.access).toEqual(['sameOrg', 'granted'])
   })
