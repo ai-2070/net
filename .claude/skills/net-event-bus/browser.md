@@ -131,9 +131,14 @@ for await (const bytes of stream) consume(bytes);   // ends on node.close()
   application label scoped to a session, so two peer-addressed streams opened
   under one label on one leaf share an id and each receives the other's bytes
   with no error — vary the `label` or `streamId` per peer.
-- **A leader-proxied `openStream` refuses `peer` by name.** A follower's stream
-  is opened by the leader tab's node, and the leader request protocol carries no
-  peer — use `connect()`'s node for leaf ↔ leaf streams.
+- **A peer-addressed stream works from a follower too.** A follower's stream is
+  opened by the leader tab's node, and the request **carries the peer**, so a
+  follower addresses a direct leaf ↔ leaf session exactly as the leader tab does
+  (this was refused by name before the proxy request gained the field). What a
+  page must handle instead: a stream handle is fenced to the session incarnation
+  it was opened on, so when a routed pair upgrades to direct, `send` rejects with
+  `session` ("stale stream handle … reopen the stream") — reopen with the same
+  `peer` and `streamId` rather than assuming continuity.
 - **`close()` ends the iterators it handed out** (direct and proxied alike): a
   `for await` loop leaves, `iterator.next()` resolves `done: true`, listeners
   drop. Opening a stream on a closed node is a typed `SessionError`. Teardown
