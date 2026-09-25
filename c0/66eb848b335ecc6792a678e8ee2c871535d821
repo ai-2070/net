@@ -1,0 +1,14 @@
+net/crates/net/sdk/benches/nrpc_common/mod.rs
+  h_64425bc75e3f3d 775-776
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c066eb848b335ecc6792a678e8ee2c871535d821",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
