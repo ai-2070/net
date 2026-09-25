@@ -4304,6 +4304,8 @@ struct ServeFake {
     refuse_register: Option<ProxyFailure>,
     /// Long-pulls parked and never answered.
     parked: Rc<RefCell<Vec<Replier>>>,
+    /// Every `OrgServeFinish` seen: `(call, status)`.
+    finished: Rc<RefCell<Vec<(u64, u16)>>>,
 }
 
 impl LeaderBackend for ServeFake {
@@ -4342,9 +4344,11 @@ impl LeaderBackend for ServeFake {
                     None => reply.bytes(envelope(ORG_ENVELOPE_END, b"")),
                 }
             }
-            LeaderRequest::OrgServeSend { .. } | LeaderRequest::OrgServeFinish { .. } => {
+            LeaderRequest::OrgServeFinish { call, status, .. } => {
+                self.finished.borrow_mut().push((call, status));
                 reply.bytes(Bytes::new())
             }
+            LeaderRequest::OrgServeSend { .. } => reply.bytes(Bytes::new()),
             LeaderRequest::OrgServeRetired { .. } => self.parked.borrow_mut().push(reply),
             _ => reply.bytes(Bytes::new()),
         }
@@ -4448,6 +4452,44 @@ async fn a_well_formed_proxied_accept_dispatches_exactly_one_handler() {
         calls.borrow().len(),
         1,
         "one accept envelope dispatches exactly one handler"
+    );
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+/// §23 audit: an accept is dequeued before its caller resolves. When the
+/// leader cannot project the caller, the call is not dispatched — and it
+/// must be SETTLED typed (`Internal`), not left admitted until its
+/// deadline. Pre-audit nothing was sent and the remote caller waited.
+#[wasm_bindgen_test]
+async fn an_accept_whose_caller_cannot_resolve_is_settled_not_stranded() {
+    let fake = ServeFake::default();
+    fake.accepts
+        .borrow_mut()
+        .push_back("{\"call\":\"9\"}".to_string());
+    // No verified projection for call 9: `OrgServeCaller` fails.
+    let finished = Rc::clone(&fake.finished);
+    let (session, leader) = serve_session(fake).await;
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    session
+        .serve_org(
+            "svc.accept-unresolved".to_string(),
+            "same-org".to_string(),
+            recording_handler(&calls),
+            serve_opts(),
+        )
+        .expect("the registration starts");
+    wait_ms(300).await;
+
+    assert!(
+        calls.borrow().is_empty(),
+        "no handler runs without a verified caller"
+    );
+    assert_eq!(
+        finished.borrow().as_slice(),
+        &[(9, RpcStatus::Internal.to_wire())],
+        "the undispatched call is settled typed, exactly once"
     );
     session.close();
     leader.close();

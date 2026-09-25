@@ -80,10 +80,27 @@ _RECEIPTS = _SDK_PY / ".s4receipts"
 # (skip), and a wheel that has org but lacks the S4 surface (FAIL LOUDLY —
 # the witnesses' subject is exactly that surface).
 _PROBE = r"""
+import importlib.util
+import os
 import sys
 try:
-    import net._net  # the native extension itself
+    import net._net  # the native extension (runs the facade's __init__ first)
 except BaseException as e:
+    # "No usable wheel" (skip) is ONLY the native extension being absent or
+    # unloadable. If the package ships its extension and the import failed
+    # for any other reason — the facade's own __init__ raising — that is a
+    # BROKEN build and must fail loudly (§23 audit: it used to exit 1 here
+    # and skip every witness). `find_spec` locates the package without
+    # executing it.
+    absent = isinstance(e, ImportError) and getattr(e, "name", None) in ("net", "net._net")
+    spec = None if absent else importlib.util.find_spec("net")
+    locations = (spec.submodule_search_locations or []) if spec else []
+    ships_native = any(
+        f.startswith("_net.") for loc in locations for f in os.listdir(loc)
+    )
+    if ships_native:
+        print("NET_FACADE_IMPORT_FAIL:", type(e).__name__, e)
+        sys.exit(4)
     print("NET_IMPORT_FAIL:", type(e).__name__, e)
     sys.exit(1)
 import net
@@ -152,6 +169,11 @@ def _probe_wheel() -> None:
         )
     if result.returncode == 3:
         pytest.skip(f"net built without the org feature: {detail}", allow_module_level=True)
+    if result.returncode == 4:
+        raise AssertionError(
+            "the `net` wheel's native extension imports but its facade does "
+            f"not (broken build?): {detail}"
+        )
     pytest.skip(f"no usable `net` wheel here: {detail}", allow_module_level=True)
 
 
@@ -477,3 +499,32 @@ def test_stale_wheel_gate_is_reachable(hide_from, tmp_path) -> None:
         "AsyncOrgClient" if hide_from == "native" else "install_org_authority"
     )
     assert expected in out, f"the missing names are not named: {out}"
+
+
+@pytest.mark.timeout(60)
+def test_a_facade_that_fails_to_import_fails_the_gate(tmp_path) -> None:
+    """A wheel whose native extension imports but whose facade raises is a
+    broken build: the probe must answer exit 4 (FAIL LOUDLY), never the
+    exit 1 that means "no usable wheel here" and skips every witness in
+    this module. Pre-fix the facade's traceback exited 1 (§23 audit)."""
+    pkg = tmp_path / "net"
+    pkg.mkdir()
+    (pkg / "_net.py").write_text(
+        "".join(f"{n} = object()\n" for n in _ORG_NAMES), encoding="utf-8"
+    )
+    (pkg / "__init__.py").write_text(
+        'raise RuntimeError("facade broken at import")\n', encoding="utf-8"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", _PROBE],
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 4 and "NET_FACADE_IMPORT_FAIL" in out, (
+        f"a broken facade answered exit {result.returncode}, not the loud "
+        "exit 4 — pre-fix behavior: exit 1 (skip as 'no usable wheel')\n"
+        "--- output ---\n" + out
+    )

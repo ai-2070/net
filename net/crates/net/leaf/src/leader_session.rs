@@ -3964,11 +3964,30 @@ impl ProxyOrgServe {
                                     // A handle the leader does not
                                     // resolve for us — a forged
                                     // accept naming a guessed or
-                                    // foreign id: no dispatch, and
-                                    // one bad accept never kills the
-                                    // registration.
-                                    Err(_) => {}
-                                    Ok(_) => {}
+                                    // foreign id, or a caller the
+                                    // leader could not project: no
+                                    // dispatch, and one bad accept
+                                    // never kills the registration.
+                                    // The accept was already dequeued,
+                                    // so a GENUINE call would sit
+                                    // admitted and undispatched until
+                                    // its deadline (§23 audit): settle
+                                    // it typed instead. The finish is
+                                    // sender-bound at the leader, so
+                                    // for a foreign handle it touches
+                                    // nothing.
+                                    Err(_) | Ok(_) => {
+                                        let _ = loop_lifecycle
+                                            .request(LeaderRequest::OrgServeFinish {
+                                                call,
+                                                status: crate::rpc_wire::RpcStatus::Internal
+                                                    .to_wire(),
+                                                message: "the serving tab could not resolve \
+                                                          the admitted caller"
+                                                    .to_string(),
+                                            })
+                                            .await;
+                                    }
                                 }
                             }
                         }

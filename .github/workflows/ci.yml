@@ -4319,8 +4319,9 @@ jobs:
       # === the sdk-py org facade witnesses (Q6) =====
       # PINS the 9 base names of the 6 matrix functions, the parametrize
       # pair that yields their 12 cells, PY-1's stale-wheel gate witness
-      # (`test_stale_wheel_gate_is_reachable[native|facade]`, 2 rows), and
-      # the count floor (15 + 2 = 17, fail-closed)
+      # (`test_stale_wheel_gate_is_reachable[native|facade]`, 2 rows), the
+      # broken-facade probe witness (§23 audit, 1 row), and the count floor
+      # (15 + 2 + 1 = 18, fail-closed)
       # — AND RUNS them: the step is here, not in `sdk-py-tests`, because
       # these are live rows through `net_sdk` and need two things only this
       # job has by now: the built extension (maturin develop, a few steps
@@ -4331,7 +4332,7 @@ jobs:
       # that can never fail. It runs with the same watchdog settings as the
       # suite run above (`--timeout-method=thread`, `PYTHONFAULTHANDLER`), so
       # a hang in one of these live rows is dumped, not a silent job timeout.
-      - name: Witness roster + floor — sdk-py org facade (17)
+      - name: Witness roster + floor — sdk-py org facade (18)
         working-directory: net/crates/net/sdk-py
         env:
           PYTHONFAULTHANDLER: "1"
@@ -4350,13 +4351,14 @@ jobs:
             test_streaming_midstream_error_surfaces_the_org_vocabulary \
             test_task_cancel_propagates_to_retirement_observables \
             test_stale_wheel_gate_is_reachable \
+            test_a_facade_that_fails_to_import_fails_the_gate \
             same_org granted native facade || exit 1
           out=$(python -m pytest -q --timeout=30 --timeout-method=thread \
                   tests/test_org_streaming.py 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
-          echo "sdk-py org facade: ${n:-0} (floor 17)"
-          if [ -z "$n" ] || [ "$n" -lt 17 ]; then
-            echo "::error::the sdk-py org facade ran ${n:-0} rows, floor is 17 — \
+          echo "sdk-py org facade: ${n:-0} (floor 18)"
+          if [ -z "$n" ] || [ "$n" -lt 18 ]; then
+            echo "::error::the sdk-py org facade ran ${n:-0} rows, floor is 18 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
@@ -6811,6 +6813,7 @@ jobs:
           a_follower_owns_its_streams_independently_under_one_wire_id
           a_forged_accept_claim_is_never_served_to_the_handler_as_the_caller
           a_well_formed_proxied_accept_dispatches_exactly_one_handler
+          an_accept_whose_caller_cannot_resolve_is_settled_not_stranded
           two_peers_under_one_wire_id_own_their_streams_independently
           a_runtime_announcement_is_restored_by_the_promoted_tab
           a_second_duplex_stream_observes_the_latched_admission_denial_not_a_fabricated_completion
@@ -6857,7 +6860,7 @@ jobs:
             # this step.
             case "$suite" in
               wasm_leaf)       floor=16 ;;
-              wasm_leader)     floor=37 ;;
+              wasm_leader)     floor=38 ;;
               wasm_anchorless) floor=2  ;;
               # The leaf half. `leaf/src/rtc.rs` is
               # `#![cfg(target_arch = "wasm32")]` in its entirety, so
@@ -6929,14 +6932,15 @@ jobs:
           # and the three accept-claim/registration witnesses ran here
           # unpinned since their slices landed; all 36 tests of the
           # suite are name-pinned and the floor is the real count. The
-          # §23 audit added the concurrent-consumer LEAF-1 witness: 37.)
+          # §23 audit added the concurrent-consumer LEAF-1 witness and the
+          # unresolved-accept settlement witness: 38.)
           for witness in $LEADER_WITNESSES; do
             grep -q "^test $witness \.\.\. ok$" /tmp/wasm_leader.log || {
               echo "::error::the leader lifecycle witness $witness did not run and pass inside wasm"
               exit 1
             }
           done
-          echo "leader lifecycle: 37 witnesses executed in headless Chromium"
+          echo "leader lifecycle: 38 witnesses executed in headless Chromium"
 
       # Exit criterion: the shipped bundle stays under 1.5 MB gzipped.
       - name: Bundle size
