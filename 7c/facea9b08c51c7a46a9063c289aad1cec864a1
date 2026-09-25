@@ -1,0 +1,37 @@
+net/crates/net/sdk/tests/rtc_bootstrap_listener.rs
+  s_4a0f4aa1c8ef20::t_b34b7f759674ce 712-713
+docs/internal/performance/WEBRTC_DOUBLE_AEAD.md
+  s_4a0f4aa1c8ef20::t_4de9c5f53c25f5 6-8
+net/crates/net/browser-ts/test/store/lifecycle-model.ts
+  s_4a0f4aa1c8ef20::t_b34b7f759674ce 7-8
+net/crates/net/tests/rtc_repairs.rs
+  s_4a0f4aa1c8ef20::t_b34b7f759674ce 5283-5284
+net/crates/net/browser-ts/test/node.test.ts
+  s_4a0f4aa1c8ef20::t_b34b7f759674ce 564-565
+docs/internal/spikes/README.md
+  s_4a0f4aa1c8ef20::t_4de9c5f53c25f5 1-16
+docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md
+  s_4a0f4aa1c8ef20::t_05ff2f24c75c0a 3-6
+.github/workflows/ci.yml
+  s_4a0f4aa1c8ef20::t_017be6a28bd6c5 5948
+net/crates/net/tests/feature_consumer/Cargo.toml
+  s_4a0f4aa1c8ef20::t_017be6a28bd6c5 1-28
+net/crates/net/tests/feature_consumer/Cargo.lock
+  s_4a0f4aa1c8ef20::t_09fa67fbfe129e 641,643,1077,1079,1723,1725,1914,1916
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7cfacea9b08c51c7a46a9063c289aad1cec864a1",
+  "prompts": {},
+  "sessions": {
+    "s_4a0f4aa1c8ef20": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "767c9b95-1bc5-40c2-b2e6-0ae35590ef7c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
