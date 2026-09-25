@@ -215,5 +215,5 @@ What to do: read `event-semantics.md`. Name events after what occurred (`order.p
 ## Further reading
 
 - [When to Use Net](https://ai2070.net/docs/worldview/right-and-wrong-use-cases)
-- [MCP vs Net](https://ai2070.net/docs/worldview/mcp-vs-net)
-- [REST vs Net](https://ai2070.net/docs/worldview/rest-vs-net)
+- [MCP vs Net](https://ai2070.net/docs/worldview/how-net-compares#mcp-and-net)
+- [REST vs Net](https://ai2070.net/docs/worldview/how-net-compares#http-and-net)

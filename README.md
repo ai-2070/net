@@ -256,7 +256,7 @@ its own interface, approvals, and user experience.
 - [The Agentic Mesh](https://ai2070.net/docs/worldview/agentic-mesh) — the problem from an application's point of view.
 - [When to use Net](https://ai2070.net/docs/worldview/right-and-wrong-use-cases) — the fit boundary, including when HTTP, MCP, NATS, or an ordinary database is the simpler choice.
 - [How Net relates to other systems](https://ai2070.net/docs/worldview/how-net-compares) — a compact comparison by abstraction, topology, and trust boundary.
-- [Net and MCP](https://ai2070.net/docs/worldview/mcp-vs-net) · [Connecting HTTP systems](https://ai2070.net/docs/worldview/rest-vs-net) · [Net and NATS](https://ai2070.net/docs/worldview/nats-vs-net) · [Net and Zenoh](https://ai2070.net/docs/worldview/zenoh-vs-net).
+- [Net and MCP](https://ai2070.net/docs/worldview/how-net-compares#mcp-and-net) · [Connecting HTTP systems](https://ai2070.net/docs/worldview/how-net-compares#http-and-net) · [Net and NATS](https://ai2070.net/docs/worldview/how-net-compares#nats-and-net) · [Net and Zenoh](https://ai2070.net/docs/worldview/how-net-compares#zenoh-and-net).
 
 Discovery, invocation, and outcome are separate: finding a provider does not authorize a call, and
 a successful invocation is not proof that the real-world outcome holds. See [Submitted is not
