@@ -127,10 +127,13 @@ extern "C" {
 /* Returns the ABI version the loaded library was built with. */
 uint32_t net_org_abi_version(void);
 
-/* Returns NET_ORG_OK iff the loaded library is at least `expected`
- * (a newer library satisfies an older header). Returns
- * NET_ORG_ERR_NULL if the loaded library is older. Pin
- * NET_ORG_ABI_VERSION at init and hard-fail on a negative return. */
+/* Returns NET_ORG_OK iff the loaded library's ABI is EXACTLY `expected` —
+ * equality, not ">=". Returns NET_ORG_ERR_NULL on ANY mismatch (older or
+ * newer): a stale header against a newer library is precisely what this
+ * check exists to catch. "A newer library satisfies an older header" only
+ * holds when every bump is additive, which nothing enforces. Pin
+ * NET_ORG_ABI_VERSION at init, hard-fail on a negative return, and rebuild
+ * against the current headers. */
 int net_org_check_abi_version(uint32_t expected);
 
 /* ======================================================================

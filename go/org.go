@@ -233,8 +233,9 @@ import (
 	"unsafe"
 )
 
-// orgABIVersion is the ABI this file was written against. init() hard-fails if
-// the loaded libnet_org is older (X3 drift guard).
+// orgABIVersion is the ABI this file was written against. init() hard-fails on
+// ANY mismatch — equality, not ">=" (X3 drift guard): a stale header against a
+// newer library is precisely what this check exists to catch.
 //
 //   - 0x0001: the unary surface (credentials / bind / call / serve + the
 //     subnet-exported and provisioning entry points).
@@ -247,7 +248,7 @@ const orgABIVersion uint32 = 0x0002
 func init() {
 	if C.net_org_check_abi_version(C.uint32_t(orgABIVersion)) != C.NET_ORG_OK {
 		panic(fmt.Sprintf(
-			"net: libnet_org ABI mismatch — header expects >= 0x%04x, library is 0x%04x",
+			"net: libnet_org ABI mismatch — header pins exactly 0x%04x, library is 0x%04x",
 			orgABIVersion, uint32(C.net_org_abi_version())))
 	}
 }
