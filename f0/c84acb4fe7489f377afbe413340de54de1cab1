@@ -1,0 +1,27 @@
+net/crates/net/leaf/tests/wasm_anchorless.rs
+  s_d8b00bedd146e9::t_cb732abf0fc17a 57-65,636-694,699
+  s_d8b00bedd146e9::t_d824c60b115100 68,773-780,785-789,791-795
+net/crates/net/leaf/src/rpc.rs
+  s_d8b00bedd146e9::t_34379f9319f4c0 335-352
+net/crates/net/leaf/src/rpc_stream.rs
+  s_d8b00bedd146e9::t_34379f9319f4c0 954-974
+net/crates/net/leaf/src/node.rs
+  s_d8b00bedd146e9::t_f43b7f1e8c0521 4625-4670
+  s_d8b00bedd146e9::t_34379f9319f4c0 2439-2440,3762-3768,3818-3846
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f0c84acb4fe7489f377afbe413340de54de1cab1",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
