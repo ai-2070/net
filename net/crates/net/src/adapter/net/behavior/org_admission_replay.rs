@@ -337,10 +337,7 @@ impl ReplayState {
     /// together, under the caller's lock, or not at all.
     fn charge(&mut self, entry_external: bool, acting_org: &OrgId) {
         self.total += 1;
-        *self.by_org.entry(*acting_org).or_insert(0) += 1;
-        if entry_external {
-            self.external_total += 1;
-        }
+        self.charge_quota(entry_external, acting_org);
     }
 
     /// Release one reclaimed entry from every counter it consumed.
@@ -352,6 +349,27 @@ impl ReplayState {
     /// is when it is hardest to diagnose.
     fn release(&mut self, entry: &ReplayEntry) {
         self.total -= 1;
+        self.release_quota(entry);
+    }
+
+    /// Charge one entry's per-org and external-pool share — every counter
+    /// except `total`. Split out so [`Self::charge`] and the expired-overwrite path
+    /// share one implementation of the quota moves.
+    fn charge_quota(&mut self, entry_external: bool, acting_org: &OrgId) {
+        *self.by_org.entry(*acting_org).or_insert(0) += 1;
+        if entry_external {
+            self.external_total += 1;
+        }
+    }
+
+    /// Release one entry's per-org and external-pool share — the mirror of
+    /// [`Self::charge_quota`]. `external_total` is SATURATED rather than
+    /// wrapped: symmetry keeps it from ever underflowing, and a wrap here
+    /// would turn one accounting slip into a debug panic inside the
+    /// admission path — or, in release, into `usize::MAX` and
+    /// [`ReplayOutcome::ExternalPoolCapacityExhausted`] for every external
+    /// caller, forever.
+    fn release_quota(&mut self, entry: &ReplayEntry) {
         if let Some(count) = self.by_org.get_mut(&entry.acting_org) {
             *count -= 1;
             if *count == 0 {
@@ -359,7 +377,7 @@ impl ReplayState {
             }
         }
         if entry.external {
-            self.external_total -= 1;
+            self.external_total = self.external_total.saturating_sub(1);
         }
     }
 
@@ -731,34 +749,45 @@ impl AdmissionReplayGuard {
         // An existing entry for this exact `(caller, call_id)`:
         // replay vs collision, UNLESS it has expired (then it is
         // reusable — the window closed, so this is a legitimate new
-        // call reusing the id). Handled under one `get_mut` so the
-        // expired overwrite touches neither `total` nor the
-        // per-caller count (the key stays occupied).
-        if let Some(inner) = st.by_caller.get_mut(caller) {
-            if let Some(existing) = inner.get(&call_id) {
-                if existing.expires_at > now {
-                    return if existing.binding_digest == binding_digest {
-                        ReplayOutcome::Replay
-                    } else {
-                        ReplayOutcome::CallIdCollision
-                    };
+        // call reusing the id).
+        let existing = st
+            .by_caller
+            .get(caller)
+            .and_then(|inner| inner.get(&call_id))
+            .map(|e| (e.expires_at, e.binding_digest, e.acting_org, e.external));
+        if let Some((expires, digest, old_org, old_external)) = existing {
+            if expires > now {
+                return if digest == binding_digest {
+                    ReplayOutcome::Replay
+                } else {
+                    ReplayOutcome::CallIdCollision
+                };
+            }
+            if old_org == *principal.acting_org && old_external == external {
+                // Same trust-domain charge: overwrite in place. The key
+                // stays occupied, so no counter moves.
+                if let Some(inner) = st.by_caller.get_mut(caller) {
+                    inner.insert(
+                        call_id,
+                        ReplayEntry {
+                            binding_digest,
+                            expires_at,
+                            acting_org: *principal.acting_org,
+                            external,
+                        },
+                    );
                 }
-                // Expired overwrite REUSES the occupied key, so no counter
-                // moves — the entry it replaces was already charged and is
-                // charged to the same principal by construction (the key is
-                // `(caller, call_id)` and the caller cannot change orgs
-                // mid-window without a new membership certificate).
-                inner.insert(
-                    call_id,
-                    ReplayEntry {
-                        binding_digest,
-                        expires_at,
-                        acting_org: *principal.acting_org,
-                        external,
-                    },
-                );
                 return ReplayOutcome::Admitted;
             }
+            // The charge would MOVE — the caller returned under a different
+            // verified acting org, or a re-adopt flipped `external` (the key
+            // excludes both, and this runs only after the window expired).
+            // For quota purposes that is a NEW admission: release the expired
+            // entry through the ordinary reclaim and admit it below, so the
+            // per-org and external-pool limits apply. Moving the charge in
+            // place (LEAF-2's first repair) skipped them and could overshoot a
+            // full pool by one entry per reused call id (§23 audit).
+            st.reclaim_caller(caller, now);
         }
 
         // New key for this caller. Per-caller ceiling FIRST (E1.5) so
@@ -1964,5 +1993,311 @@ mod tests {
             owner_reserved_entries: 0,
             max_entries_per_external_org: 4,
         });
+    }
+
+    // ==================================================================
+    // LEAF-2 twin — an expired overwrite must move the charge with the
+    // entry.
+    //
+    // The `(caller, call_id)` key EXCLUDES `acting_org`, and the overwrite
+    // branch runs only AFTER the window has expired, so the same caller can
+    // re-present the id verified for a DIFFERENT acting org — or flip
+    // `external` when the owner org changes under a re-adopt. The replaced
+    // entry's counters must move with the stored entry, or its old org's
+    // quota leaks upward until that org is denied with zero live entries,
+    // and `release` later decrements counters the stored entry never
+    // incremented — underflowing `external_total` on a flip (debug: panic
+    // in the admission path; release: `usize::MAX`, every external caller
+    // denied `ExternalPoolCapacityExhausted` forever).
+    // ==================================================================
+
+    /// An expired overwrite verified for a NEW acting org must free the
+    /// replaced entry's quota from the old org and charge the new one.
+    ///
+    /// Pre-fix red: `assert_eq!(guard.org_len(&org_b), 1)` fails — the
+    /// new org is never charged — and `assert_eq!(guard.org_len(&org_a),
+    /// 0)` fails, stranding the old org's quota (that org is later
+    /// denied `PerOrganizationCapacityExhausted` with zero live
+    /// entries).
+    #[test]
+    fn an_expired_overwrite_frees_the_old_org_and_charges_the_new_one() {
+        let guard = partitioned();
+        let t0 = Instant::now();
+        let short = t0 + Duration::from_secs(5);
+        let org_a = external_org(0xA1);
+        let org_b = external_org(0xB1);
+
+        assert_eq!(
+            admit_external(&guard, &org_a, &caller(1), 7, [1u8; 32], short, t0),
+            ReplayOutcome::Admitted,
+        );
+        assert_eq!(guard.org_len(&org_a), 1);
+
+        // The same key AFTER the window closes — now verified for org B.
+        let later = t0 + Duration::from_secs(6);
+        let new_expires = later + Duration::from_secs(5);
+        assert_eq!(
+            admit_external(&guard, &org_b, &caller(1), 7, [2u8; 32], new_expires, later),
+            ReplayOutcome::Admitted,
+        );
+
+        assert_eq!(
+            guard.org_len(&org_b),
+            1,
+            "the new org must be charged for the entry now stored under its name",
+        );
+        assert_eq!(
+            guard.org_len(&org_a),
+            0,
+            "the replaced entry's quota must leave the old org, or the old org \
+             is later denied with zero live entries",
+        );
+        assert_eq!(
+            guard.len(),
+            1,
+            "the occupied key keeps its single global slot",
+        );
+        assert_eq!(guard.external_len(), 1);
+
+        let last = later + Duration::from_secs(6);
+        assert_eq!(guard.evict_expired(last), 1);
+        assert_eq!(guard.len(), 0);
+        assert_eq!(guard.org_len(&org_a), 0);
+        assert_eq!(guard.org_len(&org_b), 0);
+    }
+
+    /// An expired overwrite whose `external` flag flips — the owner org
+    /// can CHANGE under a re-adopt — must move the external-pool charge
+    /// EXACTLY once in each direction.
+    ///
+    /// Pre-fix red: `assert_eq!(guard.external_len(), 1)` in the
+    /// owner→external half fails (never charged) and
+    /// `assert_eq!(guard.external_len(), 0)` in the external→owner half
+    /// fails (never refunded) — the pool then bounds against numbers no
+    /// live entry justifies.
+    #[test]
+    fn an_expired_overwrite_moves_the_external_pool_charge_exactly_once_each_way() {
+        let t0 = Instant::now();
+        let short = t0 + Duration::from_secs(5);
+        let later = t0 + Duration::from_secs(6);
+        let new_expires = later + Duration::from_secs(5);
+        let org_b = external_org(0xB1);
+
+        // owner → external: external_total must RISE by exactly one.
+        let guard = partitioned();
+        assert_eq!(
+            admit_owner(&guard, &caller(1), 7, [1u8; 32], short, t0),
+            ReplayOutcome::Admitted,
+        );
+        assert_eq!(guard.external_len(), 0);
+        assert_eq!(
+            admit_external(&guard, &org_b, &caller(1), 7, [2u8; 32], new_expires, later),
+            ReplayOutcome::Admitted,
+        );
+        assert_eq!(
+            guard.external_len(),
+            1,
+            "an owner→external flip must add exactly one external slot",
+        );
+        assert_eq!(guard.org_len(&owner_org()), 0);
+        assert_eq!(guard.org_len(&org_b), 1);
+
+        // external → owner: external_total must FALL by exactly one.
+        let guard = partitioned();
+        assert_eq!(
+            admit_external(&guard, &org_b, &caller(1), 7, [1u8; 32], short, t0),
+            ReplayOutcome::Admitted,
+        );
+        assert_eq!(guard.external_len(), 1);
+        assert_eq!(
+            admit_owner(&guard, &caller(1), 7, [2u8; 32], new_expires, later),
+            ReplayOutcome::Admitted,
+        );
+        assert_eq!(
+            guard.external_len(),
+            0,
+            "an external→owner flip must return exactly one external slot",
+        );
+        assert_eq!(guard.org_len(&org_b), 0);
+        assert_eq!(guard.org_len(&owner_org()), 1);
+    }
+
+    /// After overwrites that moved charges (an org move and an
+    /// `external` flip), releasing the live set must balance EVERY
+    /// counter to zero — global, external pool, per-org, per-caller.
+    ///
+    /// Pre-fix red: `assert_eq!(guard.org_len(&org_a), 0)` fails with
+    /// the moved-from org still charged. Remove that assertion and the
+    /// run instead dies inside `evict_expired` — the flipped entry's
+    /// `release` underflows `external_total` ("attempt to subtract with
+    /// overflow" in debug; `usize::MAX` in release, caught by
+    /// `assert_eq!(guard.external_len(), 0)`).
+    #[test]
+    fn release_after_overwrites_balances_to_zero_across_the_live_set() {
+        let guard = partitioned();
+        let t0 = Instant::now();
+        let short = t0 + Duration::from_secs(5);
+        let org_a = external_org(0xA1);
+        let org_b = external_org(0xB1);
+        let org_c = external_org(0xC1);
+
+        // Three live entries.
+        assert_eq!(
+            admit_external(&guard, &org_a, &caller(1), 7, [1u8; 32], short, t0),
+            ReplayOutcome::Admitted,
+        );
+        assert_eq!(
+            admit_owner(&guard, &caller(2), 8, [2u8; 32], short, t0),
+            ReplayOutcome::Admitted,
+        );
+        assert_eq!(
+            admit_external(&guard, &org_c, &caller(3), 9, [3u8; 32], short, t0),
+            ReplayOutcome::Admitted,
+        );
+
+        // Two expire and are overwritten with MOVED charges: an org
+        // move (A→B) and an owner→external flip (owner→B). The third
+        // entry is untouched.
+        let later = t0 + Duration::from_secs(6);
+        let new_expires = later + Duration::from_secs(5);
+        assert_eq!(
+            admit_external(&guard, &org_b, &caller(1), 7, [4u8; 32], new_expires, later),
+            ReplayOutcome::Admitted,
+        );
+        assert_eq!(
+            admit_external(&guard, &org_b, &caller(2), 8, [5u8; 32], new_expires, later),
+            ReplayOutcome::Admitted,
+        );
+        assert_eq!(guard.len(), 3);
+        assert_eq!(
+            guard.org_len(&org_a),
+            0,
+            "the moved-from org's quota leaked upward",
+        );
+
+        let last = later + Duration::from_secs(6);
+        assert_eq!(guard.evict_expired(last), 3);
+        assert_eq!(guard.len(), 0, "global count leaked");
+        assert_eq!(guard.external_len(), 0, "external-pool count leaked");
+        assert_eq!(guard.org_len(&org_a), 0);
+        assert_eq!(guard.org_len(&org_b), 0, "the moved-to org's quota leaked");
+        assert_eq!(guard.org_len(&org_c), 0);
+        assert_eq!(
+            guard.org_len(&owner_org()),
+            0,
+            "the flipped-from owner quota leaked",
+        );
+        assert_eq!(guard.caller_len(&caller(1)), 0);
+        assert_eq!(guard.caller_len(&caller(2)), 0);
+        assert_eq!(guard.caller_len(&caller(3)), 0);
+    }
+
+    /// LEAF-2 residual (§23 audit) — an expired overwrite whose charge
+    /// MOVES is a new admission for quota purposes, so the per-org and
+    /// external-pool limits apply to it. The first repair moved the charge
+    /// in place and skipped both checks: one reused call id could push a
+    /// full org, or a full external pool, one entry over its bound.
+    #[test]
+    fn a_moving_expired_overwrite_is_bounded_by_the_trust_domain_quotas() {
+        let t0 = Instant::now();
+        let short = t0 + Duration::from_secs(5);
+        let later = t0 + Duration::from_secs(6);
+        let long = later + Duration::from_secs(100);
+        let new_expires = later + Duration::from_secs(5);
+        let org_a = external_org(0xA1);
+        let org_b = external_org(0xB1);
+
+        // Per-org: org B is already at its 8-entry limit (two identities
+        // x 4). Caller 1's expired entry under org A returns under org B.
+        let guard = partitioned();
+        assert_eq!(
+            admit_external(&guard, &org_a, &caller(1), 7, [1u8; 32], short, t0),
+            ReplayOutcome::Admitted,
+        );
+        for id in [10u8, 11] {
+            for call in 0..4u64 {
+                assert_eq!(
+                    admit_external(&guard, &org_b, &caller(id), call, [id; 32], long, t0),
+                    ReplayOutcome::Admitted,
+                );
+            }
+        }
+        assert_eq!(
+            admit_external(&guard, &org_b, &caller(1), 7, [2u8; 32], new_expires, later),
+            ReplayOutcome::PerOrganizationCapacityExhausted,
+            "moving the charge into a full org is refused like any new entry",
+        );
+        assert_eq!(guard.org_len(&org_b), 8, "org B never exceeds its bound");
+        assert_eq!(guard.org_len(&org_a), 0, "the expired entry was reclaimed");
+
+        // External pool: 30 live external entries fill the pool (four orgs,
+        // eight callers x 4 - two unused). Caller 1's expired OWNER entry
+        // returns external under an empty org.
+        let guard = partitioned();
+        assert_eq!(
+            admit_owner(&guard, &caller(1), 7, [1u8; 32], short, t0),
+            ReplayOutcome::Admitted,
+        );
+        let mut filled = 0;
+        'fill: for org in [0xC1u8, 0xC2, 0xC3, 0xC4] {
+            for id in [org.wrapping_add(0x10), org.wrapping_add(0x20)] {
+                for call in 0..4u64 {
+                    if filled == 30 {
+                        break 'fill;
+                    }
+                    assert_eq!(
+                        admit_external(
+                            &guard,
+                            &external_org(org),
+                            &caller(id),
+                            call,
+                            [id; 32],
+                            long,
+                            t0,
+                        ),
+                        ReplayOutcome::Admitted,
+                    );
+                    filled += 1;
+                }
+            }
+        }
+        assert_eq!(guard.external_len(), 30);
+        assert_eq!(
+            admit_external(&guard, &org_b, &caller(1), 7, [2u8; 32], new_expires, later),
+            ReplayOutcome::ExternalPoolCapacityExhausted,
+            "an owner->external flip into a full pool is refused like any new entry",
+        );
+        assert_eq!(guard.external_len(), 30, "the pool never exceeds its bound");
+    }
+
+    /// The underflow guard: `release` must never wrap `external_total`.
+    /// Driven on the private state because the guarded drift is exactly
+    /// the shape the overwrite bug used to manufacture — an entry marked
+    /// `external` released while `external_total` is already zero — and
+    /// no public call sequence reaches it once the charge moves with the
+    /// stored entry.
+    ///
+    /// Pre-fix red: `st.release` panics ("attempt to subtract with
+    /// overflow" in debug); in a release build the wrap to `usize::MAX`
+    /// is caught by `assert_eq!(st.external_total, 0)`.
+    #[test]
+    fn releasing_an_external_entry_with_zero_live_external_entries_saturates() {
+        let owner = owner_org();
+        let mut st = ReplayState::default();
+        // One live OWNER entry — so `total` is sound but ZERO entries
+        // draw on the external pool.
+        st.charge(false, &owner);
+        let stranded = ReplayEntry {
+            binding_digest: [7u8; 32],
+            expires_at: Instant::now(),
+            acting_org: external_org(0xB1),
+            external: true,
+        };
+        st.release(&stranded);
+        assert_eq!(
+            st.external_total, 0,
+            "external_total wrapped instead of saturating",
+        );
+        assert_eq!(st.total, 0);
     }
 }

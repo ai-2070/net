@@ -1,0 +1,18 @@
+{
+  // The consumer-compile probe's config: a careful external consumer's
+  // check — `skipLibCheck: false`, so a broken DECLARATION in the shipped
+  // `index.d.ts` (e.g. a `ts_args_type` naming a type nothing declares)
+  // fails here even though the package's own build passes with the flag on.
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "bundler",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": false,
+    "types": ["node"]
+  },
+  "include": ["./org_streaming_consumer.ts"]
+}

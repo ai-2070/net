@@ -29,7 +29,7 @@ Chromium windows open, one per tab; Ctrl-C stops everything.
 
 Prerequisites, all of which the script assumes rather than installs:
 Rust with the `wasm32-unknown-unknown` target, `wasm-bindgen-cli`
-**0.2.128** (the version the leaf pins — a mismatch is a hard error at
+**0.2.129** (the version the leaf pins — a mismatch is a hard error at
 bindgen time), and Node ≥ 20. Playwright's Chromium is fetched on
 first run by the host itself.
 

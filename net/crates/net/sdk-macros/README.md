@@ -8,7 +8,7 @@ bindings.
 Use through the SDK's `macros` feature:
 
 ```toml
-net-mesh-sdk = { version = "0.36", features = ["tool", "macros"] }
+net-mesh-sdk = { version = "0.37", features = ["tool", "macros"] }
 ```
 
 Then:

@@ -67,6 +67,28 @@ contracts:
 What does not work is treating a timeout as a failure and retrying, then treating
 the second timeout the same way. That is how one intended effect becomes three.
 
+## The organization failure family
+
+Organization-scoped calls report through the same `org:<domain>:<kind>` vocabulary
+in every binding, and the domain answers one question: **did anything leave this
+process?**
+
+- `credentials` and `discovery` are **local** — the credential set could not
+  authorize the call, or no authorized provider was found; nothing was sent.
+- `admission_denied`, `rpc`, and `unknown` are **remote** — a provider's admission
+  engine refused, the transport failed, or a binding could not classify the string.
+
+Branch on the domain, never the message; each binding exposes the local/remote bit
+directly (`OrgErrorDomain::is_local()`, `OrgError.isLocal`, `ParsedOrgError.is_local`,
+`OrgError.IsLocal()`, the C `NET_ORG_ERR_*` codes). And for the streaming shapes a
+failure can arrive **midstream, from the handle** — the next item on a response
+stream, or the return of `send`/`finish` on a client-stream call (or
+`send`/`finish_sending` on a duplex call) — rather than from the call that opened
+it. The domain rules are identical; the terminal item is the one that ends the
+stream. The full vocabulary, the reasonless remote
+rendering, and the streaming-only refusals are in
+[Error Codes](/docs/reference/error-codes).
+
 ## Retry, hedge, and circuit breaking
 
 All four bindings offer the same three strategies over a raw call, and they solve

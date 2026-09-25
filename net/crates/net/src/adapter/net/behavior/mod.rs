@@ -76,6 +76,16 @@ pub mod org_scoped_store;
 /// semver-covered.
 #[doc(hidden)]
 pub mod org_sensing_demand;
+// Stage 0 slices 0.3 / 0.4 of ORG_SCOPED_STREAMING_PLAN: the executable
+// lifecycle model and the admission/retirement transaction model. They
+// STAY `#[cfg(test)]` — the stay-gated-plus-mirror decision recorded at
+// `cortex/rpc.rs`'s §2.1/§2.2/§2.6 block: production is the mirror
+// implementation there (`run_stream_call_supervisor` and kin), and these
+// remain the adversarially-scheduled witness of the same semantics.
+#[cfg(test)]
+pub mod org_stream_lifecycle;
+#[cfg(test)]
+pub mod org_stream_registry;
 pub mod placement;
 pub mod placement_registry;
 pub mod predicate;

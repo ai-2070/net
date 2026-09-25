@@ -114,6 +114,24 @@ from net_sdk.mesh import (
     StreamStats,
 )
 from net_sdk.node import NetNode
+from net_sdk.org import (
+    HANDLER_DROP_CONTRACT,
+    AsyncOrgClient,
+    OrgAdmissionDeniedError,
+    OrgClient,
+    OrgCredentials,
+    OrgCredentialsError,
+    OrgDiscoveryError,
+    OrgError,
+    OrgServeHandle,
+    OrgUnclassifiedError,
+    install_org_authority,
+    install_provider_grant_audience,
+    serve_org,
+    serve_org_client_stream,
+    serve_org_duplex,
+    serve_org_streaming,
+)
 from net_sdk.types import Receipt
 from net_sdk.stream import EventStream, TypedEventStream
 
@@ -134,6 +152,26 @@ __all__ = [
     "BackpressureError",
     "NotConnectedError",
     "SessionSupersededError",
+    # Organization capability auth (the §4.4 facade — thin forwarding over
+    # the wheel's org surface; the typed wrappers + the `org:` vocabulary
+    # mirror live at `net_sdk.org.TypedOrgClient` / `.serve_org_typed` /
+    # `.parse_org_error` / `.classify_org_error` / `.ParsedOrgError`).
+    "HANDLER_DROP_CONTRACT",
+    "OrgCredentials",
+    "OrgClient",
+    "AsyncOrgClient",
+    "OrgServeHandle",
+    "install_org_authority",
+    "install_provider_grant_audience",
+    "serve_org",
+    "serve_org_streaming",
+    "serve_org_client_stream",
+    "serve_org_duplex",
+    "OrgError",
+    "OrgCredentialsError",
+    "OrgDiscoveryError",
+    "OrgAdmissionDeniedError",
+    "OrgUnclassifiedError",
     # Capability-aggregation surface (Phase 6c).
     "Aggregation",
     "AggregationCls",
@@ -386,4 +424,4 @@ else:
         "fingerprint",
     ]
 
-__version__ = "0.36.0"
+__version__ = "0.37.0"

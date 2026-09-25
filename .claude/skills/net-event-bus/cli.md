@@ -417,8 +417,8 @@ This is **two-process, two-node loopback evidence** — not two computers, not c
 - `nrpc.md` — the discovered-tool / typed-call surface `typegen` generates against.
 - `capabilities.md` — the `ai-tool:*` capability tags `typegen` discovers.
 - `mcp.md` — `wrap` / `mcp serve` / `mcp pin` / `forwarding` conceptual model.
-- `org.md` — what the `net-mesh org` artifacts mean, the startup-side `install_org_authority` / `install_provider_grant_audience` calls, and the `org:<domain>:<kind>` errors.
-- `subnet-auth.md` — what the `net-mesh subnet` artifacts mean, the runtime admin surface that installs them, and the `subnet:<kind>` errors.
+- `org.md` — what the `net-mesh org` artifacts mean, the startup-side `install_org_authority` / `install_provider_grant_audience` calls that consume them, and the `org:<domain>:<kind>` errors. The artifacts authorize all four protected call shapes — nothing in this command tree changed for streaming — and a `Granted` streaming provider needs the same `install_provider_grant_audience` call as a unary one, staying encrypted and undiscoverable until it lands.
+- `subnet-auth.md` — what the `net-mesh subnet` artifacts mean, the runtime admin surface that installs them (`install_gateway_credentials` / `declare_boundaries` / `apply_control_fact`), and the `subnet:<kind>` errors.
 - `a2a.md` — the enrollment model behind `net-mesh join`/`leave` and the org/subnet/channel links (`invite → join → approve`, `InviteToken` / `JoinRequest`, no private key ever transmitted); and the runnable [enrollment journey](https://github.com/ai-2070/net/blob/master/net/crates/net/cli/tests/fixtures/enrollment/README.md).
 
 ## Further reading

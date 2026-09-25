@@ -21,7 +21,7 @@
 # routable-interface topology and the Windows Firewall prompt that
 # comes with it.
 #
-# Requires: Node >= 20, `wasm-bindgen-cli` 0.2.128 and the
+# Requires: Node >= 20, `wasm-bindgen-cli` 0.2.129 and the
 # `wasm32-unknown-unknown` target for the Stage 4b leaf, and — for the
 # Stage 5 half — a built `net/crates/net/leaf/pkg` and
 # `net/crates/net/browser-ts/dist`. When those are absent the Stage 5

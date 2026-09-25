@@ -1966,7 +1966,7 @@ async fn the_population_follows_authorization_and_never_widens_past_it() {
     ingest_owner_announcement(
         &consumer.node,
         &owner,
-        &**second.identity.keypair(),
+        &*second.identity.keypair(),
         1,
         unix_now() + 3600,
     );

@@ -55,12 +55,17 @@ use net::adapter::net::behavior::org_scoped_store::PrivateCapabilityProvider;
 use net::adapter::net::behavior::org_sensing_demand::org_sensed_bucket_permutation;
 use net::adapter::net::behavior::sensing::ConsumerLatencyBudget;
 use net::adapter::net::identity::EntityId;
-use net::adapter::net::mesh_rpc::{CallOptions, RpcError};
+use net::adapter::net::mesh_rpc::{
+    CallOptions, ClientStreamCallRaw, DuplexCallRaw, RpcError, RpcStream,
+};
 
 use super::error::{hex32, hex_capability, OrgCredentialError, OrgDiscoveryError, OrgSdkError};
 use super::types::{CapabilityAuthorityId, OrgCapabilityGrant, OrgProofIntent};
 use super::OrgClient;
-use crate::mesh_rpc::Codec;
+use crate::mesh_rpc::{
+    ClientStreamCallTyped, Codec, DuplexCallTyped, DuplexSinkTyped, DuplexStreamTyped,
+    RpcStreamTyped,
+};
 
 /// The wire status a provider's admission denial carries (OA2-E2).
 const RPC_STATUS_ADMISSION_DENIED: u16 = 0x0009;
@@ -146,6 +151,280 @@ pub(crate) enum PlanAttempt {
         /// Private candidates examined before authority filtering.
         considered: usize,
     },
+}
+
+// ===========================================================================
+// OSDK §3 — the streaming call surface (§4.3's caller rows).
+//
+// One plan per call: every verb resolves the provider ONCE and pins it for
+// the call's whole life. The typed verbs are the bytes seams plus JSON (one
+// authority path), and every error surface is the unary verb's own
+// `map_rpc_error` — `OrgSdkError` gains nothing.
+// ===========================================================================
+
+/// The facade's default protected-call lifetime (Owner Q1): 300 s, applied
+/// whenever a binding seam receives `deadline_ms == 0`. A protected call's
+/// lifetime is finite BY CONTRACT (D3), so `0` means THIS default and never
+/// "no deadline".
+const DEFAULT_LIFETIME_MS: u64 = 300_000;
+
+/// Execution control → [`CallOptions`] for the streaming shapes. The pinned
+/// intent rides along; `deadline_ms == 0` becomes [`DEFAULT_LIFETIME_MS`]
+/// (never "none"); `cancel_token == 0` means uncancellable. Neither argument
+/// is an authorization input — they select no grant and no authority.
+fn streaming_options(intent: OrgProofIntent, deadline_ms: u64, cancel_token: u64) -> CallOptions {
+    let lifetime_ms = if deadline_ms == 0 {
+        DEFAULT_LIFETIME_MS
+    } else {
+        deadline_ms
+    };
+    let mut opts = CallOptions {
+        org_proof_intent: Some(intent),
+        ..CallOptions::default()
+    };
+    opts.deadline = Some(Instant::now() + Duration::from_millis(lifetime_ms));
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
+    opts
+}
+
+/// [`OrgClient::call_streaming`]'s handle: the typed response stream with the
+/// facade's error vocabulary — `Stream<Item = Result<Resp, OrgSdkError>>`.
+///
+/// Wraps [`RpcStreamTyped`] (the facade's JSON codec decodes each chunk) and
+/// maps every wire error through the unary verb's own `map_rpc_error`: an
+/// opening refusal arrives as `Err(AdmissionDenied(coarse))`, a midstream
+/// revocation as the stream's final `Err(AdmissionDenied(Denied))`, and
+/// deadline/cancel retirement as `Err(Rpc(Timeout))` / `Err(Rpc(Cancelled))`.
+///
+/// Dropping the stream — drained or not — emits exactly one CANCEL to the
+/// provider: the wrapped [`RpcStream`]'s drop contract, unchanged.
+///
+/// [`RpcStream`]: net::adapter::net::mesh_rpc::RpcStream
+pub struct OrgStream<Resp> {
+    inner: RpcStreamTyped<Resp>,
+}
+
+impl<Resp: DeserializeOwned + Unpin> futures::Stream for OrgStream<Resp> {
+    type Item = Result<Resp, OrgSdkError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(value))) => std::task::Poll::Ready(Some(Ok(value))),
+            std::task::Poll::Ready(Some(Err(e))) => {
+                std::task::Poll::Ready(Some(Err(map_rpc_error(e))))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// [`OrgClient::call_streaming_bytes`]'s handle: raw response chunks with the
+/// facade's error vocabulary — `Stream<Item = Result<Bytes, OrgSdkError>>`.
+///
+/// Wraps the raw core stream; drop emits exactly one CANCEL (the core's
+/// contract, unchanged).
+pub struct OrgStreamRaw {
+    inner: RpcStream,
+}
+
+impl futures::Stream for OrgStreamRaw {
+    type Item = Result<Bytes, OrgSdkError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => std::task::Poll::Ready(Some(Ok(bytes))),
+            std::task::Poll::Ready(Some(Err(e))) => {
+                std::task::Poll::Ready(Some(Err(map_rpc_error(e))))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// One client-streaming call's PINNED opening: the plan resolved once at the
+/// verb (the intent and the provider), plus the execution control the call
+/// will open under.
+///
+/// The wire opening is LAZY — core's contract: the initial REQUEST "is emitted
+/// by the first `send` (or by `finish` for the zero-item degenerate path)" —
+/// so the core handle is built at that first mutation against THIS provider
+/// and no other. Resolving a provider there again would be exactly the
+/// mid-call re-resolution the pin exists to forbid.
+struct PinnedOpening {
+    client: OrgClient,
+    service: String,
+    provider: EntityId,
+    /// The opening options, with the signed intent already inside. Cloned into
+    /// the one open the call makes; never spent, so a LOCAL open refusal (no
+    /// route, binding refusal — nothing sent, nothing signed) can be reported
+    /// again by `finish` without inventing a second plan.
+    opening: CallOptions,
+}
+
+/// [`OrgClient::call_client_stream`]'s handle: `send` pushes one request item;
+/// `finish` closes the upload and awaits the typed terminal response.
+///
+/// Wraps [`ClientStreamCallTyped`]; every error surface maps through
+/// `map_rpc_error`. The provider is pinned at the verb (see
+/// `PinnedOpening`) — each `send` writes into the one pinned call and never
+/// re-resolves anything.
+pub struct OrgClientStreamCall<Req, Resp> {
+    pinned: PinnedOpening,
+    inner: Option<ClientStreamCallTyped<Req, Resp>>,
+}
+
+impl<Req: Serialize, Resp: DeserializeOwned> OrgClientStreamCall<Req, Resp> {
+    /// Build the core handle against the pinned provider — once, at the first
+    /// `send`/`finish`. Idempotent; a later call reuses the open handle.
+    async fn ensure_opened(&mut self) -> Result<(), OrgSdkError> {
+        if self.inner.is_some() {
+            return Ok(());
+        }
+        // The PINNED opening, never the bytes seam (which plans): this call's
+        // provider was resolved once, at the verb.
+        let inner = self
+            .pinned
+            .client
+            .node
+            .call_client_stream(
+                self.pinned.provider.node_id(),
+                &self.pinned.service,
+                self.pinned.opening.clone(),
+            )
+            .await
+            .map_err(map_rpc_error)?;
+        self.inner = Some(ClientStreamCallTyped::from_raw(inner, Codec::Json));
+        Ok(())
+    }
+
+    /// Encode `value` and publish it as the next request item. The first
+    /// `send` IS the call's signed opening (core's lazy initial REQUEST): the
+    /// proof is minted over this finalized first chunk, at the pinned
+    /// provider.
+    pub async fn send(&mut self, value: &Req) -> Result<(), OrgSdkError> {
+        self.ensure_opened().await?;
+        self.inner
+            .as_mut()
+            .expect("ensure_opened populated the handle")
+            .send(value)
+            .await
+            .map_err(map_rpc_error)
+    }
+
+    /// Close the upload and await the typed terminal response. With zero
+    /// items sent this is the call's opening (core's degenerate path).
+    pub async fn finish(mut self) -> Result<Resp, OrgSdkError> {
+        self.ensure_opened().await?;
+        self.inner
+            .take()
+            .expect("ensure_opened populated the handle")
+            .finish()
+            .await
+            .map_err(map_rpc_error)
+    }
+}
+
+/// [`OrgClient::call_duplex`]'s handle: `send` pushes one request item,
+/// `finish_sending` half-closes the upload, `into_split` peels independent
+/// typed halves, and the handle itself is the response `Stream`.
+///
+/// Wraps [`DuplexCallTyped`]; every error surface maps through
+/// `map_rpc_error`. Opened at the verb (`into_split` and `Stream` are
+/// synchronous) against the pinned provider.
+pub struct OrgDuplexCall<Req, Resp> {
+    inner: DuplexCallTyped<Req, Resp>,
+}
+
+impl<Req: Serialize, Resp: DeserializeOwned + Unpin> OrgDuplexCall<Req, Resp> {
+    /// Encode and publish one request item.
+    pub async fn send(&mut self, value: &Req) -> Result<(), OrgSdkError> {
+        self.inner.send(value).await.map_err(map_rpc_error)
+    }
+
+    /// Close the upload direction. The response stream stays open.
+    pub async fn finish_sending(&mut self) -> Result<(), OrgSdkError> {
+        self.inner.finish_sending().await.map_err(map_rpc_error)
+    }
+
+    /// Split into independent typed halves (upload sink + response stream).
+    /// CANCEL fires only when BOTH halves drop without a clean close — the
+    /// wrapped call's contract, unchanged.
+    pub fn into_split(self) -> (OrgDuplexSink<Req>, OrgDuplexStream<Resp>) {
+        let (sink, stream) = self.inner.into_split();
+        (
+            OrgDuplexSink { inner: sink },
+            OrgDuplexStream { inner: stream },
+        )
+    }
+}
+
+impl<Req, Resp: DeserializeOwned + Unpin> futures::Stream for OrgDuplexCall<Req, Resp> {
+    type Item = Result<Resp, OrgSdkError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(value))) => std::task::Poll::Ready(Some(Ok(value))),
+            std::task::Poll::Ready(Some(Err(e))) => {
+                std::task::Poll::Ready(Some(Err(map_rpc_error(e))))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// The upload half of a split [`OrgDuplexCall`] — the facade's typed sink.
+pub struct OrgDuplexSink<Req> {
+    inner: DuplexSinkTyped<Req>,
+}
+
+impl<Req: Serialize> OrgDuplexSink<Req> {
+    /// Encode and publish one request item.
+    pub async fn send(&mut self, value: &Req) -> Result<(), OrgSdkError> {
+        self.inner.send(value).await.map_err(map_rpc_error)
+    }
+
+    /// Close the upload direction.
+    pub async fn finish_sending(self) -> Result<(), OrgSdkError> {
+        self.inner.finish_sending().await.map_err(map_rpc_error)
+    }
+}
+
+/// The response half of a split [`OrgDuplexCall`] — `Stream<Item =
+/// Result<Resp, OrgSdkError>>`.
+pub struct OrgDuplexStream<Resp> {
+    inner: DuplexStreamTyped<Resp>,
+}
+
+impl<Resp: DeserializeOwned + Unpin> futures::Stream for OrgDuplexStream<Resp> {
+    type Item = Result<Resp, OrgSdkError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(value))) => std::task::Poll::Ready(Some(Ok(value))),
+            std::task::Poll::Ready(Some(Err(e))) => {
+                std::task::Poll::Ready(Some(Err(map_rpc_error(e))))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 impl OrgClient {
@@ -384,6 +663,205 @@ impl OrgClient {
     #[doc(hidden)]
     pub fn cancel(&self, token: u64) {
         self.node.cancel(token);
+    }
+
+    /// Everything every streaming verb shares before the wire: ONE
+    /// [`Self::plan`] — the provider is PINNED for the call — the
+    /// instrumented attribution record, and the execution-control options
+    /// (the Q1 default deadline when `deadline_ms == 0`, never "none").
+    fn streaming_opening(
+        &self,
+        service: &str,
+        deadline_ms: u64,
+        cancel_token: u64,
+    ) -> Result<(EntityId, CallOptions), OrgSdkError> {
+        let intent = self.plan(service, deadline_ms)?;
+        let provider = intent.provider.clone();
+        // Instrumented builds only: record WHICH provider planning selected,
+        // so a witness can attribute an outcome even when the send fails and
+        // no reply names anyone.
+        #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+        {
+            *self.selected.lock() = Some(provider.clone());
+        }
+        Ok((
+            provider,
+            streaming_options(intent, deadline_ms, cancel_token),
+        ))
+    }
+
+    /// Call a protected service whose response is a STREAM (OSDK §3; §4.3).
+    ///
+    /// One request in — the signed opening binds it — and typed items out.
+    /// The provider is pinned for the whole stream: one `plan()`, one
+    /// exact-target opening, never re-resolved while the stream lives. An
+    /// opening refusal is `Err(AdmissionDenied(coarse))`; midstream retirement
+    /// arrives as the stream's final item (`Err(AdmissionDenied(Denied))` on
+    /// revocation, `Err(Rpc(Timeout))` / `Err(Rpc(Cancelled))` otherwise).
+    /// Dropping the stream emits exactly one CANCEL. The lifetime defaults to
+    /// the facade's 300 s (Owner Q1); bindings needing execution control use
+    /// [`call_streaming_bytes_deadline`](Self::call_streaming_bytes_deadline).
+    pub async fn call_streaming<Req, Resp>(
+        &self,
+        service: &str,
+        request: &Req,
+    ) -> Result<OrgStream<Resp>, OrgSdkError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned + Unpin,
+    {
+        // The typed verb IS the bytes seam plus JSON: one authority path,
+        // one plan (inside the seam), and the codec layer is just marshaling.
+        let body = Codec::Json.encode(request).map_err(|e| RpcError::Codec {
+            direction: net::adapter::net::mesh_rpc::CodecDirection::Encode,
+            message: format!("org call_streaming encode: {e}"),
+        })?;
+        let inner = self
+            .call_streaming_bytes_deadline(service, Bytes::from(body), 0, 0)
+            .await?;
+        Ok(OrgStream {
+            inner: RpcStreamTyped::from_raw(inner, Codec::Json),
+        })
+    }
+
+    /// [`call_streaming`](Self::call_streaming) without the codec — bytes in,
+    /// raw chunks out (OSDK-L R1). The typed verb IS this plus JSON: one
+    /// authority path, and the codec layer is provably just marshaling.
+    pub async fn call_streaming_bytes(
+        &self,
+        service: &str,
+        request: Bytes,
+    ) -> Result<OrgStreamRaw, OrgSdkError> {
+        let inner = self
+            .call_streaming_bytes_deadline(service, request, 0, 0)
+            .await?;
+        Ok(OrgStreamRaw { inner })
+    }
+
+    /// [`call_streaming_bytes`](Self::call_streaming_bytes) with execution
+    /// control — a deadline and a pre-reserved cancel token, the same binding
+    /// seam contract as [`call_bytes_deadline`](Self::call_bytes_deadline):
+    /// neither argument is an authorization input. `deadline_ms == 0` is the
+    /// facade's default lifetime (Owner Q1, 300 s) and NEVER "no deadline" —
+    /// a protected call's lifetime is finite by contract (D3).
+    ///
+    /// Returns the EXISTING raw stream (§4.4: "the existing public stream/sink
+    /// handle types, no new stream wrapper per binding"); midstream errors
+    /// stay `RpcError` on it and the binding classifies them into its own org
+    /// vocabulary.
+    ///
+    /// `#[doc(hidden)]` — applications use `call_streaming` /
+    /// `call_streaming_bytes`; execution control is a binding concern.
+    #[doc(hidden)]
+    pub async fn call_streaming_bytes_deadline(
+        &self,
+        service: &str,
+        request: Bytes,
+        deadline_ms: u64,
+        cancel_token: u64,
+    ) -> Result<RpcStream, OrgSdkError> {
+        let (provider, opening) = self.streaming_opening(service, deadline_ms, cancel_token)?;
+        self.node
+            .call_streaming(provider.node_id(), service, request, opening)
+            .await
+            .map_err(map_rpc_error)
+    }
+
+    /// Call a protected service with a STREAM OF REQUESTS and one typed
+    /// response (OSDK §3; §4.3).
+    ///
+    /// The provider is pinned HERE — one `plan()`, one intent, resolved once
+    /// and never re-resolved at any later `send`. The wire opening rides the
+    /// first `send` (core's lazy initial REQUEST — the signed opening binds
+    /// the finalized first chunk) or `finish` for the zero-item path, against
+    /// the pinned provider only. The lifetime defaults to the facade's 300 s
+    /// (Owner Q1); bindings needing execution control use
+    /// [`call_client_stream_bytes_deadline`](Self::call_client_stream_bytes_deadline).
+    pub async fn call_client_stream<Req, Resp>(
+        &self,
+        service: &str,
+    ) -> Result<OrgClientStreamCall<Req, Resp>, OrgSdkError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let (provider, opening) = self.streaming_opening(service, 0, 0)?;
+        Ok(OrgClientStreamCall {
+            pinned: PinnedOpening {
+                client: self.clone(),
+                service: service.to_string(),
+                provider,
+                opening,
+            },
+            inner: None,
+        })
+    }
+
+    /// [`call_client_stream`](Self::call_client_stream) with execution control
+    /// at the byte level (§4.3's binding seam; the same contract as
+    /// [`call_streaming_bytes_deadline`](Self::call_streaming_bytes_deadline):
+    /// `deadline_ms == 0` ⇒ the facade default, never "none"; `cancel_token ==
+    /// 0` ⇒ uncancellable). Returns the EXISTING raw call handle for the
+    /// binding to wrap.
+    ///
+    /// `#[doc(hidden)]` — execution control is a binding concern.
+    #[doc(hidden)]
+    pub async fn call_client_stream_bytes_deadline(
+        &self,
+        service: &str,
+        deadline_ms: u64,
+        cancel_token: u64,
+    ) -> Result<ClientStreamCallRaw, OrgSdkError> {
+        let (provider, opening) = self.streaming_opening(service, deadline_ms, cancel_token)?;
+        self.node
+            .call_client_stream(provider.node_id(), service, opening)
+            .await
+            .map_err(map_rpc_error)
+    }
+
+    /// Call a protected service BIDIRECTIONALLY (OSDK §3; §4.3): `send`
+    /// pushes request items, `finish_sending` half-closes the upload,
+    /// `into_split` peels independent typed halves, and the handle itself is
+    /// the response `Stream`.
+    ///
+    /// The provider is pinned HERE (one `plan()`), and the handle opens at the
+    /// verb because `into_split` and `Stream` are synchronous. The lifetime
+    /// defaults to the facade's 300 s (Owner Q1); bindings needing execution
+    /// control use
+    /// [`call_duplex_bytes_deadline`](Self::call_duplex_bytes_deadline).
+    pub async fn call_duplex<Req, Resp>(
+        &self,
+        service: &str,
+    ) -> Result<OrgDuplexCall<Req, Resp>, OrgSdkError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned + Unpin,
+    {
+        // The typed verb IS the bytes seam plus JSON (one authority path).
+        let inner = self.call_duplex_bytes_deadline(service, 0, 0).await?;
+        Ok(OrgDuplexCall {
+            inner: DuplexCallTyped::from_raw(inner, Codec::Json),
+        })
+    }
+
+    /// [`call_duplex`](Self::call_duplex) with execution control at the byte
+    /// level (§4.3's binding seam; the same contract as
+    /// [`call_streaming_bytes_deadline`](Self::call_streaming_bytes_deadline)).
+    /// Returns the EXISTING raw call handle for the binding to wrap.
+    ///
+    /// `#[doc(hidden)]` — execution control is a binding concern.
+    #[doc(hidden)]
+    pub async fn call_duplex_bytes_deadline(
+        &self,
+        service: &str,
+        deadline_ms: u64,
+        cancel_token: u64,
+    ) -> Result<DuplexCallRaw, OrgSdkError> {
+        let (provider, opening) = self.streaming_opening(service, deadline_ms, cancel_token)?;
+        self.node
+            .call_duplex(provider.node_id(), service, opening)
+            .await
+            .map_err(map_rpc_error)
     }
 
     /// Everything `call` does before touching the network: the coherent
@@ -1465,6 +1943,15 @@ fn push_unique(out: &mut Vec<Candidate>, candidate: Candidate) {
 /// The body is the single coarse reason byte (OA2-E2). A body that does not
 /// decode maps to the least-informative bucket rather than an
 /// error-about-an-error — the caller still learns it was denied.
+///
+/// SDK-1 — the retirement classification reaches the facade HERE as the
+/// documented `Rpc(Timeout)` / `Rpc(Cancelled)`: the core's per-cause
+/// terminal seams produce the typed [`RpcError::Timeout`] /
+/// [`RpcError::Cancelled`], and this seam passes them through untouched.
+/// A genuine remote [`RpcError::ServerError`] — including one whose wire
+/// status happens to be the retirement codes (0x0003/0x0005) — stays
+/// `Rpc(ServerError)`; this seam never manufactures a typed variant from a
+/// wire status.
 fn map_rpc_error(e: RpcError) -> OrgSdkError {
     match &e {
         RpcError::ServerError { status, .. } if *status == RPC_STATUS_ADMISSION_DENIED => {
@@ -1567,6 +2054,48 @@ mod tests {
         match map_rpc_error(e) {
             OrgSdkError::Rpc(RpcError::ServerError { status, .. }) => assert_eq!(status, 0x8001),
             other => panic!("expected Rpc, got {other:?}"),
+        }
+    }
+
+    /// SDK-1 — the core's typed deadline retirement surfaces as the
+    /// documented `Rpc(Timeout)`, never a `ServerError` in the 0x0003
+    /// clothing the pre-fix folds delivered.
+    #[test]
+    fn deadline_retirement_surfaces_as_rpc_timeout() {
+        match map_rpc_error(RpcError::Timeout { elapsed_ms: 5000 }) {
+            OrgSdkError::Rpc(RpcError::Timeout { elapsed_ms }) => assert_eq!(elapsed_ms, 5000),
+            other => panic!("expected Rpc(Timeout), got {other:?}"),
+        }
+    }
+
+    /// SDK-1 — the core's typed cancellation terminal surfaces as the
+    /// documented `Rpc(Cancelled)`.
+    #[test]
+    fn cancellation_surfaces_as_rpc_cancelled() {
+        match map_rpc_error(RpcError::Cancelled) {
+            OrgSdkError::Rpc(RpcError::Cancelled) => {}
+            other => panic!("expected Rpc(Cancelled), got {other:?}"),
+        }
+    }
+
+    /// SDK-1 — a genuine remote `ServerError` stays `Rpc(ServerError)` even
+    /// when its wire status is a retirement code (0x0003/0x0005): the typed
+    /// classes come from core's retirement classification, and this seam
+    /// never rewrites a `ServerError` into one.
+    #[test]
+    fn genuine_remote_retirement_codes_stay_server_error() {
+        for status in [0x0003u16, 0x0005] {
+            let e = RpcError::ServerError {
+                status,
+                message: "remote said so".to_string(),
+                headers: vec![],
+            };
+            match map_rpc_error(e) {
+                OrgSdkError::Rpc(RpcError::ServerError { status: got, .. }) => {
+                    assert_eq!(got, status);
+                }
+                other => panic!("expected Rpc(ServerError), got {other:?}"),
+            }
         }
     }
 }

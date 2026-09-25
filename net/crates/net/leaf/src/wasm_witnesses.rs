@@ -110,9 +110,19 @@ fn pair() -> Pair {
         stun_addr: None,
     };
 
-    let identity = LeafIdentity::generate().expect("an identity");
+    // The org proof mint needs the entity keypair SHARED (`Rc`) beside
+    // the identity's own copy, and `LeafIdentity` owns its entity half
+    // with no way to read the scalar back out — so the witness draws the
+    // two secrets itself and builds both, exactly as `identity_from`
+    // does at connect (same secret twice, never a second one).
+    let entity_secret = random32().expect("an entity secret");
+    let identity = LeafIdentity::from_secrets(
+        EntityKeypair::from_secret(entity_secret),
+        random32().expect("a noise secret"),
+    );
     let us = identity.node_id();
     let mut node = crate::node::LeafNode::new(identity, 0x5001);
+    let org_keypair = Rc::new(EntityKeypair::from_secret(entity_secret));
     let control = AnchorControlPlane::bind(credential.bootstrap_url.clone(), credential, us, &info)
         .expect("a credential that pins this anchor's live key binds");
 
@@ -187,6 +197,8 @@ fn pair() -> Pair {
 
     let inner = Rc::new(RefCell::new(Inner {
         node,
+        org_keypair,
+        serve_queue: Rc::new(RefCell::new(VecDeque::new())),
         transport,
         anchor: ANCHOR,
         control,

@@ -65,7 +65,7 @@ if (!helper.trim().endsWith('}') || !tls.trim().endsWith('}')) throw new Error('
 let launches = 0;
 const context = vm.createContext({
   fs: { mkdirSync() {}, existsSync() { return true; }, mkdtempSync() { return '/simulated/profile'; }, rmSync() {} },
-  path, os: { tmpdir() { return '/simulated'; } }, execFileSync() {}, log() {},
+  path, os: { tmpdir() { return '/simulated'; } }, process: { env: {} }, execFileSync() {}, log() {},
   ENGINES: { firefox: { async launchPersistentContext() { launches++; return { async newPage() { return { async goto() { return { status() { return 200; } }; } }; }, async close() {} }; } } }
 });
 vm.runInContext(helper + '\n' + tls, context);

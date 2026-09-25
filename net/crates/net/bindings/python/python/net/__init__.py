@@ -967,6 +967,7 @@ else:
 # the native module, plus the pure-Python typed/vocabulary layer in `net.org`.
 try:
     from ._net import (
+        AsyncOrgClient,
         OrgAdmissionDeniedError,
         OrgClient,
         OrgCredentials,
@@ -978,6 +979,9 @@ try:
         install_org_authority,
         install_provider_grant_audience,
         serve_org,
+        serve_org_client_stream,
+        serve_org_duplex,
+        serve_org_streaming,
     )
 except ImportError:
     # `org` feature not compiled in; the symbols stay undefined.
@@ -985,6 +989,7 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncOrgClient",
             "OrgAdmissionDeniedError",
             "OrgClient",
             "OrgCredentials",
@@ -996,6 +1001,9 @@ else:
             "install_org_authority",
             "install_provider_grant_audience",
             "serve_org",
+            "serve_org_client_stream",
+            "serve_org_duplex",
+            "serve_org_streaming",
         ]
     )
 
@@ -1025,4 +1033,4 @@ else:
     )
 
 
-__version__ = "0.36.0"
+__version__ = "0.37.0"

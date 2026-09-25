@@ -139,6 +139,43 @@ pub enum Decoded {
     Signal(SignalEnvelope),
 }
 
+/// Which plane owns an event-plane carrier — the decision
+/// `LeafNode::handle_event_plane` makes before it
+/// touches a payload.
+///
+/// One event-plane subprotocol carries three kinds of traffic:
+/// application bytes, the nRPC **caller** plane (the reply carriers
+/// this leaf subscribed to in order to be answered) and the nRPC
+/// **served** plane (the `<service>.requests` carriers this leaf
+/// serves). Ownership is settled at subscription/registration time —
+/// exactly one owner per carrier, the [`crate::node::LeafNode::open_stream`]
+/// / `ensure_reply_subscription` reservation discipline — so the
+/// payload never decides which plane it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plane {
+    /// Opaque application bytes, delivered byte-exact.
+    Application,
+    /// nRPC replies for this leaf's own calls.
+    CallerRpc,
+    /// nRPC requests, chunks, grants and cancels for the services this
+    /// leaf serves.
+    ServedRpc,
+}
+
+/// Route an event-plane carrier by ownership, never by payload.
+///
+/// Both planes claiming one carrier is a registration bug (the
+/// reservation discipline refuses it at registration); should it ever
+/// happen, the served plane wins so admitted calls can still reach
+/// their one terminal.
+pub fn plane_for(caller_owned: bool, served_owned: bool) -> Plane {
+    match (caller_owned, served_owned) {
+        (false, false) => Plane::Application,
+        (true, false) => Plane::CallerRpc,
+        (_, true) => Plane::ServedRpc,
+    }
+}
+
 /// Strip a routing envelope, or decide the packet is not ours.
 ///
 /// Returns the inner Net packet. `None` means the packet was dropped
@@ -240,6 +277,19 @@ pub fn dispatch_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three-plane routing table: a carrier has exactly one owner,
+    /// settled before the payload is read.
+    #[test]
+    fn event_plane_carriers_route_by_ownership_not_payload() {
+        assert_eq!(plane_for(false, false), Plane::Application);
+        assert_eq!(plane_for(true, false), Plane::CallerRpc);
+        assert_eq!(plane_for(false, true), Plane::ServedRpc);
+        // Both claiming one carrier is a registration bug; the served
+        // plane wins so admitted calls still reach their one terminal.
+        assert_eq!(plane_for(true, true), Plane::ServedRpc);
+    }
+
     use crate::identity::{EntityKeypair, LeafIdentity};
     use net_wire::channel::name::ChannelName;
     use net_wire::route_codec::_MAX_TTL;

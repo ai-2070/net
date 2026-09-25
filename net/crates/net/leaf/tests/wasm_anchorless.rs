@@ -54,9 +54,18 @@ use net_leaf::control_plane::{
 use net_leaf::identity::{EntityKeypair, LeafIdentity};
 use net_leaf::mock_control_plane::{CarriedKind, MockControlPlane, MockMesh};
 use net_leaf::node::{LeafEvent, LeafNode};
-use net_leaf::rpc_wire::{self, EventMeta, RpcStatus, DISPATCH_RPC_REQUEST, DISPATCH_RPC_RESPONSE};
+use net_leaf::org::cert::{OrgKeypair, OrgMembershipCert};
+use net_leaf::org::entity::EntityId;
+use net_leaf::org::grant::{CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant};
+use net_leaf::org::proof::RpcCallShape;
+use net_leaf::rpc_serve::{ServeAccess, ServeCall, ServeOptions};
+use net_leaf::rpc_stream::OrgCallIntent;
+use net_leaf::rpc_wire::{
+    self, EventMeta, RpcStatus, StreamHandlerResult, DISPATCH_RPC_REQUEST, DISPATCH_RPC_RESPONSE,
+};
 use net_leaf::rtc::RtcLeafTransport;
 use net_leaf::stream::Reliability;
+use net_leaf::DropReason;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -624,50 +633,71 @@ async fn two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_pa
     .await;
 
     // ── The session is real, part 2: an nRPC call over it. ────────
+    // A leaf answers nRPC only for a service it SERVES: the S4 leaf
+    // acknowledges reply-channel subscribes for its own served services
+    // and refuses anything else (`LeafNode::authorize_subscribe`). So the
+    // responder is a real org-protected serve and the caller a real
+    // org call (same-org, one membership + dispatcher) — the pre-S4
+    // witness answered by hand from a leaf that served nothing, which a
+    // leaf can no longer do: its refusal of the caller's reply subscribe
+    // turned the reply into application bytes and the call timed out.
+    let org = OrgKeypair::from_bytes([0x42; 32]);
+    let now_secs = clock::now_unix_nanos() / 1_000_000_000;
+    let capability = CapabilityAuthorityId::for_tag("nrpc:echo");
+    let caller_kp = EntityKeypair::from_secret([0x11; 32]);
+    let caller_entity = EntityId::from_bytes(*caller_kp.entity_id());
+    let provider_entity = EntityId::from_bytes(*EntityKeypair::from_secret([0x21; 32]).entity_id());
+    let intent = OrgCallIntent {
+        keypair: Rc::new(caller_kp),
+        membership: OrgMembershipCert::issue_at(
+            &org,
+            caller_entity.clone(),
+            1,
+            now_secs - 60,
+            now_secs + 3_600,
+            0x1111_2222_3333_4444,
+        ),
+        dispatcher_grant: OrgDispatcherGrant::issue_at(
+            &org,
+            caller_entity,
+            DispatcherScope::Exact(capability.clone()),
+            now_secs - 60,
+            now_secs + 3_600,
+            0x5555_6666_7777_8888,
+        ),
+        capability_grant: None,
+        acting_org: org.org_id(),
+        provider_org: org.org_id(),
+        provider: provider_entity,
+        capability,
+        ttl_secs: 30,
+    };
+    b.send(|node| {
+        node.org_serve(
+            "echo",
+            ServeOptions {
+                shape: RpcCallShape::Unary,
+                access: ServeAccess::SameOrg,
+                provider_owner_org: org.org_id(),
+                skew_secs: 0,
+                default_live_ns: 300 * 1_000_000_000,
+                max_live_ns: 3_600 * 1_000_000_000,
+                policy: None,
+            },
+            Rc::new(|call: ServeCall| {
+                let _ = call.send(b"pong");
+                call.finish(StreamHandlerResult::Ok);
+            }),
+        )
+    })
+    .expect("B serves echo");
+
     // From here a ticker pumps both leaves, exactly as the bindgen
     // surface's does, so the call's future can be awaited.
     let ticker = start_ticker(Rc::clone(&a), Rc::clone(&b));
     let call = a
-        .send(|node| node.call(bn, "echo", b"ping", Some(10_000)))
+        .send(|node| node.call_org_unary(bn, "echo", b"ping", &intent, Some(10_000)))
         .expect("A calls B");
-
-    let request = poll_until("B receiving the nRPC request frame", || {
-        b.payloads().into_iter().find(|payload| {
-            EventMeta::from_bytes(payload).is_some_and(|meta| meta.dispatch == DISPATCH_RPC_REQUEST)
-        })
-    })
-    .await;
-
-    let meta = EventMeta::from_bytes(&request).expect("the request carries an EventMeta");
-    // **The route a RESPONSE carries is the REPLY channel's
-    // canonical hash, not the request's** — `mesh_rpc.rs` stamps
-    // exactly that on every server-to-caller frame, and R2 matches
-    // the pending entry against it. This witness previously echoed
-    // the REQUEST's route back, which a native responder never does;
-    // the mock was under-specified, and R2 is what surfaced it.
-    let _request_route = rpc_wire::decode_route(&request).expect("the request carries its route");
-    let reply_channel = format!(
-        "echo.replies.{:016x}",
-        a.node.borrow().identity().origin_hash()
-    );
-    let route = net_leaf::Channel::new(&reply_channel)
-        .expect("the reply channel is a valid name")
-        .canonical();
-    let reply = response_frame(
-        b.node.borrow().identity().origin_hash(),
-        meta.seq_or_ts,
-        route,
-        b"pong",
-    );
-    // **The reply must ride the route the call registered** (R2).
-    // A response is matched on (peer, session incarnation, reply
-    // channel) before it can consume the pending entry, so answering
-    // on `echo.replies` — a channel nobody subscribed — is now
-    // correctly ignored. The canonical route is
-    // `<service>.replies.<caller origin>`, which is what the caller
-    // subscribed to when it issued the call.
-    b.send(|node| node.publish(an, &reply_channel, &reply))
-        .expect("B answers the call");
 
     let body = call
         .await
@@ -740,19 +770,29 @@ async fn two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_pa
     // guard still counted, and every later borrow of that cell —
     // including the next test's — fails for a reason that has
     // nothing to do with what it was testing.
-    let (a_drops, b_drops) = (
-        a.node.borrow().counters().total_drops(),
-        b.node.borrow().counters().total_drops(),
-    );
+    let (a_drops, b_drops, b_refused) = {
+        let (a_node, b_node) = (a.node.borrow(), b.node.borrow());
+        (
+            a_node.counters().total_drops(),
+            b_node.counters().total_drops(),
+            b_node.counters().drops(DropReason::MembershipRefused),
+        )
+    };
     let (a_counters, b_counters) = (
         a.node.borrow().counters().to_json(),
         b.node.borrow().counters().to_json(),
     );
+    // The ONE expected refusal: `org_serve` asks every session peer to
+    // carry the service's request channel (the anchor path), and A — a
+    // leaf that serves no `echo` — refuses it, exactly as
+    // `authorize_subscribe` specifies. Nothing is lost by it: A's request
+    // is peer-addressed to B. Every other drop, at either end, is a loss.
     assert_eq!(
-        (a_drops, b_drops),
-        (0, 0),
-        "nothing on the direct session should have been dropped, at either end\
-         \nA: {a_counters}\nB: {b_counters}"
+        (a_drops, b_drops, b_refused),
+        (0, 1, 1),
+        "nothing on the direct session should have been dropped, at either end, beyond          B's one refused request-channel membership
+A: {a_counters}
+B: {b_counters}"
     );
 }
 

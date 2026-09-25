@@ -1,6 +1,6 @@
 {
   "name": "@net-mesh/sdk",
-  "version": "0.36.0",
+  "version": "0.37.0",
   "description": "Ergonomic TypeScript SDK for the Net mesh network",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -12,6 +12,10 @@
     "./tool": {
       "types": "./dist/tool.d.ts",
       "default": "./dist/tool.js"
+    },
+    "./org": {
+      "types": "./dist/org/index.d.ts",
+      "default": "./dist/org/index.js"
     }
   },
   "license": "MIT OR Apache-2.0",
@@ -42,7 +46,7 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@net-mesh/core": ">=0.36.0"
+    "@net-mesh/core": ">=0.37.0"
   },
   "devDependencies": {
     "@net-mesh/core": "file:../bindings/node",

@@ -608,7 +608,18 @@ pub struct ReplicationConfigJs {
 /// JS-side config for `Redex.enableGravityForGreedy`. Locked
 /// Phase-4 defaults — `DATAFORTS_PLAN.md` § Phase 4. All fields
 /// optional; omit any to keep the substrate default.
-#[cfg(feature = "dataforts")]
+//
+// Declaration NOT gated on `dataforts` (unlike its methods): napi-derive
+// collects the impl block's method signatures past inner `#[cfg]`s (the
+// `lib.rs` test-helpers comment's trap), so a feature-off build's
+// `index.d.ts` still names this type in `enableGravityForGreedy`'s
+// signature — gating the declaration left the shipped pair referencing a
+// type nothing declares (`TS2304` under a consumer's `skipLibCheck: false`).
+// The struct is an inert POD compileable everywhere; only its consumers are
+// feature-gated — hence the `allow(dead_code)`: in a feature-off build
+// nothing constructs it, but its DECLARATION must exist for the shipped
+// `index.d.ts` to be self-consistent.
+#[allow(dead_code)]
 #[napi(object)]
 #[derive(Default)]
 pub struct DataGravityConfigJs {
@@ -637,7 +648,9 @@ pub struct DataGravityConfigJs {
 /// JS-side config for `Redex.enableGreedyDataforts`. Locked
 /// Phase-1 defaults — `DATAFORTS_PLAN.md` § Phase 1. All fields
 /// optional; omit any to keep the substrate default.
-#[cfg(feature = "dataforts")]
+//
+// Declaration NOT gated on `dataforts` — see `DataGravityConfigJs`'s note.
+#[allow(dead_code)]
 #[napi(object)]
 #[derive(Default)]
 pub struct GreedyConfigJs {

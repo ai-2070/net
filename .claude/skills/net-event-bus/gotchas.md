@@ -85,6 +85,8 @@ let resp: Resp = client.call_typed(target, "echo", &req,
 
 If RPC is the **dominant** pattern (most calls, no broadcast) and the user wants a stable IDL with codegen, gRPC is still the right tool. nRPC's wire format is JSON over the mesh and there's no IDL step — typed serializers on each side are the contract. nRPC's value-add is "RPC over the same encrypted mesh you're already using for pub/sub, no separate broker / proxy / sidecar."
 
+If the constraint is **"only organization X may call this"**, that is not a hand-rolled gate around `serve_rpc` — it is the org facade: register with `serve_org` (or `serve_org_streaming` / `serve_org_client_stream` / `serve_org_duplex`) and have the caller bind `mesh.org(credentials)?`, then `org.call(..)`. The service is invisible to everyone outside the audience, not merely refused. Read `org.md`.
+
 ## "I need ordering guarantees across all consumers"
 
 **Net only orders per-stream, not globally.** There is no global sequence number across the mesh.
@@ -95,7 +97,7 @@ What to do: ask why they need global ordering — usually it's a workaround for 
 
 **Identity is built in.** Every node has an ed25519 keypair; that's the authentication. Channel-level auth uses signed permission tokens (see `concepts.md` § Identity, capabilities, and routing).
 
-What to do: for a basic trusted mesh, you don't configure anything — identity is automatic. For multi-tenant or untrusted scenarios, point at `README.md` § Security surface for permission tokens.
+What to do: for a basic trusted mesh, you don't configure anything — identity is automatic. For multi-tenant or untrusted scenarios, point at `README.md` § Security surface for permission tokens — and if the question is *"only this organization may call my service"*, the canonical answer is the org chapter (`org.md`): an organization **is** its ed25519 key, issuance is offline and occasional (never per-call), and a protected service is *invisible* — not merely refused — to everyone outside the audience, because its announcement is encrypted to the audience key. The recipe is in `patterns.md`.
 
 ## "Where are my events stored?"
 

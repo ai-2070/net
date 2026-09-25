@@ -66,6 +66,13 @@ pub struct GapReport {
 pub struct NetSession {
     /// Session ID (derived from handshake)
     session_id: u64,
+    /// The full 32-byte Noise handshake hash of the establishment
+    /// that created this session — the session binding a protected
+    /// opening signs. `None` on hand-built sessions ([`Self::new`],
+    /// which fabricates keys rather than running a handshake) and on
+    /// sessions whose construction predates the carriage; see
+    /// [`Self::with_binding`].
+    handshake_binding: Option<[u8; 32]>,
     /// Remote peer address
     peer_addr: PeerAddr,
     /// RX cipher (ChaCha20-Poly1305 with counter-based nonces)
@@ -220,7 +227,12 @@ pub struct NetSession {
 pub const CONTROL_STREAM_ID: u64 = u64::MAX;
 
 impl NetSession {
-    /// Create a new session from handshake results
+    /// Create a new session from handshake results.
+    ///
+    /// Carries **no** session binding: a hand-built session has no
+    /// establishment its `handshake_binding` could name, and
+    /// [`Self::handshake_binding`] reports `None` faithfully. Real
+    /// handshakes use [`Self::with_binding`] instead.
     pub fn new(
         keys: SessionKeys,
         peer_addr: PeerAddr,
@@ -244,6 +256,7 @@ impl NetSession {
         // struct above).
         Self {
             session_id: keys.session_id,
+            handshake_binding: None,
             peer_addr,
             rx_cipher,
             streams: DashMap::new(),
@@ -269,6 +282,29 @@ impl NetSession {
             route_hop_tx_seq: AtomicU64::new(0),
             route_hop_replay: SharedHopReplayWindow::new(),
         }
+    }
+
+    /// Create a new session from handshake results **and** the full
+    /// Noise handshake hash of that establishment — the additive
+    /// binding carriage: [`Self::new`] plus the value
+    /// `NoiseHandshake::into_session_keys_with_binding` returned
+    /// beside the keys, stored where [`Self::handshake_binding`] and
+    /// `MeshNode::peer_session_binding` read it back.
+    ///
+    /// Stored verbatim, not re-derived: it is the channel binding
+    /// both endpoints computed over this establishment and nothing
+    /// else, so a re-handshake carries a different binding by
+    /// construction.
+    pub fn with_binding(
+        keys: SessionKeys,
+        handshake_hash: [u8; 32],
+        peer_addr: PeerAddr,
+        pool_size: usize,
+        default_reliable: bool,
+    ) -> Self {
+        let mut session = Self::new(keys, peer_addr, pool_size, default_reliable);
+        session.handshake_binding = Some(handshake_hash);
+        session
     }
 
     /// Wrap `inner` in an authenticated route-hop envelope for this
@@ -421,6 +457,15 @@ impl NetSession {
     #[inline]
     pub fn session_id(&self) -> u64 {
         self.session_id
+    }
+
+    /// The full Noise handshake hash binding this session's
+    /// establishment — the session binding — or `None` when the
+    /// session carries none (hand-built via [`Self::new`]). See
+    /// [`Self::with_binding`].
+    #[inline]
+    pub fn handshake_binding(&self) -> Option<[u8; 32]> {
+        self.handshake_binding
     }
 
     /// Get the peer address
@@ -3365,6 +3410,7 @@ use crate::time::current_timestamp;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{NoiseHandshake, StaticKeypair};
 
     fn test_keys() -> SessionKeys {
         SessionKeys {
@@ -3382,6 +3428,97 @@ mod tests {
             route_hop_tx_key: [0x51u8; 32],
             route_hop_rx_key: [0x15u8; 32],
         }
+    }
+
+    /// Drive one full NKpsk0 handshake to completion and return both
+    /// finished, still-unconsumed handshake states (initiator first).
+    /// Fresh static and ephemeral keys per call: every run is a
+    /// distinct establishment.
+    fn finished_handshakes() -> (NoiseHandshake, NoiseHandshake) {
+        let psk = [0x42u8; 32];
+        let responder_keypair = StaticKeypair::generate();
+        let mut initiator = NoiseHandshake::initiator(&psk, &responder_keypair.public).unwrap();
+        let mut responder = NoiseHandshake::responder(&psk, &responder_keypair).unwrap();
+        let msg1 = initiator.write_message(b"").unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(b"").unwrap();
+        initiator.read_message(&msg2).unwrap();
+        (initiator, responder)
+    }
+
+    /// Stage 1 slice 1.1 witness (a): the binding a session stores is
+    /// the FULL Noise handshake hash of its establishment — asserted
+    /// against an independently captured transcript read
+    /// (`NoiseHandshake::handshake_hash`, taken before finalization,
+    /// not through the finalizer's own return value), not merely
+    /// against the peer's binding. Peer-vs-peer equality alone would
+    /// hold for any truncation both sides share (e.g. the 8-byte
+    /// session id widened to 32 bytes); equality to the transcript
+    /// value cannot.
+    #[test]
+    fn the_stored_binding_is_the_full_independently_captured_noise_handshake_hash() {
+        let peer_addr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let (initiator, responder) = finished_handshakes();
+
+        // Independent capture of each side's transcript value, read
+        // before finalization consumes the handshake state.
+        let init_transcript = initiator.handshake_hash().unwrap();
+        let resp_transcript = responder.handshake_hash().unwrap();
+        assert_eq!(
+            init_transcript, resp_transcript,
+            "one transcript, both sides"
+        );
+
+        let (init_keys, init_binding) = initiator.into_session_keys_with_binding().unwrap();
+        let (resp_keys, resp_binding) = responder.into_session_keys_with_binding().unwrap();
+        let init_session = NetSession::with_binding(init_keys, init_binding, peer_addr, 4, false);
+        let resp_session = NetSession::with_binding(resp_keys, resp_binding, peer_addr, 4, false);
+
+        assert_eq!(
+            init_session.handshake_binding(),
+            Some(init_transcript),
+            "the stored binding must be the full transcript hash, not a projection of it"
+        );
+        assert_eq!(resp_session.handshake_binding(), Some(resp_transcript));
+    }
+
+    /// Stage 1 slice 1.1 witness (b): a re-handshake between the same
+    /// peers yields a DIFFERENT binding — the binding names one fresh
+    /// establishment, not a peer pair or a key set, so nothing signed
+    /// for one handshake can ride the next.
+    #[test]
+    fn a_re_handshake_yields_a_different_binding() {
+        let peer_addr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let (first, _) = finished_handshakes();
+        let (second, _) = finished_handshakes();
+        let (keys_a, binding_a) = first.into_session_keys_with_binding().unwrap();
+        let (keys_b, binding_b) = second.into_session_keys_with_binding().unwrap();
+        let session_a = NetSession::with_binding(keys_a, binding_a, peer_addr, 4, false);
+        let session_b = NetSession::with_binding(keys_b, binding_b, peer_addr, 4, false);
+        assert_ne!(
+            session_a.handshake_binding(),
+            session_b.handshake_binding(),
+            "a fresh establishment must bind differently"
+        );
+    }
+
+    /// Stage 1 slice 1.1 witness (c): a hand-built session carries NO
+    /// binding, and the accessor reports exactly that — the fail-closed
+    /// input every establishment-bound check must refuse (the "never
+    /// admits" half of that refusal is slice 1.2's witness).
+    #[test]
+    fn a_hand_built_session_carries_no_binding() {
+        let session = NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9999".parse().unwrap()),
+            4,
+            false,
+        );
+        assert_eq!(
+            session.handshake_binding(),
+            None,
+            "a session with no establishment binding must read as None, faithfully"
+        );
     }
 
     /// A refused seal must not consume a hop sequence.

@@ -968,6 +968,20 @@ func installCancelWatcher(ctx context.Context, r *MeshRpc) (uint64, func()) {
 // Streaming
 // =====================================================================
 
+// parseStreamError classifies one midstream `out_err` message in the wire
+// vocabulary of the surface that OPENED the stream. A public stream carries
+// the bare nRPC shape (`timeout: …` — parseRpcError); an org stream carries
+// the canonical `org:` wire (`org:rpc:timeout: …` — parseOrgError, the same
+// vocabulary net_org_call's failures speak), so one parser per vocabulary,
+// chosen at construction, and a binding never guesses a domain from the
+// wrong shape.
+func parseStreamError(orgErrors bool, msg string) error {
+	if orgErrors {
+		return parseOrgError(msg)
+	}
+	return parseRpcError(msg)
+}
+
 // StreamOptions configures a streaming call's flow control. The
 // zero value disables explicit flow control (server runs free,
 // client auto-grants on each chunk delivery).
@@ -1091,6 +1105,13 @@ type RpcStream struct {
 	rpc    *MeshRpc
 	handle *C.RpcStreamHandleC
 	callID uint64
+	// orgErrors routes midstream error classification through
+	// parseOrgError instead of parseRpcError: a stream opened by
+	// net_org_call_streaming carries the canonical `org:` wire on its
+	// out_err (net_org.h's error model — the same vocabulary
+	// net_org_call's failures speak), never the bare nRPC `<kind>:`
+	// shape. See parseStreamError.
+	orgErrors bool
 	// guard serializes Recv/Grant against the FFI free without
 	// holding a lock across the (blocking) cgo call. Heap-allocated
 	// so the watcher goroutine can hold it without keeping the
@@ -1262,7 +1283,7 @@ func (s *RpcStream) Recv() ([]byte, error) {
 		return nil, ErrStreamDone
 	case -2: // NET_RPC_ERR_CALL_FAILED — mid-stream error
 		msg := readCError(outErr)
-		return nil, parseRpcError(msg)
+		return nil, parseStreamError(s.orgErrors, msg)
 	default:
 		msg := readCError(outErr)
 		return nil, fmt.Errorf("net_rpc_stream_next returned %d: %s", int(code), msg)
@@ -1562,6 +1583,9 @@ type ClientStreamCall struct {
 	rpc    *MeshRpc
 	handle *C.ClientStreamCallHandleC
 	callID uint64
+	// orgErrors — see RpcStream.orgErrors. Set by
+	// newClientStreamCallFromOrg (net_org_call_client_stream).
+	orgErrors bool
 	// guard serializes Send against the FFI free without holding a
 	// lock across the (blocking) cgo call. Heap-allocated so the
 	// watcher can hold it without keeping the call alive. See
@@ -1646,7 +1670,7 @@ func (c *ClientStreamCall) Send(body []byte) error {
 	case -6: // STREAM_DONE
 		return ErrStreamDone
 	case -2: // CALL_FAILED
-		return parseRpcError(readCError(outErr))
+		return parseStreamError(c.orgErrors, readCError(outErr))
 	default:
 		return fmt.Errorf("net_rpc_client_stream_send returned %d: %s", int(code), readCError(outErr))
 	}
@@ -1686,7 +1710,7 @@ func (c *ClientStreamCall) Finish() ([]byte, error) {
 		copy(out, src)
 		return out, nil
 	case -2: // CALL_FAILED
-		return nil, parseRpcError(readCError(outErr))
+		return nil, parseStreamError(c.orgErrors, readCError(outErr))
 	case -6: // STREAM_DONE
 		return nil, ErrStreamDone
 	default:
@@ -1739,6 +1763,9 @@ type DuplexCall struct {
 	rpc    *MeshRpc
 	handle *C.DuplexCallHandleC
 	callID uint64
+	// orgErrors — see RpcStream.orgErrors. Set by newDuplexCallFromOrg
+	// (net_org_call_duplex); Split's halves inherit it.
+	orgErrors bool
 	// guard serializes Send/Recv/FinishSending against the FFI free
 	// without holding a lock across the (blocking) cgo call.
 	// Heap-allocated so the watcher can hold it without keeping the
@@ -1816,7 +1843,7 @@ func (d *DuplexCall) Send(body []byte) error {
 	case -6:
 		return ErrStreamDone
 	case -2:
-		return parseRpcError(readCError(outErr))
+		return parseStreamError(d.orgErrors, readCError(outErr))
 	default:
 		return fmt.Errorf("net_rpc_duplex_send returned %d: %s", int(code), readCError(outErr))
 	}
@@ -1838,7 +1865,7 @@ func (d *DuplexCall) FinishSending() error {
 	case -6:
 		return ErrStreamDone
 	case -2:
-		return parseRpcError(readCError(outErr))
+		return parseStreamError(d.orgErrors, readCError(outErr))
 	default:
 		return fmt.Errorf("net_rpc_duplex_finish_sending returned %d: %s", int(code), readCError(outErr))
 	}
@@ -1868,7 +1895,7 @@ func (d *DuplexCall) Recv() ([]byte, error) {
 	case -6:
 		return nil, ErrStreamDone
 	case -2:
-		return nil, parseRpcError(readCError(outErr))
+		return nil, parseStreamError(d.orgErrors, readCError(outErr))
 	default:
 		return nil, fmt.Errorf("net_rpc_duplex_next returned %d: %s", int(code), readCError(outErr))
 	}
@@ -1913,17 +1940,19 @@ func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
 	// is in flight (same #1 use-after-free fix as DuplexCall).
 	sinkHandle := outSink
 	sink := &DuplexSink{
-		rpc:    d.rpc,
-		handle: outSink,
-		callID: d.callID,
-		guard:  newStreamHandleGuard(func() { C.net_rpc_duplex_sink_free(sinkHandle) }),
+		rpc:       d.rpc,
+		handle:    outSink,
+		callID:    d.callID,
+		orgErrors: d.orgErrors,
+		guard:     newStreamHandleGuard(func() { C.net_rpc_duplex_sink_free(sinkHandle) }),
 	}
 	streamHandle := outStream
 	stream := &DuplexStream{
-		rpc:    d.rpc,
-		handle: outStream,
-		callID: d.callID,
-		guard:  newStreamHandleGuard(func() { C.net_rpc_duplex_stream_free(streamHandle) }),
+		rpc:       d.rpc,
+		handle:    outStream,
+		callID:    d.callID,
+		orgErrors: d.orgErrors,
+		guard:     newStreamHandleGuard(func() { C.net_rpc_duplex_stream_free(streamHandle) }),
 	}
 	runtime.SetFinalizer(sink, (*DuplexSink).finalize)
 	runtime.SetFinalizer(stream, (*DuplexStream).finalize)
@@ -1949,6 +1978,9 @@ type DuplexSink struct {
 	rpc    *MeshRpc
 	handle *C.DuplexSinkHandleC
 	callID uint64
+	// orgErrors — see RpcStream.orgErrors. Inherited from the owning
+	// DuplexCall at Split.
+	orgErrors bool
 	// guard serializes Send/Finish against the FFI free without holding
 	// a lock across the blocking cgo call. See streamHandleGuard.
 	guard *streamHandleGuard
@@ -1973,7 +2005,7 @@ func (s *DuplexSink) Send(body []byte) error {
 	case -6:
 		return ErrStreamDone
 	case -2:
-		return parseRpcError(readCError(outErr))
+		return parseStreamError(s.orgErrors, readCError(outErr))
 	default:
 		return fmt.Errorf("net_rpc_duplex_sink_send returned %d: %s", int(code), readCError(outErr))
 	}
@@ -2000,7 +2032,7 @@ func (s *DuplexSink) Finish() error {
 	case -6:
 		return ErrStreamDone
 	case -2:
-		return parseRpcError(readCError(outErr))
+		return parseStreamError(s.orgErrors, readCError(outErr))
 	default:
 		return fmt.Errorf("net_rpc_duplex_sink_finish returned %d: %s", int(code), readCError(outErr))
 	}
@@ -2020,6 +2052,9 @@ type DuplexStream struct {
 	rpc    *MeshRpc
 	handle *C.DuplexStreamHandleC
 	callID uint64
+	// orgErrors — see RpcStream.orgErrors. Inherited from the owning
+	// DuplexCall at Split.
+	orgErrors bool
 	// guard serializes Recv against the FFI free without holding a lock
 	// across the blocking cgo call. See streamHandleGuard.
 	guard *streamHandleGuard
@@ -2052,7 +2087,7 @@ func (s *DuplexStream) Recv() ([]byte, error) {
 	case -6:
 		return nil, ErrStreamDone
 	case -2:
-		return nil, parseRpcError(readCError(outErr))
+		return nil, parseStreamError(s.orgErrors, readCError(outErr))
 	default:
 		return nil, fmt.Errorf("net_rpc_duplex_stream_next returned %d: %s", int(code), readCError(outErr))
 	}
@@ -2526,4 +2561,94 @@ func (r *MeshRpc) ServeDuplexWithOptions(service string, handler DuplexHandler, 
 	sh := &ServeHandle{rpc: r, handle: handle, handlerID: hID}
 	runtime.SetFinalizer(sh, (*ServeHandle).finalize)
 	return sh, nil
+}
+
+// =====================================================================
+// Shared-handle constructors for the org surface (net_org_call_*).
+//
+// net_org_call_streaming / _client_stream / _duplex return the SAME C
+// handle types this file's methods drive and free (§4.4: one libnet, one
+// handle vocabulary), but the pointers arrive through org.go's cgo
+// preamble, whose opaque typedefs are per-translation-unit Go types. They
+// cross as unsafe.Pointer and are re-typed HERE, where the C namespace
+// that owns the handles lives — the same convention
+// newOrgServeHandleFromPtr uses in the other direction.
+//
+// The wrapped calls carry orgErrors = true (their out_err speaks the
+// `org:` wire — see parseStreamError) and no *MeshRpc pin: the owning
+// OrgClient is their surface and the C handle owns everything the stream
+// needs. Callers (org.go) spawn the same spawnCtxCancelWatcher teardown
+// the public constructors do, so ctx-cancel / Close / finalizer semantics
+// are literally the same methods.
+//
+// SetFinalizer rather than runtime.AddCleanup BY NECESSITY, not habit:
+// the teardown is the object's own Close(), which reads object fields to
+// cancel and join the ctx-cancel watcher — and AddCleanup's callback must
+// NOT receive the object (its argument is what keeps the cleanup from
+// pinning the object forever). The public constructors above use the same
+// mechanism for the same reason; one type, one teardown.
+// =====================================================================
+
+// newRpcStreamFromOrg wraps a handle minted by net_org_call_streaming.
+func newRpcStreamFromOrg(p unsafe.Pointer) *RpcStream {
+	handle := (*C.RpcStreamHandleC)(p)
+	guard := newStreamHandleGuard(func() {
+		C.net_rpc_stream_close(handle)
+		C.net_rpc_stream_free(handle)
+	})
+	stream := &RpcStream{
+		handle:    handle,
+		callID:    uint64(C.net_rpc_stream_call_id(handle)),
+		guard:     guard,
+		orgErrors: true,
+	}
+	runtime.SetFinalizer(stream, (*RpcStream).finalize)
+	return stream
+}
+
+// newClientStreamCallFromOrg wraps a handle minted by
+// net_org_call_client_stream.
+func newClientStreamCallFromOrg(p unsafe.Pointer) *ClientStreamCall {
+	handle := (*C.ClientStreamCallHandleC)(p)
+	guard := newStreamHandleGuard(func() {
+		C.net_rpc_client_stream_free(handle)
+	})
+	call := &ClientStreamCall{
+		handle:    handle,
+		callID:    uint64(C.net_rpc_client_stream_call_id(handle)),
+		guard:     guard,
+		orgErrors: true,
+	}
+	runtime.SetFinalizer(call, (*ClientStreamCall).finalize)
+	return call
+}
+
+// newDuplexCallFromOrg wraps a handle minted by net_org_call_duplex.
+func newDuplexCallFromOrg(p unsafe.Pointer) *DuplexCall {
+	handle := (*C.DuplexCallHandleC)(p)
+	guard := newStreamHandleGuard(func() {
+		C.net_rpc_duplex_free(handle)
+	})
+	call := &DuplexCall{
+		handle:    handle,
+		callID:    uint64(C.net_rpc_duplex_call_id(handle)),
+		guard:     guard,
+		orgErrors: true,
+	}
+	runtime.SetFinalizer(call, (*DuplexCall).finalize)
+	return call
+}
+
+// newRequestStreamRecvFromPtr wraps a per-call request-stream handle the
+// org shape dispatchers borrowed across one callback. Same
+// lifetime contract as the nRPC trampolines' wrappers: bounded by the
+// callback; the org trampoline flips `invalidated` before returning.
+func newRequestStreamRecvFromPtr(p unsafe.Pointer) *RequestStreamRecv {
+	return &RequestStreamRecv{handle: (*C.RpcRequestStreamHandleC)(p)}
+}
+
+// newResponseSinkSendFromPtr wraps a per-call response-sink handle the org
+// shape dispatchers borrowed across one callback.
+func newResponseSinkSendFromPtr(p unsafe.Pointer) *ResponseSinkSend {
+	return &ResponseSinkSend{handle: (*C.RpcResponseSinkHandleC)(p)}
 }

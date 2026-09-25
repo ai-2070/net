@@ -103,6 +103,7 @@ pages:
   guides/netdb-queries: adaptive_pending
   guides/nrpc: adaptive_pending
   guides/private-capabilities: adaptive_pending
+  guides/protected-streaming: universal
   guides/production-deployment: adaptive_pending
   guides/recover-failed-workflow: adaptive_pending
   guides/submitted-is-not-completed: universal

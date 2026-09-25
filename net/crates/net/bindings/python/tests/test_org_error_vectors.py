@@ -29,7 +29,7 @@ _FIXTURE = (
 
 
 def _load() -> dict:
-    return json.loads(_FIXTURE.read_text())
+    return json.loads(_FIXTURE.read_text(encoding="utf-8"))
 
 
 def test_fixture_has_the_expected_shape() -> None:

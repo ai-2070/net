@@ -90,7 +90,7 @@ pub struct SubnetNamedExportJs {
 ///
 /// Only the org-gated admin verbs below construct this; in a build
 /// without `org` it exists as a JS type shape alone.
-#[cfg_attr(not(feature = "org"), allow(dead_code))]
+#[cfg_attr(any(not(feature = "org"), test), allow(dead_code))]
 #[napi(object)]
 #[derive(Clone)]
 pub struct SubnetBoundaryDeclarationJs {
@@ -107,7 +107,7 @@ pub struct SubnetBoundaryDeclarationJs {
 ///
 /// Only the org-gated admin verbs below construct this; in a build
 /// without `org` it exists as a JS type shape alone.
-#[cfg_attr(not(feature = "org"), allow(dead_code))]
+#[cfg_attr(any(not(feature = "org"), test), allow(dead_code))]
 #[napi(object)]
 pub struct SubnetControlOutcomeJs {
     /// `"descriptor" | "gateway_advertisement" | "export_policy" |
@@ -229,6 +229,13 @@ mod gated {
     /// WHOLESALE REPLACE: pass every currently held set, not a delta.
     /// Every artifact decodes BEFORE anything installs, so a malformed
     /// `Buffer` in the batch mutates no node state at all.
+    // The four `#[napi]` verbs below (and the two `lib.rs` pieces they
+    // read) are rooted by napi-rs registration, which is emitted under
+    // `#[cfg(not(test))]` — so the lib-test target misreads them as
+    // dead. The lib target's dead-code pass shares this build's
+    // reachability minus registration and is clean (see `mod org`'s
+    // note in `lib.rs`); the TS witness is `test/org_live.test.ts`.
+    #[cfg_attr(test, allow(dead_code))]
     #[napi]
     pub fn install_subnet_gateway_credentials(
         mesh: &crate::NetMesh,
@@ -241,6 +248,7 @@ mod gated {
 
     /// Declare this node's protected boundary inventory — also
     /// wholesale: the set replaces the previous declaration.
+    #[cfg_attr(test, allow(dead_code))]
     #[napi]
     pub fn declare_subnet_boundaries(
         mesh: &crate::NetMesh,
@@ -264,6 +272,7 @@ mod gated {
 
     /// Apply one signed control fact from its outer wire frame — the
     /// ONE door for floors and descriptive facts alike.
+    #[cfg_attr(test, allow(dead_code))]
     #[napi]
     pub fn apply_subnet_control_fact(
         mesh: &crate::NetMesh,
@@ -293,6 +302,7 @@ mod gated {
     /// attribution, never caller-claimed — and announcement visibility
     /// is always public: the external caller proves org authority and
     /// never joins this node's subnet.
+    #[cfg_attr(test, allow(dead_code))]
     #[napi]
     pub fn serve_subnet_exported(
         mesh: &crate::NetMesh,

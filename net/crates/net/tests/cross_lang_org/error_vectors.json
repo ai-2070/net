@@ -33,7 +33,12 @@
     { "wire": "org:admission_denied:unavailable", "domain": "admission_denied", "kind": "unavailable", "is_local": false },
     { "wire": "org:rpc:timeout: rpc: timeout after 5000ms", "domain": "rpc", "kind": "timeout", "is_local": false },
     { "wire": "org:rpc:no_route: rpc: no route to target 0xdead: no path", "domain": "rpc", "kind": "no_route", "is_local": false },
-    { "wire": "org:rpc:cancelled: rpc: call cancelled by caller", "domain": "rpc", "kind": "cancelled", "is_local": false }
+    { "wire": "org:rpc:cancelled: rpc: call cancelled by caller", "domain": "rpc", "kind": "cancelled", "is_local": false },
+    { "wire": "org:rpc:server_error: rpc: server returned status 0x0006: the handler failed", "domain": "rpc", "kind": "server_error", "is_local": false },
+    { "wire": "org:rpc:transport: rpc: transport: connection error: the peer session dropped", "domain": "rpc", "kind": "transport", "is_local": false },
+    { "wire": "org:rpc:codec_encode: rpc: codec (Encode): the request did not serialize", "domain": "rpc", "kind": "codec_encode", "is_local": false },
+    { "wire": "org:rpc:codec_decode: rpc: codec (Decode): the reply did not deserialize", "domain": "rpc", "kind": "codec_decode", "is_local": false },
+    { "wire": "org:rpc:capability_denied: rpc: capability denied: target 0xdead does not authorize nrpc:customer.read", "domain": "rpc", "kind": "capability_denied", "is_local": false }
   ],
   "unclassified_cases": [
     { "wire": "org:frobnicate:whatever: detail", "expect_domain": "unknown", "expect_is_local": false },

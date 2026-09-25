@@ -518,10 +518,10 @@ Install org ownership on a node. This is the one org-adjacent command that write
 ```
 net-mesh node adopt --cert <PATH> (--identity <PATH> | --entity <HEX>)
                     [--authority-dir <DIR>] [--floors <PATH>] [--audience <PATH>]
-                    [--skew-secs <N>]
+                    [--skew-secs <N>] [--insecure-permissions]
 ```
 
-Adoption writes three separately versioned files — `owner-membership.json`, `owner-audience.key`, and `revocation-state.json` — under `$XDG_CONFIG_HOME/net-mesh/authority` by default. `--floors` optionally merges a revocation-floor bundle during adoption. `--audience` installs the org's shared owner audience (from `org audience-keygen`) instead of a node-local one, so this node can discover other members' private services. `--skew-secs` is the clock-skew tolerance for the certificate window check: **strict by default**, and hard-capped at the token module's 300-second ceiling, with larger values rejected before anything is written.
+Adoption writes three separately versioned files — `owner-membership.json`, `owner-audience.key`, and `revocation-state.json` — under `$XDG_CONFIG_HOME/net-mesh/authority` by default. `--floors` optionally merges a revocation-floor bundle (as written by `net-mesh org issue-floors`) during adoption; the merge runs in certificate pre-write validation, so a certificate the resulting floors would immediately revoke never adopts. `--audience` installs the org's shared owner audience (from `org audience-keygen`) instead of a node-local one, so this node can discover other members' private services. `--skew-secs` is the clock-skew tolerance for the certificate window check: **strict by default**, and hard-capped at the token module's 300-second ceiling, with larger values rejected before anything is written. `--insecure-permissions` permits a permissive mode on the identity file on Unix, and is only meaningful alongside `--identity`.
 
 Like `keygen`, this command refuses rather than falling back to the working directory when the config directory cannot be resolved — the authority directory holds `owner-audience.key`, the raw owner discovery key.
 

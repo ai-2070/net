@@ -118,7 +118,7 @@ Default TTL is 5 minutes. Override with `announce_capabilities_with(caps, ttl, s
 
 ### Public vs private announcements
 
-Everything above describes the **plaintext** plane: `CapabilityVisibility::Public`, readable by any peer that receives the announcement. There are two **encrypted-only** forms, selected implicitly when you register a service with `serve_org`:
+Everything above describes the **plaintext** plane: `CapabilityVisibility::Public`, readable by any peer that receives the announcement. There are two **encrypted-only** forms, selected implicitly when you register a service with `serve_org` — or its streaming siblings `serve_org_streaming` / `serve_org_client_stream` / `serve_org_duplex`:
 
 | Visibility | Who can decrypt the announcement | Selected by |
 |---|---|---|

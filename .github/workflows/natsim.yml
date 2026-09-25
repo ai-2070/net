@@ -155,10 +155,10 @@ jobs:
 
       # Pinned, like ci.yml's browser-package job: wasm-bindgen's CLI and
       # the crate must agree exactly or the bundle is unloadable.
-      - name: Install wasm-bindgen-cli 0.2.128
+      - name: Install wasm-bindgen-cli 0.2.129
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.128
+          tool: wasm-bindgen-cli@0.2.129
 
       - uses: actions/setup-node@v7
         with:

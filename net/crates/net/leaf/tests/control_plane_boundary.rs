@@ -611,13 +611,14 @@ const KEYWORDS: [&str; 13] = [
 
 /// Every type the trait and its implementations may name. Adding one
 /// is a deliberate act here — that is the closure.
-const VOCABULARY: [&str; 15] = [
+const VOCABULARY: [&str; 16] = [
     "Sdp",
     "BootstrapAccepted",
     "LeafError",
     "DialogId",
     "IceCandidate",
     "SignedAnnouncement",
+    "RevocationBundle",
     "SignalEnvelope",
     "ControlEvent",
     "Vec",
@@ -918,6 +919,26 @@ fn the_bindgen_surface_does_no_transport_of_its_own() {
     assert!(checked > 10, "only {checked} modules were inspected");
     // The fence around the single exemption.
     let owner = code_only(&source("anchor_control_plane.rs"));
+    // ONE audited bare `WebSocket::new(`: the org-control revocation
+    // feed socket, which presents no credential (it only receives
+    // signed bundles the leaf verifies itself). Fenced to exactly one
+    // occurrence inside `open_org_control`, and blanked out before the
+    // ban below runs, so a second bare socket anywhere still fails.
+    let org_control = owner
+        .find("pub fn open_org_control(")
+        .expect("anchor_control_plane.rs must still open the org-control feed");
+    assert_eq!(
+        owner.matches("WebSocket::new(").count(),
+        1,
+        "anchor_control_plane.rs may open exactly one bare `WebSocket::new(` \
+         socket — the org-control feed's"
+    );
+    let bare = owner.find("WebSocket::new(").expect("counted above");
+    assert!(
+        bare > org_control && !owner[org_control..bare].contains("\n    }\n"),
+        "the one bare `WebSocket::new(` must be inside `open_org_control`"
+    );
+    let owner = owner.replacen("WebSocket::new(", "", 1);
     for forbidden in [
         "gloo_net",
         "XMLHttpRequest",

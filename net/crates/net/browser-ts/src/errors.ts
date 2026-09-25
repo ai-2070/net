@@ -34,6 +34,16 @@ export type LeafErrorKind =
   | 'rpc-indeterminate'
   | 'rpc-malformed'
   | 'ice-server-conflict'
+  | 'org-admission-denied'
+  | 'org-revoked'
+  | 'org-timeout'
+  | 'org-cancelled'
+  | 'org-leader-lost'
+  | 'org-session-lost'
+  | 'org-indeterminate'
+  | 'org-refused'
+  | 'org-internal'
+  | 'org-malformed'
   | 'unknown';
 
 /**
@@ -248,6 +258,487 @@ export class UnknownLeafError extends LeafError {
   }
 }
 
+// ── Organization-scoped streaming (plan §4.3) ────────────────────────────
+//
+// The typed terminal vocabulary of an org call or stream. The classes
+// mirror `classifyOrgError`'s vocabulary from the Node binding where
+// names coincide — {@link OrgAdmissionDeniedError} exposes exactly the
+// three coarse buckets and nothing finer, because a precise remote
+// reason would be a credential oracle (OA2-E2).
+//
+// The §4.3 mapping, exactly:
+//
+// - **Opening denial** — the call (or the stream opener) rejects with
+//   {@link OrgAdmissionDeniedError} carrying the coarse reason.
+// - **Midstream revocation** — the stream's FINAL error item is
+//   `AdmissionDenied('denied')`; where the leaf knows the cause was
+//   revocation it arrives as {@link OrgRevokedError}, which IS an
+//   `OrgAdmissionDeniedError` with `coarse === 'denied'` (the frozen
+//   Revoked → Denied coarse map) — a page that speaks §4.3 sees
+//   `AdmissionDenied('denied')`, a page that wants the cause checks
+//   `instanceof`.
+// - **Deadline / cancel retirement** — {@link OrgTimeoutError} /
+//   {@link OrgCancelledError}.
+
+/**
+ * The frozen coarse vocabulary of an admission denial — the whole of
+ * what a remote provider ever says about why. A precise remote reason
+ * would be a credential oracle, so the wire carries one of these three
+ * bytes and the detailed refusal stays provider-side audit only.
+ */
+export type CoarseAdmissionReason = 'denied' | 'not-supported' | 'unavailable';
+
+/** Every org terminal kind, one per the leaf's frozen terminal vocabulary. */
+export type OrgErrorKind =
+  | 'org-admission-denied'
+  | 'org-revoked'
+  | 'org-timeout'
+  | 'org-cancelled'
+  | 'org-leader-lost'
+  | 'org-session-lost'
+  | 'org-indeterminate'
+  | 'org-refused'
+  | 'org-internal'
+  | 'org-malformed';
+
+/**
+ * The base class of the org terminal vocabulary — what
+ * {@link OrgByteStream}'s terminal error item carries and what the org
+ * verbs reject with. `message` is the boundary's own text, verbatim,
+ * exactly as the rest of this taxonomy keeps it.
+ */
+export abstract class OrgStreamError extends LeafError {
+  abstract readonly kind: OrgErrorKind;
+}
+
+/**
+ * The provider's admission engine refused the call (`RpcStatus 0x0009`).
+ * `coarse` is the frozen three-bucket reason and nothing finer.
+ */
+export class OrgAdmissionDeniedError extends OrgStreamError {
+  readonly kind: OrgErrorKind = 'org-admission-denied';
+
+  constructor(
+    readonly coarse: CoarseAdmissionReason,
+    message?: string,
+  ) {
+    super(message ?? `org:admission_denied:${WIRE_COARSE[coarse]}`);
+    this.name = 'OrgAdmissionDeniedError';
+  }
+}
+
+/**
+ * Credentials were revoked mid-call. **Is** an admission denial:
+ * `coarse` is fixed to `'denied'` (the frozen Revoked → Denied coarse
+ * map), so `instanceof OrgAdmissionDeniedError` and
+ * `coarse === 'denied'` hold — `instanceof OrgRevokedError` is how a
+ * page that wants the cause gets it.
+ */
+export class OrgRevokedError extends OrgAdmissionDeniedError {
+  override readonly kind: OrgErrorKind = 'org-revoked';
+
+  constructor(message = 'org:admission_denied:denied') {
+    super('denied', message);
+    this.name = 'OrgRevokedError';
+  }
+}
+
+/** The call's deadline elapsed. Nothing is re-issued. */
+export class OrgTimeoutError extends OrgStreamError {
+  readonly kind = 'org-timeout' as const;
+
+  constructor(message = 'org:rpc:timeout') {
+    super(message);
+    this.name = 'OrgTimeoutError';
+  }
+}
+
+/** The call was cancelled — by its owner, or by a teardown that owns it. */
+export class OrgCancelledError extends OrgStreamError {
+  readonly kind = 'org-cancelled' as const;
+
+  constructor(message = 'org:rpc:cancelled') {
+    super(message);
+    this.name = 'OrgCancelledError';
+  }
+}
+
+/**
+ * The generation holding the call was replaced (the shared-session
+ * surface's typed `LeaderLost`). `generation` is the generation that
+ * owned the call, as an exact decimal string — the u64 never becomes a
+ * JS number here. Never resumed: a successor generation's calls are
+ * fresh calls with fresh correlation and fresh proofs.
+ */
+export class OrgLeaderLostError extends OrgStreamError {
+  readonly kind = 'org-leader-lost' as const;
+
+  constructor(
+    readonly generation: string,
+    message = 'org:rpc:leader_lost',
+  ) {
+    super(message);
+    this.name = 'OrgLeaderLostError';
+  }
+}
+
+/** The session carrying the call went away. */
+export class OrgSessionLostError extends OrgStreamError {
+  readonly kind = 'org-session-lost' as const;
+
+  constructor(message = 'org:rpc:session_lost') {
+    super(message);
+    this.name = 'OrgSessionLostError';
+  }
+}
+
+/**
+ * The caller's own deadline elapsed before an answer arrived; the
+ * remote operation may still have executed and was not retried.
+ */
+export class OrgIndeterminateError extends OrgStreamError {
+  readonly kind = 'org-indeterminate' as const;
+
+  constructor(
+    readonly deadlineMs: number,
+    message = 'org:rpc:indeterminate',
+  ) {
+    super(message);
+    this.name = 'OrgIndeterminateError';
+  }
+}
+
+/**
+ * The application refused the call. `status` is its status code.
+ *
+ * Also the frozen wire kinds `server_error` (a server-answered failure
+ * status — the vocabulary's second name for this same condition) and
+ * `capability_denied` (the capability gate's refusal of the call): a
+ * re-typed wire string carries no recoverable `status` (`0`) and its
+ * `message` keeps the detail verbatim.
+ */
+export class OrgRefusedError extends OrgStreamError {
+  readonly kind = 'org-refused' as const;
+
+  constructor(
+    readonly status: number,
+    message = 'org:rpc:refused',
+  ) {
+    super(message);
+    this.name = 'OrgRefusedError';
+  }
+}
+
+/**
+ * The boundary failed internally. Also what a terminal item whose
+ * `kind` this build does not know becomes: mis-typing a failure is the
+ * exact mistake this taxonomy exists to prevent, so an unknown kind is
+ * named internal rather than guessed into a merits bucket. The frozen
+ * wire kinds `no_route` and `transport` land here for the same reason:
+ * they carry no merits verdict (nobody refused the call).
+ */
+export class OrgInternalError extends OrgStreamError {
+  readonly kind = 'org-internal' as const;
+
+  constructor(message = 'org:rpc:internal') {
+    super(message);
+    this.name = 'OrgInternalError';
+  }
+}
+
+/**
+ * The reply or item did not decode. Also the frozen wire kinds
+ * `codec_encode` / `codec_decode` — the one codec class, both
+ * directions: an item that did not survive the codec is malformed
+ * whichever side failed.
+ */
+export class OrgMalformedError extends OrgStreamError {
+  readonly kind = 'org-malformed' as const;
+
+  constructor(message = 'org:rpc:malformed') {
+    super(message);
+    this.name = 'OrgMalformedError';
+  }
+}
+
+/**
+ * Why a call, stream, sink or request stream retired — the exact
+ * string the retirement observables resolve with, kept verbatim.
+ *
+ * `node-closed` and `replaced` are teardown verdicts rather than call
+ * outcomes; both arrive at the terminal vocabulary as `cancelled`
+ * (the frozen retire → terminal map), and the raw string is what tells
+ * them apart.
+ *
+ * `resource-exhausted` is the leaf's byte-budget retirement
+ * (`RetireReason::ResourceExhausted`'s spelling). Its precise
+ * observable is the `admission-denied` / `unavailable` denial — the
+ * same class the byte-budget send refusal on that call re-types as
+ * ({@link ORG_SINK_BUDGET_REFUSAL}) — never a cancel and never a
+ * teardown verdict.
+ */
+export type OrgRetireReason =
+  | 'timeout'
+  | 'cancelled'
+  | 'revoked'
+  | 'session-lost'
+  | 'leader-lost'
+  | 'node-closed'
+  | 'replaced'
+  | 'resource-exhausted';
+
+/**
+ * THE typed closed refusal of a handler-side sink after retirement —
+ * one text whatever the verdict, so the wrapper's belt (its own
+ * short-circuit) and the leaf's hardening (its rejection) are the
+ * same observable. The verdict itself is what `retired` reports.
+ */
+export const ORG_SINK_CLOSED_REFUSAL = 'org: the response sink is closed: the call was retired';
+
+/**
+ * The upload sink's spelling of the SAME typed closed refusal —
+ * `sink_error(SinkError::Closed, "the upload sink")` at the leaf —
+ * pinned verbatim like {@link ORG_SINK_CLOSED_REFUSAL}. One text per
+ * sink, one text per verdict: what the leaf's `sink_error` spells is
+ * exactly this family, and anything outside it is not a closed refusal.
+ */
+export const ORG_UPLOAD_SINK_CLOSED_REFUSAL =
+  'org: the upload sink is closed: the call was retired';
+
+/**
+ * The byte-budget closed refusals — `sink_error(SinkError::ResourceExhausted, ..)`
+ * for the response sink and the upload sink. The item overran the
+ * call's byte budget and the call retired as `ResourceExhausted`,
+ * whose precise observable is the `admission-denied` / `unavailable`
+ * denial (the leaf's frozen map; C4, coarse `Unavailable`) — so these
+ * re-type as exactly that, never as a cancel.
+ */
+export const ORG_SINK_BUDGET_REFUSAL =
+  "org: the response sink is closed: the call's byte budget refused the item and retired the call";
+export const ORG_UPLOAD_SINK_BUDGET_REFUSAL =
+  "org: the upload sink is closed: the call's byte budget refused the item and retired the call";
+
+const ORG_WIRE_PREFIX = 'org:';
+
+/** The three coarse buckets' wire tokens (`OrgSdkError::to_wire`). */
+const WIRE_COARSE: Record<CoarseAdmissionReason, string> = {
+  'denied': 'denied',
+  'not-supported': 'not_supported',
+  'unavailable': 'unavailable',
+};
+
+/**
+ * Parse one wire token — or the one-byte coarse body a `0x0009`
+ * refusal carries — into the coarse bucket. Anything undecodable is
+ * the least-informative bucket (`denied`), never an error about an
+ * error: the caller still learns it was denied.
+ */
+export function coarseAdmissionReason(token: string | undefined): CoarseAdmissionReason {
+  const text = (token ?? '').trim();
+  if (text === 'unavailable') return 'unavailable';
+  if (text === 'not_supported' || text === 'not-supported') return 'not-supported';
+  // The `map_rpc_error` body: the coarse reason's wire byte 0/1/2, as
+  // a raw byte or its decimal digit.
+  if (text === '\x00' || text === '0') return 'denied';
+  if (text === '\x01' || text === '1') return 'not-supported';
+  if (text === '\x02' || text === '2') return 'unavailable';
+  return 'denied';
+}
+
+/** The terminal error a retirement verdict maps to (the frozen map). */
+export function orgRetireError(reason: OrgRetireReason): OrgStreamError {
+  switch (reason) {
+    case 'timeout':
+      return new OrgTimeoutError();
+    case 'revoked':
+      return new OrgRevokedError();
+    case 'session-lost':
+      return new OrgSessionLostError();
+    case 'leader-lost':
+      // The retire signal carries no generation; the call sites that
+      // know one build `OrgLeaderLostError` themselves.
+      return new OrgLeaderLostError('');
+    case 'cancelled':
+    case 'node-closed':
+    case 'replaced':
+      return new OrgCancelledError();
+    case 'resource-exhausted':
+      // The byte-budget retirement: the leaf's frozen map sends it as
+      // `admission-denied` / `unavailable`, and the send refused on
+      // the same call re-types as exactly that denial.
+      return new OrgAdmissionDeniedError('unavailable');
+  }
+}
+
+/**
+ * Type one terminal item from the boundary — the frozen `kind`
+ * vocabulary plus its fields — as the class §4.3 names.
+ *
+ * `message` is kept verbatim as the error's message.
+ */
+export function orgTerminalError(item: {
+  kind: string;
+  message?: string;
+  coarse?: string;
+  generation?: string;
+  status?: number;
+  deadlineMs?: number;
+}): OrgStreamError {
+  const message = item.message;
+  switch (item.kind) {
+    case 'admission-denied':
+      return new OrgAdmissionDeniedError(coarseAdmissionReason(item.coarse), message);
+    case 'revoked':
+      return message === undefined ? new OrgRevokedError() : new OrgRevokedError(message);
+    case 'timeout':
+      return message === undefined ? new OrgTimeoutError() : new OrgTimeoutError(message);
+    case 'cancelled':
+      return message === undefined ? new OrgCancelledError() : new OrgCancelledError(message);
+    case 'leader-lost':
+      return new OrgLeaderLostError(item.generation ?? '', message);
+    case 'session-lost':
+      return message === undefined ? new OrgSessionLostError() : new OrgSessionLostError(message);
+    case 'indeterminate':
+      return new OrgIndeterminateError(item.deadlineMs ?? 0, message);
+    case 'refused':
+      return new OrgRefusedError(item.status ?? 0, message);
+    case 'malformed':
+      return message === undefined ? new OrgMalformedError() : new OrgMalformedError(message);
+    case 'internal':
+      return message === undefined ? new OrgInternalError() : new OrgInternalError(message);
+    default:
+      return new OrgInternalError(
+        `org:rpc:internal: unrecognized terminal kind ${JSON.stringify(item.kind)}` +
+          (message === undefined ? '' : `: ${message}`),
+      );
+  }
+}
+
+/**
+ * Type one retirement verdict coming back from the boundary's
+ * `retired()`. A string this build does not know is a boundary
+ * disagreement — named `replaced`-as-cancelled would lie about which
+ * teardown ran, so it becomes the cancelled terminal and the raw
+ * string stays in `OrgRetireReason`'s consumers' hands unchanged.
+ */
+export function orgRetireReason(raw: string): OrgRetireReason {
+  switch (raw) {
+    case 'timeout':
+    case 'cancelled':
+    case 'revoked':
+    case 'session-lost':
+    case 'leader-lost':
+    case 'node-closed':
+    case 'replaced':
+    case 'resource-exhausted':
+      return raw;
+    default:
+      return 'replaced';
+  }
+}
+
+/**
+ * Parse one `org:` wire string (`org:<domain>:<kind>[:detail]`, the
+ * `OrgSdkError::to_wire` vocabulary) or a `0x0009` admission refusal,
+ * or `null` if the message is not one.
+ *
+ * The domains and kind tokens mirror `classifyOrgError` from the Node
+ * binding where names coincide; the `rpc` domain reuses the frozen
+ * nRPC kind vocabulary rather than minting second names for the same
+ * conditions. Every frozen `org:rpc:` kind classifies (the frozen
+ * wire-kind map at the `rpc` switch) — a binding that returned `null`
+ * there forced the caller into `UnknownLeafError`, which is the
+ * cross-language drift this closes.
+ */
+export function parseOrgError(message: string): OrgStreamError | null {
+  // `sink_error`'s closed-refusal family comes first: it starts with
+  // the wire prefix but is prose, not `org:<domain>:<kind>`. BOTH
+  // verdict texts, for EVERY sink the leaf spells (the upload sink,
+  // the response sink) — the wording is pinned in the
+  // `ORG_*_REFUSAL` constants and the match is generic in the sink
+  // name only. The closed refusal is one text whatever the verdict
+  // (the verdict itself is what `retired` reports) → cancelled.
+  if (/^org: .+ is closed: the call was retired$/.test(message)) {
+    return new OrgCancelledError(message);
+  }
+  // The byte-budget refusal retires the call as `ResourceExhausted`,
+  // whose precise observable is `admission-denied` / `unavailable`
+  // (the leaf's frozen map) — typed as exactly that denial.
+  if (/^org: .+ is closed: the call's byte budget refused the item and retired the call$/.test(message)) {
+    return new OrgAdmissionDeniedError('unavailable', message);
+  }
+  if (message.startsWith(ORG_WIRE_PREFIX)) {
+    const rest = message.slice(ORG_WIRE_PREFIX.length);
+    const firstColon = rest.indexOf(':');
+    if (firstColon <= 0) return null;
+    const domain = rest.slice(0, firstColon);
+    const afterDomain = rest.slice(firstColon + 1);
+    const secondColon = afterDomain.indexOf(':');
+    const token = secondColon === -1 ? afterDomain : afterDomain.slice(0, secondColon);
+    if (token.length === 0) return null;
+    if (domain === 'admission_denied') {
+      return new OrgAdmissionDeniedError(coarseAdmissionReason(token), message);
+    }
+    if (domain !== 'rpc') return null;
+    // The frozen `org:rpc:` wire-kind map — EVERY kind `rpc_wire_kind`
+    // (and the terminal seam's spellings) can emit classifies here, in
+    // lockstep with node's `classifyOrgError`. Classification is by
+    // TOKEN ONLY: the detail is human-facing and never parsed for
+    // semantics, so fields the wire string does not carry keep their
+    // zero value and `message` keeps the detail verbatim.
+    switch (token) {
+      case 'revoked':
+        return new OrgRevokedError(message);
+      case 'timeout':
+        return new OrgTimeoutError(message);
+      case 'cancelled':
+        return new OrgCancelledError(message);
+      case 'leader_lost':
+      case 'leader-lost':
+        return new OrgLeaderLostError('', message);
+      case 'session_lost':
+      case 'session-lost':
+        return new OrgSessionLostError(message);
+      case 'indeterminate':
+        return new OrgIndeterminateError(0, message);
+      // `server_error` is the frozen vocabulary's second name for the
+      // condition `refused` names (a server-answered failure status),
+      // and `capability_denied` is the capability gate's refusal of
+      // the call — both land in the refusal class, with no status the
+      // wire string carries.
+      case 'refused':
+      case 'server_error':
+      case 'capability_denied':
+        return new OrgRefusedError(0, message);
+      // The codec family: an item that did not survive the codec is
+      // malformed whichever direction failed.
+      case 'malformed':
+      case 'codec_encode':
+      case 'codec_decode':
+        return new OrgMalformedError(message);
+      // `no_route` / `transport` carry NO merits verdict — nobody
+      // refused the call — so they take the taxonomy's non-merits
+      // bucket and are never guessed into refused/admission.
+      case 'internal':
+      case 'no_route':
+      case 'transport':
+        return new OrgInternalError(message);
+      default:
+        return null;
+    }
+  }
+
+  // The leaf's own Display for an admission refusal: `RpcStatus
+  // 0x0009` carrying the single coarse reason byte as its body —
+  // exactly the mapping `map_rpc_error` performs one layer up. The
+  // seam renders that byte as the coarse token text verbatim
+  // (`denied` | `not-supported` | `unavailable`); anything
+  // undecodable is the least-informative bucket.
+  const refused = /^rpc: refused \(9\): ([\s\S]*)$/.exec(message);
+  if (refused) return new OrgAdmissionDeniedError(coarseAdmissionReason(refused[1]), message);
+  return null;
+}
+
 const RTC_KINDS = {
   iceTimeout: 'ice-timeout',
   udpBlocked: 'udp-blocked',
@@ -336,6 +827,12 @@ function messageOf(thrown: unknown): string {
  * deserves to be unit-testable without a wasm module.
  */
 export function parseLeafError(message: string): LeafError | null {
+  // The org vocabulary first: a `0x0009` refusal would otherwise
+  // become a plain `rpc-refused` and lose that it was an admission
+  // denial.
+  const org = parseOrgError(message);
+  if (org !== null) return org;
+
   const rtc = after(message, 'rtc: ');
   if (rtc !== null) {
     const failure = parseRtcFailure(rtc);

@@ -54,7 +54,10 @@ fi
 
 # ---------------------------------------------------------------- frontmatter
 echo "==> Frontmatter"
-want_version=$(grep -m1 '^version' net/crates/net/sdk/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+# Every crate inherits `[workspace.package] version` from the workspace root
+# (`version.workspace = true`), so the one literal lives there.
+want_version=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p}' net/crates/net/Cargo.toml)
+[ -n "$want_version" ] || { echo "::error::no [workspace.package] version in net/crates/net/Cargo.toml"; exit 1; }
 for skill in "$SKILLS"/*/SKILL.md; do
   name=$(basename "$(dirname "$skill")")
   for key in name description allowed-tools; do

@@ -36,10 +36,12 @@ The crate imports as `net_sdk`.
 
 Two authority surfaces sit on top of the mesh, both marshaling-free in Rust:
 
-- **Organization auth** ([concepts](/docs/concepts/organizations)) —
-  `mesh.serve_org(service, OrgAccess::…, handler)` on the provider,
-  `mesh.org(credentials)?.call(service, &req)` on the caller. The service is
-  invisible outside its audience, not merely refused.
+- **Organization auth** ([concepts](/docs/concepts/organizations)) — the provider
+  registers with `mesh.serve_org(service, OrgAccess::…, handler)` for unary, or
+  `serve_org_streaming` / `serve_org_client_stream` / `serve_org_duplex` for the
+  three streaming shapes; the caller binds once with `mesh.org(credentials)?` and
+  uses `call(service, &req)` beside `call_streaming` / `call_client_stream` /
+  `call_duplex`. The service is invisible outside its audience, not merely refused.
 - **Subnet authority** ([concepts](/docs/concepts/subnets)) — a provider inside
   a protected subnet exports one service against a *named export* configured on
   the builder (`.subnet_export(..)`):

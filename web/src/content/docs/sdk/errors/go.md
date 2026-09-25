@@ -121,6 +121,17 @@ return SummarizeResp{}, net.AppError(net.NrpcTypedBadRequest, body)
 thrown away the distinction the caller needs to decide whether to retry — this is
 the most common way a Go provider degrades its callers' error handling.
 
+### Organization failures
+
+Organization-scoped calls return `*net.OrgError` with a `Domain` and `Kind` — with
+one exception: a cancellation *you* initiated surfaces as your own context's error
+(`ctx.Err()`), not as an `OrgError`. Branch on the domain with `.IsLocal()` —
+`credentials` and `discovery` are local;
+`admission_denied`, `rpc`, and `unknown` are remote — and use `errors.Is` against
+the `ErrOrg*` sentinels for a coarse match. A streaming call can fail **midstream**,
+from `Recv`/`Send`/`Finish` on the returned handle rather than at the call, so drain
+errors where they land.
+
 ### Recover a call
 
 Retry, hedge and circuit-breaker strategies apply as in the other bindings, and

@@ -298,3 +298,127 @@ describe('live nRPC registration through the Node binding', () => {
     handle.close()
   }, 30_000)
 })
+
+// NODE-3 breadth (§23 audit): the three PUBLIC serve bridges release the
+// handles they gave the handler at the supervisor's forced drop — promptly,
+// never V8-GC-quantized. On the public surface a caller CANCEL only flips
+// the handler's cancellation token (there is no retire arm); the forced
+// drop is the call's DEADLINE, which the request carries to the provider.
+// The org twins (caller-CANCEL retirement) live in `org_live.test.ts`.
+describe('forced drop releases handler handles on every public serve bridge', () => {
+  // Short enough that the release lands well inside the 10 s poll.
+  const DROP_DEADLINE_MS = 1_500
+
+  async function waitFor(cond: () => boolean, what: string): Promise<void> {
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline && !cond()) await sleep(25)
+    expect(cond(), what).toBe(true)
+  }
+
+  async function sinkReleased(sink: { send: (b: Buffer) => boolean }): Promise<boolean> {
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      if (!sink.send(Buffer.from('late'))) return true
+      await sleep(50)
+    }
+    return false
+  }
+
+  async function streamReleased(stream: { next: () => Promise<Buffer | null> }): Promise<boolean> {
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const outcome = await Promise.race([
+        stream.next().then(
+          () => 'pulled' as const,
+          (e: unknown) =>
+            String((e as Error).message).includes('stream_closed') ? 'refused' : 'other',
+        ),
+        sleep(250).then(() => 'parked' as const),
+      ])
+      if (outcome === 'refused') return true
+      if (outcome === 'other') return false
+      await sleep(50)
+    }
+    return false
+  }
+
+  it('server_streaming_forced_drop_releases_the_sink', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    let hSink: { send: (b: Buffer) => boolean } | undefined
+    const handle = serverRpc.serveStreaming(
+      'live.drop.ss',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ([, sink]: [Buffer, any]) => {
+        hSink = sink
+        return sleep(30_000).then(() => Buffer.alloc(0))
+      },
+    )
+    const stream = await clientRpc.callStreaming(server.nodeId(), 'live.drop.ss', Buffer.from('x'), {
+      deadlineMs: DROP_DEADLINE_MS,
+    })
+    await waitFor(() => hSink !== undefined, 'the handler ran and captured its sink')
+    expect(await sinkReleased(hSink as NonNullable<typeof hSink>), 'sink released promptly').toBe(
+      true,
+    )
+    await stream.close()
+    handle.close()
+  }, 60_000)
+
+  // A CONTRACT pin, not a guard discriminator: with the guard's release
+  // disabled this still passes — the fold's own input close refuses the
+  // pull once the handler is force-dropped, and JS cannot observe the
+  // request stream's Arc directly. The sink-side witnesses discriminate
+  // (red with the release disabled).
+  it('client_streaming_forced_drop_releases_the_request_stream', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    let hStream: { next: () => Promise<Buffer | null> } | undefined
+    const handle = serverRpc.serveClientStream(
+      'live.drop.cs',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (stream: any) => {
+        hStream = stream
+        return sleep(30_000).then(() => Buffer.alloc(0))
+      },
+    )
+    const call = await clientRpc.callClientStream(server.nodeId(), 'live.drop.cs', {
+      deadlineMs: DROP_DEADLINE_MS,
+    })
+    await call.send(Buffer.from('a'))
+    await waitFor(() => hStream !== undefined, 'the handler ran and captured its request stream')
+    expect(
+      await streamReleased(hStream as NonNullable<typeof hStream>),
+      'request stream released promptly',
+    ).toBe(true)
+    await call.close()
+    handle.close()
+  }, 60_000)
+
+  it('duplex_forced_drop_releases_both_handles', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    let hStream: { next: () => Promise<Buffer | null> } | undefined
+    let hSink: { send: (b: Buffer) => boolean } | undefined
+    const handle = serverRpc.serveDuplex(
+      'live.drop.dx',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ([stream, sink]: [any, any]) => {
+        hStream = stream
+        hSink = sink
+        return sleep(30_000).then(() => Buffer.alloc(0))
+      },
+    )
+    const call = await clientRpc.callDuplex(server.nodeId(), 'live.drop.dx', {
+      deadlineMs: DROP_DEADLINE_MS,
+    })
+    await call.send(Buffer.from('a'))
+    await waitFor(() => hSink !== undefined, 'the handler ran and captured its handles')
+    expect(await sinkReleased(hSink as NonNullable<typeof hSink>), 'sink released promptly').toBe(
+      true,
+    )
+    expect(
+      await streamReleased(hStream as NonNullable<typeof hStream>),
+      'request stream released promptly',
+    ).toBe(true)
+    await call.close()
+    handle.close()
+  }, 60_000)
+})

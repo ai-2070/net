@@ -96,6 +96,23 @@ port from TypeScript.
 `defer bus.Shutdown()`. A `MeshNode` has its own `Shutdown` — if you built both,
 shut down both.
 
+## Protected services (org)
+
+Org capability auth is fully in the **shipped** module (`go/org.go`) — no
+reference-tree caveat, unlike the resilience helpers above. It carries its own
+ABI handshake, independent of the rest of the binding: `orgABIVersion = 0x0002`,
+checked in `init()`, which hard-fails on a mismatch.
+
+The unary typed call is a **free function** — `net.OrgCall[Req, Resp](ctx,
+client, service, req)` (Go forbids type parameters on methods) — while the
+streaming verbs are **methods** on `*OrgClient`: `CallStreaming`,
+`CallClientStream`, `CallDuplex`, returning the shared nRPC handles
+(`*RpcStream`, `*ClientStreamCall`, `*DuplexCall`). Provider side: `net.ServeOrg`,
+`net.ServeOrgStreaming`, `net.ServeOrgClientStream`, `net.ServeOrgDuplex`. On the
+three streaming methods an unset deadline (`0`, or a `ctx` carrying none) means the
+facade's **300 s** protected-call lifetime, never "no deadline"; unary `OrgCall`
+/ `CallBytes` stays unbounded at `0`. Full contract: `org.md`.
+
 ## Gaps — Go is the least complete binding
 
 Check `bindings/coverage.md` before promising anything. The three to know:

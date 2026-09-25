@@ -60,11 +60,22 @@ use net::adapter::net::cortex::{
     RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink, RpcStatus, RpcStreamingContext,
 };
 use net::adapter::net::mesh_rpc::{
-    CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
-    DuplexSink as InnerDuplexSink, DuplexStream as InnerDuplexStream, RpcError as InnerRpcError,
-    RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
+    CallOptions as InnerCallOptions, RpcError as InnerRpcError, ServeHandle as InnerServeHandle,
 };
 use net::adapter::net::MeshNode;
+
+// The shared C-ABI streaming handle types — named by THIS crate's `net_rpc_*`
+// operations and by `org-ffi`'s `net_org_call_*` verbs alike (§4.4: "types
+// move to a module both `rpc-ffi` and `org-ffi` can name"). One module, one
+// rlib, one `libnet` cdylib: the handle an org verb returns is driven and
+// freed by the very same `net_rpc_stream_next` / `net_rpc_stream_free` a
+// public stream is.
+mod handles;
+pub use handles::{
+    spawn_handler_thread, ClientStreamCallHandleC, DuplexCallHandleC, DuplexSinkHandleC,
+    DuplexStreamHandleC, ErrWireFn, HandlerJoinError, RpcRequestStreamHandleC,
+    RpcResponseSinkHandleC, RpcStreamHandleC,
+};
 
 // =========================================================================
 // FFI guard — wraps every entry point in `catch_unwind`
@@ -441,7 +452,7 @@ fn handler_error_from_msg(msg: String) -> RpcHandlerError {
 ///   transport: ...
 ///   codec_encode: ...
 ///   codec_decode: ...
-fn format_rpc_error(err: &InnerRpcError) -> String {
+fn format_rpc_error(err: InnerRpcError) -> String {
     use net::adapter::net::mesh_rpc::CodecDirection;
     match err {
         InnerRpcError::NoRoute { target, reason } => {
@@ -654,7 +665,7 @@ impl RpcHandler for GoRpcHandler {
         // call doesn't park an async-runtime worker.
         let join = tokio::time::timeout(
             timeout,
-            tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+            spawn_handler_thread(move || -> Result<Vec<u8>, String> {
                 let mut resp_ptr: *mut u8 = std::ptr::null_mut();
                 let mut resp_len: usize = 0;
                 let mut err_ptr: *mut c_char = std::ptr::null_mut();
@@ -710,7 +721,7 @@ impl RpcHandler for GoRpcHandler {
             Ok(Ok(Err(msg))) => return Err(handler_error_from_msg(msg)),
             Ok(Err(join_err)) => {
                 return Err(RpcHandlerError::Internal(format!(
-                    "Go-handler blocking task panicked: {join_err}"
+                    "Go-handler handler thread ended without a result: {join_err}"
                 )));
             }
             Err(_) => {
@@ -1009,7 +1020,7 @@ pub extern "C" fn net_rpc_call(
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -1059,7 +1070,7 @@ pub extern "C" fn net_rpc_call_service(
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -1311,26 +1322,8 @@ pub extern "C" fn net_rpc_serve_handle_free(handle: *mut ServeHandleC) {
 // Streaming — opaque RpcStreamHandle, blocking next, explicit grant.
 // =========================================================================
 
-/// Opaque RpcStream handle exposed to Go. The inner SDK stream sits
-/// behind an `Arc<Mutex<Option<...>>>` so:
-///   - `close()` can `take()` the stream (which fires CANCEL via
-///     the SDK's `Drop` impl) and remain idempotent.
-///   - `next()` locks, polls, and re-stores `Some(stream)` until
-///     the stream terminates.
-///
-/// Once `close()` runs OR the stream has yielded its terminal item,
-/// subsequent `next()` calls return `NET_RPC_ERR_STREAM_DONE`.
-pub struct RpcStreamHandleC {
-    inner: Arc<Mutex<Option<InnerRpcStream>>>,
-    /// Mirrors the SDK's `RpcStream::call_id`. Captured at
-    /// construction so the diagnostic accessor doesn't need to
-    /// re-acquire the mutex.
-    call_id: u64,
-    /// `true` once a terminal item (clean end OR error) has been
-    /// observed. Latched separately from the `Option` so we don't
-    /// re-take the inner stream just to check this state.
-    done: AtomicBool,
-}
+// `RpcStreamHandleC` moved to `handles` (shared with `org-ffi`, whose
+// `net_org_call_streaming` hands out this exact type).
 
 /// Direct-addressed streaming call. Constructs the underlying
 /// `RpcStream` synchronously (via `runtime.block_on`) and returns
@@ -1379,19 +1372,14 @@ pub extern "C" fn net_rpc_call_streaming(
 
         match result {
             Ok(stream) => {
-                let call_id = stream.call_id();
-                let boxed = Box::new(RpcStreamHandleC {
-                    inner: Arc::new(Mutex::new(Some(stream))),
-                    call_id,
-                    done: AtomicBool::new(false),
-                });
+                let boxed = Box::new(RpcStreamHandleC::new(stream, format_rpc_error));
                 unsafe {
                     *out_stream = Box::into_raw(boxed);
                 }
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -1454,19 +1442,14 @@ pub extern "C" fn net_rpc_call_streaming_cancellable(
 
         match result {
             Ok(stream) => {
-                let call_id = stream.call_id();
-                let boxed = Box::new(RpcStreamHandleC {
-                    inner: Arc::new(Mutex::new(Some(stream))),
-                    call_id,
-                    done: AtomicBool::new(false),
-                });
+                let boxed = Box::new(RpcStreamHandleC::new(stream, format_rpc_error));
                 unsafe {
                     *out_stream = Box::into_raw(boxed);
                 }
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -1522,19 +1505,14 @@ pub extern "C" fn net_rpc_call_service_streaming(
 
         match result {
             Ok(stream) => {
-                let call_id = stream.call_id();
-                let boxed = Box::new(RpcStreamHandleC {
-                    inner: Arc::new(Mutex::new(Some(stream))),
-                    call_id,
-                    done: AtomicBool::new(false),
-                });
+                let boxed = Box::new(RpcStreamHandleC::new(stream, format_rpc_error));
                 unsafe {
                     *out_stream = Box::into_raw(boxed);
                 }
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -1606,7 +1584,7 @@ pub extern "C" fn net_rpc_stream_next(
                 // server already terminated us) and latch done.
                 drop(inner);
                 s.done.store(true, Ordering::Relaxed);
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, s.format_err(e));
                 NET_RPC_ERR_CALL_FAILED
             }
             None => {
@@ -1699,25 +1677,8 @@ pub extern "C" fn net_rpc_stream_free(stream: *mut RpcStreamHandleC) {
 //   net_rpc_client_stream_free(handle)             // idempotent
 // =========================================================================
 
-/// Opaque caller-side handle for a client-streaming call.
-///
-/// The inner `ClientStreamCallRaw` is held inside an `Option`
-/// behind a `Mutex` so the state machine (`JustOpened` → `Sending`
-/// → `Finishing` → `Done`) can be driven across multiple FFI
-/// calls without re-entry hazards. `finish` `take()`s the inner
-/// value permanently; subsequent `send` / `finish` calls observe
-/// `None` and return `NET_RPC_ERR_STREAM_DONE`.
-///
-/// `call_id` is captured at construction so `net_rpc_client_stream_call_id`
-/// doesn't need to lock the mutex. `done` is the same latch as
-/// `RpcStreamHandleC`: set on terminal observation OR explicit
-/// `free`, so a Go consumer can race a deferred-free with a
-/// stray send/finish cleanly.
-pub struct ClientStreamCallHandleC {
-    inner: Arc<Mutex<Option<InnerClientStreamCallRaw>>>,
-    call_id: u64,
-    done: AtomicBool,
-}
+// `ClientStreamCallHandleC` moved to `handles` (shared with `org-ffi`, whose
+// `net_org_call_client_stream` hands out this exact type).
 
 /// Direct-addressed client-streaming call. Constructs the
 /// underlying `ClientStreamCallRaw` via `runtime.block_on` (which
@@ -1767,19 +1728,14 @@ pub extern "C" fn net_rpc_call_client_stream(
         });
         match result {
             Ok(call) => {
-                let call_id = call.call_id();
-                let boxed = Box::new(ClientStreamCallHandleC {
-                    inner: Arc::new(Mutex::new(Some(call))),
-                    call_id,
-                    done: AtomicBool::new(false),
-                });
+                let boxed = Box::new(ClientStreamCallHandleC::new(call, format_rpc_error));
                 unsafe {
                     *out_handle = Box::into_raw(boxed);
                 }
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -1829,19 +1785,14 @@ pub extern "C" fn net_rpc_call_client_stream_cancellable(
         });
         match result {
             Ok(call) => {
-                let call_id = call.call_id();
-                let boxed = Box::new(ClientStreamCallHandleC {
-                    inner: Arc::new(Mutex::new(Some(call))),
-                    call_id,
-                    done: AtomicBool::new(false),
-                });
+                let boxed = Box::new(ClientStreamCallHandleC::new(call, format_rpc_error));
                 unsafe {
                     *out_handle = Box::into_raw(boxed);
                 }
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -1895,7 +1846,7 @@ pub extern "C" fn net_rpc_client_stream_send(
                 // already flew) and latch done.
                 *guard = None;
                 h.done.store(true, Ordering::Relaxed);
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, h.format_err(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -1951,7 +1902,7 @@ pub extern "C" fn net_rpc_client_stream_finish(
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, h.format_err(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -2011,53 +1962,9 @@ pub extern "C" fn net_rpc_client_stream_free(handle: *mut ClientStreamCallHandle
 // and the original DuplexCallHandleC's Option becomes None.
 // =========================================================================
 
-/// Opaque caller-side handle for a duplex call (combined send +
-/// receive). Mirrors `RpcStreamHandleC` shape: an inner
-/// `Option<DuplexCallRaw>` behind a Mutex, with a captured
-/// call_id and a `done` AtomicBool latch.
-///
-/// State transitions:
-///   - JustOpened → Sending (first `send`)
-///   - Sending → Finishing (after `finish_sending`)
-///   - Finishing → Done (after response stream's terminal frame
-///     observed via `next` returning `None` / Error item)
-///   - Any → split (after `into_split`)
-///
-/// After `into_split` or `free`, both inner Options are None and
-/// subsequent `send` / `finish_sending` / `next` calls return
-/// `NET_RPC_ERR_STREAM_DONE`.
-///
-/// **Auto-split.** The combined `DuplexCallRaw` is split into a
-/// `DuplexSink` + `DuplexStream` at construction so concurrent
-/// send + recv from Go (the primary duplex use case) do NOT
-/// contend on the same mutex. Both halves share the underlying
-/// `Arc<DuplexInner>`, so CANCEL-on-Drop semantics are preserved:
-/// the wire CANCEL fires only after both halves have been
-/// dropped without a clean close.
-pub struct DuplexCallHandleC {
-    sink: Arc<Mutex<Option<InnerDuplexSink>>>,
-    stream: Arc<Mutex<Option<InnerDuplexStream>>>,
-    call_id: u64,
-    done: AtomicBool,
-}
-
-/// Opaque caller-side handle for the send-half of a split duplex
-/// call. Constructed by [`net_rpc_duplex_into_split`].
-/// `sink_finish` consumes the inner sink.
-pub struct DuplexSinkHandleC {
-    inner: Arc<Mutex<Option<InnerDuplexSink>>>,
-    call_id: u64,
-    done: AtomicBool,
-}
-
-/// Opaque caller-side handle for the receive-half of a split
-/// duplex call. Constructed by [`net_rpc_duplex_into_split`].
-/// Drains chunks via `_stream_next` until terminal End / Error.
-pub struct DuplexStreamHandleC {
-    inner: Arc<Mutex<Option<InnerDuplexStream>>>,
-    call_id: u64,
-    done: AtomicBool,
-}
+// `DuplexCallHandleC` / `DuplexSinkHandleC` / `DuplexStreamHandleC` moved to
+// `handles` (shared with `org-ffi`, whose `net_org_call_duplex` hands out the
+// combined handle).
 
 /// Direct-addressed duplex call. Constructs the underlying
 /// `DuplexCallRaw` via block_on (reply subscription setup; no
@@ -2102,25 +2009,18 @@ pub extern "C" fn net_rpc_call_duplex(
             block_on(async move { node.call_duplex(target_node_id, &service, opts).await });
         match result {
             Ok(call) => {
-                let call_id = call.call_id();
-                // Auto-split at construction so concurrent send + recv
-                // from Go don't contend on a single mutex. Both halves
-                // share Arc<DuplexInner>; CANCEL-on-Drop remains gated
-                // on both-halves-dropped via the SDK's refcount.
-                let (sink, stream) = call.into_split();
-                let boxed = Box::new(DuplexCallHandleC {
-                    sink: Arc::new(Mutex::new(Some(sink))),
-                    stream: Arc::new(Mutex::new(Some(stream))),
-                    call_id,
-                    done: AtomicBool::new(false),
-                });
+                // `DuplexCallHandleC::new` auto-splits at construction so
+                // concurrent send + recv from Go don't contend on a single
+                // mutex. Both halves share Arc<DuplexInner>; CANCEL-on-Drop
+                // remains gated on both-halves-dropped via the SDK's refcount.
+                let boxed = Box::new(DuplexCallHandleC::new(call, format_rpc_error));
                 unsafe {
                     *out_handle = Box::into_raw(boxed);
                 }
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -2170,21 +2070,14 @@ pub extern "C" fn net_rpc_call_duplex_cancellable(
             block_on(async move { node.call_duplex(target_node_id, &service, opts).await });
         match result {
             Ok(call) => {
-                let call_id = call.call_id();
-                let (sink, stream) = call.into_split();
-                let boxed = Box::new(DuplexCallHandleC {
-                    sink: Arc::new(Mutex::new(Some(sink))),
-                    stream: Arc::new(Mutex::new(Some(stream))),
-                    call_id,
-                    done: AtomicBool::new(false),
-                });
+                let boxed = Box::new(DuplexCallHandleC::new(call, format_rpc_error));
                 unsafe {
                     *out_handle = Box::into_raw(boxed);
                 }
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -2225,7 +2118,7 @@ pub extern "C" fn net_rpc_duplex_send(
             Ok(()) => NET_RPC_OK,
             Err(e) => {
                 *guard = None;
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, h.format_err(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -2260,7 +2153,7 @@ pub extern "C" fn net_rpc_duplex_finish_sending(
         match result {
             Ok(()) => NET_RPC_OK,
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, h.format_err(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -2311,7 +2204,7 @@ pub extern "C" fn net_rpc_duplex_next(
             Some(Err(e)) => {
                 *guard = None;
                 h.done.store(true, Ordering::Relaxed);
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, h.format_err(e));
                 NET_RPC_ERR_CALL_FAILED
             }
             None => {
@@ -2382,16 +2275,9 @@ pub extern "C" fn net_rpc_duplex_into_split(
             }
         };
         let call_id = h.call_id;
-        let sink_boxed = Box::new(DuplexSinkHandleC {
-            inner: Arc::new(Mutex::new(Some(sink))),
-            call_id,
-            done: AtomicBool::new(false),
-        });
-        let stream_boxed = Box::new(DuplexStreamHandleC {
-            inner: Arc::new(Mutex::new(Some(stream))),
-            call_id,
-            done: AtomicBool::new(false),
-        });
+        let err_wire = h.err_wire;
+        let sink_boxed = Box::new(DuplexSinkHandleC::new(sink, call_id, err_wire));
+        let stream_boxed = Box::new(DuplexStreamHandleC::new(stream, call_id, err_wire));
         unsafe {
             *out_sink = Box::into_raw(sink_boxed);
             *out_stream = Box::into_raw(stream_boxed);
@@ -2466,7 +2352,7 @@ pub extern "C" fn net_rpc_duplex_sink_send(
             Err(e) => {
                 *guard = None;
                 h.done.store(true, Ordering::Relaxed);
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, h.format_err(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -2500,7 +2386,7 @@ pub extern "C" fn net_rpc_duplex_sink_finish(
         match result {
             Ok(()) => NET_RPC_OK,
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, h.format_err(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -2577,7 +2463,7 @@ pub extern "C" fn net_rpc_duplex_stream_next(
             Some(Err(e)) => {
                 *guard = None;
                 h.done.store(true, Ordering::Relaxed);
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, h.format_err(e));
                 NET_RPC_ERR_CALL_FAILED
             }
             None => {
@@ -2693,7 +2579,7 @@ pub extern "C" fn net_rpc_call_with_headers(
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -2751,7 +2637,7 @@ pub extern "C" fn net_rpc_call_service_with_headers(
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -2808,19 +2694,14 @@ pub extern "C" fn net_rpc_call_streaming_with_headers(
 
         match result {
             Ok(stream) => {
-                let call_id = stream.call_id();
-                let boxed = Box::new(RpcStreamHandleC {
-                    inner: Arc::new(Mutex::new(Some(stream))),
-                    call_id,
-                    done: AtomicBool::new(false),
-                });
+                let boxed = Box::new(RpcStreamHandleC::new(stream, format_rpc_error));
                 unsafe {
                     *out_stream = Box::into_raw(boxed);
                 }
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -2883,19 +2764,14 @@ pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
 
         match result {
             Ok(stream) => {
-                let call_id = stream.call_id();
-                let boxed = Box::new(RpcStreamHandleC {
-                    inner: Arc::new(Mutex::new(Some(stream))),
-                    call_id,
-                    done: AtomicBool::new(false),
-                });
+                let boxed = Box::new(RpcStreamHandleC::new(stream, format_rpc_error));
                 unsafe {
                     *out_stream = Box::into_raw(boxed);
                 }
                 NET_RPC_OK
             }
             Err(e) => {
-                write_err(out_err, format_rpc_error(&e));
+                write_err(out_err, format_rpc_error(e));
                 NET_RPC_ERR_CALL_FAILED
             }
         }
@@ -3004,18 +2880,8 @@ pub extern "C" fn net_rpc_set_duplex_handler_dispatcher(dispatcher: RpcDuplexHan
     })
 }
 
-/// Per-call opaque handle wrapping the SDK's `RequestStream`. The
-/// Go-side handler pulls request chunks via
-/// [`net_rpc_request_stream_next`] until it sees `STREAM_DONE`.
-///
-/// Lifetime is bounded by the dispatcher call — Rust constructs
-/// the handle, passes it to the Go dispatcher, and frees it
-/// after the dispatcher returns. The Go side MUST NOT call any
-/// `_free` on this handle.
-pub struct RpcRequestStreamHandleC {
-    inner: Mutex<Option<InnerRequestStream>>,
-    done: AtomicBool,
-}
+// `RpcRequestStreamHandleC` moved to `handles` (shared with `org-ffi`, whose
+// shape dispatchers hand the same per-call handles to Go).
 
 /// Pull the next inbound request chunk on this stream. Blocks
 /// the calling thread on `block_on(stream.next())` — the Go side
@@ -3079,13 +2945,7 @@ pub extern "C" fn net_rpc_request_stream_next(
     })
 }
 
-/// Per-call opaque handle wrapping the SDK's `RpcResponseSink`.
-/// Used by duplex handlers to emit response chunks. Same
-/// lifetime contract as `RpcRequestStreamHandleC` — Rust owns,
-/// Go borrows for the dispatcher call.
-pub struct RpcResponseSinkHandleC {
-    inner: Mutex<Option<InnerRpcResponseSink>>,
-}
+// `RpcResponseSinkHandleC` moved to `handles` (shared with `org-ffi`).
 
 /// Emit one response chunk via the sink. Non-blocking
 /// (`try_send` semantics in the underlying SDK). Returns
@@ -3159,10 +3019,7 @@ impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
         };
         let handler_id = self.handler_id;
         let timeout = self.timeout;
-        let stream_handle = Box::into_raw(Box::new(RpcRequestStreamHandleC {
-            inner: Mutex::new(Some(requests)),
-            done: AtomicBool::new(false),
-        }));
+        let stream_handle = Box::into_raw(Box::new(RpcRequestStreamHandleC::new(requests)));
         // `*mut T` is not `Send`. Smuggle the raw address through
         // the closure boundary as a `usize`, then materialize it
         // back into a pointer inside. Safe because (a) the box
@@ -3174,7 +3031,7 @@ impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
 
         let join = tokio::time::timeout(
             timeout,
-            tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+            spawn_handler_thread(move || -> Result<Vec<u8>, String> {
                 let stream_handle = stream_handle_addr as *mut RpcRequestStreamHandleC;
                 let mut resp_ptr: *mut u8 = std::ptr::null_mut();
                 let mut resp_len: usize = 0;
@@ -3229,7 +3086,7 @@ impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
             Ok(Ok(Err(msg))) => return Err(handler_error_from_msg(msg)),
             Ok(Err(join_err)) => {
                 return Err(RpcHandlerError::Internal(format!(
-                    "Go client-streaming blocking task panicked: {join_err}"
+                    "Go client-streaming handler thread ended without a result: {join_err}"
                 )));
             }
             Err(_elapsed) => {
@@ -3277,13 +3134,8 @@ impl RpcDuplexHandler for GoDuplexRpcHandler {
         };
         let handler_id = self.handler_id;
         let timeout = self.timeout;
-        let stream_handle = Box::into_raw(Box::new(RpcRequestStreamHandleC {
-            inner: Mutex::new(Some(requests)),
-            done: AtomicBool::new(false),
-        }));
-        let sink_handle = Box::into_raw(Box::new(RpcResponseSinkHandleC {
-            inner: Mutex::new(Some(responses)),
-        }));
+        let stream_handle = Box::into_raw(Box::new(RpcRequestStreamHandleC::new(requests)));
+        let sink_handle = Box::into_raw(Box::new(RpcResponseSinkHandleC::new(responses)));
         // Same Send-smuggling pattern as the client-streaming
         // handler — convert raw pointers to usize so the closure
         // is Send.
@@ -3292,7 +3144,7 @@ impl RpcDuplexHandler for GoDuplexRpcHandler {
 
         let join = tokio::time::timeout(
             timeout,
-            tokio::task::spawn_blocking(move || -> Result<(), String> {
+            spawn_handler_thread(move || -> Result<(), String> {
                 let stream_handle = stream_handle_addr as *mut RpcRequestStreamHandleC;
                 let sink_handle = sink_handle_addr as *mut RpcResponseSinkHandleC;
                 let mut err_ptr: *mut c_char = std::ptr::null_mut();
@@ -3325,7 +3177,7 @@ impl RpcDuplexHandler for GoDuplexRpcHandler {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
             Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
-                "Go duplex blocking task panicked: {join_err}"
+                "Go duplex handler thread ended without a result: {join_err}"
             ))),
             Err(_elapsed) => Err(RpcHandlerError::Internal(format!(
                 "Go duplex handler timed out after {}ms",
@@ -3459,14 +3311,12 @@ impl ::net::adapter::net::cortex::RpcStreamingHandler for GoStreamingRpcHandler 
         let handler_id = self.handler_id;
         let timeout = self.timeout;
         let req_body = ctx.payload.body;
-        let sink_handle = Box::into_raw(Box::new(RpcResponseSinkHandleC {
-            inner: Mutex::new(Some(responses)),
-        }));
+        let sink_handle = Box::into_raw(Box::new(RpcResponseSinkHandleC::new(responses)));
         let sink_handle_addr = sink_handle as usize;
 
         let join = tokio::time::timeout(
             timeout,
-            tokio::task::spawn_blocking(move || -> Result<(), String> {
+            spawn_handler_thread(move || -> Result<(), String> {
                 let sink_handle = sink_handle_addr as *mut RpcResponseSinkHandleC;
                 let mut err_ptr: *mut c_char = std::ptr::null_mut();
                 let code = unsafe {
@@ -3503,7 +3353,7 @@ impl ::net::adapter::net::cortex::RpcStreamingHandler for GoStreamingRpcHandler 
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
             Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
-                "Go streaming blocking task panicked: {join_err}"
+                "Go streaming handler thread ended without a result: {join_err}"
             ))),
             Err(_elapsed) => Err(RpcHandlerError::Internal(format!(
                 "Go streaming handler timed out after {}ms",
@@ -4199,32 +4049,32 @@ mod tests {
     /// segment to dispatch to typed errors.
     #[test]
     fn format_rpc_error_kind_segments_are_stable() {
-        assert!(format_rpc_error(&InnerRpcError::NoRoute {
+        assert!(format_rpc_error(InnerRpcError::NoRoute {
             target: 0xABCD,
             reason: "x".into(),
         })
         .starts_with("no_route:"));
         assert!(
-            format_rpc_error(&InnerRpcError::Timeout { elapsed_ms: 100 }).starts_with("timeout:")
+            format_rpc_error(InnerRpcError::Timeout { elapsed_ms: 100 }).starts_with("timeout:")
         );
-        assert!(format_rpc_error(&InnerRpcError::ServerError {
+        assert!(format_rpc_error(InnerRpcError::ServerError {
             status: 0x4001,
             message: "x".into(),
             headers: vec![],
         })
         .starts_with("server_error:"));
         assert!(
-            format_rpc_error(&InnerRpcError::Transport(AdapterError::Connection(
+            format_rpc_error(InnerRpcError::Transport(AdapterError::Connection(
                 "boom".into()
             )))
             .starts_with("transport:")
         );
-        assert!(format_rpc_error(&InnerRpcError::Codec {
+        assert!(format_rpc_error(InnerRpcError::Codec {
             direction: CodecDirection::Encode,
             message: "x".into(),
         })
         .starts_with("codec_encode:"));
-        assert!(format_rpc_error(&InnerRpcError::Codec {
+        assert!(format_rpc_error(InnerRpcError::Codec {
             direction: CodecDirection::Decode,
             message: "x".into(),
         })
@@ -4439,6 +4289,7 @@ mod tests {
             inner: Arc::new(Mutex::new(None)),
             call_id: 42,
             done: AtomicBool::new(true),
+            err_wire: format_rpc_error,
         }));
         let mut err_ptr: *mut c_char = std::ptr::null_mut();
         let body = b"x";
@@ -4583,6 +4434,7 @@ mod tests {
             inner: Arc::new(Mutex::new(None)),
             call_id: 42,
             done: AtomicBool::new(false),
+            err_wire: format_rpc_error,
         }));
         // Pre-close — no inner stream → take() returns None →
         // latches done + returns STREAM_DONE.
@@ -4609,6 +4461,7 @@ mod tests {
             inner: Arc::new(Mutex::new(None)),
             call_id: 7,
             done: AtomicBool::new(false),
+            err_wire: format_rpc_error,
         }));
         net_rpc_stream_close(handle);
         net_rpc_stream_close(handle); // second close — no panic
@@ -4625,6 +4478,7 @@ mod tests {
             inner: Arc::new(Mutex::new(None)),
             call_id: 99,
             done: AtomicBool::new(true),
+            err_wire: format_rpc_error,
         }));
         let code = net_rpc_stream_grant(handle, 16);
         assert_eq!(code, NET_RPC_OK);
@@ -4906,6 +4760,7 @@ mod tests {
             stream: Arc::new(Mutex::new(None)),
             call_id: 7,
             done: AtomicBool::new(false),
+            err_wire: format_rpc_error,
         }));
         let mut out_sink: *mut DuplexSinkHandleC = std::ptr::null_mut();
         let mut out_stream: *mut DuplexStreamHandleC = std::ptr::null_mut();

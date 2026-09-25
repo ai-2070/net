@@ -280,16 +280,18 @@ impl NoiseHandshake {
     /// endpoints computed over *this* establishment and nothing
     /// else.
     ///
-    /// Exposed because [`Self::into_session_keys`] consumes the
-    /// state, and the only projection it publishes is
-    /// [`SessionKeys::session_id`] — eight bytes, a session *name*,
-    /// far too little to bind a signature to one establishment. A
-    /// leaf's establishment proof signs this value
-    /// (`net-mesh-leaf`'s `establish` module: the initiator proves
-    /// it owns the identity it claimed, bound to this handshake and
-    /// not to a peer id, an announcement or a signalling dialog),
-    /// so the value has to be readable while the handshake state is
-    /// still alive.
+    /// Exposed for callers that need the transcript value while the
+    /// handshake state is still alive: a leaf's establishment proof
+    /// signs this value (`net-mesh-leaf`'s `establish` module: the
+    /// initiator proves it owns the identity it claimed, bound to
+    /// this handshake and not to a peer id, an announcement or a
+    /// signalling dialog), read here before finalization.
+    /// [`Self::into_session_keys_with_binding`] returns the same
+    /// value as the session binding; the older
+    /// [`Self::into_session_keys`] wrapper discards it, publishing
+    /// only [`SessionKeys::session_id`] — eight bytes, a session
+    /// *name*, far too little to bind a signature to one
+    /// establishment.
     ///
     /// Refused before the handshake finishes. An intermediate `h` is
     /// a different value on the two sides, so a proof signed over
@@ -336,11 +338,18 @@ impl NoiseHandshake {
         Ok(buf)
     }
 
-    /// Complete the handshake and extract session keys.
+    /// Complete the handshake, extracting the session keys **and** the
+    /// full Noise handshake hash of this establishment (the session
+    /// binding), before the handshake state is consumed.
     ///
-    /// This consumes the handshake state and returns the symmetric keys
-    /// for stateless packet encryption.
-    pub fn into_session_keys(self) -> Result<SessionKeys, CryptoError> {
+    /// The binding is the channel-binding transcript value both
+    /// endpoints computed over *this* establishment and nothing else
+    /// (see [`Self::handshake_hash`] for its security story). It is
+    /// returned beside the keys rather than folded into
+    /// [`SessionKeys`] so that the public keys struct stays unchanged
+    /// (additive carriage); `NetSession::with_binding` is what stores
+    /// it on a session.
+    pub fn into_session_keys_with_binding(self) -> Result<(SessionKeys, [u8; 32]), CryptoError> {
         if !self.is_finished() {
             return Err(CryptoError::Handshake("handshake not finished".to_string()));
         }
@@ -416,14 +425,32 @@ impl NoiseHandshake {
             derive_key(&handshake_hash, b"route-hop-tx-v1", &mut route_hop_rx_key);
         }
 
-        Ok(SessionKeys {
-            tx_key,
-            rx_key,
-            session_id,
-            remote_static_pub,
-            route_hop_tx_key,
-            route_hop_rx_key,
-        })
+        Ok((
+            SessionKeys {
+                tx_key,
+                rx_key,
+                session_id,
+                remote_static_pub,
+                route_hop_tx_key,
+                route_hop_rx_key,
+            },
+            handshake_hash,
+        ))
+    }
+
+    /// Complete the handshake and extract session keys.
+    ///
+    /// This consumes the handshake state and returns the symmetric keys
+    /// for stateless packet encryption.
+    ///
+    /// Compatible wrapper over [`Self::into_session_keys_with_binding`]:
+    /// the session binding (the full Noise handshake hash) is discarded
+    /// here. Callers that must bind a signature to this exact
+    /// establishment use [`Self::into_session_keys_with_binding`] and
+    /// keep the hash.
+    pub fn into_session_keys(self) -> Result<SessionKeys, CryptoError> {
+        self.into_session_keys_with_binding()
+            .map(|(keys, _binding)| keys)
     }
 }
 

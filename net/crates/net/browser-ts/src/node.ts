@@ -17,7 +17,31 @@ import {
   type LeafEventOf,
   type Unsubscribe,
 } from './events.js';
-import { fromWasmError, IdentityError, RtcError, type LeafError } from './errors.js';
+import { fromWasmError, IdentityError, OrgCancelledError, RtcError, type LeafError } from './errors.js';
+import {
+  clientStreamOrgTrampoline,
+  duplexOrgTrampoline,
+  OrgDuplex,
+  OrgHandleRegistry,
+  OrgServe,
+  OrgStream,
+  OrgUpload,
+  streamingOrgTrampoline,
+  toWasmOrgCallOptions,
+  toWasmOrgServeOptions,
+  unaryOrgTrampoline,
+  type OrgAccess,
+  type OrgByteStream,
+  type OrgCallOptions,
+  type OrgClientStreamHandler,
+  type OrgDuplexHandler,
+  type OrgDuplexHandles,
+  type OrgServeHandle,
+  type OrgServeOptions,
+  type OrgStreamingHandler,
+  type OrgUnaryHandler,
+  type OrgUploadCall,
+} from './org.js';
 import { LeafStream, type OpenStreamOptions } from './stream.js';
 import {
   acceptPeer as driveAccept,
@@ -319,6 +343,12 @@ export class BrowserNode {
    * handle.
    */
   private readonly streams = new Set<LeafStream>();
+  /**
+   * The live org handles (plan §4.5), so {@link BrowserNode.close}
+   * can retire ownership: pending calls fail typed and each dropped
+   * caller handle emits exactly one CANCEL.
+   */
+  private readonly orgHandles = new OrgHandleRegistry();
   /** The last `rtc_addr` an anchor told us about; the probe's subject. */
   private anchorRtcAddr: string | null;
   /** Set once the leaf reports a session — a bootstrap that demonstrably worked. */
@@ -452,6 +482,309 @@ export class BrowserNode {
     const stream: LeafStream = new LeafStream(inner, () => this.streams.delete(stream));
     this.streams.add(stream);
     return stream;
+  }
+
+  // ── Organization-scoped streaming (plan §4.5) ────────────────────────
+  //
+  // Eight verbs, identical on `MeshSession`. Terminal outcomes are the
+  // §4.3 vocabulary (`errors.ts`'s `OrgStreamError` family).
+
+  /**
+   * Call an org-protected unary service.
+   *
+   * Rejects with the §4.3 typed error: an **opening denial** is
+   * {@link OrgAdmissionDeniedError} carrying the coarse reason and
+   * nothing finer — a precise remote reason would be a credential
+   * oracle. Never a silent retry: the caller is told and decides.
+   *
+   * **Suspension and closure (plan §4.5).** Deadlines are absolute: a
+   * frozen tab extends no lease and no window, so a call whose
+   * deadline passes while its tab is suspended retires with its
+   * deadline terminal on wake — {@link OrgTimeoutError}, or
+   * {@link OrgIndeterminateError} where the work may already be
+   * executing elsewhere. Nothing resumes automatically: a retired
+   * call is never transparently re-opened, because re-opening is a
+   * fresh call with a fresh proof and MAY repeat effects. Node or tab
+   * close retires ownership — pending calls fail typed, and each
+   * dropped caller handle emits exactly one CANCEL.
+   */
+  async callOrg(service: string, payload: Uint8Array, options: OrgCallOptions): Promise<Uint8Array> {
+    try {
+      return await this.inner.call_org(service, payload, toWasmOrgCallOptions(options));
+    } catch (error) {
+      throw fromWasmError(error);
+    }
+  }
+
+  /**
+   * Call an org-protected server-streaming service; resolve to the
+   * response stream.
+   *
+   * An **opening denial** rejects here with
+   * {@link OrgAdmissionDeniedError} (coarse) — a denial is a
+   * rejection, never a terminal item. Midstream, the stream's FINAL
+   * error item carries the §4.3 outcome: revocation is
+   * `AdmissionDenied('denied')` ({@link OrgRevokedError} where the
+   * cause is known), deadline/cancel retirement is
+   * {@link OrgTimeoutError}/{@link OrgCancelledError}. The async
+   * iterator throws that typed error at the terminal error item.
+   *
+   * **Suspension and closure (plan §4.5).** Deadlines are absolute: a
+   * frozen tab extends no lease and no window, so a call whose
+   * deadline passes while its tab is suspended retires with its
+   * deadline terminal on wake — {@link OrgTimeoutError}, or
+   * {@link OrgIndeterminateError} where the work may already be
+   * executing elsewhere. Nothing resumes automatically: a retired
+   * call is never transparently re-opened, because re-opening is a
+   * fresh call with a fresh proof and MAY repeat effects. Node or tab
+   * close retires ownership — pending calls fail typed, and each
+   * dropped caller handle emits exactly one CANCEL.
+   */
+  async callOrgStreaming(
+    service: string,
+    payload: Uint8Array,
+    options: OrgCallOptions,
+  ): Promise<OrgByteStream> {
+    try {
+      const handle = await this.inner.call_org_streaming(
+        service,
+        payload,
+        toWasmOrgCallOptions(options),
+      );
+      const stream: OrgStream = new OrgStream(
+        handle,
+        () => handle.cancel(),
+        () => this.orgHandles.delete(stream),
+      );
+      this.orgHandles.add(stream);
+      return stream;
+    } catch (error) {
+      throw fromWasmError(error);
+    }
+  }
+
+  /**
+   * Open an org-protected client-streaming upload. `finish()` is the
+   * half-close and the reply await, and it rejects with the typed
+   * terminal error (§4.3).
+   *
+   * An **opening denial** rejects here with
+   * {@link OrgAdmissionDeniedError} (coarse).
+   *
+   * **Suspension and closure (plan §4.5).** Deadlines are absolute: a
+   * frozen tab extends no lease and no window, so a call whose
+   * deadline passes while its tab is suspended retires with its
+   * deadline terminal on wake — {@link OrgTimeoutError}, or
+   * {@link OrgIndeterminateError} where the work may already be
+   * executing elsewhere. Nothing resumes automatically: a retired
+   * call is never transparently re-opened, because re-opening is a
+   * fresh call with a fresh proof and MAY repeat effects. Node or tab
+   * close retires ownership — pending calls fail typed, and each
+   * dropped caller handle emits exactly one CANCEL.
+   */
+  async callOrgClientStream(service: string, options: OrgCallOptions): Promise<OrgUploadCall> {
+    try {
+      const handle = await this.inner.call_org_client_stream(service, toWasmOrgCallOptions(options));
+      const upload: OrgUpload = new OrgUpload(handle, () => this.orgHandles.delete(upload));
+      this.orgHandles.add(upload);
+      return upload;
+    } catch (error) {
+      throw fromWasmError(error);
+    }
+  }
+
+  /**
+   * Open an org-protected duplex call: an upload sink and an
+   * independent response stream.
+   *
+   * An **opening denial** rejects here with
+   * {@link OrgAdmissionDeniedError} (coarse). Midstream outcomes are
+   * the §4.3 terminals on each half.
+   *
+   * **Suspension and closure (plan §4.5).** Deadlines are absolute: a
+   * frozen tab extends no lease and no window, so a call whose
+   * deadline passes while its tab is suspended retires with its
+   * deadline terminal on wake — {@link OrgTimeoutError}, or
+   * {@link OrgIndeterminateError} where the work may already be
+   * executing elsewhere. Nothing resumes automatically: a retired
+   * call is never transparently re-opened, because re-opening is a
+   * fresh call with a fresh proof and MAY repeat effects. Node or tab
+   * close retires ownership — pending calls fail typed, and each
+   * dropped caller handle emits exactly one CANCEL.
+   */
+  async callOrgDuplex(service: string, options: OrgCallOptions): Promise<OrgDuplexHandles> {
+    try {
+      const handle = await this.inner.call_org_duplex(service, toWasmOrgCallOptions(options));
+      const call: OrgDuplex = new OrgDuplex(handle, () => this.orgHandles.delete(call));
+      this.orgHandles.add(call);
+      return call;
+    } catch (error) {
+      throw fromWasmError(error);
+    }
+  }
+
+  /**
+   * Serve an org-protected unary service. `access` is `'same-org'`
+   * (owner-org traffic only) or `'granted'` (capability grants too);
+   * anything else is refused loudly at registration.
+   *
+   * **Handler drop (F-S3.1-2).** The retire supervisor may drop the
+   * handler future without a final poll — cancellation is observed
+   * through the retirement observables (the terminal item, the sink's
+   * typed closed refusal, and `retired`), never assumed as a
+   * handler-side event; a detached observer holding `retired`
+   * observes the signal. After retirement a handler sees typed
+   * refusals and any return value it produces is discarded.
+   *
+   * **`close()` is a retirement, not a graceful unregister (C9's
+   * protected split).** Closing the returned handle retires its live
+   * protected calls — each with its exact retirement terminal, the
+   * deadline/cancel/revocation vocabulary — and refuses new openings
+   * on the service. Deliberately NOT the public path's
+   * let-existing-calls-finish behavior.
+   */
+  serveOrg(
+    service: string,
+    access: OrgAccess,
+    handler: OrgUnaryHandler,
+    options: OrgServeOptions,
+  ): OrgServeHandle {
+    try {
+      const serve: OrgServe = new OrgServe(
+        this.inner.serve_org(service, access, unaryOrgTrampoline(handler), toWasmOrgServeOptions(options)),
+        () => this.orgHandles.delete(serve),
+      );
+      this.orgHandles.add(serve);
+      return serve;
+    } catch (error) {
+      throw fromWasmError(error);
+    }
+  }
+
+  /**
+   * Serve an org-protected server-streaming service: one request in,
+   * items out through the {@link OrgResponseSink}.
+   *
+   * **Handler drop (F-S3.1-2).** The retire supervisor may drop the
+   * handler future without a final poll — cancellation is observed
+   * through the retirement observables (the terminal item, the sink's
+   * typed closed refusal, and `retired`), never assumed as a
+   * handler-side event; a detached observer holding `retired`
+   * observes the signal. After retirement a handler sees typed
+   * refusals and any return value it produces is discarded.
+   *
+   * **`close()` is a retirement, not a graceful unregister (C9's
+   * protected split).** Closing the returned handle retires its live
+   * protected calls — each with its exact retirement terminal, the
+   * deadline/cancel/revocation vocabulary — and refuses new openings
+   * on the service. Deliberately NOT the public path's
+   * let-existing-calls-finish behavior.
+   */
+  serveOrgStreaming(
+    service: string,
+    access: OrgAccess,
+    handler: OrgStreamingHandler,
+    options: OrgServeOptions,
+  ): OrgServeHandle {
+    try {
+      const serve: OrgServe = new OrgServe(
+        this.inner.serve_org_streaming(
+          service,
+          access,
+          streamingOrgTrampoline(handler),
+          toWasmOrgServeOptions(options),
+        ),
+        () => this.orgHandles.delete(serve),
+      );
+      this.orgHandles.add(serve);
+      return serve;
+    } catch (error) {
+      throw fromWasmError(error);
+    }
+  }
+
+  /**
+   * Serve an org-protected client-streaming service: requests in
+   * through the {@link OrgRequestStream}, one reply out.
+   *
+   * **Handler drop (F-S3.1-2).** The retire supervisor may drop the
+   * handler future without a final poll — cancellation is observed
+   * through the retirement observables (the terminal item, the sink's
+   * typed closed refusal, and `retired`), never assumed as a
+   * handler-side event; a detached observer holding `retired`
+   * observes the signal. After retirement a handler sees typed
+   * refusals and any return value it produces is discarded.
+   *
+   * **`close()` is a retirement, not a graceful unregister (C9's
+   * protected split).** Closing the returned handle retires its live
+   * protected calls — each with its exact retirement terminal, the
+   * deadline/cancel/revocation vocabulary — and refuses new openings
+   * on the service. Deliberately NOT the public path's
+   * let-existing-calls-finish behavior.
+   */
+  serveOrgClientStream(
+    service: string,
+    access: OrgAccess,
+    handler: OrgClientStreamHandler,
+    options: OrgServeOptions,
+  ): OrgServeHandle {
+    try {
+      const serve: OrgServe = new OrgServe(
+        this.inner.serve_org_client_stream(
+          service,
+          access,
+          clientStreamOrgTrampoline(handler),
+          toWasmOrgServeOptions(options),
+        ),
+        () => this.orgHandles.delete(serve),
+      );
+      this.orgHandles.add(serve);
+      return serve;
+    } catch (error) {
+      throw fromWasmError(error);
+    }
+  }
+
+  /**
+   * Serve an org-protected duplex service: requests in and items out,
+   * independently, through the request stream and the sink.
+   *
+   * **Handler drop (F-S3.1-2).** The retire supervisor may drop the
+   * handler future without a final poll — cancellation is observed
+   * through the retirement observables (the terminal item, the sink's
+   * typed closed refusal, and `retired`), never assumed as a
+   * handler-side event; a detached observer holding `retired`
+   * observes the signal. After retirement a handler sees typed
+   * refusals and any return value it produces is discarded.
+   *
+   * **`close()` is a retirement, not a graceful unregister (C9's
+   * protected split).** Closing the returned handle retires its live
+   * protected calls — each with its exact retirement terminal, the
+   * deadline/cancel/revocation vocabulary — and refuses new openings
+   * on the service. Deliberately NOT the public path's
+   * let-existing-calls-finish behavior.
+   */
+  serveOrgDuplex(
+    service: string,
+    access: OrgAccess,
+    handler: OrgDuplexHandler,
+    options: OrgServeOptions,
+  ): OrgServeHandle {
+    try {
+      const serve: OrgServe = new OrgServe(
+        this.inner.serve_org_duplex(
+          service,
+          access,
+          duplexOrgTrampoline(handler),
+          toWasmOrgServeOptions(options),
+        ),
+        () => this.orgHandles.delete(serve),
+      );
+      this.orgHandles.add(serve);
+      return serve;
+    } catch (error) {
+      throw fromWasmError(error);
+    }
   }
 
   /**
@@ -763,9 +1096,17 @@ export class BrowserNode {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    const failures: LeafError[] = [];
+    // Ownership retirement first, while the node can still put a
+    // CANCEL on the wire (plan §4.5): one per dropped caller handle,
+    // each consumer settled with its typed terminal.
+    for (const failure of this.orgHandles.retireAll(
+      new OrgCancelledError('org:rpc:cancelled: the node is closed'),
+    )) {
+      failures.push(fromWasmError(failure));
+    }
     const open = [...this.streams];
     this.streams.clear();
-    const failures: LeafError[] = [];
     for (const stream of open) {
       try {
         stream.close();

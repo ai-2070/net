@@ -19,9 +19,10 @@ WHAT THIS IS NOT. Read the two limits below before citing this script
 as evidence of anything; both have been overstated in a report.
 
 1. It is LEXICAL, not a test-inventory parser. `declared()` searches
-   raw file text for `fn <name>(` or for the name in quotes. It does
-   not parse Rust or JavaScript, does not evaluate `cfg`, and does not
-   know whether a match is a live test. A commented-out declaration,
+   raw file text for `fn <name>(` or (in `decl`/`literal`) for the name
+   as a quoted data literal. It does not parse Rust or JavaScript, does
+   not evaluate `cfg`, and does not know whether a match is a live
+   test. A commented-out declaration,
    an ordinary helper function, a declaration behind a `cfg` that is
    off in this build, or a witness literal that nothing ever emits all
    satisfy it. It also does not deduplicate the roster and does not
@@ -51,8 +52,29 @@ Usage:
 
 Modes:
     fn       the name appears as `fn <name>(` in some source file.
+    decl     the name appears as a `fn` / `func` / `def` declaration
+             (`fn <name>(`, `func <name>(`, `def <name>(`) or as a
+             quoted STRING LITERAL in a data position: preceded by one
+             of `[ ( { , :` and followed by one of `] ) } , :` — list,
+             tuple and call arguments, mapping keys and values. The Go
+             and Python rosters need both in one pass: the test
+             functions are pinned by declaration, and the parametrize
+             ids (`"same_org"`, `"granted"`) only ever appear as
+             literals. A quoted mention in prose, a comment or a
+             comparison does NOT count: before this boundary, a
+             parametrize id could vanish from every real list while a
+             docstring or a `== "granted"` switch that remembered it
+             kept the roster green (the `decl` pairing's silent-vanish
+             half, called out in the 2026-09-24 code review, CI-1).
     literal  the name appears as a quoted string in some source file
              (harness witnesses, which are emitted by name at runtime).
+    text     the name appears VERBATIM anywhere in the source. For pins
+             that are code shapes rather than names — `it.each(byteRows)`
+             in a vitest file, the unquoted keys of a scenario table —
+             this is the only lexical form there is. The cost, stated
+             plainly: a mention in a comment satisfies it too. Prefer
+             `fn` / `decl` / `literal` wherever the source offers one of
+             those forms.
 """
 
 from __future__ import annotations
@@ -66,7 +88,7 @@ from pathlib import Path
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True, help="roster name, for the error text")
-    ap.add_argument("--mode", choices=("fn", "literal"), default="fn")
+    ap.add_argument("--mode", choices=("fn", "decl", "literal", "text"), default="fn")
     ap.add_argument(
         "--source",
         action="append",
@@ -93,6 +115,20 @@ def main() -> int:
     def declared(name: str) -> bool:
         if args.mode == "fn":
             pattern = re.compile(rf"\bfn\s+{re.escape(name)}\s*\(")
+        elif args.mode == "text":
+            # Verbatim, wherever it appears — see the mode's note in the
+            # module docstring for what that costs.
+            return any(name in text for text in texts.values())
+        elif args.mode == "decl":
+            # `fn` (Rust), `func` (Go), `def` (Python) declarations, or the
+            # name as a quoted literal IN A DATA POSITION — see the mode's
+            # note in the module docstring for why the Go/Python rosters pin
+            # both, and why the quoted side is context-qualified.
+            decl = re.compile(rf"\b(?:fn|func|def)\s+{re.escape(name)}\s*\(")
+            quoted = re.compile(
+                rf"""[\[({{,:]\s*(?:"{re.escape(name)}"|'{re.escape(name)}'|`{re.escape(name)}`)\s*[\])}},:]"""
+            )
+            return any(decl.search(text) or quoted.search(text) for text in texts.values())
         else:
             # Rust uses `"name"`, JavaScript uses `'name'` or a
             # template literal. Accepting only one of them would fail

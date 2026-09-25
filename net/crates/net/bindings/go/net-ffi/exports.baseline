@@ -1,10 +1,10 @@
 # Exported symbol set of the single libnet cdylib (bindings/go/net-ffi).
 # Checked by .github/scripts/check-ffi-exports.py; regenerate with --update
 # ONLY for an intended C-ABI change, and say so in that commit.
-# generated-at: 9ab4a22c6d61a28e8957ddd4ce655667f0abf92f
+# generated-at: d4981f94fe7865da526b66b7625c4dc2be3dc6e0
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi --features net-ffi/test-helpers
-# count: 572
+# count: 581
 net_blob_adapter_registered
 net_blob_free_buffer
 net_blob_publish
@@ -382,7 +382,10 @@ net_num_shards
 net_org_abi_version
 net_org_bind
 net_org_call
+net_org_call_client_stream
+net_org_call_duplex
 net_org_call_exported
+net_org_call_streaming
 net_org_cancel_call
 net_org_check_abi_version
 net_org_client_free
@@ -395,11 +398,17 @@ net_org_reserve_cancel_token
 net_org_reserve_handler_id
 net_org_response_free
 net_org_serve
+net_org_serve_client_stream
+net_org_serve_duplex
 net_org_serve_handle_close
 net_org_serve_handle_free
 net_org_serve_handle_id
+net_org_serve_streaming
 net_org_set_callback_free
+net_org_set_client_streaming_handler_dispatcher
+net_org_set_duplex_handler_dispatcher
 net_org_set_handler_dispatcher
+net_org_set_streaming_handler_dispatcher
 net_parse_token
 net_poll
 net_poll_ex

@@ -112,7 +112,7 @@ jobs:
       - name: Run unit tests (all in-source units, full feature set)
         run: cargo test --lib --features "$UNIT_FEATURES"
 
-      # Stage 2 moved seven modules (and the routing-envelope codec)
+      # Seven modules moved (and the routing-envelope codec)
       # into `net-mesh-wire`, taking their `#[cfg(test)] mod`s with
       # them. `--lib` above is the ROOT crate only, and no other job
       # executes this suite — clippy compiles it, the wasm job runs
@@ -982,7 +982,7 @@ jobs:
           echo "deck unit tests: $ran"
           # Floor = what THIS command reports (33), with net-deck's
           # `default = []` (deck/Cargo.toml). The tree carries 35 test
-          # attributes (the Stage 6 ICE column's ledger + rollup tests
+          # attributes (the ICE column's ledger + rollup tests
           # among them); two of the 35 are feature-gated out of this
           # command by design and are excluded from the floor deliberately
           # and by name:
@@ -992,8 +992,8 @@ jobs:
           #     `#[cfg(feature = "demo")]` in main.rs ("dev-only").
           # A floor the pinned command cannot reach (35) false-reds every
           # run and guards nothing; the floor's real purpose — a suite that
-          # silently shrinks — is served only by the measured count. Stage
-          # counts follow measured counts: re-measure this exact command
+          # silently shrinks — is served only by the measured count. Floors
+          # follow measured counts: re-measure this exact command
           # and its exact `grep -c` shape when tests move.
           if [ "$ran" -lt 33 ]; then
             echo "::error::net-deck ran $ran tests, floor is 33 — \
@@ -1405,6 +1405,7 @@ jobs:
           --test gang_alloc_witness
           --test chain_discovery
           --test cross_lang_capability_fixtures
+          --test org_scoped_cross_process
           --test cross_lang_wire
           --test migration_integration
           --test migration_target_failure_mid_chunking
@@ -1416,6 +1417,29 @@ jobs:
           --test event_pingwave
           --test route_withdraw
           --test routed_transport_availability
+
+      # === the two-OS-process scoped-discovery witness (R4CoreFix) ===
+      # The step above EXECUTED it (tests/org_scoped_cross_process.rs — the
+      # natsim.rs re-exec idiom: 1 passing witness + 1 #[ignore]
+      # spawned-provider role); this step PINS it: both names must appear
+      # with their verdicts and the floor is 1 passing + 1 ignored (never
+      # 0 passing). It is the permanent regression guard for the property
+      # F-S4Vectors-1 wrongly alleged (scoped discovery DOES cross
+      # OS-process boundaries — proven here, with the handle-discard
+      # mutation as its inverse).
+      - name: Witness floor — org_scoped_cross_process (1 passing + 1 ignored)
+        run: |
+          set -o pipefail
+          out=$(cargo test --test org_scoped_cross_process 2>&1 | tee /dev/stderr)
+          printf '%s\n' "$out" | grep -q '^test scoped_discovery_crosses_an_os_process_boundary \.\.\. ok$' || {
+            echo "::error::the cross-process scoped-discovery witness did not run and pass"
+            exit 1
+          }
+          printf '%s\n' "$out" | grep -q '^test xproc_scoped_provider_child \.\.\. ignored$' || {
+            echo "::error::the spawned-provider role is missing its ignore gate"
+            exit 1
+          }
+          echo "org_scoped_cross_process: 1 passing + 1 ignored (floor held)"
 
   # --- Family B: NAT traversal + port mapping + RedEX ------------------
   integration-nat-redex:
@@ -1576,6 +1600,7 @@ jobs:
           --test nrpc_service_equality
           --test nrpc_streaming_gate
           --test org_admission_gate
+          --test org_rpc_streaming
           --test queue_group_dispatch
           --test aggregator_fold_query
           --test aggregator_registry_rpc
@@ -1768,8 +1793,9 @@ jobs:
 
           # Literal `--test` flags for the pin guard, which scrapes this file.
           cargo nextest list --color never --features "$FEATURES" \
-            --test sensing_org_exact_seam --test sensing_org_exact_guards >/dev/null \
-            || { echo "::error::the OA-5 binaries do not even list"; exit 1; }
+            --test sensing_org_exact_seam --test sensing_org_exact_guards \
+            --test org_rpc_streaming >/dev/null \
+            || { echo "::error::the pinned binaries do not even list"; exit 1; }
 
           run_binary sensing_org_exact_seam 8 \
             discovery_transport_observations_projection_and_admission_compose \
@@ -1789,6 +1815,72 @@ jobs:
           run_binary sensing_org_three_node 2 \
             relay_reauthors_org_provider_under_its_own_membership \
             a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown || exit 1
+
+          # Protected server-streaming
+          # (binary tests/org_rpc_streaming.rs). Floor = the count the binary
+          # reports at the pinned head (51, RE-DERIVED from the binary's real
+          # test list — the old comment decomposed to 41 against a pin of 42,
+          # and a wrong re-derivation baseline invites lowering the floor):
+          # the 42-witness S1.2–S1.5 estate = the 30-roster preserved verbatim
+          # + 12 CS/DX, duplex-flow and half-close witnesses; plus the 7
+          # wave-1–3 repair witnesses (WIRE-1's displaced-carrier refusal,
+          # SDK-2's three token-cancel terminals, SDK-1's three typed deadline
+          # retirements) and the 2 frozen-chain witnesses (TESTS-1's unary
+          # admission half of §1.4, TESTS-4's extraction-hash recomputation).
+          # Every witness is name-pinned below; a new one joins the roster AND
+          # this count in its own commit.
+          run_binary org_rpc_streaming 51 \
+            stream_opening_admits_same_org \
+            stream_opening_admits_cross_org \
+            unary_context_proof_is_binding_invalid_on_stream_registration \
+            stream_proof_on_unary_registration_is_not_supported \
+            frozen_old_provider_refuses_stream_proof_with_not_supported \
+            replayed_opening_on_new_session_is_session_binding_mismatch \
+            late_chunk_from_replaced_session_is_dropped \
+            omitted_deadline_gets_default_and_expires_idle \
+            requested_deadline_over_cap_is_refused_with_zero_effects \
+            requested_deadline_within_cap_is_honoured \
+            pump_parked_on_zero_credit_is_retired_at_deadline_with_one_terminal \
+            serve_handle_drop_retires_live_stream_and_sibling_survives \
+            credential_clamp_expiry_is_admission_denied_not_timeout \
+            public_ss_nonzero_deadline_expires_with_typed_timeout \
+            public_client_stream_deadline_expiry_is_typed_timeout \
+            floor_raise_retires_blocked_stream_before_publish_returns \
+            sibling_stream_of_other_org_sends_next_item_after_publication \
+            poisoned_store_retires_all_protected_streams \
+            store_replacement_retires_all_and_resubscribes \
+            session_replacement_retires_old_call \
+            active_call_id_reuse_after_replay_window_is_refused \
+            raise_between_reserve_and_install_denies_with_zero_effects \
+            queued_bytes_over_call_budget_park_send_wait_and_wake_on_retire \
+            node_shutdown_retires_live_protected_streams \
+            forbidden_stream_opening_causes_zero_handler_effects \
+            streaming_denial_is_not_fanned_out_to_the_reply_roster \
+            provider_policy_veto_denies_before_effects \
+            completed_stream_drains_queued_items_in_order_with_content_and_end_terminal \
+            cross_org_completed_stream_drains_correlated_items_with_end_terminal \
+            response_after_session_replacement_reaches_only_the_live_session \
+            client_stream_aggregate_with_valid_proof \
+            client_stream_opening_binds_first_chunk \
+            cross_direction_grant_is_ignored \
+            duplex_exchange_with_valid_proof \
+            duplex_response_window_blocks_until_grant \
+            end_cannot_cancel_another_stream_or_reopen_terminal_half \
+            opening_body_budget_refusal_completes_the_record \
+            pre_admission_chunks_are_never_delivered \
+            retire_unblocks_both_directions \
+            upload_end_then_remaining_output_completes \
+            wrong_session_grant_does_not_release_credit \
+            early_handler_return_refuses_late_input_without_resource_exhausted \
+            displaced_carrier_opening_is_refused_and_leaks_no_registry_record \
+            token_cancel_on_live_server_stream_is_a_terminal_error_never_clean_eof \
+            token_cancel_on_live_duplex_is_a_terminal_error_never_clean_eof \
+            token_cancel_classifies_client_stream_finish_as_cancelled_not_transport \
+            server_stream_deadline_retirement_is_typed_timeout_not_server_error \
+            duplex_deadline_retirement_is_typed_timeout_not_server_error \
+            client_stream_deadline_retirement_is_typed_timeout_not_server_error \
+            frozen_old_provider_admits_a_well_formed_unary \
+            frozen_85ecc77c9::every_vendored_body_window_recomputes_to_its_recorded_extraction_sha256 || exit 1
 
       # === The fixtures-off DARKNESS probe (external consumer) =============
       # No test inside this workspace can observe a fixtures-off build of the
@@ -1842,7 +1934,7 @@ jobs:
           # lockfile drifts every time the workspace gains or bumps a
           # dependency the probe also reaches — and `--locked` then
           # fails BEFORE either leg runs, which reads as "the guard
-          # broke" rather than "the lockfile is stale". Stage 5's
+          # broke" rather than "the lockfile is stale". A
           # `wasm-bindgen` pin did it for the second time (the first
           # was 64b0256c9). Say so precisely, and only when it is
           # actually the cause.
@@ -1851,6 +1943,80 @@ jobs:
                  \`cargo generate-lockfile --offline\` in \
                  net/crates/net/guards/fixtures_off_probe and commit it"
           fi
+
+      # === The org + streaming API probe (external consumer) ===============
+      # The org-scoped streaming plan changes public org and streaming types
+      # (Compatibility ledger C1/C3/C4). Every in-workspace caller of those
+      # types is edited in the same commit as the type itself, so no test in
+      # this repository fails when a DOWNSTREAM build would. This probe is
+      # that downstream: a second external crate, with its own workspace root
+      # and its own committed lockfile, that does nothing but name, construct
+      # and exhaustively match the surface.
+      #
+      # Unlike the fixtures-off probe above it has no negative leg to
+      # classify - every command is positive, and they run in this order on
+      # purpose:
+      #
+      #   * `cargo metadata --locked` FIRST. The probe resolves independently
+      #     of the workspace, so its lockfile drifts whenever the workspace
+      #     gains or bumps a dependency it also reaches; running it first is
+      #     what makes a stale lockfile read as "regenerate the lockfile"
+      #     instead of surfacing as an unexplained failure of the compile
+      #     leg, which is `--locked` too.
+      #   * `cargo check --locked` must COMPILE. When C1/C3/C4 land
+      #     it will stop compiling - that failure IS the named source break,
+      #     and `guards/org_api_probe` is updated in the same commit, which
+      #     is exactly the review signal the ledger asks for.
+      #   * `cargo test --locked` must RUN (TESTS-5/TESTS-6): the probe's
+      #     behavioral claim and its MANIFEST binding are `#[test]`s now, and
+      #     a claim that executes nowhere is not a claim.
+      - name: Organizations — external org/streaming API probe
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/guards/org_api_probe
+        run: |
+          set -uo pipefail
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+
+          if ! cargo metadata --locked --format-version 1 >/dev/null 2>&1; then
+            die "the probe's Cargo.lock is stale — regenerate it with \
+                 \`cargo generate-lockfile --offline\` in \
+                 net/crates/net/guards/org_api_probe and commit it"
+          fi
+
+          # Captured inside an `if` for the same reason the step above does
+          # it: the runner's shell has errexit on, and `set -uo pipefail`
+          # does not clear it, so a bare assignment from a failing command
+          # would exit before the diagnostic ever printed.
+          probe=""
+          if ! probe=$(cargo check --locked --message-format short 2>&1); then
+            die "the external org/streaming API probe no longer compiles: a \
+                 public org or streaming signature changed. If this is an \
+                 INTENDED source break (ORG_SCOPED_STREAMING_PLAN.md ledger \
+                 C1/C3/C4), update net/crates/net/guards/org_api_probe in \
+                 the SAME commit and record it in the migration notes; if it \
+                 is not, this is an unannounced break of a downstream \
+                 consumer." "$probe"
+          fi
+          echo "external consumer compiles: org + typed-streaming API pinned"
+
+          # TESTS-6: EXECUTED, not merely compiled. The `cargo check` leg
+          # proves the pins type-check; the probe's `#[test]`s RUN its body
+          # (the ledger C1/Q2 behavioral claim — `RpcStreamingContext::new`
+          # fabricates no admitted org facts, previously an `assert!` sealed
+          # inside a `main` this workflow never invoked) and bind `MANIFEST`
+          # to the pins in `main.rs` in both directions, with a pin-count
+          # floor (TESTS-5). `cargo test` builds the same target set as
+          # `cargo check`, so this leg adds execution, no second compile of
+          # the probe's own sources.
+          tests=""
+          if ! tests=$(cargo test --locked --message-format short 2>&1); then
+            die "the org/streaming API probe's tests failed: either its runtime \
+                 claim (the RpcStreamingContext constructor fabricates no \
+                 admitted org facts) is false, or MANIFEST drifted from the \
+                 pins in src/main.rs (the binding check or its pin-count \
+                 floor)." "$tests"
+          fi
+          echo "external consumer runs: behavioral claim + MANIFEST binding witnessed"
 
       # === NetDB ==========================================================
       - name: NetDB
@@ -2296,7 +2462,7 @@ jobs:
       #   - tool_macro              — `#[tool]` proc-macro
       #     expansion + serve-helper round-trip. Gated on
       #     `feature = "macros" + "cortex"`.
-      #   - sensing_provider        — S1 capability-sensing provider
+      #   - sensing_provider        — capability-sensing provider
       #     lifecycle: registration ownership, the publication fence
       #     (an in-flight evaluation released after a close or a
       #     replacement), state-edge notification, and terminal
@@ -2318,7 +2484,7 @@ jobs:
       # reads `.config/nextest.toml` and fails if either ever drops out — the
       # override is a filter expression, so it would otherwise stop matching
       # silently.
-      #   - sensing_consumer        — S1 capability-sensing CONSUMER
+      #   - sensing_consumer        — capability-sensing CONSUMER
       #     lifecycle for own-organization exact providers: signed
       #     readiness into one snapshot, a state edge waking a parked
       #     watcher, a change placed INSIDE a capture not being lost,
@@ -2328,7 +2494,7 @@ jobs:
       #     `feature = "net" + "cortex" + "fixtures"` (owner-scoped
       #     service discovery, plus the refresh-schedule and
       #     authority-clearing observations).
-      #   - org_exact_sensing       — OA-6 production organization
+      #   - org_exact_sensing       — production organization
       #     exact-sensing call edge (22 tests). Needs the SDK's own
       #     `fixtures` feature, which is what gates `OrgClient`'s
       #     test-only sensing observation accessors; without it the
@@ -2377,7 +2543,40 @@ jobs:
           cp "$JUNIT" "$RUNNER_TEMP/sdk-suite-junit.xml"
           exit "$st"
 
-      # === S1: the CONSUMER observation lifecycle ==========================
+      # === the org_streaming facade lifecycle
+      #
+      # The step above already EXECUTED this binary (the SDK sweep runs every
+      # test in its own process); this gate PINS its result set — a witness
+      # must not disappear silently. Fail-closed on identity/verdict/retries/
+      # anti-vacuity per the gate contract above; `--self-test` proves the
+      # predicates first. Floor = 14 (the 10-roster + the four
+      # closure witnesses: the Granted-arm rows, the Q1 default deadline,
+      # the OrgStreamRaw error items, the CS-seam typed terminal); raised with
+      # each landing, names extended in the same commit as the witnesses.
+      - name: Witness floor — org_streaming (14)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          CHECK="$GITHUB_WORKSPACE/.github/scripts/check-witness-results.py"
+          python3 "$CHECK" --self-test || exit 1
+          python3 "$CHECK" --junit "$RUNNER_TEMP/sdk-suite-junit.xml" \
+            --suite org_streaming --min 14 \
+            live_same_org_streaming_through_the_facade \
+            live_same_org_client_stream_through_the_facade \
+            live_same_org_duplex_through_the_facade \
+            live_cross_org_streaming_through_the_facade \
+            live_cross_org_client_stream_through_the_facade \
+            live_cross_org_duplex_through_the_facade \
+            facade_stream_against_unary_only_provider_is_not_supported \
+            dropping_org_stream_emits_one_cancel \
+            handler_receives_verified_org_caller_not_origin \
+            revocation_surfaces_as_final_admission_denied_item \
+            granted_facade_streaming_serve_rows_complete_cross_org \
+            facade_default_deadline_at_zero_outlives_a_shorter_provider_default \
+            org_stream_raw_surfaces_midstream_errors_as_items \
+            call_client_stream_bytes_deadline_reaches_a_typed_terminal || exit 1
+
+      # === the CONSUMER observation lifecycle ==========================
       #
       # WHAT THIS GATES, and why it is no longer a per-name re-run loop.
       #
@@ -2420,7 +2619,7 @@ jobs:
       # and `the_population_floor_wakes_a_quiet_parked_consumer` holds the
       # default-floor liveness statement the control no longer makes, since it
       # widens the floor to qualify its negative window.
-      - name: Sensing — consumer observation lifecycle (S1)
+      - name: Sensing — consumer observation lifecycle
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2460,9 +2659,9 @@ jobs:
           the_population_floor_wakes_a_quiet_parked_consumer
           REQUIRED
 
-      # === OA-6: the PRODUCTION organization exact-sensing call edge =======
+      # === the PRODUCTION organization exact-sensing call edge =======
       #
-      # Same shape and same reasoning as S1 above: the suite step already ran
+      # Same shape and same reasoning as the gate above: the suite step already ran
       # this binary, one process per test, so this gate verifies that run's
       # result set instead of re-invoking the runner 22 more times. The
       # `<flakyFailure>` rejection matters here in particular — the
@@ -2475,7 +2674,7 @@ jobs:
       # `fixtures`, so this step is NOT a fixtures-off proof. The production
       # path's independence from that feature is the separate lib-only build
       # below, which compiles no dev-dependencies.
-      - name: Sensing — organization exact production call edge (OA-6)
+      - name: Sensing — organization exact production call edge
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2513,11 +2712,11 @@ jobs:
       # dev-dependencies, and the SDK's own `[dependencies]` entry for net-mesh
       # enables no features - so if the sensed call path ever reached a
       # fixtures-gated seam, this step is what fails.
-      # The in-crate half of the OA-6 evidence: the sensed step inside the
+      # The in-crate half of the evidence: the sensed step inside the
       # authority window, the Granted-mode mapping and selection under an
       # actual reordering, and the reconciliation trigger's decision table.
       # Named because a `--lib` run would otherwise absorb a rename silently.
-      - name: Sensing — organization exact planning unit witnesses (OA-6)
+      - name: Sensing — organization exact planning unit witnesses
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2551,7 +2750,7 @@ jobs:
           org::tests_call::a_refused_wave_paces_but_a_restored_authority_does_not_wait
           REQUIRED
 
-      # === A2A paid admission (WS-C) =======================================
+      # === A2A paid admission =======================================
       #
       # Same discipline as the two steps above, same reason: the
       # auto-discovery run has already executed this binary, so this step
@@ -2573,7 +2772,7 @@ jobs:
       # `a_revoked_preflight_without_headers_is_an_unpaid_rejection_and_keeps_the_reservation`
       # is the control that keeps the first from passing for a provider that
       # simply reconciles everything.
-      - name: A2A — paid admission witnesses (WS-C)
+      - name: A2A — paid admission witnesses
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2630,7 +2829,7 @@ jobs:
             || { echo "::error::expected at least 43 paid admission witnesses executed, saw $listed"; exit 1; }
           echo "A2A paid admission: $listed executed, $pinned pinned by name, all green"
 
-      # === A2A admission journal (WS-C) ====================================
+      # === A2A admission journal ====================================
       #
       # The durability half: the lifetime-exclusive `.owner` lock (including
       # the cross-process probe that re-execs this binary), the CAS
@@ -2638,7 +2837,7 @@ jobs:
       # retention classes, and the successor owner's recovery reading. These
       # are what stop a second charge or a second run after a crash, so the
       # roster is pinned rather than left to auto-discovery.
-      - name: A2A — admission journal durability (WS-C)
+      - name: A2A — admission journal durability
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -2875,11 +3074,11 @@ jobs:
       # does inside a workspace dev build: it forwards core's own `fixtures`
       # seam, and a dev-dependency used to hide the missing forwarding. This is
       # the configuration the Go FFI jobs build, and the one that broke.
-      - name: Sensing — the fixtures observers build standalone (OA-6)
+      - name: Sensing — the fixtures observers build standalone
         if: ${{ !cancelled() }}
         run: cargo check --lib --features "net cortex fixtures"
 
-      - name: Sensing — the production call path needs no fixtures seam (OA-6)
+      - name: Sensing — the production call path needs no fixtures seam
         if: ${{ !cancelled() }}
         run: cargo check --lib --features "net cortex"
 
@@ -2896,7 +3095,25 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --doc --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
 
-      # === Stage 4a: the SDK's RTC enrollment binary ======================
+      # === the streaming-opening fixture authority ======
+      # The generator IS the Rust-side conformance verifier for
+      # tests/cross_lang_org/streaming_opening_vectors.json (--check:
+      # deterministic-regeneration drift guard + all 130 conformance rows;
+      # a9178e580's VEC-8/VEC-9 repair regenerated the fixture from
+      # `samples()` at 130 and left this pin at 120 -- §23 audit).
+      # A fixture that stops regenerating identically or a row that stops
+      # conforming fails here — the authority every other runtime consumes.
+      - name: streaming-opening fixture authority (cross-lang vectors)
+        run: |
+          set -o pipefail
+          out=$(cargo run -p net-mesh-sdk --features net,cortex,fixtures \
+                  --example gen_org_error_fixtures -- --check 2>&1 | tee /dev/stderr)
+          printf '%s\n' "$out" | grep -q "== 130 rows, 0 failed" || {
+            echo "::error::the streaming-opening fixture authority did not report 130 rows 0 failed"
+            exit 1
+          }
+
+      # === the SDK's RTC enrollment binary ======================
       #
       # `enrollment_over_rtc` is gated on the SDK's OWN `webrtc` feature,
       # which forwards to `net-mesh/webrtc`. Every step above runs with a
@@ -2934,14 +3151,14 @@ jobs:
           done
           echo "SDK RTC enrollment: both witnesses green"
 
-      # === Stage 4b: the bootstrap listener's witnesses ===================
+      # === the bootstrap listener's witnesses ===================
       #
       # `rtc_bootstrap_listener` needs the SDK's `rtc-bootstrap`
       # feature (axum + rustls), which no other step turns on, so
       # without this step the whole binary compiles to nothing —
       # the same silent-skip hazard the RTC step above exists for.
       #
-      # The six `kyra_*` names are the Stage 4b review's probes,
+      # The six `kyra_*` names are the review's probes,
       # landed verbatim. They reproduced 0/6 before the repairs and
       # are pinned individually: a repair that regresses must fail
       # here by name, not shrink the roster.
@@ -3007,7 +3224,7 @@ jobs:
 
       # The SDK's `webrtc` surface under the same lint bar as the rest of
       # the crate, and its rustdoc — neither was reachable from any step's
-      # feature list before Stage 4a.
+      # feature list before that step.
       - name: Lint and document the SDK's WebRTC surface
         if: ${{ !cancelled() }}
         run: |
@@ -3119,7 +3336,7 @@ jobs:
             || { echo "::error::expected at least 16 rows in review_round4_disposition, saw $listed"; exit 1; }
           echo "round-4b disposition probe: $listed executed, the named one green"
 
-      # === A2A caller purchase + task redeem (WS-B) =========================
+      # === A2A caller purchase + task redeem =========================
       #
       # The step above ran both binaries by auto-discovery. These two exist so
       # the roster cannot shrink silently, and because this is the money half:
@@ -3151,7 +3368,7 @@ jobs:
       # filterset carries no `--test` token, and `--no-tests=fail` is the
       # stronger guarantee anyway: a `binary()` that matches nothing FAILS
       # here at run time, where the guard's check is only lexical.
-      - name: A2A — caller purchase store witnesses (WS-B)
+      - name: A2A — caller purchase store witnesses
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
         run: |
@@ -3197,7 +3414,7 @@ jobs:
             || { echo "::error::expected at least 23 caller purchase witnesses executed, saw $listed"; exit 1; }
           echo "A2A caller purchase: $listed executed, $pinned pinned by name, all green"
 
-      - name: A2A — task redeem witnesses (WS-B)
+      - name: A2A — task redeem witnesses
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
         run: |
@@ -3236,7 +3453,7 @@ jobs:
       # unserved service fails fast with no-route instead, which is NOT the
       # defect) and requires a retryable verdict, which is what drives a
       # durable attempt to `Unknown` rather than to a false "did not happen".
-      - name: A2A — payment channel deadline (WS-B)
+      - name: A2A — payment channel deadline
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
         run: |
@@ -3370,7 +3587,7 @@ jobs:
             || { echo "::error::expected at least 15 caller identity witnesses executed, saw $listed"; exit 1; }
           echo "A2A caller identity: $listed executed, $pinned pinned by name, all green"
 
-      # === A2A paid end to end (WS-D) ======================================
+      # === A2A paid end to end ======================================
       #
       # The whole slice against the REAL engine rather than a scripted gate:
       # provider = `PaymentEngine` + mock facilitator + the engine-backed
@@ -3381,7 +3598,7 @@ jobs:
       #
       # Floor 6 is the count the binary reports (`6 tests run: 6 passed`).
       # All six are platform-independent (loopback UDP + tempdirs).
-      - name: A2A — paid end to end with the real engine (WS-D)
+      - name: A2A — paid end to end with the real engine
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
         run: |
@@ -3542,6 +3759,73 @@ jobs:
       - name: Run tests
         run: npm test
 
+      # === the Node org facade witnesses ==
+      # The vitest run above EXECUTED these; this step PINS them (a witness
+      # must not disappear silently): lexical name-existence, fail-closed,
+      # over the two test files (vitest names are literal `it(...)` strings).
+      # Floor/roster: 16 (12 in org_live + 3 in mesh_rpc_live + 1 in
+      # consumer_compile); extended in the same commit as new witnesses.
+      # The §23 audit added the NODE-3 breadth: the org server-stream and
+      # client-stream forced-drop witnesses and the three public-bridge ones.
+      - name: Witness roster — Node org facade (16)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label org_live.test --mode literal \
+            --source net/crates/net/bindings/node/test/org_live.test.ts \
+            live_same_org_streaming_call_and_serve \
+            live_same_org_client_stream_call_and_serve \
+            live_same_org_duplex_call_and_serve \
+            a_stream_call_against_a_unary_only_provider_is_refused_not_supported \
+            midstream_outcomes_route_through_classify_org_error \
+            forced_drop_releases_both_handler_handles_promptly \
+            forced_drop_releases_the_org_server_stream_sink_promptly \
+            forced_drop_releases_the_org_client_stream_requests_promptly \
+            live_granted_streaming_call_and_serve \
+            live_granted_client_stream_call_and_serve \
+            live_granted_duplex_call_and_serve \
+            closing_client_and_serve_handle_lets_both_meshes_shut_down_cleanly || exit 1
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label mesh_rpc_live.test --mode literal \
+            --source net/crates/net/bindings/node/test/mesh_rpc_live.test.ts \
+            server_streaming_forced_drop_releases_the_sink \
+            client_streaming_forced_drop_releases_the_request_stream \
+            duplex_forced_drop_releases_both_handles || exit 1
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label consumer_compile.test --mode literal \
+            --source net/crates/net/bindings/node/test/consumer_compile.test.ts \
+            a_consumer_program_compiles_against_the_shipped_org_surface || exit 1
+
+      # === the Node cross-language vectors rows =========
+      # The npm test run above EXECUTED these 134 rows (the floor was 119
+      # until the §23 audit raised it to the real count); this step runs the
+      # file scoped (it is native-free) and PINS it: the count floor + the
+      # structural roster (the describe, the seven it.each family anchors,
+      # the three standalone names), fail-closed.
+      - name: Witness roster + floor — Node cross-lang vectors (134)
+        working-directory: net/crates/net/bindings/node
+        run: |
+          set -o pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label org_streaming_opening_vectors --mode text \
+            --source test/org_streaming_opening_vectors.test.ts \
+            'org streaming opening vectors (cross-language fixture)' \
+            'loads the fixture with the expected shape' \
+            'it.each(byteRows)' \
+            'it.each(callerRows)' \
+            'it.each(providerRows)' \
+            'it.each(rejectRows)' \
+            'it.each(classifyRows)' \
+            'it.each(grammarRows)' \
+            'it.each(unclassifiedRows)' \
+            'narrowed ids never match a full id' \
+            'u64 strings round-trip exactly' || exit 1
+          out=$(npx vitest run test/org_streaming_opening_vectors.test.ts 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g' | grep -oE '^ *Tests +[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "node cross-lang vectors: ${n:-0} (floor 134)"
+          if [ -z "$n" ] || [ "$n" -lt 134 ]; then
+            echo "::error::the node cross-lang vectors ran ${n:-0} rows, floor is 134 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+
       # The tool-serving cleanup journey needs a real mesh: the property
       # under test is that closing every handle the SDK hands you releases
       # the node's last reference, and a fake `ServeHandle` cannot fail to
@@ -3615,6 +3899,18 @@ jobs:
         run: |
           python3 .github/scripts/check-npm-platform-packages.py
           python3 .github/scripts/check-npm-platform-packages.py --self-test
+
+      # One version across every published artifact. The source of truth is
+      # `[workspace.package] version` in net/crates/net/Cargo.toml (members
+      # inherit it); the check fails on any manifest, internal path
+      # dependency, npm/Python package or `__version__` that disagrees. A
+      # manual 0.36 -> 0.37 bump once missed one internal dependency line and
+      # the workspace stopped resolving.
+      - name: Guard — every published version agrees with the workspace
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 .github/scripts/check-versions.py
+          python3 .github/scripts/check-versions.py --self-test
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -3700,7 +3996,35 @@ jobs:
       #     misconfigured --features list (missing `deck`) above
       #     fails loudly rather than silently skipping.
       - name: Run vitest
-        run: npm test
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee /tmp/sdk-ts-tests.log
+          n=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/sdk-ts-tests.log | grep -oE '^ *Tests +[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "sdk-ts tests passed: ${n:-0} (floor 567)"
+          if [ -z "$n" ] || [ "$n" -lt 567 ]; then
+            echo "::error::sdk-ts ran ${n:-0} tests, floor is 567 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+          # === the sdk-ts org facade witnesses
+          # The vitest run above EXECUTED these 11 (the executable consumer
+          # + 8 shape x authority cells over all four shapes + the midstream
+          # org-vocabulary pin + strict disposal); this step PINS them: lexical
+          # name-existence, fail-closed.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
+            --label org_live.test --mode text \
+            --source test/org_live.test.ts \
+            consumer_program_compiles_against_the_shipped_org_surface \
+            same_org_unary_call_and_serve \
+            same_org_streaming_call_and_serve \
+            same_org_client_stream_call_and_serve \
+            same_org_duplex_call_and_serve \
+            granted_unary_call_and_serve \
+            granted_streaming_call_and_serve \
+            granted_client_stream_call_and_serve \
+            granted_duplex_call_and_serve \
+            midstream_outcomes_surface_an_org_error_never_a_false_clean_eof \
+            closing_client_and_serve_handle_lets_both_meshes_shut_down_cleanly || exit 1
 
   python-tests:
     name: Python bindings tests (pytest)
@@ -3852,11 +4176,166 @@ jobs:
             || { echo "::error::the C5 fixture seeder did not build"; exit 1; }
           echo "NET_A2A_SEEDER_EXE=$exe" >> "$GITHUB_ENV"
 
+      # `--junitxml` is the RESULT SET the org facade roster below reads
+      # (CI-1): that step used to re-run the whole live org suite, under
+      # this job's 20-minute ceiling and without the thread watchdog or
+      # faulthandler set here. The stale copy is deleted first so a run
+      # that wrote nothing cannot be read as one that passed.
       - name: Run tests
         env:
           PYTHONFAULTHANDLER: "1"
           PYTHONUNBUFFERED: "1"
-        run: pytest -v -s --timeout=30 --timeout-method=thread
+        run: |
+          rm -f "$RUNNER_TEMP/python-bindings-junit.xml"
+          pytest -v -s --timeout=30 --timeout-method=thread \
+            --junitxml="$RUNNER_TEMP/python-bindings-junit.xml"
+
+      # === the Python org facade witnesses ==
+      # The pytest run above EXECUTED the pinned rows; this step PINS them
+      # and COUNTS them (CI-1). Before, the pin asserted "15 items / 12
+      # cells" in prose while running no tests and counting nothing — a
+      # parametrize id or a whole matrix row could vanish and the claim kept
+      # standing. Now the pinned base names + the teardown row are pinned
+      # lexically (fail-closed, with `decl`'s data-literal quoting) and then
+      # counted PER PINNED NODE ID: the floors are the pinned estate's own
+      # shape, so a vanished id or a vanished row reddens the count, and
+      # every pinned name must have at least one passing row of its own.
+      # Unpinned sibling rows in these files cannot mask a loss: only pinned
+      # node ids are counted.
+      #
+      # The estate (26 rows / 20 cells):
+      #   * MATRIX — 8 functions x [same_org|granted] = 16 cells: the 6
+      #     shape x form cells, plus PY-2's org SS/DX pump-terminal race
+      #     witnesses (`*_terminal_is_not_raced_by_the_response_pump`);
+      #   * the PY-1 stale-wheel gate — 1 function x [native|facade] x
+      #     [test_org_live|test_runtime_teardown_no_deadlock] = 4 cells;
+      #   * STANDALONE — 5 rows: the 3 original + PY-2's nRPC SS/DX
+      #     pump-terminal race witnesses (they live in test_org_live.py);
+      #   * TEARDOWN — 1 row.
+      #
+      # The rows are read from the JUnit result set the run above wrote, NOT
+      # from a re-run. The re-run this replaced executed the whole live org
+      # suite a second time inside the job's 20-minute ceiling, without
+      # `--timeout-method=thread` or `PYTHONFAULTHANDLER`, so a hang there
+      # would have eaten the job with no dump. It also cannot grep the run
+      # above's log instead: `-s` interleaves a test's own output between
+      # the `-v` node id and its PASSED verdict.
+      #
+      # The second `--source` is the teardown witness: a live org handler at
+      # runtime-drop time must not wedge the interpreter — the GIL-held
+      # blocking drop that hung this job and the wheel job to their job
+      # ceilings instead of failing. It is its own file (the property is a
+      # teardown one), so it is pinned here rather than in a suite that does
+      # not name it.
+      - name: Witness roster + floor — Python org facade (26 pinned rows / 20 cells)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          MATRIX="
+            test_org_streaming_sync_call_and_serve
+            test_org_streaming_async_call_and_serve
+            test_org_client_stream_sync_call_and_serve
+            test_org_client_stream_async_call_and_serve
+            test_org_duplex_sync_call_and_serve
+            test_org_duplex_async_call_and_serve
+            test_org_streaming_terminal_is_not_raced_by_the_response_pump
+            test_org_duplex_terminal_is_not_raced_by_the_response_pump
+            "
+          STALE_GATE=test_stale_wheel_fails_the_gate_loudly
+          STANDALONE="
+            test_task_cancel_propagates_to_retirement_observables
+            test_streaming_midstream_error_surfaces_the_org_vocabulary
+            test_live_cross_org_call_from_a_generated_scenario
+            test_nrpc_streaming_terminal_is_not_raced_by_the_response_pump
+            test_nrpc_duplex_terminal_is_not_raced_by_the_response_pump
+            "
+          TEARDOWN=test_teardown_with_a_live_handler_does_not_deadlock
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_live --mode decl \
+            --source net/crates/net/bindings/python/tests/test_org_live.py \
+            --source net/crates/net/bindings/python/tests/test_runtime_teardown_no_deadlock.py \
+            $MATRIX $STALE_GATE $STANDALONE $TEARDOWN \
+            same_org granted native facade || exit 1
+
+          # Fail-closed: a missing or unparseable artifact, a pinned name
+          # with no passing row, or a floor miss all exit 1. A row counts
+          # only as a PASS — any <failure>/<error>/<skipped> child excludes it.
+          python3 - "$RUNNER_TEMP/python-bindings-junit.xml" 26 20 \
+            $MATRIX $STALE_GATE $STANDALONE $TEARDOWN <<'PY' || exit 1
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          junit, min_rows, min_cells, *names = sys.argv[1:]
+          modules = {"test_org_live", "test_runtime_teardown_no_deadlock"}
+          if not Path(junit).is_file():
+              print(f"::error::no pytest JUnit artifact at {junit} - the run above wrote no results")
+              sys.exit(1)
+          try:
+              root = ET.parse(junit).getroot()
+          except ET.ParseError as exc:
+              print(f"::error::could not parse {junit}: {exc}")
+              sys.exit(1)
+          passed = {n: [] for n in names}
+          for case in root.iter("testcase"):
+              if not modules & set((case.get("classname") or "").split(".")):
+                  continue
+              if any(case.find(c) is not None for c in ("failure", "error", "skipped")):
+                  continue
+              full = case.get("name") or ""
+              base = full.split("[", 1)[0]
+              if base in passed:
+                  passed[base].append(full)
+          rows = sum(len(v) for v in passed.values())
+          cells = sum(1 for v in passed.values() for full in v if "[" in full)
+          print(f"python org facade: {rows} pinned rows / {cells} cells passed "
+                f"(floor {min_rows} rows / {min_cells} cells)")
+          missing = [n for n, v in passed.items() if not v]
+          for n in missing:
+              print(f"::error::pinned python org witness {n} has no passing row in {junit}")
+          if rows < int(min_rows) or cells < int(min_cells):
+              print(f"::error::the pinned python org facade passed {rows} rows / {cells} cells; "
+                    f"the floors are {min_rows} rows / {min_cells} cells (8 matrix functions x "
+                    "[same_org|granted] + the 4 stale-wheel gate cells + 5 standalone + the "
+                    "teardown row) - lower the floors deliberately or restore the witnesses")
+              sys.exit(1)
+          sys.exit(1 if missing else 0)
+          PY
+
+      # === the Python cross-language vectors rows =======
+      # The pytest run above EXECUTED these (137 items; the floor was 119
+      # until the §23 audit pinned the provider-role and mixed_pair rows: the byte pins, the
+      # opening role rows, the reject-reality rows, the vocabulary
+      # declaration + grammar rows, the never-success rows, narrowed ids,
+      # u64 exactness); this step PINS them: the 9 function names lexically
+      # (fail-closed) plus the scoped count floor (the run itself).
+      - name: Witness roster + floor — Python cross-lang vectors (137)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_streaming_opening_vectors --mode decl \
+            --source net/crates/net/bindings/python/tests/test_org_streaming_opening_vectors.py \
+            test_fixture_has_the_expected_shape \
+            test_wire_bytes_pin \
+            test_opening_wire_as_caller \
+            test_opening_wire_as_provider \
+            test_reject_mutation_is_real_against_the_base_wire \
+            test_vocabulary_row_classifies_back_to_declared_domain_and_kind \
+            test_vocabulary_wire_grammar \
+            test_unclassified_case_never_becomes_success \
+            test_narrowed_ids_never_match_a_full_id \
+            test_u64_strings_round_trip_exactly \
+            test_mixed_pair_probes_match_the_net_stub_signatures \
+            test_mixed_pair_pipe_reads_are_watchdog_bounded \
+            test_mixed_pair_scenario_pins_cannot_drift || exit 1
+          out=$(cd net/crates/net/bindings/python && python -m pytest -q \
+                  tests/test_org_streaming_opening_vectors.py 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "python cross-lang vectors: ${n:-0} (floor 137)"
+          if [ -z "$n" ] || [ "$n" -lt 137 ]; then
+            echo "::error::the python cross-lang vectors ran ${n:-0} rows, floor is 137 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
 
       # The skill examples import `net_sdk`, the ergonomic wrapper, which sits
       # on the binding `maturin develop` just built. This is the only job with
@@ -3865,6 +4344,53 @@ jobs:
       # the wrapper. One pure-Python editable install closes the gap.
       - name: Install the sdk-py wrapper
         run: pip install --no-deps -e ../../sdk-py
+
+      # === the sdk-py org facade witnesses (Q6) =====
+      # PINS the 9 base names of the 6 matrix functions, the parametrize
+      # pair that yields their 12 cells, PY-1's stale-wheel gate witness
+      # (`test_stale_wheel_gate_is_reachable[native|facade]`, 2 rows), the
+      # broken-facade probe witness (§23 audit, 1 row), and the count floor
+      # (15 + 2 + 1 = 18, fail-closed)
+      # — AND RUNS them: the step is here, not in `sdk-py-tests`, because
+      # these are live rows through `net_sdk` and need two things only this
+      # job has by now: the built extension (maturin develop, a few steps
+      # up) and the installed wrapper (the step above). The sdk-py job is
+      # deliberately native-free — its conftest stubs the extension — so
+      # `tests/test_org_streaming.py` skips itself there (`no usable net
+      # wheel here`), and a floor asserted against a skipped run is a floor
+      # that can never fail. It runs with the same watchdog settings as the
+      # suite run above (`--timeout-method=thread`, `PYTHONFAULTHANDLER`), so
+      # a hang in one of these live rows is dumped, not a silent job timeout.
+      - name: Witness roster + floor — sdk-py org facade (18)
+        working-directory: net/crates/net/sdk-py
+        env:
+          PYTHONFAULTHANDLER: "1"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -uo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_streaming --mode decl \
+            --source tests/test_org_streaming.py \
+            test_org_streaming_sync_call_and_serve \
+            test_org_streaming_async_call_and_serve \
+            test_org_client_stream_sync_call_and_serve \
+            test_org_client_stream_async_call_and_serve \
+            test_org_duplex_sync_call_and_serve \
+            test_org_duplex_async_call_and_serve \
+            test_unary_call_and_serve_preserved_through_net_sdk \
+            test_streaming_midstream_error_surfaces_the_org_vocabulary \
+            test_task_cancel_propagates_to_retirement_observables \
+            test_stale_wheel_gate_is_reachable \
+            test_a_facade_that_fails_to_import_fails_the_gate \
+            same_org granted native facade || exit 1
+          out=$(python -m pytest -q --timeout=30 --timeout-method=thread \
+                  tests/test_org_streaming.py 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "sdk-py org facade: ${n:-0} (floor 18)"
+          if [ -z "$n" ] || [ "$n" -lt 18 ]; then
+            echo "::error::the sdk-py org facade ran ${n:-0} rows, floor is 18 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
 
       # Executed, not just type-checked. hello.py's siblings in Rust and
       # TypeScript both compiled clean for months while hanging forever on a
@@ -3982,6 +4508,7 @@ jobs:
       #     pyo3 class so this stays a pure-Python test).
       - name: Run tests
         run: pytest -v
+
 
   go-tests:
     name: Go bindings tests
@@ -4102,7 +4629,7 @@ jobs:
       # bindings compile the `net` crate in-process and never load it), so a
       # symbol that appears or disappears breaks them all at once — and until
       # this step nothing compared the export table against anything, so the
-      # browser-native WebRTC plan's Stage 1 guarantee ("default build's
+      # browser-native WebRTC plan's guarantee ("default build's
       # exported symbol set unchanged" across a ~50-site endpoint refactor)
       # was unfalsifiable. The baseline is pinned to the pre-refactor head in
       # its header and regenerated only for an intended ABI change, in the
@@ -4207,6 +4734,47 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
           RUN_INTEGRATION_TESTS: "1"
         run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh
+
+      # === the Go org facade live cells ==
+      # The run above EXECUTED these 6 live cells (3 shapes x {same-org,
+      # granted}, call+serve live two-node with verified-caller attribution
+      # asserted); this step PINS them (a witness must not disappear
+      # silently): lexical name-existence, fail-closed.
+      - name: Witness roster — Go org facade live cells (6)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label org_test --mode decl \
+            --source org_test.go \
+            TestLiveSameOrgStreamingFromAGeneratedScenario \
+            TestLiveSameOrgClientStreamFromAGeneratedScenario \
+            TestLiveSameOrgDuplexFromAGeneratedScenario \
+            TestLiveGrantedStreamingFromAGeneratedScenario \
+            TestLiveGrantedClientStreamFromAGeneratedScenario \
+            TestLiveGrantedDuplexFromAGeneratedScenario || exit 1
+
+      # === the Go cross-language vectors rows ===========
+      # The go test run above EXECUTED the 8 TestStreamingOpeningVectors_*
+      # funcs (124 rows: byte pins, opening roles, rejects, vocabulary,
+      # unclassified, narrowed ids, u64 exact — plus the mixed-pair row
+      # skip-gated fail-closed behind RUN_MIXED_CROSS_PROCESS=1,
+      # F-S4Vectors-1); this step PINS them: lexical name-existence,
+      # fail-closed.
+      - name: Witness roster — Go cross-lang vectors (9)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label org_streaming_opening_vectors --mode decl \
+            --source org_streaming_opening_vectors_test.go \
+            TestStreamingOpeningVectors_Shape \
+            TestStreamingOpeningVectors_BytePins \
+            TestStreamingOpeningVectors_OpeningRoles \
+            TestStreamingOpeningVectors_Rejects \
+            TestStreamingOpeningVectors_Vocabulary \
+            TestStreamingOpeningVectors_Unclassified \
+            TestStreamingOpeningVectors_NarrowedIds \
+            TestStreamingOpeningVectors_U64Exact \
+            TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider || exit 1
 
       # Run again with `-tags test_helpers` so the test-only files
       # (`groups_testhelpers.go`, `groups_test.go`,
@@ -4351,7 +4919,7 @@ jobs:
           shared-key: clippy
           workspaces: net/crates/net -> target
 
-      # Stage 4 of PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md: production
+      # PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md: production
       # code (lib + bins) is denied for the four panic-hygiene + unsafe
       # lints declared in `Cargo.toml`'s `[lints.clippy]` table. This
       # step has no `-A` overrides — any new `.unwrap()` /
@@ -4462,7 +5030,7 @@ jobs:
             # transfer / traversal NAPI surfaces would otherwise go
             # unlinted — that gap hid a dead-code lint on the transfer
             # stream-id helpers).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers,dataforts,nat-traversal,port-mapping
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers,dataforts,nat-traversal,port-mapping,org
           - name: python
             path: net/crates/net/bindings/python
             # The widest service-free pyo3 surface. `meshdb` /
@@ -4485,7 +5053,7 @@ jobs:
             # this job lints an empty surface while reporting success — the
             # same silent-coverage shape the comments above describe. The
             # `python-tests` build set carries both.
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a,payments,payments-http
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a,payments,payments-http,org
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             # Default features only — the cdylib production build
@@ -4552,7 +5120,7 @@ jobs:
             features: ""
           - name: wire
             # `net-mesh-wire` is the tokio-free wire layer the core
-            # depends on (Stage 2 of
+            # depends on (
             # BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md). `json` is the
             # only feature and is what the core turns on, so linting
             # with it matches the surface every native consumer
@@ -4633,7 +5201,7 @@ jobs:
         crate:
           - name: node
             path: net/crates/net/bindings/node
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers,org
           - name: python
             path: net/crates/net/bindings/python
             # `a2a` and `publish` join `payments` here so the paid-A2A
@@ -4647,7 +5215,7 @@ jobs:
             # reported as 17 never-used items (measured). All three together
             # are warning-clean and give the in-crate `#[cfg(test)]` blocks
             # in `src/a2a.rs` / `src/a2a_paid.rs` something to run against.
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,payments,a2a,publish
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,payments,a2a,publish,org
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             features: ""
@@ -4939,7 +5507,7 @@ jobs:
           cargo test --lib ${{ matrix.crate.features }}
           cargo test --doc ${{ matrix.crate.features }}
 
-      # org-ffi is the one FFI crate with INTEGRATION targets — the S4 C
+      # org-ffi is the one FFI crate with INTEGRATION targets — the C
       # live cell, which drives the real C ABI end to end (net_mesh_new
       # from JSON, net_mesh_arc_clone per consuming call, the net_subnet_*
       # admin + serve entry points, net_org_credentials_new / _bind /
@@ -4952,7 +5520,7 @@ jobs:
       # silent-skip failure mode the "Integration test pin guard" job exists
       # to catch for the core crate's by-name pins. Nothing to enforce if
       # nothing is pinned by name.
-      - name: Run integration tests (org-ffi — the S4 C ABI live cell)
+      - name: Run integration tests (org-ffi — the C ABI live cell)
         if: matrix.crate.name == 'go-org-ffi'
         working-directory: ${{ matrix.crate.path }}
         run: cargo test --test '*'
@@ -5461,7 +6029,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
       # `net-mesh-wire` is the tokio-free wire layer the core depends
-      # on (Stage 2 of BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md). It
+      # on (BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md). It
       # denies `missing_docs`, and every type the core re-exports is
       # documented there rather than in `adapter/net` now, so its
       # rustdoc IS the wire-surface documentation.
@@ -5481,14 +6049,14 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   wasm-wire:
-    # Stage 2 of BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md: `net-mesh-wire`
+    # BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md: `net-mesh-wire`
     # is the tokio-free wire layer, and the whole point of extracting it
     # is that a browser leaf can run it. This job is the only place that
     # is enforced.
     #
     # Two steps, and the second is NOT redundant. `cargo check --target
     # wasm32-unknown-unknown` catches a native type leaking into the wire
-    # crate, but it CANNOT catch the failure S0a found: on
+    # crate, but it CANNOT catch the failure described below: on
     # `wasm32-unknown-unknown`, `std::time::Instant::now()` and
     # `SystemTime::now()` compile fine and then panic at runtime ("time
     # not implemented on this platform"). `session.rs` and
@@ -5545,7 +6113,7 @@ jobs:
           }
 
       # A wire-only wasm build pays ~260 KB of `wasm-bindgen` describe
-      # metadata for `getrandom`'s browser backend (S0a §5). Fine for a
+      # metadata for `getrandom`'s browser backend. Fine for a
       # test job; it is the `net-leaf` bundle, not this one, that has to
       # care. Cached with the target dir so it is paid once.
       - name: Install wasm-bindgen-test-runner
@@ -5649,7 +6217,7 @@ jobs:
           exit $status
 
   webrtc-feature:
-    # Stage 3 of BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md. The `webrtc`
+    # BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md. The `webrtc`
     # feature is OFF by default and is the only feature in this crate
     # with a C build-time dependency: `str0m`'s `rust-crypto` stack
     # pulls `aws-lc-rs`/`aws-lc-sys`, which needs cmake and a C
@@ -5683,7 +6251,7 @@ jobs:
           workspaces: net/crates/net -> target
 
       # Recorded separately so the aws-lc-sys cost stays visible: if
-      # it grows, the decision to accept it (S3 report, option a) can
+      # it grows, the decision to accept it (option a) can
       # be revisited against a number rather than a memory.
       - name: Build the feature's dependency tree (aws-lc-sys cost)
         run: |
@@ -5726,7 +6294,7 @@ jobs:
         with:
           tool: nextest
 
-      # The Stage 3 harnesses, pinned by name like every other
+      # The harnesses, pinned by name like every other
       # integration binary (the pin-guard job scrapes these flags).
       #
       # `--retries 0` overrides the profile default of 2: these are
@@ -5959,7 +6527,7 @@ jobs:
         run: cargo clippy -p net-mesh-wire --features "json webrtc" --all-targets -- -D warnings
 
   leaf-wasm:
-    # Stage 5: the `net-mesh-leaf` crate. Its own job for the same
+    # The `net-mesh-leaf` crate. Its own job for the same
     # reason `webrtc-browser` is one — it pays for a wasm32
     # toolchain, a bindgen CLI, a browser and a chromedriver, and it
     # builds a crate that is deliberately NOT a member of the mesh
@@ -5972,7 +6540,7 @@ jobs:
     # *clippy* — which is the only thing that catches a `RefCell`
     # borrow held across an await, and did — and the executed wasm
     # tests, because `Instant::now()` COMPILES on wasm32 and panics
-    # at runtime, so a check job alone cannot guard that seam (S0a).
+    # at runtime, so a check job alone cannot guard that seam.
     name: Leaf crate + wasm test runner
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -6008,16 +6576,16 @@ jobs:
           workspaces: net/crates/net/leaf -> target
 
       # The bindgen CLI version must EQUAL the crate version the leaf
-      # pins (`wasm-bindgen = "=0.2.128"`).
-      - name: Install wasm-bindgen-cli 0.2.128
+      # pins (`wasm-bindgen = "=0.2.129"`).
+      - name: Install wasm-bindgen-cli 0.2.129
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.128
+          tool: wasm-bindgen-cli@0.2.129
 
       # `wasm-bindgen-test-runner` drives a real browser over
       # WebDriver, and chromedriver refuses a Chrome whose major
       # version differs from its own. `install-chromedriver: true`
-      # alone did NOT keep them in step on the Stage 5 candidate -
+      # alone did NOT keep them in step on the candidate -
       # it paired ChromeDriver 153 with Chrome 152 and every wasm
       # test failed before it ran. Pin ONE version for both, from
       # Chrome-for-Testing, and then assert the two majors match:
@@ -6071,7 +6639,7 @@ jobs:
       - name: Formatting
         run: cargo fmt -- --check
 
-      # Kyra's Stage 5 review probes, landed VERBATIM (assertions
+      # Kyra's review probes, landed VERBATIM (assertions
       # untouched) and pinned by name. They reproduced 12 failures
       # out of 15 when they landed; a repair that regresses one must
       # fail here by name rather than shrink the roster.
@@ -6176,17 +6744,36 @@ jobs:
           cargo test --features mock-control-plane 2>&1 | tee /tmp/leaf-native.log
           total=$(grep -c '^test .* \.\.\. ok$' /tmp/leaf-native.log || true)
           echo "leaf native tests: $total"
-          # FLOOR is the measured inventory of this exact command: 264 lib
-          # units + 81 across the ten native integration binaries (the four
+          # FLOOR is the measured inventory of this exact command: 286 lib
+          # units + 183 across the fourteen native integration binaries (the four
           # `wasm_*` binaries compile to 0 tests natively, by design, and
           # doctests are 0). No test in the leaf is `#[cfg(unix)]`/
           # `#[cfg(windows)]`, so the count is platform-independent.
           # Raise it in the SAME commit as the witnesses it counts.
-          if [ "$total" -lt 345 ]; then
-            echo "::error::the leaf's native surface ran $total tests, floor is 345 — \
+          if [ "$total" -lt 469 ]; then
+            echo "::error::the leaf's native surface ran $total tests, floor is 469 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
+          # === the org streaming suite floors
+          # The three org suites' counts, fail-closed (a suite that silently
+          # shrinks must not read as green). Floor accounting from the source
+          # rosters at the pinned head. One documented rename inside
+          # org_streaming_lifecycle:
+          # `response_credit_parks_the_sender_and_each_grant_releases_exactly_its_chunks`
+          # replaced `…the_pump…` when the instrument moved to sender-parking
+          # (strengthened — the property moved with it).
+          for spec in org_authority:22 nrpc_streaming_parity:21 org_streaming_lifecycle:29; do
+            name="${spec%%:*}"; floor="${spec##*:}"
+            out=$(cargo test --features mock-control-plane --test "$name" 2>&1 | tee /dev/stderr)
+            n=$(printf '%s\n' "$out" | grep -oE 'test result: ok\. [0-9]+ passed' | grep -oE '[0-9]+' | head -1)
+            echo "$name: ${n:-0} (floor $floor)"
+            if [ -z "$n" ] || [ "$n" -lt "$floor" ]; then
+              echo "::error::$name ran ${n:-0} tests, floor is $floor — \
+          lower the floor deliberately or restore the witness"
+              exit 1
+            fi
+          done
 
       - name: wasm32 check
         run: cargo check --target wasm32-unknown-unknown --all-targets
@@ -6241,18 +6828,26 @@ jobs:
           "
           LEADER_WITNESSES="
           a_cancelled_bootstraps_real_rtc_connection_is_closed_before_the_lock_moves
+          a_cancelled_duplex_call_yields_the_cancelled_terminal_to_every_consumer
           a_custodial_identity_is_used_verbatim_and_never_stored
           a_follower_call_expires_on_its_own_deadline_as_an_indeterminate_outcome
           a_follower_call_without_a_timeout_expires_on_the_leafs_default_deadline
           a_leader_revalidates_its_generation_against_the_store_and_stands_down
           a_leaders_own_announcement_keeps_its_followers_capabilities
+          a_permanent_serve_registration_refusal_reaches_the_page_without_a_retry_storm
           a_promotion_whose_backend_fails_reattaches_instead_of_stranding_the_tab
           a_promotion_whose_generation_transaction_fails_requeues_instead_of_stranding_the_tab
           a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_panicking
           a_retained_stream_handle_cannot_address_a_same_id_successor
           a_follower_owns_its_streams_independently_under_one_wire_id
+          a_forged_accept_claim_is_never_served_to_the_handler_as_the_caller
+          a_well_formed_proxied_accept_dispatches_exactly_one_handler
+          an_accept_whose_caller_cannot_resolve_is_settled_not_stranded
           two_peers_under_one_wire_id_own_their_streams_independently
           a_runtime_announcement_is_restored_by_the_promoted_tab
+          a_second_duplex_stream_observes_the_latched_admission_denial_not_a_fabricated_completion
+          a_second_duplex_stream_observes_the_latched_refusal_not_a_fabricated_completion
+          a_second_duplex_stream_observes_the_latched_revoked_terminal_not_a_fabricated_completion
           a_superseded_session_is_refused_by_the_leader_and_by_storage
           a_tampered_identity_record_does_not_decrypt
           an_aborted_generation_transaction_is_a_typed_failure_and_moves_nothing
@@ -6262,6 +6857,7 @@ jobs:
           closing_a_promoting_tab_cancels_its_parked_bootstrap_and_frees_the_lock
           closing_a_tab_during_its_promotion_never_publishes_a_lock_holding_leader
           closing_the_leader_promotes_a_follower_fails_its_calls_and_restores_its_channels
+          concurrent_consumers_both_observe_the_one_latched_terminal
           standing_down_fences_then_retires_the_node_then_releases_the_lock
           the_generation_counter_is_monotonic_and_fences_a_stale_holder
           the_last_capability_declaring_followers_tag_is_withdrawn
@@ -6293,9 +6889,9 @@ jobs:
             # this step.
             case "$suite" in
               wasm_leaf)       floor=16 ;;
-              wasm_leader)     floor=29 ;;
+              wasm_leader)     floor=38 ;;
               wasm_anchorless) floor=2  ;;
-              # S6-06's leaf half. `leaf/src/rtc.rs` is
+              # The leaf half. `leaf/src/rtc.rs` is
               # `#![cfg(target_arch = "wasm32")]` in its entirety, so
               # a native test could only re-implement `PeerLink` and
               # assert the copy — and the claim is precisely "every
@@ -6312,7 +6908,7 @@ jobs:
               exit 1
             fi
           done
-          # The LIB target, which nothing here ran until S6-02/03/04.
+          # The LIB target, which nothing here ran until recently.
           #
           # The loop above passes `--test <name>`, so it reaches only
           # `leaf/tests/*.rs`. `wasm.rs`'s own `#[cfg(test)]` child
@@ -6356,18 +6952,24 @@ jobs:
               exit 1
             }
           done
-          # E1 (Kyra, Stage 5 round 2): `wasm_leader` had a floor of 6
+          # E1 (Kyra, round 2): `wasm_leader` had a floor of 6
           # against 18 witnesses and pinned none of them by name, so
           # twelve lifecycle tests could vanish and the job would stay
           # green. Every name is pinned, exactly as the leaf and
-          # anchorless rosters are.
+          # anchorless rosters are. (2026-09-25: the roster caught up
+          # with reality again — the LEAF-1 latched-terminal quartet
+          # and the three accept-claim/registration witnesses ran here
+          # unpinned since their slices landed; all 36 tests of the
+          # suite are name-pinned and the floor is the real count. The
+          # §23 audit added the concurrent-consumer LEAF-1 witness and the
+          # unresolved-accept settlement witness: 38.)
           for witness in $LEADER_WITNESSES; do
             grep -q "^test $witness \.\.\. ok$" /tmp/wasm_leader.log || {
               echo "::error::the leader lifecycle witness $witness did not run and pass inside wasm"
               exit 1
             }
           done
-          echo "leader lifecycle: 29 witnesses executed in headless Chromium"
+          echo "leader lifecycle: 38 witnesses executed in headless Chromium"
 
       # Exit criterion: the shipped bundle stays under 1.5 MB gzipped.
       - name: Bundle size
@@ -6386,7 +6988,7 @@ jobs:
           fi
 
   browser-package:
-    # Stage 5: `@net-mesh/browser`. A sibling package to
+    # `@net-mesh/browser`. A sibling package to
     # `@net-mesh/sdk` precisely because the SDK's graph contains the
     # napi addon; this job therefore never touches `bindings/node`.
     name: "@net-mesh/browser"
@@ -6413,10 +7015,10 @@ jobs:
         with:
           shared-key: leaf-wasm
           workspaces: net/crates/net/leaf -> target
-      - name: Install wasm-bindgen-cli 0.2.128
+      - name: Install wasm-bindgen-cli 0.2.129
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.128
+          tool: wasm-bindgen-cli@0.2.129
 
       # The size assertion is about the bundle a page downloads, so
       # the wasm has to be the real one, built here.
@@ -6440,11 +7042,20 @@ jobs:
         run: npm run build
 
       - name: Unit tests
-        run: npm test
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee /tmp/browser-ts-tests.log
+          n=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/browser-ts-tests.log | grep -oE '^ *Tests +[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "browser-ts tests passed: ${n:-0} (floor 728)"
+          if [ -z "$n" ] || [ "$n" -lt 728 ]; then
+            echo "::error::browser-ts ran ${n:-0} tests, floor is 728 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
 
       # R11: the TS/Rust ABI asserted through the artefacts a page
       # actually loads — the built `dist/` and the wasm-bindgen `pkg`
-      # beside it. Stage 5's unit suite was green against a test
+      # beside it. The unit suite was green against a test
       # double written from the hand-maintained declarations, so
       # every place those declarations were wrong the double was
       # wrong identically. Pinned by name: a probe that stops running
@@ -6524,7 +7135,7 @@ jobs:
         run: node scripts/size.mjs --assert --require-leaf
 
   webrtc-browser:
-    # Stage 4b exit criterion 1: the six §12 admission witnesses, the
+    # Exit criterion 1: the six §12 admission witnesses, the
     # MITM witness and the mDNS measurement, against a REAL Chromium
     # and a REAL native anchor served by the production bootstrap
     # listener. 4a could only witness §12 with a native stand-in;
@@ -6562,7 +7173,7 @@ jobs:
       # target add` from the repo root, install into the STABLE
       # installation — but every cargo command here runs under
       # `net/crates/net`, whose `rust-toolchain.toml` pins 1.98.1,
-      # a separate installation with its own target set. The Stage 5
+      # a separate installation with its own target set. The
       # candidate hit exactly that: `E0463: can't find crate for
       # 'core'` when building the leaf bundle. Add the target FROM
       # the pinned directory, and assert it, as the wasm-wire job
@@ -6571,8 +7182,8 @@ jobs:
         run: |
           set -o pipefail
           # THREE directories build for wasm32 in this job and they do
-          # not all resolve the same toolchain: the Stage 5 leaf and
-          # the Stage 4b harness leaf sit under `net/crates/net`
+          # not all resolve the same toolchain: the leaf and
+          # the harness leaf sit under `net/crates/net`
           # (pinned by `rust-toolchain.toml`), while anything the
           # runner spawns from the repo root gets `stable`. The
           # candidate installed the target for one of them and then
@@ -6604,10 +7215,10 @@ jobs:
       - name: Install libnss3-tools (certutil)
         run: sudo apt-get update && sudo apt-get install -y libnss3-tools
 
-      # Chromium from Playwright's cache, the same build S0b measured
+      # Chromium from Playwright's cache, the same build measured
       # against. `--with-deps` pulls the shared libraries headless
       # Chromium needs on a bare runner.
-      # Both GATE engines. Stage 5 owns the matrix, and Firefox is a
+      # Both GATE engines. This job owns the matrix, and Firefox is a
       # gate rather than a courtesy: it is the only engine here that
       # is not Chromium, and the leaf's transport assumptions are
       # engine-visible.
@@ -6618,7 +7229,7 @@ jobs:
         with:
           node-version: "24"
 
-      # The Stage 5 half of the runner drives `@net-mesh/browser`
+      # The first half of the runner drives `@net-mesh/browser`
       # over the real leaf bundle; both are built here so a witness
       # can never run against a stale artefact.
       - name: Install the Playwright driver's dependencies
@@ -6632,12 +7243,12 @@ jobs:
         run: sudo apt-get install -y nftables
 
       # The bindgen CLI version must EQUAL the crate version the leaf
-      # pins (`wasm-bindgen = "=0.2.128"`); a mismatch is a hard error
+      # pins (`wasm-bindgen = "=0.2.129"`); a mismatch is a hard error
       # at bindgen time, which is exactly what we want it to be.
-      - name: Install wasm-bindgen-cli 0.2.128
+      - name: Install wasm-bindgen-cli 0.2.129
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.128
+          tool: wasm-bindgen-cli@0.2.129
 
       - name: Build the leaf bundle and @net-mesh/browser
         run: |
@@ -6700,7 +7311,7 @@ jobs:
       # `--stage7` on the leg above and a Firefox floor of 55 — on the
       # first green run. If it is NOT green, the log says what the
       # engine does differently, which is the point.
-      - name: Browser harness — Firefox + Stage 7 (recorded, not a gate)
+      - name: Browser harness — Firefox (recorded, not a gate)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         continue-on-error: true
@@ -6728,7 +7339,7 @@ jobs:
       # what makes that impossible, and what makes a witness being
       # renamed or dropped a failure rather than a quiet shrink.
       #
-      # Same parser self-check as the Stage 3 inventory: prove the
+      # Same parser self-check as the earlier inventory: prove the
       # grep finds a KNOWN line before believing any count, so a
       # changed output format reads as "fix the parser", never as
       # "all clear" or "the witnesses are gone".
@@ -6787,6 +7398,44 @@ jobs:
           stage6_a_network_change_drives_exactly_one_re_attempt
           stage6_rtc_stats_uses_the_native_field_names_and_names_what_it_cannot_measure
           stage6_one_node_id_spelling_across_both_signalling_surfaces
+          org_browser_call_unary_same_org
+          org_browser_call_unary_granted
+          org_browser_call_streaming_same_org
+          org_browser_call_streaming_granted
+          org_browser_call_client_stream_same_org
+          org_browser_call_client_stream_granted
+          org_browser_call_duplex_same_org
+          org_browser_call_duplex_granted
+          org_native_call_unary_same_org
+          org_native_call_unary_granted
+          org_native_call_streaming_same_org
+          org_native_call_streaming_granted
+          org_native_call_client_stream_same_org
+          org_native_call_client_stream_granted
+          org_native_call_duplex_same_org
+          org_native_call_duplex_granted
+          org_browser_pair_unary
+          org_browser_pair_streaming
+          org_browser_pair_client_stream
+          org_browser_pair_duplex
+          org_browser_pair_granted
+          org_wrong_peer_frames_refused
+          org_old_session_frames_refused
+          org_replayed_opening_refused
+          org_streaming_backpressure_and_window
+          org_client_stream_backpressure_half_close
+          org_duplex_backpressure_half_close
+          org_midstream_revocation_retires_with_denied
+          org_revocation_refuses_new_openings
+          org_tab_teardown_retires_without_resume
+          org_leader_proxied_call_preserves_follower_attribution
+          org_leader_replacement_preserves_attribution
+          org_leader_teardown_fails_pending_typed
+          org_handler_completion_after_retirement_emits_nothing
+          org_parity_codec_round_trip_both_codecs
+          org_parity_leaf_proof_verifies_under_core
+          org_parity_core_proof_verifies_under_leaf
+          org_read_timeout_never_drops_items
           "
           # The roster is checked against the harness source before the
           # logs are read: a witness name that the runner never emits
@@ -6798,8 +7447,9 @@ jobs:
             --source net/crates/net/tests/rtc_browser/runner/src/stage5.rs \
             --source net/crates/net/tests/rtc_browser/runner/src/stage6.rs \
             --source net/crates/net/tests/rtc_browser/runner/src/stage7.rs \
+            --source net/crates/net/tests/rtc_browser/runner/src/org_stream.rs \
             $REQUIRED
-          # The ELEVEN Stage 7 witnesses, required on the engine that
+          # The ELEVEN witnesses, required on the engine that
           # runs them. They carry the plan's B2' composition gate — the
           # store's chunker on the REAL stream transport, under
           # injected loss and reorder — the property that a
@@ -6830,8 +7480,8 @@ jobs:
             # Floors are PER ENGINE: Chromium runs the store stage,
             # Firefox does not (see the harness step above).
             case "$engine" in
-              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=58; extra="$STAGE7" ;;
-              firefox)  log="$RUNNER_TEMP/rtcb-firefox.log"; floor=47; extra="" ;;
+              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=95; extra="$STAGE7" ;;
+              firefox)  log="$RUNNER_TEMP/rtcb-firefox.log"; floor=84; extra="" ;;
             esac
             # Prove the parser finds a KNOWN line before believing
             # any count, so a changed output format reads as "fix the
@@ -6862,18 +7512,18 @@ jobs:
                 exit 1
               fi
             done
-            # Chromium also carries the Stage 7 store witnesses;
+            # Chromium also carries the store witnesses;
             # Firefox does not gate them (see the harness step).
             echo "[$engine] inventory complete: 12 Stage 4b + 20 Stage 5 + 15 Stage 6 \
           (+ 11 Stage 7 on chromium)"
           done
 
-      # The recorded Firefox + Stage 7 leg, PRINTED and never gated.
+      # The recorded Firefox leg, PRINTED and never gated.
       # These numbers are what a promotion decision reads — a
       # `--stage7` on the Firefox harness step and a Firefox floor of
       # 55 — and no floor consults them today. A missing log is not a
       # failure: the step above is `continue-on-error`.
-      - name: Firefox + Stage 7 evidence (recorded, no floor)
+      - name: Firefox evidence (recorded, no floor)
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
@@ -6951,7 +7601,7 @@ jobs:
           if-no-files-found: warn
 
   browser-demo:
-    # Stage 6's runnable artefact: two real browser tabs whose pages
+    # The runnable artefact: two real browser tabs whose pages
     # find each other, go direct, and exchange 60 Hz positions over
     # the PUBLIC `@net-mesh/browser` surface — no harness hooks, no
     # private methods. It gates because a demo that has rotted is
@@ -7002,10 +7652,10 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install wasm-bindgen-cli 0.2.128
+      - name: Install wasm-bindgen-cli 0.2.129
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.128
+          tool: wasm-bindgen-cli@0.2.129
 
       # Exactly what the browser matrix builds, plus the demo's own
       # deps: the page loads the real bundle, so a stale artefact

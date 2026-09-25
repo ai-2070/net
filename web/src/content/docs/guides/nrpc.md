@@ -142,7 +142,19 @@ while let Some(incoming) = stream.next().await {
 }
 ```
 
-All four shapes ship across Rust, Node, Python (sync + async), and Go with the same typed wrappers and the same wire contract. A Python client can drive a Go duplex handler that talks to a Node server-streaming handler — cross-language interop is pinned by shared golden vectors in CI.
+All four shapes ship across Rust, Node, Python (sync + async), Go, and C — in C through the `net_rpc.h` streaming verbs — with the same wire contract. A Python client can drive a Go duplex handler that talks to a Node server-streaming handler — cross-language interop is pinned by shared golden vectors in CI.
+
+### The same four shapes, protected
+
+Organization-scoped capabilities serve and call the *same four shapes* through a
+different facade: a provider registers with `serve_org` (unary) or
+`serve_org_streaming` / `serve_org_client_stream` / `serve_org_duplex`, and a caller
+that has bound a credential set uses `call` / `call_streaming` / `call_client_stream`
+/ `call_duplex`. Each carries a protected admission proof and obeys a materially
+different lifetime rule — an omitted deadline is the facade's own default rather
+than "wait forever," and a request past the provider's policy is refused at opening
+— and no protected call retries underneath. The proof, the lifetime rule, and the
+streaming-only refusals are in [Protected streaming](/docs/guides/protected-streaming).
 
 ## Capability-targeted calls
 
@@ -215,6 +227,8 @@ Idiomatic surfaces wrap the primitive in each binding:
 
 All three lower to the same substrate token, so a TS client cancelling a call to a Python server is wire-equivalent to a Python client cancelling a call to a Go server. Power users can reserve tokens directly via the raw substrate surface for cross-call cancel sharing.
 
+**A protected client reserves its own token.** An organization-scoped client is not the mesh node, so it carries its own reservation and trip: `OrgClient::reserve_cancel_token` and `.cancel(token)` in Rust, `reserve_cancel_token` / `.cancel` in Python, `MeshRpc.reserveCancelToken()` / `.cancelCall(token)` feeding `opts.cancelToken` in Node, a context watcher in Go, and the `net_org_reserve_cancel_token` / `net_org_cancel_call` pair in C. These seams take a deadline and a pre-reserved cancel token rather than the full call-options object, so `AbortSignal` / `cancel=` do not reach them — Go bridges `ctx` with a watcher — and `0` for the token means *uncancellable*, never "cancel later."
+
 ## Observers and metrics
 
 The mesh exposes an observer hook and a per-service metrics snapshot. The observer fires per call with a typed `RpcCallEvent`; the snapshot reports cumulative counters for every service the node has called or served:
@@ -280,7 +294,7 @@ let reply: EchoReply = mesh
     .await?;
 ```
 
-By default the policy retries timeouts, transport failures, and transient server errors (internal / backpressure); it leaves `NoRoute`, codec, capability-denied, cancellation, and application handler errors alone — retrying a `bad request` forever is not recovery. Override the classifier with `RetryPolicy::with_retryable`. The deadline lives on `opts.raw.deadline` (an absolute `Instant`) and does *not* advance across retries, so the total wall-clock window is bounded by the initial deadline plus the sum of backoffs. Sibling helpers — `call_service_typed_with_hedge` (race a backup provider) and `CircuitBreaker` (fast-fail a sick target) — compose the same way; see [Recover a Failed Workflow](/docs/guides/recover-failed-workflow).
+By default the policy retries timeouts, transport failures, and transient server errors (internal / backpressure); it leaves `NoRoute`, codec, capability-denied, cancellation, and application handler errors alone — retrying a `bad request` forever is not recovery. Handler application codes must sit in `0x8000`–`0xFFFF`: a handler that returns a lower code has it clamped to `Internal`, so a misbanded code surfaces as a retryable `internal` and this default policy retries it. Override the classifier with `RetryPolicy::with_retryable`. The deadline lives on `opts.raw.deadline` (an absolute `Instant`) and does *not* advance across retries, so the total wall-clock window is bounded by the initial deadline plus the sum of backoffs. Sibling helpers — `call_service_typed_with_hedge` (race a backup provider) and `CircuitBreaker` (fast-fail a sick target) — compose the same way; see [Recover a Failed Workflow](/docs/guides/recover-failed-workflow).
 
 ## AI tool calling
 

@@ -89,8 +89,16 @@ retries = 0
 # of one interleaving and of one timing boundary, so a retry could only turn a
 # swallowed wake — or an always-immediate one — into a green run. Its
 # ownership witnesses are the same shape as `sensing_provider`'s.
+#
+# `org_scoped_cross_process` joins too (CI-2): the two-OS-process scoped-
+# discovery / protected-call witness is a LOST-MESSAGE proof — a granted
+# announcement or a handler dispatch that fails to cross the process boundary
+# on one attempt is exactly the defect it exists to catch, and the batch step
+# that runs it verified nothing per-test, so `retries = 2` could retry the
+# proof into green. A spawn/handshake flake here is itself a defect worth
+# seeing, same as every suite above.
 [[profile.default.overrides]]
-filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_consumer) + binary(sensing_org_lease_wire) + binary(sensing_org_exact_projection) + binary(sensing_org_exact_seam) + binary(sensing_org_three_node) + binary(org_exact_sensing)'
+filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_consumer) + binary(sensing_org_lease_wire) + binary(sensing_org_exact_projection) + binary(sensing_org_exact_seam) + binary(sensing_org_three_node) + binary(org_exact_sensing) + binary(org_rpc_streaming) + binary(org_scoped_cross_process)'
 retries = 0
 
 # Stage 3 RTC acceptance witnesses get NO retries.

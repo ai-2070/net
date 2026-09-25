@@ -542,6 +542,26 @@
       },
       "domain": "event-bus"
     },
+    "Organization-scoped streaming RPC": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
     "Permissive channel registry (opt out of strict default)": {
       "bindings": {
         "C": {

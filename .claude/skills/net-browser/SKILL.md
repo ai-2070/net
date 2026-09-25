@@ -4,8 +4,8 @@ description: "Use this skill when the target is a **browser page** — Net in a 
 allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 metadata:
   skill-version: 1.0.0
-  last-updated: 2026-09-25
-  net-version: 0.36.0
+  last-updated: 2026-09-26
+  net-version: 0.37.0
 ---
 
 # Net in the browser — a tab as a mesh node

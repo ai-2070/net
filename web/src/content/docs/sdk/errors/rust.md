@@ -99,6 +99,17 @@ chains and `?` composes:
 | `DeviceEnrollmentError` / `DeviceRegistryError` / `EnrollmentError` | Device enrollment |
 | `PinStoreError` / `RevocationStoreError` | MCP pin approvals and revocation |
 
+### Organization failures
+
+An organization-scoped call raises `OrgSdkError`, whose `domain()` is the
+load-bearing fact: `credentials` and `discovery` are **local** (nothing left the
+process), while `admission_denied` and `rpc` are **remote**.
+`OrgErrorDomain::is_local()` answers it without parsing the message. A streaming
+call can also fail *midstream*, from the handle rather than the opening — an
+`OrgStream` yields the org item, and `send`/`finish` on an `OrgClientStreamCall`
+(or `send`/`finish_sending` on an `OrgDuplexCall`) return it — so handle failures
+where you drain, not only where you called. And do not retry below the facade: every org verb is one signed attempt.
+
 ### Recover a call
 
 ```rust

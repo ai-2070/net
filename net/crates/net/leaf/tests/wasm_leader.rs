@@ -48,11 +48,12 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use bytes::Bytes;
 use futures_channel::oneshot;
-use js_sys::{Object, Reflect, Uint8Array};
+use js_sys::{Function, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
@@ -63,11 +64,13 @@ use net_leaf::bootstrap::gloo_timer_sleep;
 use net_leaf::error::{LeafError, RpcError};
 use net_leaf::identity::{IdentitySecrets, IDENTITY_BLOB_MAGIC};
 use net_leaf::leader::{
-    GenerationLease, LeaderBackend, LeaderRequest, ProxyFailure, ProxyValue, Replier,
+    envelope, GenerationLease, LeaderBackend, LeaderRequest, ProxyFailure, ProxySide, ProxyValue,
+    Replier, ORG_ENVELOPE_ADMITTED, ORG_ENVELOPE_END, ORG_ENVELOPE_ITEM, ORG_ENVELOPE_RETIRED,
 };
 use net_leaf::leader_session::{
-    spawn_fenced, BackendFactory, EventSink, Lifecycle, OpRegistry, Role,
+    spawn_fenced, BackendFactory, EventSink, Lifecycle, MeshSession, OpRegistry, Role,
 };
+use net_leaf::rpc_wire::RpcStatus;
 use net_leaf::rtc::RtcLeafTransport;
 use net_leaf::storage::IdentityVault;
 use net_leaf::stream::Reliability;
@@ -160,7 +163,7 @@ impl LeaderBackend for TestBackend {
         self.node_id
     }
 
-    fn perform(&mut self, request: LeaderRequest, reply: Replier) {
+    fn perform(&mut self, _from: ProxySide, request: LeaderRequest, reply: Replier) {
         self.log.borrow_mut().performed.push(request.clone());
         if self.hold_calls && matches!(request, LeaderRequest::Call { .. }) {
             self.log.borrow_mut().held.push(reply);
@@ -566,7 +569,7 @@ impl LeaderBackend for RealNodeBackend {
         self.node_id
     }
 
-    fn perform(&mut self, request: LeaderRequest, reply: Replier) {
+    fn perform(&mut self, _from: ProxySide, request: LeaderRequest, reply: Replier) {
         let handles = self.handles.clone();
         match request {
             // A real pending call: issued into the real call table,
@@ -1461,11 +1464,11 @@ async fn a_superseded_session_is_refused_by_the_leader_and_by_storage() {
             from: net_leaf::leader::ProxySide::Follower(0xFEED),
             body: net_leaf::leader::ProxyBody::Request {
                 correlation: 1,
-                request: LeaderRequest::Call {
+                request: Box::new(LeaderRequest::Call {
                     service: service.into(),
                     payload: Bytes::new(),
                     timeout_ms: None,
-                },
+                }),
             },
         }
         .to_json()
@@ -2746,8 +2749,11 @@ async fn a_retained_stream_handle_cannot_address_a_same_id_successor() {
                 .and_then(|value| value.as_string())
         })
         .unwrap_or_default();
+    // Pin the STALE-GENERATION arm, not just any not-leader refusal: the
+    // handle presents generation 1 against a successor at 2 (§23 audit —
+    // "not the leader" alone also matches a plain not-leader error).
     assert!(
-        message.contains("not the leader"),
+        message.contains("not the leader") && message.contains("holds generation 1"),
         "the refusal must be the typed stale-generation one, not any failure: {message:?}"
     );
     stale.close();
@@ -3921,4 +3927,674 @@ async fn two_peers_under_one_wire_id_own_their_streams_independently() {
 #[wasm_bindgen_test]
 async fn a_follower_owns_its_streams_independently_under_one_wire_id() {
     two_peers_own_their_streams(true).await;
+}
+
+// ─────────── org terminals at the JS boundary (LEAF-1) ───────────
+//
+// One call, several consumers: `OrgDuplexCallHandle::stream()` mints a
+// fresh `OrgByteStreamHandle` over the same `OrgCall` per call, and the
+// call's terminal is latched so `finish` and every `next` agree on it.
+// Before the repair, `next_outcome` answered a poll made AFTER the
+// first terminal delivery with a fabricated `Completed { body: [] }` —
+// so the second consumer of a call whose real terminal was
+// `Retired { Revoked }`, an `AdmissionDenied` or any refusal saw a
+// clean end-of-stream. These witnesses hold the remote terminal fixed
+// (the leader-side half a proxied call actually crosses) and assert
+// that EVERY consumer — and every over-poll past the terminal —
+// observes that same typed terminal.
+
+/// What the remote answers a call's response half with: the typed
+/// terminal, spelled exactly as the leader's org relay spells it —
+/// an `ORG_ENVELOPE_RETIRED` envelope for a retirement, a typed
+/// `ProxyFailure` for a refusal.
+#[derive(Clone)]
+enum TerminalAnswer {
+    /// A retirement, as the relay's retire envelope and its frozen
+    /// `OrgRetireReason` string.
+    Retired(&'static str),
+    /// A refusal, as `reply.fail` carries it: the wire status and the
+    /// service's message.
+    Refused(u16, String),
+}
+
+/// A leader backend that acknowledges one org call and then answers
+/// every `OrgNext` with the named terminal — the leader-side half a
+/// witness needs, without a node, a session or a provider.
+struct TerminalBackend {
+    node_id: u64,
+    terminal: TerminalAnswer,
+    /// Mirror the real relay's LEAF-13 release: after the first terminal
+    /// the call is gone, and every later `OrgNext` is `no_such_call`.
+    release_after_terminal: bool,
+    answered: bool,
+}
+
+impl LeaderBackend for TerminalBackend {
+    fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    fn perform(&mut self, _from: ProxySide, request: LeaderRequest, reply: Replier) {
+        match request {
+            // The open is acknowledged exactly as the real relay
+            // acknowledges one: an empty END envelope.
+            LeaderRequest::OrgCall { .. } => reply.bytes(Bytes::from_static(&[ORG_ENVELOPE_END])),
+            LeaderRequest::OrgNext { call } if self.release_after_terminal && self.answered => {
+                reply.fail(net_leaf::leader::no_such_call(call));
+            }
+            LeaderRequest::OrgNext { .. } => match &self.terminal {
+                TerminalAnswer::Retired(reason) => {
+                    self.answered = true;
+                    let mut envelope = Vec::with_capacity(1 + reason.len());
+                    envelope.push(ORG_ENVELOPE_RETIRED);
+                    envelope.extend_from_slice(reason.as_bytes());
+                    reply.bytes(Bytes::from(envelope));
+                }
+                TerminalAnswer::Refused(status, message) => {
+                    self.answered = true;
+                    reply.fail(ProxyFailure::Typed(LeafError::Rpc(RpcError::Refused {
+                        status: *status,
+                        message: message.clone(),
+                    })));
+                }
+            },
+            _ => reply.bytes(Bytes::new()),
+        }
+    }
+
+    fn shutdown(&mut self, _generation: u64) -> usize {
+        0
+    }
+}
+
+/// A factory for [`TerminalBackend`], in the shape [`factory`] takes.
+fn terminal_factory(
+    node_id: u64,
+    terminal: TerminalAnswer,
+    release_after_terminal: bool,
+) -> BackendFactory {
+    Rc::new(move |_opts, _sink, _lease| {
+        let terminal = terminal.clone();
+        Box::pin(async move {
+            let backend: Box<dyn LeaderBackend> = Box::new(TerminalBackend {
+                node_id,
+                terminal,
+                release_after_terminal,
+                answered: false,
+            });
+            Ok(backend)
+        })
+    })
+}
+
+/// The org call options a proxied org call carries. The proofs are
+/// opaque bytes over the proxy — the leader's node mints the signed
+/// opening — so their shape is not what is under test here.
+fn org_call_opts() -> JsValue {
+    let credentials = Object::new();
+    put(
+        &credentials,
+        "membership",
+        &Uint8Array::from(&b"membership-wire"[..]).into(),
+    );
+    put(
+        &credentials,
+        "dispatcher",
+        &Uint8Array::from(&b"dispatcher-wire"[..]).into(),
+    );
+    put(
+        &credentials,
+        "actingOrg",
+        &JsValue::from_str(&format!("{:064x}", 1)),
+    );
+    put(
+        &credentials,
+        "providerOwnerOrg",
+        &JsValue::from_str(&format!("{:064x}", 2)),
+    );
+    put(
+        &credentials,
+        "provider",
+        &JsValue::from_str(&format!("{:064x}", 3)),
+    );
+    let object = Object::new();
+    put(&object, "credentials", &credentials);
+    object.into()
+}
+
+/// The `{ done, error? }` item `next()` resolves: the done flag, the
+/// terminal error object's `kind`, and that object serialized — so two
+/// consumers' terminals are compared IDENTICALLY rather than against
+/// prose a rewording could keep true.
+fn terminal_item(item: &JsValue) -> (bool, Option<String>, Option<String>) {
+    let done = Reflect::get(item, &JsValue::from_str("done"))
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let error = Reflect::get(item, &JsValue::from_str("error"))
+        .ok()
+        .filter(|value| !value.is_undefined() && !value.is_null());
+    let kind = error.as_ref().and_then(|value| {
+        Reflect::get(value, &JsValue::from_str("kind"))
+            .ok()
+            .and_then(|kind| kind.as_string())
+    });
+    let json = error
+        .as_ref()
+        .and_then(|value| js_sys::JSON::stringify(value).ok())
+        .and_then(|text| text.as_string());
+    (done, kind, json)
+}
+
+/// A follower session whose leader answers every org call's response
+/// half with `answer`.
+async fn org_terminal_session(answer: TerminalAnswer) -> (MeshSession, Lifecycle) {
+    org_terminal_session_with(answer, false).await
+}
+
+async fn org_terminal_session_with(
+    answer: TerminalAnswer,
+    release_after_terminal: bool,
+) -> (MeshSession, Lifecycle) {
+    let db = unique("org-terminal-db");
+    let scope = unique("org-terminal-scope");
+    let leader = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        terminal_factory(0x3333, answer, release_after_terminal),
+    )
+    .await
+    .expect("leader");
+    settle().await;
+    assert_eq!(leader.role(), Role::Leader);
+    let session = MeshSession::open(opts(&db, &scope, &[], &[]))
+        .await
+        .expect("session");
+    settle().await;
+    assert_eq!(session.role(), "follower");
+    (session, leader)
+}
+
+/// One duplex call whose real terminal is `answer`, consumed via two
+/// `stream()` handles and then over-polled. Every observation must be
+/// the SAME typed terminal item; the fabricated completion the
+/// over-poll used to answer with shows up as a `done` item with no
+/// `error` on every consumer after the first.
+async fn every_consumer_observes(answer: TerminalAnswer, kind: &str) {
+    let (session, leader) = org_terminal_session(answer).await;
+    let handle = session
+        .call_org_duplex("svc.terminal".into(), org_call_opts())
+        .await
+        .expect("the duplex call opens");
+
+    let first = handle.stream();
+    let second = handle.stream();
+
+    let (done, first_kind, first_json) =
+        terminal_item(&first.next().await.expect("the first terminal"));
+    assert!(done, "the terminal arrives as a done item");
+    assert_eq!(
+        first_kind.as_deref(),
+        Some(kind),
+        "the first consumer sees the typed terminal: {first_json:?}"
+    );
+    let first_json = first_json.expect("a typed terminal carries its error object");
+
+    // The second consumer — a fresh handle over the same call — must
+    // observe the SAME typed terminal. Before the repair this resolved
+    // `{ done: true }`: a fabricated `Completed` presenting a
+    // revocation or a refusal as a clean end-of-stream.
+    let (done, second_kind, second_json) =
+        terminal_item(&second.next().await.expect("the second terminal"));
+    assert!(done, "the terminal arrives as a done item");
+    assert_eq!(
+        second_kind.as_deref(),
+        Some(kind),
+        "the second consumer must observe the latched typed terminal, never a \
+         fabricated completion: {second_json:?}"
+    );
+    assert_eq!(
+        second_json.as_deref(),
+        Some(first_json.as_str()),
+        "and it is the very same terminal"
+    );
+
+    // Over-poll past the terminal: the latched terminal again.
+    let (done, third_kind, third_json) =
+        terminal_item(&second.next().await.expect("the over-poll"));
+    assert!(done);
+    assert_eq!(
+        third_kind.as_deref(),
+        Some(kind),
+        "an over-poll past the terminal returns the latched terminal, not a \
+         fabricated completion: {third_json:?}"
+    );
+    assert_eq!(third_json.as_deref(), Some(first_json.as_str()));
+
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+/// LEAF-1, concurrent half (§23 audit): two consumers poll the SAME call
+/// at once. The relay answers the first with the terminal and releases
+/// the call (LEAF-13), so the second's poll comes back `no_such_call`.
+/// Pre-audit the loser surfaced that refusal as a DIFFERENT typed
+/// terminal; the latch must answer it with the one that was delivered.
+#[wasm_bindgen_test]
+async fn concurrent_consumers_both_observe_the_one_latched_terminal() {
+    let (session, leader) =
+        org_terminal_session_with(TerminalAnswer::Retired("revoked"), true).await;
+    let handle = session
+        .call_org_duplex("svc.terminal".into(), org_call_opts())
+        .await
+        .expect("the duplex call opens");
+    let first = handle.stream();
+    let second = handle.stream();
+
+    // Both polls are in flight before either answer is processed: each
+    // runs as its own task, and the relay's replies arrive
+    // asynchronously over the channel.
+    let (first_tx, first_rx) = oneshot::channel();
+    let (second_tx, second_rx) = oneshot::channel();
+    spawn_local(async move {
+        let _ = first_tx.send(first.next().await.ok());
+    });
+    spawn_local(async move {
+        let _ = second_tx.send(second.next().await.ok());
+    });
+    let a = first_rx.await.expect("the first consumer ran");
+    let b = second_rx.await.expect("the second consumer ran");
+    for (who, item) in [("first", a), ("second", b)] {
+        let (done, kind, json) = terminal_item(&item.expect("a terminal item, not an error"));
+        assert!(done, "{who}: the terminal arrives as a done item");
+        assert_eq!(
+            kind.as_deref(),
+            Some("revoked"),
+            "{who}: both concurrent consumers observe the one latched terminal: {json:?}"
+        );
+    }
+
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+/// A call retired as `Retired { Revoked }` reaches both consumers of a
+/// duplex call — a security revocation must never present as clean
+/// end-of-stream at the JS boundary.
+#[wasm_bindgen_test]
+async fn a_second_duplex_stream_observes_the_latched_revoked_terminal_not_a_fabricated_completion()
+{
+    every_consumer_observes(TerminalAnswer::Retired("revoked"), "revoked").await;
+}
+
+/// The same for an admission denial (`Refused { AdmissionDenied }`).
+#[wasm_bindgen_test]
+async fn a_second_duplex_stream_observes_the_latched_admission_denial_not_a_fabricated_completion()
+{
+    every_consumer_observes(
+        TerminalAnswer::Refused(RpcStatus::AdmissionDenied.to_wire(), "denied".into()),
+        "admission-denied",
+    )
+    .await;
+}
+
+/// The same for a plain typed refusal (`Refused` at any other status).
+#[wasm_bindgen_test]
+async fn a_second_duplex_stream_observes_the_latched_refusal_not_a_fabricated_completion() {
+    every_consumer_observes(
+        TerminalAnswer::Refused(
+            RpcStatus::Unauthorized.to_wire(),
+            "the service refused the call".into(),
+        ),
+        "refused",
+    )
+    .await;
+}
+
+/// A cancel is a typed `cancelled` terminal latched locally — the
+/// handle's own contract — and every consumer observes it, never the
+/// fabricated completion an over-poll used to be answered with. The
+/// remote would have said `revoked` here: the cancelling caller's own
+/// action is the terminal it observes, exactly as `cancel` documents.
+#[wasm_bindgen_test]
+async fn a_cancelled_duplex_call_yields_the_cancelled_terminal_to_every_consumer() {
+    let (session, leader) = org_terminal_session(TerminalAnswer::Retired("revoked")).await;
+    let handle = session
+        .call_org_duplex("svc.cancel".into(), org_call_opts())
+        .await
+        .expect("the duplex call opens");
+    handle.cancel();
+
+    for label in ["the cancelling consumer", "a second consumer"] {
+        let stream = handle.stream();
+        let (done, kind, json) = terminal_item(&stream.next().await.expect("the terminal"));
+        assert!(done, "{label} sees a done item");
+        assert_eq!(
+            kind.as_deref(),
+            Some("cancelled"),
+            "{label} must observe the typed cancelled terminal, never a \
+             fabricated completion: {json:?}"
+        );
+    }
+
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+// ─────────── the proxied serve accept seam (LEAF-3/6/14) ───────────
+
+/// The leader-side double for the proxied SERVE seam. It answers the
+/// register / accept / caller-fetch / request verbs with exactly the
+/// envelopes the real relay emits — so what runs under test is the
+/// follower's REAL accept loop (`ProxyOrgServe`), and a forged or
+/// tampered envelope is one reply away.
+#[derive(Clone, Default)]
+struct ServeFake {
+    /// Every `OrgServeRegister` seen — the retry-storm counter.
+    registers: Rc<Cell<u32>>,
+    /// Accept doc BODIES to hand out in order (without the `0x03`
+    /// tag: the arm wraps them exactly as the real accept arm does).
+    accepts: Rc<RefCell<VecDeque<String>>>,
+    /// Bridge handle → the projection the leader's own `ServeCall`
+    /// state resolves: the LEADER-VERIFIED caller identity.
+    verified: Rc<RefCell<HashMap<u64, String>>>,
+    /// Request items per bridge handle; EOF once drained.
+    requests: Rc<RefCell<HashMap<u64, VecDeque<Bytes>>>>,
+    /// When set, every register is refused with it — the PERMANENT
+    /// class LEAF-14 must surface typed, not retry.
+    refuse_register: Option<ProxyFailure>,
+    /// Long-pulls parked and never answered.
+    parked: Rc<RefCell<Vec<Replier>>>,
+    /// Every `OrgServeFinish` seen: `(call, status)`.
+    finished: Rc<RefCell<Vec<(u64, u16)>>>,
+}
+
+impl LeaderBackend for ServeFake {
+    fn node_id(&self) -> u64 {
+        0x5E2E
+    }
+
+    fn perform(&mut self, _from: ProxySide, request: LeaderRequest, reply: Replier) {
+        match request {
+            LeaderRequest::OrgServeRegister { .. } => {
+                self.registers.set(self.registers.get() + 1);
+                match &self.refuse_register {
+                    Some(failure) => reply.fail(failure.clone()),
+                    None => reply.bytes(Bytes::new()),
+                }
+            }
+            LeaderRequest::OrgServeAccept { .. } => match self.accepts.borrow_mut().pop_front() {
+                // The producer's own construction.
+                Some(doc) => reply.bytes(envelope(ORG_ENVELOPE_ADMITTED, doc.as_bytes())),
+                None => self.parked.borrow_mut().push(reply),
+            },
+            LeaderRequest::OrgServeCaller { call } => match self.verified.borrow().get(&call) {
+                Some(json) => reply.text(json.clone()),
+                None => reply.fail(ProxyFailure::Typed(LeafError::Session(format!(
+                    "no org call for handle {call}"
+                )))),
+            },
+            LeaderRequest::OrgServeRequest { call } => {
+                let item = self
+                    .requests
+                    .borrow_mut()
+                    .get_mut(&call)
+                    .and_then(|queue| queue.pop_front());
+                match item {
+                    Some(body) => reply.bytes(envelope(ORG_ENVELOPE_ITEM, &body)),
+                    None => reply.bytes(envelope(ORG_ENVELOPE_END, b"")),
+                }
+            }
+            LeaderRequest::OrgServeFinish { call, status, .. } => {
+                self.finished.borrow_mut().push((call, status));
+                reply.bytes(Bytes::new())
+            }
+            LeaderRequest::OrgServeSend { .. } => reply.bytes(Bytes::new()),
+            LeaderRequest::OrgServeRetired { .. } => self.parked.borrow_mut().push(reply),
+            _ => reply.bytes(Bytes::new()),
+        }
+    }
+
+    fn shutdown(&mut self, _generation: u64) -> usize {
+        let parked = core::mem::take(&mut *self.parked.borrow_mut());
+        let count = parked.len();
+        drop(parked);
+        count
+    }
+}
+
+/// The projection the leader's own serve state resolves — the one a
+/// handler must see (LEAF-6).
+fn verified_caller() -> String {
+    "{\"entity\":\"0011223344556677\"}".to_string()
+}
+
+/// The forged claim an attacker adds to the accept envelope.
+const FORGED_CLAIM: &str = "{\"entity\":\"forged\"}";
+
+/// The handler's recorded `caller` arguments — what reached JS.
+fn recording_handler(calls: &Rc<RefCell<Vec<String>>>) -> Function {
+    let sink = Rc::clone(calls);
+    let closure = Closure::wrap(Box::new(move |caller: JsValue, _request: Uint8Array| {
+        sink.borrow_mut()
+            .push(caller.as_string().unwrap_or_default());
+        js_sys::Promise::resolve(&Uint8Array::from(&b"response"[..]))
+    })
+        as Box<dyn FnMut(JsValue, Uint8Array) -> js_sys::Promise<Uint8Array>>);
+    closure.into_js_value().unchecked_into()
+}
+
+/// The `ownerOrg`-bearing options a proxied serve registration reads.
+fn serve_opts() -> JsValue {
+    let object = Object::new();
+    put(
+        &object,
+        "ownerOrg",
+        &JsValue::from_str(&format!("{:064x}", 2)),
+    );
+    object.into()
+}
+
+/// A follower session whose leader is `fake`, plus the leader's own
+/// lifecycle — the [`org_terminal_session`] shape one seam over.
+async fn serve_session(fake: ServeFake) -> (MeshSession, Lifecycle) {
+    let db = unique("org-serve-db");
+    let scope = unique("org-serve-scope");
+    let leader = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        Rc::new(move |_opts, _sink, _lease| {
+            let fake = fake.clone();
+            Box::pin(async move {
+                let backend: Box<dyn LeaderBackend> = Box::new(fake);
+                Ok(backend)
+            })
+        }),
+    )
+    .await
+    .expect("leader");
+    settle().await;
+    assert_eq!(leader.role(), Role::Leader);
+    let session = MeshSession::open(opts(&db, &scope, &[], &[]))
+        .await
+        .expect("session");
+    settle().await;
+    assert_eq!(session.role(), "follower");
+    (session, leader)
+}
+
+/// LEAF-3, end to end: a well-formed proxied accept — the exact
+/// `0x03 ‖ { call }` envelope the real accept arm emits — dispatches
+/// EXACTLY ONE handler. Pre-fix `decode_admitted` ran a JSON parse on
+/// the WHOLE tagged payload and dropped every well-formed accept: the
+/// handler never ran and the caller parked to its deadline.
+#[wasm_bindgen_test]
+async fn a_well_formed_proxied_accept_dispatches_exactly_one_handler() {
+    let fake = ServeFake::default();
+    fake.accepts
+        .borrow_mut()
+        .push_back("{\"call\":\"7\"}".to_string());
+    fake.verified.borrow_mut().insert(7, verified_caller());
+    fake.requests
+        .borrow_mut()
+        .insert(7, VecDeque::from([Bytes::from_static(b"request")]));
+    let (session, leader) = serve_session(fake).await;
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    session
+        .serve_org(
+            "svc.accept-a".to_string(),
+            "same-org".to_string(),
+            recording_handler(&calls),
+            serve_opts(),
+        )
+        .expect("the registration starts");
+    wait_ms(300).await;
+
+    assert_eq!(
+        calls.borrow().len(),
+        1,
+        "one accept envelope dispatches exactly one handler"
+    );
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+/// §23 audit: an accept is dequeued before its caller resolves. When the
+/// leader cannot project the caller, the call is not dispatched — and it
+/// must be SETTLED typed (`Internal`), not left admitted until its
+/// deadline. Pre-audit nothing was sent and the remote caller waited.
+#[wasm_bindgen_test]
+async fn an_accept_whose_caller_cannot_resolve_is_settled_not_stranded() {
+    let fake = ServeFake::default();
+    fake.accepts
+        .borrow_mut()
+        .push_back("{\"call\":\"9\"}".to_string());
+    // No verified projection for call 9: `OrgServeCaller` fails.
+    let finished = Rc::clone(&fake.finished);
+    let (session, leader) = serve_session(fake).await;
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    session
+        .serve_org(
+            "svc.accept-unresolved".to_string(),
+            "same-org".to_string(),
+            recording_handler(&calls),
+            serve_opts(),
+        )
+        .expect("the registration starts");
+    wait_ms(300).await;
+
+    assert!(
+        calls.borrow().is_empty(),
+        "no handler runs without a verified caller"
+    );
+    assert_eq!(
+        finished.borrow().as_slice(),
+        &[(9, RpcStatus::Internal.to_wire())],
+        "the undispatched call is settled typed, exactly once"
+    );
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+/// LEAF-6, end to end: the handler's `caller` projection is the
+/// leader-verified identity even when the accept envelope's claim is
+/// forged. Pre-fix the claim was served verbatim — handler-level
+/// caller spoofing on the proxy path.
+#[wasm_bindgen_test]
+async fn a_forged_accept_claim_is_never_served_to_the_handler_as_the_caller() {
+    let fake = ServeFake::default();
+    // The accept envelope is TAMPERED: the claim says "forged", the
+    // leader's own serve state resolves `verified_caller()`.
+    fake.accepts
+        .borrow_mut()
+        .push_back(format!("{{\"call\":\"7\",\"caller\":{FORGED_CLAIM}}}"));
+    fake.verified.borrow_mut().insert(7, verified_caller());
+    fake.requests
+        .borrow_mut()
+        .insert(7, VecDeque::from([Bytes::from_static(b"request")]));
+    let (session, leader) = serve_session(fake).await;
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    session
+        .serve_org(
+            "svc.accept-b".to_string(),
+            "same-org".to_string(),
+            recording_handler(&calls),
+            serve_opts(),
+        )
+        .expect("the registration starts");
+    wait_ms(300).await;
+
+    let seen = calls.borrow().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the tampered claim still dispatches the real call — once"
+    );
+    assert_eq!(
+        seen[0],
+        verified_caller(),
+        "the handler must see the leader-verified identity"
+    );
+    assert_ne!(
+        seen[0], FORGED_CLAIM,
+        "pre-fix the envelope claim was served verbatim"
+    );
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+/// LEAF-14, end to end: a permanent serve-registration refusal (the
+/// name is already served) reaches the page as a typed error, once,
+/// with no retry storm. Pre-fix the re-declare loop misdiagnosed it
+/// as transient and re-registered every 50ms forever, and the page
+/// never learned why its service was not live.
+#[wasm_bindgen_test]
+async fn a_permanent_serve_registration_refusal_reaches_the_page_without_a_retry_storm() {
+    let fake = ServeFake {
+        refuse_register: Some(ProxyFailure::Typed(LeafError::Session(
+            "serve \"svc\": AlreadyServed".to_string(),
+        ))),
+        ..Default::default()
+    };
+    let (session, leader) = serve_session(fake.clone()).await;
+    let session_events = Rc::new(RefCell::new(Vec::new()));
+    let sink = Rc::clone(&session_events);
+    let listener = Closure::wrap(Box::new(move |json: JsValue| {
+        if let Some(text) = json.as_string() {
+            sink.borrow_mut().push(text);
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+    session.on_event(listener.as_ref().unchecked_ref::<Function>().clone());
+    listener.forget();
+
+    session
+        .serve_org(
+            "svc.refused".to_string(),
+            "same-org".to_string(),
+            recording_handler(&Rc::new(RefCell::new(Vec::new()))),
+            serve_opts(),
+        )
+        .expect("the handle is returned; the refusal is async");
+    wait_ms(400).await;
+
+    assert_eq!(
+        fake.registers.get(),
+        1,
+        "one attempt per permanent refusal — pre-fix the loop retried every 50ms"
+    );
+    let events = session_events.borrow().clone();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.contains("serve_registration_refused")
+                && event.contains("AlreadyServed")),
+        "the typed permanent refusal reaches the page: {events:?}"
+    );
+    session.close();
+    leader.close();
+    settle().await;
 }

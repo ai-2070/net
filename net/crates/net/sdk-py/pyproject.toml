@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # `net_sdk` (the package directory under `src/` is unchanged) so
 # user code keeps `import net_sdk` working.
 name = "net-mesh-sdk"
-version = "0.36.0"
+version = "0.37.0"
 description = "Ergonomic Python SDK for the Net mesh network"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
@@ -28,7 +28,7 @@ requires-python = ">=3.10"
 # here collapses the range to the empty set and makes the package
 # uninstallable. `tests/test_packaging_metadata.py` asserts this range is
 # non-empty and admits the sibling `bindings/python` version.
-dependencies = ["net-mesh>=0.36.0,<0.37.0"]
+dependencies = ["net-mesh>=0.37.0,<0.38.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

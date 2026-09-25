@@ -55,7 +55,7 @@ npm install
 npm run build
 ```
 
-`wasm-bindgen-cli` must be **0.2.128** — the version the leaf pins. A mismatch is
+`wasm-bindgen-cli` must be **0.2.129** — the version the leaf pins. A mismatch is
 a hard error at bindgen time, not a subtle one at run time.
 
 `npm run build` runs `tsc` into `dist/` and then bundles a single file, copying

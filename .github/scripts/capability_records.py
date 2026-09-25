@@ -469,29 +469,63 @@ def bridge_json() -> str:
     return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
+def _frontmatter_capability(path: str) -> str | None:
+    """The `capability:` value in `path`'s frontmatter, if it declares one."""
+    with open(path, encoding="utf-8") as fh:
+        in_fm = False
+        for line in fh:
+            if line.strip() == "---":
+                if in_fm:
+                    return None
+                in_fm = True
+                continue
+            if in_fm and line.startswith("capability:"):
+                return line.split(":", 1)[1].strip()
+    return None
+
+
 def page_capabilities(docs_dir: str) -> dict[str, str]:
-    """`capability:` declared in an adaptive page's universal body, by page slug.
+    """`capability:` declared by a docs page, by page slug.
+
+    Two shapes declare one, and both are scanned so the value is checked
+    wherever it is written:
+
+      * an adaptive page's universal body (`_shared.md`), whose slug is its
+        directory — that body IS the page;
+      * an ordinary page, in its own frontmatter. Those are not rendered as a
+        parity row today (the panel sits on the adaptive render path), so the
+        field is metadata there — but an unchecked claim is the defect this
+        rule exists to prevent, and `lib/docs.ts` reads the same field off
+        `DocFrontmatter` for every page shape.
+
+    Per-language fragments are not separate pages: an adaptive page's
+    declaration is its body's, so fragments are skipped when a `_shared.md`
+    sits beside them.
 
     Read with a line scan rather than a YAML parser because `lib/docs.ts` reads
     the same frontmatter with a twenty-line scanner — a checker that accepted
     shapes the site cannot parse would pass a page that renders nothing.
+
+    Release notes are excluded, as everywhere else: they are dated records of
+    what shipped, and an operation renamed since is not a typo in the note.
     """
     out: dict[str, str] = {}
-    for dirpath, _dirs, files in os.walk(docs_dir):
-        if "_shared.md" not in files:
-            continue
+    for dirpath, dirs, files in os.walk(docs_dir):
+        dirs[:] = [d for d in dirs if d != "releases"]
         rel = os.path.relpath(dirpath, docs_dir).replace(os.sep, "/")
-        with open(os.path.join(dirpath, "_shared.md"), encoding="utf-8") as fh:
-            in_fm = False
-            for line in fh:
-                if line.strip() == "---":
-                    if in_fm:
-                        break
-                    in_fm = True
-                    continue
-                if in_fm and line.startswith("capability:"):
-                    out[rel] = line.split(":", 1)[1].strip()
-        _dirs.clear()
+        rel = "" if rel == "." else rel
+        # An adaptive page declares in its universal body.
+        names = ["_shared.md"] if "_shared.md" in files else [
+            n for n in files if n.endswith(".md")]
+        for name in names:
+            value = _frontmatter_capability(os.path.join(dirpath, name))
+            if value is None:
+                continue
+            if name == "_shared.md" or name == "README.md":
+                # A section README renders at the folder's URL.
+                out[rel] = value
+            else:
+                out["/".join(p for p in (rel, name[:-3]) if p)] = value
     return out
 
 

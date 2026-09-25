@@ -77,7 +77,8 @@ All derive from `RpcError`. Import from `net`, **not** `net_sdk`:
 
 `RpcAppError` is the one class that *does* carry its status as an argument — it is
 what a handler raises to signal an application status, and it is constructed
-`RpcAppError(status, body)`.
+`RpcAppError(status, body)`. The status must be in the application band
+`0x8000`–`0xFFFF`; anything lower surfaces to the caller as `Internal`.
 
 ### Classed exceptions on the mesh
 
@@ -118,6 +119,15 @@ raising. `MeshNode.send_with_retry(...)` retries `BackpressureError` for you wit
 
 `MigrationError` and `GroupError` are **flat** in Python, where TypeScript nests
 both under `DaemonError`. Catch them individually here.
+
+### Organization failure domains
+
+Organization-scoped calls raise `OrgError` subclasses. `parse_org_error` and
+`classify_org_error` map a message or exception to `ParsedOrgError`, whose `is_local`
+says whether anything left the process (`credentials` / `discovery` are local;
+`admission_denied` / `rpc` / `unknown` are remote). A streaming call can fail
+**midstream**, from the handle's `next`/`send`/`finish` rather than from the opening,
+and classifies through the same `org:` vocabulary — never the `RpcError` family.
 
 ### Recover a call
 

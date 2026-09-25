@@ -112,6 +112,14 @@ pub enum ControlEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedAnnouncement(pub Vec<u8>);
 
+/// An organization root's signed revocation-floor bundle, carried
+/// verbatim. Opaque to the carrier exactly like
+/// [`SignedAnnouncement`]: the leaf's org module verifies the
+/// signature and merges the floors raise-only. See
+/// [`ControlPlane::take_revocation_bundles`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevocationBundle(pub Vec<u8>);
+
 /// **The session-independent signalling envelope.**
 ///
 /// This is the design Kyra pinned and the plan requires Stage 5 to
@@ -274,6 +282,28 @@ pub trait ControlPlane {
     /// call. Polled by the leaf's own loop, which keeps the trait
     /// free of a callback type and free of `Send`.
     fn drain_events(&self) -> Vec<ControlEvent>;
+
+    /// Take every org-revocation bundle the carrier delivered since
+    /// the last call. This is the revocation FEED's leaf endpoint.
+    ///
+    /// A bundle is an organization root's signed revocation-floor
+    /// bundle on the wire — opaque here exactly like
+    /// [`SignedAnnouncement`]: the carrier delivers the bytes, the
+    /// leaf's own org module verifies the signature and merges the
+    /// floors raise-only. A control plane that parsed, merged or
+    /// reordered floors would be an authority this boundary exists
+    /// to deny, so the signature check stays on the far side of it —
+    /// "verified by the leaf, not by the transport", as with
+    /// [`ControlEvent::Announcement`].
+    ///
+    /// The default is "no feed": a control plane with no revocation
+    /// carrier hands back nothing and every certificate verifies
+    /// against implicit floor 0 — core's un-adopted-node behaviour,
+    /// exactly. Implementations override only to deliver what their
+    /// carrier actually sent, in arrival order.
+    fn take_revocation_bundles(&mut self) -> Vec<RevocationBundle> {
+        vec![]
+    }
 }
 
 #[cfg(test)]

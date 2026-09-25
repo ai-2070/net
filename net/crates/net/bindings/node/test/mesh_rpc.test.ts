@@ -432,6 +432,10 @@ class StubRawMeshRpc implements RawMeshRpc {
   constructor(responseBytes: Buffer) {
     this.responseBytes = responseBytes
   }
+  // Type-surface stubs — `RawMeshRpc` declares the close contract; these
+  // tests never call it.
+  readonly isClosed = false
+  close(): void {}
   async call(_target: bigint, _service: string, req: Buffer): Promise<Buffer> {
     this.lastRequest = req
     return this.responseBytes
@@ -589,6 +593,11 @@ describe('AbortSignal wiring on the typed wrapper', () => {
     private nextToken = 100n
     private callBlock?: () => Promise<Buffer>
 
+    // Type-surface stubs — `RawMeshRpc` declares the close contract;
+    // these tests never call it.
+    readonly isClosed = false
+    close(): void {}
+
     setCallBlock(fn: () => Promise<Buffer>): void {
       this.callBlock = fn
     }
@@ -731,6 +740,11 @@ describe('AbortSignal wiring on streaming calls', () => {
     public cancelCalls: bigint[] = []
     public capturedOpts: CallOptions | undefined = undefined
     private nextToken = 200n
+
+    // Type-surface stubs — `RawMeshRpc` declares the close contract;
+    // these tests never call it.
+    readonly isClosed = false
+    close(): void {}
 
     async call(): Promise<Buffer> {
       throw new Error('call not implemented')
@@ -1076,6 +1090,8 @@ describe('TypedMeshRpc.serveClientStream', () => {
       | ((stream: RawRequestStream) => Promise<Buffer>)
       | undefined
     const stub: RawMeshRpc = {
+      close: () => {},
+      isClosed: false,
       serve: () => {
         throw new Error('not used')
       },
@@ -1337,6 +1353,8 @@ describe('TypedMeshRpc.serveDuplex', () => {
         ) => Promise<Buffer>)
       | undefined
     const stub: RawMeshRpc = {
+      close: () => {},
+      isClosed: false,
       serve: () => {
         throw new Error('not used')
       },
@@ -1554,6 +1572,8 @@ function stubRpcForObserver(
   installer: (observer: ((evt: RawRpcCallEvent) => void) | null) => void,
 ): RawMeshRpc {
   return {
+    close: () => {},
+    isClosed: false,
     serve: () => {
       throw new Error('not used')
     },
@@ -1582,6 +1602,8 @@ function stubRpcForObserver(
 
 function stubRpcForMetrics(snapshot: RpcMetricsSnapshot): RawMeshRpc {
   return {
+    close: () => {},
+    isClosed: false,
     serve: () => {
       throw new Error('not used')
     },

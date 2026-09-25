@@ -82,9 +82,16 @@ pub use client::OrgClient;
 #[cfg(feature = "cortex")]
 mod call;
 #[cfg(feature = "cortex")]
+pub use call::{
+    OrgClientStreamCall, OrgDuplexCall, OrgDuplexSink, OrgDuplexStream, OrgStream, OrgStreamRaw,
+};
+#[cfg(feature = "cortex")]
 mod serve;
 #[cfg(feature = "cortex")]
-pub use serve::{serve_org_bytes_node, OrgAccess, OrgCaller, OrgHandlerError};
+pub use serve::{
+    serve_org_bytes_node, serve_org_client_stream_bytes_node, serve_org_duplex_bytes_node,
+    serve_org_streaming_bytes_node, OrgAccess, OrgCaller, OrgHandlerError,
+};
 // The two shared serve internals the subnet-exported seam reuses
 // (SUBNET_AUTH_SDK_PLAN.md §3.5): channel-defaults registration and the
 // one OrgCaller-projecting handler bridge. Crate-internal only.

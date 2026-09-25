@@ -20,11 +20,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use net::adapter::net::behavior::org_admission_replay::AdmissionReplayConfig;
+use net::adapter::net::{ChannelConfigRegistry, MeshNode, MeshNodeConfig};
 use net_sdk::capabilities::CapabilitySet;
+use net_sdk::identity::EntityKeypair;
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::mesh_rpc::{
     CallOptions, CallOptionsTyped, Codec, RpcContext, RpcHandler, RpcHandlerError,
     RpcResponsePayload, RpcStatus,
+};
+use net_sdk::org::{
+    CapabilityAuthorityId, DispatcherScope, NodeAuthority, OrgAdmission, OrgDispatcherGrant,
+    OrgKeypair, OrgMembershipCert, OrgProofIntent,
 };
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder as RtBuilder, Runtime};
@@ -47,6 +54,11 @@ pub const SVC_RAW: &str = "bench_echo_raw";
 pub const SVC_JSON_STREAM: &str = "bench_stream_json";
 pub const SVC_JSON_CLIENT_STREAM: &str = "bench_client_stream_json";
 pub const SVC_JSON_DUPLEX: &str = "bench_duplex_json";
+/// The PROTECTED (org-admitted) unary echo service registered by
+/// [`Pair::protected`]. Raw bytes in / raw bytes out — the same
+/// [`RawEchoHandler`] the public [`SVC_RAW`] service uses, so the
+/// difference between the two bars is admission, not codec.
+pub const SVC_PROTECTED_RAW: &str = "bench_echo_protected_raw";
 
 // ============================================================================
 // Echo wire types — the same logical `String` body across all
@@ -110,6 +122,10 @@ pub struct Pair {
     /// order. Empty for a [`Pair::new`] pair. [`call_json_shard_retrying`]
     /// indexes into this to fan calls across channels.
     pub shard_services: Vec<String>,
+    /// The owner-delegated intent [`Pair::protected`] minted, which a
+    /// protected call installs on [`CallOptions::org_proof_intent`].
+    /// `None` for a public pair ([`Pair::new`] / [`Pair::new_sharded`]).
+    pub org_intent: Option<OrgProofIntent>,
     // Keep ServeHandles alive for the lifetime of the Pair. The
     // RPC dispatcher unregisters on Drop, so binding to `_` would
     // tear the service down immediately (see nrpc_echo.rs:98).
@@ -134,6 +150,16 @@ async fn build_handshaken_pair() -> (Mesh, Mesh, u64) {
         .await
         .expect("caller build");
 
+    let server_id = server.node_id();
+    handshake_and_start(&server, &caller).await;
+    (server, caller, server_id)
+}
+
+/// The handshake half of [`build_handshaken_pair`]: concurrent accept +
+/// connect, then start both nodes. Extracted so [`Pair::protected`] —
+/// whose nodes are built by hand (see [`build_bench_mesh`]) — runs the
+/// exact same dance in the exact same order.
+async fn handshake_and_start(server: &Mesh, caller: &Mesh) {
     let server_addr = server.local_addr().to_string();
     let server_pub = *server.public_key();
     let server_id = server.node_id();
@@ -148,7 +174,66 @@ async fn build_handshaken_pair() -> (Mesh, Mesh, u64) {
     connect_res.expect("connect");
     server.start();
     caller.start();
-    (server, caller, server_id)
+}
+
+/// Per-caller admission-replay ceiling for the protected provider.
+///
+/// The provider retains one `(caller, call_id)` guard entry per ADMITTED
+/// call until the proof's expiry PLUS the hard `MAX_TOKEN_CLOCK_SKEW_SECS`
+/// ceiling — 300 s past expiry, deliberately, so a runtime skew widening
+/// cannot reopen a used proof (`behavior/org_admission.rs:605-614`).
+/// Nothing an in-process bench admits ever expires during the run, so the
+/// guard grows monotonically with the call count and the SHIPPED per-caller
+/// ceiling (`DEFAULT_MAX_REPLAY_ENTRIES_PER_CALLER` = 4096) denies call
+/// 4097 with `AdmissionDenied`.
+///
+/// That bound is real production behavior, not a bench artifact — one
+/// caller identity gets 4096 protected calls per ~5 min against one
+/// provider — but it is a hard stop for a Criterion loop that issues tens
+/// of thousands. Raising it here keeps the measurement on the admission
+/// path instead of on the guard filling up. Entries are allocated on
+/// demand (`ReplayState::default()` pre-allocates nothing), so a ceiling
+/// this size costs nothing until the calls actually happen.
+const BENCH_REPLAY_ENTRIES_PER_CALLER: usize = 8_000_000;
+
+/// The protected provider's replay ceilings. `max_entries_per_caller` must
+/// be STRICTLY below `max_entries`, and `owner_reserved_entries` strictly
+/// below it too (`AdmissionReplayConfig::validate`); the external quota is
+/// left at the shipped default because this pair has no external org.
+fn bench_replay_config() -> AdmissionReplayConfig {
+    AdmissionReplayConfig {
+        max_entries: BENCH_REPLAY_ENTRIES_PER_CALLER * 2,
+        max_entries_per_caller: BENCH_REPLAY_ENTRIES_PER_CALLER,
+        owner_reserved_entries: BENCH_REPLAY_ENTRIES_PER_CALLER,
+        ..AdmissionReplayConfig::default()
+    }
+}
+
+/// One `Mesh` around a hand-built `MeshNodeConfig`.
+///
+/// `MeshBuilder` exposes no seam for the admission-replay ceilings (see
+/// [`BENCH_REPLAY_ENTRIES_PER_CALLER`]) and none for pinning a known
+/// `EntityKeypair`, both of which [`Pair::protected`] needs — the caller's
+/// node identity must BE the proof subject. So the protected pair goes
+/// through `MeshNode::new` + `Mesh::from_node_arc`, the same public seam
+/// the SDK's own live org tests use (`sdk/src/org/tests_live.rs:176-222`).
+/// Every other knob is copied from `MeshBuilder::build`
+/// (`sdk/src/mesh.rs:409-413`), so a protected node differs from a
+/// [`Pair::new`] node only in those ceilings.
+async fn build_bench_mesh(keypair: EntityKeypair, replay: AdmissionReplayConfig) -> Mesh {
+    let addr = "127.0.0.1:0".parse().expect("bench bind addr");
+    let config = MeshNodeConfig::new(addr, [0x42u8; 32])
+        .with_heartbeat_interval(Duration::from_secs(5))
+        .with_session_timeout(Duration::from_secs(30))
+        .with_num_shards(4)
+        .with_handshake(3, Duration::from_secs(5))
+        .with_admission_replay_config(replay);
+    let mut node = MeshNode::new(keypair, config)
+        .await
+        .expect("protected node build");
+    let channel_configs = Arc::new(ChannelConfigRegistry::new());
+    node.set_channel_configs(channel_configs.clone());
+    Mesh::from_node_arc(Arc::new(node), channel_configs, None)
 }
 
 impl Pair {
@@ -255,6 +340,7 @@ impl Pair {
             caller,
             server_node_id: server_id,
             shard_services: Vec::new(),
+            org_intent: None,
             _handles: vec![h_json, h_post, h_raw, h_stream, h_client_stream, h_duplex],
         }
     }
@@ -313,7 +399,134 @@ impl Pair {
             caller,
             server_node_id: server_id,
             shard_services,
+            org_intent: None,
             _handles: handles,
+        }
+    }
+
+    /// Two `Mesh` nodes as in [`Pair::new`], plus everything ONE protected
+    /// unary call needs (Stage 0 slice 0.1 of
+    /// `ORG_SCOPED_STREAMING_PLAN.md`):
+    ///
+    /// 1. an installed [`NodeAuthority`] on the provider — org B owns P, so
+    ///    a `serve_rpc_protected` registration is legal at all;
+    /// 2. that registration, under [`OrgAdmission::OwnerDelegated`] with an
+    ///    allow-all provider policy (`|_| true`: the final application veto
+    ///    is out of scope for a transport measurement);
+    /// 3. a minted [`OrgProofIntent`] the caller installs on
+    ///    [`CallOptions::org_proof_intent`] — see [`call_protected_raw`].
+    ///
+    /// The recipe is `tests/integration_nrpc_protected.rs:71-459`
+    /// (`bring_up` / `install_authority` / `owner_delegated_intent` /
+    /// `live_two_node_owner_delegated_admit`), not a re-derivation: the
+    /// caller node's identity IS the intent's caller identity, and BOTH
+    /// nodes announce so each pins the other's entity — the caller-side
+    /// proof binding needs `caller.peer_entity_id(server)` and the
+    /// provider's `resolve_direct_caller` needs the reverse.
+    pub async fn protected() -> Self {
+        // The caller node and the proof subject are one entity: the
+        // provider resolves the authenticated session peer and requires it
+        // to equal the proof's caller.
+        let caller_kp = EntityKeypair::generate();
+        let intent_kp = caller_kp.clone();
+
+        let server = build_bench_mesh(EntityKeypair::generate(), bench_replay_config()).await;
+        let caller = build_bench_mesh(caller_kp, AdmissionReplayConfig::default()).await;
+        handshake_and_start(&server, &caller).await;
+        let server_id = server.node_id();
+        let caller_id = caller.node_id();
+
+        // (1) The provider's org-B node authority. `adopt` writes a scratch
+        // dir which is deliberately LEFT BEHIND: `OrgRevocationStore` keys
+        // a process-global registry by the revocation sidecar's
+        // (device, inode), so deleting it while this core is registered
+        // lets a recycled inode join this store's live view
+        // (integration_nrpc_protected.rs:50-64).
+        let provider = server.inner().entity_id().clone();
+        let org = OrgKeypair::from_bytes([0x42u8; 32]);
+        let node_cert =
+            OrgMembershipCert::try_issue(&org, provider.clone(), 1, 3600).expect("node cert");
+        let dir = std::env::temp_dir().join(format!(
+            "net-bench-org-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority =
+            NodeAuthority::adopt(&dir, node_cert, &provider, 0, None).expect("adopt authority");
+        server
+            .inner()
+            .install_node_authority(Arc::new(authority))
+            .expect("install authority");
+
+        // (2) The protected registration. Same handler as the public raw
+        // echo, so the public/protected delta is admission alone.
+        let handle = server
+            .node()
+            .serve_rpc_protected(
+                SVC_PROTECTED_RAW,
+                Arc::new(RawEchoHandler),
+                OrgAdmission::OwnerDelegated,
+                Arc::new(|_| true),
+            )
+            .expect("serve protected");
+
+        // Both directions must pin, so BOTH nodes announce (unlike
+        // `Pair::new`, where only the server does).
+        for mesh in [&server, &caller] {
+            mesh.inner()
+                .announce_capabilities(CapabilitySet::new())
+                .await
+                .expect("announce");
+        }
+        let pinned = || {
+            caller.inner().peer_entity_id(server_id).is_some()
+                && server.inner().peer_entity_id(caller_id).is_some()
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if pinned() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            pinned(),
+            "entity pins were not established in both directions within 5s"
+        );
+
+        // (3) The owner-delegated intent: the caller acts for org B, which
+        // also owns the provider.
+        let caller_entity = intent_kp.entity_id().clone();
+        let capability = CapabilityAuthorityId::for_tag(&format!("nrpc:{SVC_PROTECTED_RAW}"));
+        let membership = OrgMembershipCert::try_issue(&org, caller_entity.clone(), 1, 3600)
+            .expect("caller membership");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org,
+            caller_entity,
+            DispatcherScope::Exact(capability),
+            3600,
+        )
+        .expect("dispatcher grant");
+        let org_intent = OrgProofIntent {
+            caller: Arc::new(intent_kp),
+            membership,
+            dispatcher,
+            capability_grant: None,
+            acting_org: org.org_id(),
+            provider_owner_org: org.org_id(),
+            provider,
+            capability,
+            proof_ttl_secs: 30,
+        };
+
+        Self {
+            server,
+            caller,
+            server_node_id: server_id,
+            shard_services: Vec::new(),
+            org_intent: Some(org_intent),
+            _handles: vec![handle],
         }
     }
 }
@@ -544,6 +757,37 @@ pub async fn call_raw_direct_retrying(pair: &Pair, body: Bytes) -> Bytes {
             Err(e) => panic!("call raw (retrying): {e}"),
         }
     }
+}
+
+/// Direct raw `call` against the PROTECTED service of a
+/// [`Pair::protected`] pair, carrying a freshly minted owner-delegated
+/// admission proof.
+///
+/// The delta against [`call_raw_direct`] at the same payload is the org
+/// OPENING cost and nothing else — same transport, same handler, same
+/// body: caller-side proof mint (one ed25519 signature over the finalized
+/// request), the proof header's bytes on the wire, and the provider's
+/// §2.4 verification order (certificate + grant + call-binding signature
+/// checks, revocation floors, and the atomic replay insert).
+///
+/// The intent is cloned per call because `CallOptions` owns it. That is
+/// the production shape, not a bench tax: the facade's own caller builds a
+/// fresh intent for every call (`sdk/src/org/call.rs`: `plan` →
+/// `intent_for`, :896/:1597).
+pub async fn call_protected_raw(pair: &Pair, body: Bytes) -> Bytes {
+    let opts = CallOptions {
+        org_proof_intent: Some(
+            pair.org_intent
+                .clone()
+                .expect("protected calls need a Pair::protected() pair"),
+        ),
+        ..CallOptions::default()
+    };
+    pair.caller
+        .call(pair.server_node_id, SVC_PROTECTED_RAW, body, opts)
+        .await
+        .expect("protected raw call")
+        .body
 }
 
 // ============================================================================

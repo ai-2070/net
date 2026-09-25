@@ -1,0 +1,678 @@
+{
+  "credentials": {
+    "dispatcher_a_hex": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e8706",
+    "dispatcher_b_hex": "55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a00000000686039b5b67665cc77ac8fed25ba025ed3689b4667450beca97ac947f284fdc5edd1074d160b2c9cfcdf00f93c4b502f75eb9d2096c07490727f80d291efe3aad3c34eb131bc2b0a",
+    "grant_b_to_a_hex": "13903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d06",
+    "membership_a_hex": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0a",
+    "membership_b_hex": "55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a00000000020000006b7923a2ef74d03c98d98051adfbc8c945b328e6ada6175cbef63c35601b71d2c91589fccca79b8da0f40115329f99a02c7a48e12b35a4ceb5a79c6ef1eb596e3f86d0b1e4e2a10b",
+    "note": "The frozen issuance chain for the opening vectors (streaming_opening_frozen_credentials.json — minted once via --mint-frozen; issuance is nondeterministic by design). The live mixed pair uses the fresh gen_org_scenario chain under the same seeds."
+  },
+  "decoder_rejects": [
+    {
+      "base": "opening.server_streaming.granted",
+      "base_wire_len": 773,
+      "expect_error_display": "invalid wire format",
+      "id": "reject.trailing_byte",
+      "mutation": "append one 0x00 byte after the suffix",
+      "roles": [
+        "provider_accepts"
+      ],
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQN902hCh3EgnEXykg32ZaULan+XNFaC1ofbZDlre8F4CUkvoKY4WDcOWc0ZU/ZU/FyoIcHTVXtOVKp8g4RpFawgBWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWloA",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a40df74da10a1dc4827117ca4837d996942da9fe5cd15a0b5a1f6d90e5adef05e02524be8298e160dc396734654fd953f172a087074d55ed3952a9f20e11a456b08015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a00",
+      "wire_len": 774
+    },
+    {
+      "base": "opening.server_streaming.granted",
+      "base_wire_len": 773,
+      "expect_error_display": "invalid wire format",
+      "id": "reject.truncated_len_minus_1",
+      "mutation": "cut the final byte (mid suffix)",
+      "roles": [
+        "provider_accepts"
+      ],
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQN902hCh3EgnEXykg32ZaULan+XNFaC1ofbZDlre8F4CUkvoKY4WDcOWc0ZU/ZU/FyoIcHTVXtOVKp8g4RpFawgBWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWg==",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a40df74da10a1dc4827117ca4837d996942da9fe5cd15a0b5a1f6d90e5adef05e02524be8298e160dc396734654fd953f172a087074d55ed3952a9f20e11a456b08015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 772
+    },
+    {
+      "base": "opening.server_streaming.granted",
+      "base_wire_len": 773,
+      "expect_error_display": "invalid wire format",
+      "id": "reject.truncated_len_minus_17",
+      "mutation": "cut 17 bytes (mid suffix)",
+      "roles": [
+        "provider_accepts"
+      ],
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQN902hCh3EgnEXykg32ZaULan+XNFaC1ofbZDlre8F4CUkvoKY4WDcOWc0ZU/ZU/FyoIcHTVXtOVKp8g4RpFawgBWlpaWlpaWlpaWlpaWlpa",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a40df74da10a1dc4827117ca4837d996942da9fe5cd15a0b5a1f6d90e5adef05e02524be8298e160dc396734654fd953f172a087074d55ed3952a9f20e11a456b08015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 756
+    },
+    {
+      "base": "opening.server_streaming.granted",
+      "base_wire_len": 773,
+      "expect_error_display": "invalid wire format",
+      "id": "reject.truncated_len_minus_33",
+      "mutation": "cut the whole 33-byte suffix",
+      "roles": [
+        "provider_accepts"
+      ],
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQN902hCh3EgnEXykg32ZaULan+XNFaC1ofbZDlre8F4CUkvoKY4WDcOWc0ZU/ZU/FyoIcHTVXtOVKp8g4RpFawg=",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a40df74da10a1dc4827117ca4837d996942da9fe5cd15a0b5a1f6d90e5adef05e02524be8298e160dc396734654fd953f172a087074d55ed3952a9f20e11a456b08",
+      "wire_len": 740
+    },
+    {
+      "base": "opening.server_streaming.granted",
+      "base_wire_len": 773,
+      "expect_error_display": "invalid wire format",
+      "id": "reject.kind_0",
+      "mutation": "overwrite the kind byte with 0",
+      "roles": [
+        "provider_accepts"
+      ],
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQN902hCh3EgnEXykg32ZaULan+XNFaC1ofbZDlre8F4CUkvoKY4WDcOWc0ZU/ZU/FyoIcHTVXtOVKp8g4RpFawgAWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a40df74da10a1dc4827117ca4837d996942da9fe5cd15a0b5a1f6d90e5adef05e02524be8298e160dc396734654fd953f172a087074d55ed3952a9f20e11a456b08005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 773
+    },
+    {
+      "base": "opening.server_streaming.granted",
+      "base_wire_len": 773,
+      "expect_error_display": "invalid wire format",
+      "id": "reject.kind_4",
+      "mutation": "overwrite the kind byte with 4",
+      "roles": [
+        "provider_accepts"
+      ],
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQN902hCh3EgnEXykg32ZaULan+XNFaC1ofbZDlre8F4CUkvoKY4WDcOWc0ZU/ZU/FyoIcHTVXtOVKp8g4RpFawgEWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a40df74da10a1dc4827117ca4837d996942da9fe5cd15a0b5a1f6d90e5adef05e02524be8298e160dc396734654fd953f172a087074d55ed3952a9f20e11a456b08045a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 773
+    },
+    {
+      "base": "opening.server_streaming.granted",
+      "base_wire_len": 773,
+      "expect_error_display": "invalid wire format",
+      "id": "reject.kind_255",
+      "mutation": "overwrite the kind byte with 255",
+      "roles": [
+        "provider_accepts"
+      ],
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQN902hCh3EgnEXykg32ZaULan+XNFaC1ofbZDlre8F4CUkvoKY4WDcOWc0ZU/ZU/FyoIcHTVXtOVKp8g4RpFawj/WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a40df74da10a1dc4827117ca4837d996942da9fe5cd15a0b5a1f6d90e5adef05e02524be8298e160dc396734654fd953f172a087074d55ed3952a9f20e11a456b08ff5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 773
+    },
+    {
+      "base": "opening.server_streaming.granted",
+      "base_wire_len": 773,
+      "expect_error_display": "invalid wire format",
+      "id": "reject.over_cap",
+      "mutation": "pad with zeros past MAX_ORG_CALL_PROOF_BYTES (1024)",
+      "roles": [
+        "provider_accepts"
+      ],
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQN902hCh3EgnEXykg32ZaULan+XNFaC1ofbZDlre8F4CUkvoKY4WDcOWc0ZU/ZU/FyoIcHTVXtOVKp8g4RpFawgBWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWloAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a40df74da10a1dc4827117ca4837d996942da9fe5cd15a0b5a1f6d90e5adef05e02524be8298e160dc396734654fd953f172a087074d55ed3952a9f20e11a456b08015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "wire_len": 1025
+    }
+  ],
+  "description": "S4Vectors — the org streaming OPENING envelope + the frozen `org:` error vocabulary, byte-exact, for cross-language conformance. Each `wire_*` pin carries the SAME bytes in two encodings (`wire_hex`/`wire_base64` over the envelope bytes, or over the `wire` string's UTF-8 bytes) plus `wire_len`: a runtime MUST recover identical bytes from both encodings before any other handling of a vector (the byte-for-byte pin — a decoder that mangles either side disagrees with the fixture and must not become success). u64 values travel as decimal STRINGS (`call_id`, `proof_expires_at_unix_ns`) and MUST round-trip exactly. GENERATED — do not hand-edit; run `cargo run -p net-mesh-sdk --features net,cortex,fixtures --example gen_org_error_fixtures`.",
+  "error_vocabulary": {
+    "description": "OSDK-L X1 — the canonical `org:` error vocabulary every language binding parses. Each vector's `wire` string is what Rust emits; a binding MUST recover `domain` and `kind` from it, and MUST use `is_local` to decide whether the request left the process. GENERATED — do not hand-edit; run `cargo run -p net-mesh-sdk --features net,cortex,fixtures --example gen_org_error_fixtures`.",
+    "domains": [
+      {
+        "is_local": true,
+        "token": "credentials"
+      },
+      {
+        "is_local": true,
+        "token": "discovery"
+      },
+      {
+        "is_local": false,
+        "token": "admission_denied"
+      },
+      {
+        "is_local": false,
+        "token": "rpc"
+      },
+      {
+        "is_local": false,
+        "token": "unknown"
+      }
+    ],
+    "notes": [
+      "A binding MUST NOT report `admission_denied` for a string it could not parse: that asserts a request reached a provider and its admission engine evaluated it.",
+      "`admission_denied` vectors carry the coarse bucket and NOTHING else — a precise remote reason would be a credential oracle (OA2-E2).",
+      "`org:rpc:` reuses the frozen nRPC kind vocabulary rather than minting second names for the same conditions."
+    ],
+    "prefix": "org:",
+    "unclassified_cases": [
+      {
+        "expect_domain": "unknown",
+        "expect_is_local": false,
+        "wire": "org:frobnicate:whatever: detail",
+        "wire_base64": "b3JnOmZyb2JuaWNhdGU6d2hhdGV2ZXI6IGRldGFpbA==",
+        "wire_len": 31
+      },
+      {
+        "expect_domain": "unknown",
+        "expect_is_local": false,
+        "wire": "org:",
+        "wire_base64": "b3JnOg==",
+        "wire_len": 4
+      },
+      {
+        "expect_domain": "unknown",
+        "expect_is_local": false,
+        "wire": "org:credentials",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxz",
+        "wire_len": 15
+      },
+      {
+        "expect_domain": "unknown",
+        "expect_is_local": false,
+        "wire": "not-an-org-error",
+        "wire_base64": "bm90LWFuLW9yZy1lcnJvcg==",
+        "wire_len": 16
+      }
+    ],
+    "vectors": [
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "persistent_identity_required",
+        "wire": "org:credentials:persistent_identity_required: org credentials: the mesh has no configured durable identity — build it with MeshBuilder::identity(..) before binding org credentials",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOnBlcnNpc3RlbnRfaWRlbnRpdHlfcmVxdWlyZWQ6IG9yZyBjcmVkZW50aWFsczogdGhlIG1lc2ggaGFzIG5vIGNvbmZpZ3VyZWQgZHVyYWJsZSBpZGVudGl0eSDigJQgYnVpbGQgaXQgd2l0aCBNZXNoQnVpbGRlcjo6aWRlbnRpdHkoLi4pIGJlZm9yZSBiaW5kaW5nIG9yZyBjcmVkZW50aWFscw==",
+        "wire_len": 181
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "node_authority_required",
+        "wire": "org:credentials:node_authority_required: org credentials: no node authority is installed — adopt this node before binding org credentials",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOm5vZGVfYXV0aG9yaXR5X3JlcXVpcmVkOiBvcmcgY3JlZGVudGlhbHM6IG5vIG5vZGUgYXV0aG9yaXR5IGlzIGluc3RhbGxlZCDigJQgYWRvcHQgdGhpcyBub2RlIGJlZm9yZSBiaW5kaW5nIG9yZyBjcmVkZW50aWFscw==",
+        "wire_len": 139
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "node_authority_org_mismatch",
+        "wire": "org:credentials:node_authority_org_mismatch: org credentials: node authority owner org OrgId(48075a597e721a15...) does not match the membership org OrgId(5e212c0980e4b39f...)",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOm5vZGVfYXV0aG9yaXR5X29yZ19taXNtYXRjaDogb3JnIGNyZWRlbnRpYWxzOiBub2RlIGF1dGhvcml0eSBvd25lciBvcmcgT3JnSWQoNDgwNzVhNTk3ZTcyMWExNS4uLikgZG9lcyBub3QgbWF0Y2ggdGhlIG1lbWJlcnNoaXAgb3JnIE9yZ0lkKDVlMjEyYzA5ODBlNGIzOWYuLi4p",
+        "wire_len": 174
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "member_binding_mismatch",
+        "wire": "org:credentials:member_binding_mismatch: org credentials: membership names EntityId(2152f8d19b791d24...) but this mesh's identity is EntityId(db995fe25169d141...)",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOm1lbWJlcl9iaW5kaW5nX21pc21hdGNoOiBvcmcgY3JlZGVudGlhbHM6IG1lbWJlcnNoaXAgbmFtZXMgRW50aXR5SWQoMjE1MmY4ZDE5Yjc5MWQyNC4uLikgYnV0IHRoaXMgbWVzaCdzIGlkZW50aXR5IGlzIEVudGl0eUlkKGRiOTk1ZmUyNTE2OWQxNDEuLi4p",
+        "wire_len": 162
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "signature_invalid",
+        "wire": "org:credentials:signature_invalid: org credentials: membership signature is invalid: certificate validity window exceeds MAX_ORG_CERT_TTL_SECS",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOnNpZ25hdHVyZV9pbnZhbGlkOiBvcmcgY3JlZGVudGlhbHM6IG1lbWJlcnNoaXAgc2lnbmF0dXJlIGlzIGludmFsaWQ6IGNlcnRpZmljYXRlIHZhbGlkaXR5IHdpbmRvdyBleGNlZWRzIE1BWF9PUkdfQ0VSVF9UVExfU0VDUw==",
+        "wire_len": 142
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "dispatcher_binding_mismatch",
+        "wire": "org:credentials:dispatcher_binding_mismatch: org credentials: dispatcher grant empowers EntityId(c050c5637a44fa86...) but the membership names EntityId(2012cb90ca60e8e5...)",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOmRpc3BhdGNoZXJfYmluZGluZ19taXNtYXRjaDogb3JnIGNyZWRlbnRpYWxzOiBkaXNwYXRjaGVyIGdyYW50IGVtcG93ZXJzIEVudGl0eUlkKGMwNTBjNTYzN2E0NGZhODYuLi4pIGJ1dCB0aGUgbWVtYmVyc2hpcCBuYW1lcyBFbnRpdHlJZCgyMDEyY2I5MGNhNjBlOGU1Li4uKQ==",
+        "wire_len": 172
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "acting_org_mismatch",
+        "wire": "org:credentials:acting_org_mismatch: org credentials: membership org OrgId(af06a3e3291714e4...) and dispatcher grant org OrgId(2df04125f0015afb...) disagree",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOmFjdGluZ19vcmdfbWlzbWF0Y2g6IG9yZyBjcmVkZW50aWFsczogbWVtYmVyc2hpcCBvcmcgT3JnSWQoYWYwNmEzZTMyOTE3MTRlNC4uLikgYW5kIGRpc3BhdGNoZXIgZ3JhbnQgb3JnIE9yZ0lkKDJkZjA0MTI1ZjAwMTVhZmIuLi4pIGRpc2FncmVl",
+        "wire_len": 156
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "grant_not_for_acting_org",
+        "wire": "org:credentials:grant_not_for_acting_org: org credentials: capability grant abababababababababababababababababababababababababababababababab is issued to OrgId(e2fe2a39b7326642...), not the acting org",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOmdyYW50X25vdF9mb3JfYWN0aW5nX29yZzogb3JnIGNyZWRlbnRpYWxzOiBjYXBhYmlsaXR5IGdyYW50IGFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWIgaXMgaXNzdWVkIHRvIE9yZ0lkKGUyZmUyYTM5YjczMjY2NDIuLi4pLCBub3QgdGhlIGFjdGluZyBvcmc=",
+        "wire_len": 200
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "duplicate_grant",
+        "wire": "org:credentials:duplicate_grant: org credentials: duplicate capability grant id abababababababababababababababababababababababababababababababab",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOmR1cGxpY2F0ZV9ncmFudDogb3JnIGNyZWRlbnRpYWxzOiBkdXBsaWNhdGUgY2FwYWJpbGl0eSBncmFudCBpZCBhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFi",
+        "wire_len": 144
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "audience_secret_mismatch",
+        "wire": "org:credentials:audience_secret_mismatch: org credentials: audience secret for grant abababababababababababababababababababababababababababababababab matches no held grant",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOmF1ZGllbmNlX3NlY3JldF9taXNtYXRjaDogb3JnIGNyZWRlbnRpYWxzOiBhdWRpZW5jZSBzZWNyZXQgZm9yIGdyYW50IGFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWIgbWF0Y2hlcyBubyBoZWxkIGdyYW50",
+        "wire_len": 171
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "audience_install_refused",
+        "wire": "org:credentials:audience_install_refused: org credentials: capability grant abababababababababababababababababababababababababababababababab is not installable: grant expired or not yet valid",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOmF1ZGllbmNlX2luc3RhbGxfcmVmdXNlZDogb3JnIGNyZWRlbnRpYWxzOiBjYXBhYmlsaXR5IGdyYW50IGFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWIgaXMgbm90IGluc3RhbGxhYmxlOiBncmFudCBleHBpcmVkIG9yIG5vdCB5ZXQgdmFsaWQ=",
+        "wire_len": 191
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "audience_secret_file",
+        "wire": "org:credentials:audience_secret_file: org credentials: audience secret file /etc/net/grants/example.audience was refused: audience secret is not a regular file",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOmF1ZGllbmNlX3NlY3JldF9maWxlOiBvcmcgY3JlZGVudGlhbHM6IGF1ZGllbmNlIHNlY3JldCBmaWxlIC9ldGMvbmV0L2dyYW50cy9leGFtcGxlLmF1ZGllbmNlIHdhcyByZWZ1c2VkOiBhdWRpZW5jZSBzZWNyZXQgaXMgbm90IGEgcmVndWxhciBmaWxl",
+        "wire_len": 159
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "not_currently_valid",
+        "wire": "org:credentials:not_currently_valid: org credentials: membership is not currently valid: invalid wire format",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOm5vdF9jdXJyZW50bHlfdmFsaWQ6IG9yZyBjcmVkZW50aWFsczogbWVtYmVyc2hpcCBpcyBub3QgY3VycmVudGx5IHZhbGlkOiBpbnZhbGlkIHdpcmUgZm9ybWF0",
+        "wire_len": 108
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "dispatcher_scope_excludes_capability",
+        "wire": "org:credentials:dispatcher_scope_excludes_capability: org credentials: the dispatcher grant does not cover capability abababababababababababababababababababababababababababababababab",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOmRpc3BhdGNoZXJfc2NvcGVfZXhjbHVkZXNfY2FwYWJpbGl0eTogb3JnIGNyZWRlbnRpYWxzOiB0aGUgZGlzcGF0Y2hlciBncmFudCBkb2VzIG5vdCBjb3ZlciBjYXBhYmlsaXR5IGFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWI=",
+        "wire_len": 182
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "missing_capability_grant",
+        "wire": "org:credentials:missing_capability_grant: org credentials: no capability grant authorizes capability abababababababababababababababababababababababababababababababab on the selected provider",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOm1pc3NpbmdfY2FwYWJpbGl0eV9ncmFudDogb3JnIGNyZWRlbnRpYWxzOiBubyBjYXBhYmlsaXR5IGdyYW50IGF1dGhvcml6ZXMgY2FwYWJpbGl0eSBhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIG9uIHRoZSBzZWxlY3RlZCBwcm92aWRlcg==",
+        "wire_len": 190
+      },
+      {
+        "domain": "credentials",
+        "is_local": true,
+        "kind": "ambiguous_capability_grant",
+        "wire": "org:credentials:ambiguous_capability_grant: org credentials: capability abababababababababababababababababababababababababababababababab is authorized by 2 overlapping grants ([\"abababababababababababababababababababababababababababababababab\", \"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\"]) — remove the ambiguity or use the low-level OrgProofIntent seam",
+        "wire_base64": "b3JnOmNyZWRlbnRpYWxzOmFtYmlndW91c19jYXBhYmlsaXR5X2dyYW50OiBvcmcgY3JlZGVudGlhbHM6IGNhcGFiaWxpdHkgYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYiBpcyBhdXRob3JpemVkIGJ5IDIgb3ZlcmxhcHBpbmcgZ3JhbnRzIChbImFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWIiLCAiY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZCJdKSDigJQgcmVtb3ZlIHRoZSBhbWJpZ3VpdHkgb3IgdXNlIHRoZSBsb3ctbGV2ZWwgT3JnUHJvb2ZJbnRlbnQgc2VhbQ==",
+        "wire_len": 379
+      },
+      {
+        "domain": "discovery",
+        "is_local": true,
+        "kind": "no_authorized_provider",
+        "wire": "org:discovery:no_authorized_provider: org discovery: no authorized provider for capability abababababababababababababababababababababababababababababababab (3 private candidate(s) considered)",
+        "wire_base64": "b3JnOmRpc2NvdmVyeTpub19hdXRob3JpemVkX3Byb3ZpZGVyOiBvcmcgZGlzY292ZXJ5OiBubyBhdXRob3JpemVkIHByb3ZpZGVyIGZvciBjYXBhYmlsaXR5IGFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWIgKDMgcHJpdmF0ZSBjYW5kaWRhdGUocykgY29uc2lkZXJlZCk=",
+        "wire_len": 191
+      },
+      {
+        "domain": "discovery",
+        "is_local": true,
+        "kind": "provider_not_direct",
+        "wire": "org:discovery:provider_not_direct: org discovery: provider EntityId(93db9f2ee0f7e39e...) has no direct session — protected calls are direct-only",
+        "wire_base64": "b3JnOmRpc2NvdmVyeTpwcm92aWRlcl9ub3RfZGlyZWN0OiBvcmcgZGlzY292ZXJ5OiBwcm92aWRlciBFbnRpdHlJZCg5M2RiOWYyZWUwZjdlMzllLi4uKSBoYXMgbm8gZGlyZWN0IHNlc3Npb24g4oCUIHByb3RlY3RlZCBjYWxscyBhcmUgZGlyZWN0LW9ubHk=",
+        "wire_len": 146
+      },
+      {
+        "domain": "admission_denied",
+        "is_local": false,
+        "kind": "denied",
+        "wire": "org:admission_denied:denied",
+        "wire_base64": "b3JnOmFkbWlzc2lvbl9kZW5pZWQ6ZGVuaWVk",
+        "wire_len": 27
+      },
+      {
+        "domain": "admission_denied",
+        "is_local": false,
+        "kind": "not_supported",
+        "wire": "org:admission_denied:not_supported",
+        "wire_base64": "b3JnOmFkbWlzc2lvbl9kZW5pZWQ6bm90X3N1cHBvcnRlZA==",
+        "wire_len": 34
+      },
+      {
+        "domain": "admission_denied",
+        "is_local": false,
+        "kind": "unavailable",
+        "wire": "org:admission_denied:unavailable",
+        "wire_base64": "b3JnOmFkbWlzc2lvbl9kZW5pZWQ6dW5hdmFpbGFibGU=",
+        "wire_len": 32
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "timeout",
+        "wire": "org:rpc:timeout: rpc: timeout after 5000ms",
+        "wire_base64": "b3JnOnJwYzp0aW1lb3V0OiBycGM6IHRpbWVvdXQgYWZ0ZXIgNTAwMG1z",
+        "wire_len": 42
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "no_route",
+        "wire": "org:rpc:no_route: rpc: no route to target 0xdead: no path",
+        "wire_base64": "b3JnOnJwYzpub19yb3V0ZTogcnBjOiBubyByb3V0ZSB0byB0YXJnZXQgMHhkZWFkOiBubyBwYXRo",
+        "wire_len": 57
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "cancelled",
+        "wire": "org:rpc:cancelled: rpc: call cancelled by caller",
+        "wire_base64": "b3JnOnJwYzpjYW5jZWxsZWQ6IHJwYzogY2FsbCBjYW5jZWxsZWQgYnkgY2FsbGVy",
+        "wire_len": 48
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "server_error",
+        "wire": "org:rpc:server_error: rpc: server returned status 0x0006: the handler failed",
+        "wire_base64": "b3JnOnJwYzpzZXJ2ZXJfZXJyb3I6IHJwYzogc2VydmVyIHJldHVybmVkIHN0YXR1cyAweDAwMDY6IHRoZSBoYW5kbGVyIGZhaWxlZA==",
+        "wire_len": 76
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "transport",
+        "wire": "org:rpc:transport: rpc: transport: connection error: the peer session dropped",
+        "wire_base64": "b3JnOnJwYzp0cmFuc3BvcnQ6IHJwYzogdHJhbnNwb3J0OiBjb25uZWN0aW9uIGVycm9yOiB0aGUgcGVlciBzZXNzaW9uIGRyb3BwZWQ=",
+        "wire_len": 77
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "codec_encode",
+        "wire": "org:rpc:codec_encode: rpc: codec (Encode): the request did not serialize",
+        "wire_base64": "b3JnOnJwYzpjb2RlY19lbmNvZGU6IHJwYzogY29kZWMgKEVuY29kZSk6IHRoZSByZXF1ZXN0IGRpZCBub3Qgc2VyaWFsaXpl",
+        "wire_len": 72
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "codec_decode",
+        "wire": "org:rpc:codec_decode: rpc: codec (Decode): the reply did not deserialize",
+        "wire_base64": "b3JnOnJwYzpjb2RlY19kZWNvZGU6IHJwYzogY29kZWMgKERlY29kZSk6IHRoZSByZXBseSBkaWQgbm90IGRlc2VyaWFsaXpl",
+        "wire_len": 72
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "capability_denied",
+        "wire": "org:rpc:capability_denied: rpc: capability denied: target 0xdead does not authorize nrpc:customer.read",
+        "wire_base64": "b3JnOnJwYzpjYXBhYmlsaXR5X2RlbmllZDogcnBjOiBjYXBhYmlsaXR5IGRlbmllZDogdGFyZ2V0IDB4ZGVhZCBkb2VzIG5vdCBhdXRob3JpemUgbnJwYzpjdXN0b21lci5yZWFk",
+        "wire_len": 102
+      }
+    ],
+    "version": 1
+  },
+  "ids": {
+    "acting_org_granted_hex": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5",
+    "acting_org_owner_delegated_hex": "55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207",
+    "callee_entity_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "caller_entity_hex": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+    "capability_tag": "nrpc:customer.read",
+    "provider_org_hex": "55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207"
+  },
+  "layout": {
+    "admission_header": "net-org-admission",
+    "capability_grant_wire_size": 318,
+    "dispatcher_grant_wire_size": 185,
+    "kind_values": {
+      "client_streaming": 2,
+      "duplex": 3,
+      "never_emitted": 0,
+      "server_streaming": 1
+    },
+    "max_proof_bytes": 1024,
+    "membership_wire_size": 156,
+    "session_binding_len": 32,
+    "signature_wire_len": 65,
+    "stream_suffix_len": 33,
+    "stream_transcript_context": "net-org-stream-call-v1",
+    "stream_transcript_width": 337,
+    "unary_transcript_context": "net-org-call-v1",
+    "unary_transcript_width": 304
+  },
+  "notes": [
+    "Four harness-integrity rules, non-negotiable in every runtime: malformed/unknown errors, narrowing IDs, callback loss, or decoder disagreement MUST NOT become success.",
+    "Malformed/unknown errors: `unclassified_cases` MUST classify as `unknown` (never a canonical domain — that would assert a request reached a provider and its admission engine evaluated it).",
+    "Narrowing IDs: the vocabulary's detail strings carry NARROWED id displays (16 hex chars + \"...\"). A narrowed display MUST NOT compare equal to, or be upgraded into, a full 32-byte id.",
+    "Callback loss: a handler, sink or stream callback that never fires is a FAILURE (timeout), never an empty success. Assert exact chunk counts.",
+    "Decoder disagreement: any runtime whose decode of the byte pins, the u64 strings, or the `org:` grammar disagrees with these vectors FAILS that vector's row.",
+    "`admission_denied` vectors carry the coarse bucket and NOTHING else — a precise remote reason would be a credential oracle (OA2-E2).",
+    "`org:rpc:` reuses the frozen nRPC kind vocabulary rather than minting second names for the same conditions."
+  ],
+  "opening_vectors": [
+    {
+      "access": "granted",
+      "call_binding_sig_hex": "df74da10a1dc4827117ca4837d996942da9fe5cd15a0b5a1f6d90e5adef05e02524be8298e160dc396734654fd953f172a087074d55ed3952a9f20e11a456b08",
+      "call_id": "42",
+      "expect": {
+        "decode": "ok",
+        "kind": 1,
+        "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "sig_domain_separated": true,
+        "verify": "ok"
+      },
+      "id": "opening.server_streaming.granted",
+      "kind": 1,
+      "kind_name": "server_streaming",
+      "pre_sig_prefix_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a",
+      "proof_expires_at_unix_ns": "1900000000000000000",
+      "request_digest_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "roles": [
+        "caller_emits",
+        "provider_accepts"
+      ],
+      "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "unary_call_binding_sig_hex": "3fb3a4c587597c149148849acbde0d414d7f5d36141e19003691b750e9d2782f9cbc423575329701572fa76460ae4e7d261d85906baa14c37cf67ca9cc34a30b",
+      "unary_wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQD+zpMWHWXwUkUiEmsveDUFNf102FB4ZADaRt1Dp0ngvnLxCNXUylwFXL6dkYK5OfSYdhZBrqhTDfPZ8qcw0ows=",
+      "unary_wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a403fb3a4c587597c149148849acbde0d414d7f5d36141e19003691b750e9d2782f9cbc423575329701572fa76460ae4e7d261d85906baa14c37cf67ca9cc34a30b",
+      "unary_wire_len": 740,
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQN902hCh3EgnEXykg32ZaULan+XNFaC1ofbZDlre8F4CUkvoKY4WDcOWc0ZU/ZU/FyoIcHTVXtOVKp8g4RpFawgBWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a40df74da10a1dc4827117ca4837d996942da9fe5cd15a0b5a1f6d90e5adef05e02524be8298e160dc396734654fd953f172a087074d55ed3952a9f20e11a456b08015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 773
+    },
+    {
+      "access": "owner_delegated",
+      "call_binding_sig_hex": "947e2ce65d8336673eb30278dec9e491001529654c61b0972fc273bc00de35c094b317933699109a542c82b2d7dcaad80db238d8823988318cce8d2cbc53b209",
+      "call_id": "42",
+      "expect": {
+        "decode": "ok",
+        "kind": 1,
+        "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "sig_domain_separated": true,
+        "verify": "ok"
+      },
+      "id": "opening.server_streaming.owner_delegated",
+      "kind": 1,
+      "kind_name": "server_streaming",
+      "pre_sig_prefix_hex": "9c0155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a00000000020000006b7923a2ef74d03c98d98051adfbc8c945b328e6ada6175cbef63c35601b71d2c91589fccca79b8da0f40115329f99a02c7a48e12b35a4ceb5a79c6ef1eb596e3f86d0b1e4e2a10bb90155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a00000000686039b5b67665cc77ac8fed25ba025ed3689b4667450beca97ac947f284fdc5edd1074d160b2c9cfcdf00f93c4b502f75eb9d2096c07490727f80d291efe3aad3c34eb131bc2b0a008080f889effd89af1a",
+      "proof_expires_at_unix_ns": "1900000000000000000",
+      "request_digest_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "roles": [
+        "caller_emits",
+        "provider_accepts"
+      ],
+      "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "unary_call_binding_sig_hex": "58ab95575de335048db4b7d4ea5244befe67ba5996d74fc2a2f1e8ce7eea729722b87d76b448a814ee4d5a712ed2cbb65139af20e34fb81f7100d64153d88501",
+      "unary_wire_base64": "nAFVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB6CapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAIAAABreSOi73TQPJjZgFGt+8jJRbMo5q2mF1y+9jw1YBtx0skVifzMp5uNoPQBFTKfmaAsekjhKzWkzrWnnG7x61luP4bQseTioQu5AVUVT0IGXqWhvqBUY4Jr4mhOuS35LBAAJ6q6rlfKVUIHoJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAaGA5tbZ2Zcx3rI/tJboCXtNom0ZnRQvsqXrJR/KE/cXt0QdNFgssnPzfAPk8S1AvdeudIJbAdJByf4DSke/jqtPDTrExvCsKAICA+Inv/YmvGkBYq5VXXeM1BI20t9TqUkS+/me6WZbXT8Ki8ejOfupylyK4fXa0SKgU7k1acS7Sy7ZROa8g40+4H3EA1kFT2IUB",
+      "unary_wire_hex": "9c0155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a00000000020000006b7923a2ef74d03c98d98051adfbc8c945b328e6ada6175cbef63c35601b71d2c91589fccca79b8da0f40115329f99a02c7a48e12b35a4ceb5a79c6ef1eb596e3f86d0b1e4e2a10bb90155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a00000000686039b5b67665cc77ac8fed25ba025ed3689b4667450beca97ac947f284fdc5edd1074d160b2c9cfcdf00f93c4b502f75eb9d2096c07490727f80d291efe3aad3c34eb131bc2b0a008080f889effd89af1a4058ab95575de335048db4b7d4ea5244befe67ba5996d74fc2a2f1e8ce7eea729722b87d76b448a814ee4d5a712ed2cbb65139af20e34fb81f7100d64153d88501",
+      "unary_wire_len": 420,
+      "wire_base64": "nAFVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB6CapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAIAAABreSOi73TQPJjZgFGt+8jJRbMo5q2mF1y+9jw1YBtx0skVifzMp5uNoPQBFTKfmaAsekjhKzWkzrWnnG7x61luP4bQseTioQu5AVUVT0IGXqWhvqBUY4Jr4mhOuS35LBAAJ6q6rlfKVUIHoJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAaGA5tbZ2Zcx3rI/tJboCXtNom0ZnRQvsqXrJR/KE/cXt0QdNFgssnPzfAPk8S1AvdeudIJbAdJByf4DSke/jqtPDTrExvCsKAICA+Inv/YmvGkCUfizmXYM2Zz6zAnjeyeSRABUpZUxhsJcvwnO8AN41wJSzF5M2mRCaVCyCstfcqtgNsjjYgjmIMYzOjSy8U7IJAVpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpa",
+      "wire_hex": "9c0155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a00000000020000006b7923a2ef74d03c98d98051adfbc8c945b328e6ada6175cbef63c35601b71d2c91589fccca79b8da0f40115329f99a02c7a48e12b35a4ceb5a79c6ef1eb596e3f86d0b1e4e2a10bb90155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a00000000686039b5b67665cc77ac8fed25ba025ed3689b4667450beca97ac947f284fdc5edd1074d160b2c9cfcdf00f93c4b502f75eb9d2096c07490727f80d291efe3aad3c34eb131bc2b0a008080f889effd89af1a40947e2ce65d8336673eb30278dec9e491001529654c61b0972fc273bc00de35c094b317933699109a542c82b2d7dcaad80db238d8823988318cce8d2cbc53b209015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 453
+    },
+    {
+      "access": "granted",
+      "call_binding_sig_hex": "37bc42018d5bdc2cd75aa060ca49946374f162cb69b8943dcd59aaa13433240769ea604d6de29f1c2c2d15288bd0a5cc54984eef7b255ccd2585a1d8be52c20f",
+      "call_id": "42",
+      "expect": {
+        "decode": "ok",
+        "kind": 2,
+        "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "sig_domain_separated": true,
+        "verify": "ok"
+      },
+      "id": "opening.client_streaming.granted",
+      "kind": 2,
+      "kind_name": "client_streaming",
+      "pre_sig_prefix_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a",
+      "proof_expires_at_unix_ns": "1900000000000000000",
+      "request_digest_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "roles": [
+        "caller_emits",
+        "provider_accepts"
+      ],
+      "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "unary_call_binding_sig_hex": "3fb3a4c587597c149148849acbde0d414d7f5d36141e19003691b750e9d2782f9cbc423575329701572fa76460ae4e7d261d85906baa14c37cf67ca9cc34a30b",
+      "unary_wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQD+zpMWHWXwUkUiEmsveDUFNf102FB4ZADaRt1Dp0ngvnLxCNXUylwFXL6dkYK5OfSYdhZBrqhTDfPZ8qcw0ows=",
+      "unary_wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a403fb3a4c587597c149148849acbde0d414d7f5d36141e19003691b750e9d2782f9cbc423575329701572fa76460ae4e7d261d85906baa14c37cf67ca9cc34a30b",
+      "unary_wire_len": 740,
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQDe8QgGNW9ws11qgYMpJlGN08WLLabiUPc1ZqqE0MyQHaepgTW3inxwsLRUoi9ClzFSYTu97JVzNJYWh2L5Swg8CWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a4037bc42018d5bdc2cd75aa060ca49946374f162cb69b8943dcd59aaa13433240769ea604d6de29f1c2c2d15288bd0a5cc54984eef7b255ccd2585a1d8be52c20f025a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 773
+    },
+    {
+      "access": "owner_delegated",
+      "call_binding_sig_hex": "153145abe88ef463f1853d8a7c868bb1aa7169aa43ab57052a78ac62224ce3906ac235505358e6d9d26ccd999234a4ddac671bf6e5eab9bb3dabe44ec1d16d06",
+      "call_id": "42",
+      "expect": {
+        "decode": "ok",
+        "kind": 2,
+        "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "sig_domain_separated": true,
+        "verify": "ok"
+      },
+      "id": "opening.client_streaming.owner_delegated",
+      "kind": 2,
+      "kind_name": "client_streaming",
+      "pre_sig_prefix_hex": "9c0155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a00000000020000006b7923a2ef74d03c98d98051adfbc8c945b328e6ada6175cbef63c35601b71d2c91589fccca79b8da0f40115329f99a02c7a48e12b35a4ceb5a79c6ef1eb596e3f86d0b1e4e2a10bb90155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a00000000686039b5b67665cc77ac8fed25ba025ed3689b4667450beca97ac947f284fdc5edd1074d160b2c9cfcdf00f93c4b502f75eb9d2096c07490727f80d291efe3aad3c34eb131bc2b0a008080f889effd89af1a",
+      "proof_expires_at_unix_ns": "1900000000000000000",
+      "request_digest_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "roles": [
+        "caller_emits",
+        "provider_accepts"
+      ],
+      "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "unary_call_binding_sig_hex": "58ab95575de335048db4b7d4ea5244befe67ba5996d74fc2a2f1e8ce7eea729722b87d76b448a814ee4d5a712ed2cbb65139af20e34fb81f7100d64153d88501",
+      "unary_wire_base64": "nAFVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB6CapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAIAAABreSOi73TQPJjZgFGt+8jJRbMo5q2mF1y+9jw1YBtx0skVifzMp5uNoPQBFTKfmaAsekjhKzWkzrWnnG7x61luP4bQseTioQu5AVUVT0IGXqWhvqBUY4Jr4mhOuS35LBAAJ6q6rlfKVUIHoJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAaGA5tbZ2Zcx3rI/tJboCXtNom0ZnRQvsqXrJR/KE/cXt0QdNFgssnPzfAPk8S1AvdeudIJbAdJByf4DSke/jqtPDTrExvCsKAICA+Inv/YmvGkBYq5VXXeM1BI20t9TqUkS+/me6WZbXT8Ki8ejOfupylyK4fXa0SKgU7k1acS7Sy7ZROa8g40+4H3EA1kFT2IUB",
+      "unary_wire_hex": "9c0155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a00000000020000006b7923a2ef74d03c98d98051adfbc8c945b328e6ada6175cbef63c35601b71d2c91589fccca79b8da0f40115329f99a02c7a48e12b35a4ceb5a79c6ef1eb596e3f86d0b1e4e2a10bb90155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a00000000686039b5b67665cc77ac8fed25ba025ed3689b4667450beca97ac947f284fdc5edd1074d160b2c9cfcdf00f93c4b502f75eb9d2096c07490727f80d291efe3aad3c34eb131bc2b0a008080f889effd89af1a4058ab95575de335048db4b7d4ea5244befe67ba5996d74fc2a2f1e8ce7eea729722b87d76b448a814ee4d5a712ed2cbb65139af20e34fb81f7100d64153d88501",
+      "unary_wire_len": 420,
+      "wire_base64": "nAFVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB6CapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAIAAABreSOi73TQPJjZgFGt+8jJRbMo5q2mF1y+9jw1YBtx0skVifzMp5uNoPQBFTKfmaAsekjhKzWkzrWnnG7x61luP4bQseTioQu5AVUVT0IGXqWhvqBUY4Jr4mhOuS35LBAAJ6q6rlfKVUIHoJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAaGA5tbZ2Zcx3rI/tJboCXtNom0ZnRQvsqXrJR/KE/cXt0QdNFgssnPzfAPk8S1AvdeudIJbAdJByf4DSke/jqtPDTrExvCsKAICA+Inv/YmvGkAVMUWr6I70Y/GFPYp8houxqnFpqkOrVwUqeKxiIkzjkGrCNVBTWObZ0mzNmZI0pN2sZxv25eq5uz2r5E7B0W0GAlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpa",
+      "wire_hex": "9c0155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a00000000020000006b7923a2ef74d03c98d98051adfbc8c945b328e6ada6175cbef63c35601b71d2c91589fccca79b8da0f40115329f99a02c7a48e12b35a4ceb5a79c6ef1eb596e3f86d0b1e4e2a10bb90155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a00000000686039b5b67665cc77ac8fed25ba025ed3689b4667450beca97ac947f284fdc5edd1074d160b2c9cfcdf00f93c4b502f75eb9d2096c07490727f80d291efe3aad3c34eb131bc2b0a008080f889effd89af1a40153145abe88ef463f1853d8a7c868bb1aa7169aa43ab57052a78ac62224ce3906ac235505358e6d9d26ccd999234a4ddac671bf6e5eab9bb3dabe44ec1d16d06025a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 453
+    },
+    {
+      "access": "granted",
+      "call_binding_sig_hex": "4c5cd3807e782aff0a697712bb238c168c1c8a861a2272c2d82a2209a11c26873f0139e4653dee41b62a5647d766777e554d33d92291b8fccd6e4def08227d0e",
+      "call_id": "42",
+      "expect": {
+        "decode": "ok",
+        "kind": 3,
+        "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "sig_domain_separated": true,
+        "verify": "ok"
+      },
+      "id": "opening.duplex.granted",
+      "kind": 3,
+      "kind_name": "duplex",
+      "pre_sig_prefix_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a",
+      "proof_expires_at_unix_ns": "1900000000000000000",
+      "request_digest_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "roles": [
+        "caller_emits",
+        "provider_accepts"
+      ],
+      "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "unary_call_binding_sig_hex": "3fb3a4c587597c149148849acbde0d414d7f5d36141e19003691b750e9d2782f9cbc423575329701572fa76460ae4e7d261d85906baa14c37cf67ca9cc34a30b",
+      "unary_wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQD+zpMWHWXwUkUiEmsveDUFNf102FB4ZADaRt1Dp0ngvnLxCNXUylwFXL6dkYK5OfSYdhZBrqhTDfPZ8qcw0ows=",
+      "unary_wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a403fb3a4c587597c149148849acbde0d414d7f5d36141e19003691b750e9d2782f9cbc423575329701572fa76460ae4e7d261d85906baa14c37cf67ca9cc34a30b",
+      "unary_wire_len": 740,
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQExc04B+eCr/Cml3ErsjjBaMHIqGGiJywtgqIgmhHCaHPwE55GU97kG2KlZH12Z3flVNM9kikbj8zW5N7wgifQ4DWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a404c5cd3807e782aff0a697712bb238c168c1c8a861a2272c2d82a2209a11c26873f0139e4653dee41b62a5647d766777e554d33d92291b8fccd6e4def08227d0e035a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 773
+    },
+    {
+      "access": "owner_delegated",
+      "call_binding_sig_hex": "368ec990e77d25fdc37fbebd33f7f199cc2bce7a7fbd8606060637174940f690914a2a99308ace99015bca475d3e73ff36e5f39fb229964bfe34ccf12b52860e",
+      "call_id": "42",
+      "expect": {
+        "decode": "ok",
+        "kind": 3,
+        "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "sig_domain_separated": true,
+        "verify": "ok"
+      },
+      "id": "opening.duplex.owner_delegated",
+      "kind": 3,
+      "kind_name": "duplex",
+      "pre_sig_prefix_hex": "9c0155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a00000000020000006b7923a2ef74d03c98d98051adfbc8c945b328e6ada6175cbef63c35601b71d2c91589fccca79b8da0f40115329f99a02c7a48e12b35a4ceb5a79c6ef1eb596e3f86d0b1e4e2a10bb90155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a00000000686039b5b67665cc77ac8fed25ba025ed3689b4667450beca97ac947f284fdc5edd1074d160b2c9cfcdf00f93c4b502f75eb9d2096c07490727f80d291efe3aad3c34eb131bc2b0a008080f889effd89af1a",
+      "proof_expires_at_unix_ns": "1900000000000000000",
+      "request_digest_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "roles": [
+        "caller_emits",
+        "provider_accepts"
+      ],
+      "session_binding_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "unary_call_binding_sig_hex": "58ab95575de335048db4b7d4ea5244befe67ba5996d74fc2a2f1e8ce7eea729722b87d76b448a814ee4d5a712ed2cbb65139af20e34fb81f7100d64153d88501",
+      "unary_wire_base64": "nAFVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB6CapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAIAAABreSOi73TQPJjZgFGt+8jJRbMo5q2mF1y+9jw1YBtx0skVifzMp5uNoPQBFTKfmaAsekjhKzWkzrWnnG7x61luP4bQseTioQu5AVUVT0IGXqWhvqBUY4Jr4mhOuS35LBAAJ6q6rlfKVUIHoJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAaGA5tbZ2Zcx3rI/tJboCXtNom0ZnRQvsqXrJR/KE/cXt0QdNFgssnPzfAPk8S1AvdeudIJbAdJByf4DSke/jqtPDTrExvCsKAICA+Inv/YmvGkBYq5VXXeM1BI20t9TqUkS+/me6WZbXT8Ki8ejOfupylyK4fXa0SKgU7k1acS7Sy7ZROa8g40+4H3EA1kFT2IUB",
+      "unary_wire_hex": "9c0155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a00000000020000006b7923a2ef74d03c98d98051adfbc8c945b328e6ada6175cbef63c35601b71d2c91589fccca79b8da0f40115329f99a02c7a48e12b35a4ceb5a79c6ef1eb596e3f86d0b1e4e2a10bb90155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a00000000686039b5b67665cc77ac8fed25ba025ed3689b4667450beca97ac947f284fdc5edd1074d160b2c9cfcdf00f93c4b502f75eb9d2096c07490727f80d291efe3aad3c34eb131bc2b0a008080f889effd89af1a4058ab95575de335048db4b7d4ea5244befe67ba5996d74fc2a2f1e8ce7eea729722b87d76b448a814ee4d5a712ed2cbb65139af20e34fb81f7100d64153d88501",
+      "unary_wire_len": 420,
+      "wire_base64": "nAFVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB6CapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAIAAABreSOi73TQPJjZgFGt+8jJRbMo5q2mF1y+9jw1YBtx0skVifzMp5uNoPQBFTKfmaAsekjhKzWkzrWnnG7x61luP4bQseTioQu5AVUVT0IGXqWhvqBUY4Jr4mhOuS35LBAAJ6q6rlfKVUIHoJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAaGA5tbZ2Zcx3rI/tJboCXtNom0ZnRQvsqXrJR/KE/cXt0QdNFgssnPzfAPk8S1AvdeudIJbAdJByf4DSke/jqtPDTrExvCsKAICA+Inv/YmvGkA2jsmQ530l/cN/vr0z9/GZzCvOen+9hgYGBjcXSUD2kJFKKpkwis6ZAVvKR10+c/825fOfsimWS/40zPErUoYOA1paWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpa",
+      "wire_hex": "9c0155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a00000000020000006b7923a2ef74d03c98d98051adfbc8c945b328e6ada6175cbef63c35601b71d2c91589fccca79b8da0f40115329f99a02c7a48e12b35a4ceb5a79c6ef1eb596e3f86d0b1e4e2a10bb90155154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a00000000686039b5b67665cc77ac8fed25ba025ed3689b4667450beca97ac947f284fdc5edd1074d160b2c9cfcdf00f93c4b502f75eb9d2096c07490727f80d291efe3aad3c34eb131bc2b0a008080f889effd89af1a40368ec990e77d25fdc37fbebd33f7f199cc2bce7a7fbd8606060637174940f690914a2a99308ace99015bca475d3e73ff36e5f39fb229964bfe34ccf12b52860e035a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 453
+    }
+  ],
+  "prefix": "org:",
+  "scenarios": {
+    "mixed_pair": {
+      "chain": "gen_org_scenario (the X2 cross-org granted chain, same seeds as `ids`)",
+      "chunk_count": 3,
+      "chunks_hex": [
+        "010203f00d0a",
+        "7365636f6e64",
+        "00ff544849524421"
+      ],
+      "expect_handler": {
+        "acting_org_hex": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5",
+        "capability_hex": "96dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c209",
+        "entity_hex": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+        "is_same_org": false,
+        "provider_org_hex": "55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207"
+      },
+      "expect_terminal": "eof",
+      "granted_capability_tag": "nrpc:customer.read",
+      "id": "mixed_pair.go_caller_python_provider.server_streaming",
+      "request_hex": "5334562d73747265616d696e6d00ff01",
+      "roles": [
+        "go_caller",
+        "python_provider"
+      ],
+      "service": "customer.read",
+      "shape": "server_streaming"
+    }
+  },
+  "signature_rejects": [
+    {
+      "base": "opening.server_streaming.granted",
+      "base_wire_len": 773,
+      "expect_decode": "ok",
+      "expect_verify_error_display": "invalid signature",
+      "id": "reject.signature_flipped",
+      "mutation": "xor 0xFF over the first signature byte",
+      "roles": [
+        "provider_accepts"
+      ],
+      "wire_base64": "nAG8fLy1Y2N1+h2CQ01GZyTZI3f1O5gGld1J0m0M4SIFpaCapfR6Z1mAL/lV+NwtKhSlyZ0jvpf4ZBJ/+Tg0VaTwdeyzagAAAACF+rNqAAAAAAEAAADem9agpTVRSrlxfub4gzM4ehxUDuMxI5qXAGRSlSxc7WTWyiwvhpKviingqj38oGx2gSFiLbzyd4ApKA4Xyw6nTTCq851yrQq5Abx8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWloJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPABlt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgl17LNqAAAAAIX6s2oAAAAAOsKCvFfZz+lGDL0SxJT4/UUfOsXk3TjB7IwC8vWMnfgZ6zEQfuM7ks+WzZWPsWQ46YYGBHLOmLf5kyCeKvpJ9JsBEu2+bocGAb4CE5A95J5TeTF2IYjVkfUU7xlcDt8rPOn5K8tNDeSaBABVFU9CBl6lob6gVGOCa+JoTrkt+SwQACequq5XylVCB7x8vLVjY3X6HYJDTUZnJNkjd/U7mAaV3UnSbQzhIgWllt1rlHou1MQSn8ZjtSam/9lJVSHsV8dsYXtsx2sowgkCAAAAAdBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB17LNqAAAAAIX6s2oAAAAA2Cw8EcyKe2/QGl5OMxbgoBwU7QCBMohauOK79hxiEH4qJb6e7FnQQVgTozb88DHGpErc3X1aPBm632XFZe4R05fjnuF+cn0GgID4ie/9ia8aQCB02hCh3EgnEXykg32ZaULan+XNFaC1ofbZDlre8F4CUkvoKY4WDcOWc0ZU/ZU/FyoIcHTVXtOVKp8g4RpFawgBWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+      "wire_hex": "9c01bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f075ecb36a0000000085fab36a0000000001000000de9bd6a0a535514ab9717ee6f88333387a1c540ee331239a97006452952c5ced64d6ca2c2f8692af8a29e0aa3dfca06c768121622dbcf2778029280e17cb0ea74d30aaf39d72ad0ab901bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00196dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c20975ecb36a0000000085fab36a000000003ac282bc57d9cfe9460cbd12c494f8fd451f3ac5e4dd38c1ec8c02f2f58c9df819eb31107ee33b92cf96cd958fb16438e986060472ce98b7f993209e2afa49f49b0112edbe6e870601be0213903de49e537931762188d591f514ef195c0edf2b3ce9f92bcb4d0de49a040055154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a596dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c2090200000001d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075ecb36a0000000085fab36a00000000d82c3c11cc8a7b6fd01a5e4e3316e0a01c14ed008132885ab8e2bbf61c62107e2a25be9eec59d0415813a336fcf031c6a44adcdd7d5a3c19badf65c565ee11d397e39ee17e727d068080f889effd89af1a402074da10a1dc4827117ca4837d996942da9fe5cd15a0b5a1f6d90e5adef05e02524be8298e160dc396734654fd953f172a087074d55ed3952a9f20e11a456b08015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "wire_len": 773
+    }
+  ],
+  "version": 1
+}

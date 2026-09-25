@@ -18,6 +18,14 @@
 //! payloads = 18 bars is too many; we keep the discovery vs
 //! direct delta on one axis and the codec delta on the other.
 //!
+//! `org_unary_open` adds the ORG-ADMITTED unary shape (Stage 0
+//! slice 0.1 of `ORG_SCOPED_STREAMING_PLAN.md`). It reuses the raw
+//! codec and the same three payloads, so the delta against
+//! `nrpc_unary_codec/raw/<payload>` is the per-call opening cost of
+//! a protected call — proof mint + verify — with no codec term in
+//! it. The public groups above are the regression control and are
+//! measured on their own `Pair::new()` pair, untouched.
+//!
 //! Run with:
 //!   cargo bench --bench nrpc_unary --features net,cortex -p net-mesh-sdk
 
@@ -28,8 +36,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 mod nrpc_common;
 
 use nrpc_common::{
-    call_json_direct, call_json_discovery, call_postcard_direct, call_raw_direct, payload, runtime,
-    EchoReq, Pair,
+    call_json_direct, call_json_discovery, call_postcard_direct, call_protected_raw,
+    call_raw_direct, payload, runtime, EchoReq, Pair,
 };
 
 const PAYLOADS: &[(&str, usize)] = &[("empty", 0), ("32B", 32), ("1KiB", 1024)];
@@ -96,6 +104,26 @@ fn bench_unary(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("discovery", label), &req, |b, req| {
             b.to_async(&rt).iter(|| async {
                 let resp = call_json_discovery(&pair, req).await;
+                std::hint::black_box(resp);
+            });
+        });
+    }
+    group.finish();
+
+    // ---------- Org admission axis (raw codec, direct routing) ----------
+    //
+    // Built AFTER the public groups finish so the control bars above are
+    // measured with exactly the process state they had before this group
+    // existed: one pair, no authority, no second provider heartbeating.
+    let protected = rt.block_on(Pair::protected());
+    let mut group = c.benchmark_group("org_unary_open");
+    group.sample_size(50);
+    for &(label, size) in PAYLOADS {
+        group.throughput(Throughput::Elements(1));
+        let body = Bytes::copy_from_slice(payload(size).as_bytes());
+        group.bench_with_input(BenchmarkId::new("protected", label), &body, |b, body| {
+            b.to_async(&rt).iter(|| async {
+                let resp = call_protected_raw(&protected, body.clone()).await;
                 std::hint::black_box(resp);
             });
         });

@@ -40,6 +40,31 @@ reply = rpc.call(provider_node_id, "summarize", {"text": "…"}, {"deadline_ms":
 transparently when registered against `AsyncTypedMeshRpc`. `rpc.call_service(...)`
 resolves by service name through the capability index rather than pinning a node.
 
+### The protected variant
+
+Organization-scoped calls live on `net_sdk.org` and carry an admission proof. A
+caller binds once and uses the four verbs; a provider registers the matching shapes
+with `serve_org` (unary) or `serve_org_streaming` / `serve_org_client_stream` /
+`serve_org_duplex`:
+
+```python
+from net_sdk.org import OrgClient, serve_org_streaming
+
+org = OrgClient.bind(node, credentials)                  # bind once
+reply = org.call("summarize", request)                   # bytes in / bytes out
+stream = org.call_streaming("summarize", request, deadline_ms=500)
+call = org.call_client_stream("upload", deadline_ms=500)
+duplex = org.call_duplex("chat", deadline_ms=500)
+
+handle = serve_org_streaming(node, "summarize", "same_org", handler)
+```
+
+`deadline_ms=0` on the streaming verbs is the facade's own default, never "no
+deadline." An async caller uses `AsyncOrgClient`, which carries the same three
+streaming verbs — not the unary `call` — and a failure classifies through the
+`org:` vocabulary (`parse_org_error` / `classify_org_error`), not `RpcError`. See
+[Protected streaming](/docs/guides/protected-streaming).
+
 ### A request that will not decode
 
 A handler that cannot decode its request does not raise into your code. The caller

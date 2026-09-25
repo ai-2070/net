@@ -10,6 +10,8 @@ A **stream** is point-to-point + ordered (per stream) + credit-bounded + statefu
 
 They serve different shapes. Don't pick one because the API names look familiar.
 
+**A per-peer stream is not nRPC streaming.** This page is the credit-bounded point-to-point byte channel: one sender, one peer, a stream id you choose, and no return value. Request/response, server-streaming, client-streaming or duplex traffic *over a named service* is nRPC (`nrpc.md`) — typed chunks, deadlines, cancellation, and its own framing on the stream underneath. Its organization-protected variant is `org.md`, where the proof additionally fences the transport session. Reach for this page only when you are moving bytes directly to one peer.
+
 ---
 
 ## Bus vs Stream — the cheat sheet
@@ -228,16 +230,16 @@ loop {
 - `Mesh::recv_shard(shard_id, limit)` and `Mesh::recv(limit)` (shard-0 shortcut) are the receive surface (`net/crates/net/sdk/src/mesh.rs:460-470`).
 - These methods drain the **MeshNode's inbound shard buffer** — they're not stream-scoped. Inbound events from any peer / any stream land in the shards; you filter on the consumer.
 
-### TypeScript / Python — high-level SDK gap
+### TypeScript / Python — the receive surface
 
-The high-level `MeshNode` wrappers in `@net-mesh/sdk` and `net_sdk` (Python) **do not expose a receive API**. The TS SDK's `MeshNode` class (`sdk-ts/src/mesh.ts`) has no `recv` / `recvShard` method; the Python SDK's `MeshNode` class (`sdk-py/src/net_sdk/mesh.py`) has no `recv` / `poll` method. This is an ergonomic gap, not a capability gap.
+The high-level `MeshNode` wrappers differ in what they expose. The TS SDK's `MeshNode` class (`sdk-ts/src/mesh.ts`) now carries the full receive shape — `recv(limit)` merges every shard, `recvShard(shardId, limit)` targets one, and `numShards()` / `shardForStream(streamId)` answer which. The Python SDK's `MeshNode` class (`sdk-py/src/net_sdk/mesh.py`) still has no `recv` / `poll` method — an ergonomic gap there, not a capability gap.
 
-To receive on a stream from TS or Python, drop to the underlying napi / PyO3 binding, which now has the full shape:
+To receive on a stream from Python, drop to the underlying PyO3 binding, which has the full shape; the TS high-level methods delegate to the same napi shape:
 
-- **TypeScript:** `mesh._native.poll(limit)` drains **every** shard; `pollShard(shardId, limit)` targets one; `numShards()` and `shardForStream(streamId)` answer which.
+- **TypeScript:** `mesh.recv(limit)` drains **every** shard and `mesh.recvShard(shardId, limit)` targets one — the napi layer beneath is `_native.poll(limit)` / `pollShard(shardId, limit)`, with `numShards()` / `shardForStream(streamId)` answering which.
 - **Python:** `mesh._native.poll(limit)`, `poll_shard(shard_id, limit)`, `num_shards()`, `shard_for_stream(stream_id)` — same shape.
 
-Both `poll` methods used to read shard 0 only, so a TS or Python consumer could not receive most stream traffic at all at the default of four shards. Rust's `Mesh::recv` had the same body under an all-shards doc comment.
+Both underlying `poll` methods used to read shard 0 only, so a TS or Python consumer could not receive most stream traffic at all at the default of four shards. Rust's `Mesh::recv` had the same body under an all-shards doc comment.
 
 Streams do not have an async-iterator shape on any SDK. Loop the poll yourself.
 
@@ -333,13 +335,15 @@ Credit-grant math: `5 MB / 64 KB ≈ 80` round trips, each a `StreamWindow` pack
 - **`BackpressureError` / `NotConnectedError` are stream-only.** Bus `emit` / `publish` never throws them. Seeing them anywhere else means a wrong call site.
 - **Don't share a `stream_id` across peers.** `(peer_A, 7)` and `(peer_B, 7)` are distinct streams by design. No global stream namespace.
 - **Don't reuse stale handles after close + reopen.** Reopen the handle. The epoch guard fails closed with `NotConnected`.
-- **Don't expect receive in TS / Python via the high-level SDK.** Drop to `mesh._native.poll(limit)` (single shard) until a wrapper lands. Rust has `Mesh::recv_shard` / `Mesh::recv`.
+- **Don't assume both high-level SDKs expose receive.** The TS `MeshNode` now does (`recv` / `recvShard`); the Python `MeshNode` still does not — drop to `mesh._native.poll(limit)`, which merges every shard, plus `poll_shard` for a single one. Rust has `Mesh::recv_shard` / `Mesh::recv`.
 - **Don't pass `windowBytes: 0` casually.** It disables backpressure on that stream — escape hatch for tiny control channels, dangerous for bulk transfer.
 
 ---
 
 ## Cross-references
 
+- `nrpc.md` — request/response and the three streaming shapes *over a service*; a per-peer stream is the byte channel underneath, not the RPC surface.
+- `org.md` — the organization-protected variant of nRPC streaming, whose opening proof binds the receiving Noise session.
 - `apis.md` § Cross-SDK gotchas — `BackpressureError` / `NotConnectedError` are mesh-stream-only. Same line; keep consistent if you edit either file.
 - `runtime.md` § Errors — bus-side error matrix, including the bus's separate `Backpressure` semantics under `FailProducer`.
 - `runtime.md` § Per-SDK shutdown — streams ride on `MeshNode`; closing the mesh closes all streams it owns.

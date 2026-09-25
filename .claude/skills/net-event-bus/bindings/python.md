@@ -108,6 +108,30 @@ becomes `except Exception`. `error-codes.md` has the full hierarchy.
 The context manager handles it. Without `with`, call the shutdown method
 explicitly — process exit is not enough.
 
+Dropping a mesh runtime while holding the GIL, or from inside an async context,
+now **detaches** instead of deadlocking the interpreter — a wedge no other
+Python thread could break.
+
+## Protected services (org)
+
+The **native wheel** carries the org call surface: both `OrgClient` (sync) and
+`AsyncOrgClient` (async) expose the streaming verbs `call_streaming` /
+`call_client_stream` / `call_duplex`; the unary `call` / `call_exported` (and
+`reserve_cancel_token` / `cancel`) are on the **sync** client only. The
+**pure-Python** `net.org.TypedOrgClient` is **unary-only** — for a streaming
+shape reach the wheel's client directly. Provider verbs: `serve_org` /
+`serve_org_streaming` / `serve_org_client_stream` / `serve_org_duplex`. On the
+three streaming verbs an unset deadline is the facade's **300 s**
+protected-call lifetime, never "no deadline"; unary `call` takes no deadline
+at all.
+
+The org error family is **distinct from nRPC's `RpcError`**: a base `OrgError`
+with four subclasses — `OrgCredentialsError`, `OrgDiscoveryError`,
+`OrgAdmissionDeniedError`, `OrgUnclassifiedError` — and the `net.org` helpers
+`parse_org_error` / `classify_org_error`, which recover the
+`org:<domain>:<kind>` wire. An `except RpcError` clause does not catch an org
+failure. Full contract: `org.md`.
+
 ## Gaps
 
 `bindings/coverage.md` is authoritative. Compute/groups and Redis dedup are

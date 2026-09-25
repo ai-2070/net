@@ -67,8 +67,13 @@ The checks run in a fixed order, and the order is the security argument:
 ```text
 1. mode is org-protected           (Public routes elsewhere)
 2. exactly one admission header    (0 or >1 → deny)
-3. proof decodes                   (malformed → deny)
-4. call is unary                   (streaming → distinct deny)
+3. proof decodes                   (malformed → deny; a streaming
+                                    registration requires the FULL
+                                    streaming proof value)
+4. shape is coherent               (unary registration + streaming flags →
+                                    NotSupported; streaming registration +
+                                    flags ≠ registered shape, or proof kind
+                                    ≠ shape → Denied)
 5. TOFU member binding             (proof caller == channel peer)
 6. mode checks                     (owner / cross-org shape)
 7. dispatcher grant checks         (acts-for org, capability)
@@ -109,6 +114,14 @@ The fix is deliberately minimal: one small atomic local file of merged maxima
 (`revocation-state.json`), not the deferred WAL/replication system. Types:
 `OrgRevocationStore`, `OrgRevocationState`, `OrgRevocationError`.
 
+**Explicit limitation (grant revocation).** Floors cover **membership
+certificates only**. Cross-org capability grants and dispatcher grants have no
+floor mechanism, so their revocation is **not** actively enforced while a call
+runs: what bounds a granted call is the grant's `not_after` (clamped into the
+call's effective deadline) and the provider policy at opening. A grant revoked
+mid-call therefore stops at its validity end or the next opening — never in
+flight. This is a documented limitation, not continuous enforcement.
+
 ## Routing
 
 `org_routing.rs` is the sole consumer of the **global** private-discovery
@@ -121,14 +134,57 @@ Faults are explicit rather than swallowed, because production builds abort on
 panic. `org_routing_registry.rs` and `org_grant_registry.rs` hold the lookup
 tables; `org_admission_replay.rs` guards replay.
 
-## The two verbs
+## The verbs
 
-Across Rust, Node, Python, Go and C the surface is two calls:
+Across Rust, Node, Python, Go and C the surface is one bind and four call
+shapes, each with its provider verb:
 
 ```rust
-mesh.org(credentials).call(..)                                   // caller
-mesh.serve_org(service, OrgAccess::{SameOrg, Granted}, handler)  // provider
+let org = mesh.org(credentials)?;                                 // bind
+org.call(service, &req).await?;                                   // unary
+org.call_streaming(service, &req).await?;                         // server-streaming
+org.call_client_stream(service).await?;                           // client-streaming
+org.call_duplex(service).await?;                                  // duplex
+
+mesh.serve_org(service, OrgAccess::{SameOrg, Granted}, handler)?;           // unary
+mesh.serve_org_streaming(service, access, handler)?;                        // server-streaming
+mesh.serve_org_client_stream(service, access, handler)?;                    // client-streaming
+mesh.serve_org_duplex(service, access, handler)?;                           // duplex
 ```
+
+Every shape runs the same admission order above (the streaming proof kinds
+and the session fence included) and every handle surfaces the same frozen
+error vocabulary item by item: an opening refusal is
+`AdmissionDenied(coarse)` — the stream's terminal item on server-streaming /
+duplex, `finish()`'s error on client-streaming (lazy opening), the call verb's
+error on unary; a stream's call verb fails only on local opening-stage errors,
+nothing sent — a midstream revocation is the stream's final
+`AdmissionDenied(Denied)`, and deadline/cancel retirement is
+`Rpc(Timeout)`/`Rpc(Cancelled)` on every handle: one deterministic variant per
+retirement cause at each terminal seam (the stream's final item, a
+client-streaming `finish()`, the unary verb). The classification never
+manufactures a typed variant from a wire status — a genuine remote
+`ServerError` passes through verbatim. Dropping a stream handle emits exactly one
+CANCEL; the streaming call handles are `OrgStream` (typed), `OrgStreamRaw`
+(bytes), `OrgClientStreamCall` (`send`/`finish`) and `OrgDuplexCall` (`send`,
+`finish_sending`, `into_split`, `Stream`).
+
+**The deadline rule (Owner Q1).** The binding seams (`call_bytes_deadline`,
+`call_streaming_bytes_deadline`, `call_client_stream_bytes_deadline`,
+`call_duplex_bytes_deadline`) carry `deadline_ms` and a pre-reserved
+`cancel_token` — neither is an authorization input. `deadline_ms == 0` is the
+facade's default protected lifetime, **300 s**, and never "no deadline": a
+protected call's lifetime is finite by contract (an explicit request beyond
+the provider's 3600 s cap is refused at opening). `cancel_token == 0` means
+uncancellable.
+
+The raw byte rows (`call_*_bytes*`, `serve_org_*_bytes(_node)`) exist for
+language bindings: a typed verb is its byte row plus JSON, one dispatch path
+per shape. The provider's trivial proof policy (`|_| true`) keeps the
+application veto at the low-level protected serve API. At the core seam the
+same shapes ride `serve_rpc_{owner_scoped,granted}_{streaming,client_stream,duplex}`
+with the streaming proofs and `DirectOnly` response routing (never the reply
+channel's roster).
 
 Errors use a frozen `org:<domain>:<kind>` vocabulary so a denial means the same
 thing in every binding. CLI provisioning is `net org keygen` / `issue-cert` /

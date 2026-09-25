@@ -443,18 +443,24 @@ fn run_org_gates(
     let header = proof.encode().expect("encode proof");
     let headers: Vec<&[u8]> = if omit_header { vec![] } else { vec![&header] };
 
-    let ctx = AdmissionContext {
+    // C3 (Q7 named break): `AdmissionContext` is `#[non_exhaustive]` —
+    // external literals are replaced by the stable constructor. This row
+    // runner is a unary call (no streaming flags, no session binding).
+    let ctx = AdmissionContext::new(
         mode,
-        authenticated_caller: &caller_entity,
-        provider: &facts.provider,
-        provider_owner_org: facts.provider_owner_org,
+        &caller_entity,
+        &facts.provider,
+        facts.provider_owner_org,
         invoked_capability,
         call_id,
         request_digest,
-        is_unary: true,
-        floors: &facts.floors,
-        skew_secs: facts.skew_secs,
-    };
+        net::adapter::net::behavior::org_call::RpcCallShape::Unary,
+        false,
+        false,
+        None,
+        &facts.floors,
+        facts.skew_secs,
+    );
 
     let replay =
         AdmissionReplayGuard::try_new(AdmissionReplayConfig::default()).expect("replay guard");

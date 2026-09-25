@@ -28,7 +28,7 @@ try {
   cargo build --release --target wasm32-unknown-unknown
   if ($LASTEXITCODE -ne 0) { throw 'cargo build (leaf, wasm32) failed' }
   wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/net_leaf.wasm
-  if ($LASTEXITCODE -ne 0) { throw 'wasm-bindgen failed — install wasm-bindgen-cli 0.2.128' }
+  if ($LASTEXITCODE -ne 0) { throw 'wasm-bindgen failed — install wasm-bindgen-cli 0.2.129' }
 } finally { Pop-Location }
 
 Step '@net-mesh/browser'

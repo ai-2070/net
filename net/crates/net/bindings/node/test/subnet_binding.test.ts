@@ -111,14 +111,14 @@ describe.skipIf(!HAS_SUBNET)('subnet authority through the napi boundary', () =>
         expect.unreachable('garbage credential bytes must refuse')
       } catch (e) {
         expect(e).toBeInstanceOf(SubnetProvisionError)
-        expect((e as SubnetProvisionError).kind).toBe('invalid_format')
+        expect((e as InstanceType<typeof SubnetProvisionError>).kind).toBe('invalid_format')
       }
       try {
         admin.applyControlFact(mesh, garbage)
         expect.unreachable('garbage fact bytes must refuse')
       } catch (e) {
         expect(e).toBeInstanceOf(SubnetProvisionError)
-        expect((e as SubnetProvisionError).kind).toBe('invalid_format')
+        expect((e as InstanceType<typeof SubnetProvisionError>).kind).toBe('invalid_format')
       }
       // A well-formed boundary declaration is accepted (it is wholesale
       // and infallible after DTO conversion).
@@ -154,7 +154,7 @@ describe.skipIf(!HAS_SUBNET)('subnet authority through the napi boundary', () =>
       } catch (e) {
         const classified = classifySubnetError(e)
         expect(classified).toBeInstanceOf(SubnetProvisionError)
-        expect((classified as SubnetProvisionError).kind).toBe('unknown_export_name')
+        expect((classified as InstanceType<typeof SubnetProvisionError>).kind).toBe('unknown_export_name')
         // The wrap is genuinely present — this is the embedded-envelope
         // shape, not a message that happens to lead with the token.
         expect(String((e as Error).message)).not.toMatch(/^subnet:/)
@@ -167,7 +167,7 @@ describe.skipIf(!HAS_SUBNET)('subnet authority through the napi boundary', () =>
         expect.unreachable('an unknown export name must be refused')
       } catch (e) {
         expect(e).toBeInstanceOf(SubnetProvisionError)
-        expect((e as SubnetProvisionError).kind).toBe('unknown_export_name')
+        expect((e as InstanceType<typeof SubnetProvisionError>).kind).toBe('unknown_export_name')
       }
 
       // Known name: resolution succeeds and the CORE refusal (no org

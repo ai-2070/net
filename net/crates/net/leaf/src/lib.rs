@@ -66,11 +66,22 @@ pub mod leader_session;
 #[cfg(feature = "mock-control-plane")]
 pub mod mock_control_plane;
 pub mod node;
+/// The org proof and admission authority (OA-1/OA-2), ported from
+/// the core `behavior/{org,org_grant,org_call,org_admission}`
+/// modules: membership certs, dispatcher/capability grants, the
+/// per-call binding proofs and the ordered admission engine —
+/// tokio-free and wasm32-clean. Every clock read and every random
+/// byte is a caller-supplied parameter (no `SystemTime`, no
+/// `getrandom`, no abort), and revocation arrives as fed facts
+/// rather than a filesystem store.
+pub mod org;
 /// The network-change re-attempt owner's policy: one owner, one
 /// absolute deadline, one re-attempt per network change. Native, so
 /// the rule is assertable without a browser.
 pub mod retry;
 pub mod rpc;
+pub mod rpc_serve;
+pub mod rpc_stream;
 pub mod rpc_wire;
 /// Which open stream a proxy caller's handle owns. Native, so the
 /// addressing rule is assertable without a browser — and shared by
@@ -106,8 +117,8 @@ pub use announce::{AnnouncementStore, VerifiedAnnouncement};
 pub use channel::Channel;
 pub use clock::Deadline;
 pub use control_plane::{
-    BootstrapAccepted, ControlEvent, ControlPlane, DialogId, IceCandidate, NodeId, Sdp,
-    SignalEnvelope, SignalKind, SignedAnnouncement,
+    BootstrapAccepted, ControlEvent, ControlPlane, DialogId, IceCandidate, NodeId,
+    RevocationBundle, Sdp, SignalEnvelope, SignalKind, SignedAnnouncement,
 };
 pub use counters::{DropReason, LeafCounters};
 pub use dispatch::{Decoded, Subprotocol};

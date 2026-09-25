@@ -188,6 +188,183 @@ export interface LeafWasmProxyStream {
 /** Either stream object, since the wrapper serves both. */
 export type LeafWasmStreamLike = LeafWasmStream | LeafWasmProxyStream;
 
+// ── Organization-scoped streaming (plan §4.5) ────────────────────────────
+//
+// The eight org verbs and their handles, at the Rust shape. All u64s
+// that carry identity cross as exact decimal strings (the crate's
+// rule) — `LeafWasmOrgTerminalError.generation` is the one on this
+// surface.
+
+/**
+ * The caller attribution one handler invocation receives: the crate's
+ * `to_json` JSON **string** (the `on_event` convention), camelCase
+ * keys verbatim {@link OrgCaller}'s, `entity` as 64 hex digits. Parsed
+ * once in the wrapper by {@link parseOrgCaller}.
+ */
+export type LeafWasmOrgCaller = string;
+
+/** The credential set one org call presents. Byte fields must be real `Uint8Array`s. */
+export interface LeafWasmOrgCredentials {
+  /** The caller's membership certificate, its 156-byte wire form. */
+  membership: Uint8Array;
+  /** The dispatcher grant, its wire form. */
+  dispatcher: Uint8Array;
+  /** The capability grant, its wire form, when the call carries one. */
+  capabilityGrant?: Uint8Array;
+  /** The org the caller acts as. */
+  actingOrg: string;
+  /** The org that owns the provider. */
+  providerOwnerOrg: string;
+  /** The provider, exactly as the call addresses it. */
+  provider: string;
+  /** Proof freshness bound, seconds. */
+  proofTtlSecs?: number;
+}
+
+/** `call_org*`'s options object. */
+export interface LeafWasmOrgCallOptions {
+  credentials: LeafWasmOrgCredentials;
+  /**
+   * The call's deadline, milliseconds.
+   */
+  deadlineMs?: number;
+  /**
+   * Initial response-direction flow-control window, **chunk
+   * credits** — one credit permits one item frame (the wire header's
+   * unit). NOT bytes.
+   */
+  streamWindowInitial?: number;
+  /**
+   * Initial request-direction flow-control window, **chunk credits**
+   * (as {@link LeafWasmOrgCallOptions.streamWindowInitial}).
+   */
+  requestWindowInitial?: number;
+}
+
+/** `serve_org*`'s options object. */
+export interface LeafWasmOrgServeOptions {
+  /** The org that owns the provider side of every admitted call. */
+  ownerOrg: string;
+}
+
+/**
+ * Which authority admits a served call: `'same-org'` (owner-org
+ * traffic only) or `'granted'` (capability grants too). Anything else
+ * is a loud refusal at registration.
+ */
+export type LeafWasmOrgAccess = 'same-org' | 'granted';
+
+/**
+ * One terminal item's typed error, exactly as it crosses: the frozen
+ * `kind` vocabulary plus its fields. `message` is the Display text,
+ * verbatim.
+ */
+export interface LeafWasmOrgTerminalError {
+  kind: string;
+  message?: string;
+  coarse?: string;
+  /** Exact decimal u64 — never a JS number. */
+  generation?: string;
+  status?: number;
+  deadlineMs?: number;
+}
+
+/**
+ * What `OrgByteStreamHandle.next()` resolves — the leaf's three item
+ * objects (`org_stream_item` / `org_stream_end` /
+ * `org_stream_end_value` / `org_stream_end_error` in
+ * `leaf/src/wasm.rs`), verbatim. The `done` arm carries `value` when
+ * the terminal carries a final body (the completion frame's non-empty
+ * body): `{ done: true, value }`, never both `value` and `error`.
+ */
+export type LeafWasmOrgByteItem =
+  | { done: false; value: Uint8Array }
+  | { done: true; value?: Uint8Array; error?: LeafWasmOrgTerminalError };
+
+/**
+ * What `OrgRequestStreamHandle.next()` resolves. No error arm: a
+ * handler-side request stream's termination is observed ONLY through
+ * `retired()`.
+ */
+export type LeafWasmOrgRequestItem = { done: false; value: Uint8Array } | { done: true; value?: undefined };
+
+/** The response half of an org call, as a raw handle. */
+export interface LeafWasmOrgByteStreamHandle {
+  next(): Promise<LeafWasmOrgByteItem>;
+  /** Drop this caller handle: at most one CANCEL leaves per handle. */
+  cancel(): void;
+}
+
+/** A client-streaming upload, as a raw handle. */
+export interface LeafWasmOrgUploadCallHandle {
+  send(payload: Uint8Array): Promise<void>;
+  finish(): Promise<Uint8Array>;
+  cancel(): void;
+}
+
+/**
+ * A duplex call, as a raw handle: the sink verbs are inline (the
+ * caller-side sink has `finish_sending`/`cancel` and NO `retired` —
+ * it differs from the serve-side {@link LeafWasmOrgResponseSinkHandle},
+ * which has `close`/`retired` and no `finish_sending`).
+ */
+export interface LeafWasmOrgDuplexCallHandle {
+  send(payload: Uint8Array): Promise<void>;
+  finish_sending(): Promise<void>;
+  cancel(): void;
+  stream(): LeafWasmOrgByteStreamHandle;
+}
+
+/** The response sink a streaming/duplex **handler** receives. */
+export interface LeafWasmOrgResponseSinkHandle {
+  send(payload: Uint8Array): Promise<void>;
+  close(): Promise<void>;
+  /** Resolves with exactly one of the seven retire verdict strings. */
+  retired(): Promise<string>;
+}
+
+/** The request stream a client-streaming/duplex **handler** receives. */
+export interface LeafWasmOrgRequestStreamHandle {
+  next(): Promise<LeafWasmOrgRequestItem>;
+  /** Resolves with exactly one of the seven retire verdict strings. */
+  retired(): Promise<string>;
+}
+
+/** One serve registration, as a raw handle. */
+export interface LeafWasmOrgServeHandle {
+  service(): string;
+  /**
+   * Unregister AND retire: every live protected call this
+   * registration admitted is retired with its exact terminal, and new
+   * openings on the service are refused. NOT the public path's
+   * let-existing-calls-finish behavior.
+   */
+  close(): void;
+}
+
+/** The trampoline `serve_org` hands the leaf for one unary call. */
+export type LeafWasmOrgUnaryHandler = (
+  caller: LeafWasmOrgCaller,
+  request: Uint8Array,
+) => Promise<Uint8Array>;
+/** The trampoline `serve_org_streaming` hands the leaf. */
+export type LeafWasmOrgStreamingHandler = (
+  caller: LeafWasmOrgCaller,
+  request: Uint8Array,
+  sink: LeafWasmOrgResponseSinkHandle,
+) => Promise<void>;
+/** The trampoline `serve_org_client_stream` hands the leaf. */
+export type LeafWasmOrgClientStreamHandler = (
+  caller: LeafWasmOrgCaller,
+  requests: LeafWasmOrgRequestStreamHandle,
+) => Promise<Uint8Array>;
+/** The trampoline `serve_org_duplex` hands the leaf. */
+export type LeafWasmOrgDuplexHandler = (
+  caller: LeafWasmOrgCaller,
+  requests: LeafWasmOrgRequestStreamHandle,
+  sink: LeafWasmOrgResponseSinkHandle,
+) => Promise<void>;
+
 /** The node object `LeafNode.connect` resolves to. */
 export interface LeafWasmNode {
   node_id_hex(): string;
@@ -213,6 +390,56 @@ export interface LeafWasmNode {
    */
   is_enrolled(): boolean;
   call(service: string, payload: Uint8Array, timeout_ms?: number): Promise<Uint8Array>;
+  // ── The eight org verbs (plan §4.5) ──
+  //
+  // Identical names on `LeafWasmSession`; u64 identity (an error
+  // item's `generation`) crosses as an exact decimal string. The
+  // three stream openers reject on an opening denial
+  // (`AdmissionDenied(coarse)`), which is the §4.3 rule that an
+  // opening denial is a rejection, never a terminal item.
+  call_org(service: string, payload: Uint8Array, options: LeafWasmOrgCallOptions): Promise<Uint8Array>;
+  call_org_streaming(
+    service: string,
+    payload: Uint8Array,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgByteStreamHandle>;
+  call_org_client_stream(
+    service: string,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgUploadCallHandle>;
+  call_org_duplex(
+    service: string,
+    options: LeafWasmOrgCallOptions,
+  ): Promise<LeafWasmOrgDuplexCallHandle>;
+  /**
+   * Serve the four shapes. The handler is invoked with `(caller,
+   * request[, requests][, sink])` per shape and returns a promise the
+   * leaf awaits; a rejection is the typed refusal text.
+   */
+  serve_org(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgUnaryHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle;
+  serve_org_streaming(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgStreamingHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle;
+  serve_org_client_stream(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgClientStreamHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle;
+  serve_org_duplex(
+    service: string,
+    access: LeafWasmOrgAccess,
+    handler: LeafWasmOrgDuplexHandler,
+    options: LeafWasmOrgServeOptions,
+  ): LeafWasmOrgServeHandle;
   subscribe(channel: string): Promise<void>;
   publish(channel: string, payload: Uint8Array): Promise<void>;
   /**

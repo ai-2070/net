@@ -20,7 +20,7 @@ crate-type = ["cdylib"]
 net-mesh-wire = { path = "../../../wire" }
 # Pinned to the installed `wasm-bindgen-cli`; a mismatch is a hard
 # error at bindgen time.
-wasm-bindgen = "=0.2.128"
+wasm-bindgen = "=0.2.129"
 bytes = "1"
 
 [profile.release]
