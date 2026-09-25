@@ -74,24 +74,22 @@ and local-first collaboration. Built end to end:
 
 ## Setting up your own mesh
 
-**Two machines, a few commands.** The operator runs one long-lived node and hands out a join
-link; the device redeems it and runs its own node. `up` generates and keeps the mesh PSK on first
-start, so no secret is copied by hand.
+**A few commands, two machines.** One machine runs a node and hands out a join link. The other
+uses the link and runs its own node. `up` makes the mesh key for you, so nothing secret is copied
+by hand.
 
 ```bash
 npm install -g @net-mesh/cli                   # installs the `net-mesh` binary
 
-net-mesh up --enroll                           # operator: one long-lived node, foreground
-net-mesh invite create                         # prints a `netmesh-join_` token — a bearer secret
-net-mesh join <TOKEN> --yes && net-mesh up     # device: redeem the link, then run as it
+net-mesh up --enroll                           # operator: runs the node, stays in the foreground
+net-mesh invite create                         # prints a `netmesh-join_` token — keep it secret
+net-mesh join <TOKEN> --yes && net-mesh up     # device: use the link, then run its own node
 ```
 
-The device redeems any of these with the same `join` + `up`, and while its `up` is stopped it can
-run a provider or consumer as itself with `wrap --joined <state-dir>` or
-`mcp serve --joined <state-dir>`.
+The device uses the same `join` and `up` for any link. While its node is stopped, it can serve or
+call tools as itself with `wrap --joined <state-dir>` or `mcp serve --joined <state-dir>`.
 
-**A channel on the link** — delegate issuance offline, start the node with the grant, gate it, then
-carry it:
+**Adding a channel.** Sign a grant offline, give it to the node, then put the channel on a link:
 
 ```bash
 net-mesh identity generate --out channel-root.toml
@@ -102,23 +100,21 @@ net-mesh channel serve fleet.telemetry --token-root <CHANNEL_ROOT_HEX>
 net-mesh invite create --channel fleet.telemetry --channel-rights subscribe
 ```
 
-**An org on the link** — the root stays offline; the link is approved with it:
+**Adding an org.** The org key stays offline; you approve the link with it:
 
 ```bash
 net-mesh org keygen --out org.toml
 net-mesh org audience-keygen --org-key org.toml --out audience.key
-net-mesh invite create --org <ORG_HEX>                    # always approval-gated
+net-mesh invite create --org <ORG_HEX>                    # a link needs approval first
 net-mesh org approve <OFFER_ID> --subject <DEVICE_HEX> --org-key org.toml --audience audience.key
 ```
 
-**What the mesh is — and its limits.** One profile is one node, and one mesh is one flat trust
-domain: the PSK is a membership secret, so a joined device can open a session with any peer. The
-join link is mesh-wide, not a scoped slice — subnet, org and channel decide what a session may do,
-not the transport. Links are minted by the operator's running `up --enroll` node, so if that node
-is down, existing members keep working but no new device can enroll. Nothing caps the mesh but the
-PSK distribution and a reachable relay: there is no registry or leader, and every device that
-cannot be reached directly falls back to the relay host you run — a shared availability and
-latency point.
+**What a mesh is, and what it can't do.** One profile is one node, and a mesh shares one key:
+anyone who joins can open a session with anyone else. A join link is not a slice of the mesh —
+subnet, org and channel rules decide what a session can do. Only the operator's running node makes
+links, so if it stops, no new device can join, though the ones already in keep working. Nothing
+limits the size but the key you hand out and a relay that's reachable. There is no registry or
+leader, and any device that can't be reached directly falls back to the relay you run.
 [CLI reference](https://ai2070.net/docs/reference/cli),
 [Enrollment journey](https://github.com/ai-2070/net/blob/master/net/crates/net/cli/tests/fixtures/enrollment/README.md).
 
