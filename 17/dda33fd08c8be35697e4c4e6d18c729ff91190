@@ -1,0 +1,16 @@
+web/src/content/docs/tutorials/distributed-daemon.md
+  h_64425bc75e3f3d 18-20,35
+web/src/content/docs/tutorials/event-sourced-service.md
+  h_64425bc75e3f3d 19-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "17dda33fd08c8be35697e4c4e6d18c729ff91190",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
