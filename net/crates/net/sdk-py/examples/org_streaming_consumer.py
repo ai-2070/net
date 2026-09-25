@@ -580,11 +580,14 @@ def cell_cancel(sc: _Scenario) -> dict:
     1. Caller side: the awaiting task raises ``asyncio.CancelledError``
        promptly (the bridge drops the pull and fires ``mesh.cancel(token)``).
     2. Substrate side, LOCAL: the per-stream cancel watcher tears the call's
-       pending entry down, so the response side EOFs — observed here as the
-       ``async for`` ending — **while the caller handle is still alive**.
-       This is the link that discriminates the cancel-token path from
-       ordinary teardown: with no token threaded the drain would park until
-       the 120 s call deadline.
+       pending entry down, so the response side terminates — observed here
+       as the ``async for`` raising the TYPED cancellation terminal
+       ``org:rpc:cancelled`` (the repair pass's documented typed terminal
+       vocabulary: a cancel ends a fold with the typed error through the
+       ``org_err_to_py`` mirror, never a swallowed clean end) — **while the
+       caller handle is still alive**. This is the link that discriminates
+       the cancel-token path from ordinary teardown: with no token threaded
+       the drain would park until the 120 s call deadline.
     3. Provider side: retirement is observable as the handler's request
        input fencing to EOF (its ``for chunk in stream:`` ends with NO final
        item and no exception) — the shape's library-controlled input, closed
@@ -662,9 +665,28 @@ def cell_cancel(sc: _Scenario) -> dict:
                         pass
 
                 # The token watcher already closed the call's response side;
-                # this drain ends immediately. Without the cancel token it
-                # would park until the 120 s deadline (bounded out at 5 s).
-                await asyncio.wait_for(_drain(), 5)
+                # this drain ends immediately — as the TYPED cancellation
+                # terminal `org:rpc:cancelled` (the repair pass's documented
+                # typed terminal vocabulary: never a swallowed clean end).
+                # Without the cancel token it would park until the 120 s
+                # deadline (bounded out at 5 s). DELIBERATE CONTRACT UPDATE
+                # (owner Q1): this pin was a clean `async for` end before the
+                # typed vocabulary landed. The org-vocabulary assertions
+                # mirror `cell_midstream`'s.
+                with _raises() as ei2:
+                    await asyncio.wait_for(_drain(), 5)
+                exc2 = ei2.value
+                assert isinstance(exc2, org.OrgError), (
+                    "a cancelled org handle must surface the mirrored org: "
+                    f"vocabulary, got {type(exc2).__name__}: {exc2}"
+                )
+                assert not isinstance(exc2, org.OrgAdmissionDeniedError), (
+                    "cancellation is `org:rpc:cancelled`, never an admission "
+                    f"denial: {exc2}"
+                )
+                parsed2 = org.parse_org_error(str(exc2))
+                assert parsed2.domain == "rpc", parsed2
+                assert str(exc2).startswith("org:rpc:cancelled"), str(exc2)
 
                 # ---- link 3 rides the handle's close()/drop ----
                 call.close()  # per-shape Drop publishes the wire CANCEL
@@ -681,7 +703,11 @@ def cell_cancel(sc: _Scenario) -> dict:
         finally:
             client.close()
             handle.close()
-        return {"link1": "CancelledError", "link2": "drain_ended", "link3": "input_eof"}
+        return {
+            "link1": "CancelledError",
+            "link2": "drain_ended:org:rpc:cancelled",
+            "link3": "input_eof",
+        }
 
 
 class _raises:

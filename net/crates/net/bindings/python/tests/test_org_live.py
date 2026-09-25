@@ -51,6 +51,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -60,14 +61,61 @@ import pytest
 
 net = pytest.importorskip("net", reason="net wheel not built")
 
-if not hasattr(net, "install_org_authority"):
-    pytest.skip("net built without the org feature", allow_module_level=True)
+# The 15 org-feature names (`net/__init__.py`'s org block) — verified
+# ONE BY ONE against the NATIVE module and the facade, never as one
+# unit: that block binds all 15 under ONE `try`/`except ImportError`, so
+# a wheel missing one S4 verb can end up with NO org names bound on the
+# facade (CPython binds `from ... import (...)` names incrementally and
+# `except ImportError: pass` swallows the rest) — the all-or-nothing
+# import cannot tell "org feature absent" from "stale build" (PY-1).
+_ORG_NAMES = (
+    "AsyncOrgClient",
+    "OrgAdmissionDeniedError",
+    "OrgClient",
+    "OrgCredentials",
+    "OrgCredentialsError",
+    "OrgDiscoveryError",
+    "OrgError",
+    "OrgServeHandle",
+    "OrgUnclassifiedError",
+    "install_org_authority",
+    "install_provider_grant_audience",
+    "serve_org",
+    "serve_org_client_stream",
+    "serve_org_duplex",
+    "serve_org_streaming",
+)
 
-# The S4 surface is the subject of these witnesses: a wheel without it must
-# FAIL LOUDLY, not skip (a skip would make every witness vacuous on exactly
-# the machines that run it).
-assert hasattr(net, "serve_org_streaming"), "wheel lacks serve_org_streaming (stale build?)"
-assert hasattr(net, "AsyncOrgClient"), "wheel lacks AsyncOrgClient (stale build?)"
+
+def _org_wheel_gate() -> None:
+    """PY-1's stale-wheel gate: skip ONLY a wheel with no org surface at
+    all; a partially stale wheel FAILS LOUDLY, naming every missing name
+    (a skip would vacate every witness below with the wrong reason on
+    exactly the machines that run them)."""
+    import importlib
+
+    try:
+        native = importlib.import_module("net._net")
+    except ImportError:  # pragma: no cover - `net` already imported above
+        native = None
+    if native is None:
+        pytest.skip(
+            "no native `net._net` here (net wheel not built)",
+            allow_module_level=True,
+        )
+    native_missing = [n for n in _ORG_NAMES if not hasattr(native, n)]
+    if len(native_missing) == len(_ORG_NAMES):
+        pytest.skip("net built without the org feature", allow_module_level=True)
+    facade_missing = [n for n in _ORG_NAMES if not hasattr(net, n)]
+    if native_missing or facade_missing:
+        raise AssertionError(
+            "the `net` wheel has the org feature but lacks the S4 org "
+            "surface (stale build?): "
+            f"native missing: {native_missing}; facade missing: {facade_missing}"
+        )
+
+
+_org_wheel_gate()
 
 from net.org import parse_org_error  # noqa: E402
 
@@ -591,6 +639,92 @@ def test_org_duplex_terminal_is_not_raced_by_the_response_pump(scenarios, access
 
 
 # =========================================================================
+# PY-2 — the same pump-terminal race in the nRPC SYNC blocking bridges
+# (`PyRpcDuplexHandler` / `PyRpcStreamingHandler` in
+# `bindings/python/src/mesh_rpc.rs`). Those bridges hand the response sink
+# to Python in the call arguments, so the pump's last mpsc sender dropped
+# at `call1`'s argument teardown — BEFORE the `spawn_blocking` result
+# deposit. The response pump then exits on an empty queue and the
+# supervisor's `pump_done` handling commits `PumpFailed` (wire
+# `0x0006: response pump failed`) over a handler that had in fact
+# returned. The bridges now retain a sink holder until the handler future
+# resolves — the org_serve.rs fix's mechanism (15484b985), mirrored here
+# by its deterministic `_SlowDrop` widening: the 1 s `__del__` runs between
+# the sink's teardown and the result deposit, the exact pre-fix window.
+# Pre-fix these cells fail with the caller's `RpcError` carrying `0x0006`
+# / "response pump failed" where the clean end-of-stream belongs.
+# =========================================================================
+
+
+def _nrpc_until_routed(open_fn, timeout: float = 15.0):
+    """`serve_*` returns once the channel is joined locally, but the
+    join-advertisement to the caller side rides the next broadcast (the
+    200 ms heartbeat here) — same beat as
+    `test_async_interop._call_until_routed`."""
+    last = None
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            return open_fn()
+        except net.RpcNoRouteError as e:
+            last = e
+            time.sleep(0.3)
+    raise AssertionError(f"the nRPC call never routed: {last}")
+
+
+@pytest.mark.timeout(60)
+def test_nrpc_streaming_terminal_is_not_raced_by_the_response_pump(mesh_pair) -> None:
+    a, b = mesh_pair
+    srv = net.MeshRpc(b)
+    cli = net.MeshRpc(a)
+
+    def handler(request: bytes, sink) -> None:
+        sink.send(b"one:" + request)
+        return _SlowDrop()
+
+    handle = srv.serve_streaming("nrpc-slowdrop-stream", handler)
+    stream = None
+    try:
+        stream = _nrpc_until_routed(
+            lambda: cli.call_streaming(b.node_id, "nrpc-slowdrop-stream", b"hi")
+        )
+        chunks = list(stream)
+    finally:
+        if stream is not None:
+            stream.close()
+        handle.close()
+    assert chunks == [b"one:hi"]
+
+
+@pytest.mark.timeout(60)
+def test_nrpc_duplex_terminal_is_not_raced_by_the_response_pump(mesh_pair) -> None:
+    a, b = mesh_pair
+    srv = net.MeshRpc(b)
+    cli = net.MeshRpc(a)
+
+    def handler(stream, sink) -> None:
+        for chunk in stream:
+            sink.send(b"echo:" + chunk)
+        return _SlowDrop()
+
+    handle = srv.serve_duplex("nrpc-slowdrop-duplex", handler)
+    call = None
+    try:
+        call = _nrpc_until_routed(
+            lambda: cli.call_duplex(b.node_id, "nrpc-slowdrop-duplex")
+        )
+        for part in (b"a", b"b"):
+            call.send(part)
+        call.finish_sending()
+        echoed = list(call)
+    finally:
+        if call is not None:
+            call.close()
+        handle.close()
+    assert echoed == [b"echo:a", b"echo:b"]
+
+
+# =========================================================================
 # The `task.cancel()` propagation witness (the F-S3.1-2 named item).
 # =========================================================================
 
@@ -607,11 +741,14 @@ def test_task_cancel_propagates_to_retirement_observables(scenarios) -> None:
     1. Caller side: the awaiting task raises ``asyncio.CancelledError``
        promptly (the bridge drops the pull and fires ``mesh.cancel(token)``).
     2. Substrate side, LOCAL: the per-stream cancel watcher tears the call's
-       pending entry down, so the response side EOFs — observed here as the
-       ``async for`` ending — **while the caller handle is still alive**. This
-       is the link that discriminates the cancel-token path from ordinary
-       teardown: with no token threaded the drain would park until the 120 s
-       call deadline.
+       pending entry down, so the response side terminates — observed here
+       as the ``async for`` raising the TYPED cancellation terminal
+       ``org:rpc:cancelled`` (the repair pass's documented typed terminal
+       vocabulary: a cancel ends a fold with the typed error through the
+       ``org_err_to_py`` mirror, never a swallowed clean end) — **while the
+       caller handle is still alive**. This is the link that discriminates
+       the cancel-token path from ordinary teardown: with no token threaded
+       the drain would park until the 120 s call deadline.
     3. Provider side: retirement is observable as the handler's request input
        fencing to EOF (its ``for chunk in stream:`` ends with NO final item
        and no exception) — the shape's library-controlled input, closed by the
@@ -688,9 +825,21 @@ def test_task_cancel_propagates_to_retirement_observables(scenarios) -> None:
                         pass
 
                 # The token watcher already closed the call's response side;
-                # this drain ends immediately. Without the cancel token it
-                # would park until the 120 s deadline (bounded out at 5 s).
-                await asyncio.wait_for(_drain(), 5)
+                # this drain ends immediately — as the TYPED cancellation
+                # terminal `org:rpc:cancelled` (the repair pass's documented
+                # typed terminal vocabulary: never a swallowed clean end).
+                # Without the cancel token it would park until the 120 s
+                # deadline (bounded out at 5 s). DELIBERATE CONTRACT UPDATE
+                # (owner Q1): this pin was a clean `async for` end before the
+                # typed vocabulary landed.
+                with pytest.raises(net.OrgError) as ei2:
+                    await asyncio.wait_for(_drain(), 5)
+                assert not isinstance(ei2.value, net.RpcError), (
+                    "org handles must not surface the nRPC exception family"
+                )
+                parsed2 = parse_org_error(str(ei2.value))
+                assert parsed2.domain == "rpc", parsed2
+                assert str(ei2.value).startswith("org:rpc:cancelled"), str(ei2.value)
 
                 # ---- link 3 rides the handle's close()/drop ----
                 call.close()  # per-shape Drop publishes the wire CANCEL
@@ -790,3 +939,82 @@ def test_live_cross_org_call_from_a_generated_scenario(scenarios) -> None:
             handle.close()
         assert json.loads(reply.decode("utf-8")) == {"n": 8, "servedBy": "py-provider"}
         assert seen["cross_org"], "four-party attribution reached the handler"
+
+
+# =========================================================================
+# PY-1 — the stale-wheel "fail loudly" gate. A wheel that HAS the org
+# feature but LACKS names of the S4 org surface (a stale build) must FAIL
+# at module import — never skip with "net built without the org feature",
+# which vacates every witness above on exactly the machines that run them.
+#
+# The trigger is simulated with a FABRICATED stale wheel on PYTHONPATH and
+# the real modules driven under it (the gate + `_ORG_NAMES` above verify
+# the 15 names one by one — `net/__init__.py` binds them all-or-nothing).
+# =========================================================================
+
+
+def _fake_wheel(root: str, hide_from: str) -> str:
+    """Write a fabricated `net` package under ``root`` that is org-enabled
+    but STALE. ``hide_from == "native"``: the extension holds 14 of the 15
+    org names (an S4 verb never landed in the native build) and the facade
+    mirrors ``net/__init__.py``'s all-or-nothing org import. The hidden
+    verb is the from-list's FIRST name on purpose: CPython binds
+    ``from ... import (...)`` names incrementally, so a later-missing name
+    would leave the earlier ones bound and the gate would see a partial
+    facade by accident — the first name is the honest all-or-nothing
+    shape (``except ImportError: pass`` swallows the whole block).
+    ``hide_from == "facade"``: the extension is complete but the facade
+    predates the org import block entirely (the committed
+    ``.s4receipts/installed-org-init.bak`` shape)."""
+    pkg = os.path.join(root, "net")
+    os.makedirs(pkg, exist_ok=True)
+    if hide_from == "native":
+        native_names = [n for n in _ORG_NAMES if n != "AsyncOrgClient"]
+        init = (
+            "try:\n    from ._net import (\n"
+            + "".join(f"        {n},\n" for n in _ORG_NAMES)
+            + "    )\nexcept ImportError:\n    pass\n"
+        )
+    else:
+        native_names = list(_ORG_NAMES)
+        init = "# stale facade: the org import block predates this wheel\n"
+    with open(os.path.join(pkg, "_net.py"), "w", encoding="utf-8") as f:
+        f.write("".join(f"{n} = object()\n" for n in native_names))
+    with open(os.path.join(pkg, "__init__.py"), "w", encoding="utf-8") as f:
+        f.write(init)
+    return root
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("hide_from", ["native", "facade"])
+@pytest.mark.parametrize(
+    "module", ["test_org_live", "test_runtime_teardown_no_deadlock"]
+)
+def test_stale_wheel_fails_the_gate_loudly(module, hide_from, tmp_path) -> None:
+    """The gate must FAIL LOUDLY (module import raises "stale build") on a
+    simulated stale wheel — for BOTH bindings gates named by PY-1.
+    Pre-fix behavior: the module SKIPS as "net built without the org
+    feature" (exit 0 from a collect-only run, no "stale build" in sight)
+    and 15+ witnesses vacate silently with the wrong reason."""
+    stub = _fake_wheel(str(tmp_path), hide_from)
+    env = {**os.environ, "PYTHONPATH": stub}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            os.path.join(_HERE, f"{module}.py"),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode != 0 and "stale build" in out, (
+        f"the stale-wheel gate did not fail loudly for {module}.py "
+        f"({hide_from}-stale); pre-fix behavior: the module skips as "
+        "'net built without the org feature'\n--- output ---\n" + out
+    )

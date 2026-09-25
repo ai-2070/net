@@ -1930,6 +1930,17 @@ impl RpcDuplexHandler for PyRpcDuplexHandler {
         let runtime = self.runtime.clone();
         let stream_inner = Arc::new(Mutex::new(Some(requests)));
         let sink_inner = Arc::new(Mutex::new(Some(responses)));
+        // PY-2 liveness holder (the org_serve.rs fix's mechanism,
+        // 15484b985): the wrapper below drops the sink at Python's
+        // argument teardown — BEFORE the spawn_blocking result deposit —
+        // and the response pump then exits on an empty queue while the
+        // handler result is still undelivered, the exact window that
+        // misfiles the handler's completion as `PumpFailed` (wire
+        // `0x0006: response pump failed`) under `run_stream_call_supervisor`.
+        // Retained until this handler future resolves (dropped in the
+        // resolving poll), so the pump's sender outlives the result
+        // deposit — the ordering in-process async handlers already have.
+        let sink_liveness = Arc::clone(&sink_inner);
         let ctx_caller_origin = ctx.caller_origin;
         let ctx_call_id = ctx.call_id;
         let ctx_deadline_ns = ctx.deadline_ns;
@@ -1975,6 +1986,10 @@ impl RpcDuplexHandler for PyRpcDuplexHandler {
             }),
         )
         .await;
+        // The liveness holder dies with the resolving poll — the pump's
+        // sender lives at least as long as the handler's result is
+        // undelivered (see its construction above).
+        drop(sink_liveness);
         match result {
             Ok(Ok(outcome)) => match finalize_handler_outcome(outcome) {
                 // Duplex returns Result<(), _> — discard the body
@@ -2090,6 +2105,13 @@ impl RpcStreamingHandler for PyRpcStreamingHandler {
     ) -> std::result::Result<(), RpcHandlerError> {
         let callable = Python::attach(|py| self.callable.clone_ref(py));
         let sink_inner = Arc::new(Mutex::new(Some(sink)));
+        // PY-2 liveness holder — same mechanism and window as
+        // `PyRpcDuplexHandler`'s: the sink wrapper drops at Python's
+        // argument teardown, BEFORE the spawn_blocking result deposit,
+        // and a pump exit in that window misfiles the handler's
+        // completion as `PumpFailed` (wire `0x0006: response pump
+        // failed`). Retained until this handler future resolves.
+        let sink_liveness = Arc::clone(&sink_inner);
         let payload_bytes: Vec<u8> = ctx.payload.body.to_vec();
         let result = tokio::time::timeout(
             self.timeout,
@@ -2115,6 +2137,10 @@ impl RpcStreamingHandler for PyRpcStreamingHandler {
             }),
         )
         .await;
+        // The liveness holder dies with the resolving poll — the pump's
+        // sender lives at least as long as the handler's result is
+        // undelivered (see its construction above).
+        drop(sink_liveness);
         match result {
             Ok(Ok(outcome)) => match finalize_handler_outcome(outcome) {
                 Ok(_) => Ok(()),

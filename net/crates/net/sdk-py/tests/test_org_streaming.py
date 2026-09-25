@@ -87,15 +87,38 @@ except BaseException as e:
     print("NET_IMPORT_FAIL:", type(e).__name__, e)
     sys.exit(1)
 import net
-if not hasattr(net, "install_org_authority"):
+# The 15 org names — verified ONE BY ONE against the NATIVE module and
+# the facade, never as one unit: `net/__init__.py`'s org block binds all
+# 15 under ONE `try`/`except ImportError`, so a wheel missing one S4
+# verb can end up with NO org names bound on the facade — the
+# all-or-nothing import cannot tell "org feature absent" from "stale
+# build" (PY-1). Verdicts: NO_ORG_FEATURE (skip) only when the native
+# module holds NONE of the 15; any partial native or facade surface is
+# a STALE build and must FAIL LOUDLY, naming every missing name.
+_ORG_NAMES = (
+    "AsyncOrgClient",
+    "OrgAdmissionDeniedError",
+    "OrgClient",
+    "OrgCredentials",
+    "OrgCredentialsError",
+    "OrgDiscoveryError",
+    "OrgError",
+    "OrgServeHandle",
+    "OrgUnclassifiedError",
+    "install_org_authority",
+    "install_provider_grant_audience",
+    "serve_org",
+    "serve_org_client_stream",
+    "serve_org_duplex",
+    "serve_org_streaming",
+)
+native_missing = [n for n in _ORG_NAMES if not hasattr(net._net, n)]
+if len(native_missing) == len(_ORG_NAMES):
     print("NO_ORG_FEATURE")
     sys.exit(3)
-missing = [n for n in (
-    "serve_org_streaming", "serve_org_client_stream", "serve_org_duplex",
-    "AsyncOrgClient", "OrgCredentials",
-) if not hasattr(net, n)]
-if missing:
-    print("STALE_BUILD_MISSING:", missing)
+facade_missing = [n for n in _ORG_NAMES if not hasattr(net, n)]
+if native_missing or facade_missing:
+    print("STALE_BUILD_MISSING: native=", native_missing, " facade=", facade_missing)
     sys.exit(2)
 print("OK")
 """
@@ -351,8 +374,106 @@ def test_task_cancel_propagates_to_retirement_observables(scenarios) -> None:
     # links (established across every cell); the contract claim is the links
     # themselves. (Main takeover fix — F-S4PySdk-5: the links-only expectation
     # against the envelope; the three links matched exactly as designed.)
+    # DELIBERATE CONTRACT UPDATE (the repair pass's owner-Q1 typed terminal
+    # vocabulary): a cancel terminal surfaces as the typed
+    # `org:rpc:cancelled` error at the fold — never a swallowed clean end —
+    # so link2's pin is the typed outcome, not the old clean `drain_ended`.
     assert {k: v for k, v in payload.items() if k.startswith("link")} == {
         "link1": "CancelledError",
-        "link2": "drain_ended",
+        "link2": "drain_ended:org:rpc:cancelled",
         "link3": "input_eof",
     }
+
+
+# =========================================================================
+# PY-1 — the stale-wheel "fail loudly" gate must be REACHABLE. A wheel
+# that HAS the org feature but LACKS names of the S4 org surface (a stale
+# build) must classify STALE (exit 2 — the gate raises), never
+# NO_ORG_FEATURE (exit 3 — the gate skips 15+ witnesses with a wrong
+# reason).
+#
+# The trigger is simulated with a FABRICATED stale wheel on PYTHONPATH and
+# the probe above driven against it. `net/__init__.py`'s org block binds
+# all 15 org names under ONE `try`/`except ImportError`, so a wheel
+# missing ONE S4 verb ends up with NO org names bound on the facade — the
+# all-or-nothing import is exactly what used to pre-empt the gate's stale
+# verdict into its skip path.
+# =========================================================================
+
+_ORG_NAMES = (
+    "AsyncOrgClient",
+    "OrgAdmissionDeniedError",
+    "OrgClient",
+    "OrgCredentials",
+    "OrgCredentialsError",
+    "OrgDiscoveryError",
+    "OrgError",
+    "OrgServeHandle",
+    "OrgUnclassifiedError",
+    "install_org_authority",
+    "install_provider_grant_audience",
+    "serve_org",
+    "serve_org_client_stream",
+    "serve_org_duplex",
+    "serve_org_streaming",
+)
+
+
+def _fake_wheel(root: str, hide_from: str) -> str:
+    """Write a fabricated `net` package under ``root`` that is org-enabled
+    but STALE. ``hide_from == "native"``: the extension holds 14 of the 15
+    org names (an S4 verb never landed in the native build) and the facade
+    mirrors ``net/__init__.py``'s all-or-nothing org import. The hidden
+    verb is the from-list's FIRST name on purpose: CPython binds
+    ``from ... import (...)`` names incrementally, so a later-missing name
+    would leave the earlier ones bound and the gate would see a partial
+    facade by accident — the first name is the honest all-or-nothing
+    shape (``except ImportError: pass`` swallows the whole block).
+    ``hide_from == "facade"``: the extension is complete but the facade
+    predates the org import block entirely (the committed
+    ``.s4receipts/installed-org-init.bak`` shape)."""
+    pkg = os.path.join(root, "net")
+    os.makedirs(pkg, exist_ok=True)
+    if hide_from == "native":
+        native_names = [n for n in _ORG_NAMES if n != "AsyncOrgClient"]
+        init = (
+            "try:\n    from ._net import (\n"
+            + "".join(f"        {n},\n" for n in _ORG_NAMES)
+            + "    )\nexcept ImportError:\n    pass\n"
+        )
+    else:
+        native_names = list(_ORG_NAMES)
+        init = "# stale facade: the org import block predates this wheel\n"
+    with open(os.path.join(pkg, "_net.py"), "w", encoding="utf-8") as f:
+        f.write("".join(f"{n} = object()\n" for n in native_names))
+    with open(os.path.join(pkg, "__init__.py"), "w", encoding="utf-8") as f:
+        f.write(init)
+    return root
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("hide_from", ["native", "facade"])
+def test_stale_wheel_gate_is_reachable(hide_from, tmp_path) -> None:
+    """The probe must answer STALE (exit 2) for BOTH stale shapes —
+    pre-fix behavior: it answers NO_ORG_FEATURE (exit 3) for each, because
+    the all-or-nothing facade import hides the S4 gap and the gate then
+    SKIPS every witness in this module with the wrong reason."""
+    stub = _fake_wheel(str(tmp_path), hide_from)
+    result = subprocess.run(
+        [sys.executable, "-c", _PROBE],
+        env={**os.environ, "PYTHONPATH": stub},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 2 and "STALE_BUILD_MISSING" in out, (
+        f"the stale-wheel gate is unreachable ({hide_from}-stale): the probe "
+        f"answered exit {result.returncode} — pre-fix behavior: exit 3 "
+        "(NO_ORG_FEATURE) and the gate skips with a wrong reason\n"
+        "--- output ---\n" + out
+    )
+    expected = (
+        "AsyncOrgClient" if hide_from == "native" else "install_org_authority"
+    )
+    assert expected in out, f"the missing names are not named: {out}"

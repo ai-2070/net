@@ -46,8 +46,57 @@ import pytest
 
 net = pytest.importorskip("net", reason="net wheel not built")
 
-if not hasattr(net, "serve_org_streaming"):
-    pytest.skip("net built without the org feature", allow_module_level=True)
+# The 15 org-feature names (`net/__init__.py`'s org block) — verified
+# ONE BY ONE against the NATIVE module and the facade, never as one
+# unit (PY-1): the all-or-nothing import cannot tell "org feature
+# absent" from "stale build".
+_ORG_NAMES = (
+    "AsyncOrgClient",
+    "OrgAdmissionDeniedError",
+    "OrgClient",
+    "OrgCredentials",
+    "OrgCredentialsError",
+    "OrgDiscoveryError",
+    "OrgError",
+    "OrgServeHandle",
+    "OrgUnclassifiedError",
+    "install_org_authority",
+    "install_provider_grant_audience",
+    "serve_org",
+    "serve_org_client_stream",
+    "serve_org_duplex",
+    "serve_org_streaming",
+)
+
+
+def _org_wheel_gate() -> None:
+    """PY-1's stale-wheel gate: skip ONLY a wheel with no org surface at
+    all; a partially stale wheel FAILS LOUDLY, naming every missing name
+    (a skip would vacate the witness below with the wrong reason)."""
+    import importlib
+
+    try:
+        native = importlib.import_module("net._net")
+    except ImportError:  # pragma: no cover - `net` already imported above
+        native = None
+    if native is None:
+        pytest.skip(
+            "no native `net._net` here (net wheel not built)",
+            allow_module_level=True,
+        )
+    native_missing = [n for n in _ORG_NAMES if not hasattr(native, n)]
+    if len(native_missing) == len(_ORG_NAMES):
+        pytest.skip("net built without the org feature", allow_module_level=True)
+    facade_missing = [n for n in _ORG_NAMES if not hasattr(net, n)]
+    if native_missing or facade_missing:
+        raise AssertionError(
+            "the `net` wheel has the org feature but lacks the S4 org "
+            "surface (stale build?): "
+            f"native missing: {native_missing}; facade missing: {facade_missing}"
+        )
+
+
+_org_wheel_gate()
 
 # The child must finish on its own; if it does not, it is deadlocked and only
 # this bound (not pytest-timeout, which cannot run) will end it. 45 s is well
