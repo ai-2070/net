@@ -41,7 +41,7 @@ pub struct ServeArgs {
     pub max_registrations: usize,
 
     /// Maximum channels (joiners) per registration.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 8_192)]
     pub max_channels_per_registration: usize,
 }
 

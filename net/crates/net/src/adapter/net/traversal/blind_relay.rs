@@ -481,7 +481,7 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             max_registrations: 100_000,
-            max_channels_per_registration: 64,
+            max_channels_per_registration: 8_192,
             max_channels: 250_000,
             registration_ttl: Duration::from_secs(90),
             channel_idle: Duration::from_secs(120),
