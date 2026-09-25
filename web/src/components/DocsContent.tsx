@@ -637,11 +637,25 @@ const mdxComponents = {
     // Change the type scale or the column and that limit goes stale silently:
     // the checker keeps passing while lines start running off the edge again, or
     // starts failing lines that now fit. Re-measure and update MAX_WIDTH there.
+    //
+    // The arithmetic above is for CODE fences. `text` fences (`.diagram`) use
+    // the diagram face, whose advance is narrower than JetBrains Mono's 0.6em —
+    // so a diagram can only ever be narrower than this limit predicts.
     if (inFigure) {
+      // A `text` fence is a DIAGRAM (box-drawing art), not code: it gets
+      // `.diagram`, which switches the face and the leading. JetBrains Mono
+      // reaches the page through next/font's Google loader, which ships the
+      // `latin` subset — no face in that set carries U+2500–257F, so the rules
+      // and arrows were being drawn by the browser's last resort, off the mono
+      // grid and not meeting between lines. See `.diagram` in globals.css.
+      const isDiagram = props["data-language"] === "text";
       return (
         <pre
           {...props}
-          className="px-4 py-3 m-0 text-[12.5px] leading-[1.6] font-mono whitespace-pre overflow-x-auto"
+          className={
+            "px-4 py-3 m-0 text-[12.5px] leading-[1.6] font-mono whitespace-pre overflow-x-auto" +
+            (isDiagram ? " diagram" : "")
+          }
         />
       );
     }
