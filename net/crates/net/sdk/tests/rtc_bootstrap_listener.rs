@@ -709,7 +709,8 @@ fn ws_client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
 // Kyra's Stage 4b probes, landed VERBATIM (assertions untouched).
 //
 // Source: `spikes/kyra/kyra_4b_listener_probes.rs` and
-// `spikes/kyra/kyra_4b_candidate_probes.rs`. They reproduced 0/6 at
+// `spikes/kyra/kyra_4b_candidate_probes.rs` (at `4a98529f2`; `spikes/`
+// has since been removed). They reproduced 0/6 at
 // `f9ddd2543`; each repair below is written against the probe that
 // names it, and the probes stay in this file as the regression.
 // ===================================================================
