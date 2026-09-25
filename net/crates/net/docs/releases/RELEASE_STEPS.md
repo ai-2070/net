@@ -74,6 +74,12 @@ git tag node-vX && git push origin node-vX
 # TS SDK → npm (`@net-mesh/sdk`)
 git tag npm-sdk-vX && git push origin npm-sdk-vX
 
+# Browser package → npm (`@net-mesh/browser`). Builds the wasm leaf
+# itself. Its FIRST publish needs the NPM_TOKEN secret (npm trusted
+# publishing can only be configured for a package that already exists);
+# configure the trusted publisher right after that first release.
+git tag npm-browser-vX && git push origin npm-browser-vX
+
 # ── ONLY after the crates-vX workflow has finished (see above) ──
 
 # CLI → crates.io (`net-cli`) + GitHub Release tarballs +
@@ -87,10 +93,15 @@ git tag cli-vX && git push origin cli-vX
 git tag deck-vX && git push origin deck-vX
 ```
 
-Not tagged, on purpose: `@net-mesh/browser`, `net-mesh-leaf`, `net-payments`
-and `net-aggregator-daemon` are version-bumped with everything else but have no
+Not tagged, on purpose: `net-mesh-leaf`, `net-payments` and
+`net-aggregator-daemon` are version-bumped with everything else but have no
 release workflow and have never been published. Nothing needs to be done for
 them here; publishing any of them is a new workflow, not a new tag.
+
+npm trusted publishing is configured PER PACKAGE (the platform packages
+included), bound to the workflow file that publishes it —
+`npm trust github <pkg> --repo ai-2070/net --file <workflow>.yml
+--allow-publish`. It needs the package to exist on npm first.
 
 
 If anything goes wrong during build:
