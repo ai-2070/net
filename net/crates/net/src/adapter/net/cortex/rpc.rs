@@ -17,7 +17,7 @@
 
 use bytes::{Buf, BufMut, Bytes};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -1594,8 +1594,10 @@ pub enum RpcHandlerError {
     #[error("application error {code:#06x}: {message}")]
     Application {
         /// Application error code; surfaces as `RpcStatus::Application(code)`
-        /// to the caller. Use `0x8000..=0xFFFF` to avoid the
-        /// reserved canonical range.
+        /// to the caller when it is in the application band
+        /// `0x8000..=0xFFFF`. A code in the reserved canonical range
+        /// surfaces as `RpcStatus::Internal` instead, on every call shape —
+        /// a handler cannot mint an engine status.
         code: u16,
         /// Diagnostic. Becomes the response body (UTF-8 bytes).
         message: String,
@@ -2176,13 +2178,8 @@ impl RpcServerFold {
                                 // documented generic for an unclassifiable
                                 // handler error, `Internal`, keeping the
                                 // handler's diagnostic as the body.
-                                let status = if (0x8000..=0xFFFF).contains(&code) {
-                                    RpcStatus::Application(code)
-                                } else {
-                                    RpcStatus::Internal
-                                };
                                 RpcResponsePayload {
-                                    status,
+                                    status: handler_application_status(code),
                                     headers: vec![],
                                     body: Bytes::from(message),
                                 }
@@ -2556,6 +2553,25 @@ pub const STREAMING_PUMP_CAPACITY: usize = 1024;
 /// sink and keeps running hold the call open indefinitely. Retirement and
 /// the call deadline still win during the wait.
 pub(crate) const HANDLER_DEPOSIT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The ONE classification of a handler's `Application` code, for every
+/// call shape (SDK-3, §23 audit). The application band (`0x8000..=0xFFFF`)
+/// is the only band a handler may mint: a code in the reserved canonical
+/// range would surface as an engine status the handler has no business
+/// asserting — `0x0009` alone counterfeits `AdmissionDenied` at the caller,
+/// `0x0003`/`0x0005` the deadline/cancel words. Out-of-band codes degrade to
+/// the documented generic for an unclassifiable handler error, `Internal`.
+/// (The SDK facades clamp first, to their own typed-handler generic
+/// `0x8001`, so their handlers never reach this fallback.) Pre-audit only
+/// the unary fold applied this; every streaming shape passed the code
+/// through verbatim.
+pub(crate) fn handler_application_status(code: u16) -> RpcStatus {
+    if (0x8000..=0xFFFF).contains(&code) {
+        RpcStatus::Application(code)
+    } else {
+        RpcStatus::Internal
+    }
+}
 
 /// Bounded capacity for the client-streaming server fold's
 /// per-call request mpsc. Mirror of [`STREAMING_PUMP_CAPACITY`]
@@ -4497,6 +4513,13 @@ pub enum CommitVerdict {
     Unknown,
 }
 
+/// WIRE-1 (§23 audit): how many retired sessions the registry remembers.
+/// The tombstones only have to outlive the gap between an opening's
+/// session-currency snapshot and its `reserve` (no await in between), and
+/// each retirement costs the peer a full handshake, so a small bound
+/// covers the window with a wide margin.
+const RETIRED_SESSION_TOMBSTONES: usize = 1024;
+
 struct RegistryInner {
     /// The bound `(authority, store)` pair the live views sample.
     authority: Option<Arc<NodeAuthority>>,
@@ -4507,6 +4530,14 @@ struct RegistryInner {
     active_node: usize,
     active_per_caller: HashMap<EntityId, usize>,
     active_per_org: HashMap<OrgId, usize>,
+    /// Sessions already retired (WIRE-1). An opening snapshots its
+    /// carrying session as current and only then takes this lock in
+    /// `reserve`; a retirement landing in between finds no record to
+    /// retire, so without the tombstone the opening would install a
+    /// record no later retire matches. `reserve` refuses a tombstoned
+    /// session under the same lock that `retire_session` writes it.
+    retired_sessions: HashSet<SessionIdentity>,
+    retired_order: VecDeque<SessionIdentity>,
 }
 
 /// One per `MeshNode`: the exact-incarnation admission/retirement
@@ -4543,6 +4574,8 @@ impl ProtectedCallRegistry {
                 active_node: 0,
                 active_per_caller: HashMap::new(),
                 active_per_org: HashMap::new(),
+                retired_sessions: HashSet::new(),
+                retired_order: VecDeque::new(),
             }),
             limits,
             bytes,
@@ -4789,6 +4822,14 @@ impl ProtectedCallRegistry {
     /// on it alone would retire a bystander's call.
     pub fn retire_session(&self, session: &SessionIdentity, reason: StreamTerminalReason) -> usize {
         let mut inner = self.inner.lock();
+        if inner.retired_sessions.insert(session.clone()) {
+            inner.retired_order.push_back(session.clone());
+            if inner.retired_order.len() > RETIRED_SESSION_TOMBSTONES {
+                if let Some(oldest) = inner.retired_order.pop_front() {
+                    inner.retired_sessions.remove(&oldest);
+                }
+            }
+        }
         let victims: Vec<(ProtectedCallKey, u64)> = inner
             .records
             .iter()
@@ -4860,6 +4901,13 @@ impl ProtectedCallRegistry {
             return Err(AdmissionDenied::AuthorityChanged);
         }
         let mut inner = self.inner.lock();
+        // WIRE-1 (§23 audit): the carrying session was current at the
+        // caller's snapshot, but a retirement may have landed since. Under
+        // this lock the answer is final: `retire_session` tombstones under
+        // it too.
+        if inner.retired_sessions.contains(&req.session) {
+            return Err(AdmissionDenied::AuthorityChanged);
+        }
 
         // The key check comes first: it is the one refusal that must land
         // before decode, and it costs a hash lookup.
@@ -5813,7 +5861,7 @@ fn supervised_handler_result(
     match result {
         Ok(Ok(())) => (StreamHandlerResult::Ok, false),
         Ok(Err(RpcHandlerError::Application { code, message })) => (
-            StreamHandlerResult::Err(RpcStatus::Application(code), message),
+            StreamHandlerResult::Err(handler_application_status(code), message),
             false,
         ),
         Ok(Err(RpcHandlerError::Internal(message))) => (
@@ -6269,7 +6317,7 @@ async fn run_client_stream_call(
                     (result, payload)
                 }
                 Ok(Err(RpcHandlerError::Application { code, message })) => {
-                    let result = StreamHandlerResult::Err(RpcStatus::Application(code), message);
+                    let result = StreamHandlerResult::Err(handler_application_status(code), message);
                     let payload =
                         stream_terminal_payload(&StreamTerminalReason::Completed(result.clone()));
                     (result, payload)
@@ -7572,7 +7620,7 @@ impl RpcStreamingRequestFold {
                             Ok(Ok(resp)) => resp,
                             Ok(Err(RpcHandlerError::Application { code, message })) => {
                                 RpcResponsePayload {
-                                    status: RpcStatus::Application(code),
+                                    status: handler_application_status(code),
                                     headers: vec![],
                                     body: Bytes::from(message),
                                 }
@@ -8421,7 +8469,7 @@ impl RpcDuplexFold {
                             },
                             Ok(Err(RpcHandlerError::Application { code, message })) => {
                                 RpcResponsePayload {
-                                    status: RpcStatus::Application(code),
+                                    status: handler_application_status(code),
                                     headers: vec![],
                                     body: Bytes::from(message),
                                 }
@@ -10653,6 +10701,116 @@ mod tests {
             Some(StreamTerminalReason::PumpFailed),
             "a panicked pump lost chunks; the call may not report Completed",
         );
+    }
+
+    /// WIRE-1, the residual race (§23 audit): an opening snapshots its
+    /// carrying session as current, then a re-handshake retires that
+    /// session BEFORE the opening's `reserve` takes the registry lock. The
+    /// retire found no record to retire; pre-audit the reserve then
+    /// installed one for the dead session that no later retire matches.
+    /// The retired-session tombstone refuses it under the same lock.
+    #[test]
+    fn an_opening_whose_session_retired_before_reserve_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "net-wire1-tombstone-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::adapter::net::behavior::org_revocation::OrgRevocationStore::init(
+            &dir,
+            crate::adapter::net::behavior::org_revocation::ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("real store");
+        let registry = ProtectedCallRegistry::with_q1_defaults().expect("limits validate");
+        registry.bind_store(None, Arc::new(store));
+
+        let displaced = SessionIdentity {
+            peer: 2,
+            session_id: 3,
+            establishment: Some([4u8; 32]),
+        };
+        let opening = |session: SessionIdentity, call_id: u64| OpeningRequest {
+            key: ProtectedCallKey {
+                caller: EntityId::from_bytes([0x24u8; 32]),
+                call_id,
+            },
+            session,
+            // The snapshot said current: the WIRE-1 staleness gate passed.
+            session_generation: Some(1),
+            registration: 1,
+            shape: RpcCallShape::ServerStreaming,
+            now_ns: 0,
+        };
+
+        assert_eq!(
+            registry.retire_session(&displaced, StreamTerminalReason::SessionReplaced),
+            0,
+            "the retire lands before the opening's record exists",
+        );
+        assert!(
+            matches!(
+                registry.reserve(opening(displaced.clone(), 1)),
+                Err(AdmissionDenied::AuthorityChanged)
+            ),
+            "an opening carried by an already-retired session is refused",
+        );
+        assert_eq!(registry.record_count(), 0, "and leaves no record behind");
+
+        // The peer's successor session is unaffected.
+        let successor = SessionIdentity {
+            session_id: 5,
+            establishment: Some([6u8; 32]),
+            ..displaced
+        };
+        let reservation = registry
+            .reserve(opening(successor, 2))
+            .expect("the successor session still reserves");
+        drop(reservation);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SDK-3, streaming leg (§23 audit): a streaming handler's reserved-band
+    /// `Application` code must not mint an engine status either. Pre-audit
+    /// the supervisor forwarded `Application(0x0009)` verbatim — on the wire
+    /// the caller decoded `AdmissionDenied` — while the unary fold clamped.
+    #[tokio::test(start_paused = true)]
+    async fn a_streaming_handler_cannot_mint_an_engine_status() {
+        struct ForgeStreaming(u16);
+        #[async_trait::async_trait]
+        impl RpcStreamingHandler for ForgeStreaming {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+                _sink: RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                Err(RpcHandlerError::Application {
+                    code: self.0,
+                    message: "forged".into(),
+                })
+            }
+        }
+        for (code, expected) in [
+            (0x0009, RpcStatus::Internal),
+            (0x0003, RpcStatus::Internal),
+            (0x0005, RpcStatus::Internal),
+            (0x8123, RpcStatus::Application(0x8123)),
+        ] {
+            let (emit, _captured) = capturing_async_emitter();
+            let (record, sup) = spawn_supervised(Arc::new(ForgeStreaming(code)), emit);
+            tokio::time::timeout(Duration::from_secs(5), sup)
+                .await
+                .expect("the call ends")
+                .expect("no panic");
+            assert_eq!(
+                record.lock().terminal_reason(),
+                Some(StreamTerminalReason::Completed(StreamHandlerResult::Err(
+                    expected,
+                    "forged".into()
+                ))),
+                "handler code {code:#06x}",
+            );
+        }
     }
 
     /// CORE-2 (mirror) — ZERO chunks publish after a retirement terminal

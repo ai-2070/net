@@ -5520,7 +5520,7 @@ async fn early_handler_return_refuses_late_input_without_resource_exhausted() {
                 terminal.body.as_ref(),
             ),
             (
-                RpcStatus::Application(0x007E),
+                RpcStatus::Application(0x807E),
                 vec![],
                 b"ER-early-9".as_slice(),
             ),

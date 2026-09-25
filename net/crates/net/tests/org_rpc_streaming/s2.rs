@@ -325,8 +325,11 @@ impl RpcDuplexHandler for EarlyReturnDX {
         }
         responses.send(Bytes::from_static(b"ER-echo-1"));
         self.returned.fetch_add(1, Ordering::SeqCst);
+        // An application-band code (§23 audit, SDK-3): every shape now
+        // clamps a reserved-band code to `Internal`, so the exact-wire pin
+        // below uses a code a handler may actually mint.
         Err(RpcHandlerError::Application {
-            code: 0x007E,
+            code: 0x807E,
             message: "ER-early-9".to_string(),
         })
     }
