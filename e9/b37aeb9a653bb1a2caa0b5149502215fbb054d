@@ -1,0 +1,65 @@
+.claude/skills/net-event-bus/SKILL.md
+  s_cdbc9688784d9a::t_18e7e8c4abf053 44,87
+.claude/skills/net-event-bus/mcp.md
+  s_cdbc9688784d9a::t_3726151a53a5e8 88-107
+web/src/content/docs/guides/daemons-and-placement.md
+  s_e802155ff9ef32::t_494a2f133947eb 243
+web/src/content/docs/reference/cli.md
+  s_c2219187d98495::t_75c9b85823d93d 20-21,26,92-115,308,372-413,416,478-501,504-513,520-521,524,528-566
+web/src/content/docs/reference/subprotocol-ids.md
+  s_e802155ff9ef32::t_f47bc1faf2046a 28-29
+.claude/skills/net-event-bus/a2a.md
+  s_c2219187d98495::t_3b585ff77b8cd3 279-307
+.claude/skills/net-event-bus/cli.md
+  s_c2219187d98495::t_be67347eeac029 3,30,32-33,36,55,112-113,178-182,191-193,195,198-199,207-249,256,310,312,321-327,339-346,348,354-355,364-369,379-407,422,428
+.claude/skills/net-event-bus/gotchas.md
+  s_c2219187d98495::t_1b7f1e17437387 148-173
+.claude/skills/net-event-bus/mesh.md
+  s_c2219187d98495::t_c70741cc3bda09 232-240
+.claude/skills/net-event-bus/org.md
+  s_c2219187d98495::t_86b03d0f2c5368 100-129
+.claude/skills/net-event-bus/subnet-auth.md
+  s_c2219187d98495::t_f32072c2f9ddef 71-105,142-143
+README.md
+  s_c2219187d98495::t_159c59cd029b29 75-96
+web/src/content/docs/concepts/channels.md
+  s_c2219187d98495::t_ffa09ac86c1865 83-114
+web/src/content/docs/concepts/organizations.md
+  s_c2219187d98495::t_a2974c2000466a 175-204
+web/src/content/docs/concepts/subnets.md
+  s_c2219187d98495::t_2cbe3e18c29e6c 133-170
+web/src/content/docs/guides/nat-and-traversal.md
+  s_c2219187d98495::t_366cd7517a1d8e 44-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e9b37aeb9a653bb1a2caa0b5149502215fbb054d",
+  "prompts": {},
+  "sessions": {
+    "s_c2219187d98495": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2beba2b0-0a94-4ee2-8338-fba35f7c1a49",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
