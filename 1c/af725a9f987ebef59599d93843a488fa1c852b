@@ -1,0 +1,29 @@
+net/crates/net/leaf/src/leader_session.rs
+  s_d8b00bedd146e9::t_ca610d7b5df926 3967-3990
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_ca610d7b5df926 6816,6863,6935-6936,6943
+  s_d8b00bedd146e9::t_c42b3e93aeba59 4322-4324,4335,4354,4359-4361
+net/crates/net/sdk-py/tests/test_org_streaming.py
+  s_d8b00bedd146e9::t_8bc259f204aea8 83-84,87,89-103
+  s_d8b00bedd146e9::t_6c83230c0cb748 172-176,502-512,514-515,517-527,530
+  s_d8b00bedd146e9::t_c42b3e93aeba59 513,516,528-529
+net/crates/net/leaf/tests/wasm_leader.rs
+  s_d8b00bedd146e9::t_ca610d7b5df926 4307-4308,4347-4348,4351,4461-4493
+  s_d8b00bedd146e9::t_a8633244e11ffd 4494-4498
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1caf725a9f987ebef59599d93843a488fa1c852b",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
