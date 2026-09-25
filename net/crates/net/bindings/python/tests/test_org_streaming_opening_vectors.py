@@ -374,9 +374,10 @@ def test_mixed_pair_probes_match_the_net_stub_signatures() -> None:
 
 
 def test_mixed_pair_pipe_reads_are_watchdog_bounded() -> None:
-    """A hung provider must time the caller OUT: every orchestrator-pipe read
-    is bounded, so the row fails fast instead of wedging on the failure class
-    the harness exists to reproduce."""
+    """A hung provider must time the caller OUT: every provider read — the
+    orchestrator-pipe lines AND the ``list(stream)`` drain — is bounded, so
+    the row fails fast instead of wedging on the failure class the harness
+    exists to reproduce."""
     caller = _load_caller()
     # The watchdog is ARMED: `_readline`'s default bound IS the `_WATCHDOG`
     # constant, and `main()` reads the pipe through it.
@@ -408,6 +409,36 @@ def test_mixed_pair_pipe_reads_are_watchdog_bounded() -> None:
         )
     finally:
         quiet.wait(timeout=10)
+
+    # The `list(stream)` drain is bounded the same way: a provider that hangs
+    # mid-stream times out loudly instead of wedging the caller.
+    drain_bound = inspect.signature(caller._drain_stream).parameters["timeout"].default
+    assert drain_bound is caller._WATCHDOG and isinstance(drain_bound, float)
+
+    class _HungStream:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            time.sleep(60)
+            raise StopIteration
+
+    start = time.monotonic()
+    with pytest.raises(caller._PipeTimeout, match="stream drain"):
+        caller._drain_stream(_HungStream(), timeout=0.25)
+    assert time.monotonic() - start < 5.0  # bounded: timed out, did not wedge
+
+    class _QuietStream:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        def __iter__(self):
+            return iter(self._chunks)
+
+    assert caller._drain_stream(_QuietStream([b"a", b"bb"]), timeout=30.0) == [
+        b"a",
+        b"bb",
+    ]
 
 
 def test_mixed_pair_scenario_pins_cannot_drift() -> None:

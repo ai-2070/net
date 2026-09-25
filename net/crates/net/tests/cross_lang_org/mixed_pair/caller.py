@@ -31,28 +31,30 @@ import time
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROVIDER = os.path.join(_HERE, "provider.py")
 # The orchestrator-pipe watchdog (matches the Go row's readLine deadline):
-# EVERY pipe read is bounded by it, so a provider hang fails the row instead of
-# wedging the caller on exactly the failure class this harness reproduces.
+# EVERY provider read — the pipe lines AND the stream drain — is bounded by
+# it, so a provider hang fails the row instead of wedging the caller on
+# exactly the failure class this harness reproduces.
 _WATCHDOG = 120.0
 
 
 class _PipeTimeout(Exception):
-    """An orchestrator-pipe read exceeded its bound — the peer hung mid-protocol."""
+    """An orchestrator read exceeded its bound — the peer hung mid-protocol."""
 
 
-def _readline(stream, phase: str, timeout: float = _WATCHDOG) -> str:
-    """One line from ``stream``, bounded by ``timeout`` seconds.
+def _bounded(read, phase: str, timeout: float = _WATCHDOG):
+    """Run ``read()`` to completion, bounded by ``timeout`` seconds.
 
-    ``readline()`` on a pipe blocks forever when the peer stops writing; the
-    pump thread hands the line over with a real deadline (threads, not
-    ``select``: Windows pipes are not selectable). A read error is re-raised
-    on the caller's side — never swallowed into a line of text.
+    A pipe ``readline()`` — and the ``list(stream)`` drain — block forever
+    when the peer stops writing; the pump thread hands the result over with a
+    real deadline (threads, not ``select``: Windows pipes are not selectable).
+    A read error is re-raised on the caller's side — never swallowed into a
+    line of text.
     """
     box: queue.Queue = queue.Queue(maxsize=1)
 
     def _pump() -> None:
         try:
-            box.put(stream.readline())
+            box.put(read())
         except BaseException as exc:  # re-raised below, on the caller's side
             box.put(exc)
 
@@ -61,12 +63,27 @@ def _readline(stream, phase: str, timeout: float = _WATCHDOG) -> str:
         got = box.get(timeout=timeout)
     except queue.Empty:
         raise _PipeTimeout(
-            f"{phase}: no orchestrator-pipe line within {timeout}s — "
+            f"{phase}: no orchestrator read within {timeout}s — "
             "a hung provider must not become success"
         ) from None
     if isinstance(got, BaseException):
         raise got
     return got
+
+
+def _readline(stream, phase: str, timeout: float = _WATCHDOG) -> str:
+    """One line from ``stream``, bounded by ``timeout`` seconds."""
+    return _bounded(stream.readline, phase, timeout)
+
+
+def _drain_stream(stream, phase: str = "stream drain", timeout: float = _WATCHDOG) -> list:
+    """Every chunk of ``stream``, bounded by ``timeout`` seconds.
+
+    The drain is a read of provider-emitted data like the pipe lines: a
+    provider that hangs mid-stream must fail loudly here, not wedge the caller
+    until the call deadline.
+    """
+    return _bounded(lambda: list(stream), phase, timeout)
 
 
 def _probe_find_nodes(mesh, tag: str):
@@ -210,7 +227,11 @@ def main() -> None:
             _fail(f"the call never converged: {last!r}")
 
         try:
-            chunks = list(stream)
+            # Bounded like the pipe lines: the `list(stream)` drain reads
+            # provider-emitted data, and a provider hanging mid-stream is the
+            # exact failure class this harness reproduces — it must time out
+            # loudly, not wedge the caller until the call deadline.
+            chunks = _drain_stream(stream)
         finally:
             stream.close()
             client.close()
