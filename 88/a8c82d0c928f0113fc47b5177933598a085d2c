@@ -1,0 +1,640 @@
+.claude/skills/README.md
+  h_64425bc75e3f3d 102
+.claude/skills/net-event-bus/SKILL.md
+  h_64425bc75e3f3d 44,87
+.claude/skills/net-event-bus/a2a.md
+  h_64425bc75e3f3d 279-307
+.claude/skills/net-event-bus/cli.md
+  h_64425bc75e3f3d 3,7,9,12-17,20,22,24,26,28-36,38,40,42,44,46-50,53-56,58,60,62-69,71-89,92-96,98-102,104-216,219-287,289-290,294-298,300-312,316-328,332-339,341-344,346,348,350-354,358-369,373-377,379,381-390,392-410,412,419,422,426-429
+.claude/skills/net-event-bus/dataforts.md
+  h_64425bc75e3f3d 89,164,167,176,218,245,247,286,290-294,296,358
+.claude/skills/net-event-bus/examples/tokenchannel.rs
+  h_64425bc75e3f3d 49-55,120
+.claude/skills/net-event-bus/gotchas.md
+  h_64425bc75e3f3d 150-175
+.claude/skills/net-event-bus/mcp.md
+  h_64425bc75e3f3d 88-107
+.claude/skills/net-event-bus/mesh.md
+  h_64425bc75e3f3d 232-240
+.claude/skills/net-event-bus/nrpc.md
+  h_64425bc75e3f3d 543
+.claude/skills/net-event-bus/observability.md
+  h_64425bc75e3f3d 101,125
+.claude/skills/net-event-bus/org.md
+  h_64425bc75e3f3d 108-137
+.claude/skills/net-event-bus/streams.md
+  h_64425bc75e3f3d 36,38,68,256,275,279
+.claude/skills/net-event-bus/subnet-auth.md
+  h_64425bc75e3f3d 71-105,142-143
+.github/scripts/check-abi-commit.py
+  h_64425bc75e3f3d 1-547
+.github/scripts/check-ffi-exports.py
+  h_64425bc75e3f3d 2-3,10-14,20-27,68-69,101-102,110-117,182-208,299-317,323-328,349-378
+.github/scripts/check-skill-ffi-constants.py
+  h_64425bc75e3f3d 1-104
+.github/scripts/check-skills.sh
+  h_64425bc75e3f3d 227-239
+.github/scripts/check-witness-results.py
+  h_64425bc75e3f3d 31-37,53,123-135,140,142,225-246,273-277,333-336,403-425,519,523-533,541,573-603
+.github/workflows/ci.yml
+  h_64425bc75e3f3d 23-39,141,334-344,346,394-396,398,496-498,500,544-546,548,633,645-650,983-999,1135,1141,1204-1206,1210-1218,1221,1256,1264,1392-1393,2459-2460,2491,2494-2495,2499-2504,2720-2721,4102,4354-4358,4385-4399,4463-4467,4641-4653,5385-5388,5418,5421-5433,5441,5453-5529,5694-5704,5706-5724,5727,5733-5747,6563,6786,6914-6921,6923,6972-6979,7161-7164,7330,7397-7401,7555,7705-7712,7714
+.github/workflows/natsim-enroll.yml
+  h_64425bc75e3f3d 1-145
+.github/workflows/natsim.yml
+  h_64425bc75e3f3d 337
+.github/workflows/skills.yml
+  h_64425bc75e3f3d 54,107
+AGENTS.md
+  h_64425bc75e3f3d 224
+README.md
+  h_64425bc75e3f3d 75-88
+TESTS.md
+  h_64425bc75e3f3d 139-145
+docs/data/tiers.yaml
+  h_64425bc75e3f3d 24,49,170-179
+docs/internal/misc/CODE_REVIEW_2026_09_22_WEBRTC_REPAIR_PASS.md
+  h_64425bc75e3f3d 1-1344
+docs/internal/misc/PERF_AUDIT_2026_09_13_TEST_EXECUTION.md
+  h_64425bc75e3f3d 166,169-170,174-178,184-185,281-282
+docs/internal/misc/WEBRTC_TRANSPORT_MERGE_REVIEW_2026_09_22.md
+  h_64425bc75e3f3d 1-864
+docs/internal/performance/WEBRTC_DOUBLE_AEAD.md
+  h_64425bc75e3f3d 13-15,223-224
+docs/internal/plans/BROWSER_GAME_STORE_API_DESIGN.md
+  h_64425bc75e3f3d 20-22,97,99-105,126,128-130,135,137,139,146,149,151-152,155-156,180-183,277-278,314-319,327,330-332,348-349,356,358,375-378,387-389,408
+docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md
+  h_64425bc75e3f3d 908-910,933-936,2024-2025
+docs/internal/plans/NET_CLI_PLAN_V2.md
+  h_64425bc75e3f3d 1-542
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  h_64425bc75e3f3d 1-4703
+docs/internal/plans/NET_RPC_LARGE_RESPONSE_BRIEF.md
+  h_64425bc75e3f3d 1-157
+docs/misc/NET_CLI_BRANCH_CODE_REVIEW_2026_09_22.md
+  h_64425bc75e3f3d 1-479
+go/nrpc_large_response_vectors_test.go
+  h_64425bc75e3f3d 1-73
+go/stream_close_test.go
+  h_64425bc75e3f3d 17-41,128-359
+go/subnet.go
+  h_64425bc75e3f3d 521-522
+go/subnet_golden_vectors_test.go
+  h_64425bc75e3f3d 66
+net/crates/net/.config/nextest.toml
+  h_64425bc75e3f3d 34-38
+net/crates/net/Cargo.lock
+  h_64425bc75e3f3d 151,162,224,291,301,671-676,873,1530,1553-1558,1722,2334,2336,2521,2647,2712,2792,2963,2965,2976,3071,3073,3088,3090,3094,3096,3108,3110,3121,3123,3143,3145,3155-3156,3163,3170-3172,3179,3181,3218,3286,3291,3304,3333,3335,3367,3374,3377,3381,3415,3512,3560-3571,3580,3664,4159-4179,4420,4422,4501,4505,4672,4851,4917,5016,5195-5205,5265-5280,5414,5606,5609,5622,5670,5705,5707,5709,5725,5727,5916,5919,5937,6091,6523,6762,6764,6767-6768,6770-6773,6848
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  h_64425bc75e3f3d 53-56,180-190
+net/crates/net/bindings/node/src/subnet.rs
+  h_64425bc75e3f3d 114
+net/crates/net/bindings/node/test/large_response_vectors.test.ts
+  h_64425bc75e3f3d 1-35
+net/crates/net/bindings/node/test/subnet_kinds.test.ts
+  h_64425bc75e3f3d 42
+net/crates/net/bindings/python/tests/test_large_response_vectors.py
+  h_64425bc75e3f3d 1-29
+net/crates/net/bindings/python/tests/test_subnet_kinds.py
+  h_64425bc75e3f3d 42
+net/crates/net/browser-ts/src/leader/session.ts
+  h_64425bc75e3f3d 75,330-334
+net/crates/net/browser-ts/src/leader/wasm.ts
+  h_64425bc75e3f3d 134
+net/crates/net/browser-ts/src/node.ts
+  h_64425bc75e3f3d 61,793-798,800,802-807
+net/crates/net/browser-ts/src/store/assembly.ts
+  h_64425bc75e3f3d 275-281,337-345,348-351,377-384
+net/crates/net/browser-ts/src/store/chunker.ts
+  h_64425bc75e3f3d 21,83-94,119-150,184-193,197-199,203-210,213-214
+net/crates/net/browser-ts/src/store/core.ts
+  h_64425bc75e3f3d 105-115,250-256,260-264
+net/crates/net/browser-ts/src/store/host.ts
+  h_64425bc75e3f3d 320-334
+net/crates/net/browser-ts/src/store/join.ts
+  h_64425bc75e3f3d 46-62,123-153,225-226,271-280,348-350,367-371,388,392-452,508-526,528-532,567-581,594,641-659,674-688,694-703,705-711,715-723,730-745,766-771
+net/crates/net/browser-ts/src/store/ledger.ts
+  h_64425bc75e3f3d 41,274-278
+net/crates/net/browser-ts/src/store/owner.ts
+  h_64425bc75e3f3d 253-262,264,266,268,296-302,313-359,374-377,677-692,694,754-763
+net/crates/net/browser-ts/src/store/replica.ts
+  h_64425bc75e3f3d 620-635,666-678
+net/crates/net/browser-ts/src/store/types.ts
+  h_64425bc75e3f3d 6-12
+net/crates/net/browser-ts/src/store/wire.ts
+  h_64425bc75e3f3d 805-812,815-816,818-823,833-865,869-870
+net/crates/net/browser-ts/src/wasm.ts
+  h_64425bc75e3f3d 462-477,479,721-751
+net/crates/net/browser-ts/test/fake-leader-wasm.ts
+  h_64425bc75e3f3d 25,145,278-293,295
+net/crates/net/browser-ts/test/fake-wasm.ts
+  h_64425bc75e3f3d 176,294-314,316-317,783-820
+net/crates/net/browser-ts/test/leader.test.ts
+  h_64425bc75e3f3d 167-179,423-482
+net/crates/net/browser-ts/test/node.test.ts
+  h_64425bc75e3f3d 285-298,300-311,854-942
+net/crates/net/browser-ts/test/store/assembly.test.ts
+  h_64425bc75e3f3d 36,165-192,272-307,688-813
+net/crates/net/browser-ts/test/store/core.test.ts
+  h_64425bc75e3f3d 320-361
+net/crates/net/browser-ts/test/store/hosted.test.ts
+  h_64425bc75e3f3d 26,133-134,176-182,390-393,1311-1404,2371-2372,2374-2379,2509-2965
+net/crates/net/browser-ts/test/store/replica.test.ts
+  h_64425bc75e3f3d 385,390-393,400-428
+net/crates/net/browser-ts/test/store/review_repairs.test.ts
+  h_64425bc75e3f3d 219-280,375-379,387-417,761-824
+net/crates/net/cli/CHANGELOG.md
+  h_64425bc75e3f3d 11-346
+net/crates/net/cli/Cargo.toml
+  h_64425bc75e3f3d 33-36,49-50,112-119,154-156
+net/crates/net/cli/README.md
+  h_64425bc75e3f3d 5,29-40,42,45-106,108-110,112-113,115-134,138-139,147-153,155,158-159,162-170,184,187-197,201,212,215,220-267,281-283
+net/crates/net/cli/src/commands/admin.rs
+  h_64425bc75e3f3d 103-108,262-272,283
+net/crates/net/cli/src/commands/aggregator.rs
+  h_64425bc75e3f3d 11-12,43,45-48,51-59,78-87,120-122,132-134,141-142,249,251-260,310-321,371-401,409-437,439-442,467,510-520,558-568
+net/crates/net/cli/src/commands/anchor.rs
+  h_64425bc75e3f3d 146-148,212-214,355-410,424-451,459,467-468,470-481,539,542-543,545-556,641,745,783-788,795-797,972-992,1029-1171,1173,1175,1183,1185-1186,1195
+net/crates/net/cli/src/commands/audit.rs
+  h_64425bc75e3f3d 22-24,56-58,93,95-104,133,135-144
+net/crates/net/cli/src/commands/cap.rs
+  h_64425bc75e3f3d 54-56,71-73,88-90,100-102,182,192,194-203,227,229-238,263,265-274,368-373,379-393,432,455-471
+net/crates/net/cli/src/commands/channel.rs
+  h_64425bc75e3f3d 14-24,26,29-30,33,36,45-189,194-196,210-212,231-342,344-613,622,624-633,657,659-668
+net/crates/net/cli/src/commands/channel_link.rs
+  h_64425bc75e3f3d 1-501
+net/crates/net/cli/src/commands/daemon.rs
+  h_64425bc75e3f3d 44-46,60,62-71
+net/crates/net/cli/src/commands/enrollment.rs
+  h_64425bc75e3f3d 1-2150
+net/crates/net/cli/src/commands/forwarding.rs
+  h_64425bc75e3f3d 51-53,109-112,119,121-122,124-175
+net/crates/net/cli/src/commands/gateway.rs
+  h_64425bc75e3f3d 50-52,62-64,111,113-122,139,141-150
+net/crates/net/cli/src/commands/ice.rs
+  h_64425bc75e3f3d 8-10,13,128-133,139-140,261,263-272,299-300,316-322,324-332,343-350,354-376,381-385,389-392,398,425,487-492,497-543,567-568
+net/crates/net/cli/src/commands/identity.rs
+  h_64425bc75e3f3d 51-53,70-72,86-88,99-101,120-191,383,397-407,757-761
+net/crates/net/cli/src/commands/joined.rs
+  h_64425bc75e3f3d 1-127
+net/crates/net/cli/src/commands/lifecycle.rs
+  h_64425bc75e3f3d 1-4596
+net/crates/net/cli/src/commands/logs.rs
+  h_64425bc75e3f3d 21-23,76,78-87,147-149,167,169-178
+net/crates/net/cli/src/commands/man.rs
+  h_64425bc75e3f3d 27,33-46
+net/crates/net/cli/src/commands/mcp.rs
+  h_64425bc75e3f3d 38,65-67,78-80,114-120,131,134-140,146,149,151-152,156-201,205-207,209-216,218-220,227,229,231-232,234-242,260,300-321
+net/crates/net/cli/src/commands/mod.rs
+  h_64425bc75e3f3d 20,24,29-30,39,41,44
+net/crates/net/cli/src/commands/netdb.rs
+  h_64425bc75e3f3d 19,71-73,87-89,99-101,133-136,167-168,178-180,251-253,261,273-305,345-381,619-680,686,693,701,735-736,778-783,785-786,1063
+net/crates/net/cli/src/commands/node.rs
+  h_64425bc75e3f3d 40-43,48-51,78-82,97-102,104-107,111-116,144-177,260-281,283-284,300-324
+net/crates/net/cli/src/commands/org.rs
+  h_64425bc75e3f3d 80-257,262-264,295-297,335-337,363-365,409-411,490-562,569-1011,1279,2038-2042
+net/crates/net/cli/src/commands/peer.rs
+  h_64425bc75e3f3d 24-26,40,42-51
+net/crates/net/cli/src/commands/relay.rs
+  h_64425bc75e3f3d 1-122
+net/crates/net/cli/src/commands/scope.rs
+  h_64425bc75e3f3d 1-99
+net/crates/net/cli/src/commands/snapshot.rs
+  h_64425bc75e3f3d 36,50-52,62,68-70,77,89,91-100,108,110-119
+net/crates/net/cli/src/commands/subnet.rs
+  h_64425bc75e3f3d 73-237,242-244,254-256,266-268,282-284,296-393,397-926,933,935-944,963,965-974,1003,1005-1014,1062,1120,1134-1136,1161-1163,1223-1225,1279-1281,1349-1351,1356-1358,1453-1474,1477-1479,1857-1878,1889-1892,1901-1911,2052-2059,2064-2068,2077-2096,2175,2194,2215
+net/crates/net/cli/src/commands/subnet_active.rs
+  h_64425bc75e3f3d 1-122
+net/crates/net/cli/src/commands/transfer.rs
+  h_64425bc75e3f3d 100-102,139-141,193,195-219,222,243,247-248,250-262,268-272,300-301,306-309,325-350,429-441,544-545,548-553,556,565,572,574-577,600,607,609-612,637,644,646-649,1008-1030
+net/crates/net/cli/src/commands/typegen/live.rs
+  h_64425bc75e3f3d 1-238
+net/crates/net/cli/src/commands/typegen/mod.rs
+  h_64425bc75e3f3d 21,178,182,185,198,201-216,218-236,242-243,250-251,301-307,329,331-349,465-466,472-474,483-493,495-505,520-529,531-538,540-555,754,772-827
+net/crates/net/cli/src/commands/wrap.rs
+  h_64425bc75e3f3d 5-6,33,35,49-50,81-88,94-98,147-153,168,170-171,173-191,193-205,207-226,228-246,248-255,259-283,353-361,369-374,454-486,598,616,649-657
+net/crates/net/cli/src/config.rs
+  h_64425bc75e3f3d 115-125,129-130,132,134,137-138,167,186,188,328,396-399
+net/crates/net/cli/src/context.rs
+  h_64425bc75e3f3d 36-39,47,54-67,191,309-310,313,316-318,323-324,398,401,419-437,443-513,623-624
+net/crates/net/cli/src/deadline.rs
+  h_64425bc75e3f3d 1-91
+net/crates/net/cli/src/main.rs
+  h_64425bc75e3f3d 28,34,69-71,126-132,148-173,176,179,182,185,188,191,194,197,203-204,207,214-215,218,221-222,225,312-356,359-366,370-389,408-409,418-446,451-462
+net/crates/net/cli/src/target.rs
+  h_64425bc75e3f3d 1-261
+net/crates/net/cli/tests/aggregator_remote.rs
+  h_64425bc75e3f3d 160-161,174-225
+net/crates/net/cli/tests/automation_contract.rs
+  h_64425bc75e3f3d 1-597
+net/crates/net/cli/tests/capability_workflow.rs
+  h_64425bc75e3f3d 1-220
+net/crates/net/cli/tests/channel_join.rs
+  h_64425bc75e3f3d 1-859
+net/crates/net/cli/tests/confirmation_tty.rs
+  h_64425bc75e3f3d 1-145
+net/crates/net/cli/tests/enrollment_crash.rs
+  h_64425bc75e3f3d 1-284
+net/crates/net/cli/tests/enrollment_leave.rs
+  h_64425bc75e3f3d 1-256
+net/crates/net/cli/tests/enrollment_lifecycle.rs
+  h_64425bc75e3f3d 1-552
+net/crates/net/cli/tests/enrollment_workflow.rs
+  h_64425bc75e3f3d 1-631
+net/crates/net/cli/tests/exit_codes.rs
+  h_64425bc75e3f3d 105-112,118-200
+net/crates/net/cli/tests/fixtures/README.md
+  h_64425bc75e3f3d 1-161
+net/crates/net/cli/tests/fixtures/capability_client.rs
+  h_64425bc75e3f3d 1-73
+net/crates/net/cli/tests/fixtures/capability_server.py
+  h_64425bc75e3f3d 1-42
+net/crates/net/cli/tests/fixtures/enrollment/README.md
+  h_64425bc75e3f3d 1-191
+net/crates/net/cli/tests/fixtures/marker_child.rs
+  h_64425bc75e3f3d 1-13
+net/crates/net/cli/tests/fixtures/native_consumer.py
+  h_64425bc75e3f3d 1-45
+net/crates/net/cli/tests/fixtures/protected_consumer.py
+  h_64425bc75e3f3d 1-64
+net/crates/net/cli/tests/fixtures/wrap_startup.rs
+  h_64425bc75e3f3d 1-29
+net/crates/net/cli/tests/join_lifecycle.rs
+  h_64425bc75e3f3d 1-280
+net/crates/net/cli/tests/local_target_inspection.rs
+  h_64425bc75e3f3d 1-1417
+net/crates/net/cli/tests/native_contract_workflow.rs
+  h_64425bc75e3f3d 1-303
+net/crates/net/cli/tests/netdb_restore_preflight.rs
+  h_64425bc75e3f3d 1-764
+net/crates/net/cli/tests/node_lifecycle.rs
+  h_64425bc75e3f3d 1-506
+net/crates/net/cli/tests/org_join.rs
+  h_64425bc75e3f3d 1-668
+net/crates/net/cli/tests/protected_native_workflow.rs
+  h_64425bc75e3f3d 1-327
+net/crates/net/cli/tests/relay_join.rs
+  h_64425bc75e3f3d 1-416
+net/crates/net/cli/tests/relay_serve.rs
+  h_64425bc75e3f3d 1-98
+net/crates/net/cli/tests/remote_inspection.rs
+  h_64425bc75e3f3d 1-565
+net/crates/net/cli/tests/rpc_deadline.rs
+  h_64425bc75e3f3d 1-141
+net/crates/net/cli/tests/snapshot_no_false_success.rs
+  h_64425bc75e3f3d 150-152
+net/crates/net/cli/tests/subnet_issuance.rs
+  h_64425bc75e3f3d 17,435-512
+net/crates/net/cli/tests/subnet_join.rs
+  h_64425bc75e3f3d 1-1016
+net/crates/net/cli/tests/subnet_remove.rs
+  h_64425bc75e3f3d 1-258
+net/crates/net/cli/tests/target_resolution.rs
+  h_64425bc75e3f3d 1-251
+net/crates/net/cli/tests/temporary_scope.rs
+  h_64425bc75e3f3d 1-303
+net/crates/net/cli/tests/transfer_cli_admin.rs
+  h_64425bc75e3f3d 71-74,116-122
+net/crates/net/cli/tests/transfer_cli_blob.rs
+  h_64425bc75e3f3d 65-68,151,171-210
+net/crates/net/cli/tests/typegen_live_metadata.rs
+  h_64425bc75e3f3d 1-471
+net/crates/net/cli/tests/wrap_listen.rs
+  h_64425bc75e3f3d 1-160
+net/crates/net/cli/tests/wrap_startup.rs
+  h_64425bc75e3f3d 1-171
+net/crates/net/docs/NRPC_LARGE_RESPONSES.md
+  h_64425bc75e3f3d 1-74
+net/crates/net/docs/SUBPROTOCOLS.md
+  h_64425bc75e3f3d 25-26
+net/crates/net/docs/TRANSPORT.md
+  h_64425bc75e3f3d 149,151,153
+net/crates/net/docs/cli/TYPEGEN.md
+  h_64425bc75e3f3d 58-64,68-94,98-100,148-152,160,162,167-173,201-205,215,217-220,227,229-236
+net/crates/net/docs/releases/RELEASE_v0.15_REBEL_YELL.md
+  h_64425bc75e3f3d 51,138-139,144,178
+net/crates/net/leaf/src/anchor_control_plane.rs
+  h_64425bc75e3f3d 121-123,135-169,333-364,369-377,421-425,428,437-446,457-458,460,464-468,471-472,494-496,498,526-537,539-555,557-560
+net/crates/net/leaf/src/bootstrap.rs
+  h_64425bc75e3f3d 42,117-135,191,193-194,224-297,380-393,398-399,405-414,431-441,467-475,659-662,664-671,718-722,836-889,982-1074
+net/crates/net/leaf/src/control_plane.rs
+  h_64425bc75e3f3d 40-44,137-138,199-201
+net/crates/net/leaf/src/counters.rs
+  h_64425bc75e3f3d 118-125,152,158,179,198,358-373,402-405
+net/crates/net/leaf/src/dispatch.rs
+  h_64425bc75e3f3d 251-258,263,266,269,272,350-360,372-378,452,466,476,482,492,513,524,529
+net/crates/net/leaf/src/enroll.rs
+  h_64425bc75e3f3d 35,122,137-157
+net/crates/net/leaf/src/error.rs
+  h_64425bc75e3f3d 19-27,228-230
+net/crates/net/leaf/src/frame.rs
+  h_64425bc75e3f3d 15,20-32
+net/crates/net/leaf/src/leader.rs
+  h_64425bc75e3f3d 2663-2665,2778,3029
+net/crates/net/leaf/src/leader_session.rs
+  h_64425bc75e3f3d 299-312,338-344,500,597-610,1064-1090,1100,1104-1118,1239-1241,1644-1648,1650-1665,1747-1753,1765-1785,2563-2567,2571,3011,3026-3032,3036
+net/crates/net/leaf/src/node.rs
+  h_64425bc75e3f3d 422-484,489,513-534,569-577,582-587,721,733,747,1035-1048,1065-1092,1395-1406,1438-1481,1505,1510-1513,1518-1534,1589-1590,1604-1619,1633-1652,1703-1704,1828-1847,1863-1869,1891-1915,1935-1937,1947-1961,1971-1975,1979-1999,2063-2065,2068,2132,2230,2235-2247,2293-2309,2433-2505,3020-3027,3184,3418-3446,3470-3473,3693-3704,6793-6866,7162-8020
+net/crates/net/leaf/src/rtc.rs
+  h_64425bc75e3f3d 219-232,235-241,310-319,321-322,325-327,348-352,356-357,367,378,403,405-411,415-439,468-479,507-508,525,580-581,625,879,902-905
+net/crates/net/leaf/src/session.rs
+  h_64425bc75e3f3d 152-159,164-165,196,210-225,233-237,240,249,252-255,977
+net/crates/net/leaf/src/signal.rs
+  h_64425bc75e3f3d 17-18,216,424
+net/crates/net/leaf/src/stream.rs
+  h_64425bc75e3f3d 339-354,357-366,369,371,680-742
+net/crates/net/leaf/src/stream_ownership.rs
+  h_64425bc75e3f3d 26,120-172,191-194,219-249,283-285,293,304-314,317,327-340,344-348,350-352,360-374,379-387,392,410-417,430-431,446-447,462,464,476,571-595,598-600,603,609-611,627-638,641,651-662,666,668-678,687-690,724-727,737,854-855,863-1067
+net/crates/net/leaf/src/wasm.rs
+  h_64425bc75e3f3d 391-422,497-512,532-540,574-584,669-677,734-836,911-920,938,976-997,1093-1134,1209-1218,1221-1225,1233-1258,1507-1512,1552-1556,1561,1566-1576,1584-1601,1604-1605,1619,1682,1722-1729,1883-1886,1902,1906,1910,1944-1955,2358-2372,2374-2375,2377-2395,2509,2524-2534,2545,2665-2676,2704-2706,2728-2745,2789-2816,2826,2835-2844,2854-2861,2864,2888-2890,2908-2927,2929-2931,2939-2964,2966,2968-3005,3159-3175,3177,3191-3198,3232-3236,3239-3271,3278-3287,3291,3298-3320,3322-3324,3327-3331,3340-3343,3345-3346,3352-3356,3361-3363,3377-3415,3461-3468,3475,3616-3619,4073-4102,4164-4184,4302-4309,7177-7311
+net/crates/net/leaf/src/wasm_witnesses.rs
+  h_64425bc75e3f3d 73-83,158-169,172-184,186-191,224,228-229,246-247,334,338-342,344,346,633-665,668,672-676,678-687,690-691,874-886,1215-1269,1307-1311,1313-1317,1319-1321,1323-1362,1468-1482,1492-1493,1500-1504,1506-1523,1529-1542,1579-1590,1615-1636,1642-1647,1651-1654,1656-1660,1662-1665,1672-1676,1683-1689,1698-1708,1716-1719,1721,1805,1811-1836,2015-2327
+net/crates/net/leaf/tests/control_plane_boundary.rs
+  h_64425bc75e3f3d 46,77-116,130-631,672-755,766-770,790-809,862-867,877-948,974-985,988-1008,1025-1036,1044-1055
+net/crates/net/leaf/tests/dependency_boundary.rs
+  h_64425bc75e3f3d 29-67,138-150,152-157,159-172,236-237,261-262
+net/crates/net/leaf/tests/fixture_parity.rs
+  h_64425bc75e3f3d 82-131
+net/crates/net/leaf/tests/kyra_followup.rs
+  h_64425bc75e3f3d 21-39,136-140,144-179,181-199,203,215,223-224
+net/crates/net/leaf/tests/kyra_round3_review.rs
+  h_64425bc75e3f3d 8-22,166
+net/crates/net/leaf/tests/kyra_round4_parent.rs
+  h_64425bc75e3f3d 9-24,275-300
+net/crates/net/leaf/tests/leader_e2e/frozen_tab_probe.mjs
+  h_64425bc75e3f3d 98-104,149-154,176-179,183-187,192-198,201-226
+net/crates/net/leaf/tests/wasm_leader.rs
+  h_64425bc75e3f3d 143-147,199-202,341-389,1103-1113,1263-1282,1397-1403,1411,1414-1417,1419-1435,1444,1448,1453-1472,1474,1476-1487,1499-1504,1508,1510-1516,1896-1905,2084-2095,2109,2113,2120-2126,2141-2156,2568-2585,2607-2629,2735-2741,2744,2750-2751,2778-2816,2877-2884,2886-2887,3413-3417,3419-3420,3533-3535,3537
+net/crates/net/leaf/tests/wasm_leaf.rs
+  h_64425bc75e3f3d 350-353,362
+net/crates/net/sdk/Cargo.toml
+  h_64425bc75e3f3d 70-73,197,292
+net/crates/net/sdk/src/bootstrap_credential.rs
+  h_64425bc75e3f3d 214-219,582-591,596,611-679,927-1070
+net/crates/net/sdk/src/channel_issuer.rs
+  h_64425bc75e3f3d 1-137
+net/crates/net/sdk/src/enrollment.rs
+  h_64425bc75e3f3d 65-97,248,264-285
+net/crates/net/sdk/src/enrollment/bundle.rs
+  h_64425bc75e3f3d 1-894
+net/crates/net/sdk/src/enrollment/device.rs
+  h_64425bc75e3f3d 1-361
+net/crates/net/sdk/src/enrollment/invite.rs
+  h_64425bc75e3f3d 1-1013
+net/crates/net/sdk/src/enrollment/org.rs
+  h_64425bc75e3f3d 1-119
+net/crates/net/sdk/src/enrollment/policy.rs
+  h_64425bc75e3f3d 1-125
+net/crates/net/sdk/src/enrollment/portmap.rs
+  h_64425bc75e3f3d 1-199
+net/crates/net/sdk/src/enrollment/redeem.rs
+  h_64425bc75e3f3d 1-613
+net/crates/net/sdk/src/enrollment/renew.rs
+  h_64425bc75e3f3d 1-276
+net/crates/net/sdk/src/enrollment/service.rs
+  h_64425bc75e3f3d 1-374
+net/crates/net/sdk/src/enrollment/standalone.rs
+  h_64425bc75e3f3d 1-1045
+net/crates/net/sdk/src/enrollment/store.rs
+  h_64425bc75e3f3d 1-1203
+net/crates/net/sdk/src/lib.rs
+  h_64425bc75e3f3d 178-185
+net/crates/net/sdk/src/members.rs
+  h_64425bc75e3f3d 1-560
+net/crates/net/sdk/src/mesh.rs
+  h_64425bc75e3f3d 95,108-112,128-129,143,166-167,177,272-287,407-416,483-488,513-515,757-769,1019-1030,1035,1047-1071
+net/crates/net/sdk/src/org.rs
+  h_64425bc75e3f3d 100-101
+net/crates/net/sdk/src/org/floors.rs
+  h_64425bc75e3f3d 1-443
+net/crates/net/sdk/src/rtc_bootstrap.rs
+  h_64425bc75e3f3d 513-520,524,529-547,569,578-581,583-589,596-606,1376,1402-1407,1454-1456,1464-1471,1561-1675
+net/crates/net/sdk/src/rtc_bootstrap_acme.rs
+  h_64425bc75e3f3d 102-137,143,208,213,220-232,244-246,250-254,752-789
+net/crates/net/sdk/src/sensing.rs
+  h_64425bc75e3f3d 902-911,913-915,918-920
+net/crates/net/sdk/src/subnet.rs
+  h_64425bc75e3f3d 101,568-571
+net/crates/net/sdk/tests/a2a_paid_admission.rs
+  h_64425bc75e3f3d 1454-1458
+net/crates/net/sdk/tests/channel_delegated.rs
+  h_64425bc75e3f3d 1-290
+net/crates/net/sdk/tests/enroll_parity.rs
+  h_64425bc75e3f3d 1-520
+net/crates/net/sdk/tests/enrollment_channel.rs
+  h_64425bc75e3f3d 1-496
+net/crates/net/sdk/tests/enrollment_invite.rs
+  h_64425bc75e3f3d 1-344
+net/crates/net/sdk/tests/enrollment_join.rs
+  h_64425bc75e3f3d 1-590
+net/crates/net/sdk/tests/enrollment_org.rs
+  h_64425bc75e3f3d 1-850
+net/crates/net/sdk/tests/enrollment_policy.rs
+  h_64425bc75e3f3d 1-113
+net/crates/net/sdk/tests/enrollment_redeem.rs
+  h_64425bc75e3f3d 1-515
+net/crates/net/sdk/tests/enrollment_relay.rs
+  h_64425bc75e3f3d 1-341
+net/crates/net/sdk/tests/enrollment_store.rs
+  h_64425bc75e3f3d 1-512
+net/crates/net/sdk/tests/enrollment_subnet.rs
+  h_64425bc75e3f3d 1-622
+net/crates/net/sdk/tests/members_observe.rs
+  h_64425bc75e3f3d 1-150
+net/crates/net/sdk/tests/rtc_bootstrap_listener.rs
+  h_64425bc75e3f3d 646-707,794,798,940,948-950,971,974-984,1016-1019,1047-1048,1061-1243
+net/crates/net/sdk/tests/subnet_kind_fixture.rs
+  h_64425bc75e3f3d 65
+net/crates/net/src/adapter/net/behavior/enrollment_storage.rs
+  h_64425bc75e3f3d 1-585
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  h_64425bc75e3f3d 1206-1231,1304
+net/crates/net/src/adapter/net/behavior/mod.rs
+  h_64425bc75e3f3d 51-53
+net/crates/net/src/adapter/net/behavior/org_authority.rs
+  h_64425bc75e3f3d 487-494,625-631,768-810,968-979,1997,2062,2110,3044-3085
+net/crates/net/src/adapter/net/behavior/org_revocation.rs
+  h_64425bc75e3f3d 1095,2560-2571,2582,2586,2591,2597,2600-2623
+net/crates/net/src/adapter/net/cortex/checkpoint.rs
+  h_64425bc75e3f3d 1-296
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  h_64425bc75e3f3d 58-73,91-127,168-169,180-192,430-435,456-457,465-484,488-516,600-674
+net/crates/net/src/adapter/net/cortex/mod.rs
+  h_64425bc75e3f3d 21-22
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  h_64425bc75e3f3d 28-30,281-282,313-315,1670-1672,1717,1761,1770-1774,2047-2048,2072,2200-2226,8667-8673,8754,8757-8761,8767-8789,8793-8816,8834-8869,8969-8991,9017-9026,9031-9033,9040,9050-9075,9260-9265,10175-10227,11895-11939
+net/crates/net/src/adapter/net/cortex/rpc_large_response.rs
+  h_64425bc75e3f3d 1-418
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  h_64425bc75e3f3d 54-69,90-126,145-146,157-169,426-431,452-453,461-480,484-512,652-678
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  h_64425bc75e3f3d 136
+net/crates/net/src/adapter/net/identity/token.rs
+  h_64425bc75e3f3d 783-789,1437-1457
+net/crates/net/src/adapter/net/mesh.rs
+  h_64425bc75e3f3d 746,762,872,1914-1938,1957,1967-1981,2090-2166,2194-2198,2493-2496,2524-2540,2615-2621,2680-2684,2711,2900-2956,3112-3119,3186-3198,3543,3551-3552,3709-3715,3924-3937,4030-4039,4070-4075,4139-4177,4180-4182,4194-4279,10618-10637,11905-11909,11935-11941,12030-12041,12765-12778,12842-12856,12918-12926,13034-13040,13332,13681-13684,13691-13692,14460-14478,14552-14553,14562-14563,14588-14593,14808-14809,14827-14832,14854-14855,14871,14897-14898,20167-20190,20327-20342,20370-20376,20389,20393-20395,20407-20574,20598,20602-20625,20635,20644-20647,24031,24110,24218-24246,24479-24492,24590,24608,25106,25213-25214,26982-26986,26994-26996,27007-27008,27020,27029,27042-27043,27294-27297,27338-27376,27399-27414,27448,27623-27635,27979,27981-28012,28015-28033,28442-28450,28483-28545,29417,29616,29697,29735,29863-29881,29890-29910,30081,30479-30489,30493,30641-30660,30668-30684,31424,32174-32175,32225-32234,32270,32297,32308,32329,32356,32363-32367,32381,32401,32410-32414,32458,32478,32631-32647,33284-33288,33290-33314,33316,33512,33517,33519,33554,33575,33837-33872,34772-34827,35471-35489,35625-35883,36189-36190,36215,39446-39496,39575,40737-40749,41042-41057,41213-41225,41279-41292,41349-41422,41456-41468,42104-42116,42122-42126,42128-42133,42972-42973,43008,43522-43533,43567-43594,43598-43608,43627-43651,43653-43684,43740-43751,43753,44046,44051,44053,44098,44653-44657,44716-44718,44762-44764,47434-47468,48742,48776-48780,48800-48801,48843-48857,48874,48877,48899-48908,48913-48983,49010,49040,49230,49399,49409-49443,49589-49640,50405-50428,51000-51007,51011,51014,53112,53211,53413,53420,53606,54151-54157,54186-54192,54222-54228,54260-54266,54295-54348,54350,54354-54455,54480-54486,54691-54711,54713-54782,54785-54796,62150-62189,62209-62213,62261-62263,62284-62346,63074-63077,63788-63989
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  h_64425bc75e3f3d 3724-3732,3864,3870,3877-3881,3914-4059,4566-4575,4635-4637,4654-4668,4670-4672,7574,7642-7670,7705-7708,7736-7742,7755-7771,9019-9057
+net/crates/net/src/adapter/net/mesh_rpc_large_response_tests.rs
+  h_64425bc75e3f3d 1-728
+net/crates/net/src/adapter/net/mod.rs
+  h_64425bc75e3f3d 239-241,1236
+net/crates/net/src/adapter/net/netdb/db.rs
+  h_64425bc75e3f3d 33-45,293-296,305-314
+net/crates/net/src/adapter/net/org_routing_wiring_tests.rs
+  h_64425bc75e3f3d 7029,7982
+net/crates/net/src/adapter/net/redex/manager.rs
+  h_64425bc75e3f3d 212-226
+net/crates/net/src/adapter/net/router.rs
+  h_64425bc75e3f3d 666-668,705,710-712,746,1002-1008,1063-1065,1120-1124,1141,1177-1182,1186,1196,1381-1406
+net/crates/net/src/adapter/net/rtc/admission.rs
+  h_64425bc75e3f3d 283-299,475-517
+net/crates/net/src/adapter/net/rtc/driver.rs
+  h_64425bc75e3f3d 2007-2008,2015-2021
+net/crates/net/src/adapter/net/rtc/engine.rs
+  h_64425bc75e3f3d 44-48,63-80,88-106,199-207,213,220,223-227,242-251,255-258,310-320,330-336,338,345,348,389,393-564
+net/crates/net/src/adapter/net/rtc/fragment.rs
+  h_64425bc75e3f3d 42-49,145-161,417-424,509-512,907-908,1249,1264-1290,1294,1317-1320,1528-1530,1719,1731-1765,2061-2066,2073-2077,2079-2082,2084-2101,2106,2108,2113-2114
+net/crates/net/src/adapter/net/rtc/stun.rs
+  h_64425bc75e3f3d 56-62,79-83,86-90,273-319
+net/crates/net/src/adapter/net/rtc/transport.rs
+  h_64425bc75e3f3d 20,119-129,251,578-580,585,609-613,630,760-792
+net/crates/net/src/adapter/net/subnet/admission.rs
+  h_64425bc75e3f3d 210-225,242-275
+net/crates/net/src/adapter/net/subnet/admission_wire.rs
+  h_64425bc75e3f3d 1-248
+net/crates/net/src/adapter/net/subnet/auth.rs
+  h_64425bc75e3f3d 17-19,51-52,218-221,261,296,871-1057,1072-1073,1082-1088,1204-1341,2710-2724,2817,2820
+net/crates/net/src/adapter/net/subnet/control.rs
+  h_64425bc75e3f3d 49,84-87,98,650-651,662,673,684,707-709,828-830
+net/crates/net/src/adapter/net/subnet/floor_status.rs
+  h_64425bc75e3f3d 1-535
+net/crates/net/src/adapter/net/subnet/floor_store.rs
+  h_64425bc75e3f3d 1-200
+net/crates/net/src/adapter/net/subnet/mod.rs
+  h_64425bc75e3f3d 16,23-24,41-43
+net/crates/net/src/adapter/net/subnet/provision.rs
+  h_64425bc75e3f3d 261,345
+net/crates/net/src/adapter/net/transport.rs
+  h_64425bc75e3f3d 344-398,414-415,428,473-489,505-516,550-564,603-620
+net/crates/net/src/adapter/net/traversal/blind_relay.rs
+  h_64425bc75e3f3d 1-2435
+net/crates/net/src/adapter/net/traversal/mod.rs
+  h_64425bc75e3f3d 50
+net/crates/net/src/adapter/net/traversal/portmap/mod.rs
+  h_64425bc75e3f3d 44,84-104
+net/crates/net/src/adapter/net/traversal/portmap/natpmp.rs
+  h_64425bc75e3f3d 87,99-100,206-215,247-310,338-352,387,394-409,446-447,458,462-472,483,593,597-600,633-634,660,1452-1534
+net/crates/net/src/adapter/net/traversal/portmap/sequential.rs
+  h_64425bc75e3f3d 75-84,86-90,264-271,280
+net/crates/net/src/adapter/net/traversal/portmap/upnp.rs
+  h_64425bc75e3f3d 90-91,124-137,233,271
+net/crates/net/tests/capability_multihop.rs
+  h_64425bc75e3f3d 558-892
+net/crates/net/tests/cross_lang_nrpc/golden_vectors_large_response.json
+  h_64425bc75e3f3d 1-48
+net/crates/net/tests/cross_lang_subnet/stable_kinds.json
+  h_64425bc75e3f3d 29-30,36-37
+net/crates/net/tests/cross_lang_wire/README.md
+  h_64425bc75e3f3d 9-12,28-31
+net/crates/net/tests/direct_upgrade.rs
+  h_64425bc75e3f3d 848-1081
+net/crates/net/tests/integration_netdb.rs
+  h_64425bc75e3f3d 17-154
+net/crates/net/tests/integration_nrpc_mesh.rs
+  h_64425bc75e3f3d 127-234
+net/crates/net/tests/integration_nrpc_streaming.rs
+  h_64425bc75e3f3d 668-737
+net/crates/net/tests/natsim/browser/driver/driver.mjs
+  h_64425bc75e3f3d 321,325-375
+net/crates/net/tests/natsim/browser/page/matrix.js
+  h_64425bc75e3f3d 580-589
+net/crates/net/tests/natsim/enroll/run_enroll_direct.sh
+  h_64425bc75e3f3d 1-220
+net/crates/net/tests/natsim/enroll/run_enroll_relay.sh
+  h_64425bc75e3f3d 1-279
+net/crates/net/tests/natsim/run_scenario.sh
+  h_64425bc75e3f3d 450-453
+net/crates/net/tests/natsim/setup.sh
+  h_64425bc75e3f3d 49-55,110,113,312-334
+net/crates/net/tests/nrpc_service_equality.rs
+  h_64425bc75e3f3d 133-145,260,308
+net/crates/net/tests/rtc_admission.rs
+  h_64425bc75e3f3d 20,82-117,190-211,214-215,231-253,255-274,276-278,281-309,311-330,333-341,344-360,363,374-385,391,403-405,407-428,430-540,1948-2010
+net/crates/net/tests/rtc_browser/page/leaf5.js
+  h_64425bc75e3f3d 497-507,525-529,543-545,548,1264,1835-1842
+net/crates/net/tests/rtc_browser/runner/src/stage5.rs
+  h_64425bc75e3f3d 5175,5223-5227
+net/crates/net/tests/rtc_loopback.rs
+  h_64425bc75e3f3d 165-226,228-235
+net/crates/net/tests/rtc_signalling.rs
+  h_64425bc75e3f3d 12-13,647-653,655-656,800-803,1028,1207-1482
+net/crates/net/tests/subnet_subject_floor.rs
+  h_64425bc75e3f3d 1-599
+net/crates/net/tests/subnet_wire_admission.rs
+  h_64425bc75e3f3d 1-319
+net/crates/net/wire/src/peer_addr.rs
+  h_64425bc75e3f3d 37-69,108-117,127,148,152-179
+net/crates/net/wire/src/session.rs
+  h_64425bc75e3f3d 103-107,265-266,1905,1909-1924,2012-2019
+net/crates/net/wire/src/stream.rs
+  h_64425bc75e3f3d 41,43-49,51-52
+web/package-lock.json
+  h_64425bc75e3f3d 13,49-50,52,61,74-75,109-110,113,123,125,373-486,497-499,1618-1620,1628-1630,1634-1636,1645-1647,1666-1668,1682-1684,1698-1700,1717-1719,1736-1738,1755-1757,1774-1776,1790-1792,1931-1934,1937,1940-1951,1953,1956-1967,1969,1972-1983,1985,1988-1999,2001,2004-2015,2017,2020-2031,2033,2036-2042,2044-2047,2049,2052-2061,2063-2068,2071-2080,2082-2087,2090-2099,2101-2106,2109-2336,4706-4708,4711-4716,4719,4723-4725,4728-4730,4733-4742,4746-4748,4751,4754-4763,4767-4769,4772,4775,4778-4781,4784,4787,4790-4842,4846,4849-4852,4855,4859,4870-4891,4903-4907,4909-4915,4918,4921-4930,4932,4935-4949,4951-4963,4966-4970,4972,4975-4982,4984,4987-4991,4993-4996,4999-5002,5005-5006,5009-5012,5015-5018,5021,5024-5027,5030,5033,5036-5039,5042-5044,5047,5050-5053,5056,5059-5062,5065,5068,5071-5074,5077-5079,5082,5085-5086,5089,5094-5097,5100,5103-5106,5109,5112,5115-5118,5121-5122,5125,5128-5131,5134-5135,5138,5141-5144,5147,5150-5153,5156,5159,5162-5165,5168,5171-5174,5177,5180,5183-5186,5189-5190,5193,5196-5199,5202,5205-5208,5211,5214,5217-5220,5223-5225,5228,5231-5234,5237,5241-5243,5246,5249,5253-5255,5259-5260,5263,5266-5269,5272,5275-5278,5281,5284,6003-6005,6013-6015,6024,6037-6039,6042,6053-6055,6059,6066,6363,7652-7663,8053-8054,8714,9058-9060,9064,9092-9094,9616,9675,9761,9863-9865,9868,10182,11719,11840-11842,13004-13006,13009,13026-13028,13147-13149,13152,13166-13173,13612-13647,13652,13668,13727,14030-14032,14036-14037,14060-14062,14065,14108-14110,14929,15180-15191,15895,16824
+web/package.json
+  h_64425bc75e3f3d 23,59-60,62,71,84-85,119-120,123,133,135
+web/src/content/docs/agent-briefs/wrap-and-use-an-mcp-server.md
+  h_64425bc75e3f3d 21-23
+web/src/content/docs/concepts/architecture.md
+  h_64425bc75e3f3d 98-100
+web/src/content/docs/concepts/channels.md
+  h_64425bc75e3f3d 83-114
+web/src/content/docs/concepts/organizations.md
+  h_64425bc75e3f3d 240-269
+web/src/content/docs/concepts/subnets.md
+  h_64425bc75e3f3d 133-170
+web/src/content/docs/concepts/webrtc-transport.md
+  h_64425bc75e3f3d 1-170
+web/src/content/docs/guides/daemons-and-placement.md
+  h_64425bc75e3f3d 243
+web/src/content/docs/guides/nat-and-traversal.md
+  h_64425bc75e3f3d 44-70,135-143
+web/src/content/docs/guides/wrap-mcp-server.md
+  h_64425bc75e3f3d 27-30
+web/src/content/docs/reference/cli.md
+  h_64425bc75e3f3d 7-20,24,26,28,30,32,34,36,38-62,64-72,74-78,80-85,87-90,92,94-121,124,126,128,130,132,134-140,143,145,147,149-161,163,165-188,190-198,201,203,205,207,209-211,213-221,224,226,228,230-231,233-239,242,246,248-249,252,256-258,275,277,282,284,308,358,362,372-413,416,455,478-501,504-513,520,524,528-566,582-584,588
+web/src/content/docs/reference/subprotocol-ids.md
+  h_64425bc75e3f3d 28-29
+web/src/content/docs/releases/RELEASE_v0.15_REBEL_YELL.md
+  h_64425bc75e3f3d 55,142-143,148,182
+web/src/content/docs/sdk/README.md
+  h_64425bc75e3f3d 19,34-39
+web/src/content/docs/sdk/browser/README.md
+  h_64425bc75e3f3d 1-124
+web/src/content/docs/sdk/browser/errors.md
+  h_64425bc75e3f3d 1-147
+web/src/content/docs/sdk/browser/quickstart.md
+  h_64425bc75e3f3d 1-179
+web/src/content/docs/sdk/browser/session.md
+  h_64425bc75e3f3d 1-128
+web/src/content/docs/sdk/browser/store.md
+  h_64425bc75e3f3d 1-199
+web/src/content/docs/sdk/browser/three.md
+  h_64425bc75e3f3d 1-159
+web/src/content/docs/start/install/typescript.md
+  h_64425bc75e3f3d 36-48
+web/src/docs.order.ts
+  h_64425bc75e3f3d 34,53-56,100,243-246
+web/src/lib/keyword-links.ts
+  h_64425bc75e3f3d 42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "88a8c82d0c928f0113fc47b5177933598a085d2c",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
