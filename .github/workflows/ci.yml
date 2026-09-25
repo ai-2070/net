@@ -3763,9 +3763,11 @@ jobs:
       # The vitest run above EXECUTED these; this step PINS them (a witness
       # must not disappear silently): lexical name-existence, fail-closed,
       # over the two test files (vitest names are literal `it(...)` strings).
-      # Floor/roster: 11 (10 in org_live + 1 in
+      # Floor/roster: 16 (12 in org_live + 3 in mesh_rpc_live + 1 in
       # consumer_compile); extended in the same commit as new witnesses.
-      - name: Witness roster — Node org facade (11)
+      # The §23 audit added the NODE-3 breadth: the org server-stream and
+      # client-stream forced-drop witnesses and the three public-bridge ones.
+      - name: Witness roster — Node org facade (16)
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
@@ -3777,10 +3779,17 @@ jobs:
             a_stream_call_against_a_unary_only_provider_is_refused_not_supported \
             midstream_outcomes_route_through_classify_org_error \
             forced_drop_releases_both_handler_handles_promptly \
+            forced_drop_releases_the_org_server_stream_sink_promptly \
+            forced_drop_releases_the_org_client_stream_requests_promptly \
             live_granted_streaming_call_and_serve \
             live_granted_client_stream_call_and_serve \
             live_granted_duplex_call_and_serve \
             closing_client_and_serve_handle_lets_both_meshes_shut_down_cleanly || exit 1
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label mesh_rpc_live.test --mode literal \
+            --source net/crates/net/bindings/node/test/mesh_rpc_live.test.ts \
+            server_streaming_forced_drop_releases_the_sink \
+            client_streaming_forced_drop_releases_the_request_stream \
+            duplex_forced_drop_releases_both_handles || exit 1
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label consumer_compile.test --mode literal \
             --source net/crates/net/bindings/node/test/consumer_compile.test.ts \
             a_consumer_program_compiles_against_the_shipped_org_surface || exit 1

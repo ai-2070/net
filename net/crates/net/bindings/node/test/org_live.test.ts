@@ -42,6 +42,8 @@ const {
   OrgClient,
   serveOrg,
   serveOrgDuplex,
+  serveOrgStreaming,
+  serveOrgClientStream,
   OrgAccess,
   installOrgAuthority,
   installProviderGrantAudience,
@@ -375,6 +377,8 @@ describe.skipIf(!HAS_S4)('S4 — same-org streaming: call AND serve through the 
     cancel: 's4.same.cancel',
     reject: 's4.same.reject',
     drop: 's4.same.drop',
+    dropSs: 's4.same.drop.ss',
+    dropCs: 's4.same.drop.cs',
   }
   let dir: string
   let manifest: SameOrgManifest
@@ -745,7 +749,109 @@ describe.skipIf(!HAS_S4)('S4 — same-org streaming: call AND serve through the 
       dropHandle.close()
     }
   }, 120_000)
+
+  // NODE-3 breadth (§23 audit): the other two ORG bridges. The duplex
+  // witness above covers `JsHandleRelease::both`; these cover `::sink`
+  // (server streaming) and `::requests` (client streaming) on the same
+  // forced-drop path — a caller CANCEL while the handler still runs.
+  it('forced_drop_releases_the_org_server_stream_sink_promptly', async () => {
+    let hSink: { send: (body: Buffer) => boolean } | undefined
+    const h = serveOrgStreaming(
+      provider,
+      SVC.dropSs,
+      OrgAccess.SameOrg,
+      (args: [unknown, Buffer, NonNullable<typeof hSink>]): Promise<Buffer> => {
+        hSink = args[2]
+        return sleep(30_000).then(() => Buffer.alloc(0))
+      },
+    )
+    handles.push(h)
+    try {
+      const stream = await convergeOrg(provider, caller, () =>
+        typed.raw.callStreamingBytes(SVC.dropSs, Buffer.from(JSON.stringify({ n: 1 }))),
+      )
+      await waitFor(() => hSink !== undefined, 'the handler ran and captured its sink')
+      await stream.close()
+      expect(
+        await releasedWithin(() => !(hSink as NonNullable<typeof hSink>).send(Buffer.from('late'))),
+        'forced drop releases the server-stream sink promptly — send() is false',
+      ).toBe(true)
+    } finally {
+      h.close()
+    }
+  }, 120_000)
+
+  // A CONTRACT pin, not a guard discriminator: with the guard's release
+  // disabled this still passes (the fold's input close refuses the pull
+  // too); the sink-side witnesses are the discriminating ones.
+  it('forced_drop_releases_the_org_client_stream_requests_promptly', async () => {
+    let hStream: { next: () => Promise<Buffer | null> } | undefined
+    const h = serveOrgClientStream(
+      provider,
+      SVC.dropCs,
+      OrgAccess.SameOrg,
+      (args: [unknown, NonNullable<typeof hStream>]): Promise<Buffer> => {
+        hStream = args[1]
+        return sleep(30_000).then(() => Buffer.alloc(0))
+      },
+    )
+    handles.push(h)
+    try {
+      const call = await convergeOrg(provider, caller, async () => {
+        const c = await typed.raw.callClientStreamBytes(SVC.dropCs)
+        await c.send(Buffer.from(JSON.stringify({ n: 1 })))
+        return c
+      })
+      await waitFor(() => hStream !== undefined, 'the handler ran and captured its request stream')
+      await call.close()
+      expect(
+        await refusesPullsWithin(hStream as NonNullable<typeof hStream>),
+        'forced drop releases the client-stream request stream promptly',
+      ).toBe(true)
+    } finally {
+      h.close()
+    }
+  }, 120_000)
 })
+
+/** Poll `cond` every 25 ms for up to 10 s; fail with `what` if it never holds. */
+async function waitFor(cond: () => boolean, what: string): Promise<void> {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline && !cond()) await sleep(25)
+  expect(cond(), what).toBe(true)
+}
+
+/** Whether `released()` turns true within 10 s (polled every 50 ms). */
+async function releasedWithin(released: () => boolean): Promise<boolean> {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    if (released()) return true
+    await sleep(50)
+  }
+  return false
+}
+
+/**
+ * Whether a handler's request stream refuses pulls with the closed-handle
+ * usage error within 10 s. Pre-release a pull either parks or resolves an
+ * item / `null`; a released handle rejects with `stream_closed`.
+ */
+async function refusesPullsWithin(stream: { next: () => Promise<Buffer | null> }): Promise<boolean> {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    const outcome = await Promise.race([
+      stream.next().then(
+        () => 'pulled' as const,
+        (e: unknown) => (String((e as Error).message).includes('stream_closed') ? 'refused' : 'other'),
+      ),
+      sleep(250).then(() => 'parked' as const),
+    ])
+    if (outcome === 'refused') return true
+    if (outcome === 'other') return false
+    await sleep(50)
+  }
+  return false
+}
 
 describe.skipIf(!HAS_S4)('S4 — granted streaming: call AND serve through the Node binding', () => {
   let dir: string
