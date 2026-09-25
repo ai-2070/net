@@ -1,0 +1,49 @@
+net/crates/net/sdk/tests/rtc_bootstrap_listener.rs
+  s_d8b00bedd146e9::t_682c1032940a23 712-713
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_682c1032940a23 6504
+docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md
+  s_d8b00bedd146e9::t_682c1032940a23 3-6
+net/crates/net/browser-ts/test/store/lifecycle-model.ts
+  s_d8b00bedd146e9::t_682c1032940a23 7-8
+docs/internal/spikes/README.md
+  s_d8b00bedd146e9::t_682c1032940a23 1-16
+net/crates/net/tests/rtc_repairs.rs
+  s_d8b00bedd146e9::t_682c1032940a23 5283-5284
+net/crates/net/browser-ts/test/node.test.ts
+  s_d8b00bedd146e9::t_682c1032940a23 564-565
+net/crates/net/tests/feature_consumer/Cargo.toml
+  s_d8b00bedd146e9::t_682c1032940a23 1-28
+net/crates/net/Cargo.toml
+  s_d8b00bedd146e9::t_682c1032940a23 312
+README.md
+  s_d8b00bedd146e9::t_682c1032940a23 1,11-14,77,79,358-362
+docs/internal/performance/WEBRTC_DOUBLE_AEAD.md
+  s_d8b00bedd146e9::t_682c1032940a23 6-8
+net/crates/net/tests/feature_consumer/.gitignore
+  s_d8b00bedd146e9::t_682c1032940a23 1
+net/crates/net/tests/feature_consumer/src/main.rs
+  s_d8b00bedd146e9::t_682c1032940a23 1-28
+net/crates/net/sdk/Cargo.toml
+  s_d8b00bedd146e9::t_682c1032940a23 164
+net/crates/net/Cargo.lock
+  s_d8b00bedd146e9::t_38f1283eec7d3a 2662,2664,5458,5460
+net/crates/net/tests/feature_consumer/Cargo.lock
+  s_d8b00bedd146e9::t_e2b2a8bdd52dbf 1063,1065,1900,1902
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7e0ff1abdb3f724583e2a63c3854ea4d20c214cb",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
