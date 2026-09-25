@@ -2,7 +2,7 @@
 
 ## 8.5 S4PySdk — pure SDK Python (Q6)
 
-**Lane:** S4PySdk. **Pinned brief:** `spikes/org-streaming/S4_BRIEF.md`
+**Lane:** S4PySdk. **Pinned brief:** `docs/internal/spikes/org-streaming/S4_BRIEF.md`
 @`02f2d6c9c` (the lane worktree predates that object; the brief's verbatim
 text was delivered as `local://S4_BRIEF.md` and is cited as the pinned
 content — both pins govern and they are identical). **Base:** `692b38961`

@@ -1,6 +1,6 @@
 # S4_BROWSER — Stage 4 browser/leaf lane (`S4Browser`)
 
-**Lane:** S4Browser (browser/leaf row, Q5). **Pinned brief:** `spikes/org-streaming/S4_BRIEF.md`
+**Lane:** S4Browser (browser/leaf row, Q5). **Pinned brief:** `docs/internal/spikes/org-streaming/S4_BRIEF.md`
 @`0f2f2d69c`. **Base:** `0f2f2d69c` (Stage 3 accepted at `2225de011`; S3R closure verified
 green at `b879ca4f8`). Session tree `C:/Users/chief/orca/workspaces/net/org-streaming` on
 `LZL0/org-streaming`. **Date:** 2026-09-23.

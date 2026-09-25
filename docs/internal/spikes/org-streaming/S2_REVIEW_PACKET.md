@@ -17,7 +17,7 @@ run `--retries 0 --no-tests=fail` on the warm aliases (`cargo tf` /
 
 **Sources of truth:** the plan's Stage 2 table + Exit + §1/§2/§3/§4.3 +
 compatibility ledger C5–C8/C11 (`docs/internal/plans/ORG_SCOPED_STREAMING_PLAN.md`);
-`spikes/org-streaming/S2_BRIEF.md` @`87f89c8da` (incl. the owner rider ruling);
+`docs/internal/spikes/org-streaming/S2_BRIEF.md` @`87f89c8da` (incl. the owner rider ruling);
 `docs/internal/spikes/org-streaming/S1_REPORT.md` §4 + §0's Stage-2 entry;
 `S1_REVIEW_PACKET.md` / `S1_REVIEW_PACKET_2.md` (the evidence standard in
 practice). Recorded rulings observed throughout: the F-S1R-2 rider DECLINED

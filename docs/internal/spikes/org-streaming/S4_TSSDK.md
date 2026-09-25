@@ -2,7 +2,7 @@
 
 `## 8.6 S4TsSdk — pure TypeScript SDK (`net/crates/net/sdk-ts/**`)`
 
-**Lane:** S4TsSdk. **Pinned brief:** `spikes/org-streaming/S4_BRIEF.md`. This
+**Lane:** S4TsSdk. **Pinned brief:** `docs/internal/spikes/org-streaming/S4_BRIEF.md`. This
 worktree's copy is pinned at `0f2f2d69c` ("Pin the Stage 4 brief"); commit
 `02f2d6c9c` (Main's pin hash) is ABSENT from this worktree, and Main's
 verbatim copy at `local://S4_BRIEF.md` is **byte-identical** to the worktree

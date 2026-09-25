@@ -2,7 +2,7 @@
 
 ## 8.2 S4Go — Go/C: the C ABI streaming verbs + the Go binding
 
-**Lane:** S4Go. **Pinned brief:** `spikes/org-streaming/S4_BRIEF.md` @`0f2f2d69c`.
+**Lane:** S4Go. **Pinned brief:** `docs/internal/spikes/org-streaming/S4_BRIEF.md` @`0f2f2d69c`.
 **Base:** `0f2f2d69c` (Stage 3 accepted at `2225de011`; S3R runs in parallel and
 owns `sdk/src/org/**` — never touched here). This file is the per-lane record
 Main's file-state ruling asks for; `## 8. Stage 4` in `S1_REPORT.md` is Main's

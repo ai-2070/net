@@ -1,6 +1,6 @@
 # Stage 1 report — core protected server-streaming
 
-**Brief:** `spikes/org-streaming/S1_BRIEF.md`, pinned at `096f54009`.
+**Brief:** `docs/internal/spikes/org-streaming/S1_BRIEF.md`, pinned at `096f54009`.
 **Base:** `096f54009` (Stage 0 accepted at `736469448`; packet
 `S0_REVIEW_PACKET.md`). **Authorized scope:** ledger C1–C9 only; additive to
 the unary gate; no Stage 2+.
@@ -284,7 +284,7 @@ source-established label and its receipt per the brief's evidence rules.
   held; the `S4PySdk`/`S4TsSdk` boundaries confirmed both ways.
 - **2026-09-22, S4TsSdk verified (executed)** — Wave 2 lane 1/3. Landed at
   `c9cebf5cc` (7 files, +1893, explicit-path staged; `S4_TSSDK.md`
-  F16-ledgered; the brief cited as `spikes/org-streaming/S4_BRIEF.md` via
+  F16-ledgered; the brief cited as `docs/internal/spikes/org-streaming/S4_BRIEF.md` via
   the `local://S4_BRIEF.md` byte-identical copy — md5 `0adc61d3…` — after
   the worktree-staleness blocker). The `@net-mesh/sdk` org facade
   (`src/org/index.ts`): the §4.4 verbs as thin pass-through over the
@@ -2755,7 +2755,7 @@ never compile here, no Linux/macOS execution.
 
 ## 3. Repair round (S1_R)
 
-**Lane:** S1Repair. **Pinned brief:** `spikes/org-streaming/S1_R_BRIEF.md`
+**Lane:** S1Repair. **Pinned brief:** `docs/internal/spikes/org-streaming/S1_R_BRIEF.md`
 @`27d7a72ee`. HOLD closed over: `e25ac28bf` (the packet's reviewed head).
 Date: 2026-09-22. Windows host only. Every run `--retries 0 --no-tests=fail`
 on the warm aliases (`cargo tf` / `cargo tfl`, the graphs pinned in
@@ -3192,7 +3192,7 @@ is byte-identical to `e25ac28bf`'s). Restored green: same `-E` run, 1/1.
 
 ## 4. Stage 2 — core protected client-streaming and duplex
 
-**Lane:** S2Core (one lane). **Pinned brief:** `spikes/org-streaming/S2_BRIEF.md`
+**Lane:** S2Core (one lane). **Pinned brief:** `docs/internal/spikes/org-streaming/S2_BRIEF.md`
 @`87f89c8da`. **Base:** `87f89c8da` (Stage 1 accepted at `cc15f4d66`). Date
 2026-09-22. Windows host only. Every run `--retries 0 --no-tests=fail` on the
 warm aliases (`cargo tf` / `cargo tfl`, graphs pinned in
@@ -3985,7 +3985,7 @@ session-replacement terminal-drop limitation stands as documented in
 
 The S2 review's ACCEPT (`S2_REVIEW_PACKET.md` @`017e7148a`) stands; this
 round closes its three non-blocking findings per the PINNED REPAIR BRIEF
-`spikes/org-streaming/S2_R_BRIEF.md` @`4bf24aad7` — F-S2R-1 (the §2.6
+`docs/internal/spikes/org-streaming/S2_R_BRIEF.md` @`4bf24aad7` — F-S2R-1 (the §2.6
 late-input disposition witness), F-S2R-2 (the post-transfer
 `ConfirmedOpening`-shape scope guard — the ONE authorized production
 change: the plan §3 step-5 mandate) and F-S2R-3 (the proof-method
@@ -4310,7 +4310,7 @@ placement only).
 
 ## 6. Stage 3
 
-**Lane:** S3Facade (one lane). **Pinned brief:** `spikes/org-streaming/S3_BRIEF.md`
+**Lane:** S3Facade (one lane). **Pinned brief:** `docs/internal/spikes/org-streaming/S3_BRIEF.md`
 @`0071fd1fc`. **Base:** `0071fd1fc` (Stage 2 accepted at `017e7148a`; S2R
 closure verified at `1d26bc4ba`/`636d80d69`). Rows 3.1 → 3.3 in order, each
 landed green before the next. Owner-pending: none.
@@ -4699,7 +4699,7 @@ contract, §6.1).
 
 ## 7. Repair round (S3_R)
 
-**Lane:** S3Repair. **Pinned brief:** `spikes/org-streaming/S3_R_BRIEF.md`
+**Lane:** S3Repair. **Pinned brief:** `docs/internal/spikes/org-streaming/S3_R_BRIEF.md`
 @`635d31cc1`. The S3Review ACCEPT (`S3_REVIEW_PACKET.md` @`2225de011`)
 **stands**; this round closes its three non-blocking findings (packet §8)
 against their closure properties VERBATIM. Date: 2026-09-23, Windows host

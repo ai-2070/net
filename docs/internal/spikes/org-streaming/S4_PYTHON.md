@@ -2,7 +2,7 @@
 
 ## 8.4 S4Python — Python wheel (net-mesh PyPI)
 
-**Lane:** S4Python. **Pinned brief:** `spikes/org-streaming/S4_BRIEF.md`
+**Lane:** S4Python. **Pinned brief:** `docs/internal/spikes/org-streaming/S4_BRIEF.md`
 @`0f2f2d69c`. **Base:** `0f2f2d69c` (Stage 3 accepted at `2225de011`).
 Row: `net/crates/net/bindings/python/**` +
 `net/crates/net/bindings/python/tests/**` — exclusively; nothing outside

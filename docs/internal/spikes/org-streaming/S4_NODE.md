@@ -2,7 +2,7 @@
 
 `## 8.1 S4Node — Node bindings (`net/crates/net/bindings/node/**`)`
 
-**Lane:** S4Node. **Pinned brief:** `spikes/org-streaming/S4_BRIEF.md` @`0f2f2d69c`.
+**Lane:** S4Node. **Pinned brief:** `docs/internal/spikes/org-streaming/S4_BRIEF.md` @`0f2f2d69c`.
 **Base:** `0f2f2d69c` (Stage 3 accepted at `2225de011`; the S3R repair lane ran in
 parallel on `sdk/src/org/**` + `sdk/tests/**` — never touched here). Date:
 2026-09-23. Owner-pending: none. Host: this Windows workstation only.

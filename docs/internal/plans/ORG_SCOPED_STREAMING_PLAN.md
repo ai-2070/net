@@ -26,7 +26,7 @@ Rust SDK contracts. No WebSocket, HTTP or cloud runtime is required by this plan
 **STAGE 2 ACCEPTED 2026-09-22 (independent review at `017e7148a`) AND ITS
 S2R REPAIR ROUND CLOSED (`1d26bc4ba`, verified + CI floor 42);
 STAGE 3 DISPATCHED AS WRITTEN ON ITS PINNED BRIEF
-(`spikes/org-streaming/S3_BRIEF.md` @`0071fd1fc`, lane `S3Facade` in
+(`docs/internal/spikes/org-streaming/S3_BRIEF.md` @`0071fd1fc`, lane `S3Facade` in
 flight); STAGE 4 NOT authorized. The owner RULED (2026-09-22) the F-S1R-2
 terminal-retarget rider NOT included — the plan-as-written governs and the
 documented limitation stands. Earlier gates: STAGE 1 ACCEPTED
@@ -40,7 +40,7 @@ with `S0_RECEIPTS_LIFECYCLE.md` / `S0_RECEIPTS_REGISTRY.md` (findings
 F1–F16) and the verdict packet `S0_REVIEW_PACKET.md` (ACCEPT: all five
 slice rows and all ten composition rows; its three P2/P3 record findings
 closed in `3dc043c1e`). Every stage proceeds ONLY through its pinned brief
-in `spikes/org-streaming/` (`S1_BRIEF`, `S1_R_BRIEF`, `S2_BRIEF`,
+in `docs/internal/spikes/org-streaming/` (`S1_BRIEF`, `S1_R_BRIEF`, `S2_BRIEF`,
 `S2_R_BRIEF`, `S3_BRIEF` — each recorded in the Review log with its
 commits); no stage is authorized by this document alone.**
 
@@ -934,7 +934,7 @@ does not turn the serverless follow-on into a dependency of this release.
 Internal integration slices toward one release. Server-first development is
 permitted; server-only shipping is not. Each stage's brief is written at
 authorization time from the section below into
-`spikes/org-streaming/S<n>_BRIEF.md`; reports go to
+`docs/internal/spikes/org-streaming/S<n>_BRIEF.md`; reports go to
 `docs/internal/spikes/org-streaming/S<n>_REPORT.md`; the plan document records
 what each stage established. Every witness row carries its inverse; a witness
 that stays green under its inverse is a finding, never re-pinned. All commands
@@ -1256,12 +1256,12 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   mutation's line delta). Local pre-push checklist green at the closure:
   fmt, `check --workspace --all-targets`, clippy ×4 under `-D warnings`,
   rustdoc ×5 under `-D warnings`, `cargo tl` 5831, `cargo t` 7037/7037.
-  Stage 1 dispatch proceeds through `spikes/org-streaming/S1_BRIEF.md` (two
+  Stage 1 dispatch proceeds through `docs/internal/spikes/org-streaming/S1_BRIEF.md` (two
   lanes: `S1Session` slice 1.1 and `S1Core` slices 1.2–1.6 sequential, with a
   `mesh.rs` hold point between them). Stage 2+ remains unauthorized.
 
 - 2026-09-22, **Stage 1 executed** (branch `LZL0/org-streaming`, pinned brief
-  `spikes/org-streaming/S1_BRIEF.md` @`096f54009`): slices 1.1–1.6 all landed
+  `docs/internal/spikes/org-streaming/S1_BRIEF.md` @`096f54009`): slices 1.1–1.6 all landed
   and accepted at coordinator level. Landed: 1.1/1.1a session-binding
   carriage and the 11-site handshake migration (`0d4bbfb24`, `4d159e484`,
   `cc3a1faa3`, `8b1e8bd12`); 1.2 streaming proof + shape-aware admission —
@@ -1305,7 +1305,7 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
 
 - 2026-09-22, **Stage 1 repair round (S1_R)** closed over the S1Review HOLD
   (`S1_REVIEW_PACKET.md`, reviewed head `e25ac28bf`; repair brief
-  `spikes/org-streaming/S1_R_BRIEF.md` @`27d7a72ee`). Landed over five
+  `docs/internal/spikes/org-streaming/S1_R_BRIEF.md` @`27d7a72ee`). Landed over five
   commits (`60c287d1e`, `4ab5738cf`, `74c9bd99c`, `3620fed0b`,
   `08dd849e2`): the Exit paragraph's positive claim is now witnessed per
   authority mode — `completed_stream_drains_queued_items_in_order_with_content_and_end_terminal`
@@ -1379,7 +1379,7 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   build.
 
 - 2026-09-22, **Stage 2 executed** (branch `LZL0/org-streaming`, pinned
-  brief `spikes/org-streaming/S2_BRIEF.md` @`87f89c8da`; one lane `S2Core`):
+  brief `docs/internal/spikes/org-streaming/S2_BRIEF.md` @`87f89c8da`; one lane `S2Core`):
   slices 2.1–2.5 landed over ten commits (`16cd67e85`…`98df0bb0b`,
   `S1_REPORT.md` §4). Landed: the lazy-opening mint binding the FIRST CHUNK
   (`OrgStreamCallProof` kinds 2/3 over the finalized initial REQUEST —
@@ -1451,7 +1451,7 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   change, probe-enforced).
 
 - 2026-09-22, **Stage 3 executed** (branch `LZL0/org-streaming`, pinned
-  brief `spikes/org-streaming/S3_BRIEF.md` @`0071fd1fc`; one lane
+  brief `docs/internal/spikes/org-streaming/S3_BRIEF.md` @`0071fd1fc`; one lane
   `S3Facade`): rows 3.1–3.3 landed over six commits (`d63e9c615`…
   `b7aaacdc5`, `S1_REPORT.md` §6). Landed: the §4.3 caller verbs verbatim
   (`call_streaming`/`call_streaming_bytes`/`call_client_stream`/
@@ -1600,8 +1600,9 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   receipts independently reproduced; Wave 2 (pure SDKs per Q6 +
   the cross-language vectors) is dispatched at `S4_BRIEF.md` @ `02f2d6c9c`
   (redistributed verbatim via `local://S4_BRIEF.md` after a worktree-
-  staleness blocker; the brief lives at repo-root `spikes/org-streaming/`,
-  not `docs/internal/spikes/`).
+  staleness blocker; the brief was dispatched from the repo-root `spikes/`
+  tree, not beside the reports — it has since moved to
+  `docs/internal/spikes/org-streaming/`).
 
 - 2026-09-22, **Wave 2 lane 1/3 closed: `S4TsSdk` verified (executed)** at
   `c9cebf5cc` (`S4_TSSDK.md` F16-ledgered): the `@net-mesh/sdk` org facade

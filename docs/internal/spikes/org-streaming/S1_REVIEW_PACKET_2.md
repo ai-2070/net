@@ -7,7 +7,7 @@
 re-pin 27→30, `3620fed0b` receipt R-A5′ + hash side-by-side + the Row-5 doc
 amendment, `08dd849e2` resolution note, `cc15f4d66` record + F-9 label fix).
 **Predecessor packet:** `S1_REVIEW_PACKET.md` (HOLD at `e25ac28bf`).
-**Repair brief:** `spikes/org-streaming/S1_R_BRIEF.md` @`27d7a72ee`.
+**Repair brief:** `docs/internal/spikes/org-streaming/S1_R_BRIEF.md` @`27d7a72ee`.
 **Probe worktree:** `C:/Users/chief/orca/workspaces/net/org-streaming-s1rev2`
 (detached at `cc15f4d66`; `CARGO_TARGET_DIR=target-s1rev2`;
 `CARGO_INCREMENTAL=0` — a stated build-cache policy after the §0 F16-class
