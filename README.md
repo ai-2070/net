@@ -86,38 +86,6 @@ net-mesh invite create                         # prints a `netmesh-join_` token 
 net-mesh join <TOKEN> --yes && net-mesh up     # device: use the link, then run its own node
 ```
 
-The device uses the same `join` and `up` for any link. While its node is stopped, it can serve or
-call tools as itself with `wrap --joined <state-dir>` or `mcp serve --joined <state-dir>`.
-
-**Adding a channel.** Sign a grant offline, give it to the node, then put the channel on a link:
-
-```bash
-net-mesh identity generate --out channel-root.toml
-net-mesh channel issue-grant --root-identity channel-root.toml --issuer <NODE_ISSUER> \
-  --channel fleet.telemetry --out channel.grant
-net-mesh up --enroll --channel-grant channel.grant
-net-mesh channel serve fleet.telemetry --token-root <CHANNEL_ROOT_HEX>
-net-mesh invite create --channel fleet.telemetry --channel-rights subscribe
-```
-
-**Adding an org.** The org key stays offline; you approve the link with it:
-
-```bash
-net-mesh org keygen --out org.toml
-net-mesh org audience-keygen --org-key org.toml --out audience.key
-net-mesh invite create --org <ORG_HEX>                    # a link needs approval first
-net-mesh org approve <OFFER_ID> --subject <DEVICE_HEX> --org-key org.toml --audience audience.key
-```
-
-**What a mesh is, and what it can't do.** One profile is one node, and a mesh shares one key:
-anyone who joins can open a session with anyone else. A join link is not a slice of the mesh —
-subnet, org and channel rules decide what a session can do. Only the operator's running node makes
-links, so if it stops, no new device can join, though the ones already in keep working. Nothing
-limits the size but the key you hand out and a relay that's reachable. There is no registry or
-leader, and any device that can't be reached directly falls back to the relay you run.
-[CLI reference](https://ai2070.net/docs/reference/cli),
-[Enrollment journey](https://github.com/ai-2070/net/blob/master/net/crates/net/cli/tests/fixtures/enrollment/README.md).
-
 ## One system, end to end
 
 An intersection has no line of sight: a building hides the cross traffic from the vehicle
