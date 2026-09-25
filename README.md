@@ -86,11 +86,30 @@ net-mesh invite create                         # prints a `netmesh-join_` token 
 net-mesh join <TOKEN> --yes && net-mesh up     # device: redeem the link, then run as it
 ```
 
-One link can carry more than membership — a subnet attachment, org membership, or a channel
-credential, each authorized on its own. While its `up` is stopped, a joined device can also run a
-provider or consumer as itself with `wrap --joined <state-dir>` / `mcp serve --joined <state-dir>`;
-`down` stops the node, `leave` leaves the mesh, and a `relay serve` host plus `up --relay` gives an
-unreachable device a fallback path.
+The device redeems any of these with the same `join` + `up`, and while its `up` is stopped it can
+run a provider or consumer as itself with `wrap --joined <state-dir>` or
+`mcp serve --joined <state-dir>`.
+
+**A channel on the link** — delegate issuance offline, start the node with the grant, gate it, then
+carry it:
+
+```bash
+net-mesh identity generate --out channel-root.toml
+net-mesh channel issue-grant --root-identity channel-root.toml --issuer <NODE_ISSUER> \
+  --channel fleet.telemetry --out channel.grant
+net-mesh up --enroll --channel-grant channel.grant
+net-mesh channel serve fleet.telemetry --token-root <CHANNEL_ROOT_HEX>
+net-mesh invite create --channel fleet.telemetry --channel-rights subscribe
+```
+
+**An org on the link** — the root stays offline; the link is approved with it:
+
+```bash
+net-mesh org keygen --out org.toml
+net-mesh org audience-keygen --org-key org.toml --out audience.key
+net-mesh invite create --org <ORG_HEX>                    # always approval-gated
+net-mesh org approve <OFFER_ID> --subject <DEVICE_HEX> --org-key org.toml --audience audience.key
+```
 
 **What the mesh is — and its limits.** One profile is one node, and one mesh is one flat trust
 domain: the PSK is a membership secret, so a joined device can open a session with any peer. The
