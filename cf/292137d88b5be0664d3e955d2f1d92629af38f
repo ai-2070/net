@@ -1,0 +1,14 @@
+net/crates/net/tests/org_rpc_streaming.rs
+  h_64425bc75e3f3d 2,3279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cf292137d88b5be0664d3e955d2f1d92629af38f",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
