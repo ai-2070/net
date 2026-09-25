@@ -773,3 +773,30 @@
     animation: none !important;
   }
 }
+
+/* Box-drawing diagrams (`text` fences). The FACE and the LEADING both matter,
+ * and neither was right.
+ *
+ * JetBrains Mono reaches the page through next/font's Google loader, which
+ * ships the `latin` subset: 37 faces loaded, and not one of them carries
+ * U+2500–257F. On a machine with no box-drawing mono in the stack (`ui-monospace`,
+ * `SFMono-Regular` and `Menlo` are macOS names) the browser's last resort draws
+ * the rules instead. Measured on the rendered page with CDP
+ * `CSS.getPlatformFontsForNode`: the `│` and the `─` in a shipped diagram were
+ * drawn by **Arial**. Arial's box glyphs neither fill the cell nor meet between
+ * lines, so the lattice comes apart even when the art's own columns are exact —
+ * which is why repairing the art alone did not fix it.
+ *
+ * So diagrams get a face that carries the block on every platform, and leading
+ * tight enough that consecutive rows' strokes touch: a terminal-drawn `│` is
+ * about one em tall, and at the 1.6 leading code fences use there is a ~5px gap
+ * per row. Scoped to diagrams — code fences keep JetBrains Mono and its leading,
+ * and the `data-language="text"` to `.diagram` mapping lives in the `pre`
+ * handler in `DocsContent.tsx`. */
+.diagram,
+.diagram code {
+  font-family:
+    "Cascadia Mono", Consolas, Menlo, "DejaVu Sans Mono", "Liberation Mono",
+    ui-monospace, monospace;
+  line-height: 1.15;
+}
