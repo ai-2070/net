@@ -6,7 +6,7 @@ description: "Wrap an existing MCP server as discoverable Net capabilities and i
 # Brief: Wrap and Use an MCP Server
 
 **Goal.** Publish an existing stdio MCP server's tools as Net capabilities and
-invoke one from a local MCP host. [Net and MCP](/docs/worldview/mcp-vs-net)
+invoke one from a local MCP host. [Net and MCP](/docs/worldview/how-net-compares#mcp-and-net)
 explains the boundary between the two systems.
 
 ## Prerequisites
