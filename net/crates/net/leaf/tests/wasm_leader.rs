@@ -48,11 +48,12 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use bytes::Bytes;
 use futures_channel::oneshot;
-use js_sys::{Object, Reflect, Uint8Array};
+use js_sys::{Function, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
@@ -63,8 +64,8 @@ use net_leaf::bootstrap::gloo_timer_sleep;
 use net_leaf::error::{LeafError, RpcError};
 use net_leaf::identity::{IdentitySecrets, IDENTITY_BLOB_MAGIC};
 use net_leaf::leader::{
-    GenerationLease, LeaderBackend, LeaderRequest, ProxyFailure, ProxyValue, Replier,
-    ORG_ENVELOPE_END, ORG_ENVELOPE_RETIRED,
+    envelope, GenerationLease, LeaderBackend, LeaderRequest, ProxyFailure, ProxySide, ProxyValue,
+    Replier, ORG_ENVELOPE_ADMITTED, ORG_ENVELOPE_END, ORG_ENVELOPE_ITEM, ORG_ENVELOPE_RETIRED,
 };
 use net_leaf::leader_session::{
     spawn_fenced, BackendFactory, EventSink, Lifecycle, MeshSession, OpRegistry, Role,
@@ -162,7 +163,7 @@ impl LeaderBackend for TestBackend {
         self.node_id
     }
 
-    fn perform(&mut self, request: LeaderRequest, reply: Replier) {
+    fn perform(&mut self, _from: ProxySide, request: LeaderRequest, reply: Replier) {
         self.log.borrow_mut().performed.push(request.clone());
         if self.hold_calls && matches!(request, LeaderRequest::Call { .. }) {
             self.log.borrow_mut().held.push(reply);
@@ -568,7 +569,7 @@ impl LeaderBackend for RealNodeBackend {
         self.node_id
     }
 
-    fn perform(&mut self, request: LeaderRequest, reply: Replier) {
+    fn perform(&mut self, _from: ProxySide, request: LeaderRequest, reply: Replier) {
         let handles = self.handles.clone();
         match request {
             // A real pending call: issued into the real call table,
@@ -3966,7 +3967,7 @@ impl LeaderBackend for TerminalBackend {
         self.node_id
     }
 
-    fn perform(&mut self, request: LeaderRequest, reply: Replier) {
+    fn perform(&mut self, _from: ProxySide, request: LeaderRequest, reply: Replier) {
         match request {
             // The open is acknowledged exactly as the real relay
             // acknowledges one: an empty END envelope.
@@ -4198,6 +4199,277 @@ async fn a_cancelled_duplex_call_yields_the_cancelled_terminal_to_every_consumer
         );
     }
 
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+// ─────────── the proxied serve accept seam (LEAF-3/6/14) ───────────
+
+/// The leader-side double for the proxied SERVE seam. It answers the
+/// register / accept / caller-fetch / request verbs with exactly the
+/// envelopes the real relay emits — so what runs under test is the
+/// follower's REAL accept loop (`ProxyOrgServe`), and a forged or
+/// tampered envelope is one reply away.
+#[derive(Clone, Default)]
+struct ServeFake {
+    /// Every `OrgServeRegister` seen — the retry-storm counter.
+    registers: Rc<Cell<u32>>,
+    /// Accept doc BODIES to hand out in order (without the `0x03`
+    /// tag: the arm wraps them exactly as the real accept arm does).
+    accepts: Rc<RefCell<VecDeque<String>>>,
+    /// Bridge handle → the projection the leader's own `ServeCall`
+    /// state resolves: the LEADER-VERIFIED caller identity.
+    verified: Rc<RefCell<HashMap<u64, String>>>,
+    /// Request items per bridge handle; EOF once drained.
+    requests: Rc<RefCell<HashMap<u64, VecDeque<Bytes>>>>,
+    /// When set, every register is refused with it — the PERMANENT
+    /// class LEAF-14 must surface typed, not retry.
+    refuse_register: Option<ProxyFailure>,
+    /// Long-pulls parked and never answered.
+    parked: Rc<RefCell<Vec<Replier>>>,
+}
+
+impl LeaderBackend for ServeFake {
+    fn node_id(&self) -> u64 {
+        0x5E2E
+    }
+
+    fn perform(&mut self, _from: ProxySide, request: LeaderRequest, reply: Replier) {
+        match request {
+            LeaderRequest::OrgServeRegister { .. } => {
+                self.registers.set(self.registers.get() + 1);
+                match &self.refuse_register {
+                    Some(failure) => reply.fail(failure.clone()),
+                    None => reply.bytes(Bytes::new()),
+                }
+            }
+            LeaderRequest::OrgServeAccept { .. } => match self.accepts.borrow_mut().pop_front() {
+                // The producer's own construction.
+                Some(doc) => reply.bytes(envelope(ORG_ENVELOPE_ADMITTED, doc.as_bytes())),
+                None => self.parked.borrow_mut().push(reply),
+            },
+            LeaderRequest::OrgServeCaller { call } => {
+                match self.verified.borrow().get(&call) {
+                    Some(json) => reply.text(json.clone()),
+                    None => reply.fail(ProxyFailure::Typed(LeafError::Session(format!(
+                        "no org call for handle {call}"
+                    )))),
+                }
+            }
+            LeaderRequest::OrgServeRequest { call } => {
+                let item = self
+                    .requests
+                    .borrow_mut()
+                    .get_mut(&call)
+                    .and_then(|queue| queue.pop_front());
+                match item {
+                    Some(body) => reply.bytes(envelope(ORG_ENVELOPE_ITEM, &body)),
+                    None => reply.bytes(envelope(ORG_ENVELOPE_END, b"")),
+                }
+            }
+            LeaderRequest::OrgServeSend { .. } | LeaderRequest::OrgServeFinish { .. } => {
+                reply.bytes(Bytes::new())
+            }
+            LeaderRequest::OrgServeRetired { .. } => self.parked.borrow_mut().push(reply),
+            _ => reply.bytes(Bytes::new()),
+        }
+    }
+
+    fn shutdown(&mut self, _generation: u64) -> usize {
+        let parked = core::mem::take(&mut *self.parked.borrow_mut());
+        let count = parked.len();
+        drop(parked);
+        count
+    }
+}
+
+/// The projection the leader's own serve state resolves — the one a
+/// handler must see (LEAF-6).
+fn verified_caller() -> String {
+    "{\"entity\":\"0011223344556677\"}".to_string()
+}
+
+/// The forged claim an attacker adds to the accept envelope.
+const FORGED_CLAIM: &str = "{\"entity\":\"forged\"}";
+
+/// The handler's recorded `caller` arguments — what reached JS.
+fn recording_handler(calls: &Rc<RefCell<Vec<String>>>) -> Function {
+    let sink = Rc::clone(calls);
+    let closure = Closure::wrap(Box::new(move |caller: JsValue, _request: Uint8Array| {
+        sink.borrow_mut()
+            .push(caller.as_string().unwrap_or_default());
+        js_sys::Promise::resolve(&Uint8Array::from(&b"response"[..]))
+    }) as Box<dyn FnMut(JsValue, Uint8Array) -> js_sys::Promise<Uint8Array>>);
+    closure.into_js_value().unchecked_into()
+}
+
+/// The `ownerOrg`-bearing options a proxied serve registration reads.
+fn serve_opts() -> JsValue {
+    let object = Object::new();
+    put(&object, "ownerOrg", &JsValue::from_str(&format!("{:064x}", 2)));
+    object.into()
+}
+
+/// A follower session whose leader is `fake`, plus the leader's own
+/// lifecycle — the [`org_terminal_session`] shape one seam over.
+async fn serve_session(fake: ServeFake) -> (MeshSession, Lifecycle) {
+    let db = unique("org-serve-db");
+    let scope = unique("org-serve-scope");
+    let leader = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        Rc::new(move |_opts, _sink, _lease| {
+            let fake = fake.clone();
+            Box::pin(async move {
+                let backend: Box<dyn LeaderBackend> = Box::new(fake);
+                Ok(backend)
+            })
+        }),
+    )
+    .await
+    .expect("leader");
+    settle().await;
+    assert_eq!(leader.role(), Role::Leader);
+    let session = MeshSession::open(opts(&db, &scope, &[], &[]))
+        .await
+        .expect("session");
+    settle().await;
+    assert_eq!(session.role(), "follower");
+    (session, leader)
+}
+
+/// LEAF-3, end to end: a well-formed proxied accept — the exact
+/// `0x03 ‖ { call }` envelope the real accept arm emits — dispatches
+/// EXACTLY ONE handler. Pre-fix `decode_admitted` ran a JSON parse on
+/// the WHOLE tagged payload and dropped every well-formed accept: the
+/// handler never ran and the caller parked to its deadline.
+#[wasm_bindgen_test]
+async fn a_well_formed_proxied_accept_dispatches_exactly_one_handler() {
+    let fake = ServeFake::default();
+    fake.accepts
+        .borrow_mut()
+        .push_back("{\"call\":\"7\"}".to_string());
+    fake.verified.borrow_mut().insert(7, verified_caller());
+    fake.requests.borrow_mut().insert(
+        7,
+        VecDeque::from([Bytes::from_static(b"request")]),
+    );
+    let (session, leader) = serve_session(fake).await;
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    session
+        .serve_org(
+            "svc.accept-a".to_string(),
+            "same-org".to_string(),
+            recording_handler(&calls),
+            serve_opts(),
+        )
+        .expect("the registration starts");
+    wait_ms(300).await;
+
+    assert_eq!(
+        calls.borrow().len(),
+        1,
+        "one accept envelope dispatches exactly one handler"
+    );
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+/// LEAF-6, end to end: the handler's `caller` projection is the
+/// leader-verified identity even when the accept envelope's claim is
+/// forged. Pre-fix the claim was served verbatim — handler-level
+/// caller spoofing on the proxy path.
+#[wasm_bindgen_test]
+async fn a_forged_accept_claim_is_never_served_to_the_handler_as_the_caller() {
+    let fake = ServeFake::default();
+    // The accept envelope is TAMPERED: the claim says "forged", the
+    // leader's own serve state resolves `verified_caller()`.
+    fake.accepts.borrow_mut().push_back(format!(
+        "{{\"call\":\"7\",\"caller\":{FORGED_CLAIM}}}"
+    ));
+    fake.verified.borrow_mut().insert(7, verified_caller());
+    fake.requests.borrow_mut().insert(
+        7,
+        VecDeque::from([Bytes::from_static(b"request")]),
+    );
+    let (session, leader) = serve_session(fake).await;
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    session
+        .serve_org(
+            "svc.accept-b".to_string(),
+            "same-org".to_string(),
+            recording_handler(&calls),
+            serve_opts(),
+        )
+        .expect("the registration starts");
+    wait_ms(300).await;
+
+    let seen = calls.borrow().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the tampered claim still dispatches the real call — once"
+    );
+    assert_eq!(
+        seen[0],
+        verified_caller(),
+        "the handler must see the leader-verified identity"
+    );
+    assert_ne!(
+        seen[0], FORGED_CLAIM,
+        "pre-fix the envelope claim was served verbatim"
+    );
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+/// LEAF-14, end to end: a permanent serve-registration refusal (the
+/// name is already served) reaches the page as a typed error, once,
+/// with no retry storm. Pre-fix the re-declare loop misdiagnosed it
+/// as transient and re-registered every 50ms forever, and the page
+/// never learned why its service was not live.
+#[wasm_bindgen_test]
+async fn a_permanent_serve_registration_refusal_reaches_the_page_without_a_retry_storm() {
+    let mut fake = ServeFake::default();
+    fake.refuse_register = Some(ProxyFailure::Typed(LeafError::Session(
+        "serve \"svc\": AlreadyServed".to_string(),
+    )));
+    let (session, leader) = serve_session(fake.clone()).await;
+    let session_events = Rc::new(RefCell::new(Vec::new()));
+    let sink = Rc::clone(&session_events);
+    let listener = Closure::wrap(Box::new(move |json: JsValue| {
+        if let Some(text) = json.as_string() {
+            sink.borrow_mut().push(text);
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+    session.on_event(listener.as_ref().unchecked_ref::<Function>().clone());
+    listener.forget();
+
+    session
+        .serve_org(
+            "svc.refused".to_string(),
+            "same-org".to_string(),
+            recording_handler(&Rc::new(RefCell::new(Vec::new()))),
+            serve_opts(),
+        )
+        .expect("the handle is returned; the refusal is async");
+    wait_ms(400).await;
+
+    assert_eq!(
+        fake.registers.get(),
+        1,
+        "one attempt per permanent refusal — pre-fix the loop retried every 50ms"
+    );
+    let events = session_events.borrow().clone();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.contains("serve_registration_refused")
+                && event.contains("AlreadyServed")),
+        "the typed permanent refusal reaches the page: {events:?}"
+    );
     session.close();
     leader.close();
     settle().await;

@@ -50,7 +50,7 @@
 //! browser to review.
 
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use bytes::Bytes;
@@ -69,7 +69,15 @@ use crate::stream::Reliability;
 /// **capability** intent beside its subscriptions: D2 promises the
 /// current announcement is re-published on takeover, and a successor
 /// that only learned about channels could restore half of it.
-pub const PROXY_VERSION: u64 = 2;
+///
+/// `3` because the org serve plane changed shape (the proxy-plane
+/// repair: `OrgServeUnregister` carries its registration alone — the
+/// leader unregisters by its own recorded name, LEAF-4; the accept
+/// doc carries the handle alone and the projection rides the new
+/// `OrgServeCaller` verb, LEAF-6). A mixed pair would half-work
+/// without the gate — an old accept decoder silently drops the new
+/// doc — so the version refuses instead.
+pub const PROXY_VERSION: u64 = 3;
 
 /// The Web Lock and `BroadcastChannel` name for an identity on an
 /// origin.
@@ -689,13 +697,31 @@ pub enum LeaderRequest {
     /// Follower → leader: **long-pull** for the next admitted call on
     /// this registration.
     ///
-    /// The reply is `0x03 ‖ <JSON>` carrying `{ call, caller }` —
-    /// the per-call correlation and the verified `OrgCaller`
-    /// projection. Admitted calls are dispatched to the registering
+    /// The reply is `0x03 ‖ <JSON>` carrying `{ call }` — the
+    /// leader-minted bridge handle for the admitted call. The verified
+    /// `OrgCaller` projection is deliberately NOT carried here: it is
+    /// resolved from the leader's own [`crate::rpc_serve::ServeCall`]
+    /// state through [`Self::OrgServeCaller`], keyed by that handle
+    /// (LEAF-6: a projection reaching a handler is produced under the
+    /// leader's verified serve state, never taken on an envelope
+    /// claim). Admitted calls are dispatched to the registering
     /// follower's handle and to no other.
     OrgServeAccept {
         /// The registration this pull waits on.
         registration: u64,
+    },
+    /// Follower → leader: the verified `OrgCaller` projection for one
+    /// served call.
+    ///
+    /// Answers [`ProxyValue::Text`] with the projection built from
+    /// the leader's own [`crate::rpc_serve::ServeCall::caller`] —
+    /// never an echo of anything a follower sent. Sender-bound: only
+    /// the follower that owns the registration the call was admitted
+    /// to can resolve it, so a guessed or foreign handle resolves to
+    /// nothing.
+    OrgServeCaller {
+        /// The served call's correlation.
+        call: u64,
     },
     /// Follower → leader: **long-pull** for the next request item of
     /// one served call (`0x00 ‖ item`, then `0x01` at EOF).
@@ -733,11 +759,14 @@ pub enum LeaderRequest {
     /// Follower → leader: close a registration (C9's protected
     /// split — its live calls retire with their exact terminals and
     /// new openings are refused).
+    ///
+    /// **Owned registrations only (LEAF-4).** The leader unregisters
+    /// by the service name IT recorded when this follower registered
+    /// — a request naming another service (or another follower's
+    /// registration) affects nothing but its own typed refusal.
     OrgServeUnregister {
         /// The registration.
         registration: u64,
-        /// The service name (the leader unregisters by name).
-        service: String,
     },
 }
 
@@ -829,7 +858,7 @@ impl ProxyFailure {
 pub type ProxyOutcome = core::result::Result<ProxyValue, ProxyFailure>;
 
 /// Who an envelope came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProxySide {
     /// The tab holding the lock.
     Leader,
@@ -1318,13 +1347,22 @@ pub trait LeaderBackend {
     /// The leader's node id.
     fn node_id(&self) -> u64;
 
-    /// Perform one request, answering through `reply`.
+    /// Perform one request on behalf of `from`, answering through
+    /// `reply`.
+    ///
+    /// `from` is the requesting side — the follower's own
+    /// [`ProxySide::Follower`] id as it attached, or
+    /// [`ProxySide::Leader`] for this tab's local operations. It is
+    /// the sender half of handle attribution (LEAF-5): every handle a
+    /// request names resolves only within that sender's own
+    /// namespace, so a request naming a guessed or colliding id owns
+    /// nothing rather than another follower's call.
     ///
     /// The replier is taken by value and consumed by whichever
     /// answer it gets, so a double answer is a compile error and a
     /// forgotten one is caught by its `Drop`. An implementation that
     /// needs to await something moves the replier into the future.
-    fn perform(&mut self, request: LeaderRequest, reply: Replier);
+    fn perform(&mut self, from: ProxySide, request: LeaderRequest, reply: Replier);
 
     /// Retire the node this backend owns, and say how many of its
     /// pending calls that failed.
@@ -1355,8 +1393,8 @@ impl LeaderBackend for Box<dyn LeaderBackend> {
         (**self).node_id()
     }
 
-    fn perform(&mut self, request: LeaderRequest, reply: Replier) {
-        (**self).perform(request, reply);
+    fn perform(&mut self, from: ProxySide, request: LeaderRequest, reply: Replier) {
+        (**self).perform(from, request, reply);
     }
 
     fn shutdown(&mut self, generation: u64) -> usize {
@@ -1376,12 +1414,63 @@ pub struct Retirement {
     pub fenced_here: bool,
 }
 
+/// How many recently-delivered request correlations the at-most-once
+/// window remembers.
+const REQUEST_DEDUP_WINDOW: usize = 1024;
+
+/// The bounded at-most-once window over request deliveries (LEAF-12).
+///
+/// A request's `correlation` is its idempotence key: one follower
+/// mints each correlation exactly once ([`ProxyClient::issue`]), so a
+/// second delivery of the same `(follower, correlation)` pair is a
+/// **replayed envelope** — the same bytes re-posted at the channel —
+/// and not a second request. Without a window, replaying a captured
+/// `OrgSend`/`OrgServeSend` envelope re-executes the verb: a
+/// duplicated stream item at the provider, a duplicated response
+/// item to the caller (terminals and CANCEL are latched, which is
+/// why only the non-idempotent verbs felt it).
+///
+/// The window is bounded on purpose: the newest
+/// [`REQUEST_DEDUP_WINDOW`] keys are remembered and older ones
+/// forgotten, so a long-lived leader pays O(window) memory and every
+/// replay inside the window is answered once (the first reply stands)
+/// and never re-performed.
+#[derive(Default)]
+struct RequestDedup {
+    seen: HashSet<(u64, u64)>,
+    order: VecDeque<(u64, u64)>,
+    /// How many deliveries were refused as replays — observable so a
+    /// witness can tell "not re-performed" from "never arrived".
+    replayed: u64,
+}
+
+impl RequestDedup {
+    /// Record one request delivery. `false` when this exact request
+    /// was already delivered inside the window (a replay).
+    fn admit(&mut self, follower: u64, correlation: u64) -> bool {
+        let key = (follower, correlation);
+        if !self.seen.insert(key) {
+            self.replayed += 1;
+            return false;
+        }
+        self.order.push_back(key);
+        if self.order.len() > REQUEST_DEDUP_WINDOW {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
 /// The leader's half of the proxy.
 pub struct ProxyServer<B: LeaderBackend> {
     backend: B,
     transport: Rc<dyn ProxyTransport>,
     lease: GenerationLease,
     followers: FollowerRegistry,
+    /// The at-most-once window over request deliveries (LEAF-12).
+    dedup: RequestDedup,
     stamped: u64,
     superseded: Option<u64>,
     /// Follower announcements parked on the next authoritative union
@@ -1422,6 +1511,7 @@ impl<B: LeaderBackend> ProxyServer<B> {
             transport,
             lease,
             followers: FollowerRegistry::new(),
+            dedup: RequestDedup::default(),
             stamped: 0,
             superseded: None,
             pending_announcements: Vec::new(),
@@ -1508,6 +1598,17 @@ impl<B: LeaderBackend> ProxyServer<B> {
     #[inline]
     pub fn stamped(&self) -> u64 {
         self.stamped
+    }
+
+    /// How many request deliveries this leader refused as replays.
+    ///
+    /// Observable for the same reason [`Self::stamped`] is: "a
+    /// replayed envelope is performed exactly once" is a claim, and
+    /// this is the count that says the second delivery was seen —
+    /// and dropped rather than re-executed.
+    #[inline]
+    pub fn replayed(&self) -> u64 {
+        self.dedup.replayed
     }
 
     /// The generation that superseded this leader, once it has seen
@@ -1654,6 +1755,21 @@ impl<B: LeaderBackend> ProxyServer<B> {
                         .fail(ProxyFailure::Typed(error.clone()));
                     return Err(error);
                 }
+                // # At-most-once under replay (LEAF-12)
+                //
+                // A request's `correlation` is its idempotence key:
+                // one follower mints each correlation exactly once, so
+                // a second delivery of this exact `(follower,
+                // correlation)` is a REPLAYED envelope — the same
+                // bytes re-posted at the channel — and not a second
+                // request. Re-performing it would duplicate the verb's
+                // effect (a second `OrgSend` item at the provider, a
+                // second `OrgServeSend` response item), so it is
+                // counted and dropped: the first delivery's reply
+                // stands and nothing re-executes.
+                if !self.dedup.admit(follower, correlation) {
+                    return Ok(());
+                }
                 // A declaration, not just an operation. Both of these
                 // are that follower's standing intent, and a successor
                 // that only learned the operations would restore the
@@ -1716,7 +1832,7 @@ impl<B: LeaderBackend> ProxyServer<B> {
                     return Ok(());
                 }
                 let reply = self.replier(correlation);
-                self.backend.perform(*request, reply);
+                self.backend.perform(ProxySide::Follower(follower), *request, reply);
                 Ok(())
             }
             // A follower does not send these.
@@ -2151,8 +2267,307 @@ pub const ORG_ENVELOPE_END: u8 = 0x01;
 /// A retirement signal: `0x02 ‖ <reason>` with the frozen
 /// `OrgRetireReason` string.
 pub const ORG_ENVELOPE_RETIRED: u8 = 0x02;
-/// An admitted serve call: `0x03 ‖ <JSON { call, caller }>`.
+/// An admitted serve call: `0x03 ‖ <JSON { call }>`.
+///
+/// Just the leader-minted bridge handle. The verified `OrgCaller`
+/// projection is deliberately NOT carried as an envelope claim
+/// (LEAF-6): it is resolved from the leader's own
+/// [`crate::rpc_serve::ServeCall`] state through
+/// [`LeaderRequest::OrgServeCaller`] once the handle is known.
 pub const ORG_ENVELOPE_ADMITTED: u8 = 0x03;
+
+/// Wrap bytes in the transparent envelope (the tags above).
+pub fn envelope(tag: u8, payload: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(1 + payload.len());
+    out.push(tag);
+    out.extend_from_slice(payload);
+    Bytes::from(out)
+}
+
+/// Read the `0x03 ‖ { call }` accept envelope's handle.
+///
+/// Strictly the producer's own shape: the tag must be
+/// [`ORG_ENVELOPE_ADMITTED`] and the body a JSON object with a
+/// decimal-string `call`. A bare-JSON body — which is what a forgery
+/// posts, having no envelope to emit — decodes to nothing (LEAF-3:
+/// the consumer this replaced ran `serde_json::from_slice` on the
+/// WHOLE payload, so it parsed exactly the forged bare accepts and
+/// dropped every well-formed one). Extra fields are ignored rather
+/// than trusted: an attacker-added `caller` claim is never read here
+/// (LEAF-6), the projection comes from the leader's serve state.
+pub fn decode_admitted(payload: &[u8]) -> Option<u64> {
+    let (&tag, rest) = payload.split_first()?;
+    if tag != ORG_ENVELOPE_ADMITTED {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(rest).ok()?;
+    value.get("call")?.as_str()?.parse::<u64>().ok()
+}
+
+/// Whether a failed serve registration is worth re-declaring (LEAF-14).
+///
+/// Only the generation/session-lifecycle moves are transient: the
+/// leader changed under the request, or the reply went with the
+/// generation that owed it. Both clear on their own — the successor
+/// generation re-declares the registration — so the re-declare loop
+/// retries them. Everything else is PERMANENT: the name is already
+/// served, the argument strings did not parse, the session is
+/// closed. A permanent refusal used to be misdiagnosed as transient
+/// and retried at 50ms forever; now it reaches the caller typed and
+/// the loop stops.
+pub fn registration_refusal_is_transient(failure: &ProxyFailure) -> bool {
+    matches!(
+        failure.typed(),
+        Some(LeafError::NotLeader { .. })
+            | Some(LeafError::Rpc(RpcError::LeaderLost { .. }))
+            | Some(LeafError::Rpc(RpcError::SessionLost))
+    )
+}
+
+/// The typed "your call is closed" failure for an unknown handle —
+/// "no org call for handle N", never another call's.
+pub fn no_such_call(call: u64) -> ProxyFailure {
+    ProxyFailure::Typed(LeafError::Session(format!("no org call for handle {call}")))
+}
+
+/// The typed refusal for a call handle that is live but already
+/// claimed — a colliding insert names nothing but its own failure.
+pub fn call_in_use(call: u64) -> ProxyFailure {
+    ProxyFailure::Typed(LeafError::Session(format!(
+        "org call handle {call} is already in use"
+    )))
+}
+
+/// The typed "no such registration" failure — unknown AND foreign
+/// alike, so a handle namespace cannot be probed by difference.
+pub fn no_such_registration(registration: u64) -> ProxyFailure {
+    ProxyFailure::Typed(LeafError::Session(format!(
+        "no org registration for handle {registration}"
+    )))
+}
+
+/// A fresh relay-handle seed: random for the reason the follower's
+/// own ids are — a bridge handle names a live served call across a
+/// channel every tab can read, and a counter from 1 is a guessable
+/// name for it.
+fn relay_seed() -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| LeafError::Identity(format!("no CSPRNG available: {e}")))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+/// The leader-side relay for proxied org calls and serves.
+///
+/// Attribution, enforced here: every entry is keyed by the handle the
+/// FOLLOWER minted (its per-call / per-registration id) and carries
+/// the [`ProxySide`] that claimed it. Every verb resolves a handle
+/// only within the requesting sender's own namespace, so a request
+/// naming a guessed or colliding id owns nothing ("no org call for
+/// handle N", never another follower's call under the same id), and a
+/// colliding insert never clobbers the live entry it names (dropping
+/// a victim's [`crate::rpc_stream::CallHandle`] is its CANCEL). That
+/// is exactly the required witness inverse.
+#[derive(Default)]
+pub struct OrgRelay {
+    /// The node-side guards for follower calls (streaming shapes),
+    /// each with the sender that claimed its handle.
+    calls: HashMap<u64, (ProxySide, crate::rpc_stream::CallHandle)>,
+    /// Served calls a follower's handler drives: bridge-call id →
+    /// (owner, registration, the real [`crate::rpc_serve::ServeCall`]).
+    serve_calls: HashMap<u64, (ProxySide, u64, crate::rpc_serve::ServeCall)>,
+    /// Per-registration queues of admitted calls awaiting an accept.
+    accepts: HashMap<u64, VecDeque<u64>>,
+    /// Registrations: id → (owner, the service name RECORDED at
+    /// registration). Unregistration acts on the recorded name and
+    /// only for the owner — a request's own claim is never the key
+    /// (LEAF-4).
+    registrations: HashMap<u64, (ProxySide, String)>,
+    /// The next bridge-call id. CSPRNG-seeded, then monotonic:
+    /// unguessable to another tab, never reused.
+    next_serve_call: u64,
+}
+
+impl OrgRelay {
+    /// The node-side call id behind a follower's streaming handle, if
+    /// the requesting sender owns it and it is live here.
+    pub fn stream_call(&self, from: ProxySide, call: u64) -> Option<u64> {
+        match self.calls.get(&call) {
+            Some((owner, handle)) if *owner == from => Some(handle.call_id),
+            _ => None,
+        }
+    }
+
+    /// Whether a call handle is live here (any owner) — the cheap
+    /// pre-check that keeps a doomed open from starting.
+    pub fn call_live(&self, call: u64) -> bool {
+        self.calls.contains_key(&call)
+    }
+
+    /// Install a freshly opened call under `from`'s handle.
+    ///
+    /// A colliding insert (the handle is live) is refused and the new
+    /// handle handed back: the live entry keeps its own handle —
+    /// dropping a victim's [`crate::rpc_stream::CallHandle`] is its
+    /// exactly-one CANCEL (LEAF-5).
+    pub fn install_call(
+        &mut self,
+        from: ProxySide,
+        call: u64,
+        handle: crate::rpc_stream::CallHandle,
+    ) -> core::result::Result<(), (ProxyFailure, crate::rpc_stream::CallHandle)> {
+        if self.calls.contains_key(&call) {
+            return Err((call_in_use(call), handle));
+        }
+        self.calls.insert(call, (from, handle));
+        Ok(())
+    }
+
+    /// Release one call entry at terminal delivery (LEAF-13): the
+    /// entry goes WITH the terminal, so a long-lived relay does not
+    /// accumulate one handle-holding entry per call it ever carried,
+    /// and a re-delivered terminal finds nothing left to re-apply.
+    /// `false` — no state change — on a second release.
+    pub fn release_call(&mut self, from: ProxySide, call: u64) -> bool {
+        match self.calls.get(&call) {
+            Some((owner, _)) if *owner == from => self.calls.remove(&call).is_some(),
+            _ => false,
+        }
+    }
+
+    /// The served call `from` owns under `call`, if any — the one
+    /// resolution every serve verb goes through.
+    pub fn serve_call(&self, from: ProxySide, call: u64) -> Option<&crate::rpc_serve::ServeCall> {
+        match self.serve_calls.get(&call) {
+            Some((owner, _, serve)) if *owner == from => Some(serve),
+            _ => None,
+        }
+    }
+
+    /// Park one admitted call for `from`'s registration, minting its
+    /// unguessable bridge handle.
+    ///
+    /// `Err` hands the call back when the registration is gone
+    /// (closed while this call was being admitted): no accept pull
+    /// remains to take it, and the caller must settle typed rather
+    /// than park on a queue nobody drains.
+    pub fn install_serve(
+        &mut self,
+        from: ProxySide,
+        registration: u64,
+        serve: crate::rpc_serve::ServeCall,
+    ) -> core::result::Result<u64, crate::rpc_serve::ServeCall> {
+        if !self.registrations.contains_key(&registration) {
+            return Err(serve);
+        }
+        let call = match self.next_bridge_call() {
+            Ok(call) => call,
+            Err(_) => return Err(serve),
+        };
+        self.serve_calls.insert(call, (from, registration, serve));
+        self.accepts.entry(registration).or_default().push_back(call);
+        Ok(call)
+    }
+
+    /// Pop the next admitted call for `from`'s registration.
+    ///
+    /// `Ok(None)` is the long-pull's "nothing yet"; `Err` is an
+    /// unknown or foreign registration — typed, and never another
+    /// follower's queue.
+    pub fn accept_admitted(
+        &mut self,
+        from: ProxySide,
+        registration: u64,
+    ) -> core::result::Result<Option<u64>, ProxyFailure> {
+        if !self.registration_owned_by(from, registration) {
+            return Err(no_such_registration(registration));
+        }
+        Ok(self
+            .accepts
+            .get_mut(&registration)
+            .and_then(|queue| queue.pop_front()))
+    }
+
+    /// Whether `from` owns `registration`.
+    pub fn registration_owned_by(&self, from: ProxySide, registration: u64) -> bool {
+        matches!(
+            self.registrations.get(&registration),
+            Some((owner, _)) if *owner == from
+        )
+    }
+
+    /// Claim `registration` for `from`, bound to `service`.
+    ///
+    /// `Ok(true)` is a fresh claim — the node registration is the
+    /// caller's to make, and [`Self::drop_registration`] rolls the
+    /// claim back if it fails. `Ok(false)` is the re-declare
+    /// idempotence: an identical claim is already recorded (and its
+    /// node registration with it). A live handle re-bound to a
+    /// different service, or claimed by a different sender, is
+    /// refused — never overwritten (LEAF-5).
+    pub fn claim_registration(
+        &mut self,
+        from: ProxySide,
+        registration: u64,
+        service: &str,
+    ) -> core::result::Result<bool, ProxyFailure> {
+        match self.registrations.get(&registration) {
+            Some((owner, bound)) if *owner == from && bound == service => Ok(false),
+            Some(_) if self.registration_owned_by(from, registration) => {
+                Err(ProxyFailure::Typed(LeafError::Session(format!(
+                    "org registration handle {registration} is already bound to another service"
+                ))))
+            }
+            Some(_) => Err(no_such_registration(registration)),
+            None => {
+                self.registrations
+                    .insert(registration, (from, service.to_string()));
+                Ok(true)
+            }
+        }
+    }
+
+    /// The service name recorded for `from`'s registration — the name
+    /// unregistration acts on (LEAF-4), never a request's claim.
+    pub fn registration_service(&self, from: ProxySide, registration: u64) -> Option<String> {
+        self.registrations
+            .get(&registration)
+            .filter(|(owner, _)| *owner == from)
+            .map(|(_, service)| service.clone())
+    }
+
+    /// Drop `from`'s registration and everything it carried: the
+    /// accept queue and every served call admitted to it. Refused
+    /// (and untouched) for a registration `from` does not own.
+    pub fn drop_registration(&mut self, from: ProxySide, registration: u64) -> bool {
+        if !self.registration_owned_by(from, registration) {
+            return false;
+        }
+        self.registrations.remove(&registration);
+        self.accepts.remove(&registration);
+        self.serve_calls
+            .retain(|_, (owner, seen, _)| !(*owner == from && *seen == registration));
+        true
+    }
+
+    /// Generation teardown: every entry goes (each dropped call
+    /// handle emits its exactly-one CANCEL).
+    pub fn clear(&mut self) {
+        self.calls.clear();
+        self.serve_calls.clear();
+        self.accepts.clear();
+        self.registrations.clear();
+    }
+
+    /// The next bridge-call id — CSPRNG-seeded, then monotonic.
+    pub fn next_bridge_call(&mut self) -> Result<u64> {
+        if self.next_serve_call == 0 {
+            self.next_serve_call = relay_seed()?;
+        }
+        self.next_serve_call = self.next_serve_call.wrapping_add(1);
+        Ok(self.next_serve_call)
+    }
+}
 
 /// An optional `u32` in the `timeout_ms` spelling: decimal string or
 /// null.
@@ -2379,6 +2794,10 @@ fn encode_request(request: &LeaderRequest) -> Value {
             map.insert("op".into(), Value::from("org_serve_accept"));
             map.insert("registration".into(), Value::from(registration.to_string()));
         }
+        LeaderRequest::OrgServeCaller { call } => {
+            map.insert("op".into(), Value::from("org_serve_caller"));
+            map.insert("call".into(), Value::from(call.to_string()));
+        }
         LeaderRequest::OrgServeRequest { call } => {
             map.insert("op".into(), Value::from("org_serve_request"));
             map.insert("call".into(), Value::from(call.to_string()));
@@ -2402,13 +2821,9 @@ fn encode_request(request: &LeaderRequest) -> Value {
             map.insert("op".into(), Value::from("org_serve_retired"));
             map.insert("call".into(), Value::from(call.to_string()));
         }
-        LeaderRequest::OrgServeUnregister {
-            registration,
-            service,
-        } => {
+        LeaderRequest::OrgServeUnregister { registration } => {
             map.insert("op".into(), Value::from("org_serve_unregister"));
             map.insert("registration".into(), Value::from(registration.to_string()));
-            map.insert("service".into(), Value::from(service.clone()));
         }
     }
     Value::Object(map)
@@ -2541,6 +2956,9 @@ fn decode_request(value: &Value) -> Result<LeaderRequest> {
         "org_serve_accept" => LeaderRequest::OrgServeAccept {
             registration: u64_field(value, "registration")?,
         },
+        "org_serve_caller" => LeaderRequest::OrgServeCaller {
+            call: u64_field(value, "call")?,
+        },
         "org_serve_request" => LeaderRequest::OrgServeRequest {
             call: u64_field(value, "call")?,
         },
@@ -2560,7 +2978,6 @@ fn decode_request(value: &Value) -> Result<LeaderRequest> {
         },
         "org_serve_unregister" => LeaderRequest::OrgServeUnregister {
             registration: u64_field(value, "registration")?,
-            service: str_field(value, "service")?.to_string(),
         },
         other => {
             return Err(LeafError::ControlPlane(format!(
@@ -2944,7 +3361,7 @@ mod tests {
             self.node_id
         }
 
-        fn perform(&mut self, request: LeaderRequest, reply: Replier) {
+        fn perform(&mut self, _from: ProxySide, request: LeaderRequest, reply: Replier) {
             self.seen.borrow_mut().push(request.clone());
             if self.answer_immediately {
                 match request {
@@ -3093,7 +3510,7 @@ mod tests {
     #[test]
     fn udp_blocked_without_both_observations_arrives_as_an_ice_timeout() {
         let forged = serde_json::json!({
-            "v": "2",
+            "v": "3",
             "generation": "1",
             "from": "leader",
             "kind": "failed",
@@ -3307,10 +3724,12 @@ mod tests {
     #[test]
     fn an_unknown_protocol_version_is_refused() {
         let text =
-            envelope(1, ProxySide::Leader, ProxyBody::Detach).replace("\"v\":\"2\"", "\"v\":\"3\"");
-        let error = ProxyEnvelope::from_json(&text).expect_err("a v3 envelope must be refused");
-        assert!(error.to_string().contains("version 3"), "{error}");
+            envelope(1, ProxySide::Leader, ProxyBody::Detach).replace("\"v\":\"3\"", "\"v\":\"4\"");
+        let error = ProxyEnvelope::from_json(&text).expect_err("a v4 envelope must be refused");
+        assert!(error.to_string().contains("version 4"), "{error}");
         assert!(ProxyEnvelope::from_json("not json").is_err());
+        // A stale peer's v2 envelope is refused the same way — that
+        // is what the bump is for.
         assert!(ProxyEnvelope::from_json("{\"v\":\"2\"}").is_err());
     }
 
@@ -3641,6 +4060,7 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         let reply = Replier::local(tx, server.lease());
         server.backend_mut().perform(
+            ProxySide::Leader,
             LeaderRequest::Call {
                 service: "svc".into(),
                 payload: Bytes::new(),
@@ -3917,6 +4337,573 @@ mod tests {
             scope_name("https://a.example", "ff"),
             scope_name("https://b.example", "ff"),
             "two origins must not share a lock"
+        );
+    }
+
+    // ───────────── the accept envelope (LEAF-3 / LEAF-6) ─────────────
+
+    /// LEAF-3: the producer's accept envelope and the consumer's
+    /// decoder agree — the exact bytes the accept arm emits parse to
+    /// exactly the one handle the loop dispatches once. Pre-fix,
+    /// `decode_admitted` ran `serde_json::from_slice` on the WHOLE
+    /// `0x03 ‖ JSON` payload, so the producer's own envelope decoded
+    /// to NOTHING and every well-formed accept was dropped at the
+    /// accept hop (the handler never dispatched, the caller timed
+    /// out).
+    #[test]
+    fn a_well_formed_accept_envelope_decodes_to_exactly_one_call_handle() {
+        let mut doc = Map::new();
+        doc.insert("call".into(), Value::from("42"));
+        // The producer's exact construction: `envelope(ORG_ENVELOPE_ADMITTED, json)`.
+        let wire = super::envelope(
+            ORG_ENVELOPE_ADMITTED,
+            Value::Object(doc).to_string().as_bytes(),
+        );
+        assert_eq!(
+            decode_admitted(&wire),
+            Some(42),
+            "the emitted accept must parse — pre-fix it decoded to None"
+        );
+    }
+
+    /// LEAF-3's inverse: the ONLY accepts that parsed before the fix
+    /// were FORGED bare-JSON ones (no tag to skip). A forgery now
+    /// decodes to nothing — dispatch is the well-formed path's alone.
+    #[test]
+    fn a_forged_bare_json_accept_does_not_decode() {
+        assert_eq!(
+            decode_admitted(br#"{"call":"42","caller":{"entity":"ff"}}"#),
+            None,
+            "pre-fix exactly this forged shape parsed; a well-formed one did not"
+        );
+    }
+
+    /// LEAF-6, codec half: a tampered envelope claim is never part of
+    /// what the decoder produces. The projection reaching handlers is
+    /// resolved from the leader's own serve state through
+    /// `OrgServeCaller` — the accept doc's `caller` field, present or
+    /// forged, is ignored.
+    #[test]
+    fn an_accept_decoder_reads_the_handle_and_never_a_caller_claim() {
+        let mut doc = Map::new();
+        doc.insert("call".into(), Value::from("42"));
+        doc.insert("caller".into(), Value::from("{\"entity\":\"deadbeef\"}"));
+        let wire = super::envelope(
+            ORG_ENVELOPE_ADMITTED,
+            Value::Object(doc).to_string().as_bytes(),
+        );
+        assert_eq!(
+            decode_admitted(&wire),
+            Some(42),
+            "a tampered claim neither breaks the parse nor becomes the projection"
+        );
+    }
+
+    // ─────────────────── at-most-once (LEAF-12) ───────────────────
+
+    /// LEAF-12: a replayed request envelope — the same bytes posted
+    /// twice at the channel — performs its verb exactly once. Pre-fix
+    /// every delivery re-executed, so a replayed `OrgSend` published
+    /// a second item (and a replayed `OrgServeSend` a second response
+    /// item) at the provider.
+    #[test]
+    fn a_replayed_org_send_envelope_is_performed_exactly_once() {
+        let transport = Rc::new(RecordingTransport::new());
+        let mut server = ProxyServer::new(TestBackend::new(0x99), transport.clone(), 7);
+        let seen = server.backend_mut().seen.clone();
+        let request = envelope(
+            7,
+            ProxySide::Follower(1),
+            ProxyBody::Request {
+                correlation: 500,
+                request: Box::new(LeaderRequest::OrgSend {
+                    call: 9,
+                    payload: Bytes::from_static(b"item"),
+                }),
+            },
+        );
+        server.on_message(&request).expect("the first delivery serves");
+        server.on_message(&request).expect("the replay is dropped, not refused");
+
+        assert_eq!(
+            seen.borrow().len(),
+            1,
+            "the replayed envelope re-executed the send — items publish exactly once"
+        );
+        assert_eq!(
+            server.replayed(),
+            1,
+            "and the replay was counted as seen, not re-performed"
+        );
+    }
+
+    /// The same at-most-once for the served-response direction: a
+    /// replayed `OrgServeSend` publishes exactly one response item.
+    #[test]
+    fn a_replayed_org_serve_send_envelope_is_performed_exactly_once() {
+        let transport = Rc::new(RecordingTransport::new());
+        let mut server = ProxyServer::new(TestBackend::new(0x99), transport.clone(), 7);
+        let seen = server.backend_mut().seen.clone();
+        let request = envelope(
+            7,
+            ProxySide::Follower(1),
+            ProxyBody::Request {
+                correlation: 501,
+                request: Box::new(LeaderRequest::OrgServeSend {
+                    call: 3,
+                    payload: Bytes::from_static(b"response"),
+                }),
+            },
+        );
+        server.on_message(&request).expect("first");
+        server.on_message(&request).expect("replay");
+        assert_eq!(seen.borrow().len(), 1, "the response item published once");
+    }
+
+    /// The window is a replay guard, not a gap: a follower's next
+    /// (fresh) correlation still performs, and an out-of-order
+    /// delivery of a fresh one is not mistaken for a replay.
+    #[test]
+    fn a_fresh_correlation_is_not_swallowed_by_the_replay_window() {
+        let transport = Rc::new(RecordingTransport::new());
+        let mut server = ProxyServer::new(TestBackend::new(0x99), transport.clone(), 7);
+        let seen = server.backend_mut().seen.clone();
+        for correlation in [502, 503, 502, 503] {
+            let request = envelope(
+                7,
+                ProxySide::Follower(1),
+                ProxyBody::Request {
+                    correlation,
+                    request: Box::new(LeaderRequest::OrgNext { call: 9 }),
+                },
+            );
+            server.on_message(&request).expect("served or dropped");
+        }
+        assert_eq!(
+            seen.borrow().len(),
+            2,
+            "two distinct requests perform once each; their replays perform nothing"
+        );
+    }
+
+    // ───────── permanent refusals reach the caller (LEAF-14) ─────────
+
+    /// LEAF-14: only a generation/session move is transient. Pre-fix
+    /// the re-declare loop retried EVERY registration failure at 50ms
+    /// forever — an `AlreadyServed` refusal was misdiagnosed as
+    /// latency and the page never learned its service was not live.
+    #[test]
+    fn a_permanent_serve_registration_refusal_is_never_transient() {
+        let permanent = [
+            ProxyFailure::Typed(LeafError::Session(
+                "serve \"svc\": AlreadyServed".into(),
+            )),
+            ProxyFailure::Reported("unknown org call shape \"x\"".into()),
+            ProxyFailure::Typed(LeafError::Session("the session is closed".into())),
+        ];
+        for failure in &permanent {
+            assert!(
+                !registration_refusal_is_transient(failure),
+                "{failure:?} is permanent and must reach the caller typed, not retry"
+            );
+        }
+    }
+
+    /// The transient half: a generation move under the request
+    /// re-declares (the `Attach` discipline), and nothing else does.
+    #[test]
+    fn only_a_generation_move_retries_the_registration() {
+        let transient = [
+            ProxyFailure::Typed(LeafError::NotLeader {
+                presented: 1,
+                current: Some(2),
+            }),
+            ProxyFailure::Typed(LeafError::Rpc(RpcError::LeaderLost { generation: 1 })),
+            ProxyFailure::Typed(LeafError::Rpc(RpcError::SessionLost)),
+        ];
+        for failure in &transient {
+            assert!(
+                registration_refusal_is_transient(failure),
+                "{failure:?} clears on its own and re-declares"
+            );
+        }
+    }
+
+    // ─────────── the sender-bound relay (LEAF-5/4/13) ───────────
+
+    use std::cell::RefCell;
+
+    use crate::identity::EntityKeypair;
+    use crate::org::cert::{OrgId, OrgKeypair, OrgMembershipCert};
+    use crate::org::entity::EntityId;
+    use crate::org::grant::{
+        CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
+    };
+    use crate::org::proof::RpcCallShape;
+    use crate::org::replay::AdmissionReplayGuard;
+    use crate::org::revocation::RevocationFacts;
+    use crate::rpc_serve::{
+        OpenOutcome, ServeAccess, ServeAdmission, ServeCall, ServeOptions, ServePeer,
+        ServeRegistry,
+    };
+    use crate::rpc_stream::{
+        attach_signed_admission, CallHandle, CallPin, OrgCallIntent, StreamCallRegistry,
+        StreamOpen,
+    };
+    use crate::rpc_wire::RpcRequestPayload;
+
+    const RELAY_SERVICE: &str = "svc.relay";
+    const RELAY_NOW_SECS: u64 = 1_700_000_000;
+    const RELAY_NOW_NS: u64 = 1_700_000_000_000_000_000;
+    const RELAY_PEER: crate::control_plane::NodeId = 0xBEEF_0000_0002;
+
+    /// The fixture world the relay witnesses mint their handles in —
+    /// one org root and one caller entity, every proof minted through
+    /// `crate::org` exactly as the serve lifecycle's harness does.
+    struct RelayWorld {
+        org: OrgKeypair,
+        caller_kp: Rc<EntityKeypair>,
+        caller_entity: EntityId,
+        provider_entity: EntityId,
+        owner_org: OrgId,
+        binding: [u8; 32],
+        facts: RevocationFacts,
+        replay: AdmissionReplayGuard,
+    }
+
+    impl RelayWorld {
+        fn new() -> Self {
+            let org = OrgKeypair::from_bytes([0x42; 32]);
+            let caller_kp = EntityKeypair::from_secret([0x24; 32]);
+            let caller_entity = EntityId::from_bytes(*caller_kp.entity_id());
+            Self {
+                owner_org: org.org_id(),
+                org,
+                caller_kp: Rc::new(caller_kp),
+                caller_entity,
+                provider_entity: EntityId::from_bytes([0x77; 32]),
+                binding: [0xAB; 32],
+                facts: RevocationFacts::default(),
+                replay: AdmissionReplayGuard::with_defaults(),
+            }
+        }
+
+        fn capability() -> CapabilityAuthorityId {
+            CapabilityAuthorityId::for_tag(&format!("nrpc:{RELAY_SERVICE}"))
+        }
+
+        fn intent(&self) -> OrgCallIntent {
+            OrgCallIntent {
+                keypair: Rc::clone(&self.caller_kp),
+                membership: OrgMembershipCert::issue_at(
+                    &self.org,
+                    self.caller_entity.clone(),
+                    1,
+                    RELAY_NOW_SECS,
+                    RELAY_NOW_SECS + 3_600,
+                    0x1111_2222_3333_4444,
+                ),
+                dispatcher_grant: OrgDispatcherGrant::issue_at(
+                    &self.org,
+                    self.caller_entity.clone(),
+                    DispatcherScope::Exact(Self::capability()),
+                    RELAY_NOW_SECS,
+                    RELAY_NOW_SECS + 3_600,
+                    0x5555_6666_7777_8888,
+                ),
+                capability_grant: None,
+                acting_org: self.owner_org,
+                provider_org: self.owner_org,
+                provider: self.provider_entity.clone(),
+                capability: Self::capability(),
+                ttl_secs: 30,
+            }
+        }
+
+        fn serve_peer(&self) -> ServePeer {
+            ServePeer {
+                peer: RELAY_PEER,
+                incarnation: 7,
+                caller: self.caller_entity.clone(),
+                session_binding: Some(self.binding),
+            }
+        }
+
+        fn admission(&self) -> ServeAdmission<'_> {
+            ServeAdmission {
+                provider: &self.provider_entity,
+                facts: &self.facts,
+                replay: &self.replay,
+            }
+        }
+    }
+
+    /// One caller-side call handle: a LAZY CS open, so nothing is put
+    /// on any wire and the relay sees exactly the handle the real
+    /// `OrgCall` arm installs.
+    fn relay_call_handle(world: &RelayWorld, seed: u64) -> CallHandle {
+        let mut calls = StreamCallRegistry::new(world.caller_entity.origin_hash(), seed);
+        calls
+            .open_client_streaming(
+                CallPin {
+                    peer: RELAY_PEER,
+                    incarnation: 7,
+                    provider: world.provider_entity.clone(),
+                    request_route: 1,
+                    reply_route: 2,
+                    carrier_stream_id: 3,
+                },
+                RELAY_SERVICE,
+                StreamOpen::default(),
+                world.intent(),
+                Some(world.binding),
+                RELAY_NOW_NS,
+            )
+            .expect("the lazy open mints a handle")
+    }
+
+    /// One real admitted [`ServeCall`] — minted through the serve
+    /// registry's own admission, never a hand-rolled double.
+    fn relay_serve_call(world: &RelayWorld, call_id: u64) -> ServeCall {
+        let mut serves = ServeRegistry::new(0x5EED);
+        let captured: Rc<RefCell<Option<ServeCall>>> = Rc::new(RefCell::new(None));
+        let sink = Rc::clone(&captured);
+        serves
+            .serve(
+                RELAY_SERVICE,
+                ServeOptions {
+                    shape: RpcCallShape::Unary,
+                    access: ServeAccess::SameOrg,
+                    provider_owner_org: world.owner_org,
+                    skew_secs: 0,
+                    default_live_ns: 300 * 1_000_000_000,
+                    max_live_ns: 3600 * 1_000_000_000,
+                    policy: None,
+                },
+                Rc::new(move |call| *sink.borrow_mut() = Some(call)),
+            )
+            .expect("serve");
+        let mut request = RpcRequestPayload {
+            service: RELAY_SERVICE.to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        };
+        attach_signed_admission(
+            &mut request,
+            &world.intent(),
+            call_id,
+            RELAY_SERVICE,
+            RpcCallShape::Unary,
+            Some(world.binding),
+            RELAY_NOW_NS,
+        )
+        .expect("mint");
+        let outcome = serves.on_request(
+            &world.serve_peer(),
+            RELAY_SERVICE,
+            call_id,
+            request,
+            RELAY_NOW_NS,
+            &world.admission(),
+        );
+        assert_eq!(outcome, OpenOutcome::Admitted, "the fixture admits");
+        let call = captured.borrow_mut().take();
+        call.expect("the handler hook ran")
+    }
+
+    /// LEAF-5: a call handle resolves only inside the namespace of
+    /// the sender that claimed it. Read (`OrgNext`), inject
+    /// (`OrgSend`) and cancel (`OrgCancel`) all resolve through
+    /// `stream_call` — a foreign sender on the exact colliding id
+    /// resolves NOTHING, and the victim's entry is untouched.
+    #[test]
+    fn a_follower_cannot_read_inject_or_cancel_another_followers_call() {
+        let world = RelayWorld::new();
+        let mut relay = OrgRelay::default();
+        let owner = ProxySide::Follower(1);
+        let attacker = ProxySide::Follower(2);
+        let call = 777;
+        relay
+            .install_call(owner, call, relay_call_handle(&world, 0x1111))
+            .expect("the owner installs its call");
+
+        assert!(relay.stream_call(owner, call).is_some());
+        assert_eq!(
+            relay.stream_call(attacker, call),
+            None,
+            "a guessed/colliding id must read no call — pre-fix the id alone resolved it"
+        );
+        assert_eq!(relay.stream_call(ProxySide::Leader, call), None);
+        assert!(relay.call_live(call), "and the victim's entry stands");
+    }
+
+    /// LEAF-5's clobber half: a colliding `OrgCall` insert must leave
+    /// the live entry intact. Pre-fix the insert overwrote it — and
+    /// dropping the victim's `CallHandle` is the victim call's
+    /// exactly-one CANCEL.
+    #[test]
+    fn a_colliding_call_insert_leaves_the_live_entry_intact() {
+        let world = RelayWorld::new();
+        let mut relay = OrgRelay::default();
+        let owner = ProxySide::Follower(1);
+        let attacker = ProxySide::Follower(2);
+        let call = 778;
+        relay
+            .install_call(owner, call, relay_call_handle(&world, 0x1111))
+            .expect("the victim's insert");
+        let before = relay.stream_call(owner, call).expect("the victim resolves");
+
+        let Err((failure, returned)) =
+            relay.install_call(attacker, call, relay_call_handle(&world, 0x2222))
+        else {
+            panic!("a colliding insert must be refused, never applied");
+        };
+        assert!(
+            matches!(failure, ProxyFailure::Typed(LeafError::Session(_))),
+            "the collision is typed: {failure:?}"
+        );
+        drop(returned);
+        assert_eq!(
+            relay.stream_call(owner, call),
+            Some(before),
+            "the victim keeps its own handle — a clobber would have cancelled its call"
+        );
+    }
+
+    /// LEAF-13: the call entry goes WITH its terminal. Pre-fix the
+    /// map held one `CallHandle`-bearing entry per call it ever
+    /// carried (unbounded growth), and a re-delivered terminal found
+    /// the entry and re-applied it.
+    #[test]
+    fn a_call_entry_is_released_with_its_terminal_and_never_re_applied() {
+        let world = RelayWorld::new();
+        let mut relay = OrgRelay::default();
+        let owner = ProxySide::Follower(1);
+        let call = 779;
+        relay
+            .install_call(owner, call, relay_call_handle(&world, 0x1111))
+            .expect("install");
+
+        assert!(relay.release_call(owner, call), "terminal delivery releases");
+        assert!(!relay.call_live(call), "the entry is gone");
+        assert_eq!(
+            relay.stream_call(owner, call),
+            None,
+            "a re-delivered terminal finds nothing left to re-apply"
+        );
+        assert!(
+            !relay.release_call(owner, call),
+            "and a second release changes nothing"
+        );
+    }
+
+    /// LEAF-4: unregistration acts on the registration the leader
+    /// RECORDED for the requesting follower — never a request's
+    /// claimed name, and never another follower's registration. Pre-fix
+    /// the `OrgServeUnregister` arm unshared whatever name the request
+    /// claimed: one follower's request killed another follower's
+    /// service and retired its live calls.
+    #[test]
+    fn an_unregister_touches_only_the_registrations_the_sender_own() {
+        let mut relay = OrgRelay::default();
+        let owner = ProxySide::Follower(1);
+        let attacker = ProxySide::Follower(2);
+        assert_eq!(relay.claim_registration(owner, 7, "svc.a"), Ok(true));
+
+        assert!(
+            relay.claim_registration(attacker, 7, "svc.b").is_err(),
+            "a foreign registration id is refused, never re-bound"
+        );
+        assert!(
+            !relay.drop_registration(attacker, 7),
+            "an attacker's unregister affects nothing"
+        );
+        assert_eq!(
+            relay.registration_service(owner, 7),
+            Some("svc.a".to_string()),
+            "the owner's registration — and the name it recorded — stand intact"
+        );
+        assert_eq!(relay.registration_service(attacker, 7), None);
+    }
+
+    /// The recorded-name half of LEAF-4: the leader records the name
+    /// at registration and unregistration acts on THAT — a request's
+    /// own service claim is no longer even carried, and an owner
+    /// re-binding its live handle to another name is refused rather
+    /// than re-pointed.
+    #[test]
+    fn an_unregister_removes_the_recorded_name_and_only_for_its_owner() {
+        let mut relay = OrgRelay::default();
+        let owner = ProxySide::Follower(1);
+        assert_eq!(relay.claim_registration(owner, 7, "svc.a"), Ok(true));
+        assert!(
+            relay.claim_registration(owner, 7, "svc.other").is_err(),
+            "a live registration keeps the name it recorded"
+        );
+        assert_eq!(
+            relay.registration_service(owner, 7),
+            Some("svc.a".to_string())
+        );
+        assert!(relay.drop_registration(owner, 7), "the owner unregisters");
+        assert_eq!(
+            relay.registration_service(owner, 7),
+            None,
+            "and exactly that registration went"
+        );
+    }
+
+    /// LEAF-5's served half: a served call resolves only for the
+    /// follower whose registration it was admitted to — read
+    /// (`OrgServeRequest`), inject (`OrgServeSend`) and
+    /// finish/retire resolve nothing for anyone else, on the exact
+    /// id. The accept queue is the owner's alone.
+    #[test]
+    fn a_served_call_resolves_only_for_its_owning_follower() {
+        let world = RelayWorld::new();
+        let mut relay = OrgRelay::default();
+        let owner = ProxySide::Follower(1);
+        let attacker = ProxySide::Follower(2);
+        relay
+            .claim_registration(owner, 7, RELAY_SERVICE)
+            .expect("claim");
+        let bridge = match relay.install_serve(owner, 7, relay_serve_call(&world, 0x2000)) {
+            Ok(bridge) => bridge,
+            Err(_) => panic!("the admitted call parks under its owner"),
+        };
+
+        assert!(relay.serve_call(owner, bridge).is_some());
+        assert!(
+            relay.serve_call(attacker, bridge).is_none(),
+            "a guessed or foreign id resolves no served call — pre-fix the id alone did"
+        );
+        assert!(
+            relay.accept_admitted(attacker, 7).is_err(),
+            "and no other follower pops this registration's accepts"
+        );
+        assert_eq!(relay.accept_admitted(owner, 7), Ok(Some(bridge)));
+    }
+
+    /// LEAF-5: bridge handles are CSPRNG-seeded, not a counter from
+    /// 1 — a sequential id on a channel every tab can read is a
+    /// guessable name for a live served call (pre-fix `next_serve_call`
+    /// counted up from zero).
+    #[test]
+    fn a_bridge_handle_is_not_the_first_guess() {
+        let world = RelayWorld::new();
+        let mut relay = OrgRelay::default();
+        relay
+            .claim_registration(ProxySide::Follower(1), 7, RELAY_SERVICE)
+            .expect("claim");
+        let bridge =
+            match relay.install_serve(ProxySide::Follower(1), 7, relay_serve_call(&world, 0x2000)) {
+                Ok(bridge) => bridge,
+                Err(_) => panic!("the admitted call parks under its owner"),
+            };
+        assert_ne!(
+            bridge, 1,
+            "pre-fix the first bridge handle was the guessable 1"
         );
     }
 }

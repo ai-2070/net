@@ -59,8 +59,10 @@ use crate::bootstrap::gloo_timer_sleep;
 use crate::error::{LeafError, Result, RpcError};
 use crate::identity::IdentitySecrets;
 use crate::leader::{
-    scope_name, FollowerEvent, GenerationLease, LeaderBackend, LeaderRequest, ProxyClient,
-    ProxyFailure, ProxyOutcome, ProxyServer, ProxyTransport, ProxyValue, Replier,
+    call_in_use, decode_admitted, envelope, no_such_call, no_such_registration,
+    registration_refusal_is_transient, scope_name, FollowerEvent, GenerationLease, LeaderBackend,
+    LeaderRequest, OrgRelay, ProxyClient, ProxyFailure, ProxyOutcome, ProxyServer, ProxySide,
+    ProxyTransport, ProxyValue, Replier,
 };
 use crate::rpc::DEFAULT_CALL_TIMEOUT_MS;
 use crate::storage::{IdentityVault, DEFAULT_DB_NAME};
@@ -634,7 +636,9 @@ impl Lifecycle {
             if let Some(server) = server.as_mut() {
                 let (tx, rx) = oneshot::channel();
                 let reply = Replier::local(tx, server.lease());
-                server.backend_mut().perform(request, reply);
+                server
+                    .backend_mut()
+                    .perform(ProxySide::Leader, request, reply);
                 rx
             } else {
                 drop(server);
@@ -2012,12 +2016,7 @@ impl LeaderBackend for NodeBackend {
         // The org relay goes with the generation: each dropped
         // caller handle emits exactly one CANCEL (the shared
         // exactly-once guard), and every serve bridge dies typed.
-        {
-            let mut relay = self.org.borrow_mut();
-            relay.calls.clear();
-            relay.serve_calls.clear();
-            relay.accepts.clear();
-        }
+        self.org.borrow_mut().clear();
         let failed = self.node.retire(generation);
         if cancelled > 0 {
             report(&format!(
@@ -2027,7 +2026,7 @@ impl LeaderBackend for NodeBackend {
         failed
     }
 
-    fn perform(&mut self, request: LeaderRequest, reply: Replier) {
+    fn perform(&mut self, from: ProxySide, request: LeaderRequest, reply: Replier) {
         let node = self.node.clone();
         // Every arm that suspends is spawned under the fence: an
         // operation admitted by this generation must be droppable when
@@ -2107,10 +2106,19 @@ impl LeaderBackend for NodeBackend {
                 // The signed opening is minted HERE, node-side: the
                 // entity key never crosses the channel — only the
                 // credential wire bytes do. The relay entry is keyed
-                // by the FOLLOWER's self-minted id: the per-follower
-                // handle the required inverse flips.
+                // by the FOLLOWER's self-minted id and BOUND to the
+                // sender that claimed it: the per-follower handle the
+                // required inverse flips (LEAF-5).
                 let org = self.org.clone();
                 spawn_fenced(&lease, &ops, async move {
+                    // The colliding insert first: a live handle is
+                    // never overwritten — clobbering the victim's
+                    // entry would drop its `CallHandle`, which is the
+                    // victim call's exactly-one CANCEL.
+                    if org.borrow().call_live(call) {
+                        reply.fail(call_in_use(call));
+                        return;
+                    }
                     let credentials = crate::wasm::OrgCallCredentials {
                         membership,
                         dispatcher,
@@ -2154,12 +2162,27 @@ impl LeaderBackend for NodeBackend {
                             }
                         }
                         Ok((crate::wasm::OrgBackendCall::Streaming(handle), _)) => {
-                            org.borrow_mut()
-                                .calls
-                                .insert(call, crate::wasm::OrgBackendCall::Streaming(handle));
                             // Opened (eager SS has its opening on the
                             // wire already; CS/DX stay lazy).
-                            reply.bytes(envelope(crate::leader::ORG_ENVELOPE_END, b""));
+                            match org.borrow_mut().install_call(from, call, handle) {
+                                Ok(()) => {
+                                    reply.bytes(envelope(crate::leader::ORG_ENVELOPE_END, b""))
+                                }
+                                Err((failure, handle)) => {
+                                    // Unreachable within one turn —
+                                    // the pre-check above refused
+                                    // live handles before the open —
+                                    // but the disposition is the
+                                    // same if it ever fires: the
+                                    // doomed open ends with its one
+                                    // CANCEL (the handle drop), the
+                                    // live entry is untouched, and
+                                    // the caller gets the collision
+                                    // typed. Never a silent clobber.
+                                    drop(handle);
+                                    reply.fail(failure);
+                                }
+                            }
                         }
                         Err(failure) => reply.fail(failure),
                     }
@@ -2174,7 +2197,11 @@ impl LeaderBackend for NodeBackend {
                 let org = self.org.clone();
                 spawn_fenced(&lease, &ops, async move {
                     loop {
-                        let Some(id) = relay_stream_call(&org, call) else {
+                        // The attribution check first: a handle this
+                        // relay never minted FOR THIS SENDER owns
+                        // nothing — never another follower's call
+                        // under the same id (LEAF-5).
+                        let Some(id) = org.borrow().stream_call(from, call) else {
                             reply.fail(no_such_call(call));
                             return;
                         };
@@ -2203,7 +2230,7 @@ impl LeaderBackend for NodeBackend {
                 let org = self.org.clone();
                 spawn_fenced(&lease, &ops, async move {
                     loop {
-                        let Some(id) = relay_stream_call(&org, call) else {
+                        let Some(id) = org.borrow().stream_call(from, call) else {
                             reply.fail(no_such_call(call));
                             return;
                         };
@@ -2231,8 +2258,10 @@ impl LeaderBackend for NodeBackend {
                 spawn_fenced(&lease, &ops, async move {
                     loop {
                         // The attribution check first: a handle this
-                        // relay never minted owns nothing.
-                        let Some(call_id) = relay_stream_call(&org, call) else {
+                        // relay never minted FOR THIS SENDER owns
+                        // nothing — a guessed or foreign id reads no
+                        // call, and injects none (LEAF-5).
+                        let Some(call_id) = org.borrow().stream_call(from, call) else {
                             reply.fail(no_such_call(call));
                             return;
                         };
@@ -2248,24 +2277,34 @@ impl LeaderBackend for NodeBackend {
                                 reply.bytes(envelope(crate::leader::ORG_ENVELOPE_ITEM, &item));
                                 return;
                             }
-                            Some(Err(StreamTerminal::Completed { body })) => {
-                                reply.bytes(envelope(crate::leader::ORG_ENVELOPE_END, &body));
-                                return;
-                            }
-                            Some(Err(StreamTerminal::Retired { reason })) => {
-                                reply.bytes(envelope(
-                                    crate::leader::ORG_ENVELOPE_RETIRED,
-                                    crate::wasm::retire_reason_text(reason).as_bytes(),
-                                ));
-                                return;
-                            }
-                            Some(Err(StreamTerminal::Refused { status, body })) => {
-                                reply.fail(ProxyFailure::Typed(LeafError::Rpc(
-                                    RpcError::Refused {
-                                        status: status.to_wire(),
-                                        message: String::from_utf8_lossy(&body).into_owned(),
-                                    },
-                                )));
+                            Some(Err(terminal)) => {
+                                // The entry goes WITH the terminal
+                                // (LEAF-13): one entry per call it
+                                // ever carried would grow without
+                                // bound on a long-lived leader, and a
+                                // re-delivered terminal finds
+                                // nothing left to re-apply.
+                                org.borrow_mut().release_call(from, call);
+                                match terminal {
+                                    StreamTerminal::Completed { body } => {
+                                        reply.bytes(envelope(crate::leader::ORG_ENVELOPE_END, &body));
+                                    }
+                                    StreamTerminal::Retired { reason } => {
+                                        reply.bytes(envelope(
+                                            crate::leader::ORG_ENVELOPE_RETIRED,
+                                            crate::wasm::retire_reason_text(reason).as_bytes(),
+                                        ));
+                                    }
+                                    StreamTerminal::Refused { status, body } => {
+                                        reply.fail(ProxyFailure::Typed(LeafError::Rpc(
+                                            RpcError::Refused {
+                                                status: status.to_wire(),
+                                                message: String::from_utf8_lossy(&body)
+                                                    .into_owned(),
+                                            },
+                                        )));
+                                    }
+                                }
                                 return;
                             }
                             None => {
@@ -2276,11 +2315,12 @@ impl LeaderBackend for NodeBackend {
                 })
             }
             LeaderRequest::OrgCancel { call } => {
-                if let Some(id) = relay_stream_call(&self.org, call) {
+                // Sender-bound like every other verb (LEAF-5), and
+                // idempotent: cancelling an unknown or dead call is a
+                // no-op — never another call's CANCEL.
+                if let Some(id) = self.org.borrow().stream_call(from, call) {
                     node.backend_org_cancel(id);
                 }
-                // Idempotent: cancelling an unknown or dead call is a
-                // no-op — never another call's CANCEL.
                 reply.bytes(Bytes::new());
             }
             LeaderRequest::OrgServeRegister {
@@ -2335,49 +2375,75 @@ impl LeaderBackend for NodeBackend {
                     max_live_ns: crate::wasm::ORG_MAX_LIVE_NS,
                     policy: None,
                 };
-                // Every admitted call parks here under a fresh
-                // bridge-call id and is handed to the REGISTERING
-                // follower's accept pull — its own handle, and no
-                // other follower's.
+                // The registration claim first (LEAF-4/LEAF-5): it
+                // binds the id to THIS sender and to the service name
+                // the leader records here — unregistration later acts
+                // on that recorded name and only for this owner. An
+                // identical repeat claim is the re-declare
+                // idempotence (the node registration is already
+                // there); a live id under another owner or another
+                // name is refused, never overwritten.
                 let org = self.org.clone();
+                let claimed = org
+                    .borrow_mut()
+                    .claim_registration(from, registration, &service);
+                match claimed {
+                    Ok(false) => {
+                        reply.bytes(Bytes::new());
+                        return;
+                    }
+                    Err(failure) => {
+                        reply.fail(failure);
+                        return;
+                    }
+                    Ok(true) => {}
+                }
+                // Every admitted call parks here under a fresh
+                // UNGUESSABLE bridge-call id and is handed to the
+                // REGISTERING follower's accept pull — its own
+                // handle, and no other follower's.
+                let bridge = org.clone();
                 let handler: crate::rpc_serve::ServeHandler = Rc::new(move |serve_call| {
-                    let mut relay = org.borrow_mut();
-                    relay.next_serve_call += 1;
-                    let id = relay.next_serve_call;
-                    relay.serve_calls.insert(id, (registration, serve_call));
-                    relay.accepts.entry(registration).or_default().push_back(id);
+                    if let Err(serve) =
+                        bridge.borrow_mut().install_serve(from, registration, serve_call)
+                    {
+                        // The registration closed while this call was
+                        // being admitted: settled typed, never parked
+                        // on a queue nobody drains, never silently
+                        // dropped.
+                        serve.finish(crate::rpc_wire::StreamHandlerResult::Err(
+                            crate::rpc_wire::RpcStatus::Internal,
+                            "the serve registration closed before this call was dispatched"
+                                .into(),
+                        ));
+                    }
                 });
                 match node.backend_org_serve(&service, opts, handler) {
                     Ok(()) => reply.bytes(Bytes::new()),
-                    Err(error) => reply.fail(ProxyFailure::Typed(error)),
+                    Err(error) => {
+                        // Roll the claim back: a registration the
+                        // node refused records nothing (its failure
+                        // is typed, and permanent refusals reach the
+                        // registering caller — LEAF-14).
+                        org.borrow_mut().drop_registration(from, registration);
+                        reply.fail(ProxyFailure::Typed(error));
+                    }
                 }
             }
             LeaderRequest::OrgServeAccept { registration } => {
                 let org = self.org.clone();
                 spawn_fenced(&lease, &ops, async move {
                     loop {
-                        let admitted = {
-                            let mut relay = org.borrow_mut();
-                            let id = relay
-                                .accepts
-                                .get_mut(&registration)
-                                .and_then(|queue| queue.pop_front());
-                            id.and_then(|id| {
-                                relay
-                                    .serve_calls
-                                    .get(&id)
-                                    .map(|(_, call)| (id, crate::wasm::caller_json(call)))
-                            })
-                        };
+                        let admitted = org.borrow_mut().accept_admitted(from, registration);
                         match admitted {
-                            Some((id, Ok(caller))) => {
+                            Ok(Some(id)) => {
+                                // Just the handle (LEAF-6): the
+                                // verified projection is resolved
+                                // from the leader's own serve state
+                                // through `OrgServeCaller`, never
+                                // carried as an envelope claim.
                                 let mut doc = serde_json::Map::new();
                                 doc.insert("call".into(), serde_json::Value::from(id.to_string()));
-                                doc.insert(
-                                    "caller".into(),
-                                    serde_json::from_str::<serde_json::Value>(&caller)
-                                        .unwrap_or(serde_json::Value::Null),
-                                );
                                 let json = serde_json::Value::Object(doc).to_string();
                                 reply.bytes(envelope(
                                     crate::leader::ORG_ENVELOPE_ADMITTED,
@@ -2385,28 +2451,45 @@ impl LeaderBackend for NodeBackend {
                                 ));
                                 return;
                             }
-                            Some((_, Err(error))) => {
-                                reply.fail(reported(error));
+                            Err(failure) => {
+                                reply.fail(failure);
                                 return;
                             }
-                            None => {
+                            Ok(None) => {
                                 gloo_timer_sleep(ORG_PULL_MS).await.ok();
                             }
                         }
                     }
                 })
             }
+            LeaderRequest::OrgServeCaller { call } => {
+                // The projection comes from the leader's own
+                // `ServeCall` state — the AEAD-authenticated
+                // attribution `ServeCall::caller()` recorded at
+                // admission — keyed by the sender-bound bridge handle
+                // (LEAF-6). A guessed or foreign handle resolves to
+                // nothing (LEAF-5).
+                let resolved = self
+                    .org
+                    .borrow()
+                    .serve_call(from, call)
+                    .map(crate::wasm::caller_json);
+                match resolved {
+                    Some(Ok(json)) => reply.text(json),
+                    Some(Err(error)) => reply.fail(reported(error)),
+                    None => reply.fail(no_such_call(call)),
+                }
+            }
             LeaderRequest::OrgServeRequest { call } => {
                 let org = self.org.clone();
                 spawn_fenced(&lease, &ops, async move {
                     loop {
-                        if !org.borrow().serve_calls.contains_key(&call) {
-                            reply.fail(no_such_call(call));
-                            return;
-                        }
+                        // Sender-bound resolution (LEAF-5): a
+                        // guessed or foreign serve handle reads no
+                        // served call — never another follower's.
                         let polled = {
                             let relay = org.borrow();
-                            relay.serve_calls.get(&call).and_then(|(_, serve)| {
+                            relay.serve_call(from, call).map(|serve| {
                                 serve
                                     .poll_request()
                                     .map(Ok)
@@ -2414,15 +2497,19 @@ impl LeaderBackend for NodeBackend {
                             })
                         };
                         match polled {
-                            Some(Ok(item)) => {
+                            None => {
+                                reply.fail(no_such_call(call));
+                                return;
+                            }
+                            Some(Some(Ok(item))) => {
                                 reply.bytes(envelope(crate::leader::ORG_ENVELOPE_ITEM, &item));
                                 return;
                             }
-                            Some(Err(())) => {
+                            Some(Some(Err(()))) => {
                                 reply.bytes(envelope(crate::leader::ORG_ENVELOPE_END, b""));
                                 return;
                             }
-                            None => {
+                            Some(None) => {
                                 gloo_timer_sleep(ORG_PULL_MS).await.ok();
                             }
                         }
@@ -2439,9 +2526,8 @@ impl LeaderBackend for NodeBackend {
                         let outcome = {
                             let relay = org.borrow();
                             relay
-                                .serve_calls
-                                .get(&call)
-                                .map(|(_, serve)| serve.send(&payload))
+                                .serve_call(from, call)
+                                .map(|serve| serve.send(&payload))
                         };
                         match outcome {
                             Some(Ok(())) => {
@@ -2479,8 +2565,8 @@ impl LeaderBackend for NodeBackend {
                 };
                 let known = {
                     let relay = self.org.borrow();
-                    match relay.serve_calls.get(&call) {
-                        Some((_, serve)) => {
+                    match relay.serve_call(from, call) {
+                        Some(serve) => {
                             // First completion wins; a result
                             // delivered after retirement is discarded
                             // by the serve side, exactly as the
@@ -2501,19 +2587,16 @@ impl LeaderBackend for NodeBackend {
                 let org = self.org.clone();
                 spawn_fenced(&lease, &ops, async move {
                     loop {
-                        if !org.borrow().serve_calls.contains_key(&call) {
-                            reply.fail(no_such_call(call));
-                            return;
-                        }
-                        let retired = {
+                        let polled = {
                             let relay = org.borrow();
-                            relay
-                                .serve_calls
-                                .get(&call)
-                                .and_then(|(_, serve)| serve.retired())
+                            relay.serve_call(from, call).map(|serve| serve.retired())
                         };
-                        match retired {
-                            Some(reason) => {
+                        match polled {
+                            None => {
+                                reply.fail(no_such_call(call));
+                                return;
+                            }
+                            Some(Some(reason)) => {
                                 // The frozen `OrgRetireReason`
                                 // string, identical to the direct
                                 // surface's `retired` vocabulary.
@@ -2523,29 +2606,35 @@ impl LeaderBackend for NodeBackend {
                                 ));
                                 return;
                             }
-                            None => {
+                            Some(None) => {
                                 gloo_timer_sleep(ORG_PULL_MS).await.ok();
                             }
                         }
                     }
                 })
             }
-            LeaderRequest::OrgServeUnregister {
-                registration,
-                service,
-            } => {
+            LeaderRequest::OrgServeUnregister { registration } => {
                 // C9's protected split: the node's unserve retires
                 // this registration's live calls with their exact
                 // terminals and refuses new openings.
-                node.backend_org_unserve(&service);
-                {
-                    let mut relay = self.org.borrow_mut();
-                    relay
-                        .serve_calls
-                        .retain(|_, (seen, _)| *seen != registration);
-                    relay.accepts.remove(&registration);
+                //
+                // LEAF-4: the name removed is the one the leader
+                // RECORDED when this sender registered, and only this
+                // sender's own registration can be named at all. A
+                // request naming another follower's registration —
+                // or claiming another service beside its own —
+                // affects nothing but its own typed refusal, so one
+                // leaf can never kill another leaf's service (or its
+                // live calls).
+                let recorded = self.org.borrow().registration_service(from, registration);
+                match recorded {
+                    Some(service) => {
+                        node.backend_org_unserve(&service);
+                        self.org.borrow_mut().drop_registration(from, registration);
+                        reply.bytes(Bytes::new());
+                    }
+                    None => reply.fail(no_such_registration(registration)),
                 }
-                reply.bytes(Bytes::new());
             }
             LeaderRequest::IsEnrolled => reply.flag(node.is_enrolled()),
             LeaderRequest::Enroll => spawn_fenced(&lease, &ops, async move {
@@ -3050,9 +3139,13 @@ impl MeshSession {
     ///
     /// Beyond [`crate::node::LeafEvent`]'s tags, a session emits
     /// `leader_changed`, `subscription_restored`, `leader_lost`,
-    /// `generation_fenced` and `not_leader` — the lifecycle made
-    /// observable, because a page that cannot see a leader change
-    /// cannot explain one.
+    /// `generation_fenced`, `not_leader` and
+    /// `serve_registration_refused` — the lifecycle made observable,
+    /// because a page that cannot see a leader change cannot explain
+    /// one, and a page that cannot see a permanent serve-registration
+    /// refusal cannot explain why its service never dispatches
+    /// (LEAF-14: the typed message a local `org_serve` would have
+    /// thrown, exactly once, with no retry storm behind it).
     pub fn on_event(&self, callback: Function) {
         self.lifecycle.on_event(callback);
     }
@@ -3402,14 +3495,6 @@ fn next_org_id() -> Result<u64> {
     })
 }
 
-/// Wrap bytes in the transparent envelope (`leader.rs`'s tags).
-fn envelope(tag: u8, payload: &[u8]) -> Bytes {
-    let mut out = Vec::with_capacity(1 + payload.len());
-    out.push(tag);
-    out.extend_from_slice(payload);
-    Bytes::from(out)
-}
-
 /// Read one transparent envelope back.
 fn decode_org_envelope(envelope: &[u8]) -> Result<crate::wasm::OrgPoll, JsError> {
     use crate::leader::{ORG_ENVELOPE_END, ORG_ENVELOPE_ITEM, ORG_ENVELOPE_RETIRED};
@@ -3610,8 +3695,11 @@ pub(crate) struct ProxyServeCall {
     lifecycle: Lifecycle,
     /// The bridge-call id.
     call: u64,
-    /// The verified caller projection, verbatim from the accept
-    /// envelope (built by the leader from `ServeCall::caller()`).
+    /// The verified caller projection, RESOLVED from the leader's own
+    /// `ServeCall` state over the sender-bound bridge handle
+    /// ([`LeaderRequest::OrgServeCaller`]) — built from the
+    /// AEAD-authenticated attribution at admission, never carried as
+    /// an envelope claim (LEAF-6).
     caller: String,
     /// Request items the background pull loop queued.
     input: RefCell<VecDeque<Bytes>>,
@@ -3769,7 +3857,6 @@ pub(crate) struct ProxyOrgServe {
     lifecycle: Lifecycle,
     /// The follower's self-minted registration id.
     registration: u64,
-    service: String,
     /// Set by `close()`: stops the re-declare/accept loop.
     closed: Rc<Cell<bool>>,
 }
@@ -3782,6 +3869,16 @@ impl ProxyOrgServe {
     /// discipline) — a successor restores the CURRENT intent, and
     /// teardown (`ProxyServer::retire`) never resurrects anything
     /// behind this handle's back.
+    ///
+    /// # Permanent refusals stop the loop (LEAF-14)
+    ///
+    /// A registration refusal that no generation move explains — the
+    /// name is already served, the strings did not parse, the session
+    /// is closed — is PERMANENT. It used to be misdiagnosed as
+    /// transient and retried at 50ms forever; now exactly one attempt
+    /// is made per refusal, the typed error reaches the page on the
+    /// session's `serve_registration_refused` event, and the loop
+    /// stops.
     pub(crate) fn start(
         lifecycle: Lifecycle,
         registration: u64,
@@ -3792,13 +3889,12 @@ impl ProxyOrgServe {
         handler: Function,
     ) -> Self {
         let closed = Rc::new(Cell::new(false));
-        let service_name = service.to_string();
         let access = access.to_string();
         let owner_org = owner_org.to_string();
         let wire_shape = shape_tag(shape);
         let stop = closed.clone();
         let loop_lifecycle = lifecycle.clone();
-        let loop_service = service_name.clone();
+        let loop_service = service.to_string();
         spawn_local(async move {
             while !stop.get() {
                 let registered = loop_lifecycle
@@ -3810,9 +3906,24 @@ impl ProxyOrgServe {
                         shape: wire_shape.to_string(),
                     })
                     .await;
-                if registered.is_err() {
-                    gloo_timer_sleep(ORG_PULL_MS).await.ok();
-                    continue;
+                match registered {
+                    // Transient — a generation move under the
+                    // request: re-declare at the retry cadence until
+                    // a successor generation takes it.
+                    Err(failure) if registration_refusal_is_transient(&failure) => {
+                        gloo_timer_sleep(ORG_PULL_MS).await.ok();
+                        continue;
+                    }
+                    Err(failure) => {
+                        // LEAF-14: permanent, typed, once. A close
+                        // racing the attempt is the page's own
+                        // decision and gets no refusal event.
+                        if !stop.get() {
+                            emit_serve_refusal(&loop_lifecycle, &loop_service, &failure);
+                        }
+                        return;
+                    }
+                    Ok(_) => {}
                 }
                 loop {
                     if stop.get() {
@@ -3823,21 +3934,63 @@ impl ProxyOrgServe {
                         .await
                     {
                         Ok(ProxyValue::Bytes(payload)) => {
-                            if let Some((call, caller)) = decode_admitted(&payload) {
-                                let mirror =
-                                    ProxyServeCall::start(loop_lifecycle.clone(), call, caller);
-                                crate::wasm::dispatch_proxied_handler(
-                                    handler.clone(),
-                                    shape,
-                                    mirror,
-                                );
+                            // One accept envelope is one dispatch
+                            // (LEAF-3). The projection is resolved
+                            // from the leader's own serve state under
+                            // the sender-bound handle (LEAF-6): a
+                            // forged or tampered envelope claim
+                            // changes nothing, and a handle the
+                            // leader will not resolve for this
+                            // registration is never dispatched at
+                            // all.
+                            if let Some(call) = decode_admitted(&payload) {
+                                match loop_lifecycle
+                                    .request(LeaderRequest::OrgServeCaller { call })
+                                    .await
+                                {
+                                    Ok(ProxyValue::Text(caller)) => {
+                                        let mirror = ProxyServeCall::start(
+                                            loop_lifecycle.clone(),
+                                            call,
+                                            caller,
+                                        );
+                                        crate::wasm::dispatch_proxied_handler(
+                                            handler.clone(),
+                                            shape,
+                                            mirror,
+                                        );
+                                    }
+                                    Err(failure)
+                                        if registration_refusal_is_transient(&failure) =>
+                                    {
+                                        gloo_timer_sleep(ORG_PULL_MS).await.ok();
+                                        break;
+                                    }
+                                    // A handle the leader does not
+                                    // resolve for us — a forged
+                                    // accept naming a guessed or
+                                    // foreign id: no dispatch, and
+                                    // one bad accept never kills the
+                                    // registration.
+                                    Err(_) => {}
+                                    Ok(_) => {}
+                                }
                             }
                         }
                         // The generation moved (or the registration
                         // died): re-declare under the new one.
-                        Err(_) => {
+                        Err(failure) if registration_refusal_is_transient(&failure) => {
                             gloo_timer_sleep(ORG_PULL_MS).await.ok();
                             break;
+                        }
+                        // LEAF-14's rule one level up: a permanent
+                        // failure is not a generation move to
+                        // re-declare behind.
+                        Err(failure) => {
+                            if !stop.get() {
+                                emit_serve_refusal(&loop_lifecycle, &loop_service, &failure);
+                            }
+                            return;
                         }
                         Ok(_) => break,
                     }
@@ -3847,27 +4000,44 @@ impl ProxyOrgServe {
         Self {
             lifecycle,
             registration,
-            service: service_name,
             closed,
         }
     }
 
     /// Close the registration (C9's protected split: its live calls
     /// retire with their exact terminals; new openings are refused).
+    ///
+    /// The leader unregisters by the name it recorded at registration
+    /// and only for this follower's own registration id (LEAF-4) —
+    /// so nothing here (or in any other tab's request) can name
+    /// another leaf's service.
     pub(crate) fn close(&self) {
         self.closed.set(true);
         let lifecycle = self.lifecycle.clone();
         let registration = self.registration;
-        let service = self.service.clone();
         spawn_local(async move {
             let _ = lifecycle
-                .request(LeaderRequest::OrgServeUnregister {
-                    registration,
-                    service,
-                })
+                .request(LeaderRequest::OrgServeUnregister { registration })
                 .await;
         });
     }
+}
+
+/// Surface one permanent serve-registration refusal to the page
+/// (LEAF-14) — the typed message a local `org_serve` would have
+/// thrown, on the session's own event stream. The lifecycle is made
+/// observable for exactly this reason: a page that cannot see a
+/// registration refusal cannot explain why its service never
+/// dispatches.
+fn emit_serve_refusal(lifecycle: &Lifecycle, service: &str, failure: &ProxyFailure) {
+    emit(
+        &lifecycle.shared,
+        &format!(
+            "{{\"type\":\"serve_registration_refused\",\"service\":{},\"message\":{}}}",
+            json_string(service),
+            json_string(&failure.message())
+        ),
+    );
 }
 
 /// The shape tag a registration rides.
@@ -3878,49 +4048,6 @@ fn shape_tag(shape: crate::wasm::HandlerShape) -> &'static str {
         crate::wasm::HandlerShape::ClientStream => "client-streaming",
         crate::wasm::HandlerShape::Duplex => "duplex",
     }
-}
-
-/// Read the `0x03 ‖ { call, caller }` accept envelope.
-fn decode_admitted(payload: &[u8]) -> Option<(u64, String)> {
-    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
-    let call = value.get("call")?.as_str()?.parse::<u64>().ok()?;
-    let caller = value.get("caller")?.to_string();
-    Some((call, caller))
-}
-
-/// The leader-side relay for proxied org calls and serves.
-///
-/// Attribution, enforced here: every entry is keyed by the
-/// FOLLOWER's self-minted id — the per-follower handle — and a
-/// request for an id this relay never minted owns nothing ("no org
-/// call for handle N", never another follower's call under the same
-/// id). That is exactly the required witness inverse.
-#[derive(Default)]
-pub(crate) struct OrgRelay {
-    /// The node-side guards for follower calls (streaming shapes).
-    calls: HashMap<u64, crate::wasm::OrgBackendCall>,
-    /// Served calls a follower's handler drives: bridge-call id →
-    /// (registration, the real [`crate::rpc_serve::ServeCall`]).
-    serve_calls: HashMap<u64, (u64, crate::rpc_serve::ServeCall)>,
-    /// Per-registration queues of admitted calls awaiting an accept.
-    accepts: HashMap<u64, VecDeque<u64>>,
-    /// The next bridge-call id. Monotonic, never reused.
-    next_serve_call: u64,
-}
-
-/// The node-side call id behind a follower's streaming handle, if it
-/// is live here.
-fn relay_stream_call(org: &Rc<RefCell<OrgRelay>>, call: u64) -> Option<u64> {
-    match org.borrow().calls.get(&call) {
-        Some(crate::wasm::OrgBackendCall::Streaming(handle)) => Some(handle.call_id),
-        _ => None,
-    }
-}
-
-/// The typed "your call is closed" failure for an unknown handle —
-/// "no org call for handle N", never another call's.
-fn no_such_call(call: u64) -> ProxyFailure {
-    ProxyFailure::Typed(LeafError::Session(format!("no org call for handle {call}")))
 }
 
 #[wasm_bindgen]
