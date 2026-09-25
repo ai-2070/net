@@ -1,0 +1,16 @@
+net/crates/net/sdk/src/org/serve.rs
+  h_64425bc75e3f3d 136-139,144-151,163-176,724-785
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  h_64425bc75e3f3d 2169-2183,2185,11033-11086
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b309615e4f46a2df2abb15cfe2bf0dbf4d80eff2",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
