@@ -1,0 +1,30 @@
+docs/internal/misc/CODE_REVIEW_2026_09_24_ORG_STREAMING.md
+  s_88b9d65bfbfdf7::t_a612fba02c45e9 216-225
+  s_88b9d65bfbfdf7::t_645d13d026f16b 365
+  s_88b9d65bfbfdf7::t_8a9dac3b739abd 382-386
+  s_88b9d65bfbfdf7::t_1a22d067b59407 408-410
+  s_88b9d65bfbfdf7::t_92f10a73109d75 54-82
+  s_88b9d65bfbfdf7::t_ff2b10d7e06e6a 420
+  s_88b9d65bfbfdf7::t_3f3b79d4e0e6c9 719-721
+  s_88b9d65bfbfdf7::t_187d0342269d6a 487
+  s_88b9d65bfbfdf7::t_5cb57608f9448f 24-30
+  s_88b9d65bfbfdf7::t_e5902ccd4c5367 347-357
+  s_88b9d65bfbfdf7::t_e94594b0ed89e8 651-658
+  s_88b9d65bfbfdf7::t_577aa1b3f502d8 425-426
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "adc04fa2c2b7255fe9aaa27b0995d608fdba5bb1",
+  "prompts": {},
+  "sessions": {
+    "s_88b9d65bfbfdf7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4c45341-9e3a-407b-a55a-9c56d6f25c1a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
