@@ -1,0 +1,48 @@
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_ad77d64c6819e6 1647,4344-4390,4395-4428,4440-4451
+  s_3f3d4c91f992be::t_e364bb32956c61 4391-4394
+  s_3f3d4c91f992be::t_79723b19e6a610 4429-4439
+  s_3f3d4c91f992be::t_6343b2ebf11e26 4452-4453
+net/crates/net/src/adapter/net/mesh.rs
+  s_3f3d4c91f992be::t_c1122cbee4fea8 12909-12917,14839-14840,44493-44497,49219,49229-49231,49240-49241,49262-49263,50225-50247
+  s_3f3d4c91f992be::t_c98f2b1677e776 29755-29756,47293-47296,47298,47303-47305
+  s_3f3d4c91f992be::t_dbea3f8300c448 29741,29750-29754,29757-29758,47290-47292,47297,47299-47302,47306-47308,48741-48743
+  s_3f3d4c91f992be::t_410ef86f2c1a87 49232-49239,49242-49261
+  s_3f3d4c91f992be::t_fb29de7a90a0c6 50248
+.github/workflows/ci.yml
+  s_3f3d4c91f992be::t_6ef38b37706602 4982-4985
+net/crates/net/cli/src/commands/enrollment.rs
+  s_3f3d4c91f992be::t_2564249be283eb 335-338,343-344
+  s_3f3d4c91f992be::t_578971d36f74fd 339-342
+net/crates/net/tests/direct_upgrade.rs
+  s_3f3d4c91f992be::t_3c53d941b5cb7d 910-913,1018-1019
+  s_3f3d4c91f992be::t_ceb0e006915701 851-868,870-877,879-883,885-891,893-901,903-909,914-925,927-946,949-964,966-1017,1020-1023,1025-1028,1030-1033,1035-1081
+  s_3f3d4c91f992be::t_1e6f272bb998a2 848-850
+  s_3f3d4c91f992be::t_5a92b9532e8b82 869
+  s_3f3d4c91f992be::t_92898129e690e3 878
+  s_3f3d4c91f992be::t_5c2edc1976d1fd 884
+  s_3f3d4c91f992be::t_cc0aa18a8c723b 892
+  s_3f3d4c91f992be::t_e742c62743a997 902
+  s_3f3d4c91f992be::t_ad3e2ac8ae0b7c 926
+  s_3f3d4c91f992be::t_44db2c8c29266c 947-948
+  s_3f3d4c91f992be::t_00bcb0ce27fe70 965
+  s_3f3d4c91f992be::t_600fbe9883e226 1024
+  s_3f3d4c91f992be::t_1c08107d3d9183 1029
+  s_3f3d4c91f992be::t_c7446cd572a8aa 1034
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "31db62919f34c251336e0b3223e8a6b97f42614d",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
