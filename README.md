@@ -45,94 +45,27 @@ Published names and source imports differ on purpose: the crates/registries use
 
 ## What it enables
 
-Capabilities, authority, and state on one substrate change what you can build. A short snippet per
-point; the links go deeper.
+Capabilities, authority, and state on one substrate change what you can build. Each point leads
+with the knobs you'd set; the links go deeper.
 
-**Distance becomes a parameter, not a rewrite.** Call a capability the same way whether it runs in
-this process or on another host. Location is a placement choice, not a rewrite.
-
-```rust
-use net_sdk::mesh_rpc::{CallOptions, CallOptionsTyped, Codec};
-use std::time::{Duration, Instant};
-
-// Provider: announce and serve. The same code runs in-process or off-host.
-let _handle = provider.serve_rpc_typed("fleet.observe", Codec::Json,
-    |req: ObserveReq| async move { Ok::<_, String>(perceive(req)) })?;
-
-// Caller: call by capability name, with a 500 ms deadline.
-let view: CornerView = caller.call_service_typed(
-    "fleet.observe",
-    &ObserveReq { intersection: "5th & Main".into() },
-    CallOptionsTyped {
-        raw: CallOptions {
-            deadline: Some(Instant::now() + Duration::from_millis(500)),
-            ..Default::default()
-        },
-        ..Default::default()
-    },
-).await?;
-```
-
+**Distance becomes a parameter, not a rewrite.** Call a capability by name; the mesh decides where
+it runs. `service=fleet.observe`, `deadline=500ms`, `routing=lowest-latency`, `target=by-name`.
 [Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke),
 [Architecture](https://ai2070.net/docs/concepts/architecture).
 
 **Sensing and computation stop sharing a body.** A device produces data without hosting the code
-that acts on it, and two sensors can address each other directly.
-
-```rust
-use net_sdk::{Bytes, ChannelConfig, ChannelId, ChannelName, PublishConfig, Reliability, Visibility};
-
-// The sensor owns the channel config; no broker registers it.
-let channel = ChannelName::new("sensors/lidar/front")?;
-sensor.register_channel(ChannelConfig::new(ChannelId::new(channel.clone()))
-    .with_visibility(Visibility::Global));
-
-// Compute joins by name and receives. The raw frames stay on the sensor.
-compute.subscribe_channel(sensor_id, &channel).await?;
-let report = sensor.publish(&channel, Bytes::from(frame),
-    PublishConfig { reliability: Reliability::Reliable, ..Default::default() }).await?;
-```
-
+that acts on it. `channel=sensors/lidar/front`, `visibility=global`, `reliability=reliable`,
+`artifact=blob-ref`.
 [Capabilities](https://ai2070.net/docs/concepts/capabilities),
 [Dataforts](https://ai2070.net/docs/guides/dataforts).
 
-**Coordination that never funnels through a coordinator.** No registry, broker, or leader whose
-capacity becomes the ceiling. Peers observe their neighbourhood, derive the rest, and route.
-
-```rust
-use net::{AdapterConfig, BackpressureMode, BatchConfig, EventBusConfig};
-
-// Sixteen shards ingest in parallel. When a buffer fills, the oldest event is
-// dropped rather than queued or blocked.
-let bus = EventBusConfig::builder()
-    .num_shards(16)
-    .backpressure_mode(BackpressureMode::DropOldest)
-    .batch(BatchConfig { max_size: 1_024, max_delay: Duration::from_millis(5), ..BatchConfig::default() })
-    .adapter(AdapterConfig::Net(Box::new(net_adapter)))
-    .build()?;
-bus.ingest(event)?;   // non-blocking, no lock, no allocation on the hot path
-```
-
+**Coordination that never funnels through a coordinator.** No registry, broker, or leader to cap
+it. `shards=16`, `backpressure=drop-oldest`, `batch=1024/5ms`, `adapter=mesh|noop|redis`.
 [Event bus](https://ai2070.net/docs/guides/event-bus),
 [Capabilities](https://ai2070.net/docs/concepts/capabilities).
 
-**Software that outlives its host.** A daemon is an identity, not a process pinned to a box —
-addressed by what it is, placed where its capabilities are, able to move with its history.
-
-```rust
-use net::adapter::net::behavior::placement::StandardPlacement;
-use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
-
-// Register the daemon; placement decides where it runs.
-let handle = sdk.register_daemon(Box::new(CounterDaemon { count: 0 }), daemon_keypair)?;
-
-// Placement scores each candidate: capability match, load, anti-affinity,
-// resource fit, and proximity — plus any filter you register.
-global_placement_filter_registry().register(
-    "gpu-vram-fits".to_string(), Arc::new(GpuVramFits { min_vram_gb: 24 }), "rust");
-let placement = StandardPlacement::new(&fold).with_custom_filter_id("gpu-vram-fits");
-```
-
+**Software that outlives its host.** A daemon is an identity, not a process pinned to a box.
+`requirements=vram>=24GB`, `placement=nearest`, `anti-affinity=on`, `replicas=3`.
 [Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement),
 [Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration),
 [Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle).
