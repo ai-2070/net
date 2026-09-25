@@ -1,0 +1,19 @@
+.claude/skills/net-event-bus/SKILL.md
+  s_cdbc9688784d9a::t_bb6acff3eb8554 3,6-7,45,89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f00b1554f70e908dc28518189c42e44a308e3b71",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
