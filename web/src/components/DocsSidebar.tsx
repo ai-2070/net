@@ -234,12 +234,20 @@ function FolderBlock({
   const within = descendsFrom(folder.slug, active);
   const count = countDocs(folder);
 
-  // Releases is 35 flat entries and dominated the sidebar, pushing every
-  // other section below the fold. Long sections collapse to their first
-  // few — newest first, which is the order that matters for releases — with
-  // the rest one click away. Nothing is hidden from routing or search; this
-  // is purely how much of a long list is shown at rest.
-  const overflows = folder.children.length > COLLAPSE_THRESHOLD;
+  // Two ways a section can be long, and a setting for each.
+  //
+  // `singleEntry` sections list nothing at rest: the header row already links to
+  // the section's own URL, and for `releases` that page is the generated index
+  // carrying every version, newest first. Everything else that runs past
+  // COLLAPSE_THRESHOLD collapses to its first few, with the rest one click away.
+  //
+  // Either way a reader INSIDE the section gets the list back — a sidebar that
+  // cannot show you where you are is worse than a long one — and that list keeps
+  // the threshold, because 39 rows of history is not navigation. Nothing is
+  // hidden from routing, search or prev/next; this is purely how much of a long
+  // list the nav shows.
+  const listed = folder.singleEntry !== true || within;
+  const overflows = listed && folder.children.length > COLLAPSE_THRESHOLD;
   // If the page you're on lives in the hidden tail, don't hide it — a
   // sidebar that can't show you where you are is worse than a long one.
   const activeIsHidden =
@@ -249,9 +257,11 @@ function FolderBlock({
       .some((c) => isActive(c.slug, active) || descendsFrom(c.slug, active));
   const [expanded, setExpanded] = useState(false);
   const collapsed = overflows && !expanded && !activeIsHidden;
-  const shown = collapsed
-    ? folder.children.slice(0, COLLAPSE_TO)
-    : folder.children;
+  const shown = !listed
+    ? []
+    : collapsed
+      ? folder.children.slice(0, COLLAPSE_TO)
+      : folder.children;
   const hiddenCount = collapsed ? folder.children.length - COLLAPSE_TO : 0;
 
   return (

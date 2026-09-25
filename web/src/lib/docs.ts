@@ -4,7 +4,12 @@ import { basename, join, resolve } from "node:path";
 import title from "title";
 import GithubSlugger from "github-slugger";
 import { DOCS_ORDER } from "@/docs.order";
-import { buildDocIndex, resolveDocLink, type DocIndex, type DocPage } from "./doc-index";
+import {
+  buildDocIndex,
+  resolveDocLink,
+  type DocIndex,
+  type DocPage,
+} from "./doc-index";
 import { KEYWORD_LINKS } from "./keyword-links";
 
 // Docs are co-located with the source tree now (MDX-capable). Both `.md`
@@ -50,6 +55,12 @@ export type DocsOrderConfig = {
    * current language is in the list. Applies to both files and folders;
    * gating a folder hides its whole subtree. */
   languages?: Record<string, Language[]>;
+  /** Sections whose children are not listed in the sidebar. The section header
+   * is the entry, and it already links to the section's own URL, so the list it
+   * would have expanded into lives on that page instead. This is a display
+   * decision only — routing, search and prev/next are unaffected, which is what
+   * separates it from `hide`. */
+  singleEntry?: string[];
 };
 
 // Reorders `items` by the slugs listed in `order`. Listed items come first
@@ -99,6 +110,15 @@ function isHidden(slug: string[]): boolean {
   if (!cfg || cfg.length === 0) return false;
   const target = normalizeSlug(slug.join("/"));
   return cfg.some((h) => normalizeSlug(h) === target);
+}
+
+/** A section whose children the sidebar does not list (see
+ *  `DocsOrderConfig.singleEntry`). Same tolerant matching as `hide`. */
+function isSingleEntry(slug: string[]): boolean {
+  const cfg = DOCS_ORDER.singleEntry;
+  if (!cfg || cfg.length === 0) return false;
+  const target = normalizeSlug(slug.join("/"));
+  return cfg.some((s) => normalizeSlug(s) === target);
 }
 
 function customLabel(slug: string[]): string | undefined {
@@ -189,6 +209,10 @@ export type DocFolder = {
    *  linear order and the static params: minting `/docs/sdk/announce` as well
    *  would publish a fifth near-duplicate of every spine page. */
   projected?: boolean;
+  /** The sidebar does not list this section's children — the header row is the
+   *  entry and links to the section's own URL. Set from the `singleEntry` list
+   *  in `docs.order.ts`; the flag rides here so the client sidebar stays dumb. */
+  singleEntry?: boolean;
 };
 
 /** An adaptive page: one universal body, composed with a selected fragment.
@@ -439,6 +463,7 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
     children: orderedChildren,
     languages: lookupLanguages(slugChain),
     adaptive,
+    singleEntry: isSingleEntry(slugChain),
   };
 }
 
@@ -813,10 +838,7 @@ export type LinearDoc = {
 // Auto-generated folder-index pages (folders without a README) are skipped
 // since they're just listings; folder READMEs are included as the section's
 // landing page.
-function flattenForLinearOrder(
-  tree: DocTree,
-  lang?: Language,
-): LinearDoc[] {
+function flattenForLinearOrder(tree: DocTree, lang?: Language): LinearDoc[] {
   const out: LinearDoc[] = [];
 
   if (tree.rootReadme) {
@@ -990,6 +1012,8 @@ export type ClientDocFolder = {
   hasReadme: boolean;
   children: ClientDocNode[];
   languages?: Language[];
+  /** See `DocFolder.singleEntry` — the sidebar lists the header only. */
+  singleEntry?: boolean;
 };
 
 export type ClientDocNode = ClientDocFile | ClientDocFolder;
@@ -1014,6 +1038,7 @@ function toClientFolder(f: DocFolder): ClientDocFolder {
       c.kind === "file" ? toClientFile(c) : toClientFolder(c),
     ),
     languages: f.languages,
+    singleEntry: f.singleEntry,
   };
 }
 
@@ -1111,7 +1136,9 @@ export function assertKeywordLinksResolve(): void {
     }
   }
 
-  const hyphenated = [...index.bySlug.values()].find((p) => p.slug.includes("-"));
+  const hyphenated = [...index.bySlug.values()].find((p) =>
+    p.slug.includes("-"),
+  );
   if (hyphenated) {
     const underscored = hyphenated.slug.replace(/-/g, "_");
     const alt = resolveDocLink(index, underscored);
@@ -1147,7 +1174,8 @@ export function getDocsVersion(): string {
     const m = /^release[_-]v(\d+)\.(\d+)/i.exec(entry);
     if (!m) continue;
     const v: [number, number] = [Number(m[1]), Number(m[2])];
-    if (!best || v[0] > best[0] || (v[0] === best[0] && v[1] > best[1])) best = v;
+    if (!best || v[0] > best[0] || (v[0] === best[0] && v[1] > best[1]))
+      best = v;
   }
   return best ? `v${best[0]}.${best[1]}` : "";
 }
@@ -1220,7 +1248,8 @@ export function assertEveryAdaptivePageDetected(): void {
 
   const onDisk: string[] = [];
   const walk = (absPath: string, slugChain: string[]): void => {
-    if (existsSync(join(absPath, SHARED_BODY))) onDisk.push(slugChain.join("/"));
+    if (existsSync(join(absPath, SHARED_BODY)))
+      onDisk.push(slugChain.join("/"));
     for (const entry of readdirSync(absPath)) {
       const entryPath = join(absPath, entry);
       if (!statSync(entryPath).isDirectory()) continue;
