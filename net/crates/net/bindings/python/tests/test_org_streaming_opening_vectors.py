@@ -18,9 +18,15 @@ runs even on a partial or unbuilt wheel, following ``test_org_error_vectors.py``
 
 from __future__ import annotations
 
+import ast
 import base64
+import importlib.util
+import inspect
 import json
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -101,6 +107,11 @@ def test_wire_bytes_pin(label: str, v: dict) -> None:
     if "wire_hex" in v:  # envelope rows only: catches non-canonical hex
         assert b.hex() == v["wire_hex"], label
     assert base64.b64encode(b).decode() == v["wire_base64"], label
+    if "unary_wire_hex" in v:  # opening rows: the unary wire triple too
+        u = bytes.fromhex(v["unary_wire_hex"])
+        assert u.hex() == v["unary_wire_hex"], label  # catches non-canonical hex
+        assert len(u) == v["unary_wire_len"], label
+        assert base64.b64encode(u).decode() == v["unary_wire_base64"], label
 
 
 @pytest.mark.parametrize("v", _OPENINGS, ids=[f"as-caller-{v['id']}" for v in _OPENINGS])
@@ -274,3 +285,141 @@ def test_u64_strings_round_trip_exactly() -> None:
             assert isinstance(s, str), (v["id"], field)
             assert re.fullmatch(r"\d+", s), (v["id"], field, s)
             assert str(int(s)) == s, (v["id"], field, s)
+
+
+# --- mixed_pair harness rows (VEC-6/7/10) ---------------------------------
+# The mixed pair's `caller.py` runs only under built wheels, so a regression in
+# it redden nothing (§18's VEC coverage note). These rows exercise its helpers
+# directly — pure stdlib, no wheel — so the probe signatures, the pipe
+# watchdog, and the vector pins have a real red.
+
+_MIXED_PAIR = (
+    Path(__file__).resolve().parents[3] / "tests" / "cross_lang_org" / "mixed_pair"
+)
+_NET_PYI = (
+    Path(__file__).resolve().parents[3] / "bindings" / "python" / "python" / "net" / "_net.pyi"
+)
+
+
+def _load_caller():
+    spec = importlib.util.spec_from_file_location(
+        "mixed_pair_caller", _MIXED_PAIR / "caller.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _pyi_param_names(method: str) -> list[str]:
+    """The parameter names of ``NetMesh.<method>`` as declared by ``_net.pyi``
+    — the signature truth the failure-path probes must match."""
+    tree = ast.parse(_NET_PYI.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "NetMesh":
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == method:
+                    return [a.arg for a in item.args.args]
+    raise AssertionError(f"NetMesh.{method} not found in {_NET_PYI}")
+
+
+def test_mixed_pair_probes_match_the_net_stub_signatures() -> None:
+    """The failure-path probes call ``find_nodes``/``find_nodes_scoped`` with
+    the ``_net.pyi`` shapes. The calls are made for real against a stub
+    carrying the declared parameters: a wrong call shape raises TypeError and
+    the row reddens, and a TypeError raised inside a probe surfaces — it is
+    never swallowed into a printed error instead of state."""
+    caller = _load_caller()
+    seen: list = []
+
+    class _StubMesh:
+        def find_nodes(self, filter):  # noqa: A002 — the pyi's parameter name
+            seen.append(("find_nodes", filter))
+            return [7]
+
+        def find_nodes_scoped(self, filter, scope):  # noqa: A002
+            seen.append(("find_nodes_scoped", filter, scope))
+            return [8]
+
+    # The stub must carry the `_net.pyi` truth, or the call proof proves
+    # nothing: bind the declared parameter names to it.
+    assert list(inspect.signature(_StubMesh.find_nodes).parameters) == _pyi_param_names(
+        "find_nodes"
+    )
+    assert list(
+        inspect.signature(_StubMesh.find_nodes_scoped).parameters
+    ) == _pyi_param_names("find_nodes_scoped")
+
+    assert caller._probe_find_nodes(_StubMesh(), "nrpc:customer.read") == [7]
+    assert caller._probe_find_nodes_scoped(_StubMesh(), "nrpc:customer.read") == [8]
+    assert seen == [
+        ("find_nodes", {"require_tags": ["nrpc:customer.read"]}),
+        (
+            "find_nodes_scoped",
+            {"require_tags": ["nrpc:customer.read"]},
+            {"kind": "any"},
+        ),
+    ]
+
+    class _Broken:
+        def find_nodes(self, filter):  # noqa: A002
+            raise TypeError("real failure")
+
+        def find_nodes_scoped(self, filter, scope):  # noqa: A002
+            raise TypeError("real failure")
+
+    with pytest.raises(TypeError, match="real failure"):
+        caller._probe_find_nodes(_Broken(), "nrpc:customer.read")
+    with pytest.raises(TypeError, match="real failure"):
+        caller._probe_find_nodes_scoped(_Broken(), "nrpc:customer.read")
+
+
+def test_mixed_pair_pipe_reads_are_watchdog_bounded() -> None:
+    """A hung provider must time the caller OUT: every orchestrator-pipe read
+    is bounded, so the row fails fast instead of wedging on the failure class
+    the harness exists to reproduce."""
+    caller = _load_caller()
+    # The watchdog is ARMED: `_readline`'s default bound IS the `_WATCHDOG`
+    # constant, and `main()` reads the pipe through it.
+    bound = inspect.signature(caller._readline).parameters["timeout"].default
+    assert bound is caller._WATCHDOG and isinstance(bound, float) and bound > 0
+    hung = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        start = time.monotonic()
+        with pytest.raises(caller._PipeTimeout, match="hung-pipe"):
+            caller._readline(hung.stdout, "hung-pipe", timeout=0.25)
+        assert time.monotonic() - start < 5.0  # bounded: timed out, did not wedge
+    finally:
+        hung.kill()
+        hung.wait(timeout=10)
+
+    quiet = subprocess.Popen(
+        [sys.executable, "-c", "print('READY 127.0.0.1:1 02 3')"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert (
+            caller._readline(quiet.stdout, "READY", timeout=30.0)
+            == "READY 127.0.0.1:1 02 3\n"
+        )
+    finally:
+        quiet.wait(timeout=10)
+
+
+def test_mixed_pair_scenario_pins_cannot_drift() -> None:
+    """caller.py pins the values the Go row asserts — ``expect_terminal`` is
+    the clean eof and the observed chunk count equals ``chunk_count`` — so a
+    fixture flip reddens instead of moving the expectation."""
+    caller = _load_caller()
+    sc = _DOC["scenarios"]["mixed_pair"]
+    chunks = [bytes.fromhex(h) for h in sc["chunks_hex"]]
+    caller._check_pins(sc, chunks)  # the fixture satisfies its own pins
+
+    with pytest.raises(AssertionError, match="expect_terminal"):
+        caller._check_pins({**sc, "expect_terminal": "cancel"}, chunks)
+    with pytest.raises(AssertionError, match="chunk_count"):
+        caller._check_pins({**sc, "chunk_count": sc["chunk_count"] + 1}, chunks)

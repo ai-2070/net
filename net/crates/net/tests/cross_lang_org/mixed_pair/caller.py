@@ -21,14 +21,78 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROVIDER = os.path.join(_HERE, "provider.py")
+# The orchestrator-pipe watchdog (matches the Go row's readLine deadline):
+# EVERY pipe read is bounded by it, so a provider hang fails the row instead of
+# wedging the caller on exactly the failure class this harness reproduces.
 _WATCHDOG = 120.0
+
+
+class _PipeTimeout(Exception):
+    """An orchestrator-pipe read exceeded its bound — the peer hung mid-protocol."""
+
+
+def _readline(stream, phase: str, timeout: float = _WATCHDOG) -> str:
+    """One line from ``stream``, bounded by ``timeout`` seconds.
+
+    ``readline()`` on a pipe blocks forever when the peer stops writing; the
+    pump thread hands the line over with a real deadline (threads, not
+    ``select``: Windows pipes are not selectable). A read error is re-raised
+    on the caller's side — never swallowed into a line of text.
+    """
+    box: queue.Queue = queue.Queue(maxsize=1)
+
+    def _pump() -> None:
+        try:
+            box.put(stream.readline())
+        except BaseException as exc:  # re-raised below, on the caller's side
+            box.put(exc)
+
+    threading.Thread(target=_pump, daemon=True).start()
+    try:
+        got = box.get(timeout=timeout)
+    except queue.Empty:
+        raise _PipeTimeout(
+            f"{phase}: no orchestrator-pipe line within {timeout}s — "
+            "a hung provider must not become success"
+        ) from None
+    if isinstance(got, BaseException):
+        raise got
+    return got
+
+
+def _probe_find_nodes(mesh, tag: str):
+    """Failure-path state probe. The call shape MUST match
+    ``NetMesh.find_nodes(filter: dict)`` (``_net.pyi``) — a wrong shape is a
+    TypeError that must surface and name the real failure, never be swallowed
+    into a printed error string."""
+    return mesh.find_nodes({"require_tags": [tag]})
+
+
+def _probe_find_nodes_scoped(mesh, tag: str):
+    """Failure-path state probe. The call shape MUST match
+    ``NetMesh.find_nodes_scoped(filter: dict, scope: dict)`` (``_net.pyi``);
+    same no-TypeError-swallowing rule as :func:`_probe_find_nodes`."""
+    return mesh.find_nodes_scoped({"require_tags": [tag]}, {"kind": "any"})
+
+
+def _check_pins(sc: dict, chunks: list) -> None:
+    """The vector's pinned verdict — the SAME values the Go row asserts: the
+    terminal is the clean eof and the observed chunk count equals
+    ``chunk_count``. Deriving either from ``chunks_hex`` would follow a fixture
+    flip instead of reddening it."""
+    if sc["expect_terminal"] != "eof":
+        raise AssertionError(f"expect_terminal {sc['expect_terminal']!r} != 'eof'")
+    if len(chunks) != sc["chunk_count"]:
+        raise AssertionError(f"chunks = {len(chunks)}, want chunk_count {sc['chunk_count']}")
 
 
 def _free_addr() -> str:
@@ -97,7 +161,7 @@ def main() -> None:
         text=True,
     )
     try:
-        ready = proc.stdout.readline().strip()
+        ready = _readline(proc.stdout, "READY").strip()
         fields = ready.split()
         if len(fields) != 4 or fields[0] != "READY":
             _fail(f"bad READY line: {ready!r}")
@@ -136,16 +200,13 @@ def main() -> None:
                 print(f"probe: discovered_nodes={mesh.discovered_nodes()}", file=sys.stderr, flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"probe: discovered_nodes err {e!r}", file=sys.stderr, flush=True)
-            try:
-                tag = sc["granted_capability_tag"]
-                print(f"probe: find_nodes={mesh.find_nodes(tag)}", file=sys.stderr, flush=True)
-            except Exception as e:  # noqa: BLE001
-                print(f"probe: find_nodes err {e!r}", file=sys.stderr, flush=True)
-            try:
-                tag = sc["granted_capability_tag"]
-                print(f"probe: find_nodes_scoped={mesh.find_nodes_scoped(tag)}", file=sys.stderr, flush=True)
-            except Exception as e:  # noqa: BLE001
-                print(f"probe: find_nodes_scoped err {e!r}", file=sys.stderr, flush=True)
+            # The catalog probes call the REAL `_net.pyi` signatures and are
+            # deliberately NOT wrapped: a wrong call shape is a TypeError that
+            # must surface and name the real failure, not be swallowed into a
+            # printed error instead of state.
+            tag = sc["granted_capability_tag"]
+            print(f"probe: find_nodes={_probe_find_nodes(mesh, tag)}", file=sys.stderr, flush=True)
+            print(f"probe: find_nodes_scoped={_probe_find_nodes_scoped(mesh, tag)}", file=sys.stderr, flush=True)
             _fail(f"the call never converged: {last!r}")
 
         try:
@@ -157,6 +218,12 @@ def main() -> None:
         if chunks != chunks_expected:
             _fail(f"chunks {chunks!r} != pinned {chunks_expected!r}")
 
+        # The vector's pinned verdict (the Go row asserts the same values).
+        try:
+            _check_pins(sc, chunks)
+        except AssertionError as exc:
+            _fail(str(exc))
+
         # Lifetime contract: the provider sequences its teardown AFTER this
         # drain confirmation — its serve handle's Drop retires live protected
         # streams (a premature close becomes a 0x0005 CANCEL terminal instead
@@ -164,9 +231,9 @@ def main() -> None:
         proc.stdin.write("DRAINED\n")
         proc.stdin.flush()
 
-        result = proc.stdout.readline().strip()
+        result = _readline(proc.stdout, "RESULT").strip()
         print(f"provider: {result}", flush=True)  # the two-sided line (echo for receipts)
-        want = f"RESULT ok calls=1 chunks={len(chunks_expected)}"
+        want = f"RESULT ok calls=1 chunks={sc['chunk_count']}"
         if result != want:
             _fail(f"provider verdict {result!r} != {want!r}")
         print(
@@ -174,6 +241,8 @@ def main() -> None:
             f"bytes={sum(len(c) for c in chunks)}",
             flush=True,
         )
+    except _PipeTimeout as exc:
+        _fail(str(exc))  # a hung provider is a failed row, not a wedged caller
     finally:
         mesh.shutdown()
         if proc.poll() is None:
