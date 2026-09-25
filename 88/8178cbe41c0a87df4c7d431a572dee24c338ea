@@ -1,0 +1,34 @@
+docs/internal/plans/ORG_SCOPED_STREAMING_PLAN.md
+  h_64425bc75e3f3d 29,43,937,1259,1264,1308,1382,1454,1603-1605
+docs/internal/spikes/org-streaming/S1_REPORT.md
+  h_64425bc75e3f3d 3,287,2758,3195,3988,4313,4702
+docs/internal/spikes/org-streaming/S1_REVIEW_PACKET_2.md
+  h_64425bc75e3f3d 10
+docs/internal/spikes/org-streaming/S2_REVIEW_PACKET.md
+  h_64425bc75e3f3d 20
+docs/internal/spikes/org-streaming/S4_BROWSER.md
+  h_64425bc75e3f3d 3
+docs/internal/spikes/org-streaming/S4_GO.md
+  h_64425bc75e3f3d 5
+docs/internal/spikes/org-streaming/S4_NODE.md
+  h_64425bc75e3f3d 5
+docs/internal/spikes/org-streaming/S4_PYSDK.md
+  h_64425bc75e3f3d 5
+docs/internal/spikes/org-streaming/S4_PYTHON.md
+  h_64425bc75e3f3d 5
+docs/internal/spikes/org-streaming/S4_TSSDK.md
+  h_64425bc75e3f3d 5
+docs/internal/spikes/org-streaming/S4_VECTORS.md
+  h_64425bc75e3f3d 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "888178cbe41c0a87df4c7d431a572dee24c338ea",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
