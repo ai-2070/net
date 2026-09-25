@@ -204,6 +204,6 @@ require an explicit `--force` acknowledgement.
 
 - Guides: [Wrap an MCP Server](/docs/guides/wrap-mcp-server),
   [Expose Net as MCP](/docs/guides/expose-net-as-mcp).
-- Worldview: [Net and MCP](/docs/worldview/mcp-vs-net).
+- Worldview: [Net and MCP](/docs/worldview/how-net-compares#mcp-and-net).
 - [CLI Reference](/docs/reference/cli) for `net-mesh transfer` / `typegen` and exit
   codes.

@@ -49,18 +49,19 @@ snow = { version = "0.10.0", default-features = false, features = [
     "default-resolver",
     "default-resolver-crypto",
 ] }
-# Two getrandom majors are in the tree and BOTH have to be told about
+# Three getrandom majors are in the tree and ALL have to be told about
 # the browser. 0.4 is what `net` itself depends on; 0.3 and 0.2 come
 # in under `ring` / `snow` / `curve25519-dalek`. Without these lines
 # the build stops at a `compile_error!` inside getrandom 0.2 —
 # nothing in the copied Net code is wrong. See the report.
-getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom = { version = "0.4.0", features = ["wasm_js"] }
+getrandom_03 = { package = "getrandom", version = "0.3.4", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
-# Packet AEAD for wasm32. 0.10.1 (aead 0.5, `AeadInPlace`) rather
-# than the 0.11 `net` pins: 0.11 moved to aead 0.6's `InOutBuf` API,
-# and 0.10.1 is already in the tree under snow's default resolver, so
-# picking it dedups instead of linking a second ChaCha20-Poly1305.
-chacha20poly1305 = "0.10.1"
+# Packet AEAD for wasm32. 0.11 (aead 0.6, `AeadInOut`), matching
+# `net`. Default features OFF: the default `getrandom` feature pulls
+# in getrandom 0.4, a `compile_error!` on wasm32-unknown-unknown
+# without its `wasm_js` opt-in, and the packet key is caller-supplied.
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
 
 [profile.release]
 opt-level = "z"

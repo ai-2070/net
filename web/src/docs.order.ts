@@ -20,6 +20,10 @@ import type { DocsOrderConfig } from "@/lib/docs";
 export const DOCS_ORDER: DocsOrderConfig = {
   sections: [
     "start",
+    // The "should I use this, and how is it different" material sits before the
+    // tour: a reader deciding whether Net applies to them was previously meeting
+    // the CLI reference first, because this section sat second-to-last.
+    "worldview",
     "sdk",
     "guides",
     "tutorials",
@@ -27,7 +31,6 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "agent-briefs",
     "payments",
     "reference",
-    "worldview",
     "releases",
   ],
   folders: {
@@ -89,10 +92,6 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "agentic-mesh",
       "right-and-wrong-use-cases",
       "how-net-compares",
-      "mcp-vs-net",
-      "nats-vs-net",
-      "zenoh-vs-net",
-      "rest-vs-net",
     ],
     start: ["what-is-net", "install", "quickstart", "claude-skills"],
     concepts: [
@@ -220,9 +219,17 @@ export const DOCS_ORDER: DocsOrderConfig = {
   // second file. Only entries with no file of their own need one now:
   // folders that have no README to carry frontmatter.
   labels: {
-    releases: "Releases",
+    releases: "Changelog",
     sdk: "SDKs",
   },
+  // Sections whose CHILDREN are not listed in the sidebar. The header row is the
+  // entry and links to the section's own URL, where the full list lives — for
+  // `releases` that is the generated folder index (`/docs/releases`), which
+  // already lists every version newest-first with dates. Unlike `hide`, nothing
+  // becomes unreachable: this only decides how much of a long list the nav shows
+  // at rest, and a reader inside the section still gets the list back (see
+  // `FolderBlock`).
+  singleEntry: ["releases"],
   languages: {
     // D7 — two reference pages are Rust-native content sitting in a
     // language-neutral section. `adapter-trait` documents a Rust trait you cannot

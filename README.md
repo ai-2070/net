@@ -1,22 +1,40 @@
 # Net
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![CI](https://github.com/ai-2070/net/actions/workflows/ci.yml/badge.svg)](https://github.com/ai-2070/net/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/net-mesh-sdk?label=crates.io)](https://crates.io/crates/net-mesh-sdk)
+[![npm](https://img.shields.io/npm/v/@net-mesh/sdk?label=npm)](https://www.npmjs.com/package/@net-mesh/sdk)
+[![PyPI](https://img.shields.io/pypi/v/net-mesh-sdk?label=pypi)](https://pypi.org/project/net-mesh-sdk/)
+[![Go](https://pkg.go.dev/badge/github.com/ai-2070/net/go.svg)](https://pkg.go.dev/github.com/ai-2070/net/go)
 [![codecov](https://codecov.io/gh/ai-2070/net/graph/badge.svg?token=AOBMOF6LE4)](https://codecov.io/gh/ai-2070/net)
 
-**Net connects agents, services, and devices into a capability mesh.**
+**Net connects agents, services, and devices into a programmable mesh.**
 
-Discover what another machine can do, invoke it through typed RPC, and move artifacts between
-participants while resource owners keep control of access. Underneath is a latency-first
-encrypted mesh — identity, discovery, channels, typed RPC, durable logs, folded state, and
-artifacts share one substrate, and the same substrate runs vehicular, industrial, robotics, and
-edge workloads.
+You find what another machine can do, call it through typed RPC, and move artifacts between
+participants — while whoever owns a resource keeps control of access. Identity, discovery,
+channels, typed RPC, durable logs, folded state, and artifacts are one substrate, so the same
+mesh runs vehicular, industrial, robotics, and edge workloads.
+
+**How the mesh works**
+
+- **Capability announcements.** A node says what it can do, so you find peers by capability, not address.
+- **Pingwaves.** Small heartbeat frames carry who a node is, what it offers, and how far away it is.
+- **Proximity graphs.** Each peer keeps a latency-weighted map of the mesh and can route to the nearest capable node.
+- **Drop instead of queue.** Buffers are fixed-size, so load is dropped rather than queued or blocked; a node that can't keep up goes quiet and the mesh routes around it.
+- **End-to-end encrypted forwarding.** Relays forward ciphertext they cannot read — there is no trusted middle.
+- **Reachable through NATs.** Nodes try a direct path first and fall back to a relay; a browser tab joins as a full node over WebRTC.
+- **Latency-first.** Transport, routing, and placement all prefer the fastest path available.
+
+**What that gives you**
 
 - **No broker, no registry, no coordinator.** Peers find each other by what they can do.
-- **Work runs where the resource lives.** A credential never leaves the machine that holds it;
-  the caller invokes a capability, not a host.
-- **One identity, several authority planes.** A node is its keypair, and that identity signs what
-  it advertises. Who may reach a capability is decided by permission tokens and organization
-  grants issued under it; subnet membership is derived from the published tags.
+- **Identity outlives a path.** A node is its keypair; addresses and routes change underneath it.
+- **Work runs where the resource lives.** A credential never leaves the machine that holds it; the caller invokes a capability, not a host.
+- **One identity, several authority planes.** Permission tokens and organization grants decide who may reach a capability; subnet membership comes from a node's published tags.
+
+**Status:** pre-1.0 (`0.36.0`). Minor releases may break APIs — pin a minor and read the
+[release notes](https://ai2070.net/docs/releases). The wire format is versioned separately, and
+subprotocol IDs are permanent.
 
 ## Install
 
@@ -35,42 +53,46 @@ Published names and source imports differ on purpose: the crates/registries use
 [SDKs](#sdks). Full per-language setup:
 [Install](https://ai2070.net/docs/start/install), [Quickstart](https://ai2070.net/docs/start/quickstart).
 
-## What it enables
+## Claude Code Skill
 
-Capabilities, authority, and state on one substrate change what you can build:
+An agent working from surface familiarity will write integration code that runs and is quietly
+wrong. Install the skills first:
 
-**Distance becomes a parameter, not a rewrite.** You invoke a capability the same way whether the
-provider sits in-process or on another host — a consistent calling model in which location is a
-placement choice. Work has to be expressed as a capability to be reached this way; once it is,
-running it beside the caller or across the mesh is a deployment decision, not a rewrite.
-[Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke),
-[Architecture](https://ai2070.net/docs/concepts/architecture).
+```bash
+npx skills add ai-2070/net-claude-skill -g     # drop -g for the current project only
+```
 
-**Sensing and computation stop sharing a body.** A device can produce data without hosting the
-intelligence that acts on it, and two sensors can address each other directly. The mesh routes
-sense-to-compute and sense-to-sense, wherever each end physically is.
-[Capabilities](https://ai2070.net/docs/concepts/capabilities),
-[Dataforts](https://ai2070.net/docs/guides/dataforts).
+Pair them with [`opensrc`](https://github.com/vercel-labs/opensrc) so the agent can read Net's
+real source instead of guessing a signature — one fetch covers all five bindings:
 
-**Coordination that never funnels through a coordinator.** There is no registry, broker, or leader
-whose capacity becomes the ceiling. Peers observe their own neighbourhood, derive the rest, and
-route, so coordination grows with the participants instead of concentrating in a control plane.
-[Event bus](https://ai2070.net/docs/guides/event-bus),
-[Capabilities](https://ai2070.net/docs/concepts/capabilities).
+```bash
+npx -y opensrc@latest path ai-2070/net
+```
 
-**Software that outlives its host.** A daemon is an identity, not a process pinned to a box —
-addressed by what it is, placed where its capabilities are, and able to move with its history when
-the hardware underneath it changes. A long job can be handed to another participant with a
-lifecycle and an explicitly verified outcome.
-[Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement),
-[Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration),
-[Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle).
+Full install options: [Claude Skills](https://ai2070.net/docs/start/claude-skills).
 
-These show up in agent runtimes, robotics and fleet operations, industrial control, edge and IoT,
-and local-first collaboration. Built end to end:
-[Distributed daemon](https://ai2070.net/docs/tutorials/distributed-daemon),
-[Event-sourced service](https://ai2070.net/docs/tutorials/event-sourced-service),
-[Fleet telemetry](https://ai2070.net/docs/tutorials/fleet-telemetry).
+## Hello, mesh
+
+Start a node and put one event on it.
+
+```rust
+use net_sdk::Net;
+
+let node = Net::builder().shards(4).memory().build().await?;
+node.emit(&Hello { msg: "hello, mesh".into() })?;   // a receipt, or an error
+```
+
+```typescript
+import { NetNode } from '@net-mesh/sdk';
+
+const node = await NetNode.create({ shards: 4 });
+node.emit({ msg: 'hello, mesh' });
+await node.shutdown();   // explicit — Node finalizers are not deterministic
+```
+
+The memory adapter accepts and counts events; it does not retain them, so a subscriber would never
+yield. For a round trip, run two nodes over the mesh transport — see
+[Event bus](https://ai2070.net/docs/guides/event-bus).
 
 ## Setting up your own mesh
 
@@ -85,6 +107,38 @@ net-mesh up --enroll                           # operator: runs the node, stays 
 net-mesh invite create                         # prints a `netmesh-join_` token — keep it secret
 net-mesh join <TOKEN> --yes && net-mesh up     # device: use the link, then run its own node
 ```
+
+## What it enables
+
+Capabilities, authority, and state on one substrate change what you can build. Each point leads
+with the knobs you'd set; the links go deeper.
+
+**Distance becomes a parameter, not a rewrite.** Call a capability by name; the mesh decides where
+it runs. `deadline=500ms`, `routing=lowest-latency`.
+[Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke),
+[Architecture](https://ai2070.net/docs/concepts/architecture).
+
+**Sensing and computation stop sharing a body.** A device produces data without hosting the code
+that acts on it. `channel=sensors/lidar/front`, `reliability=reliable`.
+[Capabilities](https://ai2070.net/docs/concepts/capabilities),
+[Dataforts](https://ai2070.net/docs/guides/dataforts).
+
+**Coordination that never funnels through a coordinator.** No registry, broker, or leader to cap
+it. `shards=16`, `backpressure=drop-oldest`.
+[Event bus](https://ai2070.net/docs/guides/event-bus),
+[Capabilities](https://ai2070.net/docs/concepts/capabilities).
+
+**Software that outlives its host.** A daemon is an identity, not a process pinned to a box.
+`placement=nearest`, `replicas=3`.
+[Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement),
+[Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration),
+[Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle).
+
+These show up in agent runtimes, robotics and fleet operations, industrial control, edge and IoT,
+and local-first collaboration. Built end to end:
+[Distributed daemon](https://ai2070.net/docs/tutorials/distributed-daemon),
+[Event-sourced service](https://ai2070.net/docs/tutorials/event-sourced-service),
+[Fleet telemetry](https://ai2070.net/docs/tutorials/fleet-telemetry).
 
 ## One system, end to end
 
@@ -191,7 +245,9 @@ The performance story — what is fast, and what the numbers do and do not inclu
 Net's unit is a **capability offered by a provider, together with the authority and live state
 needed to use it**. Other systems organize distributed work around different objects — HTTP
 around an endpoint, MCP around a tool a configured host may call, NATS around a subject, Zenoh
-around a key expression. Net addresses capabilities under identity and authority.
+around a key expression. Net addresses capabilities under identity and authority — so it looks
+like a message broker from the outside and is not one underneath, and code written from API
+familiarity runs and is quietly wrong.
 
 That makes it a substrate beneath applications, not a replacement for their workflows or business
 model: a workspace, fleet console, agent runtime, or industrial application can use Net and keep
@@ -200,7 +256,7 @@ its own interface, approvals, and user experience.
 - [The Agentic Mesh](https://ai2070.net/docs/worldview/agentic-mesh) — the problem from an application's point of view.
 - [When to use Net](https://ai2070.net/docs/worldview/right-and-wrong-use-cases) — the fit boundary, including when HTTP, MCP, NATS, or an ordinary database is the simpler choice.
 - [How Net relates to other systems](https://ai2070.net/docs/worldview/how-net-compares) — a compact comparison by abstraction, topology, and trust boundary.
-- [Net and MCP](https://ai2070.net/docs/worldview/mcp-vs-net) · [Connecting HTTP systems](https://ai2070.net/docs/worldview/rest-vs-net) · [Net and NATS](https://ai2070.net/docs/worldview/nats-vs-net) · [Net and Zenoh](https://ai2070.net/docs/worldview/zenoh-vs-net).
+- [Net and MCP](https://ai2070.net/docs/worldview/how-net-compares#mcp-and-net) · [Connecting HTTP systems](https://ai2070.net/docs/worldview/how-net-compares#http-and-net) · [Net and NATS](https://ai2070.net/docs/worldview/how-net-compares#nats-and-net) · [Net and Zenoh](https://ai2070.net/docs/worldview/how-net-compares#zenoh-and-net).
 
 Discovery, invocation, and outcome are separate: finding a provider does not authorize a call, and
 a successful invocation is not proof that the real-world outcome holds. See [Submitted is not
@@ -212,15 +268,21 @@ The rest of the surface, one line each; every entry links to the page that goes 
 
 | Surface | One line | Read |
 |---|---|---|
+| Organizations | Cross-org authority: memberships, grants and revocation floors over one identity | [Organizations](https://ai2070.net/docs/concepts/organizations) |
 | Subnets | Boundaries derived from capability tags, enforced at the channel — not VLANs | [Subnets](https://ai2070.net/docs/concepts/subnets) |
-| MeshDB | Federated queries across nodes over the same facade | [Federated queries](https://ai2070.net/docs/guides/netdb-queries#federated-queries-meshdb) |
-| Scheduler | Atomic gang-claim of a contended resource, with a task lifecycle on top | [Gang scheduler](https://ai2070.net/docs/guides/gang-scheduler), [Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle) |
-| MCP bridge | Wrap a stdio MCP server into mesh capabilities, or serve the mesh as MCP | [Wrap MCP](https://ai2070.net/docs/guides/wrap-mcp-server), [Expose as MCP](https://ai2070.net/docs/guides/expose-net-as-mcp) |
-| Payments | x402 pricing, quotes, settlement, spend policy — signed facts around a call | [Net payments](https://ai2070.net/docs/payments/what-net-payments-is) |
-| A2A | Hand a long job to an agent that doesn't share your memory | [Agent to agent](https://ai2070.net/docs/guides/agent-to-agent) |
 | Subprotocols | Opaque forwarding, version negotiation, a protocol runtime not a fixed protocol | [Subprotocol IDs](https://ai2070.net/docs/reference/subprotocol-ids) |
+| RedEX & CortEX | Durable append-only logs, and the folded state built on them | [Storage stack](https://ai2070.net/docs/concepts/storage-stack), [Durable logs](https://ai2070.net/docs/guides/durable-logs), [Folds](https://ai2070.net/docs/guides/cortex-folds) |
+| MeshDB | Federated queries across nodes over the same facade | [Federated queries](https://ai2070.net/docs/guides/netdb-queries#federated-queries-meshdb) |
+| MeshOS | Long-running stateful daemons, placement and lifecycle | [Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement) |
+| Scheduler | Atomic gang-claim of a contended resource, with a task lifecycle on top | [Gang scheduler](https://ai2070.net/docs/guides/gang-scheduler), [Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle) |
+| CLI | `net-mesh` — managed nodes, join links, capability hosting, typegen, local stores | [CLI reference](https://ai2070.net/docs/reference/cli) |
+| Deck TUI | Operator TUI over the substrate | [Deck](https://ai2070.net/docs/reference/deck) |
+| A2A | Hand a long job to an agent that doesn't share your memory | [Agent to agent](https://ai2070.net/docs/guides/agent-to-agent) |
 | Delegation | Child seeds and revocation for delegated identity | [Agent identity](https://ai2070.net/docs/concepts/agent-identity) |
-| Operator surface | MeshOS supervision and the Deck TUI | [Deck](https://ai2070.net/docs/reference/deck) |
+| Payments | x402 pricing, quotes, settlement, spend policy — signed facts around a call | [Net payments](https://ai2070.net/docs/payments/what-net-payments-is) |
+| MCP bridge | Wrap a stdio MCP server into mesh capabilities, or serve the mesh as MCP | [Wrap MCP](https://ai2070.net/docs/guides/wrap-mcp-server), [Expose as MCP](https://ai2070.net/docs/guides/expose-net-as-mcp) |
+| Transports | Direct paths first, a blind relay as the fallback, WebRTC for browser leaves | [NAT and traversal](https://ai2070.net/docs/guides/nat-and-traversal), [WebRTC transport](https://ai2070.net/docs/concepts/webrtc-transport) |
+| Continuity | A daemon moves with its history when the hardware under it changes | [Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration) |
 | Security | No plaintext on relays, no clock dependency, no trusted intermediary | [Security model](https://ai2070.net/docs/concepts/security-model) |
 
 ## Performance
@@ -264,24 +326,29 @@ Lower-level bindings (skip the SDK ergonomics, talk directly to the engine):
 | **Node binding** | [`@net-mesh/core`](https://www.npmjs.com/package/@net-mesh/core) | `npm install @net-mesh/core` |
 | **Python binding** | [`net-mesh`](https://pypi.org/project/net-mesh/) | `pip install net-mesh` |
 
-## Claude Code Skill
+The bindings are not at parity. This is the short version; the full matrix — with the reason
+behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/master/.claude/skills/net-event-bus/bindings/coverage.md).
 
-Net looks like Kafka or NATS from the outside and is not one underneath; an agent working from
-surface familiarity will write integration code that runs and is quietly wrong. Install the
-skills first:
+| Feature | Rust | Node / TS | Python | Go | C |
+|---|---|---|---|---|---|
+| Event bus — ingest + poll | ✓ | ✓ | ✓ | ✓ | ✓ `poll` |
+| Mesh channels — register / subscribe / publish | ✓ | ✓ | core-only | ✓ | ✓ |
+| Capability announce + discovery | ✓ | ✓ | ✓ | ✓ | ✓ |
+| nRPC — typed request/response + streaming | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Gang-claim scheduler | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Organization capability auth | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Subnet exports — serve + call | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Dataforts — blobs | ✓ | ✓ | ✓ | partial | ✓ |
+| RedEX / CortEX / MeshDB | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Compute / groups / daemons | ✓ | ✓ | core-only | ✓ | ✓ |
+| Deck — operator surface | ✓ | ✓ | ✓ | ✓ | ✓ |
+| MCP bridge | ✓ | ✓ | ✓ | ✓ | ✓ |
+| A2A — agent task handoff | ✓ | core-only | core-only | – | – |
+| A2A — paid task admission | ✓ | – | core-only | – | – |
+| Consumer-side filter DSL | ✓ | ✓ | ✓ | – | ✓ |
 
-```bash
-npx skills add ai-2070/net-claude-skill -g     # drop -g for the current project only
-```
-
-Pair them with [`opensrc`](https://github.com/vercel-labs/opensrc) so the agent can read Net's
-real source instead of guessing a signature — one fetch covers all five bindings:
-
-```bash
-npx -y opensrc@latest path ai-2070/net
-```
-
-Full install options: [Claude Skills](https://ai2070.net/docs/start/claude-skills).
+`✓` supported · `core-only` reachable only through the low-level binding (`@net-mesh/core`,
+`net`) · `partial` · `–` not exposed.
 
 ## Origin
 

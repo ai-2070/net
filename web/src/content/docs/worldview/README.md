@@ -31,14 +31,10 @@ state needed to use it.
    an application's point of view.
 2. **[When to use Net](/docs/worldview/right-and-wrong-use-cases)** gives the fit
    boundary, including cases where HTTP, MCP, NATS, or a normal database is enough.
-3. **[How Net relates to other systems](/docs/worldview/how-net-compares)** gives
-   a compact comparison by abstraction, topology, and trust boundary.
-4. **[Net and MCP](/docs/worldview/mcp-vs-net)** explains how existing MCP tools
-   become discoverable capabilities.
-5. **[Connecting HTTP systems](/docs/worldview/rest-vs-net)** shows where REST and
-   webhooks sit at the application boundary.
-6. **[Net and NATS](/docs/worldview/nats-vs-net)** and **[Net and Zenoh](/docs/worldview/zenoh-vs-net)**
-   cover the closest messaging and data-centric comparisons.
+3. **[How Net relates to other systems](/docs/worldview/how-net-compares)** compares
+   MCP, HTTP, NATS and Zenoh with Net by addressable object, boundary and trust
+   model — one section per system, anchored (`#mcp-and-net`, `#http-and-net`,
+   `#nats-and-net`, `#zenoh-and-net`).
 
 For the implementation model, continue to [What is Net?](/docs/start/what-is-net).
 For a concrete distinction between acceptance, execution, and verified outcome,

@@ -110,7 +110,7 @@ mod imp {
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use super::{AeadError, NONCE_LEN, TAG_LEN};
-    use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+    use chacha20poly1305::aead::{AeadInOut, KeyInit};
     use chacha20poly1305::{ChaCha20Poly1305, Tag};
 
     /// RustCrypto-backed packet key (wasm32).
@@ -132,7 +132,7 @@ mod imp {
         ) -> Result<[u8; TAG_LEN], AeadError> {
             let tag = self
                 .0
-                .encrypt_in_place_detached((&nonce).into(), aad, buffer)
+                .encrypt_inout_detached((&nonce).into(), aad, buffer.into())
                 .map_err(|_| AeadError)?;
             let mut out = [0u8; TAG_LEN];
             out.copy_from_slice(tag.as_slice());
@@ -166,9 +166,9 @@ mod imp {
             }
             let split = buffer.len() - TAG_LEN;
             let (ciphertext, tag) = buffer.split_at_mut(split);
-            let tag = Tag::clone_from_slice(tag);
+            let tag = Tag::try_from(&*tag).map_err(|_| AeadError)?;
             self.0
-                .decrypt_in_place_detached((&nonce).into(), aad, ciphertext, &tag)
+                .decrypt_inout_detached((&nonce).into(), aad, ciphertext.into(), &tag)
                 .map_err(|_| AeadError)?;
             Ok(split)
         }

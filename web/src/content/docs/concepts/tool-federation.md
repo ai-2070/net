@@ -41,7 +41,7 @@ can inspect or generate bindings for a tool it discovered at runtime.
 | `serve_tool`, `call_tool`, `list_tools`, `watch_tools` | serve, discover, and invoke tools                     | [Discover and invoke](/docs/guides/discover-and-invoke)   |
 | nRPC                                                   | typed request/response and streaming transport        | [nRPC](/docs/guides/nrpc)                                 |
 | Organization authority                                 | control discovery and invocation                      | [Private capabilities](/docs/guides/private-capabilities) |
-| MCP bridge                                             | publish MCP tools on Net or expose Net to an MCP host | [Net and MCP](/docs/worldview/mcp-vs-net)                 |
+| MCP bridge                                             | publish MCP tools on Net or expose Net to an MCP host | [Net and MCP](/docs/worldview/how-net-compares#mcp-and-net)                 |
 | A2A                                                    | delegate a longer job to another agent                | [Agent-to-agent](/docs/guides/agent-to-agent)             |
 | Agent identity                                         | identify the principal an agent represents            | [Agent identity](/docs/concepts/agent-identity)           |
 

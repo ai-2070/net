@@ -12,7 +12,7 @@ mesh calls back into MCP `tools/call` — all without the Net core ever learning
 that MCP exists.
 
 `net-mesh wrap` publishes tools from an existing MCP server as Net capabilities.
-[Net and MCP](/docs/worldview/mcp-vs-net) explains where the bridge fits.
+[Net and MCP](/docs/worldview/how-net-compares#mcp-and-net) explains where the bridge fits.
 
 ## Prerequisite: a mesh to join
 
