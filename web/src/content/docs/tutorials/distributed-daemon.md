@@ -15,9 +15,9 @@ The daemon we'll build is a small one — it tracks running tasks and emits stat
 ## The shape
 
 ```text title="What you are building"
-┌───────────────────────────────────────────────────┐
-│              StandbyGroup (3 members)             │
-│                                                   │
+┌──────────────────────────────────────────────────────┐
+│               StandbyGroup (3 members)               │
+│                                                      │
 │  ┌──────────────┐  ┌──────────────┐ ┌──────────────┐ │
 │  │   Active     │  │   Standby    │ │   Standby    │ │
 │  │  (node A)    │→ │  (node B)    │ │  (node C)    │ │
@@ -32,7 +32,7 @@ The daemon we'll build is a small one — it tracks running tasks and emits stat
 │  ┌─────────────────────────────────────────────────┐ │
 │  │  Event buffer: [101, 102, 103, ...]             │ │
 │  └─────────────────────────────────────────────────┘ │
-└───────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────┘
 ```
 
 The active processes events. The standbys hold state synced to the last snapshot. The group buffers events the active has processed since the last sync. When the active dies, the standby with the highest sync point promotes, replays the buffered events, and continues.
