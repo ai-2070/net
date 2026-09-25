@@ -24,8 +24,10 @@ address, Noise public key, and pre-shared key:
 --node-addr <ip:port>   --node-pubkey <hex>   --psk-hex <psk>
 ```
 
-There is no one-command `net up` yet: the bootstrap peer is a running mesh node
-you stand up via the SDK (`MeshBuilder`) or an existing daemon. If you just want
+The bootstrap peer can be a managed node: run `net-mesh up --enroll` on it,
+redeem one of its links on this machine with `net-mesh join <token>`, and wrap
+with `--joined <state-dir>` instead of the three flags above. A node you stand
+up via the SDK (`MeshBuilder`) or an existing daemon works too. If you just want
 to see the wrap → discover → invoke loop end-to-end today, the self-contained
 two-node path is the SDK harness in
 [Discover and Invoke](/docs/guides/discover-and-invoke); this page is the operator

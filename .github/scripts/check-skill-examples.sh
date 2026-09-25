@@ -190,7 +190,7 @@ tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 futures = "0.3"
-# Channel publish takes `bytes::Bytes`; the SDK re-exports the config types but
+# Channel publish takes bytes::Bytes; the SDK re-exports the config types but
 # not the payload type, so an example that registers a channel needs this crate.
 bytes = "1"
 EOF

@@ -4575,6 +4575,44 @@ Gates:
 - **No `DEFAULT_RELAY`.** It stays empty until a real relay is deployed.
 
 
+**Post-S8 CI repairs (2026-09-25).** Three side workflows were red on the
+branch.
+
+- **natsim `rtc_anchor_direct` / `rtc_anchor_stun_endpoint`, broken since
+  S6.**
+  - *Cause.* The routed-handshake responder replayed its held announcements
+    to every newly attached peer, including a peer that reached it through
+    a mesh relay. The replay opens a capability stream on that routed
+    session. The RTC install fence (`session_is_busy` in the RTC install
+    path) counts any non-signalling stream as busy, and streams are never
+    closed, so every ICE install to that peer was refused.
+  - *Fix.* The replay now runs only when the routed handshake crossed no
+    mesh hop (`hop_count == 0`: a peer attached to this node). A peer behind
+    a mesh relay already gets the flood from that relay.
+  - *Witness.*
+    `capability_multihop::a_peer_behind_a_mesh_relay_gets_no_replay_on_its_session`,
+    RED under `replay = true`.
+  - *S7 explained.* The same mechanism accounts for the S7 regression
+    recorded above, so that entry's open question has an answer.
+- **Examples compile.** The Rust `tokenchannel` skill example constructed
+  `SubscribeOptions` without the `chain` field added in V3-2A C1. It now
+  uses `..Default::default()`. A comment in `check-skill-examples.sh`'s
+  unquoted heredoc carried backticks (shell command substitution), which
+  produced the "bytes::Bytes: command not found" noise; removed.
+- **Documented API exists.** Two pages said there is no `net up`. That is
+  stale (and the check rejects a bare `net` invocation). They now point at
+  `net-mesh up --enroll`, `join`, and `wrap --joined`.
+
+**Open, needs a decision (not changed).** The RTC install fence treats the
+capability-announcement stream as busy. The mesh's own `session_is_busy`
+excludes control streams, but the RTC one excludes only the signalling
+stream. So any mesh-relayed session that has ever carried a forwarded
+announcement can never upgrade to RTC. Ordinary flood forwarding does
+reach routed peers, so this can happen in a long-lived session without
+either of this branch's changes. Aligning the RTC gate with the mesh gate
+(excluding control streams) would fix it, but that is a change to an RTC
+security gate and is left for an explicit decision.
+
 ## 8. Cumulative acceptance matrix
 
 All rows are required unless explicitly marked feature-conditional; narrow slices can be accepted independently without calling the entire plan complete.

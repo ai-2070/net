@@ -29786,6 +29786,13 @@ impl MeshNode {
             ctx.peers.clone(),
             ctx.sink.clone(),
         );
+        // Replay only to a peer that attached to THIS node (the routed
+        // handshake crossed no mesh hop). A peer behind a mesh relay
+        // (`hop_count > 0`) already receives the flood through that relay,
+        // and replaying over its session opens a capability stream there
+        // that keeps the session non-quiescent, which the RTC install fence
+        // then refuses for good (natsim `rtc_anchor_direct`, since S6).
+        let replay = routing_header.hop_count == 0;
         // Only across a BLIND relay (not a mesh member, so nothing floods
         // between the two ends); a mesh relay floods both announcements.
         let this = if matches!(source, PeerAddr::Relayed { .. }) {
@@ -29813,13 +29820,15 @@ impl MeshNode {
                     // A peer that attached through a routed handshake
                     // (a device reaching its hub) gets the announcements
                     // flooded before it arrived.
-                    Self::replay_relay_announcements(
-                        peer_node_id,
-                        relay,
-                        replay_peers,
-                        replay_sink,
-                    )
-                    .await;
+                    if replay {
+                        Self::replay_relay_announcements(
+                            peer_node_id,
+                            relay,
+                            replay_peers,
+                            replay_sink,
+                        )
+                        .await;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(

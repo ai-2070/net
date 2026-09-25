@@ -847,3 +847,46 @@ async fn membership_crosses_a_two_hop_relayed_session() {
         .expect("no hang")
         .expect("a membership request crosses the relay hop and is ACKed");
 }
+
+/// A peer that reaches this node THROUGH a mesh relay (the routed
+/// handshake crossed a hop) is not replayed to: that relay already floods
+/// it, and a replay would open a capability stream on the routed session
+/// and hold it non-quiescent, which the RTC install fence then refuses for
+/// good (natsim `rtc_anchor_direct` regressed exactly so after S6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_behind_a_mesh_relay_gets_no_replay_on_its_session() {
+    let x = build_node().await;
+    let b = build_node().await;
+    let r = build_node().await;
+    let a = build_node().await;
+    handshake_no_start(&x, &b).await;
+    handshake_no_start(&b, &r).await;
+    handshake_no_start(&a, &r).await;
+    start_all(&[&x, &b, &r, &a]);
+    x.announce_capabilities(CapabilitySet::new().add_tag("x"))
+        .await
+        .unwrap();
+    assert!(
+        wait_until(&b, |n| n.relay_announcements_len() >= 1).await,
+        "precondition: B holds an announcement it would replay"
+    );
+    // The flood has settled (A heard X through R) before A attaches, so a
+    // capability stream on B's session to A can only be the replay.
+    let fx = CapabilityFilter::new().require_tag("x");
+    let x_id = x.node_id();
+    assert!(wait_until(&a, |n| n.find_nodes_by_filter(&fx).contains(&x_id)).await);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (a_id, b_id) = (a.node_id(), b.node_id());
+    a.connect_via(r.local_addr(), b.public_key(), b_id)
+        .await
+        .expect("A reaches B through R");
+    // Past both replay settles.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let session = b.peer_session_for_test(a_id).expect("B holds A's session");
+    let cap_stream = net::adapter::net::behavior::SUBPROTOCOL_CAPABILITY_ANN as u64;
+    assert!(
+        !session.stream_ids().contains(&cap_stream),
+        "no replay stream on a session that crossed a mesh hop: {:?}",
+        session.stream_ids()
+    );
+}
