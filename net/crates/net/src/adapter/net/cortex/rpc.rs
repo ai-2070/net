@@ -3309,6 +3309,13 @@ impl StreamCallRecord {
         self.terminal.as_ref().map(|t| t.reason.clone())
     }
 
+    /// Whether the record still owns a live call (not terminal) — the
+    /// model's `CallLifecycle::is_live`, the CORE-2 publish barrier's
+    /// re-check.
+    fn is_live(&self) -> bool {
+        self.terminal.is_none()
+    }
+
     fn emission(&self) -> Option<StreamTerminalDisposition> {
         self.terminal.as_ref().and_then(|t| t.emission)
     }
@@ -5754,6 +5761,47 @@ impl SupervisedHandler {
     }
 }
 
+/// Convert one supervised handler completion into the §2.6 result — the
+/// shared shape of the `select!` arm and CORE-1's pre-classification
+/// re-poll (both must deposit the SAME result). Returns `(result,
+/// panicked)`.
+fn supervised_handler_result(
+    result: Result<Result<(), RpcHandlerError>, Box<dyn std::any::Any + Send>>,
+    caller_origin: u64,
+    call_id: u64,
+) -> (StreamHandlerResult, bool) {
+    match result {
+        Ok(Ok(())) => (StreamHandlerResult::Ok, false),
+        Ok(Err(RpcHandlerError::Application { code, message })) => (
+            StreamHandlerResult::Err(RpcStatus::Application(code), message),
+            false,
+        ),
+        Ok(Err(RpcHandlerError::Internal(message))) => {
+            (StreamHandlerResult::Err(RpcStatus::Internal, message), false)
+        }
+        Err(panic) => {
+            let panic_msg = panic
+                .downcast_ref::<&'static str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic>".into());
+            tracing::error!(
+                caller_origin = format!("{:#x}", caller_origin),
+                call_id,
+                panic = %panic_msg,
+                "rpc streaming server handler panicked",
+            );
+            (
+                StreamHandlerResult::Err(
+                    RpcStatus::Internal,
+                    format!("handler panicked: {panic_msg}"),
+                ),
+                true,
+            )
+        }
+    }
+}
+
 /// Run one server-streaming call to a bounded terminal (§2.2) — the
 /// production shape of the model's `run_supervisor`. The supervisor owns
 /// the handler, the response pump's `JoinHandle`, the flow semaphore and
@@ -5827,6 +5875,7 @@ async fn run_stream_call_supervisor(
     let pump_metrics = metrics.clone();
     let pump_flow = flow_sem.clone();
     let pump_gate = gate.clone();
+    let pump_record = Arc::clone(&record);
     let pump_task = tokio::spawn(async move {
         loop {
             // After the producer half closes (protected only), drain
@@ -5848,6 +5897,21 @@ async fn run_stream_call_supervisor(
                     Err(_) => break,
                 };
                 permit.forget();
+            }
+            // CORE-2 publish barrier: a retirement terminal commits
+            // under `record`'s lock (`StreamCallRecord::retire`), so the
+            // liveness re-check here turns a chunk that reaches the
+            // publish point after a terminal committed into a DISCARD —
+            // zero chunks publish after a retirement terminal commits
+            // (§2.2: every retirement discards). The item's byte
+            // reservation is released with the discard.
+            if !pump_record.lock().is_live() {
+                if let Some(shared) = chunk.permit {
+                    if let Some(permit) = shared.take() {
+                        permit.release();
+                    }
+                }
+                break;
             }
             if let Some(m) = pump_metrics.as_ref() {
                 m.streaming_chunks_emitted_total
@@ -5884,7 +5948,6 @@ async fn run_stream_call_supervisor(
     let mut handler_done = false;
     let mut handler_panicked = false;
     let mut pump_done = false;
-    let mut pump_failed = false;
 
     let sleep = async {
         match deadline {
@@ -5916,33 +5979,9 @@ async fn run_stream_call_supervisor(
 
             result = &mut handler_fut, if !handler_done => {
                 handler_done = true;
-                let result = match result {
-                    Ok(Ok(())) => StreamHandlerResult::Ok,
-                    Ok(Err(RpcHandlerError::Application { code, message })) => {
-                        StreamHandlerResult::Err(RpcStatus::Application(code), message)
-                    }
-                    Ok(Err(RpcHandlerError::Internal(message))) => {
-                        StreamHandlerResult::Err(RpcStatus::Internal, message)
-                    }
-                    Err(panic) => {
-                        handler_panicked = true;
-                        let panic_msg = panic
-                            .downcast_ref::<&'static str>()
-                            .map(|s| s.to_string())
-                            .or_else(|| panic.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "<non-string panic>".into());
-                        tracing::error!(
-                            caller_origin = format!("{:#x}", caller_origin),
-                            call_id,
-                            panic = %panic_msg,
-                            "rpc streaming server handler panicked",
-                        );
-                        StreamHandlerResult::Err(
-                            RpcStatus::Internal,
-                            format!("handler panicked: {panic_msg}"),
-                        )
-                    }
-                };
+                let (result, panicked) =
+                    supervised_handler_result(result, caller_origin, call_id);
+                handler_panicked = handler_panicked || panicked;
                 // Producer finished: Draining, NOT terminal. The gate
                 // closes the sink so a retained clone cannot extend the
                 // drain, while grants stay creditable and expiry stays
@@ -5955,10 +5994,33 @@ async fn run_stream_call_supervisor(
 
             joined = &mut pump_task, if !pump_done => {
                 pump_done = true;
-                pump_failed = joined.is_err();
+                let _ = joined;
             }
         }
     };
+
+    // CORE-1 (the R4COREFIX-9 mechanism): a pump exit must not shadow a
+    // handler whose result has landed but has not been polled yet — the
+    // sink's sender drops at handler end, BEFORE the result deposit
+    // does, so the pump exit and the ready handler race exactly here,
+    // and a `pump_done` break would classify the call `PumpFailed` (wire
+    // 0x0006) over an already-complete handler. Poll the handler ONE
+    // more time before classifying a pump exit; its result wins.
+    if forced.is_none() && !handler_done {
+        let deposited = tokio::select! {
+            biased;
+            result = &mut handler_fut => Some(result),
+            () = std::future::ready(()) => None,
+        };
+        if let Some(result) = deposited {
+            let (result, panicked) = supervised_handler_result(result, caller_origin, call_id);
+            handler_panicked = handler_panicked || panicked;
+            record.lock().handler_returned(result);
+            if let Some(g) = gate.as_ref() {
+                g.finish();
+            }
+        }
+    }
 
     if let Some(m) = metrics.as_ref() {
         m.handler_in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -5998,12 +6060,13 @@ async fn run_stream_call_supervisor(
             pump_task.as_mut().abort();
             let _ = pump_task.as_mut().await;
         }
-    } else if pump_failed {
-        record.lock().retire(StreamTerminalReason::PumpFailed);
     } else {
-        // Clean pump exit: the state machine decides whether that is a
-        // completion (Draining) or a producer that died under the
-        // handler (PumpFailed).
+        // A pump exit — clean or failed — is classified by the state
+        // machine: `Completed(result)` once the handler has returned
+        // (CORE-1's re-poll above included), and `PumpFailed` only for a
+        // pump that stopped WITHOUT the handler returning (its documented
+        // meaning). A blanket `PumpFailed` here is how a pump exit
+        // shadows a completed handler.
         record.lock().pump_exited();
     }
 
@@ -7689,7 +7752,9 @@ impl RpcStreamingRequestFold {
         }
         if end_on_initial {
             // §2.6: the opening already carried END — the input half is
-            // `Ended` from birth (the SS record's shape).
+            // `Ended` from birth (the SS record's shape). The model's
+            // frame vocabulary names this transition explicitly
+            // (`Disposition::InputEnded` ↔ `end_input() == true`).
             record.lock().end_input();
         } else {
             self.senders.lock().insert(
@@ -10211,6 +10276,224 @@ mod tests {
                 body: ctx.payload.body,
             })
         }
+    }
+
+    /// CORE-1's window as a deterministic future (the model's
+    /// `DepositLandsLate`, mirror): the handler's result deposit lands
+    /// AFTER the supervisor's last `select!` poll of the handler — the
+    /// sink's sender drops at handler end, BEFORE the deposit does — and
+    /// is observable only from a LATER poll. Polls 1 and 2: not landed
+    /// (poll 2 is the very evaluation whose pump arm fires). Poll 3 is
+    /// CORE-1's pre-classification re-poll: landed.
+    struct LateDeposit {
+        polled: usize,
+    }
+
+    impl Future for LateDeposit {
+        type Output = ();
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            self.polled += 1;
+            if self.polled >= 3 {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    /// A handler that parks its sink OUTSIDE its own future and completes
+    /// through [`LateDeposit`] — the detached-sink shape CORE-1 names.
+    struct DetachSinkHandler {
+        held: Arc<Mutex<Option<RpcResponseSink>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcStreamingHandler for DetachSinkHandler {
+        async fn call(
+            &self,
+            _ctx: RpcContext,
+            sink: RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            *self.held.lock() = Some(sink);
+            LateDeposit { polled: 0 }.await;
+            Ok(())
+        }
+    }
+
+    /// A handler that emits two chunks and returns.
+    struct TwoChunkHandler;
+
+    #[async_trait::async_trait]
+    impl RpcStreamingHandler for TwoChunkHandler {
+        async fn call(
+            &self,
+            _ctx: RpcContext,
+            sink: RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            sink.send(bytes::Bytes::from_static(b"a"));
+            sink.send(bytes::Bytes::from_static(b"b"));
+            Ok(())
+        }
+    }
+
+    fn is_continue_chunk(resp: &RpcResponsePayload) -> bool {
+        resp.headers.iter().any(|(n, v)| {
+            n == HEADER_NRPC_STREAMING && v.as_slice() == HEADER_NRPC_STREAMING_CONTINUE
+        })
+    }
+
+    /// One supervised call's wiring: a duplex record (input half open),
+    /// the flow semaphore, the producer gate, and a registration with no
+    /// registry backing (the record-level §2.6 semantics under test).
+    fn supervised_call_harness(
+        flow_permits: usize,
+    ) -> (
+        Arc<Mutex<StreamCallRecord>>,
+        Arc<tokio::sync::Semaphore>,
+        Arc<StreamProducerGate>,
+        StreamCallRegistration,
+    ) {
+        let record = Arc::new(Mutex::new(StreamCallRecord::new_duplex()));
+        let flow_sem = Arc::new(tokio::sync::Semaphore::new(flow_permits));
+        let gate = Arc::new(StreamProducerGate::new());
+        let registration = StreamCallRegistration {
+            key: (0xA, 0x51, 0xD1A9, 0xC0FFEE),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            flow_control: None,
+            protected: ProtectedStreamOwners::new(),
+            registry: None,
+            senders: None,
+        };
+        (record, flow_sem, gate, registration)
+    }
+
+    fn supervised_context() -> RpcContext {
+        RpcContext {
+            caller_origin: 0xD1A9,
+            session_peer: 0xA,
+            call_id: 0xC0FFEE,
+            payload: RpcRequestPayload {
+                service: "echo.v1".to_string(),
+                deadline_ns: 0,
+                flags: 0,
+                headers: vec![],
+                body: bytes::Bytes::new(),
+            },
+            cancellation: RpcCancellationToken::new(),
+            trace_context: None,
+            org_admission: None,
+        }
+    }
+
+    /// CORE-1 (mirror of `behavior/org_stream_lifecycle.rs`'s witness) —
+    /// a pump exit must not shadow a completed handler into `PumpFailed`
+    /// (wire 0x0006). The sink is held OUTSIDE the handler future (a
+    /// detached sink): its drop closes the queue and DRIVES THE PUMP
+    /// EXIT with the handler already complete (its result deposit landed
+    /// after its last poll). The outcome is the handler's `Completed(Ok)`.
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_pump_exit_never_shadows_a_completed_handler() {
+        let (emit, _captured) = capturing_async_emitter();
+        let (record, flow_sem, gate, registration) = supervised_call_harness(8);
+        let held: Arc<Mutex<Option<RpcResponseSink>>> = Arc::new(Mutex::new(None));
+        let handler = SupervisedHandler::ServerStreaming(
+            Arc::new(DetachSinkHandler {
+                held: Arc::clone(&held),
+            }),
+            supervised_context(),
+        );
+
+        let sup = tokio::spawn(run_stream_call_supervisor(
+            Arc::clone(&record),
+            handler,
+            None,
+            Some(flow_sem),
+            Some(Arc::clone(&gate)),
+            None,
+            None,
+            false,
+            emit,
+            (0xA, 0xD1A9, 0xC0FFEE),
+            registration,
+        ));
+
+        // The supervisor parks in its `select!` with the handler still
+        // pending (its first poll).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // The detached sink vanishes: the queue closes and the pump
+        // exits, racing the handler's late deposit.
+        held.lock().take();
+        let done = tokio::time::timeout(Duration::from_secs(5), sup)
+            .await
+            .expect("the call ends at the pump exit, not the deadline")
+            .expect("no panic");
+        let _ = done;
+        assert_eq!(
+            record.lock().terminal_reason(),
+            Some(StreamTerminalReason::Completed(StreamHandlerResult::Ok)),
+            "the handler was complete; a pump exit may not shadow it into PumpFailed",
+        );
+    }
+
+    /// CORE-2 (mirror) — ZERO chunks publish after a retirement terminal
+    /// commits: an in-flight chunk (the pump has taken it and parked on
+    /// flow credit) and a queued chunk at retire time are discarded at
+    /// the publish barrier, never emitted.
+    #[tokio::test(start_paused = true)]
+    async fn no_chunk_publishes_after_a_retirement_terminal_commits() {
+        let (emit, captured) = capturing_async_emitter();
+        let (record, flow_sem, gate, registration) = supervised_call_harness(0);
+        let handler = SupervisedHandler::ServerStreaming(
+            Arc::new(TwoChunkHandler),
+            supervised_context(),
+        );
+
+        let sup = tokio::spawn(run_stream_call_supervisor(
+            Arc::clone(&record),
+            handler,
+            None,
+            Some(Arc::clone(&flow_sem)),
+            Some(gate),
+            None,
+            None,
+            false,
+            emit,
+            (0xA, 0xD1A9, 0xC0FFEE),
+            registration,
+        ));
+
+        // The handler returned; the pump holds chunk 1 (parked on zero
+        // flow credit) and chunk 2 is queued — both in flight.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // The retirement terminal commits — the same `retire(reason)` the
+        // forced path runs — while the pump is still live.
+        assert!(record.lock().retire(StreamTerminalReason::Revoked));
+        // The credit the caller never granted now arrives: the pump
+        // reaches its publish point AFTER the terminal committed.
+        flow_sem.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(5), sup)
+            .await
+            .expect("the call ends at the pump exit")
+            .expect("no panic");
+
+        assert_eq!(
+            record.lock().terminal_reason(),
+            Some(StreamTerminalReason::Revoked),
+            "the terminal is the retirement's",
+        );
+        let emitted_chunks = captured
+            .lock()
+            .iter()
+            .filter(|(_, _, r)| is_continue_chunk(r))
+            .count();
+        assert_eq!(
+            emitted_chunks, 0,
+            "ZERO chunks publish after a retirement terminal commits",
+        );
     }
 
     /// Wait until `pred` is true, polling at 10ms intervals up to

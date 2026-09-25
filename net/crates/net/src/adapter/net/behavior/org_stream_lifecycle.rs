@@ -334,8 +334,19 @@ pub enum Disposition {
     Deliver,
     /// Add the credit to the response flow semaphore.
     Credit,
-    /// Drop it: no delivery, no credit, no state change.
+    /// Drop it: no delivery and no credit. NOT "no state change" — the
+    /// first `Frame::End` half-closes the input as a side effect and
+    /// reports [`Disposition::InputEnded`] instead; this arm is the
+    /// frames whose state effect is genuinely nil (the idempotent
+    /// second END, a chunk after the input half closed, a frame after
+    /// the terminal).
     Ignored,
+    /// The first `Frame::End` half-closed the input: `input` became
+    /// `Ended`, and that state change IS the disposition — no delivery,
+    /// no credit, but the fold can see the input half just closed (the
+    /// production mirror's `end_input() == true`,
+    /// `cortex/rpc.rs`'s §2.6 record).
+    InputEnded,
     /// Begin retirement with this reason.
     Retire(TerminalReason),
 }
@@ -427,7 +438,7 @@ impl CallLifecycle {
             Frame::End => match self.input {
                 Input::Open => {
                     self.input = Input::Ended;
-                    Disposition::Ignored
+                    Disposition::InputEnded
                 }
                 // Idempotent, and never touches `output`: half-close
                 // independence.
@@ -568,8 +579,11 @@ pub struct SupervisorOutcome {
     /// The recorded control-path disposition of the terminal (exactly
     /// once). `Some(TerminalDisposition::Queued)` is NOT peer receipt.
     pub emission: Option<TerminalDisposition>,
-    /// Response items still queued when the call ended (discarded on
-    /// every retirement).
+    /// Response items discarded instead of published: still queued when
+    /// the pump's receiver died, taken off the queue but not yet
+    /// published when a retirement terminal committed (CORE-2's publish
+    /// barrier), or refused at that barrier. Every admitted-but-never-
+    /// published item lands here — never a silent drop.
     pub discarded: usize,
 }
 
@@ -693,6 +707,75 @@ pub async fn sink_send(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SinkClosed;
 
+/// One response item the pump took off the queue but has not published
+/// yet. Dropping it unpublished IS a discard (CORE-2's publish barrier
+/// refusing it, a permit acquisition that errors out, an aborted pump's
+/// parked in-hand item) and must be counted — an item may never vanish
+/// uncounted between `admitted` and `published`.
+struct InFlightItem {
+    len: Option<usize>,
+    discarded: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl InFlightItem {
+    fn new(len: usize, discarded: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self {
+            len: Some(len),
+            discarded: Arc::clone(discarded),
+        }
+    }
+
+    /// The CORE-2 publish barrier. A retirement terminal commits under
+    /// `state`'s lock (`CallLifecycle::retire` is invoked with that lock
+    /// held), so re-checking liveness AND counting the publish under the
+    /// same lock linearizes every publish before any terminal commit:
+    /// **zero items publish after a retirement terminal commits**. Once
+    /// a terminal has committed the item is a counted discard (§2.2:
+    /// every retirement discards), never a metric-only drop — and the
+    /// pump stops publishing entirely (`false`).
+    fn publish(
+        mut self,
+        state: &parking_lot::Mutex<CallLifecycle>,
+        published: &std::sync::atomic::AtomicUsize,
+    ) -> bool {
+        let live = state.lock().is_live();
+        if live {
+            self.len = None;
+            published.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        // Unarmed: `Drop` counts nothing. Still armed: `Drop` counts the
+        // discard.
+        live
+    }
+}
+
+impl Drop for InFlightItem {
+    fn drop(&mut self) {
+        if self.len.take().is_some() {
+            self.discarded
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// The pump's queue, counted on death: items still queued when the
+/// receiver dies — retirement, deadline, a producer that died mid-send —
+/// are discards (§2.2: every retirement discards), never silent drops.
+struct CountedQueue {
+    rx: mpsc::Receiver<usize>,
+    discarded: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for CountedQueue {
+    fn drop(&mut self) {
+        let left = self.rx.len();
+        if left > 0 {
+            self.discarded
+                .fetch_add(left, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 /// Run one protected call to a bounded terminal (§2.2).
 ///
 /// The supervisor stays in its `select!` after the handler returns:
@@ -714,7 +797,7 @@ pub struct SinkClosed;
 pub async fn run_supervisor(
     state: Arc<parking_lot::Mutex<CallLifecycle>>,
     handler: impl Future<Output = HandlerResult> + Send,
-    mut queued: mpsc::Receiver<usize>,
+    queued: mpsc::Receiver<usize>,
     gate: Arc<ProducerGate>,
     pump: PumpHandles,
     retire: Arc<RetireSignal>,
@@ -725,27 +808,37 @@ pub async fn run_supervisor(
     use std::sync::atomic::Ordering;
 
     let pump_published = Arc::clone(&published);
+    let discarded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pump_credit = Arc::clone(&pump.credit);
     let pump_bytes = Arc::clone(&pump.bytes);
 
     // The pump: one credit and `len` byte permits per item. Both
     // acquisitions are cancellation points — closing either semaphore is
-    // what unparks a pump the caller stopped crediting.
+    // what unparks a pump the caller stopped crediting. Every item is
+    // either published (through CORE-2's barrier) or counted discarded:
+    // `SupervisorOutcome` accounts for each admitted item exactly once.
     let pump_gate = Arc::clone(&gate);
+    let pump_state = Arc::clone(&state);
+    let pump_discarded = Arc::clone(&discarded);
     let pump_task = tokio::spawn(async move {
+        let mut queued = CountedQueue {
+            rx: queued,
+            discarded: Arc::clone(&pump_discarded),
+        };
         loop {
             // After the producer half closes, drain what is already
             // admitted and stop — never wait for another send that the
             // gate has just made impossible.
             let next = if pump_gate.is_finished() {
-                queued.try_recv().ok()
+                queued.rx.try_recv().ok()
             } else {
                 tokio::select! {
-                    item = queued.recv() => item,
+                    item = queued.rx.recv() => item,
                     () = pump_gate.woken.notified() => continue,
                 }
             };
             let Some(len) = next else { break };
+            let item = InFlightItem::new(len, &pump_discarded);
             let Ok(permit) = pump_credit.clone().acquire_owned().await else {
                 break;
             };
@@ -758,9 +851,13 @@ pub async fn run_supervisor(
                 break;
             };
             // Publishing releases the item's byte reservation: the bytes
-            // left the queue, they were not merely counted.
+            // left the queue, they were not merely counted. A barrier
+            // refusal (the terminal already committed) discards this
+            // item AND everything still queued — nothing may publish.
             drop(bytes);
-            pump_published.fetch_add(1, Ordering::SeqCst);
+            if !item.publish(&pump_state, &pump_published) {
+                break;
+            }
         }
     });
     tokio::pin!(pump_task);
@@ -768,7 +865,6 @@ pub async fn run_supervisor(
     let mut handler = std::pin::pin!(handler);
     let mut handler_done = false;
     let mut pump_done = false;
-    let mut pump_failed = false;
 
     let sleep = async {
         match deadline {
@@ -806,15 +902,36 @@ pub async fn run_supervisor(
 
             joined = &mut pump_task, if !pump_done => {
                 pump_done = true;
-                pump_failed = joined.is_err();
+                let _ = joined;
             }
         }
     };
 
+    // CORE-1 (the R4COREFIX-9 mechanism): a pump exit must not shadow a
+    // handler whose result has landed but has not been polled yet. The
+    // handler's sink sender drops at handler end, BEFORE the result
+    // deposit does (the nRPC blocking-bridge window), so the pump exit
+    // and the ready handler race exactly here — and a `pump_done` break
+    // that never re-polls the handler classifies the call `PumpFailed`
+    // (wire 0x0006) over an already-complete handler. Poll the handler
+    // ONE more time before classifying a pump exit; its result wins.
+    if forced.is_none() && !handler_done {
+        let deposited = tokio::select! {
+            biased;
+            result = &mut handler => Some(result),
+            () = std::future::ready(()) => None,
+        };
+        if let Some(result) = deposited {
+            state.lock().handler_returned(result);
+            gate.finish();
+        }
+    }
+
     // Retirement path: close both semaphores so a parked pump errors out,
     // then abort and join it. `abort` is cooperative with the scheduler,
     // so the join is what establishes "no chunk is published after the
-    // terminal" — not the abort call.
+    // terminal" — not the abort call. (CORE-2's publish barrier is the
+    // backstop for a pump that reaches its publish point anyway.)
     if let Some(reason) = forced.clone() {
         state.lock().retire(reason);
         pump.credit.close();
@@ -823,11 +940,13 @@ pub async fn run_supervisor(
             pump_task.as_mut().abort();
             let _ = pump_task.as_mut().await;
         }
-    } else if pump_failed {
-        state.lock().retire(TerminalReason::PumpFailed);
     } else {
-        // Clean pump exit: the state machine decides whether that is a
-        // completion or a producer that died under the handler.
+        // A pump exit — clean or failed — is classified by the state
+        // machine: `Completed(result)` once the handler has returned
+        // (CORE-1's re-poll above included), and `PumpFailed` only for a
+        // pump that stopped WITHOUT the handler returning (its documented
+        // meaning). A blanket `PumpFailed` here is how a pump exit
+        // shadows a completed handler.
         state.lock().pump_exited();
     }
 
@@ -858,7 +977,7 @@ pub async fn run_supervisor(
         terminal,
         published: published.load(Ordering::SeqCst),
         emission,
-        discarded: 0,
+        discarded: discarded.load(Ordering::SeqCst),
     }
 }
 
@@ -1236,7 +1355,11 @@ mod tests {
     #[test]
     fn end_is_idempotent_and_never_touches_the_output_half() {
         let mut call = dx();
-        assert_eq!(call.on_frame(Frame::End), Disposition::Ignored);
+        assert_eq!(
+            call.on_frame(Frame::End),
+            Disposition::InputEnded,
+            "the first END half-closes the input, and says so",
+        );
         assert_eq!(call.input(), Input::Ended);
         assert_eq!(*call.output(), Output::Open);
         // Second END changes nothing and does not end output.
@@ -1536,6 +1659,7 @@ mod tests {
             .expect("no panic");
         assert_eq!(out.terminal, TerminalReason::Timeout);
         assert_eq!(out.published, 0, "queued items are discarded, not drained");
+        assert_eq!(out.discarded, 1, "the discard is counted, not silent");
         assert_eq!(out.emission, Some(TerminalDisposition::Queued));
     }
 
@@ -1727,22 +1851,234 @@ mod tests {
         assert_eq!(out.published, 0);
     }
 
+    /// The R4COREFIX-9 window as a deterministic future: the handler's
+    /// result deposit lands AFTER the supervisor's last `select!` poll of
+    /// the handler — `call1` returns (dropping the sink's sender, which
+    /// ends the pump) before the `spawn_blocking` result deposit does —
+    /// and is observable only from a LATER poll. Poll by poll:
+    ///
+    /// 1. the supervisor's first `select!` poll: the deposit has not
+    ///    landed;
+    /// 2. the poll in the very evaluation whose pump arm fires (the
+    ///    dropped sink has ended the pump): still not landed;
+    /// 3. the re-poll before classification (CORE-1): landed.
+    ///
+    /// A supervisor that breaks on `pump_done` without that last poll
+    /// classifies the call `PumpFailed` (wire 0x0006) over an
+    /// already-complete handler.
+    struct DepositLandsLate {
+        polled: usize,
+    }
+
+    impl Future for DepositLandsLate {
+        type Output = HandlerResult;
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<HandlerResult> {
+            self.polled += 1;
+            if self.polled >= 3 {
+                std::task::Poll::Ready(HandlerResult::Ok)
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    /// CORE-1 — a pump exit must not shadow a completed handler into
+    /// `PumpFailed`. The sink is held OUTSIDE the handler future (a
+    /// detached sink): the handler never touches the queue, and dropping
+    /// that sink closes the queue and DRIVES THE PUMP EXIT with the
+    /// handler already complete (its result deposit landed after its
+    /// last poll). The outcome is the handler's, not `PumpFailed`.
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_exit_never_shadows_a_completed_handler_into_pump_failed() {
+        let (r, rx) = rig(CallShape::ServerStreaming, 8, 1024);
+        let detached_sink = r.tx.clone();
+
+        let sup = tokio::spawn(run_supervisor(
+            Arc::clone(&r.state),
+            DepositLandsLate { polled: 0 },
+            rx,
+            Arc::clone(&r.gate),
+            r.pump(),
+            Arc::clone(&r.retire),
+            None,
+            Arc::clone(&r.published),
+            r.ctl.clone(),
+        ));
+
+        // Let the supervisor park in its `select!` — the handler has had
+        // its first poll and is still pending.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // The detached sink vanishes: the queue closes and the pump
+        // exits, racing the handler's late deposit exactly as the
+        // blocking bridge does.
+        drop(detached_sink);
+        drop(r.tx);
+
+        let out = tokio::time::timeout(MODEL_BOUND, sup)
+            .await
+            .expect("the call ends at the pump exit, not the deadline")
+            .expect("no panic");
+        assert_eq!(
+            out.terminal,
+            TerminalReason::Completed(HandlerResult::Ok),
+            "the handler was complete; a pump exit may not shadow it into PumpFailed: {out:?}",
+        );
+    }
+
+    /// CORE-2 — an in-flight item at retire time is discarded, never
+    /// published after the terminal. Two drives of the same obligation:
+    ///
+    /// (a) the forced path (a `RetireSignal` retirement): the terminal
+    ///     commits and the pump is stopped mid-flight — the in-flight
+    ///     item and the queued item die as counted DISCARDS, never
+    ///     silent drops (`discarded` is real, CORE-3);
+    /// (b) the race the forced path's own ordering opens — its
+    ///     `retire(reason)` commits BEFORE the pump is stopped: a pump
+    ///     that is still live when the terminal commits must discard at
+    ///     the publish barrier, and ZERO items publish afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn an_in_flight_item_at_retirement_is_discarded_never_published_after_the_terminal() {
+        // (a) the forced path.
+        let (r, rx) = rig(CallShape::Duplex, 0, 1024);
+        let tx = r.tx.clone();
+        let retire = Arc::clone(&r.retire);
+        let sup = tokio::spawn(run_supervisor(
+            Arc::clone(&r.state),
+            async move {
+                tx.send(8).await.expect("queue");
+                tx.send(8).await.expect("queue");
+                // A handler that never returns: only retirement can end
+                // this call.
+                std::future::pending::<()>().await;
+                HandlerResult::Ok
+            },
+            rx,
+            Arc::clone(&r.gate),
+            r.pump(),
+            Arc::clone(&r.retire),
+            None,
+            Arc::clone(&r.published),
+            r.ctl.clone(),
+        ));
+        // The pump takes the first item and parks on zero credit; the
+        // second stays queued. Both are in flight at retirement.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        retire.fire(TerminalReason::Revoked);
+        let out = tokio::time::timeout(MODEL_BOUND, sup)
+            .await
+            .expect("the retirement bounds the call")
+            .expect("no panic");
+        assert_eq!(out.terminal, TerminalReason::Revoked);
+        assert_eq!(out.published, 0);
+        assert_eq!(
+            out.discarded, 2,
+            "the in-flight and the queued item are counted discards, not silent drops: {out:?}",
+        );
+
+        // (b) the race: the terminal commits — the same `retire(reason)`
+        //     the forced path runs — while the pump is still live with an
+        //     in-flight item and a queued item.
+        let (r, rx) = rig(CallShape::ServerStreaming, 0, 1024);
+        let tx = r.tx.clone();
+        let handler_state = Arc::clone(&r.state);
+        let handler_gate = Arc::clone(&r.gate);
+        let sup = tokio::spawn(run_supervisor(
+            Arc::clone(&r.state),
+            async move {
+                sink_send(&handler_state, &handler_gate, &tx, 1024, 8)
+                    .await
+                    .expect("admitted");
+                sink_send(&handler_state, &handler_gate, &tx, 1024, 8)
+                    .await
+                    .expect("admitted");
+                HandlerResult::Ok
+            },
+            rx,
+            Arc::clone(&r.gate),
+            r.pump(),
+            Arc::clone(&r.retire),
+            None,
+            Arc::clone(&r.published),
+            r.ctl.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            r.state.lock().retire(TerminalReason::Revoked),
+            "the terminal was still free at the retirement commit",
+        );
+        // The credit the caller never granted now arrives: the pump
+        // reaches its publish point AFTER the terminal committed.
+        r.pump.credit.add_permits(2);
+        let out = tokio::time::timeout(MODEL_BOUND, sup)
+            .await
+            .expect("the call ends at the pump exit")
+            .expect("no panic");
+        assert_eq!(
+            out.terminal,
+            TerminalReason::Revoked,
+            "the terminal is the retirement's: {out:?}",
+        );
+        assert_eq!(
+            out.published, 0,
+            "ZERO items publish after a retirement terminal commits: {out:?}",
+        );
+        assert_eq!(out.discarded, 2, "{out:?}");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_oversized_item_never_waits_for_permits_it_cannot_get() {
         // A 4 MiB item against a 1 KiB per-call budget can never acquire
-        // enough capacity; it must fail promptly rather than park.
+        // enough capacity; it must fail promptly rather than park. The
+        // witness drives the REAL admission seam — `sink_send`, the §2.7
+        // output direction — not `input_admission_failed()` directly: the
+        // named claim is about an item waiting for permits it cannot get,
+        // and only the send path can park (or refuse) there.
         let budget = 1024usize;
         let item = 4 * 1024 * 1024usize;
         assert!(
             item > budget,
             "the model's point is that this is unsatisfiable",
         );
-        let mut call = CallLifecycle::new(CallShape::ClientStreaming, 1);
+        let (r, rx) = rig(CallShape::ServerStreaming, 8, budget);
+        let tx = r.tx.clone();
+        let handler_state = Arc::clone(&r.state);
+        let handler_gate = Arc::clone(&r.gate);
+
+        let sup = tokio::spawn(run_supervisor(
+            Arc::clone(&r.state),
+            async move {
+                assert_eq!(
+                    sink_send(&handler_state, &handler_gate, &tx, budget, item).await,
+                    Err(SinkClosed),
+                    "an unsatisfiable reservation is refused promptly, not awaited",
+                );
+                HandlerResult::Ok
+            },
+            rx,
+            Arc::clone(&r.gate),
+            r.pump(),
+            Arc::clone(&r.retire),
+            None,
+            Arc::clone(&r.published),
+            r.ctl.clone(),
+        ));
+        drop(r.tx);
+
+        let out = tokio::time::timeout(MODEL_BOUND, sup)
+            .await
+            .expect("the oversized send must not park the call for permits it cannot get")
+            .expect("no panic");
         assert_eq!(
-            call.input_admission_failed(),
-            Some(TerminalReason::ResourceExhausted),
-            "an unsatisfiable reservation retires the call instead of parking",
+            out.terminal,
+            TerminalReason::ResourceExhausted,
+            "the refusal latches (§2.7): {out:?}",
         );
+        assert_eq!(out.published, 0, "nothing was admitted: {out:?}");
     }
 
     /// The plan's `protected_output_refusal_cannot_complete_ok`
