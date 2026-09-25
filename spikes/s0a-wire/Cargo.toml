@@ -49,12 +49,13 @@ snow = { version = "0.10.0", default-features = false, features = [
     "default-resolver",
     "default-resolver-crypto",
 ] }
-# Two getrandom majors are in the tree and BOTH have to be told about
+# Three getrandom majors are in the tree and ALL have to be told about
 # the browser. 0.4 is what `net` itself depends on; 0.3 and 0.2 come
 # in under `ring` / `snow` / `curve25519-dalek`. Without these lines
 # the build stops at a `compile_error!` inside getrandom 0.2 —
 # nothing in the copied Net code is wrong. See the report.
-getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom = { version = "0.4.0", features = ["wasm_js"] }
+getrandom_03 = { package = "getrandom", version = "0.3.4", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
 # Packet AEAD for wasm32. 0.11 (aead 0.6, `AeadInOut`), matching
 # `net`. Default features OFF: the default `getrandom` feature pulls

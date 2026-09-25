@@ -59,9 +59,10 @@ wasm-bindgen = "=0.2.129"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 tracing = "0.1"
-# Identity generation in the browser. 0.3 needs its own browser
-# opt-in, as S0a recorded for 0.2 and 0.4.
-getrandom = { version = "0.3", features = ["wasm_js"] }
+# Identity generation in the browser, with its own browser opt-in as
+# S0a recorded for every major. (0.3 and 0.2, pulled in through
+# snow/ring, get theirs from `net-mesh-wire`.)
+getrandom = { version = "0.4", features = ["wasm_js"] }
 # The leaf's own identity: Ed25519 for the announcement signature and
 # the `0x0D02` envelope, X25519 for the Noise static half. Same
 # majors the core resolves, so a credential minted by a native node
