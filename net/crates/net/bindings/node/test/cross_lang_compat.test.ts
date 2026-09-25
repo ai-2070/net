@@ -103,6 +103,10 @@ function handleEchoSum(req: EchoSumRequest): EchoSumResponse {
 // ---------------------------------------------------------------
 
 class LoopbackHandlerRpc implements RawMeshRpc {
+  // Type-surface stubs — `RawMeshRpc` declares the close contract; not
+  // exercised by cross-lang compat.
+  readonly isClosed = false
+  close(): void {}
   async call(_target: bigint, service: string, req: Buffer): Promise<Buffer> {
     return this.dispatch(service, req)
   }

@@ -23,7 +23,7 @@ import { describe, expect, it } from 'vitest'
 /// change and hides the one argument that matters — the explicit opt-in
 /// to a settlement backend that moves no value. Naming it once keeps the
 /// intent visible and the positional churn in one place.
-function devProvider(mesh: NetMesh, statePath: string, billingLogPath?: string) {
+function devProvider(mesh: InstanceType<typeof NetMesh>, statePath: string, billingLogPath?: string) {
   return new PaymentProvider(
     mesh,
     statePath,
