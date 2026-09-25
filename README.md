@@ -1,6 +1,11 @@
 # Net
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![CI](https://github.com/ai-2070/net/actions/workflows/ci.yml/badge.svg)](https://github.com/ai-2070/net/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/net-mesh-sdk?label=crates.io)](https://crates.io/crates/net-mesh-sdk)
+[![npm](https://img.shields.io/npm/v/@net-mesh/sdk?label=npm)](https://www.npmjs.com/package/@net-mesh/sdk)
+[![PyPI](https://img.shields.io/pypi/v/net-mesh-sdk?label=pypi)](https://pypi.org/project/net-mesh-sdk/)
+[![Go](https://pkg.go.dev/badge/github.com/ai-2070/net/go.svg)](https://pkg.go.dev/github.com/ai-2070/net/go)
 [![codecov](https://codecov.io/gh/ai-2070/net/graph/badge.svg?token=AOBMOF6LE4)](https://codecov.io/gh/ai-2070/net)
 
 **Net connects agents, services, and devices into a programmable mesh.**
