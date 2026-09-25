@@ -1,0 +1,47 @@
+spikes/s0a-wire/Cargo.toml
+  s_86305e6abc2580::t_6519604f88eb16 52,58
+net/crates/net/leaf/Cargo.toml
+  s_86305e6abc2580::t_6519604f88eb16 62-64
+net/crates/net/wire/Cargo.toml
+  s_86305e6abc2580::t_1336e6f7a6ba76 76-79,81
+net/crates/net/Cargo.lock
+  s_86305e6abc2580::t_55fda97c3af199 2054,2058,3410
+net/crates/net/examples/browser-demo/host/Cargo.lock
+  s_86305e6abc2580::t_64f7af2e3299cf 1113,1117,1670,1692,2910,2912,2917
+net/crates/net/fuzz/Cargo.lock
+  s_86305e6abc2580::t_4459db0beb6775 666,669,679,683,693,697,1148,1169-1192,1922-1931
+net/crates/net/guards/fixtures_off_probe/Cargo.lock
+  s_86305e6abc2580::t_3945496a5bf1ba 634,638,852
+net/crates/net/leaf/Cargo.lock
+  s_86305e6abc2580::t_eeeba07804c0a0 484,488,650
+net/crates/net/tests/natsim/browser/Cargo.lock
+  s_86305e6abc2580::t_8b9f18847c3139 1113,1117,1669,1691,2909,2911,2916
+net/crates/net/tests/rtc_browser/leaf/Cargo.lock
+  s_86305e6abc2580::t_f0e16c745b9d3e 394,399-411,492,601-606
+net/crates/net/tests/rtc_browser/runner/Cargo.lock
+  s_86305e6abc2580::t_948af9e0fdcc27 1113,1117,1650,1672,2919,2921,2926
+spikes/s0a-wire/Cargo.lock
+  s_86305e6abc2580::t_9c37992c17a228 392,396,633
+spikes/s0b-rtc/native/Cargo.lock
+  s_86305e6abc2580::t_b4eceff4bd38cb 739,742,1263
+spikes/s0b-rtc/web/Cargo.lock
+  s_86305e6abc2580::t_26cdafcdefd8b6 394,399-411,579-584,634
+spikes/tools/feature_consumer/Cargo.lock
+  s_86305e6abc2580::t_b27967457a7950 961,965,1251
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f5ab04a5ddb1c600834e25aa03c59cc34876861e",
+  "prompts": {},
+  "sessions": {
+    "s_86305e6abc2580": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "436bd7a3-9b87-46b4-8218-49d86e2c8412",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
