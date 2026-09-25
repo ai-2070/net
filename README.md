@@ -17,6 +17,7 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 - **Proximity graphs.** Each peer keeps a latency-weighted map of the mesh and can route to the nearest capable node.
 - **Drop instead of queue.** Buffers are fixed-size, so load is dropped rather than queued or blocked; a node that can't keep up goes quiet and the mesh routes around it.
 - **End-to-end encrypted forwarding.** Relays forward ciphertext they cannot read — there is no trusted middle.
+- **Reachable through NATs.** Nodes try a direct path first and fall back to a relay; a browser tab joins as a full node over WebRTC.
 - **Latency-first.** Transport, routing, and placement all prefer the fastest path available.
 
 **What that gives you**
@@ -25,6 +26,10 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 - **Identity outlives a path.** A node is its keypair; addresses and routes change underneath it.
 - **Work runs where the resource lives.** A credential never leaves the machine that holds it; the caller invokes a capability, not a host.
 - **One identity, several authority planes.** Permission tokens and organization grants decide who may reach a capability; subnet membership comes from a node's published tags.
+
+**Status:** pre-1.0 (`0.36.0`). Minor releases may break APIs — pin a minor and read the
+[release notes](https://ai2070.net/docs/releases). The wire format is versioned separately, and
+subprotocol IDs are permanent.
 
 ## Install
 
@@ -42,6 +47,29 @@ Published names and source imports differ on purpose: the crates/registries use
 `from net_sdk import ...`. Lower-level bindings that skip the SDK ergonomics are in
 [SDKs](#sdks). Full per-language setup:
 [Install](https://ai2070.net/docs/start/install), [Quickstart](https://ai2070.net/docs/start/quickstart).
+
+## Hello, mesh
+
+Start a node and put one event on it.
+
+```rust
+use net_sdk::Net;
+
+let node = Net::builder().shards(4).memory().build().await?;
+node.emit(&Hello { msg: "hello, mesh".into() })?;   // a receipt, or an error
+```
+
+```typescript
+import { NetNode } from '@net-mesh/sdk';
+
+const node = await NetNode.create({ shards: 4 });
+node.emit({ msg: 'hello, mesh' });
+await node.shutdown();   // explicit — Node finalizers are not deterministic
+```
+
+The memory adapter accepts and counts events; it does not retain them, so a subscriber would never
+yield. For a round trip, run two nodes over the mesh transport — see
+[Event bus](https://ai2070.net/docs/guides/event-bus).
 
 ## Setting up your own mesh
 
@@ -194,7 +222,9 @@ The performance story — what is fast, and what the numbers do and do not inclu
 Net's unit is a **capability offered by a provider, together with the authority and live state
 needed to use it**. Other systems organize distributed work around different objects — HTTP
 around an endpoint, MCP around a tool a configured host may call, NATS around a subject, Zenoh
-around a key expression. Net addresses capabilities under identity and authority.
+around a key expression. Net addresses capabilities under identity and authority — so it looks
+like a message broker from the outside and is not one underneath, and code written from API
+familiarity runs and is quietly wrong.
 
 That makes it a substrate beneath applications, not a replacement for their workflows or business
 model: a workspace, fleet console, agent runtime, or industrial application can use Net and keep
@@ -219,13 +249,18 @@ The rest of the surface, one line each; every entry links to the page that goes 
 | Subnets | Boundaries derived from capability tags, enforced at the channel — not VLANs | [Subnets](https://ai2070.net/docs/concepts/subnets) |
 | Subprotocols | Opaque forwarding, version negotiation, a protocol runtime not a fixed protocol | [Subprotocol IDs](https://ai2070.net/docs/reference/subprotocol-ids) |
 | RedEX & CortEX | Durable append-only logs, and the folded state built on them | [Storage stack](https://ai2070.net/docs/concepts/storage-stack), [Durable logs](https://ai2070.net/docs/guides/durable-logs), [Folds](https://ai2070.net/docs/guides/cortex-folds) |
+| MeshDB | Federated queries across nodes over the same facade | [Federated queries](https://ai2070.net/docs/guides/netdb-queries#federated-queries-meshdb) |
 | MeshOS | Long-running stateful daemons, placement and lifecycle | [Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement) |
 | Scheduler | Atomic gang-claim of a contended resource, with a task lifecycle on top | [Gang scheduler](https://ai2070.net/docs/guides/gang-scheduler), [Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle) |
 | CLI | `net-mesh` — managed nodes, join links, capability hosting, typegen, local stores | [CLI reference](https://ai2070.net/docs/reference/cli) |
 | Deck TUI | Operator TUI over the substrate | [Deck](https://ai2070.net/docs/reference/deck) |
 | A2A | Hand a long job to an agent that doesn't share your memory | [Agent to agent](https://ai2070.net/docs/guides/agent-to-agent) |
+| Delegation | Child seeds and revocation for delegated identity | [Agent identity](https://ai2070.net/docs/concepts/agent-identity) |
 | Payments | x402 pricing, quotes, settlement, spend policy — signed facts around a call | [Net payments](https://ai2070.net/docs/payments/what-net-payments-is) |
 | MCP bridge | Wrap a stdio MCP server into mesh capabilities, or serve the mesh as MCP | [Wrap MCP](https://ai2070.net/docs/guides/wrap-mcp-server), [Expose as MCP](https://ai2070.net/docs/guides/expose-net-as-mcp) |
+| Transports | Direct paths first, a blind relay as the fallback, WebRTC for browser leaves | [NAT and traversal](https://ai2070.net/docs/guides/nat-and-traversal), [WebRTC transport](https://ai2070.net/docs/concepts/webrtc-transport) |
+| Continuity | A daemon moves with its history when the hardware under it changes | [Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration) |
+| Security | No plaintext on relays, no clock dependency, no trusted intermediary | [Security model](https://ai2070.net/docs/concepts/security-model) |
 
 ## Performance
 
