@@ -352,6 +352,10 @@ export class OrgStream implements OrgByteStream, OrgCallHandle {
     this.waiters.push(waiter);
     void this.inner.next().then(
       (raw) => {
+        // BROWSER-4: this pull's waiter leaves the list the moment the
+        // pull settles — a completed pull retains nothing to the
+        // terminal.
+        spliceWaiter(this.waiters, waiter);
         const item = byteItem(raw);
         if (item.done) this.complete(item);
         // With-resolvers settlement is first-wins, so a pull a
@@ -366,7 +370,12 @@ export class OrgStream implements OrgByteStream, OrgCallHandle {
         // is the §4.3 terminal set, and inventing a translation for
         // a throw this package cannot name is how a taxonomy turns
         // into guessing.
-        this.fail(fromWasmError(error));
+        spliceWaiter(this.waiters, waiter);
+        const failure = fromWasmError(error);
+        // `fail` settles every still-parked pull and latches the
+        // failure for the next one; this pull settles itself.
+        this.fail(failure);
+        reject(failure);
       },
     );
     return promise;
@@ -387,16 +396,26 @@ export class OrgStream implements OrgByteStream, OrgCallHandle {
   }
 
   [Symbol.asyncIterator](): AsyncIterator<Uint8Array> {
+    // A terminal's final body is yielded BEFORE the end (BROWSER-1):
+    // one done item carrying bytes is one yield plus one end, so the
+    // end is this iterator's own latch, not the item's `done`.
+    let ended = false;
     return {
       next: async () => {
+        if (ended) return { done: true, value: undefined };
         const item = await this.next();
         // THROWS the typed error at the terminal error item — the
         // idiomatic `for await` shape, so `catch` sees the §4.3 class.
         if (item.error !== undefined) throw item.error;
-        if (item.done || item.value === undefined) return { done: true, value: undefined };
+        if (item.value === undefined) {
+          ended = true;
+          return { done: true, value: undefined };
+        }
+        if (item.done) ended = true;
         return { done: false, value: item.value };
       },
       return: async () => {
+        ended = true;
         this.cancel();
         return { done: true, value: undefined };
       },
@@ -456,13 +475,16 @@ export class OrgUpload implements OrgUploadCall, OrgCallHandle {
   finish(): Promise<Uint8Array> {
     if (this.failure !== null) return Promise.reject(this.failure);
     const { promise, resolve, reject } = Promise.withResolvers<Uint8Array>();
-    this.waiters.push({ reject });
+    const waiter = { reject };
+    this.waiters.push(waiter);
     void this.inner.finish().then(
       (body) => {
+        spliceWaiter(this.waiters, waiter);
         this.onDone?.();
         resolve(body);
       },
       (error: unknown) => {
+        spliceWaiter(this.waiters, waiter);
         this.onDone?.();
         // finish() rejects with the typed terminal error (§4.3).
         reject(fromWasmError(error));
@@ -629,12 +651,14 @@ export class OrgRequests implements OrgRequestStream {
     this.waiters.push(resolve);
     void this.inner.next().then(
       (raw: LeafWasmOrgRequestItem) => {
+        spliceWaiter(this.waiters, resolve);
         resolve(requestItem(raw));
       },
       () => {
         // A boundary throw here ends the iteration: the request
         // direction is over one way or the other, and `retired` is
         // where a handler reads which.
+        spliceWaiter(this.waiters, resolve);
         resolve({ done: true });
       },
     );
@@ -794,10 +818,22 @@ export function duplexOrgTrampoline(handler: OrgDuplexHandler): LeafWasmOrgDuple
   };
 }
 
+/**
+ * One waiter leaves its list the moment its pull settles (BROWSER-4):
+ * a resolved pull retains no closure until the terminal.
+ */
+function spliceWaiter<T>(waiters: T[], waiter: T): void {
+  const index = waiters.indexOf(waiter);
+  if (index >= 0) waiters.splice(index, 1);
+}
+
 /** The boundary's byte item, typed through the §4.3 vocabulary. */
 function byteItem(raw: LeafWasmOrgByteItem): ByteItemOut {
   if (!raw.done) return { done: false, value: raw.value };
-  return raw.error === undefined ? { done: true } : { done: true, error: orgTerminalError(raw.error) };
+  if (raw.error !== undefined) return { done: true, error: orgTerminalError(raw.error) };
+  // A terminal that carries a final body keeps it (BROWSER-1): the
+  // item is `{ done: true, value }`, never a flattened end.
+  return raw.value === undefined ? { done: true } : { done: true, value: raw.value };
 }
 
 /** The boundary's request item: no error arm, by contract. */

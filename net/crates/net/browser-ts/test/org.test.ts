@@ -57,6 +57,7 @@ import {
 import type { FakeNodeBehaviour } from './fake-wasm.js';
 import { FakeSession, fakeSessionModule } from './fake-leader-wasm.js';
 import type { FakeSessionBehaviour } from './fake-leader-wasm.js';
+import { ORG_END_ITEMS, orgCompletionBody, orgEndItem } from './leaf-abi.js';
 
 const BASE = {
   credentialB64: 'Y3JlZA==',
@@ -634,5 +635,91 @@ describe('the contract surface', () => {
     expect('proofTtlSecs' in minimal.credentials).toBe(false);
     expect('deadlineMs' in minimal).toBe(false);
     expect('streamWindowInitial' in minimal).toBe(false);
+  });
+});
+
+describe('the terminal final body at the browser seam (BROWSER-1)', () => {
+  /** Every pinned completion frame that carries a non-empty final body. */
+  const WITH_BODY = ORG_END_ITEMS.filter((vector) => vector.bodyHex.length > 0);
+
+  it('the fixture pins the done shape the doubles must speak', () => {
+    expect(WITH_BODY.length).toBeGreaterThan(0);
+    for (const vector of ORG_END_ITEMS) {
+      expect(Object.keys(orgEndItem(vector)), vector.note).toEqual([...vector.itemKeys]);
+      // The completion frame really carries the body the seam must
+      // surface — Rust-encoded bytes, not this package's belief.
+      expect(orgCompletionBody(vector), vector.note).toEqual(orgEndItem(vector).value ?? new Uint8Array(0));
+    }
+  });
+
+  it('byteItem surfaces the final body on the done item', async () => {
+    for (const vector of WITH_BODY) {
+      const fake = new FakeOrgByteStreamHandle();
+      const stream = new OrgStream(fake, () => fake.cancel());
+      fake.deliver(orgEndItem(vector));
+      const item = await stream.next();
+      expect(item.done, vector.note).toBe(true);
+      expect(item.error, vector.note).toBeUndefined();
+      expect(item.value, vector.note).toEqual(orgCompletionBody(vector));
+    }
+  });
+
+  it('the async iterator yields the final body before ending', async () => {
+    for (const vector of WITH_BODY) {
+      const fake = new FakeOrgByteStreamHandle();
+      const stream = new OrgStream(fake, () => fake.cancel());
+      fake.deliver(orgEndItem(vector));
+      const seen: Uint8Array[] = [];
+      for await (const payload of stream) seen.push(payload);
+      expect(seen, vector.note).toEqual([orgCompletionBody(vector)]);
+    }
+  });
+});
+
+describe('pull-waiter retention (BROWSER-4)', () => {
+  /**
+   * Retention is memory-only — a resolved pull's closure is invisible
+   * on the public surface — so the assertion reads the waiters list
+   * itself: a pull keeps nothing parked once it settles.
+   */
+  function retainedWaiters(handle: object): number {
+    // Plain at runtime despite `private` in source. `in` narrows
+    // without asserting a shape — and a handle without the list fails
+    // loudly rather than counting zero.
+    if (!('waiters' in handle) || !Array.isArray(handle.waiters)) {
+      throw new Error('no waiters list to inspect');
+    }
+    return handle.waiters.length;
+  }
+
+  it('OrgStream retains no waiter once a pull resolves', async () => {
+    const fake = new FakeOrgByteStreamHandle();
+    const stream = new OrgStream(fake, () => fake.cancel());
+    const parked = stream.next();
+    fake.deliver({ done: false, value: new Uint8Array([1]) });
+    await parked;
+    expect(retainedWaiters(stream)).toBe(0);
+    const last = stream.next();
+    fake.deliver(orgEndItem(ORG_END_ITEMS[0]!));
+    await last;
+    expect(retainedWaiters(stream)).toBe(0);
+  });
+
+  it('OrgUpload retains no waiter once finish settles', async () => {
+    const fake = new FakeOrgUploadCallHandle();
+    const upload = new OrgUpload(fake);
+    const parked = upload.finish();
+    fake.complete(new Uint8Array([7]));
+    await parked;
+    expect(retainedWaiters(upload)).toBe(0);
+  });
+
+  it('OrgRequests retains no waiter once its pull resolves', async () => {
+    const handle = new FakeOrgRequestStreamHandle();
+    const requests = new OrgRequests(handle);
+    const parked = requests.next();
+    handle.deliver({ done: false, value: new Uint8Array([1]) });
+    await parked;
+    expect(retainedWaiters(requests)).toBe(0);
   });
 });

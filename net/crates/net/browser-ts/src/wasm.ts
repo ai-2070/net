@@ -269,10 +269,17 @@ export interface LeafWasmOrgTerminalError {
   deadlineMs?: number;
 }
 
-/** What `OrgByteStreamHandle.next()` resolves. */
+/**
+ * What `OrgByteStreamHandle.next()` resolves — the leaf's three item
+ * objects (`org_stream_item` / `org_stream_end` /
+ * `org_stream_end_value` / `org_stream_end_error` in
+ * `leaf/src/wasm.rs`), verbatim. The `done` arm carries `value` when
+ * the terminal carries a final body (the completion frame's non-empty
+ * body): `{ done: true, value }`, never both `value` and `error`.
+ */
 export type LeafWasmOrgByteItem =
   | { done: false; value: Uint8Array }
-  | { done: true; value?: undefined; error?: LeafWasmOrgTerminalError };
+  | { done: true; value?: Uint8Array; error?: LeafWasmOrgTerminalError };
 
 /**
  * What `OrgRequestStreamHandle.next()` resolves. No error arm: a

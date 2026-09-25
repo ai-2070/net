@@ -18,8 +18,10 @@
  */
 
 import fixture from './fixtures/leaf-abi.json';
+import orgFixture from './fixtures/org-abi.json';
 
 import { toBase64 } from '../src/events.js';
+import type { LeafWasmOrgByteItem } from '../src/wasm.js';
 
 /** One vector from `test/fixtures/leaf-abi.json`. */
 export interface StreamDataVector {
@@ -42,13 +44,18 @@ export interface StreamDataVector {
 /** Every pinned `stream_data` event, generated from Rust. */
 export const STREAM_DATA_VECTORS: readonly StreamDataVector[] = fixture.streamData;
 
-/** A vector's payload as the bytes a consumer must end up with. */
-export function vectorPayload(vector: StreamDataVector): Uint8Array {
-  const out = new Uint8Array(vector.payloadHex.length / 2);
+/** Hex, as the bytes a consumer must end up with. */
+function hexBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i += 1) {
-    out[i] = Number.parseInt(vector.payloadHex.slice(i * 2, i * 2 + 2), 16);
+    out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
   }
   return out;
+}
+
+/** A vector's payload as the bytes a consumer must end up with. */
+export function vectorPayload(vector: StreamDataVector): Uint8Array {
+  return hexBytes(vector.payloadHex);
 }
 
 /** The identifying fields of one `stream_data` event. */
@@ -96,3 +103,55 @@ export function streamDataEvent(fields: StreamDataFields): string {
  */
 export const NODE_CLOSED_REFUSAL =
   "session: the node is closed: it no longer holds this origin's identity";
+
+// ── The org byte-stream terminal items ──────────────────────────────────
+//
+// The second half of the same pin: what `OrgByteStreamHandle.next()`
+// resolves at the end of a stream. `fixtures/org-abi.json` is the
+// Rust-generated fixture — `frameHex` is `RpcResponsePayload::encode_into`'s
+// exact output for a completion frame carrying `bodyHex`, and `itemKeys` are
+// the property names `org_stream_end_value`/`org_stream_end` set on the item
+// object in `leaf/src/wasm.rs`, extracted from that source. A double that
+// invents the done shape — or drops the terminal's final body — disagrees
+// with the fixture instead of with whatever this package believes.
+
+/** One vector from `test/fixtures/org-abi.json`. */
+export interface OrgEndItemVector {
+  readonly note: string;
+  /** The completion frame's exact wire bytes, hex. */
+  readonly frameHex: string;
+  /** The terminal's final body — what the seam must surface, hex. */
+  readonly bodyHex: string;
+  /** The item object's property names, in the leaf's construction order. */
+  readonly itemKeys: readonly string[];
+}
+
+/** Every pinned org stream end item, generated from Rust. */
+export const ORG_END_ITEMS: readonly OrgEndItemVector[] = orgFixture.endItems;
+
+/**
+ * The `{ done: true }` / `{ done: true, value }` item the leaf hands
+ * `OrgByteStreamHandle.next()` for one pinned completion frame — the
+ * fixture's shape assembled, never a double's own invention.
+ */
+export function orgEndItem(vector: OrgEndItemVector): LeafWasmOrgByteItem {
+  const body = hexBytes(vector.bodyHex);
+  return body.length === 0 ? { done: true } : { done: true, value: body };
+}
+
+/**
+ * The terminal body decoded back out of a vector's `frameHex` — the
+ * completion frame's `status u16le ‖ headers ‖ body_len u32le ‖ body`
+ * at `RpcResponsePayload`, so a pin can prove the frame carries the
+ * bytes the seam surfaces. Header-free `Ok` frames only.
+ */
+export function orgCompletionBody(vector: OrgEndItemVector): Uint8Array {
+  const frame = hexBytes(vector.frameHex);
+  const status = frame[0]! | (frame[1]! << 8);
+  const headerCount = frame[2]!;
+  const length = (frame[3]! | (frame[4]! << 8) | (frame[5]! << 16) | (frame[6]! << 24)) >>> 0;
+  if (status !== 0 || headerCount !== 0 || frame.length - 7 !== length) {
+    throw new Error(`the fixture frame is not a header-free Ok completion: ${vector.note}`);
+  }
+  return frame.slice(7);
+}

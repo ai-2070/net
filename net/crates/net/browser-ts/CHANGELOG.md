@@ -96,6 +96,13 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Changed
 
+- **A stream terminal's final body is no longer dropped.** A completion
+  frame carrying a non-empty final body now surfaces as
+  `{ done: true, value }` from `next()` — the done item's `value` is
+  `Uint8Array | undefined` — and `for await` yields those bytes before
+  the loop ends. Previously the value was silently discarded at the
+  seam, so a provider's final bytes never reached the page.
+
 - **A peer session is not usable the instant a handshake completes.**
   A node that receives an inbound peer establishment now attributes it
   only after the initiator's signed establishment proof verifies
