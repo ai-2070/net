@@ -764,7 +764,7 @@ repair still running when this ledger was written.
 |---|---|---|---|
 | WIRE-1 | FIXED | `31fab08d7` | one atomic carrying-incarnation snapshot; stale incarnation refused `AuthorityChanged` before any record exists; `session_generation` armed |
 | SDK-1 | FIXED | `31fab08d7` | `classify_stream_terminal`: one deterministic variant per retirement cause; `map_rpc_error` stays a typed pass-through (genuine remote 0x0003/0x0005 remain `ServerError`) |
-| SDK-2 | FIXED | `31fab08d7` | `cancel_locally` delivers the typed cancellation terminal; SS/DX folds end `Err(Cancelled)`, CS `finish` classifies cancelled. **Follow-up in flight** (regression the python retirement-observable cell caught): consuming the synthesized terminal must still fire the wire CANCEL — `clean_close` latched it away on the DX and CS twins |
+| SDK-2 | FIXED | `31fab08d7` | `cancel_locally` delivers the typed cancellation terminal; SS/DX folds end `Err(Cancelled)`, CS `finish` classifies cancelled. **Follow-up landed** in `343211be5` (regression the python retirement-observable cell caught): consuming the synthesized terminal now leaves the Drop's wire CANCEL armed — `clean_close`/`Done` latch only server-issued terminals |
 | LEAF-1 | FIXED | `0ccdd7bf1` | the latch is the single over-poll answer; `cancel()` latches `Retired{Cancelled}` |
 | LEAF-2 (+ core twin) | FIXED | `e48851321` | `ReplayState::retarget` moves quota across the expired overwrite; `external_total` saturates; identical at both sites |
 | BROWSER-1 | FIXED | `70503b7df`, `e7eb3cff9` | done-arm `value` surfaced at `byteItem` and before iterator end; Rust-generated `org-abi.json` fixture pin |
@@ -780,7 +780,7 @@ repair still running when this ledger was written.
 | FFI-1 | FIXED | `bb506e4bf` | header + Go texts state the deliberate exact-equality ABI contract |
 | LEAF-8, LEAF-9, LEAF-10, LEAF-11, LEAF-21, LEAF-22 | FIXED | `2af0c4ee5` | failure limiter wired (throttle before the verify CPU); grants pace per consumed chunk unboundedly; retention projection rounds past the horizon so it strictly dominates acceptance; second single-response send typed `Closed`; one terminal per call_id — widened to EVERY live-key refusal; wrong-flags map `ShapeMismatch` like core |
 | NODE-1..5 | FIXED | `5c78e5218` | typed-cancel pin (contract update); undecodable 0x0009 → `AdmissionDenied(Denied)` at every seam; `JsHandleRelease` drop-guard across six bridges + live witness; manifest fields declared; the S4 gate keys on real exports (all nine witnesses run on a plain build+test) |
-| PY-1, PY-2 | FIXED | in tree (commit landing) | stale-wheel gate reachable and per-name — a stale wheel fails loudly, never skips; nRPC sync bridges retain the sink holder until the handler future resolves (the SS cell reddens the 0x0006 misfile; the DX cell is masked by the fold's join ordering, noted) |
+| PY-1, PY-2 | FIXED | `4668c3ae0` | stale-wheel gate reachable and per-name — a stale wheel fails loudly, never skips; nRPC sync bridges retain the sink holder until the handler future resolves (the SS cell reddens the 0x0006 misfile; the DX cell is masked by the fold's join ordering, noted) |
 | BROWSER-2, VEC-8, VEC-9, §11 drift | FIXED | `a9178e580` | every `sink_error` closed-refusal text re-types into `OrgStreamError`; `parseOrgError` classifies the full frozen kind set; fixtures regenerated at their source (`samples()`), 130 rows; generator comment corrected; layout metadata derived/checked |
 | BROWSER-5, BROWSER-6, BROWSER-7 | FIXED | `9da2d2405` | read-loop timer race gone (red proof: the dropped `sd-1` item); the backpressure witness exhausts a window and asserts a real park; stale caveat removed — real-Chromium org stage 38/38 |
 | LEAF-7, LEAF-17, LEAF-18, LEAF-19 | FIXED | `9a8fc891b` | step-level denial matrix (21 new witnesses), parameterized scope/rights arms, digest header-order/value/deadline binding, lower-floor + replay-capacity asserts |
@@ -789,11 +789,11 @@ repair still running when this ledger was written.
 | LEAF-15 | FIXED | in tree | the refusal witness pins the typed variant, not prose; the message reflect reads the real error object (receipt comments in `wasm_leader.rs`) |
 | TESTS-1..7 | FIXED | `dfe53978c`, `cb23b89f9`, `0d0c9b892`, `d9e4107f8` | frozen-chain admit/deny halves, extraction-hash provenance, `[[test]]` feature gates (both targets), bounded cross-process harness, measured marker count, MANIFEST↔probe binding + an executed behavioral claim |
 | CI-1, CI-2, CI-3 | FIXED | `ee3ad9117`, `0d0c9b892` | pins count reality (rosters catch up with the estate), `org_scoped_cross_process` pinned `retries = 0`, floor comment corrected |
-| VEC-1..7, VEC-10 | IN FLIGHT | — | narrowed-ID rule parity across Go/Node/Python, unary wire triple pins, mixed_pair watchdog + bounded reads + probe signatures |
+| VEC-1..7, VEC-10 | FIXED | `4bbb9bf3c`, `2f7a48699` | narrowed-ID rule parity across Go/Node/Python, unary wire triple pins, mixed_pair watchdog + bounded reads + probe signatures |
 | PY-3, DOCS-5, LEAF-23 | FIXED | `239dea825`, `093be643a`, `7c4de170c` | receipt artifacts and raw probe dumps deleted; the org-feed URL is no longer logged at bind |
 | Owner Q3 (litter) | DONE | `888178cbe`, `cf292137d` | stage BRIEFs moved under `docs/internal/spikes/org-streaming/`, citations updated |
 | §12 `start()` statement | DONE | `3f278d74a` | release-notes known-limitation statement (incl. the pyo3 `NetMesh.start()` half and the §14 cross-org floor fail-open) |
-| Integration verification | IN FLIGHT | — | pre-push checklist run from a verify worktree (`org-nrpc-merge-2-verify`) |
+| Integration verification | DONE | `4d0db7724`, `e857e8fd1` | check --workspace --all-targets; clippy default/no-default/all-features lib+bins + all-targets (CI `-A` set) + `net-mesh-sdk` + leaf; rustdoc root + sdk (`-D warnings`); fmt per-file (host `cargo fmt --all` broken: os error 206); full go suite `ok 143s` (debug cdylib); `npm run check` green. The pass also fixed an `expect` in the fixtures seam, `let_unit_value` ×2 + a private intra-doc link in `cortex/rpc.rs`, ~700 lines of fmt drift, and the TESTS-7 twin target gate |
 
 **Contract updates made deliberately** (owner Q1; each keeps its scenario and
 re-pins only the observable): the four cancel pins in
