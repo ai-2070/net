@@ -1818,11 +1818,18 @@ jobs:
 
           # Protected server-streaming
           # (binary tests/org_rpc_streaming.rs). Floor = the count the binary
-          # reports at the pinned head (41: the 30-roster
-          # preserved verbatim + 11 CS/DX + duplex-flow + half-close
-          # witnesses). Raised with each slice that lands witnesses;
-          # REQUIRED names extended in the same commit as the witnesses.
-          run_binary org_rpc_streaming 42 \
+          # reports at the pinned head (51, RE-DERIVED from the binary's real
+          # test list — the old comment decomposed to 41 against a pin of 42,
+          # and a wrong re-derivation baseline invites lowering the floor):
+          # the 42-witness S1.2–S1.5 estate = the 30-roster preserved verbatim
+          # + 12 CS/DX, duplex-flow and half-close witnesses; plus the 7
+          # wave-1–3 repair witnesses (WIRE-1's displaced-carrier refusal,
+          # SDK-2's three token-cancel terminals, SDK-3's three typed deadline
+          # retirements) and the 2 frozen-chain witnesses (TESTS-1's unary
+          # admission half of §1.4, TESTS-4's extraction-hash recomputation).
+          # Every witness is name-pinned below; a new one joins the roster AND
+          # this count in its own commit.
+          run_binary org_rpc_streaming 51 \
             stream_opening_admits_same_org \
             stream_opening_admits_cross_org \
             unary_context_proof_is_binding_invalid_on_stream_registration \
@@ -1864,7 +1871,16 @@ jobs:
             retire_unblocks_both_directions \
             upload_end_then_remaining_output_completes \
             wrong_session_grant_does_not_release_credit \
-            early_handler_return_refuses_late_input_without_resource_exhausted || exit 1
+            early_handler_return_refuses_late_input_without_resource_exhausted \
+            displaced_carrier_opening_is_refused_and_leaks_no_registry_record \
+            token_cancel_on_live_server_stream_is_a_terminal_error_never_clean_eof \
+            token_cancel_on_live_duplex_is_a_terminal_error_never_clean_eof \
+            token_cancel_classifies_client_stream_finish_as_cancelled_not_transport \
+            server_stream_deadline_retirement_is_typed_timeout_not_server_error \
+            duplex_deadline_retirement_is_typed_timeout_not_server_error \
+            client_stream_deadline_retirement_is_typed_timeout_not_server_error \
+            frozen_old_provider_admits_a_well_formed_unary \
+            every_vendored_body_window_recomputes_to_its_recorded_extraction_sha256 || exit 1
 
       # === The fixtures-off DARKNESS probe (external consumer) =============
       # No test inside this workspace can observe a fixtures-off build of the
@@ -1938,7 +1954,7 @@ jobs:
       # and exhaustively match the surface.
       #
       # Unlike the fixtures-off probe above it has no negative leg to
-      # classify - both commands are positive, and they run in this order on
+      # classify - every command is positive, and they run in this order on
       # purpose:
       #
       #   * `cargo metadata --locked` FIRST. The probe resolves independently
@@ -1951,6 +1967,9 @@ jobs:
       #     it will stop compiling - that failure IS the named source break,
       #     and `guards/org_api_probe` is updated in the same commit, which
       #     is exactly the review signal the ledger asks for.
+      #   * `cargo test --locked` must RUN (TESTS-5/TESTS-6): the probe's
+      #     behavioral claim and its MANIFEST binding are `#[test]`s now, and
+      #     a claim that executes nowhere is not a claim.
       - name: Organizations — external org/streaming API probe
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/guards/org_api_probe
@@ -1979,6 +1998,25 @@ jobs:
                  consumer." "$probe"
           fi
           echo "external consumer compiles: org + typed-streaming API pinned"
+
+          # TESTS-6: EXECUTED, not merely compiled. The `cargo check` leg
+          # proves the pins type-check; the probe's `#[test]`s RUN its body
+          # (the ledger C1/Q2 behavioral claim — `RpcStreamingContext::new`
+          # fabricates no admitted org facts, previously an `assert!` sealed
+          # inside a `main` this workflow never invoked) and bind `MANIFEST`
+          # to the pins in `main.rs` in both directions, with a pin-count
+          # floor (TESTS-5). `cargo test` builds the same target set as
+          # `cargo check`, so this leg adds execution, no second compile of
+          # the probe's own sources.
+          tests=""
+          if ! tests=$(cargo test --locked --message-format short 2>&1); then
+            die "the org/streaming API probe's tests failed: either its runtime \
+                 claim (the RpcStreamingContext constructor fabricates no \
+                 admitted org facts) is false, or MANIFEST drifted from the \
+                 pins in src/main.rs (the binding check or its pin-count \
+                 floor)." "$tests"
+          fi
+          echo "external consumer runs: behavioral claim + MANIFEST binding witnessed"
 
       # === NetDB ==========================================================
       - name: NetDB
@@ -4119,13 +4157,18 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: pytest -v -s --timeout=30 --timeout-method=thread
 
-      # === the Python org facade witnesses =
-      # The pytest run above EXECUTED these 15 items (the 6 matrix functions
-      # x [same_org|granted] = 12 cells + 3 standalone: the task-cancel
-      # propagation witness, the midstream org-vocabulary witness, and the
-      # preserved unary cross-org cell); this step PINS their 9 base names
-      # (a witness must not disappear silently): lexical name-existence,
-      # fail-closed, plus the parametrize pair that yields the 12 cells.
+      # === the Python org facade witnesses ==
+      # The pytest run above EXECUTED the pinned rows; this step PINS them
+      # and COUNTS them (CI-1). Before, the pin asserted "15 items / 12
+      # cells" in prose while running no tests and counting nothing — a
+      # parametrize id or a whole matrix row could vanish and the claim kept
+      # standing. Now the 9 base names + the teardown row are pinned
+      # lexically (fail-closed, with `decl`'s data-literal quoting) and then
+      # RE-RUN and counted PER PINNED NODE ID: the floors are the pinned
+      # estate's own shape (the 6 matrix functions x [same_org|granted] = 12
+      # cells + 3 standalone + 1 teardown = 16 rows), so a vanished id or a
+      # vanished row reddens the count. Unpinned sibling rows in these files
+      # cannot mask a loss: only pinned node ids are counted.
       #
       # The second `--source` is the teardown witness: a live org handler at
       # runtime-drop time must not wedge the interpreter — the GIL-held
@@ -4133,24 +4176,42 @@ jobs:
       # ceilings instead of failing. It is its own file (the property is a
       # teardown one), so it is pinned here rather than in a suite that does
       # not name it.
-      - name: Witness roster — Python org facade (15 items / 9 names + teardown)
+      - name: Witness roster + floor — Python org facade (15 pinned rows / 12 cells + teardown)
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
+          MATRIX="
+            test_org_streaming_sync_call_and_serve
+            test_org_streaming_async_call_and_serve
+            test_org_client_stream_sync_call_and_serve
+            test_org_client_stream_async_call_and_serve
+            test_org_duplex_sync_call_and_serve
+            test_org_duplex_async_call_and_serve
+            "
+          STANDALONE="
+            test_task_cancel_propagates_to_retirement_observables
+            test_streaming_midstream_error_surfaces_the_org_vocabulary
+            test_live_cross_org_call_from_a_generated_scenario
+            "
+          TEARDOWN=test_teardown_with_a_live_handler_does_not_deadlock
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_live --mode decl \
             --source net/crates/net/bindings/python/tests/test_org_live.py \
             --source net/crates/net/bindings/python/tests/test_runtime_teardown_no_deadlock.py \
-            test_org_streaming_sync_call_and_serve \
-            test_org_streaming_async_call_and_serve \
-            test_org_client_stream_sync_call_and_serve \
-            test_org_client_stream_async_call_and_serve \
-            test_org_duplex_sync_call_and_serve \
-            test_org_duplex_async_call_and_serve \
-            test_task_cancel_propagates_to_retirement_observables \
-            test_streaming_midstream_error_surfaces_the_org_vocabulary \
-            test_live_cross_org_call_from_a_generated_scenario \
-            test_teardown_with_a_live_handler_does_not_deadlock \
+            $MATRIX $STANDALONE $TEARDOWN \
             same_org granted || exit 1
+
+          out=$(cd net/crates/net/bindings/python && python -m pytest -v \
+                  tests/test_org_live.py tests/test_runtime_teardown_no_deadlock.py 2>&1 | tee /dev/stderr)
+          names_re="($(echo $MATRIX $STANDALONE $TEARDOWN | tr ' ' '|'))"
+          rows=$(printf '%s\n' "$out" | grep -cE "::${names_re}(\[[^]]*\])? +PASSED" || true)
+          cells=$(printf '%s\n' "$out" | grep -cE "::${names_re}\[[^]]*\] +PASSED" || true)
+          echo "python org facade: ${rows} pinned rows / ${cells} cells executed (floor 16 rows / 12 cells)"
+          if [ "${rows:-0}" -lt 16 ] || [ "${cells:-0}" -lt 12 ]; then
+            echo "::error::the pinned python org facade ran ${rows:-0} rows / ${cells:-0} cells; \
+          the floors are 16 rows / 12 cells (the 6 matrix functions x [same_org|granted] + \
+          3 standalone + the teardown row) — lower the floors deliberately or restore the witnesses"
+            exit 1
+          fi
 
       # === the Python cross-language vectors rows =======
       # The pytest run above EXECUTED these (119 items: the byte pins, the
@@ -4888,7 +4949,7 @@ jobs:
             # this job lints an empty surface while reporting success — the
             # same silent-coverage shape the comments above describe. The
             # `python-tests` build set carries both.
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a,payments,payments-http,org
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a,payments,payments-http,org
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             # Default features only — the cdylib production build
@@ -6657,18 +6718,25 @@ jobs:
           "
           LEADER_WITNESSES="
           a_cancelled_bootstraps_real_rtc_connection_is_closed_before_the_lock_moves
+          a_cancelled_duplex_call_yields_the_cancelled_terminal_to_every_consumer
           a_custodial_identity_is_used_verbatim_and_never_stored
           a_follower_call_expires_on_its_own_deadline_as_an_indeterminate_outcome
           a_follower_call_without_a_timeout_expires_on_the_leafs_default_deadline
           a_leader_revalidates_its_generation_against_the_store_and_stands_down
           a_leaders_own_announcement_keeps_its_followers_capabilities
+          a_permanent_serve_registration_refusal_reaches_the_page_without_a_retry_storm
           a_promotion_whose_backend_fails_reattaches_instead_of_stranding_the_tab
           a_promotion_whose_generation_transaction_fails_requeues_instead_of_stranding_the_tab
           a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_panicking
           a_retained_stream_handle_cannot_address_a_same_id_successor
           a_follower_owns_its_streams_independently_under_one_wire_id
+          a_forged_accept_claim_is_never_served_to_the_handler_as_the_caller
+          a_well_formed_proxied_accept_dispatches_exactly_one_handler
           two_peers_under_one_wire_id_own_their_streams_independently
           a_runtime_announcement_is_restored_by_the_promoted_tab
+          a_second_duplex_stream_observes_the_latched_admission_denial_not_a_fabricated_completion
+          a_second_duplex_stream_observes_the_latched_refusal_not_a_fabricated_completion
+          a_second_duplex_stream_observes_the_latched_revoked_terminal_not_a_fabricated_completion
           a_superseded_session_is_refused_by_the_leader_and_by_storage
           a_tampered_identity_record_does_not_decrypt
           an_aborted_generation_transaction_is_a_typed_failure_and_moves_nothing
@@ -6709,7 +6777,7 @@ jobs:
             # this step.
             case "$suite" in
               wasm_leaf)       floor=16 ;;
-              wasm_leader)     floor=29 ;;
+              wasm_leader)     floor=36 ;;
               wasm_anchorless) floor=2  ;;
               # The leaf half. `leaf/src/rtc.rs` is
               # `#![cfg(target_arch = "wasm32")]` in its entirety, so
@@ -6776,14 +6844,18 @@ jobs:
           # against 18 witnesses and pinned none of them by name, so
           # twelve lifecycle tests could vanish and the job would stay
           # green. Every name is pinned, exactly as the leaf and
-          # anchorless rosters are.
+          # anchorless rosters are. (2026-09-25: the roster caught up
+          # with reality again — the LEAF-1 latched-terminal quartet
+          # and the three accept-claim/registration witnesses ran here
+          # unpinned since their slices landed; all 36 tests of the
+          # suite are name-pinned and the floor is the real count.)
           for witness in $LEADER_WITNESSES; do
             grep -q "^test $witness \.\.\. ok$" /tmp/wasm_leader.log || {
               echo "::error::the leader lifecycle witness $witness did not run and pass inside wasm"
               exit 1
             }
           done
-          echo "leader lifecycle: 29 witnesses executed in headless Chromium"
+          echo "leader lifecycle: 36 witnesses executed in headless Chromium"
 
       # Exit criterion: the shipped bundle stays under 1.5 MB gzipped.
       - name: Bundle size

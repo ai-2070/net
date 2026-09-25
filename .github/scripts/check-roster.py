@@ -19,9 +19,10 @@ WHAT THIS IS NOT. Read the two limits below before citing this script
 as evidence of anything; both have been overstated in a report.
 
 1. It is LEXICAL, not a test-inventory parser. `declared()` searches
-   raw file text for `fn <name>(` or for the name in quotes. It does
-   not parse Rust or JavaScript, does not evaluate `cfg`, and does not
-   know whether a match is a live test. A commented-out declaration,
+   raw file text for `fn <name>(` or (in `decl`/`literal`) for the name
+   as a quoted data literal. It does not parse Rust or JavaScript, does
+   not evaluate `cfg`, and does not know whether a match is a live
+   test. A commented-out declaration,
    an ordinary helper function, a declaration behind a `cfg` that is
    off in this build, or a witness literal that nothing ever emits all
    satisfy it. It also does not deduplicate the roster and does not
@@ -53,10 +54,18 @@ Modes:
     fn       the name appears as `fn <name>(` in some source file.
     decl     the name appears as a `fn` / `func` / `def` declaration
              (`fn <name>(`, `func <name>(`, `def <name>(`) or as a
-             quoted string. The Go and Python rosters need both in one
-             pass: the test functions are pinned by declaration, and
-             the parametrize ids (`"same_org"`, `"granted"`) only ever
-             appear as literals.
+             quoted STRING LITERAL in a data position: preceded by one
+             of `[ ( { , :` and followed by one of `] ) } , :` — list,
+             tuple and call arguments, mapping keys and values. The Go
+             and Python rosters need both in one pass: the test
+             functions are pinned by declaration, and the parametrize
+             ids (`"same_org"`, `"granted"`) only ever appear as
+             literals. A quoted mention in prose, a comment or a
+             comparison does NOT count: before this boundary, a
+             parametrize id could vanish from every real list while a
+             docstring or a `== "granted"` switch that remembered it
+             kept the roster green (the `decl` pairing's silent-vanish
+             half, called out in the 2026-09-24 code review, CI-1).
     literal  the name appears as a quoted string in some source file
              (harness witnesses, which are emitted by name at runtime).
     text     the name appears VERBATIM anywhere in the source. For pins
@@ -112,11 +121,12 @@ def main() -> int:
             return any(name in text for text in texts.values())
         elif args.mode == "decl":
             # `fn` (Rust), `func` (Go), `def` (Python) declarations, or the
-            # name as a quoted literal — see the mode's note in the module
-            # docstring for why the Go/Python rosters pin both.
+            # name as a quoted literal IN A DATA POSITION — see the mode's
+            # note in the module docstring for why the Go/Python rosters pin
+            # both, and why the quoted side is context-qualified.
             decl = re.compile(rf"\b(?:fn|func|def)\s+{re.escape(name)}\s*\(")
             quoted = re.compile(
-                rf"""(?:"{re.escape(name)}"|'{re.escape(name)}'|`{re.escape(name)}`)"""
+                rf"""[\[({{,:]\s*(?:"{re.escape(name)}"|'{re.escape(name)}'|`{re.escape(name)}`)\s*[\])}},:]"""
             )
             return any(decl.search(text) or quoted.search(text) for text in texts.values())
         else:
