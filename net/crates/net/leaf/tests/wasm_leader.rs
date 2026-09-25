@@ -70,8 +70,8 @@ use net_leaf::leader::{
 use net_leaf::leader_session::{
     spawn_fenced, BackendFactory, EventSink, Lifecycle, MeshSession, OpRegistry, Role,
 };
-use net_leaf::rtc::RtcLeafTransport;
 use net_leaf::rpc_wire::RpcStatus;
+use net_leaf::rtc::RtcLeafTransport;
 use net_leaf::storage::IdentityVault;
 use net_leaf::stream::Reliability;
 use net_leaf::stream_ownership::{answer_stream_request, StreamBackend, StreamOwnership};
@@ -4021,7 +4021,11 @@ fn org_call_opts() -> JsValue {
         "dispatcher",
         &Uint8Array::from(&b"dispatcher-wire"[..]).into(),
     );
-    put(&credentials, "actingOrg", &JsValue::from_str(&format!("{:064x}", 1)));
+    put(
+        &credentials,
+        "actingOrg",
+        &JsValue::from_str(&format!("{:064x}", 1)),
+    );
     put(
         &credentials,
         "providerOwnerOrg",
@@ -4127,7 +4131,8 @@ async fn every_consumer_observes(answer: TerminalAnswer, kind: &str) {
     );
 
     // Over-poll past the terminal: the latched terminal again.
-    let (done, third_kind, third_json) = terminal_item(&second.next().await.expect("the over-poll"));
+    let (done, third_kind, third_json) =
+        terminal_item(&second.next().await.expect("the over-poll"));
     assert!(done);
     assert_eq!(
         third_kind.as_deref(),
@@ -4146,13 +4151,15 @@ async fn every_consumer_observes(answer: TerminalAnswer, kind: &str) {
 /// duplex call — a security revocation must never present as clean
 /// end-of-stream at the JS boundary.
 #[wasm_bindgen_test]
-async fn a_second_duplex_stream_observes_the_latched_revoked_terminal_not_a_fabricated_completion() {
+async fn a_second_duplex_stream_observes_the_latched_revoked_terminal_not_a_fabricated_completion()
+{
     every_consumer_observes(TerminalAnswer::Retired("revoked"), "revoked").await;
 }
 
 /// The same for an admission denial (`Refused { AdmissionDenied }`).
 #[wasm_bindgen_test]
-async fn a_second_duplex_stream_observes_the_latched_admission_denial_not_a_fabricated_completion() {
+async fn a_second_duplex_stream_observes_the_latched_admission_denial_not_a_fabricated_completion()
+{
     every_consumer_observes(
         TerminalAnswer::Refused(RpcStatus::AdmissionDenied.to_wire(), "denied".into()),
         "admission-denied",
@@ -4249,14 +4256,12 @@ impl LeaderBackend for ServeFake {
                 Some(doc) => reply.bytes(envelope(ORG_ENVELOPE_ADMITTED, doc.as_bytes())),
                 None => self.parked.borrow_mut().push(reply),
             },
-            LeaderRequest::OrgServeCaller { call } => {
-                match self.verified.borrow().get(&call) {
-                    Some(json) => reply.text(json.clone()),
-                    None => reply.fail(ProxyFailure::Typed(LeafError::Session(format!(
-                        "no org call for handle {call}"
-                    )))),
-                }
-            }
+            LeaderRequest::OrgServeCaller { call } => match self.verified.borrow().get(&call) {
+                Some(json) => reply.text(json.clone()),
+                None => reply.fail(ProxyFailure::Typed(LeafError::Session(format!(
+                    "no org call for handle {call}"
+                )))),
+            },
             LeaderRequest::OrgServeRequest { call } => {
                 let item = self
                     .requests
@@ -4300,14 +4305,19 @@ fn recording_handler(calls: &Rc<RefCell<Vec<String>>>) -> Function {
         sink.borrow_mut()
             .push(caller.as_string().unwrap_or_default());
         js_sys::Promise::resolve(&Uint8Array::from(&b"response"[..]))
-    }) as Box<dyn FnMut(JsValue, Uint8Array) -> js_sys::Promise<Uint8Array>>);
+    })
+        as Box<dyn FnMut(JsValue, Uint8Array) -> js_sys::Promise<Uint8Array>>);
     closure.into_js_value().unchecked_into()
 }
 
 /// The `ownerOrg`-bearing options a proxied serve registration reads.
 fn serve_opts() -> JsValue {
     let object = Object::new();
-    put(&object, "ownerOrg", &JsValue::from_str(&format!("{:064x}", 2)));
+    put(
+        &object,
+        "ownerOrg",
+        &JsValue::from_str(&format!("{:064x}", 2)),
+    );
     object.into()
 }
 
@@ -4350,10 +4360,9 @@ async fn a_well_formed_proxied_accept_dispatches_exactly_one_handler() {
         .borrow_mut()
         .push_back("{\"call\":\"7\"}".to_string());
     fake.verified.borrow_mut().insert(7, verified_caller());
-    fake.requests.borrow_mut().insert(
-        7,
-        VecDeque::from([Bytes::from_static(b"request")]),
-    );
+    fake.requests
+        .borrow_mut()
+        .insert(7, VecDeque::from([Bytes::from_static(b"request")]));
     let (session, leader) = serve_session(fake).await;
     let calls = Rc::new(RefCell::new(Vec::new()));
     session
@@ -4385,14 +4394,13 @@ async fn a_forged_accept_claim_is_never_served_to_the_handler_as_the_caller() {
     let fake = ServeFake::default();
     // The accept envelope is TAMPERED: the claim says "forged", the
     // leader's own serve state resolves `verified_caller()`.
-    fake.accepts.borrow_mut().push_back(format!(
-        "{{\"call\":\"7\",\"caller\":{FORGED_CLAIM}}}"
-    ));
+    fake.accepts
+        .borrow_mut()
+        .push_back(format!("{{\"call\":\"7\",\"caller\":{FORGED_CLAIM}}}"));
     fake.verified.borrow_mut().insert(7, verified_caller());
-    fake.requests.borrow_mut().insert(
-        7,
-        VecDeque::from([Bytes::from_static(b"request")]),
-    );
+    fake.requests
+        .borrow_mut()
+        .insert(7, VecDeque::from([Bytes::from_static(b"request")]));
     let (session, leader) = serve_session(fake).await;
     let calls = Rc::new(RefCell::new(Vec::new()));
     session

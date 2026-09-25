@@ -2287,7 +2287,10 @@ impl LeaderBackend for NodeBackend {
                                 org.borrow_mut().release_call(from, call);
                                 match terminal {
                                     StreamTerminal::Completed { body } => {
-                                        reply.bytes(envelope(crate::leader::ORG_ENVELOPE_END, &body));
+                                        reply.bytes(envelope(
+                                            crate::leader::ORG_ENVELOPE_END,
+                                            &body,
+                                        ));
                                     }
                                     StreamTerminal::Retired { reason } => {
                                         reply.bytes(envelope(
@@ -2405,7 +2408,9 @@ impl LeaderBackend for NodeBackend {
                 let bridge = org.clone();
                 let handler: crate::rpc_serve::ServeHandler = Rc::new(move |serve_call| {
                     if let Err(serve) =
-                        bridge.borrow_mut().install_serve(from, registration, serve_call)
+                        bridge
+                            .borrow_mut()
+                            .install_serve(from, registration, serve_call)
                     {
                         // The registration closed while this call was
                         // being admitted: settled typed, never parked
@@ -2413,8 +2418,7 @@ impl LeaderBackend for NodeBackend {
                         // dropped.
                         serve.finish(crate::rpc_wire::StreamHandlerResult::Err(
                             crate::rpc_wire::RpcStatus::Internal,
-                            "the serve registration closed before this call was dispatched"
-                                .into(),
+                            "the serve registration closed before this call was dispatched".into(),
                         ));
                     }
                 });
@@ -3960,9 +3964,7 @@ impl ProxyOrgServe {
                                             mirror,
                                         );
                                     }
-                                    Err(failure)
-                                        if registration_refusal_is_transient(&failure) =>
-                                    {
+                                    Err(failure) if registration_refusal_is_transient(&failure) => {
                                         gloo_timer_sleep(ORG_PULL_MS).await.ok();
                                         break;
                                     }

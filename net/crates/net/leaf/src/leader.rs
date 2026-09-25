@@ -1832,7 +1832,8 @@ impl<B: LeaderBackend> ProxyServer<B> {
                     return Ok(());
                 }
                 let reply = self.replier(correlation);
-                self.backend.perform(ProxySide::Follower(follower), *request, reply);
+                self.backend
+                    .perform(ProxySide::Follower(follower), *request, reply);
                 Ok(())
             }
             // A follower does not send these.
@@ -2465,7 +2466,10 @@ impl OrgRelay {
             Err(_) => return Err(serve),
         };
         self.serve_calls.insert(call, (from, registration, serve));
-        self.accepts.entry(registration).or_default().push_back(call);
+        self.accepts
+            .entry(registration)
+            .or_default()
+            .push_back(call);
         Ok(call)
     }
 
@@ -4422,8 +4426,12 @@ mod tests {
                 }),
             },
         );
-        server.on_message(&request).expect("the first delivery serves");
-        server.on_message(&request).expect("the replay is dropped, not refused");
+        server
+            .on_message(&request)
+            .expect("the first delivery serves");
+        server
+            .on_message(&request)
+            .expect("the replay is dropped, not refused");
 
         assert_eq!(
             seen.borrow().len(),
@@ -4495,9 +4503,7 @@ mod tests {
     #[test]
     fn a_permanent_serve_registration_refusal_is_never_transient() {
         let permanent = [
-            ProxyFailure::Typed(LeafError::Session(
-                "serve \"svc\": AlreadyServed".into(),
-            )),
+            ProxyFailure::Typed(LeafError::Session("serve \"svc\": AlreadyServed".into())),
             ProxyFailure::Reported("unknown org call shape \"x\"".into()),
             ProxyFailure::Typed(LeafError::Session("the session is closed".into())),
         ];
@@ -4536,19 +4542,15 @@ mod tests {
     use crate::identity::EntityKeypair;
     use crate::org::cert::{OrgId, OrgKeypair, OrgMembershipCert};
     use crate::org::entity::EntityId;
-    use crate::org::grant::{
-        CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant,
-    };
+    use crate::org::grant::{CapabilityAuthorityId, DispatcherScope, OrgDispatcherGrant};
     use crate::org::proof::RpcCallShape;
     use crate::org::replay::AdmissionReplayGuard;
     use crate::org::revocation::RevocationFacts;
     use crate::rpc_serve::{
-        OpenOutcome, ServeAccess, ServeAdmission, ServeCall, ServeOptions, ServePeer,
-        ServeRegistry,
+        OpenOutcome, ServeAccess, ServeAdmission, ServeCall, ServeOptions, ServePeer, ServeRegistry,
     };
     use crate::rpc_stream::{
-        attach_signed_admission, CallHandle, CallPin, OrgCallIntent, StreamCallRegistry,
-        StreamOpen,
+        attach_signed_admission, CallHandle, CallPin, OrgCallIntent, StreamCallRegistry, StreamOpen,
     };
     use crate::rpc_wire::RpcRequestPayload;
 
@@ -4786,7 +4788,10 @@ mod tests {
             .install_call(owner, call, relay_call_handle(&world, 0x1111))
             .expect("install");
 
-        assert!(relay.release_call(owner, call), "terminal delivery releases");
+        assert!(
+            relay.release_call(owner, call),
+            "terminal delivery releases"
+        );
         assert!(!relay.call_live(call), "the entry is gone");
         assert_eq!(
             relay.stream_call(owner, call),
@@ -4896,11 +4901,14 @@ mod tests {
         relay
             .claim_registration(ProxySide::Follower(1), 7, RELAY_SERVICE)
             .expect("claim");
-        let bridge =
-            match relay.install_serve(ProxySide::Follower(1), 7, relay_serve_call(&world, 0x2000)) {
-                Ok(bridge) => bridge,
-                Err(_) => panic!("the admitted call parks under its owner"),
-            };
+        let bridge = match relay.install_serve(
+            ProxySide::Follower(1),
+            7,
+            relay_serve_call(&world, 0x2000),
+        ) {
+            Ok(bridge) => bridge,
+            Err(_) => panic!("the admitted call parks under its owner"),
+        };
         assert_ne!(
             bridge, 1,
             "pre-fix the first bridge handle was the guessable 1"

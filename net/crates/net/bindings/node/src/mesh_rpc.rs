@@ -2761,10 +2761,7 @@ mod tests {
             CoarseAdmissionReason::NotSupported,
             CoarseAdmissionReason::Unavailable,
         ] {
-            let got = org_sdk_error(server_error(
-                0x0009,
-                denial_message(coarse),
-            ));
+            let got = org_sdk_error(server_error(0x0009, denial_message(coarse)));
             let expected = OrgSdkError::AdmissionDenied(coarse);
             assert_eq!(
                 got.to_wire(),

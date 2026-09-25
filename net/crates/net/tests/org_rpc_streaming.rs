@@ -476,8 +476,9 @@ fn frozen_old_provider_admits_a_well_formed_unary() {
     // shape, no streaming flag and no session binding — exactly the v0.4
     // caller the vendored chain was built to serve.
     let req = fixture::opening_request(SERVICE, 0, b"open");
-    let (_name, bytes) = test_sign_admission_proof(&intent, CALL_ID, &req, RpcCallShape::Unary, None)
-        .expect("mint the unary proof header");
+    let (_name, bytes) =
+        test_sign_admission_proof(&intent, CALL_ID, &req, RpcCallShape::Unary, None)
+            .expect("mint the unary proof header");
     let digest = org_request_digest(&req).expect("request digest");
     let caller_entity = caller_kp.entity_id().clone();
     let floors = OrgRevocationState::empty();
@@ -5733,7 +5734,11 @@ async fn displaced_carrier_opening_is_refused_and_leaks_no_registry_record() {
         0,
         "nothing survives the retire sweep",
     );
-    assert_eq!(registry.active_node(), 0, "no quota charge survives the retire sweep");
+    assert_eq!(
+        registry.active_node(),
+        0,
+        "no quota charge survives the retire sweep"
+    );
 
     // The honest single-session path still admits: a fresh opening on the
     // LIVE incarnation, signed over ITS binding.
@@ -5753,11 +5758,15 @@ async fn displaced_carrier_opening_is_refused_and_leaks_no_registry_record() {
         "the bridge accepted the honest opening",
     );
     assert!(
-        s13::wait_for(Duration::from_secs(10), || entries.load(Ordering::SeqCst) == 1).await,
+        s13::wait_for(Duration::from_secs(10), || entries.load(Ordering::SeqCst)
+            == 1)
+        .await,
         "the honest single-session opening admits and enters the handler",
     );
     assert!(
-        s13::wait_for(Duration::from_secs(10), || sends.load(Ordering::SeqCst) == 2).await,
+        s13::wait_for(Duration::from_secs(10), || sends.load(Ordering::SeqCst)
+            == 2)
+        .await,
         "the admitted call runs to its chunks",
     );
 }
@@ -5799,11 +5808,15 @@ async fn token_cancel_on_live_server_stream_is_a_terminal_error_never_clean_eof(
         .await
         .expect("call_streaming opens");
     assert!(
-        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst) == 1).await,
+        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst)
+            == 1)
+        .await,
         "precondition: the call is LIVE server-side",
     );
     assert!(
-        s13::wait_for(Duration::from_secs(10), || caller.cancel_registry_len() >= 1).await,
+        s13::wait_for(Duration::from_secs(10), || caller.cancel_registry_len()
+            >= 1)
+        .await,
         "precondition: the cancel watcher is armed",
     );
 
@@ -5853,11 +5866,15 @@ async fn token_cancel_on_live_duplex_is_a_terminal_error_never_clean_eof() {
         .await
         .expect("the first send publishes the REQUEST");
     assert!(
-        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst) == 1).await,
+        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst)
+            == 1)
+        .await,
         "precondition: the call is LIVE server-side",
     );
     assert!(
-        s13::wait_for(Duration::from_secs(10), || caller.cancel_registry_len() >= 1).await,
+        s13::wait_for(Duration::from_secs(10), || caller.cancel_registry_len()
+            >= 1)
+        .await,
         "precondition: the cancel watcher is armed",
     );
 
@@ -5912,11 +5929,15 @@ async fn token_cancel_classifies_client_stream_finish_as_cancelled_not_transport
         .await
         .expect("the first send publishes the REQUEST");
     assert!(
-        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst) == 1).await,
+        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst)
+            == 1)
+        .await,
         "precondition: the call is LIVE server-side",
     );
     assert!(
-        s13::wait_for(Duration::from_secs(10), || caller.cancel_registry_len() >= 1).await,
+        s13::wait_for(Duration::from_secs(10), || caller.cancel_registry_len()
+            >= 1)
+        .await,
         "precondition: the cancel watcher is armed",
     );
     let finish_task = tokio::spawn(async move { call.finish().await });
@@ -5979,7 +6000,8 @@ async fn server_stream_deadline_retirement_is_typed_timeout_not_server_error() {
             break;
         }
     }
-    let err = terminal.expect("the deadline retirement surfaces as a terminal error, never clean EOF");
+    let err =
+        terminal.expect("the deadline retirement surfaces as a terminal error, never clean EOF");
     assert!(
         matches!(err, RpcError::Timeout { .. }),
         "a forced deadline expiry is the documented Rpc(Timeout), never Rpc(ServerError{{0x0003}}); got {err:?}",
@@ -6029,7 +6051,8 @@ async fn duplex_deadline_retirement_is_typed_timeout_not_server_error() {
             break;
         }
     }
-    let err = terminal.expect("the deadline retirement surfaces as a terminal error, never clean EOF");
+    let err =
+        terminal.expect("the deadline retirement surfaces as a terminal error, never clean EOF");
     assert!(
         matches!(err, RpcError::Timeout { .. }),
         "a forced deadline expiry is the documented Rpc(Timeout), never Rpc(ServerError{{0x0003}}); got {err:?}",
@@ -6074,7 +6097,9 @@ async fn client_stream_deadline_retirement_is_typed_timeout_not_server_error() {
         .await
         .expect("the first send publishes the REQUEST");
     assert!(
-        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst) == 1).await,
+        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst)
+            == 1)
+        .await,
         "precondition: the call is LIVE server-side",
     );
     tokio::time::sleep(Duration::from_millis(700)).await;

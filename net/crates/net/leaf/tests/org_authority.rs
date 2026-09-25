@@ -140,7 +140,8 @@ fn same_org_creds(scope: DispatcherScope) -> (OrgMembershipCert, OrgDispatcherGr
     let cid = caller_id();
     let membership =
         OrgMembershipCert::try_issue(&owner, cid.clone(), 3, 3600, NOW_SECS, 0x11).unwrap();
-    let dispatcher = OrgDispatcherGrant::try_issue(&owner, cid, scope, 3600, NOW_SECS, 0x12).unwrap();
+    let dispatcher =
+        OrgDispatcherGrant::try_issue(&owner, cid, scope, 3600, NOW_SECS, 0x12).unwrap();
     (membership, dispatcher)
 }
 
@@ -1303,7 +1304,8 @@ fn membership_and_dispatcher_from_different_orgs_are_refused_as_acting_org_misma
     // The acting org is named by the membership (org A); the
     // dispatcher grant must agree and names org B.
     let membership =
-        OrgMembershipCert::try_issue(&grantee(), caller_id.clone(), 1, 3600, NOW_SECS, 0x41).unwrap();
+        OrgMembershipCert::try_issue(&grantee(), caller_id.clone(), 1, 3600, NOW_SECS, 0x41)
+            .unwrap();
     let dispatcher = OrgDispatcherGrant::try_issue(
         &owner(),
         caller_id.clone(),

@@ -1085,8 +1085,8 @@ fn a_used_proof_is_not_reusable_inside_the_final_sub_ms_of_the_max_skew_window()
         MAX_TOKEN_CLOCK_SKEW_SECS,
     );
     let intent = l.w.intent(5); // ttl_secs = 30
-    // Mint PAST a whole millisecond so the retention projection's
-    // sub-ms remainder is nonzero — the floored projection loses it.
+                                // Mint PAST a whole millisecond so the retention projection's
+                                // sub-ms remainder is nonzero — the floored projection loses it.
     l.now = NOW_NS + 700_000;
     let minted_at = l.now;
     let raw = l.craft_request(
@@ -1249,13 +1249,7 @@ fn a_refusal_reusing_a_live_call_id_never_latches_the_calls_terminal() {
     );
 
     // (2) A crafted WRONG-FLAGS REQUEST reusing the live call's id.
-    let raw = l.craft_request(
-        id,
-        FLAG_RPC_STREAMING_RESPONSE,
-        b"u",
-        Vec::new(),
-        None,
-    );
+    let raw = l.craft_request(id, FLAG_RPC_STREAMING_RESPONSE, b"u", Vec::new(), None);
     assert_eq!(
         l.feed_raw(raw),
         OpenOutcome::Denied(AdmissionDenied::ShapeMismatch),
@@ -1271,13 +1265,9 @@ fn a_refusal_reusing_a_live_call_id_never_latches_the_calls_terminal() {
         headers: Vec::new(),
         body: Bytes::from_static(b"u"),
     };
-    let raw = rpc_wire::encode_request_frame(
-        l.w.caller_entity.origin_hash(),
-        id,
-        l.request_route,
-        &req,
-    )
-    .expect("encode");
+    let raw =
+        rpc_wire::encode_request_frame(l.w.caller_entity.origin_hash(), id, l.request_route, &req)
+            .expect("encode");
     assert_eq!(
         l.feed_raw(raw),
         OpenOutcome::Malformed(
@@ -2526,7 +2516,9 @@ mod node_level {
             "the refusal must name the failed authenticity check: {err:?}"
         );
         assert_eq!(handle.retired(), None, "the forgery retires nothing");
-        handle.send(b"gen3-more").expect("the call keeps delivering");
+        handle
+            .send(b"gen3-more")
+            .expect("the call keeps delivering");
 
         // Forgery 2: a genuine signature over TAMPERED floor values
         // — the floors are signed input, so the signature must bind
@@ -2542,11 +2534,7 @@ mod node_level {
             matches!(&err, net_leaf::LeafError::Wire(msg) if msg == "revocation bundle: invalid signature"),
             "the refusal must name the failed authenticity check: {err:?}"
         );
-        assert_eq!(
-            handle.retired(),
-            None,
-            "the tampered floors change nothing"
-        );
+        assert_eq!(handle.retired(), None, "the tampered floors change nothing");
 
         // The positive restored: the SIGNED truth raises the floor
         // and retires exactly the call the forgeries pretended to

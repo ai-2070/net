@@ -2056,15 +2056,7 @@ mod tests {
         let later = t0 + Duration::from_secs(6);
         let new_expires = later + Duration::from_secs(5);
         assert_eq!(
-            admit_external(
-                &guard,
-                &org_b,
-                &caller(1),
-                7,
-                [2u8; 32],
-                new_expires,
-                later
-            ),
+            admit_external(&guard, &org_b, &caller(1), 7, [2u8; 32], new_expires, later),
             ReplayOutcome::Admitted,
         );
 
@@ -2118,15 +2110,7 @@ mod tests {
         );
         assert_eq!(guard.external_len(), 0);
         assert_eq!(
-            admit_external(
-                &guard,
-                &org_b,
-                &caller(1),
-                7,
-                [2u8; 32],
-                new_expires,
-                later
-            ),
+            admit_external(&guard, &org_b, &caller(1), 7, [2u8; 32], new_expires, later),
             ReplayOutcome::Admitted,
         );
         assert_eq!(
@@ -2196,27 +2180,11 @@ mod tests {
         let later = t0 + Duration::from_secs(6);
         let new_expires = later + Duration::from_secs(5);
         assert_eq!(
-            admit_external(
-                &guard,
-                &org_b,
-                &caller(1),
-                7,
-                [4u8; 32],
-                new_expires,
-                later
-            ),
+            admit_external(&guard, &org_b, &caller(1), 7, [4u8; 32], new_expires, later),
             ReplayOutcome::Admitted,
         );
         assert_eq!(
-            admit_external(
-                &guard,
-                &org_b,
-                &caller(2),
-                8,
-                [5u8; 32],
-                new_expires,
-                later
-            ),
+            admit_external(&guard, &org_b, &caller(2), 8, [5u8; 32], new_expires, later),
             ReplayOutcome::Admitted,
         );
         assert_eq!(guard.len(), 3);

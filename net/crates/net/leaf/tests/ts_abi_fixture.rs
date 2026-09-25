@@ -215,7 +215,9 @@ fn wasm_item_keys(span_start: &str, span_end: &str) -> Vec<String> {
     });
     let rest = &source[start + span_start.len()..];
     let end = rest.find(span_end).unwrap_or_else(|| {
-        panic!("{span_end} must follow {span_start} in leaf/src/wasm.rs — the extraction span moved")
+        panic!(
+            "{span_end} must follow {span_start} in leaf/src/wasm.rs — the extraction span moved"
+        )
     });
     let body = &rest[..end];
     let mut keys = Vec::new();

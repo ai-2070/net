@@ -770,7 +770,10 @@ mod tests {
                 RpcHandlerError::Application { code, message } => (code, message),
                 other => panic!("an application error must classify as application: {other:?}"),
             };
-            assert_eq!(message, "diagnostic", "the diagnostic body survives verbatim");
+            assert_eq!(
+                message, "diagnostic",
+                "the diagnostic body survives verbatim"
+            );
             let expected = if (0x8000..=0xFFFF).contains(&code) {
                 code
             } else {

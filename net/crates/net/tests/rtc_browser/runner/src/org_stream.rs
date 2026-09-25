@@ -99,7 +99,9 @@ use bytes::Bytes;
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert, OrgRevocationBundle};
 use net::adapter::net::behavior::org_admission::Admitted;
-use net::adapter::net::behavior::org_admission_replay::{AdmissionReplayConfig, AdmissionReplayGuard};
+use net::adapter::net::behavior::org_admission_replay::{
+    AdmissionReplayConfig, AdmissionReplayGuard,
+};
 use net::adapter::net::behavior::org_authority::NodeAuthority;
 use net::adapter::net::behavior::org_call::{
     OrgCallProof, OrgStreamCallProof, RpcCallShape, ORG_ADMISSION_HEADER,
@@ -111,9 +113,9 @@ use net::adapter::net::behavior::org_grant::{
 };
 use net::adapter::net::behavior::org_revocation::OrgRevocationStore;
 use net::adapter::net::cortex::{
-    encode_rpc_route, EventMeta, RequestStream, RpcContext, RpcDuplexHandler, RpcHandler,
-    RpcHandlerError, RpcRequestPayload, RpcResponsePayload, RpcResponseSink, RpcStatus,
-    RpcClientStreamingHandler, RpcStreamingContext, RpcStreamingHandler, DISPATCH_RPC_REQUEST,
+    encode_rpc_route, EventMeta, RequestStream, RpcClientStreamingHandler, RpcContext,
+    RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcRequestPayload, RpcResponsePayload,
+    RpcResponseSink, RpcStatus, RpcStreamingContext, RpcStreamingHandler, DISPATCH_RPC_REQUEST,
     FLAG_RPC_STREAMING_RESPONSE, RPC_FRAME_BODY_OFFSET,
 };
 use net::adapter::net::identity::{EntityId, EntityKeypair};
@@ -193,8 +195,18 @@ const BROWSER_WITNESSES: usize = 35;
 /// and one Web Locks namespace — which is the topology the proxied
 /// attribution witnesses measure).
 pub const TABS: [&str; 12] = [
-    TAB_CALL, TAB_SERVE, TAB_PAIR_A, TAB_PAIR_B, TAB_REVOKED, TAB_COMPLIANT, TAB_TEARDOWN,
-    TAB_LEAD, TAB_FOLLOW1, TAB_FOLLOW2, TAB_OLD, TAB_NEW,
+    TAB_CALL,
+    TAB_SERVE,
+    TAB_PAIR_A,
+    TAB_PAIR_B,
+    TAB_REVOKED,
+    TAB_COMPLIANT,
+    TAB_TEARDOWN,
+    TAB_LEAD,
+    TAB_FOLLOW1,
+    TAB_FOLLOW2,
+    TAB_OLD,
+    TAB_NEW,
 ];
 
 const TAB_CALL: &str = "oc";
@@ -563,7 +575,11 @@ fn stat<'a>(result: &'a StepResult, key: &str) -> Option<&'a Value> {
 fn stat_u64(result: &StepResult, key: &str) -> u64 {
     stat(result, key)
         .and_then(Value::as_u64)
-        .or_else(|| stat(result, key).and_then(|v| v.as_str()).and_then(|s| s.parse().ok()))
+        .or_else(|| {
+            stat(result, key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+        })
         .unwrap_or(0)
 }
 
@@ -690,9 +706,14 @@ impl OrgWorld {
                 ..
             }) => {
                 anchor.clear_node_authority_for_test();
-                let authority =
-                    NodeAuthority::adopt(&dir, cert2_for(&root_a, &anchor_entity), &anchor_entity, 0, None)
-                        .expect("re-adopt");
+                let authority = NodeAuthority::adopt(
+                    &dir,
+                    cert2_for(&root_a, &anchor_entity),
+                    &anchor_entity,
+                    0,
+                    None,
+                )
+                .expect("re-adopt");
                 anchor
                     .install_node_authority(Arc::new(authority))
                     .expect("install anchor authority after clearing the 4b placeholder");
@@ -733,9 +754,13 @@ impl OrgWorld {
     ) -> (OrgMembershipCert, OrgDispatcherGrant) {
         let cert = OrgMembershipCert::try_issue(root, member.clone(), generation, CRED_TTL_SECS)
             .expect("cert");
-        let grant =
-            OrgDispatcherGrant::try_issue(root, member.clone(), DispatcherScope::Any, CRED_TTL_SECS)
-                .expect("dispatcher grant");
+        let grant = OrgDispatcherGrant::try_issue(
+            root,
+            member.clone(),
+            DispatcherScope::Any,
+            CRED_TTL_SECS,
+        )
+        .expect("dispatcher grant");
         (cert, grant)
     }
 
@@ -745,11 +770,7 @@ impl OrgWorld {
     /// scope narrowed to `ExactNode` — the call names an exact
     /// provider P anyway, and an unadopted (browser) provider is
     /// nobody's "node owned by".
-    fn granted(
-        &self,
-        provider: &EntityId,
-        service: &str,
-    ) -> OrgCapabilityGrant {
+    fn granted(&self, provider: &EntityId, service: &str) -> OrgCapabilityGrant {
         let (grant, _secret) = OrgCapabilityGrant::try_issue(
             &self.root_a,
             self.root_b.org_id(),
@@ -799,8 +820,7 @@ impl OrgWorld {
         granted: bool,
         generation: u32,
     ) -> OrgProofIntent {
-        let (membership, dispatcher) =
-            self.belonging(acting, caller_key.entity_id(), generation);
+        let (membership, dispatcher) = self.belonging(acting, caller_key.entity_id(), generation);
         OrgProofIntent {
             caller: Arc::clone(caller_key),
             membership,
@@ -1256,10 +1276,7 @@ fn leaf_of(result: &StepResult) -> Option<LeafInfo> {
     }
     let node_hex = result.node_id.clone()?;
     let node_id = u64::from_str_radix(node_hex.trim_start_matches("0x"), 16).ok()?;
-    Some(LeafInfo {
-        node_id,
-        node_hex,
-    })
+    Some(LeafInfo { node_id, node_hex })
 }
 
 fn connect_step(
@@ -1328,7 +1345,13 @@ fn unary_step(service: &str, payload: &[u8], creds: &Value) -> Value {
     })
 }
 
-fn stream_open_step(service: &str, payload: &[u8], creds: &Value, handle: &str, window: Option<u64>) -> Value {
+fn stream_open_step(
+    service: &str,
+    payload: &[u8],
+    creds: &Value,
+    handle: &str,
+    window: Option<u64>,
+) -> Value {
     json!({
         "kind": "org_stream_open",
         "session": "s",
@@ -1372,7 +1395,13 @@ fn upload_finish_step(handle: &str) -> Value {
     json!({ "kind": "org_upload_finish", "handle": handle })
 }
 
-fn duplex_open_step(service: &str, creds: &Value, handle: &str, stream_window: Option<u64>, request_window: Option<u64>) -> Value {
+fn duplex_open_step(
+    service: &str,
+    creds: &Value,
+    handle: &str,
+    stream_window: Option<u64>,
+    request_window: Option<u64>,
+) -> Value {
     json!({
         "kind": "org_duplex_open",
         "session": "s",
@@ -1471,7 +1500,11 @@ fn register_native_services(anchor: &Arc<MeshNode>) -> NativeServices {
     for (service, pre, post, granted) in [
         (
             N_S_SAME,
-            vec![b"s-same-0".to_vec(), b"s-same-1".to_vec(), b"s-same-2".to_vec()],
+            vec![
+                b"s-same-0".to_vec(),
+                b"s-same-1".to_vec(),
+                b"s-same-2".to_vec(),
+            ],
             vec![b"s-same-tail".to_vec()],
             false,
         ),
@@ -1551,9 +1584,10 @@ fn register_native_services(anchor: &Arc<MeshNode>) -> NativeServices {
 
     // Client-streaming family + the slow-consumer backpressure
     // provider.
-    for (service, label, granted) in
-        [(N_CS_SAME, "cs-same", false), (N_CS_GRANTED, "cs-granted", true)]
-    {
+    for (service, label, granted) in [
+        (N_CS_SAME, "cs-same", false),
+        (N_CS_GRANTED, "cs-granted", true),
+    ] {
         let handler = Arc::new(CsOrg {
             service,
             label,
@@ -1679,7 +1713,11 @@ async fn browser_call_matrix(
     ];
 
     for (index, service, shape, granted) in cases {
-        let acting = if granted { &world.root_b } else { &world.root_a };
+        let acting = if granted {
+            &world.root_b
+        } else {
+            &world.root_a
+        };
         let acting_hex = if granted { &b_hex } else { &a_hex };
         let creds = world.creds(
             &world.caller.entity,
@@ -1716,7 +1754,8 @@ async fn browser_call_matrix(
                 let r = script
                     .run(TAB_CALL, unary_step(service, &payload, &creds))
                     .await;
-                let expected = expected_unary(if granted { "u-granted" } else { "u-same" }, &payload);
+                let expected =
+                    expected_unary(if granted { "u-granted" } else { "u-same" }, &payload);
                 let reply = r.reply.as_deref().map(crate::unhex).unwrap_or_default();
                 (
                     r.ok && reply == expected,
@@ -1732,7 +1771,10 @@ async fn browser_call_matrix(
             "streaming" => {
                 let handle = format!("a{index}");
                 let open = script
-                    .run(TAB_CALL, stream_open_step(service, &payload, &creds, &handle, None))
+                    .run(
+                        TAB_CALL,
+                        stream_open_step(service, &payload, &creds, &handle, None),
+                    )
                     .await;
                 let read = if open.ok {
                     script
@@ -1750,9 +1792,10 @@ async fn browser_call_matrix(
                 .into_iter()
                 .map(|s| hex(s.as_bytes()))
                 .collect();
-                let terminal_done =
-                    stat_obj(&read, "terminal").and_then(|t| t.get("done")).and_then(Value::as_bool)
-                        == Some(true);
+                let terminal_done = stat_obj(&read, "terminal")
+                    .and_then(|t| t.get("done"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
                 (
                     open.ok && read.ok && items == expected && terminal_done,
                     format!(
@@ -1800,9 +1843,14 @@ async fn browser_call_matrix(
                     format!("dx-{}-1", index).into_bytes(),
                 ];
                 let open = script
-                    .run(TAB_CALL, duplex_open_step(service, &creds, &handle, None, None))
+                    .run(
+                        TAB_CALL,
+                        duplex_open_step(service, &creds, &handle, None, None),
+                    )
                     .await;
-                let _ = script.run(TAB_CALL, duplex_send_step(&handle, &sends)).await;
+                let _ = script
+                    .run(TAB_CALL, duplex_send_step(&handle, &sends))
+                    .await;
                 let _ = script.run(TAB_CALL, duplex_finish_step(&handle)).await;
                 let read = if open.ok {
                     script
@@ -1820,11 +1868,16 @@ async fn browser_call_matrix(
                         hex(&echo)
                     })
                     .collect();
-                expected.push(hex(if granted { b"dx-granted-tail" } else { b"dx-same-tail" }));
+                expected.push(hex(if granted {
+                    b"dx-granted-tail"
+                } else {
+                    b"dx-same-tail"
+                }));
                 let items = stat_list(&read, "items");
-                let terminal_done =
-                    stat_obj(&read, "terminal").and_then(|t| t.get("done")).and_then(Value::as_bool)
-                        == Some(true);
+                let terminal_done = stat_obj(&read, "terminal")
+                    .and_then(|t| t.get("done"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
                 (
                     open.ok && read.ok && items == expected && terminal_done,
                     format!(
@@ -1840,11 +1893,7 @@ async fn browser_call_matrix(
 
         // The FIVE verified attribution fields, exactly, on the
         // record the handler itself captured.
-        let record = services
-            .log
-            .for_service(service)
-            .into_iter()
-            .last();
+        let record = services.log.for_service(service).into_iter().last();
         let attribution_ok = record.as_ref().is_some_and(|rec| {
             rec.payload == record_payload
                 && rec.caller.as_deref() == Some(caller_hex.as_str())
@@ -1913,7 +1962,10 @@ async fn native_call_matrix(
     for (index, service, shape, granted) in cases {
         let access = if granted { "granted" } else { "same-org" };
         let label = format!("b{index}");
-        let pre: Vec<Vec<u8>> = vec![format!("{label}-0").into_bytes(), format!("{label}-1").into_bytes()];
+        let pre: Vec<Vec<u8>> = vec![
+            format!("{label}-0").into_bytes(),
+            format!("{label}-1").into_bytes(),
+        ];
         let post: Vec<Vec<u8>> = vec![format!("{label}-tail").into_bytes()];
         let handle = format!("bs{index}");
 
@@ -1922,7 +1974,9 @@ async fn native_call_matrix(
         let serve = script
             .run(
                 TAB_SERVE,
-                serve_step(&handle, service, shape, access, &owner_org, &label, &pre, &post, false, 0),
+                serve_step(
+                    &handle, service, shape, access, &owner_org, &label, &pre, &post, false, 0,
+                ),
             )
             .await;
         if !serve.ok {
@@ -1937,7 +1991,11 @@ async fn native_call_matrix(
         // The native caller — the frozen mint glue signs the proof.
         let intent = world.intent(
             cx.anchor_key,
-            if granted { &world.root_b } else { &world.root_a },
+            if granted {
+                &world.root_b
+            } else {
+                &world.root_a
+            },
             &world.root_a,
             &world.server.entity,
             service,
@@ -1955,7 +2013,12 @@ async fn native_call_matrix(
                 let expected = expected_unary(&label, &payload);
                 match cx
                     .anchor
-                    .call(server.node_id, service, Bytes::copy_from_slice(&payload), opts)
+                    .call(
+                        server.node_id,
+                        service,
+                        Bytes::copy_from_slice(&payload),
+                        opts,
+                    )
                     .await
                 {
                     Ok(reply) => (
@@ -1971,24 +2034,27 @@ async fn native_call_matrix(
                 let terminal;
                 match cx
                     .anchor
-                    .call_streaming(server.node_id, service, Bytes::copy_from_slice(&payload), opts)
+                    .call_streaming(
+                        server.node_id,
+                        service,
+                        Bytes::copy_from_slice(&payload),
+                        opts,
+                    )
                     .await
                 {
-                    Ok(mut stream) => {
-                        loop {
-                            match stream.next().await {
-                                Some(Ok(chunk)) => items.push(chunk.to_vec()),
-                                Some(Err(e)) => {
-                                    terminal = format!("ERR {e}");
-                                    break;
-                                }
-                                None => {
-                                    terminal = "done".to_string();
-                                    break;
-                                }
+                    Ok(mut stream) => loop {
+                        match stream.next().await {
+                            Some(Ok(chunk)) => items.push(chunk.to_vec()),
+                            Some(Err(e)) => {
+                                terminal = format!("ERR {e}");
+                                break;
+                            }
+                            None => {
+                                terminal = "done".to_string();
+                                break;
                             }
                         }
-                    }
+                    },
                     Err(e) => terminal = format!("OPEN-ERR {e}"),
                 }
                 let expected: Vec<Vec<u8>> = pre.into_iter().chain(post).collect();
@@ -1997,12 +2063,19 @@ async fn native_call_matrix(
                     format!(
                         "items={} (want {}) terminal={terminal}",
                         items.iter().map(|c| hex(c)).collect::<Vec<_>>().join(","),
-                        expected.iter().map(|c| hex(c)).collect::<Vec<_>>().join(",")
+                        expected
+                            .iter()
+                            .map(|c| hex(c))
+                            .collect::<Vec<_>>()
+                            .join(",")
                     ),
                 )
             }
             "client_stream" => {
-                let up = vec![format!("nu-{}-0", index).into_bytes(), format!("nu-{}-1", index).into_bytes()];
+                let up = vec![
+                    format!("nu-{}-0", index).into_bytes(),
+                    format!("nu-{}-1", index).into_bytes(),
+                ];
                 match cx
                     .anchor
                     .call_client_stream(server.node_id, service, opts)
@@ -2034,7 +2107,10 @@ async fn native_call_matrix(
                 }
             }
             "duplex" => {
-                let sends = vec![format!("nd-{}-0", index).into_bytes(), format!("nd-{}-1", index).into_bytes()];
+                let sends = vec![
+                    format!("nd-{}-0", index).into_bytes(),
+                    format!("nd-{}-1", index).into_bytes(),
+                ];
                 match cx.anchor.call_duplex(server.node_id, service, opts).await {
                     Ok(mut call) => {
                         for chunk in &sends {
@@ -2083,7 +2159,11 @@ async fn native_call_matrix(
                             format!(
                                 "items={} (want {}) terminal={terminal}",
                                 items.iter().map(|c| hex(c)).collect::<Vec<_>>().join(","),
-                                expected.iter().map(|c| hex(c)).collect::<Vec<_>>().join(",")
+                                expected
+                                    .iter()
+                                    .map(|c| hex(c))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
                             ),
                         )
                     }
@@ -2323,17 +2403,27 @@ async fn browser_pair_matrix(
         let serve = script
             .run(
                 TAB_PAIR_B,
-                serve_step(&handle, service, shape, access, &owner_org, &label, &pre, &post, false, 0),
+                serve_step(
+                    &handle, service, shape, access, &owner_org, &label, &pre, &post, false, 0,
+                ),
             )
             .await;
         if !serve.ok {
-            ledger.record(WITNESSES[index], false, format!("pair-b could not serve: {}", why(&serve)));
+            ledger.record(
+                WITNESSES[index],
+                false,
+                format!("pair-b could not serve: {}", why(&serve)),
+            );
             continue;
         }
         let creds = world.creds(
             &world.pair_a.entity,
             1,
-            if granted { &world.root_b } else { &world.root_a },
+            if granted {
+                &world.root_b
+            } else {
+                &world.root_a
+            },
             &world.root_a,
             &world.pair_b.entity,
             service,
@@ -2349,16 +2439,26 @@ async fn browser_pair_matrix(
                 let reply = r.reply.as_deref().map(crate::unhex).unwrap_or_default();
                 (
                     r.ok && reply == expected,
-                    format!("reply={} (want {}); {}", hex(&reply), hex(&expected), typed(&r)),
+                    format!(
+                        "reply={} (want {}); {}",
+                        hex(&reply),
+                        hex(&expected),
+                        typed(&r)
+                    ),
                 )
             }
             "streaming" => {
                 let handle = "pairstream".to_string();
                 let open = script
-                    .run(TAB_PAIR_A, stream_open_step(service, &payload, &creds, &handle, None))
+                    .run(
+                        TAB_PAIR_A,
+                        stream_open_step(service, &payload, &creds, &handle, None),
+                    )
                     .await;
                 let read = if open.ok {
-                    script.run(TAB_PAIR_A, stream_read_step(&handle, 5, 15_000)).await
+                    script
+                        .run(TAB_PAIR_A, stream_read_step(&handle, 5, 15_000))
+                        .await
                 } else {
                     fail("open failed")
                 };
@@ -2390,19 +2490,31 @@ async fn browser_pair_matrix(
                 let reply = fin.reply.as_deref().map(crate::unhex).unwrap_or_default();
                 (
                     fin.ok && reply == expected,
-                    format!("reply={} (want {}); {}", hex(&reply), hex(&expected), typed(&fin)),
+                    format!(
+                        "reply={} (want {}); {}",
+                        hex(&reply),
+                        hex(&expected),
+                        typed(&fin)
+                    ),
                 )
             }
             "duplex" => {
                 let handle = "pairdx".to_string();
                 let sends = vec![b"pd-0".to_vec(), b"pd-1".to_vec()];
                 let open = script
-                    .run(TAB_PAIR_A, duplex_open_step(service, &creds, &handle, None, None))
+                    .run(
+                        TAB_PAIR_A,
+                        duplex_open_step(service, &creds, &handle, None, None),
+                    )
                     .await;
-                let _ = script.run(TAB_PAIR_A, duplex_send_step(&handle, &sends)).await;
+                let _ = script
+                    .run(TAB_PAIR_A, duplex_send_step(&handle, &sends))
+                    .await;
                 let _ = script.run(TAB_PAIR_A, duplex_finish_step(&handle)).await;
                 let read = if open.ok {
-                    script.run(TAB_PAIR_A, duplex_read_step(&handle, 5, 15_000)).await
+                    script
+                        .run(TAB_PAIR_A, duplex_read_step(&handle, 5, 15_000))
+                        .await
                 } else {
                     fail("open failed")
                 };
@@ -2427,7 +2539,10 @@ async fn browser_pair_matrix(
         // The provider-side attribution (the five fields) recorded by
         // pair-b's own handler.
         let report = script.run(TAB_PAIR_B, report_step(&handle)).await;
-        let calls = stat_obj(&report, "calls").and_then(Value::as_array).cloned().unwrap_or_default();
+        let calls = stat_obj(&report, "calls")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let attribution_ok = calls.len() == 1
             && calls[0].get("entity").and_then(Value::as_str)
                 == Some(hex32(world.pair_a.entity.as_bytes()).as_str())
@@ -2438,7 +2553,12 @@ async fn browser_pair_matrix(
         ledger.record(
             WITNESSES[index],
             pass && attribution_ok,
-            format!("{detail}; attribution={attribution_ok} ran={} (pair-a {} -> pair-b {})", calls.len(), a.node_hex, b.node_hex),
+            format!(
+                "{detail}; attribution={attribution_ok} ran={} (pair-a {} -> pair-b {})",
+                calls.len(),
+                a.node_hex,
+                b.node_hex
+            ),
         );
     }
 }
@@ -2475,11 +2595,26 @@ async fn wrong_peer_refused(
     let serve = script
         .run(
             TAB_SERVE,
-            serve_step(&handle, B_INJECT, "streaming", "same-org", &owner_org, "wp", &pre, &post, false, 0),
+            serve_step(
+                &handle,
+                B_INJECT,
+                "streaming",
+                "same-org",
+                &owner_org,
+                "wp",
+                &pre,
+                &post,
+                false,
+                0,
+            ),
         )
         .await;
     if !serve.ok {
-        ledger.record(witness, false, format!("the leaf could not serve: {}", why(&serve)));
+        ledger.record(
+            witness,
+            false,
+            format!("the leaf could not serve: {}", why(&serve)),
+        );
         return;
     }
 
@@ -2508,7 +2643,11 @@ async fn wrong_peer_refused(
             false,
         ),
         None => {
-            ledger.record(witness, false, "no live session binding to bind the captured frame to");
+            ledger.record(
+                witness,
+                false,
+                "no live session binding to bind the captured frame to",
+            );
             return;
         }
     };
@@ -2563,7 +2702,11 @@ async fn wrong_peer_refused(
     let sibling = script
         .run(TAB_CALL, unary_step(N_U_SAME, &sibling_payload, &creds))
         .await;
-    let sibling_reply = sibling.reply.as_deref().map(crate::unhex).unwrap_or_default();
+    let sibling_reply = sibling
+        .reply
+        .as_deref()
+        .map(crate::unhex)
+        .unwrap_or_default();
     let sibling_expected = expected_unary("u-same", &sibling_payload);
     let sibling_ok = sibling.ok && sibling_reply == sibling_expected;
     let after_all = world_call_count(script, TAB_SERVE, &handle).await;
@@ -2670,12 +2813,11 @@ async fn old_session_frames_refused(
         .run(TAB_OLD, stream_read_step("old-parked", 99, 8_000))
         .await;
     let items_after = stat_list(&final_read, "items");
-    let terminal = stat_obj(&final_read, "terminal").cloned().unwrap_or(Value::Null);
-    let x_delivered_nothing = items_after
-        == vec![
-            hex(b"held-0"),
-            hex(b"held-1"),
-        ] && terminal.is_null();
+    let terminal = stat_obj(&final_read, "terminal")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let x_delivered_nothing =
+        items_after == vec![hex(b"held-0"), hex(b"held-1")] && terminal.is_null();
 
     // Y's fresh call proceeds exactly (distinct payload; if the old
     // response leaked into it the identity check fails).
@@ -2748,11 +2890,26 @@ async fn replayed_opening_refused(
     let serve = script
         .run(
             TAB_SERVE,
-            serve_step(&handle, B_REPLAY, "streaming", "same-org", &owner_org, "rp", &pre, &post, false, 0),
+            serve_step(
+                &handle,
+                B_REPLAY,
+                "streaming",
+                "same-org",
+                &owner_org,
+                "rp",
+                &pre,
+                &post,
+                false,
+                0,
+            ),
         )
         .await;
     if !serve.ok {
-        ledger.record(witness, false, format!("the leaf could not serve: {}", why(&serve)));
+        ledger.record(
+            witness,
+            false,
+            format!("the leaf could not serve: {}", why(&serve)),
+        );
         return;
     }
 
@@ -2875,12 +3032,7 @@ async fn deliver_opening(anchor: &Arc<MeshNode>, peer: u64, opening: &Opening) -
 /// `no pinned entity` transient: a promoted tab's node is REBUILT
 /// (fresh session, fresh announcement store) and its pin of the
 /// anchor lands on the next announce beat (~500 ms).
-async fn run_pinned(
-    script: &mut ScriptOrg,
-    tab: &str,
-    step: Value,
-    attempts: usize,
-) -> StepResult {
+async fn run_pinned(script: &mut ScriptOrg, tab: &str, step: Value, attempts: usize) -> StepResult {
     let mut last = fail("never attempted");
     for _ in 0..attempts {
         last = script.run(tab, step.clone()).await;
@@ -2945,11 +3097,26 @@ async fn streaming_backpressure(
     let serve = script
         .run(
             TAB_PAIR_B,
-            serve_step(&handle, B_BP, "streaming", "same-org", &owner_org, "bp", &pre, &post, false, 0),
+            serve_step(
+                &handle,
+                B_BP,
+                "streaming",
+                "same-org",
+                &owner_org,
+                "bp",
+                &pre,
+                &post,
+                false,
+                0,
+            ),
         )
         .await;
     if !serve.ok {
-        ledger.record(witness, false, format!("the browser could not serve: {}", why(&serve)));
+        ledger.record(
+            witness,
+            false,
+            format!("the browser could not serve: {}", why(&serve)),
+        );
         return;
     }
     let creds = world.creds(
@@ -2971,7 +3138,10 @@ async fn streaming_backpressure(
         .await;
     tokio::time::sleep(Duration::from_millis(700)).await;
     let mid = script.run(TAB_PAIR_B, report_step(&handle)).await;
-    let mid_calls = stat_obj(&mid, "calls").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mid_calls = stat_obj(&mid, "calls")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let send_log_early = mid_calls
         .first()
         .and_then(|c| c.get("send_log"))
@@ -3009,11 +3179,16 @@ async fn streaming_backpressure(
         reads.push(stat_list(&r, "items").len());
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    let final_read = script.run(TAB_PAIR_A, stream_read_step("bp-call", 10, 10_000)).await;
+    let final_read = script
+        .run(TAB_PAIR_A, stream_read_step("bp-call", 10, 10_000))
+        .await;
     let items = stat_list(&final_read, "items");
     let expected: Vec<String> = pre.iter().map(|c| hex(c)).collect();
     let report = script.run(TAB_PAIR_B, report_step(&handle)).await;
-    let calls = stat_obj(&report, "calls").and_then(Value::as_array).cloned().unwrap_or_default();
+    let calls = stat_obj(&report, "calls")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let send_log = calls
         .first()
         .and_then(|c| c.get("send_log"))
@@ -3021,11 +3196,14 @@ async fn streaming_backpressure(
         .cloned()
         .unwrap_or_default();
     let resolved_once = send_log.len() == 6
-        && send_log
-            .iter()
-            .all(|e| e.get("i").is_some() && e.get("resolved_at").and_then(Value::as_f64).unwrap_or(0.0) > 0.0);
-    let terminal_done =
-        stat_obj(&final_read, "terminal").and_then(|t| t.get("done")).and_then(Value::as_bool) == Some(true);
+        && send_log.iter().all(|e| {
+            e.get("i").is_some()
+                && e.get("resolved_at").and_then(Value::as_f64).unwrap_or(0.0) > 0.0
+        });
+    let terminal_done = stat_obj(&final_read, "terminal")
+        .and_then(|t| t.get("done"))
+        .and_then(Value::as_bool)
+        == Some(true);
 
     ledger.record(
         witness,
@@ -3076,11 +3254,19 @@ async fn client_stream_backpressure(
         })
         .collect();
     let open = script
-        .run(TAB_CALL, upload_open_step(N_CS_BP, &creds, "cs-bp", Some(2)))
+        .run(
+            TAB_CALL,
+            upload_open_step(N_CS_BP, &creds, "cs-bp", Some(2)),
+        )
         .await;
     // Send beyond the window: 4 at once, then observe the park.
-    let send1 = script.run(TAB_CALL, upload_send_step("cs-bp", &chunks[..4])).await;
-    let send_log = stat_obj(&send1, "send_log").and_then(Value::as_array).cloned().unwrap_or_default();
+    let send1 = script
+        .run(TAB_CALL, upload_send_step("cs-bp", &chunks[..4]))
+        .await;
+    let send_log = stat_obj(&send1, "send_log")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let parked = send_log
         .iter()
         .filter(|e| {
@@ -3092,7 +3278,9 @@ async fn client_stream_backpressure(
             }
         })
         .count();
-    let send2 = script.run(TAB_CALL, upload_send_step("cs-bp", &chunks[4..])).await;
+    let send2 = script
+        .run(TAB_CALL, upload_send_step("cs-bp", &chunks[4..]))
+        .await;
     // Half-close: EOF reaches the handler; the terminal reply is the
     // exact concatenation.
     let fin = script.run(TAB_CALL, upload_finish_step("cs-bp")).await;
@@ -3108,14 +3296,14 @@ async fn client_stream_backpressure(
     // it delivers nothing and cancels nothing — the call's result is
     // already exact and the handler's collected set is unchanged.
     let late = script
-        .run(TAB_CALL, upload_send_step("cs-bp", &[b"late-after-end".to_vec()]))
+        .run(
+            TAB_CALL,
+            upload_send_step("cs-bp", &[b"late-after-end".to_vec()]),
+        )
         .await;
     let late_refused = stat_obj(&late, "refused").is_some();
     let records = services.log.for_service(N_CS_BP);
-    let collected_exact = records
-        .last()
-        .map(|r| r.payload == joined)
-        .unwrap_or(false);
+    let collected_exact = records.last().map(|r| r.payload == joined).unwrap_or(false);
 
     ledger.record(
         witness,
@@ -3166,12 +3354,20 @@ async fn duplex_backpressure(
     // Response window 8; upload window 2 — the upload window is the
     // one this witness exhausts.
     let open = script
-        .run(TAB_CALL, duplex_open_step(N_DX_BP, &creds, "dx-bp", Some(8), Some(2)))
+        .run(
+            TAB_CALL,
+            duplex_open_step(N_DX_BP, &creds, "dx-bp", Some(8), Some(2)),
+        )
         .await;
     // Send beyond the window: 4 at once, then observe the park (the
     // same attempt-first send_log discipline as the CS witness).
-    let send1 = script.run(TAB_CALL, duplex_send_step("dx-bp", &chunks[..4])).await;
-    let send_log = stat_obj(&send1, "send_log").and_then(Value::as_array).cloned().unwrap_or_default();
+    let send1 = script
+        .run(TAB_CALL, duplex_send_step("dx-bp", &chunks[..4]))
+        .await;
+    let send_log = stat_obj(&send1, "send_log")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let parked = send_log
         .iter()
         .filter(|e| {
@@ -3183,14 +3379,20 @@ async fn duplex_backpressure(
             }
         })
         .count();
-    let send2 = script.run(TAB_CALL, duplex_send_step("dx-bp", &chunks[4..])).await;
+    let send2 = script
+        .run(TAB_CALL, duplex_send_step("dx-bp", &chunks[4..]))
+        .await;
     // Read while the input half is still open: echoes arrive
     // independently of half-close.
-    let mid = script.run(TAB_CALL, duplex_read_step("dx-bp", 2, 15_000)).await;
+    let mid = script
+        .run(TAB_CALL, duplex_read_step("dx-bp", 2, 15_000))
+        .await;
     let mid_items = stat_list(&mid, "items");
     // Half-close; the response side keeps completing (tail AFTER EOF).
     let fin = script.run(TAB_CALL, duplex_finish_step("dx-bp")).await;
-    let read = script.run(TAB_CALL, duplex_read_step("dx-bp", 10, 15_000)).await;
+    let read = script
+        .run(TAB_CALL, duplex_read_step("dx-bp", 10, 15_000))
+        .await;
     let items = stat_list(&read, "items");
     let mut expected: Vec<String> = chunks
         .iter()
@@ -3202,8 +3404,10 @@ async fn duplex_backpressure(
         })
         .collect();
     expected.push(hex(b"dx-bp-tail"));
-    let terminal_done =
-        stat_obj(&read, "terminal").and_then(|t| t.get("done")).and_then(Value::as_bool) == Some(true);
+    let terminal_done = stat_obj(&read, "terminal")
+        .and_then(|t| t.get("done"))
+        .and_then(Value::as_bool)
+        == Some(true);
 
     ledger.record(
         witness,
@@ -3247,8 +3451,7 @@ async fn raise_floor(
 ) -> (usize, usize) {
     let mut floors = BTreeMap::new();
     floors.insert(member.clone(), floor);
-    let bundle =
-        OrgRevocationBundle::try_issue(root, &floors).expect("revocation bundle");
+    let bundle = OrgRevocationBundle::try_issue(root, &floors).expect("revocation bundle");
     let raised = world
         .anchor_store
         .apply_bundle(&bundle)
@@ -3300,7 +3503,10 @@ async fn midstream_revocation(
         false,
     );
     let open_r = script
-        .run(TAB_REVOKED, stream_open_step(N_REV, b"rev-revoked", &creds_revoked, "rev-r", None))
+        .run(
+            TAB_REVOKED,
+            stream_open_step(N_REV, b"rev-revoked", &creds_revoked, "rev-r", None),
+        )
         .await;
     let open_c = script
         .run(
@@ -3310,10 +3516,16 @@ async fn midstream_revocation(
         .await;
     // Both live, one item in — the precondition the raise happens
     // MID-STREAM against.
-    let live_r = script.run(TAB_REVOKED, stream_read_step("rev-r", 1, 10_000)).await;
-    let live_c = script.run(TAB_COMPLIANT, stream_read_step("rev-c", 1, 10_000)).await;
-    let precondition =
-        open_r.ok && open_c.ok && !stat_list(&live_r, "items").is_empty() && !stat_list(&live_c, "items").is_empty();
+    let live_r = script
+        .run(TAB_REVOKED, stream_read_step("rev-r", 1, 10_000))
+        .await;
+    let live_c = script
+        .run(TAB_COMPLIANT, stream_read_step("rev-c", 1, 10_000))
+        .await;
+    let precondition = open_r.ok
+        && open_c.ok
+        && !stat_list(&live_r, "items").is_empty()
+        && !stat_list(&live_c, "items").is_empty();
 
     // The raise: floor 2 revokes generation 1, spares generation 5.
     let (raised, deliveries) = raise_floor(
@@ -3328,16 +3540,20 @@ async fn midstream_revocation(
 
     // The revoked call's FINAL item is exactly Err
     // AdmissionDenied('denied') + then end.
-    let final_r = script.run(TAB_REVOKED, stream_read_step("rev-r", 99, 10_000)).await;
+    let final_r = script
+        .run(TAB_REVOKED, stream_read_step("rev-r", 99, 10_000))
+        .await;
     let items_r = stat_list(&final_r, "items");
-    let terminal_r = stat_obj(&final_r, "terminal").cloned().unwrap_or(Value::Null);
+    let terminal_r = stat_obj(&final_r, "terminal")
+        .cloned()
+        .unwrap_or(Value::Null);
     let coarse_r = terminal_r
         .get("stats")
         .and_then(|s| s.get("coarse"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let revoked_terminal_exact = coarse_r == "denied"
-        && terminal_r.get("kind").and_then(Value::as_str).is_some();
+    let revoked_terminal_exact =
+        coarse_r == "denied" && terminal_r.get("kind").and_then(Value::as_str).is_some();
     let ended_after = stat_obj(&final_r, "done").and_then(Value::as_bool) == Some(true);
 
     // retired-not-zombie: the provider's record for the revoked call
@@ -3362,7 +3578,9 @@ async fn midstream_revocation(
 
     // The sibling keeps delivering in the same window and completes
     // exactly (the two-branch property).
-    let final_c = script.run(TAB_COMPLIANT, stream_read_step("rev-c", 99, 15_000)).await;
+    let final_c = script
+        .run(TAB_COMPLIANT, stream_read_step("rev-c", 99, 15_000))
+        .await;
     let items_c = stat_list(&final_c, "items");
     let expected_c: Vec<String> = (0..8)
         .map(|i| hex(format!("drip-{i}").as_bytes()))
@@ -3429,35 +3647,58 @@ async fn revocation_refuses_openings(
     // the stream's TERMINAL (the opening itself resolves), so the
     // typed identity is read there — exact coarse 'denied'.
     let open_r = script
-        .run(TAB_REVOKED, stream_open_step(N_S_SAME, b"post-raise-revoked", &creds_revoked, "post-r", None))
+        .run(
+            TAB_REVOKED,
+            stream_open_step(
+                N_S_SAME,
+                b"post-raise-revoked",
+                &creds_revoked,
+                "post-r",
+                None,
+            ),
+        )
         .await;
     let read_r = if open_r.ok {
-        script.run(TAB_REVOKED, stream_read_step("post-r", 1, 8_000)).await
+        script
+            .run(TAB_REVOKED, stream_read_step("post-r", 1, 8_000))
+            .await
     } else {
         fail("revoked open failed before a terminal could be read")
     };
-    let terminal_r = stat_obj(&read_r, "terminal").cloned().unwrap_or(Value::Null);
+    let terminal_r = stat_obj(&read_r, "terminal")
+        .cloned()
+        .unwrap_or(Value::Null);
     let coarse_r = terminal_r
         .get("stats")
         .and_then(|s| s.get("coarse"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let denied_r = terminal_r.get("kind").and_then(Value::as_str).is_some_and(|_| coarse_r == "denied");
+    let denied_r = terminal_r
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|_| coarse_r == "denied");
     // Fallback shape: the opening itself refused typed.
     let refused_exact = denied_r
-        || (!open_r.ok
-            && stat_obj(&open_r, "coarse").and_then(Value::as_str) == Some("denied"));
+        || (!open_r.ok && stat_obj(&open_r, "coarse").and_then(Value::as_str) == Some("denied"));
     let after_refusal = services.log.total();
     // The compliant generation's opening in the same window proceeds
     // exactly (the discriminating pair).
     let open_c = script
         .run(
             TAB_COMPLIANT,
-            stream_open_step(N_S_SAME, b"post-raise-compliant", &creds_compliant, "post-c", None),
+            stream_open_step(
+                N_S_SAME,
+                b"post-raise-compliant",
+                &creds_compliant,
+                "post-c",
+                None,
+            ),
         )
         .await;
     let read_c = if open_c.ok {
-        script.run(TAB_COMPLIANT, stream_read_step("post-c", 10, 15_000)).await
+        script
+            .run(TAB_COMPLIANT, stream_read_step("post-c", 10, 15_000))
+            .await
     } else {
         fail("compliant open failed")
     };
@@ -3506,7 +3747,18 @@ async fn tab_teardown(
     let serve = script
         .run(
             TAB_TEARDOWN,
-            serve_step(&handle, B_TEARDOWN, "streaming", "same-org", &owner_org, "td", &pre, &post, true, 0),
+            serve_step(
+                &handle,
+                B_TEARDOWN,
+                "streaming",
+                "same-org",
+                &owner_org,
+                "td",
+                &pre,
+                &post,
+                true,
+                0,
+            ),
         )
         .await;
     // E0.3 (adjudicated): protected org RPC is DIRECT-SESSION-ONLY —
@@ -3599,16 +3851,22 @@ async fn tab_teardown(
     open_step["deadline_ms"] = json!(4000);
     let call_started = std::time::Instant::now();
     let open = run_pinned(script, TAB_PAIR_A, open_step, 30).await;
-    let _live = script.run(TAB_PAIR_A, stream_read_step("td-call", 1, 8_000)).await;
+    let _live = script
+        .run(TAB_PAIR_A, stream_read_step("td-call", 1, 8_000))
+        .await;
     tokio::time::sleep(Duration::from_millis(700)).await;
 
     // THE TEARDOWN: destroy the serving tab.
     let closed = cx.driver.close_page(PAGE_TEARDOWN).await;
-    let final_read = script.run(TAB_PAIR_A, stream_read_step("td-call", 99, 8_000)).await;
+    let final_read = script
+        .run(TAB_PAIR_A, stream_read_step("td-call", 99, 8_000))
+        .await;
     let elapsed = call_started.elapsed();
     // The caller's stream state accumulates across reads.
     let items = stat_list(&final_read, "items");
-    let terminal = stat_obj(&final_read, "terminal").cloned().unwrap_or(Value::Null);
+    let terminal = stat_obj(&final_read, "terminal")
+        .cloned()
+        .unwrap_or(Value::Null);
     let kind = terminal
         .get("kind")
         .and_then(Value::as_str)
@@ -3633,7 +3891,18 @@ async fn tab_teardown(
     let serve2 = script
         .run(
             TAB_PAIR_A,
-            serve_step(&handle2, B_TEARDOWN, "streaming", "same-org", &owner_org, "td", &pre, &post, false, 0),
+            serve_step(
+                &handle2,
+                B_TEARDOWN,
+                "streaming",
+                "same-org",
+                &owner_org,
+                "td",
+                &pre,
+                &post,
+                false,
+                0,
+            ),
         )
         .await;
     let intent2 = world.intent(
@@ -3676,7 +3945,9 @@ async fn tab_teardown(
     };
     let fresh_expected: Vec<String> = pre.iter().chain(post.iter()).map(|c| hex(c)).collect();
     let report2 = script.run(TAB_PAIR_A, report_step(&handle2)).await;
-    let fresh_ran = stat_obj(&report2, "ran").and_then(Value::as_u64).unwrap_or(0);
+    let fresh_ran = stat_obj(&report2, "ran")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let fresh_payload_exact = stat_obj(&report2, "calls")
         .and_then(Value::as_array)
         .and_then(|c| c.first())
@@ -3685,11 +3956,7 @@ async fn tab_teardown(
         == Some(hex(b"td-fresh-call").as_str());
     let fresh_ok = serve2.ok
         && fresh_terminal == "done"
-        && fresh_items
-            .iter()
-            .map(|c| hex(c))
-            .collect::<Vec<_>>()
-            == fresh_expected
+        && fresh_items.iter().map(|c| hex(c)).collect::<Vec<_>>() == fresh_expected
         && fresh_ran == 1
         && fresh_payload_exact;
     ledger.record(
@@ -3867,7 +4134,9 @@ async fn leader_replacement(
             stream_open_step(N_TEARDOWN, &pending_payload, &creds, "repl-pending", None),
         )
         .await;
-    let live = script.run(TAB_FOLLOW1, stream_read_step("repl-pending", 1, 8_000)).await;
+    let live = script
+        .run(TAB_FOLLOW1, stream_read_step("repl-pending", 1, 8_000))
+        .await;
     let precondition = open.ok && !stat_list(&live, "items").is_empty();
 
     // THE REPLACEMENT: close the leader tab mid-stream; a follower
@@ -3889,7 +4158,9 @@ async fn leader_replacement(
     let final_read = script
         .run(TAB_FOLLOW1, stream_read_step("repl-pending", 99, 8_000))
         .await;
-    let terminal = stat_obj(&final_read, "terminal").cloned().unwrap_or(Value::Null);
+    let terminal = stat_obj(&final_read, "terminal")
+        .cloned()
+        .unwrap_or(Value::Null);
     let kind = terminal.get("kind").and_then(Value::as_str).unwrap_or("");
     // The surface's exact LeaderLost class spelling.
     let typed_lost = kind == "org-leader-lost"
@@ -3911,7 +4182,11 @@ async fn leader_replacement(
         30,
     )
     .await;
-    let successor_reply = successor.reply.as_deref().map(crate::unhex).unwrap_or_default();
+    let successor_reply = successor
+        .reply
+        .as_deref()
+        .map(crate::unhex)
+        .unwrap_or_default();
     let successor_expected = expected_unary("u-leader", &successor_payload);
     let successor_ok = successor.ok && successor_reply == successor_expected;
     let successor_recorded = service_log
@@ -3989,8 +4264,12 @@ async fn leader_teardown(
         8,
     )
     .await;
-    let live1 = script.run(TAB_FOLLOW2, stream_read_step("td-p1", 1, 8_000)).await;
-    let live2 = script.run(TAB_FOLLOW2, stream_read_step("td-p2", 1, 8_000)).await;
+    let live1 = script
+        .run(TAB_FOLLOW2, stream_read_step("td-p1", 1, 8_000))
+        .await;
+    let live2 = script
+        .run(TAB_FOLLOW2, stream_read_step("td-p2", 1, 8_000))
+        .await;
     let precondition = open1.ok
         && open2.ok
         && !stat_list(&live1, "items").is_empty()
@@ -4001,7 +4280,9 @@ async fn leader_teardown(
     // closed the original leader. Assert that as a precondition and
     // close it; BOTH pending calls live on FOLLOW2 so their terminals
     // stay observable after the close.
-    let info1 = script.run(TAB_FOLLOW1, json!({ "kind": "info", "session": SESSION })).await;
+    let info1 = script
+        .run(TAB_FOLLOW1, json!({ "kind": "info", "session": SESSION }))
+        .await;
     let role1 = role_of(&info1);
     let leader_page = PAGE_FOLLOW1;
     let pending_tab = TAB_FOLLOW2;
@@ -4015,8 +4296,12 @@ async fn leader_teardown(
     let final2 = script
         .run(TAB_FOLLOW2, stream_read_step("td-p2", 99, 8_000))
         .await;
-    let t1 = stat_obj(&final1, "terminal").cloned().unwrap_or(Value::Null);
-    let t2 = stat_obj(&final2, "terminal").cloned().unwrap_or(Value::Null);
+    let t1 = stat_obj(&final1, "terminal")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let t2 = stat_obj(&final2, "terminal")
+        .cloned()
+        .unwrap_or(Value::Null);
     let k1 = t1.get("kind").and_then(Value::as_str).unwrap_or("");
     let k2 = t2.get("kind").and_then(Value::as_str).unwrap_or("");
     let typed_lost = |k: &str| {
@@ -4093,7 +4378,18 @@ async fn handler_completion_after_retirement(
     let serve = script
         .run(
             TAB_PAIR_B,
-            serve_step(&handle, B_DEFER, "streaming", "same-org", &owner_org, "hr", &pre, &post, false, 800),
+            serve_step(
+                &handle,
+                B_DEFER,
+                "streaming",
+                "same-org",
+                &owner_org,
+                "hr",
+                &pre,
+                &post,
+                false,
+                800,
+            ),
         )
         .await;
     let creds = world.creds(
@@ -4107,15 +4403,23 @@ async fn handler_completion_after_retirement(
     );
     let pair_before = forwarded_pair(cx.anchor, &world.pair_a.entity, &world.pair_b.entity);
     let open = script
-        .run(TAB_PAIR_A, stream_open_step(B_DEFER, b"hr-call", &creds, "hr-call", None))
+        .run(
+            TAB_PAIR_A,
+            stream_open_step(B_DEFER, b"hr-call", &creds, "hr-call", None),
+        )
         .await;
-    let _live = script.run(TAB_PAIR_A, stream_read_step("hr-call", 1, 8_000)).await;
+    let _live = script
+        .run(TAB_PAIR_A, stream_read_step("hr-call", 1, 8_000))
+        .await;
     let mid_pair = forwarded_pair(cx.anchor, &world.pair_a.entity, &world.pair_b.entity);
 
     // THE RETIREMENT: cancel mid-stream; then let the handler finish
     // (its defer_ms keeps it alive 800 ms past this point).
     let cancel = script
-        .run(TAB_PAIR_A, json!({ "kind": "org_stream_cancel", "handle": "hr-call" }))
+        .run(
+            TAB_PAIR_A,
+            json!({ "kind": "org_stream_cancel", "handle": "hr-call" }),
+        )
         .await;
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let after_pair = forwarded_pair(cx.anchor, &world.pair_a.entity, &world.pair_b.entity);
@@ -4131,7 +4435,10 @@ async fn handler_completion_after_retirement(
     // `retired_at` is armed by the page at construction now, so a
     // missing reading is a FAIL, not a vacuous pass.
     let report = script.run(TAB_PAIR_B, report_step(&handle)).await;
-    let calls = stat_obj(&report, "calls").and_then(Value::as_array).cloned().unwrap_or_default();
+    let calls = stat_obj(&report, "calls")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let record = calls.first().cloned().unwrap_or(Value::Null);
     let retired_at = record.get("retired_at").and_then(Value::as_f64);
     let completed_at = record.get("completed_at").and_then(Value::as_f64);
@@ -4147,7 +4454,12 @@ async fn handler_completion_after_retirement(
     let entry_items: Vec<String> = record
         .get("items")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default();
     let late_hex: Vec<String> = vec![hex(b"hr-late-0"), hex(b"hr-late-1")];
     // At least ONE late send was attempted (the handler reached its
@@ -4239,10 +4551,14 @@ async fn read_timeout_never_drops_items(
     let first_items = stat_list(&first, "items");
     // Let the drip deliver the late item into the retained pull.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let second = script.run(TAB_CALL, stream_read_step("sd", 10, 8_000)).await;
+    let second = script
+        .run(TAB_CALL, stream_read_step("sd", 10, 8_000))
+        .await;
     let items = stat_list(&second, "items");
-    let terminal_done =
-        stat_obj(&second, "terminal").and_then(|t| t.get("done")).and_then(Value::as_bool) == Some(true);
+    let terminal_done = stat_obj(&second, "terminal")
+        .and_then(|t| t.get("done"))
+        .and_then(Value::as_bool)
+        == Some(true);
     let expected = vec![hex(b"sd-0"), hex(b"sd-1"), hex(b"sd-2")];
 
     ledger.record(
@@ -4289,7 +4605,10 @@ fn parity_codec_round_trip(world: &OrgWorld) -> (bool, String) {
             now_unix_ns() + 10_000_000_000,
             [9u8; 32],
         );
-        vec![(ORG_ADMISSION_HEADER.to_string(), proof.encode().expect("encode"))]
+        vec![(
+            ORG_ADMISSION_HEADER.to_string(),
+            proof.encode().expect("encode"),
+        )]
     };
     let granted_headers = {
         let proof = leaf_org::OrgCallProof::sign_for_call(
@@ -4308,7 +4627,10 @@ fn parity_codec_round_trip(world: &OrgWorld) -> (bool, String) {
             now_unix_ns() + 10_000_000_000,
             [9u8; 32],
         );
-        vec![(ORG_ADMISSION_HEADER.to_string(), proof.encode().expect("encode"))]
+        vec![(
+            ORG_ADMISSION_HEADER.to_string(),
+            proof.encode().expect("encode"),
+        )]
     };
 
     let mut rows = Vec::new();
@@ -4374,8 +4696,11 @@ fn core_decodes_identically(payload: &[u8], want: &RpcRequestPayload) -> bool {
 /// `verify_org_admission` against a real `AdmissionContext`.
 fn parity_leaf_proof_under_core(world: &OrgWorld) -> (bool, String) {
     let caller_key = net_leaf::identity::EntityKeypair::from_secret([0x36u8; 32]);
-    let (membership, dispatcher) =
-        world.belonging(&world.root_a, &EntityId::from_bytes(*caller_key.entity_id()), 1);
+    let (membership, dispatcher) = world.belonging(
+        &world.root_a,
+        &EntityId::from_bytes(*caller_key.entity_id()),
+        1,
+    );
     let leaf_proof = leaf_org::OrgCallProof::sign_for_call(
         &caller_key,
         leaf_org::OrgMembershipCert::from_bytes(&membership.to_bytes()).expect("cert"),
@@ -4434,7 +4759,10 @@ fn parity_leaf_proof_under_core(world: &OrgWorld) -> (bool, String) {
                 ),
             )
         }
-        Err(denied) => (false, format!("core DENIED the leaf-minted proof: {denied:?}")),
+        Err(denied) => (
+            false,
+            format!("core DENIED the leaf-minted proof: {denied:?}"),
+        ),
     }
 }
 
@@ -4462,7 +4790,9 @@ fn parity_core_proof_under_leaf(world: &OrgWorld) -> (bool, String) {
     let bytes = core_proof.encode().expect("encode");
     let leaf_bytes = leaf_org::OrgCallProof::decode(&bytes).expect("leaf decodes core's proof");
 
-    use leaf_org::{verify_org_admission as leaf_verify, AdmissionContext as LeafCtx, OrgAdmission as LeafMode};
+    use leaf_org::{
+        verify_org_admission as leaf_verify, AdmissionContext as LeafCtx, OrgAdmission as LeafMode,
+    };
     let caller_entity = caller_key.entity_id().clone();
     let provider = world.anchor_entity.clone();
     let floors = leaf_org::RevocationFacts::default();
@@ -4485,7 +4815,15 @@ fn parity_core_proof_under_leaf(world: &OrgWorld) -> (bool, String) {
     );
     let replay = leaf_org::AdmissionReplayGuard::new(leaf_org::AdmissionReplayConfig::default());
     let encoded = leaf_bytes.encode().expect("re-encode");
-    match leaf_verify(&ctx, &[&encoded[..]], &replay, now_unix_ns(), now_mono_ms(), || true, |_| true) {
+    match leaf_verify(
+        &ctx,
+        &[&encoded[..]],
+        &replay,
+        now_unix_ns(),
+        now_mono_ms(),
+        || true,
+        |_| true,
+    ) {
         Ok(admitted) => {
             let ok = admitted.caller == caller_leaf && admitted.provider == provider_leaf;
             (
@@ -4501,7 +4839,10 @@ fn parity_core_proof_under_leaf(world: &OrgWorld) -> (bool, String) {
                 ),
             )
         }
-        Err(denied) => (false, format!("leaf DENIED the core-minted proof: {denied:?}")),
+        Err(denied) => (
+            false,
+            format!("leaf DENIED the core-minted proof: {denied:?}"),
+        ),
     }
 }
 
@@ -4692,8 +5033,10 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     json!({ "kind": "query", "session": SESSION, "capability": "org.s4.native" }),
                 )
                 .await;
-            let sees_anchor = peers_of(&seen)
-                .map_or(false, |p| p.to_string().contains(&hex32(world.anchor_entity.as_bytes())));
+            let sees_anchor = peers_of(&seen).map_or(false, |p| {
+                p.to_string()
+                    .contains(&hex32(world.anchor_entity.as_bytes()))
+            });
             if !sees_anchor {
                 pages_pinned = false;
             }
@@ -4724,18 +5067,40 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
     }
 
     // ── A: browser→native (8) ──
-    browser_call_matrix(&cx, &world, &mut script, ledger, &services, &leaves[TAB_CALL]).await;
+    browser_call_matrix(
+        &cx,
+        &world,
+        &mut script,
+        ledger,
+        &services,
+        &leaves[TAB_CALL],
+    )
+    .await;
 
     // ── B: native→browser (8) ──
     native_call_matrix(&cx, &world, &mut script, ledger, &leaves[TAB_SERVE]).await;
 
     // ── C: browser→browser (5) ──
-    browser_pair_matrix(&world, &mut script, ledger, &leaves[TAB_PAIR_A], &leaves[TAB_PAIR_B]).await;
+    browser_pair_matrix(
+        &world,
+        &mut script,
+        ledger,
+        &leaves[TAB_PAIR_A],
+        &leaves[TAB_PAIR_B],
+    )
+    .await;
 
     // ── D: attribution / refusal (3) ──
     wrong_peer_refused(&cx, &world, &mut script, ledger, &leaves[TAB_SERVE]).await;
-    old_session_frames_refused(&cx, &world, &mut script, ledger, &services, &leaves[TAB_OLD])
-        .await;
+    old_session_frames_refused(
+        &cx,
+        &world,
+        &mut script,
+        ledger,
+        &services,
+        &leaves[TAB_OLD],
+    )
+    .await;
     replayed_opening_refused(&cx, &world, &mut script, ledger, &leaves[TAB_SERVE]).await;
 
     // ── E: backpressure / half-close (3) ──

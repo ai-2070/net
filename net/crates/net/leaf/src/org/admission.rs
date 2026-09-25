@@ -651,9 +651,7 @@ pub fn verify_org_admission(
         now_mono_ms
     } else {
         let remaining_ms = (retain_until_wall_ns - now_unix_ns).div_ceil(1_000_000);
-        now_mono_ms
-            .saturating_add(remaining_ms)
-            .saturating_add(1)
+        now_mono_ms.saturating_add(remaining_ms).saturating_add(1)
     };
     let principal = ReplayPrincipal {
         caller: ctx.authenticated_caller,

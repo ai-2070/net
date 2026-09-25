@@ -865,7 +865,11 @@ mod repair_witnesses {
                 }
                 _ => {
                     out.push(src[i..].chars().next().expect("non-empty remainder"));
-                    i += src[i..].chars().next().expect("non-empty remainder").len_utf8();
+                    i += src[i..]
+                        .chars()
+                        .next()
+                        .expect("non-empty remainder")
+                        .len_utf8();
                 }
             }
         }
@@ -949,11 +953,9 @@ mod repair_witnesses {
             let after = at + leaf.len();
             let after_ok = after >= bytes.len()
                 || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
-            let continues_segment = code[after..]
-                .strip_prefix("::")
-                .is_some_and(|rest| {
-                    rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-                });
+            let continues_segment = code[after..].strip_prefix("::").is_some_and(|rest| {
+                rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            });
             let middle_segment = code[..at].ends_with("::") && continues_segment;
             if before_ok && after_ok && !middle_segment {
                 return true;
