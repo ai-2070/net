@@ -1,0 +1,20 @@
+net/crates/net/bindings/node/org.ts
+  h_64425bc75e3f3d 277-284
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  h_64425bc75e3f3d 114-127,131-137,144,152,157-162,164-165,1297-1303,1432-1521,1646-1649,1651,1697-1703,1746-1749,1844-1847,1849,1852,1862,2724-2860
+net/crates/net/bindings/node/src/org.rs
+  h_64425bc75e3f3d 728-734,874-875,884-886,984-986,1048-1051
+net/crates/net/bindings/node/test/org_live.test.ts
+  h_64425bc75e3f3d 19,44,56-60,64-65,72-78,81,227-235,238,240-241,245,258,270-310,377,391-393,395-398,486-487,505-506,527-528,572-584,610-615,617-627,662-747,925-927,929-932
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5c78e5218be946c36b82176f2d460c9f7ec11dcf",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
