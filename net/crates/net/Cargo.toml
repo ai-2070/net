@@ -481,6 +481,16 @@ required-features = ["net", "cortex", "fixtures"]
 name = "org_rpc_streaming"
 required-features = ["net", "cortex", "fixtures"]
 
+# The cross-process org-scoped proof (tests/org_scoped_cross_process.rs)
+# carries the same vanish hazard as TESTS-7 above: its whole body is gated
+# `#![cfg(all(feature = "net", feature = "cortex"))]`, so a
+# feature-incomplete invocation built a 0-test binary and exited 0. The
+# contract lives in the target: an invocation missing a feature now skips
+# (or, with an explicit `--test` request, refuses) instead of passing empty.
+[[test]]
+name = "org_scoped_cross_process"
+required-features = ["net", "cortex"]
+
 [[test]]
 name = "handshake_retry_resync"
 required-features = ["net"]
