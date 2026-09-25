@@ -5,6 +5,21 @@
 //! below is the parent's. At the head they landed on they reproduced
 //! eight failures against four controls; each repair row turns named
 //! probes green without touching this file.
+//!
+//! One exception, `36cb4c0d6`, which supersedes the "without
+//! touching this file" claim above for one probe:
+//! `kyra_reliable_fragment_head_promotes_consumer_before_faf_tail_traffic`'s
+//! delivery body and terminal assertion (this file's :146-156) are
+//! no longer the reviewer's. The FAF tail packet is now delivered
+//! BETWEEN the two reliable fragments, and the closing assertion
+//! requires the consumer to hold the complete 9000-byte reliable
+//! body (`payload.as_ref()==body.as_slice()`) under the message "all
+//! consistent reliable fragments arrived but consumer lost the
+//! message". The rewrite makes the body enforce the ordering the
+//! probe's name claims. The name is unchanged and every other probe
+//! and helper in this file is still Kyra's verbatim — but the
+//! provenance claim above holds only up to `36cb4c0d6`, and this
+//! file is not verbatim below this header.
 //! Reviewer composition probes: payload and reliable ownership boundaries.
 
 fn pair() -> (LeafNode, LeafNode) {
@@ -148,7 +163,7 @@ fn kyra_reliable_fragment_head_promotes_consumer_before_faf_tail_traffic() {
     b.on_datagram(a.node_id(), pieces[1].packet.clone(), now);
     transfer(&mut b, &mut a);
     let events = b.drain_events();
-    assert!(events.iter().any(|e|matches!(e,LeafEvent::StreamData{payload,..} if payload.as_ref()==body.as_slice()))||events.iter().any(|e|matches!(e,LeafEvent::StreamFailed{..})),
+    assert!(events.iter().any(|e|matches!(e,LeafEvent::StreamData{payload,..} if payload.as_ref()==body.as_slice())),
         "all consistent reliable fragments arrived but consumer lost the message; events={events:?}");
 }
 #[test]

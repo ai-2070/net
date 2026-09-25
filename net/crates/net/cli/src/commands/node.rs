@@ -37,10 +37,18 @@ use crate::prelude::{emit_value, OutputFormat};
 pub enum NodeCommand {
     /// Adopt this node into an organization (install ownership).
     Adopt(AdoptArgs),
+
+    /// Report the state of this profile's `net-mesh up` node, verified
+    /// through its lifetime lock and authenticated control endpoint.
+    Status(crate::commands::lifecycle::StatusArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct AdoptArgs {
+    /// Resolve the adoption inputs and destination without installing ownership.
+    #[arg(long)]
+    pub inspect_target: bool,
+
     /// Path to the membership certificate JSON (from
     /// `net-mesh org issue-cert`).
     #[arg(long, value_name = "PATH")]
@@ -67,6 +75,11 @@ pub struct AdoptArgs {
     /// `net-mesh org issue-floors`) to merge during adoption.
     #[arg(long, value_name = "PATH")]
     pub floors: Option<PathBuf>,
+    /// The org's shared owner audience (`org audience-keygen`), installed
+    /// instead of a node-local one so this node can discover other members'
+    /// private services.
+    #[arg(long, value_name = "PATH")]
+    pub audience: Option<PathBuf>,
 
     /// Clock-skew tolerance (seconds) for the certificate window
     /// check. Strict by default, mirroring the token module;
@@ -81,13 +94,26 @@ pub struct AdoptArgs {
     pub insecure_permissions: bool,
 }
 
-pub async fn run(cmd: NodeCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
+pub async fn run(
+    cmd: NodeCommand,
+    output: Option<OutputFormat>,
+    config_path: Option<&Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
     match cmd {
-        NodeCommand::Adopt(args) => run_adopt(args, output).await,
+        NodeCommand::Adopt(args) => run_adopt(args, output, config_path, profile_name).await,
+        NodeCommand::Status(args) => {
+            crate::commands::lifecycle::run_status(args, output, profile_name).await
+        }
     }
 }
 
-async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+async fn run_adopt(
+    args: AdoptArgs,
+    output: Option<OutputFormat>,
+    config_path: Option<&Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
     // Enforce the token-module clock-skew ceiling BEFORE touching
     // anything (review-8 §11): the library would refuse too, but a
     // misuse this plain is argument validation, not a ceremony
@@ -114,6 +140,40 @@ async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), 
         }
         (Some(_), Some(_)) => unreachable!("clap conflicts_with enforces exclusivity"),
     };
+
+    let dir = resolve_authority_dir(args.authority_dir.as_deref())?;
+    if args.inspect_target {
+        let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+        let mut target = crate::target::TargetInspection::local(&profile, "persistent_store");
+        target.store = Some(dir);
+        target.source = Some(args.cert.clone());
+        target.subject_fingerprint = Some(crate::target::public_fingerprint(entity.as_bytes()));
+        target.provenance(
+            "store",
+            if args.authority_dir.is_some() {
+                "flag"
+            } else {
+                "default"
+            },
+        );
+        target.provenance("source", "flag");
+        target.provenance(
+            "subject",
+            if args.identity.is_some() {
+                "identity_file"
+            } else {
+                "flag"
+            },
+        );
+        let view = AdoptInspection {
+            target,
+            identity_source: args.identity,
+            floors_source: args.floors,
+            files: NodeAuthority::file_names(),
+        };
+        return emit_value(OutputFormat::resolve_oneshot(output), &view)
+            .map_err(|e| generic(format!("write inspection: {e}")));
+    }
 
     // Load the certificate envelope.
     let cert_text = tokio::fs::read_to_string(&args.cert).await.map_err(|e| {
@@ -168,17 +228,6 @@ async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), 
         None => None,
     };
 
-    let dir = match args.authority_dir.clone() {
-        Some(explicit) => explicit,
-        None => default_authority_dir().ok_or_else(|| {
-            invalid_args(
-                "cannot determine the default authority directory on this platform \
-                 (no config dir); pass --authority-dir explicitly. Refusing to fall \
-                 back to the working directory — the authority dir holds the raw \
-                 owner audience key.",
-            )
-        })?,
-    };
     // The authority scaffold (`NodeAuthority::adopt`) owns creating the
     // authority directory as an owner-only (0700, atomic) local security
     // boundary and validating an existing one. We deliberately do NOT
@@ -208,14 +257,31 @@ async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), 
     // floors durably, and publishes membership last. Sync file I/O
     // on a oneshot CLI path; the same pattern as `identity
     // revoke`'s store write.
-    let authority = NodeAuthority::adopt(
-        &dir,
-        cert_file.cert,
-        &entity,
-        args.skew_secs,
-        floors_bundle.as_ref(),
-    )
+    let audience = match &args.audience {
+        Some(path) => Some(super::org::load_org_audience(path, false).await?),
+        None => None,
+    };
+    let authority = match &audience {
+        // The org's shared audience rather than a node-local one.
+        Some(audience) => NodeAuthority::adopt_with_audience(
+            &dir,
+            cert_file.cert,
+            &entity,
+            args.skew_secs,
+            floors_bundle.as_ref(),
+            audience,
+        ),
+        None => NodeAuthority::adopt(
+            &dir,
+            cert_file.cert,
+            &entity,
+            args.skew_secs,
+            floors_bundle.as_ref(),
+        ),
+    }
     .map_err(|e| sdk(format!("adopt refused: {e}")))?;
+    // An explicit, authorized adoption ends a recorded `org leave`.
+    super::lifecycle::clear_org_left(&dir);
 
     let summary = AdoptOutput {
         authority_dir: dir.display().to_string(),
@@ -229,6 +295,31 @@ async fn run_adopt(args: AdoptArgs, output: Option<OutputFormat>) -> Result<(), 
     emit_value(OutputFormat::resolve_oneshot(output), &summary)
         .map_err(|e| generic(format!("write summary: {e}")))?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct AdoptInspection {
+    #[serde(flatten)]
+    target: crate::target::TargetInspection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_source: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    floors_source: Option<PathBuf>,
+    files: [&'static str; 3],
+}
+
+fn resolve_authority_dir(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(default_authority_dir)
+        .ok_or_else(|| {
+            invalid_args(
+                "cannot determine the default authority directory on this platform \
+             (no config dir); pass --authority-dir explicitly. Refusing to fall \
+             back to the working directory — the authority dir holds the raw \
+             owner audience key.",
+            )
+        })
 }
 
 #[derive(Debug, Serialize)]

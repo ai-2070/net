@@ -53,10 +53,13 @@ pub fn is_binding_request(datagram: &[u8]) -> bool {
 /// `USERNAME` (RFC 8445 §7.2.2) with the peer's negotiated ufrag
 /// pair; a client asking "what is my reflexive address?" carries no
 /// attributes at all. Attribute walking is bounds-checked and
-/// bounded by the header's own length field — a malformed request
-/// simply stops the walk, and an unparsable one is treated as
-/// credentialed (the conservative answer: hand it to the sessions
-/// rather than answer it blind).
+/// bounded by the header's own length field — and a walk that does
+/// not complete cleanly (an attribute length running past the body,
+/// a truncated trailing header) is treated as credentialed (the
+/// conservative answer: hand it to the sessions rather than answer
+/// it blind). Only a walk that consumed the body EXACTLY may answer
+/// "no `USERNAME`": anything less lets a corrupted attribute length
+/// field disguise an ICE check as a gathering request.
 pub fn has_username(datagram: &[u8]) -> bool {
     if !is_binding_request(datagram) {
         return false;
@@ -73,11 +76,18 @@ pub fn has_username(datagram: &[u8]) -> bool {
         // Attributes are padded to a 4-byte boundary.
         let padded = len.div_ceil(4) * 4;
         i = match i.checked_add(4).and_then(|i| i.checked_add(padded)) {
-            Some(next) if next > i => next,
-            _ => break,
+            Some(next) if next <= body.len() => next,
+            // The declared length runs past the body (or overflowed):
+            // the walk did not complete, so the request is unparsable
+            // — credentialed, not a gathering request.
+            _ => return true,
         };
     }
-    false
+    // A clean walk consumes the body exactly and answers "no
+    // `USERNAME`". Anything left over — one to three bytes of a
+    // truncated attribute header — is unparsable, therefore
+    // credentialed.
+    i != body.len()
 }
 
 /// Build the binding success response for `request`, reporting
@@ -258,6 +268,53 @@ mod tests {
         let source: SocketAddr = "[2001:db8::1]:9000".parse().expect("addr");
         let resp = binding_response(&req, source).expect("response");
         assert_eq!(parse_xor_mapped_address(&resp), Some(source));
+    }
+
+    /// The `USERNAME` walk is the ICE-check-vs-gathering
+    /// discriminator (R4-A): a clean request carrying `USERNAME` is
+    /// credentialed, a clean request carrying none is not.
+    #[test]
+    fn username_is_the_ice_check_discriminator() {
+        let mut check = hand_built_request([0x51u8; TXID_LEN]);
+        // USERNAME attribute: type 0x0006, length 8, 8 bytes of ufrag pair.
+        check[2..4].copy_from_slice(&12u16.to_be_bytes()); // one padded attr
+        check.extend_from_slice(&[0x00, 0x06, 0x00, 0x08]);
+        check.extend_from_slice(b"ufragxxx");
+        assert!(has_username(&check), "an ICE check carries USERNAME");
+
+        let gathering = hand_built_request([0x52u8; TXID_LEN]);
+        assert!(
+            !has_username(&gathering),
+            "a clean gathering request carries no attributes at all"
+        );
+    }
+
+    /// The conservative default must hold on a walk that cannot
+    /// complete: corrupting one attribute length field must not
+    /// disguise an ICE check as an unsolicited gathering request
+    /// (which callers answer blind). Inverse: the pre-fix walk
+    /// `break`ed and answered `false` here.
+    #[test]
+    fn an_unparsable_attribute_walk_is_credentialed_the_conservative_answer() {
+        // Correctly framed message (header length matches the
+        // datagram) whose ONE attribute declares more bytes than the
+        // body carries: the walk cannot complete.
+        let mut lying = hand_built_request([0x53u8; TXID_LEN]);
+        lying[2..4].copy_from_slice(&4u16.to_be_bytes());
+        lying.extend_from_slice(&[0x00, 0x08, 0x00, 0x20]); // declares 32, carries 0
+        assert!(is_binding_request(&lying), "the framing itself is valid");
+        assert!(
+            has_username(&lying),
+            "an uncompletable attribute walk is unparsable, and an \
+             unparsable request is treated as credentialed"
+        );
+
+        // …and a truncated trailing attribute header is unparsable
+        // in the same way.
+        let mut truncated = hand_built_request([0x54u8; TXID_LEN]);
+        truncated[2..4].copy_from_slice(&2u16.to_be_bytes());
+        truncated.extend_from_slice(&[0x00, 0x08]); // half an attribute header
+        assert!(has_username(&truncated));
     }
 
     /// Everything else on the RTC socket — DTLS, SRTP, a truncated

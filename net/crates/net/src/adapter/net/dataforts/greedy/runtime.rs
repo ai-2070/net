@@ -133,7 +133,7 @@ pub enum DispatchOutcome {
     /// counter for the reason.
     RejectedByAdmission(AdmitRejectReason),
     /// Admission passed but the bandwidth budget refused — try
-    /// later. The runtime bumped the `capacity` reject counter.
+    /// later. The runtime bumped the `bandwidth` reject counter.
     BandwidthExhausted,
     /// Append into the per-channel cache failed (typically the
     /// disk-tier rejected the write). Greedy is best-effort; the

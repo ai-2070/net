@@ -32,7 +32,7 @@
 //! contained the same way as the other two:
 //!
 //! - `tests/cross_lang_wire/enroll_exchange.json` pins the bytes,
-//!   and `tests/enroll_parity.rs` asserts this module reproduces
+//!   and `tests/fixture_parity.rs` asserts this module reproduces
 //!   them from a deterministic identity and invite;
 //! - the **live** cross-check is stronger than either: the browser
 //!   matrix runs this request against the anchor's real
@@ -119,7 +119,7 @@ pub mod reject {
 /// opaque: the enrollment request has to echo `nonce` as
 /// proof-of-invite and bind `root` into its signature, so a leaf
 /// that cannot read it cannot enroll.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Invite {
     /// The mesh root this invite admits to, bound into the join
     /// signature so a request captured for one mesh cannot be
@@ -132,6 +132,27 @@ pub struct Invite {
     pub expires_at: u64,
     /// Where the device was told to present itself.
     pub rendezvous: String,
+}
+
+/// Redacting `Debug` (M16).
+///
+/// `nonce` is proof-of-invite for a single-use invite: anyone holding
+/// it can `build_join_request` echoing the stolen nonce, root under
+/// their own device key and redeem first — and the authority's
+/// single-use accounting then burns the victim's only attempt. The
+/// derived `Debug` printed it in cleartext straight through
+/// `Credential`'s own *redacting* `Debug`, one field below the
+/// redaction. `root` is the mesh root public key and `expires_at` /
+/// `rendezvous` are not secret, so those stay visible.
+impl core::fmt::Debug for Invite {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Invite")
+            .field("root", &crate::identity::hex_lower(&self.root))
+            .field("nonce", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("rendezvous", &self.rendezvous)
+            .finish()
+    }
 }
 
 impl Invite {

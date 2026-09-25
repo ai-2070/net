@@ -72,7 +72,7 @@ import {
   type PeerPrimitives,
 } from '../peer-driver.js';
 import { LeafStream, type OpenStreamOptions } from '../stream.js';
-import { loadLeafWasm } from '../wasm.js';
+import { idArg, loadLeafWasm } from '../wasm.js';
 import {
   isLifecycleEvent,
   parseSessionEvent,
@@ -327,8 +327,11 @@ export class MeshSession {
    * Sign and send a `0x0D02` signalling envelope — the
    * session-independent path, so no session with `peer` is needed.
    */
-  async signal(peerHex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void> {
-    await this.guard(() => this.inner.signal(peerHex, dialog, kind, payload));
+  async signal(peerHex: string, dialogHex: string, kind: string, payload: Uint8Array): Promise<void> {
+    // The same id marshaling `BrowserNode.signal` applies (finding
+    // #52): strings verbatim, a non-string refused by the parsers'
+    // names — peer first — before the wasm seam.
+    await this.guard(() => this.inner.signal(idArg(peerHex, 'peer'), idArg(dialogHex, 'dialog'), kind, payload));
   }
 
   /**

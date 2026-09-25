@@ -13,12 +13,15 @@
 //! `SubnetGrant`s for protected transport rights.
 
 pub mod admission;
+pub mod admission_wire;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod alloc_probe;
 mod assignment;
 pub mod auth;
 pub mod control;
 mod error;
+pub mod floor_status;
+pub mod floor_store;
 mod gateway;
 mod id;
 pub mod provision;
@@ -35,9 +38,9 @@ pub use auth::{
     build_gateway_context_set, compile_gateway_context, ExpectedBinding, ForwardDenial,
     SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig, SubnetBoundarySet,
     SubnetCredentialSet, SubnetExportBinding, SubnetFloorRegistry, SubnetGrant, SubnetIssuerGrant,
-    SubnetRef, SubnetRevocationFloor, SubnetRights, TransitionDecision, VerifiedGatewayContext,
-    VerifiedGatewayContextSet, VerifiedSubnetAuthority, VerifiedSubnetContext,
-    MAX_GATEWAY_CONTEXTS_PER_AUTHORITY, MAX_TRANSITION_LOOKUPS,
+    SubnetRef, SubnetRevocationFloor, SubnetRights, SubnetSubjectFloor, TransitionDecision,
+    VerifiedGatewayContext, VerifiedGatewayContextSet, VerifiedSubnetAuthority,
+    VerifiedSubnetContext, MAX_GATEWAY_CONTEXTS_PER_AUTHORITY, MAX_TRANSITION_LOOKUPS,
 };
 pub use control::{
     GatewayAdvertisement, SubnetControlFact, SubnetControlOutcome, SubnetControlStore,

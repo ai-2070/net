@@ -50,6 +50,10 @@ use crate::wrap::invoke::{
 };
 use crate::wrap::DelegationSigner;
 
+/// The most one provider call spends opening a session to a provider it
+/// learned of through a hub (direct first, then relayed).
+const ENSURE_SESSION_MAX: Duration = Duration::from_secs(5);
+
 /// How many times a bounded call is retried before giving up (covers the
 /// reply-channel first-reply race).
 const MAX_ATTEMPTS: usize = 4;
@@ -173,6 +177,17 @@ impl MeshGateway {
             request_headers: headers,
             ..CallOptions::default()
         };
+        // A provider discovered through a hub has no session with this
+        // node yet: open one (direct first, then relayed) through the SDK,
+        // bounded by this attempt's budget. The session is the provider's
+        // own, endpoint-authenticated — never the hub's. A failure is left
+        // to the call, which reports the missing route itself.
+        let started = tokio::time::Instant::now();
+        let _ = self
+            .mesh
+            .ensure_session(node, (timeout / 2).min(ENSURE_SESSION_MAX))
+            .await;
+        let timeout = timeout.saturating_sub(started.elapsed());
         match tokio::time::timeout(timeout, self.mesh.call(node, service, body, opts)).await {
             Ok(Ok(reply)) => Ok(reply.body),
             Ok(Err(e)) => Err(e),

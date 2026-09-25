@@ -3721,6 +3721,15 @@ async fn publish_response_to_caller(
     payload: Bytes,
     fallback: ResponseRouteFallback,
 ) -> Result<(), AdapterError> {
+    let payload = bound_response_packet(payload)?;
+    let fragmented = EventMeta::from_bytes(&payload)
+        .is_some_and(|meta| meta.dispatch == crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE)
+        && RpcResponsePayload::decode(payload.slice(EVENT_META_SIZE..)).is_ok_and(|response| {
+            response
+                .headers
+                .iter()
+                .any(|(name, _)| name == crate::adapter::net::cortex::rpc::large_response::HEADER)
+        });
     // OA2-E0.2: every server→caller frame (RESPONSE / DEADLINE /
     // REQUEST_GRANT / STREAM_GRANT built for the reply channel)
     // funnels through here, so insert the RpcRouteV1 discriminator —
@@ -3852,18 +3861,24 @@ async fn publish_response_to_caller(
     //                  transmitted. Safe to fall back per `fallback`.
     if let Some(target_node_id) = resolved {
         match mesh
-            .try_publish_to_peer(
+            .try_publish_to_peer_bound(
                 target_node_id,
                 reply_channel_hash,
                 reply_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload),
+                fragmented.then_some(receiving_session_id),
             )
             .await
         {
             PeerPublishOutcome::Sent => return Ok(()),
             PeerPublishOutcome::SendFailed(e) => return Err(e),
             PeerPublishOutcome::NoSession => {
+                if fragmented {
+                    return Err(AdapterError::Connection(
+                        "RPC response session retired".into(),
+                    ));
+                }
                 if fallback == ResponseRouteFallback::DirectOnly {
                     // The authenticated peer's session vanished. Drop the
                     // frame — a denial must never reflect onto a claimed
@@ -3894,6 +3909,152 @@ async fn publish_response_to_caller(
     // at send time (nothing was sent).
     let publisher = ChannelPublisher::new(reply_channel.clone(), PublishConfig::default());
     mesh.publish(&publisher, payload).await.map(|_| ())
+}
+
+/// Preserve the call identity while replacing a response this publish path
+/// cannot transport with a small, old-peer-compatible terminal error. Never
+/// echo application bytes or invite a retry: the handler may have committed.
+fn bound_response_packet(payload: Bytes) -> Result<Bytes, AdapterError> {
+    let event_size = payload.len().saturating_add(RPC_ROUTE_V1_SIZE);
+    let limit = net_wire::protocol::MAX_EVENT_SIZE;
+    if event_size <= limit {
+        return Ok(payload);
+    }
+    let meta = payload
+        .get(..EVENT_META_SIZE)
+        .and_then(EventMeta::from_bytes);
+    if !meta.is_some_and(|meta| meta.dispatch == crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE)
+    {
+        return Err(AdapterError::Connection(format!(
+            "RPC control event of {event_size} bytes exceeds the {limit}-byte single-packet limit; nothing was sent"
+        )));
+    }
+    let response = RpcResponsePayload {
+        status: RpcStatus::Internal,
+        headers: Vec::new(),
+        body: Bytes::from(format!(
+            "RPC response event of {event_size} bytes exceeds the {limit}-byte single-packet limit; large-response transport is not supported on this path. The handler may have completed; do not automatically retry."
+        )),
+    };
+    let mut bounded = Vec::with_capacity(EVENT_META_SIZE + response.encoded_len());
+    bounded.extend_from_slice(&payload[..EVENT_META_SIZE]);
+    response.encode_into(&mut bounded);
+    Ok(Bytes::from(bounded))
+}
+
+/// One handler-owned pump per admitted logical response. No individual fragment
+/// enters the shared response queue, and no detached task outlives this future.
+async fn deliver_large_response(
+    mesh: &MeshNode,
+    service: &str,
+    transfer: crate::adapter::net::cortex::rpc::large_response::Transfer,
+) {
+    use crate::adapter::net::cortex::rpc::large_response;
+    let deadline = large_response::transfer_deadline(transfer.deadline_ns);
+    if transfer.cancellation.is_cancelled()
+        || !mesh.rpc_session_is_live(transfer.from_node, transfer.session_id)
+    {
+        return;
+    }
+    let Ok(channel) = ChannelName::new(&format!(
+        "{service}.replies.{:016x}",
+        transfer.caller_origin
+    )) else {
+        return;
+    };
+    let channel_id = ChannelId::new(channel.clone());
+    let hash = channel_id.hash();
+    let stream = MeshNode::publish_stream_id(&channel_id);
+    let meta = EventMeta::new(
+        crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
+        0,
+        mesh.identity_origin_hash(),
+        transfer.call_id,
+        0,
+    );
+    let from_node = transfer.from_node;
+    let session_id = transfer.session_id;
+    let refuse = |status: RpcStatus, reason: &'static str| async move {
+        // Even a saturated sender's diagnostic is direct, session-bound and
+        // bounded. It cannot re-enter a shared queue or reflect via a roster.
+        let mut frame = meta.to_bytes().to_vec();
+        encode_rpc_route(&mut frame, hash);
+        let mut payload = large_response::error(reason);
+        payload.status = status;
+        payload.encode_into(&mut frame);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            mesh.try_publish_to_peer_bound(
+                from_node,
+                hash,
+                stream,
+                true,
+                &[Bytes::from(frame)],
+                Some(session_id),
+            ),
+        )
+        .await;
+    };
+    let Ok(_slot) = mesh.rpc_large_response_slots().try_acquire_owned() else {
+        drop(transfer.response);
+        // Review finding 9: pump exhaustion is a capacity refusal, not a
+        // handler failure — surface `Backpressure` so the caller can tell
+        // the two apart instead of the generic `Internal`.
+        refuse(
+            RpcStatus::Backpressure,
+            "sender capacity exhausted; no fragments sent",
+        )
+        .await;
+        return;
+    };
+    let mut pieces = Vec::new();
+    large_response::emit(transfer.response, true, |piece| pieces.push(piece));
+    let send = async {
+        for piece in pieces {
+            if transfer.cancellation.is_cancelled() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("transfer deadline exhausted");
+            }
+            let mut frame = meta.to_bytes().to_vec();
+            piece.encode_into(&mut frame);
+            publish_response_to_caller(
+                mesh,
+                transfer.caller_origin,
+                transfer.call_id,
+                transfer.session_id,
+                Some(transfer.from_node),
+                &channel,
+                hash,
+                stream,
+                Bytes::from(frame),
+                ResponseRouteFallback::DirectOnly,
+            )
+            .await
+            .map_err(|_| "fragment send failed")?;
+        }
+        Ok(())
+    };
+    let session_ended = async {
+        let mut check = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            check.tick().await;
+            if !mesh.rpc_session_is_live(transfer.from_node, transfer.session_id) {
+                break;
+            }
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        _ = transfer.cancellation.cancelled() => Ok(()),
+        _ = tokio::time::sleep_until(deadline) => Err("transfer deadline exhausted"),
+        _ = session_ended => Ok(()),
+        result = send => result,
+    };
+    if let Err(reason) = result {
+        refuse(RpcStatus::Internal, reason).await;
+    }
 }
 
 /// The runtime a client call was opened on, for [`spawn_cancel_publish`]
@@ -4402,9 +4563,16 @@ impl MeshNode {
         let resp_tx_for_denials = resp_tx.clone();
         let emit: RpcResponseEmitter =
             Arc::new(move |from_node, session_id, caller_origin, call_id, resp| {
-                let target_hint = origin_node_cache_for_emit
-                    .get((from_node, caller_origin, call_id))
-                    .map(|(node, _session)| node);
+                let fragmented = resp.headers.iter().any(|(name, _)| {
+                    name == crate::adapter::net::cortex::rpc::large_response::HEADER
+                });
+                let target_hint = if fragmented {
+                    Some(from_node)
+                } else {
+                    origin_node_cache_for_emit
+                        .get((from_node, caller_origin, call_id))
+                        .map(|(node, _session)| node)
+                };
                 // Resolve the reply channel from cache (Arc bump on hit; one
                 // `format!` + `ChannelName::new` the first time we see a caller).
                 let cached = match reply_channel_cache.get(caller_origin) {
@@ -4464,9 +4632,9 @@ impl MeshNode {
                         "rpc serve_rpc: response drainer at capacity; dropping response"
                     );
                 }
-                // AV-4 item 4: a unary call emits exactly one, always-
-                // terminal RESPONSE — retire its cached response route now
-                // (target_hint for THIS response was already captured above).
+                // Retire the cached route on first emission. Negotiated
+                // fragments use the authenticated from_node directly, so
+                // subsequent pieces do not depend on this cache entry.
                 origin_node_cache_for_emit.remove((from_node, caller_origin, call_id));
             });
 
@@ -4483,8 +4651,25 @@ impl MeshNode {
         // (The denial itself is emitted by `emit_capability_denial`,
         // which unicasts to the authenticated session peer — NC2.)
         let metrics_for_bridge = Arc::clone(&metrics_handle);
+        let large_emit: crate::adapter::net::cortex::rpc::large_response::Emitter = {
+            let mesh = Arc::clone(self);
+            let service = service.to_string();
+            let cache = Arc::clone(&origin_node_cache);
+            Arc::new(move |transfer| {
+                let mesh = mesh.clone();
+                let service = service.clone();
+                let cache = cache.clone();
+                Box::pin(async move {
+                    let key = (transfer.from_node, transfer.caller_origin, transfer.call_id);
+                    cache.remove(key);
+                    deliver_large_response(&mesh, &service, transfer).await;
+                })
+            })
+        };
         let fold = Arc::new(Mutex::new(
-            RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit).with_metrics(metrics_handle),
+            RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit)
+                .with_metrics(metrics_handle)
+                .with_large_response_emitter(large_emit),
         ));
 
         // Register the inbound dispatcher. Push into the mpsc;
@@ -7386,7 +7571,7 @@ impl MeshNode {
         let mut req = RpcRequestPayload {
             service: service.to_string(),
             deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
-            flags,
+            flags: flags | crate::adapter::net::cortex::rpc::large_response::FLAG,
             headers,
             body: payload.clone(),
         };
@@ -7454,7 +7639,35 @@ impl MeshNode {
         // somewhere to land (S-4 part 2: bound to target_node_id, so the deliver
         // gate rejects a RESPONSE spoofed from any other session peer).
         let pending = self.rpc_client_pending();
-        let rx = pending.register(call_id, target_node_id);
+        let expected_session =
+            self.peer_session_id(target_node_id)
+                .ok_or_else(|| RpcError::NoRoute {
+                    target: target_node_id,
+                    reason: "RPC target session retired before dispatch".into(),
+                })?;
+        let rx = pending.register_large(call_id, target_node_id, expected_session);
+
+        // Install the RAII cleanup IMMEDIATELY after registration and
+        // BEFORE the publish await below (review finding 1): a future
+        // dropped inside `publish_to_peer(...).await` — hedge loser,
+        // `select!`-cancelled call, aborted `JoinHandle` — must still
+        // retire the entry. A drop in that gap used to strand
+        // `PendingEntry::Unary { session: Some(..) }` for the node's
+        // lifetime, letting late fragments charge the node-global
+        // reassembly budget with no release path. Drop fires CANCEL
+        // while `completed` is false; for a request that never finished
+        // publishing that CANCEL may name an id the server never saw —
+        // a server-side no-op, strictly safer than leaking.
+        remember_cancel_publish_runtime();
+        let mut guard = UnaryCallGuard {
+            pending: Arc::clone(&pending),
+            mesh: Arc::clone(self),
+            target_node_id,
+            request_channel: route.request_channel.clone(),
+            self_origin,
+            call_id,
+            completed: false,
+        };
 
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.body.len() + 32);
@@ -7489,7 +7702,10 @@ impl MeshNode {
             )
             .await
         {
-            pending.cancel(call_id);
+            // The REQUEST never completed its publish, so a wire CANCEL
+            // has nothing to cancel: mark the guard so Drop retires the
+            // pending entry only.
+            guard.completed = true;
             // Distinguish "I don't know how to reach this peer"
             // from a generic transport blip: when the publish path
             // surfaces a no-session error, that's NoRoute (the
@@ -7517,28 +7733,13 @@ impl MeshNode {
             return Err(err);
         }
 
-        // From here on, the REQUEST is in flight on the server.
-        // Wrap the rest of the call in an RAII guard whose Drop
-        // fires CANCEL if `guard.completed` isn't set — covering:
-        //  - the call future being dropped mid-flight (e.g. hedge
-        //    loser, select!-cancelled future, caller awaiting a
-        //    `JoinHandle` that gets cancelled).
-        //  - the timeout path (we leave `completed=false` so Drop
-        //    handles CANCEL emission; no need for a separate
-        //    `send_rpc_cancel` call).
-        //  - the cancel_token path (same: leave completed=false,
-        //    Drop emits CANCEL).
-        // See `remember_cancel_publish_runtime`.
-        remember_cancel_publish_runtime();
-        let mut guard = UnaryCallGuard {
-            pending: Arc::clone(&pending),
-            mesh: Arc::clone(self),
-            target_node_id,
-            request_channel: route.request_channel.clone(),
-            self_origin,
-            call_id,
-            completed: false,
-        };
+        // From here on, the REQUEST is in flight on the server. The
+        // `UnaryCallGuard` installed right after `register_large` covers
+        // every remaining exit: the timeout and cancel_token paths leave
+        // `completed = false` so Drop emits CANCEL (no separate
+        // `send_rpc_cancel` call needed), and a dropped call future
+        // (hedge loser, `select!`-cancel, aborted `JoinHandle`) cleans up
+        // from Drop exactly as the resolved paths do.
 
         // Substrate cancel-token plumbing (v3 / C-S1). When the
         // caller set `opts.cancel_token`, register a Notify against
@@ -7550,6 +7751,23 @@ impl MeshNode {
         // grow unboundedly.
         let cancel_token = opts.cancel_token.unwrap_or(0);
         let cancel_notify = self.cancel_registry().register_notify(cancel_token);
+
+        // The pending entry owns all incomplete fragments. Retire it on
+        // session turnover even when the caller chose no deadline.
+        let rx = async {
+            tokio::pin!(rx);
+            let mut check = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                tokio::select! {
+                    result = &mut rx => return result,
+                    _ = check.tick() => {
+                        if !self.rpc_session_is_live(target_node_id, expected_session) {
+                            pending.cancel(call_id);
+                        }
+                    }
+                }
+            }
+        };
 
         // Race the receiver against the deadline AND the cancel
         // signal. Each branch lifts to the same outcome shape
@@ -8798,6 +9016,45 @@ fn _ensure_send_sync() {
 
 #[cfg(test)]
 mod reply_subscribe_retry_tests {
+    #[cfg(test)]
+    mod large_response_compat_tests {
+        use super::super::*;
+
+        #[test]
+        fn old_caller_receives_one_bounded_error_with_original_call_identity() {
+            let original = EventMeta::new(
+                crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
+                0,
+                42,
+                99,
+                0,
+            );
+            let mut output = Vec::new();
+            crate::adapter::net::cortex::rpc::large_response::emit(
+                RpcResponsePayload {
+                    status: crate::adapter::net::cortex::RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::from(vec![b'x'; 22_000]),
+                },
+                false,
+                |response| {
+                    let mut frame = original.to_bytes().to_vec();
+                    response.encode_into(&mut frame);
+                    output.push(bound_response_packet(Bytes::from(frame)).unwrap());
+                },
+            );
+            assert_eq!(output.len(), 1);
+            let frame = &output[0];
+            assert!(frame.len() + RPC_ROUTE_V1_SIZE <= net_wire::protocol::MAX_EVENT_SIZE);
+            assert_eq!(&frame[..EVENT_META_SIZE], original.to_bytes());
+            let response = RpcResponsePayload::decode(frame.slice(EVENT_META_SIZE..)).unwrap();
+            assert_eq!(
+                response.status,
+                crate::adapter::net::cortex::RpcStatus::Internal
+            );
+            assert!(String::from_utf8_lossy(&response.body).contains("single-packet limit"));
+        }
+    }
     /// The retry condition and the corrective-announce latch are two
     /// separate decisions, and re-fusing them is a silent regression:
     /// the loop still compiles, still retries once, and only misbehaves

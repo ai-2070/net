@@ -72,9 +72,22 @@ impl SequentialMapper {
     ///   matched traffic to. Required by UPnP; see
     ///   [`super::upnp::UpnpMapper::new`].
     pub fn new(gateway: Option<Ipv4Addr>, local_ip: IpAddr) -> Self {
+        Self::new_for(gateway, local_ip, super::MapTransport::Udp)
+    }
+
+    /// [`Self::new`] for an explicit transport. Both protocol clients map
+    /// the same transport.
+    pub fn new_for(
+        gateway: Option<Ipv4Addr>,
+        local_ip: IpAddr,
+        transport: super::MapTransport,
+    ) -> Self {
         Self {
-            nat_pmp: gateway.map(|g| Box::new(NatPmpMapper::new(g)) as Box<dyn PortMapperClient>),
-            upnp: Box::new(UpnpMapper::new(local_ip)),
+            nat_pmp: gateway.map(|g| {
+                Box::new(NatPmpMapper::new(g).with_transport(transport))
+                    as Box<dyn PortMapperClient>
+            }),
+            upnp: Box::new(UpnpMapper::new(local_ip).with_transport(transport)),
             active: Mutex::new(None),
         }
     }
@@ -248,6 +261,14 @@ impl PortMapperClient for SequentialMapper {
 /// set, so operators get the production sequencer instead of
 /// [`super::NullPortMapper`].
 pub async fn sequential_mapper_from_os() -> Option<SequentialMapper> {
+    sequential_mapper_from_os_for(super::MapTransport::Udp).await
+}
+
+/// [`sequential_mapper_from_os`] for an explicit transport, e.g. a TCP
+/// listener that shares the mesh's port number.
+pub async fn sequential_mapper_from_os_for(
+    transport: super::MapTransport,
+) -> Option<SequentialMapper> {
     let gateway = super::gateway::default_ipv4_gateway();
     // Resolve a local IP against whatever address routes us to
     // the internet. Prefer the gateway if we have it; fall back
@@ -256,7 +277,7 @@ pub async fn sequential_mapper_from_os() -> Option<SequentialMapper> {
     // that would be used to reach it, which is what UPnP wants.
     let probe_target = gateway.unwrap_or(Ipv4Addr::new(8, 8, 8, 8));
     let local_ip = super::gateway::local_ipv4_for_gateway(probe_target).await?;
-    Some(SequentialMapper::new(gateway, local_ip))
+    Some(SequentialMapper::new_for(gateway, local_ip, transport))
 }
 
 #[cfg(test)]

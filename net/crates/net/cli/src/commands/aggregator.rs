@@ -8,8 +8,8 @@
 //!   via `DeckClient::aggregator_*` accessors. Empty output when
 //!   no aggregator is installed (same convention as
 //!   `subnet show` / `gateway stats`).
-//! - `ls` — local by default; remote when `--node-addr` is set or
-//!   `--remote` is passed. Local reads through
+//! - `ls` — resolves flags/profile to a remote target, or explicitly
+//!   opts into a temporary supervisor with `--local`. Local reads through
 //!   `DeckClient::aggregator_registry_snapshot`; remote routes
 //!   through `RegistryClient::list`.
 //! - `query` — remote-only. Issues a `fold.query` RPC against
@@ -40,16 +40,23 @@ use crate::context::{resolve_profile, CliContext, RemoteAttach};
 use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::parsers::{parse_u16_flexible, parse_u64_flexible};
 use crate::prelude::{emit_value, OutputFormat};
+use crate::target::has_profile_target;
 
-/// Flags every aggregator verb accepts for remote-attach. Each
-/// is also resolvable from the profile (`node_addr` / `node_pubkey`
-/// / `node_id` / `psk_hex`) — the CLI flag wins when both are
-/// set. Resolution is centralised in
-/// [`crate::context::resolve_remote_attach`]; when every field is
-/// `None` and the profile has no defaults, the subcommand runs
-/// in-process.
+/// Shared remote-client target, bind and inspection flags. Target/bind
+/// flags override profile fields through [`crate::context::resolve_attach_args`].
+/// Missing targets fail for remote-only clients; aggregator list additionally
+/// supports an explicitly selected temporary-supervisor mode.
 #[derive(Args, Debug, Default)]
 pub struct RemoteAttachArgs {
+    /// Inspect resolution and exit without connecting, starting a supervisor,
+    /// creating files or starting the hosted protocol/subprocess.
+    #[arg(long)]
+    pub inspect_target: bool,
+
+    /// Local UDP bind IP:port. Overrides profile bind; :0 selects an ephemeral
+    /// port. Use a reachable interface/wildcard for a non-loopback peer.
+    #[arg(long, value_parser = crate::parsers::parse_socket_addr_string)]
+    pub bind: Option<String>,
     /// Remote daemon `IP:port`. Operators copy this from the
     /// daemon's `--print-bootstrap` output.
     #[arg(long, value_parser = crate::parsers::parse_socket_addr_string)]
@@ -66,6 +73,16 @@ pub struct RemoteAttachArgs {
     /// common case.
     #[arg(long, value_parser = crate::parsers::parse_hex32_string)]
     pub psk_hex: Option<String>,
+}
+
+impl RemoteAttachArgs {
+    pub(crate) fn has_target_flags(&self) -> bool {
+        self.bind.is_some()
+            || self.node_addr.is_some()
+            || self.node_pubkey.is_some()
+            || self.remote_node_id.is_some()
+            || self.psk_hex.is_some()
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -100,6 +117,9 @@ pub enum AggregatorCommand {
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
+    #[command(flatten)]
+    pub scope: super::scope::InspectableLocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -109,16 +129,17 @@ pub struct InspectArgs {
 
 #[derive(Args, Debug)]
 pub struct LsArgs {
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
     #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
 
-    /// When set (or implicit via `--node-addr`), route `ls`
-    /// through the registry RPC against the remote daemon
-    /// rather than reading the local registry snapshot. Wired
-    /// in A-5.
+    /// Require remote registry RPC. A complete target from flags or profile
+    /// already selects remote execution, without this flag.
     #[arg(long, default_value_t = false)]
     pub remote: bool,
 
@@ -225,7 +246,18 @@ async fn run_inspect(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::validate_local(args.scope.local, "aggregator inspect")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "aggregator inspect")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
     let view = match deck.aggregator_snapshot() {
@@ -275,6 +307,18 @@ async fn run_query(
 
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "query")?;
+    if args.attach.inspect_target {
+        let mut view = crate::target::inspect(
+            &profile,
+            &args.attach,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?;
+        view.provider_node_id = Some(target);
+        return view.emit(output);
+    }
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
             .await?;
@@ -324,6 +368,37 @@ fn require_remote_attach(
     })
 }
 
+/// The single mode/target decision consumed by both inspection and execution.
+fn resolve_ls_target(
+    profile: &crate::config::Profile,
+    args: &LsArgs,
+) -> Result<Option<RemoteAttach>, CliError> {
+    crate::context::validate_endpoint(profile)?;
+    let explicit_target = args.attach.has_target_flags();
+    if args.scope.local {
+        if args.remote || explicit_target {
+            return Err(invalid_args(
+                "--local conflicts with explicit remote target flags",
+            ));
+        }
+        return Ok(None);
+    }
+    let remote = crate::context::resolve_attach_args(
+        profile,
+        &args.attach,
+        crate::context::DEFAULT_CLIENT_BIND,
+    )?;
+    if remote.is_none() {
+        if args.remote {
+            return Err(invalid_args(
+                "--remote requires a complete target from flags or profile",
+            ));
+        }
+        super::scope::validate_local(false, "aggregator ls")?;
+    }
+    Ok(remote)
+}
+
 async fn run_ls(
     args: LsArgs,
     output: Option<OutputFormat>,
@@ -331,13 +406,40 @@ async fn run_ls(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
-    // --remote flips the path; --node-addr implies --remote so
-    // an operator who supplied attach flags doesn't accidentally
-    // read the local registry.
-    let want_remote = args.remote || args.attach.node_addr.is_some();
-    if want_remote {
-        return run_ls_remote(args, output, &profile).await;
+    let remote = resolve_ls_target(&profile, &args)?;
+    if args.attach.inspect_target {
+        if remote.is_none() {
+            return super::scope::inspect_temporary(
+                &profile,
+                args.identity.as_deref(),
+                args.node,
+                output,
+            )
+            .await;
+        }
+        // `remote` is `Some` here: the `remote.is_none()` branch above already
+        // returned through `scope::inspect_temporary`, which is the sole
+        // emitter of `"mode": "temporary_supervisor"` for this verb.
+        let mut view = crate::target::inspect(
+            &profile,
+            &args.attach,
+            args.identity.as_deref(),
+            remote.as_ref(),
+            "remote",
+        )
+        .await?;
+        if args.remote {
+            view.explicit_mode();
+        }
+        return view.emit(output);
     }
+    if let Some(remote) = remote {
+        return run_ls_remote(args, output, &profile, remote).await;
+    }
+    if has_profile_target(&profile) {
+        eprintln!("net-mesh: --local explicitly ignores profile remote target defaults");
+    }
+    super::scope::require_local(args.scope.local, "aggregator ls")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
     let snapshot = deck.aggregator_registry_snapshot().await;
@@ -362,8 +464,8 @@ async fn run_ls_remote(
     args: LsArgs,
     output: Option<OutputFormat>,
     profile: &crate::config::Profile,
+    remote: RemoteAttach,
 ) -> Result<(), CliError> {
-    let remote = require_remote_attach(profile, &args.attach, "ls --remote")?;
     let target_node_id = remote.node_id;
     let ctx =
         CliContext::build_with_remote(profile, args.identity.as_deref(), args.node, false, remote)
@@ -405,6 +507,17 @@ async fn run_spawn(
 
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "spawn")?;
+    if args.attach.inspect_target {
+        let view = crate::target::inspect(
+            &profile,
+            &args.attach,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?;
+        return view.emit(output);
+    }
     let target_node_id = remote.node_id;
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
@@ -442,6 +555,17 @@ async fn run_scale(
 
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "scale")?;
+    if args.attach.inspect_target {
+        let view = crate::target::inspect(
+            &profile,
+            &args.attach,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?;
+        return view.emit(output);
+    }
     let target_node_id = remote.node_id;
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)

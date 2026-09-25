@@ -130,6 +130,19 @@ async fn deliver(a: &Arc<MeshNode>, channel: &ChannelName, frame: Bytes) {
     tokio::time::sleep(Duration::from_millis(150)).await;
 }
 
+/// Wait (bounded) for `hits` to reach one, then settle and return the final
+/// count. A fixed sleep made the positive controls flake on a loaded runner;
+/// settling after the first hit also catches an earlier, wrongly accepted
+/// frame that merely arrived late (the count would be two).
+async fn settled_hits(hits: &AtomicUsize) -> usize {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while hits.load(Ordering::Relaxed) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    hits.load(Ordering::Relaxed)
+}
+
 /// Two nodes; B serves `admin` and `echo` with counting handlers and
 /// is subscribed (from A) to both request channels so a raw publish
 /// from A reaches the registered dispatcher.
@@ -244,7 +257,7 @@ async fn admin_route_with_echo_payload_never_runs_admin_handler() {
     )
     .await;
     assert_eq!(
-        f.admin_hits.load(Ordering::Relaxed),
+        settled_hits(&f.admin_hits).await,
         1,
         "a correctly-named admin REQUEST on the same channel must reach the handler",
     );
@@ -292,7 +305,7 @@ async fn echo_route_with_admin_payload_never_runs_echo_handler() {
     )
     .await;
     assert_eq!(
-        f.echo_hits.load(Ordering::Relaxed),
+        settled_hits(&f.echo_hits).await,
         1,
         "a correctly-named echo REQUEST on the same channel must reach the handler",
     );

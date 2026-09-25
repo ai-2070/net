@@ -484,6 +484,14 @@ pub enum OrgAuthorityError {
         /// The candidate owner org.
         owner_org: OrgId,
     },
+    /// The org audience supplied to [`NodeAuthority::adopt_with_audience`]
+    /// belongs to a different org than the certificate being adopted.
+    AudienceForeignOrg {
+        /// The org the supplied audience names.
+        audience_org: OrgId,
+        /// The org of the certificate being adopted.
+        owner_org: OrgId,
+    },
     /// `owner-audience.key` is group/other-readable. Creation-time
     /// 0600 is insufficient — config management, copying, or manual
     /// edits can weaken it later — so both startup and re-adoption
@@ -613,6 +621,13 @@ impl std::fmt::Display for OrgAuthorityError {
                 f,
                 "floor bundle signed by org {bundle_org} but the candidate owner is \
                  {owner_org}; the adoption ceremony tracks only the owner root"
+            ),
+            Self::AudienceForeignOrg {
+                audience_org,
+                owner_org,
+            } => write!(
+                f,
+                "the supplied org audience belongs to org {audience_org}, not to the adopted                  membership's org {owner_org}"
             ),
             Self::PermissiveAudienceFile { path, mode } => write!(
                 f,
@@ -750,6 +765,49 @@ impl NodeAuthority {
         skew_secs: u64,
         owner_floors: Option<&OrgRevocationBundle>,
     ) -> Result<Self, OrgAuthorityError> {
+        Self::adopt_inner(dir, owner_cert, local_entity, skew_secs, owner_floors, None)
+    }
+
+    /// [`Self::adopt`], installing the org's canonical `audience` (the one
+    /// owner audience every member shares, so members can open each other's
+    /// owner-scoped announcements) instead of minting a node-local one.
+    /// Written through the ceremony's own owner-only atomic writer, under the
+    /// ceremony lock; it replaces an existing audience file (rotation is
+    /// config management). Refused when `audience` names another org.
+    pub fn adopt_with_audience(
+        dir: &Path,
+        owner_cert: OrgMembershipCert,
+        local_entity: &EntityId,
+        skew_secs: u64,
+        owner_floors: Option<&OrgRevocationBundle>,
+        audience: &OwnerAudienceCredential,
+    ) -> Result<Self, OrgAuthorityError> {
+        Self::adopt_inner(
+            dir,
+            owner_cert,
+            local_entity,
+            skew_secs,
+            owner_floors,
+            Some(audience),
+        )
+    }
+
+    fn adopt_inner(
+        dir: &Path,
+        owner_cert: OrgMembershipCert,
+        local_entity: &EntityId,
+        skew_secs: u64,
+        owner_floors: Option<&OrgRevocationBundle>,
+        supplied_audience: Option<&OwnerAudienceCredential>,
+    ) -> Result<Self, OrgAuthorityError> {
+        if let Some(audience) = supplied_audience {
+            if audience.owner_org != owner_cert.org_id {
+                return Err(OrgAuthorityError::AudienceForeignOrg {
+                    audience_org: audience.owner_org,
+                    owner_org: owner_cert.org_id,
+                });
+            }
+        }
         // Gate-1: normalize the authority path ONCE, up front — resolve a
         // relative path against the current directory and strip a trailing
         // separator so a final symlink cannot be followed. EVERY path below
@@ -907,9 +965,18 @@ impl NodeAuthority {
             revocation.apply_bundle(bundle)?;
         }
 
-        // 8. Audience material: preserved, or created and written
-        //    now (0600, atomic, fresh temp inode).
-        if !have_audience {
+        // 8. Audience material: the supplied org audience (written now,
+        //    replacing any node-local one), else preserved, else created
+        //    and written now (0600, atomic, fresh temp inode).
+        if let Some(audience) = supplied_audience {
+            let mut raw = audience.encode_config();
+            let encoded = ScrubbedBytes(raw.to_vec());
+            for byte in raw.iter_mut() {
+                // SAFETY: `byte` is a valid mutable reference into the owned array.
+                unsafe { std::ptr::write_volatile(byte, 0) };
+            }
+            write_atomic(&audience_path, encoded.as_slice())?;
+        } else if !have_audience {
             let audience = OwnerAudienceCredential::generate(owner_org_id);
             // The serialized key buffer scrubs on every exit: the source array
             // inline (before the `?`), the Vec copy via its RAII guard.
@@ -1927,7 +1994,7 @@ fn read_object_security_handle(
 /// path-based [`validate_audience_file_acl`] leaves open. Same verdict logic
 /// ([`validate_audience_acl_view`]); only the acquisition differs.
 #[cfg(windows)]
-fn validate_audience_file_acl_handle(
+pub(crate) fn validate_audience_file_acl_handle(
     file: &std::fs::File,
     path: &Path,
 ) -> Result<(), OrgAuthorityError> {
@@ -1992,7 +2059,7 @@ fn create_missing_components_0700(dir: &Path) -> std::io::Result<()> {
 ///
 /// The returned path is the one EVERY subsequent step (prevalidation, creation,
 /// postvalidation, lock acquisition, file operations) must use.
-fn normalize_authority_dir(dir: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn normalize_authority_dir(dir: &Path) -> std::io::Result<PathBuf> {
     let base = if dir.is_absolute() {
         dir.to_path_buf()
     } else {
@@ -2040,7 +2107,7 @@ fn normalize_authority_dir(dir: &Path) -> std::io::Result<PathBuf> {
 ///   fails closed unless every write-capable ACE grants only a trusted
 ///   principal. The user account, SYSTEM, and local administrators are trusted
 ///   principals.
-fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
+pub(crate) fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
     let io = |e: std::io::Error| OrgAuthorityError::Io {
         path: dir.display().to_string(),
         reason: format!("authority directory: {e}"),
@@ -2972,6 +3039,48 @@ mod tests {
             opened.audience.discovery_key(),
             authority.audience.discovery_key()
         );
+    }
+
+    /// The org's canonical audience, supplied at adoption, is what the node
+    /// installs (and keeps across reopen), replacing a node-local one on
+    /// re-adoption; an audience naming another org is refused, leaving the
+    /// installed one untouched.
+    #[test]
+    fn adopt_with_audience_installs_the_org_audience() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        let local = NodeAuthority::adopt(scratch.dir(), cert_for(&kp, 1), kp.entity_id(), 0, None)
+            .expect("adopt");
+        let canonical = OwnerAudienceCredential::generate(org().org_id());
+        assert_ne!(local.audience.audience_handle, canonical.audience_handle);
+
+        NodeAuthority::adopt_with_audience(
+            scratch.dir(),
+            cert_for(&kp, 1),
+            kp.entity_id(),
+            0,
+            None,
+            &canonical,
+        )
+        .expect("adopt with the org audience");
+        let opened = NodeAuthority::open(scratch.dir(), kp.entity_id()).expect("open");
+        assert_eq!(opened.audience.audience_handle, canonical.audience_handle);
+        assert_eq!(opened.audience.discovery_key(), canonical.discovery_key());
+
+        let foreign = OwnerAudienceCredential::generate(OrgKeypair::generate().org_id());
+        assert!(matches!(
+            NodeAuthority::adopt_with_audience(
+                scratch.dir(),
+                cert_for(&kp, 1),
+                kp.entity_id(),
+                0,
+                None,
+                &foreign,
+            ),
+            Err(OrgAuthorityError::AudienceForeignOrg { .. })
+        ));
+        let still = NodeAuthority::open(scratch.dir(), kp.entity_id()).expect("open");
+        assert_eq!(still.audience.audience_handle, canonical.audience_handle);
     }
 
     /// Review-9: the ceremony lock inode is held to the full

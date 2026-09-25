@@ -276,6 +276,35 @@ skips it, the invite is only as good as the channel it travelled over.
 
 Invites expire (`is_expired(now)`); failures are `EnrollmentError`.
 
+### Managed-node links (V3)
+
+At the CLI level the same ceremony is a `netmesh-join_` link → `join` → `up`.
+**One signed token carries several relations, each authorized on its own** —
+mesh membership, a subnet attachment (`--subnet`), org membership (`--org`,
+always operator-approved) and a channel credential (`--channel` /
+`--channel-rights`). The roots that authorize them stay offline (`subnet
+issue-issuer`, `channel issue-grant`, `org approve`); the node carries only
+what the link names.
+
+- **A token is a bearer secret unless bound.** `--for <ENTITY>` binds a link to
+  one device's entity id; until then, whoever holds it can redeem it — treat it
+  like a password.
+- **`--require-approval` holds issuance** until `invite approve`; it is the
+  link-level counterpart of the human fingerprint check above.
+- **Attach tries direct first, then the relay.** `join` reports `enroll_path`
+  and `attach_path` — `direct`, `relay`, or `relay_tcp` when UDP to the relay
+  went unanswered (`relay serve` / `up --relay` supply the fallback). A
+  registered relay is not a prerequisite: a reachable direct path wins.
+- **`wrap --joined <state-dir>` / `mcp serve --joined <state-dir>`** run a
+  provider or consumer as the enrolled device without re-supplying secrets —
+  the identity, mesh PSK and enrolled contact all come from that join store. It
+  refuses while `up` owns the store, and refuses `--psk-hex`. An explicit
+  `--node-addr` / `--node-pubkey` / `--node-id` names another peer of the same
+  mesh (e.g. a provider device) while still running as the enrolled device.
+
+A device already on the mesh adds a single relation with a standalone link
+(`subnet invite` / `org invite` / `channel invite`) redeemed over its session.
+
 ---
 
 ## Cross-references

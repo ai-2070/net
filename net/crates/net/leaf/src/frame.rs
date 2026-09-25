@@ -12,19 +12,24 @@
 //! a payload it cannot carry comes back as a typed
 //! [`LeafError::Wire`] from the send path.
 //!
-//! ## The wire fields, and what this module defines
+//! ## The wire fields
 //!
 //! [`NetHeader`] has carried `fragment_id`, `fragment_offset` and
 //! `frag_flags` since before the extraction, and `aad()` authenticates
 //! all three — so a fragment's position cannot be tampered with
-//! without breaking the AEAD tag. What did **not** exist anywhere in
-//! the tree is an interpretation of `frag_flags`: nothing in the core
-//! reads or writes it. This module defines that interpretation
-//! ([`FRAG_FRAGMENTED`], [`FRAG_LAST`]) and is therefore the first
-//! and only reader. See the Stage 5 report's named gaps: a native
-//! node does not reassemble today, so an over-cap payload works
-//! leaf ↔ leaf and needs a native-side reassembly arm before it
-//! works leaf → native.
+//! without breaking the AEAD tag. The interpretation of `frag_flags`
+//! ([`FRAG_FRAGMENTED`], [`FRAG_LAST`]) lives beside the header that
+//! carries it, in `net-mesh-wire`, because the native RTC ingress
+//! reassembles leaf fragments and the two ends must read one
+//! definition; this module re-exports it so the leaf keeps a single
+//! fragmentation vocabulary.
+//!
+//! The native-side arm the Stage 5 report listed as a named gap has
+//! since landed — `MeshNode::reassemble_rtc_fragments`, see
+//! `adapter/net/rtc/fragment.rs` — so an over-cap payload now works
+//! leaf ↔ leaf **and** leaf ↔ native over RTC. The native sender
+//! fragments back to this leaf for the same reason, gated on the peer
+//! advertising `TAG_FRAGMENT_REASSEMBLY`.
 //!
 //! ## Why the size ceiling is what it is
 //!

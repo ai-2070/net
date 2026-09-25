@@ -2004,14 +2004,21 @@ async fn receive(
             // tells the peer nothing it can use. Name it — a check
             // that is silently unclaimed is indistinguishable, from
             // the peer's side, from a dropped packet.
-            if stun::has_username(datagram) {
+            let credentialed = stun::has_username(datagram);
+            if credentialed {
                 tracing::debug!(
                     %source,
                     sessions = sessions.len(),
                     "an ICE connectivity check no session claimed"
                 );
             }
-            if answer_binding_request(socket, datagram, source).await {
+            if answer_binding_request(socket, datagram, source).await && !credentialed {
+                // R8's counter is "a peer using us as their STUN
+                // server" — unsolicited GATHERING requests only
+                // (stats.rs: "ICE checks … are not counted here").
+                // Counting unclaimed ICE checks here too inflated
+                // the telemetry in proportion to failed ICE
+                // attempts.
                 stats.note_stun_binding_request();
             }
         }

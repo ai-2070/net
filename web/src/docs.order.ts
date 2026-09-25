@@ -31,7 +31,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "releases",
   ],
   folders: {
-    sdk: ["rust", "typescript", "python", "go", "c"],
+    sdk: ["rust", "typescript", "browser", "python", "go", "c"],
     "sdk/rust": [
       "quickstart",
       "announce",
@@ -50,6 +50,10 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "artifacts",
       "errors",
     ],
+    // The browser surface is not the announce/discover/invoke spine: it is a
+    // different runtime with its own entry points, so it is organised by what
+    // a page does with it rather than by the capability path.
+    "sdk/browser": ["quickstart", "session", "store", "three", "errors"],
     "sdk/python": [
       "quickstart",
       "announce",
@@ -93,6 +97,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     start: ["what-is-net", "install", "quickstart", "claude-skills"],
     concepts: [
       "architecture",
+      "webrtc-transport",
       "identity",
       "capabilities",
       "channels",
@@ -235,6 +240,10 @@ export const DOCS_ORDER: DocsOrderConfig = {
     // Each SDK spine is visible under its language pill. Rust is the default.
     "sdk/rust": ["rust"],
     "sdk/typescript": ["ts"],
+    // The browser package is TypeScript over a WebAssembly leaf. It is a
+    // separate runtime from `@net-mesh/sdk`, not a separate language, so it is
+    // gated to the TypeScript pill rather than given one of its own.
+    "sdk/browser": ["ts"],
     "sdk/python": ["python"],
     "sdk/go": ["go"],
     "sdk/c": ["c"],

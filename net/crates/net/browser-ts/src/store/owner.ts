@@ -250,11 +250,22 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     return this.handles.get(h);
   }
 
-  /** Replace the authoritative state, as `setState` does. */
+  /**
+   * Replace the authoritative state, as `setState` does.
+   *
+   * Inside an open transaction the write JOINS it (`applySnapshot`
+   * stages) and the delta emission is DEFERRED to that transaction's
+   * commit (#5): `decide`/`input` diff the committed before/after at
+   * the transaction's end and ship exactly one delta, and a rollback
+   * ships nothing at all. Emitting here would put a staged-world
+   * delta on the wire that no rollback retracts.
+   */
   commit(next: S): Dispatched {
+    const inTransaction = this.core.inTransaction;
     const previous = this.core.getState() as S;
-    this.revisionBeforeCommit = this.core.revision;
+    if (!inTransaction) this.revisionBeforeCommit = this.core.revision;
     this.core.applySnapshot(next);
+    if (inTransaction) return this.accept([]);
     const current = this.core.getState() as S;
     if (Object.is(previous, current)) {
       // An equivalent commit is not a change (§4): no revision moved,
@@ -282,6 +293,13 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     const out: Outbound[] = [];
     const base = String(this.revisionBeforeCommit);
     const r = String(this.core.revision);
+    // One projection pair and one root diff per DISTINCT audience,
+    // shared by every handle that carries it. Projecting and diffing
+    // per handle made this O(handles × world) JSON work per commit:
+    // both projections were freshly built per handle, so `shallowDiff`'s
+    // identity test could never fire and every key paid its
+    // serialization comparison once per handle.
+    const diffs = new Map<string, readonly WireOp[] | null>();
     for (const handle of [...this.handles.values()]) {
       // No `generation === 0` test: a handle is created and installed
       // in one synchronous `join`, and a join whose emission fails
@@ -292,10 +310,53 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       // old one locally.
       if (this.deferred.has(handle.h)) continue;
 
-      const before = this.project(handle.audience, previous);
-      const after = this.project(handle.audience, current);
-      if (before === null || after === null) continue;
-      const ops = shallowDiff(before as JsonObject, after as JsonObject);
+      // Re-authorize before shipping. Permission does not carry forward
+      // across time (the rule the read paths below all hold to), and the
+      // delta feed IS the read delivered fresh: a policy revocation has to
+      // stop it, not only the next projection. `join`, `aud`/`resume` and
+      // `resync` are all gated, and the `resync` refusal deliberately keeps
+      // the handle warm — which is why the feed cannot rely on the grant
+      // having been checked once at admission. The handle goes with the
+      // refusal here because the feed is the grant: leaving it alive would
+      // let `alive` renew the lease of a peer the policy now forbids.
+      if (!this.permitsRead(handle.peer, handle.audience)) {
+        this.forget(handle.h);
+        // `closed`, the wire's legal unsolicited refusal (§1.12 admits
+        // exactly `closed` and `owner-lost` without a `q`): it closes
+        // the subscription, the replica rejoins, and the JOIN — a
+        // request path that CAN carry a refusal — answers `forbidden`
+        // correlated. A q-less `forbidden` is not a frame the codec
+        // admits; `encodeMessage` throws it out of `propagate`.
+        out.push(this.no(handle.peer, handle.h, 'closed', null));
+        continue;
+      }
+
+      const audienceKey = JSON.stringify(handle.audience);
+      let ops = diffs.get(audienceKey);
+      if (ops === undefined) {
+        const before = this.project(handle.audience, previous);
+        const after = this.project(handle.audience, current);
+        ops =
+          before === null || after === null
+            ? null
+            : shallowDiff(before as JsonObject, after as JsonObject);
+        diffs.set(audienceKey, ops);
+      }
+      if (ops === null) {
+        // `project` and its `empty()` fallback both failed: there is
+        // nothing truthful to ship, exactly as when `install` cannot
+        // carry a projection. Silence — the previous `continue` — left
+        // the replica at its old revision reporting `ready, stale:
+        // false` until the next change to that audience happened to
+        // resync it. The handle goes with a typed notice: `closed`,
+        // the only unsolicited refusal the wire admits (§1.12), which
+        // closes the subscription and provokes a rejoin — and the
+        // JOIN, a request path that CAN carry a refusal, answers
+        // `capacity` correlated if the projection is still broken.
+        this.forget(handle.h);
+        out.push(this.no(handle.peer, handle.h, 'closed', null));
+        continue;
+      }
       if (ops.length === 0) continue;
 
       const delta = encodeDeltaWithin(
@@ -310,7 +371,10 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       const frames = this.install(handle, null);
       if (frames === null) {
         this.forget(handle.h);
-        out.push(this.no(handle.peer, handle.h, 'capacity', null));
+        // `closed`, the legal unsolicited refusal: the replacement
+        // could not be carried at all. The rejoin it provokes is
+        // refused `capacity` correlated at the join.
+        out.push(this.no(handle.peer, handle.h, 'closed', null));
         continue;
       }
       out.push(...frames);
@@ -608,17 +672,26 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     this.revisionBeforeCommit = this.core.revision;
     let outcome: Outcome;
     try {
-      const input = spec.input(message.in);
       const handler = this.deps.actions[message.name as keyof A];
       // Everything that can REFUSE this action happens inside the
-      // transaction, because a throw inside it discards the staged
-      // writes and a throw after it does not. Validating the output
-      // afterwards let a handler whose result the definition refuses
-      // commit its writes and ship a delta, answering
-      // `action-rejected` for a change that had already happened —
-      // and the same for a result too large to send, which left the
-      // caller with a document it could not be told about.
+      // transaction — the input parse INCLUDED, because it is
+      // application code and a write it makes through the public
+      // `host.setState` must join the transaction like the handler's
+      // own: discarded on a throw, shipped once at the commit (#5).
+      // A parse run beside the transaction published its write and an
+      // emission of its own, and the rollback then answered
+      // `action-rejected` for a change that had already shipped.
+      //
+      // The output is validated here for the same reason: a throw
+      // inside the transaction discards the staged writes and a throw
+      // after it does not. Validating the output afterwards let a
+      // handler whose result the definition refuses commit its writes
+      // and ship a delta, answering `action-rejected` for a change
+      // that had already happened — and the same for a result too
+      // large to send, which left the caller with a document it could
+      // not be told about.
       const produced = this.core.transact(context => {
+        const input = spec.input(message.in);
         const out = spec.output(handler(input, context)) as JsonObject;
         const frame = encodeMessage({
           k: 'res',
@@ -678,10 +751,16 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     const before = this.core.getState() as S;
     this.revisionBeforeCommit = this.core.revision;
     try {
-      const parse = this.deps.definition.inputs[name as keyof I];
-      const input = parse(message.in);
-      const handler = this.deps.inputs[name as keyof I];
-      this.core.transact(context => handler(input, context), peer);
+      // The parse runs INSIDE the transaction, exactly as the action
+      // ladder does (#5): it is application code, and a write it makes
+      // through the public `host.setState` joins the transaction —
+      // discarded with the handler's own writes on a throw, shipped
+      // once in the change this path reports at the end.
+      this.core.transact(context => {
+        const parse = this.deps.definition.inputs[name as keyof I];
+        const handler = this.deps.inputs[name as keyof I];
+        handler(parse(message.in), context);
+      }, peer);
     } catch {
       return this.refuse('in-rejected');
     }

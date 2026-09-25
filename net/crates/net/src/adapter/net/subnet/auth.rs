@@ -14,6 +14,9 @@
 //!   leaf delegation bit;
 //! - [`SubnetRevocationFloor`] — a root-signed, subtree-scoped,
 //!   monotonic generation floor;
+//! - [`SubnetSubjectFloor`] — a root-signed, SUBJECT-scoped floor:
+//!   removes one full entity's named rights inside one subtree without
+//!   touching any other subject (see its docs for the exact semantics);
 //! - [`SubnetFloorRegistry`] — per-authority floor state plus the
 //!   `subnet_auth_epoch` counter compiled contexts compare against;
 //! - [`verify_credential_set`] — the fail-closed verifier producing a
@@ -45,6 +48,8 @@ pub const SUBNET_GRANT_SIG_DOMAIN: &[u8] = b"net.subnet.grant.v1";
 pub const SUBNET_ISSUER_GRANT_SIG_DOMAIN: &[u8] = b"net.subnet.issuer-grant.v1";
 /// Domain prefix for the revocation floor's ed25519 transcript.
 pub const SUBNET_FLOOR_SIG_DOMAIN: &[u8] = b"net.subnet.floor.v1";
+/// Domain prefix for the subject floor's ed25519 transcript.
+pub const SUBNET_SUBJECT_FLOOR_SIG_DOMAIN: &[u8] = b"net.subnet.subject-floor.v1";
 /// Domain label for [`SubnetCredentialSet::credential_set_hash`].
 const SUBNET_CREDSET_HASH_DOMAIN: &[u8] = b"net.subnet.credset.v1";
 
@@ -210,6 +215,10 @@ pub enum SubnetAuthError {
     InvalidValidityWindow,
     /// Caller-supplied skew exceeds [`MAX_TOKEN_CLOCK_SKEW_SECS`].
     ClockSkewTooLarge,
+    /// Accepted revocation state could not be durably persisted. The
+    /// in-memory state keeps the stricter result (floors only remove
+    /// authority), but nothing may report the change committed.
+    StateNotPersisted,
 }
 
 impl SubnetAuthError {
@@ -249,6 +258,7 @@ impl SubnetAuthError {
         Self::InvalidFormat,
         Self::InvalidValidityWindow,
         Self::ClockSkewTooLarge,
+        Self::StateNotPersisted,
     ];
 
     /// The stable wire token for this reason code — the `<kind>` in a
@@ -283,6 +293,7 @@ impl SubnetAuthError {
             Self::InvalidFormat => "invalid_format",
             Self::InvalidValidityWindow => "invalid_validity_window",
             Self::ClockSkewTooLarge => "clock_skew_too_large",
+            Self::StateNotPersisted => "state_not_persisted",
         }
     }
 }
@@ -857,6 +868,193 @@ impl SubnetRevocationFloor {
     }
 }
 
+/// Root-signed **subject** floor: removes one full subject's named
+/// rights inside one authority-qualified subtree, without touching any
+/// other subject (NET_CLI_PLAN_V3 §6.1a).
+///
+/// Semantics, pinned:
+///
+/// - **Where.** It applies to any admission of `subject` whose
+///   *target* (attachment) lies at or under `scope` — whichever grant
+///   is presented, including one scoped at an ancestor of `scope`. The
+///   subject's authority outside `scope` is untouched.
+/// - **What.** Exactly the rights in `rights`; an admission requesting
+///   any of them there is refused. Nothing broadens implicitly.
+/// - **Which generation.** The presented *leaf* grant's `generation`
+///   against this floor's per-right `minimum_generation`. Only a
+///   root-direct leaf at or above it re-admits; a delegated (one-hop)
+///   leaf is refused for a floored right regardless of its generation,
+///   so a delegated issuer — including the subject itself, if it holds
+///   an issuer grant — cannot mint its way back in.
+/// - **Ordering.** Applied per `(scope, topology_epoch, subject)` by
+///   strictly increasing `revision`; each right's generation only ever
+///   rises. A floor with `minimum_generation` `0` removes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubnetSubjectFloor {
+    /// Wire version; only `1` decodes.
+    pub version: u8,
+    /// Authority-qualified subtree the floor applies inside.
+    pub scope: SubnetRef,
+    /// Topology epoch the floor belongs to.
+    pub topology_epoch: u32,
+    /// Signing root (a delegated issuer cannot sign one).
+    pub issuer: EntityId,
+    /// The full entity removed (never a routing id).
+    pub subject: EntityId,
+    /// Rights removed inside `scope`; strict and non-empty.
+    pub rights: SubnetRights,
+    /// Leaf grants for `subject` below this generation lose `rights`
+    /// inside `scope`.
+    pub minimum_generation: u32,
+    /// Per-`(scope, topology_epoch, subject)` ordering revision.
+    pub revision: u64,
+    /// Advisory issue timestamp (unix seconds).
+    pub issued_at: u64,
+    /// ed25519 over [`SUBNET_SUBJECT_FLOOR_SIG_DOMAIN`] ‖ payload.
+    pub signature: [u8; 64],
+}
+
+impl SubnetSubjectFloor {
+    /// version 1 + authority 32 + path 4 + epoch 4 + issuer 32 +
+    /// subject 32 + rights 1 + minimum_generation 4 + revision 8 +
+    /// issued_at 8.
+    pub const SIGNED_PAYLOAD_SIZE: usize = 126;
+    /// Payload + 64-byte signature.
+    pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64;
+    const SIGNING_INPUT_SIZE: usize =
+        SUBNET_SUBJECT_FLOOR_SIG_DOMAIN.len() + Self::SIGNED_PAYLOAD_SIZE;
+
+    /// Issue signed by `root_keypair` (`issuer` is set from it).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each parameter is a distinct signed field of the artifact"
+    )]
+    pub fn try_issue(
+        root_keypair: &EntityKeypair,
+        scope: SubnetRef,
+        topology_epoch: u32,
+        subject: EntityId,
+        rights: SubnetRights,
+        minimum_generation: u32,
+        revision: u64,
+        issued_at: u64,
+    ) -> Result<Self, SubnetAuthError> {
+        SubnetRights::try_from_bits(rights.bits())?;
+        let mut floor = Self {
+            version: 1,
+            scope,
+            topology_epoch,
+            issuer: root_keypair.entity_id().clone(),
+            subject,
+            rights,
+            minimum_generation,
+            revision,
+            issued_at,
+            signature: [0u8; 64],
+        };
+        let sig = root_keypair
+            .try_sign(&floor.signing_input())
+            .map_err(|_| SubnetAuthError::InvalidSignature)?;
+        floor.signature = sig.to_bytes();
+        Ok(floor)
+    }
+
+    pub(crate) fn signed_payload(&self) -> [u8; Self::SIGNED_PAYLOAD_SIZE] {
+        let mut buf = [0u8; Self::SIGNED_PAYLOAD_SIZE];
+        let mut off = 0;
+        buf[off] = self.version;
+        off += 1;
+        buf[off..off + 32].copy_from_slice(self.scope.authority.as_bytes());
+        off += 32;
+        buf[off..off + 4].copy_from_slice(&self.scope.path.raw().to_le_bytes());
+        off += 4;
+        buf[off..off + 4].copy_from_slice(&self.topology_epoch.to_le_bytes());
+        off += 4;
+        buf[off..off + 32].copy_from_slice(self.issuer.as_bytes());
+        off += 32;
+        buf[off..off + 32].copy_from_slice(self.subject.as_bytes());
+        off += 32;
+        buf[off] = self.rights.bits();
+        off += 1;
+        buf[off..off + 4].copy_from_slice(&self.minimum_generation.to_le_bytes());
+        off += 4;
+        buf[off..off + 8].copy_from_slice(&self.revision.to_le_bytes());
+        off += 8;
+        buf[off..off + 8].copy_from_slice(&self.issued_at.to_le_bytes());
+        buf
+    }
+
+    fn signing_input(&self) -> [u8; Self::SIGNING_INPUT_SIZE] {
+        let mut buf = [0u8; Self::SIGNING_INPUT_SIZE];
+        buf[..SUBNET_SUBJECT_FLOOR_SIG_DOMAIN.len()]
+            .copy_from_slice(SUBNET_SUBJECT_FLOOR_SIG_DOMAIN);
+        buf[SUBNET_SUBJECT_FLOOR_SIG_DOMAIN.len()..].copy_from_slice(&self.signed_payload());
+        buf
+    }
+
+    /// Wire form: payload ‖ signature.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::WIRE_SIZE);
+        out.extend_from_slice(&self.signed_payload());
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    /// Strict decode (exact length, version 1, strict rights);
+    /// signature NOT verified here.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, SubnetAuthError> {
+        if bytes.len() != Self::WIRE_SIZE {
+            return Err(SubnetAuthError::InvalidFormat);
+        }
+        let mut off = 0;
+        let version = bytes[off];
+        off += 1;
+        if version != 1 {
+            return Err(SubnetAuthError::InvalidFormat);
+        }
+        let authority = EntityId::from_bytes(read_32(bytes, &mut off));
+        let path = TopologySubnetId::from_raw(read_u32(bytes, &mut off));
+        let topology_epoch = read_u32(bytes, &mut off);
+        let issuer = EntityId::from_bytes(read_32(bytes, &mut off));
+        let subject = EntityId::from_bytes(read_32(bytes, &mut off));
+        let rights = SubnetRights::try_from_bits(bytes[off])?;
+        off += 1;
+        let minimum_generation = read_u32(bytes, &mut off);
+        let revision = read_u64(bytes, &mut off);
+        let issued_at = read_u64(bytes, &mut off);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&bytes[off..off + 64]);
+        Ok(Self {
+            version,
+            scope: SubnetRef { authority, path },
+            topology_epoch,
+            issuer,
+            subject,
+            rights,
+            minimum_generation,
+            revision,
+            issued_at,
+            signature,
+        })
+    }
+
+    /// Signature verification against `self.issuer` (whether that
+    /// issuer is a configured root is the registry's decision).
+    pub fn verify(&self) -> Result<(), SubnetAuthError> {
+        let sig = Signature::from_bytes(&self.signature);
+        self.issuer
+            .verify(&self.signing_input(), &sig)
+            .map_err(|_| SubnetAuthError::InvalidSignature)
+    }
+}
+
+/// Right bits in their fixed index order (ATTACH, ROUTE, EXPORT).
+const RIGHT_BITS: [SubnetRights; 3] = [
+    SubnetRights::ATTACH,
+    SubnetRights::ROUTE,
+    SubnetRights::EXPORT,
+];
+
 /// Per-authority floor state + the `subnet_auth_epoch` counter.
 ///
 /// Floors are keyed `(authority, topology_epoch, scope path)` and
@@ -871,12 +1069,21 @@ impl SubnetRevocationFloor {
 pub struct SubnetFloorRegistry {
     floors: DashMap<([u8; 32], u32, u32), FloorEntry>,
     auth_epochs: DashMap<[u8; 32], u64>,
+    /// Subject floors keyed `(authority, topology_epoch, path, subject)`.
+    subject_floors: DashMap<([u8; 32], u32, u32, [u8; 32]), SubjectFloorEntry>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct FloorEntry {
     minimum_generation: u32,
     revision: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SubjectFloorEntry {
+    revision: u64,
+    /// Per-right minimum generation, indexed like [`RIGHT_BITS`].
+    generations: [u32; 3],
 }
 
 impl SubnetFloorRegistry {
@@ -993,6 +1200,144 @@ impl SubnetFloorRegistry {
             .get(authority.as_bytes())
             .map(|e| *e)
             .unwrap_or(0)
+    }
+
+    /// Verify and apply a subject floor under `config`'s trust (its
+    /// authority must be the config's, its issuer a configured ROOT).
+    /// Returns `Ok(true)` iff some right's generation for that subject
+    /// rose. A stale or equal revision is an `Ok(false)` no-op, and no
+    /// right's generation is ever lowered. Unlike a subtree floor this
+    /// does NOT advance the authority-wide auth epoch: the caller drops
+    /// only the affected subject's contexts, so no sibling re-admits.
+    pub fn apply_subject(
+        &self,
+        floor: &SubnetSubjectFloor,
+        config: &SubnetAuthorityConfig,
+    ) -> Result<bool, SubnetAuthError> {
+        if floor.scope.authority != config.authority {
+            return Err(SubnetAuthError::WrongAuthority);
+        }
+        if config.roots.is_empty() {
+            return Err(SubnetAuthError::UnknownAuthority);
+        }
+        if !config.roots.contains(&floor.issuer) {
+            return Err(SubnetAuthError::IssuerNotAuthorized);
+        }
+        floor.verify()?;
+        let key = (
+            *floor.scope.authority.as_bytes(),
+            floor.topology_epoch,
+            floor.scope.path.raw(),
+            *floor.subject.as_bytes(),
+        );
+        let mut changed = false;
+        let raise = |generations: &mut [u32; 3], changed: &mut bool| {
+            for (i, bit) in RIGHT_BITS.iter().enumerate() {
+                if floor.rights.contains(*bit) && floor.minimum_generation > generations[i] {
+                    generations[i] = floor.minimum_generation;
+                    *changed = true;
+                }
+            }
+        };
+        self.subject_floors
+            .entry(key)
+            .and_modify(|e| {
+                if floor.revision > e.revision {
+                    e.revision = floor.revision;
+                    raise(&mut e.generations, &mut changed);
+                }
+            })
+            .or_insert_with(|| {
+                let mut generations = [0u32; 3];
+                raise(&mut generations, &mut changed);
+                SubjectFloorEntry {
+                    revision: floor.revision,
+                    generations,
+                }
+            });
+        Ok(changed)
+    }
+
+    /// Whether a subject floor refuses `subject` the `requested` rights
+    /// at `target` under `topology_epoch`: some floor at `target` or an
+    /// ancestor covers a requested right with a non-zero generation that
+    /// the leaf does not meet — or the leaf is delegated (`one_hop`),
+    /// which never meets a subject floor. ≤ 5 lookups; free when no
+    /// subject floor exists.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each parameter is a distinct verifier-owned input"
+    )]
+    pub fn subject_refuses(
+        &self,
+        authority: &EntityId,
+        topology_epoch: u32,
+        subject: &EntityId,
+        target: TopologySubnetId,
+        requested: SubnetRights,
+        leaf_generation: u32,
+        one_hop: bool,
+    ) -> bool {
+        if self.subject_floors.is_empty() {
+            return false;
+        }
+        let (auth, subj) = (*authority.as_bytes(), *subject.as_bytes());
+        let mut cursor = target;
+        loop {
+            if let Some(e) = self
+                .subject_floors
+                .get(&(auth, topology_epoch, cursor.raw(), subj))
+            {
+                for (i, bit) in RIGHT_BITS.iter().enumerate() {
+                    let floor = e.generations[i];
+                    if requested.contains(*bit) && floor > 0 && (one_hop || leaf_generation < floor)
+                    {
+                        return true;
+                    }
+                }
+            }
+            if cursor.is_global() {
+                break;
+            }
+            cursor = cursor.parent();
+        }
+        false
+    }
+
+    /// The subject floor held exactly at `(authority, topology_epoch,
+    /// path, subject)`: its revision and per-right generations (ATTACH,
+    /// ROUTE, EXPORT), or zeros when none is held. Readback only.
+    pub fn subject_floor_state(
+        &self,
+        authority: &EntityId,
+        topology_epoch: u32,
+        path: TopologySubnetId,
+        subject: &EntityId,
+    ) -> (u64, [u32; 3]) {
+        self.subject_floors
+            .get(&(
+                *authority.as_bytes(),
+                topology_epoch,
+                path.raw(),
+                *subject.as_bytes(),
+            ))
+            .map(|e| (e.revision, e.generations))
+            .unwrap_or((0, [0; 3]))
+    }
+
+    /// Whether any subject floor for `subject` covers `target` (or an
+    /// ancestor) with a non-zero generation for a right in `rights` —
+    /// the conservative test used to drop live contexts on apply;
+    /// re-presentation then decides admission exactly.
+    pub fn subject_covers(
+        &self,
+        authority: &EntityId,
+        topology_epoch: u32,
+        subject: &EntityId,
+        target: TopologySubnetId,
+        rights: SubnetRights,
+    ) -> bool {
+        self.subject_refuses(authority, topology_epoch, subject, target, rights, 0, true)
     }
 }
 
@@ -2362,6 +2707,21 @@ pub fn verify_admission(
     if !verified.rights.contains(presentation.requested_rights) {
         return Err(SubnetAuthError::RightNotGranted);
     }
+    // Subject floors are checked against the TARGET, not the grant's
+    // scope: an ancestor-scoped grant cannot carry a removed subject
+    // back into the floored subtree, and a delegated leaf never
+    // satisfies a subject floor (§6.1a).
+    if floors.subject_refuses(
+        &verified.authority,
+        verified.topology_epoch,
+        &verified.subject,
+        presentation.target.path,
+        presentation.requested_rights,
+        verified.generation,
+        matches!(set, SubnetCredentialSet::OneHop { .. }),
+    ) {
+        return Err(SubnetAuthError::Revoked);
+    }
 
     Ok(VerifiedSubnetContext {
         authority: verified.authority,
@@ -2454,9 +2814,10 @@ mod wire_kind_tests {
                 E::InvalidFormat => 20,
                 E::InvalidValidityWindow => 21,
                 E::ClockSkewTooLarge => 22,
+                E::StateNotPersisted => 23,
             }
         }
-        const EXPECTED: usize = 23;
+        const EXPECTED: usize = 24;
         assert_eq!(
             E::ALL.len(),
             EXPECTED,

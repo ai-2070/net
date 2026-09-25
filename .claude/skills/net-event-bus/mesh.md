@@ -229,6 +229,15 @@ Effectiveness signal: `punches_succeeded / punches_attempted` near zero means th
 
 The `nat_type` / `connect_direct` / `connect_direct_auto` / `traversal_stats` surface is on the lower-level binding (`@net-mesh/core`'s `NetMesh` in TS, `from net import NetMesh` in Python), with full stats parity across the FFI, Go, Node, and Python bindings. The Rust SDK exposes it on `Mesh` directly behind `#[cfg(feature = "nat-traversal")]`.
 
+### Blind relay — the operator-run fallback
+
+The routed-handshake path needs *some* node that can forward. V3 ships a standalone one: `net-mesh relay serve --bind 0.0.0.0:443` runs a **blind** UDP relay in the foreground. It holds no trust-domain PSK, issuer key or mesh credential and forwards opaque NKpsk0 ciphertext by channel number — it cannot read, forge or join anything it carries, and relay state is never authority. A device registers from its own mesh socket (so the same NAT mapping carries its relayed traffic); a joiner that knows the registration id from its signed join token binds a channel.
+
+- **UDP and TCP on the same port.** `up --enroll --relay <host:port>` names the relay (defaults to the profile `relay`; `--no-relay` opts out). A joiner attaches **direct first, then through the relay** — a registered relay is not a prerequisite, and a reachable direct path wins. `attach_path` reports `direct`, `relay`, or `relay_tcp`.
+- **Binding 443** covers networks that allow only that port. When UDP *to the relay* goes unanswered (a network that blocks UDP), the node opens a plain **TCP tunnel** on the same TCP listener; the enrolling node then reports `relay_transport: tcp`. Registration still signs the observed endpoint and the stream's end-to-end Noise handshake still authenticates the device — but the tunnel is plain TCP, explicitly **not** claimed to cross proxies or TLS-inspecting middleboxes.
+
+This is a reachability fallback, distinct from the SDK's routed-handshake forwarding above (which needs a relay-capable *peer*, not a standalone service).
+
 ---
 
 ## Port mapping — opt-in shortcut

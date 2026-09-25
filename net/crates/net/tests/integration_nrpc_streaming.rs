@@ -665,3 +665,73 @@ async fn call_service_streaming_no_servers_returns_no_route() {
         other => panic!("expected RpcError::NoRoute, got {other:?}"),
     }
 }
+
+/// Emits `count` chunks `gap` apart, so the response is in flight for a
+/// while (C3 witness below).
+struct PacedStreamHandler {
+    count: usize,
+    gap: Duration,
+}
+
+#[async_trait::async_trait]
+impl RpcStreamingHandler for PacedStreamHandler {
+    async fn call(&self, _ctx: RpcContext, sink: RpcResponseSink) -> Result<(), RpcHandlerError> {
+        for i in 0..self.count {
+            sink.send(format!("paced-{i}").into_bytes());
+            tokio::time::sleep(self.gap).await;
+        }
+        Ok(())
+    }
+}
+
+/// C3 responder gate, live peer: while the server is mid-way through a
+/// streaming response (session-bound), a same-static re-handshake from the
+/// caller — still heartbeating, so still speaking on the session — is
+/// deferred, and the response arrives whole on the original session. The
+/// restart counterpart (a SILENT peer's re-handshake rotates within a few
+/// heartbeats rather than the whole session timeout) is the unit witness
+/// `busy_rotation_defers_only_while_the_peer_is_speaking`.
+#[tokio::test]
+async fn a_live_peers_rehandshake_does_not_cut_a_streaming_response() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    let _serve = server
+        .serve_rpc_streaming(
+            "paced",
+            Arc::new(PacedStreamHandler {
+                count: 20,
+                gap: Duration::from_millis(100),
+            }),
+        )
+        .expect("serve_rpc_streaming");
+    let mut stream = caller
+        .call_streaming(
+            server.node_id(),
+            "paced",
+            Bytes::from_static(b"go"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("call_streaming must succeed");
+    let first = stream.next().await.expect("first chunk").expect("chunk ok");
+    assert_eq!(&first[..], b"paced-0");
+
+    // Mid-transfer: the caller re-handshakes with a fresh ephemeral.
+    let rotated = caller
+        .connect_via(server.local_addr(), server.public_key(), server.node_id())
+        .await;
+    assert!(
+        rotated.is_err(),
+        "the server must defer rotating a live peer's busy session"
+    );
+
+    let mut collected = vec![String::from_utf8(first.to_vec()).unwrap()];
+    while let Some(item) = stream.next().await {
+        let chunk = item.expect("chunk must be Ok");
+        collected.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+    let expected: Vec<String> = (0..20).map(|i| format!("paced-{i}")).collect();
+    assert_eq!(collected, expected, "the response must arrive whole");
+}

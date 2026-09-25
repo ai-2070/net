@@ -125,6 +125,114 @@ impl RpcHandler for SlowHandler {
 // ============================================================================
 
 #[tokio::test]
+async fn rpc_large_response_preserves_packet_boundary_and_rejects_over_limit() {
+    struct SizedResponse(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl RpcHandler for SizedResponse {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let size = u32::from_le_bytes(ctx.payload.body[..4].try_into().unwrap()) as usize;
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: Bytes::from(vec![b'x'; size]),
+            })
+        }
+    }
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc("sized_response", Arc::new(SizedResponse(calls.clone())))
+        .unwrap();
+    let empty = RpcResponsePayload {
+        status: RpcStatus::Ok,
+        headers: vec![],
+        body: Bytes::new(),
+    };
+    let boundary = net_wire::protocol::MAX_EVENT_SIZE
+        - net::adapter::net::cortex::EVENT_META_SIZE
+        - net::adapter::net::cortex::RPC_ROUTE_V1_SIZE
+        - empty.encoded_len();
+    let maximum = 1024 * 1024 - empty.encoded_len();
+    for size in [boundary, boundary + 1, 22_000, maximum, maximum + 1] {
+        let result = caller
+            .call(
+                server.node_id(),
+                "sized_response",
+                Bytes::copy_from_slice(&(size as u32).to_le_bytes()),
+                CallOptions {
+                    deadline: Some(Instant::now() + Duration::from_secs(3)),
+                    ..Default::default()
+                },
+            )
+            .await;
+        if size <= maximum {
+            assert_eq!(result.unwrap().body, Bytes::from(vec![b'x'; size]));
+        } else {
+            match result.unwrap_err() {
+                RpcError::ServerError {
+                    status, message, ..
+                } => {
+                    assert_eq!(status, RpcStatus::Internal.to_wire());
+                    assert!(message.contains("1048576-byte limit"), "{message}");
+                    assert!(message.contains("handler may have completed"), "{message}");
+                    assert!(
+                        !message.contains("xxxxx"),
+                        "must not echo application bytes"
+                    );
+                }
+                other => panic!("expected explicit size error, not timeout: {other:?}"),
+            }
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 5, "no automatic retries");
+}
+
+#[tokio::test]
+async fn rpc_oversized_request_refuses_before_handler_and_next_small_call_works() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc(
+            "bounded_request",
+            Arc::new(CountingHandler {
+                count: calls.clone(),
+            }),
+        )
+        .unwrap();
+    let error = caller
+        .call(
+            server.node_id(),
+            "bounded_request",
+            Bytes::from(vec![b'x'; 22_000]),
+            CallOptions {
+                deadline: Some(Instant::now() + Duration::from_secs(3)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("single-packet limit"), "{error}");
+    assert!(error.to_string().contains("nothing was sent"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let reply = caller
+        .call(
+            server.node_id(),
+            "bounded_request",
+            Bytes::from_static(b"small"),
+            CallOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.body, Bytes::from_static(b"small"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn rpc_round_trip_two_meshes() {
     let server = build_node().await;
     let caller = build_node().await;

@@ -317,6 +317,48 @@ describe('the synchronous transaction', () => {
     expect(store.getState().ship?.heading).toBe(0);
   });
 
+  it('discards a nested full snapshot when the handler throws', () => {
+    // `host.setState` reaches the core as a FULL SNAPSHOT through
+    // `commit`, so `applySnapshot` is the public-handle path a
+    // rollback must not be defeated through — committing beside the
+    // open transaction published the handler's world AND then
+    // reported `action-rejected` for it.
+    const store = core();
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    expect(() =>
+      store.transact(ctx => {
+        ctx.setState({ ship: { heading: 4, sail: 0, shots: 0 } });
+        store.applySnapshot({ ship: { heading: 5, sail: 0, shots: 0 } });
+        throw new Error('abort');
+      }, 'a1b2c3d4e5f60718'),
+    ).toThrow('abort');
+
+    expect(listener).not.toHaveBeenCalled();
+    expect(store.getState().ship?.heading).toBe(0);
+    expect(store.revision).toBe(0);
+  });
+
+  it('commits a nested full snapshot with the transaction instead of reverting it', () => {
+    const store = core();
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    store.transact(ctx => {
+      ctx.setState({ ship: { heading: 4, sail: 1, shots: 0 } });
+      // Routed beside the transaction, this publishes at once and the
+      // transaction's own commit then silently reverts it — after
+      // subscribers were told.
+      store.applySnapshot({ ship: { heading: 5, sail: 1, shots: 0 } });
+      return undefined;
+    }, 'a1b2c3d4e5f60718');
+
+    expect(store.getState().ship).toEqual({ heading: 5, sail: 1, shots: 0 });
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(store.revision).toBe(1);
+  });
+
   it('refuses a nested transaction', () => {
     const store = core();
     let thrown: unknown;

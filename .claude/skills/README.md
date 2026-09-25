@@ -99,7 +99,7 @@ Each skill is a `SKILL.md` entry point plus reference files that Claude loads **
 | `payloads.md` | Event schema, size limits, cross-language interop traps. |
 | `filter-dsl.md` | Consumer-side content filtering — equality `$and`/`$or`/`$not` predicates on the bus. |
 | `error-codes.md` | Classifying a specific error variant — the full core-crate + subsystem taxonomy. |
-| `cli.md` | The `net-mesh` CLI — `transfer` (blob/dir) and `typegen` commands, exit codes. |
+| `cli.md` | The `net-mesh` CLI — execution scopes (offline / persistent store / temporary supervisor / mesh client / hosted service), the `--local` gate, `--inspect-target`, `transfer`, `typegen`, `wrap`/`mcp`, `netdb`, org/subnet issuance, exit codes, deadlines and scripting notes. |
 | `testing.md` | Fixtures, race conditions, CI gotchas. |
 | `gotchas.md` | Migrating from Kafka / NATS / Redis Streams / Pulsar. |
 | `event-semantics.md` | Naming events / what an event may assert — a fact observed at one layer, not an end-to-end `200 OK`. |

@@ -216,6 +216,68 @@ describe('C — an application callback that throws', () => {
 
     expect(() => store.receive(joinFrame(), PEER)).not.toThrow();
   });
+
+  it('refuses a handle typed when a commit can no longer project for it', () => {
+    // The `propagate` side of the same application failure: the
+    // projection worked at join and dies at a later commit, with
+    // `empty()` broken too. Silence left the replica at its old
+    // revision reporting `ready, stale: false`.
+    let broken = false;
+    const store = owner({
+      definition: definition({ empty: failingEmpty() }),
+      project: state => {
+        if (broken) throw new Error('projection explodes');
+        return state;
+      },
+    });
+
+    // A caller holding a live view of that handle, through the real
+    // replica.
+    const replicaDefinition = definition();
+    const replicaCore = new StoreCore<Doc, Record<string, never>, Record<string, never>>({
+      definition: replicaDefinition,
+      initialState: { tick: 0 },
+    });
+    let replicaQs = 0;
+    const replica = new StoreReplica<Doc, Record<string, never>, Record<string, never>>({
+      definition: replicaDefinition,
+      core: replicaCore,
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: () => 0,
+      newQ: () => (++replicaQs).toString(16).padStart(16, '0') as Hex,
+      audience: ['crew'],
+      store: 'test-store',
+      key: 'k',
+    });
+    const toReplica = (frames: readonly { readonly frame: string }[]) =>
+      frames.flatMap(frame => replica.receive(frame.frame).out);
+    const joined = store.receive(replica.join().frame, PEER);
+    const h = handleOf(joined.out);
+    toReplica(joined.out);
+    expect(replica.state).toBe('ready');
+    expect(store.handleCount).toBe(1);
+
+    broken = true;
+    const committed = store.commit({ tick: 2 });
+
+    // The caller is TOLD — `closed`, the only unsolicited refusal the
+    // wire admits — and the handle goes with it.
+    expect(committed.out).toHaveLength(1);
+    const decoded = decodeMessage(committed.out[0]!.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
+    expect(decoded.ok && decoded.message.k).toBe('no');
+    expect(decoded.ok && decoded.message.k === 'no' && decoded.message.code).toBe('closed');
+    expect(decoded.ok && decoded.message.k === 'no' && decoded.message.h).toBe(h);
+    expect(store.handleCount).toBe(0);
+
+    // And the ladder lands the TYPED refusal at the caller: the notice
+    // provokes a rejoin, and the join — a request path that CAN carry
+    // a refusal — answers `capacity` correlated.
+    const rejoined = toReplica(committed.out);
+    expect(rejoined.map(request => request.kind)).toEqual(['join']);
+    toReplica(store.receive(rejoined[0]!.frame, PEER).out);
+    expect(replica.state).toBe('fenced');
+    expect(replicaCore.getStatus().error?.code).toBe('capacity');
+  });
 });
 
 describe('C — a solicited `resync` is a read', () => {
@@ -310,13 +372,47 @@ describe('D — the replica', () => {
     deliver(store.receive(gap.out[0]!.frame, PEER).out);
     expect(replica.state).toBe('ready');
 
-    const late = replica.receive(encodeMessage({ k: 'no', q: staleQ, h, code: 'closed' }));
+    // A REQUEST refusal answers a question, so one arriving for a request
+    // already finished is news about nothing: tearing down a healthy view
+    // on it would discard an installed document, the watermark and the
+    // handle. (`closed` is deliberately not this case — see below.)
+    const late = replica.receive(encodeMessage({ k: 'no', q: staleQ, h, code: 'forbidden' }));
 
-    // A refusal of an abandoned request is not news about the handle.
     expect(late.dropped).toBe('stale-correlation');
     expect(replica.handle).toBe(h);
     expect(replica.retired).not.toBe('0');
     expect(core.getState()).toEqual({ tick: 1 });
+  });
+
+  it('treats a correlated `no {closed}` as handle death', () => {
+    // `closed` is terminal for the HANDLE and for any action in flight on
+    // it (errors.ts), and `receive`'s foreign-handle gate has already
+    // discarded any `closed` naming a different handle — so one reaching
+    // the refusal dispatch is news about THIS handle whatever `q` it
+    // carries. Every owner-side handle-death answer is correlated to the
+    // request that provoked it (`no {q: <an alive's q>, h, closed}`), so
+    // reading that as "answered a dead question" held a dead handle for
+    // ever: every later `alive` was answered the same way and counted the
+    // same way, the view stayed published as `ready`, and no rejoin ran.
+    const { store, core, replica, joined, deliver } = pair();
+    joined();
+    const h = replica.handle as Hex;
+
+    const gap = replica.receive(encodeMessage({ k: 'delta', h, g: '1', base: '5', r: '6', ops: [] }));
+    const staleQ = gap.out[0]!.q;
+    deliver(store.receive(gap.out[0]!.frame, PEER).out);
+    expect(replica.state).toBe('ready');
+
+    const death = replica.receive(encodeMessage({ k: 'no', q: staleQ, h, code: 'closed' }));
+
+    expect(death.dropped).toBe('closed');
+    expect(death.out).toHaveLength(1);
+    expect(replica.handle).toBe(null);
+    expect(replica.retired).toBe('0');
+    expect(replica.state).toBe('joining');
+    // The view is cleared to the definition's EMPTY document — the world
+    // this replica had is gone with the handle that carried it.
+    expect(core.getState()).toEqual({ tick: 0 });
   });
 
   it('keeps a cancellation cancelled when the owner answers anyway', () => {
@@ -660,5 +756,69 @@ describe('a cancellation during an installation is not overwritten', () => {
     expect(pair.core.getStatus().phase).not.toBe('ready');
     expect(pair.core.getStatus().stale).toBe(false);
     expect(pair.core.getState()).toEqual({ tick: 0 });
+  });
+});
+
+describe('the delta feed re-authorizes before shipping (#27)', () => {
+  // Regression witnesses for the re-authorization fence in
+  // `propagate`, which shipped without coverage — including the key
+  // security case. The delta feed IS the read delivered fresh: a
+  // policy revocation has to stop it, not only the next projection.
+  // `join`, `aud`/`resume` and `resync` are all gated and the
+  // `resync` refusal deliberately keeps the handle warm — which is
+  // exactly why the feed cannot rely on the grant having been checked
+  // once at admission. Removing the fence makes the rows below fail by
+  // DELIVERING a delta to the revoked peer and keeping its handle.
+
+  const B = '00000000000000bb';
+
+  const kindOf = (frame: string) => {
+    const decoded = decodeMessage(frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
+    return decoded.ok ? decoded.message.k : 'refused';
+  };
+
+  it('ships no delta to a revoked peer and forgets its handle', () => {
+    let permit = true;
+    const store = owner({ authorize: request => (request.type === 'read' ? permit : true) });
+    const h = handleOf(store.receive(joinFrame(), PEER).out);
+    expect(store.handleCount).toBe(1);
+
+    // Positive control: while the policy permits, the feed ships the
+    // change — so "no delta" below is the fence, not a broken feed.
+    const allowed = store.commit({ tick: 2 });
+    expect(allowed.out.map(frame => kindOf(frame.frame))).toContain('delta');
+
+    permit = false;
+    const revoked = store.commit({ tick: 3 });
+
+    // Nothing is shipped for state the policy now forbids. The handle
+    // goes with the refusal — `closed`, the wire's legal unsolicited
+    // notice — because leaving it alive would let `alive` renew the
+    // lease of a peer the policy forbids.
+    expect(revoked.out.map(frame => kindOf(frame.frame))).not.toContain('delta');
+    expect(revoked.out.map(frame => kindOf(frame.frame))).toEqual(['no']);
+    expect(store.handle(h)).toBeUndefined();
+    expect(store.handleCount).toBe(0);
+  });
+
+  it('keeps shipping to the peers the policy still permits', () => {
+    let permitA = true;
+    const store = owner({
+      authorize: request =>
+        request.type !== 'read' || request.peer !== PEER || permitA,
+    });
+    const hA = handleOf(store.receive(joinFrame(), PEER).out);
+    handleOf(store.receive(joinFrame(), B).out);
+
+    permitA = false;
+    const committed = store.commit({ tick: 2 });
+
+    const byPeer = new Map(committed.out.map(out => [out.peer, kindOf(out.frame)]));
+    // The fence is per peer: A is closed and forgotten, B's delta
+    // ships in the same commit.
+    expect(byPeer.get(PEER)).toBe('no');
+    expect(byPeer.get(B)).toBe('delta');
+    expect(store.handle(hA)).toBeUndefined();
+    expect(store.handleCount).toBe(1);
   });
 });

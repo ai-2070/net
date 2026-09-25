@@ -85,6 +85,26 @@ Consent failure surfaces as: `Capability requires local approval. Approve with: 
 
 ---
 
+## Running as an enrolled device — `--joined`
+
+`net-mesh wrap` and `net-mesh mcp serve` both take `--joined <state-dir>`: run as
+the device that `join` + `up` enrolled in that state directory, instead of
+supplying `--identity` and a remote peer. The identity, the mesh PSK and the
+node it enrolled with all come from the join store, so no secret is handed over
+on the command line — `--joined` **refuses `--psk-hex`**.
+
+The join store has one owner at a time, so `--joined` **refuses while `up` owns
+the join** (stop it with `net-mesh down` first). The consumer then holds the
+store for its whole lifetime, so `up` cannot start on the same identity beneath
+it either.
+
+By default it attaches to the node it enrolled with; an explicit
+`--node-addr` / `--node-pubkey` / `--node-id` names another peer of the same
+mesh (for example a provider device) while still running as the enrolled
+device. `--inspect-target` is not available alongside `--joined`.
+
+---
+
 ## Pinning — promotion to a first-class tool
 
 Pinning is the reliability + consent mechanism, not a convenience.

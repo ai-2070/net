@@ -48,6 +48,9 @@ pub enum ForwardingCommand {
 
 #[derive(Args, Debug)]
 pub struct StoreArgs {
+    /// Report the policy-store path without opening or changing it.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Forwarding policy store file. Defaults to the per-user store.
     #[arg(long = "store", value_name = "PATH")]
     pub store: Option<PathBuf>,
@@ -103,17 +106,73 @@ pub struct RmArgs {
 
 #[derive(Args, Debug)]
 pub struct SetValueArgs {
+    /// Inspect the keychain destination without reading stdin or accessing it.
+    #[cfg(feature = "keychain")]
+    #[arg(long)]
+    pub inspect_target: bool,
     /// The secret ref name to store the value under (should match a ref you
     /// configured with `net-mesh forwarding allow`).
     pub ref_name: String,
 }
 
 pub async fn run(
-    cmd: ForwardingCommand,
+    mut cmd: ForwardingCommand,
     output: Option<OutputFormat>,
-    _config_path: Option<&Path>,
-    _profile_name: &str,
+    config_path: Option<&Path>,
+    profile_name: &str,
 ) -> Result<(), CliError> {
+    #[cfg(feature = "keychain")]
+    if let ForwardingCommand::SetValue(args) = &cmd {
+        if args.inspect_target {
+            net_mcp::forward::validate_ref_name(&args.ref_name)
+                .map_err(|e| invalid_args(e.to_string()))?;
+            let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+            let mut target = crate::target::TargetInspection::local(&profile, "persistent_store");
+            target.provenance("source", "stdin");
+            target.provenance("keychain_service", "default");
+            target.provenance("keychain_account", "argument");
+            #[derive(serde::Serialize)]
+            struct View<'a> {
+                #[serde(flatten)]
+                target: crate::target::TargetInspection,
+                keychain_service: &'static str,
+                keychain_account: &'a str,
+            }
+            return crate::output::emit_value(
+                OutputFormat::resolve_oneshot(output),
+                &View {
+                    target,
+                    keychain_service: net_mcp::forward::DEFAULT_KEYCHAIN_SERVICE,
+                    keychain_account: &args.ref_name,
+                },
+            )
+            .map_err(|e| generic(format!("write inspection: {e}")));
+        }
+    }
+    let store = match &mut cmd {
+        ForwardingCommand::Enable(args)
+        | ForwardingCommand::Disable(args)
+        | ForwardingCommand::Audit(args) => Some(args),
+        ForwardingCommand::Allow(args) => Some(&mut args.store),
+        ForwardingCommand::Rm(args) => Some(&mut args.store),
+        ForwardingCommand::SetValue(_) => None,
+    };
+    if let Some(store) = store {
+        let source = if store.store.is_some() {
+            "flag"
+        } else {
+            "default"
+        };
+        let path = resolve_store(store.store.as_deref())?;
+        if store.inspect_target {
+            let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+            let mut view = crate::target::TargetInspection::local(&profile, "persistent_store");
+            view.store = Some(path);
+            view.provenance("store", source);
+            return view.emit(output);
+        }
+        store.store = Some(path);
+    }
     match cmd {
         ForwardingCommand::Enable(args) => set_enabled(args, output, true).await,
         ForwardingCommand::Disable(args) => set_enabled(args, output, false).await,

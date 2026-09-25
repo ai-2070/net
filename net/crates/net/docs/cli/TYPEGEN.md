@@ -55,15 +55,49 @@ res = await call_acme_web_search(mesh, AcmeWebSearchRequest(query="net mesh", ma
 - **Live discovery** — pass the remote-attach flags (`--node-addr`,
   `--node-pubkey`, `--node-id`, `--psk-hex`, each defaultable in the
   profile). The CLI joins the mesh, lets the capability fold populate, then
-  reads `list_tools`. A short discovery poll (≤ 5 s) avoids racing an empty
-  result.
+  reads provider-attributed capability entries. Explicit `--tool` IDs must all be observed after
+  filtering within five seconds; unrelated tools cannot end the wait.
+  Missing IDs fail with exit 7 before snapshot/generated output is written.
+  Without IDs, discovery observes the full five-second window. This is a
+  bounded observation, not a complete mesh inventory or proof of absence.
+  An explicit global `--timeout` can shorten the wait using the remaining
+  budget after attachment; it does not extend the discovery window.
 - **Snapshot** — `generate --from-snapshot <file>` regenerates from a pinned
   capture. Offline and deterministic; this is the path CI and tests use.
+
+Live acquisition fetches a missing input schema from the exact advertising
+provider using `tool.metadata.fetch`. If that provider advertises the metadata
+service, a missing output schema also triggers a fetch; an output still absent
+in the full response remains optional. Legacy inline-input tools without that
+service can retain an absent output. Returned tool ID, version, tags and any
+already-inline schemas must agree with the selected advertisement.
+
+Conflicting selected advertisements (including versions) fail before output.
+Identical replicas use the lowest node ID, with no fallback or CLI retry on
+fetch failure. Snapshot v1 stays unchanged: provenance selects the live RPC,
+but provider IDs are not persisted as an offline routing guarantee.
+
+An explicit `--timeout` shares its remaining budget across attachment,
+observation and all metadata fetches. If omitted, acquisition after attachment
+has one 30-second limit; observation still lasts at most five seconds and SDK
+RPC limits still apply. Schema/metadata failure preserves existing output.
+Publication after successful acquisition is not a crash-atomic transaction.
+Metadata uses the existing unary RPC transport. Updated native peers negotiate
+responses up to 1 MiB **including encoded status and headers**, split into bounded
+packets; the 8 KiB packet limit is unchanged. A roughly 22 KB live contract is
+covered, including offline regeneration after provider shutdown. Incomplete
+responses never become successful metadata. Older providers may still refuse
+responses above the single-packet limit. Over-limit responses return an explicit
+RPC size error. The handler may have completed; do not automatically retry.
+The [bounded response contract](../NRPC_LARGE_RESPONSES.md) describes sender
+admission limits, transfer deadlines and cancellation after handler completion.
 
 ### Filtering
 
 `--tag <T>...` keeps a tool if ANY of its tags match; `--tool <ID>...` keeps
-exact tool ids. Both apply to live and snapshot sources.
+exact tool ids. Both apply to live and snapshot sources. When both groups
+are supplied, a tool must match both. Live discovery requires every requested
+ID to pass that intersection; offline filtering remains a subset operation.
 
 ---
 
@@ -111,6 +145,11 @@ cleanly in source control. Commit them alongside the code that depends on
 the generated types; regenerate from the committed snapshot in CI so the
 build output doesn't drift with the live mesh population.
 
+For example, given `old.snapshot` advertising `vendor/search` v1.2.0
+with an optional `input.max_results`, and `new.snapshot` advertising
+`vendor/new_tool` v1.0.0 plus `vendor/search` v1.3.0 (`input.filter`
+added as optional, `input.max_results` made required):
+
 ```sh
 $ net-mesh typegen diff --from old.snapshot --to new.snapshot
 Added tools (1):
@@ -118,11 +157,19 @@ Added tools (1):
 
 Schema changes (1):
   vendor/search v1.2.0 → v1.3.0
-    - input.max_results: optional → required          [BREAKING]
+    - version: 1.2.0 → 1.3.0
     - input.filter: added (optional)
+    - input.max_results: optional → required          [BREAKING]
 
 1 changed tool(s), 1 marked BREAKING.
 ```
+
+*(Transcript `source-established, not executed` — derived from the
+renderer rather than captured from a live run: `typegen/diff.rs`
+`changes_between` emits the `version` line first whenever versions
+differ, `diff_objects` walks field names in `BTreeMap` order (so
+`input.filter` precedes `input.max_results`), and `render_text`
+produces the section headers, `[BREAKING]` flag and summary line.)*
 
 `diff` emits the structured report under `--output json` / `yaml`. Pass
 `--exit-code` to make `diff` exit non-zero (code **14**) when any BREAKING
@@ -151,8 +198,11 @@ array element so the change is visible.
 
 Supported (common subset): primitives + null, arrays, tuples
 (`prefixItems`), objects (`properties` / `required` / `additionalProperties`),
-`enum`, `const`, `oneOf` / `anyOf` (unions), `allOf` (TS intersection /
-Python inheritance for object combinations), local `$ref` to `$defs`,
+`enum`, `const`, `oneOf` / `anyOf` (unions), `allOf` (TS: `A & B`
+wherever it appears; Python: inheritance **only** for a top-level
+`allOf` whose members are all `$ref`s — every other `allOf` (nested,
+property-level, or with inline members) types as `Any`), local `$ref`
+to `$defs`,
 `nullable: true` (OpenAPI dialect), and doc strings from `description` /
 `title`.
 
@@ -162,21 +212,28 @@ without intending an open object); only an explicit `true` / typed schema
 opens it (TS index signature, Python `ConfigDict(extra="allow")`), and
 `false` closes it.
 
-Out of initial scope — a tool with one of these is **skipped with a
-warning**, not silently mis-generated: external `$ref` URIs, `not`,
+Out of scope: external `$ref` URIs, `not`,
 `if`/`then`/`else`, `dependentSchemas` / `dependentRequired`,
-`unevaluatedProperties`. A tool whose `input_schema` is `None` (schema
-exceeded the fold's per-entry budget) is also skipped until the
-`tool.metadata.fetch` RPC ships. A tool with no `output_schema` still
+`unevaluatedProperties`. Live snapshot/generation rejects unsupported schemas
+or a missing input schema after hydration before writing output. Offline
+generation retains legacy warning-and-skip behavior for incomplete or
+unsupported saved descriptors. A tool with no `output_schema` still
 generates — its response type is `unknown` (TS) / `Any` (Python).
 
 ---
 
 ## 6. Editing generated code
 
-Don't. Every file starts with an "Auto-generated … Do not edit by hand"
-header. Regenerate instead; commit the snapshot so regeneration is
+Don't. Regenerate instead; commit the snapshot so regeneration is
 reproducible.
+
+Each generated module carries an "Auto-generated … Do not edit by hand"
+header — TS `tools/<base>.ts` and `index.ts`, Python `<base>/models.py`
+(a module docstring) and the package-root `__init__.py`. The auxiliary
+files carry **no** header — TS `meta.json`, Python `_meta.json`,
+`<base>/models.pyi`, `<base>/call.py`, and the per-tool
+`<base>/__init__.py` — but they are generated all the same: regenerate
+rather than hand-editing them.
 
 ---
 

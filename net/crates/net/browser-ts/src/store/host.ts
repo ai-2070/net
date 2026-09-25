@@ -317,8 +317,21 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       replies.set(peer, stream);
       return stream;
     });
-    pendingReplies.set(peer, opening);
-    return opening;
+    const tracked = opening.catch(error => {
+      // A failed first open must not be cached as this peer's fate. The
+      // success path above is what removes the entry, so without this the
+      // map holds a REJECTED promise and every later frame for the peer
+      // takes the `inFlight` branch and receives the same stale rejection
+      // — one transient `openStream` failure during the session-replacement
+      // window wedges that peer's service for the lifetime of the store,
+      // with every future commit's frames counted `send-failed`. The
+      // stale-send reopen path below deletes both entries; this is its
+      // first-open counterpart.
+      pendingReplies.delete(peer);
+      throw error;
+    });
+    pendingReplies.set(peer, tracked);
+    return tracked;
   }
 
   async function emit(out: readonly Outbound[]): Promise<void> {

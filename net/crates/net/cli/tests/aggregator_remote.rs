@@ -157,7 +157,8 @@ async fn ls_remote_lists_configured_groups() {
     let home = TempDir::new().expect("home tempdir");
     let (booted, _cfg) = boot_daemon(&toml).await;
 
-    let (code, stdout, stderr) = run_cli(&booted, &home, "ls", &["--remote"]).await;
+    let (code, stdout, stderr) =
+        run_cli(&booted, &home, "ls", &["--remote", "--timeout", "10s"]).await;
     assert_eq!(code, 0, "ls --remote failed: stderr={stderr}");
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));
@@ -169,6 +170,58 @@ async fn ls_remote_lists_configured_groups() {
         .map(|g| g["name"].as_str().expect("name string"))
         .collect();
     assert_eq!(names, vec!["alpha", "beta"]);
+
+    // Profile-only selection must resolve to the same remote registry that
+    // inspection reports; neither --remote nor explicit attach flags is used.
+    let profile =
+        write_temp_config(&format!(
+        "[profiles.test]\nnode_addr = '{}'\nnode_pubkey = '{}'\nnode_id = '{}'\npsk_hex = '{}'\n",
+        booted.bound_addr, hex::encode(booted.public_key), booted.mesh.node_id(), PSK_HEX
+    ))
+        .await;
+    let profile_path = profile.path().to_path_buf();
+    let (inspection, execution) =
+        tokio::task::spawn_blocking(move || {
+            let invoke = |inspect: bool| {
+                let mut cmd = AssertCommand::cargo_bin("net-mesh").unwrap();
+                cmd.timeout(Duration::from_secs(15))
+                    .args(["aggregator", "ls", "--profile", "test", "--config"])
+                    .arg(&profile_path)
+                    .args(["--output", "json"]);
+                if inspect {
+                    cmd.arg("--inspect-target");
+                }
+                let assert = cmd.assert().success();
+                let out = assert.get_output();
+                assert!(
+                    !String::from_utf8_lossy(&out.stderr).contains("Starts a temporary supervisor")
+                );
+                serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+            };
+            (invoke(true), invoke(false))
+        })
+        .await
+        .unwrap();
+    assert_eq!(inspection["mode"], "remote");
+    assert_eq!(inspection["target"]["node_id"], execution["target_node_id"]);
+    assert_eq!(execution["group_count"], 2);
+    // Replica generations advance on the live daemon between calls; compare
+    // stable registry identity/configuration, not the changing counters.
+    for (actual, expected) in execution["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(parsed["groups"].as_array().unwrap())
+    {
+        for key in [
+            "name",
+            "group_seed_fingerprint",
+            "source_subnet",
+            "replica_count",
+        ] {
+            assert_eq!(actual[key], expected[key]);
+        }
+    }
 
     drain_registry(&booted.registry).await;
 }

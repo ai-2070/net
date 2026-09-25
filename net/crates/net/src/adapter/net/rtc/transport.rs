@@ -17,7 +17,7 @@
 //!    only refreshed while the driver is writing to that peer (S0b
 //!    §4b: an idle-then-burst peer reads a stale zero).
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -116,13 +116,17 @@ struct PeerSlot {
     /// A slot whose generation wrapped: never handed out again.
     retired: bool,
     /// A close whose notification the mesh never received (H3):
-    /// `generation + 1`, or `0` for none. The close channel is
-    /// bounded and `try_send` can fail under lifetime churn — a
-    /// live peer's close used to be discarded with nothing recorded
-    /// and no retry, leaving the mesh's removal to the failure
-    /// detector. The bit is per slot, so this is a fixed amount of
-    /// state, not a queue.
-    pending_eviction: AtomicU32,
+    /// `generation + 1` in this wider mark space, or `0` for none.
+    /// The close channel is bounded and `try_send` can fail under
+    /// lifetime churn — a live peer's close used to be discarded
+    /// with nothing recorded and no retry, leaving the mesh's
+    /// removal to the failure detector. The bit is per slot, so this
+    /// is a fixed amount of state, not a queue. The mark space is
+    /// wider than `generation` on purpose: encoding `generation + 1`
+    /// in a `u32` saturated at `u32::MAX` and decoded to
+    /// `u32::MAX - 1`, an already-spent incarnation — a deferred
+    /// close at the last generation named the wrong id.
+    pending_eviction: AtomicU64,
     /// Installs in flight against this exact incarnation (H2).
     /// Registered and validated **under `queue`**, the same lock
     /// `close_peer` publishes `closed` under, so a close between an
@@ -244,7 +248,7 @@ impl RtcTransport {
                 closed: AtomicBool::new(false),
                 retired: false,
                 install_intents: AtomicU32::new(0),
-                pending_eviction: AtomicU32::new(0),
+                pending_eviction: AtomicU64::new(0),
             },
         );
         Ok(RtcPeerId { slot, generation })
@@ -571,12 +575,14 @@ impl RtcTransport {
     }
 
     /// Record a close notification the driver could not deliver
-    /// (H3). Re-delivered on a later driver turn.
+    /// (H3). Re-delivered on a later driver turn. The mark encodes
+    /// `generation + 1` exactly, in a space wider than `generation`
+    /// itself — see `PeerSlot::pending_eviction`.
     pub(crate) fn mark_pending_eviction(&self, id: RtcPeerId) {
         if let Some(slot) = self.slots.get(&id.slot) {
             if slot.generation == id.generation {
                 slot.pending_eviction
-                    .store(id.generation.saturating_add(1), Ordering::Release);
+                    .store(u64::from(id.generation) + 1, Ordering::Release);
             }
         }
     }
@@ -600,7 +606,11 @@ impl RtcTransport {
             if marked > 0 {
                 out.push(RtcPeerId {
                     slot: *entry.key(),
-                    generation: marked - 1,
+                    // The mark is `generation + 1` in the wider mark
+                    // space; `mark_pending_eviction` is its only
+                    // writer, so this is exact for every `u32`
+                    // generation — including the last.
+                    generation: (marked - 1) as u32,
                 });
             }
         }
@@ -617,7 +627,7 @@ impl RtcTransport {
     pub(super) fn clear_pending_eviction(&self, id: RtcPeerId) {
         if let Some(slot) = self.slots.get(&id.slot) {
             let _ = slot.pending_eviction.compare_exchange(
-                id.generation.saturating_add(1),
+                u64::from(id.generation) + 1,
                 0,
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -745,6 +755,39 @@ mod tests {
         assert_eq!(t.stats().discarded_at_close(), 3);
         assert_eq!(t.submit(b"late", id), Err(RtcSubmitError::UnknownPeer));
         assert!(!t.is_open(id));
+    }
+
+    /// H3's deferred close must name the EXACT incarnation it was
+    /// set for — at every generation, including the last one `u32`
+    /// can hold. The old `generation.saturating_add(1)` mark stored
+    /// `u32::MAX` at `generation == u32::MAX` and decoded to
+    /// `u32::MAX - 1`, so a deferred close named an already-spent
+    /// incarnation and the eviction fell back to the failure
+    /// detector. Inverse: shrink the mark back to a `u32`
+    /// `saturating_add(1)` and the decoded id below is wrong.
+    #[test]
+    fn a_deferred_close_names_its_exact_incarnation_at_the_last_generation() {
+        let t = transport(16, 1 << 20, usize::MAX);
+        let id = t.open_peer().expect("a slot");
+        // In-module: walk the slot to the last generation u32 can
+        // hold — the wrap boundary the old encoding broke at.
+        t.slots.get_mut(&id.slot).expect("slot").generation = u32::MAX;
+        let last = RtcPeerId {
+            slot: id.slot,
+            generation: u32::MAX,
+        };
+
+        t.mark_pending_eviction(last);
+        assert_eq!(
+            t.pending_evictions(),
+            vec![last],
+            "the deferred close names the exact incarnation it was set for"
+        );
+        t.clear_pending_eviction(last);
+        assert!(
+            !t.has_pending_eviction(last.slot),
+            "and the clear matches the very mark the set stored"
+        );
     }
 
     #[test]

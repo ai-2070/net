@@ -14,6 +14,144 @@ use net::adapter::net::redex::Redex;
 
 const ORIGIN: u64 = 0xABCD_EF01;
 
+#[cfg(feature = "redex-disk")]
+fn close_persistent(db: NetDb) {
+    db.close().unwrap();
+    for file in db.redex().open_files() {
+        file.close().unwrap();
+    }
+}
+
+#[cfg(feature = "redex-disk")]
+#[tokio::test]
+async fn persistent_restore_reopens_full_state_and_replays_later_writes() {
+    let source = NetDb::builder(Redex::new())
+        .origin(ORIGIN)
+        .with_tasks()
+        .with_memories()
+        .build()
+        .await
+        .unwrap();
+    source.tasks().create(1, "task", 100).unwrap();
+    let seq = source.tasks().complete(1, 200).unwrap();
+    source.tasks().wait_for_seq(seq).await.unwrap();
+    source
+        .memories()
+        .store(2, "memory", vec!["tag".into()], "provenance", 300)
+        .unwrap();
+    let seq = source.memories().pin(2, 400).unwrap();
+    source.memories().wait_for_seq(seq).await.unwrap();
+    let snapshot = source.snapshot().unwrap();
+    source.close().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let restored = NetDb::builder(Redex::new().with_persistent_dir(dir.path()))
+        .origin(ORIGIN)
+        .persistent(true)
+        .with_tasks()
+        .with_memories()
+        .build_from_snapshot(&snapshot)
+        .await
+        .unwrap();
+    close_persistent(restored);
+    // No source snapshot is supplied to any of these ordinary opens.
+    for round in 0..3 {
+        let db = NetDb::builder(Redex::new().with_persistent_dir(dir.path()))
+            .origin(ORIGIN)
+            .persistent(true)
+            .with_tasks()
+            .with_memories()
+            .build()
+            .await
+            .unwrap();
+        {
+            let state = db.tasks().state();
+            let guard = state.read();
+            let task = guard.get(1).unwrap();
+            assert_eq!(task.status, TaskStatus::Completed);
+            assert_eq!(task.created_ns, 100);
+            assert_eq!(task.title, if round == 0 { "task" } else { "renamed" });
+        }
+        {
+            let state = db.memories().state();
+            let guard = state.read();
+            let memory = guard.find_unique(2).unwrap();
+            assert_eq!(memory.content, "memory");
+            assert_eq!(memory.source, "provenance");
+            assert_eq!(memory.created_ns, 300);
+            assert_eq!(memory.pinned, round == 0);
+        }
+        if round == 0 {
+            let seq = db.tasks().rename(1, "renamed", 500).unwrap();
+            db.tasks().wait_for_seq(seq).await.unwrap();
+            let seq = db.memories().unpin(2, 600).unwrap();
+            db.memories().wait_for_seq(seq).await.unwrap();
+        }
+        close_persistent(db);
+    }
+    let wrong = NetDb::builder(Redex::new().with_persistent_dir(dir.path()))
+        .origin(ORIGIN + 1)
+        .persistent(true)
+        .with_tasks()
+        .build()
+        .await;
+    assert!(wrong.unwrap_err().to_string().contains("origin mismatch"));
+}
+
+#[cfg(feature = "redex-disk")]
+#[tokio::test]
+async fn persistent_restore_keeps_existing_post_snapshot_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = NetDb::builder(Redex::new().with_persistent_dir(dir.path()))
+        .origin(ORIGIN)
+        .persistent(true)
+        .with_tasks()
+        .with_memories()
+        .build()
+        .await
+        .unwrap();
+    let seq = db.tasks().create(1, "before", 100).unwrap();
+    db.tasks().wait_for_seq(seq).await.unwrap();
+    let mut snapshot = db.snapshot().unwrap();
+    snapshot.memories = None;
+    let seq = db.tasks().rename(1, "after", 200).unwrap();
+    db.tasks().wait_for_seq(seq).await.unwrap();
+    let seq = db.tasks().create(3, "tail", 300).unwrap();
+    db.tasks().wait_for_seq(seq).await.unwrap();
+    let seq = db
+        .memories()
+        .store(2, "keep", vec![], "local", 400)
+        .unwrap();
+    db.memories().wait_for_seq(seq).await.unwrap();
+    close_persistent(db);
+    let restored = NetDb::builder(Redex::new().with_persistent_dir(dir.path()))
+        .origin(ORIGIN)
+        .persistent(true)
+        .with_tasks()
+        .build_from_snapshot(&snapshot)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.tasks().state().read().get(1).unwrap().title,
+        "after"
+    );
+    close_persistent(restored);
+    let reopened = NetDb::builder(Redex::new().with_persistent_dir(dir.path()))
+        .origin(ORIGIN)
+        .persistent(true)
+        .with_tasks()
+        .with_memories()
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.tasks().state().read().get(1).unwrap().title,
+        "after"
+    );
+    assert!(reopened.tasks().state().read().contains(3));
+    assert_eq!(reopened.memories().count(), 1);
+    close_persistent(reopened);
+}
+
 #[tokio::test]
 async fn test_netdb_build_with_both_models() {
     let redex = Redex::new();

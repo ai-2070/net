@@ -22,6 +22,8 @@ Every Net packet carries a `subprotocol_id: u16` identifying how the payload sho
 | `0x0801` | Log reconciliation |
 | `0x0900` | Replica group coordination (reserved) |
 | `0x0A00` | Channel membership |
+| `0x0A01` | Identity proof (`SUBPROTOCOL_IDENTITY_PROOF`) |
+| `0x0A02` | Subnet admission (`SUBPROTOCOL_SUBNET_ADMISSION`): ChallengeRequest / Challenge / Present / Verdict |
 | `0x0B00` | Stream-window flow control |
 | `0x0C00` | Capability announcement |
 | `0x0D00` | NAT-traversal reflex |

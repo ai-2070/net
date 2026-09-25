@@ -80,6 +80,38 @@ bloom filter and a verified-positive cache for confirmed pairs. A header carryin
 an authorized `(origin_hash, channel_hash)` can use the cached decision; anything
 else is denied or escalated according to the guard result.
 
+## Enrolled channel relations
+
+A channel credential can also be delivered by enrollment instead of being
+hand-installed. The offline channel root (an operator identity) signs one
+bounded DELEGATE grant with `channel issue-grant`, delegating publish and/or
+subscribe on one canonical channel to an issuing node; that node mints a
+per-device chain `root → issuer → device` at join, and the device presents the
+full chain. The root never reaches a node, and a leaf never outlives the
+grant. `ADMIN`, wildcard and unbounded delegation are never issued.
+
+The CLI carries the lifecycle:
+
+- `channel serve <name> --token-root <ENTITY>` gates a channel on the running
+  node so only chains anchored at that root may subscribe. It is persisted and
+  re-registered on every `up`, and no root is installed implicitly.
+- `channel invite` / `channel join` add a channel to a device already on the
+  mesh with a standalone link; rejoining after `channel leave` takes a fresh
+  link, and the spent one stays spent.
+- `channel publish` makes one real publish through the node's own production
+  path, so the local gate decides — `gate: passed`, `gate: open` for an
+  ungated channel here, or a denial with its reason. Delivery counts are this
+  node's sends, not subscriber receipts.
+- `channel leave [<name>]` records the departure durably, then unsubscribes
+  and removes exactly the installed publish credential.
+
+Readiness is never inferred from holding a credential. A subscribe is live
+only after the publisher acknowledges the full chain, and the node
+re-establishes it after every reconnect; a publish credential is
+credential-ready only while this node's own config trusts the chain's root,
+and live-active only once a real publish clears the gate. `channel status`
+reports these as separate facts and is never a subscriber roster.
+
 ## Fan-out
 
 Publishing on a channel sends one packet to every subscriber. There's no multicast primitive on the wire — Net deliberately doesn't have one. Each subscriber gets a unicast, encrypted with the per-peer session key, with the same payload. This keeps the trust model simple (every packet is end-to-end authenticated to a single recipient) and keeps the wire format unchanged whether there are two subscribers or two thousand.

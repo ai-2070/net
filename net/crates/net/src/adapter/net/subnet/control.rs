@@ -46,7 +46,7 @@ use ed25519_dalek::Signature;
 
 use super::auth::{
     read_32, read_u32, read_u64, SubnetAuthError, SubnetAuthorityConfig, SubnetRef,
-    SubnetRevocationFloor, MAX_TOKEN_CLOCK_SKEW_SECS,
+    SubnetRevocationFloor, SubnetSubjectFloor, MAX_TOKEN_CLOCK_SKEW_SECS,
 };
 use super::id::TopologySubnetId;
 use crate::adapter::net::channel::ChannelHash;
@@ -81,6 +81,10 @@ pub enum SubnetFactKind {
     ExportPolicy = 3,
     /// [`SubnetRevocationFloor`], distributed as a fact.
     RevocationFloor = 4,
+    /// [`SubnetSubjectFloor`], distributed as a fact. A verifier that
+    /// predates this kind decodes the tag as `InvalidFormat` (fail
+    /// closed): it never silently accepts it as something else.
+    SubjectFloor = 5,
 }
 
 impl SubnetFactKind {
@@ -91,6 +95,7 @@ impl SubnetFactKind {
             2 => Ok(Self::GatewayAdvertisement),
             3 => Ok(Self::ExportPolicy),
             4 => Ok(Self::RevocationFloor),
+            5 => Ok(Self::SubjectFloor),
             _ => Err(SubnetAuthError::InvalidFormat),
         }
     }
@@ -642,6 +647,8 @@ pub enum SubnetControlFact {
     /// artifact, so distribution and local provisioning verify
     /// identically.
     RevocationFloor(SubnetRevocationFloor),
+    /// A [`SubnetSubjectFloor`].
+    SubjectFloor(SubnetSubjectFloor),
 }
 
 impl SubnetControlFact {
@@ -652,6 +659,7 @@ impl SubnetControlFact {
             Self::GatewayAdvertisement(_) => SubnetFactKind::GatewayAdvertisement,
             Self::ExportPolicy(_) => SubnetFactKind::ExportPolicy,
             Self::RevocationFloor(_) => SubnetFactKind::RevocationFloor,
+            Self::SubjectFloor(_) => SubnetFactKind::SubjectFloor,
         }
     }
 
@@ -662,6 +670,7 @@ impl SubnetControlFact {
             Self::GatewayAdvertisement(f) => &f.scope,
             Self::ExportPolicy(f) => &f.scope,
             Self::RevocationFloor(f) => &f.scope,
+            Self::SubjectFloor(f) => &f.scope,
         }
     }
 
@@ -672,6 +681,7 @@ impl SubnetControlFact {
             Self::GatewayAdvertisement(f) => f.to_bytes(),
             Self::ExportPolicy(f) => f.to_bytes(),
             Self::RevocationFloor(f) => f.to_bytes(),
+            Self::SubjectFloor(f) => f.to_bytes(),
         };
         let mut out = Vec::with_capacity(1 + body.len());
         out.push(self.kind() as u8);
@@ -693,6 +703,9 @@ impl SubnetControlFact {
             }
             SubnetFactKind::RevocationFloor => {
                 SubnetRevocationFloor::from_bytes(body).map(Self::RevocationFloor)
+            }
+            SubnetFactKind::SubjectFloor => {
+                SubnetSubjectFloor::from_bytes(body).map(Self::SubjectFloor)
             }
         }
     }
@@ -812,7 +825,9 @@ impl SubnetControlStore {
                     |s| s.revision,
                 ))
             }
-            SubnetControlFact::RevocationFloor(_) => Err(SubnetAuthError::InvalidFormat),
+            SubnetControlFact::RevocationFloor(_) | SubnetControlFact::SubjectFloor(_) => {
+                Err(SubnetAuthError::InvalidFormat)
+            }
         }
     }
 

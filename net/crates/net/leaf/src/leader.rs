@@ -2660,6 +2660,9 @@ fn encode_error(error: &LeafError) -> Value {
             map.insert("kind".into(), Value::from("wire"));
             map.insert("detail".into(), Value::from(detail.clone()));
         }
+        LeafError::Replay => {
+            map.insert("kind".into(), Value::from("replay"));
+        }
         LeafError::Session(detail) => {
             map.insert("kind".into(), Value::from("session"));
             map.insert("detail".into(), Value::from(detail.clone()));
@@ -2772,6 +2775,7 @@ fn decode_error(value: &Value) -> Result<LeafError> {
     let detail = |key: &str| str_field(value, key).map(str::to_string);
     Ok(match str_field(value, "kind")? {
         "wire" => LeafError::Wire(detail("detail")?),
+        "replay" => LeafError::Replay,
         "session" => LeafError::Session(detail("detail")?),
         "control_plane" => LeafError::ControlPlane(detail("detail")?),
         "identity" => LeafError::Identity(detail("detail")?),
@@ -3022,6 +3026,7 @@ mod tests {
         let evidence = UdpBlockedEvidence::new(true, true, "203.0.113.7:9").expect("both hold");
         for original in [
             LeafError::Wire("framing".into()),
+            LeafError::Replay,
             LeafError::Session("no session".into()),
             LeafError::ControlPlane("no endpoint".into()),
             LeafError::Identity("no CSPRNG".into()),

@@ -62,7 +62,10 @@ async fn boot_holder_with_blob(bytes: &[u8]) -> (Mesh, BlobRef) {
 
 fn cli_cmd(home_dir: &TempDir) -> AssertCommand {
     let mut cmd = AssertCommand::cargo_bin("net-mesh").expect("cargo_bin");
-    cmd.env("HOME", home_dir.path())
+    // Do not inherit a developer's exported mesh config or profile.
+    cmd.env_remove("NET_MESH_CONFIG")
+        .env_remove("NET_MESH_PROFILE")
+        .env("HOME", home_dir.path())
         .env("XDG_CONFIG_HOME", home_dir.path())
         .env("USERPROFILE", home_dir.path());
     cmd
@@ -145,6 +148,7 @@ async fn recv_blob_fetches_byte_for_byte() {
         "json".into(),
     ];
     args.extend(attach(&holder));
+    args.extend(["--timeout".into(), "10s".into()]);
 
     let (code, stdout, stderr) = run_transfer(&home, args).await;
     assert_eq!(
@@ -162,6 +166,46 @@ async fn recv_blob_fetches_byte_for_byte() {
     // The atomic write must not leave a `.partial` sibling on success.
     let partial = out_dir.path().join("received.bin.partial");
     assert!(!partial.exists(), "stray .partial left behind: {partial:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recv_blob_deadline_preserves_destination_after_attachment() {
+    // A real mesh handshake succeeds, but this peer installs no blob engine.
+    // The partial file proves the CLI passed attachment and reached receive.
+    let holder = MeshBuilder::new("127.0.0.1:0", &psk())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    holder.start();
+    let home = TempDir::new().unwrap();
+    let out_dir = TempDir::new().unwrap();
+    let destination = out_dir.path().join("received.bin");
+    let partial = out_dir.path().join("received.bin.partial");
+    std::fs::write(&destination, b"existing destination").unwrap();
+    for budget in ["0s", "1s"] {
+        let mut args = vec![
+            "recv-blob".into(),
+            "--blob-ref".into(),
+            "42".repeat(32),
+            "--out".into(),
+            destination.display().to_string(),
+            "--output".into(),
+            "json".into(),
+            "--timeout".into(),
+            budget.into(),
+        ];
+        args.extend(attach(&holder));
+        let (code, stdout, stderr) = run_transfer(&home, args).await;
+        assert_eq!(code, 7, "{stderr}");
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("does not prove cancellation"));
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"existing destination"
+        );
+        assert_eq!(partial.exists(), budget != "0s");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

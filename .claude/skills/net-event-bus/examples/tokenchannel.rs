@@ -46,16 +46,13 @@ async fn handshake(responder: &Mesh, initiator: &Mesh, responder_addr: SocketAdd
     let responder_pub = *responder.inner().public_key();
     let responder_id = responder.inner().node_id();
     let initiator_id = initiator.inner().node_id();
-    let (accepted, connected) = tokio::join!(
-        responder.inner().accept(initiator_id),
-        async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            initiator
-                .inner()
-                .connect(responder_addr, &responder_pub, responder_id)
-                .await
-        }
-    );
+    let (accepted, connected) = tokio::join!(responder.inner().accept(initiator_id), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        initiator
+            .inner()
+            .connect(responder_addr, &responder_pub, responder_id)
+            .await
+    });
     accepted.expect("accept");
     connected.expect("connect");
 }
@@ -120,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &channel,
             SubscribeOptions {
                 token: Some(token),
+                ..Default::default()
             },
         )
         .await

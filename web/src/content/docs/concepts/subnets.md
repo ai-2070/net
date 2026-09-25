@@ -130,6 +130,44 @@ Signed artifacts cross SDK and ABI boundaries as canonical opaque bytes. A stale
 but authentic control fact is an idempotent no-op, reported as `applied: false`;
 it does not roll authority backward.
 
+## One active attachment per verifier
+
+A verifier keeps one admission context per peer, so a device presents exactly
+one attachment to it at a time. A device may still hold several subnet
+relations there — its join's own and any standalone memberships — but only the
+active one is presented; the others stay stored and renewed and are reported
+inactive. Making a different scope active is always explicit: `subnet join
+--switch` or `subnet activate <scope>`. A left relation leaves the active one
+alone.
+
+## Enrolled subnet membership
+
+Operator tooling under [`net-mesh subnet`](/docs/reference/cli) issues the
+authority artifacts above and also carries the enrolled-device verbs:
+
+- `subnet invite <scope>` creates a standalone subnet link for a device
+  already on the mesh; `subnet join <link>` redeems it over the device's own
+  session with the node it enrolled with, installs the issued credentials, and
+  reports the verifier's verdict. The node re-presents and renews them on
+  every session.
+- `subnet members <scope>` separates what this node issued for that scope (and
+  its subtree) from which peers are admitted to it at that node right now. It
+  is not a claim about other verifiers, and a member that is not connected here
+  is absent, not removed.
+- `subnet remove` signs a subject floor with the offline root and hands it to
+  each named verifier. Each verifier reports from its own signed attestation,
+  and `complete` holds only when every named verifier persisted the floor.
+  Unnamed verifiers are never assumed.
+- `subnet leave <scope>` withdraws the device's own admission at the verifier
+  and is recorded durably before anything else. It is local and is not `subnet
+  remove`: the credentials stay valid until they expire or the operator removes
+  the device.
+
+These facts travel on the admission subprotocol `0x0A02`
+(`SUBPROTOCOL_SUBNET_ADMISSION`), in the auth family beside identity proof
+`0x0A01`; the verifier runs the same credential-chain, floor and routing-id
+checks described above.
+
 ## Exported services
 
 An exported service composes subnet authority with organization admission. The

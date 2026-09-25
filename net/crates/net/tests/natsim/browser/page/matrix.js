@@ -577,6 +577,16 @@ async function main() {
   }
 }
 
+// BOOTED, as distinct from LOADED. This line is reached only after
+// every static import has evaluated — `/browser/index.js` and the wasm
+// glue included — so it is the page's own statement that it is ready to
+// be driven. The driver waits for it after `goto` (see
+// `navigateUntilBooted` in `driver/driver.mjs`): `domcontentloaded`
+// says the HTML parsed, and a module fetch cancelled by Chromium's
+// network layer during startup produces a parsed document with an
+// inert page that used to fail a row as a bare timeout.
+globalThis.__natsimBooted = true;
+
 main().catch(async (e) => {
   await log(`FATAL ${(e && (e.message || String(e))) || 'unknown'}`);
 });

@@ -240,7 +240,7 @@ name = "fleet-west"
 replicas = 3
 ```
 
-The `aggregator.registry` RPC service lets any node enumerate, spawn, scale, and unregister aggregator groups on any other node. The CLI exposes `net-mesh aggregator spawn / scale / ls / query --remote --node-addr <ip:port> --node-pubkey <hex>` for operating against a live daemon over the wire.
+The `aggregator.registry` RPC service lets any node enumerate, spawn, scale, and unregister aggregator groups on any other node. The CLI exposes `net-mesh aggregator spawn / scale / ls / query --remote --node-addr <ip:port> --node-pubkey <hex>` for operating against a live daemon over the wire — normally a managed node: `up` runs one long-lived node per profile (foreground), `down` drains and stops exactly that node, and `node status` verifies it through its lifetime lock and authenticated control endpoint.
 
 ## Replica groups
 

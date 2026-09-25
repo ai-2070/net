@@ -46,6 +46,13 @@
 #               outbound.
 #   symmetric — `masquerade fully-random`: a fresh public port per
 #               connection tuple → classifies Symmetric.
+#   upnp      — a home router that forwards NOTHING by itself: plain
+#               port-preserving `masquerade`, no static mapping, no DNAT.
+#               Inbound reaches the LAN only through mappings a
+#               port-mapping daemon (miniupnpd: NAT-PMP / PCP / UPnP-IGD,
+#               started by the enrollment scenario) installs on request.
+#               Its public address is the alias 11.99.0.<n> (see one_side).
+#               This is the "no manual router configuration" row.
 #   none      — the joiner is expected to run publicly in nsim_wan
 #               instead; no gateway/ns is created for that side.
 #
@@ -100,10 +107,10 @@ done
 # unrecognized used to fall through to the cone masquerade).
 for mode in "$NAT_A" "$NAT_B"; do
   case "$mode" in
-    cone|cone-ar|cone-pr|symmetric|none) ;;
+    cone|cone-ar|cone-pr|symmetric|upnp|none) ;;
     *)
       echo "invalid NAT mode: '$mode'" \
-        "(want cone|cone-ar|cone-pr|symmetric|none)" >&2
+        "(want cone|cone-ar|cone-pr|symmetric|upnp|none)" >&2
       exit 2
       ;;
   esac
@@ -302,6 +309,29 @@ EOF
   # stranger is still refused, and nothing is reachable unsolicited.
   # Everything lives in ONE table because an nftables set is
   # table-scoped and the nat rule has to reference it.
+  if [[ "$MODE" == "upnp" ]]; then
+    # A real home router has a PUBLIC WAN address, and miniupnpd (2.3.4)
+    # refuses to map ports on an RFC1918 one ("ext_ip contains reserved /
+    # private address"). Give this router a non-reserved public alias,
+    # 11.99.0.<n>/32, routed to it from the lab "internet". The lab is
+    # isolated in namespaces, so nothing real ever uses that address.
+    local UPNP_PUB="11.99.0.${PUB##*.}"
+    ip -n "$GW" addr add "$UPNP_PUB/32" dev "gw$L-wan"
+    ip -n "$WAN" route add "$UPNP_PUB/32" via "$PUB"
+    # Outbound masquerade only. Anything reaching the LAN from outside
+    # must come from a DNAT the port-mapping daemon added; the daemon's
+    # own tables are created by the scenario that starts it.
+    ip netns exec "$GW" nft -f - <<EOF
+table ip natsim {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "gw$L-wan" masquerade
+  }
+}
+EOF
+    return 0
+  fi
+
   if [[ "$MODE" == "cone-ar" || "$MODE" == "cone-pr" ]]; then
     local AR_LEARN="" AR_DNAT=""
     if [[ "$MODE" == "cone-ar" ]]; then
