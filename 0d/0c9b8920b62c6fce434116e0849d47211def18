@@ -1,0 +1,16 @@
+net/crates/net/.config/nextest.toml
+  h_64425bc75e3f3d 92-99,101
+net/crates/net/tests/org_scoped_cross_process.rs
+  h_64425bc75e3f3d 20-23,71-163,309-313,324-332,389-393,487-492,494-508,515-517,519,521,600-601,654,656,658,665-666,669-670,684
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0d0c9b8920b62c6fce434116e0849d47211def18",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
