@@ -9094,7 +9094,7 @@ impl RpcClientPending {
     /// SDK-2: the terminal is delivered before the entry's senders
     /// drop, so a token-cancelled in-flight call surfaces a terminal
     /// error distinct from clean EOF on every shape (see
-    /// [`PendingEntry::cancel_locally`]).
+    /// `PendingEntry::cancel_locally`).
     pub fn cancel(&self, call_id: u64) {
         if let Some((_, (_, entry))) = self.senders.remove(&call_id) {
             entry.cancel_locally();
@@ -10442,11 +10442,10 @@ mod tests {
         // The detached sink vanishes: the queue closes and the pump
         // exits, racing the handler's late deposit.
         held.lock().take();
-        let done = tokio::time::timeout(Duration::from_secs(5), sup)
+        tokio::time::timeout(Duration::from_secs(5), sup)
             .await
             .expect("the call ends at the pump exit, not the deadline")
             .expect("no panic");
-        let _ = done;
         assert_eq!(
             record.lock().terminal_reason(),
             Some(StreamTerminalReason::Completed(StreamHandlerResult::Ok)),
