@@ -9,9 +9,14 @@
 //!    paths. These are the cross-implementation conformance bar
 //!    against the core's `behavior/{org,org_grant}` tests: if these
 //!    pass, a credential minted here verifies there and vice versa.
-//! 2. **The admission denial matrix** — each refusal surfaces the
-//!    EXACT `AdmissionDenied` variant the core engine produces, at
-//!    the exact ordered step that owns it.
+//! 2. **The admission denial matrix** — every `AdmissionDenied`
+//!    variant the leaf's admission pipeline can PRODUCE is surfaced
+//!    by a named test at the exact ordered step that owns it, with
+//!    the exact variant the core engine produces. The full variant
+//!    set is 37; four can never be produced by any net-mesh-leaf code
+//!    path and are tracked in the "variant-coverage gap" note below —
+//!    the matrix witnesses the other 33, one named test per variant
+//!    at its owning step.
 //! 3. **The decode discipline** — the streaming decoder is strict
 //!    (truncation, trailing bytes and unknown kinds all refuse); the
 //!    unary decoder is prefix-tolerant exactly as core's frozen one.
@@ -35,7 +40,9 @@ use net_leaf::org::proof::{
     OrgCallProof, OrgStreamCallProof, RpcCallShape, ORG_ADMISSION_HEADER,
     STREAM_CALL_KIND_CLIENT_STREAMING, STREAM_CALL_KIND_SERVER_STREAMING,
 };
-use net_leaf::org::replay::AdmissionReplayGuard;
+use net_leaf::org::replay::{
+    AdmissionReplayConfig, AdmissionReplayGuard, ReplayOutcome, ReplayPrincipal,
+};
 use net_leaf::org::revocation::RevocationFacts;
 use net_leaf::rpc_wire::RpcRequestPayload;
 
@@ -125,58 +132,52 @@ fn tampered_request() -> RpcRequestPayload {
 
 /// Same-org credentials: membership + dispatcher grant from org B,
 /// minted through the ported ISSUE functions with caller-supplied
-/// time and nonce.
-fn same_org_creds() -> (OrgMembershipCert, OrgDispatcherGrant) {
+/// time and nonce. The dispatcher scope is a parameter so the
+/// scope-mismatch arm (`DispatcherGrantScope`) and the `Any` arm can
+/// both be exercised at their owning step.
+fn same_org_creds(scope: DispatcherScope) -> (OrgMembershipCert, OrgDispatcherGrant) {
     let owner = owner();
     let cid = caller_id();
     let membership =
         OrgMembershipCert::try_issue(&owner, cid.clone(), 3, 3600, NOW_SECS, 0x11).unwrap();
-    let dispatcher = OrgDispatcherGrant::try_issue(
-        &owner,
-        cid,
-        DispatcherScope::Exact(cap()),
-        3600,
-        NOW_SECS,
-        0x12,
-    )
-    .unwrap();
+    let dispatcher = OrgDispatcherGrant::try_issue(&owner, cid, scope, 3600, NOW_SECS, 0x12).unwrap();
     (membership, dispatcher)
 }
 
-/// Cross-org credentials: membership + dispatcher grant from org A.
-fn cross_org_creds() -> (OrgMembershipCert, OrgDispatcherGrant) {
+/// Cross-org credentials: membership + dispatcher grant from org A
+/// (scope-parameterized as [`same_org_creds`]).
+fn cross_org_creds(scope: DispatcherScope) -> (OrgMembershipCert, OrgDispatcherGrant) {
     let grantee = grantee();
     let cid = caller_id();
     let membership =
         OrgMembershipCert::try_issue(&grantee, cid.clone(), 1, 3600, NOW_SECS, 0x21).unwrap();
-    let dispatcher = OrgDispatcherGrant::try_issue(
-        &grantee,
-        cid,
-        DispatcherScope::Exact(cap()),
-        3600,
-        NOW_SECS,
-        0x22,
-    )
-    .unwrap();
+    let dispatcher =
+        OrgDispatcherGrant::try_issue(&grantee, cid, scope, 3600, NOW_SECS, 0x22).unwrap();
     (membership, dispatcher)
 }
 
-/// A capability grant B → A through the ported ISSUE function
-/// (INVOKE only, no audience material).
+/// A capability grant through the ported ISSUE function. Fully
+/// parameterized — issuer, grantee, rights and target — so the
+/// grant-side refusal arms (rights, grantee, issuer, scope) can each
+/// be fired at their owning step; a DISCOVER-carrying grant brings
+/// its audience material exactly as the issue-path rule demands.
 fn capability_grant(
+    issuer: &OrgKeypair,
+    grantee_org: OrgId,
     capability: CapabilityAuthorityId,
+    rights: GrantRights,
     target: GrantTargetScope,
 ) -> OrgCapabilityGrant {
-    let owner = owner();
+    let audience_random = rights.contains(GrantRights::DISCOVER).then_some([0x44; 64]);
     OrgCapabilityGrant::try_issue(
-        &owner,
-        grantee().org_id(),
+        issuer,
+        grantee_org,
         capability,
-        GrantRights::INVOKE,
+        rights,
         target,
         3600,
         [0x11; 32],
-        None,
+        audience_random,
         NOW_SECS,
         0x13,
     )
@@ -184,21 +185,50 @@ fn capability_grant(
     .0
 }
 
-/// A same-org unary proof over `digest`.
-fn same_org_proof(digest: [u8; 32], call_id: u64, expires_ns: u64) -> OrgCallProof {
-    let (membership, dispatcher) = same_org_creds();
+/// A proof over `digest` assembled from arbitrary verified parts —
+/// the step-level refusal witnesses use it to mix credentials the
+/// convenience builders cannot (a membership naming another member,
+/// a membership and dispatcher from different orgs, an expired
+/// window). `acting_org` is the signed binding term and must equal
+/// `dispatcher.org_id` wherever the witness reaches step 9.
+#[allow(clippy::too_many_arguments)]
+fn proof_with(
+    signer: &EntityKeypair,
+    membership: OrgMembershipCert,
+    dispatcher: OrgDispatcherGrant,
+    grant: Option<OrgCapabilityGrant>,
+    acting_org: OrgId,
+    digest: [u8; 32],
+    call_id: u64,
+    expires_ns: u64,
+) -> OrgCallProof {
     OrgCallProof::sign_for_call(
-        &caller(),
+        signer,
         membership,
         dispatcher,
-        None,
-        owner().org_id(),
+        grant,
+        acting_org,
         owner().org_id(),
         provider_id(),
         call_id,
         cap(),
         expires_ns,
         digest,
+    )
+}
+
+/// A same-org unary proof over `digest`.
+fn same_org_proof(digest: [u8; 32], call_id: u64, expires_ns: u64) -> OrgCallProof {
+    let (membership, dispatcher) = same_org_creds(DispatcherScope::Exact(cap()));
+    proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        None,
+        owner().org_id(),
+        digest,
+        call_id,
+        expires_ns,
     )
 }
 
@@ -209,7 +239,7 @@ fn cross_org_proof(
     call_id: u64,
     capability: CapabilityAuthorityId,
 ) -> OrgCallProof {
-    let (membership, dispatcher) = cross_org_creds();
+    let (membership, dispatcher) = cross_org_creds(DispatcherScope::Exact(cap()));
     OrgCallProof::sign_for_call(
         &caller(),
         membership,
@@ -227,7 +257,7 @@ fn cross_org_proof(
 
 /// A same-org streaming proof with an explicit `kind`.
 fn stream_proof(kind: u8, digest: [u8; 32], call_id: u64) -> OrgStreamCallProof {
-    let (membership, dispatcher) = same_org_creds();
+    let (membership, dispatcher) = same_org_creds(DispatcherScope::Exact(cap()));
     OrgStreamCallProof::sign_for_stream_call(
         &caller(),
         membership,
@@ -460,7 +490,13 @@ fn cross_org_granted_admission_admits_a_valid_granted_call() {
     let provider_id = provider_id();
     let facts = RevocationFacts::default();
     let guard = AdmissionReplayGuard::with_defaults();
-    let grant = capability_grant(cap(), GrantTargetScope::AnyNodeOwnedBy(owner().org_id()));
+    let grant = capability_grant(
+        &owner(),
+        grantee().org_id(),
+        cap(),
+        GrantRights::INVOKE,
+        GrantTargetScope::AnyNodeOwnedBy(owner().org_id()),
+    );
     let proof = cross_org_proof(grant, digest, 7, cap());
     let header = proof.encode().unwrap();
     let ctx = unary_ctx(
@@ -561,7 +597,10 @@ fn grant_capability_mismatch_is_refused_as_capability_mismatch() {
     let guard = AdmissionReplayGuard::with_defaults();
     // The grant names a DIFFERENT capability than the one invoked.
     let grant = capability_grant(
+        &owner(),
+        grantee().org_id(),
         CapabilityAuthorityId::for_tag("nrpc:other-service"),
+        GrantRights::INVOKE,
         GrantTargetScope::AnyNodeOwnedBy(owner().org_id()),
     );
     let proof = cross_org_proof(grant, digest, 7, cap());
@@ -597,7 +636,13 @@ fn grant_target_not_covering_the_provider_is_refused_as_target_not_covered() {
     let guard = AdmissionReplayGuard::with_defaults();
     // A grant covering a DIFFERENT provider node — "wrong provider".
     let other_provider = EntityId::from_bytes(*EntityKeypair::from_secret([0x55; 32]).entity_id());
-    let grant = capability_grant(cap(), GrantTargetScope::ExactNode(other_provider));
+    let grant = capability_grant(
+        &owner(),
+        grantee().org_id(),
+        cap(),
+        GrantRights::INVOKE,
+        GrantTargetScope::ExactNode(other_provider),
+    );
     let proof = cross_org_proof(grant, digest, 7, cap());
     let header = proof.encode().unwrap();
     let ctx = unary_ctx(
@@ -631,20 +676,13 @@ fn grant_from_a_foreign_org_is_refused_as_foreign_issuer() {
     let guard = AdmissionReplayGuard::with_defaults();
     // Self-signed by org A: authority ONLY if the provider's owner
     // issued it.
-    let grant = OrgCapabilityGrant::try_issue(
+    let grant = capability_grant(
         &grantee(),
         grantee().org_id(),
         cap(),
         GrantRights::INVOKE,
         GrantTargetScope::AnyNodeOwnedBy(grantee().org_id()),
-        3600,
-        [0x33; 32],
-        None,
-        NOW_SECS,
-        0x33,
-    )
-    .unwrap()
-    .0;
+    );
     let proof = cross_org_proof(grant, digest, 7, cap());
     let header = proof.encode().unwrap();
     let ctx = unary_ctx(
@@ -689,6 +727,83 @@ fn tampered_request_body_is_refused_as_binding_invalid() {
         owner().org_id(),
         7,
         tampered_digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::BindingInvalid);
+}
+
+/// LEAF-18: the digest must bind header ORDER, header VALUES and the
+/// deadline — and NOTHING else. Mint and verify share
+/// `org_request_digest`, so a pipeline-only witness cannot tell a
+/// binding digest from a constant; these discriminators can (a
+/// sorting digest ties the reorder, an unstripped admission header
+/// breaks the strip equation, an unbound deadline ties the retime).
+#[test]
+fn the_request_digest_binds_header_order_values_and_the_deadline() {
+    let base = org_request_digest(&request()).unwrap();
+
+    // Header ORDER binds: the duplicated `x-trace` entries are
+    // distinct positions, not a set.
+    let mut reordered = request();
+    reordered.headers.swap(0, 2);
+    let reordered_digest = org_request_digest(&reordered).unwrap();
+    assert_ne!(reordered_digest, base, "header order must bind the digest");
+
+    // Header VALUES bind.
+    let mut revalued = request();
+    revalued.headers[0].1 = b"t3".to_vec();
+    assert_ne!(
+        org_request_digest(&revalued).unwrap(),
+        base,
+        "header values must bind the digest"
+    );
+
+    // The deadline binds.
+    let mut redeadlined = request();
+    redeadlined.deadline_ns += 1;
+    assert_ne!(
+        org_request_digest(&redeadlined).unwrap(),
+        base,
+        "the deadline must bind the digest"
+    );
+
+    // …and the admission header binds NOTHING: its value is stripped
+    // before hashing, so the same call digests identically whatever
+    // proof header it carries.
+    let mut reproofed = request();
+    reproofed.headers[1].1 = b"a-different-proof-header".to_vec();
+    assert_eq!(
+        org_request_digest(&reproofed).unwrap(),
+        base,
+        "the admission header must be stripped from the digest"
+    );
+
+    // The pipeline discriminates through the real binding: a proof
+    // signed over the ORIGINAL request refuses when the request
+    // arrives reordered.
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    let proof = same_org_proof(base, 7, NOW_NS + 10_000_000_000);
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        reordered_digest,
         &facts,
     );
     let err = verify_org_admission(
@@ -915,6 +1030,1092 @@ fn revocation_floor_above_the_generation_is_refused_as_membership_revoked() {
     )
     .unwrap_err();
     assert_eq!(err, AdmissionDenied::MembershipRevoked);
+}
+
+/// LEAF-19: the floor view is raise-only. A later bundle claiming a
+/// LOWER floor (or none) must never un-revoke — no counter moves, no
+/// epoch bump, and the admission consequence is unchanged.
+#[test]
+fn a_lower_floor_never_rolls_back_a_raised_one() {
+    let caller_id = caller_id();
+    let mut facts = RevocationFacts::default();
+    assert_eq!(
+        facts.merge_floors(owner().org_id(), &[(caller_id.clone(), 5)]),
+        1
+    );
+    let epoch_after_raise = facts.epoch;
+
+    // The un-revocation attempts: floor 4 and floor 0 both lose.
+    assert_eq!(
+        facts.merge_floors(owner().org_id(), &[(caller_id.clone(), 4)]),
+        0
+    );
+    assert_eq!(
+        facts.merge_floors(owner().org_id(), &[(caller_id.clone(), 0)]),
+        0
+    );
+    assert_eq!(facts.floor_for(&owner().org_id(), &caller_id), 5);
+    assert_eq!(
+        facts.epoch, epoch_after_raise,
+        "a lower floor moves no epoch — the stability view must not \
+         wobble for a rollback attempt"
+    );
+
+    // And the pipeline consequence: the generation-3 cert stays
+    // refused — an un-revocation is invisible to admission.
+    let digest = org_request_digest(&request()).unwrap();
+    let provider_id = provider_id();
+    let guard = AdmissionReplayGuard::with_defaults();
+    let proof = same_org_proof(digest, 7, NOW_NS + 10_000_000_000);
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::MembershipRevoked);
+}
+
+/// LEAF-19: the floor's strictness, witnessed at the outcome level —
+/// "every cert below this generation is revoked" leaves a cert AT the
+/// floor alive, and it admits end to end.
+#[test]
+fn a_membership_at_the_floor_is_still_admitted() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let mut facts = RevocationFacts::default();
+    // The same-org fixture cert is at generation 3; the floor lands
+    // exactly on it.
+    assert_eq!(
+        facts.merge_floors(owner().org_id(), &[(caller_id.clone(), 3)]),
+        1
+    );
+    assert_eq!(facts.floor_for(&owner().org_id(), &caller_id), 3);
+    let guard = AdmissionReplayGuard::with_defaults();
+    let proof = same_org_proof(digest, 7, NOW_NS + 10_000_000_000);
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let admitted = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .expect("a cert AT the floor is alive");
+    assert_eq!(admitted.caller, caller_id);
+}
+
+// ---------------------------------------------------------------------------
+// (b2) The step-level denial matrix — one named test per variant the
+//      leaf's pipeline can produce, at the step that owns it (LEAF-7)
+// ---------------------------------------------------------------------------
+//
+// Variant-coverage gap (LEAF-7, narrowed claim — the tracked gap the
+// closure allows): the enum carries 37 variants and this matrix
+// covers the 33 any net-mesh-leaf code path can produce. Four are
+// unwitnessable here because the leaf has ZERO construction sites for
+// them: `AdmissionDenied::ActiveStreamCapacity`,
+// `AdmissionDenied::Revoked`, `AdmissionDenied::ResourceExhausted`
+// and `AdmissionDenied::ProviderAuthorityUnavailable`. The situations
+// they name surface in the leaf under other types: mid-call
+// revocation and byte-budget retirement travel as
+// `StreamTerminalReason::Revoked` / `StreamTerminalReason::ResourceExhausted`
+// (coarse bytes at the wire), and a poisoned revocation store fails
+// the §9.5 stability recheck → `AuthorityChanged` at step 9.5. The
+// CORE mints all four (its engine owns the active-stream reserve
+// budget and the installed-authority pre-check the leaf has no
+// analogue for): `src/adapter/net/cortex/rpc.rs` and
+// `src/adapter/net/org_admission_gate.rs` — a different
+// `AdmissionDenied` enum, in a different crate. No leaf test can
+// produce these four through the real pipeline; asserting the enum
+// literal would be a tautology, so the gap is tracked here instead.
+
+/// Charge `guard` with live replay entries — the state the step-10
+/// outcome witnesses need before the pipeline consults it.
+fn fill_replay(
+    guard: &AdmissionReplayGuard,
+    caller: &EntityId,
+    acting_org: &OrgId,
+    call_ids: &[u64],
+) {
+    for &call_id in call_ids {
+        let outcome = guard.admit(
+            ReplayPrincipal {
+                caller,
+                acting_org,
+                provider_owner_org: &owner().org_id(),
+            },
+            call_id,
+            [call_id as u8; 32],
+            NOW_MONO_MS + 1_000_000,
+            NOW_MONO_MS,
+        );
+        assert_eq!(outcome, ReplayOutcome::Admitted, "the fill must land");
+    }
+}
+
+#[test]
+fn public_authenticated_mode_is_refused_as_not_org_protected() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    let proof = same_org_proof(digest, 7, NOW_NS + 10_000_000_000);
+    let header = proof.encode().unwrap();
+    // Step 1: a non-org-protected mode never reaches the engine.
+    let ctx = unary_ctx(
+        OrgAdmission::PublicAuthenticated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::NotOrgProtected);
+}
+
+#[test]
+fn two_admission_headers_are_refused_as_multiple_headers() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    let proof = same_org_proof(digest, 7, NOW_NS + 10_000_000_000);
+    let header = proof.encode().unwrap();
+    let second: &[u8] = b"a-second-proof-header";
+    // Step 2: exactly one admission header, or deny — two values are
+    // refused before anything decodes.
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header, second],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::MultipleHeaders);
+}
+
+#[test]
+fn a_proof_for_another_member_is_refused_as_member_binding_mismatch() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    // The proof's membership names a DIFFERENT member than the
+    // TOFU-authenticated channel peer — a captured proof replayed by
+    // another peer, refused before any signature work (step 5).
+    let other_member = EntityId::from_bytes(*EntityKeypair::from_secret([0x25; 32]).entity_id());
+    let membership =
+        OrgMembershipCert::try_issue(&owner(), other_member, 3, 3600, NOW_SECS, 0x41).unwrap();
+    let (_, dispatcher) = same_org_creds(DispatcherScope::Exact(cap()));
+    let proof = proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        None,
+        owner().org_id(),
+        digest,
+        7,
+        NOW_NS + 10_000_000_000,
+    );
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::MemberBindingMismatch);
+}
+
+#[test]
+fn membership_and_dispatcher_from_different_orgs_are_refused_as_acting_org_mismatch() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    // The acting org is named by the membership (org A); the
+    // dispatcher grant must agree and names org B.
+    let membership =
+        OrgMembershipCert::try_issue(&grantee(), caller_id.clone(), 1, 3600, NOW_SECS, 0x41).unwrap();
+    let dispatcher = OrgDispatcherGrant::try_issue(
+        &owner(),
+        caller_id.clone(),
+        DispatcherScope::Exact(cap()),
+        3600,
+        NOW_SECS,
+        0x42,
+    )
+    .unwrap();
+    let proof = proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        None,
+        owner().org_id(),
+        digest,
+        7,
+        NOW_NS + 10_000_000_000,
+    );
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::ActingOrgMismatch);
+}
+
+#[test]
+fn a_capability_grant_on_a_same_org_call_is_refused_as_unexpected_capability_grant() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    // `OwnerDelegated` admission carrying a cross-org capability
+    // grant: same-org calls have none (step 6).
+    let (membership, dispatcher) = same_org_creds(DispatcherScope::Exact(cap()));
+    let grant = capability_grant(
+        &owner(),
+        grantee().org_id(),
+        cap(),
+        GrantRights::INVOKE,
+        GrantTargetScope::AnyNodeOwnedBy(owner().org_id()),
+    );
+    let proof = proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        Some(grant),
+        owner().org_id(),
+        digest,
+        7,
+        NOW_NS + 10_000_000_000,
+    );
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::UnexpectedCapabilityGrant);
+}
+
+#[test]
+fn a_granted_call_without_its_grant_is_refused_as_missing_capability_grant() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    // `CrossOrgGranted` admission carrying NO capability grant
+    // (step 6).
+    let (membership, dispatcher) = cross_org_creds(DispatcherScope::Exact(cap()));
+    let proof = proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        None,
+        grantee().org_id(),
+        digest,
+        7,
+        NOW_NS + 10_000_000_000,
+    );
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::CrossOrgGranted,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::MissingCapabilityGrant);
+}
+
+#[test]
+fn a_grant_for_another_grantee_is_refused_as_grantee_mismatch() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+
+    // Arm 1 (step 6, same-org mode): the caller acts for org A while
+    // the registration is MY owner's — nobody's same-org call.
+    let (membership, dispatcher) = cross_org_creds(DispatcherScope::Exact(cap()));
+    let proof = proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        None,
+        grantee().org_id(),
+        digest,
+        7,
+        NOW_NS + 10_000_000_000,
+    );
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::GranteeMismatch);
+
+    // Arm 2 (step 6, granted mode): the grant names a THIRD org as
+    // grantee, not the caller's verified acting org.
+    let third_org = OrgKeypair::from_bytes([0x13; 32]);
+    let grant = capability_grant(
+        &owner(),
+        third_org.org_id(),
+        cap(),
+        GrantRights::INVOKE,
+        GrantTargetScope::AnyNodeOwnedBy(owner().org_id()),
+    );
+    let proof = cross_org_proof(grant, digest, 8, cap());
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::CrossOrgGranted,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        8,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::GranteeMismatch);
+}
+
+#[test]
+fn a_grant_without_invoke_is_refused_as_insufficient_rights() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    // The grant carries DISCOVER only — invoking needs `rights ⊇
+    // INVOKE` (step 6).
+    let grant = capability_grant(
+        &owner(),
+        grantee().org_id(),
+        cap(),
+        GrantRights::DISCOVER,
+        GrantTargetScope::AnyNodeOwnedBy(owner().org_id()),
+    );
+    let proof = cross_org_proof(grant, digest, 7, cap());
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::CrossOrgGranted,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::InsufficientRights);
+}
+
+#[test]
+fn a_dispatcher_grant_out_of_scope_is_refused_as_dispatcher_grant_scope() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+
+    // Arm 1 (step 7): the dispatcher grant empowers a DIFFERENT
+    // entity to dispatch.
+    let other = EntityId::from_bytes(*EntityKeypair::from_secret([0x25; 32]).entity_id());
+    let membership =
+        OrgMembershipCert::try_issue(&owner(), caller_id.clone(), 3, 3600, NOW_SECS, 0x41).unwrap();
+    let dispatcher = OrgDispatcherGrant::try_issue(
+        &owner(),
+        other,
+        DispatcherScope::Exact(cap()),
+        3600,
+        NOW_SECS,
+        0x42,
+    )
+    .unwrap();
+    let proof = proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        None,
+        owner().org_id(),
+        digest,
+        7,
+        NOW_NS + 10_000_000_000,
+    );
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::DispatcherGrantScope);
+
+    // Arm 2 (step 7): the right dispatcher, but an `Exact` scope
+    // naming a DIFFERENT capability than the one invoked.
+    let (membership, _) = same_org_creds(DispatcherScope::Exact(cap()));
+    let dispatcher = OrgDispatcherGrant::try_issue(
+        &owner(),
+        caller_id.clone(),
+        DispatcherScope::Exact(CapabilityAuthorityId::for_tag("nrpc:other-service")),
+        3600,
+        NOW_SECS,
+        0x43,
+    )
+    .unwrap();
+    let proof = proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        None,
+        owner().org_id(),
+        digest,
+        8,
+        NOW_NS + 10_000_000_000,
+    );
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        8,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::DispatcherGrantScope);
+}
+
+#[test]
+fn a_dispatcher_grant_for_any_capability_admits() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    // The `Any` arm of the very same step-7 scope check: the org
+    // trusts this dispatcher broadly, and the call admits end to end.
+    let (membership, dispatcher) = same_org_creds(DispatcherScope::Any);
+    let proof = proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        None,
+        owner().org_id(),
+        digest,
+        7,
+        NOW_NS + 10_000_000_000,
+    );
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let admitted = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .expect("a dispatcher scoped Any covers the invoked capability");
+    assert_eq!(admitted.caller, caller_id);
+    assert_eq!(admitted.capability, cap());
+}
+
+#[test]
+fn an_expired_membership_is_refused_as_membership_invalid() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    // The membership window closed an hour ago (step 8's credential
+    // verify/window check).
+    let membership = OrgMembershipCert::issue_at(
+        &owner(),
+        caller_id.clone(),
+        3,
+        NOW_SECS - 7_200,
+        NOW_SECS - 3_600,
+        0x41,
+    );
+    let dispatcher = OrgDispatcherGrant::try_issue(
+        &owner(),
+        caller_id.clone(),
+        DispatcherScope::Exact(cap()),
+        3600,
+        NOW_SECS,
+        0x42,
+    )
+    .unwrap();
+    let proof = proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        None,
+        owner().org_id(),
+        digest,
+        7,
+        NOW_NS + 10_000_000_000,
+    );
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::MembershipInvalid);
+}
+
+#[test]
+fn an_expired_dispatcher_grant_is_refused_as_dispatcher_grant_invalid() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    // The membership is fresh; the DISPATCHER grant's window closed
+    // an hour ago (step 8).
+    let membership =
+        OrgMembershipCert::try_issue(&owner(), caller_id.clone(), 3, 3600, NOW_SECS, 0x41).unwrap();
+    let dispatcher = OrgDispatcherGrant::issue_at(
+        &owner(),
+        caller_id.clone(),
+        DispatcherScope::Exact(cap()),
+        NOW_SECS - 7_200,
+        NOW_SECS - 3_600,
+        0x42,
+    );
+    let proof = proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        None,
+        owner().org_id(),
+        digest,
+        7,
+        NOW_NS + 10_000_000_000,
+    );
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::DispatcherGrantInvalid);
+}
+
+#[test]
+fn an_expired_capability_grant_is_refused_as_capability_grant_invalid() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    // Membership and dispatcher are fresh (minted inside
+    // `cross_org_proof`); the CAPABILITY grant's window closed an
+    // hour ago (step 8). Issued at `NOW - 7200` with a 3600 s life:
+    // `[NOW-7200, NOW-3600]`.
+    let grant = OrgCapabilityGrant::try_issue(
+        &owner(),
+        grantee().org_id(),
+        cap(),
+        GrantRights::INVOKE,
+        GrantTargetScope::AnyNodeOwnedBy(owner().org_id()),
+        3600,
+        [0x11; 32],
+        None,
+        NOW_SECS - 7_200,
+        0x13,
+    )
+    .unwrap()
+    .0;
+    let proof = cross_org_proof(grant, digest, 7, cap());
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::CrossOrgGranted,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::CapabilityGrantInvalid);
+}
+
+#[test]
+fn a_failed_stability_recheck_is_refused_as_authority_changed() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    let guard = AdmissionReplayGuard::with_defaults();
+    let proof = same_org_proof(digest, 7, NOW_NS + 10_000_000_000);
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    // Step 9.5: the provider's security view moved mid-admission.
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || false,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::AuthorityChanged);
+    // …and the contract on the outcome: the refusal consumed NO
+    // replay slot, so a retry from a fresh view admits rather than
+    // reading as `Replay`.
+    let admitted = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .expect("the stability refusal consumed no replay slot");
+    assert_eq!(admitted.caller, caller_id);
+}
+
+#[test]
+fn a_full_replay_guard_is_refused_as_replay_capacity() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    // Every global slot holds a still-live guard (owner-org traffic,
+    // which draws on the reserve AND whatever external capacity is
+    // idle) — a novel admission fails closed rather than evicting
+    // one (step 10).
+    let guard = AdmissionReplayGuard::try_new(AdmissionReplayConfig {
+        max_entries: 4,
+        max_entries_per_caller: 3,
+        owner_reserved_entries: 1,
+        max_entries_per_external_org: 3,
+    })
+    .unwrap();
+    let a = EntityId::from_bytes([0xA1; 32]);
+    let b = EntityId::from_bytes([0xA2; 32]);
+    fill_replay(&guard, &a, &owner().org_id(), &[1, 2, 3]);
+    fill_replay(&guard, &b, &owner().org_id(), &[1]);
+    let proof = same_org_proof(digest, 7, NOW_NS + 10_000_000_000);
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        7,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::ReplayCapacity);
+}
+
+#[test]
+fn a_caller_over_quota_is_refused_as_per_caller_replay_capacity() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    // THIS caller already holds its maximum retained entries; the
+    // denial must name the caller's own quota, not the global guard
+    // (step 10).
+    let guard = AdmissionReplayGuard::try_new(AdmissionReplayConfig {
+        max_entries: 8,
+        max_entries_per_caller: 2,
+        owner_reserved_entries: 1,
+        max_entries_per_external_org: 7,
+    })
+    .unwrap();
+    fill_replay(&guard, &caller_id, &owner().org_id(), &[1, 2]);
+    let proof = same_org_proof(digest, 3, NOW_NS + 10_000_000_000);
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::OwnerDelegated,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        3,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::PerCallerReplayCapacity);
+}
+
+#[test]
+fn an_org_over_quota_is_refused_as_per_organization_replay_capacity() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    // The external acting org has consumed its aggregate allocation
+    // across TWO member identities — the org quota, not any caller's
+    // (step 10).
+    let guard = AdmissionReplayGuard::try_new(AdmissionReplayConfig {
+        max_entries: 8,
+        max_entries_per_caller: 3,
+        owner_reserved_entries: 1,
+        max_entries_per_external_org: 2,
+    })
+    .unwrap();
+    let m1 = EntityId::from_bytes([0xA1; 32]);
+    let m2 = EntityId::from_bytes([0xA2; 32]);
+    fill_replay(&guard, &m1, &grantee().org_id(), &[1]);
+    fill_replay(&guard, &m2, &grantee().org_id(), &[1]);
+    let grant = capability_grant(
+        &owner(),
+        grantee().org_id(),
+        cap(),
+        GrantRights::INVOKE,
+        GrantTargetScope::AnyNodeOwnedBy(owner().org_id()),
+    );
+    let proof = cross_org_proof(grant, digest, 3, cap());
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::CrossOrgGranted,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        3,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::PerOrganizationReplayCapacity);
+}
+
+#[test]
+fn a_full_external_replay_pool_is_refused_as_external_pool_replay_capacity() {
+    let digest = org_request_digest(&request()).unwrap();
+    let caller_id = caller_id();
+    let provider_id = provider_id();
+    let facts = RevocationFacts::default();
+    // The external pool is full with NO single org over its quota —
+    // three live entries from three distinct external orgs — and the
+    // refusal must say so rather than blame the fourth org's own
+    // allocation (step 10).
+    let guard = AdmissionReplayGuard::try_new(AdmissionReplayConfig {
+        max_entries: 4,
+        max_entries_per_caller: 3,
+        owner_reserved_entries: 1,
+        max_entries_per_external_org: 3,
+    })
+    .unwrap();
+    for (seed, call_id) in [(0xA1u8, 1u64), (0xA2, 1), (0xA3, 1)] {
+        let member = EntityId::from_bytes([seed; 32]);
+        let org = OrgKeypair::from_bytes([seed; 32]).org_id();
+        fill_replay(&guard, &member, &org, &[call_id]);
+    }
+    // The fourth external org's caller: its own quota is untouched,
+    // so only the pool can refuse it.
+    let org_d = OrgKeypair::from_bytes([0x88; 32]);
+    let membership =
+        OrgMembershipCert::try_issue(&org_d, caller_id.clone(), 1, 3600, NOW_SECS, 0x41).unwrap();
+    let dispatcher = OrgDispatcherGrant::try_issue(
+        &org_d,
+        caller_id.clone(),
+        DispatcherScope::Exact(cap()),
+        3600,
+        NOW_SECS,
+        0x42,
+    )
+    .unwrap();
+    let grant = capability_grant(
+        &owner(),
+        org_d.org_id(),
+        cap(),
+        GrantRights::INVOKE,
+        GrantTargetScope::AnyNodeOwnedBy(owner().org_id()),
+    );
+    let proof = proof_with(
+        &caller(),
+        membership,
+        dispatcher,
+        Some(grant),
+        org_d.org_id(),
+        digest,
+        3,
+        NOW_NS + 10_000_000_000,
+    );
+    let header = proof.encode().unwrap();
+    let ctx = unary_ctx(
+        OrgAdmission::CrossOrgGranted,
+        &caller_id,
+        &provider_id,
+        owner().org_id(),
+        3,
+        digest,
+        &facts,
+    );
+    let err = verify_org_admission(
+        &ctx,
+        &[&header],
+        &guard,
+        NOW_NS,
+        NOW_MONO_MS,
+        || true,
+        |_| true,
+    )
+    .unwrap_err();
+    assert_eq!(err, AdmissionDenied::ExternalPoolReplayCapacity);
 }
 
 // ---------------------------------------------------------------------------
