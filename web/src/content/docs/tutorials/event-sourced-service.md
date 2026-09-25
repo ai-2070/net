@@ -16,27 +16,27 @@ application work.
 ## The shape
 
 ```text title="What you are building"
-┌──────────────────────────────────────────────────────┐
-│                                                      │
-│  Producer ─►  Event  ─►  Channel  ─►  RedEX file     │
-│              (Order command)         (append-only)   │
-│                                          │           │
-│                                          ▼           │
-│                                   ┌────────────┐     │
-│                                   │  Fold task │     │
-│                                   │ (CortEX)   │     │
-│                                   └─────┬──────┘     │
-│                                         │           │
-│                                  ┌──────▼──────┐    │
-│                                  │ Order state │    │
-│                                  │ (in-memory) │    │
-│                                  └──────┬──────┘    │
-│                                         │           │
-│                                ┌────────┼────────┐  │
-│                                ▼        ▼        ▼  │
-│                              Query   Watch    Snapshot
-│                                                    │
-└──────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────┐
+│                                                        │
+│  Producer ─►  Event  ─►  Channel  ─►  RedEX file       │
+│              (Order command)         (append-only)     │
+│                                          │             │
+│                                          ▼             │
+│                                   ┌────────────┐       │
+│                                   │  Fold task │       │
+│                                   │ (CortEX)   │       │
+│                                   └─────┬──────┘       │
+│                                         │              │
+│                                  ┌──────▼──────┐       │
+│                                  │ Order state │       │
+│                                  │ (in-memory) │       │
+│                                  └──────┬──────┘       │
+│                                         │              │
+│                                ┌────────┼────────┐     │
+│                                ▼        ▼        ▼     │
+│                              Query   Watch    Snapshot │
+│                                                        │
+└────────────────────────────────────────────────────────┘
 ```
 
 Every state change in the system is an event. The event lands in a RedEX log. The fold reads the log, applies each event to an in-memory state, and emits change notifications. Queries read the state; watchers subscribe to state changes; snapshots checkpoint the state for fast restart.
