@@ -166,7 +166,8 @@ emission build, the wire send, the relay decision, and the ingest dispositions.
 The Python↔Python pair (`mixed_pair/caller.py --manifest <fresh %TEMP% scenario>
 --vectors …`) under that wheel produced
 `docs/internal/spikes/org-streaming/r4corefix-diag-pythonpair.log` (verbatim
-extract):
+extract; the raw dump was removed in `093be643a` (DOCS-5), so this extract is
+the record — the dump itself: `git show 239dea825:docs/internal/spikes/org-streaming/r4corefix-diag-pythonpair.log`):
 
 ```
 [xproc-diag] send_emission_to node=0x2cb5fa683e11dfe1 public=732 scoped=0
@@ -237,9 +238,11 @@ test scoped_discovery_crosses_an_os_process_boundary ... FAILED
 panicked at …: F-S4Vectors-1: scoped discovery did not cross the OS-process boundary
 ```
 
-(`r4corefix-inverse-red.log`; the child's own side fails closed too — `RESULT
-fail callback-loss emitted=…`). Restoring the handle hold returns the witness to
-green (`r4corefix-witness-green.log`). The same mutation in the real harness is
+(`r4corefix-inverse-red.log`, removed in `093be643a` — the excerpt above is the
+record, raw: `git show 239dea825:docs/internal/spikes/org-streaming/r4corefix-inverse-red.log`; the child's own side fails closed
+too — `RESULT fail callback-loss emitted=…`). Restoring the handle hold returns
+the witness to green (`r4corefix-witness-green.log`, removed in `093be643a` —
+the GREEN block above is the record, raw: `git show 239dea825:docs/internal/spikes/org-streaming/r4corefix-witness-green.log`). The same mutation in the real harness is
 the whole defect history: §2.1 (S4Vectors' runs) and §2.2 (my verbatim row
 re-run at this head with fresh artifacts — the fix-reverted state) are the named
 row red with the handle discarded, and §2.3 is the mechanism-level red
@@ -251,7 +254,7 @@ row red with the handle discarded, and §2.3 is the mechanism-level red
 |---|---|---|---|
 | 1 | Fix: bind + hold the serve handle through the provider's announce loop | `net/crates/net/tests/cross_lang_org/mixed_pair/provider.py` (S4Vectors-owned; applied by them on my root-cause request — see §5 coordination) | §3 (row GREEN), §3 inverse |
 | 2 | Acceptance witness #2 (new) | `net/crates/net/tests/org_scoped_cross_process.rs` | §2.4 |
-| 3 | This report + diagnostic receipt | `docs/internal/spikes/org-streaming/R4COREFIX.md`, `r4corefix-diag-pythonpair.log` | F16 hashes below |
+| 3 | This report + diagnostic receipt | `docs/internal/spikes/org-streaming/R4COREFIX.md`, `r4corefix-diag-pythonpair.log` (removed in `093be643a`; the §2.3 extract is the record) | F16 hashes in §8 (recomputed from `239dea825`, the last tree holding the logs) |
 | 4 | Core (`mesh.rs`, `behavior/org_scoped_store.rs`) | **no change** — ten temporary probes added and fully reverted | `git diff --stat net/crates/net/src/` empty |
 
 ## 3. Acceptance receipts (post-fix)
@@ -268,7 +271,9 @@ the verbatim command:
 cd go && RUN_INTEGRATION_TESTS=1 RUN_MIXED_CROSS_PROCESS=1 go test -run 'TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider' -v -timeout 15m
 ```
 
-produced (`r4corefix-row-green.log`, round 1 — verbatim extract):
+produced (`r4corefix-row-green.log`, round 1 — verbatim extract; the log was
+removed in `093be643a`, so this extract is the record — raw:
+`git show 239dea825:docs/internal/spikes/org-streaming/r4corefix-row-green.log`):
 
 ```
 === RUN   TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider
@@ -308,7 +313,8 @@ Round 2's Go row reached the streaming exchange (`0x0006: response pump failed`
 at recv — see finding 9) but the Python↔Python pair stayed red at discovery with
 the ORIGINAL signature. The instrumented probe wheel (fresh scenario) produced
 the receipt-grade aggregate that closes the case
-(`r4corefix-diag-round3.log`):
+(`r4corefix-diag-round3.log`, removed in `093be643a` — the aggregate below is
+the record, raw: `git show 239dea825:docs/internal/spikes/org-streaming/r4corefix-diag-round3.log`):
 
 ```
 8  send_emission_to node=<caller-id>  scoped=1     (provider shipping envelopes)
@@ -350,7 +356,8 @@ installed), the verbatim command from the acceptance contract:
 cd go && RUN_INTEGRATION_TESTS=1 RUN_MIXED_CROSS_PROCESS=1 go test -run 'TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider' -v -timeout 15m
 ```
 
-produced (`r4corefix-row-round3-green.log`, verbatim):
+produced (`r4corefix-row-round3-green.log`, verbatim; removed in `093be643a`,
+so this block is the record — raw: `git show 239dea825:docs/internal/spikes/org-streaming/r4corefix-row-round3-green.log`):
 
 ```
 === RUN   TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider
@@ -405,7 +412,8 @@ receipts above.**
    Rights" ACE, the operational rule is: scenario outdirs go under the user
    temp via ordinary directory creation — never `mkdtemp`-style protected DACLs,
    never a directory with group/user ACEs. Receipt:
-   `r4corefix-diag-pythonpair.log` run 1 (the `C:\tmp` refusal).
+   `r4corefix-diag-pythonpair.log` run 1 (the `C:\tmp` refusal; log removed in
+   `093be643a`, raw: `git show 239dea825:docs/internal/spikes/org-streaming/r4corefix-diag-pythonpair.log`).
 3. **S4Vectors' localization inference named the right chain but the wrong
    layer.** All three named sites are probe-innocent (§2.3); the drop is the
    catalog input to site 1's region. The lane's own caveat held: "A same-code
@@ -546,6 +554,23 @@ message — a document cannot contain its own digest):
 - `docs/internal/spikes/org-streaming/r4corefix-inverse-red.log` (§2.4 inverse)
 - `docs/internal/spikes/org-streaming/r4corefix-witness-green.log` (§2.4 green)
 - `docs/internal/spikes/org-streaming/r4corefix-row-green.log` (§3.1 round 1)
+
+[DOCS-5 note, added after the fact] Every `r4corefix-*.log` named in this
+report was deleted in `093be643a` (the raw probe dumps; the load-bearing
+excerpts are embedded verbatim in §2.2–§2.4 and §3.1–§3.4, which are now the
+record). The last tree that holds them is `239dea825`; each is retrievable with
+`git show 239dea825:docs/internal/spikes/org-streaming/<name>`. Size (bytes) +
+sha256 of each log as committed, recomputed from that tree (the round-3
+diagnostic matches the digest recorded at `86d2212b9` below):
+
+| Log | Bytes | sha256 |
+|---|---|---|
+| `r4corefix-diag-pythonpair.log` | 9449 | `ea34fce2e8de86877b15d6bf67fceba2dd22e46cb950ce2a08cc943059fcf3be` |
+| `r4corefix-inverse-red.log` | 2932 | `9a9bbf4338f74048d375961cf558024e62378b198b0fbce2a3f7cf1baed0a71d` |
+| `r4corefix-witness-green.log` | 619 | `e481fefcd4272cf862d6ab0626bd85555a49ae59d106d600489d6142a1708f2b` |
+| `r4corefix-row-green.log` | 464 | `bf9a76e3cdfd6e33030294099d9797f7f89d686c6e7f8ddbd725ea54c4b6d4ac` |
+| `r4corefix-diag-round3.log` | 3127 | `c3d08d0212f3861845b27d9cd8e8bf4e151ee58c8e3e528c8263d04caf260fe7` |
+| `r4corefix-row-round3-green.log` | 308 | `47eb8d13845f0d19a39d7e347d8dc9b05d03a42e96cd4f7279d284385f24ded4` |
 
 Consumer artifacts referenced by the receipts: pre-fix `net.dll`
 `a5be938384f1734f2bbda170ca91a7bb361edea140f18837acf977976f4c7ad5` and wheel

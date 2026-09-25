@@ -114,7 +114,9 @@ return SummarizeResp{}, net.AppError(net.NrpcTypedBadRequest, body)
 `AppError(code, body)` is how a handler returns a typed application status rather
 than an opaque failure. **Any other error a handler returns surfaces as
 `Internal`**, so a handler that returns a bare `fmt.Errorf` has thrown away the
-distinction the caller needs to decide whether to retry.
+distinction the caller needs to decide whether to retry. The `code` must be in
+the application band `0x8000`–`0xFFFF` (the `NrpcTyped*` constants start at
+`0x8000`); a lower code is clamped and also surfaces as `Internal`.
 
 **On the caller side, Go does not give you the code and body as fields.**
 `RpcError` carries `Kind` (a coarse transport-level discriminator: `no_route`,

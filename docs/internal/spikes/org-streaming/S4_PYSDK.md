@@ -268,12 +268,14 @@ in §9 is Main-executed at the tree head after that commit.*
 ### 9.1 Witnesses and counts (8.5.3) — 15/15 green
 
 Final acceptance run: **15 passed in 24.13s** (`.s4receipts/main-acceptance-15.xml`,
-`main-acceptance-15.log`). The 15 items = the 6 matrix functions ×
+`main-acceptance-15.log` — removed from the tree in `239dea825` (PY-3); read
+them with `git show 239dea825^:net/crates/net/sdk-py/.s4receipts/<file>`). The 15 items = the 6 matrix functions ×
 `[same_org|granted]` + `test_unary_call_and_serve_preserved_through_net_sdk` +
 `test_streaming_midstream_error_surfaces_the_org_vocabulary` +
 `test_task_cancel_propagates_to_retirement_observables` (9 base names; the
-parametrize pair `"same_org"`/`"granted"`). Run history (all xmls durable in
-`.s4receipts/`): `S4PySdk`'s part1B 327/327 + part2 6/6 + batch1 (2 pass + 1
+parametrize pair `"same_org"`/`"granted"`). Run history (the xmls were kept in
+`.s4receipts/` until `239dea825` removed them; they remain readable at
+`239dea825^`): `S4PySdk`'s part1B 327/327 + part2 6/6 + batch1 (2 pass + 1
 load-flake re-run isolated green) + its rest12 partial (exit 255 at the
 midstream row); Main's full-15 (12 pass + 3 classified below); the isolated
 classification runs; the three receipt cycles; the acceptance run.
@@ -348,7 +350,8 @@ known-good row green again before any receipt ran).
 
 Sizes+shas recorded in the `S4PySdk:` commit message for: the two takeover
 edits (`tests/test_org_streaming.py`, `examples/org_streaming_consumer.py`),
-this report, and the `.s4receipts/` xmls (`main-acceptance-15.xml`,
+this report, and the `.s4receipts/` xmls (removed in `239dea825`, readable
+at `239dea825^`; `main-acceptance-15.xml`,
 `main-isolated-{1,2b,3}-*.xml`, `main-r-{r1,r3,r2}-{red,green}.xml`,
 `main-cancel-fixed.xml`, `main-midstream-fixed.xml`, `main-editable.log`,
 `m-{un,re,knowngood}.log`, `installed-org-init.bak`).

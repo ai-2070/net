@@ -1685,7 +1685,9 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   with the two-sided `RESULT ok calls=1 chunks=3` (exact-matched at
   `go:711-714`, Fatalf otherwise); chunks byte-for-byte vs `chunks_hex`,
   eof terminal, and `expect_handler` facts all held. Receipted 3-deep:
-  `R4CoreFix` round-3 (`r4corefix-row-round3-green.log`), the coordinator
+  `R4CoreFix` round-3 (`r4corefix-row-round3-green.log` — removed in
+  `093be643a` (DOCS-5); its verbatim content is embedded in `R4COREFIX.md`
+  §3.4, raw: `git show 239dea825:docs/internal/spikes/org-streaming/r4corefix-row-round3-green.log`), the coordinator
   re-run (the `awaiting DRAINED` handshake visible in the transcript),
   and `S4Vectors`' receipt-append. The three-defect consumer-side harness
   chain is closed at its owners (`a919a26f0` — serve-handle RAII, the

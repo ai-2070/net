@@ -390,7 +390,8 @@ int net_org_call_duplex(NetOrgClient* client,
  * NET_ORG_OK; on failure it writes `*out_err` and returns non-zero. Rust
  * copies the response and frees it with the C runtime's free. To signal a
  * typed application status, write an "nrpc:app_error:0x<code>:<body>"
- * message to `*out_err`. */
+ * message to `*out_err`. `<code>` MUST be in the application band
+ * 0x8000-0xFFFF; any lower code surfaces to the caller as Internal. */
 typedef int (*NetOrgHandlerFn)(
     uint64_t handler_id, const net_org_caller_t* caller,
     const uint8_t* req_ptr, size_t req_len,
@@ -453,7 +454,9 @@ int net_org_set_handler_dispatcher(NetOrgHandlerFn dispatcher);
 /* Server-streaming: one request in, chunks out via the sink. The terminal
  * frame is the substrate fold's, emitted after the handler returns. To
  * signal a typed application status, write an
- * "nrpc:app_error:0x<code>:<body>" message to `*out_err`. */
+ * "nrpc:app_error:0x<code>:<body>" message to `*out_err`. `<code>` MUST be
+ * in the application band 0x8000-0xFFFF; any lower code surfaces to the
+ * caller as Internal (the same clamp on every shape). */
 typedef int (*NetOrgStreamingHandlerFn)(
     uint64_t handler_id, const net_org_caller_t* caller,
     const uint8_t* req_ptr, size_t req_len,

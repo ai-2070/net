@@ -44,7 +44,7 @@ _FIXTURE = (
 
 
 def _load() -> dict:
-    return json.loads(_FIXTURE.read_text())
+    return json.loads(_FIXTURE.read_text(encoding="utf-8"))
 
 
 # The parametrized rows are named at collection time, so the fixture is loaded

@@ -294,7 +294,7 @@ let reply: EchoReply = mesh
     .await?;
 ```
 
-By default the policy retries timeouts, transport failures, and transient server errors (internal / backpressure); it leaves `NoRoute`, codec, capability-denied, cancellation, and application handler errors alone — retrying a `bad request` forever is not recovery. Override the classifier with `RetryPolicy::with_retryable`. The deadline lives on `opts.raw.deadline` (an absolute `Instant`) and does *not* advance across retries, so the total wall-clock window is bounded by the initial deadline plus the sum of backoffs. Sibling helpers — `call_service_typed_with_hedge` (race a backup provider) and `CircuitBreaker` (fast-fail a sick target) — compose the same way; see [Recover a Failed Workflow](/docs/guides/recover-failed-workflow).
+By default the policy retries timeouts, transport failures, and transient server errors (internal / backpressure); it leaves `NoRoute`, codec, capability-denied, cancellation, and application handler errors alone — retrying a `bad request` forever is not recovery. Handler application codes must sit in `0x8000`–`0xFFFF`: a handler that returns a lower code has it clamped to `Internal`, so a misbanded code surfaces as a retryable `internal` and this default policy retries it. Override the classifier with `RetryPolicy::with_retryable`. The deadline lives on `opts.raw.deadline` (an absolute `Instant`) and does *not* advance across retries, so the total wall-clock window is bounded by the initial deadline plus the sum of backoffs. Sibling helpers — `call_service_typed_with_hedge` (race a backup provider) and `CircuitBreaker` (fast-fail a sick target) — compose the same way; see [Recover a Failed Workflow](/docs/guides/recover-failed-workflow).
 
 ## AI tool calling
 

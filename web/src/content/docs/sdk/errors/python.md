@@ -77,7 +77,8 @@ All derive from `RpcError`. Import from `net`, **not** `net_sdk`:
 
 `RpcAppError` is the one class that *does* carry its status as an argument — it is
 what a handler raises to signal an application status, and it is constructed
-`RpcAppError(status, body)`.
+`RpcAppError(status, body)`. The status must be in the application band
+`0x8000`–`0xFFFF`; anything lower surfaces to the caller as `Internal`.
 
 ### Classed exceptions on the mesh
 

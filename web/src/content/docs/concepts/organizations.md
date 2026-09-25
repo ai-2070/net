@@ -201,11 +201,12 @@ How a live call ends, and where the caller sees it, depends on its shape:
 - dropping a handle instead of cancelling sends the one CANCEL and observes
   nothing.
 
-A **local** deadline is its own case even though it reports the same
-`org:rpc:timeout`. On the browser and leaf port a follower tab can reach its
-own deadline on a call the leader node owns, and the outcome is stated as
-indeterminate: the remote operation may still have executed, and it is never
-retried.
+A **local** deadline is its own case and never reports `org:rpc:timeout`. On
+the browser and leaf port a follower tab can reach its own deadline on a call
+the leader node owns, and that outcome surfaces as indeterminate (the browser
+kind `rpc-indeterminate`, not `rpc-timeout`; see
+[the browser session](/docs/sdk/browser/session)): the remote operation may
+still have executed, and it is never retried.
 
 Only a credential-validity clamp or the next opening can stop a call already
 running on a grant (see the floor limitation above).

@@ -185,17 +185,22 @@ depends on the shape and on who retired the call:
 | Caller cancel (the reserved token), any shape | `org:rpc:cancelled`, at the same seam as the deadline row |
 | Stream handle dropped instead of cancelled | exactly one CANCEL on the wire and nothing observable (see above) |
 
-The kind is chosen by the retirement cause — not by the shape, and not by the
-wire status a frame carries: a deadline is `org:rpc:timeout`, a caller cancel
-is `org:rpc:cancelled`, a revocation or a credential-clamp expiry is
+The kind is not chosen by the shape. It is mapped from the wire status the
+terminal frame carries — `Timeout` (`0x0003`) is `org:rpc:timeout`, `Cancelled`
+(`0x0005`) is `org:rpc:cancelled` — and it tracks the retirement cause because
+only the engine mints those reserved codes: a handler cannot, since any
+handler application code outside `0x8000`–`0xFFFF` is clamped to `Internal` on
+every call shape. So a deadline is `org:rpc:timeout`, a caller cancel is
+`org:rpc:cancelled`, a revocation or a credential-clamp expiry is
 `org:admission_denied:denied` (never a timeout), and any other remote terminal
 is `org:rpc:server_error` with its status and diagnostic verbatim.
 
-A **local** deadline is its own case even though it reports the same
-`org:rpc:timeout`: on the browser and leaf port a follower tab can reach its
-own deadline on a call the leader node owns, and the outcome is stated as
-**indeterminate** — the remote operation may still have executed, and it is
-never retried.
+A **local** deadline is its own case and never reports `org:rpc:timeout`: on
+the browser and leaf port a follower tab can reach its own deadline on a call
+the leader node owns, and that outcome surfaces as **indeterminate** (the
+browser kind `rpc-indeterminate`, not `rpc-timeout`) — the remote operation may
+still have executed, and it is never retried. See
+[the browser session](/docs/sdk/browser/session).
 
 Only a credential-validity clamp or the next opening can stop a call already
 running on a grant; grants have no revocation floor, so a revoked grant is not
@@ -224,6 +229,7 @@ check is exact equality, so rebuild against the current headers.
 ```c
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "net_org.h"
 #include "net_rpc.h"
@@ -249,14 +255,23 @@ static int on_stream(uint64_t handler_id, const net_org_caller_t* caller,
     return 0;
 }
 
-/* Wire the shape dispatcher once, reserve a handler id, then serve the
- * shape. The mesh arc is consumed on EVERY path — success and failure
- * alike: the call takes ownership of the clone the moment it is entered,
- * so never free it yourself (mint a fresh net_mesh_arc_clone per serve). */
-static int serve_streaming(net_compute_mesh_arc_t* mesh, char** out_err) {
-    if (net_org_set_streaming_handler_dispatcher(on_stream) != 0) {
+/* Once, at init, BEFORE any mesh clone is minted: register the
+ * deallocator (every dispatcher refuses registration without it), then the
+ * shape dispatcher. A failure here has no clone in hand to strand. */
+static int init_org_dispatch(void) {
+    if (net_org_set_callback_free(free) != 0) {
         return -1;
     }
+    return net_org_set_streaming_handler_dispatcher(on_stream) == 0 ? 0 : -1;
+}
+
+/* After init_org_dispatch succeeded: reserve a handler id, then serve the
+ * shape. The mesh arc is consumed on EVERY path — success and failure
+ * alike: the call takes ownership of the clone the moment it is entered,
+ * so never free it yourself (mint a fresh net_mesh_arc_clone per serve,
+ * right before this call, so no early return sits between the mint and
+ * the call that consumes it). */
+static int serve_streaming(net_compute_mesh_arc_t* mesh, char** out_err) {
     uint64_t hid = net_org_reserve_handler_id();
     NetOrgServeHandle* serve = NULL;
     return net_org_serve_streaming(mesh, "chat.complete", 13,

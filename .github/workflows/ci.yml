@@ -3795,11 +3795,12 @@ jobs:
             a_consumer_program_compiles_against_the_shipped_org_surface || exit 1
 
       # === the Node cross-language vectors rows =========
-      # The npm test run above EXECUTED these 119 rows; this step runs the
+      # The npm test run above EXECUTED these 134 rows (the floor was 119
+      # until the §23 audit raised it to the real count); this step runs the
       # file scoped (it is native-free) and PINS it: the count floor + the
       # structural roster (the describe, the seven it.each family anchors,
       # the three standalone names), fail-closed.
-      - name: Witness roster + floor — Node cross-lang vectors (119)
+      - name: Witness roster + floor — Node cross-lang vectors (134)
         working-directory: net/crates/net/bindings/node
         run: |
           set -o pipefail
@@ -3818,9 +3819,9 @@ jobs:
             'u64 strings round-trip exactly' || exit 1
           out=$(npx vitest run test/org_streaming_opening_vectors.test.ts 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g' | grep -oE '^ *Tests +[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
-          echo "node cross-lang vectors: ${n:-0} (floor 119)"
-          if [ -z "$n" ] || [ "$n" -lt 119 ]; then
-            echo "::error::the node cross-lang vectors ran ${n:-0} rows, floor is 119 — \
+          echo "node cross-lang vectors: ${n:-0} (floor 134)"
+          if [ -z "$n" ] || [ "$n" -lt 134 ]; then
+            echo "::error::the node cross-lang vectors ran ${n:-0} rows, floor is 134 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
@@ -4289,12 +4290,13 @@ jobs:
           PY
 
       # === the Python cross-language vectors rows =======
-      # The pytest run above EXECUTED these (119 items: the byte pins, the
+      # The pytest run above EXECUTED these (137 items; the floor was 119
+      # until the §23 audit pinned the provider-role and mixed_pair rows: the byte pins, the
       # opening role rows, the reject-reality rows, the vocabulary
       # declaration + grammar rows, the never-success rows, narrowed ids,
       # u64 exactness); this step PINS them: the 9 function names lexically
       # (fail-closed) plus the scoped count floor (the run itself).
-      - name: Witness roster + floor — Python cross-lang vectors (119)
+      - name: Witness roster + floor — Python cross-lang vectors (137)
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
@@ -4303,18 +4305,22 @@ jobs:
             test_fixture_has_the_expected_shape \
             test_wire_bytes_pin \
             test_opening_wire_as_caller \
+            test_opening_wire_as_provider \
             test_reject_mutation_is_real_against_the_base_wire \
             test_vocabulary_row_classifies_back_to_declared_domain_and_kind \
             test_vocabulary_wire_grammar \
             test_unclassified_case_never_becomes_success \
             test_narrowed_ids_never_match_a_full_id \
-            test_u64_strings_round_trip_exactly || exit 1
+            test_u64_strings_round_trip_exactly \
+            test_mixed_pair_probes_match_the_net_stub_signatures \
+            test_mixed_pair_pipe_reads_are_watchdog_bounded \
+            test_mixed_pair_scenario_pins_cannot_drift || exit 1
           out=$(cd net/crates/net/bindings/python && python -m pytest -q \
                   tests/test_org_streaming_opening_vectors.py 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
-          echo "python cross-lang vectors: ${n:-0} (floor 119)"
-          if [ -z "$n" ] || [ "$n" -lt 119 ]; then
-            echo "::error::the python cross-lang vectors ran ${n:-0} rows, floor is 119 — \
+          echo "python cross-lang vectors: ${n:-0} (floor 137)"
+          if [ -z "$n" ] || [ "$n" -lt 137 ]; then
+            echo "::error::the python cross-lang vectors ran ${n:-0} rows, floor is 137 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
@@ -7417,6 +7423,7 @@ jobs:
           org_parity_codec_round_trip_both_codecs
           org_parity_leaf_proof_verifies_under_core
           org_parity_core_proof_verifies_under_leaf
+          org_read_timeout_never_drops_items
           "
           # The roster is checked against the harness source before the
           # logs are read: a witness name that the runner never emits
