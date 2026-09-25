@@ -1304,7 +1304,7 @@ fn build_leaf(root: &Path) -> Result<PathBuf, String> {
         .arg(&wasm)
         .status()
         .map_err(|e| {
-            format!("wasm-bindgen: {e} (install with `cargo install wasm-bindgen-cli --version 0.2.128`)")
+            format!("wasm-bindgen: {e} (install with `cargo install wasm-bindgen-cli --version 0.2.129`)")
         })?;
     if !status.success() {
         return Err("wasm-bindgen failed (CLI/crate version mismatch?)".into());

@@ -6472,11 +6472,11 @@ jobs:
           workspaces: net/crates/net/leaf -> target
 
       # The bindgen CLI version must EQUAL the crate version the leaf
-      # pins (`wasm-bindgen = "=0.2.128"`).
-      - name: Install wasm-bindgen-cli 0.2.128
+      # pins (`wasm-bindgen = "=0.2.129"`).
+      - name: Install wasm-bindgen-cli 0.2.129
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.128
+          tool: wasm-bindgen-cli@0.2.129
 
       # `wasm-bindgen-test-runner` drives a real browser over
       # WebDriver, and chromedriver refuses a Chrome whose major
@@ -6907,10 +6907,10 @@ jobs:
         with:
           shared-key: leaf-wasm
           workspaces: net/crates/net/leaf -> target
-      - name: Install wasm-bindgen-cli 0.2.128
+      - name: Install wasm-bindgen-cli 0.2.129
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.128
+          tool: wasm-bindgen-cli@0.2.129
 
       # The size assertion is about the bundle a page downloads, so
       # the wasm has to be the real one, built here.
@@ -7135,12 +7135,12 @@ jobs:
         run: sudo apt-get install -y nftables
 
       # The bindgen CLI version must EQUAL the crate version the leaf
-      # pins (`wasm-bindgen = "=0.2.128"`); a mismatch is a hard error
+      # pins (`wasm-bindgen = "=0.2.129"`); a mismatch is a hard error
       # at bindgen time, which is exactly what we want it to be.
-      - name: Install wasm-bindgen-cli 0.2.128
+      - name: Install wasm-bindgen-cli 0.2.129
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.128
+          tool: wasm-bindgen-cli@0.2.129
 
       - name: Build the leaf bundle and @net-mesh/browser
         run: |
@@ -7543,10 +7543,10 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install wasm-bindgen-cli 0.2.128
+      - name: Install wasm-bindgen-cli 0.2.129
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.128
+          tool: wasm-bindgen-cli@0.2.129
 
       # Exactly what the browser matrix builds, plus the demo's own
       # deps: the page loads the real bundle, so a stale artefact

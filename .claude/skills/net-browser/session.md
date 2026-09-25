@@ -194,7 +194,7 @@ cd ../browser-ts
 npm install && npm run build      # tsc + the single-file bundle, copying the leaf pkg/ beside it
 ```
 
-`wasm-bindgen-cli` must be **0.2.128** — the version the leaf pins; a mismatch is
+`wasm-bindgen-cli` must be **0.2.129** — the version the leaf pins; a mismatch is
 a hard error at bindgen time rather than a subtle one at run time.
 
 **Loading.** Either serve the build output directory and `import { connect } from

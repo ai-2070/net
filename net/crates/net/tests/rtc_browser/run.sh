@@ -14,7 +14,7 @@
 # installs on first use), and prints one `RTCB PASS`/`RTCB FAIL` line
 # per witness. Exits non-zero on any failed witness.
 #
-# Requires: Node >= 20, `wasm-bindgen-cli` 0.2.128, the
+# Requires: Node >= 20, `wasm-bindgen-cli` 0.2.129, the
 # `wasm32-unknown-unknown` target, `certutil` (libnss3-tools) and the
 # Playwright browser for the chosen engine. The Stage 5 half
 # additionally needs `net/crates/net/leaf/pkg` and
