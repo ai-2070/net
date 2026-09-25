@@ -1,0 +1,16 @@
+net/crates/net/bindings/python/tests/test_org_streaming_opening_vectors.py
+  h_64425bc75e3f3d 377-380,413-442
+net/crates/net/tests/cross_lang_org/mixed_pair/caller.py
+  h_64425bc75e3f3d 34-36,41,44-45,47-51,57,66,74-88,230-234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "768f14798cb814e822ee14b2c8f4bc7f50764446",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
