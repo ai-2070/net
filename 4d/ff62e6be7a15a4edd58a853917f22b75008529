@@ -1,0 +1,40 @@
+net/crates/net/sdk-ts/test/org_live.test.ts
+  s_d8b00bedd146e9::t_60f2e736399908 39,205-209,211-234
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_d8b00bedd146e9::t_bece1edce1c15b 511,1255
+net/crates/net/sdk-ts/test/org_consumer/org_streaming_consumer.ts
+  s_d8b00bedd146e9::t_60f2e736399908 93-97,99-105,109,285-286,312-313
+net/crates/net/tests/integration_mesh_cancel.rs
+  s_d8b00bedd146e9::t_7fee6cc8203b50 475,501,540
+  s_d8b00bedd146e9::t_ad9cc5fe006e18 478-479
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_d8b00bedd146e9::t_65ce0aa247d454 5487
+  s_d8b00bedd146e9::t_ad9cc5fe006e18 5810-5813,10504-10505
+  s_d8b00bedd146e9::t_824f520bc9c659 5610,5623
+  s_d8b00bedd146e9::t_5cf91f4d6d1550 5486,5488-5492,5496-5503,5505-5506,5511-5512,5518,5525,5531,5536,5540,5542,5544,5576,5580,5588,5594,5612,5622,5624
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_eab7d517ccfacf 1883
+net/crates/net/leaf/tests/wasm_leader.rs
+  s_d8b00bedd146e9::t_7fee6cc8203b50 4443-4448
+net/crates/net/tests/org_rpc_streaming/s14.rs
+  s_d8b00bedd146e9::t_5cf91f4d6d1550 321
+  s_d8b00bedd146e9::t_bece1edce1c15b 303
+net/crates/net/src/adapter/net/mesh.rs
+  s_d8b00bedd146e9::t_bece1edce1c15b 11843-11850,14544-14545,14979-14986,21476,24929,32657,32659,33452,51118,51291-51292,51294
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4dff62e6be7a15a4edd58a853917f22b75008529",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
