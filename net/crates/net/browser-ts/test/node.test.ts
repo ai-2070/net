@@ -561,7 +561,8 @@ describe('BrowserNode', () => {
 });
 
 /**
- * Kyra's round-5 teardown probe (`spikes/kyra/kyra_5_round5_close_probe.mjs`),
+ * Kyra's round-5 teardown probe (`spikes/kyra/kyra_5_round5_close_probe.mjs`
+ * at `4a98529f2`; `spikes/` has since been removed),
  * as a vitest against the real `BrowserNode`.
  *
  * Two iterators are parked and the FIRST inner stream's `close`

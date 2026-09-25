@@ -3,8 +3,9 @@
 Stage 0 / S0c of
 [`BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md`](../plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md)
 (§4's deferred DTLS-exporter question). Measurement harness:
-[`spikes/s0b-rtc/`](../../../spikes/s0b-rtc), run with
-`pwsh -File spikes/s0b-rtc/run.ps1 -Bench`. Throwaway spike code.
+`spikes/s0b-rtc/`, run with `pwsh -File spikes/s0b-rtc/run.ps1 -Bench`.
+Throwaway spike code, since removed; it is preserved at `4a98529f2` (see
+[`spikes/README.md`](../spikes/README.md)).
 
 **Answer up front.** Net's ChaCha20-Poly1305, on top of DTLS, in a real
 headless Chromium over a real DataChannel, costs:

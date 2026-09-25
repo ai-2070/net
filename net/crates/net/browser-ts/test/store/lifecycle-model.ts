@@ -4,7 +4,8 @@
  * **Test-only and deliberately so.** Nothing here is exported from the
  * package, nothing touches a transport, and no protocol subsystem is
  * introduced: this is the brief's normative tables
- * (`spikes/S7_STORE_BRIEF_DRAFT.md` §1.7a/§1.7b/§1.8) turned into code
+ * (`spikes/S7_STORE_BRIEF_DRAFT.md` §1.7a/§1.7b/§1.8, at `4a98529f2`;
+ * `spikes/` has since been removed) turned into code
  * so the tables can be *executed* instead of read.
  *
  * Three reducers' worth of state and one scheduler:

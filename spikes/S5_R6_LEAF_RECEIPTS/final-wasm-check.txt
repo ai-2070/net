@@ -1,6 +1,0 @@
-warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
-warning: `net-mesh` (manifest) generated 1 warning
-    Checking net-mesh-wire v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\wire)
-    Checking net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.75s
-EXIT=0
