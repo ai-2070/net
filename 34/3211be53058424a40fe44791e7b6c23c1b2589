@@ -1,0 +1,18 @@
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  h_64425bc75e3f3d 8815-8827,8831,8836-8845
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  h_64425bc75e3f3d 2759-2767,2826-2830,2874-2879,3164-3173
+net/crates/net/tests/integration_mesh_cancel.rs
+  h_64425bc75e3f3d 457-648
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "343211be53058424a40fe44791e7b6c23c1b2589",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
