@@ -1,0 +1,33 @@
+.github/scripts/check-skill-examples.sh
+  s_3f3d4c91f992be::t_9dd6d5e80efa3a 193
+net/crates/net/tests/capability_multihop.rs
+  s_3f3d4c91f992be::t_1bedc9b43d3fc7 850-872,879-892
+  s_3f3d4c91f992be::t_882a06babff9a2 873-878
+.claude/skills/net-event-bus/examples/tokenchannel.rs
+  s_3f3d4c91f992be::t_f4d70a44ffed16 49-55
+  s_3f3d4c91f992be::t_9dd6d5e80efa3a 120
+web/src/content/docs/agent-briefs/wrap-and-use-an-mcp-server.md
+  s_3f3d4c91f992be::t_bdfefa53c333b4 21-23
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_4e1eafb77150e0 4578-4615
+net/crates/net/src/adapter/net/mesh.rs
+  s_3f3d4c91f992be::t_c7bb5561894060 29789-29795,29823-29831
+web/src/content/docs/guides/wrap-mcp-server.md
+  s_3f3d4c91f992be::t_bdfefa53c333b4 27-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "feb9951b2eecc9511f371aa3ceb6864497930e7e",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
