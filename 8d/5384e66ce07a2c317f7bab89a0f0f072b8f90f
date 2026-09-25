@@ -1,0 +1,20 @@
+net/crates/net/docs/ORGANIZATIONS.md
+  h_64425bc75e3f3d 158-161,163-167
+web/src/content/docs/concepts/organizations.md
+  h_64425bc75e3f3d 188,191-194,196-208
+web/src/content/docs/guides/private-capabilities.md
+  h_64425bc75e3f3d 230-237,305
+web/src/content/docs/guides/protected-streaming.md
+  h_64425bc75e3f3d 182,184-198,253-255
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8d5384e66ce07a2c317f7bab89a0f0f072b8f90f",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
