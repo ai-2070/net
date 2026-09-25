@@ -178,7 +178,6 @@ struct Loop {
     request_route: u64,
     reply_route: u64,
     carrier: u64,
-    #[allow(dead_code)]
     outcomes: Vec<OpenOutcome>,
 }
 
@@ -282,7 +281,6 @@ impl Loop {
         (handle.call_id, handle)
     }
 
-    #[allow(dead_code)]
     fn open_dx(&mut self, open: StreamOpen, intent: OrgCallIntent) -> (u64, CallHandle) {
         let pin = self.pin();
         let handle = self
@@ -990,6 +988,54 @@ fn streaming_flags_on_a_unary_registration_stay_streaming_unsupported() {
         vec![denied(CoarseAdmissionReason::NotSupported)],
         "typed NotSupported refusal, byte-exact"
     );
+}
+
+#[test]
+fn a_deadline_past_the_policy_cap_is_refused_as_deadline_exceeds_policy() {
+    // §2.1 bound 2: an explicit deadline beyond `now + max_live_ns`
+    // is REFUSED, never clamped. The payload carries its over-cap
+    // deadline BEFORE the proof is minted — the digest binds the
+    // deadline, so a post-mint retime would (correctly) read as
+    // `BindingInvalid` and never reach the deadline step.
+    let mut l = Loop::new();
+    l.serve(RpcCallShape::ServerStreaming, ServeAccess::SameOrg);
+    let intent = l.w.intent(5);
+    let mut req = RpcRequestPayload {
+        service: SERVICE.to_string(),
+        deadline_ns: NOW_NS + 3_601 * 1_000_000_000,
+        flags: FLAG_RPC_STREAMING_RESPONSE,
+        headers: Vec::new(),
+        body: Bytes::from_static(b"x"),
+    };
+    attach_signed_admission(
+        &mut req,
+        &intent,
+        0x2040,
+        SERVICE,
+        RpcCallShape::ServerStreaming,
+        Some(l.w.binding),
+        l.now,
+    )
+    .expect("mint");
+    let raw = rpc_wire::encode_request_frame(
+        l.w.caller_entity.origin_hash(),
+        0x2040,
+        l.request_route,
+        &req,
+    )
+    .expect("encode");
+    assert_eq!(
+        l.feed_raw(raw),
+        OpenOutcome::Denied(AdmissionDenied::DeadlineExceedsPolicy),
+        "an over-cap deadline is refused typed, never clamped"
+    );
+    let down = l.provider_out();
+    assert_eq!(
+        responses(&down),
+        vec![denied(CoarseAdmissionReason::Denied)],
+        "typed Denied refusal, byte-exact"
+    );
+    assert!(l.served.borrow().is_empty(), "nothing was admitted");
 }
 
 #[test]
@@ -2375,6 +2421,146 @@ mod node_level {
             handles[1].retired(),
             None,
             "and completes without retirement"
+        );
+    }
+
+    /// LEAF-20: the revocation feed's authenticity, negatively. A
+    /// forged bundle — the real org id and floors under a wrong
+    /// signature, and a genuine signature over tampered floor values
+    /// — must merge NOTHING and retire NOTHING; only the signed
+    /// truth moves floors. Deleting the `bundle.verify()` gate in
+    /// `LeafNode::ingest_org_revocation_bundle` accepts both forgeries
+    /// as raises, which reddens this witness at the refusal asserts
+    /// and at `retired()` staying `None` until the genuine bundle.
+    #[test]
+    fn a_forged_revocation_bundle_is_refused_and_never_retires_a_call() {
+        let world = World::at(clock::now_unix_secs());
+        let peer_ident = peer_identity();
+        let peer = peer_ident.node_id();
+        let (mut node, peer_session) = connected(peer);
+
+        // The attribution pin, as in the positive twin.
+        let signed = net_leaf::announce::build_announcement(
+            &peer_ident,
+            &["test.anchor".to_string()],
+            1,
+            clock::now_unix_nanos(),
+            300,
+        )
+        .expect("announcement");
+        assert!(node.ingest_announcement(&signed), "the pin is installed");
+
+        // Serve server-streaming org-protected, with ONE live call at
+        // membership generation 3 — exactly the call a floor-4 bundle
+        // retires when it is GENUINE.
+        let calls: Rc<RefCell<Vec<ServeCall>>> = Rc::new(RefCell::new(Vec::new()));
+        let handler_calls = Rc::clone(&calls);
+        node.org_serve(
+            SERVICE,
+            ServeOptions {
+                shape: RpcCallShape::ServerStreaming,
+                access: ServeAccess::SameOrg,
+                provider_owner_org: world.owner_org,
+                skew_secs: 0,
+                default_live_ns: 300 * 1_000_000_000,
+                max_live_ns: 3600 * 1_000_000_000,
+                policy: None,
+            },
+            Rc::new(move |call| handler_calls.borrow_mut().push(call)),
+        )
+        .expect("serve");
+
+        let request_route =
+            Channel::from_name(channel::request_channel(SERVICE).expect("c")).canonical();
+        let stream_id = channel::publish_stream_id(request_route);
+        let binding = node.peer_session_binding(peer).expect("session binding");
+        let node_entity = EntityId::from_bytes(*node.identity().entity().entity_id());
+        let intent = world.intent_at(3, node_entity);
+        let mut req = RpcRequestPayload {
+            service: SERVICE.to_string(),
+            deadline_ns: 0,
+            flags: FLAG_RPC_STREAMING_RESPONSE,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"open"),
+        };
+        attach_signed_admission(
+            &mut req,
+            &intent,
+            0x3001,
+            SERVICE,
+            RpcCallShape::ServerStreaming,
+            Some(binding),
+            clock::now_unix_nanos(),
+        )
+        .expect("mint");
+        let frame = rpc_wire::encode_request_frame(
+            world.caller_entity.origin_hash(),
+            0x3001,
+            request_route,
+            &req,
+        )
+        .expect("frame");
+        let packet = peer_packet(&peer_session, stream_id, 0, request_route as u16, &frame);
+        node.on_datagram(peer, packet, clock::now());
+        assert_eq!(calls.borrow().len(), 1, "the opening was admitted");
+        let handle = calls.borrow()[0].clone();
+        handle.send(b"gen3-item").expect("send");
+        node.tick(clock::now());
+        assert_eq!(handle.retired(), None);
+
+        // The genuine artifact, held back as the witness's oracle.
+        let mut floors = BTreeMap::new();
+        floors.insert(world.caller_entity.clone(), 4u32);
+        let genuine = OrgRevocationBundle::issue_at(&world.org, &floors, world.now_secs)
+            .expect("bundle issues");
+
+        // Forgery 1: the real org id and floors under a WRONG
+        // signature — a bundle-injection attack's cheapest shape.
+        let mut wrong_sig = genuine.to_bytes();
+        *wrong_sig.last_mut().expect("signature tail") ^= 0xFF;
+        let err = node
+            .ingest_org_revocation_bundle(&wrong_sig)
+            .expect_err("a forged signature must refuse");
+        assert!(
+            matches!(&err, net_leaf::LeafError::Wire(msg) if msg == "revocation bundle: invalid signature"),
+            "the refusal must name the failed authenticity check: {err:?}"
+        );
+        assert_eq!(handle.retired(), None, "the forgery retires nothing");
+        handle.send(b"gen3-more").expect("the call keeps delivering");
+
+        // Forgery 2: a genuine signature over TAMPERED floor values
+        // — the floors are signed input, so the signature must bind
+        // them. (One floor entry: canonical ordering holds either
+        // way, so only the signature can refuse this.)
+        let mut tampered_floors = genuine.to_bytes();
+        let floor_at = tampered_floors.len() - 64 - 4;
+        tampered_floors[floor_at] ^= 0x01;
+        let err = node
+            .ingest_org_revocation_bundle(&tampered_floors)
+            .expect_err("tampered floors must refuse");
+        assert!(
+            matches!(&err, net_leaf::LeafError::Wire(msg) if msg == "revocation bundle: invalid signature"),
+            "the refusal must name the failed authenticity check: {err:?}"
+        );
+        assert_eq!(
+            handle.retired(),
+            None,
+            "the tampered floors change nothing"
+        );
+
+        // The positive restored: the SIGNED truth raises the floor
+        // and retires exactly the call the forgeries pretended to
+        // condemn — so "nothing happened" above is the forgery being
+        // refused, not the feed being inert.
+        let raised = node
+            .ingest_org_revocation_bundle(&genuine.to_bytes())
+            .expect("the genuine bundle verifies");
+        assert_eq!(raised, 1, "exactly one floor rose");
+        assert_eq!(handle.retired(), Some(RetireReason::Revoked));
+        assert_eq!(
+            handle.send(b"after"),
+            Err(SinkError::Closed),
+            "its sink refuses typed"
         );
     }
 
