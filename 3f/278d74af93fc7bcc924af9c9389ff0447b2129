@@ -1,0 +1,16 @@
+net/crates/net/docs/releases/RELEASE_v0.37_MONEY_TALKS.md
+  h_64425bc75e3f3d 84-95
+web/src/content/docs/releases/RELEASE_v0.37_MONEY_TALKS.md
+  h_64425bc75e3f3d 88-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3f278d74af93fc7bcc924af9c9389ff0447b2129",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
