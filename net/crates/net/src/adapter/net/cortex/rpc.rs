@@ -2166,8 +2166,23 @@ impl RpcServerFold {
                         match outcome {
                             Ok(Ok(payload)) => payload,
                             Ok(Err(RpcHandlerError::Application { code, message })) => {
+                                // The application band is the only band a
+                                // handler error may mint (see `RpcStatus`):
+                                // a code in the reserved canonical range
+                                // would surface as an engine status a handler
+                                // has no business asserting — `0x0009` alone
+                                // counterfeits `AdmissionDenied` at the
+                                // caller. Out-of-band codes degrade to the
+                                // documented generic for an unclassifiable
+                                // handler error, `Internal`, keeping the
+                                // handler's diagnostic as the body.
+                                let status = if (0x8000..=0xFFFF).contains(&code) {
+                                    RpcStatus::Application(code)
+                                } else {
+                                    RpcStatus::Internal
+                                };
                                 RpcResponsePayload {
-                                    status: RpcStatus::Application(code),
+                                    status,
                                     headers: vec![],
                                     body: Bytes::from(message),
                                 }
@@ -11013,6 +11028,60 @@ mod tests {
         let (_, _, resp) = &captured[0];
         assert_eq!(resp.status, RpcStatus::Application(0xBEEF));
         assert_eq!(resp.body.as_ref(), b"bad input");
+    }
+
+    /// SDK-3 (core leg) — a handler `Application` code in the reserved
+    /// canonical range must never mint an engine status: `0x0009` alone
+    /// would counterfeit `AdmissionDenied` at the caller, `0x0003`/`0x0005`
+    /// the deadline/cancel words. Out-of-band codes degrade to `Internal`,
+    /// keeping the handler's diagnostic as the body.
+    ///
+    /// Pre-fix behavior this red-greens: the fold minted
+    /// `RpcStatus::Application(code)` verbatim, so `to_wire()` emitted the
+    /// handler's own word (e.g. `0x0009`) and the caller decoded
+    /// `AdmissionDenied`.
+    #[tokio::test]
+    async fn server_fold_application_error_cannot_mint_an_engine_status() {
+        struct ForgeHandler(u16);
+        #[async_trait::async_trait]
+        impl RpcHandler for ForgeHandler {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                Err(RpcHandlerError::Application {
+                    code: self.0,
+                    message: "handler-chosen".to_string(),
+                })
+            }
+        }
+        // Every engine word, the first reserved value, and the top of the
+        // reserved middle range — all out of the application band.
+        for code in [0x0000, 0x0003, 0x0005, 0x0009, 0x000A, 0x7FFF] {
+            let (emit, captured) = capturing_emitter();
+            let mut fold = RpcServerFold::new(Arc::new(ForgeHandler(code)), emit);
+            let req = RpcRequestPayload {
+                service: "x".to_string(),
+                deadline_ns: 0,
+                flags: 0,
+                headers: vec![],
+                body: Bytes::new(),
+            };
+            fold.apply(&rpc_request_event(1, 1, req), &mut ()).unwrap();
+            assert!(
+                wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+                "expected terminal RESPONSE for code {code:#06x}"
+            );
+            let captured = captured.lock();
+            let (_, _, resp) = &captured[0];
+            // The wire status is the seam that counterfeits:
+            // `RpcStatus::Application(0x0009)` and `RpcStatus::AdmissionDenied`
+            // are distinct values that serialize to the SAME word, so assert
+            // on what the caller decodes.
+            assert_eq!(
+                RpcStatus::from_wire(resp.status.to_wire()),
+                RpcStatus::Internal,
+                "handler code {code:#06x} must not surface as an engine status"
+            );
+            assert_eq!(resp.body.as_ref(), b"handler-chosen");
+        }
     }
 
     /// Internal error: handler returns `RpcHandlerError::Internal`

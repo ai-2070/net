@@ -133,12 +133,22 @@ impl OrgCaller {
 /// flattening every failure into one status.
 ///
 /// Neither variant is ever an admission denial: `0x0009` is the admission
-/// engine's word, and a handler cannot counterfeit it.
+/// engine's word, and a handler cannot counterfeit it. That promise is
+/// ENFORCED, not just documented: the [`From`] classification below admits
+/// only the application band, so no handler-chosen code can ever reach the
+/// wire as an engine status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrgHandlerError {
     /// An application-level rejection carrying a status the caller sees.
     Application {
-        /// Application status code (the `0x8000..=0xFFFF` band by convention).
+        /// Application status code — the `0x8000..=0xFFFF` band, the
+        /// application-defined range [`RpcStatus`] reserves for handlers.
+        ///
+        /// A code outside the band is remapped to
+        /// [`NRPC_TYPED_HANDLER_ERROR`] on classification, never forwarded:
+        /// a forwarded `0x0009` would surface as `AdmissionDenied`, `0x0003`
+        /// as `Timeout`, and so on — engine words a handler has no business
+        /// asserting.
         code: u16,
         /// Diagnostic body.
         message: String,
@@ -150,9 +160,20 @@ pub enum OrgHandlerError {
 impl From<OrgHandlerError> for RpcHandlerError {
     fn from(e: OrgHandlerError) -> Self {
         match e {
-            OrgHandlerError::Application { code, message } => {
-                RpcHandlerError::Application { code, message }
-            }
+            OrgHandlerError::Application { code, message } => RpcHandlerError::Application {
+                // The ONE classification point every verb routes a handler
+                // failure through (all four bridges `?`-convert here), so
+                // this band check is the enforcement behind
+                // `OrgHandlerError`'s "never an admission denial" contract —
+                // including for binding handlers, whose
+                // `nrpc:app_error:0x<code>:` codes are caller-chosen.
+                code: if (0x8000..=0xFFFF).contains(&code) {
+                    code
+                } else {
+                    NRPC_TYPED_HANDLER_ERROR
+                },
+                message,
+            },
             OrgHandlerError::Internal(message) => RpcHandlerError::Internal(message),
         }
     }
@@ -698,5 +719,67 @@ where
     match access {
         OrgAccess::SameOrg => node.serve_rpc_owner_scoped_duplex(service, raw, policy),
         OrgAccess::Granted => node.serve_rpc_granted_duplex(service, raw, policy),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SDK-3 — [`From<OrgHandlerError>`] is the ONE classification point every
+    /// verb routes a handler failure through (each of the four bridges
+    /// `?`-converts the handler's `OrgHandlerError` here), so the wire code a
+    /// caller decodes is decided at this seam.
+    ///
+    /// Pre-fix behavior this red-greens: the conversion forwarded `code`
+    /// verbatim, so a raw handler — or a binding's `nrpc:app_error:0x<code>:`
+    /// parse — could emit `0x0009`, the core minted it unchanged, and the
+    /// caller's `map_rpc_error` classified the wire status as
+    /// `AdmissionDenied`: a counterfeit of the admission engine's word,
+    /// contradicting `OrgHandlerError`'s own contract.
+    #[test]
+    fn handler_error_0x0009_never_surfaces_as_admission_denied() {
+        // The named counterfeit, through the caller's own decode seam:
+        // `from_wire` is what turns the minted code back into a status.
+        let counterfeit: RpcHandlerError = OrgHandlerError::Application {
+            code: 0x0009,
+            message: "denied".to_string(),
+        }
+        .into();
+        let code = match counterfeit {
+            RpcHandlerError::Application { code, .. } => code,
+            other => panic!("an application error must classify as application: {other:?}"),
+        };
+        assert_eq!(
+            RpcStatus::from_wire(code),
+            RpcStatus::Application(NRPC_TYPED_HANDLER_ERROR),
+            "a handler's 0x0009 must not decode as the engine's AdmissionDenied"
+        );
+
+        // And the exact classification for EVERY handler-chosen code: the
+        // application band passes verbatim; everything else — the engine
+        // words 0x0000..=0x0009 and the reserved middle range alike — is
+        // remapped to the generic handler error, never forwarded.
+        for code in 0..=u16::MAX {
+            let classified: RpcHandlerError = OrgHandlerError::Application {
+                code,
+                message: "diagnostic".to_string(),
+            }
+            .into();
+            let (got, message) = match classified {
+                RpcHandlerError::Application { code, message } => (code, message),
+                other => panic!("an application error must classify as application: {other:?}"),
+            };
+            assert_eq!(message, "diagnostic", "the diagnostic body survives verbatim");
+            let expected = if (0x8000..=0xFFFF).contains(&code) {
+                code
+            } else {
+                NRPC_TYPED_HANDLER_ERROR
+            };
+            assert_eq!(
+                got, expected,
+                "code {code:#06x} must classify as {expected:#06x}"
+            );
+        }
     }
 }
