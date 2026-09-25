@@ -21,6 +21,13 @@ the terminal/lifecycle vocabulary and the leader-proxy plane are not
 merge-ready. Findings below are numbered per lane (e.g. `LEAF-3`), stable for
 repair briefs.
 
+**Spot-check addendum (2026-09-25):** 16 findings were re-read in source and all
+hold (see the receipts below). The counts are kept as filed. However, the
+spot-check recommends re-grading LEAF-4/5/6 to P2 once the leader-proxy trust
+model is settled (owner question 4). It also found that SDK-2's root is a
+pre-existing core nRPC behavior, so its fix belongs in core. The HOLD stands
+either way.
+
 ---
 
 ## Verification receipts
@@ -43,6 +50,35 @@ of the headline P1 claims:
 | LEAF-1 fabricated completion | `leaf/src/wasm.rs:5047-5073` | **CONFIRMED** — `if self.settled.get()` returns `Terminal(Completed{body: Bytes::new()})` before the latched-terminal read at :5065 |
 | LEAF-3 envelope tag | `leader_session.rs:2254-2273` + `:3747-3765` | **CONFIRMED** — producer wraps `envelope(ORG_ENVELOPE_ADMITTED, json)`; `decode_admitted` runs `serde_json::from_slice(payload)` on the whole payload |
 | BROWSER-1 final body dropped | `browser-ts/src/org.ts:787-808` | **CONFIRMED** — `byteItem` flattens a `done` item without `error` to `{ done: true }`, discarding `raw.value` |
+
+### Second-pass spot-check (2026-09-25)
+
+A follow-up read-only pass re-read 16 findings at `1a2667b75` (`git show
+1a2667b75:<path>`), weighted toward the P1s the coordinator had not read back.
+Every claim checked holds in source. Two findings needed their severity or
+framing changed (both are annotated in place, marked **Spot-check**), and three
+line citations were corrected.
+
+| Claim | Read at `1a2667b75` | Result |
+|---|---|---|
+| LEAF-2 + core twin | `leaf/src/org/replay.rs:268-322, 670-690`; `behavior/org_admission_replay.rs:746-760` | **CONFIRMED** — the overwrite stores the new `acting_org`/`external` and moves no counters; `release` decrements by the stored entry. The core comment's "cannot change orgs mid-window" does not apply, because this branch runs only after the window has expired |
+| LEAF-4 | `leader_session.rs:2412-2428`; `rpc_serve.rs:513-523` | **CONFIRMED** in source — **severity re-scoped**, see §7 |
+| LEAF-5 | `leader.rs:1317-1327`; `leader_session.rs:2222-2228, 3767-3778, 3256-3272` | **CONFIRMED** in source — **severity re-scoped**, see §8. Follower ids come from `correlation_seed()` (random start), so honest tabs do not collide; the leader's bridge ids start at 1 and count up |
+| LEAF-7 | leaf `tests/{org_authority,org_streaming_lifecycle,wasm_leader}.rs`; `leaf/src/org/` | **CONFIRMED** — each named variant appears exactly once in the tests, inside the classification arrays; `leaf/src/org/` has no `cfg(test)` units |
+| LEAF-8 | `git grep` over `leaf/src` | **CONFIRMED** — `AdmissionFailureLimiter` is only re-exported (`org/mod.rs:90`); no `may_attempt`/`on_failure` call sites |
+| LEAF-10 | `leaf/src/org/admission.rs:634-644` | **CONFIRMED** — the projection floors with `/ 1_000_000` (citation corrected) |
+| SDK-2 (core leg) | `mesh_rpc.rs:2277-2343, 4016-4027`; `cortex/rpc.rs:8838-8840` | **CONFIRMED** — `pending.cancel` only removes the sender, and `RpcStream::poll_next` maps the closed channel to `Ready(None)`. **The root predates the branch** — see §2 |
+| SDK-3 | `sdk/src/org/serve.rs:150-159`; `cortex/rpc.rs:2152-2157` | **CONFIRMED** — the code is forwarded unchanged into `RpcStatus::Application(code)`, with no band check at either layer |
+| NODE-2 | `bindings/node/src/mesh_rpc.rs:135-155` vs `sdk/src/org/call.rs:1946-1953` | **CONFIRMED** — the facade falls back to `unwrap_or(Denied)`; node falls back to `OrgSdkError::Rpc` |
+| CI-2 | `.config/nextest.toml:87-89` | **CONFIRMED** — `org_rpc_streaming` is present in the override; `org_scoped_cross_process` is absent |
+| TESTS-7 | `tests/org_rpc_streaming.rs:8`; `Cargo.toml` | **CONFIRMED** — gated on `fixtures`; no `[[test]]` entry |
+| DOCS-3 | `protected-streaming.md:255-256` vs `include/net_org.h:265, 488, 502` | **CONFIRMED** |
+| PY-3 / DOCS-5 | `git ls-tree` | **CONFIRMED** — 22 files under `.s4receipts/` (incl. `installed-org-init.bak`); 6 `r4corefix-*.log` |
+| §12 `start()` ruling | `git grep try_start\|start_with_report` | **CONFIRMED** — no such function anywhere in the crate |
+| Count table | arithmetic | **CONFIRMED** — 10 / 40 / 29 |
+
+Not re-read in this pass: CORE-1/2, PY-2, the VEC suite rows, BROWSER-2 and
+later. These are still lane claims.
 
 ---
 
@@ -177,6 +213,16 @@ item is the cancellation error (never `None`), and cancelling
 `call_client_stream` and asserting `finish` classifies it as cancelled; all
 three reddening today's folds.
 
+**Spot-check (2026-09-25): the root predates the branch.** At the merge base
+`85ecc77c9`, the cancel watcher's "observe EOF via Ready(None)" comment
+(`mesh_rpc.rs:3294`) and the CS "terminal sender dropped before response
+arrived" transport error (`:1978, :1992`) already exist. What the branch adds is
+the facade's `Cancelled` promise and the exposed cancel tokens. The fix therefore
+belongs in core — `PendingStreams::cancel` must deliver a typed cancellation
+terminal rather than just dropping the sender, or `RpcStream` must tell a closed
+channel apart from `StreamItem::End`. That change also alters behavior for plain
+(non-org) nRPC callers, so a facade-only patch would not close this finding.
+
 ---
 
 ## 3 — Wasm over-poll fabricates a clean completion (LEAF-1)
@@ -298,6 +344,17 @@ authority state is not corrupted.
 **Closure:** unregistration affects only registrations the requesting follower
 owns.
 
+**Spot-check (2026-09-25): the attacker model is narrower than stated;
+recommended re-grade P2 (see owner question 4).** The source reading holds. But
+per the module's own design (`leader.rs:1-39`), leader and followers are tabs of
+**one origin sharing one identity**, and they talk over a same-origin
+`BroadcastChannel`. A "malicious leaf" is therefore same-origin script. Such a
+script can already read the IndexedDB identity vault, and it can contend for the
+Web Lock and become the leader itself. LEAF-4, LEAF-5 and LEAF-6 are isolation
+defects between tabs that are meant to cooperate — defense in depth and
+robustness — not a trust boundary an outside attacker crosses. They are P1 only
+if the plan requires tabs of one identity to be mutually distrusting.
+
 ---
 
 ## 8 — Leader relay handles escape the follower namespace (LEAF-5)
@@ -305,7 +362,7 @@ owns.
 **Severity: HIGH (P1). Cross-leaf call read/inject/cancel.**
 
 `LeaderBackend::perform(&mut self, request, reply)` carries no sender identity
-(trait verified, `leader.rs:1316-1325`); `OrgRelay` keys bare `u64`s
+(trait verified, `leader.rs:1317-1327`); `OrgRelay` keys bare `u64`s
 (calls/serve_calls/accepts, `leader_session.rs:3771-3785`) and every org verb
 addresses by id alone (`OrgSend` :2047, `OrgNext` :2113, `OrgCancel` :2157,
 `OrgServeRequest` :2288, `OrgServeSend` :2311). Bridge ids are
@@ -321,6 +378,11 @@ admission bypass, no provider-side privilege.
 
 **Closure:** handles resolve only within the requesting follower's namespace
 (or are unguessable and sender-bound).
+
+**Spot-check (2026-09-25):** same attacker-model re-scope as §7 — recommended
+P2. Honest tabs cannot collide by accident: `next_org_id` starts from
+`correlation_seed()` (`leader_session.rs:3256-3272`), not from 0. Only the
+leader's `next_serve_call` bridge ids are sequential.
 
 ---
 
@@ -343,6 +405,9 @@ accepts are the only ones that dispatch today.
 **Closure:** the projection reaching handlers is produced under an
 authenticated envelope/channel, not carried as a claim.
 
+**Spot-check (2026-09-25):** same attacker-model re-scope as §7 — recommended
+P2. Only same-origin script can post a `from:"leader"` message on the channel.
+
 ---
 
 ## 10 — 22 of 37 AdmissionDenied variants unwitnessed (LEAF-7)
@@ -352,12 +417,13 @@ Deleting named security checks keeps the suite green.**
 
 `leaf/tests/org_authority.rs:12-14` claims "each refusal surfaces the EXACT
 AdmissionDenied variant … at the exact ordered step that owns it", but
-`MultipleHeaders`, `MemberBindingMismatch`, `ActingOrgMismatch`,
+variants including `MultipleHeaders`, `MemberBindingMismatch`, `ActingOrgMismatch`,
 `UnexpectedCapabilityGrant`, `MissingCapabilityGrant`, `GranteeMismatch`,
 `InsufficientRights`, `DispatcherGrantScope/Invalid`, `MembershipInvalid`,
 `CapabilityGrantInvalid`, `DeadlineExceedsPolicy`, `NotOrgProtected` appear only
 inside the classification arrays (:1007-1032) — executed grep confirms zero
-constructions; produced set is 15/37.
+constructions. The produced set is 15/37, so 22 variants are unwitnessed; the
+names above are a subset of those 22, not the full list.
 
 **Impact boundary:** deleting the exactly-one-header check, the
 member-vs-TOFU-peer check, the grant-presence/grantee/rights checks, or the
@@ -418,7 +484,7 @@ from the tree. Only the FILED ruling stands (see §18).
 |---|---|---|---|
 | LEAF-8 | `leaf/src/rpc_serve.rs:650-659` | `verify_org_admission` (3–4 verify_strict ops) runs with no `may_attempt` gate and never calls `on_failure`; the ported `AdmissionFailureLimiter` (`replay.rs:474-586`) has zero call sites (executed grep) while core gates it (`mesh_rpc.rs:1342-1346`) — unbounded signature-verification CPU on the leaf's single thread | wire `may_attempt`/`on_failure` into the leaf admission path |
 | LEAF-9 | `leaf/src/rpc_serve.rs:1177-1186` | `emit_request_grants` caps lifetime REQUEST_GRANTs at `initial + REQUEST_GRANT_PER_CALL_CAP` while core's constant caps the caller's semaphore BALANCE (`mesh_rpc.rs:3346-3362`) and grants per consumed chunk unboundedly (`cortex/rpc.rs:2764-2767`) — CS/DX uploads past ~window+1M chunks stall in WouldBlock to the deadline | grants pace per consumed chunk unboundedly, or the cap is spec'd on both sides |
-| LEAF-10 | `leaf/src/org/admission.rs:636-465` | Retention projection floors to mono-ms while core adds full-precision (`admission_clock.rs:82-85`); in the final sub-ms of the max-skew window `expires_at == now` ⇒ entry instantly reusable while `check_proof_expiry_at` still accepts — "widening skew must never re-open an already-used proof" breaks at its boundary | round the projection up (or carry ns) so retention strictly dominates every acceptance window |
+| LEAF-10 | `leaf/src/org/admission.rs:634-644` | Retention projection floors to mono-ms while core adds full-precision (`admission_clock.rs:82-85`); in the final sub-ms of the max-skew window `expires_at == now` ⇒ entry instantly reusable while `check_proof_expiry_at` still accepts — "widening skew must never re-open an already-used proof" breaks at its boundary | round the projection up (or carry ns) so retention strictly dominates every acceptance window |
 
 ---
 
@@ -582,6 +648,14 @@ Not branch regressions; recorded so they are not re-discovered or misattributed.
    the receipts with citations updated? Repo convention puts internal records
    under `docs/internal/`; the top-level `spikes/` dir and raw logs are the
    questionable parts.
+4. **Leader-proxy trust model** (added by the 2026-09-25 spot-check; drives
+   the grades of LEAF-4/5/6 and the weight of question 2): are tabs of one
+   origin and one identity meant to distrust each other? If not — which is what
+   `leader.rs:1-39` implies — LEAF-4/5/6 re-grade to P2 hardening. LEAF-3 then
+   becomes a plain correctness fix: it can land without waiting for LEAF-6,
+   since a forged accept needs same-origin script that already holds the
+   identity. If tabs must distrust each other, the current P1 grades and
+   question 2's sequencing stand.
 
 ---
 
@@ -642,7 +716,9 @@ Merge gate, in order:
 1. The five integrity/authority P1s: SDK-2, LEAF-1, BROWSER-1, WIRE-1, LEAF-2
    (+ the core replay twin).
 2. The proxy-plane cluster as one change: LEAF-3, LEAF-4, LEAF-5, LEAF-6
-   (owner question 2).
+   (owner question 2). If owner question 4 settles that same-origin tabs
+   trust each other, only LEAF-3 gates the merge here; LEAF-4/5/6 move to a
+   hardening follow-up.
 3. The terminal-vocabulary decision (owner question 1), then SDK-1, NODE-1/2,
    DOCS-1/2/4, BROWSER-2, SDK-3.
 4. Witness fixes that guard security checks: LEAF-7, TESTS-1, TESTS-7, CI-1,
