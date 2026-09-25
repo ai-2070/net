@@ -332,6 +332,16 @@ impl EnrollOwner {
             channels: channels.iter().map(|(_, i)| i.clone()).collect(),
             org: self.org.clone(),
         });
+        // R2 phase 5: announce the direct address tokens name, so a device
+        // that attached through the relay upgrades to it once it answers.
+        // Only a hint: it never marks this node's NAT open, and a wrong one
+        // fails an authenticated handshake while the relay keeps serving.
+        if let Some(addr) = default_endpoint
+            .as_ref()
+            .and_then(|e| bundles.contact_addr(e))
+        {
+            let _ = mesh.node().set_direct_hint(Some(addr)).await;
+        }
         let service = EnrollmentService::bind(
             self.bind,
             &self.issuer,

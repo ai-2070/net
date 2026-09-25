@@ -4979,7 +4979,10 @@ jobs:
     #   tests/dry_run.rs             — admin verb `--dry-run` envelope
     name: Net CLI tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Two full net-cli runs (~9 min each: default and rtc-bootstrap), the
+    # keychain branch, then the crash-recovery step's own `fixtures` build.
+    # 20 minutes cancelled that last step mid-compile (V3 S5/S6 heads).
+    timeout-minutes: 35
     defaults:
       run:
         working-directory: net/crates/net

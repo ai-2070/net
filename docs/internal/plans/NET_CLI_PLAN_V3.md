@@ -1644,7 +1644,7 @@ This completes the user's reachability requirement in the lab:
 - no dependency on the relay for a viable direct path (rows B and C).
 
 **Next:** R2 phase 5 (later), a relayed-to-direct upgrade using the existing
-hole-punch machinery. Also still open: a deployed project relay to fill
+hole-punch machinery (done in V3 S7). Also still open: a deployed project relay to fill
 `DEFAULT_RELAY`; a TCP/443 last-resort tunnel for UDP-blocked networks; and
 the earlier open items (lifecycle fencing, selective subnet semantics, V2
 exact-head acceptance).
@@ -4339,6 +4339,116 @@ Gates:
 - `cargo tl` 5818/5818 and `cargo t` 7046/7046;
 - SDK 831/831, MCP adapter 275/275 (`dependency_boundary` included), CLI
   374/374 (journey included); `capability_multihop` 13/13.
+
+
+**S7 receipt: R2 phase 5, relayed → direct (decision 9, 2026-09-25).**
+
+**What already existed and what did not.** The core's background direct-path
+upgrade (`auto_direct_upgrade`, on by default) already treats a blind-relay
+channel as a relayed peer. When driven by hand, a probe moved a
+blind-relayed session to direct.
+
+In the CLI topology it could never fire:
+- An enrolled device whose only peer is its operator cannot classify its NAT
+  (a sweep needs two observers), so neither end announces a reflex address
+  and the upgrade has nothing to dial.
+- C1 lets only the lower node id initiate, so a device with the higher id
+  could not dial even an address it knew.
+- A session installed by a routed handshake never pushed the node's own
+  announcement, so the device waited for the ~150 s re-announce to learn
+  anything about the operator.
+
+**User decisions (2026-09-25):**
+1. **Announced direct hint.** An enrollment node announces the address its
+   tokens name.
+2. **Deterministic initiator swap.** The higher id initiates when only the
+   lower one announced an address.
+
+**Core (`MeshNode`):**
+- **`set_direct_hint(Option<SocketAddr>)`** (nat-traversal) stores the
+  hint and republishes the current baseline.
+  - The hint rides the existing signed reflex field only while no reflex was
+    observed or overridden (`announced_reflex`), so no wire field is added.
+  - It never changes the NAT class: it claims reachability at one address,
+    not openness.
+  - A wrong hint fails a Noise handshake authenticated against the
+    operator's key, and the relay keeps serving.
+  - Republishing with no baseline publishes the same (empty) set the
+    re-announce loop already publishes on every started node; it only
+    arrives earlier.
+- **`upgrade_initiates_for`** makes C1 total, and the loop's candidate
+  filter uses it:
+  - The higher id claims the upgrade exactly when it announced no address,
+    the lower id announced one, and the pair action is `Direct`.
+  - Otherwise the lower id initiates, as before.
+  - Both ends evaluate the same claim; the pair matrix is symmetric. They
+    can disagree only while an announcement is in flight, and the C2
+    compare-and-swap install settles that race.
+- **`spawn_routed_announcement_push`**: both ends of a routed or relayed
+  session (`connect_via_endpoint`, and the routed-handshake responder after
+  commit) push their own announcement after the replay settle delay, as
+  `connect`/`accept` do on a direct session.
+  - The task holds only a `Weak` across the settle. A first version held a
+    strong `Arc`, which kept a dropped node alive for 250 ms.
+    `subnet_subject_floor`'s in-process restart caught it: the store was
+    still owned. That test is the witness for this contract.
+
+**CLI.** `up --enroll` calls `set_direct_hint` with the UDP address matching
+its default token endpoint (`--public-addr`, the full router mapping, or a
+concrete bind).
+
+**Unchanged:**
+- the upgrade's busy gate (C3: open streams or unacked data defer the
+  swap);
+- the CAS install;
+- the relay-kept-on-failure contract.
+
+The existing `direct_upgrade` mesh-relay tests pass as before.
+
+Witnesses (`tests/direct_upgrade.rs`, already pinned under the "fixtures
+port-mapping" CI step). Each uses a real `BlindRelay`, an operator
+registered with it, and a device attached only through it, with no other
+peers, so neither end can classify its NAT:
+
+| Test | Proves |
+|---|---|
+| `a_blind_relayed_device_upgrades_when_its_operator_is_the_lower_id` | The device learns the operator's hint over the relay. Only the device initiates, even as the higher id. The background loop moves the session to the operator's address. The same entity id holds, and the operator never dialled. The subscription granted over the relay stays in the roster once, with no re-subscribe. A publish is delivered once and the relay forwards nothing afterwards. |
+| `a_blind_relayed_device_upgrades_when_it_is_the_lower_id` | The same, with the device as the lower id (classic C1) |
+| `a_failed_upgrade_keeps_the_blind_relayed_session` | The hint does not answer. The attempt fails with backoff, the same session id stays relayed, and delivery still rides the relay. |
+
+Inverse mutations, all RED (5):
+
+| # | Mutation |
+|---|---|
+| M1 | Strict C1: the higher id never claims |
+| M2 | The lower id ignores the claim, so both dial |
+| M3 | The hint is never announced |
+| M4 | No own-announcement push on a routed session |
+| M5 | A failed upgrade drops the relayed session |
+
+Gates:
+- core clippy (all, default and no-default features; strict and all-targets);
+- root rustdoc and CLI clippy;
+- `direct_upgrade` 19/19 with CI's features;
+- `cargo tl` 5818/5818 and `cargo t` 7049/7049;
+- SDK 831/831 and CLI 374/374.
+
+**CI.** Since S5, the "Net CLI tests" job overran its 20-minute limit: two
+~9-minute net-cli runs, then the crash step's own `fixtures` build. That
+cancelled the S5 and S6 heads. The limit is now 35 minutes.
+
+**Limits:**
+- **Which end becomes direct.** Only the initiator's end is recorded as a
+  direct adjacency. The responder's end is installed at the initiator's
+  address as routed. That is pre-existing upgrade behaviour: a responder
+  cannot tell a direct handshake from a blind-relayed one by hop count.
+  It is framing-correct, and adjacency predicates stay conservative.
+- **No CLI-level success witness.** On loopback, a token address that fails
+  at join time also fails as a hint. The success path is witnessed in the
+  core; a CLI or natsim row, where direct fails at join time and works
+  later, is left for the natsim harness.
+- **Pair actions.** `SinglePunch` pairs (Cone×Cone, …) still defer, as
+  before: single-punch upgrades are not wired.
 
 
 ## 8. Cumulative acceptance matrix

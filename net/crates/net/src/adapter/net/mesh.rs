@@ -12906,6 +12906,15 @@ pub struct MeshNode {
     /// announce-capabilities path.
     #[cfg(feature = "nat-traversal")]
     reflex_override_active: Arc<std::sync::atomic::AtomicBool>,
+    /// An address this node is known to be reachable at directly, set by
+    /// its owner (an enrollment node: the address its tokens name). It is
+    /// announced in the signed reflex field ONLY while no reflex has been
+    /// observed or overridden, as an upgrade target for a relayed peer
+    /// (R2 phase 5). It never changes the NAT class: it claims
+    /// reachability at one address, not openness, and a wrong hint only
+    /// fails an authenticated handshake while the relay keeps serving.
+    #[cfg(feature = "nat-traversal")]
+    direct_hint: Arc<ArcSwapOption<SocketAddr>>,
     /// Publication barrier held briefly during any code path
     /// that touches more than one of `nat_class`, `reflex_addr`,
     /// and `reflex_override_active` as a group. The three atomics
@@ -14826,6 +14835,8 @@ impl MeshNode {
             reflex_override_active: Arc::new(std::sync::atomic::AtomicBool::new(
                 initial_reflex_override.is_some(),
             )),
+            #[cfg(feature = "nat-traversal")]
+            direct_hint: Arc::new(ArcSwapOption::empty()),
             #[cfg(feature = "nat-traversal")]
             traversal_publish_mu: Arc::new(parking_lot::Mutex::new(())),
             #[cfg(feature = "nat-traversal")]
@@ -29727,6 +29738,7 @@ impl MeshNode {
             ctx.peers.clone(),
             ctx.sink.clone(),
         );
+        let this = ctx.self_weak.get().cloned();
         tokio::spawn(async move {
             match sink.send(&payload, next_hop).await {
                 Ok(_) => {
@@ -29735,6 +29747,15 @@ impl MeshNode {
                     // place, and the guard's own references are
                     // released.
                     guard.commit();
+                    // This node's own announcement too, as `accept` pushes
+                    // it on a direct session (R2 phase 5: a relayed peer
+                    // learns this node's direct hint without waiting for
+                    // the next re-announce).
+                    if let Some(node) = this.and_then(|w| w.upgrade()) {
+                        // Only schedules (a `Weak`-holding task); the strong
+                        // ref drops at the end of this block.
+                        node.spawn_routed_announcement_push(peer_node_id);
+                    }
                     // A peer that attached through a routed handshake
                     // (a device reaching its hub) gets the announcements
                     // flooded before it arrived.
@@ -44469,7 +44490,11 @@ impl MeshNode {
                 let _g = self.traversal_publish_mu.lock();
                 let class =
                     NatClass::from_u8(self.nat_class.load(std::sync::atomic::Ordering::Acquire));
-                let reflex = self.reflex_addr.load_full().map(|arc| *arc);
+                let reflex = self
+                    .reflex_addr
+                    .load_full()
+                    .or_else(|| self.direct_hint.load_full())
+                    .map(|arc| *arc);
                 // Strip any prior `nat:*` tags before adding the fresh
                 // one so a reclassification doesn't leave a stale tag
                 // behind when the class transitions. Phase A.5.N.2:
@@ -47262,6 +47287,25 @@ impl MeshNode {
         ));
     }
 
+    /// [`Self::push_local_announcement`] for a session installed by a
+    /// routed handshake, after the settle a routed peer needs to install
+    /// its end (frames that overtake it are dropped). Needs a started
+    /// node; a bare one waits for the re-announce instead. The task holds
+    /// only a `Weak` across the settle, never a strong ref: a node its
+    /// owner drops must not outlive that drop (the same contract as the
+    /// background loops).
+    fn spawn_routed_announcement_push(&self, peer_node_id: u64) {
+        let Some(weak) = self.self_weak.get().cloned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(REPLAY_SETTLE[0]).await;
+            if let Some(node) = weak.upgrade() {
+                node.push_local_announcement(peer_node_id).await;
+            }
+        });
+    }
+
     async fn push_local_announcement(&self, peer_node_id: u64) {
         // Serialized through the epoch-checked path (review-9
         // addendum): a late joiner must receive what this node's
@@ -48694,6 +48738,9 @@ impl MeshNode {
         // for the direct-handshake-only bookkeeping.
         let (keys, hops) = keys;
         self.install_routed(dest_node_id, via, keys, None, hops > 0);
+        // The routed peer still learns this node's own announcement (its
+        // direct hint included) now rather than at the next re-announce.
+        self.spawn_routed_announcement_push(dest_node_id);
 
         Ok(dest_node_id)
     }
@@ -49169,8 +49216,7 @@ impl MeshNode {
     /// redundant `peers.get` shard-lookup on the map it is iterating.
     #[cfg(feature = "nat-traversal")]
     fn upgrade_is_loop_candidate_at(&self, peer_id: u64, addr: PeerAddr) -> bool {
-        // C1: only the lower-node-id end initiates.
-        if self.node_id >= peer_id {
+        if !self.upgrade_initiates_for(peer_id) {
             return false;
         }
         // Relay-routed only — a direct session has nothing to upgrade.
@@ -49178,6 +49224,41 @@ impl MeshNode {
             return false;
         }
         self.upgrade_should_attempt(peer_id)
+    }
+
+    /// C1, made total: exactly one end of a pair initiates its upgrade,
+    /// decided from the same two announcements at both ends.
+    ///
+    /// The higher node id CLAIMS the upgrade when it announces no address
+    /// itself (so the lower end has nothing to dial), the lower end
+    /// announced one, and the pair's action is a plain direct connect: an
+    /// enrolled device behind a NAT dialling its operator's announced
+    /// address. Otherwise the lower node id initiates, as before (C1).
+    /// Both ends evaluate the same claim (the pair matrix is symmetric),
+    /// so they disagree only while an announcement is in flight, and the
+    /// compare-and-swap install (C2) settles that race.
+    #[cfg(feature = "nat-traversal")]
+    fn upgrade_initiates_for(&self, peer_id: u64) -> bool {
+        use super::traversal::classify::PairAction;
+        let mine = self.announced_reflex().is_some();
+        let theirs = self.peer_reflex_addr(peer_id).is_some();
+        let lower = self.node_id < peer_id;
+        let (higher_announced, lower_announced) = if lower {
+            (theirs, mine)
+        } else {
+            (mine, theirs)
+        };
+        let higher_claims = !higher_announced
+            && lower_announced
+            && self.pair_action_for(peer_id) == PairAction::Direct;
+        lower != higher_claims
+    }
+
+    /// Test hook for [`Self::upgrade_initiates_for`].
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn upgrade_initiates_for_test(&self, peer_id: u64) -> bool {
+        self.upgrade_initiates_for(peer_id)
     }
 
     /// Test hook for [`Self::upgrade_is_loop_candidate`] — lets
@@ -50139,6 +50220,30 @@ impl MeshNode {
         // window. The parked flush task no-ops when it finds the
         // slot cleared.
         self.invalidate_broadcast_window();
+    }
+
+    /// Set (or clear) this node's direct-path hint (see the `direct_hint`
+    /// field) and republish the current capability baseline so peers see
+    /// it. The hint is announced only while no reflex was observed or
+    /// overridden; the NAT class is untouched.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn set_direct_hint(&self, hint: Option<SocketAddr>) -> Result<(), AdapterError> {
+        {
+            let _g = self.traversal_publish_mu.lock();
+            self.direct_hint.store(hint.map(Arc::new));
+            self.invalidate_broadcast_window();
+        }
+        self.reannounce_current_capabilities().await
+    }
+
+    /// The address this node currently announces as its reflex: an
+    /// observed or overridden reflex, else its direct hint.
+    #[cfg(feature = "nat-traversal")]
+    fn announced_reflex(&self) -> Option<SocketAddr> {
+        self.reflex_addr
+            .load_full()
+            .or_else(|| self.direct_hint.load_full())
+            .map(|arc| *arc)
     }
 
     /// Drop a previously-installed runtime reflex override. The
