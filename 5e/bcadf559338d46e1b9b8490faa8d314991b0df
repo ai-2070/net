@@ -1,0 +1,16 @@
+web/src/app/globals.css
+  h_64425bc75e3f3d 776-802
+web/src/components/DocsContent.tsx
+  h_64425bc75e3f3d 640-643,645-651,655-658
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5ebcadf559338d46e1b9b8490faa8d314991b0df",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
