@@ -1,0 +1,22 @@
+net/crates/net/bindings/node/test/cross_lang_compat.test.ts
+  h_64425bc75e3f3d 106-109
+net/crates/net/bindings/node/test/mesh_rpc.test.ts
+  h_64425bc75e3f3d 435-438,596-600,744-748,1093-1094,1356-1357,1575-1576,1605-1606
+net/crates/net/bindings/node/test/payment_conformance.test.ts
+  h_64425bc75e3f3d 32
+net/crates/net/bindings/node/test/payment_provider.test.ts
+  h_64425bc75e3f3d 26
+net/crates/net/bindings/node/test/subnet_binding.test.ts
+  h_64425bc75e3f3d 114,121,157,170
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3cb8384a23b367d8dcfc58268420535597d12454",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
