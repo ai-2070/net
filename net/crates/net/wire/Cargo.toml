@@ -78,11 +78,13 @@ snow = { version = "0.10.0", default-features = false, features = [
 # `compile_error!` inside getrandom itself. (S0a §6.2.)
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
-# Packet AEAD for wasm32: 0.10.1 (aead 0.5, `AeadInPlace`), not the
-# 0.11 the core pins — 0.11 moved to aead 0.6's `InOutBuf` API, and
-# 0.10.1 is already in the tree under snow's default resolver, so this
-# dedups rather than linking a second ChaCha20-Poly1305.
-chacha20poly1305 = "0.10.1"
+# Packet AEAD for wasm32: 0.11 (aead 0.6, `AeadInOut`), the same major
+# the core pins. Default features OFF: the default `getrandom` feature
+# pulls in getrandom 0.4, which is a `compile_error!` on
+# wasm32-unknown-unknown without its `wasm_js` opt-in — and nothing
+# here needs it, because the packet key is always caller-supplied.
+# `alloc` stays on for the `Aead` trait the cross-backend tests use.
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # `crypto.rs`'s cross-backend vectors seal with ring and open with
