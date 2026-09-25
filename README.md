@@ -1,4 +1,4 @@
-# Net
+# NET: Network Event Transport
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![CI](https://github.com/ai-2070/net/actions/workflows/ci.yml/badge.svg)](https://github.com/ai-2070/net/actions/workflows/ci.yml)
