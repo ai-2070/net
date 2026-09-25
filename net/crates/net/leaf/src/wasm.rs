@@ -5714,9 +5714,12 @@ pub(crate) struct OrgCall {
     /// Where the bytes flow.
     pub(crate) where_: OrgWhere,
     /// The terminal, latched at the source exactly once and held so
-    /// `finish` and `next` on a shared duplex handle agree on it.
+    /// `finish`, `next`, and every handle [`OrgDuplexCallHandle::stream`]
+    /// mints over this call agree on it.
     terminal: RefCell<Option<crate::rpc_stream::StreamTerminal>>,
-    /// Whether a terminal has been delivered to a consumer.
+    /// Whether a terminal has been delivered to a consumer. Pushes
+    /// and half-closes refuse from here on — the terminal itself
+    /// stays latched above and is re-delivered on every later poll.
     settled: Cell<bool>,
 }
 
@@ -5724,7 +5727,10 @@ pub(crate) struct OrgCall {
 pub(crate) enum OrgPoll {
     /// One response item.
     Item(Bytes),
-    /// The call's terminal, delivered exactly once.
+    /// The call's terminal. Latched at the source on first sight and
+    /// re-delivered to every consumer: one call can be read by
+    /// `finish` and by every handle `stream()` mints over the same
+    /// `OrgCall`, and they all observe this same typed terminal.
     Terminal(crate::rpc_stream::StreamTerminal),
     /// Nothing yet — poll again after the next pump.
     Pending,
@@ -5762,15 +5768,14 @@ impl OrgCall {
     ///
     /// The pull discipline the sans-IO lifecycle is built on: polled
     /// right after each pump and on the ticker as the backstop. The
-    /// terminal is latched here on first sight.
+    /// terminal is latched here on first sight and re-delivered from
+    /// the latch on every later poll — an over-poll, or a second
+    /// consumer on a shared duplex handle, observes the SAME typed
+    /// terminal. An earlier `settled` short-circuit answered those
+    /// polls with a fabricated `Completed { body: [] }`, which
+    /// presented a `Retired { Revoked }`, an `AdmissionDenied` or any
+    /// refusal as a clean end-of-stream at the JS boundary.
     pub(crate) async fn next_outcome(&self) -> Result<OrgPoll, JsError> {
-        if self.settled.get() {
-            // The terminal was delivered once already; an over-poll
-            // sees a benign completion rather than hanging.
-            return Ok(OrgPoll::Terminal(
-                crate::rpc_stream::StreamTerminal::Completed { body: Bytes::new() },
-            ));
-        }
         if let Some(t) = self.terminal.borrow().clone() {
             return Ok(OrgPoll::Terminal(t));
         }
@@ -5790,7 +5795,7 @@ impl OrgCall {
             OrgWhere::Proxy(proxy) => proxy.poll().await?,
         };
         if let OrgPoll::Terminal(terminal) = &got {
-            *self.terminal.borrow_mut() = Some(terminal.clone());
+            self.latch(terminal.clone());
         }
         Ok(got)
     }
@@ -5858,8 +5863,17 @@ impl OrgCall {
 
     /// Cancel the call: exactly one CANCEL on the wire, a terminal
     /// `Retired { Cancelled }` latched locally.
+    ///
+    /// The latch is written HERE, not left to the source poll: a
+    /// consumer that polls after a cancel must observe the typed
+    /// `Cancelled` terminal, never a completion. The node latches the
+    /// same terminal on its side (`org_call_cancel`), so the two
+    /// halves agree.
     pub(crate) fn cancel(&self) {
         self.settled.set(true);
+        self.latch(crate::rpc_stream::StreamTerminal::Retired {
+            reason: crate::rpc_stream::RetireReason::Cancelled,
+        });
         match &self.where_ {
             OrgWhere::Node { inner, call } => {
                 let call_id = call.call_id;
@@ -5871,7 +5885,19 @@ impl OrgCall {
         }
     }
 
-    /// Mark the terminal delivered.
+    /// Latch the call's terminal. First writer wins: the source's own
+    /// terminal is never overwritten by a later local event, and a
+    /// `cancel` after the fact cannot rename it.
+    fn latch(&self, terminal: crate::rpc_stream::StreamTerminal) {
+        let mut held = self.terminal.borrow_mut();
+        if held.is_none() {
+            *held = Some(terminal);
+        }
+    }
+
+    /// Mark the terminal delivered — pushes and half-closes refuse
+    /// from here on. The terminal itself stays latched and readable:
+    /// `next`/`finish` over-polls are answered from the latch.
     pub(crate) fn settle(&self) {
         self.settled.set(true);
     }
@@ -6378,6 +6404,11 @@ impl OrgDuplexCallHandle {
     }
 
     /// The response half of this call.
+    ///
+    /// Every handle this mints shares the call's latched terminal:
+    /// each consumer observes the real typed terminal (a
+    /// `Retired { Revoked }`, an `AdmissionDenied`, a refusal), never
+    /// a fabricated clean completion left for whoever polls second.
     pub fn stream(&self) -> OrgByteStreamHandle {
         OrgByteStreamHandle::from_call(self.call.clone())
     }

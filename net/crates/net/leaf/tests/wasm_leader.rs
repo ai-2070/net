@@ -64,11 +64,13 @@ use net_leaf::error::{LeafError, RpcError};
 use net_leaf::identity::{IdentitySecrets, IDENTITY_BLOB_MAGIC};
 use net_leaf::leader::{
     GenerationLease, LeaderBackend, LeaderRequest, ProxyFailure, ProxyValue, Replier,
+    ORG_ENVELOPE_END, ORG_ENVELOPE_RETIRED,
 };
 use net_leaf::leader_session::{
-    spawn_fenced, BackendFactory, EventSink, Lifecycle, OpRegistry, Role,
+    spawn_fenced, BackendFactory, EventSink, Lifecycle, MeshSession, OpRegistry, Role,
 };
 use net_leaf::rtc::RtcLeafTransport;
+use net_leaf::rpc_wire::RpcStatus;
 use net_leaf::storage::IdentityVault;
 use net_leaf::stream::Reliability;
 use net_leaf::stream_ownership::{answer_stream_request, StreamBackend, StreamOwnership};
@@ -3921,4 +3923,282 @@ async fn two_peers_under_one_wire_id_own_their_streams_independently() {
 #[wasm_bindgen_test]
 async fn a_follower_owns_its_streams_independently_under_one_wire_id() {
     two_peers_own_their_streams(true).await;
+}
+
+// ─────────── org terminals at the JS boundary (LEAF-1) ───────────
+//
+// One call, several consumers: `OrgDuplexCallHandle::stream()` mints a
+// fresh `OrgByteStreamHandle` over the same `OrgCall` per call, and the
+// call's terminal is latched so `finish` and every `next` agree on it.
+// Before the repair, `next_outcome` answered a poll made AFTER the
+// first terminal delivery with a fabricated `Completed { body: [] }` —
+// so the second consumer of a call whose real terminal was
+// `Retired { Revoked }`, an `AdmissionDenied` or any refusal saw a
+// clean end-of-stream. These witnesses hold the remote terminal fixed
+// (the leader-side half a proxied call actually crosses) and assert
+// that EVERY consumer — and every over-poll past the terminal —
+// observes that same typed terminal.
+
+/// What the remote answers a call's response half with: the typed
+/// terminal, spelled exactly as the leader's org relay spells it —
+/// an `ORG_ENVELOPE_RETIRED` envelope for a retirement, a typed
+/// `ProxyFailure` for a refusal.
+#[derive(Clone)]
+enum TerminalAnswer {
+    /// A retirement, as the relay's retire envelope and its frozen
+    /// `OrgRetireReason` string.
+    Retired(&'static str),
+    /// A refusal, as `reply.fail` carries it: the wire status and the
+    /// service's message.
+    Refused(u16, String),
+}
+
+/// A leader backend that acknowledges one org call and then answers
+/// every `OrgNext` with the named terminal — the leader-side half a
+/// witness needs, without a node, a session or a provider.
+struct TerminalBackend {
+    node_id: u64,
+    terminal: TerminalAnswer,
+}
+
+impl LeaderBackend for TerminalBackend {
+    fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    fn perform(&mut self, request: LeaderRequest, reply: Replier) {
+        match request {
+            // The open is acknowledged exactly as the real relay
+            // acknowledges one: an empty END envelope.
+            LeaderRequest::OrgCall { .. } => reply.bytes(Bytes::from_static(&[ORG_ENVELOPE_END])),
+            LeaderRequest::OrgNext { .. } => match &self.terminal {
+                TerminalAnswer::Retired(reason) => {
+                    let mut envelope = Vec::with_capacity(1 + reason.len());
+                    envelope.push(ORG_ENVELOPE_RETIRED);
+                    envelope.extend_from_slice(reason.as_bytes());
+                    reply.bytes(Bytes::from(envelope));
+                }
+                TerminalAnswer::Refused(status, message) => {
+                    reply.fail(ProxyFailure::Typed(LeafError::Rpc(RpcError::Refused {
+                        status: *status,
+                        message: message.clone(),
+                    })));
+                }
+            },
+            _ => reply.bytes(Bytes::new()),
+        }
+    }
+
+    fn shutdown(&mut self, _generation: u64) -> usize {
+        0
+    }
+}
+
+/// A factory for [`TerminalBackend`], in the shape [`factory`] takes.
+fn terminal_factory(node_id: u64, terminal: TerminalAnswer) -> BackendFactory {
+    Rc::new(move |_opts, _sink, _lease| {
+        let terminal = terminal.clone();
+        Box::pin(async move {
+            let backend: Box<dyn LeaderBackend> = Box::new(TerminalBackend { node_id, terminal });
+            Ok(backend)
+        })
+    })
+}
+
+/// The org call options a proxied org call carries. The proofs are
+/// opaque bytes over the proxy — the leader's node mints the signed
+/// opening — so their shape is not what is under test here.
+fn org_call_opts() -> JsValue {
+    let credentials = Object::new();
+    put(
+        &credentials,
+        "membership",
+        &Uint8Array::from(&b"membership-wire"[..]).into(),
+    );
+    put(
+        &credentials,
+        "dispatcher",
+        &Uint8Array::from(&b"dispatcher-wire"[..]).into(),
+    );
+    put(&credentials, "actingOrg", &JsValue::from_str(&format!("{:064x}", 1)));
+    put(
+        &credentials,
+        "providerOwnerOrg",
+        &JsValue::from_str(&format!("{:064x}", 2)),
+    );
+    put(
+        &credentials,
+        "provider",
+        &JsValue::from_str(&format!("{:064x}", 3)),
+    );
+    let object = Object::new();
+    put(&object, "credentials", &credentials);
+    object.into()
+}
+
+/// The `{ done, error? }` item `next()` resolves: the done flag, the
+/// terminal error object's `kind`, and that object serialized — so two
+/// consumers' terminals are compared IDENTICALLY rather than against
+/// prose a rewording could keep true.
+fn terminal_item(item: &JsValue) -> (bool, Option<String>, Option<String>) {
+    let done = Reflect::get(item, &JsValue::from_str("done"))
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let error = Reflect::get(item, &JsValue::from_str("error"))
+        .ok()
+        .filter(|value| !value.is_undefined() && !value.is_null());
+    let kind = error.as_ref().and_then(|value| {
+        Reflect::get(value, &JsValue::from_str("kind"))
+            .ok()
+            .and_then(|kind| kind.as_string())
+    });
+    let json = error
+        .as_ref()
+        .and_then(|value| js_sys::JSON::stringify(value).ok())
+        .and_then(|text| text.as_string());
+    (done, kind, json)
+}
+
+/// A follower session whose leader answers every org call's response
+/// half with `answer`.
+async fn org_terminal_session(answer: TerminalAnswer) -> (MeshSession, Lifecycle) {
+    let db = unique("org-terminal-db");
+    let scope = unique("org-terminal-scope");
+    let leader = Lifecycle::open(
+        opts(&db, &scope, &[], &[]),
+        terminal_factory(0x3333, answer),
+    )
+    .await
+    .expect("leader");
+    settle().await;
+    assert_eq!(leader.role(), Role::Leader);
+    let session = MeshSession::open(opts(&db, &scope, &[], &[]))
+        .await
+        .expect("session");
+    settle().await;
+    assert_eq!(session.role(), "follower");
+    (session, leader)
+}
+
+/// One duplex call whose real terminal is `answer`, consumed via two
+/// `stream()` handles and then over-polled. Every observation must be
+/// the SAME typed terminal item; the fabricated completion the
+/// over-poll used to answer with shows up as a `done` item with no
+/// `error` on every consumer after the first.
+async fn every_consumer_observes(answer: TerminalAnswer, kind: &str) {
+    let (session, leader) = org_terminal_session(answer).await;
+    let handle = session
+        .call_org_duplex("svc.terminal".into(), org_call_opts())
+        .await
+        .expect("the duplex call opens");
+
+    let first = handle.stream();
+    let second = handle.stream();
+
+    let (done, first_kind, first_json) =
+        terminal_item(&first.next().await.expect("the first terminal"));
+    assert!(done, "the terminal arrives as a done item");
+    assert_eq!(
+        first_kind.as_deref(),
+        Some(kind),
+        "the first consumer sees the typed terminal: {first_json:?}"
+    );
+    let first_json = first_json.expect("a typed terminal carries its error object");
+
+    // The second consumer — a fresh handle over the same call — must
+    // observe the SAME typed terminal. Before the repair this resolved
+    // `{ done: true }`: a fabricated `Completed` presenting a
+    // revocation or a refusal as a clean end-of-stream.
+    let (done, second_kind, second_json) =
+        terminal_item(&second.next().await.expect("the second terminal"));
+    assert!(done, "the terminal arrives as a done item");
+    assert_eq!(
+        second_kind.as_deref(),
+        Some(kind),
+        "the second consumer must observe the latched typed terminal, never a \
+         fabricated completion: {second_json:?}"
+    );
+    assert_eq!(
+        second_json.as_deref(),
+        Some(first_json.as_str()),
+        "and it is the very same terminal"
+    );
+
+    // Over-poll past the terminal: the latched terminal again.
+    let (done, third_kind, third_json) = terminal_item(&second.next().await.expect("the over-poll"));
+    assert!(done);
+    assert_eq!(
+        third_kind.as_deref(),
+        Some(kind),
+        "an over-poll past the terminal returns the latched terminal, not a \
+         fabricated completion: {third_json:?}"
+    );
+    assert_eq!(third_json.as_deref(), Some(first_json.as_str()));
+
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+/// A call retired as `Retired { Revoked }` reaches both consumers of a
+/// duplex call — a security revocation must never present as clean
+/// end-of-stream at the JS boundary.
+#[wasm_bindgen_test]
+async fn a_second_duplex_stream_observes_the_latched_revoked_terminal_not_a_fabricated_completion() {
+    every_consumer_observes(TerminalAnswer::Retired("revoked"), "revoked").await;
+}
+
+/// The same for an admission denial (`Refused { AdmissionDenied }`).
+#[wasm_bindgen_test]
+async fn a_second_duplex_stream_observes_the_latched_admission_denial_not_a_fabricated_completion() {
+    every_consumer_observes(
+        TerminalAnswer::Refused(RpcStatus::AdmissionDenied.to_wire(), "denied".into()),
+        "admission-denied",
+    )
+    .await;
+}
+
+/// The same for a plain typed refusal (`Refused` at any other status).
+#[wasm_bindgen_test]
+async fn a_second_duplex_stream_observes_the_latched_refusal_not_a_fabricated_completion() {
+    every_consumer_observes(
+        TerminalAnswer::Refused(
+            RpcStatus::Unauthorized.to_wire(),
+            "the service refused the call".into(),
+        ),
+        "refused",
+    )
+    .await;
+}
+
+/// A cancel is a typed `cancelled` terminal latched locally — the
+/// handle's own contract — and every consumer observes it, never the
+/// fabricated completion an over-poll used to be answered with. The
+/// remote would have said `revoked` here: the cancelling caller's own
+/// action is the terminal it observes, exactly as `cancel` documents.
+#[wasm_bindgen_test]
+async fn a_cancelled_duplex_call_yields_the_cancelled_terminal_to_every_consumer() {
+    let (session, leader) = org_terminal_session(TerminalAnswer::Retired("revoked")).await;
+    let handle = session
+        .call_org_duplex("svc.cancel".into(), org_call_opts())
+        .await
+        .expect("the duplex call opens");
+    handle.cancel();
+
+    for label in ["the cancelling consumer", "a second consumer"] {
+        let stream = handle.stream();
+        let (done, kind, json) = terminal_item(&stream.next().await.expect("the terminal"));
+        assert!(done, "{label} sees a done item");
+        assert_eq!(
+            kind.as_deref(),
+            Some("cancelled"),
+            "{label} must observe the typed cancelled terminal, never a \
+             fabricated completion: {json:?}"
+        );
+    }
+
+    session.close();
+    leader.close();
+    settle().await;
 }
