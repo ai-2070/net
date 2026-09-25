@@ -990,3 +990,35 @@ confirmed only by syntax checks and a standalone probe run until CI runs them.
   BROWSER-2/4–7, LEAF-7..11, LEAF-15, LEAF-17..25, CORE-5/6, SDK-5.
 
 — Audit repair, 2026-09-26.
+
+### 23.5 — Remaining items closed, and the un-audited rows (2026-09-26)
+
+The four "still open" items above are closed. The rows §23.2 left un-audited
+were then audited (read-only lanes, coordinator-reviewed): most hold, and the
+partial ones are repaired here.
+
+| Item | Status | Commit | Closure / witness |
+|---|---|---|---|
+| `wasm_anchorless` (red since `e865df329`) | FIXED | `f0c84acb4` | The witness drives a real same-org org call into a real `org_serve` responder, the only way a leaf answers nRPC. Its accounting names the one expected refusal: B's request-channel subscribe at A. Caller side: a refused reply-carrier subscription fails the calls waiting on it typed (`Refused{NotFound\|Unauthorized}`), not `Timeout` (`a_refused_reply_subscription_fails_its_waiting_calls_typed`). Local headless Chrome: 2/2 |
+| NODE-3 breadth | FIXED | `764e9d81c` | Forced-drop witnesses on the org SS and CS bridges (caller CANCEL) and the three public bridges (the call deadline: a public CANCEL only flips the token). Red (4 sink-side) with `JsHandleRelease::drop` disabled. The two CS rows are contract pins: the fold's input close refuses the pull too. Node roster 16; full `npm test` 747 green |
+| BROWSER-1 minor | NO CHANGE (analysis) | — | The byte-stream handle serves SS/DX only, whose `end` terminal carries an empty body by protocol; CS returns its body through `finish()`, which keeps an empty body. Nothing is lost |
+| LEAF-5 | RECORDED | — | Inside the same-origin trust model. The per-request, per-call and per-bridge ids are now unpredictable |
+| LEAF-21 | FIXED | `200e8771f` | Refusals under a live key send NO frame and are counted. The first repair's `call_id ^ 2^63` could name the caller's other live call, since a leaf seeds its stream table at `seed ^ 2^63`. Witnesses re-pinned |
+| LEAF-15 | FIXED | `200e8771f` | The stale-generation witness also requires `holds generation 1` |
+| LEAF-7..11, 17..20, 22..25 | HOLDS | — | Audited at HEAD |
+| DOCS-1/2 | FIXED | `617a2ba08` | The follower-local deadline surfaces as indeterminate (`rpc-indeterminate`), never `org:rpc:timeout`. The kind is mapped from the wire status and tracks the cause because only the engine mints 0x0003/0x0005 |
+| DOCS-5 | FIXED | `617a2ba08` | Every citation of a deleted receipt names its deleting commit and the parent to read it at. R4COREFIX.md's promised hash table now exists |
+| Handler-code band | DOCUMENTED | `617a2ba08` | `net_org.h` (comments only), the Go and Python handler docs, and nrpc.md's retry note |
+| C sample | FIXED | `617a2ba08` | `net_org_set_callback_free` plus the dispatcher are wired once at init, before any clone exists |
+| DOCS-3/4, FFI-1, CORE-5/6, SDK-5 | HOLDS | — | Audited at HEAD |
+| VEC-4/6/10 floors | FIXED | `617a2ba08` | Node cross-lang floor 119 → 134, Python 119 → 137, the provider-role and mixed_pair rows pinned. The Python org fixture readers decode UTF-8 (on Windows, cp1252 failed four byte pins) |
+| BROWSER-5 roster | FIXED | `617a2ba08` | `org_read_timeout_never_drops_items` is in the rtc REQUIRED roster |
+| BROWSER-2 residue | FIXED | `8ec499242` | `resource-exhausted` in `OrgRetireReason`. The org:rpc test is driven by `error_vectors.json`. The sink wording and retire spellings are pinned leaf ↔ TS (`ts_abi_fixture.rs`). The rtc witnesses 26 and 34 assert `OrgCancelledError` |
+| Proxy retire parity (found while repairing BROWSER-2) | FIXED | `8ec499242` | A proxied call's retire terminal crossed the envelope in the frozen `retired()` text, turning `ResourceExhausted` into `Cancelled` at the follower. It now carries `RetireReason::as_str`, decoded by `from_proxy_text` (natively tested round trip) |
+| BROWSER-4/6/7, VEC-1..3/5/7..9 | HOLDS | — | Audited at HEAD |
+
+**Unverified locally, so CI is their first run:** the real-browser rtc
+harness (witnesses 26/34 and the roster), Go, the Python binding suite beyond
+the vector files, and the sdk-ts consumer program.
+
+— Remaining-items close-out, 2026-09-26.
