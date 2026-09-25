@@ -1,0 +1,34 @@
+net/crates/net/bindings/go/rpc-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_6a739516f08624 41
+  s_d8b00bedd146e9::t_ec609aa82a7d57 3
+.claude/skills/net-browser/SKILL.md
+  s_7587706a246770::t_8ed763ca15bf1b 7-8
+net/crates/net/tests/feature_consumer/Cargo.lock
+  s_d8b00bedd146e9::t_f8793f8dd30951 1177,1228
+net/crates/net/bindings/go/meshos-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_f48a1e0b9d84e4 3,31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "34616d820831d05ce278df469d3707abb3cdf83e",
+  "prompts": {},
+  "sessions": {
+    "s_7587706a246770": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "646541ea-302a-45a7-8364-07a8dac2c81e",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
