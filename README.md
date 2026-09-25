@@ -8,7 +8,10 @@
 [![Go](https://pkg.go.dev/badge/github.com/ai-2070/net/go.svg)](https://pkg.go.dev/github.com/ai-2070/net/go)
 [![codecov](https://codecov.io/gh/ai-2070/net/graph/badge.svg?token=AOBMOF6LE4)](https://codecov.io/gh/ai-2070/net)
 
-**Net connects agents, services, and devices into a programmable mesh.**
+**Net is what the internet would look like if it were built today** — the Net from the Cyberpunk
+universe, built for real machines. A flat, latency-first, end-to-end encrypted mesh where every
+agent, service, and device is an equal node: no clients, no servers, no coordinators. The mesh
+propagates state, not connections.
 
 You find what another machine can do, call it through typed RPC, and move artifacts between
 participants — while whoever owns a resource keeps control of access. Identity, discovery,
@@ -71,9 +74,9 @@ npx -y opensrc@latest path ai-2070/net
 
 Full install options: [Claude Skills](https://ai2070.net/docs/start/claude-skills).
 
-## Hello, mesh
+## Chippin' In
 
-Start a node and put one event on it.
+Start a mesh node and put one event on it.
 
 ```rust
 use net_sdk::Net;
@@ -352,10 +355,11 @@ behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/m
 
 ## Origin
 
-Net is loosely inspired by the Net from *Cyberpunk 2077* — a flat, encrypted mesh where every
-device is a first-class node. Not affiliated with CD Projekt Red or R. Talsorian Games; this is
-an engineering take on the concept, not a licensed adaptation. Implementation details, the module
-map, and code examples live in the [crate README](net/crates/net/README.md).
+Net (Network Event Transport) is loosely inspired by the Net from the Cyberpunk universe — a
+flat, encrypted mesh where every device is a first-class node. Not affiliated with CD Projekt Red
+or R. Talsorian Games; this is an engineering take on the concept, not a licensed adaptation.
+Implementation details, the module map, and code examples live in the
+[crate README](net/crates/net/README.md).
 
 ## License
 
