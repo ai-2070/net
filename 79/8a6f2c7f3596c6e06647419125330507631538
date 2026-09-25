@@ -1,0 +1,61 @@
+net/crates/net/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 26-32,35
+net/crates/net/sdk/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+.github/scripts/check-skills.sh
+  s_d8b00bedd146e9::t_af4a3e27c1a205 57-60
+net/crates/net/cli/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/aggregator-daemon/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/bindings/go/mcp-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/bindings/go/rpc-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_ca925b465c33df 3
+net/crates/net/bindings/go/org-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/wire/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/sdk-macros/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/payments/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/adapters/mcp/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_825ab417002ad7 3903-3914
+net/crates/net/bindings/go/meshos-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+.github/scripts/check-versions.py
+  s_d8b00bedd146e9::t_21c01e77734665 1-251
+net/crates/net/bindings/python/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/deck/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/bindings/go/deck-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/bindings/go/net-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/bindings/go/meshdb-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+net/crates/net/bindings/node/Cargo.toml
+  s_d8b00bedd146e9::t_8a97f4a35763ff 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "798a6f2c7f3596c6e06647419125330507631538",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
