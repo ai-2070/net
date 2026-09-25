@@ -31,9 +31,9 @@
 
 use net::adapter::net::behavior::org::{OrgError, OrgKeypair, OrgMembershipCert};
 use net::adapter::net::behavior::org_call::{
-    OrgCallProof, OrgStreamCallProof, MAX_ORG_CALL_PROOF_BYTES, ORG_CALL_BINDING_CONTEXT,
-    ORG_STREAM_CALL_BINDING_CONTEXT, STREAM_CALL_KIND_CLIENT_STREAMING, STREAM_CALL_KIND_DUPLEX,
-    STREAM_CALL_KIND_SERVER_STREAMING,
+    CallBinding, OrgCallProof, OrgStreamCallProof, StreamCallBinding, MAX_ORG_CALL_PROOF_BYTES,
+    ORG_CALL_BINDING_CONTEXT, ORG_STREAM_CALL_BINDING_CONTEXT, STREAM_CALL_KIND_CLIENT_STREAMING,
+    STREAM_CALL_KIND_DUPLEX, STREAM_CALL_KIND_SERVER_STREAMING,
 };
 use net::adapter::net::behavior::org_grant::{
     CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope, OrgCapabilityGrant,
@@ -274,6 +274,81 @@ fn build_proofs(frozen: &Frozen, access: Access, kind: u8) -> (OrgCallProof, Org
     (unary, stream)
 }
 
+/// The signed transcript widths (unary, stream), derived from the
+/// codec's OWN binding structs (VEC-9). The destructures are
+/// exhaustive over what `transcript_hash` concatenates: a field
+/// added, removed or re-sized there breaks THIS example's build (or
+/// moves the number) instead of leaving the fixture's layout metadata
+/// silently stale.
+fn transcript_widths(frozen: &Frozen) -> (usize, usize) {
+    let (unary, stream) = build_proofs(frozen, Access::Granted, STREAM_CALL_KIND_SERVER_STREAMING);
+    let CallBinding {
+        acting_org,
+        caller,
+        provider_org,
+        callee,
+        call_id,
+        capability,
+        proof_expires_at_unix_ns,
+        membership_digest,
+        dispatcher_grant_digest,
+        capability_grant_digest,
+        request_digest,
+    } = unary.binding_for_verify(
+        org_b().org_id(),
+        provider_entity(),
+        CALL_ID,
+        CapabilityAuthorityId::for_tag(CAPABILITY_TAG),
+        REQUEST_DIGEST,
+    );
+    let unary_width = acting_org.as_bytes().len()
+        + caller.as_bytes().len()
+        + provider_org.as_bytes().len()
+        + callee.as_bytes().len()
+        + call_id.to_le_bytes().len()
+        + capability.as_bytes().len()
+        + proof_expires_at_unix_ns.to_le_bytes().len()
+        + membership_digest.len()
+        + dispatcher_grant_digest.len()
+        + capability_grant_digest.len()
+        + request_digest.len();
+    let StreamCallBinding {
+        acting_org,
+        caller,
+        provider_org,
+        callee,
+        call_id,
+        capability,
+        proof_expires_at_unix_ns,
+        membership_digest,
+        dispatcher_grant_digest,
+        capability_grant_digest,
+        request_digest,
+        kind,
+        session_binding,
+    } = stream.binding_for_stream_verify(
+        org_b().org_id(),
+        provider_entity(),
+        CALL_ID,
+        CapabilityAuthorityId::for_tag(CAPABILITY_TAG),
+        REQUEST_DIGEST,
+    );
+    let stream_width = acting_org.as_bytes().len()
+        + caller.as_bytes().len()
+        + provider_org.as_bytes().len()
+        + callee.as_bytes().len()
+        + call_id.to_le_bytes().len()
+        + capability.as_bytes().len()
+        + proof_expires_at_unix_ns.to_le_bytes().len()
+        + membership_digest.len()
+        + dispatcher_grant_digest.len()
+        + capability_grant_digest.len()
+        + request_digest.len()
+        + std::mem::size_of_val(&kind)
+        + session_binding.len();
+    (unary_width, stream_width)
+}
+
 /// Postcard serializes `call_binding_sig` as bytes-with-length: 1 length byte
 /// + 64 signature bytes (the in-core `SIG_WIRE` arithmetic).
 const SIG_WIRE: usize = 65;
@@ -465,7 +540,7 @@ fn render_streaming_opening_vectors() -> String {
     // A signature-level rejection: the envelope decodes, but the call binding
     // refuses it. Decode success must never become verify success.
     let mut sig_flipped = base.clone();
-    let sig_at = sig_flipped.len() - STREAM_SUFFIX - SIG_WIRE + 1; // past the 0x41 length byte
+    let sig_at = sig_flipped.len() - STREAM_SUFFIX - SIG_WIRE + 1; // past the 0x40 length byte
     sig_flipped[sig_at] ^= 0xFF;
     let (_, flipped_proof) = (
         (),
@@ -495,6 +570,17 @@ fn render_streaming_opening_vectors() -> String {
         "expect_verify_error_display": verify_err,
     });
 
+    // The layout sizes are DERIVED from the codec and the frozen
+    // chain's real bytes (VEC-9) — hand-typed numbers here went
+    // stale silently because no row checked them and no suite read
+    // them. `transcript_widths` destructures the signed bindings
+    // exhaustively, so a codec transcript change breaks THIS
+    // example's build instead of staling the metadata.
+    let membership_wire_size = frozen.membership_a.len();
+    let dispatcher_grant_wire_size = frozen.dispatcher_a.len();
+    let capability_grant_wire_size = frozen.grant_b_to_a.len();
+    let (unary_transcript_width, stream_transcript_width) = transcript_widths(&frozen);
+
     let doc = json!({
         "description": "S4Vectors — the org streaming OPENING envelope + the frozen `org:` error vocabulary, byte-exact, for cross-language conformance. Each `wire_*` pin carries the SAME bytes in two encodings (`wire_hex`/`wire_base64` over the envelope bytes, or over the `wire` string's UTF-8 bytes) plus `wire_len`: a runtime MUST recover identical bytes from both encodings before any other handling of a vector (the byte-for-byte pin — a decoder that mangles either side disagrees with the fixture and must not become success). u64 values travel as decimal STRINGS (`call_id`, `proof_expires_at_unix_ns`) and MUST round-trip exactly. GENERATED — do not hand-edit; run `cargo run -p net-mesh-sdk --features net,cortex,fixtures --example gen_org_error_fixtures`.",
         "version": 1,
@@ -502,16 +588,16 @@ fn render_streaming_opening_vectors() -> String {
         "layout": {
             "unary_transcript_context": ORG_CALL_BINDING_CONTEXT,
             "stream_transcript_context": ORG_STREAM_CALL_BINDING_CONTEXT,
-            "unary_transcript_width": 304,
-            "stream_transcript_width": 337,
+            "unary_transcript_width": unary_transcript_width,
+            "stream_transcript_width": stream_transcript_width,
             "admission_header": "net-org-admission",
             "stream_suffix_len": STREAM_SUFFIX,
             "session_binding_len": 32,
             "signature_wire_len": SIG_WIRE,
             "max_proof_bytes": MAX_ORG_CALL_PROOF_BYTES,
-            "membership_wire_size": 156,
-            "dispatcher_grant_wire_size": 185,
-            "capability_grant_wire_size": 318,
+            "membership_wire_size": membership_wire_size,
+            "dispatcher_grant_wire_size": dispatcher_grant_wire_size,
+            "capability_grant_wire_size": capability_grant_wire_size,
             "kind_values": {
                 "never_emitted": 0,
                 "server_streaming": STREAM_CALL_KIND_SERVER_STREAMING,

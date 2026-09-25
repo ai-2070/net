@@ -366,6 +366,46 @@
         "wire": "org:rpc:cancelled: rpc: call cancelled by caller",
         "wire_base64": "b3JnOnJwYzpjYW5jZWxsZWQ6IHJwYzogY2FsbCBjYW5jZWxsZWQgYnkgY2FsbGVy",
         "wire_len": 48
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "server_error",
+        "wire": "org:rpc:server_error: rpc: server returned status 0x0006: the handler failed",
+        "wire_base64": "b3JnOnJwYzpzZXJ2ZXJfZXJyb3I6IHJwYzogc2VydmVyIHJldHVybmVkIHN0YXR1cyAweDAwMDY6IHRoZSBoYW5kbGVyIGZhaWxlZA==",
+        "wire_len": 76
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "transport",
+        "wire": "org:rpc:transport: rpc: transport: connection error: the peer session dropped",
+        "wire_base64": "b3JnOnJwYzp0cmFuc3BvcnQ6IHJwYzogdHJhbnNwb3J0OiBjb25uZWN0aW9uIGVycm9yOiB0aGUgcGVlciBzZXNzaW9uIGRyb3BwZWQ=",
+        "wire_len": 77
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "codec_encode",
+        "wire": "org:rpc:codec_encode: rpc: codec (Encode): the request did not serialize",
+        "wire_base64": "b3JnOnJwYzpjb2RlY19lbmNvZGU6IHJwYzogY29kZWMgKEVuY29kZSk6IHRoZSByZXF1ZXN0IGRpZCBub3Qgc2VyaWFsaXpl",
+        "wire_len": 72
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "codec_decode",
+        "wire": "org:rpc:codec_decode: rpc: codec (Decode): the reply did not deserialize",
+        "wire_base64": "b3JnOnJwYzpjb2RlY19kZWNvZGU6IHJwYzogY29kZWMgKERlY29kZSk6IHRoZSByZXBseSBkaWQgbm90IGRlc2VyaWFsaXpl",
+        "wire_len": 72
+      },
+      {
+        "domain": "rpc",
+        "is_local": false,
+        "kind": "capability_denied",
+        "wire": "org:rpc:capability_denied: rpc: capability denied: target 0xdead does not authorize nrpc:customer.read",
+        "wire_base64": "b3JnOnJwYzpjYXBhYmlsaXR5X2RlbmllZDogcnBjOiBjYXBhYmlsaXR5IGRlbmllZDogdGFyZ2V0IDB4ZGVhZCBkb2VzIG5vdCBhdXRob3JpemUgbnJwYzpjdXN0b21lci5yZWFk",
+        "wire_len": 102
       }
     ],
     "version": 1

@@ -220,8 +220,8 @@ func TestStreamingOpeningVectors_Shape(t *testing.T) {
 		t.Fatalf("opening/rejects/sig_rejects = %d/%d/%d, want 6/8/1",
 			len(v.OpeningVectors), len(v.DecoderRejects), len(v.SignatureRejects))
 	}
-	if len(v.ErrorVocabulary.Vectors) != 24 || len(v.ErrorVocabulary.UnclassifiedCases) != 4 {
-		t.Fatalf("vocab/unclassified = %d/%d, want 24/4",
+	if len(v.ErrorVocabulary.Vectors) != 29 || len(v.ErrorVocabulary.UnclassifiedCases) != 4 {
+		t.Fatalf("vocab/unclassified = %d/%d, want 29/4",
 			len(v.ErrorVocabulary.Vectors), len(v.ErrorVocabulary.UnclassifiedCases))
 	}
 	if v.Layout.StreamSuffixLen != 33 || v.Layout.SignatureWireLen != 65 || v.Layout.MaxProofBytes != 1024 {

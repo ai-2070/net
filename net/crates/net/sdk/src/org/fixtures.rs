@@ -124,12 +124,35 @@ fn samples() -> Vec<OrgSdkError> {
         OrgSdkError::AdmissionDenied(CoarseAdmissionReason::NotSupported),
         OrgSdkError::AdmissionDenied(CoarseAdmissionReason::Unavailable),
         // ---- rpc (transport / non-admission server failure) ----
+        // ONE row per frozen nRPC kind (`rpc_wire_kind`), so the
+        // fixture covers the whole `org:rpc:` vocabulary every
+        // binding's classifier must type.
         OrgSdkError::Rpc(net::adapter::net::mesh_rpc::RpcError::Timeout { elapsed_ms: 5000 }),
         OrgSdkError::Rpc(net::adapter::net::mesh_rpc::RpcError::NoRoute {
             target: 0xDEAD,
             reason: "no path".to_string(),
         }),
         OrgSdkError::Rpc(net::adapter::net::mesh_rpc::RpcError::Cancelled),
+        OrgSdkError::Rpc(net::adapter::net::mesh_rpc::RpcError::ServerError {
+            status: 0x0006,
+            message: "the handler failed".to_string(),
+            headers: vec![],
+        }),
+        OrgSdkError::Rpc(net::adapter::net::mesh_rpc::RpcError::Transport(
+            net::error::AdapterError::Connection("the peer session dropped".to_string()),
+        )),
+        OrgSdkError::Rpc(net::adapter::net::mesh_rpc::RpcError::Codec {
+            direction: net::adapter::net::mesh_rpc::CodecDirection::Encode,
+            message: "the request did not serialize".to_string(),
+        }),
+        OrgSdkError::Rpc(net::adapter::net::mesh_rpc::RpcError::Codec {
+            direction: net::adapter::net::mesh_rpc::CodecDirection::Decode,
+            message: "the reply did not deserialize".to_string(),
+        }),
+        OrgSdkError::Rpc(net::adapter::net::mesh_rpc::RpcError::CapabilityDenied {
+            target: 0xDEAD,
+            capability: "customer.read".to_string(),
+        }),
     ]
 }
 

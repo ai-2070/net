@@ -408,7 +408,15 @@ export class OrgIndeterminateError extends OrgStreamError {
   }
 }
 
-/** The application refused the call. `status` is its status code. */
+/**
+ * The application refused the call. `status` is its status code.
+ *
+ * Also the frozen wire kinds `server_error` (a server-answered failure
+ * status — the vocabulary's second name for this same condition) and
+ * `capability_denied` (the capability gate's refusal of the call): a
+ * re-typed wire string carries no recoverable `status` (`0`) and its
+ * `message` keeps the detail verbatim.
+ */
 export class OrgRefusedError extends OrgStreamError {
   readonly kind = 'org-refused' as const;
 
@@ -425,7 +433,9 @@ export class OrgRefusedError extends OrgStreamError {
  * The boundary failed internally. Also what a terminal item whose
  * `kind` this build does not know becomes: mis-typing a failure is the
  * exact mistake this taxonomy exists to prevent, so an unknown kind is
- * named internal rather than guessed into a merits bucket.
+ * named internal rather than guessed into a merits bucket. The frozen
+ * wire kinds `no_route` and `transport` land here for the same reason:
+ * they carry no merits verdict (nobody refused the call).
  */
 export class OrgInternalError extends OrgStreamError {
   readonly kind = 'org-internal' as const;
@@ -436,7 +446,12 @@ export class OrgInternalError extends OrgStreamError {
   }
 }
 
-/** The reply or item did not decode. */
+/**
+ * The reply or item did not decode. Also the frozen wire kinds
+ * `codec_encode` / `codec_decode` — the one codec class, both
+ * directions: an item that did not survive the codec is malformed
+ * whichever side failed.
+ */
 export class OrgMalformedError extends OrgStreamError {
   readonly kind = 'org-malformed' as const;
 
@@ -471,6 +486,29 @@ export type OrgRetireReason =
  * same observable. The verdict itself is what `retired` reports.
  */
 export const ORG_SINK_CLOSED_REFUSAL = 'org: the response sink is closed: the call was retired';
+
+/**
+ * The upload sink's spelling of the SAME typed closed refusal —
+ * `sink_error(SinkError::Closed, "the upload sink")` at the leaf —
+ * pinned verbatim like {@link ORG_SINK_CLOSED_REFUSAL}. One text per
+ * sink, one text per verdict: what the leaf's `sink_error` spells is
+ * exactly this family, and anything outside it is not a closed refusal.
+ */
+export const ORG_UPLOAD_SINK_CLOSED_REFUSAL =
+  'org: the upload sink is closed: the call was retired';
+
+/**
+ * The byte-budget closed refusals — `sink_error(SinkError::ResourceExhausted, ..)`
+ * for the response sink and the upload sink. The item overran the
+ * call's byte budget and the call retired as `ResourceExhausted`,
+ * whose precise observable is the `admission-denied` / `unavailable`
+ * denial (the leaf's frozen map; C4, coarse `Unavailable`) — so these
+ * re-type as exactly that, never as a cancel.
+ */
+export const ORG_SINK_BUDGET_REFUSAL =
+  "org: the response sink is closed: the call's byte budget refused the item and retired the call";
+export const ORG_UPLOAD_SINK_BUDGET_REFUSAL =
+  "org: the upload sink is closed: the call's byte budget refused the item and retired the call";
 
 const ORG_WIRE_PREFIX = 'org:';
 
@@ -593,13 +631,27 @@ export function orgRetireReason(raw: string): OrgRetireReason {
  * The domains and kind tokens mirror `classifyOrgError` from the Node
  * binding where names coincide; the `rpc` domain reuses the frozen
  * nRPC kind vocabulary rather than minting second names for the same
- * conditions.
+ * conditions. Every frozen `org:rpc:` kind classifies (the frozen
+ * wire-kind map at the `rpc` switch) — a binding that returned `null`
+ * there forced the caller into `UnknownLeafError`, which is the
+ * cross-language drift this closes.
  */
 export function parseOrgError(message: string): OrgStreamError | null {
-  // The handler-side sink's typed closed refusal comes first: it
-  // starts with the wire prefix but is prose, not `org:<domain>:<kind>`.
-  if (message.startsWith('org: the response sink is closed:')) {
+  // `sink_error`'s closed-refusal family comes first: it starts with
+  // the wire prefix but is prose, not `org:<domain>:<kind>`. BOTH
+  // verdict texts, for EVERY sink the leaf spells (the upload sink,
+  // the response sink) — the wording is pinned in the
+  // `ORG_*_REFUSAL` constants and the match is generic in the sink
+  // name only. The closed refusal is one text whatever the verdict
+  // (the verdict itself is what `retired` reports) → cancelled.
+  if (/^org: .+ is closed: the call was retired$/.test(message)) {
     return new OrgCancelledError(message);
+  }
+  // The byte-budget refusal retires the call as `ResourceExhausted`,
+  // whose precise observable is `admission-denied` / `unavailable`
+  // (the leaf's frozen map) — typed as exactly that denial.
+  if (/^org: .+ is closed: the call's byte budget refused the item and retired the call$/.test(message)) {
+    return new OrgAdmissionDeniedError('unavailable', message);
   }
   if (message.startsWith(ORG_WIRE_PREFIX)) {
     const rest = message.slice(ORG_WIRE_PREFIX.length);
@@ -614,6 +666,12 @@ export function parseOrgError(message: string): OrgStreamError | null {
       return new OrgAdmissionDeniedError(coarseAdmissionReason(token), message);
     }
     if (domain !== 'rpc') return null;
+    // The frozen `org:rpc:` wire-kind map — EVERY kind `rpc_wire_kind`
+    // (and the terminal seam's spellings) can emit classifies here, in
+    // lockstep with node's `classifyOrgError`. Classification is by
+    // TOKEN ONLY: the detail is human-facing and never parsed for
+    // semantics, so fields the wire string does not carry keep their
+    // zero value and `message` keeps the detail verbatim.
     switch (token) {
       case 'revoked':
         return new OrgRevokedError(message);
@@ -629,11 +687,27 @@ export function parseOrgError(message: string): OrgStreamError | null {
         return new OrgSessionLostError(message);
       case 'indeterminate':
         return new OrgIndeterminateError(0, message);
+      // `server_error` is the frozen vocabulary's second name for the
+      // condition `refused` names (a server-answered failure status),
+      // and `capability_denied` is the capability gate's refusal of
+      // the call — both land in the refusal class, with no status the
+      // wire string carries.
       case 'refused':
+      case 'server_error':
+      case 'capability_denied':
         return new OrgRefusedError(0, message);
+      // The codec family: an item that did not survive the codec is
+      // malformed whichever direction failed.
       case 'malformed':
+      case 'codec_encode':
+      case 'codec_decode':
         return new OrgMalformedError(message);
+      // `no_route` / `transport` carry NO merits verdict — nobody
+      // refused the call — so they take the taxonomy's non-merits
+      // bucket and are never guessed into refused/admission.
       case 'internal':
+      case 'no_route':
+      case 'transport':
         return new OrgInternalError(message);
       default:
         return null;

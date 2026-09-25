@@ -123,11 +123,11 @@ describe('org streaming opening vectors (cross-language fixture)', () => {
     expect(fixture.opening_vectors.length).toBe(6)
     expect(fixture.decoder_rejects.length).toBe(8)
     expect(fixture.signature_rejects.length).toBe(1)
-    expect(fixture.error_vocabulary.vectors.length).toBe(24)
+    expect(fixture.error_vocabulary.vectors.length).toBe(29)
     expect(fixture.error_vocabulary.unclassified_cases.length).toBe(4)
   })
 
-  // ---- byte-for-byte pin: one row per EVERY vector (43 rows) ----
+  // ---- byte-for-byte pin: one row per EVERY vector (48 rows) ----
   interface ByteRow {
     src: string
     srcEnc: 'hex' | 'utf8'
@@ -239,10 +239,10 @@ describe('org streaming opening vectors (cross-language fixture)', () => {
   }
   const rejectRows: [string, RejectRow][] = [
     ...fixture.decoder_rejects.map(
-      (r) => [`as-provider-reject-${r.id.replace(/^reject\./, '')}`, { ...r, section: 'decoder' as const }],
+      (r): [string, RejectRow] => [`as-provider-reject-${r.id.replace(/^reject\./, '')}`, { ...r, section: 'decoder' as const }],
     ),
     ...fixture.signature_rejects.map(
-      (r) => [`as-provider-reject-${r.id.replace(/^reject\./, '')}`, { ...r, section: 'signature' as const }],
+      (r): [string, RejectRow] => [`as-provider-reject-${r.id.replace(/^reject\./, '')}`, { ...r, section: 'signature' as const }],
     ),
   ]
   it.each(rejectRows)('%s', (_title, rej) => {
@@ -293,7 +293,7 @@ describe('org streaming opening vectors (cross-language fixture)', () => {
     }
   })
 
-  // ---- vocabulary rows: classifier recovery (24 rows) ----
+  // ---- vocabulary rows: classifier recovery (29 rows) ----
   const classifyRows: [string, VocabVector][] = fixture.error_vocabulary.vectors.map((v) => [
     `as-caller-classify-${v.domain}.${v.kind}`,
     v,
@@ -307,7 +307,7 @@ describe('org streaming opening vectors (cross-language fixture)', () => {
     expect(err.isLocal).toBe(v.is_local)
   })
 
-  // ---- vocabulary rows: `org:` grammar (24 rows) ----
+  // ---- vocabulary rows: `org:` grammar (29 rows) ----
   const grammarRows: [string, VocabVector][] = fixture.error_vocabulary.vectors.map((v) => [
     `as-provider-grammar-${v.domain}.${v.kind}`,
     v,

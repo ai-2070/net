@@ -56,13 +56,13 @@ _FULL_ID = re.compile(r"[0-9a-f]{64}")
 
 # The 65-byte signature field is Postcard's bytes-with-length: 1 length byte
 # (0x40 = varint 64) + the 64-byte signature. The frozen fixture carries 0x40
-# in every wire; the generator's "0x41 length byte" comment is stale.
+# in every wire, matching the generator's comment on the flipped byte.
 _SIG_LEN_BYTE = 0x40
 
 
 def _byte_rows() -> list[tuple[str, dict]]:
-    """(row label, vector) for every vector carrying ``wire_*`` pins: 43 rows
-    (6 opening + 8 decoder rejects + 1 signature reject + 24 vocabulary +
+    """(row label, vector) for every vector carrying ``wire_*`` pins: 48 rows
+    (6 opening + 8 decoder rejects + 1 signature reject + 29 vocabulary +
     4 unclassified)."""
     rows = [(v["id"], v) for v in _OPENINGS + _REJECTS]
     rows += [(f"vocab-{v['domain']}.{v['kind']}", v) for v in _VOCAB]
@@ -81,7 +81,7 @@ def test_fixture_has_the_expected_shape() -> None:
     assert len(doc["opening_vectors"]) == 6
     assert len(doc["decoder_rejects"]) == 8
     assert len(doc["signature_rejects"]) == 1
-    assert len(doc["error_vocabulary"]["vectors"]) == 24
+    assert len(doc["error_vocabulary"]["vectors"]) == 29
     assert len(doc["error_vocabulary"]["unclassified_cases"]) == 4
 
 

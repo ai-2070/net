@@ -24,7 +24,10 @@ import {
   OrgSessionLostError,
   OrgStreamError,
   OrgTimeoutError,
+  ORG_SINK_BUDGET_REFUSAL,
   ORG_SINK_CLOSED_REFUSAL,
+  ORG_UPLOAD_SINK_BUDGET_REFUSAL,
+  ORG_UPLOAD_SINK_CLOSED_REFUSAL,
   orgRetireError,
   orgRetireReason,
   orgTerminalError,
@@ -198,6 +201,73 @@ describe('the org terminal vocabulary (plan §4.3)', () => {
     // bucket.
     expect(parseOrgError('org:credentials:nope')).toBeNull();
     expect(fromWasmError(new Error('org:credentials:nope'))).not.toBeInstanceOf(OrgStreamError);
+  });
+
+  it('classifies the FULL frozen org:rpc kind set (§11 cross-language drift)', () => {
+    // The exact `wire` strings `error_vectors.json` pins for the rpc
+    // domain — the frozen nRPC kind vocabulary. Classification is by
+    // TOKEN ONLY (the detail is human-facing), and the detail travels
+    // verbatim in `message`. Pre-drift-fix these six frozen kinds
+    // returned null and fell through to `UnknownLeafError` while
+    // node's `classifyOrgError` typed every one of them.
+    const rows: Array<[string, OrgErrorKind]> = [
+      ['org:rpc:timeout: rpc: timeout after 5000ms', 'org-timeout'],
+      ['org:rpc:cancelled: rpc: call cancelled by caller', 'org-cancelled'],
+      [
+        'org:rpc:server_error: rpc: server returned status 0x0006: the handler failed',
+        'org-refused',
+      ],
+      [
+        'org:rpc:capability_denied: rpc: capability denied: target 0xdead does not authorize nrpc:customer.read',
+        'org-refused',
+      ],
+      ['org:rpc:codec_encode: rpc: codec (Encode): the request did not serialize', 'org-malformed'],
+      ['org:rpc:codec_decode: rpc: codec (Decode): the reply did not deserialize', 'org-malformed'],
+      ['org:rpc:no_route: rpc: no route to target 0xdead: no path', 'org-internal'],
+      [
+        'org:rpc:transport: rpc: transport: connection error: the peer session dropped',
+        'org-internal',
+      ],
+    ];
+    for (const [wire, kind] of rows) {
+      const typed = parseOrgError(wire);
+      expect(typed, wire).toBeInstanceOf(OrgStreamError);
+      expect(typed?.kind, wire).toBe(kind);
+      // The doctrine of this taxonomy: `message` is the boundary's
+      // own text, verbatim.
+      expect(typed?.message, wire).toBe(wire);
+    }
+  });
+
+  it('every sink_error closed-refusal text re-types — upload sinks included (BROWSER-2)', () => {
+    // THE pinned family, one text per sink per verdict — what the
+    // leaf's `sink_error` spells. Pre-fix only the response sink's
+    // closed refusal typed; the upload sink's texts (and both
+    // byte-budget texts) fell through to `UnknownLeafError`.
+    for (const text of [ORG_SINK_CLOSED_REFUSAL, ORG_UPLOAD_SINK_CLOSED_REFUSAL]) {
+      const typed = fromWasmError(new Error(text));
+      expect(typed, text).toBeInstanceOf(OrgCancelledError);
+      expect(typed.message, text).toBe(text);
+    }
+    // The byte-budget refusal's precise observable is the
+    // `admission-denied` / `unavailable` denial (the leaf's frozen
+    // `ResourceExhausted` map) — never a cancel.
+    for (const text of [ORG_SINK_BUDGET_REFUSAL, ORG_UPLOAD_SINK_BUDGET_REFUSAL]) {
+      const typed = fromWasmError(new Error(text));
+      expect(typed, text).toBeInstanceOf(OrgAdmissionDeniedError);
+      expect((typed as OrgAdmissionDeniedError).coarse, text).toBe('unavailable');
+      expect(typed.message, text).toBe(text);
+    }
+  });
+
+  it('the closed-refusal typing is generic in the sink name, exact in the verdict wording', () => {
+    // Every `sink_error` closed refusal re-types whatever the sink
+    // the leaf names…
+    expect(parseOrgError('org: the banana sink is closed: the call was retired')).toBeInstanceOf(
+      OrgCancelledError,
+    );
+    // …but a different verdict wording is NOT the typed refusal.
+    expect(parseOrgError('org: the upload sink is closed: something else happened')).toBeNull();
   });
 
   it('every retire verdict maps onto the terminal vocabulary', () => {
