@@ -10,10 +10,13 @@
 //! empty service, over-cap fields) and accept exactly what core
 //! accepts (empty header values, empty bodies, unknown dispatches).
 //!
-//! Every assertion below is either a concrete byte vector written by
-//! hand (never through the codec under test) or an exact error
+//! Most assertions below are either a concrete byte vector written
+//! by hand (never through the codec under test) or an exact error
 //! identity (`LeafError::Rpc(RpcError::Malformed(msg))` with the
-//! message compared). No "does not panic" passes.
+//! message compared). The five `*_round_trips_*` witnesses are the
+//! documented exception: they build their payloads by hand but
+//! assert encode→decode symmetry (a field-faithful round trip plus
+//! `encoded_len`), not a byte pin. No "does not panic" passes.
 
 use bytes::Bytes;
 use net_leaf::rpc_wire::*;
