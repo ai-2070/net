@@ -55,7 +55,7 @@ net-mesh-wire = { path = "../wire", features = ["webrtc"] }
 bytes = "1"
 # Pinned to the installed `wasm-bindgen-cli`; a mismatch is a hard
 # error at bindgen time, so the version is exact here and in CI.
-wasm-bindgen = "=0.2.128"
+wasm-bindgen = "=0.2.129"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 tracing = "0.1"
