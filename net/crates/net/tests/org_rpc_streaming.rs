@@ -5479,3 +5479,535 @@ async fn early_handler_return_refuses_late_input_without_resource_exhausted() {
         );
     }
 }
+
+// ===========================================================================
+// Repair pass — the CODE_REVIEW_2026_09_24_ORG_STREAMING witnesses (WIRE-1,
+// SDK-2, SDK-1). WIRE-1 drives the REAL serve bridge
+// (`ServeHandle::inject_inbound_for_test` = the dispatcher's exact hand-off)
+// and reuses the wiring tests' independent handshake-binding capture as its
+// oracle; SDK-2/SDK-1 drive the REAL caller-side verbs over a live pair and
+// read the caller's terminal surface — the exact folds the findings name.
+// The cancel token here is `MeshNode::cancel(token)`, which `OrgClient::cancel`
+// forwards to verbatim (`self.node.cancel(token)`).
+// ===========================================================================
+
+use futures::StreamExt;
+use net::adapter::net::cortex::rpc::{
+    RequestStream, RpcDuplexHandler, RpcHandlerError, RpcResponseSink,
+};
+use net::adapter::net::cortex::RpcStreamingContext;
+use net::adapter::net::mesh_rpc::RpcError;
+use std::time::Instant;
+
+/// A duplex handler that enters and parks forever — the live-call fixture
+/// for the cancel and deadline witnesses (the call is only ever ended by
+/// the mechanism under test).
+struct ParkForeverDx {
+    started: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl RpcDuplexHandler for ParkForeverDx {
+    async fn call(
+        &self,
+        _ctx: RpcStreamingContext,
+        _requests: RequestStream,
+        _responses: RpcResponseSink,
+    ) -> Result<(), RpcHandlerError> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+/// WIRE-1 — a re-handshake displacing the carrying session while its
+/// opening sits in the bridge queue: the drained opening is REFUSED (the
+/// stale-incarnation gate), leaves ZERO registry effects (nothing that
+/// could leak past a retire — the record never exists), and the honest
+/// single-session path still admits.
+///
+/// The pre-fix behavior this reddens: `admit_and_dispatch_protected_stream`
+/// fused TWO session incarnations into the registry record
+/// (`session_id: inbound.session_id` = the CARRYING one, `establishment:
+/// mesh.peer_session_binding()` = the LIVE one) and admitted regardless, so
+/// the deliberately-realized window — a peer signing the opening over the
+/// NEW handshake's binding and riding it under the OLD session id —
+/// produced a `(A_id, B_binding)` record that matched neither the
+/// already-executed A retire nor any future B retire: a quota-charged
+/// zombie that survived every session replacement and dead-peer sweep.
+#[tokio::test]
+async fn displaced_carrier_opening_is_refused_and_leaks_no_registry_record() {
+    // The pair's roles are asymmetric ON PURPOSE (the
+    // `response_after_session_replacement_reaches_only_the_live_session`
+    // idiom): `accept()` is only legal before `start()`, so the RESPONDER
+    // (the server) never starts and every re-handshake is legal — while the
+    // CALLER runs its dispatch loop so the denial is RECORDABLE at its
+    // endpoint. The provider pins the caller exactly as a signature-verified
+    // direct announcement would.
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x76u8; 32])).await;
+    let caller = fixture::build_node_with(s15::caller_keypair(0x26)).await;
+    fixture::connect_no_start(&caller, &server).await;
+    server.test_pin_peer_entity(caller.node_id(), caller.entity_id().clone());
+    caller.start();
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "w1-displaced");
+
+    let entries = Arc::new(AtomicUsize::new(0));
+    let sends = Arc::new(AtomicUsize::new(0));
+    let serve = server
+        .serve_rpc_owner_scoped_streaming(
+            "svc",
+            Arc::new(s15::CountingSS {
+                entries: Arc::clone(&entries),
+                sends: Arc::clone(&sends),
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped streaming");
+
+    let caller_origin = caller.origin_hash();
+    let reply_channel = ChannelName::new(&format!("svc.replies.{caller_origin:016x}")).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+
+    let intent = fixture::owner_delegated_intent(
+        s15::caller_keypair(0x26),
+        &org_b,
+        server.entity_id().clone(),
+        "svc",
+    );
+
+    // ORACLE — the wiring tests' independent handshake-binding capture: the
+    // CARRYING incarnation's id and binding, then the REPLACEMENT's.
+    let (carrying_id, carrying_binding) = server
+        .peer_session_snapshot(caller.node_id())
+        .expect("a live session carries its incarnation");
+    let carrying_binding = carrying_binding.expect("a real session carries its binding");
+
+    // RE-HANDSHAKE: the carrying session is displaced — the moment
+    // `org_registry_retire_session` runs for it, BEFORE any opening queued
+    // from it could build a registry record.
+    fixture::connect_no_start(&caller, &server).await;
+    let (live_id, live_binding) = server
+        .peer_session_snapshot(caller.node_id())
+        .expect("a live session carries its incarnation");
+    assert_ne!(
+        live_id, carrying_id,
+        "precondition: the re-handshake displaced the carrying incarnation",
+    );
+    let live_binding = live_binding.expect("a real session carries its binding");
+    assert_ne!(
+        live_binding, carrying_binding,
+        "precondition: a re-handshake is a new establishment",
+    );
+
+    // The displaced-carrier opening — the bridge-queue drain: a frame whose
+    // carrying incarnation is the OLD session id, signed over the NEW
+    // binding (the window the peer controls: as the new handshake's
+    // responder it knows the new hash before msg2).
+    let (frame, _req) =
+        s14::mint_ss_opening(&intent, live_binding, 42, caller_origin, None, b"open");
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            carrying_id,
+            caller.node_id(),
+            caller_origin,
+            frame,
+        )),
+        "the bridge accepted the queued opening",
+    );
+
+    // REFUSED: exactly one bounded denial, handler dark, ZERO registry
+    // effects — nothing exists that could leak past a retire.
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() == 1).await,
+        "the stale opening is refused with exactly one bounded denial",
+    );
+    assert!(
+        s15::is_denied_byte(&caller_seen.lock()[0], 2),
+        "the refusal is AdmissionDenied + the coarse Unavailable byte (stale incarnation)",
+    );
+    fixture::assert_handler_stays_dark(&entries, "the displaced-carrier opening's handler").await;
+    let registry = s14::registry_of(&server);
+    assert_eq!(
+        registry.record_count(),
+        0,
+        "no registry record exists for the refused opening",
+    );
+    assert_eq!(registry.active_node(), 0, "no active-call quota charged");
+    {
+        let fold = serve
+            .streaming_fold_for_test()
+            .expect("the streaming fold handle");
+        assert!(
+            fold.lock().in_flight_keys().is_empty(),
+            "no in-flight state for a refused opening",
+        );
+    }
+
+    // A further session replacement (the retire sweep over the live
+    // incarnation) still sees nothing: no record leaked past the retire
+    // that displaced the opening's carrier.
+    fixture::connect_no_start(&caller, &server).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        registry.record_count(),
+        0,
+        "nothing survives the retire sweep",
+    );
+    assert_eq!(registry.active_node(), 0, "no quota charge survives the retire sweep");
+
+    // The honest single-session path still admits: a fresh opening on the
+    // LIVE incarnation, signed over ITS binding.
+    let (live_id, live_binding) = server
+        .peer_session_snapshot(caller.node_id())
+        .expect("a live session carries its incarnation");
+    let live_binding = live_binding.expect("a real session carries its binding");
+    let (frame2, _req2) =
+        s14::mint_ss_opening(&intent, live_binding, 43, caller_origin, None, b"open");
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            live_id,
+            caller.node_id(),
+            caller_origin,
+            frame2,
+        )),
+        "the bridge accepted the honest opening",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || entries.load(Ordering::SeqCst) == 1).await,
+        "the honest single-session opening admits and enters the handler",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || sends.load(Ordering::SeqCst) == 2).await,
+        "the admitted call runs to its chunks",
+    );
+}
+
+/// SDK-2 — a token cancel on a LIVE server-streaming call ends the stream
+/// with the typed cancellation terminal error — never the clean `None` the
+/// pre-fix fold delivered (the cancel watcher dropped the pending entry,
+/// closing the receiver's mpsc, and `poll_next` read the closed channel as
+/// EOF: a cancelled transfer observationally identical to a completed one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_cancel_on_live_server_stream_is_a_terminal_error_never_clean_eof() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x77u8; 32])).await;
+    let caller = fixture::build_node_with(s15::caller_keypair(0x27)).await;
+    fixture::bring_up(&caller, &server).await;
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let _serve = server
+        .serve_rpc_streaming(
+            "cancel.ss",
+            Arc::new(s13::ParkForever {
+                dropped: Arc::clone(&dropped),
+                started: Arc::clone(&started),
+            }),
+        )
+        .expect("serve public streaming");
+
+    let token = caller.reserve_cancel_token();
+    let mut stream = caller
+        .call_streaming(
+            server.node_id(),
+            "cancel.ss",
+            Bytes::from_static(b"go"),
+            CallOptions {
+                cancel_token: Some(token),
+                ..CallOptions::default()
+            },
+        )
+        .await
+        .expect("call_streaming opens");
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst) == 1).await,
+        "precondition: the call is LIVE server-side",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller.cancel_registry_len() >= 1).await,
+        "precondition: the cancel watcher is armed",
+    );
+
+    caller.cancel(token);
+
+    let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the cancelled stream must terminate");
+    assert!(
+        matches!(item, Some(Err(RpcError::Cancelled))),
+        "a token-cancelled stream's final item is the cancellation error, never clean EOF; got {item:?}",
+    );
+}
+
+/// SDK-2 — the duplex twin: a token cancel on a LIVE duplex call ends the
+/// response stream with the typed cancellation terminal error — never the
+/// clean `None` the pre-fix fold delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_cancel_on_live_duplex_is_a_terminal_error_never_clean_eof() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x78u8; 32])).await;
+    let caller = fixture::build_node_with(s15::caller_keypair(0x28)).await;
+    fixture::bring_up(&caller, &server).await;
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc_duplex(
+            "cancel.dx",
+            Arc::new(ParkForeverDx {
+                started: Arc::clone(&started),
+            }),
+        )
+        .expect("serve public duplex");
+
+    let token = caller.reserve_cancel_token();
+    let mut call = caller
+        .call_duplex(
+            server.node_id(),
+            "cancel.dx",
+            CallOptions {
+                cancel_token: Some(token),
+                ..CallOptions::default()
+            },
+        )
+        .await
+        .expect("call_duplex opens");
+    call.send(Bytes::from_static(b"go"))
+        .await
+        .expect("the first send publishes the REQUEST");
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst) == 1).await,
+        "precondition: the call is LIVE server-side",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller.cancel_registry_len() >= 1).await,
+        "precondition: the cancel watcher is armed",
+    );
+
+    caller.cancel(token);
+
+    let item = tokio::time::timeout(Duration::from_secs(5), call.next())
+        .await
+        .expect("the cancelled duplex must terminate");
+    assert!(
+        matches!(item, Some(Err(RpcError::Cancelled))),
+        "a token-cancelled duplex's final item is the cancellation error, never clean EOF; got {item:?}",
+    );
+}
+
+/// SDK-2 — a token cancel on a LIVE client-streaming call classifies
+/// `finish` as CANCELLED — never the pre-fix
+/// `RpcError::Transport("terminal sender dropped before response arrived")`
+/// misfile (the cancel dropped `PendingEntry::ClientStreaming`'s
+/// `terminal_tx` without a terminal, and both `finish` shapes read the
+/// dropped sender as a transport truncation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_cancel_classifies_client_stream_finish_as_cancelled_not_transport() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x79u8; 32])).await;
+    let caller = fixture::build_node_with(s15::caller_keypair(0x29)).await;
+    fixture::bring_up(&caller, &server).await;
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let _serve = server
+        .serve_rpc_client_stream(
+            "cancel.cs",
+            Arc::new(s13::CsParkForever {
+                dropped: Arc::clone(&dropped),
+                started: Arc::clone(&started),
+            }),
+        )
+        .expect("serve public client-streaming");
+
+    let token = caller.reserve_cancel_token();
+    let mut call = caller
+        .call_client_stream(
+            server.node_id(),
+            "cancel.cs",
+            CallOptions {
+                cancel_token: Some(token),
+                ..CallOptions::default()
+            },
+        )
+        .await
+        .expect("call_client_stream opens");
+    call.send(Bytes::from_static(b"go"))
+        .await
+        .expect("the first send publishes the REQUEST");
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst) == 1).await,
+        "precondition: the call is LIVE server-side",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller.cancel_registry_len() >= 1).await,
+        "precondition: the cancel watcher is armed",
+    );
+    let finish_task = tokio::spawn(async move { call.finish().await });
+
+    caller.cancel(token);
+
+    let err = tokio::time::timeout(Duration::from_secs(5), finish_task)
+        .await
+        .expect("finish must resolve after cancel")
+        .expect("finish task panicked")
+        .expect_err("a cancelled call must not succeed");
+    assert!(
+        matches!(err, RpcError::Cancelled),
+        "finish classifies a token cancellation as cancelled, not the transport misfile; got {err:?}",
+    );
+}
+
+/// SDK-1 — a forced deadline expiry on a server-streaming call surfaces the
+/// documented `Rpc(Timeout)` — never the pre-fix
+/// `Rpc(ServerError{0x0003})` the terminal arm dressed the deadline
+/// retirement in.
+#[tokio::test]
+async fn server_stream_deadline_retirement_is_typed_timeout_not_server_error() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x7Au8; 32])).await;
+    let caller = fixture::build_node_with(s15::caller_keypair(0x2A)).await;
+    fixture::bring_up(&caller, &server).await;
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let _serve = server
+        .serve_rpc_streaming(
+            "deadline.ss",
+            Arc::new(s13::ParkForever {
+                dropped: Arc::clone(&dropped),
+                started: Arc::clone(&started),
+            }),
+        )
+        .expect("serve public streaming");
+
+    let mut stream = caller
+        .call_streaming(
+            server.node_id(),
+            "deadline.ss",
+            Bytes::from_static(b"go"),
+            CallOptions {
+                deadline: Some(Instant::now() + Duration::from_millis(300)),
+                ..CallOptions::default()
+            },
+        )
+        .await
+        .expect("call_streaming opens");
+
+    let mut terminal: Option<RpcError> = None;
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("the deadline must retire the stream within bounds")
+    {
+        if let Err(e) = item {
+            terminal = Some(e);
+            break;
+        }
+    }
+    let err = terminal.expect("the deadline retirement surfaces as a terminal error, never clean EOF");
+    assert!(
+        matches!(err, RpcError::Timeout { .. }),
+        "a forced deadline expiry is the documented Rpc(Timeout), never Rpc(ServerError{{0x0003}}); got {err:?}",
+    );
+}
+
+/// SDK-1 — the duplex twin: a forced deadline expiry surfaces the
+/// documented `Rpc(Timeout)`, never `Rpc(ServerError{0x0003})`.
+#[tokio::test]
+async fn duplex_deadline_retirement_is_typed_timeout_not_server_error() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x7Bu8; 32])).await;
+    let caller = fixture::build_node_with(s15::caller_keypair(0x2B)).await;
+    fixture::bring_up(&caller, &server).await;
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc_duplex(
+            "deadline.dx",
+            Arc::new(ParkForeverDx {
+                started: Arc::clone(&started),
+            }),
+        )
+        .expect("serve public duplex");
+
+    let mut call = caller
+        .call_duplex(
+            server.node_id(),
+            "deadline.dx",
+            CallOptions {
+                deadline: Some(Instant::now() + Duration::from_millis(300)),
+                ..CallOptions::default()
+            },
+        )
+        .await
+        .expect("call_duplex opens");
+    call.send(Bytes::from_static(b"go"))
+        .await
+        .expect("the first send publishes the REQUEST");
+
+    let mut terminal: Option<RpcError> = None;
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(10), call.next())
+        .await
+        .expect("the deadline must retire the call within bounds")
+    {
+        if let Err(e) = item {
+            terminal = Some(e);
+            break;
+        }
+    }
+    let err = terminal.expect("the deadline retirement surfaces as a terminal error, never clean EOF");
+    assert!(
+        matches!(err, RpcError::Timeout { .. }),
+        "a forced deadline expiry is the documented Rpc(Timeout), never Rpc(ServerError{{0x0003}}); got {err:?}",
+    );
+}
+
+/// SDK-1 — the client-streaming twin: a forced deadline expiry classifies
+/// `finish` as the documented `Rpc(Timeout)`, never
+/// `Rpc(ServerError{0x0003})`. The sleep past the deadline makes the
+/// provider's typed `Timeout` terminal the deterministic input to `finish`
+/// (both pre-fix shapes otherwise raced the local deadline arm).
+#[tokio::test]
+async fn client_stream_deadline_retirement_is_typed_timeout_not_server_error() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x7Cu8; 32])).await;
+    let caller = fixture::build_node_with(s15::caller_keypair(0x2C)).await;
+    fixture::bring_up(&caller, &server).await;
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let _serve = server
+        .serve_rpc_client_stream(
+            "deadline.cs",
+            Arc::new(s13::CsParkForever {
+                dropped: Arc::clone(&dropped),
+                started: Arc::clone(&started),
+            }),
+        )
+        .expect("serve public client-streaming");
+
+    let mut call = caller
+        .call_client_stream(
+            server.node_id(),
+            "deadline.cs",
+            CallOptions {
+                deadline: Some(Instant::now() + Duration::from_millis(300)),
+                ..CallOptions::default()
+            },
+        )
+        .await
+        .expect("call_client_stream opens");
+    call.send(Bytes::from_static(b"go"))
+        .await
+        .expect("the first send publishes the REQUEST");
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst) == 1).await,
+        "precondition: the call is LIVE server-side",
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let err = tokio::time::timeout(Duration::from_secs(5), call.finish())
+        .await
+        .expect("finish must resolve at the deadline")
+        .expect_err("a deadline retirement must not succeed");
+    assert!(
+        matches!(err, RpcError::Timeout { .. }),
+        "a forced deadline expiry is the documented Rpc(Timeout), never Rpc(ServerError{{0x0003}}); got {err:?}",
+    );
+}

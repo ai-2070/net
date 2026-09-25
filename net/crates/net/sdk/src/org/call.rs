@@ -1943,6 +1943,15 @@ fn push_unique(out: &mut Vec<Candidate>, candidate: Candidate) {
 /// The body is the single coarse reason byte (OA2-E2). A body that does not
 /// decode maps to the least-informative bucket rather than an
 /// error-about-an-error — the caller still learns it was denied.
+///
+/// SDK-1 — the retirement classification reaches the facade HERE as the
+/// documented `Rpc(Timeout)` / `Rpc(Cancelled)`: the core's per-cause
+/// terminal seams produce the typed [`RpcError::Timeout`] /
+/// [`RpcError::Cancelled`], and this seam passes them through untouched.
+/// A genuine remote [`RpcError::ServerError`] — including one whose wire
+/// status happens to be the retirement codes (0x0003/0x0005) — stays
+/// `Rpc(ServerError)`; this seam never manufactures a typed variant from a
+/// wire status.
 fn map_rpc_error(e: RpcError) -> OrgSdkError {
     match &e {
         RpcError::ServerError { status, .. } if *status == RPC_STATUS_ADMISSION_DENIED => {
@@ -2045,6 +2054,48 @@ mod tests {
         match map_rpc_error(e) {
             OrgSdkError::Rpc(RpcError::ServerError { status, .. }) => assert_eq!(status, 0x8001),
             other => panic!("expected Rpc, got {other:?}"),
+        }
+    }
+
+    /// SDK-1 — the core's typed deadline retirement surfaces as the
+    /// documented `Rpc(Timeout)`, never a `ServerError` in the 0x0003
+    /// clothing the pre-fix folds delivered.
+    #[test]
+    fn deadline_retirement_surfaces_as_rpc_timeout() {
+        match map_rpc_error(RpcError::Timeout { elapsed_ms: 5000 }) {
+            OrgSdkError::Rpc(RpcError::Timeout { elapsed_ms }) => assert_eq!(elapsed_ms, 5000),
+            other => panic!("expected Rpc(Timeout), got {other:?}"),
+        }
+    }
+
+    /// SDK-1 — the core's typed cancellation terminal surfaces as the
+    /// documented `Rpc(Cancelled)`.
+    #[test]
+    fn cancellation_surfaces_as_rpc_cancelled() {
+        match map_rpc_error(RpcError::Cancelled) {
+            OrgSdkError::Rpc(RpcError::Cancelled) => {}
+            other => panic!("expected Rpc(Cancelled), got {other:?}"),
+        }
+    }
+
+    /// SDK-1 — a genuine remote `ServerError` stays `Rpc(ServerError)` even
+    /// when its wire status is a retirement code (0x0003/0x0005): the typed
+    /// classes come from core's retirement classification, and this seam
+    /// never rewrites a `ServerError` into one.
+    #[test]
+    fn genuine_remote_retirement_codes_stay_server_error() {
+        for status in [0x0003u16, 0x0005] {
+            let e = RpcError::ServerError {
+                status,
+                message: "remote said so".to_string(),
+                headers: vec![],
+            };
+            match map_rpc_error(e) {
+                OrgSdkError::Rpc(RpcError::ServerError { status: got, .. }) => {
+                    assert_eq!(got, status);
+                }
+                other => panic!("expected Rpc(ServerError), got {other:?}"),
+            }
         }
     }
 }

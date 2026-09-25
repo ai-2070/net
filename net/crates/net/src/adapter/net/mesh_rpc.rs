@@ -1535,16 +1535,22 @@ async fn admit_and_dispatch_protected(
     // consumed) → install under the registry lock (§2.3 requalification).
     // The fold seam then TRANSFERS the lease at its effect boundary.
     let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
+    // WIRE-1: ONE atomic snapshot of the peer's live session (the streaming
+    // twin's verbatim clause): the record's `(session_id, establishment)`
+    // must BOTH come from the exact incarnation that carried the frame, and
+    // admission must refuse while that incarnation is no longer live — a
+    // record created after its own retire already ran matches no future
+    // retire and leaks its quota charge. `session_generation: None` (stale)
+    // arms the reserve seam's refusal, which fires BEFORE any record exists.
+    let carrying = mesh
+        .peer_session_snapshot(from_node)
+        .filter(|(live_session_id, _)| *live_session_id == inbound.session_id);
     let session = crate::adapter::net::cortex::rpc::SessionIdentity {
         peer: from_node,
         session_id: inbound.session_id,
-        establishment: mesh.peer_session_binding(from_node),
+        establishment: carrying.and_then(|(_, binding)| binding),
     };
-    // `SessionCurrentness`'s live generation is not reachable from this
-    // module (finding F-S1.4-2): `Some(0)` records "a live, non-exhausted
-    // generation", keeping the seam's `u64::MAX` refusal armed for the
-    // callers that can resolve it.
-    let session_generation = Some(0);
+    let session_generation = carrying.map(|_| 0);
     let opening = admit_protected_opening(
         mesh,
         inbound,
@@ -1845,17 +1851,35 @@ async fn admit_and_dispatch_protected_stream<F: ProtectedStreamFold>(
     // required to equal `proof.session_binding` at step 9b (a hand-built
     // session with `None` can never admit a protected stream).
     let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
+    // WIRE-1: ONE atomic snapshot of the peer's live session. The record's
+    // `(session_id, establishment)` must BOTH come from the exact
+    // incarnation that carried the frame (`inbound.session_id` is that
+    // incarnation — the mesh.rs ingress semantic), never one incarnation's
+    // id fused with the live one's binding. And the opening must be
+    // REFUSED while its carrying incarnation is no longer the peer's live
+    // session: `org_registry_retire_session` runs at displacement time —
+    // before a bridge-queued opening reaches this seam — so a record
+    // created for a displaced incarnation matches no past or future retire
+    // and leaks its quota charge. The staleness gate rides
+    // `session_generation`: `None` arms the reserve seam's refusal, which
+    // fires BEFORE any record exists (fixing only the binding source is
+    // insufficient — a correct record created after its retire already ran
+    // leaks identically).
+    let carrying = mesh
+        .peer_session_snapshot(from_node)
+        .filter(|(live_session_id, _)| *live_session_id == inbound.session_id);
     let session = crate::adapter::net::cortex::rpc::SessionIdentity {
         peer: from_node,
         session_id: inbound.session_id,
-        establishment: mesh.peer_session_binding(from_node),
+        establishment: carrying.and_then(|(_, binding)| binding),
     };
-    let session_binding = mesh.peer_session_binding(from_node);
-    // `SessionCurrentness`'s live generation is not reachable from this
-    // module (finding F-S1.4-2): `Some(0)` records "a live, non-exhausted
-    // generation", keeping the seam's `u64::MAX` refusal armed for the
-    // callers that can resolve it.
-    let session_generation = Some(0);
+    let session_binding = carrying.and_then(|(_, binding)| binding);
+    // `Some(_)` = the carrying incarnation is the live one ("a live,
+    // non-exhausted generation" — `SessionCurrentness`'s own generation is
+    // not reachable from this module, finding F-S1.4-2, so `0` stands in
+    // for it). `None` = stale carrying incarnation: the reserve seam's
+    // stale-incarnation refusal must fire instead of admitting.
+    let session_generation = carrying.map(|_| 0);
     let opening = admit_protected_opening(
         mesh,
         inbound,
@@ -2274,6 +2298,35 @@ fn spawn_grant_publish(
     });
 }
 
+/// SDK-1 — ONE deterministic classification per retirement cause at the
+/// caller's terminal seams (the [`RpcStream`] / [`DuplexStream`] terminal
+/// arms and client-streaming `finish`): a terminal carrying the core's
+/// retirement codes classifies by CAUSE — `Timeout` (0x0003, the deadline)
+/// → [`RpcError::Timeout`], `Cancelled` (0x0005: cancel incl.
+/// `ServeHandleDropped` / `SessionReplaced`, §2.2's table) →
+/// [`RpcError::Cancelled`] — and every other non-`Ok` status stays
+/// [`RpcError::ServerError`] with its wire status and diagnostic verbatim
+/// (a genuine remote error). Those codes are produced by
+/// `stream_terminal_payload` and the deadline guards FROM the retirement
+/// cause, so the mapping is total and deterministic on it, and the facade's
+/// `map_rpc_error` surfaces the documented `Rpc(Timeout)` / `Rpc(Cancelled)`
+/// without ever rewriting a `ServerError`.
+fn classify_stream_terminal(resp: RpcResponsePayload, elapsed_ms: u64) -> RpcError {
+    match resp.status {
+        RpcStatus::Timeout => RpcError::Timeout { elapsed_ms },
+        RpcStatus::Cancelled => RpcError::Cancelled,
+        status => {
+            let message = String::from_utf8(resp.body.to_vec())
+                .unwrap_or_else(|e| format!("<{} bytes of non-utf8 body>", e.into_bytes().len()));
+            RpcError::ServerError {
+                status: status.to_wire(),
+                message,
+                headers: resp.headers,
+            }
+        }
+    }
+}
+
 impl futures::Stream for RpcStream {
     type Item = Result<Bytes, RpcError>;
 
@@ -2322,17 +2375,19 @@ impl futures::Stream for RpcStream {
             }
             std::task::Poll::Ready(Some(StreamItem::Error(resp))) => {
                 self.done = true;
-                let status = resp.status.to_wire();
-                let message = String::from_utf8(resp.body.to_vec()).unwrap_or_else(|e| {
-                    format!("<{} bytes of non-utf8 body>", e.into_bytes().len())
-                });
-                self.observer
-                    .latch_error(format!("server returned status {status:#06x}: {message}"));
-                std::task::Poll::Ready(Some(Err(RpcError::ServerError {
-                    status,
-                    message,
-                    headers: resp.headers,
-                })))
+                // SDK-1 — classify the terminal per retirement cause (the
+                // one mapping shared with `DuplexStream` and CS `finish`):
+                // a `Timeout`/`Cancelled` terminal is the documented
+                // `RpcError::Timeout`/`Cancelled`, never a `ServerError`
+                // dressed in the retirement code.
+                let err = classify_stream_terminal(resp, self.observer.elapsed_ms());
+                match &err {
+                    RpcError::Timeout { .. } => self.observer.latch_timeout(),
+                    // Unlatched fires the observer's `Canceled` class.
+                    RpcError::Cancelled => {}
+                    _ => self.observer.latch_error(err.to_string()),
+                }
+                std::task::Poll::Ready(Some(Err(err)))
             }
             std::task::Poll::Ready(None) => {
                 self.done = true;
@@ -2656,7 +2711,18 @@ impl ClientStreamCallRaw {
                 "terminal receiver already consumed".into(),
             ))
         })?;
-        // Honor the deadline if the caller set one.
+        // SDK-1 / SDK-2 — both `finish` shapes (deadline-armed and not)
+        // resolve the terminal through ONE deterministic mapping per
+        // retirement cause: a delivered terminal classifies below
+        // (`Timeout` status → `RpcError::Timeout`, the typed local
+        // cancellation or a remote `Cancelled` → `RpcError::Cancelled`,
+        // anything else `ServerError` verbatim), a deadline expiry is
+        // `RpcError::Timeout`, and a sender that dropped WITHOUT
+        // delivering a terminal is the same genuine truncation in both
+        // shapes. Pre-fix a token cancellation dropped the terminal
+        // sender and raced these two shapes into the
+        // `Transport("terminal sender dropped...")` misfile.
+        const TERMINAL_TRUNCATED: &str = "terminal sender dropped before response arrived";
         let resp = if self.deadline_ns > 0 {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2668,9 +2734,10 @@ impl ClientStreamCallRaw {
             {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => {
-                    let msg = "terminal sender dropped before response arrived";
-                    self.observer.latch_error(msg);
-                    return Err(RpcError::Transport(AdapterError::Connection(msg.into())));
+                    self.observer.latch_error(TERMINAL_TRUNCATED);
+                    return Err(RpcError::Transport(AdapterError::Connection(
+                        TERMINAL_TRUNCATED.into(),
+                    )));
                 }
                 Err(_elapsed) => {
                     let elapsed_ms = self.started.elapsed().as_millis() as u64;
@@ -2682,31 +2749,30 @@ impl ClientStreamCallRaw {
             match terminal_rx.await {
                 Ok(r) => r,
                 Err(_) => {
-                    let msg = "terminal sender dropped before response arrived";
-                    self.observer.latch_error(msg);
-                    return Err(RpcError::Transport(AdapterError::Connection(msg.into())));
+                    self.observer.latch_error(TERMINAL_TRUNCATED);
+                    return Err(RpcError::Transport(AdapterError::Connection(
+                        TERMINAL_TRUNCATED.into(),
+                    )));
                 }
             }
         };
         self.state = ClientStreamState::Done;
         self.observer.add_response_bytes(resp.body.len() as u32);
         if !resp.status.is_ok() {
-            // String::from_utf8 takes `Vec<u8>`. `Bytes::to_vec()`
-            // matches the prior `resp.body.clone()` semantics (full
-            // copy of the body for the error-formatting path);
-            // bulk-throughput improvement lives on the decode side,
-            // not here.
-            let message = String::from_utf8(resp.body.to_vec())
-                .unwrap_or_else(|e| format!("<{} bytes of non-utf8 body>", e.into_bytes().len()));
-            self.observer.latch_error(format!(
-                "server returned status {:#06x}: {message}",
-                resp.status.to_wire()
-            ));
-            return Err(RpcError::ServerError {
-                status: resp.status.to_wire(),
-                message,
-                headers: resp.headers,
-            });
+            // SDK-1 — the per-cause classification, the same mapping the
+            // SS/DX folds run on their terminal arms (one retirement
+            // cause, one result, every shape). `Bytes::to_vec()` matches
+            // the prior `resp.body.clone()` semantics (full copy of the
+            // body for the error-formatting path); bulk-throughput
+            // improvement lives on the decode side, not here.
+            let err = classify_stream_terminal(resp, self.started.elapsed().as_millis() as u64);
+            match &err {
+                RpcError::Timeout { .. } => self.observer.latch_timeout(),
+                // Unlatched fires the observer's `Canceled` class.
+                RpcError::Cancelled => {}
+                _ => self.observer.latch_error(err.to_string()),
+            }
+            return Err(err);
         }
         self.observer.latch_ok();
         let latency_ns = self.started.elapsed().as_nanos() as u64;
@@ -3082,18 +3148,19 @@ impl futures::Stream for DuplexStream {
             std::task::Poll::Ready(Some(StreamItem::Error(resp))) => {
                 self.done = true;
                 self.inner.clean_close.store(true, Ordering::SeqCst);
-                let status = resp.status.to_wire();
-                let message = String::from_utf8(resp.body.to_vec()).unwrap_or_else(|e| {
-                    format!("<{} bytes of non-utf8 body>", e.into_bytes().len())
-                });
-                self.inner
-                    .observer
-                    .latch_error(format!("server returned status {status:#06x}: {message}"));
-                std::task::Poll::Ready(Some(Err(RpcError::ServerError {
-                    status,
-                    message,
-                    headers: resp.headers,
-                })))
+                // SDK-1 — the one per-cause classification (shared with
+                // `RpcStream` and CS `finish`): a `Timeout`/`Cancelled`
+                // terminal is the documented `RpcError::Timeout`/
+                // `Cancelled`, never a `ServerError` dressed in the
+                // retirement code.
+                let err = classify_stream_terminal(resp, self.inner.observer.elapsed_ms());
+                match &err {
+                    RpcError::Timeout { .. } => self.inner.observer.latch_timeout(),
+                    // Unlatched fires the observer's `Canceled` class.
+                    RpcError::Cancelled => {}
+                    _ => self.inner.observer.latch_error(err.to_string()),
+                }
+                std::task::Poll::Ready(Some(Err(err)))
             }
             std::task::Poll::Ready(None) => {
                 self.done = true;
@@ -3307,6 +3374,12 @@ impl StreamingObserverState {
 
     pub(crate) fn latch_timeout(&self) {
         self.observer_status.store(3, Ordering::Relaxed);
+    }
+
+    /// Wall-clock milliseconds since the call started — the typed
+    /// `RpcError::Timeout`'s elapsed term at the terminal seams.
+    pub(crate) fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
     }
 
     /// Fire the observer event. Idempotent — only the first call
@@ -4147,12 +4220,12 @@ type StreamCancelKeepAlive = tokio::sync::oneshot::Sender<()>;
 /// Spawn a cancel-watcher task for a streaming call (call_streaming,
 /// call_client_stream, call_duplex). The watcher races
 /// `cancel_notify.notified()` against the keep-alive oneshot — first
-/// to fire wins. On cancel, the watcher drops the pending-streaming
-/// entry (which closes the receiver's mpsc, letting the stream's
-/// poll_next observe EOF), then releases the registry entry. On
-/// handle Drop, the keep-alive sender drops, the oneshot resolves
-/// `Err`, and the watcher exits via the done arm with a registry
-/// release.
+/// to fire wins. On cancel, the watcher cancels the pending-streaming
+/// entry (which delivers the typed cancellation terminal, letting the
+/// stream's poll_next observe a cancellation error — never a clean
+/// EOF), then releases the registry entry. On handle Drop, the
+/// keep-alive sender drops, the oneshot resolves `Err`, and the
+/// watcher exits via the done arm with a registry release.
 ///
 /// When `cancel_token == 0` (the "no token" sentinel), this is a
 /// no-op: the returned sender is a placeholder whose drop has no
@@ -4178,11 +4251,12 @@ fn spawn_stream_cancel_watcher(
         tokio::select! {
             biased;
             _ = cancel_notify.notified() => {
-                // Cancel fired. Drop the pending-stream entry so
-                // the receiver's mpsc closes (causing the stream's
-                // poll_next to observe EOF via Ready(None)). The
-                // handle's Drop will then fire CANCEL on the wire
-                // via its existing per-shape Drop impl.
+                // Cancel fired. Deliver the typed cancellation terminal
+                // and drop the pending-stream entry (SDK-2: the terminal
+                // makes the stream's poll_next observe a cancellation
+                // error — never the clean EOF the closed channel alone
+                // used to read as). The handle's Drop will then fire
+                // CANCEL on the wire via its existing per-shape Drop impl.
                 pending.cancel(call_id);
                 cancel_registry.release(cancel_token);
             }
@@ -10360,6 +10434,10 @@ mod roster_fallback_tests {
         let caller_kp = EntityKeypair::generate();
         let caller_origin = caller_kp.entity_id().origin_hash();
         server.test_pin_peer_entity(CALLER_NODE, caller_kp.entity_id().clone());
+        // WIRE-1's carrying-incarnation gate reads the LIVE session: the
+        // injected frames name session 0, so install it as the caller's
+        // live incarnation (exactly as ingress would have delivered them).
+        server.test_install_session(CALLER_NODE, 0);
         let intent = owner_delegated_intent(caller_kp, &org_b, node_entity);
 
         let base = RpcRequestPayload {
@@ -10468,6 +10546,10 @@ mod roster_fallback_tests {
         let caller_kp = std::sync::Arc::new(EntityKeypair::generate());
         let caller_origin = caller_kp.entity_id().origin_hash();
         server.test_pin_peer_entity(CALLER_NODE, caller_kp.entity_id().clone());
+        // WIRE-1's carrying-incarnation gate reads the LIVE session: the
+        // injected frames name session 0, so install it as the caller's
+        // live incarnation (exactly as ingress would have delivered them).
+        server.test_install_session(CALLER_NODE, 0);
 
         // One intent per service for the SAME caller — capability `nrpc:<svc>`.
         let intent_for = |service: &str| -> OrgProofIntent {
@@ -11591,6 +11673,11 @@ mod roster_fallback_tests {
         let caller_entity = caller_kp.entity_id().clone();
         let caller_origin = caller_entity.origin_hash();
         server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+        // The protected admission's carrying-incarnation gate reads the
+        // LIVE session (`peer_session_snapshot`): install the caller's
+        // synthetic session so the injected frames name a live incarnation,
+        // exactly as ingress delivers them (WIRE-1's contract).
+        server.test_install_session(CALLER_NODE, 0);
 
         let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
         let call_id = 7u64;
@@ -11733,6 +11820,11 @@ mod roster_fallback_tests {
         let caller_entity = caller_kp.entity_id().clone();
         let caller_origin = caller_entity.origin_hash();
         server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+        // The protected admission's carrying-incarnation gate reads the
+        // LIVE session (`peer_session_snapshot`): install the caller's
+        // synthetic session so the injected frames name a live incarnation,
+        // exactly as ingress delivers them (WIRE-1's contract).
+        server.test_install_session(CALLER_NODE, 0);
 
         let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
         let call_id = 7u64;
@@ -11905,6 +11997,11 @@ mod roster_fallback_tests {
         let caller_entity = caller_kp.entity_id().clone();
         let caller_origin = caller_entity.origin_hash();
         server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+        // The protected admission's carrying-incarnation gate reads the
+        // LIVE session (`peer_session_snapshot`): install the caller's
+        // synthetic session so the injected frames name a live incarnation,
+        // exactly as ingress delivers them (WIRE-1's contract).
+        server.test_install_session(CALLER_NODE, 0);
 
         let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
         let base = RpcRequestPayload {
@@ -12034,6 +12131,11 @@ mod roster_fallback_tests {
         let caller_entity = caller_kp.entity_id().clone();
         let caller_origin = caller_entity.origin_hash();
         server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+        // The protected admission's carrying-incarnation gate reads the
+        // LIVE session (`peer_session_snapshot`): install the caller's
+        // synthetic session so the injected frames name a live incarnation,
+        // exactly as ingress delivers them (WIRE-1's contract).
+        server.test_install_session(CALLER_NODE, 0);
 
         let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
         let membership = OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600)
@@ -12158,6 +12260,11 @@ mod roster_fallback_tests {
         let caller_entity = caller_kp.entity_id().clone();
         let caller_origin = caller_entity.origin_hash();
         server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+        // The protected admission's carrying-incarnation gate reads the
+        // LIVE session (`peer_session_snapshot`): install the caller's
+        // synthetic session so the injected frames name a live incarnation,
+        // exactly as ingress delivers them (WIRE-1's contract).
+        server.test_install_session(CALLER_NODE, 0);
 
         let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
         let membership = OrgMembershipCert::try_issue(&org_a, caller_entity.clone(), 1, 3600)
@@ -12316,6 +12423,11 @@ mod roster_fallback_tests {
         let caller_entity = caller_kp.entity_id().clone();
         let caller_origin = caller_entity.origin_hash();
         server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+        // The protected admission's carrying-incarnation gate reads the
+        // LIVE session (`peer_session_snapshot`): install the caller's
+        // synthetic session so the injected frames name a live incarnation,
+        // exactly as ingress delivers them (WIRE-1's contract).
+        server.test_install_session(CALLER_NODE, 0);
 
         let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
         let base = RpcRequestPayload {
@@ -12723,6 +12835,11 @@ mod roster_fallback_tests {
         let caller_entity = caller_kp.entity_id().clone();
         let caller_origin = caller_entity.origin_hash();
         server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+        // The protected admission's carrying-incarnation gate reads the
+        // LIVE session (`peer_session_snapshot`): install the caller's
+        // synthetic session so the injected frames name a live incarnation,
+        // exactly as ingress delivers them (WIRE-1's contract).
+        server.test_install_session(CALLER_NODE, 0);
 
         let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
         let base = RpcRequestPayload {
@@ -13098,6 +13215,11 @@ mod roster_fallback_tests {
         let caller_entity = caller_kp.entity_id().clone();
         let caller_origin = caller_entity.origin_hash();
         server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+        // The protected admission's carrying-incarnation gate reads the
+        // LIVE session (`peer_session_snapshot`): install the caller's
+        // synthetic session so the injected frames name a live incarnation,
+        // exactly as ingress delivers them (WIRE-1's contract).
+        server.test_install_session(CALLER_NODE, 0);
 
         let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
         let base = RpcRequestPayload {
@@ -13387,6 +13509,11 @@ mod roster_fallback_tests {
         let caller_origin = caller_entity.origin_hash();
         let victim_origin = caller_origin ^ 0xFFFF_FFFF; // a DIFFERENT origin
         server.test_pin_peer_entity(CALLER_NODE, caller_entity.clone());
+        // The protected admission's carrying-incarnation gate reads the
+        // LIVE session (`peer_session_snapshot`): install the caller's
+        // synthetic session so the injected frames name a live incarnation,
+        // exactly as ingress delivers them (WIRE-1's contract).
+        server.test_install_session(CALLER_NODE, 0);
 
         let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
         let membership = OrgMembershipCert::try_issue(&org_b, caller_entity.clone(), 1, 3600)

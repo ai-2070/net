@@ -4301,7 +4301,9 @@ pub struct OpeningRequest {
     pub key: ProtectedCallKey,
     /// The exact originating session.
     pub session: SessionIdentity,
-    /// The routing registry's session generation; `None` models the
+    /// The carrying incarnation's session generation; `None` is the
+    /// refusal marker — either the WIRE-1 staleness gate (the opening's
+    /// carrying session is no longer the peer's live one) or the
     /// `u64::MAX` terminal marker (`SessionCurrentness` exhaustion).
     pub session_generation: Option<u64>,
     /// The protected registration this opening targets.
@@ -4817,8 +4819,13 @@ impl ProtectedCallRegistry {
         req: OpeningRequest,
     ) -> Result<ReservationGuard, AdmissionDenied> {
         if req.session_generation.is_none() {
-            // `SessionCurrentness` generation `u64::MAX` (§3): refuse
-            // admission. No C4 variant names it (finding F-S1.4-1).
+            // Stale-incarnation refusal (WIRE-1): the opening's carrying
+            // session is no longer the peer's live one — refuse BEFORE any
+            // record exists, so a displaced-carrier opening can never
+            // install a record that matches no past or future retire. Also
+            // the `SessionCurrentness` generation `u64::MAX` terminal
+            // marker (§3): refuse admission. No C4 variant names either
+            // (finding F-S1.4-1).
             return Err(AdmissionDenied::AuthorityChanged);
         }
         let mut inner = self.inner.lock();
@@ -8720,6 +8727,46 @@ enum PendingEntry {
     },
 }
 
+/// The terminal one local cancellation delivers (SDK-2): the frozen
+/// wire `RpcStatus::Cancelled` — the same cancellation vocabulary a
+/// remote retirement with this cause carries — so the caller-side
+/// terminal seams classify it per cause (`RpcError::Cancelled`), never
+/// as a clean end-of-stream or a truncated transport.
+fn local_cancellation_payload() -> RpcResponsePayload {
+    RpcResponsePayload {
+        status: RpcStatus::Cancelled,
+        headers: vec![],
+        body: Bytes::from_static(b"call cancelled by caller"),
+    }
+}
+
+impl PendingEntry {
+    /// SDK-2 — deliver the typed cancellation terminal BEFORE this
+    /// entry's senders drop (see [`RpcClientPending::cancel`]): dropping
+    /// the senders alone closes the receiver's channel, which the
+    /// caller-side folds used to read as a clean end — a cancelled
+    /// transfer observationally identical to a completed one (SS/DX), or
+    /// as a truncated transport (CS `finish`'s dropped terminal sender).
+    fn cancel_locally(self) {
+        match self {
+            // Unary has no stream terminal to shape: dropping the
+            // oneshot is the existing signal, and the unary caller's own
+            // `select!` cancel arm (biased) resolves
+            // `RpcError::Cancelled` ahead of the dropped sender.
+            PendingEntry::Unary { .. } => {}
+            PendingEntry::Streaming(tx) => {
+                let _ = tx.send(StreamItem::Error(local_cancellation_payload()));
+            }
+            PendingEntry::Duplex { chunks_tx, .. } => {
+                let _ = chunks_tx.send(StreamItem::Error(local_cancellation_payload()));
+            }
+            PendingEntry::ClientStreaming { terminal_tx, .. } => {
+                let _ = terminal_tx.send(local_cancellation_payload());
+            }
+        }
+    }
+}
+
 /// One item delivered to a streaming caller. The caller's
 /// `RpcStream` translates these into `Stream::Item =
 /// Result<Bytes, RpcError>` plus stream termination.
@@ -8957,13 +9004,21 @@ impl RpcClientPending {
         (chunks_rx, grant_rx)
     }
 
-    /// Drop the pending entry for `call_id`. Called by the
-    /// caller-side cancellation path (e.g. `Mesh::call`'s future
-    /// being dropped, the stream being dropped, or a deadline
-    /// timer firing). The matching RESPONSE(s) that may still
-    /// arrive afterwards are silently discarded by `deliver`.
+    /// Drop the pending entry for `call_id`, delivering the typed
+    /// CANCELLATION TERMINAL first. Called by the caller-side
+    /// cancellation path (e.g. `Mesh::call`'s future being dropped,
+    /// the stream being dropped, or a deadline timer firing). The
+    /// matching RESPONSE(s) that may still arrive afterwards are
+    /// silently discarded by `deliver`.
+    ///
+    /// SDK-2: the terminal is delivered before the entry's senders
+    /// drop, so a token-cancelled in-flight call surfaces a terminal
+    /// error distinct from clean EOF on every shape (see
+    /// [`PendingEntry::cancel_locally`]).
     pub fn cancel(&self, call_id: u64) {
-        self.senders.remove(&call_id);
+        if let Some((_, (_, entry))) = self.senders.remove(&call_id) {
+            entry.cancel_locally();
+        }
     }
 
     /// Test-only observation of actual pending ownership, not a second counter.

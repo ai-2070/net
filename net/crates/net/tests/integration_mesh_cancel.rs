@@ -309,18 +309,18 @@ async fn cancel_streaming_mid_drain_terminates_stream() {
     wait_for_cancel_entries(&a, 1).await;
     a.cancel(token);
 
-    // The watcher drops the pending entry → the stream's mpsc
-    // closes → poll_next returns Ready(None) (the existing EOF
-    // path in `impl Stream for RpcStream` at the
-    // `Ready(None)` arm). The stream terminates cleanly.
+    // The watcher's local cancel delivers the typed cancellation
+    // terminal (RpcStatus::Cancelled) before the entry's senders
+    // drop, so the stream ends with Err(RpcError::Cancelled): a
+    // cancelled transfer is never a clean EOF (SDK-2).
     let mut stream = stream;
     let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
         .await
         .expect("stream should terminate within 2s after cancel");
-    assert!(
-        first.is_none(),
-        "expected stream EOF after cancel, got {first:?}"
-    );
+    match first {
+        Some(Err(RpcError::Cancelled)) => {}
+        other => panic!("expected the typed cancellation terminal after cancel, got {other:?}"),
+    }
 }
 
 // =====================================================================
@@ -353,20 +353,18 @@ async fn cancel_client_stream_mid_finish_surfaces_terminal() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     a.cancel(token);
 
-    // The cancel-watcher drops the pending entry. The finish()'s
-    // oneshot receiver returns Err (sender dropped). The substrate
-    // surfaces this as a Transport-class error indicating the
-    // pending registration was cleared without a response. The
-    // exact error variant is less load-bearing than the contract
-    // that finish() resolves (doesn't hang) within bounded time.
+    // The local cancel delivers the typed cancellation terminal;
+    // finish() classifies it as RpcError::Cancelled (SDK-2: never
+    // the Transport "terminal sender dropped" misfile). finish()
+    // must also resolve (not hang) within bounded time.
     let result = tokio::time::timeout(Duration::from_secs(2), finish_task)
         .await
         .expect("client-stream finish should resolve within 2s after cancel")
         .expect("spawn task panicked");
-    assert!(
-        result.is_err(),
-        "client-stream finish after cancel must return an error, not Ok"
-    );
+    match result {
+        Err(RpcError::Cancelled) => {}
+        other => panic!("expected RpcError::Cancelled after cancel, got {other:?}"),
+    }
 }
 
 // =====================================================================
@@ -397,17 +395,17 @@ async fn cancel_duplex_mid_recv_terminates_stream() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     a.cancel(token);
 
-    // Cancel drops the pending entry → both halves' mpscs close →
-    // next() returns None. The shared Arc<DuplexInner> drops once
-    // both halves are released, firing CANCEL on the wire via the
-    // existing Drop impl.
+    // The local cancel delivers the typed cancellation terminal to
+    // the receive half (never clean EOF, SDK-2). The shared
+    // Arc<DuplexInner> drops once both halves are released, firing
+    // CANCEL on the wire via the existing Drop impl.
     let next = tokio::time::timeout(Duration::from_secs(2), call.next())
         .await
         .expect("duplex next should resolve within 2s after cancel");
-    assert!(
-        next.is_none(),
-        "expected duplex EOF after cancel, got {next:?}"
-    );
+    match next {
+        Some(Err(RpcError::Cancelled)) => {}
+        other => panic!("expected the typed cancellation terminal after cancel, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -437,14 +435,14 @@ async fn cancel_duplex_after_split_terminates_both_halves() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     a.cancel(token);
 
-    // The receive half observes EOF.
+    // The receive half observes the typed cancellation terminal.
     let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
         .await
         .expect("duplex stream should resolve within 2s after cancel");
-    assert!(
-        next.is_none(),
-        "expected duplex stream EOF after cancel post-split, got {next:?}"
-    );
+    match next {
+        Some(Err(RpcError::Cancelled)) => {}
+        other => panic!("expected the typed cancellation terminal after cancel, got {other:?}"),
+    }
     // Subsequent sends after cancel surface stream-closed-shaped
     // errors. Don't pin the exact message; just that the sink
     // refuses further sends or surfaces a terminal error within

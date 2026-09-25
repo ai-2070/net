@@ -19851,6 +19851,51 @@ impl MeshNode {
         });
     }
 
+    /// Test-only helper — install (or replace) `node_id`'s live session
+    /// with one carrying `session_id` and NO handshake binding (a
+    /// hand-built session). The transport deliberately will not hand a
+    /// caller a chosen incarnation on request, so fixtures that need a
+    /// session to EXIST — e.g. the protected admission's
+    /// carrying-incarnation gate, which reads exactly this entry through
+    /// [`Self::peer_session_snapshot`] — install it here, and every
+    /// decision over it stays the real code path.
+    ///
+    /// Gated like the seams above: a live session is security-relevant
+    /// state (the admission gate reads it), so no production build may
+    /// reach it.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn test_install_session(&self, node_id: u64, session_id: u64) {
+        use crate::adapter::net::crypto::SessionKeys;
+        let addr: std::net::SocketAddr = "127.0.0.1:9".parse().expect("literal addr");
+        self.peers.insert(
+            node_id,
+            PeerInfo {
+                node_id,
+                transport: PeerTransport::Direct {
+                    owned: PeerAddr::Udp(addr),
+                },
+                session: Arc::new(NetSession::new(
+                    SessionKeys {
+                        tx_key: [0x11; 32],
+                        rx_key: [0x22; 32],
+                        session_id,
+                        remote_static_pub: [0x33; 32],
+                        route_hop_tx_key: [0x44; 32],
+                        route_hop_rx_key: [0x55; 32],
+                    },
+                    PeerAddr::Udp(addr),
+                    4,
+                    false,
+                )),
+                remote_static_pub: [0x33; 32],
+                last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
+            },
+        );
+    }
+
     /// Test/debug accessor for the live [`NetSession`] to a peer.
     /// Integration tests use it to drive session-level state (e.g. open
     /// a stream to make a session "busy" for the upgrade C3 gate), and
@@ -20165,6 +20210,21 @@ impl MeshNode {
         self.peers
             .get(&node_id)
             .and_then(|p| p.session.handshake_binding())
+    }
+
+    /// ONE atomic snapshot of the live session incarnation for `node_id`:
+    /// `(session_id, handshake binding)` read from the SAME `peers` entry.
+    ///
+    /// A protected admission must source its registry record's
+    /// `(session_id, establishment)` from one incarnation. Two separate
+    /// lookups ([`Self::peer_session_id`] + [`Self::peer_session_binding`])
+    /// can straddle a session replacement and fuse one incarnation's id
+    /// with another's binding into a record that matches no retire — the
+    /// displaced-carrier zombie. `None` when no session exists.
+    pub fn peer_session_snapshot(&self, node_id: u64) -> Option<(u64, Option<[u8; 32]>)> {
+        self.peers
+            .get(&node_id)
+            .map(|p| (p.session.session_id(), p.session.handshake_binding()))
     }
 
     /// Has the session with `node_id` gone without authenticated traffic
