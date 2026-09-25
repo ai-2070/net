@@ -2660,10 +2660,27 @@ Inverse mutations:
   `join`, so they do not isolate the restart path. The id's stability is
   structural: the relay computes it from the entity.
 
-Noted, not changed: the relay allows 64 channels per registration by default
+Noted: the relay allowed 64 channels per registration by default
 (`max_channels_per_registration`), and idle channels expire after 120 s. With
 many devices behind one operator, a mass reattach after a restart could hit
-that cap. This is relay sizing, and it applies to first joins too.
+that cap. This is relay sizing, and it applies to first joins too. **Raised to
+8192 by user decision (2026-09-25).**
+- Beyond fleet size, the higher cap makes a token holder's lockout slower:
+  at the unchanged bind rate (16 per 10 s), filling 64 channels took about
+  40 s, while 8192 takes over an hour.
+- The relay's total `max_channels` (250,000) is unchanged.
+
+**The enrollment service's concurrent-session cap**
+(`ServiceConfig::max_sessions`) went from 64 to 256, also by user decision,
+after weighing 8192.
+- It bounds concurrent pre-authentication (PSK-free NK) handshakes on the
+  operator's public port.
+- 64 already served thousands of joins a minute, since each handshake takes
+  milliseconds.
+- 8192 would let a flood hold far more operator resources and could exhaust
+  a default 1024 open-file limit. The ledger's durable writes need file
+  descriptors, so that exhaustion could fail a legitimate issuance.
+- 256 gives burst headroom and stays well under that limit.
 
 Regressions: `relay_join` 5/5; `net-cli` clippy is clean.
 

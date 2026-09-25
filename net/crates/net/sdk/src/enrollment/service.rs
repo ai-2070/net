@@ -71,7 +71,7 @@ pub struct ServiceConfig {
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
-            max_sessions: 64,
+            max_sessions: 256,
             session_timeout: Duration::from_secs(10),
         }
     }
