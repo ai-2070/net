@@ -91,6 +91,15 @@ credential, each authorized on its own. While its `up` is stopped, a joined devi
 provider or consumer as itself with `wrap --joined <state-dir>` / `mcp serve --joined <state-dir>`;
 `down` stops the node, `leave` leaves the mesh, and a `relay serve` host plus `up --relay` gives an
 unreachable device a fallback path.
+
+**What the mesh is — and its limits.** One profile is one node, and one mesh is one flat trust
+domain: the PSK is a membership secret, so a joined device can open a session with any peer. The
+join link is mesh-wide, not a scoped slice — subnet, org and channel decide what a session may do,
+not the transport. Links are minted by the operator's running `up --enroll` node, so if that node
+is down, existing members keep working but no new device can enroll. Nothing caps the mesh but the
+PSK distribution and a reachable relay: there is no registry or leader, and every device that
+cannot be reached directly falls back to the relay host you run — a shared availability and
+latency point.
 [CLI reference](https://ai2070.net/docs/reference/cli),
 [Enrollment journey](https://github.com/ai-2070/net/blob/master/net/crates/net/cli/tests/fixtures/enrollment/README.md).
 
