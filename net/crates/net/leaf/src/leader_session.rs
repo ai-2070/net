@@ -1282,7 +1282,6 @@ async fn take_leadership(shared: &Rc<Shared>, previous: Option<u64>) -> Result<(
 /// *and* on the path where a promotion's re-bootstrap failed, and the
 /// declarations it carries have to be the same both times.
 fn attach_as_follower(shared: &Rc<Shared>) -> Result<()> {
-    let seed = correlation_seed()?;
     let follower = follower_id()?;
     let (declared, capabilities) = {
         let state = shared.state.borrow();
@@ -1291,13 +1290,7 @@ fn attach_as_follower(shared: &Rc<Shared>) -> Result<()> {
             state.capabilities.clone(),
         )
     };
-    let mut client = ProxyClient::new(
-        shared.transport.clone(),
-        follower,
-        declared,
-        capabilities,
-        seed,
-    );
+    let mut client = ProxyClient::new(shared.transport.clone(), follower, declared, capabilities);
     client.attach();
     *shared.client.borrow_mut() = Some(client);
     Ok(())
@@ -3445,13 +3438,6 @@ fn follower_id() -> Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-/// A fresh correlation seed, for the reason `CallTable::with_seed`
-/// exists: a follower that reattaches after a leader change must not
-/// reuse a predecessor's ids.
-fn correlation_seed() -> Result<u64> {
-    follower_id()
-}
-
 // ───────── org-scoped calls and serves through the proxy (S4) ─────────
 //
 // # Attribution invariants (enforced here; the browser lane's witness
@@ -3460,11 +3446,12 @@ fn correlation_seed() -> Result<u64> {
 // Per-call correlation is the **follower's self-minted `call` id**
 // plus the gate generation it opened under — never a wire id, never
 // an incarnation (a stream's resolved identity comes back in
-// `ProxyValue::Stream` and is not a correlation). The id namespace is
-// process-monotonic and never reset (the `GenerationGate` rule one
-// level down): a successor generation's calls carry fresh, higher
-// ids, so a late reply to a dead generation's call can never land on
-// a live one. A generation move fails every pending proxied call
+// `ProxyValue::Stream` and is not a correlation). Each id is a fresh
+// CSPRNG draw: a successor generation's calls carry fresh ids, so a
+// late reply to a dead generation's call cannot land on a live one,
+// and no tab can predict another's next id to pre-claim it at the
+// leader (§23 audit — a counted id was predictable from one observed
+// envelope). A generation move fails every pending proxied call
 // typed `LeaderLost` (`ProxyClient::fail_pending`) and is NEVER
 // resumed. Per-follower callback attribution is the follower's own
 // handle: the leader's relay keys every call by exactly the id the
@@ -3495,22 +3482,15 @@ use crate::rpc_stream::{RetireReason, StreamTerminal};
 /// How often a pending org long-pull re-checks its queue.
 const ORG_PULL_MS: i32 = 50;
 
-// The follower's self-minted org correlation namespace. Monotonic
-// and never reset — see the attribution note above.
-thread_local! {
-    static NEXT_ORG_ID: Cell<u64> = const { Cell::new(0) };
-}
-
-/// The next self-minted org correlation id.
+/// The next self-minted org correlation id: a fresh CSPRNG draw, never
+/// 0 — see the attribution note above.
 fn next_org_id() -> Result<u64> {
-    NEXT_ORG_ID.with(|next| {
-        if next.get() == 0 {
-            next.set(correlation_seed()?);
+    loop {
+        let id = follower_id()?;
+        if id != 0 {
+            return Ok(id);
         }
-        let id = next.get().wrapping_add(1);
-        next.set(id);
-        Ok(id)
-    })
+    }
 }
 
 /// Read one transparent envelope back.

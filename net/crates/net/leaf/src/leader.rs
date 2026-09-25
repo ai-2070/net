@@ -589,14 +589,16 @@ pub enum LeaderRequest {
     //
     // **Attribution, stated once and enforced everywhere below.**
     // Per-call correlation is the FOLLOWER's self-minted `call` id
-    // (`correlation_seed()`-derived, monotonic across generations:
-    // never a wire id, never an incarnation — a stream's resolved
-    // identity comes back in `ProxyValue::Stream` and is not a
-    // correlation). The gate generation rides every envelope
-    // (`ProxyEnvelope::generation`) and a generation move fails every
-    // pending correlation typed `LeaderLost`, never resumed; a
-    // successor generation's calls carry fresh, higher ids so a late
-    // reply to a dead generation's call can never land on a live one.
+    // (a fresh CSPRNG draw per call: never a wire id, never an
+    // incarnation — a stream's resolved identity comes back in
+    // `ProxyValue::Stream` and is not a correlation). The gate generation
+    // rides every envelope (`ProxyEnvelope::generation`) and a generation
+    // move fails every pending correlation typed `LeaderLost`, never
+    // resumed; a successor generation's calls draw fresh ids, so a late
+    // reply to a dead generation's call cannot land on a live one.
+    // Random rather than counted (§23 audit): the ids travel in clear on
+    // a channel every same-origin tab reads, and a counted id let a tab
+    // pre-empt a victim's NEXT request in the leader's dedup window.
     // Per-follower attribution is the follower's own handle — its
     // `call` id — and the backend keys its relay state by exactly
     // that; delivering a call's items under another follower's
@@ -1945,24 +1947,21 @@ pub struct ProxyClient {
     subscriptions: Vec<String>,
     capabilities: Vec<String>,
     pending: HashMap<u64, oneshot::Sender<ProxyOutcome>>,
-    next_correlation: u64,
 }
 
 impl ProxyClient {
     /// A client for `follower`, declaring `subscriptions` and
     /// `capabilities`.
     ///
-    /// `correlation_seed` is the first correlation id, for the same
-    /// reason [`crate::rpc::CallTable::with_seed`] exists: a follower
-    /// that reattaches after a leader change must not reuse a
-    /// predecessor's ids, or a late reply would land on a live
-    /// correlation.
+    /// Correlation ids are drawn fresh from the CSPRNG per request
+    /// ([`Self::issue`]): a follower that reattaches after a leader
+    /// change never reuses a predecessor's ids, and no tab can predict
+    /// another's next id (LEAF-12, §23 audit).
     pub fn new(
         transport: Rc<dyn ProxyTransport>,
         follower: u64,
         subscriptions: Vec<String>,
         capabilities: Vec<String>,
-        correlation_seed: u64,
     ) -> Self {
         Self {
             transport,
@@ -1972,7 +1971,6 @@ impl ProxyClient {
             subscriptions,
             capabilities,
             pending: HashMap::new(),
-            next_correlation: correlation_seed,
         }
     }
 
@@ -2050,8 +2048,13 @@ impl ProxyClient {
             })));
             return (None, rx);
         }
-        let correlation = self.next_correlation;
-        self.next_correlation = self.next_correlation.wrapping_add(1);
+        let correlation = match fresh_correlation(&self.pending) {
+            Ok(correlation) => correlation,
+            Err(error) => {
+                let _ = tx.send(Err(ProxyFailure::Typed(error)));
+                return (None, rx);
+            }
+        };
         // Standing intent, recorded so a re-attach after a leader
         // change carries it: whichever tab is promoted restores what
         // its followers currently want, not what they asked for once.
@@ -2361,6 +2364,17 @@ fn relay_seed() -> Result<u64> {
     getrandom::fill(&mut bytes)
         .map_err(|e| LeafError::Identity(format!("no CSPRNG available: {e}")))?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+/// A fresh request correlation: a CSPRNG draw, never 0 and never a
+/// pending id (LEAF-12, §23 audit — see [`ProxyClient::new`]).
+fn fresh_correlation(pending: &HashMap<u64, oneshot::Sender<ProxyOutcome>>) -> Result<u64> {
+    loop {
+        let correlation = relay_seed()?;
+        if correlation != 0 && !pending.contains_key(&correlation) {
+            return Ok(correlation);
+        }
+    }
 }
 
 /// The leader-side relay for proxied org calls and serves.
@@ -4121,7 +4135,7 @@ mod tests {
     #[test]
     fn a_leader_change_fails_the_old_generations_calls_typed_and_retries_nothing() {
         let transport = Rc::new(RecordingTransport::new());
-        let mut client = ProxyClient::new(transport.clone(), 42, vec!["chan".into()], vec![], 100);
+        let mut client = ProxyClient::new(transport.clone(), 42, vec!["chan".into()], vec![]);
 
         client
             .on_message(&envelope(
@@ -4187,10 +4201,15 @@ mod tests {
     /// THE stale-leader witness, in its pure form: a tab that was
     /// suspended still believes it holds generation *n*, and every
     /// message it emits is refused by a follower that has seen *n+1*.
+    /// LEAF-12 residual (§23 audit): a follower's request correlations
+    /// are drawn per request, so one observed envelope does not predict
+    /// the next — a tab cannot pre-claim a victim's next `(follower,
+    /// correlation)` in the leader's dedup window and get the real request
+    /// dropped. Pre-audit they counted up by one from a random seed.
     #[test]
-    fn a_resumed_leaders_messages_are_fenced_and_change_nothing() {
+    fn consecutive_request_correlations_are_not_sequential() {
         let transport = Rc::new(RecordingTransport::new());
-        let mut client = ProxyClient::new(transport.clone(), 42, vec![], vec![], 100);
+        let mut client = ProxyClient::new(transport, 42, vec![], vec![]);
         client
             .on_message(&envelope(
                 9,
@@ -4198,7 +4217,30 @@ mod tests {
                 ProxyBody::Leadership { node_id: 8 },
             ))
             .expect("current leader");
-        let mut pending = client.request(LeaderRequest::Counters);
+        let (first, _a) = client.issue(LeaderRequest::Counters);
+        let (second, _b) = client.issue(LeaderRequest::Counters);
+        let (first, second) = (first.expect("issued"), second.expect("issued"));
+        assert_ne!(
+            second,
+            first.wrapping_add(1),
+            "the next correlation is not predictable"
+        );
+        assert_ne!(second, first);
+    }
+
+    #[test]
+    fn a_resumed_leaders_messages_are_fenced_and_change_nothing() {
+        let transport = Rc::new(RecordingTransport::new());
+        let mut client = ProxyClient::new(transport.clone(), 42, vec![], vec![]);
+        client
+            .on_message(&envelope(
+                9,
+                ProxySide::Leader,
+                ProxyBody::Leadership { node_id: 8 },
+            ))
+            .expect("current leader");
+        let (issued, mut pending) = client.issue(LeaderRequest::Counters);
+        let issued = issued.expect("a current leader issues a correlation");
 
         // The resumed tab, still stamping the generation it held.
         for body in [
@@ -4207,7 +4249,7 @@ mod tests {
                 json: "{\"type\":\"connected\"}".into(),
             },
             ProxyBody::Reply {
-                correlation: 100,
+                correlation: issued,
                 value: ProxyValue::Text("stale".into()),
             },
             ProxyBody::Restored {
@@ -4246,7 +4288,7 @@ mod tests {
     #[test]
     fn an_announced_leader_loss_fails_the_pending_work_it_names() {
         let transport = Rc::new(RecordingTransport::new());
-        let mut client = ProxyClient::new(transport, 42, vec![], vec![], 100);
+        let mut client = ProxyClient::new(transport, 42, vec![], vec![]);
         client
             .on_message(&envelope(
                 3,
@@ -4278,7 +4320,7 @@ mod tests {
     #[test]
     fn a_request_with_no_leader_is_refused_immediately() {
         let transport = Rc::new(RecordingTransport::new());
-        let mut client = ProxyClient::new(transport.clone(), 42, vec![], vec![], 100);
+        let mut client = ProxyClient::new(transport.clone(), 42, vec![], vec![]);
 
         let mut pending = client.request(LeaderRequest::Counters);
         let outcome = pending.try_recv().expect("not cancelled").expect("settled");
@@ -4308,7 +4350,7 @@ mod tests {
         let backend = TestBackend::new(0x5151);
         let seen = backend.seen.clone();
         let mut server = ProxyServer::new(backend, to_follower.clone(), 6);
-        let mut client = ProxyClient::new(to_leader.clone(), 77, vec!["chan".into()], vec![], 500);
+        let mut client = ProxyClient::new(to_leader.clone(), 77, vec!["chan".into()], vec![]);
 
         client.attach();
         for text in to_leader.raw() {

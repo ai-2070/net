@@ -310,30 +310,9 @@ impl ReplayState {
         self.release_quota(entry);
     }
 
-    /// Move one overwritten entry's quota onto the principal the
-    /// re-admission presents — the expired-overwrite mirror of
-    /// [`Self::release`] + [`Self::charge`] WITHOUT `total`, because
-    /// the `(caller, call_id)` key was occupied and stays occupied.
-    ///
-    /// The CHARGE must move anyway: the key excludes `acting_org`,
-    /// and this path runs only AFTER the window has expired, so the
-    /// caller can return under a DIFFERENT verified acting org (or a
-    /// re-adopt can flip [`ReplayEntry::external`]). Leaving the
-    /// replaced entry's counters in place strands the old org's quota
-    /// — denied [`ReplayOutcome::PerOrganizationCapacityExhausted`]
-    /// with zero live entries — and makes `release` decrement
-    /// counters the stored entry never incremented, underflowing
-    /// `external_total` on an `external` flip.
-    fn retarget(&mut self, old: &ReplayEntry, entry_external: bool, acting_org: &OrgId) {
-        if old.acting_org != *acting_org || old.external != entry_external {
-            self.release_quota(old);
-            self.charge_quota(entry_external, acting_org);
-        }
-    }
-
     /// Charge one entry's per-org and external-pool share — every
     /// counter except `total`. Split out so [`Self::charge`] and
-    /// [`Self::retarget`] share one implementation of the quota moves.
+    /// the expired-overwrite path share one implementation of the quota moves.
     fn charge_quota(&mut self, entry_external: bool, acting_org: &OrgId) {
         *self.by_org.entry(*acting_org).or_insert(0) += 1;
         if entry_external {
@@ -701,43 +680,45 @@ impl AdmissionReplayGuard {
         // An existing entry for this exact `(caller, call_id)`:
         // replay vs collision, UNLESS it has expired (then it is
         // reusable — the window closed, so this is a legitimate new
-        // call reusing the id). Handled under one `get_mut` so the
-        // expired overwrite touches neither `total` nor the
-        // per-caller count (the key stays occupied).
-        if let Some(inner) = st.by_caller.get_mut(caller) {
-            if let Some(existing) = inner.get(&call_id) {
-                if existing.expires_at > now {
-                    return if existing.binding_digest == binding_digest {
-                        ReplayOutcome::Replay
-                    } else {
-                        ReplayOutcome::CallIdCollision
-                    };
-                }
-                // Expired overwrite REUSES the occupied key, so
-                // `total` and the per-caller count must not move.
-                // The CHARGE must move anyway: the key is
-                // `(caller, call_id)` and excludes `acting_org`, and
-                // this branch runs only AFTER the window has expired —
-                // the caller can return under a DIFFERENT verified
-                // acting org, and a re-adopt can flip `external`.
-                // `retarget` moves the replaced entry's counters onto
-                // the entry actually stored; leaving them put strands
-                // the old org's quota and makes `release` decrement
-                // counters this entry never incremented.
-                let replaced = inner.insert(
-                    call_id,
-                    ReplayEntry {
-                        binding_digest,
-                        expires_at,
-                        acting_org: *principal.acting_org,
-                        external,
-                    },
-                );
-                if let Some(replaced) = replaced {
-                    st.retarget(&replaced, external, principal.acting_org);
+        // call reusing the id).
+        let existing = st
+            .by_caller
+            .get(caller)
+            .and_then(|inner| inner.get(&call_id))
+            .map(|e| (e.expires_at, e.binding_digest, e.acting_org, e.external));
+        if let Some((expires, digest, old_org, old_external)) = existing {
+            if expires > now {
+                return if digest == binding_digest {
+                    ReplayOutcome::Replay
+                } else {
+                    ReplayOutcome::CallIdCollision
+                };
+            }
+            if old_org == *principal.acting_org && old_external == external {
+                // Same trust-domain charge: overwrite in place. The key
+                // stays occupied, so no counter moves.
+                if let Some(inner) = st.by_caller.get_mut(caller) {
+                    inner.insert(
+                        call_id,
+                        ReplayEntry {
+                            binding_digest,
+                            expires_at,
+                            acting_org: *principal.acting_org,
+                            external,
+                        },
+                    );
                 }
                 return ReplayOutcome::Admitted;
             }
+            // The charge would MOVE — the caller returned under a different
+            // verified acting org, or a re-adopt flipped `external` (the key
+            // excludes both, and this runs only after the window expired).
+            // For quota purposes that is a NEW admission: release the expired
+            // entry through the ordinary reclaim and admit it below, so the
+            // per-org and external-pool limits apply. Moving the charge in
+            // place (LEAF-2's first repair) skipped them and could overshoot a
+            // full pool by one entry per reused call id (§23 audit).
+            st.reclaim_caller(caller, now);
         }
 
         // New key for this caller. Per-caller ceiling FIRST so a
@@ -975,7 +956,8 @@ mod tests {
     //
     // The `(caller, call_id)` key EXCLUDES `acting_org`, and the overwrite
     // branch runs only AFTER the window has expired, so the same caller can
-    // re-present the id verified for a DIFFERENT acting org — or flip    // `external` when the owner org changes under a re-adopt. The replaced
+    // re-present the id verified for a DIFFERENT acting org — or flip
+    // `external` when the owner org changes under a re-adopt. The replaced
     // entry's counters must move with the stored entry, or its old org's
     // quota leaks upward until that org is denied with zero live entries,
     // and `release` later decrements counters the stored entry never
@@ -1162,6 +1144,84 @@ mod tests {
         assert_eq!(guard.caller_len(&caller(1)), 0);
         assert_eq!(guard.caller_len(&caller(2)), 0);
         assert_eq!(guard.caller_len(&caller(3)), 0);
+    }
+
+    /// LEAF-2 residual (§23 audit) — an expired overwrite whose charge
+    /// MOVES is a new admission for quota purposes, so the per-org and
+    /// external-pool limits apply to it. The first repair moved the charge
+    /// in place and skipped both checks: one reused call id could push a
+    /// full org, or a full external pool, one entry over its bound.
+    #[test]
+    fn a_moving_expired_overwrite_is_bounded_by_the_trust_domain_quotas() {
+        let t0 = 1_000u64;
+        let short = t0 + 5_000;
+        let later = t0 + 6_000;
+        let long = later + 100_000;
+        let new_expires = later + 5_000;
+        let org_a = external_org(0xA1);
+        let org_b = external_org(0xB1);
+
+        // Per-org: org B is already at its 8-entry limit (two identities
+        // x 4). Caller 1's expired entry under org A returns under org B.
+        let guard = partitioned();
+        assert_eq!(
+            admit_external(&guard, &org_a, &caller(1), 7, [1u8; 32], short, t0),
+            ReplayOutcome::Admitted,
+        );
+        for id in [10u8, 11] {
+            for call in 0..4u64 {
+                assert_eq!(
+                    admit_external(&guard, &org_b, &caller(id), call, [id; 32], long, t0),
+                    ReplayOutcome::Admitted,
+                );
+            }
+        }
+        assert_eq!(
+            admit_external(&guard, &org_b, &caller(1), 7, [2u8; 32], new_expires, later),
+            ReplayOutcome::PerOrganizationCapacityExhausted,
+            "moving the charge into a full org is refused like any new entry",
+        );
+        assert_eq!(guard.org_len(&org_b), 8, "org B never exceeds its bound");
+        assert_eq!(guard.org_len(&org_a), 0, "the expired entry was reclaimed");
+
+        // External pool: 30 live external entries fill the pool (four orgs,
+        // eight callers x 4 - two unused). Caller 1's expired OWNER entry
+        // returns external under an empty org.
+        let guard = partitioned();
+        assert_eq!(
+            admit_owner(&guard, &caller(1), 7, [1u8; 32], short, t0),
+            ReplayOutcome::Admitted,
+        );
+        let mut filled = 0;
+        'fill: for org in [0xC1u8, 0xC2, 0xC3, 0xC4] {
+            for id in [org.wrapping_add(0x10), org.wrapping_add(0x20)] {
+                for call in 0..4u64 {
+                    if filled == 30 {
+                        break 'fill;
+                    }
+                    assert_eq!(
+                        admit_external(
+                            &guard,
+                            &external_org(org),
+                            &caller(id),
+                            call,
+                            [id; 32],
+                            long,
+                            t0,
+                        ),
+                        ReplayOutcome::Admitted,
+                    );
+                    filled += 1;
+                }
+            }
+        }
+        assert_eq!(guard.external_len(), 30);
+        assert_eq!(
+            admit_external(&guard, &org_b, &caller(1), 7, [2u8; 32], new_expires, later),
+            ReplayOutcome::ExternalPoolCapacityExhausted,
+            "an owner->external flip into a full pool is refused like any new entry",
+        );
+        assert_eq!(guard.external_len(), 30, "the pool never exceeds its bound");
     }
 
     /// The underflow guard: `release` must never wrap `external_total`.
