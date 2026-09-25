@@ -1,0 +1,41 @@
+net/crates/net/leaf/src/leader_session.rs
+  s_d8b00bedd146e9::t_9cd086f6aea43b 2291,3518-3519,3521
+net/crates/net/browser-ts/src/org.ts
+  s_d8b00bedd146e9::t_c107a262de3dc0 210-211
+net/crates/net/browser-ts/test/org.test.ts
+  s_d8b00bedd146e9::t_027ab4bc0256f5 61,208-234,242-258,304-305,312-334
+  s_d8b00bedd146e9::t_2dee742db1b4e9 335
+net/crates/net/leaf/src/rpc_stream.rs
+  s_d8b00bedd146e9::t_9cd086f6aea43b 203-223
+  s_d8b00bedd146e9::t_04173c2483c8d6 1284-1312
+net/crates/net/browser-ts/src/errors.ts
+  s_d8b00bedd146e9::t_69b6631e77f541 472-478,487-488,565-569,633
+net/crates/net/tests/rtc_browser/page/org.js
+  s_d8b00bedd146e9::t_ce4f14b0258ad9 199-202,403,492
+net/crates/net/tests/rtc_browser/runner/src/org_stream.rs
+  s_d8b00bedd146e9::t_96b50003321e66 4516-4517
+  s_d8b00bedd146e9::t_561a67af8d9a7f 4501-4506
+  s_d8b00bedd146e9::t_f5b71ba31fa79e 3319-3326
+  s_d8b00bedd146e9::t_6891d9ed8cb722 605-619
+  s_d8b00bedd146e9::t_f87f85fa380284 3337-3339,3343-3344
+  s_d8b00bedd146e9::t_99f36e6922cb76 4533-4534,4536-4537
+net/crates/net/leaf/tests/ts_abi_fixture.rs
+  s_d8b00bedd146e9::t_2b58f65d97ac2d 346-619,621-649
+  s_d8b00bedd146e9::t_465cca8b0a0a89 620
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8ec499242eec494c49c1e5205a4c2a02da24521a",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
