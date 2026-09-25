@@ -1,7 +1,0 @@
-=== RUN   TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider
-provider: handshake done, starting mesh + announce loop
-provider: serving, announcing
-provider: awaiting DRAINED
---- PASS: TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider (19.35s)
-PASS
-ok  	github.com/ai-2070/net/go	19.760s

@@ -1,8 +1,0 @@
-=== RUN   TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider
-provider: handshake done, starting mesh + announce loop
-provider: serving, announcing
-    org_streaming_opening_vectors_test.go:679: recv: org:rpc:server_error: rpc: server returned status 0x0005: server observed CANCEL during streaming handler execution
---- FAIL: TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider (31.51s)
-FAIL
-exit status 1
-FAIL	github.com/ai-2070/net/go	31.899s
