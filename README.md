@@ -63,23 +63,22 @@ Capabilities, authority, and state on one substrate change what you can build. E
 with the knobs you'd set; the links go deeper.
 
 **Distance becomes a parameter, not a rewrite.** Call a capability by name; the mesh decides where
-it runs. `service=fleet.observe`, `deadline=500ms`, `routing=lowest-latency`, `target=by-name`.
+it runs. `deadline=500ms`, `routing=lowest-latency`.
 [Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke),
 [Architecture](https://ai2070.net/docs/concepts/architecture).
 
 **Sensing and computation stop sharing a body.** A device produces data without hosting the code
-that acts on it. `channel=sensors/lidar/front`, `visibility=global`, `reliability=reliable`,
-`artifact=blob-ref`.
+that acts on it. `channel=sensors/lidar/front`, `reliability=reliable`.
 [Capabilities](https://ai2070.net/docs/concepts/capabilities),
 [Dataforts](https://ai2070.net/docs/guides/dataforts).
 
 **Coordination that never funnels through a coordinator.** No registry, broker, or leader to cap
-it. `shards=16`, `backpressure=drop-oldest`, `batch=1024/5ms`, `adapter=mesh|noop|redis`.
+it. `shards=16`, `backpressure=drop-oldest`.
 [Event bus](https://ai2070.net/docs/guides/event-bus),
 [Capabilities](https://ai2070.net/docs/concepts/capabilities).
 
 **Software that outlives its host.** A daemon is an identity, not a process pinned to a box.
-`requirements=vram>=24GB`, `placement=nearest`, `anti-affinity=on`, `replicas=3`.
+`placement=nearest`, `replicas=3`.
 [Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement),
 [Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration),
 [Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle).
