@@ -308,6 +308,30 @@ Lower-level bindings (skip the SDK ergonomics, talk directly to the engine):
 | **Node binding** | [`@net-mesh/core`](https://www.npmjs.com/package/@net-mesh/core) | `npm install @net-mesh/core` |
 | **Python binding** | [`net-mesh`](https://pypi.org/project/net-mesh/) | `pip install net-mesh` |
 
+The bindings are not at parity. This is the short version; the full matrix — with the reason
+behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/master/.claude/skills/net-event-bus/bindings/coverage.md).
+
+| Feature | Rust | Node / TS | Python | Go | C |
+|---|---|---|---|---|---|
+| Event bus — ingest + poll | ✓ | ✓ | ✓ | ✓ | ✓ `poll` |
+| Mesh channels — register / subscribe / publish | ✓ | ✓ | core-only | ✓ | ✓ |
+| Capability announce + discovery | ✓ | ✓ | ✓ | ✓ | ✓ |
+| nRPC — typed request/response + streaming | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Gang-claim scheduler | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Organization capability auth | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Subnet exports — serve + call | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Dataforts — blobs | ✓ | ✓ | ✓ | partial | ✓ |
+| RedEX / CortEX / MeshDB | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Compute / groups / daemons | ✓ | ✓ | core-only | ✓ | ✓ |
+| Deck — operator surface | ✓ | ✓ | ✓ | ✓ | ✓ |
+| MCP bridge | ✓ | ✓ | ✓ | ✓ | ✓ |
+| A2A — agent task handoff | ✓ | core-only | core-only | – | – |
+| A2A — paid task admission | ✓ | – | core-only | – | – |
+| Consumer-side filter DSL | ✓ | ✓ | ✓ | – | ✓ |
+
+`✓` supported · `core-only` reachable only through the low-level binding (`@net-mesh/core`,
+`net`) · `partial` · `–` not exposed.
+
 ## Claude Code Skill
 
 Net looks like Kafka or NATS from the outside and is not one underneath; an agent working from
