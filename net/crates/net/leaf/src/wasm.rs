@@ -5792,7 +5792,21 @@ impl OrgCall {
                     }
                 })
             }
-            OrgWhere::Proxy(proxy) => proxy.poll().await?,
+            OrgWhere::Proxy(proxy) => {
+                let polled = proxy.poll().await;
+                // LEAF-1, concurrent half (§23 audit): another consumer
+                // may have latched the terminal while this poll was in
+                // flight. The relay releases a call with its terminal
+                // (LEAF-13), so this poll's answer is then `no_such_call`
+                // — which must not surface as a DIFFERENT terminal. Items
+                // were ordered before the terminal and still deliver.
+                let latched = self.terminal.borrow().clone();
+                match (polled, latched) {
+                    (Ok(OrgPoll::Item(body)), _) => OrgPoll::Item(body),
+                    (_, Some(terminal)) => return Ok(OrgPoll::Terminal(terminal)),
+                    (polled, None) => polled?,
+                }
+            }
         };
         if let OrgPoll::Terminal(terminal) = &got {
             self.latch(terminal.clone());

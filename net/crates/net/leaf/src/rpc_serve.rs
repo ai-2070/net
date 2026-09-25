@@ -247,6 +247,10 @@ struct ServeShared {
     /// The retired signal (an observable, never a handler-side event —
     /// see [`ServeHandler`], F-S3.1-2).
     retired: Option<RetireReason>,
+    /// The call's ONE terminal has committed — by completion or by
+    /// retirement — and its registry entry is gone. Nothing further can
+    /// happen to it; a holder may release it (§23 audit, LEAF-13).
+    settled: bool,
 }
 
 /// The handler-side handle: verified caller facts, request-item
@@ -339,6 +343,14 @@ impl ServeCall {
     /// detached holder can observe this (F-S3.1-2).
     pub fn retired(&self) -> Option<RetireReason> {
         self.inner.borrow().retired
+    }
+
+    /// Whether the call's one terminal has committed (completion OR
+    /// retirement). Unlike [`Self::retired`], this is also `true` after a
+    /// normal completion — the signal a relay holding this call needs to
+    /// know it can release it.
+    pub fn settled(&self) -> bool {
+        self.inner.borrow().settled
     }
 }
 
@@ -800,6 +812,7 @@ impl ServeRegistry {
             producer_done: false,
             closed: false,
             retired: None,
+            settled: false,
         }));
         self.openings.remove(&key);
         self.calls.insert(
@@ -1012,7 +1025,9 @@ impl ServeRegistry {
             // Whether retired now or earlier, a committed terminal
             // means the entry is no longer live.
             if self.calls.get(key).is_some_and(|s| s.terminal.is_some()) {
-                self.calls.remove(key);
+                if let Some(state) = self.calls.remove(key) {
+                    state.shared.borrow_mut().settled = true;
+                }
             }
         }
         n
@@ -1028,7 +1043,9 @@ impl ServeRegistry {
             state.terminal.is_some()
         };
         if committed {
-            self.calls.remove(&key);
+            if let Some(state) = self.calls.remove(&key) {
+                state.shared.borrow_mut().settled = true;
+            }
         }
     }
 

@@ -2593,14 +2593,16 @@ impl LeaderBackend for NodeBackend {
                     loop {
                         let polled = {
                             let relay = org.borrow();
-                            relay.serve_call(from, call).map(|serve| serve.retired())
+                            relay
+                                .serve_call(from, call)
+                                .map(|serve| (serve.retired(), serve.settled()))
                         };
                         match polled {
                             None => {
                                 reply.fail(no_such_call(call));
                                 return;
                             }
-                            Some(Some(reason)) => {
+                            Some((Some(reason), _)) => {
                                 // The frozen `OrgRetireReason`
                                 // string, identical to the direct
                                 // surface's `retired` vocabulary.
@@ -2608,9 +2610,21 @@ impl LeaderBackend for NodeBackend {
                                     crate::leader::ORG_ENVELOPE_RETIRED,
                                     crate::wasm::retire_reason_text(reason).as_bytes(),
                                 ));
+                                org.borrow_mut().release_serve(from, call);
                                 return;
                             }
-                            Some(None) => {
+                            Some((None, true)) => {
+                                // Completed without retirement: the
+                                // watcher's answer is END. Pre-audit
+                                // this loop never answered a completed
+                                // call, and the served call stayed in
+                                // the relay for the registration's life
+                                // (§23 audit, LEAF-13).
+                                reply.bytes(envelope(crate::leader::ORG_ENVELOPE_END, b""));
+                                org.borrow_mut().release_serve(from, call);
+                                return;
+                            }
+                            Some((None, false)) => {
                                 gloo_timer_sleep(ORG_PULL_MS).await.ok();
                             }
                         }
@@ -3769,36 +3783,35 @@ impl ProxyServeCall {
         });
         let retirement = state.clone();
         spawn_local(async move {
-            loop {
-                if retirement.retired.get().is_some() {
-                    return;
-                }
-                match retirement
-                    .lifecycle
-                    .request(LeaderRequest::OrgServeRetired { call })
-                    .await
-                {
-                    Ok(ProxyValue::Bytes(payload)) => {
-                        if let Ok(crate::wasm::OrgPoll::Terminal(StreamTerminal::Retired {
-                            reason,
-                        })) = decode_org_envelope(&payload)
-                        {
-                            if retirement.retired.get().is_none() {
-                                retirement.retired.set(Some(reason));
-                            }
-                            return;
-                        }
-                    }
-                    Err(_) => {
-                        // The leader went away: the generation
-                        // failure IS the retirement.
+            if retirement.retired.get().is_some() {
+                return;
+            }
+            // ONE long-poll: the leader answers once, with the retirement
+            // reason or `END` for a call that completed without retiring,
+            // and releases the call as it answers (LEAF-13) — asking again
+            // would read that release as a failure.
+            match retirement
+                .lifecycle
+                .request(LeaderRequest::OrgServeRetired { call })
+                .await
+            {
+                Ok(ProxyValue::Bytes(payload)) => {
+                    if let Ok(crate::wasm::OrgPoll::Terminal(StreamTerminal::Retired { reason })) =
+                        decode_org_envelope(&payload)
+                    {
                         if retirement.retired.get().is_none() {
-                            retirement.retired.set(Some(RetireReason::LeaderLost));
+                            retirement.retired.set(Some(reason));
                         }
-                        return;
                     }
-                    Ok(_) => return,
                 }
+                Err(_) => {
+                    // The leader went away: the generation failure IS
+                    // the retirement.
+                    if retirement.retired.get().is_none() {
+                        retirement.retired.set(Some(RetireReason::LeaderLost));
+                    }
+                }
+                Ok(_) => {}
             }
         });
         state

@@ -77,7 +77,12 @@ use crate::stream::Reliability;
 /// `OrgServeCaller` verb, LEAF-6). A mixed pair would half-work
 /// without the gate — an old accept decoder silently drops the new
 /// doc — so the version refuses instead.
-pub const PROXY_VERSION: u64 = 3;
+///
+/// `4` because `OrgServeRetired` now ANSWERS for a normally completed
+/// call (an `END` envelope) and the leader releases the served call
+/// there (§23 audit, LEAF-13). A `3` follower would re-ask, find the
+/// call released, and misread the refusal as `LeaderLost`.
+pub const PROXY_VERSION: u64 = 4;
 
 /// The Web Lock and `BroadcastChannel` name for an identity on an
 /// origin.
@@ -2384,9 +2389,6 @@ pub struct OrgRelay {
     /// only for the owner — a request's own claim is never the key
     /// (LEAF-4).
     registrations: HashMap<u64, (ProxySide, String)>,
-    /// The next bridge-call id. CSPRNG-seeded, then monotonic:
-    /// unguessable to another tab, never reused.
-    next_serve_call: u64,
 }
 
 impl OrgRelay {
@@ -2563,13 +2565,36 @@ impl OrgRelay {
         self.registrations.clear();
     }
 
-    /// The next bridge-call id — CSPRNG-seeded, then monotonic.
+    /// The next bridge-call id: a fresh CSPRNG draw per call, never 0
+    /// and never a live id. A seeded counter (the pre-audit shape) made
+    /// every later id predictable from one observed accept envelope
+    /// (§23 audit).
     pub fn next_bridge_call(&mut self) -> Result<u64> {
-        if self.next_serve_call == 0 {
-            self.next_serve_call = relay_seed()?;
+        loop {
+            let call = relay_seed()?;
+            if call != 0 && !self.serve_calls.contains_key(&call) {
+                return Ok(call);
+            }
         }
-        self.next_serve_call = self.next_serve_call.wrapping_add(1);
-        Ok(self.next_serve_call)
+    }
+
+    /// Release a SETTLED served call `from` owns (LEAF-13): its terminal
+    /// has committed on the node and the follower has been told the
+    /// outcome, so nothing further can reach it. `false` — no state
+    /// change — for an unsettled, foreign or unknown handle.
+    pub fn release_serve(&mut self, from: ProxySide, call: u64) -> bool {
+        match self.serve_calls.get(&call) {
+            Some((owner, _, serve)) if *owner == from && serve.settled() => {
+                self.serve_calls.remove(&call).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// How many served calls the relay holds (test observability).
+    #[cfg(test)]
+    pub(crate) fn serve_call_count(&self) -> usize {
+        self.serve_calls.len()
     }
 }
 
@@ -3514,7 +3539,7 @@ mod tests {
     #[test]
     fn udp_blocked_without_both_observations_arrives_as_an_ice_timeout() {
         let forged = serde_json::json!({
-            "v": "3",
+            "v": PROXY_VERSION.to_string(),
             "generation": "1",
             "from": "leader",
             "kind": "failed",
@@ -3727,13 +3752,19 @@ mod tests {
     /// guesses: two tabs on different deploys is an ordinary state.
     #[test]
     fn an_unknown_protocol_version_is_refused() {
-        let text =
-            envelope(1, ProxySide::Leader, ProxyBody::Detach).replace("\"v\":\"3\"", "\"v\":\"4\"");
-        let error = ProxyEnvelope::from_json(&text).expect_err("a v4 envelope must be refused");
-        assert!(error.to_string().contains("version 4"), "{error}");
+        let current = format!("\"v\":\"{PROXY_VERSION}\"");
+        let future = PROXY_VERSION + 1;
+        let text = envelope(1, ProxySide::Leader, ProxyBody::Detach)
+            .replace(&current, &format!("\"v\":\"{future}\""));
+        let error = ProxyEnvelope::from_json(&text).expect_err("a future envelope must be refused");
+        assert!(
+            error.to_string().contains(&format!("version {future}")),
+            "{error}"
+        );
         assert!(ProxyEnvelope::from_json("not json").is_err());
-        // A stale peer's v2 envelope is refused the same way — that
-        // is what the bump is for.
+        // A stale peer's envelope is refused the same way — that is what
+        // each bump is for (v3: the pre-LEAF-13 watcher; v2: pre-LEAF-4/6).
+        assert!(ProxyEnvelope::from_json("{\"v\":\"3\"}").is_err());
         assert!(ProxyEnvelope::from_json("{\"v\":\"2\"}").is_err());
     }
 
@@ -4667,6 +4698,12 @@ mod tests {
     /// One real admitted [`ServeCall`] — minted through the serve
     /// registry's own admission, never a hand-rolled double.
     fn relay_serve_call(world: &RelayWorld, call_id: u64) -> ServeCall {
+        relay_serve_call_in(world, call_id).1
+    }
+
+    /// [`relay_serve_call`], keeping the registry that owns the call so a
+    /// test can drive it to a terminal.
+    fn relay_serve_call_in(world: &RelayWorld, call_id: u64) -> (ServeRegistry, ServeCall) {
         let mut serves = ServeRegistry::new(0x5EED);
         let captured: Rc<RefCell<Option<ServeCall>>> = Rc::new(RefCell::new(None));
         let sink = Rc::clone(&captured);
@@ -4712,7 +4749,7 @@ mod tests {
         );
         assert_eq!(outcome, OpenOutcome::Admitted, "the fixture admits");
         let call = captured.borrow_mut().take();
-        call.expect("the handler hook ran")
+        (serves, call.expect("the handler hook ran"))
     }
 
     /// LEAF-5: a call handle resolves only inside the namespace of
@@ -4913,5 +4950,79 @@ mod tests {
             bridge, 1,
             "pre-fix the first bridge handle was the guessable 1"
         );
+    }
+
+    /// §23 audit: bridge handles are drawn per call, not counted up from
+    /// one random seed — one observed accept envelope must not predict
+    /// the next live handle.
+    #[test]
+    fn consecutive_bridge_handles_are_not_sequential() {
+        let world = RelayWorld::new();
+        let mut relay = OrgRelay::default();
+        let owner = ProxySide::Follower(1);
+        relay
+            .claim_registration(owner, 7, RELAY_SERVICE)
+            .expect("claim");
+        let mut install = |id| match relay.install_serve(owner, 7, relay_serve_call(&world, id)) {
+            Ok(bridge) => bridge,
+            Err(_) => panic!("the admitted call parks under its owner"),
+        };
+        let first = install(0x2000);
+        let second = install(0x2001);
+        assert_ne!(
+            second,
+            first.wrapping_add(1),
+            "pre-fix the second handle was the first plus one"
+        );
+    }
+
+    /// LEAF-13, the served-call half (§23 audit): a served call is
+    /// released once its terminal has committed — by completion or by
+    /// retirement — and only by its owner. Pre-audit `serve_calls` was
+    /// pruned only by `drop_registration`/`clear`, so a long-lived
+    /// registration kept one handle-holding entry per call it ever
+    /// served.
+    #[test]
+    fn a_settled_served_call_is_released_by_its_owner_only() {
+        let world = RelayWorld::new();
+        let owner = ProxySide::Follower(1);
+        let attacker = ProxySide::Follower(2);
+        let mut relay = OrgRelay::default();
+        relay
+            .claim_registration(owner, 7, RELAY_SERVICE)
+            .expect("claim");
+
+        // Completion.
+        let (mut serves, call) = relay_serve_call_in(&world, 0x2000);
+        let Ok(bridge) = relay.install_serve(owner, 7, call.clone()) else {
+            panic!("the admitted call parks under its owner");
+        };
+        assert!(
+            !relay.release_serve(owner, bridge),
+            "a live call is never released"
+        );
+        call.finish(crate::rpc_wire::StreamHandlerResult::Ok);
+        serves.advance(RELAY_NOW_NS);
+        assert!(call.settled(), "the unary terminal committed");
+        assert!(
+            !relay.release_serve(attacker, bridge),
+            "another sender cannot release it"
+        );
+        assert!(relay.release_serve(owner, bridge));
+        assert!(relay.serve_call(owner, bridge).is_none());
+        assert!(
+            !relay.release_serve(owner, bridge),
+            "a second release changes nothing"
+        );
+
+        // Retirement.
+        let (mut serves, call) = relay_serve_call_in(&world, 0x2001);
+        let Ok(bridge) = relay.install_serve(owner, 7, call.clone()) else {
+            panic!("the admitted call parks under its owner");
+        };
+        serves.fail_all(crate::rpc_stream::RetireReason::NodeClosed);
+        assert!(call.settled(), "a retirement settles the call");
+        assert!(relay.release_serve(owner, bridge));
+        assert_eq!(relay.serve_call_count(), 0, "nothing accumulates");
     }
 }

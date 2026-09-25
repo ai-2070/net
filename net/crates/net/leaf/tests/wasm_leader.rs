@@ -3960,6 +3960,10 @@ enum TerminalAnswer {
 struct TerminalBackend {
     node_id: u64,
     terminal: TerminalAnswer,
+    /// Mirror the real relay's LEAF-13 release: after the first terminal
+    /// the call is gone, and every later `OrgNext` is `no_such_call`.
+    release_after_terminal: bool,
+    answered: bool,
 }
 
 impl LeaderBackend for TerminalBackend {
@@ -3972,14 +3976,19 @@ impl LeaderBackend for TerminalBackend {
             // The open is acknowledged exactly as the real relay
             // acknowledges one: an empty END envelope.
             LeaderRequest::OrgCall { .. } => reply.bytes(Bytes::from_static(&[ORG_ENVELOPE_END])),
+            LeaderRequest::OrgNext { call } if self.release_after_terminal && self.answered => {
+                reply.fail(net_leaf::leader::no_such_call(call));
+            }
             LeaderRequest::OrgNext { .. } => match &self.terminal {
                 TerminalAnswer::Retired(reason) => {
+                    self.answered = true;
                     let mut envelope = Vec::with_capacity(1 + reason.len());
                     envelope.push(ORG_ENVELOPE_RETIRED);
                     envelope.extend_from_slice(reason.as_bytes());
                     reply.bytes(Bytes::from(envelope));
                 }
                 TerminalAnswer::Refused(status, message) => {
+                    self.answered = true;
                     reply.fail(ProxyFailure::Typed(LeafError::Rpc(RpcError::Refused {
                         status: *status,
                         message: message.clone(),
@@ -3996,11 +4005,20 @@ impl LeaderBackend for TerminalBackend {
 }
 
 /// A factory for [`TerminalBackend`], in the shape [`factory`] takes.
-fn terminal_factory(node_id: u64, terminal: TerminalAnswer) -> BackendFactory {
+fn terminal_factory(
+    node_id: u64,
+    terminal: TerminalAnswer,
+    release_after_terminal: bool,
+) -> BackendFactory {
     Rc::new(move |_opts, _sink, _lease| {
         let terminal = terminal.clone();
         Box::pin(async move {
-            let backend: Box<dyn LeaderBackend> = Box::new(TerminalBackend { node_id, terminal });
+            let backend: Box<dyn LeaderBackend> = Box::new(TerminalBackend {
+                node_id,
+                terminal,
+                release_after_terminal,
+                answered: false,
+            });
             Ok(backend)
         })
     })
@@ -4068,11 +4086,18 @@ fn terminal_item(item: &JsValue) -> (bool, Option<String>, Option<String>) {
 /// A follower session whose leader answers every org call's response
 /// half with `answer`.
 async fn org_terminal_session(answer: TerminalAnswer) -> (MeshSession, Lifecycle) {
+    org_terminal_session_with(answer, false).await
+}
+
+async fn org_terminal_session_with(
+    answer: TerminalAnswer,
+    release_after_terminal: bool,
+) -> (MeshSession, Lifecycle) {
     let db = unique("org-terminal-db");
     let scope = unique("org-terminal-scope");
     let leader = Lifecycle::open(
         opts(&db, &scope, &[], &[]),
-        terminal_factory(0x3333, answer),
+        terminal_factory(0x3333, answer, release_after_terminal),
     )
     .await
     .expect("leader");
@@ -4141,6 +4166,50 @@ async fn every_consumer_observes(answer: TerminalAnswer, kind: &str) {
          fabricated completion: {third_json:?}"
     );
     assert_eq!(third_json.as_deref(), Some(first_json.as_str()));
+
+    session.close();
+    leader.close();
+    settle().await;
+}
+
+/// LEAF-1, concurrent half (§23 audit): two consumers poll the SAME call
+/// at once. The relay answers the first with the terminal and releases
+/// the call (LEAF-13), so the second's poll comes back `no_such_call`.
+/// Pre-audit the loser surfaced that refusal as a DIFFERENT typed
+/// terminal; the latch must answer it with the one that was delivered.
+#[wasm_bindgen_test]
+async fn concurrent_consumers_both_observe_the_one_latched_terminal() {
+    let (session, leader) =
+        org_terminal_session_with(TerminalAnswer::Retired("revoked"), true).await;
+    let handle = session
+        .call_org_duplex("svc.terminal".into(), org_call_opts())
+        .await
+        .expect("the duplex call opens");
+    let first = handle.stream();
+    let second = handle.stream();
+
+    // Both polls are in flight before either answer is processed: each
+    // runs as its own task, and the relay's replies arrive
+    // asynchronously over the channel.
+    let (first_tx, first_rx) = oneshot::channel();
+    let (second_tx, second_rx) = oneshot::channel();
+    spawn_local(async move {
+        let _ = first_tx.send(first.next().await.ok());
+    });
+    spawn_local(async move {
+        let _ = second_tx.send(second.next().await.ok());
+    });
+    let a = first_rx.await.expect("the first consumer ran");
+    let b = second_rx.await.expect("the second consumer ran");
+    for (who, item) in [("first", a), ("second", b)] {
+        let (done, kind, json) = terminal_item(&item.expect("a terminal item, not an error"));
+        assert!(done, "{who}: the terminal arrives as a done item");
+        assert_eq!(
+            kind.as_deref(),
+            Some("revoked"),
+            "{who}: both concurrent consumers observe the one latched terminal: {json:?}"
+        );
+    }
 
     session.close();
     leader.close();

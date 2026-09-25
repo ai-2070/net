@@ -6825,6 +6825,7 @@ jobs:
           closing_a_promoting_tab_cancels_its_parked_bootstrap_and_frees_the_lock
           closing_a_tab_during_its_promotion_never_publishes_a_lock_holding_leader
           closing_the_leader_promotes_a_follower_fails_its_calls_and_restores_its_channels
+          concurrent_consumers_both_observe_the_one_latched_terminal
           standing_down_fences_then_retires_the_node_then_releases_the_lock
           the_generation_counter_is_monotonic_and_fences_a_stale_holder
           the_last_capability_declaring_followers_tag_is_withdrawn
@@ -6856,7 +6857,7 @@ jobs:
             # this step.
             case "$suite" in
               wasm_leaf)       floor=16 ;;
-              wasm_leader)     floor=36 ;;
+              wasm_leader)     floor=37 ;;
               wasm_anchorless) floor=2  ;;
               # The leaf half. `leaf/src/rtc.rs` is
               # `#![cfg(target_arch = "wasm32")]` in its entirety, so
@@ -6927,14 +6928,15 @@ jobs:
           # with reality again — the LEAF-1 latched-terminal quartet
           # and the three accept-claim/registration witnesses ran here
           # unpinned since their slices landed; all 36 tests of the
-          # suite are name-pinned and the floor is the real count.)
+          # suite are name-pinned and the floor is the real count. The
+          # §23 audit added the concurrent-consumer LEAF-1 witness: 37.)
           for witness in $LEADER_WITNESSES; do
             grep -q "^test $witness \.\.\. ok$" /tmp/wasm_leader.log || {
               echo "::error::the leader lifecycle witness $witness did not run and pass inside wasm"
               exit 1
             }
           done
-          echo "leader lifecycle: 36 witnesses executed in headless Chromium"
+          echo "leader lifecycle: 37 witnesses executed in headless Chromium"
 
       # Exit criterion: the shipped bundle stays under 1.5 MB gzipped.
       - name: Bundle size
