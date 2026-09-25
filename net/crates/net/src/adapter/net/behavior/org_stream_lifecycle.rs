@@ -727,22 +727,28 @@ impl InFlightItem {
 
     /// The CORE-2 publish barrier. A retirement terminal commits under
     /// `state`'s lock (`CallLifecycle::retire` is invoked with that lock
-    /// held), so re-checking liveness AND counting the publish under the
-    /// same lock linearizes every publish before any terminal commit:
-    /// **zero items publish after a retirement terminal commits**. Once
-    /// a terminal has committed the item is a counted discard (§2.2:
-    /// every retirement discards), never a metric-only drop — and the
-    /// pump stops publishing entirely (`false`).
+    /// held), so re-checking liveness AND counting the publish in ONE
+    /// critical section of that lock linearizes every publish decision
+    /// against every terminal commit: an item is either published before
+    /// the terminal commits or discarded after it — **zero items publish
+    /// after a retirement terminal commits**. Once a terminal has
+    /// committed the item is a counted discard (§2.2: every retirement
+    /// discards), never a metric-only drop — and the pump stops
+    /// publishing entirely (`false`).
     fn publish(
         mut self,
         state: &parking_lot::Mutex<CallLifecycle>,
         published: &std::sync::atomic::AtomicUsize,
     ) -> bool {
-        let live = state.lock().is_live();
+        // The guard is held across the count (§23 audit: releasing it
+        // between the check and the count let a retire commit in the gap).
+        let guard = state.lock();
+        let live = guard.is_live();
         if live {
             self.len = None;
             published.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+        drop(guard);
         // Unarmed: `Drop` counts nothing. Still armed: `Drop` counts the
         // discard.
         live
@@ -865,6 +871,9 @@ pub async fn run_supervisor(
     let mut handler = std::pin::pin!(handler);
     let mut handler_done = false;
     let mut pump_done = false;
+    // A `JoinError` from the pump inside the loop is a panic: the pump is
+    // only aborted after the loop, on the forced path.
+    let mut pump_failed = false;
 
     let sleep = async {
         match deadline {
@@ -902,30 +911,43 @@ pub async fn run_supervisor(
 
             joined = &mut pump_task, if !pump_done => {
                 pump_done = true;
-                let _ = joined;
+                pump_failed = joined.is_err();
             }
         }
     };
 
-    // CORE-1 (the R4COREFIX-9 mechanism): a pump exit must not shadow a
-    // handler whose result has landed but has not been polled yet. The
-    // handler's sink sender drops at handler end, BEFORE the result
-    // deposit does (the nRPC blocking-bridge window), so the pump exit
-    // and the ready handler race exactly here — and a `pump_done` break
-    // that never re-polls the handler classifies the call `PumpFailed`
-    // (wire 0x0006) over an already-complete handler. Poll the handler
-    // ONE more time before classifying a pump exit; its result wins.
-    if forced.is_none() && !handler_done {
-        let deposited = tokio::select! {
+    // CORE-1 (the R4COREFIX-9 mechanism): a clean pump exit must not
+    // shadow a handler whose result has not landed YET. The handler's
+    // sink sender drops at handler end, BEFORE the result deposit does
+    // (the nRPC blocking-bridge window), so the pump exit and the
+    // handler's return race exactly here — and a `pump_done` break
+    // classifies the call `PumpFailed` (wire 0x0006) over a handler about
+    // to complete. Wait for the handler, bounded by
+    // `HANDLER_DEPOSIT_GRACE`; retirement and the deadline keep priority.
+    // A single non-blocking re-poll loses whenever the deposit lands after
+    // it. A PANICKED pump is not waited on: chunks were lost, so the call
+    // is `PumpFailed` whatever the handler returns (below).
+    let forced = if forced.is_none() && !handler_done && !pump_failed {
+        let grace = tokio::time::sleep(HANDLER_DEPOSIT_GRACE);
+        tokio::pin!(grace);
+        tokio::select! {
             biased;
-            result = &mut handler => Some(result),
-            () = std::future::ready(()) => None,
-        };
-        if let Some(result) = deposited {
-            state.lock().handler_returned(result);
-            gate.finish();
+
+            reason = retire.wait() => Some(reason),
+
+            reason = &mut sleep, if expiry_armed => Some(reason),
+
+            result = &mut handler => {
+                state.lock().handler_returned(result);
+                gate.finish();
+                None
+            }
+
+            () = &mut grace => None,
         }
-    }
+    } else {
+        forced
+    };
 
     // Retirement path: close both semaphores so a parked pump errors out,
     // then abort and join it. `abort` is cooperative with the scheduler,
@@ -940,11 +962,17 @@ pub async fn run_supervisor(
             pump_task.as_mut().abort();
             let _ = pump_task.as_mut().await;
         }
+    } else if pump_failed {
+        // The pump PANICKED: items it held or had queued were lost, so the
+        // call did not complete, whatever the handler returned. Pre-audit
+        // this path mapped a `Draining` handler result to `Completed` — a
+        // success terminal over lost items.
+        state.lock().retire(TerminalReason::PumpFailed);
     } else {
-        // A pump exit — clean or failed — is classified by the state
-        // machine: `Completed(result)` once the handler has returned
-        // (CORE-1's re-poll above included), and `PumpFailed` only for a
-        // pump that stopped WITHOUT the handler returning (its documented
+        // A clean pump exit is classified by the state machine:
+        // `Completed(result)` once the handler has returned (CORE-1's
+        // bounded wait above included), and `PumpFailed` only for a pump
+        // that stopped WITHOUT the handler returning (its documented
         // meaning). A blanket `PumpFailed` here is how a pump exit
         // shadows a completed handler.
         state.lock().pump_exited();
@@ -989,6 +1017,11 @@ pub fn pump_handles(credit: usize, bytes: usize) -> PumpHandles {
         bytes: Arc::new(Semaphore::new(bytes)),
     }
 }
+
+/// CORE-1: how long a supervised call waits, after a clean pump exit, for
+/// the handler's result to land before classifying the exit `PumpFailed`
+/// (mirror of `cortex::rpc::HANDLER_DEPOSIT_GRACE`).
+pub const HANDLER_DEPOSIT_GRACE: Duration = Duration::from_secs(1);
 
 /// A short bound for model waits: long enough that a correct
 /// implementation always finishes, short enough that a hang is a failure
@@ -1927,6 +1960,44 @@ mod tests {
             out.terminal,
             TerminalReason::Completed(HandlerResult::Ok),
             "the handler was complete; a pump exit may not shadow it into PumpFailed: {out:?}",
+        );
+    }
+
+    /// CORE-1 (§23 audit) — the handler's result lands AFTER the pump's
+    /// clean exit via a real waker. The pre-audit single non-blocking
+    /// re-poll committed `PumpFailed` here; the bounded wait classifies
+    /// it `Completed(Ok)`.
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_result_landing_after_the_pump_exit_is_waited_for() {
+        let (r, rx) = rig(CallShape::ServerStreaming, 8, 1024);
+        let pump = r.pump();
+        // Every sender gone: the pump exits at once.
+        drop(r.tx);
+        let handler = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            HandlerResult::Ok
+        };
+
+        let sup = tokio::spawn(run_supervisor(
+            Arc::clone(&r.state),
+            handler,
+            rx,
+            Arc::clone(&r.gate),
+            pump,
+            Arc::clone(&r.retire),
+            None,
+            Arc::clone(&r.published),
+            r.ctl.clone(),
+        ));
+
+        let out = tokio::time::timeout(MODEL_BOUND, sup)
+            .await
+            .expect("the call ends once the handler returns")
+            .expect("no panic");
+        assert_eq!(
+            out.terminal,
+            TerminalReason::Completed(HandlerResult::Ok),
+            "a handler returning shortly after the pump exit completed the call: {out:?}",
         );
     }
 

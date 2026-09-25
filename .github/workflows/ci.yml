@@ -1824,7 +1824,7 @@ jobs:
           # the 42-witness S1.2–S1.5 estate = the 30-roster preserved verbatim
           # + 12 CS/DX, duplex-flow and half-close witnesses; plus the 7
           # wave-1–3 repair witnesses (WIRE-1's displaced-carrier refusal,
-          # SDK-2's three token-cancel terminals, SDK-3's three typed deadline
+          # SDK-2's three token-cancel terminals, SDK-1's three typed deadline
           # retirements) and the 2 frozen-chain witnesses (TESTS-1's unary
           # admission half of §1.4, TESTS-4's extraction-hash recomputation).
           # Every witness is name-pinned below; a new one joins the roster AND
@@ -3761,9 +3761,9 @@ jobs:
       # The vitest run above EXECUTED these; this step PINS them (a witness
       # must not disappear silently): lexical name-existence, fail-closed,
       # over the two test files (vitest names are literal `it(...)` strings).
-      # Floor/roster: 10 (9 in org_live + 1 in
+      # Floor/roster: 11 (10 in org_live + 1 in
       # consumer_compile); extended in the same commit as new witnesses.
-      - name: Witness roster — Node org facade (10)
+      - name: Witness roster — Node org facade (11)
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
@@ -3774,6 +3774,7 @@ jobs:
             live_same_org_duplex_call_and_serve \
             a_stream_call_against_a_unary_only_provider_is_refused_not_supported \
             midstream_outcomes_route_through_classify_org_error \
+            forced_drop_releases_both_handler_handles_promptly \
             live_granted_streaming_call_and_serve \
             live_granted_client_stream_call_and_serve \
             live_granted_duplex_call_and_serve \
@@ -4151,24 +4152,50 @@ jobs:
             || { echo "::error::the C5 fixture seeder did not build"; exit 1; }
           echo "NET_A2A_SEEDER_EXE=$exe" >> "$GITHUB_ENV"
 
+      # `--junitxml` is the RESULT SET the org facade roster below reads
+      # (CI-1): that step used to re-run the whole live org suite, under
+      # this job's 20-minute ceiling and without the thread watchdog or
+      # faulthandler set here. The stale copy is deleted first so a run
+      # that wrote nothing cannot be read as one that passed.
       - name: Run tests
         env:
           PYTHONFAULTHANDLER: "1"
           PYTHONUNBUFFERED: "1"
-        run: pytest -v -s --timeout=30 --timeout-method=thread
+        run: |
+          rm -f "$RUNNER_TEMP/python-bindings-junit.xml"
+          pytest -v -s --timeout=30 --timeout-method=thread \
+            --junitxml="$RUNNER_TEMP/python-bindings-junit.xml"
 
       # === the Python org facade witnesses ==
       # The pytest run above EXECUTED the pinned rows; this step PINS them
       # and COUNTS them (CI-1). Before, the pin asserted "15 items / 12
       # cells" in prose while running no tests and counting nothing — a
       # parametrize id or a whole matrix row could vanish and the claim kept
-      # standing. Now the 9 base names + the teardown row are pinned
+      # standing. Now the pinned base names + the teardown row are pinned
       # lexically (fail-closed, with `decl`'s data-literal quoting) and then
-      # RE-RUN and counted PER PINNED NODE ID: the floors are the pinned
-      # estate's own shape (the 6 matrix functions x [same_org|granted] = 12
-      # cells + 3 standalone + 1 teardown = 16 rows), so a vanished id or a
-      # vanished row reddens the count. Unpinned sibling rows in these files
-      # cannot mask a loss: only pinned node ids are counted.
+      # counted PER PINNED NODE ID: the floors are the pinned estate's own
+      # shape, so a vanished id or a vanished row reddens the count, and
+      # every pinned name must have at least one passing row of its own.
+      # Unpinned sibling rows in these files cannot mask a loss: only pinned
+      # node ids are counted.
+      #
+      # The estate (26 rows / 20 cells):
+      #   * MATRIX — 8 functions x [same_org|granted] = 16 cells: the 6
+      #     shape x form cells, plus PY-2's org SS/DX pump-terminal race
+      #     witnesses (`*_terminal_is_not_raced_by_the_response_pump`);
+      #   * the PY-1 stale-wheel gate — 1 function x [native|facade] x
+      #     [test_org_live|test_runtime_teardown_no_deadlock] = 4 cells;
+      #   * STANDALONE — 5 rows: the 3 original + PY-2's nRPC SS/DX
+      #     pump-terminal race witnesses (they live in test_org_live.py);
+      #   * TEARDOWN — 1 row.
+      #
+      # The rows are read from the JUnit result set the run above wrote, NOT
+      # from a re-run. The re-run this replaced executed the whole live org
+      # suite a second time inside the job's 20-minute ceiling, without
+      # `--timeout-method=thread` or `PYTHONFAULTHANDLER`, so a hang there
+      # would have eaten the job with no dump. It also cannot grep the run
+      # above's log instead: `-s` interleaves a test's own output between
+      # the `-v` node id and its PASSED verdict.
       #
       # The second `--source` is the teardown witness: a live org handler at
       # runtime-drop time must not wedge the interpreter — the GIL-held
@@ -4176,7 +4203,7 @@ jobs:
       # ceilings instead of failing. It is its own file (the property is a
       # teardown one), so it is pinned here rather than in a suite that does
       # not name it.
-      - name: Witness roster + floor — Python org facade (15 pinned rows / 12 cells + teardown)
+      - name: Witness roster + floor — Python org facade (26 pinned rows / 20 cells)
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
@@ -4187,31 +4214,68 @@ jobs:
             test_org_client_stream_async_call_and_serve
             test_org_duplex_sync_call_and_serve
             test_org_duplex_async_call_and_serve
+            test_org_streaming_terminal_is_not_raced_by_the_response_pump
+            test_org_duplex_terminal_is_not_raced_by_the_response_pump
             "
+          STALE_GATE=test_stale_wheel_fails_the_gate_loudly
           STANDALONE="
             test_task_cancel_propagates_to_retirement_observables
             test_streaming_midstream_error_surfaces_the_org_vocabulary
             test_live_cross_org_call_from_a_generated_scenario
+            test_nrpc_streaming_terminal_is_not_raced_by_the_response_pump
+            test_nrpc_duplex_terminal_is_not_raced_by_the_response_pump
             "
           TEARDOWN=test_teardown_with_a_live_handler_does_not_deadlock
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_live --mode decl \
             --source net/crates/net/bindings/python/tests/test_org_live.py \
             --source net/crates/net/bindings/python/tests/test_runtime_teardown_no_deadlock.py \
-            $MATRIX $STANDALONE $TEARDOWN \
-            same_org granted || exit 1
+            $MATRIX $STALE_GATE $STANDALONE $TEARDOWN \
+            same_org granted native facade || exit 1
 
-          out=$(cd net/crates/net/bindings/python && python -m pytest -v \
-                  tests/test_org_live.py tests/test_runtime_teardown_no_deadlock.py 2>&1 | tee /dev/stderr)
-          names_re="($(echo $MATRIX $STANDALONE $TEARDOWN | tr ' ' '|'))"
-          rows=$(printf '%s\n' "$out" | grep -cE "::${names_re}(\[[^]]*\])? +PASSED" || true)
-          cells=$(printf '%s\n' "$out" | grep -cE "::${names_re}\[[^]]*\] +PASSED" || true)
-          echo "python org facade: ${rows} pinned rows / ${cells} cells executed (floor 16 rows / 12 cells)"
-          if [ "${rows:-0}" -lt 16 ] || [ "${cells:-0}" -lt 12 ]; then
-            echo "::error::the pinned python org facade ran ${rows:-0} rows / ${cells:-0} cells; \
-          the floors are 16 rows / 12 cells (the 6 matrix functions x [same_org|granted] + \
-          3 standalone + the teardown row) — lower the floors deliberately or restore the witnesses"
-            exit 1
-          fi
+          # Fail-closed: a missing or unparseable artifact, a pinned name
+          # with no passing row, or a floor miss all exit 1. A row counts
+          # only as a PASS — any <failure>/<error>/<skipped> child excludes it.
+          python3 - "$RUNNER_TEMP/python-bindings-junit.xml" 26 20 \
+            $MATRIX $STALE_GATE $STANDALONE $TEARDOWN <<'PY' || exit 1
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          junit, min_rows, min_cells, *names = sys.argv[1:]
+          modules = {"test_org_live", "test_runtime_teardown_no_deadlock"}
+          if not Path(junit).is_file():
+              print(f"::error::no pytest JUnit artifact at {junit} - the run above wrote no results")
+              sys.exit(1)
+          try:
+              root = ET.parse(junit).getroot()
+          except ET.ParseError as exc:
+              print(f"::error::could not parse {junit}: {exc}")
+              sys.exit(1)
+          passed = {n: [] for n in names}
+          for case in root.iter("testcase"):
+              if not modules & set((case.get("classname") or "").split(".")):
+                  continue
+              if any(case.find(c) is not None for c in ("failure", "error", "skipped")):
+                  continue
+              full = case.get("name") or ""
+              base = full.split("[", 1)[0]
+              if base in passed:
+                  passed[base].append(full)
+          rows = sum(len(v) for v in passed.values())
+          cells = sum(1 for v in passed.values() for full in v if "[" in full)
+          print(f"python org facade: {rows} pinned rows / {cells} cells passed "
+                f"(floor {min_rows} rows / {min_cells} cells)")
+          missing = [n for n, v in passed.items() if not v]
+          for n in missing:
+              print(f"::error::pinned python org witness {n} has no passing row in {junit}")
+          if rows < int(min_rows) or cells < int(min_cells):
+              print(f"::error::the pinned python org facade passed {rows} rows / {cells} cells; "
+                    f"the floors are {min_rows} rows / {min_cells} cells (8 matrix functions x "
+                    "[same_org|granted] + the 4 stale-wheel gate cells + 5 standalone + the "
+                    "teardown row) - lower the floors deliberately or restore the witnesses")
+              sys.exit(1)
+          sys.exit(1 if missing else 0)
+          PY
 
       # === the Python cross-language vectors rows =======
       # The pytest run above EXECUTED these (119 items: the byte pins, the
@@ -4254,7 +4318,9 @@ jobs:
 
       # === the sdk-py org facade witnesses (Q6) =====
       # PINS the 9 base names of the 6 matrix functions, the parametrize
-      # pair that yields their 12 cells, and the count floor (fail-closed)
+      # pair that yields their 12 cells, PY-1's stale-wheel gate witness
+      # (`test_stale_wheel_gate_is_reachable[native|facade]`, 2 rows), and
+      # the count floor (15 + 2 = 17, fail-closed)
       # — AND RUNS them: the step is here, not in `sdk-py-tests`, because
       # these are live rows through `net_sdk` and need two things only this
       # job has by now: the built extension (maturin develop, a few steps
@@ -4262,9 +4328,14 @@ jobs:
       # deliberately native-free — its conftest stubs the extension — so
       # `tests/test_org_streaming.py` skips itself there (`no usable net
       # wheel here`), and a floor asserted against a skipped run is a floor
-      # that can never fail.
-      - name: Witness roster + floor — sdk-py org facade (15)
+      # that can never fail. It runs with the same watchdog settings as the
+      # suite run above (`--timeout-method=thread`, `PYTHONFAULTHANDLER`), so
+      # a hang in one of these live rows is dumped, not a silent job timeout.
+      - name: Witness roster + floor — sdk-py org facade (17)
         working-directory: net/crates/net/sdk-py
+        env:
+          PYTHONFAULTHANDLER: "1"
+          PYTHONUNBUFFERED: "1"
         run: |
           set -uo pipefail
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_org_streaming --mode decl \
@@ -4278,12 +4349,14 @@ jobs:
             test_unary_call_and_serve_preserved_through_net_sdk \
             test_streaming_midstream_error_surfaces_the_org_vocabulary \
             test_task_cancel_propagates_to_retirement_observables \
-            same_org granted || exit 1
-          out=$(python -m pytest -q tests/test_org_streaming.py 2>&1 | tee /dev/stderr)
+            test_stale_wheel_gate_is_reachable \
+            same_org granted native facade || exit 1
+          out=$(python -m pytest -q --timeout=30 --timeout-method=thread \
+                  tests/test_org_streaming.py 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
-          echo "sdk-py org facade: ${n:-0} (floor 15)"
-          if [ -z "$n" ] || [ "$n" -lt 15 ]; then
-            echo "::error::the sdk-py org facade ran ${n:-0} rows, floor is 15 — \
+          echo "sdk-py org facade: ${n:-0} (floor 17)"
+          if [ -z "$n" ] || [ "$n" -lt 17 ]; then
+            echo "::error::the sdk-py org facade ran ${n:-0} rows, floor is 17 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi

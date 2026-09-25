@@ -75,6 +75,13 @@ const ENV_CALLER_NODE: &str = "R4_XPROC_CALLER_NODE";
 const CHILD_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(60);
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// TESTS-3: how long the child keeps serving AFTER its first dispatch before
+/// it reads the final count. The announce loop exits on the first `calls > 0`;
+/// reading the count right there would never see a duplicate dispatch that
+/// lands a moment later, so `calls=1` would hold vacuously. Bounded and short
+/// — the parent's RESULT pull allows `CHILD_PROTOCOL_TIMEOUT`.
+const DUPLICATE_DISPATCH_GRACE: Duration = Duration::from_secs(1);
+
 /// TESTS-2: the spawned provider child must not outlive ANY parent verdict.
 /// The success path hands the exit status over via [`Self::wait_clean`]; every
 /// other path — including an `assert!` panic unwinding out of the test — drops
@@ -382,6 +389,10 @@ async fn provider_child_main() {
         );
         std::process::exit(2);
     }
+    // TESTS-3: keep the node and the serve handle alive through a bounded
+    // grace window, so a duplicate dispatch arriving after the first one is
+    // still counted below instead of racing the read.
+    tokio::time::sleep(DUPLICATE_DISPATCH_GRACE).await;
     if !attribution_ok.load(Ordering::SeqCst) {
         println!("RESULT fail attribution emitted={emitted}");
         std::process::exit(1);
