@@ -1,0 +1,30 @@
+go/org_streaming_opening_vectors_test.go
+  h_64425bc75e3f3d 223-224
+net/crates/net/bindings/node/test/org_streaming_opening_vectors.test.ts
+  h_64425bc75e3f3d 126,130,242,245,296,310
+net/crates/net/bindings/python/tests/test_org_streaming_opening_vectors.py
+  h_64425bc75e3f3d 59,64-65,84
+net/crates/net/browser-ts/src/errors.ts
+  h_64425bc75e3f3d 411-419,436-438,449-454,490-512,634-637,640-647,650-655,669-674,690-694,696-697,699-700,702-703,705-707,709-710
+net/crates/net/browser-ts/test/org.test.ts
+  h_64425bc75e3f3d 27,29-30,206-272
+net/crates/net/sdk/examples/gen_org_error_fixtures.rs
+  h_64425bc75e3f3d 34-36,277-351,543,573-583,591-592,598-600
+net/crates/net/sdk/src/org/fixtures.rs
+  h_64425bc75e3f3d 127-129,136-155
+net/crates/net/tests/cross_lang_org/error_vectors.json
+  h_64425bc75e3f3d 36-41
+net/crates/net/tests/cross_lang_org/streaming_opening_vectors.json
+  h_64425bc75e3f3d 369-408
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a9178e580c4bfa8c8ebe477c013f93b4cdc05ca5",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
