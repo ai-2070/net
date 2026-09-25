@@ -8,7 +8,7 @@
 [![Go](https://pkg.go.dev/badge/github.com/ai-2070/net/go.svg)](https://pkg.go.dev/github.com/ai-2070/net/go)
 [![codecov](https://codecov.io/gh/ai-2070/net/graph/badge.svg?token=AOBMOF6LE4)](https://codecov.io/gh/ai-2070/net)
 
-**Net is what the internet would look like if it were built today** — the Net from the Cyberpunk
+**Net is what the internet would look like if it were built today** — the Net inspired by the Cyberpunk
 universe, built for real machines. A flat, latency-first, end-to-end encrypted mesh where every
 agent, service, and device is an equal node: no clients, no servers, no coordinators. The mesh
 propagates state, not connections.
