@@ -1,0 +1,25 @@
+.github/workflows/release-npm-sdk.yml
+  s_d8b00bedd146e9::t_d468556696705c 26-32
+.github/workflows/release-npm.yml
+  s_d8b00bedd146e9::t_d468556696705c 177-183
+.github/workflows/release-npm-browser.yml
+  s_d8b00bedd146e9::t_a9c2e5068c68f4 1-119
+net/crates/net/docs/releases/RELEASE_STEPS.md
+  s_d8b00bedd146e9::t_a52e64caf63bfc 77-82,96-97,101-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0e905d8694a7f898cb4ae829ac48cc11d1427af3",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
