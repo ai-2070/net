@@ -227,13 +227,14 @@ on the C `net_org_call*` rows). Neither is an authorization input: they select n
 grant and no authority.
 
 A stream's failure can arrive **as its final item** rather than from the call
-verb, and the shape decides which kind. An opening refusal fails the call — for
-client-streaming, the first `send`, since its opening is lazy; a mid-call
-revocation ends the stream with `org:admission_denied:denied`; a provider deadline
-ends a server-streaming or duplex stream with `org:rpc:server_error` (the timeout
-status rides it), *not* `org:rpc:timeout` — which comes from a local timer (the
-unary verb's, or a client-streaming `finish()`'s). `org:rpc:cancelled` is
-unary-only.
+verb. An opening refusal on a stream IS that terminal item — on
+client-streaming, `finish()`'s error (its opening is lazy: it rides the first
+`send`, or `finish` on the zero-item path); a call-verb failure is reserved for
+local opening-stage errors, where nothing was sent. A mid-call revocation ends
+the stream with `org:admission_denied:denied`, and each retirement cause has
+exactly one kind wherever it lands: a deadline is `org:rpc:timeout`, a caller
+cancel is `org:rpc:cancelled` — the stream's final item on server-streaming /
+duplex, `finish()`'s error on client-streaming, the call verb's error on unary.
 
 ## Closing the client is a security step
 
@@ -301,7 +302,7 @@ In every one of these, binding **consumes** the credential set — on success an
 
 Org errors are strings of the form `org:<domain>:<kind>`, and the domain answers the question you actually have: *did anything leave this process?* `credentials` and `discovery` are local — the call was never sent. `admission_denied` means a provider evaluated and refused. `rpc` is transport. Every binding exposes that distinction directly; don't re-parse the message.
 
-For a streaming call, the refusal can arrive as the stream's **final item** rather than from the call verb. An opening refusal still fails the call (for client-streaming, the first `send`, since its opening is lazy); a mid-call revocation ends the stream with `org:admission_denied:denied`, and a provider deadline on a server-streaming or duplex call ends it with `org:rpc:server_error`. `org:rpc:timeout` comes from a local timer — the unary verb's, or a client-streaming `finish()`'s — and `org:rpc:cancelled` only from the unary path; a caller cancel on a stream just ends it.
+For a streaming call, the refusal can arrive as the stream's **final item** rather than from the call verb. An opening refusal on a stream IS that terminal item — `finish()`'s error on client-streaming, whose opening is lazy — while a call-verb failure is reserved for local opening-stage errors, where nothing was sent; a mid-call revocation ends the stream with `org:admission_denied:denied`. Each retirement cause has exactly one kind wherever it lands — a deadline is `org:rpc:timeout`, a caller cancel is `org:rpc:cancelled` — surfacing as the stream's final item, at `finish()`, or from the unary verb.
 
 A few local kinds are worth recognizing on sight:
 

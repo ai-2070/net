@@ -155,9 +155,16 @@ mesh.serve_org_duplex(service, access, handler)?;                           // d
 Every shape runs the same admission order above (the streaming proof kinds
 and the session fence included) and every handle surfaces the same frozen
 error vocabulary item by item: an opening refusal is
-`AdmissionDenied(coarse)`, a midstream revocation is the stream's final
+`AdmissionDenied(coarse)` — the stream's terminal item on server-streaming /
+duplex, `finish()`'s error on client-streaming (lazy opening), the call verb's
+error on unary; a stream's call verb fails only on local opening-stage errors,
+nothing sent — a midstream revocation is the stream's final
 `AdmissionDenied(Denied)`, and deadline/cancel retirement is
-`Rpc(Timeout)`/`Rpc(Cancelled)`. Dropping a stream handle emits exactly one
+`Rpc(Timeout)`/`Rpc(Cancelled)` on every handle: one deterministic variant per
+retirement cause at each terminal seam (the stream's final item, a
+client-streaming `finish()`, the unary verb). The classification never
+manufactures a typed variant from a wire status — a genuine remote
+`ServerError` passes through verbatim. Dropping a stream handle emits exactly one
 CANCEL; the streaming call handles are `OrgStream` (typed), `OrgStreamRaw`
 (bytes), `OrgClientStreamCall` (`send`/`finish`) and `OrgDuplexCall` (`send`,
 `finish_sending`, `into_split`, `Stream`).

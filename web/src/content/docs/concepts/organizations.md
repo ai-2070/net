@@ -185,25 +185,27 @@ deadline, so a zero deadline resolves to the facade's **300 s default** — neve
 it asked for something the provider does not offer, not silently given less. (The
 unary verb is the exception: with no deadline it sets none.)
 
-How a live call ends, and what the caller sees, depends on its shape:
+How a live call ends, and where the caller sees it, depends on its shape:
 
 - an **opening refusal** is the coarse admission denial (`denied`,
-  `not_supported`, or `unavailable`) on every shape;
+  `not_supported`, or `unavailable`) — the stream's **terminal item** on
+  server-streaming / duplex, `finish()`'s error on client-streaming (its
+  opening is lazy), the call verb's error on unary; a stream's call verb fails
+  only on local opening-stage errors, nothing sent;
 - a **midstream revocation** is the stream's final item, a coarse
-  `AdmissionDenied(Denied)`;
-- on a **unary** call, a deadline that passes is `org:rpc:timeout` and a caller
-  cancel is `org:rpc:cancelled`;
-- on a **server-streaming** or **duplex** call the deadline is the provider's, so
-  its final item is `org:rpc:server_error` carrying the timeout status — *not*
-  `org:rpc:timeout` — and a caller cancel simply ends the stream, after which the
-  dropped handle sends the one CANCEL;
-- on a **client-streaming** call either class can arrive, depending on whether
-  the client's own timer or the provider's terminal fires first.
+  `AdmissionDenied(Denied)` (`finish()`'s terminal on client-streaming);
+- a **deadline** is `org:rpc:timeout` and a caller **cancel** is
+  `org:rpc:cancelled` on every shape — one kind per retirement cause — surfacing
+  as the stream's final item on server-streaming / duplex, `finish()`'s error on
+  client-streaming, the call verb's error on unary;
+- dropping a handle instead of cancelling sends the one CANCEL and observes
+  nothing.
 
-A **local** deadline is a class of its own, distinct from a provider-side
-timeout. On the browser and leaf port a follower tab can reach its own deadline
-on a call the leader node owns, and the outcome is stated as indeterminate: the
-remote operation may still have executed, and it is never retried.
+A **local** deadline is its own case even though it reports the same
+`org:rpc:timeout`. On the browser and leaf port a follower tab can reach its
+own deadline on a call the leader node owns, and the outcome is stated as
+indeterminate: the remote operation may still have executed, and it is never
+retried.
 
 Only a credential-validity clamp or the next opening can stop a call already
 running on a grant (see the floor limitation above).

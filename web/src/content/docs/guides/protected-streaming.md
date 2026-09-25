@@ -179,26 +179,23 @@ depends on the shape and on who retired the call:
 
 | What happened | What the caller sees |
 | --- | --- |
-| Opening refused by admission | the call verb fails with a coarse admission denial — on client-streaming, from the first `send` (the opening is lazy) |
+| Opening refused by admission | the stream's **terminal item** — `org:admission_denied:` with the coarse reason (`denied`, `not_supported`, `unavailable`) — on server-streaming / duplex, and `finish()`'s error on client-streaming (its opening is lazy: it rides the first `send`, or `finish` on the zero-item path). A **call-verb** failure is reserved for LOCAL opening-stage errors — no route, a binding refusal, an unauthorizable credential set — where nothing was sent |
 | Credential revoked mid-call | the stream's final item (`finish()`'s terminal on client-streaming), `org:admission_denied:denied` |
-| Unary call past its deadline | `org:rpc:timeout` |
-| Unary call cancelled | `org:rpc:cancelled` |
-| Server-streaming / duplex deadline | the stream's final item, `org:rpc:server_error` (the provider's timeout status rides it) |
-| Server-streaming / duplex cancel | the stream simply ends; the dropped handle sends the one CANCEL |
-| Client-streaming deadline | `org:rpc:timeout` if the client's own timer fires first, else `org:rpc:server_error` |
+| Deadline expiry, any shape | `org:rpc:timeout` — the stream's final item on server-streaming / duplex, `finish()`'s error on client-streaming, the call verb's error on unary |
+| Caller cancel (the reserved token), any shape | `org:rpc:cancelled`, at the same seam as the deadline row |
+| Stream handle dropped instead of cancelled | exactly one CANCEL on the wire and nothing observable (see above) |
 
-The trap is matching on the timeout kind alone. The wire kind is chosen by the
-`RpcError` variant, not by the status a frame carries: the provider's terminal
-with a timeout status arrives as a **server error** on a stream, so
-`org:rpc:server_error` is what a server-streaming or duplex deadline produces.
-`org:rpc:timeout` is minted by a local timer — the unary verb's, or a
-client-streaming `finish()`'s — and `org:rpc:cancelled` only by the unary path;
-for a stream a caller cancel retires the call locally and the stream just ends.
+The kind is chosen by the retirement cause — not by the shape, and not by the
+wire status a frame carries: a deadline is `org:rpc:timeout`, a caller cancel
+is `org:rpc:cancelled`, a revocation or a credential-clamp expiry is
+`org:admission_denied:denied` (never a timeout), and any other remote terminal
+is `org:rpc:server_error` with its status and diagnostic verbatim.
 
-A **local** deadline is a class of its own, distinct from a provider-side
-timeout: on the browser and leaf port a follower tab can reach its own deadline
-on a call the leader node owns, and the outcome is stated as **indeterminate** —
-the remote operation may still have executed, and it is never retried.
+A **local** deadline is its own case even though it reports the same
+`org:rpc:timeout`: on the browser and leaf port a follower tab can reach its
+own deadline on a call the leader node owns, and the outcome is stated as
+**indeterminate** — the remote operation may still have executed, and it is
+never retried.
 
 Only a credential-validity clamp or the next opening can stop a call already
 running on a grant; grants have no revocation floor, so a revoked grant is not
@@ -253,7 +250,9 @@ static int on_stream(uint64_t handler_id, const net_org_caller_t* caller,
 }
 
 /* Wire the shape dispatcher once, reserve a handler id, then serve the
- * shape (the mesh arc is consumed on success). */
+ * shape. The mesh arc is consumed on EVERY path — success and failure
+ * alike: the call takes ownership of the clone the moment it is entered,
+ * so never free it yourself (mint a fresh net_mesh_arc_clone per serve). */
 static int serve_streaming(net_compute_mesh_arc_t* mesh, char** out_err) {
     if (net_org_set_streaming_handler_dispatcher(on_stream) != 0) {
         return -1;
