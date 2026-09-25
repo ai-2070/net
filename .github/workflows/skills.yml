@@ -85,6 +85,11 @@ on:
       - "net/crates/net/include/**"
       - "net/crates/net/docs/**"
       - "net/crates/net/tests/**"
+      # The browser leaf and its page package: `browser.md` documents them, so
+      # a move there must re-run the checks that police that prose.
+      - "net/crates/net/leaf/**"
+      - "net/crates/net/browser-ts/**"
+      - "net/crates/net/examples/**"
       # Dependency or API resolution can shift without a source edit.
       - "Cargo.lock"
       - "go/go.mod"
@@ -136,6 +141,11 @@ on:
       - "net/crates/net/include/**"
       - "net/crates/net/docs/**"
       - "net/crates/net/tests/**"
+      # The browser leaf and its page package: `browser.md` documents them, so
+      # a move there must re-run the checks that police that prose.
+      - "net/crates/net/leaf/**"
+      - "net/crates/net/browser-ts/**"
+      - "net/crates/net/examples/**"
       # Dependency or API resolution can shift without a source edit.
       - "Cargo.lock"
       - "go/go.mod"

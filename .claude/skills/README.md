@@ -100,6 +100,7 @@ Each skill is a `SKILL.md` entry point plus reference files that Claude loads **
 | `filter-dsl.md` | Consumer-side content filtering — equality `$and`/`$or`/`$not` predicates on the bus. |
 | `error-codes.md` | Classifying a specific error variant — the full core-crate + subsystem taxonomy. |
 | `cli.md` | The `net-mesh` CLI — execution scopes (offline / persistent store / temporary supervisor / mesh client / hosted service), the `--local` gate, `--inspect-target`, `transfer`, `typegen`, `wrap`/`mcp`, `netdb`, org/subnet issuance, exit codes, deadlines and scripting notes. |
+| `browser.md` | A **browser tab** as a mesh node — `@net-mesh/browser` (a sibling package to `@net-mesh/sdk`), `connect` vs `openSession`, the anchor bootstrap credential, leaf ↔ leaf peer sessions, stream `reliability`, the typed error kinds, `udp-blocked` vs `ice-timeout`, and the networked store + Three.js binding. |
 | `testing.md` | Fixtures, race conditions, CI gotchas. |
 | `gotchas.md` | Migrating from Kafka / NATS / Redis Streams / Pulsar. |
 | `event-semantics.md` | Naming events / what an event may assert — a fact observed at one layer, not an end-to-end `200 OK`. |
