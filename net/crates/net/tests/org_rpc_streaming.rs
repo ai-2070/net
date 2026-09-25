@@ -1,5 +1,5 @@
 //! Stage 1 — core protected server-streaming witnesses
-//! (`ORG_SCOPED_STREAMING_PLAN.md`, pinned brief `spikes/org-streaming/S1_BRIEF.md`).
+//! (`ORG_SCOPED_STREAMING_PLAN.md`, pinned brief `docs/internal/spikes/org-streaming/S1_BRIEF.md`).
 //!
 //! Slice 1.2 — streaming proof (contract 2): `OrgStreamCallProof` /
 //! `StreamCallBinding` admission through the shape-aware verifier, the
@@ -3276,7 +3276,7 @@ async fn response_after_session_replacement_reaches_only_the_live_session() {
 // ===========================================================================
 // Stage 2 — core protected client-streaming and duplex
 // (`ORG_SCOPED_STREAMING_PLAN.md` Stage 2 table; pinned brief
-// `spikes/org-streaming/S2_BRIEF.md`).
+// `docs/internal/spikes/org-streaming/S2_BRIEF.md`).
 //
 // Slice 2.1 — the LAZY-OPENING MINT (contract 2's caller half):
 // `call_client_stream` / `call_duplex` accept `org_proof_intent` (C11) and
