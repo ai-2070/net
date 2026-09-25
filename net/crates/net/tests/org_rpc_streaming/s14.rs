@@ -300,7 +300,7 @@ impl RpcStreamingHandler for QueueChunksAndReturn {
 
 /// The one-call registry view most assertions read.
 pub(crate) fn registry_of(node: &Arc<MeshNode>) -> Arc<ProtectedCallRegistry> {
-    net::adapter::net::cortex::rpc::protected_call_registry_for(node.node_id())
+    net::adapter::net::cortex::rpc::protected_call_registry_for(node.protected_call_registry_key())
 }
 
 /// The registry key shape the witnesses name.
@@ -318,7 +318,7 @@ pub(crate) fn call_key(
 /// (before the store install binds it).
 pub(crate) fn set_tiny_byte_registry(node: &Arc<MeshNode>) {
     net::adapter::net::cortex::rpc::set_protected_call_registry_for_node(
-        node.node_id(),
+        node.protected_call_registry_key(),
         net::adapter::net::cortex::rpc::tiny_byte_call_limits(),
         net::adapter::net::cortex::rpc::tiny_byte_byte_limits(),
     )

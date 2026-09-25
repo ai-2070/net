@@ -5483,49 +5483,65 @@ impl CommitTxn<'_> {
 // Per-node registry resolution + the mesh.rs hook surface
 // ---------------------------------------------------------------------
 
+/// Per-node protected-call registries, keyed by each `MeshNode`
+/// INSTANCE's [`next_protected_call_registry_key`] — never by `node_id`.
+/// An identity-derived key let two live nodes built from one identity in
+/// one process share a registry: each store install rebound it under the
+/// other, and the first node's drop removed the survivor's registry, so
+/// its next protected call met a fresh unbound registry and was refused
+/// `ProviderAuthorityUnavailable` (coarse `Unavailable`).
 static PROTECTED_CALL_REGISTRIES: std::sync::LazyLock<DashMap<u64, Arc<ProtectedCallRegistry>>> =
     std::sync::LazyLock::new(DashMap::new);
 
+static NEXT_PROTECTED_CALL_REGISTRY_KEY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Mint a process-unique registry key for a newly constructed node.
+pub(crate) fn next_protected_call_registry_key() -> u64 {
+    NEXT_PROTECTED_CALL_REGISTRY_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The node's protected-call registry, created on first use with the Q1
-/// defaults (validated at construction).
+/// defaults (validated at construction). `node_key` is the node's
+/// `MeshNode::protected_call_registry_key`.
 #[expect(
     clippy::expect_used,
     reason = "the Q1 limits validate by construction (startup validation per Q1); a panic here is a constant defect, not a runtime contingency"
 )]
-pub fn protected_call_registry_for(node_id: u64) -> Arc<ProtectedCallRegistry> {
-    if let Some(existing) = PROTECTED_CALL_REGISTRIES.get(&node_id) {
+pub fn protected_call_registry_for(node_key: u64) -> Arc<ProtectedCallRegistry> {
+    if let Some(existing) = PROTECTED_CALL_REGISTRIES.get(&node_key) {
         return existing.value().clone();
     }
     let registry = ProtectedCallRegistry::with_q1_defaults()
         .expect("the Q1 protected-call limits validate by construction");
     PROTECTED_CALL_REGISTRIES
-        .entry(node_id)
+        .entry(node_key)
         .or_insert_with(|| Arc::clone(&registry))
         .value()
         .clone()
 }
 
 /// Test/fixture seam: install a registry with explicit limits as THE
-/// registry for `node_id` (replacing any current one — the replacement is
+/// registry for `node_key` (replacing any current one — the replacement is
 /// dropped, which drops its raise subscription). Used to drive the §2.7
 /// byte witnesses with small budgets; production always uses the Q1
 /// defaults.
 #[cfg(any(test, feature = "fixtures"))]
 pub fn set_protected_call_registry_for_node(
-    node_id: u64,
+    node_key: u64,
     limits: CallLimits,
     byte_limits: ByteLimits,
 ) -> Result<Arc<ProtectedCallRegistry>, LimitsError> {
     let registry = ProtectedCallRegistry::with_limits(limits, byte_limits)?;
-    PROTECTED_CALL_REGISTRIES.insert(node_id, Arc::clone(&registry));
+    PROTECTED_CALL_REGISTRIES.insert(node_key, Arc::clone(&registry));
     Ok(registry)
 }
 
-/// Test/fixture seam: the current registry for `node_id`, if any.
+/// Test/fixture seam: the current registry for `node_key`, if any.
 #[cfg(any(test, feature = "fixtures"))]
-pub fn existing_protected_call_registry(node_id: u64) -> Option<Arc<ProtectedCallRegistry>> {
+pub fn existing_protected_call_registry(node_key: u64) -> Option<Arc<ProtectedCallRegistry>> {
     PROTECTED_CALL_REGISTRIES
-        .get(&node_id)
+        .get(&node_key)
         .map(|r| r.value().clone())
 }
 
@@ -5557,11 +5573,11 @@ pub fn tiny_byte_byte_limits() -> ByteLimits {
 /// replacement semantics (retire every record captured under the old
 /// `(authority_ptr, store_ptr)`; re-subscribe to the new store).
 pub fn org_registry_store_installed(
-    node_id: u64,
+    node_key: u64,
     authority: Option<Arc<NodeAuthority>>,
     store: Arc<OrgRevocationStore>,
 ) {
-    let registry = protected_call_registry_for(node_id);
+    let registry = protected_call_registry_for(node_key);
     registry.bind_store(authority, store);
 }
 
@@ -5569,13 +5585,13 @@ pub fn org_registry_store_installed(
 /// dead-peer sweep: retire exactly the displaced session's records
 /// (session replacement / disconnect).
 pub fn org_registry_retire_session(
-    node_id: u64,
+    node_key: u64,
     peer: u64,
     session_id: u64,
     establishment: Option<[u8; 32]>,
 ) {
     let Some(registry) = PROTECTED_CALL_REGISTRIES
-        .get(&node_id)
+        .get(&node_key)
         .map(|r| r.value().clone())
     else {
         return;
@@ -5591,9 +5607,9 @@ pub fn org_registry_retire_session(
 /// mesh.rs hook — node shutdown (`Adapter::shutdown`): retire every live
 /// protected record of this node. Q3/C9: node shutdown retires all
 /// node-owned calls.
-pub fn org_registry_retire_all(node_id: u64) {
+pub fn org_registry_retire_all(node_key: u64) {
     let Some(registry) = PROTECTED_CALL_REGISTRIES
-        .get(&node_id)
+        .get(&node_key)
         .map(|r| r.value().clone())
     else {
         return;
@@ -5603,9 +5619,9 @@ pub fn org_registry_retire_all(node_id: u64) {
 
 /// mesh.rs hook — `Drop for MeshNode`: retire (best-effort, idempotent)
 /// and DISENGAGE the node's registry so its raise subscription dies with
-/// the node and a reused node id cannot inherit stale records.
-pub fn org_registry_node_dropped(node_id: u64) {
-    if let Some((_, registry)) = PROTECTED_CALL_REGISTRIES.remove(&node_id) {
+/// the node and a later node cannot inherit stale records.
+pub fn org_registry_node_dropped(node_key: u64) {
+    if let Some((_, registry)) = PROTECTED_CALL_REGISTRIES.remove(&node_key) {
         registry.retire_all(StreamTerminalReason::ServeHandleDropped);
     }
 }
@@ -5791,9 +5807,10 @@ fn supervised_handler_result(
             StreamHandlerResult::Err(RpcStatus::Application(code), message),
             false,
         ),
-        Ok(Err(RpcHandlerError::Internal(message))) => {
-            (StreamHandlerResult::Err(RpcStatus::Internal, message), false)
-        }
+        Ok(Err(RpcHandlerError::Internal(message))) => (
+            StreamHandlerResult::Err(RpcStatus::Internal, message),
+            false,
+        ),
         Err(panic) => {
             let panic_msg = panic
                 .downcast_ref::<&'static str>()
@@ -10484,10 +10501,8 @@ mod tests {
     async fn no_chunk_publishes_after_a_retirement_terminal_commits() {
         let (emit, captured) = capturing_async_emitter();
         let (record, flow_sem, gate, registration) = supervised_call_harness(0);
-        let handler = SupervisedHandler::ServerStreaming(
-            Arc::new(TwoChunkHandler),
-            supervised_context(),
-        );
+        let handler =
+            SupervisedHandler::ServerStreaming(Arc::new(TwoChunkHandler), supervised_context());
 
         let sup = tokio::spawn(run_stream_call_supervisor(
             Arc::clone(&record),

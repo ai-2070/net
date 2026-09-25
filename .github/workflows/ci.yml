@@ -1880,7 +1880,7 @@ jobs:
             duplex_deadline_retirement_is_typed_timeout_not_server_error \
             client_stream_deadline_retirement_is_typed_timeout_not_server_error \
             frozen_old_provider_admits_a_well_formed_unary \
-            every_vendored_body_window_recomputes_to_its_recorded_extraction_sha256 || exit 1
+            frozen_85ecc77c9::every_vendored_body_window_recomputes_to_its_recorded_extraction_sha256 || exit 1
 
       # === The fixtures-off DARKNESS probe (external consumer) =============
       # No test inside this workspace can observe a fixtures-off build of the

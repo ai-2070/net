@@ -472,11 +472,11 @@ async fn cancel_duplex_after_split_terminates_both_halves() {
 // the fence assert.
 // =====================================================================
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use net::adapter::net::cortex::{
-    RequestStream, RpcClientStreamingHandler, RpcDuplexHandler, RpcHandlerError, RpcResponsePayload,
-    RpcResponseSink, RpcStatus, RpcStreamingContext,
+    RequestStream, RpcClientStreamingHandler, RpcDuplexHandler, RpcHandlerError,
+    RpcResponsePayload, RpcResponseSink, RpcStatus, RpcStreamingContext,
 };
 
 /// A provider handler that drains its request stream until EOF and
@@ -498,7 +498,7 @@ impl FenceProbe {
     }
 
     fn signal_eof(&self) {
-        if let Some(tx) = self.eof_tx.lock().expect("eof mutex").take() {
+        if let Some(tx) = self.eof_tx.lock().take() {
             let _ = tx.send(());
         }
     }
@@ -537,7 +537,7 @@ impl RpcClientStreamingHandler for CsCancelProbe {
         use futures::StreamExt;
         while requests.next().await.is_some() {}
         ctx.cancellation.cancelled().await;
-        if let Some(tx) = self.cancel_tx.lock().expect("cancel mutex").take() {
+        if let Some(tx) = self.cancel_tx.lock().take() {
             let _ = tx.send(());
         }
         Ok(RpcResponsePayload {

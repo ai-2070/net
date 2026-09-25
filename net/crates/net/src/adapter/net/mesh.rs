@@ -11840,6 +11840,14 @@ pub struct MeshNode {
     static_keypair: StaticKeypair,
     /// Derived node ID
     node_id: u64,
+    /// Process-unique key for this INSTANCE's protected-call registry
+    /// (org-streaming slice 1.4). Deliberately not `node_id`: two live
+    /// nodes built from one identity in the same process (a restart
+    /// overlapping its predecessor's drop, or parallel in-process tests
+    /// with fixed seeds) would otherwise share — and rebind, and on drop
+    /// remove — one registry.
+    #[cfg(feature = "cortex")]
+    protected_call_registry_key: u64,
     /// Configuration
     config: MeshNodeConfig,
     /// Shared UDP socket
@@ -14533,6 +14541,8 @@ impl MeshNode {
             identity: Arc::new(identity),
             static_keypair,
             node_id,
+            #[cfg(feature = "cortex")]
+            protected_call_registry_key: super::cortex::rpc::next_protected_call_registry_key(),
             config,
             socket,
             sink,
@@ -14964,6 +14974,14 @@ impl MeshNode {
     /// Get this node's ID.
     pub fn node_id(&self) -> u64 {
         self.node_id
+    }
+
+    /// The process-unique key of this node's protected-call registry
+    /// (see [`crate::adapter::net::cortex::rpc::protected_call_registry_for`]).
+    /// Unique per `MeshNode` instance, NOT per identity.
+    #[cfg(feature = "cortex")]
+    pub fn protected_call_registry_key(&self) -> u64 {
+        self.protected_call_registry_key
     }
 
     /// Number of shards inbound stream traffic is spread across.
@@ -21455,7 +21473,7 @@ impl MeshNode {
         // returns — and re-subscribes to the new store.
         #[cfg(feature = "cortex")]
         super::cortex::rpc::org_registry_store_installed(
-            self.node_id(),
+            self.protected_call_registry_key,
             self.node_authority(),
             store.clone(),
         );
@@ -24908,7 +24926,7 @@ impl MeshNode {
             // peers survive.
             #[cfg(feature = "cortex")]
             super::cortex::rpc::org_registry_retire_session(
-                self.node_id(),
+                self.protected_call_registry_key,
                 peer_node_id,
                 old.session.session_id(),
                 old.session.handshake_binding(),
@@ -32636,9 +32654,9 @@ impl MeshNode {
         let peer_transitions_evict = self.peer_transitions.clone();
         // §2.3 (org-streaming slice 1.4): the dead-peer sweep retires the
         // departed session's protected calls through the node's registry —
-        // the local node id rides here like the other sweep handles.
+        // the node's registry key rides here like the other sweep handles.
         #[cfg(feature = "cortex")]
-        let registry_node_id = self.node_id();
+        let registry_key = self.protected_call_registry_key;
         // OLB-2B.3c step 2: an eviction moves the session/direct-state
         // projection, so the sweep republishes it and retires the pools that
         // movement supersedes.
@@ -33431,7 +33449,7 @@ impl MeshNode {
                                 // unrelated peers are untouched.
                                 #[cfg(feature = "cortex")]
                                 super::cortex::rpc::org_registry_retire_session(
-                                    registry_node_id,
+                                    registry_key,
                                     node_id,
                                     old_info.session.session_id(),
                                     old_info.session.handshake_binding(),
@@ -51097,7 +51115,7 @@ impl Adapter for MeshNode {
         // live protected call of this node — typed
         // `ServeHandleDropped` — before the task drain.
         #[cfg(feature = "cortex")]
-        super::cortex::rpc::org_registry_retire_all(self.node_id());
+        super::cortex::rpc::org_registry_retire_all(self.protected_call_registry_key);
         self.shutdown_notify.notify_waiters();
         self.router.stop();
 
@@ -51270,10 +51288,10 @@ impl Drop for MeshNode {
         self.shutdown.store(true, Ordering::Release);
         // Q3/C9 (org-streaming slice 1.4): the destructor's best-effort
         // half retires this node's protected calls and DISENGAGES its
-        // registry (dropping the raise subscription) so a reused node id
-        // inherits nothing.
+        // registry (dropping the raise subscription) so no later node
+        // inherits anything.
         #[cfg(feature = "cortex")]
-        super::cortex::rpc::org_registry_node_dropped(self.node_id());
+        super::cortex::rpc::org_registry_node_dropped(self.protected_call_registry_key);
         self.shutdown_notify.notify_waiters();
         self.router.stop();
         // OLB-2B-E3c: `shutdown().await` is the deterministic JOINED teardown.

@@ -90,13 +90,23 @@ function sleep(ms: number): Promise<void> {
 // Fixture shapes (issuer-produced manifests loaded from disk).
 // ---------------------------------------------------------------------------
 
-/** `testMintSameOrgScenario`'s manifest (same-org: one shared org). */
+/**
+ * `gen_subnet_scenario`'s manifest fields the same-org rig consumes
+ * (provider and caller in ONE org; the harness pre-stages the shared
+ * owner audience before this program runs).
+ */
 type SameOrgManifest = {
-  org_id_hex: string;
-  provider: { seed_hex: string; entity_id_hex: string; authority_dir: string };
+  psk_hex: string;
+  provider: {
+    seed_hex: string;
+    entity_id_hex: string;
+    org_id_hex: string;
+    authority_dir: string;
+  };
   caller: {
     seed_hex: string;
     entity_id_hex: string;
+    org_id_hex: string;
     authority_dir: string;
     membership_path: string;
     dispatcher_path: string;
@@ -137,9 +147,6 @@ type ExpectedCaller = {
   provider: string;
   sameOrg: boolean;
 };
-
-/** The same-org fixture's transport psk (orthogonal to the minted authority). */
-const SAME_ORG_PSK = '51'.repeat(32);
 
 // ---------------------------------------------------------------------------
 // The projection witness oracle: the five admission-verified facts, exact.
@@ -275,8 +282,8 @@ async function withSameOrg(
   const manifest = JSON.parse(
     readFileSync(join(dir, 'manifest.json'), 'utf8'),
   ) as SameOrgManifest;
-  const provider = await meshFromSeed(manifest.provider.seed_hex, SAME_ORG_PSK);
-  const caller = await meshFromSeed(manifest.caller.seed_hex, SAME_ORG_PSK);
+  const provider = await meshFromSeed(manifest.provider.seed_hex, manifest.psk_hex);
+  const caller = await meshFromSeed(manifest.caller.seed_hex, manifest.psk_hex);
   const handles: OrgServeHandle[] = [];
   let client: OrgClient | undefined;
   try {
@@ -302,8 +309,8 @@ async function withSameOrg(
       svc: `q6.tssdk.${serviceSuffix}`,
       expected: {
         entity: manifest.caller.entity_id_hex,
-        actingOrg: manifest.org_id_hex,
-        providerOrg: manifest.org_id_hex,
+        actingOrg: manifest.caller.org_id_hex,
+        providerOrg: manifest.provider.org_id_hex,
         provider: manifest.provider.entity_id_hex,
         sameOrg: true,
       },

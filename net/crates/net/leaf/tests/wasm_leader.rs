@@ -4440,10 +4440,12 @@ async fn a_forged_accept_claim_is_never_served_to_the_handler_as_the_caller() {
 /// never learned why its service was not live.
 #[wasm_bindgen_test]
 async fn a_permanent_serve_registration_refusal_reaches_the_page_without_a_retry_storm() {
-    let mut fake = ServeFake::default();
-    fake.refuse_register = Some(ProxyFailure::Typed(LeafError::Session(
-        "serve \"svc\": AlreadyServed".to_string(),
-    )));
+    let fake = ServeFake {
+        refuse_register: Some(ProxyFailure::Typed(LeafError::Session(
+            "serve \"svc\": AlreadyServed".to_string(),
+        ))),
+        ..Default::default()
+    };
     let (session, leader) = serve_session(fake.clone()).await;
     let session_events = Rc::new(RefCell::new(Vec::new()));
     let sink = Rc::clone(&session_events);

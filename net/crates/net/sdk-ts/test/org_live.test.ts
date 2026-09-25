@@ -36,6 +36,7 @@ import {
   cpSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -43,7 +44,6 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { testMintSameOrgScenario } from '@net-mesh/core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 const here = dirname(fileURLToPath(import.meta.url)) // sdk-ts/test
@@ -202,8 +202,36 @@ beforeAll(async () => {
   consumerJs = join(work, 'out', 'org_streaming_consumer.js')
 
   // (4) Mint the issuer fixtures.
+  // SAME-ORG rides `gen_subnet_scenario`'s ORG artifacts (the Node
+  // binding suite's and the Go harness's `setupSameOrgLive` pattern — no
+  // `test-helpers` build needed), plus spec §3.4's out-of-band
+  // owner-audience pre-staging: the caller authority must hold the
+  // provider's ONE per-organization audience before either loads.
   sameDir = tmpScenarioDir('same')
-  testMintSameOrgScenario(sameDir)
+  execFileSync(
+    'cargo',
+    [
+      'run',
+      '-q',
+      '-p',
+      'net-mesh-sdk',
+      '--features',
+      'net,cortex,fixtures',
+      '--example',
+      'gen_subnet_scenario',
+      '--',
+      sameDir,
+    ],
+    { cwd: crateRoot, stdio: 'pipe', encoding: 'utf8', timeout: 300_000 },
+  )
+  const sameManifest = JSON.parse(readFileSync(join(sameDir, 'manifest.json'), 'utf8')) as {
+    provider: { authority_dir: string }
+    caller: { authority_dir: string }
+  }
+  writeFileSync(
+    join(sameDir, sameManifest.caller.authority_dir, 'owner-audience.key'),
+    readFileSync(join(sameDir, sameManifest.provider.authority_dir, 'owner-audience.key')),
+  )
   grantedDir = mkdtempSync(join(tmpdir(), 'x2-ts-sdk-granted-'))
   execFileSync(
     'cargo',

@@ -508,7 +508,7 @@ impl Drop for ServeHandle {
         // registration (protected unary records included), synchronously,
         // before this returns. Idempotent with the `retire_all` above
         // (first writer wins on each record).
-        crate::adapter::net::cortex::rpc::protected_call_registry_for(self.mesh.node_id())
+        crate::adapter::net::cortex::rpc::protected_call_registry_for(self.mesh.protected_call_registry_key())
             .retire_registration(
                 self.registration_id,
                 StreamTerminalReason::ServeHandleDropped,
@@ -1252,7 +1252,7 @@ pub fn admit_protected_opening(
     // §3 step 1 — RESERVE. The reservation guard owns the rollback for
     // every early return below (§2.4: pre-transfer, the bridge's guard is
     // the ONE cleanup owner).
-    let registry = fold::protected_call_registry_for(mesh.node_id());
+    let registry = fold::protected_call_registry_for(mesh.protected_call_registry_key());
     let mut reservation = registry.reserve(fold::OpeningRequest {
         key: fold::ProtectedCallKey {
             caller: caller.clone(),
