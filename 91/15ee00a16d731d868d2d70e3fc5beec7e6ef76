@@ -1,0 +1,21 @@
+docs/internal/misc/CODE_REVIEW_2026_09_24_ORG_STREAMING.md
+  s_d8b00bedd146e9::t_241588e8d1520e 816-932
+  s_d8b00bedd146e9::t_a2e37831408f0e 30-31
+  s_d8b00bedd146e9::t_d02ab9110a028a 111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9115ee00a16d731d868d2d70e3fc5beec7e6ef76",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
