@@ -1,0 +1,38 @@
+net/crates/net/src/adapter/net/behavior/org_stream_lifecycle.rs
+  s_d8b00bedd146e9::t_7d54764b89abf0 730-737,743-746,751,874-876,914,919-933,935-946,948-950,965-970,972-975
+  s_d8b00bedd146e9::t_e74667cd03e94a 1021-1025
+  s_d8b00bedd146e9::t_fe61c89a84bd73 1966-1985,1987-2003
+  s_d8b00bedd146e9::t_1176499f196472 1986
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_efaf0109abae12 4174,4176-4198,4206,4217-4218,4220,4225-4226,4232-4246,4248-4274,4276-4278
+  s_d8b00bedd146e9::t_a2656d1b7b0d4d 4247,4275
+  s_d8b00bedd146e9::t_0d999790188778 4321-4323,4331-4334,4336-4338,4352-4355,4357-4359
+  s_d8b00bedd146e9::t_88ab7deb53062d 3764,3766
+  s_d8b00bedd146e9::t_6c06776b1e973b 3777
+  s_d8b00bedd146e9::t_3f5f0a938afb44 1827
+  s_d8b00bedd146e9::t_951f21f867b56c 4155-4159,4164-4167
+net/crates/net/tests/org_scoped_cross_process.rs
+  s_d8b00bedd146e9::t_dde5b254757e31 78-84
+  s_d8b00bedd146e9::t_983b96ffa6417b 392-395
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_d8b00bedd146e9::t_fdeffa9a9b76a0 2551-2557,2559,5999-6001,6048,6053-6067,6069-6071,6073-6087,6089-6091,6131-6136,6138-6141
+  s_d8b00bedd146e9::t_79132ad3218d97 5943-5955,10566,10615-10618
+  s_d8b00bedd146e9::t_fe61c89a84bd73 10538-10565,10567-10614,10619-10657
+  s_d8b00bedd146e9::t_551d7e3891f756 2558
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c9935110a27c54decd6caad87714241982b22882",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
