@@ -16,7 +16,7 @@
 // with the `org` feature; skips cleanly otherwise.
 
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
@@ -41,6 +41,7 @@ const {
   OrgCredentials,
   OrgClient,
   serveOrg,
+  serveOrgDuplex,
   OrgAccess,
   installOrgAuthority,
   installProviderGrantAudience,
@@ -52,21 +53,32 @@ const HAS_ORG =
   typeof OrgClient?.bind === 'function' &&
   typeof serveOrg === 'function'
 
-// The Stage 4 streaming surface: the §4.4 verbs plus the `test-helpers`
-// same-org scenario minter. Skips cleanly on a build without them.
+// The Stage 4 streaming surface: the §4.4 verbs. Keys on REAL build exports
+// only (NODE-5) — the same-org cell mints from `gen_subnet_scenario` like
+// the Go/Python harnesses, so a plain `npm run build && npm test` RUNS the
+// whole §4.4 estate instead of silently skipping it on a build without the
+// `test-helpers` feature.
 const HAS_S4 =
   HAS_ORG &&
   typeof binding.serveOrgStreaming === 'function' &&
-  typeof binding.testMintSameOrgScenario === 'function'
+  typeof binding.serveOrgClientStream === 'function' &&
+  typeof binding.serveOrgDuplex === 'function'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Mesh = any
 type Manifest = {
   psk_hex: string
   granted_service: string
-  provider: { seed_hex: string; authority_dir: string; grant_path: string; grant_secret_path: string }
+  provider: {
+    seed_hex: string
+    org_id_hex: string
+    authority_dir: string
+    grant_path: string
+    grant_secret_path: string
+  }
   caller: {
     seed_hex: string
+    org_id_hex: string
     authority_dir: string
     membership_path: string
     dispatcher_path: string
@@ -212,21 +224,25 @@ describe.skipIf(!HAS_ORG)('X2 — live cross-org call through the Node binding',
 //
 // Fixture consumption: GRANTED rides the `gen_org_scenario` manifest (the
 // same issuance chain every language's live cell loads); SAME-ORG rides the
-// `test-helpers`-gated `testMintSameOrgScenario` (no generator mints a
-// shared-owner-audience same-org chain). Every shape's handler-side
-// attribution asserts the five admission-verified `OrgCaller` facts EXACTLY
-// — that assertion is the projection witness whose inverse receipt (a
-// projection reporting anything but the verified facts) must redden it.
+// `gen_subnet_scenario` manifest's ORG artifacts (the Go harness's
+// `setupSameOrgLive` pattern — the plain protected surface, no subnet
+// plane) plus §3.4's out-of-band owner-audience pre-staging from files
+// (`shareOwnerAudience`). Both generators run from any build's toolchain,
+// so a plain `npm run build && npm test` RUNS this whole estate (NODE-5).
+// Every shape's handler-side attribution asserts the five
+// admission-verified `OrgCaller` facts EXACTLY — that assertion is the
+// projection witness whose inverse receipt (a projection reporting
+// anything but the verified facts) must redden it.
 // ===========================================================================
 
-const S4_PSK = '51'.repeat(32)
-
+/** The `gen_subnet_scenario` manifest fields this suite consumes. */
 type SameOrgManifest = {
-  org_id_hex: string
-  provider: { seed_hex: string; entity_id_hex: string; authority_dir: string }
+  psk_hex: string
+  provider: { seed_hex: string; entity_id_hex: string; org_id_hex: string; authority_dir: string }
   caller: {
     seed_hex: string
     entity_id_hex: string
+    org_id_hex: string
     authority_dir: string
     membership_path: string
     dispatcher_path: string
@@ -239,7 +255,7 @@ const hex = (b: Buffer): string => Buffer.from(b).toString('hex')
  * Plain `mkdir`, NOT `mkdtemp`: on Windows an mkdtemp directory carries an
  * owner-only ACL whose inheritance the audience-secret loader (rightly)
  * refuses on files created beneath it (the Python twin's live cells carry
- * the same note). The Rust minter's checked writers need ordinary
+ * the same note). The Rust generator's checked writers need ordinary
  * per-user directories.
  */
 function tmpScenarioDir(tag: string): string {
@@ -249,6 +265,47 @@ function tmpScenarioDir(tag: string): string {
   )
   mkdirSync(dir, { recursive: true })
   return dir
+}
+
+/**
+ * Mint a same-org scenario from `gen_subnet_scenario`'s ORG artifacts — the
+ * Go harness's `setupSameOrgLive` source (this section uses the PLAIN
+ * protected surface; no subnet plane is configured). GENERATED fresh per
+ * run (the credentials expire), exactly like `gen_org_scenario`.
+ */
+function genSubnetScenario(dir: string): SameOrgManifest {
+  execFileSync(
+    'cargo',
+    [
+      'run',
+      '-q',
+      '-p',
+      'net-mesh-sdk',
+      '--features',
+      'net,cortex,fixtures',
+      '--example',
+      'gen_subnet_scenario',
+      '--',
+      dir,
+    ],
+    { cwd: crateRoot, stdio: 'inherit' },
+  )
+  return JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')) as SameOrgManifest
+}
+
+/**
+ * spec §3.4's out-of-band pre-staging step FROM THE GENERATED FILES (the
+ * Go harness's `shareOwnerAudience`, same semantics): copy the provider
+ * authority's owner-audience credential (`owner-audience.key`) over the
+ * caller authority's BEFORE `installOrgAuthority` loads either.
+ * Owner-scoped discovery is keyed on ONE per-organization audience, so two
+ * independently adopted nodes each minting their own could never open the
+ * other's envelopes. Overwriting in place preserves the file's checked
+ * permissions.
+ */
+function shareOwnerAudience(providerAuthorityDir: string, callerAuthorityDir: string): void {
+  const audience = readFileSync(join(providerAuthorityDir, 'owner-audience.key'))
+  writeFileSync(join(callerAuthorityDir, 'owner-audience.key'), audience)
 }
 
 /**
@@ -317,6 +374,7 @@ describe.skipIf(!HAS_S4)('S4 — same-org streaming: call AND serve through the 
     unary: 's4.same.unary',
     cancel: 's4.same.cancel',
     reject: 's4.same.reject',
+    drop: 's4.same.drop',
   }
   let dir: string
   let manifest: SameOrgManifest
@@ -330,10 +388,14 @@ describe.skipIf(!HAS_S4)('S4 — same-org streaming: call AND serve through the 
 
   beforeAll(async () => {
     dir = tmpScenarioDir('same')
-    manifest = JSON.parse(binding.testMintSameOrgScenario(dir)) as SameOrgManifest
-    provider = await meshFromSeed(manifest.provider.seed_hex, S4_PSK)
-    caller = await meshFromSeed(manifest.caller.seed_hex, S4_PSK)
+    manifest = genSubnetScenario(dir)
+    provider = await meshFromSeed(manifest.provider.seed_hex, manifest.psk_hex)
+    caller = await meshFromSeed(manifest.caller.seed_hex, manifest.psk_hex)
     installOrgAuthority(provider, join(dir, manifest.provider.authority_dir))
+    shareOwnerAudience(
+      join(dir, manifest.provider.authority_dir),
+      join(dir, manifest.caller.authority_dir),
+    )
     installOrgAuthority(caller, join(dir, manifest.caller.authority_dir))
     await handshake(caller, provider)
     await provider.start()
@@ -421,8 +483,8 @@ describe.skipIf(!HAS_S4)('S4 — same-org streaming: call AND serve through the 
     expect(items, 'exact streamed payloads').toEqual([{ n: 8 }, { n: 9 }])
     expectVerifiedCaller(attrSS, {
       entity: manifest.caller.entity_id_hex,
-      actingOrg: manifest.org_id_hex,
-      providerOrg: manifest.org_id_hex,
+      actingOrg: manifest.caller.org_id_hex,
+      providerOrg: manifest.provider.org_id_hex,
       provider: manifest.provider.entity_id_hex,
       sameOrg: true,
     })
@@ -440,8 +502,8 @@ describe.skipIf(!HAS_S4)('S4 — same-org streaming: call AND serve through the 
     expect(summary, 'exact terminal summary').toEqual({ count: 2, total: 30 })
     expectVerifiedCaller(attrCS, {
       entity: manifest.caller.entity_id_hex,
-      actingOrg: manifest.org_id_hex,
-      providerOrg: manifest.org_id_hex,
+      actingOrg: manifest.caller.org_id_hex,
+      providerOrg: manifest.provider.org_id_hex,
       provider: manifest.provider.entity_id_hex,
       sameOrg: true,
     })
@@ -462,8 +524,8 @@ describe.skipIf(!HAS_S4)('S4 — same-org streaming: call AND serve through the 
     expect(echoes, 'exact duplex echoes').toEqual([{ n: 10 }, { n: 20 }])
     expectVerifiedCaller(attrDX, {
       entity: manifest.caller.entity_id_hex,
-      actingOrg: manifest.org_id_hex,
-      providerOrg: manifest.org_id_hex,
+      actingOrg: manifest.caller.org_id_hex,
+      providerOrg: manifest.provider.org_id_hex,
       provider: manifest.provider.entity_id_hex,
       sameOrg: true,
     })
@@ -507,10 +569,19 @@ describe.skipIf(!HAS_S4)('S4 — same-org streaming: call AND serve through the 
     //
     // (1) CANCEL retirement (the §2.2 contract at the caller's handle,
     //     EXECUTED here): the retired call's items are DISCARDED and the
-    //     stream ends with `null` — never a late item. That EOF plus the
-    //     one wire CANCEL is what "cancellation is observed through the
-    //     retirement observables" means for the caller. The handler just
-    //     sleeps and is never told (the F-S3.1-2 handler-drop level).
+    //     stream terminates with the TYPED cancellation terminal —
+    //     `org:rpc:cancelled`, an `OrgError{rpc}` with `kind: 'cancelled'`
+    //     through `classifyOrgError`, the same typed-cancellation
+    //     observable the browser surface delivers as `OrgCancelledError` —
+    //     never a clean `null` EOF and never a late item. That terminal
+    //     plus the one wire CANCEL is what "cancellation is observed
+    //     through the retirement observables" means for the caller. The
+    //     handler just sleeps and is never told (the F-S3.1-2 handler-drop
+    //     level).
+    //     (NODE-1 — DELIBERATE CONTRACT UPDATE, Owner Q1's typed terminal
+    //     vocabulary: this witness previously pinned clean `null` EOF
+    //     after `cancelCall`. The scenario is kept; only the pinned
+    //     observable moved to the typed terminal the docs promise.)
     // (2) A midstream terminal ERROR (a handler rejection): the reused
     //     typed stream throws the classifyOrgError OUTPUT — an `OrgError`
     //     with the frozen `org:rpc:` kind, not a bare string.
@@ -536,10 +607,24 @@ describe.skipIf(!HAS_S4)('S4 — same-org streaming: call AND serve through the 
       })
       expect(await opened.stream.next(), 'the live item before retirement').toEqual({ n: 1 })
       rpc.cancelCall(opened.token)
+      let cancelled: unknown
+      try {
+        await opened.stream.next()
+      } catch (e) {
+        cancelled = e
+      }
       expect(
-        await opened.stream.next(),
-        'cancel retirement discards the call — the stream ends, never a late item',
-      ).toBeNull()
+        cancelled,
+        'cancel retirement surfaces a typed terminal — never a clean EOF, never a late item',
+      ).toBeDefined()
+      expect(cancelled, 'classified through classifyOrgError').toBeInstanceOf(OrgError)
+      const cancelErr = cancelled as OrgError
+      expect(cancelErr.domain, 'the frozen rpc domain').toBe('rpc')
+      expect(cancelErr.kind, 'cancel retirement is the cancelled kind').toBe('cancelled')
+      expect(
+        cancelErr.message.startsWith('org:rpc:cancelled'),
+        `wire vocabulary: ${cancelErr.message}`,
+      ).toBe(true)
       expect(await opened.stream.next(), 'the ended stream stays ended').toBeNull()
     } finally {
       cancelHandle.close()
@@ -572,6 +657,92 @@ describe.skipIf(!HAS_S4)('S4 — same-org streaming: call AND serve through the 
       expect(err.kind, 'a handler rejection is the server_error kind').toBe('server_error')
     } finally {
       rejectHandle.close()
+    }
+  }, 120_000)
+
+  it('forced_drop_releases_both_handler_handles_promptly', async () => {
+    // NODE-3's witness: when the retire supervisor force-drops the handler
+    // future (caller cancel while the handler still runs), the RUST side
+    // releases BOTH handles the bridge handed the handler — promptly, never
+    // V8-GC-quantized.
+    //
+    // Pre-fix behavior this reddens: `JsRequestStream` owned the only Arc
+    // and `JsResponseSink` held a clone, so on the forced-drop path release
+    // waited on a V8 GC (measured 7–16 s) exactly where the handler-drop
+    // contract matters — and a late `sink.send` returned `true` into the
+    // dead call's queue instead of `false`.
+    let hStream: { next: () => Promise<Buffer | null> } | undefined
+    let hSink: { send: (body: Buffer) => boolean } | undefined
+    const dropHandle = serveOrgDuplex(
+      provider,
+      SVC.drop,
+      OrgAccess.SameOrg,
+      // Raw bridge args `[caller, stream, sink]` — the probe needs the RAW
+      // handles, whose `send` returns the release verdict as a boolean.
+      (args: [unknown, NonNullable<typeof hStream>, NonNullable<typeof hSink>]): Promise<Buffer> => {
+        hStream = args[1]
+        hSink = args[2]
+        // Sleep past the retirement: the supervisor's DROP is what releases
+        // the handles, not this promise settling (it may never).
+        return sleep(30_000).then(() => Buffer.alloc(0))
+      },
+    )
+    handles.push(dropHandle)
+    try {
+      // The REQUEST rides the first send — that is the call's opening.
+      // RAW halves, because the retirement is the documented one-CANCEL
+      // contract ("dropping or closing a call handle emits exactly one
+      // CANCEL"): closing BOTH halves drops the shared call inner, whose
+      // guard publishes the wire CANCEL (no response terminal was ever
+      // observed). `MeshRpc.cancelCall` alone delivers only the LOCAL
+      // typed terminal — the wire CANCEL is what retires the provider.
+      const opened = await convergeOrg(provider, caller, async () => {
+        const [sink, stream] = await typed.raw.callDuplexBytes(SVC.drop)
+        await sink.send(Buffer.from(JSON.stringify({ n: 1 })))
+        return { sink, stream }
+      })
+      // Wait for the handler to run and capture the handles (the dispatch
+      // crosses the TSFN), THEN retire the call: the wire CANCEL reaches
+      // the provider, its retire supervisor FORCE-DROPS the handler
+      // future, and that drop is what must release the handles.
+      const startDeadline = Date.now() + 10_000
+      while (Date.now() < startDeadline && !hSink) {
+        await sleep(25)
+      }
+      expect(hSink, 'the handler ran and captured its handles').toBeDefined()
+      await opened.sink.close()
+      await opened.stream.close()
+
+      // The forced drop must release the RESPONSE SINK: `send` flips to
+      // `false` promptly (bounded poll; pre-fix it returns `true` into the
+      // dead call's queue forever).
+      const releaseDeadline = Date.now() + 10_000
+      let released = false
+      while (Date.now() < releaseDeadline && !released) {
+        const sink = hSink as NonNullable<typeof hSink>
+        released = !sink.send(Buffer.from('late'))
+        if (!released) await sleep(50)
+      }
+      expect(
+        released,
+        'forced drop releases the response sink promptly — send() is false, never true into the dead call',
+      ).toBe(true)
+
+      // …and the REQUEST STREAM: `next()` refuses with the closed-handle
+      // usage error (pre-fix it resolved `null`, the underlying stream
+      // freed only at GC).
+      const stream = hStream as NonNullable<typeof hStream>
+      const refused = await stream.next().then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      )
+      expect(refused, 'forced drop releases the request stream promptly').toBeDefined()
+      expect(
+        String((refused as Error).message),
+        'a released handle refuses pulls',
+      ).toContain('stream_closed')
+    } finally {
+      dropHandle.close()
     }
   }, 120_000)
 })
@@ -751,10 +922,14 @@ describe.skipIf(!HAS_S4)('S4 — disposal: bounded cleanup through the documente
     // await mesh.shutdown()` must release every reference — the failure
     // mode is a REJECTED shutdown ("outstanding references exist").
     dir = tmpScenarioDir('dispose')
-    const manifest = JSON.parse(binding.testMintSameOrgScenario(dir)) as SameOrgManifest
-    const provider = await meshFromSeed(manifest.provider.seed_hex, S4_PSK)
-    const caller = await meshFromSeed(manifest.caller.seed_hex, S4_PSK)
+    const manifest = genSubnetScenario(dir)
+    const provider = await meshFromSeed(manifest.provider.seed_hex, manifest.psk_hex)
+    const caller = await meshFromSeed(manifest.caller.seed_hex, manifest.psk_hex)
     installOrgAuthority(provider, join(dir, manifest.provider.authority_dir))
+    shareOwnerAudience(
+      join(dir, manifest.provider.authority_dir),
+      join(dir, manifest.caller.authority_dir),
+    )
     installOrgAuthority(caller, join(dir, manifest.caller.authority_dir))
     await handshake(caller, provider)
     await provider.start()

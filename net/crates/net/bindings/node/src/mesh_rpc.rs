@@ -111,27 +111,37 @@ fn nrpc_err_from_inner(err: InnerRpcError) -> Error {
 /// wire vocabulary — the error path for handles opened by the org verbs
 /// (`OrgClient.callStreamingBytes` etc., §4.4).
 ///
+/// See [`org_sdk_error`] for the classification itself, split out so a
+/// cargo unit test can witness it (a napi `Error` cannot be constructed
+/// off the Node thread). Local binding-usage refusals (`nrpc:stream_closed`)
+/// are not call outcomes and keep the `nrpc:` usage vocabulary even on an
+/// org handle.
+pub(crate) fn org_err_from_inner(err: InnerRpcError) -> Error {
+    Error::from_reason(org_sdk_error(err).to_wire())
+}
+
+/// The classification behind [`org_err_from_inner`], in the ONE
+/// `OrgSdkError::to_wire()` vocabulary so the strings an org handle throws
+/// are exactly what `classifyOrgError` and
+/// `tests/cross_lang_org/error_vectors.json` pin.
+///
 /// The `*_bytes_deadline` seams return the EXISTING raw handles ("no new
 /// stream wrapper per binding"), so a midstream error VALUE lands here
 /// rather than in the facade's `map_rpc_error`. This mirrors that mapping
-/// — an admission denial is status `0x0009` carrying the single coarse
-/// reason byte as its body — and renders through the ONE
-/// `OrgSdkError::to_wire()` vocabulary, so the strings an org handle throws
-/// are exactly what `classifyOrgError` and
-/// `tests/cross_lang_org/error_vectors.json` pin. An undecodable coarse
-/// body is the least-informative bucket (`denied`), never an error about an
-/// error.
-///
-/// Local binding-usage refusals (`nrpc:stream_closed`) are not call
-/// outcomes and keep the `nrpc:` usage vocabulary even on an org handle.
-pub(crate) fn org_err_from_inner(err: InnerRpcError) -> Error {
+/// EXACTLY (NODE-2): an admission denial is status `0x0009` carrying the
+/// single coarse reason byte as its body — and a `0x0009` frame is an
+/// admission denial in EVERY body shape. An undecodable, missing, or
+/// unknown coarse byte falls back to the least-informative `Denied` bucket,
+/// never an error about an error and never `rpc:server_error`, so
+/// `instanceof OrgAdmissionDeniedError` cannot silently miss a denial.
+pub(crate) fn org_sdk_error(err: InnerRpcError) -> net_sdk::org::OrgSdkError {
     /// The wire status a provider's admission denial carries (OA2-E2) —
     /// the same value the facade's private constant names.
     const RPC_STATUS_ADMISSION_DENIED: u16 = 0x0009;
     use net_sdk::org::types::CoarseAdmissionReason;
     use net_sdk::org::OrgSdkError;
 
-    let denial = match &err {
+    match &err {
         InnerRpcError::ServerError {
             status, message, ..
         } if *status == RPC_STATUS_ADMISSION_DENIED => {
@@ -139,20 +149,20 @@ pub(crate) fn org_err_from_inner(err: InnerRpcError) -> Error {
             // rendered `message` exactly the way the facade's
             // `admission_reason_of` recovers it.
             let mut chars = message.chars();
-            match (chars.next(), chars.next()) {
+            let coarse = match (chars.next(), chars.next()) {
                 (Some(c), None) => u8::try_from(u32::from(c))
                     .ok()
                     .and_then(CoarseAdmissionReason::from_wire),
                 _ => None,
-            }
+            };
+            // NODE-2 — mirror the facade's `unwrap_or(Denied)` fallback:
+            // the caller still learns it was denied (and a provider that
+            // learns a new coarse bucket cannot make old callers
+            // misreport the outcome).
+            OrgSdkError::AdmissionDenied(coarse.unwrap_or(CoarseAdmissionReason::Denied))
         }
-        _ => None,
-    };
-    let mapped = match denial {
-        Some(coarse) => OrgSdkError::AdmissionDenied(coarse),
-        None => OrgSdkError::Rpc(err),
-    };
-    Error::from_reason(mapped.to_wire())
+        _ => OrgSdkError::Rpc(err),
+    }
 }
 
 /// The one error-rendering seam for the caller-side handle classes: org
@@ -1284,9 +1294,13 @@ impl DuplexStream {
 ///
 /// Lifetime: bounded by the handler callback. The SDK's
 /// underlying `RequestStream` is taken into this wrapper at
-/// handler dispatch and dropped when the wrapper is dropped
-/// (which happens when JS releases its reference to the instance,
-/// typically right after the handler returns).
+/// handler dispatch and released by the RUST side the moment the
+/// handler bridge's future settles or is dropped (the retire
+/// supervisor's forced drop) — the bridge's `JsHandleRelease`
+/// guard owns that release (NODE-3), so it is prompt and never
+/// V8-GC-quantized. Dropping THIS wrapper (JS releasing its
+/// reference) is only the fallback for a handle a bridge never
+/// guarded; `next()` then refuses with `nrpc:stream_closed`.
 #[napi]
 pub struct JsRequestStream {
     pub(crate) inner: Arc<tokio::sync::Mutex<Option<InnerRequestStream>>>,
@@ -1415,6 +1429,96 @@ impl JsResponseSink {
     }
 }
 
+/// NODE-3 — the handler-drop contract's RELEASE OWNER: a local guard in
+/// every handler bridge (`NodeStreamingRpcHandler::call` and its
+/// client-streaming / duplex / org siblings) that releases the inner
+/// [`InnerRpcResponseSink`] / [`InnerRequestStream`] the instant the
+/// bridge's future completes OR is dropped.
+///
+/// Without it, a forced drop — the retire supervisor dropping the handler
+/// future on cancel / deadline / revocation — left `JsResponseSink`'s
+/// clone and `JsRequestStream`'s only owner alive in JS, so release was
+/// V8-GC-quantized (measured 7–16 s) exactly where the handler-drop
+/// contract matters, and a late `sink.send` returned `true` into the dead
+/// call's queue. With it, `send` is `false` and `next` refuses with
+/// `nrpc:stream_closed` from the release instant.
+///
+/// One edge, stated: if a JS `next()` pull holds the request stream's lock
+/// across its await at the drop instant, the request release lands the
+/// moment that pull completes (the guard hands the take to the ambient
+/// runtime instead of blocking a worker here). The sink release is
+/// synchronous either way.
+pub(crate) struct JsHandleRelease {
+    sink: Option<Arc<Mutex<Option<InnerRpcResponseSink>>>>,
+    requests: Option<Arc<tokio::sync::Mutex<Option<InnerRequestStream>>>>,
+}
+
+impl JsHandleRelease {
+    /// Release owner for the response-sink slot alone (server-streaming).
+    pub(crate) fn sink(slot: Arc<Mutex<Option<InnerRpcResponseSink>>>) -> Self {
+        Self {
+            sink: Some(slot),
+            requests: None,
+        }
+    }
+
+    /// Release owner for the request-stream slot alone (client-streaming).
+    pub(crate) fn requests(slot: Arc<tokio::sync::Mutex<Option<InnerRequestStream>>>) -> Self {
+        Self {
+            sink: None,
+            requests: Some(slot),
+        }
+    }
+
+    /// Release owner for both handler handles (duplex).
+    pub(crate) fn both(
+        sink: Arc<Mutex<Option<InnerRpcResponseSink>>>,
+        requests: Arc<tokio::sync::Mutex<Option<InnerRequestStream>>>,
+    ) -> Self {
+        Self {
+            sink: Some(sink),
+            requests: Some(requests),
+        }
+    }
+}
+
+impl Drop for JsHandleRelease {
+    fn drop(&mut self) {
+        if let Some(sink) = self.sink.take() {
+            let _ = sink.lock().take();
+        }
+        if let Some(requests) = self.requests.take() {
+            if !try_release_requests_now(&requests) {
+                // A live JS pull holds the lock across its await; hand
+                // the take to the runtime so it lands the moment the
+                // pull completes (never block a runtime worker here —
+                // this Drop runs on one).
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = requests.lock().await.take();
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Take the request-stream slot now when the lock is free (`true`); `false`
+/// when a live JS `next()` pull holds it across its await — the caller then
+/// hands the take to the ambient runtime. Split out from
+/// [`JsHandleRelease::drop`] so the guard borrow ends before the `Arc` can
+/// move into the spawned take.
+fn try_release_requests_now(slot: &tokio::sync::Mutex<Option<InnerRequestStream>>) -> bool {
+    let locked = slot.try_lock();
+    match locked {
+        Ok(mut guard) => {
+            let _ = guard.take();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 // ============================================================================
 // Server-side TSFN bridges (Phase B9-2).
 //
@@ -1539,8 +1643,12 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
         // GC cycles: measured at 7.6 s, 7.7 s and 15.8 s on loopback,
         // and unaffected by mesh traffic, because GC is not driven by
         // the mesh. Retaining the slot lets us drop it ourselves the
-        // moment the handler's promise settles.
+        // moment the handler's promise settles — and the
+        // `JsHandleRelease` guard releases it at a forced drop too (the
+        // supervisor dropping this future), so the release is NEVER
+        // V8-GC-quantized (NODE-3).
         let sink_slot = Arc::new(Mutex::new(Some(sink)));
+        let _release = JsHandleRelease::sink(sink_slot.clone());
         let args = StreamingHandlerArgs {
             req: Buffer::from(ctx.payload.body.to_vec()),
             sink: JsResponseSink {
@@ -1586,7 +1694,13 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
         let settled = tokio::time::timeout_at(deadline, promise).await;
         // The handler is done with the sink the instant its promise
         // settles, whichever way it settled. Drop it here rather than
-        // waiting for V8 to collect the JS-side wrapper.
+        // waiting for V8 to collect the JS-side wrapper — and if this
+        // future is dropped BEFORE the promise settles (the retire
+        // supervisor's forced drop on cancel / deadline / revocation),
+        // the `JsHandleRelease` guard releases the slot at the drop
+        // instead (NODE-3). Either way the release is Rust-side and
+        // prompt: a late `sink.send` is `false` from that instant,
+        // never `true` into the dead call's queue.
         drop(sink_slot.lock().take());
         match settled {
             Ok(Ok(_)) => Ok(()),
@@ -1629,6 +1743,10 @@ impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
             deadline_ns: ctx.deadline_ns,
             headers: Arc::new(ctx.headers),
         };
+        // NODE-3 — release the request stream the moment this future
+        // completes OR is dropped (the retire supervisor's forced drop),
+        // never on a V8 GC of the JS wrapper.
+        let _release = JsHandleRelease::requests(stream_handle.inner.clone());
         let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
         let status = self.tsfn.call_with_return_value(
             stream_handle,
@@ -1723,11 +1841,15 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
         // GC cycles: measured at 7.6 s, 7.7 s and 15.8 s on loopback,
         // and unaffected by mesh traffic, because GC is not driven by
         // the mesh. Retaining the slot lets us drop it ourselves the
-        // moment the handler's promise settles.
+        // moment the handler's promise settles — and the
+        // `JsHandleRelease` guard releases BOTH handler handles at a
+        // forced drop too (the supervisor dropping this future), so the
+        // release is NEVER V8-GC-quantized (NODE-3).
         let sink_slot = Arc::new(Mutex::new(Some(responses)));
+        let requests_slot = Arc::new(tokio::sync::Mutex::new(Some(requests)));
         let args = DuplexHandlerArgs {
             stream: JsRequestStream {
-                inner: Arc::new(tokio::sync::Mutex::new(Some(requests))),
+                inner: requests_slot.clone(),
                 caller_origin: ctx.caller_origin,
                 call_id: ctx.call_id,
                 deadline_ns: ctx.deadline_ns,
@@ -1737,6 +1859,7 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
                 inner: sink_slot.clone(),
             },
         };
+        let _release = JsHandleRelease::both(sink_slot.clone(), requests_slot);
         let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
         let status = self.tsfn.call_with_return_value(
             args,
@@ -2597,5 +2720,142 @@ mod tests {
                 "codec/diagnostic string MUST NOT match app-error format: {s:?}",
             );
         }
+    }
+
+    // ========================================================================
+    // NODE-2 — `org_sdk_error` matches the facade's `map_rpc_error` for the
+    // SAME input. The facade's own tests pin its four cases; these pin that
+    // this mirror classifies each of them identically, because the two seams
+    // render the same `RpcError` value for the same wire frame and a caller
+    // that switches between a raw org handle and the typed verb must see ONE
+    // outcome.
+    // ========================================================================
+
+    /// Exactly how the provider ships a denial: status `0x0009`, and a
+    /// one-byte body carrying the coarse reason — rendered lossily into
+    /// `message` on the caller side (the facade's `admission_reason_of`
+    /// recovers the byte from that single char).
+    fn denial_message(coarse: net_sdk::org::types::CoarseAdmissionReason) -> String {
+        String::from_utf8(vec![coarse.to_wire()]).expect("coarse wire bytes are utf-8")
+    }
+
+    fn server_error(status: u16, message: String) -> InnerRpcError {
+        InnerRpcError::ServerError {
+            status,
+            message,
+            headers: vec![],
+        }
+    }
+
+    /// Every coarse reason round-trips into the facade's own variant — the
+    /// same assertion `sdk/src/org/call.rs`'s
+    /// `every_coarse_reason_decodes_from_an_admission_denial` pins for
+    /// `map_rpc_error`, here at the binding mirror.
+    #[test]
+    fn org_classification_matches_the_facade_for_every_coarse_reason() {
+        use net_sdk::org::types::CoarseAdmissionReason;
+        use net_sdk::org::OrgSdkError;
+
+        for coarse in [
+            CoarseAdmissionReason::Denied,
+            CoarseAdmissionReason::NotSupported,
+            CoarseAdmissionReason::Unavailable,
+        ] {
+            let got = org_sdk_error(server_error(
+                0x0009,
+                denial_message(coarse),
+            ));
+            let expected = OrgSdkError::AdmissionDenied(coarse);
+            assert_eq!(
+                got.to_wire(),
+                expected.to_wire(),
+                "node must classify a decodable 0x0009 exactly as the facade does ({coarse:?})"
+            );
+            match got {
+                OrgSdkError::AdmissionDenied(c) => assert_eq!(c, coarse),
+                other => panic!("expected AdmissionDenied({coarse:?}), got {other:?}"),
+            }
+        }
+    }
+
+    /// NODE-2's red-green pin. Pre-fix behavior this catches: an undecodable
+    /// `0x0009` body mapped to `OrgSdkError::Rpc(ServerError)` and rendered
+    /// `org:rpc:server_error: …`, while the facade's `map_rpc_error` falls
+    /// back to `AdmissionDenied(Denied)` (`org:admission_denied:denied`) —
+    /// so `instanceof OrgAdmissionDeniedError` silently missed the denial at
+    /// the raw-handle seam. The facade's
+    /// `an_undecodable_denial_body_falls_back_to_denied` pins its half; this
+    /// pins the mirror's.
+    #[test]
+    fn an_undecodable_denial_body_falls_back_to_denied_exactly_as_the_facade_does() {
+        use net_sdk::org::types::CoarseAdmissionReason;
+        use net_sdk::org::OrgSdkError;
+
+        for message in [
+            // The facade's own input: lossy-rendered non-utf8 body.
+            "<3 bytes of non-utf8 body>".to_string(),
+            // A wrong-length body (a foreign or buggy provider).
+            "xx".to_string(),
+            // An empty body.
+            String::new(),
+        ] {
+            let got = org_sdk_error(server_error(0x0009, message.clone()));
+            let expected = OrgSdkError::AdmissionDenied(CoarseAdmissionReason::Denied);
+            assert_eq!(
+                got.to_wire(),
+                expected.to_wire(),
+                "an undecodable 0x0009 body ({message:?}) must classify as the \
+                 facade's AdmissionDenied(Denied), never rpc:server_error"
+            );
+        }
+    }
+
+    /// A reason byte outside the known set is still a denial, not a decode
+    /// failure — the facade's `an_unknown_reason_byte_is_still_a_denial`,
+    /// mirrored (a provider that learns a new bucket cannot make old callers
+    /// misreport the outcome).
+    #[test]
+    fn an_unknown_reason_byte_is_still_a_denial_exactly_as_the_facade_does() {
+        use net_sdk::org::types::CoarseAdmissionReason;
+        use net_sdk::org::OrgSdkError;
+
+        let got = org_sdk_error(server_error(
+            0x0009,
+            String::from_utf8(vec![0x7F]).expect("ascii"),
+        ));
+        let expected = OrgSdkError::AdmissionDenied(CoarseAdmissionReason::Denied);
+        assert_eq!(got.to_wire(), expected.to_wire());
+    }
+
+    /// Any other server status stays `OrgSdkError::Rpc(ServerError)` — the
+    /// mirror never manufactures an admission denial (the facade's
+    /// `other_server_errors_are_not_admission_denials`), and the typed
+    /// cancellation terminal keeps its documented `org:rpc:cancelled` kind
+    /// (NODE-1's observable).
+    #[test]
+    fn non_denial_terminals_keep_their_frozen_kinds() {
+        use net_sdk::org::OrgSdkError;
+
+        let got = org_sdk_error(server_error(0x8001, "xx".to_string()));
+        assert_eq!(
+            got.to_wire(),
+            OrgSdkError::Rpc(server_error(0x8001, "xx".to_string())).to_wire(),
+        );
+        assert!(
+            got.to_wire().starts_with("org:rpc:server_error"),
+            "got {}",
+            got.to_wire()
+        );
+
+        let cancelled = org_sdk_error(InnerRpcError::Cancelled);
+        assert_eq!(
+            cancelled.to_wire(),
+            OrgSdkError::Rpc(InnerRpcError::Cancelled).to_wire(),
+        );
+        assert!(
+            cancelled.to_wire().starts_with("org:rpc:cancelled"),
+            "cancel retirement renders the typed cancelled kind — got {}",
+            cancelled.to_wire()
+        );
     }
 }

@@ -725,7 +725,13 @@ pub(crate) async fn dispatch_to_js(
 //
 // The response sink / request stream this bridge hands the handler are
 // released by the RUST side the moment the handler's promise settles OR the
-// supervisor drops the future — never on a handler-side `finally`.
+// supervisor drops the future — the `mesh_rpc::JsHandleRelease` drop guard
+// owns the drop path (NODE-3), so the release is prompt and never
+// V8-GC-quantized — and never on a handler-side `finally`. From the
+// release instant a late `sink.send` is `false` (never `true` into a dead
+// call's queue) and `stream.next()` refuses with `nrpc:stream_closed`. One
+// edge, stated: if a JS `next()` pull holds the request stream's lock at
+// the drop instant, that release lands the moment the pull completes.
 // ---------------------------------------------------------------------------
 
 /// The `[caller, req, sink]` server-streaming handler arguments — the
@@ -865,8 +871,8 @@ fn org_handler_rejection(e: napi::Error) -> net_sdk::org::OrgHandlerError {
 /// [`dispatch_to_js`] (ONE `timeout_at` deadline across both stages) plus
 /// `mesh_rpc.rs`'s `NodeStreamingRpcHandler` sink discipline: the sink slot
 /// is retained by the bridge and dropped the moment the handler's promise
-/// settles OR this future is dropped (the handler-drop contract above) —
-/// never on a V8 GC.
+/// settles, and the `mesh_rpc::JsHandleRelease` guard releases it when
+/// this future is dropped — the handler-drop contract above, never a V8 GC.
 async fn dispatch_streaming_to_js(
     tsfn: Arc<OrgStreamingHandlerTsfn>,
     caller: net_sdk::org::OrgCaller,
@@ -875,6 +881,9 @@ async fn dispatch_streaming_to_js(
     timeout: Duration,
 ) -> std::result::Result<(), net_sdk::org::OrgHandlerError> {
     let sink_slot = Arc::new(parking_lot::Mutex::new(Some(sink)));
+    // NODE-3 — the release owner for the forced-drop path (see the
+    // handler-drop contract above).
+    let _release = crate::mesh_rpc::JsHandleRelease::sink(sink_slot.clone());
     let arg = OrgStreamingHandlerArgs {
         caller: org_caller_js(&caller),
         req: Buffer::from(body.to_vec()),
@@ -972,6 +981,9 @@ async fn dispatch_client_stream_to_js(
         caller: org_caller_js(&caller),
         stream: org_request_stream(requests),
     };
+    // NODE-3 — the release owner for the forced-drop path (see the
+    // handler-drop contract above).
+    let _release = crate::mesh_rpc::JsHandleRelease::requests(arg.stream.inner.clone());
     let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
     let status = tsfn.call_with_return_value(
         arg,
@@ -1033,6 +1045,10 @@ async fn dispatch_duplex_to_js(
             inner: sink_slot.clone(),
         },
     };
+    // NODE-3 — the release owner for BOTH handler handles on the
+    // forced-drop path (see the handler-drop contract above).
+    let _release =
+        crate::mesh_rpc::JsHandleRelease::both(sink_slot.clone(), arg.stream.inner.clone());
     let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
     let status = tsfn.call_with_return_value(
         arg,
@@ -1260,137 +1276,3 @@ pub fn serve_org_duplex(
     Ok(OrgServeHandle::from_handle(handle))
 }
 
-// ---------------------------------------------------------------------------
-// Test-only provisioning (`test-helpers`) — the same-org live scenario.
-//
-// The Rust-minted fixtures (`gen_org_scenario`) cover the GRANTED
-// (cross-org) cell only; a same-org streaming live test needs two nodes in
-// ONE org sharing §3.4's out-of-band owner audience, which no generator
-// writes. This minter is the Node row's equivalent of the Rust live
-// fixture's `fast_mesh(.., shared_audience)` provisioning — adoption (the
-// operator ceremony) plus the shared audience staging — reachable only from
-// a `--features test-helpers` build (the vitest build), exactly like
-// `NetMesh::test_inject_synthetic_peer`. It is NOT exported to production
-// consumers.
-// ---------------------------------------------------------------------------
-
-/// The provider node's identity seed (hex in the manifest) — `EntityKeypair`
-/// semantics so `NetMesh.create({ identitySeed })` reconstructs the exact
-/// entity the certs name.
-#[cfg(feature = "test-helpers")]
-const TEST_PROVIDER_SEED: [u8; 32] = [0x41u8; 32];
-/// The caller node's identity seed.
-#[cfg(feature = "test-helpers")]
-const TEST_CALLER_SEED: [u8; 32] = [0x42u8; 32];
-/// The single organization both nodes belong to.
-#[cfg(feature = "test-helpers")]
-const TEST_ORG_SEED: [u8; 32] = [0xA4u8; 32];
-/// Validity window for every minted cert/grant — fresh per run.
-#[cfg(feature = "test-helpers")]
-const TEST_TTL_SECS: u64 = 3600;
-
-#[cfg(feature = "test-helpers")]
-fn test_to_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-/// Mint a complete same-org scenario into `outdir` and return its manifest
-/// as JSON: two adopted node authorities in ONE org sharing one owner
-/// audience (the §3.4 out-of-band pre-staging, without which owner-private
-/// discovery could never open the other side's envelopes), plus the caller's
-/// membership + wide-open dispatcher grant (no capability grants — same-org
-/// admission is `OwnerDelegated`).
-///
-/// The shared audience is staged by rewriting the caller authority
-/// directory's `owner-audience.key` with the provider's adopted audience
-/// AFTER both adoptions (adoption mints one when absent and preserves an
-/// existing same-org one, but a pre-existing audience would flip its
-/// provisioning expectation; the post-adopt rewrite is the exact file state
-/// `NodeAuthority::open` — i.e. `installOrgAuthority` — loads).
-#[cfg(feature = "test-helpers")]
-#[napi]
-pub fn test_mint_same_org_scenario(outdir: String) -> Result<String> {
-    use net_sdk::org::types::{
-        DispatcherScope, NodeAuthority, OrgDispatcherGrant, OrgKeypair, OrgMembershipCert,
-        OWNER_AUDIENCE_FILE,
-    };
-
-    let outdir = std::path::PathBuf::from(outdir);
-    let org = OrgKeypair::from_bytes(TEST_ORG_SEED);
-    let provider_kp = ::net::adapter::net::identity::EntityKeypair::from_bytes(TEST_PROVIDER_SEED);
-    let caller_kp = ::net::adapter::net::identity::EntityKeypair::from_bytes(TEST_CALLER_SEED);
-    let provider_entity = provider_kp.entity_id().clone();
-    let caller_entity = caller_kp.entity_id().clone();
-
-    let provider_dir = outdir.join("provider");
-    let caller_dir = outdir.join("caller");
-    let provider_auth = provider_dir.join("authority");
-    let caller_auth = caller_dir.join("authority");
-    std::fs::create_dir_all(&provider_dir).map_err(|e| Error::from_reason(e.to_string()))?;
-    std::fs::create_dir_all(&caller_dir).map_err(|e| Error::from_reason(e.to_string()))?;
-
-    // The adoption ceremony (`net node adopt`'s exact shape) for both nodes.
-    let provider_cert =
-        OrgMembershipCert::try_issue(&org, provider_entity.clone(), 1, TEST_TTL_SECS)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-    NodeAuthority::adopt(&provider_auth, provider_cert, &provider_entity, 0, None)
-        .map_err(|e| Error::from_reason(e.to_string()))?;
-    let caller_cert = OrgMembershipCert::try_issue(&org, caller_entity.clone(), 1, TEST_TTL_SECS)
-        .map_err(|e| Error::from_reason(e.to_string()))?;
-    NodeAuthority::adopt(&caller_auth, caller_cert.clone(), &caller_entity, 0, None)
-        .map_err(|e| Error::from_reason(e.to_string()))?;
-
-    // Stage the ONE per-organization owner audience across both authority
-    // dirs: read the provider's adopted audience and install it as the
-    // caller's (the caller's minted one is replaced). The file already
-    // exists owner-only from the adopt above, so a truncating rewrite keeps
-    // its checked permissions.
-    let shared = NodeAuthority::open(&provider_auth, &provider_entity)
-        .map_err(|e| Error::from_reason(e.to_string()))?;
-    let audience_bytes = shared.audience.encode_config();
-    std::fs::write(caller_auth.join(OWNER_AUDIENCE_FILE), audience_bytes)
-        .map_err(|e| Error::from_reason(e.to_string()))?;
-
-    // The caller's credentials — membership + a wide-open dispatcher grant
-    // (no capability grants: same-org is OwnerDelegated).
-    let dispatcher = OrgDispatcherGrant::try_issue(
-        &org,
-        caller_entity.clone(),
-        DispatcherScope::Any,
-        TEST_TTL_SECS,
-    )
-    .map_err(|e| Error::from_reason(e.to_string()))?;
-    std::fs::write(caller_dir.join("membership.bin"), caller_cert.to_bytes())
-        .map_err(|e| Error::from_reason(e.to_string()))?;
-    std::fs::write(caller_dir.join("dispatcher.bin"), dispatcher.to_bytes())
-        .map_err(|e| Error::from_reason(e.to_string()))?;
-
-    let manifest = serde_json::json!({
-        "version": 1,
-        "description": "test-helpers same-org streaming scenario: provider and \
-                        caller in ONE org sharing one owner audience. GENERATED \
-                        fresh per run (certs expire) — do not commit.",
-        "org_id_hex": test_to_hex(org.org_id().as_bytes()),
-        "provider": {
-            "seed_hex": test_to_hex(&TEST_PROVIDER_SEED),
-            "entity_id_hex": test_to_hex(provider_entity.as_bytes()),
-            "authority_dir": "provider/authority",
-        },
-        "caller": {
-            "seed_hex": test_to_hex(&TEST_CALLER_SEED),
-            "entity_id_hex": test_to_hex(caller_entity.as_bytes()),
-            "authority_dir": "caller/authority",
-            "membership_path": "caller/membership.bin",
-            "dispatcher_path": "caller/dispatcher.bin",
-        },
-    });
-    let json =
-        serde_json::to_string_pretty(&manifest).map_err(|e| Error::from_reason(e.to_string()))?;
-    std::fs::write(outdir.join("manifest.json"), &json)
-        .map_err(|e| Error::from_reason(e.to_string()))?;
-    Ok(json)
-}

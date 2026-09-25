@@ -274,10 +274,14 @@ export class TypedOrgClient {
    * Discovers privately, selects one authorized provider, mints ONE
    * request-bound proof, and never retries (the proof binds one call id).
    * Opening errors are classified here; midstream outcomes surface from the
-   * stream's `next()` already routed through `classifyOrgError`
-   * (`OrgError{rpc}` on deadline/cancel retirement, an
-   * `OrgAdmissionDeniedError` on revocation). Drop or `close()` emits one
-   * CANCEL.
+   * stream's `next()` already routed through `classifyOrgError` as TYPED
+   * terminals (the §4.3 vocabulary, Owner Q1): cancel retirement throws
+   * `org:rpc:cancelled` — an `OrgError{rpc}` with `kind: 'cancelled'`, the
+   * same typed-cancellation observable the browser surface delivers as its
+   * `OrgCancelledError`, never a clean `null` EOF — deadline retirement
+   * throws `org:rpc:timeout` (`kind: 'timeout'`), and a midstream
+   * revocation throws an `OrgAdmissionDeniedError`. After the terminal the
+   * ended stream returns `null`. Drop or `close()` emits one CANCEL.
    */
   async callStreaming<Req = unknown, Resp = unknown>(
     service: string,
