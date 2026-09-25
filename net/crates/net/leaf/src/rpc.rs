@@ -332,6 +332,24 @@ impl CallTable {
         lost.len()
     }
 
+    /// Fail every call whose reply rides `carrier_stream_id` from
+    /// `peer`, with `error` — the provider refused that reply carrier's
+    /// subscription, so no reply can arrive on it.
+    pub fn fail_carrier(&mut self, peer: NodeId, carrier_stream_id: u64, error: RpcError) -> usize {
+        let lost: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.owner.peer == peer && p.owner.carrier_stream_id == carrier_stream_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &lost {
+            if let Some(pending) = self.pending.remove(id) {
+                let _ = pending.reply.send(Err(error.clone()));
+            }
+        }
+        lost.len()
+    }
+
     /// Fail every call with `error` — leader replacement, or close.
     pub fn fail_all(&mut self, error: RpcError) -> usize {
         let count = self.pending.len();

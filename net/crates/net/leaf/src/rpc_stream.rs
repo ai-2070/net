@@ -951,6 +951,27 @@ impl StreamCallRegistry {
         n
     }
 
+    /// The provider refused the reply carrier these calls ride: latch
+    /// `terminal` on every call pinned to `peer` and `carrier_stream_id`
+    /// (no CANCEL — the provider refused to answer on it at all).
+    pub fn fail_carrier(
+        &mut self,
+        peer: NodeId,
+        carrier_stream_id: u64,
+        terminal: StreamTerminal,
+    ) -> usize {
+        let mut n = 0;
+        for core in self.calls.values_mut() {
+            if core.pin.peer == peer
+                && core.pin.carrier_stream_id == carrier_stream_id
+                && core.latch(terminal.clone())
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Node close / leader loss: every call fails typed, and the drop
     /// guards are disarmed so teardown emits no CANCELs.
     pub fn fail_all(&mut self, reason: RetireReason) -> usize {

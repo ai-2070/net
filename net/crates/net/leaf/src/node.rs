@@ -2436,8 +2436,8 @@ impl LeafNode {
             MembershipMsg::Ack {
                 nonce,
                 accepted,
-                reason: _,
-            } => self.handle_membership_ack(peer, nonce, accepted),
+                reason,
+            } => self.handle_membership_ack(peer, nonce, accepted, reason),
         }
     }
 
@@ -3759,7 +3759,13 @@ impl LeafNode {
     /// A refusal that can no longer be correlated is still surfaced
     /// (a refusal is always news); an uncorrelated admission is stale
     /// good news and is ignored.
-    fn handle_membership_ack(&mut self, from: NodeId, nonce: u64, accepted: bool) {
+    fn handle_membership_ack(
+        &mut self,
+        from: NodeId,
+        nonce: u64,
+        accepted: bool,
+        reason: Option<AckReason>,
+    ) {
         // The Ack must answer a request this leaf made TO THIS PEER:
         // nonces are node-global, and honouring one echoed by another
         // peer would let that peer move a membership it has nothing
@@ -3809,6 +3815,35 @@ impl LeafNode {
                 }
                 if self.rpc_reply_carriers.remove(&key) {
                     self.reply_subscriptions.remove(&(from, pending.canonical));
+                    // The calls already waiting on this carrier can no
+                    // longer be answered: their reply plane was just
+                    // refused. Fail them typed NOW (§23 audit) — pre-
+                    // audit they waited out their full deadline and
+                    // ended `Timeout`, which blames the provider's
+                    // latency for what was a refusal.
+                    let status = match reason {
+                        Some(AckReason::Unauthorized) => RpcStatus::Unauthorized,
+                        _ => RpcStatus::NotFound,
+                    };
+                    let message = format!(
+                        "the provider refused this caller's reply subscription ({reason:?})"
+                    );
+                    self.calls.fail_carrier(
+                        from,
+                        pending.stream_id,
+                        RpcError::Refused {
+                            status: status.to_wire(),
+                            message: message.clone(),
+                        },
+                    );
+                    self.org_calls.fail_carrier(
+                        from,
+                        pending.stream_id,
+                        StreamTerminal::Refused {
+                            status,
+                            body: Bytes::from(message),
+                        },
+                    );
                 }
             }
         }
@@ -4585,6 +4620,52 @@ mod tests {
             node.take_outbound().is_empty(),
             "a lost session must never re-issue the request"
         );
+    }
+
+    /// §23 audit: a refused REPLY subscription fails the calls waiting
+    /// on that carrier typed, at once. Pre-audit the refusal took the
+    /// carrier back and the call then waited out its whole deadline to
+    /// end `Timeout` — blaming latency for a refusal.
+    #[test]
+    fn a_refused_reply_subscription_fails_its_waiting_calls_typed() {
+        use net_wire::channel::membership::{encode, AckReason};
+
+        let (mut node, anchor) = connected();
+        let mut rx = node
+            .call(ANCHOR, "app.orders", b"a", Some(60_000))
+            .expect("call");
+        node.take_outbound();
+        let nonce = *node
+            .pending_memberships
+            .keys()
+            .next()
+            .expect("the call subscribed its reply channel");
+        let channel =
+            Channel::new(&node.reply_channel_for("app.orders").expect("name")).expect("valid");
+
+        let refusal = encode(&MembershipMsg::Ack {
+            nonce,
+            accepted: false,
+            reason: Some(AckReason::UnknownChannel),
+        });
+        node.on_datagram(
+            ANCHOR,
+            anchor_packet(
+                &anchor,
+                channel.publish_stream_id(),
+                SUBPROTOCOL_MEMBERSHIP,
+                channel.wire_hash(),
+                true,
+                &refusal,
+            ),
+            clock::now(),
+        );
+        match rx.try_recv().expect("alive") {
+            Some(Err(RpcError::Refused { status, .. })) => {
+                assert_eq!(status, RpcStatus::NotFound.to_wire())
+            }
+            other => panic!("the waiting call fails typed at the refusal, got {other:?}"),
+        }
     }
 
     #[test]
