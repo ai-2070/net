@@ -637,10 +637,23 @@ pub fn verify_org_admission(
     // this port passes instead of an `Instant`: project the wall
     // retention horizon onto the monotonic sample, clamped at the
     // sample itself (an already-past horizon retains nothing).
+    //
+    // The projection rounds UP and one tick PAST the horizon: the
+    // guard retains while `expires_at > now` (strictly) on a MILLIS
+    // grid, so a floored projection can tie `expires_at == now` inside
+    // the horizon's final sub-millisecond — the used entry would be
+    // instantly reusable while `check_proof_expiry_at` still accepts
+    // the same proof. Retention must STRICTLY dominate every
+    // acceptance window ("widening skew must never re-open an
+    // already-used proof"): core's ns-precision `Instant` projection
+    // gets that strictness for free, the ms port must round for it.
     let expires_at = if retain_until_wall_ns <= now_unix_ns {
         now_mono_ms
     } else {
-        now_mono_ms.saturating_add((retain_until_wall_ns - now_unix_ns) / 1_000_000)
+        let remaining_ms = (retain_until_wall_ns - now_unix_ns).div_ceil(1_000_000);
+        now_mono_ms
+            .saturating_add(remaining_ms)
+            .saturating_add(1)
     };
     let principal = ReplayPrincipal {
         caller: ctx.authenticated_caller,

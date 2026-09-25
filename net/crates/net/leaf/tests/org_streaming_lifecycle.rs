@@ -25,9 +25,10 @@ use net_leaf::org::grant::{
     CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope, OrgCapabilityGrant,
     OrgDispatcherGrant,
 };
-use net_leaf::org::proof::RpcCallShape;
-use net_leaf::org::replay::AdmissionReplayGuard;
+use net_leaf::org::proof::{check_proof_expiry_at, RpcCallShape};
+use net_leaf::org::replay::{AdmissionReplayGuard, DEFAULT_MAX_FAILED_ADMISSIONS_PER_PEER};
 use net_leaf::org::revocation::RevocationFacts;
+use net_leaf::org::MAX_TOKEN_CLOCK_SKEW_SECS;
 use net_leaf::rpc::{CallOwner, CallTable};
 use net_leaf::rpc_serve::{
     HandlerResult, OpenOutcome, ServeAccess, ServeAdmission, ServeCall, ServeOptions, ServePeer,
@@ -207,12 +208,16 @@ impl Loop {
     }
 
     fn serve(&mut self, shape: RpcCallShape, access: ServeAccess) {
+        self.serve_with_skew(shape, access, 0);
+    }
+
+    fn serve_with_skew(&mut self, shape: RpcCallShape, access: ServeAccess, skew_secs: u64) {
         let calls = Rc::clone(&self.served);
         let opts = ServeOptions {
             shape,
             access,
             provider_owner_org: self.w.owner_org,
-            skew_secs: 0,
+            skew_secs,
             default_live_ns: 300 * 1_000_000_000,
             max_live_ns: 3600 * 1_000_000_000,
             policy: None,
@@ -905,8 +910,13 @@ fn a_different_session_binding_never_admits() {
 }
 
 #[test]
-fn flag_shape_mismatch_is_not_supported_and_proof_kind_mismatch_is_shape_mismatch() {
-    // (1) A CS-flagged REQUEST on a server-streaming registration.
+fn flag_shape_mismatch_is_shape_mismatch_and_proof_kind_mismatch_is_shape_mismatch() {
+    // (1) A CS-flagged REQUEST on a server-streaming registration: a
+    // streaming registration's wrong flags are `ShapeMismatch`
+    // (coarse `Denied`) — the core mapping (§1.5 step 4(b) + the
+    // folds' contract-4 flag checks). RENAMED and RE-PINNED from the
+    // old blanket `StreamingUnsupported`/`NotSupported`, which
+    // contradicted core (review LEAF-22).
     let mut l = Loop::new();
     l.serve(RpcCallShape::ServerStreaming, ServeAccess::SameOrg);
     let intent = l.w.intent(5);
@@ -919,14 +929,14 @@ fn flag_shape_mismatch_is_not_supported_and_proof_kind_mismatch_is_shape_mismatc
     );
     assert_eq!(
         l.feed_raw(raw),
-        OpenOutcome::Denied(AdmissionDenied::StreamingUnsupported),
+        OpenOutcome::Denied(AdmissionDenied::ShapeMismatch),
         "the flags claim a shape this registration does not serve"
     );
     let down = l.provider_out();
     assert_eq!(
         responses(&down),
-        vec![denied(CoarseAdmissionReason::NotSupported)],
-        "typed NotSupported refusal, byte-exact"
+        vec![denied(CoarseAdmissionReason::Denied)],
+        "typed ShapeMismatch refusal, coarse `Denied` byte, byte-exact"
     );
 
     // (2) A proof whose KIND disagrees with the flags (kind 3 proof on
@@ -950,6 +960,35 @@ fn flag_shape_mismatch_is_not_supported_and_proof_kind_mismatch_is_shape_mismatc
     assert_eq!(
         responses(&down),
         vec![denied(CoarseAdmissionReason::Denied)]
+    );
+}
+
+#[test]
+fn streaming_flags_on_a_unary_registration_stay_streaming_unsupported() {
+    // §1.5 step 4(a) is preserved: only a UNARY registration's
+    // streaming flags read `StreamingUnsupported` (coarse
+    // `NotSupported`) — "this service does not stream" must read
+    // differently from "your flags do not match your registration".
+    let mut l = Loop::new();
+    l.serve(RpcCallShape::Unary, ServeAccess::SameOrg);
+    let intent = l.w.intent(5);
+    let raw = l.craft_request(
+        0x2030,
+        FLAG_RPC_STREAMING_RESPONSE,
+        b"x",
+        Vec::new(),
+        Some((&intent, RpcCallShape::ServerStreaming)),
+    );
+    assert_eq!(
+        l.feed_raw(raw),
+        OpenOutcome::Denied(AdmissionDenied::StreamingUnsupported),
+        "a unary registration never admits streaming flags"
+    );
+    let down = l.provider_out();
+    assert_eq!(
+        responses(&down),
+        vec![denied(CoarseAdmissionReason::NotSupported)],
+        "typed NotSupported refusal, byte-exact"
     );
 }
 
@@ -984,6 +1023,111 @@ fn a_replayed_call_id_after_completion_is_replay_denied() {
 }
 
 #[test]
+fn a_used_proof_is_not_reusable_inside_the_final_sub_ms_of_the_max_skew_window() {
+    // Retention (proof expiry + `MAX_TOKEN_CLOCK_SKEW_SECS`) must
+    // STRICTLY dominate every acceptance window: inside the window's
+    // final sub-millisecond `check_proof_expiry_at` still accepts, so
+    // the used entry must still be retained. The old ms projection
+    // FLOORED (`/ 1_000_000`), tying `expires_at == now` at the
+    // horizon's last tick and letting the same proof re-enter as an
+    // "expired overwrite" — "widening skew must never re-open an
+    // already-used proof" broken at its boundary.
+    let mut l = Loop::new();
+    l.serve_with_skew(
+        RpcCallShape::ServerStreaming,
+        ServeAccess::SameOrg,
+        MAX_TOKEN_CLOCK_SKEW_SECS,
+    );
+    let intent = l.w.intent(5); // ttl_secs = 30
+    // Mint PAST a whole millisecond so the retention projection's
+    // sub-ms remainder is nonzero — the floored projection loses it.
+    l.now = NOW_NS + 700_000;
+    let minted_at = l.now;
+    let raw = l.craft_request(
+        0x2020,
+        FLAG_RPC_STREAMING_RESPONSE,
+        b"x",
+        Vec::new(),
+        Some((&intent, RpcCallShape::ServerStreaming)),
+    );
+    assert_eq!(l.feed_raw(raw.clone()), OpenOutcome::Admitted);
+
+    // Run the call to its one terminal, so the key is free and only
+    // the replay record holds the used proof.
+    let call = l.served.borrow()[0].clone();
+    call.finish(StreamHandlerResult::Ok);
+    let _ = l.provider_out();
+
+    // The final sub-millisecond of the max-skew acceptance window.
+    let expires_ns = minted_at + 30 * 1_000_000_000;
+    let horizon_ns = expires_ns + MAX_TOKEN_CLOCK_SKEW_SECS * 1_000_000_000;
+    l.now = horizon_ns - 500_000;
+    assert!(
+        check_proof_expiry_at(expires_ns, l.now, MAX_TOKEN_CLOCK_SKEW_SECS).is_ok(),
+        "the expiry check still accepts at this instant"
+    );
+    assert_eq!(
+        l.feed_raw(raw),
+        OpenOutcome::Denied(AdmissionDenied::Replay),
+        "a used proof is not reusable while the expiry check still accepts \
+         (pre-fix: the floored projection tied expires_at == now at the \
+         horizon's last tick and the replay re-admitted)"
+    );
+}
+
+#[test]
+fn a_failing_peer_exhausts_its_budget_and_is_refused_before_the_verify_work() {
+    // §6 charges a failed admission to its peer (core's disposition,
+    // incl. the D7 `AuthorityChanged` exception) and consults the
+    // budget BEFORE the signature work. Each failing attempt below is
+    // a full `verify_strict` pass ending in `BindingInvalid` — the
+    // exact CPU the limiter exists to bound.
+    let mut l = Loop::new();
+    l.serve(RpcCallShape::ServerStreaming, ServeAccess::SameOrg);
+    let doomed = l.w.intent_at(5, EntityId::from_bytes([0x66; 32]));
+    for n in 0..u64::from(DEFAULT_MAX_FAILED_ADMISSIONS_PER_PEER) {
+        let raw = l.craft_request(
+            0x3000 + n,
+            FLAG_RPC_STREAMING_RESPONSE,
+            b"x",
+            Vec::new(),
+            Some((&doomed, RpcCallShape::ServerStreaming)),
+        );
+        assert_eq!(
+            l.feed_raw(raw),
+            OpenOutcome::Denied(AdmissionDenied::BindingInvalid)
+        );
+        let _ = l.provider_out();
+    }
+
+    // The budget is spent. The next attempt carries a proof that
+    // would otherwise ADMIT — the refusal must come from the budget,
+    // before any signature work.
+    let good = l.w.intent(5);
+    let raw = l.craft_request(
+        0x3100,
+        FLAG_RPC_STREAMING_RESPONSE,
+        b"x",
+        Vec::new(),
+        Some((&good, RpcCallShape::ServerStreaming)),
+    );
+    assert_eq!(
+        l.feed_raw(raw),
+        OpenOutcome::Throttled,
+        "a failing peer is refused before the verify work (pre-fix: no gate \
+         existed — the 65th (valid) attempt reached `verify_org_admission` \
+         and was ADMITTED)"
+    );
+    let down = l.provider_out();
+    assert_eq!(
+        responses(&down),
+        vec![denied(CoarseAdmissionReason::Unavailable)],
+        "core's Throttled disposition: the coarse Unavailable byte"
+    );
+    assert_eq!(l.serves.live_calls(), 0);
+}
+
+#[test]
 fn live_call_id_reuse_is_active_call_owned_with_exactly_one_refusal() {
     let mut l = Loop::new();
     l.serve(RpcCallShape::ServerStreaming, ServeAccess::SameOrg);
@@ -1014,6 +1158,150 @@ fn live_call_id_reuse_is_active_call_owned_with_exactly_one_refusal() {
     call.finish(StreamHandlerResult::Ok);
     let down = l.provider_out();
     assert_eq!(responses(&down), vec![end_terminal()]);
+}
+
+#[test]
+fn a_refusal_reusing_a_live_call_id_never_latches_the_calls_terminal() {
+    // The caller's latch is first-writer-wins and LATCHING DISARMS the
+    // drop-CANCEL guard: ANY refusal that rides the LIVE call's id —
+    // the `ActiveCallOwned` duplicate-key refusal, or a crafted
+    // REQUEST reusing the id with wrong flags / a wrong service —
+    // would be consumed as that call's terminal (a self-inflicted
+    // desync: the provider keeps running the handler while the caller
+    // believes the call ended and will never CANCEL it). Exactly ONE
+    // terminal per call_id on the wire: refusals under a live key go
+    // out under a DISTINCT id.
+    let mut l = Loop::new();
+    l.serve(RpcCallShape::ClientStreaming, ServeAccess::SameOrg);
+    let intent = l.w.intent(5);
+    let (id, handle) = l.open_cs(
+        StreamOpen {
+            body: Bytes::from_static(b"u"),
+            ..empty_open()
+        },
+        intent.clone(),
+    );
+    // The CS opening is lazy: flush it (the one-item path — `u` rides
+    // the REQUEST with FLAG_END).
+    l.caller.finish_sending(id, l.now).expect("half-close");
+    let up = l.caller_out();
+    l.feed_provider(up);
+    assert_eq!(l.serves.live_calls(), 1, "the live call is admitted");
+
+    // (1) A re-delivered opening for the SAME live key.
+    let raw = l.craft_request(
+        id,
+        FLAG_RPC_CLIENT_STREAMING_REQUEST,
+        b"u",
+        Vec::new(),
+        Some((&intent, RpcCallShape::ClientStreaming)),
+    );
+    assert_eq!(
+        l.feed_raw(raw),
+        OpenOutcome::Denied(AdmissionDenied::ActiveCallOwned),
+        "the live key is refused before any of it is decoded into state"
+    );
+
+    // (2) A crafted WRONG-FLAGS REQUEST reusing the live call's id.
+    let raw = l.craft_request(
+        id,
+        FLAG_RPC_STREAMING_RESPONSE,
+        b"u",
+        Vec::new(),
+        None,
+    );
+    assert_eq!(
+        l.feed_raw(raw),
+        OpenOutcome::Denied(AdmissionDenied::ShapeMismatch),
+        "the wrong-flags refusal keeps its core-mapped typed reason (LEAF-22)"
+    );
+
+    // (3) A crafted MALFORMED REQUEST (wrong service on the carrier)
+    // reusing the live call's id.
+    let req = RpcRequestPayload {
+        service: "svc.other".to_string(),
+        deadline_ns: 0,
+        flags: FLAG_RPC_CLIENT_STREAMING_REQUEST,
+        headers: Vec::new(),
+        body: Bytes::from_static(b"u"),
+    };
+    let raw = rpc_wire::encode_request_frame(
+        l.w.caller_entity.origin_hash(),
+        id,
+        l.request_route,
+        &req,
+    )
+    .expect("encode");
+    assert_eq!(
+        l.feed_raw(raw),
+        OpenOutcome::Malformed(
+            "the request names a different service than its carrier serves".to_string()
+        ),
+    );
+
+    // Every refusal is terminal-shaped on the wire, but NONE rides the
+    // live call's id.
+    let down = l.provider_out();
+    assert_eq!(terminals(&down), 3, "three refusal terminals");
+    assert_eq!(
+        responses(&down),
+        vec![
+            denied(CoarseAdmissionReason::Denied),
+            denied(CoarseAdmissionReason::Denied),
+            RpcResponsePayload {
+                status: RpcStatus::UnknownVersion,
+                headers: vec![(
+                    HEADER_NRPC_STREAMING.to_string(),
+                    HEADER_NRPC_STREAMING_END.to_vec(),
+                )],
+                body: Bytes::from_static(
+                    b"malformed request: the request names a different service than its carrier serves"
+                ),
+            },
+        ],
+        "the typed refusals, byte-exact"
+    );
+    assert!(
+        down.iter().all(|o| o.call_id != id),
+        "no refusal may ride the live call's id \
+         (pre-fix: each did — the first was consumed as the call's terminal)"
+    );
+
+    // Fed to the caller they neither latch nor disarm anything.
+    l.feed_caller(down);
+    assert_eq!(
+        l.caller.terminal(id),
+        None,
+        "the latch stays empty (pre-fix: the first refusal was consumed as \
+         the call's terminal)"
+    );
+
+    // The drop-CANCEL guard is still armed: dropping the handle
+    // cancels the live call (pre-fix: the false terminal disarmed it
+    // and the drop emitted nothing).
+    drop(handle);
+    let out = l.caller_out();
+    assert!(
+        matches!(&out[..], [Outgoing { call_id, frame: RpcFrame::Cancel { .. } }] if *call_id == id),
+        "the drop still emits the call's one CANCEL"
+    );
+
+    // The provider retires with the call's OWN single terminal — the
+    // only terminal that ever rides this call_id — and the latch
+    // consumes exactly that one.
+    l.feed_provider(out);
+    let down = l.provider_out();
+    assert_eq!(terminals(&down), 1);
+    assert!(down.iter().all(|o| o.call_id == id));
+    l.feed_caller(down);
+    assert_eq!(
+        l.caller.terminal(id),
+        Some(&StreamTerminal::Refused {
+            status: RpcStatus::Cancelled,
+            body: Bytes::from_static(b"server observed CANCEL during streaming handler execution"),
+        }),
+        "exactly one terminal is consumed by the latch — the call's own"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1282,6 +1570,111 @@ fn upload_chunks_wait_for_request_grants_and_consumption_grants_one_each() {
         Some(&StreamTerminal::Completed {
             body: Bytes::from_static(b"sum")
         })
+    );
+    drop(handle);
+}
+
+#[test]
+fn request_grants_pace_per_consumed_chunk_past_the_old_lifetime_cap() {
+    // Core grants one `REQUEST_GRANT` per consumed chunk for the LIFE
+    // of the call (`RequestStream::poll_next` auto-grant): the
+    // `REQUEST_GRANT_PER_CALL_CAP` constant bounds the CALLER's credit
+    // BALANCE, never the provider's lifetime grant count. The old
+    // provider pacing capped lifetime grants at
+    // `initial + REQUEST_GRANT_PER_CALL_CAP` — every sustained upload
+    // stalled in `SinkError::WouldBlock` to its deadline once spent.
+    let mut l = Loop::new();
+    l.serve(RpcCallShape::ClientStreaming, ServeAccess::SameOrg);
+    let intent = l.w.intent(5);
+    let (id, handle) = l.open_cs(
+        StreamOpen {
+            request_window_initial: Some(1),
+            ..empty_open()
+        },
+        intent,
+    );
+    // The lazy opening carries the first item; consume it.
+    assert_eq!(l.caller.send(id, b"x", l.now), Ok(()));
+    let up = l.caller_out();
+    l.feed_provider(up);
+    let call = l.served.borrow()[0].clone();
+    assert_eq!(call.poll_request(), Some(Bytes::from_static(b"x")));
+
+    // A sustained upload driven straight at the provider (one
+    // synthetic chunk consumed per step) so the witness crosses the
+    // old cap (window 1 + 1_000_000) without minting a million wire
+    // frames. The old pacing stopped granting at 1_000_001.
+    let peer = l.serve_peer();
+    const CHUNKS: u64 = 1_000_010;
+    let mut grants = 0u64;
+    for i in 0..CHUNKS {
+        l.serves.on_chunk(
+            &peer,
+            RpcRequestChunkPayload {
+                call_id: id,
+                flags: 0,
+                headers: Vec::new(),
+                body: Bytes::new(),
+            },
+        );
+        assert!(call.poll_request().is_some());
+        if i % 50_000 == 49_999 {
+            l.serves.advance(l.now);
+            grants += l.serves.take_outbound().len() as u64;
+        }
+    }
+    l.serves.advance(l.now);
+    grants += l.serves.take_outbound().len() as u64;
+    assert_eq!(
+        grants,
+        1 + CHUNKS,
+        "one REQUEST_GRANT per consumed chunk, past the old lifetime cap \
+         (pre-fix: grants stop at initial + REQUEST_GRANT_PER_CALL_CAP and \
+         the upload stalls in WouldBlock to its deadline)"
+    );
+    drop(handle);
+}
+
+#[test]
+fn a_second_single_response_send_is_refused_closed_not_silently_dropped() {
+    // §2.7: a protected call can never drop an item and report an
+    // earlier success. The single-response emitter (CS/unary, §2.2)
+    // takes ONE body: the documented `SinkError::Closed` refusal, not
+    // `Ok` followed by a pump-side silent discard.
+    let mut l = Loop::new();
+    l.serve(RpcCallShape::ClientStreaming, ServeAccess::SameOrg);
+    let intent = l.w.intent(5);
+    let (id, handle) = l.open_cs(
+        StreamOpen {
+            body: Bytes::from_static(b"req"),
+            ..empty_open()
+        },
+        intent,
+    );
+    l.caller.finish_sending(id, l.now).expect("half-close");
+    let up = l.caller_out();
+    l.feed_provider(up);
+    let call = l.served.borrow()[0].clone();
+    assert_eq!(call.poll_request(), Some(Bytes::from_static(b"req")));
+
+    assert_eq!(call.send(b"resp-1"), Ok(()));
+    assert_eq!(
+        call.send(b"resp-2"),
+        Err(SinkError::Closed),
+        "the single response is already filled — a second send is refused \
+         TYPED (pre-fix: `Ok`, and the pump silently discarded the item)"
+    );
+    call.finish(StreamHandlerResult::Ok);
+    let down = l.provider_out();
+    assert_eq!(terminals(&down), 1);
+    assert_eq!(
+        responses(&down),
+        vec![RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"resp-1"),
+        }],
+        "the ONE single response, byte-exact"
     );
     drop(handle);
 }

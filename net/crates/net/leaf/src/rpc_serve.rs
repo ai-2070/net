@@ -42,14 +42,15 @@ use bytes::Bytes;
 
 use crate::control_plane::NodeId;
 use crate::org::admission::{
-    verify_org_admission, AdmissionContext, AdmissionDenied, Admitted, OrgAdmission,
+    verify_org_admission, AdmissionContext, AdmissionDenied, Admitted, CoarseAdmissionReason,
+    OrgAdmission,
 };
 use crate::org::cert::OrgId;
 use crate::org::digest::org_request_digest;
 use crate::org::entity::EntityId;
 use crate::org::grant::CapabilityAuthorityId;
 use crate::org::proof::{OrgCallProof, OrgStreamCallProof, RpcCallShape, ORG_ADMISSION_HEADER};
-use crate::org::replay::AdmissionReplayGuard;
+use crate::org::replay::{AdmissionFailureLimiter, AdmissionReplayGuard};
 use crate::org::revocation::RevocationFacts;
 use crate::rpc_wire::{
     self, encode_request_grant_frame, encode_response_frame, stream_terminal_payload,
@@ -191,6 +192,12 @@ pub enum OpenOutcome {
     Admitted,
     /// Typed admission refusal.
     Denied(AdmissionDenied),
+    /// The §6 failed-admission throttle refused this peer BEFORE any
+    /// signature work (core's `OpeningRefusal::Throttled`): the wire
+    /// frame carries the coarse `Unavailable` byte, and the peer's
+    /// failure budget is NOT charged again (the limiter already
+    /// counted the denial).
+    Throttled,
     /// Structural refusal before admission (malformed request, wrong
     /// service on the carrier): `UnknownVersion` + `end` + diagnostic.
     Malformed(String),
@@ -225,6 +232,11 @@ struct ServeShared {
     resp_credit: Option<u32>,
     /// The handler's result, once [`ServeCall::finish`] ran.
     result: Option<StreamHandlerResult>,
+    /// The single-response emitter's shape (CS/unary, §2.2): at most
+    /// ONE response item may ever be queued — a second [`ServeCall::send`]
+    /// is refused [`SinkError::Closed`], never queued to be silently
+    /// discarded by the pump.
+    single_response: bool,
     /// Producer-finished gate (§2.2: producer finished is NOT
     /// terminal): further sends are refused and a retained sink clone
     /// cannot extend the drain.
@@ -288,6 +300,13 @@ impl ServeCall {
         if sh.closed || sh.producer_done {
             return Err(SinkError::Closed);
         }
+        if sh.single_response && !sh.output.is_empty() {
+            // The single response is already filled (§2.2): a second
+            // send can NEVER succeed, so it is refused TYPED here — a
+            // queued extra would only be silently discarded by the
+            // pump, a drop followed by an earlier `Ok` (§2.7).
+            return Err(SinkError::Closed);
+        }
         if sh.resp_credit == Some(0) {
             return Err(SinkError::WouldBlock);
         }
@@ -339,8 +358,9 @@ struct ServeCallState {
     bound: DeadlineBound,
     /// Upload window the caller opted into (`None` = unbounded).
     request_window_initial: Option<u32>,
-    /// Request grants already emitted (capped at opening window +
-    /// [`REQUEST_GRANT_PER_CALL_CAP`]).
+    /// Request grants already emitted — one per consumed chunk for the
+    /// life of the call (core's unbounded per-consumption pacing; see
+    /// [`emit_request_grants`]).
     request_granted: u64,
     /// §2.6's input half.
     input: InputHalf,
@@ -460,6 +480,11 @@ pub struct ServeRegistry {
     /// inserted, stays consumed — Owner Q4).
     openings: HashSet<(NodeId, u64, u64)>,
     calls: HashMap<(NodeId, u64, u64), ServeCallState>,
+    /// §6's failed-admission throttle (core's
+    /// `MeshNode::admission_rate_limiter`): consulted BEFORE the
+    /// signature work and charged on every denial except
+    /// `AuthorityChanged` (D7).
+    failure_limiter: AdmissionFailureLimiter,
     out: VecDeque<ServeOutFrame>,
 }
 
@@ -483,6 +508,7 @@ impl ServeRegistry {
             handlers: HashMap::new(),
             openings: HashSet::new(),
             calls: HashMap::new(),
+            failure_limiter: AdmissionFailureLimiter::with_defaults(),
             out: VecDeque::new(),
         }
     }
@@ -562,16 +588,23 @@ impl ServeRegistry {
         let flags = payload.flags;
         let client_streaming = flags & FLAG_RPC_CLIENT_STREAMING_REQUEST != 0;
         let streaming_response = flags & FLAG_RPC_STREAMING_RESPONSE != 0;
+        // One supplied clock for the whole admission: the paired
+        // sample's monotonic millis (see `verify_org_admission`).
+        let now_mono_ms = now_unix_ns / 1_000_000;
         if !request_flags_ok(opts.shape, flags) {
-            // The flags claim a shape this registration does not serve
-            // (a unary-flagged REQUEST on a streaming registration, or
-            // the reverse): a typed `NotSupported` refusal, both ways.
-            return self.refuse_denied(
-                from,
-                served_service,
-                call_id,
-                AdmissionDenied::StreamingUnsupported,
-            );
+            // The flags claim a shape this registration does not serve.
+            // The typed reason is the CORE mapping, exactly (§1.5 step
+            // 4 + the folds' contract-4 flag checks): only a UNARY
+            // registration's streaming flags read the preserved
+            // `StreamingUnsupported`, while a streaming registration's
+            // wrong flags are `ShapeMismatch` (coarse `Denied`) — the
+            // two are never conflated.
+            let reason = if opts.shape == RpcCallShape::Unary {
+                AdmissionDenied::StreamingUnsupported
+            } else {
+                AdmissionDenied::ShapeMismatch
+            };
+            return self.refuse_denied(from, served_service, call_id, now_mono_ms, reason);
         }
         // Parse the opt-in windows. Malformed values parse as `None`
         // (no flow control), exactly as the core's parsers behave.
@@ -584,20 +617,23 @@ impl ServeRegistry {
                 from,
                 served_service,
                 call_id,
+                now_mono_ms,
                 AdmissionDenied::ProviderPolicyRejected,
             );
         }
 
         // §3 step 1 — RESERVE the active key before any signature
         // work. A live key (or one already opening) is refused
-        // `ActiveCallOwned`: exactly one terminal to the offender,
-        // while the live call keeps its own single terminal.
+        // `ActiveCallOwned`; its frame rides the distinct id
+        // (`refusal_wire_id`) so the live call keeps its own single
+        // terminal.
         let key = (from.peer, from.incarnation, call_id);
         if self.calls.contains_key(&key) || self.openings.contains(&key) {
             return self.refuse_denied(
                 from,
                 served_service,
                 call_id,
+                now_mono_ms,
                 AdmissionDenied::ActiveCallOwned,
             );
         }
@@ -625,6 +661,7 @@ impl ServeRegistry {
                     from,
                     served_service,
                     call_id,
+                    now_mono_ms,
                     AdmissionDenied::BindingInvalid,
                 );
             }
@@ -647,9 +684,14 @@ impl ServeRegistry {
         let epoch_at_reserve = admission.facts.epoch;
         let poisoned_at_reserve = admission.facts.poisoned;
         let policy = opts.policy.clone();
-        // One supplied clock: the monotonic millis the replay guard
-        // wants are the same timeline scaled down.
-        let now_mono_ms = now_unix_ns / 1_000_000;
+        // §6 — throttle BEFORE the signature work, not after (the core
+        // bridge's `admit_protected_opening` gate): a peer that has
+        // spent its failure budget is refused WITHOUT reaching
+        // `verify_org_admission` and its `verify_strict` work.
+        if !self.failure_limiter.may_attempt(from.peer, now_mono_ms) {
+            self.openings.remove(&key);
+            return self.refuse_throttled(from, served_service, call_id);
+        }
         let admitted = match verify_org_admission(
             &ctx,
             &proof_headers,
@@ -670,7 +712,7 @@ impl ServeRegistry {
                 // §3 step 3 — release the active reservation; the
                 // replay record (if inserted) stays consumed.
                 self.openings.remove(&key);
-                return self.refuse_denied(from, served_service, call_id, reason);
+                return self.refuse_denied(from, served_service, call_id, now_mono_ms, reason);
             }
         };
 
@@ -683,6 +725,7 @@ impl ServeRegistry {
                 from,
                 served_service,
                 call_id,
+                now_mono_ms,
                 AdmissionDenied::MalformedProof,
             );
         };
@@ -707,6 +750,7 @@ impl ServeRegistry {
                     from,
                     served_service,
                     call_id,
+                    now_mono_ms,
                     AdmissionDenied::DeadlineExceedsPolicy,
                 );
             }
@@ -749,6 +793,10 @@ impl ServeRegistry {
             output: VecDeque::new(),
             resp_credit: output_window,
             result: None,
+            single_response: matches!(
+                opts.shape,
+                RpcCallShape::ClientStreaming | RpcCallShape::Unary
+            ),
             producer_done: false,
             closed: false,
             retired: None,
@@ -985,22 +1033,59 @@ impl ServeRegistry {
     }
 
     /// A refusal frame plus its typed outcome: `AdmissionDenied` + the
-    /// one-byte coarse reason (the `emit_admission_denial` shape).
+    /// one-byte coarse reason (the `emit_admission_denial` shape). §6:
+    /// every denial charges the peer's failed-admission budget EXCEPT
+    /// `AuthorityChanged` (D7) — the core bridge's exact disposition.
     fn refuse_denied(
         &mut self,
         from: &ServePeer,
         service: &str,
         call_id: u64,
+        now_mono_ms: u64,
         reason: AdmissionDenied,
     ) -> OpenOutcome {
-        let wire = reason.coarse().to_wire();
-        let payload = RpcResponsePayload {
-            status: RpcStatus::AdmissionDenied,
-            headers: Vec::new(),
-            body: Bytes::copy_from_slice(&[wire]),
-        };
-        self.emit_terminal(from, service, call_id, &payload);
+        if reason != AdmissionDenied::AuthorityChanged {
+            self.failure_limiter.on_failure(from.peer, now_mono_ms);
+        }
+        let payload = denial_payload(reason.coarse());
+        let wire_id = self.refusal_wire_id(from, call_id);
+        self.emit_terminal(from, service, wire_id, &payload);
         OpenOutcome::Denied(reason)
+    }
+
+    /// The wire id a refusal frame may ride: the request's `call_id`,
+    /// UNLESS a call (or an in-flight opening) already owns that key —
+    /// then the `2^63` flip. Exactly ONE terminal per call_id on the
+    /// wire: the live call's own single terminal must be the only
+    /// terminal-shaped frame its id ever carries (the caller's latch is
+    /// first-writer-wins, and LATCHING DISARMS the drop-CANCEL guard),
+    /// and ANY refusal reaching this under a live key — the
+    /// `ActiveCallOwned` duplicate, or a crafted REQUEST reusing the id
+    /// with wrong flags / a wrong service / a zero window — would be
+    /// consumed as that call's terminal (self-inflicted desync). The
+    /// flip keeps the refusal id `2^63` from any id the caller's
+    /// counter can hold live — the same "2^63 apart" id discipline the
+    /// caller mints under — and a reply naming an id no call holds is
+    /// ignored by the caller's registry. A refusal for a FRESH key
+    /// keeps its `call_id`: that frame IS the caller's latch for the
+    /// refused opening.
+    fn refusal_wire_id(&self, from: &ServePeer, call_id: u64) -> u64 {
+        let key = (from.peer, from.incarnation, call_id);
+        if self.calls.contains_key(&key) || self.openings.contains(&key) {
+            call_id ^ (1 << 63)
+        } else {
+            call_id
+        }
+    }
+
+    /// The §6 throttle refusal (core's `OpeningRefusal::Throttled`):
+    /// the coarse `Unavailable` byte on the wire, WITHOUT a second
+    /// `on_failure` charge (the limiter counted this denial itself).
+    fn refuse_throttled(&mut self, from: &ServePeer, service: &str, call_id: u64) -> OpenOutcome {
+        let payload = denial_payload(CoarseAdmissionReason::Unavailable);
+        let wire_id = self.refusal_wire_id(from, call_id);
+        self.emit_terminal(from, service, wire_id, &payload);
+        OpenOutcome::Throttled
     }
 
     /// A structural refusal: the core's malformed-request shape
@@ -1020,7 +1105,8 @@ impl ServeRegistry {
             )],
             body: Bytes::from(format!("malformed request: {what}")),
         };
-        self.emit_terminal(from, service, call_id, &payload);
+        let wire_id = self.refusal_wire_id(from, call_id);
+        self.emit_terminal(from, service, wire_id, &payload);
         OpenOutcome::Malformed(what.to_string())
     }
 
@@ -1116,9 +1202,9 @@ fn pump(out: &mut VecDeque<ServeOutFrame>, state: &mut ServeCallState) {
             }
             let body = {
                 let mut sh = state.shared.borrow_mut();
-                let body = sh.output.pop_front().unwrap_or_default();
-                sh.output.clear();
-                body
+                // `ServeCall::send` refuses a second single-response
+                // item typed, so at most one is ever queued.
+                sh.output.pop_front().unwrap_or_default()
             };
             let outcome = result.unwrap_or(StreamHandlerResult::Ok);
             let payload = match outcome.clone() {
@@ -1172,15 +1258,20 @@ fn pump(out: &mut VecDeque<ServeOutFrame>, state: &mut ServeCallState) {
 }
 
 /// One-per-consumed-chunk `REQUEST_GRANT` pacing for upload-windowed
-/// calls, capped at the opening window +
-/// [`REQUEST_GRANT_PER_CALL_CAP`] per call.
+/// calls (core's `RequestStream::poll_next` auto-grant): every consumed
+/// chunk earns exactly one grant, for the LIFE of the call —
+/// unbounded, exactly like core, whose
+/// [`REQUEST_GRANT_PER_CALL_CAP`] bounds the CALLER's credit BALANCE
+/// (`StreamCallRegistry::on_grant`), never this lifetime count. A
+/// lifetime cap here would stall every sustained upload in
+/// `SinkError::WouldBlock` to its deadline once the cap is spent.
 fn emit_request_grants(out: &mut VecDeque<ServeOutFrame>, state: &mut ServeCallState) {
-    let Some(initial) = state.request_window_initial else {
+    if state.request_window_initial.is_none() {
+        // Not upload-windowed: consumption grants nothing.
         return;
-    };
+    }
     let consumed = state.shared.borrow().consumed;
-    let cap = u64::from(initial) + u64::from(REQUEST_GRANT_PER_CALL_CAP);
-    while state.request_granted < consumed && state.request_granted < cap {
+    while state.request_granted < consumed {
         state.request_granted += 1;
         let frame =
             encode_request_grant_frame(state.origin_hash, state.key.2, state.reply_route, 1);
@@ -1189,6 +1280,17 @@ fn emit_request_grants(out: &mut VecDeque<ServeOutFrame>, state: &mut ServeCallS
             route: state.reply_route,
             frame,
         });
+    }
+}
+
+/// The one-byte coarse admission-denial payload (the
+/// `emit_admission_denial` shape: `AdmissionDenied` + the coarse byte;
+/// "denial is not a credential oracle").
+fn denial_payload(coarse: CoarseAdmissionReason) -> RpcResponsePayload {
+    RpcResponsePayload {
+        status: RpcStatus::AdmissionDenied,
+        headers: Vec::new(),
+        body: Bytes::copy_from_slice(&[coarse.to_wire()]),
     }
 }
 
