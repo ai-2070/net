@@ -12845,6 +12845,14 @@ pub struct MeshNode {
     /// through a relay.
     #[cfg(feature = "nat-traversal")]
     relay_clients: Arc<DashMap<SocketAddr, Arc<super::traversal::blind_relay::RelayClient>>>,
+    /// Where this node's relay TCP tunnels hand received datagrams; drained
+    /// by the task `start` spawns (`spawn_relay_tunnel_ingress`), never by
+    /// the UDP receive loop, which stays exactly as it is.
+    #[cfg(feature = "nat-traversal")]
+    relay_tunnel_ingress: super::traversal::blind_relay::TunnelIngress,
+    #[cfg(feature = "nat-traversal")]
+    relay_tunnel_rx:
+        Arc<parking_lot::Mutex<Option<super::traversal::blind_relay::TunnelIngressRx>>>,
     #[cfg(feature = "nat-traversal")]
     punch_observers: Arc<
         DashMap<
@@ -13679,6 +13687,8 @@ impl MeshNode {
             .map_err(|e| AdapterError::Connection(format!("bind failed: {}", e)))?;
         let socket = Arc::new(socket);
         let sink = PeerSink::new(socket.clone());
+        #[cfg(feature = "nat-traversal")]
+        let (relay_tunnel_ingress, relay_tunnel_rx) = tokio::sync::mpsc::channel(4_096);
 
         // RTC: a dedicated socket and one driver task, only when the
         // operator asked for it. `rtc: None` (the default) leaves
@@ -14814,6 +14824,10 @@ impl MeshNode {
             punch_observers: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             relay_clients: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            relay_tunnel_ingress: relay_tunnel_ingress.clone(),
+            #[cfg(feature = "nat-traversal")]
+            relay_tunnel_rx: Arc::new(parking_lot::Mutex::new(Some(relay_tunnel_rx))),
             #[cfg(feature = "nat-traversal")]
             rendezvous_budgets: Arc::new(RendezvousBudgets::default()),
             #[cfg(feature = "nat-traversal")]
@@ -25119,6 +25133,8 @@ impl MeshNode {
         }
 
         let recv_handle = self.spawn_receive_loop();
+        #[cfg(feature = "nat-traversal")]
+        self.spawn_relay_tunnel_ingress();
         // R3-E: the driver's close notifications drive the ordinary
         // peer-removal transaction. Spawned here, next to the receive
         // loop, because it is the same lifecycle: it exits with the
@@ -28387,6 +28403,38 @@ impl MeshNode {
         })
     }
 
+    /// Drain datagrams that arrive over this node's relay TCP tunnels into the
+    /// same relay boundary a UDP datagram from the relay crosses
+    /// ([`Self::relay_ingress`], attributed to the relay's address) and on to
+    /// dispatch. A separate task, so the UDP receive loop — the hot path — is
+    /// untouched; it parks on an empty channel while no tunnel exists. Exits
+    /// with the node (`shutdown`), since the context it holds reaches the
+    /// relay clients that hold the channel's senders.
+    #[cfg(feature = "nat-traversal")]
+    fn spawn_relay_tunnel_ingress(&self) {
+        let Some(mut rx) = self.relay_tunnel_rx.lock().take() else {
+            return;
+        };
+        let ctx = self.dispatch_ctx();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        tokio::spawn(async move {
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    frame = rx.recv() => {
+                        let Some((data, relay)) = frame else { break };
+                        if let Some((data, source)) =
+                            Self::relay_ingress(Bytes::from(data), PeerAddr::Udp(relay), &ctx)
+                        {
+                            Self::dispatch_packet(data, source, &ctx);
+                        }
+                    }
+                    _ = shutdown_notify.notified() => break,
+                }
+            }
+        });
+    }
+
     /// Blind-relay boundary for one UDP datagram. `Some` passes the
     /// (possibly unwrapped) packet on to [`Self::dispatch_packet`]; `None`
     /// means it was a relay control reply, consumed here.
@@ -29738,7 +29786,13 @@ impl MeshNode {
             ctx.peers.clone(),
             ctx.sink.clone(),
         );
-        let this = ctx.self_weak.get().cloned();
+        // Only across a BLIND relay (not a mesh member, so nothing floods
+        // between the two ends); a mesh relay floods both announcements.
+        let this = if matches!(source, PeerAddr::Relayed { .. }) {
+            ctx.self_weak.get().cloned()
+        } else {
+            None
+        };
         tokio::spawn(async move {
             match sink.send(&payload, next_hop).await {
                 Ok(_) => {
@@ -29748,9 +29802,9 @@ impl MeshNode {
                     // released.
                     guard.commit();
                     // This node's own announcement too, as `accept` pushes
-                    // it on a direct session (R2 phase 5: a relayed peer
-                    // learns this node's direct hint without waiting for
-                    // the next re-announce).
+                    // it on a direct session (R2 phase 5: a blind-relayed
+                    // peer learns this node's direct hint without waiting
+                    // for the next re-announce).
                     if let Some(node) = this.and_then(|w| w.upgrade()) {
                         // Only schedules (a `Weak`-holding task); the strong
                         // ref drops at the end of this block.
@@ -47288,7 +47342,7 @@ impl MeshNode {
     }
 
     /// [`Self::push_local_announcement`] for a session installed by a
-    /// routed handshake, after the settle a routed peer needs to install
+    /// routed handshake across a blind relay, after the settle a routed peer needs to install
     /// its end (frames that overtake it are dropped). Needs a started
     /// node; a bare one waits for the re-announce instead. The task holds
     /// only a `Weak` across the settle, never a strong ref: a node its
@@ -48738,9 +48792,15 @@ impl MeshNode {
         // for the direct-handshake-only bookkeeping.
         let (keys, hops) = keys;
         self.install_routed(dest_node_id, via, keys, None, hops > 0);
-        // The routed peer still learns this node's own announcement (its
-        // direct hint included) now rather than at the next re-announce.
-        self.spawn_routed_announcement_push(dest_node_id);
+        // A peer behind a BLIND relay learns this node's own announcement
+        // (its direct hint included) now rather than at the next
+        // re-announce: the relay is not a mesh member, so nothing floods
+        // between the two ends. A mesh relay floods it already, and pushing
+        // there too was found to stall the RTC upgrade dialog
+        // (`rtc_classifier::an_ice_pair_schedules_the_upgrade_attempt`).
+        if matches!(via, PeerAddr::Relayed { .. }) {
+            self.spawn_routed_announcement_push(dest_node_id);
+        }
 
         Ok(dest_node_id)
     }
@@ -48755,6 +48815,8 @@ impl MeshNode {
                 Arc::new(super::traversal::blind_relay::RelayClient::new(
                     relay,
                     self.sink.udp_socket().clone(),
+                    self.sink.relay_tunnels().clone(),
+                    self.relay_tunnel_ingress.clone(),
                 ))
             })
             .clone()
@@ -48789,6 +48851,13 @@ impl MeshNode {
         Ok(super::traversal::blind_relay::RelayRegistration::new(
             client, id, task,
         ))
+    }
+
+    /// Whether this node reaches `relay` through a TCP tunnel right now (its
+    /// UDP to the relay went unanswered).
+    #[cfg(feature = "nat-traversal")]
+    pub fn relay_tunneled(&self, relay: SocketAddr) -> bool {
+        self.sink.relay_tunnels().contains(&relay)
     }
 
     /// Open a channel to registration `id` on `relay`; the returned relayed

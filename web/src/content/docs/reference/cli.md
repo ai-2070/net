@@ -50,7 +50,12 @@ file:<path>` or `stdin`, never on the command line.
 With `up --enroll` the node hands out `netmesh-join_` links (bearer secrets
 unless bound with `--for`). A clean device runs `join <token>` and then
 `up`. It attaches direct first and falls back to a relay started with
-`relay serve`.
+`relay serve`. Once attached through the relay, it moves to the direct
+path by itself when that path starts answering. The relay serves UDP and
+TCP on one port. A node whose UDP to the relay gets no answer falls back to
+a plain TCP tunnel on that port, reported as `relay_transport: tcp` and
+`attach_path: relay_tcp`. Binding the relay on 443 covers networks that
+allow only that port. The tunnel is not designed to traverse proxies.
 
 | Command | What it does |
 |---|---|

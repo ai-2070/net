@@ -5111,6 +5111,19 @@ jobs:
               echo "::error::$t did not run"; exit 1; }
           done
 
+      # The relay TCP-tunnel fallback through real subprocesses (NET_CLI_PLAN_V3
+      # S8). The UDP block on `relay serve` is a `fixtures` seam, so the witness
+      # is `#[cfg(feature = "fixtures")]` and only this step runs it; the same
+      # build as the step above, so no extra feature-set rebuild.
+      - name: Run net-cli relay TCP-tunnel witness (fixtures)
+        run: |
+          set -o pipefail
+          cargo test -p net-cli --features fixtures --test relay_join             2>&1 | tee /tmp/cli_relay_tcp.log
+          for t in a_relay_whose_udp_is_blocked_is_reached_over_its_tcp_tunnel; do
+            grep -q "test $t ... ok" /tmp/cli_relay_tcp.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
+
   aggregator-daemon-tests:
     # `net-aggregator-daemon` is a lib + bin crate. The lib hosts
     # the `boot` / `run` entry points + config parsing + template

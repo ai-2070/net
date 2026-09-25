@@ -5,6 +5,11 @@
 //! bind channels to that registration, and the relay forwards their encrypted
 //! datagrams without being able to read them. It never holds a PSK, an issuer
 //! key or any mesh credential, and it is not a mesh member.
+//!
+//! The same port number also serves TCP: enrollment splices, and a tunnel
+//! that nodes whose UDP to the relay goes unanswered fall back to (bind port
+//! 443 to reach networks that only allow it). The tunnel is plain TCP carrying
+//! the same end-to-end ciphertext; it is not claimed to cross proxies.
 
 use std::sync::atomic::Ordering;
 
@@ -25,8 +30,9 @@ pub enum RelayCommand {
 /// `net-mesh relay serve` arguments.
 #[derive(Args, Debug)]
 pub struct ServeArgs {
-    /// UDP address to serve on (`IP:port`); must be reachable by devices and
-    /// joiners, e.g. `0.0.0.0:<port>` on a host with a public address.
+    /// Address to serve on (`IP:port`), UDP and TCP on the same port; must be
+    /// reachable by devices and joiners, e.g. `0.0.0.0:443` on a host with a
+    /// public address (TCP/443 is the fallback for networks that block UDP).
     #[arg(long, value_name = "ADDR")]
     pub bind: String,
 
@@ -60,6 +66,12 @@ async fn serve(args: ServeArgs, output: Option<OutputFormat>) -> Result<(), CliE
         .local_addr()
         .map_err(|e| generic(format!("relay socket: {e}")))?;
     let core = relay.core().clone();
+    // Test-only seam (`fixtures` builds): behave as a network that blocks UDP
+    // to the relay, so the TCP tunnel fallback runs end to end in a CLI test.
+    #[cfg(feature = "fixtures")]
+    if std::env::var_os("NET_MESH_FIXTURE_RELAY_BLOCK_UDP").is_some() {
+        relay.block_udp_for_test(true);
+    }
     emit_stream_row(
         fmt,
         &json!({ "event": "ready", "relay": local.to_string() }),
@@ -87,6 +99,7 @@ async fn serve(args: ServeArgs, output: Option<OutputFormat>) -> Result<(), CliE
             "registrations_accepted": stats.registrations.load(Ordering::Relaxed),
             "splices": stats.splices_opened.load(Ordering::Relaxed),
             "splice_bytes": stats.splice_bytes.load(Ordering::Relaxed),
+            "tunnels": stats.tunnels_opened.load(Ordering::Relaxed),
         }),
     )
     .map_err(|e| generic(format!("write stop event: {e}")))

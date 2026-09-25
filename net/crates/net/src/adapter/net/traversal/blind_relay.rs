@@ -46,6 +46,19 @@
 //! sent to a registered device, after a completed TCP handshake, at a bounded
 //! per-registration rate. Splices are bounded in number, bytes per direction and
 //! lifetime.
+//!
+//! # TCP tunnel (same port number, last resort)
+//!
+//! A node whose UDP to the relay gets no answer (a network that blocks UDP)
+//! opens `[TUNNEL][16 zero bytes]` on the same TCP listener. After the `OK`
+//! status byte the stream carries exactly the datagrams above, each as a
+//! big-endian `u16` length and the datagram. The relay gives each tunnel a
+//! synthetic endpoint in the RFC 6666 discard prefix (`100::/64`), which no
+//! UDP datagram can legitimately come from, and runs the unchanged state
+//! machine against it: registration still signs that observed endpoint, and
+//! anything the relay addresses to it goes down the tunnel. Nothing about it
+//! is claimed to cross proxies or TLS-inspecting middleboxes: it is plain TCP,
+//! carrying the same end-to-end ciphertext.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -89,6 +102,9 @@ pub mod splice {
     pub const JOIN: u8 = 0x20;
     /// Device → relay: `[ACCEPT][splice id]` (from an `OFFER`).
     pub const ACCEPT: u8 = 0x21;
+    /// Node → relay: `[TUNNEL][16 zero bytes]` — carry this node's relay
+    /// datagrams over the stream, each `u16`-length-prefixed.
+    pub const TUNNEL: u8 = 0x22;
     /// Preamble length.
     pub const PREAMBLE_LEN: usize = 1 + 16;
     /// Status byte: spliced; everything after it is the peer's bytes. Any
@@ -134,6 +150,70 @@ pub fn registration_id(entity: &EntityId) -> RegistrationId {
     let mut id = [0u8; 16];
     id.copy_from_slice(&full[..16]);
     id
+}
+
+/// The synthetic endpoint the relay gives its `n`th TCP tunnel: inside the
+/// RFC 6666 discard-only prefix `100::/64`, so it can never collide with a
+/// UDP source.
+pub fn tunnel_endpoint(n: u64) -> SocketAddr {
+    let seg = |shift: u32| ((n >> shift) & 0xffff) as u16;
+    SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::new(
+            0x0100,
+            0,
+            0,
+            0,
+            seg(48),
+            seg(32),
+            seg(16),
+            seg(0),
+        )),
+        0,
+    )
+}
+
+/// Whether `addr` is a tunnel endpoint (see [`tunnel_endpoint`]).
+pub fn is_tunnel_endpoint(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V6(v6) => v6.segments()[..4] == [0x0100, 0, 0, 0],
+        IpAddr::V4(_) => false,
+    }
+}
+
+/// Largest datagram a tunnel frame carries (its `u16` length).
+const TUNNEL_FRAME_MAX: usize = u16::MAX as usize;
+/// Frames queued toward one tunnel before further ones are dropped (datagram
+/// semantics: a slow stream loses datagrams, it never stalls the relay).
+const TUNNEL_QUEUE: usize = 1_024;
+
+/// Read one `u16`-length-prefixed frame; `None` at end of stream, on error,
+/// or on a zero-length frame.
+pub(crate) async fn read_tunnel_frame<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Option<Vec<u8>> {
+    let mut len = [0u8; 2];
+    reader.read_exact(&mut len).await.ok()?;
+    let len = u16::from_be_bytes(len) as usize;
+    if len == 0 {
+        return None;
+    }
+    let mut frame = vec![0u8; len];
+    reader.read_exact(&mut frame).await.ok()?;
+    Some(frame)
+}
+
+/// Write one frame (`u16` length + bytes); frames over the limit are dropped.
+pub(crate) async fn write_tunnel_frame<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &[u8],
+) -> std::io::Result<()> {
+    if frame.is_empty() || frame.len() > TUNNEL_FRAME_MAX {
+        return Ok(());
+    }
+    let mut out = Vec::with_capacity(2 + frame.len());
+    out.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+    out.extend_from_slice(frame);
+    writer.write_all(&out).await
 }
 
 /// Why the relay refused a request. Deliberately coarse.
@@ -438,6 +518,8 @@ pub struct RelayStats {
     pub splices_opened: AtomicU64,
     /// Bytes copied by splices (both directions).
     pub splice_bytes: AtomicU64,
+    /// TCP tunnels opened.
+    pub tunnels_opened: AtomicU64,
 }
 
 struct Registration {
@@ -831,6 +913,11 @@ struct Shared {
     waiting: Mutex<HashMap<SpliceId, tokio::sync::oneshot::Sender<TcpStream>>>,
     live_splices: Arc<Semaphore>,
     connections: Arc<Semaphore>,
+    /// Open TCP tunnels, by synthetic endpoint.
+    tunnels: Mutex<HashMap<SocketAddr, tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    next_tunnel: AtomicU64,
+    /// Test seam: drop every UDP datagram (a network that blocks UDP).
+    udp_blocked: std::sync::atomic::AtomicBool,
 }
 
 impl BlindRelay {
@@ -868,6 +955,9 @@ impl BlindRelay {
                             connections: Arc::new(Semaphore::new(config.max_tcp_connections)),
                             core: Arc::new(RelayCore::new(config)?),
                             waiting: Mutex::new(HashMap::new()),
+                            tunnels: Mutex::new(HashMap::new()),
+                            next_tunnel: AtomicU64::new(0),
+                            udp_blocked: std::sync::atomic::AtomicBool::new(false),
                         }),
                         listener,
                     });
@@ -886,6 +976,13 @@ impl BlindRelay {
     /// Shared state machine (stats, sizes).
     pub fn core(&self) -> &Arc<RelayCore> {
         &self.shared.core
+    }
+
+    /// Test seam: while set, the relay drops every UDP datagram, as a network
+    /// that blocks UDP would; TCP (splices and tunnels) is unaffected.
+    #[doc(hidden)]
+    pub fn block_udp_for_test(&self, blocked: bool) {
+        self.shared.udp_blocked.store(blocked, Ordering::Relaxed);
     }
 
     /// Serve until the task is dropped/aborted.
@@ -909,9 +1006,14 @@ impl BlindRelay {
             let Ok(Ok((n, from))) = recv else {
                 continue;
             };
+            // A tunnel endpoint is never a UDP source (discard-only prefix);
+            // a datagram claiming one is dropped before the state machine.
+            if is_tunnel_endpoint(&from) || shared.udp_blocked.load(Ordering::Relaxed) {
+                continue;
+            }
             if let Action::Send { to, bytes } = shared.core.handle(from, &buf[..n], unix_now(), now)
             {
-                let _ = shared.socket.send_to(&bytes, to).await;
+                shared.deliver(to, bytes).await;
             }
         }
     }
@@ -944,6 +1046,68 @@ impl BlindRelay {
 }
 
 impl Shared {
+    /// Send one relay datagram to `to`: down its tunnel when `to` is a tunnel
+    /// endpoint (dropped if that tunnel is gone or full), else over UDP.
+    async fn deliver(&self, to: SocketAddr, bytes: Vec<u8>) {
+        if is_tunnel_endpoint(&to) {
+            let tx = self.tunnels.lock().get(&to).cloned();
+            if let Some(tx) = tx {
+                let _ = tx.try_send(bytes);
+            }
+            return;
+        }
+        if self.udp_blocked.load(Ordering::Relaxed) {
+            return;
+        }
+        let _ = self.socket.send_to(&bytes, to).await;
+    }
+
+    /// A node's TCP tunnel: a synthetic endpoint the state machine sees like
+    /// a UDP source, fed by the stream's frames; everything addressed to it
+    /// goes back down the stream. Ends at end of stream, on an error, or after
+    /// [`RelayConfig::channel_idle`] without a frame.
+    async fn tunnel(&self, mut stream: TcpStream, zero: [u8; 16]) {
+        if zero != [0u8; 16] || stream.write_all(&[splice::OK]).await.is_err() {
+            self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let endpoint = tunnel_endpoint(self.next_tunnel.fetch_add(1, Ordering::Relaxed));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TUNNEL_QUEUE);
+        self.tunnels.lock().insert(endpoint, tx);
+        self.core
+            .stats
+            .tunnels_opened
+            .fetch_add(1, Ordering::Relaxed);
+        let (mut reader, mut writer) = stream.into_split();
+        let write = async {
+            while let Some(frame) = rx.recv().await {
+                if write_tunnel_frame(&mut writer, &frame).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let idle = self.core.config.channel_idle;
+        let read = async {
+            loop {
+                let frame = match tokio::time::timeout(idle, read_tunnel_frame(&mut reader)).await {
+                    Ok(Some(frame)) => frame,
+                    _ => break,
+                };
+                let now = Instant::now();
+                if let Action::Send { to, bytes } =
+                    self.core.handle(endpoint, &frame, unix_now(), now)
+                {
+                    self.deliver(to, bytes).await;
+                }
+            }
+        };
+        tokio::select! {
+            _ = read => {}
+            _ = write => {}
+        }
+        self.tunnels.lock().remove(&endpoint);
+    }
+
     async fn serve_stream(&self, mut stream: TcpStream) {
         let mut preamble = [0u8; splice::PREAMBLE_LEN];
         let read = tokio::time::timeout(PREAMBLE_WAIT, stream.read_exact(&mut preamble)).await;
@@ -956,6 +1120,7 @@ impl Shared {
         match preamble[0] {
             splice::JOIN => self.join(stream, id).await,
             splice::ACCEPT => self.accept(stream, id).await,
+            splice::TUNNEL => self.tunnel(stream, id).await,
             _ => {
                 self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -983,7 +1148,7 @@ impl Shared {
         let offer = Message::Offer { splice: splice_id }.encode();
         let deadline = tokio::time::Instant::now() + self.core.config.splice_accept_wait;
         let device = loop {
-            let _ = self.socket.send_to(&offer, endpoint).await;
+            self.deliver(endpoint, offer.clone()).await;
             let tick = (tokio::time::Instant::now() + OFFER_RESEND).min(deadline);
             match tokio::time::timeout_at(tick, &mut rx).await {
                 Ok(Ok(device)) => break Some(device),
@@ -1084,6 +1249,17 @@ pub enum RelayError {
 const RELAY_REPLY_WAIT: Duration = Duration::from_millis(1_500);
 /// Attempts per request (UDP may drop either direction).
 const RELAY_ATTEMPTS: u32 = 3;
+/// UDP attempts before a request falls back to the TCP tunnel.
+const RELAY_UDP_ATTEMPTS: u32 = 2;
+/// Bound on connecting a tunnel and reading its status byte.
+const TUNNEL_CONNECT_WAIT: Duration = Duration::from_secs(5);
+
+/// Where a node's relay tunnels hand received datagrams: each with the
+/// relay's address, for the node's relay ingress (the same path a UDP
+/// datagram from the relay takes).
+pub type TunnelIngress = tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>;
+/// The receiving end of [`TunnelIngress`].
+pub type TunnelIngressRx = tokio::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>;
 
 /// A mesh node's handle on one relay. Requests go out on the node's own mesh
 /// socket (so a device's registration holds the same NAT mapping its relayed
@@ -1092,6 +1268,11 @@ const RELAY_ATTEMPTS: u32 = 3;
 pub struct RelayClient {
     relay: SocketAddr,
     socket: Arc<crate::adapter::net::transport::NetSocket>,
+    /// The node's relay tunnels (shared with its send path).
+    tunnels: Arc<crate::adapter::net::transport::RelayTunnels>,
+    ingress: TunnelIngress,
+    /// Serializes tunnel opens to this relay.
+    opening: tokio::sync::Mutex<()>,
     replies_tx: tokio::sync::mpsc::Sender<Message>,
     replies: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Message>>,
     /// Where splice offers go while this node accepts splices.
@@ -1099,12 +1280,22 @@ pub struct RelayClient {
 }
 
 impl RelayClient {
-    /// A client for `relay` sending on `socket`.
-    pub fn new(relay: SocketAddr, socket: Arc<crate::adapter::net::transport::NetSocket>) -> Self {
+    /// A client for `relay` sending on `socket`, falling back to a TCP
+    /// tunnel (installed in `tunnels`, received frames handed to `ingress`)
+    /// when UDP to the relay gets no answer.
+    pub fn new(
+        relay: SocketAddr,
+        socket: Arc<crate::adapter::net::transport::NetSocket>,
+        tunnels: Arc<crate::adapter::net::transport::RelayTunnels>,
+        ingress: TunnelIngress,
+    ) -> Self {
         let (replies_tx, replies) = tokio::sync::mpsc::channel(32);
         Self {
             relay,
             socket,
+            tunnels,
+            ingress,
+            opening: tokio::sync::Mutex::new(()),
             replies_tx,
             replies: tokio::sync::Mutex::new(replies),
             offers: Mutex::new(None),
@@ -1133,6 +1324,15 @@ impl RelayClient {
         }
     }
 
+    /// Whether this node currently reaches the relay through a TCP tunnel.
+    pub fn tunneled(&self) -> bool {
+        self.tunnels.contains(&self.relay)
+    }
+
+    /// One request/reply exchange. While a tunnel to this relay is up, over
+    /// it (one endpoint for everything this node holds at the relay). Else
+    /// over UDP, and when UDP gets no answer, over a freshly opened tunnel:
+    /// TCP is the last resort, never the first try.
     async fn exchange<R>(
         &self,
         request: &Message,
@@ -1141,8 +1341,101 @@ impl RelayClient {
         let mut replies = self.replies.lock().await;
         while replies.try_recv().is_ok() {}
         let bytes = request.encode();
-        for _ in 0..RELAY_ATTEMPTS {
-            self.socket.send_to(&bytes, self.relay).await?;
+        if let Some(tx) = self.tunnels.tunnel_sender(self.relay) {
+            return self
+                .attempts(&mut replies, &bytes, Some(&tx), RELAY_ATTEMPTS, &accept)
+                .await;
+        }
+        match self
+            .attempts(&mut replies, &bytes, None, RELAY_UDP_ATTEMPTS, &accept)
+            .await
+        {
+            Err(RelayError::Timeout) => {}
+            answered => return answered,
+        }
+        let tx = self.open_tunnel().await?;
+        self.attempts(&mut replies, &bytes, Some(&tx), RELAY_ATTEMPTS, &accept)
+            .await
+    }
+
+    /// Open (or reuse) the TCP tunnel to this relay: `[TUNNEL][0; 16]`, one
+    /// status byte, then `u16`-length-prefixed datagrams both ways. The
+    /// tunnel is installed for the node's send path and removed when its
+    /// stream ends; received datagrams go to the node's relay ingress.
+    async fn open_tunnel(&self) -> Result<tokio::sync::mpsc::Sender<Vec<u8>>, RelayError> {
+        let _serial = self.opening.lock().await;
+        if let Some(tx) = self.tunnels.tunnel_sender(self.relay) {
+            return Ok(tx);
+        }
+        let relay = self.relay;
+        let stream = tokio::time::timeout(TUNNEL_CONNECT_WAIT, async {
+            let mut stream = TcpStream::connect(relay).await?;
+            let mut preamble = [0u8; splice::PREAMBLE_LEN];
+            preamble[0] = splice::TUNNEL;
+            stream.write_all(&preamble).await?;
+            let mut status = [0u8; 1];
+            stream.read_exact(&mut status).await?;
+            match status[0] {
+                splice::OK => Ok(stream),
+                code => Err(RelayError::Refused(
+                    Refusal::from_code(code).unwrap_or(Refusal::BadProof),
+                )),
+            }
+        })
+        .await
+        .map_err(|_| RelayError::Timeout)??;
+        let (mut reader, mut writer) = stream.into_split();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TUNNEL_QUEUE);
+        self.tunnels.install(relay, tx.clone());
+        let mine = tx.downgrade();
+        let tunnels = self.tunnels.clone();
+        let ingress = self.ingress.clone();
+        tokio::spawn(async move {
+            let write = async {
+                while let Some(frame) = rx.recv().await {
+                    if write_tunnel_frame(&mut writer, &frame).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let read = async {
+                while let Some(frame) = read_tunnel_frame(&mut reader).await {
+                    if ingress.send((frame, relay)).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = read => {}
+                _ = write => {}
+            }
+            if let Some(tx) = mine.upgrade() {
+                tunnels.remove_if(relay, &tx);
+            }
+            tracing::debug!(%relay, "blind relay tunnel ended");
+        });
+        tracing::info!(%relay, "blind relay: UDP unanswered, using the TCP tunnel");
+        Ok(tx)
+    }
+
+    async fn attempts<R>(
+        &self,
+        replies: &mut tokio::sync::mpsc::Receiver<Message>,
+        bytes: &[u8],
+        tunnel: Option<&tokio::sync::mpsc::Sender<Vec<u8>>>,
+        attempts: u32,
+        accept: &impl Fn(&Message) -> Option<R>,
+    ) -> Result<R, RelayError> {
+        for _ in 0..attempts {
+            match tunnel {
+                Some(tx) => tx
+                    .send(bytes.to_vec())
+                    .await
+                    .map_err(|_| RelayError::Closed)?,
+                None => {
+                    self.socket.send_to(bytes, self.relay).await?;
+                }
+            }
             let deadline = tokio::time::Instant::now() + RELAY_REPLY_WAIT;
             loop {
                 match tokio::time::timeout_at(deadline, replies.recv()).await {
@@ -2016,5 +2309,127 @@ mod tests {
         .await
         .expect("no hang")
         .expect("the cancelled attempt must not block this one");
+    }
+
+    // ---- TCP tunnel: the last resort when UDP is blocked (V3 S8) ----
+
+    /// A relay whose UDP is blocked (as a network that drops UDP would), its
+    /// TCP listener serving as usual.
+    async fn udp_blocked_relay() -> (SocketAddr, Arc<RelayCore>, tokio::task::JoinHandle<()>) {
+        let relay = Arc::new(
+            BlindRelay::bind("127.0.0.1:0".parse().unwrap(), RelayConfig::default())
+                .await
+                .unwrap(),
+        );
+        relay.block_udp_for_test(true);
+        let addr = relay.local_addr().unwrap();
+        let core = relay.core().clone();
+        (addr, core, tokio::spawn(async move { relay.run().await }))
+    }
+
+    #[test]
+    fn tunnel_endpoints_are_discard_prefix_and_distinct() {
+        let a = tunnel_endpoint(0);
+        let b = tunnel_endpoint(u64::MAX);
+        assert!(is_tunnel_endpoint(&a) && is_tunnel_endpoint(&b));
+        assert_ne!(a, b);
+        for real in [
+            "127.0.0.1:9000",
+            "[::1]:9000",
+            "[2001:db8::1]:443",
+            "[::ffff:10.0.0.1]:1",
+        ] {
+            assert!(!is_tunnel_endpoint(&addr(real)), "{real}");
+        }
+    }
+
+    /// UDP to the relay is blocked: registration and bind fall back to the
+    /// TCP tunnel on the same port, and a real mesh session (routed handshake
+    /// plus a sealed request/ack) runs end-to-end through it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_mesh_session_runs_through_the_tcp_tunnel_when_udp_is_blocked() {
+        use crate::adapter::net::ChannelName;
+
+        let (relay_addr, core, relay_task) = udp_blocked_relay().await;
+        let device = mesh_node().await;
+        let joiner = mesh_node().await;
+        device.start();
+        joiner.start();
+
+        let registration = device
+            .relay_register(relay_addr)
+            .await
+            .expect("registered over the tunnel");
+        assert!(
+            device.relay_tunneled(relay_addr),
+            "the device fell back to TCP"
+        );
+        let via = joiner
+            .relay_bind(relay_addr, registration.id())
+            .await
+            .expect("bound over the tunnel");
+        assert!(
+            joiner.relay_tunneled(relay_addr),
+            "the joiner fell back to TCP"
+        );
+        joiner
+            .connect_via_endpoint(via, device.public_key(), device.node_id())
+            .await
+            .expect("routed handshake through the tunnels");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            joiner.subscribe_channel(device.node_id(), ChannelName::new("relay.tcp").unwrap()),
+        )
+        .await
+        .expect("no hang")
+        .expect("a sealed request and its ack cross both tunnels");
+        assert_eq!(core.stats().tunnels_opened.load(Ordering::Relaxed), 2);
+        assert!(core.stats().forwarded_packets.load(Ordering::Relaxed) >= 4);
+        drop(registration);
+        relay_task.abort();
+    }
+
+    /// With UDP answering, no tunnel is opened: TCP is the last resort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn udp_is_used_when_it_answers() {
+        let (relay_addr, core, relay_task) = live_relay(RelayConfig::default()).await;
+        let device = mesh_node().await;
+        let joiner = mesh_node().await;
+        device.start();
+        joiner.start();
+        let registration = device.relay_register(relay_addr).await.expect("register");
+        joiner
+            .relay_bind(relay_addr, registration.id())
+            .await
+            .expect("bind");
+        assert!(!device.relay_tunneled(relay_addr) && !joiner.relay_tunneled(relay_addr));
+        assert_eq!(core.stats().tunnels_opened.load(Ordering::Relaxed), 0);
+        drop(registration);
+        relay_task.abort();
+    }
+
+    /// Enrollment splices reach a device registered over the tunnel: the
+    /// relay's offer goes down the device's tunnel and the device dials back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_byte_stream_is_spliced_to_a_device_registered_over_the_tunnel() {
+        let (relay, core, task) = udp_blocked_relay().await;
+        let device = mesh_node().await;
+        device.start();
+        let mut registration = device.relay_register(relay).await.unwrap();
+        assert!(device.relay_tunneled(relay));
+        let mut streams = registration.accept_splices(4);
+        let mut joiner = open_splice(relay, registration.id())
+            .await
+            .expect("spliced");
+        let mut at_device = tokio::time::timeout(Duration::from_secs(5), streams.recv())
+            .await
+            .expect("device got the stream")
+            .unwrap();
+        joiner.write_all(b"to device").await.unwrap();
+        let mut buf = [0u8; 9];
+        at_device.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"to device");
+        assert_eq!(core.stats().splices_opened.load(Ordering::Relaxed), 1);
+        task.abort();
     }
 }

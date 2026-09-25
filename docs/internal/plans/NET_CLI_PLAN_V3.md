@@ -4451,6 +4451,130 @@ cancelled the S5 and S6 heads. The limit is now 35 minutes.
   before: single-punch upgrades are not wired.
 
 
+**S7 correction (found by S7's CI, fixed in the S8 commit).** The
+own-announcement push on routed sessions also ran on mesh-relayed
+(`connect_via`) sessions. There it stalled the RTC upgrade dialog:
+`rtc_classifier::an_ice_pair_schedules_the_upgrade_attempt` never installed
+the RTC endpoint, and it passes with the push disabled. I did not isolate
+the exact mechanism.
+
+The push is now limited to blind-relayed sessions (`PeerAddr::Relayed`),
+which are the only kind that needs it: a blind relay is not a mesh member,
+so nothing floods between the two ends. A mesh relay already floods both
+announcements.
+
+**Open.** The same hop-0 announcement over a mesh-relayed session still
+arrives at the 150 s re-announce, so if the interaction is real it can
+still occur later in a session's life. It is recorded as a follow-up, not
+claimed fixed.
+
+After the fix:
+- the RTC harness family passes 207/208; the other, `rtc_repairs`' 0.3 s
+  fragment test, failed once under the full-family load and passed 3/3
+  alone;
+- the S7 witnesses still pass.
+
+**S8 receipt: TCP/443 last-resort tunnel (decision 9, 2026-09-25).**
+
+User decisions (2026-09-25):
+- plain TCP with length-prefixed frames, no TLS;
+- automatic last resort;
+- the same port as UDP.
+
+**Relay (`BlindRelay`):**
+- **Opening a tunnel.** A new preamble kind, `splice::TUNNEL`, on the
+  existing TCP listener. After the `OK` status byte the stream carries
+  exactly the relay's datagrams, each as a big-endian `u16` length and the
+  bytes.
+- **Endpoint.** Each tunnel gets a synthetic endpoint in the RFC 6666
+  discard-only prefix `100::/64`, and the unchanged state machine runs
+  against it. Registration still signs that observed endpoint; channels,
+  forwarding, rate limits, bounds and splice offers are all as before.
+- **Delivery.** `Shared::deliver` sends to a tunnel endpoint down its
+  stream (dropped if the tunnel is gone or its 1024-frame queue is full,
+  keeping datagram semantics), and everything else over UDP.
+- **Isolation.** The UDP loop drops any datagram whose source claims the
+  tunnel prefix.
+- **Bounds.** A tunnel holds one of the existing `max_tcp_connections`
+  permits and closes after `channel_idle` without a frame.
+- **Stats.** `tunnels_opened` is counted and printed in `relay serve`'s
+  stop row.
+
+**Node:**
+- **Fallback.** `RelayClient::exchange` tries UDP twice (about 3 s). Only
+  when that gets no answer does it open the tunnel (`open_tunnel`, which
+  serializes opens) and retry over it.
+- **Stickiness.** While the tunnel lives, everything for that relay uses
+  it. A node's registration and channel binds must share one endpoint, so
+  returning to UDP mid-stream would split them. A node tries UDP first
+  again only when it next needs a new tunnel.
+- **`PeerSink` routing.** `RelayTunnels` routes `PeerAddr::Relayed` frames
+  into the tunnel.
+- **Hot path.**
+  - Direct (`PeerAddr::Udp`) sends are unchanged.
+  - A relayed send pays one relaxed atomic load while no tunnel exists.
+  - Tunnel frames are drained by their own task (`spawn_relay_tunnel_ingress`,
+    exits on shutdown) into the same `relay_ingress` → `dispatch_packet`
+    path. The UDP receive loop, and the batched receiver, are unchanged.
+- **Observability.** `MeshNode::relay_tunneled`.
+
+**CLI:**
+- `up --enroll` readiness reports `relay_transport: udp|tcp`.
+- `join` and joined `up` report `attach_path` / `path: "relay_tcp"` when
+  attached through the tunnel. The UDP relay case keeps `"relay"`, so
+  existing consumers are unaffected.
+- `RELAY_REGISTER_WAIT` rose from 4 s to 6 s, leaving room for the UDP
+  attempts and then the tunnel before readiness.
+- `relay serve` documents TCP/443.
+- Docs: the CLI reference (`web/.../reference/cli.md`).
+
+Witnesses:
+
+| Test | Proves |
+|---|---|
+| `blind_relay::tunnel_endpoints_are_discard_prefix_and_distinct` | Synthetic endpoints sit in `100::/64`, are distinct, and are never a real address |
+| `blind_relay::a_mesh_session_runs_through_the_tcp_tunnel_when_udp_is_blocked` | With the relay's UDP blocked, device registration and joiner bind both fall back to tunnels. A routed handshake plus a sealed request/ack runs end-to-end through them (2 tunnels opened). |
+| `blind_relay::udp_is_used_when_it_answers` | With UDP answering, no tunnel opens |
+| `blind_relay::a_byte_stream_is_spliced_to_a_device_registered_over_the_tunnel` | Enrollment splice offers reach a tunneled device through its tunnel |
+| `cli/tests/relay_join.rs::a_relay_whose_udp_is_blocked_is_reached_over_its_tcp_tunnel` | A real `relay serve` with UDP blocked (`fixtures`-only `NET_MESH_FIXTURE_RELAY_BLOCK_UDP`). The operator reports `relay_transport: tcp`. The agent enrolls through the relay (`enroll_path: relay`, the splice) and attaches with `attach_path: relay_tcp`; joined `up` reports `path: relay_tcp`. |
+
+**CI.** A new "net-cli relay TCP-tunnel witness (fixtures)" step pins the
+CLI witness by name, reusing the crash step's `fixtures` build. The
+blind-relay units run in the core unit job.
+
+Inverse mutations, all RED (5 core, plus 1 end-to-end):
+
+| # | Mutation |
+|---|---|
+| T1 | Never fall back to the tunnel (RED in the core and in the CLI witness) |
+| T2 | Relayed sends ignore the tunnel |
+| T3 | The relay sends to tunnel endpoints over UDP |
+| T4 | Tunnel tried before UDP |
+| T5 | Tunnel ingress never dispatched |
+
+Gates:
+- core clippy (all, default and no-default features; strict and all-targets);
+- root rustdoc;
+- CLI clippy, default and `fixtures`;
+- `cargo tl` 5822/5822 and `cargo t` 7053/7053;
+- `direct_upgrade` 19/19;
+- the RTC harness family (CI's list) as described above;
+- SDK 831/831, MCP 275/275, CLI 374/374 and CLI `fixtures` 9/9.
+
+**Limits:**
+- **No TLS.** DPI or proxies that require TLS on 443 are not crossed, and
+  nothing claims they are.
+- **Stickiness.** Once tunneled, a node stays on TCP until that stream
+  ends.
+- **Joiner recovery (not witnessed).** A joiner has no registration
+  refresh. If its tunnel drops, the relayed session stays down until the
+  joined runtime re-attaches; that re-bind tries UDP first again.
+- **Unwitnessed guard.** The relay's drop of UDP datagrams that claim the
+  tunnel prefix has no test, since such a source cannot be produced on
+  loopback.
+- **No `DEFAULT_RELAY`.** It stays empty until a real relay is deployed.
+
+
 ## 8. Cumulative acceptance matrix
 
 All rows are required unless explicitly marked feature-conditional; narrow slices can be accepted independently without calling the entire plan complete.

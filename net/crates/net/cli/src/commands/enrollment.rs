@@ -414,8 +414,9 @@ impl EnrollOwner {
 }
 
 /// How long `up --enroll` waits for the first relay registration before it
-/// reports readiness (it keeps retrying in the background either way).
-const RELAY_REGISTER_WAIT: Duration = Duration::from_secs(4);
+/// reports readiness (it keeps retrying in the background either way). Room
+/// for the UDP attempts (~3 s) and then the TCP tunnel fallback.
+const RELAY_REGISTER_WAIT: Duration = Duration::from_secs(6);
 /// Pause between relay registration attempts while the relay is unreachable.
 const RELAY_RETRY: Duration = Duration::from_secs(15);
 /// Spliced enrollment streams buffered for the service.
@@ -428,6 +429,7 @@ const RELAY_SPLICE_BACKLOG: usize = 16;
 struct RelayLink {
     locator: RelayLocator,
     state: Arc<parking_lot::Mutex<RelayLinkState>>,
+    node: Arc<net::adapter::net::MeshNode>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -451,11 +453,18 @@ impl RelayLink {
         };
         let state = Arc::new(parking_lot::Mutex::new(RelayLinkState::default()));
         let (first_tx, first) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(relay_loop(node, endpoint, sink, state.clone(), first_tx));
+        let task = tokio::spawn(relay_loop(
+            node.clone(),
+            endpoint,
+            sink,
+            state.clone(),
+            first_tx,
+        ));
         let _ = tokio::time::timeout(RELAY_REGISTER_WAIT, first).await;
         Self {
             locator,
             state,
+            node,
             task,
         }
     }
@@ -715,6 +724,10 @@ pub(crate) struct EnrollmentReport {
     relay_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     relay_error: Option<String>,
+    /// How the relay is reached once registered: `udp`, or `tcp` (the tunnel
+    /// fallback, when UDP to the relay went unanswered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_transport: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     created: Vec<String>,
     /// The subnet this node verifies and issues for, if any.
@@ -760,6 +773,17 @@ impl RunningEnrollment {
                 .relay
                 .as_ref()
                 .and_then(|r| r.state.lock().error.clone()),
+            relay_transport: self.relay.as_ref().and_then(|r| {
+                let registered = r.state.lock().registered?;
+                Some(
+                    if r.node.relay_tunneled(registered) {
+                        "tcp"
+                    } else {
+                        "udp"
+                    }
+                    .to_string(),
+                )
+            }),
             created: self.created.iter().map(|s| s.to_string()).collect(),
             subnet: c.subnet.as_ref().map(|s| {
                 let g = s.grant();
@@ -1740,7 +1764,8 @@ const DIRECT_RETRY_PAUSE: Duration = Duration::from_millis(500);
 /// Attach `mesh` to `contact` via the routed handshake: **direct first**, the
 /// contact's blind relay only if the direct attempt fails. The session
 /// authenticates the contact's key end-to-end on either path. Returns the path
-/// used (`"direct"` or `"relay"`).
+/// used (`"direct"`, `"relay"`, or `"relay_tcp"` when the relay is reached
+/// through its TCP tunnel because UDP to it went unanswered).
 pub(crate) async fn attach_contact(
     node: &Arc<net::adapter::net::MeshNode>,
     contact: &MeshContact,
@@ -1795,12 +1820,14 @@ pub(crate) async fn attach_contact(
             .map_err(|e| e.to_string())?;
         node.connect_via_endpoint(via, &contact.noise_pubkey, contact.node_id)
             .await
-            .map(drop)
+            .map(|_| addr)
             .map_err(|e| e.to_string())
     })
     .await;
     let relay_failure = match relayed {
-        Ok(Ok(())) => return Ok("relay"),
+        // Over the relay's TCP tunnel when UDP to the relay went unanswered.
+        Ok(Ok(addr)) if node.relay_tunneled(addr) => return Ok("relay_tcp"),
+        Ok(Ok(_)) => return Ok("relay"),
         Ok(Err(e)) => format!("relay {}: {e}", relay.endpoint.as_str()),
         Err(_) => format!("relay {}: timed out", relay.endpoint.as_str()),
     };

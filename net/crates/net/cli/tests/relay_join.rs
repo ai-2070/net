@@ -234,6 +234,64 @@ fn a_dead_direct_path_falls_back_to_the_relay() {
     drop(op);
 }
 
+/// UDP to the relay blocked (as some networks do): the operator registers
+/// and the agent enrolls and attaches through the relay's TCP tunnel on the
+/// same port, automatically, and both report it. `fixtures` builds only: the
+/// relay's UDP block is a test seam.
+#[cfg(feature = "fixtures")]
+#[test]
+fn a_relay_whose_udp_is_blocked_is_reached_over_its_tcp_tunnel() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_net-mesh"))
+        .env_remove("NET_MESH_CONFIG")
+        .env_remove("NET_MESH_PROFILE")
+        .env("NET_MESH_FIXTURE_RELAY_BLOCK_UDP", "1")
+        .args([
+            "--output",
+            "ndjson",
+            "relay",
+            "serve",
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let ready = read_row(&mut stdout, &mut child);
+    let relay = ready["relay"].as_str().unwrap().to_string();
+    let _relay = Relay(child);
+
+    let operator = Fx::new();
+    let op = operator.up(&["--enroll", "--no-port-mapping", "--relay", &relay]);
+    assert_eq!(
+        op.ready["enrollment"]["relay_state"], "registered",
+        "{}",
+        op.ready
+    );
+    assert_eq!(
+        op.ready["enrollment"]["relay_transport"], "tcp",
+        "{}",
+        op.ready
+    );
+
+    let dead = dead_port();
+    let created = operator.json(&["invite", "create", "--addr", &dead]);
+    let agent = Fx::new();
+    let joined = agent.json(&["join", &token_of(&created), "--yes"]);
+    assert_eq!(joined["state"], "joined", "{joined}");
+    assert_eq!(joined["attached"], true, "{joined}");
+    assert_eq!(joined["enroll_path"], "relay", "{joined}");
+    assert_eq!(joined["attach_path"], "relay_tcp", "{joined}");
+
+    let node = agent.up(&[]);
+    assert_eq!(node.ready["joined"]["attached"], true, "{}", node.ready);
+    assert_eq!(node.ready["joined"]["path"], "relay_tcp", "{}", node.ready);
+    drop(node);
+    drop(op);
+}
+
 /// Direct alive, relay alive: the direct path is used and the relay is not.
 #[test]
 fn a_live_direct_path_is_used_while_a_relay_is_present() {
