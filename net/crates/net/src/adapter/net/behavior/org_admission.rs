@@ -952,6 +952,7 @@ mod tests {
         call_id: u64,
         session_binding: [u8; 32],
         expiry_ns: u64,
+        kind: u8,
     ) -> OrgStreamCallProof {
         let caller = caller();
         let membership =
@@ -985,15 +986,21 @@ mod tests {
             cap(),
             expiry_ns,
             REQ,
-            crate::adapter::net::behavior::org_call::STREAM_CALL_KIND_SERVER_STREAMING,
+            kind,
             session_binding,
         )
     }
 
-    /// A live [`cross_org_stream_proof_at`] (expiry 20 s out).
+    /// A live [`cross_org_stream_proof_at`] (expiry 20 s out), signed for
+    /// the server-streaming kind.
     fn cross_org_stream_proof(call_id: u64, session_binding: [u8; 32]) -> OrgStreamCallProof {
         let expiry = (crate::adapter::net::behavior::org::current_timestamp() + 20) * 1_000_000_000;
-        cross_org_stream_proof_at(call_id, session_binding, expiry)
+        cross_org_stream_proof_at(
+            call_id,
+            session_binding,
+            expiry,
+            crate::adapter::net::behavior::org_call::STREAM_CALL_KIND_SERVER_STREAMING,
+        )
     }
 
     /// The streaming-registered twin of [`cross_org_ctx`] (§1.5 step 4's
@@ -1230,6 +1237,114 @@ mod tests {
         assert_eq!(admitted.provider_org, org_b().org_id());
         assert_eq!(admitted.provider, provider_entity);
         assert_eq!(admitted.capability, cap());
+    }
+
+    /// Step 4(c), at its own step (CORE-6): a streaming registration with
+    /// COHERENT flags whose streaming proof names a DIFFERENT shape in
+    /// `proof.kind` is `ShapeMismatch` — the kind arm, not the flags arm
+    /// (step 4(b)), and not an earlier decode refusal (the proof decodes
+    /// cleanly; only its kind disagrees).
+    #[test]
+    fn step_4c_a_proof_kind_naming_another_shape_is_shape_mismatch() {
+        let floors = empty_floors();
+        let binding = [0x5Au8; 32];
+        let caller_entity = caller().entity_id().clone();
+        let provider_entity = provider();
+        let ctx = cross_org_stream_ctx(&floors, &caller_entity, &provider_entity, binding);
+        let replay = AdmissionReplayGuard::with_defaults();
+        // Flags and registration both say server-streaming; the proof
+        // says duplex.
+        let bytes = cross_org_stream_proof_at(
+            CALL_ID,
+            binding,
+            (crate::adapter::net::behavior::org::current_timestamp() + 20) * 1_000_000_000,
+            crate::adapter::net::behavior::org_call::STREAM_CALL_KIND_DUPLEX,
+        )
+        .encode()
+        .expect("encode");
+        assert_eq!(
+            verify_org_admission(
+                &ctx,
+                &[&bytes],
+                &replay,
+                ClockSample::now(),
+                || true,
+                |_| true
+            ),
+            Err(AdmissionDenied::ShapeMismatch),
+            "step 4(c): a kind naming another shape is ShapeMismatch",
+        );
+    }
+
+    /// Step 9b, at its own step (CORE-6): the session fence refuses
+    /// `SessionBindingMismatch` — never `Replay`, never `BindingInvalid` —
+    /// both when the receiving session carries a DIFFERENT binding and
+    /// when it is hand-built (`None`), and the refusal runs BEFORE the
+    /// replay insert: the same opening still admits on the session its
+    /// proof binds.
+    #[test]
+    fn step_9b_session_binding_mismatch_is_refused_before_the_replay_insert() {
+        let floors = empty_floors();
+        let binding = [0x5Au8; 32];
+        let other_binding = [0xA5u8; 32];
+        let caller_entity = caller().entity_id().clone();
+        let provider_entity = provider();
+        let replay = AdmissionReplayGuard::with_defaults();
+        let bytes = cross_org_stream_proof(CALL_ID, binding)
+            .encode()
+            .expect("encode");
+
+        // (a) a REPLACED session: the receiving binding differs from the
+        //     one the proof names.
+        let ctx_other =
+            cross_org_stream_ctx(&floors, &caller_entity, &provider_entity, other_binding);
+        assert_eq!(
+            verify_org_admission(
+                &ctx_other,
+                &[&bytes],
+                &replay,
+                ClockSample::now(),
+                || true,
+                |_| true
+            ),
+            Err(AdmissionDenied::SessionBindingMismatch),
+            "step 9b(a): a foreign session binding is SessionBindingMismatch",
+        );
+
+        // (b) a hand-built session: no Noise handshake hash at all can
+        //     never admit a protected stream.
+        let mut ctx_hand_built =
+            cross_org_stream_ctx(&floors, &caller_entity, &provider_entity, binding);
+        ctx_hand_built.session_binding = None;
+        assert_eq!(
+            verify_org_admission(
+                &ctx_hand_built,
+                &[&bytes],
+                &replay,
+                ClockSample::now(),
+                || true,
+                |_| true
+            ),
+            Err(AdmissionDenied::SessionBindingMismatch),
+            "step 9b(b): a hand-built session is SessionBindingMismatch",
+        );
+
+        // (c) both refusals landed BEFORE the replay insert: the opening
+        //     still admits on the session its proof binds — a consumed
+        //     replay slot would refuse it `Replay` instead.
+        let ctx_bound = cross_org_stream_ctx(&floors, &caller_entity, &provider_entity, binding);
+        let admitted = verify_org_admission(
+            &ctx_bound,
+            &[&bytes],
+            &replay,
+            ClockSample::now(),
+            || true,
+            |_| true,
+        );
+        assert!(
+            admitted.is_ok(),
+            "step 9b runs before the replay insert: {admitted:?}",
+        );
     }
 
     #[test]
@@ -1722,7 +1837,12 @@ mod tests {
         //      proof is refused as `ProofExpired` (the credential checks
         //      run BEFORE the recheck), not `AuthorityChanged`.
         let ctx = cross_org_stream_ctx(&floors, &caller_entity, &provider_entity, binding);
-        let expired = cross_org_stream_proof_at(CALL_ID, binding, 1);
+        let expired = cross_org_stream_proof_at(
+            CALL_ID,
+            binding,
+            1,
+            crate::adapter::net::behavior::org_call::STREAM_CALL_KIND_SERVER_STREAMING,
+        );
         let expired_bytes = expired.encode().expect("encode");
         assert_eq!(
             verify_org_admission(
