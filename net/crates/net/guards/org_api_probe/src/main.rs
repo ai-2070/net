@@ -612,7 +612,10 @@ async fn pin_org_stream_wrappers(
     let _sink_close: Result<(), OrgSdkError> = sink.finish_sending().await;
 }
 
-fn main() {
+/// The probe body — moved verbatim out of `main` so the test harness can
+/// EXECUTE it (TESTS-6: CI runs `cargo check` + `cargo test` on this crate,
+/// and a runtime assert sealed inside a never-run `main` is not a witness).
+fn probe() {
     // Constructed for real, not merely type-checked: no mesh, no runtime, no
     // node. These are the literals ledger rows C1/C3 break.
     let options = pin_call_options();
@@ -664,4 +667,299 @@ fn main() {
         handler_error,
         unrun.len(),
     );
+}
+
+fn main() {
+    probe();
+}
+
+#[cfg(test)]
+mod repair_witnesses {
+    //! TESTS-5 + TESTS-6 — the probe's two missing halves.
+    //!
+    //! TESTS-6: every runtime claim this crate makes now EXECUTES. CI pinned
+    //! the probe with `cargo check` alone, which compiles the pins — and the
+    //! one `assert!` inside [`super::pin_rpc_streaming_context`] — without
+    //! ever running them; the behavioral claim ("the constructor fabricates
+    //! no admitted org facts") rested on a never-executed assert.
+    //!
+    //! TESTS-5: `MANIFEST` (the pin inventory) is BOUND to the pins in
+    //! `main.rs` in both directions, with a pin-count floor. Before this, the
+    //! two drifted silently in one direction already — names pinned here and
+    //! absent from `MANIFEST`. The binding is LEXICAL, in the honest sense
+    //! `check-roster.py` documents for itself:
+    //!
+    //! * code → manifest: every `net::…` / `net_sdk::…` path this file names
+    //!   (brace-group `use` lists expanded, comments and string literals
+    //!   stripped) must be covered by a MANIFEST line — the exact name, a
+    //!   `Type::method` pin under it, or the item a pinned `::Variant` path
+    //!   extends. This is the direction the filed defect broke in.
+    //! * manifest → code: every MANIFEST line must still be reached by the
+    //!   pinned code — an extracted path that is the name itself or a
+    //!   `…::Variant` extension of it, or the name's final segment standing
+    //!   in the code as a whole word outside comments and strings (a middle
+    //!   `a::leaf::b` path segment does NOT count, and a turbofish
+    //!   `Type::method::<…>` is not a segment continuation, so `net_sdk::
+    //!   org::…` cannot witness a pin named `…::org` while `Mesh::org` is
+    //!   witnessed by its real value reference). A method pin whose spelling
+    //!   shares a word with unrelated code could still pass this direction —
+    //!   that is the stated limit of a lexical check, not a claim of
+    //!   parse-level equality.
+    //! * floor: the inventory's size is floored at the post-repair count, so
+    //!   a deletion that keeps both sides "in sync" still reddens.
+
+    use super::*;
+    use std::collections::BTreeSet;
+
+    const MANIFEST: &str = include_str!("../MANIFEST");
+    const SOURCE: &str = include_str!("main.rs");
+
+    /// The inventory's size after the TESTS-5 repair: the 66 names the review
+    /// counted, plus the eight this file pinned and `MANIFEST` missed
+    /// (`MeshNode`, `Bytes`, the `RequestStream`/`RpcResponseSink` pair and
+    /// the `ClientStreamCallRaw`/`DuplexCallRaw`/`RpcStream` trio, and the
+    /// `net_sdk::org::OrgRevocationState` spelling of the floors type). Any
+    /// future shrink must pass this floor deliberately.
+    const PIN_COUNT_FLOOR: usize = 74;
+
+    #[test]
+    fn manifest_lists_exactly_the_names_this_probe_pins() {
+        let code = strip_comments_and_strings(SOURCE);
+        let pinned = extract_net_paths(&code);
+        let manifest: Vec<&str> = MANIFEST
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+
+        let mut seen = BTreeSet::new();
+        for m in &manifest {
+            assert!(
+                seen.insert(*m),
+                "MANIFEST lists `{m}` more than once — the inventory is one name per line"
+            );
+        }
+
+        // code -> manifest: a name pinned here must be named there.
+        for p in &pinned {
+            assert!(
+                manifest.iter().any(|m| {
+                    *m == p.as_str()
+                        || m.starts_with(&format!("{p}::"))
+                        || p.starts_with(&format!("{m}::"))
+                }),
+                "main.rs pins `{p}` but MANIFEST names neither it nor a method/variant \
+                 of it — add `{p}` to MANIFEST (the filed TESTS-5 defect is exactly \
+                 this direction)"
+            );
+        }
+
+        // manifest -> code: a name inventoried there must still be pinned
+        // here — either an extracted path reaches it (the exact name or a
+        // `…::Variant` extension of it), or its final segment stands in the
+        // code as a real name (see `leaf_witnessed`, and its stated limits).
+        for m in &manifest {
+            let extended = pinned
+                .iter()
+                .any(|p| p.as_str() == *m || p.starts_with(&format!("{m}::")));
+            assert!(
+                extended || leaf_witnessed(&code, m),
+                "MANIFEST names `{m}` but no pinned code reaches or mentions its name — \
+                 restore the pin or remove the line from MANIFEST"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_holds_the_pin_count_floor() {
+        let count = MANIFEST
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .count();
+        assert!(
+            count >= PIN_COUNT_FLOOR,
+            "MANIFEST holds {count} pins, floor is {PIN_COUNT_FLOOR} — a mass \
+             deletion that stays self-consistent must not pass; lower the floor \
+             deliberately or restore the pins"
+        );
+    }
+
+    /// TESTS-6's named behavioral claim (ledger C1 / Q2): the stable
+    /// `RpcStreamingContext` constructor creates NO admitted org facts —
+    /// admission facts originate at the verifier.
+    #[test]
+    fn rpc_streaming_context_new_fabricates_no_admitted_org_facts() {
+        let context = pin_rpc_streaming_context();
+        assert!(
+            context.org_admission.is_none(),
+            "RpcStreamingContext::new must create no admitted org facts",
+        );
+    }
+
+    /// TESTS-6: the whole probe body executes — every construction, every
+    /// exhaustive match, and the runtime asserts sealed inside the pins.
+    #[test]
+    fn the_probe_body_executes_in_the_test_harness() {
+        probe();
+    }
+
+    /// Comments, string literals and CHAR literals blanked (contents removed,
+    /// delimiters and newlines kept, so offsets stay honest). `//` inside a
+    /// string does not start a comment, `"` inside a comment does not start a
+    /// string, and `'x'` / `'\''` char literals — which this very file
+    /// contains — do not smuggle a `"` into string state (a lifetime like
+    /// `'a` passes through untouched).
+    fn strip_comments_and_strings(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\''
+                && (src[i..].starts_with("'\\")
+                    || (i + 2 < b.len() && b[i + 2] == b'\'' && b[i + 1] != b'\n'))
+            {
+                out.push(' ');
+                i += 1;
+                if i < b.len() && b[i] == b'\\' {
+                    i += 1;
+                }
+                if i < b.len() {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'\'' {
+                    i += 1;
+                }
+                continue;
+            }
+            match b[i] {
+                b'"' => {
+                    out.push('"');
+                    i += 1;
+                    while i < b.len() {
+                        match b[i] {
+                            b'\\' => {
+                                out.push(' ');
+                                i += 2;
+                            }
+                            b'"' => {
+                                out.push('"');
+                                i += 1;
+                                break;
+                            }
+                            _ => {
+                                if b[i] == b'\n' {
+                                    out.push('\n');
+                                } else {
+                                    out.push(' ');
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    out.push(src[i..].chars().next().expect("non-empty remainder"));
+                    i += src[i..].chars().next().expect("non-empty remainder").len_utf8();
+                }
+            }
+        }
+        out
+    }
+
+    /// Every `net::…` / `net_sdk::…` path in the stripped source, with
+    /// brace-group `use` lists (`prefix::{a, b}`) expanded to `prefix::a`,
+    /// `prefix::b`.
+    fn extract_net_paths(code: &str) -> BTreeSet<String> {
+        let b = code.as_bytes();
+        let mut out = BTreeSet::new();
+        let mut i = 0;
+        while i < b.len() {
+            if !(b[i].is_ascii_alphabetic() || b[i] == b'_') {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let mut segs: Vec<&str> = vec![&code[start..i]];
+            loop {
+                if !code[i..].starts_with("::") {
+                    break;
+                }
+                let after = &code[i + 2..];
+                if after.starts_with('{') {
+                    let end = after.find('}').expect("balanced use brace group");
+                    for entry in after[1..end].split(',') {
+                        let entry = entry.trim();
+                        if entry.is_empty() {
+                            continue;
+                        }
+                        let first = entry.split("::").next().expect("non-empty entry");
+                        let p = format!("{}::{first}", segs.join("::"));
+                        if p.starts_with("net::") || p.starts_with("net_sdk::") {
+                            out.insert(p);
+                        }
+                    }
+                    i += 2 + end + 1;
+                    segs.clear();
+                    break;
+                }
+                let seg_start = i + 2;
+                let mut j = seg_start;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                if j == seg_start {
+                    break; // turbofish `::<…>` or dangling `::`: the path ends
+                }
+                segs.push(&code[seg_start..j]);
+                i = j;
+            }
+            if !segs.is_empty() {
+                let p = segs.join("::");
+                if p.starts_with("net::") || p.starts_with("net_sdk::") {
+                    out.insert(p);
+                }
+            }
+        }
+        out
+    }
+
+    /// The manifest line's final segment appears in the pinned code as a
+    /// whole word — as a final path segment, a method reference/call, or a
+    /// bare name — but NOT as a middle `a::leaf::b` segment (so `net_sdk::
+    /// org::OrgId` cannot witness a pin named `…::org`). A turbofish
+    /// `Type::method::<…>` is NOT a middle segment: what follows the `::`
+    /// must be an identifier for the segment to continue.
+    fn leaf_witnessed(code: &str, manifest_line: &str) -> bool {
+        let leaf = manifest_line.rsplit("::").next().expect("non-empty name");
+        let bytes = code.as_bytes();
+        let mut from = 0;
+        while let Some(off) = code[from..].find(leaf) {
+            let at = from + off;
+            let before_ok =
+                at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            let after = at + leaf.len();
+            let after_ok = after >= bytes.len()
+                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+            let continues_segment = code[after..]
+                .strip_prefix("::")
+                .is_some_and(|rest| {
+                    rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                });
+            let middle_segment = code[..at].ends_with("::") && continues_segment;
+            if before_ok && after_ok && !middle_segment {
+                return true;
+            }
+            from = after;
+        }
+        false
+    }
 }

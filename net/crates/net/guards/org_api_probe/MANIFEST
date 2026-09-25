@@ -64,3 +64,11 @@ net::adapter::net::behavior::org_revocation::OrgRevocationState
 net::adapter::net::identity::EntityId
 net_sdk::org::OrgId
 net_sdk::org::CapabilityAuthorityId
+net::adapter::net::MeshNode
+net::adapter::net::cortex::rpc::RequestStream
+net::adapter::net::cortex::rpc::RpcResponseSink
+net::adapter::net::mesh_rpc::ClientStreamCallRaw
+net::adapter::net::mesh_rpc::DuplexCallRaw
+net::adapter::net::mesh_rpc::RpcStream
+net_sdk::Bytes
+net_sdk::org::OrgRevocationState
