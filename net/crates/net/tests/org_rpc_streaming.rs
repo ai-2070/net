@@ -453,6 +453,83 @@ async fn frozen_old_provider_refuses_stream_proof_with_not_supported() {
     }
 }
 
+/// §1.4's OTHER half (TESTS-1) — the FROZEN old provider (`85ecc77c9`:
+/// [`frozen_85ecc77c9`]) ADMITS a well-formed UNARY opening minted by the new
+/// caller's real shared mint helper: [`FrozenYield::Admitted`] with the exact
+/// five-field attribution. Without this half the vendored chain is only ever
+/// observed DENYING, so a deny-everything mutation of `verify_org_admission`
+/// (or of `frozen_opening`) stays green beside the refusal witness above.
+/// If the frozen path refuses a well-formed unary, §1.4's compatibility claim
+/// is false in the admitting direction too — STOP and report it.
+#[test]
+fn frozen_old_provider_admits_a_well_formed_unary() {
+    use frozen_85ecc77c9::old_org_admission as old_adm;
+    use frozen_85ecc77c9::{frozen_opening, FrozenYield};
+
+    let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+    let caller_kp = EntityKeypair::from_bytes([0x24u8; 32]);
+    let provider = net::adapter::net::identity::EntityId::from_bytes([0x99u8; 32]);
+    let intent =
+        fixture::owner_delegated_intent(caller_kp.clone(), &org_b, provider.clone(), SERVICE);
+
+    // The old provider's well-formed call: the REAL shared mint helper, UNARY
+    // shape, no streaming flag and no session binding — exactly the v0.4
+    // caller the vendored chain was built to serve.
+    let req = fixture::opening_request(SERVICE, 0, b"open");
+    let (_name, bytes) = test_sign_admission_proof(&intent, CALL_ID, &req, RpcCallShape::Unary, None)
+        .expect("mint the unary proof header");
+    let digest = org_request_digest(&req).expect("request digest");
+    let caller_entity = caller_kp.entity_id().clone();
+    let floors = OrgRevocationState::empty();
+    let frozen_ctx = old_adm::AdmissionContext {
+        mode: old_adm::OrgAdmission::OwnerDelegated,
+        authenticated_caller: &caller_entity,
+        provider: &provider,
+        provider_owner_org: org_b.org_id(),
+        invoked_capability: cap(),
+        call_id: CALL_ID,
+        request_digest: digest,
+        // Overwritten by the verbatim frozen flag derivation inside
+        // `frozen_opening` (the frozen path owns this decision).
+        is_unary: true,
+        floors: &floors,
+        skew_secs: 0,
+    };
+
+    let replay = AdmissionReplayGuard::with_defaults();
+    match frozen_opening(
+        &req,
+        frozen_ctx,
+        &[&bytes],
+        &replay,
+        ClockSample::now(),
+        |_| true,
+    ) {
+        FrozenYield::Admitted(admitted) => {
+            // THE ADMITTED ARM, asserted: the full four-party attribution the
+            // frozen verifier must carry out unchanged.
+            assert_eq!(
+                *admitted,
+                old_adm::Admitted {
+                    caller: caller_entity,
+                    acting_org: org_b.org_id(),
+                    provider_org: org_b.org_id(),
+                    provider,
+                    capability: cap(),
+                },
+                "the frozen old provider admits the well-formed unary with exact \
+                 five-field attribution",
+            );
+        }
+        other => panic!(
+            "STOP (§1.4): the frozen path yielded {:?} for a well-formed unary, \
+             not Admitted — the old-provider admission half of the prefix design \
+             is false; report it, do not patch",
+            yield_debug(&other),
+        ),
+    }
+}
+
 fn yield_debug(y: &frozen_85ecc77c9::FrozenYield) -> String {
     match y {
         frozen_85ecc77c9::FrozenYield::Admitted(a) => format!("Admitted({a:?})"),

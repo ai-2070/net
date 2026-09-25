@@ -470,6 +470,17 @@ required-features = ["cli"]
 name = "subnet_auth_e2e"
 required-features = ["net", "cortex", "fixtures"]
 
+# The protected server-streaming estate (tests/org_rpc_streaming.rs). Its
+# whole body is gated `#![cfg(all(feature = "net", feature = "cortex",
+# feature = "fixtures"))]`, so a feature-incomplete invocation built a 0-test
+# binary and exited 0 — the entire witness estate silently vanishing into a
+# vacuous green (TESTS-7). `required-features` moves that contract into the
+# target: an invocation missing a feature now SKIPS (or, with an explicit
+# `--test` request, refuses) instead of passing empty.
+[[test]]
+name = "org_rpc_streaming"
+required-features = ["net", "cortex", "fixtures"]
+
 [[test]]
 name = "handshake_retry_resync"
 required-features = ["net"]
