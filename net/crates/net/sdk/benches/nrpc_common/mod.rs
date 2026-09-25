@@ -772,7 +772,8 @@ pub async fn call_raw_direct_retrying(pair: &Pair, body: Bytes) -> Bytes {
 ///
 /// The intent is cloned per call because `CallOptions` owns it. That is
 /// the production shape, not a bench tax: the facade's own caller builds a
-/// fresh intent for every call (`sdk/src/org/call.rs:241`).
+/// fresh intent for every call (`sdk/src/org/call.rs`: `plan` →
+/// `intent_for`, :896/:1597).
 pub async fn call_protected_raw(pair: &Pair, body: Bytes) -> Bytes {
     let opts = CallOptions {
         org_proof_intent: Some(
