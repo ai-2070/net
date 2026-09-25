@@ -117,6 +117,12 @@ pub struct Profile {
     /// Absent preserves the command's existing loopback or wildcard default.
     #[serde(default)]
     pub bind: Option<String>,
+
+    /// Blind relay (`host:port`) an `up --enroll` node registers with, so
+    /// joiners that cannot reach it directly fall back to the relay. Explicit
+    /// `--relay` / `--no-relay` win.
+    #[serde(default)]
+    pub relay: Option<String>,
 }
 
 impl ConfigFile {

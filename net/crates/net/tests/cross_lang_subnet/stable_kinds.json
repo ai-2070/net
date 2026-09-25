@@ -26,13 +26,15 @@
     "invalid_signature",
     "invalid_format",
     "invalid_validity_window",
-    "clock_skew_too_large"
+    "clock_skew_too_large",
+    "state_not_persisted"
   ],
   "fact_kinds": [
     "descriptor",
     "gateway_advertisement",
     "export_policy",
-    "revocation_floor"
+    "revocation_floor",
+    "subject_floor"
   ],
   "local_kinds": [
     "empty_export_name",

@@ -30,6 +30,10 @@ rtc-bootstrap = ["webrtc", "net-sdk/rtc-bootstrap"]
 # `set-value` subcommand is always present; without this feature it returns a
 # clear "rebuild with --features keychain" error instead of silently missing.
 keychain = ["net-mesh-mcp/keychain"]
+# TEST ONLY: compiles the core's crash-injection points at the enrollment
+# storage's durable-write transitions (`NET_MESH_FIXTURE_CRASH`), exercised by
+# `tests/enrollment_crash.rs`. Never enable it in a shipped build.
+fixtures = ["net/fixtures"]
 
 [dependencies]
 # The low-level core crate, for the OFFLINE subnet issuance verbs (SSDK
@@ -42,6 +46,8 @@ net = { package = "net-mesh", version = "0.36.0", path = "..", default-features 
 net-sdk = { package = "net-mesh-sdk", version = "0.36.0", path = "../sdk", default-features = false, features = [
     "net",
     "nat-traversal",
+    # `up --enroll` asks the router to forward its port (UPnP / NAT-PMP / PCP).
+    "port-mapping",
     "cortex",
     "compute",
     "groups",
@@ -102,6 +108,14 @@ indicatif = "0.18"
 # levels. Format pinned to compact for stderr.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing = "0.1"
+
+# `net-mesh up` local control: keyed-BLAKE3 mutual authentication of the
+# per-run control secret, and CSPRNG for that secret, the run incarnation and
+# a generated trust-domain PSK. Both versions are already in the workspace.
+blake3 = "1"
+getrandom = "0.4"
+# The SDK enrollment ledger handle (`SharedLedger`) is a parking_lot mutex.
+parking_lot = "0.12"
 
 # XDG paths + TOML for the config + identity stores.
 dirs = "7"

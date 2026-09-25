@@ -78,6 +78,19 @@ impl InvitationPolicy {
         })
     }
 
+    /// Rebuild a persisted policy; `None` unless the expiry follows creation.
+    pub(crate) fn from_stored(
+        created_at: u64,
+        expires_at: u64,
+        approval: ApprovalMode,
+    ) -> Option<Self> {
+        (expires_at > created_at).then_some(Self {
+            created_at,
+            expires_at,
+            approval,
+        })
+    }
+
     /// Creation time in Unix seconds.
     pub fn created_at(&self) -> u64 {
         self.created_at

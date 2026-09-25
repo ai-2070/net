@@ -14,7 +14,7 @@ use net::adapter::net::identity::EntityId;
 use net::adapter::net::subnet::auth::verify_credential_set;
 use net::adapter::net::subnet::{
     SubnetAuthorityConfig, SubnetControlFact, SubnetCredentialSet, SubnetFloorRegistry,
-    SubnetIssuerGrant,
+    SubnetIssuerGrant, SubnetRights,
 };
 use std::path::Path;
 use std::process::Command;
@@ -431,4 +431,82 @@ fn control_facts_frame_correctly_and_inspect_classifies_artifacts() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!all.contains(&seed_hex), "inspect must never print a seed");
+}
+
+/// A subject floor removes exactly the named rights of one full subject:
+/// ATTACH by default, others only when named. The receipt says what
+/// issuing did (signed) and what it did not (enforcement is pending until
+/// each verifier applies it), and a floor that removes nothing is refused.
+#[test]
+fn subject_floor_issuance_is_exact_and_reports_enforcement_as_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = subnet_keygen(dir.path(), "root.toml");
+    let root = entity_of(&key);
+    let authority_hex = toml_field(&key, "entity_id_hex");
+    let issue = |out: &Path, extra: &[&str]| {
+        Command::cargo_bin("net-mesh")
+            .unwrap()
+            .args([
+                "--output",
+                "json",
+                "subnet",
+                "issue-control-fact",
+                "subject-floor",
+            ])
+            .arg("--root-key")
+            .arg(&key)
+            .args(["--authority", &authority_hex])
+            .args(["--scope", "3.7", "--topology-epoch", "0", "--revision", "1"])
+            .args(["--subject", SUBJECT_HEX])
+            .args(extra)
+            .arg("--out")
+            .arg(out)
+            .output()
+            .unwrap()
+    };
+
+    let out = dir.path().join("b.subject-floor");
+    let run = issue(&out, &["--minimum-generation", "2"]);
+    assert!(run.status.success(), "{run:?}");
+    let receipt: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    assert_eq!(receipt["kind"], "subject_floor");
+    assert_eq!(receipt["subject_hex"], SUBJECT_HEX);
+    assert_eq!(receipt["rights"], "attach", "ATTACH only unless named");
+    assert!(
+        receipt["enforcement"]
+            .as_str()
+            .unwrap()
+            .starts_with("pending"),
+        "issuing is not enforcement: {receipt}"
+    );
+    let fact = SubnetControlFact::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    let SubnetControlFact::SubjectFloor(floor) = &fact else {
+        panic!("expected a subject floor, got {:?}", fact.kind());
+    };
+    floor.verify().expect("signed by the root");
+    assert_eq!(floor.issuer, root);
+    assert_eq!(floor.rights, SubnetRights::ATTACH);
+    assert_eq!(floor.minimum_generation, 2);
+    assert_eq!(hex::encode(floor.subject.as_bytes()), SUBJECT_HEX);
+
+    let wider = dir.path().join("b.route.subject-floor");
+    let run = issue(
+        &wider,
+        &["--minimum-generation", "2", "--rights", "attach,route"],
+    );
+    assert!(run.status.success(), "{run:?}");
+    let SubnetControlFact::SubjectFloor(floor) =
+        SubnetControlFact::from_bytes(&std::fs::read(&wider).unwrap()).unwrap()
+    else {
+        panic!("expected a subject floor");
+    };
+    assert_eq!(
+        floor.rights,
+        SubnetRights::ATTACH.union(SubnetRights::ROUTE)
+    );
+
+    let none = dir.path().join("nothing.subject-floor");
+    let run = issue(&none, &["--minimum-generation", "0"]);
+    assert_eq!(run.status.code(), Some(2), "{run:?}");
+    assert!(!none.exists());
 }

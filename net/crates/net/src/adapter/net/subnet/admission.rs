@@ -207,6 +207,22 @@ impl SubnetContextStore {
         self.by_peer.remove(&node_id);
     }
 
+    /// Drop `node_id`'s context only if it is the admission at exactly
+    /// `attachment` under `authority` (a peer's self-withdrawal names one
+    /// admission; any other stays). Returns whether one was dropped.
+    pub fn forget_if_at(
+        &self,
+        node_id: u64,
+        authority: &EntityId,
+        attachment: super::TopologySubnetId,
+    ) -> bool {
+        self.by_peer
+            .remove_if(&node_id, |_, ctx| {
+                &ctx.authority == authority && ctx.attachment == attachment
+            })
+            .is_some()
+    }
+
     /// Drop contexts whose authority auth epoch is behind `current` —
     /// the off-path invalidation an accepted revocation floor
     /// triggers. Returns how many were dropped.
@@ -215,6 +231,40 @@ impl SubnetContextStore {
             .by_peer
             .iter()
             .filter(|e| &e.value().authority == authority && e.value().subnet_auth_epoch < current)
+            .map(|e| *e.key())
+            .collect();
+        for node_id in &stale {
+            self.by_peer.remove(node_id);
+        }
+        stale.len()
+    }
+
+    /// Drop only `subject`'s contexts under `authority` that a subject
+    /// floor now covers (attachment at/under a floored scope, for a
+    /// right the context holds). Every other peer's context — every
+    /// sibling — is left exactly as it was: no re-admission, no churn.
+    /// Returns how many were dropped.
+    pub fn invalidate_subject(
+        &self,
+        authority: &EntityId,
+        subject: &EntityId,
+        floors: &super::auth::SubnetFloorRegistry,
+    ) -> usize {
+        let stale: Vec<u64> = self
+            .by_peer
+            .iter()
+            .filter(|e| {
+                let c = e.value();
+                &c.authority == authority
+                    && &c.subject == subject
+                    && floors.subject_covers(
+                        authority,
+                        c.topology_epoch,
+                        subject,
+                        c.attachment,
+                        c.rights,
+                    )
+            })
             .map(|e| *e.key())
             .collect();
         for node_id in &stale {

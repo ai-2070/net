@@ -258,6 +258,7 @@ pub fn fact_kind_wire(kind: SubnetFactKind) -> &'static str {
         SubnetFactKind::GatewayAdvertisement => "gateway_advertisement",
         SubnetFactKind::ExportPolicy => "export_policy",
         SubnetFactKind::RevocationFloor => "revocation_floor",
+        SubnetFactKind::SubjectFloor => "subject_floor",
     }
 }
 
@@ -341,7 +342,7 @@ pub mod dto {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SubnetControlOutcomeDto {
         /// `"descriptor" | "gateway_advertisement" | "export_policy" |
-        /// "revocation_floor"`.
+        /// "revocation_floor" | "subject_floor"`.
         pub kind: String,
         /// Whether any state changed.
         pub applied: bool,

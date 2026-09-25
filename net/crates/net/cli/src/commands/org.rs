@@ -77,6 +77,184 @@ pub enum OrgCommand {
     /// DACL on Windows); only its commitment rides in the signed
     /// grant (the raw key never touches the wire).
     GrantCapability(GrantCapabilityArgs),
+    /// Mint the org's shared owner audience once: the key every member uses
+    /// to open (and be found in) the org's private announcements. Written
+    /// owner-only; keep it with the org root. `org approve --audience` and
+    /// `node adopt --audience` hand it to members.
+    AudienceKeygen(OrgAudienceKeygenArgs),
+    /// Approve a device's pending org invite: sign its membership
+    /// certificate here, with the offline org root, for exactly the device
+    /// that claimed the invite, and hand it to the running enrolling node,
+    /// which delivers it. The root key never reaches a node.
+    Approve(OrgApproveArgs),
+    /// Create a standalone org link: org membership only, for a device
+    /// already on this mesh, redeemed over its session with this node.
+    /// Always approval-gated (`org approve`).
+    Invite(OrgInviteArgs),
+    /// Join an org with a standalone link, through this device's running
+    /// `up`. Until the operator approves, the node keeps asking by itself;
+    /// once issued it adopts the membership and installs it live.
+    Join(OrgJoinArgs),
+    /// Remove one member: sign a floor here with the org root (every
+    /// membership certificate of that member below `--minimum-generation`
+    /// is revoked) and have each named node apply it. Reported per node
+    /// from that node's own signed attestation; `complete` only when every
+    /// named node attested the floor applied and persisted. Nodes not named
+    /// are never assumed.
+    Remove(OrgRemoveArgs),
+    /// Leave this device's org: record it durably, then stop the running
+    /// node; its next `up` runs on the mesh without the org. Local only —
+    /// the org still accepts this device's certificate until `org remove`.
+    /// Rejoining takes a new link approved with the org root.
+    Leave(OrgLeaveArgs),
+    /// What the node of `--state-dir` issued for this org (when it enrolls)
+    /// and each member's standing against its own floors — explicitly not a
+    /// claim about other nodes or about activity.
+    Members(OrgMembersArgs),
+}
+
+/// `org members` arguments.
+#[derive(Args, Debug)]
+pub struct OrgMembersArgs {
+    /// The org (its 64-hex org id).
+    pub org: String,
+    /// State directory of the node to ask (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Also ask these nodes for each issued member's standing there (signed
+    /// observations): `self` or `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`.
+    /// Needs `--org-key`: only the org may read its inventory.
+    #[arg(long = "verifier", value_name = "NODE", requires = "org_key")]
+    pub verifiers: Vec<String>,
+    /// The org root key file that signs the requests (stays here).
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: Option<PathBuf>,
+    /// How long to wait for each node's answer.
+    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = crate::humantime::parse_duration)]
+    pub wait: std::time::Duration,
+    /// Accept a group/world-readable org key file (Unix).
+    #[arg(long)]
+    pub insecure_permissions: bool,
+}
+
+/// `org leave` arguments.
+#[derive(Args, Debug)]
+pub struct OrgLeaveArgs {
+    /// State directory of this device (as given to `join` and `up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// How long to wait for a running node to stop after recording.
+    #[arg(long, value_name = "DURATION", default_value = "15s", value_parser = crate::humantime::parse_duration)]
+    pub wait: std::time::Duration,
+}
+
+/// `org remove` arguments.
+#[derive(Args, Debug)]
+pub struct OrgRemoveArgs {
+    /// The member's full 64-hex entity id.
+    pub member: String,
+    /// The org root key file (`org keygen`); stays on this machine.
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: PathBuf,
+    /// Revoke every certificate of the member below this generation.
+    /// Re-admission later needs `org approve --generation` at or above it.
+    #[arg(long, value_name = "N")]
+    pub minimum_generation: u32,
+    /// A node to apply the floor at: `self` (the node of `--state-dir`) or
+    /// `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`. Repeat for each enforcement
+    /// point.
+    #[arg(long = "verifier", value_name = "NODE", required = true)]
+    pub verifiers: Vec<String>,
+    /// State directory of the operator's running node, which carries the
+    /// requests (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// How long to wait for each node's answer.
+    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = crate::humantime::parse_duration)]
+    pub wait: std::time::Duration,
+    /// Show what would be signed and asked, without signing or sending.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Accept a group/world-readable org key file (Unix).
+    #[arg(long)]
+    pub insecure_permissions: bool,
+}
+
+/// `org audience-keygen` arguments.
+#[derive(Args, Debug)]
+pub struct OrgAudienceKeygenArgs {
+    /// The org root key file (names the org the audience belongs to).
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: PathBuf,
+    /// Where to write the audience (a new owner-only file).
+    #[arg(long, value_name = "PATH")]
+    pub out: PathBuf,
+    /// Accept a group/world-readable org key file (Unix).
+    #[arg(long)]
+    pub insecure_permissions: bool,
+}
+
+/// `org approve` arguments.
+#[derive(Args, Debug)]
+pub struct OrgApproveArgs {
+    /// Offer id from `invite create` / `invite status`.
+    pub offer_id: String,
+    /// The full 64-hex device entity you expect to approve; must match the
+    /// pending claim.
+    #[arg(long, value_name = "ENTITY")]
+    pub subject: String,
+    /// The org root key file (`org keygen`); stays on this machine.
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: PathBuf,
+    /// Membership generation (raise it to re-admit after a revocation floor).
+    #[arg(long, default_value_t = 0)]
+    pub generation: u32,
+    /// The org's shared owner audience (`org audience-keygen`), delivered
+    /// with the membership so the device can discover other members'
+    /// private services. Without it the device's audience is node-local.
+    #[arg(long, value_name = "PATH")]
+    pub audience: Option<PathBuf>,
+    /// Membership certificate lifetime in seconds.
+    #[arg(long = "ttl-secs", default_value_t = ORG_CERT_TTL_SECS_RECOMMENDED)]
+    pub ttl_secs: u64,
+    /// Accept a group/world-readable org key file (Unix).
+    #[arg(long)]
+    pub insecure_permissions: bool,
+    /// State directory of the enrolling node (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+}
+
+/// `org invite` arguments.
+#[derive(Args, Debug)]
+pub struct OrgInviteArgs {
+    /// The org (its 64-hex org id).
+    pub org: String,
+    /// State directory of the enrolling node (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Lifetime of the unredeemed link (default 24h).
+    #[arg(long, value_name = "DURATION", value_parser = crate::humantime::parse_duration)]
+    pub ttl: Option<std::time::Duration>,
+    /// Bind the link to one device's full 64-hex entity id.
+    #[arg(long = "for", value_name = "ENTITY")]
+    pub for_subject: Option<String>,
+    /// Write the link to this new owner-only file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    pub out: Option<PathBuf>,
+}
+
+/// `org join` arguments.
+#[derive(Args, Debug)]
+pub struct OrgJoinArgs {
+    /// The standalone org link, or `-` to read it from stdin (then `--yes`).
+    pub token: String,
+    /// State directory of this device's running `net-mesh up`.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Skip the interactive confirmation (scripts and agent tool use).
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -388,7 +566,430 @@ pub async fn run(
         OrgCommand::IssueFloors(args) => run_issue_floors(args, output).await,
         OrgCommand::GrantDispatcher(args) => run_grant_dispatcher(args, output).await,
         OrgCommand::GrantCapability(args) => run_grant_capability(args, output).await,
+        OrgCommand::AudienceKeygen(args) => run_audience_keygen(args, output).await,
+        OrgCommand::Approve(args) => run_approve(args, output, profile_name).await,
+        OrgCommand::Invite(args) => {
+            super::enrollment::run_invite(
+                super::enrollment::InviteCommand::Create(super::enrollment::CreateArgs {
+                    state_dir: args.state_dir,
+                    ttl: args.ttl,
+                    require_approval: true,
+                    for_subject: args.for_subject,
+                    out: args.out,
+                    addr: None,
+                    subnet: None,
+                    subnet_rights: None,
+                    org: Some(args.org),
+                    channel: None,
+                    channel_rights: None,
+                    standalone: true,
+                }),
+                output,
+                profile_name,
+            )
+            .await
+        }
+        OrgCommand::Join(args) => run_org_join(args, output, profile_name).await,
+        OrgCommand::Remove(args) => run_remove(args, output, profile_name).await,
+        OrgCommand::Members(args) => {
+            let org = super::enrollment::parse_org_id(&args.org).map_err(invalid_args)?;
+            let remote = match (&args.org_key, args.verifiers.is_empty()) {
+                (Some(key), false) => {
+                    let keypair = load_org_key(key, args.insecure_permissions).await?;
+                    if keypair.org_id() != org {
+                        return Err(invalid_args("--org-key is the root of a different org"));
+                    }
+                    // The org root's key, as the signer the nodes verify
+                    // against the org id.
+                    let root = net::adapter::net::identity::EntityKeypair::from_bytes(
+                        *keypair.secret_bytes(),
+                    );
+                    drop(keypair);
+                    Some(super::lifecycle::RemoteMembers {
+                        root,
+                        authority: None,
+                        verifiers: args.verifiers.clone(),
+                        wait: args.wait,
+                    })
+                }
+                _ => None,
+            };
+            super::lifecycle::run_members(
+                "org",
+                hex::encode(org.0),
+                args.state_dir,
+                remote,
+                output,
+                profile_name,
+            )
+            .await
+        }
+        OrgCommand::Leave(args) => {
+            super::lifecycle::run_org_leave(args.state_dir, args.wait, output, profile_name).await
+        }
     }
+}
+
+/// `org remove`: sign the floor here, carry it through the operator's node to
+/// each named node, and report each node's verified attestation.
+async fn run_remove(
+    args: OrgRemoveArgs,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use net_sdk::org::floors::{OrgFloorAttestation, OrgFloorOutcome, OrgFloorRequest};
+    let member = parse_entity_hex(&args.member)?;
+    if args.minimum_generation == 0 {
+        return Err(invalid_args(
+            "--minimum-generation 0 revokes nothing (a floor n revokes certificates below n)",
+        ));
+    }
+    let node_dir = super::lifecycle::state_dir(args.state_dir.clone(), profile_name)?
+        .join(super::lifecycle::NODE_SUBDIR);
+    let fmt = OutputFormat::resolve_oneshot(output);
+    if args.dry_run {
+        return emit_value(
+            fmt,
+            &serde_json::json!({
+                "dry_run": true,
+                "member": hex::encode(member.as_bytes()),
+                "minimum_generation": args.minimum_generation,
+                "verifiers": args.verifiers,
+                "effect": "none: nothing was signed or sent",
+            }),
+        )
+        .map_err(|e| generic(format!("write result: {e}")));
+    }
+    // `self` is the operator's node: its entity from its authenticated status.
+    let mut targets = Vec::new();
+    for v in &args.verifiers {
+        if v == "self" {
+            let (_, status) =
+                super::lifecycle::control_call(&node_dir, serde_json::json!({ "op": "status" }))
+                    .await
+                    .map_err(|e| {
+                        crate::error::connection_failure(format!("operator node: {e:?}"))
+                    })?;
+            let entity =
+                parse_entity_hex(status["node"]["entity_id"].as_str().unwrap_or_default())?;
+            targets.push((entity, None));
+        } else {
+            let contact = super::subnet::parse_verifier(v)?;
+            targets.push((contact.entity.clone(), Some(contact)));
+        }
+    }
+    let keypair = load_org_key(&args.org_key, args.insecure_permissions).await?;
+    let mut floors = BTreeMap::new();
+    floors.insert(member.clone(), args.minimum_generation);
+    let bundle = OrgRevocationBundle::try_issue(&keypair, &floors)
+        .map_err(|e| invalid_args(format!("floor: {e}")))?;
+    let org = hex::encode(keypair.org_id().as_bytes());
+    drop(keypair);
+
+    let mut rows = Vec::with_capacity(targets.len());
+    let mut applied = 0usize;
+    for (verifier, contact) in &targets {
+        let request = OrgFloorRequest::new(&bundle, verifier.clone()).map_err(generic)?;
+        let mut call = serde_json::json!({
+            "op": "org_floor_forward",
+            "request": hex::encode(request.to_bytes()),
+            "wait_ms": args.wait.as_millis() as u64,
+        });
+        if let Some(c) = contact {
+            call["addr"] = serde_json::json!(c.addr.to_string());
+            call["noise_pubkey"] = serde_json::json!(hex::encode(c.noise_pubkey));
+        }
+        let entity = hex::encode(verifier.as_bytes());
+        let row = match super::lifecycle::control_call_within(
+            &node_dir,
+            call,
+            args.wait + std::time::Duration::from_secs(5),
+        )
+        .await
+        {
+            Err(e) => serde_json::json!({
+                "verifier": entity, "state": "no_answer", "detail": format!("operator node: {e:?}"),
+            }),
+            Ok((_, reply)) => match reply["attestation"].as_str() {
+                Some(hex_a) => match hex::decode(hex_a)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| OrgFloorAttestation::from_bytes(&b))
+                    .and_then(|a| a.verify_for(&request).map(|()| a))
+                {
+                    Ok(a) => {
+                        let floor = a.floor_of(&member);
+                        let done = a.outcome == OrgFloorOutcome::Applied
+                            && floor.is_some_and(|f| f >= args.minimum_generation);
+                        if done {
+                            applied += 1;
+                        }
+                        serde_json::json!({
+                            "verifier": entity,
+                            "state": if done { "applied" } else { a.outcome.as_str() },
+                            "floor": floor,
+                        })
+                    }
+                    Err(e) => serde_json::json!({
+                        "verifier": entity, "state": "bad_attestation", "detail": e,
+                    }),
+                },
+                None => serde_json::json!({
+                    "verifier": entity,
+                    "state": if reply["refused"].is_string() { "refused" } else { "no_answer" },
+                    "detail": reply["refused"]
+                        .as_str()
+                        .or_else(|| reply["no_answer"].as_str())
+                        .or_else(|| reply["error"].as_str()),
+                }),
+            },
+        };
+        rows.push(row);
+    }
+    emit_value(
+        fmt,
+        &serde_json::json!({
+            "org": org,
+            "member": hex::encode(member.as_bytes()),
+            "minimum_generation": args.minimum_generation,
+            "verifiers": rows,
+            "applied": applied,
+            "pending": targets.len() - applied,
+            "complete": applied == targets.len(),
+            // What removal does not do, stated rather than implied.
+            "scope": "membership only: the member's transport (the mesh PSK) and any independently granted access are unaffected; nodes not named here were not asked",
+        }),
+    )
+    .map_err(|e| generic(format!("write result: {e}")))
+}
+
+/// `org approve`: fetch the pending claim, sign its membership here with the
+/// org root, and hand the certificate to the enrolling node.
+async fn run_approve(
+    args: OrgApproveArgs,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let expected = parse_entity_hex(&args.subject)?;
+    let pending = super::enrollment::node_request(
+        args.state_dir.clone(),
+        profile_name,
+        serde_json::json!({ "op": "invite_org_pending", "offer_id": args.offer_id }),
+    )
+    .await?;
+    let claimed = parse_entity_hex(pending["subject"].as_str().unwrap_or_default())?;
+    if claimed != expected {
+        return Err(invalid_args(format!(
+            "the pending claim is from {}, not the --subject you named",
+            pending["subject"].as_str().unwrap_or_default()
+        )));
+    }
+    let keypair = load_org_key(&args.org_key, args.insecure_permissions).await?;
+    let offered = pending["org"].as_str().unwrap_or_default();
+    if hex::encode(keypair.org_id().as_bytes()) != offered {
+        return Err(invalid_args(format!(
+            "--org-key is the root of org {}, but the invite offers org {offered}",
+            hex::encode(keypair.org_id().as_bytes())
+        )));
+    }
+    let cert = OrgMembershipCert::try_issue(&keypair, claimed, args.generation, args.ttl_secs)
+        .map_err(|e| invalid_args(format!("membership certificate: {e}")))?;
+    let audience = match &args.audience {
+        Some(path) => {
+            let audience = load_org_audience(path, args.insecure_permissions).await?;
+            if audience.owner_org != keypair.org_id() {
+                return Err(invalid_args(format!(
+                    "{} is the audience of another org",
+                    path.display()
+                )));
+            }
+            Some(ScrubbedString::new(hex::encode(audience.encode_config())))
+        }
+        None => None,
+    };
+    drop(keypair);
+    let reply = super::enrollment::node_request(
+        args.state_dir,
+        profile_name,
+        serde_json::json!({
+            "op": "invite_org_approve",
+            "offer_id": args.offer_id,
+            "subject": hex::encode(expected.as_bytes()),
+            "cert": hex::encode(cert.to_bytes()),
+            "audience": audience.as_ref().map(|a| a.as_str()),
+        }),
+    )
+    .await?;
+    emit_value(OutputFormat::resolve_oneshot(output), &reply)
+        .map_err(|e| generic(format!("write result: {e}")))
+}
+
+/// `org audience-keygen`: mint the org's shared owner audience, owner-only.
+async fn run_audience_keygen(
+    args: OrgAudienceKeygenArgs,
+    output: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    if args.out.exists() {
+        return Err(invalid_args(format!(
+            "{} already exists",
+            args.out.display()
+        )));
+    }
+    let keypair = load_org_key(&args.org_key, args.insecure_permissions).await?;
+    let audience = net::adapter::net::behavior::org_authority::OwnerAudienceCredential::generate(
+        keypair.org_id(),
+    );
+    drop(keypair);
+    let encoded = ScrubbedBytes::new(audience.encode_config().to_vec());
+    let tmp = args.out.with_extension("tmp-netmesh-audience");
+    crate::commands::identity::write_identity_atomically(&tmp, &args.out, encoded.as_slice())
+        .await?;
+    emit_value(
+        OutputFormat::resolve_oneshot(output),
+        &serde_json::json!({
+            "org": hex::encode(audience.owner_org.as_bytes()),
+            "audience_handle": hex::encode(audience.audience_handle),
+            "file": args.out.display().to_string(),
+        }),
+    )
+    .map_err(|e| generic(format!("write result: {e}")))
+}
+
+/// Read an org owner-audience file (`org audience-keygen`) through the
+/// secret-file gate (regular file, owned by this user, owner-only, checked
+/// on the opened descriptor), then decode exactly one credential.
+pub(crate) async fn load_org_audience(
+    path: &Path,
+    insecure_permissions: bool,
+) -> Result<net::adapter::net::behavior::org_authority::OwnerAudienceCredential, CliError> {
+    use net::adapter::net::behavior::org_authority::OwnerAudienceCredential;
+    use std::io::Read as _;
+    let owned = path.to_path_buf();
+    let read = tokio::task::spawn_blocking(move || {
+        let mut file =
+            net::adapter::net::secret_file::open_secret_file(&owned, insecure_permissions)
+                .map_err(|e| e.to_string())?;
+        let mut bytes = Vec::with_capacity(OwnerAudienceCredential::ENCODED_SIZE + 1);
+        (&mut file)
+            .take(OwnerAudienceCredential::ENCODED_SIZE as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>(ScrubbedBytes::new(bytes))
+    })
+    .await
+    .map_err(|e| generic(format!("org audience {}: {e}", path.display())))?
+    .map_err(|e| {
+        invalid_args(format!(
+            "org audience {}: {e}; or pass --insecure-permissions to override",
+            path.display()
+        ))
+    })?;
+    if read.as_slice().len() != OwnerAudienceCredential::ENCODED_SIZE {
+        return Err(invalid_args(format!(
+            "org audience {} is not an org audience file",
+            path.display()
+        )));
+    }
+    OwnerAudienceCredential::decode_config(read.as_slice())
+        .map_err(|e| invalid_args(format!("org audience {}: {e}", path.display())))
+}
+
+/// Bound on the `org join` exchange with the running node.
+const ORG_JOIN_CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(28);
+
+/// `org join`: show what is being joined, confirm, and hand the link to the
+/// running node over its authenticated control endpoint.
+async fn run_org_join(
+    args: OrgJoinArgs,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use net_sdk::enrollment::standalone::is_standalone_org;
+    let from_stdin = args.token == "-";
+    if from_stdin && !args.yes {
+        return Err(invalid_args(
+            "reading the link from stdin needs --yes (stdin cannot also answer the prompt)",
+        ));
+    }
+    let token = if from_stdin {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = String::new();
+        tokio::io::stdin()
+            .take(4096)
+            .read_to_string(&mut buf)
+            .await
+            .map_err(|e| generic(format!("read link from stdin: {e}")))?;
+        ScrubbedString::new(buf.trim().to_string())
+    } else {
+        ScrubbedString::new(args.token)
+    };
+    let invite = net_sdk::enrollment::invite::MembershipInvite::decode(token.as_str())
+        .map_err(|e| invalid_args(format!("not a valid link: {e}")))?;
+    let offer = match invite.org() {
+        Some(offer) if is_standalone_org(&invite) => *offer,
+        _ => {
+            return Err(invalid_args(
+                "not a standalone org link (a mesh invite is redeemed with `net-mesh join`)",
+            ))
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now >= invite.policy().expires_at() {
+        return Err(invalid_args("this link has expired; ask for a new one"));
+    }
+    eprintln!(
+        "Joining org {} under issuer {}\n  membership only (no dispatcher or capability right); \
+         the operator approves it with the org root",
+        hex::encode(offer.org.as_bytes()),
+        invite.issuer_fingerprint(),
+    );
+    let tty = {
+        use std::io::IsTerminal as _;
+        std::io::stdin().is_terminal() && !from_stdin
+    };
+    let yes = args.yes;
+    tokio::task::spawn_blocking(move || {
+        super::ice::check_confirm_gate(tty, yes, || {
+            use std::io::{BufRead as _, Write as _};
+            let mut err = std::io::stderr();
+            write!(
+                err,
+                "Confirm the org and issuer are the ones you expect. Type YES to join: "
+            )
+            .and_then(|()| err.flush())
+            .map_err(|e| generic(format!("prompt: {e}")))?;
+            let mut line = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| generic(format!("prompt: {e}")))?;
+            Ok(line.trim() == "YES")
+        })
+    })
+    .await
+    .map_err(|e| generic(format!("confirmation task failed: {e}")))??;
+
+    let node_dir = super::lifecycle::state_dir(args.state_dir, profile_name)?
+        .join(super::lifecycle::NODE_SUBDIR);
+    let (_, reply) = super::lifecycle::control_call_within(
+        &node_dir,
+        serde_json::json!({ "op": "org_join", "token": token.as_str() }),
+        ORG_JOIN_CONTROL_WAIT,
+    )
+    .await
+    .map_err(|e| {
+        crate::error::connection_failure(format!(
+            "this device's node is not reachable ({e:?}); `org join` runs through a running \
+             `net-mesh up`"
+        ))
+    })?;
+    if let Some(e) = reply["error"].as_str() {
+        return Err(generic(e.to_string()));
+    }
+    emit_value(OutputFormat::resolve_oneshot(output), &reply)
+        .map_err(|e| generic(format!("write result: {e}")))
 }
 
 #[derive(Serialize)]

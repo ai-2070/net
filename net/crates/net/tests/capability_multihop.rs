@@ -555,3 +555,338 @@ async fn version_collision_from_same_origin_is_dropped_at_dedup_cache() {
         "B must still have #1's tag (first-writer-wins)",
     );
 }
+
+// =========================================================================
+// V3 decision 1 — a late attacher discovers and reaches a provider via its hub
+// =========================================================================
+
+async fn build_node_with(cfg: MeshNodeConfig) -> Arc<MeshNode> {
+    Arc::new(
+        MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new"),
+    )
+}
+
+/// B announces BEFORE A attaches to hub H (A–H–B, no A–B link). H replays
+/// B's still-valid, origin-signed announcement to A when A attaches, so A
+/// discovers B without waiting for B's next re-announce; A then opens an
+/// endpoint-authenticated session to B through H with the Noise key B
+/// signed into its own announcement. A provider that announced no key
+/// cannot be reached this way (nothing to authenticate against).
+#[tokio::test]
+async fn a_late_attacher_discovers_and_reaches_a_provider_through_its_hub() {
+    let b = build_node_with(test_config().with_announce_noise_key(true)).await;
+    let quiet = build_node().await; // announces no Noise key
+    let h = build_node().await;
+    handshake_no_start(&b, &h).await;
+    handshake_no_start(&quiet, &h).await;
+    start_all(&[&b, &h, &quiet]);
+    b.announce_capabilities(CapabilitySet::new().add_tag("late-tool"))
+        .await
+        .expect("B announce");
+    quiet
+        .announce_capabilities(CapabilitySet::new().add_tag("quiet-tool"))
+        .await
+        .expect("quiet announce");
+    let (b_id, quiet_id) = (b.node_id(), quiet.node_id());
+    let late = CapabilityFilter::new().require_tag("late-tool");
+    let quiet_filter = CapabilityFilter::new().require_tag("quiet-tool");
+    assert!(wait_until(&h, |n| n.find_nodes_by_filter(&late).contains(&b_id)).await);
+    assert!(
+        wait_until(&h, |n| n
+            .find_nodes_by_filter(&quiet_filter)
+            .contains(&quiet_id))
+        .await
+    );
+    assert!(h.relay_announcements_len() >= 2, "H holds both for replay");
+
+    // A attaches only now, long after the flood went by.
+    // As a device attaches to its hub: a routed handshake to a running
+    // node (the responder side is where H replays).
+    let a = build_node().await;
+    a.start();
+    a.connect_via(h.local_addr(), h.public_key(), h.node_id())
+        .await
+        .expect("A attaches to H");
+    assert!(
+        wait_until(&a, |n| n.find_nodes_by_filter(&late).contains(&b_id)).await,
+        "A discovers B from H's replay"
+    );
+    assert_eq!(a.peer_announced_noise_pubkey(b_id), Some(*b.public_key()));
+    assert!(a.peer_session_id(b_id).is_none(), "no session with B yet");
+
+    let path = a
+        .ensure_session(b_id, Duration::from_secs(10))
+        .await
+        .expect("a relayed session to B");
+    assert_eq!(path, net::adapter::net::SessionPath::Relayed);
+    assert!(a.peer_session_id(b_id).is_some());
+    let a_id = a.node_id();
+    assert!(
+        wait_until(&b, |n| n.peer_session_id(a_id).is_some()).await,
+        "B holds the session end to end"
+    );
+    assert_eq!(
+        a.ensure_session(b_id, Duration::from_secs(1))
+            .await
+            .unwrap(),
+        net::adapter::net::SessionPath::Existing
+    );
+
+    // A provider that announced no key: discovered, but not reachable.
+    assert!(
+        wait_until(&a, |n| n
+            .find_nodes_by_filter(&quiet_filter)
+            .contains(&quiet_id))
+        .await
+    );
+    assert!(a
+        .ensure_session(quiet_id, Duration::from_secs(2))
+        .await
+        .is_err());
+}
+
+/// A forwarded (or replayed) announcement lives only what remains of its
+/// origin-signed lifetime (plus bounded skew); a direct one is unchanged.
+#[test]
+fn forwarding_or_replay_never_refreshes_an_announcement_lifetime() {
+    use net::adapter::net::behavior::capability::CapabilityAnnouncement;
+    use net::adapter::net::behavior::fold::capability_bridge::{
+        effective_ttl_secs, FORWARDED_ANNOUNCEMENT_SKEW_SECS,
+    };
+    let kp = EntityKeypair::generate();
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let at = |age_secs: u64, hop: u8| {
+        let mut ann = CapabilityAnnouncement::new(
+            kp.node_id(),
+            kp.entity_id().clone(),
+            1,
+            CapabilitySet::new(),
+        )
+        .with_ttl(300);
+        ann.timestamp_ns = now_ns - age_secs * 1_000_000_000;
+        ann.hop_count = hop;
+        ann
+    };
+    assert_eq!(effective_ttl_secs(&at(200, 0)), 300, "direct: unchanged");
+    assert_eq!(
+        effective_ttl_secs(&at(200, 1)),
+        300 - (200 - FORWARDED_ANNOUNCEMENT_SKEW_SECS as u32),
+        "forwarded: what remains of the origin lifetime"
+    );
+    assert_eq!(effective_ttl_secs(&at(10, 1)), 300, "fresh: within skew");
+    assert_eq!(effective_ttl_secs(&at(400, 3)), 0, "stale: nothing left");
+}
+
+/// The device topology: BOTH the provider and the caller attach to the hub
+/// with routed handshakes (as `join`ed devices do), after the hub started.
+#[tokio::test]
+async fn devices_attached_to_a_hub_by_routed_handshakes_reach_each_other() {
+    let h = build_node().await;
+    h.start();
+    let b = build_node_with(test_config().with_announce_noise_key(true)).await;
+    b.start();
+    b.connect_via(h.local_addr(), h.public_key(), h.node_id())
+        .await
+        .expect("B attaches to H");
+    b.announce_capabilities(CapabilitySet::new().add_tag("device-tool"))
+        .await
+        .expect("B announce");
+    let b_id = b.node_id();
+    let tool = CapabilityFilter::new().require_tag("device-tool");
+    assert!(wait_until(&h, |n| n.find_nodes_by_filter(&tool).contains(&b_id)).await);
+
+    let a = build_node().await;
+    a.start();
+    a.connect_via(h.local_addr(), h.public_key(), h.node_id())
+        .await
+        .expect("A attaches to H");
+    assert!(
+        wait_until(&a, |n| n.find_nodes_by_filter(&tool).contains(&b_id)).await,
+        "A discovers B from H's replay"
+    );
+    let path = a
+        .ensure_session(b_id, Duration::from_secs(10))
+        .await
+        .expect("a session to B");
+    assert_ne!(path, net::adapter::net::SessionPath::Existing);
+    let a_id = a.node_id();
+    assert!(wait_until(&b, |n| n.peer_session_id(a_id).is_some()).await);
+}
+
+#[cfg(feature = "cortex")]
+struct Echo;
+
+#[cfg(feature = "cortex")]
+#[async_trait::async_trait]
+impl net::adapter::net::cortex::rpc::RpcHandler for Echo {
+    async fn call(
+        &self,
+        ctx: net::adapter::net::cortex::rpc::RpcContext,
+    ) -> Result<
+        net::adapter::net::cortex::rpc::RpcResponsePayload,
+        net::adapter::net::cortex::rpc::RpcHandlerError,
+    > {
+        Ok(net::adapter::net::cortex::rpc::RpcResponsePayload {
+            status: net::adapter::net::cortex::rpc::RpcStatus::Ok,
+            headers: vec![],
+            body: ctx.payload.body,
+        })
+    }
+}
+
+/// An nRPC call crosses the hub: A calls B's service over the relayed,
+/// endpoint-authenticated session `ensure_session` opened.
+#[cfg(feature = "cortex")]
+#[tokio::test]
+async fn a_call_to_a_provider_crosses_the_hub_over_the_relayed_session() {
+    let h = build_node().await;
+    h.start();
+    let b = build_node_with(test_config().with_announce_noise_key(true)).await;
+    b.start();
+    b.connect_via(h.local_addr(), h.public_key(), h.node_id())
+        .await
+        .expect("B attaches to H");
+    let _serve = b.serve_rpc("echo", Arc::new(Echo)).expect("serve_rpc");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+    let b_id = b.node_id();
+    let echo = CapabilityFilter::new().require_tag("nrpc:echo");
+    assert!(wait_until(&h, |n| n.find_nodes_by_filter(&echo).contains(&b_id)).await);
+
+    let a = build_node().await;
+    a.start();
+    a.connect_via(h.local_addr(), h.public_key(), h.node_id())
+        .await
+        .expect("A attaches to H");
+    assert!(wait_until(&a, |n| n.find_nodes_by_filter(&echo).contains(&b_id)).await);
+    a.ensure_session(b_id, Duration::from_secs(10))
+        .await
+        .expect("a session to B");
+    let reply = tokio::time::timeout(
+        Duration::from_secs(10),
+        a.call(
+            b_id,
+            "echo",
+            bytes::Bytes::from_static(b"through the hub"),
+            net::adapter::net::mesh_rpc::CallOptions::default(),
+        ),
+    )
+    .await
+    .expect("the call answers")
+    .expect("B answers A");
+    assert_eq!(reply.body.as_ref(), b"through the hub");
+}
+
+#[cfg(feature = "cortex")]
+#[tokio::test]
+/// An nRPC call crosses the hub when both endpoints hold DIRECT sessions
+/// with it (the relay topology of `direct_upgrade`).
+async fn a_call_crosses_a_hub_the_endpoints_are_directly_attached_to() {
+    let h = build_node().await;
+    let b = build_node_with(test_config().with_announce_noise_key(true)).await;
+    let a = build_node().await;
+    handshake_no_start(&b, &h).await;
+    handshake_no_start(&a, &h).await;
+    start_all(&[&b, &h, &a]);
+    let _serve = b.serve_rpc("echo", Arc::new(Echo)).expect("serve_rpc");
+    b.announce_capabilities(CapabilitySet::new()).await.unwrap();
+    let b_id = b.node_id();
+    let echo = CapabilityFilter::new().require_tag("nrpc:echo");
+    assert!(wait_until(&a, |n| n.find_nodes_by_filter(&echo).contains(&b_id)).await);
+    a.ensure_session(b_id, Duration::from_secs(10))
+        .await
+        .expect("session");
+    let reply = a
+        .call(
+            b_id,
+            "echo",
+            bytes::Bytes::from_static(b"x"),
+            net::adapter::net::mesh_rpc::CallOptions::default(),
+        )
+        .await
+        .expect("call");
+    assert_eq!(reply.body.as_ref(), b"x");
+}
+
+#[tokio::test]
+/// Session-scoped control traffic (a channel membership request and its
+/// ACK) crosses a two-hop relayed session: both directions ride a routing
+/// header to the relay, which forwards them — pre-fix both were sent bare
+/// to the relay's address and silently dropped there.
+async fn membership_crosses_a_two_hop_relayed_session() {
+    let h = build_node().await;
+    let b = build_node_with(test_config().with_announce_noise_key(true)).await;
+    let a = build_node().await;
+    handshake_no_start(&b, &h).await;
+    handshake_no_start(&a, &h).await;
+    start_all(&[&b, &h, &a]);
+    b.announce_capabilities(CapabilitySet::new().add_tag("x"))
+        .await
+        .unwrap();
+    let b_id = b.node_id();
+    let f = CapabilityFilter::new().require_tag("x");
+    assert!(wait_until(&a, |n| n.find_nodes_by_filter(&f).contains(&b_id)).await);
+    a.announce_capabilities(CapabilitySet::new().add_tag("a"))
+        .await
+        .unwrap();
+    let a_id = a.node_id();
+    let fa = CapabilityFilter::new().require_tag("a");
+    assert!(wait_until(&b, |n| n.find_nodes_by_filter(&fa).contains(&a_id)).await);
+    a.connect_routed(b.public_key(), b_id)
+        .await
+        .expect("routed");
+    let ch = net::adapter::net::ChannelName::new("probe.relay").unwrap();
+    tokio::time::timeout(Duration::from_secs(8), a.subscribe_channel(b_id, ch))
+        .await
+        .expect("no hang")
+        .expect("a membership request crosses the relay hop and is ACKed");
+}
+
+/// A peer that reaches this node THROUGH a mesh relay (the routed
+/// handshake crossed a hop) is not replayed to: that relay already floods
+/// it, and a replay would open a capability stream on the routed session
+/// and hold it non-quiescent, which the RTC install fence then refuses for
+/// good (natsim `rtc_anchor_direct` regressed exactly so after S6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_behind_a_mesh_relay_gets_no_replay_on_its_session() {
+    let x = build_node().await;
+    let b = build_node().await;
+    let r = build_node().await;
+    let a = build_node().await;
+    handshake_no_start(&x, &b).await;
+    handshake_no_start(&b, &r).await;
+    handshake_no_start(&a, &r).await;
+    start_all(&[&x, &b, &r, &a]);
+    x.announce_capabilities(CapabilitySet::new().add_tag("x"))
+        .await
+        .unwrap();
+    assert!(
+        wait_until(&b, |n| n.relay_announcements_len() >= 1).await,
+        "precondition: B holds an announcement it would replay"
+    );
+    // The flood has settled (A heard X through R) before A attaches, so a
+    // capability stream on B's session to A can only be the replay.
+    let fx = CapabilityFilter::new().require_tag("x");
+    let x_id = x.node_id();
+    assert!(wait_until(&a, |n| n.find_nodes_by_filter(&fx).contains(&x_id)).await);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (a_id, b_id) = (a.node_id(), b.node_id());
+    a.connect_via(r.local_addr(), b.public_key(), b_id)
+        .await
+        .expect("A reaches B through R");
+    // Past both replay settles.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let session = b.peer_session_for_test(a_id).expect("B holds A's session");
+    let cap_stream = net::adapter::net::behavior::SUBPROTOCOL_CAPABILITY_ANN as u64;
+    assert!(
+        !session.stream_ids().contains(&cap_stream),
+        "no replay stream on a session that crossed a mesh hop: {:?}",
+        session.stream_ids()
+    );
+}

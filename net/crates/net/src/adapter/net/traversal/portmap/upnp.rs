@@ -87,6 +87,8 @@ pub struct UpnpMapper {
     /// Cached IGD gateway. Populated on first successful
     /// `probe()` / `install()`; cleared on transport errors.
     gateway: Mutex<Option<Gateway<Tokio>>>,
+    /// Transport this mapper installs and removes. UDP by default.
+    transport: super::MapTransport,
 }
 
 impl UpnpMapper {
@@ -119,6 +121,20 @@ impl UpnpMapper {
         Self {
             local_ip,
             gateway: Mutex::new(None),
+            transport: super::MapTransport::Udp,
+        }
+    }
+
+    /// Bind this mapper to `transport` (UDP by default).
+    pub fn with_transport(mut self, transport: super::MapTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    fn igd_protocol(&self) -> PortMappingProtocol {
+        match self.transport {
+            super::MapTransport::Udp => PortMappingProtocol::UDP,
+            super::MapTransport::Tcp => PortMappingProtocol::TCP,
         }
     }
 
@@ -214,7 +230,7 @@ impl PortMapperClient for UpnpMapper {
             // `add_any_port` returns the actually-mapped external
             // port, which we record in the `PortMapping`.
             let actual_external_port = gw
-                .add_any_port(PortMappingProtocol::UDP, local, lease, UPNP_DESCRIPTION)
+                .add_any_port(self.igd_protocol(), local, lease, UPNP_DESCRIPTION)
                 .await
                 .map_err(add_any_port_err_to_port_mapping)?;
             Ok::<_, PortMappingError>(PortMapping {
@@ -252,7 +268,7 @@ impl PortMapperClient for UpnpMapper {
         // if this fails (plan decision 12).
         let _ = tokio::time::timeout(UPNP_DEADLINE, async {
             let gw = self.gateway().await?;
-            gw.remove_port(PortMappingProtocol::UDP, mapping.external.port())
+            gw.remove_port(self.igd_protocol(), mapping.external.port())
                 .await
                 .map_err(|_| PortMappingError::Transport("remove_port failed".into()))?;
             Ok::<_, PortMappingError>(())

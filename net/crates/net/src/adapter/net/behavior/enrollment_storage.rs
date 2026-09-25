@@ -162,8 +162,14 @@ impl EnrollmentStorage {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+        #[cfg(feature = "fixtures")]
+        fixture_crash::point("before_replace", &self.dir);
         match write(&path, bytes) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                #[cfg(feature = "fixtures")]
+                fixture_crash::point("after_replace", &self.dir);
+                Ok(())
+            }
             Err(WritePhase::PreRename(_)) => Err(StorageError::Io(std::io::Error::other(
                 "snapshot replacement failed before publication",
             ))),
@@ -171,6 +177,47 @@ impl EnrollmentStorage {
                 self.uncertain = true;
                 Err(StorageError::Uncertain)
             }
+        }
+    }
+}
+
+/// Test-only crash injection at the real durable-write transitions
+/// (`fixtures` builds only). `NET_MESH_FIXTURE_CRASH=<point>:<store>:<nth>`
+/// aborts the process at the `nth` (1-based) `point` — `before_replace`
+/// (nothing of this write is on disk) or `after_replace` (the snapshot is
+/// durable, and nothing after it ran) — of the store whose directory is
+/// named `<store>`. A test then restarts against the resulting disk state.
+#[cfg(feature = "fixtures")]
+pub(crate) mod fixture_crash {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+
+    pub(crate) fn point(point: &str, dir: &Path) {
+        if std::env::var_os("NET_MESH_FIXTURE_TRACE").is_some() {
+            eprintln!(
+                "net-mesh fixture point: {point} {}",
+                dir.file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default()
+            );
+        }
+        let Ok(spec) = std::env::var("NET_MESH_FIXTURE_CRASH") else {
+            return;
+        };
+        let mut parts = spec.splitn(3, ':');
+        let (Some(want_point), Some(store)) = (parts.next(), parts.next()) else {
+            return;
+        };
+        let nth: u32 = parts.next().and_then(|n| n.parse().ok()).unwrap_or(1);
+        let named = dir.file_name().is_some_and(|n| n == store);
+        if want_point != point || !named {
+            return;
+        }
+        if SEEN.fetch_add(1, Ordering::SeqCst) + 1 == nth {
+            eprintln!("net-mesh fixture crash: {point} of {store} #{nth}");
+            std::process::abort();
         }
     }
 }
@@ -294,7 +341,20 @@ mod tests {
         owner.replace(b"second").unwrap();
         assert_eq!(owner.read().unwrap(), b"second");
         drop(owner);
-        let reopened = EnrollmentStorage::open(&dir).unwrap();
+        // On Unix the lock is `flock`, owned by the open file description. A
+        // child forked by ANOTHER test thread shares that description until
+        // its exec closes the (CLOEXEC) descriptor, so in this multithreaded
+        // test binary the lock can briefly outlive `drop`. Retry `Busy`
+        // within a bound; any other error, or a lock that never frees, fails.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reopened = loop {
+            match EnrollmentStorage::open(&dir) {
+                Err(StorageError::Busy) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => break other.unwrap(),
+            }
+        };
         assert_eq!(reopened.read().unwrap(), b"second");
         assert!(matches!(
             EnrollmentStorage::create(&dir, b"reset"),

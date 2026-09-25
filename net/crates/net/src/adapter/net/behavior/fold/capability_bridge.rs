@@ -1203,6 +1203,32 @@ fn may_execute_with_caller(
     false
 }
 
+/// Clock skew tolerated when bounding a forwarded announcement's lifetime
+/// by its origin's signed timestamp.
+pub const FORWARDED_ANNOUNCEMENT_SKEW_SECS: u64 = 30;
+
+/// The lifetime the fold grants an announcement. A DIRECT announcement
+/// lives its signed `ttl_secs` from receipt, as before. A FORWARDED one
+/// (`hop_count > 0`) — including one a hub replays to a peer that attached
+/// later — lives only what remains of its origin-signed lifetime (measured
+/// from its signed `timestamp_ns`, with [`FORWARDED_ANNOUNCEMENT_SKEW_SECS`]
+/// of clock-skew slack): forwarding or replaying it never refreshes stale
+/// authority. Already past that bound, it lives zero seconds.
+pub fn effective_ttl_secs(ann: &CapabilityAnnouncement) -> u32 {
+    if ann.hop_count == 0 {
+        return ann.ttl_secs;
+    }
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let age_secs = now_ns.saturating_sub(ann.timestamp_ns) / 1_000_000_000;
+    let consumed = age_secs.saturating_sub(FORWARDED_ANNOUNCEMENT_SKEW_SECS);
+    u64::from(ann.ttl_secs)
+        .saturating_sub(consumed)
+        .min(u64::from(ann.ttl_secs)) as u32
+}
+
 /// Translate a legacy [`CapabilityAnnouncement`] into a
 /// fold-shaped [`SignedAnnouncement<CapabilityMembership>`]
 /// suitable for [`Fold::apply`] dual-population during the
@@ -1275,7 +1301,7 @@ pub fn translate_announcement(
         ann.version.max(1),
         EnvelopeMeta {
             announced_at: ann.timestamp_ns / 1_000,
-            ttl_secs: Some(ann.ttl_secs),
+            ttl_secs: Some(effective_ttl_secs(ann)),
             flags: 0,
         },
         CapabilityMembership {

@@ -1451,7 +1451,11 @@ async fn prepare_refuses_a_different_brief_under_the_same_id() {
 async fn prepare_reports_busy_at_max_in_flight_and_frees_on_expiry() {
     let mut narrow = offer(true);
     narrow.bounds.max_in_flight = 1;
-    narrow.reservation_ttl_secs = 1;
+    // Expiry is kept in whole unix seconds, so a TTL of 1 can lapse within
+    // milliseconds of the reservation (made at x.999, expiring at x+1) and a
+    // loaded runner then sees the Busy checks below race it. 2 guarantees at
+    // least a full second; the lapse is polled for, not slept on.
+    narrow.reservation_ttl_secs = 2;
     let fx = pending(true)
         .await
         .serve(vec![A2aServicePolicy::Paid(narrow)], false)

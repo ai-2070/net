@@ -145,6 +145,31 @@ enum Command {
     /// Operator identity authoring + inspection.
     #[command(subcommand)]
     Identity(commands::identity::IdentityCommand),
+
+    /// Start one long-lived production node for this profile (foreground).
+    Up(commands::lifecycle::UpArgs),
+
+    /// Ask this profile's running node to drain and stop, and verify it did.
+    Down(commands::lifecycle::DownArgs),
+
+    /// Enrollment ledger setup for `up --enroll`.
+    #[command(subcommand)]
+    Enrollment(commands::enrollment::EnrollmentCommand),
+
+    /// Create, inspect and manage join tokens on the running `up --enroll` node.
+    #[command(subcommand)]
+    Invite(commands::enrollment::InviteCommand),
+
+    /// Join a mesh from a `netmesh-join_` token (confirm, redeem, install, attach).
+    Join(commands::enrollment::JoinArgs),
+
+    /// Leave the mesh this state directory joined: stop its running node,
+    /// erase the delivered credentials and keep the device identity.
+    Leave(commands::lifecycle::LeaveArgs),
+
+    /// Run a blind UDP relay (the fallback path for unreachable devices).
+    #[command(subcommand)]
+    Relay(commands::relay::RelayCommand),
     /// Offline previews or temporary-supervisor admin commits (--local).
     #[command(subcommand)]
     Admin(commands::admin::AdminCommand),
@@ -175,24 +200,26 @@ enum Command {
     /// NetDB local KV adapters (Cortex-backed tasks + memories).
     #[command(subcommand)]
     Netdb(commands::netdb::NetdbCommand),
-    /// Organization root authority authoring (keygen / issue-cert
-    /// / issue-floors) — OA-1.
+    /// Organization authority: offline root tools, org links (invite /
+    /// approve / join), removal, leave and member standing.
     #[command(subcommand)]
     Org(commands::org::OrgCommand),
-    /// Node ownership provisioning (`adopt`) — OA-1.
+    /// This profile's running node (`status`) and org ownership (`adopt`).
     #[command(subcommand)]
     Node(commands::node::NodeCommand),
     /// Browser-facing anchor surface: bootstrap credentials
     /// (plan §5 Layer 0, Stage 4b).
     #[command(subcommand)]
     Anchor(commands::anchor::AnchorCommand),
-    /// Temporary topology reads (--local) or offline subnet authority tools.
+    /// Subnet authority: offline issuance, subnet links (invite / join),
+    /// removal, leave and members; temporary topology reads (--local).
     #[command(subcommand)]
     Subnet(commands::subnet::SubnetCommand),
     /// Temporary gateway reads (--local); export is unsupported.
     #[command(subcommand)]
     Gateway(commands::gateway::GatewayCommand),
-    /// Temporary channel registry reads (--local).
+    /// Channel credentials: offline grants, serving, status, publish and
+    /// leave on the running node; temporary registry reads (--local).
     #[command(subcommand)]
     Channel(commands::channel::ChannelCommand),
     /// Temporary inspection (--local) or explicitly targeted aggregator RPC.
@@ -341,6 +368,25 @@ async fn dispatch_inner(cli: Cli, deadline: Option<deadline::Deadline>) -> Resul
     match cli.command {
         Command::Version => commands::version::run(output).await,
         Command::Identity(cmd) => commands::identity::run(cmd, output, config_path, profile).await,
+        Command::Up(args) => {
+            Box::pin(commands::lifecycle::run_up(
+                args,
+                output,
+                config_path,
+                profile,
+            ))
+            .await
+        }
+        Command::Down(args) => commands::lifecycle::run_down(args, output, profile).await,
+        Command::Enrollment(cmd) => {
+            commands::enrollment::run_enrollment(cmd, output, profile).await
+        }
+        Command::Invite(cmd) => commands::enrollment::run_invite(cmd, output, profile).await,
+        Command::Relay(cmd) => commands::relay::run(cmd, output).await,
+        Command::Join(args) => {
+            Box::pin(commands::enrollment::run_join(args, output, profile)).await
+        }
+        Command::Leave(args) => commands::lifecycle::run_leave(args, output, profile).await,
         Command::Admin(cmd) => commands::admin::run(cmd, output, config_path, profile).await,
         Command::Ice(cmd) => commands::ice::run(cmd, output, config_path, profile).await,
         Command::Snapshot(cmd) => commands::snapshot::run(cmd, output, config_path, profile).await,

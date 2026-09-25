@@ -341,6 +341,61 @@ impl std::fmt::Debug for NetSocket {
 /// owns the type since Stage 2 so the wire layer needs nothing native.
 pub use net_wire::peer_addr::PeerAddr;
 
+/// TCP tunnels to blind relays this node reaches only over TCP (UDP to them
+/// got no answer), by the relay's address. Relayed frames for such a relay go
+/// into its tunnel instead of the UDP socket. `live` lets the relayed send
+/// path skip the map entirely while no tunnel exists — the common case — and
+/// direct (`PeerAddr::Udp`) sends never consult any of this.
+#[derive(Default)]
+pub struct RelayTunnels {
+    live: std::sync::atomic::AtomicUsize,
+    map: dashmap::DashMap<SocketAddr, tokio::sync::mpsc::Sender<Vec<u8>>>,
+}
+
+impl RelayTunnels {
+    /// Route `relay`'s frames into `tx` (replacing any earlier tunnel).
+    pub fn install(&self, relay: SocketAddr, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+        if self.map.insert(relay, tx).is_none() {
+            self.live.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Stop routing `relay` through a tunnel, but only if `tx` is still its
+    /// tunnel (a newer one is never removed by an older one's teardown).
+    pub fn remove_if(&self, relay: SocketAddr, tx: &tokio::sync::mpsc::Sender<Vec<u8>>) {
+        if self
+            .map
+            .remove_if(&relay, |_, current| current.same_channel(tx))
+            .is_some()
+        {
+            self.live.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Whether `relay` is currently reached through a tunnel.
+    pub fn contains(&self, relay: &SocketAddr) -> bool {
+        self.sender(*relay).is_some()
+    }
+
+    /// The tunnel to `relay`, when one is up.
+    #[inline]
+    pub fn tunnel_sender(&self, relay: SocketAddr) -> Option<tokio::sync::mpsc::Sender<Vec<u8>>> {
+        self.sender(relay)
+    }
+
+    #[inline]
+    fn sender(&self, relay: SocketAddr) -> Option<tokio::sync::mpsc::Sender<Vec<u8>>> {
+        if self.live.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.map.get(&relay).map(|e| e.value().clone())
+    }
+}
+
+fn tunnel_closed() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "relay tunnel closed")
+}
+
 /// The one outbound submission surface for peer-addressed packets.
 ///
 /// Three entry points, one per blocking shape the send inventory
@@ -356,6 +411,8 @@ pub use net_wire::peer_addr::PeerAddr;
 #[derive(Clone)]
 pub struct PeerSink {
     udp: Arc<NetSocket>,
+    /// TCP tunnels to relays (see [`RelayTunnels`]).
+    relay_tunnels: Arc<RelayTunnels>,
     /// The RTC half (Stage 3). `None` until a node is configured with
     /// `MeshNodeConfig::rtc`, so compiling the feature changes nothing.
     #[cfg(feature = "webrtc")]
@@ -368,6 +425,7 @@ impl PeerSink {
     pub fn new(udp: Arc<NetSocket>) -> Self {
         Self {
             udp,
+            relay_tunnels: Arc::new(RelayTunnels::default()),
             #[cfg(feature = "webrtc")]
             rtc: None,
         }
@@ -412,6 +470,23 @@ impl PeerSink {
             .map_err(io::Error::from)
     }
 
+    /// Frame `packet` for a blind relay: the data header, then the packet.
+    /// One copy per datagram; relayed traffic is the fallback path.
+    #[inline]
+    fn relay_frame(packet: &[u8], channel: u32) -> Vec<u8> {
+        let mut framed =
+            Vec::with_capacity(net_wire::peer_addr::RELAY_DATA_HEADER_LEN + packet.len());
+        framed.extend_from_slice(&net_wire::peer_addr::relay_data_header(channel));
+        framed.extend_from_slice(packet);
+        framed
+    }
+
+    /// The relay tunnels this sink routes relayed frames through.
+    #[inline]
+    pub fn relay_tunnels(&self) -> &Arc<RelayTunnels> {
+        &self.relay_tunnels
+    }
+
     /// The UDP socket this sink submits on.
     ///
     /// For the paths that need the socket itself rather than a submission:
@@ -427,6 +502,18 @@ impl PeerSink {
     pub async fn send(&self, packet: &[u8], to: PeerAddr) -> io::Result<usize> {
         match to {
             PeerAddr::Udp(addr) => self.udp.send_to(packet, addr).await,
+            // Blind relay: the relay's own tuple carries the framed datagram.
+            // The returned length is the caller's packet, not the frame.
+            PeerAddr::Relayed { relay, channel } => {
+                let framed = Self::relay_frame(packet, channel);
+                match self.relay_tunnels.sender(relay) {
+                    Some(tx) => tx.send(framed).await.map_err(|_| tunnel_closed())?,
+                    None => {
+                        self.udp.send_to(&framed, relay).await?;
+                    }
+                }
+                Ok(packet.len())
+            }
             // RTC: there is nothing to await. Admission is total and
             // the driver owns what it accepts, so the awaited entry
             // point is the synchronous one. `WouldBlock` reaches the
@@ -460,6 +547,21 @@ impl PeerSink {
     pub fn try_send(&self, packet: &[u8], to: PeerAddr) -> io::Result<usize> {
         match to {
             PeerAddr::Udp(addr) => self.udp.try_send_to(packet, addr),
+            PeerAddr::Relayed { relay, channel } => {
+                let framed = Self::relay_frame(packet, channel);
+                match self.relay_tunnels.sender(relay) {
+                    Some(tx) => tx.try_send(framed).map_err(|e| match e {
+                        tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                            io::Error::from(io::ErrorKind::WouldBlock)
+                        }
+                        tokio::sync::mpsc::error::TrySendError::Closed(_) => tunnel_closed(),
+                    })?,
+                    None => {
+                        self.udp.try_send_to(&framed, relay)?;
+                    }
+                }
+                Ok(packet.len())
+            }
             #[cfg(feature = "webrtc")]
             PeerAddr::Rtc(id) => self.submit_rtc(packet, id),
             // R5-A: the endpoint type lives in the wire crate, and a
@@ -497,6 +599,24 @@ impl PeerSink {
         match to {
             PeerAddr::Udp(addr) => {
                 bound_datagram_send(self.udp.send_to(packet, addr), to, deadline).await
+            }
+            PeerAddr::Relayed { relay, channel } => {
+                let framed = Self::relay_frame(packet, channel);
+                match self.relay_tunnels.sender(relay) {
+                    Some(tx) => {
+                        let len = framed.len();
+                        let send = async move {
+                            tx.send(framed)
+                                .await
+                                .map(|_| len)
+                                .map_err(|_| tunnel_closed())
+                        };
+                        bound_datagram_send(send, to, deadline).await
+                    }
+                    None => {
+                        bound_datagram_send(self.udp.send_to(&framed, relay), to, deadline).await
+                    }
+                }
             }
             // A deadline around a synchronous decision is a no-op by
             // construction; the RTC half cannot block, so there is

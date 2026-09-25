@@ -62,6 +62,7 @@ fn committed_fixture_matches_the_canonical_matches() {
             SubnetFactKind::GatewayAdvertisement,
             SubnetFactKind::ExportPolicy,
             SubnetFactKind::RevocationFloor,
+            SubnetFactKind::SubjectFloor,
         ]
         .map(fact_kind_wire),
     );

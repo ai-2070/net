@@ -78,6 +78,53 @@ listener selection without binding a port or starting the child; it cannot
 report a live port or Noise key. Startup `--timeout` ends at publication; it
 does not stop a healthy published service later.
 
+### Managed nodes, join links and leave
+
+`up` runs one long-lived node per profile (foreground); `down` drains and
+stops exactly that node; `node status` reports it through its lifetime lock
+and authenticated control endpoint. With `up --enroll` the node hands out
+join links, and a clean device joins with one of them:
+
+```sh
+net-mesh up --enroll                              # operator
+net-mesh invite create                            # prints a netmesh-join_ token (a secret)
+net-mesh join <TOKEN> --yes && net-mesh up        # device
+```
+
+The mesh PSK is generated and kept on first start (or supplied with
+`--psk-from file:<path>` / `stdin`, never on the command line).
+
+A link can also carry more than mesh membership, each part authorized on
+its own:
+- a subnet attachment (`--subnet`);
+- org membership (`--org`, always operator-approved);
+- a channel credential (`--channel` / `--channel-rights`).
+
+The roots that authorize these stay offline:
+- `subnet issue-issuer` and `channel issue-grant` delegate bounded issuance
+  to the node;
+- `org approve` signs a membership with the org root.
+
+The device's `up` reports admission and subscription as observed on the
+live session, not as implied by holding credentials. It re-establishes both
+after every reconnect.
+
+An enrolled device can run a provider or consumer as itself with
+`wrap --joined <state-dir>` / `mcp serve --joined <state-dir>`.
+
+Removal and leave:
+- The operator removes one member with `subnet remove` / `org remove`.
+  Each named node reports from its own signed attestation.
+- A device leaves one relation (`channel leave`, `subnet leave`,
+  `org leave`) or the whole mesh (`leave`). Every leave is recorded first
+  and survives restart.
+- Leaving is local and is not revocation.
+
+The runnable three-participant walkthrough, with every command, is in
+[the enrollment journey](tests/fixtures/enrollment/README.md). Like the
+capability journey, it is loopback evidence on one machine, not off-host
+or NAT acceptance.
+
 ### Temporary-supervisor development commands
 
 **Starts a temporary supervisor for this command; does not inspect a running node.** This applies to admin/ICE, snapshot, audit/log/failures, peer/daemon listings, capability reads, subnet topology reads, gateway/channel reads, and local aggregator inspection. These paths now require explicit `--local`, with a scope notice on stderr even under `--quiet`. Admin `--dry-run` remains an offline preview and needs no opt-in; ICE simulation does require it. Gateway export remains unsupported. Offline issuance and real remote clients do not take this flag.
@@ -97,6 +144,11 @@ script has to do differently. Temporary-supervisor scripts must now add
 |---------------|---------------------------------------------------------------------------------|
 | `version`     | SDK version + build metadata.                                                   |
 | `identity`    | Generate / inspect / fingerprint operator identity files.                       |
+| `up` / `down` | Start one long-lived node for the profile (foreground); drain and stop it.      |
+| `invite`      | Create / inspect / list / revoke / approve / deny join links on `up --enroll`.  |
+| `join` / `leave` | Join a mesh from a link and run as it; leave it (local, durable).            |
+| `enrollment`  | Enrollment ledger setup for `up --enroll`.                                      |
+| `relay`       | Run a blind UDP relay (`serve`), the fallback path for unreachable devices.     |
 | `admin`       | Offline previews or signed commits against a temporary supervisor. |
 | `ice`         | Simulate/commit break-glass operations against a temporary supervisor. |
 | `snapshot`    | One-shot substrate reads, both requiring `--local`: `get` prints the `MeshOsSnapshot`; `status` prints the typed `StatusSummary`. |
@@ -107,15 +159,15 @@ script has to do differently. Temporary-supervisor scripts must now add
 | `peer`        | `ls` reads the temporary snapshot; no NAT-management verbs. |
 | `daemon`      | Per-daemon listing from the local snapshot.                                     |
 | `netdb`       | NetDB local KV adapter — Cortex-backed tasks + memories.                        |
-| `org`         | Organization root authority authoring (keygen / issue-cert / issue-floors).     |
-| `node`        | Node ownership provisioning (`adopt`).                                          |
-| `subnet`      | Temporary topology reads; offline authority issuance and decode-only inspection. |
+| `org`         | Offline org root tools; org links (`invite` / `approve` / `join`), `remove`, `leave`, `members`. |
+| `node`        | `status` of this profile's node; ownership provisioning (`adopt`).             |
+| `subnet`      | Offline authority issuance; subnet links (`invite` / `join`), `remove`, `leave`, `members`; temporary topology reads. |
 | `gateway`     | Temporary-context reads; `export` refuses without a live gateway. |
-| `channel`     | `ChannelConfigRegistry` inspection (`visibility`, `ls`).                        |
+| `channel`     | Offline `issue-grant`; standalone links (`invite` / `join`); `serve`, `status`, `publish`, `leave` on the running node; registry reads (`visibility`, `ls`). |
 | `aggregator`  | Temporary inspect/list with `--local`; remote query/spawn/scale and list selected by flags or profile. Remote verbs and `ls` support `--inspect-target`. |
 | `transfer`    | Receive/admin via mesh; send computes references or stages local content, not hosting or publication. |
-| `wrap`        | Wrap a local stdio MCP server as owner-only mesh capabilities.                  |
-| `mcp`         | MCP bridge — expose mesh capabilities to a local MCP host (`serve`).            |
+| `wrap`        | Wrap a local stdio MCP server as owner-only mesh capabilities (`--joined` runs as an enrolled device). |
+| `mcp`         | MCP bridge — expose mesh capabilities to a local MCP host (`serve`, `--joined`). |
 | `forwarding`  | Caller-side credential/header forwarding policy + audit (deny-by-default).      |
 | `typegen`     | Generate typed language bindings from discovered tool descriptors.              |
 | `completion`  | Emit a shell-completion script (`bash` / `zsh` / `fish` / `powershell`).        |

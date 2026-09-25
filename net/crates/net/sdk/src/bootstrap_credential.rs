@@ -211,6 +211,12 @@ impl TrustDomainId {
         Self(id)
     }
 
+    /// Wrap id bytes decoded from another signed structure. Grants nothing:
+    /// equality with [`Self::of_psk`] is still the only trust-domain check.
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
     /// The raw id bytes.
     pub fn as_bytes(&self) -> &[u8; 16] {
         &self.0

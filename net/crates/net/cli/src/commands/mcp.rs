@@ -111,6 +111,13 @@ pub struct ServeArgs {
     #[arg(long = "trust-equivalent-providers")]
     pub trust_equivalent_providers: bool,
 
+    /// Run as the device enrolled in this state directory (as given to
+    /// `join` / `up`): its identity, mesh PSK and the node it enrolled with,
+    /// instead of `--identity` and a remote peer. `up` must not be running
+    /// on it.
+    #[arg(long, value_name = "DIR", conflicts_with = "identity")]
+    pub joined: Option<PathBuf>,
+
     /// The mesh peer to join.
     #[command(flatten)]
     pub remote: RemoteAttachArgs,
@@ -146,6 +153,24 @@ async fn run_serve(
 
     // A mesh peer to join — the running node this shim reads capabilities from
     // and routes invocations through. Without one there is nothing to serve.
+    // An enrolled device (`--joined`) takes it, and its identity, from the join.
+    if let Some(dir) = &args.joined {
+        let peer = crate::commands::joined::peer_override(&args.remote)?;
+        let bind = args
+            .remote
+            .bind
+            .clone()
+            .or(profile.bind.clone())
+            .unwrap_or_else(|| crate::context::DEFAULT_SERVICE_BIND.to_string());
+        let (mesh, _path, guard) = crate::deadline::run_optional(
+            deadline,
+            crate::commands::joined::attach(dir, &bind, peer),
+        )
+        .await?;
+        let mesh = Arc::new(mesh);
+        let shim = build_shim(&args, &mesh)?;
+        return serve_shim(mesh, shim, Some(guard)).await;
+    }
     let remote = require_remote_attach_with_bind(
         &profile,
         &args.remote,
@@ -183,24 +208,36 @@ async fn run_serve(
 
         let mesh = build_attached_mesh(Some(identity), &remote).await?;
         let mesh = Arc::new(mesh);
-
-        // Seed the shim consent allowlist from `--allow-capability`.
-        let mut consent = ConsentPolicy::new();
-        for raw in &args.allow_capability {
-            let id = CapabilityId::parse(raw)
-                .map_err(|e| invalid_args(format!("--allow-capability {raw:?}: {e}")))?;
-            consent.allow(id);
-        }
-
-        let gateway = MeshGateway::new(Arc::clone(&mesh))
-            .trust_equivalent_providers(args.trust_equivalent_providers);
-        let shim = Shim::new(gateway)
-            .with_consent(consent)
-            .with_pin_store(resolve_pin_store(args.pin_store.as_deref())?);
+        let shim = build_shim(&args, &mesh)?;
         Ok((mesh, shim))
     })
     .await?;
+    serve_shim(mesh, shim, None).await
+}
 
+/// The shim over `mesh`: consent seeded from `--allow-capability`, the pin
+/// store, and the equivalent-provider policy.
+fn build_shim(args: &ServeArgs, mesh: &Arc<net_sdk::Mesh>) -> Result<Shim<MeshGateway>, CliError> {
+    let mut consent = ConsentPolicy::new();
+    for raw in &args.allow_capability {
+        let id = CapabilityId::parse(raw)
+            .map_err(|e| invalid_args(format!("--allow-capability {raw:?}: {e}")))?;
+        consent.allow(id);
+    }
+    let gateway = MeshGateway::new(Arc::clone(mesh))
+        .trust_equivalent_providers(args.trust_equivalent_providers);
+    Ok(Shim::new(gateway)
+        .with_consent(consent)
+        .with_pin_store(resolve_pin_store(args.pin_store.as_deref())?))
+}
+
+/// Serve MCP on stdio until EOF or Ctrl-C, then shut the mesh down. An
+/// enrolled device's join store (`joined`) is held until the very end.
+async fn serve_shim(
+    mesh: Arc<net_sdk::Mesh>,
+    shim: Shim<MeshGateway>,
+    joined: Option<crate::commands::joined::JoinedGuard>,
+) -> Result<(), CliError> {
     // Startup budget ends here. Protocol input and service lifetime are not
     // bounded by --timeout; an idle host must not lose its running listener.
     // Serve until the host closes stdin (EOF) or the operator hits Ctrl-C.
@@ -220,6 +257,7 @@ async fn run_serve(
         mesh.shutdown().await.ok();
     }
 
+    drop(joined);
     serve_result.map_err(|e| generic(format!("mcp serve loop: {e}")))?;
     Ok(())
 }

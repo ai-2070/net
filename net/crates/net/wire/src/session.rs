@@ -93,6 +93,11 @@ pub struct NetSession {
     inorder_held: AtomicUsize,
     /// Last activity timestamp (for session timeout)
     last_activity: AtomicU64,
+    /// Last AUTHENTICATED inbound packet (heartbeats included). Unlike
+    /// `last_activity`, sends never move it: it answers "is the far end
+    /// still speaking on this session?", which is what tells a live peer
+    /// from one that restarted and abandoned it.
+    last_inbound: AtomicU64,
     /// Thread-local pool for zero-contention hot path. The single
     /// authoritative source of TX-side AEAD encryptions for this
     /// session — see the `tx_key` comment above for the
@@ -244,6 +249,8 @@ impl NetSession {
             streams: DashMap::new(),
             inorder_held: AtomicUsize::new(0),
             last_activity: AtomicU64::new(current_timestamp()),
+            // The handshake that created the session was itself inbound.
+            last_inbound: AtomicU64::new(current_timestamp()),
             thread_local_pool,
             default_reliable,
             active: AtomicBool::new(true),
@@ -1850,8 +1857,24 @@ impl NetSession {
         if !self.rx_cipher.try_admit_rx_counter(counter) {
             return false;
         }
-        self.touch();
+        self.note_inbound();
         true
+    }
+
+    /// Record an authenticated inbound packet (AEAD verified and its
+    /// counter admitted). Also refreshes `last_activity`.
+    #[inline]
+    pub fn note_inbound(&self) {
+        let now = current_timestamp();
+        self.last_inbound.store(now, Ordering::Release);
+        self.last_activity.store(now, Ordering::Release);
+    }
+
+    /// Has the far end sent an authenticated packet within `window`?
+    pub fn heard_within(&self, window: Duration) -> bool {
+        let last = self.last_inbound.load(Ordering::Acquire);
+        let window_ns = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
+        current_timestamp().saturating_sub(last) <= window_ns
     }
 
     /// Update last activity timestamp
@@ -1939,6 +1962,14 @@ impl NetSession {
     /// carrying live streams must not be swapped out from under them.
     pub fn has_open_streams(&self) -> bool {
         !self.streams.is_empty()
+    }
+
+    /// `true` if any open stream's id satisfies `counts`. Lets a caller
+    /// that knows which ids are control-plane (subprotocol frames ride a
+    /// stream whose id is the subprotocol id) ask about application
+    /// streams only.
+    pub fn has_open_streams_where(&self, counts: impl Fn(u64) -> bool) -> bool {
+        self.streams.iter().any(|entry| counts(*entry.key()))
     }
 
     /// `true` if any stream on this session has unacked in-flight

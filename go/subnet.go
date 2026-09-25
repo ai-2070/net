@@ -518,8 +518,8 @@ func DeclareSubnetBoundaries(node *MeshNode, decl SubnetBoundaryDeclaration) err
 // Applied == false is an authenticated stale/idempotent outcome — the fact
 // verified but changed nothing — NOT a transport or authority failure.
 type SubnetControlOutcome struct {
-	// Kind is "descriptor", "gateway_advertisement", "export_policy", or
-	// "revocation_floor".
+	// Kind is "descriptor", "gateway_advertisement", "export_policy",
+	// "revocation_floor", or "subject_floor".
 	Kind string
 	// Applied reports whether any state changed.
 	Applied bool

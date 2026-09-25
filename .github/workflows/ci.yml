@@ -1389,6 +1389,8 @@ jobs:
           --test subnet_assign_alloc
           --test subnet_session_auth
           --test subnet_control_facts
+          --test subnet_subject_floor
+          --test subnet_wire_admission
           --test integration_placement_filter_callback
           --test capability_broadcast
           --test capability_multihop
@@ -4977,7 +4979,10 @@ jobs:
     #   tests/dry_run.rs             — admin verb `--dry-run` envelope
     name: Net CLI tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Two full net-cli runs (~9 min each: default and rtc-bootstrap), the
+    # keychain branch, then the crash-recovery step's own `fixtures` build.
+    # 20 minutes cancelled that last step mid-compile (V3 S5/S6 heads).
+    timeout-minutes: 35
     defaults:
       run:
         working-directory: net/crates/net
@@ -5086,6 +5091,36 @@ jobs:
             2>&1 | tee /tmp/cli_keychain.log
           for t in policy_and_pin_execution_use_inspected_paths_and_defaults_stay_distinct; do
             grep -q "test $t ... ok" /tmp/cli_keychain.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
+
+      # Crash recovery at the real durable-write transitions (NET_CLI_PLAN_V3
+      # decision 7). `tests/enrollment_crash.rs` is `#![cfg(feature =
+      # "fixtures")]`: the `fixtures` feature compiles the core's crash points
+      # into `EnrollmentStorage` replacement, and no other run here enables
+      # it — so without this step the binary compiles to zero tests and every
+      # run above is silently green without it. Scoped to that one binary (a
+      # feature set is a full rebuild; see the keychain step's cost note), and
+      # each witness is pinned by name: a rename must fail here, not vanish.
+      - name: Run net-cli crash-recovery witnesses (fixtures)
+        run: |
+          set -o pipefail
+          cargo test -p net-cli --features fixtures --test enrollment_crash             2>&1 | tee /tmp/cli_crash.log
+          for t in an_operator_crash_after_the_issuance_commit_is_recovered_not_reissued                    an_operator_crash_before_the_issuance_commit_issues_exactly_once_on_retry                    a_device_crash_after_installing_its_bundle_resumes_without_redeeming_again; do
+            grep -q "test $t ... ok" /tmp/cli_crash.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
+
+      # The relay TCP-tunnel fallback through real subprocesses (NET_CLI_PLAN_V3
+      # S8). The UDP block on `relay serve` is a `fixtures` seam, so the witness
+      # is `#[cfg(feature = "fixtures")]` and only this step runs it; the same
+      # build as the step above, so no extra feature-set rebuild.
+      - name: Run net-cli relay TCP-tunnel witness (fixtures)
+        run: |
+          set -o pipefail
+          cargo test -p net-cli --features fixtures --test relay_join             2>&1 | tee /tmp/cli_relay_tcp.log
+          for t in a_relay_whose_udp_is_blocked_is_reached_over_its_tcp_tunnel; do
+            grep -q "test $t ... ok" /tmp/cli_relay_tcp.log || {
               echo "::error::$t did not run"; exit 1; }
           done
 

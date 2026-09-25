@@ -999,6 +999,13 @@ impl NetRouter {
     pub async fn send_to(&self, data: &[u8], dest: PeerAddr) -> std::io::Result<usize> {
         match dest {
             PeerAddr::Udp(addr) => self.socket.send_to(data, addr).await,
+            // A blind relay forwards only from the registered/bound endpoint,
+            // i.e. the node's mesh socket; this router socket is a different
+            // source, so the relay would drop it. Refuse rather than send.
+            PeerAddr::Relayed { .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "relayed endpoints are not reachable from the router's own socket",
+            )),
             // R5-A: total over the shared wire type — a downstream
             // consumer can enable `net-mesh-wire/webrtc` without the
             // core's feature, and this crate then has no driver to
@@ -1053,7 +1060,8 @@ impl NetRouter {
         let drop_counter = self.test_drop_counter.clone();
         #[cfg(feature = "webrtc")]
         let rtc = self.rtc.clone();
-        #[cfg(feature = "webrtc")]
+        // Counts packets this loop cannot send: RTC refusals, and relayed
+        // destinations (never sendable from the router's own socket).
         let dropped = self.packets_dropped.clone();
 
         Some(tokio::spawn(async move {
@@ -1109,6 +1117,11 @@ impl NetRouter {
                                 PeerAddr::Udp(addr) => {
                                     let _ = socket.send_to(&first.data, addr).await;
                                 }
+                                // Not sendable from this socket (see
+                                // `NetRouter::send_to`): count the drop.
+                                PeerAddr::Relayed { .. } => {
+                                    dropped.fetch_add(1, Ordering::Relaxed);
+                                }
                                 // R5-A: see `NetRouter::send_to`.
                                 #[cfg(not(feature = "webrtc"))]
                                 #[allow(
@@ -1161,9 +1174,16 @@ impl NetRouter {
                         // Endpoint-variant partition for the flush. Only
                         // `Udp` is live; the grouping above, `MAX_DRAIN`
                         // and the drain instrumentation stay whole-drain.
+                        // Relayed destinations are not sendable from this
+                        // socket (see `NetRouter::send_to`): count the drops.
+                        if matches!(*dest, PeerAddr::Relayed { .. }) {
+                            dropped.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            continue;
+                        }
                         #[cfg(feature = "webrtc")]
                         let dest = match *dest {
                             PeerAddr::Udp(addr) => addr,
+                            PeerAddr::Relayed { .. } => continue,
                             PeerAddr::Rtc(id) => {
                                 // One at a time: str0m's contract is
                                 // one `Channel::write` per drain, so

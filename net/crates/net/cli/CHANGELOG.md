@@ -8,6 +8,59 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — managed nodes, join links, relations and leave
+
+**Nodes and links**
+- New `up` / `down` / `node status`: one long-lived node per profile, a
+  lifetime lock and an authenticated local control endpoint.
+- `up` generates and keeps the mesh PSK on first start, or takes it from
+  `--psk-from file:<path>` / `stdin`. A literal PSK is never accepted on the
+  command line.
+- New `up --enroll`, `invite create|inspect|status|revoke|approve|deny`,
+  `join` and `leave`.
+  - A `netmesh-join_` link joins a clean device without hand-installed
+    secrets. Direct attach is tried first, then the relay (`relay serve`,
+    `up --relay`).
+  - Links are bearer secrets unless bound with `--for`.
+  - `--require-approval` holds issuance for `invite approve`.
+
+**Relations one link can carry**
+- A subnet attachment: `--subnet`, with `up --subnet-issuer-grant/--subnet-issuer-key`.
+- Org membership: `--org`, always approved with `org approve --org-key`.
+- A channel credential: `--channel` / `--channel-rights`, with
+  `up --channel-grant` from the offline `channel issue-grant`.
+- A device already on the mesh adds one relation with `subnet invite|join`
+  or `org invite|join`.
+
+**Channels**
+- New `channel serve` (persisted gating), `channel status`,
+  `channel publish` and `channel leave [<name>]`.
+- New `channel invite` / `channel join`: add a channel to an already-joined
+  device with a standalone link.
+- Subscription and publish readiness are reported from the live session and
+  the node's own gate, never implied by holding a credential.
+
+**Removal and leave**
+- New `subnet remove`, `org remove`, and `subnet members` / `org members`.
+  - Removal is reported per named node from its own signed attestation;
+    `complete` holds only when all of them persisted it.
+  - Members are listed as "issued" versus "observed here", never a global
+    roster.
+- One active subnet attachment per verifier. `subnet join --switch` and
+  `subnet activate <scope>` switch it explicitly.
+- New `subnet leave`, `org leave` and `channel leave`. Each is local and
+  durable, and survives restart. None of them revokes.
+
+**Enrolled consumers**
+- New `wrap --joined <state-dir>` / `mcp serve --joined <state-dir>`: run as
+  the enrolled device.
+  - It refuses while `up` owns the join, and refuses `--psk-hex`.
+  - An explicit `--node-addr/--node-pubkey/--node-id` names the peer.
+
+**Help text**
+- The top-level help for `org`, `node`, `subnet` and `channel` now
+  describes these verbs.
+
 ## Unreleased — one bind/PSK validation for every verb
 
 - A malformed `--bind` / profile `bind` literal is now one exit-code class on

@@ -37,6 +37,10 @@ use crate::prelude::{emit_value, OutputFormat};
 pub enum NodeCommand {
     /// Adopt this node into an organization (install ownership).
     Adopt(AdoptArgs),
+
+    /// Report the state of this profile's `net-mesh up` node, verified
+    /// through its lifetime lock and authenticated control endpoint.
+    Status(crate::commands::lifecycle::StatusArgs),
 }
 
 #[derive(Args, Debug)]
@@ -71,6 +75,11 @@ pub struct AdoptArgs {
     /// `net-mesh org issue-floors`) to merge during adoption.
     #[arg(long, value_name = "PATH")]
     pub floors: Option<PathBuf>,
+    /// The org's shared owner audience (`org audience-keygen`), installed
+    /// instead of a node-local one so this node can discover other members'
+    /// private services.
+    #[arg(long, value_name = "PATH")]
+    pub audience: Option<PathBuf>,
 
     /// Clock-skew tolerance (seconds) for the certificate window
     /// check. Strict by default, mirroring the token module;
@@ -93,6 +102,9 @@ pub async fn run(
 ) -> Result<(), CliError> {
     match cmd {
         NodeCommand::Adopt(args) => run_adopt(args, output, config_path, profile_name).await,
+        NodeCommand::Status(args) => {
+            crate::commands::lifecycle::run_status(args, output, profile_name).await
+        }
     }
 }
 
@@ -245,14 +257,31 @@ async fn run_adopt(
     // floors durably, and publishes membership last. Sync file I/O
     // on a oneshot CLI path; the same pattern as `identity
     // revoke`'s store write.
-    let authority = NodeAuthority::adopt(
-        &dir,
-        cert_file.cert,
-        &entity,
-        args.skew_secs,
-        floors_bundle.as_ref(),
-    )
+    let audience = match &args.audience {
+        Some(path) => Some(super::org::load_org_audience(path, false).await?),
+        None => None,
+    };
+    let authority = match &audience {
+        // The org's shared audience rather than a node-local one.
+        Some(audience) => NodeAuthority::adopt_with_audience(
+            &dir,
+            cert_file.cert,
+            &entity,
+            args.skew_secs,
+            floors_bundle.as_ref(),
+            audience,
+        ),
+        None => NodeAuthority::adopt(
+            &dir,
+            cert_file.cert,
+            &entity,
+            args.skew_secs,
+            floors_bundle.as_ref(),
+        ),
+    }
     .map_err(|e| sdk(format!("adopt refused: {e}")))?;
+    // An explicit, authorized adoption ends a recorded `org leave`.
+    super::lifecycle::clear_org_left(&dir);
 
     let summary = AdoptOutput {
         authority_dir: dir.display().to_string(),

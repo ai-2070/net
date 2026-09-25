@@ -66,6 +66,35 @@ use crate::identity::{EntityId, Identity, TokenError, TOKEN_CLOCK_SKEW_SECS_RECO
 /// Does not change the legacy delegation-based enrollment APIs in this module.
 pub mod policy;
 
+// Signed membership invite (`netmesh-join_` token) and canonical redemption intent.
+pub mod invite;
+
+// Router TCP port mapping for the enrollment listener (UPnP / NAT-PMP / PCP).
+#[cfg(feature = "port-mapping")]
+pub mod portmap;
+
+// PSK-free Noise enrollment session: protocol, responder key and client.
+pub mod redeem;
+// Subnet leaf renewal (V3-2 task 5).
+pub mod renew;
+// Standalone subnet join over an existing session (V3-2 task 3).
+pub mod standalone;
+// Organization membership in enrollment: approval-time certificates.
+pub mod org;
+
+// Enrollment redemption listener over the shared ledger.
+pub mod service;
+
+// Membership-only bundle (signed receipt + PSK + contact) and its issuer.
+pub mod bundle;
+
+// Device-side durable join: persist, redeem, verify, install.
+pub mod device;
+
+// Durable, issuer-bound invitation ledger for the same V3 path; not a verifier.
+// (Outer `///` docs here would resolve the module's intra-doc links in this scope.)
+pub mod store;
+
 // Re-export the anchor type so `net_sdk::enrollment` is a complete surface.
 pub use crate::delegation::RevocationRegistry;
 

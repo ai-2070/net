@@ -47,6 +47,7 @@
 //! stages having landed; later stages lift performance without
 //! changing the correctness contract.
 
+pub mod blind_relay;
 pub mod classify;
 pub mod config;
 #[cfg(feature = "port-mapping")]

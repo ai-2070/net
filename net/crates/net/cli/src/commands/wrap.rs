@@ -144,6 +144,13 @@ pub struct WrapArgs {
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
+    /// Run as the device enrolled in this state directory (as given to
+    /// `join` / `up`): its identity, mesh PSK and the node it enrolled with,
+    /// instead of `--identity` and a remote peer. `up` must not be running
+    /// on it.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["identity", "listen"])]
+    pub joined: Option<PathBuf>,
+
     /// The mesh peer to join.
     #[command(flatten)]
     pub remote: RemoteAttachArgs,
@@ -163,12 +170,16 @@ pub async fn run(
     let profile =
         crate::deadline::run_optional(deadline, resolve_profile(config_path, profile_name)).await?;
 
+    let joined_peer = match &args.joined {
+        Some(_) => crate::commands::joined::peer_override(&args.remote)?,
+        None => None,
+    };
     let listener = if args.listen {
         Some(resolve_listener(&profile, &args.remote)?)
     } else {
         None
     };
-    let remote = if args.listen {
+    let remote = if args.listen || args.joined.is_some() {
         None
     } else {
         Some(require_remote_attach_with_bind(
@@ -214,42 +225,62 @@ pub async fn run(
         return view.emit(output);
     }
 
-    // Operator identity — owner-only keys on this node's origin.
-    let identity_path = args
-        .identity
-        .as_deref()
-        .or(profile.identity.as_deref())
-        .ok_or_else(|| {
-            invalid_args(
-                "net-mesh wrap needs an operator identity: pass --identity <PATH> or set \
-                 `identity = \"...\"` in your profile. Owner-only scoping keys on it, \
-                 so an ephemeral key would admit nobody.",
+    // Operator identity — owner-only keys on this node's origin. An enrolled
+    // device (`--joined`) runs as its enrolled identity instead.
+    let identity = match &args.joined {
+        Some(_) => None,
+        None => {
+            let identity_path = args
+                .identity
+                .as_deref()
+                .or(profile.identity.as_deref())
+                .ok_or_else(|| {
+                    invalid_args(
+                        "net-mesh wrap needs an operator identity: pass --identity <PATH> or set \
+                         `identity = \"...\"` in your profile. Owner-only scoping keys on it, \
+                         so an ephemeral key would admit nobody.",
+                    )
+                })?;
+            Some(
+                crate::deadline::run_optional(deadline, load_operator_identity(identity_path))
+                    .await?,
             )
-        })?;
-    let identity =
-        crate::deadline::run_optional(deadline, load_operator_identity(identity_path)).await?;
+        }
+    };
+    let joined_bind = args
+        .remote
+        .bind
+        .clone()
+        .or(profile.bind.clone())
+        .unwrap_or_else(|| crate::context::DEFAULT_SERVICE_BIND.to_string());
 
     // Build a mesh under that identity and join via the peer. `Arc` because
     // the publisher (and each publication) holds the mesh alongside us.
-    let mesh = std::sync::Arc::new(
-        crate::deadline::run_optional(deadline, async {
-            if let Some((bind, psk)) = listener {
-                let mesh = net_sdk::MeshBuilder::new(&bind.to_string(), &psk)
-                    .map_err(|e| connection_failure(format!("listener configuration: {e}")))?
-                    .identity(identity)
-                    .build()
-                    .await
-                    .map_err(|e| connection_failure(format!("listener startup: {e}")))?;
-                mesh.start();
-                Ok(mesh)
-            } else if let Some(remote) = remote.as_ref() {
-                build_attached_mesh(Some(identity), remote).await
-            } else {
-                Err(invalid_args("wrap needs --listen or a remote peer"))
-            }
-        })
-        .await?,
-    );
+    let (mesh, _joined_guard) = crate::deadline::run_optional(deadline, async {
+        if let Some(dir) = &args.joined {
+            let (mesh, path, guard) =
+                crate::commands::joined::attach(dir, &joined_bind, joined_peer.clone()).await?;
+            eprintln!("net-mesh wrap: running as the enrolled device ({path} attach)");
+            return Ok((mesh, Some(guard)));
+        }
+        let identity = identity.ok_or_else(|| invalid_args("wrap needs an operator identity"))?;
+        if let Some((bind, psk)) = listener {
+            let mesh = net_sdk::MeshBuilder::new(&bind.to_string(), &psk)
+                .map_err(|e| connection_failure(format!("listener configuration: {e}")))?
+                .identity(identity)
+                .build()
+                .await
+                .map_err(|e| connection_failure(format!("listener startup: {e}")))?;
+            mesh.start();
+            Ok((mesh, None))
+        } else if let Some(remote) = remote.as_ref() {
+            Ok((build_attached_mesh(Some(identity), remote).await?, None))
+        } else {
+            Err(invalid_args("wrap needs --listen or a remote peer"))
+        }
+    })
+    .await?;
+    let mesh = std::sync::Arc::new(mesh);
 
     // Parse the rest of the operator's intent.
     let (program, prog_args) = args

@@ -18,8 +18,9 @@ explains the boundary between the two systems.
 - **A running mesh peer to join.** `net-mesh wrap` builds a node and _joins_ the mesh via
   a peer — it does not bootstrap the first node. If you don't have one, stand up a
   bootstrap node via the SDK ([Discover and Invoke](/docs/guides/discover-and-invoke))
-  and note its `--node-addr` / `--node-pubkey` / `--psk-hex`. There is no `net up`
-  one-liner yet — do not invent one.
+  and note its `--node-addr` / `--node-pubkey` / `--psk-hex`, or use a managed node:
+  `net-mesh up --enroll` there, `net-mesh join <token>` here, then wrap with
+  `--joined <state-dir>`.
 
 ## Steps
 
