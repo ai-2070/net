@@ -1,6 +1,6 @@
 [package]
 name = "net-mesh-wire"
-version = "0.36.0"
+version = "0.37.0"
 edition = "2021"
 description = "Net mesh wire layer: packet protocol, Noise handshake, packet AEAD, reliability, sessions and the routing envelope. tokio-free and wasm32-clean."
 license = "MIT OR Apache-2.0"

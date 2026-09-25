@@ -51,7 +51,7 @@ jobs:
           key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
 
       # `net-mesh-wire` publishes BEFORE the root crate: `net-mesh`
-      # depends on it by `version = "0.36.0", path = "wire"`, and
+      # depends on it by `version = "0.37.0", path = "wire"`, and
       # cargo resolves the version half against crates.io at publish
       # time. It has no workspace dependencies of its own, so it can
       # be dry-run and published independently.

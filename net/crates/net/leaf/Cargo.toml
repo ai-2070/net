@@ -1,6 +1,6 @@
 [package]
 name = "net-mesh-leaf"
-version = "0.36.0"
+version = "0.37.0"
 edition = "2021"
 description = "Net mesh leaf profile: the browser-side node over net-mesh-wire — sessions, streams, dispatcher, channels, nRPC client, and the control-plane boundary. wasm32 first."
 license = "MIT OR Apache-2.0"

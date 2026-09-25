@@ -25,7 +25,7 @@ members = [
 
 [package]
 name = "net-mesh"
-version = "0.36.0"
+version = "0.37.0"
 edition = "2021"
 description = "High-performance, schema-agnostic, backend-agnostic event bus"
 license = "MIT OR Apache-2.0"
@@ -253,7 +253,7 @@ cli = ["dataforts", "redex-disk", "dep:clap"]
 # handshake, packet AEAD, reliability, sessions, the routing envelope.
 # tokio-free and wasm32-clean; the core re-exports every module of it
 # under its previous path.
-net-mesh-wire = { version = "0.36.0", path = "wire", features = ["json"] }
+net-mesh-wire = { version = "0.37.0", path = "wire", features = ["json"] }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
@@ -421,7 +421,7 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 # The wire crate's own surface, for `tests/cross_lang_wire.rs`: the
 # AEAD golden vector is asserted against the seam directly, so the
 # fixture pins the backend rather than only the packet path above it.
-net-mesh-wire = { version = "0.36.0", path = "wire", features = ["json", "test-vectors"] }
+net-mesh-wire = { version = "0.37.0", path = "wire", features = ["json", "test-vectors"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 # `heartbeat_api_drift_check`'s workspace-layout classifier is
 # witnessed over synthetic trees (a packaged crate, the same tree

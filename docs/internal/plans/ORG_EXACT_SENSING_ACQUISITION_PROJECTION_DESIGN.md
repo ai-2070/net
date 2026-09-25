@@ -2653,7 +2653,7 @@ fixtures = ["net/fixtures"]
 # `package =` + a short key is the in-repo idiom (sdk/Cargo.toml:25, :88), and it
 # is required here: the lib is named `net`, not `net-mesh`, so `use net::…` is
 # what compiles.
-net = { package = "net-mesh", version = "0.36.0", path = "../..", default-features = false, features = ["net"] }
+net = { package = "net-mesh", version = "0.37.0", path = "../..", default-features = false, features = ["net"] }
 
 [[bin]]
 name = "fixtures_off_probe"
@@ -2799,7 +2799,7 @@ publish = false
 fixtures = ["net/fixtures"]
 
 [dependencies]
-net = { package = "net-mesh", version = "0.36.0", path = "../..", default-features = false, features = ["net"] }
+net = { package = "net-mesh", version = "0.37.0", path = "../..", default-features = false, features = ["net"] }
 
 [dev-dependencies]
 # Present ONLY in this crate. `trybuild` is absent from the net-mesh workspace and

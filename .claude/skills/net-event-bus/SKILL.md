@@ -4,8 +4,8 @@ description: "Use this skill when integrating the Net library (`@net-mesh/sdk`, 
 allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 metadata:
   skill-version: 1.14.0
-  last-updated: 2026-09-25
-  net-version: 0.36.0
+  last-updated: 2026-09-26
+  net-version: 0.37.0
 ---
 
 # Net as an Event Bus

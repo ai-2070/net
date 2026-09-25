@@ -311,7 +311,7 @@ fn net_workspace_detection_needs_every_layout_marker() {
     // A packaged crate: manifest, sources, no `wire/` member.
     std::fs::write(
         root.join("Cargo.toml"),
-        "[package]\nname = \"net-mesh\"\n\n[dependencies]\nnet-mesh-wire = { version = \"0.36.0\" }\n",
+        "[package]\nname = \"net-mesh\"\n\n[dependencies]\nnet-mesh-wire = { version = \"0.37.0\" }\n",
     )
     .expect("write manifest");
     assert!(
@@ -350,7 +350,7 @@ fn net_workspace_detection_needs_every_layout_marker() {
     std::fs::write(
         root.join("Cargo.toml"),
         "[workspace]\nmembers = [\n    \".\",\n    \"wire\",\n]\n\n[package]\nname = \"net-mesh\"\n\n\
-         [dependencies]\nnet-mesh-wire = { version = \"0.36.0\" }\n",
+         [dependencies]\nnet-mesh-wire = { version = \"0.37.0\" }\n",
     )
     .expect("write member-only manifest");
     assert!(
@@ -363,7 +363,7 @@ fn net_workspace_detection_needs_every_layout_marker() {
     std::fs::write(
         root.join("Cargo.toml"),
         "[workspace]\nmembers = [\n    \".\",\n    \"wire\",\n]\n\n[package]\nname = \"net-mesh\"\n\n\
-         [dependencies]\nnet-mesh-wire = { version = \"0.36.0\", path = \"wire\" }\n",
+         [dependencies]\nnet-mesh-wire = { version = \"0.37.0\", path = \"wire\" }\n",
     )
     .expect("write complete manifest");
     assert!(
