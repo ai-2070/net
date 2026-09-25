@@ -334,9 +334,8 @@ behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/m
 
 ## Claude Code Skill
 
-Net looks like Kafka or NATS from the outside and is not one underneath; an agent working from
-surface familiarity will write integration code that runs and is quietly wrong. Install the
-skills first:
+An agent working from surface familiarity will write integration code that runs and is quietly
+wrong. Install the skills first:
 
 ```bash
 npx skills add ai-2070/net-claude-skill -g     # drop -g for the current project only
