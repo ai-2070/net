@@ -5945,7 +5945,7 @@ jobs:
       # which must build; the failing leg is the middle one.
       - name: Wire-feature consumer graph (R5-A)
         if: ${{ !cancelled() }}
-        working-directory: spikes/tools/feature_consumer
+        working-directory: net/crates/net/tests/feature_consumer
         run: |
           cargo check --locked
           cargo check --locked --features wire-only

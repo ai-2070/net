@@ -1,5 +1,9 @@
 # Browser-Native Net over WebRTC Plan
 
+> The top-level `spikes/` tree cited throughout this plan (briefs, scratch
+> crates, probes, receipts) was removed; every `spikes/...` path resolves at
+> `4a98529f2`. See [`spikes/README.md`](../spikes/README.md).
+
 Make a browser tab a first-class Net node: its own entity identity, its own
 Noise sessions, its own streams, channels, nRPC calls and fold participation —
 with WebRTC DataChannels as the **primary** transport so browser ↔ browser and

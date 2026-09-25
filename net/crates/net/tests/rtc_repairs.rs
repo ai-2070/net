@@ -5280,7 +5280,8 @@ async fn a_peer_without_the_reassembly_tag_still_gets_event_too_large() {
 
 /// **R4-5.** One normal expiry pass retains EVERY distinct terminal
 /// owner — Kyra's fourth-review native mechanism
-/// (`spikes/kyra/kyra_5_round4_native_terminal_wrapper.rs`), landed as
+/// (`spikes/kyra/kyra_5_round4_native_terminal_wrapper.rs` at
+/// `4a98529f2`; `spikes/` has since been removed), landed as
 /// a pinned test with her property, her counts and her assertion
 /// message. Her wrapper compiled the candidate `rtc/fragment.rs` by
 /// `#[path]` from a detached worktree because it ran outside the
