@@ -1,0 +1,14 @@
+README.md
+  h_64425bc75e3f3d 46-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9a0c3818f0f2afde50953357f873c12d5cd955cc",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
