@@ -2749,8 +2749,11 @@ async fn a_retained_stream_handle_cannot_address_a_same_id_successor() {
                 .and_then(|value| value.as_string())
         })
         .unwrap_or_default();
+    // Pin the STALE-GENERATION arm, not just any not-leader refusal: the
+    // handle presents generation 1 against a successor at 2 (§23 audit —
+    // "not the leader" alone also matches a plain not-leader error).
     assert!(
-        message.contains("not the leader"),
+        message.contains("not the leader") && message.contains("holds generation 1"),
         "the refusal must be the typed stale-generation one, not any failure: {message:?}"
     );
     stale.close();

@@ -1192,11 +1192,12 @@ fn live_call_id_reuse_is_active_call_owned_with_exactly_one_refusal() {
         "a live key is refused before any of it is decoded into state"
     );
     let down = l.provider_out();
-    assert_eq!(terminals(&down), 1, "exactly one refusal terminal");
-    assert_eq!(
-        responses(&down),
-        vec![denied(CoarseAdmissionReason::Denied)]
+    assert!(
+        down.is_empty(),
+        "a refusal under a live key sends NO frame — the live call owes the caller its one \
+         terminal (§23 audit: the flipped-id frame could land on the caller's other call table)"
     );
+    assert_eq!(l.serves.live_key_refusals(), 1, "the refusal is counted");
     assert_eq!(l.serves.live_calls(), 1, "the live call is untouched");
 
     // And it still ends with its OWN single terminal afterwards.
@@ -1275,33 +1276,17 @@ fn a_refusal_reusing_a_live_call_id_never_latches_the_calls_terminal() {
         ),
     );
 
-    // Every refusal is terminal-shaped on the wire, but NONE rides the
-    // live call's id.
+    // No refusal under the live key reaches the wire at all: the typed
+    // outcomes above are the whole answer, and each is counted. (The
+    // first repair sent them on `id ^ 2^63`, which a leaf caller can hold
+    // live in its other call table — §23 audit; before that they rode
+    // `id` itself and the first was consumed as the call's terminal.)
     let down = l.provider_out();
-    assert_eq!(terminals(&down), 3, "three refusal terminals");
-    assert_eq!(
-        responses(&down),
-        vec![
-            denied(CoarseAdmissionReason::Denied),
-            denied(CoarseAdmissionReason::Denied),
-            RpcResponsePayload {
-                status: RpcStatus::UnknownVersion,
-                headers: vec![(
-                    HEADER_NRPC_STREAMING.to_string(),
-                    HEADER_NRPC_STREAMING_END.to_vec(),
-                )],
-                body: Bytes::from_static(
-                    b"malformed request: the request names a different service than its carrier serves"
-                ),
-            },
-        ],
-        "the typed refusals, byte-exact"
-    );
     assert!(
-        down.iter().all(|o| o.call_id != id),
-        "no refusal may ride the live call's id \
-         (pre-fix: each did — the first was consumed as the call's terminal)"
+        down.is_empty(),
+        "no refusal frame under a live key: {down:?}"
     );
+    assert_eq!(l.serves.live_key_refusals(), 3, "every refusal is counted");
 
     // Fed to the caller they neither latch nor disarm anything.
     l.feed_caller(down);

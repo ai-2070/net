@@ -497,6 +497,9 @@ pub struct ServeRegistry {
     /// signature work and charged on every denial except
     /// `AuthorityChanged` (D7).
     failure_limiter: AdmissionFailureLimiter,
+    /// Refusals answered with NO wire frame because their key was live
+    /// (see [`Self::key_is_live`]).
+    live_key_refusals: u64,
     out: VecDeque<ServeOutFrame>,
 }
 
@@ -521,8 +524,15 @@ impl ServeRegistry {
             openings: HashSet::new(),
             calls: HashMap::new(),
             failure_limiter: AdmissionFailureLimiter::with_defaults(),
+            live_key_refusals: 0,
             out: VecDeque::new(),
         }
+    }
+
+    /// How many refusals were answered with no wire frame because a
+    /// call (or an in-flight opening) already owned their key.
+    pub fn live_key_refusals(&self) -> u64 {
+        self.live_key_refusals
     }
 
     /// Register one service. The node pairs this with reserving the
@@ -636,9 +646,8 @@ impl ServeRegistry {
 
         // §3 step 1 — RESERVE the active key before any signature
         // work. A live key (or one already opening) is refused
-        // `ActiveCallOwned`; its frame rides the distinct id
-        // (`refusal_wire_id`) so the live call keeps its own single
-        // terminal.
+        // `ActiveCallOwned` with NO wire frame (`key_is_live`), so the
+        // live call keeps its own single terminal.
         let key = (from.peer, from.incarnation, call_id);
         if self.calls.contains_key(&key) || self.openings.contains(&key) {
             return self.refuse_denied(
@@ -1065,34 +1074,44 @@ impl ServeRegistry {
             self.failure_limiter.on_failure(from.peer, now_mono_ms);
         }
         let payload = denial_payload(reason.coarse());
-        let wire_id = self.refusal_wire_id(from, call_id);
-        self.emit_terminal(from, service, wire_id, &payload);
+        self.emit_refusal(from, service, call_id, &payload);
         OpenOutcome::Denied(reason)
     }
 
-    /// The wire id a refusal frame may ride: the request's `call_id`,
-    /// UNLESS a call (or an in-flight opening) already owns that key —
-    /// then the `2^63` flip. Exactly ONE terminal per call_id on the
-    /// wire: the live call's own single terminal must be the only
-    /// terminal-shaped frame its id ever carries (the caller's latch is
-    /// first-writer-wins, and LATCHING DISARMS the drop-CANCEL guard),
-    /// and ANY refusal reaching this under a live key — the
-    /// `ActiveCallOwned` duplicate, or a crafted REQUEST reusing the id
-    /// with wrong flags / a wrong service / a zero window — would be
-    /// consumed as that call's terminal (self-inflicted desync). The
-    /// flip keeps the refusal id `2^63` from any id the caller's
-    /// counter can hold live — the same "2^63 apart" id discipline the
-    /// caller mints under — and a reply naming an id no call holds is
-    /// ignored by the caller's registry. A refusal for a FRESH key
-    /// keeps its `call_id`: that frame IS the caller's latch for the
-    /// refused opening.
-    fn refusal_wire_id(&self, from: &ServePeer, call_id: u64) -> u64 {
+    /// Whether a call (or an in-flight opening) already owns this key.
+    /// A refusal under a live key sends NO wire frame: exactly one
+    /// terminal per call_id on the wire, and the live call's own single
+    /// terminal must be the only terminal-shaped frame its id ever
+    /// carries (the caller's latch is first-writer-wins, and LATCHING
+    /// DISARMS the drop-CANCEL guard). ANY refusal reaching this under a
+    /// live key — the `ActiveCallOwned` duplicate, or a crafted REQUEST
+    /// reusing the id with wrong flags / a wrong service / a zero window
+    /// — would otherwise be consumed as that call's terminal. Nothing is
+    /// owed to the sender: the live call already guarantees the caller
+    /// its one terminal. (The first repair sent the refusal on
+    /// `call_id ^ 2^63` instead; a leaf caller seeds its stream table at
+    /// `seed ^ 2^63`, so that id can be the same caller's OTHER live call
+    /// — §23 audit.) A refusal for a FRESH key keeps its `call_id`: that
+    /// frame IS the caller's latch for the refused opening.
+    fn key_is_live(&self, from: &ServePeer, call_id: u64) -> bool {
         let key = (from.peer, from.incarnation, call_id);
-        if self.calls.contains_key(&key) || self.openings.contains(&key) {
-            call_id ^ (1 << 63)
-        } else {
-            call_id
+        self.calls.contains_key(&key) || self.openings.contains(&key)
+    }
+
+    /// Emit a refusal frame for `call_id` unless its key is live (then
+    /// count it and send nothing — see [`Self::key_is_live`]).
+    fn emit_refusal(
+        &mut self,
+        from: &ServePeer,
+        service: &str,
+        call_id: u64,
+        payload: &RpcResponsePayload,
+    ) {
+        if self.key_is_live(from, call_id) {
+            self.live_key_refusals += 1;
+            return;
         }
+        self.emit_terminal(from, service, call_id, payload);
     }
 
     /// The §6 throttle refusal (core's `OpeningRefusal::Throttled`):
@@ -1100,8 +1119,7 @@ impl ServeRegistry {
     /// `on_failure` charge (the limiter counted this denial itself).
     fn refuse_throttled(&mut self, from: &ServePeer, service: &str, call_id: u64) -> OpenOutcome {
         let payload = denial_payload(CoarseAdmissionReason::Unavailable);
-        let wire_id = self.refusal_wire_id(from, call_id);
-        self.emit_terminal(from, service, wire_id, &payload);
+        self.emit_refusal(from, service, call_id, &payload);
         OpenOutcome::Throttled
     }
 
@@ -1122,8 +1140,7 @@ impl ServeRegistry {
             )],
             body: Bytes::from(format!("malformed request: {what}")),
         };
-        let wire_id = self.refusal_wire_id(from, call_id);
-        self.emit_terminal(from, service, wire_id, &payload);
+        self.emit_refusal(from, service, call_id, &payload);
         OpenOutcome::Malformed(what.to_string())
     }
 
