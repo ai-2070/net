@@ -26,6 +26,7 @@ name: Skills
 #
 #   .claude/skills/net-event-bus/  ->  net-event-bus/
 #   .claude/skills/net-payments/   ->  net-payments/
+#   .claude/skills/net-browser/    ->  net-browser/
 #   .claude/skills/README.md       ->  README.md
 #
 # Anything else over there (LICENSE-APACHE, LICENSE-MIT, sync.sh) is left alone.
@@ -85,6 +86,11 @@ on:
       - "net/crates/net/include/**"
       - "net/crates/net/docs/**"
       - "net/crates/net/tests/**"
+      # The browser leaf and its page package: `browser.md` documents them, so
+      # a move there must re-run the checks that police that prose.
+      - "net/crates/net/leaf/**"
+      - "net/crates/net/browser-ts/**"
+      - "net/crates/net/examples/**"
       # Dependency or API resolution can shift without a source edit.
       - "Cargo.lock"
       - "go/go.mod"
@@ -136,6 +142,11 @@ on:
       - "net/crates/net/include/**"
       - "net/crates/net/docs/**"
       - "net/crates/net/tests/**"
+      # The browser leaf and its page package: `browser.md` documents them, so
+      # a move there must re-run the checks that police that prose.
+      - "net/crates/net/leaf/**"
+      - "net/crates/net/browser-ts/**"
+      - "net/crates/net/examples/**"
       # Dependency or API resolution can shift without a source edit.
       - "Cargo.lock"
       - "go/go.mod"
@@ -440,7 +451,7 @@ jobs:
       - name: Copy the skills across
         run: |
           set -euo pipefail
-          for skill in net-event-bus net-payments; do
+          for skill in net-event-bus net-payments net-browser; do
             test -f ".claude/skills/$skill/SKILL.md" || {
               echo "::error::.claude/skills/$skill/SKILL.md is missing — refusing to publish"
               exit 1

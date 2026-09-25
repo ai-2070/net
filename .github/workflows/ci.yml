@@ -6176,8 +6176,14 @@ jobs:
           cargo test --features mock-control-plane 2>&1 | tee /tmp/leaf-native.log
           total=$(grep -c '^test .* \.\.\. ok$' /tmp/leaf-native.log || true)
           echo "leaf native tests: $total"
-          if [ "$total" -lt 308 ]; then
-            echo "::error::the leaf's native surface ran $total tests, floor is 308 — \
+          # FLOOR is the measured inventory of this exact command: 264 lib
+          # units + 81 across the ten native integration binaries (the four
+          # `wasm_*` binaries compile to 0 tests natively, by design, and
+          # doctests are 0). No test in the leaf is `#[cfg(unix)]`/
+          # `#[cfg(windows)]`, so the count is platform-independent.
+          # Raise it in the SAME commit as the witnesses it counts.
+          if [ "$total" -lt 345 ]; then
+            echo "::error::the leaf's native surface ran $total tests, floor is 345 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
