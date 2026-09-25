@@ -1,6 +1,6 @@
 [package]
 name = "net-payments"
-version = "0.37.0"
+version.workspace = true
 edition = "2021"
 # Benches are registered explicitly with `[[bench]]` (see the bottom of
 # this file). `autobenches = false` keeps Cargo from auto-discovering

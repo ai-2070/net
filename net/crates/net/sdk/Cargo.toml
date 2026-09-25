@@ -1,6 +1,6 @@
 [package]
 name = "net-mesh-sdk"
-version = "0.37.0"
+version.workspace = true
 edition = "2021"
 description = "Ergonomic Rust SDK for the Net mesh network"
 license = "MIT OR Apache-2.0"

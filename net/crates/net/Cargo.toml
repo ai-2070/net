@@ -23,9 +23,16 @@ members = [
     "bindings/go/net-ffi",
 ]
 
+[workspace.package]
+# THE version of every crate in this workspace (each member inherits it with
+# `version.workspace = true`). Bump it here; the version-consistency check
+# (.github/scripts/check-versions.py) fails CI on any published manifest,
+# internal dependency or package file that disagrees.
+version = "0.37.0"
+
 [package]
 name = "net-mesh"
-version = "0.37.0"
+version.workspace = true
 edition = "2021"
 description = "High-performance, schema-agnostic, backend-agnostic event bus"
 license = "MIT OR Apache-2.0"

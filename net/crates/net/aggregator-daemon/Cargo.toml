@@ -1,6 +1,6 @@
 [package]
 name = "net-aggregator-daemon"
-version = "0.37.0"
+version.workspace = true
 edition = "2021"
 description = "Long-running daemon that hosts net-mesh AggregatorRegistry + aggregator groups"
 license = "MIT OR Apache-2.0"

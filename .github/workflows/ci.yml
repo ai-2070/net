@@ -3900,6 +3900,18 @@ jobs:
           python3 .github/scripts/check-npm-platform-packages.py
           python3 .github/scripts/check-npm-platform-packages.py --self-test
 
+      # One version across every published artifact. The source of truth is
+      # `[workspace.package] version` in net/crates/net/Cargo.toml (members
+      # inherit it); the check fails on any manifest, internal path
+      # dependency, npm/Python package or `__version__` that disagrees. A
+      # manual 0.36 -> 0.37 bump once missed one internal dependency line and
+      # the workspace stopped resolving.
+      - name: Guard — every published version agrees with the workspace
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 .github/scripts/check-versions.py
+          python3 .github/scripts/check-versions.py --self-test
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 

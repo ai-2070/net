@@ -1,6 +1,6 @@
 [package]
 name = "net-ffi"
-version = "0.37.0"
+version.workspace = true
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "The single cdylib carrying every C-ABI surface Net exposes"
