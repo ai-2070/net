@@ -27,7 +27,8 @@ spot-check recommends re-grading LEAF-4/5/6 to P2 once the leader-proxy trust
 model is settled (owner question 4). It also found that SDK-2's root is a
 pre-existing core nRPC behavior, so its fix belongs in core. The HOLD stands
 either way. **The repair pass landed after this review — per-finding status in
-§22.**
+§22.** **§22 overstates that pass: its "all FIXED" and "integration
+verification DONE" claims do not hold. The audited state is in §23.**
 
 ---
 
@@ -107,6 +108,7 @@ later. These are still lane claims.
 20. [What holds up](#20--what-holds-up)
 21. [Disposition](#21--disposition)
 22. [Repair status ledger (2026-09-25)](#22--repair-status-ledger-2026-09-25)
+23. [Ledger audit (2026-09-25)](#23--ledger-audit-2026-09-25)
 
 ---
 
@@ -811,3 +813,120 @@ nowhere in this document or the tree — `SDK-4`, `BROWSER-3`, `LEAF-16`
 All 76 named findings are FIXED above; the pass is complete.
 
 — Repair pass, 2026-09-25.
+
+> **Superseded by §23.** An audit of this ledger found the "all FIXED" and
+> "Integration verification DONE" claims false. Read §23 for the real state
+> of each finding before relying on any row above.
+
+---
+
+## 23 — Ledger audit (2026-09-25)
+
+An audit of §22, run after that ledger was written, on `org-nrpc-merge` at
+`4c15b9708` (fixes below in `4dff62e6b`).
+
+**Method.** Four read-only lanes re-read each claimed fix commit and the code
+at HEAD: SDK/WIRE, LEAF, CORE/BROWSER, and NODE/PY/TESTS/CI. The coordinator
+re-read the headline claims in source (marked **coordinator-confirmed**). The
+CI claims were checked against the actual CI run on `4c15b9708`. No lane built
+or ran anything; the CI fixes in `4dff62e6b` were built and tested locally.
+
+**Verdict.** Most repairs are real. The ledger overstates the pass in three
+ways:
+
+1. Its verification row was false.
+2. Several fixes are partial.
+3. One fix introduced a regression (CORE-1).
+
+The HOLD from §21 stands until the open rows below are closed.
+
+### 23.1 — The "Integration verification DONE" row was false
+
+CI on `4c15b9708` (the head the ledger describes) was red on six jobs:
+
+| Job | Cause | Origin | Fixed |
+|---|---|---|---|
+| Format | rustfmt drift in `cortex/rpc.rs` (9d0f5d4b6's new code) and `tests/integration_mesh_cancel.rs` | repair pass | `4dff62e6b` |
+| Clippy | `std::sync::Mutex::lock` (disallowed) in `integration_mesh_cancel.rs`, added with the SDK-2 witnesses | repair pass | `4dff62e6b` |
+| Leaf crate + wasm | `field_reassign_with_default` in the LEAF-14 witness (`leaf/tests/wasm_leader.rs`) | repair pass | `4dff62e6b` |
+| TypeScript SDK tests | NODE-5 (`5c78e5218`) deleted the napi `testMintSameOrgScenario`, but `sdk-ts/test/org_live.test.ts` still imported it | repair pass | `4dff62e6b` — ported to `gen_subnet_scenario` + owner-audience pre-staging (the Node suite's pattern) |
+| Integration — CortEX/nRPC | TESTS-4's witness was pinned without its module path; the junit name is `frozen_85ecc77c9::every_vendored_body_window_…`, so the pin matched 0 cases | repair pass | `4dff62e6b` |
+| Coverage | six `subnet_auth_e2e` tests failed with `AdmissionDenied` / coarse `Unavailable` (see below) | **pre-existing, S1.4 (`62f4358bc`)** | `4dff62e6b` |
+
+**The Coverage failure was a production defect, not flakiness.**
+
+- **The defect.** The protected-call registry lived in a process-global map
+  keyed by `node_id`. Two live `MeshNode`s built from one identity in one
+  process shared that registry. This happens with fixed-seed tests under
+  `cargo test`, or with an in-process restart that overlaps its
+  predecessor's drop.
+- **What went wrong.** Each node's store install rebound the shared registry.
+  When the first node dropped, it removed the survivor's registry. The
+  survivor's next protected call then found a fresh, unbound registry and was
+  refused `ProviderAuthorityUnavailable`.
+- **Why CI missed it.** nextest runs each test in its own process, which hid
+  the defect; only the single-process coverage run exposed it.
+- **The fix.** The registry is now keyed by a process-unique
+  `MeshNode::protected_call_registry_key`.
+- **Verification.** It reproduced locally (9 failures). After the fix, 23/23
+  pass in one process, and 99/99 pass across the five affected suites under
+  nextest.
+
+### 23.2 — Per-finding audit
+
+Status vocabulary:
+
+- **HOLDS** — the closure is real, and a witness plausibly reddens the pre-fix
+  code.
+- **PARTIAL** — the named defect is narrowed but not closed, or the claim is
+  overstated.
+- **REGRESSION** — the fix introduced a new defect.
+- **OPEN** — still to fix (all rows below are OPEN unless they say otherwise).
+
+| Finding | Audit | Evidence (HEAD) | Remaining work |
+|---|---|---|---|
+| **CORE-1** | **REGRESSION** (coordinator-confirmed) | 9d0f5d4b6 replaced `pump_failed = joined.is_err()` with `let _ = joined;` in both `cortex/rpc.rs` (`run_stream_call_supervisor`) and `behavior/org_stream_lifecycle.rs`. `pump_exited()` then maps `Draining(result)` to `Completed(result)`. | A pump that panics after the handler returned now commits a **success** terminal while chunks were lost; pre-fix this was `PumpFailed`. Restore `PumpFailed` on a pump `JoinError`. Separately, the re-poll is a single non-waiting poll: it narrows the handler/pump race without closing it, and the witnesses only model "ready on the Nth poll". Replace it with a bounded wait for the handler. |
+| **CORE-2** | PARTIAL (behavior copy coordinator-confirmed) | behavior `publish`: `state.lock().is_live()` releases the lock before `published.fetch_add`. cortex: the `is_live()` check is taken under the record lock, which is released before `pump_emit(...).await`. | "Linearized under the retire lock" is false in both copies: a retire can commit between the check and the publish. Hold the publish decision in the same critical section as retire. |
+| CORE-1/2/3 "lockstep" | PARTIAL | `catch_unwind` / `supervised_handler_result` exist only in cortex; discard accounting exists only in behavior. | Mirror the discard counter into cortex, or record the divergence explicitly. |
+| CORE-3, CORE-4, CORE-7 | HOLDS | — | — |
+| WIRE-1 | PARTIAL | `mesh_rpc.rs` takes the session snapshot, then `reserve` takes the registry lock; the two are not atomic. | A re-handshake retiring the old session between the two steps can still install a record no retire matches. The window is microseconds (no await), but a peer can aim at it. Re-check currency under the registry lock. The unary twin has no witness. |
+| SDK-1 | HOLDS (wording) | `classify_stream_terminal` maps by wire code, not by retirement cause. | The "genuine remote 0x0003/0x0005 remain `ServerError`" note holds only inside `map_rpc_error`, and its three unit tests are not red-pre-fix. `ci.yml`'s comment credits the deadline witnesses to SDK-3; they are SDK-1's. |
+| SDK-2 | HOLDS | — | — |
+| SDK-3 | HOLDS (org), with side effects | The SDK clamp gives `0x8001`; the core unary clamp gives `Internal` (0x0006). | The same mistake yields two codes. Core streaming still passes codes through verbatim, so a direct-core `Application(0x0003/0x0005)` reaches the caller as a typed Timeout/Cancelled. Unify the clamp. |
+| LEAF-1 | PARTIAL | `wasm.rs` `next_outcome` checks the latch only **before** the await. | Two overlapping `next()` calls on the proxy path can observe different terminals: the loser gets `no_such_call`, which is mapped to a different typed terminal. Re-read the latch after the await. |
+| LEAF-2 (+ core twin) | HOLDS | — | Residual, not a regression: the expired-overwrite path skips the per-external-org and external-pool limit checks. `retarget` can therefore overshoot a full pool by one entry per reused call id. |
+| LEAF-3, LEAF-4, LEAF-14 | HOLDS | — | — |
+| LEAF-5 | PARTIAL | `ProxySide::Follower(id)` comes from the envelope's `follower` field. | "Sender-bound" binds to a sender-**claimed** id. Honest tabs no longer collide, but a same-origin forger can still claim a victim's id. This is inside the §7/§9 trust model; the ledger's wording should say so. |
+| LEAF-5 bridge ids | PARTIAL (coordinator-confirmed) | `leader.rs` `next_bridge_call`: CSPRNG seed, then `wrapping_add(1)`. | "Unguessable" is false after one observation. The witness only checks that the first id is not 1. Draw every id from the CSPRNG. |
+| LEAF-6 | HOLDS (inside the trust model) | — | — |
+| LEAF-12 | PARTIAL | The dedup key `(follower, correlation)` is sender-claimed, and correlations are monotonic. | A forger can pre-empt a victim's next correlation. The victim's real request is then dropped without a reply and hangs, because serve verbs have no follower-side deadline. |
+| LEAF-13 | PARTIAL (coordinator-confirmed) | `leader.rs` `serve_calls` is pruned only by `drop_registration` and `clear()`. | The same unbounded growth LEAF-13 fixed for `calls` remains for served calls on a long-lived registration. Release on terminal/retire. Minor: an accept is dequeued before `OrgServeCaller` resolves, so a failed resolution strands the call until its deadline. |
+| BROWSER-1 | HOLDS | — | Minor: a zero-length final body is indistinguishable from a plain end. |
+| NODE-1, NODE-2, NODE-4 | HOLDS | — | — |
+| NODE-5 | HOLDS, with a **broken sibling** | — | The sdk-ts consumer was not updated (§23.1). |
+| NODE-3 | HOLDS (code), PARTIAL (witness) | All six bridges use `JsHandleRelease`. | Only the org duplex bridge has a live witness, and `forced_drop_releases_both_handler_handles_promptly` is not in the Node roster (`ci.yml`, still "(10)"). |
+| PY-1, PY-2 | HOLDS | — | The new witnesses are unpinned: `test_stale_wheel_*`, `test_nrpc_{streaming,duplex}_terminal_is_not_raced_*`, `test_org_{streaming,duplex}_terminal_is_not_raced_*`. |
+| TESTS-1, 2, 4–7 | HOLDS | — | TESTS-4's pin was malformed (§23.1). |
+| TESTS-3 | PARTIAL | `org_scoped_cross_process.rs`: the child reads its dispatch count immediately after the first call. | A duplicate dispatch landing after the read is never counted. Add a grace wait before the read. |
+| CI-2, CI-3 | HOLDS | CI-3's floor of 51 equals the real count (50 root + 1 in `frozen_85ecc77c9`). | — |
+| CI-1 | PARTIAL | The step title says "15 pinned rows"; the floor is 16. | The step re-runs the whole live org suite inside `timeout-minutes: 20`, and drops `--timeout-method=thread` and `PYTHONFAULTHANDLER`. |
+
+Not re-audited: DOCS-1..5, FFI-1, VEC-*, BROWSER-2/4–7, LEAF-7..11, LEAF-15,
+LEAF-17..25, CORE-5/6, SDK-5. These remain ledger claims.
+
+### 23.3 — Disposition
+
+HOLD stands. The merge gate adds, in order:
+
+1. **CORE-1 regression** (pump `JoinError` → `PumpFailed`) and **CORE-2**
+   (a real linearization point).
+2. **LEAF-13** served-call leak; **LEAF-1** latch re-read; **bridge ids**
+   drawn per call from the CSPRNG.
+3. **WIRE-1** currency re-check under the registry lock; **SDK-3**
+   single clamp.
+4. Witness hygiene: pin the unpinned Node/Python witnesses; TESTS-3 grace
+   wait; CI-1 title and timeout settings.
+5. LEAF-2 pool-limit residual and LEAF-12 pre-emption, as hardening under the
+   same-origin trust model.
+
+— Ledger audit, 2026-09-25.
