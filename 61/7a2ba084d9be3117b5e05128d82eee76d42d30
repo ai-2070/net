@@ -1,0 +1,46 @@
+net/crates/net/bindings/python/tests/test_org_streaming_opening_vectors.py
+  s_d8b00bedd146e9::t_ed90383e3a4928 47
+docs/internal/spikes/org-streaming/S4_PYSDK.md
+  s_d8b00bedd146e9::t_d341d68a79675e 271-272,276-278,353-354
+docs/internal/misc/CODE_REVIEW_2026_09_24_ORG_STREAMING.md
+  s_d8b00bedd146e9::t_a974b77445534a 787
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_552b90d4fd289c 3798-3799,3803,3822-3824,4293-4294,4299,4308,4314-4317,4321-4323
+  s_d8b00bedd146e9::t_babd5034b265cc 7426
+net/crates/net/bindings/python/tests/test_org_error_vectors.py
+  s_d8b00bedd146e9::t_ed90383e3a4928 32
+web/src/content/docs/sdk/errors/python.md
+  s_d8b00bedd146e9::t_7c61544928050f 80-81
+web/src/content/docs/guides/protected-streaming.md
+  s_d8b00bedd146e9::t_fbabe2dfdc9368 232,258-268,271-273
+  s_d8b00bedd146e9::t_bf020c8636d2a2 188-194,198-203
+docs/internal/spikes/org-streaming/R4COREFIX.md
+  s_d8b00bedd146e9::t_0e23ddf020bc02 169-170,241-245,257,274-276,316-317,359-360,415-416,558-573
+  s_d8b00bedd146e9::t_d0706a266bc1a8 574
+web/src/content/docs/guides/nrpc.md
+  s_d8b00bedd146e9::t_7c61544928050f 297
+web/src/content/docs/sdk/invoke/go.md
+  s_d8b00bedd146e9::t_7c61544928050f 117-119
+docs/internal/plans/ORG_SCOPED_STREAMING_PLAN.md
+  s_d8b00bedd146e9::t_0e23ddf020bc02 1688-1690
+net/crates/net/include/net_org.h
+  s_d8b00bedd146e9::t_613a5ece6fffce 393-394,457-459
+web/src/content/docs/concepts/organizations.md
+  s_d8b00bedd146e9::t_031ac196b82f01 204-209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "617a2ba084d9be3117b5e05128d82eee76d42d30",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
