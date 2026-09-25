@@ -448,39 +448,72 @@ func TestStreamingOpeningVectors_Unclassified(t *testing.T) {
 
 var sovNarrowed = regexp.MustCompile(`[0-9a-f]{16}\.\.\.`)
 
+// A narrowed display is exactly 16 hex chars + "..."; a full id is exactly 64
+// hex chars (the fixture also carries non-ids in `ids`, e.g. `capability_tag`).
+var sovNarrowedFull = regexp.MustCompile(`^[0-9a-f]{16}\.\.\.$`)
+var sovFullID = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 func TestStreamingOpeningVectors_NarrowedIds(t *testing.T) {
 	v := loadSOV(t)
 	var full []string
 	for _, id := range v.IDs {
-		if len(id) == 64 {
+		if sovFullID.MatchString(id) {
 			full = append(full, id)
 		}
 	}
 	if len(full) == 0 {
 		t.Fatal("no full 32-byte ids in the fixture")
 	}
-	seen := 0
+	// Every wire a consumer can see is scanned — the vocabulary AND the
+	// unclassified cases (the Python consumer's rule: either side may carry
+	// a narrowed display).
+	wires := make([]string, 0, len(v.ErrorVocabulary.Vectors)+len(v.ErrorVocabulary.UnclassifiedCases))
 	for _, x := range v.ErrorVocabulary.Vectors {
-		for _, narrowed := range sovNarrowed.FindAllString(x.Wire, -1) {
+		wires = append(wires, x.Wire)
+	}
+	for _, x := range v.ErrorVocabulary.UnclassifiedCases {
+		wires = append(wires, x.Wire)
+	}
+	seen := 0
+	for _, w := range wires {
+		for _, loc := range sovNarrowed.FindAllStringIndex(w, -1) {
+			narrowed := w[loc[0]:loc[1]]
+			// Boundary rule: exactly 16 hex chars — the match must never be
+			// the tail of a longer id display ("…<32 hex>..." would otherwise
+			// present its last 16 chars as narrowed).
+			if loc[0] != 0 && strings.ContainsAny(w[loc[0]-1:loc[0]], "0123456789abcdef") {
+				t.Fatalf("narrowed display %q in %q is the tail of a longer id display", narrowed, w)
+			}
 			seen++
-			core := strings.TrimSuffix(narrowed, "...")
-			if len(core) != 16 {
+			if !sovNarrowedFull.MatchString(narrowed) {
 				t.Fatalf("narrowed display %q is not 16 hex chars", narrowed)
 			}
+			core := strings.TrimSuffix(narrowed, "...")
 			for _, f := range full {
 				if f == narrowed || f == core {
 					t.Fatalf("a narrowed display %q became a full id — narrowing IDs must not become success", narrowed)
 				}
-			}
-			// The classification of such a wire must surface no id at all.
-			oe := parseOrgError(x.Wire)
-			if string(oe.Domain) != x.Domain || oe.Kind != x.Kind {
-				t.Fatal("classification changed for a wire carrying a narrowed id")
+				// "MUST NOT … BE UPGRADED INTO": a full id must never
+				// complete the narrowed display.
+				if strings.HasPrefix(f, core) {
+					t.Fatalf("narrowed display %q upgrades into full id %s — narrowing IDs must not become success", narrowed, f)
+				}
 			}
 		}
 	}
 	if seen == 0 {
 		t.Fatal("no narrowed displays found — the narrowing-ID guard had nothing to guard")
+	}
+	// The classification of a wire carrying a narrowed id must surface no id
+	// at all — same domain/kind verdict as without it.
+	for _, x := range v.ErrorVocabulary.Vectors {
+		if !sovNarrowed.MatchString(x.Wire) {
+			continue
+		}
+		oe := parseOrgError(x.Wire)
+		if string(oe.Domain) != x.Domain || oe.Kind != x.Kind {
+			t.Fatal("classification changed for a wire carrying a narrowed id")
+		}
 	}
 }
 

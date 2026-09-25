@@ -41,6 +41,7 @@ interface OpeningVector {
   proof_expires_at_unix_ns: string
   session_binding_hex: string
   unary_call_binding_sig_hex: string
+  unary_wire_base64: string
   unary_wire_hex: string
   unary_wire_len: number
   wire_base64: string
@@ -133,14 +134,23 @@ describe('org streaming opening vectors (cross-language fixture)', () => {
     srcEnc: 'hex' | 'utf8'
     wire_base64: string
     wire_len: number
+    /** The opening rows' unary wire triple — Go pins it at its `sovPin`, so
+     * `unary_wire_*` is flip-sensitive here too. */
+    unary?: { src: string; wire_base64: string; wire_len: number }
   }
   const byteRows: [string, ByteRow][] = [
     ...fixture.opening_vectors.map(
       (v) =>
-        [`bytes-${v.id}`, { src: v.wire_hex, srcEnc: 'hex', wire_base64: v.wire_base64, wire_len: v.wire_len }] as [
-          string,
-          ByteRow,
-        ],
+        [
+          `bytes-${v.id}`,
+          {
+            src: v.wire_hex,
+            srcEnc: 'hex',
+            wire_base64: v.wire_base64,
+            wire_len: v.wire_len,
+            unary: { src: v.unary_wire_hex, wire_base64: v.unary_wire_base64, wire_len: v.unary_wire_len },
+          },
+        ] as [string, ByteRow],
     ),
     ...fixture.decoder_rejects.map(
       (r) =>
@@ -179,6 +189,14 @@ describe('org streaming opening vectors (cross-language fixture)', () => {
       // Envelope rows only: round-trips the hex, catching non-canonical / upper /
       // invalid hex because Buffer.from silently truncates a bad hex string.
       expect(bytes.toString('hex')).toBe(row.src)
+    }
+    if (row.unary) {
+      // The unary wire triple is pinned the same way as the streaming one
+      // (Go's `sovPin` pins both): length, canonical hex, base64 re-encode.
+      const unary = Buffer.from(row.unary.src, 'hex')
+      expect(unary.length).toBe(row.unary.wire_len)
+      expect(unary.toString('hex')).toBe(row.unary.src)
+      expect(unary.toString('base64')).toBe(row.unary.wire_base64)
     }
   })
 
@@ -337,6 +355,10 @@ describe('org streaming opening vectors (cross-language fixture)', () => {
       // A non-`org:` string passes through untouched — also not a coerced success.
       expect(classified).toBe(original)
       expect(u.wire.startsWith('org:')).toBe(false)
+      // The row still carries the fixture's never-success pins — assert them
+      // too, so a flipped `expect_domain`/`expect_is_local` reddens this row.
+      expect(u.expect_domain).toBe('unknown')
+      expect(u.expect_is_local).toBe(false)
       return
     }
     // Malformed / unknown `org:` strings classify as `unknown`, never a canonical
@@ -350,10 +372,26 @@ describe('org streaming opening vectors (cross-language fixture)', () => {
   })
 
   it('narrowed ids never match a full id', () => {
-    // Every narrowed display in the vocabulary is exactly 16 hex chars + '...'.
+    // Every narrowed display is exactly 16 hex chars + '...'. Both wire lists
+    // are scanned (the Python consumer's rule): either may carry one.
+    const wires = [
+      ...fixture.error_vocabulary.vectors.map((v) => v.wire),
+      ...fixture.error_vocabulary.unclassified_cases.map((u) => u.wire),
+    ]
     const narrowed: string[] = []
-    for (const v of fixture.error_vocabulary.vectors) {
-      for (const m of v.wire.matchAll(/[0-9a-f]{16}\.\.\./g)) narrowed.push(m[0])
+    for (const w of wires) {
+      for (const m of w.matchAll(/[0-9a-f]{16}\.\.\./g)) {
+        // Boundary rule: exactly 16 hex chars — the match must never be the
+        // tail of a longer id display ('…<32 hex>...' would otherwise present
+        // its last 16 chars as narrowed).
+        const tailOfLongerId = m.index! > 0 && /[0-9a-f]/.test(w[m.index! - 1])
+        expect({ wire: w, narrowed: m[0], tailOfLongerId }).toEqual({
+          wire: w,
+          narrowed: m[0],
+          tailOfLongerId: false,
+        })
+        narrowed.push(m[0])
+      }
     }
     expect(narrowed.length).toBeGreaterThan(0)
     for (const n of narrowed) expect(n).toMatch(/^[0-9a-f]{16}\.\.\.$/)
@@ -364,6 +402,9 @@ describe('org streaming opening vectors (cross-language fixture)', () => {
       for (const f of fullIds) {
         expect(f).not.toBe(n)
         expect(f).not.toBe(n16)
+        // "MUST NOT … BE UPGRADED INTO": a full id must never complete the
+        // narrowed display (prefix, not just equality).
+        expect(f.startsWith(n16)).toBe(false)
       }
     }
 
