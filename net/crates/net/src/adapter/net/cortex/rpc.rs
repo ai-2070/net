@@ -8812,12 +8812,35 @@ enum PendingEntry {
 /// remote retirement with this cause carries — so the caller-side
 /// terminal seams classify it per cause (`RpcError::Cancelled`), never
 /// as a clean end-of-stream or a truncated transport.
+///
+/// SDK-2 follow-up — the terminal also carries [`LOCAL_CANCEL_MARKER`].
+/// A locally-synthesized terminal is the CALLER's own cancellation, NOT
+/// a server-issued terminal: the server's call is still live, so the
+/// handle's Drop must STILL publish the wire CANCEL (the §2.2 retirement
+/// trigger the provider's request-input fence rides). Without the marker
+/// the terminal seams latched "the server is done" on this payload and
+/// the Drop's CANCEL was suppressed — the provider call was never
+/// retired. A forged marker on a wire terminal can only cause a
+/// spurious best-effort CANCEL for an already-completed call (its map
+/// entry is gone), never a swallowed one.
+pub(crate) const LOCAL_CANCEL_MARKER: &str = "nrpc-local-cancel";
+
 fn local_cancellation_payload() -> RpcResponsePayload {
     RpcResponsePayload {
         status: RpcStatus::Cancelled,
-        headers: vec![],
+        headers: vec![(LOCAL_CANCEL_MARKER.to_string(), b"1".to_vec())],
         body: Bytes::from_static(b"call cancelled by caller"),
     }
+}
+
+/// SDK-2 follow-up: `true` when `resp` is the terminal
+/// [`PendingEntry::cancel_locally`] synthesizes (see
+/// [`LOCAL_CANCEL_MARKER`]) — a caller-side cancellation, not a
+/// server-issued terminal.
+pub(crate) fn is_local_cancellation(resp: &RpcResponsePayload) -> bool {
+    resp.headers
+        .iter()
+        .any(|(name, _)| name == LOCAL_CANCEL_MARKER)
 }
 
 impl PendingEntry {

@@ -2756,7 +2756,15 @@ impl ClientStreamCallRaw {
                 }
             }
         };
-        self.state = ClientStreamState::Done;
+        // SDK-2 follow-up: `Done` means "the server's call is done — the
+        // Drop's wire CANCEL can be suppressed". A locally-synthesized
+        // cancellation terminal (the caller's own `cancel(token)`) is NOT
+        // that — consuming it must leave the Drop's CANCEL armed (the §2.2
+        // retirement trigger the provider observes). See
+        // `LOCAL_CANCEL_MARKER`.
+        if !crate::adapter::net::cortex::rpc::is_local_cancellation(&resp) {
+            self.state = ClientStreamState::Done;
+        }
         self.observer.add_response_bytes(resp.body.len() as u32);
         if !resp.status.is_ok() {
             // SDK-1 — the per-cause classification, the same mapping the
@@ -2815,8 +2823,11 @@ impl Drop for ClientStreamCallRaw {
         // the first call emits.
         self.observer.fire();
         if matches!(self.state, ClientStreamState::Done) {
-            // Successful completion — pending entry already gone,
-            // no CANCEL needed.
+            // A server-issued terminal was observed (success or error) —
+            // pending entry already gone, no CANCEL needed. A
+            // locally-synthesized cancellation terminal leaves the state
+            // non-`Done` so the CANCEL below still fires (SDK-2
+            // follow-up).
             return;
         }
         self.mesh.rpc_client_pending_arc().cancel(self.call_id);
@@ -2860,9 +2871,12 @@ struct DuplexInner {
     /// `false` means we never reached the wire — no CANCEL needed
     /// (server doesn't know about the call).
     initial_sent: std::sync::atomic::AtomicBool,
-    /// Set true when the call closes cleanly — terminal RESPONSE
-    /// (or terminal Error) was observed on the response stream.
-    /// Suppresses CANCEL-on-drop.
+    /// Set true when the call closed on a SERVER-issued terminal —
+    /// terminal RESPONSE (or terminal Error) was observed on the
+    /// response stream. Suppresses CANCEL-on-drop. A locally-synthesized
+    /// cancellation terminal does NOT set it (SDK-2 follow-up): the
+    /// server's call is still live and the Drop's wire CANCEL is the
+    /// §2.2 retirement trigger.
     clean_close: std::sync::atomic::AtomicBool,
     /// Observer-fire bookkeeping. Latched from the various
     /// terminal-observation sites (DuplexCall::next /
@@ -3147,7 +3161,16 @@ impl futures::Stream for DuplexStream {
             }
             std::task::Poll::Ready(Some(StreamItem::Error(resp))) => {
                 self.done = true;
-                self.inner.clean_close.store(true, Ordering::SeqCst);
+                // SDK-2 follow-up: only a SERVER-issued terminal means the
+                // server's call is done and the Drop's wire CANCEL can be
+                // suppressed. The locally-synthesized cancellation terminal
+                // (the caller's own `cancel(token)`) leaves the server call
+                // live — consuming it must NOT disarm the Drop's CANCEL (the
+                // §2.2 retirement trigger the provider's request-input
+                // fence rides).
+                if !crate::adapter::net::cortex::rpc::is_local_cancellation(&resp) {
+                    self.inner.clean_close.store(true, Ordering::SeqCst);
+                }
                 // SDK-1 — the one per-cause classification (shared with
                 // `RpcStream` and CS `finish`): a `Timeout`/`Cancelled`
                 // terminal is the documented `RpcError::Timeout`/
