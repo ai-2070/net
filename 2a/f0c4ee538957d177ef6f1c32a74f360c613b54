@@ -1,0 +1,18 @@
+net/crates/net/leaf/src/org/admission.rs
+  h_64425bc75e3f3d 640-649,653-656
+net/crates/net/leaf/src/rpc_serve.rs
+  h_64425bc75e3f3d 45-46,53,195-200,235-239,303-309,361-363,483-487,511,591-593,595-607,620,627-629,636,664,687-694,715,728,753,796-799,1036-1038,1044,1047-1052,1056-1090,1108-1109,1205-1207,1261-1267,1269-1270,1272,1274,1286-1296
+net/crates/net/leaf/tests/org_streaming_lifecycle.rs
+  h_64425bc75e3f3d 28-29,31,211-214,220,913-919,932,938-939,966-994,1025-1129,1163-1306,1577-1681
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2af0c4ee538957d177ef6f1c32a74f360c613b54",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
