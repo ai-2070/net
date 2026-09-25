@@ -1,0 +1,48 @@
+net/crates/net/cli/tests/relay_join.rs
+  s_3f3d4c91f992be::t_a7df0572657fc9 237-294
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_3f3d4c91f992be::t_657aeeb2862561 4454-4577
+net/crates/net/cli/src/commands/relay.rs
+  s_3f3d4c91f992be::t_a7df0572657fc9 69-74
+  s_3f3d4c91f992be::t_3098dc8640b45f 8-12,33-35,102
+net/crates/net/src/adapter/net/traversal/blind_relay.rs
+  s_3f3d4c91f992be::t_fa997793594d81 1252-1260,1271-1275,1283-1291,1296-1298,1327-1335,1344-1438
+  s_3f3d4c91f992be::t_3ae62ad6aa7982 1261-1262
+  s_3f3d4c91f992be::t_d84662629c19d3 49-61,105-107,155-218,521-522,916-920,958-960,981-987,1009-1013,1016,1049-1110,1123,1151
+  s_3f3d4c91f992be::t_e87673290fd7c8 2313-2339,2341-2434
+  s_3f3d4c91f992be::t_1006481963d04f 2340
+net/crates/net/cli/src/commands/enrollment.rs
+  s_3f3d4c91f992be::t_3098dc8640b45f 432,456-462,467,727-730,776-783,785-786
+  s_3f3d4c91f992be::t_a7df0572657fc9 417-419
+  s_3f3d4c91f992be::t_b75ea94f01b6b6 1767-1768,1823,1828-1830
+  s_3f3d4c91f992be::t_89edca3553af5f 784
+.github/workflows/ci.yml
+  s_3f3d4c91f992be::t_6a79dcb1d10efd 5114-5126
+web/src/content/docs/reference/cli.md
+  s_3f3d4c91f992be::t_0a07bc697ceff9 53-58
+net/crates/net/src/adapter/net/mesh.rs
+  s_3f3d4c91f992be::t_92b2a2b7d91cdc 29789-29795,29805-29807,47345,48795-48803
+  s_3f3d4c91f992be::t_68f2fbe939a5e2 28436,48856-48862
+  s_3f3d4c91f992be::t_3ae62ad6aa7982 12855
+  s_3f3d4c91f992be::t_85bf1b096c49cb 12848-12854,13690-13691,14828-14831,25136-25137,28406-28435,48818-48819
+  s_3f3d4c91f992be::t_511dd7f5371e9a 28437
+net/crates/net/src/adapter/net/transport.rs
+  s_3f3d4c91f992be::t_295017800ee5d0 344-379,386-398,414-415,428,484-489,507-516,550-564,605-619
+  s_3f3d4c91f992be::t_fa997793594d81 380-385
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4baf098bd5f8e110fe6b8827fd81989989182696",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
