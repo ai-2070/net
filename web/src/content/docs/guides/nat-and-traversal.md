@@ -41,6 +41,33 @@ In the relay-fallback case, the relay forwards end-to-end encrypted packets. The
 extra hop adds latency and consumes relay capacity; applications should still
 apply their normal deadlines and failure handling.
 
+## The blind relay
+
+For devices that cannot be reached directly, `net-mesh relay serve` runs a
+blind UDP relay. A device registers from its own mesh socket (proving its
+identity key), joiners bind channels to that registration, and the relay
+forwards the opaque ciphertext by channel number; it never holds a PSK, an
+issuer key or any mesh credential, and it is not a mesh member. Registrations,
+channels and rates are bounded, idle state expires, and the relay never
+amplifies.
+
+The same port number also serves TCP. It carries enrollment splices and a
+last-resort tunnel for nodes whose UDP to the relay goes unanswered; binding
+port 443 reaches networks that allow only that port. The tunnel is plain TCP
+carrying the same end-to-end ciphertext — it is not designed to cross proxies
+or TLS-inspecting middleboxes.
+
+An enrolled device attaches direct-first: it tries the direct endpoint its
+token names and falls back to the relay only when it cannot connect. A service
+answer, including a refusal, is never rerouted, and a dead relay never delays a
+reachable direct endpoint. The path taken is reported: `join` shows
+`enroll_path` and `attach_path`, and joined `up` shows `joined.path`. When the
+relay is reached through its TCP tunnel, the enrollment row reports
+`relay_transport: tcp` and the attach path is `attach_path: relay_tcp`.
+
+A relayed session is a real mesh session, so the background direct-path
+upgrade below can move it to direct; a failed attempt keeps the relay.
+
 ## Port mapping (optional)
 
 For nodes that have a router supporting UPnP-IGD or NAT-PMP / PCP, opportunistic port mapping can open the inbound port automatically. It's not on by default — port mapping modifies state on the user's router, which some environments forbid — but it's a one-flag opt-in:

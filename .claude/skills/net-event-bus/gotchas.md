@@ -145,6 +145,32 @@ What to do: version your event types in the payload (`{ "v": 2, "data": ... }`).
 
 What to do: configure the bind address on the node (`mesh_bind` parameter or equivalent). Open the UDP port in the firewall. NAT traversal is opt-in (feature flag).
 
+One V3 wrinkle: the CLI blind relay (`net-mesh relay serve`) listens on **UDP and TCP on the same port number**. That TCP listener is not general mesh transport — it is the last-resort **tunnel** a node falls back to when UDP *to the relay* goes unanswered (a network that blocks UDP). It carries the same end-to-end ciphertext, but it is plain TCP and is **not** claimed to cross proxies or TLS-inspecting middleboxes; the enrolling node reports it as `relay_transport: tcp` / `attach_path: relay_tcp`.
+
+## "I left the mesh — am I revoked?"
+
+**No. Leaving is local, not revocation.** A whole-mesh `leave`, or one-relation `channel leave` / `subnet leave` / `org leave`, is recorded durably before anything else and survives restart — but the credential itself stays valid until it expires or the operator removes the device (`subnet remove` / `org remove`). Leaving stops this device presenting the relation; it does not withdraw authority at the verifier.
+
+What to do: get the distinction right before telling a user a compromised device is cut off. Only `remove` — a floor signed offline by the root and applied at each named verifier, attested per node — actually revokes; `complete` holds only when every named verifier persisted it.
+
+## "My device holds the credential — why isn't it publishing / subscribed?"
+
+**Holding a credential is not readiness.** Admission (`joined.subnet.admitted`) and subscription (`joined.channel.subscribed`) are reported from the **live session**, and publish readiness only while the device's own channel config trusts the root here — never implied by a credential the device merely holds. The node re-establishes admission and subscription itself after every reconnect, so "credential present + a gap in the session" is normal, not a config problem.
+
+What to do: read the live status (`channel status`, `node status`) instead of assuming. `gate: open` means the local channel is ungated — no credential evidence; and delivery counts are this node's sends, not subscriber receipts.
+
+## "Can I present two subnet credentials to one verifier?"
+
+**Only one is active per verifier.** A device may *hold* several subnet relations there, but exactly one is presented; the rest stay stored and renewed and report inactive. A new relation becomes active by itself only when the verifier has no active attachment; otherwise it is refused unless `subnet join --switch` is given, and `subnet activate <scope>` switches explicitly (withdrawing the previous one, which stays stored).
+
+What to do: don't expect two scopes active at once — that is not multi-attachment routing.
+
+## "Can I paste a join token into a ticket / log?"
+
+**A join token is a bearer secret unless bound.** `netmesh-join_…` authorizes whoever holds it. `--for <ENTITY>` binds it to one device's entity id, and `--require-approval` holds issuance until `invite approve` — but neither is a substitute for treating the token as a secret.
+
+What to do: write unbound tokens to an owner-only file (`--out`) and transport them out-of-band, never into a ticket, a log, or a shell history.
+
 ## "Should I be using Net for this at all?"
 
 Ask it early — the honest "no" is cheaper than a migration. The value of Net shows up precisely when the world is **distributed, changing, and stateful**; reaching for a discovery mesh when one HTTP call would do is the same mistake as standing up Kafka to move ten messages a day.

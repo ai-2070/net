@@ -72,6 +72,28 @@ and local-first collaboration. Built end to end:
 [Event-sourced service](https://ai2070.net/docs/tutorials/event-sourced-service),
 [Fleet telemetry](https://ai2070.net/docs/tutorials/fleet-telemetry).
 
+## Setting up your own mesh
+
+**Two machines, a few commands.** The operator runs one long-lived node and hands out a join
+link; the device redeems it and runs its own node. `up` generates and keeps the mesh PSK on first
+start, so no secret is copied by hand.
+
+```bash
+npm install -g @net-mesh/cli                   # installs the `net-mesh` binary
+
+net-mesh up --enroll                           # operator: one long-lived node, foreground
+net-mesh invite create                         # prints a `netmesh-join_` token — a bearer secret
+net-mesh join <TOKEN> --yes && net-mesh up     # device: redeem the link, then run as it
+```
+
+One link can carry more than membership — a subnet attachment, org membership, or a channel
+credential, each authorized on its own. While its `up` is stopped, a joined device can also run a
+provider or consumer as itself with `wrap --joined <state-dir>` / `mcp serve --joined <state-dir>`;
+`down` stops the node, `leave` leaves the mesh, and a `relay serve` host plus `up --relay` gives an
+unreachable device a fallback path.
+[CLI reference](https://ai2070.net/docs/reference/cli),
+[Enrollment journey](https://github.com/ai-2070/net/blob/master/net/crates/net/cli/tests/fixtures/enrollment/README.md).
+
 ## One system, end to end
 
 An intersection has no line of sight: a building hides the cross traffic from the vehicle

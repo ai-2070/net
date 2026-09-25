@@ -97,6 +97,36 @@ Then, **at node startup**, in code:
 
 > **A `Granted` service registers before its audience exists, on purpose.** `serve_org(.., Granted, ..)` succeeds immediately and admission protection is live from that instant; the service is simply *encrypted and undiscoverable* until `install_provider_grant_audience` runs, which triggers a coherent re-announce. Failing the registration instead would break valid startup ordering and dynamic grant installation. If a granted service is "not found," check the audience install before you check the grant.
 
+### Org links on a managed node
+
+`node adopt` / `org issue-cert` is the hand-installed path above. A node started
+with `up --enroll` also accepts org **links** — the same relation `--org` can
+carry in a join token — and the org root still never reaches a node:
+
+- **`org invite <ORG> --state-dir <DIR>`** — mints a standalone link (org
+  membership only, for a device already on the mesh). `--for <ENTITY>` binds it
+  to one device, `--out` writes it to an owner-only file instead of stdout. It
+  is always approval-gated.
+- **`org approve --org-key <root> --subject <ENTITY>`** — signs the membership
+  here, with the offline root, for exactly the device that claimed the invite,
+  and hands it to the running enrolling node, which delivers it. `--audience`
+  carries the shared owner audience; `--generation` re-admits at or above a
+  revocation floor.
+- **`org join <TOKEN>`** — on the device, redeemed through its running `up`.
+  Until the operator approves, the node keeps asking by itself; once issued it
+  adopts the membership and installs it live.
+- **`org members <ORG>`** — what the node of `--state-dir` **issued** for the
+  org, and each member's standing against its own floors: issued versus observed
+  here, explicitly **not** a global roster.
+- **`org remove <MEMBER> --org-key … --minimum-generation N --verifier …`** —
+  signs a floor with the offline root and has each named node apply it. Reported
+  per node from that node's own signed attestation; `complete` holds only when
+  every named verifier persisted it. Nodes not named are never assumed.
+- **`org leave`** — records the departure durably, then stops the running node;
+  its next `up` runs on the mesh without the org. **Local only** — the org still
+  accepts this device's certificate until `org remove`. Rejoining takes a new
+  link approved with the root.
+
 ### Two hard prerequisites for binding
 
 `mesh.org(credentials)` refuses unless both hold:

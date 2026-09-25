@@ -17,11 +17,13 @@ calls through a Rust SDK fixture adapter, using an offline contract.
 
 The `net-mesh` binary provides capability hosting/consumption, typed contract generation, local stores, and offline authority tools. `wrap` hosts a stdio MCP server as mesh capabilities; `mcp serve` bridges mesh capabilities to a local MCP client. `daemon` only lists a temporary snapshot: there is no `daemon run` command.
 
+Managed nodes are a separate surface: `up` runs one long-lived node per profile in the foreground, `down` drains and stops exactly that node, and `node status` reports it. This is not the temporary supervisor below; see [Managed nodes, join links and leave](#managed-nodes-join-links-and-leave).
+
 The `net-mesh` binary is produced by the `net-cli` crate (kept separate so library consumers don't pay the `clap` build cost). Install it with `cargo install net-cli`, or build from source with `cargo build --release -p net-cli` and run from `target/release/net-mesh`.
 
 Execution scope is command-specific. Identity/org/subnet issuance, capability announcement artifacts, and saved typegen input are offline. NetDB, MCP pins, forwarding policy, and staged transfers use local persistent files. Transfer receive/admin, live typegen, and remote aggregator operations use explicit mesh attachment; mesh attachment does not make the Deck client remote.
 
-For admin/ICE, snapshot, audit/log/failures, peer/daemon listings, capability reads, subnet topology reads, gateway/channel reads, and local aggregator inspection: **Starts a temporary supervisor for this command; does not inspect a running node.** These operations require `--local` and disclose scope on stderr, including with `--quiet`. Admin `--dry-run` remains an offline preview without this requirement; ICE simulation requires it. Gateway export is unsupported. Profile `endpoint` accepts only `in-process`; it does not provide remote Deck attachment. For `aggregator ls`, a complete remote target from flags or profile selects remote RPC; combining `--local` with explicit remote targeting is refused.
+For admin/ICE, snapshot, audit/log/failures, peer/daemon listings, capability reads, subnet topology reads, gateway/channel reads, and local aggregator inspection: **Starts a temporary supervisor for this command; does not inspect a running node.** These operations require `--local` and disclose scope on stderr, including with `--quiet`. Admin `--dry-run` remains an offline preview without this requirement; ICE simulation requires it. Gateway export is unsupported. Profile `endpoint` accepts only `in-process`; it does not provide remote Deck attachment. For `aggregator ls`, a complete remote target from flags or profile selects remote RPC; combining `--local` with explicit remote targeting is refused. Commands that address this profile's managed node — `invite *`, `channel serve/status/publish/leave`, `subnet join/leave/activate`, `org join/leave/members` and `node status` — talk to the running `up` node through its authenticated local control endpoint (`--state-dir`), not a temporary supervisor.
 
 Migration: a script that previously ran `net-mesh peer ls` must use `net-mesh peer ls --local` only if it intentionally wants a fresh development snapshot. The old invocation now fails with exit 2 and no result payload. No remote Deck alternative is implied. Offline issuance, persistent stores, and real remote clients keep their existing syntax and scope.
 
@@ -86,6 +88,30 @@ The runnable three-participant
 [enrollment journey](https://github.com/ai-2070/net/blob/master/net/crates/net/cli/tests/fixtures/enrollment/README.md)
 lists every command in order. It is one machine on loopback, not off-host or
 NAT evidence.
+
+### The node state directory and `up` flags
+
+Each profile has one state directory (`--state-dir`, default
+`<platform data dir>/net-mesh/nodes/<profile>`) holding the node identity
+seed, the mesh PSK, the lifetime lock and the control endpoint. Every
+command that talks to a running node names it with `--state-dir` — `invite
+*`, `channel serve/status/publish/leave`, `subnet join/leave/activate`,
+`org join/leave/members`, and `node status` — as given to `up`.
+
+Beyond `--psk-from`, `up` takes `--bind <IP:PORT>` (mesh bind; defaults to
+the profile `bind`, else `0.0.0.0:0`) and `--identity <PATH>` (defaults to
+the profile identity, else one generated and kept in the state directory).
+With `--enroll` it also takes `--public-addr <HOST:PORT>` (the address
+signed into tokens by default), `--issuer-identity <PATH>`, `--ledger
+<DIR>`, `--no-port-mapping`, `--domain-name <NAME>`, `--relay <HOST:PORT>`
+or `--no-relay`, repeatable `--channel-grant <PATH>`, and the subnet issuer
+pair `--subnet-issuer-grant <PATH>` / `--subnet-issuer-key <PATH>`.
+`--subnet-leaf-ttl` (default `24h`) and `--subnet-generation` tune the
+delegated subnet credentials.
+
+`net-mesh enrollment init --issuer-identity <PATH> [--ledger <DIR>]
+[--state-dir <DIR>]` prepares an enrollment ledger offline (the ledger
+directory must not exist yet), before the first `up --enroll` uses it.
 
 ## `net-mesh aggregator ls`
 
@@ -279,7 +305,7 @@ Output lists added tools, removed tools, version bumps, and schema deltas (added
 
 ## `net-mesh org`
 
-Offline authoring of organization capability-auth credentials against an org root key. These commands are ceremonies over files: they need no live node and do not connect to the mesh. The conceptual model is in [Organizations](/docs/concepts/organizations); the end-to-end flow is in [Private capabilities](/docs/guides/private-capabilities).
+Offline authoring of organization capability-auth credentials against an org root key, plus the link, removal and standing verbs. The authoring ceremonies — `keygen`, `issue-cert`, `issue-floors`, `grant-dispatcher`, `grant-capability`, `audience-keygen` — need no live node and do not connect to the mesh. The link/standing verbs — `approve`, `invite`, `join`, `remove`, `leave`, `members` — talk to a running node through its control endpoint (`--state-dir`). The conceptual model is in [Organizations](/docs/concepts/organizations); the end-to-end flow is in [Private capabilities](/docs/guides/private-capabilities).
 
 ### `keygen`
 
@@ -343,9 +369,51 @@ Three behaviors of these two commands surprise people:
 - **On Windows the audience secret's 0600 mode is unenforceable.** The file inherits its parent directory's NTFS DACL, and a loud warning fires unless you pass `--accept-windows-dacl`. Point `--audience-out` at an owner-only parent directory.
 - **`--accept-windows-dacl` and `--insecure-permissions` are separate flags on purpose.** The first suppresses a warning about a freshly written *output* secret; the second relaxes a mode check on an *input* you already control, such as an org key checked out of git at 0644. They were one flag once, and operators who added it on Linux carried it to Windows and silently killed the only warning that platform has.
 
+### `audience-keygen`
+
+Mint the org's shared owner audience once — the key every member uses to open (and be found in) the org's private announcements.
+
+```
+net-mesh org audience-keygen --org-key <PATH> --out <PATH>
+```
+
+Written owner-only and kept with the org root. `org approve --audience` and `node adopt --audience` hand it to members; without it a member's audience stays node-local.
+
+### `invite` / `join` / `approve`
+
+A standalone org link carries org membership only, for a device already on the mesh.
+
+```
+net-mesh org invite <ORG> --state-dir <DIR> [--ttl <DURATION>] [--for <ENTITY>] [--out <PATH>]
+net-mesh org join <TOKEN> --state-dir <DIR> [--yes]
+net-mesh org approve <OFFER-ID> --subject <ENTITY> --org-key <PATH> --state-dir <DIR> \
+                    [--generation <N>] [--audience <PATH>] [--ttl-secs <N>]
+```
+
+Org links are **always approval-gated**: until the operator runs `org approve`, the joining device's node keeps asking by itself, and once the membership is signed (with the offline org root) the device adopts it and installs it live. `--generation` re-admits a member after a revocation floor; `--audience` delivers the shared owner audience; `--ttl-secs` sets the certificate lifetime.
+
+### `remove` / `members`
+
+```
+net-mesh org remove <MEMBER> --org-key <PATH> --minimum-generation <N> \
+                    --verifier <NODE> [--verifier …] [--state-dir <DIR>] [--dry-run]
+net-mesh org members <ORG> --state-dir <DIR> \
+                    [--verifier <NODE> --org-key <PATH> …]
+```
+
+`remove` signs a floor here with the offline org root — every membership certificate of the member below `--minimum-generation` is revoked — and has each named verifier (`self`, or `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`) apply it. Each verifier's own signed attestation is reported, and `complete` holds only when every named verifier persisted the floor; unnamed nodes are never assumed. `members` reports what the node of `--state-dir` issued for the org and each member's standing against its own floors — explicitly not a global roster or a claim about activity.
+
+### `leave`
+
+```
+net-mesh org leave --state-dir <DIR>
+```
+
+Records the departure durably, then stops the running node; its next `up` runs on the mesh without the org. Local only: the org still accepts the certificate until `org remove`, and leaving is not revocation. Rejoining takes a new link approved with the org root.
+
 ## `net-mesh subnet`
 
-`show`, `ls`, and `tree` read a temporary supervisor's topology view. **Starts a temporary supervisor for this command; does not inspect a running node.** The issuance commands below author subnet authority offline: signed credentials and control facts for protected attachment, routing, and export. Signed artifacts use framed **canonical wire bytes**, not a JSON mirror. `inspect` decodes an artifact; it does not verify its signature.
+`show`, `ls`, and `tree` read a temporary supervisor's topology view. **Starts a temporary supervisor for this command; does not inspect a running node.** The issuance commands below author subnet authority offline: signed credentials and control facts for protected attachment, routing, and export. Signed artifacts use framed **canonical wire bytes**, not a JSON mirror. `inspect` decodes an artifact; it does not verify its signature. The V3 link and membership verbs below (`invite`, `join`, `leave`, `remove`, `members`, `activate`) act on a running node through its control endpoint instead.
 
 ### `keygen`
 
@@ -407,7 +475,41 @@ Decode and summarize any subnet artifact file — credential set, issuer grant, 
 net-mesh subnet inspect <FILE>
 ```
 
+### `remove` / `members`
+
+```
+net-mesh subnet remove --root-key <PATH> --authority <HEX> --scope <PATH> \
+                       --topology-epoch <N> --revision <N> --subject <HEX> \
+                       --minimum-generation <N> --verifier <CONTACT> [--verifier …] \
+                       [--rights <attach>] [--state-dir <DIR>] [--dry-run]
+net-mesh subnet members <SCOPE> --state-dir <DIR> \
+                        [--verifier <NODE> --root-key <PATH> --authority <HEX> …]
+```
+
+`remove` signs a subject floor with the offline root and hands it to each named verifier (`self`, or a contact), reporting each verifier's own signed attestation; `complete` holds only when every named verifier persisted the floor, and unnamed ones are never assumed. `members` reports what the node of `--state-dir` issued for the scope and the peers admitted to it there right now — not a global roster.
+
+### `invite` / `join` / `leave` / `activate`
+
+```
+net-mesh subnet invite <SCOPE> --state-dir <DIR> [--rights <RIGHTS>] [--require-approval]
+net-mesh subnet join <TOKEN> --state-dir <DIR> [--yes] [--switch]
+net-mesh subnet leave <SCOPE> --state-dir <DIR>
+net-mesh subnet activate <SCOPE> --state-dir <DIR>
+```
+
+A standalone subnet link carries the subnet relation only, for a device already on the mesh; the device redeems it over its own session with the node it enrolled with (no PSK is delivered), and the verifier's verdict is reported. `--require-approval` holds issuance until `invite approve`. A device may hold several subnet relations, but only **one active attachment per verifier** is presented: joining a second scope at the same verifier is refused unless `subnet join --switch` is given, and `subnet activate <scope>` switches explicitly — the previous attachment is withdrawn there and stays stored. `leave` records the departure durably (the relation is never presented or renewed again) and asks the verifier to drop the admission; the credential is not revoked.
+
 ## `net-mesh node`
+
+### `status`
+
+Report the state of this profile's `net-mesh up` node.
+
+```
+net-mesh node status --state-dir <DIR>
+```
+
+Liveness comes from the node's lifetime lock and a reply from its authenticated control endpoint — never from a PID or a file's mere presence; a control file without a held lock is reported as stale metadata. The report carries the node's id, entity, public key, bind, PSK **source** (never the PSK), and trust domain; the enrollment endpoint and issuer when it serves enrollment; a joined device's live link and current subnet-leaf expiry; and the adopted org, with `org_state` when a membership is not installed (revoked or invalid).
 
 ### `adopt`
 
@@ -415,12 +517,52 @@ Install org ownership on a node. This is the one org-adjacent command that write
 
 ```
 net-mesh node adopt --cert <PATH> (--identity <PATH> | --entity <HEX>)
-                    [--authority-dir <DIR>] [--floors <PATH>] [--skew-secs <N>]
+                    [--authority-dir <DIR>] [--floors <PATH>] [--audience <PATH>]
+                    [--skew-secs <N>]
 ```
 
-Adoption writes three separately versioned files — `owner-membership.json`, `owner-audience.key`, and `revocation-state.json` — under `$XDG_CONFIG_HOME/net-mesh/authority` by default. `--floors` optionally merges a revocation-floor bundle during adoption. `--skew-secs` is the clock-skew tolerance for the certificate window check: **strict by default**, and hard-capped at the token module's 300-second ceiling, with larger values rejected before anything is written.
+Adoption writes three separately versioned files — `owner-membership.json`, `owner-audience.key`, and `revocation-state.json` — under `$XDG_CONFIG_HOME/net-mesh/authority` by default. `--floors` optionally merges a revocation-floor bundle during adoption. `--audience` installs the org's shared owner audience (from `org audience-keygen`) instead of a node-local one, so this node can discover other members' private services. `--skew-secs` is the clock-skew tolerance for the certificate window check: **strict by default**, and hard-capped at the token module's 300-second ceiling, with larger values rejected before anything is written.
 
 Like `keygen`, this command refuses rather than falling back to the working directory when the config directory cannot be resolved — the authority directory holds `owner-audience.key`, the raw owner discovery key.
+
+## `net-mesh channel`
+
+Channel credentials for the running node and the offline root. `visibility <name>` and `ls` read a temporary supervisor's channel registry (**Starts a temporary supervisor for this command; does not inspect a running node.**); every other verb acts on the running node or offline.
+
+### `issue-grant`
+
+Offline, on the operator's machine: the channel root — an operator identity file — signs one delegate grant on one canonical channel to an issuing node.
+
+```
+net-mesh channel issue-grant --root-identity <PATH> --issuer <ENTITY> --channel <NAME>
+                             --out <PATH> [--rights <publish,subscribe>] [--ttl <DURATION>] [--force]
+```
+
+`--issuer` is the enrolling node's full 64-hex `issuer`, reported by `up --enroll` and `node status`. The root never reaches the node. `--rights` (default `publish,subscribe`) bounds what the node may grant onward, and every device credential expires with the grant's `--ttl` (default `30d`).
+
+### `serve` / `status` / `publish` / `leave`
+
+On the running node.
+
+```
+net-mesh channel serve <NAME> --token-root <ENTITY> [--token-root …] --state-dir <DIR>
+net-mesh channel status --state-dir <DIR>
+net-mesh channel publish <NAME> --data <TEXT> --state-dir <DIR>
+net-mesh channel leave [<NAME>] --state-dir <DIR>
+```
+
+`serve` gates a channel so only chains anchored at the given token root(s) may subscribe; it is persisted and re-registered on every `up`. `status` shows the channels this node serves and, for a joined device, its channel credential — subscribe ACK and publish readiness, never a roster of other members. `publish` sends one payload through the node's own local gate: `gate: passed` means this node's production gate accepted it, `gate: open` means the channel is ungated here (no credential evidence), and a denial carries the gate's reason; delivery counts are this node's sends, not subscriber receipts. `leave` records the departure durably, then acknowledges the unsubscribe and removes exactly the installed publish credential (`publish_stop: confirmed` or `unconfirmed`); it is not revocation.
+
+### `invite` / `join`
+
+Standalone channel links add a channel to a device already on the mesh.
+
+```
+net-mesh channel invite <NAME> --rights <RIGHTS> --state-dir <DIR> [--require-approval]
+net-mesh channel join <TOKEN> --state-dir <DIR> [--yes]
+```
+
+One link carries one channel and its rights (`publish`, `subscribe` or `publish,subscribe`); subscribe sends the device to this node as publisher, so the channel must be served here first. `--require-approval` holds issuance until `invite approve`. A device holds **one active credential per channel**: a second is refused until the active one is left, and a rejoin after `channel leave` takes a fresh link — the spent one stays spent.
 
 ## Exit codes
 

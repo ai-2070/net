@@ -68,6 +68,41 @@ At runtime, the **admin namespace** (deliberately apart from the ordinary verbs)
 - **Boundaries** — `declare_boundaries(declaration)`: also wholesale.
 - **Control facts** — `apply_control_fact(bytes)`: the **one door** for floors and descriptive facts alike. Returns `{kind, applied}`; `applied == false` is an authenticated stale/idempotent outcome, **not** a failure.
 
+### Subnet links on a managed node
+
+A device can take the subnet relation from its join link (`up --enroll` with
+`--subnet-issuer-grant` / `--subnet-issuer-key`), or add it afterwards with a
+standalone link redeemed over its own session:
+
+- **`subnet invite <SCOPE> --state-dir <DIR>`** — the relation only, no PSK
+  delivered. `--rights` defaults to `attach`; `--for <ENTITY>` binds it to one
+  device; `--require-approval` holds issuance for `invite approve`. Needs an
+  issuer whose grant covers the scope.
+- **`subnet join <TOKEN>`** — through the device's running `up`: redeems, keeps
+  and presents the credentials; the node renews and re-presents them itself.
+- **`subnet members <SCOPE>`** — what the node of `--state-dir` issued for the
+  scope (subtree included) and who is admitted there right now — explicitly not
+  a claim about other verifiers.
+- **`subnet remove`** — signs a subject floor with the offline root, hands it to
+  each named verifier, and reports each verifier's own signed attestation;
+  `complete` only when every named verifier persisted it.
+- **`subnet leave <SCOPE>`** — records the departure durably and asks the
+  verifier over the session to drop the admission (acknowledged or
+  `unconfirmed`). The credential is **not revoked** — it stays valid until it
+  expires or `subnet remove`.
+
+**One active attachment per verifier.** A device may *hold* several subnet
+relations at one verifier (its join's own and standalone memberships), but only
+one is presented there; the others stay stored and renewed and are reported
+inactive. A relation becomes active by itself only when its verifier has no
+active attachment (the first there, or after the active one was left).
+Replacing an active attachment is always explicit — `subnet join --switch`, or
+`subnet activate <scope>`, which withdraws the previous one there (it stays
+stored). The choice is durable (`<state>/subnet.active.json`); a corrupt record
+is an error rather than a silent re-resolution. This is not multi-attachment
+routing: holding credentials for several scopes is distinct from being attached
+at several topology points.
+
 ## Per-SDK API
 
 | | provider verb | caller verb | admin |
@@ -104,6 +139,8 @@ Subnet failures are **local and startup-shaped** — configuration, decode, or i
 - **The export name never crosses the wire.** If a caller "knows" a provider's export name, something is mislayered — callers name *services* only.
 - **Epochs pin bindings.** An export binding declares the topology epoch it was minted under; a topology change that bumps the epoch stops the old binding at dispatch (`wrong_topology_epoch`), by design.
 - **No signing key type exists in any binding.** If you want to sign a subnet artifact in-process, you're looking for the CLI ceremony instead.
+- **Leaving a relation is not revocation.** `subnet leave` stops this device presenting the relation (durably, across restart) and asks the verifier to drop the admission; the credential itself stays valid until it expires or the offline root signs a `subnet remove` floor.
+- **One active attachment per verifier.** Holding several relations there is normal; only the active scope is presented. A second one is refused unless you mean it (`subnet join --switch` / `subnet activate <scope>`) — a supervisor never flips one admission with another silently.
 
 ## Source of truth
 
