@@ -1,0 +1,119 @@
+web/src/content/docs/concepts/tool-federation.md
+  s_7587706a246770::t_c49a696abf1b9f 44
+web/src/components/DocsContent.tsx
+  s_7587706a246770::t_c49a696abf1b9f 640-643,645-651,655-658
+spikes/s0a-wire/src/aead.rs
+  s_7587706a246770::t_c49a696abf1b9f 108,128,159,161
+.claude/skills/net-browser/session.md
+  s_7587706a246770::t_c49a696abf1b9f 1-217
+.claude/skills/net-browser/store.md
+  s_7587706a246770::t_c49a696abf1b9f 1-188
+net/crates/net/wire/Cargo.toml
+  s_7587706a246770::t_c49a696abf1b9f 76-81,83-89
+net/crates/net/wire/src/aead.rs
+  s_7587706a246770::t_c49a696abf1b9f 113,135,169,171
+docs/internal/misc/WEBRTC_TRANSPORT_MERGE_REVIEW_2026_09_22.md
+  s_7587706a246770::t_c49a696abf1b9f 61,83,95
+spikes/s0a-wire/Cargo.toml
+  s_7587706a246770::t_c49a696abf1b9f 52,57-58,60-64
+.claude/skills/net-event-bus/SKILL.md
+  s_7587706a246770::t_c49a696abf1b9f 6-7,45,89
+  s_7587706a246770::t_ecf15faae554c3 3
+.claude/skills/net-event-bus/browser.md
+  s_7587706a246770::t_c49a696abf1b9f 1-310
+.claude/skills/README.md
+  s_7587706a246770::t_c49a696abf1b9f 3,7,9,65,70-71,106,143-156,160-161,164
+web/src/content/docs/agent-briefs/wrap-and-use-an-mcp-server.md
+  s_7587706a246770::t_c49a696abf1b9f 9
+.github/workflows/ci.yml
+  s_7587706a246770::t_c49a696abf1b9f 6645-6648
+  s_7587706a246770::t_2e4b8f4a5518c1 6643-6644,6649-6650
+web/src/components/DocsSidebar.tsx
+  s_7587706a246770::t_c49a696abf1b9f 237-250,260-264
+web/src/content/docs/reference/mcp-bridge.md
+  s_7587706a246770::t_c49a696abf1b9f 207
+docs/data/tiers.yaml
+  s_7587706a246770::t_c49a696abf1b9f 24
+.claude/skills/net-browser/SKILL.md
+  s_7587706a246770::t_c49a696abf1b9f 1-130
+web/next.config.ts
+  s_7587706a246770::t_c49a696abf1b9f 3-24,26-32
+.claude/skills/net-browser/source-access.md
+  s_7587706a246770::t_c49a696abf1b9f 1-59
+spikes/s0b-rtc/web/Cargo.toml
+  s_7587706a246770::t_c49a696abf1b9f 18
+web/src/content/docs/tutorials/distributed-daemon.md
+  s_7587706a246770::t_c49a696abf1b9f 18-20,35
+.claude/skills/net-browser/concepts.md
+  s_7587706a246770::t_c49a696abf1b9f 1-132
+.github/workflows/skills.yml
+  s_7587706a246770::t_c49a696abf1b9f 29,91-95,149-153,458
+web/src/content/docs/worldview/how-net-compares.md
+  s_7587706a246770::t_c49a696abf1b9f 44-61,64-108,112-143,147-167,171-191,222-224
+web/package.json
+  s_7587706a246770::t_c49a696abf1b9f 84
+web/src/docs.order.ts
+  s_7587706a246770::t_c49a696abf1b9f 23-26,222,225-232
+.claude/skills/net-event-bus/gotchas.md
+  s_7587706a246770::t_c49a696abf1b9f 220-221
+web/src/lib/docs.ts
+  s_7587706a246770::t_c49a696abf1b9f 7-12,58-63,115-123,212-215,466,841,1015-1016,1041,1139-1141,1177-1178,1251-1252
+web/src/content/docs/guides/wrap-mcp-server.md
+  s_7587706a246770::t_c49a696abf1b9f 15
+.claude/skills/net-browser/errors.md
+  s_7587706a246770::t_c49a696abf1b9f 1-136
+docs/internal/plans/NAT_TRAVERSAL_V3_NOTES.md
+  s_7587706a246770::t_c49a696abf1b9f 1-134
+web/src/content/docs/tutorials/event-sourced-service.md
+  s_7587706a246770::t_c49a696abf1b9f 19-39
+net/crates/net/leaf/Cargo.toml
+  s_7587706a246770::t_c49a696abf1b9f 58,62-65
+README.md
+  s_7587706a246770::t_c49a696abf1b9f 4-8,11,13-28,31-37,56-110,113-114,116-117,121-122,126-127,131-132,248-250,259,271,273-274,276,278-279,282-285,329-351
+web/src/content/docs/worldview/README.md
+  s_7587706a246770::t_c49a696abf1b9f 34-37
+web/src/app/globals.css
+  s_7587706a246770::t_c49a696abf1b9f 776-802
+net/crates/net/Cargo.lock
+  s_7587706a246770::t_510bd84518316a 151,162,925,927,1530,1722,2068,2072,2354,2356,2358,2364,3411,3667,4623,4625,4854,4920,5417,5612,5625,6541
+net/crates/net/examples/browser-demo/host/Cargo.lock
+  s_7587706a246770::t_6b77179700a357 1113,1117,1670,1687,1692,2910,2912,2917
+net/crates/net/fuzz/Cargo.lock
+  s_7587706a246770::t_1a24a15d2e40f5 666,669,679,683,693,697,1148,1169-1192,1922-1931
+net/crates/net/guards/fixtures_off_probe/Cargo.lock
+  s_7587706a246770::t_0a90ac84868a9f 331,377,447,634,637-638,847,852,1185,1634
+net/crates/net/leaf/Cargo.lock
+  s_7587706a246770::t_4a0681f9fcbc74 15-24,32,42,44,190,194-204,211-214,218-229,237,241-251,329,338,375,445,553,558-570,644-652,661,663,717,739,744,829-839,851,892-893,895,1040,1063,1135-1143,1197-1206,1246,1248,1259,1261,1264,1270,1272,1280,1282,1293,1295,1302,1304,1324,1326,1335,1337,1341,1343,1469
+net/crates/net/tests/natsim/browser/Cargo.lock
+  s_7587706a246770::t_d402dfeb835796 1113,1117,1669,1686,1691,2909,2911,2916
+net/crates/net/tests/rtc_browser/leaf/Cargo.lock
+  s_7587706a246770::t_0a822114fbf3ee 15-24,32-33,42,44,127-139,148-151,155-166,174,178-188,204-212,253,272,394,399-411,446-454,487,492,550,552-562,572,574,602-603,605,673,703,813-822
+net/crates/net/tests/rtc_browser/runner/Cargo.lock
+  s_7587706a246770::t_3ce6f10983a1d9 1134,1138,1735,1740
+spikes/s0a-wire/Cargo.lock
+  s_7587706a246770::t_1dbf3974b4f452 15-24,32-33,42,44,127-139,148-151,155-166,174,178-188,204-212,253,272,394,399-411,446-454,528,530-540,550,552,580-581,583,629,634,662,692,782-791
+spikes/s0b-rtc/native/Cargo.lock
+  s_7587706a246770::t_40c183a77a0d6c 15-24,32-33,42,44,218-219,237-249,258-261,265-276,284,288-298,339-347,416,435,552-553,739,742,808-816,1048,1050-1060,1070,1072,1258,1263,1360,1371,1411,1625-1634
+spikes/s0b-rtc/web/Cargo.lock
+  s_7587706a246770::t_4796b907d16a10 15-24,32-33,42,44,127-139,148-151,155-166,174,178-188,204-212,253,272,394,399-411,446-454,457,459,528,530-540,550,552,580-581,583,629,634,671,701,791-800,830,832,843,845,853,855,866,868
+spikes/tools/feature_consumer/Cargo.lock
+  s_7587706a246770::t_a15f804b526d0e 961,965,1246,1251
+web/package-lock.json
+  s_7587706a246770::t_04ebe83b5d7f67 74,2317-2319,9863-9865,9868,13004-13006,13009,13026-13028,14030-14032,14060-14062
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7dcc73df25de1e0a029328b2d1615d0a6b613953",
+  "prompts": {},
+  "sessions": {
+    "s_7587706a246770": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "646541ea-302a-45a7-8364-07a8dac2c81e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
