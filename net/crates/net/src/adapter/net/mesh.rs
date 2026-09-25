@@ -19867,7 +19867,7 @@ impl MeshNode {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn test_install_session(&self, node_id: u64, session_id: u64) {
         use crate::adapter::net::crypto::SessionKeys;
-        let addr: std::net::SocketAddr = "127.0.0.1:9".parse().expect("literal addr");
+        let addr: std::net::SocketAddr = std::net::SocketAddr::from(([127, 0, 0, 1], 9));
         self.peers.insert(
             node_id,
             PeerInfo {
