@@ -1,0 +1,28 @@
+.claude/skills/README.md
+  h_64425bc75e3f3d 3,7,9,65,70-71,143-156,160-161,164
+.claude/skills/net-browser/SKILL.md
+  h_64425bc75e3f3d 1-130
+.claude/skills/net-browser/concepts.md
+  h_64425bc75e3f3d 1-132
+.claude/skills/net-browser/errors.md
+  h_64425bc75e3f3d 1-136
+.claude/skills/net-browser/session.md
+  h_64425bc75e3f3d 1-217
+.claude/skills/net-browser/source-access.md
+  h_64425bc75e3f3d 1-59
+.claude/skills/net-browser/store.md
+  h_64425bc75e3f3d 1-188
+.github/workflows/skills.yml
+  h_64425bc75e3f3d 29,454
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "10d69505ddcd9cd28587de5aaecde7bb8f8e0dc5",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
