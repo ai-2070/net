@@ -1,0 +1,16 @@
+go/org_streaming_opening_vectors_test.go
+  h_64425bc75e3f3d 451-455,460,467-470,472-486,488,491,496-500,507-517
+net/crates/net/bindings/node/test/org_streaming_opening_vectors.test.ts
+  h_64425bc75e3f3d 44,137-139,144-153,193-200,358-361,375-380,382-394,405-407
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4bbb9bf3c0b322467f2b15b57bb360b1de441274",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
