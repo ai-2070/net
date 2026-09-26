@@ -436,14 +436,11 @@ async fn a_native_lossy_stream_rides_the_lossy_channel_and_delivers() {
     use net::adapter::net::{StreamConfig, StreamInboundSink};
     let (a, b, _id_a, _id_b) = rtc_pair().await;
     const SID: u64 = 0x0002_0000_0000_7A11;
-    let seen: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>> = Arc::default();
+    type Seen = Arc<parking_lot::Mutex<Vec<(u64, Vec<u8>)>>>;
+    let seen: Seen = Arc::default();
     let sink: StreamInboundSink = {
         let seen = seen.clone();
-        Arc::new(move |event| {
-            seen.lock()
-                .unwrap()
-                .push((event.from_node, event.payload.to_vec()))
-        })
+        Arc::new(move |event| seen.lock().push((event.from_node, event.payload.to_vec())))
     };
     b.register_stream_inbound(SID, sink).expect("vacant");
     let receiver = b.rtc_driver().expect("driver");
@@ -473,10 +470,10 @@ async fn a_native_lossy_stream_rides_the_lossy_channel_and_delivers() {
         "a native lossy stream's packets arrive on the lossy channel"
     );
     assert!(
-        wait_for(|| !seen.lock().unwrap().is_empty(), Duration::from_secs(5)).await,
+        wait_for(|| !seen.lock().is_empty(), Duration::from_secs(5)).await,
         "and are delivered"
     );
-    let seen = seen.lock().unwrap().clone();
+    let seen = seen.lock().clone();
     assert!(seen
         .iter()
         .all(|(from, payload)| *from == a.node_id() && payload == b"snapshot"));
