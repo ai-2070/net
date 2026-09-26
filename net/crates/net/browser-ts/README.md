@@ -322,6 +322,19 @@ The host's `project(state, audience)` returns what that audience may see. Leave
 secret things out of the returned state (or set them to `null`). Hidden data is
 never sent, so it isn't sitting in the page waiting to be found.
 
+When what you see depends on *who you are* — your own cards, your own fog of
+war — use `projectFor` instead of `project`. It is told which player it is for:
+
+```js
+projectFor: (state, { peer }) => ({
+  ...state,
+  hands: { [peer]: state.hands[peer] ?? [] },   // only your own hand
+}),
+```
+
+Use one or the other, not both. `projectFor` runs once per player on each
+change, so prefer `project` when everyone in an audience sees the same thing.
+
 **One tab per player.** All tabs of the same site in one browser profile share a
 single identity, so two tabs are the *same* player — and a player can't join
 itself. To test with two players on one machine, use two browser profiles, or

@@ -81,7 +81,8 @@ store**. It is not a CRDT and not a lock-step replication protocol; the shape is
   the audience names, the actions, the inputs and the projection function. Both
   ends of a store instance share it; a version disagreement is a typed refusal.
 - **An `audience`** is a name describing *who is reading* (`'crew'`,
-  `'command'`). `project(state, audience)` decides what that audience may see,
+  `'command'`). `project(state, audience)` decides what that audience may see (or
+  `projectFor(state, { peer, audience })`, what that one player may see),
   and `authorize(request)` decides whether a request is allowed at all.
 - **`act` is a correlated transaction** — it executes on the host and its result
   comes back to the caller. **`input` is coalesced and unacknowledged** — the

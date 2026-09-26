@@ -28,6 +28,12 @@ the README on why it is a sibling package rather than a sub-path.
   projection for its audience rather than the raw document.
   `HostedStoreHandle` now carries its `definition` and its action and
   input types.
+- **`projectFor(state, { peer, audience })`** — a per-player
+  projection, given to `hostStore` instead of `project`, for views that
+  depend on who is looking (your own hand). Computed once per distinct
+  player and audience; a player whose view did not change is sent
+  nothing. Exactly one of `project` and `projectFor` is accepted, in the
+  types (`HostProjection`) and at construction (`invalid-data`).
 - **`@net-mesh/browser/local`** — `createLocalMesh()`, several nodes in
   one page with no anchor and no network, each a `StoreTransport`. The
   store on top is the real one; delivery is a function call and the

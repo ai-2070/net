@@ -101,8 +101,23 @@ export interface OwnerDeps<S extends object, A extends ActionSpec, I extends Inp
    * The audience projection: what this caller may see. Returning the
    * whole state is a decision, not a default — `empty()` is what
    * absence looks like.
+   *
+   * Computed once per DISTINCT audience and shared by every handle
+   * carrying it. Exactly one of `project` and {@link projectFor} is
+   * given.
    */
-  project(state: S, audience: readonly string[]): S;
+  project?(state: S, audience: readonly string[]): S;
+  /**
+   * The per-player projection: what THIS player may see — their own
+   * hand, their own fog of war. Handed the authenticated peer with the
+   * audience it reads.
+   *
+   * Computed once per distinct (peer, audience) pair, so its cost per
+   * change grows with the number of players, where `project`'s grows
+   * with the number of distinct audiences. That is inherent: a view
+   * that depends on who is looking has to be taken for each of them.
+   */
+  projectFor?(state: S, viewer: Viewer): S;
   /** The admissible frame size, derived from the transport (§1.9). */
   readonly maxEventBytes: number;
   /** Monotone clock, milliseconds. */
@@ -130,6 +145,14 @@ export interface OwnerDeps<S extends object, A extends ActionSpec, I extends Inp
   readonly actions: ActionHandlers<S, A>;
   /** The latest-value input handlers. Fire-and-forget, no reply. */
   readonly inputs: InputHandlers<S, I>;
+}
+
+/** Who a per-player projection is for. */
+export interface Viewer {
+  /** The authenticated peer, 16 lowercase hex — as `context.peer`. */
+  readonly peer: string;
+  /** The audience this handle reads. */
+  readonly audience: readonly string[];
 }
 
 /** One handler per declared action. */
@@ -240,7 +263,23 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     if (this.incarnation.length !== INCARNATION_HEX_LENGTH) {
       throw new StoreError('invalid-data', 'newIncarnation must return 16 lowercase hex');
     }
+    // Exactly one projection. Neither would ship nothing truthful;
+    // both would leave which one decides a secret to the reader of
+    // this file.
+    const projections = (typeof deps.project === 'function' ? 1 : 0) + (typeof deps.projectFor === 'function' ? 1 : 0);
+    if (projections !== 1) {
+      throw new StoreError('invalid-data', 'a host needs exactly one of `project` and `projectFor`');
+    }
+    this.perPlayer = typeof deps.projectFor === 'function';
     this.core = new StoreCore({ definition: deps.definition, initialState: deps.definition.empty() });
+  }
+
+  /** Whether projections depend on the peer (`projectFor`). */
+  private readonly perPlayer: boolean;
+
+  /** The key under which two handles are certain to receive the same projection. */
+  private viewKey(peer: string, audience: readonly string[]): string {
+    return this.perPlayer ? JSON.stringify([peer, audience]) : JSON.stringify(audience);
   }
 
   /** Counters a host can report. Every refusal moves exactly one. */
@@ -301,8 +340,9 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     const out: Outbound[] = [];
     const base = String(this.revisionBeforeCommit);
     const r = String(this.core.revision);
-    // One projection pair and one root diff per DISTINCT audience,
-    // shared by every handle that carries it. Projecting and diffing
+    // One projection pair and one root diff per DISTINCT audience
+    // (per distinct peer and audience under `projectFor`), shared by
+    // every handle that carries it. Projecting and diffing
     // per handle made this O(handles × world) JSON work per commit:
     // both projections were freshly built per handle, so `shallowDiff`'s
     // identity test could never fire and every key paid its
@@ -339,11 +379,11 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         continue;
       }
 
-      const audienceKey = JSON.stringify(handle.audience);
+      const audienceKey = this.viewKey(handle.peer, handle.audience);
       let ops = diffs.get(audienceKey);
       if (ops === undefined) {
-        const before = this.project(handle.audience, previous);
-        const after = this.project(handle.audience, current);
+        const before = this.project(handle.peer, handle.audience, previous);
+        const after = this.project(handle.peer, handle.audience, current);
         ops =
           before === null || after === null
             ? null
@@ -425,8 +465,8 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
   }
 
   /** The host's own player: the projection a replica of `audience` receives. */
-  localView(audience: readonly string[]): S | null {
-    return this.project(audience);
+  localView(peer: string, audience: readonly string[]): S | null {
+    return this.project(peer, audience);
   }
 
   /**
@@ -1143,7 +1183,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * guessing.
    */
   private install(handle: OwnerHandle, q: Hex | null): Outbound[] | null {
-    const projected = this.project(handle.audience);
+    const projected = this.project(handle.peer, handle.audience);
     // `null` means the application could produce neither a projection
     // nor its own empty value. There is nothing truthful to ship, so
     // the emission fails and the caller refuses.
@@ -1212,9 +1252,17 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * must not be shipped as a snapshot, so it becomes `empty()` — the
    * value that represents absence — rather than the full state.
    */
-  private project(audience: readonly string[], state: S = this.core.getState() as S): S | null {
+  private project(
+    peer: string,
+    audience: readonly string[],
+    state: S = this.core.getState() as S,
+  ): S | null {
     try {
-      return this.deps.definition.state(this.deps.project(state, audience));
+      const projected =
+        this.deps.projectFor !== undefined
+          ? this.deps.projectFor(state, Object.freeze({ peer, audience: Object.freeze([...audience]) }))
+          : this.deps.project!(state, audience);
+      return this.deps.definition.state(projected);
     } catch {
       // `empty()` is application code as well, and it is reached
       // precisely when the application has already thrown once. A

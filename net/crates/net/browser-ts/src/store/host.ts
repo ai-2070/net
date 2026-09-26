@@ -27,7 +27,7 @@
  */
 
 import { isStaleStream, StoreError } from './errors.js';
-import { StoreOwner, type Dispatched, type OwnerDeps, type Outbound } from './owner.js';
+import { StoreOwner, type Dispatched, type OwnerDeps, type Outbound, type Viewer } from './owner.js';
 import type { ActionSpec, Cancel, InputSpec, StoreDefinition } from './types.js';
 import { encodeMessage, type Hex } from './wire.js';
 
@@ -147,11 +147,34 @@ export function samePeer(left: string, right: string): boolean {
   return a !== null && a === b;
 }
 
+/**
+ * How a host decides what each replica sees: exactly one of these.
+ *
+ * - `project(state, audience)` — one view per audience, shared by
+ *   every player reading it. The default choice.
+ * - `projectFor(state, { peer, audience })` — one view per player, for
+ *   what differs by who is looking (your own hand). Costs one
+ *   projection per player per change.
+ */
+export type HostProjection<S extends object> =
+  | {
+      project(state: S, audience: readonly string[]): S;
+      readonly projectFor?: never;
+    }
+  | {
+      projectFor(state: S, viewer: Viewer): S;
+      readonly project?: never;
+    };
+
 /** What a host needs beyond the owner's own dependencies. */
-export interface HostStoreOptions<S extends object, A extends ActionSpec, I extends InputSpec>
+export type HostStoreOptions<S extends object, A extends ActionSpec, I extends InputSpec> =
+  HostStoreBaseOptions<S, A, I> & HostProjection<S>;
+
+/** {@link HostStoreOptions} without the projection. */
+export interface HostStoreBaseOptions<S extends object, A extends ActionSpec, I extends InputSpec>
   extends Omit<
     OwnerDeps<S, A, I>,
-    'maxEventBytes' | 'newHandle' | 'newIncarnation' | 'now' | 'canProject' | 'store'
+    'maxEventBytes' | 'newHandle' | 'newIncarnation' | 'now' | 'canProject' | 'store' | 'project' | 'projectFor'
   > {
   readonly transport: StoreTransport;
   /**
@@ -285,6 +308,7 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     store: address,
     authorize: options.authorize,
     project: options.project,
+    projectFor: options.projectFor,
     actions: options.actions,
     inputs: options.inputs,
     maxEventBytes: options.maxEventBytes,

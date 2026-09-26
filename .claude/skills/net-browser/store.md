@@ -96,6 +96,12 @@ throws `invalid-data` at construction.
 - **`project(state, audience)` decides what each audience may see**, applied by
   the host before anything leaves. A replica cannot read what it was not given;
   do not rely on client-side hiding.
+- **Per-player secrets (a hand of cards) need `projectFor(state, { peer,
+  audience })`** instead of `project` — `project` is computed once per audience
+  and cannot tell two players apart. Give exactly one of the two (both, or
+  neither, throws `invalid-data`). `peer` is the same 16-hex id as
+  `context.peer`, so a state keyed by `context.peer` is filtered with
+  `state.hands[peer]`. It costs one projection per player per change.
 - **`authorize(request)` decides whether a request is allowed** — and it is
   consulted on the **ongoing delta feed**, not just at join. A read that policy
   has since revoked stops arriving rather than being served because the handle
@@ -113,7 +119,7 @@ throws `invalid-data` at construction.
 | `definition`, `store` | which document type, and which instance of it |
 | `transport` | a `StoreTransport` — see below |
 | `initialState`, `actions`, `inputs` | the document, and the **handlers** for its transactions and coalesced intents (the definition holds only their validators) |
-| `authorize`, `project` | admission and per-audience visibility |
+| `authorize`, `project` / `projectFor` | admission, and visibility per audience (`project`) or per player (`projectFor`) — exactly one |
 | `maxEventBytes` | **required** — the bound on one frame; a snapshot over it is chunked (8104 in the package's own tests and demo) |
 
 | Joiner | Meaning |

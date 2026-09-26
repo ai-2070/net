@@ -142,7 +142,7 @@ export function hostPlayer<S extends object, A extends ActionSpec, I extends Inp
       end('failed', new StoreError('forbidden', 'the store refused: forbidden'));
       return;
     }
-    const projected = owner.localView(audience);
+    const projected = owner.localView(peer, audience);
     if (projected === null) {
       end('failed', new StoreError('capacity', 'the store refused: capacity'));
       return;

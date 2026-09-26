@@ -35,12 +35,15 @@ export type { HostPlayerOptions } from './player.js';
 export type {
   Frame,
   HostedStoreHandle,
+  HostProjection,
+  HostStoreBaseOptions,
   HostStoreOptions,
   StoreTransport,
   TransportFrame,
   TransportStream,
 } from './host.js';
 export type { JoinedStoreHandle, JoinStoreOptions } from './join.js';
+export type { Viewer } from './owner.js';
 export { StoreCore } from './core.js';
 export { StoreError } from './errors.js';
 export { mergeShallow, reconcile } from './state.js';

@@ -70,7 +70,7 @@ What stands in the way:
 | G7 | **No fallback when UDP is blocked.** `udp-blocked` is classified, but nothing relays. `iceServers` accepts TURN credentials; provisioning and fallback are not built. | `browser-ts/src/node.ts`, `udp-probe.ts` |
 | G8 | **Every state change re-projects the whole world, once per distinct audience set.** Cost ∝ distinct views × world size. | `store/owner.ts` (one projection pair + root diff per distinct audience) |
 | G9 | **Changing audience blanks the view.** The old subscription is fenced, the view shows `empty()`, then a full snapshot arrives. Using cells as audiences, a player crossing a border sees the world vanish. | `store/owner.ts` `aud`; store design §5 |
-| G10 | **`project` doesn't know the player.** The design specified `project(state, { peer, audience })`; the implementation is `project(state, audience)`. | store design §2 vs `store/owner.ts:105` |
+| G10 | ~~**`project` doesn't know the player.**~~ **Closed:** `projectFor(state, { peer, audience })`, an alternative to `project` (exactly one), keyed per player so `project`'s per-audience sharing is unchanged. | `store/owner.ts`, `store/host.ts` `HostProjection` |
 | G11 | **Hard bounds sized for rooms:** 32 audience labels per handle, 1 MiB snapshot, 64 KiB store message. | store design §5 "Bounded defaults" |
 | G12 | **The store only runs in a browser today**, and a player-host sees the whole world (it can read hidden state and modify its own client). Whether the store can run on a Node transport is **unverified**: `sdk-ts` has a `MeshNode`, but nobody has checked it against `StoreTransport` (`nodeIdHex`, `openStream({reliability, peer, label})`, `onEvent`). | `store/host.ts` `StoreTransport`; `sdk-ts/src/mesh.ts` |
 
@@ -181,8 +181,10 @@ views.
    as removes. The view never blanks. Permission (audience) changes keep today's
    fence-and-resnapshot semantics, because narrowing permission must never
    leave stale private data visible.
-5. **The player in `project` (closes G10).** Implement the designed
-   `project(state, { peer, audience })`, keeping the current signature working.
+5. **The player in `project` (closes G10).** **Done** as `projectFor(state,
+   { peer, audience })` beside `project` rather than a changed signature:
+   the per-audience cache stays for `project`, and the per-player cost is
+   opted into by name.
 6. **Hysteresis.** Leaving a cell drops it only after the player is a margin
    away, so standing on a border doesn't churn.
 7. **Update rate by distance (later).** Near cells every commit; far cells

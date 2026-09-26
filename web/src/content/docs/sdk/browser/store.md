@@ -61,7 +61,7 @@ check all work without the store depending on any of them.
 | `initialState` | The document as it starts |
 | `maxEventBytes` | The largest frame your transport carries (the package's own tests and demo use 8104) |
 | `authorize` | Who may read, act or send an input — handed the **authenticated** peer |
-| `project` | What a given audience may see |
+| `project` | What a given audience may see — or `projectFor`, what a given player may see (exactly one) |
 | `actions` | One handler per declared action |
 | `inputs` | One handler per declared input |
 
@@ -116,6 +116,22 @@ A zero must never be readable as "you cannot see this", and a replica cannot rea
 what it was not given: the withheld part is absent from the frames, not hidden in
 the renderer. `replica.setAudience(names)` asks for a different audience and
 resolves when the new projection is installed.
+
+When the view depends on the player rather than the audience — each player's own
+hand — give `projectFor` instead of `project`. It receives the authenticated
+player with the audience they read:
+
+```typescript
+projectFor: (state, { peer, audience }) => ({
+  ...state,
+  hands: { [peer]: state.hands[peer] ?? [] },
+}),
+```
+
+`project` is computed once per distinct audience and shared; `projectFor` once
+per distinct player and audience, so it costs one projection per player per
+change. A player whose view did not change is sent nothing. A host given both,
+or neither, is refused with `invalid-data`.
 
 ## The transport, and one gate to know about
 
