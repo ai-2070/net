@@ -1,0 +1,70 @@
+net/crates/net/leaf/src/node.rs
+  s_d8b00bedd146e9::t_7d385a79e61298 364-367,1793-1815,1831,1837,2067-2086,2129,2142-2152,5023
+  s_d8b00bedd146e9::t_0cb0f3d370dbbe 5025-5061
+  s_d8b00bedd146e9::t_2c8b2ebbf68c81 5022,5024
+net/crates/net/leaf/src/stream_ownership.rs
+  s_d8b00bedd146e9::t_7d385a79e61298 521
+net/crates/net/tests/rtc_browser/runner/src/stage5.rs
+  s_d8b00bedd146e9::t_111cf01a871348 401-403,1922,2117,2299,2627,2997,3188,3354,3622,3745,4505,4598,4768
+  s_d8b00bedd146e9::t_92a73f413801f7 3486-3489,3537-3544
+  s_d8b00bedd146e9::t_3e798997063db2 244,273,3459-3485,3490-3536,3545-3564
+  s_d8b00bedd146e9::t_964691e8407d03 3565-3568
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_aee319510c0c23 21-32
+net/crates/net/leaf/src/rtc.rs
+  s_d8b00bedd146e9::t_cf0d6eee1c3d0a 84-86,186-188,220-227,257-261,343-346,522-538,567-568,639-651,682-683,791-812,1107-1124
+  s_d8b00bedd146e9::t_acbb7d54b820ec 1125-1131
+net/crates/net/leaf/src/leader_session.rs
+  s_d8b00bedd146e9::t_7d385a79e61298 831-838
+net/crates/net/tests/rtc_browser/runner/src/stage6.rs
+  s_d8b00bedd146e9::t_20ba80c75c9c79 2389-2391,2409-2410,2417,2419
+net/crates/net/browser-ts/src/wasm.ts
+  s_d8b00bedd146e9::t_5ba831e905c9b9 80-98
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_aee319510c0c23 397-417
+net/crates/net/wire/src/carrier.rs
+  s_d8b00bedd146e9::t_33e0df2ea6a647 1-111,116-117,122-123
+  s_d8b00bedd146e9::t_92a73f413801f7 112-115,118-121
+net/crates/net/wire/src/lib.rs
+  s_d8b00bedd146e9::t_7bf5432bd56e26 51
+net/crates/net/leaf/src/wasm.rs
+  s_d8b00bedd146e9::t_7d385a79e61298 2383,2388,2394,4983-4985,5015-5017,5034-5040,5042
+net/crates/net/leaf/src/counters.rs
+  s_d8b00bedd146e9::t_cf0d6eee1c3d0a 481-483,514,526-528,582-591,602,642-646,660,709-716,915-917
+net/crates/net/src/adapter/net/rtc/stats.rs
+  s_d8b00bedd146e9::t_05e901848ee1c7 120-122,245-259
+net/crates/net/tests/rtc_loopback.rs
+  s_d8b00bedd146e9::t_26ee040925340f 363-372,375-388,392-399,405-411,417-425
+  s_d8b00bedd146e9::t_92a73f413801f7 389-391,403-404,412-416
+  s_d8b00bedd146e9::t_235c5b654d6513 400-402
+  s_d8b00bedd146e9::t_b367fc2905f50b 373-374
+net/crates/net/browser-ts/src/stream.ts
+  s_d8b00bedd146e9::t_5ba831e905c9b9 89-107
+net/crates/net/tests/rtc_browser/page/leaf5.js
+  s_d8b00bedd146e9::t_111cf01a871348 907
+net/crates/net/wire/src/protocol.rs
+  s_d8b00bedd146e9::t_7bf5432bd56e26 142-149
+net/crates/net/leaf/src/session.rs
+  s_d8b00bedd146e9::t_f495effebcf4dc 507-537,677
+net/crates/net/src/adapter/net/rtc/driver.rs
+  s_d8b00bedd146e9::t_92a73f413801f7 1674-1678
+  s_d8b00bedd146e9::t_05e901848ee1c7 1103-1106,1667-1673,1679-1698,1849-1853,1862-1864,1885-1888,2145-2154,2372
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_aee319510c0c23 7386,7487-7488
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ad90f1fd5fde318040fc91bf20f318a0b50a5489",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
