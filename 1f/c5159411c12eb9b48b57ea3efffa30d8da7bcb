@@ -1,0 +1,24 @@
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_4ac4eef820f96b 7819
+  s_d8b00bedd146e9::t_6e2720b0fa8bb5 7839-7840
+  s_d8b00bedd146e9::t_a239e89d8ce5d7 7847-7850
+  s_d8b00bedd146e9::t_89f2c8e1a35baa 7755-7818,7820-7838,7841-7846,7851-7874
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_35d679a28164a6 229-234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1fc5159411c12eb9b48b57ea3efffa30d8da7bcb",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
