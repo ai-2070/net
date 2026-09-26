@@ -126,7 +126,8 @@ any hand-written projection — so code can narrow a rule, never widen it:
 defineStore({
   /* … */
   visibility: {
-    'players.*.hand': 'owner',   // the key matched by the first `*` must be the viewer's peer id
+    // `owner`: the key matched by the first `*` must be the viewer's peer id.
+    'players.*.hand': 'owner',
     'deck': 'nobody',            // the host only
     'deck.length': 'everyone',   // the count of a hidden array
     'waypoint': ['command'],     // viewers reading any of these audiences
@@ -197,7 +198,12 @@ const mesh = createLocalMesh();
 const hostNode = mesh.node();
 const guestNode = mesh.node();
 const host = hostStore({ definition, transport: hostNode, /* … */ });
-const guest = joinStore({ definition, transport: guestNode, host: hostNode.nodeIdHex(), /* … */ });
+const guest = joinStore({
+  definition,
+  transport: guestNode,
+  host: hostNode.nodeIdHex(),
+  /* … */
+});
 ```
 
 Local nodes also `announce` and `query` like a real node — a node finds the
