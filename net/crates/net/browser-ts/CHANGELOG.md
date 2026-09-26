@@ -18,6 +18,15 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **Netcode: `@net-mesh/browser/netcode`** — `hostNetcode` (fixed-rate tick
+  loop; inputs applied exactly once per player however often the lossy
+  carrier repeats them; per-player `visible` filter; `authorize`; capped
+  lag compensation `rewind(seen)`, default 200 ms) and `joinNetcode` (clock
+  sync, snapshot interpolation a delay behind the host, local prediction
+  with reconciliation, redundant inputs). Transport-agnostic: a browser
+  node, the local mesh, or a Node dedicated host via `meshStoreTransport`.
+  Also `ClockEstimator`, `SnapshotBuffer`, `lerpNumbers`.
+- The store's transport type accepts `lossy?: boolean` on `openStream`.
 - **Lossy streams: `openStream({ reliability: 'fireAndForget', lossy: true })`**
   — for high-rate state where only the newest value matters. Every stream
   used to share one ordered, fully retransmitted DataChannel, so one lost

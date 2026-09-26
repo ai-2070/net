@@ -21,6 +21,10 @@
     "./local": {
       "types": "./dist/local.d.ts",
       "default": "./dist/local.js"
+    },
+    "./netcode": {
+      "types": "./dist/netcode/index.d.ts",
+      "default": "./dist/netcode/index.js"
     }
   },
   "sideEffects": false,

@@ -48303,6 +48303,7 @@ impl MeshNode {
             || session
                 .try_stream(stream_id)
                 .is_some_and(|s| s.tx_promoted());
+        let lossy = stream.config().lossy;
         // Opt-in: bulk-transfer streams route their originating sends
         // through the FairScheduler (T-0.5) instead of straight to the
         // socket, so they participate in per-stream weighted fairness.
@@ -48395,6 +48396,10 @@ impl MeshNode {
         // disappears mid-call.
         let flags = if reliable {
             PacketFlags::RELIABLE
+        } else if lossy {
+            // `net_wire::carrier`: a browser session carries it on the
+            // unordered, zero-retransmit DataChannel.
+            PacketFlags::LOSSY
         } else {
             PacketFlags::NONE
         };

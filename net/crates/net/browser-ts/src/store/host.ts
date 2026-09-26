@@ -97,6 +97,12 @@ export interface StoreTransport {
     reliability: 'reliable' | 'fireAndForget';
     peer?: string;
     label?: string;
+    /**
+     * Ride the lossy carrier (fire-and-forget only): unordered, no
+     * retransmits, never delaying anything else. A transport without one
+     * may ignore it and send the packets like any others.
+     */
+    lossy?: boolean;
   }): TransportStream | Promise<TransportStream>;
   onEvent(handler: (event: TransportFrame) => void): Cancel;
   /**

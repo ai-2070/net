@@ -64,6 +64,7 @@ export interface MeshStoreTransport {
     reliability: 'reliable' | 'fireAndForget';
     peer?: string;
     label?: string;
+    lossy?: boolean;
   }): { send(payload: Uint8Array): Promise<void>; close(): void };
   onEvent(handler: (event: StoreTransportFrame) => void): () => void;
   /** Stop receiving on every stream this transport subscribed to. */
@@ -109,7 +110,7 @@ export function meshStoreTransport(mesh: MeshNode, options: MeshStoreTransportOp
 
   return {
     nodeIdHex: () => hex(mesh.nodeId()),
-    openStream: ({ reliability, peer, label }) => {
+    openStream: ({ reliability, peer, label, lossy }) => {
       if (closed) throw new Error('this store transport is closed');
       if (peer === undefined || label === undefined) {
         throw new TypeError('a native store stream needs both a peer and a label');
@@ -121,6 +122,7 @@ export function meshStoreTransport(mesh: MeshNode, options: MeshStoreTransportOp
       const stream: MeshStream = mesh.openStream(target, {
         streamId,
         reliability: reliability === 'reliable' ? 'reliable' : 'fire_and_forget',
+        ...(lossy === true ? { lossy: true } : {}),
       });
       let open = true;
       return {

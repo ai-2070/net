@@ -24,6 +24,10 @@ install time.
 - **`streamIdFromLabel(label)`** — the stream id a label names, the same
   derivation the browser package uses (now one function, in the wire
   crate).
+- **`StreamConfig.lossy`** — a fire-and-forget stream whose packets ride a
+  browser session's unordered, zero-retransmit DataChannel (refused with
+  `reliability: 'reliable'`); `meshStoreTransport` passes `lossy` through,
+  so a Node dedicated host can run `@net-mesh/browser/netcode`.
 - **`meshStoreTransport(mesh, { listen })`** — the browser package's
   `StoreTransport` over a native node: a dedicated host for
   `@net-mesh/browser` stores, with `authorize` seeing each player's real

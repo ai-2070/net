@@ -1107,6 +1107,10 @@ mod mesh_bindings {
         pub window_bytes: Option<u32>,
         /// Fair-scheduler weight (1 = equal share). Default: 1.
         pub fairness_weight: Option<u8>,
+        /// Ride the lossy carrier: this fire-and-forget stream's packets
+        /// travel on a browser session's unordered, zero-retransmit
+        /// DataChannel. Refused with `reliability: "reliable"`.
+        pub lossy: Option<bool>,
     }
 
     /// One event on a stream registered with `onStreamData`, with the
@@ -1267,10 +1271,17 @@ mod mesh_bindings {
                 )));
             }
         };
+        let lossy = opts.lossy.unwrap_or(false);
+        if lossy && reliability == Reliability::Reliable {
+            return Err(Error::from_reason(
+                "lossy: true needs reliability \"fire_and_forget\"; a reliable stream cannot                  ride the lossy carrier",
+            ));
+        }
         Ok(StreamConfig::new()
             .with_reliability(reliability)
             .with_window_bytes(opts.window_bytes.unwrap_or(DEFAULT_STREAM_WINDOW_BYTES))
-            .with_fairness_weight(opts.fairness_weight.unwrap_or(1)))
+            .with_fairness_weight(opts.fairness_weight.unwrap_or(1))
+            .with_lossy(lossy))
     }
 
     /// Configuration for creating a MeshNode.

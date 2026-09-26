@@ -415,11 +415,42 @@ genre is left without a model; 3–5 wait for a game that needs them.
      snapshots to browsers need it — model 2's next step, with the tick
      loop); the leader proxy does not carry `lossy`; the replay window (1024)
      bounds how far the reliable channel may lag the lossy one.
+   - **Built (2026-09-26), step 2: native senders.** `StreamConfig::lossy`
+     (`with_lossy`) stamps a fire-and-forget stream's packets LOSSY, fragments
+     included; napi `lossy` (refused with reliable), `sdk-ts`
+     `StreamConfig.lossy`, and `meshStoreTransport` passes it through.
+     Witnessed natively (a loopback test: a native lossy stream arrives on
+     `net-u` and is delivered; fails when the stamp is removed).
 2. **Clock sync and round-trip/jitter estimates per peer**, so host and players
    agree on one **tick timeline**. Interpolation delay, prediction horizon and
    reconciliation all depend on it. (The reliable stream's SRTT is transport
    state for loss recovery and stays there; this is an application-facing
    estimate.)
+
+**Built (2026-09-26), step 3 — clock sync and the netcode module.** Clock sync
+is built in **TypeScript**, not Rust, as part of the netcode module
+(`ClockEstimator`, NTP-style, offset from the lowest-RTT samples of a window
+of 16, jitter = mean absolute deviation). Why not Rust: the game's timeline
+is the JS event loop on both ends, the same module runs unchanged on a page
+and on a Node dedicated host, and a Rust-side estimate would add precision no
+game code could observe. Revisit only if a measurement disagrees.
+
+`@net-mesh/browser/netcode` (`browser-ts/src/netcode/`): `hostNetcode` —
+fixed-rate tick, inputs applied exactly once per player (dedup by seq, gaps
+skipped), per-player `visible`, `authorize`, history ring, `rewind(seen)`
+capped at 200 ms; `joinNetcode` — clock pings, `SnapshotBuffer`
+interpolation a delay behind the host (reorder-tolerant, held past the
+newest), prediction + reconciliation (replay of unacked inputs over each
+newer authoritative state), inputs sent with redundancy and re-sent on a
+timer. JSON frames tagged with the instance label, all on lossy streams.
+Witnessed: 11 tests over a simulated lossy (≤20%), laggy, jittery network and
+the local mesh (clock within 10 ms of a 5 s offset; 61 inputs applied exactly
+once at 20% loss; zero corrections; monotonic, interpolated remote
+positions; the rewind cap), each property shown to fail when removed (7
+mutations); and an `sdk-ts` test with a **Node dedicated host** on native
+nodes via `meshStoreTransport`. **Not yet:** a browser-runner witness,
+correction smoothing, extrapolation, binary frames, fragmentation-aware
+snapshot sizing, interest-key integration (today `visible`).
 
 ### What model 2 adds on top
 

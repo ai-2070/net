@@ -359,6 +359,41 @@ function onMove() {
 - Interest decides what's *near*, not what's *allowed*: secrets still belong in
   `visibility`.
 
+## Responsive movement: netcode
+
+For positions and aim — state sent many times a second where only the
+newest value matters — use `@net-mesh/browser/netcode` beside the store.
+The host runs a fixed tick; your own ship moves the instant you press a key
+(prediction) and is corrected by the host only if you disagree
+(reconciliation); everyone else's ships are drawn a few frames in the past,
+between two host snapshots, so a lost packet never makes them jump.
+
+```js
+import { hostNetcode, joinNetcode } from '@net-mesh/browser/netcode';
+
+// On the host:
+hostNetcode({
+  transport: node, label: 'my-game.movement', tickRate: 30,
+  step: ({ inputs }) => { for (const [peer, list] of inputs) for (const { data } of list) moveShip(peer, data); },
+  snapshot: () => ships,
+});
+
+// On each player:
+const net = joinNetcode({
+  transport: node, host: hostId, label: 'my-game.movement',
+  local: { id: node.nodeIdHex(), predict: (ship, input) => movedShip(ship, input) },
+});
+onKey(input => net.input(input));
+function frame() { draw(net.view()); requestAnimationFrame(frame); }
+```
+
+Everything rides a **lossy stream** (`openStream({ reliability:
+'fireAndForget', lossy: true })`): unordered, no retransmits, so one lost
+packet never delays the next. Shooting games get lag compensation:
+`host.rewind(input.seen)` returns the world as the shooter saw it, capped at
+200 ms so faking lag gains nothing. Keep snapshots small (filter with
+`visible`); corrections snap rather than smooth for now.
+
 ## Reacting to players: one hook
 
 Give the host an `onEvent` and it hears everything that happens to a player —

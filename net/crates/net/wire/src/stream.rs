@@ -112,6 +112,12 @@ pub struct StreamConfig {
     pub scheduled: bool,
     /// What to do with pending outbound packets on close.
     pub close_behavior: CloseBehavior,
+    /// Stamp this stream's fire-and-forget packets
+    /// [`crate::protocol::PacketFlags::LOSSY`], so a browser session
+    /// carries them on its unordered, zero-retransmit DataChannel
+    /// ([`crate::carrier`]) — for state where only the newest value
+    /// matters. Ignored while the stream is reliable. Default `false`.
+    pub lossy: bool,
 }
 
 impl Default for StreamConfig {
@@ -122,6 +128,7 @@ impl Default for StreamConfig {
             fairness_weight: 1,
             scheduled: false,
             close_behavior: CloseBehavior::DropAndClose,
+            lossy: false,
         }
     }
 }
@@ -135,6 +142,12 @@ impl StreamConfig {
     /// Set the reliability mode.
     pub fn with_reliability(mut self, reliability: Reliability) -> Self {
         self.reliability = reliability;
+        self
+    }
+
+    /// Ride the lossy carrier (see [`Self::lossy`]).
+    pub fn with_lossy(mut self, lossy: bool) -> Self {
+        self.lossy = lossy;
         self
     }
 

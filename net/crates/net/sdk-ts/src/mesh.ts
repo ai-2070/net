@@ -129,6 +129,13 @@ export interface StreamConfig {
    * more packets per round. Default: `1`.
    */
   fairnessWeight?: number;
+  /**
+   * Ride the lossy carrier — for state where only the newest value
+   * matters. A fire-and-forget stream's packets then travel on a browser
+   * session's unordered, zero-retransmit DataChannel, where a lost one
+   * never delays anything. Refused with `reliability: 'reliable'`.
+   */
+  lossy?: boolean;
 }
 
 /** Per-stream stats snapshot. */
@@ -625,6 +632,7 @@ export class MeshNode {
       reliability: config.reliability,
       windowBytes: config.windowBytes,
       fairnessWeight: config.fairnessWeight,
+      lossy: config.lossy,
     });
     return {
       peerNodeId,

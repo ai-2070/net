@@ -92,6 +92,16 @@ describe('onStreamData', () => {
     expect(seen).toHaveLength(2);
   });
 
+  it('refuses a reliable stream on the lossy carrier', async () => {
+    const { alice, host } = await trio();
+    expect(() =>
+      alice.openStream(host.nodeId(), { streamId: streamIdFromLabel('x'), reliability: 'reliable', lossy: true }),
+    ).toThrow(/lossy/);
+    expect(() =>
+      alice.openStream(host.nodeId(), { streamId: streamIdFromLabel('y'), reliability: 'fire_and_forget', lossy: true }),
+    ).not.toThrow();
+  });
+
   it('derives the same id for the same label, with the stream bit set', () => {
     const id = streamIdFromLabel('store/my-game.world');
     expect(id).toBe(streamIdFromLabel('store/my-game.world'));
@@ -162,6 +172,59 @@ describe('meshStoreTransport: a dedicated host', () => {
     expect(asked).toContain(`action:${hex(bob.nodeId())}`);
     await Promise.all([a.close(), b.close()]);
     await served.close();
+    hostTransport.close();
+  });
+});
+
+describe('meshStoreTransport: a dedicated netcode host', () => {
+  it('hosts netcode for native players on the lossy carrier: inputs applied once, positions converge', async () => {
+    const { hostNetcode, joinNetcode } = await import('../../browser-ts/src/netcode/index');
+    const { host, alice, bob } = await trio();
+    type Ship = { readonly x: number };
+    type Move = { readonly dx: number };
+    const move = (ship: Ship, input: Move): Ship => ({ x: ship.x + input.dx });
+    const ships = new Map<string, Ship>();
+    const applied: number[] = [];
+    const LABEL = 'sdk-ts-e2e.movement';
+    const hostTransport = meshStoreTransport(host, { listen: [LABEL] });
+    const served = hostNetcode<Ship, Move>({
+      transport: hostTransport,
+      label: LABEL,
+      tickRate: 30,
+      step: ({ inputs }) => {
+        for (const [peer, list] of inputs) {
+          for (const input of list) {
+            applied.push(input.seq);
+            ships.set(peer, move(ships.get(peer) ?? { x: 0 }, input.data));
+          }
+        }
+      },
+      snapshot: () => Object.fromEntries(ships),
+    });
+    const player = (mesh: MeshNode) =>
+      joinNetcode<Ship, Move>({
+        transport: meshStoreTransport(mesh),
+        host: hex(host.nodeId()),
+        label: LABEL,
+        local: { id: hex(mesh.nodeId()), predict: move },
+      });
+    const a = player(alice);
+    const b = player(bob);
+    await until(() => a.stats().snapshots > 0 && b.stats().snapshots > 0, 'both players receive snapshots');
+    a.input({ dx: 0 });
+    for (let i = 0; i < 20; i += 1) {
+      a.input({ dx: 1 });
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    await until(() => ships.get(hex(alice.nodeId()))?.x === 20, "the host applied every one of Alice's inputs");
+    await until(() => a.stats().pendingInputs === 0, 'Alice has every input acknowledged');
+    expect(new Set(applied).size).toBe(applied.length);
+    expect(a.view()[hex(alice.nodeId())]).toEqual({ x: 20 });
+    await until(() => b.view()[hex(alice.nodeId())]?.x === 20, "Bob sees Alice's ship arrive");
+    expect(a.stats().clock?.samples).toBeGreaterThan(0);
+    a.close();
+    b.close();
+    served.close();
     hostTransport.close();
   });
 });
