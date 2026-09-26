@@ -147,8 +147,8 @@ await game.ready();
   the UI can bind to.
 - **Offline (G5):** **done** — `@net-mesh/browser/local` exports
   `createLocalMesh()`; `createLobby`/`joinLobby` must run on it in one page
-  with no network. (Lobby discovery will need `announce`/`query` on a local
-  node, which it does not offer yet.)
+  with no network. Local nodes `announce`/`query` with the leaf's lease
+  semantics, so lobby discovery can run offline too.
 
 **Acceptance:** the demo becomes a lobby-based game in fewer lines than today;
 two browser profiles on one machine can list, join by code and play against a

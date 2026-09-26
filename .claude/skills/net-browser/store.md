@@ -321,7 +321,10 @@ writes.
 - **Prototype offline first** with `@net-mesh/browser/local`:
   `const mesh = createLocalMesh(); const hostNode = mesh.node(); const guestNode = mesh.node();`
   — each node is a `transport` for `hostStore` / `joinStore`, in one page, with
-  the real store and no anchor or network. It proves game logic, not that two
+  the real store and no anchor or network. Local nodes also `announce(tags)` and
+  `query(tag)` like a real node (another node's announcement, never your own;
+  it expires after 300 s unless re-announced), so the find-the-host loop works
+  offline unchanged. It proves game logic, not that two
   browsers can connect; switch the nodes to `connect()` for that. The package
   demo (`net/crates/net/browser-ts/demo/`) runs this way by default.
 

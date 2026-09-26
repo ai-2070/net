@@ -23,16 +23,48 @@
  * wiring. It is not evidence that two browsers can reach each other —
  * that takes an anchor and `connect()`.
  *
+ * Discovery works too: `announce(tags)` and `query(tag)` behave like
+ * the real node's, including the announcement expiring, so a lobby
+ * list or a find-the-host loop can be built offline as well.
+ *
  * Nothing here loads the wasm node: importing this subpath costs no
  * download.
  */
 
+import type { NodeDescriptor } from './node.js';
 import type { StoreTransport, TransportFrame, TransportStream } from './store/host.js';
+
+/**
+ * How long an announcement stays discoverable: the leaf's default,
+ * 300 s (`net-mesh-leaf` `DEFAULT_TTL_SECS`). A node that announces
+ * once and never again drops out of `query` after it, as on the mesh.
+ */
+export const LOCAL_ANNOUNCEMENT_TTL_MS = 300_000;
+
+/** Options for {@link createLocalMesh}. */
+export interface LocalMeshOptions {
+  /** Announcement lifetime, milliseconds. Default {@link LOCAL_ANNOUNCEMENT_TTL_MS}. */
+  readonly announcementTtlMs?: number;
+  /** The clock announcements are judged against. Default `Date.now`. */
+  readonly now?: () => number;
+}
 
 /** A node on a local mesh. Pass it wherever the store takes a `transport`. */
 export interface LocalNode extends StoreTransport {
   /** This node's id: 16 lowercase hex, as `connect()`'s node reports it. */
   nodeIdHex(): string;
+  /**
+   * Publish this node's capability tags, replacing any it announced
+   * before — as `connect()`'s node does. Discoverable by the OTHER
+   * nodes on this mesh until the announcement expires.
+   */
+  announce(capabilities: readonly string[]): Promise<void>;
+  /**
+   * The other nodes whose fresh announcement carries `capability`, in
+   * the same descriptor shape `connect()`'s node returns. This node's
+   * own announcement is not included, as a leaf does not hear itself.
+   */
+  query(capability: string): Promise<NodeDescriptor[]>;
   /** Take this node off the mesh: frames to it fail, and it hears nothing. */
   close(): void;
 }
@@ -67,8 +99,14 @@ function canonicalId(id: string): string {
 }
 
 /** Create an empty local mesh. */
-export function createLocalMesh(): LocalMesh {
+export function createLocalMesh(options: LocalMeshOptions = {}): LocalMesh {
   const listeners = new Map<string, Set<(event: TransportFrame) => void>>();
+  const ttl = options.announcementTtlMs ?? LOCAL_ANNOUNCEMENT_TTL_MS;
+  const now = options.now ?? (() => Date.now());
+  const announcements = new Map<
+    string,
+    { readonly capabilities: readonly string[]; readonly at: number; readonly version: bigint }
+  >();
 
   function deliver(to: string, from: string, payload: Uint8Array, streamId: string | undefined): void {
     const targets = listeners.get(to);
@@ -119,10 +157,35 @@ export function createLocalMesh(): LocalMesh {
           own.delete(handler);
         };
       },
+      announce: capabilities => {
+        if (closed) return Promise.reject(new Error(`local node ${self} is closed`));
+        const version = (announcements.get(self)?.version ?? 0n) + 1n;
+        announcements.set(self, { capabilities: Object.freeze([...capabilities]), at: now(), version });
+        return Promise.resolve();
+      },
+      query: capability => {
+        if (closed) return Promise.reject(new Error(`local node ${self} is closed`));
+        const at = now();
+        const found: NodeDescriptor[] = [];
+        for (const [id, entry] of announcements) {
+          if (id === self || at - entry.at >= ttl || !entry.capabilities.includes(capability)) continue;
+          found.push({
+            nodeId: BigInt(`0x${id}`).toString(10),
+            peerIdHex: id,
+            entityId: null,
+            capabilities: entry.capabilities,
+            rtcAddr: null,
+            noisePubkey: null,
+            version: entry.version.toString(),
+          });
+        }
+        return Promise.resolve(found);
+      },
       close: () => {
         if (closed) return;
         closed = true;
         own.clear();
+        announcements.delete(self);
         if (listeners.get(self) === own) listeners.delete(self);
       },
     };
@@ -134,6 +197,7 @@ export function createLocalMesh(): LocalMesh {
     close: () => {
       for (const handlers of listeners.values()) handlers.clear();
       listeners.clear();
+      announcements.clear();
     },
   };
 }

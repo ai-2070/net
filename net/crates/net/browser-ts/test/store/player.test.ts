@@ -318,6 +318,43 @@ describe('createLocalMesh', () => {
     expect(mesh.nodes()).toEqual(['000000000000000a']);
   });
 
+  it('discovers other nodes by tag, in the real descriptor shape, until the announcement expires', async () => {
+    let clock = 1_000;
+    const mesh = createLocalMesh({ announcementTtlMs: 5_000, now: () => clock });
+    const host = mesh.node('00000000000000ff');
+    const guest = mesh.node('b');
+    await host.announce(['my-game.host', 'other']);
+    const [found] = await guest.query('my-game.host');
+    expect(found).toEqual({
+      nodeId: '255',
+      peerIdHex: '00000000000000ff',
+      entityId: null,
+      capabilities: ['my-game.host', 'other'],
+      rtcAddr: null,
+      noisePubkey: null,
+      version: '1',
+    });
+    // Not its own announcement, as a leaf does not hear itself.
+    expect(await host.query('my-game.host')).toEqual([]);
+    expect(await guest.query('nothing')).toEqual([]);
+
+    // A re-announce replaces the tags and moves the version.
+    await host.announce(['other']);
+    expect(await guest.query('my-game.host')).toEqual([]);
+    expect((await guest.query('other'))[0]?.version).toBe('2');
+
+    // A lease: announce once and it is gone after the TTL.
+    clock += 4_999;
+    expect(await guest.query('other')).toHaveLength(1);
+    clock += 1;
+    expect(await guest.query('other')).toEqual([]);
+
+    // A closed node is not discoverable.
+    await host.announce(['other']);
+    host.close();
+    expect(await guest.query('other')).toEqual([]);
+  });
+
   it('keeps meshes apart', async () => {
     const one = createLocalMesh();
     const two = createLocalMesh();

@@ -37,7 +37,10 @@ the README on why it is a sibling package rather than a sub-path.
 - **`@net-mesh/browser/local`** — `createLocalMesh()`, several nodes in
   one page with no anchor and no network, each a `StoreTransport`. The
   store on top is the real one; delivery is a function call and the
-  peer is assigned rather than proved. For building game logic first;
+  peer is assigned rather than proved. Local nodes also `announce` and
+  `query` in the real descriptor shape, with the leaf's lease (another
+  node's announcement only, expiring after 300 s by default), so
+  discovery code runs offline. For building game logic first;
   the demo's `demo/local-mesh.js` is replaced by it.
 
 ## Unreleased — targets 0.36.0

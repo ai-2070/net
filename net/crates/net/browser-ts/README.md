@@ -96,7 +96,8 @@ curl -s "http://localhost:<port>/config?tab=1" | jq -r .credentialB64
 > const friend = mesh.node();        // a second player, in the same page
 > ```
 >
-> Build your game logic this way, then swap in `connect()` for real
+> Local nodes can `announce` and `query` too, so step 3's host-finding code
+> works unchanged. Build your game logic this way, then swap in `connect()` for real
 > multiplayer. It proves your rules work, not that two browsers can reach each
 > other. The [`demo/`](https://github.com/ai-2070/net/tree/master/net/crates/net/browser-ts/demo)
 > runs a host and two players like this.
