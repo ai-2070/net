@@ -18,6 +18,15 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **Lobbies.** `createLobby()` hosts a store with the host's own
+  player (`lobby.self`), a room code, a shareable link, presence
+  (`players()`, `subscribePlayers`), capacity (the host counted) and
+  immediate kicks; `listLobbies()` lists a game's public lobbies;
+  `joinLobby()` joins by code, link or listing. Discovery is capability
+  tags in the host's signed announcement — no new protocol. Records are
+  bounded (256-byte `info`, 512-byte tag) and validated when read; a
+  code claimed by two nodes is refused as `ambiguous`; unlisted lobbies
+  publish only a hash of their code.
 - **`hostPlayer(host, { audience })`** — the hosting node's own player,
   with the handle shape `joinStore` returns. A node cannot join its own
   store, so every game whose host also plays wrote a wrapper around the

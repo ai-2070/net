@@ -982,11 +982,64 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * lifetime.
    */
   private forget(h: Hex): void {
-    this.handles.delete(h);
+    const existed = this.handles.delete(h);
     this.ledgers.forget(h);
     // §1.8: expiry retires any projection already pending, and a dead
     // handle never acquires one.
     this.deferred.delete(h);
+    if (existed) this.membershipChanged();
+  }
+
+  /** Listeners told when the set of installed handles changes. */
+  private readonly membership = new Set<() => void>();
+
+  private membershipChanged(): void {
+    for (const listener of [...this.membership]) {
+      try {
+        listener();
+      } catch {
+        // A listener is application code on the frame path; its
+        // failure must not take the dispatch down with it.
+      }
+    }
+  }
+
+  /**
+   * Be told when a handle is installed or forgotten — join, leave,
+   * expiry, a policy refusal, closure. Synchronous, inside the frame
+   * that caused it: a listener reads {@link peers} and must not call
+   * back into the owner.
+   */
+  onMembership(listener: () => void): Cancel {
+    this.membership.add(listener);
+    return () => {
+      this.membership.delete(listener);
+    };
+  }
+
+  /** The distinct authenticated peers with an installed handle. */
+  peers(): readonly string[] {
+    return [...new Set([...this.handles.values()].map(handle => handle.peer))];
+  }
+
+  /**
+   * Re-ask `authorize` for every installed read, now.
+   *
+   * The delta feed re-authorizes before shipping, but only when there
+   * is a change to ship: a policy that revokes a peer (a kick) would
+   * otherwise leave it subscribed until the next commit. A refused
+   * handle is forgotten with the same unsolicited `closed` the feed
+   * sends, so the replica rejoins and its join is answered
+   * `forbidden`.
+   */
+  reauthorize(): Dispatched {
+    const out: Outbound[] = [];
+    for (const handle of [...this.handles.values()]) {
+      if (this.permitsRead(handle.peer, handle.audience)) continue;
+      this.forget(handle.h);
+      out.push(this.no(handle.peer, handle.h, 'closed', null));
+    }
+    return this.accept(out);
   }
 
   /**
@@ -1172,6 +1225,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       this.forget(h);
       return this.refuse('join-projection-capacity', [this.no(peer, null, 'capacity', message.q)]);
     }
+    this.membershipChanged();
     return this.accept(emitted);
   }
 

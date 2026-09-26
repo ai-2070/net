@@ -310,6 +310,50 @@ try {
 
 ---
 
+## Lobbies: a list, a code, a link
+
+Steps 3a and 3b find each other by hand. A lobby does it for you: the host opens
+one, other players pick it from a list or type its code, and the host keeps
+playing in its own world.
+
+```js
+import { createLobby, listLobbies, joinLobby, lobbyCodeFromUrl } from '@net-mesh/browser';
+
+// Host page: the same store options as step 3a, plus a game name, a lobby name and a size.
+const lobby = await createLobby({
+  node, game: 'my-game', name: 'Friday arena', capacity: 8,
+  info: { map: 'dunes' },           // small public fields your list can show
+  definition: arena, initialState: { ships: {} },
+  project: state => state, actions, inputs,
+});
+lobby.code;                         // 'K7QP2M' — read it out, or share lobby.link()
+const world = lobby.self;           // the host's own player
+lobby.subscribePlayers(players => showPlayers(players));
+```
+
+```js
+// Everyone else: pick from the list…
+const lobbies = await listLobbies({ node, game: 'my-game' });
+// [{ code, name, players, capacity, info, host, store }]
+const world = await joinLobby({ node, definition: arena, game: 'my-game', lobby: lobbies[0] });
+// …or by typed code, or from the link: { …, code: 'K7QP2M' } / { …, code: lobbyCodeFromUrl() }
+await world.ready();
+```
+
+- **Full lobbies turn players away** (`ready()` rejects with `forbidden`); the
+  host counts as one of `capacity`. `lobby.kick(playerId)` removes a player at
+  once and keeps them out.
+- **`visibility: 'unlisted'`** keeps a lobby out of the list; it is joined by
+  code or link only. Unlisted is not a password — anyone with the code can
+  try, and your `authorize` decides who gets in.
+- **A lobby list is what hosts claim about themselves.** Names and player counts
+  come from the host's own announcement; the host id does not, it is proven. If
+  two hosts claim one code, `joinLobby` refuses (`ambiguous`) rather than guess.
+- **One lobby per node** — a lobby owns the node's announcements while it is
+  open. `lobby.close()` withdraws it.
+- It all works on `@net-mesh/browser/local` too, so you can build the lobby
+  screen before you have an anchor.
+
 ## Things worth knowing
 
 **Inputs vs actions.** `world.input(name, value)` never waits and never

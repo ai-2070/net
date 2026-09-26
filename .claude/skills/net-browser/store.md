@@ -285,7 +285,18 @@ writes.
 - **Give each player an entity with an `enlist` action keyed by `context.peer`**
   (the authenticated caller — never an id the client sends). A joiner does
   `await replica.ready(); await replica.act('enlist', …)` before steering.
-- **Discovery before join.** Share the host's `node.nodeIdHex()` out of band (the
+- **Prefer a lobby over hand-rolled discovery.** `createLobby({ node, game,
+  name, capacity, info?, visibility?, …hostStore options })` hosts the store,
+  gives the host `lobby.self` (a `hostPlayer`), and re-announces on its own;
+  `listLobbies({ node, game })` returns `{ code, name, players, capacity, info,
+  host, store }`; `joinLobby({ node, definition, game, code | lobby })` finds
+  the host and returns a `joinStore` handle (await `ready()`). Capacity counts
+  the host; a full lobby answers `forbidden`. `lobby.kick(peer)` is immediate.
+  `joinLobby` throws `LobbyError` `not-found` / `ambiguous` (two nodes claim
+  the code — never pick one) / `invalid`. A lobby owns its node's
+  announcements (pass other tags as `tags`); unlisted lobbies are not secret —
+  gate with `authorize`. Codes: `lobby.link()` / `lobbyCodeFromUrl()`.
+- **Discovery before join** (without a lobby). Share the host's `node.nodeIdHex()` out of band (the
   demo uses a `?host=<hex>` link). The host announces a tag and **re-announces
   every ~2 s** — announcements are leases that expire. The joiner polls
   `node.query(tag)` until the host is present — compare with

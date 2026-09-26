@@ -63,7 +63,7 @@ What stands in the way:
 |---|---|---|
 | G1 | **No installable anchor admits browsers.** `net-mesh anchor serve` registers no enrollment service, so a page's `connect()` times out. Only the `examples/browser-demo/host` example serves enrollment. | `cli/src/commands/anchor.rs` `run_serve`; `browser-ts/demo/README.md` |
 | G2 | **Credentials are minted by hand** (`net-mesh anchor credential mint`) or by the demo host's `/config?tab=N`. | `cli/src/commands/anchor.rs` |
-| G3 | **No lobby API.** Every game re-implements re-announce loops, query-until-present polling, ready, enlist, and a ~40-line wrapper so the host can play in its own world. | `browser-ts/demo/main.js` |
+| G3 | **Closed:** `createLobby` / `listLobbies` / `joinLobby` (`src/lobby.ts`). Was: **No lobby API.** Every game re-implements re-announce loops, query-until-present polling, ready, enlist, and a ~40-line wrapper so the host can play in its own world. | `browser-ts/demo/main.js` |
 | G4 | ~~**The host player can't join its own store** (`invalid-data`); the workaround is application code.~~ **Closed:** `hostPlayer(host, { audience })`. | `store/player.ts` |
 | G5 | ~~**The offline transport isn't in the package**, so prototyping needs a clone of the repo.~~ **Closed:** `@net-mesh/browser/local` (`createLocalMesh`). | `src/local.ts` |
 | G6 | **The host leaving ends the world.** Replicas get `owner-lost`, which is terminal; there is no migration. By design for v1. | `store/errors.ts`; store design §1 |
@@ -134,7 +134,21 @@ await game.ready();
 
 - **Discovery:** lobby metadata rides the announcement (tag plus a small
   metadata record), re-announced on a timer the helper owns. Stale lobbies
-  vanish when announcements lapse.
+  vanish when announcements lapse. Concretely (Q4), with no protocol change —
+  capability tags are free-form strings, only `causal:`/`fork-of:`/`heat:`/
+  `scope:` are reserved, and the core imposes no tag length:
+  - `net-lobby:<game>` — the queryable listing tag, public lobbies only;
+  - `net-lobby:<game>:rec:<base64url JSON>` — the record: version, code, name,
+    players, capacity, store `id@version`, and app `info` (≤ 256 bytes of
+    JSON); the whole tag ≤ 512 bytes. Public lobbies only;
+  - `net-lobby:<game>:code:<sha-256(code), 32 hex>` — how a code is looked up;
+    both kinds announce it. Unlisted means *not listed*, not *secret*: a
+    6-character code can be brute-forced against the hash, and the anchor sees
+    every announcement. Access control is the host's `authorize`.
+- **Capacity and kick** are enforced in the `authorize` the helper wraps around
+  the game's, counted from the owner's live handles (not from guesses about
+  who joined), and a kick re-authorizes installed handles at once rather than
+  at the next change.
 - **The host's own player (G4):** `lobby.self` is the demo's wrapper made
   official: the same `authorize`, the same handlers, the same handle shape as a
   replica, so game code doesn't branch on "am I the host". **Done** as the
@@ -441,10 +455,10 @@ holds replicas of its current region and its neighbours.
 | Q1 | Run the store in Node over `sdk-ts`, or build a native store host? (Spike first.) | Sets the cost of P3 and P4 |
 | Q2 | CLI anchor mode vs a hosted anchor service (or both)? | P0 shape; business model |
 | Q3 | Credential policy: anonymous + rate limit, or game-login-signed requests? | Abuse surface |
-| Q4 | Lobby metadata on announcements: size limit and what's public | Privacy of unlisted lobbies |
-| Q5 | Interest keys: cells only, or arbitrary keys (teams, instances)? | P2 API generality |
+| Q4 | ~~Lobby metadata on announcements: size limit and what's public~~ **Decided (2026-09-26):** a fixed record (name, players, capacity, code, store version) plus small developer-defined fields, under a byte cap; unlisted lobbies publish no record. | Privacy of unlisted lobbies |
+| Q5 | ~~Interest keys: cells only, or arbitrary keys?~~ **Decided (2026-09-26):** arbitrary string keys; grid cells are one helper (`cellsAround`). | P2 API generality |
 | Q6 | Handoff consistency target: at-most-once with typed failure, or exactly-once? | P4 protocol complexity |
-| Q7 | Visibility API and defaults: path strings (as sketched) or schema annotations (e.g. a validator wrapper `secret(owner, schema)`)? How is `team` resolved — an app callback? Which presets ship first (proposed: `open`, `card-game`)? How is "development mode" detected — an explicit `dev` flag, or the bundler's `NODE_ENV`? | P2 hidden-information API shape and defaults |
+| Q7 | **Decided (2026-09-26):** path rules plus presets (`open`, `card-game` first), development warnings behind an explicit `dev` flag rather than `NODE_ENV`; `team` resolution still to specify. Original question — Visibility API and defaults: path strings (as sketched) or schema annotations (e.g. a validator wrapper `secret(owner, schema)`)? How is `team` resolved — an app callback? Which presets ship first (proposed: `open`, `card-game`)? How is "development mode" detected — an explicit `dev` flag, or the bundler's `NODE_ENV`? | P2 hidden-information API shape and defaults |
 
 ---
 

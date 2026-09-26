@@ -200,6 +200,30 @@ A replica has **no `setState`**. That is a type-level fact rather than a runtime
 check: writes go through actions and inputs, and only the host's handle carries
 the setter.
 
+## Lobbies
+
+`createLobby`, `listLobbies` and `joinLobby` are a layer over the store and
+discovery, with no protocol of their own:
+
+```typescript
+const lobby = await createLobby({ node, game: 'arena', name: 'Friday arena', capacity: 8,
+  definition, initialState, project, actions, inputs });
+const lobbies = await listLobbies({ node, game: 'arena' });
+const world = await joinLobby({ node, definition, game: 'arena', code: lobby.code });
+```
+
+A lobby is found through capability tags in the host's signed announcement: a
+listing tag, a record (code, name, players, capacity, store version and up to 256
+bytes of the game's own `info`; at most 512 bytes in all), and a hash of the
+code. Unlisted lobbies publish only the hash. The record is the host's claim and
+is validated before it is shown; the host id is taken from the signed
+announcement. A code claimed by two nodes is refused (`ambiguous`) rather than
+resolved.
+
+Capacity and kicks are enforced in front of the game's `authorize`, counted from
+the store's live subscriptions; `lobby.kick(peer)` re-checks every installed
+subscription at once. `lobby.self` is the host's own player (below).
+
 ## The host's own player
 
 `hostPlayer(host, { audience })` returns the same handle shape as `joinStore`,

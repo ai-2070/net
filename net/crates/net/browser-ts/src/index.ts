@@ -188,3 +188,7 @@ export * from './leader/index.js';
 // peer and subscription lifecycle they require, and are absent rather
 // than stubbed until then — see `store/index.ts`.
 export * from './store/index.js';
+
+// Lobbies: host a game others can find, list the open ones, join by
+// code or link — `createLobby` / `listLobbies` / `joinLobby`.
+export * from './lobby.js';
