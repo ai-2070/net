@@ -1,0 +1,31 @@
+net/crates/net/sdk-ts/test/store_persist.test.ts
+  s_d8b00bedd146e9::t_a09a2775eda5ce 1-179
+net/crates/net/sdk-ts/src/store-persist.ts
+  s_d8b00bedd146e9::t_c9b284ac30ba47 1-197
+net/crates/net/sdk-ts/src/index.ts
+  s_d8b00bedd146e9::t_d78bb4229ec202 126-133
+.claude/skills/net-browser/netcode.md
+  s_d8b00bedd146e9::t_a6c1931db873c8 42-44
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_b84f9c41580141 559-564
+net/crates/net/sdk-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_66730ad963683a 19-25
+web/src/content/docs/sdk/browser/store.md
+  s_d8b00bedd146e9::t_ea120df7f74b28 217-245
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "84d4df3df7c565acffc1ea1a88ca6177c38a1874",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
