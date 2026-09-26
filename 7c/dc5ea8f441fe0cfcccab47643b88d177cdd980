@@ -1,0 +1,38 @@
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_b690eb6d68e627 95,598-618
+net/crates/net/browser-ts/test/store/hosted.test.ts
+  s_d8b00bedd146e9::t_851b21613064fd 2498
+.claude/skills/net-browser/store.md
+  s_d8b00bedd146e9::t_b690eb6d68e627 173-177
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_b690eb6d68e627 27-32
+web/src/content/docs/sdk/browser/store.md
+  s_d8b00bedd146e9::t_b690eb6d68e627 290-296
+net/crates/net/browser-ts/src/store/host.ts
+  s_d8b00bedd146e9::t_2be22d6fb9aeb9 251-262,820
+net/crates/net/browser-ts/test/store/sparse-views.test.ts
+  s_d8b00bedd146e9::t_4178860bb4d3f4 69-70
+  s_d8b00bedd146e9::t_2be22d6fb9aeb9 190-191
+  s_d8b00bedd146e9::t_ec4a0574823ae8 1-68,71-189,192-194
+net/crates/net/browser-ts/src/store/owner.ts
+  s_d8b00bedd146e9::t_494de53fd79ca1 283-296,490-492,538-542,544,1633-1757
+  s_d8b00bedd146e9::t_2be22d6fb9aeb9 398-406,543
+  s_d8b00bedd146e9::t_227912a0f0ee64 493,533-537
+  s_d8b00bedd146e9::t_0721e331ae09a7 1758
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7cdc5ea8f441fe0cfcccab47643b88d177cdd980",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
