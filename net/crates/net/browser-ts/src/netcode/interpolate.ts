@@ -12,7 +12,11 @@ export interface TimedSnapshot<E> {
   readonly entities: Readonly<Record<string, E>>;
 }
 
-/** Blend two states of one entity; `alpha` is in `[0, 1]`. */
+/**
+ * Blend two states of one entity; `alpha` is in `[0, 1]` — or above 1 when
+ * extrapolating past the newest snapshot (`extrapolateMs`), where `to` is
+ * carried on along the line from `from`.
+ */
 export type Interpolator<E> = (from: E, to: E, alpha: number) => E;
 
 /**
@@ -71,17 +75,31 @@ export class SnapshotBuffer<E> {
 
   /**
    * The entities as of host time `at`: interpolated between the two
-   * snapshots around it. Before the oldest held, the oldest; past the
-   * newest, the newest (held, not extrapolated). An entity present only in
-   * the later snapshot appears as it is there; one gone from the later
-   * snapshot is gone.
+   * snapshots around it. Before the oldest held, the oldest. Past the
+   * newest: held there, or — with `extrapolateMs` — carried on along the
+   * last two snapshots' line for at most that long, then held. An entity
+   * present only in the later snapshot appears as it is there; one gone
+   * from the later snapshot is gone.
    */
-  at(time: number, blend: Interpolator<E>): Readonly<Record<string, E>> {
+  at(time: number, blend: Interpolator<E>, extrapolateMs = 0): Readonly<Record<string, E>> {
     const list = this.#snapshots;
     if (list.length === 0) return {};
     if (time <= list[0]!.time) return list[0]!.entities;
     const last = list.at(-1)!;
-    if (time >= last.time) return last.entities;
+    if (time >= last.time) {
+      const before = list.at(-2);
+      if (extrapolateMs <= 0 || before === undefined || last.time === before.time || time === last.time) {
+        return last.entities;
+      }
+      const ahead = Math.min(time - last.time, extrapolateMs);
+      const alpha = 1 + ahead / (last.time - before.time);
+      const out: Record<string, E> = {};
+      for (const [id, to] of Object.entries(last.entities)) {
+        const from = before.entities[id];
+        out[id] = from === undefined ? to : blend(from, to, alpha);
+      }
+      return out;
+    }
     let i = 1;
     while (list[i]!.time < time) i += 1;
     const a = list[i - 1]!;

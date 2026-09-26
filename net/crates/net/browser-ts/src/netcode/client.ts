@@ -40,12 +40,29 @@ export interface JoinNetcodeOptions<E, I> {
   readonly interpolationDelayMs?: number;
   /** Blend two states of an entity. Default {@link lerpNumbers}. */
   readonly interpolate?: Interpolator<E>;
+  /**
+   * When the newest snapshot is older than the render time (a late or lost
+   * snapshot), carry remote entities on along their last motion for at most
+   * this long, ms, instead of freezing them. Default 0: hold. Extrapolation
+   * guesses; a wrong guess is corrected by the next snapshot, visibly. Your
+   * `interpolate`, if you supply one, is then called with `alpha > 1`.
+   */
+  readonly extrapolateMs?: number;
   /** Predict and reconcile this entity. Omit for a spectator. */
   readonly local?: LocalEntity<E, I>;
   /** Unacknowledged inputs repeated in each input frame. Default 8. */
   readonly inputRedundancy?: number;
   /** Clock pings per second. Default 4. */
   readonly pingRate?: number;
+  /**
+   * How long a correction takes to show, ms. Default 100; `0` snaps.
+   *
+   * When reconciliation moves your entity, the view blends from where it
+   * was drawn to where the host says it is, instead of jumping. Inputs
+   * keep applying to both during the blend, so it never lags your
+   * controls; it only closes the gap.
+   */
+  readonly correctionSmoothingMs?: number;
   readonly now?: Now;
 }
 
@@ -89,6 +106,20 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   let seq = 0;
   let pending: WireInput<I>[] = [];
   let predicted: E | null = null;
+  // A correction being blended in: the stale prediction (still advanced
+  // by every input, so it keeps pace with the controls) and when it began.
+  let correcting: { from: E; at: number } | null = null;
+  const smoothing = Math.max(0, options.correctionSmoothingMs ?? 100);
+  /** The local entity as drawn now, and ends a finished blend. */
+  const drawnLocal = (): E | null => {
+    if (predicted === null || correcting === null) return predicted;
+    const alpha = smoothing === 0 ? 1 : (now() - correcting.at) / smoothing;
+    if (alpha >= 1) {
+      correcting = null;
+      return predicted;
+    }
+    return blend(correcting.from, predicted, Math.max(0, alpha));
+  };
   let snapshotsSeen = 0;
   let corrections = 0;
   let joined = false;
@@ -166,7 +197,12 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       if (authoritative !== undefined) {
         let replayed: E = authoritative;
         for (const input of pending) replayed = options.local.predict(replayed, input.data);
-        if (predicted !== null && JSON.stringify(replayed) !== JSON.stringify(predicted)) corrections += 1;
+        if (predicted !== null && JSON.stringify(replayed) !== JSON.stringify(predicted)) {
+          corrections += 1;
+          // Blend from what is on screen now, so a correction that lands
+          // mid-blend continues from there rather than jumping back.
+          if (smoothing > 0) correcting = { from: drawnLocal() ?? predicted, at: now() };
+        }
         predicted = replayed;
       }
     }
@@ -192,15 +228,20 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       seq += 1;
       const seen = (hostNow() ?? now()) - delay;
       pending.push({ seq, seen, data });
-      if (options.local && predicted !== null) predicted = options.local.predict(predicted, data);
+      if (options.local && predicted !== null) {
+        predicted = options.local.predict(predicted, data);
+        if (correcting !== null) correcting = { ...correcting, from: options.local.predict(correcting.from, data) };
+      }
       send({ n: label, k: 'i', i: pending.slice(-redundancy) });
     },
     view() {
       const at = hostNow();
       const latest = snapshots.latest();
-      const entities = at === null ? (latest?.entities ?? {}) : snapshots.at(at - delay, blend);
-      if (!options.local || predicted === null) return entities;
-      return { ...entities, [options.local.id]: predicted };
+      const entities =
+        at === null ? (latest?.entities ?? {}) : snapshots.at(at - delay, blend, options.extrapolateMs ?? 0);
+      const local = drawnLocal();
+      if (!options.local || local === null) return entities;
+      return { ...entities, [options.local.id]: local };
     },
     hostNow,
     stats: () => ({

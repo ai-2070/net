@@ -74,8 +74,12 @@ function frame() { draw(net.view()); requestAnimationFrame(frame); }
 - **Keep snapshots small.** A snapshot over one event (~8 KiB) is sent as
   fragments, and on the lossy carrier one lost fragment loses the whole
   snapshot. Filter with `visible` (interest) rather than sending the world.
-- **Not built yet:** smoothing of corrections (they snap), extrapolation
-  past the newest snapshot (it holds), binary encoding (frames are JSON).
+- **Corrections blend in** over `correctionSmoothingMs` (default 100, `0`
+  snaps); inputs keep moving the drawn entity during the blend.
+- **Past the newest snapshot remote entities hold**, unless you set
+  `extrapolateMs` (then they carry on along their last motion for at most
+  that long; a custom `interpolate` then sees `alpha > 1`).
+- **Not built yet:** binary encoding (frames are JSON).
 - The **anchor must be the same release** as the package: an older anchor
   treats the lossy channel as its only one.
 - Source: `net/crates/net/browser-ts/src/netcode/`, tests

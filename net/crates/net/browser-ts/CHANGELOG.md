@@ -18,6 +18,12 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **Netcode: correction smoothing and extrapolation.** `joinNetcode`'s
+  `correctionSmoothingMs` (default 100, `0` snaps) blends a reconciliation
+  correction in instead of jumping; inputs keep applying during the blend.
+  `extrapolateMs` (default 0) carries remote entities on along their last
+  motion when the newest snapshot is late, capped at that long.
+
 - **Entity writes: `setEntities(collection, changes)` / `setEntity(collection,
   id, value)`** on the host handle, for collections that declare a per-entity
   parser in the definition's new `entities` field. Only the written entities

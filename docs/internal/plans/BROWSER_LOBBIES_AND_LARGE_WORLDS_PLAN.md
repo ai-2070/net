@@ -464,9 +464,11 @@ event's sender as a DECIMAL u64 and netcode read it as hex, refusing every
 frame; netcode now reads event peers exactly as the store does
 (`peerHexOf`), and the simulator reports decimal like the leaf. The runner witness
 `stage7_netcode_predicts_a_ship_and_the_host_applies_every_input_over_the_lossy_channel`
-runs on the DIRECT pair (after §8). **Not yet:** correction smoothing,
-extrapolation, binary frames, fragmentation-aware snapshot sizing,
-interest-key integration (today `visible`).
+runs on the DIRECT pair (after §8). Correction smoothing
+(`correctionSmoothingMs`, default 100) and opt-in extrapolation
+(`extrapolateMs`) are done (2026-09-27). **Not yet:** binary frames,
+fragmentation-aware snapshot sizing, interest-key integration (today
+`visible`).
 
 **Fixed (2026-09-27) — netcode on a direct pair.** Run right after the pair
 went direct, the host's netcode sends to the player all failed. Cause:

@@ -76,6 +76,20 @@ describe('SnapshotBuffer', () => {
     expect(buffer.at(999, lerpNumbers).s).toEqual({ x: 20, y: 0 });
   });
 
+  it('extrapolates past the newest only when asked, and only as far as the cap', () => {
+    const buffer = new SnapshotBuffer<Ship>();
+    buffer.add(snap(0, 0, 0));
+    buffer.add(snap(1, 100, 10));
+    expect(buffer.at(150, lerpNumbers).s).toEqual({ x: 10, y: 0 });
+    expect(buffer.at(150, lerpNumbers, 80).s).toEqual({ x: 15, y: 0 });
+    // Capped: 500 ms past the newest carries on only 80.
+    expect(buffer.at(600, lerpNumbers, 80).s).toEqual({ x: 18, y: 0 });
+    // One snapshot has no line to carry on along.
+    const single = new SnapshotBuffer<Ship>();
+    single.add(snap(0, 0, 3));
+    expect(single.at(50, lerpNumbers, 80).s).toEqual({ x: 3, y: 0 });
+  });
+
   it('shows an entity appearing as it is, and drops one that is gone from the later snapshot', () => {
     const buffer = new SnapshotBuffer<Ship>();
     buffer.add(snap(0, 0, null));
@@ -95,7 +109,7 @@ describe('netcode over a lossy, laggy network', () => {
   });
 
   /** A world of ships moved by inputs, hosted at 30 Hz. */
-  function game(net: ReturnType<typeof simNetwork>, hostClockAhead = 0) {
+  function game(net: ReturnType<typeof simNetwork>, hostClockAhead = 0, rule: typeof move = move) {
     const ships = new Map<string, Ship>();
     const applied = new Map<string, number[]>();
     const host = hostNetcode<Ship, Move>({
@@ -106,7 +120,7 @@ describe('netcode over a lossy, laggy network', () => {
       step: ({ inputs }) => {
         for (const [peer, list] of inputs) {
           for (const input of list) {
-            ships.set(peer, move(ships.get(peer) ?? { x: 0, y: 0 }, input.data));
+            ships.set(peer, rule(ships.get(peer) ?? { x: 0, y: 0 }, input.data));
             applied.set(peer, [...(applied.get(peer) ?? []), input.seq]);
           }
         }
@@ -116,15 +130,67 @@ describe('netcode over a lossy, laggy network', () => {
     return { host, ships, applied };
   }
 
-  function player(net: ReturnType<typeof simNetwork>, id: string) {
+  function player(net: ReturnType<typeof simNetwork>, id: string, correctionSmoothingMs?: number) {
     return joinNetcode<Ship, Move>({
       transport: net.node(id),
       host: HOST,
       label: 'test.movement',
       now: () => Date.now(),
       local: { id, predict: move },
+      ...(correctionSmoothingMs === undefined ? {} : { correctionSmoothingMs }),
     });
   }
+
+  // The host has a wall at x = 5 the player's prediction does not know
+  // about, so reconciliation has to pull the ship back.
+  const walled = (ship: Ship, input: Move): Ship => ({ x: Math.min(5, ship.x + input.dx), y: ship.y });
+
+  it('blends a correction in over the smoothing time, without lagging the controls', async () => {
+    const net = simNetwork({ latencyMs: 40 });
+    const { host, ships } = game(net, 0, walled);
+    const alice = player(net, ALICE, 200);
+    await vi.advanceTimersByTimeAsync(500);
+    alice.input({ dx: 0 });
+    await vi.advanceTimersByTimeAsync(500);
+    for (let i = 0; i < 8; i += 1) alice.input({ dx: 1 });
+    expect(alice.view()[ALICE]?.x).toBe(8);
+
+    // Step until the first correction lands, then look at the next frames.
+    while (alice.stats().corrections === 0) await vi.advanceTimersByTimeAsync(5);
+    const first = alice.view()[ALICE]!.x;
+    expect(first).toBeGreaterThan(5);
+    expect(first).toBeLessThanOrEqual(8);
+    await vi.advanceTimersByTimeAsync(50);
+    const mid = alice.view()[ALICE]!.x;
+    // Moving toward the host, not there yet.
+    expect(mid).toBeLessThan(first);
+    expect(mid).toBeGreaterThan(5);
+
+    // An input during the blend still moves the drawn ship at once. (It
+    // hits the wall on the host too; what matters is the frame.)
+    alice.input({ dx: -1 });
+    expect(alice.view()[ALICE]!.x).toBeCloseTo(mid - 1, 5);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(ships.get(ALICE)).toEqual({ x: 4, y: 0 });
+    expect(alice.view()[ALICE]).toEqual({ x: 4, y: 0 });
+    alice.close();
+    host.close();
+  });
+
+  it('snaps a correction when smoothing is 0', async () => {
+    const net = simNetwork({ latencyMs: 40 });
+    const { host } = game(net, 0, walled);
+    const alice = player(net, ALICE, 0);
+    await vi.advanceTimersByTimeAsync(500);
+    alice.input({ dx: 0 });
+    await vi.advanceTimersByTimeAsync(500);
+    for (let i = 0; i < 8; i += 1) alice.input({ dx: 1 });
+    while (alice.stats().corrections === 0) await vi.advanceTimersByTimeAsync(5);
+    expect(alice.view()[ALICE]!.x).toBeLessThanOrEqual(5);
+    alice.close();
+    host.close();
+  });
 
   it("syncs the player's clock to the host's, through latency and loss", async () => {
     const net = simNetwork({ latencyMs: 60, lossRate: 0.1, jitterMs: 10 });
