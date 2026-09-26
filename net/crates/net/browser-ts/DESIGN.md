@@ -158,7 +158,7 @@ const host = hostStore({
   // id; name them when one node hosts several, or the joins are
   // ambiguous and the wrong store answers.
   definition, store: 'world', transport: node, initialState, maxEventBytes: 8104,
-  authorize: request => request.audience.every(a => a !== 'command'),
+  authorize: request => request.type !== 'read' || !request.audience.includes('command'),
   project: (state, audience) => audience.includes('command') ? state : publicPart(state),
   actions, inputs,
 });

@@ -22,14 +22,18 @@ const node = await connect({ credentialB64, bootstrapUrl: 'https://anchor.exampl
 | Called twice in one origin | two nodes contending for one identity | the same node |
 | Tab closes | the node is gone | a follower is promoted and re-bootstraps |
 | Three promise-valued methods | — | `counters()`, `isEnrolled()`, `openStream()` |
-| Reach for it when | a harness, a demo, one-node page | any real page |
+| Only on this surface | `peerAttempt`, `handshakePeer`, `refineIceFailure`, `rtcStats`, `retryReport`, `enableNetworkRetry`, `anchorIdHex`, `originHashHex` | `role`, `generation`, `fingerprint`, `scope`, `interruptionMs`, `onLifecycle`, `unsubscribe` |
+| `nodeIdHex()` | `string` | `string \| null` |
+| Reach for it when | a harness, a demo, one-node page, **the game store** | any real page (but a store over it is not established) |
 
 `session.role()` reads `'leader' | 'follower'`; `session.generation()` is the
 fence value that moves on promotion; `session.onLifecycle(handler)` delivers
-`leader_changed`, `leader_lost`, `generation_fenced`, `subscription_restored`
-and `not_leader` events. `session.nodeIdHex()`, `session.fingerprint()` and
-`session.scope()` identify the node; `session.interruptionMs()` reports the
-observed gap across a handoff.
+`leader_changed`, `leader_lost`, `generation_fenced`, `subscription_restored`,
+`not_leader` and `promotion_failed` events. `promotion_failed` means this tab
+won the lock but failed to re-bootstrap the node: it is a follower again and
+will ask for the lock again shortly. `session.nodeIdHex()`,
+`session.fingerprint()` and `session.scope()` identify the node;
+`session.interruptionMs()` reports the observed gap across a handoff.
 
 A stale tab's operation fails as `not-leader` **by name** rather than silently
 doing nothing — that is the point of the typed surface.
@@ -46,9 +50,20 @@ const node = await connect({
 `credentialB64` is issued by the anchor (`net-mesh anchor credential mint`,
 `net-mesh anchor credential inspect`) and is **signed and secret-bearing**; the
 leaf's job is to present it unmodified, and the anchor verifies the issuer
-signature. The anchor's live verbs (`ls`, `stats`, `serve`) need the CLI's
-`rtc-bootstrap` feature, and so does the bootstrap listener a page connects to —
+signature. `credential mint` / `inspect` need no extra feature; the anchor's
+live verbs (`ls`, `stats`, `serve`) need the CLI's `rtc-bootstrap` feature —
 standard CLI packaging does not include them.
+
+**`net-mesh anchor serve` cannot host a browser today.** It serves the bootstrap
+listener but registers no enrollment service, so a page's `connect()` times out
+with `rpc-timeout`. The only anchor a page can use is the browser-demo host —
+from the Rust workspace root (net/crates/net):
+
+```sh
+cargo run --release --manifest-path examples/browser-demo/host/Cargo.toml -- --headless --seconds 600
+```
+
+It serves `GET /config?tab=N`, whose JSON carries a `credentialB64` per tab.
 
 **ICE configuration.** `iceServers` is optional with a working default: omitted,
 the leaf gathers against the `stun_addr` the anchor announces on `GET
@@ -56,13 +71,14 @@ the leaf gathers against the `stun_addr` the anchor announces on `GET
 `rtc_addr` — is refused with `IceServerConflictError` **before** any ICE work,
 because a peer cannot be its own STUN server.
 
-**Admission is not carriage.** Three distinct outcomes a page must not blur:
+**Admission is not carriage.** Distinct outcomes a page must not blur:
 
 | Situation | What you get |
 |---|---|
 | The anchor answered and refused enrollment (replay, expired invite, over §12's bound) | `identity` |
 | The offer/trickle/announcement-publish/signal envelope did not get there | `control-plane` |
 | The anchor never answered at all | `rpc-timeout` |
+| `rpc-refused` with status 1 (NotFound) or 2 (Unauthorized) and a message containing "refused this caller's reply subscription" | the provider refused the reply plane — the anchor answered; it is not a slow provider |
 
 `node.isEnrolled()` is the cheap state check between them, and `enroll()` is
 explicit for harnesses (`connect()` already enrolls).
@@ -93,12 +109,14 @@ Rules that bite:
 - **`connectPeer` is the drive loop plus one offer**; `acceptPeer` is its
   counterpart. Both run the same loop whether the tab is the leader or a follower,
   so a proxied attempt and a direct one cannot disagree about what supersession
-  or a terminal reading looks like. `peerAttempt(hex)` reads the attempt's status
-  without driving it, and `handshakePeer(hex, dialog)` completes a dialog you
-  already hold.
+  or a terminal reading looks like. On `connect()`'s `BrowserNode` only,
+  `peerAttempt(hex)` reads the attempt's status without driving it, and
+  `handshakePeer(hex, dialog)` completes a dialog you already hold; a
+  `MeshSession` has `connectPeer` / `acceptPeer` but neither of those.
 - **ICE may fail.** `outcome` is a reading, not a promise of connectivity; see
-  `errors.md` for what an ICE failure does and does not prove, and `refineIceFailure`
-  for turning a raw failure into a classified one.
+  `errors.md` for what an ICE failure does and does not prove, and
+  `refineIceFailure` (a `BrowserNode` method) for turning a raw failure into a
+  classified one.
 - **A relayed session is a session.** `openStream({ peer })` refuses a peer the
   node has **no session** with (`session: no session with 0x…`), and sessions are
   installed by an attempt — not by discovery. Discovery alone is not enough to
@@ -135,9 +153,11 @@ for await (const bytes of stream) consume(bytes);   // ends when the node or str
 - **`close()` ends the iterators it handed out** on both surfaces: a `for await`
   loop leaves, `next()` resolves `done: true`, `onMessage` listeners drop.
   Opening a stream on a closed node is a typed `session` error. Teardown order is
-  part of the contract (streams retire before the node), and if anything throws
-  during teardown, `close()` throws an `AggregateError` whose `.errors` are the
-  typed errors in teardown order.
+  part of the contract (streams retire before the node). On `connect()`'s
+  `BrowserNode`, if anything throws during teardown, `close()` throws an
+  `AggregateError` whose `.errors` are the typed errors in teardown order; a
+  `MeshSession`'s `close()` ends its streams and org handles but does not
+  aggregate.
 
 ## Events
 

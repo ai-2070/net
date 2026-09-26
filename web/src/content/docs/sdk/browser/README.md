@@ -41,8 +41,15 @@ SDK's with napi.
 
 ## Build it
 
-`@net-mesh/browser` is **not on a registry yet** — it is built from the
-repository. Two builds, in order: the leaf's WebAssembly, then the package.
+Install it from npm (published from 0.37.0):
+
+```sh
+npm install @net-mesh/browser
+```
+
+To build it from the repository instead — for development, or to try an
+unreleased change — run two builds, in order: the leaf's WebAssembly, then the
+package.
 
 ```sh
 cd net/crates/net/leaf
