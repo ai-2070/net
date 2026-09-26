@@ -4805,17 +4805,19 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
         run: |
           set -o pipefail
-          go test -v -tags abi_stability -run TestABIStabilityU64FFIRoundTrip ./... \
+          go test -v -tags abi_stability -run '^(TestABIStabilityU64FFIRoundTrip|TestABIStabilityStreamOccupied)$' ./... \
             2>&1 | tee /tmp/abi_stability_cgo.log
           # `-run` exits 0 when the filter matches NOTHING ("no tests to
           # run"), so the test's own PASS line must appear in the output —
           # the silent-skip shape this repo has been bitten by twice. The
           # trailing space keeps `<name>Extended` or a subtest of it from
           # satisfying the grep.
-          grep -q -- '^--- PASS: TestABIStabilityU64FFIRoundTrip ' /tmp/abi_stability_cgo.log || {
-            echo "::error::TestABIStabilityU64FFIRoundTrip did not run and pass — the -run filter matched nothing"
-            exit 1
-          }
+          for name in TestABIStabilityU64FFIRoundTrip TestABIStabilityStreamOccupied; do
+            grep -q -- "^--- PASS: $name " /tmp/abi_stability_cgo.log || {
+              echo "::error::$name did not run and pass — the -run filter matched nothing"
+              exit 1
+            }
+          done
 
       # With CGO_ENABLED=0 — the default on a Go install with no C compiler
       # on PATH — the toolchain drops every cgo file in this package and
