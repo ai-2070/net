@@ -91,6 +91,7 @@ const GAME_ROOT_CONTEXT: &str = "net-mesh game anchor: game root v1";
 /// Domain separation for deriving a registry secret from an issuer key.
 const ISSUER_SECRET_CONTEXT: &str = "net-mesh game anchor: secret from issuer v1";
 /// Domain separation for a game's tenant id.
+#[cfg(feature = "webrtc")]
 const TENANT_CONTEXT: &str = "net-mesh game anchor: tenant v1";
 /// Domain separation for deriving the invite MAC key from the secret.
 const INVITE_MAC_CONTEXT: &str = "net-mesh game anchor: invite mac v1";
