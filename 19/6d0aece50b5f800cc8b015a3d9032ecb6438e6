@@ -1,0 +1,70 @@
+net/crates/net/sdk-ts/src/mesh.ts
+  s_d8b00bedd146e9::t_5303b8dbee379b 132-138,635
+net/crates/net/wire/src/stream.rs
+  s_d8b00bedd146e9::t_088749f451378f 115-120,131,147-150
+  s_d8b00bedd146e9::t_a6b7ea4162d0f3 151-152
+net/crates/net/tests/rtc_loopback.rs
+  s_d8b00bedd146e9::t_83a64a469cfe44 426-471,476-479,483
+  s_d8b00bedd146e9::t_ac344fe0125e22 472-475,480-482
+net/crates/net/browser-ts/test/netcode/sim.ts
+  s_d8b00bedd146e9::t_a5371469ffb896 1-77
+net/crates/net/sdk-ts/test/store_transport.test.ts
+  s_d8b00bedd146e9::t_2a3db1389e1530 95-104
+  s_d8b00bedd146e9::t_8c39521b4f97ce 178-230
+net/crates/net/browser-ts/src/netcode/index.ts
+  s_d8b00bedd146e9::t_b46f016aaded0d 1-20
+net/crates/net/sdk-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_f7b9eb64dcf016 27-30
+net/crates/net/browser-ts/src/store/host.ts
+  s_d8b00bedd146e9::t_5303b8dbee379b 100-105
+net/crates/net/browser-ts/package.json
+  s_d8b00bedd146e9::t_faa8aa18c84dff 24-27
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_f7b9eb64dcf016 21-29
+.claude/skills/net-browser/SKILL.md
+  s_d8b00bedd146e9::t_f7b9eb64dcf016 56
+net/crates/net/browser-ts/src/netcode/clock.ts
+  s_d8b00bedd146e9::t_d63e7d4890e7c4 1-75
+net/crates/net/browser-ts/src/netcode/client.ts
+  s_d8b00bedd146e9::t_db7a8196446af8 1-140,142-195
+  s_d8b00bedd146e9::t_fcdcc0402994b2 141
+.claude/skills/net-browser/netcode.md
+  s_d8b00bedd146e9::t_1de8cdd8b80705 1-82
+net/crates/net/browser-ts/src/netcode/wire.ts
+  s_d8b00bedd146e9::t_47f41e7e66587d 1-122
+net/crates/net/sdk-ts/src/store-transport.ts
+  s_d8b00bedd146e9::t_5303b8dbee379b 67,113,125
+net/crates/net/browser-ts/src/netcode/interpolate.ts
+  s_d8b00bedd146e9::t_18e7d399e6b97d 1-97
+net/crates/net/bindings/node/src/lib.rs
+  s_d8b00bedd146e9::t_5303b8dbee379b 1110-1113,1274-1279,1283-1284
+net/crates/net/browser-ts/test/netcode/netcode.test.ts
+  s_d8b00bedd146e9::t_95dc008b06d402 166-169
+  s_d8b00bedd146e9::t_8968f3426bec8e 248-288
+  s_d8b00bedd146e9::t_c9e3acbf1ae778 1-165,170-247
+net/crates/net/src/adapter/net/mesh.rs
+  s_d8b00bedd146e9::t_088749f451378f 48306,48399-48402
+net/crates/net/browser-ts/src/netcode/host.ts
+  s_d8b00bedd146e9::t_505538e17ac6f1 1-273
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_f7b9eb64dcf016 418-423,430-453
+  s_d8b00bedd146e9::t_11143a4d135adf 454
+net/crates/net/browser-ts/README.md
+  s_d8b00bedd146e9::t_f7b9eb64dcf016 362-396
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "196d0aece50b5f800cc8b015a3d9032ecb6438e6",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
