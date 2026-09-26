@@ -448,7 +448,17 @@ the local mesh (clock within 10 ms of a 5 s offset; 61 inputs applied exactly
 once at 20% loss; zero corrections; monotonic, interpolated remote
 positions; the rewind cap), each property shown to fail when removed (7
 mutations); and an `sdk-ts` test with a **Node dedicated host** on native
-nodes via `meshStoreTransport`. **Not yet:** a browser-runner witness,
+nodes via `meshStoreTransport`. **In real browsers (2026-09-26):** the
+acceptance run (`examples/anchor-acceptance`, 10/10) adds a netcode phase —
+host page `hostNetcode`, joiner `joinNetcode`, through the real CLI anchor: 31
+inputs applied exactly once, prediction immediate and converged with zero
+corrections, clock RTT 31.7 ms / jitter 6.3 ms, and the traffic on the lossy
+channel both ways (`lossy_written` / `lossy_ingress` on both pages). It found
+a real defect the simulated network could not: the browser node reports an
+event's sender as a DECIMAL u64 and netcode read it as hex, refusing every
+frame; netcode now reads event peers exactly as the store does
+(`peerHexOf`), and the simulator reports decimal like the leaf. **Not yet:**
+a browser-runner witness in CI,
 correction smoothing, extrapolation, binary frames, fragmentation-aware
 snapshot sizing, interest-key integration (today `visible`).
 

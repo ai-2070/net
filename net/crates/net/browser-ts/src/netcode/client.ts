@@ -17,7 +17,7 @@
 
 import { ClockEstimator, type ClockEstimate } from './clock.js';
 import { type Interpolator, lerpNumbers, SnapshotBuffer } from './interpolate.js';
-import { type Frame, type NetcodeStream, type NetcodeTransport, type Now, type WireInput, defaultNow, decodeFrame, encodeFrame, peerHex } from './wire.js';
+import { type Frame, type NetcodeStream, type NetcodeTransport, type Now, type WireInput, defaultNow, decodeFrame, encodeFrame, eventPeer, peerHex } from './wire.js';
 
 /** Your own entity, predicted locally. */
 export interface LocalEntity<E, I> {
@@ -120,7 +120,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
 
   const stopEvents = options.transport.onEvent(event => {
     if (closed || event.type !== 'stream_data') return;
-    if (peerHex(event.peerNode) !== host) return;
+    if (eventPeer(event.peerNode) !== host) return;
     const frame = decodeFrame<E, I>(event.payload, label);
     if (frame === null) return;
     if (frame.k === 'q') {

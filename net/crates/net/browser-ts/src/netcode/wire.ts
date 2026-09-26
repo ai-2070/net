@@ -109,11 +109,26 @@ export function decodeFrame<E, I>(payload: Uint8Array | undefined, label: string
   }
 }
 
-/** 16 lowercase hex, or `null`. */
+import { peerHexOf } from '../store/host.js';
+
+/**
+ * A node id the CALLER supplied (`host`, from `nodeIdHex()`): hex only, 16
+ * lowercase digits out, or `null`.
+ */
 export function peerHex(peer: string | null | undefined): string | null {
   if (typeof peer !== 'string') return null;
   const raw = peer.startsWith('0x') ? peer.slice(2) : peer;
   return /^[0-9a-fA-F]{1,16}$/.test(raw) ? raw.toLowerCase().padStart(16, '0') : null;
+}
+
+/**
+ * The authenticated sender of a transport event, 16 lowercase hex. The
+ * browser node reports it as a DECIMAL u64, `meshStoreTransport` as hex —
+ * read exactly the way the store reads it (`peerHexOf`), so netcode and the
+ * store never disagree about who a peer is.
+ */
+export function eventPeer(peer: string | null | undefined): string | null {
+  return typeof peer === 'string' && peer.length > 0 ? peerHexOf(peer) : null;
 }
 
 /** The time source: `performance.now()` unless a test injects one. */

@@ -23,6 +23,16 @@ import {
   rememberedIdentity,
   requestCredential,
 } from '/pkg/index.bundle.js';
+import { hostNetcode, joinNetcode } from '/pkg/netcode/index.js';
+
+// Netcode (model 2) rides beside the lobby: ships moved by inputs,
+// predicted locally, on the lossy carrier.
+const NET_LABEL = 'acceptance.movement';
+const move = (ship, input) => ({ x: ship.x + input.dx });
+const lossy = node => {
+  const counters = node.rtcStats().counters;
+  return { written: Number(counters.lossy_written ?? 0), ingress: Number(counters.lossy_ingress ?? 0) };
+};
 
 const params = new URLSearchParams(location.search);
 const role = params.get('role');
@@ -137,12 +147,39 @@ async function run() {
     });
     step('lobby', { code: lobby.code });
     result.code = lobby.code;
+    const ships = new Map();
+    const applied = [];
+    const net = params.get('wait') === '0' ? null : hostNetcode({
+      transport: node,
+      label: NET_LABEL,
+      tickRate: 30,
+      step: ({ inputs }) => {
+        for (const [peer, list] of inputs) {
+          for (const input of list) {
+            applied.push(input.seq);
+            ships.set(peer, move(ships.get(peer) ?? { x: 0 }, input.data));
+          }
+        }
+      },
+      snapshot: () => Object.fromEntries(ships),
+    });
     if (params.get('wait') === '0') {
       result.ok = true;
       return;
     }
     await until('a second player seated', () => Object.keys(lobby.host.getState().seats).length >= 1, 120_000);
     step('seated', { seats: lobby.host.getState().seats });
+    const joiner = Object.keys(lobby.host.getState().seats)[0];
+    globalThis.__diag = () => ({ dropped: net.dropped, players: net.players(), lossy: lossy(node), ships: Object.fromEntries(ships) });
+    await until("the joiner's netcode ship at x=30", () => ships.get(joiner)?.x === 30, 120_000);
+    result.netcode = {
+      ship: ships.get(joiner),
+      applied: applied.length,
+      unique: new Set(applied).size,
+      players: net.players(),
+      lossy: lossy(node),
+    };
+    step('netcode', result.netcode);
     result.ok = true;
     return;
   }
@@ -184,12 +221,43 @@ async function run() {
   const { seat } = await player.act('sit', {});
   step('sat', { seat });
   await until('my seat in my own view', () => player.getState().seats[node.nodeIdHex()] === seat, 30_000);
+
+  // Netcode: join the host's movement, predict my ship, send 31 inputs.
+  const self = node.nodeIdHex();
+  const net = joinNetcode({ transport: node, host: listing.host, label: NET_LABEL, local: { id: self, predict: move } });
+  globalThis.__diag = () => ({ stats: net.stats(), lossy: lossy(node), view: net.view() });
+  await until('netcode snapshots', () => net.stats().snapshots > 0, 30_000);
+  net.input({ dx: 0 });
+  let immediate = true;
+  for (let i = 0; i < 30; i += 1) {
+    const before = net.view()[self]?.x;
+    net.input({ dx: 1 });
+    if (before !== undefined && net.view()[self]?.x !== before + 1) immediate = false;
+    await new Promise(resolve => setTimeout(resolve, 33));
+  }
+  await until('every input acknowledged', () => net.stats().pendingInputs === 0 && net.view()[self]?.x === 30, 60_000);
+  const stats = net.stats();
+  result.netcode = {
+    view: net.view()[self],
+    immediate,
+    corrections: stats.corrections,
+    snapshots: stats.snapshots,
+    clock: stats.clock,
+    lossy: lossy(node),
+  };
+  step('netcode', result.netcode);
   result.ok = true;
 }
 
 run()
   .catch(error => {
-    step('error', { message: String(error?.message ?? error), kind: error?.kind });
+    let diag = null;
+    try {
+      diag = globalThis.__diag?.() ?? null;
+    } catch (e) {
+      diag = String(e);
+    }
+    step('error', { message: String(error?.message ?? error), kind: error?.kind, diag });
   })
   .finally(() => {
     result.done = true;

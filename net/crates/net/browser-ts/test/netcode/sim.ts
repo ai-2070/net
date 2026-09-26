@@ -16,6 +16,11 @@ export interface SimOptions {
   /** Extra per-frame delay spread, ms (uniform 0..jitterMs) — reorders. */
   readonly jitterMs?: number;
   readonly seed?: number;
+  /**
+   * How events spell the sender: `'decimal'` (the default — what the
+   * browser node reports) or `'hex'` (what `meshStoreTransport` reports).
+   */
+  readonly peerSpelling?: 'decimal' | 'hex';
 }
 
 export interface SimStats {
@@ -56,7 +61,8 @@ export function simNetwork(options: SimOptions) {
             setTimeout(() => {
               stats.delivered += 1;
               for (const handler of [...(handlers.get(peer) ?? [])]) {
-                handler({ type: 'stream_data', streamId: label, peerNode: id, payload: copy });
+                const peerNode = options.peerSpelling === 'hex' ? id : BigInt(`0x${id}`).toString(10);
+                handler({ type: 'stream_data', streamId: label, peerNode, payload: copy });
               }
             }, delay);
           },

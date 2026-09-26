@@ -17,7 +17,7 @@
  * ```
  */
 
-import { type Frame, type NetcodeStream, type NetcodeTransport, type Now, defaultNow, decodeFrame, encodeFrame, peerHex } from './wire.js';
+import { type Frame, type NetcodeStream, type NetcodeTransport, type Now, defaultNow, decodeFrame, encodeFrame, eventPeer } from './wire.js';
 
 /** One input as `step` receives it. */
 export interface TickInput<I> {
@@ -173,7 +173,7 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
     if (closed || event.type !== 'stream_data') return;
     const frame = decodeFrame<E, I>(event.payload, options.label);
     if (frame === null) return;
-    const peer = peerHex(event.peerNode);
+    const peer = eventPeer(event.peerNode);
     if (peer === null) {
       drop('no-authenticated-peer');
       return;

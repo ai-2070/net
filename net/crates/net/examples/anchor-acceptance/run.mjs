@@ -202,6 +202,21 @@ try {
   check('a second player found it in the list, joined and was seated',
     joinResult.ok && joinResult.steps.some(s => s.name === 'sat'), stepsOf(joinResult));
 
+  // Netcode over real browsers: 31 inputs applied once on the host, the
+  // joiner's ship predicted at once and converged with no corrections,
+  // the clock synced, and the traffic on the lossy DataChannel.
+  const hn = hostResult.netcode;
+  const jn = joinResult.netcode;
+  check('netcode: every input applied exactly once on the host, the ship where the player predicted it',
+    !!hn && !!jn && hn.applied === 31 && hn.unique === 31 && hn.ship?.x === 30 && jn.view?.x === 30 &&
+      jn.immediate === true && jn.corrections === 0 && jn.clock?.samples > 0,
+    JSON.stringify({ host: hn && { applied: hn.applied, unique: hn.unique, ship: hn.ship }, join: jn && {
+      view: jn.view, immediate: jn.immediate, corrections: jn.corrections, rttMs: jn.clock?.rttMs,
+      jitterMs: jn.clock?.jitterMs } }));
+  check('netcode rode the lossy DataChannel: the joiner wrote on it and the host received on it',
+    !!hn && !!jn && jn.lossy.written > 0 && hn.lossy.ingress > 0,
+    JSON.stringify({ joiner: jn?.lossy, host: hn?.lossy }));
+
   // Another game on the same anchor sees nothing of this one. The rival
   // host opens its own lobby so the rival player's discovery is shown to
   // work (it must find that one) while game A's stays invisible.
