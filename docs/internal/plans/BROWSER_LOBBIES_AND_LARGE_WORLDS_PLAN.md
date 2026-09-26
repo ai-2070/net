@@ -82,7 +82,7 @@ What stands in the way:
 |---|---|---|---|---|
 | **P0** Foundation | A browser-capable anchor you can install; automatic per-visitor credentials | G1, G2 | M | — |
 | **P1** Drop-in lobbies | Lobby API in the package, host-player helper, presence, exported offline transport | G3, G4, G5 | M | P0 (P1's offline parts don't) |
-| **P2** Interest management | Only nearby state reaches each player, on one host | G8, G9, G10, G11 | M–L | — |
+| **P2** Interest management + hidden information | Only nearby state reaches each player, on one host; secrets declared, not hand-projected | G8, G9, G10, G11 | M–L | — |
 | **P3** Dedicated hosts | The store runs on a native node; lobbies and regions survive players leaving | G6, G12 | M | Node transport (open question Q1) |
 | **P4** Large worlds | The world is split across region hosts with seamless crossing | — | L | P2, P3 |
 | **P5** Reach | TURN fallback, reconnection hardening, region-aware anchors | G7 | M | P0 |
@@ -211,6 +211,85 @@ interest produces ordinary adds and removes.
 - Hidden-information guarantees are unchanged: a witness that a permission
   narrowing still removes private data immediately.
 
+### Hidden information, modeled (part of P2)
+
+**Why.** Enforcement is already right: `project` runs on the host and what it
+omits is never sent, and a throwing handler answers the caller with the code
+alone — the handler's message never leaves the host (`store/owner.ts`, the
+`action-rejected` refusal carries no text). The weakness is authoring. The
+developer writes `project` by hand, and every mistake is a **silent** leak: the
+game works and the secret is readable in the browser. The common ones:
+
+- returning `state` unchanged — which the README and skill examples do today,
+  for brevity;
+- forgetting a nested field when copying;
+- a plausible value (`0`, `""`) standing for "you cannot see this";
+- per-player secrets (your own hand), awkward because `project` does not know
+  the viewer (G10).
+
+For AI-written games this is the worst class of bug: nothing fails.
+
+**What to add** — one enforcement point (`project`), generated rather than
+hand-written:
+
+1. **Declarative visibility on the definition.** Paths with a visibility rule;
+   the SDK builds the projection from them, and it composes with interest keys
+   (visibility = who *may* see, interest = what is *near*).
+
+   ```ts
+   defineStore({
+     …,
+     visibility: {
+       'players.*.hand': 'owner',      // only the player whose key it is
+       'deck':           'nobody',     // host only
+       'deck.length':    'everyone',   // reveal a count, not contents
+       'units.*':        'team',       // viewer's team, from an app-provided resolver
+       'waypoint':       ['command'],  // an audience
+     },
+   });
+   ```
+
+   Needs the viewer in `project` (G10). A hand-written `project` stays
+   supported; when both exist, the declared rules apply **after** it, so a
+   hand-written projection can narrow but never widen a declared secret.
+2. **Private stays private by construction.** Unlisted paths keep today's
+   behavior, so nothing existing changes. A path marked private is removed
+   (collections) or set to the typed hidden marker (fields) — never a
+   plausible default — and `empty()` is checked to satisfy the same rules.
+3. **Proof tools.**
+   - `assertHidden(definition, state, { viewer }, paths)` for tests, and an
+     executable example in the skill.
+   - A dev-mode check: when the host projects for viewer A, flag any
+     `owner`-scoped data belonging to B. Off in production.
+4. **Standard patterns as helpers:** reveal-count-not-contents; reveal-on-event
+   (a card becomes `everyone` when played — a state change, not a rule
+   change); a typed `hidden` marker instead of magic zeros.
+5. **The trust boundary, stated in the API.** `host.trust` is `'player'` or
+   `'dedicated'` (P3). Docs say plainly: a player-host sees everything, so games
+   with real stakes need a dedicated host. No SDK feature can change this, and
+   the SDK should not imply otherwise.
+
+**Deliberately not in scope:**
+- **Line of sight / fog of war as computation.** Whether a unit sees another
+  is game logic; the SDK makes "visible to this viewer" easy to express, it
+  does not compute it.
+- **Traffic analysis.** A player can infer that something visible to them
+  changed from updates arriving. Hidden-only changes already produce no
+  per-audience diff; padding or constant-rate updates are not worth their
+  cost for games in v1. Revisit only for a concrete threat.
+- **Action results.** An output goes to its caller only — already the right
+  scope.
+
+**Acceptance:**
+- A card-game example (hands `owner`, deck `nobody` + count `everyone`,
+  table `everyone`) written with no hand-written `project`; `assertHidden`
+  proves each player sees only their own hand, over the real wire.
+- Removing a visibility rule reddens that test; the dev-mode check reports a
+  deliberate cross-player leak in a fixture.
+- The README and skill examples move from `project: state => state` to a
+  declared rule, with an executed example.
+- Decision Q7 (§10) resolved before the API freezes.
+
 ---
 
 ## 6. P3 — dedicated hosts
@@ -313,6 +392,7 @@ holds replicas of its current region and its neighbours.
 | Q4 | Lobby metadata on announcements: size limit and what's public | Privacy of unlisted lobbies |
 | Q5 | Interest keys: cells only, or arbitrary keys (teams, instances)? | P2 API generality |
 | Q6 | Handoff consistency target: at-most-once with typed failure, or exactly-once? | P4 protocol complexity |
+| Q7 | Visibility rules: path strings (as sketched) or schema annotations (e.g. a validator wrapper `secret(owner, schema)`)? How is `team` resolved — an app callback? | P2 hidden-information API shape |
 
 ---
 

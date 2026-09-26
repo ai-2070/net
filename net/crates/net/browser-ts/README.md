@@ -178,7 +178,9 @@ const host = hostStore({
     fire: (input, context) => {
       const ships = { ...context.getState().ships };
       const target = ships[input.at];
-      if (!target) throw new Error('no such ship');   // refused, with a reason
+      if (!target) throw new Error('no such ship');   // refused: the player gets
+                                                      // code 'action-rejected' — your
+                                                      // message stays on the host
       ships[input.at] = { ...target, hull: Math.max(0, target.hull - 25) };
       context.setState({ ships });
       return { hull: ships[input.at].hull };
