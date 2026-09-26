@@ -1,0 +1,36 @@
+net/crates/net/browser-ts/scripts/bench-world.mjs
+  s_d8b00bedd146e9::t_18125e93a02e32 252-253
+  s_d8b00bedd146e9::t_9071c1d84d172f 1-6,8-183,189-204,207-210,230-251,254
+  s_d8b00bedd146e9::t_2473beacd51fea 205-206,211-229
+  s_d8b00bedd146e9::t_cd888056700343 7,184-188
+net/crates/net/browser-ts/src/store/replica.ts
+  s_d8b00bedd146e9::t_f8bc88ce0a5617 590-599
+net/crates/net/browser-ts/package.json
+  s_d8b00bedd146e9::t_cd888056700343 52-53
+net/crates/net/browser-ts/src/store/visibility.ts
+  s_d8b00bedd146e9::t_a9d03ca429a66b 191,199,222-242,244,247-249,252-257,259-263,265,268,276-279,284-292,294-300,303-304,306-307,311
+net/crates/net/browser-ts/src/store/owner.ts
+  s_d8b00bedd146e9::t_d09c6c6826d530 1724-1729
+  s_d8b00bedd146e9::t_a9d03ca429a66b 68,1813-1822,1826,1837-1868
+  s_d8b00bedd146e9::t_b9f6fe02cf073d 1869-1871
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_eae51d3ec09759 392-451
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_72703a0621922a 21-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6606d7485c41267dc55379409f05032f634c9711",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
