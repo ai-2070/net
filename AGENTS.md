@@ -107,6 +107,7 @@ Measurements behind all of this (and behind the dev profile's
 
 ```bash
 cargo fmt --all -- --check      # on Windows: python ../../../.github/scripts/fmt.py --check
+(cd leaf && cargo fmt -- --check)   # the leaf is its OWN workspace: the line above never reaches it
 cargo check --workspace --all-targets
 
 # Production code, strict (matches CI):
