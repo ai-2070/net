@@ -30,6 +30,8 @@
 export { defineStore } from './definition.js';
 export { hostStore, HOST_SWEEP_MS } from './host.js';
 export { joinStore, ALIVE_INTERVAL_MS, MAX_OUTSTANDING, REQUEST_DEADLINE_MS } from './join.js';
+export { hostPlayer } from './player.js';
+export type { HostPlayerOptions } from './player.js';
 export type {
   Frame,
   HostedStoreHandle,

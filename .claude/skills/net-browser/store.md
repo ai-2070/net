@@ -256,29 +256,25 @@ writes.
   node**, so test two players with **two browser profiles** (or two browsers),
   not two tabs.
 - **`maxEventBytes` is required on both sides and must match** — use 8104.
-- **The host player cannot `joinStore` its own node** — it throws `invalid-data`
-  (a node has no session with itself). Render the host's page from `host`
-  (`bindEntities({ store: host, … })`) and apply the host player's moves through
-  the **same handlers**, checking the same `authorize` first. Keep `authorize`,
-  `actions` and `inputs` as named values so both paths share them:
+- **The host player plays through `hostPlayer(host, { audience })`**, never
+  `joinStore` on its own node (that throws `invalid-data` — a node has no session
+  with itself). `hostPlayer` returns the same handle shape as `joinStore`
+  (`ready`, `getState`, `subscribe`, `act`, `input`, `setAudience`, `close`),
+  held to the host's own `authorize` with the host's node id as `peer`, and its
+  `getState()` is the **projection** for its audience, not the raw document. So
+  game code, `bindEntities` included, never branches on "am I the host":
 
   ```js
-  const self = node.nodeIdHex();
-  const context = () => ({
-    peer: self,
-    getState: () => host.getState(),
-    // host.setState REPLACES the document; a handler's setState merges — so merge here.
-    setState: (patch) => host.setState({ ...host.getState(), ...patch }),
-  });
-  const hostAct = (name, input) => {
-    if (!authorize({ type: 'action', peer: self, name, input })) throw new Error('forbidden');
-    return actions[name](input, context());
-  };
-  const hostInput = (name, value) => {
-    if (authorize({ type: 'input', peer: self, name, input: value })) inputs[name](value, context());
-  };
-  hostAct('enlist', {});
+  import { hostPlayer } from '@net-mesh/browser';
+  const world = isHost
+    ? hostPlayer(host, { audience: ['crew'] })
+    : joinStore({ definition, transport: node, host: hostId, audience: ['crew'], key: 'player', maxEventBytes: 8104 });
+  await world.ready();
+  await world.act('enlist', {});
   ```
+
+  Do not hand-roll a wrapper that calls the handlers directly — it skips input
+  validation, the transaction, and the result checks a replica gets.
 
 - **Give each player an entity with an `enlist` action keyed by `context.peer`**
   (the authenticated caller — never an id the client sends). A joiner does
@@ -316,9 +312,12 @@ writes.
 - **Store naming.** The name defaults to the definition id; a lobby and a match
   on one host need `store: 'lobby'` / `store: 'match'` on both sides, and two
   stores with the same name on one transport throw `invalid-data`.
-- **Prototype offline first.** `net/crates/net/browser-ts/demo/` runs a host and
-  two players in one page over a local bus — the real store, no anchor, no
-  network. It proves game logic, not that two browsers can connect.
+- **Prototype offline first** with `@net-mesh/browser/local`:
+  `const mesh = createLocalMesh(); const hostNode = mesh.node(); const guestNode = mesh.node();`
+  — each node is a `transport` for `hostStore` / `joinStore`, in one page, with
+  the real store and no anchor or network. It proves game logic, not that two
+  browsers can connect; switch the nodes to `connect()` for that. The package
+  demo (`net/crates/net/browser-ts/demo/`) runs this way by default.
 
 ## What is not established (do not present it as proven)
 

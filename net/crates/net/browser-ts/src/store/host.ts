@@ -28,7 +28,7 @@
 
 import { isStaleStream, StoreError } from './errors.js';
 import { StoreOwner, type Dispatched, type OwnerDeps, type Outbound } from './owner.js';
-import type { ActionSpec, Cancel, InputSpec } from './types.js';
+import type { ActionSpec, Cancel, InputSpec, StoreDefinition } from './types.js';
 import { encodeMessage, type Hex } from './wire.js';
 
 /** How often a host expires handles whose lease has run out (§2). */
@@ -178,9 +178,15 @@ export interface HostStoreOptions<S extends object, A extends ActionSpec, I exte
 }
 
 /** The authoritative store, served to whoever the transport authenticates. */
-export interface HostedStoreHandle<S extends object> {
+export interface HostedStoreHandle<
+  S extends object,
+  A extends ActionSpec = ActionSpec,
+  I extends InputSpec = InputSpec,
+> {
   /** This node's id: the authority every replica is talking to. */
   readonly authority: string;
+  /** The definition this store serves. */
+  readonly definition: StoreDefinition<S, A, I>;
   getState(): S;
   subscribe(listener: (state: S, previous: S) => void): Cancel;
   setState(next: S): void;
@@ -214,6 +220,30 @@ export interface HostedStoreHandle<S extends object> {
  */
 const addressesByTransport = new WeakMap<StoreTransport, Set<string>>();
 
+/**
+ * What {@link hostPlayer} needs from a hosted store and nothing else
+ * does: its owner, the path that sends what a local call dispatched,
+ * and whether the store is still serving. Package-internal — keyed on
+ * the handle object, so only a handle `hostStore` returned has one.
+ */
+export interface HostInternals<S extends object, A extends ActionSpec, I extends InputSpec> {
+  readonly owner: StoreOwner<S, A, I>;
+  readonly peer: string;
+  readonly maxEventBytes: number;
+  dispatched(result: Dispatched): void;
+  isClosed(): boolean;
+  onClose(listener: () => void): void;
+}
+
+const internals = new WeakMap<object, HostInternals<object, ActionSpec, InputSpec>>();
+
+/** The internals of a handle `hostStore` returned, or `undefined`. */
+export function hostInternals<S extends object, A extends ActionSpec, I extends InputSpec>(
+  handle: HostedStoreHandle<S, A, I>,
+): HostInternals<S, A, I> | undefined {
+  return internals.get(handle) as HostInternals<S, A, I> | undefined;
+}
+
 function randomHex(bytes: number): string {
   const buffer = new Uint8Array(bytes);
   crypto.getRandomValues(buffer);
@@ -236,7 +266,7 @@ const decoder = new TextDecoder();
  */
 export function hostStore<S extends object, A extends ActionSpec, I extends InputSpec>(
   options: HostStoreOptions<S, A, I>,
-): HostedStoreHandle<S> {
+): HostedStoreHandle<S, A, I> {
   const streamId = options.streamId ?? `store/${options.definition.id}`;
   const address = options.store ?? options.definition.id;
   const taken = addressesByTransport.get(options.transport) ?? new Set<string>();
@@ -648,8 +678,11 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     });
   }
 
-  return {
-    authority: options.transport.nodeIdHex() ?? owner.incarnationHex,
+  const authority = options.transport.nodeIdHex() ?? owner.incarnationHex;
+  const closeListeners = new Set<() => void>();
+  const handle: HostedStoreHandle<S, A, I> = {
+    authority,
+    definition: options.definition,
     getState: () => owner.getState(),
     subscribe: listener => owner.subscribe(listener),
     setState: next => {
@@ -673,8 +706,25 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       // streams out from under the frames still in flight. A review
       // probe measured ZERO goodbyes delivered under a concurrent
       // close where one call delivers one.
-      closing ??= shutdown();
+      if (closing === null) {
+        closing = shutdown();
+        for (const listener of [...closeListeners]) listener();
+        closeListeners.clear();
+      }
       return closing;
     },
   };
+  internals.set(handle, {
+    owner: owner as unknown as StoreOwner<object, ActionSpec, InputSpec>,
+    // The spelling `AccessRequest.peer` and `ActionContext.peer`
+    // promise: 16 lowercase hex, as a replica's frames are handed.
+    peer: peerHexOf(authority) ?? authority,
+    maxEventBytes: options.maxEventBytes,
+    dispatched,
+    isClosed: () => closed,
+    onClose: listener => {
+      closeListeners.add(listener);
+    },
+  } as HostInternals<object, ActionSpec, InputSpec>);
+  return handle;
 }

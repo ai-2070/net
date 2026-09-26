@@ -17,6 +17,10 @@
     "./three": {
       "types": "./dist/three/index.d.ts",
       "default": "./dist/three/index.js"
+    },
+    "./local": {
+      "types": "./dist/local.d.ts",
+      "default": "./dist/local.js"
     }
   },
   "sideEffects": false,

@@ -85,11 +85,21 @@ It prints its address and hands out a credential per player:
 curl -s "http://localhost:<port>/config?tab=1" | jq -r .credentialB64
 ```
 
-> **Building the game before you have an anchor?** The demo in
-> [`demo/`](https://github.com/ai-2070/net/tree/master/net/crates/net/browser-ts/demo)
-> runs a host and two players in a single page with no network at all, using the
-> real store. Use it to build your game logic, then switch to a real anchor for
-> actual multiplayer.
+> **Building the game before you have an anchor?** `@net-mesh/browser/local`
+> is a mesh inside one page: no anchor, no network, and the real store on top.
+>
+> ```js
+> import { createLocalMesh } from '@net-mesh/browser/local';
+>
+> const mesh = createLocalMesh();
+> const node = mesh.node();          // use it wherever this guide uses `node`
+> const friend = mesh.node();        // a second player, in the same page
+> ```
+>
+> Build your game logic this way, then swap in `connect()` for real
+> multiplayer. It proves your rules work, not that two browsers can reach each
+> other. The [`demo/`](https://github.com/ai-2070/net/tree/master/net/crates/net/browser-ts/demo)
+> runs a host and two players like this.
 
 ---
 
@@ -205,6 +215,20 @@ await node.announce([TAG]);
 setInterval(() => node.announce([TAG]).catch(() => {}), 2_000);
 ```
 
+The host is usually a player too. A page can't join its own world, so it plays
+through `hostPlayer` — the same kind of handle joined players get, held to the
+same `authorize` rules and seeing the same projected view:
+
+```js
+import { hostPlayer } from '@net-mesh/browser';
+
+const world = hostPlayer(host, { audience: ['crew'] });
+await world.ready();
+await world.act('enlist', {});     // same rules as everyone else
+```
+
+From here on, the host's page and every other page use `world` the same way.
+
 ### 3b. Join the world (on everyone else's page)
 
 ```js
@@ -243,7 +267,7 @@ const geometry = new THREE.ConeGeometry(0.4, 1, 8);   // shared by every ship
 const material = new THREE.MeshStandardMaterial({ color: 0x44aaff });
 
 const ships = bindEntities({
-  store: world,                   // a joined world, or the `host` itself
+  store: world,                   // `hostPlayer(host)` or `joinStore(…)` — same code
   scene,
   select: state => state.ships,   // the entities to draw, by id
   binding: {
@@ -282,14 +306,6 @@ try {
   showMessage(`Refused: ${error.code}`);   // e.g. 'forbidden' for firing at yourself
 }
 ```
-
-> **The hosting player doesn't join its own world** — a page can't connect to
-> itself. On the host's page, render from `host` directly
-> (`bindEntities({ store: host, … })`) and apply that player's moves on the host.
-> The demo's
-> [`main.js`](https://github.com/ai-2070/net/blob/master/net/crates/net/browser-ts/demo/main.js)
-> shows a small helper that does this and applies the same `authorize` rules to
-> the host's own player.
 
 ---
 

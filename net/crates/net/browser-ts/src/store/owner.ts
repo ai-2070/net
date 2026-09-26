@@ -191,6 +191,14 @@ interface Counters {
 }
 
 /**
+ * Placeholder correlation and handle for sizing a local result as the
+ * `res` a replica would receive. Same lengths as real ones, so the
+ * budget test measures the same bytes.
+ */
+const LOCAL_Q = '0'.repeat(16) as Hex;
+const LOCAL_H = '0'.repeat(32) as Hex;
+
+/**
  * The owner half of the store protocol.
  *
  * Holds no transport: frames come in as text with an authenticated
@@ -403,6 +411,116 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
   /** The current authoritative revision. */
   get currentRevision(): number {
     return this.core.revision;
+  }
+
+  /**
+   * The host's own player: whether `peer` may read `audience`.
+   *
+   * The same `authorize` call a `join` makes. There is no handle, no
+   * lease and no ledger — the host's player has no wire to lose a
+   * frame on and no request to replay — but there is the policy.
+   */
+  localRead(peer: string, audience: readonly string[]): boolean {
+    return this.permitsRead(peer, audience);
+  }
+
+  /** The host's own player: the projection a replica of `audience` receives. */
+  localView(audience: readonly string[]): S | null {
+    return this.project(audience);
+  }
+
+  /**
+   * The host's own player: one action, through the ladder a replica's
+   * `act` takes after the wire — known name, `authorize`, then one
+   * transaction that parses the input, runs the handler and validates
+   * the output, and a result that must fit the message budget a
+   * replica would have received it in.
+   *
+   * `input` is what `parseStoreJson` produced from the caller's value,
+   * so the handler sees exactly what it would see from a replica.
+   */
+  localAct(
+    name: string,
+    input: JsonValue,
+    peer: string,
+  ): { readonly outcome: Outcome; readonly dispatched: Dispatched } {
+    if (!Object.prototype.hasOwnProperty.call(this.deps.definition.actions, name)) {
+      return {
+        outcome: { kind: 'refusal', code: 'invalid-data' },
+        dispatched: this.refuse('local-act-unknown-name'),
+      };
+    }
+    if (!this.permitsAction(peer, name, input)) {
+      return {
+        outcome: { kind: 'refusal', code: 'forbidden' },
+        dispatched: this.refuse('local-act-forbidden'),
+      };
+    }
+    const spec = this.deps.definition.actions[name as keyof A];
+    const before = this.core.getState() as S;
+    this.revisionBeforeCommit = this.core.revision;
+    let outcome: Outcome;
+    try {
+      const handler = this.deps.actions[name as keyof A];
+      const produced = this.core.transact(context => {
+        const out = spec.output(handler(spec.input(input), context)) as JsonObject;
+        // The budget a replica's `res` would have had to fit. A result
+        // that works for the host and not for its players is a bug the
+        // host would never see, so it is refused here the same way.
+        const frame = encodeMessage({
+          k: 'res',
+          q: LOCAL_Q,
+          h: LOCAL_H,
+          s: '1',
+          out,
+        });
+        if (utf8Length(frame) > this.deps.maxEventBytes) {
+          throw new StoreError('capacity', 'the result does not fit the message budget');
+        }
+        return out;
+      }, peer);
+      outcome = { kind: 'result', out: produced };
+    } catch (error) {
+      outcome = {
+        kind: 'refusal',
+        code:
+          error instanceof StoreError && error.code === 'capacity' ? 'capacity' : 'action-rejected',
+      };
+    }
+    const after = this.core.getState() as S;
+    const propagated = Object.is(before, after) ? [] : this.propagate(before, after);
+    return {
+      outcome,
+      dispatched:
+        outcome.kind === 'refusal'
+          ? this.refuse(`local-act-${outcome.code}`, propagated)
+          : this.accept(propagated),
+    };
+  }
+
+  /**
+   * The host's own player: one latest-value input, through the same
+   * ladder as a replica's `in` after the wire. No sequence: a local
+   * call cannot arrive out of order.
+   */
+  localInput(name: string, input: JsonValue, peer: string): Dispatched {
+    if (!Object.prototype.hasOwnProperty.call(this.deps.definition.inputs, name)) {
+      return this.refuse('local-in-unknown-name');
+    }
+    if (!this.permitsInput(peer, name, input)) return this.refuse('local-in-forbidden');
+    const before = this.core.getState() as S;
+    this.revisionBeforeCommit = this.core.revision;
+    try {
+      this.core.transact(context => {
+        const parse = this.deps.definition.inputs[name as keyof I];
+        const handler = this.deps.inputs[name as keyof I];
+        handler(parse(input), context);
+      }, peer);
+    } catch {
+      return this.refuse('local-in-rejected');
+    }
+    const after = this.core.getState() as S;
+    return this.accept(Object.is(before, after) ? [] : this.propagate(before, after));
   }
 
   /**

@@ -14,6 +14,26 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
+## Unreleased
+
+### Added
+
+- **`hostPlayer(host, { audience })`** — the hosting node's own player,
+  with the handle shape `joinStore` returns. A node cannot join its own
+  store, so every game whose host also plays wrote a wrapper around the
+  handlers; this replaces it and holds the host's player to parity with
+  a replica: the host's `authorize` with its own node id as `peer`,
+  input and output validation and the result budget inside one
+  transaction, the wire's value rules, and `getState()` as the
+  projection for its audience rather than the raw document.
+  `HostedStoreHandle` now carries its `definition` and its action and
+  input types.
+- **`@net-mesh/browser/local`** — `createLocalMesh()`, several nodes in
+  one page with no anchor and no network, each a `StoreTransport`. The
+  store on top is the real one; delivery is a function call and the
+  peer is assigned rather than proved. For building game logic first;
+  the demo's `demo/local-mesh.js` is replaced by it.
+
 ## Unreleased — targets 0.36.0
 
 ### Added

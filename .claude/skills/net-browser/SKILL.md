@@ -1,6 +1,6 @@
 ---
 name: net-browser
-description: "Use this skill when the target is a **browser page** — Net in a tab, or a multiplayer Three.js game built on it. Covers: **`@net-mesh/browser`** (a sibling package to the Node SDK, never a sub-path of it) riding a **WebRTC DataChannel** to a native **anchor** ('run Net in a browser', 'WebRTC transport', 'connect a page to the mesh'). **One node per origin** — Web Lock election, leader vs follower tabs, `connect()` vs `openSession()`, a follower promoted when the holder closes, generation fencing. **The anchor + bootstrap credential** (`net-mesh anchor credential mint`, `credentialB64`, `bootstrapUrl`), the ICE/STUN split, and the ICE-failure classification (`udp-blocked` needs two observations; `ice-timeout` alone is not evidence). **Leaf-to-leaf sessions** (`connectPeer` / `acceptPeer`), streams with a required `reliability`, and the typed `LeafError` / `RtcError` / `RpcError` kinds — including `rpc-indeterminate` from a frozen leader, which must not be retried. **The networked store** for game state: `defineStore`, `hostStore`, `joinStore`, one authoritative document with replicas, audiences with `project`/`authorize`, correlated `act` versus coalesced `input`, chunked snapshots, the twelve `StoreError` codes, and `bindEntities` from `@net-mesh/browser/three` binding entities to a scene graph ('multiplayer game state', 'authoritative game document', 'three.js networked store', 'multiplayer browser game', 'sync players', 'one player hosts'). Skip for native/Node/Python/Go/C mesh work, and for editing Net's own internals."
+description: "Use this skill when the target is a **browser page** — Net in a tab, or a multiplayer Three.js game built on it. Covers: **`@net-mesh/browser`** (a sibling package to the Node SDK, never a sub-path of it) riding a **WebRTC DataChannel** to a native **anchor** ('run Net in a browser', 'WebRTC transport', 'connect a page to the mesh'). **One node per origin** — Web Lock election, leader vs follower tabs, `connect()` vs `openSession()`, a follower promoted when the holder closes, generation fencing. **The anchor + bootstrap credential** (`net-mesh anchor credential mint`, `credentialB64`, `bootstrapUrl`), the ICE/STUN split, and the ICE-failure classification (`udp-blocked` needs two observations; `ice-timeout` alone is not evidence). **Leaf-to-leaf sessions** (`connectPeer` / `acceptPeer`), streams with a required `reliability`, and the typed `LeafError` / `RtcError` / `RpcError` kinds — including `rpc-indeterminate` from a frozen leader, which must not be retried. **The networked store** for game state: `defineStore`, `hostStore`, `joinStore`, `hostPlayer` (the host's own player), `createLocalMesh` from `@net-mesh/browser/local` (offline prototyping in one page), one authoritative document with replicas, audiences with `project`/`authorize`, correlated `act` versus coalesced `input`, chunked snapshots, the twelve `StoreError` codes, and `bindEntities` from `@net-mesh/browser/three` binding entities to a scene graph ('multiplayer game state', 'authoritative game document', 'three.js networked store', 'multiplayer browser game', 'sync players', 'one player hosts'). Skip for native/Node/Python/Go/C mesh work, and for editing Net's own internals."
 allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 metadata:
   skill-version: 1.0.0
@@ -29,7 +29,7 @@ model that a client-prediction habit will get wrong.
 ## Building a game? The fast path
 
 1. **Read `store.md`** — its opening example and § Game recipe are the runnable
-   shape (host player renders from `host`, joiners `joinStore`, `enlist` keyed
+   shape (host player via `hostPlayer(host)`, joiners `joinStore`, `enlist` keyed
    by `context.peer`, re-announce, poll `query` before joining).
 2. **Use `connect()`, one tab per player** — a store over `openSession` is not
    established. Test two players with two browser profiles, not two tabs.
@@ -38,8 +38,9 @@ model that a client-prediction habit will get wrong.
    examples/browser-demo/host/Cargo.toml -- --headless --seconds 600`; each
    player's credential is the `credentialB64` from its `/config?tab=N`.
    `net-mesh anchor serve` cannot host a browser today.
-4. **Prototype game logic offline** in `net/crates/net/browser-ts/demo/` — a host
-   and two players in one page over a local bus, the real store, no network.
+4. **Prototype game logic offline** with `createLocalMesh()` from
+   `@net-mesh/browser/local` — several nodes in one page, the real store, no
+   anchor, no network.
 5. **Render with `bindEntities`** from `@net-mesh/browser/three`.
 6. **Walkthrough for game developers:** `net/crates/net/browser-ts/README.md`.
 

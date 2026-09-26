@@ -30,12 +30,12 @@ node serve.mjs         # http://localhost:8173/
 ```
 
 Open <http://localhost:8173/demo/index.html>. The host and two joiners
-run in that one page over `demo/local-mesh.js`.
+run in that one page over `@net-mesh/browser/local` (`createLocalMesh`).
 
 **What local mode is, exactly.** The store is real and every frame is
 really encoded, parsed, chunked, assembled and dispatched. The *mesh*
 is not: delivery is a function call, and the authenticated peer is
-assigned by `local-mesh.js` instead of proved by a handshake. It is for
+assigned by the local mesh instead of proved by a handshake. It is for
 developing the game without an anchor. A screenshot of it is **not**
 evidence that two browsers can play.
 
@@ -260,6 +260,5 @@ the other half nobody writes.
 | `game.js` | the store definition, projection, handlers and policy — the only file that says what the game *is* |
 | `scene.js` | Three.js: what a ship LOOKS like. The add/update/remove reconciliation is `@net-mesh/browser/three`, not this file |
 | `main.js` | wiring: mode selection, the frame loop, keyboard → input/action |
-| `local-mesh.js` | the development bus for `mode=local`, and what it is not |
 | `serve.mjs` | a dependency-free static server; ES modules and importmaps need an origin |
 | `package.json` | Three.js, scoped to the demo so the published package does not carry it |

@@ -133,7 +133,26 @@ game usually wants.
 
 A replica of the node it is running on is refused with `invalid-data` — a node
 has no session with itself, and refusing at construction beats a `no session with
-0x…` from inside the transport after the subscription was accepted.
+0x…` from inside the transport after the subscription was accepted. A host that
+is also a player uses `hostPlayer` instead (below).
+
+For development without an anchor, `@net-mesh/browser/local` provides a mesh
+inside one page. Each node it creates is a `StoreTransport`, so the store on top
+is the real one — frames are encoded, chunked and dispatched — while delivery is
+a function call and the peer on each frame is assigned rather than proved:
+
+```typescript
+import { createLocalMesh } from '@net-mesh/browser/local';
+
+const mesh = createLocalMesh();
+const hostNode = mesh.node();
+const guestNode = mesh.node();
+const host = hostStore({ definition, transport: hostNode, /* … */ });
+const guest = joinStore({ definition, transport: guestNode, host: hostNode.nodeIdHex(), /* … */ });
+```
+
+It is evidence about game logic, not about whether two browsers can reach each
+other.
 
 An announcement is a lease, so both sides re-announce on a timer; a joiner that
 looks a few seconds late otherwise reports that the host never announced.
@@ -162,6 +181,36 @@ last `StoreError`.
 A replica has **no `setState`**. That is a type-level fact rather than a runtime
 check: writes go through actions and inputs, and only the host's handle carries
 the setter.
+
+## The host's own player
+
+`hostPlayer(host, { audience })` returns the same handle shape as `joinStore`,
+for the node that hosts the store:
+
+```typescript
+const me = hostPlayer(host, { audience: ['crew'] });
+await me.ready();
+await me.act('enlist', {});
+```
+
+It is held to parity with a replica rather than trusted:
+
+- **The same policy.** Reads, actions and inputs go to the host's `authorize`,
+  with the host's own node id as `peer`.
+- **The same transaction.** Input validation, the handler, output validation and
+  the result's message budget run in one transaction, and the change reaches
+  every replica.
+- **The same values.** A value the wire would refuse (`NaN`, a cycle) is refused
+  with `invalid-data`.
+- **The same view.** `getState()` is the projection for its audience, not the
+  authoritative document, so the host's page renders what a player would.
+
+Calls settle a turn later, as a replica's do, so a call started inside a handler
+runs as its own transaction. When the host closes, the player's phase becomes
+`closed` and its calls reject with `owner-lost`.
+
+The projection keeps the host's own UI honest; it does not hide anything from
+the person running the host, whose page holds the whole document.
 
 ## Codes to branch on
 

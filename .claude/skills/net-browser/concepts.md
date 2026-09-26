@@ -92,8 +92,8 @@ store**. It is not a CRDT and not a lock-step replication protocol; the shape is
 Three traps a game hits first (the full recipe is `store.md` § Game recipe):
 
 - **The host cannot `joinStore` its own node** — it throws `invalid-data`. The
-  hosting player renders from the `hostStore` handle and plays through the same
-  handlers.
+  hosting player uses `hostPlayer(host, { audience })`: a replica-shaped handle
+  held to the same `authorize`, handlers and projection.
 - **Announcements are leases.** A host that announces once vanishes from
   `query` a few seconds later; re-announce on a timer.
 - **Two tabs are one player.** Same origin + same browser profile = one node, so
