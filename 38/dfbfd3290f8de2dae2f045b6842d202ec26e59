@@ -1,0 +1,61 @@
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_cfca633e0c1a5d 519-531
+net/crates/net/src/adapter/net/mesh.rs
+  s_d8b00bedd146e9::t_d862d660cf2450 2106-2110
+  s_d8b00bedd146e9::t_4b2f67dbecf69d 2073-2105,2111-2142,34031-34065
+  s_d8b00bedd146e9::t_5a405fe2edc673 34066
+net/crates/net/tests/rtc_browser/runner/src/stage5.rs
+  s_d8b00bedd146e9::t_6ff8868962de61 3391-3394,3396-3397
+  s_d8b00bedd146e9::t_ef202e5184bef6 244,271-272,3301-3390,3395,3398-3443
+  s_d8b00bedd146e9::t_29c32f81e79523 3444-3447
+net/crates/net/bindings/python/tests/test_stream_inbox.py
+  s_d8b00bedd146e9::t_e430c133b642f6 1-55
+go/net.h
+  s_d8b00bedd146e9::t_741ec5346105e8 57-59,339,432-464
+  s_d8b00bedd146e9::t_4ba30b1fbc67fa 465
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_fd014dc55cd8f9 7383,7484-7485
+net/crates/net/include/net.go.h
+  s_d8b00bedd146e9::t_741ec5346105e8 57-59,343,447-479
+  s_d8b00bedd146e9::t_15f4754befcd03 480
+net/crates/net/bindings/python/src/identity.rs
+  s_d8b00bedd146e9::t_d862d660cf2450 500-507
+net/crates/net/src/ffi/mesh.rs
+  s_d8b00bedd146e9::t_bab385f73cdc9b 4871-5038
+  s_d8b00bedd146e9::t_741ec5346105e8 84-86,2156-2238,2242,2258-2341
+  s_d8b00bedd146e9::t_8a79c927dae2bc 2239-2241,2243-2257
+  s_d8b00bedd146e9::t_5c7e8f2d4f7bd9 2342
+net/crates/net/src/adapter/net/mesh_stream_inbound_tests.rs
+  s_d8b00bedd146e9::t_4b2f67dbecf69d 224-280
+net/crates/net/src/adapter/net/mod.rs
+  s_d8b00bedd146e9::t_4b2f67dbecf69d 241
+go/stream_inbox.go
+  s_d8b00bedd146e9::t_0fffc5813f7c3f 1-143
+go/stream_inbox_test.go
+  s_d8b00bedd146e9::t_349df29edb7254 1-89
+net/crates/net/bindings/python/src/lib.rs
+  s_d8b00bedd146e9::t_d862d660cf2450 1143-1254,2317-2341,4121-4122,4186
+go/mesh.go
+  s_d8b00bedd146e9::t_971a3bcca58c8c 50-53,100-101
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_d8b00bedd146e9::t_dcbad5910e7719 759-785,1046-1048,1461-1462
+  s_d8b00bedd146e9::t_f19ff5ad2f1d50 1463-1464
+net/crates/net/bindings/python/python/net/__init__.py
+  s_d8b00bedd146e9::t_06bfa9d3493145 204-205,225-226,240,257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "38dfbfd3290f8de2dae2f045b6842d202ec26e59",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
