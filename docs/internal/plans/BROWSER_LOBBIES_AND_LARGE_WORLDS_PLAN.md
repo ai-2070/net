@@ -269,6 +269,53 @@ hand-written:
    with real stakes need a dedicated host. No SDK feature can change this, and
    the SDK should not imply otherwise.
 
+**Defaults.** Principle: *compatible by default, loud when a secret could
+leak.* A strict default that hides data makes a game look broken and pushes the
+developer to disable it; a leak looks fine. So the defaults force an explicit
+choice without breaking anything:
+
+1. **No `visibility` → today's behavior.** Existing stores are untouched; this
+   is not a breaking change.
+2. **`owner` needs no configuration.** The standard pattern keys each player's
+   entity by the proven caller (`ships[context.peer]`), so by default `owner`
+   means *the map key equals the viewer's peer id*. `ownerOf(entity)` overrides
+   it for other layouts.
+3. **Rules inherit and cannot be widened.** A rule on `players.*.hand` covers
+   everything beneath it; a hand-written `project` may narrow it further, never
+   widen it.
+4. **One hidden form.** Collections drop hidden entries; hidden fields become
+   the typed `hidden` marker — never `0`, `""` or `null`.
+5. **Unknowable inputs fail at definition time.** `team` without a team
+   resolver (and any other rule needing app data) throws in `defineStore`, not
+   at first projection.
+6. **Presets for common game types** — a small closed set an AI agent can pick
+   correctly, each shipped only with an executed example:
+
+   ```ts
+   visibility: 'open'                                         // everyone sees everything — explicit
+   visibility: 'card-game'                                    // hands owner, deck nobody + count everyone, table everyone
+   visibility: { preset: 'card-game', 'players.*.score': 'everyone' }   // preset + overrides
+   ```
+
+   Later presets (team game; fog of war composed with interest keys) land only
+   with their examples.
+7. **Development-mode warnings, on by default:**
+   - A store that sends the entire state to every player *without saying so*
+     warns once: "every player receives the full state; declare
+     `visibility: 'open'` if intended". An explicit `'open'` silences it —
+     turning an accident into a decision.
+   - The cross-player leak check (item 3 above) runs in development, off in
+     production.
+   - Secrets declared on a player-hosted store remind once that the hosting
+     player can see them (`host.trust === 'player'`).
+
+**Defaults deliberately avoided:**
+- **Guessing from names** (hiding fields called `hand`, `secret`, `deck`): too
+  magical, and wrong often enough to create confusing bugs.
+- **Deny-everything once any rule is declared:** safe in theory, but games lose
+  their world state and developers reach for `'open'` just to make it work,
+  defeating the point.
+
 **Deliberately not in scope:**
 - **Line of sight / fog of war as computation.** Whether a unit sees another
   is game logic; the SDK makes "visible to this viewer" easy to express, it
@@ -392,7 +439,7 @@ holds replicas of its current region and its neighbours.
 | Q4 | Lobby metadata on announcements: size limit and what's public | Privacy of unlisted lobbies |
 | Q5 | Interest keys: cells only, or arbitrary keys (teams, instances)? | P2 API generality |
 | Q6 | Handoff consistency target: at-most-once with typed failure, or exactly-once? | P4 protocol complexity |
-| Q7 | Visibility rules: path strings (as sketched) or schema annotations (e.g. a validator wrapper `secret(owner, schema)`)? How is `team` resolved — an app callback? | P2 hidden-information API shape |
+| Q7 | Visibility API and defaults: path strings (as sketched) or schema annotations (e.g. a validator wrapper `secret(owner, schema)`)? How is `team` resolved — an app callback? Which presets ship first (proposed: `open`, `card-game`)? How is "development mode" detected — an explicit `dev` flag, or the bundler's `NODE_ENV`? | P2 hidden-information API shape and defaults |
 
 ---
 
