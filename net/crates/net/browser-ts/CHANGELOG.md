@@ -24,6 +24,12 @@ the README on why it is a sibling package rather than a sub-path.
   are validated, and the whole-document `state` validator does not run. At
   8,000 entities a commit drops from about 16 ms to about 2 ms. `undefined`
   removes an entity. `scripts/bench-world.mjs --write entities` measures it.
+- **Per-player views cost what changed, not the world.** When an entity write
+  touches only collections declared in both `interest` and `entities`, and
+  the host projects by declared `visibility` rules alone, each player's delta
+  projects just the changed entities. 8,000 entities under an `owner` rule
+  with 16 players: 459 → 25 ms a commit. `host.counts().sparseViews` counts
+  it.
 
 - **Netcode: `@net-mesh/browser/netcode`** — `hostNetcode` (fixed-rate tick
   loop; inputs applied exactly once per player however often the lossy

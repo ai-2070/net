@@ -248,8 +248,18 @@ export interface HostedStoreHandle<
   ): void;
   /** {@link setEntities} for one id; `undefined` removes it. */
   setEntity<C extends EntityCollection<S>>(collection: C, id: string, value: EntityOf<S, C> | undefined): void;
-  /** Handles, ledgers and pending projections, for a bounds report. */
-  counts(): { readonly handles: number; readonly ledgers: number; readonly deferred: number };
+  /**
+   * Handles, ledgers and pending projections, for a bounds report; and
+   * `sparseViews`, how many per-view deltas were projected from the changed
+   * entities alone (an entity write on a collection declared in both
+   * `interest` and `entities`, with only declared visibility rules).
+   */
+  counts(): {
+    readonly handles: number;
+    readonly ledgers: number;
+    readonly deferred: number;
+    readonly sparseViews: number;
+  };
   counters(): Readonly<Record<string, number>>;
   close(): Promise<void>;
 }
@@ -807,6 +817,7 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       handles: owner.handleCount,
       ledgers: owner.ledgerCount,
       deferred: owner.deferredCount,
+      sparseViews: owner.sparseViews,
     }),
     counters: () => ({ ...owner.snapshotCounters(), ...dropped }),
     close: () => {

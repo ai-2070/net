@@ -92,7 +92,7 @@ Gaps, with their state:
 | G11 | Bounds sized for rooms | Partly: interest has its own bounds; one-frame deltas remain (§8) |
 | G12 | The store only runs in a browser | Closed: runs in Node over `meshStoreTransport` |
 | G13 | **The leaf has only a reliable, ordered DataChannel** | **Open — netcode model 2 (§6)** |
-| G14 | **The host's commit validates the whole world** (15.6 ms at 8,000 entities, no players) | **Mitigated — §8 item 1: `setEntities` 2.2 ms; per-player projection (item 2) open** |
+| G14 | **The host's commit validates the whole world** (15.6 ms at 8,000 entities, no players) | **Mitigated — §8: `setEntities` 2.2 ms; per-player views O(changed) (owner, 16 players 459 → 25 ms); O(nearby) open** |
 
 ---
 
@@ -595,9 +595,27 @@ and input transaction commits the same way. Per-player projections under
    handler's `context` (a handler can call the host handle, and the write
    joins its transaction, but that commit validates the document as before).
    Replicas still validate the whole document per delta.
-2. **A maintained spatial index** (cell → ids, updated from each commit's changed
-   entities), so declared-visibility stores filter by interest *before*
-   projecting: per-player cost O(nearby).
+2. **Per-view cost O(changed), not O(world) — DONE (2026-09-27).** This is
+   the first half of the item. When a commit changes only collections
+   declared in both `interest` and `entities`, and the host projects only by
+   DECLARED rules (no `project` / `projectFor`), `propagate` computes the
+   raw entity change once. Each view then projects just the changed entities
+   on a sparse document: declared rules are path patterns, so an entity's
+   visibility does not depend on the rest of the world. It validates them
+   with the per-entity parser, where the full path ran `state` over the whole
+   view. Anything it cannot answer exactly falls back to the full path.
+   `host.counts().sparseViews` counts the uses. A 150-step random property
+   test (`test/store/sparse-views.test.ts`) holds every replica equal to the
+   declared projection narrowed to its interest. Measured (8,000 entities,
+   5% moving, `owner` rule, ms/tick median): 4 players 130 → 10.3, 16
+   players 459 → 25.0.
+   **Still open: O(changed ∩ nearby).** Each view still projects every
+   changed entity, not only the ones its interest covers. Narrowing by the
+   RAW interest key is not sound as it stands, because the key is taken from
+   the PROJECTED entity. When a rule hides the keyed field, the key function
+   sees the marker and the entity is delivered to everyone. A maintained
+   index (cell → ids) needs a rule that keyed fields are never hidden, or a
+   per-rule check of that, before it can filter first.
 3. **Moving the hot path to Rust** only if the harness still demands it after 1
    and 2 — a much larger project.
 

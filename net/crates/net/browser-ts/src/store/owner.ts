@@ -280,6 +280,20 @@ interface InterestChange {
   readonly afterKey: string | null;
 }
 
+/**
+ * A commit's raw change to its entity collections, computed once and
+ * shared by every view: per collection, the ids whose entity is a
+ * different object, with both sides.
+ */
+interface EntityDelta {
+  readonly collections: readonly {
+    readonly collection: string;
+    readonly ids: readonly string[];
+    readonly before: Readonly<Record<string, unknown>>;
+    readonly after: Readonly<Record<string, unknown>>;
+  }[];
+}
+
 /** A view's change, split for per-handle interest filtering. */
 interface InterestDiff {
   /** Root ops for everything outside the interest collections. */
@@ -381,6 +395,15 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     return this.perPlayer ? JSON.stringify([peer, audience]) : JSON.stringify(audience);
   }
 
+  /**
+   * Views whose change was projected from the changed entities alone
+   * (`sparseInterestDiff`). Not a refusal, so not in {@link snapshotCounters}.
+   */
+  get sparseViews(): number {
+    return this.sparseViewCount;
+  }
+  private sparseViewCount = 0;
+
   /** Counters a host can report. Every refusal moves exactly one. */
   snapshotCounters(): Readonly<Counters> {
     return { ...this.counters };
@@ -464,6 +487,10 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     // identity test could never fire and every key paid its
     // serialization comparison once per handle.
     const diffs = new Map<string, readonly WireOp[] | null>();
+    // The commit's raw entity change, when it qualifies for per-view
+    // projection of the changed entities alone (see `sparseInterestDiff`);
+    // computed on first need.
+    let entityChange: EntityDelta | null | undefined;
     for (const handle of [...this.handles.values()]) {
       // No `generation === 0` test: a handle is created and installed
       // in one synchronous `join`, and a join whose emission fails
@@ -503,9 +530,18 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         // handle takes only the entities its interest covers.
         let diff = interestCache.get(audienceKey);
         if (diff === undefined) {
-          const before = this.project(handle.peer, handle.audience, previous);
-          const after = this.project(handle.peer, handle.audience, current);
-          diff = before === null || after === null ? null : this.interestDiff(before, after);
+          if (entityChange === undefined) entityChange = this.entityDelta(previous, current);
+          diff =
+            entityChange === null
+              ? undefined
+              : this.sparseInterestDiff(handle.peer, handle.audience, entityChange);
+          if (diff === undefined) {
+            const before = this.project(handle.peer, handle.audience, previous);
+            const after = this.project(handle.peer, handle.audience, current);
+            diff = before === null || after === null ? null : this.interestDiff(before, after);
+          } else {
+            this.sparseViewCount += 1;
+          }
           interestCache.set(audienceKey, diff);
         }
         ops = diff === null ? null : this.interestOps(diff, handle.interest);
@@ -1592,6 +1628,132 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       out[collection] = kept;
     }
     return out as S;
+  }
+
+  /**
+   * The commit's raw entity change, or `null` when this commit cannot be
+   * projected entity by entity.
+   *
+   * It can when the host projects only by DECLARED rules (no `project` /
+   * `projectFor`, which see the whole document), and every root key the
+   * commit changed is a collection declared in both `interest` and
+   * `entities`, and is an entity map on both sides. Declared rules are
+   * path patterns, so an entity's visibility is the same in a document
+   * holding only the changed entities; and `entities` is the contract that
+   * an entity is valid on its own, so its projection is validated by the
+   * per-entity parser instead of `state` over the whole view.
+   */
+  private entityDelta(previous: S, current: S): EntityDelta | null {
+    if (this.deps.project !== undefined || this.deps.projectFor !== undefined) return null;
+    const entities = this.deps.definition.entities;
+    if (entities === undefined) return null;
+    const interest = new Set(this.interestFns.map(([collection]) => collection));
+    const was = previous as Record<string, unknown>;
+    const now = current as Record<string, unknown>;
+    const collections: {
+      collection: string;
+      ids: string[];
+      before: Record<string, unknown>;
+      after: Record<string, unknown>;
+    }[] = [];
+    for (const key of new Set([...Object.keys(was), ...Object.keys(now)])) {
+      const b = Object.prototype.hasOwnProperty.call(was, key) ? was[key] : undefined;
+      const a = Object.prototype.hasOwnProperty.call(now, key) ? now[key] : undefined;
+      if (Object.is(b, a)) continue;
+      if (!interest.has(key) || !Object.prototype.hasOwnProperty.call(entities, key)) return null;
+      if (!isRecord(b) || !isRecord(a)) return null;
+      const ids: string[] = [];
+      for (const id of new Set([...Object.keys(b), ...Object.keys(a)])) {
+        const before = Object.prototype.hasOwnProperty.call(b, id) ? b[id] : undefined;
+        const after = Object.prototype.hasOwnProperty.call(a, id) ? a[id] : undefined;
+        if (!Object.is(before, after)) ids.push(id);
+      }
+      collections.push({ collection: key, ids, before: b, after: a });
+    }
+    return { collections };
+  }
+
+  /**
+   * One view's change from the changed entities alone: O(changed) per
+   * view instead of two whole-world projections, a whole-view validation
+   * and a scan of every id. Returns `undefined` for anything it cannot
+   * answer exactly as `interestDiff` over full projections would (a rule
+   * hiding a whole collection, a projected entity its parser refuses),
+   * and the caller takes the full path.
+   */
+  private sparseInterestDiff(
+    peer: string,
+    audience: readonly string[],
+    delta: EntityDelta,
+  ): InterestDiff | undefined {
+    const viewer: Viewer = Object.freeze({ peer, audience: Object.freeze([...audience]) });
+    const define = (target: Record<string, unknown>, key: string, value: unknown): void => {
+      Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+    };
+    const sparseBefore: Record<string, unknown> = {};
+    const sparseAfter: Record<string, unknown> = {};
+    for (const { collection, ids, before, after } of delta.collections) {
+      const b: Record<string, unknown> = {};
+      const a: Record<string, unknown> = {};
+      for (const id of ids) {
+        if (Object.prototype.hasOwnProperty.call(before, id)) define(b, id, before[id]);
+        if (Object.prototype.hasOwnProperty.call(after, id)) define(a, id, after[id]);
+      }
+      define(sparseBefore, collection, b);
+      define(sparseAfter, collection, a);
+    }
+    const projectedBefore =
+      this.visibility === null ? sparseBefore : applyVisibility(this.visibility, sparseBefore, viewer);
+    const projectedAfter =
+      this.visibility === null ? sparseAfter : applyVisibility(this.visibility, sparseAfter, viewer);
+    const keyFns = new Map(this.interestFns);
+    const entities = this.deps.definition.entities!;
+    const changes: InterestChange[] = [];
+    for (const { collection, ids } of delta.collections) {
+      const pb = projectedBefore[collection];
+      const pa = projectedAfter[collection];
+      if (!isRecord(pb) || !isRecord(pa)) return undefined;
+      const parse = entities[collection]!;
+      const fn = keyFns.get(collection)!;
+      // Untouched by the rules: these ARE committed entities, validated
+      // when committed, exactly as `project` returns a committed state.
+      const check = (projected: unknown, rebuilt: boolean): { ok: boolean; value: unknown } => {
+        if (projected === undefined || !rebuilt) return { ok: true, value: projected };
+        try {
+          return { ok: true, value: this.core.runReadOnly(() => parse(projected)) };
+        } catch {
+          return { ok: false, value: undefined };
+        }
+      };
+      for (const id of ids) {
+        const was = check(
+          Object.prototype.hasOwnProperty.call(pb, id) ? pb[id] : undefined,
+          projectedBefore !== sparseBefore,
+        );
+        const now = check(
+          Object.prototype.hasOwnProperty.call(pa, id) ? pa[id] : undefined,
+          projectedAfter !== sparseAfter,
+        );
+        if (!was.ok || !now.ok) return undefined;
+        if (
+          Object.is(was.value, now.value) ||
+          (was.value !== undefined &&
+            now.value !== undefined &&
+            JSON.stringify(was.value) === JSON.stringify(now.value))
+        ) {
+          continue;
+        }
+        changes.push({
+          collection,
+          id,
+          before: was.value,
+          after: now.value,
+          beforeKey: was.value === undefined ? null : this.interestKey(fn, was.value, id),
+          afterKey: now.value === undefined ? null : this.interestKey(fn, now.value, id),
+        });
+      }
+    }
+    return { rest: [], entities: changes, whole: [] };
   }
 
   /** One view's change, split for interest: the rest of the document, and per-entity changes with their keys. */

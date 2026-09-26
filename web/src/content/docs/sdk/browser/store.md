@@ -287,6 +287,13 @@ entity passing its parser. Keep rules that span entities in actions. Inside an
 action handler the write joins the handler's transaction, and that commit
 validates the document as usual.
 
+Declaring the collection in both `interest` and `entities` also makes
+per-player views cheap. When visibility comes only from declared rules (no
+`project` / `projectFor`), each player's delta projects just the entities that
+changed, not the whole world. With 8,000 entities under an `owner` rule and 16
+players, a commit drops from 459 ms to 25 ms. `host.counts().sparseViews` counts
+how often that path ran.
+
 `cellKey`, `cellsAround(x, z, { size, radius })`, `stickyCells(previous, x, z, {
 size, radius, margin })` (hysteresis at cell borders) and `sameCells` are the
 grid helpers.

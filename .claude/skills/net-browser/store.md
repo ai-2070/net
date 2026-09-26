@@ -170,7 +170,11 @@ answer rather than a second guess.
   removes). Only the written entities are validated; the whole-document
   `state` validator does not run. 8,000 ships: ~16 ms → ~2 ms a commit. The
   contract: `state` must impose nothing on that collection beyond each entity
-  passing its parser, so keep cross-entity rules in actions.
+  passing its parser, so keep cross-entity rules in actions. Declare the
+  collection in `interest` too, and use declared `visibility` rather than
+  `projectFor`: per-player deltas then project only the changed entities
+  (`owner` rule, 16 players: 459 → 25 ms).
+  `host.counts().sparseViews` shows it running.
 - **Host `setState(next)` replaces the whole document.** Inside a handler,
   `context.setState(patch | (state) => patch)` **shallow-merges** the patch into
   the top level. Handlers are **synchronous**: returning a thenable (an `async`
