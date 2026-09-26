@@ -25,7 +25,8 @@ const net = hostNetcode<Ship, Move>({
     for (const [peer, list] of inputs) for (const { data } of list) ships[peer] = move(ships[peer], data);
   },
   snapshot: () => ships,           // entity id → state, what players see
-  visible: (peer, id, ship) => near(ships[peer], ship),   // optional per-player filter
+  visible: (peer, id, ship) => !ship.cloaked,             // optional: the PERMISSION
+  interest: (id, ship) => cellKey(ship.x, ship.z, 32),    // optional: the key players ask by
   authorize: peer => players.has(peer),                   // optional
 });
 ```
@@ -54,6 +55,7 @@ const net = joinNetcode<Ship, Move>({
   label: 'my-game.movement',
   local: { id: node.nodeIdHex()!, predict: move },   // the SAME rule the host applies
   interpolationDelayMs: 100,       // ≥ two snapshot intervals
+  interest: cellsAround(x, z, { size: 32 }),   // optional; net.setInterest(keys) to move
 });
 onInput(input => net.input(input));   // your ship moves NOW; the host gets it too
 function frame() { draw(net.view()); requestAnimationFrame(frame); }

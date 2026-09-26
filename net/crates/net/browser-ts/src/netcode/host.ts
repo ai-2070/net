@@ -73,6 +73,15 @@ export interface HostNetcodeOptions<E, I> {
   snapshot(tick: number): Readonly<Record<string, E>>;
   /** Which entities `peer` receives. Default: all. */
   visible?(peer: string, id: string, entity: E): boolean;
+  /**
+   * Interest management: the key an entity is found under (a grid cell, a
+   * room; `null`: always delivered). A player that states interest keys
+   * (`joinNetcode({ interest })` / `setInterest`) then receives only the
+   * entities whose key it named — after `visible`, which stays the
+   * permission; interest is only a filter. A player that states none
+   * receives everything `visible` allows.
+   */
+  interest?(id: string, entity: E): string | null;
   /** Admit `peer` as a player. Default: everyone. */
   authorize?(peer: string): boolean;
   /**
@@ -122,6 +131,9 @@ interface Player<I> {
   lastApplied: number;
   pending: Map<number, TickInput<I>>;
   lastHeard: number;
+  /** The interest keys it stated (`null`: none, so everything) and their version. */
+  interest: ReadonlySet<string> | null;
+  interestVersion: number;
 }
 
 /** History kept: enough ticks to cover the rewind cap with room. */
@@ -129,7 +141,6 @@ function historySize(tickRate: number, maxRewindMs: number): number {
   return Math.max(8, Math.ceil((maxRewindMs / 1000) * tickRate) + 4);
 }
 
-/** Start the authoritative netcode host. */
 /**
  * One snapshot as frames: one, or — over `maxBytes` — chunks by
  * {@link chunkOf}, as many as it takes for each to fit (up to
@@ -143,8 +154,12 @@ export function snapshotFrames<E>(
   ack: number,
   entities: Readonly<Record<string, E>>,
   maxBytes: number,
+  interestVersion = 0,
 ): Frame<E, never>[] {
-  const whole: Frame<E, never> = { n: label, k: 's', tick, t: time, ack, e: entities };
+  // The interest version the view was filtered by, echoed so the player
+  // stops repeating its `w` frame.
+  const iv = interestVersion > 0 ? { iv: interestVersion } : {};
+  const whole: Frame<E, never> = { n: label, k: 's', tick, t: time, ack, e: entities, ...iv };
   const size = encodeFrame(whole).length;
   if (size <= maxBytes) return [whole];
   const ids = Object.keys(entities);
@@ -153,7 +168,7 @@ export function snapshotFrames<E>(
     const parts: Record<string, E>[] = Array.from({ length: of }, () => ({}));
     for (const id of ids) parts[chunkOf(id, of)]![id] = entities[id]!;
     const frames = parts.map(
-      (e, c): Frame<E, never> => ({ n: label, k: 's', tick, t: time, ack, e, c, of }),
+      (e, c): Frame<E, never> => ({ n: label, k: 's', tick, t: time, ack, e, c, of, ...iv }),
     );
     if (of >= MAX_SNAPSHOT_CHUNKS || frames.every(frame => encodeFrame(frame).length <= maxBytes)) {
       return frames;
@@ -162,6 +177,7 @@ export function snapshotFrames<E>(
   }
 }
 
+/** Start the authoritative netcode host. */
 export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcode<E> {
   const now = options.now ?? defaultNow;
   const tickRate = options.tickRate ?? 30;
@@ -238,7 +254,15 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
       drop('unauthorized');
       return null;
     }
-    const player: Player<I> = { stream: null, opening: false, lastApplied: 0, pending: new Map(), lastHeard: now() };
+    const player: Player<I> = {
+      stream: null,
+      opening: false,
+      lastApplied: 0,
+      pending: new Map(),
+      lastHeard: now(),
+      interest: null,
+      interestVersion: 0,
+    };
     players.set(peer, player);
     return player;
   };
@@ -261,6 +285,13 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
         return;
       case 'p':
         send(peer, player, { n: options.label, k: 'q', t0: frame.t0, t1, t2: now() });
+        return;
+      case 'w':
+        // The lossy carrier reorders and repeats: only a newer version counts.
+        if (frame.v > player.interestVersion) {
+          player.interestVersion = frame.v;
+          player.interest = new Set(frame.w);
+        }
         return;
       case 'i':
         for (const input of frame.i) {
@@ -302,16 +333,34 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
     if (history.length > keep) history.shift();
     for (const [peer, player] of players) {
       let view = entities;
-      if (options.visible) {
+      const wanted = options.interest && player.interest;
+      if (options.visible || wanted) {
         const filtered: Record<string, E> = {};
         for (const [id, entity] of Object.entries(entities)) {
-          if (options.visible(peer, id, entity)) filtered[id] = entity;
+          if (options.visible && !options.visible(peer, id, entity)) continue;
+          if (wanted) {
+            let key: string | null;
+            try {
+              key = options.interest!(id, entity);
+            } catch {
+              key = null;
+            }
+            if (typeof key === 'string' && !wanted.has(key)) continue;
+          }
+          filtered[id] = entity;
         }
         view = filtered;
       }
-      for (const frame of snapshotFrames(options.label, tick, time, player.lastApplied, view, maxFrameBytes)) {
-        send(peer, player, frame);
-      }
+      const frames = snapshotFrames(
+        options.label,
+        tick,
+        time,
+        player.lastApplied,
+        view,
+        maxFrameBytes,
+        player.interestVersion,
+      );
+      for (const frame of frames) send(peer, player, frame);
     }
     tick += 1;
   };

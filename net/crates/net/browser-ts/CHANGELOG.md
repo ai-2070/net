@@ -18,6 +18,12 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **Netcode: interest keys.** `hostNetcode({ interest: (id, entity) => key })`
+  and `joinNetcode({ interest: keys })` / `setInterest(keys)`: a player
+  receives only the entities under the keys it named. An entity keyed `null`
+  is always delivered. `visible` stays the permission, and interest only
+  narrows it. The key set crosses the lossy carrier as a versioned frame,
+  repeated until a snapshot echoes the version back.
 - **Netcode: large snapshots travel as chunks.** A snapshot over the host's
   `maxFrameBytes` (default 8000) is split into chunks that each fit one
   event, with each entity always in the same chunk. A lost chunk no longer

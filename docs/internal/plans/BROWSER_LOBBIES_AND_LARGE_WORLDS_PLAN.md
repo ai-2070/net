@@ -469,8 +469,9 @@ runs on the DIRECT pair (after §8). Correction smoothing
 (`extrapolateMs`) are done (2026-09-27). So is fragmentation-aware
 snapshot sizing: over `maxFrameBytes` a snapshot is sent as stable-hash
 chunks that each fit one event, and a lost chunk's entities carry over for
-one tick. **Not yet:** binary frames, interest-key integration (today
-`visible`).
+one tick. Interest keys too: host `interest(id, entity)`, player
+`interest` / `setInterest`, with a versioned `w` frame repeated until a
+snapshot echoes it. **Not yet:** binary frames.
 
 **Benign anchor warning, recorded:** the acceptance run's anchor logs
 `open_stream: ignoring a fire-and-forget open on a reliable stream`. That is

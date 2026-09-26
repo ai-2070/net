@@ -23,6 +23,8 @@ import {
   type NetcodeTransport,
   type Now,
   type WireInput,
+  MAX_NETCODE_INTEREST_KEYS,
+  MAX_NETCODE_INTEREST_KEY_LENGTH,
   chunkOf,
   defaultNow,
   decodeFrame,
@@ -75,6 +77,12 @@ export interface JoinNetcodeOptions<E, I> {
   /** Clock pings per second. Default 4. */
   readonly pingRate?: number;
   /**
+   * The interest keys to receive (the host's `interest` keys entities; an
+   * entity keyed `null` always arrives). Omit to receive everything the host
+   * shows you. Change it with {@link NetcodeClient.setInterest}.
+   */
+  readonly interest?: readonly string[];
+  /**
    * How long a correction takes to show, ms. Default 100; `0` snaps.
    *
    * When reconciliation moves your entity, the view blends from where it
@@ -106,6 +114,12 @@ export interface NetcodeClient<E, I> {
   input(data: I): void;
   /** The world to draw now: remote entities interpolated, yours predicted. */
   view(): Readonly<Record<string, E>>;
+  /**
+   * Receive only entities under these interest keys from now on. Entities
+   * that leave the set disappear from later snapshots, and so from `view()`.
+   * Throws `RangeError` over 256 keys or for a key over 64 characters.
+   */
+  setInterest(keys: readonly string[]): void;
   /** The host clock, as estimated. `null` before the first pong. */
   hostNow(): number | null;
   stats(): NetcodeStats;
@@ -143,6 +157,31 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     return blend(correcting.from, predicted, Math.max(0, alpha));
   };
   let snapshotsSeen = 0;
+  // The interest set: what was asked, its version, and the newest version a
+  // snapshot has echoed (the `w` frame repeats until they meet).
+  let interest: readonly string[] | null = null;
+  let interestVersion = 0;
+  let interestAcked = 0;
+  const checkInterest = (keys: readonly string[]): readonly string[] => {
+    if (keys.length > MAX_NETCODE_INTEREST_KEYS) {
+      throw new RangeError(`at most ${MAX_NETCODE_INTEREST_KEYS} interest keys, got ${keys.length}`);
+    }
+    for (const key of keys) {
+      if (typeof key !== 'string' || key.length > MAX_NETCODE_INTEREST_KEY_LENGTH) {
+        throw new RangeError(`an interest key is a string of at most ${MAX_NETCODE_INTEREST_KEY_LENGTH} characters`);
+      }
+    }
+    return [...keys];
+  };
+  if (options.interest !== undefined) {
+    interest = checkInterest(options.interest);
+    interestVersion = 1;
+  }
+  const sendInterest = () => {
+    if (interest !== null && interestAcked < interestVersion) {
+      send({ n: label, k: 'w', v: interestVersion, w: interest });
+    }
+  };
   // Chunked snapshots being assembled, by tick; the newest tick accepted;
   // snapshots finished with chunks missing.
   const assemblies = new Map<number, Assembly<E>>();
@@ -213,6 +252,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     }
     if (frame.k !== 's') return;
     joined = true;
+    if (frame.iv !== undefined && frame.iv > interestAcked) interestAcked = frame.iv;
     if (frame.of === undefined || frame.c === undefined) {
       accept(frame.tick, frame.t, frame.ack, frame.e, frame.e);
       return;
@@ -298,6 +338,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   const timer = setInterval(() => {
     if (!joined) send({ n: label, k: 'h' });
     send({ n: label, k: 'p', t0: now() });
+    sendInterest();
     // Unacknowledged inputs are repeated even with nothing new to send, so
     // a lost input frame is repaired without waiting for the next input.
     if (pending.length > 0) send({ n: label, k: 'i', i: pending.slice(-redundancy) });
@@ -305,6 +346,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   void open().then(() => {
     send({ n: label, k: 'h' });
     send({ n: label, k: 'p', t0: now() });
+    sendInterest();
   });
 
   return {
@@ -327,6 +369,11 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       const local = drawnLocal();
       if (!options.local || local === null) return entities;
       return { ...entities, [options.local.id]: local };
+    },
+    setInterest(keys: readonly string[]) {
+      interest = checkInterest(keys);
+      interestVersion += 1;
+      if (!closed) sendInterest();
     },
     hostNow,
     stats: () => ({

@@ -52,6 +52,11 @@ export type Frame<E, I> =
   | { readonly n: string; readonly k: 'i'; readonly i: readonly WireInput<I>[] }
   /** Player → host: clock ping. */
   | { readonly n: string; readonly k: 'p'; readonly t0: number }
+  /**
+   * Player → host: the interest keys it wants, version `v` (repeated until a
+   * snapshot echoes `v` back as `iv`; the host keeps the highest version).
+   */
+  | { readonly n: string; readonly k: 'w'; readonly v: number; readonly w: readonly string[] }
   /** Host → player: clock pong. */
   | { readonly n: string; readonly k: 'q'; readonly t0: number; readonly t1: number; readonly t2: number }
   /**
@@ -70,7 +75,13 @@ export type Frame<E, I> =
       readonly e: Readonly<Record<string, E>>;
       readonly c?: number;
       readonly of?: number;
+      /** The interest version this snapshot was filtered by, if any. */
+      readonly iv?: number;
     };
+
+/** Interest keys a player may name, and the longest key, in UTF-16 units. */
+export const MAX_NETCODE_INTEREST_KEYS = 256;
+export const MAX_NETCODE_INTEREST_KEY_LENGTH = 64;
 
 /** Chunks a snapshot may be split into, at most. */
 export const MAX_SNAPSHOT_CHUNKS = 256;
@@ -115,6 +126,16 @@ export function decodeFrame<E, I>(payload: Uint8Array | undefined, label: string
       return Array.isArray((frame as { i?: unknown }).i) ? (frame as Frame<E, I>) : null;
     case 'p':
       return typeof (frame as { t0?: unknown }).t0 === 'number' ? (frame as Frame<E, I>) : null;
+    case 'w': {
+      const w = frame as { v?: unknown; w?: unknown };
+      return Number.isSafeInteger(w.v) &&
+        (w.v as number) >= 1 &&
+        Array.isArray(w.w) &&
+        w.w.length <= MAX_NETCODE_INTEREST_KEYS &&
+        w.w.every(key => typeof key === 'string' && key.length <= MAX_NETCODE_INTEREST_KEY_LENGTH)
+        ? (frame as Frame<E, I>)
+        : null;
+    }
     case 'q': {
       const q = frame as { t0?: unknown; t1?: unknown; t2?: unknown };
       return typeof q.t0 === 'number' && typeof q.t1 === 'number' && typeof q.t2 === 'number'
@@ -122,8 +143,17 @@ export function decodeFrame<E, I>(payload: Uint8Array | undefined, label: string
         : null;
     }
     case 's': {
-      const s = frame as { tick?: unknown; t?: unknown; ack?: unknown; e?: unknown; c?: unknown; of?: unknown };
+      const s = frame as {
+        tick?: unknown;
+        t?: unknown;
+        ack?: unknown;
+        e?: unknown;
+        c?: unknown;
+        of?: unknown;
+        iv?: unknown;
+      };
       if (
+        (s.iv !== undefined && !Number.isSafeInteger(s.iv)) ||
         typeof s.tick !== 'number' ||
         typeof s.t !== 'number' ||
         typeof s.ack !== 'number' ||
