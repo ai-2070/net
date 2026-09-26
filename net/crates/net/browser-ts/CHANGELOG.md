@@ -14,6 +14,103 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
+## Unreleased
+
+### Added
+
+- **`rememberedIdentity(key?)`** — the same player on every visit for
+  `connect()`: the node's two secrets, created once and kept in
+  `localStorage` (`connect({ …, ...rememberedIdentity() })`). Without it,
+  `connect()` is a new node on every page load.
+- **Fixed: a lobby could not be joined over a real anchor.** A browser node
+  accepts a relayed handshake only from a peer whose signed announcement it
+  holds, and a joiner announced nothing — so the host refused it and the
+  store failed with `no session with 0x…` (the local mesh does not model
+  this; a real anchor run found it). `joinLobby` now announces
+  `net-lobby:<game>:seek:<host>` while playing (new `tags` option keeps the
+  page's own), and retries reaching the host until `timeoutMs`, failing as
+  `LobbyError('not-found', "could not reach the lobby's host …")`.
+- **`requestCredential({ anchorUrl, game })`** — an anonymous visitor
+  credential from an anchor started with `net-mesh anchor serve --game`,
+  returning `{ credentialB64, bootstrapUrl, game }` for `openSession()`.
+  Failures are a typed `CredentialRequestError` (`unknown-game`,
+  `rate-limited`, `malformed-request`, `unreachable`, `unexpected`).
+
+- **Fixed: a change inside a map resent the whole map.** The owner's
+  diff goes one level deeper for maps, so moving 25 of 500 ships sends
+  those 25, not all 500 (62 KB → 3 KB per player per tick, measured).
+- **Faster declared visibility** (linear instead of quadratic) and no
+  re-validation of an identity projection. `npm run bench:world`
+  measures host time and bytes per player across world sizes.
+- **Fixed: a validator that cancels during assembly** published the
+  cancelled document before clearing it; the installation is now
+  abandoned before anything is published.
+- **Interest management.** `defineStore({ interest: { <entity map>:
+  (entity, id) => key | null } })`; `joinStore({ interest })`,
+  `setInterest(keys)` (also on `hostPlayer` and `joinLobby`). Only
+  entities whose key is in the set are delivered, as per-entity ops;
+  far changes send nothing; interest changes are one additive delta
+  (new `int` wire message; optional `int` on `join` / `resume`). Grid
+  helpers `cellKey`, `cellsAround`, `stickyCells`, `sameCells`.
+- **Fixed: a replica sent nothing on a commit then saw a gap.** A delta's
+  `base` was the owner's previous revision, so a replica whose view had
+  not changed (and was sent nothing) detected a gap on its next delta
+  and re-fetched its whole view. `base` is now the revision that
+  replica is at.
+- **Declared visibility.** `defineStore({ visibility })`: path → rule
+  (`'everyone'`, `'nobody'`, `'owner'`, or audiences; `x.length` reveals a
+  hidden array's count), presets `'open'` and `'card-game'` with
+  overrides. Enforced by the host after any `project` / `projectFor`
+  (which become optional). Hidden entries are removed, hidden fields
+  become `HIDDEN` (`hiddenOr`, `isHidden`); a validator that refuses the
+  marker is refused at `hostStore`. `assertHidden` and `projectVisible`
+  for tests; `hostStore({ dev })` warns about an undeclared
+  everything-to-everyone store and about projections the validator
+  refuses.
+- **`onEvent(event, context)`** — one host hook for `join`, `leave`
+  (with a reason: `left` / `expired` / `refused` / `dropped`) and `area`
+  (from `areaOf(state, peer)`, on change only). A transaction like an
+  action handler, run after the causing frame, including the host's own
+  player; throws are discarded and counted, and runaway chains stop at
+  `MAX_EVENT_ROUNDS`.
+- **Inventory bones** — `Inventory` (item id → count), `addItems`,
+  `removeItems`, `countItems`, `hasItems`, `inventoryOf`,
+  `parseInventory`, `onlyOwn`, with optional `maxKinds` / `maxCount`
+  rules and a typed `InventoryError`. Trading is not included.
+- **Lobbies.** `createLobby()` hosts a store with the host's own
+  player (`lobby.self`), a room code, a shareable link, presence
+  (`players()`, `subscribePlayers`), capacity (the host counted) and
+  immediate kicks; `listLobbies()` lists a game's public lobbies;
+  `joinLobby()` joins by code, link or listing. Discovery is capability
+  tags in the host's signed announcement — no new protocol. Records are
+  bounded (256-byte `info`, 512-byte tag) and validated when read; a
+  code claimed by two nodes is refused as `ambiguous`; unlisted lobbies
+  publish only a hash of their code.
+- **`hostPlayer(host, { audience })`** — the hosting node's own player,
+  with the handle shape `joinStore` returns. A node cannot join its own
+  store, so every game whose host also plays wrote a wrapper around the
+  handlers; this replaces it and holds the host's player to parity with
+  a replica: the host's `authorize` with its own node id as `peer`,
+  input and output validation and the result budget inside one
+  transaction, the wire's value rules, and `getState()` as the
+  projection for its audience rather than the raw document.
+  `HostedStoreHandle` now carries its `definition` and its action and
+  input types.
+- **`projectFor(state, { peer, audience })`** — a per-player
+  projection, given to `hostStore` instead of `project`, for views that
+  depend on who is looking (your own hand). Computed once per distinct
+  player and audience; a player whose view did not change is sent
+  nothing. Exactly one of `project` and `projectFor` is accepted, in the
+  types (`HostProjection`) and at construction (`invalid-data`).
+- **`@net-mesh/browser/local`** — `createLocalMesh()`, several nodes in
+  one page with no anchor and no network, each a `StoreTransport`. The
+  store on top is the real one; delivery is a function call and the
+  peer is assigned rather than proved. Local nodes also `announce` and
+  `query` in the real descriptor shape, with the leaf's lease (another
+  node's announcement only, expiring after 300 s by default), so
+  discovery code runs offline. For building game logic first;
+  the demo's `demo/local-mesh.js` is replaced by it.
+
 ## Unreleased — targets 0.36.0
 
 ### Added

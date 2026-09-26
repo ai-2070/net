@@ -81,6 +81,9 @@ use super::NetError;
 // `ffi/cortex.rs`. The Go layer maps these to typed sentinels.
 // =========================================================================
 
+/// The stream already has a receiver (`net_mesh_open_stream_inbox`):
+/// one inbox per stream id per node. Close the first to open another.
+pub(crate) const NET_ERR_MESH_STREAM_OCCUPIED: c_int = -109;
 pub(crate) const NET_ERR_MESH_INIT: c_int = -110;
 pub(crate) const NET_ERR_MESH_HANDSHAKE: c_int = -111;
 pub(crate) const NET_ERR_MESH_BACKPRESSURE: c_int = -112;
@@ -2148,6 +2151,193 @@ pub unsafe extern "C" fn net_mesh_stream_stats(
             write_string_out("null".to_string(), out_json, out_len)
         }
     }
+}
+
+// =========================================================================
+// Stream inbox: stream events WITH their authenticated sender
+// =========================================================================
+
+/// FFI handle for a [`crate::adapter::net::StreamInbox`].
+///
+/// `HandleGuard`-protected like [`MeshStreamHandle`]: the box stays
+/// leaked across `_free`, ops register via `try_enter`, and `_free`
+/// quiesces them. `_free` CLOSES the inbox before quiescing, which
+/// disconnects its channel, so a `recv` blocked in another thread returns
+/// at once rather than holding the free until its timeout.
+pub struct MeshStreamInboxHandle {
+    inbox: ManuallyDrop<crate::adapter::net::StreamInbox>,
+    guard: HandleGuard,
+}
+
+/// Receive every event on `stream_id`, from any peer, with the peer
+/// whose session authenticated it — what `net_mesh_recv_shard` cannot
+/// say (its events carry no sender).
+///
+/// At most `capacity` events wait (0 means 1); beyond that an arriving
+/// event is dropped and counted (`net_mesh_stream_inbox_dropped`)
+/// rather than stalling the mesh. Returns 0 and writes `*out_inbox`, or
+/// `NET_ERR_MESH_STREAM_OCCUPIED` when the stream already has a receiver.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_open_stream_inbox(
+    handle: *mut MeshNodeHandle,
+    stream_id: u64,
+    capacity: u32,
+    out_inbox: *mut *mut MeshStreamInboxHandle,
+) -> c_int {
+    if handle.is_null() || out_inbox.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    match h.inner.open_stream_inbox(stream_id, capacity as usize) {
+        Some(inbox) => {
+            let boxed = Box::new(MeshStreamInboxHandle {
+                inbox: ManuallyDrop::new(inbox),
+                guard: HandleGuard::new(),
+            });
+            unsafe {
+                *out_inbox = Box::into_raw(boxed);
+            }
+            0
+        }
+        None => NET_ERR_MESH_STREAM_OCCUPIED,
+    }
+}
+
+/// Take the next event, waiting up to `timeout_ms`.
+///
+/// Returns 1 with `*out_from_node` (the authenticated sender),
+/// `*out_buf` and `*out_len` written — the buffer is the caller's, to
+/// release with `net_free_bytes(buf, len)`; an empty payload writes a
+/// NULL buffer and length 0. Returns 0 on timeout or once the inbox is
+/// closed, with nothing written; a negative `NET_ERR_*` on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_stream_inbox_recv(
+    inbox: *mut MeshStreamInboxHandle,
+    timeout_ms: u32,
+    out_from_node: *mut u64,
+    out_buf: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    if inbox.is_null() || out_from_node.is_null() || out_buf.is_null() || out_len.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*inbox };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let Some(event) = h
+        .inbox
+        .recv_timeout(std::time::Duration::from_millis(u64::from(timeout_ms)))
+    else {
+        return 0;
+    };
+    let len = event.payload.len();
+    let ptr = if len == 0 {
+        std::ptr::null_mut()
+    } else {
+        // An explicit `Layout::array::<u8>(len)`, the layout
+        // `net_free_bytes` releases with — not a `Box<[u8]>`, whose
+        // layout matching is an allocator-internals coincidence (see
+        // `write_bytes_out` in `ffi/blob.rs`).
+        let Ok(layout) = std::alloc::Layout::array::<u8>(len) else {
+            return NetError::IntOverflow.into();
+        };
+        // SAFETY: `layout` is non-zero-sized (len > 0).
+        let raw = unsafe { std::alloc::alloc(layout) };
+        if raw.is_null() {
+            return NET_ERR_MESH_TRANSPORT;
+        }
+        // SAFETY: `raw` is a fresh allocation of `len` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(event.payload.as_ptr(), raw, len) };
+        raw
+    };
+    unsafe {
+        *out_from_node = event.from_node;
+        *out_buf = ptr;
+        *out_len = len;
+    }
+    1
+}
+
+/// Events dropped because `capacity` were already waiting. 0 for a
+/// NULL or freed handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_stream_inbox_dropped(inbox: *mut MeshStreamInboxHandle) -> u64 {
+    if inbox.is_null() {
+        return 0;
+    }
+    let h = unsafe { &*inbox };
+    match h.guard.try_enter() {
+        Some(_op) => h.inbox.dropped(),
+        None => 0,
+    }
+}
+
+/// Stop receiving, without freeing: a `recv` waiting in another thread
+/// returns 0 at once, and the stream's events go back to the shard
+/// queue. Idempotent. Free the handle with `net_mesh_stream_inbox_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_stream_inbox_close(inbox: *mut MeshStreamInboxHandle) -> c_int {
+    if inbox.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*inbox };
+    match h.guard.try_enter() {
+        Some(_op) => {
+            h.inbox.close();
+            0
+        }
+        None => NetError::ShuttingDown.into(),
+    }
+}
+
+/// Close the inbox and free the handle. Calling it twice on the same
+/// pointer is undefined; null your handle afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_stream_inbox_free(inbox: *mut MeshStreamInboxHandle) {
+    if inbox.is_null() {
+        return;
+    }
+    let h: &MeshStreamInboxHandle = unsafe { &*inbox };
+    // Close first, under an op, so a `recv` blocked on the channel is
+    // woken before the quiesce below waits for it.
+    if let Some(_op) = h.guard.try_enter() {
+        h.inbox.close();
+    }
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference.
+        unsafe {
+            let inbox = ManuallyDrop::take(&mut (*inbox).inbox);
+            drop(inbox);
+        }
+    } else {
+        tracing::warn!(
+            "net_mesh_stream_inbox_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
+    }
+}
+
+/// The stream id a label names — the browser leaf's derivation — so a
+/// native node and a page that agree on a label open the same stream.
+/// Any UTF-8 string is a label. Returns 0 and writes `*out_id`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_stream_id_from_label(label: *const c_char, out_id: *mut u64) -> c_int {
+    if label.is_null() || out_id.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let Some(text) = (unsafe { c_str_to_string(label) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    unsafe {
+        *out_id = crate::adapter::net::stream_id_from_label(&text);
+    }
+    0
 }
 
 // =========================================================================
@@ -4677,6 +4867,174 @@ fn claim_outcome_code(o: crate::adapter::net::behavior::gang::ClaimOutcome) -> c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stream inbox through the C ABI, end to end over real UDP:
+    /// what the Go binding calls, witnessed here because cgo cannot be
+    /// built on every developer machine.
+    mod stream_inbox_c_abi {
+        use super::super::*;
+        use std::ffi::CString;
+        use std::ptr::null_mut;
+        use std::time::{Duration, Instant};
+
+        fn free_port() -> String {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            socket.local_addr().expect("addr").to_string()
+        }
+
+        fn new_node(addr: &str) -> *mut MeshNodeHandle {
+            let cfg = CString::new(format!(
+                r#"{{"bind_addr":"{addr}","psk_hex":"{}","heartbeat_ms":200}}"#,
+                "42".repeat(32)
+            ))
+            .unwrap();
+            let mut handle = null_mut();
+            assert_eq!(unsafe { net_mesh_new(cfg.as_ptr(), &mut handle) }, 0);
+            handle
+        }
+
+        fn public_key(handle: *mut MeshNodeHandle) -> CString {
+            let (mut out, mut len) = (null_mut(), 0usize);
+            assert_eq!(
+                unsafe { net_mesh_public_key_hex(handle, &mut out, &mut len) },
+                0
+            );
+            let key = unsafe { std::ffi::CStr::from_ptr(out) }.to_owned();
+            unsafe { crate::ffi::net_free_string(out) };
+            key
+        }
+
+        #[test]
+        fn a_c_inbox_receives_each_event_with_its_sender_wakes_on_close_and_frees() {
+            let (a_addr, b_addr) = (free_port(), free_port());
+            let a = new_node(&a_addr);
+            let b = new_node(&b_addr);
+            let (a_id, b_id) = unsafe { (net_mesh_node_id(a), net_mesh_node_id(b)) };
+
+            let b_ptr = b as usize;
+            let accept = std::thread::spawn(move || {
+                let (mut out, mut len) = (null_mut(), 0usize);
+                let rc = unsafe {
+                    net_mesh_accept(b_ptr as *mut MeshNodeHandle, a_id, &mut out, &mut len)
+                };
+                if !out.is_null() {
+                    unsafe { crate::ffi::net_free_string(out) };
+                }
+                rc
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            let b_key = public_key(b);
+            let b_at = CString::new(b_addr).unwrap();
+            assert_eq!(
+                unsafe { net_mesh_connect(a, b_at.as_ptr(), b_key.as_ptr(), b_id) },
+                0
+            );
+            assert_eq!(accept.join().unwrap(), 0);
+            unsafe {
+                assert_eq!(net_mesh_start(a), 0);
+                assert_eq!(net_mesh_start(b), 0);
+            }
+
+            let label = CString::new("store/c-abi-inbox").unwrap();
+            let mut sid = 0u64;
+            assert_eq!(
+                unsafe { net_stream_id_from_label(label.as_ptr(), &mut sid) },
+                0
+            );
+            assert_eq!(
+                sid,
+                crate::adapter::net::stream_id_from_label("store/c-abi-inbox")
+            );
+
+            let mut inbox = null_mut();
+            assert_eq!(
+                unsafe { net_mesh_open_stream_inbox(b, sid, 8, &mut inbox) },
+                0
+            );
+            let mut second = null_mut();
+            assert_eq!(
+                unsafe { net_mesh_open_stream_inbox(b, sid, 8, &mut second) },
+                NET_ERR_MESH_STREAM_OCCUPIED
+            );
+
+            let cfg = CString::new(r#"{"reliability":"reliable"}"#).unwrap();
+            let mut stream = null_mut();
+            assert_eq!(
+                unsafe { net_mesh_open_stream(a, b_id, sid, cfg.as_ptr(), &mut stream) },
+                0
+            );
+            let payload: &[u8] = b"from-c";
+            let (ptrs, lens) = ([payload.as_ptr()], [payload.len()]);
+            let (mut size, mut limit) = (0usize, 0usize);
+            assert_eq!(
+                unsafe {
+                    net_mesh_send(
+                        stream,
+                        ptrs.as_ptr(),
+                        lens.as_ptr(),
+                        1,
+                        a,
+                        &mut size,
+                        &mut limit,
+                    )
+                },
+                0
+            );
+
+            let (mut from, mut buf, mut len) = (0u64, null_mut(), 0usize);
+            assert_eq!(
+                unsafe { net_mesh_stream_inbox_recv(inbox, 5_000, &mut from, &mut buf, &mut len) },
+                1
+            );
+            assert_eq!(from, a_id, "the authenticated sender");
+            assert_eq!(unsafe { std::slice::from_raw_parts(buf, len) }, b"from-c");
+            unsafe { net_free_bytes(buf, len) };
+            assert_eq!(
+                unsafe { net_mesh_stream_inbox_recv(inbox, 20, &mut from, &mut buf, &mut len) },
+                0
+            );
+            assert_eq!(unsafe { net_mesh_stream_inbox_dropped(inbox) }, 0);
+
+            // `close` wakes a recv parked in another thread at once.
+            let inbox_ptr = inbox as usize;
+            let waiter = std::thread::spawn(move || {
+                let (mut from, mut buf, mut len) = (0u64, null_mut(), 0usize);
+                let started = Instant::now();
+                let rc = unsafe {
+                    net_mesh_stream_inbox_recv(
+                        inbox_ptr as *mut MeshStreamInboxHandle,
+                        10_000,
+                        &mut from,
+                        &mut buf,
+                        &mut len,
+                    )
+                };
+                (rc, started.elapsed())
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(unsafe { net_mesh_stream_inbox_close(inbox) }, 0);
+            let (rc, waited) = waiter.join().unwrap();
+            assert_eq!(rc, 0);
+            assert!(
+                waited < Duration::from_secs(5),
+                "close must wake the parked recv, waited {waited:?}"
+            );
+
+            unsafe { net_mesh_stream_inbox_free(inbox) };
+            let mut again = null_mut();
+            assert_eq!(
+                unsafe { net_mesh_open_stream_inbox(b, sid, 8, &mut again) },
+                0,
+                "freeing released the stream"
+            );
+            unsafe {
+                net_mesh_stream_inbox_free(again);
+                net_mesh_stream_free(stream);
+                net_mesh_free(a);
+                net_mesh_free(b);
+            }
+        }
+    }
 
     /// Scope filters that deserialize cleanly but carry no usable
     /// selector must return `InvalidArgument`, not resolve to the

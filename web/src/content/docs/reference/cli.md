@@ -168,6 +168,25 @@ Identity `generate/show/fingerprint/revoke` supports `--inspect-target`. Generat
 
 `cap announce --inspect-target` loads the explicit signing key through the normal permission/parse gate, reports its public fingerprint and the file/stdout destination, and exits before signing or writing an announcement. It does not use profile identity or remote defaults. An incompatible `--node-id` is refused before either inspection or signing. Other tag/policy validation remains part of execution; target inspection is not publication or authority approval. Ordinary output formats and overwrite/revocation safeguards are unchanged.
 
+## Admit browsers for your games
+
+`anchor serve --game <id>` turns a standalone anchor into one browser players can join: it serves enrollment and issues an **anonymous credential per visitor** at `POST <url>/credential` with the body `{"game": "<id>"}`. The reply is `{credentialB64, bootstrapUrl, game}` — what `@net-mesh/browser`'s `openSession()` takes; `requestCredential({ anchorUrl, game })` makes the request for a page.
+
+```sh
+net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
+  --tls-cert cert.pem --tls-key key.pem --allow-origin https://game.example.com \
+  --issuer-identity issuer.json --game my-game --game other-game:120
+```
+
+- **One anchor, several games.** Repeat `--game`. Each game has its own enrollment root, derived from the `--issuer-identity` key, so every instance started with the same key file admits the same visitors, and a visitor's grant says which game admitted it. Ids are lowercase letters, digits, `.`, `-` and `_`.
+- **Limits.** Issuance is capped per game (`--game ID:N`, default 600 credentials a minute) and per source IP (`--credentials-per-minute`, default 30). Refusals are typed: `unknown_game` (404), `rate_limited` (429), `malformed_request` (400).
+- **Counters.** `--game-stats-secs N` prints every game's credentials issued and refused and enrollments admitted and refused as a JSON line every N seconds. The start report lists `games` and the `credential_endpoint`.
+- **What a credential is.** Its invite binds to the first browser identity that enrolls with it; that identity may reconnect with it for 12 hours (a reload with `rememberedIdentity()`, a promoted leader tab), and any other is refused. One credential is one player.
+- **Proved end to end** by `examples/anchor-acceptance`: two real browsers join a lobby through this command.
+- **Not yet enforced:** that a game's players cannot announce, discover or route into another game on the same anchor. Run one anchor per game until that lands.
+
+`--credential-issuer` becomes optional with `--issuer-identity` (it is that key's public half); given both, they must agree. `--game` requires `--issuer-identity`.
+
 ## Inspect standalone anchor serving
 
 With `rtc-bootstrap`, add `--inspect-target` to an otherwise configured `anchor serve` invocation. It reports mesh/HTTPS/RTC/STUN bind selections, TLS certificate/key paths or ACME cache/challenge settings, and a public credential-issuer fingerprint. No PSK/TLS file is read, socket opened, certificate ordered or identity generated. Profile configuration is read for selection validation/disclosure; profile identity, remote target and bind defaults remain unused by standalone serving.

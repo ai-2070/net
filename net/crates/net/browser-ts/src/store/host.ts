@@ -27,9 +27,10 @@
  */
 
 import { isStaleStream, StoreError } from './errors.js';
-import { StoreOwner, type Dispatched, type OwnerDeps, type Outbound } from './owner.js';
-import type { ActionSpec, Cancel, InputSpec } from './types.js';
+import { StoreOwner, type Dispatched, type OwnerDeps, type Outbound, type Viewer } from './owner.js';
+import type { ActionSpec, Cancel, InputSpec, StoreDefinition } from './types.js';
 import { encodeMessage, type Hex } from './wire.js';
+import { applyVisibility, compileVisibility } from './visibility.js';
 
 /** How often a host expires handles whose lease has run out (§2). */
 export const HOST_SWEEP_MS = 5_000;
@@ -147,11 +148,39 @@ export function samePeer(left: string, right: string): boolean {
   return a !== null && a === b;
 }
 
+/**
+ * How a host decides what each replica sees: exactly one of these.
+ *
+ * - `project(state, audience)` — one view per audience, shared by
+ *   every player reading it. The default choice.
+ * - `projectFor(state, { peer, audience })` — one view per player, for
+ *   what differs by who is looking (your own hand). Costs one
+ *   projection per player per change.
+ */
+export type HostProjection<S extends object> =
+  | {
+      project(state: S, audience: readonly string[]): S;
+      readonly projectFor?: never;
+    }
+  | {
+      projectFor(state: S, viewer: Viewer): S;
+      readonly project?: never;
+    }
+  | {
+      /** Neither: the definition's declared `visibility` alone decides. */
+      readonly project?: never;
+      readonly projectFor?: never;
+    };
+
 /** What a host needs beyond the owner's own dependencies. */
-export interface HostStoreOptions<S extends object, A extends ActionSpec, I extends InputSpec>
+export type HostStoreOptions<S extends object, A extends ActionSpec, I extends InputSpec> =
+  HostStoreBaseOptions<S, A, I> & HostProjection<S>;
+
+/** {@link HostStoreOptions} without the projection. */
+export interface HostStoreBaseOptions<S extends object, A extends ActionSpec, I extends InputSpec>
   extends Omit<
     OwnerDeps<S, A, I>,
-    'maxEventBytes' | 'newHandle' | 'newIncarnation' | 'now' | 'canProject' | 'store'
+    'maxEventBytes' | 'newHandle' | 'newIncarnation' | 'now' | 'canProject' | 'store' | 'project' | 'projectFor'
   > {
   readonly transport: StoreTransport;
   /**
@@ -169,6 +198,15 @@ export interface HostStoreOptions<S extends object, A extends ActionSpec, I exte
   readonly streamId?: string;
   readonly maxEventBytes: number;
   readonly initialState: S;
+  /**
+   * Development checks: `true` warns through `console.warn`, a function
+   * receives the messages. It says so when every player would receive
+   * the whole state without the definition declaring `visibility:
+   * 'open'`, and when a projection fails the state validator (which
+   * otherwise sends the player `empty()` silently). Leave it off in
+   * production.
+   */
+  readonly dev?: boolean | ((message: string) => void);
   now?: () => number;
   newHandle?: () => Hex;
   newIncarnation?: () => Hex;
@@ -178,9 +216,15 @@ export interface HostStoreOptions<S extends object, A extends ActionSpec, I exte
 }
 
 /** The authoritative store, served to whoever the transport authenticates. */
-export interface HostedStoreHandle<S extends object> {
+export interface HostedStoreHandle<
+  S extends object,
+  A extends ActionSpec = ActionSpec,
+  I extends InputSpec = InputSpec,
+> {
   /** This node's id: the authority every replica is talking to. */
   readonly authority: string;
+  /** The definition this store serves. */
+  readonly definition: StoreDefinition<S, A, I>;
   getState(): S;
   subscribe(listener: (state: S, previous: S) => void): Cancel;
   setState(next: S): void;
@@ -214,6 +258,30 @@ export interface HostedStoreHandle<S extends object> {
  */
 const addressesByTransport = new WeakMap<StoreTransport, Set<string>>();
 
+/**
+ * What {@link hostPlayer} needs from a hosted store and nothing else
+ * does: its owner, the path that sends what a local call dispatched,
+ * and whether the store is still serving. Package-internal — keyed on
+ * the handle object, so only a handle `hostStore` returned has one.
+ */
+export interface HostInternals<S extends object, A extends ActionSpec, I extends InputSpec> {
+  readonly owner: StoreOwner<S, A, I>;
+  readonly peer: string;
+  readonly maxEventBytes: number;
+  dispatched(result: Dispatched): void;
+  isClosed(): boolean;
+  onClose(listener: () => void): void;
+}
+
+const internals = new WeakMap<object, HostInternals<object, ActionSpec, InputSpec>>();
+
+/** The internals of a handle `hostStore` returned, or `undefined`. */
+export function hostInternals<S extends object, A extends ActionSpec, I extends InputSpec>(
+  handle: HostedStoreHandle<S, A, I>,
+): HostInternals<S, A, I> | undefined {
+  return internals.get(handle) as HostInternals<S, A, I> | undefined;
+}
+
 function randomHex(bytes: number): string {
   const buffer = new Uint8Array(bytes);
   crypto.getRandomValues(buffer);
@@ -236,7 +304,7 @@ const decoder = new TextDecoder();
  */
 export function hostStore<S extends object, A extends ActionSpec, I extends InputSpec>(
   options: HostStoreOptions<S, A, I>,
-): HostedStoreHandle<S> {
+): HostedStoreHandle<S, A, I> {
   const streamId = options.streamId ?? `store/${options.definition.id}`;
   const address = options.store ?? options.definition.id;
   const taken = addressesByTransport.get(options.transport) ?? new Set<string>();
@@ -255,6 +323,15 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     store: address,
     authorize: options.authorize,
     project: options.project,
+    projectFor: options.projectFor,
+    onEvent: options.onEvent,
+    areaOf: options.areaOf,
+    warn:
+      options.dev === true
+        ? message => console.warn(`[@net-mesh/browser] ${message}`)
+        : typeof options.dev === 'function'
+          ? options.dev
+          : undefined,
     actions: options.actions,
     inputs: options.inputs,
     maxEventBytes: options.maxEventBytes,
@@ -263,6 +340,24 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     newIncarnation: options.newIncarnation ?? (() => randomHex(8) as Hex),
     canProject: options.canProject ?? (() => true),
   });
+  // Declared secrets become the HIDDEN marker in a player's view, and
+  // the view must pass the state validator. Checked now, against the
+  // initial state as a stranger would see it, so a validator that
+  // refuses the marker fails here rather than sending every player
+  // `empty()` in silence.
+  if (options.definition.visibility !== undefined) {
+    const stranger = applyVisibility(compileVisibility(options.definition.visibility), options.initialState, null);
+    try {
+      options.definition.state(stranger);
+    } catch (error) {
+      throw new StoreError(
+        'invalid-data',
+        `store '${options.definition.id}': the state validator rejects a view with secrets hidden — ` +
+          `wrap each field a rule hides with hiddenOr(…): ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+  }
   owner.commit(options.initialState);
 
   const replies = new Map<string, TransportStream>();
@@ -420,7 +515,26 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     // reply exactly like the synchronous one, or the caller waits on a
     // result that was computed and never sent.
     if (result.deferred !== null) {
-      detached(result.deferred.then(later => emit(later.out)));
+      detached(result.deferred.then(later => dispatched(later)));
+    }
+    flushEvents();
+  }
+
+  /**
+   * Run the `onEvent` hook for whatever the frame just dispatched
+   * caused — a join, a leave, an area change — AFTER that frame's own
+   * output is on its way, and send what the hook changed. Never
+   * re-entered: a hook's own changes are drained by the same call.
+   */
+  let flushing = false;
+  function flushEvents(): void {
+    if (flushing || closed) return;
+    flushing = true;
+    try {
+      const drained = owner.drainEvents();
+      if (drained.out.length > 0) detached(emit(drained.out));
+    } finally {
+      flushing = false;
     }
   }
 
@@ -648,8 +762,11 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     });
   }
 
-  return {
-    authority: options.transport.nodeIdHex() ?? owner.incarnationHex,
+  const authority = options.transport.nodeIdHex() ?? owner.incarnationHex;
+  const closeListeners = new Set<() => void>();
+  const handle: HostedStoreHandle<S, A, I> = {
+    authority,
+    definition: options.definition,
     getState: () => owner.getState(),
     subscribe: listener => owner.subscribe(listener),
     setState: next => {
@@ -673,8 +790,25 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       // streams out from under the frames still in flight. A review
       // probe measured ZERO goodbyes delivered under a concurrent
       // close where one call delivers one.
-      closing ??= shutdown();
+      if (closing === null) {
+        closing = shutdown();
+        for (const listener of [...closeListeners]) listener();
+        closeListeners.clear();
+      }
       return closing;
     },
   };
+  internals.set(handle, {
+    owner: owner as unknown as StoreOwner<object, ActionSpec, InputSpec>,
+    // The spelling `AccessRequest.peer` and `ActionContext.peer`
+    // promise: 16 lowercase hex, as a replica's frames are handed.
+    peer: peerHexOf(authority) ?? authority,
+    maxEventBytes: options.maxEventBytes,
+    dispatched,
+    isClosed: () => closed,
+    onClose: listener => {
+      closeListeners.add(listener);
+    },
+  } as HostInternals<object, ActionSpec, InputSpec>);
+  return handle;
 }

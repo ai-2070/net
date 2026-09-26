@@ -35,7 +35,7 @@ import type {
   StoreDefinition,
   StoreStatus,
 } from './types.js';
-import { decodeMessage, encodeMessage, type Hex } from './wire.js';
+import { decodeMessage, encodeMessage, utf8Length, type Hex } from './wire.js';
 
 /** How often a live handle renews its lease (§1.6). */
 export const ALIVE_INTERVAL_MS = 20_000;
@@ -93,6 +93,12 @@ export interface JoinStoreOptions<S extends object, A extends ActionSpec, I exte
   readonly store?: string;
   /** The opaque key the host's policy reads. */
   readonly key: string;
+  /**
+   * The interest set to start with: keys of the definition's `interest`
+   * collections (grid cells, rooms…). Only those entities are delivered.
+   * Omit it to receive every entity.
+   */
+  readonly interest?: readonly string[];
   readonly maxEventBytes: number;
   readonly streamId?: string;
   now?: () => number;
@@ -111,6 +117,12 @@ export interface JoinedStoreHandle<S extends object, A extends ActionSpec, I ext
   act<K extends keyof A & string>(name: K, input: A[K]['input']): Promise<A[K]['output']>;
   input<K extends keyof I & string>(name: K, value: I[K]): InputDisposition;
   setAudience(names: readonly string[]): Promise<void>;
+  /**
+   * Replace the interest set. Entities entering it arrive and entities
+   * leaving it go in one change — the view never blanks. Resolves once
+   * the host has applied it.
+   */
+  setInterest(keys: readonly string[]): Promise<void>;
   /** The session was replaced: resume on the new one (§1.6). */
   reconnect(): Promise<void>;
   close(): Promise<void>;
@@ -213,6 +225,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     audience: options.audience,
     store: options.store ?? options.definition.id,
     key: options.key,
+    ...(options.interest === undefined ? {} : { interest: options.interest }),
   });
 
   const outstanding = new Map<Hex, Outstanding>();
@@ -596,7 +609,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     });
   }
 
-  return {
+  const handle: JoinedStoreHandle<S, A, I> = {
     getState: () => core.getState(),
     subscribe: listener => core.subscribe(listener),
     getStatus: () => core.getStatus(),
@@ -722,6 +735,34 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
       if (slot !== undefined) await send(framesOf(requests));
       await installed;
     },
+    setInterest: async keys => {
+      if (closed) throw new StoreError('closed', 'this store handle is closed');
+      const next = [...keys];
+      const placeholder = '0'.repeat(32) as Hex;
+      let probe: string;
+      try {
+        probe = encodeMessage({ k: 'int', q: '0'.repeat(16) as Hex, h: placeholder, int: next });
+      } catch (error) {
+        throw new StoreError('invalid-data', 'the interest set cannot be encoded', { cause: error });
+      }
+      if (utf8Length(probe) > options.maxEventBytes) {
+        throw new StoreError('capacity', 'the interest set does not fit one message');
+      }
+      // Stated first: a join or resume from here on carries it.
+      replica.interest = next;
+      const h = replica.handle;
+      if (h === null || replica.state !== 'ready') {
+        // Not installed yet. The join in flight may carry the OLD set,
+        // so once ready, the new one is sent — unless it was superseded.
+        await handle.ready();
+        if (replica.interest === null || replica.interest.join('\u0000') !== next.join('\u0000')) return;
+        return handle.setInterest(next);
+      }
+      const q = (options.newQ ?? (() => randomHex(8) as Hex))();
+      const answered = correlate<void>(q);
+      await send([encodeMessage({ k: 'int', q, h, int: next })]);
+      await answered;
+    },
     reconnect: async () => {
       if (closed) throw new StoreError('closed', 'this store handle is closed');
       // The old stream belongs to the lost session.
@@ -781,4 +822,5 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
       core.close();
     },
   };
+  return handle;
 }

@@ -30,15 +30,20 @@
 export { defineStore } from './definition.js';
 export { hostStore, HOST_SWEEP_MS } from './host.js';
 export { joinStore, ALIVE_INTERVAL_MS, MAX_OUTSTANDING, REQUEST_DEADLINE_MS } from './join.js';
+export { hostPlayer } from './player.js';
+export type { HostPlayerOptions } from './player.js';
 export type {
   Frame,
   HostedStoreHandle,
+  HostProjection,
+  HostStoreBaseOptions,
   HostStoreOptions,
   StoreTransport,
   TransportFrame,
   TransportStream,
 } from './host.js';
 export type { JoinedStoreHandle, JoinStoreOptions } from './join.js';
+export type { Viewer } from './owner.js';
 export { StoreCore } from './core.js';
 export { StoreError } from './errors.js';
 export { mergeShallow, reconcile } from './state.js';
@@ -63,3 +68,29 @@ export type {
   StoreReader,
   StoreStatus,
 } from './types.js';
+export type { LeaveReason, StoreEvent } from './owner.js';
+export { MAX_EVENT_ROUNDS } from './owner.js';
+export {
+  addItems,
+  countItems,
+  emptyInventory,
+  hasItems,
+  InventoryError,
+  inventoryOf,
+  MAX_ITEM_ID_CHARS,
+  onlyOwn,
+  parseInventory,
+  removeItems,
+} from './inventory.js';
+export type { Inventory, InventoryErrorCode, InventoryRules } from './inventory.js';
+export {
+  assertHidden,
+  HIDDEN,
+  hiddenOr,
+  isHidden,
+  projectVisible,
+} from './visibility.js';
+export type { Hidden, Visibility, VisibilityPreset, VisibilityRule, VisibilityRules } from './visibility.js';
+export { cellKey, cellsAround, sameCells, stickyCells } from './interest.js';
+export type { CellOptions } from './interest.js';
+export { MAX_INTEREST_KEYS, MAX_INTEREST_KEY_BYTES } from './wire.js';

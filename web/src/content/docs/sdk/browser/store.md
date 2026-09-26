@@ -61,7 +61,7 @@ check all work without the store depending on any of them.
 | `initialState` | The document as it starts |
 | `maxEventBytes` | The largest frame your transport carries (the package's own tests and demo use 8104) |
 | `authorize` | Who may read, act or send an input — handed the **authenticated** peer |
-| `project` | What a given audience may see |
+| `project` | What a given audience may see — or `projectFor`, what a given player may see (exactly one) |
 | `actions` | One handler per declared action |
 | `inputs` | One handler per declared input |
 
@@ -117,6 +117,55 @@ what it was not given: the withheld part is absent from the frames, not hidden i
 the renderer. `replica.setAudience(names)` asks for a different audience and
 resolves when the new projection is installed.
 
+### Declared visibility
+
+A definition can declare its secrets instead, and the host enforces them after
+any hand-written projection — so code can narrow a rule, never widen it:
+
+```typescript
+defineStore({
+  /* … */
+  visibility: {
+    'players.*.hand': 'owner',   // the key matched by the first `*` must be the viewer's peer id
+    'deck': 'nobody',            // the host only
+    'deck.length': 'everyone',   // the count of a hidden array
+    'waypoint': ['command'],     // viewers reading any of these audiences
+  },
+});
+```
+
+Hidden entries of a collection (a path ending in `*`) are removed; hidden fields
+become the `HIDDEN` marker, so the state validator must accept it there —
+`hiddenOr(parse)` wraps a field's parser, and a host whose validator refuses the
+marker is refused at construction. Unlisted paths are visible. Presets: `'open'`
+(everything visible, stated rather than accidental) and `'card-game'`, which take
+overrides (`{ preset: 'card-game', 'players.*.score': 'nobody' }`). Rules are
+checked at `defineStore`: a malformed path, an `'owner'` rule with no `*`, or an
+unknown preset throws `invalid-data`. With declared visibility, `project` and
+`projectFor` are optional.
+
+`assertHidden(definition, state, viewer, paths)` throws if a viewer could read
+any of the paths — for tests. `hostStore({ dev: true })` (or a function) warns
+when every player would receive the whole state with no `visibility` declared,
+and when a projection fails the validator, which otherwise sends `empty()`
+silently.
+
+When the view depends on the player rather than the audience — each player's own
+hand — give `projectFor` instead of `project`. It receives the authenticated
+player with the audience they read:
+
+```typescript
+projectFor: (state, { peer, audience }) => ({
+  ...state,
+  hands: { [peer]: state.hands[peer] ?? [] },
+}),
+```
+
+`project` is computed once per distinct audience and shared; `projectFor` once
+per distinct player and audience, so it costs one projection per player per
+change. A player whose view did not change is sent nothing. A host given both,
+or neither, is refused with `invalid-data`.
+
 ## The transport, and one gate to know about
 
 A store needs a `StoreTransport` — the structural subset of the node that
@@ -133,7 +182,28 @@ game usually wants.
 
 A replica of the node it is running on is refused with `invalid-data` — a node
 has no session with itself, and refusing at construction beats a `no session with
-0x…` from inside the transport after the subscription was accepted.
+0x…` from inside the transport after the subscription was accepted. A host that
+is also a player uses `hostPlayer` instead (below).
+
+For development without an anchor, `@net-mesh/browser/local` provides a mesh
+inside one page. Each node it creates is a `StoreTransport`, so the store on top
+is the real one — frames are encoded, chunked and dispatched — while delivery is
+a function call and the peer on each frame is assigned rather than proved:
+
+```typescript
+import { createLocalMesh } from '@net-mesh/browser/local';
+
+const mesh = createLocalMesh();
+const hostNode = mesh.node();
+const guestNode = mesh.node();
+const host = hostStore({ definition, transport: hostNode, /* … */ });
+const guest = joinStore({ definition, transport: guestNode, host: hostNode.nodeIdHex(), /* … */ });
+```
+
+Local nodes also `announce` and `query` like a real node — a node finds the
+others' announcements, not its own, and an announcement expires unless it is
+refreshed — so discovery code runs offline unchanged. It is evidence about game
+logic, not about whether two browsers can reach each other.
 
 An announcement is a lease, so both sides re-announce on a timer; a joiner that
 looks a few seconds late otherwise reports that the host never announced.
@@ -162,6 +232,118 @@ last `StoreError`.
 A replica has **no `setState`**. That is a type-level fact rather than a runtime
 check: writes go through actions and inputs, and only the host's handle carries
 the setter.
+
+## Interest management
+
+A definition may name its top-level entity maps and how an entity is keyed —
+`interest: { ships: ship => cellKey(ship.x, ship.z, 32) }`, any string, `null`
+for "always delivered". A replica joined with `interest: [...]` (and the host's
+own player) then receives only the entities whose key is in its set:
+
+- **Per entity on the wire.** A change to an entity is sent as one op for that
+  entity, and only to players whose interest covers its old or new key; an
+  entity moving out of a player's set is removed from their view.
+- **`setInterest(keys)` is additive.** The host answers with one delta of the
+  entities entering and leaving, then an acknowledgement; the view never blanks.
+  (If that delta would not fit one message, the view is replaced whole, still
+  without a blank frame.) A later `join` or `resume` restates the current set.
+- **Bounds.** At most `MAX_INTEREST_KEYS` (256) keys of at most 64 bytes, and
+  the set must fit one message.
+- **A filter, not a permission.** Interest never calls `authorize`; what a
+  player may see at all is the audience, `project`/`projectFor` and
+  `visibility`, applied first.
+- **Host cost.** The view is still projected once per distinct audience (or
+  player, under `projectFor` / `owner` rules) per change; what interest removes
+  is the per-player serialization and the bytes.
+
+`cellKey`, `cellsAround(x, z, { size, radius })`, `stickyCells(previous, x, z, {
+size, radius, margin })` (hysteresis at cell borders) and `sameCells` are the
+grid helpers.
+
+A related fix: a delta's `base` is now the revision each replica is actually at,
+so a replica whose view did not change on a commit — sent nothing — applies the
+next delta directly instead of detecting a gap and re-fetching its whole view.
+
+## One hook for players: `onEvent`
+
+`onEvent(event, context)` is the host's single hook for what happens to players:
+
+| Event | When |
+| --- | --- |
+| `{ type: 'join', peer, audience }` | A player's first subscription is installed, or the host's own player starts |
+| `{ type: 'leave', peer, reason }` | Their last one ends: `left`, `expired`, `refused` (a kick or revoked read) or `dropped` (their view could not be delivered) |
+| `{ type: 'area', peer, from, to }` | `areaOf(state, peer)` answers differently than last time; `from` is `null` the first time |
+
+The hook runs on the host as one transaction with `context.peer` set to the
+player — the same contract as an action handler — so it can `setState`, and its
+changes reach every replica. It runs after the frame that caused the event, never
+during one. A throw discards its writes and is counted (`event-rejected`); hooks
+whose writes keep causing new events are stopped after `MAX_EVENT_ROUNDS` runs
+(`event-rounds-bound`). A closing store raises no events.
+
+## Inventories
+
+`Inventory` is plain JSON (item id → whole count ≥ 1). `addItems`,
+`removeItems`, `countItems`, `hasItems`, `inventoryOf` and `parseInventory` are
+pure functions with optional rules (`maxKinds`, `maxCount`); a change that breaks
+a rule throws `InventoryError` (`full`, `insufficient`, `invalid`), which inside
+a handler refuses the action with nothing written. `onlyOwn(byPeer, peer)` is the
+`projectFor` helper that leaves only the viewer's entry, so another player's
+inventory is never sent. Trading is not built yet.
+
+## Lobbies
+
+`createLobby`, `listLobbies` and `joinLobby` are a layer over the store and
+discovery, with no protocol of their own:
+
+```typescript
+const lobby = await createLobby({ node, game: 'arena', name: 'Friday arena', capacity: 8,
+  definition, initialState, project, actions, inputs });
+const lobbies = await listLobbies({ node, game: 'arena' });
+const world = await joinLobby({ node, definition, game: 'arena', code: lobby.code });
+```
+
+A lobby is found through capability tags in the host's signed announcement: a
+listing tag, a record (code, name, players, capacity, store version and up to 256
+bytes of the game's own `info`; at most 512 bytes in all), and a hash of the
+code. Unlisted lobbies publish only the hash. The record is the host's claim and
+is validated before it is shown; the host id is taken from the signed
+announcement. A code claimed by two nodes is refused (`ambiguous`) rather than
+resolved.
+
+Capacity and kicks are enforced in front of the game's `authorize`, counted from
+the store's live subscriptions; `lobby.kick(peer)` re-checks every installed
+subscription at once. `lobby.self` is the host's own player (below).
+
+## The host's own player
+
+`hostPlayer(host, { audience })` returns the same handle shape as `joinStore`,
+for the node that hosts the store:
+
+```typescript
+const me = hostPlayer(host, { audience: ['crew'] });
+await me.ready();
+await me.act('enlist', {});
+```
+
+It is held to parity with a replica rather than trusted:
+
+- **The same policy.** Reads, actions and inputs go to the host's `authorize`,
+  with the host's own node id as `peer`.
+- **The same transaction.** Input validation, the handler, output validation and
+  the result's message budget run in one transaction, and the change reaches
+  every replica.
+- **The same values.** A value the wire would refuse (`NaN`, a cycle) is refused
+  with `invalid-data`.
+- **The same view.** `getState()` is the projection for its audience, not the
+  authoritative document, so the host's page renders what a player would.
+
+Calls settle a turn later, as a replica's do, so a call started inside a handler
+runs as its own transaction. When the host closes, the player's phase becomes
+`closed` and its calls reject with `owner-lost`.
+
+The projection keeps the host's own UI honest; it does not hide anything from
+the person running the host, whose page holds the whole document.
 
 ## Codes to branch on
 

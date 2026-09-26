@@ -280,6 +280,10 @@ pub struct BootstrapConfig {
     pub acme_challenge_addr: SocketAddr,
     /// Renew this long before the certificate expires (R4c).
     pub acme_renewal_horizon: Duration,
+    /// Anonymous visitor credentials, served as `POST /credential`.
+    /// `None` (the default) serves no such route: credentials are then
+    /// minted out of band (`net-mesh anchor credential mint`).
+    pub credential_issuance: Option<CredentialIssuance>,
 }
 
 impl BootstrapConfig {
@@ -304,7 +308,69 @@ impl BootstrapConfig {
             acme: AcmeState::new(),
             acme_challenge_addr: SocketAddr::from(([0, 0, 0, 0], 80)),
             acme_renewal_horizon: crate::rtc_bootstrap_acme::DEFAULT_RENEWAL_HORIZON,
+            credential_issuance: None,
         }
+    }
+}
+
+/// Default per-source-IP `POST /credential` ceiling per minute.
+pub const DEFAULT_CREDENTIALS_PER_IP_PER_MINUTE: u32 = 30;
+/// Upper bound on a `POST /credential` body.
+const MAX_CREDENTIAL_REQUEST_BYTES: usize = 1024;
+
+/// What `POST /credential` needs: which games this anchor admits, the
+/// key credentials are signed with, and how long they live.
+///
+/// Every credential is **anonymous and per visitor**: a fresh
+/// single-use invite for the requested game (see
+/// [`crate::game_anchor`]). Issuance is limited per game by the
+/// registry and per source IP here.
+#[derive(Clone)]
+pub struct CredentialIssuance {
+    /// The games, their roots, limits and counters.
+    pub registry: Arc<crate::game_anchor::GameRegistry>,
+    /// The key credentials are signed with. Its public half must be
+    /// [`BootstrapConfig::credential_issuer`], or the listener would
+    /// hand out credentials it then refuses —
+    /// [`serve_bootstrap`] checks.
+    pub issuer: crate::identity::Identity,
+    /// This listener's externally reachable URL, written into every
+    /// credential.
+    pub bootstrap_url: String,
+    /// Lifetime of each credential's single-use invite.
+    pub invite_ttl: Duration,
+    /// Lifetime of each credential's standing half.
+    pub psk_ttl: Duration,
+    /// Per-source-IP ceiling, credentials per minute.
+    pub per_ip_per_minute: u32,
+}
+
+impl CredentialIssuance {
+    /// Issuance with the default lifetimes and per-IP ceiling.
+    pub fn new(
+        registry: Arc<crate::game_anchor::GameRegistry>,
+        issuer: crate::identity::Identity,
+        bootstrap_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            registry,
+            issuer,
+            bootstrap_url: bootstrap_url.into(),
+            invite_ttl: crate::game_anchor::DEFAULT_INVITE_TTL,
+            psk_ttl: crate::game_anchor::DEFAULT_PSK_TTL,
+            per_ip_per_minute: DEFAULT_CREDENTIALS_PER_IP_PER_MINUTE,
+        }
+    }
+}
+
+impl fmt::Debug for CredentialIssuance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CredentialIssuance")
+            .field("registry", &self.registry)
+            .field("issuer", self.issuer.entity_id())
+            .field("bootstrap_url", &self.bootstrap_url)
+            .field("per_ip_per_minute", &self.per_ip_per_minute)
+            .finish_non_exhaustive()
     }
 }
 
@@ -328,6 +394,10 @@ pub enum BootstrapRefusal {
     ForbiddenOrigin,
     /// The named dialog does not exist on this anchor.
     UnknownDialog,
+    /// `POST /credential` named a game this anchor does not admit.
+    UnknownGame,
+    /// A request body was not the expected JSON.
+    MalformedRequest,
 }
 
 impl BootstrapRefusal {
@@ -337,7 +407,7 @@ impl BootstrapRefusal {
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::AtCapacity => StatusCode::SERVICE_UNAVAILABLE,
             Self::ForbiddenOrigin => StatusCode::FORBIDDEN,
-            Self::UnknownDialog => StatusCode::NOT_FOUND,
+            Self::UnknownDialog | Self::UnknownGame => StatusCode::NOT_FOUND,
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -540,7 +610,7 @@ impl fmt::Debug for Attempts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let guard = self.by_token.lock();
         f.debug_map()
-            .entries(guard.iter().map(|(_, attempt)| ("<redacted>", attempt)))
+            .entries(guard.values().map(|attempt| ("<redacted>", attempt)))
             .finish()
     }
 }
@@ -616,6 +686,14 @@ struct AppState {
     acme: AcmeState,
     dialogs: Arc<AtomicU64>,
     attempts: Arc<Attempts>,
+    issuance: Option<Arc<Issuance>>,
+}
+
+/// [`CredentialIssuance`] resolved against the running node.
+struct Issuance {
+    config: CredentialIssuance,
+    params: crate::game_anchor::AnchorCredentialParams,
+    rate: RateLimiter,
 }
 
 /// Fixed-window per-source-IP counter. Deliberately not a token
@@ -668,6 +746,7 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([axum::http::header::CONTENT_TYPE])
         .allow_origin(tower_http::cors::AllowOrigin::list(origins));
+    let noise_pubkey = *node.public_key();
     let state = AppState {
         node,
         psk: Arc::new(config.psk.clone()),
@@ -677,6 +756,19 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
         acme: config.acme.clone(),
         dialogs: Arc::new(AtomicU64::new(1)),
         attempts: Arc::new(Attempts::default()),
+        issuance: config.credential_issuance.clone().map(|issuance| {
+            Arc::new(Issuance {
+                params: crate::game_anchor::AnchorCredentialParams {
+                    noise_pubkey,
+                    psk: config.psk.clone(),
+                    bootstrap_url: issuance.bootstrap_url.clone(),
+                    invite_ttl: issuance.invite_ttl,
+                    psk_ttl: issuance.psk_ttl,
+                },
+                rate: RateLimiter::new(issuance.per_ip_per_minute),
+                config: issuance,
+            })
+        }),
     };
     // The trickle socket's `Origin` check is a LAYER, not a line in
     // the handler: an axum extractor rejection (`426`, "not a
@@ -778,16 +870,85 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
             }
         },
     ));
-    Router::new()
+    let serves_credentials = state.issuance.is_some();
+    let router = Router::new()
         .route("/rtc/offer", post(post_offer))
         .route("/rtc/anchor", get(get_anchor))
         .route("/rtc/trickle", trickle)
         .route(
             "/.well-known/acme-challenge/{token}",
             get(get_acme_challenge),
-        )
-        .layer(cors)
-        .with_state(state)
+        );
+    let router = if serves_credentials {
+        router.route("/credential", post(post_credential))
+    } else {
+        router
+    };
+    router.layer(cors).with_state(state)
+}
+
+/// `POST /credential` — `{"game": "<id>"}` in, a fresh anonymous
+/// visitor credential out:
+///
+/// ```json
+/// { "credentialB64": "net-bootstrap:…", "bootstrapUrl": "https://…", "game": "my-game" }
+/// ```
+///
+/// `credentialB64` and `bootstrapUrl` are exactly what `@net-mesh/browser`'s
+/// `connect()` takes. The credential's invite is single-use, so a page
+/// fetches one per `connect()`. Refusals: `unknown_game` (404),
+/// `rate_limited` (429, per source IP or per game), `malformed_request`.
+async fn post_credential(
+    State(state): State<AppState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    body: String,
+) -> Response {
+    #[derive(Deserialize)]
+    struct CredentialRequest {
+        game: String,
+    }
+    let Some(issuance) = state.issuance.as_ref() else {
+        // Unreachable: the route exists only with issuance configured.
+        return refuse(
+            BootstrapRefusal::UnknownGame,
+            "this anchor issues no credentials",
+        );
+    };
+    if body.len() > MAX_CREDENTIAL_REQUEST_BYTES {
+        return refuse(
+            BootstrapRefusal::MalformedRequest,
+            "the request body is over the bound",
+        );
+    }
+    let Ok(request) = serde_json::from_str::<CredentialRequest>(&body) else {
+        return refuse(
+            BootstrapRefusal::MalformedRequest,
+            "expected {\"game\": \"<id>\"}",
+        );
+    };
+    if !issuance.rate.allow(remote.ip(), Instant::now()) {
+        return refuse(
+            BootstrapRefusal::RateLimited,
+            "too many credential requests from this address",
+        );
+    }
+    use crate::game_anchor::GameAnchorError;
+    match issuance.config.registry.issue_credential(
+        &request.game,
+        &issuance.config.issuer,
+        &issuance.params,
+    ) {
+        Ok(credential) => Json(serde_json::json!({
+            "credentialB64": credential.encode(),
+            "bootstrapUrl": issuance.params.bootstrap_url,
+            "game": request.game,
+        }))
+        .into_response(),
+        Err(e @ GameAnchorError::RateLimited(_)) => {
+            refuse(BootstrapRefusal::RateLimited, e.to_string())
+        }
+        Err(e) => refuse(BootstrapRefusal::UnknownGame, e.to_string()),
+    }
 }
 
 /// Start the listener. Returns once the socket is bound, so a caller
@@ -796,6 +957,15 @@ pub async fn serve_bootstrap(
     node: Arc<MeshNode>,
     config: BootstrapConfig,
 ) -> Result<BootstrapHandle, BootstrapError> {
+    if let Some(issuance) = &config.credential_issuance {
+        if issuance.issuer.entity_id() != &config.credential_issuer {
+            return Err(BootstrapError::Config(
+                "the credential issuance key is not the credential issuer this listener \
+                 verifies: every credential it issued would be refused at /rtc/offer"
+                    .into(),
+            ));
+        }
+    }
     let (initial, challenge_task) = tls_acceptor(&config).await?;
     // **R4c: the acceptor is swappable.** A static one meant the
     // certificate a process started with was the certificate it died
@@ -964,6 +1134,9 @@ pub enum BootstrapError {
     /// ACME could not obtain a certificate.
     #[error("bootstrap ACME: {0}")]
     Acme(String),
+    /// The configuration contradicts itself.
+    #[error("bootstrap config: {0}")]
+    Config(String),
 }
 
 /// Cancel a task and WAIT for it to be gone.

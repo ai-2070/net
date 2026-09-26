@@ -68,28 +68,50 @@ Net needs two things that don't come from the page:
 2. **A credential per player** — a string the anchor issues, which the page
    passes to `connect()`.
 
-**Today, the anchor that works with browsers is the browser-demo host in this
-repository.** The general-purpose `net-mesh anchor serve` command doesn't yet
-accept browser players (they connect, then time out). To run one locally:
+**Run an anchor for your game** with the `net-mesh` CLI. It needs a TLS
+certificate browsers trust, the page's origin, a pre-shared key file, and an
+issuer key file (`net-mesh identity generate --out issuer.toml`):
 
 ```sh
-git clone https://github.com/ai-2070/net
-cd net/net/crates/net
-cargo run --release --manifest-path examples/browser-demo/host/Cargo.toml -- \
-  --headless --seconds 600
+net-mesh anchor serve --psk-file psk.hex   --url https://anchor.example.com --tls-cert cert.pem --tls-key key.pem   --allow-origin https://game.example.com   --issuer-identity issuer.toml --game my-game
 ```
 
-It prints its address and hands out a credential per player:
+**Each player gets their own credential from it**, anonymously — no sign-up.
+`rememberedIdentity()` keeps the player the same across visits:
 
-```sh
-curl -s "http://localhost:<port>/config?tab=1" | jq -r .credentialB64
+```js
+import { connect, rememberedIdentity, requestCredential } from '@net-mesh/browser';
+
+const { credentialB64, bootstrapUrl } = await requestCredential({
+  anchorUrl: 'https://anchor.example.com',
+  game: 'my-game',
+});
+const node = await connect({ credentialB64, bootstrapUrl, ...rememberedIdentity() });
 ```
 
-> **Building the game before you have an anchor?** The demo in
-> [`demo/`](https://github.com/ai-2070/net/tree/master/net/crates/net/browser-ts/demo)
-> runs a host and two players in a single page with no network at all, using the
-> real store. Use it to build your game logic, then switch to a real anchor for
-> actual multiplayer.
+- A player is a **browser profile**: clearing site data makes a new player,
+  and one person on two devices is two players.
+- A credential is one player's: the anchor refuses it from anyone else.
+- One anchor can serve several games (repeat `--game`), but it does not yet
+  keep one game's players out of another's discovery; run one anchor per game
+  for now.
+
+> **Building the game before you have an anchor?** `@net-mesh/browser/local`
+> is a mesh inside one page: no anchor, no network, and the real store on top.
+>
+> ```js
+> import { createLocalMesh } from '@net-mesh/browser/local';
+>
+> const mesh = createLocalMesh();
+> const node = mesh.node();          // use it wherever this guide uses `node`
+> const friend = mesh.node();        // a second player, in the same page
+> ```
+>
+> Local nodes can `announce` and `query` too, so step 3's host-finding code
+> works unchanged. Build your game logic this way, then swap in `connect()` for real
+> multiplayer. It proves your rules work, not that two browsers can reach each
+> other. The [`demo/`](https://github.com/ai-2070/net/tree/master/net/crates/net/browser-ts/demo)
+> runs a host and two players like this.
 
 ---
 
@@ -114,6 +136,7 @@ export const arena = defineStore({
   version: 1,
   state: v => ({ ships: v?.ships ?? {} }),   // the whole world
   empty: () => ({ ships: {} }),              // what a player sees before joining
+  visibility: 'open',                        // every player sees every ship — see "Hidden information"
   actions: {
     // Something that needs an answer. `enlist` gives the sender a ship…
     enlist: {
@@ -136,11 +159,16 @@ export const arena = defineStore({
 ### 2. Connect
 
 ```js
-import { connect } from '@net-mesh/browser';
+import { connect, rememberedIdentity, requestCredential } from '@net-mesh/browser';
 
+const { credentialB64, bootstrapUrl } = await requestCredential({
+  anchorUrl: 'https://anchor.example.com',
+  game: 'my-game',
+});
 const node = await connect({
-  credentialB64,   // the credential the anchor issued for this player
-  bootstrapUrl,    // the anchor's address (optional — the credential carries it)
+  credentialB64,           // this player's credential, from your anchor
+  bootstrapUrl,            // the anchor's address
+  ...rememberedIdentity(), // the same player on every visit
 });
 
 const myId = node.nodeIdHex();   // this player's id, shared with whoever joins
@@ -164,9 +192,6 @@ const host = hostStore({
   // Who may do what. Here: no shooting yourself.
   authorize: request =>
     request.type !== 'action' || request.input.at !== request.peer,
-
-  // What each player may see. Everyone sees every ship here.
-  project: (state, audience) => state,
 
   actions: {
     enlist: (input, context) => {
@@ -204,6 +229,20 @@ const TAG = 'my-game.host';
 await node.announce([TAG]);
 setInterval(() => node.announce([TAG]).catch(() => {}), 2_000);
 ```
+
+The host is usually a player too. A page can't join its own world, so it plays
+through `hostPlayer` — the same kind of handle joined players get, held to the
+same `authorize` rules and seeing the same projected view:
+
+```js
+import { hostPlayer } from '@net-mesh/browser';
+
+const world = hostPlayer(host, { audience: ['crew'] });
+await world.ready();
+await world.act('enlist', {});     // same rules as everyone else
+```
+
+From here on, the host's page and every other page use `world` the same way.
 
 ### 3b. Join the world (on everyone else's page)
 
@@ -243,7 +282,7 @@ const geometry = new THREE.ConeGeometry(0.4, 1, 8);   // shared by every ship
 const material = new THREE.MeshStandardMaterial({ color: 0x44aaff });
 
 const ships = bindEntities({
-  store: world,                   // a joined world, or the `host` itself
+  store: world,                   // `hostPlayer(host)` or `joinStore(…)` — same code
   scene,
   select: state => state.ships,   // the entities to draw, by id
   binding: {
@@ -283,15 +322,146 @@ try {
 }
 ```
 
-> **The hosting player doesn't join its own world** — a page can't connect to
-> itself. On the host's page, render from `host` directly
-> (`bindEntities({ store: host, … })`) and apply that player's moves on the host.
-> The demo's
-> [`main.js`](https://github.com/ai-2070/net/blob/master/net/crates/net/browser-ts/demo/main.js)
-> shows a small helper that does this and applies the same `authorize` rules to
-> the host's own player.
-
 ---
+
+## Big worlds: send each player only what's near them
+
+In a large world, a player doesn't need every ship — only the ones nearby. Tell
+the definition how to place an entity on a grid, and each player asks for the
+cells around them:
+
+```js
+import { cellKey, cellsAround, stickyCells, sameCells } from '@net-mesh/browser';
+
+const arena = defineStore({
+  // …
+  interest: { ships: ship => cellKey(ship.x, ship.z, 32) },   // 32-unit grid cells
+});
+
+const world = joinStore({ /* … */ interest: cellsAround(me.x, me.z, { size: 32 }) });
+
+// As the player moves:
+let cells = cellsAround(me.x, me.z, { size: 32 });
+function onMove() {
+  const next = stickyCells(cells, me.x, me.z, { size: 32 });
+  if (!sameCells(next, cells)) { cells = next; world.setInterest(cells); }
+}
+```
+
+- Ships entering the player's cells appear and ships leaving disappear in one
+  update — the world never blanks while the player crosses a border — and
+  `bindEntities` adds and removes them from the scene as usual.
+- Changes far away send that player nothing at all.
+- `stickyCells` keeps a cell the player just left until they're a cell past it,
+  so walking along a border doesn't flicker.
+- An interest key is any string — a room name works as well as a grid cell. An
+  entity whose key function returns `null` goes to everyone.
+- Interest decides what's *near*, not what's *allowed*: secrets still belong in
+  `visibility`.
+
+## Reacting to players: one hook
+
+Give the host an `onEvent` and it hears everything that happens to a player —
+someone joins, someone leaves, someone walks into a different area. It runs on
+the host like an action handler, so it can change the world, and every player
+sees the change:
+
+```js
+const host = hostStore({
+  // …the options from step 3a…
+  areaOf: (state, peer) => (state.ships[peer]?.x ?? 0) < 50 ? 'harbour' : 'open-sea',
+  onEvent: (event, context) => {
+    const state = context.getState();
+    switch (event.type) {
+      case 'join':   // a new player: a starter kit (add `inventories: {}` to your state)
+        context.setState({ inventories: { ...state.inventories,
+          [event.peer]: addItems(emptyInventory(), 'torpedo', 3) } });
+        break;
+      case 'leave':  // event.reason: 'left', 'expired', 'refused' (kicked) or 'dropped'
+        break;
+      case 'area':   // event.from → event.to, e.g. 'harbour' → 'open-sea'
+        break;
+    }
+  },
+});
+```
+
+- `join` and `leave` are per player, and include the host's own player.
+- `area` fires only when `areaOf`'s answer changes — the first time with
+  `from: null`. An area is any string you like: a zone, a room, a grid cell.
+- A hook that throws changes nothing. Keep it quick and synchronous, like a
+  handler.
+
+## Inventories (the basics)
+
+An inventory is plain data in your world — item id → count — and the helpers
+change it only on the host, refusing what breaks the rules:
+
+```js
+import { addItems, removeItems, countItems, hasItems, emptyInventory,
+         inventoryOf, onlyOwn, parseInventory } from '@net-mesh/browser';
+
+const rules = { maxKinds: 20, maxCount: { torpedo: 10 } };
+
+actions: {
+  fireTorpedo: (input, context) => {
+    const inventories = { ...context.getState().inventories };
+    // Throws when the player has none, which refuses the action and changes nothing.
+    inventories[context.peer] = removeItems(inventoryOf(inventories, context.peer), 'torpedo', 1);
+    context.setState({ inventories });
+    return { left: countItems(inventories[context.peer], 'torpedo') };
+  },
+},
+// Each player sees their own inventory and nobody else's:
+projectFor: (state, { peer }) => ({ ...state, inventories: onlyOwn(state.inventories, peer) }),
+```
+
+Use `parseInventory(value, rules)` inside your store's `state` validator. Trading
+between players is not built yet.
+
+## Lobbies: a list, a code, a link
+
+Steps 3a and 3b find each other by hand. A lobby does it for you: the host opens
+one, other players pick it from a list or type its code, and the host keeps
+playing in its own world.
+
+```js
+import { createLobby, listLobbies, joinLobby, lobbyCodeFromUrl } from '@net-mesh/browser';
+
+// Host page: the same store options as step 3a, plus a game name, a lobby name and a size.
+const lobby = await createLobby({
+  node, game: 'my-game', name: 'Friday arena', capacity: 8,
+  info: { map: 'dunes' },           // small public fields your list can show
+  definition: arena, initialState: { ships: {} },
+  actions, inputs,
+});
+lobby.code;                         // 'K7QP2M' — read it out, or share lobby.link()
+const world = lobby.self;           // the host's own player
+lobby.subscribePlayers(players => showPlayers(players));
+```
+
+```js
+// Everyone else: pick from the list…
+const lobbies = await listLobbies({ node, game: 'my-game' });
+// [{ code, name, players, capacity, info, host, store }]
+const world = await joinLobby({ node, definition: arena, game: 'my-game', lobby: lobbies[0] });
+// …or by typed code, or from the link: { …, code: 'K7QP2M' } / { …, code: lobbyCodeFromUrl() }
+await world.ready();
+```
+
+- **Full lobbies turn players away** (`ready()` rejects with `forbidden`); the
+  host counts as one of `capacity`. `lobby.kick(playerId)` removes a player at
+  once and keeps them out.
+- **`visibility: 'unlisted'`** keeps a lobby out of the list; it is joined by
+  code or link only. Unlisted is not a password — anyone with the code can
+  try, and your `authorize` decides who gets in.
+- **A lobby list is what hosts claim about themselves.** Names and player counts
+  come from the host's own announcement; the host id does not, it is proven. If
+  two hosts claim one code, `joinLobby` refuses (`ambiguous`) rather than guess.
+- **One lobby per node** — a lobby owns the node's announcements while it is
+  open. `lobby.close()` withdraws it.
+- It all works on `@net-mesh/browser/local` too, so you can build the lobby
+  screen before you have an anchor.
 
 ## Things worth knowing
 
@@ -301,10 +471,45 @@ answers. It tells you only what happened locally (`queued`, `replaced`, or
 your game so that's fine. `world.act(name, input)` returns a promise with the
 host's answer, or rejects with a reason.
 
-**Hidden information.** A joining player asks for an *audience* (`['crew']`).
-The host's `project(state, audience)` returns what that audience may see. Leave
-secret things out of the returned state (or set them to `null`). Hidden data is
-never sent, so it isn't sitting in the page waiting to be found.
+**Hidden information.** Say what is secret on the definition, and the host
+removes it from every player's copy before anything is sent — it is never in
+their page to be found:
+
+```js
+import { defineStore, hiddenOr } from '@net-mesh/browser';
+
+defineStore({
+  // …
+  visibility: {
+    'players.*.hand': 'owner',     // only the player whose id is that key
+    'deck':           'nobody',    // only the host
+    'deck.length':    'everyone',  // …but everyone may count the cards
+    'waypoint':       ['command'], // players who joined with the 'command' audience
+  },
+  // A hidden field arrives as the HIDDEN marker, so let your validator accept it:
+  state: v => ({ /* … */ hand: hiddenOr(parseHand)(v.hand) }),
+});
+```
+
+- **`'owner'` needs no setup**: the key matched by the first `*` is the player's
+  id, which is how games already key players (`ships[context.peer]`).
+- **Hidden entries of a collection are removed; hidden fields become `HIDDEN`**
+  (check with `isHidden(value)`), never a fake `0` or `""` your game would believe.
+- **Presets**: `visibility: 'open'` says "everyone sees everything" on purpose,
+  and `'card-game'` hides hands (owner) and the deck (nobody, count visible).
+  Add overrides: `{ preset: 'card-game', 'players.*.score': 'nobody' }`.
+- **Prove it in a test** with `assertHidden(definition, state, { peer, audience },
+  ['players.bob.hand'])`, and pass `dev: true` to `hostStore` while developing:
+  it warns if every player is getting the whole world without you saying so.
+- **The host sees everything.** If the host is a player, that player can read
+  every secret in their own browser. Games with real stakes need a host that
+  isn't a player: run the same `hostStore` on a server with `@net-mesh/sdk`'s
+  `meshStoreTransport` — your pages join it exactly as they join a player's.
+
+For views the rules can't express, write the projection yourself:
+`project(state, audience)` (one view per audience) or `projectFor(state, { peer,
+audience })` (one per player). The declared rules still apply after it, so your
+code can hide more but never reveal a declared secret.
 
 **One tab per player.** All tabs of the same site in one browser profile share a
 single identity, so two tabs are the *same* player — and a player can't join

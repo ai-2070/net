@@ -54,16 +54,26 @@ signature. `credential mint` / `inspect` need no extra feature; the anchor's
 live verbs (`ls`, `stats`, `serve`) need the CLI's `rtc-bootstrap` feature —
 standard CLI packaging does not include them.
 
-**`net-mesh anchor serve` cannot host a browser today.** It serves the bootstrap
-listener but registers no enrollment service, so a page's `connect()` times out
-with `rpc-timeout`. The only anchor a page can use is the browser-demo host —
-from the Rust workspace root (net/crates/net):
+**A game's anchor issues credentials itself.** With `--game` (and the issuer's
+key file, `--issuer-identity`), `net-mesh anchor serve` serves enrollment and
+`POST <url>/credential {"game"}`:
 
 ```sh
-cargo run --release --manifest-path examples/browser-demo/host/Cargo.toml -- --headless --seconds 600
+net-mesh anchor serve --psk-file psk.hex \
+  --url https://anchor.example.com --tls-cert cert.pem --tls-key key.pem \
+  --allow-origin https://game.example.com \
+  --issuer-identity issuer.toml --game my-game
 ```
 
-It serves `GET /config?tab=N`, whose JSON carries a `credentialB64` per tab.
+A page calls `requestCredential({ anchorUrl, game })` and passes the result to
+`connect()` with `...rememberedIdentity()`. Each credential is anonymous and
+binds to the first identity that enrolls with it (which may reconnect with it
+for 12 h); another identity presenting it is refused as a replay, surfacing
+from `connect()` as `identity: the anchor rejected enrollment: replay`.
+Without `--game` the anchor registers no enrollment service and `connect()`
+times out with `rpc-timeout`. Games are not yet isolated from each other on
+one anchor, so run one per game. `examples/anchor-acceptance` runs the whole
+flow with two real browsers.
 
 **ICE configuration.** `iceServers` is optional with a working default: omitted,
 the leaf gathers against the `stun_addr` the anchor announces on `GET

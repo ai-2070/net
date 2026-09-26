@@ -109,6 +109,8 @@ export interface ReplicaDeps<S extends object, A extends ActionSpec, I extends I
   readonly store: string;
   /** The opaque join key the owner's policy reads. */
   readonly key: string;
+  /** The interest set to join with; absent: every entity. */
+  readonly interest?: readonly string[];
 }
 
 /**
@@ -174,6 +176,22 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
 
   constructor(private readonly deps: ReplicaDeps<S, A, I>) {
     this.#desired = [...deps.audience];
+    this.#interest = deps.interest === undefined ? null : [...deps.interest];
+  }
+
+  #interest: readonly string[] | null;
+
+  /**
+   * The caller's desired interest set, stated by every later `join` and
+   * `resume` so a rejoin never falls back to an older one. `null`: none
+   * declared, every entity delivered.
+   */
+  get interest(): readonly string[] | null {
+    return this.#interest === null ? null : [...this.#interest];
+  }
+
+  set interest(keys: readonly string[] | null) {
+    this.#interest = keys === null ? null : [...keys];
   }
 
   /** The caller's latest desired audience. */
@@ -260,6 +278,7 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
         ver: this.deps.definition.version,
         key: this.deps.key,
         aud: [...this.#desired],
+        ...(this.#interest === null ? {} : { int: [...this.#interest] }),
       }),
     };
   }
@@ -348,7 +367,17 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     this.#state = 'installing';
     this.deps.core.setStatus({ phase: 'reconnecting', stale: this.#published() });
     return [
-      { kind: 'resume', q, frame: encodeMessage({ k: 'resume', q, h, aud: [...this.#desired] }) },
+      {
+        kind: 'resume',
+        q,
+        frame: encodeMessage({
+          k: 'resume',
+          q,
+          h,
+          aud: [...this.#desired],
+          ...(this.#interest === null ? {} : { int: [...this.#interest] }),
+        }),
+      },
     ];
   }
 
@@ -558,13 +587,16 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
       raw => this.deps.definition.state(raw),
       this.deps.now(),
     );
-    // No epoch check here, and not for want of trying: a
-    // cancellation from the VALIDATOR is caught by the one in
-    // `#install` — the epoch it compares moved for the validator's
-    // cancellation exactly as it does for a subscriber's — and I
-    // could not construct an observable the two answer differently,
-    // including the notification count. An inverse that goes green is
-    // a guard that is not there, so it is not there.
+    // A cancellation from the VALIDATOR, noticed before anything is
+    // published. `#install`'s own epoch check runs only AFTER
+    // `applySnapshot` has notified subscribers, so leaving this to it
+    // handed every subscriber the cancelled world and then an empty
+    // one. That went unobserved for as long as the owner's projection
+    // happened to call the shared validator first and spent the
+    // cancellation there; once an identity projection stopped
+    // re-validating, "stays fenced when the definition cancels while
+    // validating" saw `[5, 0]`.
+    if (this.#epoch !== epoch) return this.#drop('superseded-installation');
     if (!outcome.ok) {
       // A fatal refusal has destroyed the assembly; a non-fatal one
       // (a duplicate) leaves it open and is only counted.

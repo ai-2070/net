@@ -497,3 +497,11 @@ pub fn delegate_token(
 pub fn channel_hash(channel: &str) -> PyResult<u64> {
     channel_to_hash(channel)
 }
+
+/// The stream id a label names — the same derivation the browser leaf
+/// uses, so a native node and a page that agree on a label open the same
+/// stream. Any string is a label; nothing is validated.
+#[pyfunction]
+pub fn stream_id_from_label(label: &str) -> u64 {
+    net::adapter::net::stream_id_from_label(label)
+}

@@ -16,7 +16,11 @@ mod blob;
 #[cfg(feature = "net")]
 mod capabilities;
 mod capability_aggregation;
+// `net` is in the list because the mesh surface itself (`open_stream`,
+// `on_stream_data`, …) converts its BigInt ids here: a `--features net`
+// build without it did not compile.
 #[cfg(any(
+    feature = "net",
     feature = "meshdb",
     feature = "cortex",
     feature = "compute",
@@ -60,7 +64,12 @@ mod org;
 // SDK surface, mirroring the Python binding).
 #[cfg(feature = "delegation")]
 mod enrollment;
-#[cfg(feature = "net")]
+// The gang surface is ONE `#[napi] impl NetMesh` gated on these
+// features; under `net` alone every item in the module was dead.
+#[cfg(all(
+    feature = "net",
+    any(feature = "compute", feature = "cortex", feature = "aggregator")
+))]
 mod gang;
 #[cfg(feature = "groups")]
 mod groups;
@@ -1100,6 +1109,63 @@ mod mesh_bindings {
         pub fairness_weight: Option<u8>,
     }
 
+    /// One event on a stream registered with `onStreamData`, with the
+    /// peer whose SESSION decrypted it — the authenticated sender, never
+    /// a value the packet carries. `poll` / `pollShard` cannot offer this:
+    /// their events have no sender.
+    #[napi(object)]
+    pub struct StreamDataEvent {
+        /// The authenticated sender's node id.
+        pub peer_node_id: BigInt,
+        /// The stream it arrived on.
+        pub stream_id: BigInt,
+        /// One event's payload.
+        pub payload: Buffer,
+    }
+
+    /// Returned by `onStreamData`. `close()` stops delivery; the stream's
+    /// events go back to the shard queue.
+    #[napi]
+    pub struct StreamDataSubscription {
+        // Weak: a live subscription must not keep the node alive past
+        // `shutdown()` (an outstanding strong reference makes shutdown
+        // fail).
+        node: std::sync::Weak<MeshNode>,
+        stream_id: u64,
+        registration_id: u64,
+        closed: std::sync::atomic::AtomicBool,
+    }
+
+    #[napi]
+    impl StreamDataSubscription {
+        /// The stream this subscription receives.
+        #[napi(getter)]
+        pub fn stream_id(&self) -> BigInt {
+            BigInt::from(self.stream_id)
+        }
+
+        /// Stop delivering. Idempotent; `true` only for the call that
+        /// removed the registration.
+        #[napi]
+        pub fn close(&self) -> bool {
+            if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return false;
+            }
+            match self.node.upgrade() {
+                Some(node) => node.unregister_stream_inbound(self.stream_id, self.registration_id),
+                None => false,
+            }
+        }
+    }
+
+    type StreamDataTsfn = napi::threadsafe_function::ThreadsafeFunction<
+        StreamDataEvent,
+        (),
+        StreamDataEvent,
+        napi::Status,
+        false,
+    >;
+
     /// Handle to an open stream. Opaque to JS callers; pass back to
     /// `sendOnStream` / `sendWithRetry` / `sendBlocking` / `closeStream`.
     #[napi]
@@ -2090,6 +2156,50 @@ mod mesh_bindings {
             let stream_u64 = crate::common::bigint_u64(stream_id)?;
             node.close_stream(peer_u64, stream_u64);
             Ok(())
+        }
+
+        /// Receive every event arriving on `streamId`, from any peer,
+        /// WITH the authenticated sender — instead of the shard queue
+        /// (`poll`), whose events carry none.
+        ///
+        /// This is what a consumer that authorizes by peer needs: a
+        /// native host serving the browser store, for one. `handler` is
+        /// called on the JS thread, once per event, in delivery order.
+        /// One subscription per stream id: a second one throws until the
+        /// first is closed.
+        #[napi]
+        pub fn on_stream_data(
+            &self,
+            stream_id: BigInt,
+            handler: Function<'_, StreamDataEvent, ()>,
+        ) -> Result<StreamDataSubscription> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let stream_u64 = crate::common::bigint_u64(stream_id)?;
+            let tsfn: StreamDataTsfn = handler.build_threadsafe_function().build()?;
+            let sink: ::net::adapter::net::StreamInboundSink = std::sync::Arc::new(move |event| {
+                let _ = tsfn.call(
+                    StreamDataEvent {
+                        peer_node_id: BigInt::from(event.from_node),
+                        stream_id: BigInt::from(event.stream_id),
+                        payload: event.payload.to_vec().into(),
+                    },
+                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            });
+            let registration_id =
+                node.register_stream_inbound(stream_u64, sink)
+                    .ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "onStreamData: stream {stream_u64:#x} already has a subscription"
+                        ))
+                    })?;
+            Ok(StreamDataSubscription {
+                node: std::sync::Arc::downgrade(node),
+                stream_id: stream_u64,
+                registration_id,
+                closed: std::sync::atomic::AtomicBool::new(false),
+            })
         }
 
         /// Send a batch of events on an explicit stream.

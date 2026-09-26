@@ -19,6 +19,7 @@
 package net
 
 import (
+	"errors"
 	"math"
 	"testing"
 	"unsafe"
@@ -65,5 +66,22 @@ func TestABIStabilityU64FFIRoundTrip(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+// TestABIStabilityStreamOccupied pins the stream-inbox refusal end to end:
+// the header's value, its mapping to the Go sentinel, and the sentinel's
+// text. A renumbered constant or a dropped `case` would otherwise surface
+// as "mesh unknown error (code -109)" at runtime.
+func TestABIStabilityStreamOccupied(t *testing.T) {
+	if got := abiStabilityStreamOccupiedCode(); got != -109 {
+		t.Fatalf("NET_ERR_MESH_STREAM_OCCUPIED = %d, want -109", got)
+	}
+	if err := abiStabilityMeshError(-109); !errors.Is(err, ErrStreamOccupied) {
+		t.Fatalf("code -109 maps to %v, want ErrStreamOccupied", err)
+	}
+	const want = "stream already has a receiver"
+	if got := ErrStreamOccupied.Error(); got != want {
+		t.Fatalf("ErrStreamOccupied = %q, want %q", got, want)
 	}
 }

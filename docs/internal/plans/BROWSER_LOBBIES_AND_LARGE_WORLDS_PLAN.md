@@ -1,477 +1,593 @@
 # Browser lobbies and large worlds — plan
 
-**Status:** proposed. Nothing here is implemented unless §2 says so.
-**Scope:** `@net-mesh/browser` (the store and its Three.js binding), the browser
-anchor, and a new world layer on the mesh. Companion to
+**Status:** in progress. P1, P2 and the P3 transport are built on the
+`browser-host-player` branch (§2). **Next: P0, a shared-ready CLI anchor**, then
+**netcode model 2** (§6). Direction re-set on 2026-09-26 — see §3.
+**Scope:** `@net-mesh/browser` (the store, its Three.js binding, and optional
+netcode modules), the browser anchor, the leaf's transport primitives, and a world
+layer on the mesh. Companion to
 [the browser game store design](BROWSER_GAME_STORE_API_DESIGN.md) and
 [the browser WebRTC transport plan](BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md).
 **Source baseline:** `93b224799` (master after the org-nrpc merge).
-**Audience:** the team, before any of this is built.
+**Audience:** the team.
 
-**Supersedes one decision.** The store design (§5, "Snapshot, deltas and
-audiences") says: *"A minimal spatial selector is application code, not a new
-interest-management service."* That holds for a room of a few players. It does
-not hold for worlds larger than what one player should receive, which is the
-goal of this plan. §5 below proposes interest management as a store feature.
+**Supersedes two earlier decisions.**
+- The store design (§5, "Snapshot, deltas and audiences") said *"A minimal
+  spatial selector is application code, not a new interest-management
+  service."* That holds for a room of a few players, not for worlds larger than
+  one player should receive. Interest management is now a store feature (§5).
+- This plan's own first non-goal, "no deterministic lockstep", is now **parked
+  and revisited on demand** (§1, §9) rather than ruled out.
 
 ---
 
 ## 1. Goal
 
 A Three.js developer can build a multiplayer game that a player joins **by
-opening a link**, in a world that can be **larger than any one player loads**:
+opening a link**, in a world that can be **larger than any one player loads**,
+with movement that **feels responsive at real latency**:
 
 1. **Drop-in lobbies.** No per-player setup, no hand-minted credentials, no
    repository checkout. A lobby list or a room code, and you're in.
 2. **Large worlds.** A player receives only the part of the world near them.
    Beyond what one host can hold, the world is split across several hosts, and
    crossing between them is seamless.
-3. **Built with an AI agent.** Every step is expressible in the `net-browser`
+3. **Responsive movement.** Interpolated remote entities, predicted local ones,
+   reconciliation to the host, and fair hit judgement — netcode model 2 (§6).
+4. **Built with an AI agent.** Every step is expressible in the `net-browser`
    skill, so a developer who vibe-codes gets a correct result.
+
+**Audience and language.** This audience writes TypeScript/JavaScript, so this
+plan invests in **`@net-mesh/browser` and the Node SDK (`sdk-ts`) only**. The
+Python, Go and C surfaces already committed on the branch (the stream inbox, §7)
+stay as they are, with no further investment here.
 
 ### Non-goals (for this plan)
 
 - A general physics or simulation engine. The store replicates validated game
   state; simulation stays game code.
-- Deterministic lockstep or CRDT multi-writer state. One authority per piece of
-  the world, as today.
+- CRDT multi-writer state. One authority per piece of the world, as today.
 - Matchmaking by skill or rating. A lobby list and room codes only; ranking is
   application code on top.
+- **Parked, not ruled out:** rollback netcode, deterministic lockstep and
+  client-authoritative dead reckoning (netcode models 3–5, §6). They are
+  revisited only when a game needs them.
 
 ---
 
-## 2. Where we are (verified at the baseline)
+## 2. Where we are (updated 2026-09-26)
 
-What works, with the code that backs it:
+Built on the `browser-host-player` branch, each with tests (most checked by
+deliberately breaking the code), docs, skill and changelog:
 
 | Capability | Where |
 |---|---|
-| Authoritative host + joiners, late joiners get a chunked snapshot | `browser-ts/src/store/{host,join,owner,chunker,assembly}.ts` |
-| Actions (correlated, answered) vs inputs (coalesced, newest wins) | `store/join.ts` `act` / `input`; dispositions in `store/types.ts` |
-| Caller identity proven by the transport; `authorize` sees `request.peer` | `store/types.ts` `AccessRequest`, `store/owner.ts` |
-| Per-audience projection; hidden data never sent | `store/owner.ts` `project`, one diff per distinct audience |
-| Several named stores per node (`store: 'lobby'` / `'match'`) | `store/host.ts` (duplicate name on one transport → `invalid-data`) |
-| Three.js binding: create / update-only-on-change / remove / dispose | `browser-ts/src/three/index.ts` |
-| Discovery: announce a tag, `query(tag)` | `browser-ts/src/node.ts` |
-| Direct WebRTC between players; the anchor only introduces | leaf + `node.ts` `connectPeer` |
-| An in-page transport for offline development (not exported) | `browser-ts/demo/local-mesh.js` |
-| Daemon placement and migration on native nodes | [Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement), [Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration) |
+| Authoritative host + joiners, chunked snapshots, actions vs inputs | `browser-ts/src/store/*` (pre-existing) |
+| The host's own player, replica-shaped and held to the same policy | `store/player.ts` `hostPlayer` |
+| Offline development: a mesh in one page, with discovery | `@net-mesh/browser/local` `createLocalMesh` |
+| Per-player projection | `projectFor(state, { peer, audience })` |
+| Lobbies: list, room code, link, capacity, kick, presence | `src/lobby.ts` |
+| One host hook for players: `join` / `leave` / `area` | `onEvent`, `areaOf` |
+| Inventory bones (trading deferred) | `store/inventory.ts` |
+| Declared visibility: path rules, presets, `HIDDEN`, `assertHidden`, dev warnings | `store/visibility.ts` |
+| Interest management: keyed entities, per-entity deltas, additive `setInterest` | `store/interest.ts`, `int` wire message |
+| A world-scale benchmark harness | `browser-ts/scripts/bench-world.mjs` |
+| A native host for the browser store (dedicated hosts) | core `register_stream_inbound`; `sdk-ts` `meshStoreTransport` |
+| Browser ↔ native witness: a page's labeled stream attributed to the page | runner `stage5.rs` |
 
-What stands in the way:
+Gaps, with their state:
 
-| # | Gap | Evidence |
+| # | Gap | State |
 |---|---|---|
-| G1 | **No installable anchor admits browsers.** `net-mesh anchor serve` registers no enrollment service, so a page's `connect()` times out. Only the `examples/browser-demo/host` example serves enrollment. | `cli/src/commands/anchor.rs` `run_serve`; `browser-ts/demo/README.md` |
-| G2 | **Credentials are minted by hand** (`net-mesh anchor credential mint`) or by the demo host's `/config?tab=N`. | `cli/src/commands/anchor.rs` |
-| G3 | **No lobby API.** Every game re-implements re-announce loops, query-until-present polling, ready, enlist, and a ~40-line wrapper so the host can play in its own world. | `browser-ts/demo/main.js` |
-| G4 | **The host player can't join its own store** (`invalid-data`); the workaround is application code. | `store/join.ts` |
-| G5 | **The offline transport isn't in the package**, so prototyping needs a clone of the repo. | `demo/local-mesh.js` |
-| G6 | **The host leaving ends the world.** Replicas get `owner-lost`, which is terminal; there is no migration. By design for v1. | `store/errors.ts`; store design §1 |
-| G7 | **No fallback when UDP is blocked.** `udp-blocked` is classified, but nothing relays. `iceServers` accepts TURN credentials; provisioning and fallback are not built. | `browser-ts/src/node.ts`, `udp-probe.ts` |
-| G8 | **Every state change re-projects the whole world, once per distinct audience set.** Cost ∝ distinct views × world size. | `store/owner.ts` (one projection pair + root diff per distinct audience) |
-| G9 | **Changing audience blanks the view.** The old subscription is fenced, the view shows `empty()`, then a full snapshot arrives. Using cells as audiences, a player crossing a border sees the world vanish. | `store/owner.ts` `aud`; store design §5 |
-| G10 | **`project` doesn't know the player.** The design specified `project(state, { peer, audience })`; the implementation is `project(state, audience)`. | store design §2 vs `store/owner.ts:105` |
-| G11 | **Hard bounds sized for rooms:** 32 audience labels per handle, 1 MiB snapshot, 64 KiB store message. | store design §5 "Bounded defaults" |
-| G12 | **The store only runs in a browser today**, and a player-host sees the whole world (it can read hidden state and modify its own client). Whether the store can run on a Node transport is **unverified**: `sdk-ts` has a `MeshNode`, but nobody has checked it against `StoreTransport` (`nodeIdHex`, `openStream({reliability, peer, label})`, `onEvent`). | `store/host.ts` `StoreTransport`; `sdk-ts/src/mesh.ts` |
+| G1 | No installable anchor admits browsers (`net-mesh anchor serve` serves no enrollment) | **Open — P0** |
+| G2 | Credentials are minted by hand | **Open — P0** |
+| G3 | No lobby API | Closed (`src/lobby.ts`) |
+| G4 | The host player can't join its own store | Closed (`hostPlayer`) |
+| G5 | The offline transport isn't in the package | Closed (`@net-mesh/browser/local`) |
+| G6 | The host leaving ends the world | Dedicated hosts address it (P3); host migration between players deferred |
+| G7 | No fallback when UDP is blocked | Open — P5 (deferred) |
+| G8 | Every change re-projects the whole world per view | **Partly closed.** Per-player bytes are O(nearby); host cost is still O(world) per commit — §8 |
+| G9 | Changing audience blanks the view | Closed for interest (additive `setInterest`); audience changes still resnapshot by design |
+| G10 | `project` doesn't know the player | Closed (`projectFor`) |
+| G11 | Bounds sized for rooms | Partly: interest has its own bounds; one-frame deltas remain (§8) |
+| G12 | The store only runs in a browser | Closed: runs in Node over `meshStoreTransport` |
+| G13 | **The leaf has only a reliable, ordered DataChannel** | **Open — netcode model 2 (§6)** |
+| G14 | **The host's commit validates the whole world** (15.6 ms at 8,000 entities, no players) | **Open — §8** |
 
 ---
 
-## 3. Phases at a glance
+## 3. Direction (decided 2026-09-26)
 
-| Phase | Delivers | Closes | Size | Depends on |
+- **TypeScript only** for this audience (§1). Other bindings on the branch are
+  kept, not extended.
+- **Simple identity:** anonymous per-visitor credentials, and the player's key
+  kept in `localStorage` (`rememberedIdentity()`). Games run on `connect()`,
+  which persists nothing by itself (§4).
+- **Anchors:** a **CLI anchor first, built shared-ready from day one** — game-id
+  namespacing, per-game credential issuance and rate limits, per-game counters,
+  stateless credential checks — so a **shared anchor** follows without rework
+  (§4).
+- **Next netcode milestone: model 2** (snapshot interpolation, prediction,
+  reconciliation, lag compensation) on two new Rust primitives: an **unreliable
+  latest-value channel** and **clock sync with round-trip and jitter estimates**
+  (§6).
+- **Rollback, lockstep and client-authoritative dead reckoning are parked** until
+  a game needs them (§6, §9).
+
+### Phases
+
+| Phase | Delivers | Closes | Size | State |
 |---|---|---|---|---|
-| **P0** Foundation | A browser-capable anchor you can install; automatic per-visitor credentials | G1, G2 | M | — |
-| **P1** Drop-in lobbies | Lobby API in the package, host-player helper, presence, exported offline transport | G3, G4, G5 | M | P0 (P1's offline parts don't) |
-| **P2** Interest management + hidden information | Only nearby state reaches each player, on one host; secrets declared, not hand-projected | G8, G9, G10, G11 | M–L | — |
-| **P3** Dedicated hosts | The store runs on a native node; lobbies and regions survive players leaving | G6, G12 | M | Node transport (open question Q1) |
-| **P4** Large worlds | The world is split across region hosts with seamless crossing | — | L | P2, P3 |
-| **P5** Reach | TURN fallback, reconnection hardening, region-aware anchors | G7 | M | P0 |
+| **P0** Shared-ready CLI anchor | Browser-capable anchor, anonymous per-visitor credentials, game-id namespacing, per-game limits and counters | G1, G2 | M | **Next** |
+| **P1** Drop-in lobbies | Lobby API, host-player helper, presence, offline transport | G3–G5 | M | Built |
+| **P2** Interest + hidden information | Nearby-only delivery; declared secrets | G8–G11 (part) | M–L | Built (host cost open, §8) |
+| **P3** Dedicated hosts | The store on a native node; persistence (§7) | G6, G12 | M | Transport built; persistence open |
+| **Netcode model 2** | Unreliable channel, clock sync, host tick loop, interpolation/prediction module | G13 | L | After P0 |
+| **Host commit cost** | Incremental validation; maintained spatial index | G14, G8 | M | Parallel to model 2 |
+| **P4** Large worlds | Region hosts, handoff (at-most-once) | — | L | After model 2 |
+| **P5** Reach | TURN fallback, region-aware anchor endpoints | G7 | M | Deferred |
 
-P2 needs nothing from P0 or P1 and can start first, to de-risk the store changes.
-P1's offline work (exporting the local transport, the host-player helper) also
-needs nothing and is the fastest visible win.
+### Release sequence
 
----
-
-## 4. P0 + P1 — drop-in lobbies
-
-### P0. A browser anchor and credentials
-
-- **CLI:** `net-mesh anchor serve --browsers` (name to decide) that serves the
-  enrollment service the demo host serves today, shipped in the normal CLI
-  release. Acceptance: a page built from the npm package connects to it and
-  `isEnrolled()` is true, with no repo checkout.
-- **Credential endpoint:** an HTTP route on the anchor (or a documented
-  companion) that issues one credential per visitor. Policy is a decision
-  (Q3): anonymous with rate limiting, or behind the game's own login via a
-  signed request. The demo's `/config?tab=N` is the prototype.
-- **Docs + skill:** the README's "Before players can connect" and SKILL.md's
-  fast path switch from the demo host to this.
-
-### P1. The lobby API (proposed)
-
-A thin layer over what exists; it adds no protocol.
-
-```ts
-// Host side: one call instead of hostStore + announce loop + host-player wrapper.
-const lobby = await createLobby({
-  node, definition, initialState, actions, inputs, authorize, project,
-  game: 'my-game',                 // namespace for discovery
-  name: 'Friday arena',
-  capacity: 8,
-  visibility: 'public',            // or 'unlisted' (room code / link only)
-});
-lobby.code;                        // short room code
-lobby.link;                        // shareable URL
-lobby.self;                        // the host's own player handle — same shape as a replica
-lobby.players.subscribe(list => …); // presence, from the host's authority
-
-// Anyone: browse or join by code/link.
-const lobbies = await listLobbies({ node, game: 'my-game' });  // name, players, capacity, code
-const game = await joinLobby({ node, definition, code });      // or { lobby: lobbies[0] }
-await game.ready();
-```
-
-- **Discovery:** lobby metadata rides the announcement (tag plus a small
-  metadata record), re-announced on a timer the helper owns. Stale lobbies
-  vanish when announcements lapse.
-- **The host's own player (G4):** `lobby.self` is the demo's wrapper made
-  official: the same `authorize`, the same handlers, the same handle shape as a
-  replica, so game code doesn't branch on "am I the host". Also available
-  standalone as `hostPlayer(host, { authorize, actions, inputs })` for games
-  not using lobbies.
-- **Capacity and kick:** enforced in the host's `authorize` generated by the
-  helper (full → `forbidden` with a reason; kick = peer deny-list).
-- **Presence:** join/leave derived from the host's handles, exposed as a store
-  the UI can bind to.
-- **Offline (G5):** export the local transport, e.g. `@net-mesh/browser/local`,
-  so `createLobby`/`joinLobby` run in one page with no network.
-
-**Acceptance:** the demo becomes a lobby-based game in fewer lines than today;
-two browser profiles on one machine can list, join by code and play against a
-P0 anchor; the whole flow is in the skill and a fresh agent reproduces it.
+1. **The CLI anchor** (P0), in the normal CLI release.
+2. **The two-browser acceptance run** against it: two browser profiles on one
+   machine list, join by code and play through the published-shape package.
+3. **Publish `@net-mesh/browser`** (first release 0.37.0; `release-npm-browser.yml`).
+   The leaf's wasm and the package are released together; the unreliable
+   channel (§6) changes the leaf's wasm boundary, so from then on a package
+   release pins the leaf it was built with.
+4. **The shared anchor**, the same code run for many games.
 
 ---
 
-## 5. P2 — interest management on one host
+## 4. P0 — a shared-ready CLI anchor, and identity
 
-**Goal:** a player receives only the entities near them, and the host's cost
-per change is proportional to what changed, not to the world × the number of
-views.
+**Goal:** `net-mesh anchor serve --browsers` (name to decide) admits browsers and
+issues their credentials, built so that the same code runs as a **shared anchor**
+for many games without rework.
 
-### What changes in the store
+### Identity: anonymous, per browser profile
 
-1. **Interest keys instead of audience-as-cells.** A replica declares an
-   *interest set* (e.g. the cells around it) separately from its audience
-   (what it may see). Audience stays the permission; interest becomes the
-   spatial filter. This keeps the 32-label bound meaningful for permissions and
-   gives interest its own, larger bound.
-2. **A spatial index on the host.** The definition says how to key an entity
-   (e.g. `cellOf(entity) → string`). The host maintains entity → cell and
-   cell → entities incrementally from each commit's diff.
-3. **Dirty tracking.** A commit marks the cells its changes touch. Only
-   replicas interested in a dirty cell get a delta, and only for those cells.
-   The per-commit cost becomes ∝ changed cells × interested replicas, not
-   world × views (closes G8).
-4. **Additive interest changes (closes G9).** Changing interest sends only the
-   difference: entities of newly entered cells as adds, entities of left cells
-   as removes. The view never blanks. Permission (audience) changes keep today's
-   fence-and-resnapshot semantics, because narrowing permission must never
-   leave stale private data visible.
-5. **The player in `project` (closes G10).** Implement the designed
-   `project(state, { peer, audience })`, keeping the current signature working.
-6. **Hysteresis.** Leaving a cell drops it only after the player is a margin
-   away, so standing on a border doesn't churn.
-7. **Update rate by distance (later).** Near cells every commit; far cells
-   coalesced to a lower rate. Needs measurement first; not v1 of P2.
-8. **Bounds (G11).** Re-derive the limits for interest sets and snapshot sizes
-   from measurements on a large demo scene, not by guessing.
+- The page asks the anchor's credential endpoint for a credential; the anchor
+  issues one per visitor, with **no login**. The player's key is kept in
+  `localStorage` by `rememberedIdentity()` and passed to `connect()`. Games must
+  use `connect()`: a store needs a session with its host, installed by
+  `connectPeer`, which exists only on the `connect()` node, not on
+  `openSession()`'s (which does persist its own key, in IndexedDB). Measured
+  2026-09-26 in the acceptance run.
+- **What that identity is**, stated in the docs: one player per **browser
+  profile**, not per person. Clearing site data makes a new player; the same
+  person on two devices is two players. `authorize`, `context.peer` and
+  inventories all key on it. That is the right trade for drop-in games.
+- **Room to grow:** a game that later needs accounts adds game-login-signed
+  credential requests (Q3's other option) without a protocol change — the
+  credential format already carries what the anchor checks.
 
-### Proposed API
+### Shared-ready from day one
 
-```ts
-const world = defineStore({
-  id: 'my-game.world', version: 1, state, empty, actions, inputs,
-  interest: { key: entity => cellOf(entity.x, entity.z) },   // opt-in
-});
+1. **Game-id namespacing, enforced, not declared.** Each credential **carries
+   its game id**. The anchor refuses announcements, lobby tags
+   (`net-lobby:<game>…`) and routing outside the credential's game. Tags alone
+   would be honour-system: any node can announce any tag (§5, lobbies).
+2. **Per-game credential issuance and rate limits** — a pool per game, not one
+   global pool, keyed on the game id in the credential, which a client cannot
+   forge.
+3. **Per-game counters now, metering later.** Cheap counters per game (sessions,
+   routed bytes, credential issues, refusals) are what make per-game limits
+   enforceable. Billing and quotas wait; the counters do not.
+4. **Stateless credential checks.** Credentials are self-contained and signed,
+   so any anchor instance can verify any credential. Discovery state
+   (announcements) already federates over the mesh, so one anchor can become
+   several behind a region-aware endpoint later (P5) without redesign.
 
-const replica = joinStore({ …, interest: cellsAround(myX, myZ, 1) });
-replica.setInterest(cellsAround(x, z, 1));   // additive, no blank frame
-```
+### Announcement lifetime
 
-`bindEntities` needs no change: it already diffs by reference, and additive
-interest produces ordinary adds and removes.
+The leaf keeps an announcement for its TTL (300 s default), while earlier docs
+said announcements vanish "in seconds" (likely the anchor's forwarding). The
+lobby helper re-announces every ~2 s, which is correct under either behaviour.
+**Measure once against the P0 anchor; investigate only if the anchor really
+drops announcements in seconds.**
 
-**Acceptance:**
-- A demo world with thousands of entities: each player's received bytes are
-  proportional to entities near them.
-- The host's per-commit work is proportional to dirty cells (measured with the
-  existing counters).
-- Crossing a cell border shows no empty frame, verified in the browser matrix.
-- Hidden-information guarantees are unchanged: a witness that a permission
-  narrowing still removes private data immediately.
+**Acceptance:** a page built from the npm package connects to a freshly
+installed CLI anchor and `isEnrolled()` is true, with no repo checkout; a
+credential for game A cannot announce a lobby for game B; per-game counters and
+limits are visible; README "Before players can connect" and the skill's fast
+path switch to it.
 
-### Hidden information, modeled (part of P2)
+### Slice 1 — built (2026-09-26)
 
-**Why.** Enforcement is already right: `project` runs on the host and what it
-omits is never sent, and a throwing handler answers the caller with the code
-alone — the handler's message never leaves the host (`store/owner.ts`, the
-`action-rejected` refusal carries no text). The weakness is authoring. The
-developer writes `project` by hand, and every mistake is a **silent** leak: the
-game works and the secret is readable in the browser. The common ones:
+- **SDK `game_anchor`:** `GameRegistry` — games by id, each with an enrollment
+  root derived from the anchor secret (`from_identity`: from the issuer key),
+  so instances with the same key agree with no shared state. Invites are
+  **self-verifying** (nonce = random ‖ deadline ‖ keyed MAC), rebuilt from the
+  join request alone. Per-game issuance ceiling per minute; counters
+  (credentials issued/refused, enrollments admitted/refused).
+- **An invite binds to its first device.** The same device may re-enroll with
+  it (a promoted leader tab reuses the credential `openSession()` was opened
+  with — a one-shot invite would leave it provisional); another device is a
+  replay. One credential = one identity, which is what makes issuance limits
+  meaningful. Invites therefore live 12 h. Bindings are per instance (pruned at
+  the deadline); strict cross-instance binding needs a shared map (P5).
+- **`POST /credential {game}`** on the bootstrap listener
+  (`BootstrapConfig.credential_issuance`), per-IP ceiling, typed refusals
+  (`unknown_game`, `rate_limited`, `malformed_request`); the listener refuses to
+  start if the issuing key is not the issuer it verifies.
+- **CLI:** `anchor serve --issuer-identity … --game ID[:N]`,
+  `--credentials-per-minute`, `--game-stats-secs`.
+- **`@net-mesh/browser`:** `requestCredential({ anchorUrl, game })`.
+- **Witnessed:** registry unit tests (roots, MAC, expiry, binding, per-game
+  limits), listener route tests, CLI flag tests, package tests — each security
+  check shown to fail when removed. **Not yet:** a real browser enrolling
+  through it (the two-browser acceptance run), so README/skill still point at
+  the demo host.
+- **Follow-up:** `openSession({ credential: () => Promise<string> })` — fetch a
+  fresh credential per connect, so a promotion never depends on an old invite.
+  A leaf change; not needed while invites bind to their device.
 
-- returning `state` unchanged — which the README and skill examples do today,
-  for brevity;
-- forgetting a nested field when copying;
-- a plausible value (`0`, `""`) standing for "you cannot see this";
-- per-player secrets (your own hand), awkward because `project` does not know
-  the viewer (G10).
+### Acceptance run — passed (2026-09-26)
 
-For AI-written games this is the worst class of bug: nothing fails.
+`net/crates/net/examples/anchor-acceptance` (`node run.mjs --net-mesh <bin>`):
+the real `net-mesh anchor serve --game`, two isolated Chrome contexts, the built
+package. **7/7:** the anchor reports its game and endpoint; a host fetches a
+credential, enrolls and opens a lobby; a second player lists it, joins and is
+seated; an unknown game is refused typed; a third identity presenting another
+player's credential is refused at `connect()` (`replay`); a reloaded player
+(same storage) comes back as the **same node** and re-enrolls with its original
+credential; the anchor's counters agree (2 issued, 3 admitted, 1 refused).
 
-**What to add** — one enforcement point (`project`), generated rather than
-hand-written:
+It found a **P1 lobby defect**: a browser node accepts a relayed handshake only
+from a peer whose signed announcement it holds, and a joiner announced nothing,
+so no lobby could be joined over a real anchor (the local mesh does not model
+discovery-before-handshake). Fixed in `joinLobby` (announce a `seek` tag, retry
+reaching the host); shown causal by mutation both in the real run and in unit
+tests that model the rule. Not yet in CI (needs a release CLI build and Chrome);
+the README, skill and quickstart now point at the CLI anchor.
 
-1. **Declarative visibility on the definition.** Paths with a visibility rule;
-   the SDK builds the projection from them, and it composes with interest keys
-   (visibility = who *may* see, interest = what is *near*).
+### Slice 2 — next: the core records the game
 
-   ```ts
-   defineStore({
-     …,
-     visibility: {
-       'players.*.hand': 'owner',      // only the player whose key it is
-       'deck':           'nobody',     // host only
-       'deck.length':    'everyone',   // reveal a count, not contents
-       'units.*':        'team',       // viewer's team, from an app-provided resolver
-       'waypoint':       ['command'],  // an audience
-     },
-   });
-   ```
-
-   Needs the viewer in `project` (G10). A hand-written `project` stays
-   supported; when both exist, the declared rules apply **after** it, so a
-   hand-written projection can narrow but never widen a declared secret.
-2. **Private stays private by construction.** Unlisted paths keep today's
-   behavior, so nothing existing changes. A path marked private is removed
-   (collections) or set to the typed hidden marker (fields) — never a
-   plausible default — and `empty()` is checked to satisfy the same rules.
-3. **Proof tools.**
-   - `assertHidden(definition, state, { viewer }, paths)` for tests, and an
-     executable example in the skill.
-   - A dev-mode check: when the host projects for viewer A, flag any
-     `owner`-scoped data belonging to B. Off in production.
-4. **Standard patterns as helpers:** reveal-count-not-contents; reveal-on-event
-   (a card becomes `everyone` when played — a state change, not a rule
-   change); a typed `hidden` marker instead of magic zeros.
-5. **The trust boundary, stated in the API.** `host.trust` is `'player'` or
-   `'dedicated'` (P3). Docs say plainly: a player-host sees everything, so games
-   with real stakes need a dedicated host. No SDK feature can change this, and
-   the SDK should not imply otherwise.
-
-**Defaults.** Principle: *compatible by default, loud when a secret could
-leak.* A strict default that hides data makes a game look broken and pushes the
-developer to disable it; a leak looks fine. So the defaults force an explicit
-choice without breaking anything:
-
-1. **No `visibility` → today's behavior.** Existing stores are untouched; this
-   is not a breaking change.
-2. **`owner` needs no configuration.** The standard pattern keys each player's
-   entity by the proven caller (`ships[context.peer]`), so by default `owner`
-   means *the map key equals the viewer's peer id*. `ownerOf(entity)` overrides
-   it for other layouts.
-3. **Rules inherit and cannot be widened.** A rule on `players.*.hand` covers
-   everything beneath it; a hand-written `project` may narrow it further, never
-   widen it.
-4. **One hidden form.** Collections drop hidden entries; hidden fields become
-   the typed `hidden` marker — never `0`, `""` or `null`.
-5. **Unknowable inputs fail at definition time.** `team` without a team
-   resolver (and any other rule needing app data) throws in `defineStore`, not
-   at first projection.
-6. **Presets for common game types** — a small closed set an AI agent can pick
-   correctly, each shipped only with an executed example:
-
-   ```ts
-   visibility: 'open'                                         // everyone sees everything — explicit
-   visibility: 'card-game'                                    // hands owner, deck nobody + count everyone, table everyone
-   visibility: { preset: 'card-game', 'players.*.score': 'everyone' }   // preset + overrides
-   ```
-
-   Later presets (team game; fog of war composed with interest keys) land only
-   with their examples.
-7. **Development-mode warnings, on by default:**
-   - A store that sends the entire state to every player *without saying so*
-     warns once: "every player receives the full state; declare
-     `visibility: 'open'` if intended". An explicit `'open'` silences it —
-     turning an accident into a decision.
-   - The cross-player leak check (item 3 above) runs in development, off in
-     production.
-   - Secrets declared on a player-hosted store remind once that the hosting
-     player can see them (`host.trust === 'player'`).
-
-**Defaults deliberately avoided:**
-- **Guessing from names** (hiding fields called `hand`, `secret`, `deck`): too
-  magical, and wrong often enough to create confusing bugs.
-- **Deny-everything once any rule is declared:** safe in theory, but games lose
-  their world state and developers reach for `'open'` just to make it work,
-  defeating the point.
-
-**Deliberately not in scope:**
-- **Line of sight / fog of war as computation.** Whether a unit sees another
-  is game logic; the SDK makes "visible to this viewer" easy to express, it
-  does not compute it.
-- **Traffic analysis.** A player can infer that something visible to them
-  changed from updates arriving. Hidden-only changes already produce no
-  per-audience diff; padding or constant-rate updates are not worth their
-  cost for games in v1. Revisit only for a concrete threat.
-- **Action results.** An output goes to its caller only — already the right
-  scope.
-
-**Acceptance:**
-- A card-game example (hands `owner`, deck `nobody` + count `everyone`,
-  table `everyone`) written with no hand-written `project`; `assertHidden`
-  proves each player sees only their own hand, over the real wire.
-- Removing a visibility rule reddens that test; the dev-mode check reports a
-  deliberate cross-player leak in a fixture.
-- The README and skill examples move from `project: state => state` to a
-  declared rule, with an executed example.
-- Decision Q7 (§10) resolved before the API freezes.
+The core promotes a session on an Admitted outcome without reading the grant's
+root, so it cannot yet tell which game a session belongs to. Slice 2: record
+the grant's root (→ game) on the promoted session, then enforce it at three
+points — announcements (lobby tags outside the game refused), the anchor's
+answers to discovery queries (filtered to the game), and routed traffic between
+sessions of different games. Witnessed by a cross-game refusal test at each.
 
 ---
 
-## 6. P3 — dedicated hosts
+## 5. P1 + P2 — lobbies, interest and hidden information (built)
 
-**Why:** a player's tab is a fragile, all-seeing host. Lobbies that outlive
-their creator, and every region in P4, need a host that is not a player.
+### Lobbies
 
-- **Q1 first:** can the store (plain TypeScript) run in Node over `sdk-ts`'s
-  `MeshNode`, or is a small `StoreTransport` adapter needed? If neither, a
-  native Rust store host is a much larger project, which changes P4's cost.
-- **A dedicated host** runs the same `hostStore` with game rules loaded from the
-  developer's code, on a native node, discoverable by the same lobby tags.
-- **Browser players become pure replicas** of it, so the "host sees
-  everything" problem is gone and hidden information holds against everyone.
-- **Survival:** a dedicated host is a mesh daemon, so placement and migration
-  apply (docs linked in §2). A player-hosted lobby still ends with its host
-  (G6); **host migration between players is deferred** (§9).
+`createLobby` / `listLobbies` / `joinLobby` (`src/lobby.ts`) — a thin layer
+over the store and discovery, with no protocol of its own:
+
+- **Discovery** rides capability tags in the host's signed announcement (Q4):
+  - `net-lobby:<game>` — the queryable listing tag, public lobbies only;
+  - `net-lobby:<game>:rec:<base64url JSON>` — code, name, players, capacity,
+    store `id@version`, app `info` (≤ 256 bytes; tag ≤ 512 bytes);
+  - `net-lobby:<game>:code:<sha-256(code), 32 hex>` — how a code is looked up.
+
+  Unlisted means *not listed*, not *secret*. A record is the host's claim,
+  validated on read; the host id comes from the signed announcement; a code
+  claimed by two nodes is refused as `ambiguous`. P0's game-id credentials turn
+  the `<game>` namespace from a convention into an enforced boundary.
+- **Capacity and kick** are enforced in front of the game's `authorize`, counted
+  from the owner's live handles; a kick re-authorizes installed handles at once.
+- **The host's own player** is `lobby.self` (`hostPlayer`); **presence** is
+  `players()` / `subscribePlayers`.
+- **Players' events:** one host hook, `onEvent(event, context)` — `join`,
+  `leave` (with a reason), `area` (from `areaOf`) — running as a transaction.
+  **Inventory bones** (item → count, `onlyOwn`) ship; trading is deferred.
+
+### Interest management (built)
+
+A definition names its top-level entity maps and how an entity is keyed:
+`interest: { ships: ship => cellKey(ship.x, ship.z, 32) }` (any string; `null`
+= always delivered, Q5). A replica joins with `interest: [...]` and moves with
+`setInterest(keys)`:
+
+- only entities whose key is in the set are delivered, as **per-entity** ops;
+  far changes send nothing;
+- `setInterest` is one additive delta (the `int` wire message) — the view never
+  blanks; `stickyCells` adds hysteresis at borders;
+- interest is a filter, not a permission: it never calls `authorize`.
+
+A pre-existing defect surfaced and was fixed: a delta's `base` was the owner's
+previous revision, so a replica sent nothing on a commit resynced its whole view
+on the next. `base` is now the revision each replica is at.
+
+**Not built:** update rate by distance, and bounds re-derived from measurement.
+
+### Hidden information (built)
+
+`defineStore({ visibility })`: path rules (`'everyone'`, `'nobody'`, `'owner'`
+by the first `*`, audience lists; `x.length` reveals a hidden array's count),
+presets `'open'` and `'card-game'` with overrides. Enforced by the host after any
+`project` / `projectFor`, so code narrows but never widens. Hidden entries are
+removed, hidden fields become `HIDDEN` (`hiddenOr`); a validator that refuses the
+marker is refused at `hostStore`. `assertHidden` for tests; `hostStore({ dev })`
+warns about an undeclared everything-to-everyone store.
+
+- **`team` visibility: not built, and not planned** (Q7). Games put players in a
+  `team:red` audience through `authorize` and write `['team:red']` rules — zero
+  new API.
+- Not built: an `ownerOf` override, `host.trust`.
+- **The trust boundary stands:** a player-host sees everything; games with real
+  stakes need a dedicated host (P3).
+
+### Measurements (`browser-ts/scripts/bench-world.mjs`)
+
+`npm run bench:world` runs the built package over the local mesh. World: 2
+entities per 32-unit cell on average, 5% moving per tick, one `setState` per tick,
+40 ticks. Modes: `full`, `interest` (3×3 cells), `owner` (interest plus a
+per-player secret). Windows dev box, Node 24; medians.
+
+| mode | entities × players | host ms/tick | bytes/player/tick | initial bytes/player |
+|---|---|---|---|---|
+| full | 500 × 16 | 1.8 | 3,082 | 62,050 |
+| full | 8,000 × 16 | 767 | 1,002,012 (whole world, 127 frames) | 1,001,791 |
+| interest | 500 × 16 | 1.1 | 219 | 2,171 |
+| interest | 8,000 × 16 | 18.1 | 235 | 2,452 |
+| owner | 500 × 16 | 22 | 238 | 2,691 |
+| owner | 8,000 × 16 | 531 | 257 | 3,043 |
+| interest, 0 players | 8,000 | 15.6 | — | — |
+
+Bytes per player are flat in world size under interest; host work is flat in
+player count. Fixed on the way: maps resent whole (62 KB → 3.1 KB), quadratic
+visibility (6,649 → 30 ms), identity projections re-validated (30 → 17 ms), and a
+latent replica defect (a cancelling validator published the cancelled document).
+Open findings are §8.
 
 ---
 
-## 7. P4 — large worlds across region hosts
+## 6. Netcode — models 1 and 2 now, the rest on demand
+
+### The five models
+
+| # | Model | Genres | What it takes | State |
+|---|---|---|---|---|
+| 1 | **Authoritative state sync** (today's store) | MMO, RPG, card, strategy, party | Done, plus interest management and visibility | **Built** |
+| 2 | **Snapshot interpolation plus prediction and reconciliation** | Shooters, action, MMO movement, casual racing | Interpolation buffers, local prediction, reconciliation to the host's state, lag compensation (the host rewinds to judge hits) | **Next** |
+| 3 | Rollback netcode (the model behind GGPO) | Fighting games, precision 1v1 or 2v2 | Deterministic fixed-step simulation, exchanged inputs, prediction, rollback and re-simulation, adjustable input delay | Deferred |
+| 4 | Deterministic lockstep | RTS, large unit counts | Input-only sync on a synchronized frame clock, desync detection | Deferred |
+| 5 | Client-authoritative with host validation, plus dead reckoning | Racing, casual physics | Each player owns their vehicle; others extrapolate; the host validates and settles collisions | Deferred |
+
+**Only models 1 and 2 are in scope.** Casual racing is served by model 2, so no
+genre is left without a model; 3–5 wait for a game that needs them.
+
+### Rust primitives (next to the WebRTC leaf) — only what model 2 needs
+
+1. **An unreliable, latest-value channel** for high-rate inputs and positions.
+   - **Verified fact (2026-09-26):** the leaf opens **one** DataChannel,
+     `ordered: true`, with no retransmit limit (`leaf/src/rtc.rs:495`). Every Net
+     stream — "fire-and-forget" included — rides reliable, ordered SCTP, so a
+     lost packet is retransmitted underneath and **blocks everything behind it**
+     (head-of-line blocking). Fire-and-forget at the Net layer does not make
+     60 Hz positions unreliable on the wire (G13).
+   - **The primitive:** a second DataChannel, **unordered with zero
+     retransmits**, negotiated alongside the first on the same session and
+     carrying the same Noise-protected frames; plus a receiver that keeps **only
+     the newest value per key** (sequence-numbered, stale ones dropped).
+   - Native side: the same semantics on the core's UDP path (fire-and-forget
+     without per-stream ordering holds).
+2. **Clock sync and round-trip/jitter estimates per peer**, so host and players
+   agree on one **tick timeline**. Interpolation delay, prediction horizon and
+   reconciliation all depend on it. (The reliable stream's SRTT is transport
+   state for loss recovery and stays there; this is an application-facing
+   estimate.)
+
+### What model 2 adds on top
+
+- **A host tick loop.** A fixed-rate authoritative step on the host
+  (`tickRate`), stamping snapshots with a tick number. Store revisions count
+  changes, not time; model 2 needs time.
+- **A separate optional module**, e.g. `@net-mesh/browser/netcode`, **alongside
+  the store rather than inside it**:
+  - the store keeps durable, validated state (inventory, score, doors);
+  - the netcode module carries high-rate transforms over the unreliable channel,
+    **filtered by the same interest keys**, so large-world movement stays cheap;
+  - remote entities: interpolation buffers rendered a small delay behind the
+    newest snapshot; local entity: predicted from its own inputs, reconciled to
+    the host's tick-stamped state with input replay.
+- **Lag compensation with a bounded rewind.** The host keeps a bounded history
+  of positions (a ring of N ticks) and judges a hit where the target was at the
+  shooter's tick — **capped (≈ 200 ms)**, so faked latency cannot buy an
+  advantage.
+- **Optional modules, not core weight.** Each netcode model ships as its own
+  subpath, so "any game" does not bloat the core package.
+
+**Acceptance:** a demo with interpolated remote players and a predicted local
+player at 100–150 ms simulated latency with loss, no visible snapping; loss on
+the unreliable channel stalls nothing on the reliable one (a witness measuring
+it); a hit judged by rewind within the cap, refused beyond it.
+
+### Deferred primitives (models 3–5)
+
+- Input ring buffers and a rollback/lockstep engine (frame scheduling,
+  confirmation, resimulation bookkeeping in Rust; the game's `step(state,
+  inputs)` in TypeScript).
+- **Host-less** peer-to-peer sessions for 1v1. (Direct browser-to-browser pairs
+  already exist and the store rides them when a pair is promoted; what is
+  deferred is a match with no host at all.)
+
+---
+
+## 7. P3 — dedicated hosts, and persistence
+
+**Why:** a player's tab is a fragile, all-seeing host. Lobbies that outlive their
+creator, and every region in P4, need a host that is not a player.
+
+### The transport (built)
+
+- **Q1 spike:** the store runs in Node unchanged; the gap was that no Node API
+  delivered stream bytes with the authenticated sender. The core had it and
+  dropped it where it queued `StoredEvent`; nRPC's `callerOrigin` is
+  caller-supplied, not an identity.
+- **Built:** core `MeshNode::register_stream_inbound` (vacant-only, registration
+  ids; after the admission gate and the blob-transfer divert, before the shard
+  queue); `net_wire::channel::name::stream_id_from_label` as the one label → id
+  derivation (the leaf delegates to it); napi `NetMesh.onStreamData` and
+  `streamIdFromLabel`; `sdk-ts` `MeshNode.onStreamData` and
+  `meshStoreTransport(mesh, { listen })`.
+- **Witnessed:** core tests over real UDP; `sdk-ts` test serving the browser
+  store to two native players with `authorize` refusing one by the reported
+  peer; browser runner
+  `stage5_a_labeled_page_stream_reaches_a_native_sink_attributed_to_the_page`.
+- **Other bindings (kept, not extended):** a pull-based inbox,
+  `MeshNode::open_stream_inbox`, with Python `open_stream_inbox`, C
+  `net_mesh_open_stream_inbox` & co. (`NET_ERR_MESH_STREAM_OCCUPIED`, -109) and
+  Go `OpenStreamInbox`, each tested.
+
+### Persistence (in scope, minimal)
+
+- A dedicated host **snapshots its store document to RedEX** (the repo's durable
+  log) on an interval and on clean shutdown, and **restores it on start**.
+- It is also Q6's recovery path: a failed region handoff re-joins the player to
+  the destination region from persisted state (§9).
+- Deferred: per-entity databases, migrations between store versions, replay.
+
+### Survival
+
+A dedicated host is a mesh daemon, so placement and migration apply. A
+player-hosted lobby still ends with its host (G6); host migration between players
+is deferred.
+
+---
+
+## 8. Host commit cost
+
+**Measured:** 8,000 entities with **no players** cost **15.6 ms per `setState`**
+(G14). The core validates the whole document on every commit, and every action
+and input transaction commits the same way. Per-player projections under
+`projectFor` / `owner` rules add O(world × players) (531 ms at 8,000 × 16).
+
+**Follow-up, in order:**
+
+1. **Incremental validation in TypeScript first.** An entity-level write, e.g.
+   `setEntity(collection, id, value)`, validated by a per-entity validator from
+   the definition, and committed without re-validating the untouched world.
+   Measure with the harness.
+2. **A maintained spatial index** (cell → ids, updated from each commit's changed
+   entities), so declared-visibility stores filter by interest *before*
+   projecting: per-player cost O(nearby).
+3. **Moving the hot path to Rust** only if the harness still demands it after 1
+   and 2 — a much larger project.
+
+Also open: **a delta is one frame** (a tick changing more than ~8 KB without
+interest reinstalls the view; chunked deltas would be a wire change), and **one
+unreproduced harness stall** (each point is now bounded and named).
+
+---
+
+## 9. P4 — large worlds across region hosts
 
 **Model:** the world map is divided into regions. Each region is its own store
-(`store: 'region:4:7'`), hosted by a dedicated host (P3). A player's client
-holds replicas of its current region and its neighbours.
-
-### Pieces
+(`store: 'region:4:7'`) hosted by a dedicated host (P3); a client holds replicas
+of its current region and its neighbours.
 
 1. **Region directory = discovery.** A region host announces
-   `my-world:region:4:7`; clients and other hosts find it with `query`. No
-   central directory service. This is the property no game SDK has, and why it
-   belongs on the mesh.
-2. **Client world view.** A `joinWorld({ node, world, position })` helper keeps
-   replicas of the current region plus neighbours (with P2 interest inside
-   each), joins and leaves as the player moves, and exposes **one merged view**
-   the Three.js binding renders (`bindEntities` over the merged state).
-3. **Entity handoff.** Crossing a border moves an entity's authority from
-   region A to region B:
-   - A freezes the entity at a fenced epoch and sends its state to B.
-   - B admits it at the next epoch and becomes authoritative; A keeps a
-     read-only ghost until B confirms.
-   - Late inputs to A for that entity are forwarded to B or refused typed, never
-     applied twice.
-   - The store's existing incarnation and ledger fencing is the base. The
-     protocol (and its failure cases: B down, A dies mid-handoff) needs its own
-     design and model-checking, like the org-streaming lifecycle got.
-4. **Cross-border actions.** Firing from A into B is forwarded host to host over
-   the mesh; the target's authority (B) decides. Result goes back through A.
-5. **Ghosting.** Entities near a border are mirrored read-only into the
-   neighbour so interactions and rendering across the line work.
-6. **Load balancing.** Split a busy region, merge quiet ones, move a region host
-   to another machine using daemon placement and migration. Splitting is a
-   handoff of many entities at once, so it reuses item 3.
+   `my-world:region:4:7`; clients and hosts find it with `query`. No central
+   directory service — the property no game SDK has.
+2. **Client world view.** `joinWorld({ node, world, position })` keeps replicas
+   of the current region plus neighbours (with interest inside each) and exposes
+   one merged view to `bindEntities`.
+3. **Entity handoff — at-most-once with a typed failure (Q6).** A freezes the
+   entity at a fenced epoch and sends its state to B; B admits it and becomes
+   authoritative; late inputs to A are forwarded or refused typed, never applied
+   twice. **A failed handoff re-joins the player to B from persisted state**
+   (§7). Exactly-once is not attempted: it is a large protocol project, needed
+   only for things like item transfers mid-crossing, which are designed around.
+4. **Cross-border actions** forward host to host; the target's authority decides.
+5. **Ghosting** mirrors border entities read-only into the neighbour.
+6. **Load balancing** splits and merges regions with daemon placement and
+   migration; a split reuses handoff.
 
-**Acceptance:**
-- A walkable world of several regions on several native hosts; a player
-  crosses borders with no visible pop or duplicate entity.
-- An action across a border resolves exactly once.
-- Killing a region host mid-handoff yields a typed, recoverable outcome (no
-  duplicated or lost entity), proven by a deterministic simulation test before
-  any browser test.
-- Region hosts move between machines while players stay connected.
+**Acceptance:** a walkable multi-region world on several native hosts with no
+visible pop or duplicate at borders; killing a region host mid-handoff yields a
+typed, recoverable outcome (no duplicated or lost entity), proven by a
+deterministic simulation before any browser test.
 
 ---
 
-## 8. P5 — reach and resilience
+## 10. P5 — reach and resilience (deferred)
 
-- **TURN (G7):** provision TURN servers with the anchor (or document bringing
-  your own), pass them as `iceServers`, and fall back automatically after a
-  classified `udp-blocked`. Needs an end-to-end test on a UDP-blocked network
-  (the natsim harness is the candidate).
-- **Reconnection:** the lobby and world helpers use `replica.reconnect()` so a
-  mobile player's brief drop resumes rather than rejoins.
-- **Region-aware anchors:** once several anchors exist, the lobby layer picks
-  the nearest (the mesh's proximity data applies).
+- **TURN (G7):** provision or bring-your-own TURN, fall back after a classified
+  `udp-blocked`; test on the natsim harness.
+- **Reconnection:** lobby and world helpers use `replica.reconnect()`.
+- **Region-aware anchor endpoints:** several shared anchors behind one endpoint
+  picking the nearest; P0's stateless credentials make this additive.
 
 ---
 
-## 9. Deliberately deferred
+## 11. Deliberately deferred
 
-- **Host migration between players (G6).** Electing a new player-host and
-  moving authority without a dedicated host is the hardest version of the P4
-  handoff with the least reliable participants. Dedicated hosts (P3) cover the
-  need first; revisit only with demand.
-- **Unreliable replica updates.** The store design already defers a separate
-  unreliable replica protocol until measurements demand it; P2's distance-based
-  rates come first.
-- **Anti-cheat beyond authority.** Server authority plus hidden information is
-  the baseline; client-side cheat detection is out of scope.
+- **Netcode models 3–5** — rollback, lockstep, client-authoritative dead
+  reckoning — and their primitives (input ring buffers, a rollback/lockstep
+  engine, host-less 1v1 sessions). Revisit on demand.
+- **Metering and billing.** Per-game counters ship with P0; quotas and billing
+  wait.
+- **Host migration between players (G6).** Dedicated hosts cover the need first.
+- **Trading** (both players' consent, one atomic transfer).
+- **`team` visibility rules** — use audiences (§5).
+- **Update rate by distance; chunked deltas; bounds from measurement.**
+- **Further Python / Go / C investment** for this audience.
+- **Anti-cheat beyond authority.** Server authority, hidden information and the
+  capped lag-compensation rewind are the baseline.
 
 ---
 
-## 10. Decisions needed from the owner
+## 12. Decisions
 
-| # | Question | Why it matters |
+| # | Question | Decision |
 |---|---|---|
-| Q1 | Run the store in Node over `sdk-ts`, or build a native store host? (Spike first.) | Sets the cost of P3 and P4 |
-| Q2 | CLI anchor mode vs a hosted anchor service (or both)? | P0 shape; business model |
-| Q3 | Credential policy: anonymous + rate limit, or game-login-signed requests? | Abuse surface |
-| Q4 | Lobby metadata on announcements: size limit and what's public | Privacy of unlisted lobbies |
-| Q5 | Interest keys: cells only, or arbitrary keys (teams, instances)? | P2 API generality |
-| Q6 | Handoff consistency target: at-most-once with typed failure, or exactly-once? | P4 protocol complexity |
-| Q7 | Visibility API and defaults: path strings (as sketched) or schema annotations (e.g. a validator wrapper `secret(owner, schema)`)? How is `team` resolved — an app callback? Which presets ship first (proposed: `open`, `card-game`)? How is "development mode" detected — an explicit `dev` flag, or the bundler's `NODE_ENV`? | P2 hidden-information API shape and defaults |
+| Q1 | Store in Node, or a native store host? | **Node.** Spiked and built: the store runs as-is; the core now delivers stream data with its authenticated sender (§7). |
+| Q2 | CLI anchor, hosted anchor service, or both? | **CLI anchor first, shared anchor second**, the CLI anchor shared-ready from day one (§4). |
+| Q3 | Credential policy? | **Anonymous per-visitor credentials with per-game rate limits**, visitor key in `localStorage`; login-signed requests can be added later without a protocol change (§4). |
+| Q4 | Lobby metadata on announcements? | A fixed record plus ≤ 256 bytes of app fields; unlisted lobbies publish only a code hash (§5). |
+| Q5 | Interest keys? | Arbitrary string keys; grid cells are a helper (§5). |
+| Q6 | Handoff consistency? | **At-most-once with a typed failure**; a failed handoff re-joins from persisted state (§9). |
+| Q7 | Visibility API and defaults? | Path rules plus presets, dev warnings behind an explicit `dev` flag; **`team` left out — use audiences** (§5). |
+| Q8 | Bindings for this audience? | **TypeScript only**; the Python/Go/C surfaces on the branch are kept, not extended (§1). |
+| Q9 | Netcode scope? | **Models 1 and 2**; the Rust primitives trimmed to the unreliable channel and clock sync; models 3–5 deferred (§6). |
+| Q10 | Announcement lifetime? | Keep re-announcing every ~2 s; measure once against the P0 anchor, investigate only if it drops announcements in seconds (§4). |
 
 ---
 
-## 11. Competitive context (brief)
+## 13. Competitive context (brief)
 
 Hosted room servers (Colyseus, Photon, Nakama, PartyKit) ship lobbies,
-matchmaking and reconnection today but are services with their own identity.
-Web drop-in kits (Playroom, Rune) nail "open a link and play" on a proprietary
-cloud. P2P libraries (Trystero, PeerJS) are drop-in but have no authority or
-hidden information. Replicated computation (Croquet) shows everything to
-everyone. Protocol peers (libp2p, Iroh) stop at transport. SpatialOS-style
-spatial sharding existed only as an expensive centralized cloud.
+matchmaking and reconnection but are services with their own identity. Web
+drop-in kits (Playroom, Rune) nail "open a link and play" on a proprietary cloud.
+P2P libraries (Trystero, PeerJS) are drop-in but have no authority or hidden
+information. Replicated computation (Croquet) shows everything to everyone.
+Protocol peers (libp2p, Iroh) stop at transport. SpatialOS-style spatial sharding
+existed only as an expensive centralized cloud.
 
-This plan's differentiator is the combination: open protocol, proven identity
-feeding authority, hidden information enforced before sending, **and** a world
-whose regions are discovered, placed and migrated on the same mesh that lets a
-game call AI characters or native services. P1 makes the entry point
+The differentiator is the combination: an open protocol, proven identity feeding
+authority, hidden information enforced before sending, responsive netcode, **and**
+a world whose regions are discovered, placed and migrated on the same mesh that
+lets a game call AI characters or native services. P0–P1 make the entry point
 competitive; P4 is the part that is hard to copy.
 
 (Landscape as of mid-2026, from memory — refresh before external use.)
 
 ---
 
-## 12. Risks
+## 14. Risks
 
-- **Handoff correctness (P4)** is the dominant risk. Mitigation: a
-  deterministic model and simulation tests before browser tests, as the
-  org-streaming lifecycle did.
-- **Store performance under P2** could hit JavaScript limits on the host at
-  large entity counts. Mitigation: measure on the demo early; P3's native host
-  is the escape hatch if Node suffices, a Rust store if not (Q1).
-- **Scope creep toward a game engine.** The non-goals in §1 are the guard.
+- **Handoff correctness (P4)** remains the dominant risk. Mitigation: a
+  deterministic model and simulation tests before browser tests.
+- **The unreliable channel (G13)** is new transport work in the leaf: a second
+  DataChannel's negotiation, and keeping the Noise session's guarantees on an
+  unordered, lossy carrier. Mitigation: witnesses in the browser runner that
+  loss on it stalls nothing on the reliable channel.
+- **Clock and fairness.** A lag-compensated host trusts claimed latency within
+  the cap; the cap is the guard, and it is a tuning parameter to measure.
+- **Host commit cost (G14)** could cap world size before P4 splits it.
+  Mitigation: §8's incremental validation, measured with the harness.
+- **Multi-tenant leakage on the shared anchor.** Mitigation: game ids in
+  credentials, enforced at the anchor, witnessed by a cross-game refusal test.
+- **Scope creep toward a game engine.** The non-goals in §1 and the deferred
+  list in §11 are the guard.
 - **Skill drift.** Each phase lands with its `net-browser` skill update and an
-  executed example, as the current skill fixes did; otherwise vibe-coded games
-  break first.
+  executed example; otherwise vibe-coded games break first.

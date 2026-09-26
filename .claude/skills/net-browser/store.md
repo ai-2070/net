@@ -17,6 +17,7 @@ const arena = defineStore({
   version: 1,
   state: (v) => ({ ships: v?.ships ?? {} }),   // REQUIRED: validates a whole state
   empty: () => ({ ships: {} }),                // REQUIRED: absence; must pass `state`
+  visibility: 'open',                          // everyone sees every ship — a DECISION, stated
   actions: {                                   // { name: { input, output } } validators
     enlist: { input: () => ({}), output: (v) => ({ id: String(v.id) }) },
     fire: { input: (v) => ({ at: String(v.at) }), output: (v) => ({ hull: num(v.hull) }) },
@@ -38,7 +39,6 @@ const host = hostStore({
   // Branch on `request.type` — a policy that throws is a refusal (`forbidden`).
   authorize: (request) =>
     request.type !== 'action' || request.name !== 'fire' || request.input.at !== request.peer,
-  project: (state, audience) => state,         // everyone sees every ship
   actions: {                                   // HANDLERS, one per declared action
     enlist: (input, context) => {
       const ships = { ...context.getState().ships };
@@ -93,9 +93,27 @@ throws `invalid-data` at construction.
 - **`input` is coalesced and unacknowledged.** The right shape for 60 Hz intent —
   movement, aim, camera. Nothing waits for it, and nothing is guaranteed
   individually; the projection converges.
+- **Declare secrets with `visibility` on the definition — prefer it to a
+  hand-written `project`.** Path → rule: `'everyone'`, `'nobody'` (host only),
+  `'owner'` (the first `*` key is the player's peer id — needs no setup), or a list
+  of audiences. `'x.length': 'everyone'` reveals only an array's count. Presets
+  `'open'` (say it when everything is public) and `'card-game'`, with overrides
+  `{ preset: 'card-game', …}`. Hidden collection entries are REMOVED; hidden
+  fields become `HIDDEN` — wrap those fields' validators with `hiddenOr(parse)`
+  or `hostStore` throws `invalid-data`. Rules apply after any `project` /
+  `projectFor`, so code cannot widen them. With neither `project` nor
+  `projectFor`, the rules alone decide. Prove it: `assertHidden(definition,
+  state, { peer, audience }, ['players.<peer>.hand'])`. Pass `dev: true` to
+  `hostStore` in development. No `team` rule yet — use audiences.
 - **`project(state, audience)` decides what each audience may see**, applied by
   the host before anything leaves. A replica cannot read what it was not given;
   do not rely on client-side hiding.
+- **Per-player secrets (a hand of cards) need `projectFor(state, { peer,
+  audience })`** instead of `project` — `project` is computed once per audience
+  and cannot tell two players apart. Give exactly one of the two (both, or
+  neither, throws `invalid-data`). `peer` is the same 16-hex id as
+  `context.peer`, so a state keyed by `context.peer` is filtered with
+  `state.hands[peer]`. It costs one projection per player per change.
 - **`authorize(request)` decides whether a request is allowed** — and it is
   consulted on the **ongoing delta feed**, not just at join. A read that policy
   has since revoked stops arriving rather than being served because the handle
@@ -113,7 +131,7 @@ throws `invalid-data` at construction.
 | `definition`, `store` | which document type, and which instance of it |
 | `transport` | a `StoreTransport` — see below |
 | `initialState`, `actions`, `inputs` | the document, and the **handlers** for its transactions and coalesced intents (the definition holds only their validators) |
-| `authorize`, `project` | admission and per-audience visibility |
+| `authorize`, `project` / `projectFor` | admission, and visibility per audience (`project`) or per player (`projectFor`) — exactly one |
 | `maxEventBytes` | **required** — the bound on one frame; a snapshot over it is chunked (8104 in the package's own tests and demo) |
 
 | Joiner | Meaning |
@@ -256,34 +274,68 @@ writes.
   node**, so test two players with **two browser profiles** (or two browsers),
   not two tabs.
 - **`maxEventBytes` is required on both sides and must match** — use 8104.
-- **The host player cannot `joinStore` its own node** — it throws `invalid-data`
-  (a node has no session with itself). Render the host's page from `host`
-  (`bindEntities({ store: host, … })`) and apply the host player's moves through
-  the **same handlers**, checking the same `authorize` first. Keep `authorize`,
-  `actions` and `inputs` as named values so both paths share them:
+- **The host player plays through `hostPlayer(host, { audience })`**, never
+  `joinStore` on its own node (that throws `invalid-data` — a node has no session
+  with itself). `hostPlayer` returns the same handle shape as `joinStore`
+  (`ready`, `getState`, `subscribe`, `act`, `input`, `setAudience`, `close`),
+  held to the host's own `authorize` with the host's node id as `peer`, and its
+  `getState()` is the **projection** for its audience, not the raw document. So
+  game code, `bindEntities` included, never branches on "am I the host":
 
   ```js
-  const self = node.nodeIdHex();
-  const context = () => ({
-    peer: self,
-    getState: () => host.getState(),
-    // host.setState REPLACES the document; a handler's setState merges — so merge here.
-    setState: (patch) => host.setState({ ...host.getState(), ...patch }),
-  });
-  const hostAct = (name, input) => {
-    if (!authorize({ type: 'action', peer: self, name, input })) throw new Error('forbidden');
-    return actions[name](input, context());
-  };
-  const hostInput = (name, value) => {
-    if (authorize({ type: 'input', peer: self, name, input: value })) inputs[name](value, context());
-  };
-  hostAct('enlist', {});
+  import { hostPlayer } from '@net-mesh/browser';
+  const world = isHost
+    ? hostPlayer(host, { audience: ['crew'] })
+    : joinStore({ definition, transport: node, host: hostId, audience: ['crew'], key: 'player', maxEventBytes: 8104 });
+  await world.ready();
+  await world.act('enlist', {});
   ```
+
+  Do not hand-roll a wrapper that calls the handlers directly — it skips input
+  validation, the transaction, and the result checks a replica gets.
 
 - **Give each player an entity with an `enlist` action keyed by `context.peer`**
   (the authenticated caller — never an id the client sends). A joiner does
   `await replica.ready(); await replica.act('enlist', …)` before steering.
-- **Discovery before join.** Share the host's `node.nodeIdHex()` out of band (the
+- **Large worlds: interest management.** On the definition, `interest: {
+  <top-level entity map>: (entity, id) => key | null }` (any string; `null` =
+  delivered to everyone); `cellKey(x, z, size)` is the grid key. A replica joins
+  with `interest: cellsAround(x, z, { size, radius? })` and moves with
+  `setInterest(keys)` — send `stickyCells(prev, x, z, { size })` only when
+  `!sameCells(next, prev)`. Entering/leaving entities arrive as one delta (no
+  blank frame); far changes send nothing. Bounds: ≤ 256 keys, ≤ 64 bytes each,
+  and the whole set must fit one message. Interest is a filter, NOT a permission
+  — keep secrets in `visibility`. `hostPlayer(host, { audience, interest })` and
+  `joinLobby({ interest })` take it too. Entity maps must be top-level keys.
+- **React to players with the single `onEvent(event, context)` hook** on
+  `hostStore` / `createLobby`: `{ type: 'join', peer, audience }`,
+  `{ type: 'leave', peer, reason: 'left' | 'expired' | 'refused' | 'dropped' }`,
+  `{ type: 'area', peer, from, to }` (from `areaOf(state, peer) → string | null`,
+  fired only on change, `from: null` first). It is a transaction like a handler
+  (`context.peer` = the player, `setState` reaches every replica, a throw
+  discards its writes), runs after the causing frame, and includes the host's own
+  player. Put per-player setup (spawn, starter inventory) in `join`, not in an
+  `enlist` action the client must remember to call.
+- **Inventories:** keep `inventories: Record<peer, Inventory>` in state
+  (`Inventory` = item id → count). Change them only with `addItems` /
+  `removeItems` (they throw `InventoryError` `full` / `insufficient` /
+  `invalid`, which refuses the action with nothing written), read with
+  `countItems` / `hasItems` / `inventoryOf`, validate with `parseInventory(value,
+  rules)` in the definition's `state`, and hide other players' with
+  `projectFor: (state, { peer }) => ({ ...state, inventories: onlyOwn(state.inventories, peer) })`.
+  Trading is not built — do not fake it with two independent actions.
+- **Prefer a lobby over hand-rolled discovery.** `createLobby({ node, game,
+  name, capacity, info?, visibility?, …hostStore options })` hosts the store,
+  gives the host `lobby.self` (a `hostPlayer`), and re-announces on its own;
+  `listLobbies({ node, game })` returns `{ code, name, players, capacity, info,
+  host, store }`; `joinLobby({ node, definition, game, code | lobby })` finds
+  the host and returns a `joinStore` handle (await `ready()`). Capacity counts
+  the host; a full lobby answers `forbidden`. `lobby.kick(peer)` is immediate.
+  `joinLobby` throws `LobbyError` `not-found` / `ambiguous` (two nodes claim
+  the code — never pick one) / `invalid`. A lobby owns its node's
+  announcements (pass other tags as `tags`); unlisted lobbies are not secret —
+  gate with `authorize`. Codes: `lobby.link()` / `lobbyCodeFromUrl()`.
+- **Discovery before join** (without a lobby). Share the host's `node.nodeIdHex()` out of band (the
   demo uses a `?host=<hex>` link). The host announces a tag and **re-announces
   every ~2 s** — announcements are leases that expire. The joiner polls
   `node.query(tag)` until the host is present — compare with
@@ -316,9 +368,15 @@ writes.
 - **Store naming.** The name defaults to the definition id; a lobby and a match
   on one host need `store: 'lobby'` / `store: 'match'` on both sides, and two
   stores with the same name on one transport throw `invalid-data`.
-- **Prototype offline first.** `net/crates/net/browser-ts/demo/` runs a host and
-  two players in one page over a local bus — the real store, no anchor, no
-  network. It proves game logic, not that two browsers can connect.
+- **Prototype offline first** with `@net-mesh/browser/local`:
+  `const mesh = createLocalMesh(); const hostNode = mesh.node(); const guestNode = mesh.node();`
+  — each node is a `transport` for `hostStore` / `joinStore`, in one page, with
+  the real store and no anchor or network. Local nodes also `announce(tags)` and
+  `query(tag)` like a real node (another node's announcement, never your own;
+  it expires after 300 s unless re-announced), so the find-the-host loop works
+  offline unchanged. It proves game logic, not that two
+  browsers can connect; switch the nodes to `connect()` for that. The package
+  demo (`net/crates/net/browser-ts/demo/`) runs this way by default.
 
 ## What is not established (do not present it as proven)
 

@@ -12,6 +12,23 @@ upgraded together — the SDK is a thin typed layer over the native binding, so
 a version skew shows up as a missing method at the call site rather than at
 install time.
 
+## Unreleased
+
+### Added
+
+- **`MeshNode.onStreamData(streamId, handler)`** — every event on a
+  stream, with `peerNodeId`: the peer whose session authenticated it.
+  `recv` / `recvShard` return events with no sender; this is the receive
+  path for anything that decides by who is asking. One subscription per
+  stream id; `close()` hands the stream back to `recv`.
+- **`streamIdFromLabel(label)`** — the stream id a label names, the same
+  derivation the browser package uses (now one function, in the wire
+  crate).
+- **`meshStoreTransport(mesh, { listen })`** — the browser package's
+  `StoreTransport` over a native node: a dedicated host for
+  `@net-mesh/browser` stores, with `authorize` seeing each player's real
+  id.
+
 ## Unreleased — targets 0.35.0
 
 ### Breaking

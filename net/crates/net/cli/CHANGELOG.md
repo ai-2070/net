@@ -10,6 +10,17 @@ and output shape.
 
 ## Unreleased — managed nodes, join links, relations and leave
 
+**Browsers for your games (`anchor serve`)**
+- New `--game <id>[:<per-minute>]` (repeatable) with `--issuer-identity`:
+  the anchor serves enrollment and issues anonymous visitor credentials at
+  `POST <url>/credential`. Each game has its own enrollment root derived
+  from the issuer key; issuance is limited per game and per source IP
+  (`--credentials-per-minute`); `--game-stats-secs` prints per-game
+  counters. The start report gains `games` and `credential_endpoint`.
+- `--credential-issuer` is now optional when `--issuer-identity` is given.
+- `--inspect-target` omits `credential_issuer_fingerprint` when only
+  `--issuer-identity` names the issuer (inspection reads no key files).
+
 **Nodes and links**
 - New `up` / `down` / `node status`: one long-lived node per profile, a
   lifetime lock and an authenticated local control endpoint.

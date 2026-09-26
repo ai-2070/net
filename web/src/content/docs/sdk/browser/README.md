@@ -121,9 +121,14 @@ request: one node hosts an authoritative document, others join replicas of it,
 and a subpath binds the entities to a scene graph.
 
 ```typescript
-import { defineStore, hostStore, joinStore } from '@net-mesh/browser';
+import { defineStore, hostStore, joinStore, hostPlayer } from '@net-mesh/browser';
 import { bindEntities } from '@net-mesh/browser/three';
+import { createLocalMesh } from '@net-mesh/browser/local';   // offline development
 ```
+
+`hostPlayer` is the hosting node's own player, with the same handle shape as a
+joined replica. `@net-mesh/browser/local` runs several nodes in one page with no
+anchor, for building game logic before there is a network.
 
 `@net-mesh/browser/three` imports nothing from `three` — the scene graph is
 anything with `add` and `remove`, and the types are structural — so the package

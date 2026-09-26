@@ -17,6 +17,10 @@
     "./three": {
       "types": "./dist/three/index.d.ts",
       "default": "./dist/three/index.js"
+    },
+    "./local": {
+      "types": "./dist/local.d.ts",
+      "default": "./dist/local.js"
     }
   },
   "sideEffects": false,
@@ -45,7 +49,8 @@
     "build": "tsc && node scripts/bundle.mjs",
     "size": "node scripts/size.mjs",
     "test": "tsc -p tsconfig.test.json && vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "bench:world": "node scripts/bench-world.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.28.0",

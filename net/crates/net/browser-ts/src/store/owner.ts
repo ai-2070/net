@@ -36,6 +36,7 @@ import { assertChunkingFits, chunkSnapshot } from './chunker.js';
 import { StoreCore } from './core.js';
 import { StoreError, type StoreErrorCode } from './errors.js';
 import type { JsonObject, JsonValue } from './json.js';
+import { applyVisibility, compileVisibility, type CompiledVisibility } from './visibility.js';
 import {
   canonicalRequest,
   digestBinding,
@@ -64,6 +65,7 @@ import {
   type CallerMessage,
   type Hex,
   type WireOp,
+  MAX_PATH_SEGMENT_BYTES,
 } from './wire.js';
 
 /** Actions in flight per owner, against the pending bound (§2). */
@@ -101,8 +103,43 @@ export interface OwnerDeps<S extends object, A extends ActionSpec, I extends Inp
    * The audience projection: what this caller may see. Returning the
    * whole state is a decision, not a default — `empty()` is what
    * absence looks like.
+   *
+   * Computed once per DISTINCT audience and shared by every handle
+   * carrying it. Exactly one of `project` and {@link projectFor} is
+   * given.
    */
-  project(state: S, audience: readonly string[]): S;
+  project?(state: S, audience: readonly string[]): S;
+  /**
+   * The per-player projection: what THIS player may see — their own
+   * hand, their own fog of war. Handed the authenticated peer with the
+   * audience it reads.
+   *
+   * Computed once per distinct (peer, audience) pair, so its cost per
+   * change grows with the number of players, where `project`'s grows
+   * with the number of distinct audiences. That is inherent: a view
+   * that depends on who is looking has to be taken for each of them.
+   */
+  projectFor?(state: S, viewer: Viewer): S;
+  /**
+   * The one hook for things that happen to players: `join`, `leave`,
+   * `area`. Runs on the host as a transaction with the player as
+   * `context.peer`, exactly like an action handler — so it can
+   * `setState` (a starting inventory on join) — and its changes reach
+   * every replica. Synchronous; a throw discards its writes.
+   */
+  onEvent?(event: StoreEvent, context: ActionContext<S>): void;
+  /**
+   * Development warnings: a store that sends everything to everyone
+   * without saying so, a projection the state validator refuses. Off
+   * unless given; never on by default in production.
+   */
+  warn?(message: string): void;
+  /**
+   * Which area a player is in, for `area` events: any string (a zone,
+   * a room, a grid cell), or `null` for none. Read-only; called after
+   * changes, for each present player.
+   */
+  areaOf?(state: S, peer: string): string | null;
   /** The admissible frame size, derived from the transport (§1.9). */
   readonly maxEventBytes: number;
   /** Monotone clock, milliseconds. */
@@ -132,6 +169,42 @@ export interface OwnerDeps<S extends object, A extends ActionSpec, I extends Inp
   readonly inputs: InputHandlers<S, I>;
 }
 
+/** Why a player left, as `onEvent` hears it. */
+export type LeaveReason =
+  /** The player closed their handle. */
+  | 'left'
+  /** Its lease ran out: a closed tab, a lost connection. */
+  | 'expired'
+  /** `authorize` stopped granting its read: a kick, a revoked permission. */
+  | 'refused'
+  /** Its view could not be delivered (too large, or `project` failed). */
+  | 'dropped';
+
+/**
+ * What happened to a player, for the host's single `onEvent` hook.
+ *
+ * - `join`: a player arrived — their first subscription, or the host's
+ *   own player (`hostPlayer`). Per player, not per connection.
+ * - `leave`: their last subscription ended, and why.
+ * - `area`: `areaOf(state, peer)` gave a different answer than it last
+ *   did for them (`from` is `null` the first time).
+ */
+export type StoreEvent =
+  | { readonly type: 'join'; readonly peer: string; readonly audience: readonly string[] }
+  | { readonly type: 'leave'; readonly peer: string; readonly reason: LeaveReason }
+  | { readonly type: 'area'; readonly peer: string; readonly from: string | null; readonly to: string | null };
+
+/** How many hook runs one drain may perform before it stops (see `drainEvents`). */
+export const MAX_EVENT_ROUNDS = 256;
+
+/** Who a per-player projection is for. */
+export interface Viewer {
+  /** The authenticated peer, 16 lowercase hex — as `context.peer`. */
+  readonly peer: string;
+  /** The audience this handle reads. */
+  readonly audience: readonly string[];
+}
+
 /** One handler per declared action. */
 export type ActionHandlers<S extends object, A extends ActionSpec> = {
   readonly [K in keyof A]: (
@@ -154,8 +227,15 @@ export interface OwnerHandle {
   readonly audience: readonly string[];
   /** Highest generation allocated for this handle; monotone (§1.7a). */
   readonly generation: number;
-  /** The revision its current installation was taken at. */
+  /**
+   * The revision this replica's view is at: its installation's, then
+   * each delta's `r`. A delta's `base` is THIS, not the owner's previous
+   * revision — a replica whose view did not change on a commit was sent
+   * nothing and is still here, and a `base` it never had is a gap.
+   */
   readonly revision: number;
+  /** Its interest set; `null` when it declared none (sees every entity). */
+  readonly interest: readonly string[] | null;
   /** Last accepted authenticated message, for the lease. */
   readonly lastSeen: number;
 }
@@ -189,6 +269,37 @@ export interface Dispatched {
 interface Counters {
   [reason: string]: number;
 }
+
+/** One entity that changed between two views of an interest collection. */
+interface InterestChange {
+  readonly collection: string;
+  readonly id: string;
+  readonly before: unknown;
+  readonly after: unknown;
+  readonly beforeKey: string | null;
+  readonly afterKey: string | null;
+}
+
+/** A view's change, split for per-handle interest filtering. */
+interface InterestDiff {
+  /** Root ops for everything outside the interest collections. */
+  readonly rest: readonly WireOp[];
+  readonly entities: readonly InterestChange[];
+  /** Interest collections that were not entity maps on both sides. */
+  readonly whole: readonly { readonly collection: string; readonly after: unknown }[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Placeholder correlation and handle for sizing a local result as the
+ * `res` a replica would receive. Same lengths as real ones, so the
+ * budget test measures the same bytes.
+ */
+const LOCAL_Q = '0'.repeat(16) as Hex;
+const LOCAL_H = '0'.repeat(32) as Hex;
 
 /**
  * The owner half of the store protocol.
@@ -232,7 +343,42 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     if (this.incarnation.length !== INCARNATION_HEX_LENGTH) {
       throw new StoreError('invalid-data', 'newIncarnation must return 16 lowercase hex');
     }
+    // Exactly one projection. Neither would ship nothing truthful;
+    // both would leave which one decides a secret to the reader of
+    // this file.
+    const projections = (typeof deps.project === 'function' ? 1 : 0) + (typeof deps.projectFor === 'function' ? 1 : 0);
+    const declared = deps.definition.visibility;
+    if (projections > 1 || (projections === 0 && declared === undefined)) {
+      throw new StoreError(
+        'invalid-data',
+        'a host needs one of `project` and `projectFor`, or a definition that declares `visibility`',
+      );
+    }
+    this.visibility = declared === undefined ? null : compileVisibility(declared);
+    this.perPlayer = typeof deps.projectFor === 'function' || this.visibility?.perPlayer === true;
     this.core = new StoreCore({ definition: deps.definition, initialState: deps.definition.empty() });
+  }
+
+  /** Whether projections depend on the peer (`projectFor`, or an `owner` rule). */
+  private readonly perPlayer: boolean;
+  /** The definition's declared rules, compiled; `null` when it declares none. */
+  private readonly visibility: CompiledVisibility | null;
+  /** Development warnings already given, so each is said once. */
+  private readonly warned = new Set<string>();
+
+  private warnOnce(message: string): void {
+    if (this.deps.warn === undefined || this.warned.has(message)) return;
+    this.warned.add(message);
+    try {
+      this.deps.warn(message);
+    } catch {
+      // A logger's failure is not the store's.
+    }
+  }
+
+  /** The key under which two handles are certain to receive the same projection. */
+  private viewKey(peer: string, audience: readonly string[]): string {
+    return this.perPlayer ? JSON.stringify([peer, audience]) : JSON.stringify(audience);
   }
 
   /** Counters a host can report. Every refusal moves exactly one. */
@@ -291,10 +437,11 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    */
   private propagate(previous: S, current: S): Outbound[] {
     const out: Outbound[] = [];
-    const base = String(this.revisionBeforeCommit);
     const r = String(this.core.revision);
-    // One projection pair and one root diff per DISTINCT audience,
-    // shared by every handle that carries it. Projecting and diffing
+    const interestCache = new Map<string, InterestDiff | null>();
+    // One projection pair and one root diff per DISTINCT audience
+    // (per distinct peer and audience under `projectFor`), shared by
+    // every handle that carries it. Projecting and diffing
     // per handle made this O(handles × world) JSON work per commit:
     // both projections were freshly built per handle, so `shallowDiff`'s
     // identity test could never fire and every key paid its
@@ -320,7 +467,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       // refusal here because the feed is the grant: leaving it alive would
       // let `alive` renew the lease of a peer the policy now forbids.
       if (!this.permitsRead(handle.peer, handle.audience)) {
-        this.forget(handle.h);
+        this.forget(handle.h, 'refused');
         // `closed`, the wire's legal unsolicited refusal (§1.12 admits
         // exactly `closed` and `owner-lost` without a `q`): it closes
         // the subscription, the replica rejoins, and the JOIN — a
@@ -331,16 +478,31 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         continue;
       }
 
-      const audienceKey = JSON.stringify(handle.audience);
-      let ops = diffs.get(audienceKey);
-      if (ops === undefined) {
-        const before = this.project(handle.audience, previous);
-        const after = this.project(handle.audience, current);
-        ops =
-          before === null || after === null
-            ? null
-            : shallowDiff(before as JsonObject, after as JsonObject);
-        diffs.set(audienceKey, ops);
+      const audienceKey = this.viewKey(handle.peer, handle.audience);
+      let ops: readonly WireOp[] | null | undefined;
+      if (this.interestFns.length > 0 && handle.interest !== null) {
+        // Interest-filtered: the view's diff, shared per view, is split
+        // into the rest of the document and per-entity changes, and each
+        // handle takes only the entities its interest covers.
+        let diff = interestCache.get(audienceKey);
+        if (diff === undefined) {
+          const before = this.project(handle.peer, handle.audience, previous);
+          const after = this.project(handle.peer, handle.audience, current);
+          diff = before === null || after === null ? null : this.interestDiff(before, after);
+          interestCache.set(audienceKey, diff);
+        }
+        ops = diff === null ? null : this.interestOps(diff, handle.interest);
+      } else {
+        ops = diffs.get(audienceKey);
+        if (ops === undefined) {
+          const before = this.project(handle.peer, handle.audience, previous);
+          const after = this.project(handle.peer, handle.audience, current);
+          ops =
+            before === null || after === null
+              ? null
+              : shallowDiff(before as JsonObject, after as JsonObject);
+          diffs.set(audienceKey, ops);
+        }
       }
       if (ops === null) {
         // `project` and its `empty()` fallback both failed: there is
@@ -360,11 +522,12 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       if (ops.length === 0) continue;
 
       const delta = encodeDeltaWithin(
-        { k: 'delta', h: handle.h, g: String(handle.generation), base, r, ops },
+        { k: 'delta', h: handle.h, g: String(handle.generation), base: String(handle.revision), r, ops },
         this.deps.maxEventBytes,
       );
       if (delta !== null) {
         out.push({ peer: handle.peer, h: handle.h, frame: delta });
+        this.handles.set(handle.h, { ...handle, revision: this.core.revision });
         continue;
       }
       // Too large to carry as a patch: replace the whole view.
@@ -406,6 +569,117 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
   }
 
   /**
+   * The host's own player: whether `peer` may read `audience`.
+   *
+   * The same `authorize` call a `join` makes. There is no handle, no
+   * lease and no ledger — the host's player has no wire to lose a
+   * frame on and no request to replay — but there is the policy.
+   */
+  localRead(peer: string, audience: readonly string[]): boolean {
+    return this.permitsRead(peer, audience);
+  }
+
+  /** The host's own player: the projection a replica of `audience` receives. */
+  localView(peer: string, audience: readonly string[], interest: readonly string[] | null = null): S | null {
+    const view = this.project(peer, audience);
+    return view === null ? null : this.filterInterest(view, interest);
+  }
+
+  /**
+   * The host's own player: one action, through the ladder a replica's
+   * `act` takes after the wire — known name, `authorize`, then one
+   * transaction that parses the input, runs the handler and validates
+   * the output, and a result that must fit the message budget a
+   * replica would have received it in.
+   *
+   * `input` is what `parseStoreJson` produced from the caller's value,
+   * so the handler sees exactly what it would see from a replica.
+   */
+  localAct(
+    name: string,
+    input: JsonValue,
+    peer: string,
+  ): { readonly outcome: Outcome; readonly dispatched: Dispatched } {
+    if (!Object.prototype.hasOwnProperty.call(this.deps.definition.actions, name)) {
+      return {
+        outcome: { kind: 'refusal', code: 'invalid-data' },
+        dispatched: this.refuse('local-act-unknown-name'),
+      };
+    }
+    if (!this.permitsAction(peer, name, input)) {
+      return {
+        outcome: { kind: 'refusal', code: 'forbidden' },
+        dispatched: this.refuse('local-act-forbidden'),
+      };
+    }
+    const spec = this.deps.definition.actions[name as keyof A];
+    const before = this.core.getState() as S;
+    this.revisionBeforeCommit = this.core.revision;
+    let outcome: Outcome;
+    try {
+      const handler = this.deps.actions[name as keyof A];
+      const produced = this.core.transact(context => {
+        const out = spec.output(handler(spec.input(input), context)) as JsonObject;
+        // The budget a replica's `res` would have had to fit. A result
+        // that works for the host and not for its players is a bug the
+        // host would never see, so it is refused here the same way.
+        const frame = encodeMessage({
+          k: 'res',
+          q: LOCAL_Q,
+          h: LOCAL_H,
+          s: '1',
+          out,
+        });
+        if (utf8Length(frame) > this.deps.maxEventBytes) {
+          throw new StoreError('capacity', 'the result does not fit the message budget');
+        }
+        return out;
+      }, peer);
+      outcome = { kind: 'result', out: produced };
+    } catch (error) {
+      outcome = {
+        kind: 'refusal',
+        code:
+          error instanceof StoreError && error.code === 'capacity' ? 'capacity' : 'action-rejected',
+      };
+    }
+    const after = this.core.getState() as S;
+    const propagated = Object.is(before, after) ? [] : this.propagate(before, after);
+    return {
+      outcome,
+      dispatched:
+        outcome.kind === 'refusal'
+          ? this.refuse(`local-act-${outcome.code}`, propagated)
+          : this.accept(propagated),
+    };
+  }
+
+  /**
+   * The host's own player: one latest-value input, through the same
+   * ladder as a replica's `in` after the wire. No sequence: a local
+   * call cannot arrive out of order.
+   */
+  localInput(name: string, input: JsonValue, peer: string): Dispatched {
+    if (!Object.prototype.hasOwnProperty.call(this.deps.definition.inputs, name)) {
+      return this.refuse('local-in-unknown-name');
+    }
+    if (!this.permitsInput(peer, name, input)) return this.refuse('local-in-forbidden');
+    const before = this.core.getState() as S;
+    this.revisionBeforeCommit = this.core.revision;
+    try {
+      this.core.transact(context => {
+        const parse = this.deps.definition.inputs[name as keyof I];
+        const handler = this.deps.inputs[name as keyof I];
+        handler(parse(input), context);
+      }, peer);
+    } catch {
+      return this.refuse('local-in-rejected');
+    }
+    const after = this.core.getState() as S;
+    return this.accept(Object.is(before, after) ? [] : this.propagate(before, after));
+  }
+
+  /**
    * Dispatch one inbound frame.
    *
    * `peer` is the **authenticated** originating caller — see the module
@@ -432,9 +706,11 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         return this.accept([{ peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) }]);
       }
       case 'leave': {
-        this.forget(bound.h);
+        this.forget(bound.h, 'left');
         return this.accept([{ peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) }]);
       }
+      case 'int':
+        return this.interestChange(message, bound, peer, now);
       case 'act':
         return this.action(message, bound, peer, now);
       case 'in':
@@ -499,6 +775,9 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         const rebound: OwnerHandle = {
           ...bound,
           audience: [...message.aud],
+          // A resume states the caller's desired interest too; an `aud`
+          // leaves it as it was.
+          interest: message.k === 'resume' && message.int !== undefined ? [...message.int] : bound.interest,
           lastSeen: now,
         };
         this.handles.set(rebound.h, rebound);
@@ -823,12 +1102,178 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * ledger table bounded by live handles instead of by the owner's
    * lifetime.
    */
-  private forget(h: Hex): void {
+  private forget(h: Hex, reason: LeaveReason = 'dropped'): void {
+    const gone = this.handles.get(h);
     this.handles.delete(h);
     this.ledgers.forget(h);
     // §1.8: expiry retires any projection already pending, and a dead
     // handle never acquires one.
     this.deferred.delete(h);
+    if (gone === undefined) return;
+    this.presenceChanged(gone.peer, reason);
+    this.membershipChanged();
+  }
+
+  // ─────────────────────────────── events ───────────────────────────
+
+  /** Peers present as players: a handle installed, or a local player. */
+  private readonly present = new Set<string>();
+  private readonly localPlayers = new Set<string>();
+  private readonly pendingEvents: StoreEvent[] = [];
+  private readonly areas = new Map<string, string | null>();
+  private areasAt = -1;
+  /** Set by `farewell`: a closing store raises no more events. */
+  private ending = false;
+
+  private get wantsEvents(): boolean {
+    return this.deps.onEvent !== undefined || this.deps.areaOf !== undefined;
+  }
+
+  private isPresent(peer: string): boolean {
+    if (this.localPlayers.has(peer)) return true;
+    for (const handle of this.handles.values()) if (handle.peer === peer) return true;
+    return false;
+  }
+
+  /** Queue `join` / `leave` when a peer's presence actually flips. */
+  private presenceChanged(peer: string, reason: LeaveReason | null, audience: readonly string[] = []): void {
+    if (!this.wantsEvents || this.ending) return;
+    const now = this.isPresent(peer);
+    const was = this.present.has(peer);
+    if (now === was) return;
+    if (now) {
+      this.present.add(peer);
+      this.pendingEvents.push(Object.freeze({ type: 'join', peer, audience: Object.freeze([...audience]) }));
+    } else {
+      this.present.delete(peer);
+      this.areas.delete(peer);
+      this.pendingEvents.push(Object.freeze({ type: 'leave', peer, reason: reason ?? 'dropped' }));
+    }
+  }
+
+  /**
+   * The host's own player arriving or going (`hostPlayer`). It has no
+   * handle, but it is a player: `onEvent` hears it like any other.
+   */
+  localPresence(peer: string, joined: boolean, audience: readonly string[] = [], reason: LeaveReason = 'left'): void {
+    if (joined) this.localPlayers.add(peer);
+    else this.localPlayers.delete(peer);
+    this.presenceChanged(peer, joined ? null : reason, audience);
+  }
+
+  /** Queue `area` events for present players whose area moved. */
+  private detectAreas(): void {
+    const areaOf = this.deps.areaOf;
+    if (areaOf === undefined || this.ending) return;
+    if (this.areasAt === this.core.revision && [...this.present].every(peer => this.areas.has(peer))) return;
+    this.areasAt = this.core.revision;
+    const state = this.core.getState() as S;
+    for (const peer of this.present) {
+      let area: string | null;
+      try {
+        const value = this.core.runReadOnly(() => areaOf(state, peer));
+        area = typeof value === 'string' ? value : null;
+      } catch {
+        area = null;
+      }
+      const known = this.areas.has(peer);
+      const from = known ? (this.areas.get(peer) ?? null) : null;
+      this.areas.set(peer, area);
+      if (known ? from !== area : area !== null) {
+        this.pendingEvents.push(Object.freeze({ type: 'area', peer, from, to: area }));
+      }
+    }
+  }
+
+  /**
+   * Run `onEvent` for everything queued, each as its own transaction,
+   * and return what those transactions changed for the replicas.
+   *
+   * Called by the host AFTER the frame that caused the events has been
+   * dispatched — never inside it — so a hook never runs in the middle
+   * of a projection pass. A hook that throws discards its writes, as a
+   * handler's do, and is counted. A hook whose writes cause more events
+   * (a teleport on join) is served in the same drain, up to a bound, so
+   * two hooks cannot ping-pong forever.
+   */
+  drainEvents(): Dispatched {
+    const out: Outbound[] = [];
+    if (!this.wantsEvents) return this.accept(out);
+    for (let rounds = 0; ; rounds += 1) {
+      if (this.pendingEvents.length === 0) this.detectAreas();
+      const event = this.pendingEvents.shift();
+      if (event === undefined) break;
+      if (rounds >= MAX_EVENT_ROUNDS) {
+        this.pendingEvents.length = 0;
+        this.counters['event-rounds-bound'] = (this.counters['event-rounds-bound'] ?? 0) + 1;
+        break;
+      }
+      const hook = this.deps.onEvent;
+      if (hook === undefined) continue;
+      const before = this.core.getState() as S;
+      this.revisionBeforeCommit = this.core.revision;
+      try {
+        this.core.transact(context => hook(event, context), event.peer);
+      } catch {
+        this.counters['event-rejected'] = (this.counters['event-rejected'] ?? 0) + 1;
+        continue;
+      }
+      const after = this.core.getState() as S;
+      if (!Object.is(before, after)) out.push(...this.propagate(before, after));
+    }
+    return this.accept(out);
+  }
+
+  /** Listeners told when the set of installed handles changes. */
+  private readonly membership = new Set<() => void>();
+
+  private membershipChanged(): void {
+    for (const listener of [...this.membership]) {
+      try {
+        listener();
+      } catch {
+        // A listener is application code on the frame path; its
+        // failure must not take the dispatch down with it.
+      }
+    }
+  }
+
+  /**
+   * Be told when a handle is installed or forgotten — join, leave,
+   * expiry, a policy refusal, closure. Synchronous, inside the frame
+   * that caused it: a listener reads {@link peers} and must not call
+   * back into the owner.
+   */
+  onMembership(listener: () => void): Cancel {
+    this.membership.add(listener);
+    return () => {
+      this.membership.delete(listener);
+    };
+  }
+
+  /** The distinct authenticated peers with an installed handle. */
+  peers(): readonly string[] {
+    return [...new Set([...this.handles.values()].map(handle => handle.peer))];
+  }
+
+  /**
+   * Re-ask `authorize` for every installed read, now.
+   *
+   * The delta feed re-authorizes before shipping, but only when there
+   * is a change to ship: a policy that revokes a peer (a kick) would
+   * otherwise leave it subscribed until the next commit. A refused
+   * handle is forgotten with the same unsolicited `closed` the feed
+   * sends, so the replica rejoins and its join is answered
+   * `forbidden`.
+   */
+  reauthorize(): Dispatched {
+    const out: Outbound[] = [];
+    for (const handle of [...this.handles.values()]) {
+      if (this.permitsRead(handle.peer, handle.audience)) continue;
+      this.forget(handle.h, 'refused');
+      out.push(this.no(handle.peer, handle.h, 'closed', null));
+    }
+    return this.accept(out);
   }
 
   /**
@@ -890,7 +1335,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     const expired: { h: Hex; peer: string }[] = [];
     for (const [h, handle] of [...this.handles]) {
       if (now - handle.lastSeen >= HANDLE_LEASE_MS) {
-        this.forget(h);
+        this.forget(h, 'expired');
         expired.push({ h, peer: handle.peer });
       }
     }
@@ -921,6 +1366,8 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * a second call has nothing to say.
    */
   farewell(): readonly Outbound[] {
+    this.ending = true;
+    this.pendingEvents.length = 0;
     const out: Outbound[] = [];
     for (const [h, handle] of [...this.handles]) {
       this.forget(h);
@@ -1001,6 +1448,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       inc: this.incarnation,
       peer,
       audience: [...message.aud],
+      interest: message.int === undefined ? null : [...message.int],
       generation: 0,
       revision: this.core.revision,
       lastSeen: now,
@@ -1014,6 +1462,8 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       this.forget(h);
       return this.refuse('join-projection-capacity', [this.no(peer, null, 'capacity', message.q)]);
     }
+    this.presenceChanged(peer, null, message.aud);
+    this.membershipChanged();
     return this.accept(emitted);
   }
 
@@ -1025,7 +1475,8 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * guessing.
    */
   private install(handle: OwnerHandle, q: Hex | null): Outbound[] | null {
-    const projected = this.project(handle.audience);
+    const base = this.project(handle.peer, handle.audience);
+    const projected = base === null ? null : this.filterInterest(base, handle.interest);
     // `null` means the application could produce neither a projection
     // nor its own empty value. There is nothing truthful to ship, so
     // the emission fails and the caller refuses.
@@ -1087,6 +1538,160 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     }
   }
 
+  // ───────────────────────────── interest ───────────────────────────
+
+  /** The definition's interest collections and their key functions. */
+  private get interestFns(): readonly (readonly [string, (entity: unknown, id: string) => string | null])[] {
+    this.#interestFns ??= Object.entries(this.deps.definition.interest ?? {}).map(
+      ([collection, key]) => [collection, key as (entity: unknown, id: string) => string | null] as const,
+    );
+    return this.#interestFns;
+  }
+  #interestFns: readonly (readonly [string, (entity: unknown, id: string) => string | null])[] | undefined;
+
+  /** An entity's interest key; a key function that throws or returns a non-string means "no key": always delivered. */
+  private interestKey(fn: (entity: unknown, id: string) => string | null, entity: unknown, id: string): string | null {
+    try {
+      const key = this.core.runReadOnly(() => fn(entity, id));
+      return typeof key === 'string' ? key : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** A view narrowed to the entities an interest set covers. */
+  private filterInterest(view: S, interest: readonly string[] | null): S {
+    if (interest === null || this.interestFns.length === 0) return view;
+    const wanted = new Set(interest);
+    const out: Record<string, unknown> = { ...(view as Record<string, unknown>) };
+    for (const [collection, fn] of this.interestFns) {
+      const entities = out[collection];
+      if (!isRecord(entities)) continue;
+      const kept: Record<string, unknown> = {};
+      for (const [id, entity] of Object.entries(entities)) {
+        const key = this.interestKey(fn, entity, id);
+        if (key === null || wanted.has(key)) kept[id] = entity;
+      }
+      out[collection] = kept;
+    }
+    return out as S;
+  }
+
+  /** One view's change, split for interest: the rest of the document, and per-entity changes with their keys. */
+  private interestDiff(before: S, after: S): InterestDiff {
+    const collections = new Set(this.interestFns.map(([collection]) => collection));
+    const strip = (view: S): JsonObject => {
+      const rest: JsonObject = {};
+      for (const [key, value] of Object.entries(view as JsonObject)) if (!collections.has(key)) rest[key] = value;
+      return rest;
+    };
+    const rest = shallowDiff(strip(before), strip(after));
+    const entities: InterestChange[] = [];
+    const whole: { collection: string; after: unknown }[] = [];
+    for (const [collection, fn] of this.interestFns) {
+      const b = (before as Record<string, unknown>)[collection];
+      const a = (after as Record<string, unknown>)[collection];
+      if (!isRecord(b) || !isRecord(a)) {
+        // Not an entity map on one side: replaced whole, filtered per handle.
+        if (JSON.stringify(b) !== JSON.stringify(a)) whole.push({ collection, after: a });
+        continue;
+      }
+      for (const id of new Set([...Object.keys(b), ...Object.keys(a)])) {
+        const was = Object.prototype.hasOwnProperty.call(b, id) ? b[id] : undefined;
+        const now = Object.prototype.hasOwnProperty.call(a, id) ? a[id] : undefined;
+        if (Object.is(was, now) || (was !== undefined && now !== undefined && JSON.stringify(was) === JSON.stringify(now))) {
+          continue;
+        }
+        entities.push({
+          collection,
+          id,
+          before: was,
+          after: now,
+          beforeKey: was === undefined ? null : this.interestKey(fn, was, id),
+          afterKey: now === undefined ? null : this.interestKey(fn, now, id),
+        });
+      }
+    }
+    return { rest, entities, whole };
+  }
+
+  /** The ops one handle receives for a split diff. */
+  private interestOps(diff: InterestDiff, interest: readonly string[]): WireOp[] {
+    const wanted = new Set(interest);
+    const covers = (key: string | null): boolean => key === null || wanted.has(key);
+    const ops: WireOp[] = [...diff.rest];
+    for (const change of diff.entities) {
+      const wasIn = change.before !== undefined && covers(change.beforeKey);
+      const isIn = change.after !== undefined && covers(change.afterKey);
+      if (isIn) ops.push({ o: 'r', p: [change.collection, change.id], val: change.after as JsonValue });
+      else if (wasIn) ops.push({ o: 'x', p: [change.collection, change.id] });
+    }
+    for (const entry of diff.whole) {
+      const filtered = this.filterInterest({ [entry.collection]: entry.after } as S, interest) as Record<string, unknown>;
+      ops.push({ o: 'r', p: [entry.collection], val: filtered[entry.collection] as JsonValue });
+    }
+    return ops;
+  }
+
+  /**
+   * A new interest set: the entities entering it arrive, the ones leaving
+   * go, in one delta — the view never blanks — and then `ok`.
+   *
+   * Interest is a filter, not a permission: nothing here asks `authorize`,
+   * because the audience (which is) is unchanged and every entity sent
+   * was already readable under it.
+   */
+  private interestChange(
+    message: Extract<CallerMessage, { k: 'int' }>,
+    bound: OwnerHandle,
+    peer: string,
+    now: number,
+  ): Dispatched {
+    const next: OwnerHandle = { ...bound, interest: [...message.int], lastSeen: now };
+    this.handles.set(next.h, next);
+    const ok: Outbound = { peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) };
+    if (this.interestFns.length === 0 || this.deferred.has(bound.h)) {
+      // Nothing to filter, or an installation is pending that will
+      // project with the new set.
+      return this.accept([ok]);
+    }
+    const view = this.project(peer, bound.audience);
+    if (view === null) {
+      this.forget(bound.h);
+      return this.refuse('int-projection-capacity', [this.no(peer, bound.h, 'capacity', message.q)]);
+    }
+    const before = this.filterInterest(view, bound.interest) as Record<string, unknown>;
+    const after = this.filterInterest(view, next.interest) as Record<string, unknown>;
+    const ops: WireOp[] = [];
+    for (const [collection] of this.interestFns) {
+      const b = before[collection];
+      const a = after[collection];
+      if (!isRecord(b) || !isRecord(a)) continue;
+      for (const id of Object.keys(a)) if (!Object.prototype.hasOwnProperty.call(b, id)) ops.push({ o: 'r', p: [collection, id], val: a[id] as JsonValue });
+      for (const id of Object.keys(b)) if (!Object.prototype.hasOwnProperty.call(a, id)) ops.push({ o: 'x', p: [collection, id] });
+    }
+    if (ops.length === 0) return this.accept([ok]);
+    const r = String(this.core.revision);
+    const delta =
+      bound.revision === this.core.revision
+        ? encodeDeltaWithin(
+            { k: 'delta', h: bound.h, g: String(bound.generation), base: r, r, ops },
+            this.deps.maxEventBytes,
+          )
+        : null;
+    if (delta !== null) return this.accept([{ peer, h: bound.h, frame: delta }, ok]);
+    // Too large for one delta, or this replica is behind the current
+    // revision: replace the view whole — an owner-initiated
+    // installation, admissible at a ready replica — and then `ok`,
+    // which arrives after the last chunk.
+    const frames = this.install(next, null);
+    if (frames === null) {
+      this.forget(bound.h);
+      return this.refuse('int-projection-capacity', [this.no(peer, bound.h, 'capacity', message.q)]);
+    }
+    return this.accept([...frames, ok]);
+  }
+
   /**
    * The audience projection, validated by the definition.
    *
@@ -1094,9 +1699,44 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * must not be shipped as a snapshot, so it becomes `empty()` — the
    * value that represents absence — rather than the full state.
    */
-  private project(audience: readonly string[], state: S = this.core.getState() as S): S | null {
+  private project(
+    peer: string,
+    audience: readonly string[],
+    state: S = this.core.getState() as S,
+  ): S | null {
     try {
-      return this.deps.definition.state(this.deps.project(state, audience));
+      const viewer: Viewer = Object.freeze({ peer, audience: Object.freeze([...audience]) });
+      const base =
+        this.deps.projectFor !== undefined
+          ? this.deps.projectFor(state, viewer)
+          : this.deps.project !== undefined
+            ? this.deps.project(state, audience)
+            : state;
+      if (this.visibility === null && base === state) {
+        this.warnOnce(
+          `store '${this.deps.definition.id}': every player receives the full state. ` +
+            "Declare `visibility: 'open'` on the definition if that is intended, or rules for what is secret.",
+        );
+      }
+      // Declared rules apply AFTER the hand-written projection: code can
+      // narrow what a rule allows, never widen it.
+      const projected = this.visibility === null ? base : applyVisibility(this.visibility, base, viewer);
+      // Nothing withheld and nothing rebuilt: this IS a committed state,
+      // which the core validated when it was committed. Validating again
+      // builds fresh objects, and fresh objects defeat every identity
+      // check downstream — the diff then serializes every entity to find
+      // the few that moved (measured, scripts/bench-world.mjs).
+      if (projected === state) return state;
+      try {
+        return this.deps.definition.state(projected);
+      } catch (error) {
+        this.warnOnce(
+          `store '${this.deps.definition.id}': a projection failed the state validator, so the player got empty() — ` +
+            `${error instanceof Error ? error.message : String(error)}` +
+            (this.visibility === null ? '' : ' (a hidden field is the HIDDEN marker: wrap its parser with hiddenOr)'),
+        );
+        throw error;
+      }
     } catch {
       // `empty()` is application code as well, and it is reached
       // precisely when the application has already thrown once. A
@@ -1124,7 +1764,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     const handle = this.handles.get(h);
     if (handle === undefined) return 'handle-unknown';
     if (now - handle.lastSeen >= HANDLE_LEASE_MS) {
-      this.forget(h);
+      this.forget(h, 'expired');
       return 'handle-expired';
     }
     if (handle.peer !== peer) return 'handle-foreign-peer';
@@ -1170,19 +1810,61 @@ function shallowDiff(before: JsonObject, after: JsonObject): WireOp[] {
   for (const key of Object.keys(after)) {
     const nextValue = after[key];
     if (Object.prototype.hasOwnProperty.call(before, key) && Object.is(before[key], nextValue)) continue;
+    const previousValue = Object.prototype.hasOwnProperty.call(before, key) ? before[key] : undefined;
+    // One level deeper for a map on both sides: the entries that
+    // changed, not the whole map. Measured (scripts/bench-world.mjs):
+    // moving 5% of 500 ships resent all 62 KB of `ships` every tick,
+    // because any change inside a root key replaced it whole.
+    const entries = previousValue === undefined ? null : entryDiff(key, previousValue, nextValue);
+    if (entries !== null) {
+      ops.push(...entries);
+      continue;
+    }
     // Not `Object.is` alone: reconciliation shares unchanged subtrees,
     // so identity IS the comparison for anything it touched, and a
     // value it could not share is compared by its serialization.
-    if (
-      Object.prototype.hasOwnProperty.call(before, key) &&
-      JSON.stringify(before[key]) === JSON.stringify(nextValue)
-    ) {
+    if (previousValue !== undefined && JSON.stringify(previousValue) === JSON.stringify(nextValue)) {
       continue;
     }
     ops.push({ o: 'r', p: [key], val: nextValue as JsonValue });
   }
   for (const key of Object.keys(before)) {
     if (!Object.prototype.hasOwnProperty.call(after, key)) ops.push({ o: 'x', p: [key] });
+  }
+  return ops;
+}
+
+/** Entry ops worth sending instead of replacing a whole map: at most this many. */
+const MAX_ENTRY_OPS = 128;
+
+/**
+ * The per-entry ops turning map `before` into map `after` under root
+ * `key`, or `null` when replacing the whole value is the better (or
+ * only) choice: not maps on both sides, an entry name the patch path
+ * cannot carry, or more changed entries than {@link MAX_ENTRY_OPS} or
+ * than half the map.
+ */
+function entryDiff(key: string, before: unknown, after: unknown): WireOp[] | null {
+  const isMap = (value: unknown): value is JsonObject =>
+    typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (!isMap(before) || !isMap(after)) return null;
+  const ops: WireOp[] = [];
+  const limit = Math.min(MAX_ENTRY_OPS, Math.max(1, Math.floor(Object.keys(after).length / 2)));
+  const carriable = (entry: string): boolean =>
+    utf8Length(entry) <= MAX_PATH_SEGMENT_BYTES && !['__proto__', 'constructor', 'prototype'].includes(entry);
+  for (const entry of Object.keys(after)) {
+    const next = after[entry];
+    const had = Object.prototype.hasOwnProperty.call(before, entry);
+    if (had && (Object.is(before[entry], next) || JSON.stringify(before[entry]) === JSON.stringify(next))) continue;
+    if (!carriable(entry)) return null;
+    ops.push({ o: 'r', p: [key, entry], val: next as JsonValue });
+    if (ops.length > limit) return null;
+  }
+  for (const entry of Object.keys(before)) {
+    if (Object.prototype.hasOwnProperty.call(after, entry)) continue;
+    if (!carriable(entry)) return null;
+    ops.push({ o: 'x', p: [key, entry] });
+    if (ops.length > limit) return null;
   }
   return ops;
 }

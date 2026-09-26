@@ -54,6 +54,9 @@ typedef enum {
     NET_ERR_REDEX = -103,
     /* Mesh / channel surface (compiled when the Rust cdylib has the
      * `net` feature on). */
+    /* The stream already has a receiver (net_mesh_open_stream_inbox):
+     * one inbox per stream id per node. */
+    NET_ERR_MESH_STREAM_OCCUPIED = -109,
     NET_ERR_MESH_INIT = -110,
     NET_ERR_MESH_HANDSHAKE = -111,
     NET_ERR_MESH_BACKPRESSURE = -112,
@@ -337,6 +340,7 @@ void net_redis_dedup_clear(net_redis_dedup_t* handle);
 
 typedef struct net_meshnode_s    net_meshnode_t;
 typedef struct net_mesh_stream_s net_mesh_stream_t;
+typedef struct net_mesh_stream_inbox_s net_mesh_stream_inbox_t;
 
 /* ---- Lifecycle ---- */
 
@@ -439,6 +443,40 @@ void     net_mesh_stream_free(net_mesh_stream_t* handle);
  * replaced since the handle was opened: the stream id may be live on
  * the successor session and closing it is not this handle's to do. */
 int      net_mesh_close_stream(net_mesh_stream_t* handle);
+
+/* ---- Stream inbox: stream events WITH their authenticated sender ----
+ *
+ * `net_mesh_recv_shard` returns events without a sender. An inbox
+ * receives every event on one stream id, from any peer, with the peer
+ * whose session authenticated it — the receive path for anything that
+ * decides by who is asking (a native host serving the browser store).
+ *
+ * open:    0, or NET_ERR_MESH_STREAM_OCCUPIED if the stream already has
+ *          a receiver. At most `capacity` events wait (0 means 1); more
+ *          are dropped and counted, never blocking the mesh.
+ * recv:    1 = an event: `*out_from_node`, `*out_buf`, `*out_len`
+ *          written; release the buffer with net_free_bytes(buf, len)
+ *          (NULL/0 for an empty payload). 0 = timeout or closed, nothing
+ *          written. Negative = NET_ERR_*.
+ * close:   stop receiving without freeing; a waiting recv returns 0.
+ * free:    close and release. Null your handle afterwards.
+ */
+int      net_mesh_open_stream_inbox(net_meshnode_t* handle,
+                                    uint64_t stream_id,
+                                    uint32_t capacity,
+                                    net_mesh_stream_inbox_t** out_inbox);
+int      net_mesh_stream_inbox_recv(net_mesh_stream_inbox_t* inbox,
+                                    uint32_t timeout_ms,
+                                    uint64_t* out_from_node,
+                                    uint8_t** out_buf,
+                                    size_t* out_len);
+uint64_t net_mesh_stream_inbox_dropped(net_mesh_stream_inbox_t* inbox);
+int      net_mesh_stream_inbox_close(net_mesh_stream_inbox_t* inbox);
+void     net_mesh_stream_inbox_free(net_mesh_stream_inbox_t* inbox);
+
+/* The stream id a label names — the browser leaf's derivation. Any
+ * UTF-8 string is a label. Returns 0 and writes `*out_id`. */
+int      net_stream_id_from_label(const char* label, uint64_t* out_id);
 
 /* Send a batch of payloads on an open stream.
  *
