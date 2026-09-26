@@ -47,6 +47,10 @@ var (
 	// `SendBlocking` propagate it immediately instead of absorbing
 	// it like ErrBackpressure.
 	ErrSessionSuperseded = errors.New("stream session superseded")
+	// ErrStreamOccupied: the stream already has a receiver
+	// (NET_ERR_MESH_STREAM_OCCUPIED, -109) — one StreamInbox per
+	// stream id per node. Close the first to open another.
+	ErrStreamOccupied = errors.New("stream already has a receiver")
 
 	// One payload in the batch is larger than what the stream can
 	// carry to its peer (NET_ERR_MESH_EVENT_TOO_LARGE, -118).
@@ -93,6 +97,8 @@ func meshErrorFromCode(code C.int) error {
 		return ErrInvalidUTF8
 	case -3:
 		return ErrInvalidJSON
+	case -109:
+		return ErrStreamOccupied
 	case -110:
 		return ErrMeshInit
 	case -111:

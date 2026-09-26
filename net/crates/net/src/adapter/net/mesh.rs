@@ -2070,6 +2070,76 @@ pub type StreamInboundSink = Arc<dyn Fn(StreamInboundEvent) + Send + Sync + 'sta
 /// Registered stream sinks by full stream id: `(registration_id, sink)`.
 type StreamInboundMap = DashMap<u64, (u64, StreamInboundSink)>;
 
+/// A queue of one stream's events, each with its authenticated sender
+/// ([`MeshNode::open_stream_inbox`]). Closing — or dropping — it
+/// unregisters the sink, and the stream's events go back to the shard
+/// queue. Holds the node weakly: an open inbox never keeps a node alive.
+pub struct StreamInbox {
+    node: std::sync::Weak<MeshNode>,
+    stream_id: u64,
+    registration_id: u64,
+    rx: parking_lot::Mutex<std::sync::mpsc::Receiver<StreamInboundEvent>>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl StreamInbox {
+    /// The stream this inbox receives.
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// The next event, waiting up to `timeout`; `None` on timeout or once
+    /// closed.
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<StreamInboundEvent> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        self.rx.lock().recv_timeout(timeout).ok()
+    }
+
+    /// The next event if one is waiting; never blocks.
+    pub fn try_recv(&self) -> Option<StreamInboundEvent> {
+        self.rx.lock().try_recv().ok()
+    }
+
+    /// Whether [`Self::close`] has run.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Events dropped because `capacity` were already waiting.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Stop receiving. Idempotent; `true` only for the call that
+    /// unregistered the sink.
+    pub fn close(&self) -> bool {
+        if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return false;
+        }
+        self.node.upgrade().is_some_and(|node| {
+            node.unregister_stream_inbound(self.stream_id, self.registration_id)
+        })
+    }
+}
+
+impl Drop for StreamInbox {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl std::fmt::Debug for StreamInbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamInbox")
+            .field("stream_id", &self.stream_id)
+            .field("dropped", &self.dropped())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The per-`u16`-wire-bucket list of registered nRPC inbound
 /// dispatchers: `(canonical ChannelHash, registration_id,
 /// dispatcher)` (OA2-E0.1 — the id enables conditional teardown).
@@ -33956,6 +34026,42 @@ impl MeshNode {
                 Some(registration_id)
             }
         }
+    }
+
+    /// A pull-based receiver for `stream_id`: a stream sink that queues
+    /// each [`StreamInboundEvent`] — with its authenticated sender — for
+    /// [`StreamInbox::recv_timeout`] to take.
+    ///
+    /// For callers that must not run on the receive path: a binding
+    /// whose callback would take a language lock (Python's GIL) or cross
+    /// an FFI boundary (cgo). At most `capacity` events wait; beyond
+    /// that an arriving event is DROPPED and counted
+    /// ([`StreamInbox::dropped`]) rather than stalling the mesh's
+    /// receive loop. `None` when the stream already has a sink.
+    pub fn open_stream_inbox(
+        self: &Arc<Self>,
+        stream_id: u64,
+        capacity: usize,
+    ) -> Option<StreamInbox> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity.max(1));
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sink: StreamInboundSink = {
+            let dropped = dropped.clone();
+            Arc::new(move |event| {
+                if tx.try_send(event).is_err() {
+                    dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+        let registration_id = self.register_stream_inbound(stream_id, sink)?;
+        Some(StreamInbox {
+            node: Arc::downgrade(self),
+            stream_id,
+            registration_id,
+            rx: parking_lot::Mutex::new(rx),
+            dropped,
+            closed: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// Remove the sink registered for `stream_id` under

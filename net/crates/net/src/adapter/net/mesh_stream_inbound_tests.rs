@@ -221,3 +221,60 @@ async fn an_unregistered_stream_still_lands_in_the_shard_queue() {
     );
     assert!(seen.lock().is_empty());
 }
+
+#[tokio::test]
+async fn an_inbox_queues_events_with_their_sender_bounds_what_waits_and_unregisters_when_dropped() {
+    let host = node().await;
+    let alice = node().await;
+    connect(&alice, &host).await;
+    host.start();
+    alice.start();
+    let stream_id = net_wire::channel::name::stream_id_from_label(LABEL);
+
+    let inbox = host.open_stream_inbox(stream_id, 2).expect("vacant");
+    assert!(
+        host.open_stream_inbox(stream_id, 2).is_none(),
+        "one receiver per stream"
+    );
+    let stream = alice
+        .open_stream(host.node_id(), stream_id, reliable())
+        .unwrap();
+    alice
+        .send_on_stream(
+            &stream,
+            &[
+                Bytes::from_static(b"one"),
+                Bytes::from_static(b"two"),
+                Bytes::from_static(b"three"),
+            ],
+        )
+        .await
+        .unwrap();
+    // Capacity 2: two wait, the third is dropped and counted — the
+    // receive loop is never stalled for a slow consumer.
+    for _ in 0..200 {
+        if inbox.dropped() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(inbox.dropped(), 1);
+    let first = inbox.recv_timeout(Duration::from_secs(2)).expect("first");
+    let second = inbox.recv_timeout(Duration::from_secs(2)).expect("second");
+    assert_eq!(
+        (first.from_node, first.payload.to_vec()),
+        (alice.node_id(), b"one".to_vec())
+    );
+    assert_eq!(
+        (second.from_node, second.payload.to_vec()),
+        (alice.node_id(), b"two".to_vec())
+    );
+    assert!(inbox.try_recv().is_none());
+
+    drop(inbox);
+    let (sink, _) = collecting();
+    assert!(
+        host.register_stream_inbound(stream_id, sink).is_some(),
+        "dropping the inbox unregistered its sink"
+    );
+}

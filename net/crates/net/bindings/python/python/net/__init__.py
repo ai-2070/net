@@ -201,6 +201,8 @@ try:
         NetStreamStats,
         NotConnectedError,
         SessionSupersededError,
+        StreamData,
+        StreamInbox,
         generate_net_keypair,
     )
 except ImportError:
@@ -220,6 +222,8 @@ else:
             "NetStreamStats",
             "NotConnectedError",
             "SessionSupersededError",
+            "StreamData",
+            "StreamInbox",
             "generate_net_keypair",
         ]
     )
@@ -233,6 +237,7 @@ try:
         TokenError,
         channel_hash,
         delegate_token,
+        stream_id_from_label,
         normalize_gpu_vendor,
         parse_token,
         token_is_expired,
@@ -249,6 +254,7 @@ else:
             "TokenError",
             "channel_hash",
             "delegate_token",
+            "stream_id_from_label",
             "normalize_gpu_vendor",
             "parse_token",
             "token_is_expired",

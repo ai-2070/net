@@ -516,9 +516,19 @@ their creator, and every region in P4, need a host that is not a player.
     dependency on `@net-mesh/browser`). Witness `store_transport.test.ts`: a
     native host serves the browser store's own source to two native players
     and `authorize` refuses one by the peer the transport reports.
-  - Not yet: the browser-page ↔ native-host witness in the runner (the
-    leaf ↔ native stream path it would ride is already witnessed byte-exact
-    by `stage5.rs`), and Python / Go / C surfaces for `onStreamData`.
+  - Browser witness: `stage5_a_labeled_page_stream_reaches_a_native_sink_attributed_to_the_page`
+    (runner `stage5.rs`, pinned in ci.yml, floors 96/85): a real page opens
+    the stream BY LABEL, its derived id equals the native derivation, and
+    every event reaches the native sink attributed to the page's node id,
+    with the shard queue untouched. Passes locally in Chrome.
+  - Python / Go / C: a pull-based inbox, `MeshNode::open_stream_inbox`
+    (bounded; overflow dropped and counted, never blocking the receive
+    loop) — Python `NetMesh.open_stream_inbox` / `StreamInbox`, C
+    `net_mesh_open_stream_inbox` / `_recv` / `_dropped` / `_close` / `_free`
+    + `net_stream_id_from_label` + `NET_ERR_MESH_STREAM_OCCUPIED` (-109) in
+    both headers, Go `MeshNode.OpenStreamInbox` / `StreamInbox` /
+    `StreamIDFromLabel` / `ErrStreamOccupied`. Witnessed in Rust (core +
+    the C ABI end to end), pytest and `go test`.
 - **A dedicated host** runs the same `hostStore` with game rules loaded from the
   developer's code, on a native node, discoverable by the same lobby tags.
 - **Browser players become pure replicas** of it, so the "host sees

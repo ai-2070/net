@@ -1140,6 +1140,118 @@ mod mesh_bindings {
         super::ChannelError::new_err(format!("channel: {}", err))
     }
 
+    /// One event from a :class:`StreamInbox`, with the peer whose
+    /// session authenticated it — never a value the packet carries.
+    #[pyclass(frozen, module = "_net")]
+    pub struct StreamData {
+        /// The authenticated sender's node id.
+        #[pyo3(get)]
+        pub peer_node_id: u64,
+        /// The stream it arrived on.
+        #[pyo3(get)]
+        pub stream_id: u64,
+        payload: Vec<u8>,
+    }
+
+    #[pymethods]
+    impl StreamData {
+        /// The event's payload.
+        #[getter]
+        fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyBytes> {
+            pyo3::types::PyBytes::new(py, &self.payload)
+        }
+
+        fn __repr__(&self) -> String {
+            format!(
+                "StreamData(peer_node_id={:#x}, stream_id={:#x}, payload=<{} bytes>)",
+                self.peer_node_id,
+                self.stream_id,
+                self.payload.len()
+            )
+        }
+    }
+
+    /// Every event on one stream, each with its authenticated sender —
+    /// what ``poll`` cannot give you (its events have no sender).
+    ///
+    /// Returned by :meth:`NetMesh.open_stream_inbox`. Events queue here
+    /// until :meth:`recv` takes them; at most ``capacity`` wait, and an
+    /// event arriving beyond that is dropped and counted in
+    /// :attr:`dropped` rather than stalling the mesh. :meth:`close` (or
+    /// leaving a ``with`` block) stops it, and the stream's events go
+    /// back to ``poll``.
+    #[pyclass(module = "_net")]
+    pub struct StreamInbox {
+        inner: net::adapter::net::StreamInbox,
+    }
+
+    #[pymethods]
+    impl StreamInbox {
+        /// The stream this inbox receives.
+        #[getter]
+        fn stream_id(&self) -> u64 {
+            self.inner.stream_id()
+        }
+
+        /// Events dropped because ``capacity`` were already waiting.
+        #[getter]
+        fn dropped(&self) -> u64 {
+            self.inner.dropped()
+        }
+
+        /// The next event, or ``None`` on timeout or once closed.
+        ///
+        /// ``timeout_ms=None`` waits until an event arrives or the inbox
+        /// is closed. The GIL is released while waiting, and a wait
+        /// without a timeout still answers ``KeyboardInterrupt``.
+        #[pyo3(signature = (timeout_ms=None))]
+        fn recv(&self, py: Python<'_>, timeout_ms: Option<u64>) -> PyResult<Option<StreamData>> {
+            let event = match timeout_ms {
+                Some(ms) => py.detach(|| self.inner.recv_timeout(Duration::from_millis(ms))),
+                None => loop {
+                    let slice = py.detach(|| self.inner.recv_timeout(Duration::from_millis(200)));
+                    if slice.is_some() {
+                        break slice;
+                    }
+                    if self.inner.is_closed() {
+                        break None;
+                    }
+                    py.check_signals()?;
+                },
+            };
+            Ok(event.map(|event| StreamData {
+                peer_node_id: event.from_node,
+                stream_id: event.stream_id,
+                payload: event.payload.to_vec(),
+            }))
+        }
+
+        /// The next event if one is waiting; never blocks.
+        fn try_recv(&self) -> Option<StreamData> {
+            self.inner.try_recv().map(|event| StreamData {
+                peer_node_id: event.from_node,
+                stream_id: event.stream_id,
+                payload: event.payload.to_vec(),
+            })
+        }
+
+        /// Stop receiving. Idempotent; ``True`` only for the call that
+        /// closed it.
+        fn close(&self) -> bool {
+            self.inner.close()
+        }
+
+        fn __enter__(slf: Py<Self>) -> Py<Self> {
+            slf
+        }
+
+        #[pyo3(signature = (*_args))]
+        fn __exit__(&self, _args: &Bound<'_, pyo3::types::PyTuple>) -> bool {
+            self.inner.close();
+            false
+        }
+    }
+
     /// Handle to an open stream. Opaque to Python callers.
     ///
     /// Async equivalent: :class:`AsyncNetStream` — awaitable
@@ -2200,6 +2312,31 @@ mod mesh_bindings {
             let node = self.get_node()?;
             node.close_stream(peer_node_id, stream_id);
             Ok(())
+        }
+
+        /// Receive every event on ``stream_id`` — from any peer — with the
+        /// peer that sent it, instead of through ``poll``.
+        ///
+        /// ``poll`` returns events without a sender; an inbox is the
+        /// receive path for anything that decides by who is asking. Pair
+        /// with :func:`stream_id_from_label` to agree on an id with a
+        /// browser page. One inbox per stream id.
+        ///
+        /// Raises:
+        ///     RuntimeError: the stream already has a receiver.
+        #[pyo3(signature = (stream_id, capacity=4096))]
+        fn open_stream_inbox(&self, stream_id: u64, capacity: usize) -> PyResult<StreamInbox> {
+            let node = self
+                .node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let inner = node.open_stream_inbox(stream_id, capacity).ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "open_stream_inbox: stream {stream_id:#x} already has a receiver"
+                ))
+            })?;
+            Ok(StreamInbox { inner })
         }
 
         /// Send a batch of events on an explicit stream. Each event is
@@ -3981,6 +4118,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_net_keypair, m)?)?;
     #[cfg(feature = "net")]
     m.add_class::<mesh_bindings::NetMesh>()?;
+    m.add_class::<mesh_bindings::StreamInbox>()?;
+    m.add_class::<mesh_bindings::StreamData>()?;
     #[cfg(feature = "net")]
     m.add_class::<mesh_bindings::NetStream>()?;
     #[cfg(feature = "net")]
@@ -4044,6 +4183,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(identity::token_is_expired, m)?)?;
         m.add_function(wrap_pyfunction!(identity::delegate_token, m)?)?;
         m.add_function(wrap_pyfunction!(identity::channel_hash, m)?)?;
+        m.add_function(wrap_pyfunction!(identity::stream_id_from_label, m)?)?;
         m.add_function(wrap_pyfunction!(capabilities::normalize_gpu_vendor, m)?)?;
         m.add(
             "IdentityError",

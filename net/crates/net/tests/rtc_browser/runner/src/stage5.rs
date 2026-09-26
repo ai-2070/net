@@ -241,7 +241,7 @@ const ABI_PROXY_SIZE: usize = 700;
 /// Every Stage 5 witness name, in ledger order. The CI job pins these
 /// exactly; the list is here so a rename is one edit and a drop is
 /// impossible to do quietly.
-pub const WITNESSES: [&str; 20] = [
+pub const WITNESSES: [&str; 21] = [
     "stage5_leaf_handshake_over_the_real_listener",
     "stage5_reliable_round_trip",
     "stage5_nrpc_call_to_a_native_service",
@@ -268,6 +268,8 @@ pub const WITNESSES: [&str; 20] = [
     "stage5_a_refused_connect_closes_rtc_and_hands_back_its_attempt",
     "stage5_direct_close_ends_a_parked_iterator_in_the_live_package",
     "stage5_direct_close_refuses_a_later_open_with_the_leafs_typed_fence",
+    // Appended (indexed by position, see above).
+    "stage5_a_labeled_page_stream_reaches_a_native_sink_attributed_to_the_page",
 ];
 
 // ===================================================================
@@ -3292,6 +3294,153 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 cx.anchor.shard_for_stream(ABI_LEAF_FRAG_STREAM_ID),
                 delivered.len(),
                 peer_state(cx.anchor, node_id),
+            ),
+        );
+    }
+
+    // ================================================================
+    // 21 — a page's LABELED stream reaches a native stream sink, and
+    //      every event is attributed to the page
+    //
+    // The seam a native host serving the browser store stands on: the
+    // store opens `store/<definition id>` BY LABEL, the leaf derives the
+    // id, and the host receives through `register_stream_inbound`, whose
+    // `from_node` is the only identity the store's `authorize` ever sees.
+    // Three facts, all asserted here with the real leaf in a real
+    // browser: the page's derived id is the native derivation (one
+    // function, `net_wire::channel::name::stream_id_from_label` — the
+    // page is NOT given the id), every event lands in the sink with the
+    // page's node id as its sender, and none of them also lands in the
+    // shard queue.
+    // ================================================================
+    {
+        const SINK_LABEL: &str = "store/stage5.sink-witness";
+        const SINK_EVENTS: usize = 4;
+        const SINK_SIZE: usize = 256;
+        let derived = net::adapter::net::stream_id_from_label(SINK_LABEL);
+        let seen: Arc<std::sync::Mutex<Vec<(u64, u64, Vec<u8>)>>> = Arc::default();
+        let sink: net::adapter::net::StreamInboundSink = {
+            let seen = seen.clone();
+            Arc::new(move |event: net::adapter::net::StreamInboundEvent| {
+                if let Ok(mut list) = seen.lock() {
+                    list.push((event.from_node, event.stream_id, event.payload.to_vec()));
+                }
+            })
+        };
+        let registration = cx.anchor.register_stream_inbound(derived, sink);
+
+        let open = script
+            .run(
+                "a",
+                Step5::StreamOpen {
+                    id: 0,
+                    session: "main".into(),
+                    handle: "sink".into(),
+                    reliable: true,
+                    label: Some(SINK_LABEL.into()),
+                    // Deliberately absent: the page derives it.
+                    stream_id: None,
+                    channel_hash: None,
+                },
+            )
+            .await;
+        let reported_id = stat_str(&open, "stream_id");
+        let derived_hex = format!("{derived:016x}");
+        let same_id = reported_id == format!("\"{derived_hex}\"");
+        // The anchor's side of the id, as witness 16 does: a receive half
+        // with per-stream state to acknowledge against.
+        let native = cx
+            .anchor
+            .open_stream(
+                node_id,
+                derived,
+                StreamConfig::new().with_reliability(Reliability::Reliable),
+            )
+            .map_err(|e| e.to_string());
+        let seed = 0x5100 ^ (rand_u64() & 0xFFFF);
+        let wrote = if open.ok && native.is_ok() && registration.is_some() {
+            script
+                .run(
+                    "a",
+                    Step5::StreamWrite {
+                        id: 0,
+                        handle: "sink".into(),
+                        frames: vec![],
+                        seed,
+                        size: SINK_SIZE,
+                        count: SINK_EVENTS,
+                        drop_every: 0,
+                        reorder_every: 0,
+                    },
+                )
+                .await
+        } else {
+            fail(format!(
+                "not attempted: page open ok={} anchor open={native:?} sink registered={}",
+                open.ok,
+                registration.is_some()
+            ))
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline
+            && seen.lock().map(|list| list.len()).unwrap_or(0) < SINK_EVENTS
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let events = seen.lock().map(|list| list.clone()).unwrap_or_default();
+        let got: Vec<Mark> = events
+            .iter()
+            .map(|(_, _, payload)| Mark::of(payload))
+            .collect();
+        let want = expected_marks(seed, SINK_SIZE, SINK_EVENTS);
+        let senders: std::collections::BTreeSet<u64> =
+            events.iter().map(|(from, _, _)| *from).collect();
+        let on_stream = events.iter().all(|(_, stream, _)| *stream == derived);
+        let attributed = senders.len() == 1 && senders.contains(&node_id);
+        // Nothing ALSO went to the queue the sink replaces.
+        let queued = match cx
+            .anchor
+            .poll_shard(cx.anchor.shard_for_stream(derived), None, 512)
+            .await
+        {
+            Ok(result) => result.events.len(),
+            Err(_) => usize::MAX,
+        };
+        let released = registration
+            .map(|id| cx.anchor.unregister_stream_inbound(derived, id))
+            .unwrap_or(false);
+        let pass = registration.is_some()
+            && open.ok
+            && same_id
+            && native.is_ok()
+            && wrote.ok
+            && got == want
+            && attributed
+            && on_stream
+            && queued == 0
+            && released;
+        ledger.record(
+            WITNESSES[20],
+            pass,
+            format!(
+                "A LABELED stream from the page to a native stream sink. The anchor registered \
+                 a sink on stream_id_from_label({SINK_LABEL:?}) = {derived_hex} \
+                 (registered={}). The page opened the stream through the built package BY \
+                 LABEL ONLY — no id given — and reports id {reported_id}, the native \
+                 derivation={same_id}: one formula on both sides. The page wrote \
+                 {SINK_EVENTS} × {SINK_SIZE} B (ok={}, error={:?}). The sink received {} \
+                 event(s), marks {got:?} against the expected {want:?}; every event's \
+                 authenticated sender is the page's node {node_id:#x} = {attributed} \
+                 (senders seen: {senders:?}), all on the derived stream = {on_stream}. The \
+                 shard queue for that stream holds {queued} event(s) afterwards (0 = the \
+                 sink REPLACED the queue, not duplicated it), and the sink unregistered \
+                 cleanly = {released}. This is the receive path a native host serving the \
+                 browser store stands on (`meshStoreTransport` over `onStreamData`): its \
+                 `authorize` sees exactly this sender.",
+                registration.is_some(),
+                wrote.ok,
+                wrote.error,
+                events.len(),
             ),
         );
     }
