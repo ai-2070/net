@@ -1,0 +1,26 @@
+AGENTS.md
+  s_d8b00bedd146e9::t_50b421823ee11f 109
+net/crates/net/bindings/node/src/lib.rs
+  s_d8b00bedd146e9::t_3e27d62e421fbc 67-72
+  s_d8b00bedd146e9::t_6645b6c99b6b31 19-21,23
+net/crates/net/src/adapter/net/mesh.rs
+  s_d8b00bedd146e9::t_faaca20a6e4bff 63992-63996
+.github/scripts/fmt.py
+  s_d8b00bedd146e9::t_9a9421879a6b7f 1-68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "493fdfb8d96840464a2f753020e2ccb1b88f28ad",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
