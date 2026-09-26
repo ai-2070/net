@@ -587,13 +587,16 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
       raw => this.deps.definition.state(raw),
       this.deps.now(),
     );
-    // No epoch check here, and not for want of trying: a
-    // cancellation from the VALIDATOR is caught by the one in
-    // `#install` — the epoch it compares moved for the validator's
-    // cancellation exactly as it does for a subscriber's — and I
-    // could not construct an observable the two answer differently,
-    // including the notification count. An inverse that goes green is
-    // a guard that is not there, so it is not there.
+    // A cancellation from the VALIDATOR, noticed before anything is
+    // published. `#install`'s own epoch check runs only AFTER
+    // `applySnapshot` has notified subscribers, so leaving this to it
+    // handed every subscriber the cancelled world and then an empty
+    // one. That went unobserved for as long as the owner's projection
+    // happened to call the shared validator first and spent the
+    // cancellation there; once an identity projection stopped
+    // re-validating, "stays fenced when the definition cancels while
+    // validating" saw `[5, 0]`.
+    if (this.#epoch !== epoch) return this.#drop('superseded-installation');
     if (!outcome.ok) {
       // A fatal refusal has destroyed the assembly; a non-fatal one
       // (a duplicate) leaves it open and is only counted.

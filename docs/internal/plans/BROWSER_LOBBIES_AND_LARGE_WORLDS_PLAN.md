@@ -389,6 +389,66 @@ choice without breaking anything:
 
 ---
 
+### Measurements (2026-09-26, `browser-ts/scripts/bench-world.mjs`)
+
+`npm run bench:world` runs the built package over the local mesh: every frame
+really encoded, chunked, parsed and applied; no network. World: entities at 2
+per 32-unit cell on average, 5% of them moving each tick, one `setState` per
+tick, 40 ticks. Modes: `full` (no interest), `interest` (each player reads the
+3×3 cells around it), `owner` (interest plus a per-player secret,
+`ships.*.cargo: 'owner'`). Windows dev box, Node 24; medians.
+
+| mode | entities × players | host ms/tick | bytes/player/tick | initial bytes/player |
+|---|---|---|---|---|
+| full | 500 × 16 | 1.8 | 3,082 | 62,050 |
+| full | 8,000 × 16 | 767 | 1,002,012 (whole world, 127 frames) | 1,001,791 |
+| interest | 500 × 16 | 1.1 | 219 | 2,171 |
+| interest | 8,000 × 16 | 18.1 | 235 | 2,452 |
+| owner | 500 × 16 | 22 | 238 | 2,691 |
+| owner | 8,000 × 16 | 531 | 257 | 3,043 |
+| interest, 0 players | 8,000 | 15.6 | — | — |
+
+**Acceptance, as far as it goes.** Bytes per player are flat in world size under
+interest (≈ 200–250 B/tick from 500 to 8,000 entities) — met. Host work for
+interest is flat in player count (18.1 ms at 4 or 16 players) — the fan-out is
+cheap. Host work is **not** proportional to dirty cells: see the first finding.
+
+**Fixed on the way** (each found by the harness, each with a witness):
+
+1. A change inside a root map resent the whole map (500 ships: 62 KB per player
+   per tick, 9 frames). The owner's diff now goes one level deeper for maps
+   (≤ 128 entry ops, and fewer than half the map): 3.1 KB, 1 frame.
+2. Visibility was quadratic: a copy-on-write set per hidden entry and a scan of
+   all hidden paths per match. Now one edit tree and one rebuild. `owner`
+   500 × 16: 700 → 22 ms; 2,000 × 4: 6,649 → 30 ms.
+3. An identity projection (`'open'`, no `project`) re-validated the committed
+   state per view, building fresh objects that defeated every identity check
+   downstream. Skipped: 8,000-entity interest 30 → 17 ms.
+4. That change exposed a latent replica defect: a validator that cancels during
+   assembly published the cancelled document before clearing it. The existing
+   witness had been passing only because the owner's projection spent the
+   cancellation first. `#chunk` now checks the epoch before installing.
+
+**Open findings:**
+
+- **The commit itself is O(world).** 8,000 entities with **no players** cost
+  15.6 ms per `setState`: the core validates the whole document on every commit,
+  and every action and input transaction commits the same way. Host cost cannot
+  be proportional to dirty cells without an incremental write path (validate the
+  changed entities, not the world). This is an API decision, not a tuning pass.
+- **Per-player projections are O(world × players)** (`owner` 8,000 × 16:
+  531 ms). With declared visibility and no hand-written projection, rules are
+  path-local, so the host could filter by interest *before* projecting and keep
+  a maintained spatial index (cell → ids, updated from the commit's changed
+  entities): per-player cost O(nearby). Not built.
+- **A delta is one frame.** A tick changing more than fits 8 KB (≈ 100 moved
+  entities without interest) reinstalls the whole view (`full` 2,000+). Chunked
+  deltas would be a wire change; with interest it does not arise per player.
+- **One unreproduced stall.** The first `interest` sweep ended with an unsettled
+  await (a promise nothing would settle). Not reproduced in five further full
+  sweeps; the harness now bounds each point (`--limit-ms`) and names the one that
+  stalls.
+
 ## 6. P3 — dedicated hosts
 
 **Why:** a player's tab is a fragile, all-seeing host. Lobbies that outlive

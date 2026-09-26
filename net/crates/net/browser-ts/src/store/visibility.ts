@@ -188,6 +188,7 @@ function allows(rule: VisibilityRule, captures: readonly string[], viewer: Viewe
 interface Match {
   readonly keys: readonly (string | number)[];
   readonly captures: readonly string[];
+  readonly value: unknown;
 }
 
 /** Every concrete location a pattern names in `value`. */
@@ -195,7 +196,7 @@ function matches(value: unknown, segments: readonly string[]): Match[] {
   const out: Match[] = [];
   const walk = (node: unknown, depth: number, keys: (string | number)[], captures: string[]): void => {
     if (depth === segments.length) {
-      out.push({ keys: [...keys], captures: [...captures] });
+      out.push({ keys: [...keys], captures: [...captures], value: node });
       return;
     }
     if (typeof node !== 'object' || node === null) return;
@@ -218,55 +219,53 @@ function matches(value: unknown, segments: readonly string[]): Match[] {
 
 const DROP = Symbol('drop');
 
-/** Copy-on-write set along `keys`. */
-function setIn(root: unknown, keys: readonly (string | number)[], value: unknown): unknown {
-  if (keys.length === 0) return value;
-  const [head, ...rest] = keys;
-  if (Array.isArray(root)) {
-    const copy = [...root];
-    copy[head as number] = setIn(copy[head as number], rest, value);
-    return copy;
-  }
-  const record = root as Record<string, unknown>;
-  return { ...record, [head as string]: setIn(record[head as string], rest, value) };
+/**
+ * Pending edits as a tree mirroring the paths they touch: a node either
+ * replaces its location (`value`) or has children to descend into.
+ * Applying it rebuilds only the touched paths, each once — where a
+ * copy-on-write set per edit copied a 500-entry map 500 times
+ * (measured: 170 ms per tick for 4 players, scripts/bench-world.mjs).
+ */
+interface Edit {
+  value?: unknown;
+  readonly children: Map<string | number, Edit>;
 }
 
-/** Remove the DROP sentinels: object keys deleted, array entries filtered. */
-function sweep(node: unknown): unknown {
+function record(edits: Edit, keys: readonly (string | number)[], value: unknown): void {
+  let node = edits;
+  for (const key of keys) {
+    let child = node.children.get(key);
+    if (child === undefined) {
+      child = { children: new Map() };
+      node.children.set(key, child);
+    }
+    node = child;
+  }
+  node.value = value;
+}
+
+function rebuild(node: unknown, edits: Edit): unknown {
+  if ('value' in edits) return edits.value;
+  if (edits.children.size === 0 || typeof node !== 'object' || node === null) return node;
   if (Array.isArray(node)) {
-    let changed = false;
     const out: unknown[] = [];
-    for (const child of node) {
-      if (child === DROP) {
-        changed = true;
-        continue;
-      }
-      const next = sweep(child);
-      if (next !== child) changed = true;
-      out.push(next);
-    }
-    return changed ? out : node;
+    node.forEach((child, index) => {
+      const edit = edits.children.get(index);
+      const next = edit === undefined ? child : rebuild(child, edit);
+      if (next !== DROP) out.push(next);
+    });
+    return out;
   }
-  if (typeof node === 'object' && node !== null) {
-    let changed = false;
-    const out: Record<string, unknown> = {};
-    for (const [key, child] of Object.entries(node)) {
-      if (child === DROP) {
-        changed = true;
-        continue;
-      }
-      const next = sweep(child);
-      if (next !== child) changed = true;
-      out[key] = next;
-    }
-    return changed ? out : node;
+  const out: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(node)) {
+    const edit = edits.children.get(key);
+    const next = edit === undefined ? child : rebuild(child, edit);
+    if (next !== DROP) out[key] = next;
   }
-  return node;
+  return out;
 }
 
-function isUnder(keys: readonly (string | number)[], prefix: readonly (string | number)[]): boolean {
-  return prefix.length <= keys.length && prefix.every((key, index) => keys[index] === key);
-}
+const SEP = '\u0000';
 
 /**
  * Apply compiled rules for one viewer (`null`: nobody in particular —
@@ -274,35 +273,42 @@ function isUnder(keys: readonly (string | number)[], prefix: readonly (string | 
  */
 export function applyVisibility<S>(compiled: CompiledVisibility, state: S, viewer: Viewer | null): S {
   if (compiled.rules.length === 0) return state;
-  let out: unknown = state;
-  const hidden: (readonly (string | number)[])[] = [];
+  const edits: Edit = { children: new Map() };
+  // Every hidden location, by its joined path, so "is this under a
+  // hidden ancestor" is a lookup per prefix, not a scan of all of them.
+  const hidden = new Set<string>();
   let touched = false;
 
   for (const rule of compiled.rules) {
     if (rule.counts) continue;
+    // A `.length` rule on this path may reveal the count.
+    const countRule = compiled.rules.find(
+      candidate =>
+        candidate.counts &&
+        candidate.segments.length === rule.segments.length + 1 &&
+        candidate.segments.slice(0, -1).every((segment, index) => segment === rule.segments[index]),
+    );
+    // Last pattern segment a wildcard: an entry of a collection, removed.
+    const entry = rule.segments[rule.segments.length - 1] === '*';
     for (const match of matches(state, rule.segments)) {
-      if (hidden.some(keys => isUnder(match.keys, keys))) continue;
-      if (allows(rule.rule, match.captures, viewer)) continue;
-      // Last pattern segment a wildcard: an entry of a collection, removed.
-      const entry = rule.segments[rule.segments.length - 1] === '*';
-      let replacement: unknown = entry ? DROP : HIDDEN;
-      // A `.length` rule on this path may reveal the count.
-      const countRule = compiled.rules.find(
-        candidate =>
-          candidate.counts &&
-          candidate.segments.length === rule.segments.length + 1 &&
-          candidate.segments.slice(0, -1).every((segment, index) => segment === rule.segments[index]),
-      );
-      const current = match.keys.reduce<unknown>((node, key) => (node as Record<string, unknown>)[key as string], state);
-      if (countRule !== undefined && Array.isArray(current) && allows(countRule.rule, match.captures, viewer)) {
-        replacement = current.map(() => HIDDEN);
+      let prefix = '';
+      let under = false;
+      for (let i = 0; i < match.keys.length - 1 && !under; i += 1) {
+        prefix = i === 0 ? String(match.keys[0]) : `${prefix}${SEP}${String(match.keys[i])}`;
+        under = hidden.has(prefix);
       }
-      out = setIn(out, match.keys, replacement);
-      hidden.push(match.keys);
+      if (under) continue;
+      if (allows(rule.rule, match.captures, viewer)) continue;
+      let replacement: unknown = entry ? DROP : HIDDEN;
+      if (countRule !== undefined && Array.isArray(match.value) && allows(countRule.rule, match.captures, viewer)) {
+        replacement = match.value.map(() => HIDDEN);
+      }
+      record(edits, match.keys, replacement);
+      hidden.add(match.keys.map(String).join(SEP));
       touched = true;
     }
   }
-  return (touched ? sweep(out) : out) as S;
+  return (touched ? rebuild(state, edits) : state) as S;
 }
 
 /**

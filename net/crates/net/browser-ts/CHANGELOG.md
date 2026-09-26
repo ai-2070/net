@@ -18,6 +18,15 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **Fixed: a change inside a map resent the whole map.** The owner's
+  diff goes one level deeper for maps, so moving 25 of 500 ships sends
+  those 25, not all 500 (62 KB → 3 KB per player per tick, measured).
+- **Faster declared visibility** (linear instead of quadratic) and no
+  re-validation of an identity projection. `npm run bench:world`
+  measures host time and bytes per player across world sizes.
+- **Fixed: a validator that cancels during assembly** published the
+  cancelled document before clearing it; the installation is now
+  abandoned before anything is published.
 - **Interest management.** `defineStore({ interest: { <entity map>:
   (entity, id) => key | null } })`; `joinStore({ interest })`,
   `setInterest(keys)` (also on `hostPlayer` and `joinLobby`). Only

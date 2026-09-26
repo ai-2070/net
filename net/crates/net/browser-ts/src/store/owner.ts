@@ -65,6 +65,7 @@ import {
   type CallerMessage,
   type Hex,
   type WireOp,
+  MAX_PATH_SEGMENT_BYTES,
 } from './wire.js';
 
 /** Actions in flight per owner, against the pending bound (§2). */
@@ -1720,6 +1721,12 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       // Declared rules apply AFTER the hand-written projection: code can
       // narrow what a rule allows, never widen it.
       const projected = this.visibility === null ? base : applyVisibility(this.visibility, base, viewer);
+      // Nothing withheld and nothing rebuilt: this IS a committed state,
+      // which the core validated when it was committed. Validating again
+      // builds fresh objects, and fresh objects defeat every identity
+      // check downstream — the diff then serializes every entity to find
+      // the few that moved (measured, scripts/bench-world.mjs).
+      if (projected === state) return state;
       try {
         return this.deps.definition.state(projected);
       } catch (error) {
@@ -1803,19 +1810,61 @@ function shallowDiff(before: JsonObject, after: JsonObject): WireOp[] {
   for (const key of Object.keys(after)) {
     const nextValue = after[key];
     if (Object.prototype.hasOwnProperty.call(before, key) && Object.is(before[key], nextValue)) continue;
+    const previousValue = Object.prototype.hasOwnProperty.call(before, key) ? before[key] : undefined;
+    // One level deeper for a map on both sides: the entries that
+    // changed, not the whole map. Measured (scripts/bench-world.mjs):
+    // moving 5% of 500 ships resent all 62 KB of `ships` every tick,
+    // because any change inside a root key replaced it whole.
+    const entries = previousValue === undefined ? null : entryDiff(key, previousValue, nextValue);
+    if (entries !== null) {
+      ops.push(...entries);
+      continue;
+    }
     // Not `Object.is` alone: reconciliation shares unchanged subtrees,
     // so identity IS the comparison for anything it touched, and a
     // value it could not share is compared by its serialization.
-    if (
-      Object.prototype.hasOwnProperty.call(before, key) &&
-      JSON.stringify(before[key]) === JSON.stringify(nextValue)
-    ) {
+    if (previousValue !== undefined && JSON.stringify(previousValue) === JSON.stringify(nextValue)) {
       continue;
     }
     ops.push({ o: 'r', p: [key], val: nextValue as JsonValue });
   }
   for (const key of Object.keys(before)) {
     if (!Object.prototype.hasOwnProperty.call(after, key)) ops.push({ o: 'x', p: [key] });
+  }
+  return ops;
+}
+
+/** Entry ops worth sending instead of replacing a whole map: at most this many. */
+const MAX_ENTRY_OPS = 128;
+
+/**
+ * The per-entry ops turning map `before` into map `after` under root
+ * `key`, or `null` when replacing the whole value is the better (or
+ * only) choice: not maps on both sides, an entry name the patch path
+ * cannot carry, or more changed entries than {@link MAX_ENTRY_OPS} or
+ * than half the map.
+ */
+function entryDiff(key: string, before: unknown, after: unknown): WireOp[] | null {
+  const isMap = (value: unknown): value is JsonObject =>
+    typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (!isMap(before) || !isMap(after)) return null;
+  const ops: WireOp[] = [];
+  const limit = Math.min(MAX_ENTRY_OPS, Math.max(1, Math.floor(Object.keys(after).length / 2)));
+  const carriable = (entry: string): boolean =>
+    utf8Length(entry) <= MAX_PATH_SEGMENT_BYTES && !['__proto__', 'constructor', 'prototype'].includes(entry);
+  for (const entry of Object.keys(after)) {
+    const next = after[entry];
+    const had = Object.prototype.hasOwnProperty.call(before, entry);
+    if (had && (Object.is(before[entry], next) || JSON.stringify(before[entry]) === JSON.stringify(next))) continue;
+    if (!carriable(entry)) return null;
+    ops.push({ o: 'r', p: [key, entry], val: next as JsonValue });
+    if (ops.length > limit) return null;
+  }
+  for (const entry of Object.keys(before)) {
+    if (Object.prototype.hasOwnProperty.call(after, entry)) continue;
+    if (!carriable(entry)) return null;
+    ops.push({ o: 'x', p: [key, entry] });
+    if (ops.length > limit) return null;
   }
   return ops;
 }
