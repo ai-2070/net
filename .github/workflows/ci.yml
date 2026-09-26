@@ -7077,6 +7077,7 @@ jobs:
             real_wasm_refuses_a_channel_hash_it_would_otherwise_silence
             real_wasm_keeps_u64_stream_ids_off_the_number_path
             real_wasm_reads_a_peer_addressed_stream_in_the_id_spelling_it_hands_out
+            real_wasm_reads_lossy_and_refuses_it_on_a_reliable_stream
             real_package_exports_every_symbol_the_browser_harness_imports
             real_package_re_types_the_leafs_closed_node_fence
             real_package_ends_a_parked_iterator_when_the_direct_node_closes

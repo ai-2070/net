@@ -366,12 +366,13 @@ await probe('real_wasm_reads_stream_options_the_way_the_package_declares_them', 
       streamId: '0000000000000009',
       channelHash: 7,
       peer: null,
+      lossy: false,
     },
     'the declared options',
   );
   eq(
     JSON.parse(LeafNode.effective_stream_options({ reliability: 'reliable' })),
-    { reliability: 'reliable', label: 'app', streamId: null, channelHash: null, peer: null },
+    { reliability: 'reliable', label: 'app', streamId: null, channelHash: null, peer: null, lossy: false },
     'the defaults',
   );
   eq(
@@ -388,6 +389,7 @@ await probe('real_wasm_reads_stream_options_the_way_the_package_declares_them', 
       streamId: 'ffffffffffffffff',
       channelHash: 65535,
       peer: null,
+      lossy: false,
     },
     'the boundary values',
   );
@@ -416,6 +418,7 @@ await probe('real_wasm_reads_a_peer_addressed_stream_in_the_id_spelling_it_hands
       streamId: null,
       channelHash: null,
       peer: '00366d403ce19dac',
+      lossy: false,
     },
     'the peer the stream addresses',
   );
@@ -432,6 +435,7 @@ await probe('real_wasm_reads_a_peer_addressed_stream_in_the_id_spelling_it_hands
       streamId: null,
       channelHash: null,
       peer: '00366d403ce19dac',
+      lossy: false,
     },
     'the 0x prefix, normalised to the spelling node_id_hex() emits',
   );
@@ -444,6 +448,18 @@ await probe('real_wasm_reads_a_peer_addressed_stream_in_the_id_spelling_it_hands
   refusal(() => LeafNode.effective_stream_options({ peer: '0x9' }), 'a short hex peer id');
   refusal(() => LeafNode.effective_stream_options({ peer: 9 }), 'a numeric peer id');
   refusal(() => LeafNode.effective_stream_options({ peer: 'nine' }), 'a non-hex peer id');
+});
+
+// `lossy: true` rides the unordered, zero-retransmit channel, and is
+// fire-and-forget only: the parser reads it back, and refuses it with
+// `reliable` rather than silently opening a reliable stream.
+await probe('real_wasm_reads_lossy_and_refuses_it_on_a_reliable_stream', () => {
+  eq(
+    JSON.parse(LeafNode.effective_stream_options({ reliability: 'fireAndForget', label: 'pos', lossy: true })),
+    { reliability: 'fireAndForget', label: 'pos', streamId: null, channelHash: null, peer: null, lossy: true },
+    'a lossy fire-and-forget stream',
+  );
+  refusal(() => LeafNode.effective_stream_options({ reliability: 'reliable', lossy: true }), 'lossy on a reliable stream');
 });
 
 await probe('real_wasm_refuses_a_channel_hash_it_would_otherwise_silence', () => {
