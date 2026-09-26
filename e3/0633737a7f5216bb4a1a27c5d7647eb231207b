@@ -1,0 +1,24 @@
+go/abi_stability_cgo.go
+  s_d8b00bedd146e9::t_14a39239a8a4d5 24,36-48
+go/abi_stability_cgo_test.go
+  s_d8b00bedd146e9::t_14a39239a8a4d5 22,71-86
+  s_d8b00bedd146e9::t_c45ccd128114d2 87
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_c3e788d0e75991 4808,4815-4820
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e30633737a7f5216bb4a1a27c5d7647eb231207b",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
