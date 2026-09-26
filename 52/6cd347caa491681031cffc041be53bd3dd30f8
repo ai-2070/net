@@ -1,0 +1,20 @@
+net/crates/net/sdk-ts/src/store-transport.ts
+  s_d8b00bedd146e9::t_1e9b224911a4a0 45-50
+  s_d8b00bedd146e9::t_53e5e3a161f0d2 104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "526cd347caa491681031cffc041be53bd3dd30f8",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
