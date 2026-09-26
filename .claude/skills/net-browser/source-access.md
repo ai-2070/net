@@ -22,7 +22,7 @@ tree.
 | `net/crates/net/browser-ts/src/` | the page package: the node surface, the leader session, streams, events, errors, the UDP probe |
 | `net/crates/net/browser-ts/src/store/` | the networked store: definition, owner, replica, ledger, chunking and assembly |
 | `net/crates/net/browser-ts/src/three/` | the scene-graph binding (`bindEntities`) |
-| `net/crates/net/browser-ts/README.md` | the package's own reference — the measured tables and the reasoning behind every rule this skill states |
+| `net/crates/net/browser-ts/DESIGN.md` | the package's design notes — the measured tables and the reasoning behind every rule this skill states (`README.md` beside it is the user-facing quick start) |
 | `net/crates/net/leaf/src/` | the wasm half: the node, dispatch, sessions, streams, establishment, identity, storage |
 | `net/crates/net/leaf/tests/` | the leaf's native and wasm witness suites |
 | `net/crates/net/tests/rtc_browser/` | the Playwright matrix that drives the built package in a real browser |
