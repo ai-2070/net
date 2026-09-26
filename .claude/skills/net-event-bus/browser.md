@@ -302,9 +302,10 @@ five claims on the anchor rather than on the HUD.
   the leader session, the stream wrapper, the event union, the typed errors, the
   UDP probe, the store and the Three.js binding — over
   `net/crates/net/leaf/src/`, the wasm half.
-- **The package's own README:** `net/crates/net/browser-ts/README.md` — the
+- **The package's design notes:** `net/crates/net/browser-ts/DESIGN.md` — the
   measured details behind every rule above (the ICE classification table, the
   freeze measurement, the stream-identity reasoning, the size table).
+  `README.md` beside it is the user-facing quick start.
 - **Worked page:** `net/crates/net/examples/browser-demo/page/demo.js`.
 - **Docs:** [WebRTC transport](https://ai2070.net/docs/concepts/webrtc-transport)
   and [Browser SDK](https://ai2070.net/docs/sdk/browser).
