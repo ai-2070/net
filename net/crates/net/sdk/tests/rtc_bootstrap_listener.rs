@@ -1838,3 +1838,205 @@ async fn an_attempt_whose_channel_just_opened_is_not_over_yet() {
     anchor.shutdown().await.expect("shutdown");
     client.shutdown().await.expect("shutdown");
 }
+
+// ---------------------------------------------------------------------------
+// `POST /credential` — anonymous per-visitor credentials (browser plan P0)
+// ---------------------------------------------------------------------------
+
+use net_sdk::game_anchor::{GameConfig, GameRegistry};
+use net_sdk::rtc_bootstrap::{BootstrapError, CredentialIssuance};
+
+const ANCHOR_URL: &str = "https://anchor.example";
+
+fn games(configs: Vec<GameConfig>) -> Arc<GameRegistry> {
+    Arc::new(GameRegistry::new([0x21u8; 32], configs).expect("registry"))
+}
+
+fn issuing_config(registry: Arc<GameRegistry>, per_ip: u32) -> BootstrapConfig {
+    let mut cfg = config(PSK);
+    let mut issuance = CredentialIssuance::new(registry, issuer(), ANCHOR_URL);
+    issuance.per_ip_per_minute = per_ip;
+    cfg.credential_issuance = Some(issuance);
+    cfg
+}
+
+async fn post_json(router: &axum::Router, uri: &str, body: String) -> (StatusCode, Vec<u8>) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, ORIGIN)
+        .body(Body::from(body))
+        .expect("request");
+    let response = router
+        .clone()
+        .into_make_service_with_connect_info::<std::net::SocketAddr>()
+        .oneshot("203.0.113.9:5000".parse::<std::net::SocketAddr>().unwrap())
+        .await
+        .expect("make service")
+        .oneshot(request)
+        .await
+        .expect("response");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body")
+        .to_vec();
+    (status, body)
+}
+
+async fn request_credential(router: &axum::Router, game: &str) -> (StatusCode, Vec<u8>) {
+    post_json(
+        router,
+        "/credential",
+        serde_json::json!({ "game": game }).to_string(),
+    )
+    .await
+}
+
+/// A page asks for a credential for its game and gets one it can hand
+/// straight to `connect()`: signed by the issuer this listener verifies,
+/// for this trust domain, with an invite naming the GAME's root — and it
+/// clears every credential check `/rtc/offer` runs.
+///
+/// Inverse: sign with another key, or mint the invite under any other
+/// root, and the issuer / root assertions fail; drop the issuance from
+/// the config and the route is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_gets_a_credential_for_its_game_that_the_offer_path_accepts() {
+    let anchor = anchor().await;
+    let registry = games(vec![GameConfig::new("alpha"), GameConfig::new("beta")]);
+    let router = bootstrap_router(
+        Arc::clone(&anchor),
+        &issuing_config(Arc::clone(&registry), 30),
+    );
+
+    let (status, body) = request_credential(&router, "alpha").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reply["game"], "alpha");
+    assert_eq!(reply["bootstrapUrl"], ANCHOR_URL);
+    let credential =
+        BrowserBootstrapCredential::decode(reply["credentialB64"].as_str().unwrap()).unwrap();
+    credential.verify_issuer(issuer().entity_id()).unwrap();
+    credential.check_trust_domain(&Psk::new(PSK)).unwrap();
+    assert_eq!(&credential.invite.root, registry.root_of("alpha").unwrap());
+    assert_ne!(Some(&credential.invite.root), registry.root_of("beta"));
+    assert_eq!(credential.anchor_noise_pubkey, *anchor.public_key());
+
+    // Past every credential check: a junk SDP is what gets refused.
+    let (status, body) = post_offer(&router, &credential, 0x1234, "not an sdp").await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(
+        refusal_of(&body),
+        "offer_refused",
+        "the credential itself was accepted"
+    );
+    assert_eq!(
+        registry
+            .stats()
+            .iter()
+            .map(|s| s.credentials_issued)
+            .sum::<u64>(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_game_or_a_malformed_request_is_refused_typed() {
+    let anchor = anchor().await;
+    let router = bootstrap_router(
+        Arc::clone(&anchor),
+        &issuing_config(games(vec![GameConfig::new("alpha")]), 30),
+    );
+    let (status, body) = request_credential(&router, "gamma").await;
+    assert_eq!(
+        (status, refusal_of(&body).as_str()),
+        (StatusCode::NOT_FOUND, "unknown_game")
+    );
+    let (status, body) = post_json(&router, "/credential", "{\"name\":1}".into()).await;
+    assert_eq!(
+        (status, refusal_of(&body).as_str()),
+        (StatusCode::BAD_REQUEST, "malformed_request")
+    );
+}
+
+/// Two ceilings, both typed: per source IP here, per game in the
+/// registry — and one game spending its pool leaves another's alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issuance_is_limited_per_source_ip_and_per_game() {
+    let anchor = anchor().await;
+    let per_ip = bootstrap_router(
+        Arc::clone(&anchor),
+        &issuing_config(games(vec![GameConfig::new("alpha")]), 2),
+    );
+    for _ in 0..2 {
+        assert_eq!(request_credential(&per_ip, "alpha").await.0, StatusCode::OK);
+    }
+    let (status, body) = request_credential(&per_ip, "alpha").await;
+    assert_eq!(
+        (status, refusal_of(&body).as_str()),
+        (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+    );
+
+    let registry = games(vec![
+        GameConfig {
+            id: "busy".into(),
+            issue_per_minute: 1,
+        },
+        GameConfig::new("quiet"),
+    ]);
+    let per_game = bootstrap_router(
+        Arc::clone(&anchor),
+        &issuing_config(Arc::clone(&registry), 30),
+    );
+    assert_eq!(
+        request_credential(&per_game, "busy").await.0,
+        StatusCode::OK
+    );
+    let (status, body) = request_credential(&per_game, "busy").await;
+    assert_eq!(
+        (status, refusal_of(&body).as_str()),
+        (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+    );
+    assert_eq!(
+        request_credential(&per_game, "quiet").await.0,
+        StatusCode::OK
+    );
+    let busy = registry
+        .stats()
+        .into_iter()
+        .find(|s| s.game == "busy")
+        .unwrap();
+    assert_eq!((busy.credentials_issued, busy.credentials_refused), (1, 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_issuance_there_is_no_credential_route() {
+    let anchor = anchor().await;
+    let router = bootstrap_router(Arc::clone(&anchor), &config(PSK));
+    let (status, body) = request_credential(&router, "alpha").await;
+    // The router's own 404 — no such route — not a typed refusal from a
+    // registered one.
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.is_empty(),
+        "expected no route, got {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// An issuance key that is not the verified issuer would hand out
+/// credentials the same listener refuses; the listener will not start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_issuance_key_that_is_not_the_verified_issuer_is_refused_at_start() {
+    let anchor = anchor().await;
+    let mut cfg = issuing_config(games(vec![GameConfig::new("alpha")]), 30);
+    if let Some(issuance) = cfg.credential_issuance.as_mut() {
+        issuance.issuer = Identity::generate();
+    }
+    assert!(matches!(
+        serve_bootstrap(anchor, cfg).await,
+        Err(BootstrapError::Config(_))
+    ));
+}

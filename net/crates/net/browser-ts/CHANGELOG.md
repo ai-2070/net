@@ -18,6 +18,12 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **`requestCredential({ anchorUrl, game })`** — an anonymous visitor
+  credential from an anchor started with `net-mesh anchor serve --game`,
+  returning `{ credentialB64, bootstrapUrl, game }` for `openSession()`.
+  Failures are a typed `CredentialRequestError` (`unknown-game`,
+  `rate-limited`, `malformed-request`, `unreachable`, `unexpected`).
+
 - **Fixed: a change inside a map resent the whole map.** The owner's
   diff goes one level deeper for maps, so moving 25 of 500 ships sends
   those 25, not all 500 (62 KB → 3 KB per player per tick, measured).

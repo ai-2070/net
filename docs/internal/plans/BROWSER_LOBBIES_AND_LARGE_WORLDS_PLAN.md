@@ -100,8 +100,9 @@ Gaps, with their state:
 
 - **TypeScript only** for this audience (§1). Other bindings on the branch are
   kept, not extended.
-- **Simple identity:** anonymous per-visitor credentials, with the visitor's key
-  kept in `localStorage` (§4).
+- **Simple identity:** anonymous per-visitor credentials; the visitor's key is
+  the one `openSession()` already keeps per origin (IndexedDB, under a
+  non-extractable WebCrypto key — stronger than `localStorage`) (§4).
 - **Anchors:** a **CLI anchor first, built shared-ready from day one** — game-id
   namespacing, per-game credential issuance and rate limits, per-game counters,
   stateless credential checks — so a **shared anchor** follows without rework
@@ -148,8 +149,11 @@ for many games without rework.
 ### Identity: anonymous, per browser profile
 
 - The page asks the anchor's credential endpoint for a credential; the anchor
-  issues one per visitor, with **no login**. The visitor's key lives in
-  `localStorage` (the package already keeps one node per origin across tabs).
+  issues one per visitor, with **no login**. The visitor's key is the one
+  `openSession()` keeps for the origin, in IndexedDB under a non-extractable
+  WebCrypto key (verified 2026-09-26; `leaf/src/identity.rs`). A bare
+  `connect()` without `entitySecretHex` makes a new identity per page load, so
+  games use `openSession()`.
 - **What that identity is**, stated in the docs: one player per **browser
   profile**, not per person. Clearing site data makes a new player; the same
   person on two devices is two players. `authorize`, `context.peer` and
@@ -188,6 +192,45 @@ installed CLI anchor and `isEnrolled()` is true, with no repo checkout; a
 credential for game A cannot announce a lobby for game B; per-game counters and
 limits are visible; README "Before players can connect" and the skill's fast
 path switch to it.
+
+### Slice 1 — built (2026-09-26)
+
+- **SDK `game_anchor`:** `GameRegistry` — games by id, each with an enrollment
+  root derived from the anchor secret (`from_identity`: from the issuer key),
+  so instances with the same key agree with no shared state. Invites are
+  **self-verifying** (nonce = random ‖ deadline ‖ keyed MAC), rebuilt from the
+  join request alone. Per-game issuance ceiling per minute; counters
+  (credentials issued/refused, enrollments admitted/refused).
+- **An invite binds to its first device.** The same device may re-enroll with
+  it (a promoted leader tab reuses the credential `openSession()` was opened
+  with — a one-shot invite would leave it provisional); another device is a
+  replay. One credential = one identity, which is what makes issuance limits
+  meaningful. Invites therefore live 12 h. Bindings are per instance (pruned at
+  the deadline); strict cross-instance binding needs a shared map (P5).
+- **`POST /credential {game}`** on the bootstrap listener
+  (`BootstrapConfig.credential_issuance`), per-IP ceiling, typed refusals
+  (`unknown_game`, `rate_limited`, `malformed_request`); the listener refuses to
+  start if the issuing key is not the issuer it verifies.
+- **CLI:** `anchor serve --issuer-identity … --game ID[:N]`,
+  `--credentials-per-minute`, `--game-stats-secs`.
+- **`@net-mesh/browser`:** `requestCredential({ anchorUrl, game })`.
+- **Witnessed:** registry unit tests (roots, MAC, expiry, binding, per-game
+  limits), listener route tests, CLI flag tests, package tests — each security
+  check shown to fail when removed. **Not yet:** a real browser enrolling
+  through it (the two-browser acceptance run), so README/skill still point at
+  the demo host.
+- **Follow-up:** `openSession({ credential: () => Promise<string> })` — fetch a
+  fresh credential per connect, so a promotion never depends on an old invite.
+  A leaf change; not needed while invites bind to their device.
+
+### Slice 2 — next: the core records the game
+
+The core promotes a session on an Admitted outcome without reading the grant's
+root, so it cannot yet tell which game a session belongs to. Slice 2: record
+the grant's root (→ game) on the promoted session, then enforce it at three
+points — announcements (lobby tags outside the game refused), the anchor's
+answers to discovery queries (filtered to the game), and routed traffic between
+sessions of different games. Witnessed by a cross-game refusal test at each.
 
 ---
 

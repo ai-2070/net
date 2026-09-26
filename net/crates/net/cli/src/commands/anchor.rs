@@ -869,9 +869,49 @@ pub struct ServeArgs {
 
     /// The issuer whose signature this anchor accepts on a
     /// credential (64 hex chars) — the public half of the key
-    /// `anchor credential mint --issuer-identity` uses (R3).
-    #[arg(long = "credential-issuer", value_name = "HEX")]
-    pub credential_issuer: String,
+    /// `anchor credential mint --issuer-identity` uses (R3). Optional
+    /// with `--issuer-identity`, which implies it; given both, they
+    /// must agree.
+    #[arg(
+        long = "credential-issuer",
+        value_name = "HEX",
+        required_unless_present = "issuer_identity"
+    )]
+    pub credential_issuer: Option<String>,
+
+    /// The issuer's identity file (the PRIVATE key
+    /// `anchor credential mint --issuer-identity` reads). Needed to
+    /// issue visitor credentials with `--game`; every game's
+    /// enrollment root is derived from it, so instances started with
+    /// the same file admit the same visitors.
+    #[arg(long = "issuer-identity", value_name = "PATH")]
+    pub issuer_identity: Option<PathBuf>,
+
+    /// Allow a permissive identity-file mode on Unix.
+    #[arg(long)]
+    pub insecure_permissions: bool,
+
+    /// Admit browsers for this game: serve enrollment and issue
+    /// anonymous visitor credentials at `POST <url>/credential` with
+    /// `{"game": "<id>"}`. Repeatable, one per game. `ID:N` sets the
+    /// game's issuance ceiling to N credentials per minute (default
+    /// 600). Lowercase letters, digits, `.`, `-`, `_`. Needs
+    /// `--issuer-identity`.
+    #[arg(
+        long = "game",
+        value_name = "ID[:PER_MINUTE]",
+        requires = "issuer_identity"
+    )]
+    pub game: Vec<String>,
+
+    /// Per-source-IP `POST /credential` ceiling per minute (default 30).
+    #[arg(long = "credentials-per-minute")]
+    pub credentials_per_minute: Option<u32>,
+
+    /// Print every game's counters as a JSON line this often, in
+    /// seconds. 0 (the default) prints none.
+    #[arg(long = "game-stats-secs", default_value_t = 0)]
+    pub game_stats_secs: u64,
 
     /// Browser origins allowed to call the endpoints and open the
     /// trickle socket. Repeatable. **No wildcard** — an endpoint
@@ -916,6 +956,42 @@ struct ServeReport {
     rtc_stun_addr: Option<String>,
     trust_domain: String,
     noise_pubkey: String,
+    /// Games this anchor admits browsers for; absent without `--game`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    games: Vec<String>,
+    /// Where pages ask for a visitor credential; absent without `--game`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_endpoint: Option<String>,
+}
+
+/// Parse `--game` values: `ID` or `ID:PER_MINUTE`.
+#[cfg(feature = "rtc-bootstrap")]
+fn parse_games(values: &[String]) -> Result<Vec<net_sdk::game_anchor::GameConfig>, CliError> {
+    values
+        .iter()
+        .map(|value| {
+            let (id, limit) = match value.split_once(':') {
+                Some((id, n)) => (
+                    id,
+                    Some(n.parse::<u32>().map_err(|_| {
+                        invalid_args(format!("--game {value}: the per-minute ceiling is not a number"))
+                    })?),
+                ),
+                None => (value.as_str(), None),
+            };
+            if !net_sdk::game_anchor::is_valid_game_id(id) {
+                return Err(invalid_args(format!(
+                    "--game {id:?}: use lowercase letters, digits, '.', '-' and '_' (at most {} bytes)",
+                    net_sdk::game_anchor::MAX_GAME_ID_LEN
+                )));
+            }
+            let mut config = net_sdk::game_anchor::GameConfig::new(id);
+            if let Some(limit) = limit {
+                config.issue_per_minute = limit;
+            }
+            Ok(config)
+        })
+        .collect()
 }
 
 /// The RTC driver configuration `serve` runs with, from the
@@ -983,7 +1059,12 @@ fn resolve_serve(args: &ServeArgs) -> Result<ResolvedServe, CliError> {
         .unwrap_or("0.0.0.0:8443")
         .parse()
         .map_err(|e| invalid_args(format!("--listen: {e}")))?;
-    let issuer = parse_entity_hex(&args.credential_issuer)?;
+    let issuer = args
+        .credential_issuer
+        .as_deref()
+        .map(parse_entity_hex)
+        .transpose()?;
+    parse_games(&args.game)?;
     let challenge = args
         .acme_challenge_addr
         .as_deref()
@@ -1050,7 +1131,8 @@ fn resolve_serve(args: &ServeArgs) -> Result<ResolvedServe, CliError> {
 struct ResolvedServe {
     bind: std::net::SocketAddr,
     listen: std::net::SocketAddr,
-    issuer: net_sdk::identity::EntityId,
+    /// `None` when only `--issuer-identity` names it (read at start).
+    issuer: Option<net_sdk::identity::EntityId>,
     challenge: std::net::SocketAddr,
     tls: net_sdk::rtc_bootstrap::BootstrapTls,
     rtc: net::adapter::net::rtc::RtcConfig,
@@ -1071,7 +1153,10 @@ struct ServeInspection {
     tls_key: Option<PathBuf>,
     acme_cache: Option<PathBuf>,
     acme_challenge_bind: Option<std::net::SocketAddr>,
-    credential_issuer_fingerprint: String,
+    /// Absent when only `--issuer-identity` names the issuer: inspection
+    /// reads no secret files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_issuer_fingerprint: Option<String>,
 }
 
 #[cfg(feature = "rtc-bootstrap")]
@@ -1158,9 +1243,10 @@ async fn run_serve(
                 } else {
                     None
                 },
-                credential_issuer_fingerprint: crate::target::public_fingerprint(
-                    resolved.issuer.as_bytes(),
-                ),
+                credential_issuer_fingerprint: resolved
+                    .issuer
+                    .as_ref()
+                    .map(|issuer| crate::target::public_fingerprint(issuer.as_bytes())),
             },
         )
         .map_err(|e| generic(format!("write anchor target inspection: {e}")));
@@ -1169,6 +1255,34 @@ async fn run_serve(
         .await
         .map_err(|e| invalid_args(format!("--psk-file {}: {e}", args.psk_file.display())))?;
     let psk = hex_decode_32(psk_hex.trim()).map_err(|e| invalid_args(format!("psk: {e}")))?;
+
+    // The issuer: named by its public half, its identity file, or both
+    // (which must agree — a listener verifying one key while issuing
+    // under another would refuse every credential it hands out).
+    let issuer_identity = match &args.issuer_identity {
+        Some(path) => {
+            let file = read_identity_file(path, args.insecure_permissions).await?;
+            let seed = hex_decode_32(&file.seed_hex)
+                .map_err(|e| invalid_args(format!("--issuer-identity: seed_hex: {e}")))?;
+            Some(net_sdk::identity::Identity::from_seed(seed))
+        }
+        None => None,
+    };
+    let issuer = match (resolved.issuer.clone(), &issuer_identity) {
+        (Some(named), Some(identity)) if &named != identity.entity_id() => {
+            return Err(invalid_args(
+                "--credential-issuer is not the public half of --issuer-identity",
+            ))
+        }
+        (Some(named), _) => named,
+        (None, Some(identity)) => identity.entity_id().clone(),
+        (None, None) => {
+            return Err(invalid_args(
+                "one of --credential-issuer or --issuer-identity is required",
+            ))
+        }
+    };
+    let games = parse_games(&args.game)?;
 
     let mesh = Mesh::builder(&resolved.bind.to_string(), &psk)
         .map_err(|e| generic(format!("mesh builder: {e}")))?
@@ -1182,7 +1296,7 @@ async fn run_serve(
     let mut listener_config = BootstrapConfig::new(
         resolved.listen,
         sdk_psk.clone(),
-        resolved.issuer,
+        issuer,
         resolved.tls,
         args.allow_origin
             .first()
@@ -1205,6 +1319,45 @@ async fn run_serve(
     // fold state, so only the node that owns it can answer for it.
     let _ice_stats = net_sdk::rtc_bootstrap::serve_anchor_ice_stats(&mesh)
         .map_err(|e| generic(format!("serving the anchor ICE stats: {e}")))?;
+    // Browsers for registered games: real enrollment (a game's
+    // visitors are rooted at that game) and anonymous credentials.
+    let mut _enrollment = None;
+    let mut _game_stats = None;
+    if let (false, Some(identity)) = (games.is_empty(), &issuer_identity) {
+        let registry = std::sync::Arc::new(
+            net_sdk::game_anchor::GameRegistry::from_identity(identity, games)
+                .map_err(|e| invalid_args(format!("--game: {e}")))?,
+        );
+        _enrollment = Some(
+            net_sdk::game_anchor::serve_game_enrollment(
+                &mesh,
+                std::sync::Arc::clone(&registry),
+                net_sdk::game_anchor::DEFAULT_GRANT_TTL,
+            )
+            .map_err(|e| generic(format!("serving enrollment: {e}")))?,
+        );
+        let mut issuance = net_sdk::rtc_bootstrap::CredentialIssuance::new(
+            std::sync::Arc::clone(&registry),
+            identity.clone(),
+            args.url.clone(),
+        );
+        if let Some(limit) = args.credentials_per_minute {
+            issuance.per_ip_per_minute = limit;
+        }
+        listener_config.credential_issuance = Some(issuance);
+        if args.game_stats_secs > 0 {
+            let every = std::time::Duration::from_secs(args.game_stats_secs);
+            _game_stats = Some(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(every);
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    println!("{}", serde_json::json!({ "game_stats": registry.stats() }));
+                }
+            }));
+        }
+    }
+
     let node = std::sync::Arc::clone(mesh.node());
     let handle = serve_bootstrap(node, listener_config)
         .await
@@ -1228,6 +1381,13 @@ async fn run_serve(
             rtc_stun_addr: mesh.node().rtc_public_stun_addr().map(|a| a.to_string()),
             trust_domain: sdk_psk.trust_domain().to_string(),
             noise_pubkey: hex_string(mesh.node().public_key()),
+            games: args
+                .game
+                .iter()
+                .map(|g| g.split(':').next().unwrap_or_default().to_string())
+                .collect(),
+            credential_endpoint: (!args.game.is_empty())
+                .then(|| format!("{}/credential", args.url.trim_end_matches('/'))),
         },
     )
     .map_err(|e| generic(format!("write anchor serve: {e}")))?;
@@ -1236,6 +1396,9 @@ async fn run_serve(
     tokio::signal::ctrl_c()
         .await
         .map_err(|e| generic(format!("waiting for ctrl-c: {e}")))?;
+    if let Some(task) = _game_stats {
+        task.abort();
+    }
     handle.shutdown().await;
     Ok(())
 }
@@ -1277,6 +1440,68 @@ mod tests {
         ];
         argv.extend_from_slice(extra);
         Root::parse_from(argv).serve
+    }
+
+    /// `ServeArgs` from exactly `argv` (after the program name), or the
+    /// parser's refusal.
+    fn try_serve_args(argv: &[&str]) -> Result<ServeArgs, clap::Error> {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Root {
+            #[command(flatten)]
+            serve: ServeArgs,
+        }
+        let mut full = vec!["net-mesh"];
+        full.extend_from_slice(argv);
+        Root::try_parse_from(full).map(|root| root.serve)
+    }
+
+    const BASE: [&str; 6] = [
+        "--psk-file",
+        "psk.hex",
+        "--url",
+        "https://anchor.example.com",
+        "--allow-origin",
+        "https://app.example.com",
+    ];
+
+    /// The issuer is named by its public half, its identity file, or
+    /// both — but by one of them; and `--game` needs the identity file,
+    /// because issuing credentials needs the private key.
+    #[test]
+    fn serve_names_its_issuer_one_way_or_the_other_and_game_needs_the_key() {
+        assert!(try_serve_args(&BASE).is_err(), "no issuer at all");
+        let mut with_key = BASE.to_vec();
+        with_key.extend([
+            "--issuer-identity",
+            "issuer.json",
+            "--game",
+            "alpha",
+            "--game",
+            "beta:5",
+        ]);
+        let args = try_serve_args(&with_key).expect("identity file alone names the issuer");
+        assert_eq!(args.credential_issuer, None);
+        assert_eq!(args.game, ["alpha", "beta:5"]);
+        let mut game_without_key = BASE.to_vec();
+        game_without_key.extend(["--credential-issuer", "00", "--game", "alpha"]);
+        assert!(
+            try_serve_args(&game_without_key).is_err(),
+            "--game requires --issuer-identity"
+        );
+    }
+
+    #[test]
+    fn game_flags_parse_ids_and_ceilings_and_refuse_bad_ones() {
+        let games = parse_games(&["alpha".into(), "beta.2:5".into()]).unwrap();
+        assert_eq!(games[0], net_sdk::game_anchor::GameConfig::new("alpha"));
+        assert_eq!(
+            (games[1].id.as_str(), games[1].issue_per_minute),
+            ("beta.2", 5)
+        );
+        for bad in ["Alpha", "net-lobby:x", "a:many", ""] {
+            assert!(parse_games(&[bad.into()]).is_err(), "{bad:?}");
+        }
     }
 
     /// The two STUN flags land on the two `RtcConfig` fields that
@@ -1439,8 +1664,14 @@ mod tests {
             rtc_stun_addr: None,
             trust_domain: "td".to_string(),
             noise_pubkey: "ab".to_string(),
+            games: vec![],
+            credential_endpoint: None,
         };
         let json = serde_json::to_string(&base).expect("serialize");
+        assert!(
+            !json.contains("games") && !json.contains("credential_endpoint"),
+            "an anchor without --game reports neither key: {json}"
+        );
         assert!(
             !json.contains("rtc_stun_addr"),
             "an anchor that configured no STUN endpoint reports no such key: {json}"

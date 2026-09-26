@@ -192,3 +192,11 @@ export * from './store/index.js';
 // Lobbies: host a game others can find, list the open ones, join by
 // code or link — `createLobby` / `listLobbies` / `joinLobby`.
 export * from './lobby.js';
+
+// Anonymous visitor credentials from a game anchor.
+export { requestCredential, CredentialRequestError } from './credential.js';
+export type {
+  AnchorCredential,
+  CredentialRequestErrorKind,
+  RequestCredentialOptions,
+} from './credential.js';
