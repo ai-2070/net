@@ -671,6 +671,11 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         });
       }
       const answered = correlate<unknown>(q);
+      // Observed now: a refusal that lands while `send` is still pending
+      // (a native mesh answers inside it) rejected `answered` with no
+      // handler yet, which is an unhandled rejection even though the
+      // caller receives it a moment later. As `setAudience` does.
+      answered.catch(() => undefined);
       // The frame goes out AFTER the correlation is registered, or a
       // reply that arrives immediately has nothing to resolve.
       await send([frame]);
@@ -760,6 +765,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
       }
       const q = (options.newQ ?? (() => randomHex(8) as Hex))();
       const answered = correlate<void>(q);
+      answered.catch(() => undefined);
       await send([encodeMessage({ k: 'int', q, h, int: next })]);
       await answered;
     },

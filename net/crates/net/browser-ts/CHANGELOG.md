@@ -227,6 +227,11 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Fixed
 
+- **A refused `act` or `setInterest` no longer raises an unhandled
+  rejection.** When the refusal arrived while the request's `send` was still
+  pending (a native host answers that fast), the request's promise rejected
+  before anything was listening. The caller still got the error, but the page
+  also saw `unhandledrejection`.
 - **`connectPeer` is idempotent on a healthy direct pair.** It resolves
   `{ type: 'direct' }` with the live dialog and sends nothing. Before this,
   it made a fresh offer whose connection replaced — and closed — the working

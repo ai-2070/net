@@ -94,21 +94,34 @@ impl Fx {
     }
 
     fn up(&self, extra: &[&str]) -> Up {
-        let mut child = self
-            .base()
-            .args(["--output", "ndjson", "up", "--bind", "127.0.0.1:0"])
-            .args(extra)
-            .arg("--state-dir")
-            .arg(self.state())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-        let ready = read_row(&mut stdout, &mut child);
-        assert_eq!(ready["event"], "ready", "{ready}");
-        Up { child, ready }
+        // `--bind 127.0.0.1:0` lets the OS pick the UDP port, and the
+        // enrollment listener then binds TCP on the SAME number (a token
+        // names one port for both). Another process may hold that TCP
+        // port — tests run in parallel — so that one refusal is retried
+        // with a fresh port; every other failure fails the test.
+        for attempt in 1..=3 {
+            let mut child = self
+                .base()
+                .args(["--output", "ndjson", "up", "--bind", "127.0.0.1:0"])
+                .args(extra)
+                .arg("--state-dir")
+                .arg(self.state())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut stdout = BufReader::new(child.stdout.take().unwrap());
+            match try_read_row(&mut stdout, &mut child) {
+                Ok(ready) => {
+                    assert_eq!(ready["event"], "ready", "{ready}");
+                    return Up { child, ready };
+                }
+                Err(stderr) if attempt < 3 && stderr.contains("Address already in use") => continue,
+                Err(stderr) => panic!("no row from up; stderr: {stderr}"),
+            }
+        }
+        unreachable!("the last attempt returns or panics")
     }
 
     /// Operator node with minimal-config enrollment.
@@ -129,7 +142,8 @@ impl Drop for Up {
     }
 }
 
-fn read_row(stdout: &mut BufReader<ChildStdout>, child: &mut Child) -> Value {
+/// One NDJSON row, or the child's stderr when none arrived.
+fn try_read_row(stdout: &mut BufReader<ChildStdout>, child: &mut Child) -> Result<Value, String> {
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|s| {
         s.spawn(|| {
@@ -138,14 +152,15 @@ fn read_row(stdout: &mut BufReader<ChildStdout>, child: &mut Child) -> Value {
             let _ = tx.send(line);
         });
         match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(line) if !line.trim().is_empty() => serde_json::from_str(&line).unwrap(),
+            Ok(line) if !line.trim().is_empty() => Ok(serde_json::from_str(&line).unwrap()),
             _ => {
                 let _ = child.kill();
+                let _ = child.wait();
                 let mut err = String::new();
                 if let Some(mut e) = child.stderr.take() {
                     let _ = e.read_to_string(&mut err);
                 }
-                panic!("no row from up; stderr: {err}");
+                Err(err)
             }
         }
     })
