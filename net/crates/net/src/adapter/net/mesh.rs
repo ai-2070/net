@@ -2044,6 +2044,32 @@ impl RetainedChain {
 ///
 /// `Clone`: every field is an `Arc` handle or a small config copy,
 /// so a clone is ~a round of refcount bumps. The SI-6.1 trailing-
+/// One event from a stream a sink is registered for
+/// ([`MeshNode::register_stream_inbound`]).
+///
+/// `from_node` is the peer whose **installed session decrypted** the
+/// packet — the authenticated sender, never a value the packet carries.
+/// It is the identity a consumer may authorize on, which is exactly what
+/// the shard queue (`poll_shard`) cannot offer: a `StoredEvent` has no
+/// sender at all.
+#[derive(Debug, Clone)]
+pub struct StreamInboundEvent {
+    /// The authenticated sender's node id.
+    pub from_node: u64,
+    /// The stream the event arrived on.
+    pub stream_id: u64,
+    /// One event's payload, as the sender framed it.
+    pub payload: Bytes,
+}
+
+/// A registered stream sink. Called on the receive path, once per
+/// event, in delivery order: it must not block. Hand the event to a
+/// channel or a thread-safe callback and return.
+pub type StreamInboundSink = Arc<dyn Fn(StreamInboundEvent) + Send + Sync + 'static>;
+
+/// Registered stream sinks by full stream id: `(registration_id, sink)`.
+type StreamInboundMap = DashMap<u64, (u64, StreamInboundSink)>;
+
 /// The per-`u16`-wire-bucket list of registered nRPC inbound
 /// dispatchers: `(canonical ChannelHash, registration_id,
 /// dispatcher)` (OA2-E0.1 — the id enables conditional teardown).
@@ -2224,6 +2250,10 @@ struct DispatchCtx {
     // evict a newer registration for the same canonical channel.
     #[cfg(feature = "cortex")]
     rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
+    /// Registered stream sinks ([`MeshNode::register_stream_inbound`]):
+    /// a stream with one bypasses the shard queue and is delivered WITH
+    /// its authenticated sender.
+    stream_inbound: Arc<StreamInboundMap>,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
     ///
@@ -12026,6 +12056,10 @@ pub struct MeshNode {
     // `DispatchCtx` field for the teardown rationale).
     #[cfg(feature = "cortex")]
     rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
+    /// Registered stream sinks, shared with every `DispatchCtx`.
+    stream_inbound: Arc<StreamInboundMap>,
+    /// Monotonic source of stream-sink registration ids.
+    stream_registration_seq: Arc<std::sync::atomic::AtomicU64>,
     /// OA2-E0.1: monotonic source of registration ids for
     /// [`Self::register_rpc_inbound`]. Bumped once per successful
     /// (vacant-only) registration so each carries a unique id that
@@ -14593,6 +14627,8 @@ impl MeshNode {
             inbound: Arc::new(DashMap::new()),
             #[cfg(feature = "cortex")]
             rpc_inbound_dispatchers: Arc::new(DashMap::new()),
+            stream_inbound: Arc::new(DashMap::new()),
+            stream_registration_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
             rpc_registration_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
@@ -26988,6 +27024,7 @@ impl MeshNode {
                 .map(|_| Arc::clone(&self.rtc_signal_tap)),
             #[cfg(feature = "cortex")]
             rpc_inbound_dispatchers: self.rpc_inbound_dispatchers.clone(),
+            stream_inbound: self.stream_inbound.clone(),
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
             org_revocation: self.org_revocation.clone(),
@@ -31857,6 +31894,29 @@ impl MeshNode {
             return;
         }
 
+        // A stream with a registered sink is delivered to it, WITH the
+        // authenticated sender, instead of the shard queue — the queue's
+        // `StoredEvent` has no sender, so a consumer that authorizes by
+        // peer (the browser store served from a native host) cannot be
+        // built on it. After the admission gate above (R1: a
+        // provisional peer's event is not delivered here either) and
+        // after the blob-transfer divert. One map lookup per packet;
+        // absent registrations fall through unchanged.
+        if let Some(sink) = ctx
+            .stream_inbound
+            .get(&stream_id)
+            .map(|entry| entry.1.clone())
+        {
+            for payload in events {
+                sink(StreamInboundEvent {
+                    from_node,
+                    stream_id,
+                    payload,
+                });
+            }
+            return;
+        }
+
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
@@ -33867,6 +33927,45 @@ impl MeshNode {
         self.rpc_inbound_dispatchers
             .remove_if(&wire, |_, v| v.is_empty());
         Some(removed)
+    }
+
+    /// Deliver every event arriving on `stream_id` to `sink`, with the
+    /// authenticated sender, instead of the shard queue.
+    ///
+    /// The shard queue (`poll_shard`) drops the sender: its
+    /// `StoredEvent` has none. A consumer that must know WHO sent each
+    /// event — authorizes on it, keys state by it — registers a sink
+    /// here and receives [`StreamInboundEvent`]s whose `from_node` is the
+    /// peer whose session decrypted the packet.
+    ///
+    /// Vacant-only, like [`Self::register_rpc_inbound`]: an occupied
+    /// stream id is left untouched and this returns `None`. On success
+    /// the returned registration id is what
+    /// [`Self::unregister_stream_inbound`] needs, so a stale teardown
+    /// cannot evict a newer registration.
+    pub fn register_stream_inbound(&self, stream_id: u64, sink: StreamInboundSink) -> Option<u64> {
+        use dashmap::mapref::entry::Entry;
+        match self.stream_inbound.entry(stream_id) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(slot) => {
+                let registration_id = self
+                    .stream_registration_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                slot.insert((registration_id, sink));
+                Some(registration_id)
+            }
+        }
+    }
+
+    /// Remove the sink registered for `stream_id` under
+    /// `registration_id`. `false` — and nothing removed — when the id
+    /// does not match (a newer registration holds the stream). Events on
+    /// the stream then land in the shard queue again.
+    pub fn unregister_stream_inbound(&self, stream_id: u64, registration_id: u64) -> bool {
+        self.stream_inbound
+            .remove_if(&stream_id, |_, (id, _)| *id == registration_id)
+            .is_some()
     }
 
     /// Cheap probe: is a dispatcher already registered for this
@@ -63165,6 +63264,10 @@ mod exported_discovery_pin_coherence_tests {
 #[cfg(all(test, feature = "cortex"))]
 #[path = "mesh_rpc_large_response_tests.rs"]
 mod rpc_large_response_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "mesh_stream_inbound_tests.rs"]
+mod stream_inbound_tests;
 
 /// R1 (Kyra's HOLD on `b6e522bb5`): the `Stream` handle's config and
 /// the session's retransmit bookkeeping cannot disagree.

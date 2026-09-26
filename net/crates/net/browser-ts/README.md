@@ -487,7 +487,8 @@ defineStore({
   it warns if every player is getting the whole world without you saying so.
 - **The host sees everything.** If the host is a player, that player can read
   every secret in their own browser. Games with real stakes need a host that
-  isn't a player.
+  isn't a player: run the same `hostStore` on a server with `@net-mesh/sdk`'s
+  `meshStoreTransport` — your pages join it exactly as they join a player's.
 
 For views the rules can't express, write the projection yourself:
 `project(state, audience)` (one view per audience) or `projectFor(state, { peer,

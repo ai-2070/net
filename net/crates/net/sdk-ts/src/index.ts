@@ -116,8 +116,13 @@ export {
   TokenError,
   channelHash,
   delegateToken,
+  streamIdFromLabel,
   verifySignature,
 } from './identity';
+
+// Serve the browser package's store from a native node.
+export { meshStoreTransport } from './store-transport';
+export type { MeshStoreTransport, MeshStoreTransportOptions, StoreTransportFrame } from './store-transport';
 export type { TokenScope, TokenErrorKind, IssueTokenOptions } from './identity';
 
 // Capabilities (announce + find-peers).

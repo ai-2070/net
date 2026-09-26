@@ -29,6 +29,7 @@
 import {
   Identity as NapiIdentity,
   channelHash as napiChannelHash,
+  streamIdFromLabel as napiStreamIdFromLabel,
   delegateToken as napiDelegateToken,
   parseToken as napiParseToken,
   tokenIsExpired as napiTokenIsExpired,
@@ -446,6 +447,15 @@ export class Identity {
  */
 export function channelHash(channel: string): bigint {
   return runMapped(() => napiChannelHash(channel));
+}
+
+/**
+ * The stream id a label names — the one derivation the browser package
+ * (`@net-mesh/browser`) uses too, so a native node and a page that agree
+ * on a label open the same stream. Any string is a label.
+ */
+export function streamIdFromLabel(label: string): bigint {
+  return napiStreamIdFromLabel(label);
 }
 
 /**

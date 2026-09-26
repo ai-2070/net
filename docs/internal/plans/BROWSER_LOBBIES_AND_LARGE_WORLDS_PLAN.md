@@ -499,6 +499,26 @@ their creator, and every region in P4, need a host that is not a player.
      implementing `StoreTransport` over `openStream` + `sendOnStream` +
      `onStreamData`, witnessed by a native host serving a real browser page
      in the runner, including a spoofed-origin refusal.
+
+  **Built (2026-09-26)**, on the branch that carries this plan:
+  - core: `MeshNode::register_stream_inbound` / `unregister_stream_inbound`
+    (vacant-only, registration ids, like `register_rpc_inbound`); the divert
+    sits after the admission gate and the blob-transfer divert, before the
+    shard queue, and hands `StreamInboundEvent { from_node, stream_id,
+    payload }` to the sink. Witnesses: `mesh_stream_inbound_tests.rs`
+    (two senders attributed, queue bypassed, vacant-only, stale id, restore).
+  - `net_wire::channel::name::stream_id_from_label` is now THE derivation;
+    the leaf delegates to it and the core re-exports it.
+  - napi: `NetMesh.onStreamData(streamId, handler)` → `StreamDataSubscription`
+    (holds a `Weak` so it cannot block shutdown), `streamIdFromLabel`.
+  - `sdk-ts`: `MeshNode.onStreamData`, `streamIdFromLabel`,
+    `meshStoreTransport(mesh, { listen })` (in `sdk-ts`, structural, no
+    dependency on `@net-mesh/browser`). Witness `store_transport.test.ts`: a
+    native host serves the browser store's own source to two native players
+    and `authorize` refuses one by the peer the transport reports.
+  - Not yet: the browser-page ↔ native-host witness in the runner (the
+    leaf ↔ native stream path it would ride is already witnessed byte-exact
+    by `stage5.rs`), and Python / Go / C surfaces for `onStreamData`.
 - **A dedicated host** runs the same `hostStore` with game rules loaded from the
   developer's code, on a native node, discoverable by the same lobby tags.
 - **Browser players become pure replicas** of it, so the "host sees
