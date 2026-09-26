@@ -13,29 +13,24 @@ commands), serve `dist/` over HTTP, and open a page.
 Two things, and neither comes from the page:
 
 - **An anchor**, reachable over HTTPS.
-- **A bootstrap credential**, minted by that anchor's operator and handed to the
-  page out of band.
+- **A bootstrap credential** per player, which that anchor issues.
 
-One caveat worth knowing before you go looking for it: **`net-mesh anchor serve`
-does not host a browser.** A page's `connect()` makes an enrollment call while
-establishing its session, and that command registers only the anchor directory
-and the ICE ledger — nothing answers the enrollment service, and the page fails
+Run the anchor for your game with the CLI. It needs a certificate browsers
+trust, your page's origin, a pre-shared key file and an issuer key file
+(`net-mesh identity generate --out issuer.toml`):
+
+```sh
+net-mesh anchor serve --psk-file psk.hex \
+  --url https://anchor.example.com --tls-cert cert.pem --tls-key key.pem \
+  --allow-origin https://game.example.com \
+  --issuer-identity issuer.toml --game my-game
+```
+
+Each player then asks it for an anonymous credential — see *Connect* below.
+Without `--game` the anchor serves no enrollment, and a page's `connect()` fails
 with `session: rpc: the call's deadline elapsed` after a perfectly good TLS
-listener and handshake.
-
-The shipped thing that *does* serve enrollment is the browser demo:
-
-```sh
-cd net/crates/net
-cargo run --release --manifest-path examples/browser-demo/host/Cargo.toml -- \
-  --headless --seconds 600
-```
-
-It prints its page URL and mints a credential per tab:
-
-```sh
-curl -s "http://localhost:<port>/config?tab=1" | jq -r .credentialB64
-```
+handshake. One anchor can serve several games but does not yet isolate them
+from each other; run one per game for now.
 
 `tests/rtc_browser/run.sh` (`run.ps1` on Windows) is the other one: the CI
 harness, on Chromium and Firefox, which issues its own CA and trusts it per
@@ -44,9 +39,22 @@ engine rather than disabling certificate checking.
 ## Connect
 
 ```typescript
-import { connect } from '@net-mesh/browser';
+import { connect, rememberedIdentity, requestCredential } from '@net-mesh/browser';
 
+// An anonymous credential for this player, from your game's anchor.
+const { credentialB64, bootstrapUrl } = await requestCredential({
+  anchorUrl: 'https://anchor.example.com',
+  game: 'my-game',
+});
+```
+
+`rememberedIdentity()` keeps the player the same across visits (the secrets live
+in `localStorage`; one player per browser profile). A credential binds to the
+first player that uses it.
+
+```typescript
 const node = await connect({
+  ...rememberedIdentity(),
   credentialB64,                          // the whole `net-bootstrap:…` string
   bootstrapUrl: 'https://anchor.example', // optional; the credential carries one
 });

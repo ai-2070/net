@@ -18,6 +18,18 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **`rememberedIdentity(key?)`** — the same player on every visit for
+  `connect()`: the node's two secrets, created once and kept in
+  `localStorage` (`connect({ …, ...rememberedIdentity() })`). Without it,
+  `connect()` is a new node on every page load.
+- **Fixed: a lobby could not be joined over a real anchor.** A browser node
+  accepts a relayed handshake only from a peer whose signed announcement it
+  holds, and a joiner announced nothing — so the host refused it and the
+  store failed with `no session with 0x…` (the local mesh does not model
+  this; a real anchor run found it). `joinLobby` now announces
+  `net-lobby:<game>:seek:<host>` while playing (new `tags` option keeps the
+  page's own), and retries reaching the host until `timeoutMs`, failing as
+  `LobbyError('not-found', "could not reach the lobby's host …")`.
 - **`requestCredential({ anchorUrl, game })`** — an anonymous visitor
   credential from an anchor started with `net-mesh anchor serve --game`,
   returning `{ credentialB64, bootstrapUrl, game }` for `openSession()`.

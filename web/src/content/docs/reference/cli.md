@@ -181,7 +181,8 @@ net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
 - **One anchor, several games.** Repeat `--game`. Each game has its own enrollment root, derived from the `--issuer-identity` key, so every instance started with the same key file admits the same visitors, and a visitor's grant says which game admitted it. Ids are lowercase letters, digits, `.`, `-` and `_`.
 - **Limits.** Issuance is capped per game (`--game ID:N`, default 600 credentials a minute) and per source IP (`--credentials-per-minute`, default 30). Refusals are typed: `unknown_game` (404), `rate_limited` (429), `malformed_request` (400).
 - **Counters.** `--game-stats-secs N` prints every game's credentials issued and refused and enrollments admitted and refused as a JSON line every N seconds. The start report lists `games` and the `credential_endpoint`.
-- **What a credential is.** Its invite binds to the first browser identity that enrolls with it; that identity may reconnect with it for 12 hours (a promoted leader tab does), and any other is refused. One credential is one player.
+- **What a credential is.** Its invite binds to the first browser identity that enrolls with it; that identity may reconnect with it for 12 hours (a reload with `rememberedIdentity()`, a promoted leader tab), and any other is refused. One credential is one player.
+- **Proved end to end** by `examples/anchor-acceptance`: two real browsers join a lobby through this command.
 - **Not yet enforced:** that a game's players cannot announce, discover or route into another game on the same anchor. Run one anchor per game until that lands.
 
 `--credential-issuer` becomes optional with `--issuer-identity` (it is that key's public half); given both, they must agree. `--game` requires `--issuer-identity`.

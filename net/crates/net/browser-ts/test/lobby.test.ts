@@ -215,3 +215,77 @@ describe('lobbies', () => {
     expect(() => normalizeLobbyCode('K7QP2O')).toThrow(LobbyError);
   });
 });
+
+// A browser node accepts a relayed handshake only from a peer whose signed
+// announcement it holds (`leaf/src/node.rs`, "keys from discovery only").
+// The local mesh does not model that, so these tests give the joining node a
+// `connectPeer` that does: it succeeds only once the HOST can see this
+// node's announcement. Measured against a real anchor in
+// `examples/anchor-acceptance`: a joiner that announced nothing never
+// reached the host.
+describe('joining reaches a host that only accepts discovered peers', () => {
+  function strictJoiner(mesh: ReturnType<typeof createLocalMesh>, hostNode: ReturnType<typeof mesh.node>) {
+    const node = mesh.node();
+    const attempts: boolean[] = [];
+    const joiner = {
+      ...node,
+      connectPeer: async (peer: string) => {
+        const seen = (await hostNode.query(`net-lobby:lobby-test:seek:${peer}`)).some(
+          descriptor => descriptor.peerIdHex === node.nodeIdHex(),
+        );
+        attempts.push(seen);
+        if (!seen) throw new Error('session: not discovered by the host');
+        return { disposition: 'relayed' };
+      },
+    };
+    return { joiner, attempts };
+  }
+
+  it('announces a seek tag for its host, so the handshake is accepted, and plays', async () => {
+    const mesh = createLocalMesh();
+    const hostNode = mesh.node();
+    const lobby = await lobbyOn(mesh, { node: hostNode });
+    const { joiner, attempts } = strictJoiner(mesh, hostNode);
+    const world = await joinLobby({ node: joiner, definition: room, game: 'lobby-test', code: lobby.code });
+    await world.ready();
+    await expect(world.act('sit', {})).resolves.toEqual({ seat: 1 });
+    expect(attempts.at(-1)).toBe(true);
+    await world.close();
+  });
+
+  it("keeps the page's own tags while playing, and withdraws only the seek tag on close", async () => {
+    const mesh = createLocalMesh();
+    const hostNode = mesh.node();
+    const lobby = await lobbyOn(mesh, { node: hostNode });
+    const { joiner } = strictJoiner(mesh, hostNode);
+    const world = await joinLobby({ node: joiner, definition: room, game: 'lobby-test', code: lobby.code, tags: ['my-app'] });
+    await world.ready();
+    const ids = async (tag: string) => (await hostNode.query(tag)).map(descriptor => descriptor.peerIdHex);
+    const seek = `net-lobby:lobby-test:seek:${lobby.host.authority}`;
+    expect(await ids('my-app')).toEqual([joiner.nodeIdHex()]);
+    expect(await ids(seek)).toEqual([joiner.nodeIdHex()]);
+    await world.close();
+    await settle();
+    expect(await ids('my-app')).toEqual([joiner.nodeIdHex()]);
+    expect(await ids(seek)).toEqual([]);
+  });
+
+  it('names an unreachable host, typed, at the deadline', async () => {
+    const mesh = createLocalMesh();
+    const hostNode = mesh.node();
+    const lobby = await lobbyOn(mesh, { node: hostNode });
+    const node = mesh.node();
+    const unreachable = {
+      ...node,
+      connectPeer: async () => {
+        throw new Error('session: not reachable');
+      },
+    };
+    const error = await joinLobby({ node: unreachable, definition: room, game: 'lobby-test', code: lobby.code, timeoutMs: 600 }).catch(
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(LobbyError);
+    expect((error as LobbyError).code).toBe('not-found');
+    expect((error as Error).message).toMatch(/could not reach the lobby's host/);
+  });
+});

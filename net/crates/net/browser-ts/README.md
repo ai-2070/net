@@ -68,22 +68,33 @@ Net needs two things that don't come from the page:
 2. **A credential per player** — a string the anchor issues, which the page
    passes to `connect()`.
 
-**Today, the anchor that works with browsers is the browser-demo host in this
-repository.** The general-purpose `net-mesh anchor serve` command doesn't yet
-accept browser players (they connect, then time out). To run one locally:
+**Run an anchor for your game** with the `net-mesh` CLI. It needs a TLS
+certificate browsers trust, the page's origin, a pre-shared key file, and an
+issuer key file (`net-mesh identity generate --out issuer.toml`):
 
 ```sh
-git clone https://github.com/ai-2070/net
-cd net/net/crates/net
-cargo run --release --manifest-path examples/browser-demo/host/Cargo.toml -- \
-  --headless --seconds 600
+net-mesh anchor serve --psk-file psk.hex   --url https://anchor.example.com --tls-cert cert.pem --tls-key key.pem   --allow-origin https://game.example.com   --issuer-identity issuer.toml --game my-game
 ```
 
-It prints its address and hands out a credential per player:
+**Each player gets their own credential from it**, anonymously — no sign-up.
+`rememberedIdentity()` keeps the player the same across visits:
 
-```sh
-curl -s "http://localhost:<port>/config?tab=1" | jq -r .credentialB64
+```js
+import { connect, rememberedIdentity, requestCredential } from '@net-mesh/browser';
+
+const { credentialB64, bootstrapUrl } = await requestCredential({
+  anchorUrl: 'https://anchor.example.com',
+  game: 'my-game',
+});
+const node = await connect({ credentialB64, bootstrapUrl, ...rememberedIdentity() });
 ```
+
+- A player is a **browser profile**: clearing site data makes a new player,
+  and one person on two devices is two players.
+- A credential is one player's: the anchor refuses it from anyone else.
+- One anchor can serve several games (repeat `--game`), but it does not yet
+  keep one game's players out of another's discovery; run one anchor per game
+  for now.
 
 > **Building the game before you have an anchor?** `@net-mesh/browser/local`
 > is a mesh inside one page: no anchor, no network, and the real store on top.
@@ -148,11 +159,16 @@ export const arena = defineStore({
 ### 2. Connect
 
 ```js
-import { connect } from '@net-mesh/browser';
+import { connect, rememberedIdentity, requestCredential } from '@net-mesh/browser';
 
+const { credentialB64, bootstrapUrl } = await requestCredential({
+  anchorUrl: 'https://anchor.example.com',
+  game: 'my-game',
+});
 const node = await connect({
-  credentialB64,   // the credential the anchor issued for this player
-  bootstrapUrl,    // the anchor's address (optional — the credential carries it)
+  credentialB64,           // this player's credential, from your anchor
+  bootstrapUrl,            // the anchor's address
+  ...rememberedIdentity(), // the same player on every visit
 });
 
 const myId = node.nodeIdHex();   // this player's id, shared with whoever joins

@@ -100,9 +100,9 @@ Gaps, with their state:
 
 - **TypeScript only** for this audience (§1). Other bindings on the branch are
   kept, not extended.
-- **Simple identity:** anonymous per-visitor credentials; the visitor's key is
-  the one `openSession()` already keeps per origin (IndexedDB, under a
-  non-extractable WebCrypto key — stronger than `localStorage`) (§4).
+- **Simple identity:** anonymous per-visitor credentials, and the player's key
+  kept in `localStorage` (`rememberedIdentity()`). Games run on `connect()`,
+  which persists nothing by itself (§4).
 - **Anchors:** a **CLI anchor first, built shared-ready from day one** — game-id
   namespacing, per-game credential issuance and rate limits, per-game counters,
   stateless credential checks — so a **shared anchor** follows without rework
@@ -149,11 +149,12 @@ for many games without rework.
 ### Identity: anonymous, per browser profile
 
 - The page asks the anchor's credential endpoint for a credential; the anchor
-  issues one per visitor, with **no login**. The visitor's key is the one
-  `openSession()` keeps for the origin, in IndexedDB under a non-extractable
-  WebCrypto key (verified 2026-09-26; `leaf/src/identity.rs`). A bare
-  `connect()` without `entitySecretHex` makes a new identity per page load, so
-  games use `openSession()`.
+  issues one per visitor, with **no login**. The player's key is kept in
+  `localStorage` by `rememberedIdentity()` and passed to `connect()`. Games must
+  use `connect()`: a store needs a session with its host, installed by
+  `connectPeer`, which exists only on the `connect()` node, not on
+  `openSession()`'s (which does persist its own key, in IndexedDB). Measured
+  2026-09-26 in the acceptance run.
 - **What that identity is**, stated in the docs: one player per **browser
   profile**, not per person. Clearing site data makes a new player; the same
   person on two devices is two players. `authorize`, `context.peer` and
@@ -222,6 +223,25 @@ path switch to it.
 - **Follow-up:** `openSession({ credential: () => Promise<string> })` — fetch a
   fresh credential per connect, so a promotion never depends on an old invite.
   A leaf change; not needed while invites bind to their device.
+
+### Acceptance run — passed (2026-09-26)
+
+`net/crates/net/examples/anchor-acceptance` (`node run.mjs --net-mesh <bin>`):
+the real `net-mesh anchor serve --game`, two isolated Chrome contexts, the built
+package. **7/7:** the anchor reports its game and endpoint; a host fetches a
+credential, enrolls and opens a lobby; a second player lists it, joins and is
+seated; an unknown game is refused typed; a third identity presenting another
+player's credential is refused at `connect()` (`replay`); a reloaded player
+(same storage) comes back as the **same node** and re-enrolls with its original
+credential; the anchor's counters agree (2 issued, 3 admitted, 1 refused).
+
+It found a **P1 lobby defect**: a browser node accepts a relayed handshake only
+from a peer whose signed announcement it holds, and a joiner announced nothing,
+so no lobby could be joined over a real anchor (the local mesh does not model
+discovery-before-handshake). Fixed in `joinLobby` (announce a `seek` tag, retry
+reaching the host); shown causal by mutation both in the real run and in unit
+tests that model the rule. Not yet in CI (needs a release CLI build and Chrome);
+the README, skill and quickstart now point at the CLI anchor.
 
 ### Slice 2 — next: the core records the game
 

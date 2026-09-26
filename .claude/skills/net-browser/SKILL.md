@@ -34,11 +34,13 @@ model that a client-prediction habit will get wrong.
    finding each other).
 2. **Use `connect()`, one tab per player** — a store over `openSession` is not
    established. Test two players with two browser profiles, not two tabs.
-3. **The anchor is `examples/browser-demo/host`** — from the Rust workspace
-   root (net/crates/net), `cargo run --release --manifest-path
-   examples/browser-demo/host/Cargo.toml -- --headless --seconds 600`; each
-   player's credential is the `credentialB64` from its `/config?tab=N`.
-   `net-mesh anchor serve` cannot host a browser today.
+3. **The anchor is `net-mesh anchor serve --issuer-identity <key> --game <id>`**
+   (plus `--psk-file`, `--url`, `--tls-cert`/`--tls-key`, `--allow-origin`).
+   Each player asks it for an anonymous credential and keeps one identity:
+   `const { credentialB64, bootstrapUrl } = await requestCredential({ anchorUrl,
+   game })`, then `connect({ credentialB64, bootstrapUrl, ...rememberedIdentity()
+   })`. One credential is one player (another identity presenting it is refused).
+   It does not yet isolate games from each other: one anchor per game.
 4. **Prototype game logic offline** with `createLocalMesh()` from
    `@net-mesh/browser/local` — several nodes in one page, the real store, no
    anchor, no network.
@@ -104,19 +106,22 @@ model that a client-prediction habit will get wrong.
    `openSession` takes `capabilities` and `subscriptions` **up front** so a new
    leader can restore them without being asked.
 3. **Get the credential from the anchor, and know its scope.** `credentialB64`
-   is signed and secret-bearing; the leaf presents it unmodified. **`net-mesh
-   anchor serve` cannot host a browser today** — it registers no enrollment
-   service, so `connect()` times out with `rpc-timeout`. The only anchor a page
-   can use is the browser-demo host: from the workspace root (net/crates/net),
-   `cargo run --release --manifest-path examples/browser-demo/host/Cargo.toml --
-   --headless --seconds 600`, which serves `/config?tab=N` returning a `credentialB64` per tab. `anchor
-   credential mint` needs no extra feature; `anchor ls` / `stats` / `serve` need
-   the CLI's `rtc-bootstrap` feature — see `session.md`.
-4. **Wire identity deliberately.** By default the leaf generates the identity
-   from the platform CSPRNG and persists it under a non-extractable key. The
-   origin is the trust boundary: any script on it can ask the browser to use that
-   key, so a deployment that needs the key elsewhere must inject it custodially
-   (`entitySecretHex` + `noiseSecretHex`).
+   is signed and secret-bearing; the leaf presents it unmodified. A game's
+   anchor issues one per visitor: `net-mesh anchor serve --issuer-identity
+   <key> --game <id> …` serves `POST <url>/credential {"game"}`, which
+   `requestCredential({ anchorUrl, game })` calls; refusals are a typed
+   `CredentialRequestError` (`unknown-game`, `rate-limited`, …). The credential
+   binds to the first identity that enrolls with it, which may reconnect with it
+   for 12 h. Without `--game` the anchor serves no enrollment and `connect()`
+   times out with `rpc-timeout`; `anchor credential mint` still mints one by
+   hand. `anchor ls` / `stats` / `serve` need the CLI's `rtc-bootstrap` feature
+   — see `session.md`.
+4. **Wire identity deliberately.** `openSession()` persists its identity (in
+   IndexedDB, under a non-extractable key); **`connect()` does not** — without
+   `entitySecretHex` + `noiseSecretHex` every page load is a new node. Games run
+   on `connect()`, so pass `...rememberedIdentity()`, which keeps both secrets in
+   `localStorage`. Either way the origin is the trust boundary: script on it
+   can use the key.
 5. **Keep the lifecycle honest.** Subscribe before you need deliveries, and on a
    session declare channels in `subscriptions` rather than subscribing late — a
    tab that only called `subscribe()` after a handoff leaves a window where

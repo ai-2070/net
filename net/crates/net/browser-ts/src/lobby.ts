@@ -21,6 +21,12 @@
  * - `net-lobby:<game>:rec:<base64url JSON>` — the record a list shows:
  *   code, name, players, capacity, store version and the game's own
  *   `info`. Public lobbies only.
+ * - `net-lobby:<game>:seek:<host hex>` — announced by a player joining that
+ *   host. A browser node accepts a relayed handshake only from a peer whose
+ *   signed announcement it holds, and the anchor delivers announcements to
+ *   its peers — so a joiner that announces nothing cannot reach the host
+ *   (measured: `examples/anchor-acceptance`). The tag says why this player
+ *   announces at all.
  * - `net-lobby:<game>:code:<32 hex>` — the code, hashed; how a code is
  *   looked up. Both kinds announce it.
  *
@@ -107,6 +113,7 @@ export const LOBBY_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 export const LOBBY_CODE_LENGTH = 6;
 /** How often a lobby re-announces itself. */
 export const LOBBY_ANNOUNCE_MS = 2_000;
+
 /** The frame bound the package's own tests and demo use. */
 const DEFAULT_MAX_EVENT_BYTES = 8104;
 
@@ -142,6 +149,11 @@ function randomCode(): string {
     }
   }
   return code;
+}
+
+/** A player joining `host` announces this, so the host can discover it. */
+function seekTag(game: string, host: string): string {
+  return `net-lobby:${game}:seek:${host}`;
 }
 
 function listingTag(game: string): string {
@@ -513,8 +525,15 @@ export interface JoinLobbyOptions<S extends object, A extends ActionSpec, I exte
   /** The opaque join token. Default `'player'`. */
   readonly key?: string;
   readonly maxEventBytes?: number;
-  /** How long to look for the code. Default 20 s. */
+  /** How long to look for the code, and to reach the host. Default 20 s. */
   readonly timeoutMs?: number;
+  /**
+   * Tags this node keeps announcing while it plays. Joining announces a
+   * `seek` tag so the host can discover this player, and an announcement
+   * replaces the node's whole tag set — so anything else the page
+   * announces goes here. The same option as `createLobby`'s.
+   */
+  readonly tags?: readonly string[];
 }
 
 /**
@@ -552,15 +571,68 @@ export async function joinLobby<S extends object, A extends ActionSpec, I extend
   if (self !== null && hexPeer(self) === host) {
     throw new StoreError('invalid-data', 'this node hosts that lobby: use lobby.self to play in it');
   }
-  return joinStore<S, A, I>({
-    definition: options.definition,
-    transport: options.node,
-    host,
-    audience: options.audience ?? [],
-    key: options.key ?? 'player',
-    maxEventBytes: options.maxEventBytes ?? DEFAULT_MAX_EVENT_BYTES,
-    ...(options.interest === undefined ? {} : { interest: options.interest }),
-  });
+
+  // Announce, so the host holds this player's signed key: its node
+  // refuses a relayed handshake from a peer it has no announcement for.
+  // Kept up while playing — a re-handshake (a reconnect, a replaced
+  // channel) needs the key again after the old announcement lapses.
+  const node = options.node;
+  const keep = [...(options.tags ?? [])];
+  const seeking = [...keep, seekTag(options.game, host)];
+  let stopped = false;
+  const announce = () => {
+    if (!stopped) node.announce(seeking).catch(() => {});
+  };
+  announce();
+  const timer = setInterval(announce, LOBBY_ANNOUNCE_MS);
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    node.announce(keep).catch(() => {});
+  };
+
+  // Reach the host before joining. Until this player's announcement has
+  // reached the host, the host refuses the handshake — so a refusal here
+  // is "not yet", retried until the deadline, and naming the host is
+  // better than the store's later `no session with 0x…`.
+  if (node.connectPeer !== undefined) {
+    const deadline = Date.now() + (options.timeoutMs ?? 20_000);
+    for (;;) {
+      try {
+        await node.connectPeer(host);
+        break;
+      } catch (error) {
+        if (Date.now() >= deadline) {
+          stop();
+          throw new LobbyError('not-found', `could not reach the lobby's host ${host}: ${String((error as Error)?.message ?? error)}`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+  }
+
+  let joined: JoinedStoreHandle<S, A, I>;
+  try {
+    joined = joinStore<S, A, I>({
+      definition: options.definition,
+      transport: node,
+      host,
+      audience: options.audience ?? [],
+      key: options.key ?? 'player',
+      maxEventBytes: options.maxEventBytes ?? DEFAULT_MAX_EVENT_BYTES,
+      ...(options.interest === undefined ? {} : { interest: options.interest }),
+    });
+  } catch (error) {
+    stop();
+    throw error;
+  }
+  const close = joined.close.bind(joined);
+  (joined as { close: () => Promise<void> }).close = async () => {
+    stop();
+    await close();
+  };
+  return joined;
 }
 
 /** The lobby code in a link made by `lobby.link()`, or `null`. Default: this page. */

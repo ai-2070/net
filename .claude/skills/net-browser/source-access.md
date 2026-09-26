@@ -31,7 +31,9 @@ tree.
 | `net/crates/net/browser-ts/src/store/inventory.ts` | the inventory helpers and their rules |
 | `net/crates/net/browser-ts/src/lobby.ts` | lobbies: the announcement tags, record bounds, capacity and kick, join by code |
 | `net/crates/net/browser-ts/src/local.ts` | `createLocalMesh`: the in-page mesh behind `@net-mesh/browser/local` |
-| `net/crates/net/examples/browser-demo/host/` | the only anchor that serves browser enrollment today (`/config?tab=N` hands out a `credentialB64` per tab) |
+| `net/crates/net/sdk/src/game_anchor.rs` | game anchors: per-game enrollment roots, self-verifying invites bound to their first device, per-game limits and counters |
+| `net/crates/net/examples/anchor-acceptance/` | two real browsers join a lobby through `net-mesh anchor serve --game` with anonymous credentials |
+| `net/crates/net/examples/browser-demo/host/` | the 60 Hz position demo's own host (hands out a `credentialB64` per tab at `/config?tab=N`) |
 | `net/crates/net/leaf/src/` | the wasm half: the node, dispatch, sessions, streams, establishment, identity, storage |
 | `net/crates/net/leaf/tests/` | the leaf's native and wasm witness suites |
 | `net/crates/net/tests/rtc_browser/` | the Playwright matrix that drives the built package in a real browser |

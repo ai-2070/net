@@ -193,6 +193,10 @@ export * from './store/index.js';
 // code or link — `createLobby` / `listLobbies` / `joinLobby`.
 export * from './lobby.js';
 
+// The same player on every visit, for connect().
+export { rememberedIdentity, DEFAULT_IDENTITY_KEY } from './identity.js';
+export type { IdentitySecrets } from './identity.js';
+
 // Anonymous visitor credentials from a game anchor.
 export { requestCredential, CredentialRequestError } from './credential.js';
 export type {
