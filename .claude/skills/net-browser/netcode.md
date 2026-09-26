@@ -71,9 +71,12 @@ function frame() { draw(net.view()); requestAnimationFrame(frame); }
 
 - **Lossy streams are `connect()`-only.** `openSession()` refuses
   `lossy: true`; games run on `connect()` anyway (stores need it too).
-- **Keep snapshots small.** A snapshot over one event (~8 KiB) is sent as
-  fragments, and on the lossy carrier one lost fragment loses the whole
-  snapshot. Filter with `visible` (interest) rather than sending the world.
+- **Keep snapshots small anyway.** A snapshot over `maxFrameBytes` (default
+  8000, under one event) is sent as independent chunks, each entity always in
+  the same chunk. A lost chunk's entities are carried over from the previous
+  snapshot for that tick (`stats().partialSnapshots` counts it), never
+  dropped from view. Every chunk still costs bandwidth each tick, so filter
+  with `visible` (interest) rather than sending the world.
 - **Corrections blend in** over `correctionSmoothingMs` (default 100, `0`
   snaps); inputs keep moving the drawn entity during the blend.
 - **Past the newest snapshot remote entities hold**, unless you set

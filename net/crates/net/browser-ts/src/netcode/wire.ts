@@ -54,7 +54,13 @@ export type Frame<E, I> =
   | { readonly n: string; readonly k: 'p'; readonly t0: number }
   /** Host → player: clock pong. */
   | { readonly n: string; readonly k: 'q'; readonly t0: number; readonly t1: number; readonly t2: number }
-  /** Host → player: a snapshot, and the last input seq applied for them. */
+  /**
+   * Host → player: a snapshot, and the last input seq applied for them.
+   *
+   * A snapshot too large for one frame is sent as `of` chunks, chunk `c`
+   * carrying the entities {@link chunkOf} assigns to it — each chunk
+   * usable on its own, so a lost one costs part of a snapshot, not all.
+   */
   | {
       readonly n: string;
       readonly k: 's';
@@ -62,7 +68,25 @@ export type Frame<E, I> =
       readonly t: number;
       readonly ack: number;
       readonly e: Readonly<Record<string, E>>;
+      readonly c?: number;
+      readonly of?: number;
     };
+
+/** Chunks a snapshot may be split into, at most. */
+export const MAX_SNAPSHOT_CHUNKS = 256;
+
+/**
+ * The chunk (of `of`) entity `id` travels in: FNV-1a of the id. Stable, so
+ * a player missing a chunk knows which entities it would have carried.
+ */
+export function chunkOf(id: string, of: number): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < id.length; i += 1) {
+    hash ^= id.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0) % of;
+}
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -98,11 +122,25 @@ export function decodeFrame<E, I>(payload: Uint8Array | undefined, label: string
         : null;
     }
     case 's': {
-      const s = frame as { tick?: unknown; t?: unknown; ack?: unknown; e?: unknown };
-      return typeof s.tick === 'number' && typeof s.t === 'number' && typeof s.ack === 'number' &&
-        typeof s.e === 'object' && s.e !== null
-        ? (frame as Frame<E, I>)
-        : null;
+      const s = frame as { tick?: unknown; t?: unknown; ack?: unknown; e?: unknown; c?: unknown; of?: unknown };
+      if (
+        typeof s.tick !== 'number' ||
+        typeof s.t !== 'number' ||
+        typeof s.ack !== 'number' ||
+        typeof s.e !== 'object' ||
+        s.e === null
+      ) {
+        return null;
+      }
+      if (s.c === undefined && s.of === undefined) return frame as Frame<E, I>;
+      const chunked =
+        Number.isInteger(s.c) &&
+        Number.isInteger(s.of) &&
+        (s.of as number) >= 1 &&
+        (s.of as number) <= MAX_SNAPSHOT_CHUNKS &&
+        (s.c as number) >= 0 &&
+        (s.c as number) < (s.of as number);
+      return chunked ? (frame as Frame<E, I>) : null;
     }
     default:
       return null;

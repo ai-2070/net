@@ -18,6 +18,14 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **Netcode: large snapshots travel as chunks.** A snapshot over the host's
+  `maxFrameBytes` (default 8000) is split into chunks that each fit one
+  event, with each entity always in the same chunk. A lost chunk no longer
+  loses the whole snapshot: its entities are carried over from the previous
+  snapshot for that tick, and the player's own entity is never reconciled
+  against a carried-over copy. `stats().partialSnapshots` counts these. Host
+  and players must run the same release: an older player would treat each
+  chunk as a whole snapshot.
 - **Netcode: correction smoothing and extrapolation.** `joinNetcode`'s
   `correctionSmoothingMs` (default 100, `0` snaps) blends a reconciliation
   correction in instead of jumping; inputs keep applying during the blend.

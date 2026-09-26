@@ -17,7 +17,18 @@
  * ```
  */
 
-import { type Frame, type NetcodeStream, type NetcodeTransport, type Now, defaultNow, decodeFrame, encodeFrame, eventPeer } from './wire.js';
+import {
+  type Frame,
+  type NetcodeStream,
+  type NetcodeTransport,
+  type Now,
+  MAX_SNAPSHOT_CHUNKS,
+  chunkOf,
+  defaultNow,
+  decodeFrame,
+  encodeFrame,
+  eventPeer,
+} from './wire.js';
 
 /** One input as `step` receives it. */
 export interface TickInput<I> {
@@ -70,6 +81,13 @@ export interface HostNetcodeOptions<E, I> {
    * advantage by faking lag.
    */
   readonly maxRewindMs?: number;
+  /**
+   * Largest snapshot frame, bytes. Default 8000 — under one event, so a
+   * snapshot never rides as fragments (on the lossy carrier one lost
+   * fragment loses them all). A larger snapshot is sent as independent
+   * chunks; a lost chunk costs the entities it carried, for one tick.
+   */
+  readonly maxFrameBytes?: number;
   /** Drop a player silent this long, ms. Default 5000. */
   readonly playerTimeoutMs?: number;
   /** `false` to drive ticks yourself with {@link HostNetcode.tick}. Default `true`. */
@@ -112,12 +130,45 @@ function historySize(tickRate: number, maxRewindMs: number): number {
 }
 
 /** Start the authoritative netcode host. */
+/**
+ * One snapshot as frames: one, or — over `maxBytes` — chunks by
+ * {@link chunkOf}, as many as it takes for each to fit (up to
+ * {@link MAX_SNAPSHOT_CHUNKS}; past that the chunks are sent over-size and
+ * ride as fragments).
+ */
+export function snapshotFrames<E>(
+  label: string,
+  tick: number,
+  time: number,
+  ack: number,
+  entities: Readonly<Record<string, E>>,
+  maxBytes: number,
+): Frame<E, never>[] {
+  const whole: Frame<E, never> = { n: label, k: 's', tick, t: time, ack, e: entities };
+  const size = encodeFrame(whole).length;
+  if (size <= maxBytes) return [whole];
+  const ids = Object.keys(entities);
+  let of = Math.min(MAX_SNAPSHOT_CHUNKS, Math.max(2, Math.ceil(size / (maxBytes * 0.75))));
+  for (;;) {
+    const parts: Record<string, E>[] = Array.from({ length: of }, () => ({}));
+    for (const id of ids) parts[chunkOf(id, of)]![id] = entities[id]!;
+    const frames = parts.map(
+      (e, c): Frame<E, never> => ({ n: label, k: 's', tick, t: time, ack, e, c, of }),
+    );
+    if (of >= MAX_SNAPSHOT_CHUNKS || frames.every(frame => encodeFrame(frame).length <= maxBytes)) {
+      return frames;
+    }
+    of = Math.min(MAX_SNAPSHOT_CHUNKS, of * 2);
+  }
+}
+
 export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcode<E> {
   const now = options.now ?? defaultNow;
   const tickRate = options.tickRate ?? 30;
   if (!(tickRate > 0 && tickRate <= 240)) throw new RangeError('tickRate must be in (0, 240]');
   const tickMs = 1000 / tickRate;
   const maxRewindMs = options.maxRewindMs ?? 200;
+  const maxFrameBytes = Math.max(256, options.maxFrameBytes ?? 8000);
   const playerTimeoutMs = options.playerTimeoutMs ?? 5000;
   const players = new Map<string, Player<I>>();
   const history: { tick: number; time: number; entities: Readonly<Record<string, E>> }[] = [];
@@ -258,7 +309,9 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
         }
         view = filtered;
       }
-      send(peer, player, { n: options.label, k: 's', tick, t: time, ack: player.lastApplied, e: view });
+      for (const frame of snapshotFrames(options.label, tick, time, player.lastApplied, view, maxFrameBytes)) {
+        send(peer, player, frame);
+      }
     }
     tick += 1;
   };

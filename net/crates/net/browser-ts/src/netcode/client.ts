@@ -17,7 +17,27 @@
 
 import { ClockEstimator, type ClockEstimate } from './clock.js';
 import { type Interpolator, lerpNumbers, SnapshotBuffer } from './interpolate.js';
-import { type Frame, type NetcodeStream, type NetcodeTransport, type Now, type WireInput, defaultNow, decodeFrame, encodeFrame, eventPeer, peerHex } from './wire.js';
+import {
+  type Frame,
+  type NetcodeStream,
+  type NetcodeTransport,
+  type Now,
+  type WireInput,
+  chunkOf,
+  defaultNow,
+  decodeFrame,
+  encodeFrame,
+  eventPeer,
+  peerHex,
+} from './wire.js';
+
+/** A chunked snapshot being assembled. */
+interface Assembly<E> {
+  readonly t: number;
+  ack: number;
+  readonly of: number;
+  readonly parts: Map<number, Readonly<Record<string, E>>>;
+}
 
 /** Your own entity, predicted locally. */
 export interface LocalEntity<E, I> {
@@ -76,6 +96,8 @@ export interface NetcodeStats {
   readonly pendingInputs: number;
   /** Times reconciliation moved the local entity away from its prediction. */
   readonly corrections: number;
+  /** Chunked snapshots finished with chunks missing (their entities carried over). */
+  readonly partialSnapshots: number;
 }
 
 /** The running client. */
@@ -121,6 +143,11 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     return blend(correcting.from, predicted, Math.max(0, alpha));
   };
   let snapshotsSeen = 0;
+  // Chunked snapshots being assembled, by tick; the newest tick accepted;
+  // snapshots finished with chunks missing.
+  const assemblies = new Map<number, Assembly<E>>();
+  let newestTick: number | null = null;
+  let partialSnapshots = 0;
   let corrections = 0;
   let joined = false;
 
@@ -186,14 +213,72 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     }
     if (frame.k !== 's') return;
     joined = true;
+    if (frame.of === undefined || frame.c === undefined) {
+      accept(frame.tick, frame.t, frame.ack, frame.e, frame.e);
+      return;
+    }
+    // A chunk. Older assemblies still open when a newer tick shows up are
+    // finished as they are: their missing chunks were lost.
+    for (const [tick, open] of assemblies) {
+      if (tick < frame.tick) finish(tick, open);
+    }
+    let assembly = assemblies.get(frame.tick);
+    if (assembly === undefined) {
+      if (newestTick !== null && frame.tick <= newestTick) return; // already finished
+      assembly = { t: frame.t, ack: frame.ack, of: frame.of, parts: new Map() };
+      assemblies.set(frame.tick, assembly);
+    }
+    if (assembly.of !== frame.of) return;
+    assembly.parts.set(frame.c, frame.e);
+    assembly.ack = Math.max(assembly.ack, frame.ack);
+    if (assembly.parts.size === assembly.of) finish(frame.tick, assembly);
+  });
+
+  /**
+   * A chunked snapshot, done: every chunk, or the chunks that came, with
+   * each missing chunk's entities carried over from the previous snapshot
+   * ({@link chunkOf} is stable, so which entities a chunk carries is known
+   * whatever the previous snapshot's cut).
+   */
+  function finish(tick: number, assembly: Assembly<E>): void {
+    assemblies.delete(tick);
+    const received: Record<string, E> = {};
+    for (const part of assembly.parts.values()) Object.assign(received, part);
+    let entities: Record<string, E> = received;
+    if (assembly.parts.size < assembly.of) {
+      partialSnapshots += 1;
+      const previous = snapshots.latest();
+      if (previous !== null && previous.tick < tick) {
+        entities = { ...received };
+        for (const [id, entity] of Object.entries(previous.entities)) {
+          if (!assembly.parts.has(chunkOf(id, assembly.of)) && !(id in entities)) entities[id] = entity;
+        }
+      }
+    }
+    // Reconciled against what the host actually sent this tick: a local
+    // entity carried over from a lost chunk is not the host's word.
+    accept(tick, assembly.t, assembly.ack, entities, received);
+  }
+
+  /** One snapshot, whole or assembled: buffered, and reconciled against. */
+  function accept(
+    tick: number,
+    time: number,
+    ack: number,
+    entities: Readonly<Record<string, E>>,
+    sent: Readonly<Record<string, E>>,
+  ): void {
     snapshotsSeen += 1;
     const newest = snapshots.latest();
-    snapshots.add({ time: frame.t, tick: frame.tick, entities: frame.e });
+    snapshots.add({ time, tick, entities });
+    if (newestTick === null || tick > newestTick) newestTick = tick;
     // Reconcile only on a snapshot newer than any seen: an older one
     // (reordered by the carrier) must not roll the local entity back.
-    if (options.local && (newest === null || frame.tick > newest.tick)) {
-      pending = pending.filter(input => input.seq > frame.ack);
-      const authoritative = frame.e[options.local.id];
+    if (options.local && (newest === null || tick > newest.tick)) {
+      pending = pending.filter(input => input.seq > ack);
+      const authoritative = Object.prototype.hasOwnProperty.call(sent, options.local.id)
+        ? sent[options.local.id]
+        : undefined;
       if (authoritative !== undefined) {
         let replayed: E = authoritative;
         for (const input of pending) replayed = options.local.predict(replayed, input.data);
@@ -206,7 +291,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
         predicted = replayed;
       }
     }
-  });
+  }
 
   // Join, and keep the clock honest.
   const pingEvery = 1000 / Math.max(0.5, options.pingRate ?? 4);
@@ -250,6 +335,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       lateSnapshots: snapshots.late,
       pendingInputs: pending.length,
       corrections,
+      partialSnapshots,
     }),
     close() {
       if (closed) return;

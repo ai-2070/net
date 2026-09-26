@@ -466,9 +466,17 @@ frame; netcode now reads event peers exactly as the store does
 `stage7_netcode_predicts_a_ship_and_the_host_applies_every_input_over_the_lossy_channel`
 runs on the DIRECT pair (after §8). Correction smoothing
 (`correctionSmoothingMs`, default 100) and opt-in extrapolation
-(`extrapolateMs`) are done (2026-09-27). **Not yet:** binary frames,
-fragmentation-aware snapshot sizing, interest-key integration (today
+(`extrapolateMs`) are done (2026-09-27). So is fragmentation-aware
+snapshot sizing: over `maxFrameBytes` a snapshot is sent as stable-hash
+chunks that each fit one event, and a lost chunk's entities carry over for
+one tick. **Not yet:** binary frames, interest-key integration (today
 `visible`).
+
+**Benign anchor warning, recorded:** the acceptance run's anchor logs
+`open_stream: ignoring a fire-and-forget open on a reliable stream`. That is
+`publish_to_peer` opening a channel stream fire-and-forget that the peer
+already used reliably. The stream stays reliable, so delivery only gets
+stronger; nothing is lost.
 
 **Fixed (2026-09-27) — netcode on a direct pair.** Run right after the pair
 went direct, the host's netcode sends to the player all failed. Cause:
