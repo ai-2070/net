@@ -1,0 +1,64 @@
+.claude/skills/net-browser/SKILL.md
+  s_d8b00bedd146e9::t_6a526f6cc1f12c 119-124
+  s_d8b00bedd146e9::t_bdde1ec56b80ec 37-43,109-118
+.claude/skills/net-browser/source-access.md
+  s_d8b00bedd146e9::t_8a4253e921ac5d 34-36
+web/src/content/docs/reference/cli.md
+  s_d8b00bedd146e9::t_8208f95969db05 184-185
+net/crates/net/browser-ts/test/identity.test.ts
+  s_d8b00bedd146e9::t_f6e4129dd487fa 1-54
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_8208f95969db05 103-105,152-157,227-244
+  s_d8b00bedd146e9::t_9657a047ec17c4 245
+net/crates/net/examples/anchor-acceptance/page/index.html
+  s_d8b00bedd146e9::t_7c40068dd862ea 1-5
+net/crates/net/browser-ts/src/identity.ts
+  s_d8b00bedd146e9::t_452855774fec0e 1-87
+net/crates/net/examples/anchor-acceptance/package.json
+  s_d8b00bedd146e9::t_57ae43d11a31e8 1-13
+net/crates/net/examples/anchor-acceptance/run.mjs
+  s_d8b00bedd146e9::t_272e054b45d657 1-112,114-154,165-168,171-177,179-195,197-212,227-229,232-242
+  s_d8b00bedd146e9::t_42c68218f164ad 169-170,178,213-226,230-231
+  s_d8b00bedd146e9::t_5129186c9dc5cb 196
+  s_d8b00bedd146e9::t_c439bec78c8625 155-164
+  s_d8b00bedd146e9::t_a296f9dd04c8cb 113
+net/crates/net/browser-ts/src/lobby.ts
+  s_d8b00bedd146e9::t_7de6d209eb5d5e 24,116,154-158,528,530-536,574,579-594,599-635
+  s_d8b00bedd146e9::t_1ff46a8c3d3c24 25-29,575-578,595-598
+.claude/skills/net-browser/session.md
+  s_d8b00bedd146e9::t_8a4253e921ac5d 57-59,62-65,68-76
+net/crates/net/browser-ts/test/lobby.test.ts
+  s_d8b00bedd146e9::t_76055bd64c900c 218-291
+web/src/content/docs/sdk/browser/quickstart.md
+  s_d8b00bedd146e9::t_8a4253e921ac5d 16,18-20,23-26,29-33,42,44-55,57
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_8208f95969db05 21-32
+net/crates/net/examples/anchor-acceptance/page/player.mjs
+  s_d8b00bedd146e9::t_42c68218f164ad 11-13,23,65-67,106-112,118
+  s_d8b00bedd146e9::t_c1910c83a2316d 1-10,14-22,24-64,68-87,103-105,113-117,119-167
+  s_d8b00bedd146e9::t_5129186c9dc5cb 88-102
+net/crates/net/examples/anchor-acceptance/.gitignore
+  s_d8b00bedd146e9::t_3efe4861b356dc 1-2
+net/crates/net/browser-ts/src/index.ts
+  s_d8b00bedd146e9::t_9bd2f69a9fc5a2 196-199
+net/crates/net/browser-ts/README.md
+  s_d8b00bedd146e9::t_9911d9524e370c 162,164-167,169-171
+  s_d8b00bedd146e9::t_68c085ec576dcc 71-73,76,79-80,82-89,92-97
+  s_d8b00bedd146e9::t_3b99052a8d1eb9 98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9f01c24cea6645516ba6ed11f2a91654a0360a01",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
