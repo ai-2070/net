@@ -1,0 +1,19 @@
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_082ed3e5b697bb 3-8,12,14-20,27-28,35-37,40-44,49,52-54,58,60-61,65-80,82-95,99-118,120-138,142-190,194,196,198-199,201-260,272-276,280,282,284-348,350-390,394-401,403-445,449-455,457-472,476,478,480-489,493,496-506,513-528,530
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4de3d2395af7d7477952328b35d5e2166d8bc53a",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
