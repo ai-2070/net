@@ -144,6 +144,8 @@ export interface FakeNodeBehaviour {
   /** One reading per `peer_candidate` call, replayed in order; the last repeats. */
   peerCandidateJson?: string[];
   peerOfferDialog?: string;
+  /** What `peer_direct_dialog` answers: a healthy direct pair's dialog, or none. */
+  peerDirectDialog?: string;
   peerOfferError?: unknown;
   peerAcceptOfferError?: unknown;
   peerHandshakeError?: unknown;
@@ -330,6 +332,10 @@ export class FakeNode implements LeafWasmNode {
     if (this.behaviour.peerOfferError !== undefined) throw this.behaviour.peerOfferError;
     this.peerOffers.push(peer_hex);
     return this.behaviour.peerOfferDialog ?? '00000000000000d1';
+  }
+
+  peer_direct_dialog(_peer_hex: string): string | undefined {
+    return this.behaviour.peerDirectDialog;
   }
 
   async peer_accept_offer(peer_hex: string): Promise<string> {

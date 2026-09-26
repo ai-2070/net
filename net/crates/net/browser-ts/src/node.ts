@@ -837,11 +837,26 @@ export class BrowserNode {
    * credential this node connected with. A page that could supply a
    * key could supply any key.
    *
+   * **Idempotent on a healthy pair.** When the pair is already direct
+   * and its channel open, this resolves `direct` with the live dialog
+   * and sends nothing: a second offer would replace the working link
+   * and close it under the other side. So a library may call it "to be
+   * sure" before opening a stream.
+   *
    * Returns a {@link PeerConnectOutcome}. It **rejects** only for
    * something that is not a disposition of the attempt — a closed
    * node, a peer that answered `Reject`, a malformed peer id.
    */
   async connectPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
+    // Already direct and open: the pair it has. A new offer would
+    // replace the working link and close it under the other side.
+    let settled: string | undefined;
+    try {
+      settled = this.inner.peer_direct_dialog(idArg(nodeIdHex, 'peer'));
+    } catch (error) {
+      throw fromWasmError(error);
+    }
+    if (settled !== undefined && settled !== null) return { type: 'direct', peer: nodeIdHex, dialog: settled };
     return driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus);
   }
 

@@ -212,6 +212,15 @@ the README on why it is a sibling package rather than a sub-path.
   `SIZE <artifact> raw=<n> gz=<n>` lines for CI, a comparison against
   the S0a baseline, and `--assert` / `--require-leaf` exit codes.
 
+### Fixed
+
+- **`connectPeer` is idempotent on a healthy direct pair.** It resolves
+  `{ type: 'direct' }` with the live dialog and sends nothing. Before this,
+  it made a fresh offer whose connection replaced — and closed — the working
+  link under the peer. The pair still read as direct while every send to it
+  was refused. This hit any library that calls `connectPeer` before opening a
+  stream (netcode, lobbies). Not yet applied to `openSession().connectPeer`.
+
 ### Changed
 
 - **A stream terminal's final body is no longer dropped.** A completion

@@ -7403,6 +7403,7 @@ jobs:
           stage6_a_network_change_drives_exactly_one_re_attempt
           stage6_rtc_stats_uses_the_native_field_names_and_names_what_it_cannot_measure
           stage6_one_node_id_spelling_across_both_signalling_surfaces
+          stage6_connect_peer_on_a_healthy_direct_pair_is_idempotent
           org_browser_call_unary_same_org
           org_browser_call_unary_granted
           org_browser_call_streaming_same_org
@@ -7486,8 +7487,8 @@ jobs:
             # Floors are PER ENGINE: Chromium runs the store stage,
             # Firefox does not (see the harness step above).
             case "$engine" in
-              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=98; extra="$STAGE7" ;;
-              firefox)  log="$RUNNER_TEMP/rtcb-firefox.log"; floor=86; extra="" ;;
+              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=99; extra="$STAGE7" ;;
+              firefox)  log="$RUNNER_TEMP/rtcb-firefox.log"; floor=87; extra="" ;;
             esac
             # Prove the parser finds a KNOWN line before believing
             # any count, so a changed output format reads as "fix the

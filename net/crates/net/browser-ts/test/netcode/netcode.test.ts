@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ClockEstimator, SnapshotBuffer, hostNetcode, joinNetcode, lerpNumbers } from '../../src/netcode/index.js';
+import type { TimedSnapshot } from '../../src/netcode/index.js';
 import { simNetwork } from './sim.js';
 
 const HOST = '00000000000000aa';
@@ -56,7 +57,7 @@ describe('ClockEstimator', () => {
 });
 
 describe('SnapshotBuffer', () => {
-  const snap = (tick: number, time: number, x: number | null) => ({
+  const snap = (tick: number, time: number, x: number | null): TimedSnapshot<Ship> => ({
     tick,
     time,
     entities: x === null ? {} : { s: { x, y: 0 } },
@@ -69,8 +70,10 @@ describe('SnapshotBuffer', () => {
     buffer.add(snap(1, 100, 10));
     expect(buffer.late).toBe(2);
     expect(buffer.at(150, lerpNumbers).s).toEqual({ x: 15, y: 0 });
-    expect(buffer.at(-50, lerpNumbers).s).toEqual({ x: 0, y: 0 }, 'before the oldest: the oldest');
-    expect(buffer.at(999, lerpNumbers).s).toEqual({ x: 20, y: 0 }, 'past the newest: held, not extrapolated');
+    // Before the oldest: the oldest.
+    expect(buffer.at(-50, lerpNumbers).s).toEqual({ x: 0, y: 0 });
+    // Past the newest: held, not extrapolated.
+    expect(buffer.at(999, lerpNumbers).s).toEqual({ x: 20, y: 0 });
   });
 
   it('shows an entity appearing as it is, and drops one that is gone from the later snapshot', () => {

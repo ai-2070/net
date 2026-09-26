@@ -2601,6 +2601,29 @@ impl LeafNode {
         Ok(format!("{dialog:016x}"))
     }
 
+    /// The live attempt's dialog, 16 hex digits, when `peer` is
+    /// **already a healthy direct pair** — session installed, no
+    /// relay entry, transport open — and `null` otherwise.
+    ///
+    /// What makes `connectPeer` idempotent. A second offer to a
+    /// healthy pair is not a no-op: its connection replaces the
+    /// transport's link, which closes the working one under the other
+    /// side, and the answerer never asked for a new attempt — so the
+    /// pair ends up reading direct with a closed channel. A page (or a
+    /// library, like netcode or a lobby) that calls `connectPeer` "to
+    /// be sure" must get the pair it already has.
+    pub fn peer_direct_dialog(&self, peer_hex: String) -> Result<Option<String>, JsError> {
+        let peer = parse_peer_id(&peer_hex)?;
+        let guard = self.inner.borrow();
+        guard.admit().map_err(js)?;
+        if guard.direct_interrupted(peer) {
+            return Ok(None);
+        }
+        Ok(guard
+            .attempt_of(peer)
+            .map(|attempt| format!("{:016x}", attempt.dialog)))
+    }
+
     /// [`Self::peer_offer`]'s whole body, with the attempt's
     /// absolute deadline as a parameter.
     ///

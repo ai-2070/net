@@ -457,28 +457,33 @@ channel both ways (`lossy_written` / `lossy_ingress` on both pages). It found
 a real defect the simulated network could not: the browser node reports an
 event's sender as a DECIMAL u64 and netcode read it as hex, refusing every
 frame; netcode now reads event peers exactly as the store does
-(`peerHexOf`), and the simulator reports decimal like the leaf. **Not yet:**
-a CI witness on a DIRECT pair (the runner witness
+(`peerHexOf`), and the simulator reports decimal like the leaf. The runner witness
 `stage7_netcode_predicts_a_ship_and_the_host_applies_every_input_over_the_lossy_channel`
-runs on the ROUTED pair; see the open defect below),
-correction smoothing, extrapolation, binary frames, fragmentation-aware
-snapshot sizing, interest-key integration (today `visible`).
+runs on the DIRECT pair (after §8). **Not yet:** correction smoothing,
+extrapolation, binary frames, fragmentation-aware snapshot sizing,
+interest-key integration (today `visible`).
 
-**Open defect (found 2026-09-27) — lossy sends to a direct-upgraded peer.**
-In the runner's Stage 7, run right after the pair goes direct (§8, whose
-reliable store traffic host → player passes), the host's netcode sends to the
-player all failed: the host page's link counters showed
-`admission_refused_unknown_peer` 442 and `lossy_written` 0 (its transport had
-no link for the peer it addressed), the player received nothing on its lossy
-channel, and the host's stream credit then ran out (`backpressure: … the peer
-has not granted more`) because credit is spent before the transport refuses.
-The same code on a routed pair passes, and the acceptance run's (fresh pair)
-passes. To investigate: how a LOSSY packet to a peer is addressed after the
-§9 direct upgrade versus a reliable one (relay entry cleared, link keyed
-differently, or the direct link's answerer side), and whether credit should be
-charged for a packet the transport refuses. Netcode's own recovery (retire and
-reopen a stream on send failure, `lastSendError`) is built and witnessed in
-the simulator; it cannot fix a transport that has no link.
+**Fixed (2026-09-27) — netcode on a direct pair.** Run right after the pair
+went direct, the host's netcode sends to the player all failed. Cause:
+`joinNetcode` (like the lobby) calls `connectPeer` "to be sure" before
+opening its stream, and on a pair that was ALREADY direct that made a fresh
+offer. The new connection replaced the player's transport link and so closed
+the working one under the host. The host kept reading the pair as direct
+(session installed, no relay) while its channel was `Closed`: every send was
+refused (`channel … is Closed`, counted as `admission_refused_unknown_peer`)
+and the stream's credit ran out. Only the player → host lossy channel of the
+new, never-answered connection still carried anything. Fix: `connectPeer` is
+idempotent on a healthy pair. The leaf's `peer_direct_dialog` reports the
+live dialog when the session is installed, unrelayed and the transport open,
+and `BrowserNode.connectPeer` then resolves `direct` without offering.
+Witnessed by `stage6_connect_peer_on_a_healthy_direct_pair_is_idempotent`.
+Stage 6's unanswered-offer witness now makes its offer through the raw
+`peer_offer` primitive, which is how the re-attempt owner makes one. **Still
+open:** the leader-proxied `openSession().connectPeer` has no such check;
+it needs a proxy-protocol addition. Lossy streams are refused on sessions
+anyway, but a lobby run on a session could hit it. Separately, credit is
+spent before the transport refuses a packet; a refused send should arguably
+not consume credit.
 
 ### What model 2 adds on top
 

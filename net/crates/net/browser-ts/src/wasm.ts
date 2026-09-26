@@ -513,6 +513,13 @@ export interface LeafWasmNode {
    */
   peer_offer(peer_hex: string): Promise<string>;
   /**
+   * The live attempt's dialog when `peer` is already a healthy direct
+   * pair (session installed, no relay entry, transport open), else
+   * `undefined`. What makes `connectPeer` idempotent: a second offer
+   * would replace — and close — the working link.
+   */
+  peer_direct_dialog(peer_hex: string): string | undefined;
+  /**
    * Answer the offer `peer` sent, from the **verified envelope** that
    * arrived — not from anything the caller supplies. Resolves to the
    * dialog id the offerer minted.
