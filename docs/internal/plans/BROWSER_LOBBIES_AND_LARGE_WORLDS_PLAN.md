@@ -92,7 +92,7 @@ Gaps, with their state:
 | G11 | Bounds sized for rooms | Partly: interest has its own bounds; one-frame deltas remain (§8) |
 | G12 | The store only runs in a browser | Closed: runs in Node over `meshStoreTransport` |
 | G13 | **The leaf has only a reliable, ordered DataChannel** | **Open — netcode model 2 (§6)** |
-| G14 | **The host's commit validates the whole world** (15.6 ms at 8,000 entities, no players) | **Open — §8** |
+| G14 | **The host's commit validates the whole world** (15.6 ms at 8,000 entities, no players) | **Mitigated — §8 item 1: `setEntities` 2.2 ms; per-player projection (item 2) open** |
 
 ---
 
@@ -572,10 +572,29 @@ and input transaction commits the same way. Per-player projections under
 
 **Follow-up, in order:**
 
-1. **Incremental validation in TypeScript first.** An entity-level write, e.g.
-   `setEntity(collection, id, value)`, validated by a per-entity validator from
-   the definition, and committed without re-validating the untouched world.
-   Measure with the harness.
+1. **Incremental validation in TypeScript first — DONE (2026-09-27).** The
+   definition's `entities: { [collection]: parseOne }` plus the host's
+   `setEntities(collection, changes)` / `setEntity(...)`. Only the written
+   entities are parsed. The whole-document validator is skipped by contract:
+   declaring a collection says `state` imposes nothing on it beyond each entity.
+   Outside a transaction, only the changed entities are reconciled, and the
+   collection is rebuilt by one spread with no whole-tree reconcile. The
+   profile showed that reconcile's `defineProperty` walk cost as much as the
+   validator. Measured with `bench-world.mjs --write entities` (8,000 entities,
+   5% moving, ms/tick median):
+
+   | | `setState` | `setEntities` |
+   |---|---|---|
+   | no players | 15.9 | 2.2 |
+   | interest, 4 / 16 players | 18.4 / 18.2 | 4.6 / 4.7 |
+   | owner rule, 4 / 16 players | 135 / 486 | 130 / 459 |
+
+   (The byte columns also fell, but mostly because the entity bench does not
+   bump `tick`.) The `owner` rows are per-player projection over the whole
+   world, and that is item 2. Not done: an entity write from an action
+   handler's `context` (a handler can call the host handle, and the write
+   joins its transaction, but that commit validates the document as before).
+   Replicas still validate the whole document per delta.
 2. **A maintained spatial index** (cell → ids, updated from each commit's changed
    entities), so declared-visibility stores filter by interest *before*
    projecting: per-player cost O(nearby).

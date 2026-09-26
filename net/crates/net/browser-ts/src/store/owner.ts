@@ -422,6 +422,23 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
   }
 
   /**
+   * Write entities of one declared collection, as `setEntities` does:
+   * each changed entity validated by its per-entity parser, no
+   * whole-document validation. Same transaction and delta rules as
+   * {@link commit}.
+   */
+  commitEntities(collection: string, changes: Readonly<Record<string, unknown>>): Dispatched {
+    const inTransaction = this.core.inTransaction;
+    const previous = this.core.getState() as S;
+    if (!inTransaction) this.revisionBeforeCommit = this.core.revision;
+    this.core.applyEntities(collection, changes);
+    if (inTransaction) return this.accept([]);
+    const current = this.core.getState() as S;
+    if (Object.is(previous, current)) return this.accept([]);
+    return this.accept(this.propagate(previous, current));
+  }
+
+  /**
    * Tell every installed handle what changed (§1.9).
    *
    * Per audience, because a delta of the raw state would ship what a

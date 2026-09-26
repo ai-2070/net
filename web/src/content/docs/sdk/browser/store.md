@@ -262,6 +262,31 @@ own player) then receives only the entities whose key is in its set:
   player, under `projectFor` / `owner` rules) per change; what interest removes
   is the per-player serialization and the bytes.
 
+### Writing entities without validating the world
+
+`setState` runs the definition's `state` validator over the whole document on
+every commit, which costs O(world). Declare a per-entity parser for a collection
+and write that collection through `setEntities` instead:
+
+```typescript
+const world = defineStore({
+  /* … */
+  entities: { ships: parseShip },   // one entity in, one validated entity out
+});
+
+// One commit, one delta: move two ships, remove a third.
+host.setEntities('ships', { a: movedA, b: movedB, c: undefined });
+host.setEntity('ships', 'd', shipD);
+```
+
+Only the written entities are parsed, and untouched ones keep their identity.
+With 8,000 ships and 5% moving per tick, a commit drops from about 16 ms to
+about 2 ms. With interest and 16 players, it drops from 18 ms to 5 ms. Declaring
+the collection is a contract: `state` must impose nothing on it beyond each
+entity passing its parser. Keep rules that span entities in actions. Inside an
+action handler the write joins the handler's transaction, and that commit
+validates the document as usual.
+
 `cellKey`, `cellsAround(x, z, { size, radius })`, `stickyCells(previous, x, z, {
 size, radius, margin })` (hysteresis at cell borders) and `sameCells` are the
 grid helpers.

@@ -86,7 +86,33 @@ export interface StoreDefinition<
    * omit it.
    */
   readonly interest?: { readonly [collection: string]: (entity: never, id: string) => string | null };
+  /**
+   * Per-entity validators, for the top-level entity maps whose validity is
+   * **per entity**: collection name → a parser for ONE entity.
+   *
+   * What makes {@link HostedStoreHandle.setEntities} cheap. An entity
+   * write validates only the entities it changes, and it commits without
+   * running {@link StoreDefinition.state} over the untouched world. That
+   * is the whole-document validator, which costs O(world) on every commit.
+   *
+   * **A contract, not a hint.** Declaring a collection here says that
+   * `state`'s rule for that key is exactly "a record of entities, each
+   * passing this parser", with no cross-entity or cross-collection
+   * invariant. `setEntities` trusts that, so an invariant that `state`
+   * enforces across entities is not enforced on this path. Keep such
+   * invariants in actions, or write through `setState`.
+   */
+  readonly entities?: { readonly [collection: string]: Parse<unknown> };
 }
+
+/** The top-level keys of `S` whose values are entity maps. */
+export type EntityCollection<S extends object> = {
+  [K in keyof S & string]: S[K] extends Readonly<Record<string, unknown>> ? K : never;
+}[keyof S & string];
+
+/** One entity of collection `C` of `S`. */
+export type EntityOf<S extends object, C extends keyof S> =
+  S[C] extends Readonly<Record<string, infer E>> ? E : never;
 
 /** Where a handle is in its lifecycle. Kept out of game state. */
 export type StorePhase =

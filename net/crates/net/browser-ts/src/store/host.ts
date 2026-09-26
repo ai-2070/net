@@ -28,7 +28,7 @@
 
 import { isStaleStream, StoreError } from './errors.js';
 import { StoreOwner, type Dispatched, type OwnerDeps, type Outbound, type Viewer } from './owner.js';
-import type { ActionSpec, Cancel, InputSpec, StoreDefinition } from './types.js';
+import type { ActionSpec, Cancel, EntityCollection, EntityOf, InputSpec, StoreDefinition } from './types.js';
 import { encodeMessage, type Hex } from './wire.js';
 import { applyVisibility, compileVisibility } from './visibility.js';
 
@@ -234,6 +234,20 @@ export interface HostedStoreHandle<
   getState(): S;
   subscribe(listener: (state: S, previous: S) => void): Cancel;
   setState(next: S): void;
+  /**
+   * Write entities of a collection declared in the definition's
+   * `entities`: `id → value`, or `id → undefined` to remove one. Only the
+   * written entities are validated (by their per-entity parser); the
+   * whole-document `state` validator does not run, so a tick that moves a
+   * few ships out of thousands costs what it touches. One revision, one
+   * delta, however many ids.
+   */
+  setEntities<C extends EntityCollection<S>>(
+    collection: C,
+    changes: Readonly<Record<string, EntityOf<S, C> | undefined>>,
+  ): void;
+  /** {@link setEntities} for one id; `undefined` removes it. */
+  setEntity<C extends EntityCollection<S>>(collection: C, id: string, value: EntityOf<S, C> | undefined): void;
   /** Handles, ledgers and pending projections, for a bounds report. */
   counts(): { readonly handles: number; readonly ledgers: number; readonly deferred: number };
   counters(): Readonly<Record<string, number>>;
@@ -780,6 +794,14 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       // that return would leave every replica at the revision it
       // joined on.
       dispatched(owner.commit(next));
+    },
+    setEntities: (collection, changes) => {
+      dispatched(owner.commitEntities(collection, changes));
+    },
+    setEntity: (collection, id, value) => {
+      const changes: Record<string, unknown> = {};
+      Object.defineProperty(changes, id, { value, enumerable: true, writable: true, configurable: true });
+      dispatched(owner.commitEntities(collection, changes));
     },
     counts: () => ({
       handles: owner.handleCount,

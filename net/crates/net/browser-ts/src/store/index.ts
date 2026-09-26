@@ -53,6 +53,8 @@ export type {
   ActionContext,
   ActionSpec,
   Cancel,
+  EntityCollection,
+  EntityOf,
   HostedStore,
   InputDisposition,
   InputSpec,

@@ -161,9 +161,16 @@ answer rather than a second guess.
 
 | Surface | Calls |
 |---|---|
-| host handle | `authority` (this node's id), `getState()`, `subscribe(listener)`, `setState(next)`, `counts()` (`handles` / `ledgers` / `deferred`), `counters()`, `close()` |
+| host handle | `authority` (this node's id), `getState()`, `subscribe(listener)`, `setState(next)`, `setEntities(collection, changes)` / `setEntity(collection, id, value)`, `counts()` (`handles` / `ledgers` / `deferred`), `counters()`, `close()` |
 | replica handle | `getState()`, `subscribe(listener)`, `getStatus()`, `subscribeStatus(listener)`, `ready()`, `act(name, input)`, `input(name, value)`, `setAudience(names)`, `reconnect()`, `close()` |
 
+- **Moving many entities per tick? Use `setEntities`, not `setState`.** Declare
+  a per-entity parser on the definition (`entities: { ships: parseShip }`),
+  then `host.setEntities('ships', { a: shipA, b: undefined })` (`undefined`
+  removes). Only the written entities are validated; the whole-document
+  `state` validator does not run. 8,000 ships: ~16 ms → ~2 ms a commit. The
+  contract: `state` must impose nothing on that collection beyond each entity
+  passing its parser, so keep cross-entity rules in actions.
 - **Host `setState(next)` replaces the whole document.** Inside a handler,
   `context.setState(patch | (state) => patch)` **shallow-merges** the patch into
   the top level. Handlers are **synchronous**: returning a thenable (an `async`

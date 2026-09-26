@@ -83,5 +83,30 @@ export function defineStore<
     }
   }
 
+  if (definition.entities !== undefined) {
+    for (const [collection, parse] of Object.entries(definition.entities)) {
+      if (collection.length === 0 || collection.includes('.') || typeof parse !== 'function') {
+        throw new StoreError(
+          'invalid-data',
+          `store '${definition.id}': entities maps a top-level collection name to a per-entity parser, got '${collection}'`,
+        );
+      }
+      const inEmpty = (empty as Record<string, unknown>)[collection];
+      if (inEmpty !== undefined && !isEntityMap(inEmpty)) {
+        throw new StoreError(
+          'invalid-data',
+          `store '${definition.id}': entities names '${collection}', but empty().${collection} is not a record of entities`,
+        );
+      }
+    }
+  }
+
   return Object.freeze({ ...definition });
+}
+
+/** A plain object: what an entity map is. */
+export function isEntityMap(value: unknown): value is Readonly<Record<string, unknown>> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value) as unknown;
+  return proto === Object.prototype || proto === null;
 }

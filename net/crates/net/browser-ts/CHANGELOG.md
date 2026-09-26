@@ -18,6 +18,13 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **Entity writes: `setEntities(collection, changes)` / `setEntity(collection,
+  id, value)`** on the host handle, for collections that declare a per-entity
+  parser in the definition's new `entities` field. Only the written entities
+  are validated, and the whole-document `state` validator does not run. At
+  8,000 entities a commit drops from about 16 ms to about 2 ms. `undefined`
+  removes an entity. `scripts/bench-world.mjs --write entities` measures it.
+
 - **Netcode: `@net-mesh/browser/netcode`** — `hostNetcode` (fixed-rate tick
   loop; inputs applied exactly once per player however often the lossy
   carrier repeats them; per-player `visible` filter; `authorize`; capped

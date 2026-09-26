@@ -19,6 +19,12 @@
 //
 // Each tick moves a fraction of the entities (default 5%) by a small step
 // and commits once, as a game loop's authoritative update would.
+//
+// Writes (`--write`):
+//   state     — `setState` of the whole document (default): the definition's
+//               whole-document validator runs on every commit.
+//   entities  — `setEntities('ships', moved)`: only the moved ships are
+//               validated, by the per-entity parser the definition declares.
 
 import { performance } from 'node:perf_hooks';
 
@@ -31,6 +37,11 @@ const flag = (name, fallback) => {
   return at === -1 ? fallback : Number(args[at + 1]);
 };
 const json = args.includes('--json');
+const write = (() => {
+  const at = args.indexOf('--write');
+  return at === -1 ? 'state' : args[at + 1];
+})();
+if (write !== 'state' && write !== 'entities') throw new Error(`--write is 'state' or 'entities', got '${write}'`);
 const only = (() => {
   const at = args.indexOf('--mode');
   return at === -1 ? null : args[at + 1];
@@ -68,6 +79,7 @@ function definitionFor(mode) {
     empty: () => ({ ships: {}, tick: 0 }),
     visibility: mode === 'owner' ? { 'ships.*.cargo': 'owner' } : 'open',
     ...(mode === 'full' ? {} : { interest: { ships: s => pkg.cellKey(s.x, s.z, CELL) } }),
+    ...(write === 'entities' ? { entities: { ships: ship } } : {}),
     actions: {},
     inputs: {},
   });
@@ -148,18 +160,19 @@ async function run({ mode, entities, players, ticks, moving, density }) {
   const settleStarted = performance.now();
   for (let tick = 1; tick <= ticks; tick += 1) {
     const state = host.getState();
-    const next = { ...state.ships };
+    const moved = {};
     for (let k = 0; k < perTick; k += 1) {
       const id = ids[Math.floor(random() * ids.length)];
-      const s = next[id];
-      next[id] = {
+      const s = moved[id] ?? state.ships[id];
+      moved[id] = {
         ...s,
         x: Math.min(side, Math.max(0, s.x + (random() - 0.5) * 4)),
         z: Math.min(side, Math.max(0, s.z + (random() - 0.5) * 4)),
       };
     }
     const started = performance.now();
-    host.setState({ ships: next, tick });
+    if (write === 'entities') host.setEntities('ships', moved);
+    else host.setState({ ships: { ...state.ships, ...moved }, tick });
     hostMs.push(performance.now() - started);
     await turn();
   }
@@ -205,7 +218,7 @@ const base = { ticks: flag('ticks', 40), moving: flag('moving', 0.05), density: 
 const fmt = (n, digits = 1) => (n >= 100 ? Math.round(n).toString() : n.toFixed(digits));
 if (!json) {
   console.log(
-    `ticks=${base.ticks} moving=${base.moving * 100}%/tick density=${base.density}/cell cell=${CELL} (local mesh, dist build)\n`,
+    `ticks=${base.ticks} moving=${base.moving * 100}%/tick density=${base.density}/cell cell=${CELL} write=${write} (local mesh, dist build)\n`,
   );
   console.log('mode      entities players | host ms/tick med  p95 | B/player/tick mean   max | frames/tick | initial B/player | resyncs notReady');
 }
@@ -250,5 +263,5 @@ for (const point of sweep) {
   }
 }
 
-if (json) console.log(JSON.stringify({ base, results }, null, 2));
+if (json) console.log(JSON.stringify({ base: { ...base, write }, results }, null, 2));
 process.exit(0);

@@ -30,6 +30,7 @@
 
 import { StoreError } from './errors.js';
 import { mergeShallow, reconcile } from './state.js';
+import { isEntityMap } from './definition.js';
 import { applyPatch, type PatchOutcome } from './patch.js';
 import type { WireOp } from './wire.js';
 import type {
@@ -266,6 +267,108 @@ export class StoreCore<S extends object, A extends ActionSpec, I extends InputSp
   }
 
   /**
+   * Write entities of one declared collection: each changed entity
+   * validated by its PER-ENTITY parser (`definition.entities`), and the
+   * document committed WITHOUT the whole-document validator.
+   *
+   * `changes` maps an id to its new value, or to `undefined` to remove
+   * it. The untouched entities keep their identity, so reconciliation
+   * and every downstream diff short-circuit on them. What is not free:
+   * rebuilding the collection object, O(entities) shallow and with no
+   * parsing.
+   *
+   * Inside a handler it JOINS the open transaction, like
+   * {@link applySnapshot}. The whole-document validator is skipped by
+   * contract: declaring the collection in `entities` says `state`
+   * imposes nothing on it beyond each entity passing its parser.
+   */
+  applyEntities(collection: string, changes: Readonly<Record<string, unknown>>): void {
+    this.#refuseWhenClosed();
+    const parse = this.#definition.entities?.[collection];
+    if (parse === undefined || !Object.prototype.hasOwnProperty.call(this.#definition.entities, collection)) {
+      throw new StoreError(
+        'invalid-data',
+        `store '${this.#definition.id}' declares no per-entity parser for '${collection}'; declare it in \`entities\` or write through setState`,
+      );
+    }
+    const open = this.#transaction;
+    const from = open !== null && open.active ? open.staged : this.#state;
+    const current = (from as Record<string, unknown>)[collection];
+    if (current !== undefined && !isEntityMap(current)) {
+      throw new StoreError(
+        'invalid-data',
+        `store '${this.#definition.id}': '${collection}' is not an entity map in the current state`,
+      );
+    }
+    // Every change parsed BEFORE anything is built: a refusal on the last
+    // id publishes nothing.
+    const parsed: [string, unknown][] = [];
+    for (const id of Object.keys(changes)) {
+      if (id.length === 0) {
+        throw new StoreError('invalid-data', `store '${this.#definition.id}': an entity id in '${collection}' is empty`);
+      }
+      const raw = changes[id];
+      if (raw === undefined) {
+        parsed.push([id, undefined]);
+        continue;
+      }
+      try {
+        parsed.push([id, this.runReadOnly(() => parse(raw))]);
+      } catch (error) {
+        if (error instanceof StoreError) throw error;
+        throw new StoreError(
+          'invalid-data',
+          `entity '${collection}.${id}' failed the '${this.#definition.id}' entity validator: ${String(error)}`,
+          { cause: error },
+        );
+      }
+    }
+
+    if (open !== null && open.active) {
+      // A staged document need not be reconciled yet (a `setState` inside
+      // the handler stages the validator's raw output), so the transaction
+      // gets the general merge; its commit validates the document anyway.
+      const draft: Record<string, unknown> = { ...(current ?? {}) };
+      for (const [id, entity] of parsed) {
+        if (entity === undefined) delete draft[id];
+        else defineData(draft, id, entity);
+      }
+      open.staged = mergeShallow(from, { [collection]: draft } as unknown as Partial<S>);
+      return;
+    }
+
+    // Outside a transaction `from` is the committed state: reconciled and
+    // frozen all the way down. So only the CHANGED entities are reconciled,
+    // the collection is rebuilt by a spread (which defines own properties,
+    // `__proto__` included, and parses nothing), and the result is
+    // installed without a second whole-tree reconcile — `reconcile` over the
+    // collection is exactly the O(world) walk this path exists to skip.
+    let changed = false;
+    const reconciled: [string, unknown][] = [];
+    for (const [id, entity] of parsed) {
+      const present = current !== undefined && Object.prototype.hasOwnProperty.call(current, id);
+      const before = present ? current[id] : undefined;
+      if (entity === undefined) {
+        if (present) changed = true;
+        reconciled.push([id, undefined]);
+        continue;
+      }
+      const next = reconcile(before, entity);
+      if (!Object.is(before, next)) changed = true;
+      reconciled.push([id, next]);
+    }
+    if (!changed) return;
+    const map: Record<string, unknown> = { ...(current ?? {}) };
+    for (const [id, entity] of reconciled) {
+      if (entity === undefined) delete map[id];
+      else defineData(map, id, entity);
+    }
+    const root: Record<string, unknown> = { ...(from as Record<string, unknown>) };
+    defineData(root, collection, Object.freeze(map));
+    this.#install(Object.freeze(root) as S);
+  }
+
+  /**
    * Apply a replica delta: the owner's patch operations, at this
    * document, validated by this definition.
    *
@@ -359,7 +462,16 @@ export class StoreCore<S extends object, A extends ActionSpec, I extends InputSp
   #publish(validated: S): void {
     const next = reconcile(this.#state, validated);
     if (Object.is(next, this.#state)) return;
+    this.#install(next);
+  }
 
+  /**
+   * Install a document that is ALREADY reconciled against the current one
+   * and frozen, and tell the subscribers. Only {@link applyEntities}
+   * builds such a document itself; everything else comes through
+   * {@link #publish}.
+   */
+  #install(next: S): void {
     const previous = this.#state;
     this.#state = next;
     this.#revision += 1;
@@ -457,4 +569,9 @@ function dispatch(deliver: () => void): void {
   } catch (error) {
     console.error('[@net-mesh/browser] store listener threw', error);
   }
+}
+
+/** Store a caller's key as data: an id of `__proto__` is not a prototype. */
+function defineData(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
 }
