@@ -556,6 +556,12 @@ creator, and every region in P4, need a host that is not a player.
 
 - A dedicated host **snapshots its store document to RedEX** (the repo's durable
   log) on an interval and on clean shutdown, and **restores it on start**.
+  **DONE (2026-09-27):** `persistStore` / `restoreStore` in `@net-mesh/sdk`
+  (`sdk-ts/src/store-persist.ts`). Snapshots are JSON tagged with the store id,
+  its version and a format number. The interval skips unchanged documents, and
+  `close()` writes one last snapshot. Restore takes the newest snapshot that
+  matches and validates. Tests cover a real restart of a disk-backed file and a
+  real `hostStore`.
 - It is also Q6's recovery path: a failed region handoff re-joins the player to
   the destination region from persisted state (§9).
 - Deferred: per-entity databases, migrations between store versions, replay.

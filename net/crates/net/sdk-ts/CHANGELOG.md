@@ -16,6 +16,13 @@ install time.
 
 ### Added
 
+- **`persistStore(host, { file, intervalMs })` / `restoreStore(file,
+  definition)`** — a dedicated host's store document, snapshotted to a RedEX
+  file and restored on start. A snapshot is written only when the document
+  changed, and again on `close()`. Restore returns the newest snapshot that
+  matches the definition's id and version and passes its validator.
+  Structural: this package still does not depend on `@net-mesh/browser`.
+
 - **`MeshNode.onStreamData(streamId, handler)`** — every event on a
   stream, with `peerNodeId`: the peer whose session authenticated it.
   `recv` / `recvShard` return events with no sender; this is the receive

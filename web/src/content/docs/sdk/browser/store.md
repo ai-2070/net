@@ -214,6 +214,35 @@ logic, not about whether two browsers can reach each other.
 An announcement is a lease, so both sides re-announce on a timer; a joiner that
 looks a few seconds late otherwise reports that the host never announced.
 
+### A dedicated host in Node
+
+A world that outlives any one player runs its host in Node. `@net-mesh/sdk`
+provides the transport, `meshStoreTransport(mesh, { listen: ['store/<id>'] })`,
+and a snapshot of the document in RedEX, the mesh's durable log, restored on
+start:
+
+```typescript
+import { Redex, meshStoreTransport, persistStore, restoreStore } from '@net-mesh/sdk';
+
+const redex = new Redex({ persistentDir: './state' });
+const file = redex.openFile('game/world', { persistent: true, retentionMaxEvents: 4n });
+const restored = restoreStore(file, world);   // null on a first start
+const host = hostStore({
+  definition: world,
+  transport: meshStoreTransport(mesh, { listen: ['store/my-game.world'] }),
+  initialState: restored?.state ?? freshWorld(),
+  /* … */
+});
+const saving = persistStore(host, { file, intervalMs: 5_000 });
+// on shutdown:
+saving.close();   // one last snapshot
+```
+
+`persistStore` writes only when the document changed since its last snapshot.
+`restoreStore` returns the newest snapshot whose store id and version match the
+definition and that passes its `state` validator. A snapshot from another version
+is skipped, not migrated: migrations are the application's.
+
 ## The replica handle
 
 ```typescript

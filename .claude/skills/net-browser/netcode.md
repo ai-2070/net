@@ -39,7 +39,9 @@ const net = hostNetcode<Ship, Move>({
   rendering). It never goes further back than `maxRewindMs` (default 200 ms),
   so faked lag buys nothing; `clamped` says when the cap applied.
 - A dedicated host (Node) uses `meshStoreTransport(mesh, { listen: [label] })`
-  from `@net-mesh/sdk`.
+  from `@net-mesh/sdk`. Its store document survives a restart with
+  `persistStore(host, { file })` and `restoreStore(file, definition)` (a RedEX
+  file opened `persistent: true` with a small `retentionMaxEvents`).
 
 ## Player
 
