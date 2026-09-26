@@ -18,6 +18,16 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **`onEvent(event, context)`** — one host hook for `join`, `leave`
+  (with a reason: `left` / `expired` / `refused` / `dropped`) and `area`
+  (from `areaOf(state, peer)`, on change only). A transaction like an
+  action handler, run after the causing frame, including the host's own
+  player; throws are discarded and counted, and runaway chains stop at
+  `MAX_EVENT_ROUNDS`.
+- **Inventory bones** — `Inventory` (item id → count), `addItems`,
+  `removeItems`, `countItems`, `hasItems`, `inventoryOf`,
+  `parseInventory`, `onlyOwn`, with optional `maxKinds` / `maxCount`
+  rules and a typed `InventoryError`. Trading is not included.
 - **Lobbies.** `createLobby()` hosts a store with the host's own
   player (`lobby.self`), a room code, a shareable link, presence
   (`players()`, `subscribePlayers`), capacity (the host counted) and

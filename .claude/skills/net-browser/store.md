@@ -285,6 +285,23 @@ writes.
 - **Give each player an entity with an `enlist` action keyed by `context.peer`**
   (the authenticated caller — never an id the client sends). A joiner does
   `await replica.ready(); await replica.act('enlist', …)` before steering.
+- **React to players with the single `onEvent(event, context)` hook** on
+  `hostStore` / `createLobby`: `{ type: 'join', peer, audience }`,
+  `{ type: 'leave', peer, reason: 'left' | 'expired' | 'refused' | 'dropped' }`,
+  `{ type: 'area', peer, from, to }` (from `areaOf(state, peer) → string | null`,
+  fired only on change, `from: null` first). It is a transaction like a handler
+  (`context.peer` = the player, `setState` reaches every replica, a throw
+  discards its writes), runs after the causing frame, and includes the host's own
+  player. Put per-player setup (spawn, starter inventory) in `join`, not in an
+  `enlist` action the client must remember to call.
+- **Inventories:** keep `inventories: Record<peer, Inventory>` in state
+  (`Inventory` = item id → count). Change them only with `addItems` /
+  `removeItems` (they throw `InventoryError` `full` / `insufficient` /
+  `invalid`, which refuses the action with nothing written), read with
+  `countItems` / `hasItems` / `inventoryOf`, validate with `parseInventory(value,
+  rules)` in the definition's `state`, and hide other players' with
+  `projectFor: (state, { peer }) => ({ ...state, inventories: onlyOwn(state.inventories, peer) })`.
+  Trading is not built — do not fake it with two independent actions.
 - **Prefer a lobby over hand-rolled discovery.** `createLobby({ node, game,
   name, capacity, info?, visibility?, …hostStore options })` hosts the store,
   gives the host `lobby.self` (a `hostPlayer`), and re-announces on its own;

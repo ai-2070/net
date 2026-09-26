@@ -170,6 +170,17 @@ P0 anchor; the whole flow is in the skill and a fresh agent reproduces it.
 
 ---
 
+### Added on request (2026-09-26): player events and inventory bones
+
+- **`onEvent(event, context)`** — done. One host hook for `join` / `leave` /
+  `area`; `area` comes from a developer `areaOf(state, peer)`. P2's interest
+  keys should reuse `areaOf` rather than add a second notion of "where a player
+  is": an interest set can be derived from the area (and its neighbours).
+- **Inventory bones** — done: pure helpers over `item id → count` in store
+  state, with `onlyOwn` for `projectFor`. **Trading deferred**: it needs both
+  players' consent and one atomic transfer (an action pair is not atomic from
+  the traders' point of view), and belongs with hidden-information work.
+
 ## 5. P2 — interest management on one host
 
 **Goal:** a player receives only the entities near them, and the host's cost

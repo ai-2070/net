@@ -125,6 +125,7 @@ export function hostPlayer<S extends object, A extends ActionSpec, I extends Inp
 
   function end(phase: 'failed' | 'closed', error: StoreError | null): void {
     ended = true;
+    if (error?.code === 'forbidden') queueMicrotask(() => depart('refused'));
     // As a replica does on a terminal refusal: the view is cleared, so
     // a revoked read stops showing what it no longer may.
     view.applySnapshot(definition.empty());
@@ -159,6 +160,21 @@ export function hostPlayer<S extends object, A extends ActionSpec, I extends Inp
     if (!closed && !ended) end('closed', null);
   });
   refresh();
+
+  // A player, as far as `onEvent` is concerned: `join` now if the read
+  // was granted, `leave` when this handle ends.
+  let joined = false;
+  if (view.getStatus().phase === 'ready') {
+    joined = true;
+    owner.localPresence(peer, true, audience);
+    inner.dispatched({ out: [], refused: null, deferred: null });
+  }
+  function depart(reason: 'left' | 'refused'): void {
+    if (!joined || inner!.isClosed()) return;
+    joined = false;
+    owner.localPresence(peer, false, audience, reason);
+    inner!.dispatched({ out: [], refused: null, deferred: null });
+  }
 
   function refusal(): StoreError | null {
     if (closed) return new StoreError('closed', 'this store handle is closed');
@@ -256,6 +272,7 @@ export function hostPlayer<S extends object, A extends ActionSpec, I extends Inp
     close: () => {
       if (!closed) {
         closed = true;
+        depart('left');
         pendingInputs.clear();
         stopWatching();
         view.close();

@@ -310,6 +310,66 @@ try {
 
 ---
 
+## Reacting to players: one hook
+
+Give the host an `onEvent` and it hears everything that happens to a player —
+someone joins, someone leaves, someone walks into a different area. It runs on
+the host like an action handler, so it can change the world, and every player
+sees the change:
+
+```js
+const host = hostStore({
+  // …the options from step 3a…
+  areaOf: (state, peer) => (state.ships[peer]?.x ?? 0) < 50 ? 'harbour' : 'open-sea',
+  onEvent: (event, context) => {
+    const state = context.getState();
+    switch (event.type) {
+      case 'join':   // a new player: a starter kit (add `inventories: {}` to your state)
+        context.setState({ inventories: { ...state.inventories,
+          [event.peer]: addItems(emptyInventory(), 'torpedo', 3) } });
+        break;
+      case 'leave':  // event.reason: 'left', 'expired', 'refused' (kicked) or 'dropped'
+        break;
+      case 'area':   // event.from → event.to, e.g. 'harbour' → 'open-sea'
+        break;
+    }
+  },
+});
+```
+
+- `join` and `leave` are per player, and include the host's own player.
+- `area` fires only when `areaOf`'s answer changes — the first time with
+  `from: null`. An area is any string you like: a zone, a room, a grid cell.
+- A hook that throws changes nothing. Keep it quick and synchronous, like a
+  handler.
+
+## Inventories (the basics)
+
+An inventory is plain data in your world — item id → count — and the helpers
+change it only on the host, refusing what breaks the rules:
+
+```js
+import { addItems, removeItems, countItems, hasItems, emptyInventory,
+         inventoryOf, onlyOwn, parseInventory } from '@net-mesh/browser';
+
+const rules = { maxKinds: 20, maxCount: { torpedo: 10 } };
+
+actions: {
+  fireTorpedo: (input, context) => {
+    const inventories = { ...context.getState().inventories };
+    // Throws when the player has none, which refuses the action and changes nothing.
+    inventories[context.peer] = removeItems(inventoryOf(inventories, context.peer), 'torpedo', 1);
+    context.setState({ inventories });
+    return { left: countItems(inventories[context.peer], 'torpedo') };
+  },
+},
+// Each player sees their own inventory and nobody else's:
+projectFor: (state, { peer }) => ({ ...state, inventories: onlyOwn(state.inventories, peer) }),
+```
+
+Use `parseInventory(value, rules)` inside your store's `state` validator. Trading
+between players is not built yet.
+
 ## Lobbies: a list, a code, a link
 
 Steps 3a and 3b find each other by hand. A lobby does it for you: the host opens

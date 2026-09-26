@@ -136,6 +136,18 @@ describe('lobbies', () => {
     expect(() => lobby.kick(lobby.host.authority)).toThrow(LobbyError);
   });
 
+  it("tells onEvent a kicked player left because they were refused", async () => {
+    const mesh = createLocalMesh();
+    const events: unknown[] = [];
+    const lobby = await lobbyOn(mesh, { onEvent: (event: unknown) => events.push(event) } as never);
+    const node = mesh.node();
+    const world = await joinLobby({ node, definition: room, game: 'lobby-test', code: lobby.code });
+    await world.ready();
+    lobby.kick(node.nodeIdHex());
+    await settle();
+    expect(events).toContainEqual({ type: 'leave', peer: node.nodeIdHex(), reason: 'refused' });
+  });
+
   it('keeps an unlisted lobby out of the list, but joinable by code', async () => {
     const mesh = createLocalMesh();
     const lobby = await lobbyOn(mesh, { visibility: 'unlisted' });

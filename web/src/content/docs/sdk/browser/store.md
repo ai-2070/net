@@ -200,6 +200,33 @@ A replica has **no `setState`**. That is a type-level fact rather than a runtime
 check: writes go through actions and inputs, and only the host's handle carries
 the setter.
 
+## One hook for players: `onEvent`
+
+`onEvent(event, context)` is the host's single hook for what happens to players:
+
+| Event | When |
+| --- | --- |
+| `{ type: 'join', peer, audience }` | A player's first subscription is installed, or the host's own player starts |
+| `{ type: 'leave', peer, reason }` | Their last one ends: `left`, `expired`, `refused` (a kick or revoked read) or `dropped` (their view could not be delivered) |
+| `{ type: 'area', peer, from, to }` | `areaOf(state, peer)` answers differently than last time; `from` is `null` the first time |
+
+The hook runs on the host as one transaction with `context.peer` set to the
+player — the same contract as an action handler — so it can `setState`, and its
+changes reach every replica. It runs after the frame that caused the event, never
+during one. A throw discards its writes and is counted (`event-rejected`); hooks
+whose writes keep causing new events are stopped after `MAX_EVENT_ROUNDS` runs
+(`event-rounds-bound`). A closing store raises no events.
+
+## Inventories
+
+`Inventory` is plain JSON (item id → whole count ≥ 1). `addItems`,
+`removeItems`, `countItems`, `hasItems`, `inventoryOf` and `parseInventory` are
+pure functions with optional rules (`maxKinds`, `maxCount`); a change that breaks
+a rule throws `InventoryError` (`full`, `insufficient`, `invalid`), which inside
+a handler refuses the action with nothing written. `onlyOwn(byPeer, peer)` is the
+`projectFor` helper that leaves only the viewer's entry, so another player's
+inventory is never sent. Trading is not built yet.
+
 ## Lobbies
 
 `createLobby`, `listLobbies` and `joinLobby` are a layer over the store and

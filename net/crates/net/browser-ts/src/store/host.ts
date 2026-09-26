@@ -309,6 +309,8 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     authorize: options.authorize,
     project: options.project,
     projectFor: options.projectFor,
+    onEvent: options.onEvent,
+    areaOf: options.areaOf,
     actions: options.actions,
     inputs: options.inputs,
     maxEventBytes: options.maxEventBytes,
@@ -474,7 +476,26 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     // reply exactly like the synchronous one, or the caller waits on a
     // result that was computed and never sent.
     if (result.deferred !== null) {
-      detached(result.deferred.then(later => emit(later.out)));
+      detached(result.deferred.then(later => dispatched(later)));
+    }
+    flushEvents();
+  }
+
+  /**
+   * Run the `onEvent` hook for whatever the frame just dispatched
+   * caused — a join, a leave, an area change — AFTER that frame's own
+   * output is on its way, and send what the hook changed. Never
+   * re-entered: a hook's own changes are drained by the same call.
+   */
+  let flushing = false;
+  function flushEvents(): void {
+    if (flushing || closed) return;
+    flushing = true;
+    try {
+      const drained = owner.drainEvents();
+      if (drained.out.length > 0) detached(emit(drained.out));
+    } finally {
+      flushing = false;
     }
   }
 

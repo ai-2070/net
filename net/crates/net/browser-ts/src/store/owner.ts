@@ -118,6 +118,20 @@ export interface OwnerDeps<S extends object, A extends ActionSpec, I extends Inp
    * that depends on who is looking has to be taken for each of them.
    */
   projectFor?(state: S, viewer: Viewer): S;
+  /**
+   * The one hook for things that happen to players: `join`, `leave`,
+   * `area`. Runs on the host as a transaction with the player as
+   * `context.peer`, exactly like an action handler — so it can
+   * `setState` (a starting inventory on join) — and its changes reach
+   * every replica. Synchronous; a throw discards its writes.
+   */
+  onEvent?(event: StoreEvent, context: ActionContext<S>): void;
+  /**
+   * Which area a player is in, for `area` events: any string (a zone,
+   * a room, a grid cell), or `null` for none. Read-only; called after
+   * changes, for each present player.
+   */
+  areaOf?(state: S, peer: string): string | null;
   /** The admissible frame size, derived from the transport (§1.9). */
   readonly maxEventBytes: number;
   /** Monotone clock, milliseconds. */
@@ -146,6 +160,34 @@ export interface OwnerDeps<S extends object, A extends ActionSpec, I extends Inp
   /** The latest-value input handlers. Fire-and-forget, no reply. */
   readonly inputs: InputHandlers<S, I>;
 }
+
+/** Why a player left, as `onEvent` hears it. */
+export type LeaveReason =
+  /** The player closed their handle. */
+  | 'left'
+  /** Its lease ran out: a closed tab, a lost connection. */
+  | 'expired'
+  /** `authorize` stopped granting its read: a kick, a revoked permission. */
+  | 'refused'
+  /** Its view could not be delivered (too large, or `project` failed). */
+  | 'dropped';
+
+/**
+ * What happened to a player, for the host's single `onEvent` hook.
+ *
+ * - `join`: a player arrived — their first subscription, or the host's
+ *   own player (`hostPlayer`). Per player, not per connection.
+ * - `leave`: their last subscription ended, and why.
+ * - `area`: `areaOf(state, peer)` gave a different answer than it last
+ *   did for them (`from` is `null` the first time).
+ */
+export type StoreEvent =
+  | { readonly type: 'join'; readonly peer: string; readonly audience: readonly string[] }
+  | { readonly type: 'leave'; readonly peer: string; readonly reason: LeaveReason }
+  | { readonly type: 'area'; readonly peer: string; readonly from: string | null; readonly to: string | null };
+
+/** How many hook runs one drain may perform before it stops (see `drainEvents`). */
+export const MAX_EVENT_ROUNDS = 256;
 
 /** Who a per-player projection is for. */
 export interface Viewer {
@@ -368,7 +410,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       // refusal here because the feed is the grant: leaving it alive would
       // let `alive` renew the lease of a peer the policy now forbids.
       if (!this.permitsRead(handle.peer, handle.audience)) {
-        this.forget(handle.h);
+        this.forget(handle.h, 'refused');
         // `closed`, the wire's legal unsolicited refusal (§1.12 admits
         // exactly `closed` and `owner-lost` without a `q`): it closes
         // the subscription, the replica rejoins, and the JOIN — a
@@ -590,7 +632,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         return this.accept([{ peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) }]);
       }
       case 'leave': {
-        this.forget(bound.h);
+        this.forget(bound.h, 'left');
         return this.accept([{ peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) }]);
       }
       case 'act':
@@ -981,13 +1023,126 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * ledger table bounded by live handles instead of by the owner's
    * lifetime.
    */
-  private forget(h: Hex): void {
-    const existed = this.handles.delete(h);
+  private forget(h: Hex, reason: LeaveReason = 'dropped'): void {
+    const gone = this.handles.get(h);
+    this.handles.delete(h);
     this.ledgers.forget(h);
     // §1.8: expiry retires any projection already pending, and a dead
     // handle never acquires one.
     this.deferred.delete(h);
-    if (existed) this.membershipChanged();
+    if (gone === undefined) return;
+    this.presenceChanged(gone.peer, reason);
+    this.membershipChanged();
+  }
+
+  // ─────────────────────────────── events ───────────────────────────
+
+  /** Peers present as players: a handle installed, or a local player. */
+  private readonly present = new Set<string>();
+  private readonly localPlayers = new Set<string>();
+  private readonly pendingEvents: StoreEvent[] = [];
+  private readonly areas = new Map<string, string | null>();
+  private areasAt = -1;
+  /** Set by `farewell`: a closing store raises no more events. */
+  private ending = false;
+
+  private get wantsEvents(): boolean {
+    return this.deps.onEvent !== undefined || this.deps.areaOf !== undefined;
+  }
+
+  private isPresent(peer: string): boolean {
+    if (this.localPlayers.has(peer)) return true;
+    for (const handle of this.handles.values()) if (handle.peer === peer) return true;
+    return false;
+  }
+
+  /** Queue `join` / `leave` when a peer's presence actually flips. */
+  private presenceChanged(peer: string, reason: LeaveReason | null, audience: readonly string[] = []): void {
+    if (!this.wantsEvents || this.ending) return;
+    const now = this.isPresent(peer);
+    const was = this.present.has(peer);
+    if (now === was) return;
+    if (now) {
+      this.present.add(peer);
+      this.pendingEvents.push(Object.freeze({ type: 'join', peer, audience: Object.freeze([...audience]) }));
+    } else {
+      this.present.delete(peer);
+      this.areas.delete(peer);
+      this.pendingEvents.push(Object.freeze({ type: 'leave', peer, reason: reason ?? 'dropped' }));
+    }
+  }
+
+  /**
+   * The host's own player arriving or going (`hostPlayer`). It has no
+   * handle, but it is a player: `onEvent` hears it like any other.
+   */
+  localPresence(peer: string, joined: boolean, audience: readonly string[] = [], reason: LeaveReason = 'left'): void {
+    if (joined) this.localPlayers.add(peer);
+    else this.localPlayers.delete(peer);
+    this.presenceChanged(peer, joined ? null : reason, audience);
+  }
+
+  /** Queue `area` events for present players whose area moved. */
+  private detectAreas(): void {
+    const areaOf = this.deps.areaOf;
+    if (areaOf === undefined || this.ending) return;
+    if (this.areasAt === this.core.revision && [...this.present].every(peer => this.areas.has(peer))) return;
+    this.areasAt = this.core.revision;
+    const state = this.core.getState() as S;
+    for (const peer of this.present) {
+      let area: string | null;
+      try {
+        const value = this.core.runReadOnly(() => areaOf(state, peer));
+        area = typeof value === 'string' ? value : null;
+      } catch {
+        area = null;
+      }
+      const known = this.areas.has(peer);
+      const from = known ? (this.areas.get(peer) ?? null) : null;
+      this.areas.set(peer, area);
+      if (known ? from !== area : area !== null) {
+        this.pendingEvents.push(Object.freeze({ type: 'area', peer, from, to: area }));
+      }
+    }
+  }
+
+  /**
+   * Run `onEvent` for everything queued, each as its own transaction,
+   * and return what those transactions changed for the replicas.
+   *
+   * Called by the host AFTER the frame that caused the events has been
+   * dispatched — never inside it — so a hook never runs in the middle
+   * of a projection pass. A hook that throws discards its writes, as a
+   * handler's do, and is counted. A hook whose writes cause more events
+   * (a teleport on join) is served in the same drain, up to a bound, so
+   * two hooks cannot ping-pong forever.
+   */
+  drainEvents(): Dispatched {
+    const out: Outbound[] = [];
+    if (!this.wantsEvents) return this.accept(out);
+    for (let rounds = 0; ; rounds += 1) {
+      if (this.pendingEvents.length === 0) this.detectAreas();
+      const event = this.pendingEvents.shift();
+      if (event === undefined) break;
+      if (rounds >= MAX_EVENT_ROUNDS) {
+        this.pendingEvents.length = 0;
+        this.counters['event-rounds-bound'] = (this.counters['event-rounds-bound'] ?? 0) + 1;
+        break;
+      }
+      const hook = this.deps.onEvent;
+      if (hook === undefined) continue;
+      const before = this.core.getState() as S;
+      this.revisionBeforeCommit = this.core.revision;
+      try {
+        this.core.transact(context => hook(event, context), event.peer);
+      } catch {
+        this.counters['event-rejected'] = (this.counters['event-rejected'] ?? 0) + 1;
+        continue;
+      }
+      const after = this.core.getState() as S;
+      if (!Object.is(before, after)) out.push(...this.propagate(before, after));
+    }
+    return this.accept(out);
   }
 
   /** Listeners told when the set of installed handles changes. */
@@ -1036,7 +1191,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     const out: Outbound[] = [];
     for (const handle of [...this.handles.values()]) {
       if (this.permitsRead(handle.peer, handle.audience)) continue;
-      this.forget(handle.h);
+      this.forget(handle.h, 'refused');
       out.push(this.no(handle.peer, handle.h, 'closed', null));
     }
     return this.accept(out);
@@ -1101,7 +1256,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     const expired: { h: Hex; peer: string }[] = [];
     for (const [h, handle] of [...this.handles]) {
       if (now - handle.lastSeen >= HANDLE_LEASE_MS) {
-        this.forget(h);
+        this.forget(h, 'expired');
         expired.push({ h, peer: handle.peer });
       }
     }
@@ -1132,6 +1287,8 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * a second call has nothing to say.
    */
   farewell(): readonly Outbound[] {
+    this.ending = true;
+    this.pendingEvents.length = 0;
     const out: Outbound[] = [];
     for (const [h, handle] of [...this.handles]) {
       this.forget(h);
@@ -1225,6 +1382,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       this.forget(h);
       return this.refuse('join-projection-capacity', [this.no(peer, null, 'capacity', message.q)]);
     }
+    this.presenceChanged(peer, null, message.aud);
     this.membershipChanged();
     return this.accept(emitted);
   }
@@ -1344,7 +1502,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     const handle = this.handles.get(h);
     if (handle === undefined) return 'handle-unknown';
     if (now - handle.lastSeen >= HANDLE_LEASE_MS) {
-      this.forget(h);
+      this.forget(h, 'expired');
       return 'handle-expired';
     }
     if (handle.peer !== peer) return 'handle-foreign-peer';

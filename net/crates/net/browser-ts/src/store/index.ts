@@ -68,3 +68,18 @@ export type {
   StoreReader,
   StoreStatus,
 } from './types.js';
+export type { LeaveReason, StoreEvent } from './owner.js';
+export { MAX_EVENT_ROUNDS } from './owner.js';
+export {
+  addItems,
+  countItems,
+  emptyInventory,
+  hasItems,
+  InventoryError,
+  inventoryOf,
+  MAX_ITEM_ID_CHARS,
+  onlyOwn,
+  parseInventory,
+  removeItems,
+} from './inventory.js';
+export type { Inventory, InventoryErrorCode, InventoryRules } from './inventory.js';
