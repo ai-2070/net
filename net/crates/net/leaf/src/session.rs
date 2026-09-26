@@ -504,6 +504,37 @@ impl LeafSession {
         reliable: bool,
         payload: &[u8],
     ) -> Result<Vec<Bytes>> {
+        self.build_packets_carried(
+            stream_id,
+            subprotocol_id,
+            channel_hash,
+            origin_hash,
+            reliable,
+            false,
+            payload,
+        )
+    }
+
+    /// [`Self::build_packets`], optionally stamping
+    /// [`PacketFlags::LOSSY`] so the packets ride the session's unordered,
+    /// zero-retransmit DataChannel ([`net_wire::carrier`]). `lossy` is for
+    /// fire-and-forget data only; with `reliable` it is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_packets_carried(
+        &self,
+        stream_id: u64,
+        subprotocol_id: u16,
+        channel_hash: u16,
+        origin_hash: u64,
+        reliable: bool,
+        lossy: bool,
+        payload: &[u8],
+    ) -> Result<Vec<Bytes>> {
+        if reliable && lossy {
+            return Err(LeafError::Session(
+                "a reliable packet cannot ride the lossy carrier".into(),
+            ));
+        }
         let fragments = split_payload(payload)?;
         let fragment_id = if fragments.len() > 1 {
             self.next_fragment_id()
@@ -643,6 +674,7 @@ impl LeafSession {
                     PacketFlags::RELIABLE.with(PacketFlags::MODE_BOUNDARY)
                 }
                 true => PacketFlags::RELIABLE,
+                false if lossy => PacketFlags::LOSSY,
                 false => PacketFlags::NONE,
             };
             drop(stream);

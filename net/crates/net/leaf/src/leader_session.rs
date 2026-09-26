@@ -828,6 +828,14 @@ impl Lifecycle {
     /// spelling of it.
     pub async fn open_stream(&self, opts: &JsValue) -> Result<ProxyStream, JsError> {
         let options = crate::wasm::stream_options(opts)?;
+        if options.lossy {
+            // Not carried through the leader proxy yet: refused typed
+            // rather than silently opened on the reliable carrier.
+            return Err(JsError::new(
+                "lossy streams are available on a connect() node; an openSession() stream \
+                 is proxied through the leader tab, which does not carry them yet",
+            ));
+        }
         let reliable = options.reliability.is_reliable();
         // Read before the request, not after: a request that crosses a
         // handoff must produce a handle stamped with the generation it

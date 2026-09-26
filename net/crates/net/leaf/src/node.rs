@@ -361,6 +361,10 @@ pub struct StreamHandle {
     pub channel_hash: u16,
     /// Reliable or fire-and-forget.
     pub reliability: Reliability,
+    /// Fire-and-forget packets of this stream ride the session's lossy,
+    /// unordered DataChannel ([`net_wire::carrier`]): a lost or late one
+    /// never delays anything. Only with [`Reliability::FireAndForget`].
+    pub lossy: bool,
 }
 
 /// What a stream id is, in this leaf's own namespace.
@@ -1787,6 +1791,29 @@ impl LeafNode {
         payload: &[u8],
         reliable: bool,
     ) -> Result<()> {
+        self.send_subprotocol_carried(
+            peer,
+            stream_id,
+            subprotocol_id,
+            channel_hash,
+            payload,
+            reliable,
+            false,
+        )
+    }
+
+    /// [`Self::send_subprotocol`], optionally on the lossy carrier.
+    #[allow(clippy::too_many_arguments)]
+    fn send_subprotocol_carried(
+        &mut self,
+        peer: NodeId,
+        stream_id: u64,
+        subprotocol_id: u16,
+        channel_hash: u16,
+        payload: &[u8],
+        reliable: bool,
+        lossy: bool,
+    ) -> Result<()> {
         let origin_hash = self.identity.origin_hash();
         let session = self
             .sessions
@@ -1801,12 +1828,13 @@ impl LeafNode {
                  (incarnation {incarnation}); reconnect or use another stream id"
             )));
         }
-        let packets = session.build_packets(
+        let packets = session.build_packets_carried(
             stream_id,
             subprotocol_id,
             channel_hash,
             origin_hash,
             reliable,
+            lossy,
             payload,
         )?;
         let fragmented = packets.len() > 1;
@@ -2036,6 +2064,26 @@ impl LeafNode {
         stream_id: Option<u64>,
         channel_hash: Option<u16>,
     ) -> Result<StreamHandle> {
+        self.open_stream_carried(peer, label, reliability, stream_id, channel_hash, false)
+    }
+
+    /// [`Self::open_stream`], choosing whether the stream's packets ride
+    /// the lossy, unordered carrier (`lossy`, fire-and-forget only).
+    pub fn open_stream_carried(
+        &mut self,
+        peer: NodeId,
+        label: &str,
+        reliability: Reliability,
+        stream_id: Option<u64>,
+        channel_hash: Option<u16>,
+        lossy: bool,
+    ) -> Result<StreamHandle> {
+        if lossy && reliability.is_reliable() {
+            return Err(LeafError::Session(
+                "a lossy stream is fire-and-forget: a reliable stream cannot ride the lossy carrier"
+                    .into(),
+            ));
+        }
         let Some(incarnation) = self.sessions.get(peer).map(|s| s.incarnation()) else {
             return Err(LeafError::Session(format!("no session with {peer:#x}")));
         };
@@ -2078,6 +2126,7 @@ impl LeafNode {
             stream_id,
             channel_hash: channel_hash.unwrap_or(0),
             reliability,
+            lossy,
         })
     }
 
@@ -2090,6 +2139,17 @@ impl LeafNode {
     /// bytes land on the successor's stream.
     pub fn stream_send(&mut self, handle: StreamHandle, payload: &[u8]) -> Result<()> {
         self.check_handle(handle)?;
+        if handle.lossy {
+            return self.send_subprotocol_carried(
+                handle.peer,
+                handle.stream_id,
+                SUBPROTOCOL_EVENT_PLANE,
+                handle.channel_hash,
+                payload,
+                false,
+                true,
+            );
+        }
         self.send_event_plane(
             handle.peer,
             handle.stream_id,
@@ -4959,6 +5019,46 @@ mod tests {
             u16::from_le_bytes([out[0].packet[0], out[0].packet[1]]),
             net_wire::protocol::MAGIC,
             "and it carries the Net magic, not the routing magic"
+        );
+    }
+
+    /// A stream opened `lossy` stamps its packets for the lossy carrier —
+    /// relayed or direct, the classifier every transport uses says so —
+    /// and they are still delivered; an ordinary fire-and-forget stream's
+    /// are not lossy, and a reliable stream cannot be.
+    #[test]
+    fn a_lossy_stream_rides_the_lossy_carrier_and_still_delivers() {
+        use net_wire::carrier::rides_lossy_carrier;
+        let (mut a, mut b) = relayed_pair();
+        let bid = b.node_id();
+        let lossy = a
+            .open_stream_carried(bid, "positions", Reliability::FireAndForget, None, None, true)
+            .expect("lossy stream");
+        let plain = a
+            .open_stream(bid, "chat", Reliability::FireAndForget, None, None)
+            .expect("plain stream");
+
+        a.stream_send(lossy, b"relayed").expect("send");
+        let out = a.take_outbound();
+        assert_eq!(out.len(), 1);
+        assert!(rides_lossy_carrier(&out[0].packet), "a relayed lossy packet is read past its routing header");
+        for o in out {
+            a.outbound.push_back(o);
+        }
+        assert_eq!(forward(&mut a, &mut b), 1, "and it is delivered");
+
+        assert!(a.clear_peer_relay(bid));
+        a.stream_send(lossy, b"direct").expect("send");
+        a.stream_send(plain, b"not lossy").expect("send");
+        let out = a.take_outbound();
+        assert_eq!(out.len(), 2);
+        assert!(rides_lossy_carrier(&out[0].packet));
+        assert!(!rides_lossy_carrier(&out[1].packet), "fire-and-forget alone is not lossy");
+
+        assert!(
+            a.open_stream_carried(bid, "state", Reliability::Reliable, None, None, true)
+                .is_err(),
+            "a reliable stream cannot ride the lossy carrier"
         );
     }
 

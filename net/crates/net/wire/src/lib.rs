@@ -48,6 +48,7 @@
 
 pub mod aead;
 pub mod batch;
+pub mod carrier;
 pub mod channel;
 pub mod clock;
 pub mod crypto;

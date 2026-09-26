@@ -904,6 +904,7 @@ async function execute(step) {
       };
       if (step.label) opts.label = step.label;
       if (step.stream_id) opts.streamId = step.stream_id;
+      if (step.lossy) opts.lossy = true;
       if (step.channel_hash !== null && step.channel_hash !== undefined) {
         opts.channelHash = step.channel_hash;
       }

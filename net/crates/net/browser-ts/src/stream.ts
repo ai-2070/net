@@ -86,6 +86,25 @@ export interface OpenStreamOptions {
    * field to carry.
    */
   peer?: string;
+  /**
+   * **Ride the lossy carrier** — for high-rate state where only the newest
+   * value matters (positions, inputs). With `reliability: 'fireAndForget'`
+   * only; `true` with `'reliable'` throws.
+   *
+   * Every stream normally shares one ordered, fully retransmitted
+   * DataChannel, so one lost packet delays everything behind it. A lossy
+   * stream's packets ride a second, unordered channel with no
+   * retransmits: each arrives promptly or not at all, and none delays
+   * anything else. A packet that would queue behind a backed-up buffer is
+   * dropped instead (it would be stale on arrival). The receiver sees a
+   * fire-and-forget stream as always: gaps are skipped and anything older
+   * than what it already delivered is dropped — the newest value wins.
+   *
+   * Direct `connect()` nodes only for now: {@link MeshSession.openStream}
+   * refuses it. A peer or anchor that opens no lossy channel still gets
+   * the packets, on the reliable one.
+   */
+  lossy?: boolean;
 }
 
 /**

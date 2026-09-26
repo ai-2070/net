@@ -360,3 +360,66 @@ async fn the_delivery_sequence_survives_a_datachannel_close() {
         "a send onto a closed DataChannel must fail loudly, not vanish"
     );
 }
+
+/// The lossy carrier (`net_wire::carrier`), native ↔ native: a packet
+/// stamped `LOSSY` is written on the unordered, zero-retransmit channel
+/// and arrives on it; a packet without the flag never touches it. The
+/// offer opens both channels and the answerer tells them apart by label.
+///
+/// Inverse: have the answerer ignore the label (take every channel as the
+/// reliable one) and nothing is ever counted as lossy ingress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lossy_packet_rides_the_lossy_channel_and_a_plain_one_does_not() {
+    use net::adapter::net::{PacketFlags, HEADER_SIZE};
+    use net_wire::protocol::MAGIC;
+    let (a, b, id_a, _id_b) = rtc_pair().await;
+    let sender = a.rtc_driver().expect("driver");
+    let receiver = b.rtc_driver().expect("driver");
+    let datagram = |flags: PacketFlags| {
+        let mut packet = vec![0u8; HEADER_SIZE];
+        packet[..2].copy_from_slice(&MAGIC.to_le_bytes());
+        packet[3] = flags.bits();
+        packet
+    };
+
+    // The lossy channel may open a moment after the reliable one: offer
+    // until it carries one.
+    let arrived = wait_for(
+        || {
+            let _ = sender
+                .transport()
+                .submit(&datagram(PacketFlags::LOSSY), id_a);
+            receiver.stats().lossy_ingress() > 0
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(arrived, "a LOSSY packet arrives on the lossy channel");
+    assert!(sender.stats().lossy_written() > 0);
+
+    // Let every lossy packet the wait above submitted land before the
+    // baseline, or a late one reads as a plain packet on the wrong channel.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (lossy_before, written_before) =
+        (receiver.stats().lossy_ingress(), sender.stats().written());
+    for _ in 0..5 {
+        sender
+            .transport()
+            .submit(&datagram(PacketFlags::NONE), id_a)
+            .expect("submit");
+    }
+    assert!(
+        wait_for(
+            || sender.stats().written() >= written_before + 5,
+            Duration::from_secs(5)
+        )
+        .await,
+        "plain packets go out on the reliable channel"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        receiver.stats().lossy_ingress(),
+        lossy_before,
+        "and never on the lossy one"
+    );
+}

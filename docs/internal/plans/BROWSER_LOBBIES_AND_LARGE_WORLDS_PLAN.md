@@ -394,6 +394,27 @@ genre is left without a model; 3–5 wait for a game that needs them.
      the newest value per key** (sequence-numbered, stale ones dropped).
    - Native side: the same semantics on the core's UDP path (fire-and-forget
      without per-stream ordering holds).
+   - **Built (2026-09-26), step 1:** `PacketFlags::LOSSY` (0x80, the one free
+     header bit — authenticated, ignored by receivers that don't know it) and
+     `net_wire::carrier` (`rides_lossy_carrier`: LOSSY and nothing needing
+     delivery; reads past a routing header; labels `net` / `net-u`). The leaf
+     offers `net-u` (unordered, `maxRetransmits: 0`) beside `net`, the answerer
+     tells them apart by label, and a lossy packet is sent now or dropped
+     (counted), never queued. The native driver tracks the two by label,
+     writes lossy packets (including relayed ones) on `net-u`, and survives
+     `net-u` closing; native offers open both. Page API: `openStream({
+     reliability: 'fireAndForget', lossy: true })` (`connect()` nodes; the
+     leader proxy refuses it typed). Counters `lossy_written` /
+     `lossy_dropped` / `lossy_ingress` on both sides (the leaf's native-stats
+     inventory now also names slice 2's two tenant counters). Witnessed: wire
+     classifier tests, a leaf send test, a native loopback test (fails when
+     the anchor ignores the label), all 157 native RTC tests and 468 leaf
+     tests, and the browser witness
+     `stage5_a_lossy_page_stream_rides_the_lossy_channel_to_the_anchor`.
+     **Not yet:** native senders cannot stamp LOSSY (a dedicated host's
+     snapshots to browsers need it — model 2's next step, with the tick
+     loop); the leader proxy does not carry `lossy`; the replay window (1024)
+     bounds how far the reliable channel may lag the lossy one.
 2. **Clock sync and round-trip/jitter estimates per peer**, so host and players
    agree on one **tick timeline**. Interpolation delay, prediction horizon and
    reconciliation all depend on it. (The reliable stream's SRTT is transport

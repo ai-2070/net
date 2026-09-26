@@ -1100,6 +1100,10 @@ struct Session {
     rtc: Rtc,
     id: RtcPeerId,
     cid: Option<ChannelId>,
+    /// The unordered, zero-retransmit channel (`net_wire::carrier`),
+    /// once the peer opens one. Lossy packets ride it; nothing else does,
+    /// and its closing ends only itself, never the session.
+    lossy_cid: Option<ChannelId>,
     pending: Option<SdpPendingOffer>,
     /// A packet `Channel::write` refused; retained, never dropped.
     retry: Option<Bytes>,
@@ -1660,6 +1664,38 @@ async fn pump_peer(
             },
         };
 
+        // **A lossy packet is never retained** (`net_wire::carrier`): it
+        // goes out on the lossy channel now, or it is dropped and
+        // counted — a stale position is worth nothing, and retaining it
+        // would rebuild the head-of-line blocking the channel avoids.
+        // Without a lossy channel it rides the reliable one below.
+        if let Some(lossy_cid) = session.lossy_cid {
+            if net_wire::carrier::rides_lossy_carrier(&packet) {
+                match session
+                    .rtc
+                    .channel(lossy_cid)
+                    .map(|mut c| c.write(true, &packet))
+                {
+                    Some(Ok(true)) => stats.note_lossy_written(),
+                    _ => stats.note_lossy_dropped(),
+                }
+                drain_session(
+                    session,
+                    socket,
+                    transport,
+                    stats,
+                    ingress,
+                    #[cfg(any(test, feature = "fixtures"))]
+                    hooks,
+                )
+                .await;
+                if sessions.get(&slot).is_some_and(|s| s.closed) {
+                    return;
+                }
+                continue;
+            }
+        }
+
         // Publish the reading this write is about to invalidate: that
         // is what bounds the advisory's staleness to one packet
         // (S0b §4b measured max 8 089 B, mean 3 235 B).
@@ -1810,6 +1846,11 @@ async fn drain_session(
                 }
             }
             Ok(Output::Event(event)) => match event {
+                Event::ChannelOpen(cid, label)
+                    if label == net_wire::carrier::LOSSY_CHANNEL_LABEL =>
+                {
+                    session.lossy_cid = Some(cid);
+                }
                 Event::ChannelOpen(cid, _label) => {
                     session.cid = Some(cid);
                     session.open = true;
@@ -1818,6 +1859,9 @@ async fn drain_session(
                     }
                 }
                 Event::ChannelData(data) => {
+                    if session.lossy_cid == Some(data.id) {
+                        stats.note_lossy_ingress();
+                    }
                     // Injected DataChannel loss. With
                     // `maxRetransmits: 0` SCTP will not recover it,
                     // which is the point: `reliability.rs` is the
@@ -1837,6 +1881,10 @@ async fn drain_session(
                             session.closed = true;
                         }
                     }
+                }
+                Event::ChannelClose(id) if session.lossy_cid == Some(id) => {
+                    // Lossy packets fall back to the reliable channel.
+                    session.lossy_cid = None;
                 }
                 Event::ChannelClose(_) => {
                     session.open = false;
@@ -2094,7 +2142,16 @@ async fn handle_signal(
             // reliability that matters is `reliability.rs`'s, and two
             // retransmit mechanisms in series is worse than one.
             api.add_channel_with_config(ChannelConfig {
-                label: "net".to_string(),
+                label: net_wire::carrier::RELIABLE_CHANNEL_LABEL.to_string(),
+                ordered: false,
+                reliability: Reliability::MaxRetransmits { retransmits: 0 },
+                negotiated: None,
+                protocol: String::new(),
+            });
+            // The lossy carrier (`net_wire::carrier`), for packets their
+            // sender stamped LOSSY.
+            api.add_channel_with_config(ChannelConfig {
+                label: net_wire::carrier::LOSSY_CHANNEL_LABEL.to_string(),
                 ordered: false,
                 reliability: Reliability::MaxRetransmits { retransmits: 0 },
                 negotiated: None,
@@ -2312,6 +2369,7 @@ fn new_session(
         rtc,
         id,
         cid: None,
+        lossy_cid: None,
         pending: None,
         retry: None,
         last_transmit: None,

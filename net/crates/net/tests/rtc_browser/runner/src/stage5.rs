@@ -241,7 +241,7 @@ const ABI_PROXY_SIZE: usize = 700;
 /// Every Stage 5 witness name, in ledger order. The CI job pins these
 /// exactly; the list is here so a rename is one edit and a drop is
 /// impossible to do quietly.
-pub const WITNESSES: [&str; 21] = [
+pub const WITNESSES: [&str; 22] = [
     "stage5_leaf_handshake_over_the_real_listener",
     "stage5_reliable_round_trip",
     "stage5_nrpc_call_to_a_native_service",
@@ -270,6 +270,7 @@ pub const WITNESSES: [&str; 21] = [
     "stage5_direct_close_refuses_a_later_open_with_the_leafs_typed_fence",
     // Appended (indexed by position, see above).
     "stage5_a_labeled_page_stream_reaches_a_native_sink_attributed_to_the_page",
+    "stage5_a_lossy_page_stream_rides_the_lossy_channel_to_the_anchor",
 ];
 
 // ===================================================================
@@ -397,6 +398,9 @@ pub enum Step5 {
         /// and send on it. Decimal, because a u64 is not a JS number.
         stream_id: Option<String>,
         channel_hash: Option<u16>,
+        /// Open it `lossy` — its packets ride the unordered,
+        /// zero-retransmit DataChannel.
+        lossy: bool,
     },
     /// Send on a stream [`Step5::StreamOpen`] already opened.
     ///
@@ -1915,6 +1919,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-direct".into()),
                     stream_id: Some(ABI_DIRECT_STREAM_ID.to_string()),
                     channel_hash: None,
+                    lossy: false,
                 },
             )
             .await;
@@ -2109,6 +2114,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-window".into()),
                     stream_id: Some(ABI_WINDOW_STREAM_ID.to_string()),
                     channel_hash: None,
+                    lossy: false,
                 },
             )
             .await;
@@ -2290,6 +2296,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-recover".into()),
                     stream_id: Some(recover_stream_id.clone()),
                     channel_hash: Some(recover_channel),
+                    lossy: false,
                 },
             )
             .await;
@@ -2617,6 +2624,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-large".into()),
                     stream_id: Some(ABI_LARGE_STREAM_ID.to_string()),
                     channel_hash: None,
+                    lossy: false,
                 },
             )
             .await;
@@ -2986,6 +2994,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-frag".into()),
                     stream_id: Some(ABI_FRAG_STREAM_ID.to_string()),
                     channel_hash: None,
+                    lossy: false,
                 },
             )
             .await;
@@ -3176,6 +3185,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-leaf-frag".into()),
                     stream_id: Some(ABI_LEAF_FRAG_STREAM_ID.to_string()),
                     channel_hash: None,
+                    lossy: false,
                 },
             )
             .await;
@@ -3341,6 +3351,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     // Deliberately absent: the page derives it.
                     stream_id: None,
                     channel_hash: None,
+                    lossy: false,
                 },
             )
             .await;
@@ -3446,6 +3457,116 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
     }
 
     // ================================================================
+    // 22 — a LOSSY page stream rides the unordered, zero-retransmit
+    //      DataChannel to the anchor (netcode model 2's carrier)
+    //
+    // The page opens a fire-and-forget stream with `lossy: true` through
+    // the built package and writes to it. Every event must reach the
+    // anchor's stream sink, attributed to the page, AND the anchor's
+    // `lossy_ingress` counter — which counts only messages arriving on the
+    // `net-u` channel — must rise by at least as many: the events came
+    // over the lossy channel, not the reliable one. Loopback loses
+    // nothing, so all of them arrive.
+    // ================================================================
+    {
+        const LOSSY_LABEL: &str = "store/stage5.lossy-witness";
+        const LOSSY_EVENTS: usize = 20;
+        const LOSSY_SIZE: usize = 256;
+        let derived = net::adapter::net::stream_id_from_label(LOSSY_LABEL);
+        let seen: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>> = Arc::default();
+        let sink: net::adapter::net::StreamInboundSink = {
+            let seen = seen.clone();
+            Arc::new(move |event: net::adapter::net::StreamInboundEvent| {
+                if let Ok(mut list) = seen.lock() {
+                    list.push((event.from_node, event.payload.to_vec()));
+                }
+            })
+        };
+        let registration = cx.anchor.register_stream_inbound(derived, sink);
+        let lossy_before = cx
+            .anchor
+            .rtc_driver()
+            .map_or(0, |d| d.stats().lossy_ingress());
+        let open = script
+            .run(
+                "a",
+                Step5::StreamOpen {
+                    id: 0,
+                    session: "main".into(),
+                    handle: "lossy".into(),
+                    reliable: false,
+                    label: Some(LOSSY_LABEL.into()),
+                    stream_id: None,
+                    channel_hash: None,
+                    lossy: true,
+                },
+            )
+            .await;
+        let seed = 0x7700 ^ (rand_u64() & 0xFFFF);
+        let wrote = if open.ok && registration.is_some() {
+            script
+                .run(
+                    "a",
+                    Step5::StreamWrite {
+                        id: 0,
+                        handle: "lossy".into(),
+                        frames: vec![],
+                        seed,
+                        size: LOSSY_SIZE,
+                        count: LOSSY_EVENTS,
+                        drop_every: 0,
+                        reorder_every: 0,
+                    },
+                )
+                .await
+        } else {
+            fail(format!(
+                "not attempted: page open ok={} ({:?}) sink registered={}",
+                open.ok,
+                open.error,
+                registration.is_some()
+            ))
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline
+            && seen.lock().map(|list| list.len()).unwrap_or(0) < LOSSY_EVENTS
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let events = seen.lock().map(|list| list.clone()).unwrap_or_default();
+        let lossy_after = cx
+            .anchor
+            .rtc_driver()
+            .map_or(0, |d| d.stats().lossy_ingress());
+        let mut got: Vec<Mark> = events
+            .iter()
+            .map(|(_, payload)| Mark::of(payload))
+            .collect();
+        let mut want = expected_marks(seed, LOSSY_SIZE, LOSSY_EVENTS);
+        // Unordered carrier: compare as sets.
+        got.sort_by_key(|m| (m.len, m.fnv));
+        want.sort_by_key(|m| (m.len, m.fnv));
+        let attributed = events.iter().all(|(from, _)| *from == node_id);
+        let over_lossy = lossy_after.saturating_sub(lossy_before) >= LOSSY_EVENTS as u64;
+        if let Some(id) = registration {
+            cx.anchor.unregister_stream_inbound(derived, id);
+        }
+        ledger.record(
+            WITNESSES[21],
+            open.ok && wrote.ok && got == want && attributed && over_lossy,
+            format!(
+                "A page stream opened with `lossy: true` (fireAndForget) through the built                  package (open ok={}, error={:?}); the page wrote {LOSSY_EVENTS} ×                  {LOSSY_SIZE} B (ok={}, error={:?}). The anchor's sink received {} event(s),                  byte-identical to what was written as a set={} (an unordered carrier may                  reorder), every one attributed to the page's node {node_id:#x}={attributed}.                  THE CARRIER: the anchor's `lossy_ingress` — messages that arrived on the                  `net-u` channel only — went {lossy_before} → {lossy_after}, at least                  {LOSSY_EVENTS} more={over_lossy}: the events rode the unordered,                  zero-retransmit channel, not the reliable one.",
+                open.ok,
+                open.error,
+                wrote.ok,
+                wrote.error,
+                events.len(),
+                got == want,
+            ),
+        );
+    }
+
+    // ================================================================
     // 18 and 19 — direct `close()`, through the LIVE package, in a
     //             real browser: two outcomes, two witnesses
     //
@@ -3498,6 +3619,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         label: Some("close-probe".into()),
                         stream_id: Some(CLOSE_PROBE_STREAM_ID.to_string()),
                         channel_hash: None,
+                        lossy: false,
                     },
                 )
                 .await
@@ -3620,6 +3742,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         label: Some("close-probe-after".into()),
                         stream_id: Some(CLOSE_PROBE_STREAM_ID.to_string()),
                         channel_hash: None,
+                        lossy: false,
                     },
                 )
                 .await
@@ -4379,6 +4502,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         label: Some("abi-proxied".into()),
                         stream_id: Some(ABI_PROXY_STREAM_ID.to_string()),
                         channel_hash: None,
+                        lossy: false,
                     },
                 )
                 .await
@@ -4471,6 +4595,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         label: Some("abi-proxied-out".into()),
                         stream_id: Some(format!("{}", out_frame.stream_id)),
                         channel_hash: Some(out_frame.channel_hash_u16),
+                        lossy: false,
                     },
                 )
                 .await
@@ -4640,6 +4765,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         label: Some("x7-broadcast".into()),
                         stream_id: Some(X7_BROADCAST_STREAM_ID.to_string()),
                         channel_hash: None,
+                        lossy: false,
                     },
                 )
                 .await

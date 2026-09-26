@@ -2386,6 +2386,9 @@ async fn retry_witness(cx: &Cx6<'_>, ledger: &mut Ledger) {
         "ice_direct",
         "ice_relayed",
         "ice_failed",
+        "lossy_written",
+        "lossy_dropped",
+        "lossy_ingress",
     ];
     let all_native_present = native_names
         .iter()
@@ -2403,17 +2406,17 @@ async fn retry_witness(cx: &Cx6<'_>, ledger: &mut Ledger) {
     ledger.record(
         P3_WITNESSES[1],
         stats.ok
-            && emitted == 16
-            && declared == 24
+            && emitted == 19
+            && declared == 26
             && all_native_present
             && stun_absent
             && stun_explained
             && traffic_observed,
         format!(
             "node.rtcStats() on a leaf that has actually carried traffic: {emitted} measured \
-             fields, {declared} declared inapplicable. Every one of the 15 native RtcStats \
+             fields, {declared} declared inapplicable. Every one of the 18 native RtcStats \
              names with a leaf meaning is present ({all_native_present}); udp_blocked is the \
-             16th and is the one term with NO native counterpart, because native says a node \
+             19th and is the one term with NO native counterpart, because native says a node \
              signalling over UDP cannot have UDP blocked and the leaf is the side whose \
              evidence can establish it. accepted={} written={} ingress_delivered={} \
              ice_attempted={} ice_direct={} — measurements, not zeros. \

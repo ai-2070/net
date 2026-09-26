@@ -18,6 +18,18 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **Lossy streams: `openStream({ reliability: 'fireAndForget', lossy: true })`**
+  — for high-rate state where only the newest value matters. Every stream
+  used to share one ordered, fully retransmitted DataChannel, so one lost
+  packet delayed everything behind it. A lossy stream's packets ride a
+  second, unordered, zero-retransmit channel (`net-u`): prompt or not at
+  all, never delaying anything, and dropped rather than queued behind a
+  backed-up buffer. The receiver's fire-and-forget semantics are unchanged
+  (gaps skipped, the newest value wins). `connect()` nodes only for now;
+  an anchor or peer that opens no lossy channel still gets the packets on
+  the reliable one. **Upgrade the anchor with the package**: an older
+  anchor treats the second channel as its only one.
+
 - **`rememberedIdentity(key?)`** — the same player on every visit for
   `connect()`: the node's two secrets, created once and kept in
   `localStorage` (`connect({ …, ...rememberedIdentity() })`). Without it,

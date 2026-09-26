@@ -117,6 +117,9 @@ pub struct RtcStats {
     admission_refused_forward: AtomicU64,
     admission_refused_transit: AtomicU64,
     tenant_refused_transit: AtomicU64,
+    lossy_written: AtomicU64,
+    lossy_dropped: AtomicU64,
+    lossy_ingress: AtomicU64,
     tenant_withheld_announcement: AtomicU64,
     admission_refused_route: AtomicU64,
     admission_refused_subscribe: AtomicU64,
@@ -238,6 +241,21 @@ impl RtcStats {
         admission_refused_transit,
         note_admission_refused_transit,
         "Routed-envelope TRANSIT refused for a provisional adjacent session (F1 specifically). Separate from the other forwarding sites so a witness can tell 'refused to relay onward' from 'refused to re-flood a pingwave'."
+    );
+    counter!(
+        lossy_written,
+        note_lossy_written,
+        "Lossy packets written on the unordered, zero-retransmit DataChannel (`net_wire::carrier`)."
+    );
+    counter!(
+        lossy_dropped,
+        note_lossy_dropped,
+        "Lossy packets dropped instead of retained: the lossy channel refused the write. Stale state is worth nothing."
+    );
+    counter!(
+        lossy_ingress,
+        note_lossy_ingress,
+        "DataChannel messages received on the lossy channel (also counted in `ingress_delivered`)."
     );
     counter!(
         tenant_refused_transit,
