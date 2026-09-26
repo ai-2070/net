@@ -530,6 +530,17 @@ pub enum LeaderRequest {
         /// The peer to offer to.
         peer: u64,
     },
+    /// The live attempt's dialog when `peer` is already a healthy direct
+    /// pair, or none — what makes a follower's `connectPeer` idempotent.
+    /// A second offer to a healthy pair replaces the working link and
+    /// closes it under the peer.
+    ///
+    /// A leader of an older release refuses the op, and the follower
+    /// then offers as it always did.
+    PeerDirectDialog {
+        /// The peer.
+        peer: u64,
+    },
     /// Answer the offer `peer` already filed.
     ///
     /// Also dialogless on the way in — the dialog is read off the
@@ -2734,6 +2745,10 @@ fn encode_request(request: &LeaderRequest) -> Value {
             map.insert("op".into(), Value::from("peer_offer"));
             map.insert("peer".into(), Value::from(peer.to_string()));
         }
+        LeaderRequest::PeerDirectDialog { peer } => {
+            map.insert("op".into(), Value::from("peer_direct_dialog"));
+            map.insert("peer".into(), Value::from(peer.to_string()));
+        }
         LeaderRequest::PeerAcceptOffer { peer } => {
             map.insert("op".into(), Value::from("peer_accept_offer"));
             map.insert("peer".into(), Value::from(peer.to_string()));
@@ -2940,6 +2955,9 @@ fn decode_request(value: &Value) -> Result<LeaderRequest> {
             payload: unb64(value, "payload")?,
         },
         "peer_offer" => LeaderRequest::PeerOffer {
+            peer: u64_field(value, "peer")?,
+        },
+        "peer_direct_dialog" => LeaderRequest::PeerDirectDialog {
             peer: u64_field(value, "peer")?,
         },
         "peer_accept_offer" => LeaderRequest::PeerAcceptOffer {
@@ -3706,6 +3724,10 @@ mod tests {
             ProxyBody::Request {
                 correlation: 24,
                 request: Box::new(LeaderRequest::PeerAcceptOffer { peer: 0xAC }),
+            },
+            ProxyBody::Request {
+                correlation: 27,
+                request: Box::new(LeaderRequest::PeerDirectDialog { peer: 0xAF }),
             },
             ProxyBody::Request {
                 correlation: 25,

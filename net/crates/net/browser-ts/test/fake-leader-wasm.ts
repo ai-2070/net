@@ -130,6 +130,10 @@ export interface FakeSessionBehaviour {
   orgOpenError?: unknown;
   /** Thrown by the four serve registrations. */
   orgServeError?: unknown;
+  /** What `peer_direct_dialog` answers: a healthy direct pair's dialog, or none. */
+  peerDirectDialog?: string;
+  /** Thrown by `peer_direct_dialog`, as a leader too old for the op refuses it. */
+  peerDirectError?: unknown;
 }
 
 export class FakeSession implements LeafWasmSession {
@@ -232,6 +236,11 @@ export class FakeSession implements LeafWasmSession {
   async peer_offer(peer_hex: string): Promise<string> {
     this.peerOffers.push(peer_hex);
     return '00000000000000d1';
+  }
+
+  async peer_direct_dialog(_peer_hex: string): Promise<string | undefined> {
+    if (this.behaviour.peerDirectError !== undefined) throw this.behaviour.peerDirectError;
+    return this.behaviour.peerDirectDialog;
   }
 
   async peer_accept_offer(peer_hex: string): Promise<string> {

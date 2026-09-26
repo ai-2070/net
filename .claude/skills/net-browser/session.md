@@ -125,10 +125,10 @@ Rules that bite:
   `peerAttempt(hex)` reads the attempt's status without driving it, and
   `handshakePeer(hex, dialog)` completes a dialog you already hold; a
   `MeshSession` has `connectPeer` / `acceptPeer` but neither of those.
-- **On `connect()`, `connectPeer` on an already-direct, open pair is a no-op**
-  that resolves `direct`, so calling it "to be sure" is safe there. A
-  `MeshSession`'s `connectPeer` does NOT have that check yet: calling it on a
-  healthy direct pair re-offers, which closes the working link under the peer.
+- **`connectPeer` on an already-direct, open pair is a no-op** that resolves
+  `direct`, on `connect()`'s node and on a `MeshSession` alike, so calling it
+  "to be sure" is safe. (A follower whose leader is from an older release
+  still re-offers.)
 - **ICE may fail.** `outcome` is a reading, not a promise of connectivity; see
   `errors.md` for what an ICE failure does and does not prove, and
   `refineIceFailure` (a `BrowserNode` method) for turning a raw failure into a

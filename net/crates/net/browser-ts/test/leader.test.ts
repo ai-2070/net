@@ -186,6 +186,25 @@ describe('MeshSession', () => {
     expect(await session.counters()).toEqual({ packets_in: '18446744073709551615' });
   });
 
+  // A second offer to a healthy direct pair replaces the working link and
+  // closes it under the peer (the leader's `peer_direct_dialog` reading).
+  it('answers direct without offering when the leader reports a healthy direct pair', async () => {
+    const { session, fake } = await opened({ peerDirectDialog: '00000000000000e7' });
+    await expect(session.connectPeer('a1b2c3d4e5f60718')).resolves.toEqual({
+      type: 'direct',
+      peer: 'a1b2c3d4e5f60718',
+      dialog: '00000000000000e7',
+    });
+    expect(fake.peerOffers).toEqual([]);
+    expect(fake.peerHandshakes).toEqual([]);
+  });
+
+  it('offers as before when the leader is too old to answer that reading', async () => {
+    const { session, fake } = await opened({ peerDirectError: new Error('unknown proxy op peer_direct_dialog') });
+    await expect(session.connectPeer('a1b2c3d4e5f60718')).resolves.toMatchObject({ type: 'direct' });
+    expect(fake.peerOffers).toEqual(['a1b2c3d4e5f60718']);
+  });
+
   it('proxies both enrollment verbs, so a follower is not missing them', async () => {
     // The divergence this closes: a page calling `enroll()` must not
     // work in the first tab and raise an unknown error in the second.

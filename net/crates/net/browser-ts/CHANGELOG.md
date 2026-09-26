@@ -237,7 +237,9 @@ the README on why it is a sibling package rather than a sub-path.
   it made a fresh offer whose connection replaced — and closed — the working
   link under the peer. The pair still read as direct while every send to it
   was refused. This hit any library that calls `connectPeer` before opening a
-  stream (netcode, lobbies). Not yet applied to `openSession().connectPeer`.
+  stream (netcode, lobbies). The same holds for `openSession().connectPeer`:
+  the follower asks the leader through a new proxied reading. A leader from an
+  older release doesn't answer it, and the follower then offers as before.
 
 ### Changed
 

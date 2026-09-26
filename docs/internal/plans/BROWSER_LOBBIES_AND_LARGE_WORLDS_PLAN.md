@@ -483,10 +483,10 @@ live dialog when the session is installed, unrelayed and the transport open,
 and `BrowserNode.connectPeer` then resolves `direct` without offering.
 Witnessed by `stage6_connect_peer_on_a_healthy_direct_pair_is_idempotent`.
 Stage 6's unanswered-offer witness now makes its offer through the raw
-`peer_offer` primitive, which is how the re-attempt owner makes one. **Still
-open:** the leader-proxied `openSession().connectPeer` has no such check;
-it needs a proxy-protocol addition. Lossy streams are refused on sessions
-anyway, but a lobby run on a session could hit it. Separately, credit is
+`peer_offer` primitive, which is how the re-attempt owner makes one. The
+leader-proxied `openSession().connectPeer` does the same through a new proxy
+op, `peer_direct_dialog`. A leader too old for it refuses the op, and the
+follower offers as before. Separately, credit is
 spent before the transport refuses a packet; a refused send should arguably
 not consume credit.
 
