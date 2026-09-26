@@ -5032,7 +5032,14 @@ mod tests {
         let (mut a, mut b) = relayed_pair();
         let bid = b.node_id();
         let lossy = a
-            .open_stream_carried(bid, "positions", Reliability::FireAndForget, None, None, true)
+            .open_stream_carried(
+                bid,
+                "positions",
+                Reliability::FireAndForget,
+                None,
+                None,
+                true,
+            )
             .expect("lossy stream");
         let plain = a
             .open_stream(bid, "chat", Reliability::FireAndForget, None, None)
@@ -5041,7 +5048,10 @@ mod tests {
         a.stream_send(lossy, b"relayed").expect("send");
         let out = a.take_outbound();
         assert_eq!(out.len(), 1);
-        assert!(rides_lossy_carrier(&out[0].packet), "a relayed lossy packet is read past its routing header");
+        assert!(
+            rides_lossy_carrier(&out[0].packet),
+            "a relayed lossy packet is read past its routing header"
+        );
         for o in out {
             a.outbound.push_back(o);
         }
@@ -5053,7 +5063,10 @@ mod tests {
         let out = a.take_outbound();
         assert_eq!(out.len(), 2);
         assert!(rides_lossy_carrier(&out[0].packet));
-        assert!(!rides_lossy_carrier(&out[1].packet), "fire-and-forget alone is not lossy");
+        assert!(
+            !rides_lossy_carrier(&out[1].packet),
+            "fire-and-forget alone is not lossy"
+        );
 
         assert!(
             a.open_stream_carried(bid, "state", Reliability::Reliable, None, None, true)
