@@ -457,6 +457,48 @@ their creator, and every region in P4, need a host that is not a player.
 - **Q1 first:** can the store (plain TypeScript) run in Node over `sdk-ts`'s
   `MeshNode`, or is a small `StoreTransport` adapter needed? If neither, a
   native Rust store host is a much larger project, which changes P4's cost.
+
+  **Spike result (2026-09-26): yes for the store, no for the transport today —
+  and the gap is small and in the core.**
+  - *The store runs in Node unchanged.* `hostStore`, `joinStore`,
+    `hostPlayer` and lobbies ran from the built package under Node 24 in the
+    world harness; they use only `crypto`, `TextEncoder`, timers and
+    microtasks. No Rust store host is needed, so P3/P4 stay cheap.
+  - *No Node API delivers inbound stream bytes with the authenticated
+    sender,* which is the store's only identity source. The core has it —
+    `dispatch_local_packet` receives the session-authenticated `from_node`
+    (`src/adapter/net/mesh.rs`, `process_local_packet` → dispatch) — and drops
+    it where it queues `StoredEvent::new(id, data, seq, shard)`;
+    `wire::event::StoredEvent` has no sender or stream id. napi
+    `poll`/`pollShard` and `sdk-ts` `recv`/`recvShard` pass on what is left.
+  - *nRPC is not a substitute.* Streaming handlers' `callerOrigin` is the
+    packet header's `origin_hash`, documented in the core as "routing
+    metadata, not identity authentication — do not authorize on this"; the
+    napi unary `serve` handler receives only the body. The authenticated
+    `RpcContext::session_peer` exists in the core but is not bridged. Only
+    org-protected services (`serveOrg`) hand over a verified caller, and that
+    needs org credentials on every player.
+  - *Leaf ↔ native streams do interoperate* (runner `stage5.rs`, both
+    directions, byte-exact), with ids that match when derived the same way:
+    the leaf's `stream_id_from_label` = bit 49 | `channel_hash(label)` low 48
+    bits. The native side has no such helper; napi `channelHash` computes the
+    same hash but validates the name as a `ChannelName` first.
+
+  **Recommended gap-closer** (a core + napi + `sdk-ts` change, then a small TS
+  adapter):
+  1. Core: an authenticated per-stream inbound path — deliver `{ from_node,
+     stream_id, payload }` for streams a caller registers (as nRPC already
+     does for its channels via `register_rpc_inbound`), rather than widening
+     `wire::event::StoredEvent`, which every adapter (Redis, JetStream) and
+     binding shares.
+  2. napi + `sdk-ts`: `MeshNode.onStreamData(streamId, handler)` delivering
+     `{ peerNode, streamId, payload }`, and a native `streamIdFromLabel` that
+     matches `leaf/src/stream.rs` exactly (no `ChannelName` validation), so
+     the id is derived once, in Rust.
+  3. `@net-mesh/browser` (or a Node sibling): `nodeStoreTransport(meshNode)`
+     implementing `StoreTransport` over `openStream` + `sendOnStream` +
+     `onStreamData`, witnessed by a native host serving a real browser page
+     in the runner, including a spoofed-origin refusal.
 - **A dedicated host** runs the same `hostStore` with game rules loaded from the
   developer's code, on a native node, discoverable by the same lobby tags.
 - **Browser players become pure replicas** of it, so the "host sees
@@ -543,7 +585,7 @@ holds replicas of its current region and its neighbours.
 
 | # | Question | Why it matters |
 |---|---|---|
-| Q1 | Run the store in Node over `sdk-ts`, or build a native store host? (Spike first.) | Sets the cost of P3 and P4 |
+| Q1 | ~~Run the store in Node over `sdk-ts`, or build a native store host?~~ **Spiked (2026-09-26):** the store runs in Node as-is; the transport needs an authenticated per-stream inbound path in the core + napi (see §6). | Sets the cost of P3 and P4 |
 | Q2 | CLI anchor mode vs a hosted anchor service (or both)? | P0 shape; business model |
 | Q3 | Credential policy: anonymous + rate limit, or game-login-signed requests? | Abuse surface |
 | Q4 | ~~Lobby metadata on announcements: size limit and what's public~~ **Decided (2026-09-26):** a fixed record (name, players, capacity, code, store version) plus small developer-defined fields, under a byte cap; unlisted lobbies publish no record. | Privacy of unlisted lobbies |
