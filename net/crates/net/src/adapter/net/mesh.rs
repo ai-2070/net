@@ -63989,7 +63989,11 @@ mod lifecycle_regression_tests {
 /// skipping: no announcement frame is flooded and no punch relay is
 /// emitted for a sender or destination with no peer entry at any
 /// check on that path.
-#[cfg(test)]
+// Every test here is `webrtc`-gated (the gates live on the WebRTC
+// forwarding paths), so the module is: gated per test only, its shared
+// helpers and imports were dead code — a clippy `-D warnings` failure —
+// in a default-feature lib-test build.
+#[cfg(all(test, feature = "webrtc"))]
 mod unresolvable_endpoint_gate_tests {
     use super::*;
     use std::net::SocketAddr;

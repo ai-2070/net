@@ -16,7 +16,11 @@ mod blob;
 #[cfg(feature = "net")]
 mod capabilities;
 mod capability_aggregation;
+// `net` is in the list because the mesh surface itself (`open_stream`,
+// `on_stream_data`, …) converts its BigInt ids here: a `--features net`
+// build without it did not compile.
 #[cfg(any(
+    feature = "net",
     feature = "meshdb",
     feature = "cortex",
     feature = "compute",
@@ -60,7 +64,12 @@ mod org;
 // SDK surface, mirroring the Python binding).
 #[cfg(feature = "delegation")]
 mod enrollment;
-#[cfg(feature = "net")]
+// The gang surface is ONE `#[napi] impl NetMesh` gated on these
+// features; under `net` alone every item in the module was dead.
+#[cfg(all(
+    feature = "net",
+    any(feature = "compute", feature = "cortex", feature = "aggregator")
+))]
 mod gang;
 #[cfg(feature = "groups")]
 mod groups;

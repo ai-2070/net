@@ -106,7 +106,7 @@ Measurements behind all of this (and behind the dev profile's
 `cargo check` plus a `--lib` clippy is **not** a green branch — several CI lints only fire on targets those commands never build (that exact gap has let three different CI failures through in a single day: a cfg'd test that never compiled, a lint that fires only on the lib-test target, and a rustdoc link error). Before calling a branch ready:
 
 ```bash
-cargo fmt --all -- --check
+cargo fmt --all -- --check      # on Windows: python ../../../.github/scripts/fmt.py --check
 cargo check --workspace --all-targets
 
 # Production code, strict (matches CI):
