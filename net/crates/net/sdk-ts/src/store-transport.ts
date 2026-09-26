@@ -42,7 +42,12 @@ import { streamIdFromLabel } from './identity';
 export interface StoreTransportFrame {
   readonly type: 'stream_data';
   readonly streamId: string;
-  /** The authenticated sender, 16 lowercase hex. */
+  /**
+   * The authenticated sender, as a DECIMAL u64 — the spelling the browser
+   * node's events use. One spelling for both transports is what lets the
+   * store (and netcode) read every sender unambiguously: a hex id whose
+   * digits happen to be all 0-9 would otherwise read as decimal.
+   */
   readonly peerNode: string;
   readonly payload: Uint8Array;
 }
@@ -96,7 +101,7 @@ export function meshStoreTransport(mesh: MeshNode, options: MeshStoreTransportOp
           const frame: StoreTransportFrame = {
             type: 'stream_data',
             streamId: data.streamId.toString(),
-            peerNode: hex(data.peerNodeId),
+            peerNode: data.peerNodeId.toString(10),
             payload: new Uint8Array(data.payload.buffer, data.payload.byteOffset, data.payload.byteLength),
           };
           for (const handler of [...handlers]) handler(frame);
