@@ -59,6 +59,8 @@ export interface HostPlayerOptions {
    * audience })`. Authorized by the host's policy like any other read.
    */
   readonly audience: readonly string[];
+  /** The interest set, as `joinStore({ interest })`. Omit it to see every entity. */
+  readonly interest?: readonly string[];
 }
 
 const PLACEHOLDER_Q = '0'.repeat(16) as Hex;
@@ -118,6 +120,7 @@ export function hostPlayer<S extends object, A extends ActionSpec, I extends Inp
   const view = new StoreCore<S, A, I>({ definition, initialState: definition.empty(), phase: 'syncing' });
 
   let audience: readonly string[] = [...options.audience];
+  let interest: readonly string[] | null = options.interest === undefined ? null : [...options.interest];
   let closed = false;
   /** Terminal: the read was refused, the projection failed, or the host closed. */
   let ended = false;
@@ -143,7 +146,7 @@ export function hostPlayer<S extends object, A extends ActionSpec, I extends Inp
       end('failed', new StoreError('forbidden', 'the store refused: forbidden'));
       return;
     }
-    const projected = owner.localView(peer, audience);
+    const projected = owner.localView(peer, audience, interest);
     if (projected === null) {
       end('failed', new StoreError('capacity', 'the store refused: capacity'));
       return;
@@ -265,6 +268,14 @@ export function hostPlayer<S extends object, A extends ActionSpec, I extends Inp
         throw new StoreError('forbidden', 'the store refused: forbidden');
       }
       audience = [...names];
+      refresh();
+    },
+    setInterest: async keys => {
+      const early = refusal();
+      if (early !== null) throw early;
+      const next = [...keys];
+      await Promise.resolve();
+      interest = next;
       refresh();
     },
     // Nothing to resume: there is no session under this handle.

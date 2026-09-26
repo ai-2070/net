@@ -18,6 +18,18 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **Interest management.** `defineStore({ interest: { <entity map>:
+  (entity, id) => key | null } })`; `joinStore({ interest })`,
+  `setInterest(keys)` (also on `hostPlayer` and `joinLobby`). Only
+  entities whose key is in the set are delivered, as per-entity ops;
+  far changes send nothing; interest changes are one additive delta
+  (new `int` wire message; optional `int` on `join` / `resume`). Grid
+  helpers `cellKey`, `cellsAround`, `stickyCells`, `sameCells`.
+- **Fixed: a replica sent nothing on a commit then saw a gap.** A delta's
+  `base` was the owner's previous revision, so a replica whose view had
+  not changed (and was sent nothing) detected a gap on its next delta
+  and re-fetched its whole view. `base` is now the revision that
+  replica is at.
 - **Declared visibility.** `defineStore({ visibility })`: path → rule
   (`'everyone'`, `'nobody'`, `'owner'`, or audiences; `x.length` reveals a
   hidden array's count), presets `'open'` and `'card-game'` with

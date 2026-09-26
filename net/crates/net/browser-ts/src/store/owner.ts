@@ -226,8 +226,15 @@ export interface OwnerHandle {
   readonly audience: readonly string[];
   /** Highest generation allocated for this handle; monotone (§1.7a). */
   readonly generation: number;
-  /** The revision its current installation was taken at. */
+  /**
+   * The revision this replica's view is at: its installation's, then
+   * each delta's `r`. A delta's `base` is THIS, not the owner's previous
+   * revision — a replica whose view did not change on a commit was sent
+   * nothing and is still here, and a `base` it never had is a gap.
+   */
   readonly revision: number;
+  /** Its interest set; `null` when it declared none (sees every entity). */
+  readonly interest: readonly string[] | null;
   /** Last accepted authenticated message, for the lease. */
   readonly lastSeen: number;
 }
@@ -260,6 +267,29 @@ export interface Dispatched {
 
 interface Counters {
   [reason: string]: number;
+}
+
+/** One entity that changed between two views of an interest collection. */
+interface InterestChange {
+  readonly collection: string;
+  readonly id: string;
+  readonly before: unknown;
+  readonly after: unknown;
+  readonly beforeKey: string | null;
+  readonly afterKey: string | null;
+}
+
+/** A view's change, split for per-handle interest filtering. */
+interface InterestDiff {
+  /** Root ops for everything outside the interest collections. */
+  readonly rest: readonly WireOp[];
+  readonly entities: readonly InterestChange[];
+  /** Interest collections that were not entity maps on both sides. */
+  readonly whole: readonly { readonly collection: string; readonly after: unknown }[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -406,8 +436,8 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    */
   private propagate(previous: S, current: S): Outbound[] {
     const out: Outbound[] = [];
-    const base = String(this.revisionBeforeCommit);
     const r = String(this.core.revision);
+    const interestCache = new Map<string, InterestDiff | null>();
     // One projection pair and one root diff per DISTINCT audience
     // (per distinct peer and audience under `projectFor`), shared by
     // every handle that carries it. Projecting and diffing
@@ -448,15 +478,30 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       }
 
       const audienceKey = this.viewKey(handle.peer, handle.audience);
-      let ops = diffs.get(audienceKey);
-      if (ops === undefined) {
-        const before = this.project(handle.peer, handle.audience, previous);
-        const after = this.project(handle.peer, handle.audience, current);
-        ops =
-          before === null || after === null
-            ? null
-            : shallowDiff(before as JsonObject, after as JsonObject);
-        diffs.set(audienceKey, ops);
+      let ops: readonly WireOp[] | null | undefined;
+      if (this.interestFns.length > 0 && handle.interest !== null) {
+        // Interest-filtered: the view's diff, shared per view, is split
+        // into the rest of the document and per-entity changes, and each
+        // handle takes only the entities its interest covers.
+        let diff = interestCache.get(audienceKey);
+        if (diff === undefined) {
+          const before = this.project(handle.peer, handle.audience, previous);
+          const after = this.project(handle.peer, handle.audience, current);
+          diff = before === null || after === null ? null : this.interestDiff(before, after);
+          interestCache.set(audienceKey, diff);
+        }
+        ops = diff === null ? null : this.interestOps(diff, handle.interest);
+      } else {
+        ops = diffs.get(audienceKey);
+        if (ops === undefined) {
+          const before = this.project(handle.peer, handle.audience, previous);
+          const after = this.project(handle.peer, handle.audience, current);
+          ops =
+            before === null || after === null
+              ? null
+              : shallowDiff(before as JsonObject, after as JsonObject);
+          diffs.set(audienceKey, ops);
+        }
       }
       if (ops === null) {
         // `project` and its `empty()` fallback both failed: there is
@@ -476,11 +521,12 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       if (ops.length === 0) continue;
 
       const delta = encodeDeltaWithin(
-        { k: 'delta', h: handle.h, g: String(handle.generation), base, r, ops },
+        { k: 'delta', h: handle.h, g: String(handle.generation), base: String(handle.revision), r, ops },
         this.deps.maxEventBytes,
       );
       if (delta !== null) {
         out.push({ peer: handle.peer, h: handle.h, frame: delta });
+        this.handles.set(handle.h, { ...handle, revision: this.core.revision });
         continue;
       }
       // Too large to carry as a patch: replace the whole view.
@@ -533,8 +579,9 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
   }
 
   /** The host's own player: the projection a replica of `audience` receives. */
-  localView(peer: string, audience: readonly string[]): S | null {
-    return this.project(peer, audience);
+  localView(peer: string, audience: readonly string[], interest: readonly string[] | null = null): S | null {
+    const view = this.project(peer, audience);
+    return view === null ? null : this.filterInterest(view, interest);
   }
 
   /**
@@ -661,6 +708,8 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         this.forget(bound.h, 'left');
         return this.accept([{ peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) }]);
       }
+      case 'int':
+        return this.interestChange(message, bound, peer, now);
       case 'act':
         return this.action(message, bound, peer, now);
       case 'in':
@@ -725,6 +774,9 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         const rebound: OwnerHandle = {
           ...bound,
           audience: [...message.aud],
+          // A resume states the caller's desired interest too; an `aud`
+          // leaves it as it was.
+          interest: message.k === 'resume' && message.int !== undefined ? [...message.int] : bound.interest,
           lastSeen: now,
         };
         this.handles.set(rebound.h, rebound);
@@ -1395,6 +1447,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       inc: this.incarnation,
       peer,
       audience: [...message.aud],
+      interest: message.int === undefined ? null : [...message.int],
       generation: 0,
       revision: this.core.revision,
       lastSeen: now,
@@ -1421,7 +1474,8 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * guessing.
    */
   private install(handle: OwnerHandle, q: Hex | null): Outbound[] | null {
-    const projected = this.project(handle.peer, handle.audience);
+    const base = this.project(handle.peer, handle.audience);
+    const projected = base === null ? null : this.filterInterest(base, handle.interest);
     // `null` means the application could produce neither a projection
     // nor its own empty value. There is nothing truthful to ship, so
     // the emission fails and the caller refuses.
@@ -1481,6 +1535,160 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     } catch {
       return null;
     }
+  }
+
+  // ───────────────────────────── interest ───────────────────────────
+
+  /** The definition's interest collections and their key functions. */
+  private get interestFns(): readonly (readonly [string, (entity: unknown, id: string) => string | null])[] {
+    this.#interestFns ??= Object.entries(this.deps.definition.interest ?? {}).map(
+      ([collection, key]) => [collection, key as (entity: unknown, id: string) => string | null] as const,
+    );
+    return this.#interestFns;
+  }
+  #interestFns: readonly (readonly [string, (entity: unknown, id: string) => string | null])[] | undefined;
+
+  /** An entity's interest key; a key function that throws or returns a non-string means "no key": always delivered. */
+  private interestKey(fn: (entity: unknown, id: string) => string | null, entity: unknown, id: string): string | null {
+    try {
+      const key = this.core.runReadOnly(() => fn(entity, id));
+      return typeof key === 'string' ? key : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** A view narrowed to the entities an interest set covers. */
+  private filterInterest(view: S, interest: readonly string[] | null): S {
+    if (interest === null || this.interestFns.length === 0) return view;
+    const wanted = new Set(interest);
+    const out: Record<string, unknown> = { ...(view as Record<string, unknown>) };
+    for (const [collection, fn] of this.interestFns) {
+      const entities = out[collection];
+      if (!isRecord(entities)) continue;
+      const kept: Record<string, unknown> = {};
+      for (const [id, entity] of Object.entries(entities)) {
+        const key = this.interestKey(fn, entity, id);
+        if (key === null || wanted.has(key)) kept[id] = entity;
+      }
+      out[collection] = kept;
+    }
+    return out as S;
+  }
+
+  /** One view's change, split for interest: the rest of the document, and per-entity changes with their keys. */
+  private interestDiff(before: S, after: S): InterestDiff {
+    const collections = new Set(this.interestFns.map(([collection]) => collection));
+    const strip = (view: S): JsonObject => {
+      const rest: JsonObject = {};
+      for (const [key, value] of Object.entries(view as JsonObject)) if (!collections.has(key)) rest[key] = value;
+      return rest;
+    };
+    const rest = shallowDiff(strip(before), strip(after));
+    const entities: InterestChange[] = [];
+    const whole: { collection: string; after: unknown }[] = [];
+    for (const [collection, fn] of this.interestFns) {
+      const b = (before as Record<string, unknown>)[collection];
+      const a = (after as Record<string, unknown>)[collection];
+      if (!isRecord(b) || !isRecord(a)) {
+        // Not an entity map on one side: replaced whole, filtered per handle.
+        if (JSON.stringify(b) !== JSON.stringify(a)) whole.push({ collection, after: a });
+        continue;
+      }
+      for (const id of new Set([...Object.keys(b), ...Object.keys(a)])) {
+        const was = Object.prototype.hasOwnProperty.call(b, id) ? b[id] : undefined;
+        const now = Object.prototype.hasOwnProperty.call(a, id) ? a[id] : undefined;
+        if (Object.is(was, now) || (was !== undefined && now !== undefined && JSON.stringify(was) === JSON.stringify(now))) {
+          continue;
+        }
+        entities.push({
+          collection,
+          id,
+          before: was,
+          after: now,
+          beforeKey: was === undefined ? null : this.interestKey(fn, was, id),
+          afterKey: now === undefined ? null : this.interestKey(fn, now, id),
+        });
+      }
+    }
+    return { rest, entities, whole };
+  }
+
+  /** The ops one handle receives for a split diff. */
+  private interestOps(diff: InterestDiff, interest: readonly string[]): WireOp[] {
+    const wanted = new Set(interest);
+    const covers = (key: string | null): boolean => key === null || wanted.has(key);
+    const ops: WireOp[] = [...diff.rest];
+    for (const change of diff.entities) {
+      const wasIn = change.before !== undefined && covers(change.beforeKey);
+      const isIn = change.after !== undefined && covers(change.afterKey);
+      if (isIn) ops.push({ o: 'r', p: [change.collection, change.id], val: change.after as JsonValue });
+      else if (wasIn) ops.push({ o: 'x', p: [change.collection, change.id] });
+    }
+    for (const entry of diff.whole) {
+      const filtered = this.filterInterest({ [entry.collection]: entry.after } as S, interest) as Record<string, unknown>;
+      ops.push({ o: 'r', p: [entry.collection], val: filtered[entry.collection] as JsonValue });
+    }
+    return ops;
+  }
+
+  /**
+   * A new interest set: the entities entering it arrive, the ones leaving
+   * go, in one delta — the view never blanks — and then `ok`.
+   *
+   * Interest is a filter, not a permission: nothing here asks `authorize`,
+   * because the audience (which is) is unchanged and every entity sent
+   * was already readable under it.
+   */
+  private interestChange(
+    message: Extract<CallerMessage, { k: 'int' }>,
+    bound: OwnerHandle,
+    peer: string,
+    now: number,
+  ): Dispatched {
+    const next: OwnerHandle = { ...bound, interest: [...message.int], lastSeen: now };
+    this.handles.set(next.h, next);
+    const ok: Outbound = { peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) };
+    if (this.interestFns.length === 0 || this.deferred.has(bound.h)) {
+      // Nothing to filter, or an installation is pending that will
+      // project with the new set.
+      return this.accept([ok]);
+    }
+    const view = this.project(peer, bound.audience);
+    if (view === null) {
+      this.forget(bound.h);
+      return this.refuse('int-projection-capacity', [this.no(peer, bound.h, 'capacity', message.q)]);
+    }
+    const before = this.filterInterest(view, bound.interest) as Record<string, unknown>;
+    const after = this.filterInterest(view, next.interest) as Record<string, unknown>;
+    const ops: WireOp[] = [];
+    for (const [collection] of this.interestFns) {
+      const b = before[collection];
+      const a = after[collection];
+      if (!isRecord(b) || !isRecord(a)) continue;
+      for (const id of Object.keys(a)) if (!Object.prototype.hasOwnProperty.call(b, id)) ops.push({ o: 'r', p: [collection, id], val: a[id] as JsonValue });
+      for (const id of Object.keys(b)) if (!Object.prototype.hasOwnProperty.call(a, id)) ops.push({ o: 'x', p: [collection, id] });
+    }
+    if (ops.length === 0) return this.accept([ok]);
+    const r = String(this.core.revision);
+    const delta =
+      bound.revision === this.core.revision
+        ? encodeDeltaWithin(
+            { k: 'delta', h: bound.h, g: String(bound.generation), base: r, r, ops },
+            this.deps.maxEventBytes,
+          )
+        : null;
+    if (delta !== null) return this.accept([{ peer, h: bound.h, frame: delta }, ok]);
+    // Too large for one delta, or this replica is behind the current
+    // revision: replace the view whole — an owner-initiated
+    // installation, admissible at a ready replica — and then `ok`,
+    // which arrives after the last chunk.
+    const frames = this.install(next, null);
+    if (frames === null) {
+      this.forget(bound.h);
+      return this.refuse('int-projection-capacity', [this.no(peer, bound.h, 'capacity', message.q)]);
+    }
+    return this.accept([...frames, ok]);
   }
 
   /**

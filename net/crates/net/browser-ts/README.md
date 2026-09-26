@@ -308,6 +308,41 @@ try {
 
 ---
 
+## Big worlds: send each player only what's near them
+
+In a large world, a player doesn't need every ship — only the ones nearby. Tell
+the definition how to place an entity on a grid, and each player asks for the
+cells around them:
+
+```js
+import { cellKey, cellsAround, stickyCells, sameCells } from '@net-mesh/browser';
+
+const arena = defineStore({
+  // …
+  interest: { ships: ship => cellKey(ship.x, ship.z, 32) },   // 32-unit grid cells
+});
+
+const world = joinStore({ /* … */ interest: cellsAround(me.x, me.z, { size: 32 }) });
+
+// As the player moves:
+let cells = cellsAround(me.x, me.z, { size: 32 });
+function onMove() {
+  const next = stickyCells(cells, me.x, me.z, { size: 32 });
+  if (!sameCells(next, cells)) { cells = next; world.setInterest(cells); }
+}
+```
+
+- Ships entering the player's cells appear and ships leaving disappear in one
+  update — the world never blanks while the player crosses a border — and
+  `bindEntities` adds and removes them from the scene as usual.
+- Changes far away send that player nothing at all.
+- `stickyCells` keeps a cell the player just left until they're a cell past it,
+  so walking along a border doesn't flicker.
+- An interest key is any string — a room name works as well as a grid cell. An
+  entity whose key function returns `null` goes to everyone.
+- Interest decides what's *near*, not what's *allowed*: secrets still belong in
+  `visibility`.
+
 ## Reacting to players: one hook
 
 Give the host an `onEvent` and it hears everything that happens to a player —

@@ -233,6 +233,37 @@ A replica has **no `setState`**. That is a type-level fact rather than a runtime
 check: writes go through actions and inputs, and only the host's handle carries
 the setter.
 
+## Interest management
+
+A definition may name its top-level entity maps and how an entity is keyed —
+`interest: { ships: ship => cellKey(ship.x, ship.z, 32) }`, any string, `null`
+for "always delivered". A replica joined with `interest: [...]` (and the host's
+own player) then receives only the entities whose key is in its set:
+
+- **Per entity on the wire.** A change to an entity is sent as one op for that
+  entity, and only to players whose interest covers its old or new key; an
+  entity moving out of a player's set is removed from their view.
+- **`setInterest(keys)` is additive.** The host answers with one delta of the
+  entities entering and leaving, then an acknowledgement; the view never blanks.
+  (If that delta would not fit one message, the view is replaced whole, still
+  without a blank frame.) A later `join` or `resume` restates the current set.
+- **Bounds.** At most `MAX_INTEREST_KEYS` (256) keys of at most 64 bytes, and
+  the set must fit one message.
+- **A filter, not a permission.** Interest never calls `authorize`; what a
+  player may see at all is the audience, `project`/`projectFor` and
+  `visibility`, applied first.
+- **Host cost.** The view is still projected once per distinct audience (or
+  player, under `projectFor` / `owner` rules) per change; what interest removes
+  is the per-player serialization and the bytes.
+
+`cellKey`, `cellsAround(x, z, { size, radius })`, `stickyCells(previous, x, z, {
+size, radius, margin })` (hysteresis at cell borders) and `sameCells` are the
+grid helpers.
+
+A related fix: a delta's `base` is now the revision each replica is actually at,
+so a replica whose view did not change on a commit — sent nothing — applies the
+next delta directly instead of detecting a gap and re-fetching its whole view.
+
 ## One hook for players: `onEvent`
 
 `onEvent(event, context)` is the host's single hook for what happens to players:

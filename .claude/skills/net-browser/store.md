@@ -297,6 +297,16 @@ writes.
 - **Give each player an entity with an `enlist` action keyed by `context.peer`**
   (the authenticated caller — never an id the client sends). A joiner does
   `await replica.ready(); await replica.act('enlist', …)` before steering.
+- **Large worlds: interest management.** On the definition, `interest: {
+  <top-level entity map>: (entity, id) => key | null }` (any string; `null` =
+  delivered to everyone); `cellKey(x, z, size)` is the grid key. A replica joins
+  with `interest: cellsAround(x, z, { size, radius? })` and moves with
+  `setInterest(keys)` — send `stickyCells(prev, x, z, { size })` only when
+  `!sameCells(next, prev)`. Entering/leaving entities arrive as one delta (no
+  blank frame); far changes send nothing. Bounds: ≤ 256 keys, ≤ 64 bytes each,
+  and the whole set must fit one message. Interest is a filter, NOT a permission
+  — keep secrets in `visibility`. `hostPlayer(host, { audience, interest })` and
+  `joinLobby({ interest })` take it too. Entity maps must be top-level keys.
 - **React to players with the single `onEvent(event, context)` hook** on
   `hostStore` / `createLobby`: `{ type: 'join', peer, audience }`,
   `{ type: 'leave', peer, reason: 'left' | 'expired' | 'refused' | 'dropped' }`,

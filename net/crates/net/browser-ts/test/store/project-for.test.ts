@@ -166,6 +166,13 @@ describe('projectFor', () => {
     // change — and a per-audience diff would have sent him a delta
     // computed from someone else's view.
     expect(toBob).toEqual([]);
+
+    // And Bob's NEXT change arrives as a plain delta on the revision he
+    // is actually at — not a gap that forces a whole reinstall.
+    await bob.act('draw', { card: 'bob-queen' });
+    await settle();
+    expect(toBob.map(frame => JSON.parse(frame).k)).not.toContain('man');
+    expect(bob.getState().hands[BOB]).toEqual(['bob-king', 'bob-queen']);
   });
 
   it("gives the host's own player its own hand", async () => {

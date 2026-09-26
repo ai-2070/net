@@ -508,6 +508,8 @@ export interface JoinLobbyOptions<S extends object, A extends ActionSpec, I exte
   readonly lobby?: LobbyListing;
   /** The audience to read. Default `[]`. */
   readonly audience?: readonly string[];
+  /** The interest set to join with (see `joinStore`). Default: every entity. */
+  readonly interest?: readonly string[];
   /** The opaque join token. Default `'player'`. */
   readonly key?: string;
   readonly maxEventBytes?: number;
@@ -557,6 +559,7 @@ export async function joinLobby<S extends object, A extends ActionSpec, I extend
     audience: options.audience ?? [],
     key: options.key ?? 'player',
     maxEventBytes: options.maxEventBytes ?? DEFAULT_MAX_EVENT_BYTES,
+    ...(options.interest === undefined ? {} : { interest: options.interest }),
   });
 }
 

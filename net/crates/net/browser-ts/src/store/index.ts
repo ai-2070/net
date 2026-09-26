@@ -91,3 +91,6 @@ export {
   projectVisible,
 } from './visibility.js';
 export type { Hidden, Visibility, VisibilityPreset, VisibilityRule, VisibilityRules } from './visibility.js';
+export { cellKey, cellsAround, sameCells, stickyCells } from './interest.js';
+export type { CellOptions } from './interest.js';
+export { MAX_INTEREST_KEYS, MAX_INTEREST_KEY_BYTES } from './wire.js';

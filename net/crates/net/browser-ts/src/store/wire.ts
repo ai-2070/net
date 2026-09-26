@@ -48,6 +48,13 @@ export const INCARNATION_HEX_LENGTH = 16;
 /** Audience bounds (brief §2). */
 export const MAX_AUDIENCE_LABELS = 32;
 export const MAX_AUDIENCE_LABEL_BYTES = 128;
+/**
+ * Interest keys per request, and bytes per key. Interest is a spatial
+ * filter, not a permission, so its bound is separate from — and larger
+ * than — the audience's; the frame budget is what really caps it.
+ */
+export const MAX_INTEREST_KEYS = 256;
+export const MAX_INTEREST_KEY_BYTES = 64;
 
 /** Snapshot bounds (brief §2). */
 export const MAX_SNAPSHOT_BYTES = 1024 * 1024;
@@ -75,6 +82,7 @@ export const CALLER_KINDS = [
   'aud',
   'alive',
   'leave',
+  'int',
 ] as const;
 
 /** Owner → caller kinds (brief §1.4). */
@@ -97,8 +105,12 @@ const FIELDS: Readonly<Record<MessageKind, { required: readonly string[]; option
   // that answers is whichever listener happened to run first. `key`
   // cannot serve: it is the caller's opaque policy token, and two
   // callers of one store carry different ones.
-  join: { required: ['v', 'k', 'q', 'def', 'ver', 'store', 'key', 'aud'], optional: [] },
-  resume: { required: ['v', 'k', 'q', 'h', 'aud'], optional: [] },
+  // `int` — the caller's interest set: which keys of the definition's
+  // interest collections it wants delivered. Optional: absent means no
+  // filtering, which is every store before interest existed.
+  join: { required: ['v', 'k', 'q', 'def', 'ver', 'store', 'key', 'aud'], optional: ['int'] },
+  resume: { required: ['v', 'k', 'q', 'h', 'aud'], optional: ['int'] },
+  int: { required: ['v', 'k', 'q', 'h', 'int'], optional: [] },
   resync: { required: ['v', 'k', 'q', 'h', 'g', 'have'], optional: [] },
   aud: { required: ['v', 'k', 'q', 'h', 'aud'], optional: [] },
   alive: { required: ['v', 'k', 'q', 'h'], optional: [] },
@@ -115,8 +127,9 @@ const FIELDS: Readonly<Record<MessageKind, { required: readonly string[]; option
 
 /** Canonical key order for encoding, per kind. */
 const KEY_ORDER: Readonly<Record<MessageKind, readonly string[]>> = {
-  join: ['v', 'k', 'q', 'def', 'ver', 'store', 'key', 'aud'],
-  resume: ['v', 'k', 'q', 'h', 'aud'],
+  join: ['v', 'k', 'q', 'def', 'ver', 'store', 'key', 'aud', 'int'],
+  resume: ['v', 'k', 'q', 'h', 'aud', 'int'],
+  int: ['v', 'k', 'q', 'h', 'int'],
   resync: ['v', 'k', 'q', 'h', 'g', 'have'],
   aud: ['v', 'k', 'q', 'h', 'aud'],
   alive: ['v', 'k', 'q', 'h'],
@@ -155,12 +168,21 @@ export interface JoinMessage {
   readonly store: string;
   readonly key: string;
   readonly aud: readonly string[];
+  readonly int?: readonly string[];
 }
 export interface ResumeMessage {
   readonly k: 'resume';
   readonly q: Hex;
   readonly h: Hex;
   readonly aud: readonly string[];
+  readonly int?: readonly string[];
+}
+/** Replace the caller's interest set; answered by a delta, then `ok`. */
+export interface InterestMessage {
+  readonly k: 'int';
+  readonly q: Hex;
+  readonly h: Hex;
+  readonly int: readonly string[];
 }
 export interface ResyncMessage {
   readonly k: 'resync';
@@ -257,6 +279,7 @@ export type WireOp =
 export type CallerMessage =
   | JoinMessage
   | ResumeMessage
+  | InterestMessage
   | ResyncMessage
   | AudienceMessage
   | AliveMessage
@@ -285,6 +308,7 @@ export type MessageFor<T extends Side> = T extends 'owner' ? CallerMessage : Own
 export type StoreMessage =
   | JoinMessage
   | ResumeMessage
+  | InterestMessage
   | ResyncMessage
   | AudienceMessage
   | AliveMessage
@@ -486,7 +510,32 @@ function buildMessage(k: MessageKind, body: JsonObject): DecodeResult {
     return labels;
   };
 
+  const interest = (required: boolean): readonly string[] | undefined | Refused => {
+    if (!Object.prototype.hasOwnProperty.call(body, 'int')) {
+      return required ? no('payload', 'missing-field') : undefined;
+    }
+    const v = body['int'];
+    if (!Array.isArray(v)) return no('payload', 'bad-interest');
+    if (v.length > MAX_INTEREST_KEYS) return no('payload', 'interest-too-many', 'capacity');
+    const keys: string[] = [];
+    for (const key of v) {
+      if (typeof key !== 'string' || key.length === 0) return no('payload', 'bad-interest-key');
+      if (utf8Length(key) > MAX_INTEREST_KEY_BYTES) return no('payload', 'interest-key-too-long', 'capacity');
+      keys.push(key);
+    }
+    return keys;
+  };
+
   switch (k) {
+    case 'int': {
+      const q = hex('q', REQUEST_HEX_LENGTH);
+      if (bad(q)) return q.refusal;
+      const h = hex('h', HANDLE_HEX_LENGTH);
+      if (bad(h)) return h.refusal;
+      const keys = interest(true);
+      if (bad(keys)) return keys.refusal;
+      return { ok: true, message: { k, q, h, int: keys! } };
+    }
     case 'join': {
       const q = hex('q', REQUEST_HEX_LENGTH);
       if (bad(q)) return q.refusal;
@@ -500,7 +549,12 @@ function buildMessage(k: MessageKind, body: JsonObject): DecodeResult {
       if (bad(key)) return key.refusal;
       const aud = audience();
       if (bad(aud)) return aud.refusal;
-      return { ok: true, message: { k, q, def, ver, store, key, aud } };
+      const keys = interest(false);
+      if (bad(keys)) return keys.refusal;
+      return {
+        ok: true,
+        message: keys === undefined ? { k, q, def, ver, store, key, aud } : { k, q, def, ver, store, key, aud, int: keys },
+      };
     }
     case 'resume':
     case 'aud': {
@@ -510,7 +564,12 @@ function buildMessage(k: MessageKind, body: JsonObject): DecodeResult {
       if (bad(h)) return h.refusal;
       const aud = audience();
       if (bad(aud)) return aud.refusal;
-      return { ok: true, message: { k, q, h, aud } as ResumeMessage | AudienceMessage };
+      if (k === 'resume') {
+        const keys = interest(false);
+        if (bad(keys)) return keys.refusal;
+        return { ok: true, message: keys === undefined ? { k, q, h, aud } : { k, q, h, aud, int: keys } };
+      }
+      return { ok: true, message: { k, q, h, aud } as AudienceMessage };
     }
     case 'resync': {
       const q = hex('q', REQUEST_HEX_LENGTH);

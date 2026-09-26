@@ -72,5 +72,16 @@ export function defineStore<
     }
   }
 
+  if (definition.interest !== undefined) {
+    for (const [collection, key] of Object.entries(definition.interest)) {
+      if (collection.length === 0 || collection.includes('.') || typeof key !== 'function') {
+        throw new StoreError(
+          'invalid-data',
+          `store '${definition.id}': interest maps a top-level collection name to a key function, got '${collection}'`,
+        );
+      }
+    }
+  }
+
   return Object.freeze({ ...definition });
 }

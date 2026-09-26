@@ -26,6 +26,8 @@ tree.
 | `net/crates/net/browser-ts/README.md` | the game-developer walkthrough: anchor, define, connect, host/join, render, play, and the store's error codes |
 | `net/crates/net/browser-ts/demo/` | a single page running a host and two players over `@net-mesh/browser/local` — the real store, no anchor, no network; for prototyping game logic |
 | `net/crates/net/browser-ts/src/store/player.ts` | `hostPlayer`: the host's own player, and what it shares with a replica |
+| `net/crates/net/browser-ts/src/store/visibility.ts` | declared visibility: rules, presets, the `HIDDEN` marker, `assertHidden` |
+| `net/crates/net/browser-ts/src/store/interest.ts` | grid-cell helpers for interest management (`cellKey`, `cellsAround`, `stickyCells`) |
 | `net/crates/net/browser-ts/src/store/inventory.ts` | the inventory helpers and their rules |
 | `net/crates/net/browser-ts/src/lobby.ts` | lobbies: the announcement tags, record bounds, capacity and kick, join by code |
 | `net/crates/net/browser-ts/src/local.ts` | `createLocalMesh`: the in-page mesh behind `@net-mesh/browser/local` |

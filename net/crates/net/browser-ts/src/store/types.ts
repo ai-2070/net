@@ -78,6 +78,14 @@ export interface StoreDefinition<
    * `visibility.ts`.
    */
   readonly visibility?: Visibility;
+  /**
+   * Interest management: for each top-level entity map, the key an
+   * entity is found under — a grid cell, a room, any string (`null`:
+   * always delivered). A replica that declares an interest set receives
+   * only the entities whose key is in it. Used by the host; a joiner may
+   * omit it.
+   */
+  readonly interest?: { readonly [collection: string]: (entity: never, id: string) => string | null };
 }
 
 /** Where a handle is in its lifecycle. Kept out of game state. */

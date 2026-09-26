@@ -187,6 +187,18 @@ P0 anchor; the whole flow is in the skill and a fresh agent reproduces it.
 per change is proportional to what changed, not to the world × the number of
 views.
 
+**Status (2026-09-26):** items 1–4, 5 (as `projectFor`) and 6 (as the
+client-side `stickyCells` helper) are built — `store/interest.ts`, the owner's
+`filterInterest` / `interestDiff` / `interestChange`, the `int` wire message.
+Deviations: the spatial index is not a maintained host structure; changed
+entities are found per distinct view by comparison, so the host still projects
+once per distinct view per commit (O(world) there), while each player's cost and
+bytes are O(entities changed near them). A pre-existing defect surfaced and was
+fixed on the way: a delta's `base` was the owner's previous revision, which made
+every replica sent nothing on a commit resync its whole view on the next one.
+Items 7 (rate by distance) and 8 (bounds from measurement) remain; so does the
+large-demo acceptance measurement.
+
 ### What changes in the store
 
 1. **Interest keys instead of audience-as-cells.** A replica declares an
