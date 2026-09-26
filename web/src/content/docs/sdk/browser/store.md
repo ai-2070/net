@@ -16,7 +16,8 @@ const host = hostStore({
   definition, store: 'world', transport: node,
   initialState,
   maxEventBytes: 8104,
-  authorize: request => request.audience.every(a => a !== 'command'),
+  // Only a `read` request carries `audience`; `action` / `input` carry `name` + `input`.
+  authorize: request => request.type !== 'read' || !request.audience.includes('command'),
   project: (state, audience) =>
     audience.includes('command') ? state : publicPart(state),
   actions,
@@ -104,8 +105,9 @@ consult, so a page cannot claim to be someone else.
 
 ## Audiences and projection
 
-A replica asks for an audience (`audience: ['crew']`) and carries an opaque `key`
-its host's `authorize` reads. The host's `project(state, audience)` returns a
+A replica asks for an audience (`audience: ['crew']`) and sends a required, opaque
+`key` join token; `authorize` does not see it — identify callers by
+`request.peer`. The host's `project(state, audience)` returns a
 validated `S` — never a partial — so visibility is expressed **in the schema**:
 collections omit invisible entities, individually hidden fields are explicit
 `null` or a tagged value, and `empty()` means absence.
@@ -172,7 +174,8 @@ Every refusal is a `StoreError` with a `code`:
 | `forbidden` | The owner's `authorize` refused |
 | `not-ready` | The handle has no live, synchronized view |
 | `capacity` | A declared bound was reached |
-| `timeout` / `aborted` | The caller's deadline or signal fired |
+| `timeout` | A deadline fired before the answer arrived |
+| `aborted` | The handle closed before the answer, or a newer request (a later `setAudience`) superseded this one |
 | `indeterminate` | Submitted, and no response established the outcome |
 | `owner-lost` | The store incarnation ended — terminal |
 | `closed` | This handle is unusable: unknown, expired, fenced, or bound to another peer |

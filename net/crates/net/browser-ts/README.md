@@ -30,6 +30,33 @@ dependency on it, so you use whichever Three.js version you like.
 
 ---
 
+## Building with Claude Code (or another AI agent)
+
+If an AI agent is writing your game code, give it the Net skills first.
+Without them, an agent will write multiplayer code that looks right and runs,
+but gets the details wrong — like re-running game rules on each player instead
+of on the host, or retrying an action that may already have happened.
+
+```sh
+npx skills add ai-2070/net-claude-skill -g     # drop -g to install for this project only
+```
+
+The `net-browser` skill in that set covers this package end to end: connecting,
+hosting and joining a world, inputs vs actions, hidden information, the Three.js
+binding, and every error code. Ask for what you want in plain words — *"make
+this a two-player game where one player hosts"* — and the agent will use it.
+
+To let the agent read Net's actual source instead of guessing, add
+[`opensrc`](https://github.com/vercel-labs/opensrc):
+
+```sh
+npx -y opensrc@latest path ai-2070/net
+```
+
+More install options: [Claude Skills](https://ai2070.net/docs/start/claude-skills).
+
+---
+
 ## Before players can connect
 
 A browser can't find other browsers on its own, so every multiplayer game on
@@ -197,7 +224,7 @@ const world = joinStore({
   transport: node,
   host: hostId,
   audience: ['crew'],              // which view of the world to ask for
-  key: 'player',                   // a label your `authorize` can check
+  key: 'player',                   // an opaque join token (required)
   maxEventBytes: 8104,
 });
 await world.ready();               // resolves once the first copy has arrived
@@ -307,7 +334,7 @@ A refused store operation rejects with a `StoreError`. Check its `.code`:
 | `version-mismatch` | Host and player were built from different game versions |
 | `not-ready` | There's no synchronized copy yet (before `ready()`, or while reconnecting) |
 | `timeout` | Your deadline passed before an answer arrived |
-| `aborted` | You cancelled the operation |
+| `aborted` | The world handle closed, or a newer request replaced this one |
 | `indeterminate` | No answer came back — the action *may* have happened. Don't retry blindly |
 | `owner-lost` | The host stopped hosting this world. Join a new one |
 | `closed` | This connection to the world can't be used any more — join again |
