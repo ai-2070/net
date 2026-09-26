@@ -1,0 +1,22 @@
+net/crates/net/browser-ts/tests/abi_real_package.mjs
+  s_d8b00bedd146e9::t_5aeb1d77a19e19 369,375,392,421,438,453-462
+  s_d8b00bedd146e9::t_cb491e4296c6a6 463-464
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_4082a96d291ca8 7080
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "441ebed2b2b5f68cb44d5faa64ab92cb9f71aed6",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
