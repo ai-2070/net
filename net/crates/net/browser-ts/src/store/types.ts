@@ -24,6 +24,7 @@
  */
 
 import type { StoreError } from './errors.js';
+import type { Visibility } from './visibility.js';
 
 /** Deeply-readonly view of validated plain state. */
 export type ReadonlyState<T> = T extends readonly (infer V)[]
@@ -71,6 +72,12 @@ export interface StoreDefinition<
     };
   };
   readonly inputs: { readonly [K in keyof I]: Parse<I[K]> };
+  /**
+   * What each player may see, declared: `'open'`, a preset, or path →
+   * rule. Enforced by the host after any hand-written projection. See
+   * `visibility.ts`.
+   */
+  readonly visibility?: Visibility;
 }
 
 /** Where a handle is in its lifecycle. Kept out of game state. */

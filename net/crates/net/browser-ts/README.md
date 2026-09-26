@@ -125,6 +125,7 @@ export const arena = defineStore({
   version: 1,
   state: v => ({ ships: v?.ships ?? {} }),   // the whole world
   empty: () => ({ ships: {} }),              // what a player sees before joining
+  visibility: 'open',                        // every player sees every ship — see "Hidden information"
   actions: {
     // Something that needs an answer. `enlist` gives the sender a ship…
     enlist: {
@@ -175,9 +176,6 @@ const host = hostStore({
   // Who may do what. Here: no shooting yourself.
   authorize: request =>
     request.type !== 'action' || request.input.at !== request.peer,
-
-  // What each player may see. Everyone sees every ship here.
-  project: (state, audience) => state,
 
   actions: {
     enlist: (input, context) => {
@@ -384,7 +382,7 @@ const lobby = await createLobby({
   node, game: 'my-game', name: 'Friday arena', capacity: 8,
   info: { map: 'dunes' },           // small public fields your list can show
   definition: arena, initialState: { ships: {} },
-  project: state => state, actions, inputs,
+  actions, inputs,
 });
 lobby.code;                         // 'K7QP2M' — read it out, or share lobby.link()
 const world = lobby.self;           // the host's own player
@@ -422,23 +420,44 @@ answers. It tells you only what happened locally (`queued`, `replaced`, or
 your game so that's fine. `world.act(name, input)` returns a promise with the
 host's answer, or rejects with a reason.
 
-**Hidden information.** A joining player asks for an *audience* (`['crew']`).
-The host's `project(state, audience)` returns what that audience may see. Leave
-secret things out of the returned state (or set them to `null`). Hidden data is
-never sent, so it isn't sitting in the page waiting to be found.
-
-When what you see depends on *who you are* — your own cards, your own fog of
-war — use `projectFor` instead of `project`. It is told which player it is for:
+**Hidden information.** Say what is secret on the definition, and the host
+removes it from every player's copy before anything is sent — it is never in
+their page to be found:
 
 ```js
-projectFor: (state, { peer }) => ({
-  ...state,
-  hands: { [peer]: state.hands[peer] ?? [] },   // only your own hand
-}),
+import { defineStore, hiddenOr } from '@net-mesh/browser';
+
+defineStore({
+  // …
+  visibility: {
+    'players.*.hand': 'owner',     // only the player whose id is that key
+    'deck':           'nobody',    // only the host
+    'deck.length':    'everyone',  // …but everyone may count the cards
+    'waypoint':       ['command'], // players who joined with the 'command' audience
+  },
+  // A hidden field arrives as the HIDDEN marker, so let your validator accept it:
+  state: v => ({ /* … */ hand: hiddenOr(parseHand)(v.hand) }),
+});
 ```
 
-Use one or the other, not both. `projectFor` runs once per player on each
-change, so prefer `project` when everyone in an audience sees the same thing.
+- **`'owner'` needs no setup**: the key matched by the first `*` is the player's
+  id, which is how games already key players (`ships[context.peer]`).
+- **Hidden entries of a collection are removed; hidden fields become `HIDDEN`**
+  (check with `isHidden(value)`), never a fake `0` or `""` your game would believe.
+- **Presets**: `visibility: 'open'` says "everyone sees everything" on purpose,
+  and `'card-game'` hides hands (owner) and the deck (nobody, count visible).
+  Add overrides: `{ preset: 'card-game', 'players.*.score': 'nobody' }`.
+- **Prove it in a test** with `assertHidden(definition, state, { peer, audience },
+  ['players.bob.hand'])`, and pass `dev: true` to `hostStore` while developing:
+  it warns if every player is getting the whole world without you saying so.
+- **The host sees everything.** If the host is a player, that player can read
+  every secret in their own browser. Games with real stakes need a host that
+  isn't a player.
+
+For views the rules can't express, write the projection yourself:
+`project(state, audience)` (one view per audience) or `projectFor(state, { peer,
+audience })` (one per player). The declared rules still apply after it, so your
+code can hide more but never reveal a declared secret.
 
 **One tab per player.** All tabs of the same site in one browser profile share a
 single identity, so two tabs are the *same* player — and a player can't join

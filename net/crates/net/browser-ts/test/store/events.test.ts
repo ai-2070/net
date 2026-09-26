@@ -26,6 +26,7 @@ import { joinStore } from '../../src/store/join.js';
 import type { StoreEvent } from '../../src/store/owner.js';
 import { hostPlayer } from '../../src/store/player.js';
 import type { ActionContext, Cancel } from '../../src/store/types.js';
+import { sniff } from './sniff.js';
 
 const MAX_EVENT_BYTES = 8104;
 const HOST = '00000000000000aa';
@@ -135,10 +136,7 @@ describe('onEvent', () => {
   it('runs on join as a transaction: the starter kit reaches the player, and only them', async () => {
     const { mesh, host, events } = setup();
     const guestNode = mesh.node(GUEST);
-    const wire: string[] = [];
-    guestNode.onEvent(event => {
-      if (event.payload !== undefined) wire.push(new TextDecoder().decode(event.payload));
-    });
+    const wire = sniff(guestNode);
     const me = hostPlayer(host, { audience: [] });
     const guest = join(guestNode);
     await Promise.all([me.ready(), guest.ready()]);
@@ -155,8 +153,8 @@ describe('onEvent', () => {
     expect(me.getState().inventories).toEqual({ [HOST]: { potion: 3 } });
     expect(Object.keys(host.getState().inventories).sort()).toEqual([HOST, GUEST]);
     // The sniff can see an inventory — the guest's own — and never the host's.
-    expect(wire.join('\n')).toContain(`"${GUEST}":{"potion":3}`);
-    expect(wire.join('\n')).not.toContain(`"${HOST}":{"potion`);
+    expect(wire.text()).toContain(`"${GUEST}":{"potion":3}`);
+    expect(wire.text()).not.toContain(`"${HOST}":{"potion`);
   });
 
   it('fires area only when the area changes', async () => {

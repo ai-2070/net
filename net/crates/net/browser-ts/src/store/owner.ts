@@ -36,6 +36,7 @@ import { assertChunkingFits, chunkSnapshot } from './chunker.js';
 import { StoreCore } from './core.js';
 import { StoreError, type StoreErrorCode } from './errors.js';
 import type { JsonObject, JsonValue } from './json.js';
+import { applyVisibility, compileVisibility, type CompiledVisibility } from './visibility.js';
 import {
   canonicalRequest,
   digestBinding,
@@ -126,6 +127,12 @@ export interface OwnerDeps<S extends object, A extends ActionSpec, I extends Inp
    * every replica. Synchronous; a throw discards its writes.
    */
   onEvent?(event: StoreEvent, context: ActionContext<S>): void;
+  /**
+   * Development warnings: a store that sends everything to everyone
+   * without saying so, a projection the state validator refuses. Off
+   * unless given; never on by default in production.
+   */
+  warn?(message: string): void;
   /**
    * Which area a player is in, for `area` events: any string (a zone,
    * a room, a grid cell), or `null` for none. Read-only; called after
@@ -309,15 +316,34 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     // both would leave which one decides a secret to the reader of
     // this file.
     const projections = (typeof deps.project === 'function' ? 1 : 0) + (typeof deps.projectFor === 'function' ? 1 : 0);
-    if (projections !== 1) {
-      throw new StoreError('invalid-data', 'a host needs exactly one of `project` and `projectFor`');
+    const declared = deps.definition.visibility;
+    if (projections > 1 || (projections === 0 && declared === undefined)) {
+      throw new StoreError(
+        'invalid-data',
+        'a host needs one of `project` and `projectFor`, or a definition that declares `visibility`',
+      );
     }
-    this.perPlayer = typeof deps.projectFor === 'function';
+    this.visibility = declared === undefined ? null : compileVisibility(declared);
+    this.perPlayer = typeof deps.projectFor === 'function' || this.visibility?.perPlayer === true;
     this.core = new StoreCore({ definition: deps.definition, initialState: deps.definition.empty() });
   }
 
-  /** Whether projections depend on the peer (`projectFor`). */
+  /** Whether projections depend on the peer (`projectFor`, or an `owner` rule). */
   private readonly perPlayer: boolean;
+  /** The definition's declared rules, compiled; `null` when it declares none. */
+  private readonly visibility: CompiledVisibility | null;
+  /** Development warnings already given, so each is said once. */
+  private readonly warned = new Set<string>();
+
+  private warnOnce(message: string): void {
+    if (this.deps.warn === undefined || this.warned.has(message)) return;
+    this.warned.add(message);
+    try {
+      this.deps.warn(message);
+    } catch {
+      // A logger's failure is not the store's.
+    }
+  }
 
   /** The key under which two handles are certain to receive the same projection. */
   private viewKey(peer: string, audience: readonly string[]): string {
@@ -1470,11 +1496,32 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     state: S = this.core.getState() as S,
   ): S | null {
     try {
-      const projected =
+      const viewer: Viewer = Object.freeze({ peer, audience: Object.freeze([...audience]) });
+      const base =
         this.deps.projectFor !== undefined
-          ? this.deps.projectFor(state, Object.freeze({ peer, audience: Object.freeze([...audience]) }))
-          : this.deps.project!(state, audience);
-      return this.deps.definition.state(projected);
+          ? this.deps.projectFor(state, viewer)
+          : this.deps.project !== undefined
+            ? this.deps.project(state, audience)
+            : state;
+      if (this.visibility === null && base === state) {
+        this.warnOnce(
+          `store '${this.deps.definition.id}': every player receives the full state. ` +
+            "Declare `visibility: 'open'` on the definition if that is intended, or rules for what is secret.",
+        );
+      }
+      // Declared rules apply AFTER the hand-written projection: code can
+      // narrow what a rule allows, never widen it.
+      const projected = this.visibility === null ? base : applyVisibility(this.visibility, base, viewer);
+      try {
+        return this.deps.definition.state(projected);
+      } catch (error) {
+        this.warnOnce(
+          `store '${this.deps.definition.id}': a projection failed the state validator, so the player got empty() — ` +
+            `${error instanceof Error ? error.message : String(error)}` +
+            (this.visibility === null ? '' : ' (a hidden field is the HIDDEN marker: wrap its parser with hiddenOr)'),
+        );
+        throw error;
+      }
     } catch {
       // `empty()` is application code as well, and it is reached
       // precisely when the application has already thrown once. A

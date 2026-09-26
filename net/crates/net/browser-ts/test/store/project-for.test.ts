@@ -15,6 +15,7 @@ import { hostStore, type HostStoreOptions } from '../../src/store/host.js';
 import { joinStore } from '../../src/store/join.js';
 import { hostPlayer } from '../../src/store/player.js';
 import type { Cancel } from '../../src/store/types.js';
+import { sniff } from './sniff.js';
 
 const MAX_EVENT_BYTES = 8104;
 const HOST = '00000000000000aa';
@@ -59,8 +60,8 @@ const table = defineStore<Table, Actions, Inputs>({
 const never = (): Cancel => () => {};
 const decoder = new TextDecoder();
 
-/** Every frame a node receives, as text. */
-function sniff(node: LocalNode): string[] {
+/** Every raw frame a node receives (for counting frames, not searching them). */
+function frames(node: LocalNode): string[] {
   const seen: string[] = [];
   node.onEvent(event => {
     if (event.payload !== undefined) seen.push(decoder.decode(event.payload));
@@ -138,8 +139,10 @@ describe('projectFor', () => {
     expect(alice.getState().hands).toEqual({ [ALICE]: ['alice-ace', 'alice-queen'] });
     expect(store.getState().hands[ALICE]).toEqual(['alice-ace', 'alice-queen']);
 
-    const bobWire = toBob.join('\n');
-    const aliceWire = toAlice.join('\n');
+    const bobWire = toBob.text();
+    const aliceWire = toAlice.text();
+    // Positive control: the decoded stream does carry Bob's own hand.
+    expect(bobWire).toContain('bob-king');
     expect(bobWire).not.toContain('alice-');
     expect(bobWire).not.toContain('host-card');
     expect(aliceWire).not.toContain('bob-king');
@@ -156,7 +159,7 @@ describe('projectFor', () => {
     await Promise.all([alice.ready(), bob.ready()]);
     await settle();
 
-    const toBob = sniff(bobNode);
+    const toBob = frames(bobNode);
     await alice.act('draw', { card: 'alice-queen' });
     await settle();
     // Alice's hand is not in Bob's view, so Bob's projection did not

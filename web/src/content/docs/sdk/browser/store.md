@@ -117,6 +117,39 @@ what it was not given: the withheld part is absent from the frames, not hidden i
 the renderer. `replica.setAudience(names)` asks for a different audience and
 resolves when the new projection is installed.
 
+### Declared visibility
+
+A definition can declare its secrets instead, and the host enforces them after
+any hand-written projection — so code can narrow a rule, never widen it:
+
+```typescript
+defineStore({
+  /* … */
+  visibility: {
+    'players.*.hand': 'owner',   // the key matched by the first `*` must be the viewer's peer id
+    'deck': 'nobody',            // the host only
+    'deck.length': 'everyone',   // the count of a hidden array
+    'waypoint': ['command'],     // viewers reading any of these audiences
+  },
+});
+```
+
+Hidden entries of a collection (a path ending in `*`) are removed; hidden fields
+become the `HIDDEN` marker, so the state validator must accept it there —
+`hiddenOr(parse)` wraps a field's parser, and a host whose validator refuses the
+marker is refused at construction. Unlisted paths are visible. Presets: `'open'`
+(everything visible, stated rather than accidental) and `'card-game'`, which take
+overrides (`{ preset: 'card-game', 'players.*.score': 'nobody' }`). Rules are
+checked at `defineStore`: a malformed path, an `'owner'` rule with no `*`, or an
+unknown preset throws `invalid-data`. With declared visibility, `project` and
+`projectFor` are optional.
+
+`assertHidden(definition, state, viewer, paths)` throws if a viewer could read
+any of the paths — for tests. `hostStore({ dev: true })` (or a function) warns
+when every player would receive the whole state with no `visibility` declared,
+and when a projection fails the validator, which otherwise sends `empty()`
+silently.
+
 When the view depends on the player rather than the audience — each player's own
 hand — give `projectFor` instead of `project`. It receives the authenticated
 player with the audience they read:

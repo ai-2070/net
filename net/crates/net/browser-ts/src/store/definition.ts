@@ -20,6 +20,7 @@
 
 import { StoreError } from './errors.js';
 import type { ActionSpec, InputSpec, StoreDefinition } from './types.js';
+import { compileVisibility } from './visibility.js';
 
 export function defineStore<
   S extends object,
@@ -57,6 +58,18 @@ export function defineStore<
       `store '${definition.id}': empty() is not a valid state, so a replica could not clear a projection with it: ${String(error)}`,
       { cause: error },
     );
+  }
+
+  // Visibility rules that could not be enforced as written fail here,
+  // at the developer's desk, rather than at the first projection.
+  if (definition.visibility !== undefined) {
+    try {
+      compileVisibility(definition.visibility);
+    } catch (error) {
+      throw new StoreError('invalid-data', `store '${definition.id}': ${error instanceof Error ? error.message : String(error)}`, {
+        cause: error,
+      });
+    }
   }
 
   return Object.freeze({ ...definition });

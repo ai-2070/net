@@ -243,6 +243,14 @@ interest produces ordinary adds and removes.
 
 ### Hidden information, modeled (part of P2)
 
+**Status (2026-09-26): built** — `store/visibility.ts`: path rules, `owner` by
+the first `*`, audience lists, `.length` counts, presets `open` / `card-game`
+with overrides, `HIDDEN` / `hiddenOr`, `assertHidden`, the `dev` warnings (items
+7a and the validator case; the cross-player leak check is moot for declared
+rules, which are applied after any hand-written projection). Not built:
+`ownerOf` override, `team` rules (Q7's open point), `host.trust`. The acceptance
+card game is `test/store/visibility.test.ts`, proved on decoded wire frames.
+
 **Why.** Enforcement is already right: `project` runs on the host and what it
 omits is never sent, and a throwing handler answers the caller with the code
 alone — the handler's message never leaves the host (`store/owner.ts`, the

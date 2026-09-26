@@ -83,3 +83,11 @@ export {
   removeItems,
 } from './inventory.js';
 export type { Inventory, InventoryErrorCode, InventoryRules } from './inventory.js';
+export {
+  assertHidden,
+  HIDDEN,
+  hiddenOr,
+  isHidden,
+  projectVisible,
+} from './visibility.js';
+export type { Hidden, Visibility, VisibilityPreset, VisibilityRule, VisibilityRules } from './visibility.js';

@@ -18,6 +18,16 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **Declared visibility.** `defineStore({ visibility })`: path → rule
+  (`'everyone'`, `'nobody'`, `'owner'`, or audiences; `x.length` reveals a
+  hidden array's count), presets `'open'` and `'card-game'` with
+  overrides. Enforced by the host after any `project` / `projectFor`
+  (which become optional). Hidden entries are removed, hidden fields
+  become `HIDDEN` (`hiddenOr`, `isHidden`); a validator that refuses the
+  marker is refused at `hostStore`. `assertHidden` and `projectVisible`
+  for tests; `hostStore({ dev })` warns about an undeclared
+  everything-to-everyone store and about projections the validator
+  refuses.
 - **`onEvent(event, context)`** — one host hook for `join`, `leave`
   (with a reason: `left` / `expired` / `refused` / `dropped`) and `area`
   (from `areaOf(state, peer)`, on change only). A transaction like an

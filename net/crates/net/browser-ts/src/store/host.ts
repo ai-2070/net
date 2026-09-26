@@ -30,6 +30,7 @@ import { isStaleStream, StoreError } from './errors.js';
 import { StoreOwner, type Dispatched, type OwnerDeps, type Outbound, type Viewer } from './owner.js';
 import type { ActionSpec, Cancel, InputSpec, StoreDefinition } from './types.js';
 import { encodeMessage, type Hex } from './wire.js';
+import { applyVisibility, compileVisibility } from './visibility.js';
 
 /** How often a host expires handles whose lease has run out (§2). */
 export const HOST_SWEEP_MS = 5_000;
@@ -164,6 +165,11 @@ export type HostProjection<S extends object> =
   | {
       projectFor(state: S, viewer: Viewer): S;
       readonly project?: never;
+    }
+  | {
+      /** Neither: the definition's declared `visibility` alone decides. */
+      readonly project?: never;
+      readonly projectFor?: never;
     };
 
 /** What a host needs beyond the owner's own dependencies. */
@@ -192,6 +198,15 @@ export interface HostStoreBaseOptions<S extends object, A extends ActionSpec, I 
   readonly streamId?: string;
   readonly maxEventBytes: number;
   readonly initialState: S;
+  /**
+   * Development checks: `true` warns through `console.warn`, a function
+   * receives the messages. It says so when every player would receive
+   * the whole state without the definition declaring `visibility:
+   * 'open'`, and when a projection fails the state validator (which
+   * otherwise sends the player `empty()` silently). Leave it off in
+   * production.
+   */
+  readonly dev?: boolean | ((message: string) => void);
   now?: () => number;
   newHandle?: () => Hex;
   newIncarnation?: () => Hex;
@@ -311,6 +326,12 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     projectFor: options.projectFor,
     onEvent: options.onEvent,
     areaOf: options.areaOf,
+    warn:
+      options.dev === true
+        ? message => console.warn(`[@net-mesh/browser] ${message}`)
+        : typeof options.dev === 'function'
+          ? options.dev
+          : undefined,
     actions: options.actions,
     inputs: options.inputs,
     maxEventBytes: options.maxEventBytes,
@@ -319,6 +340,24 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     newIncarnation: options.newIncarnation ?? (() => randomHex(8) as Hex),
     canProject: options.canProject ?? (() => true),
   });
+  // Declared secrets become the HIDDEN marker in a player's view, and
+  // the view must pass the state validator. Checked now, against the
+  // initial state as a stranger would see it, so a validator that
+  // refuses the marker fails here rather than sending every player
+  // `empty()` in silence.
+  if (options.definition.visibility !== undefined) {
+    const stranger = applyVisibility(compileVisibility(options.definition.visibility), options.initialState, null);
+    try {
+      options.definition.state(stranger);
+    } catch (error) {
+      throw new StoreError(
+        'invalid-data',
+        `store '${options.definition.id}': the state validator rejects a view with secrets hidden — ` +
+          `wrap each field a rule hides with hiddenOr(…): ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+  }
   owner.commit(options.initialState);
 
   const replies = new Map<string, TransportStream>();

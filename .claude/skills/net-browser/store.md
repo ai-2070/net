@@ -17,6 +17,7 @@ const arena = defineStore({
   version: 1,
   state: (v) => ({ ships: v?.ships ?? {} }),   // REQUIRED: validates a whole state
   empty: () => ({ ships: {} }),                // REQUIRED: absence; must pass `state`
+  visibility: 'open',                          // everyone sees every ship — a DECISION, stated
   actions: {                                   // { name: { input, output } } validators
     enlist: { input: () => ({}), output: (v) => ({ id: String(v.id) }) },
     fire: { input: (v) => ({ at: String(v.at) }), output: (v) => ({ hull: num(v.hull) }) },
@@ -38,7 +39,6 @@ const host = hostStore({
   // Branch on `request.type` — a policy that throws is a refusal (`forbidden`).
   authorize: (request) =>
     request.type !== 'action' || request.name !== 'fire' || request.input.at !== request.peer,
-  project: (state, audience) => state,         // everyone sees every ship
   actions: {                                   // HANDLERS, one per declared action
     enlist: (input, context) => {
       const ships = { ...context.getState().ships };
@@ -93,6 +93,18 @@ throws `invalid-data` at construction.
 - **`input` is coalesced and unacknowledged.** The right shape for 60 Hz intent —
   movement, aim, camera. Nothing waits for it, and nothing is guaranteed
   individually; the projection converges.
+- **Declare secrets with `visibility` on the definition — prefer it to a
+  hand-written `project`.** Path → rule: `'everyone'`, `'nobody'` (host only),
+  `'owner'` (the first `*` key is the player's peer id — needs no setup), or a list
+  of audiences. `'x.length': 'everyone'` reveals only an array's count. Presets
+  `'open'` (say it when everything is public) and `'card-game'`, with overrides
+  `{ preset: 'card-game', …}`. Hidden collection entries are REMOVED; hidden
+  fields become `HIDDEN` — wrap those fields' validators with `hiddenOr(parse)`
+  or `hostStore` throws `invalid-data`. Rules apply after any `project` /
+  `projectFor`, so code cannot widen them. With neither `project` nor
+  `projectFor`, the rules alone decide. Prove it: `assertHidden(definition,
+  state, { peer, audience }, ['players.<peer>.hand'])`. Pass `dev: true` to
+  `hostStore` in development. No `team` rule yet — use audiences.
 - **`project(state, audience)` decides what each audience may see**, applied by
   the host before anything leaves. A replica cannot read what it was not given;
   do not rely on client-side hiding.
