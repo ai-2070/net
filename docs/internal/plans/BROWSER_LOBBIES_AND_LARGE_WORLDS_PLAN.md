@@ -226,7 +226,12 @@ path switch to it.
   fresh credential per connect, so a promotion never depends on an old invite.
   A leaf change; not needed while invites bind to their device.
 
-### Acceptance run — passed (2026-09-26)
+### Acceptance run — passed (2026-09-26), gated in CI (2026-09-27)
+
+CI job `browser-acceptance` builds `net-mesh` with `rtc-bootstrap`, the leaf
+bundle and the package, and runs it headless in Playwright's Chromium. The job
+pins all ten check names (each must be in `run.mjs` and print `PASS`) and the
+`10/10` summary.
 
 `net/crates/net/examples/anchor-acceptance` (`node run.mjs --net-mesh <bin>`):
 the real `net-mesh anchor serve --game`, two isolated Chrome contexts, the built

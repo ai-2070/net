@@ -7752,6 +7752,126 @@ jobs:
           path: ${{ runner.temp }}/demo.log
           if-no-files-found: warn
 
+  browser-acceptance:
+    # The browser plan's P0 acceptance run (release step 2): two real
+    # browser players join a lobby through the REAL CLI anchor
+    # (`net-mesh anchor serve --game`), each with an anonymous credential
+    # that anchor issued, then play netcode over the lossy DataChannel.
+    # Plus the refusals only a real browser shows: a game the anchor does
+    # not admit, a third identity presenting another player's credential,
+    # and a rival game on the same anchor that must not see this one.
+    #
+    # Its own job, not a step on `browser-demo`: it pays for a net-cli
+    # build under `rtc-bootstrap` on top of the leaf bundle and Chromium.
+    # Chromium only, as the demo: the run drives Chromium's
+    # throttling-defeat flags, and engine coverage is the matrix's job.
+    name: Browser acceptance (CLI anchor, Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Add wasm32 to the leaf's toolchain
+        run: |
+          set -o pipefail
+          cd net/crates/net/leaf
+          rustup target add wasm32-unknown-unknown
+          rustup target list --installed | grep -qx wasm32-unknown-unknown || {
+            echo "::error::wasm32-unknown-unknown is missing for the toolchain the leaf selects"
+            exit 1
+          }
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: browser-acceptance
+          workspaces: |
+            net/crates/net -> target
+            net/crates/net/leaf -> target
+
+      - name: Install Chromium from Playwright's cache
+        run: npx --yes playwright@1.56.0 install --with-deps chromium
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Install wasm-bindgen-cli 0.2.129
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
+
+      # The anchor is the CLI a deployment runs, built with the feature
+      # that carries `anchor serve`; the page loads the real bundle.
+      - name: Build net-mesh (rtc-bootstrap), the leaf bundle and @net-mesh/browser
+        run: |
+          set -euo pipefail
+          ( cd net/crates/net && cargo build -p net-cli --features rtc-bootstrap )
+          cd net/crates/net/leaf
+          cargo build --release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir pkg \
+            target/wasm32-unknown-unknown/release/net_leaf.wasm
+          cd ../browser-ts
+          npm install --no-audit --no-fund
+          npm run build
+          cd ../examples/anchor-acceptance
+          npm install --no-audit --no-fund
+
+      - name: Acceptance run
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: |
+          set -uo pipefail
+          cd net/crates/net/examples/anchor-acceptance
+          node run.mjs --net-mesh "$GITHUB_WORKSPACE/net/crates/net/target/debug/net-mesh" 2>&1 \
+            | tee "$RUNNER_TEMP/acceptance.log"
+          exit "${PIPESTATUS[0]}"
+
+      # The exit code already fails on any FAILED check. This pins the
+      # roster: every named check must appear in run.mjs AND pass, and
+      # the summary must count all of them, so a check that is dropped
+      # or never reached is a failure rather than a shorter green run.
+      - name: Acceptance inventory
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # Byte semantics: the log's separator is a UTF-8 em dash.
+          export LC_ALL=C
+          src=net/crates/net/examples/anchor-acceptance/run.mjs
+          log="$RUNNER_TEMP/acceptance.log"
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            grep -qF -- "$name" "$src" || {
+              echo "::error::required check is not in run.mjs: $name"; exit 1; }
+            # The line is `PASS <name>` or `PASS <name> — <detail>`;
+            # compared as bytes, so no locale can split the dash.
+            awk -v want="PASS $name" '$0 == want || index($0, want " — ") == 1 { found = 1 }
+              END { exit !found }' "$log" || {
+              echo "::error::required acceptance check missing or failed: $name"; exit 1; }
+          done <<'NAMES'
+          the anchor reports its game and credential endpoint
+          the host fetched a credential, enrolled and opened a lobby
+          a second player found it in the list, joined and was seated
+          netcode: every input applied exactly once on the host, the ship where the player predicted it
+          netcode rode the lossy DataChannel: the joiner wrote on it and the host received on it
+          another game's player finds its own lobby but never this game's
+          a game the anchor does not admit is refused typed
+          a third identity presenting another player's credential is not enrolled
+          a reloaded player comes back as the same node and re-enrolls with its credential
+          the anchor counted two credentials, three enrollments (one a return) and the refused reuse
+          NAMES
+          grep -qx '10/10 checks passed' "$log" || {
+            echo "::error::the acceptance summary is not 10/10"; tail -20 "$log"; exit 1; }
+
+      - name: Upload the acceptance log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-acceptance-log
+          path: ${{ runner.temp }}/acceptance.log
+          if-no-files-found: warn
+
   acme-cold-start:
     # R4a: a COLD-CACHE ACME order against a real local directory,
     # then a verifying TLS client. The defect this exists for is that
