@@ -29,8 +29,8 @@ net-mesh anchor serve --psk-file psk.hex \
 Each player then asks it for an anonymous credential — see *Connect* below.
 Without `--game` the anchor serves no enrollment, and a page's `connect()` fails
 with `session: rpc: the call's deadline elapsed` after a perfectly good TLS
-handshake. One anchor can serve several games but does not yet isolate them
-from each other; run one per game for now.
+handshake. One anchor can serve several games (repeat `--game`) and keeps them
+apart: a player never discovers or reaches another game's players.
 
 `tests/rtc_browser/run.sh` (`run.ps1` on Windows) is the other one: the CI
 harness, on Chromium and Firefox, which issues its own CA and trusts it per

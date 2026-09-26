@@ -71,9 +71,11 @@ binds to the first identity that enrolls with it (which may reconnect with it
 for 12 h); another identity presenting it is refused as a replay, surfacing
 from `connect()` as `identity: the anchor rejected enrollment: replay`.
 Without `--game` the anchor registers no enrollment service and `connect()`
-times out with `rpc-timeout`. Games are not yet isolated from each other on
-one anchor, so run one per game. `examples/anchor-acceptance` runs the whole
-flow with two real browsers.
+times out with `rpc-timeout`. Several games on one anchor are kept apart: the
+anchor records which game admitted each session and neither floods, replays
+nor relays between games, so a player never discovers another game's lobbies.
+`examples/anchor-acceptance` runs the whole flow with real browsers, a rival
+game included.
 
 **ICE configuration.** `iceServers` is optional with a working default: omitted,
 the leaf gathers against the `stun_addr` the anchor announces on `GET

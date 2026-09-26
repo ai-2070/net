@@ -10718,6 +10718,19 @@ fn snapshot_peers(peers: &DashMap<u64, PeerInfo>, exclude: Option<u64>) -> Vec<P
         .collect()
 }
 
+/// A peer's enrollment tenant (P0 slice 2); `None` for native sessions.
+#[cfg(feature = "webrtc")]
+fn tenant_of(peers: &DashMap<u64, PeerInfo>, node_id: u64) -> Option<super::rtc::TenantId> {
+    peers.get(&node_id)?.admission.tenant()
+}
+
+/// Maps an Admitted enrollment grant (its delegation-chain bytes) to the
+/// tenant it was issued for. Installed by the application
+/// ([`MeshNode::set_enrollment_tenant_resolver`]).
+#[cfg(feature = "webrtc")]
+pub type EnrollmentTenantResolver =
+    Arc<dyn Fn(&[u8]) -> Option<super::rtc::TenantId> + Send + Sync>;
+
 /// When a hub replays held announcements to a newly attached peer (after
 /// the peer has had time to install the session, then once more).
 const REPLAY_SETTLE: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(2)];
@@ -11974,6 +11987,10 @@ pub struct MeshNode {
     /// touch the peer map (F3 router drain, F6 traversal, F7 proxy).
     #[cfg(feature = "webrtc")]
     provisional_endpoints: super::rtc::ProvisionalEndpoints,
+    /// Maps an Admitted enrollment grant to the tenant it was issued for
+    /// ([`Self::set_enrollment_tenant_resolver`]). `None`: no tenants.
+    #[cfg(feature = "webrtc")]
+    enrollment_tenant_resolver: parking_lot::RwLock<Option<EnrollmentTenantResolver>>,
     /// §12 step 4: the session incarnation an in-flight enrollment
     /// call was decoded against, keyed by `(node_id, call_id)`.
     /// Promotion consumes it and re-verifies the binding — a
@@ -14660,6 +14677,8 @@ impl MeshNode {
             rtc_signal_budget: Arc::new(parking_lot::Mutex::new(super::rtc::SignalBudget::new())),
             #[cfg(feature = "webrtc")]
             provisional_endpoints,
+            #[cfg(feature = "webrtc")]
+            enrollment_tenant_resolver: parking_lot::RwLock::new(None),
             #[cfg(feature = "webrtc")]
             pending_promotions: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
@@ -29141,6 +29160,26 @@ impl MeshNode {
                     }) {
                         return;
                     }
+                    // P0 slice 2: no relayed transit between sessions
+                    // enrolled for different tenants (games). The source
+                    // is the authenticated adjacent session, never the
+                    // header's claimed `src_id`; a destination that is
+                    // not a direct peer has no tenant here and passes
+                    // (multi-hop routing is not a browser path).
+                    #[cfg(feature = "webrtc")]
+                    {
+                        let source_tenant = ctx
+                            .addr_to_node
+                            .get(&source)
+                            .and_then(|node| tenant_of(&ctx.peers, *node));
+                        let dest_tenant = tenant_of(&ctx.peers, routing_header.dest_id);
+                        if !super::rtc::tenants_may_meet(source_tenant, dest_tenant) {
+                            if let Some(stats) = ctx.rtc_stats.as_ref() {
+                                stats.note_tenant_refused_transit();
+                            }
+                            return;
+                        }
+                    }
                     // §10 part 2: count this forward for the pair,
                     // unless it is signalling. Reading
                     // `subprotocol_id` off the inner header is
@@ -39819,6 +39858,20 @@ impl MeshNode {
         expected_session_id: u64,
         expected_endpoint: PeerAddr,
     ) -> bool {
+        self.promote_admission_with_tenant(node_id, expected_session_id, expected_endpoint, None)
+    }
+
+    /// [`Self::promote_admission`], recording the tenant the enrollment
+    /// grant named (browser plan P0 slice 2). The tenant is bound to the
+    /// promoted incarnation, exactly like the promotion itself.
+    #[cfg(feature = "webrtc")]
+    pub fn promote_admission_with_tenant(
+        &self,
+        node_id: u64,
+        expected_session_id: u64,
+        expected_endpoint: PeerAddr,
+        tenant: Option<super::rtc::TenantId>,
+    ) -> bool {
         let Some(mut entry) = self.peers.get_mut(&node_id) else {
             return false;
         };
@@ -39832,6 +39885,7 @@ impl MeshNode {
         info.admission = super::rtc::PeerAdmission::Admitted {
             promoted_at: std::time::Instant::now(),
             session_id: expected_session_id,
+            tenant,
         };
         drop(entry);
         self.provisional_endpoints.remove(&expected_endpoint);
@@ -39966,6 +40020,7 @@ impl MeshNode {
             &super::rtc::enroll_reply_channel(origin),
             call_id,
             session,
+            None,
         )
     }
 
@@ -40067,6 +40122,7 @@ impl MeshNode {
         reply_channel: &str,
         call_id: u64,
         receiving_session_id: u64,
+        tenant: Option<super::rtc::TenantId>,
     ) -> bool {
         let Some(origin) = self.provisional_reply_origin(node_id) else {
             return false;
@@ -40090,7 +40146,34 @@ impl MeshNode {
             return false;
         };
         self.release_enrollment_slot_of(node_id, session_id);
-        self.promote_admission(node_id, session_id, endpoint)
+        self.promote_admission_with_tenant(node_id, session_id, endpoint, tenant)
+    }
+
+    /// Install how this node maps an Admitted enrollment grant (the
+    /// delegation-chain bytes the enrollment service answered with) to a
+    /// tenant. A game anchor maps each game's enrollment root to that
+    /// game. With a resolver installed, sessions enrolled for DIFFERENT
+    /// tenants are kept apart here: no announcement flooded or replayed
+    /// between them, no relayed transit between them
+    /// ([`super::rtc::tenants_may_meet`]). `None` removes it; sessions
+    /// already promoted keep the tenant they were promoted with.
+    #[cfg(feature = "webrtc")]
+    pub fn set_enrollment_tenant_resolver(&self, resolver: Option<EnrollmentTenantResolver>) {
+        *self.enrollment_tenant_resolver.write() = resolver;
+    }
+
+    /// The tenant `chain` (an Admitted grant) belongs to, per the
+    /// installed resolver.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn resolve_enrollment_tenant(&self, chain: &[u8]) -> Option<super::rtc::TenantId> {
+        let resolver = self.enrollment_tenant_resolver.read().clone()?;
+        resolver(chain)
+    }
+
+    /// The tenant `node_id`'s current session was enrolled for, if any.
+    #[cfg(feature = "webrtc")]
+    pub fn peer_tenant(&self, node_id: u64) -> Option<super::rtc::TenantId> {
+        self.peers.get(&node_id)?.admission.tenant()
     }
 
     /// **R6-B: which node actually holds the reservation for this
@@ -41587,6 +41670,13 @@ impl MeshNode {
         let sink = ctx.sink.clone();
         let partition_filter = ctx.partition_filter.clone();
         let router = ctx.router.clone();
+        // P0 slice 2: an announcement from a session enrolled for one
+        // tenant (game) is not flooded to sessions enrolled for another —
+        // discovery is how one game's players would otherwise find, and
+        // learn the keys of, another's.
+        #[cfg(feature = "webrtc")]
+        let (origin_tenant, rtc_stats) =
+            (tenant_of(&ctx.peers, origin_node_id), ctx.rtc_stats.clone());
 
         tokio::spawn(async move {
             // Split-horizon: consult the routing table for the
@@ -41597,7 +41687,30 @@ impl MeshNode {
             let next_hop_addr = router.routing_table().lookup(origin_node_id);
 
             // Snapshot FIRST (HOLD-2 item 2), same as the scoped path above.
-            for peer in snapshot_peers(&peers, Some(sender_node_id)) {
+            #[cfg(feature = "webrtc")]
+            let recipients: Vec<PeerRecipient> = peers
+                .iter()
+                .filter(|entry| entry.value().node_id != sender_node_id)
+                .filter(|entry| {
+                    let meets = super::rtc::tenants_may_meet(
+                        origin_tenant,
+                        entry.value().admission.tenant(),
+                    );
+                    if !meets {
+                        if let Some(stats) = rtc_stats.as_ref() {
+                            stats.note_tenant_withheld_announcement();
+                        }
+                    }
+                    meets
+                })
+                .map(|entry| PeerRecipient {
+                    addr: entry.value().addr(),
+                    session: entry.value().session.clone(),
+                })
+                .collect();
+            #[cfg(not(feature = "webrtc"))]
+            let recipients = snapshot_peers(&peers, Some(sender_node_id));
+            for peer in recipients {
                 if Some(peer.addr) == next_hop_addr {
                     continue; // split horizon: that's our path to the origin
                 }
@@ -41662,9 +41775,24 @@ impl MeshNode {
         peers: &DashMap<u64, PeerInfo>,
         sink: &PeerSink,
     ) {
+        // P0 slice 2: never replay one tenant's announcements to a session
+        // enrolled for another.
+        #[cfg(feature = "webrtc")]
+        let recipient_tenant = tenant_of(peers, peer);
         let held: Vec<Vec<u8>> = relay
             .iter()
             .filter(|e| *e.key() != peer && !e.value().is_expired())
+            .filter(|e| {
+                #[cfg(feature = "webrtc")]
+                {
+                    super::rtc::tenants_may_meet(tenant_of(peers, *e.key()), recipient_tenant)
+                }
+                #[cfg(not(feature = "webrtc"))]
+                {
+                    let _ = e;
+                    true
+                }
+            })
             .map(|e| e.value().to_bytes())
             .collect();
         if held.is_empty() {
@@ -63374,6 +63502,10 @@ mod rpc_large_response_lifecycle_tests;
 #[cfg(test)]
 #[path = "mesh_stream_inbound_tests.rs"]
 mod stream_inbound_tests;
+
+#[cfg(all(test, feature = "webrtc"))]
+#[path = "mesh_tenant_tests.rs"]
+mod tenant_tests;
 
 /// R1 (Kyra's HOLD on `b6e522bb5`): the `Stream` handle's config and
 /// the session's retransmit bookkeeping cannot disagree.

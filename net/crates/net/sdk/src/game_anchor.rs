@@ -61,11 +61,16 @@
 //! makes a per-game limit enforceable and what a shared anchor's
 //! metering will read later ([`GameRegistry::stats`]).
 //!
-//! # What this does NOT enforce yet
+//! # Games are kept apart
 //!
-//! That a session enrolled for game A cannot announce, discover or route
-//! into game B. The core does not yet record which root promoted a
-//! session; that is the plan's second P0 slice.
+//! [`serve_game_enrollment`] also installs the core's enrollment tenant
+//! resolver: when a visitor is admitted, the core reads the grant's root,
+//! this registry names the game ([`GameRegistry::tenant_of_chain`]), and
+//! the session is promoted **for that game**. The anchor then neither
+//! floods nor replays one game's announcements to another game's players
+//! and refuses relayed traffic between them — so a game-B player cannot
+//! list, discover or reach a game-A lobby through this anchor. Sessions
+//! with no game (native peers, dedicated hosts) meet everyone.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,6 +90,8 @@ use crate::identity::{EntityId, Identity};
 const GAME_ROOT_CONTEXT: &str = "net-mesh game anchor: game root v1";
 /// Domain separation for deriving a registry secret from an issuer key.
 const ISSUER_SECRET_CONTEXT: &str = "net-mesh game anchor: secret from issuer v1";
+/// Domain separation for a game's tenant id.
+const TENANT_CONTEXT: &str = "net-mesh game anchor: tenant v1";
 /// Domain separation for deriving the invite MAC key from the secret.
 const INVITE_MAC_CONTEXT: &str = "net-mesh game anchor: invite mac v1";
 /// Longest game id accepted.
@@ -297,6 +304,25 @@ impl GameRegistry {
     /// The game a root belongs to, or `None`.
     pub fn game_of_root(&self, root: &EntityId) -> Option<&str> {
         self.by_root.get(root.as_bytes()).map(String::as_str)
+    }
+
+    /// The core tenant id of `game`: how the anchor tells games apart. A
+    /// hash of the id, so every instance agrees without coordination.
+    #[cfg(feature = "webrtc")]
+    pub fn tenant_id(game: &str) -> net::adapter::net::rtc::TenantId {
+        let digest = blake3::derive_key(TENANT_CONTEXT, game.as_bytes());
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&digest[..8]);
+        net::adapter::net::rtc::TenantId(u64::from_le_bytes(id))
+    }
+
+    /// The tenant of an Admitted grant (delegation-chain bytes) this
+    /// registry issued: its root's game. `None` for a chain that does not
+    /// parse or is rooted anywhere else.
+    #[cfg(feature = "webrtc")]
+    pub fn tenant_of_chain(&self, chain: &[u8]) -> Option<net::adapter::net::rtc::TenantId> {
+        let chain = DelegationChain::from_bytes(chain).ok()?;
+        self.game_of_root(&chain.root()).map(Self::tenant_id)
     }
 
     /// The registered game ids, sorted.
@@ -552,6 +578,16 @@ pub fn serve_game_enrollment(
     registry: std::sync::Arc<GameRegistry>,
     grant_ttl: Duration,
 ) -> Result<crate::mesh_rpc::ServeHandle, crate::mesh_rpc::ServeError> {
+    // Each admitted session is promoted FOR ITS GAME: the core asks this
+    // registry which game a grant belongs to, and keeps games apart.
+    #[cfg(feature = "webrtc")]
+    {
+        let registry = registry.clone();
+        mesh.node()
+            .set_enrollment_tenant_resolver(Some(std::sync::Arc::new(move |chain: &[u8]| {
+                registry.tenant_of_chain(chain)
+            })));
+    }
     // Raw bodies both ways: the core's promotion gate reads the
     // outcome's own `NMO1` framing (see `mesh_enroll`).
     mesh.serve_rpc_raw_bytes(
@@ -604,6 +640,37 @@ mod tests {
             one.root_of("alpha"),
             raw.root_of("alpha"),
             "derived, not the seed itself"
+        );
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn a_grant_names_its_game_and_nothing_else_does() {
+        let games = registry(&["alpha", "beta"]);
+        let credential = games
+            .issue_credential_at("alpha", &Identity::generate(), &params(), NOW)
+            .unwrap();
+        let JoinOutcome::Admitted { chain } = outcome(&games.handle_join_request_at(
+            &join(&credential.invite),
+            DEFAULT_GRANT_TTL,
+            NOW,
+        )) else {
+            panic!("admitted");
+        };
+        assert_eq!(
+            games.tenant_of_chain(&chain),
+            Some(GameRegistry::tenant_id("alpha"))
+        );
+        assert_ne!(
+            GameRegistry::tenant_id("alpha"),
+            GameRegistry::tenant_id("beta")
+        );
+        assert_eq!(games.tenant_of_chain(b"not a chain"), None);
+        let elsewhere = GameRegistry::new([8u8; 32], vec![GameConfig::new("alpha")]).unwrap();
+        assert_eq!(
+            elsewhere.tenant_of_chain(&chain),
+            None,
+            "another anchor's roots are not ours"
         );
     }
 

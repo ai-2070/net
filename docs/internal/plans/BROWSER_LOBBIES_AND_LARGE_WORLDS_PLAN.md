@@ -188,6 +188,8 @@ lobby helper re-announces every ~2 s, which is correct under either behaviour.
 **Measure once against the P0 anchor; investigate only if the anchor really
 drops announcements in seconds.**
 
+**Status: P0 done** — slice 1, slice 2 and the acceptance run below.
+
 **Acceptance:** a page built from the npm package connects to a freshly
 installed CLI anchor and `isEnrolled()` is true, with no repo checkout; a
 credential for game A cannot announce a lobby for game B; per-game counters and
@@ -243,14 +245,36 @@ reaching the host); shown causal by mutation both in the real run and in unit
 tests that model the rule. Not yet in CI (needs a release CLI build and Chrome);
 the README, skill and quickstart now point at the CLI anchor.
 
-### Slice 2 — next: the core records the game
+### Slice 2 — built (2026-09-26): the core records the game
 
-The core promotes a session on an Admitted outcome without reading the grant's
-root, so it cannot yet tell which game a session belongs to. Slice 2: record
-the grant's root (→ game) on the promoted session, then enforce it at three
-points — announcements (lobby tags outside the game refused), the anchor's
-answers to discovery queries (filtered to the game), and routed traffic between
-sessions of different games. Witnessed by a cross-game refusal test at each.
+- **Recording.** `PeerAdmission::Admitted` carries `tenant: Option<TenantId>`
+  (an opaque `u64`; the core only compares). At promotion the core reads the
+  Admitted outcome's chain and asks the application's resolver
+  (`MeshNode::set_enrollment_tenant_resolver`); `serve_game_enrollment`
+  installs one that maps the chain's root to its game
+  (`GameRegistry::tenant_of_chain`, `tenant_id(game)` = a hash of the id).
+  Bound to the promoted incarnation; `peer_tenant(node)` reads it.
+- **Rule** (`tenants_may_meet`): only two DIFFERENT tenants are kept apart; a
+  session with none (native peer, other anchor, dedicated host) meets all.
+- **Enforced at the three places a leaf can touch another:** the announcement
+  flood (per recipient), the replay of held announcements on attach, and the
+  relay-transit arm (source = the authenticated adjacent session, never the
+  header's `src_id`). New counters `tenant_withheld_announcement`,
+  `tenant_refused_transit`. Leaves never query the anchor — they answer
+  `query()` from pushed announcements — so filtering the two push paths IS
+  discovery isolation (mapped 2026-09-26).
+- **Witnessed:** core tests for each of the three (each fails with its filter
+  removed); SDK test that a grant names its game and nothing else does; and
+  the acceptance run's rival game — its player finds its own lobby and never
+  game A's over 25 s, and with the resolver removed from the SDK the same run
+  fails (`sawForeign: 22`).
+- **Not covered, by design for now:** an announcement forwarded from ANOTHER
+  anchor carries no tenant here (multi-anchor is P5); a departed player's
+  held announcement loses its tenant with its session until it expires;
+  native-only paths (protected hops, punch, scoped announcements, the fold
+  subprotocol) are not browser paths. Tags a player announces are not
+  checked against its game — isolation makes a false tag visible only to its
+  own game.
 
 ---
 

@@ -183,7 +183,7 @@ net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
 - **Counters.** `--game-stats-secs N` prints every game's credentials issued and refused and enrollments admitted and refused as a JSON line every N seconds. The start report lists `games` and the `credential_endpoint`.
 - **What a credential is.** Its invite binds to the first browser identity that enrolls with it; that identity may reconnect with it for 12 hours (a reload with `rememberedIdentity()`, a promoted leader tab), and any other is refused. One credential is one player.
 - **Proved end to end** by `examples/anchor-acceptance`: two real browsers join a lobby through this command.
-- **Not yet enforced:** that a game's players cannot announce, discover or route into another game on the same anchor. Run one anchor per game until that lands.
+- **Games are kept apart.** The anchor records which game admitted each browser session. It never floods or replays one game's announcements to another game's players, and refuses relayed traffic between them, so a player cannot list, discover or reach another game's lobbies. Native peers (other anchors, dedicated hosts) belong to no game and meet every game.
 
 `--credential-issuer` becomes optional with `--issuer-identity` (it is that key's public half); given both, they must agree. `--game` requires `--issuer-identity`.
 

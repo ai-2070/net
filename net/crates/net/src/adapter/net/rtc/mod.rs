@@ -38,11 +38,11 @@ mod stun;
 mod transport;
 
 pub use admission::{
-    allow_provisional_action, enroll_reply_channel, AdmissionRefusal, BootstrapAction,
-    PeerAdmission, ProvisionalBudget, ProvisionalEndpoints, ENROLL_SERVICE, MAX_ENROLL_BODY_BYTES,
-    MAX_ENROLL_REQUEST_FRAMES, MAX_INFLIGHT_ENROLLMENTS, MAX_PROVISIONAL_BYTES,
-    MAX_PROVISIONAL_CHANNELS, MAX_PROVISIONAL_FRAMES, MAX_PROVISIONAL_STREAMS,
-    MAX_PROVISIONAL_STREAM_BYTES, PROVISIONAL_TTL, RENEWAL_SERVICE,
+    allow_provisional_action, enroll_reply_channel, tenants_may_meet, AdmissionRefusal,
+    BootstrapAction, PeerAdmission, ProvisionalBudget, ProvisionalEndpoints, TenantId,
+    ENROLL_SERVICE, MAX_ENROLL_BODY_BYTES, MAX_ENROLL_REQUEST_FRAMES, MAX_INFLIGHT_ENROLLMENTS,
+    MAX_PROVISIONAL_BYTES, MAX_PROVISIONAL_CHANNELS, MAX_PROVISIONAL_FRAMES,
+    MAX_PROVISIONAL_STREAMS, MAX_PROVISIONAL_STREAM_BYTES, PROVISIONAL_TTL, RENEWAL_SERVICE,
 };
 pub use config::{
     RtcConfig, DEFAULT_BUFFERED_AMOUNT_ADVISORY, DEFAULT_ICE_DEADLINE,

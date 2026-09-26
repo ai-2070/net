@@ -28,6 +28,7 @@ const params = new URLSearchParams(location.search);
 const role = params.get('role');
 const anchorUrl = params.get('anchor');
 const game = params.get('game') ?? 'acceptance';
+const lobbyName = params.get('name') ?? 'Acceptance arena';
 const result = { role, done: false, ok: false, steps: [] };
 globalThis.__acceptance = result;
 
@@ -121,7 +122,7 @@ async function run() {
     const lobby = await createLobby({
       node,
       game,
-      name: 'Acceptance arena',
+      name: lobbyName,
       capacity: 4,
       definition: room,
       initialState: { seats: {} },
@@ -136,16 +137,45 @@ async function run() {
     });
     step('lobby', { code: lobby.code });
     result.code = lobby.code;
+    if (params.get('wait') === '0') {
+      result.ok = true;
+      return;
+    }
     await until('a second player seated', () => Object.keys(lobby.host.getState().seats).length >= 1, 120_000);
     step('seated', { seats: lobby.host.getState().seats });
     result.ok = true;
     return;
   }
 
+  if (role === 'isolated') {
+    // A player of ANOTHER game on the same anchor: it must find its own
+    // game's lobby (so its discovery demonstrably works) and never see
+    // the foreign game's — by list or by raw tag — over a window long
+    // enough for several of that host's re-announcements.
+    const foreign = params.get('foreign');
+    let foundOwn = false;
+    let sawForeign = [];
+    const until = Date.now() + 25_000;
+    let ownAt = null;
+    while (Date.now() < until && (ownAt === null || Date.now() - ownAt < 10_000)) {
+      if (!foundOwn) {
+        foundOwn = (await listLobbies({ node, game })).some(entry => entry.name === lobbyName);
+        if (foundOwn) ownAt = Date.now();
+      }
+      const listed = await listLobbies({ node, game: foreign });
+      const tagged = await node.query(`net-lobby:${foreign}`);
+      if (listed.length > 0 || tagged.length > 0) sawForeign.push({ listed: listed.length, tagged: tagged.length });
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    step('watched', { foundOwn, sawForeign: sawForeign.length });
+    result.ok = foundOwn && sawForeign.length === 0;
+    return;
+  }
+
   // join
   const listing = await until('the lobby in the list', async () => {
     const lobbies = await listLobbies({ node, game });
-    return lobbies.find(entry => entry.name === 'Acceptance arena');
+    return lobbies.find(entry => entry.name === lobbyName);
   });
   step('listed', { code: listing.code, host: listing.host });
   const player = await joinLobby({ node, definition: room, game, lobby: listing });

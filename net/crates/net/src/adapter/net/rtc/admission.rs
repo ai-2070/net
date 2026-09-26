@@ -70,6 +70,27 @@ pub fn enroll_reply_channel(origin: u64) -> String {
     format!("net.mesh.enroll.replies.{origin:016x}")
 }
 
+/// Which application a browser session was enrolled for — on a game
+/// anchor, the game. Opaque to the core: the application maps its own ids
+/// to these ([`MeshNode::set_enrollment_tenant_resolver`]) and the core
+/// only compares them. Two sessions whose tenants differ may not exchange
+/// announcements or relayed traffic through this node
+/// ([`tenants_may_meet`]).
+///
+/// [`MeshNode::set_enrollment_tenant_resolver`]: crate::adapter::net::MeshNode::set_enrollment_tenant_resolver
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TenantId(pub u64);
+
+/// May a session with tenant `a` see or reach one with tenant `b`?
+/// Only two DIFFERENT tenants are kept apart: a session without one — a
+/// native peer, another anchor, a dedicated host — meets everyone.
+pub fn tenants_may_meet(a: Option<TenantId>, b: Option<TenantId>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
 /// What a session may exercise (§12), kept beside — never inside —
 /// `PeerTransport`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +119,10 @@ pub enum PeerAdmission {
         /// The session id promotion was bound to. A later session
         /// under the same `node_id` is **not** this one.
         session_id: u64,
+        /// The tenant the enrollment grant named, when the node has a
+        /// tenant resolver and it recognised the grant. Bound to this
+        /// incarnation like everything else here.
+        tenant: Option<TenantId>,
     },
 }
 
@@ -110,6 +135,7 @@ impl Default for PeerAdmission {
         Self::Admitted {
             promoted_at: Instant::now(),
             session_id: 0,
+            tenant: None,
         }
     }
 }
@@ -186,6 +212,15 @@ impl PeerAdmission {
         match self {
             Self::Admitted { session_id, .. } => Some(*session_id),
             Self::Provisional { .. } => None,
+        }
+    }
+
+    /// The tenant this session was enrolled for; `None` while provisional,
+    /// for native sessions, and when no resolver recognised the grant.
+    pub fn tenant(&self) -> Option<TenantId> {
+        match self {
+            Self::Provisional { .. } => None,
+            Self::Admitted { tenant, .. } => *tenant,
         }
     }
 }
@@ -682,6 +717,18 @@ mod tests {
     }
 
     #[test]
+    fn only_two_different_tenants_are_kept_apart() {
+        let (a, b) = (Some(TenantId(1)), Some(TenantId(2)));
+        assert!(tenants_may_meet(a, a));
+        assert!(!tenants_may_meet(a, b));
+        assert!(
+            tenants_may_meet(a, None) && tenants_may_meet(None, b) && tenants_may_meet(None, None)
+        );
+        assert_eq!(PeerAdmission::provisional(Instant::now()).tenant(), None);
+        assert_eq!(PeerAdmission::default().tenant(), None);
+    }
+
+    #[test]
     fn provisional_state_expires_and_admitted_state_does_not() {
         let start = Instant::now();
         let prov = PeerAdmission::provisional(start);
@@ -692,6 +739,7 @@ mod tests {
         let admitted = PeerAdmission::Admitted {
             promoted_at: start,
             session_id: 7,
+            tenant: None,
         };
         assert!(!admitted.is_provisional());
         assert!(!admitted.is_expired(start + PROVISIONAL_TTL * 10));

@@ -92,9 +92,9 @@ const node = await connect({ credentialB64, bootstrapUrl, ...rememberedIdentity(
 - A player is a **browser profile**: clearing site data makes a new player,
   and one person on two devices is two players.
 - A credential is one player's: the anchor refuses it from anyone else.
-- One anchor can serve several games (repeat `--game`), but it does not yet
-  keep one game's players out of another's discovery; run one anchor per game
-  for now.
+- One anchor can serve several games (repeat `--game`), kept apart: a
+  player of one game never discovers, lists or reaches another game's
+  lobbies or players.
 
 > **Building the game before you have an anchor?** `@net-mesh/browser/local`
 > is a mesh inside one page: no anchor, no network, and the real store on top.

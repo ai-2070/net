@@ -26,6 +26,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const dist = join(here, '..', '..', 'browser-ts', 'dist');
 const work = join(here, 'work');
 const GAME = 'acceptance';
+// A second game on the same anchor: its players must not see GAME's lobby.
+const RIVAL = 'rival';
 
 const args = process.argv.slice(2);
 const arg = name => {
@@ -109,6 +111,7 @@ const anchor = spawn(netMesh, [
   '--issuer-identity', issuerFile,
   '--insecure-permissions',
   '--game', GAME,
+  '--game', RIVAL,
   '--game-stats-secs', '1',
   '--output', 'ndjson',
 ], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -146,7 +149,7 @@ try {
   if (!report) throw new Error('the anchor never reported that it was serving');
   log(`anchor ${report.node} at ${anchorUrl}; games ${JSON.stringify(report.games)}`);
   check('the anchor reports its game and credential endpoint',
-    JSON.stringify(report.games) === JSON.stringify([GAME]) && report.credential_endpoint === `${anchorUrl}/credential`,
+    JSON.stringify(report.games) === JSON.stringify([GAME, RIVAL]) && report.credential_endpoint === `${anchorUrl}/credential`,
     `games=${JSON.stringify(report.games)} endpoint=${report.credential_endpoint}`);
 
   browser = await chromium.launch({
@@ -198,6 +201,16 @@ try {
     hostResult.ok && hostResult.steps.some(s => s.name === 'enrolled'), stepsOf(hostResult));
   check('a second player found it in the list, joined and was seated',
     joinResult.ok && joinResult.steps.some(s => s.name === 'sat'), stepsOf(joinResult));
+
+  // Another game on the same anchor sees nothing of this one. The rival
+  // host opens its own lobby so the rival player's discovery is shown to
+  // work (it must find that one) while game A's stays invisible.
+  const rivalHost = await player('rival-host', { role: 'host', game: RIVAL, name: 'Rival arena', wait: '0' });
+  const rivalHostResult = await rivalHost.finished();
+  const rival = await (await player('rival', { role: 'isolated', game: RIVAL, name: 'Rival arena', foreign: GAME })).finished();
+  check("another game's player finds its own lobby but never this game's",
+    rivalHostResult.ok && rival.ok,
+    `rival host: ${stepsOf(rivalHostResult)}; rival player: ${JSON.stringify(rival.steps?.find(s => s.name === 'watched') ?? rival)}`);
 
   const unknown = await (await player('unknown', { role: 'unknown-game' })).finished();
   check('a game the anchor does not admit is refused typed', unknown.ok,
