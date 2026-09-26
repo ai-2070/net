@@ -1,0 +1,26 @@
+net/crates/net/browser-ts/src/store/join.ts
+  s_d8b00bedd146e9::t_f5d6dd8cfb4bf4 674-678,768
+net/crates/net/cli/tests/join_lifecycle.rs
+  s_d8b00bedd146e9::t_1a031010239fbd 97-124,145-146,155,158,163
+net/crates/net/browser-ts/test/store/slow-send.test.ts
+  s_d8b00bedd146e9::t_d9feec1c641d41 1-55,67-72,74-77,79-107
+  s_d8b00bedd146e9::t_19bd8f9508f903 56-66,73,78
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_f0ebff89974ca8 230-234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c5ee88edcd6a200206d7eeee405e88f9503d7b02",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
