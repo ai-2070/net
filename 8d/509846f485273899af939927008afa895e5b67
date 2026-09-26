@@ -1,0 +1,60 @@
+net/crates/net/wire/src/channel/name.rs
+  s_d8b00bedd146e9::t_67de43163cbb55 182-198
+  s_d8b00bedd146e9::t_47ba3e313db86b 466-470,478-480,486-490
+  s_d8b00bedd146e9::t_6ec38c2fa01c85 471-477,481-485
+  s_d8b00bedd146e9::t_d33f46eac98d2a 465
+net/crates/net/leaf/src/stream.rs
+  s_d8b00bedd146e9::t_67de43163cbb55 109,113-115,117
+net/crates/net/sdk-ts/test/store_transport.test.ts
+  s_d8b00bedd146e9::t_aa88f79eaf7235 1-167
+net/crates/net/bindings/node/src/identity.rs
+  s_d8b00bedd146e9::t_b80d12cf2f476d 604-612
+net/crates/net/src/adapter/net/mesh_stream_inbound_tests.rs
+  s_d8b00bedd146e9::t_22b2e41f20276a 1-70,76-103,106,113-115,120-137,142-148,151-158,162,171,175-185,196-209,213-216,222-223
+  s_d8b00bedd146e9::t_6ec38c2fa01c85 71-75,104-105,107-112,116-119,138-141,149-150,159-161,163-170,172-174,186-195,210-212,217-221
+net/crates/net/browser-ts/README.md
+  s_d8b00bedd146e9::t_6454e09c56830c 490-491
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_6454e09c56830c 502-521
+net/crates/net/sdk-ts/src/mesh.ts
+  s_d8b00bedd146e9::t_9f5e27a4a2210b 371-389,641-661
+  s_d8b00bedd146e9::t_a45eab768a8385 662-663
+net/crates/net/sdk-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_6454e09c56830c 15-31
+net/crates/net/bindings/node/src/lib.rs
+  s_d8b00bedd146e9::t_b80d12cf2f476d 1103-1151,1159,2152-2180,2188-2194
+  s_d8b00bedd146e9::t_6ec38c2fa01c85 1152-1158,2181-2187
+  s_d8b00bedd146e9::t_2c4b1b7cd11b19 2195
+net/crates/net/sdk-ts/README.md
+  s_d8b00bedd146e9::t_6454e09c56830c 122-147
+net/crates/net/sdk-ts/src/index.ts
+  s_d8b00bedd146e9::t_9f5e27a4a2210b 119,122-125
+net/crates/net/src/adapter/net/mod.rs
+  s_d8b00bedd146e9::t_6ec38c2fa01c85 241-242,249-250
+net/crates/net/sdk-ts/src/store-transport.ts
+  s_d8b00bedd146e9::t_f780c838759baa 1-149
+net/crates/net/src/adapter/net/mesh.rs
+  s_d8b00bedd146e9::t_2634ee1ff9b03f 2047-2072,2253-2256,12059-12062,14630-14631,27027,31897-31904,31910-31919,33932-33969
+  s_d8b00bedd146e9::t_6ec38c2fa01c85 31905-31909
+  s_d8b00bedd146e9::t_ccd12f6babe1fd 63268-63271
+  s_d8b00bedd146e9::t_8ed015baa62610 33970
+net/crates/net/sdk-ts/src/identity.ts
+  s_d8b00bedd146e9::t_9f5e27a4a2210b 32,452-458
+  s_d8b00bedd146e9::t_4dbb62d09c5e9b 459-460
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8d509846f485273899af939927008afa895e5b67",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
