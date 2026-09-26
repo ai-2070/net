@@ -65,7 +65,7 @@
 //!
 //! [`serve_game_enrollment`] also installs the core's enrollment tenant
 //! resolver: when a visitor is admitted, the core reads the grant's root,
-//! this registry names the game ([`GameRegistry::tenant_of_chain`]), and
+//! this registry names the game (`GameRegistry::tenant_of_chain`, with `webrtc`), and
 //! the session is promoted **for that game**. The anchor then neither
 //! floods nor replays one game's announcements to another game's players
 //! and refuses relayed traffic between them — so a game-B player cannot
