@@ -99,22 +99,48 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     return o === null ? null : now() + o;
   };
 
-  const opening = (async () => {
-    await options.transport.connectPeer?.(host).catch(() => {});
-    const opened = await options.transport.openStream({ reliability: 'fireAndForget', peer: host, label, lossy: true });
-    if (closed) {
-      opened.close();
+  let opening: Promise<void> | null = null;
+  const open = (): Promise<void> => {
+    opening ??= (async () => {
+      await options.transport.connectPeer?.(host).catch(() => {});
+      const opened = await options.transport.openStream({ reliability: 'fireAndForget', peer: host, label, lossy: true });
+      if (closed) {
+        opened.close();
+        return;
+      }
+      stream = opened;
+    })()
+      .catch(() => {})
+      .finally(() => {
+        opening = null;
+      });
+    return opening;
+  };
+
+  // A failed send retires the stream: the session under it may have been
+  // replaced (a reconnect, a relayed → direct upgrade) and a stream handle
+  // is fenced to the session it was opened on. The protocol repeats what
+  // was lost, so reopening is all recovery needs.
+  const send = (frame: Frame<E, I>) => {
+    const current = stream;
+    if (current === null) {
+      void open();
       return;
     }
-    stream = opened;
-  })().catch(() => {});
-
-  const send = (frame: Frame<E, I>) => {
-    if (stream === null) return;
+    const retire = () => {
+      if (stream === current) {
+        stream = null;
+        try {
+          current.close();
+        } catch {
+          // Already unusable.
+        }
+      }
+    };
     try {
-      void Promise.resolve(stream.send(encodeFrame(frame))).catch(() => {});
+      void Promise.resolve(current.send(encodeFrame(frame))).catch(retire);
     } catch {
-      // A lossy send that fails is a lost packet; the protocol repeats.
+      retire();
     }
   };
 
@@ -155,7 +181,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     // a lost input frame is repaired without waiting for the next input.
     if (pending.length > 0) send({ n: label, k: 'i', i: pending.slice(-redundancy) });
   }, pingEvery);
-  void opening.then(() => {
+  void open().then(() => {
     send({ n: label, k: 'h' });
     send({ n: label, k: 'p', t0: now() });
   });

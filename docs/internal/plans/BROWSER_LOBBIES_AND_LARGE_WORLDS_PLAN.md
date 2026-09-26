@@ -458,9 +458,27 @@ a real defect the simulated network could not: the browser node reports an
 event's sender as a DECIMAL u64 and netcode read it as hex, refusing every
 frame; netcode now reads event peers exactly as the store does
 (`peerHexOf`), and the simulator reports decimal like the leaf. **Not yet:**
-a browser-runner witness in CI,
+a CI witness on a DIRECT pair (the runner witness
+`stage7_netcode_predicts_a_ship_and_the_host_applies_every_input_over_the_lossy_channel`
+runs on the ROUTED pair; see the open defect below),
 correction smoothing, extrapolation, binary frames, fragmentation-aware
 snapshot sizing, interest-key integration (today `visible`).
+
+**Open defect (found 2026-09-27) — lossy sends to a direct-upgraded peer.**
+In the runner's Stage 7, run right after the pair goes direct (§8, whose
+reliable store traffic host → player passes), the host's netcode sends to the
+player all failed: the host page's link counters showed
+`admission_refused_unknown_peer` 442 and `lossy_written` 0 (its transport had
+no link for the peer it addressed), the player received nothing on its lossy
+channel, and the host's stream credit then ran out (`backpressure: … the peer
+has not granted more`) because credit is spent before the transport refuses.
+The same code on a routed pair passes, and the acceptance run's (fresh pair)
+passes. To investigate: how a LOSSY packet to a peer is addressed after the
+§9 direct upgrade versus a reliable one (relay entry cleared, link keyed
+differently, or the direct link's answerer side), and whether credit should be
+charged for a packet the transport refuses. Netcode's own recovery (retire and
+reopen a stream on send failure, `lastSendError`) is built and witnessed in
+the simulator; it cannot fix a transport that has no link.
 
 ### What model 2 adds on top
 

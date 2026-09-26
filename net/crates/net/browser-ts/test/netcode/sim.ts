@@ -40,6 +40,9 @@ export function simNetwork(options: SimOptions) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
   const handlers = new Map<string, Set<Handler>>();
+  // Session incarnation per node: a stream is fenced to the incarnation
+  // it was opened under, like the leaf's stale-handle refusal.
+  const incarnation = new Map<string, number>();
   const stats: SimStats = { sent: 0, dropped: 0, delivered: 0 };
 
   function node(id: string): NetcodeTransport {
@@ -48,8 +51,12 @@ export function simNetwork(options: SimOptions) {
       nodeIdHex: () => id,
       openStream: ({ peer, label, lossy }) => {
         let open = true;
+        const openedUnder = incarnation.get(id) ?? 0;
         return {
           send: (payload: Uint8Array) => {
+            if ((incarnation.get(id) ?? 0) !== openedUnder) {
+              throw new Error('session: stale stream handle; reopen the stream');
+            }
             if (!open || peer === undefined) return;
             stats.sent += 1;
             if (lossy && random() < (options.lossRate ?? 0)) {
@@ -79,5 +86,9 @@ export function simNetwork(options: SimOptions) {
       },
     };
   }
-  return { node, stats };
+  /** Replace `id`'s session: every stream it opened before now fails. */
+  const replaceSession = (id: string) => {
+    incarnation.set(id, (incarnation.get(id) ?? 0) + 1);
+  };
+  return { node, stats, replaceSession };
 }

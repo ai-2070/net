@@ -7476,6 +7476,7 @@ jobs:
           stage7_an_unauthorized_write_is_refused_while_the_replica_still_reads
           stage7_a_handle_from_a_replaced_owner_is_refused
           stage7_data_only_use_asks_for_no_media_permission
+          stage7_netcode_predicts_a_ship_and_the_host_applies_every_input_over_the_lossy_channel
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "browser matrix stage 7" --mode literal \
@@ -7485,7 +7486,7 @@ jobs:
             # Floors are PER ENGINE: Chromium runs the store stage,
             # Firefox does not (see the harness step above).
             case "$engine" in
-              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=97; extra="$STAGE7" ;;
+              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=98; extra="$STAGE7" ;;
               firefox)  log="$RUNNER_TEMP/rtcb-firefox.log"; floor=86; extra="" ;;
             esac
             # Prove the parser finds a KNOWN line before believing

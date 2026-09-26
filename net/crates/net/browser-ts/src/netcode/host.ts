@@ -93,6 +93,8 @@ export interface HostNetcode<E> {
   rewind(seen: number): Rewound<E>;
   /** Frames dropped and why. */
   readonly dropped: Readonly<Record<string, number>>;
+  /** The last error a send or stream open raised, for diagnosis; `null` if none. */
+  readonly lastSendError: string | null;
   close(): void;
 }
 
@@ -125,6 +127,7 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
     dropped[why] = (dropped[why] ?? 0) + 1;
   };
   let tick = 0;
+  let lastError: string | null = null;
   let lastTickAt = now();
   let closed = false;
 
@@ -142,7 +145,10 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
             }
             player.stream = stream;
           })
-          .catch(() => drop('stream-open-failed'))
+          .catch(error => {
+            lastError = String((error as Error)?.message ?? error);
+            drop('stream-open-failed');
+          })
           .finally(() => {
             player.opening = false;
           });
@@ -150,10 +156,27 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
       drop('stream-not-open');
       return;
     }
-    try {
-      void Promise.resolve(player.stream.send(encodeFrame(frame))).catch(() => drop('send-failed'));
-    } catch {
+    // A failed send retires the stream: the session under it may have
+    // been replaced (a reconnect, a relayed → direct upgrade), and a stream
+    // handle is fenced to the session it was opened on — every later send
+    // on it would fail too. The next send reopens on the current session.
+    const stream = player.stream;
+    const retire = (error?: unknown) => {
+      lastError = String((error as Error)?.message ?? error);
       drop('send-failed');
+      if (player.stream === stream) {
+        player.stream = null;
+        try {
+          stream.close();
+        } catch {
+          // Already unusable.
+        }
+      }
+    };
+    try {
+      void Promise.resolve(stream.send(encodeFrame(frame))).catch(retire);
+    } catch (error) {
+      retire(error);
     }
   };
 
@@ -261,6 +284,9 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
       return { entities: chosen?.entities ?? {}, time, clamped };
     },
     dropped,
+    get lastSendError() {
+      return lastError;
+    },
     close() {
       if (closed) return;
       closed = true;

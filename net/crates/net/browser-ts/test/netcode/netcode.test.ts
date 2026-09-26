@@ -172,6 +172,30 @@ describe('netcode over a lossy, laggy network', () => {
     host.close();
   });
 
+  it('survives a replaced session mid-game: streams are reopened and every input still lands once', async () => {
+    const net = simNetwork({ latencyMs: 40, lossRate: 0.1 });
+    const { host, ships, applied } = game(net);
+    const alice = player(net, ALICE);
+    await vi.advanceTimersByTimeAsync(1_000);
+    alice.input({ dx: 0 });
+    for (let i = 0; i < 20; i += 1) {
+      if (i === 10) {
+        // A relayed → direct upgrade, say: both ends' handles go stale.
+        net.replaceSession(HOST);
+        net.replaceSession(ALICE);
+      }
+      alice.input({ dx: 1 });
+      await vi.advanceTimersByTimeAsync(33);
+    }
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(ships.get(ALICE)).toEqual({ x: 20, y: 0 });
+    expect(new Set(applied.get(ALICE)).size).toBe(21);
+    expect(alice.view()[ALICE]).toEqual({ x: 20, y: 0 });
+    expect(alice.stats().pendingInputs).toBe(0);
+    alice.close();
+    host.close();
+  });
+
   it("interpolates another player's ship smoothly, a delay behind the host", async () => {
     const net = simNetwork({ latencyMs: 40, lossRate: 0.15, jitterMs: 20 });
     const { host } = game(net);

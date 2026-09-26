@@ -824,6 +824,34 @@ pub enum Step5 {
         /// released: a `leave` is a frame and has to cross first.
         settle_ms: u64,
     },
+    /// `hostNetcode` from `@net-mesh/browser/netcode` on a session: ships
+    /// moved by `{ dx }` inputs, 30 Hz, on the lossy carrier.
+    NetcodeHost {
+        id: u64,
+        session: String,
+        label: String,
+    },
+    /// `joinNetcode` against `host_hex`: send one `{dx: 0}` then `inputs`
+    /// × `{dx: 1}` 33 ms apart, wait for every one to be acknowledged, and
+    /// report what the player saw.
+    NetcodePlay {
+        id: u64,
+        session: String,
+        host_hex: String,
+        label: String,
+        inputs: u32,
+    },
+    /// The netcode host's view: the player's ship, the inputs applied.
+    NetcodeReport {
+        id: u64,
+        session: String,
+        peer_hex: String,
+    },
+    /// Stop the netcode host on a session (its tick loop and sends).
+    NetcodeClose {
+        id: u64,
+        session: String,
+    },
     /// What this page asked of the user's camera and microphone.
     ///
     /// `control` makes the page CALL both media entry points after
@@ -878,6 +906,10 @@ impl Step5 {
             | Self::StoreReconnect { id, .. }
             | Self::StoreCounts { id, .. }
             | Self::StoreClose { id, .. }
+            | Self::NetcodeHost { id, .. }
+            | Self::NetcodePlay { id, .. }
+            | Self::NetcodeReport { id, .. }
+            | Self::NetcodeClose { id, .. }
             | Self::PeerConnect { id, .. }
             | Self::PeerAccept { id, .. }
             | Self::PeerAttempt { id, .. }
@@ -933,6 +965,10 @@ impl Step5 {
             | Self::StoreReconnect { id, .. }
             | Self::StoreCounts { id, .. }
             | Self::StoreClose { id, .. }
+            | Self::NetcodeHost { id, .. }
+            | Self::NetcodePlay { id, .. }
+            | Self::NetcodeReport { id, .. }
+            | Self::NetcodeClose { id, .. }
             | Self::PeerConnect { id, .. }
             | Self::PeerAccept { id, .. }
             | Self::PeerAttempt { id, .. }
