@@ -1,0 +1,119 @@
+name: Release NPM Browser
+
+# Publishes `@net-mesh/browser` (the browser-native leaf package at
+# `browser-ts/`) to npm: idiomatic TypeScript over the `net-mesh-leaf`
+# wasm node, with the leaf's wasm-bindgen output shipped inside `dist/`.
+# A sibling of `@net-mesh/sdk`, never a sub-path of it — its graph has no
+# napi addon, so this workflow never touches `bindings/node`.
+#
+# Tag schema: `npm-browser-v<semver>`.
+#
+# Authentication: npm trusted publishing (OIDC, `id-token: write`) once the
+# package has a trusted publisher configured
+# (`npm trust github @net-mesh/browser --repo ai-2070/net
+#  --file release-npm-browser.yml --allow-publish`). npm only accepts that
+# for a package that already exists, so the FIRST publish needs the
+# `NPM_TOKEN` repository secret (an Automation token, so 2FA does not block
+# CI); the token stays as the fallback until then.
+
+on:
+  push:
+    tags:
+      - "npm-browser-v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Build + publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm trusted publishing (OIDC) and provenance.
+      id-token: write
+    defaults:
+      run:
+        working-directory: net/crates/net/browser-ts
+    steps:
+      - uses: actions/checkout@v7
+
+      # The tag names the version being released; the manifest must agree,
+      # or npm would publish whatever the manifest says under this tag.
+      - name: Gate — the tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/npm-browser-v')
+        run: |
+          want="${GITHUB_REF_NAME#npm-browser-v}"
+          have="$(node -p "require('./package.json').version")"
+          if [ "$want" != "$have" ]; then
+            echo "::error::tag $GITHUB_REF_NAME names $want but package.json is $have"
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Add wasm32 to the pinned toolchain
+        working-directory: net/crates/net/leaf
+        run: |
+          set -o pipefail
+          rustup target add wasm32-unknown-unknown
+          rustup target list --installed | grep -qx wasm32-unknown-unknown || {
+            echo "::error::wasm32-unknown-unknown is not installed for the toolchain this directory selects"
+            exit 1
+          }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: leaf-wasm
+          workspaces: net/crates/net/leaf -> target
+      # Exactly the leaf's pinned `wasm-bindgen = "=0.2.129"`; a mismatched
+      # CLI is a hard error.
+      - name: Install wasm-bindgen-cli 0.2.129
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
+
+      - name: Build the leaf bundle
+        working-directory: net/crates/net/leaf
+        run: |
+          cargo build --release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir pkg \
+            target/wasm32-unknown-unknown/release/net_leaf.wasm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # `npm install`, not `npm ci`: the repo ignores package-lock.json.
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm test
+
+      # `scripts/bundle.mjs` only WARNS when the leaf `pkg/` is missing, so
+      # without this gate a package with no wasm in it would publish green.
+      - name: Verify dist/ carries the entry points and the leaf wasm
+        run: |
+          for f in dist/index.js dist/index.d.ts dist/index.bundle.js \
+                   dist/three/index.js dist/net_leaf.js dist/net_leaf_bg.wasm; do
+            test -f "$f" || { echo "::error::$f missing from the package"; exit 1; }
+          done
+
+      - name: Publish to npm
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          case "$VERSION" in
+            *-*) DIST_TAG="$(printf '%s' "${VERSION#*-}" | cut -d. -f1)" ;;
+            *)   DIST_TAG="latest" ;;
+          esac
+          echo "Publishing $VERSION with npm dist-tag: $DIST_TAG"
+          npm publish --access public --provenance --tag "$DIST_TAG"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
