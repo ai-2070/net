@@ -659,7 +659,25 @@ of its current region and its neighbours.
 2. **Client world view.** `joinWorld({ node, world, position })` keeps replicas
    of the current region plus neighbours (with interest inside each) and exposes
    one merged view to `bindEntities`.
-3. **Entity handoff — at-most-once with a typed failure (Q6).** A freezes the
+3. **Entity handoff — at-most-once with a typed failure (Q6).** *Protocol
+   done and simulated (2026-09-27):* `@net-mesh/browser/world`
+   (`src/world/handoff.ts`), pure steps over each region's persisted state.
+   A freezes the entity into `outgoing` and offers it under a handoff id. B
+   decides each id once (`handled`) and answers every repeat identically. A
+   drops the frozen copy on `accept` and restores it only on an explicit
+   `refuse`. With no answer, A keeps offering, then reports `unresolved`
+   after `giveUpMs` while keeping the entity frozen. `reofferHandoff`
+   resumes it under the same id. Durability-before-send is the stated
+   contract, and `handledRetentionMs > giveUpMs` is enforced. The
+   deterministic simulation (`test/world/handoff.test.ts`) runs 300 seeds
+   with three hosts, 20% loss, duplication, reordering, and crashes both
+   between persist and send and longer than give-up. It checks after every
+   event that no entity is live in two regions and no id is admitted twice,
+   and at the end that every entity is live exactly once. Mutations that
+   unfreeze on give-up, or make the target forget its decisions, fail it.
+   **Next:** the transport (host-to-host over the mesh), and wiring it into
+   a region store's persisted document.
+   Original design: A freezes the
    entity at a fenced epoch and sends its state to B; B admits it and becomes
    authoritative; late inputs to A are forwarded or refused typed, never applied
    twice. **A failed handoff re-joins the player to B from persisted state**

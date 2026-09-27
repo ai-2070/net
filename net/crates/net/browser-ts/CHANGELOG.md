@@ -18,6 +18,18 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **`@net-mesh/browser/world`: at-most-once entity handoff between region
+  hosts** (plan §9). Pure steps over a region's persisted state: `beginHandoff`
+  freezes an entity and offers it; `onHandoffOffer` decides each handoff id
+  once and answers every repeat the same way; `onHandoffReply` settles, and
+  only an explicit refusal brings the entity back; `retryHandoffs` re-offers
+  and, after `giveUpMs`, reports `unresolved` while keeping it frozen;
+  `reofferHandoff` resumes it; `locate` answers where an entity is.
+  **Contract:** make each step's state durable before sending its messages.
+  A deterministic simulation (300 seeds, with loss, duplication, reordering
+  and host crashes) finds no entity ever live twice and no id admitted twice.
+  Transport and region discovery come next.
+
 - **Netcode: interest keys.** `hostNetcode({ interest: (id, entity) => key })`
   and `joinNetcode({ interest: keys })` / `setInterest(keys)`: a player
   receives only the entities under the keys it named. An entity keyed `null`

@@ -25,6 +25,10 @@
     "./netcode": {
       "types": "./dist/netcode/index.d.ts",
       "default": "./dist/netcode/index.js"
+    },
+    "./world": {
+      "types": "./dist/world/index.d.ts",
+      "default": "./dist/world/index.js"
     }
   },
   "sideEffects": false,
