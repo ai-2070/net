@@ -61,7 +61,6 @@ struct NodeState {
     /// Current status
     status: NodeStatus,
     /// Node address
-    #[allow(dead_code)]
     addr: PeerAddr,
     /// Total heartbeats received
     total_heartbeats: u64,
@@ -315,6 +314,42 @@ impl FailureDetector {
     /// shard lock.
     pub fn heartbeat(&self, node_id: u64, addr: PeerAddr) {
         self.heartbeat_for_incarnation(node_id, addr, 0);
+    }
+
+    /// Liveness evidence from ordinary AUTHENTICATED traffic: a
+    /// [`Self::heartbeat_for_incarnation`], but only when this node's
+    /// record is at least `min_interval` old, or not `Healthy`, or
+    /// under a different incarnation or address.
+    ///
+    /// A peer that never sends heartbeats — a browser leaf — is still
+    /// alive while its authenticated packets arrive. Without this, the
+    /// detector declared every such peer failed `timeout ×
+    /// miss_threshold` after it connected and evicted it, however busy
+    /// it was. The caller must have verified the packet (AEAD and the
+    /// replay window) first: an unauthenticated datagram is not
+    /// evidence, for the same reason the heartbeat path verifies before
+    /// it records.
+    ///
+    /// Checked under the shard's read lock first, so steady traffic
+    /// costs one read per packet, and a write at most once per
+    /// `min_interval`.
+    pub fn observe_liveness(
+        &self,
+        node_id: u64,
+        addr: PeerAddr,
+        epoch: u64,
+        min_interval: Duration,
+    ) {
+        if let Some(state) = self.nodes.get(&node_id) {
+            if state.status == NodeStatus::Healthy
+                && state.addr == addr
+                && (epoch == 0 || state.epoch == epoch)
+                && state.last_heartbeat.elapsed() < min_interval
+            {
+                return;
+            }
+        }
+        self.heartbeat_for_incarnation(node_id, addr, epoch);
     }
 
     /// [`Self::heartbeat`], naming the peer INCARNATION the heartbeat
@@ -1191,6 +1226,78 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0], 0x1234);
         assert_eq!(detector.status(0x1234), NodeStatus::Failed);
+    }
+
+    /// A peer that sends no heartbeats but keeps delivering
+    /// authenticated traffic (a browser leaf) stays Healthy through
+    /// `observe_liveness`. Without it, the same schedule reaches
+    /// Failed — the anchor-evicts-browsers-at-90-s bug in miniature.
+    #[test]
+    fn observe_liveness_keeps_a_heartbeatless_peer_healthy() {
+        let config = || FailureDetectorConfig {
+            timeout: Duration::from_millis(100),
+            miss_threshold: 2,
+            suspicion_threshold: 1,
+            cleanup_interval: Duration::from_secs(60),
+        };
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
+
+        let talking = FailureDetector::with_config(config());
+        let silent = FailureDetector::with_config(config());
+        talking.heartbeat_for_incarnation(0x1, addr, 7);
+        silent.heartbeat_for_incarnation(0x1, addr, 7);
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(40));
+            talking.observe_liveness(0x1, addr, 7, Duration::from_millis(10));
+            talking.check_all();
+            silent.check_all();
+        }
+        assert_eq!(talking.status(0x1), NodeStatus::Healthy);
+        assert_eq!(silent.status(0x1), NodeStatus::Failed);
+    }
+
+    /// Steady traffic writes the record at most once per
+    /// `min_interval`; a different incarnation or address, or a peer
+    /// that is not Healthy, is recorded at once.
+    #[test]
+    fn observe_liveness_is_rate_limited_but_not_for_a_change() {
+        let detector = FailureDetector::with_config(FailureDetectorConfig {
+            timeout: Duration::from_millis(100),
+            miss_threshold: 2,
+            suspicion_threshold: 1,
+            cleanup_interval: Duration::from_secs(60),
+        });
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
+        let other: PeerAddr = PeerAddr::Udp("127.0.0.1:9001".parse().unwrap());
+        let beats = || {
+            detector
+                .nodes
+                .get(&0x1)
+                .map(|s| s.total_heartbeats)
+                .unwrap_or(0)
+        };
+
+        detector.observe_liveness(0x1, addr, 7, Duration::from_secs(60));
+        assert_eq!(beats(), 1, "an unknown peer is recorded");
+        for _ in 0..100 {
+            detector.observe_liveness(0x1, addr, 7, Duration::from_secs(60));
+        }
+        assert_eq!(
+            beats(),
+            1,
+            "a fresh, healthy, unchanged record is not rewritten"
+        );
+
+        detector.observe_liveness(0x1, addr, 8, Duration::from_secs(60));
+        assert_eq!(beats(), 2, "a new incarnation is recorded at once");
+        assert_eq!(detector.nodes.get(&0x1).unwrap().epoch, 8);
+        detector.observe_liveness(0x1, other, 8, Duration::from_secs(60));
+        assert_eq!(beats(), 3, "a new address is recorded at once");
+
+        detector.nodes.get_mut(&0x1).unwrap().status = NodeStatus::Suspected;
+        detector.observe_liveness(0x1, other, 8, Duration::from_secs(60));
+        assert_eq!(beats(), 4, "a suspected peer is recorded at once");
+        assert_eq!(detector.status(0x1), NodeStatus::Healthy);
     }
 
     #[test]
