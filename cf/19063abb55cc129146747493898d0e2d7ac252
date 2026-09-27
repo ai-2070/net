@@ -1,0 +1,23 @@
+net/crates/net/browser-ts/scripts/check-package.mjs
+  s_d8b00bedd146e9::t_7b67d935600509 1-41
+.github/workflows/release-npm-browser.yml
+  s_d8b00bedd146e9::t_083e6969c9e9bb 101-105
+net/crates/net/browser-ts/package.json
+  s_d8b00bedd146e9::t_083e6969c9e9bb 59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cf19063abb55cc129146747493898d0e2d7ac252",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
