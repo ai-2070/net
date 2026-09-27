@@ -45,6 +45,12 @@ the README on why it is a sibling package rather than a sub-path.
     `BorderActionError` `refused` (the neighbour said no) or `unresolved`
     (no answer: it may have run, never twice). A simulation over 300 seeds
     with loss, duplication and crashes finds no action applied twice.
+  - **No pop at borders:** `joinWorld`'s `lingerMs` (default 500) keeps an
+    entity that vanished from a held region at its last state until it
+    appears elsewhere. A handoff freezes it at the source before the
+    destination shows it. `handoffLink`'s `refresh` (e.g.
+    `directory.lookup`) re-reads the directory when a destination is unknown
+    or a sender does not match it.
   - **Ghosting:** `regionHandoffs({ ghosting })` mirrors a region's
     entities near a border to the neighbour across it, read-only. Read them
     with `handoffs.ghosts()` / `onGhosts`. A newer frame replaces an older

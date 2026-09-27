@@ -17,7 +17,8 @@ announceRegions(node, 'my-world', ['r:4:7']);            // re-announces every 2
 
 // Moving an entity to the neighbour: at-most-once.
 const directory = regionDirectory({ node, world: 'my-world', trustedHosts: HOST_NODE_IDS });
-const link = handoffLink({ transport, label: 'my-world.handoff', peerOf: directory.peerOf });
+const link = handoffLink({ transport, label: 'my-world.handoff',
+                          peerOf: directory.peerOf, refresh: directory.lookup });
 const handoffs = regionHandoffs({
   link, region: 'r:4:7',
   ...storeRegion(host, { region: 'r:4:7', collection: 'ships', ledger: 'handoff' }),
@@ -56,7 +57,11 @@ await view.act('fire', input);     // goes to the region you are in
 - `view.regions()` shows each region's phase: `looking`, `unhosted`,
   `ambiguous`, `joining`, `ready`, `failed` (retried every `retryMs`).
 - An entity held by two regions at once (mid-handoff) shows once:
-  `positionOf` picks the copy from the region containing it.
+  `positionOf` picks the copy from the region containing it. One that
+  vanishes from a held region lingers at its last state for `lingerMs`
+  (default 500) until it appears elsewhere, so a handoff does not blink.
+- A native (Node) host or player uses `meshStoreTransport(mesh, { listen })`
+  from `@net-mesh/sdk`, which has `announce` / `query` too.
 - **Ghosting:** `regionHandoffs({ ghosting: { size, margin, positionOf } })`
   sends each neighbour this region's entities within `margin` of their shared
   border, read-only. `handoffs.ghosts()` and `onGhosts` give the neighbours'

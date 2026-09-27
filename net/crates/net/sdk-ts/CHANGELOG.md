@@ -16,6 +16,12 @@ install time.
 
 ### Added
 
+- **`meshStoreTransport` discovers too:** `announce(tags)`, which replaces
+  this node's announced tags, and `query(tag)`, which lists the nodes that
+  announced it, in the browser node's descriptor shape. So a native node can
+  host world regions and run `joinWorld`. A descriptor carries only the tag
+  it was found by.
+
 - **`persistStore(host, { file, intervalMs })` / `restoreStore(file,
   definition)`** — a dedicated host's store document, snapshotted to a RedEX
   file and restored on start. A snapshot is written only when the document

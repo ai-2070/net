@@ -73,6 +73,14 @@ export interface HandoffLinkOptions {
    * says it comes from region X is accepted only from `peerOf(X)`.
    */
   peerOf(region: string): string | null;
+  /**
+   * Refresh what `peerOf` knows about a region (e.g. `directory.lookup`).
+   * Called, at most once a second per region, when a message is for a region
+   * `peerOf` cannot place, or from a sender `peerOf` does not name as that
+   * region's host (the directory may be stale). The message itself is still
+   * dropped; the protocol's retry finds the refreshed answer.
+   */
+  refresh?(region: string): unknown;
 }
 
 /** The running link. */
@@ -131,6 +139,18 @@ export function handoffLink<E>(options: HandoffLinkOptions): HandoffLink<E> {
     dropped[reason] = (dropped[reason] ?? 0) + 1;
   };
   let closed = false;
+  const refreshedAt = new Map<string, number>();
+  const refresh = (region: string) => {
+    if (options.refresh === undefined) return;
+    const at = Date.now();
+    if (at - (refreshedAt.get(region) ?? -Infinity) < 1_000) return;
+    refreshedAt.set(region, at);
+    try {
+      void Promise.resolve(options.refresh(region)).catch(() => undefined);
+    } catch {
+      // A failing refresh leaves the directory as it was.
+    }
+  };
 
   const retire = (peer: string, stream: { close(): unknown }) => {
     if (streams.get(peer) === stream) streams.delete(peer);
@@ -199,6 +219,7 @@ export function handoffLink<E>(options: HandoffLinkOptions): HandoffLink<E> {
     const expected = options.peerOf(body.from);
     if (sender === null || expected === null || peerHexOf(expected) !== sender) {
       drop('unauthenticated');
+      refresh(body.from);
       return;
     }
     for (const handler of [...handlers]) handler(body);
@@ -211,6 +232,7 @@ export function handoffLink<E>(options: HandoffLinkOptions): HandoffLink<E> {
       const hex = peer === null ? null : peerHexOf(peer);
       if (hex === null) {
         drop('unknown-region');
+        refresh(message.to);
         return;
       }
       deliver(hex, encoder.encode(JSON.stringify({ n: label, b: message.body })));

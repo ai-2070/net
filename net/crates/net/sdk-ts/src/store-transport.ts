@@ -72,8 +72,27 @@ export interface MeshStoreTransport {
     lossy?: boolean;
   }): { send(payload: Uint8Array): Promise<void>; close(): void };
   onEvent(handler: (event: StoreTransportFrame) => void): () => void;
+  /**
+   * Discovery, in the browser node's shape, so world and lobby helpers run
+   * on a native node: `announce(tags)` REPLACES this node's announced tags
+   * (`announceCapabilities({ tags })`); `query(tag)` lists the nodes that
+   * announced it (`findNodes({ requireTags: [tag] })`). A descriptor carries
+   * only the tag it was found by, not the node's other tags.
+   */
+  announce(tags: readonly string[]): Promise<void>;
+  query(tag: string): Promise<StoreTransportNode[]>;
   /** Stop receiving on every stream this transport subscribed to. */
   close(): void;
+}
+
+/** A node {@link MeshStoreTransport.query} found, in the browser node's descriptor shape. */
+export interface StoreTransportNode {
+  /** Decimal, as the browser node spells it. */
+  readonly nodeId: string;
+  /** 16 lowercase hex: what peer arguments take. */
+  readonly peerIdHex: string;
+  readonly entityId: null;
+  readonly capabilities: readonly string[];
 }
 
 function hex(id: bigint): string {
@@ -146,6 +165,16 @@ export function meshStoreTransport(mesh: MeshNode, options: MeshStoreTransportOp
         handlers.delete(handler);
       };
     },
+    announce: async tags => {
+      await mesh.announceCapabilities({ tags: [...tags] });
+    },
+    query: async tag =>
+      mesh.findNodes({ requireTags: [tag] }).map(id => ({
+        nodeId: id.toString(10),
+        peerIdHex: hex(id),
+        entityId: null,
+        capabilities: [tag],
+      })),
     close: () => {
       closed = true;
       for (const subscription of subscriptions.values()) subscription.close();

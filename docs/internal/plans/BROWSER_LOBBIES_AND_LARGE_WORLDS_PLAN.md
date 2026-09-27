@@ -701,8 +701,24 @@ of its current region and its neighbours.
    neighbour the entities within `margin` of their shared edge, corners
    included, each round and empty when none, so leaving clears. Receivers
    keep the newest `seq` per neighbour and expire a silent one. Tested on
-   the local mesh (appear, follow, clear, expire). **Next:** item 6 (load
-   balancing) and the acceptance world across native hosts.
+   the local mesh (appear, follow, clear, expire).
+   **Acceptance, on native hosts — passed (2026-09-27):**
+   `sdk-ts/test/world_acceptance.test.ts` runs two native region hosts that
+   persist to RedEX, and a native player watching through `joinWorld`.
+   - A ship crosses the border with no pop and no duplicate at any view
+     change. That needed `joinWorld`'s `lingerMs`: the source freezes the
+     ship before the destination shows it, and without the linger the view
+     blinked; a mutation removing it fails the test.
+   - Then the destination is killed mid-handoff. The source reports a typed
+     `unresolved` with the ship frozen and nowhere live. The destination
+     restarts from its RedEX snapshot, the re-offer lands the ship exactly
+     once, and there are two admissions in total.
+
+   Getting there added `meshStoreTransport` `announce`/`query` (native
+   discovery) and `handoffLink`'s `refresh`: the link authenticated against
+   a directory cache the destination had never filled, so every offer was
+   dropped. **Next:** item 6 (load balancing: split/merge with daemon
+   placement); a browser run of the same world.
    Original design: A freezes the
    entity at a fenced epoch and sends its state to B; B admits it and becomes
    authoritative; late inputs to A are forwarded or refused typed, never applied

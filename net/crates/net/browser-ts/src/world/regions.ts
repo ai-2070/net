@@ -191,6 +191,15 @@ export interface JoinWorldOptions<S extends object, A extends ActionSpec, I exte
   readonly positionOf?: (entity: unknown) => { readonly x: number; readonly z: number } | null;
   /** Retry an unhosted or failed region this often, ms. Default 2000. */
   readonly retryMs?: number;
+  /**
+   * How long an entity that vanishes from a region the view still holds
+   * stays in the view at its last state, ms. Default 500. A handoff freezes
+   * an entity at its source before the destination's replica shows it, and
+   * without this it would blink out at the border. It stops lingering as
+   * soon as it appears in any region. `0` disables. Entities of a region
+   * released because the player moved away go at once.
+   */
+  readonly lingerMs?: number;
 }
 
 /** A player's view of a world across regions. */
@@ -234,6 +243,12 @@ export function joinWorld<S extends object, A extends ActionSpec, I extends Inpu
   let position = { x: options.position.x, z: options.position.z };
   let merged: Readonly<Record<string, E>> = {};
   let closed = false;
+  const lingerMs = Math.max(0, options.lingerMs ?? 500);
+  // Where each entity in `merged` came from, and entities lingering after
+  // vanishing from a held region: their last state and when they vanished.
+  let origin = new Map<string, string>();
+  const lingering = new Map<string, { entity: E; region: string; since: number }>();
+  let lingerTimer: ReturnType<typeof setTimeout> | null = null;
 
   const remerge = () => {
     const next: Record<string, E> = {};
@@ -255,6 +270,31 @@ export function joinWorld<S extends object, A extends ActionSpec, I extends Inpu
         from.set(id, region);
       }
     }
+    // Vanished from a region still held: linger. Reappeared anywhere, or its
+    // region released, or its time up: gone from the lingering set.
+    const at = Date.now();
+    for (const [id, region] of origin) {
+      if (from.has(id) || lingering.has(id) || lingerMs === 0) continue;
+      if (held.get(region)?.phase === 'ready') {
+        lingering.set(id, { entity: merged[id] as E, region, since: at });
+      }
+    }
+    let soonest = Infinity;
+    for (const [id, linger] of lingering) {
+      if (from.has(id) || held.get(linger.region)?.phase !== 'ready' || at - linger.since >= lingerMs) {
+        lingering.delete(id);
+        continue;
+      }
+      Object.defineProperty(next, id, { value: linger.entity, enumerable: true, writable: true, configurable: true });
+      soonest = Math.min(soonest, linger.since + lingerMs);
+    }
+    if (lingerTimer !== null) clearTimeout(lingerTimer);
+    lingerTimer = null;
+    if (soonest !== Infinity && !closed) {
+      lingerTimer = setTimeout(remerge, Math.max(0, soonest - at) + 1);
+      (lingerTimer as { unref?: () => void }).unref?.();
+    }
+    origin = from;
     const previous = merged;
     merged = next;
     for (const listener of [...listeners]) {
@@ -370,6 +410,7 @@ export function joinWorld<S extends object, A extends ActionSpec, I extends Inpu
     async close() {
       if (closed) return;
       closed = true;
+      if (lingerTimer !== null) clearTimeout(lingerTimer);
       for (const region of [...held.keys()]) release(region);
       listeners.clear();
     },
