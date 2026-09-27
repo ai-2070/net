@@ -54,6 +54,19 @@ document.
 - CI runs the Rust, Node, Python, and Go suites plus clippy and rustfmt. Every
   job must be green before merge.
 
+### Plans are required for substantial changes
+
+A pull request that adds a feature, a subsystem, a protocol or wire change, a
+new public API, or anything else substantial must include its implementation
+plan, committed in the same pull request as a new file in
+`docs/internal/plans/`, written in the house style described in
+[`docs/internal/plans/README.md`](docs/internal/plans/README.md). Bug fixes,
+refactors, dependency updates and documentation changes do not need one.
+
+If an AI agent writes your change, ask it to write the plan first: *"Read
+`docs/internal/plans/README.md`, write the implementation plan as a new file in house-style
+there."*
+
 Useful local checks before pushing (run from `net/crates/net/`):
 
 ```bash
