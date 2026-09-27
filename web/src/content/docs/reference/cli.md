@@ -170,7 +170,7 @@ Identity `generate/show/fingerprint/revoke` supports `--inspect-target`. Generat
 
 ## Admit browsers for your games
 
-`anchor serve --game <id>` turns a standalone anchor into one browser players can join: it serves enrollment and issues an **anonymous credential per visitor** at `POST <url>/credential` with the body `{"game": "<id>"}`. The reply is `{credentialB64, bootstrapUrl, game}` — what `@net-mesh/browser`'s `openSession()` takes; `requestCredential({ anchorUrl, game })` makes the request for a page.
+`anchor serve --game <id>` turns a standalone anchor into one browser players can join: it serves enrollment and issues an **anonymous credential per visitor** at `POST <url>/credential` with the body `{"game": "<id>"}`. The reply is `{credentialB64, bootstrapUrl, game}` — what `@net-mesh/browser`'s `connect()` takes, together with `rememberedIdentity()` so a returning player is the same node; `requestCredential({ anchorUrl, game })` makes the request for a page. The anchor verbs need a CLI built with the anchor feature: `cargo install net-cli --features rtc-bootstrap`.
 
 ```sh
 net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \

@@ -50,5 +50,32 @@ anchors are configured on the mesh constructor (`subnetExports`,
 failures classify through `classifySubnetError`
 ([reference](/docs/reference/error-codes)).
 
+## Serving browser games from Node
+
+A dedicated game host, a world region host or a netcode host can run in Node and
+serve pages running [`@net-mesh/browser`](/docs/sdk/browser):
+
+- **`meshStoreTransport(mesh, { listen })`** satisfies the browser package's
+  store transport over a `MeshNode`, so `hostStore` / `joinStore`,
+  `hostNetcode` and the world helpers run natively. `listen` names the labels a
+  host must hear before anyone writes (`store/<definition id>`, a netcode label).
+  It also has `announce(tags)` (replaces this node's tags) and `query(tag)`,
+  which lists the nodes that announced a tag, in the browser node's descriptor
+  shape.
+- **`persistStore(host, { file })` / `restoreStore(file, definition)`** snapshot a
+  hosted store's document to a RedEX file (only when it changed, and on
+  `close()`), and restore the newest snapshot that matches the definition's id
+  and version and passes its validator.
+- **`mesh.onStreamData(streamId, handler)`** delivers every event on a stream
+  with `peerNodeId`: the peer whose session authenticated it, which `recv`
+  cannot tell you. One subscription per stream id; `close()` hands the stream
+  back to `recv`.
+- **`streamIdFromLabel(label)`** is the stream id a label names, the same
+  derivation the browser package uses, so a native node and a page that agree
+  on a label open the same stream.
+- **`StreamConfig.lossy`** rides the lossy carrier: a fire-and-forget stream's
+  packets travel on a browser session's unordered, zero-retransmit DataChannel.
+  It is refused with `reliability: 'reliable'`.
+
 The concepts match the other SDKs, while method names, lifecycle, and error shapes
 follow TypeScript and Node.js conventions.

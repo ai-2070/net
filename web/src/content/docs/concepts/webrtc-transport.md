@@ -115,6 +115,19 @@ Two deployment constraints are deliberate and have no override:
 - **CORS is an explicit allow-list with no wildcard**, because the endpoint takes
   a credential. Origin is validated on the trickle WebSocket too.
 
+### Credentials for games
+
+A game cannot hand every visitor an operator-minted credential, so an anchor run
+with `--issuer-identity` and one `--game <id>` per game issues them:
+`POST /credential` with `{"game": "<id>"}` returns a short-lived anonymous
+credential for that game (`requestCredential()` in the package). Each game has
+its own enrollment root derived from the issuer key, and a credential's invite
+binds to the first browser identity that enrolls with it: that identity may
+reconnect with it, and any other is refused. Games on one anchor are kept
+apart: the anchor never floods or replays one game's announcements to another
+game's players, and refuses relayed traffic between them. Flags and limits are
+in the [CLI reference](/docs/reference/cli).
+
 ## Direct and routed
 
 Every browser ↔ browser and browser ↔ native pair starts **routed**: the two
@@ -131,6 +144,18 @@ needing it.
 
 That counter **excludes `0x0D02` signalling**, so "flat once direct" is a claim
 about application traffic rather than an artefact of signalling having stopped.
+
+## Two DataChannels
+
+Every connection opens two DataChannels. `net` is ordered and fully
+retransmitted, and everything that assumes delivery rides it. `net-u` is
+unordered with no retransmits, for a stream opened with `lossy: true`: each
+packet arrives promptly or not at all, never delaying anything else, and a
+packet that would queue behind a backed-up buffer is dropped rather than sent
+stale. The packets carry a flag saying which channel they belong on. A peer or
+anchor that opens no `net-u` still receives lossy packets, on `net`. An anchor
+from an older release does not know the second channel, so run the anchor from
+the same release as the package.
 Native ↔ native pairs keep using UDP and the existing hole punch; WebRTC's value
 here is browser reach, not a better path between two native nodes.
 

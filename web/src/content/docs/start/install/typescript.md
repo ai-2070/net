@@ -41,10 +41,14 @@ would fail on a `.node` file. A page uses **`@net-mesh/browser`** instead —
 TypeScript over a WebAssembly leaf, with a WebRTC DataChannel to a native anchor
 and no native binding anywhere in its dependency graph.
 
-It is **not on npm yet**, so it is built from the repository: two commands, listed
-in [Browser SDK](/docs/sdk/browser#build-it), the first of which builds the leaf's
-WebAssembly. Then start at the
-[Browser quickstart](/docs/sdk/browser/quickstart).
+It is on npm from 0.37.0, with the leaf's WebAssembly inside the package:
+
+```bash
+npm install @net-mesh/browser
+```
+
+A page also needs an anchor from the same release to reach the mesh. Start at
+the [Browser quickstart](/docs/sdk/browser/quickstart).
 
 ### Verify it worked
 

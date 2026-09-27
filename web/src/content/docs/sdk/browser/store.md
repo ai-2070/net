@@ -243,6 +243,12 @@ saving.close();   // one last snapshot
 definition and that passes its `state` validator. A snapshot from another version
 is skipped, not migrated: migrations are the application's.
 
+A native node on `meshStoreTransport` can use the discovery helpers too:
+`announce(tags)` replaces the node's announced tags and `query(tag)` lists the
+nodes that announced it, in the browser node's descriptor shape. That is what
+lets a Node process host [world](/docs/sdk/browser/world) regions or run a lobby.
+A descriptor carries only the tag it was found by.
+
 ## The replica handle
 
 ```typescript
@@ -378,6 +384,10 @@ is validated before it is shown; the host id is taken from the signed
 announcement. A code claimed by two nodes is refused (`ambiguous`) rather than
 resolved.
 
+**One lobby per node, and it owns the node's announcement.** `announce` replaces
+a node's tags, so pass any other tags the node should keep announcing as `tags`,
+to `createLobby` while it hosts and to `joinLobby` while it plays.
+
 Capacity and kicks are enforced in front of the game's `authorize`, counted from
 the store's live subscriptions; `lobby.kick(peer)` re-checks every installed
 subscription at once. `lobby.self` is the host's own player (below).
@@ -447,5 +457,7 @@ Three of those carry a disposition worth stating plainly:
 
 ## Next
 
+- [Netcode](/docs/sdk/browser/netcode) — the high-rate half of the same game
+- [World](/docs/sdk/browser/world) — one region per store, across many hosts
 - [Three](/docs/sdk/browser/three) — render the replica's entities
 - [Errors](/docs/sdk/browser/errors) — the node-level taxonomy underneath

@@ -12,13 +12,15 @@ source inspection or tests for the exact mechanism being changed.
 
 > These are skills _about_ Net. They don't install the library — that's [Install](/docs/start/install).
 
-## The two skills
+## The three skills
 
 **`net-event-bus`** — Net as an event bus: pub/sub over the mesh, nRPC request/response (all four shapes — unary, server-streaming, client-streaming, duplex), the MCP bridge (`net-mesh wrap` / `net-mesh mcp serve`), [organization capability auth](/docs/guides/private-capabilities) (`serve_org` / `mesh.org(..).call`, plus the protected streaming verbs `serve_org_streaming` / `call_streaming` / `call_client_stream` / `call_duplex`), the gang-claim scheduler, and the RedEX / CortEX / Dataforts layers on top.
 
 **`net-payments`** — x402-native payments: pricing a capability at discovery, signed quotes, the provider lifecycle engine (quote → verify → settle → bill), the caller-side pay-to-invoke flow, tiered on-chain verification, and spend policy.
 
-Install both or just the one you need. Each is a directory containing a `SKILL.md` plus reference files that load on demand.
+**`net-browser`** — Net in a browser tab with `@net-mesh/browser`: `connect()` vs `openSession()` and one node per origin, the anchor and its game credentials, leaf-to-leaf sessions and streams (including the lossy channel), the networked store and lobbies, netcode (prediction, interpolation), large worlds across region hosts, and `bindEntities` for a Three.js scene.
+
+Install all of them or just the ones you need. Each is a directory containing a `SKILL.md` plus reference files that load on demand.
 
 ## Where skills live
 
@@ -44,7 +46,7 @@ npx skills update -g
 A few flags for when you don't want the prompts:
 
 ```bash
-# both skills, Claude Code
+# every skill, Claude Code
 npx skills add ai-2070/net-claude-skill --skill '*' -a claude-code -g
 # just one skill
 npx skills add ai-2070/net-claude-skill --skill net-payments -g
@@ -97,10 +99,11 @@ ln -s ~/src/net-claude-skill/net-payments ~/.claude/skills/net-payments
 Check the files landed:
 
 ```bash
-ls ~/.claude/skills/net-event-bus/SKILL.md ~/.claude/skills/net-payments/SKILL.md
+ls ~/.claude/skills/net-event-bus/SKILL.md ~/.claude/skills/net-payments/SKILL.md \
+   ~/.claude/skills/net-browser/SKILL.md
 ```
 
-Then restart Claude Code and run `/skills` — **net-event-bus** and **net-payments** should be listed.
+Then restart Claude Code and run `/skills` — **net-event-bus**, **net-payments** and **net-browser** should be listed.
 
 Skills load automatically when a request matches. To see one fire, ask for something Net-shaped:
 

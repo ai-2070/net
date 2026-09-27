@@ -92,7 +92,7 @@ const workers = await node.query('transcribe');
   `capabilities` in `openSession` makes a new leader re-announce them for you.
 - `call` is nRPC and resolves the reply. It rejects with a typed `RpcError` —
   `rpc-refused`, `rpc-timeout`, `session-lost`, `leader-lost`,
-  `rpc-malformed` — and **never retries silently**. A call whose session or
+  `rpc-indeterminate`, `rpc-malformed` — and **never retries silently**. A call whose session or
   leader went away is surfaced so the caller decides.
 - `query` resolves parsed descriptors. `nodeId` is **decimal**;
   `peerIdHex(descriptor.nodeId)` is the 16-hex spelling `connectPeer` takes.
@@ -113,6 +113,15 @@ typo into a compile error.
 
 `reliable` retransmits and reorders by `seq`. `fireAndForget` does neither, which
 is the point of it: a dropped frame stays dropped and the consumer sees the gap.
+
+**A lossy stream** — `openStream({ reliability: 'fireAndForget', lossy: true })` —
+rides a second, unordered DataChannel with no retransmits, for high-rate state
+where only the newest value matters (positions, inputs). Each packet arrives
+promptly or not at all, and none delays anything else; one that would queue
+behind a backed-up buffer is dropped instead. `lossy: true` with `'reliable'`
+throws, and it is `connect()`-only: a session refuses it. A peer or anchor that
+opens no lossy channel still gets the packets, on the reliable one.
+[Netcode](/docs/sdk/browser/netcode) is built on it.
 
 A stream is identified by **`(peer, streamId)`**, not by its id alone — a stream
 id is an application label scoped to a session, so the same label against two

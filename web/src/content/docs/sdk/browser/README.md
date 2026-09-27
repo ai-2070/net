@@ -1,6 +1,6 @@
 ---
 title: Browser
-description: "Run a Net node in a browser tab over a WebRTC DataChannel — connect or openSession, a networked store, and a Three.js scene binding."
+description: "Run a Net node in a browser tab over a WebRTC DataChannel — connect or openSession, a networked store, netcode, large worlds, and a Three.js scene binding."
 ---
 
 # Browser SDK
@@ -80,7 +80,8 @@ Two shapes come out of that one build, and either is fine:
 - serve `dist/` and `import { connect } from '/browser/index.js'` — the entry
   imports its siblings with explicit `.js` specifiers, so no bundler or import
   map is involved;
-- map the single file `dist/index.bundle.js`.
+- map the single file `dist/index.bundle.js` (also the `@net-mesh/browser/bundle`
+  export, typed like the root entry).
 
 Either way the wasm is fetched **relative to the entry point**, so the `pkg/`
 output has to sit beside it. Override the lookup with `connect({ wasmUrl })`, a
@@ -106,13 +107,21 @@ follower the work happens in another tab: `counters()`, `isEnrolled()` and
 `openStream()`. Everything else — nRPC, channels, streams, announcements,
 queries, enrollment — has the same shape and the same typed errors on both.
 
+**Games use `connect()`.** The store's joiner needs a direct session with its
+host, the lossy DataChannel netcode rides is refused on a follower's session,
+and a store over a proxied session is not established. A game page is
+deliberately the one node: `connect()` with `rememberedIdentity()`, so a
+returning player is the same node.
+
 ## Follow the path
 
 1. [Quickstart](/docs/sdk/browser/quickstart) — build it, connect, call, close
 2. [Session](/docs/sdk/browser/session) — one node per origin, and its lifecycle
 3. [Store](/docs/sdk/browser/store) — an authoritative document served to replicas
-4. [Three](/docs/sdk/browser/three) — bind a store's entities to a scene graph
-5. [Errors](/docs/sdk/browser/errors) — the typed taxonomy, and `udp-blocked`
+4. [Netcode](/docs/sdk/browser/netcode) — prediction, interpolation, the lossy channel
+5. [World](/docs/sdk/browser/world) — regions across hosts, and border handoff
+6. [Three](/docs/sdk/browser/three) — bind a store's entities to a scene graph
+7. [Errors](/docs/sdk/browser/errors) — the typed taxonomy, and `udp-blocked`
 
 ## The store and the scene binding
 
@@ -124,6 +133,8 @@ and a subpath binds the entities to a scene graph.
 import { defineStore, hostStore, joinStore, hostPlayer } from '@net-mesh/browser';
 import { bindEntities } from '@net-mesh/browser/three';
 import { createLocalMesh } from '@net-mesh/browser/local';   // offline development
+import { hostNetcode, joinNetcode } from '@net-mesh/browser/netcode';
+import { joinWorld, regionHandoffs } from '@net-mesh/browser/world';
 ```
 
 `hostPlayer` is the hosting node's own player, with the same handle shape as a
@@ -134,3 +145,8 @@ anchor, for building game logic before there is a network.
 anything with `add` and `remove`, and the types are structural — so the package
 gains no renderer dependency. See [Store](/docs/sdk/browser/store) and
 [Three](/docs/sdk/browser/three).
+
+`@net-mesh/browser/netcode` carries high-rate movement over the lossy channel,
+with prediction and interpolation: [Netcode](/docs/sdk/browser/netcode).
+`@net-mesh/browser/world` spreads a map over region hosts and moves entities
+across borders at most once: [World](/docs/sdk/browser/world).
