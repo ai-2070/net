@@ -1,0 +1,21 @@
+net/crates/net/docs/releases/RELEASE_v0.37_TURBO_LOVER.md
+  s_d8b00bedd146e9::t_36270af98bdd84 264
+web/src/content/docs/releases/RELEASE_v0.37_TURBO_LOVER.md
+  s_d8b00bedd146e9::t_c17af4edbc1379 268
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c37e7952c233cf810a73cd187929bdd342d9a102",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
