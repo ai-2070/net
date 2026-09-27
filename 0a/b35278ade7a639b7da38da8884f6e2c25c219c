@@ -1,0 +1,19 @@
+net/crates/net/sdk-ts/test/world_acceptance.test.ts
+  s_d8b00bedd146e9::t_d1645e395a6db8 35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0ab35278ade7a639b7da38da8884f6e2c25c219c",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
