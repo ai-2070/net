@@ -1,6 +1,7 @@
 /**
- * `@net-mesh/browser/world` — large worlds across region hosts (browser
- * plan §9). So far: at-most-once entity handoff between regions.
+ * `@net-mesh/browser/world` — large worlds across region hosts: regions and
+ * their directory, a player's merged view (`joinWorld`), at-most-once entity
+ * handoff between region hosts, cross-border actions, and ghosting.
  */
 
 export {

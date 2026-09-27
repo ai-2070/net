@@ -4,7 +4,8 @@
  * ```typescript
  * import { connect, isUdpBlocked } from '@net-mesh/browser';
  *
- * const node = await connect({ credentialB64, bootstrapUrl: 'https://anchor.example/rtc/bootstrap' });
+ * // `bootstrapUrl` is the anchor's base URL (the credential carries one).
+ * const node = await connect({ credentialB64, bootstrapUrl: 'https://anchor.example' });
  * await node.announce(['transcribe']);
  * const reply = await node.call('summarise', new TextEncoder().encode('…'), 5_000);
  * ```

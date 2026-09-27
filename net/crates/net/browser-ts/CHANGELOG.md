@@ -14,7 +14,10 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
-## Unreleased
+## 0.37.0 — the first npm release
+
+Everything in this file ships in 0.37.0, the package's first release on npm.
+This section is what landed last; the section after it is the initial surface.
 
 ### Added
 
@@ -211,7 +214,7 @@ the README on why it is a sibling package rather than a sub-path.
   discovery code runs offline. For building game logic first;
   the demo's `demo/local-mesh.js` is replaced by it.
 
-## Unreleased — targets 0.36.0
+## The initial surface (developed for 0.36, first published in 0.37.0)
 
 ### Added
 

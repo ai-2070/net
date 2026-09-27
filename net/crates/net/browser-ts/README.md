@@ -42,8 +42,8 @@ npx skills add ai-2070/net-claude-skill -g     # drop -g to install for this pro
 ```
 
 The `net-browser` skill in that set covers this package end to end: connecting,
-hosting and joining a world, inputs vs actions, hidden information, the Three.js
-binding, and every error code. Ask for what you want in plain words — *"make
+hosting and joining a world, inputs vs actions, hidden information, netcode,
+worlds across region hosts, the Three.js binding, and every error code. Ask for what you want in plain words — *"make
 this a two-player game where one player hosts"* — and the agent will use it.
 
 To let the agent read Net's actual source instead of guessing, add
@@ -391,8 +391,38 @@ Everything rides a **lossy stream** (`openStream({ reliability:
 'fireAndForget', lossy: true })`): unordered, no retransmits, so one lost
 packet never delays the next. Shooting games get lag compensation:
 `host.rewind(input.seen)` returns the world as the shooter saw it, capped at
-200 ms so faking lag gains nothing. Keep snapshots small (filter with
-`visible`); corrections snap rather than smooth for now.
+200 ms so faking lag gains nothing. A correction blends in over
+`correctionSmoothingMs` (100 ms by default) instead of snapping, and each
+player can ask for only nearby entities with `interest` keys. A snapshot too
+big for one message is sent in chunks, so one lost packet costs a few
+entities for one tick, not the whole frame.
+
+## Worlds bigger than one host
+
+`@net-mesh/browser/world` cuts the map into regions (`r:<x>:<z>` squares), each
+its own store on whichever host announces it. A player holds the regions
+around it and sees them as one world:
+
+```js
+import { joinWorld } from '@net-mesh/browser/world';
+
+const world = joinWorld({
+  node, world: 'my-world', definition: region, collection: 'ships',
+  position: { x, z }, size: 256, key: 'player', maxEventBytes: 8104,
+  trustedHosts: HOSTS, positionOf: ship => ship,
+});
+bindEntities({ store: world, select: ships => ships, scene, binding });
+world.setPosition(x, z);            // regions come and go as you move
+await world.act('fire', target);    // goes to the region you are in
+```
+
+Region hosts, usually dedicated Node processes, move an entity across a border
+**at most once**. It is frozen at the source, offered, and admitted once by the
+destination; a crash leaves it frozen and reported, never duplicated. The
+region hosts can also ask a neighbour to act on something it owns, and mirror
+their border entities to it read-only. The
+[world docs](https://ai2070.net/docs/sdk/browser/world) walk through a region
+host.
 
 ## Reacting to players: one hook
 
@@ -614,6 +644,8 @@ share one connection. See the [Browser SDK docs](https://ai2070.net/docs/sdk/bro
 
 - [Browser quickstart](https://ai2070.net/docs/sdk/browser/quickstart) — connecting, step by step
 - [The store](https://ai2070.net/docs/sdk/browser/store) — hosting, joining, audiences, every option
+- [Netcode](https://ai2070.net/docs/sdk/browser/netcode) — prediction, interpolation, lag compensation
+- [Worlds](https://ai2070.net/docs/sdk/browser/world) — regions, region hosts, handoff across borders
 - [Three.js](https://ai2070.net/docs/sdk/browser/three) — the binding in depth, and disposing resources properly
 - [Errors](https://ai2070.net/docs/sdk/browser/errors) — every error and what to do about it
 - [The demo](https://github.com/ai-2070/net/tree/master/net/crates/net/browser-ts/demo) — a small playable game using all of the above

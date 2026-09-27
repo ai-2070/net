@@ -17,12 +17,12 @@
  * browser identity that enrolls with it, and that identity may reconnect
  * with it for the credential's lifetime (a promoted leader tab does).
  *
- * **Who the player is.** The identity is the one `openSession()` keeps
- * for this origin (in IndexedDB, under a key the page cannot export) — so
- * one player per **browser profile**: clearing site data makes a new
- * player, and the same person on two devices is two players. A bare
- * `connect()` without `entitySecretHex` makes a new identity every page
- * load; use `openSession()` for a player who comes back.
+ * **Who the player is.** A game connects with `connect()` (stores, lobbies
+ * and the lossy channel need it) and keeps its player with
+ * `rememberedIdentity()`, which stores the identity in this origin's
+ * `localStorage`: one player per **browser profile**. Clearing site data
+ * makes a new player, and the same person on two devices is two players.
+ * A bare `connect()` without it makes a new identity every page load.
  */
 
 /** {@link requestCredential}'s argument. */
