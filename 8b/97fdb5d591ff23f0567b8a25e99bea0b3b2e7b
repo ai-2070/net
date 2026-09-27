@@ -1,0 +1,22 @@
+docs/internal/plans/BLTP_BINDINGS_PLAN.md
+  h_64425bc75e3f3d 1-515
+docs/internal/plans/BLTP_OPTIMIZATIONS_PLAN.md
+  h_64425bc75e3f3d 1-566
+docs/internal/plans/PHASE3_PLAN.md
+  h_64425bc75e3f3d 1-497
+docs/internal/plans/PHASE4_PLAN.md
+  h_64425bc75e3f3d 1-1261
+docs/internal/plans/UDP_ADAPTER_PLAN.md
+  h_64425bc75e3f3d 1-1018
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8b97fdb5d591ff23f0567b8a25e99bea0b3b2e7b",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
