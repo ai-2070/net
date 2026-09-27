@@ -1453,6 +1453,55 @@ impl RoutingTable {
         });
     }
 
+    /// Keep `peer`'s own authenticated direct route fresh: the PROTECTED
+    /// candidate for destination `peer` whose bound identity is `peer`
+    /// itself — the one [`crate::adapter::net::NetRouter::add_direct_route`]
+    /// installs when a session with that peer comes up.
+    ///
+    /// Called for every AUTHENTICATED packet that peer's session
+    /// delivers. The candidate is stamped once, at install, and ages
+    /// out at `max_route_age`; a native peer's pingwaves keep it
+    /// fresh, but a browser leaf sends none, so its route expired
+    /// `3 × session_timeout` after it connected and relayed traffic to
+    /// it was silently dropped at the route lookup.
+    ///
+    /// A pure freshness refresh, and deliberately narrow:
+    /// - only `updated_at` moves, so no transition token is issued (see
+    ///   the `token` field doc);
+    /// - a deactivated candidate stays deactivated — unlike
+    ///   [`Self::activate_route`], this does not override a deliberate
+    ///   [`Self::deactivate_route`];
+    /// - the ordinary (unauthenticated) candidate is not touched, and
+    ///   neither is a protected candidate bound to anyone else.
+    ///
+    /// Read first; the entry is written at most once per
+    /// `min_interval`. Returns whether it refreshed.
+    pub fn refresh_authenticated_adjacency(
+        &self,
+        peer: u64,
+        min_interval: std::time::Duration,
+    ) -> bool {
+        let is_own = |e: &RouteEntry| e.active && e.next_hop_id == Some(peer);
+        let stale = self.routes.get(&peer).is_some_and(|d| {
+            d.protected
+                .as_ref()
+                .is_some_and(|e| is_own(e) && e.updated_at.elapsed() >= min_interval)
+        });
+        if !stale {
+            return false;
+        }
+        match self.routes.get_mut(&peer) {
+            Some(mut d) => match d.protected.as_mut() {
+                Some(e) if is_own(e) => {
+                    e.updated_at = Instant::now();
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
     /// Reactivate a destination's candidates
     pub fn activate_route(&self, dest_id: u64) {
         self.mutate(dest_id, |d| {
@@ -1897,6 +1946,83 @@ mod tests {
         let e = table.protected_of(DEST).expect("candidate present");
         assert_eq!(e.next_hop_id, Some(A));
         assert_eq!(e.next_hop, via_a);
+    }
+
+    /// `refresh_authenticated_adjacency` keeps a peer's own direct route
+    /// effective past `max_route_age`, as a browser leaf's traffic must
+    /// (it sends no pingwaves), without issuing a transition token.
+    /// Without the refresh the same route ages out — the relay-drop half
+    /// of the anchor-evicts-browsers-at-90-s bug.
+    #[test]
+    fn refresh_authenticated_adjacency_keeps_the_direct_route_fresh() {
+        use std::time::Duration;
+        let table = RoutingTable::new(0x1111);
+        let via: PeerAddr = PeerAddr::Udp("127.0.0.1:4000".parse().unwrap());
+        const PEER: u64 = 0xB0;
+        table.add_authenticated_route(PEER, via, PEER);
+        table.set_max_route_age(Duration::from_millis(50));
+        let before = table.observe(PEER).expect("installed").token;
+
+        table.backdate(PEER, Duration::from_millis(200));
+        assert_eq!(
+            table.lookup(PEER),
+            None,
+            "precondition: an unrefreshed route ages out"
+        );
+
+        assert!(table.refresh_authenticated_adjacency(PEER, Duration::ZERO));
+        assert_eq!(table.lookup(PEER), Some(via), "refreshed: effective again");
+        assert_eq!(
+            table.observe(PEER).expect("present").token,
+            before,
+            "a freshness refresh is not a transition"
+        );
+
+        // Rate-limited: a fresh entry is not rewritten.
+        assert!(!table.refresh_authenticated_adjacency(PEER, Duration::from_secs(60)));
+    }
+
+    /// The refresh is narrow: it never re-activates a deliberately
+    /// deactivated route (as `activate_route` would), never touches a
+    /// protected candidate bound to another identity, and never touches
+    /// the ordinary candidate.
+    #[test]
+    fn refresh_authenticated_adjacency_touches_only_the_peers_own_live_route() {
+        use std::time::Duration;
+        let table = RoutingTable::new(0x1111);
+        let via: PeerAddr = PeerAddr::Udp("127.0.0.1:4000".parse().unwrap());
+        const PEER: u64 = 0xB1;
+        const OTHER: u64 = 0xB2;
+
+        // Deactivated: stays deactivated, and stays stale.
+        table.add_authenticated_route(PEER, via, PEER);
+        table.deactivate_route(PEER);
+        table.backdate(PEER, Duration::from_millis(200));
+        let stamp = table.protected_of(PEER).expect("present").updated_at;
+        assert!(!table.refresh_authenticated_adjacency(PEER, Duration::ZERO));
+        let e = table.protected_of(PEER).expect("present");
+        assert!(!e.active, "a deactivated route is not revived");
+        assert_eq!(e.updated_at, stamp);
+
+        // A protected route to PEER bound to someone else: untouched.
+        const DEST: u64 = 0xD70;
+        table.add_authenticated_route(DEST, via, OTHER);
+        table.backdate(DEST, Duration::from_millis(200));
+        let stamp = table.protected_of(DEST).expect("present").updated_at;
+        assert!(!table.refresh_authenticated_adjacency(DEST, Duration::ZERO));
+        assert_eq!(table.protected_of(DEST).expect("present").updated_at, stamp);
+
+        // Only an ordinary candidate: nothing to refresh.
+        const PLAIN: u64 = 0xB3;
+        table.add_route(PLAIN, via);
+        table.backdate(PLAIN, Duration::from_millis(200));
+        let stamp = table.ordinary_of(PLAIN).expect("present").updated_at;
+        assert!(!table.refresh_authenticated_adjacency(PLAIN, Duration::ZERO));
+        assert_eq!(table.ordinary_of(PLAIN).expect("present").updated_at, stamp);
+
+        // Unknown destination: no entry is created.
+        assert!(!table.refresh_authenticated_adjacency(0xDEAD, Duration::ZERO));
+        assert!(table.observe(0xDEAD).is_none());
     }
 
     /// PROVENANCE ISOLATION. An unauthenticated writer must not be

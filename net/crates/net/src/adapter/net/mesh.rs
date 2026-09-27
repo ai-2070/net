@@ -125,6 +125,14 @@ const RETRANSMIT_TICK: Duration = Duration::from_millis(25);
 /// down.
 const SHUTDOWN_TASK_JOIN: Duration = Duration::from_secs(2);
 
+/// How often authenticated traffic from a peer may refresh its
+/// failure-detector record and its direct route
+/// (`note_authenticated_liveness`). Far below the 30 s default
+/// `session_timeout`, so a peer that is talking is never close to
+/// expiring; high enough that a busy peer costs a read per packet
+/// rather than a write.
+const LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Max fixed-size control events packed into one batched control
 /// packet, per message type (STREAM_ACK_BATCHING B-2/B-3):
 /// `floor(MAX_PAYLOAD_SIZE / (event-frame length prefix + payload))`.
@@ -29137,7 +29145,9 @@ impl MeshNode {
                         })
                         .filter(|(_, session)| session.session_id() == session_id);
                     if let Some((peer_node_id, session)) = matched {
-                        Self::process_local_packet(parsed, peer_node_id, &session, ctx);
+                        if Self::process_local_packet(parsed, peer_node_id, &session, ctx) {
+                            Self::note_authenticated_liveness(peer_node_id, source, &session, ctx);
+                        }
                         session.touch();
                     }
                 } else {
@@ -29361,7 +29371,9 @@ impl MeshNode {
             return;
         }
 
-        Self::process_local_packet(parsed, peer_node_id, &session, ctx);
+        if Self::process_local_packet(parsed, peer_node_id, &session, ctx) {
+            Self::note_authenticated_liveness(peer_node_id, source, &session, ctx);
+        }
         session.touch();
     }
 
@@ -30259,12 +30271,17 @@ impl MeshNode {
     /// INCARNATION is retired is refused before it is decrypted,
     /// dispatched or reassembled; a frame from a merely inactive
     /// session is processed normally.
+    ///
+    /// Returns `true` when the packet AUTHENTICATED — its AEAD tag
+    /// verified and the replay window admitted its counter — whatever
+    /// its dispatch then did with it. That, and only that, is evidence
+    /// the peer is alive: see [`Self::note_authenticated_liveness`].
     fn process_local_packet(
         mut parsed: ParsedPacket,
         from_node: u64,
         session: &NetSession,
         ctx: &DispatchCtx,
-    ) {
+    ) -> bool {
         if session.is_receive_lifetime_retired() {
             tracing::debug!(
                 session_id = session.session_id(),
@@ -30273,14 +30290,14 @@ impl MeshNode {
                 "dispatch: frame captured under a retired session incarnation \
                  refused"
             );
-            return;
+            return false;
         }
         // Validate payload length
         if !parsed.header.flags.is_handshake()
             && !parsed.header.flags.is_heartbeat()
             && !parsed.is_valid_length()
         {
-            return;
+            return false;
         }
 
         // Decrypt payload. Per crypto-session perf #128, route
@@ -30306,12 +30323,12 @@ impl MeshNode {
         let decrypted = match rx_cipher.decrypt_to_bytes(counter, &aad, payload) {
             Ok(d) => {
                 if !rx_cipher.try_admit_rx_counter(counter) {
-                    return;
+                    return false;
                 }
                 session.note_inbound();
                 d
             }
-            Err(_) => return,
+            Err(_) => return false,
         };
 
         let stream_id = parsed.header.stream_id;
@@ -30319,6 +30336,40 @@ impl MeshNode {
         while let Some(held) = session.take_in_order_frame(stream_id) {
             Self::dispatch_local_packet(held.parsed, held.decrypted, from_node, session, ctx, true);
         }
+        true
+    }
+
+    /// An authenticated packet from `peer` is proof it is alive and
+    /// adjacent. Record it with the failure detector and freshen the
+    /// peer's own direct route.
+    ///
+    /// Native peers keep both fresh with heartbeats and pingwaves. A
+    /// browser leaf sends neither, so without this an anchor declared
+    /// every browser peer failed, and let its direct route to it age
+    /// out, `3 × session_timeout` after it connected — however much it
+    /// was talking — and stopped relaying to it
+    /// (`docs/internal/misc/NET_ISSUE_PEERS_EXPIRE.md`). Both have to
+    /// be refreshed: either expiry alone still cuts the peer off.
+    ///
+    /// Callers pass only packets [`Self::process_local_packet`]
+    /// reported as authenticated. Both refreshes are rate-limited to
+    /// one write per [`LIVENESS_REFRESH_INTERVAL`] per peer, so busy
+    /// traffic costs a read each.
+    fn note_authenticated_liveness(
+        peer: u64,
+        source: PeerAddr,
+        session: &NetSession,
+        ctx: &DispatchCtx,
+    ) {
+        ctx.failure_detector.observe_liveness(
+            peer,
+            source,
+            session.session_id(),
+            LIVENESS_REFRESH_INTERVAL,
+        );
+        ctx.router
+            .routing_table()
+            .refresh_authenticated_adjacency(peer, LIVENESS_REFRESH_INTERVAL);
     }
 
     /// Dispatch one decrypted packet: stream accounting, then the
@@ -63507,6 +63558,10 @@ mod rpc_large_response_lifecycle_tests;
 #[cfg(test)]
 #[path = "mesh_stream_inbound_tests.rs"]
 mod stream_inbound_tests;
+
+#[cfg(test)]
+#[path = "mesh_leaf_liveness_tests.rs"]
+mod leaf_liveness_tests;
 
 #[cfg(all(test, feature = "webrtc"))]
 #[path = "mesh_tenant_tests.rs"]
