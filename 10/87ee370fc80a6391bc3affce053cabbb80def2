@@ -1,0 +1,48 @@
+web/src/content/docs/sdk/browser/errors.md
+  s_d8b00bedd146e9::t_aef7973a590b2f 32-39,151-162
+  s_d8b00bedd146e9::t_515ee4ebcbfefb 163
+web/src/content/docs/reference/cli.md
+  s_d8b00bedd146e9::t_de95ba01c42c58 173
+web/src/content/docs/concepts/webrtc-transport.md
+  s_d8b00bedd146e9::t_de95ba01c42c58 118-130,147-158
+web/src/content/docs/sdk/browser/netcode.md
+  s_d8b00bedd146e9::t_61f38c8dddef8e 1-165
+web/src/content/docs/sdk/browser/store.md
+  s_d8b00bedd146e9::t_38ed97ee3cccbc 246-251,387-390,460-461
+web/src/content/docs/sdk/browser/session.md
+  s_d8b00bedd146e9::t_59b0c8fd208212 45-51,62-95
+  s_d8b00bedd146e9::t_9cdc9aa7799c92 96
+web/src/content/docs/start/claude-skills.md
+  s_d8b00bedd146e9::t_5741f21e41bed8 102-103
+  s_d8b00bedd146e9::t_4e92178d09607f 15,21-23,49,106
+web/src/docs.order.ts
+  s_d8b00bedd146e9::t_d8363a8ead0f26 59,177-179
+web/src/content/docs/sdk/browser/README.md
+  s_d8b00bedd146e9::t_231d0dfddf9dd2 3,83-84,110-115,121-124,136-137,148-152
+web/src/content/docs/sdk/browser/quickstart.md
+  s_d8b00bedd146e9::t_10779ba56ce884 95,117-124
+  s_d8b00bedd146e9::t_13166b584e0ab9 125
+web/src/content/docs/sdk/browser/world.md
+  s_d8b00bedd146e9::t_4f76e2ecd3b440 102
+  s_d8b00bedd146e9::t_f5e20f2d242624 1-101,103-176
+web/src/content/docs/sdk/typescript/README.md
+  s_d8b00bedd146e9::t_fbf5970cc765ce 53-79
+web/src/content/docs/start/install/typescript.md
+  s_d8b00bedd146e9::t_1b0975165f3d39 44-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1087ee370fc80a6391bc3affce053cabbb80def2",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
