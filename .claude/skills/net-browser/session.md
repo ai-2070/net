@@ -13,7 +13,7 @@ const session = await openSession({
 });
 
 // A harness, or a page that is deliberately the one node: THIS TAB's node.
-const node = await connect({ credentialB64, bootstrapUrl: 'https://anchor.example/rtc/bootstrap' });
+const node = await connect({ credentialB64, bootstrapUrl: 'https://anchor.example' });
 ```
 
 | | `connect()` | `openSession()` |
@@ -43,9 +43,13 @@ doing nothing — that is the point of the typed surface.
 ```typescript
 const node = await connect({
   credentialB64,                                    // minted by the anchor
-  bootstrapUrl: 'https://anchor.example/rtc/bootstrap',
+  bootstrapUrl: 'https://anchor.example',           // optional; the credential carries it
 });
 ```
+
+`bootstrapUrl` is the anchor's **base URL**, not an endpoint: the leaf appends
+`/rtc/anchor`, `/rtc/offer` and `/rtc/trickle` itself. A URL that already ends
+in a path (`…/rtc/bootstrap`) points every request at the wrong place.
 
 `credentialB64` is issued by the anchor (`net-mesh anchor credential mint`,
 `net-mesh anchor credential inspect`) and is **signed and secret-bearing**; the
@@ -163,6 +167,20 @@ for await (const bytes of stream) consume(bytes);   // ends when the node or str
   a routed pair upgrades to direct, `send` on the old handle rejects with
   `session` ("stale stream handle … reopen the stream"). Reopen with the same
   `peer` and `streamId` rather than assuming continuity.
+- **`lossy: true` rides a second, unordered DataChannel with no retransmits**
+  (`openStream({ reliability: 'fireAndForget', peer, label, lossy: true })`).
+  A packet arrives promptly or not at all, and none delays anything else: use it
+  for positions and inputs, where only the newest value matters. The rules:
+  - It is valid **with `'fireAndForget'` only**; with `'reliable'` it throws.
+  - It is available on **`connect()` only**; a `MeshSession`'s `openStream`
+    refuses it.
+  - A packet that would queue behind a backed-up buffer is dropped (and
+    counted), never queued.
+  - A peer or anchor that opens no lossy channel still gets the packets, on
+    the reliable one. The anchor must be the same release, since an older one
+    does not know the second channel.
+
+  Netcode (`netcode.md`) is built on it.
 - **Size limits.** A leaf fragments up to 8 pieces / 64 832 B and refuses above
   that with a typed `wire` error naming streams. A peer that does not advertise
   fragment reassembly is refused at the ordinary event bound.

@@ -39,6 +39,20 @@ const net = hostNetcode<Ship, Move>({
   player saw them when they acted (`seen` is the host time they were
   rendering). It never goes further back than `maxRewindMs` (default 200 ms),
   so faked lag buys nothing; `clamped` says when the cap applied.
+- **Host options beyond the example:** `maxFrameBytes` (default 8000, see
+  below), `playerTimeoutMs` (default 5000: a player silent that long is
+  dropped), `autoTick: false` to drive the loop yourself with `net.tick()`
+  (default `true`, at `tickRate`, default 30), and `now` for a test clock.
+- **Host handle:** `players()` (16-hex ids now connected), `currentTick`,
+  `tick()`, `rewind(seen)`, `dropped` (frames refused, by reason:
+  `unauthorized`, `no-authenticated-peer`, `unexpected-frame`,
+  `stream-not-open`, `stream-open-failed`, `send-failed`), `lastSendError` (the
+  last send/open error text, or `null`), and `close()`.
+- **`visible` is the permission, `interest` is only a filter.** `visible(peer,
+  id, entity)` decides what a player may see at all. `interest(id, entity)`
+  keys each entity (return `null` for "always delivered"), and a player that
+  stated interest keys then receives only the visible entities under them. A
+  player that stated none receives everything `visible` allows.
 - A dedicated host (Node) uses `meshStoreTransport(mesh, { listen: [label] })`
   from `@net-mesh/sdk`. Its store document survives a restart with
   `persistStore(host, { file })` and `restoreStore(file, definition)` (a RedEX
@@ -64,8 +78,19 @@ function frame() { draw(net.view()); requestAnimationFrame(frame); }
 - `view()` = everyone else interpolated at `hostNow − interpolationDelayMs`,
   your entity predicted. `predict` must be the host's own rule, or every
   snapshot corrects you (`stats().corrections` counts it).
-- `stats()`: `clock` (`offsetMs`, `rttMs`, `jitterMs`), snapshots, late
-  (reordered) snapshots, pending inputs, corrections.
+- `stats()`: `clock` (`offsetMs`, `rttMs`, `jitterMs`, `samples`, or `null`
+  before the first pong), `snapshots`, `lateSnapshots` (reordered),
+  `pendingInputs`, `corrections`, `partialSnapshots`.
+- `hostNow()`: the host clock as estimated (`null` before the first pong);
+  `close()` stops the pings and the stream.
+- **Player options beyond the example:** `inputRedundancy` (default 8:
+  unacknowledged inputs repeated in each input frame), `pingRate` (clock
+  pings per second, default 4), `correctionSmoothingMs`, `extrapolateMs`,
+  `interpolate`, `now`.
+- **Interest:** `interest` (at join) and `net.setInterest(keys)` (later) name
+  the keys to receive. Both throw `RangeError` over 256 keys, or for a key over
+  64 characters. The set crosses the lossy carrier as a versioned frame
+  repeated until a snapshot acknowledges it, so it survives loss.
 - The default `interpolate` lerps numeric fields (nested too) and takes the
   rest from the newer state; supply your own for angles that wrap.
 
@@ -77,14 +102,19 @@ function frame() { draw(net.view()); requestAnimationFrame(frame); }
   8000, under one event) is sent as independent chunks, each entity always in
   the same chunk. A lost chunk's entities are carried over from the previous
   snapshot for that tick (`stats().partialSnapshots` counts it), never
-  dropped from view. Every chunk still costs bandwidth each tick, so filter
-  with `visible` (interest) rather than sending the world.
+  dropped from view. Every chunk still costs bandwidth each tick, so narrow
+  what each player gets (`interest` keys, or `visible` where it is a real
+  permission) rather than sending the world.
 - **Corrections blend in** over `correctionSmoothingMs` (default 100, `0`
   snaps); inputs keep moving the drawn entity during the blend.
 - **Past the newest snapshot remote entities hold**, unless you set
   `extrapolateMs` (then they carry on along their last motion for at most
   that long; a custom `interpolate` then sees `alpha > 1`).
 - **Not built yet:** binary encoding (frames are JSON).
+- **Building blocks are exported too**, for a custom loop: `ClockEstimator`
+  (NTP-style offset from the lowest-RTT samples), `SnapshotBuffer`
+  (time-ordered snapshots with interpolated reads) and `lerpNumbers` (the
+  default interpolator).
 - The **anchor must be the same release** as the package: an older anchor
   treats the lossy channel as its only one.
 - Source: `net/crates/net/browser-ts/src/netcode/`, tests

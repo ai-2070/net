@@ -29,9 +29,12 @@ The Rust half is `net-mesh-leaf` (`net/crates/net/leaf`), compiled to
 `wasm32-unknown-unknown`; `@net-mesh/browser` is the typed surface over it. A
 page imports the package, never `#[wasm_bindgen]` methods directly.
 
-**Not on a registry yet.** `@net-mesh/browser` is built from the repository
-(`net/crates/net/browser-ts`), which is why `examples/` has no browser route and
-why the build recipe below starts with the wasm.
+**Published on npm from 0.37.0** as `@net-mesh/browser` (`npm install
+@net-mesh/browser`), with the leaf's wasm inside the package. Building it from
+the repository (`net/crates/net/browser-ts`) is still the recipe below, wasm
+first. `examples/` has no browser route. **Games** — netcode, lobbies, large
+worlds across region hosts — are the `net-browser` skill's (its netcode, world
+and store chapters); this page is the node surface under them.
 
 ## Two entry points — and the one to pick
 
@@ -72,14 +75,39 @@ import { connect } from '@net-mesh/browser';
 
 const node = await connect({
   credentialB64,                                    // minted by the anchor
-  bootstrapUrl: 'https://anchor.example/rtc/bootstrap',
+  bootstrapUrl: 'https://anchor.example',           // optional; the credential carries it
 });
 ```
 
+`bootstrapUrl` is the anchor's **base URL**: the leaf appends `/rtc/anchor`,
+`/rtc/offer` and `/rtc/trickle` itself, so a URL ending in a path points every
+request at the wrong place.
+
 The credential is issued by the anchor (`net-mesh anchor credential mint` /
-`inspect`; the CLI's live `anchor` verbs need the `rtc-bootstrap` feature — see
-`cli.md`). It is **signed and secret-bearing**, and the leaf's job is to present
-it unmodified: the anchor verifies the issuer signature.
+`inspect`; the CLI's live `anchor` verbs need the `rtc-bootstrap` feature —
+`cargo install net-cli --features rtc-bootstrap`, see `cli.md`). It is **signed
+and secret-bearing**, and the leaf's job is to present it unmodified: the anchor
+verifies the issuer signature.
+
+**A game's players get credentials from the anchor itself.** `net-mesh anchor
+serve --issuer-identity issuer.toml --game my-game` (repeat `--game` for more
+games; `--game ID:N` sets that game's issuance ceiling to N credentials a minute,
+default 600) serves `POST <url>/credential`, and the page asks
+for one anonymously:
+
+```typescript
+import { connect, rememberedIdentity, requestCredential } from '@net-mesh/browser';
+
+const { credentialB64, bootstrapUrl } = await requestCredential({ anchorUrl: 'https://anchor.example', game: 'my-game' });
+const node = await connect({ credentialB64, bootstrapUrl, ...rememberedIdentity() });
+```
+
+`rememberedIdentity()` keeps the player the same node across visits (its secrets
+live in `localStorage`); a credential binds to the first device that uses it and
+is refused from any other. Games on one anchor are kept apart: a player of one
+never discovers another game's lobbies or players. Failures are a
+`CredentialRequestError` with a `.kind` (`unknown-game`, `rate-limited`,
+`malformed-request`, `unreachable`, `unexpected`).
 
 - **`iceServers` is optional with a working default.** Omitted, the leaf gathers
   against the `stun_addr` the anchor announces on `GET /rtc/anchor`. An entry
@@ -139,6 +167,13 @@ for await (const bytes of stream) consume(bytes);   // ends on node.close()
   it was opened on, so when a routed pair upgrades to direct, `send` rejects with
   `session` ("stale stream handle … reopen the stream") — reopen with the same
   `peer` and `streamId` rather than assuming continuity.
+- **`lossy: true` rides a second, unordered DataChannel with no retransmits**:
+  `openStream({ reliability: 'fireAndForget', peer, label, lossy: true })`, for
+  positions and inputs where only the newest value matters. The rules:
+  - `'fireAndForget'` only; with `'reliable'` it throws.
+  - `connect()` only; a `MeshSession` refuses it.
+  - A packet that would queue behind a full buffer is dropped, never queued.
+  - The anchor must be the same release.
 - **`close()` ends the iterators it handed out** (direct and proxied alike): a
   `for await` loop leaves, `iterator.next()` resolves `done: true`, listeners
   drop. Opening a stream on a closed node is a typed `SessionError`. Teardown
@@ -207,7 +242,8 @@ import { bindEntities } from '@net-mesh/browser/three';
 
 const host = hostStore({
   definition, store: 'world', transport: node, initialState,
-  authorize: (request) => request.audience.every((a) => a !== 'command'),
+  // Only a `read` request carries `audience`; `action` / `input` requests carry `name` and `input`.
+  authorize: (request) => request.type !== 'read' || !request.audience.includes('command'),
   project: (state, audience) => (audience.includes('command') ? state : publicPart(state)),
   actions, inputs,
 });
@@ -234,9 +270,11 @@ await replica.ready();
   (the expiry notice a replica rejoins on) — rejoining an owner that is gone
   either hangs or attaches you to a successor's different document.
 - **A joiner needs a session with the host**, which is what
-  `StoreTransport.connectPeer` is for: `connect()`'s node has it, `openSession()`'s
-  `MeshSession` does not. A host and a joiner in **one tab** are exercised by
-  this package's tests; two tabs sharing a leader are not — the store's own use
+  `StoreTransport.connectPeer` is for. Both surfaces have `connectPeer` (a
+  `MeshSession`'s is proxied to the leader tab), and on both it is idempotent: a
+  pair already direct and open resolves `direct` without a new offer. Run stores
+  on `connect()`'s node anyway: a host and a joiner in **one tab** are exercised
+  by this package's tests; two tabs sharing a leader are not — the store's own use
   of a proxied handle on a follower (last-consumer cleanup, the peer/stream
   lifecycle across a leader change) is recorded as not established in
   `net/crates/net/browser-ts/src/store/index.ts`, so do not present it as proven.
@@ -289,8 +327,8 @@ five claims on the anchor rather than on the HUD.
 
 - **Native ↔ native WebRTC is not the path.** For two native nodes UDP plus the
   existing punch remains the transport; WebRTC's value is browser reach.
-- **The package is unpublished** and the two-tab leader-proxy store case is not
-  established (see above). Do not present either as shipped-and-proven.
+- **The two-tab leader-proxy store case is not established** (see above), even
+  though the package is published. Do not present it as proven.
 - **A browser node cannot do everything a native node can** — the leaf is a
   deliberate subset of the Rust surface, and `udp-blocked` networks are an
   explicit, classified limitation rather than something the transport routes

@@ -180,3 +180,25 @@ is no longer reported as cancelled on a follower.
 A refused store operation is a `StoreError` with its own `.code` — a closed set
 of twelve, with `owner-lost` and `result-expired` carrying contract subtleties.
 See `store.md` § `StoreError.code`.
+
+## Credential, lobby and world errors
+
+Three more classes, each with a closed set of codes on its own field. None is a
+`LeafError`; branch on the field, never on the message.
+
+- **`CredentialRequestError.kind`** (from `requestCredential`, with `.status`
+  holding the HTTP status when the anchor answered):
+  - `unknown-game`: the anchor does not admit that game.
+  - `rate-limited`: too many requests from this address or for this game; retry
+    shortly.
+  - `malformed-request`: the anchor did not understand the request.
+  - `unreachable`: the anchor could not be reached, or it issues no credentials.
+  - `unexpected`: an answer this package does not recognise.
+- **`LobbyError.code`** (from the lobby helpers):
+  - `not-found`: no lobby answered to that code before the deadline.
+  - `ambiguous`: two nodes claim the code. Never pick one.
+  - `invalid`: a game name, code, record or option is not usable.
+- **`BorderActionError.code`** (from `regionHandoffs(…).forward`):
+  - `refused`: the neighbour decided no, and `.message` is its reason.
+  - `unresolved`: no answer within `giveUpMs`. The action may have run, but
+    never twice. Retrying means a new `forward`, which gets a new id.

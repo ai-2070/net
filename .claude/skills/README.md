@@ -4,7 +4,7 @@ Three [Agent Skills](https://docs.anthropic.com/en/docs/claude-code/skills) that
 
 - **`net-event-bus`** — the mesh: pub/sub, nRPC request/response, organization-scoped streaming (one bind, four shapes, unary through duplex), agent-to-agent task handoff, the MCP bridge, org capability auth, the gang-claim scheduler, and the RedEX / CortEX / Dataforts layers on top.
 - **`net-payments`** — x402 payments on the mesh: price a capability, quote, verify, settle, bill, and spend policy.
-- **`net-browser`** — a **tab as a mesh node** over WebRTC, and the networked store for multiplayer game state: one node per origin, leaf-to-leaf sessions and streams, and `defineStore` / `hostStore` / `joinStore` with a Three.js scene binding.
+- **`net-browser`** — a **tab as a mesh node** over WebRTC, and multiplayer games on it: one node per origin, leaf-to-leaf sessions and streams (lossy ones too), game anchors and player credentials, lobbies, the networked store (`defineStore` / `hostStore` / `joinStore`) with a Three.js scene binding, netcode (`@net-mesh/browser/netcode`: prediction, interpolation, lag compensation), and large worlds across region hosts (`@net-mesh/browser/world`).
 
 Net looks like Kafka/NATS on the surface but has no broker. Net Payments looks like a payment SDK but never moves money. Net Browser looks like a game-networking library but the state lives on a peer, not a server. Out of the box, a coding agent will happily write Net code that **compiles, runs, and is wrong** — these skills load the right mental model and verified per-SDK templates instead.
 
@@ -103,7 +103,7 @@ Each skill is a `SKILL.md` entry point plus reference files that Claude loads **
 | `filter-dsl.md` | Consumer-side content filtering — equality `$and`/`$or`/`$not` predicates on the bus. |
 | `error-codes.md` | Classifying a specific error variant — the full core-crate + subsystem taxonomy. |
 | `cli.md` | The `net-mesh` CLI — execution scopes (offline / persistent store / temporary supervisor / mesh client / hosted service), the `--local` gate, `--inspect-target`, `transfer`, `typegen`, `wrap`/`mcp`, `netdb`, org/subnet issuance, exit codes, deadlines and scripting notes. |
-| `browser.md` | A **browser tab** as a mesh node — `@net-mesh/browser` (a sibling package to `@net-mesh/sdk`), `connect` vs `openSession`, the anchor bootstrap credential, leaf ↔ leaf peer sessions, stream `reliability`, the typed error kinds, `udp-blocked` vs `ice-timeout`, and the networked store + Three.js binding. |
+| `browser.md` | A **browser tab** as a mesh node — `@net-mesh/browser` (a sibling package to `@net-mesh/sdk`), `connect` vs `openSession`, the anchor bootstrap credential and game credentials, leaf ↔ leaf peer sessions, stream `reliability` and `lossy`, the typed error kinds, `udp-blocked` vs `ice-timeout`, and the networked store + Three.js binding; games (netcode, worlds) route to the `net-browser` skill. |
 | `testing.md` | Fixtures, race conditions, CI gotchas. |
 | `gotchas.md` | Migrating from Kafka / NATS / Redis Streams / Pulsar. |
 | `event-semantics.md` | Naming events / what an event may assert — a fact observed at one layer, not an end-to-end `200 OK`. |
@@ -149,7 +149,9 @@ Each skill is a `SKILL.md` entry point plus reference files that Claude loads **
 | `concepts.md` | **Always first** — a tab is a node, the anchor's role, Web Lock election and leader/follower lifetimes, the store's authority model, what a page downloads, and what a browser cannot do. |
 | `session.md` | Connecting — `connect()` vs `openSession()`, the bootstrap credential, ICE/STUN configuration, admission vs carriage, leaf-to-leaf peer sessions, streams and their `reliability`/incarnation rules, the event union, identity and the origin trust boundary, and the wasm build. |
 | `store.md` | Multiplayer state — `defineStore` / `hostStore` / `joinStore`, audiences with `project`/`authorize`, `act` vs `input`, the `StoreTransport` seam, snapshots and their bounds, lifecycle and timing constants, all twelve `StoreError` codes, and `bindEntities` into a scene graph. |
-| `errors.md` | A rejection to classify — the `LeafError` kind table, the admission/carriage/no-answer split, `udp-blocked`'s two observations, `rpc-indeterminate` from a frozen leader, and teardown's `AggregateError`. |
+| `netcode.md` | Responsive movement — `hostNetcode` / `joinNetcode` from `@net-mesh/browser/netcode`: the host tick loop, prediction and reconciliation, snapshot interpolation, capped lag compensation, clock sync, interest keys and chunked snapshots, all on the lossy carrier. |
+| `world.md` | Large worlds — `@net-mesh/browser/world`: regions and their directory, a player's merged view (`joinWorld`), at-most-once entity handoff between region hosts, cross-border actions, ghosting, and the pure steps for a custom driver. |
+| `errors.md` | A rejection to classify — the `LeafError` kind table, the admission/carriage/no-answer split, `udp-blocked`'s two observations, `rpc-indeterminate` from a frozen leader, teardown's `AggregateError`, and the `CredentialRequestError` / `LobbyError` / `BorderActionError` codes. |
 | `source-access.md` | A citation to open, or a mechanism question the chapters only summarize — how to root a browser/leaf source path and read the real tree. |
 
 </details>

@@ -143,7 +143,8 @@ throws `invalid-data` at construction.
 | `maxEventBytes` | **required**; must agree with the host's frame bound |
 
 **`transport` is structural.** `StoreTransport` is `nodeIdHex()`,
-`openStream({ reliability, peer?, label? })`, `onEvent(handler)`, and an
+`openStream({ reliability, peer?, label?, lossy? })` (the store itself never
+asks for `lossy`; netcode does), `onEvent(handler)`, and an
 **optional** `connectPeer(peerHex)`. Use the node from `connect()`. A
 `MeshSession` from `openSession()` has the same methods, but a store over
 `openSession` is not established (see the end of this file). The `label` form is
@@ -161,7 +162,7 @@ answer rather than a second guess.
 
 | Surface | Calls |
 |---|---|
-| host handle | `authority` (this node's id), `getState()`, `subscribe(listener)`, `setState(next)`, `setEntities(collection, changes)` / `setEntity(collection, id, value)`, `counts()` (`handles` / `ledgers` / `deferred`), `counters()`, `close()` |
+| host handle | `authority` (this node's id), `getState()`, `subscribe(listener)`, `setState(next)`, `setEntities(collection, changes)` / `setEntity(collection, id, value)`, `counts()` (`handles` / `ledgers` / `deferred` / `sparseViews`), `counters()` (refusals only), `close()` |
 | replica handle | `getState()`, `subscribe(listener)`, `getStatus()`, `subscribeStatus(listener)`, `ready()`, `act(name, input)`, `input(name, value)`, `setAudience(names)`, `reconnect()`, `close()` |
 
 - **Moving many entities per tick? Use `setEntities`, not `setState`.** Declare
@@ -344,7 +345,9 @@ writes.
   the host; a full lobby answers `forbidden`. `lobby.kick(peer)` is immediate.
   `joinLobby` throws `LobbyError` `not-found` / `ambiguous` (two nodes claim
   the code — never pick one) / `invalid`. A lobby owns its node's
-  announcements (pass other tags as `tags`); unlisted lobbies are not secret —
+  announcements: pass the node's other tags as `tags` to `createLobby` **and**
+  to `joinLobby` (a joiner announces a `seek` tag so the host can find it, and
+  an announcement replaces the whole tag set). Unlisted lobbies are not secret —
   gate with `authorize`. Codes: `lobby.link()` / `lobbyCodeFromUrl()`.
 - **Discovery before join** (without a lobby). Share the host's `node.nodeIdHex()` out of band (the
   demo uses a `?host=<hex>` link). The host announces a tag and **re-announces
