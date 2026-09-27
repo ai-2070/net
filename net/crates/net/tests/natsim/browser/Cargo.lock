@@ -1379,9 +1379,9 @@ dependencies = [
 
 [[package]]
 name = "is"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d08f9118d003d441f79c1070e84d0a2a89f35721ca8ae0cd5e1f9026dc4a2517"
+checksum = "b6edbbdc611843e8c65878ee735f68c495cede11ae5a9582b17fe0369c456ef5"
 dependencies = [
  "crc",
  "serde",
@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh"
-version = "0.37.0"
+version = "0.37.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh-sdk"
-version = "0.37.0"
+version = "0.37.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh-wire"
-version = "0.37.0"
+version = "0.37.1"
 dependencies = [
  "blake2 0.11.0",
  "bytes",
@@ -2645,9 +2645,9 @@ dependencies = [
 
 [[package]]
 name = "str0m"
-version = "0.23.1"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8522aa06c731cfdc1488e32de7fcebcfc8d9d86d49a6ecc95a64779fe7b545f2"
+checksum = "018e4267976f45bf568c146b559bbabd2e823a9dc8c10b5b86e83118b597b89c"
 dependencies = [
  "arrayvec",
  "base64ct",
