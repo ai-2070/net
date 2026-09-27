@@ -265,7 +265,7 @@ The cycle is **1,482 non-merge commits over 1,105 files (+489,438 / −12,861)**
 
 ---
 
-Released 2026-09-26.
+Released 2026-09-27.
 
 ## License
 
