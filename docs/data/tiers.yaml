@@ -169,10 +169,12 @@ pages:
   # section rather than a projection, because it has no universal body to share.
   sdk/browser: sdk_native
   sdk/browser/errors: sdk_native
+  sdk/browser/netcode: sdk_native
   sdk/browser/quickstart: sdk_native
   sdk/browser/session: sdk_native
   sdk/browser/store: sdk_native
   sdk/browser/three: sdk_native
+  sdk/browser/world: sdk_native
   sdk/python: sdk_native
   sdk/go: sdk_native
   sdk/c: boundary_native
