@@ -681,8 +681,17 @@ of its current region and its neighbours.
    store document, so `persistStore` saves them as one unit. Witnessed on
    the local mesh (forged offer dropped; unresolved while the destination is
    down, completed by `reoffer`) and between two native `MeshNode` hosts
-   persisting to RedEX (sdk-ts `store_transport.test.ts`). **Next:** region
-   discovery (item 1) and `joinWorld` (item 2).
+   persisting to RedEX (sdk-ts `store_transport.test.ts`). Items 1–2 are
+   done too (2026-09-27). `announceRegions`, `regionDirectory`
+   (`trustedHosts`; a contested region is `ambiguous`, never guessed) and
+   `joinWorld` (3×3 held, 5×5 hysteresis, merged view with `positionOf`
+   tie-break, `act` to the current region) are tested on the local mesh
+   with two host nodes serving four region stores. That test found a store
+   defect: sibling stores on one node answered `closed` for handles they
+   did not issue. Fixed in `host.ts`: only the issuing store answers, and an
+   unknown handle is refused once. **Next:** items 4–6 (cross-border
+   actions, ghosting, load balancing), and the acceptance world across
+   native hosts.
    Original design: A freezes the
    entity at a fenced epoch and sends its state to B; B admits it and becomes
    authoritative; late inputs to A are forwarded or refused typed, never applied

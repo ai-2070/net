@@ -37,7 +37,14 @@ the README on why it is a sibling package rather than a sub-path.
     its handoff ledger in one store document, so `persistStore` saves both
     together; `parseHandoffLedger` validates the ledger. Tested between two
     hosts on the local mesh and between two native `MeshNode` hosts
-    persisting to RedEX. Region discovery and `joinWorld` come next.
+    persisting to RedEX.
+  - **Regions and a player's view:** `regionOf` / `regionsAround`;
+    `announceRegions(node, world, regions)`, which re-announces every 2 s;
+    `regionDirectory({ node, world, trustedHosts })`, where a region more
+    than one untrusted node claims is `ambiguous` and never guessed; and
+    `joinWorld(...)`, which keeps replicas of the 3×3 regions around the
+    player (released beyond 5×5), merges them into one `bindEntities`-ready
+    view, and sends `act` to the player's region.
 
 - **Netcode: interest keys.** `hostNetcode({ interest: (id, entity) => key })`
   and `joinNetcode({ interest: keys })` / `setInterest(keys)`: a player
@@ -267,6 +274,13 @@ the README on why it is a sibling package rather than a sub-path.
   the S0a baseline, and `--assert` / `--require-leaf` exit codes.
 
 ### Fixed
+
+- **Several stores on one node no longer refuse each other's players.**
+  Every hosted store sees every frame, and a store that did not know a
+  handle answered `closed` for it. With two stores of one definition on a
+  node (the `store` option, for example two regions of a world), a player's
+  action could be refused by the wrong store. Now only the store that issued
+  the handle answers, and a handle no store issued gets a single `closed`.
 
 - **A refused `act` or `setInterest` no longer raises an unhandled
   rejection.** When the refusal arrived while the request's `send` was still

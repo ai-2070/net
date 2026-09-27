@@ -34,3 +34,21 @@ export type {
   RegionHandoffs,
   RegionHandoffsOptions,
 } from './link.js';
+export {
+  REGION_ANNOUNCE_MS,
+  announceRegions,
+  joinWorld,
+  regionDirectory,
+  regionOf,
+  regionTag,
+  regionsAround,
+} from './regions.js';
+export type {
+  JoinWorldOptions,
+  RegionDirectory,
+  RegionDirectoryOptions,
+  RegionLookup,
+  WorldNode,
+  WorldRegion,
+  WorldView,
+} from './regions.js';

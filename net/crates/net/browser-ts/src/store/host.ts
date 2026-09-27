@@ -289,6 +289,30 @@ export interface HostedStoreHandle<
 const addressesByTransport = new WeakMap<StoreTransport, Set<string>>();
 
 /**
+ * The stores hosted on each transport, in the order they started.
+ *
+ * Every hosted store on a node sees every frame, and every message but a
+ * join names a handle that exactly one of them issued. A store that does
+ * not know the handle must stay silent when a SIBLING knows it. Answering
+ * `closed` on the owner's behalf refused a live player's every action on
+ * a node serving two stores (two regions of a world). A handle nobody
+ * knows still gets its `closed`, from the first store alone.
+ */
+const ownersByTransport = new WeakMap<StoreTransport, Set<{ handle(h: Hex): unknown }>>();
+
+/** The handle a caller message names, without decoding it twice; `null` for a join or a non-message. */
+function namedHandle(text: string): Hex | null {
+  try {
+    const value = JSON.parse(text) as { k?: unknown; h?: unknown };
+    return value !== null && typeof value === 'object' && value.k !== 'join' && typeof value.h === 'string'
+      ? (value.h as Hex)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * What {@link hostPlayer} needs from a hosted store and nothing else
  * does: its owner, the path that sends what a local call dispatched,
  * and whether the store is still serving. Package-internal — keyed on
@@ -568,6 +592,10 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     }
   }
 
+  const siblings = ownersByTransport.get(options.transport) ?? new Set();
+  siblings.add(owner);
+  ownersByTransport.set(options.transport, siblings);
+
   const unsubscribe = options.transport.onEvent(event => {
     // No `closed` test here: `close` UNSUBSCRIBES, so a closed host
     // receives nothing to test. A second check would be a claim, and
@@ -627,6 +655,22 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     // as `foreign-stream` for the life of the page. Which store a
     // JOIN is for is decided before this, by `join.store`
     // (`owner.ts`); this is what keeps the id learned from it right.
+    const siblings = ownersByTransport.get(options.transport);
+    if (siblings !== undefined && siblings.size > 1) {
+      const h = namedHandle(text);
+      if (h !== null && owner.handle(h) === undefined) {
+        // Not ours. The store that issued it answers; if none did, only
+        // the first store says `closed`, so the caller hears it once.
+        let ownedElsewhere = false;
+        for (const sibling of siblings) {
+          if (sibling !== owner && sibling.handle(h) !== undefined) ownedElsewhere = true;
+        }
+        if (ownedElsewhere || siblings.values().next().value !== owner) {
+          dropped['sibling-handle'] = (dropped['sibling-handle'] ?? 0) + 1;
+          return;
+        }
+      }
+    }
     const outcome = owner.receive(text, authenticated);
     if (arrived !== undefined && arrivesOn === null && outcome.refused === null) {
       arrivesOn = arrived;
@@ -751,6 +795,7 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     pendingReplies.clear();
     // The name is free again, so a successor may take it.
     addressesByTransport.get(options.transport)?.delete(address);
+    ownersByTransport.get(options.transport)?.delete(owner);
   }
 
   /**
