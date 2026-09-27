@@ -61,4 +61,4 @@ await view.act('fire', input);     // goes to the region you are in
   entities, load balancing (split/merge).
 
 Source: `net/crates/net/browser-ts/src/world/`; the protocol's deterministic
-simulation is `test/world/handoff.test.ts`.
+simulation is `net/crates/net/browser-ts/test/world/handoff.test.ts`.
