@@ -133,12 +133,18 @@ jobs:
           # `unknown-linux-musl` isn't a valid OS+abi pair in
           # zig's parser. Strip it — our own `-target` flag below
           # already pins the cross target in zig's native format.
+          #
+          # rustc (1.98) also passes `-Wl,--fix-cortex-a53-843419` when
+          # linking for aarch64, and `zig cc` refuses it ("unsupported
+          # linker arg"). That failed the 0.37.0 arm64 musl build. Strip
+          # it too, as `cargo-zigbuild` does for the CLI's musl builds.
           cat > "$WRAPPER" <<EOF
           #!/bin/bash
           args=()
           for arg in "\$@"; do
             case "\$arg" in
               --target=*) ;;
+              -Wl,--fix-cortex-a53-843419|--fix-cortex-a53-843419) ;;
               *) args+=("\$arg") ;;
             esac
           done
