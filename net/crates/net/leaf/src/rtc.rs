@@ -81,6 +81,9 @@ pub struct RtcLinkCounters {
     admission_refused_advisory: Cell<u64>,
     admission_refused_unknown_peer: Cell<u64>,
     ingress_delivered: Cell<u64>,
+    lossy_written: Cell<u64>,
+    lossy_dropped: Cell<u64>,
+    lossy_ingress: Cell<u64>,
 }
 
 impl RtcLinkCounters {
@@ -180,6 +183,9 @@ impl RtcLinkCounters {
             admission_refused_advisory: self.admission_refused_advisory.get(),
             admission_refused_unknown_peer: self.admission_refused_unknown_peer.get(),
             ingress_delivered: self.ingress_delivered.get(),
+            lossy_written: self.lossy_written.get(),
+            lossy_dropped: self.lossy_dropped.get(),
+            lossy_ingress: self.lossy_ingress.get(),
         }
     }
 }
@@ -211,7 +217,14 @@ pub const SEND_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// One channel per peer (§3), named so a native peer's driver can
 /// recognise it.
-pub const CHANNEL_LABEL: &str = "net";
+pub const CHANNEL_LABEL: &str = net_wire::carrier::RELIABLE_CHANNEL_LABEL;
+
+/// The unordered, zero-retransmit channel's label ([`net_wire::carrier`]).
+pub const LOSSY_CHANNEL_LABEL: &str = net_wire::carrier::LOSSY_CHANNEL_LABEL;
+
+/// Past this many bytes buffered on the lossy channel a lossy packet is
+/// dropped instead of sent: newer state is already on its way.
+pub const LOSSY_BUFFERED_LIMIT: u32 = 64 * 1024;
 
 /// What the transport hands back for each inbound message.
 pub type InboundSink = Rc<dyn Fn(NodeId, Bytes)>;
@@ -241,6 +254,11 @@ struct PeerLink {
     channel_id: u64,
     connection: RtcPeerConnection,
     channel: Option<RtcDataChannel>,
+    /// The unordered, zero-retransmit channel ([`LOSSY_CHANNEL_LABEL`]).
+    /// `None` until it opens — and for a peer that never offers one, in
+    /// which case lossy packets ride [`Self::channel`] like any other.
+    lossy: Option<RtcDataChannel>,
+    _lossy_message: Option<Closure<dyn FnMut(MessageEvent)>>,
     /// Retained packets accepted at admission but not yet written.
     retained: VecDeque<Bytes>,
     retained_bytes: usize,
@@ -321,6 +339,10 @@ impl Drop for PeerLink {
             channel.set_onmessage(None);
             channel.set_onbufferedamountlow(None);
             channel.close();
+        }
+        if let Some(lossy) = &self.lossy {
+            lossy.set_onmessage(None);
+            lossy.close();
         }
         self.connection.set_onicecandidate(None);
         self.connection.set_oniceconnectionstatechange(None);
@@ -497,6 +519,23 @@ impl RtcLeafTransport {
         channel.set_binary_type(RtcDataChannelType::Arraybuffer);
         channel.set_buffered_amount_low_threshold(BUFFERED_AMOUNT_LOW);
 
+        // The second channel: unordered, zero retransmits — only packets
+        // their sender stamped LOSSY ride it (`net_wire::carrier`), so a
+        // lost position never holds a reliable packet up. Same SCTP
+        // association, same m-line; a peer that ignores it loses nothing.
+        let lossy_init = RtcDataChannelInit::new();
+        lossy_init.set_ordered(false);
+        lossy_init.set_max_retransmits(0);
+        let lossy =
+            connection.create_data_channel_with_data_channel_dict(LOSSY_CHANNEL_LABEL, &lossy_init);
+        lossy.set_binary_type(RtcDataChannelType::Arraybuffer);
+        let lossy_message = lossy_message_handler(
+            Rc::clone(&self.inbound),
+            Rc::clone(&self.stats),
+            peer,
+            &lossy,
+        );
+
         let message = message_handler(
             Rc::clone(&self.inbound),
             Rc::clone(&self.stats),
@@ -525,6 +564,8 @@ impl RtcLeafTransport {
                 channel_id,
                 connection: connection.clone(),
                 channel: Some(channel),
+                lossy: Some(lossy),
+                _lossy_message: Some(lossy_message),
                 retained: VecDeque::new(),
                 retained_bytes: 0,
                 discarded_at_close: 0,
@@ -595,6 +636,19 @@ impl RtcLeafTransport {
             let Some(peers) = peers.upgrade() else {
                 return;
             };
+            // The lossy channel is told apart by its label; every other
+            // channel keeps the rule below (the first is the Net one).
+            if channel.label() == LOSSY_CHANNEL_LABEL {
+                let message =
+                    lossy_message_handler(Rc::clone(&inbound), Rc::clone(&stats), peer, &channel);
+                if let Some(link) = peers.borrow_mut().get_mut(&peer) {
+                    if link.lossy.is_none() {
+                        link._lossy_message = Some(message);
+                        link.lossy = Some(channel);
+                    }
+                }
+                return;
+            }
             let message = message_handler(Rc::clone(&inbound), Rc::clone(&stats), peer, &channel);
             // The low-water handler is what retries a retained
             // packet; an accepted channel without it would retain
@@ -625,6 +679,8 @@ impl RtcLeafTransport {
                 channel_id,
                 connection: connection.clone(),
                 channel: None,
+                lossy: None,
+                _lossy_message: None,
                 retained: VecDeque::new(),
                 retained_bytes: 0,
                 discarded_at_close: 0,
@@ -732,6 +788,28 @@ impl RtcLeafTransport {
             self.stats.note_refused_unknown_peer();
             LeafError::Session(format!("no transport for {peer:#x}"))
         })?;
+        // **A lossy packet is never queued.** It goes out on the lossy
+        // channel now or not at all: a position that waited behind a
+        // backed-up buffer is stale when it lands, and queueing it would
+        // rebuild the head-of-line blocking this channel exists to avoid.
+        // Without an open lossy channel (a peer that offers none, or one
+        // still opening) it rides the reliable channel like any packet.
+        if net_wire::carrier::rides_lossy_carrier(&packet) {
+            if let Some(lossy) = link
+                .lossy
+                .as_ref()
+                .filter(|lossy| lossy.ready_state() == RtcDataChannelState::Open)
+            {
+                if lossy.buffered_amount() >= LOSSY_BUFFERED_LIMIT
+                    || lossy.send_with_u8_array(&packet).is_err()
+                {
+                    bump(&self.stats.lossy_dropped);
+                } else {
+                    bump(&self.stats.lossy_written);
+                }
+                return Ok(());
+            }
+        }
         let channel = link
             .channel
             .as_ref()
@@ -1019,6 +1097,31 @@ fn message_handler(
             // A text frame on the Net channel is not ours.
             return;
         };
+        stats.note_ingress_delivered();
+        inbound(peer, Bytes::from(bytes));
+    }) as Box<dyn FnMut(MessageEvent)>);
+    channel.set_onmessage(Some(closure.as_ref().unchecked_ref()));
+    closure
+}
+
+/// The inbound handler for one peer's lossy channel: the same delivery as
+/// [`message_handler`], counted apart so the carrier is observable.
+fn lossy_message_handler(
+    inbound: InboundSink,
+    stats: Rc<RtcLinkCounters>,
+    peer: NodeId,
+    channel: &RtcDataChannel,
+) -> Closure<dyn FnMut(MessageEvent)> {
+    let closure = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let data = event.data();
+        let bytes = if let Some(buffer) = data.dyn_ref::<js_sys::ArrayBuffer>() {
+            Uint8Array::new(buffer).to_vec()
+        } else if let Some(array) = data.dyn_ref::<Uint8Array>() {
+            array.to_vec()
+        } else {
+            return;
+        };
+        bump(&stats.lossy_ingress);
         stats.note_ingress_delivered();
         inbound(peer, Bytes::from(bytes));
     }) as Box<dyn FnMut(MessageEvent)>);

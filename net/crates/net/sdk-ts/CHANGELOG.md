@@ -12,6 +12,40 @@ upgraded together — the SDK is a thin typed layer over the native binding, so
 a version skew shows up as a missing method at the call site rather than at
 install time.
 
+## Unreleased
+
+### Added
+
+- **`meshStoreTransport` discovers too:** `announce(tags)`, which replaces
+  this node's announced tags, and `query(tag)`, which lists the nodes that
+  announced it, in the browser node's descriptor shape. So a native node can
+  host world regions and run `joinWorld`. A descriptor carries only the tag
+  it was found by.
+
+- **`persistStore(host, { file, intervalMs })` / `restoreStore(file,
+  definition)`** — a dedicated host's store document, snapshotted to a RedEX
+  file and restored on start. A snapshot is written only when the document
+  changed, and again on `close()`. Restore returns the newest snapshot that
+  matches the definition's id and version and passes its validator.
+  Structural: this package still does not depend on `@net-mesh/browser`.
+
+- **`MeshNode.onStreamData(streamId, handler)`** — every event on a
+  stream, with `peerNodeId`: the peer whose session authenticated it.
+  `recv` / `recvShard` return events with no sender; this is the receive
+  path for anything that decides by who is asking. One subscription per
+  stream id; `close()` hands the stream back to `recv`.
+- **`streamIdFromLabel(label)`** — the stream id a label names, the same
+  derivation the browser package uses (now one function, in the wire
+  crate).
+- **`StreamConfig.lossy`** — a fire-and-forget stream whose packets ride a
+  browser session's unordered, zero-retransmit DataChannel (refused with
+  `reliability: 'reliable'`); `meshStoreTransport` passes `lossy` through,
+  so a Node dedicated host can run `@net-mesh/browser/netcode`.
+- **`meshStoreTransport(mesh, { listen })`** — the browser package's
+  `StoreTransport` over a native node: a dedicated host for
+  `@net-mesh/browser` stores, with `authorize` seeing each player's real
+  id.
+
 ## Unreleased — targets 0.35.0
 
 ### Breaking

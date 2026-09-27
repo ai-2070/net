@@ -2380,16 +2380,18 @@ impl LeafNode {
                     .unwrap_or_else(|| crate::stream::stream_id_from_label(&options.label)),
                 channel_hash: options.channel_hash.unwrap_or(0),
                 reliability: options.reliability,
+                lossy: options.lossy,
             }
         } else {
             guard
                 .node
-                .open_stream(
+                .open_stream_carried(
                     peer,
                     &options.label,
                     options.reliability,
                     options.stream_id,
                     options.channel_hash,
+                    options.lossy,
                 )
                 .map_err(js)?
         };
@@ -2597,6 +2599,29 @@ impl LeafNode {
             .offer_peer(peer, crate::clock::Deadline::in_ms(PEER_ICE_DEADLINE_MS))
             .await?;
         Ok(format!("{dialog:016x}"))
+    }
+
+    /// The live attempt's dialog, 16 hex digits, when `peer` is
+    /// **already a healthy direct pair** — session installed, no
+    /// relay entry, transport open — and `null` otherwise.
+    ///
+    /// What makes `connectPeer` idempotent. A second offer to a
+    /// healthy pair is not a no-op: its connection replaces the
+    /// transport's link, which closes the working one under the other
+    /// side, and the answerer never asked for a new attempt — so the
+    /// pair ends up reading direct with a closed channel. A page (or a
+    /// library, like netcode or a lobby) that calls `connectPeer` "to
+    /// be sure" must get the pair it already has.
+    pub fn peer_direct_dialog(&self, peer_hex: String) -> Result<Option<String>, JsError> {
+        let peer = parse_peer_id(&peer_hex)?;
+        let guard = self.inner.borrow();
+        guard.admit().map_err(js)?;
+        if guard.direct_interrupted(peer) {
+            return Ok(None);
+        }
+        Ok(guard
+            .attempt_of(peer)
+            .map(|attempt| format!("{:016x}", attempt.dialog)))
     }
 
     /// [`Self::peer_offer`]'s whole body, with the attempt's
@@ -4978,6 +5003,9 @@ pub(crate) struct StreamOptions {
     /// take. A decimal id is refused rather than accepted as a
     /// second spelling.
     pub(crate) peer: Option<u64>,
+    /// `lossy: true` — fire-and-forget packets ride the session's
+    /// unordered, zero-retransmit DataChannel ([`net_wire::carrier`]).
+    pub(crate) lossy: bool,
 }
 
 impl StreamOptions {
@@ -5007,8 +5035,9 @@ impl StreamOptions {
             .map_or_else(|| "null".to_string(), |peer| format!("\"{peer:016x}\""));
         format!(
             "{{\"reliability\":\"{reliability}\",\"label\":{},\"streamId\":{stream_id},\
-             \"channelHash\":{channel_hash},\"peer\":{peer}}}",
-            json_string(&self.label)
+             \"channelHash\":{channel_hash},\"peer\":{peer},\"lossy\":{}}}",
+            json_string(&self.label),
+            self.lossy
         )
     }
 }
@@ -5025,7 +5054,15 @@ pub(crate) fn stream_options(opts: &JsValue) -> Result<StreamOptions, JsError> {
             Some(false) => Reliability::FireAndForget,
         },
     };
+    let lossy = optional_bool(opts, "lossy").unwrap_or(false);
+    if lossy && reliability.is_reliable() {
+        return Err(JsError::new(
+            "lossy: true needs reliability: \"fireAndForget\" — a reliable stream cannot ride \
+             the lossy carrier",
+        ));
+    }
     Ok(StreamOptions {
+        lossy,
         reliability,
         label: typed_string(opts, "label", "a string")?.unwrap_or_else(|| "app".to_string()),
         stream_id: match typed_string(opts, "streamId", "a decimal or 0x-hex string")? {

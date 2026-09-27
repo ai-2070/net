@@ -1703,6 +1703,15 @@ type StreamCallKey = (u64, u64, u64, u64);
 /// `session_id`).
 type InFlightCalls = Arc<Mutex<HashMap<StreamCallKey, RpcCancellationToken>>>;
 
+/// How long the unary server fold remembers a CANCEL that arrived before
+/// its REQUEST ([`RpcServerFold`]'s `early_cancels`).
+const EARLY_CANCEL_TTL_NS: u64 = 30_000_000_000;
+
+/// At most this many early CANCELs remembered per fold; past it the oldest
+/// is forgotten, which degrades that call to the pre-fix behaviour and no
+/// further.
+const EARLY_CANCEL_MAX: usize = 1024;
+
 /// Server-side fold. Sees REQUEST events on the configured channel,
 /// dispatches to the user-supplied handler, emits RESPONSE events
 /// via the supplied emitter. CANCEL events flip the matching
@@ -1734,6 +1743,20 @@ pub struct RpcServerFold {
     /// tasks can remove their own entries without going back through
     /// the fold.
     in_flight: InFlightCalls,
+    /// CANCELs that arrived for a call not (yet) in flight, by the same
+    /// key, with when they arrived (ns).
+    ///
+    /// A protected REQUEST passes admission before it reaches this fold,
+    /// and a CANCEL does not, so a caller that cancels quickly — a hedged
+    /// call whose backup already won — can have its CANCEL applied FIRST.
+    /// Without a record of it the REQUEST that follows ran its handler to
+    /// completion, cancellation never observed. A REQUEST whose key is
+    /// here within [`EARLY_CANCEL_TTL_NS`] starts already cancelled.
+    ///
+    /// The key carries the authenticated session peer, so a CANCEL can
+    /// only pre-cancel its own sender's calls. Bounded by
+    /// [`EARLY_CANCEL_MAX`].
+    early_cancels: HashMap<StreamCallKey, u64>,
     /// Optional per-service metrics handle. When `Some`, the
     /// spawned handler task bumps `handler_invocations_total` /
     /// `handler_in_flight` / `handler_panics_total` and records
@@ -1763,10 +1786,46 @@ impl RpcServerFold {
             large_emit: None,
             session_id: 0,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            early_cancels: HashMap::new(),
             metrics: None,
             #[cfg(test)]
             test_now_ns: None,
         }
+    }
+
+    /// Remember a CANCEL for a call that is not in flight: it may be
+    /// early (see `early_cancels`), or late (the call already finished;
+    /// the record then simply expires).
+    fn remember_early_cancel(&mut self, key: StreamCallKey) {
+        let now = self.now_ns();
+        self.early_cancels
+            .retain(|_, at| now.saturating_sub(*at) <= EARLY_CANCEL_TTL_NS);
+        if self.early_cancels.len() >= EARLY_CANCEL_MAX {
+            if let Some(oldest) = self
+                .early_cancels
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| *key)
+            {
+                self.early_cancels.remove(&oldest);
+            }
+        }
+        self.early_cancels.insert(key, now);
+    }
+
+    /// Whether a CANCEL for `key` arrived before its REQUEST, recently
+    /// enough to apply; the record is consumed either way.
+    fn take_early_cancel(&mut self, key: &StreamCallKey) -> bool {
+        let now = self.now_ns();
+        self.early_cancels
+            .remove(key)
+            .is_some_and(|at| now.saturating_sub(at) <= EARLY_CANCEL_TTL_NS)
+    }
+
+    /// Test-only: how many early CANCELs are remembered.
+    #[cfg(test)]
+    pub(crate) fn early_cancel_count(&self) -> usize {
+        self.early_cancels.len()
     }
 
     pub(crate) fn with_large_response_emitter(mut self, emit: large_response::Emitter) -> Self {
@@ -2044,6 +2103,12 @@ impl RpcServerFold {
                     .map(|c| c.cancellation.clone())
                     .unwrap_or_else(RpcCancellationToken::new);
                 self.in_flight.lock().insert(key, cancellation.clone());
+                // Its CANCEL overtook it (see `early_cancels`): the call
+                // starts cancelled, so the handler observes it at once and
+                // the caller gets the documented Cancelled terminal.
+                if self.take_early_cancel(&key) {
+                    cancellation.cancel();
+                }
                 let handler = self.handler.clone();
                 let emit = self.emit.clone();
                 let large_emit = self.large_emit.clone();
@@ -2239,8 +2304,12 @@ impl RpcServerFold {
                 });
             }
             DISPATCH_RPC_CANCEL => {
-                if let Some(token) = self.in_flight.lock().remove(&key) {
-                    token.cancel();
+                let known = self.in_flight.lock().remove(&key);
+                match known {
+                    Some(token) => token.cancel(),
+                    // Not in flight: remembered briefly, in case its
+                    // REQUEST is still in admission (`early_cancels`).
+                    None => self.remember_early_cancel(key),
                 }
                 // Idempotent — CANCEL for an unknown call_id (e.g.
                 // a CANCEL that races the handler's completion) is
@@ -12219,6 +12288,77 @@ mod tests {
         fold.apply(&rpc_cancel_event(1, 999), &mut ()).unwrap();
         assert!(captured.lock().is_empty());
         assert!(fold.in_flight_keys().is_empty());
+    }
+
+    /// A CANCEL that overtakes its REQUEST (a protected REQUEST is still in
+    /// admission when a hedged caller's CANCEL lands) is remembered: the
+    /// REQUEST then starts cancelled, the handler observes it at once, and
+    /// the caller gets `Cancelled`. Before, the early CANCEL was a no-op and
+    /// the handler ran to completion (CI: `hedge_loser_handler_observes_
+    /// cancellation`, 3/3 on a loaded runner).
+    #[tokio::test]
+    async fn server_fold_cancel_before_request_starts_the_call_cancelled() {
+        struct WaitsForCancel;
+        #[async_trait::async_trait]
+        impl RpcHandler for WaitsForCancel {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                tokio::select! {
+                    _ = ctx.cancellation.cancelled() => Err(RpcHandlerError::Internal("cancelled".into())),
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => Ok(RpcResponsePayload {
+                        status: RpcStatus::Ok,
+                        headers: vec![],
+                        body: Bytes::from_static(b"ran to completion"),
+                    }),
+                }
+            }
+        }
+        let (emit, captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(Arc::new(WaitsForCancel), emit);
+        fold.apply(&rpc_cancel_event(7, 11), &mut ()).unwrap();
+        assert_eq!(fold.early_cancel_count(), 1);
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::new(),
+        };
+        fold.apply(&rpc_request_event(7, 11, req), &mut ()).unwrap();
+        assert_eq!(fold.early_cancel_count(), 0, "the record is consumed");
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(1)).await,
+            "the handler must observe the early cancel, not run for 5 s"
+        );
+        assert_eq!(captured.lock()[0].2.status, RpcStatus::Cancelled);
+
+        // Another call from the same caller is not affected.
+        let req = RpcRequestPayload {
+            service: "x".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::new(),
+        };
+        fold.apply(&rpc_request_event(7, 12, req), &mut ()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(captured.lock().len(), 1, "call 12 was never cancelled");
+    }
+
+    /// Early CANCELs expire and are bounded: a stale one does not cancel a
+    /// later REQUEST, and the map never exceeds its cap.
+    #[tokio::test]
+    async fn server_fold_early_cancels_expire_and_are_bounded() {
+        let (emit, _captured) = capturing_emitter();
+        let mut fold = RpcServerFold::new(Arc::new(EchoHandler), emit).with_test_now_ns(1_000);
+        for call in 0..(EARLY_CANCEL_MAX as u64 + 50) {
+            fold.apply(&rpc_cancel_event(1, call), &mut ()).unwrap();
+        }
+        assert_eq!(fold.early_cancel_count(), EARLY_CANCEL_MAX);
+        fold.test_now_ns = Some(1_000 + EARLY_CANCEL_TTL_NS + 1);
+        assert!(
+            !fold.take_early_cancel(&(0, 0, 1, EARLY_CANCEL_MAX as u64 + 49)),
+            "expired"
+        );
     }
 
     /// Malformed request payload: fold emits a

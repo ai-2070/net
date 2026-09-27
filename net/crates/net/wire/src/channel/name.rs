@@ -179,6 +179,23 @@ pub fn channel_hash(name: &str) -> ChannelHash {
     xxh3_64(name.as_bytes())
 }
 
+/// Bit 49: marks a stream id derived from a label by
+/// [`stream_id_from_label`], so an unsolicited arrival on it classifies
+/// as stream data at a leaf rather than as a channel publication (bit
+/// 48). The label hash is masked to 48 bits, so the bit is always set.
+pub const LABELED_STREAM_DISCRIMINATOR: u64 = 0x0002_0000_0000_0000;
+
+/// A stable stream id from a caller-chosen label.
+///
+/// The one derivation both ends of a labeled stream use — the browser
+/// leaf (`net-mesh-leaf`) and a native node alike — so two ends that
+/// agree on the label agree on the id without exchanging it. Unlike a
+/// [`ChannelName`], a label is not validated: any string is a label.
+#[inline]
+pub fn stream_id_from_label(label: &str) -> u64 {
+    LABELED_STREAM_DISCRIMINATOR | (channel_hash(label) & 0x0000_FFFF_FFFF_FFFF)
+}
+
 /// Canonical hash for the *worker grant* on `(channel, queue_group)`.
 ///
 /// A queue group is a work-distribution set: every published event goes
@@ -444,6 +461,32 @@ impl std::error::Error for ChannelError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labeled_stream_ids_carry_bit_49_never_bit_48_and_the_label_hash() {
+        // Bit 49 marks stream data at a leaf and bit 48 a channel
+        // publication: a labeled id must be the former and never the
+        // latter, for every label — including ones no ChannelName
+        // accepts, because labels are not validated.
+        for label in [
+            "store/my-game.world",
+            "app/telemetry",
+            "",
+            "has spaces",
+            "ünïcode",
+        ] {
+            let id = stream_id_from_label(label);
+            assert_ne!(id & LABELED_STREAM_DISCRIMINATOR, 0, "{label}");
+            assert_eq!(id & 0x0001_0000_0000_0000, 0, "{label}");
+            assert_eq!(
+                id & 0x0000_FFFF_FFFF_FFFF,
+                channel_hash(label) & 0x0000_FFFF_FFFF_FFFF,
+                "{label}"
+            );
+            assert_eq!(id >> 50, 0, "{label}");
+        }
+        assert_ne!(stream_id_from_label("a"), stream_id_from_label("b"));
+    }
 
     #[test]
     fn test_valid_names() {

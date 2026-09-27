@@ -4,7 +4,8 @@
  * ```typescript
  * import { connect, isUdpBlocked } from '@net-mesh/browser';
  *
- * const node = await connect({ credentialB64, bootstrapUrl: 'https://anchor.example/rtc/bootstrap' });
+ * // `bootstrapUrl` is the anchor's base URL (the credential carries one).
+ * const node = await connect({ credentialB64, bootstrapUrl: 'https://anchor.example' });
  * await node.announce(['transcribe']);
  * const reply = await node.call('summarise', new TextEncoder().encode('…'), 5_000);
  * ```
@@ -188,3 +189,19 @@ export * from './leader/index.js';
 // peer and subscription lifecycle they require, and are absent rather
 // than stubbed until then — see `store/index.ts`.
 export * from './store/index.js';
+
+// Lobbies: host a game others can find, list the open ones, join by
+// code or link — `createLobby` / `listLobbies` / `joinLobby`.
+export * from './lobby.js';
+
+// The same player on every visit, for connect().
+export { rememberedIdentity, DEFAULT_IDENTITY_KEY } from './identity.js';
+export type { IdentitySecrets } from './identity.js';
+
+// Anonymous visitor credentials from a game anchor.
+export { requestCredential, CredentialRequestError } from './credential.js';
+export type {
+  AnchorCredential,
+  CredentialRequestErrorKind,
+  RequestCredentialOptions,
+} from './credential.js';

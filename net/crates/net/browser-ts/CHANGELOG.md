@@ -14,7 +14,207 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
-## Unreleased — targets 0.36.0
+## 0.37.0 — the first npm release
+
+Everything in this file ships in 0.37.0, the package's first release on npm.
+This section is what landed last; the section after it is the initial surface.
+
+### Added
+
+- **`@net-mesh/browser/world`: at-most-once entity handoff between region
+  hosts** (plan §9). Pure steps over a region's persisted state: `beginHandoff`
+  freezes an entity and offers it; `onHandoffOffer` decides each handoff id
+  once and answers every repeat the same way; `onHandoffReply` settles, and
+  only an explicit refusal brings the entity back; `retryHandoffs` re-offers
+  and, after `giveUpMs`, reports `unresolved` while keeping it frozen;
+  `reofferHandoff` resumes it; `locate` answers where an entity is.
+  **Contract:** make each step's state durable before sending its messages.
+  A deterministic simulation (300 seeds, with loss, duplication, reordering
+  and host crashes) finds no entity ever live twice and no id admitted twice.
+  - **Over the mesh:** `handoffLink({ transport, label, peerOf })` carries the
+    messages. It accepts a message naming region X only from the node that
+    hosts X, so a player cannot forge an offer or a reply.
+    `regionHandoffs({ link, region, load, commit, persist, … })` runs the
+    steps in order: commit, `persist` (awaited), then send.
+    `storeRegion(host, { collection, ledger })` keeps a region's entities and
+    its handoff ledger in one store document, so `persistStore` saves both
+    together; `parseHandoffLedger` validates the ledger. Tested between two
+    hosts on the local mesh and between two native `MeshNode` hosts
+    persisting to RedEX.
+  - **Cross-border actions:** `regionHandoffs({ actions })` serves named
+    actions, and `handoffs.forward(to, name, input)` asks a neighbour. The
+    neighbour runs each action id once, records the outcome durably with its
+    effect, and answers every repeat the same way. A forward rejects with
+    `BorderActionError` `refused` (the neighbour said no) or `unresolved`
+    (no answer: it may have run, never twice). A simulation over 300 seeds
+    with loss, duplication and crashes finds no action applied twice.
+  - **No pop at borders:** `joinWorld`'s `lingerMs` (default 500) keeps an
+    entity that vanished from a held region at its last state until it
+    appears elsewhere. A handoff freezes it at the source before the
+    destination shows it. `handoffLink`'s `refresh` (e.g.
+    `directory.lookup`) re-reads the directory when a destination is unknown
+    or a sender does not match it.
+  - **Ghosting:** `regionHandoffs({ ghosting })` mirrors a region's
+    entities near a border to the neighbour across it, read-only. Read them
+    with `handoffs.ghosts()` / `onGhosts`. A newer frame replaces an older
+    one, an empty frame clears, and a silent neighbour's ghosts expire.
+    `ghostTargets` names which neighbours an entity at a position reaches.
+  - **Regions and a player's view:** `regionOf` / `regionsAround`;
+    `announceRegions(node, world, regions)`, which re-announces every 2 s;
+    `regionDirectory({ node, world, trustedHosts })`, where a region more
+    than one untrusted node claims is `ambiguous` and never guessed; and
+    `joinWorld(...)`, which keeps replicas of the 3×3 regions around the
+    player (released beyond 5×5), merges them into one `bindEntities`-ready
+    view, and sends `act` to the player's region.
+
+- **Netcode: interest keys.** `hostNetcode({ interest: (id, entity) => key })`
+  and `joinNetcode({ interest: keys })` / `setInterest(keys)`: a player
+  receives only the entities under the keys it named. An entity keyed `null`
+  is always delivered. `visible` stays the permission, and interest only
+  narrows it. The key set crosses the lossy carrier as a versioned frame,
+  repeated until a snapshot echoes the version back.
+- **Netcode: large snapshots travel as chunks.** A snapshot over the host's
+  `maxFrameBytes` (default 8000) is split into chunks that each fit one
+  event, with each entity always in the same chunk. A lost chunk no longer
+  loses the whole snapshot: its entities are carried over from the previous
+  snapshot for that tick, and the player's own entity is never reconciled
+  against a carried-over copy. `stats().partialSnapshots` counts these. Host
+  and players must run the same release: an older player would treat each
+  chunk as a whole snapshot.
+- **Netcode: correction smoothing and extrapolation.** `joinNetcode`'s
+  `correctionSmoothingMs` (default 100, `0` snaps) blends a reconciliation
+  correction in instead of jumping; inputs keep applying during the blend.
+  `extrapolateMs` (default 0) carries remote entities on along their last
+  motion when the newest snapshot is late, capped at that long.
+
+- **Entity writes: `setEntities(collection, changes)` / `setEntity(collection,
+  id, value)`** on the host handle, for collections that declare a per-entity
+  parser in the definition's new `entities` field. Only the written entities
+  are validated, and the whole-document `state` validator does not run. At
+  8,000 entities a commit drops from about 16 ms to about 2 ms. `undefined`
+  removes an entity. `scripts/bench-world.mjs --write entities` measures it.
+- **Per-player views cost what changed, not the world.** When an entity write
+  touches only collections declared in both `interest` and `entities`, and
+  the host projects by declared `visibility` rules alone, each player's delta
+  projects just the changed entities. 8,000 entities under an `owner` rule
+  with 16 players: 459 → 25 ms a commit. `host.counts().sparseViews` counts
+  it.
+
+- **Netcode: `@net-mesh/browser/netcode`** — `hostNetcode` (fixed-rate tick
+  loop; inputs applied exactly once per player however often the lossy
+  carrier repeats them; per-player `visible` filter; `authorize`; capped
+  lag compensation `rewind(seen)`, default 200 ms) and `joinNetcode` (clock
+  sync, snapshot interpolation a delay behind the host, local prediction
+  with reconciliation, redundant inputs). Transport-agnostic: a browser
+  node, the local mesh, or a Node dedicated host via `meshStoreTransport`.
+  Also `ClockEstimator`, `SnapshotBuffer`, `lerpNumbers`.
+- The store's transport type accepts `lossy?: boolean` on `openStream`.
+- **Lossy streams: `openStream({ reliability: 'fireAndForget', lossy: true })`**
+  — for high-rate state where only the newest value matters. Every stream
+  used to share one ordered, fully retransmitted DataChannel, so one lost
+  packet delayed everything behind it. A lossy stream's packets ride a
+  second, unordered, zero-retransmit channel (`net-u`): prompt or not at
+  all, never delaying anything, and dropped rather than queued behind a
+  backed-up buffer. The receiver's fire-and-forget semantics are unchanged
+  (gaps skipped, the newest value wins). `connect()` nodes only for now;
+  an anchor or peer that opens no lossy channel still gets the packets on
+  the reliable one. **Upgrade the anchor with the package**: an older
+  anchor treats the second channel as its only one.
+
+- **`rememberedIdentity(key?)`** — the same player on every visit for
+  `connect()`: the node's two secrets, created once and kept in
+  `localStorage` (`connect({ …, ...rememberedIdentity() })`). Without it,
+  `connect()` is a new node on every page load.
+- **Fixed: a lobby could not be joined over a real anchor.** A browser node
+  accepts a relayed handshake only from a peer whose signed announcement it
+  holds, and a joiner announced nothing — so the host refused it and the
+  store failed with `no session with 0x…` (the local mesh does not model
+  this; a real anchor run found it). `joinLobby` now announces
+  `net-lobby:<game>:seek:<host>` while playing (new `tags` option keeps the
+  page's own), and retries reaching the host until `timeoutMs`, failing as
+  `LobbyError('not-found', "could not reach the lobby's host …")`.
+- **`requestCredential({ anchorUrl, game })`** — an anonymous visitor
+  credential from an anchor started with `net-mesh anchor serve --game`,
+  returning `{ credentialB64, bootstrapUrl, game }` for `openSession()`.
+  Failures are a typed `CredentialRequestError` (`unknown-game`,
+  `rate-limited`, `malformed-request`, `unreachable`, `unexpected`).
+
+- **Fixed: a change inside a map resent the whole map.** The owner's
+  diff goes one level deeper for maps, so moving 25 of 500 ships sends
+  those 25, not all 500 (62 KB → 3 KB per player per tick, measured).
+- **Faster declared visibility** (linear instead of quadratic) and no
+  re-validation of an identity projection. `npm run bench:world`
+  measures host time and bytes per player across world sizes.
+- **Fixed: a validator that cancels during assembly** published the
+  cancelled document before clearing it; the installation is now
+  abandoned before anything is published.
+- **Interest management.** `defineStore({ interest: { <entity map>:
+  (entity, id) => key | null } })`; `joinStore({ interest })`,
+  `setInterest(keys)` (also on `hostPlayer` and `joinLobby`). Only
+  entities whose key is in the set are delivered, as per-entity ops;
+  far changes send nothing; interest changes are one additive delta
+  (new `int` wire message; optional `int` on `join` / `resume`). Grid
+  helpers `cellKey`, `cellsAround`, `stickyCells`, `sameCells`.
+- **Fixed: a replica sent nothing on a commit then saw a gap.** A delta's
+  `base` was the owner's previous revision, so a replica whose view had
+  not changed (and was sent nothing) detected a gap on its next delta
+  and re-fetched its whole view. `base` is now the revision that
+  replica is at.
+- **Declared visibility.** `defineStore({ visibility })`: path → rule
+  (`'everyone'`, `'nobody'`, `'owner'`, or audiences; `x.length` reveals a
+  hidden array's count), presets `'open'` and `'card-game'` with
+  overrides. Enforced by the host after any `project` / `projectFor`
+  (which become optional). Hidden entries are removed, hidden fields
+  become `HIDDEN` (`hiddenOr`, `isHidden`); a validator that refuses the
+  marker is refused at `hostStore`. `assertHidden` and `projectVisible`
+  for tests; `hostStore({ dev })` warns about an undeclared
+  everything-to-everyone store and about projections the validator
+  refuses.
+- **`onEvent(event, context)`** — one host hook for `join`, `leave`
+  (with a reason: `left` / `expired` / `refused` / `dropped`) and `area`
+  (from `areaOf(state, peer)`, on change only). A transaction like an
+  action handler, run after the causing frame, including the host's own
+  player; throws are discarded and counted, and runaway chains stop at
+  `MAX_EVENT_ROUNDS`.
+- **Inventory bones** — `Inventory` (item id → count), `addItems`,
+  `removeItems`, `countItems`, `hasItems`, `inventoryOf`,
+  `parseInventory`, `onlyOwn`, with optional `maxKinds` / `maxCount`
+  rules and a typed `InventoryError`. Trading is not included.
+- **Lobbies.** `createLobby()` hosts a store with the host's own
+  player (`lobby.self`), a room code, a shareable link, presence
+  (`players()`, `subscribePlayers`), capacity (the host counted) and
+  immediate kicks; `listLobbies()` lists a game's public lobbies;
+  `joinLobby()` joins by code, link or listing. Discovery is capability
+  tags in the host's signed announcement — no new protocol. Records are
+  bounded (256-byte `info`, 512-byte tag) and validated when read; a
+  code claimed by two nodes is refused as `ambiguous`; unlisted lobbies
+  publish only a hash of their code.
+- **`hostPlayer(host, { audience })`** — the hosting node's own player,
+  with the handle shape `joinStore` returns. A node cannot join its own
+  store, so every game whose host also plays wrote a wrapper around the
+  handlers; this replaces it and holds the host's player to parity with
+  a replica: the host's `authorize` with its own node id as `peer`,
+  input and output validation and the result budget inside one
+  transaction, the wire's value rules, and `getState()` as the
+  projection for its audience rather than the raw document.
+  `HostedStoreHandle` now carries its `definition` and its action and
+  input types.
+- **`projectFor(state, { peer, audience })`** — a per-player
+  projection, given to `hostStore` instead of `project`, for views that
+  depend on who is looking (your own hand). Computed once per distinct
+  player and audience; a player whose view did not change is sent
+  nothing. Exactly one of `project` and `projectFor` is accepted, in the
+  types (`HostProjection`) and at construction (`invalid-data`).
+- **`@net-mesh/browser/local`** — `createLocalMesh()`, several nodes in
+  one page with no anchor and no network, each a `StoreTransport`. The
+  store on top is the real one; delivery is a function call and the
+  peer is assigned rather than proved. Local nodes also `announce` and
+  `query` in the real descriptor shape, with the leaf's lease (another
+  node's announcement only, expiring after 300 s by default), so
+  discovery code runs offline. For building game logic first;
+  the demo's `demo/local-mesh.js` is replaced by it.
+
+## The initial surface (developed for 0.36, first published in 0.37.0)
 
 ### Added
 
@@ -93,6 +293,29 @@ the README on why it is a sibling package rather than a sub-path.
   wasm-bindgen glue, the ESM directory and the single-file bundle, with
   `SIZE <artifact> raw=<n> gz=<n>` lines for CI, a comparison against
   the S0a baseline, and `--assert` / `--require-leaf` exit codes.
+
+### Fixed
+
+- **Several stores on one node no longer refuse each other's players.**
+  Every hosted store sees every frame, and a store that did not know a
+  handle answered `closed` for it. With two stores of one definition on a
+  node (the `store` option, for example two regions of a world), a player's
+  action could be refused by the wrong store. Now only the store that issued
+  the handle answers, and a handle no store issued gets a single `closed`.
+
+- **A refused `act` or `setInterest` no longer raises an unhandled
+  rejection.** When the refusal arrived while the request's `send` was still
+  pending (a native host answers that fast), the request's promise rejected
+  before anything was listening. The caller still got the error, but the page
+  also saw `unhandledrejection`.
+- **`connectPeer` is idempotent on a healthy direct pair.** It resolves
+  `{ type: 'direct' }` with the live dialog and sends nothing. Before this,
+  it made a fresh offer whose connection replaced — and closed — the working
+  link under the peer. The pair still read as direct while every send to it
+  was refused. This hit any library that calls `connectPeer` before opening a
+  stream (netcode, lobbies). The same holds for `openSession().connectPeer`:
+  the follower asks the leader through a new proxied reading. A leader from an
+  older release doesn't answer it, and the follower then offers as before.
 
 ### Changed
 

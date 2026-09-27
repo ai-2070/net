@@ -27,9 +27,10 @@
  */
 
 import { isStaleStream, StoreError } from './errors.js';
-import { StoreOwner, type Dispatched, type OwnerDeps, type Outbound } from './owner.js';
-import type { ActionSpec, Cancel, InputSpec } from './types.js';
+import { StoreOwner, type Dispatched, type OwnerDeps, type Outbound, type Viewer } from './owner.js';
+import type { ActionSpec, Cancel, EntityCollection, EntityOf, InputSpec, StoreDefinition } from './types.js';
 import { encodeMessage, type Hex } from './wire.js';
+import { applyVisibility, compileVisibility } from './visibility.js';
 
 /** How often a host expires handles whose lease has run out (§2). */
 export const HOST_SWEEP_MS = 5_000;
@@ -96,6 +97,12 @@ export interface StoreTransport {
     reliability: 'reliable' | 'fireAndForget';
     peer?: string;
     label?: string;
+    /**
+     * Ride the lossy carrier (fire-and-forget only): unordered, no
+     * retransmits, never delaying anything else. A transport without one
+     * may ignore it and send the packets like any others.
+     */
+    lossy?: boolean;
   }): TransportStream | Promise<TransportStream>;
   onEvent(handler: (event: TransportFrame) => void): Cancel;
   /**
@@ -147,11 +154,39 @@ export function samePeer(left: string, right: string): boolean {
   return a !== null && a === b;
 }
 
+/**
+ * How a host decides what each replica sees: exactly one of these.
+ *
+ * - `project(state, audience)` — one view per audience, shared by
+ *   every player reading it. The default choice.
+ * - `projectFor(state, { peer, audience })` — one view per player, for
+ *   what differs by who is looking (your own hand). Costs one
+ *   projection per player per change.
+ */
+export type HostProjection<S extends object> =
+  | {
+      project(state: S, audience: readonly string[]): S;
+      readonly projectFor?: never;
+    }
+  | {
+      projectFor(state: S, viewer: Viewer): S;
+      readonly project?: never;
+    }
+  | {
+      /** Neither: the definition's declared `visibility` alone decides. */
+      readonly project?: never;
+      readonly projectFor?: never;
+    };
+
 /** What a host needs beyond the owner's own dependencies. */
-export interface HostStoreOptions<S extends object, A extends ActionSpec, I extends InputSpec>
+export type HostStoreOptions<S extends object, A extends ActionSpec, I extends InputSpec> =
+  HostStoreBaseOptions<S, A, I> & HostProjection<S>;
+
+/** {@link HostStoreOptions} without the projection. */
+export interface HostStoreBaseOptions<S extends object, A extends ActionSpec, I extends InputSpec>
   extends Omit<
     OwnerDeps<S, A, I>,
-    'maxEventBytes' | 'newHandle' | 'newIncarnation' | 'now' | 'canProject' | 'store'
+    'maxEventBytes' | 'newHandle' | 'newIncarnation' | 'now' | 'canProject' | 'store' | 'project' | 'projectFor'
   > {
   readonly transport: StoreTransport;
   /**
@@ -169,6 +204,15 @@ export interface HostStoreOptions<S extends object, A extends ActionSpec, I exte
   readonly streamId?: string;
   readonly maxEventBytes: number;
   readonly initialState: S;
+  /**
+   * Development checks: `true` warns through `console.warn`, a function
+   * receives the messages. It says so when every player would receive
+   * the whole state without the definition declaring `visibility:
+   * 'open'`, and when a projection fails the state validator (which
+   * otherwise sends the player `empty()` silently). Leave it off in
+   * production.
+   */
+  readonly dev?: boolean | ((message: string) => void);
   now?: () => number;
   newHandle?: () => Hex;
   newIncarnation?: () => Hex;
@@ -178,14 +222,44 @@ export interface HostStoreOptions<S extends object, A extends ActionSpec, I exte
 }
 
 /** The authoritative store, served to whoever the transport authenticates. */
-export interface HostedStoreHandle<S extends object> {
+export interface HostedStoreHandle<
+  S extends object,
+  A extends ActionSpec = ActionSpec,
+  I extends InputSpec = InputSpec,
+> {
   /** This node's id: the authority every replica is talking to. */
   readonly authority: string;
+  /** The definition this store serves. */
+  readonly definition: StoreDefinition<S, A, I>;
   getState(): S;
   subscribe(listener: (state: S, previous: S) => void): Cancel;
   setState(next: S): void;
-  /** Handles, ledgers and pending projections, for a bounds report. */
-  counts(): { readonly handles: number; readonly ledgers: number; readonly deferred: number };
+  /**
+   * Write entities of a collection declared in the definition's
+   * `entities`: `id → value`, or `id → undefined` to remove one. Only the
+   * written entities are validated (by their per-entity parser); the
+   * whole-document `state` validator does not run, so a tick that moves a
+   * few ships out of thousands costs what it touches. One revision, one
+   * delta, however many ids.
+   */
+  setEntities<C extends EntityCollection<S>>(
+    collection: C,
+    changes: Readonly<Record<string, EntityOf<S, C> | undefined>>,
+  ): void;
+  /** {@link setEntities} for one id; `undefined` removes it. */
+  setEntity<C extends EntityCollection<S>>(collection: C, id: string, value: EntityOf<S, C> | undefined): void;
+  /**
+   * Handles, ledgers and pending projections, for a bounds report; and
+   * `sparseViews`, how many per-view deltas were projected from the changed
+   * entities alone (an entity write on a collection declared in both
+   * `interest` and `entities`, with only declared visibility rules).
+   */
+  counts(): {
+    readonly handles: number;
+    readonly ledgers: number;
+    readonly deferred: number;
+    readonly sparseViews: number;
+  };
   counters(): Readonly<Record<string, number>>;
   close(): Promise<void>;
 }
@@ -214,6 +288,54 @@ export interface HostedStoreHandle<S extends object> {
  */
 const addressesByTransport = new WeakMap<StoreTransport, Set<string>>();
 
+/**
+ * The stores hosted on each transport, in the order they started.
+ *
+ * Every hosted store on a node sees every frame, and every message but a
+ * join names a handle that exactly one of them issued. A store that does
+ * not know the handle must stay silent when a SIBLING knows it. Answering
+ * `closed` on the owner's behalf refused a live player's every action on
+ * a node serving two stores (two regions of a world). A handle nobody
+ * knows still gets its `closed`, from the first store alone.
+ */
+const ownersByTransport = new WeakMap<StoreTransport, Set<{ handle(h: Hex): unknown }>>();
+
+/** The handle a caller message names, without decoding it twice; `null` for a join or a non-message. */
+function namedHandle(text: string): Hex | null {
+  try {
+    const value = JSON.parse(text) as { k?: unknown; h?: unknown };
+    return value !== null && typeof value === 'object' && value.k !== 'join' && typeof value.h === 'string'
+      ? (value.h as Hex)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What {@link hostPlayer} needs from a hosted store and nothing else
+ * does: its owner, the path that sends what a local call dispatched,
+ * and whether the store is still serving. Package-internal — keyed on
+ * the handle object, so only a handle `hostStore` returned has one.
+ */
+export interface HostInternals<S extends object, A extends ActionSpec, I extends InputSpec> {
+  readonly owner: StoreOwner<S, A, I>;
+  readonly peer: string;
+  readonly maxEventBytes: number;
+  dispatched(result: Dispatched): void;
+  isClosed(): boolean;
+  onClose(listener: () => void): void;
+}
+
+const internals = new WeakMap<object, HostInternals<object, ActionSpec, InputSpec>>();
+
+/** The internals of a handle `hostStore` returned, or `undefined`. */
+export function hostInternals<S extends object, A extends ActionSpec, I extends InputSpec>(
+  handle: HostedStoreHandle<S, A, I>,
+): HostInternals<S, A, I> | undefined {
+  return internals.get(handle) as HostInternals<S, A, I> | undefined;
+}
+
 function randomHex(bytes: number): string {
   const buffer = new Uint8Array(bytes);
   crypto.getRandomValues(buffer);
@@ -236,7 +358,7 @@ const decoder = new TextDecoder();
  */
 export function hostStore<S extends object, A extends ActionSpec, I extends InputSpec>(
   options: HostStoreOptions<S, A, I>,
-): HostedStoreHandle<S> {
+): HostedStoreHandle<S, A, I> {
   const streamId = options.streamId ?? `store/${options.definition.id}`;
   const address = options.store ?? options.definition.id;
   const taken = addressesByTransport.get(options.transport) ?? new Set<string>();
@@ -255,6 +377,15 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     store: address,
     authorize: options.authorize,
     project: options.project,
+    projectFor: options.projectFor,
+    onEvent: options.onEvent,
+    areaOf: options.areaOf,
+    warn:
+      options.dev === true
+        ? message => console.warn(`[@net-mesh/browser] ${message}`)
+        : typeof options.dev === 'function'
+          ? options.dev
+          : undefined,
     actions: options.actions,
     inputs: options.inputs,
     maxEventBytes: options.maxEventBytes,
@@ -263,6 +394,24 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     newIncarnation: options.newIncarnation ?? (() => randomHex(8) as Hex),
     canProject: options.canProject ?? (() => true),
   });
+  // Declared secrets become the HIDDEN marker in a player's view, and
+  // the view must pass the state validator. Checked now, against the
+  // initial state as a stranger would see it, so a validator that
+  // refuses the marker fails here rather than sending every player
+  // `empty()` in silence.
+  if (options.definition.visibility !== undefined) {
+    const stranger = applyVisibility(compileVisibility(options.definition.visibility), options.initialState, null);
+    try {
+      options.definition.state(stranger);
+    } catch (error) {
+      throw new StoreError(
+        'invalid-data',
+        `store '${options.definition.id}': the state validator rejects a view with secrets hidden — ` +
+          `wrap each field a rule hides with hiddenOr(…): ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+  }
   owner.commit(options.initialState);
 
   const replies = new Map<string, TransportStream>();
@@ -420,9 +569,32 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     // reply exactly like the synchronous one, or the caller waits on a
     // result that was computed and never sent.
     if (result.deferred !== null) {
-      detached(result.deferred.then(later => emit(later.out)));
+      detached(result.deferred.then(later => dispatched(later)));
+    }
+    flushEvents();
+  }
+
+  /**
+   * Run the `onEvent` hook for whatever the frame just dispatched
+   * caused — a join, a leave, an area change — AFTER that frame's own
+   * output is on its way, and send what the hook changed. Never
+   * re-entered: a hook's own changes are drained by the same call.
+   */
+  let flushing = false;
+  function flushEvents(): void {
+    if (flushing || closed) return;
+    flushing = true;
+    try {
+      const drained = owner.drainEvents();
+      if (drained.out.length > 0) detached(emit(drained.out));
+    } finally {
+      flushing = false;
     }
   }
+
+  const siblings = ownersByTransport.get(options.transport) ?? new Set();
+  siblings.add(owner);
+  ownersByTransport.set(options.transport, siblings);
 
   const unsubscribe = options.transport.onEvent(event => {
     // No `closed` test here: `close` UNSUBSCRIBES, so a closed host
@@ -483,6 +655,22 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     // as `foreign-stream` for the life of the page. Which store a
     // JOIN is for is decided before this, by `join.store`
     // (`owner.ts`); this is what keeps the id learned from it right.
+    const siblings = ownersByTransport.get(options.transport);
+    if (siblings !== undefined && siblings.size > 1) {
+      const h = namedHandle(text);
+      if (h !== null && owner.handle(h) === undefined) {
+        // Not ours. The store that issued it answers; if none did, only
+        // the first store says `closed`, so the caller hears it once.
+        let ownedElsewhere = false;
+        for (const sibling of siblings) {
+          if (sibling !== owner && sibling.handle(h) !== undefined) ownedElsewhere = true;
+        }
+        if (ownedElsewhere || siblings.values().next().value !== owner) {
+          dropped['sibling-handle'] = (dropped['sibling-handle'] ?? 0) + 1;
+          return;
+        }
+      }
+    }
     const outcome = owner.receive(text, authenticated);
     if (arrived !== undefined && arrivesOn === null && outcome.refused === null) {
       arrivesOn = arrived;
@@ -607,6 +795,7 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     pendingReplies.clear();
     // The name is free again, so a successor may take it.
     addressesByTransport.get(options.transport)?.delete(address);
+    ownersByTransport.get(options.transport)?.delete(owner);
   }
 
   /**
@@ -648,8 +837,11 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     });
   }
 
-  return {
-    authority: options.transport.nodeIdHex() ?? owner.incarnationHex,
+  const authority = options.transport.nodeIdHex() ?? owner.incarnationHex;
+  const closeListeners = new Set<() => void>();
+  const handle: HostedStoreHandle<S, A, I> = {
+    authority,
+    definition: options.definition,
     getState: () => owner.getState(),
     subscribe: listener => owner.subscribe(listener),
     setState: next => {
@@ -658,10 +850,19 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       // joined on.
       dispatched(owner.commit(next));
     },
+    setEntities: (collection, changes) => {
+      dispatched(owner.commitEntities(collection, changes));
+    },
+    setEntity: (collection, id, value) => {
+      const changes: Record<string, unknown> = {};
+      Object.defineProperty(changes, id, { value, enumerable: true, writable: true, configurable: true });
+      dispatched(owner.commitEntities(collection, changes));
+    },
     counts: () => ({
       handles: owner.handleCount,
       ledgers: owner.ledgerCount,
       deferred: owner.deferredCount,
+      sparseViews: owner.sparseViews,
     }),
     counters: () => ({ ...owner.snapshotCounters(), ...dropped }),
     close: () => {
@@ -673,8 +874,25 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       // streams out from under the frames still in flight. A review
       // probe measured ZERO goodbyes delivered under a concurrent
       // close where one call delivers one.
-      closing ??= shutdown();
+      if (closing === null) {
+        closing = shutdown();
+        for (const listener of [...closeListeners]) listener();
+        closeListeners.clear();
+      }
       return closing;
     },
   };
+  internals.set(handle, {
+    owner: owner as unknown as StoreOwner<object, ActionSpec, InputSpec>,
+    // The spelling `AccessRequest.peer` and `ActionContext.peer`
+    // promise: 16 lowercase hex, as a replica's frames are handed.
+    peer: peerHexOf(authority) ?? authority,
+    maxEventBytes: options.maxEventBytes,
+    dispatched,
+    isClosed: () => closed,
+    onClose: listener => {
+      closeListeners.add(listener);
+    },
+  } as HostInternals<object, ActionSpec, InputSpec>);
+  return handle;
 }

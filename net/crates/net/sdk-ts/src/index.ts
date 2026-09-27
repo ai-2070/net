@@ -116,8 +116,26 @@ export {
   TokenError,
   channelHash,
   delegateToken,
+  streamIdFromLabel,
   verifySignature,
 } from './identity';
+
+// Serve the browser package's store from a native node.
+export { meshStoreTransport } from './store-transport';
+export type {
+  MeshStoreTransport,
+  MeshStoreTransportOptions,
+  StoreTransportFrame,
+  StoreTransportNode,
+} from './store-transport';
+export { persistStore, restoreStore } from './store-persist';
+export type {
+  PersistableDefinition,
+  PersistableStore,
+  PersistStoreOptions,
+  RestoredStore,
+  StorePersistence,
+} from './store-persist';
 export type { TokenScope, TokenErrorKind, IssueTokenOptions } from './identity';
 
 // Capabilities (announce + find-peers).

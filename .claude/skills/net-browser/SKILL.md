@@ -1,10 +1,10 @@
 ---
 name: net-browser
-description: "Use this skill when the target is a **browser page** — Net in a tab, or a multiplayer Three.js game built on it. Covers: **`@net-mesh/browser`** (a sibling package to the Node SDK, never a sub-path of it) riding a **WebRTC DataChannel** to a native **anchor** ('run Net in a browser', 'WebRTC transport', 'connect a page to the mesh'). **One node per origin** — Web Lock election, leader vs follower tabs, `connect()` vs `openSession()`, a follower promoted when the holder closes, generation fencing. **The anchor + bootstrap credential** (`net-mesh anchor credential mint`, `credentialB64`, `bootstrapUrl`), the ICE/STUN split, and the ICE-failure classification (`udp-blocked` needs two observations; `ice-timeout` alone is not evidence). **Leaf-to-leaf sessions** (`connectPeer` / `acceptPeer`), streams with a required `reliability`, and the typed `LeafError` / `RtcError` / `RpcError` kinds — including `rpc-indeterminate` from a frozen leader, which must not be retried. **The networked store** for game state: `defineStore`, `hostStore`, `joinStore`, one authoritative document with replicas, audiences with `project`/`authorize`, correlated `act` versus coalesced `input`, chunked snapshots, the twelve `StoreError` codes, and `bindEntities` from `@net-mesh/browser/three` binding entities to a scene graph ('multiplayer game state', 'authoritative game document', 'three.js networked store', 'multiplayer browser game', 'sync players', 'one player hosts'). Skip for native/Node/Python/Go/C mesh work, and for editing Net's own internals."
+description: "Use this skill when the target is a **browser page** — Net in a tab, or a multiplayer Three.js game built on it. Covers: **`@net-mesh/browser`** (a sibling package to the Node SDK, never a sub-path of it) riding a **WebRTC DataChannel** to a native **anchor** ('run Net in a browser', 'WebRTC transport', 'connect a page to the mesh'). **One node per origin** — Web Lock election, leader vs follower tabs, `connect()` vs `openSession()`, a follower promoted when the holder closes, generation fencing. **The anchor + bootstrap credential** (`net-mesh anchor credential mint`, `credentialB64`, `bootstrapUrl`), the ICE/STUN split, and the ICE-failure classification (`udp-blocked` needs two observations; `ice-timeout` alone is not evidence). **Leaf-to-leaf sessions** (`connectPeer` / `acceptPeer`), streams with a required `reliability`, and the typed `LeafError` / `RtcError` / `RpcError` kinds — including `rpc-indeterminate` from a frozen leader, which must not be retried. **The networked store** for game state: `defineStore`, `hostStore`, `joinStore`, `hostPlayer` (the host's own player), `createLobby` / `listLobbies` / `joinLobby` (lobbies, room codes, capacity, kick), interest management for large worlds (`interest` keys, `cellsAround` / `stickyCells`, `setInterest`), declared `visibility` (rules, presets, `hiddenOr`, `assertHidden`), the `onEvent` hook (join / leave / area) and inventory helpers (`addItems` / `removeItems` / `onlyOwn`), `createLocalMesh` from `@net-mesh/browser/local` (offline prototyping in one page), one authoritative document with replicas, audiences with `project`/`authorize`, correlated `act` versus coalesced `input`, chunked snapshots, the twelve `StoreError` codes, and `bindEntities` from `@net-mesh/browser/three` binding entities to a scene graph ('multiplayer game state', 'authoritative game document', 'three.js networked store', 'multiplayer browser game', 'sync players', 'one player hosts'). **Game anchors**: `requestCredential` / `rememberedIdentity` against `net-mesh anchor serve --game`. **Lossy streams** (`openStream({ lossy: true })`) and **netcode** from `@net-mesh/browser/netcode` (`hostNetcode` / `joinNetcode`: prediction, reconciliation, interpolation, lag compensation, interest keys). **Large worlds** from `@net-mesh/browser/world`: regions (`announceRegions`, `regionDirectory`, `joinWorld`), at-most-once entity handoff between region hosts (`regionHandoffs`, `handoffLink`), cross-border actions and ghosting. **Dedicated Node hosts** through `@net-mesh/sdk`'s `meshStoreTransport` and `persistStore` / `restoreStore`. Skip for native/Node/Python/Go/C mesh work that has no browser in it, and for editing Net's own internals."
 allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 metadata:
   skill-version: 1.0.0
-  last-updated: 2026-09-26
+  last-updated: 2026-09-27
   net-version: 0.37.0
 ---
 
@@ -29,17 +29,21 @@ model that a client-prediction habit will get wrong.
 ## Building a game? The fast path
 
 1. **Read `store.md`** — its opening example and § Game recipe are the runnable
-   shape (host player renders from `host`, joiners `joinStore`, `enlist` keyed
-   by `context.peer`, re-announce, poll `query` before joining).
+   shape (host player via `hostPlayer(host)`, joiners `joinStore`, `enlist` keyed
+   by `context.peer`, and `createLobby` / `listLobbies` / `joinLobby` for
+   finding each other).
 2. **Use `connect()`, one tab per player** — a store over `openSession` is not
    established. Test two players with two browser profiles, not two tabs.
-3. **The anchor is `examples/browser-demo/host`** — from the Rust workspace
-   root (net/crates/net), `cargo run --release --manifest-path
-   examples/browser-demo/host/Cargo.toml -- --headless --seconds 600`; each
-   player's credential is the `credentialB64` from its `/config?tab=N`.
-   `net-mesh anchor serve` cannot host a browser today.
-4. **Prototype game logic offline** in `net/crates/net/browser-ts/demo/` — a host
-   and two players in one page over a local bus, the real store, no network.
+3. **The anchor is `net-mesh anchor serve --issuer-identity <key> --game <id>`**
+   (plus `--psk-file`, `--url`, `--tls-cert`/`--tls-key`, `--allow-origin`).
+   Each player asks it for an anonymous credential and keeps one identity:
+   `const { credentialB64, bootstrapUrl } = await requestCredential({ anchorUrl,
+   game })`, then `connect({ credentialB64, bootstrapUrl, ...rememberedIdentity()
+   })`. One credential is one player (another identity presenting it is refused).
+   Several games may share one anchor; it keeps their players apart.
+4. **Prototype game logic offline** with `createLocalMesh()` from
+   `@net-mesh/browser/local` — several nodes in one page, the real store, no
+   anchor, no network.
 5. **Render with `bindEntities`** from `@net-mesh/browser/three`.
 6. **Walkthrough for game developers:** `net/crates/net/browser-ts/README.md`.
 
@@ -49,8 +53,10 @@ model that a client-prediction habit will get wrong.
 |---|---|
 | `concepts.md` | **Always first** — the mental model. A tab is a node; the anchor finds peers rather than carrying traffic; one node per origin; a store has one authority; what a browser *cannot* do. ~6 min. |
 | `session.md` | Connecting and staying connected — `connect()` vs `openSession()`, the bootstrap credential, ICE/STUN and the UDP probe, leader/follower lifecycle, leaf-to-leaf peer sessions, streams, the event union, identity and the origin trust boundary. |
+| `netcode.md` | Responsive movement — `hostNetcode` / `joinNetcode` from `@net-mesh/browser/netcode`: host tick loop, snapshot interpolation, prediction and reconciliation, capped lag compensation, clock sync, all on the lossy carrier (`openStream({ lossy: true })`). |
+| `world.md` | Large worlds — `@net-mesh/browser/world`: regions each hosted as a store, `announceRegions` / `regionDirectory` (with `trustedHosts`), at-most-once entity handoff between region hosts (`regionHandoffs`, `handoffLink`, `storeRegion`), cross-border actions (`forward`), ghosting, and a player's merged view across regions (`joinWorld`). |
 | `store.md` | Multiplayer state — `defineStore` / `hostStore` / `joinStore`, audiences and projection, `act` vs `input`, snapshots and their bounds, expiry/resync/revocation, the `StoreError` codes, and `bindEntities` to a scene graph. |
-| `errors.md` | A rejection you have to classify. The full `LeafError` kind table, the admission/carriage/no-answer split, `udp-blocked`'s two observations, and `rpc-indeterminate`. |
+| `errors.md` | A rejection you have to classify. The full `LeafError` kind table, the admission/carriage/no-answer split, `udp-blocked`'s two observations, `rpc-indeterminate`, and the `CredentialRequestError` / `LobbyError` / `BorderActionError` codes. |
 | `source-access.md` | You are not inside the Net repository and need to open a file this skill cites, or a mechanism this skill only summarizes. One command fetches the whole tree; the page carries the root map. |
 
 ## TL;DR mental model
@@ -102,19 +108,22 @@ model that a client-prediction habit will get wrong.
    `openSession` takes `capabilities` and `subscriptions` **up front** so a new
    leader can restore them without being asked.
 3. **Get the credential from the anchor, and know its scope.** `credentialB64`
-   is signed and secret-bearing; the leaf presents it unmodified. **`net-mesh
-   anchor serve` cannot host a browser today** — it registers no enrollment
-   service, so `connect()` times out with `rpc-timeout`. The only anchor a page
-   can use is the browser-demo host: from the workspace root (net/crates/net),
-   `cargo run --release --manifest-path examples/browser-demo/host/Cargo.toml --
-   --headless --seconds 600`, which serves `/config?tab=N` returning a `credentialB64` per tab. `anchor
-   credential mint` needs no extra feature; `anchor ls` / `stats` / `serve` need
-   the CLI's `rtc-bootstrap` feature — see `session.md`.
-4. **Wire identity deliberately.** By default the leaf generates the identity
-   from the platform CSPRNG and persists it under a non-extractable key. The
-   origin is the trust boundary: any script on it can ask the browser to use that
-   key, so a deployment that needs the key elsewhere must inject it custodially
-   (`entitySecretHex` + `noiseSecretHex`).
+   is signed and secret-bearing; the leaf presents it unmodified. A game's
+   anchor issues one per visitor: `net-mesh anchor serve --issuer-identity
+   <key> --game <id> …` serves `POST <url>/credential {"game"}`, which
+   `requestCredential({ anchorUrl, game })` calls; refusals are a typed
+   `CredentialRequestError` (`unknown-game`, `rate-limited`, …). The credential
+   binds to the first identity that enrolls with it, which may reconnect with it
+   for 12 h. Without `--game` the anchor serves no enrollment and `connect()`
+   times out with `rpc-timeout`; `anchor credential mint` still mints one by
+   hand. `anchor ls` / `stats` / `serve` need the CLI's `rtc-bootstrap` feature
+   — see `session.md`.
+4. **Wire identity deliberately.** `openSession()` persists its identity (in
+   IndexedDB, under a non-extractable key); **`connect()` does not** — without
+   `entitySecretHex` + `noiseSecretHex` every page load is a new node. Games run
+   on `connect()`, so pass `...rememberedIdentity()`, which keeps both secrets in
+   `localStorage`. Either way the origin is the trust boundary: script on it
+   can use the key.
 5. **Keep the lifecycle honest.** Subscribe before you need deliveries, and on a
    session declare channels in `subscriptions` rather than subscribing late — a
    tab that only called `subscribe()` after a handoff leaves a window where

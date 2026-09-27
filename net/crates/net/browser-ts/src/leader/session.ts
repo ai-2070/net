@@ -348,8 +348,23 @@ export class MeshSession {
    * runs on the leader tab's node. A step whose attempt was replaced
    * while the request was in flight is refused by the leaf before it
    * touches the replacement, and arrives here as `superseded`.
+   *
+   * **Idempotent on a healthy pair**, as `BrowserNode.connectPeer` is: an
+   * already-direct, open pair resolves `direct` with its live dialog and
+   * nothing is offered — a second offer would replace the working link
+   * and close it under the peer. A leader too old to answer that reading
+   * is asked for an offer, as before.
    */
   async connectPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
+    let settled: string | undefined;
+    try {
+      settled = (await this.inner.peer_direct_dialog(nodeIdHex)) ?? undefined;
+    } catch {
+      // A closed session is refused by the offer below, typed; an older
+      // leader simply has no such reading.
+      settled = undefined;
+    }
+    if (settled !== undefined) return { type: 'direct', peer: nodeIdHex, dialog: settled };
     return driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus);
   }
 

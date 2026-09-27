@@ -78,6 +78,9 @@ const pending = new Map();
 /// session's own teardown: the report has to be readable after the
 /// node it belonged to is gone.
 const reentry = new Map();
+// Netcode hosts started by `netcode_host`, keyed by session.
+const netcodes = new Map();
+
 /// Streams opened by `stream_open`, keyed by the runner's handle.
 ///
 /// Each entry holds the PACKAGE's `LeafStream` — the object
@@ -904,6 +907,7 @@ async function execute(step) {
       };
       if (step.label) opts.label = step.label;
       if (step.stream_id) opts.streamId = step.stream_id;
+      if (step.lossy) opts.lossy = true;
       if (step.channel_hash !== null && step.channel_hash !== undefined) {
         opts.channelHash = step.channel_hash;
       }
@@ -2347,6 +2351,121 @@ async function execute(step) {
       };
     }
 
+    case 'netcode_host': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const { hostNetcode } = await import('/browser/netcode/index.js');
+      const ships = new Map();
+      const applied = [];
+      const host = hostNetcode({
+        transport: node,
+        label: step.label,
+        tickRate: 30,
+        step: ({ inputs }) => {
+          for (const [peer, list] of inputs) {
+            for (const input of list) {
+              applied.push(input.seq);
+              ships.set(peer, { x: (ships.get(peer)?.x ?? 0) + input.data.dx });
+            }
+          }
+        },
+        snapshot: () => Object.fromEntries(ships),
+      });
+      netcodes.set(step.session, { host, ships, applied });
+      return { ok: true };
+    }
+    case 'netcode_close': {
+      const entry = netcodes.get(step.session);
+      entry?.host.close();
+      netcodes.delete(step.session);
+      return { ok: true };
+    }
+    case 'netcode_report': {
+      const node = nodes.get(step.session);
+      const entry = netcodes.get(step.session);
+      if (!node || !entry) return { ok: false, error: 'no netcode host on ' + step.session };
+      const counters = node.rtcStats().counters;
+      return {
+        ok: true,
+        stats: {
+          x: entry.ships.get(step.peer_hex)?.x ?? null,
+          applied: entry.applied.length,
+          unique: new Set(entry.applied).size,
+          players: entry.host.players().length,
+          lossy_ingress: Number(counters.lossy_ingress ?? 0),
+          lossy_written: Number(counters.lossy_written ?? 0),
+          rtc: JSON.stringify(counters),
+          dropped: JSON.stringify(entry.host.dropped),
+          last_error: entry.host.lastSendError,
+        },
+      };
+    }
+    case 'netcode_play': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const { joinNetcode } = await import('/browser/netcode/index.js');
+      const self = node.nodeIdHex();
+      const move = (ship, input) => ({ x: ship.x + input.dx });
+      const net = joinNetcode({ transport: node, host: step.host_hex, label: step.label, local: { id: self, predict: move } });
+      const until = async (check, ms) => {
+        const deadline = performance.now() + ms;
+        while (!check()) {
+          if (performance.now() > deadline) return false;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        return true;
+      };
+      try {
+        if (!(await until(() => net.stats().snapshots > 0, 30000))) {
+          let leaf = null;
+          try {
+            const raw = typeof node.counters === 'function' ? node.counters() : null;
+            leaf = raw && { ...raw, drops: typeof raw.drops === 'object' ? JSON.stringify(raw.drops) : raw.drops };
+          } catch (e) {
+            leaf = String(e);
+          }
+          return {
+            ok: false,
+            error: 'no netcode snapshot within 30 s',
+            stats: {
+              netcode: JSON.stringify(net.stats()),
+              rtc: JSON.stringify(node.rtcStats().counters),
+              leaf: JSON.stringify(leaf),
+            },
+          };
+        }
+        net.input({ dx: 0 });
+        let immediate = true;
+        for (let i = 0; i < step.inputs; i += 1) {
+          const before = net.view()[self]?.x;
+          net.input({ dx: 1 });
+          if (before !== undefined && net.view()[self]?.x !== before + 1) immediate = false;
+          await new Promise(resolve => setTimeout(resolve, 33));
+        }
+        const settled = await until(
+          () => net.stats().pendingInputs === 0 && net.view()[self]?.x === step.inputs,
+          30000,
+        );
+        const stats = net.stats();
+        const counters = node.rtcStats().counters;
+        return {
+          ok: settled,
+          error: settled ? undefined : 'inputs not all acknowledged within 30 s',
+          stats: {
+            x: net.view()[self]?.x ?? null,
+            immediate,
+            corrections: stats.corrections,
+            snapshots: stats.snapshots,
+            clock_samples: stats.clock?.samples ?? 0,
+            rtt_ms: Math.round(stats.clock?.rttMs ?? -1),
+            lossy_written: Number(counters.lossy_written ?? 0),
+            lossy_ingress: Number(counters.lossy_ingress ?? 0),
+          },
+        };
+      } finally {
+        net.close();
+      }
+    }
     case 'store_close': {
       const host = hosts.get(step.handle);
       const joined = joins.get(step.handle);

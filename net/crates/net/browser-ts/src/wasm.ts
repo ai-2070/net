@@ -77,6 +77,25 @@ export interface LeafWasmStreamOptions {
    * spelling, exactly as `connectPeer` refuses one.
    */
   peer?: string;
+  /**
+   * **Ride the lossy carrier** — for high-rate state where only the newest
+   * value matters (positions, inputs). With `reliability: 'fireAndForget'`
+   * only; `true` with `'reliable'` throws.
+   *
+   * Every stream normally shares one ordered, fully retransmitted
+   * DataChannel, so one lost packet delays everything behind it. A lossy
+   * stream's packets ride a second, unordered channel with no
+   * retransmits: each arrives promptly or not at all, and none delays
+   * anything else. A packet that would queue behind a backed-up buffer is
+   * dropped instead (it would be stale on arrival). The receiver sees a
+   * fire-and-forget stream as always: gaps are skipped and anything older
+   * than what it already delivered is dropped — the newest value wins.
+   *
+   * Direct `connect()` nodes only for now: {@link MeshSession.openStream}
+   * refuses it. A peer or anchor that opens no lossy channel still gets
+   * the packets, on the reliable one.
+   */
+  lossy?: boolean;
 }
 
 /**
@@ -493,6 +512,13 @@ export interface LeafWasmNode {
    * already there.
    */
   peer_offer(peer_hex: string): Promise<string>;
+  /**
+   * The live attempt's dialog when `peer` is already a healthy direct
+   * pair (session installed, no relay entry, transport open), else
+   * `undefined`. What makes `connectPeer` idempotent: a second offer
+   * would replace — and close — the working link.
+   */
+  peer_direct_dialog(peer_hex: string): string | undefined;
   /**
    * Answer the offer `peer` sent, from the **verified envelope** that
    * arrived — not from anything the caller supplies. Resolves to the

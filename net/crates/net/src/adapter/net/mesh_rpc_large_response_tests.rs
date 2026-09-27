@@ -10,6 +10,10 @@ use crate::adapter::net::mesh_rpc::{CallOptions, RpcError};
 use crate::adapter::net::DEFAULT_STREAM_WINDOW_BYTES;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// How long a call may take to reach its handler. A liveness wait, not the
+/// property under test: 1 s timed out on a loaded CI runner.
+const HANDLER_ENTRY_WAIT: Duration = Duration::from_secs(5);
+
 async fn connected_pair(start: bool) -> (Arc<MeshNode>, Arc<MeshNode>) {
     async fn node() -> Arc<MeshNode> {
         Arc::new(
@@ -220,7 +224,7 @@ async fn partial_call_cleanup(end: End) {
                 .await
         })
     };
-    let call_id = tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+    let call_id = tokio::time::timeout(HANDLER_ENTRY_WAIT, entered_rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -315,7 +319,7 @@ async fn partial_call_cleanup(end: End) {
                     .await
             })
         };
-        let control_id = tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+        let control_id = tokio::time::timeout(HANDLER_ENTRY_WAIT, entered_rx.recv())
             .await
             .expect("control call must reach the handler")
             .expect("handler reports its call id");

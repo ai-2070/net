@@ -518,6 +518,7 @@ mod tests {
             stream_id: 9,
             channel_hash: 0,
             reliability: crate::stream::Reliability::Reliable,
+            lossy: false,
         };
 
         let (owner, id) = owned.adopt(handle).expect("a readable identity is adopted");

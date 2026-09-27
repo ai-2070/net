@@ -26,7 +26,45 @@ An anchor is an ordinary native node built with `--features webrtc` and the `rtc
 
 **What is proven, and where.** Real Chromium and real Firefox run the browser matrix against a real anchor in CI, including a NAT conformance matrix (cone, port-restricted, symmetric) behind actual NATs. The wasm node replays the cross-language wire fixtures inside the browser runtime, and the two-tab demo in `net/crates/net/examples/browser-demo/` sustains a direct 60 Hz link with a `--check` mode that makes five assertions on the anchor itself.
 
-**Not in this release, deliberately.** No TURN server and no rescue for a network that blocks UDP outright — that surfaces as the typed `udp-blocked` failure rather than a hang. ICE-TCP candidates, native-to-native WebRTC, mDNS resolution on the anchor, and browser-side RedEX/Dataforts are all deferred. WebKit is recorded in CI but never gates; the store witnesses gate on Chromium and run `continue-on-error` on Firefox. Anchors are not packaged or published yet — you build them, and you build `@net-mesh/browser` with `net-mesh-leaf` from the repo, together (they share a wasm-bindgen boundary and must never be version-skewed).
+**Not in this release, deliberately.** No TURN server and no rescue for a network that blocks UDP outright — that surfaces as the typed `udp-blocked` failure rather than a hang. ICE-TCP candidates, native-to-native WebRTC, mDNS resolution on the anchor, and browser-side RedEX/Dataforts are all deferred. WebKit is recorded in CI but never gates; the store witnesses gate on Chromium and run `continue-on-error` on Firefox.
+
+**Getting it.** `@net-mesh/browser` is published to npm with this release, with the `net-mesh-leaf` wasm inside it, so a page needs nothing built from the repo. The anchor is the CLI built with its anchor feature: `cargo install net-cli --features rtc-bootstrap`. The prebuilt CLI binaries do not carry it. The package and its anchor are one release: they share the wire, and an older anchor does not know the lossy channel below.
+
+---
+
+## Games in a browser
+
+The first half of this release made a tab a node. This half makes it a player. Everything below is in `@net-mesh/browser`, and all of it runs on the same anchor, the same node and the same store.
+
+**An anchor that serves games, not just pages.** `net-mesh anchor serve` takes `--issuer-identity` and one `--game ID[:N]` per game it admits. A page asks `POST /credential` (the package's `requestCredential()`) for a short-lived anonymous credential for one game and enrolls with it. No account, and no secret in the page. Each game gets its own enrollment root derived from the issuer key, and invites verify themselves: an invite binds to the first device that presents it, which may come back with it, and any other device presenting it is refused as a replay. Games on one anchor are kept apart all the way down. Announcements, the replay a new page receives on attach, and relayed transit all carry the game's tenant, so a rival game's player never sees your lobby. Issuance is limited per game (`--game ID:N`, N credentials a minute, 600 by default) and per source IP (`--credentials-per-minute`), each game has its own counters (`--game-stats-secs`), and `rememberedIdentity()` makes a returning player the same node.
+
+**Lobbies.** `createLobby`, `listLobbies` and `joinLobby` are lobbies with room codes, capacity and kick, built on the node's own signed announcements and a store. There is no lobby server.
+
+**A channel that is allowed to lose packets.** Next to the reliable DataChannel, a page and an anchor (or two pages) now open a second, unordered channel with no retransmits: `openStream({ reliability: 'fireAndForget', lossy: true })`. A packet on it is written now or dropped and counted, never queued behind anything, which is what position updates want. It is available on `connect()` only; a follower tab's session refuses it. Natively the same stream is `StreamConfig::lossy`, and on the wire it is one new packet flag.
+
+**Netcode that feels local.** `@net-mesh/browser/netcode` is an authoritative-host tick loop (`hostNetcode`) and a player (`joinNetcode`) over that lossy channel:
+- **Prediction:** your own entity moves the frame you press a key.
+- **Reconciliation:** corrections replay your unacknowledged inputs over the host's word and blend in over `correctionSmoothingMs` rather than snapping.
+- **Interpolation:** everyone else renders a little in the past between snapshots, with `extrapolateMs` if you want them to carry on through a late one.
+- **The protocol under it:** clock sync, redundant inputs applied exactly once on the host, lag compensation capped at 200 ms, per-player interest keys, and snapshots cut into self-contained chunks, so one lost packet costs a few entities for one tick rather than the frame.
+
+This is netcode "model 2"; rollback and lockstep are deliberately not in it.
+
+**Worlds bigger than one host.** `@net-mesh/browser/world` cuts a map into regions, each its own store on a host that announces it.
+- **One view:** `joinWorld` keeps a player's replicas of the regions around it and merges them into a single view for `bindEntities`.
+- **Crossing borders:** an entity moves to another region's host **at most once**. The source freezes it and offers it; the target decides each offer once and gives every repeat the same answer; a crash between them leaves it frozen and typed `unresolved`, never live twice.
+- **Across the border:** a neighbour can be asked to act on something it owns (`forward`), again at most once, and entities near a border are mirrored read-only to the neighbour (ghosting).
+- **Proof:** the handoff and cross-border protocols are proven by a deterministic simulation (300 seeds of loss, duplication, reordering and crashes) and exercised on native hosts. A ship crosses with no visible pop or duplicate in a watching player's view; with its destination killed mid-crossing, the ship recovers exactly once after the destination restarts from its snapshot.
+
+**A host that costs what it touches.**
+- **Entity writes:** a store definition can declare a per-entity parser (`entities`), and `setEntities` / `setEntity` validate only what they write. 8,000 entities went from about 16 ms a commit to about 2 ms.
+- **Per-player views:** with declared visibility, each player's update projects only the changed entities. 8,000 entities under an `owner` rule with 16 players went from 459 ms to 25 ms a commit.
+
+**Dedicated hosts in Node.** `@net-mesh/sdk` gains `meshStoreTransport(mesh)`, which serves (or joins) the browser store, netcode and worlds from a native node, discovery included. It also gains `persistStore` / `restoreStore`, which snapshot a host's document to RedEX and restore it on start.
+
+**What is proven, and where.** A CI job runs the whole path in headless Chromium against the real CLI anchor (`browser-acceptance`, ten named checks). Two players enroll with credentials the anchor issued, one lists and joins the other's lobby, and they play netcode over the lossy channel. The same run refuses an unknown game, a player presenting another player's credential, and a rival game's lobby, and it checks the anchor's own per-game counters. The browser matrix witnesses the lossy channel and netcode between two real browsers on a direct pair.
+
+**Not in this release.** Region load balancing (splitting and merging regions), binary netcode frames, host migration between players, and a shared multi-game anchor service are all planned and not built.
 
 ---
 
@@ -146,6 +184,8 @@ Alongside it, reliable streams gained in-order delivery on the receive side: the
 ## Everything else in the box
 
 - **A third skill, and examples that run.** `.claude/skills/` gained `net-browser` (the tab-as-node and the networked store), and the checked-example corpus grew from a two-route install check to eleven routes across five bindings, executed in CI and matched against a manifest. The plan's proposal to relocate example sources to a neutral directory was explicitly rejected in favour of a neutral *index*; the files stay where their build systems expect them. The README got a positioning rewrite, and `check-readmes.py` exists but is not yet wired into a workflow — a known gap rather than a claim.
+- **nRPC: a cancel that overtakes its request now cancels it.** A protected request passes admission before it reaches the server, and a cancel does not, so a fast cancel (a hedged call whose backup already won) could arrive first and be dropped, and the handler then ran to completion. The server now remembers such a cancel for 30 seconds, bounded, keyed to the peer that sent it.
+- **Two stores on one node no longer refuse each other's players.** Every hosted store sees every frame, and one that did not issue a handle used to answer `closed` for it.
 - **A guard against silent API breaks.** `net/crates/net/guards/org_api_probe` pins the public org and streaming signatures and fails the build when one changes without the change being announced. It is the mechanism that makes the source breaks listed below safe to publish as a list.
 - **One version for the workspace.** Every crate now inherits a single workspace version, checked in CI. The 0.36 cycle shipped a broken Python lower/upper bound by rewriting one line in the wrong place; this is the structural answer to that class of mistake.
 - **CI and test infrastructure.** A new `natsim-enroll.yml` workflow runs the NAT matrix for the enrollment path. Test execution itself got cheaper — `debug = "line-tables-only"`, JUnit-based verification instead of re-running named witnesses, one feature graph per integration family — which is a developer-facing change with no user-facing surface.
@@ -188,7 +228,8 @@ Grouped by who feels them. Everything not listed is additive.
 
 - `submitTask` accepts an optional `taskId`, plus optional `service`/`revision` addressing a catalog entry — free-path only. A paid catalog entry refuses the uncharged submit verb before the executor runs. Paid A2A has no Node twin in either direction.
 - The org/streaming verbs are additive: `callStreamingBytes`, `callClientStreamBytes`, `callDuplexBytes`, the `serveOrg*` family, and typed wrappers in `@net-mesh/sdk`.
-- `@net-mesh/browser` is a new package with its own break list inside it, and one rule worth repeating: it must be upgraded together with `net-mesh-leaf`, because the two share a wasm-bindgen boundary that fails at the call site rather than at install time.
+- `@net-mesh/browser` is a new package, published to npm for the first time with this release, with the `net-mesh-leaf` wasm bundled inside it. The rule worth repeating is about the anchor: run one from this same release. An older anchor does not know the lossy channel and treats it as the page's only channel.
+- `@net-mesh/sdk` gains `meshStoreTransport`, `persistStore` / `restoreStore`, `MeshNode.onStreamData`, `streamIdFromLabel` and `StreamConfig.lossy`. All additive.
 
 **Python**
 
@@ -203,7 +244,7 @@ Grouped by who feels them. Everything not listed is additive.
 2. **Fix your CLI scripts first.** Add `--local` to every temporary-supervisor read command, add it to `aggregator ls` if you wanted the development snapshot, and rewrite any `jq -s '.[1]'` on an ICE commit. Then decide what a real `--timeout` should be per command — the flag now means what it says, and a command that cannot honour it will refuse it.
 3. **If you sell A2A tasks:** put the journal on a local filesystem, treat `<path>.owner` as part of the store, and wire `unresolved()` / `a2a_unresolved()` into your paging. Choose `reservation_retention_secs` deliberately — it has no default. Upgrade every requester that polls a configured provider's status, in every language, before that provider serves paid work, or it will read `interrupted` as a decode error.
 4. **If you use organization streaming:** rebuild Go and C consumers against the current headers, and take the Rust source changes above. Then decide how you feel about cross-org floors: if you do not import a caller organization's revocation bundles, you are permitting every cross-org caller until its certificate expires.
-5. **If you run browsers:** build `net-mesh-leaf` and `@net-mesh/browser` from the repo, together, and stand up an anchor with `--features webrtc`. Treat `udp-blocked` as a real outcome rather than a bug — a network that blocks UDP is unsupported in this release, and the typed failure is the whole of the answer.
+5. **If you run browsers:** `npm install @net-mesh/browser`, and stand up an anchor from this same release with `cargo install net-cli --features rtc-bootstrap` and `net-mesh anchor serve` (add `--issuer-identity` and a `--game` per game to issue player credentials). Treat `udp-blocked` as a real outcome rather than a bug — a network that blocks UDP is unsupported in this release, and the typed failure is the whole of the answer.
 6. **If you run a relay:** it is a blind forwarder with no TLS on its TCP path and no secret of yours in it. Deploy it as you would any untrusted-but-critical hop, and leave `DEFAULT_RELAY` empty until you have one.
 7. **Rust callers:** add the `input_hash` parameter, the new A2A fields, and the org-streaming source changes; the guard crate will tell you if you missed one.
 
@@ -213,18 +254,18 @@ Grouped by who feels them. Everything not listed is additive.
 
 The cycle is **1,482 non-merge commits over 1,105 files (+489,438 / −12,861)** from `v0.36.0` to the 0.37.0 bump — the largest cycle in the series, roughly twice the diff of the 0.34 release that held the record before it, and the first to add a workspace member for the portable wire layer.
 
-- **New:** `net-mesh-wire` (the tokio-free, wasm-clean wire crate, now a workspace member and the core's dependency), the `net-mesh-leaf` browser node and the `@net-mesh/browser` package (both outside the root workspace, built together), and the two CI guard crates under `net/crates/net/guards/`.
+- **New:** `net-mesh-wire` (the tokio-free, wasm-clean wire crate, now a workspace member and the core's dependency), the `net-mesh-leaf` browser node and the `@net-mesh/browser` package (both outside the root workspace, built together and published as one npm package), and the two CI guard crates under `net/crates/net/guards/`.
 - **Toolchain:** Rust `1.97.1 → 1.98.1`, same component set.
 - **Rust dependencies:** the browser transport is most of the churn. It brought in the WebRTC stack (`str0m` 0.24.0 on the rust-crypto backend, `sctp-proto`, `dimpl`), a WebSocket client for signalling (`tokio-tungstenite`/`tungstenite`), an HTTP server for the anchor's bootstrap endpoint (`axum`, and `tower-http` 0.6.11 → 0.7.1), and certificate plumbing for it (`instant-acme`, `rcgen`, `rustls-pemfile`, the `x509-*`/`der-parser` family) over `aws-lc-rs` as rustls's crypto backend. The wasm side added `wasm-bindgen-test` and `minicov`, so the leaf's test runner and its coverage work in the browser runtime. Elsewhere: `portable-pty`, `serial2`, `shell-words`, `dunce`, `fs_extra` and `shared_library` for the CLI's new surfaces.
 - **Notable bumps:** `rustls` 0.23.43 → 0.23.45, `hyper` 1.11.0 → 1.11.1, `reqwest` 0.13.4 → 0.13.5, `napi` 3.12.1 → 3.13.0, `wasm-bindgen` 0.2.127 → 0.2.129 (pinned exactly — it is the leaf/package boundary), `syn` 3.0.3 → 3.0.6, `uuid` 1.24.0 → 1.26.1, `redis` 1.5.0 → 1.7.1, `fastcdc` 4.0.1 → 5.0.0, `num-bigint` 0.4.8 → 0.5.1, `blake2` 0.10.6 → 0.11.0, `miniz_oxide` 0.8.9 → 0.9.1, `toml` 1.1.4 → 1.1.6, `dirs` 6.0.0 → 7.0.0, `pest` 2.9.0 → 2.9.2. Two crates left the graph entirely (`arrayref`, `tinyvec_macros`).
 - **Web and npm:** Next 16.3.0 → 16.3.6, React 19.2.8 → 19.3.0, Sentry 10.70.0 → 11.0.0, Prisma 7.9.1 → 7.10.0, tRPC 11.18.0 → 11.19.0, better-auth 1.6.27 → 1.7.6, motion 13.1.0 → 13.4.4, plus the usual axios, TanStack and PostHog drift.
 - **Build:** one workspace version (`[workspace.package]`), with a new `check-versions.py` CI guard that every published version agrees.
-- **CI:** a new `natsim-enroll.yml` workflow, plus `natsim.yml`, `skills.yml`, `ci.yml`, `release-crates.yml` and `panic-probe-witness.yml` updated for the new crates, packages and matrices.
-- **Docs and web:** the release notes, the CLI reference, `TRANSPORT.md`, `SENSING.md` and `ORGANIZATIONS.md` all moved with their tracks; the docs site gained a protected-streaming guide. The Claude-skills page still says "the two skills" and does not mention `net-browser` — a stale line, not a stale feature.
+- **CI:** a new `browser-acceptance` job (the CLI anchor and two headless players), a new `natsim-enroll.yml` workflow, plus `natsim.yml`, `skills.yml`, `ci.yml`, `release-crates.yml` and `panic-probe-witness.yml` updated for the new crates, packages and matrices.
+- **Docs and web:** the release notes, the CLI reference, `TRANSPORT.md`, `SENSING.md` and `ORGANIZATIONS.md` all moved with their tracks; the docs site gained a protected-streaming guide. The browser SDK pages cover the game anchor, lobbies, netcode and worlds, and the `net-browser` skill gained `netcode.md` and `world.md`.
 
 ---
 
-Released 2026-09-26.
+Released 2026-09-27.
 
 ## License
 

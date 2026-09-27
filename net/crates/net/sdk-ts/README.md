@@ -119,6 +119,32 @@ rpc.raw.close();   // release before node.shutdown()
 For services rather than tools, nRPC gives you the same shape with deadlines,
 streaming and cancellation — [Typed RPC](https://ai2070.net/docs/guides/nrpc).
 
+## A dedicated host for browser games
+
+The browser package's networked store (`@net-mesh/browser`'s `hostStore`)
+can run on a native node, so a game world outlives any one player's tab and
+no player holds the whole world:
+
+```typescript
+import { MeshNode, meshStoreTransport } from '@net-mesh/sdk';
+import { hostStore } from '@net-mesh/browser';
+
+const mesh = await MeshNode.create({ bindAddr: '0.0.0.0:9000', psk });
+await mesh.start();
+const host = hostStore({
+  definition: world,                                   // the same definition the pages use
+  transport: meshStoreTransport(mesh, { listen: ['store/my-game.world'] }),
+  initialState, maxEventBytes: 8104, authorize, actions, inputs,
+});
+```
+
+`meshStoreTransport` receives with `mesh.onStreamData(streamId, handler)`,
+which delivers each event with the peer whose session authenticated it —
+the identity every `authorize` decision rests on (`recv` has no sender). A
+host lists its store labels in `listen` (`store/<definition id>` by
+default) because players write first; `streamIdFromLabel(label)` is the id
+a browser page derives for the same label.
+
 ## The bus
 
 `NetNode` is the other node type: a sharded, in-process event bus with explicit

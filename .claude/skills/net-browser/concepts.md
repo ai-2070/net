@@ -81,7 +81,8 @@ store**. It is not a CRDT and not a lock-step replication protocol; the shape is
   the audience names, the actions, the inputs and the projection function. Both
   ends of a store instance share it; a version disagreement is a typed refusal.
 - **An `audience`** is a name describing *who is reading* (`'crew'`,
-  `'command'`). `project(state, audience)` decides what that audience may see,
+  `'command'`). `project(state, audience)` decides what that audience may see (or
+  `projectFor(state, { peer, audience })`, what that one player may see),
   and `authorize(request)` decides whether a request is allowed at all.
 - **`act` is a correlated transaction** — it executes on the host and its result
   comes back to the caller. **`input` is coalesced and unacknowledged** — the
@@ -92,8 +93,8 @@ store**. It is not a CRDT and not a lock-step replication protocol; the shape is
 Three traps a game hits first (the full recipe is `store.md` § Game recipe):
 
 - **The host cannot `joinStore` its own node** — it throws `invalid-data`. The
-  hosting player renders from the `hostStore` handle and plays through the same
-  handlers.
+  hosting player uses `hostPlayer(host, { audience })`: a replica-shaped handle
+  held to the same `authorize`, handlers and projection.
 - **Announcements are leases.** A host that announces once vanishes from
   `query` a few seconds later; re-announce on a timer.
 - **Two tabs are one player.** Same origin + same browser profile = one node, so

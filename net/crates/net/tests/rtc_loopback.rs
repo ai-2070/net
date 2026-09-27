@@ -360,3 +360,121 @@ async fn the_delivery_sequence_survives_a_datachannel_close() {
         "a send onto a closed DataChannel must fail loudly, not vanish"
     );
 }
+
+/// The lossy carrier (`net_wire::carrier`), native ↔ native: a packet
+/// stamped `LOSSY` is written on the unordered, zero-retransmit channel
+/// and arrives on it; a packet without the flag never touches it. The
+/// offer opens both channels and the answerer tells them apart by label.
+///
+/// Inverse: have the answerer ignore the label (take every channel as the
+/// reliable one) and nothing is ever counted as lossy ingress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lossy_packet_rides_the_lossy_channel_and_a_plain_one_does_not() {
+    use net::adapter::net::{PacketFlags, HEADER_SIZE};
+    use net_wire::protocol::MAGIC;
+    let (a, b, id_a, _id_b) = rtc_pair().await;
+    let sender = a.rtc_driver().expect("driver");
+    let receiver = b.rtc_driver().expect("driver");
+    let datagram = |flags: PacketFlags| {
+        let mut packet = vec![0u8; HEADER_SIZE];
+        packet[..2].copy_from_slice(&MAGIC.to_le_bytes());
+        packet[3] = flags.bits();
+        packet
+    };
+
+    // The lossy channel may open a moment after the reliable one: offer
+    // until it carries one.
+    let arrived = wait_for(
+        || {
+            let _ = sender
+                .transport()
+                .submit(&datagram(PacketFlags::LOSSY), id_a);
+            receiver.stats().lossy_ingress() > 0
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(arrived, "a LOSSY packet arrives on the lossy channel");
+    assert!(sender.stats().lossy_written() > 0);
+
+    // Let every lossy packet the wait above submitted land before the
+    // baseline, or a late one reads as a plain packet on the wrong channel.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (lossy_before, written_before) =
+        (receiver.stats().lossy_ingress(), sender.stats().written());
+    for _ in 0..5 {
+        sender
+            .transport()
+            .submit(&datagram(PacketFlags::NONE), id_a)
+            .expect("submit");
+    }
+    assert!(
+        wait_for(
+            || sender.stats().written() >= written_before + 5,
+            Duration::from_secs(5)
+        )
+        .await,
+        "plain packets go out on the reliable channel"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        receiver.stats().lossy_ingress(),
+        lossy_before,
+        "and never on the lossy one"
+    );
+}
+
+/// A NATIVE sender's lossy stream (`StreamConfig::with_lossy`) stamps its
+/// packets LOSSY, so they ride the lossy channel — what a dedicated host
+/// sending snapshots to browsers needs — and they are still delivered, to
+/// a stream sink, attributed to the sender.
+///
+/// Inverse: stop `send_on_stream` stamping LOSSY and `lossy_ingress`
+/// stays flat (the first assertion fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_lossy_stream_rides_the_lossy_channel_and_delivers() {
+    use net::adapter::net::{StreamConfig, StreamInboundSink};
+    let (a, b, _id_a, _id_b) = rtc_pair().await;
+    const SID: u64 = 0x0002_0000_0000_7A11;
+    type Seen = Arc<parking_lot::Mutex<Vec<(u64, Vec<u8>)>>>;
+    let seen: Seen = Arc::default();
+    let sink: StreamInboundSink = {
+        let seen = seen.clone();
+        Arc::new(move |event| seen.lock().push((event.from_node, event.payload.to_vec())))
+    };
+    b.register_stream_inbound(SID, sink).expect("vacant");
+    let receiver = b.rtc_driver().expect("driver");
+    let before = receiver.stats().lossy_ingress();
+
+    let stream = a
+        .open_stream(b.node_id(), SID, StreamConfig::new().with_lossy(true))
+        .expect("open");
+    // The lossy channel may open a moment after the reliable one; until it
+    // does, lossy packets ride the reliable one. Send until it carries.
+    let carried = wait_for(
+        || {
+            let a = a.clone();
+            let stream = stream.clone();
+            tokio::spawn(async move {
+                let _ = a
+                    .send_on_stream(&stream, &[bytes::Bytes::from_static(b"snapshot")])
+                    .await;
+            });
+            receiver.stats().lossy_ingress() > before
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        carried,
+        "a native lossy stream's packets arrive on the lossy channel"
+    );
+    assert!(
+        wait_for(|| !seen.lock().is_empty(), Duration::from_secs(5)).await,
+        "and are delivered"
+    );
+    let seen = seen.lock().clone();
+    assert!(seen
+        .iter()
+        .all(|(from, payload)| *from == a.node_id() && payload == b"snapshot"));
+}

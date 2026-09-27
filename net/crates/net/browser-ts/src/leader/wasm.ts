@@ -140,6 +140,11 @@ export interface LeafWasmSession {
    * before it can drive the replacement.
    */
   peer_offer(peer_hex: string): Promise<string>;
+  /**
+   * The live attempt's dialog when the pair is already direct and open on
+   * the leader, else `undefined`. An older leader refuses the op.
+   */
+  peer_direct_dialog(peer_hex: string): Promise<string | undefined>;
   peer_accept_offer(peer_hex: string): Promise<string>;
   peer_candidate(peer_hex: string, dialog_hex: string): Promise<string>;
   peer_handshake(peer_hex: string, dialog_hex: string): Promise<string>;

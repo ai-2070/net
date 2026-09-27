@@ -24,6 +24,7 @@
  */
 
 import type { StoreError } from './errors.js';
+import type { Visibility } from './visibility.js';
 
 /** Deeply-readonly view of validated plain state. */
 export type ReadonlyState<T> = T extends readonly (infer V)[]
@@ -71,7 +72,47 @@ export interface StoreDefinition<
     };
   };
   readonly inputs: { readonly [K in keyof I]: Parse<I[K]> };
+  /**
+   * What each player may see, declared: `'open'`, a preset, or path →
+   * rule. Enforced by the host after any hand-written projection. See
+   * `visibility.ts`.
+   */
+  readonly visibility?: Visibility;
+  /**
+   * Interest management: for each top-level entity map, the key an
+   * entity is found under — a grid cell, a room, any string (`null`:
+   * always delivered). A replica that declares an interest set receives
+   * only the entities whose key is in it. Used by the host; a joiner may
+   * omit it.
+   */
+  readonly interest?: { readonly [collection: string]: (entity: never, id: string) => string | null };
+  /**
+   * Per-entity validators, for the top-level entity maps whose validity is
+   * **per entity**: collection name → a parser for ONE entity.
+   *
+   * What makes {@link HostedStoreHandle.setEntities} cheap. An entity
+   * write validates only the entities it changes, and it commits without
+   * running {@link StoreDefinition.state} over the untouched world. That
+   * is the whole-document validator, which costs O(world) on every commit.
+   *
+   * **A contract, not a hint.** Declaring a collection here says that
+   * `state`'s rule for that key is exactly "a record of entities, each
+   * passing this parser", with no cross-entity or cross-collection
+   * invariant. `setEntities` trusts that, so an invariant that `state`
+   * enforces across entities is not enforced on this path. Keep such
+   * invariants in actions, or write through `setState`.
+   */
+  readonly entities?: { readonly [collection: string]: Parse<unknown> };
 }
+
+/** The top-level keys of `S` whose values are entity maps. */
+export type EntityCollection<S extends object> = {
+  [K in keyof S & string]: S[K] extends Readonly<Record<string, unknown>> ? K : never;
+}[keyof S & string];
+
+/** One entity of collection `C` of `S`. */
+export type EntityOf<S extends object, C extends keyof S> =
+  S[C] extends Readonly<Record<string, infer E>> ? E : never;
 
 /** Where a handle is in its lifecycle. Kept out of game state. */
 export type StorePhase =

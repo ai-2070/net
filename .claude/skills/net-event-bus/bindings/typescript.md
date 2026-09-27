@@ -141,6 +141,39 @@ An unset deadline in `OrgCallOptions` — and this is a **streaming**-verb contr
 which `call` does not take — means the facade's **300 s** protected-streaming
 lifetime, never "no deadline". Full contract: `org.md`.
 
+## Serving browser games from Node
+
+`@net-mesh/sdk` can host (or join) what `@net-mesh/browser` pages run, from a
+native node — a dedicated host that outlives any player:
+
+```typescript
+import { MeshNode, Redex, meshStoreTransport, persistStore, restoreStore } from '@net-mesh/sdk';
+import { hostStore } from '@net-mesh/browser';
+
+const transport = meshStoreTransport(mesh, { listen: ['store/my-game.world'] });
+const file = new Redex({ persistentDir: './state' }).openFile('game/world', { persistent: true, retentionMaxEvents: 4n });
+const restored = restoreStore(file, world);                 // null on a first start
+const host = hostStore({ definition: world, transport, initialState: restored?.state ?? fresh(), … });
+const saving = persistStore(host, { file, intervalMs: 5_000 });
+```
+
+- **`meshStoreTransport(mesh, { listen })`** is the browser package's
+  transport over a native node: `openStream` / `onEvent` over
+  `openStream` + `onStreamData`, keyed by `streamIdFromLabel`. A host must
+  **`listen`** on its labels (`store/<definition id>` unless the store sets
+  `streamId`, the netcode label, the handoff label) before anyone writes. It
+  also has `announce(tags)` (which replaces this node's tags) and
+  `query(tag)`, so lobbies and world regions run on a native node. Peers must
+  already have sessions (`connect` / `accept`).
+- **`persistStore(host, { file, intervalMs })`** snapshots the host's document
+  to a RedEX file, only when it changed and again on `close()`, and
+  `flush()` writes one now. **`restoreStore(file, definition)`** returns the
+  newest snapshot whose store id and version match and that passes the
+  validator, or `null`. A snapshot from another version is skipped, never
+  migrated.
+- Netcode (`hostNetcode`) and world regions (`regionHandoffs`, `joinWorld`)
+  take the same transport. The browser side is the `net-browser` skill.
+
 ## Gaps
 
 `bindings/coverage.md` is authoritative. The one to know up front: A2A is

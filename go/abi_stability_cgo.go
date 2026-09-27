@@ -21,6 +21,7 @@ package net
 
 /*
 #include <stdint.h>
+#include "net.h"
 
 static uint64_t abi_stability_u64_roundtrip(uint64_t v) { return v; }
 */
@@ -31,4 +32,17 @@ import "C"
 // the result. Called only from the ABI-stability test.
 func abiStabilityU64Roundtrip(v uint64) uint64 {
 	return uint64(C.abi_stability_u64_roundtrip(C.uint64_t(v)))
+}
+
+// abiStabilityStreamOccupiedCode is NET_ERR_MESH_STREAM_OCCUPIED as the C
+// header declares it, so a test can pin the header's value and the Go
+// mapping against each other.
+func abiStabilityStreamOccupiedCode() int {
+	return int(C.NET_ERR_MESH_STREAM_OCCUPIED)
+}
+
+// abiStabilityMeshError runs a raw C return code through the mesh error
+// mapping the binding uses.
+func abiStabilityMeshError(code int) error {
+	return meshErrorFromCode(C.int(code))
 }

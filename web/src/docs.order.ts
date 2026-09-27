@@ -56,7 +56,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     // The browser surface is not the announce/discover/invoke spine: it is a
     // different runtime with its own entry points, so it is organised by what
     // a page does with it rather than by the capability path.
-    "sdk/browser": ["quickstart", "session", "store", "three", "errors"],
+    "sdk/browser": ["quickstart", "session", "store", "netcode", "world", "three", "errors"],
     "sdk/python": [
       "quickstart",
       "announce",
@@ -174,6 +174,9 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // Releases — newest first.
     releases: [
+      "RELEASE_v0.37_TURBO_LOVER",
+      "RELEASE_v0.36_PARANOID",
+      "RELEASE_v0.35_DOUBLEBACK",
       "RELEASE_v0.34_HOTEL_CALIFORNIA",
       "RELEASE_v0.33_CIRCUS_MAXIMUS",
       "RELEASE_v0.32_SUMMER_MADNESS",

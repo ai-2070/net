@@ -13,7 +13,7 @@ const session = await openSession({
 });
 
 // A harness, or a page that is deliberately the one node: THIS TAB's node.
-const node = await connect({ credentialB64, bootstrapUrl: 'https://anchor.example/rtc/bootstrap' });
+const node = await connect({ credentialB64, bootstrapUrl: 'https://anchor.example' });
 ```
 
 | | `connect()` | `openSession()` |
@@ -43,9 +43,13 @@ doing nothing — that is the point of the typed surface.
 ```typescript
 const node = await connect({
   credentialB64,                                    // minted by the anchor
-  bootstrapUrl: 'https://anchor.example/rtc/bootstrap',
+  bootstrapUrl: 'https://anchor.example',           // optional; the credential carries it
 });
 ```
+
+`bootstrapUrl` is the anchor's **base URL**, not an endpoint: the leaf appends
+`/rtc/anchor`, `/rtc/offer` and `/rtc/trickle` itself. A URL that already ends
+in a path (`…/rtc/bootstrap`) points every request at the wrong place.
 
 `credentialB64` is issued by the anchor (`net-mesh anchor credential mint`,
 `net-mesh anchor credential inspect`) and is **signed and secret-bearing**; the
@@ -54,16 +58,28 @@ signature. `credential mint` / `inspect` need no extra feature; the anchor's
 live verbs (`ls`, `stats`, `serve`) need the CLI's `rtc-bootstrap` feature —
 standard CLI packaging does not include them.
 
-**`net-mesh anchor serve` cannot host a browser today.** It serves the bootstrap
-listener but registers no enrollment service, so a page's `connect()` times out
-with `rpc-timeout`. The only anchor a page can use is the browser-demo host —
-from the Rust workspace root (net/crates/net):
+**A game's anchor issues credentials itself.** With `--game` (and the issuer's
+key file, `--issuer-identity`), `net-mesh anchor serve` serves enrollment and
+`POST <url>/credential {"game"}`:
 
 ```sh
-cargo run --release --manifest-path examples/browser-demo/host/Cargo.toml -- --headless --seconds 600
+net-mesh anchor serve --psk-file psk.hex \
+  --url https://anchor.example.com --tls-cert cert.pem --tls-key key.pem \
+  --allow-origin https://game.example.com \
+  --issuer-identity issuer.toml --game my-game
 ```
 
-It serves `GET /config?tab=N`, whose JSON carries a `credentialB64` per tab.
+A page calls `requestCredential({ anchorUrl, game })` and passes the result to
+`connect()` with `...rememberedIdentity()`. Each credential is anonymous and
+binds to the first identity that enrolls with it (which may reconnect with it
+for 12 h); another identity presenting it is refused as a replay, surfacing
+from `connect()` as `identity: the anchor rejected enrollment: replay`.
+Without `--game` the anchor registers no enrollment service and `connect()`
+times out with `rpc-timeout`. Several games on one anchor are kept apart: the
+anchor records which game admitted each session and neither floods, replays
+nor relays between games, so a player never discovers another game's lobbies.
+`examples/anchor-acceptance` runs the whole flow with real browsers, a rival
+game included.
 
 **ICE configuration.** `iceServers` is optional with a working default: omitted,
 the leaf gathers against the `stun_addr` the anchor announces on `GET
@@ -113,6 +129,10 @@ Rules that bite:
   `peerAttempt(hex)` reads the attempt's status without driving it, and
   `handshakePeer(hex, dialog)` completes a dialog you already hold; a
   `MeshSession` has `connectPeer` / `acceptPeer` but neither of those.
+- **`connectPeer` on an already-direct, open pair is a no-op** that resolves
+  `direct`, on `connect()`'s node and on a `MeshSession` alike, so calling it
+  "to be sure" is safe. (A follower whose leader is from an older release
+  still re-offers.)
 - **ICE may fail.** `outcome` is a reading, not a promise of connectivity; see
   `errors.md` for what an ICE failure does and does not prove, and
   `refineIceFailure` (a `BrowserNode` method) for turning a raw failure into a
@@ -147,6 +167,20 @@ for await (const bytes of stream) consume(bytes);   // ends when the node or str
   a routed pair upgrades to direct, `send` on the old handle rejects with
   `session` ("stale stream handle … reopen the stream"). Reopen with the same
   `peer` and `streamId` rather than assuming continuity.
+- **`lossy: true` rides a second, unordered DataChannel with no retransmits**
+  (`openStream({ reliability: 'fireAndForget', peer, label, lossy: true })`).
+  A packet arrives promptly or not at all, and none delays anything else: use it
+  for positions and inputs, where only the newest value matters. The rules:
+  - It is valid **with `'fireAndForget'` only**; with `'reliable'` it throws.
+  - It is available on **`connect()` only**; a `MeshSession`'s `openStream`
+    refuses it.
+  - A packet that would queue behind a backed-up buffer is dropped (and
+    counted), never queued.
+  - A peer or anchor that opens no lossy channel still gets the packets, on
+    the reliable one. The anchor must be the same release, since an older one
+    does not know the second channel.
+
+  Netcode (`netcode.md`) is built on it.
 - **Size limits.** A leaf fragments up to 8 pieces / 64 832 B and refuses above
   that with a typed `wire` error naming streams. A peer that does not advertise
   fragment reassembly is refused at the ordinary event bound.

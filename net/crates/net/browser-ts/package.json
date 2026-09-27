@@ -17,6 +17,18 @@
     "./three": {
       "types": "./dist/three/index.d.ts",
       "default": "./dist/three/index.js"
+    },
+    "./local": {
+      "types": "./dist/local.d.ts",
+      "default": "./dist/local.js"
+    },
+    "./netcode": {
+      "types": "./dist/netcode/index.d.ts",
+      "default": "./dist/netcode/index.js"
+    },
+    "./world": {
+      "types": "./dist/world/index.d.ts",
+      "default": "./dist/world/index.js"
     }
   },
   "sideEffects": false,
@@ -44,8 +56,10 @@
   "scripts": {
     "build": "tsc && node scripts/bundle.mjs",
     "size": "node scripts/size.mjs",
+    "check:package": "node scripts/check-package.mjs",
     "test": "tsc -p tsconfig.test.json && vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "bench:world": "node scripts/bench-world.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.28.0",

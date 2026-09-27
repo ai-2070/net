@@ -2044,6 +2044,102 @@ impl RetainedChain {
 ///
 /// `Clone`: every field is an `Arc` handle or a small config copy,
 /// so a clone is ~a round of refcount bumps. The SI-6.1 trailing-
+/// One event from a stream a sink is registered for
+/// ([`MeshNode::register_stream_inbound`]).
+///
+/// `from_node` is the peer whose **installed session decrypted** the
+/// packet — the authenticated sender, never a value the packet carries.
+/// It is the identity a consumer may authorize on, which is exactly what
+/// the shard queue (`poll_shard`) cannot offer: a `StoredEvent` has no
+/// sender at all.
+#[derive(Debug, Clone)]
+pub struct StreamInboundEvent {
+    /// The authenticated sender's node id.
+    pub from_node: u64,
+    /// The stream the event arrived on.
+    pub stream_id: u64,
+    /// One event's payload, as the sender framed it.
+    pub payload: Bytes,
+}
+
+/// A registered stream sink. Called on the receive path, once per
+/// event, in delivery order: it must not block. Hand the event to a
+/// channel or a thread-safe callback and return.
+pub type StreamInboundSink = Arc<dyn Fn(StreamInboundEvent) + Send + Sync + 'static>;
+
+/// Registered stream sinks by full stream id: `(registration_id, sink)`.
+type StreamInboundMap = DashMap<u64, (u64, StreamInboundSink)>;
+
+/// A queue of one stream's events, each with its authenticated sender
+/// ([`MeshNode::open_stream_inbox`]). Closing — or dropping — it
+/// unregisters the sink, and the stream's events go back to the shard
+/// queue. Holds the node weakly: an open inbox never keeps a node alive.
+pub struct StreamInbox {
+    node: std::sync::Weak<MeshNode>,
+    stream_id: u64,
+    registration_id: u64,
+    rx: parking_lot::Mutex<std::sync::mpsc::Receiver<StreamInboundEvent>>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl StreamInbox {
+    /// The stream this inbox receives.
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// The next event, waiting up to `timeout`; `None` on timeout or once
+    /// closed.
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<StreamInboundEvent> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        self.rx.lock().recv_timeout(timeout).ok()
+    }
+
+    /// The next event if one is waiting; never blocks.
+    pub fn try_recv(&self) -> Option<StreamInboundEvent> {
+        self.rx.lock().try_recv().ok()
+    }
+
+    /// Whether [`Self::close`] has run.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Events dropped because `capacity` were already waiting.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Stop receiving. Idempotent; `true` only for the call that
+    /// unregistered the sink.
+    pub fn close(&self) -> bool {
+        if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return false;
+        }
+        self.node.upgrade().is_some_and(|node| {
+            node.unregister_stream_inbound(self.stream_id, self.registration_id)
+        })
+    }
+}
+
+impl Drop for StreamInbox {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl std::fmt::Debug for StreamInbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamInbox")
+            .field("stream_id", &self.stream_id)
+            .field("dropped", &self.dropped())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The per-`u16`-wire-bucket list of registered nRPC inbound
 /// dispatchers: `(canonical ChannelHash, registration_id,
 /// dispatcher)` (OA2-E0.1 — the id enables conditional teardown).
@@ -2224,6 +2320,10 @@ struct DispatchCtx {
     // evict a newer registration for the same canonical channel.
     #[cfg(feature = "cortex")]
     rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
+    /// Registered stream sinks ([`MeshNode::register_stream_inbound`]):
+    /// a stream with one bypasses the shard queue and is delivered WITH
+    /// its authenticated sender.
+    stream_inbound: Arc<StreamInboundMap>,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
     ///
@@ -10618,6 +10718,19 @@ fn snapshot_peers(peers: &DashMap<u64, PeerInfo>, exclude: Option<u64>) -> Vec<P
         .collect()
 }
 
+/// A peer's enrollment tenant (P0 slice 2); `None` for native sessions.
+#[cfg(feature = "webrtc")]
+fn tenant_of(peers: &DashMap<u64, PeerInfo>, node_id: u64) -> Option<super::rtc::TenantId> {
+    peers.get(&node_id)?.admission.tenant()
+}
+
+/// Maps an Admitted enrollment grant (its delegation-chain bytes) to the
+/// tenant it was issued for. Installed by the application
+/// ([`MeshNode::set_enrollment_tenant_resolver`]).
+#[cfg(feature = "webrtc")]
+pub type EnrollmentTenantResolver =
+    Arc<dyn Fn(&[u8]) -> Option<super::rtc::TenantId> + Send + Sync>;
+
 /// When a hub replays held announcements to a newly attached peer (after
 /// the peer has had time to install the session, then once more).
 const REPLAY_SETTLE: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(2)];
@@ -11874,6 +11987,10 @@ pub struct MeshNode {
     /// touch the peer map (F3 router drain, F6 traversal, F7 proxy).
     #[cfg(feature = "webrtc")]
     provisional_endpoints: super::rtc::ProvisionalEndpoints,
+    /// Maps an Admitted enrollment grant to the tenant it was issued for
+    /// ([`Self::set_enrollment_tenant_resolver`]). `None`: no tenants.
+    #[cfg(feature = "webrtc")]
+    enrollment_tenant_resolver: parking_lot::RwLock<Option<EnrollmentTenantResolver>>,
     /// §12 step 4: the session incarnation an in-flight enrollment
     /// call was decoded against, keyed by `(node_id, call_id)`.
     /// Promotion consumes it and re-verifies the binding — a
@@ -12026,6 +12143,10 @@ pub struct MeshNode {
     // `DispatchCtx` field for the teardown rationale).
     #[cfg(feature = "cortex")]
     rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
+    /// Registered stream sinks, shared with every `DispatchCtx`.
+    stream_inbound: Arc<StreamInboundMap>,
+    /// Monotonic source of stream-sink registration ids.
+    stream_registration_seq: Arc<std::sync::atomic::AtomicU64>,
     /// OA2-E0.1: monotonic source of registration ids for
     /// [`Self::register_rpc_inbound`]. Bumped once per successful
     /// (vacant-only) registration so each carries a unique id that
@@ -14557,6 +14678,8 @@ impl MeshNode {
             #[cfg(feature = "webrtc")]
             provisional_endpoints,
             #[cfg(feature = "webrtc")]
+            enrollment_tenant_resolver: parking_lot::RwLock::new(None),
+            #[cfg(feature = "webrtc")]
             pending_promotions: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
             rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
@@ -14593,6 +14716,8 @@ impl MeshNode {
             inbound: Arc::new(DashMap::new()),
             #[cfg(feature = "cortex")]
             rpc_inbound_dispatchers: Arc::new(DashMap::new()),
+            stream_inbound: Arc::new(DashMap::new()),
+            stream_registration_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
             rpc_registration_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
@@ -26988,6 +27113,7 @@ impl MeshNode {
                 .map(|_| Arc::clone(&self.rtc_signal_tap)),
             #[cfg(feature = "cortex")]
             rpc_inbound_dispatchers: self.rpc_inbound_dispatchers.clone(),
+            stream_inbound: self.stream_inbound.clone(),
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
             org_revocation: self.org_revocation.clone(),
@@ -29033,6 +29159,26 @@ impl MeshNode {
                         stats.note_admission_refused_forward();
                     }) {
                         return;
+                    }
+                    // P0 slice 2: no relayed transit between sessions
+                    // enrolled for different tenants (games). The source
+                    // is the authenticated adjacent session, never the
+                    // header's claimed `src_id`; a destination that is
+                    // not a direct peer has no tenant here and passes
+                    // (multi-hop routing is not a browser path).
+                    #[cfg(feature = "webrtc")]
+                    {
+                        let source_tenant = ctx
+                            .addr_to_node
+                            .get(&source)
+                            .and_then(|node| tenant_of(&ctx.peers, *node));
+                        let dest_tenant = tenant_of(&ctx.peers, routing_header.dest_id);
+                        if !super::rtc::tenants_may_meet(source_tenant, dest_tenant) {
+                            if let Some(stats) = ctx.rtc_stats.as_ref() {
+                                stats.note_tenant_refused_transit();
+                            }
+                            return;
+                        }
                     }
                     // §10 part 2: count this forward for the pair,
                     // unless it is signalling. Reading
@@ -31857,6 +32003,29 @@ impl MeshNode {
             return;
         }
 
+        // A stream with a registered sink is delivered to it, WITH the
+        // authenticated sender, instead of the shard queue — the queue's
+        // `StoredEvent` has no sender, so a consumer that authorizes by
+        // peer (the browser store served from a native host) cannot be
+        // built on it. After the admission gate above (R1: a
+        // provisional peer's event is not delivered here either) and
+        // after the blob-transfer divert. One map lookup per packet;
+        // absent registrations fall through unchanged.
+        if let Some(sink) = ctx
+            .stream_inbound
+            .get(&stream_id)
+            .map(|entry| entry.1.clone())
+        {
+            for payload in events {
+                sink(StreamInboundEvent {
+                    from_node,
+                    stream_id,
+                    payload,
+                });
+            }
+            return;
+        }
+
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
@@ -33867,6 +34036,81 @@ impl MeshNode {
         self.rpc_inbound_dispatchers
             .remove_if(&wire, |_, v| v.is_empty());
         Some(removed)
+    }
+
+    /// Deliver every event arriving on `stream_id` to `sink`, with the
+    /// authenticated sender, instead of the shard queue.
+    ///
+    /// The shard queue (`poll_shard`) drops the sender: its
+    /// `StoredEvent` has none. A consumer that must know WHO sent each
+    /// event — authorizes on it, keys state by it — registers a sink
+    /// here and receives [`StreamInboundEvent`]s whose `from_node` is the
+    /// peer whose session decrypted the packet.
+    ///
+    /// Vacant-only, like [`Self::register_rpc_inbound`]: an occupied
+    /// stream id is left untouched and this returns `None`. On success
+    /// the returned registration id is what
+    /// [`Self::unregister_stream_inbound`] needs, so a stale teardown
+    /// cannot evict a newer registration.
+    pub fn register_stream_inbound(&self, stream_id: u64, sink: StreamInboundSink) -> Option<u64> {
+        use dashmap::mapref::entry::Entry;
+        match self.stream_inbound.entry(stream_id) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(slot) => {
+                let registration_id = self
+                    .stream_registration_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                slot.insert((registration_id, sink));
+                Some(registration_id)
+            }
+        }
+    }
+
+    /// A pull-based receiver for `stream_id`: a stream sink that queues
+    /// each [`StreamInboundEvent`] — with its authenticated sender — for
+    /// [`StreamInbox::recv_timeout`] to take.
+    ///
+    /// For callers that must not run on the receive path: a binding
+    /// whose callback would take a language lock (Python's GIL) or cross
+    /// an FFI boundary (cgo). At most `capacity` events wait; beyond
+    /// that an arriving event is DROPPED and counted
+    /// ([`StreamInbox::dropped`]) rather than stalling the mesh's
+    /// receive loop. `None` when the stream already has a sink.
+    pub fn open_stream_inbox(
+        self: &Arc<Self>,
+        stream_id: u64,
+        capacity: usize,
+    ) -> Option<StreamInbox> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity.max(1));
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sink: StreamInboundSink = {
+            let dropped = dropped.clone();
+            Arc::new(move |event| {
+                if tx.try_send(event).is_err() {
+                    dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+        let registration_id = self.register_stream_inbound(stream_id, sink)?;
+        Some(StreamInbox {
+            node: Arc::downgrade(self),
+            stream_id,
+            registration_id,
+            rx: parking_lot::Mutex::new(rx),
+            dropped,
+            closed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Remove the sink registered for `stream_id` under
+    /// `registration_id`. `false` — and nothing removed — when the id
+    /// does not match (a newer registration holds the stream). Events on
+    /// the stream then land in the shard queue again.
+    pub fn unregister_stream_inbound(&self, stream_id: u64, registration_id: u64) -> bool {
+        self.stream_inbound
+            .remove_if(&stream_id, |_, (id, _)| *id == registration_id)
+            .is_some()
     }
 
     /// Cheap probe: is a dispatcher already registered for this
@@ -39614,6 +39858,20 @@ impl MeshNode {
         expected_session_id: u64,
         expected_endpoint: PeerAddr,
     ) -> bool {
+        self.promote_admission_with_tenant(node_id, expected_session_id, expected_endpoint, None)
+    }
+
+    /// [`Self::promote_admission`], recording the tenant the enrollment
+    /// grant named (browser plan P0 slice 2). The tenant is bound to the
+    /// promoted incarnation, exactly like the promotion itself.
+    #[cfg(feature = "webrtc")]
+    pub fn promote_admission_with_tenant(
+        &self,
+        node_id: u64,
+        expected_session_id: u64,
+        expected_endpoint: PeerAddr,
+        tenant: Option<super::rtc::TenantId>,
+    ) -> bool {
         let Some(mut entry) = self.peers.get_mut(&node_id) else {
             return false;
         };
@@ -39627,6 +39885,7 @@ impl MeshNode {
         info.admission = super::rtc::PeerAdmission::Admitted {
             promoted_at: std::time::Instant::now(),
             session_id: expected_session_id,
+            tenant,
         };
         drop(entry);
         self.provisional_endpoints.remove(&expected_endpoint);
@@ -39761,6 +40020,7 @@ impl MeshNode {
             &super::rtc::enroll_reply_channel(origin),
             call_id,
             session,
+            None,
         )
     }
 
@@ -39862,6 +40122,7 @@ impl MeshNode {
         reply_channel: &str,
         call_id: u64,
         receiving_session_id: u64,
+        tenant: Option<super::rtc::TenantId>,
     ) -> bool {
         let Some(origin) = self.provisional_reply_origin(node_id) else {
             return false;
@@ -39885,7 +40146,34 @@ impl MeshNode {
             return false;
         };
         self.release_enrollment_slot_of(node_id, session_id);
-        self.promote_admission(node_id, session_id, endpoint)
+        self.promote_admission_with_tenant(node_id, session_id, endpoint, tenant)
+    }
+
+    /// Install how this node maps an Admitted enrollment grant (the
+    /// delegation-chain bytes the enrollment service answered with) to a
+    /// tenant. A game anchor maps each game's enrollment root to that
+    /// game. With a resolver installed, sessions enrolled for DIFFERENT
+    /// tenants are kept apart here: no announcement flooded or replayed
+    /// between them, no relayed transit between them
+    /// ([`super::rtc::tenants_may_meet`]). `None` removes it; sessions
+    /// already promoted keep the tenant they were promoted with.
+    #[cfg(feature = "webrtc")]
+    pub fn set_enrollment_tenant_resolver(&self, resolver: Option<EnrollmentTenantResolver>) {
+        *self.enrollment_tenant_resolver.write() = resolver;
+    }
+
+    /// The tenant `chain` (an Admitted grant) belongs to, per the
+    /// installed resolver.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn resolve_enrollment_tenant(&self, chain: &[u8]) -> Option<super::rtc::TenantId> {
+        let resolver = self.enrollment_tenant_resolver.read().clone()?;
+        resolver(chain)
+    }
+
+    /// The tenant `node_id`'s current session was enrolled for, if any.
+    #[cfg(feature = "webrtc")]
+    pub fn peer_tenant(&self, node_id: u64) -> Option<super::rtc::TenantId> {
+        self.peers.get(&node_id)?.admission.tenant()
     }
 
     /// **R6-B: which node actually holds the reservation for this
@@ -41382,6 +41670,13 @@ impl MeshNode {
         let sink = ctx.sink.clone();
         let partition_filter = ctx.partition_filter.clone();
         let router = ctx.router.clone();
+        // P0 slice 2: an announcement from a session enrolled for one
+        // tenant (game) is not flooded to sessions enrolled for another —
+        // discovery is how one game's players would otherwise find, and
+        // learn the keys of, another's.
+        #[cfg(feature = "webrtc")]
+        let (origin_tenant, rtc_stats) =
+            (tenant_of(&ctx.peers, origin_node_id), ctx.rtc_stats.clone());
 
         tokio::spawn(async move {
             // Split-horizon: consult the routing table for the
@@ -41392,7 +41687,30 @@ impl MeshNode {
             let next_hop_addr = router.routing_table().lookup(origin_node_id);
 
             // Snapshot FIRST (HOLD-2 item 2), same as the scoped path above.
-            for peer in snapshot_peers(&peers, Some(sender_node_id)) {
+            #[cfg(feature = "webrtc")]
+            let recipients: Vec<PeerRecipient> = peers
+                .iter()
+                .filter(|entry| entry.value().node_id != sender_node_id)
+                .filter(|entry| {
+                    let meets = super::rtc::tenants_may_meet(
+                        origin_tenant,
+                        entry.value().admission.tenant(),
+                    );
+                    if !meets {
+                        if let Some(stats) = rtc_stats.as_ref() {
+                            stats.note_tenant_withheld_announcement();
+                        }
+                    }
+                    meets
+                })
+                .map(|entry| PeerRecipient {
+                    addr: entry.value().addr(),
+                    session: entry.value().session.clone(),
+                })
+                .collect();
+            #[cfg(not(feature = "webrtc"))]
+            let recipients = snapshot_peers(&peers, Some(sender_node_id));
+            for peer in recipients {
                 if Some(peer.addr) == next_hop_addr {
                     continue; // split horizon: that's our path to the origin
                 }
@@ -41457,9 +41775,24 @@ impl MeshNode {
         peers: &DashMap<u64, PeerInfo>,
         sink: &PeerSink,
     ) {
+        // P0 slice 2: never replay one tenant's announcements to a session
+        // enrolled for another.
+        #[cfg(feature = "webrtc")]
+        let recipient_tenant = tenant_of(peers, peer);
         let held: Vec<Vec<u8>> = relay
             .iter()
             .filter(|e| *e.key() != peer && !e.value().is_expired())
+            .filter(|e| {
+                #[cfg(feature = "webrtc")]
+                {
+                    super::rtc::tenants_may_meet(tenant_of(peers, *e.key()), recipient_tenant)
+                }
+                #[cfg(not(feature = "webrtc"))]
+                {
+                    let _ = e;
+                    true
+                }
+            })
             .map(|e| e.value().to_bytes())
             .collect();
         if held.is_empty() {
@@ -47970,6 +48303,7 @@ impl MeshNode {
             || session
                 .try_stream(stream_id)
                 .is_some_and(|s| s.tx_promoted());
+        let lossy = stream.config().lossy;
         // Opt-in: bulk-transfer streams route their originating sends
         // through the FairScheduler (T-0.5) instead of straight to the
         // socket, so they participate in per-stream weighted fairness.
@@ -48062,6 +48396,10 @@ impl MeshNode {
         // disappears mid-call.
         let flags = if reliable {
             PacketFlags::RELIABLE
+        } else if lossy {
+            // `net_wire::carrier`: a browser session carries it on the
+            // unordered, zero-retransmit DataChannel.
+            PacketFlags::LOSSY
         } else {
             PacketFlags::NONE
         };
@@ -63166,6 +63504,14 @@ mod exported_discovery_pin_coherence_tests {
 #[path = "mesh_rpc_large_response_tests.rs"]
 mod rpc_large_response_lifecycle_tests;
 
+#[cfg(test)]
+#[path = "mesh_stream_inbound_tests.rs"]
+mod stream_inbound_tests;
+
+#[cfg(all(test, feature = "webrtc"))]
+#[path = "mesh_tenant_tests.rs"]
+mod tenant_tests;
+
 /// R1 (Kyra's HOLD on `b6e522bb5`): the `Stream` handle's config and
 /// the session's retransmit bookkeeping cannot disagree.
 ///
@@ -63886,7 +64232,11 @@ mod lifecycle_regression_tests {
 /// skipping: no announcement frame is flooded and no punch relay is
 /// emitted for a sender or destination with no peer entry at any
 /// check on that path.
-#[cfg(test)]
+// Every test here is `webrtc`-gated (the gates live on the WebRTC
+// forwarding paths), so the module is: gated per test only, its shared
+// helpers and imports were dead code — a clippy `-D warnings` failure —
+// in a default-feature lib-test build.
+#[cfg(all(test, feature = "webrtc"))]
 mod unresolvable_endpoint_gate_tests {
     use super::*;
     use std::net::SocketAddr;

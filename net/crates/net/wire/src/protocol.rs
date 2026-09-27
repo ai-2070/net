@@ -139,6 +139,14 @@ impl PacketFlags {
     /// the hole; the signal then raises the boundary and concedes
     /// what was actually fire-and-forget.
     pub const MODE_BOUNDARY: Self = Self(0b0100_0000);
+    /// **May ride a lossy, unordered carrier.** Set by the sender only
+    /// on the fire-and-forget data of a stream opened for it: a browser
+    /// session then sends the packet on its unordered, zero-retransmit
+    /// DataChannel ([`crate::carrier`]), where a loss never delays
+    /// anything else. Ignored by receivers — it changes how a packet
+    /// travels, not what it means — and never combined with a flag that
+    /// needs delivery.
+    pub const LOSSY: Self = Self(0b1000_0000);
 
     /// Create flags from raw bits
     #[inline]

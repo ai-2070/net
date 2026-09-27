@@ -129,6 +129,13 @@ export interface StreamConfig {
    * more packets per round. Default: `1`.
    */
   fairnessWeight?: number;
+  /**
+   * Ride the lossy carrier — for state where only the newest value
+   * matters. A fire-and-forget stream's packets then travel on a browser
+   * session's unordered, zero-retransmit DataChannel, where a lost one
+   * never delays anything. Refused with `reliability: 'reliable'`.
+   */
+  lossy?: boolean;
 }
 
 /** Per-stream stats snapshot. */
@@ -366,6 +373,25 @@ export interface MeshStream {
   readonly streamId: bigint;
   /** @internal napi-backed native handle. */
   readonly _native: unknown;
+}
+
+/** One event from {@link MeshNode.onStreamData}. */
+export interface StreamData {
+  /**
+   * The peer whose session decrypted this event — the authenticated
+   * sender, never a value the packet carries. What {@link MeshNode.recv}
+   * cannot tell you.
+   */
+  readonly peerNodeId: bigint;
+  readonly streamId: bigint;
+  readonly payload: Buffer;
+}
+
+/** Returned by {@link MeshNode.onStreamData}. */
+export interface StreamDataSubscription {
+  readonly streamId: bigint;
+  /** Stop delivering; the stream's events go back to `recv`. Idempotent. */
+  close(): boolean;
 }
 
 /**
@@ -606,6 +632,7 @@ export class MeshNode {
       reliability: config.reliability,
       windowBytes: config.windowBytes,
       fairnessWeight: config.fairnessWeight,
+      lossy: config.lossy,
     });
     return {
       peerNodeId,
@@ -617,6 +644,29 @@ export class MeshNode {
   /** Close a stream. Idempotent. */
   closeStream(peerNodeId: bigint, streamId: bigint): void {
     this.native.closeStream(peerNodeId, streamId);
+  }
+
+  /**
+   * Receive every event arriving on `streamId` — from any peer — with
+   * the peer that sent it, instead of through {@link recv}.
+   *
+   * `recv` returns events without a sender, which is fine for a feed
+   * and useless for anything that decides by who is asking. The sender
+   * here is the peer whose session authenticated the packet. One
+   * subscription per stream id; a second throws until the first is
+   * closed. Pair with {@link streamIdFromLabel} to agree on an id with a
+   * browser page.
+   */
+  onStreamData(streamId: bigint, handler: (data: StreamData) => void): StreamDataSubscription {
+    const native = this.native.onStreamData(streamId, event => {
+      handler({ peerNodeId: event.peerNodeId, streamId: event.streamId, payload: event.payload });
+    });
+    return {
+      get streamId() {
+        return native.streamId;
+      },
+      close: () => native.close(),
+    };
   }
 
   /**

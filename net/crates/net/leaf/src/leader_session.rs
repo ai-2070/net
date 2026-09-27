@@ -828,6 +828,14 @@ impl Lifecycle {
     /// spelling of it.
     pub async fn open_stream(&self, opts: &JsValue) -> Result<ProxyStream, JsError> {
         let options = crate::wasm::stream_options(opts)?;
+        if options.lossy {
+            // Not carried through the leader proxy yet: refused typed
+            // rather than silently opened on the reliable carrier.
+            return Err(JsError::new(
+                "lossy streams are available on a connect() node; an openSession() stream \
+                 is proxied through the leader tab, which does not carry them yet",
+            ));
+        }
         let reliable = options.reliability.is_reliable();
         // Read before the request, not after: a request that crosses a
         // handoff must produce a handle stamped with the generation it
@@ -2684,6 +2692,14 @@ impl LeaderBackend for NodeBackend {
                     Err(error) => reply.fail(reported(error)),
                 }
             }),
+            LeaderRequest::PeerDirectDialog { peer } => {
+                // Synchronous on the leader: a reading, nothing to await.
+                // The empty text is "not a healthy direct pair".
+                match node.peer_direct_dialog(format!("{peer:016x}")) {
+                    Ok(dialog) => reply.text(dialog.unwrap_or_default()),
+                    Err(error) => reply.fail(reported(error)),
+                }
+            }
             LeaderRequest::PeerAcceptOffer { peer } => spawn_fenced(&lease, &ops, async move {
                 match node.peer_accept_offer(format!("{peer:016x}")).await {
                     Ok(json) => reply.text(json),
@@ -2992,6 +3008,25 @@ impl MeshSession {
             ProxyValue::Text(json) => Ok(json),
             other => Err(JsError::new(&format!(
                 "an offer answered with {other:?}, which is not a reading"
+            ))),
+        }
+    }
+
+    /// The live attempt's dialog when `peer_hex` is already a healthy
+    /// direct pair on the leader, or `undefined` — what makes a follower's
+    /// `connectPeer` idempotent, as `LeafNode::peer_direct_dialog` makes
+    /// the leader's.
+    pub async fn peer_direct_dialog(&self, peer_hex: String) -> Result<Option<String>, JsError> {
+        let peer = crate::wasm::parse_peer_id(&peer_hex)?;
+        match self
+            .lifecycle
+            .request(LeaderRequest::PeerDirectDialog { peer })
+            .await?
+        {
+            ProxyValue::Text(dialog) if dialog.is_empty() => Ok(None),
+            ProxyValue::Text(dialog) => Ok(Some(dialog)),
+            other => Err(JsError::new(&format!(
+                "a direct-pair reading answered with {other:?}, which is not a dialog"
             ))),
         }
     }

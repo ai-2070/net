@@ -148,6 +148,8 @@ pub mod enrollment;
 // reason `enrollment` does (identity, base64, blake3).
 #[cfg(feature = "net")]
 pub mod bootstrap_credential;
+#[cfg(feature = "net")]
+pub mod game_anchor;
 // The browser bootstrap LISTENER (plan §5 Layer 0, Stage 4 bullet
 // 3): HTTPS `POST /rtc/offer`, `GET /rtc/anchor`, and the `wss`
 // trickle socket, over the core's production dialog path. It lives

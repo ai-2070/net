@@ -478,6 +478,9 @@ impl LeafCounters {
                 link.admission_refused_unknown_peer,
             ),
             ("ingress_delivered", link.ingress_delivered),
+            ("lossy_written", link.lossy_written),
+            ("lossy_dropped", link.lossy_dropped),
+            ("lossy_ingress", link.lossy_ingress),
             ("ice_attempted", self.ice_attempted.get()),
             ("ice_direct", self.ice_direct.get()),
             ("ice_relayed", self.ice_relayed.get()),
@@ -508,7 +511,7 @@ impl LeafCounters {
     /// Exported so the correspondence test can compare the emitted
     /// set against [`NATIVE_RTC_STATS_FIELDS`] without parsing the
     /// JSON it is asserting about.
-    pub const RTC_STATS_EMITTED: [&'static str; 16] = [
+    pub const RTC_STATS_EMITTED: [&'static str; 19] = [
         "accepted",
         "written",
         "write_false",
@@ -520,6 +523,9 @@ impl LeafCounters {
         "admission_refused_advisory",
         "admission_refused_unknown_peer",
         "ingress_delivered",
+        "lossy_written",
+        "lossy_dropped",
+        "lossy_ingress",
         "ice_attempted",
         "ice_direct",
         "ice_relayed",
@@ -573,6 +579,16 @@ pub struct RtcLinkSnapshot {
     pub admission_refused_unknown_peer: u64,
     /// DataChannel messages handed to the node.
     pub ingress_delivered: u64,
+    /// Lossy packets `RTCDataChannel.send` took on the unordered,
+    /// zero-retransmit channel.
+    pub lossy_written: u64,
+    /// Lossy packets dropped instead of queued — the lossy channel was
+    /// backed up or refused the write. Stale state is worth nothing, so a
+    /// lossy packet is never retained.
+    pub lossy_dropped: u64,
+    /// Messages received on the lossy channel (also counted in
+    /// `ingress_delivered`).
+    pub lossy_ingress: u64,
 }
 
 /// Every field the native `RtcStats` carries, verbatim.
@@ -583,7 +599,7 @@ pub struct RtcLinkSnapshot {
 /// of its own or quietly forget one: the emitted names plus
 /// [`RTC_STATS_NOT_APPLICABLE`] are asserted to be exactly this
 /// list, with nothing in both.
-pub const NATIVE_RTC_STATS_FIELDS: [&str; 39] = [
+pub const NATIVE_RTC_STATS_FIELDS: [&str; 44] = [
     "accepted",
     "admission_refused_slots",
     "admission_refused_bytes",
@@ -623,6 +639,11 @@ pub const NATIVE_RTC_STATS_FIELDS: [&str; 39] = [
     "ice_direct",
     "ice_relayed",
     "ice_failed",
+    "tenant_refused_transit",
+    "tenant_withheld_announcement",
+    "lossy_written",
+    "lossy_dropped",
+    "lossy_ingress",
 ];
 
 /// Native `RtcStats` fields a leaf has no meaning for, each with the
@@ -636,7 +657,7 @@ pub const NATIVE_RTC_STATS_FIELDS: [&str; 39] = [
 /// "rather than a field frozen at zero, which would read as 'no UDP
 /// blocking observed', a claim this surface is not entitled to
 /// make". This is that rule applied to the leaf's 24.
-pub const RTC_STATS_NOT_APPLICABLE: [(&str, &str); 24] = [
+pub const RTC_STATS_NOT_APPLICABLE: [(&str, &str); 26] = [
     (
         "ingress_dropped",
         "the leaf's inbound queue is an unbounded VecDeque the pump drains on the same turn, \
@@ -684,6 +705,14 @@ pub const RTC_STATS_NOT_APPLICABLE: [(&str, &str); 24] = [
     (
         "admission_promoted",
         "a leaf enrolls WITH an anchor; it promotes nobody",
+    ),
+    (
+        "tenant_refused_transit",
+        "tenant isolation is the ANCHOR's: a leaf relays no one's traffic between games",
+    ),
+    (
+        "tenant_withheld_announcement",
+        "tenant isolation is the ANCHOR's: a leaf floods no announcements",
     ),
     (
         "close_notify_deferred",
@@ -883,6 +912,9 @@ mod tests {
             admission_refused_advisory: 4,
             admission_refused_unknown_peer: 5,
             ingress_delivered: 11,
+            lossy_written: 12,
+            lossy_dropped: 13,
+            lossy_ingress: 14,
         };
         let parsed: serde_json::Value =
             serde_json::from_str(&c.rtc_stats_json(&link)).expect("valid JSON");

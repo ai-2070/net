@@ -1,0 +1,13 @@
+{
+  "name": "net-anchor-acceptance",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser plan P0 acceptance: two real browser players join a lobby through a real `net-mesh anchor serve --game`, with anonymous credentials the anchor issued. `playwright-core` drives the browsers.",
+  "scripts": {
+    "acceptance": "node run.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "1.56.0"
+  }
+}

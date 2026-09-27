@@ -42,9 +42,13 @@ Calling `announce()` or `subscribe()` yourself as well is fine and additive.
 
 ## The same surface, with three promises
 
-The difference from `connect()` is scope, not capability. Everything works on
-both; three methods are promises on a session because on a follower the work
-happens in another tab:
+The difference from `connect()` is scope, not capability, with two exceptions:
+a session refuses the lossy stream (`openStream({ lossy: true })`, which
+[netcode](/docs/sdk/browser/netcode) rides), and a
+[store](/docs/sdk/browser/store) over a follower's proxied session is not
+established. Games use `connect()`. Otherwise everything works on both; three
+methods are promises on a session because on a follower the work happens in
+another tab:
 
 | | `BrowserNode` | `MeshSession` |
 | --- | --- | --- |
@@ -54,6 +58,41 @@ happens in another tab:
 
 Failures are the same taxonomy, re-typed by the same mapper, so a proxied refusal
 and a direct one arrive as the same class.
+
+## Direct peers
+
+`connectPeer(peerIdHex)` takes this node from a routed session with another
+node (through the anchor) to a direct DataChannel with it; the other side calls
+`acceptPeer(peerIdHex)`. Both resolve a typed outcome: `direct`, `iceTimeout`,
+`udpBlocked`, `noAnnouncement`, `handshakeFailed` or `superseded`. Both exist on
+`connect()`'s node and on a session.
+
+**`connectPeer` on a pair that is already direct and open is a no-op** that
+resolves `direct` with the live dialog, so calling it "to be sure" before
+opening a stream is safe. A second offer would replace the working link and
+close it under the peer. (A follower whose leader runs an older release still
+re-offers.)
+
+## A player that comes back
+
+A game's page usually does not hold a credential of its own. It asks a game
+anchor for a short-lived anonymous one, and keeps the same identity across
+visits:
+
+```typescript
+import { connect, requestCredential, rememberedIdentity } from '@net-mesh/browser';
+
+const { credentialB64, bootstrapUrl } = await requestCredential({
+  anchorUrl: 'https://anchor.example', game: 'my-game',
+});
+const node = await connect({ credentialB64, bootstrapUrl, ...rememberedIdentity() });
+```
+
+`requestCredential` is `POST /credential` on an anchor run with `--game`
+(see [CLI](/docs/reference/cli)); it fails with a typed `CredentialRequestError`.
+`rememberedIdentity()` keeps this origin's player secrets in `localStorage`, so
+the same player is the same node on every visit (pass another key for a second
+player on one origin).
 
 ## Lifecycle
 

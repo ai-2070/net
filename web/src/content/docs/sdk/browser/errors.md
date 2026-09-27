@@ -29,6 +29,14 @@ stable discriminant a caller branches on.
 | `ice-server-conflict` | `IceServerConflictError` | `LeafError::IceServerConflictsWithPeer` |
 | `unknown` | `UnknownLeafError` | *nothing* |
 
+Calls behind an organization boundary end with their own terminal kinds, all
+subclasses of `OrgStreamError`: `org-admission-denied`
+(`OrgAdmissionDeniedError`, with a coarse reason: `denied`, `not-supported` or
+`unavailable`), `org-revoked` (`OrgRevokedError`, a kind of denial),
+`org-timeout`, `org-cancelled`, `org-leader-lost`, `org-session-lost`,
+`org-indeterminate`, `org-refused`, `org-internal` and `org-malformed`, each
+with the matching `Org…Error` class.
+
 An unrecognised message becomes `UnknownLeafError` rather than being folded into
 a near neighbour. Mis-typing a failure is the exact mistake this taxonomy exists
 to prevent, so the package does not guess.
@@ -139,6 +147,19 @@ unreachable, misconfigured, or slow — and the address was not established.
 The store has its own `StoreError` and its own code set, documented in
 [Store](/docs/sdk/browser/store#codes-to-branch-on). A store refusal is not a
 `LeafError`; branch on `StoreError.code`.
+
+## The game helpers' errors
+
+These are not `LeafError`s either; each has its own discriminant.
+
+| Error | Branch on | Values |
+| --- | --- | --- |
+| `CredentialRequestError` (`requestCredential`) | `.kind` | `unknown-game`, `rate-limited` (retry shortly), `malformed-request`, `unreachable`, `unexpected`; `.status` is the HTTP status when the anchor answered |
+| `LobbyError` (lobbies) | `.code` | `not-found`, `ambiguous` (two nodes claim the code), `invalid` |
+| `BorderActionError` (`handoffs.forward`) | `.code` | `refused` (the neighbour said no; the message is its reason), `unresolved` (no answer: it may have run, never twice) |
+
+See [Session](/docs/sdk/browser/session#a-player-that-comes-back),
+[Store](/docs/sdk/browser/store#lobbies) and [World](/docs/sdk/browser/world).
 
 ## Next
 

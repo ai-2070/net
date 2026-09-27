@@ -275,7 +275,7 @@ const ENTRIES: u32 = 700;
 /// chunk budget from (`MAX_EVENT_SIZE`).
 const MAX_EVENT_BYTES: u32 = 8104;
 
-pub const WITNESSES: [&str; 11] = [
+pub const WITNESSES: [&str; 12] = [
     "stage7_store_snapshot_installs_over_the_real_stream",
     "stage7_store_snapshot_installs_through_injected_loss_and_reorder",
     "stage7_an_action_round_trip_crosses_the_real_transport",
@@ -293,6 +293,8 @@ pub const WITNESSES: [&str; 11] = [
     // Criterion 4's media clause, read on the pages that did the
     // whole path — bootstrap, relay, ICE, promotion, store traffic.
     "stage7_data_only_use_asks_for_no_media_permission",
+    // Appended (indexed by position).
+    "stage7_netcode_predicts_a_ship_and_the_host_applies_every_input_over_the_lossy_channel",
 ];
 
 /// The tabs this stage drives, on their own isolated contexts.
@@ -1485,6 +1487,124 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
             why(&direct_seen)
         ),
     );
+
+    // --- 12. netcode (model 2) on the DIRECT pair ------------------
+    //
+    // `@net-mesh/browser/netcode` in two real browsers: the host page
+    // runs `hostNetcode`, the player `joinNetcode`, over the DIRECT
+    // session §8 just promoted — the path a game actually plays on. The
+    // player's `joinNetcode` calls `connectPeer` on a pair that is already
+    // direct, which is itself a check: a second offer used to replace the
+    // working link and close it under the host, so every snapshot the
+    // host sent was refused as `channel … is Closed`. `connectPeer` is
+    // idempotent on a healthy pair now. The player's ship must move the
+    // instant it presses (prediction), every input must be applied on the
+    // host exactly once however the lossy carrier repeated it, the
+    // prediction must end where the host put the ship with no correction,
+    // the clock must have synced, and the traffic must have ridden the
+    // lossy DataChannel both ways.
+    {
+        const NETCODE_LABEL: &str = "stage7.netcode";
+        const NETCODE_INPUTS: u32 = 30;
+        let hosted = script
+            .run(
+                tab_host,
+                Step5::NetcodeHost {
+                    id: 0,
+                    session: session.clone(),
+                    label: NETCODE_LABEL.into(),
+                },
+            )
+            .await;
+        let played = if hosted.ok {
+            script
+                .run(
+                    tab_player,
+                    Step5::NetcodePlay {
+                        id: 0,
+                        session: session.clone(),
+                        host_hex: host.node_hex.clone(),
+                        label: NETCODE_LABEL.into(),
+                        inputs: NETCODE_INPUTS,
+                    },
+                )
+                .await
+        } else {
+            hosted.clone()
+        };
+        let report = script
+            .run(
+                tab_host,
+                Step5::NetcodeReport {
+                    id: 0,
+                    session: session.clone(),
+                    peer_hex: player.node_hex.clone(),
+                },
+            )
+            .await;
+        // Stopped before the next section, so nothing ticks behind it.
+        let _ = script
+            .run(
+                tab_host,
+                Step5::NetcodeClose {
+                    id: 0,
+                    session: session.clone(),
+                },
+            )
+            .await;
+        let expected = u64::from(NETCODE_INPUTS);
+        let host_x = stat_u64(&report, "x");
+        let applied = stat_u64(&report, "applied");
+        let unique = stat_u64(&report, "unique");
+        let player_x = stat_u64(&played, "x");
+        let immediate = played
+            .stats
+            .as_ref()
+            .and_then(|s| s.get("immediate"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let corrections = stat_u64(&played, "corrections");
+        let clock = stat_u64(&played, "clock_samples").unwrap_or(0);
+        let written = stat_u64(&played, "lossy_written").unwrap_or(0);
+        let host_ingress = stat_u64(&report, "lossy_ingress").unwrap_or(0);
+        ledger.record(
+            WITNESSES[11],
+            hosted.ok
+                && played.ok
+                && report.ok
+                && host_x == Some(expected)
+                && player_x == Some(expected)
+                && applied == Some(expected + 1)
+                && unique == applied
+                && immediate
+                && corrections == Some(0)
+                && clock > 0
+                && written > 0
+                && host_ingress > 0,
+            format!(
+                "NETCODE MODEL 2 IN TWO REAL BROWSERS over the pair's DIRECT session. The host \
+                 page runs `hostNetcode` (ok={}), the player `joinNetcode` (ok={}, {}). \
+                 The player sent 1 + {NETCODE_INPUTS} inputs; its ship moved the instant \
+                 each was pressed={immediate} (prediction) and ended at x={player_x:?}. \
+                 The host applied {applied:?} inputs, {unique:?} distinct (exactly once \
+                 each however the lossy carrier repeated them), and holds the ship at \
+                 x={host_x:?}; reconciliation corrected the player {corrections:?} times \
+                 (0 = the prediction was the host's). Clock samples: {clock}, RTT \
+                 {:?} ms. THE CARRIER: the player wrote {written} message(s) on the lossy \
+                 DataChannel and the host received {host_ingress} on its own (host drops: \
+                 {}; last send error: {:?}). PLAYER DIAGNOSTICS: rtc={:?} leaf={:?} HOST rtc={:?}",
+                hosted.ok,
+                played.ok,
+                why(&played),
+                stat_u64(&played, "rtt_ms"),
+                stat_str(&report, "dropped").unwrap_or_default(),
+                stat_str(&report, "last_error"),
+                stat_str(&played, "rtc"),
+                stat_str(&played, "leaf"),
+                stat_str(&report, "rtc"),
+            ),
+        );
+    }
 
     // --- 11. data-only: no camera, no microphone -------------------
     //

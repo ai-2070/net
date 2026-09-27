@@ -106,15 +106,15 @@ pub const MAX_REORDER_HELD: usize = 64;
 /// logical streams sharing per-stream state on one session — but
 /// the word "cannot" does not belong in this comment, and the
 /// Stage 5 report carries it as a core-side latent hazard.
-pub const LEAF_STREAM_DISCRIMINATOR: u64 = 0x0002_0000_0000_0000;
+pub const LEAF_STREAM_DISCRIMINATOR: u64 = net_wire::channel::name::LABELED_STREAM_DISCRIMINATOR;
 
 /// Derive a stable stream id from a caller-chosen label.
 ///
-/// Same hash the channel layer uses, so two ends of a stream that
-/// agree on the label agree on the id without exchanging it.
+/// The wire crate's derivation, so a native node (which serves a
+/// browser's store over the same label) cannot drift from it: there is
+/// one formula, in `net_wire::channel::name`.
 pub fn stream_id_from_label(label: &str) -> u64 {
-    LEAF_STREAM_DISCRIMINATOR
-        | (net_wire::channel::name::channel_hash(label) & 0x0000_FFFF_FFFF_FFFF)
+    net_wire::channel::name::stream_id_from_label(label)
 }
 
 /// The largest sequence jump a single packet may declare.

@@ -756,6 +756,33 @@ def generate_net_keypair() -> NetKeypair:
     """Generate a fresh ed25519 keypair for encrypted UDP transport."""
     ...
 
+class StreamData:
+    """One event from a :class:`StreamInbox`, with its authenticated sender."""
+
+    @property
+    def peer_node_id(self) -> int: ...
+    @property
+    def stream_id(self) -> int: ...
+    @property
+    def payload(self) -> bytes: ...
+
+class StreamInbox:
+    """Every event on one stream, each with the peer that sent it.
+
+    Returned by :meth:`NetMesh.open_stream_inbox`. At most ``capacity``
+    events wait; beyond that they are dropped and counted in ``dropped``.
+    """
+
+    @property
+    def stream_id(self) -> int: ...
+    @property
+    def dropped(self) -> int: ...
+    def recv(self, timeout_ms: Optional[int] = None) -> Optional[StreamData]: ...
+    def try_recv(self) -> Optional[StreamData]: ...
+    def close(self) -> bool: ...
+    def __enter__(self) -> "StreamInbox": ...
+    def __exit__(self, *args: object) -> bool: ...
+
 class NetStream:
     """Opaque handle to an open mesh stream between this node and a peer."""
 
@@ -1015,6 +1042,9 @@ class NetMesh:
         ...
     def close_stream(self, peer_node_id: int, stream_id: int) -> None:
         """Close a stream. Idempotent."""
+        ...
+    def open_stream_inbox(self, stream_id: int, capacity: int = 4096) -> StreamInbox:
+        """Receive every event on ``stream_id`` with its authenticated sender."""
         ...
     def send_on_stream(self, stream: "NetStream", events: List[bytes]) -> None:
         """Send a batch of events on a stream. Raises
@@ -1426,6 +1456,10 @@ def delegate_token(
     must include ``'delegate'`` scope and have
     ``delegation_depth > 0``; the ``signer`` must be the subject
     of the parent token."""
+    ...
+
+def stream_id_from_label(label: str) -> int:
+    """The stream id a label names — the browser leaf's derivation."""
     ...
 
 def channel_hash(channel: str) -> int:

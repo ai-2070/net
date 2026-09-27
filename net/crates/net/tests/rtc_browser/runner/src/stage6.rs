@@ -98,7 +98,7 @@ const CANDIDATE_POLLS: usize = 400;
 /// Every Stage 6 witness name, in ledger order. CI pins these
 /// exactly; the list lives here so a rename is one edit and a drop
 /// cannot be done quietly.
-pub const WITNESSES: [&str; 15] = [
+pub const WITNESSES: [&str; 16] = [
     "stage6_two_isolated_contexts_reach_a_direct_session",
     "stage6_each_leaf_learns_the_others_keys_from_a_signed_announcement",
     "stage6_the_four_wasm_methods_drive_one_attempt_end_to_end",
@@ -114,6 +114,8 @@ pub const WITNESSES: [&str; 15] = [
     "stage6_a_network_change_drives_exactly_one_re_attempt",
     "stage6_rtc_stats_uses_the_native_field_names_and_names_what_it_cannot_measure",
     "stage6_one_node_id_spelling_across_both_signalling_surfaces",
+    // Appended (indexed by position).
+    "stage6_connect_peer_on_a_healthy_direct_pair_is_idempotent",
 ];
 
 /// Everything the Stage 6 witnesses need from the runner.
@@ -439,14 +441,17 @@ pub async fn run(cx: Cx6<'_>, ledger: &mut Ledger) -> Result<(), String> {
         ),
     );
 
-    // --- 5. an offer nobody answers --------------------------------
+    // --- 5a. connectPeer on a healthy direct pair ------------------
     //
-    // A offers to B and B is never asked to answer, so ICE has
-    // nothing to connect to. The attempt must end at its own
-    // deadline, typed, with the pair still relayed — §9 step 6's
-    // "the routed session is simply never replaced".
+    // The pair is direct (witnesses 1 and 2). Asking again must hand
+    // back the pair it already has and create nothing: a second offer
+    // is not a no-op — its connection replaces the transport's link,
+    // which closes the working one under the peer, and the peer never
+    // asked for a new attempt. That is how a library calling
+    // `connectPeer` "to be sure" (netcode, a lobby) used to leave the
+    // host reading direct with a closed channel.
     let before = counters(&mut script, TAB_A).await;
-    let unanswered = script
+    let again = script
         .run(
             TAB_A,
             Step5::PeerConnect {
@@ -457,7 +462,66 @@ pub async fn run(cx: Cx6<'_>, ledger: &mut Ledger) -> Result<(), String> {
         )
         .await;
     let after = counters(&mut script, TAB_A).await;
-    let kind = outcome(&unanswered);
+    let idempotent = outcome(&again).as_deref() == Some("direct")
+        && counter_of(&after, "ice_attempted") == counter_of(&before, "ice_attempted");
+    ledger.record(
+        WITNESSES[15],
+        idempotent,
+        format!(
+            "connectPeer on a pair that is already direct and open: outcome={:?} (dialog \
+             {:?}), ice_attempted {} → {}. The pair it already had, and no new attempt — a \
+             re-offer would have replaced the working link and closed it under the peer.",
+            outcome(&again),
+            stat_str(&again, "dialog"),
+            counter_of(&before, "ice_attempted"),
+            counter_of(&after, "ice_attempted"),
+        ),
+    );
+
+    // --- 5. an offer nobody answers --------------------------------
+    //
+    // A offers to B and B is never asked to answer, so ICE has
+    // nothing to connect to. The attempt must end at its own
+    // deadline, typed, with the pair still relayed — §9 step 6's
+    // "the routed session is simply never replaced".
+    //
+    // Driven with the RAW primitive and polled to its end: `connectPeer`
+    // on this (healthy, direct) pair answers `direct` without offering
+    // (5a above), so the offer is made the way the re-attempt owner
+    // makes one.
+    let before = counters(&mut script, TAB_A).await;
+    let offered = script
+        .run(
+            TAB_A,
+            Step5::PeerOffer {
+                id: 0,
+                session: "peer".to_string(),
+                peer_hex: b.node_hex.clone(),
+            },
+        )
+        .await;
+    let mut unanswered = offered.clone();
+    let poll_until = std::time::Instant::now() + Duration::from_secs(90);
+    while offered.ok && std::time::Instant::now() < poll_until {
+        let poll = script
+            .run(
+                TAB_A,
+                Step5::PeerCandidate {
+                    id: 0,
+                    session: "peer".to_string(),
+                    peer_hex: b.node_hex.clone(),
+                },
+            )
+            .await;
+        let state = stat_str(&poll, "state").unwrap_or_default();
+        unanswered = poll;
+        if matches!(state.as_str(), "iceTimeout" | "udpBlocked" | "failed") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let after = counters(&mut script, TAB_A).await;
+    let kind = stat_str(&unanswered, "state");
     let relayed_moved = counter_of(&after, "ice_relayed") > counter_of(&before, "ice_relayed");
     let blocked_moved = counter_of(&after, "udp_blocked") > counter_of(&before, "udp_blocked");
     let timed_out = matches!(kind.as_deref(), Some("iceTimeout" | "udpBlocked"));
@@ -2386,6 +2450,9 @@ async fn retry_witness(cx: &Cx6<'_>, ledger: &mut Ledger) {
         "ice_direct",
         "ice_relayed",
         "ice_failed",
+        "lossy_written",
+        "lossy_dropped",
+        "lossy_ingress",
     ];
     let all_native_present = native_names
         .iter()
@@ -2403,17 +2470,17 @@ async fn retry_witness(cx: &Cx6<'_>, ledger: &mut Ledger) {
     ledger.record(
         P3_WITNESSES[1],
         stats.ok
-            && emitted == 16
-            && declared == 24
+            && emitted == 19
+            && declared == 26
             && all_native_present
             && stun_absent
             && stun_explained
             && traffic_observed,
         format!(
             "node.rtcStats() on a leaf that has actually carried traffic: {emitted} measured \
-             fields, {declared} declared inapplicable. Every one of the 15 native RtcStats \
+             fields, {declared} declared inapplicable. Every one of the 18 native RtcStats \
              names with a leaf meaning is present ({all_native_present}); udp_blocked is the \
-             16th and is the one term with NO native counterpart, because native says a node \
+             19th and is the one term with NO native counterpart, because native says a node \
              signalling over UDP cannot have UDP blocked and the leaf is the side whose \
              evidence can establish it. accepted={} written={} ingress_delivered={} \
              ice_attempted={} ice_direct={} — measurements, not zeros. \

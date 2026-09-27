@@ -3782,6 +3782,27 @@ fn enrollment_outcome_is_admitted(frame: &Bytes) -> Option<bool> {
     rest.is_empty().then_some(admitted)
 }
 
+/// The delegation-chain bytes of an Admitted enrollment outcome frame —
+/// what [`enrollment_outcome_is_admitted`] skips. `None` for anything
+/// else. Only called after that function returned `Some(true)`, so the
+/// framing is already known sound.
+#[cfg(feature = "webrtc")]
+fn admitted_chain(frame: &Bytes) -> Option<Vec<u8>> {
+    const OUTCOME_MAGIC: [u8; 4] = *b"NMO1";
+    if frame.len() < RPC_FRAME_BODY_OFFSET {
+        return None;
+    }
+    let payload = RpcResponsePayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..)).ok()?;
+    let rest = payload
+        .body
+        .as_ref()
+        .strip_prefix(&OUTCOME_MAGIC[..])?
+        .strip_prefix(&[0u8][..])?;
+    let (len, chain) = rest.split_at_checked(4)?;
+    let len = u32::from_le_bytes(len.try_into().ok()?) as usize;
+    chain.get(..len).map(<[u8]>::to_vec)
+}
+
 /// Skip one `u32`-LE length-prefixed field, returning the remainder,
 /// or `None` when the prefix is truncated or overruns the buffer.
 /// Mirrors `Reader::take_lp` in `sdk/src/enrollment.rs`.
@@ -3900,11 +3921,16 @@ async fn publish_response_to_caller(
     {
         match enrollment_outcome_is_admitted(&payload) {
             Some(true) => {
+                // P0 slice 2: the grant says which tenant this session
+                // was enrolled for, when the application resolves it.
+                let tenant = admitted_chain(&payload)
+                    .and_then(|chain| mesh.resolve_enrollment_tenant(&chain));
                 if mesh.promote_on_enrollment_response(
                     node_id,
                     reply_channel.as_str(),
                     call_id,
                     receiving_session_id,
+                    tenant,
                 ) {
                     tracing::debug!(
                         node_id = format!("{node_id:#x}"),

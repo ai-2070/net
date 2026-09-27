@@ -241,7 +241,7 @@ const ABI_PROXY_SIZE: usize = 700;
 /// Every Stage 5 witness name, in ledger order. The CI job pins these
 /// exactly; the list is here so a rename is one edit and a drop is
 /// impossible to do quietly.
-pub const WITNESSES: [&str; 20] = [
+pub const WITNESSES: [&str; 22] = [
     "stage5_leaf_handshake_over_the_real_listener",
     "stage5_reliable_round_trip",
     "stage5_nrpc_call_to_a_native_service",
@@ -268,6 +268,9 @@ pub const WITNESSES: [&str; 20] = [
     "stage5_a_refused_connect_closes_rtc_and_hands_back_its_attempt",
     "stage5_direct_close_ends_a_parked_iterator_in_the_live_package",
     "stage5_direct_close_refuses_a_later_open_with_the_leafs_typed_fence",
+    // Appended (indexed by position, see above).
+    "stage5_a_labeled_page_stream_reaches_a_native_sink_attributed_to_the_page",
+    "stage5_a_lossy_page_stream_rides_the_lossy_channel_to_the_anchor",
 ];
 
 // ===================================================================
@@ -395,6 +398,9 @@ pub enum Step5 {
         /// and send on it. Decimal, because a u64 is not a JS number.
         stream_id: Option<String>,
         channel_hash: Option<u16>,
+        /// Open it `lossy` — its packets ride the unordered,
+        /// zero-retransmit DataChannel.
+        lossy: bool,
     },
     /// Send on a stream [`Step5::StreamOpen`] already opened.
     ///
@@ -818,6 +824,34 @@ pub enum Step5 {
         /// released: a `leave` is a frame and has to cross first.
         settle_ms: u64,
     },
+    /// `hostNetcode` from `@net-mesh/browser/netcode` on a session: ships
+    /// moved by `{ dx }` inputs, 30 Hz, on the lossy carrier.
+    NetcodeHost {
+        id: u64,
+        session: String,
+        label: String,
+    },
+    /// `joinNetcode` against `host_hex`: send one `{dx: 0}` then `inputs`
+    /// × `{dx: 1}` 33 ms apart, wait for every one to be acknowledged, and
+    /// report what the player saw.
+    NetcodePlay {
+        id: u64,
+        session: String,
+        host_hex: String,
+        label: String,
+        inputs: u32,
+    },
+    /// The netcode host's view: the player's ship, the inputs applied.
+    NetcodeReport {
+        id: u64,
+        session: String,
+        peer_hex: String,
+    },
+    /// Stop the netcode host on a session (its tick loop and sends).
+    NetcodeClose {
+        id: u64,
+        session: String,
+    },
     /// What this page asked of the user's camera and microphone.
     ///
     /// `control` makes the page CALL both media entry points after
@@ -872,6 +906,10 @@ impl Step5 {
             | Self::StoreReconnect { id, .. }
             | Self::StoreCounts { id, .. }
             | Self::StoreClose { id, .. }
+            | Self::NetcodeHost { id, .. }
+            | Self::NetcodePlay { id, .. }
+            | Self::NetcodeReport { id, .. }
+            | Self::NetcodeClose { id, .. }
             | Self::PeerConnect { id, .. }
             | Self::PeerAccept { id, .. }
             | Self::PeerAttempt { id, .. }
@@ -927,6 +965,10 @@ impl Step5 {
             | Self::StoreReconnect { id, .. }
             | Self::StoreCounts { id, .. }
             | Self::StoreClose { id, .. }
+            | Self::NetcodeHost { id, .. }
+            | Self::NetcodePlay { id, .. }
+            | Self::NetcodeReport { id, .. }
+            | Self::NetcodeClose { id, .. }
             | Self::PeerConnect { id, .. }
             | Self::PeerAccept { id, .. }
             | Self::PeerAttempt { id, .. }
@@ -1913,6 +1955,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-direct".into()),
                     stream_id: Some(ABI_DIRECT_STREAM_ID.to_string()),
                     channel_hash: None,
+                    lossy: false,
                 },
             )
             .await;
@@ -2107,6 +2150,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-window".into()),
                     stream_id: Some(ABI_WINDOW_STREAM_ID.to_string()),
                     channel_hash: None,
+                    lossy: false,
                 },
             )
             .await;
@@ -2288,6 +2332,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-recover".into()),
                     stream_id: Some(recover_stream_id.clone()),
                     channel_hash: Some(recover_channel),
+                    lossy: false,
                 },
             )
             .await;
@@ -2615,6 +2660,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-large".into()),
                     stream_id: Some(ABI_LARGE_STREAM_ID.to_string()),
                     channel_hash: None,
+                    lossy: false,
                 },
             )
             .await;
@@ -2984,6 +3030,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-frag".into()),
                     stream_id: Some(ABI_FRAG_STREAM_ID.to_string()),
                     channel_hash: None,
+                    lossy: false,
                 },
             )
             .await;
@@ -3174,6 +3221,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                     label: Some("abi-leaf-frag".into()),
                     stream_id: Some(ABI_LEAF_FRAG_STREAM_ID.to_string()),
                     channel_hash: None,
+                    lossy: false,
                 },
             )
             .await;
@@ -3297,6 +3345,264 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
     }
 
     // ================================================================
+    // 21 — a page's LABELED stream reaches a native stream sink, and
+    //      every event is attributed to the page
+    //
+    // The seam a native host serving the browser store stands on: the
+    // store opens `store/<definition id>` BY LABEL, the leaf derives the
+    // id, and the host receives through `register_stream_inbound`, whose
+    // `from_node` is the only identity the store's `authorize` ever sees.
+    // Three facts, all asserted here with the real leaf in a real
+    // browser: the page's derived id is the native derivation (one
+    // function, `net_wire::channel::name::stream_id_from_label` — the
+    // page is NOT given the id), every event lands in the sink with the
+    // page's node id as its sender, and none of them also lands in the
+    // shard queue.
+    // ================================================================
+    {
+        const SINK_LABEL: &str = "store/stage5.sink-witness";
+        const SINK_EVENTS: usize = 4;
+        const SINK_SIZE: usize = 256;
+        let derived = net::adapter::net::stream_id_from_label(SINK_LABEL);
+        let seen: Arc<std::sync::Mutex<Vec<(u64, u64, Vec<u8>)>>> = Arc::default();
+        let sink: net::adapter::net::StreamInboundSink = {
+            let seen = seen.clone();
+            Arc::new(move |event: net::adapter::net::StreamInboundEvent| {
+                if let Ok(mut list) = seen.lock() {
+                    list.push((event.from_node, event.stream_id, event.payload.to_vec()));
+                }
+            })
+        };
+        let registration = cx.anchor.register_stream_inbound(derived, sink);
+
+        let open = script
+            .run(
+                "a",
+                Step5::StreamOpen {
+                    id: 0,
+                    session: "main".into(),
+                    handle: "sink".into(),
+                    reliable: true,
+                    label: Some(SINK_LABEL.into()),
+                    // Deliberately absent: the page derives it.
+                    stream_id: None,
+                    channel_hash: None,
+                    lossy: false,
+                },
+            )
+            .await;
+        let reported_id = stat_str(&open, "stream_id");
+        let derived_hex = format!("{derived:016x}");
+        let same_id = reported_id == format!("\"{derived_hex}\"");
+        // The anchor's side of the id, as witness 16 does: a receive half
+        // with per-stream state to acknowledge against.
+        let native = cx
+            .anchor
+            .open_stream(
+                node_id,
+                derived,
+                StreamConfig::new().with_reliability(Reliability::Reliable),
+            )
+            .map_err(|e| e.to_string());
+        let seed = 0x5100 ^ (rand_u64() & 0xFFFF);
+        let wrote = if open.ok && native.is_ok() && registration.is_some() {
+            script
+                .run(
+                    "a",
+                    Step5::StreamWrite {
+                        id: 0,
+                        handle: "sink".into(),
+                        frames: vec![],
+                        seed,
+                        size: SINK_SIZE,
+                        count: SINK_EVENTS,
+                        drop_every: 0,
+                        reorder_every: 0,
+                    },
+                )
+                .await
+        } else {
+            fail(format!(
+                "not attempted: page open ok={} anchor open={native:?} sink registered={}",
+                open.ok,
+                registration.is_some()
+            ))
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline
+            && seen.lock().map(|list| list.len()).unwrap_or(0) < SINK_EVENTS
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let events = seen.lock().map(|list| list.clone()).unwrap_or_default();
+        let got: Vec<Mark> = events
+            .iter()
+            .map(|(_, _, payload)| Mark::of(payload))
+            .collect();
+        let want = expected_marks(seed, SINK_SIZE, SINK_EVENTS);
+        let senders: std::collections::BTreeSet<u64> =
+            events.iter().map(|(from, _, _)| *from).collect();
+        let on_stream = events.iter().all(|(_, stream, _)| *stream == derived);
+        let attributed = senders.len() == 1 && senders.contains(&node_id);
+        // Nothing ALSO went to the queue the sink replaces.
+        let queued = match cx
+            .anchor
+            .poll_shard(cx.anchor.shard_for_stream(derived), None, 512)
+            .await
+        {
+            Ok(result) => result.events.len(),
+            Err(_) => usize::MAX,
+        };
+        let released = registration
+            .map(|id| cx.anchor.unregister_stream_inbound(derived, id))
+            .unwrap_or(false);
+        let pass = registration.is_some()
+            && open.ok
+            && same_id
+            && native.is_ok()
+            && wrote.ok
+            && got == want
+            && attributed
+            && on_stream
+            && queued == 0
+            && released;
+        ledger.record(
+            WITNESSES[20],
+            pass,
+            format!(
+                "A LABELED stream from the page to a native stream sink. The anchor registered \
+                 a sink on stream_id_from_label({SINK_LABEL:?}) = {derived_hex} \
+                 (registered={}). The page opened the stream through the built package BY \
+                 LABEL ONLY — no id given — and reports id {reported_id}, the native \
+                 derivation={same_id}: one formula on both sides. The page wrote \
+                 {SINK_EVENTS} × {SINK_SIZE} B (ok={}, error={:?}). The sink received {} \
+                 event(s), marks {got:?} against the expected {want:?}; every event's \
+                 authenticated sender is the page's node {node_id:#x} = {attributed} \
+                 (senders seen: {senders:?}), all on the derived stream = {on_stream}. The \
+                 shard queue for that stream holds {queued} event(s) afterwards (0 = the \
+                 sink REPLACED the queue, not duplicated it), and the sink unregistered \
+                 cleanly = {released}. This is the receive path a native host serving the \
+                 browser store stands on (`meshStoreTransport` over `onStreamData`): its \
+                 `authorize` sees exactly this sender.",
+                registration.is_some(),
+                wrote.ok,
+                wrote.error,
+                events.len(),
+            ),
+        );
+    }
+
+    // ================================================================
+    // 22 — a LOSSY page stream rides the unordered, zero-retransmit
+    //      DataChannel to the anchor (netcode model 2's carrier)
+    //
+    // The page opens a fire-and-forget stream with `lossy: true` through
+    // the built package and writes to it. Every event must reach the
+    // anchor's stream sink, attributed to the page, AND the anchor's
+    // `lossy_ingress` counter — which counts only messages arriving on the
+    // `net-u` channel — must rise by at least as many: the events came
+    // over the lossy channel, not the reliable one. Loopback loses
+    // nothing, so all of them arrive.
+    // ================================================================
+    {
+        const LOSSY_LABEL: &str = "store/stage5.lossy-witness";
+        const LOSSY_EVENTS: usize = 20;
+        const LOSSY_SIZE: usize = 256;
+        let derived = net::adapter::net::stream_id_from_label(LOSSY_LABEL);
+        let seen: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>> = Arc::default();
+        let sink: net::adapter::net::StreamInboundSink = {
+            let seen = seen.clone();
+            Arc::new(move |event: net::adapter::net::StreamInboundEvent| {
+                if let Ok(mut list) = seen.lock() {
+                    list.push((event.from_node, event.payload.to_vec()));
+                }
+            })
+        };
+        let registration = cx.anchor.register_stream_inbound(derived, sink);
+        let lossy_before = cx
+            .anchor
+            .rtc_driver()
+            .map_or(0, |d| d.stats().lossy_ingress());
+        let open = script
+            .run(
+                "a",
+                Step5::StreamOpen {
+                    id: 0,
+                    session: "main".into(),
+                    handle: "lossy".into(),
+                    reliable: false,
+                    label: Some(LOSSY_LABEL.into()),
+                    stream_id: None,
+                    channel_hash: None,
+                    lossy: true,
+                },
+            )
+            .await;
+        let seed = 0x7700 ^ (rand_u64() & 0xFFFF);
+        let wrote = if open.ok && registration.is_some() {
+            script
+                .run(
+                    "a",
+                    Step5::StreamWrite {
+                        id: 0,
+                        handle: "lossy".into(),
+                        frames: vec![],
+                        seed,
+                        size: LOSSY_SIZE,
+                        count: LOSSY_EVENTS,
+                        drop_every: 0,
+                        reorder_every: 0,
+                    },
+                )
+                .await
+        } else {
+            fail(format!(
+                "not attempted: page open ok={} ({:?}) sink registered={}",
+                open.ok,
+                open.error,
+                registration.is_some()
+            ))
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline
+            && seen.lock().map(|list| list.len()).unwrap_or(0) < LOSSY_EVENTS
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let events = seen.lock().map(|list| list.clone()).unwrap_or_default();
+        let lossy_after = cx
+            .anchor
+            .rtc_driver()
+            .map_or(0, |d| d.stats().lossy_ingress());
+        let mut got: Vec<Mark> = events
+            .iter()
+            .map(|(_, payload)| Mark::of(payload))
+            .collect();
+        let mut want = expected_marks(seed, LOSSY_SIZE, LOSSY_EVENTS);
+        // Unordered carrier: compare as sets.
+        got.sort_by_key(|m| (m.len, m.fnv));
+        want.sort_by_key(|m| (m.len, m.fnv));
+        let attributed = events.iter().all(|(from, _)| *from == node_id);
+        let over_lossy = lossy_after.saturating_sub(lossy_before) >= LOSSY_EVENTS as u64;
+        if let Some(id) = registration {
+            cx.anchor.unregister_stream_inbound(derived, id);
+        }
+        ledger.record(
+            WITNESSES[21],
+            open.ok && wrote.ok && got == want && attributed && over_lossy,
+            format!(
+                "A page stream opened with `lossy: true` (fireAndForget) through the built                  package (open ok={}, error={:?}); the page wrote {LOSSY_EVENTS} ×                  {LOSSY_SIZE} B (ok={}, error={:?}). The anchor's sink received {} event(s),                  byte-identical to what was written as a set={} (an unordered carrier may                  reorder), every one attributed to the page's node {node_id:#x}={attributed}.                  THE CARRIER: the anchor's `lossy_ingress` — messages that arrived on the                  `net-u` channel only — went {lossy_before} → {lossy_after}, at least                  {LOSSY_EVENTS} more={over_lossy}: the events rode the unordered,                  zero-retransmit channel, not the reliable one.",
+                open.ok,
+                open.error,
+                wrote.ok,
+                wrote.error,
+                events.len(),
+                got == want,
+            ),
+        );
+    }
+
+    // ================================================================
     // 18 and 19 — direct `close()`, through the LIVE package, in a
     //             real browser: two outcomes, two witnesses
     //
@@ -3349,6 +3655,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         label: Some("close-probe".into()),
                         stream_id: Some(CLOSE_PROBE_STREAM_ID.to_string()),
                         channel_hash: None,
+                        lossy: false,
                     },
                 )
                 .await
@@ -3471,6 +3778,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         label: Some("close-probe-after".into()),
                         stream_id: Some(CLOSE_PROBE_STREAM_ID.to_string()),
                         channel_hash: None,
+                        lossy: false,
                     },
                 )
                 .await
@@ -4230,6 +4538,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         label: Some("abi-proxied".into()),
                         stream_id: Some(ABI_PROXY_STREAM_ID.to_string()),
                         channel_hash: None,
+                        lossy: false,
                     },
                 )
                 .await
@@ -4322,6 +4631,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         label: Some("abi-proxied-out".into()),
                         stream_id: Some(format!("{}", out_frame.stream_id)),
                         channel_hash: Some(out_frame.channel_hash_u16),
+                        lossy: false,
                     },
                 )
                 .await
@@ -4491,6 +4801,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                         label: Some("x7-broadcast".into()),
                         stream_id: Some(X7_BROADCAST_STREAM_ID.to_string()),
                         channel_hash: None,
+                        lossy: false,
                     },
                 )
                 .await

@@ -89,6 +89,7 @@ const stream = mesh.openStream(peerNodeId, {
 - `MeshNode.openStream(peerNodeId: bigint, config: StreamConfig): MeshStream` (`sdk-ts/src/mesh.ts:326`). The napi shape is `(peerNodeId, opts: StreamOptions)`; the SDK splays `streamId` into `opts`.
 - `peerNodeId` and `streamId` cross the napi boundary as `BigInt`. A plain `number` throws — keypair-derived node ids routinely exceed `Number.MAX_SAFE_INTEGER`.
 - `reliability` is a string tag: `'fire_and_forget'` (default) | `'reliable'`. `windowBytes` unset = 64 KB; `0` = backpressure disabled.
+- `lossy: true` (fire-and-forget only; refused with `'reliable'`) sends the stream's packets on a browser session's second, unordered, zero-retransmit DataChannel, for state where only the newest value matters. Over UDP between native nodes it changes nothing. Rust: `StreamConfig::lossy` / `with_lossy`.
 - Returned `MeshStream` is opaque — pass to `sendOnStream` / `closeStream`.
 
 ### Python
@@ -241,7 +242,9 @@ To receive on a stream from Python, drop to the underlying PyO3 binding, which h
 
 Both underlying `poll` methods used to read shard 0 only, so a TS or Python consumer could not receive most stream traffic at all at the default of four shards. Rust's `Mesh::recv` had the same body under an all-shards doc comment.
 
-Streams do not have an async-iterator shape on any SDK. Loop the poll yourself.
+**Receiving with the sender (TypeScript).** `recv` returns events with no sender. `mesh.onStreamData(streamId, data => …)` delivers every event on one stream id with `data.peerNodeId`: the peer whose session authenticated it, never a value the packet claims. It allows one subscription per stream id (a second throws until `.close()`), and `close()` hands the stream back to `recv`. `streamIdFromLabel(label)` derives the same id a browser page derives from a label, which is how a native node and `@net-mesh/browser` agree on a stream without exchanging one (`sdk-ts/src/mesh.ts`, `sdk-ts/src/identity.ts`).
+
+Streams do not have an async-iterator shape on any SDK. Loop the poll yourself, or take the `onStreamData` callback.
 
 ---
 

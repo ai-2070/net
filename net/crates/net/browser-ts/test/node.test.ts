@@ -776,6 +776,17 @@ describe('peer attempts', () => {
     });
   });
 
+  // A second offer to a healthy direct pair replaces the working link
+  // and closes it under the peer. `connectPeer` must hand back the pair
+  // it has — netcode and lobbies call it "to be sure".
+  it('answers direct without offering when the pair is already direct and open', async () => {
+    const inner = new FakeNode({ peerDirectDialog: OLD });
+    const node = await connected(inner);
+    await expect(node.connectPeer(PEER)).resolves.toEqual({ type: 'direct', peer: PEER, dialog: OLD });
+    expect(inner.peerOffers).toEqual([]);
+    expect(inner.peerHandshakes).toEqual([]);
+  });
+
   it('reports the dialog it handshook when nothing replaced it', async () => {
     const inner = new FakeNode({ peerOfferDialog: OLD });
     const node = await connected(inner);

@@ -2495,7 +2495,7 @@ describe('the host’s own surface', () => {
     const { host, joined } = wired();
     await joined.ready();
 
-    expect(host.counts()).toEqual({ handles: 1, ledgers: 0, deferred: 0 });
+    expect(host.counts()).toEqual({ handles: 1, ledgers: 0, deferred: 0, sparseViews: 0 });
     await joined.act('fire', { power: 1 });
     expect(host.counts().ledgers).toBe(1);
   });

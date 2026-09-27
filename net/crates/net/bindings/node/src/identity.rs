@@ -601,3 +601,12 @@ pub fn delegate_token(
 pub fn channel_hash(channel: String) -> Result<BigInt> {
     channel_to_hash(&channel).map(BigInt::from)
 }
+
+/// The stream id a label names — the same derivation the browser leaf
+/// uses (`net-mesh-leaf`'s `stream_id_from_label`), so a native node and a
+/// page that agree on a label open the same stream. Any string is a
+/// label; unlike `channelHash`, nothing is validated.
+#[napi]
+pub fn stream_id_from_label(label: String) -> BigInt {
+    BigInt::from(net::adapter::net::stream_id_from_label(&label))
+}

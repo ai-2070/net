@@ -5,8 +5,7 @@
  * difference between a demo and evidence:
  *
  * - `?mode=local` (default) — host and player in this one page over
- *   the development bus in `local-mesh.js`. The store is real; the
- *   mesh is not.
+ *   `@net-mesh/browser/local`. The store is real; the mesh is not.
  * - `?mode=mesh` — this page's own node from the built package, over a
  *   real anchor. `&host=<16 hex>` joins that node's store; without it
  *   the page hosts and prints its own id to join from another browser.
@@ -16,7 +15,6 @@
  */
 
 import { defineGame, project, handlers, authorize } from './game.js';
-import { localNode } from './local-mesh.js';
 import { createScene } from './scene.js';
 
 const params = new URLSearchParams(globalThis.location?.search ?? '');
@@ -33,10 +31,9 @@ async function loadPackage() {
   return import('../dist/index.js');
 }
 
-function hex(bytes) {
-  const buffer = new Uint8Array(bytes);
-  crypto.getRandomValues(buffer);
-  return [...buffer].map(byte => byte.toString(16).padStart(2, '0')).join('');
+/** The in-page mesh, as a consumer imports `@net-mesh/browser/local`. */
+async function loadLocal() {
+  return import('../dist/local.js');
 }
 
 /** Held keys → a steer input, sent at most once per frame. */
@@ -56,13 +53,17 @@ function keyboard() {
 
 async function startLocal(pkg) {
   const game = defineGame(pkg.defineStore);
-  const hostId = hex(8);
-  const playerId = hex(8);
-  const spectatorId = hex(8);
+  const mesh = (await loadLocal()).createLocalMesh();
+  const hostNode = mesh.node();
+  const playerNode = mesh.node();
+  const spectatorNode = mesh.node();
+  const hostId = hostNode.nodeIdHex();
+  const playerId = playerNode.nodeIdHex();
+  const spectatorId = spectatorNode.nodeIdHex();
 
   const host = pkg.hostStore({
     definition: game,
-    transport: localNode(hostId),
+    transport: hostNode,
     initialState: { ships: {}, waypoint: { x: 6, z: -6 }, tick: 0 },
     maxEventBytes: 8104,
     authorize: request => authorize({ ...request, host: hostId }),
@@ -72,7 +73,7 @@ async function startLocal(pkg) {
 
   const player = pkg.joinStore({
     definition: game,
-    transport: localNode(playerId),
+    transport: playerNode,
     host: hostId,
     audience: ['crew'],
     key: 'player',
@@ -83,7 +84,7 @@ async function startLocal(pkg) {
   // projection withholding something rather than claiming it would.
   const spectator = pkg.joinStore({
     definition: game,
-    transport: localNode(spectatorId),
+    transport: spectatorNode,
     host: hostId,
     audience: ['crew'],
     key: 'spectator',
@@ -165,56 +166,11 @@ async function startMesh(pkg) {
       ...handlers(),
     });
     say(`hosting as ${String(self)} — join with ?mode=mesh&host=${String(self)}`);
-    // The hosting tab plays through its OWN authority, not through a
-    // replica of itself.
-    //
-    // It used to call `joinStore({host: self})`, and a real browser
-    // answered `no session with 0x…`: `openStream({peer})` needs a
-    // session with that peer and a node has none with itself. The
-    // store now refuses that construction with `invalid-data` and
-    // says what to hold instead — this.
-    //
-    // Nothing is bypassed by playing locally: the host IS where
-    // actions and inputs execute, and for the owner there is no
-    // network hop to make. Authorization is applied here explicitly
-    // so the owner is held to the same policy as a replica.
-    const spec = handlers();
-    const context = () => ({
-      peer: self,
-      getState: () => host.getState(),
-      setState: patch => {
-        host.setState({ ...host.getState(), ...patch });
-      },
-    });
-    // The same `authorize` a replica is held to, with the same
-    // request shape it receives — `type`, not `kind`, and the input
-    // included, because `fire` is refused by reading it.
-    const admit = (type, name, input) => {
-      if (!authorize({ type, name, input, peer: self, audience: ['crew', 'command'], host: self })) {
-        const error = new Error(`the host's own policy refused ${type} ${name}`);
-        error.code = 'forbidden';
-        throw error;
-      }
-    };
-    const player = {
-      ready: () => Promise.resolve(),
-      getState: () => host.getState(),
-      subscribe: listener => host.subscribe(listener),
-      subscribeStatus: listener => {
-        listener({ phase: 'ready', stale: false });
-        return () => {};
-      },
-      input: (name, payload) => {
-        admit('input', name, payload);
-        spec.inputs[name](payload, context());
-      },
-      act: (name, payload) =>
-        Promise.resolve().then(() => {
-          admit('action', name, payload);
-          return spec.actions[name](payload, context());
-        }),
-      close: () => Promise.resolve(),
-    };
+    // The hosting tab plays through its OWN authority: a node cannot
+    // join its own store (there is no session with itself), so
+    // `hostPlayer` gives it a replica-shaped handle held to the same
+    // `authorize`, handlers and projection as every other player.
+    const player = pkg.hostPlayer(host, { audience: ['crew', 'command'] });
     await player.act('enlist', { colour: 2 });
     return { host, player, self, others: [], node: session };
   }
