@@ -98,12 +98,11 @@ jobs:
 
       # `scripts/bundle.mjs` only WARNS when the leaf `pkg/` is missing, so
       # without this gate a package with no wasm in it would publish green.
-      - name: Verify dist/ carries the entry points and the leaf wasm
-        run: |
-          for f in dist/index.js dist/index.d.ts dist/index.bundle.js \
-                   dist/three/index.js dist/net_leaf.js dist/net_leaf_bg.wasm; do
-            test -f "$f" || { echo "::error::$f missing from the package"; exit 1; }
-          done
+      # The list is package.json's own `exports` (plus the leaf wasm), read
+      # by the script: a hard-coded list here once missed `./local`,
+      # `./netcode` and `./world`.
+      - name: Verify dist/ carries every declared export and the leaf wasm
+        run: npm run check:package
 
       - name: Publish to npm
         shell: bash
