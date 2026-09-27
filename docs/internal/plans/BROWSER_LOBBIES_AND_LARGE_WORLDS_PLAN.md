@@ -697,8 +697,12 @@ of its current region and its neighbours.
    ran. After give-up the source reports a typed `unresolved`. Simulated
    over 300 seeds with loss, duplication, reordering and target crashes
    between commit and reply, and tested between two region stores.
-   **Next:** items 5–6 (ghosting, load balancing), and the acceptance world
-   across native hosts.
+   Item 5 (ghosting) is done as well: the driver's `ghosting` sends each
+   neighbour the entities within `margin` of their shared edge, corners
+   included, each round and empty when none, so leaving clears. Receivers
+   keep the newest `seq` per neighbour and expire a silent one. Tested on
+   the local mesh (appear, follow, clear, expire). **Next:** item 6 (load
+   balancing) and the acceptance world across native hosts.
    Original design: A freezes the
    entity at a fenced epoch and sends its state to B; B admits it and becomes
    authoritative; late inputs to A are forwarded or refused typed, never applied

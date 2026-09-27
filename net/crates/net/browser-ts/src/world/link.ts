@@ -21,6 +21,8 @@ import {
   type ActionResult,
   type BorderAction,
   type ForwardedAction,
+  type GhostFrame,
+  ghostTargets,
   onForwardedAction,
   pruneActs,
 } from './border.js';
@@ -85,7 +87,7 @@ export interface HandoffLink<E> {
 }
 
 /** Everything a link carries. */
-export type LinkBody<E> = HandoffOffer<E> | HandoffReply | ForwardedAction | ActionResult;
+export type LinkBody<E> = HandoffOffer<E> | HandoffReply | ForwardedAction | ActionResult | GhostFrame<E>;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -93,7 +95,8 @@ const decoder = new TextDecoder('utf-8', { fatal: true });
 function isBody(value: unknown): value is LinkBody<unknown> {
   if (typeof value !== 'object' || value === null) return false;
   const body = value as Record<string, unknown>;
-  if (typeof body.id !== 'string' || typeof body.from !== 'string') return false;
+  if (typeof body.from !== 'string') return false;
+  if (body.k !== 'ghost' && typeof body.id !== 'string') return false;
   switch (body.k) {
     case 'offer':
       return typeof body.entity === 'string' && 'state' in body;
@@ -105,6 +108,13 @@ function isBody(value: unknown): value is LinkBody<unknown> {
       return typeof body.name === 'string' && 'input' in body;
     case 'result':
       return body.ok === true ? 'output' in body : body.ok === false && typeof body.reason === 'string';
+    case 'ghost':
+      return (
+        Number.isSafeInteger(body.seq) &&
+        typeof body.entities === 'object' &&
+        body.entities !== null &&
+        !Array.isArray(body.entities)
+      );
     default:
       return false;
   }
@@ -246,6 +256,18 @@ export interface RegionHandoffsOptions<E> {
    * the answer goes back.
    */
   readonly actions?: Readonly<Record<string, BorderAction<E>>>;
+  /**
+   * Ghosting (plan §9 item 5): send each neighbouring region this region's
+   * entities within `margin` of their shared border, read-only, every
+   * `everyMs` (default 100). Regions are `r:<rx>:<rz>` squares of `size`.
+   * What neighbours send here is read with {@link RegionHandoffs.ghosts}.
+   */
+  readonly ghosting?: {
+    readonly size: number;
+    readonly margin: number;
+    positionOf(entity: E): { readonly x: number; readonly z: number } | null;
+    readonly everyMs?: number;
+  };
   /** Outcomes: `moved`, `refused`, `unresolved` (source), `admitted` (target). */
   onEvent?(event: HandoffEvent): void;
   readonly timing?: HandoffTiming;
@@ -257,7 +279,7 @@ export interface RegionHandoffsOptions<E> {
 }
 
 /** The running handoff driver. */
-export interface RegionHandoffs {
+export interface RegionHandoffs<E = unknown> {
   /**
    * Hand `entity` to region `to`: frozen here now, live there once it
    * accepts. Resolves with the handoff id after the freeze is durable and the
@@ -275,6 +297,14 @@ export interface RegionHandoffs {
    * it may have happened, never twice).
    */
   forward(to: string, name: string, input: unknown): Promise<unknown>;
+  /**
+   * Neighbours' entities near this region's borders, read-only — the latest
+   * each neighbour sent, until it goes quiet. Not authoritative here: act on
+   * them with {@link forward}.
+   */
+  ghosts(): Readonly<Record<string, E>>;
+  /** Called when a neighbour's ghosts change. */
+  onGhosts(listener: () => void): () => void;
   close(): void;
 }
 
@@ -296,7 +326,7 @@ function randomId(region: string): HandoffId {
 }
 
 /** Run handoffs for one region host. */
-export function regionHandoffs<E>(options: RegionHandoffsOptions<E>): RegionHandoffs {
+export function regionHandoffs<E>(options: RegionHandoffsOptions<E>): RegionHandoffs<E> {
   const now = options.now ?? Date.now;
   const newId = options.newId ?? (() => randomId(options.region));
   let closed = false;
@@ -334,6 +364,43 @@ export function regionHandoffs<E>(options: RegionHandoffsOptions<E>): RegionHand
       reject(error: BorderActionError): void;
     }
   >();
+  // Ghosts: what each neighbour last sent (with when), and what we send.
+  const received = new Map<string, { seq: number; entities: Readonly<Record<string, E>>; at: number }>();
+  const ghostListeners = new Set<() => void>();
+  let ghostSeq = 0;
+  let ghostSentAt = -Infinity;
+  const ghostEvery = options.ghosting?.everyMs ?? 100;
+  const sendGhosts = (at: number) => {
+    const ghosting = options.ghosting;
+    if (ghosting === undefined || at - ghostSentAt < ghostEvery) return;
+    ghostSentAt = at;
+    const byNeighbour = new Map<string, Record<string, E>>();
+    // Every neighbour hears from us each round, even with nothing near its
+    // border: an empty frame is how ghosts that left get cleared.
+    const match = /^r:(-?\d+):(-?\d+)$/.exec(options.region);
+    if (match !== null) {
+      for (let dx = -1; dx <= 1; dx += 1) {
+        for (let dz = -1; dz <= 1; dz += 1) {
+          if (dx !== 0 || dz !== 0) byNeighbour.set(`r:${Number(match[1]) + dx}:${Number(match[2]) + dz}`, {});
+        }
+      }
+    }
+    for (const [id, entity] of Object.entries(options.load().entities)) {
+      const at2 = ghosting.positionOf(entity);
+      if (at2 === null) continue;
+      for (const target of ghostTargets(options.region, at2.x, at2.z, ghosting.size, ghosting.margin)) {
+        const bucket = byNeighbour.get(target);
+        if (bucket !== undefined) {
+          Object.defineProperty(bucket, id, { value: entity, enumerable: true, writable: true, configurable: true });
+        }
+      }
+    }
+    ghostSeq += 1;
+    for (const [to, entities] of byNeighbour) {
+      const frame: GhostFrame<E> = { k: 'ghost', from: options.region, seq: ghostSeq, entities };
+      options.link.send({ to, body: frame });
+    }
+  };
   const retryMs = options.timing?.retryMs ?? 250;
   const giveUpMs = options.timing?.giveUpMs ?? 60_000;
   const retentionMs = options.timing?.handledRetentionMs ?? 600_000;
@@ -360,6 +427,13 @@ export function regionHandoffs<E>(options: RegionHandoffsOptions<E>): RegionHand
         );
         return;
       }
+      case 'ghost': {
+        const known = received.get(body.from);
+        if (known !== undefined && known.seq >= body.seq) return; // reordered or repeated
+        received.set(body.from, { seq: body.seq, entities: body.entities as Readonly<Record<string, E>>, at: now() });
+        for (const listener of [...ghostListeners]) listener();
+        return;
+      }
       case 'result': {
         const pending = forwarded.get(body.id);
         if (pending === undefined || pending.to !== body.from) return;
@@ -374,6 +448,16 @@ export function regionHandoffs<E>(options: RegionHandoffsOptions<E>): RegionHand
   const timer = setInterval(() => {
     if (closed) return;
     const at = now();
+    sendGhosts(at);
+    // A neighbour gone quiet: its ghosts are stale, so they go.
+    let expired = false;
+    for (const [from, frame] of received) {
+      if (at - frame.at > ghostEvery * 5) {
+        received.delete(from);
+        expired = true;
+      }
+    }
+    if (expired) for (const listener of [...ghostListeners]) listener();
     for (const [id, pending] of forwarded) {
       if (at - pending.since >= giveUpMs) {
         forwarded.delete(id);
@@ -400,6 +484,21 @@ export function regionHandoffs<E>(options: RegionHandoffsOptions<E>): RegionHand
     },
     locate: entity => locate(options.load(), entity),
     reoffer: id => run(state => reofferHandoff(state, id, now()), () => undefined),
+    ghosts() {
+      const out: Record<string, E> = {};
+      for (const frame of received.values()) {
+        for (const [id, entity] of Object.entries(frame.entities)) {
+          Object.defineProperty(out, id, { value: entity, enumerable: true, writable: true, configurable: true });
+        }
+      }
+      return out;
+    },
+    onGhosts(listener) {
+      ghostListeners.add(listener);
+      return () => {
+        ghostListeners.delete(listener);
+      };
+    },
     forward(to, name, input) {
       if (closed) return Promise.reject(new BorderActionError('unresolved', 'the handoff driver is closed'));
       const id = newId();

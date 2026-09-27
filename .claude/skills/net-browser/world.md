@@ -57,8 +57,13 @@ await view.act('fire', input);     // goes to the region you are in
   `ambiguous`, `joining`, `ready`, `failed` (retried every `retryMs`).
 - An entity held by two regions at once (mid-handoff) shows once:
   `positionOf` picks the copy from the region containing it.
-- **Not built yet:** ghosting of border entities, load balancing
-  (split/merge).
+- **Ghosting:** `regionHandoffs({ ghosting: { size, margin, positionOf } })`
+  sends each neighbour this region's entities within `margin` of their shared
+  border, read-only. `handoffs.ghosts()` and `onGhosts` give the neighbours'
+  entities near this region's borders, for collisions or line of sight in the
+  host's own simulation. They are not authoritative here: to act on one, use
+  `forward`. A neighbour that goes quiet has its ghosts expired.
+- **Not built yet:** load balancing (split/merge).
 
 ## Cross-border actions
 

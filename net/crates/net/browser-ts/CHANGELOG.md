@@ -45,6 +45,11 @@ the README on why it is a sibling package rather than a sub-path.
     `BorderActionError` `refused` (the neighbour said no) or `unresolved`
     (no answer: it may have run, never twice). A simulation over 300 seeds
     with loss, duplication and crashes finds no action applied twice.
+  - **Ghosting:** `regionHandoffs({ ghosting })` mirrors a region's
+    entities near a border to the neighbour across it, read-only. Read them
+    with `handoffs.ghosts()` / `onGhosts`. A newer frame replaces an older
+    one, an empty frame clears, and a silent neighbour's ghosts expire.
+    `ghostTargets` names which neighbours an entity at a position reaches.
   - **Regions and a player's view:** `regionOf` / `regionsAround`;
     `announceRegions(node, world, regions)`, which re-announces every 2 s;
     `regionDirectory({ node, world, trustedHosts })`, where a region more

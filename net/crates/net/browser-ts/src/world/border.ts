@@ -96,6 +96,43 @@ export function onForwardedAction<E>(
   return { state: { ...state, entities, acts: nextActs }, reply: resultOf(state.region, act.id, record) };
 }
 
+/**
+ * Region A to neighbour B: A's entities near their shared border, read-only
+ * (plan §9 item 5, ghosting). Newer `seq` replaces older; nothing here is
+ * authoritative in B.
+ */
+export interface GhostFrame<E> {
+  readonly k: 'ghost';
+  readonly from: string;
+  readonly seq: number;
+  readonly entities: Readonly<Record<string, E>>;
+}
+
+/**
+ * Which neighbours of region `r:<rx>:<rz>` (squares of `size`) should see an
+ * entity at (x, z) within `margin` of their edge — up to three (two sides
+ * and the corner between them).
+ */
+export function ghostTargets(region: string, x: number, z: number, size: number, margin: number): string[] {
+  const match = /^r:(-?\d+):(-?\d+)$/.exec(region);
+  if (match === null) return [];
+  const rx = Number(match[1]);
+  const rz = Number(match[2]);
+  const near = (low: number, high: number, at: number): number[] => {
+    const out: number[] = [0];
+    if (at - low < margin) out.push(-1);
+    if (high - at <= margin) out.push(1);
+    return out;
+  };
+  const out: string[] = [];
+  for (const dx of near(rx * size, (rx + 1) * size, x)) {
+    for (const dz of near(rz * size, (rz + 1) * size, z)) {
+      if (dx !== 0 || dz !== 0) out.push(`r:${rx + dx}:${rz + dz}`);
+    }
+  }
+  return out;
+}
+
 /** Forget action records older than `retentionMs` (which must outlast any source's retries). */
 export function pruneActs<E>(state: RegionState<E>, now: number, retentionMs: number): RegionState<E> {
   const acts = state.acts;

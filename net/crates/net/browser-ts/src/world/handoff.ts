@@ -37,7 +37,7 @@
  * than any A keeps offering: `handledRetentionMs` > `giveUpMs`.
  */
 
-import type { ActRecord, ActionResult, ForwardedAction } from './border.js';
+import type { ActRecord, ActionResult, ForwardedAction, GhostFrame } from './border.js';
 
 /** A handoff's idempotence key: unique per crossing. */
 export type HandoffId = string;
@@ -60,7 +60,7 @@ export type HandoffReply =
 /** A message between region hosts, addressed to region `to`. */
 export type HandoffMessage<E> = {
   readonly to: string;
-  readonly body: HandoffOffer<E> | HandoffReply | ForwardedAction | ActionResult;
+  readonly body: HandoffOffer<E> | HandoffReply | ForwardedAction | ActionResult | GhostFrame<E>;
 };
 
 /** An entity frozen at the source, on its way out. */
