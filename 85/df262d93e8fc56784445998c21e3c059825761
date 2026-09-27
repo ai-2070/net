@@ -1,0 +1,29 @@
+net/crates/net/browser-ts/src/world/index.ts
+  s_d8b00bedd146e9::t_12f2aad8b45a93 1-27
+net/crates/net/browser-ts/test/world/handoff.test.ts
+  s_d8b00bedd146e9::t_f74ae06014b6c2 1-271
+net/crates/net/browser-ts/package.json
+  s_d8b00bedd146e9::t_6f2df49303fa52 28-31
+net/crates/net/browser-ts/src/world/handoff.ts
+  s_d8b00bedd146e9::t_5f1b90be620e6d 1-317
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_6f2df49303fa52 21-32
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_54335cd5e2928d 662-680
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "85df262d93e8fc56784445998c21e3c059825761",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
