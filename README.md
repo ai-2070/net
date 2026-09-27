@@ -74,7 +74,7 @@ npx -y opensrc@latest path ai-2070/net
 
 Full install options: [Claude Skills](https://ai2070.net/docs/start/claude-skills).
 
-## Chippin' In
+## Set up Your Own Mesh: Chippin' In
 
 Start a mesh node and put one event on it.
 
