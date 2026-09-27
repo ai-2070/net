@@ -28,7 +28,16 @@ the README on why it is a sibling package rather than a sub-path.
   **Contract:** make each step's state durable before sending its messages.
   A deterministic simulation (300 seeds, with loss, duplication, reordering
   and host crashes) finds no entity ever live twice and no id admitted twice.
-  Transport and region discovery come next.
+  - **Over the mesh:** `handoffLink({ transport, label, peerOf })` carries the
+    messages. It accepts a message naming region X only from the node that
+    hosts X, so a player cannot forge an offer or a reply.
+    `regionHandoffs({ link, region, load, commit, persist, … })` runs the
+    steps in order: commit, `persist` (awaited), then send.
+    `storeRegion(host, { collection, ledger })` keeps a region's entities and
+    its handoff ledger in one store document, so `persistStore` saves both
+    together; `parseHandoffLedger` validates the ledger. Tested between two
+    hosts on the local mesh and between two native `MeshNode` hosts
+    persisting to RedEX. Region discovery and `joinWorld` come next.
 
 - **Netcode: interest keys.** `hostNetcode({ interest: (id, entity) => key })`
   and `joinNetcode({ interest: keys })` / `setInterest(keys)`: a player

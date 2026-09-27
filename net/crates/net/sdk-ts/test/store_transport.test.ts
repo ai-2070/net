@@ -228,3 +228,80 @@ describe('meshStoreTransport: a dedicated netcode host', () => {
     hostTransport.close();
   });
 });
+
+describe('meshStoreTransport: dedicated region hosts', () => {
+  it('hand a ship from one region store to the other, persisted to RedEX before every send', async () => {
+    const { Redex } = await import('../src/cortex');
+    const { persistStore } = await import('../src/store-persist');
+    const world = await import('../../browser-ts/src/world/index');
+    const { host: westNode, alice: eastNode } = await trio();
+    const LABEL = 'sdk-ts-e2e.handoff';
+    type Ship = { readonly hp: number };
+    type Region = { readonly ships: Record<string, Ship>; readonly handoff: unknown };
+    const parseShip = (value: unknown): Ship => ({ hp: Number((value as { hp: unknown }).hp) });
+    const definition = defineStore<Region, Record<string, never>, Record<string, never>>({
+      id: 'sdk-ts-e2e.region',
+      version: 1,
+      state: value => {
+        const doc = value as { ships: Record<string, unknown>; handoff?: unknown };
+        const ships: Record<string, Ship> = {};
+        for (const [id, ship] of Object.entries(doc.ships)) ships[id] = parseShip(ship);
+        return { ships, handoff: world.parseHandoffLedger(doc.handoff, parseShip) };
+      },
+      empty: () => ({ ships: {}, handoff: { outgoing: {}, handled: {} } }),
+      visibility: { handoff: 'nobody' },
+      actions: {},
+      inputs: {},
+    });
+    const directory: Record<string, string> = { west: hex(westNode.nodeId()), east: hex(eastNode.nodeId()) };
+    const redex = new Redex();
+    const events: string[] = [];
+    const regionHost = (mesh: MeshNode, name: string, ships: Record<string, Ship>) => {
+      const transport = meshStoreTransport(mesh, { listen: [LABEL] });
+      const host = hostStore<Region, Record<string, never>, Record<string, never>>({
+        definition,
+        transport,
+        initialState: { ships, handoff: { outgoing: {}, handled: {} } },
+        maxEventBytes: 8104,
+        authorize: () => true,
+        actions: {},
+        inputs: {},
+      });
+      const saving = persistStore(host, { file: redex.openFile(`e2e/${name}`), intervalMs: 0 });
+      const link = world.handoffLink<Ship>({ transport, label: LABEL, peerOf: region => directory[region] ?? null });
+      const handoffs = world.regionHandoffs<Ship>({
+        link,
+        region: name,
+        ...world.storeRegion<Region, Ship>(host, { region: name, collection: 'ships', ledger: 'handoff' }),
+        persist: () => {
+          saving.flush();
+        },
+        onEvent: event => events.push(`${name}:${event.type}`),
+        tickMs: 50,
+      });
+      return { host, handoffs, link, saving, transport, file: redex.openFile(`e2e/${name}`) };
+    };
+    const west = regionHost(westNode, 'west', { s1: { hp: 7 } });
+    const east = regionHost(eastNode, 'east', {});
+
+    await west.handoffs.handoff('s1', 'east');
+    await until(() => events.includes('west:moved'), 'the handoff to settle');
+    expect(events).toContain('east:admitted');
+    expect(west.host.getState().ships).toEqual({});
+    expect(east.host.getState().ships).toEqual({ s1: { hp: 7 } });
+    // What each region would restore after a restart agrees: the ship is
+    // east's, and west's ledger holds nothing frozen.
+    const { restoreStore } = await import('../src/store-persist');
+    expect(restoreStore(east.file, definition)?.state.ships).toEqual({ s1: { hp: 7 } });
+    const westSaved = restoreStore(west.file, definition)?.state;
+    expect(westSaved?.ships).toEqual({});
+
+    for (const r of [west, east]) {
+      r.handoffs.close();
+      r.link.close();
+      r.saving.close();
+      await r.host.close();
+      r.transport.close();
+    }
+  });
+});

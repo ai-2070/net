@@ -675,8 +675,14 @@ of its current region and its neighbours.
    event that no entity is live in two regions and no id is admitted twice,
    and at the end that every entity is live exactly once. Mutations that
    unfreeze on give-up, or make the target forget its decisions, fail it.
-   **Next:** the transport (host-to-host over the mesh), and wiring it into
-   a region store's persisted document.
+   *Transport and store wiring done too:* `handoffLink` authenticates by
+   the region directory (`peerOf`), and `regionHandoffs` commits, persists
+   (awaited), then sends. `storeRegion` keeps entities and ledger in one
+   store document, so `persistStore` saves them as one unit. Witnessed on
+   the local mesh (forged offer dropped; unresolved while the destination is
+   down, completed by `reoffer`) and between two native `MeshNode` hosts
+   persisting to RedEX (sdk-ts `store_transport.test.ts`). **Next:** region
+   discovery (item 1) and `joinWorld` (item 2).
    Original design: A freezes the
    entity at a fenced epoch and sends its state to B; B admits it and becomes
    authoritative; late inputs to A are forwarded or refused typed, never applied

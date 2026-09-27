@@ -25,3 +25,12 @@ export type {
   Outgoing,
   RegionState,
 } from './handoff.js';
+export { handoffLink, parseHandoffLedger, regionHandoffs, storeRegion } from './link.js';
+export type {
+  HandoffLedger,
+  HandoffLink,
+  HandoffLinkOptions,
+  HandoffTransport,
+  RegionHandoffs,
+  RegionHandoffsOptions,
+} from './link.js';
