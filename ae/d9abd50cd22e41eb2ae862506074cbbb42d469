@@ -1,0 +1,30 @@
+net/crates/net/browser-ts/src/world/link.ts
+  s_d8b00bedd146e9::t_4df74d97ecbb71 1-362,367-372,374-379,381-385,387-389,391-393
+  s_d8b00bedd146e9::t_23d16c8e81b488 363-366,373,380,386,390
+net/crates/net/browser-ts/test/world/link.test.ts
+  s_d8b00bedd146e9::t_a9e89fc695955d 1-162
+net/crates/net/sdk-ts/test/store_transport.test.ts
+  s_d8b00bedd146e9::t_fb3ff1969fc1a4 231-307
+docs/internal/plans/BROWSER_LOBBIES_AND_LARGE_WORLDS_PLAN.md
+  s_d8b00bedd146e9::t_49d3d7271bdc50 678-685
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_83f6bed9cafd87 31-40
+net/crates/net/browser-ts/src/world/index.ts
+  s_d8b00bedd146e9::t_b054419e3a0ae1 28-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "aed9abd50cd22e41eb2ae862506074cbbb42d469",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
