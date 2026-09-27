@@ -32,7 +32,7 @@ import {
 } from '../../browser-ts/src/world/index';
 
 const PSK = '42'.repeat(32);
-let portSeed = 29_900;
+let portSeed = 32_600;
 const nodes: MeshNode[] = [];
 const cleanup: (() => unknown)[] = [];
 
