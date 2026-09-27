@@ -17,6 +17,14 @@
 
 import { peerHexOf } from '../store/host.js';
 import {
+  type ActRecord,
+  type ActionResult,
+  type BorderAction,
+  type ForwardedAction,
+  onForwardedAction,
+  pruneActs,
+} from './border.js';
+import {
   type HandoffEvent,
   type HandoffId,
   type HandoffMessage,
@@ -69,17 +77,20 @@ export interface HandoffLinkOptions {
 export interface HandoffLink<E> {
   /** Send one step's message to the host of `message.to`. Best effort: the protocol retries. */
   send(message: HandoffMessage<E>): void;
-  /** Receive authenticated offers and replies. */
-  onMessage(handler: (body: HandoffOffer<E> | HandoffReply) => void): () => void;
+  /** Receive authenticated offers, replies, forwarded actions and their results. */
+  onMessage(handler: (body: LinkBody<E>) => void): () => void;
   /** Messages refused, by reason. */
   readonly dropped: Readonly<Record<string, number>>;
   close(): void;
 }
 
+/** Everything a link carries. */
+export type LinkBody<E> = HandoffOffer<E> | HandoffReply | ForwardedAction | ActionResult;
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
 
-function isBody(value: unknown): value is HandoffOffer<unknown> | HandoffReply {
+function isBody(value: unknown): value is LinkBody<unknown> {
   if (typeof value !== 'object' || value === null) return false;
   const body = value as Record<string, unknown>;
   if (typeof body.id !== 'string' || typeof body.from !== 'string') return false;
@@ -90,6 +101,10 @@ function isBody(value: unknown): value is HandoffOffer<unknown> | HandoffReply {
       return true;
     case 'refuse':
       return typeof body.reason === 'string';
+    case 'act':
+      return typeof body.name === 'string' && 'input' in body;
+    case 'result':
+      return body.ok === true ? 'output' in body : body.ok === false && typeof body.reason === 'string';
     default:
       return false;
   }
@@ -100,7 +115,7 @@ export function handoffLink<E>(options: HandoffLinkOptions): HandoffLink<E> {
   const { label } = options;
   const streams = new Map<string, { send(payload: Uint8Array): unknown; close(): unknown }>();
   const opening = new Map<string, Promise<void>>();
-  const handlers = new Set<(body: HandoffOffer<E> | HandoffReply) => void>();
+  const handlers = new Set<(body: LinkBody<E>) => void>();
   const dropped: Record<string, number> = {};
   const drop = (reason: string) => {
     dropped[reason] = (dropped[reason] ?? 0) + 1;
@@ -166,7 +181,7 @@ export function handoffLink<E>(options: HandoffLinkOptions): HandoffLink<E> {
       drop('malformed');
       return;
     }
-    const body = frame.b as HandoffOffer<E> | HandoffReply;
+    const body = frame.b as LinkBody<E>;
     // A region speaks only from the node that hosts it: a player (or any
     // other node) cannot offer an entity into a region or settle a
     // handoff on another region's behalf.
@@ -225,6 +240,12 @@ export interface RegionHandoffsOptions<E> {
   persist?(): void | Promise<void>;
   /** Asked once per incoming entity: `true` to admit, or a refusal reason. */
   admit?(entity: string, state: E): true | string;
+  /**
+   * Cross-border actions this region serves, by name: applied ONCE per
+   * action id, their effect and record committed and made durable before
+   * the answer goes back.
+   */
+  readonly actions?: Readonly<Record<string, BorderAction<E>>>;
   /** Outcomes: `moved`, `refused`, `unresolved` (source), `admitted` (target). */
   onEvent?(event: HandoffEvent): void;
   readonly timing?: HandoffTiming;
@@ -247,7 +268,25 @@ export interface RegionHandoffs {
   locate(entity: string): ReturnType<typeof locate>;
   /** Re-offer an `unresolved` handoff under its own id (the destination is back). */
   reoffer(id: HandoffId): Promise<void>;
+  /**
+   * Ask region `to` to run action `name` on something it owns; resolves
+   * with its answer. Rejects with {@link BorderActionError}: `refused` (it
+   * decided no — the reason), or `unresolved` (no answer within `giveUpMs`:
+   * it may have happened, never twice).
+   */
+  forward(to: string, name: string, input: unknown): Promise<unknown>;
   close(): void;
+}
+
+/** Why a forwarded action did not produce an answer. */
+export class BorderActionError extends Error {
+  constructor(
+    readonly code: 'refused' | 'unresolved',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'BorderActionError';
+  }
 }
 
 function randomId(region: string): HandoffId {
@@ -282,20 +321,73 @@ export function regionHandoffs<E>(options: RegionHandoffsOptions<E>): RegionHand
     return next;
   };
 
+  // Actions this host forwarded, awaiting an answer. In memory only: see
+  // `border.ts` for why that keeps at-most-once.
+  const forwarded = new Map<
+    string,
+    {
+      readonly body: ForwardedAction;
+      readonly to: string;
+      readonly since: number;
+      sentAt: number;
+      resolve(output: unknown): void;
+      reject(error: BorderActionError): void;
+    }
+  >();
+  const retryMs = options.timing?.retryMs ?? 250;
+  const giveUpMs = options.timing?.giveUpMs ?? 60_000;
+  const retentionMs = options.timing?.handledRetentionMs ?? 600_000;
+
   const stop = options.link.onMessage(body => {
     if (closed) return;
-    if (body.k === 'offer') {
-      void run(state => onHandoffOffer(state, body as HandoffOffer<E>, now(), options.admit), () => undefined);
-    } else {
-      void run(state => onHandoffReply(state, body), () => undefined);
+    switch (body.k) {
+      case 'offer':
+        void run(state => onHandoffOffer(state, body as HandoffOffer<E>, now(), options.admit), () => undefined);
+        return;
+      case 'accept':
+      case 'refuse':
+        void run(state => onHandoffReply(state, body), () => undefined);
+        return;
+      case 'act': {
+        let reply: ActionResult | null = null;
+        void run(
+          state => {
+            const done = onForwardedAction(state, body, now(), options.actions ?? {});
+            reply = done.reply;
+            return { state: done.state, send: [{ to: body.from, body: done.reply }], events: [] };
+          },
+          () => reply,
+        );
+        return;
+      }
+      case 'result': {
+        const pending = forwarded.get(body.id);
+        if (pending === undefined || pending.to !== body.from) return;
+        forwarded.delete(body.id);
+        if (body.ok) pending.resolve(body.output);
+        else pending.reject(new BorderActionError('refused', body.reason));
+        return;
+      }
     }
   });
 
   const timer = setInterval(() => {
     if (closed) return;
+    const at = now();
+    for (const [id, pending] of forwarded) {
+      if (at - pending.since >= giveUpMs) {
+        forwarded.delete(id);
+        pending.reject(
+          new BorderActionError('unresolved', `no answer from ${pending.to} for action ${id}; it may have run, never twice`),
+        );
+      } else if (at - pending.sentAt >= retryMs) {
+        pending.sentAt = at;
+        options.link.send({ to: pending.to, body: pending.body });
+      }
+    }
     void run(state => {
       const retried = retryHandoffs(state, now(), options.timing);
-      const pruned = pruneHandled(retried.state, now(), options.timing);
+      const pruned = pruneActs(pruneHandled(retried.state, now(), options.timing), now(), retentionMs);
       return { ...retried, state: pruned };
     }, () => undefined);
   }, options.tickMs ?? 100);
@@ -308,11 +400,25 @@ export function regionHandoffs<E>(options: RegionHandoffsOptions<E>): RegionHand
     },
     locate: entity => locate(options.load(), entity),
     reoffer: id => run(state => reofferHandoff(state, id, now()), () => undefined),
+    forward(to, name, input) {
+      if (closed) return Promise.reject(new BorderActionError('unresolved', 'the handoff driver is closed'));
+      const id = newId();
+      const body: ForwardedAction = { k: 'act', id, from: options.region, name, input };
+      return new Promise((resolve, reject) => {
+        const at = now();
+        forwarded.set(id, { body, to, since: at, sentAt: at, resolve, reject });
+        options.link.send({ to, body });
+      });
+    },
     close() {
       if (closed) return;
       closed = true;
       clearInterval(timer);
       stop();
+      for (const [id, pending] of forwarded) {
+        forwarded.delete(id);
+        pending.reject(new BorderActionError('unresolved', 'the handoff driver closed before an answer'));
+      }
     },
   };
 }
@@ -321,6 +427,7 @@ export function regionHandoffs<E>(options: RegionHandoffsOptions<E>): RegionHand
 export interface HandoffLedger<E> {
   readonly outgoing: Readonly<Record<HandoffId, Outgoing<E>>>;
   readonly handled: Readonly<Record<HandoffId, Handled>>;
+  readonly acts?: Readonly<Record<string, ActRecord>>;
 }
 
 /**
@@ -341,14 +448,20 @@ export function storeRegion<S extends object, E>(
       const doc = host.getState() as Record<string, unknown>;
       const entities = (doc[options.collection] ?? {}) as Readonly<Record<string, E>>;
       const ledger = (doc[options.ledger] ?? { outgoing: {}, handled: {} }) as HandoffLedger<E>;
-      return { region: options.region, entities, outgoing: ledger.outgoing, handled: ledger.handled };
+      return {
+        region: options.region,
+        entities,
+        outgoing: ledger.outgoing,
+        handled: ledger.handled,
+        acts: ledger.acts ?? {},
+      };
     },
     commit: next => {
       const doc = host.getState() as Record<string, unknown>;
       host.setState({
         ...doc,
         [options.collection]: next.entities,
-        [options.ledger]: { outgoing: next.outgoing, handled: next.handled },
+        [options.ledger]: { outgoing: next.outgoing, handled: next.handled, acts: next.acts ?? {} },
       } as S);
     },
   };
@@ -389,5 +502,16 @@ export function parseHandoffLedger<E>(value: unknown, parseEntity: (value: unkno
       ...(typeof h.reason === 'string' ? { reason: h.reason } : {}),
     });
   }
-  return { outgoing, handled };
+  const acts: Record<string, ActRecord> = {};
+  for (const [id, raw] of Object.entries(record(ledger.acts ?? {}, 'acts'))) {
+    const a = record(raw, `act ${id}`);
+    if (typeof a.ok !== 'boolean') throw new Error(`act ${id} is malformed`);
+    define(acts, id, {
+      at: Number(a.at),
+      ok: a.ok,
+      ...('output' in a ? { output: a.output } : {}),
+      ...(typeof a.reason === 'string' ? { reason: a.reason } : {}),
+    });
+  }
+  return { outgoing, handled, acts };
 }

@@ -689,9 +689,16 @@ of its current region and its neighbours.
    with two host nodes serving four region stores. That test found a store
    defect: sibling stores on one node answered `closed` for handles they
    did not issue. Fixed in `host.ts`: only the issuing store answers, and an
-   unknown handle is refused once. **Next:** items 4–6 (cross-border
-   actions, ghosting, load balancing), and the acceptance world across
-   native hosts.
+   unknown handle is refused once. Item 4 (cross-border actions) is done
+   too (2026-09-27): `forward(to, name, input)` and served `actions`. The
+   target runs each action id once and keeps its record in the same
+   durable commit as the effect. The source keeps pending actions in
+   memory, which is safe: a lost pending action either ran once or never
+   ran. After give-up the source reports a typed `unresolved`. Simulated
+   over 300 seeds with loss, duplication, reordering and target crashes
+   between commit and reply, and tested between two region stores.
+   **Next:** items 5–6 (ghosting, load balancing), and the acceptance world
+   across native hosts.
    Original design: A freezes the
    entity at a fenced epoch and sends its state to B; B admits it and becomes
    authoritative; late inputs to A are forwarded or refused typed, never applied

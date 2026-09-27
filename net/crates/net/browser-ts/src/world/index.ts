@@ -25,12 +25,15 @@ export type {
   Outgoing,
   RegionState,
 } from './handoff.js';
-export { handoffLink, parseHandoffLedger, regionHandoffs, storeRegion } from './link.js';
+export { BorderActionError, handoffLink, parseHandoffLedger, regionHandoffs, storeRegion } from './link.js';
+export { onForwardedAction, pruneActs } from './border.js';
+export type { ActRecord, ActionResult, BorderAction, ForwardedAction } from './border.js';
 export type {
   HandoffLedger,
   HandoffLink,
   HandoffLinkOptions,
   HandoffTransport,
+  LinkBody,
   RegionHandoffs,
   RegionHandoffsOptions,
 } from './link.js';

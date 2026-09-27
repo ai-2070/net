@@ -38,6 +38,13 @@ the README on why it is a sibling package rather than a sub-path.
     together; `parseHandoffLedger` validates the ledger. Tested between two
     hosts on the local mesh and between two native `MeshNode` hosts
     persisting to RedEX.
+  - **Cross-border actions:** `regionHandoffs({ actions })` serves named
+    actions, and `handoffs.forward(to, name, input)` asks a neighbour. The
+    neighbour runs each action id once, records the outcome durably with its
+    effect, and answers every repeat the same way. A forward rejects with
+    `BorderActionError` `refused` (the neighbour said no) or `unresolved`
+    (no answer: it may have run, never twice). A simulation over 300 seeds
+    with loss, duplication and crashes finds no action applied twice.
   - **Regions and a player's view:** `regionOf` / `regionsAround`;
     `announceRegions(node, world, regions)`, which re-announces every 2 s;
     `regionDirectory({ node, world, trustedHosts })`, where a region more

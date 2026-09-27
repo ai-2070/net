@@ -128,7 +128,7 @@ function simulate(seed: number): RunResult {
       offersDelivered += 1;
       const body = message.body;
       apply(to, onHandoffOffer(current, body, now, () => (random() < 0.2 ? 'full' : true)));
-    } else {
+    } else if (message.body.k === 'accept' || message.body.k === 'refuse') {
       apply(to, onHandoffReply(current, message.body));
     }
   };

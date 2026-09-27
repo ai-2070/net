@@ -37,6 +37,8 @@
  * than any A keeps offering: `handledRetentionMs` > `giveUpMs`.
  */
 
+import type { ActRecord, ActionResult, ForwardedAction } from './border.js';
+
 /** A handoff's idempotence key: unique per crossing. */
 export type HandoffId = string;
 
@@ -56,7 +58,10 @@ export type HandoffReply =
   | { readonly k: 'refuse'; readonly id: HandoffId; readonly from: string; readonly reason: string };
 
 /** A message between region hosts, addressed to region `to`. */
-export type HandoffMessage<E> = { readonly to: string; readonly body: HandoffOffer<E> | HandoffReply };
+export type HandoffMessage<E> = {
+  readonly to: string;
+  readonly body: HandoffOffer<E> | HandoffReply | ForwardedAction | ActionResult;
+};
 
 /** An entity frozen at the source, on its way out. */
 export interface Outgoing<E> {
@@ -89,6 +94,8 @@ export interface RegionState<E> {
   readonly entities: Readonly<Record<string, E>>;
   readonly outgoing: Readonly<Record<HandoffId, Outgoing<E>>>;
   readonly handled: Readonly<Record<HandoffId, Handled>>;
+  /** Cross-border actions applied here, by id (`border.ts`). */
+  readonly acts?: Readonly<Record<string, ActRecord>>;
 }
 
 /** Timing for {@link retryHandoffs} and {@link pruneHandled}. */

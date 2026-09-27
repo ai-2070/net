@@ -57,8 +57,29 @@ await view.act('fire', input);     // goes to the region you are in
   `ambiguous`, `joining`, `ready`, `failed` (retried every `retryMs`).
 - An entity held by two regions at once (mid-handoff) shows once:
   `positionOf` picks the copy from the region containing it.
-- **Not built yet:** cross-border actions (host to host), ghosting of border
-  entities, load balancing (split/merge).
+- **Not built yet:** ghosting of border entities, load balancing
+  (split/merge).
+
+## Cross-border actions
+
+A region host asks a neighbour to act on something the neighbour owns. The
+neighbour's authority decides, and runs each action at most once:
+
+```ts
+regionHandoffs({ …, actions: {
+  hit: (ships, input, fromRegion) => ships[input.ship]
+    ? { entities: { ...ships, [input.ship]: damaged(ships[input.ship]) }, output: 'hit' }
+    : 'no such ship',                                   // a string refuses
+} });
+await handoffs.forward('r:4:8', 'hit', { ship: 's9' });  // the neighbour's answer
+```
+
+- Rejections are a `BorderActionError`: `refused` carries the neighbour's
+  reason. `unresolved` means no answer within `giveUpMs`: the action may have
+  run, but never twice. To retry, call `forward` again, which uses a new id.
+- The neighbour records each outcome in the ledger (`acts`), in the same
+  commit as the effect and made durable before it answers. A repeat of the
+  same id gets the recorded answer.
 
 Source: `net/crates/net/browser-ts/src/world/`; the protocol's deterministic
 simulation is `net/crates/net/browser-ts/test/world/handoff.test.ts`.
