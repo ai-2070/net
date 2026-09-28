@@ -50,12 +50,11 @@ import {
   type PeerPrimitives,
 } from './peer-driver.js';
 import {
-  classifyRtcError,
+  classifyRtcFailureAll,
   probeBootstrapReachable,
-  probeStunBinding,
+  probeStunBindings,
   type BootstrapProbeOptions,
   type StunProbeOptions,
-  type StunProbeOutcome,
 } from './udp-probe.js';
 import {
   idArg,
@@ -351,6 +350,12 @@ export class BrowserNode {
   private readonly orgHandles = new OrgHandleRegistry();
   /** The last `rtc_addr` an anchor told us about; the probe's subject. */
   private anchorRtcAddr: string | null;
+  /**
+   * Every endpoint that anchor published (one per family on a
+   * dual-stack anchor). Empty until a `connected` event names them;
+   * the probe then aims at all of them.
+   */
+  private anchorRtcAddrs: readonly string[] = [];
   /** Set once the leaf reports a session — a bootstrap that demonstrably worked. */
   private bootstrapObserved = false;
 
@@ -1056,7 +1061,7 @@ export class BrowserNode {
    * `ice-timeout` it gathers the two observations the correction
    * requires — the anchor answering over HTTPS, and a STUN binding to
    * the address that anchor published going unanswered — and returns
-   * the classification {@link classifyRtcError} makes of them. With no
+   * the classification {@link classifyRtcFailureAll} makes of them. With no
    * address to probe there is no evidence, and the error comes back
    * unchanged.
    *
@@ -1069,6 +1074,7 @@ export class BrowserNode {
       bootstrapUrl: this.bootstrapUrl,
       bootstrapObserved: this.bootstrapObserved,
       anchorRtcAddr: this.anchorRtcAddr,
+      anchorRtcAddrs: this.anchorRtcAddrs,
       failureTyping: this.failureTyping,
     });
   }
@@ -1155,6 +1161,7 @@ export class BrowserNode {
     if (event.type === 'connected') {
       this.bootstrapObserved = true;
       if (event.rtcAddr !== null) this.anchorRtcAddr = event.rtcAddr;
+      if (event.rtcAddrs.length > 0) this.anchorRtcAddrs = event.rtcAddrs;
     }
     this.hub.dispatch(event);
   }
@@ -1375,6 +1382,11 @@ interface RefineContext {
   /** The leaf already demonstrated a working bootstrap this session. */
   readonly bootstrapObserved: boolean;
   readonly anchorRtcAddr: string | null;
+  /**
+   * Every endpoint the anchor published, when known. Absent or empty
+   * falls back to `[anchorRtcAddr]`.
+   */
+  readonly anchorRtcAddrs?: readonly string[];
   readonly failureTyping: FailureTypingOptions;
 }
 
@@ -1387,22 +1399,30 @@ export async function refineIceFailure(error: LeafError, context: RefineContext)
   if (!(error instanceof RtcError) || error.failure.type !== 'iceTimeout') return error;
   if (context.failureTyping.probeOnIceTimeout === false) return error;
 
-  const probed = context.anchorRtcAddr;
-  if (probed === null) {
+  const endpoints =
+    context.anchorRtcAddrs !== undefined && context.anchorRtcAddrs.length > 0
+      ? context.anchorRtcAddrs
+      : context.anchorRtcAddr !== null
+        ? [context.anchorRtcAddr]
+        : [];
+  if (endpoints.length === 0) {
     // No subject, no claim. The plan's whole point: an ICE timeout
     // alone is never promoted.
     return error;
   }
 
-  const stunProbe: StunProbeOutcome = await probeStunBinding(probed, context.failureTyping.stun);
-  if (stunProbe.type !== 'unanswered') return error;
+  // Every published endpoint, under one deadline (dual-stack plan,
+  // slice 3): one answered family means UDP works, so the failure
+  // stays an ICE timeout without even asking HTTPS.
+  const probes = await probeStunBindings(endpoints, context.failureTyping.stun);
+  if (probes.some((probe) => probe.stunProbe.type !== 'unanswered')) return error;
 
   const bootstrapOk =
     context.bootstrapObserved ||
     (context.bootstrapUrl !== null &&
       (await probeBootstrapReachable(context.bootstrapUrl, context.failureTyping.bootstrap)));
 
-  return classifyRtcError({ bootstrapOk, stunProbe, probed });
+  return new RtcError(classifyRtcFailureAll({ bootstrapOk, probes }));
 }
 
 /**

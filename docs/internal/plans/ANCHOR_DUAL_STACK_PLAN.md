@@ -382,6 +382,62 @@ carries the primary `rtc_addr` only.
 
 ### Slice 3: honest diagnostics
 
+**Done 2026-09-29.** What landed:
+
+- **Rust (leaf).**
+  - `probe_event_answers` / `probe_verdict`: a reflexive candidate (the
+    `typ` token then `srflx`, not a substring), or a STUN error below 700.
+  - `stun_probe_outcomes`: every endpoint, concurrently, under one
+    `STUN_PROBE_MS`. Empty or unbuildable probes are `NotRun`.
+  - `classify_ice_failure_all`.
+  - `UdpBlockedEvidence::{probed_all, for_endpoints}`.
+  - The observation-not-cause `Display`.
+  - `probed_all` across the leader/follower channel, with `[probed]` from
+    an older sender.
+  - `LeafEvent::Connected::rtc_addrs`, serialized only when there is more
+    than one.
+- **TypeScript.**
+  - `probeEventAnswers` / `stunProbeAnswered` / `candidateLineIsReflexive`,
+    used by the live probe.
+  - `probeStunBindings` and `classifyRtcFailureAll`.
+  - `UdpBlockedEvidence.probedAll` and `ConnectedEvent.rtcAddrs`.
+  - The new message, formatted and parsed byte-identically to Rust.
+  - `refineIceFailure` over every endpoint.
+  - The existing exports are unchanged; the new ones are additive.
+- **Harness.** The stage-5 browser runner matches the new prefix. This is a
+  string change in a standalone crate that was not compiled locally.
+
+**Evidence:**
+
+- The shared vector file `browser-ts/test/fixtures/stun-probe-verdicts.json`
+  has 14 cases, run by `leaf/tests/stun_probe_parity.rs` and by
+  `classification.test.ts` ("the shared STUN probe rule").
+- Classification tests on both sides cover the IPv6-only player (v4 silent,
+  v6 answered → `ice-timeout`), both silent (→ `udp-blocked` naming both),
+  and `notRun`/`unsupported`/`stunError`/empty/no-bootstrap (→
+  `ice-timeout`).
+- A TypeScript deadline test: 3 silent endpoints, a 150 ms deadline, done in
+  under 300 ms.
+- Leaf, with CI's exact command: 485 native tests (floor raised from 469 in
+  the same commit), `wasm32 --all-targets` check, and clippy on both
+  targets.
+- `@net-mesh/browser`: 943 tests.
+
+**Mutations, all caught:**
+
+- The Rust rule ignoring STUN errors fails the parity test.
+- Rust `all`→`any` fails the classifier test.
+- The TypeScript rule ignoring STUN errors fails the vector cases.
+- TypeScript `some`→`every` fails 4 classification tests.
+
+**Defect found on the way:** slice 2d had broken a wasm-only test's
+`AnchorInfo` literal (`tests/wasm_leaf.rs`), because that slice's
+`wasm32` check covered `--lib` only. It was caught here by CI's
+`--all-targets` command and fixed.
+
+**Not witnessed:** the probes' behaviour in a real browser against a real
+dual-stack anchor. That is slice 4.
+
 - The leaf probes every published address under one deadline; `udp-blocked`
   requires every probe `unanswered`; `probedAll` is added; the message states
   the observation, not a cause.

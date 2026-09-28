@@ -54,11 +54,16 @@ const VARIANTS: Array<{ error: LeafError; kind: LeafErrorKind; display: string }
   {
     error: new RtcError({
       type: 'udpBlocked',
-      evidence: { bootstrapOk: true, stunProbeFailed: true, probed: '203.0.113.9:4433' },
+      evidence: {
+        bootstrapOk: true,
+        stunProbeFailed: true,
+        probed: '203.0.113.9:4433',
+        probedAll: ['203.0.113.9:4433'],
+      },
     }),
     kind: 'udp-blocked',
     display:
-      "rtc: UDP appears blocked: the anchor's HTTPS bootstrap succeeded but a STUN binding to 203.0.113.9:4433 was unanswered",
+      "rtc: no UDP response from the anchor's advertised endpoints: its HTTPS bootstrap succeeded but STUN bindings to 203.0.113.9:4433 went unanswered",
   },
   {
     error: new RtcError({ type: 'channelClosed', detail: 'remote reset' }),
@@ -135,7 +140,7 @@ describe('fromWasmError', () => {
   it('recovers the evidence a udp-blocked claim is built on', () => {
     const blocked = fromWasmError(
       new Error(
-        "rtc: UDP appears blocked: the anchor's HTTPS bootstrap succeeded but a STUN binding to [2001:db8::1]:4433 was unanswered",
+        "rtc: no UDP response from the anchor's advertised endpoints: its HTTPS bootstrap succeeded but STUN bindings to [2001:db8::1]:4433 went unanswered",
       ),
     );
     expect(isUdpBlocked(blocked)).toBe(true);
@@ -144,7 +149,22 @@ describe('fromWasmError', () => {
         bootstrapOk: true,
         stunProbeFailed: true,
         probed: '[2001:db8::1]:4433',
+        probedAll: ['[2001:db8::1]:4433'],
       });
+    }
+  });
+
+  // The dual-stack observation: every family named, in order, and the
+  // round trip through the Rust `Display` text loses none of them.
+  it('recovers every endpoint of a dual-stack udp-blocked observation', () => {
+    const text =
+      "rtc: no UDP response from the anchor's advertised endpoints: its HTTPS bootstrap succeeded but STUN bindings to 203.0.113.7:7101, [2001:db8::7]:7101 went unanswered";
+    const blocked = fromWasmError(new Error(text));
+    expect(isUdpBlocked(blocked)).toBe(true);
+    if (isUdpBlocked(blocked)) {
+      expect(blocked.failure.evidence.probed).toBe('203.0.113.7:7101');
+      expect(blocked.failure.evidence.probedAll).toEqual(['203.0.113.7:7101', '[2001:db8::7]:7101']);
+      expect(blocked.message).toBe(text);
     }
   });
 

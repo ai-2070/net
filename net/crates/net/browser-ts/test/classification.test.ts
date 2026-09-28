@@ -9,6 +9,8 @@
 
 import { describe, expect, it } from 'vitest';
 
+import verdicts from './fixtures/stun-probe-verdicts.json';
+
 import {
   IceServerConflictError,
   isUdpBlocked,
@@ -19,10 +21,14 @@ import {
 import { refineIceFailure } from '../src/node.js';
 import {
   classifyRtcFailure,
+  classifyRtcFailureAll,
   diagnosticStunUrl,
   probeBootstrapReachable,
   probeStunBinding,
+  probeStunBindings,
   reflexiveAddress,
+  stunProbeAnswered,
+  type ProbeEvent,
   type StunProbeOutcome,
 } from '../src/udp-probe.js';
 
@@ -37,7 +43,7 @@ describe('classifyRtcFailure', () => {
     });
     expect(classification).toEqual({
       type: 'udpBlocked',
-      evidence: { bootstrapOk: true, stunProbeFailed: true, probed: PROBED },
+      evidence: { bootstrapOk: true, stunProbeFailed: true, probed: PROBED, probedAll: [PROBED] },
     });
   });
 
@@ -82,7 +88,112 @@ describe('udpBlockedEvidence', () => {
       bootstrapOk: true,
       stunProbeFailed: true,
       probed: PROBED,
+      probedAll: [PROBED],
     });
+  });
+
+  it('refuses a list that does not start with its subject or names nothing', () => {
+    expect(udpBlockedEvidence(true, true, PROBED, [])).toBeNull();
+    expect(udpBlockedEvidence(true, true, PROBED, ['other:1', PROBED])).toBeNull();
+    expect(udpBlockedEvidence(true, true, PROBED, [PROBED, ''])).toBeNull();
+  });
+});
+
+/**
+ * **One rule, two probes** (dual-stack plan, defect 3). The Rust (WASM)
+ * probe runs the same vector file in `leaf/tests/stun_probe_parity.rs`;
+ * a case either side answers differently fails that side.
+ */
+describe('the shared STUN probe rule', () => {
+  it('holds the vector file to its cases', () => {
+    expect(verdicts.cases.length).toBeGreaterThanOrEqual(10);
+  });
+
+  it.each(verdicts.cases)('$name', ({ events, answered }) => {
+    expect(stunProbeAnswered(events as ProbeEvent[])).toBe(answered);
+  });
+});
+
+/**
+ * Slice 3's classification over every endpoint a dual-stack anchor
+ * published. `udpBlocked` needs EVERY probe unanswered after a good
+ * bootstrap; anything else is `iceTimeout`.
+ */
+describe('classifyRtcFailureAll', () => {
+  const V4 = '203.0.113.7:7101';
+  const V6 = '[2001:db8::7]:7101';
+  const silent: StunProbeOutcome = { type: 'unanswered', detail: 'no answer inside the probe deadline' };
+  const answered: StunProbeOutcome = { type: 'reflexive', address: '198.51.100.7' };
+
+  it('never calls UDP blocked for the IPv6-only player whose IPv6 probe answers', () => {
+    expect(
+      classifyRtcFailureAll({
+        bootstrapOk: true,
+        probes: [
+          { probed: V4, stunProbe: silent },
+          { probed: V6, stunProbe: answered },
+        ],
+      }),
+    ).toEqual({ type: 'iceTimeout' });
+  });
+
+  it('reports the observation, naming both families, when both are silent', () => {
+    expect(
+      classifyRtcFailureAll({
+        bootstrapOk: true,
+        probes: [
+          { probed: V4, stunProbe: silent },
+          { probed: V6, stunProbe: silent },
+        ],
+      }),
+    ).toEqual({
+      type: 'udpBlocked',
+      evidence: { bootstrapOk: true, stunProbeFailed: true, probed: V4, probedAll: [V4, V6] },
+    });
+  });
+
+  it.each<[string, StunProbeOutcome]>([
+    ['notRun', { type: 'notRun', reason: 'not an address' }],
+    ['unsupported', { type: 'unsupported', detail: 'no RTCPeerConnection' }],
+    ['stunError', { type: 'stunError', code: 401, detail: '401' }],
+  ])('treats a %s probe as no evidence of blocking', (_name, stunProbe) => {
+    expect(
+      classifyRtcFailureAll({
+        bootstrapOk: true,
+        probes: [
+          { probed: V4, stunProbe: silent },
+          { probed: V6, stunProbe },
+        ],
+      }),
+    ).toEqual({ type: 'iceTimeout' });
+  });
+
+  it('makes no claim about no endpoints, or without a bootstrap', () => {
+    expect(classifyRtcFailureAll({ bootstrapOk: true, probes: [] })).toEqual({ type: 'iceTimeout' });
+    expect(
+      classifyRtcFailureAll({ bootstrapOk: false, probes: [{ probed: V4, stunProbe: silent }] }),
+    ).toEqual({ type: 'iceTimeout' });
+  });
+});
+
+describe('probeStunBindings', () => {
+  // One deadline, not one per endpoint: the probes run concurrently.
+  // Three silent endpoints with a 150 ms deadline finish in about 150 ms,
+  // never the 450 ms a sequential probe would take.
+  it('probes every endpoint under one deadline, in the order given', async () => {
+    const started = performance.now();
+    const probes = await probeStunBindings(['203.0.113.7:7101', '[2001:db8::7]:7101', '198.51.100.9:7101'], {
+      timeoutMs: 150,
+      peerConnectionFactory: fakePeerConnection(() => {}),
+    });
+    const elapsed = performance.now() - started;
+    expect(probes.map((probe) => probe.probed)).toEqual([
+      '203.0.113.7:7101',
+      '[2001:db8::7]:7101',
+      '198.51.100.9:7101',
+    ]);
+    expect(probes.every((probe) => probe.stunProbe.type === 'unanswered')).toBe(true);
+    expect(elapsed).toBeLessThan(300);
   });
 });
 
@@ -303,6 +414,40 @@ describe('refineIceFailure', () => {
       },
     });
     expect(refined.kind).toBe('ice-timeout');
+  });
+
+  // The false diagnosis slice 3 removes: an IPv6-only player behind
+  // NAT64 reaches HTTPS, its IPv4 probe is silent, its IPv6 probe is
+  // answered. UDP works, so this is never `udp-blocked`.
+  it('stays ice-timeout when one family answers, however silent the other is', async () => {
+    const refined = await refineIceFailure(new RtcError({ type: 'iceTimeout' }), {
+      ...context,
+      anchorRtcAddrs: ['203.0.113.7:7101', '[2001:db8::7]:7101'],
+      failureTyping: {
+        stun: {
+          timeoutMs: 5,
+          peerConnectionFactory: fakePeerConnection((pc) => {
+            if (firstIceUrl(pc.config).includes('[')) {
+              pc.emitCandidate(candidate({ type: 'srflx', address: '2001:db8::99', line: srflxLine() }));
+            }
+          }),
+        },
+      },
+    });
+    expect(refined.kind).toBe('ice-timeout');
+  });
+
+  it('names every published endpoint when all of them are silent', async () => {
+    const refined = await refineIceFailure(new RtcError({ type: 'iceTimeout' }), {
+      ...context,
+      anchorRtcAddrs: ['203.0.113.7:7101', '[2001:db8::7]:7101'],
+      failureTyping: {
+        stun: { timeoutMs: 5, peerConnectionFactory: fakePeerConnection(() => {}) },
+      },
+    });
+    expect(refined.kind).toBe('udp-blocked');
+    expect(refined.message).toContain('203.0.113.7:7101, [2001:db8::7]:7101');
+    expect(refined.message).toContain('no UDP response');
   });
 
   it('falls back to an HTTPS reachability probe when no session was ever observed', async () => {

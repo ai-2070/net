@@ -19,7 +19,22 @@ describe('parseEvent', () => {
       nodeIdHex: 'beefcafe00000001',
       peerNode: '7',
       rtcAddr: '203.0.113.9:4433',
+      rtcAddrs: ['203.0.113.9:4433'],
     });
+  });
+
+  it('parses a dual-stack anchor\'s every published endpoint, primary first', () => {
+    const event = parseEvent(
+      '{"type":"connected","node_id_hex":"aa","peer_node":"7","rtc_addr":"203.0.113.7:7101",' +
+        '"rtc_addrs":["203.0.113.7:7101","[2001:db8::7]:7101"]}',
+    );
+    expect(event.type === 'connected' && event.rtcAddr).toBe('203.0.113.7:7101');
+    expect(event.type === 'connected' && event.rtcAddrs).toEqual(['203.0.113.7:7101', '[2001:db8::7]:7101']);
+  });
+
+  it('reads no rtc_addr as no endpoints at all', () => {
+    const event = parseEvent('{"type":"connected","node_id_hex":"aa","peer_node":"7","rtc_addr":null}');
+    expect(event.type === 'connected' && event.rtcAddrs).toEqual([]);
   });
 
   it('reads a null rtc_addr as absent rather than as the string "null"', () => {

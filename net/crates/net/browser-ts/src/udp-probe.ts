@@ -50,6 +50,48 @@ export type StunProbeOutcome =
   /** This engine could not run the probe at all. */
   | { readonly type: 'unsupported'; readonly detail: string };
 
+/**
+ * One thing a diagnostic probe connection reported: a candidate's SDP
+ * line, or an `icecandidateerror`'s STUN error code. The shape of the
+ * shared vector file both probes are tested against.
+ */
+export type ProbeEvent = { readonly candidate: string } | { readonly error: number };
+
+/**
+ * Is this candidate line server-reflexive? The `typ` token followed by
+ * the `srflx` token, as SDP defines the field, never a substring a
+ * foreign attribute could contain. The Rust probe's rule, the same
+ * tokens.
+ */
+export function candidateLineIsReflexive(line: string): boolean {
+  const tokens = line.trim().split(/\s+/);
+  return tokens.some((token, index) => token === 'typ' && tokens[index + 1] === 'srflx');
+}
+
+/**
+ * **The rule both probes share** (`ANCHOR_DUAL_STACK_PLAN.md`, defect 3):
+ * does this one event prove a STUN response came back? A reflexive
+ * candidate does, and so does a STUN error *response* (code below 700).
+ * Host and relay candidates prove nothing. The Rust (WASM) probe applies
+ * the same rule; `test/fixtures/stun-probe-verdicts.json` holds both to
+ * it.
+ */
+export function probeEventAnswers(event: ProbeEvent): boolean {
+  if ('candidate' in event) return candidateLineIsReflexive(event.candidate);
+  return event.error < STUN_NO_RESPONSE_CODE;
+}
+
+/** {@link probeEventAnswers} over everything one probe reported. */
+export function stunProbeAnswered(events: readonly ProbeEvent[]): boolean {
+  return events.some(probeEventAnswers);
+}
+
+/** One endpoint and what probing it established. */
+export interface EndpointProbe {
+  readonly probed: string;
+  readonly stunProbe: StunProbeOutcome;
+}
+
 /** Everything the classification is allowed to look at. */
 export interface RtcFailureObservations {
   /** Did the HTTPS bootstrap to this anchor succeed? */
@@ -75,8 +117,29 @@ export type IceFailureClassification =
  */
 export function classifyRtcFailure(observations: RtcFailureObservations): IceFailureClassification {
   const { bootstrapOk, stunProbe, probed } = observations;
-  if (stunProbe.type !== 'unanswered') return { type: 'iceTimeout' };
-  const evidence = udpBlockedEvidence(bootstrapOk, true, probed ?? '');
+  if (probed === null) return { type: 'iceTimeout' };
+  return classifyRtcFailureAll({ bootstrapOk, probes: [{ probed, stunProbe }] });
+}
+
+/**
+ * The rule over **every** endpoint the anchor published (dual-stack
+ * plan, slice 3). `udpBlocked` only when the bootstrap answered and
+ * every endpoint's probe ran and came back `unanswered`. Everything
+ * else stays `iceTimeout`: one answered family (UDP works there), any
+ * probe `notRun` or `unsupported` (an unrun probe observed nothing),
+ * or no endpoints at all. Even then the claim is the observation, no
+ * UDP response from the advertised endpoints, not a proven cause.
+ */
+export function classifyRtcFailureAll(observations: {
+  readonly bootstrapOk: boolean;
+  readonly probes: readonly EndpointProbe[];
+}): IceFailureClassification {
+  const { bootstrapOk, probes } = observations;
+  if (probes.length === 0 || probes.some((probe) => probe.stunProbe.type !== 'unanswered')) {
+    return { type: 'iceTimeout' };
+  }
+  const probedAll = probes.map((probe) => probe.probed);
+  const evidence = udpBlockedEvidence(bootstrapOk, true, probedAll[0] ?? '', probedAll);
   return evidence === null ? { type: 'iceTimeout' } : { type: 'udpBlocked', evidence };
 }
 
@@ -98,7 +161,7 @@ export interface StunProbeOptions {
 
 const DEFAULT_PROBE_TIMEOUT_MS = 2500;
 /** Anything at or above this `errorCode` means "no response arrived". */
-const STUN_NO_RESPONSE_CODE = 700;
+export const STUN_NO_RESPONSE_CODE = 700;
 const DEFAULT_STUN_PORT = 3478;
 
 /**
@@ -175,7 +238,7 @@ export async function probeStunBinding(
     // the anchor and the reply got home, so UDP is not blocked. (An
     // anchor's ICE agent refusing an unauthenticated binding lands
     // here; Chromium reports the STUN error number, e.g. `1` for a 401.)
-    if (code < STUN_NO_RESPONSE_CODE) {
+    if (probeEventAnswers({ error: code })) {
       settle({ type: 'stunError', code, detail });
       return;
     }
@@ -203,6 +266,21 @@ export async function probeStunBinding(
     pc.onicegatheringstatechange = null;
     pc.close();
   }
+}
+
+/**
+ * Probe **every** endpoint at once, under **one** deadline: the probes
+ * run concurrently, so a dual-stack anchor's diagnosis costs what a
+ * single-stack one's does. Each result is {@link probeStunBinding}'s,
+ * in the order given.
+ */
+export async function probeStunBindings(
+  rtcAddrs: readonly string[],
+  options: StunProbeOptions = {},
+): Promise<EndpointProbe[]> {
+  return Promise.all(
+    rtcAddrs.map(async (probed) => ({ probed, stunProbe: await probeStunBinding(probed, options) })),
+  );
 }
 
 /** Injection seam for the bootstrap observation. */
@@ -294,7 +372,7 @@ export function diagnosticStunUrl(rtcAddr: string): string | null {
 export function reflexiveAddress(candidate: RTCIceCandidate): string | null {
   if (candidate.type === 'srflx') return candidate.address ?? sdpAddress(candidate.candidate);
   if (candidate.type !== null) return null;
-  return / typ srflx /.test(candidate.candidate) ? sdpAddress(candidate.candidate) : null;
+  return candidateLineIsReflexive(candidate.candidate) ? sdpAddress(candidate.candidate) : null;
 }
 
 function sdpAddress(line: string): string {

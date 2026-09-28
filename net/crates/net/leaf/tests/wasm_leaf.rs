@@ -700,6 +700,7 @@ async fn the_anchor_control_plane_refuses_to_carry_a_signalling_envelope() {
         // and that refusal is what must NOT be what this test sees.
         noise_pubkey: *anchor.public_key(),
         rtc_addr: None,
+        rtc_addrs: Vec::new(),
         stun_addr: None,
     };
 

@@ -146,16 +146,23 @@ export type {
 } from './errors.js';
 
 export {
+  candidateLineIsReflexive,
   classifyRtcError,
   classifyRtcFailure,
+  classifyRtcFailureAll,
   diagnosticStunUrl,
   probeBootstrapReachable,
+  probeEventAnswers,
   probeStunBinding,
+  probeStunBindings,
   reflexiveAddress,
+  stunProbeAnswered,
 } from './udp-probe.js';
 export type {
   BootstrapProbeOptions,
+  EndpointProbe,
   IceFailureClassification,
+  ProbeEvent,
   RtcFailureObservations,
   StunProbeOptions,
   StunProbeOutcome,

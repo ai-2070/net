@@ -472,32 +472,134 @@ impl OfferAccepted {
     }
 }
 
-/// Run the STUN probe against `rtc_addr`.
+/// Run the STUN probe against one `rtc_addr`: `true` when it ran and
+/// nothing came back inside [`STUN_PROBE_MS`].
 ///
-/// `true` means no server-reflexive candidate came back inside
-/// [`STUN_PROBE_MS`] — i.e. the STUN binding went unanswered.
-///
-/// Paired with a *successful* HTTPS bootstrap to the same anchor by
-/// [`classify_ice_failure`], and only then.
+/// [`stun_probe_outcomes`] for one endpoint. An unrun probe is
+/// `false`, because no probe is no evidence.
 #[cfg(target_arch = "wasm32")]
 pub async fn stun_probe_failed(rtc_addr: &str) -> bool {
-    let Ok(probe) = build_probe(rtc_addr) else {
-        // No probe means no evidence, which means no `UdpBlocked`.
-        return false;
-    };
-    let deadline = gloo_timer_sleep(STUN_PROBE_MS);
-    // A rejected timer promise cannot happen; either way the
-    // deadline has elapsed by the time we are here.
-    let _ = deadline.await;
-    probe.connection.close();
-    // Detach before dropping, so a queued ICE event cannot reach a
-    // dropped `Closure`. With the connection closed and the handler
-    // cleared, the probe's callback drops here with the handle that
-    // owned it — nothing is leaked and nothing outlives the probe.
-    probe.connection.set_onicecandidate(None);
-    let failed = !probe.saw_srflx.get();
-    drop(probe.on_icecandidate);
-    failed
+    let outcomes = stun_probe_outcomes(&[rtc_addr.to_string()]).await;
+    outcomes.first().map(|(_, outcome)| *outcome) == Some(ProbeOutcome::Unanswered)
+}
+
+/// Probe **every** endpoint the anchor published, all at once, under
+/// **one** [`STUN_PROBE_MS`] deadline, and report each outcome in the
+/// order given.
+///
+/// One deadline, not one per endpoint: the probes run concurrently
+/// and are read together when it elapses, so a dual-stack anchor's
+/// diagnosis costs what a single-stack one's does.
+///
+/// An endpoint that is empty or that the browser refuses to build a
+/// probe for is [`ProbeOutcome::NotRun`], never `Unanswered`: a probe
+/// that did not run observed nothing. Each outcome is
+/// [`probe_verdict`] over what that probe's connection reported, the
+/// same rule the TypeScript probe applies.
+#[cfg(target_arch = "wasm32")]
+pub async fn stun_probe_outcomes(endpoints: &[String]) -> Vec<(String, ProbeOutcome)> {
+    let mut outcomes: Vec<(String, ProbeOutcome)> = endpoints
+        .iter()
+        .map(|endpoint| (endpoint.clone(), ProbeOutcome::NotRun))
+        .collect();
+    let mut running = Vec::new();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        if endpoint.trim().is_empty() {
+            continue;
+        }
+        if let Ok(probe) = build_probe(endpoint) {
+            running.push((index, probe));
+        }
+    }
+    if running.is_empty() {
+        return outcomes;
+    }
+    // A rejected timer promise cannot happen; either way the deadline
+    // has elapsed by the time we are here.
+    let _ = gloo_timer_sleep(STUN_PROBE_MS).await;
+    for (index, probe) in running {
+        probe.connection.close();
+        // Detach before dropping, so a queued ICE event cannot reach a
+        // dropped `Closure`. With the connection closed and the
+        // handlers cleared, the callbacks drop here with the handle
+        // that owned them — nothing is leaked and nothing outlives the
+        // probe.
+        probe.connection.set_onicecandidate(None);
+        set_onicecandidateerror(&probe.connection, None);
+        let verdict = probe_verdict(&probe.events.borrow());
+        drop(probe.on_icecandidate);
+        drop(probe.on_icecandidateerror);
+        if let Some(slot) = outcomes.get_mut(index) {
+            slot.1 = verdict;
+        }
+    }
+    outcomes
+}
+
+/// A STUN `errorCode` at or above this means **no response arrived**;
+/// below it, an error *response* came back, which proves the packet
+/// reached the endpoint and the reply got home. The browser package's
+/// `STUN_NO_RESPONSE_CODE`, the same number.
+pub const STUN_NO_RESPONSE_CODE: u16 = 700;
+
+/// One thing a diagnostic probe connection reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeEvent {
+    /// An ICE candidate, as its SDP line.
+    Candidate(String),
+    /// An `icecandidateerror`, as its STUN error code.
+    CandidateError(u16),
+}
+
+/// What probing one endpoint established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// A STUN response came back: a server-reflexive candidate, or a
+    /// STUN error response. UDP reaches that endpoint.
+    Answered,
+    /// The probe ran and nothing came back inside its deadline.
+    Unanswered,
+    /// The probe could not run: an empty or malformed address, or an
+    /// engine that would not build the probe. It observed nothing, so
+    /// it is never evidence either way.
+    NotRun,
+}
+
+/// **The rule both probes share** (`ANCHOR_DUAL_STACK_PLAN.md`,
+/// defect 3): does this one event prove a STUN response came back?
+///
+/// A server-reflexive candidate does, and so does a STUN **error
+/// response** (code below [`STUN_NO_RESPONSE_CODE`]) — the anchor's
+/// ICE agent refusing an unauthenticated binding still proves the
+/// packet arrived and the reply got home. This probe used to count
+/// only the reflexive candidate, so the same network could be typed
+/// `udp-blocked` here and `iceTimeout` by the TypeScript probe. Both
+/// now run this rule over one vector file
+/// (`browser-ts/test/fixtures/stun-probe-verdicts.json`).
+///
+/// Host candidates prove nothing: they are gathered whatever the
+/// network does to UDP.
+pub fn probe_event_answers(event: &ProbeEvent) -> bool {
+    match event {
+        // The `typ` TOKEN followed by the `srflx` token, as SDP
+        // defines the field — not a substring, which a foreign
+        // attribute value could contain.
+        ProbeEvent::Candidate(line) => {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            tokens.windows(2).any(|pair| pair == ["typ", "srflx"])
+        }
+        ProbeEvent::CandidateError(code) => *code < STUN_NO_RESPONSE_CODE,
+    }
+}
+
+/// [`probe_event_answers`] over everything one probe reported, for a
+/// probe that ran to its deadline.
+pub fn probe_verdict(events: &[ProbeEvent]) -> ProbeOutcome {
+    if events.iter().any(probe_event_answers) {
+        ProbeOutcome::Answered
+    } else {
+        ProbeOutcome::Unanswered
+    }
 }
 
 /// The corrected classification.
@@ -513,11 +615,51 @@ pub fn classify_ice_failure(
     probed: Option<&str>,
 ) -> RtcError {
     match probed {
-        Some(addr) => match UdpBlockedEvidence::new(bootstrap_ok, probe_failed, addr) {
-            Some(evidence) => RtcError::udp_blocked(evidence),
-            None => RtcError::IceTimeout,
-        },
+        Some(addr) => {
+            let outcome = if probe_failed {
+                ProbeOutcome::Unanswered
+            } else {
+                ProbeOutcome::Answered
+            };
+            classify_ice_failure_all(bootstrap_ok, &[(addr.to_string(), outcome)])
+        }
         // Nothing to probe means nothing is established.
+        None => RtcError::IceTimeout,
+    }
+}
+
+/// The classification over **every** published endpoint
+/// (`ANCHOR_DUAL_STACK_PLAN.md`, slice 3).
+///
+/// [`RtcError::UdpBlocked`] only when the HTTPS bootstrap answered and
+/// **every** endpoint's probe ran and went unanswered. Everything else
+/// stays [`RtcError::IceTimeout`]:
+///
+/// - any probe [`ProbeOutcome::Answered`]: UDP works for that family,
+///   so the failure is something else. This is what keeps an
+///   IPv6-only player whose IPv4 probe fails from being told UDP is
+///   blocked when its IPv6 probe answers;
+/// - any probe [`ProbeOutcome::NotRun`]: an unrun probe is no
+///   evidence, and "all the evidence we have" is not "every endpoint";
+/// - no endpoints at all.
+///
+/// Even when it holds, the claim is the observation — no UDP response
+/// from the advertised endpoints — not a proven cause; the message
+/// says so.
+pub fn classify_ice_failure_all(
+    bootstrap_ok: bool,
+    outcomes: &[(String, ProbeOutcome)],
+) -> RtcError {
+    let every_unanswered = !outcomes.is_empty()
+        && outcomes
+            .iter()
+            .all(|(_, outcome)| *outcome == ProbeOutcome::Unanswered);
+    if !every_unanswered {
+        return RtcError::IceTimeout;
+    }
+    let unanswered = outcomes.iter().map(|(addr, _)| addr.clone()).collect();
+    match UdpBlockedEvidence::for_endpoints(bootstrap_ok, unanswered) {
+        Some(evidence) => RtcError::udp_blocked(evidence),
         None => RtcError::IceTimeout,
     }
 }
@@ -705,8 +847,11 @@ impl EndpointKey {
 #[cfg(target_arch = "wasm32")]
 struct StunProbe {
     connection: RtcPeerConnection,
-    saw_srflx: std::rc::Rc<core::cell::Cell<bool>>,
+    /// Everything the connection reported, judged by
+    /// [`probe_verdict`] once the deadline elapses.
+    events: std::rc::Rc<core::cell::RefCell<Vec<ProbeEvent>>>,
     on_icecandidate: Closure<dyn FnMut(RtcPeerConnectionIceEvent)>,
+    on_icecandidateerror: Closure<dyn FnMut(web_sys::RtcPeerConnectionIceErrorEvent)>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -724,16 +869,28 @@ fn build_probe(rtc_addr: &str) -> Result<StunProbe> {
     let connection = RtcPeerConnection::new_with_configuration(&config)
         .map_err(|_| malformed("no RTCPeerConnection for the probe"))?;
 
-    let saw_srflx = std::rc::Rc::new(core::cell::Cell::new(false));
-    let flag = std::rc::Rc::clone(&saw_srflx);
+    let events = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    let candidates = std::rc::Rc::clone(&events);
     let closure = Closure::wrap(Box::new(move |event: RtcPeerConnectionIceEvent| {
         if let Some(candidate) = event.candidate() {
-            if candidate.candidate().contains("typ srflx") {
-                flag.set(true);
-            }
+            candidates
+                .borrow_mut()
+                .push(ProbeEvent::Candidate(candidate.candidate()));
         }
     }) as Box<dyn FnMut(RtcPeerConnectionIceEvent)>);
     connection.set_onicecandidate(Some(closure.as_ref().unchecked_ref()));
+    // A STUN error RESPONSE is still a response (defect 3): recorded
+    // here and judged by the shared rule.
+    let errors = std::rc::Rc::clone(&events);
+    let error_closure = Closure::wrap(Box::new(
+        move |event: web_sys::RtcPeerConnectionIceErrorEvent| {
+            errors
+                .borrow_mut()
+                .push(ProbeEvent::CandidateError(event.error_code()));
+        },
+    )
+        as Box<dyn FnMut(web_sys::RtcPeerConnectionIceErrorEvent)>);
+    set_onicecandidateerror(&connection, Some(error_closure.as_ref().unchecked_ref()));
 
     // A channel is what makes the browser gather at all.
     let init = RtcDataChannelInit::new();
@@ -759,9 +916,23 @@ fn build_probe(rtc_addr: &str) -> Result<StunProbe> {
     });
     Ok(StunProbe {
         connection,
-        saw_srflx,
+        events,
         on_icecandidate: closure,
+        on_icecandidateerror: error_closure,
     })
+}
+
+/// Set (or clear) `onicecandidateerror`. `web-sys` exposes the event
+/// type but no setter for this handler, so it is set as the plain
+/// property it is.
+#[cfg(target_arch = "wasm32")]
+fn set_onicecandidateerror(connection: &RtcPeerConnection, handler: Option<&js_sys::Function>) {
+    let value = handler.map_or(JsValue::NULL, |handler| handler.clone().into());
+    let _ = js_sys::Reflect::set(
+        connection,
+        &JsValue::from_str("onicecandidateerror"),
+        &value,
+    );
 }
 
 /// `setTimeout` as a future. No `tokio`, no `gloo` dependency — the
@@ -1276,6 +1447,50 @@ mod tests {
         // rather than a promise.
         check_ice_servers_against_peer(["stun:alias.example:4433"], peer)
             .expect("an unresolved alias is outside what equality can see");
+    }
+
+    /// **Slice 3's classification over every endpoint.** `udp-blocked`
+    /// only when the bootstrap answered and EVERY endpoint's probe ran
+    /// and went unanswered; an answered family, an unrun probe or no
+    /// endpoints at all keeps it an ICE timeout.
+    #[test]
+    fn udp_blocked_needs_every_published_endpoint_unanswered() {
+        use ProbeOutcome::{Answered, NotRun, Unanswered};
+        let v4 = "203.0.113.7:7101".to_string();
+        let v6 = "[2001:db8::7]:7101".to_string();
+
+        // The IPv6-only player: v4 silent, v6 answered. The witness for
+        // the false diagnosis this slice exists to remove.
+        assert_eq!(
+            classify_ice_failure_all(true, &[(v4.clone(), Unanswered), (v6.clone(), Answered)]),
+            RtcError::IceTimeout,
+            "one answered family means UDP works: never udp-blocked"
+        );
+        let RtcError::UdpBlocked(evidence) =
+            classify_ice_failure_all(true, &[(v4.clone(), Unanswered), (v6.clone(), Unanswered)])
+        else {
+            panic!("both families silent after a good bootstrap is the observation");
+        };
+        assert_eq!(evidence.probed_all, [v4.clone(), v6.clone()]);
+        for (what, outcomes) in [
+            (
+                "an unrun probe",
+                vec![(v4.clone(), Unanswered), (v6.clone(), NotRun)],
+            ),
+            ("only unrun probes", vec![(v4.clone(), NotRun)]),
+            ("no endpoints", vec![]),
+        ] {
+            assert_eq!(
+                classify_ice_failure_all(true, &outcomes),
+                RtcError::IceTimeout,
+                "{what} is not evidence"
+            );
+        }
+        assert_eq!(
+            classify_ice_failure_all(false, &[(v4, Unanswered), (v6, Unanswered)]),
+            RtcError::IceTimeout,
+            "no bootstrap, no claim"
+        );
     }
 
     /// `rtc_addrs` resolves by the documented rule: the list when the

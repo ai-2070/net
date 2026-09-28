@@ -1,0 +1,81 @@
+{
+  "doc": "One rule, two probes (ANCHOR_DUAL_STACK_PLAN.md, defect 3). Each case is what one diagnostic probe connection reported before its deadline, in order, and whether that proves a STUN response came back. Read by leaf/tests/stun_probe_parity.rs (Rust: probe_verdict) and browser-ts/test/classification.test.ts (TypeScript: stunProbeAnswered). A case that one side answers differently fails that side's test.",
+  "cases": [
+    {
+      "name": "a server-reflexive candidate is an answer",
+      "events": [{ "candidate": "candidate:1 1 udp 1686052607 203.0.113.9 50000 typ srflx raddr 0.0.0.0 rport 0" }],
+      "answered": true
+    },
+    {
+      "name": "a reflexive candidate at the end of the line is still one",
+      "events": [{ "candidate": "candidate:1 1 udp 1686052607 203.0.113.9 50000 typ srflx" }],
+      "answered": true
+    },
+    {
+      "name": "a host candidate proves nothing",
+      "events": [{ "candidate": "candidate:2 1 udp 2122260223 192.168.1.2 50001 typ host generation 0" }],
+      "answered": false
+    },
+    {
+      "name": "an mDNS host candidate proves nothing",
+      "events": [{ "candidate": "candidate:3 1 udp 2122260223 9f1c2a3b-4d5e.local 50002 typ host" }],
+      "answered": false
+    },
+    {
+      "name": "a relay candidate is not a STUN answer from this endpoint",
+      "events": [{ "candidate": "candidate:4 1 udp 41885439 198.51.100.4 3478 typ relay raddr 203.0.113.9 rport 50000" }],
+      "answered": false
+    },
+    {
+      "name": "a STUN error response is an answer (401)",
+      "events": [{ "error": 401 }],
+      "answered": true
+    },
+    {
+      "name": "Chromium's STUN error number is an answer",
+      "events": [{ "error": 1 }],
+      "answered": true
+    },
+    {
+      "name": "699 is still a response",
+      "events": [{ "error": 699 }],
+      "answered": true
+    },
+    {
+      "name": "700 means no response arrived",
+      "events": [{ "error": 700 }],
+      "answered": false
+    },
+    {
+      "name": "701 means no response arrived",
+      "events": [{ "error": 701 }],
+      "answered": false
+    },
+    {
+      "name": "silence until the deadline",
+      "events": [],
+      "answered": false
+    },
+    {
+      "name": "no response, then a reflexive candidate: answered",
+      "events": [
+        { "error": 701 },
+        { "candidate": "candidate:1 1 udp 1686052607 203.0.113.9 50000 typ srflx raddr 0.0.0.0 rport 0" }
+      ],
+      "answered": true
+    },
+    {
+      "name": "host candidates and a 701: unanswered",
+      "events": [
+        { "candidate": "candidate:2 1 udp 2122260223 192.168.1.2 50001 typ host" },
+        { "error": 701 }
+      ],
+      "answered": false
+    },
+    {
+      "name": "a word that merely contains srflx is not the type",
+      "events": [{ "candidate": "candidate:5 1 udp 2122260223 192.168.1.2 50001 typ host ufrag nosrflx" }],
+      "answered": false
+    }
+  ]
+}

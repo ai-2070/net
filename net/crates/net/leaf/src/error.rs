@@ -158,8 +158,13 @@ pub struct UdpBlockedEvidence {
     /// published was not answered within the probe deadline.
     pub stun_probe_failed: bool,
     /// The address the probe was aimed at, so the claim names its
-    /// own subject.
+    /// own subject. The first of [`Self::probed_all`].
     pub probed: String,
+    /// **Every** endpoint probed, `probed` first. Each went
+    /// unanswered: a dual-stack anchor publishes one per family, and
+    /// one answered probe means UDP works for that family, which is
+    /// never this evidence (`ANCHOR_DUAL_STACK_PLAN.md`, slice 3).
+    pub probed_all: Vec<String>,
 }
 
 impl UdpBlockedEvidence {
@@ -171,10 +176,29 @@ impl UdpBlockedEvidence {
         stun_probe_failed: bool,
         probed: impl Into<String>,
     ) -> Option<Self> {
+        let probed = probed.into();
         (bootstrap_ok && stun_probe_failed).then(|| Self {
             bootstrap_ok,
             stun_probe_failed,
-            probed: probed.into(),
+            probed_all: vec![probed.clone()],
+            probed,
+        })
+    }
+
+    /// The evidence over **every** endpoint the anchor published:
+    /// `Some` only when the bootstrap answered and `unanswered` names
+    /// at least one endpoint, none of them empty. The caller passes
+    /// only endpoints whose probe actually ran and went unanswered;
+    /// an unrun, unsupported or answered probe is never evidence.
+    pub fn for_endpoints(bootstrap_ok: bool, unanswered: Vec<String>) -> Option<Self> {
+        if !bootstrap_ok || unanswered.is_empty() || unanswered.iter().any(String::is_empty) {
+            return None;
+        }
+        Some(Self {
+            bootstrap_ok,
+            stun_probe_failed: true,
+            probed: unanswered[0].clone(),
+            probed_all: unanswered,
         })
     }
 }
@@ -281,10 +305,17 @@ impl fmt::Display for RtcError {
                 f,
                 "ICE did not connect inside the deadline (this does not establish that UDP is blocked)"
             ),
+            // **An observation, not a cause.** HTTPS answered and no STUN
+            // binding to any advertised endpoint did — which blocked UDP
+            // produces, and so does a stopped UDP listener, a wrong
+            // advertised address, a routing failure or loss. The kind
+            // stays `udp-blocked` for compatibility; the sentence says
+            // only what was seen. Parsed verbatim by
+            // `@net-mesh/browser`'s `parseRtcFailure`.
             Self::UdpBlocked(e) => write!(
                 f,
-                "UDP appears blocked: the anchor's HTTPS bootstrap succeeded but a STUN binding to {} was unanswered",
-                e.probed
+                "no UDP response from the anchor's advertised endpoints: its HTTPS bootstrap succeeded but STUN bindings to {} went unanswered",
+                e.probed_all.join(", ")
             ),
             Self::ChannelClosed(e) => write!(f, "the DataChannel closed: {e}"),
             Self::Unsupported(e) => write!(f, "this browser refused the attempt: {e}"),
@@ -335,6 +366,38 @@ mod tests {
         // A STUN probe that succeeded says UDP works.
         assert!(UdpBlockedEvidence::new(true, false, "203.0.113.7:7101").is_none());
         assert!(UdpBlockedEvidence::new(false, false, "203.0.113.7:7101").is_none());
+    }
+
+    /// The dual-stack rule: evidence names every endpoint, and there is
+    /// none without a bootstrap and at least one named endpoint.
+    #[test]
+    fn evidence_over_every_endpoint_requires_all_of_them_named() {
+        let both = UdpBlockedEvidence::for_endpoints(
+            true,
+            vec!["203.0.113.7:7101".into(), "[2001:db8::7]:7101".into()],
+        )
+        .expect("bootstrap answered and both went unanswered");
+        assert_eq!(both.probed, "203.0.113.7:7101");
+        assert_eq!(both.probed_all.len(), 2);
+        assert!(UdpBlockedEvidence::for_endpoints(false, vec!["a:1".into()]).is_none());
+        assert!(UdpBlockedEvidence::for_endpoints(true, vec![]).is_none());
+        assert!(UdpBlockedEvidence::for_endpoints(true, vec![String::new()]).is_none());
+    }
+
+    /// The message states the observation and names every endpoint;
+    /// it does not claim a cause.
+    #[test]
+    fn the_udp_blocked_message_is_an_observation_naming_every_endpoint() {
+        let evidence = UdpBlockedEvidence::for_endpoints(
+            true,
+            vec!["203.0.113.7:7101".into(), "[2001:db8::7]:7101".into()],
+        )
+        .expect("evidence");
+        assert_eq!(
+            RtcError::udp_blocked(evidence).to_string(),
+            "no UDP response from the anchor's advertised endpoints: its HTTPS bootstrap \
+             succeeded but STUN bindings to 203.0.113.7:7101, [2001:db8::7]:7101 went unanswered"
+        );
     }
 
     #[test]

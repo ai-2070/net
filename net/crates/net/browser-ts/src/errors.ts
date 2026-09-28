@@ -62,6 +62,12 @@ export interface UdpBlockedEvidence {
   readonly stunProbeFailed: true;
   /** The address the probe was aimed at, so the claim names its subject. */
   readonly probed: string;
+  /**
+   * Every endpoint probed, `probed` first; each went unanswered. A
+   * dual-stack anchor publishes one per family, and one answered probe
+   * means UDP works for that family, which is never this evidence.
+   */
+  readonly probedAll: readonly string[];
 }
 
 /**
@@ -73,9 +79,13 @@ export function udpBlockedEvidence(
   bootstrapOk: boolean,
   stunProbeFailed: boolean,
   probed: string,
+  probedAll: readonly string[] = [probed],
 ): UdpBlockedEvidence | null {
   if (!bootstrapOk || !stunProbeFailed || probed.length === 0) return null;
-  return { bootstrapOk: true, stunProbeFailed: true, probed };
+  if (probedAll.length === 0 || probedAll[0] !== probed || probedAll.some((addr) => addr.length === 0)) {
+    return null;
+  }
+  return { bootstrapOk: true, stunProbeFailed: true, probed, probedAll: [...probedAll] };
 }
 
 /** Why an RTC attempt did not produce a DataChannel. */
@@ -764,9 +774,12 @@ function rtcDisplay(failure: RtcErrorFailure): string {
     case 'iceTimeout':
       return ICE_TIMEOUT_DISPLAY;
     case 'udpBlocked':
+      // An observation, not a cause: blocked UDP, a stopped UDP
+      // listener, a wrong advertised address or loss all look like
+      // this. Byte-identical to the Rust `Display`.
       return (
-        "UDP appears blocked: the anchor's HTTPS bootstrap succeeded " +
-        `but a STUN binding to ${failure.evidence.probed} was unanswered`
+        "no UDP response from the anchor's advertised endpoints: its HTTPS bootstrap succeeded " +
+        `but STUN bindings to ${failure.evidence.probedAll.join(', ')} went unanswered`
       );
     case 'channelClosed':
       return `the DataChannel closed: ${failure.detail}`;
@@ -884,12 +897,14 @@ export function parseLeafError(message: string): LeafError | null {
 export function parseRtcFailure(text: string): RtcErrorFailure | null {
   if (text === ICE_TIMEOUT_DISPLAY) return { type: 'iceTimeout' };
 
-  const blocked = /^UDP appears blocked: the anchor's HTTPS bootstrap succeeded but a STUN binding to (.+) was unanswered$/.exec(
+  const blocked = /^no UDP response from the anchor's advertised endpoints: its HTTPS bootstrap succeeded but STUN bindings to (.+) went unanswered$/.exec(
     text,
   );
   if (blocked) {
-    const probed = blocked[1] ?? '';
-    const evidence = udpBlockedEvidence(true, true, probed);
+    // Endpoints are `host:port` or `[v6]:port`; neither holds ", ".
+    const probedAll = (blocked[1] ?? '').split(', ');
+    const probed = probedAll[0] ?? '';
+    const evidence = udpBlockedEvidence(true, true, probed, probedAll);
     // The regex matched the message the Rust side only emits when it
     // holds the evidence, so `probed` is non-empty and this is
     // `UdpBlockedEvidence`; an empty subject is not evidence.
