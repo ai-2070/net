@@ -55,6 +55,19 @@
 #               This is the "no manual router configuration" row.
 #   none      — the joiner is expected to run publicly in nsim_wan
 #               instead; no gateway/ns is created for that side.
+#   cone-ar-v4only
+#             — `cone-ar` with IPv6 DISABLED inside the joiner's
+#               namespace: an IPv4-only player (dual-stack anchor
+#               plan, slice 4). Not "has no global IPv6 address" but
+#               no IPv6 at all, so nothing — not a link-local
+#               candidate, not a stray route — can give it a common
+#               family with an IPv6-only peer.
+#   v6only    — an IPv6-only player: the gateway ROUTES IPv6 (no NAT,
+#               as IPv6 is deployed) behind a stateful firewall that
+#               drops unsolicited inbound, like a home CPE, and the
+#               joiner has NO IPv4 address or route beyond loopback.
+#               Also gives the wan bridge its IPv6 prefix, so the
+#               anchor has an IPv6 address to be reached on.
 #
 # --drop-direct installs forward-hook drops on BOTH gateways for UDP
 # addressed directly at the other side's public IP — kills punch
@@ -107,10 +120,10 @@ done
 # unrecognized used to fall through to the cone masquerade).
 for mode in "$NAT_A" "$NAT_B"; do
   case "$mode" in
-    cone|cone-ar|cone-pr|symmetric|upnp|none) ;;
+    cone|cone-ar|cone-pr|cone-ar-v4only|v6only|symmetric|upnp|none) ;;
     *)
       echo "invalid NAT mode: '$mode'" \
-        "(want cone|cone-ar|cone-pr|symmetric|upnp|none)" >&2
+        "(want cone|cone-ar|cone-pr|cone-ar-v4only|v6only|symmetric|upnp|none)" >&2
       exit 2
       ;;
   esac
@@ -178,15 +191,92 @@ ip -n "$WAN" addr add 10.99.0.11/24 dev br0
 if [[ "$PUBLIC_B" == 1 ]]; then
   ip -n "$WAN" addr add 10.99.0.12/24 dev br0
 fi
+# The lab internet's IPv6 prefix, only when a side is IPv6-only: the
+# bridge and the anchor (`::10`, R's IPv6 twin). `nodad` because
+# duplicate-address detection would leave the address tentative —
+# unusable — for the first second or so, and nothing else on this
+# bridge could hold it. Existing rows are untouched: no IPv6 is
+# configured unless a row asks for it.
+WAN_V6=0
+[[ "$NAT_A" == v6only || "$NAT_B" == v6only ]] && WAN_V6=1
+if [[ "$WAN_V6" == 1 ]]; then
+  ip -n "$WAN" -6 addr add 2001:db8:99::1/64 dev br0 nodad
+  ip -n "$WAN" -6 addr add 2001:db8:99::10/64 dev br0 nodad
+fi
+
+# one_side_v6only <letter> <gw index>
+#
+# An IPv6-only player behind a ROUTING gateway. IPv6 is deployed
+# without NAT, so the joiner's address is global and the gateway's job
+# is the stateful filter every home CPE ships: replies to what the
+# joiner sent are let in, unsolicited inbound is not. The joiner has
+# no IPv4 address and no IPv4 route; its loopback keeps 127.0.0.1,
+# which is what serves the page on `http://localhost`.
+one_side_v6only() {
+  local L="$1" N="$2"
+  local GW="nsim_gw$L" NS="nsim_$L"
+  local WAN6="2001:db8:99::$N" LAN6="2001:db8:10$N::"
+  ip netns add "$GW"
+  ip netns add "$NS"
+  ip -n "$GW" link set lo up
+  ip -n "$NS" link set lo up
+
+  ip link add "gw$L-wan" netns "$GW" type veth peer name "gw$L-br" netns "$WAN"
+  ip -n "$WAN" link set "gw$L-br" master br0 up
+  ip -n "$GW" -6 addr add "$WAN6/64" dev "gw$L-wan" nodad
+  ip -n "$GW" link set "gw$L-wan" up
+
+  ip link add "gw$L-lan" netns "$GW" type veth peer name eth0 netns "$NS"
+  ip -n "$GW" -6 addr add "${LAN6}1/64" dev "gw$L-lan" nodad
+  ip -n "$GW" link set "gw$L-lan" up
+  ip -n "$NS" -6 addr add "${LAN6}2/64" dev eth0 nodad
+  ip -n "$NS" link set eth0 up
+  ip -n "$NS" -6 route add default via "${LAN6}1"
+  # No `224.0.0.0/4` route, unlike the IPv4 sides: that is an IPv4
+  # route, and this side must have none. The browser's mDNS responder
+  # uses ff02::fb here, which is link-local and needs no route.
+  ip -n "$NS" link set eth0 multicast on
+
+  ip -n "$GW" -6 route add default via 2001:db8:99::1
+  ip -n "$WAN" -6 route add "${LAN6}/64" via "$WAN6"
+  ip netns exec "$GW" sysctl -qw net.ipv6.conf.all.forwarding=1
+
+  ip netns exec "$GW" nft -f - <<EOF
+table inet natsim {
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    ct state established,related accept
+    iifname "gw$L-wan" ct state new drop
+  }
+}
+EOF
+}
 
 # one_side <letter> <gw_pub_ip> <lan_subnet> <nat_mode> <joiner_port>
 #          [rtc_port] [stun_port]
 one_side() {
   local L="$1" PUB="$2" LAN="$3" MODE="$4" PORT="$5" RTC="${6:-}" STUN="${7:-}"
   [[ "$MODE" == "none" ]] && return 0
+  if [[ "$MODE" == "v6only" ]]; then
+    local N=2
+    [[ "$L" == b ]] && N=3
+    one_side_v6only "$L" "$N"
+    return 0
+  fi
+  # `cone-ar-v4only` is `cone-ar` plus IPv6 switched off in the
+  # joiner's namespace; everything below reads the base mode.
+  local V4ONLY=0
+  if [[ "$MODE" == "cone-ar-v4only" ]]; then
+    MODE=cone-ar
+    V4ONLY=1
+  fi
   local GW="nsim_gw$L" NS="nsim_$L"
   ip netns add "$GW"
   ip netns add "$NS"
+  if [[ "$V4ONLY" == 1 ]]; then
+    ip netns exec "$NS" sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+    ip netns exec "$NS" sysctl -qw net.ipv6.conf.default.disable_ipv6=1
+  fi
   ip -n "$GW" link set lo up
   ip -n "$NS" link set lo up
 

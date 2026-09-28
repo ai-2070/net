@@ -209,6 +209,16 @@ case "$SCENARIO" in
   # the anchor's own per-pair forwarding counter moving in both
   # directions across the exchange.
   browser_symmetric_symmetric_nomedia) NAT_A=symmetric NAT_B=symmetric MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium MEDIA=none OUTCOME_NODE=browser ;;
+  # The DUAL-STACK rows (ANCHOR_DUAL_STACK_PLAN.md, slice 4): an
+  # IPv4-only player and an IPv6-only player, no address family in
+  # common, one dual-stack anchor. Each reaches the anchor over its
+  # own family; the pair cannot solve ICE and must be carried by the
+  # anchor — the family bridge — with payloads observed both ways.
+  # Permission-free on both engines: a supported engine passes
+  # without a media grant or it is a named support decision in the
+  # plan, never a quiet fallback to whichever engine worked.
+  browser_dualstack_v4_meets_v6) NAT_A=cone-ar-v4only NAT_B=v6only MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium MEDIA=none OUTCOME_NODE=browser ;;
+  browser_dualstack_v4_meets_v6_firefox) NAT_A=cone-ar-v4only NAT_B=v6only MODE=browser EXPECT=relayed ENGINE_A=firefox ENGINE_B=firefox MEDIA=none OUTCOME_NODE=browser ;;
   *) echo "unknown scenario: $SCENARIO" >&2; exit 2 ;;
 esac
 
@@ -380,6 +390,12 @@ if [[ "$MODE" == browser ]]; then
   capture nsim_a browser_a
   capture nsim_b browser_b
   capture nsim_wan anchor_wan
+  # A row with an IPv6-only side makes the anchor dual-stack: its
+  # IPv6 address is the one `setup.sh` gave the wan bridge.
+  ANCHOR_V6_ARGS=()
+  if [[ "$NAT_A" == v6only || "$NAT_B" == v6only ]]; then
+    ANCHOR_V6_ARGS=(--anchor-ip6 2001:db8:99::10)
+  fi
   ip netns exec nsim_wan env RUST_LOG="$NATSIM_BROWSER_LOG" \
     "$BROWSER_BIN" \
       --scenario "$SCENARIO" \
@@ -389,6 +405,7 @@ if [[ "$MODE" == browser ]]; then
       --engine-a "$ENGINE_A" --engine-b "$ENGINE_B" \
       --media "$MEDIA" \
       --anchor-ip 10.99.0.10 \
+      "${ANCHOR_V6_ARGS[@]}" \
       --stun-ip 10.99.0.11 \
       --netns-a "${NETNS_A:-nsim_a}" --netns-b "${NETNS_B:-nsim_b}" \
       >"$STATE/runner.log" 2>&1 &
@@ -532,6 +549,12 @@ if [[ "$MODE" == browser ]]; then
       if out="$(ip netns exec "$ns" conntrack -L 2>/dev/null)"; then
         raw="$out"
         source="conntrack"
+        # `conntrack -L` lists IPv4 only unless asked; an IPv6-only
+        # side's flows are in the IPv6 table. Appended, never instead:
+        # a peer of either family must be findable.
+        if out6="$(ip netns exec "$ns" conntrack -L -f ipv6 2>/dev/null)"; then
+          raw="$raw"$'\n'"$out6"
+        fi
       elif out="$(ip netns exec "$ns" cat /proc/net/nf_conntrack 2>/dev/null)"; then
         raw="$out"
         source="procfs"
@@ -539,7 +562,7 @@ if [[ "$MODE" == browser ]]; then
     fi
     printf '%s' "$raw" | awk -v peer="$peer" -v source="$source" '
         $0 ~ /(^|[[:space:]])udp[[:space:]]/ {
-          if ($0 !~ ("(src|dst)=" peer "([^0-9]|$)")) next
+          if ($0 !~ ("(src|dst)=" peer "([^0-9a-fA-F:.]|$)")) next
           flows++
           if ($0 !~ /\[UNREPLIED\]/) replied++
         }
@@ -549,11 +572,19 @@ if [[ "$MODE" == browser ]]; then
         }
       '
   }
+  # The address each gateway would see the OTHER side at: its NAT'd
+  # public IPv4 address, or — for an IPv6-only side, which is routed,
+  # not NAT'd — its own global IPv6 address. On a dual-stack row the
+  # two sides share no family, so neither gateway can hold a flow to
+  # the other at all, and the witness reads "measured, none".
+  peer_of() { # peer_of <nat mode> <ipv4 public> <ipv6 lan index>
+    if [[ "$1" == v6only ]]; then echo "2001:db8:10$3::2"; else echo "$2"; fi
+  }
   {
     printf '{"a":'
-    flow_side nsim_gwa 10.99.0.3
+    flow_side nsim_gwa "$(peer_of "$NAT_B" 10.99.0.3 3)"
     printf ',"b":'
-    flow_side nsim_gwb 10.99.0.2
+    flow_side nsim_gwb "$(peer_of "$NAT_A" 10.99.0.2 2)"
     printf '}\n'
   } >"$STATE/nat_flow.json"
   echo "natsim: gateway flow witness: $(cat "$STATE/nat_flow.json")"

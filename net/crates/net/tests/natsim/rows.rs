@@ -94,6 +94,13 @@ pub enum Nat {
     /// `symmetric` — `masquerade fully-random`, a fresh public port
     /// per destination tuple.
     Symmetric,
+    /// `cone-ar-v4only` — `cone-ar` with IPv6 disabled in the
+    /// player's namespace: an IPv4-only player (dual-stack plan,
+    /// slice 4).
+    ConeArV4Only,
+    /// `v6only` — an IPv6-only player behind a routing (not NAT'ing)
+    /// gateway with a stateful firewall, and no IPv4 beyond loopback.
+    V6Only,
 }
 
 impl Nat {
@@ -103,6 +110,8 @@ impl Nat {
             Self::ConeAr => "cone-ar",
             Self::ConePr => "cone-pr",
             Self::Symmetric => "symmetric",
+            Self::ConeArV4Only => "cone-ar-v4only",
+            Self::V6Only => "v6only",
         }
     }
 
@@ -114,6 +123,8 @@ impl Nat {
             "cone-ar" => Some(Self::ConeAr),
             "cone-pr" => Some(Self::ConePr),
             "symmetric" => Some(Self::Symmetric),
+            "cone-ar-v4only" => Some(Self::ConeArV4Only),
+            "v6only" => Some(Self::V6Only),
             _ => None,
         }
     }
@@ -375,6 +386,22 @@ pub struct Row {
     /// silently acquired a permission it claims not to need would be
     /// measuring the granted environment under the other name.
     pub media: Media,
+    /// What the row asserts about the two players' address families.
+    pub families: Families,
+}
+
+/// The address-family property a row asserts.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Families {
+    /// Nothing: both players are IPv4 behind NAT, as every row before
+    /// the dual-stack slice.
+    Unasserted,
+    /// **A is IPv4-only, B is IPv6-only, and they share no family**
+    /// (dual-stack plan, slice 4). The verdict must show it from the
+    /// namespaces themselves, and must show each player's anchor
+    /// session on its own family, so a pass cannot come from a direct
+    /// pair nobody meant to allow.
+    V4MeetsV6,
 }
 
 impl Row {
@@ -488,6 +515,7 @@ pub const ROWS: &[Row] = &[
         expect: Disposition::Direct,
         why: "both sides admit the peer's check once their own outbound has opened the mapping",
         media: Media::Granted,
+        families: Families::Unasserted,
     },
     Row {
         scenario: "browser_cone_portrestricted",
@@ -497,6 +525,7 @@ pub const ROWS: &[Row] = &[
         why: "both mappings are endpoint-independent, so each side's check hits the exact tuple \
                the other sent to",
         media: Media::Granted,
+        families: Families::Unasserted,
     },
     Row {
         scenario: "browser_portrestricted_portrestricted",
@@ -506,6 +535,7 @@ pub const ROWS: &[Row] = &[
         why: "simultaneous open: each check matches the conntrack reply tuple the other side's \
                own check created",
         media: Media::Granted,
+        families: Families::Unasserted,
     },
     Row {
         scenario: "browser_cone_symmetric",
@@ -515,6 +545,7 @@ pub const ROWS: &[Row] = &[
         why: "the symmetric side's check arrives from an unpredictable port and the \
                address-restricted filter admits it; ICE learns the pair peer-reflexively",
         media: Media::Granted,
+        families: Families::Unasserted,
     },
     Row {
         scenario: "browser_portrestricted_symmetric",
@@ -524,6 +555,7 @@ pub const ROWS: &[Row] = &[
         why: "the symmetric side's check arrives from a port the full-tuple filter never sent \
                to and is dropped; the reverse check dies at the symmetric gateway",
         media: Media::Granted,
+        families: Families::Unasserted,
     },
     Row {
         scenario: "browser_symmetric_symmetric",
@@ -533,6 +565,7 @@ pub const ROWS: &[Row] = &[
         why: "neither side can predict the other's mapping; the routed session through the \
                anchor is kept and typed as such",
         media: Media::Granted,
+        families: Families::Unasserted,
     },
 ];
 
@@ -561,6 +594,7 @@ pub const CONTROL: Row = Row {
     expect: Disposition::Direct,
     why: "the cone × cone row on the other engine — the direct path is not Chromium-specific",
     media: Media::None,
+    families: Families::Unasserted,
 };
 
 /// The permission-free leg: **row 1 again, with nothing granted —
@@ -616,6 +650,7 @@ pub const NO_MEDIA: Row = Row {
     why: "row 1 with no camera/microphone grant: enumeration is denied and the ports are \
           wildcard, and the pair still solves and still delivers in both directions",
     media: Media::None,
+    families: Families::Unasserted,
 };
 
 /// The permission-free **ROUTED** leg: `symmetric × symmetric` again,
@@ -680,14 +715,67 @@ pub const NO_MEDIA_RELAYED: Row = Row {
           path, which is not TURN and depends on a working leaf-to-anchor session, carries \
           application bytes for a page that was never asked for a media permission",
     media: Media::None,
+    families: Families::Unasserted,
+};
+
+/// **An IPv4-only player meets an IPv6-only player** through one
+/// dual-stack anchor (`ANCHOR_DUAL_STACK_PLAN.md`, slice 4), on
+/// Chromium, permission-free.
+///
+/// The two players share no address family, so ICE between them
+/// cannot solve by construction: the peer dialog must be carried by
+/// the anchor, which reaches A over IPv4 and B over IPv6 — the family
+/// bridge. Everything the routed rows require is required here too:
+/// both typed halves agree on `iceTimeout` (never `udpBlocked`: B's
+/// IPv6 probe of the anchor is answered, which is the slice 3 rule
+/// under test), exact ledgers, receiver-observed nonces both ways,
+/// and the anchor's application-only forwarding counters accounting
+/// for them. Beyond them, the verdict must show from the namespaces
+/// that A has no IPv6 and B has no IPv4, and that the anchor's
+/// selected pair with each is on that player's family.
+///
+/// Permission-free because Kyra's bar for slice 4 is that a supported
+/// engine passes without a grant a real player's browser would not
+/// have, or the plan records a named support decision.
+pub const DUAL_STACK: Row = Row {
+    scenario: "browser_dualstack_v4_meets_v6",
+    nat_a: Nat::ConeArV4Only,
+    nat_b: Nat::V6Only,
+    expect: Disposition::Relayed,
+    why: "an IPv4-only and an IPv6-only player share no family, so ICE between them cannot \
+          solve; the dual-stack anchor reaches each over its own family and carries the pair",
+    media: Media::None,
+    families: Families::V4MeetsV6,
+};
+
+/// [`DUAL_STACK`] on Firefox, both sides: the second supported engine.
+/// Not a control of the NAT axis (that is [`CONTROL`]) but a required
+/// engine for the dual-stack claim — a Chromium pass cannot stand in
+/// for it.
+pub const DUAL_STACK_FIREFOX: Row = Row {
+    scenario: "browser_dualstack_v4_meets_v6_firefox",
+    nat_a: Nat::ConeArV4Only,
+    nat_b: Nat::V6Only,
+    expect: Disposition::Relayed,
+    why: "the dual-stack family bridge on Firefox: the claim holds per supported engine, not \
+          for whichever engine passed",
+    media: Media::None,
+    families: Families::V4MeetsV6,
 };
 
 /// Every scenario this slice defines: the six rows, the Firefox
-/// control, then the two permission-free legs — direct and routed.
+/// control, the two permission-free legs — direct and routed — then
+/// the two dual-stack rows.
 pub fn all_scenarios() -> Vec<Row> {
     ROWS.iter()
         .copied()
-        .chain([CONTROL, NO_MEDIA, NO_MEDIA_RELAYED])
+        .chain([
+            CONTROL,
+            NO_MEDIA,
+            NO_MEDIA_RELAYED,
+            DUAL_STACK,
+            DUAL_STACK_FIREFOX,
+        ])
         .collect()
 }
 
@@ -1107,6 +1195,10 @@ pub struct RowVerdict {
     pub media: String,
     /// The row's application-delivery witness.
     pub app: AppExchange,
+    /// The players' address families, read from their namespaces by
+    /// the runner, and the anchor's selected pair with each. Only a
+    /// dual-stack row requires it; `None` elsewhere.
+    pub families: Option<serde_json::Value>,
     /// Anything the runner could not do. Non-empty fails the row
     /// before any counter is read: a verdict written around an error
     /// is not a measurement.
@@ -1203,8 +1295,78 @@ impl RowVerdict {
                     )
                 }
             },
+            families: v.get("families").filter(|f| !f.is_null()).cloned(),
             errors,
         })
+    }
+
+    /// The dual-stack witness: A is IPv4-only and B IPv6-only, read
+    /// from the namespaces, and the anchor's selected pair with each
+    /// is on that player's family. Every term REQUIRED: a verdict
+    /// that cannot say which family a player had has not shown that
+    /// the pair could not have gone direct.
+    pub fn check_families(&self, row: &Row) -> Result<(), String> {
+        if row.families == Families::Unasserted {
+            return Ok(());
+        }
+        let f = self.families.as_ref().ok_or_else(|| {
+            format!(
+                "row {} asserts the players share no address family, but the verdict carries \
+                 no `families` witness",
+                row.scenario
+            )
+        })?;
+        let flag = |side: &str, key: &str| -> Result<bool, String> {
+            f.get(side)
+                .and_then(|s| s.get(key))
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| format!("families.{side}.{key} missing or not a bool: {f}"))
+        };
+        let want = [
+            ("a", "ipv4", true),
+            ("a", "ipv6", false),
+            ("b", "ipv4", false),
+            ("b", "ipv6", true),
+        ];
+        for (side, family, expected) in want {
+            let has = flag(side, family)?;
+            if has != expected {
+                return Err(format!(
+                    "row {}: player {side} {} {family} (a global address or a default route), \
+                     so the two players are not an IPv4-only and an IPv6-only one and a relayed \
+                     result proves nothing about the family bridge: {f}",
+                    row.scenario,
+                    if has { "has" } else { "lacks" },
+                ));
+            }
+        }
+        let pair = |side: &str| -> Result<(String, String), String> {
+            let p = f
+                .get("anchor_pair")
+                .and_then(|p| p.get(side))
+                .ok_or_else(|| format!("families.anchor_pair.{side} missing: {f}"))?;
+            let text = |k: &str| {
+                p.get(k)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("families.anchor_pair.{side}.{k} missing: {f}"))
+            };
+            Ok((text("local")?, text("remote")?))
+        };
+        let is_v6 = |addr: &str| addr.starts_with('[');
+        for (side, v6) in [("a", false), ("b", true)] {
+            let (local, remote) = pair(side)?;
+            if is_v6(&local) != v6 || is_v6(&remote) != v6 {
+                return Err(format!(
+                    "row {}: the anchor's session with player {side} runs {local} <-> {remote}, \
+                     not over {} — the dual-stack anchor did not reach that player on its own \
+                     family",
+                    row.scenario,
+                    if v6 { "IPv6" } else { "IPv4" },
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The disposition one side's `PeerConnectOutcome` reports, or the
@@ -1285,6 +1447,7 @@ impl RowVerdict {
             ));
         }
         self.app.check(row)?;
+        self.check_families(row)?;
         Ok(())
     }
 }

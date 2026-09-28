@@ -793,6 +793,37 @@ fn natsim_browser_symmetric_symmetric_is_relayed_without_media_permission() {
     browser_row(&rows::NO_MEDIA_RELAYED);
 }
 
+/// **An IPv4-only player meets an IPv6-only player through one
+/// dual-stack anchor** (`ANCHOR_DUAL_STACK_PLAN.md`, slice 4), on
+/// Chromium, permission-free.
+///
+/// The players share no address family — A's namespace has IPv6
+/// disabled, B's has no IPv4 beyond loopback — so ICE between them
+/// cannot solve and the anchor must carry the pair. The row requires
+/// everything the routed rows do (typed `iceTimeout` on both halves,
+/// never `udpBlocked`; exact ledgers; receiver-observed nonces both
+/// ways; the anchor's application forwarding accounting for them;
+/// no replied flow at either gateway) plus the family witness read
+/// from the namespaces and the anchor's selected pair with each
+/// player on that player's own family.
+///
+/// `udpBlocked` refused is the slice 3 rule under test in a real
+/// browser: B's IPv4 probe of the anchor is unanswerable and its IPv6
+/// probe is answered, so the failure must stay `iceTimeout`.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_ipv4_only_meets_ipv6_only_through_a_dual_stack_anchor() {
+    browser_row(&rows::DUAL_STACK);
+}
+
+/// The same on Firefox, both sides: the dual-stack claim is per
+/// supported engine, and a Chromium pass cannot stand in for it.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_ipv4_only_meets_ipv6_only_through_a_dual_stack_anchor_on_firefox() {
+    browser_row(&rows::DUAL_STACK_FIREFOX);
+}
+
 // =========================================================================
 // Configuration-validation guards (no root, no netns — run anywhere
 // the suite compiles). These pin the harness's fail-loudly behavior

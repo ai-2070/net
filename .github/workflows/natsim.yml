@@ -25,6 +25,16 @@ on:
     # Nightly at 03:17 UTC — off the peak to keep runner queues calm.
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      filter:
+        description: >-
+          Run only the natsim tests whose name contains this string (e.g.
+          `dual_stack`). A development affordance for iterating on one
+          row: a FILTERED run skips the roster and floor checks, which only
+          mean something for the whole matrix, and says so in its log.
+          Empty runs everything, gated.
+        required: false
+        default: ""
 
 concurrency:
   group: natsim-${{ github.ref }}
@@ -210,6 +220,10 @@ jobs:
       # topology via sudo.
       - name: Run scenario matrix
         working-directory: net/crates/net
+        # Through the environment, never interpolated into the script:
+        # a dispatch input is text, not shell.
+        env:
+          FILTER: ${{ github.event.inputs.filter }}
         run: |
           set -o pipefail
           BROWSER_ROW_WITNESSES="
@@ -223,10 +237,22 @@ jobs:
           natsim_browser_cone_cone_is_direct_without_media_permission
           natsim_natted_anchor_publishes_both_mapped_endpoints
           natsim_browser_symmetric_symmetric_is_relayed_without_media_permission
+          natsim_browser_ipv4_only_meets_ipv6_only_through_a_dual_stack_anchor
+          natsim_browser_ipv4_only_meets_ipv6_only_through_a_dual_stack_anchor_on_firefox
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "NAT conformance rows" --mode fn \
             --source tests/natsim.rs $BROWSER_ROW_WITNESSES
+          if [ -n "$FILTER" ]; then
+            echo "::warning::FILTERED natsim run ($FILTER): the roster and floor checks are skipped"
+            cargo test --test natsim --features net,nat-traversal,webrtc \
+              -- --ignored --test-threads=1 --nocapture "$FILTER" 2>&1 | tee /tmp/natsim.log
+            ran=$(grep -c '^test .* \.\.\. ok$' /tmp/natsim.log || true)
+            failed=$(grep -c '^test .* \.\.\. FAILED$' /tmp/natsim.log || true)
+            echo "natsim filtered run: $ran passed, $failed failed"
+            if [ "${ran:-0}" -eq 0 ] || [ "${failed:-0}" -ne 0 ]; then exit 1; fi
+            exit 0
+          fi
           cargo test --test natsim --features net,nat-traversal,webrtc \
             -- --ignored --test-threads=1 --nocapture 2>&1 | tee /tmp/natsim.log
           ran=$(grep -c '^test .* \.\.\. ok$' /tmp/natsim.log || true)
@@ -235,9 +261,11 @@ jobs:
           # two S6 acceptance rows: the permission-free Chromium leg
           # (the granted camera/microphone was part of the measured
           # environment, not of the product) and the NAT'd anchor that
-          # observes BOTH of its mapped endpoints answering.
-          if [ "${ran:-0}" -lt 16 ]; then
-            echo "::error::natsim ran ${ran:-0} scenarios, floor is 16 — \
+          # observes BOTH of its mapped endpoints answering — plus the
+          # two dual-stack rows (IPv4-only meets IPv6-only, Chromium
+          # and Firefox; ANCHOR_DUAL_STACK_PLAN.md slice 4).
+          if [ "${ran:-0}" -lt 18 ]; then
+            echo "::error::natsim ran ${ran:-0} scenarios, floor is 18 — \
           lower the floor deliberately or restore the row"
             exit 1
           fi
