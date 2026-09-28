@@ -210,15 +210,20 @@ neighbour — mis-typing a failure is the mistake this design exists to prevent.
 **An ICE timeout is not evidence that UDP is blocked.** An anchor that is down,
 misconfigured or saturated produces the same symptom. Only two observations
 together narrow it: the HTTPS bootstrap to *that anchor* succeeded **and** a
-STUN binding to the `rtc_addr` *that same anchor published* went unanswered.
-`classifyRtcFailure(observations)` is a pure function of those two facts and the
-only path to `udp-blocked`; `probeStunBinding(addr)` produces the second
-observation, `probeBootstrapReachable()` the first (before any `connected`
-event), and `udpBlockedEvidence()` returns `null` unless both hold and the
-address is named. Host candidates are ignored (they are gathered whatever the
+STUN binding to **every** RTC endpoint *that same anchor published* went
+unanswered (one per family on a dual-stack anchor, probed together under one
+deadline). `classifyRtcFailureAll({ bootstrapOk, probes })` is a pure function of
+those facts and the only path to `udp-blocked`; `probeStunBindings(addrs)`
+produces the probes, `probeBootstrapReachable()` the bootstrap observation
+(before any `connected` event), and `udpBlockedEvidence()` returns `null` unless
+both hold and the endpoints are named. One answered family, an unrun probe or no
+endpoints stays `ice-timeout`, and the message states the observation ("no UDP
+response from the anchor's advertised endpoints"), not a cause — branch on
+`kind`. Host candidates are ignored (they are gathered whatever the
 network does), and a STUN **error** response still proves reachability — that is
-why the rule is a code threshold, not a list. The probe needs a subject: the
-`connected` event's `rtc_addr`, or `connect({ anchorRtcAddr })`.
+why the rule is a code threshold, not a list; the Rust and TypeScript probes
+share it. The probes need a subject: the `connected` event's `rtcAddrs`, or
+`connect({ anchorRtcAddr })`.
 
 **`rpc-indeterminate` is not a timeout, and must not be retried.** On a session,
 a call can fail because the tab running the node was frozen by the browser: a

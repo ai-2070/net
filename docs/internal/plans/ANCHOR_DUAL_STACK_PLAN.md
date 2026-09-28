@@ -484,6 +484,31 @@ dual-stack anchor. That is slice 4.
 
 ### Slice 5: docs and operators
 
+**Done 2026-09-29, ahead of slice 4** (decided with the maintainer: slices
+1–3 go to review while the Linux route for slice 4 is settled). What landed:
+
+- **CLI reference.** A new "Serve IPv4 and IPv6 players" section: the
+  flags, DNS, `rtc_addrs`, /64 limits, and "no `AAAA` until dual-stack".
+  Hosting notes cover a plain VM, a DigitalOcean Reserved IP, Fly.io's
+  IPv4-only UDP with its proxy hiding client addresses, and platforms
+  without UDP. The `--inspect-target` keys are also documented.
+- **Transport concepts.** The `rtc_addrs` field, a dual-stack paragraph, and
+  the every-endpoint `udp-blocked` rule.
+- **Browser errors page, `net-browser` / `net-event-bus` skills, and the
+  `@net-mesh/browser` CHANGELOG** (slice 3's commit): the every-endpoint
+  rule, observation-not-cause wording, `probedAll`/`rtcAddrs`, probe parity,
+  and the new exports.
+- **Checks:** `check-skills.sh` and `web` `npm run check` (180 docs, links
+  resolve) pass.
+
+**Not done here:**
+
+- The 0.38 release note is written at release time, from this plan.
+- The docs say Chromium and Firefox are the engines under test (Decision in
+  slice 4), but no browser IPv6 witness exists until slice 4 lands. Until
+  then, dual-stack browser support is claimed from the native and unit
+  evidence of slices 1–3 only.
+
 - CLI reference, `concepts/webrtc-transport.md`, the browser quickstart and
   the "run an anchor" guide (prebuilt-binaries plan, slice 4) show the
   dual-stack flags and the need for an `AAAA` record.

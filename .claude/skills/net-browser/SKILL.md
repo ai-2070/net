@@ -86,7 +86,9 @@ model that a client-prediction habit will get wrong.
    A replica cannot read what it was not given.
 6. **Two failures a page must not misread.** An ICE timeout is **not** evidence
    that UDP is blocked — only a successful bootstrap *plus* an unanswered STUN
-   binding to the anchor's published `rtc_addr` is. And `rpc-indeterminate` from
+   binding to **every** endpoint the anchor published (one per family on a
+   dual-stack anchor) is, and even then the message states the observation, not
+   a cause. And `rpc-indeterminate` from
    a frozen leader means "the remote may have executed this"; retrying can cause
    the effect twice.
 7. **The package is published as `@net-mesh/browser`** (install with `npm

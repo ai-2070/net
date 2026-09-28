@@ -89,15 +89,28 @@ misconfigured or saturated produces the same symptom. An ICE failure therefore
 surfaces as `ice-timeout`, and only two observations *together* may narrow it:
 
 1. the HTTPS bootstrap to **that anchor** succeeded (it is up and addressable); and
-2. a STUN binding to the `rtc_addr` **that same anchor published** went unanswered.
+2. a STUN binding to **every** RTC endpoint that same anchor published went
+   unanswered. A dual-stack anchor publishes one per family (IPv4, IPv6); all are
+   probed at once, under one deadline.
 
-`classifyRtcFailure(observations)` is a pure function of those two facts and the
-**only** path to `udp-blocked`. `probeStunBinding(addr)` produces the second
-observation, `probeBootstrapReachable(bootstrapUrl)` the first (needed before any `connected`
-event exists), and `udpBlockedEvidence()` returns `null` unless both hold and the
-address is named.
+`classifyRtcFailureAll({ bootstrapOk, probes })` is a pure function of those facts
+and the **only** path to `udp-blocked`. `probeStunBindings(addrs)` produces the
+probes, `probeBootstrapReachable(bootstrapUrl)` the bootstrap observation (needed
+before any `connected` event exists), and `udpBlockedEvidence()` returns `null`
+unless both hold and the endpoints are named (`probed`, and `probedAll` for every
+one). The single-endpoint `classifyRtcFailure` / `probeStunBinding` remain.
 
-What the probe keys on was measured in headless Chromium, not assumed:
+Anything short of every probe unanswered stays `ice-timeout`: **one answered
+family** (UDP works there; this is the IPv6-only player behind NAT64 whose IPv4
+probe is silent), **a probe that did not run** (`notRun`, `unsupported`), or **no
+endpoints**. Even when it holds, the claim is the observation, not a cause — the
+message reads `no UDP response from the anchor's advertised endpoints: …`, because
+a stopped UDP listener or a wrong advertised address looks the same. Branch on
+`kind` / `isUdpBlocked`, never on the message.
+
+What a probe keys on was measured in headless Chromium, not assumed, and the
+Rust (wasm) and TypeScript probes share the rule (`probeEventAnswers`), held to one
+vector file (`browser-ts/test/fixtures/stun-probe-verdicts.json`) on both sides:
 
 | What the engine did | Classification |
 |---|---|
@@ -112,9 +125,10 @@ Three details that shape real code:
   the network does to UDP (Chromium even hides them behind an mDNS `.local` name).
 - **The probe's deadline is load-bearing**, not a safety net: against a
   black-holed address Chromium emits no error event and never completes gathering.
-- **The probe needs a subject.** The address comes from the `connected` event's
-  `rtcAddr` (the anchor's published `rtc_addr`), or from `connect({ anchorRtcAddr })` for a page that already knows
-  it. With neither, there is no evidence and an ICE timeout correctly stays
+- **The probe needs a subject.** The addresses come from the `connected` event's
+  `rtcAddrs` (every endpoint the anchor published, primary first; `rtcAddr` is the
+  primary), or from `connect({ anchorRtcAddr })` for a page that already knows
+  one. With neither, there is no evidence and an ICE timeout correctly stays
   `ice-timeout`; `connect({ failureTyping: { probeOnIceTimeout: false } })` turns
   probing off with the same consequence. `diagnosticStunUrl(rtcAddr)` builds that
   target — and it is **not** a source of `iceServers`: `rtc_addr` is this
