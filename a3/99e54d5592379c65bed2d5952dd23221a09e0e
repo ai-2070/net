@@ -1,0 +1,31 @@
+web/src/content/docs/sdk/browser/errors.md
+  s_d8b00bedd146e9::t_ea64c896054942 70-96,98-100,102-104,126-129,143-145,163-165
+.claude/skills/net-browser/errors.md
+  s_d8b00bedd146e9::t_fe2d100d2f5e58 92-113,128-131
+.claude/skills/net-browser/SKILL.md
+  s_d8b00bedd146e9::t_fe2d100d2f5e58 89-91
+.claude/skills/net-event-bus/browser.md
+  s_d8b00bedd146e9::t_fe2d100d2f5e58 213-222,224-226
+web/src/content/docs/concepts/webrtc-transport.md
+  s_d8b00bedd146e9::t_8574310995b59a 67,70-79,178-179,182-185
+docs/internal/plans/ANCHOR_DUAL_STACK_PLAN.md
+  s_d8b00bedd146e9::t_72454a0b1c6a67 487-511
+web/src/content/docs/reference/cli.md
+  s_d8b00bedd146e9::t_8574310995b59a 190-216,219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a399e54d5592379c65bed2d5952dd23221a09e0e",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
