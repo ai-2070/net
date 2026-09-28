@@ -458,6 +458,66 @@ dual-stack anchor. That is slice 4.
 
 ### Slice 4: a real IPv6-only player
 
+**In progress (2026-09-29), iterating in CI.** natsim runs only on Linux, so
+this slice is developed against the `natsim` workflow. A dispatch-only
+`filter` input runs one row, and a filtered run skips the roster and floor
+checks and says so.
+
+**As built** (commit `2f53c076a`):
+
+- **`setup.sh`.**
+  - `cone-ar-v4only`: `cone-ar` with IPv6 *disabled* in the player's
+    namespace.
+  - `v6only`: a routing gateway (IPv6 is deployed without NAT) with a
+    stateful CPE-style firewall, `ct state new` inbound dropped, and no
+    IPv4 on the player beyond loopback.
+  - The wan bridge gets `2001:db8:99::/64` and the anchor `::10` only when
+    a row has an IPv6-only side, so the existing rows are untouched.
+- **Rows.** `browser_dualstack_v4_meets_v6` (Chromium) and `…_firefox`, both
+  `MEDIA=none`, expected **relayed**: with no family in common, ICE cannot
+  solve, so the anchor carries the pair.
+- **Runner.** Given `--anchor-ip6`, the runner makes the anchor dual-stack:
+  - an RTC socket;
+  - a bootstrap listener sharing one state;
+  - a control listener and a certificate SAN.
+
+  Each tab gets the URLs, credential and `anchor_rtc_addr` of its own
+  family.
+- **What the row requires.**
+  - Everything a routed row requires: typed `iceTimeout` on both halves
+    (**`udpBlocked` refused**, which is slice 3's rule running in a real
+    browser); exact ledgers; receiver-observed nonces both ways; the anchor's
+    application-only forwarding accounting for them; and no replied flow at
+    either gateway (the conntrack witness now reads the IPv6 table too).
+  - Plus the **family witness**: `ip -n <ns>` shows A with IPv4 only and B
+    with IPv6 only (a global address or a default route), and
+    `anchor.rtc_selected_pair` shows each player's anchor session on its
+    own family.
+  - Unit-tested platform-independently in `natsim_browser.rs`: 5 tests,
+    46 in the file.
+- **Dropped by decision (maintainer, 2026-09-29): the old-leaf / new-anchor
+  case.** Kyra's review asked for a 0.37.1 `@net-mesh/browser` against the
+  dual-stack anchor. It is out of scope for 0.38:
+  - Net has no deployed users yet, so the only pages that will meet a
+    dual-stack anchor are the maintainer's own, on 0.38.
+  - The package's documented contract is already that it and its anchor are
+    released and upgraded together (`browser-ts/CHANGELOG.md`).
+  - What an old page would lose is known from the design, not measured.
+    Its answer SDP carries both candidates, so connecting should work.
+    `udp-blocked` stays the old single-address rule, so an IPv6-only player
+    can still be misdiagnosed. The STUN guard covers only the primary
+    address.
+  - **Revisit when there are users on a release older than the anchor they
+    reach.** Cross-version interoperability then becomes a real
+    requirement, and this case becomes a row.
+- **Risk to watch.** On an IPv6 network without NAT, a STUN reply maps to the
+  host's own address, and libwebrtc may not surface a server-reflexive
+  candidate identical to the host one. If so, the leaf's IPv6 probe of the
+  anchor reads unanswered while UDP works, and the row fails on
+  `udpBlocked`. That would be a real product defect in slice 3's probe
+  (answered must not depend on a srflx differing from the host), not a
+  harness problem.
+
 - **Where:** a natsim scenario that puts a browser leaf in an IPv6-only
   network namespace (`tests/natsim/browser/` already drives a browser inside
   natsim), alongside a v4-only leaf, against one dual-stack anchor.
@@ -474,8 +534,9 @@ dual-stack anchor. That is slice 4.
     not merely sent;
   - **the anchor's application-forwarding counters** rise in step with those
     payloads, correlated per direction, proving the anchor is the bridge;
-  - **old leaf, new anchor:** a 0.37.1 leaf connects to the dual-stack
-    anchor over IPv4 and exchanges payloads.
+  - ~~**old leaf, new anchor:** a 0.37.1 leaf connects to the dual-stack
+    anchor over IPv4 and exchanges payloads.~~ Dropped by decision
+    (2026-09-29); see the slice 4 status above.
 - **A native str0m pass is not a substitute for a browser pass.** If a
   supported engine cannot run the scenario, the slice is not done. The outcome
   is a **named support decision** recorded here, for example "Firefox is
@@ -540,6 +601,8 @@ dual-stack anchor. That is slice 4.
   is standard ICE, and 0.37 leaves pass the SDP through to the browser, but
   slice 1's byte-for-byte check covers only the IPv4-only configuration. Run
   one 0.37.1 leaf against a dual-stack anchor as part of slice 4.
+  *Amended 2026-09-29: dropped by decision; see slice 4. There are no users
+  on 0.37.1, and the package and anchor ship together.*
 
 ## Until this lands
 
