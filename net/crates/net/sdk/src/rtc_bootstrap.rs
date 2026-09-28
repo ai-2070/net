@@ -252,6 +252,17 @@ impl AcmeState {
 pub struct BootstrapConfig {
     /// Address to bind the HTTPS listener on.
     pub bind_addr: SocketAddr,
+    /// Further addresses the HTTPS listener binds beside
+    /// [`Self::bind_addr`]: a dual-stack anchor listens on an IPv4 and
+    /// an IPv6 address.
+    ///
+    /// Every listener serves the **same** router, so the per-source
+    /// budgets are one budget whichever family a request arrived on.
+    /// A router per listener would give each family its own budget and
+    /// double every ceiling. With more than one listener, each IPv6
+    /// one is bound with `IPV6_V6ONLY` set, so it never claims the
+    /// IPv4 port beside it whatever the platform default.
+    pub additional_bind_addrs: Vec<SocketAddr>,
     /// The transport trust domain's PSK — the one credentials for
     /// this anchor were minted against. Used only to derive the
     /// trust-domain id a presented credential is checked against.
@@ -292,6 +303,13 @@ pub struct BootstrapConfig {
     /// process, same challenge store, second socket — reconciled in
     /// the report.
     pub acme_challenge_addr: SocketAddr,
+    /// Further addresses the plaintext HTTP-01 challenge ingress binds.
+    ///
+    /// An ACME directory validates over IPv6 when the domain has an
+    /// `AAAA` record, so an anchor that publishes one needs an IPv6
+    /// challenge listener too, or issuance and renewal fail. The same
+    /// `IPV6_V6ONLY` rule as the HTTPS listeners applies.
+    pub additional_acme_challenge_addrs: Vec<SocketAddr>,
     /// Renew this long before the certificate expires (R4c).
     pub acme_renewal_horizon: Duration,
     /// Anonymous visitor credentials, served as `POST /credential`.
@@ -313,6 +331,7 @@ impl BootstrapConfig {
         let origin = origin.into();
         Self {
             bind_addr,
+            additional_bind_addrs: Vec::new(),
             psk,
             credential_issuer,
             tls,
@@ -321,6 +340,7 @@ impl BootstrapConfig {
             offers_per_ip_per_minute: DEFAULT_OFFERS_PER_IP_PER_MINUTE,
             acme: AcmeState::new(),
             acme_challenge_addr: SocketAddr::from(([0, 0, 0, 0], 80)),
+            additional_acme_challenge_addrs: Vec::new(),
             acme_renewal_horizon: crate::rtc_bootstrap_acme::DEFAULT_RENEWAL_HORIZON,
             credential_issuance: None,
         }
@@ -532,6 +552,16 @@ pub struct AnchorInfo {
     /// at. `None` means nothing was announced, and a leaf then
     /// configures no ICE servers at all.
     pub stun_addr: Option<String>,
+    /// Every published RTC endpoint, primary first, **only on a
+    /// dual-stack anchor** that publishes one per family.
+    ///
+    /// Omitted otherwise, so a single-socket anchor's reply is
+    /// unchanged field for field, and [`Self::rtc_addr`] stays its
+    /// complete answer. A consumer reads `rtc_addrs` when present,
+    /// else `[rtc_addr]`, else nothing. Like `rtc_addr`, only
+    /// operator-published endpoints appear here, never a bound one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_addrs: Option<Vec<String>>,
     /// The trust domain this anchor serves.
     pub trust_domain: String,
     /// §12 provisional capacity: bound and current occupancy.
@@ -561,6 +591,7 @@ pub struct TrickleQuery {
 /// A running listener.
 pub struct BootstrapHandle {
     local_addr: SocketAddr,
+    local_addrs: Vec<SocketAddr>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -570,6 +601,12 @@ impl BootstrapHandle {
     /// port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Every address actually bound, [`Self::local_addr`] first: one
+    /// per configured listener.
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.local_addrs
     }
 
     /// Stop serving and wait for the accept loop to finish.
@@ -1077,6 +1114,61 @@ async fn post_credential(
     }
 }
 
+/// Bind one TCP listener. `v6_only` sets `IPV6_V6ONLY` on an IPv6
+/// address; it is asked for whenever a listener has siblings, so an
+/// IPv6 listener never claims the IPv4 port beside it and the result
+/// does not depend on the platform default (dual-stack on Linux,
+/// IPv6-only on Windows). A lone listener binds as
+/// `TcpListener::bind` would.
+fn bind_tcp(addr: SocketAddr, v6_only: bool) -> std::io::Result<tokio::net::TcpListener> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    if addr.is_ipv6() && v6_only {
+        socket.set_only_v6(true)?;
+    }
+    // What `TcpListener::bind` does on Unix, so a lone listener is
+    // unchanged by going through here.
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
+/// Bind every address in `addrs`, all or nothing, and return the
+/// listeners with the addresses they actually bound, in order.
+fn bind_tcp_all(
+    addrs: &[SocketAddr],
+) -> std::io::Result<(Vec<tokio::net::TcpListener>, Vec<SocketAddr>)> {
+    let v6_only = addrs.len() > 1;
+    let mut listeners = Vec::with_capacity(addrs.len());
+    let mut bound = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        let listener = bind_tcp(*addr, v6_only)?;
+        bound.push(listener.local_addr()?);
+        listeners.push(listener);
+    }
+    Ok((listeners, bound))
+}
+
+/// The next connection on any of `listeners`. `TcpListener::accept`
+/// is cancel-safe, so the accepts that lose the race drop nothing.
+async fn accept_any(
+    listeners: &[tokio::net::TcpListener],
+) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+    if let [only] = listeners {
+        return only.accept().await;
+    }
+    futures::future::select_all(listeners.iter().map(|listener| Box::pin(listener.accept())))
+        .await
+        .0
+}
+
 /// Start the listener. Returns once the socket is bound, so a caller
 /// can publish the URL without racing the first request.
 pub async fn serve_bootstrap(
@@ -1092,7 +1184,7 @@ pub async fn serve_bootstrap(
             ));
         }
     }
-    let (initial, challenge_task) = tls_acceptor(&config).await?;
+    let (initial, challenge_tasks) = tls_acceptor(&config).await?;
     // **R4c: the acceptor is swappable.** A static one meant the
     // certificate a process started with was the certificate it died
     // with; ACME certificates expire in weeks.
@@ -1102,28 +1194,29 @@ pub async fn serve_bootstrap(
     // A TLS bind that fails AFTER the challenge ingress and the
     // renewal owner exist must not detach them either (R4, round
     // two): same reasoning as the ordering failure, same remedy.
-    let bound = tokio::net::TcpListener::bind(config.bind_addr)
-        .await
-        .and_then(|listener| listener.local_addr().map(|addr| (listener, addr)));
-    let (listener, local_addr) = match bound {
-        Ok(pair) => pair,
+    let addrs: Vec<SocketAddr> = std::iter::once(config.bind_addr)
+        .chain(config.additional_bind_addrs.iter().copied())
+        .collect();
+    let (listeners, local_addrs) = match bind_tcp_all(&addrs) {
+        Ok(bound) => bound,
         Err(e) => {
             if let Some(renewal) = renewal {
                 abort_and_join(renewal).await;
             }
-            if let Some(challenge) = challenge_task {
+            for challenge in challenge_tasks {
                 abort_and_join(challenge).await;
             }
             return Err(BootstrapError::Bind(e.to_string()));
         }
     };
+    let local_addr = local_addrs[0];
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let service = router.into_make_service_with_connect_info::<SocketAddr>();
         loop {
             let accepted = tokio::select! {
                 _ = &mut shutdown_rx => break,
-                accepted = listener.accept() => accepted,
+                accepted = accept_any(&listeners) => accepted,
             };
             let Ok((stream, remote)) = accepted else {
                 continue;
@@ -1142,12 +1235,13 @@ pub async fn serve_bootstrap(
         if let Some(renewal) = renewal {
             abort_and_join(renewal).await;
         }
-        if let Some(challenge) = challenge_task {
+        for challenge in challenge_tasks {
             abort_and_join(challenge).await;
         }
     });
     Ok(BootstrapHandle {
         local_addr,
+        local_addrs,
         shutdown: shutdown_tx,
         task,
     })
@@ -1287,12 +1381,12 @@ async fn abort_and_join(task: tokio::task::JoinHandle<()>) {
 async fn serve_challenge_ingress(
     addr: SocketAddr,
     acme: AcmeState,
+    v6_only: bool,
 ) -> Result<(tokio::task::JoinHandle<()>, SocketAddr), BootstrapError> {
     let router = Router::new()
         .route("/.well-known/acme-challenge/{token}", get(challenge_route))
         .with_state(acme);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
+    let listener = bind_tcp(addr, v6_only)
         .map_err(|e| BootstrapError::Bind(format!("acme http-01 ingress on {addr}: {e}")))?;
     let bound = listener
         .local_addr()
@@ -1341,25 +1435,43 @@ async fn tls_acceptor(
 ) -> Result<
     (
         Arc<tokio_rustls::TlsAcceptor>,
-        Option<tokio::task::JoinHandle<()>>,
+        Vec<tokio::task::JoinHandle<()>>,
     ),
     BootstrapError,
 > {
-    let mut challenge_task = None;
+    let mut challenge_tasks = Vec::new();
     let (chain, key) = match &config.tls {
         BootstrapTls::Operator { cert_pem, key_pem } => read_pem_pair(cert_pem, key_pem)?,
         BootstrapTls::Acme(acme) => {
-            // R4a: the challenge ingress exists before we order.
-            let (task, bound) =
-                serve_challenge_ingress(config.acme_challenge_addr, config.acme.clone()).await?;
-            tracing::info!(
-                %bound,
-                domain = %acme.domain,
-                "acme http-01 ingress bound before ordering"
-            );
+            // R4a: the challenge ingress exists before we order, on
+            // every configured address (an IPv6 one included, since a
+            // directory validates over IPv6 when the name has AAAA).
+            let addrs: Vec<SocketAddr> = std::iter::once(config.acme_challenge_addr)
+                .chain(config.additional_acme_challenge_addrs.iter().copied())
+                .collect();
+            let v6_only = addrs.len() > 1;
+            let mut tasks = Vec::with_capacity(addrs.len());
+            for addr in addrs {
+                match serve_challenge_ingress(addr, config.acme.clone(), v6_only).await {
+                    Ok((task, bound)) => {
+                        tracing::info!(
+                            %bound,
+                            domain = %acme.domain,
+                            "acme http-01 ingress bound before ordering"
+                        );
+                        tasks.push(task);
+                    }
+                    Err(e) => {
+                        for task in tasks {
+                            abort_and_join(task).await;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
             match crate::rtc_bootstrap_acme::obtain_certificate(acme, &config.acme).await {
                 Ok(pair) => {
-                    challenge_task = Some(task);
+                    challenge_tasks = tasks;
                     pair
                 }
                 Err(e) => {
@@ -1370,16 +1482,18 @@ async fn tls_acceptor(
                     // rebind it after a failed order. `abort`
                     // requests cancellation; only the await makes
                     // the listener gone by the time this returns.
-                    abort_and_join(task).await;
+                    for task in tasks {
+                        abort_and_join(task).await;
+                    }
                     return Err(e);
                 }
             }
         }
     };
     match server_config(chain, key) {
-        Ok(acceptor) => Ok((acceptor, challenge_task)),
+        Ok(acceptor) => Ok((acceptor, challenge_tasks)),
         Err(e) => {
-            if let Some(task) = challenge_task {
+            for task in challenge_tasks {
                 abort_and_join(task).await;
             }
             Err(e)
@@ -1572,6 +1686,14 @@ async fn post_offer(
     }
 }
 
+/// `AnchorInfo::rtc_addrs`'s serialization rule, in one place: every
+/// published RTC endpoint when there is more than one, otherwise
+/// `None` so the key is omitted and the reply is unchanged.
+pub fn published_rtc_addrs(node: &MeshNode) -> Option<Vec<String>> {
+    let published = node.rtc_public_addrs();
+    (published.len() > 1).then(|| published.iter().map(|addr| addr.to_string()).collect())
+}
+
 async fn get_anchor(State(state): State<AppState>) -> Response {
     Json(AnchorInfo {
         node_id: format!("{:#x}", state.node.node_id()),
@@ -1581,6 +1703,7 @@ async fn get_anchor(State(state): State<AppState>) -> Response {
         // bind: one resolution rule, in the node, so this handler
         // and the announcement emission point cannot disagree.
         stun_addr: state.node.rtc_public_stun_addr().map(|a| a.to_string()),
+        rtc_addrs: published_rtc_addrs(&state.node),
         trust_domain: state.psk.trust_domain().to_string(),
         max_provisional: state.node.rtc_max_provisional(),
         provisional: state.node.provisional_count(),

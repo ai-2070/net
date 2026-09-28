@@ -804,8 +804,11 @@ pub struct ServeArgs {
     pub psk_file: PathBuf,
 
     /// Address for the HTTPS bootstrap listener (default: 0.0.0.0:8443).
+    /// Repeatable: a dual-stack anchor listens on an IPv4 and an IPv6
+    /// address, e.g. `--listen 0.0.0.0:443 --listen '[::]:443'`. Every
+    /// listener serves one state, so the rate limits are one budget.
     #[arg(long = "listen", value_name = "ADDR")]
-    pub listen: Option<String>,
+    pub listen: Vec<String>,
 
     /// The externally reachable base URL of that listener. It is
     /// published as `rtc_bootstrap` on the announcement, so it must
@@ -815,14 +818,20 @@ pub struct ServeArgs {
 
     /// Public address of the RTC/STUN socket, published as
     /// `rtc_addr`. Required behind NAT; without it a browser has no
-    /// address to aim ICE at.
+    /// address to aim ICE at. Repeatable once per family on a
+    /// dual-stack anchor: each public address advertises the
+    /// `--rtc-bind` socket of its family.
     #[arg(long = "rtc-public-addr", value_name = "ADDR")]
-    pub rtc_public_addr: Option<String>,
+    pub rtc_public_addr: Vec<String>,
 
     /// Bind address of the RTC socket. Pin it when `--rtc-public-addr`
-    /// maps a fixed port.
+    /// maps a fixed port. Repeatable once per family: an IPv4 and an
+    /// IPv6 bind make a **dual-stack anchor**, whose sessions offer a
+    /// candidate in each family, so players on IPv6-only networks can
+    /// connect too. One bind of either family is a single-socket
+    /// anchor, as before.
     #[arg(long = "rtc-bind", value_name = "ADDR")]
-    pub rtc_bind: Option<String>,
+    pub rtc_bind: Vec<String>,
 
     /// Bind address of a SECOND UDP socket that answers STUN only,
     /// published as `rtc_stun_addr` on the announcement. Off by
@@ -874,9 +883,11 @@ pub struct ServeArgs {
 
     /// Address for the plaintext HTTP-01 challenge ingress, bound
     /// before ordering. Defaults to `0.0.0.0:80`, the port an ACME
-    /// directory dials.
+    /// directory dials. Repeatable: an anchor whose name has an
+    /// `AAAA` record needs an IPv6 one too (`--acme-challenge-addr
+    /// '[::]:80'`), because the directory validates over IPv6 then.
     #[arg(long = "acme-challenge-addr", value_name = "ADDR")]
-    pub acme_challenge_addr: Option<String>,
+    pub acme_challenge_addr: Vec<String>,
 
     /// The issuer whose signature this anchor accepts on a
     /// credential (64 hex chars) — the public half of the key
@@ -973,6 +984,17 @@ struct ServeReport {
     /// Where pages ask for a visitor credential; absent without `--game`.
     #[serde(skip_serializing_if = "Option::is_none")]
     credential_endpoint: Option<String>,
+    /// Listeners beyond `listening_on`. Absent with one listener, so a
+    /// single-listener anchor's report is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    also_listening_on: Vec<String>,
+    /// Every published RTC endpoint, primary first, **only on a
+    /// dual-stack anchor** that publishes one per family (the same
+    /// rule as `GET /rtc/anchor`): absent otherwise, so a
+    /// single-socket anchor's report is unchanged field for field and
+    /// `rtc_addr` stays its complete answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtc_addrs: Option<Vec<String>>,
 }
 
 /// Parse `--game` values: `ID` or `ID:PER_MINUTE`.
@@ -1005,6 +1027,56 @@ fn parse_games(values: &[String]) -> Result<Vec<net_sdk::game_anchor::GameConfig
         .collect()
 }
 
+/// Parse a repeatable address flag that allows **at most one value
+/// per family**, returning `(IPv4, IPv6)`.
+///
+/// Two of one family is refused rather than resolved: the anchor
+/// routes a datagram to the socket of its destination's family, so
+/// two sockets of one family would leave that choice ambiguous.
+#[cfg(feature = "rtc-bootstrap")]
+fn one_per_family(
+    flag: &str,
+    values: &[String],
+) -> Result<(Option<std::net::SocketAddr>, Option<std::net::SocketAddr>), CliError> {
+    let mut v4 = None;
+    let mut v6 = None;
+    for value in values {
+        let addr: std::net::SocketAddr = value
+            .parse()
+            .map_err(|e| invalid_args(format!("{flag} {value}: {e}")))?;
+        let slot = if addr.is_ipv4() { &mut v4 } else { &mut v6 };
+        if let Some(previous) = slot.replace(addr) {
+            return Err(invalid_args(format!(
+                "{flag} is given twice for one address family ({previous} and {addr}); it \
+                 takes at most one IPv4 and one IPv6 address"
+            )));
+        }
+    }
+    Ok((v4, v6))
+}
+
+/// Parse a repeatable address flag, or its default when not given.
+#[cfg(feature = "rtc-bootstrap")]
+fn addrs_or_default(
+    flag: &str,
+    values: &[String],
+    default: &str,
+) -> Result<Vec<std::net::SocketAddr>, CliError> {
+    if values.is_empty() {
+        return Ok(vec![default.parse().map_err(|e| {
+            invalid_args(format!("{flag} default {default}: {e}"))
+        })?]);
+    }
+    values
+        .iter()
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|e| invalid_args(format!("{flag} {value}: {e}")))
+        })
+        .collect()
+}
+
 /// The RTC driver configuration `serve` runs with, from the
 /// operator's flags.
 ///
@@ -1017,7 +1089,11 @@ fn parse_games(values: &[String]) -> Result<Vec<net_sdk::game_anchor::GameConfig
 ///
 /// * `--rtc-bind` / `--rtc-public-addr` → the ICE/RTC socket. It
 ///   keeps `serve_stun = true`, which is what answers the
-///   diagnostic `UdpBlocked` probe aimed at `rtc_addr`.
+///   diagnostic `UdpBlocked` probe aimed at `rtc_addr`. Each flag
+///   takes at most one address per family; an IPv4 and an IPv6
+///   `--rtc-bind` make a dual-stack anchor with a second, IPv6 RTC
+///   socket, and each public address advertises the socket of its
+///   own family.
 /// * `--rtc-stun-bind` / `--rtc-stun-public-addr` → the SECOND,
 ///   STUN-only socket announced as `rtc_stun_addr` (Stage 6),
 ///   additional to the first and never a replacement for it.
@@ -1026,18 +1102,28 @@ fn parse_games(values: &[String]) -> Result<Vec<net_sdk::game_anchor::GameConfig
 fn rtc_config_from_args(args: &ServeArgs) -> Result<net::adapter::net::rtc::RtcConfig, CliError> {
     let mut rtc = net::adapter::net::rtc::RtcConfig::new().with_bootstrap_url(args.url.clone());
     rtc.serve_stun = true;
-    if let Some(bind) = args.rtc_bind.as_ref() {
-        rtc.bind_addr = Some(
-            bind.parse()
-                .map_err(|e| invalid_args(format!("--rtc-bind: {e}")))?,
-        );
-    }
-    if let Some(public) = args.rtc_public_addr.as_ref() {
-        rtc.public_addr = Some(
-            public
-                .parse()
-                .map_err(|e| invalid_args(format!("--rtc-public-addr: {e}")))?,
-        );
+    let (bind, bind_v6) = one_per_family("--rtc-bind", &args.rtc_bind)?;
+    let (public, public_v6) = one_per_family("--rtc-public-addr", &args.rtc_public_addr)?;
+    match (bind, bind_v6) {
+        // An IPv4 and an IPv6 bind: a dual-stack anchor. Each public
+        // address advertises the socket of its own family.
+        (Some(bind), Some(bind_v6)) => {
+            rtc.bind_addr = Some(bind);
+            rtc.bind_addr_v6 = Some(bind_v6);
+            rtc.public_addr = public;
+            rtc.public_addr_v6 = public_v6;
+        }
+        // One socket, of either family: as before, one public address
+        // at most, and it advertises that socket.
+        (single, single_v6) => {
+            rtc.bind_addr = single.or(single_v6);
+            if public.is_some() && public_v6.is_some() {
+                return Err(invalid_args(
+                    "--rtc-public-addr names an IPv4 and an IPv6 address, but only one                      --rtc-bind socket exists; give an --rtc-bind of each family for a                      dual-stack anchor",
+                ));
+            }
+            rtc.public_addr = public.or(public_v6);
+        }
     }
     if let Some(bind) = args.rtc_stun_bind.as_ref() {
         rtc.stun_addr = Some(
@@ -1064,24 +1150,18 @@ fn resolve_serve(args: &ServeArgs) -> Result<ResolvedServe, CliError> {
         .unwrap_or("0.0.0.0:0")
         .parse()
         .map_err(|e| invalid_args(format!("--bind: {e}")))?;
-    let listen = args
-        .listen
-        .as_deref()
-        .unwrap_or("0.0.0.0:8443")
-        .parse()
-        .map_err(|e| invalid_args(format!("--listen: {e}")))?;
+    let listen = addrs_or_default("--listen", &args.listen, "0.0.0.0:8443")?;
     let issuer = args
         .credential_issuer
         .as_deref()
         .map(parse_entity_hex)
         .transpose()?;
     parse_games(&args.game)?;
-    let challenge = args
-        .acme_challenge_addr
-        .as_deref()
-        .unwrap_or("0.0.0.0:80")
-        .parse()
-        .map_err(|e| invalid_args(format!("--acme-challenge-addr: {e}")))?;
+    let challenge = addrs_or_default(
+        "--acme-challenge-addr",
+        &args.acme_challenge_addr,
+        "0.0.0.0:80",
+    )?;
 
     let tls = match (&args.tls_cert, &args.tls_key, &args.acme_directory) {
         (Some(cert), Some(key), None) => BootstrapTls::Operator {
@@ -1141,10 +1221,12 @@ fn resolve_serve(args: &ServeArgs) -> Result<ResolvedServe, CliError> {
 #[cfg(feature = "rtc-bootstrap")]
 struct ResolvedServe {
     bind: std::net::SocketAddr,
-    listen: std::net::SocketAddr,
+    /// Every HTTPS listener, the primary first. Never empty.
+    listen: Vec<std::net::SocketAddr>,
     /// `None` when only `--issuer-identity` names it (read at start).
     issuer: Option<net_sdk::identity::EntityId>,
-    challenge: std::net::SocketAddr,
+    /// Every HTTP-01 challenge listener, the primary first. Never empty.
+    challenge: Vec<std::net::SocketAddr>,
     tls: net_sdk::rtc_bootstrap::BootstrapTls,
     rtc: net::adapter::net::rtc::RtcConfig,
 }
@@ -1155,8 +1237,19 @@ struct ServeInspection {
     #[serde(flatten)]
     target: crate::target::TargetInspection,
     listen: std::net::SocketAddr,
+    /// Listeners beyond `listen` (a dual-stack anchor's IPv6 one).
+    /// Absent when there are none, so a single-listener anchor's
+    /// inspection is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    listen_additional: Vec<std::net::SocketAddr>,
     rtc_bind: Option<std::net::SocketAddr>,
     rtc_public_addr: Option<std::net::SocketAddr>,
+    /// The dual-stack anchor's IPv6 RTC socket. Absent without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtc_bind_v6: Option<std::net::SocketAddr>,
+    /// Its public override. Absent without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtc_public_addr_v6: Option<std::net::SocketAddr>,
     rtc_stun_bind: Option<std::net::SocketAddr>,
     rtc_stun_public_addr: Option<std::net::SocketAddr>,
     tls: &'static str,
@@ -1164,6 +1257,10 @@ struct ServeInspection {
     tls_key: Option<PathBuf>,
     acme_cache: Option<PathBuf>,
     acme_challenge_bind: Option<std::net::SocketAddr>,
+    /// Challenge listeners beyond `acme_challenge_bind`. Absent when
+    /// there are none, or without ACME.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    acme_challenge_bind_additional: Vec<std::net::SocketAddr>,
     /// Absent when only `--issuer-identity` names the issuer: inspection
     /// reads no secret files.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1188,8 +1285,8 @@ async fn run_serve(
         );
         for (name, explicit) in [
             ("bind", args.bind.is_some()),
-            ("listen", args.listen.is_some()),
-            ("rtc_bind", args.rtc_bind.is_some()),
+            ("listen", !args.listen.is_empty()),
+            ("rtc_bind", !args.rtc_bind.is_empty()),
         ] {
             target.provenance(name, if explicit { "flag" } else { "default" });
         }
@@ -1198,7 +1295,7 @@ async fn run_serve(
         target.provenance("tls", "flag");
         target.provenance(
             "rtc_public_addr",
-            if args.rtc_public_addr.is_some() {
+            if !args.rtc_public_addr.is_empty() {
                 "flag"
             } else {
                 "runtime"
@@ -1223,7 +1320,7 @@ async fn run_serve(
         };
         for (name, explicit) in [
             ("acme_cache", args.acme_cache.is_some()),
-            ("acme_challenge_bind", args.acme_challenge_addr.is_some()),
+            ("acme_challenge_bind", !args.acme_challenge_addr.is_empty()),
         ] {
             target.provenance(
                 name,
@@ -1240,9 +1337,12 @@ async fn run_serve(
             OutputFormat::resolve_oneshot(output),
             &ServeInspection {
                 target,
-                listen: resolved.listen,
+                listen: resolved.listen[0],
+                listen_additional: resolved.listen[1..].to_vec(),
                 rtc_bind: resolved.rtc.bind_addr,
                 rtc_public_addr: resolved.rtc.public_addr,
+                rtc_bind_v6: resolved.rtc.bind_addr_v6,
+                rtc_public_addr_v6: resolved.rtc.public_addr_v6,
                 rtc_stun_bind: resolved.rtc.stun_addr,
                 rtc_stun_public_addr: resolved.rtc.stun_public_addr,
                 tls,
@@ -1250,9 +1350,14 @@ async fn run_serve(
                 tls_key,
                 acme_cache,
                 acme_challenge_bind: if tls == "acme" {
-                    Some(resolved.challenge)
+                    Some(resolved.challenge[0])
                 } else {
                     None
+                },
+                acme_challenge_bind_additional: if tls == "acme" {
+                    resolved.challenge[1..].to_vec()
+                } else {
+                    Vec::new()
                 },
                 credential_issuer_fingerprint: resolved
                     .issuer
@@ -1305,7 +1410,7 @@ async fn run_serve(
 
     let sdk_psk = Psk::new(psk);
     let mut listener_config = BootstrapConfig::new(
-        resolved.listen,
+        resolved.listen[0],
         sdk_psk.clone(),
         issuer,
         resolved.tls,
@@ -1317,7 +1422,9 @@ async fn run_serve(
     listener_config.allowed_origins = args.allow_origin.clone();
     listener_config.ws_allowed_origins = args.allow_origin.clone();
     listener_config.acme = AcmeState::new();
-    listener_config.acme_challenge_addr = resolved.challenge;
+    listener_config.additional_bind_addrs = resolved.listen[1..].to_vec();
+    listener_config.acme_challenge_addr = resolved.challenge[0];
+    listener_config.additional_acme_challenge_addrs = resolved.challenge[1..].to_vec();
     if let Some(limit) = args.offers_per_minute {
         listener_config.offers_per_ip_per_minute = limit;
     }
@@ -1399,6 +1506,11 @@ async fn run_serve(
                 .collect(),
             credential_endpoint: (!args.game.is_empty())
                 .then(|| format!("{}/credential", args.url.trim_end_matches('/'))),
+            also_listening_on: handle.local_addrs()[1..]
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect(),
+            rtc_addrs: net_sdk::rtc_bootstrap::published_rtc_addrs(mesh.node()),
         },
     )
     .map_err(|e| generic(format!("write anchor serve: {e}")))?;
@@ -1677,8 +1789,14 @@ mod tests {
             noise_pubkey: "ab".to_string(),
             games: vec![],
             credential_endpoint: None,
+            also_listening_on: vec![],
+            rtc_addrs: None,
         };
         let json = serde_json::to_string(&base).expect("serialize");
+        assert!(
+            !json.contains("also_listening_on") && !json.contains("rtc_addrs"),
+            "a single-listener, single-socket anchor reports neither dual-stack key: {json}"
+        );
         assert!(
             !json.contains("games") && !json.contains("credential_endpoint"),
             "an anchor without --game reports neither key: {json}"
@@ -1704,6 +1822,137 @@ mod tests {
         assert_eq!(
             json["rtc_addr"], "203.0.113.7:7101",
             "the two endpoints are reported separately because they ARE separate"
+        );
+    }
+
+    /// The dual-stack flags: an `--rtc-bind` of each family makes the
+    /// second socket, each `--rtc-public-addr` advertises the socket of
+    /// its family, and one bind of either family is the single-socket
+    /// anchor it always was.
+    #[test]
+    fn rtc_binds_of_each_family_make_a_dual_stack_anchor() {
+        let dual = rtc_config_from_args(&serve_args(&[
+            "--rtc-bind",
+            "[::]:7101",
+            "--rtc-bind",
+            "0.0.0.0:7101",
+            "--rtc-public-addr",
+            "[2001:db8::7]:7101",
+            "--rtc-public-addr",
+            "203.0.113.7:7101",
+        ]))
+        .expect("dual-stack flags");
+        assert_eq!(dual.bind_addr, Some("0.0.0.0:7101".parse().unwrap()));
+        assert_eq!(dual.bind_addr_v6, Some("[::]:7101".parse().unwrap()));
+        assert_eq!(dual.public_addr, Some("203.0.113.7:7101".parse().unwrap()));
+        assert_eq!(
+            dual.public_addr_v6,
+            Some("[2001:db8::7]:7101".parse().unwrap()),
+            "each public address advertises the socket of its own family, whatever the \
+             flag order"
+        );
+        assert_eq!(dual.validate(), None);
+
+        let single_v6 = rtc_config_from_args(&serve_args(&[
+            "--rtc-bind",
+            "[::]:7101",
+            "--rtc-public-addr",
+            "[2001:db8::7]:7101",
+        ]))
+        .expect("one IPv6 socket");
+        assert_eq!(
+            (single_v6.bind_addr, single_v6.bind_addr_v6),
+            (Some("[::]:7101".parse().unwrap()), None),
+            "one IPv6 bind is still the primary socket, as before"
+        );
+        assert_eq!(
+            single_v6.public_addr,
+            Some("[2001:db8::7]:7101".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn two_rtc_addresses_of_one_family_are_refused() {
+        for flags in [
+            ["--rtc-bind", "0.0.0.0:7101", "--rtc-bind", "127.0.0.1:7102"],
+            [
+                "--rtc-public-addr",
+                "[2001:db8::1]:1",
+                "--rtc-public-addr",
+                "[2001:db8::2]:1",
+            ],
+        ] {
+            assert!(
+                rtc_config_from_args(&serve_args(&flags)).is_err(),
+                "{flags:?} must be refused: two sockets of one family is ambiguous"
+            );
+        }
+        assert!(
+            rtc_config_from_args(&serve_args(&[
+                "--rtc-bind",
+                "0.0.0.0:7101",
+                "--rtc-public-addr",
+                "203.0.113.7:7101",
+                "--rtc-public-addr",
+                "[2001:db8::7]:7101",
+            ]))
+            .is_err(),
+            "an IPv6 public address with no IPv6 socket is refused"
+        );
+    }
+
+    /// `ServeArgs` that `resolve_serve` accepts: a real issuer key and
+    /// an operator certificate, plus `extra`.
+    fn resolvable_serve_args(extra: &[&str]) -> ServeArgs {
+        let issuer = hex_string(
+            net_sdk::identity::Identity::from_seed([0x61; 32])
+                .entity_id()
+                .as_bytes(),
+        );
+        let mut argv = vec![
+            "--psk-file",
+            "psk.hex",
+            "--url",
+            "https://anchor.example.com",
+            "--credential-issuer",
+            issuer.as_str(),
+            "--allow-origin",
+            "https://app.example.com",
+            "--tls-cert",
+            "c.pem",
+            "--tls-key",
+            "k.pem",
+        ];
+        argv.extend_from_slice(extra);
+        try_serve_args(&argv).expect("serve args parse")
+    }
+
+    #[test]
+    fn listen_and_acme_challenge_addresses_are_repeatable() {
+        let resolved = resolve_serve(&resolvable_serve_args(&[
+            "--listen",
+            "0.0.0.0:443",
+            "--listen",
+            "[::]:443",
+        ]))
+        .expect("resolves");
+        assert_eq!(
+            resolved.listen,
+            vec![
+                "0.0.0.0:443".parse::<std::net::SocketAddr>().unwrap(),
+                "[::]:443".parse().unwrap()
+            ]
+        );
+        assert_eq!(
+            resolved.challenge,
+            vec!["0.0.0.0:80".parse::<std::net::SocketAddr>().unwrap()],
+            "the challenge default is unchanged"
+        );
+        let defaulted = resolve_serve(&resolvable_serve_args(&[])).expect("resolves");
+        assert_eq!(
+            defaulted.listen,
+            vec!["0.0.0.0:8443".parse::<std::net::SocketAddr>().unwrap()],
+            "the listen default is unchanged"
         );
     }
 }

@@ -27920,6 +27920,29 @@ impl MeshNode {
         self.config.rtc.as_ref().and_then(|rtc| rtc.public_addr)
     }
 
+    /// The operator-published public address of the **IPv6** RTC
+    /// socket on a dual-stack anchor — [`Self::rtc_public_addr`]'s
+    /// counterpart, and `None` unless both the socket and its public
+    /// address are configured.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_addr_v6(&self) -> Option<SocketAddr> {
+        let rtc = self.config.rtc.as_ref()?;
+        rtc.bind_addr_v6?;
+        rtc.public_addr_v6
+    }
+
+    /// Every operator-published RTC endpoint, primary first: the
+    /// values `GET /rtc/anchor` reports and a leaf's diagnostic probe
+    /// may aim at. Published only, never a bound address, which is
+    /// what [`Self::rtc_public_addr`] means too.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_addrs(&self) -> Vec<SocketAddr> {
+        self.rtc_public_addr()
+            .into_iter()
+            .chain(self.rtc_public_addr_v6())
+            .collect()
+    }
+
     /// The **separately announced STUN endpoint**, when configured.
     ///
     /// Distinct from [`Self::rtc_public_addr`] on purpose, and this is

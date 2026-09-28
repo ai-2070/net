@@ -399,6 +399,75 @@ async fn the_trickle_socket_refuses_a_foreign_origin_before_upgrading() {
     );
 }
 
+/// `GET /rtc/anchor`'s dual-stack field under its serialization rule.
+/// A single-socket anchor's reply carries **no** `rtc_addrs` key, so
+/// it is unchanged field for field. A dual-stack anchor that
+/// publishes an endpoint per family lists both, primary first. A
+/// bound address is never listed, only published ones, which is what
+/// `rtc_addr` means too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_anchor_endpoint_lists_every_published_family_only_when_dual_stack() {
+    async fn anchor_json(rtc: RtcConfig) -> serde_json::Value {
+        let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), PSK);
+        cfg.rtc = Some(rtc);
+        let node = Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        );
+        let response = bootstrap_router(Arc::clone(&node), &config(PSK))
+            .oneshot(
+                Request::builder()
+                    .uri("/rtc/anchor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+    let v4: std::net::SocketAddr = "203.0.113.7:7101".parse().unwrap();
+    let v6: std::net::SocketAddr = "[2001:db8::7]:7101".parse().unwrap();
+
+    let mut single = rtc_config();
+    single.public_addr = Some(v4);
+    let json = anchor_json(single).await;
+    assert!(
+        json.get("rtc_addrs").is_none(),
+        "a single-socket anchor's reply has no rtc_addrs key: {json}"
+    );
+    assert_eq!(json["rtc_addr"], v4.to_string());
+
+    let mut dual = rtc_config()
+        .with_bind_addr_v6("[::1]:0".parse().unwrap())
+        .with_public_addr_v6(v6);
+    dual.public_addr = Some(v4);
+    let json = anchor_json(dual).await;
+    assert_eq!(
+        json["rtc_addrs"],
+        serde_json::json!([v4.to_string(), v6.to_string()]),
+        "every published family, primary first"
+    );
+    assert_eq!(
+        json["rtc_addr"],
+        v4.to_string(),
+        "rtc_addr is still the primary"
+    );
+
+    // An IPv6 socket with no published address adds nothing to the
+    // published list: a bound address is never reported.
+    let mut unpublished = rtc_config().with_bind_addr_v6("[::1]:0".parse().unwrap());
+    unpublished.public_addr = Some(v4);
+    let json = anchor_json(unpublished).await;
+    assert!(
+        json.get("rtc_addrs").is_none(),
+        "one published endpoint is not a list: {json}"
+    );
+}
+
 /// `GET /rtc/anchor` publishes the LIVE announcement fields so a
 /// browser can compare them with the credential it holds. The
 /// comparison is the point: a browser that took its pinned key from
@@ -583,6 +652,150 @@ fn issue_localhost_certificate() -> (rustls::pki_types::CertificateDer<'static>,
         chain_pem,
         leaf_key.serialize_pem(),
     )
+}
+
+/// **A dual-stack anchor's two listeners are one listener** (dual-stack
+/// plan, slice 2). It binds an IPv4 and an IPv6 address, and both
+/// serve the SAME router state.
+///
+/// That is a functional requirement, not tidiness. A browser's
+/// `POST /rtc/offer` and its trickle WebSocket are separate
+/// connections that Happy Eyeballs may place on different families,
+/// so an attempt minted through one listener must exist for the
+/// other. Every per-source and per-game budget is also only one
+/// budget if the state is one.
+///
+/// The observable is the dialog counter in that state. An offer
+/// accepted through the IPv6 listener continues the numbering of one
+/// accepted through the IPv4 listener. A router per listener would
+/// hand both a first dialog.
+///
+/// Inverse: build a router per listener in `serve_bootstrap` and the
+/// second offer's dialog restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_dual_stack_listener_serves_both_families_from_one_state() {
+    let anchor = anchor().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (ca_der, cert_pem, key_pem) = issue_localhost_certificate();
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert_pem).unwrap();
+    std::fs::write(&key_path, key_pem).unwrap();
+
+    let mut cfg = config(PSK);
+    cfg.tls = BootstrapTls::Operator {
+        cert_pem: cert_path,
+        key_pem: key_path,
+    };
+    cfg.additional_bind_addrs = vec!["[::1]:0".parse().expect("addr")];
+    let handle = serve_bootstrap(Arc::clone(&anchor), cfg)
+        .await
+        .expect("both listeners bind");
+    let addrs = handle.local_addrs().to_vec();
+    assert_eq!(addrs.len(), 2, "one bound address per configured listener");
+    assert!(addrs[0].is_ipv4() && addrs[1].is_ipv6(), "{addrs:?}");
+    assert_eq!(handle.local_addr(), addrs[0], "the primary is listed first");
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca_der).unwrap();
+    let client: Arc<rustls::ClientConfig> = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth()
+    .into();
+
+    let credential = credential_for(PSK, Duration::from_secs(600));
+    let mut dialogs = Vec::new();
+    for addr in &addrs {
+        // A fresh real offer per request, from its own offerer, so the
+        // per-sender dialog budget is not what is being measured.
+        let offerer = offerer().await;
+        let sdp = offerer
+            .rtc_driver()
+            .expect("driver")
+            .create_offer()
+            .await
+            .expect("offer")
+            .1;
+        let body = serde_json::json!({
+            "credential": credential.encode(),
+            "node_id": format!("{:#x}", offerer.node_id()),
+            "sdp": sdp,
+        })
+        .to_string();
+        let response = https_request_to_close(
+            *addr,
+            "localhost",
+            Arc::clone(&client),
+            "POST",
+            "/rtc/offer",
+            &format!("Content-Type: application/json\r\nOrigin: {ORIGIN}\r\n"),
+            &body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("offer over {addr}: {e}"));
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "offer over {addr} was answered: {}",
+            &response[..response.len().min(200)]
+        );
+        let json = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("a body");
+        let answer: OfferResponse = serde_json::from_str(json).expect("an offer response");
+        dialogs.push(answer.dialog);
+    }
+    assert!(
+        dialogs[1] > dialogs[0],
+        "the IPv6 listener continued the IPv4 listener's dialog numbering ({dialogs:?}): \
+         one state, not one per listener"
+    );
+
+    handle.shutdown().await;
+}
+
+/// [`https_request`], asking the server to close the connection and
+/// reading to EOF, so a body that arrives in a later TLS record than
+/// its headers is still read.
+async fn https_request_to_close(
+    addr: std::net::SocketAddr,
+    server_name: &str,
+    config: Arc<rustls::ClientConfig>,
+    method: &str,
+    path: &str,
+    extra_headers: &str,
+    body: &str,
+) -> Result<String, String> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| e.to_string())?;
+    let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+        .map_err(|e| e.to_string())?;
+    let mut tls = connector
+        .connect(name, stream)
+        .await
+        .map_err(|e| e.to_string())?;
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {server_name}\r\nConnection: close\r\n\
+         {extra_headers}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    tls.write_all(request.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut buf))
+        .await
+        .map_err(|_| "timed out reading the response".to_string())?
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
 /// A minimal verifying HTTPS GET — enough to prove the TLS layer

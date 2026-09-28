@@ -3375,6 +3375,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snow",
+ "socket2",
  "str0m",
  "tempfile",
  "thiserror 2.0.21",
