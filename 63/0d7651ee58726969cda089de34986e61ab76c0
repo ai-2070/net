@@ -1,0 +1,22 @@
+.github/workflows/natsim.yml
+  s_d8b00bedd146e9::t_9813b9531bab92 148-149
+  s_d8b00bedd146e9::t_1c6594f06d97aa 135-139
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_c5afe41515a7cc 6376
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "630d7651ee58726969cda089de34986e61ab76c0",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
