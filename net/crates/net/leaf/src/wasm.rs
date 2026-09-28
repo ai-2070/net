@@ -1864,11 +1864,14 @@ impl LeafNode {
         // candidate, which is the deliberate misconfiguration
         // fail-fast validation exists to catch. Same check, same
         // equality, now over the list actually handed to the browser.
-        crate::bootstrap::check_ice_servers_against_peer(
+        // **Every** endpoint the anchor published: a dual-stack anchor
+        // has one per family, and a STUN entry naming the IPv6 one
+        // eats that family's checks as surely as one naming the IPv4.
+        crate::bootstrap::check_ice_servers_against_peers(
             ice_servers
                 .iter()
                 .flat_map(|server| server.urls.iter().map(String::as_str)),
-            anchor_rtc_addr.as_deref(),
+            &control.anchor_rtc_addrs(),
         )
         .map_err(js)?;
 

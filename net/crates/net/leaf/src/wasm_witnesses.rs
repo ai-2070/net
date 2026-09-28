@@ -107,6 +107,7 @@ fn pair() -> Pair {
         node_id: ANCHOR,
         noise_pubkey: anchor_noise,
         rtc_addr: None,
+        rtc_addrs: Vec::new(),
         stun_addr: None,
     };
 

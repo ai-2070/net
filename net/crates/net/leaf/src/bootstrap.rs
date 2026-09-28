@@ -308,6 +308,14 @@ pub struct AnchorInfo {
     /// **not** an `iceServers` entry for a connection with this
     /// anchor, which is what [`Self::stun_addr`] is for.
     pub rtc_addr: Option<String>,
+    /// **Every** published RTC endpoint, primary first: one per family
+    /// on a dual-stack anchor (`ANCHOR_DUAL_STACK_PLAN.md`).
+    ///
+    /// Resolved once, here, by the rule `GET /rtc/anchor` documents:
+    /// its `rtc_addrs` when present, else `[rtc_addr]`, else empty. So
+    /// an anchor that predates the field reads exactly as before, and
+    /// every consumer sees one list rather than re-deriving it.
+    pub rtc_addrs: Vec<String>,
     /// The **separately announced** STUN endpoint, when the anchor
     /// announced one: a second, distinct UDP endpoint that answers
     /// STUN for connections pairing with this anchor.
@@ -336,13 +344,30 @@ impl AnchorInfo {
         let noise_pubkey: [u8; 32] = crate::identity::unhex(noise_pubkey)?
             .try_into()
             .map_err(|_| malformed("noise_pubkey is not 32 bytes"))?;
+        let rtc_addr = document
+            .get("rtc_addr")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let rtc_addrs = match document
+            .get("rtc_addrs")
+            .and_then(serde_json::Value::as_array)
+        {
+            Some(list) => list
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| malformed("anchor info's rtc_addrs holds a non-string"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => rtc_addr.iter().cloned().collect(),
+        };
         Ok(Self {
             node_id,
             noise_pubkey,
-            rtc_addr: document
-                .get("rtc_addr")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
+            rtc_addr,
+            rtc_addrs,
             stun_addr: document
                 .get("stun_addr")
                 .and_then(serde_json::Value::as_str)
@@ -566,6 +591,23 @@ pub fn check_ice_servers_against_peer<'a>(
                 peer_rtc_addr: peer_rtc_addr.to_string(),
             });
         }
+    }
+    Ok(())
+}
+
+/// [`check_ice_servers_against_peer`] against **every** RTC endpoint
+/// of the peer: a dual-stack anchor has one per family, and a STUN
+/// entry naming either eats that family's connectivity checks.
+///
+/// An empty list has nothing to compare, exactly as `None` there.
+/// The refusal names the endpoint that matched.
+pub fn check_ice_servers_against_peers<'a>(
+    urls: impl IntoIterator<Item = &'a str>,
+    peer_rtc_addrs: &[String],
+) -> Result<()> {
+    let urls: Vec<&str> = urls.into_iter().collect();
+    for peer in peer_rtc_addrs {
+        check_ice_servers_against_peer(urls.iter().copied(), Some(peer.as_str()))?;
     }
     Ok(())
 }
@@ -938,6 +980,7 @@ mod tests {
             node_id: 1,
             noise_pubkey: [0xA1u8; 32],
             rtc_addr: None,
+            rtc_addrs: Vec::new(),
             stun_addr: None,
         };
         matching
@@ -948,6 +991,7 @@ mod tests {
             node_id: 1,
             noise_pubkey: [0xBEu8; 32],
             rtc_addr: None,
+            rtc_addrs: Vec::new(),
             stun_addr: None,
         };
         let err = impostor
@@ -1232,6 +1276,79 @@ mod tests {
         // rather than a promise.
         check_ice_servers_against_peer(["stun:alias.example:4433"], peer)
             .expect("an unresolved alias is outside what equality can see");
+    }
+
+    /// `rtc_addrs` resolves by the documented rule: the list when the
+    /// anchor sends one, else `[rtc_addr]`, else empty. An anchor
+    /// that predates the field reads exactly as before.
+    #[test]
+    fn anchor_info_resolves_every_published_rtc_endpoint() {
+        let base = r#""node_id":"0x1","noise_pubkey":"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1""#;
+        let dual = AnchorInfo::from_json(&format!(
+            r#"{{{base},"rtc_addr":"203.0.113.7:7101","rtc_addrs":["203.0.113.7:7101","[2001:db8::7]:7101"]}}"#
+        ))
+        .expect("parses");
+        assert_eq!(dual.rtc_addr.as_deref(), Some("203.0.113.7:7101"));
+        assert_eq!(dual.rtc_addrs, ["203.0.113.7:7101", "[2001:db8::7]:7101"]);
+
+        let single = AnchorInfo::from_json(&format!(r#"{{{base},"rtc_addr":"203.0.113.7:7101"}}"#))
+            .expect("parses");
+        assert_eq!(
+            single.rtc_addrs,
+            ["203.0.113.7:7101"],
+            "no list: the one rtc_addr"
+        );
+
+        let none = AnchorInfo::from_json(&format!("{{{base}}}")).expect("parses");
+        assert!(
+            none.rtc_addrs.is_empty(),
+            "nothing published, nothing listed"
+        );
+
+        assert!(
+            AnchorInfo::from_json(&format!(r#"{{{base},"rtc_addrs":[7101]}}"#)).is_err(),
+            "a list holding a non-string is malformed, not silently shortened"
+        );
+    }
+
+    /// **The collision guard covers every family.** A dual-stack
+    /// anchor has an RTC endpoint per family, and a STUN entry naming
+    /// the IPv6 one eats that family's connectivity checks exactly as
+    /// one naming the IPv4 one does, including under another legal
+    /// spelling. Distinct endpoints, and an anchor with no published
+    /// endpoint, are still accepted.
+    #[test]
+    fn a_stun_entry_naming_either_of_a_dual_stack_anchors_endpoints_is_refused() {
+        let peers = vec![
+            "203.0.113.7:7101".to_string(),
+            "[2001:db8::7]:7101".to_string(),
+        ];
+        let err = check_ice_servers_against_peers(["stun:[2001:db8::7]:7101"], &peers)
+            .expect_err("the IPv6 endpoint is this connection's peer too");
+        assert_eq!(
+            err,
+            LeafError::IceServerConflictsWithPeer {
+                entry: "stun:[2001:db8::7]:7101".into(),
+                peer_rtc_addr: "[2001:db8::7]:7101".into(),
+            },
+            "the refusal names the endpoint that matched"
+        );
+        assert!(
+            check_ice_servers_against_peers(
+                ["stun:[2001:0db8:0000:0000:0000:0000:0000:0007]:7101"],
+                &peers
+            )
+            .is_err(),
+            "an equivalent spelling of the IPv6 endpoint is the same endpoint"
+        );
+        assert!(check_ice_servers_against_peers(["stun:203.0.113.7:7101"], &peers).is_err());
+        check_ice_servers_against_peers(
+            ["stun:[2001:db8::7]:3479", "stun:203.0.113.7:3479"],
+            &peers,
+        )
+        .expect("the anchor's STUN ports are different endpoints");
+        check_ice_servers_against_peers(["stun:[2001:db8::7]:7101"], &[])
+            .expect("no published endpoint, nothing to collide with");
     }
 
     /// **S6-07.5.** Two legal spellings of ONE IPv6 endpoint are one

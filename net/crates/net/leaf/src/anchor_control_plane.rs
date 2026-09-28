@@ -113,6 +113,9 @@ struct State {
     anchor_node: NodeId,
     /// The anchor's published RTC socket, when it has one.
     anchor_rtc_addr: Option<String>,
+    /// Every RTC endpoint the anchor published, primary first: one
+    /// per family on a dual-stack anchor.
+    anchor_rtc_addrs: Vec<String>,
     /// The anchor's **separately announced** STUN endpoint, when it
     /// announced one. A different socket from `anchor_rtc_addr`.
     anchor_stun_addr: Option<String>,
@@ -234,6 +237,7 @@ impl AnchorControlPlane {
                 self_node,
                 anchor_node: info.node_id,
                 anchor_rtc_addr: info.rtc_addr.clone(),
+                anchor_rtc_addrs: info.rtc_addrs.clone(),
                 anchor_stun_addr: info.stun_addr.clone(),
                 dialog: Cell::new(None),
                 trickle: RefCell::new(None),
@@ -312,6 +316,14 @@ impl AnchorControlPlane {
     #[inline]
     pub fn anchor_rtc_addr(&self) -> Option<String> {
         self.state.anchor_rtc_addr.clone()
+    }
+
+    /// Every RTC endpoint the anchor published, primary first — one per
+    /// family on a dual-stack anchor, `[rtc_addr]` on any other, empty
+    /// when it published none. What the STUN collision guard checks
+    /// against.
+    pub fn anchor_rtc_addrs(&self) -> Vec<String> {
+        self.state.anchor_rtc_addrs.clone()
     }
 
     /// The anchor's separately announced STUN endpoint, when it

@@ -294,6 +294,65 @@ two families** with no new code. Slice 4 witnesses it rather than assuming it.
 
 ### Slice 2: the CLI, the listener and the limiter
 
+**Done 2026-09-28**, in three commits on `anchor-dual-stack`. What landed:
+
+- **2a, the limiter.**
+  - /64 keying, with IPv4-mapped sources unmapped first. Masking
+    `::ffff:a.b.c.d` to /64 would have put every IPv4 client on a dual-stack
+    listener in one bucket. This was found while writing it; the plan did not
+    name it.
+  - A 65,536-bucket bound and reclamation once per window. When full,
+    reclamation runs at most once a second, so a flood of new sources cannot
+    buy an O(n) sweep per request.
+  - Refuse-when-full.
+  - Two new `RtcStats` counters, reported by `anchor stats` as optional
+    fields.
+- **2b, the listeners.**
+  - `BootstrapConfig::additional_bind_addrs`, served from one router.
+  - `IPV6_V6ONLY` on IPv6 listeners whenever there is more than one.
+  - `additional_acme_challenge_addrs`. This is new scope: a directory
+    validates over IPv6 once the name has `AAAA`, so a v4-only challenge
+    listener would fail issuance and renewal.
+- **2c, the CLI and published addresses.**
+  - Repeatable `--rtc-bind`/`--rtc-public-addr` (one per family),
+    `--listen` and `--acme-challenge-addr`.
+  - `rtc_addrs` on `GET /rtc/anchor` and in the serve report, under the
+    serialization rule.
+  - **Refinement:** `rtc_addrs` lists **published** endpoints only, never a
+    bound one, because that is what `rtc_addr` already meant (the probe's
+    only legitimate target).
+- **2d, the leaf.** `AnchorInfo::rtc_addrs`, resolved once by the documented
+  rule, and `check_ice_servers_against_peers` over every endpoint at the
+  anchor-connect site.
+
+**Evidence:**
+
+- SDK:
+  - 5 limiter unit tests, all green;
+  - `rtc_bootstrap_listener`: 32 tests, including
+    `a_dual_stack_listener_serves_both_families_from_one_state` and
+    `the_anchor_endpoint_lists_every_published_family_only_when_dual_stack`.
+- CLI: 3 new unit tests (9 in `anchor::`); `anchor_stats_live` and
+  `remote_inspection`, 10 tests.
+- Leaf: 2 new tests; 285 lib tests; `wasm32` check and clippy clean.
+
+**Mutations run on the limiter:**
+
+- Dropping the IPv4-mapped unmapping fails the mapped-source test.
+- Disabling reclamation fails the expiry and table-full tests.
+
+**Not witnessed:**
+
+- The shared-state listener test was not mutation-run. It rests on each
+  router state starting its dialog counter at 1.
+- The extra ACME challenge listeners have no test. ACME is exercised only by
+  the Pebble CI job, on one listener.
+
+**Known limit, by design (Decision 2).** The leaf's own anchor is checked
+against every published endpoint. A *different* anchor reached later as a
+peer (`ice_servers_for`) is checked against its signed announcement, which
+carries the primary `rtc_addr` only.
+
 - Repeatable, per-family `--rtc-bind` / `--rtc-public-addr`, and repeatable
   `--listen` sharing one limiter state.
 - `AnchorInfo.rtc_addrs` and `ServeReport.rtc_addrs`, under the
