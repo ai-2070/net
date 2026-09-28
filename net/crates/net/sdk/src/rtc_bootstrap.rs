@@ -52,7 +52,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -80,6 +80,20 @@ pub const DEFAULT_OFFERS_PER_IP_PER_MINUTE: u32 = 10;
 
 /// Window the rate limit counts over.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Most source buckets one rate limiter retains.
+///
+/// A bound on memory, and so also on how many distinct sources can be
+/// held to a limit at once. Generous on purpose: past it a NEW source
+/// is refused (never an existing restriction erased), which is only
+/// acceptable if honest traffic essentially never reaches it.
+const RATE_MAX_BUCKETS: usize = 65_536;
+
+/// Shortest gap between two sweeps of a FULL table. Buckets expire
+/// with time, not with requests, so sweeping on every refused request
+/// would turn a flood of new sources into O(buckets) work per request
+/// without reclaiming anything sooner than this.
+const RATE_FULL_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Cap on the offer body. An SDP is a few kilobytes; the credential
 /// is bounded by its own format.
@@ -696,35 +710,144 @@ struct Issuance {
     rate: RateLimiter,
 }
 
-/// Fixed-window per-source-IP counter. Deliberately not a token
+/// Fixed-window per-source counter. Deliberately not a token
 /// bucket: the requirement is a fast, typed refusal, and a window is
 /// the cheapest thing that cannot be walked past by pacing.
+///
+/// **Bounded** (`ANCHOR_DUAL_STACK_PLAN.md`, defect 2). It used to
+/// insert every source it ever saw and never remove one, so its memory
+/// grew with the number of distinct addresses, and IPv6 makes that
+/// number effectively unlimited. Now:
+///
+/// - a source is charged to a bucket by [`rate_key`]: an IPv6 client
+///   by its /64, since one subscriber can rotate through a whole /64;
+/// - expired buckets are reclaimed, once per window and, when the
+///   table is full, at most once per [`RATE_FULL_SWEEP_INTERVAL`];
+/// - at [`RATE_MAX_BUCKETS`] live buckets a **new** source is refused
+///   ([`RateVerdict::TableFull`]). An existing restriction is never
+///   evicted to make room: eviction is exactly how a flood would
+///   erase a limit.
+///
+/// What /64 does not buy: a client controlling many prefixes still
+/// gets a bucket per prefix. The per-game ceiling (`--game ID:N`)
+/// caps total issuance regardless.
 #[derive(Debug)]
 struct RateLimiter {
     per_minute: u32,
-    windows: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    max_buckets: usize,
+    table: Mutex<RateTable>,
+}
+
+#[derive(Debug, Default)]
+struct RateTable {
+    windows: HashMap<IpAddr, (Instant, u32)>,
+    last_sweep: Option<Instant>,
+}
+
+/// What one request's rate check decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateVerdict {
+    /// Within its source's budget, and charged to it.
+    Allowed,
+    /// Its source spent this window's budget.
+    Limited,
+    /// Its source is new and the table already holds its bound of
+    /// live buckets. Counted apart from [`Self::Limited`]: this one
+    /// says the anchor is under a many-source load, not that one
+    /// client is too eager.
+    TableFull,
+}
+
+/// The bucket a source address is charged to.
+///
+/// IPv4: the address itself. IPv6: its /64 prefix. A subscriber
+/// normally holds a whole /64 and can rotate through it, so a
+/// per-address key would give each request a fresh budget.
+///
+/// An **IPv4-mapped** IPv6 address (`::ffff:a.b.c.d`, which is how an
+/// IPv4 client appears on a dual-stack listener) is unmapped FIRST.
+/// Masked to /64 as it stands, it would charge every IPv4 client on
+/// the internet to one shared bucket.
+fn rate_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
+        },
+    }
 }
 
 impl RateLimiter {
     fn new(per_minute: u32) -> Self {
+        Self::with_max_buckets(per_minute, RATE_MAX_BUCKETS)
+    }
+
+    fn with_max_buckets(per_minute: u32, max_buckets: usize) -> Self {
         Self {
             per_minute,
-            windows: Mutex::new(HashMap::new()),
+            max_buckets,
+            table: Mutex::new(RateTable::default()),
         }
     }
 
-    /// `true` when this request is allowed.
-    fn allow(&self, ip: IpAddr, now: Instant) -> bool {
-        let mut windows = self.windows.lock();
-        let entry = windows.entry(ip).or_insert((now, 0));
-        if now.duration_since(entry.0) >= RATE_WINDOW {
+    /// Check one request from `ip` at `now`, charging it when allowed.
+    fn check(&self, ip: IpAddr, now: Instant) -> RateVerdict {
+        let key = rate_key(ip);
+        let mut table = self.table.lock();
+        let since_sweep = table.last_sweep.map(|t| now.saturating_duration_since(t));
+        let is_new = !table.windows.contains_key(&key);
+        let full = table.windows.len() >= self.max_buckets;
+        let sweep_due = match since_sweep {
+            None => true,
+            Some(gap) => gap >= RATE_WINDOW || (full && is_new && gap >= RATE_FULL_SWEEP_INTERVAL),
+        };
+        if sweep_due {
+            table
+                .windows
+                .retain(|_, (start, _)| now.saturating_duration_since(*start) < RATE_WINDOW);
+            table.last_sweep = Some(now);
+        }
+        if is_new && table.windows.len() >= self.max_buckets {
+            return RateVerdict::TableFull;
+        }
+        let entry = table.windows.entry(key).or_insert((now, 0));
+        if now.saturating_duration_since(entry.0) >= RATE_WINDOW {
             *entry = (now, 0);
         }
         if entry.1 >= self.per_minute {
-            return false;
+            return RateVerdict::Limited;
         }
         entry.1 += 1;
-        true
+        RateVerdict::Allowed
+    }
+
+    /// [`Self::check`], counting every refusal on the anchor's RTC
+    /// stats under its own cause. `true` when the request may
+    /// proceed.
+    fn admit(&self, ip: IpAddr, now: Instant, node: &MeshNode) -> bool {
+        match self.check(ip, now) {
+            RateVerdict::Allowed => true,
+            RateVerdict::Limited => {
+                node.rtc_stats().note_bootstrap_rate_limited();
+                false
+            }
+            RateVerdict::TableFull => {
+                node.rtc_stats().note_bootstrap_rate_table_full();
+                tracing::warn!(
+                    source = %ip,
+                    buckets = self.max_buckets,
+                    "bootstrap rate limiter is full of live sources; refusing a new one"
+                );
+                false
+            }
+        }
+    }
+
+    /// Retained buckets, for witnesses.
+    #[cfg(test)]
+    fn buckets(&self) -> usize {
+        self.table.lock().windows.len()
     }
 }
 
@@ -926,7 +1049,10 @@ async fn post_credential(
             "expected {\"game\": \"<id>\"}",
         );
     };
-    if !issuance.rate.allow(remote.ip(), Instant::now()) {
+    if !issuance
+        .rate
+        .admit(remote.ip(), Instant::now(), &state.node)
+    {
         return refuse(
             BootstrapRefusal::RateLimited,
             "too many credential requests from this address",
@@ -1377,7 +1503,7 @@ async fn post_offer(
     };
     // Rate first: it is the cheapest check, and the one an attacker
     // is trying to spend.
-    if !state.rate.allow(remote.ip(), Instant::now()) {
+    if !state.rate.admit(remote.ip(), Instant::now(), &state.node) {
         return refuse(
             BootstrapRefusal::RateLimited,
             "too many bootstrap offers from this address",
@@ -1655,22 +1781,147 @@ fn hex_of(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn the_rate_limiter_refuses_past_the_ceiling_and_recovers_next_window() {
         let limiter = RateLimiter::new(3);
-        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let source = ip("203.0.113.7");
         let t0 = Instant::now();
-        assert!(limiter.allow(ip, t0));
-        assert!(limiter.allow(ip, t0));
-        assert!(limiter.allow(ip, t0));
-        assert!(
-            !limiter.allow(ip, t0),
+        for _ in 0..3 {
+            assert_eq!(limiter.check(source, t0), RateVerdict::Allowed);
+        }
+        assert_eq!(
+            limiter.check(source, t0),
+            RateVerdict::Limited,
             "the fourth offer in a window is refused"
         );
         // Another address is unaffected — the bound is per source.
-        assert!(limiter.allow("198.51.100.1".parse().unwrap(), t0));
+        assert_eq!(limiter.check(ip("198.51.100.1"), t0), RateVerdict::Allowed);
         // …and the window rolls.
-        assert!(limiter.allow(ip, t0 + RATE_WINDOW + Duration::from_millis(1)));
+        assert_eq!(
+            limiter.check(source, t0 + RATE_WINDOW + Duration::from_millis(1)),
+            RateVerdict::Allowed
+        );
+    }
+
+    /// An IPv6 subscriber holds a whole /64 and can rotate through it:
+    /// every address in one /64 draws from ONE budget, a different /64
+    /// has its own, and IPv4 is charged per address as before.
+    #[test]
+    fn ipv6_sources_share_one_budget_per_64() {
+        let limiter = RateLimiter::new(2);
+        let t0 = Instant::now();
+        assert_eq!(
+            limiter.check(ip("2001:db8:1:2::1"), t0),
+            RateVerdict::Allowed
+        );
+        assert_eq!(
+            limiter.check(ip("2001:db8:1:2:ffff:ffff:ffff:ffff"), t0),
+            RateVerdict::Allowed
+        );
+        assert_eq!(
+            limiter.check(ip("2001:db8:1:2:dead:beef::9"), t0),
+            RateVerdict::Limited,
+            "a third address in the same /64 is the same source"
+        );
+        assert_eq!(
+            limiter.check(ip("2001:db8:1:3::1"), t0),
+            RateVerdict::Allowed,
+            "the neighbouring /64 is a different source"
+        );
+        assert_eq!(limiter.check(ip("192.0.2.1"), t0), RateVerdict::Allowed);
+        assert_eq!(limiter.check(ip("192.0.2.2"), t0), RateVerdict::Allowed);
+        assert_eq!(
+            limiter.buckets(),
+            4,
+            "one bucket per /64 and one per IPv4 address"
+        );
+    }
+
+    /// **An IPv4 client on a dual-stack listener arrives IPv4-mapped**
+    /// (`::ffff:a.b.c.d`). Masked to /64 as it stands, every IPv4
+    /// client on the internet would share one bucket; it is charged
+    /// as the IPv4 address it is instead, the same bucket a plain
+    /// IPv4 listener would have used.
+    #[test]
+    fn an_ipv4_mapped_source_is_charged_as_its_ipv4_address() {
+        let limiter = RateLimiter::new(1);
+        let t0 = Instant::now();
+        assert_eq!(
+            limiter.check(ip("::ffff:192.0.2.1"), t0),
+            RateVerdict::Allowed
+        );
+        assert_eq!(
+            limiter.check(ip("::ffff:192.0.2.2"), t0),
+            RateVerdict::Allowed,
+            "two mapped IPv4 clients are two sources, not one /64"
+        );
+        assert_eq!(
+            limiter.check(ip("192.0.2.1"), t0),
+            RateVerdict::Limited,
+            "the mapped and plain spellings of one IPv4 address are one source"
+        );
+    }
+
+    /// Expired buckets are reclaimed: the table does not keep every
+    /// source it ever saw.
+    #[test]
+    fn expired_buckets_are_reclaimed() {
+        let limiter = RateLimiter::new(5);
+        let t0 = Instant::now();
+        for i in 0..50u8 {
+            let _ = limiter.check(IpAddr::from([198, 51, 100, i]), t0);
+        }
+        assert_eq!(limiter.buckets(), 50);
+        let later = t0 + RATE_WINDOW + Duration::from_secs(1);
+        let _ = limiter.check(ip("203.0.113.1"), later);
+        assert_eq!(
+            limiter.buckets(),
+            1,
+            "every bucket from the previous window was reclaimed"
+        );
+    }
+
+    /// At the bound, with every bucket live, a NEW source is refused as
+    /// `TableFull`, and **every existing restriction still holds**: a
+    /// flood of new sources cannot evict a limited one to reset it.
+    /// Once buckets expire, new sources are admitted again.
+    #[test]
+    fn a_full_table_refuses_new_sources_and_keeps_every_restriction() {
+        let limiter = RateLimiter::with_max_buckets(1, 4);
+        let t0 = Instant::now();
+        let limited = ip("203.0.113.9");
+        assert_eq!(limiter.check(limited, t0), RateVerdict::Allowed);
+        assert_eq!(limiter.check(limited, t0), RateVerdict::Limited);
+        for i in 1..=3u8 {
+            assert_eq!(
+                limiter.check(IpAddr::from([198, 51, 100, i]), t0),
+                RateVerdict::Allowed
+            );
+        }
+        assert_eq!(limiter.buckets(), 4);
+        for i in 10..40u8 {
+            let t = t0 + Duration::from_secs(u64::from(i));
+            assert_eq!(
+                limiter.check(IpAddr::from([192, 0, 2, i]), t),
+                RateVerdict::TableFull,
+                "a new source past the bound is refused, not admitted by eviction"
+            );
+            assert_eq!(
+                limiter.check(limited, t),
+                RateVerdict::Limited,
+                "the flood did not erase the existing restriction"
+            );
+        }
+        let later = t0 + RATE_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            limiter.check(ip("192.0.2.200"), later),
+            RateVerdict::Allowed,
+            "once the live buckets expire, new sources are admitted again"
+        );
     }
 
     #[test]
@@ -1974,6 +2225,17 @@ pub struct AnchorIceStats {
     /// attempted a direct path has no direct-path ratio, and `0.0`
     /// would report total failure where nothing has happened.
     pub direct_ratio: Option<f64>,
+    /// Bootstrap requests refused because their source spent its
+    /// per-minute budget (an IPv6 source is charged by its /64).
+    /// `None` from an anchor that predates the field, which is not
+    /// the same as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_rate_limited: Option<u64>,
+    /// Bootstrap requests refused because the rate limiter was full
+    /// of live sources and this one was new: many sources at once,
+    /// not one eager one. `None` from an anchor that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_rate_table_full: Option<u64>,
 }
 
 /// Serve the anchor's own ICE attempt ledger on `mesh`.
@@ -2002,6 +2264,8 @@ pub fn serve_anchor_ice_stats(mesh: &crate::Mesh) -> Result<crate::mesh_rpc::Ser
                 failed: ledger.as_ref().map(|s| s.failed).unwrap_or(0),
                 pending: ledger.as_ref().map(|s| s.pending()).unwrap_or(0),
                 direct_ratio: ledger.as_ref().and_then(|s| s.direct_ratio()),
+                bootstrap_rate_limited: Some(node.rtc_stats().bootstrap_rate_limited()),
+                bootstrap_rate_table_full: Some(node.rtc_stats().bootstrap_rate_table_full()),
             };
             serde_json::to_vec(&reply).map_err(|e| e.to_string())
         }

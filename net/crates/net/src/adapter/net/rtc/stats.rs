@@ -153,6 +153,8 @@ pub struct RtcStats {
     /// here: this is "somebody used us as their STUN server", which
     /// is what a published `rtc_addr` is for.
     stun_binding_requests: AtomicU64,
+    bootstrap_rate_limited: AtomicU64,
+    bootstrap_rate_table_full: AtomicU64,
     ice_attempted: AtomicU64,
     ice_direct: AtomicU64,
     ice_relayed: AtomicU64,
@@ -356,6 +358,16 @@ impl RtcStats {
         stun_binding_requests,
         note_stun_binding_request,
         "Unsolicited STUN binding requests answered by this anchor's own responder — a peer using the published `rtc_addr` as its STUN target. ICE checks carry `USERNAME` and belong to a session; they are not counted here."
+    );
+    counter!(
+        bootstrap_rate_limited,
+        note_bootstrap_rate_limited,
+        "Bootstrap listener requests (`/rtc/offer`, `/credential`) refused because their source spent its per-minute budget. An IPv6 source is charged by its /64."
+    );
+    counter!(
+        bootstrap_rate_table_full,
+        note_bootstrap_rate_table_full,
+        "Bootstrap listener requests refused because the rate limiter already holds its bound of live sources and this source is new. Separate from `bootstrap_rate_limited`: this is many sources at once, not one eager one, and no existing restriction was evicted to admit it."
     );
     // ---------------------------------------------------------------
     // The ICE attempt ledger (plan §10). Read the type-level

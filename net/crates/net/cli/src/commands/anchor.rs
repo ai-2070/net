@@ -323,6 +323,15 @@ struct IceStatsRow {
     denominator: &'static str,
     /// What the ratio does NOT mean.
     caveat: &'static str,
+    /// Bootstrap requests refused by the per-source rate limit (an
+    /// IPv6 source is charged by its /64). Absent from an anchor that
+    /// predates the counter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrap_rate_limited: Option<u64>,
+    /// Bootstrap requests refused because the limiter was full of live
+    /// sources and this one was new. Absent from an older anchor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrap_rate_table_full: Option<u64>,
 }
 
 /// The one-line prose form of the denominator, printed with every
@@ -588,6 +597,8 @@ async fn run_stats(
         ice_direct_ratio: stats.direct_ratio,
         denominator: ICE_DENOMINATOR,
         caveat: ICE_CAVEAT,
+        bootstrap_rate_limited: stats.bootstrap_rate_limited,
+        bootstrap_rate_table_full: stats.bootstrap_rate_table_full,
     };
     emit_value(OutputFormat::resolve_oneshot(output), &row)
         .map_err(|e| generic(format!("write anchor stats: {e}")))?;
