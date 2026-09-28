@@ -27803,16 +27803,43 @@ impl MeshNode {
     /// browser outside the NAT cannot use the bound address.
     #[cfg(feature = "webrtc")]
     pub fn bootstrap_host_candidate(&self) -> Option<String> {
-        let driver = self.rtc_driver.as_ref()?;
-        let addr = self
-            .config
-            .rtc
-            .as_ref()
+        self.bootstrap_host_candidates().into_iter().next()
+    }
+
+    /// Every host candidate this anchor offers, in SDP form, primary
+    /// first: one per RTC socket, so two on a dual-stack anchor
+    /// (`ANCHOR_DUAL_STACK_PLAN.md`). The trickle socket sends each,
+    /// and [`Self::bootstrap_host_candidate`] is the first of them.
+    #[cfg(feature = "webrtc")]
+    pub fn bootstrap_host_candidates(&self) -> Vec<String> {
+        self.rtc_advertised_addrs()
+            .into_iter()
+            .filter_map(|addr| str0m::Candidate::host(addr, "udp").ok())
+            .map(|c| c.to_sdp_string())
+            .collect()
+    }
+
+    /// The addresses this anchor's RTC sockets are advertised as,
+    /// primary first: the operator's public override for each socket
+    /// when configured, otherwise what the socket bound. Empty
+    /// without an RTC driver.
+    ///
+    /// The same values the driver puts on every session's host
+    /// candidates, so what a browser is told over signalling and
+    /// what it finds in the session answer never disagree.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_advertised_addrs(&self) -> Vec<SocketAddr> {
+        let Some(driver) = self.rtc_driver.as_ref() else {
+            return Vec::new();
+        };
+        let rtc = self.config.rtc.as_ref();
+        let primary = rtc
             .and_then(|rtc| rtc.public_addr)
             .unwrap_or_else(|| driver.local_addr());
-        str0m::Candidate::host(addr, "udp")
-            .ok()
-            .map(|c| c.to_sdp_string())
+        let v6 = driver
+            .local_addr_v6()
+            .map(|bound| rtc.and_then(|rtc| rtc.public_addr_v6).unwrap_or(bound));
+        std::iter::once(primary).chain(v6).collect()
     }
 
     /// End a bootstrap dialog the browser abandoned (Stage 4b): the
@@ -28063,28 +28090,20 @@ impl MeshNode {
     /// same socket.
     #[cfg(feature = "webrtc")]
     async fn trickle_local_candidate(&self, peer_node_id: u64, dialog: u64) {
-        let Some(driver) = self.rtc_driver.as_ref() else {
-            return;
-        };
-        let addr = self
-            .config
-            .rtc
-            .as_ref()
-            .and_then(|rtc| rtc.public_addr)
-            .unwrap_or_else(|| driver.local_addr());
-        let Ok(candidate) = str0m::Candidate::host(addr, "udp") else {
-            return;
-        };
-        let _ = self
-            .send_rtc_signal(
-                peer_node_id,
-                &super::rtc::RtcSignalMsg::Candidate {
-                    dialog,
-                    candidate: candidate.to_sdp_string(),
-                    mid: "0".to_string(),
-                },
-            )
-            .await;
+        // One frame per RTC socket: a dual-stack anchor trickles both
+        // families, primary first.
+        for candidate in self.bootstrap_host_candidates() {
+            let _ = self
+                .send_rtc_signal(
+                    peer_node_id,
+                    &super::rtc::RtcSignalMsg::Candidate {
+                        dialog,
+                        candidate,
+                        mid: "0".to_string(),
+                    },
+                )
+                .await;
+        }
     }
 
     /// **The production completion owner for one dialog (R4).**

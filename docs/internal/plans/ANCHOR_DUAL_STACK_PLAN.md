@@ -233,6 +233,42 @@ two families** with no new code. Slice 4 witnesses it rather than assuming it.
 
 ### Slice 1: the driver speaks both families
 
+**Done 2026-09-28** (branch `anchor-dual-stack`). What landed:
+
+- `RtcConfig::{bind_addr_v6, public_addr_v6}` with `dual_stack_conflict`,
+  `dual_stack_primary_conflict` (the resolved primary must be IPv4) and the
+  Stage 6 STUN-collision rule extended to the IPv6 endpoint, pre-bind and
+  resolved (`resolved_v6_endpoint_conflict`);
+- the driver's `RtcSockets`: the IPv6 socket bound with `IPV6_V6ONLY` set
+  through `socket2`, per-socket advertised address, transmit routed by
+  destination family, a readiness wait across both sockets;
+- `MeshNode::{rtc_advertised_addrs, bootstrap_host_candidates}`, used by
+  `trickle_local_candidate` and by the bootstrap listener's trickle socket,
+  which now send one candidate frame per family, primary first.
+  `bootstrap_host_candidate` remains, returning the primary.
+
+**Evidence:**
+
+- `tests/rtc_dual_stack.rs`, 5 tests, pinned in `ci.yml` (RTC harnesses,
+  floor 5, two required names);
+- 4 new config unit tests in `rtc/config.rs` (7 in the module), among the 71
+  `rtc::` lib tests, all green;
+- CI's whole RTC harness set, 215 tests including the new file, and
+  `net-mesh-sdk --test rtc_bootstrap_listener` (30 tests), all green locally
+  on Windows.
+
+**Mutations run:**
+
+- **Caught.** Routing every transmit through the primary socket, and offering
+  only the primary candidate, each fail the flagship test.
+- **Not caught.** Stamping IPv6 arrivals with the primary's address
+  **survived**: str0m accepted the IPv6 checks anyway. The per-socket stamp
+  stays because it is the correct local address, and the test says it does
+  not witness it.
+- **Linux only.** Dropping `set_only_v6(true)` is invisible on Windows, whose
+  default is IPv6-only. It is caught on Linux (CI), where the read-back and
+  the wildcard same-port bind both fail.
+
 - `RtcConfig` per-family fields; a second socket with `IPV6_V6ONLY`.
 - `receive` stamps the arriving socket's advertised address; `Transmit` picks
   its socket by destination family.

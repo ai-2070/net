@@ -1559,8 +1559,9 @@ async fn trickle_socket(mut socket: WebSocket, state: AppState, attempt: Attempt
     // The anchor's own candidate goes first: the browser can start
     // checks against it while it is still gathering its own. S0b
     // measured trickle at 6.6x gather-complete at the floor, and
-    // this is the half the anchor controls.
-    if let Some(candidate) = state.node.bootstrap_host_candidate() {
+    // this is the half the anchor controls. A dual-stack anchor has
+    // one per family, primary first.
+    for candidate in state.node.bootstrap_host_candidates() {
         let frame = serde_json::json!({
             "type": "candidate",
             "dialog": dialog,

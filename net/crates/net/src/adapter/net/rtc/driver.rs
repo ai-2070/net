@@ -92,6 +92,89 @@ const WRITE_QUANTUM_PER_TURN: usize = 8;
 /// somebody else is filling is not a bound.
 const SIGNAL_QUANTUM_PER_TURN: usize = 16;
 
+/// One RTC socket and the address it is advertised as — the value a
+/// session's host candidate carries and the destination every
+/// datagram arriving on it is stamped with.
+#[derive(Debug)]
+struct RtcSocket {
+    socket: UdpSocket,
+    advertised: SocketAddr,
+}
+
+/// The RTC sockets a driver owns: the primary one, and on a
+/// dual-stack anchor a second, IPv6 one (`RtcConfig::bind_addr_v6`).
+///
+/// **One family per socket** is what makes routing trivial: a
+/// datagram leaves through the socket of its destination's family,
+/// and one arriving is stamped with its own socket's advertised
+/// address, which is the local candidate str0m matches it against.
+/// Sessions, queues and stats are shared; only the wire is split.
+#[derive(Debug)]
+struct RtcSockets {
+    primary: RtcSocket,
+    v6: Option<RtcSocket>,
+}
+
+impl RtcSockets {
+    /// The socket a datagram to `destination` leaves through: the
+    /// IPv6 socket for an IPv6 destination when there is one, the
+    /// primary otherwise. A single-socket driver always answers the
+    /// primary, which is its behaviour before this type existed.
+    fn for_destination(&self, destination: SocketAddr) -> &RtcSocket {
+        match &self.v6 {
+            Some(v6) if destination.is_ipv6() => v6,
+            _ => &self.primary,
+        }
+    }
+
+    /// Every advertised address, primary first: one host candidate
+    /// per family.
+    fn advertised(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        std::iter::once(self.primary.advertised).chain(self.v6.as_ref().map(|s| s.advertised))
+    }
+
+    /// Wait for a datagram on either socket, then read it.
+    ///
+    /// Readiness, then a non-blocking read, rather than two
+    /// concurrent `recv_from`s: those would both need the one buffer.
+    /// A readiness that turns out spurious surfaces as `WouldBlock`,
+    /// which the loop already treats as "nothing this turn".
+    async fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> (std::io::Result<(usize, SocketAddr)>, &RtcSocket) {
+        let Some(v6) = &self.v6 else {
+            return (self.primary.socket.recv_from(buf).await, &self.primary);
+        };
+        let ready = tokio::select! {
+            r = self.primary.socket.readable() => r.map(|()| &self.primary),
+            r = v6.socket.readable() => r.map(|()| v6),
+        };
+        match ready {
+            Ok(arrived) => (arrived.socket.try_recv_from(buf), arrived),
+            Err(e) => (Err(e), &self.primary),
+        }
+    }
+}
+
+/// Bind the IPv6 RTC socket with `IPV6_V6ONLY` **set explicitly**.
+///
+/// Without it, a Linux `[::]:P` bind is dual-stack and collides with
+/// the primary socket's `0.0.0.0:P`; with it left to the platform,
+/// Windows and Linux disagree. Set, the socket carries IPv6 and only
+/// IPv6, whatever the host's default.
+fn bind_v6_only(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_only_v6(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    UdpSocket::from_std(socket.into())
+}
+
 /// One signalling instruction for the driver.
 ///
 /// Stage 3 has no signalling subprotocol — `0x0D02` is Stage 4's — so
@@ -652,6 +735,13 @@ pub struct RtcDriverHandle {
     transport: Arc<RtcTransport>,
     stats: Arc<RtcStats>,
     local_addr: SocketAddr,
+    /// The IPv6 RTC socket's bound address, on a dual-stack anchor.
+    local_addr_v6: Option<SocketAddr>,
+    /// `IPV6_V6ONLY` as read back off the IPv6 socket after binding —
+    /// the option itself, so a witness checks it rather than
+    /// inferring it from a bind that happened not to collide.
+    #[cfg(any(test, feature = "fixtures"))]
+    v6_only: Option<bool>,
     shutdown: Arc<AtomicBool>,
     /// The driver task and its **release**, so shutdown can join it.
     /// Without this the task (and its bound UDP socket) outlived the
@@ -691,6 +781,23 @@ impl RtcDriverHandle {
     #[inline]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The address the **IPv6** RTC socket is bound to, when
+    /// [`RtcConfig::bind_addr_v6`] configured one (a dual-stack
+    /// anchor). Resolved post-bind, so a `:0` bind reports a real
+    /// port.
+    #[inline]
+    pub fn local_addr_v6(&self) -> Option<SocketAddr> {
+        self.local_addr_v6
+    }
+
+    /// Test-only: `IPV6_V6ONLY` as read back off the IPv6 socket, or
+    /// `None` when there is no IPv6 socket.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[inline]
+    pub fn v6_only(&self) -> Option<bool> {
+        self.v6_only
     }
 
     /// The address the **STUN-only** socket is bound to, when
@@ -1174,9 +1281,33 @@ impl RtcDriver {
                 conflict,
             ));
         }
-        let socket = UdpSocket::bind(config.resolved_bind_addr(net_bind_addr)).await?;
+        let primary_bind = config.resolved_bind_addr(net_bind_addr);
+        if let Some(conflict) = config.dual_stack_primary_conflict(primary_bind) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                conflict,
+            ));
+        }
+        let socket = UdpSocket::bind(primary_bind).await?;
         let local_addr = socket.local_addr()?;
         let advertised = config.advertised_rtc_addr(local_addr);
+        // The dual-stack socket, when configured. A bind that cannot
+        // be taken is fatal for the same reason the STUN one is: the
+        // alternative advertises an endpoint nothing answers on.
+        let v6 = match config.bind_addr_v6 {
+            Some(bind) => {
+                let v6_socket = bind_v6_only(bind)?;
+                let bound = v6_socket.local_addr()?;
+                Some((v6_socket, bound))
+            }
+            None => None,
+        };
+        let local_addr_v6 = v6.as_ref().map(|(_, bound)| *bound);
+        #[cfg(any(test, feature = "fixtures"))]
+        let v6_only = match &v6 {
+            Some((v6_socket, _)) => Some(socket2::SockRef::from(v6_socket).only_v6()?),
+            None => None,
+        };
 
         let transport = Arc::new(RtcTransport::new(&config, Arc::clone(&stats)));
         let (signal_tx, signal_rx) = mpsc::channel(64);
@@ -1200,8 +1331,10 @@ impl RtcDriver {
             }
             None => None,
         };
+        let stun_bound_addr = stun_bound.as_ref().map(|(_, bound)| *bound);
         if let Some(conflict) = config
-            .resolved_endpoint_conflict(local_addr, stun_bound.as_ref().map(|(_, bound)| *bound))
+            .resolved_endpoint_conflict(local_addr, stun_bound_addr)
+            .or_else(|| config.resolved_v6_endpoint_conflict(local_addr_v6, stun_bound_addr))
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1229,11 +1362,18 @@ impl RtcDriver {
         });
 
         let (done_tx, _) = tokio::sync::watch::channel(false);
+        let v6 = v6.map(|(v6_socket, bound)| RtcSocket {
+            socket: v6_socket,
+            advertised: config.advertised_rtc_addr_v6(Some(bound)).unwrap_or(bound),
+        });
+        let sockets = RtcSockets {
+            primary: RtcSocket { socket, advertised },
+            v6,
+        };
         let task = tokio::spawn(driver_loop(
             done_tx.clone(),
             config,
-            socket,
-            advertised,
+            sockets,
             Arc::clone(&transport),
             Arc::clone(&stats),
             ingress,
@@ -1249,6 +1389,9 @@ impl RtcDriver {
             transport: Arc::clone(&transport),
             stats: Arc::clone(&stats),
             local_addr,
+            local_addr_v6,
+            #[cfg(any(test, feature = "fixtures"))]
+            v6_only,
             shutdown: Arc::clone(&shutdown),
             release: TaskRelease::new(task, done_tx, "rtc driver"),
             stun,
@@ -1265,8 +1408,7 @@ impl RtcDriver {
 async fn driver_loop(
     done: tokio::sync::watch::Sender<bool>,
     config: RtcConfig,
-    socket: UdpSocket,
-    advertised: SocketAddr,
+    sockets: RtcSockets,
     transport: Arc<RtcTransport>,
     stats: Arc<RtcStats>,
     ingress: mpsc::Sender<(Bytes, RtcPeerId)>,
@@ -1283,7 +1425,7 @@ async fn driver_loop(
     // queued packets uncounted and `submit` returning `Ok(())`.
     let mut table = SessionTable {
         sessions: HashMap::new(),
-        socket: Some(socket),
+        sockets: Some(sockets),
         transport: Arc::clone(&transport),
         stats: Arc::clone(&stats),
         closed: closed.clone(),
@@ -1293,7 +1435,7 @@ async fn driver_loop(
     };
     let sessions = &mut table.sessions;
     // Taken only by teardown, which runs after this borrow ends.
-    let Some(socket) = table.socket.as_ref() else {
+    let Some(sockets) = table.sockets.as_ref() else {
         return;
     };
     let mut buf = vec![0u8; RECV_BUF];
@@ -1334,8 +1476,7 @@ async fn driver_loop(
             handle_signal(
                 &config,
                 sessions,
-                advertised,
-                socket,
+                sockets,
                 &transport,
                 &stats,
                 &ingress,
@@ -1361,7 +1502,7 @@ async fn driver_loop(
                 pump_peer(
                     *slot,
                     sessions,
-                    socket,
+                    sockets,
                     &transport,
                     &stats,
                     &ingress,
@@ -1408,7 +1549,7 @@ async fn driver_loop(
                     }
                     drain_session(
                         session,
-                        socket,
+                        sockets,
                         &transport,
                         &stats,
                         &ingress,
@@ -1463,13 +1604,19 @@ async fn driver_loop(
         let injected_reset = hooks.take_conn_reset();
         #[cfg(not(any(test, feature = "fixtures")))]
         let injected_reset = false;
-        let read = if injected_reset {
-            Ok(Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "injected ICMP port-unreachable",
-            )))
+        let (read, arrived) = if injected_reset {
+            (
+                Ok(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "injected ICMP port-unreachable",
+                ))),
+                &sockets.primary,
+            )
         } else {
-            tokio::time::timeout(wait, socket.recv_from(&mut buf)).await
+            match tokio::time::timeout(wait, sockets.recv_from(&mut buf)).await {
+                Ok((read, arrived)) => (Ok(read), arrived),
+                Err(elapsed) => (Err(elapsed), &sockets.primary),
+            }
         };
 
         match read {
@@ -1477,8 +1624,8 @@ async fn driver_loop(
                 receive(
                     &config,
                     sessions,
-                    advertised,
-                    socket,
+                    arrived,
+                    sockets,
                     &transport,
                     &stats,
                     &ingress,
@@ -1591,11 +1738,11 @@ impl Drop for StunSocket {
 /// is free.
 struct SessionTable {
     sessions: HashMap<u32, Session>,
-    /// The RTC socket, owned here so teardown order is explicit:
-    /// slots closed and counted, transport terminal, **socket
+    /// The RTC sockets, owned here so teardown order is explicit:
+    /// slots closed and counted, transport terminal, **sockets
     /// released**, and only then release recorded. A joiner woken
-    /// by `done` therefore always finds the port free.
-    socket: Option<UdpSocket>,
+    /// by `done` therefore always finds the ports free.
+    sockets: Option<RtcSockets>,
     transport: Arc<RtcTransport>,
     stats: Arc<RtcStats>,
     closed: mpsc::Sender<RtcPeerId>,
@@ -1626,7 +1773,7 @@ impl Drop for SessionTable {
         // never opened — are closed here too, and the transport
         // becomes terminal.
         self.transport.shutdown_terminal();
-        drop(self.socket.take());
+        drop(self.sockets.take());
         // Recorded, not merely signalled: see `StunSocket::drop`.
         self.done.send_replace(true);
     }
@@ -1636,7 +1783,7 @@ impl Drop for SessionTable {
 async fn pump_peer(
     slot: u32,
     sessions: &mut HashMap<u32, Session>,
-    socket: &UdpSocket,
+    sockets: &RtcSockets,
     transport: &Arc<RtcTransport>,
     stats: &Arc<RtcStats>,
     ingress: &mpsc::Sender<(Bytes, RtcPeerId)>,
@@ -1681,7 +1828,7 @@ async fn pump_peer(
                 }
                 drain_session(
                     session,
-                    socket,
+                    sockets,
                     transport,
                     stats,
                     ingress,
@@ -1734,7 +1881,7 @@ async fn pump_peer(
                 session.retry = Some(packet);
                 drain_session(
                     session,
-                    socket,
+                    sockets,
                     transport,
                     stats,
                     ingress,
@@ -1754,7 +1901,7 @@ async fn pump_peer(
         }
         drain_session(
             session,
-            socket,
+            sockets,
             transport,
             stats,
             ingress,
@@ -1771,7 +1918,7 @@ async fn pump_peer(
 /// Rule 2: drain to `Output::Timeout` after every mutation.
 async fn drain_session(
     session: &mut Session,
-    socket: &UdpSocket,
+    sockets: &RtcSockets,
     transport: &Arc<RtcTransport>,
     stats: &Arc<RtcStats>,
     ingress: &mpsc::Sender<(Bytes, RtcPeerId)>,
@@ -1825,7 +1972,12 @@ async fn drain_session(
                         ]),
                     )
                 });
-                match socket.send_to(&t.contents, t.destination).await {
+                match sockets
+                    .for_destination(t.destination)
+                    .socket
+                    .send_to(&t.contents, t.destination)
+                    .await
+                {
                     Err(e) => tracing::debug!(
                         destination = %t.destination,
                         bytes = t.contents.len(),
@@ -1970,8 +2122,8 @@ async fn answer_binding_request(socket: &UdpSocket, datagram: &[u8], source: Soc
 async fn receive(
     config: &RtcConfig,
     sessions: &mut HashMap<u32, Session>,
-    advertised: SocketAddr,
-    socket: &UdpSocket,
+    arrived: &RtcSocket,
+    sockets: &RtcSockets,
     transport: &Arc<RtcTransport>,
     stats: &Arc<RtcStats>,
     ingress: &mpsc::Sender<(Bytes, RtcPeerId)>,
@@ -1986,7 +2138,7 @@ async fn receive(
     // negotiated those credentials; it goes to `Rtc::accepts` first,
     // and reaches the bare responder only if no session claims it.
     if config.serve_stun && stun::is_binding_request(datagram) && !stun::has_username(datagram) {
-        if answer_binding_request(socket, datagram, source).await {
+        if answer_binding_request(&arrived.socket, datagram, source).await {
             // R8: a peer aiming at our published `rtc_addr` is
             // observable here, and nowhere else — an ICE check
             // carries `USERNAME` and never reaches this arm, and the
@@ -2004,7 +2156,7 @@ async fn receive(
         Receive {
             proto: Protocol::Udp,
             source,
-            destination: advertised,
+            destination: arrived.advertised,
             contents,
         },
     );
@@ -2060,7 +2212,7 @@ async fn receive(
                     "an ICE connectivity check no session claimed"
                 );
             }
-            if answer_binding_request(socket, datagram, source).await && !credentialed {
+            if answer_binding_request(&arrived.socket, datagram, source).await && !credentialed {
                 // R8's counter is "a peer using us as their STUN
                 // server" — unsolicited GATHERING requests only
                 // (stats.rs: "ICE checks … are not counted here").
@@ -2098,7 +2250,7 @@ async fn receive(
     // it reports a refused send.
     drain_session(
         session,
-        socket,
+        sockets,
         transport,
         stats,
         ingress,
@@ -2115,8 +2267,7 @@ async fn receive(
 async fn handle_signal(
     config: &RtcConfig,
     sessions: &mut HashMap<u32, Session>,
-    advertised: SocketAddr,
-    socket: &UdpSocket,
+    sockets: &RtcSockets,
     transport: &Arc<RtcTransport>,
     stats: &Arc<RtcStats>,
     ingress: &mpsc::Sender<(Bytes, RtcPeerId)>,
@@ -2130,7 +2281,7 @@ async fn handle_signal(
                 let _ = reply.send(Err("rtc: max_peers reached".into()));
                 return;
             }
-            let mut session = match new_session(config, transport, advertised) {
+            let mut session = match new_session(config, transport, sockets) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = reply.send(Err(format!("rtc: {e}")));
@@ -2164,7 +2315,7 @@ async fn handle_signal(
                     let sdp = offer.to_sdp_string();
                     drain_session(
                         &mut session,
-                        socket,
+                        sockets,
                         transport,
                         stats,
                         ingress,
@@ -2193,7 +2344,7 @@ async fn handle_signal(
                     return;
                 }
             };
-            let mut session = match new_session(config, transport, advertised) {
+            let mut session = match new_session(config, transport, sockets) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = reply.send(Err(format!("rtc: {e}")));
@@ -2206,7 +2357,7 @@ async fn handle_signal(
                     let sdp = answer.to_sdp_string();
                     drain_session(
                         &mut session,
-                        socket,
+                        sockets,
                         transport,
                         stats,
                         ingress,
@@ -2247,7 +2398,7 @@ async fn handle_signal(
                 Ok(()) => {
                     drain_session(
                         session,
-                        socket,
+                        sockets,
                         transport,
                         stats,
                         ingress,
@@ -2267,12 +2418,19 @@ async fn handle_signal(
             // An unnamed socket cannot report a local half; the
             // unspecified address says "not known" without panicking
             // on a path an operator is only observing.
-            let socket_addr = socket.local_addr().unwrap_or(std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                0,
-            ));
             let answer = session_for(sessions, peer).and_then(|session| {
                 let remote = session.last_transmit?;
+                // The local half is the socket this pair's traffic
+                // leaves through, which on a dual-stack anchor is the
+                // one of the remote's family.
+                let socket_addr = sockets
+                    .for_destination(remote)
+                    .socket
+                    .local_addr()
+                    .unwrap_or(std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        0,
+                    ));
                 let learned = if session.signalled_remotes.contains(&remote) {
                     "signalled"
                 } else {
@@ -2302,7 +2460,7 @@ async fn handle_signal(
                     session.rtc.add_remote_candidate(c);
                     drain_session(
                         session,
-                        socket,
+                        sockets,
                         transport,
                         stats,
                         ingress,
@@ -2355,11 +2513,15 @@ fn session_for(sessions: &mut HashMap<u32, Session>, peer: RtcPeerId) -> Option<
 fn new_session(
     config: &RtcConfig,
     transport: &Arc<RtcTransport>,
-    advertised: SocketAddr,
+    sockets: &RtcSockets,
 ) -> Result<Session, super::transport::RtcError> {
     let mut rtc = Rtc::new(Instant::now());
-    if let Ok(candidate) = Candidate::host(advertised, "udp") {
-        rtc.add_local_candidate(candidate);
+    // One host candidate per family: on a dual-stack anchor the
+    // browser pairs with whichever its network can reach.
+    for advertised in sockets.advertised() {
+        if let Ok(candidate) = Candidate::host(advertised, "udp") {
+            rtc.add_local_candidate(candidate);
+        }
     }
     // R3-D: this is the recycling allocator now. It can refuse, and a
     // refusal is a real answer — silently reusing an identity is what
