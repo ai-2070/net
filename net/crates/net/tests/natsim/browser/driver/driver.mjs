@@ -149,8 +149,22 @@ async function opLaunch(req) {
     fs.mkdirSync(req.profileDir, { recursive: true });
     fs.writeFileSync(caPemPath, req.caPem);
     trust = seedFirefoxProfile(req.profileDir, caPemPath);
+    // Firefox's own ICE log, written beside the run's other evidence
+    // (`<state>/moz-<profile>*`, bundled by run_scenario.sh). Added
+    // when the first dual-stack run showed Firefox gathering NOTHING in
+    // an IPv6-only namespace — every RTCPeerConnection went `failed`
+    // within milliseconds, before a candidate or a check — while the
+    // same Firefox in the IPv4 namespace gathered normally. nICEr's
+    // own address filtering is the question, and only its log answers
+    // it. Log modules, not behaviour: nothing about ICE is changed.
+    const stateDir = path.resolve(req.profileDir, '..', '..');
     const context = await firefox.launchPersistentContext(req.profileDir, {
       headless: true,
+      env: {
+        ...process.env,
+        MOZ_LOG: 'nicer:5,mtransport:5,signaling:4,jsep:4,sync',
+        MOZ_LOG_FILE: path.join(stateDir, `moz-${path.basename(req.profileDir)}`),
+      },
     });
     live = { engine: req.engine, context, browser: null, persistent: true };
   } else {

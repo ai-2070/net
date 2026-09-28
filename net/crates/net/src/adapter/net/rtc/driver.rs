@@ -753,6 +753,9 @@ pub struct RtcDriverHandle {
     /// configured one: the address to announce and the task
     /// answering on it.
     stun: Option<StunEndpoint>,
+    /// The IPv6 STUN-only endpoint, on a dual-stack anchor
+    /// (`RtcConfig::stun_addr_v6`).
+    stun_v6: Option<StunEndpoint>,
     #[cfg(any(test, feature = "fixtures"))]
     hooks: Arc<RtcTestHooks>,
 }
@@ -816,6 +819,13 @@ impl RtcDriverHandle {
     #[inline]
     pub fn stun_local_addr(&self) -> Option<SocketAddr> {
         self.stun.as_ref().map(|stun| stun.local_addr)
+    }
+
+    /// The address the **IPv6** STUN-only socket is bound to, when
+    /// [`RtcConfig::stun_addr_v6`] configured one.
+    #[inline]
+    pub fn stun_local_addr_v6(&self) -> Option<SocketAddr> {
+        self.stun_v6.as_ref().map(|stun| stun.local_addr)
     }
 
     /// Send a signalling instruction to the driver.
@@ -930,7 +940,7 @@ impl RtcDriverHandle {
     pub fn shutdown_detached(&self) {
         self.shutdown.store(true, Ordering::Release);
         self.release.abort();
-        if let Some(stun) = &self.stun {
+        for stun in [&self.stun, &self.stun_v6].into_iter().flatten() {
             stun.release.abort();
         }
     }
@@ -971,7 +981,7 @@ impl RtcDriverHandle {
         // R3-B obligation: a shut-down anchor must not keep
         // answering, and a successor must be able to rebind an
         // explicit STUN port.
-        if let Some(stun) = &self.stun {
+        for stun in [&self.stun, &self.stun_v6].into_iter().flatten() {
             stun.release.join().await;
         }
     }
@@ -1331,17 +1341,31 @@ impl RtcDriver {
             }
             None => None,
         };
+        // The IPv6 STUN-only socket, on a dual-stack anchor: bound
+        // `IPV6_V6ONLY` like the IPv6 RTC socket, and fatal if it
+        // cannot be taken, for the same reason as the first.
+        let stun_v6_bound = match config.stun_addr_v6 {
+            Some(bind) => {
+                let stun_socket = bind_v6_only(bind)?;
+                let bound = stun_socket.local_addr()?;
+                Some((stun_socket, bound))
+            }
+            None => None,
+        };
         let stun_bound_addr = stun_bound.as_ref().map(|(_, bound)| *bound);
+        let stun_v6_bound_addr = stun_v6_bound.as_ref().map(|(_, bound)| *bound);
         if let Some(conflict) = config
             .resolved_endpoint_conflict(local_addr, stun_bound_addr)
             .or_else(|| config.resolved_v6_endpoint_conflict(local_addr_v6, stun_bound_addr))
+            .or_else(|| config.resolved_v6_stun_conflict(local_addr_v6, stun_v6_bound_addr))
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 conflict,
             ));
         }
-        let stun = stun_bound.map(|(stun_socket, bound)| {
+        let serve_stun_only = |(stun_socket, bound): (UdpSocket, SocketAddr),
+                               name: &'static str| {
             // No receiver is retained on purpose: release is a
             // RECORDED value, not a notification that needs a
             // listener — see `TaskRelease`.
@@ -1357,9 +1381,11 @@ impl RtcDriver {
                 // announcement is built — one resolution rule, in
                 // one place.
                 local_addr: bound,
-                release: TaskRelease::new(stun_task, stun_done, "rtc stun socket"),
+                release: TaskRelease::new(stun_task, stun_done, name),
             }
-        });
+        };
+        let stun = stun_bound.map(|bound| serve_stun_only(bound, "rtc stun socket"));
+        let stun_v6 = stun_v6_bound.map(|bound| serve_stun_only(bound, "rtc stun socket (ipv6)"));
 
         let (done_tx, _) = tokio::sync::watch::channel(false);
         let v6 = v6.map(|(v6_socket, bound)| RtcSocket {
@@ -1395,6 +1421,7 @@ impl RtcDriver {
             shutdown: Arc::clone(&shutdown),
             release: TaskRelease::new(task, done_tx, "rtc driver"),
             stun,
+            stun_v6,
             #[cfg(any(test, feature = "fixtures"))]
             hooks,
         })

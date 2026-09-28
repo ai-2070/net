@@ -702,6 +702,7 @@ async fn the_anchor_control_plane_refuses_to_carry_a_signalling_envelope() {
         rtc_addr: None,
         rtc_addrs: Vec::new(),
         stun_addr: None,
+        stun_addrs: Vec::new(),
     };
 
     let self_node = 0x0000_0000_0000_0011;

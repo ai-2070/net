@@ -1847,15 +1847,21 @@ impl LeafNode {
             // announced none leaves this empty, which is exactly
             // the pre-Stage-6 behaviour, and an explicit empty array
             // stays empty.
-            None => crate::bootstrap::default_stun_url(control.anchor_stun_addr().as_deref())
-                .map(|url| {
+            // One entry per announced STUN endpoint: a dual-stack
+            // anchor announces one per family, and a browser that
+            // cannot enumerate interfaces needs the one of its own.
+            None => {
+                let urls = crate::bootstrap::default_stun_urls(&control.anchor_stun_addrs());
+                if urls.is_empty() {
+                    Vec::new()
+                } else {
                     vec![IceServer {
-                        urls: vec![url],
+                        urls,
                         username: None,
                         credential: None,
                     }]
-                })
-                .unwrap_or_default(),
+                }
+            }
         };
         // **The EFFECTIVE list, not the caller's half of it.** The
         // check used to run inside the `Some` arm only, so the

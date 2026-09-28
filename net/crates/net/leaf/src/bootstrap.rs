@@ -324,6 +324,11 @@ pub struct AnchorInfo {
     /// nothing, which parses as `None` and leaves the leaf
     /// configuring no ICE servers at all.
     pub stun_addr: Option<String>,
+    /// **Every** announced STUN endpoint, primary first: one per
+    /// family on a dual-stack anchor. Resolved like
+    /// [`Self::rtc_addrs`]: `stun_addrs` when present, else
+    /// `[stun_addr]`, else empty.
+    pub stun_addrs: Vec<String>,
 }
 
 impl AnchorInfo {
@@ -368,6 +373,26 @@ impl AnchorInfo {
             noise_pubkey,
             rtc_addr,
             rtc_addrs,
+            stun_addrs: match document
+                .get("stun_addrs")
+                .and_then(serde_json::Value::as_array)
+            {
+                Some(list) => {
+                    list.iter()
+                        .map(|value| {
+                            value.as_str().map(str::to_string).ok_or_else(|| {
+                                malformed("anchor info's stun_addrs holds a non-string")
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                }
+                None => document
+                    .get("stun_addr")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect(),
+            },
             stun_addr: document
                 .get("stun_addr")
                 .and_then(serde_json::Value::as_str)
@@ -687,6 +712,19 @@ pub fn default_stun_url(announced: Option<&str>) -> Option<String> {
         return Some(announced.to_string());
     }
     Some(format!("stun:{announced}"))
+}
+
+/// The `iceServers` URLs a leaf defaults to: one per STUN endpoint the
+/// anchor announced, primary first, through [`default_stun_url`]'s
+/// rule. On a dual-stack anchor that is one per family, which a browser
+/// that does not enumerate interfaces needs: its only usable local
+/// candidate is the server-reflexive one a STUN server of its OWN
+/// family gives it (`ANCHOR_DUAL_STACK_PLAN.md`, slice 4, measured).
+pub fn default_stun_urls(announced: &[String]) -> Vec<String> {
+    announced
+        .iter()
+        .filter_map(|addr| default_stun_url(Some(addr)))
+        .collect()
 }
 
 /// Refuse an `iceServers` configuration that aims a STUN URL at the
@@ -1153,6 +1191,7 @@ mod tests {
             rtc_addr: None,
             rtc_addrs: Vec::new(),
             stun_addr: None,
+            stun_addrs: Vec::new(),
         };
         matching
             .check_pinned_key(&credential)
@@ -1164,6 +1203,7 @@ mod tests {
             rtc_addr: None,
             rtc_addrs: Vec::new(),
             stun_addr: None,
+            stun_addrs: Vec::new(),
         };
         let err = impostor
             .check_pinned_key(&credential)
@@ -1519,6 +1559,23 @@ mod tests {
             none.rtc_addrs.is_empty(),
             "nothing published, nothing listed"
         );
+        assert!(none.stun_addrs.is_empty());
+
+        let stun = AnchorInfo::from_json(&format!(
+            r#"{{{base},"stun_addr":"203.0.113.7:3479","stun_addrs":["203.0.113.7:3479","[2001:db8::7]:3479"]}}"#
+        ))
+        .expect("parses");
+        assert_eq!(stun.stun_addrs, ["203.0.113.7:3479", "[2001:db8::7]:3479"]);
+        let stun_single =
+            AnchorInfo::from_json(&format!(r#"{{{base},"stun_addr":"203.0.113.7:3479"}}"#))
+                .expect("parses");
+        assert_eq!(stun_single.stun_addrs, ["203.0.113.7:3479"]);
+        // The default `iceServers` hold one URL per announced endpoint.
+        assert_eq!(
+            default_stun_urls(&stun.stun_addrs),
+            ["stun:203.0.113.7:3479", "stun:[2001:db8::7]:3479"]
+        );
+        assert!(default_stun_urls(&[]).is_empty());
 
         assert!(
             AnchorInfo::from_json(&format!(r#"{{{base},"rtc_addrs":[7101]}}"#)).is_err(),

@@ -844,16 +844,22 @@ pub struct ServeArgs {
     /// against it, so the endpoint it gathers against has to be a
     /// distinct one. Use `:0` to let the OS pick — the announced
     /// value is the port the socket actually bound, never a guess.
+    ///
+    /// Repeatable once per family: a dual-stack anchor needs an IPv6
+    /// STUN endpoint too, or a browser on an IPv6-only network that
+    /// does not enumerate interfaces has no usable candidate at all.
     #[arg(long = "rtc-stun-bind", value_name = "ADDR")]
-    pub rtc_stun_bind: Option<String>,
+    pub rtc_stun_bind: Vec<String>,
 
     /// Public address of that STUN socket, published as
     /// `rtc_stun_addr`. Required behind NAT, and it must be a
     /// **distinct externally reachable endpoint** from
     /// `--rtc-public-addr` — two ports on this host is fine, a
     /// gateway mapping that lands both on one public tuple is not.
+    /// Repeatable once per family, each advertising the
+    /// `--rtc-stun-bind` socket of its own family.
     #[arg(long = "rtc-stun-public-addr", value_name = "ADDR")]
-    pub rtc_stun_public_addr: Option<String>,
+    pub rtc_stun_public_addr: Vec<String>,
 
     /// Operator-supplied certificate chain (PEM). With `--tls-key`.
     #[arg(long = "tls-cert", value_name = "PATH", requires = "tls_key")]
@@ -1119,24 +1125,35 @@ fn rtc_config_from_args(args: &ServeArgs) -> Result<net::adapter::net::rtc::RtcC
             rtc.bind_addr = single.or(single_v6);
             if public.is_some() && public_v6.is_some() {
                 return Err(invalid_args(
-                    "--rtc-public-addr names an IPv4 and an IPv6 address, but only one                      --rtc-bind socket exists; give an --rtc-bind of each family for a                      dual-stack anchor",
+                    "--rtc-public-addr names an IPv4 and an IPv6 address, but only one --rtc-bind socket exists; give an --rtc-bind of each family for a dual-stack anchor",
                 ));
             }
             rtc.public_addr = public.or(public_v6);
         }
     }
-    if let Some(bind) = args.rtc_stun_bind.as_ref() {
-        rtc.stun_addr = Some(
-            bind.parse()
-                .map_err(|e| invalid_args(format!("--rtc-stun-bind: {e}")))?,
-        );
-    }
-    if let Some(public) = args.rtc_stun_public_addr.as_ref() {
-        rtc.stun_public_addr = Some(
-            public
-                .parse()
-                .map_err(|e| invalid_args(format!("--rtc-stun-public-addr: {e}")))?,
-        );
+    // The STUN-only sockets follow the same per-family rule as the RTC
+    // sockets: an IPv4 and an IPv6 bind make one endpoint per family,
+    // and one bind of either family is the single endpoint it was.
+    let (stun_bind, stun_bind_v6) = one_per_family("--rtc-stun-bind", &args.rtc_stun_bind)?;
+    let (stun_public, stun_public_v6) =
+        one_per_family("--rtc-stun-public-addr", &args.rtc_stun_public_addr)?;
+    match (stun_bind, stun_bind_v6) {
+        (Some(bind), Some(bind_v6)) => {
+            rtc.stun_addr = Some(bind);
+            rtc.stun_addr_v6 = Some(bind_v6);
+            rtc.stun_public_addr = stun_public;
+            rtc.stun_public_addr_v6 = stun_public_v6;
+        }
+        (single, single_v6) => {
+            rtc.stun_addr = single.or(single_v6);
+            if stun_public.is_some() && stun_public_v6.is_some() {
+                return Err(invalid_args(
+                    "--rtc-stun-public-addr names an IPv4 and an IPv6 address, but only one \
+                     --rtc-stun-bind socket exists; give an --rtc-stun-bind of each family",
+                ));
+            }
+            rtc.stun_public_addr = stun_public.or(stun_public_v6);
+        }
     }
     Ok(rtc)
 }
@@ -1303,7 +1320,7 @@ async fn run_serve(
         );
         target.provenance(
             "rtc_stun_bind",
-            if args.rtc_stun_bind.is_some() {
+            if !args.rtc_stun_bind.is_empty() {
                 "flag"
             } else {
                 "unused"
@@ -1868,6 +1885,41 @@ mod tests {
         assert_eq!(
             single_v6.public_addr,
             Some("[2001:db8::7]:7101".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn stun_binds_of_each_family_make_a_stun_endpoint_per_family() {
+        let dual = rtc_config_from_args(&serve_args(&[
+            "--rtc-stun-bind",
+            "[::]:3479",
+            "--rtc-stun-bind",
+            "0.0.0.0:3479",
+            "--rtc-stun-public-addr",
+            "[2001:db8::7]:3479",
+            "--rtc-stun-public-addr",
+            "203.0.113.7:3479",
+        ]))
+        .expect("per-family STUN flags");
+        assert_eq!(dual.stun_addr, Some("0.0.0.0:3479".parse().unwrap()));
+        assert_eq!(dual.stun_addr_v6, Some("[::]:3479".parse().unwrap()));
+        assert_eq!(
+            dual.stun_public_addr,
+            Some("203.0.113.7:3479".parse().unwrap())
+        );
+        assert_eq!(
+            dual.stun_public_addr_v6,
+            Some("[2001:db8::7]:3479".parse().unwrap())
+        );
+        assert!(
+            rtc_config_from_args(&serve_args(&[
+                "--rtc-stun-bind",
+                "0.0.0.0:3479",
+                "--rtc-stun-bind",
+                "127.0.0.1:3480",
+            ]))
+            .is_err(),
+            "two STUN sockets of one family are refused"
         );
     }
 

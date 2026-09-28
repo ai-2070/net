@@ -27978,6 +27978,31 @@ impl MeshNode {
         rtc.advertised_stun_addr(bound)
     }
 
+    /// The announced **IPv6** STUN endpoint of a dual-stack anchor,
+    /// resolved as [`Self::rtc_public_stun_addr`] is.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_stun_addr_v6(&self) -> Option<SocketAddr> {
+        let rtc = self.config.rtc.as_ref()?;
+        let bound = self
+            .rtc_driver
+            .as_ref()
+            .and_then(|d| d.stun_local_addr_v6());
+        rtc.advertised_stun_addr_v6(bound)
+    }
+
+    /// Every announced STUN endpoint, primary first: one per family on
+    /// a dual-stack anchor. What a leaf's default `iceServers` should
+    /// hold, because a browser that cannot enumerate interfaces only
+    /// gets a usable local candidate from a STUN server of its own
+    /// family.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_stun_addrs(&self) -> Vec<SocketAddr> {
+        self.rtc_public_stun_addr()
+            .into_iter()
+            .chain(self.rtc_public_stun_addr_v6())
+            .collect()
+    }
+
     /// `rtc_stats()` without requiring a driver to exist.
     #[cfg(feature = "webrtc")]
     fn rtc_stats_opt(&self) -> Option<&Arc<super::rtc::RtcStats>> {

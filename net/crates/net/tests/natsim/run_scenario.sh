@@ -653,7 +653,7 @@ done
 # empty artifact after the fact.
 BUNDLE="$STATE/artifacts"
 mkdir -p "$BUNDLE"
-for f in "$STATE"/*.json "$STATE"/*.log "$STATE"/*.pcap; do
+for f in "$STATE"/*.json "$STATE"/*.log "$STATE"/*.pcap "$STATE"/moz-*; do
   [[ -f "$f" ]] || continue
   cp -- "$f" "$BUNDLE/" 2>/dev/null || true
 done

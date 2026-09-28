@@ -109,6 +109,7 @@ fn pair() -> Pair {
         rtc_addr: None,
         rtc_addrs: Vec::new(),
         stun_addr: None,
+        stun_addrs: Vec::new(),
     };
 
     // The org proof mint needs the entity keypair SHARED (`Rc`) beside

@@ -1233,6 +1233,16 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         // exactly the harness search this acceptance item forbids.
         stun_addr: Some(SocketAddr::new(IpAddr::V4(m.anchor_ip), m.stun_port)),
         stun_public_addr: Some(SocketAddr::new(IpAddr::V4(m.anchor_ip), m.stun_port)),
+        // The dual-stack anchor's IPv6 STUN endpoint: without it an
+        // IPv6-only Chromium tab that does not enumerate interfaces
+        // gathers no usable candidate and sends no ICE check at all
+        // (measured on the first dual-stack run).
+        stun_addr_v6: m
+            .anchor_ip6
+            .map(|ip| SocketAddr::new(IpAddr::V6(ip), m.stun_port)),
+        stun_public_addr_v6: m
+            .anchor_ip6
+            .map(|ip| SocketAddr::new(IpAddr::V6(ip), m.stun_port)),
         // The anchor is NOT behind a NAT here: it lives on the
         // simulated internet, and its bind address is the address the
         // browsers reach. `public_addr` is still set explicitly so the

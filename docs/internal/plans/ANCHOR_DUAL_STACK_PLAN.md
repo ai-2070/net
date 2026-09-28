@@ -510,7 +510,42 @@ checks and says so.
   - **Revisit when there are users on a release older than the anchor they
     reach.** Cross-version interoperability then becomes a real
     requirement, and this case becomes a row.
-- **Risk to watch.** On an IPv6 network without NAT, a STUN reply maps to the
+- **Iteration 1 (natsim run 36496321778): both rows failed, and the IPv6-only
+  tab B never connected to the anchor.**
+  - **Chromium, permission-free (the root cause).** Chromium does not
+    enumerate interfaces, so it binds wildcard ports and hides their host
+    candidates. A wildcard port's only usable local candidate is the
+    server-reflexive one from a STUN server **of its own family**. The
+    anchor announced only an IPv4 STUN endpoint, so B's IPv6 port logged
+    "STUN server address is incompatible", gathered nothing, formed no pair,
+    and sent no ICE check at all. The anchor's log confirms that not one
+    check from B arrived.
+  - **The IPv6 path itself worked.** B's diagnostic probes, given an IPv6
+    STUN server, got srflx immediately. **The srflx-dedupe risk below did
+    not materialise**: Chromium surfaces a srflx identical to the host
+    address.
+  - **This triggers the evidence gate that deferred the IPv6 STUN
+    endpoint.** It is now built:
+    - `RtcConfig::{stun_addr_v6, stun_public_addr_v6}` (IPV6_V6ONLY), with
+      validation and the collision rule against the IPv6 RTC endpoint;
+    - `AnchorInfo.stun_addrs` (only when dual-stack);
+    - the leaf's default `iceServers` = every announced STUN endpoint;
+    - per-family `--rtc-stun-bind` / `--rtc-stun-public-addr`;
+    - the runner announces one.
+    - Tests: `the_ipv6_stun_endpoint_answers_on_its_own_socket`, a config
+      rules test, the listener's `stun_addrs`, the leaf's defaults, and the
+      CLI flags.
+  - **Firefox: a separate failure.** Every RTCPeerConnection on B went
+    `failed` within milliseconds, before gathering any candidate, while the
+    same Firefox on IPv4-only tab A gathered and connected normally. So
+    Firefox gathers nothing in an IPv6-only namespace here. The next run
+    carries Firefox's ICE log (`MOZ_LOG`, bundled as `moz-*`) to say why.
+  - **Defect found (honesty, slice 3's probe).** Firefox B's probes also
+    failed instantly without sending anything, and were judged `unanswered`,
+    producing `udp-blocked`. A probe whose connection gave up before
+    gathering anything did not run; it should be `NotRun`. It is to be fixed
+    once the Firefox cause is known, with a vector case in the shared file.
+- **Risk to watch (did not occur; see iteration 1).** On an IPv6 network without NAT, a STUN reply maps to the
   host's own address, and libwebrtc may not surface a server-reflexive
   candidate identical to the host one. If so, the leaf's IPv6 probe of the
   anchor reads unanswered while UDP works, and the row fails on

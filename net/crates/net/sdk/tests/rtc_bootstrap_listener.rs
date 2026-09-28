@@ -436,20 +436,33 @@ async fn the_anchor_endpoint_lists_every_published_family_only_when_dual_stack()
     single.public_addr = Some(v4);
     let json = anchor_json(single).await;
     assert!(
-        json.get("rtc_addrs").is_none(),
-        "a single-socket anchor's reply has no rtc_addrs key: {json}"
+        json.get("rtc_addrs").is_none() && json.get("stun_addrs").is_none(),
+        "a single-socket anchor's reply has neither list key: {json}"
     );
     assert_eq!(json["rtc_addr"], v4.to_string());
 
     let mut dual = rtc_config()
         .with_bind_addr_v6("[::1]:0".parse().unwrap())
-        .with_public_addr_v6(v6);
+        .with_public_addr_v6(v6)
+        .with_stun_addr("127.0.0.1:0".parse().unwrap())
+        .with_stun_public_addr("203.0.113.7:3479".parse().unwrap())
+        .with_stun_addr_v6("[::1]:0".parse().unwrap())
+        .with_stun_public_addr_v6("[2001:db8::7]:3479".parse().unwrap());
     dual.public_addr = Some(v4);
     let json = anchor_json(dual).await;
     assert_eq!(
         json["rtc_addrs"],
         serde_json::json!([v4.to_string(), v6.to_string()]),
         "every published family, primary first"
+    );
+    assert_eq!(
+        json["stun_addrs"],
+        serde_json::json!(["203.0.113.7:3479", "[2001:db8::7]:3479"]),
+        "a STUN endpoint per family, primary first"
+    );
+    assert_eq!(
+        json["stun_addr"], "203.0.113.7:3479",
+        "stun_addr is still the primary"
     );
     assert_eq!(
         json["rtc_addr"],

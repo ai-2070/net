@@ -552,6 +552,14 @@ pub struct AnchorInfo {
     /// at. `None` means nothing was announced, and a leaf then
     /// configures no ICE servers at all.
     pub stun_addr: Option<String>,
+    /// Every announced STUN endpoint, primary first, **only on a
+    /// dual-stack anchor** that announces one per family; omitted
+    /// otherwise, so a single-stack reply is unchanged. A leaf's
+    /// default `iceServers` holds all of them: a browser that does not
+    /// enumerate interfaces gets its only usable local candidate from a
+    /// STUN server of its own family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stun_addrs: Option<Vec<String>>,
     /// Every published RTC endpoint, primary first, **only on a
     /// dual-stack anchor** that publishes one per family.
     ///
@@ -1694,6 +1702,13 @@ pub fn published_rtc_addrs(node: &MeshNode) -> Option<Vec<String>> {
     (published.len() > 1).then(|| published.iter().map(|addr| addr.to_string()).collect())
 }
 
+/// `AnchorInfo::stun_addrs`'s rule: every announced STUN endpoint
+/// when there is more than one, otherwise `None` (key omitted).
+pub fn published_stun_addrs(node: &MeshNode) -> Option<Vec<String>> {
+    let announced = node.rtc_public_stun_addrs();
+    (announced.len() > 1).then(|| announced.iter().map(|addr| addr.to_string()).collect())
+}
+
 async fn get_anchor(State(state): State<AppState>) -> Response {
     Json(AnchorInfo {
         node_id: format!("{:#x}", state.node.node_id()),
@@ -1704,6 +1719,7 @@ async fn get_anchor(State(state): State<AppState>) -> Response {
         // and the announcement emission point cannot disagree.
         stun_addr: state.node.rtc_public_stun_addr().map(|a| a.to_string()),
         rtc_addrs: published_rtc_addrs(&state.node),
+        stun_addrs: published_stun_addrs(&state.node),
         trust_domain: state.psk.trust_domain().to_string(),
         max_provisional: state.node.rtc_max_provisional(),
         provisional: state.node.provisional_count(),

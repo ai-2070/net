@@ -336,6 +336,57 @@ async fn the_trickled_candidates_are_one_per_family_primary_first() {
     );
 }
 
+/// **The IPv6 STUN-only endpoint answers, on its own socket.**
+///
+/// Measured need (slice 4): an IPv6-only Chromium tab that does not
+/// enumerate interfaces gathers its only usable candidate from a STUN
+/// server of its own family, so a dual-stack anchor that announced
+/// only an IPv4 STUN endpoint left it with no candidate and no ICE
+/// check at all. The second STUN socket answers an unsolicited binding
+/// request over IPv6 with the requester's own tuple, and is a
+/// different socket from the IPv6 RTC endpoint.
+#[tokio::test]
+async fn the_ipv6_stun_endpoint_answers_on_its_own_socket() {
+    let anchor = spawn(
+        dual_stack_loopback()
+            .with_stun_addr(addr("127.0.0.1:0"))
+            .with_stun_addr_v6(addr("[::1]:0")),
+        "127.0.0.1:0",
+    )
+    .await
+    .expect("dual-stack anchor with a STUN endpoint per family");
+    let stun_v6 = anchor
+        .handle
+        .stun_local_addr_v6()
+        .expect("an IPv6 STUN socket");
+    assert!(stun_v6.is_ipv6());
+    assert_ne!(
+        Some(stun_v6),
+        anchor.handle.local_addr_v6(),
+        "the STUN endpoint is not the IPv6 RTC endpoint"
+    );
+
+    let client = tokio::net::UdpSocket::bind("[::1]:0")
+        .await
+        .expect("v6 client");
+    let mut request = Vec::with_capacity(20);
+    request.extend_from_slice(&0x0001u16.to_be_bytes());
+    request.extend_from_slice(&0u16.to_be_bytes());
+    request.extend_from_slice(&net::adapter::net::rtc::STUN_MAGIC_COOKIE.to_be_bytes());
+    request.extend_from_slice(&[0x66; 12]);
+    client.send_to(&request, stun_v6).await.expect("send");
+    let mut buf = [0u8; 256];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+        .await
+        .expect("an answer within the deadline")
+        .expect("recv");
+    assert_eq!(from, stun_v6, "answered from the IPv6 STUN socket itself");
+    let mapped =
+        net::adapter::net::rtc::parse_xor_mapped_address(&buf[..n]).expect("an XOR-MAPPED-ADDRESS");
+    assert_eq!(mapped, client.local_addr().expect("client addr"));
+    anchor.handle.shutdown_and_join().await;
+}
+
 /// A misconfigured IPv6 socket refuses the spawn: it would otherwise
 /// advertise an endpoint nothing answers on, or split one family
 /// across two sockets.
