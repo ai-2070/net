@@ -6373,7 +6373,7 @@ jobs:
             --floor rtc_admission=26 \
             --floor rtc_anchor_registry=2 \
             --floor rtc_proxy_boundary=2 \
-            --floor natsim_browser=41 \
+            --floor natsim_browser=46 \
             --floor rtc_stun_endpoint=14 \
             --floor rtc_dual_stack=5 \
             --required-file - <<'REQUIRED'

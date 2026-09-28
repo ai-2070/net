@@ -132,6 +132,11 @@ jobs:
           a_miswired_scenario_fails_even_with_perfect_counters
           a_relayed_row_with_a_broken_anchor_dialog_fails
           the_gateways_discriminate_direct_from_relayed
+          a_dual_stack_verdict_with_disjoint_families_passes
+          a_dual_stack_verdict_without_the_family_witness_is_refused
+          a_shared_family_fails_the_dual_stack_row
+          an_anchor_session_on_the_wrong_family_fails
+          a_nat_row_ignores_the_family_witness
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "natsim matrix table" --mode fn \
@@ -140,8 +145,8 @@ jobs:
             grep -q "^test $w \.\.\. ok$" /tmp/natsim_rows.log || {
               echo "::error::the matrix-table witness $w did not run and pass"; exit 1; }
           done
-          grep -q "^test result: ok. 41 passed" /tmp/natsim_rows.log || {
-            echo "::error::expected 41 matrix-table witnesses"; exit 1; }
+          grep -q "^test result: ok. 46 passed" /tmp/natsim_rows.log || {
+            echo "::error::expected 46 matrix-table witnesses"; exit 1; }
 
       # The repo root resolves `stable`; `net/crates/net/**` resolves the
       # PINNED toolchain from `rust-toolchain.toml`, and they are separate
