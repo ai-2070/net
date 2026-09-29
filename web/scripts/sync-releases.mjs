@@ -117,6 +117,7 @@ const TITLES = {
   "RELEASE_v0.35_DOUBLEBACK.md": "v0.35.0 — Doubleback",
   "RELEASE_v0.36_PARANOID.md": "v0.36.0 — Paranoid",
   "RELEASE_v0.37.1_TURBO_LOVER.md": "v0.37.1 — Turbo Lover",
+  "RELEASE_v0.38.1_TWO_TRIBES.md": "v0.38.1 — Two Tribes",
   "RELEASE_v0.38_TWO_TRIBES.md": "v0.38.0 — Two Tribes",
   "RELEASE_v0.37_TURBO_LOVER.md": "v0.37.0 — Turbo Lover",
   "RELEASE_v0.8_KILLING_MOON.md": "v0.8 — Killing Moon",
