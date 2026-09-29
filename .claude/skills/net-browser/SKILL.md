@@ -5,7 +5,7 @@ allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 metadata:
   skill-version: 1.0.0
   last-updated: 2026-09-27
-  net-version: 0.38.0
+  net-version: 0.38.1
 ---
 
 # Net in the browser — a tab as a mesh node
