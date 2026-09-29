@@ -2146,8 +2146,11 @@ async fn a_page_gets_a_credential_for_its_game_that_the_offer_path_accepts() {
         BrowserBootstrapCredential::decode(reply["credentialB64"].as_str().unwrap()).unwrap();
     credential.verify_issuer(issuer().entity_id()).unwrap();
     credential.check_trust_domain(&Psk::new(PSK)).unwrap();
-    assert_eq!(&credential.invite.root, registry.root_of("alpha").unwrap());
-    assert_ne!(Some(&credential.invite.root), registry.root_of("beta"));
+    assert_eq!(credential.invite.root, registry.root_of("alpha").unwrap());
+    assert_ne!(
+        Some(credential.invite.root.clone()),
+        registry.root_of("beta")
+    );
     assert_eq!(credential.anchor_noise_pubkey, *anchor.public_key());
 
     // Past every credential check: a junk SDP is what gets refused.
@@ -2265,4 +2268,170 @@ async fn an_issuance_key_that_is_not_the_verified_issuer_is_refused_at_start() {
         serve_bootstrap(anchor, cfg).await,
         Err(BootstrapError::Config(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Open games: a public anchor any page may use
+// ---------------------------------------------------------------------------
+
+use net_sdk::game_anchor::OpenGames;
+
+/// A public anchor: `alpha` registered for the listed [`ORIGIN`], open
+/// games for everyone, any origin admitted.
+fn open_router(anchor: &Arc<MeshNode>) -> (axum::Router, Arc<GameRegistry>) {
+    let registry = Arc::new(
+        GameRegistry::new([0x21u8; 32], vec![GameConfig::new("alpha")])
+            .expect("registry")
+            .with_open_games(OpenGames::new(None))
+            .expect("open"),
+    );
+    let mut cfg = issuing_config(Arc::clone(&registry), 30);
+    cfg.any_origin = true;
+    (bootstrap_router(Arc::clone(anchor), &cfg), registry)
+}
+
+/// `POST /credential` from `origin` (none: no header), returning the
+/// status, the CORS allow-origin header and the body.
+async fn credential_from(
+    router: &axum::Router,
+    origin: Option<&str>,
+    game: &str,
+) -> (StatusCode, Option<String>, Vec<u8>) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/credential")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(origin) = origin {
+        builder = builder.header(header::ORIGIN, origin);
+    }
+    let request = builder
+        .body(Body::from(serde_json::json!({ "game": game }).to_string()))
+        .expect("request");
+    let response = router
+        .clone()
+        .into_make_service_with_connect_info::<std::net::SocketAddr>()
+        .oneshot("203.0.113.9:5000".parse::<std::net::SocketAddr>().unwrap())
+        .await
+        .expect("make service")
+        .oneshot(request)
+        .await
+        .expect("response");
+    let status = response.status();
+    let allow = response
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body")
+        .to_vec();
+    (status, allow, body)
+}
+
+fn root_in(body: &[u8]) -> net_sdk::identity::EntityId {
+    let reply: serde_json::Value = serde_json::from_slice(body).expect("a credential");
+    BrowserBootstrapCredential::decode(reply["credentialB64"].as_str().unwrap())
+        .unwrap()
+        .invite
+        .root
+}
+
+/// Any page gets a credential for any game, keyed on its own origin:
+/// CORS echoes that origin (never `*`, never with credentials), an
+/// unlisted page naming a registered game gets its OWN open game rather
+/// than the registered one, and the listed page still gets the
+/// registered game.
+///
+/// Inverse: route an unlisted origin by the game name alone and the
+/// `evil` page's root equals `alpha`'s — the assertion that it does not
+/// fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_public_anchor_issues_any_page_its_own_open_game() {
+    let anchor = anchor().await;
+    let (router, registry) = open_router(&anchor);
+
+    let (status, allow, body) =
+        credential_from(&router, Some("https://game.example"), "chess").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(allow.as_deref(), Some("https://game.example"));
+    assert_eq!(
+        Some(root_in(&body)),
+        registry.open_root_of("https://game.example", "chess")
+    );
+
+    // Naming a registered game from an unlisted origin: its own game.
+    let (status, _, body) = credential_from(&router, Some("https://evil.example"), "alpha").await;
+    assert_eq!(status, StatusCode::OK);
+    let evil = root_in(&body);
+    assert_ne!(Some(evil.clone()), registry.root_of("alpha"));
+    assert_eq!(
+        Some(evil),
+        registry.open_root_of("https://evil.example", "alpha")
+    );
+
+    // The listed origin still gets the registered game.
+    let (status, _, body) = credential_from(&router, Some(ORIGIN), "alpha").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(Some(root_in(&body)), registry.root_of("alpha"));
+
+    // No Origin: nothing to key an open game on.
+    let (status, _, body) = credential_from(&router, None, "chess").await;
+    assert_eq!(
+        (status, refusal_of(&body).as_str()),
+        (StatusCode::BAD_REQUEST, "malformed_request")
+    );
+    let (status, _, body) = credential_from(&router, Some("https://game.example"), "Bad Id").await;
+    assert_eq!(
+        (status, refusal_of(&body).as_str()),
+        (StatusCode::BAD_REQUEST, "malformed_request")
+    );
+}
+
+/// The trickle socket on a public anchor: any origin passes the origin
+/// gate and reaches the attempt-token gate, which still refuses without
+/// a token; a handshake with no `Origin` is still refused as one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_public_anchor_admits_any_origin_to_the_trickle_gate_but_not_a_missing_one() {
+    let anchor = anchor().await;
+    let (router, _) = open_router(&anchor);
+    let handshake = |origin: Option<&'static str>| {
+        let router = router.clone();
+        async move {
+            let mut builder = Request::builder()
+                .uri("/rtc/trickle?dialog=1&node_id=0x1")
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .header(header::SEC_WEBSOCKET_VERSION, "13")
+                .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==");
+            if let Some(origin) = origin {
+                builder = builder.header(header::ORIGIN, origin);
+            }
+            let response = router
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+    };
+    let (status, body) = handshake(Some("https://game.example")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let message: ErrorBody = serde_json::from_slice(&body).expect("an error body");
+    assert!(
+        message.message.contains("attempt token"),
+        "refused for the token, not the origin: {}",
+        message.message
+    );
+    let (status, body) = handshake(None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let message: ErrorBody = serde_json::from_slice(&body).expect("an error body");
+    assert!(
+        message.message.contains("origin"),
+        "no Origin is refused as an origin: {}",
+        message.message
+    );
 }
