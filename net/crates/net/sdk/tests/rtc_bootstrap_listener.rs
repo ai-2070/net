@@ -2435,3 +2435,135 @@ async fn a_public_anchor_admits_any_origin_to_the_trickle_gate_but_not_a_missing
         message.message
     );
 }
+
+// ---------------------------------------------------------------------------
+// Connection deadlines: what kept the public anchor's descriptors
+// ---------------------------------------------------------------------------
+
+/// A TLS listener with short connection deadlines, and the CA a client
+/// must trust to reach it.
+async fn short_deadline_listener(
+    anchor: &Arc<MeshNode>,
+    dir: &std::path::Path,
+) -> (
+    net_sdk::rtc_bootstrap::BootstrapHandle,
+    rustls::pki_types::CertificateDer<'static>,
+) {
+    let (ca_der, cert_pem, key_pem) = issue_localhost_certificate();
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, cert_pem).unwrap();
+    std::fs::write(&key_path, key_pem).unwrap();
+    let mut cfg = config(PSK);
+    cfg.tls = BootstrapTls::Operator {
+        cert_pem: cert_path,
+        key_pem: key_path,
+    };
+    cfg.tls_handshake_timeout = Duration::from_secs(1);
+    cfg.http_idle_timeout = Duration::from_secs(1);
+    let handle = serve_bootstrap(Arc::clone(anchor), cfg)
+        .await
+        .expect("the listener starts");
+    (handle, ca_der)
+}
+
+/// Read until the peer closes, or give up after `within`. `Ok` with
+/// everything read means the SERVER closed the connection in time.
+async fn read_until_closed<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    within: Duration,
+) -> Result<Vec<u8>, &'static str> {
+    use tokio::io::AsyncReadExt as _;
+    let mut all = Vec::new();
+    let mut buf = [0u8; 4096];
+    tokio::time::timeout(within, async {
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => all.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "the server kept the connection open")?;
+    Ok(all)
+}
+
+/// **A client that connects and never finishes the TLS handshake is
+/// dropped.** Such connections used to be held forever: enough of them
+/// (scanners, half-open pools) and the process ran out of file
+/// descriptors, after which the public anchor served nothing at all.
+///
+/// Inverse: take the handshake deadline out of `serve_one` and the
+/// silent socket stays open past the read window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_never_finishes_its_tls_handshake_is_dropped() {
+    let anchor = anchor().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, _) = short_deadline_listener(&anchor, dir.path()).await;
+
+    let mut silent = tokio::net::TcpStream::connect(handle.local_addr())
+        .await
+        .expect("connect");
+    let started = std::time::Instant::now();
+    read_until_closed(&mut silent, Duration::from_secs(6))
+        .await
+        .expect("a connection that never sends a ClientHello is closed");
+    assert!(
+        started.elapsed() >= Duration::from_millis(800),
+        "closed by the deadline, not at once: {:?}",
+        started.elapsed()
+    );
+
+    handle.shutdown().await;
+}
+
+/// **An idle keep-alive connection is closed.** After answering a
+/// request the listener waits for the next one only as long as the
+/// idle deadline, so connection pools that open and then say nothing
+/// (the traffic that filled the public anchor) cannot accumulate.
+///
+/// Inverse: drop the hyper timer from `serve_one` and hyper enforces
+/// no header deadline at all; the connection outlives the read window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_keep_alive_connection_is_closed_after_its_request() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let anchor = anchor().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, ca_der) = short_deadline_listener(&anchor, dir.path()).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca_der).unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(handle.local_addr())
+        .await
+        .expect("connect");
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            tcp,
+        )
+        .await
+        .expect("the handshake completes");
+    tls.write_all(b"GET /rtc/anchor HTTP/1.1\r\nhost: localhost\r\nconnection: keep-alive\r\n\r\n")
+        .await
+        .expect("send the request");
+
+    let answered = read_until_closed(&mut tls, Duration::from_secs(8))
+        .await
+        .expect("the idle connection is closed after its response");
+    let text = String::from_utf8_lossy(&answered);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "the request itself was served before the connection went idle: {text}"
+    );
+
+    handle.shutdown().await;
+}
