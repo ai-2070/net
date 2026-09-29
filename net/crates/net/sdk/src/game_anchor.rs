@@ -315,11 +315,11 @@ pub struct OpenGames {
 }
 
 /// Default [`OpenGames::capacity`].
-pub const DEFAULT_OPEN_GAME_CAPACITY: usize = 4096;
+pub const DEFAULT_OPEN_GAME_CAPACITY: usize = 8192;
 /// Default [`OpenGames::total_per_minute`].
-pub const DEFAULT_OPEN_TOTAL_PER_MINUTE: u32 = 3000;
+pub const DEFAULT_OPEN_TOTAL_PER_MINUTE: u32 = 9000;
 /// Default [`OpenGames::max_players_per_game`].
-pub const DEFAULT_OPEN_MAX_PLAYERS_PER_GAME: usize = 64;
+pub const DEFAULT_OPEN_MAX_PLAYERS_PER_GAME: usize = 256;
 /// Longest page origin an open game may be keyed on.
 pub const MAX_ORIGIN_LEN: usize = 256;
 

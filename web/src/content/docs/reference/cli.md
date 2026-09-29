@@ -201,13 +201,13 @@ net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
 - **Registered games stay yours.** `--game` and `--allow-origin` still work beside open games. A listed origin asking for a registered game gets that game. Any other origin naming it gets its own open game of the same name, never the registered one.
 - **Any origin may call the endpoints.** CORS echoes the caller's origin. It is never `*` and never allows credentials. Nothing on the anchor carries ambient authority (no cookies, no HTTP authentication), so a page can only spend a credential it fetched itself. The trickle socket still requires an `Origin` and the attempt token.
 - **Limits.**
-  - `--open-games-max` sets how many open games are held at once (default 4096). Past it, a new game is refused `rate_limited` until one has had no credential issued for the invite lifetime (12 hours). A game still in use is never evicted.
-  - `--open-games-per-minute` caps credentials across all open games together (default 3000), so inventing game names cannot multiply the budget. Each open game also has the per-game ceiling of 600.
-  - `--open-game-max-players` caps the players one open game may have enrolled at once (default 64), so no single game can take every peer slot. A visitor over the cap is refused at enrollment and may retry.
+  - `--open-games-max` sets how many open games are held at once (default 8192). Past it, a new game is refused `rate_limited` until one has had no credential issued for the invite lifetime (12 hours). A game still in use is never evicted.
+  - `--open-games-per-minute` caps credentials across all open games together (default 9000), so inventing game names cannot multiply the budget. Each open game also has the per-game ceiling of 600.
+  - `--open-game-max-players` caps the players one open game may have enrolled at once (default 256), so no single game can take every peer slot. A visitor over the cap is refused at enrollment and may retry.
   - The per-source-IP ceiling (`--credentials-per-minute`) applies as always.
 - **The state file** lists the open games held, one `<origin> <game>` per line. It lets a restarted anchor still admit a page that reconnects with a credential issued before the restart. Without it, such pages must fetch a new credential. Game roots are derived from `--issuer-identity`, not stored, so the file holds no secrets.
 - **Counters.** With `--game-stats-secs`, every game line carries its `origin` when it is an open game, and the line gains `open_games` (games held, capacity, state-file write errors). The start report shows `open_games: true`.
-- **Relay cost.** A public anchor relays for players whose networks cannot connect directly, and that bandwidth is yours. `--rtc-max-peers` (browser sessions held at once, default 256; size it to the host) and the per-game player cap bound how many players it serves. They do not bound bytes, so watch the host's traffic.
+- **Relay cost.** A public anchor relays for players whose networks cannot connect directly, and that bandwidth is yours. `--rtc-max-peers` (browser sessions held at once, default 1024; size it to the host) and the per-game player cap bound how many players it serves. They do not bound bytes, so watch the host's traffic.
 
 ## Serve IPv4 and IPv6 players
 

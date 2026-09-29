@@ -861,7 +861,7 @@ pub struct ServeArgs {
     #[arg(long = "rtc-stun-public-addr", value_name = "ADDR")]
     pub rtc_stun_public_addr: Vec<String>,
 
-    /// Browser sessions this anchor holds at once (default 256). Every
+    /// Browser sessions this anchor holds at once (default 1024). Every
     /// connected player is one, whatever its game, so a public anchor
     /// (`--open-games`) sizes this to its host.
     #[arg(long = "rtc-max-peers", value_name = "N")]
@@ -952,14 +952,14 @@ pub struct ServeArgs {
     )]
     pub open_games: Option<PathBuf>,
 
-    /// Open games held at once (default 4096). Past it a new game is
+    /// Open games held at once (default 8192). Past it a new game is
     /// refused until one has been idle for the invite lifetime; a game
     /// in use is never evicted.
     #[arg(long = "open-games-max", value_name = "N", requires = "open_games")]
     pub open_games_max: Option<usize>,
 
     /// Credentials per minute across ALL open games together (default
-    /// 3000), so inventing game names cannot multiply the budget. Each
+    /// 9000), so inventing game names cannot multiply the budget. Each
     /// open game also has the per-game ceiling of 600.
     #[arg(
         long = "open-games-per-minute",
@@ -969,7 +969,7 @@ pub struct ServeArgs {
     pub open_games_per_minute: Option<u32>,
 
     /// Players one open game may have enrolled on this anchor at once
-    /// (default 64), so no single game can take every peer slot
+    /// (default 256), so no single game can take every peer slot
     /// (`--rtc-max-peers`).
     #[arg(
         long = "open-game-max-players",
@@ -1161,14 +1161,18 @@ fn addrs_or_default(
 ///   additional to the first and never a replacement for it.
 ///   Neither flag given: no second socket, nothing announced.
 #[cfg(feature = "rtc-bootstrap")]
+/// `anchor serve`'s browser-session ceiling. Higher than the core's
+/// own default (256): an anchor exists to hold browser sessions, and
+/// every connected player is one, whatever its game.
+const DEFAULT_ANCHOR_MAX_PEERS: usize = 1024;
+
 fn rtc_config_from_args(args: &ServeArgs) -> Result<net::adapter::net::rtc::RtcConfig, CliError> {
     let mut rtc = net::adapter::net::rtc::RtcConfig::new().with_bootstrap_url(args.url.clone());
-    if let Some(max) = args.rtc_max_peers {
-        if max == 0 {
-            return Err(invalid_args("--rtc-max-peers must be at least 1"));
-        }
-        rtc.max_peers = max;
+    let max_peers = args.rtc_max_peers.unwrap_or(DEFAULT_ANCHOR_MAX_PEERS);
+    if max_peers == 0 {
+        return Err(invalid_args("--rtc-max-peers must be at least 1"));
     }
+    rtc.max_peers = max_peers;
     rtc.serve_stun = true;
     let (bind, bind_v6) = one_per_family("--rtc-bind", &args.rtc_bind)?;
     let (public, public_v6) = one_per_family("--rtc-public-addr", &args.rtc_public_addr)?;
@@ -1690,6 +1694,17 @@ mod tests {
         "--allow-origin",
         "https://app.example.com",
     ];
+
+    /// An anchor holds 1024 browser sessions unless told otherwise,
+    /// `--rtc-max-peers` overrides it, and zero is refused.
+    #[test]
+    fn the_session_ceiling_defaults_to_1024_and_zero_is_refused() {
+        let bare = rtc_config_from_args(&serve_args(&[])).expect("defaults parse");
+        assert_eq!(bare.max_peers, 1024);
+        let set = rtc_config_from_args(&serve_args(&["--rtc-max-peers", "32"])).expect("parses");
+        assert_eq!(set.max_peers, 32);
+        assert!(rtc_config_from_args(&serve_args(&["--rtc-max-peers", "0"])).is_err());
+    }
 
     /// `--open-games` makes `--allow-origin` optional (every origin may
     /// use the open games) and, like `--game`, needs the identity file;
