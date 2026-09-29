@@ -1,0 +1,26 @@
+docs/internal/plans/ANCHOR_DUAL_STACK_PLAN.md
+  s_d8b00bedd146e9::t_28df78620557cb 5,461
+  s_d8b00bedd146e9::t_2253d6a3e3f2ac 568-582,644-647
+web/src/content/docs/reference/cli.md
+  s_d8b00bedd146e9::t_2253d6a3e3f2ac 201-202,207-208
+.claude/skills/net-browser/SKILL.md
+  s_d8b00bedd146e9::t_2253d6a3e3f2ac 91-94
+web/src/content/docs/concepts/webrtc-transport.md
+  s_d8b00bedd146e9::t_2253d6a3e3f2ac 78-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ed23194a35ac2d2090d612fbb320598302da9b81",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
