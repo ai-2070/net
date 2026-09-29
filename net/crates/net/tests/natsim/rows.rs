@@ -101,6 +101,10 @@ pub enum Nat {
     /// `v6only` — an IPv6-only player behind a routing (not NAT'ing)
     /// gateway with a stateful firewall, and no IPv4 beyond loopback.
     V6Only,
+    /// `v6only-clat` — the same IPv6-only player on a 464XLAT network:
+    /// a CLAT gives it IPv4 (192.0.0.4) translated to IPv6, and a NAT64
+    /// on its gateway translates back.
+    V6OnlyClat,
 }
 
 impl Nat {
@@ -112,6 +116,7 @@ impl Nat {
             Self::Symmetric => "symmetric",
             Self::ConeArV4Only => "cone-ar-v4only",
             Self::V6Only => "v6only",
+            Self::V6OnlyClat => "v6only-clat",
         }
     }
 
@@ -125,6 +130,7 @@ impl Nat {
             "symmetric" => Some(Self::Symmetric),
             "cone-ar-v4only" => Some(Self::ConeArV4Only),
             "v6only" => Some(Self::V6Only),
+            "v6only-clat" => Some(Self::V6OnlyClat),
             _ => None,
         }
     }
@@ -415,6 +421,10 @@ pub enum Families {
     /// session on its own family, so a pass cannot come from a direct
     /// pair nobody meant to allow.
     V4MeetsV6,
+    /// **A is IPv4-only; B is IPv6-only on a 464XLAT network**: B has
+    /// IPv6 and an IPv4 route, and that IPv4 comes from a CLAT device,
+    /// not a native address. Read from the namespaces.
+    V4MeetsClat,
 }
 
 impl Row {
@@ -799,9 +809,32 @@ pub const DUAL_STACK_FIREFOX: Row = Row {
     families: Families::V4MeetsV6,
 };
 
+/// **Firefox where B's IPv6-only network is 464XLAT** — the support
+/// boundary of [`DUAL_STACK_FIREFOX`], measured from the other side.
+///
+/// Mobile IPv6-only networks are 464XLAT: no native IPv4, but a CLAT
+/// on the device gives it an IPv4 address and route, translated to
+/// IPv6 and back by a NAT64. That route is exactly what Firefox's
+/// permission-free default-address discovery needs, so here B gathers
+/// and connects. Expected direct: B's IPv4 reaches A through the NAT64
+/// and its masquerade, which is endpoint-independent, and A's
+/// address-restricted filter admits the checks once A has written to
+/// B's mapped address — the `cone-ar` rows' shape.
+pub const DUAL_STACK_FIREFOX_464XLAT: Row = Row {
+    scenario: "browser_dualstack_firefox_464xlat",
+    nat_a: Nat::ConeArV4Only,
+    nat_b: Nat::V6OnlyClat,
+    expect: Disposition::Direct,
+    why: "on a 464XLAT network the CLAT gives Firefox the IPv4 route its default-address \
+          discovery needs; B's translated IPv4 mapping is endpoint-independent and A's \
+          address-restricted filter admits it once A has written to it",
+    media: Media::None,
+    families: Families::V4MeetsClat,
+};
+
 /// Every scenario this slice defines: the six rows, the Firefox
 /// control, the two permission-free legs — direct and routed — then
-/// the two dual-stack rows.
+/// the dual-stack rows.
 pub fn all_scenarios() -> Vec<Row> {
     ROWS.iter()
         .copied()
@@ -811,6 +844,7 @@ pub fn all_scenarios() -> Vec<Row> {
             NO_MEDIA_RELAYED,
             DUAL_STACK,
             DUAL_STACK_FIREFOX,
+            DUAL_STACK_FIREFOX_464XLAT,
         ])
         .collect()
 }
@@ -1349,8 +1383,10 @@ impl RowVerdict {
         })
     }
 
-    /// The namespace half of the family witness: A has IPv4 and not
-    /// IPv6, B the reverse, read from the namespaces themselves.
+    /// The namespace half of the family witness, read from the
+    /// namespaces themselves: A has IPv4 and not IPv6, and B the
+    /// reverse — or, on a 464XLAT row, B has IPv6 and an IPv4 route
+    /// that comes from a CLAT device.
     pub fn check_family_flags(&self, row: &Row) -> Result<(), String> {
         if row.families == Families::Unasserted {
             return Ok(());
@@ -1368,12 +1404,22 @@ impl RowVerdict {
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(|| format!("families.{side}.{key} missing or not a bool: {f}"))
         };
-        for (side, family, expected) in [
-            ("a", "ipv4", true),
-            ("a", "ipv6", false),
-            ("b", "ipv4", false),
-            ("b", "ipv6", true),
-        ] {
+        let want: &[(&str, &str, bool)] = match row.families {
+            Families::V4MeetsClat => &[
+                ("a", "ipv4", true),
+                ("a", "ipv6", false),
+                ("b", "ipv4", true),
+                ("b", "ipv6", true),
+                ("b", "clat", true),
+            ],
+            _ => &[
+                ("a", "ipv4", true),
+                ("a", "ipv6", false),
+                ("b", "ipv4", false),
+                ("b", "ipv6", true),
+            ],
+        };
+        for &(side, family, expected) in want {
             let has = flag(side, family)?;
             if has != expected {
                 return Err(format!(
@@ -1405,6 +1451,11 @@ impl RowVerdict {
             )
         })?;
         self.check_family_flags(row)?;
+        // The anchor-pair half is the family BRIDGE's witness, and only
+        // the no-common-family row has one to prove.
+        if row.families != Families::V4MeetsV6 {
+            return Ok(());
+        }
         let pair = |side: &str| -> Result<(String, String), String> {
             let p = f
                 .get("anchor_pair")

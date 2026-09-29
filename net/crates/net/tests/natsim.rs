@@ -831,6 +831,17 @@ fn natsim_browser_firefox_cannot_reach_a_dual_stack_anchor_from_a_pure_ipv6_only
     browser_row(&rows::DUAL_STACK_FIREFOX);
 }
 
+/// Firefox where B's IPv6-only network is **464XLAT**, as mobile
+/// IPv6-only networks are: a CLAT gives B an IPv4 route translated to
+/// IPv6, which is all Firefox's permission-free default-address
+/// discovery needs. The other side of the pinned limitation above: B
+/// gathers, reaches the anchor, and meets A directly through the NAT64.
+#[test]
+#[ignore = "requires root + Linux netns + tayga + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_firefox_works_on_a_dual_stack_anchor_from_a_464xlat_network() {
+    browser_row(&rows::DUAL_STACK_FIREFOX_464XLAT);
+}
+
 // =========================================================================
 // Configuration-validation guards (no root, no netns — run anywhere
 // the suite compiles). These pin the harness's fail-loudly behavior

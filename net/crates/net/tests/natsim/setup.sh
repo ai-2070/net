@@ -68,6 +68,17 @@
 #               joiner has NO IPv4 address or route beyond loopback.
 #               Also gives the wan bridge its IPv6 prefix, so the
 #               anchor has an IPv6 address to be reached on.
+#   v6only-clat
+#             — `v6only` as a 464XLAT network, the way mobile IPv6-only
+#               networks are deployed: the player still has no native
+#               IPv4, but a CLAT in its namespace gives it an IPv4
+#               address (192.0.0.4) and route, translated to IPv6 toward
+#               the NAT64 prefix, and a NAT64 on its gateway translates
+#               back and masquerades out the gateway's IPv4 address.
+#               Both translators are tayga. The NAT64 prefix is the
+#               network-specific 2001:db8:64::/96, not the well-known
+#               64:ff9b::/96, which RFC 6052 forbids for the private
+#               IPv4 addresses this lab uses.
 #
 # --drop-direct installs forward-hook drops on BOTH gateways for UDP
 # addressed directly at the other side's public IP — kills punch
@@ -120,10 +131,10 @@ done
 # unrecognized used to fall through to the cone masquerade).
 for mode in "$NAT_A" "$NAT_B"; do
   case "$mode" in
-    cone|cone-ar|cone-pr|cone-ar-v4only|v6only|symmetric|upnp|none) ;;
+    cone|cone-ar|cone-pr|cone-ar-v4only|v6only|v6only-clat|symmetric|upnp|none) ;;
     *)
       echo "invalid NAT mode: '$mode'" \
-        "(want cone|cone-ar|cone-pr|cone-ar-v4only|v6only|symmetric|upnp|none)" >&2
+        "(want cone|cone-ar|cone-pr|cone-ar-v4only|v6only|v6only-clat|symmetric|upnp|none)" >&2
       exit 2
       ;;
   esac
@@ -198,13 +209,20 @@ fi
 # bridge could hold it. Existing rows are untouched: no IPv6 is
 # configured unless a row asks for it.
 WAN_V6=0
-[[ "$NAT_A" == v6only || "$NAT_B" == v6only ]] && WAN_V6=1
+[[ "$NAT_A" == v6only* || "$NAT_B" == v6only* ]] && WAN_V6=1
+# A 464XLAT side needs tayga, checked before anything is provisioned.
+if [[ "$NAT_A" == v6only-clat || "$NAT_B" == v6only-clat ]]; then
+  command -v tayga >/dev/null || {
+    echo "v6only-clat needs tayga (apt-get install tayga)" >&2
+    exit 2
+  }
+fi
 if [[ "$WAN_V6" == 1 ]]; then
   ip -n "$WAN" -6 addr add 2001:db8:99::1/64 dev br0 nodad
   ip -n "$WAN" -6 addr add 2001:db8:99::10/64 dev br0 nodad
 fi
 
-# one_side_v6only <letter> <gw index>
+# one_side_v6only <letter> <gw index> [clat]
 #
 # An IPv6-only player behind a ROUTING gateway. IPv6 is deployed
 # without NAT, so the joiner's address is global and the gateway's job
@@ -213,7 +231,7 @@ fi
 # no IPv4 address and no IPv4 route; its loopback keeps 127.0.0.1,
 # which is what serves the page on `http://localhost`.
 one_side_v6only() {
-  local L="$1" N="$2"
+  local L="$1" N="$2" CLAT="${3:-0}"
   local GW="nsim_gw$L" NS="nsim_$L"
   local WAN6="2001:db8:99::$N" LAN6="2001:db8:10$N::"
   ip netns add "$GW"
@@ -250,6 +268,69 @@ table inet natsim {
   }
 }
 EOF
+
+  [[ "$CLAT" == 1 ]] || return 0
+
+  # --- 464XLAT: the NAT64 half, on the gateway -------------------------
+  #
+  # The gateway gets an IPv4 address on the lab internet to masquerade
+  # out of, and tayga translates the NAT64 prefix to a private IPv4
+  # pool and back. The stateful `ct state new` drop above is an `inet`
+  # table, so it filters the translated IPv4 as well: this gateway
+  # admits replies only, like the IPv6 one it is.
+  local NAT64_PREFIX="2001:db8:64::/96" TAYGA_DIR="/tmp/natsim-tayga-gw$L"
+  mkdir -p "$TAYGA_DIR"
+  ip -n "$GW" addr add "10.99.0.$N/24" dev "gw$L-wan"
+  ip -n "$GW" route add default via 10.99.0.1
+  ip netns exec "$GW" sysctl -qw net.ipv4.ip_forward=1
+  cat >"$TAYGA_DIR/tayga.conf" <<EOF
+tun-device nat64
+ipv4-addr 192.168.255.1
+prefix $NAT64_PREFIX
+dynamic-pool 192.168.255.0/24
+data-dir $TAYGA_DIR
+EOF
+  ip netns exec "$GW" tayga --mktun -c "$TAYGA_DIR/tayga.conf"
+  ip -n "$GW" link set nat64 up
+  ip -n "$GW" route add 192.168.255.0/24 dev nat64
+  ip -n "$GW" -6 route add "$NAT64_PREFIX" dev nat64
+  ip netns exec "$GW" nft -f - <<EOF
+table ip natsim64 {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "gw$L-wan" masquerade
+  }
+}
+EOF
+  ip netns exec "$GW" tayga -c "$TAYGA_DIR/tayga.conf" --pidfile "$TAYGA_DIR/tayga.pid"
+
+  # --- 464XLAT: the CLAT half, in the player's namespace -----------------
+  #
+  # The player's IPv4 is 192.0.0.4 on the CLAT device (192.0.0.0/29 is
+  # the range RFC 7335 reserves for it), with the IPv4 default route
+  # pointing at the CLAT, which maps it to a dedicated IPv6 address
+  # (`::c`) in the player's /64. That address is not assigned to eth0
+  # — the kernel would then deliver it locally instead of to the CLAT —
+  # so the namespace forwards it to the CLAT and answers neighbour
+  # discovery for it on eth0.
+  local CLAT6="${LAN6}c" CLAT_DIR="/tmp/natsim-tayga-$L"
+  mkdir -p "$CLAT_DIR"
+  ip netns exec "$NS" sysctl -qw net.ipv6.conf.all.forwarding=1
+  ip netns exec "$NS" sysctl -qw net.ipv6.conf.eth0.proxy_ndp=1
+  cat >"$CLAT_DIR/tayga.conf" <<EOF
+tun-device clat
+ipv4-addr 192.0.0.1
+prefix $NAT64_PREFIX
+map 192.0.0.4 $CLAT6
+data-dir $CLAT_DIR
+EOF
+  ip netns exec "$NS" tayga --mktun -c "$CLAT_DIR/tayga.conf"
+  ip -n "$NS" link set clat up
+  ip -n "$NS" addr add 192.0.0.4/32 dev clat
+  ip -n "$NS" route add default dev clat
+  ip -n "$NS" -6 route add "$CLAT6" dev clat
+  ip -n "$NS" -6 neigh add proxy "$CLAT6" dev eth0
+  ip netns exec "$NS" tayga -c "$CLAT_DIR/tayga.conf" --pidfile "$CLAT_DIR/tayga.pid"
 }
 
 # one_side <letter> <gw_pub_ip> <lan_subnet> <nat_mode> <joiner_port>
@@ -257,10 +338,11 @@ EOF
 one_side() {
   local L="$1" PUB="$2" LAN="$3" MODE="$4" PORT="$5" RTC="${6:-}" STUN="${7:-}"
   [[ "$MODE" == "none" ]] && return 0
-  if [[ "$MODE" == "v6only" ]]; then
-    local N=2
+  if [[ "$MODE" == v6only* ]]; then
+    local N=2 CLAT=0
     [[ "$L" == b ]] && N=3
-    one_side_v6only "$L" "$N"
+    [[ "$MODE" == v6only-clat ]] && CLAT=1
+    one_side_v6only "$L" "$N" "$CLAT"
     return 0
   fi
   # `cone-ar-v4only` is `cone-ar` plus IPv6 switched off in the

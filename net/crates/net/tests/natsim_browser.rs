@@ -22,8 +22,8 @@ mod rows;
 
 use rows::{
     all_scenarios, AppExchange, Disposition, Enumeration, Forwarding, IceCounters, Media, Nat,
-    NatFlows, Row, RowVerdict, CONTROL, DUAL_STACK, DUAL_STACK_FIREFOX, NO_MEDIA, NO_MEDIA_RELAYED,
-    ROWS,
+    NatFlows, Row, RowVerdict, CONTROL, DUAL_STACK, DUAL_STACK_FIREFOX, DUAL_STACK_FIREFOX_464XLAT,
+    NO_MEDIA, NO_MEDIA_RELAYED, ROWS,
 };
 
 // =========================================================================
@@ -229,7 +229,11 @@ fn run_scenario_matrix_matches_the_rust_table() {
     // behaviour. The dual-stack rows are a different claim — support
     // per ENGINE for IPv6-only players — so they run each supported
     // engine by name and are pinned as their own exact set below.
-    let dual_stack = [DUAL_STACK.scenario, DUAL_STACK_FIREFOX.scenario];
+    let dual_stack = [
+        DUAL_STACK.scenario,
+        DUAL_STACK_FIREFOX.scenario,
+        DUAL_STACK_FIREFOX_464XLAT.scenario,
+    ];
     let firefox: Vec<&str> = arms
         .iter()
         .filter(|a| a.engine_a == "firefox" || a.engine_b == "firefox")
@@ -262,6 +266,12 @@ fn run_scenario_matrix_matches_the_rust_table() {
         vec![
             (DUAL_STACK.scenario, "chromium", "chromium", "none"),
             (DUAL_STACK_FIREFOX.scenario, "firefox", "firefox", "none"),
+            (
+                DUAL_STACK_FIREFOX_464XLAT.scenario,
+                "firefox",
+                "firefox",
+                "none"
+            ),
         ],
         "the dual-stack claim is per supported engine, each permission-free — Firefox's as a \
          pinned support decision"

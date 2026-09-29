@@ -223,6 +223,11 @@ case "$SCENARIO" in
   # with no IPv4 route (its default-address discovery tries IPv4 only),
   # so B must fail typed ice-timeout and A must still connect.
   browser_dualstack_firefox_pure_v6_unreachable) NAT_A=cone-ar-v4only NAT_B=v6only MODE=browser EXPECT=unreachable ENGINE_A=firefox ENGINE_B=firefox MEDIA=none OUTCOME_NODE=browser ;;
+  # The same Firefox pair where B's IPv6-only network is 464XLAT, as
+  # mobile IPv6-only networks are: B still has no native IPv4, but its
+  # CLAT gives it an IPv4 route, which is all Firefox's default-address
+  # discovery needs. The support boundary, measured from the other side.
+  browser_dualstack_firefox_464xlat) NAT_A=cone-ar-v4only NAT_B=v6only-clat MODE=browser EXPECT=direct ENGINE_A=firefox ENGINE_B=firefox MEDIA=none OUTCOME_NODE=browser ;;
   *) echo "unknown scenario: $SCENARIO" >&2; exit 2 ;;
 esac
 
@@ -397,7 +402,7 @@ if [[ "$MODE" == browser ]]; then
   # A row with an IPv6-only side makes the anchor dual-stack: its
   # IPv6 address is the one `setup.sh` gave the wan bridge.
   ANCHOR_V6_ARGS=()
-  if [[ "$NAT_A" == v6only || "$NAT_B" == v6only ]]; then
+  if [[ "$NAT_A" == v6only* || "$NAT_B" == v6only* ]]; then
     ANCHOR_V6_ARGS=(--anchor-ip6 2001:db8:99::10)
   fi
   ip netns exec nsim_wan env RUST_LOG="$NATSIM_BROWSER_LOG" \
@@ -582,7 +587,14 @@ if [[ "$MODE" == browser ]]; then
   # two sides share no family, so neither gateway can hold a flow to
   # the other at all, and the witness reads "measured, none".
   peer_of() { # peer_of <nat mode> <ipv4 public> <ipv6 lan index>
-    if [[ "$1" == v6only ]]; then echo "2001:db8:10$3::2"; else echo "$2"; fi
+    # A 464XLAT side reaches IPv4 peers from its gateway's own IPv4
+    # address (NAT64, then masquerade) — the same public IPv4 a NAT'd
+    # side has.
+    case "$1" in
+      v6only) echo "2001:db8:10$3::2" ;;
+      v6only-clat) echo "10.99.0.$3" ;;
+      *) echo "$2" ;;
+    esac
   }
   {
     printf '{"a":'

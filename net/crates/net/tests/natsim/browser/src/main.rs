@@ -266,7 +266,10 @@ impl Matrix {
     /// an IPv6-only player, IPv4 for every other. An IPv6-only side
     /// without `--anchor-ip6` is a mis-wired run, refused by name.
     fn anchor_host_for(&self, nat: &str) -> Result<IpAddr, String> {
-        if nat == "v6only" {
+        // A 464XLAT player (`v6only-clat`) is still an IPv6 player: its
+        // IPv4 is translated, and a dual-stack name resolves to IPv6
+        // first for it too.
+        if nat.starts_with("v6only") {
             self.anchor_ip6.map(IpAddr::V6).ok_or_else(|| {
                 "a v6only side needs --anchor-ip6: the anchor has no IPv6 address for it to reach"
                     .to_owned()
@@ -1162,7 +1165,16 @@ async fn namespace_families(netns: &str) -> Result<serde_json::Value, String> {
         || has("-4", &["route", "show", "default"]).await?;
     let v6 = has("-6", &["addr", "show", "scope", "global"]).await?
         || has("-6", &["route", "show", "default"]).await?;
-    Ok(serde_json::json!({ "ipv4": v4, "ipv6": v6 }))
+    // A CLAT device (464XLAT) is what gives an IPv6-only player its
+    // IPv4 route; its presence is what distinguishes that IPv4 from a
+    // native one.
+    let clat = tokio::process::Command::new("ip")
+        .args(["-n", netns, "link", "show", "dev", "clat"])
+        .output()
+        .await
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    Ok(serde_json::json!({ "ipv4": v4, "ipv6": v6, "clat": clat }))
 }
 
 /// A leaf's node id as the page reports it: 16 lowercase hex digits.

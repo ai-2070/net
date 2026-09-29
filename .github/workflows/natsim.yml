@@ -74,7 +74,7 @@ jobs:
           # into the Firefox control row's profile NSS database. The
           # driver REFUSES the run if it cannot seed it, so without this
           # the control row fails loudly rather than running untrusted.
-          sudo apt-get install -y -q nftables iproute2 conntrack libnss3-tools tcpdump xvfb
+          sudo apt-get install -y -q nftables iproute2 conntrack libnss3-tools tcpdump xvfb tayga
 
       # A display for the HEADED Chromium rows. The Chromium NAT rows
       # fail inside the engine — every anchor-side boundary passes and
@@ -247,6 +247,7 @@ jobs:
           natsim_browser_symmetric_symmetric_is_relayed_without_media_permission
           natsim_browser_ipv4_only_meets_ipv6_only_through_a_dual_stack_anchor
           natsim_browser_firefox_cannot_reach_a_dual_stack_anchor_from_a_pure_ipv6_only_network
+          natsim_browser_firefox_works_on_a_dual_stack_anchor_from_a_464xlat_network
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "NAT conformance rows" --mode fn \
@@ -272,8 +273,8 @@ jobs:
           # observes BOTH of its mapped endpoints answering — plus the
           # two dual-stack rows (IPv4-only meets IPv6-only, Chromium
           # and Firefox; ANCHOR_DUAL_STACK_PLAN.md slice 4).
-          if [ "${ran:-0}" -lt 18 ]; then
-            echo "::error::natsim ran ${ran:-0} scenarios, floor is 18 — \
+          if [ "${ran:-0}" -lt 19 ]; then
+            echo "::error::natsim ran ${ran:-0} scenarios, floor is 19 — \
           lower the floor deliberately or restore the row"
             exit 1
           fi
