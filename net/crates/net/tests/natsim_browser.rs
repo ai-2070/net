@@ -263,7 +263,13 @@ fn run_scenario_matrix_matches_the_rust_table() {
             (DUAL_STACK.scenario, "chromium", "chromium", "none"),
             (DUAL_STACK_FIREFOX.scenario, "firefox", "firefox", "none"),
         ],
-        "the dual-stack claim is per supported engine, each permission-free"
+        "the dual-stack claim is per supported engine, each permission-free — Firefox's as a \
+         pinned support decision"
+    );
+    assert_eq!(
+        DUAL_STACK_FIREFOX.expect,
+        Disposition::Unreachable,
+        "the Firefox dual-stack row pins its limitation; flipping it is a deliberate edit"
     );
     let control = arms
         .iter()
@@ -368,6 +374,13 @@ fn the_anchor_bootstrap_dialog_is_counted_in_every_expectation() {
                 (want.direct, want.relayed),
                 (1, 1),
                 "{}: the anchor dialog is still direct on a relayed row",
+                row.scenario
+            ),
+            // Side A's anchor dialog only: B never reached the anchor.
+            Disposition::Unreachable => assert_eq!(
+                (want.attempted, want.direct, want.relayed),
+                (1, 1, 0),
+                "{}: an unreachable row counts side A's anchor dialog and nothing else",
                 row.scenario
             ),
         }
@@ -957,7 +970,7 @@ fn delivery_and_the_counter_disposition_are_two_assertions() {
 fn every_row_names_the_forwarding_disposition_its_expectation_implies() {
     for row in rows::all_scenarios() {
         let want = match row.expect {
-            Disposition::Direct => Forwarding::Flat,
+            Disposition::Direct | Disposition::Unreachable => Forwarding::Flat,
             Disposition::Relayed => Forwarding::Carried,
         };
         assert_eq!(
@@ -1191,4 +1204,69 @@ fn a_nat_row_ignores_the_family_witness() {
         .expect("parse")
         .check(row)
         .expect("a NAT row asserts nothing about families");
+}
+
+// =========================================================================
+// The pinned engine limitation (Disposition::Unreachable)
+// =========================================================================
+
+/// What a correct unreachable-B verdict looks like: side A connected
+/// with its one anchor dialog direct, side B's connect ended as
+/// `b_kind`, no exchange, and the players' families from the
+/// namespaces (no anchor pair for B: it never had a session).
+fn unreachable_verdict(b_kind: &str) -> serde_json::Value {
+    let row = &DUAL_STACK_FIREFOX;
+    serde_json::json!({
+        "scenario": row.scenario,
+        "nat_a": row.nat_a.mode(),
+        "nat_b": row.nat_b.mode(),
+        "engine_a": "firefox",
+        "engine_b": "firefox",
+        "page_type": "",
+        "peer_page_type": "",
+        "page_detail": "",
+        "a": { "node_id": "00000000000000aa", "counters": counters_json(row.leaf_expectation()) },
+        "b": { "node_id": "", "counters": null },
+        // The runner reads the anchor's ledger on every path; this row
+        // asserts nothing about it (B's dialog may still be pending).
+        "anchor": { "counters": counters_json(row.anchor_expectation()) },
+        "media": row.media.flag(),
+        "app": null,
+        "families": {
+            "a": { "ipv4": true, "ipv6": false },
+            "b": { "ipv4": false, "ipv6": true },
+        },
+        "b_connect_kind": b_kind,
+        "errors": [],
+    })
+}
+
+#[test]
+fn a_pinned_unreachable_side_passes_as_a_typed_ice_timeout() {
+    RowVerdict::from_json(&unreachable_verdict("ice-timeout"))
+        .expect("parse")
+        .check(&DUAL_STACK_FIREFOX)
+        .expect("B failed typed ice-timeout, A connected, families disjoint");
+}
+
+/// `udp-blocked` from a browser whose probes could not run is exactly
+/// the false diagnosis the probes' `notRun` rule removes.
+#[test]
+fn a_pinned_unreachable_side_reporting_udp_blocked_fails() {
+    let err = RowVerdict::from_json(&unreachable_verdict("udp-blocked"))
+        .expect("parse")
+        .check(&DUAL_STACK_FIREFOX)
+        .expect_err("udp-blocked is a false diagnosis here");
+    assert!(err.contains("not typed `ice-timeout`"), "{err}");
+}
+
+/// The limitation disappearing must be LOUD: the row fails and says
+/// to flip it, rather than passing a result it did not predict.
+#[test]
+fn a_pinned_unreachable_side_that_connects_fails_so_it_gets_flipped() {
+    let err = RowVerdict::from_json(&unreachable_verdict("connected"))
+        .expect("parse")
+        .check(&DUAL_STACK_FIREFOX)
+        .expect_err("the engine limitation is gone");
+    assert!(err.contains("flip it deliberately"), "{err}");
 }

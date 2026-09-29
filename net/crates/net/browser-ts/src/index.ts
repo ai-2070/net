@@ -157,6 +157,7 @@ export {
   probeStunBindings,
   reflexiveAddress,
   stunProbeAnswered,
+  stunProbeVerdict,
 } from './udp-probe.js';
 export type {
   BootstrapProbeOptions,

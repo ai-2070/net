@@ -963,6 +963,9 @@ struct Verdict {
     /// player's families and the anchor's selected pair with each.
     /// `null` on rows without an IPv6-only side.
     families: serde_json::Value,
+    /// How side B's connect ended on a row that pins B as unable to
+    /// reach the anchor: its error kind, or `connected`.
+    b_connect_kind: Option<String>,
 }
 
 impl Verdict {
@@ -990,8 +993,15 @@ impl Verdict {
             // driver that ignored it.
             "media": self.media,
             "enumeration": self.enumeration,
-            "app": self.app.to_json(),
+            // No exchange runs on a row that pins B as unreachable, and
+            // an empty report would read as a measured one.
+            "app": if self.b_connect_kind.is_some() {
+                serde_json::Value::Null
+            } else {
+                self.app.to_json()
+            },
             "families": self.families,
+            "b_connect_kind": self.b_connect_kind,
             "a": self.a.to_json(),
             "b": self.b.to_json(),
             "anchor": { "counters": self.anchor },
@@ -1728,6 +1738,10 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
             "[runner] row {} landed {d}, expected {} — {}",
             row.scenario, row.expect, row.why
         ),
+        None if row.expect == Disposition::Unreachable => println!(
+            "[runner] row {} pins b as unreachable; b's connect ended as {:?}",
+            row.scenario, verdict.b_connect_kind
+        ),
         None => println!(
             "[runner] row {} reached no disposition: {:?}",
             row.scenario, verdict.page_type
@@ -1784,6 +1798,41 @@ async fn drive_sequence(
     // is one-sided is the first thing a NAT row has to say.
     let b_connected = tab_b.run(connect_step("b")).await?;
     let a_connected = tab_a.run(connect_step("a")).await?;
+    // A row that PINS side B as unable to reach the anchor (a named
+    // engine limitation, `rows.rs` `Disposition::Unreachable`): B's
+    // failure is the measurement, not an error. Record how B ended,
+    // require A, witness the families, settle A, and stop — there is
+    // no peer dialog to run.
+    if row_for(m)?.expect == Disposition::Unreachable {
+        verdict.b_connect_kind = Some(if b_connected.ok {
+            "connected".to_owned()
+        } else {
+            b_connected
+                .page_type
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned())
+        });
+        println!(
+            "[runner] unreachable row: b's connect ended as {:?} ({})",
+            verdict.b_connect_kind,
+            b_connected.detail()
+        );
+        if let Some(failure) = step_failure("a", &a_connected) {
+            return Err(failure);
+        }
+        verdict.a.node_id = a_connected
+            .node_id
+            .clone()
+            .ok_or("tab a reported no node id")?;
+        if m.anchor_ip6.is_some() {
+            verdict.families = serde_json::json!({
+                "a": namespace_families(&m.netns_a).await?,
+                "b": namespace_families(&m.netns_b).await?,
+            });
+        }
+        verdict.a = settle(tab_a, verdict.a.node_id.clone(), m.settle).await?;
+        return Ok(());
+    }
     let refused: Vec<String> = [("b", &b_connected), ("a", &a_connected)]
         .into_iter()
         .filter_map(|(tab, r)| step_failure(tab, r))

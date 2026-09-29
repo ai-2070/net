@@ -218,7 +218,11 @@ case "$SCENARIO" in
   # without a media grant or it is a named support decision in the
   # plan, never a quiet fallback to whichever engine worked.
   browser_dualstack_v4_meets_v6) NAT_A=cone-ar-v4only NAT_B=v6only MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium MEDIA=none OUTCOME_NODE=browser ;;
-  browser_dualstack_v4_meets_v6_firefox) NAT_A=cone-ar-v4only NAT_B=v6only MODE=browser EXPECT=relayed ENGINE_A=firefox ENGINE_B=firefox MEDIA=none OUTCOME_NODE=browser ;;
+  # Firefox on the same topology is a NAMED SUPPORT DECISION, pinned:
+  # without a media permission it cannot gather on an IPv6-only network
+  # with no IPv4 route (its default-address discovery tries IPv4 only),
+  # so B must fail typed ice-timeout and A must still connect.
+  browser_dualstack_firefox_pure_v6_unreachable) NAT_A=cone-ar-v4only NAT_B=v6only MODE=browser EXPECT=unreachable ENGINE_A=firefox ENGINE_B=firefox MEDIA=none OUTCOME_NODE=browser ;;
   *) echo "unknown scenario: $SCENARIO" >&2; exit 2 ;;
 esac
 

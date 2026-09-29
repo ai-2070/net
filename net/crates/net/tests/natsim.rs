@@ -816,11 +816,18 @@ fn natsim_browser_ipv4_only_meets_ipv6_only_through_a_dual_stack_anchor() {
     browser_row(&rows::DUAL_STACK);
 }
 
-/// The same on Firefox, both sides: the dual-stack claim is per
-/// supported engine, and a Chromium pass cannot stand in for it.
+/// Firefox on the same topology: a **named support decision**, pinned.
+///
+/// Without a media permission Firefox cannot use WebRTC on an
+/// IPv6-only network with no IPv4 route — its default-address
+/// discovery connects one IPv4 socket, fails, and gathers nothing
+/// (measured from its own `moz_log`). The row asserts exactly that and
+/// no more: B's connect fails typed `ice-timeout`, never `udp-blocked`
+/// (its probes could not run), and A still connects. A Firefox that
+/// starts working fails this row, which is the prompt to flip it.
 #[test]
 #[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
-fn natsim_browser_ipv4_only_meets_ipv6_only_through_a_dual_stack_anchor_on_firefox() {
+fn natsim_browser_firefox_cannot_reach_a_dual_stack_anchor_from_a_pure_ipv6_only_network() {
     browser_row(&rows::DUAL_STACK_FIREFOX);
 }
 

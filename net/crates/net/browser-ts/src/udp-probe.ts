@@ -55,7 +55,11 @@ export type StunProbeOutcome =
  * line, or an `icecandidateerror`'s STUN error code. The shape of the
  * shared vector file both probes are tested against.
  */
-export type ProbeEvent = { readonly candidate: string } | { readonly error: number };
+export type ProbeEvent =
+  | { readonly candidate: string }
+  | { readonly error: number }
+  /** The probe connection's ICE state became `failed`. */
+  | { readonly ice: 'failed' };
 
 /**
  * Is this candidate line server-reflexive? The `typ` token followed by
@@ -78,12 +82,28 @@ export function candidateLineIsReflexive(line: string): boolean {
  */
 export function probeEventAnswers(event: ProbeEvent): boolean {
   if ('candidate' in event) return candidateLineIsReflexive(event.candidate);
-  return event.error < STUN_NO_RESPONSE_CODE;
+  if ('error' in event) return event.error < STUN_NO_RESPONSE_CODE;
+  return false;
+}
+
+/**
+ * The verdict over everything one probe reported: `answered` when any
+ * event answers, `notRun` when the engine failed the connection before
+ * gathering a single candidate (nothing was sent, so silence is not
+ * evidence — measured: Firefox without a media permission on an
+ * IPv6-only network with no IPv4 route), `unanswered` otherwise. The
+ * Rust probe's `probe_verdict`, the same three answers.
+ */
+export function stunProbeVerdict(events: readonly ProbeEvent[]): 'answered' | 'unanswered' | 'notRun' {
+  if (events.some(probeEventAnswers)) return 'answered';
+  const gathered = events.some((event) => 'candidate' in event);
+  const failed = events.some((event) => 'ice' in event && event.ice === 'failed');
+  return failed && !gathered ? 'notRun' : 'unanswered';
 }
 
 /** {@link probeEventAnswers} over everything one probe reported. */
 export function stunProbeAnswered(events: readonly ProbeEvent[]): boolean {
-  return events.some(probeEventAnswers);
+  return stunProbeVerdict(events) === 'answered';
 }
 
 /** One endpoint and what probing it established. */
@@ -218,12 +238,26 @@ export async function probeStunBinding(
     });
   };
 
+  // Did the engine gather anything at all? A connection it fails
+  // before the first candidate is one it could not gather for, and
+  // such a probe did not run (see `stunProbeVerdict`).
+  let gathered = false;
+  pc.oniceconnectionstatechange = () => {
+    if (pc.iceConnectionState === 'failed' && !gathered) {
+      settle({
+        type: 'notRun',
+        reason: 'the engine failed the probe connection before gathering any candidate',
+      });
+    }
+  };
+
   pc.onicecandidate = (event) => {
     const candidate = event.candidate;
     if (candidate === null) {
       gatheringDone();
       return;
     }
+    gathered = true;
     // Host candidates are gathered regardless of what the network does
     // to UDP — Chromium even hides them behind an mDNS `.local` name —
     // so only a reflexive one is evidence.
@@ -263,6 +297,7 @@ export async function probeStunBinding(
     clearTimeout(timer);
     pc.onicecandidate = null;
     pc.onicecandidateerror = null;
+    pc.oniceconnectionstatechange = null;
     pc.onicegatheringstatechange = null;
     pc.close();
   }

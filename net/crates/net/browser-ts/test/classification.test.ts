@@ -27,7 +27,7 @@ import {
   probeStunBinding,
   probeStunBindings,
   reflexiveAddress,
-  stunProbeAnswered,
+  stunProbeVerdict,
   type ProbeEvent,
   type StunProbeOutcome,
 } from '../src/udp-probe.js';
@@ -109,8 +109,8 @@ describe('the shared STUN probe rule', () => {
     expect(verdicts.cases.length).toBeGreaterThanOrEqual(10);
   });
 
-  it.each(verdicts.cases)('$name', ({ events, answered }) => {
-    expect(stunProbeAnswered(events as ProbeEvent[])).toBe(answered);
+  it.each(verdicts.cases)('$name', ({ events, verdict }) => {
+    expect(stunProbeVerdict(events as ProbeEvent[])).toBe(verdict);
   });
 });
 
@@ -328,6 +328,21 @@ describe('probeStunBinding', () => {
     expect(connections[0]?.closed).toBe(true);
   });
 
+  // Measured (dual-stack plan, slice 4): Firefox without a media
+  // permission on an IPv6-only network with no IPv4 route fails every
+  // connection before gathering anything. Such a probe sent nothing,
+  // and must never be counted as unanswered — that is the path that
+  // told a browser which could not gather that UDP was blocked.
+  it('reports notRun when the engine fails the connection before gathering anything', async () => {
+    const outcome = await probeStunBinding(PROBED, {
+      timeoutMs: 1000,
+      peerConnectionFactory: fakePeerConnection((pc) => {
+        pc.failIce();
+      }),
+    });
+    expect(outcome.type).toBe('notRun');
+  });
+
   it('does not run at all against something that is not an address', async () => {
     const outcome = await probeStunBinding('not-an-address!', {
       peerConnectionFactory: fakePeerConnection(() => {
@@ -488,7 +503,9 @@ class FakePeerConnection {
   onicecandidate: ((event: { candidate: RTCIceCandidate | null }) => void) | null = null;
   onicecandidateerror: ((event: { errorCode: number; errorText: string; url: string }) => void) | null = null;
   onicegatheringstatechange: (() => void) | null = null;
+  oniceconnectionstatechange: (() => void) | null = null;
   iceGatheringState = 'new';
+  iceConnectionState = 'new';
   closed = false;
   channels: string[] = [];
 
@@ -523,6 +540,11 @@ class FakePeerConnection {
   emitError(errorCode: number, errorText: string): void {
     const url = firstIceUrl(this.config);
     this.onicecandidateerror?.({ errorCode, errorText, url });
+  }
+
+  failIce(): void {
+    this.iceConnectionState = 'failed';
+    this.oniceconnectionstatechange?.();
   }
 
   completeGathering(): void {

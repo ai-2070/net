@@ -28,6 +28,9 @@ fn event(value: &serde_json::Value) -> ProbeEvent {
     if let Some(line) = value.get("candidate").and_then(serde_json::Value::as_str) {
         return ProbeEvent::Candidate(line.to_string());
     }
+    if value.get("ice").and_then(serde_json::Value::as_str) == Some("failed") {
+        return ProbeEvent::ConnectionFailed;
+    }
     let code = value
         .get("error")
         .and_then(serde_json::Value::as_u64)
@@ -48,10 +51,11 @@ fn the_rust_probe_rule_agrees_with_every_shared_vector() {
             .iter()
             .map(event)
             .collect();
-        let want = if case["answered"].as_bool().expect("answered") {
-            ProbeOutcome::Answered
-        } else {
-            ProbeOutcome::Unanswered
+        let want = match case["verdict"].as_str().expect("verdict") {
+            "answered" => ProbeOutcome::Answered,
+            "unanswered" => ProbeOutcome::Unanswered,
+            "notRun" => ProbeOutcome::NotRun,
+            other => panic!("{name}: unknown verdict {other:?}"),
         };
         assert_eq!(probe_verdict(&events), want, "{name}");
     }

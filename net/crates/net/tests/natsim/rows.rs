@@ -145,6 +145,14 @@ pub enum Disposition {
     /// ICE could not solve: the routed session through the anchor was
     /// kept, and the page surface says so.
     Relayed,
+    /// **Side B cannot reach the anchor at all: a named engine
+    /// limitation**, pinned rather than papered over
+    /// (`ANCHOR_DUAL_STACK_PLAN.md`, slice 4). There is no peer dialog.
+    /// B's connect must fail TYPED `ice-timeout` — never `udp-blocked`,
+    /// because B's probes could not run — and side A must still
+    /// connect. If B ever connects, the row fails loudly: the
+    /// limitation is gone and the row should become a pass.
+    Unreachable,
 }
 
 impl Disposition {
@@ -153,6 +161,7 @@ impl Disposition {
         match self {
             Self::Direct => "direct",
             Self::Relayed => "relayed",
+            Self::Unreachable => "unreachable",
         }
     }
 
@@ -160,6 +169,7 @@ impl Disposition {
         match s {
             "direct" => Some(Self::Direct),
             "relayed" => Some(Self::Relayed),
+            "unreachable" => Some(Self::Unreachable),
             _ => None,
         }
     }
@@ -184,6 +194,8 @@ impl Disposition {
         match self {
             Self::Direct => "direct",
             Self::Relayed => "iceTimeout",
+            // No peer dialog runs, so no `PeerConnectOutcome` exists.
+            Self::Unreachable => "none",
         }
     }
 
@@ -192,6 +204,7 @@ impl Disposition {
         match self {
             Self::Direct => "ice_direct",
             Self::Relayed => "ice_relayed",
+            Self::Unreachable => "none",
         }
     }
 }
@@ -427,6 +440,13 @@ impl Row {
                 relayed: 1,
                 ..IceCounters::default()
             },
+            // Side A only: its anchor dialog, direct, and no peer
+            // dialog. Side B never reached the anchor.
+            Disposition::Unreachable => IceCounters {
+                attempted: 1,
+                direct: 1,
+                ..IceCounters::default()
+            },
         }
     }
 
@@ -480,6 +500,8 @@ impl Row {
         match self.expect {
             Disposition::Direct => Forwarding::Flat,
             Disposition::Relayed => Forwarding::Carried,
+            // No exchange runs; nothing may be forwarded between them.
+            Disposition::Unreachable => Forwarding::Flat,
         }
     }
 
@@ -748,17 +770,31 @@ pub const DUAL_STACK: Row = Row {
     families: Families::V4MeetsV6,
 };
 
-/// [`DUAL_STACK`] on Firefox, both sides: the second supported engine.
-/// Not a control of the NAT axis (that is [`CONTROL`]) but a required
-/// engine for the dual-stack claim — a Chromium pass cannot stand in
-/// for it.
+/// [`DUAL_STACK`]'s topology on Firefox, both sides — and a **named
+/// support decision** (maintainer, 2026-09-29), not a pass.
+///
+/// Measured (natsim runs 36496321778, 36499600332, Firefox's own
+/// `moz_log`): without a media permission Firefox runs "use only
+/// default local addresses", and its default-address discovery
+/// connects ONE IPv4 socket (`PR_Connect failed: -5980`, network
+/// unreachable), reports "failed to find default addresses" and
+/// gathers nothing — although it had enumerated the IPv6 address.
+/// Every connection fails within milliseconds. A page cannot change
+/// that, and asking a data-only game for a microphone is not a fix.
+///
+/// So the row pins it: B's connect fails TYPED `ice-timeout` (never
+/// `udp-blocked`: its probes did not run), A still connects, and a
+/// Firefox that starts working fails the row loudly so it can be
+/// flipped to a pass. Pure IPv6-only only: a 464XLAT network gives the
+/// device an IPv4 route, which is a separate row.
 pub const DUAL_STACK_FIREFOX: Row = Row {
-    scenario: "browser_dualstack_v4_meets_v6_firefox",
+    scenario: "browser_dualstack_firefox_pure_v6_unreachable",
     nat_a: Nat::ConeArV4Only,
     nat_b: Nat::V6Only,
-    expect: Disposition::Relayed,
-    why: "the dual-stack family bridge on Firefox: the claim holds per supported engine, not \
-          for whichever engine passed",
+    expect: Disposition::Unreachable,
+    why: "Firefox without a media permission cannot use WebRTC on an IPv6-only network with \
+          no IPv4 route: its default-address discovery tries IPv4 only and gives up, so B \
+          gathers nothing (measured, moz_log). A named support decision, pinned",
     media: Media::None,
     families: Families::V4MeetsV6,
 };
@@ -1199,6 +1235,10 @@ pub struct RowVerdict {
     /// the runner, and the anchor's selected pair with each. Only a
     /// dual-stack row requires it; `None` elsewhere.
     pub families: Option<serde_json::Value>,
+    /// How side B's connect ended, on a row that pins B as unable to
+    /// reach the anchor: the error kind (`ice-timeout`, …) or
+    /// `connected`. `None` on every other row.
+    pub b_connect_kind: Option<String>,
     /// Anything the runner could not do. Non-empty fails the row
     /// before any counter is read: a verdict written around an error
     /// is not a measurement.
@@ -1229,14 +1269,22 @@ impl RowVerdict {
         // exactly this shape. So when `errors` is non-empty the
         // ledgers default and `check` reports the errors first, which
         // it does unconditionally.
+        // A row that pins side B as unable to reach the anchor measures
+        // B's FAILURE: B has no ledger and no exchange ran. Those two
+        // absences are accepted only when the verdict says how B ended.
+        let b_connect_kind = v
+            .get("b_connect_kind")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let side = |key: &str| -> Result<IceCounters, String> {
+            let unreachable_b = key == "b" && b_connect_kind.is_some();
             let Some(obj) = v.get(key).and_then(|s| s.get("counters")) else {
-                if errors.is_empty() {
+                if errors.is_empty() && !unreachable_b {
                     return Err(format!("verdict field {key}.counters missing"));
                 }
                 return Ok(IceCounters::default());
             };
-            if obj.is_null() && !errors.is_empty() {
+            if obj.is_null() && (!errors.is_empty() || unreachable_b) {
                 return Ok(IceCounters::default());
             }
             IceCounters::from_json(obj).map_err(|e| format!("{key}.counters: {e}"))
@@ -1279,7 +1327,7 @@ impl RowVerdict {
                 Some(obj) if !obj.is_null() => {
                     AppExchange::from_json(obj).map_err(|e| format!("app: {e}"))?
                 }
-                _ if !errors.is_empty() => AppExchange::default(),
+                _ if !errors.is_empty() || b_connect_kind.is_some() => AppExchange::default(),
                 Some(_) => {
                     return Err(
                         "verdict field app is null and the runner reported no error, so the \
@@ -1296,8 +1344,48 @@ impl RowVerdict {
                 }
             },
             families: v.get("families").filter(|f| !f.is_null()).cloned(),
+            b_connect_kind,
             errors,
         })
+    }
+
+    /// The namespace half of the family witness: A has IPv4 and not
+    /// IPv6, B the reverse, read from the namespaces themselves.
+    pub fn check_family_flags(&self, row: &Row) -> Result<(), String> {
+        if row.families == Families::Unasserted {
+            return Ok(());
+        }
+        let f = self.families.as_ref().ok_or_else(|| {
+            format!(
+                "row {} asserts the players share no address family, but the verdict carries \
+                 no `families` witness",
+                row.scenario
+            )
+        })?;
+        let flag = |side: &str, key: &str| -> Result<bool, String> {
+            f.get(side)
+                .and_then(|s| s.get(key))
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| format!("families.{side}.{key} missing or not a bool: {f}"))
+        };
+        for (side, family, expected) in [
+            ("a", "ipv4", true),
+            ("a", "ipv6", false),
+            ("b", "ipv4", false),
+            ("b", "ipv6", true),
+        ] {
+            let has = flag(side, family)?;
+            if has != expected {
+                return Err(format!(
+                    "row {}: player {side} {} {family} (a global address or a default route), \
+                     so the two players are not an IPv4-only and an IPv6-only one and the row \
+                     proves nothing about the families: {f}",
+                    row.scenario,
+                    if has { "has" } else { "lacks" },
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The dual-stack witness: A is IPv4-only and B IPv6-only, read
@@ -1316,30 +1404,7 @@ impl RowVerdict {
                 row.scenario
             )
         })?;
-        let flag = |side: &str, key: &str| -> Result<bool, String> {
-            f.get(side)
-                .and_then(|s| s.get(key))
-                .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| format!("families.{side}.{key} missing or not a bool: {f}"))
-        };
-        let want = [
-            ("a", "ipv4", true),
-            ("a", "ipv6", false),
-            ("b", "ipv4", false),
-            ("b", "ipv6", true),
-        ];
-        for (side, family, expected) in want {
-            let has = flag(side, family)?;
-            if has != expected {
-                return Err(format!(
-                    "row {}: player {side} {} {family} (a global address or a default route), \
-                     so the two players are not an IPv4-only and an IPv6-only one and a relayed \
-                     result proves nothing about the family bridge: {f}",
-                    row.scenario,
-                    if has { "has" } else { "lacks" },
-                ));
-            }
-        }
+        self.check_family_flags(row)?;
         let pair = |side: &str| -> Result<(String, String), String> {
             let p = f
                 .get("anchor_pair")
@@ -1367,6 +1432,52 @@ impl RowVerdict {
             }
         }
         Ok(())
+    }
+
+    /// The [`Disposition::Unreachable`] path: a named engine
+    /// limitation, pinned. No peer dialog ran, so there is no
+    /// disposition, exchange or anchor ledger to hold to the relayed
+    /// rows' numbers; what IS required is exact.
+    fn check_unreachable(&self, row: &Row) -> Result<(), String> {
+        if self.scenario != row.scenario {
+            return Err(format!(
+                "verdict is for scenario {:?}, expected {:?}",
+                self.scenario, row.scenario
+            ));
+        }
+        match self.b_connect_kind.as_deref() {
+            Some("ice-timeout") => {}
+            Some("connected") => {
+                return Err(format!(
+                    "row {}: side B CONNECTED. This row pins an engine limitation ({}); it is \
+                     gone, so the row should become a pass — flip it deliberately",
+                    row.scenario, row.why
+                ))
+            }
+            Some(other) => {
+                return Err(format!(
+                    "row {}: side B's connect failed as {other:?}, not typed `ice-timeout`. A \
+                     `udp-blocked` here is the false diagnosis the probes' notRun rule \
+                     exists to prevent: B's probes could not run",
+                    row.scenario
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "row {}: the verdict does not say how side B's connect ended",
+                    row.scenario
+                ))
+            }
+        }
+        self.a
+            .check_exact("side a (leaf)", row.leaf_expectation())?;
+        if self.media != row.media.flag() {
+            return Err(format!(
+                "row {} ran with media {:?} but the table says {}",
+                row.scenario, self.media, row.media
+            ));
+        }
+        self.check_family_flags(row)
     }
 
     /// The disposition one side's `PeerConnectOutcome` reports, or the
@@ -1399,6 +1510,9 @@ impl RowVerdict {
                 "the runner reported errors, so nothing below is a measurement: {:?}",
                 self.errors
             ));
+        }
+        if row.expect == Disposition::Unreachable {
+            return self.check_unreachable(row);
         }
         if self.scenario != row.scenario {
             return Err(format!(
@@ -1577,7 +1691,7 @@ impl NatFlows {
                 }
                 Ok(())
             }
-            Disposition::Relayed => {
+            Disposition::Relayed | Disposition::Unreachable => {
                 if self.a.udp_replied != 0 || self.b.udp_replied != 0 {
                     return Err(format!(
                         "row {} claims relayed, but a gateway saw a two-way UDP flow to the \

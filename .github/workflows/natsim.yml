@@ -137,6 +137,9 @@ jobs:
           a_shared_family_fails_the_dual_stack_row
           an_anchor_session_on_the_wrong_family_fails
           a_nat_row_ignores_the_family_witness
+          a_pinned_unreachable_side_passes_as_a_typed_ice_timeout
+          a_pinned_unreachable_side_reporting_udp_blocked_fails
+          a_pinned_unreachable_side_that_connects_fails_so_it_gets_flipped
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "natsim matrix table" --mode fn \
@@ -145,8 +148,8 @@ jobs:
             grep -q "^test $w \.\.\. ok$" /tmp/natsim_rows.log || {
               echo "::error::the matrix-table witness $w did not run and pass"; exit 1; }
           done
-          grep -q "^test result: ok. 46 passed" /tmp/natsim_rows.log || {
-            echo "::error::expected 46 matrix-table witnesses"; exit 1; }
+          grep -q "^test result: ok. 49 passed" /tmp/natsim_rows.log || {
+            echo "::error::expected 49 matrix-table witnesses"; exit 1; }
 
       # The repo root resolves `stable`; `net/crates/net/**` resolves the
       # PINNED toolchain from `rust-toolchain.toml`, and they are separate
@@ -243,7 +246,7 @@ jobs:
           natsim_natted_anchor_publishes_both_mapped_endpoints
           natsim_browser_symmetric_symmetric_is_relayed_without_media_permission
           natsim_browser_ipv4_only_meets_ipv6_only_through_a_dual_stack_anchor
-          natsim_browser_ipv4_only_meets_ipv6_only_through_a_dual_stack_anchor_on_firefox
+          natsim_browser_firefox_cannot_reach_a_dual_stack_anchor_from_a_pure_ipv6_only_network
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "NAT conformance rows" --mode fn \

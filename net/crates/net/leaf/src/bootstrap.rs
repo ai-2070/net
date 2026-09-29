@@ -551,9 +551,11 @@ pub async fn stun_probe_outcomes(endpoints: &[String]) -> Vec<(String, ProbeOutc
         // probe.
         probe.connection.set_onicecandidate(None);
         set_onicecandidateerror(&probe.connection, None);
+        probe.connection.set_oniceconnectionstatechange(None);
         let verdict = probe_verdict(&probe.events.borrow());
         drop(probe.on_icecandidate);
         drop(probe.on_icecandidateerror);
+        drop(probe.on_iceconnectionstatechange);
         if let Some(slot) = outcomes.get_mut(index) {
             slot.1 = verdict;
         }
@@ -574,6 +576,16 @@ pub enum ProbeEvent {
     Candidate(String),
     /// An `icecandidateerror`, as its STUN error code.
     CandidateError(u16),
+    /// The probe connection's ICE state became `failed`.
+    ///
+    /// On its own it says nothing about the network. Before ANY
+    /// candidate it is the engine refusing to gather at all — measured:
+    /// Firefox without a media permission on an IPv6-only network with
+    /// no IPv4 route fails every connection within milliseconds because
+    /// its default-address discovery tries IPv4 only
+    /// (`ANCHOR_DUAL_STACK_PLAN.md`, slice 4). Such a probe sent
+    /// nothing, so it did not run.
+    ConnectionFailed,
 }
 
 /// What probing one endpoint established.
@@ -614,14 +626,30 @@ pub fn probe_event_answers(event: &ProbeEvent) -> bool {
             tokens.windows(2).any(|pair| pair == ["typ", "srflx"])
         }
         ProbeEvent::CandidateError(code) => *code < STUN_NO_RESPONSE_CODE,
+        ProbeEvent::ConnectionFailed => false,
     }
 }
 
 /// [`probe_event_answers`] over everything one probe reported, for a
 /// probe that ran to its deadline.
+///
+/// Three answers, not two. Any answering event is `Answered`. A
+/// connection the engine failed before gathering a single candidate is
+/// `NotRun`: nothing was sent, so silence is not evidence, and
+/// counting it `Unanswered` is how a browser that could not gather at
+/// all was told UDP is blocked. Everything else is `Unanswered`.
 pub fn probe_verdict(events: &[ProbeEvent]) -> ProbeOutcome {
     if events.iter().any(probe_event_answers) {
-        ProbeOutcome::Answered
+        return ProbeOutcome::Answered;
+    }
+    let gathered = events
+        .iter()
+        .any(|event| matches!(event, ProbeEvent::Candidate(_)));
+    let failed = events
+        .iter()
+        .any(|event| matches!(event, ProbeEvent::ConnectionFailed));
+    if failed && !gathered {
+        ProbeOutcome::NotRun
     } else {
         ProbeOutcome::Unanswered
     }
@@ -890,6 +918,7 @@ struct StunProbe {
     events: std::rc::Rc<core::cell::RefCell<Vec<ProbeEvent>>>,
     on_icecandidate: Closure<dyn FnMut(RtcPeerConnectionIceEvent)>,
     on_icecandidateerror: Closure<dyn FnMut(web_sys::RtcPeerConnectionIceErrorEvent)>,
+    on_iceconnectionstatechange: Closure<dyn FnMut(web_sys::Event)>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -929,6 +958,16 @@ fn build_probe(rtc_addr: &str) -> Result<StunProbe> {
     )
         as Box<dyn FnMut(web_sys::RtcPeerConnectionIceErrorEvent)>);
     set_onicecandidateerror(&connection, Some(error_closure.as_ref().unchecked_ref()));
+    // The engine giving up on the connection: before any candidate,
+    // that is "could not gather", and the probe did not run.
+    let states = std::rc::Rc::clone(&events);
+    let watched = connection.clone();
+    let state_closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        if watched.ice_connection_state() == web_sys::RtcIceConnectionState::Failed {
+            states.borrow_mut().push(ProbeEvent::ConnectionFailed);
+        }
+    }) as Box<dyn FnMut(web_sys::Event)>);
+    connection.set_oniceconnectionstatechange(Some(state_closure.as_ref().unchecked_ref()));
 
     // A channel is what makes the browser gather at all.
     let init = RtcDataChannelInit::new();
@@ -957,6 +996,7 @@ fn build_probe(rtc_addr: &str) -> Result<StunProbe> {
         events,
         on_icecandidate: closure,
         on_icecandidateerror: error_closure,
+        on_iceconnectionstatechange: state_closure,
     })
 }
 

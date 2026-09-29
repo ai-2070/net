@@ -545,6 +545,35 @@ checks and says so.
     producing `udp-blocked`. A probe whose connection gave up before
     gathering anything did not run; it should be `NotRun`. It is to be fixed
     once the Firefox cause is known, with a vector case in the shared file.
+- **Iteration 2 (natsim run 36499600332).**
+  - **Chromium: PASS.** `browser_dualstack_v4_meets_v6`, permission-free,
+    with every check green. The per-family STUN endpoint was the fix.
+  - **Firefox: still failed; cause identified from its own `moz_log`.**
+    Without a media permission Firefox runs "use only default local
+    addresses". Its discovery connects ONE IPv4 socket
+    (`Creating socket … IP4:0.0.0.0:0`, `PR_Connect failed: -5980`, network
+    unreachable), then logs "failed to find default addresses" and gathers
+    nothing, although it had enumerated `2001:db8:103::2`. It never tries
+    the IPv6 default route. A page cannot change this, and a microphone
+    grant for a data-only game is not a fix.
+- **Named support decision (maintainer, 2026-09-29).** Firefox without a
+  media permission is **unsupported on pure IPv6-only networks with no IPv4
+  route** (no CLAT).
+  - **The Firefox row is pinned**, not dropped:
+    `browser_dualstack_firefox_pure_v6_unreachable`,
+    `Disposition::Unreachable`.
+  - **What it requires:** B's connect fails typed `ice-timeout`, A connects
+    with an exact ledger, and the families are witnessed. A Firefox that
+    starts connecting fails the row loudly, so it gets flipped.
+  - **The 464XLAT case gets its own row** (the next iteration), to show
+    Firefox works where the network gives the device an IPv4 route, as
+    mobile IPv6-only networks do.
+- **Defect fixed (honesty, slice 3's probes).** A probe connection the engine
+  fails before gathering a single candidate now reads `notRun`, not
+  `unanswered`, in both the Rust and TypeScript probes. That was the path by
+  which Firefox B, which could not gather at all, was told UDP was blocked.
+  - Covered by 3 new cases in the shared vector file (`ice: failed`), a TS
+    probe test, and 3 table tests for the pinned row.
 - **Risk to watch (did not occur; see iteration 1).** On an IPv6 network without NAT, a STUN reply maps to the
   host's own address, and libwebrtc may not surface a server-reflexive
   candidate identical to the host one. If so, the leaf's IPv6 probe of the
