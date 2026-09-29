@@ -27803,16 +27803,43 @@ impl MeshNode {
     /// browser outside the NAT cannot use the bound address.
     #[cfg(feature = "webrtc")]
     pub fn bootstrap_host_candidate(&self) -> Option<String> {
-        let driver = self.rtc_driver.as_ref()?;
-        let addr = self
-            .config
-            .rtc
-            .as_ref()
+        self.bootstrap_host_candidates().into_iter().next()
+    }
+
+    /// Every host candidate this anchor offers, in SDP form, primary
+    /// first: one per RTC socket, so two on a dual-stack anchor
+    /// (`ANCHOR_DUAL_STACK_PLAN.md`). The trickle socket sends each,
+    /// and [`Self::bootstrap_host_candidate`] is the first of them.
+    #[cfg(feature = "webrtc")]
+    pub fn bootstrap_host_candidates(&self) -> Vec<String> {
+        self.rtc_advertised_addrs()
+            .into_iter()
+            .filter_map(|addr| str0m::Candidate::host(addr, "udp").ok())
+            .map(|c| c.to_sdp_string())
+            .collect()
+    }
+
+    /// The addresses this anchor's RTC sockets are advertised as,
+    /// primary first: the operator's public override for each socket
+    /// when configured, otherwise what the socket bound. Empty
+    /// without an RTC driver.
+    ///
+    /// The same values the driver puts on every session's host
+    /// candidates, so what a browser is told over signalling and
+    /// what it finds in the session answer never disagree.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_advertised_addrs(&self) -> Vec<SocketAddr> {
+        let Some(driver) = self.rtc_driver.as_ref() else {
+            return Vec::new();
+        };
+        let rtc = self.config.rtc.as_ref();
+        let primary = rtc
             .and_then(|rtc| rtc.public_addr)
             .unwrap_or_else(|| driver.local_addr());
-        str0m::Candidate::host(addr, "udp")
-            .ok()
-            .map(|c| c.to_sdp_string())
+        let v6 = driver
+            .local_addr_v6()
+            .map(|bound| rtc.and_then(|rtc| rtc.public_addr_v6).unwrap_or(bound));
+        std::iter::once(primary).chain(v6).collect()
     }
 
     /// End a bootstrap dialog the browser abandoned (Stage 4b): the
@@ -27893,6 +27920,29 @@ impl MeshNode {
         self.config.rtc.as_ref().and_then(|rtc| rtc.public_addr)
     }
 
+    /// The operator-published public address of the **IPv6** RTC
+    /// socket on a dual-stack anchor — [`Self::rtc_public_addr`]'s
+    /// counterpart, and `None` unless both the socket and its public
+    /// address are configured.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_addr_v6(&self) -> Option<SocketAddr> {
+        let rtc = self.config.rtc.as_ref()?;
+        rtc.bind_addr_v6?;
+        rtc.public_addr_v6
+    }
+
+    /// Every operator-published RTC endpoint, primary first: the
+    /// values `GET /rtc/anchor` reports and a leaf's diagnostic probe
+    /// may aim at. Published only, never a bound address, which is
+    /// what [`Self::rtc_public_addr`] means too.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_addrs(&self) -> Vec<SocketAddr> {
+        self.rtc_public_addr()
+            .into_iter()
+            .chain(self.rtc_public_addr_v6())
+            .collect()
+    }
+
     /// The **separately announced STUN endpoint**, when configured.
     ///
     /// Distinct from [`Self::rtc_public_addr`] on purpose, and this is
@@ -27926,6 +27976,31 @@ impl MeshNode {
         let rtc = self.config.rtc.as_ref()?;
         let bound = self.rtc_driver.as_ref().and_then(|d| d.stun_local_addr());
         rtc.advertised_stun_addr(bound)
+    }
+
+    /// The announced **IPv6** STUN endpoint of a dual-stack anchor,
+    /// resolved as [`Self::rtc_public_stun_addr`] is.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_stun_addr_v6(&self) -> Option<SocketAddr> {
+        let rtc = self.config.rtc.as_ref()?;
+        let bound = self
+            .rtc_driver
+            .as_ref()
+            .and_then(|d| d.stun_local_addr_v6());
+        rtc.advertised_stun_addr_v6(bound)
+    }
+
+    /// Every announced STUN endpoint, primary first: one per family on
+    /// a dual-stack anchor. What a leaf's default `iceServers` should
+    /// hold, because a browser that cannot enumerate interfaces only
+    /// gets a usable local candidate from a STUN server of its own
+    /// family.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_stun_addrs(&self) -> Vec<SocketAddr> {
+        self.rtc_public_stun_addr()
+            .into_iter()
+            .chain(self.rtc_public_stun_addr_v6())
+            .collect()
     }
 
     /// `rtc_stats()` without requiring a driver to exist.
@@ -28063,28 +28138,20 @@ impl MeshNode {
     /// same socket.
     #[cfg(feature = "webrtc")]
     async fn trickle_local_candidate(&self, peer_node_id: u64, dialog: u64) {
-        let Some(driver) = self.rtc_driver.as_ref() else {
-            return;
-        };
-        let addr = self
-            .config
-            .rtc
-            .as_ref()
-            .and_then(|rtc| rtc.public_addr)
-            .unwrap_or_else(|| driver.local_addr());
-        let Ok(candidate) = str0m::Candidate::host(addr, "udp") else {
-            return;
-        };
-        let _ = self
-            .send_rtc_signal(
-                peer_node_id,
-                &super::rtc::RtcSignalMsg::Candidate {
-                    dialog,
-                    candidate: candidate.to_sdp_string(),
-                    mid: "0".to_string(),
-                },
-            )
-            .await;
+        // One frame per RTC socket: a dual-stack anchor trickles both
+        // families, primary first.
+        for candidate in self.bootstrap_host_candidates() {
+            let _ = self
+                .send_rtc_signal(
+                    peer_node_id,
+                    &super::rtc::RtcSignalMsg::Candidate {
+                        dialog,
+                        candidate,
+                        mid: "0".to_string(),
+                    },
+                )
+                .await;
+        }
     }
 
     /// **The production completion owner for one dialog (R4).**

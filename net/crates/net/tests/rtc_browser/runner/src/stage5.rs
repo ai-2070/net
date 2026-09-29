@@ -5298,9 +5298,11 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 // Both halves: the kind the wrapper reports AND the
                 // Rust Display it claims to carry. `IceTimeout`'s
                 // text also mentions UDP, so the prefix is matched,
-                // never a substring.
+                // never a substring. The Display states the
+                // observation, not a cause (dual-stack plan, slice 3).
                 let typed = kind == "udp-blocked"
-                    && message.starts_with("rtc: UDP appears blocked:")
+                    && message
+                        .starts_with("rtc: no UDP response from the anchor's advertised endpoints:")
                     && !blocked.test_error.unwrap_or(false);
                 let prompt = elapsed.is_finite() && elapsed < 45_000.0;
                 // The control: with the profile gone the same connect

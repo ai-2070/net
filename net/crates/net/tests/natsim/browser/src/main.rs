@@ -102,7 +102,7 @@ mod driver;
 mod rows;
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -214,6 +214,12 @@ struct Matrix {
     engine_a: String,
     engine_b: String,
     anchor_ip: Ipv4Addr,
+    /// The anchor's IPv6 address, which makes it **dual-stack**
+    /// (`ANCHOR_DUAL_STACK_PLAN.md`, slice 4): an RTC socket, a
+    /// bootstrap listener and a control listener in each family, and
+    /// a tab behind a `v6only` gateway reaches all of them over IPv6.
+    /// `None` on every row without an IPv6-only side.
+    anchor_ip6: Option<Ipv6Addr>,
     /// The address of the run's STUN responder, which MUST NOT be the
     /// anchor's own RTC socket. See `run_row` — the whole of §6.12.
     /// Accepted and deliberately UNUSED since §6.12.2.
@@ -253,6 +259,33 @@ struct Matrix {
     /// exact nonce equality, and a longer wait cannot turn the wrong
     /// nonce into the right one.
     app_exchange: Duration,
+}
+
+impl Matrix {
+    /// The anchor address a tab behind `nat` reaches it on: IPv6 for
+    /// an IPv6-only player, IPv4 for every other. An IPv6-only side
+    /// without `--anchor-ip6` is a mis-wired run, refused by name.
+    fn anchor_host_for(&self, nat: &str) -> Result<IpAddr, String> {
+        // A 464XLAT player (`v6only-clat`) is still an IPv6 player: its
+        // IPv4 is translated, and a dual-stack name resolves to IPv6
+        // first for it too.
+        if nat.starts_with("v6only") {
+            self.anchor_ip6.map(IpAddr::V6).ok_or_else(|| {
+                "a v6only side needs --anchor-ip6: the anchor has no IPv6 address for it to reach"
+                    .to_owned()
+            })
+        } else {
+            Ok(IpAddr::V4(self.anchor_ip))
+        }
+    }
+}
+
+/// An address as a URL host: bracketed for IPv6.
+fn url_host(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -338,6 +371,10 @@ fn parse_args() -> Result<Mode, String> {
         anchor_ip: need("anchor-ip")?
             .parse()
             .map_err(|e| format!("--anchor-ip: {e}"))?,
+        anchor_ip6: flags
+            .get("anchor-ip6")
+            .map(|v| v.parse().map_err(|e| format!("--anchor-ip6: {e}")))
+            .transpose()?,
         // Defaulted, and passed explicitly by `run_scenario.sh`
         // because the lab's second public address is a fact of the
         // topology that file owns. 10.99.0.11 is `X`, the aux public
@@ -768,7 +805,7 @@ struct Ca {
 /// the leaf carries an `iPAddress` SAN. A DNS-only certificate would
 /// have needed a resolvable name inside two namespaces with no
 /// resolver, which is a second mechanism to get wrong.
-fn issue_certificate(dir: &Path, ip: Ipv4Addr) -> Result<Ca, String> {
+fn issue_certificate(dir: &Path, ip: Ipv4Addr, ip6: Option<Ipv6Addr>) -> Result<Ca, String> {
     let mut ca_params =
         rcgen::CertificateParams::new(Vec::<String>::new()).map_err(|e| e.to_string())?;
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -791,6 +828,13 @@ fn issue_certificate(dir: &Path, ip: Ipv4Addr) -> Result<Ca, String> {
         rcgen::SanType::IpAddress(IpAddr::V4(ip)),
         rcgen::SanType::DnsName("localhost".try_into().map_err(|_| "localhost san")?),
     ];
+    // A dual-stack anchor is reached over IPv6 too, and the name on
+    // the certificate is the address the tab dials.
+    if let Some(ip6) = ip6 {
+        leaf_params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress(IpAddr::V6(ip6)));
+    }
     let leaf_key = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
     let leaf = leaf_params
         .signed_by(&leaf_key, &issuer)
@@ -918,6 +962,13 @@ struct Verdict {
     /// row it is the finding itself.
     enumeration: serde_json::Value,
     app: AppExchangeReport,
+    /// The dual-stack family witness (`rows.rs` `Families`): each
+    /// player's families and the anchor's selected pair with each.
+    /// `null` on rows without an IPv6-only side.
+    families: serde_json::Value,
+    /// How side B's connect ended on a row that pins B as unable to
+    /// reach the anchor: its error kind, or `connected`.
+    b_connect_kind: Option<String>,
 }
 
 impl Verdict {
@@ -945,7 +996,15 @@ impl Verdict {
             // driver that ignored it.
             "media": self.media,
             "enumeration": self.enumeration,
-            "app": self.app.to_json(),
+            // No exchange runs on a row that pins B as unreachable, and
+            // an empty report would read as a measured one.
+            "app": if self.b_connect_kind.is_some() {
+                serde_json::Value::Null
+            } else {
+                self.app.to_json()
+            },
+            "families": self.families,
+            "b_connect_kind": self.b_connect_kind,
             "a": self.a.to_json(),
             "b": self.b.to_json(),
             "anchor": { "counters": self.anchor },
@@ -1079,6 +1138,45 @@ fn nonce(scenario: &str, tab: &str) -> String {
     secret_hex(scenario, tab, "app-nonce")[..16].to_owned()
 }
 
+/// Which address families a namespace can use to leave it: a GLOBAL
+/// address or a default route, per family. Read with `ip` from the
+/// namespace itself, so the dual-stack row's "these two players share
+/// no family" is a fact about the topology the browsers ran in rather
+/// than about the script that meant to build it.
+async fn namespace_families(netns: &str) -> Result<serde_json::Value, String> {
+    let has = |family: &'static str, what: &'static [&'static str]| {
+        let netns = netns.to_owned();
+        async move {
+            let out = tokio::process::Command::new("ip")
+                .args(["-n", &netns, family])
+                .args(what)
+                .output()
+                .await
+                .map_err(|e| format!("ip -n {netns} {family} {what:?}: {e}"))?;
+            if !out.status.success() {
+                // `ip -6` in a namespace with IPv6 disabled has no table
+                // to show; that is "no IPv6", not an error.
+                return Ok::<bool, String>(false);
+            }
+            Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+        }
+    };
+    let v4 = has("-4", &["addr", "show", "scope", "global"]).await?
+        || has("-4", &["route", "show", "default"]).await?;
+    let v6 = has("-6", &["addr", "show", "scope", "global"]).await?
+        || has("-6", &["route", "show", "default"]).await?;
+    // A CLAT device (464XLAT) is what gives an IPv6-only player its
+    // IPv4 route; its presence is what distinguishes that IPv4 from a
+    // native one.
+    let clat = tokio::process::Command::new("ip")
+        .args(["-n", netns, "link", "show", "dev", "clat"])
+        .output()
+        .await
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    Ok(serde_json::json!({ "ipv4": v4, "ipv6": v6, "clat": clat }))
+}
+
 /// A leaf's node id as the page reports it: 16 lowercase hex digits.
 fn parse_node_id(hex: &str) -> Result<u64, String> {
     u64::from_str_radix(hex.trim_start_matches("0x"), 16)
@@ -1157,12 +1255,30 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         // exactly the harness search this acceptance item forbids.
         stun_addr: Some(SocketAddr::new(IpAddr::V4(m.anchor_ip), m.stun_port)),
         stun_public_addr: Some(SocketAddr::new(IpAddr::V4(m.anchor_ip), m.stun_port)),
+        // The dual-stack anchor's IPv6 STUN endpoint: without it an
+        // IPv6-only Chromium tab that does not enumerate interfaces
+        // gathers no usable candidate and sends no ICE check at all
+        // (measured on the first dual-stack run).
+        stun_addr_v6: m
+            .anchor_ip6
+            .map(|ip| SocketAddr::new(IpAddr::V6(ip), m.stun_port)),
+        stun_public_addr_v6: m
+            .anchor_ip6
+            .map(|ip| SocketAddr::new(IpAddr::V6(ip), m.stun_port)),
         // The anchor is NOT behind a NAT here: it lives on the
         // simulated internet, and its bind address is the address the
         // browsers reach. `public_addr` is still set explicitly so the
         // announced `rtc_addr` is a fact of this configuration rather
         // than of whatever the socket happened to bind.
         public_addr: Some(rtc_bind),
+        // The dual-stack socket, when the row has an IPv6-only side:
+        // the same port in the other family, published as itself.
+        bind_addr_v6: m
+            .anchor_ip6
+            .map(|ip| SocketAddr::new(IpAddr::V6(ip), m.rtc_port)),
+        public_addr_v6: m
+            .anchor_ip6
+            .map(|ip| SocketAddr::new(IpAddr::V6(ip), m.rtc_port)),
         // Comfortably above the page's own step budget so a slow ICE
         // in a namespace reports as a page-side timeout naming the
         // step, not as an anchor that retired the attempt underneath
@@ -1227,7 +1343,7 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
     // and must keep being answered.
 
     // --- 2. TLS + the bootstrap listener ---------------------------
-    let ca = issue_certificate(&work, m.anchor_ip)?;
+    let ca = issue_certificate(&work, m.anchor_ip, m.anchor_ip6)?;
     let page_origin = format!("http://localhost:{}", m.page_port);
     let bootstrap_bind = SocketAddr::new(IpAddr::V4(m.anchor_ip), m.bootstrap_port);
     let issuer = Identity::generate();
@@ -1244,22 +1360,47 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
     // Both namespaces serve their page on `localhost:<page_port>`, so
     // ONE origin covers both browsers.
     boot.offers_per_ip_per_minute = 200;
+    // The dual-stack anchor's second listener: same port, the other
+    // family, the SAME router state (so an attempt minted over one
+    // family is valid on the other).
+    if let Some(ip6) = m.anchor_ip6 {
+        boot.additional_bind_addrs = vec![SocketAddr::new(IpAddr::V6(ip6), m.bootstrap_port)];
+    }
     let listener = serve_bootstrap(Arc::clone(&anchor), boot)
         .await
         .map_err(|e| format!("bootstrap listener: {e}"))?;
-    let bootstrap_url = format!("https://{}:{}", m.anchor_ip, listener.local_addr().port());
-    println!("[runner] bootstrap {bootstrap_url}");
+    // Each tab dials the anchor on the family it has: its own
+    // bootstrap URL, and a credential naming that URL.
+    let host_a = m.anchor_host_for(&m.nat_a)?;
+    let host_b = m.anchor_host_for(&m.nat_b)?;
+    let bootstrap_url_for = |host: IpAddr| {
+        format!(
+            "https://{}:{}",
+            url_host(host),
+            listener.local_addr().port()
+        )
+    };
+    let bootstrap_url_a = bootstrap_url_for(host_a);
+    let bootstrap_url_b = bootstrap_url_for(host_b);
+    println!(
+        "[runner] bootstrap {bootstrap_url_a} (a), {bootstrap_url_b} (b), listening on {:?}",
+        listener.local_addrs()
+    );
 
     let root_entity = Identity::generate().entity_id().clone();
-    let credential = BrowserBootstrapCredential::mint(
-        &issuer,
-        InviteToken::mint(&root_entity, &bootstrap_url, Duration::from_secs(600)),
-        *anchor.public_key(),
-        Psk::new(PSK),
-        &bootstrap_url,
-        Duration::from_secs(86_400),
-    )
-    .encode();
+    let mint = |url: &str| {
+        BrowserBootstrapCredential::mint(
+            &issuer,
+            InviteToken::mint(&root_entity, url, Duration::from_secs(600)),
+            *anchor.public_key(),
+            Psk::new(PSK),
+            url,
+            Duration::from_secs(86_400),
+        )
+        .encode()
+    };
+    let credential_a = mint(&bootstrap_url_a);
+    let credential_b = mint(&bootstrap_url_b);
 
     // --- 3. the control plane --------------------------------------
     let mut queues: HashMap<String, Queue> = HashMap::new();
@@ -1270,17 +1411,25 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         senders.insert(tab, tx);
     }
     let control_bind = SocketAddr::new(IpAddr::V4(m.anchor_ip), m.control_port);
-    serve_control(
-        control_bind,
-        Control {
-            queues: Arc::new(queues),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            origin: page_origin.clone(),
-        },
-    )
-    .await?;
-    let control_url = format!("http://{}:{}", m.anchor_ip, m.control_port);
-    println!("[runner] control {control_url}");
+    let control = Control {
+        queues: Arc::new(queues),
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        origin: page_origin.clone(),
+    };
+    // One control state, served on each family the tabs use: an
+    // IPv6-only tab has no route to the IPv4 listener.
+    if let Some(ip6) = m.anchor_ip6 {
+        serve_control(
+            SocketAddr::new(IpAddr::V6(ip6), m.control_port),
+            control.clone(),
+        )
+        .await?;
+    }
+    serve_control(control_bind, control).await?;
+    let control_url_for = |host: IpAddr| format!("http://{}:{}", url_host(host), m.control_port);
+    let control_url_a = control_url_for(host_a);
+    let control_url_b = control_url_for(host_b);
+    println!("[runner] control {control_url_a} (a), {control_url_b} (b)");
 
     let ids = Arc::new(AtomicU64::new(1));
     let tab_a = Tab {
@@ -1404,10 +1553,15 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         .await?;
 
     let page_url = |tab: &str| {
+        let control_url = if tab == "b" {
+            &control_url_b
+        } else {
+            &control_url_a
+        };
         format!(
             "http://localhost:{}/?tab={tab}&control={}",
             m.page_port,
-            urlencode(&control_url)
+            urlencode(control_url)
         )
     };
     // The grant, as each DRIVER reports performing it. Both sides
@@ -1439,8 +1593,9 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         verdict,
         &tab_a,
         &tab_b,
-        &credential,
-        &bootstrap_url,
+        [&credential_a, &credential_b],
+        [&bootstrap_url_a, &bootstrap_url_b],
+        [host_a, host_b],
         &page_origin,
         // The anchor itself, because the row's application witness
         // reads ITS per-pair forwarding counter in this process,
@@ -1595,6 +1750,10 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
             "[runner] row {} landed {d}, expected {} — {}",
             row.scenario, row.expect, row.why
         ),
+        None if row.expect == Disposition::Unreachable => println!(
+            "[runner] row {} pins b as unreachable; b's connect ended as {:?}",
+            row.scenario, verdict.b_connect_kind
+        ),
         None => println!(
             "[runner] row {} reached no disposition: {:?}",
             row.scenario, verdict.page_type
@@ -1615,17 +1774,20 @@ async fn drive_sequence(
     verdict: &mut Verdict,
     tab_a: &Tab,
     tab_b: &Tab,
-    credential: &str,
-    bootstrap_url: &str,
+    credentials: [&str; 2],
+    bootstrap_urls: [&str; 2],
+    hosts: [IpAddr; 2],
     page_origin: &str,
     anchor: &MeshNode,
 ) -> Result<(), String> {
-    let anchor_rtc_addr = format!("{}:{}", m.anchor_ip, m.rtc_port);
+    // Everything a tab dials is on its own family: A's is `[0]`, B's
+    // `[1]`.
     let connect_step = |tab: &'static str| {
-        let credential = credential.to_owned();
-        let bootstrap_url = bootstrap_url.to_owned();
+        let i = usize::from(tab == "b");
+        let credential = credentials[i].to_owned();
+        let bootstrap_url = bootstrap_urls[i].to_owned();
         let origin = page_origin.to_owned();
-        let anchor_rtc_addr = anchor_rtc_addr.clone();
+        let anchor_rtc_addr = SocketAddr::new(hosts[i], m.rtc_port).to_string();
         let scenario = m.scenario.clone();
         move |id: u64| Step::Connect {
             id,
@@ -1648,6 +1810,41 @@ async fn drive_sequence(
     // is one-sided is the first thing a NAT row has to say.
     let b_connected = tab_b.run(connect_step("b")).await?;
     let a_connected = tab_a.run(connect_step("a")).await?;
+    // A row that PINS side B as unable to reach the anchor (a named
+    // engine limitation, `rows.rs` `Disposition::Unreachable`): B's
+    // failure is the measurement, not an error. Record how B ended,
+    // require A, witness the families, settle A, and stop — there is
+    // no peer dialog to run.
+    if row_for(m)?.expect == Disposition::Unreachable {
+        verdict.b_connect_kind = Some(if b_connected.ok {
+            "connected".to_owned()
+        } else {
+            b_connected
+                .page_type
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned())
+        });
+        println!(
+            "[runner] unreachable row: b's connect ended as {:?} ({})",
+            verdict.b_connect_kind,
+            b_connected.detail()
+        );
+        if let Some(failure) = step_failure("a", &a_connected) {
+            return Err(failure);
+        }
+        verdict.a.node_id = a_connected
+            .node_id
+            .clone()
+            .ok_or("tab a reported no node id")?;
+        if m.anchor_ip6.is_some() {
+            verdict.families = serde_json::json!({
+                "a": namespace_families(&m.netns_a).await?,
+                "b": namespace_families(&m.netns_b).await?,
+            });
+        }
+        verdict.a = settle(tab_a, verdict.a.node_id.clone(), m.settle).await?;
+        return Ok(());
+    }
     let refused: Vec<String> = [("b", &b_connected), ("a", &a_connected)]
         .into_iter()
         .filter_map(|(tab, r)| step_failure(tab, r))
@@ -1819,6 +2016,30 @@ async fn drive_sequence(
     let (post_ab, post_ba) = pair_counts(anchor, a_id, b_id);
     verdict.app.forwarded_post_ab = post_ab;
     verdict.app.forwarded_post_ba = post_ba;
+
+    // The dual-stack family witness, on a row with an IPv6-only side:
+    // each player's families READ FROM ITS NAMESPACE, and the pair the
+    // anchor's ICE stack is using with each. Taken here, after the
+    // exchange, because a selected pair exists only once something
+    // has been sent.
+    if m.anchor_ip6.is_some() {
+        let pair = |node: u64| async move {
+            match anchor.rtc_selected_pair(node).await {
+                Some((local, remote, learned)) => serde_json::json!({
+                    "local": local.to_string(),
+                    "remote": remote.to_string(),
+                    "learned": learned,
+                }),
+                None => serde_json::Value::Null,
+            }
+        };
+        verdict.families = serde_json::json!({
+            "a": namespace_families(&m.netns_a).await?,
+            "b": namespace_families(&m.netns_b).await?,
+            "anchor_pair": { "a": pair(a_id).await, "b": pair(b_id).await },
+        });
+        println!("[runner] families: {}", verdict.families);
+    }
     println!(
         "[runner] app exchange: a sent {} received {} (saw {:?}), b sent {} received {} (saw \
          {:?}); anchor pair a→b {pre_ab} → {post_ab}, b→a {pre_ba} → {post_ba}",

@@ -52,7 +52,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -80,6 +80,20 @@ pub const DEFAULT_OFFERS_PER_IP_PER_MINUTE: u32 = 10;
 
 /// Window the rate limit counts over.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Most source buckets one rate limiter retains.
+///
+/// A bound on memory, and so also on how many distinct sources can be
+/// held to a limit at once. Generous on purpose: past it a NEW source
+/// is refused (never an existing restriction erased), which is only
+/// acceptable if honest traffic essentially never reaches it.
+const RATE_MAX_BUCKETS: usize = 65_536;
+
+/// Shortest gap between two sweeps of a FULL table. Buckets expire
+/// with time, not with requests, so sweeping on every refused request
+/// would turn a flood of new sources into O(buckets) work per request
+/// without reclaiming anything sooner than this.
+const RATE_FULL_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Cap on the offer body. An SDP is a few kilobytes; the credential
 /// is bounded by its own format.
@@ -238,6 +252,17 @@ impl AcmeState {
 pub struct BootstrapConfig {
     /// Address to bind the HTTPS listener on.
     pub bind_addr: SocketAddr,
+    /// Further addresses the HTTPS listener binds beside
+    /// [`Self::bind_addr`]: a dual-stack anchor listens on an IPv4 and
+    /// an IPv6 address.
+    ///
+    /// Every listener serves the **same** router, so the per-source
+    /// budgets are one budget whichever family a request arrived on.
+    /// A router per listener would give each family its own budget and
+    /// double every ceiling. With more than one listener, each IPv6
+    /// one is bound with `IPV6_V6ONLY` set, so it never claims the
+    /// IPv4 port beside it whatever the platform default.
+    pub additional_bind_addrs: Vec<SocketAddr>,
     /// The transport trust domain's PSK — the one credentials for
     /// this anchor were minted against. Used only to derive the
     /// trust-domain id a presented credential is checked against.
@@ -278,6 +303,13 @@ pub struct BootstrapConfig {
     /// process, same challenge store, second socket — reconciled in
     /// the report.
     pub acme_challenge_addr: SocketAddr,
+    /// Further addresses the plaintext HTTP-01 challenge ingress binds.
+    ///
+    /// An ACME directory validates over IPv6 when the domain has an
+    /// `AAAA` record, so an anchor that publishes one needs an IPv6
+    /// challenge listener too, or issuance and renewal fail. The same
+    /// `IPV6_V6ONLY` rule as the HTTPS listeners applies.
+    pub additional_acme_challenge_addrs: Vec<SocketAddr>,
     /// Renew this long before the certificate expires (R4c).
     pub acme_renewal_horizon: Duration,
     /// Anonymous visitor credentials, served as `POST /credential`.
@@ -299,6 +331,7 @@ impl BootstrapConfig {
         let origin = origin.into();
         Self {
             bind_addr,
+            additional_bind_addrs: Vec::new(),
             psk,
             credential_issuer,
             tls,
@@ -307,6 +340,7 @@ impl BootstrapConfig {
             offers_per_ip_per_minute: DEFAULT_OFFERS_PER_IP_PER_MINUTE,
             acme: AcmeState::new(),
             acme_challenge_addr: SocketAddr::from(([0, 0, 0, 0], 80)),
+            additional_acme_challenge_addrs: Vec::new(),
             acme_renewal_horizon: crate::rtc_bootstrap_acme::DEFAULT_RENEWAL_HORIZON,
             credential_issuance: None,
         }
@@ -518,6 +552,24 @@ pub struct AnchorInfo {
     /// at. `None` means nothing was announced, and a leaf then
     /// configures no ICE servers at all.
     pub stun_addr: Option<String>,
+    /// Every announced STUN endpoint, primary first, **only on a
+    /// dual-stack anchor** that announces one per family; omitted
+    /// otherwise, so a single-stack reply is unchanged. A leaf's
+    /// default `iceServers` holds all of them: a browser that does not
+    /// enumerate interfaces gets its only usable local candidate from a
+    /// STUN server of its own family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stun_addrs: Option<Vec<String>>,
+    /// Every published RTC endpoint, primary first, **only on a
+    /// dual-stack anchor** that publishes one per family.
+    ///
+    /// Omitted otherwise, so a single-socket anchor's reply is
+    /// unchanged field for field, and [`Self::rtc_addr`] stays its
+    /// complete answer. A consumer reads `rtc_addrs` when present,
+    /// else `[rtc_addr]`, else nothing. Like `rtc_addr`, only
+    /// operator-published endpoints appear here, never a bound one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_addrs: Option<Vec<String>>,
     /// The trust domain this anchor serves.
     pub trust_domain: String,
     /// §12 provisional capacity: bound and current occupancy.
@@ -547,6 +599,7 @@ pub struct TrickleQuery {
 /// A running listener.
 pub struct BootstrapHandle {
     local_addr: SocketAddr,
+    local_addrs: Vec<SocketAddr>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -556,6 +609,12 @@ impl BootstrapHandle {
     /// port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Every address actually bound, [`Self::local_addr`] first: one
+    /// per configured listener.
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.local_addrs
     }
 
     /// Stop serving and wait for the accept loop to finish.
@@ -696,35 +755,144 @@ struct Issuance {
     rate: RateLimiter,
 }
 
-/// Fixed-window per-source-IP counter. Deliberately not a token
+/// Fixed-window per-source counter. Deliberately not a token
 /// bucket: the requirement is a fast, typed refusal, and a window is
 /// the cheapest thing that cannot be walked past by pacing.
+///
+/// **Bounded** (`ANCHOR_DUAL_STACK_PLAN.md`, defect 2). It used to
+/// insert every source it ever saw and never remove one, so its memory
+/// grew with the number of distinct addresses, and IPv6 makes that
+/// number effectively unlimited. Now:
+///
+/// - a source is charged to a bucket by [`rate_key`]: an IPv6 client
+///   by its /64, since one subscriber can rotate through a whole /64;
+/// - expired buckets are reclaimed, once per window and, when the
+///   table is full, at most once per [`RATE_FULL_SWEEP_INTERVAL`];
+/// - at [`RATE_MAX_BUCKETS`] live buckets a **new** source is refused
+///   ([`RateVerdict::TableFull`]). An existing restriction is never
+///   evicted to make room: eviction is exactly how a flood would
+///   erase a limit.
+///
+/// What /64 does not buy: a client controlling many prefixes still
+/// gets a bucket per prefix. The per-game ceiling (`--game ID:N`)
+/// caps total issuance regardless.
 #[derive(Debug)]
 struct RateLimiter {
     per_minute: u32,
-    windows: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    max_buckets: usize,
+    table: Mutex<RateTable>,
+}
+
+#[derive(Debug, Default)]
+struct RateTable {
+    windows: HashMap<IpAddr, (Instant, u32)>,
+    last_sweep: Option<Instant>,
+}
+
+/// What one request's rate check decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateVerdict {
+    /// Within its source's budget, and charged to it.
+    Allowed,
+    /// Its source spent this window's budget.
+    Limited,
+    /// Its source is new and the table already holds its bound of
+    /// live buckets. Counted apart from [`Self::Limited`]: this one
+    /// says the anchor is under a many-source load, not that one
+    /// client is too eager.
+    TableFull,
+}
+
+/// The bucket a source address is charged to.
+///
+/// IPv4: the address itself. IPv6: its /64 prefix. A subscriber
+/// normally holds a whole /64 and can rotate through it, so a
+/// per-address key would give each request a fresh budget.
+///
+/// An **IPv4-mapped** IPv6 address (`::ffff:a.b.c.d`, which is how an
+/// IPv4 client appears on a dual-stack listener) is unmapped FIRST.
+/// Masked to /64 as it stands, it would charge every IPv4 client on
+/// the internet to one shared bucket.
+fn rate_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
+        },
+    }
 }
 
 impl RateLimiter {
     fn new(per_minute: u32) -> Self {
+        Self::with_max_buckets(per_minute, RATE_MAX_BUCKETS)
+    }
+
+    fn with_max_buckets(per_minute: u32, max_buckets: usize) -> Self {
         Self {
             per_minute,
-            windows: Mutex::new(HashMap::new()),
+            max_buckets,
+            table: Mutex::new(RateTable::default()),
         }
     }
 
-    /// `true` when this request is allowed.
-    fn allow(&self, ip: IpAddr, now: Instant) -> bool {
-        let mut windows = self.windows.lock();
-        let entry = windows.entry(ip).or_insert((now, 0));
-        if now.duration_since(entry.0) >= RATE_WINDOW {
+    /// Check one request from `ip` at `now`, charging it when allowed.
+    fn check(&self, ip: IpAddr, now: Instant) -> RateVerdict {
+        let key = rate_key(ip);
+        let mut table = self.table.lock();
+        let since_sweep = table.last_sweep.map(|t| now.saturating_duration_since(t));
+        let is_new = !table.windows.contains_key(&key);
+        let full = table.windows.len() >= self.max_buckets;
+        let sweep_due = match since_sweep {
+            None => true,
+            Some(gap) => gap >= RATE_WINDOW || (full && is_new && gap >= RATE_FULL_SWEEP_INTERVAL),
+        };
+        if sweep_due {
+            table
+                .windows
+                .retain(|_, (start, _)| now.saturating_duration_since(*start) < RATE_WINDOW);
+            table.last_sweep = Some(now);
+        }
+        if is_new && table.windows.len() >= self.max_buckets {
+            return RateVerdict::TableFull;
+        }
+        let entry = table.windows.entry(key).or_insert((now, 0));
+        if now.saturating_duration_since(entry.0) >= RATE_WINDOW {
             *entry = (now, 0);
         }
         if entry.1 >= self.per_minute {
-            return false;
+            return RateVerdict::Limited;
         }
         entry.1 += 1;
-        true
+        RateVerdict::Allowed
+    }
+
+    /// [`Self::check`], counting every refusal on the anchor's RTC
+    /// stats under its own cause. `true` when the request may
+    /// proceed.
+    fn admit(&self, ip: IpAddr, now: Instant, node: &MeshNode) -> bool {
+        match self.check(ip, now) {
+            RateVerdict::Allowed => true,
+            RateVerdict::Limited => {
+                node.rtc_stats().note_bootstrap_rate_limited();
+                false
+            }
+            RateVerdict::TableFull => {
+                node.rtc_stats().note_bootstrap_rate_table_full();
+                tracing::warn!(
+                    source = %ip,
+                    buckets = self.max_buckets,
+                    "bootstrap rate limiter is full of live sources; refusing a new one"
+                );
+                false
+            }
+        }
+    }
+
+    /// Retained buckets, for witnesses.
+    #[cfg(test)]
+    fn buckets(&self) -> usize {
+        self.table.lock().windows.len()
     }
 }
 
@@ -926,7 +1094,10 @@ async fn post_credential(
             "expected {\"game\": \"<id>\"}",
         );
     };
-    if !issuance.rate.allow(remote.ip(), Instant::now()) {
+    if !issuance
+        .rate
+        .admit(remote.ip(), Instant::now(), &state.node)
+    {
         return refuse(
             BootstrapRefusal::RateLimited,
             "too many credential requests from this address",
@@ -951,6 +1122,61 @@ async fn post_credential(
     }
 }
 
+/// Bind one TCP listener. `v6_only` sets `IPV6_V6ONLY` on an IPv6
+/// address; it is asked for whenever a listener has siblings, so an
+/// IPv6 listener never claims the IPv4 port beside it and the result
+/// does not depend on the platform default (dual-stack on Linux,
+/// IPv6-only on Windows). A lone listener binds as
+/// `TcpListener::bind` would.
+fn bind_tcp(addr: SocketAddr, v6_only: bool) -> std::io::Result<tokio::net::TcpListener> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    if addr.is_ipv6() && v6_only {
+        socket.set_only_v6(true)?;
+    }
+    // What `TcpListener::bind` does on Unix, so a lone listener is
+    // unchanged by going through here.
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
+/// Bind every address in `addrs`, all or nothing, and return the
+/// listeners with the addresses they actually bound, in order.
+fn bind_tcp_all(
+    addrs: &[SocketAddr],
+) -> std::io::Result<(Vec<tokio::net::TcpListener>, Vec<SocketAddr>)> {
+    let v6_only = addrs.len() > 1;
+    let mut listeners = Vec::with_capacity(addrs.len());
+    let mut bound = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        let listener = bind_tcp(*addr, v6_only)?;
+        bound.push(listener.local_addr()?);
+        listeners.push(listener);
+    }
+    Ok((listeners, bound))
+}
+
+/// The next connection on any of `listeners`. `TcpListener::accept`
+/// is cancel-safe, so the accepts that lose the race drop nothing.
+async fn accept_any(
+    listeners: &[tokio::net::TcpListener],
+) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+    if let [only] = listeners {
+        return only.accept().await;
+    }
+    futures::future::select_all(listeners.iter().map(|listener| Box::pin(listener.accept())))
+        .await
+        .0
+}
+
 /// Start the listener. Returns once the socket is bound, so a caller
 /// can publish the URL without racing the first request.
 pub async fn serve_bootstrap(
@@ -966,7 +1192,7 @@ pub async fn serve_bootstrap(
             ));
         }
     }
-    let (initial, challenge_task) = tls_acceptor(&config).await?;
+    let (initial, challenge_tasks) = tls_acceptor(&config).await?;
     // **R4c: the acceptor is swappable.** A static one meant the
     // certificate a process started with was the certificate it died
     // with; ACME certificates expire in weeks.
@@ -976,28 +1202,29 @@ pub async fn serve_bootstrap(
     // A TLS bind that fails AFTER the challenge ingress and the
     // renewal owner exist must not detach them either (R4, round
     // two): same reasoning as the ordering failure, same remedy.
-    let bound = tokio::net::TcpListener::bind(config.bind_addr)
-        .await
-        .and_then(|listener| listener.local_addr().map(|addr| (listener, addr)));
-    let (listener, local_addr) = match bound {
-        Ok(pair) => pair,
+    let addrs: Vec<SocketAddr> = std::iter::once(config.bind_addr)
+        .chain(config.additional_bind_addrs.iter().copied())
+        .collect();
+    let (listeners, local_addrs) = match bind_tcp_all(&addrs) {
+        Ok(bound) => bound,
         Err(e) => {
             if let Some(renewal) = renewal {
                 abort_and_join(renewal).await;
             }
-            if let Some(challenge) = challenge_task {
+            for challenge in challenge_tasks {
                 abort_and_join(challenge).await;
             }
             return Err(BootstrapError::Bind(e.to_string()));
         }
     };
+    let local_addr = local_addrs[0];
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let service = router.into_make_service_with_connect_info::<SocketAddr>();
         loop {
             let accepted = tokio::select! {
                 _ = &mut shutdown_rx => break,
-                accepted = listener.accept() => accepted,
+                accepted = accept_any(&listeners) => accepted,
             };
             let Ok((stream, remote)) = accepted else {
                 continue;
@@ -1016,12 +1243,13 @@ pub async fn serve_bootstrap(
         if let Some(renewal) = renewal {
             abort_and_join(renewal).await;
         }
-        if let Some(challenge) = challenge_task {
+        for challenge in challenge_tasks {
             abort_and_join(challenge).await;
         }
     });
     Ok(BootstrapHandle {
         local_addr,
+        local_addrs,
         shutdown: shutdown_tx,
         task,
     })
@@ -1161,12 +1389,12 @@ async fn abort_and_join(task: tokio::task::JoinHandle<()>) {
 async fn serve_challenge_ingress(
     addr: SocketAddr,
     acme: AcmeState,
+    v6_only: bool,
 ) -> Result<(tokio::task::JoinHandle<()>, SocketAddr), BootstrapError> {
     let router = Router::new()
         .route("/.well-known/acme-challenge/{token}", get(challenge_route))
         .with_state(acme);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
+    let listener = bind_tcp(addr, v6_only)
         .map_err(|e| BootstrapError::Bind(format!("acme http-01 ingress on {addr}: {e}")))?;
     let bound = listener
         .local_addr()
@@ -1215,25 +1443,43 @@ async fn tls_acceptor(
 ) -> Result<
     (
         Arc<tokio_rustls::TlsAcceptor>,
-        Option<tokio::task::JoinHandle<()>>,
+        Vec<tokio::task::JoinHandle<()>>,
     ),
     BootstrapError,
 > {
-    let mut challenge_task = None;
+    let mut challenge_tasks = Vec::new();
     let (chain, key) = match &config.tls {
         BootstrapTls::Operator { cert_pem, key_pem } => read_pem_pair(cert_pem, key_pem)?,
         BootstrapTls::Acme(acme) => {
-            // R4a: the challenge ingress exists before we order.
-            let (task, bound) =
-                serve_challenge_ingress(config.acme_challenge_addr, config.acme.clone()).await?;
-            tracing::info!(
-                %bound,
-                domain = %acme.domain,
-                "acme http-01 ingress bound before ordering"
-            );
+            // R4a: the challenge ingress exists before we order, on
+            // every configured address (an IPv6 one included, since a
+            // directory validates over IPv6 when the name has AAAA).
+            let addrs: Vec<SocketAddr> = std::iter::once(config.acme_challenge_addr)
+                .chain(config.additional_acme_challenge_addrs.iter().copied())
+                .collect();
+            let v6_only = addrs.len() > 1;
+            let mut tasks = Vec::with_capacity(addrs.len());
+            for addr in addrs {
+                match serve_challenge_ingress(addr, config.acme.clone(), v6_only).await {
+                    Ok((task, bound)) => {
+                        tracing::info!(
+                            %bound,
+                            domain = %acme.domain,
+                            "acme http-01 ingress bound before ordering"
+                        );
+                        tasks.push(task);
+                    }
+                    Err(e) => {
+                        for task in tasks {
+                            abort_and_join(task).await;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
             match crate::rtc_bootstrap_acme::obtain_certificate(acme, &config.acme).await {
                 Ok(pair) => {
-                    challenge_task = Some(task);
+                    challenge_tasks = tasks;
                     pair
                 }
                 Err(e) => {
@@ -1244,16 +1490,18 @@ async fn tls_acceptor(
                     // rebind it after a failed order. `abort`
                     // requests cancellation; only the await makes
                     // the listener gone by the time this returns.
-                    abort_and_join(task).await;
+                    for task in tasks {
+                        abort_and_join(task).await;
+                    }
                     return Err(e);
                 }
             }
         }
     };
     match server_config(chain, key) {
-        Ok(acceptor) => Ok((acceptor, challenge_task)),
+        Ok(acceptor) => Ok((acceptor, challenge_tasks)),
         Err(e) => {
-            if let Some(task) = challenge_task {
+            for task in challenge_tasks {
                 abort_and_join(task).await;
             }
             Err(e)
@@ -1377,7 +1625,7 @@ async fn post_offer(
     };
     // Rate first: it is the cheapest check, and the one an attacker
     // is trying to spend.
-    if !state.rate.allow(remote.ip(), Instant::now()) {
+    if !state.rate.admit(remote.ip(), Instant::now(), &state.node) {
         return refuse(
             BootstrapRefusal::RateLimited,
             "too many bootstrap offers from this address",
@@ -1446,6 +1694,21 @@ async fn post_offer(
     }
 }
 
+/// `AnchorInfo::rtc_addrs`'s serialization rule, in one place: every
+/// published RTC endpoint when there is more than one, otherwise
+/// `None` so the key is omitted and the reply is unchanged.
+pub fn published_rtc_addrs(node: &MeshNode) -> Option<Vec<String>> {
+    let published = node.rtc_public_addrs();
+    (published.len() > 1).then(|| published.iter().map(|addr| addr.to_string()).collect())
+}
+
+/// `AnchorInfo::stun_addrs`'s rule: every announced STUN endpoint
+/// when there is more than one, otherwise `None` (key omitted).
+pub fn published_stun_addrs(node: &MeshNode) -> Option<Vec<String>> {
+    let announced = node.rtc_public_stun_addrs();
+    (announced.len() > 1).then(|| announced.iter().map(|addr| addr.to_string()).collect())
+}
+
 async fn get_anchor(State(state): State<AppState>) -> Response {
     Json(AnchorInfo {
         node_id: format!("{:#x}", state.node.node_id()),
@@ -1455,6 +1718,8 @@ async fn get_anchor(State(state): State<AppState>) -> Response {
         // bind: one resolution rule, in the node, so this handler
         // and the announcement emission point cannot disagree.
         stun_addr: state.node.rtc_public_stun_addr().map(|a| a.to_string()),
+        rtc_addrs: published_rtc_addrs(&state.node),
+        stun_addrs: published_stun_addrs(&state.node),
         trust_domain: state.psk.trust_domain().to_string(),
         max_provisional: state.node.rtc_max_provisional(),
         provisional: state.node.provisional_count(),
@@ -1559,8 +1824,9 @@ async fn trickle_socket(mut socket: WebSocket, state: AppState, attempt: Attempt
     // The anchor's own candidate goes first: the browser can start
     // checks against it while it is still gathering its own. S0b
     // measured trickle at 6.6x gather-complete at the floor, and
-    // this is the half the anchor controls.
-    if let Some(candidate) = state.node.bootstrap_host_candidate() {
+    // this is the half the anchor controls. A dual-stack anchor has
+    // one per family, primary first.
+    for candidate in state.node.bootstrap_host_candidates() {
         let frame = serde_json::json!({
             "type": "candidate",
             "dialog": dialog,
@@ -1654,22 +1920,147 @@ fn hex_of(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn the_rate_limiter_refuses_past_the_ceiling_and_recovers_next_window() {
         let limiter = RateLimiter::new(3);
-        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let source = ip("203.0.113.7");
         let t0 = Instant::now();
-        assert!(limiter.allow(ip, t0));
-        assert!(limiter.allow(ip, t0));
-        assert!(limiter.allow(ip, t0));
-        assert!(
-            !limiter.allow(ip, t0),
+        for _ in 0..3 {
+            assert_eq!(limiter.check(source, t0), RateVerdict::Allowed);
+        }
+        assert_eq!(
+            limiter.check(source, t0),
+            RateVerdict::Limited,
             "the fourth offer in a window is refused"
         );
         // Another address is unaffected — the bound is per source.
-        assert!(limiter.allow("198.51.100.1".parse().unwrap(), t0));
+        assert_eq!(limiter.check(ip("198.51.100.1"), t0), RateVerdict::Allowed);
         // …and the window rolls.
-        assert!(limiter.allow(ip, t0 + RATE_WINDOW + Duration::from_millis(1)));
+        assert_eq!(
+            limiter.check(source, t0 + RATE_WINDOW + Duration::from_millis(1)),
+            RateVerdict::Allowed
+        );
+    }
+
+    /// An IPv6 subscriber holds a whole /64 and can rotate through it:
+    /// every address in one /64 draws from ONE budget, a different /64
+    /// has its own, and IPv4 is charged per address as before.
+    #[test]
+    fn ipv6_sources_share_one_budget_per_64() {
+        let limiter = RateLimiter::new(2);
+        let t0 = Instant::now();
+        assert_eq!(
+            limiter.check(ip("2001:db8:1:2::1"), t0),
+            RateVerdict::Allowed
+        );
+        assert_eq!(
+            limiter.check(ip("2001:db8:1:2:ffff:ffff:ffff:ffff"), t0),
+            RateVerdict::Allowed
+        );
+        assert_eq!(
+            limiter.check(ip("2001:db8:1:2:dead:beef::9"), t0),
+            RateVerdict::Limited,
+            "a third address in the same /64 is the same source"
+        );
+        assert_eq!(
+            limiter.check(ip("2001:db8:1:3::1"), t0),
+            RateVerdict::Allowed,
+            "the neighbouring /64 is a different source"
+        );
+        assert_eq!(limiter.check(ip("192.0.2.1"), t0), RateVerdict::Allowed);
+        assert_eq!(limiter.check(ip("192.0.2.2"), t0), RateVerdict::Allowed);
+        assert_eq!(
+            limiter.buckets(),
+            4,
+            "one bucket per /64 and one per IPv4 address"
+        );
+    }
+
+    /// **An IPv4 client on a dual-stack listener arrives IPv4-mapped**
+    /// (`::ffff:a.b.c.d`). Masked to /64 as it stands, every IPv4
+    /// client on the internet would share one bucket; it is charged
+    /// as the IPv4 address it is instead, the same bucket a plain
+    /// IPv4 listener would have used.
+    #[test]
+    fn an_ipv4_mapped_source_is_charged_as_its_ipv4_address() {
+        let limiter = RateLimiter::new(1);
+        let t0 = Instant::now();
+        assert_eq!(
+            limiter.check(ip("::ffff:192.0.2.1"), t0),
+            RateVerdict::Allowed
+        );
+        assert_eq!(
+            limiter.check(ip("::ffff:192.0.2.2"), t0),
+            RateVerdict::Allowed,
+            "two mapped IPv4 clients are two sources, not one /64"
+        );
+        assert_eq!(
+            limiter.check(ip("192.0.2.1"), t0),
+            RateVerdict::Limited,
+            "the mapped and plain spellings of one IPv4 address are one source"
+        );
+    }
+
+    /// Expired buckets are reclaimed: the table does not keep every
+    /// source it ever saw.
+    #[test]
+    fn expired_buckets_are_reclaimed() {
+        let limiter = RateLimiter::new(5);
+        let t0 = Instant::now();
+        for i in 0..50u8 {
+            let _ = limiter.check(IpAddr::from([198, 51, 100, i]), t0);
+        }
+        assert_eq!(limiter.buckets(), 50);
+        let later = t0 + RATE_WINDOW + Duration::from_secs(1);
+        let _ = limiter.check(ip("203.0.113.1"), later);
+        assert_eq!(
+            limiter.buckets(),
+            1,
+            "every bucket from the previous window was reclaimed"
+        );
+    }
+
+    /// At the bound, with every bucket live, a NEW source is refused as
+    /// `TableFull`, and **every existing restriction still holds**: a
+    /// flood of new sources cannot evict a limited one to reset it.
+    /// Once buckets expire, new sources are admitted again.
+    #[test]
+    fn a_full_table_refuses_new_sources_and_keeps_every_restriction() {
+        let limiter = RateLimiter::with_max_buckets(1, 4);
+        let t0 = Instant::now();
+        let limited = ip("203.0.113.9");
+        assert_eq!(limiter.check(limited, t0), RateVerdict::Allowed);
+        assert_eq!(limiter.check(limited, t0), RateVerdict::Limited);
+        for i in 1..=3u8 {
+            assert_eq!(
+                limiter.check(IpAddr::from([198, 51, 100, i]), t0),
+                RateVerdict::Allowed
+            );
+        }
+        assert_eq!(limiter.buckets(), 4);
+        for i in 10..40u8 {
+            let t = t0 + Duration::from_secs(u64::from(i));
+            assert_eq!(
+                limiter.check(IpAddr::from([192, 0, 2, i]), t),
+                RateVerdict::TableFull,
+                "a new source past the bound is refused, not admitted by eviction"
+            );
+            assert_eq!(
+                limiter.check(limited, t),
+                RateVerdict::Limited,
+                "the flood did not erase the existing restriction"
+            );
+        }
+        let later = t0 + RATE_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            limiter.check(ip("192.0.2.200"), later),
+            RateVerdict::Allowed,
+            "once the live buckets expire, new sources are admitted again"
+        );
     }
 
     #[test]
@@ -1973,6 +2364,17 @@ pub struct AnchorIceStats {
     /// attempted a direct path has no direct-path ratio, and `0.0`
     /// would report total failure where nothing has happened.
     pub direct_ratio: Option<f64>,
+    /// Bootstrap requests refused because their source spent its
+    /// per-minute budget (an IPv6 source is charged by its /64).
+    /// `None` from an anchor that predates the field, which is not
+    /// the same as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_rate_limited: Option<u64>,
+    /// Bootstrap requests refused because the rate limiter was full
+    /// of live sources and this one was new: many sources at once,
+    /// not one eager one. `None` from an anchor that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_rate_table_full: Option<u64>,
 }
 
 /// Serve the anchor's own ICE attempt ledger on `mesh`.
@@ -2001,6 +2403,8 @@ pub fn serve_anchor_ice_stats(mesh: &crate::Mesh) -> Result<crate::mesh_rpc::Ser
                 failed: ledger.as_ref().map(|s| s.failed).unwrap_or(0),
                 pending: ledger.as_ref().map(|s| s.pending()).unwrap_or(0),
                 direct_ratio: ledger.as_ref().and_then(|s| s.direct_ratio()),
+                bootstrap_rate_limited: Some(node.rtc_stats().bootstrap_rate_limited()),
+                bootstrap_rate_table_full: Some(node.rtc_stats().bootstrap_rate_table_full()),
             };
             serde_json::to_vec(&reply).map_err(|e| e.to_string())
         }

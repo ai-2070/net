@@ -187,9 +187,42 @@ net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
 
 `--credential-issuer` becomes optional with `--issuer-identity` (it is that key's public half); given both, they must agree. `--game` requires `--issuer-identity`.
 
+## Serve IPv4 and IPv6 players
+
+A browser pairs only with the address families its network routes, so an anchor with one IPv4 RTC socket cannot reach a player on an IPv6-only network. Give it one in each family:
+
+```sh
+net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
+  --acme-directory https://acme-v02.api.letsencrypt.org/directory \
+  --acme-email you@example.com \
+  --listen 0.0.0.0:443 --listen '[::]:443' \
+  --acme-challenge-addr 0.0.0.0:80 --acme-challenge-addr '[::]:80' \
+  --rtc-bind 0.0.0.0:7101 --rtc-bind '[::]:7101' \
+  --rtc-public-addr 203.0.113.7:7101 --rtc-public-addr '[2001:db8::7]:7101' \
+  --rtc-stun-bind 0.0.0.0:3478 --rtc-stun-bind '[::]:3478' \
+  --rtc-stun-public-addr 203.0.113.7:3478 \
+  --rtc-stun-public-addr '[2001:db8::7]:3478' \
+  --allow-origin https://game.example.com --issuer-identity issuer.json --game my-game
+```
+
+- **`--rtc-bind` / `--rtc-public-addr`** take at most one address per family. An IPv4 and an IPv6 bind make a dual-stack anchor: every session offers a host candidate per family, and ICE picks the one that works. Each public address advertises the socket of its own family, whatever the flag order. One bind of either family is the single-socket anchor it always was. The IPv6 socket is bound IPv6-only, so it shares a port number with the IPv4 one.
+- **`--rtc-stun-bind` / `--rtc-stun-public-addr`** also take one address per family, and a dual-stack anchor needs both. A browser with no camera or microphone permission (every data-only game) does not list its interfaces: its only usable candidate on a network is the server-reflexive one a STUN server **of that family** reports. Without an IPv6 STUN endpoint, an IPv6-only Chromium player gathers nothing and never sends a check. The anchor then lists every STUN endpoint as `stun_addrs`, and the browser SDK's default ICE servers use them all.
+- **Firefox on an IPv6-only network with no IPv4 route is not supported.** Without a media permission Firefox looks for its default local address over IPv4 only, so on such a network it gathers nothing and the connect fails `ice-timeout`, never `udp-blocked`. Mobile IPv6-only networks are 464XLAT and give the device an IPv4 route, and there Firefox connects. Chromium works on both. Both cases are tested in the network simulator.
+- **`--listen`** is repeatable. Every listener serves one state, so the rate limits are one budget whichever family a request arrives on, and a signalling socket may use a different family than the offer that started it.
+- **`--acme-challenge-addr`** is repeatable. An ACME directory validates over IPv6 once the name has an `AAAA` record, so an anchor that publishes one needs an IPv6 challenge listener too, or issuance and renewal fail.
+- **Publish both addresses in DNS** (`A` and `AAAA`) and both `--rtc-public-addr`s. `GET /rtc/anchor` and the start report then list every published endpoint as `rtc_addrs`; a single-stack anchor's output is unchanged. Browsers probe every endpoint before calling a failure `udp-blocked` ([Errors](/docs/sdk/browser/errors)).
+- **Rate limits by /64.** An IPv6 client is charged by its /64 prefix, since one subscriber can rotate through a whole /64; IPv4 is charged per address. The limiter holds a bounded number of sources: past it a new source is refused, never an existing limit erased. `anchor stats` reports `bootstrap_rate_limited` and `bootstrap_rate_table_full`.
+- **Until an anchor is dual-stack, do not publish an `AAAA` record for it.** HTTPS would then work over IPv6 while ICE still targets IPv4 only, which helps no one and opens the listener to IPv6 clients.
+
+### Hosting notes
+
+- **A plain VM** (a DigitalOcean Droplet, an EC2 instance) serves both families once IPv6 is enabled on its interface. Use the VM's own addresses; on DigitalOcean a Reserved IP's outbound traffic leaves from the Droplet's own address, which breaks UDP replies.
+- **Fly.io's UDP service is IPv4-only**, so an anchor there cannot serve IPv6-only players whatever the flags. Its TCP passthrough also hides the client's address from the anchor (every request appears to come from Fly's proxy), which collapses the per-source limits into one; raise `--credentials-per-minute` and `--offers-per-minute` and rely on the per-game ceiling there.
+- **Platforms without UDP** (DigitalOcean App Platform and similar) cannot run an anchor at all.
+
 ## Inspect standalone anchor serving
 
-With `rtc-bootstrap`, add `--inspect-target` to an otherwise configured `anchor serve` invocation. It reports mesh/HTTPS/RTC/STUN bind selections, TLS certificate/key paths or ACME cache/challenge settings, and a public credential-issuer fingerprint. No PSK/TLS file is read, socket opened, certificate ordered or identity generated. Profile configuration is read for selection validation/disclosure; profile identity, remote target and bind defaults remain unused by standalone serving.
+With `rtc-bootstrap`, add `--inspect-target` to an otherwise configured `anchor serve` invocation. It reports mesh/HTTPS/RTC/STUN bind selections (a dual-stack anchor's extra listeners and IPv6 RTC socket as `listen_additional`, `acme_challenge_bind_additional`, `rtc_bind_v6` and `rtc_public_addr_v6`, omitted when absent), TLS certificate/key paths or ACME cache/challenge settings, and a public credential-issuer fingerprint. No PSK/TLS file is read, socket opened, certificate ordered or identity generated. Profile configuration is read for selection validation/disclosure; profile identity, remote target and bind defaults remain unused by standalone serving.
 
 The same resolved values drive execution. Existing defaults remain mesh `0.0.0.0:0`, HTTPS `0.0.0.0:8443`, RTC on the mesh IP with an ephemeral port, and no second STUN socket. The identity remains ephemeral and is reported unavailable during inspection. Port `0` means runtime allocation, not an observed bound endpoint; null advertised addresses with runtime provenance are unresolved until startup. Inspection is not TLS/content validation, authorization approval or proof of reachability. Malformed listener addresses and a STUN public override without its bind fail before mesh startup.
 

@@ -793,6 +793,55 @@ fn natsim_browser_symmetric_symmetric_is_relayed_without_media_permission() {
     browser_row(&rows::NO_MEDIA_RELAYED);
 }
 
+/// **An IPv4-only player meets an IPv6-only player through one
+/// dual-stack anchor** (`ANCHOR_DUAL_STACK_PLAN.md`, slice 4), on
+/// Chromium, permission-free.
+///
+/// The players share no address family — A's namespace has IPv6
+/// disabled, B's has no IPv4 beyond loopback — so ICE between them
+/// cannot solve and the anchor must carry the pair. The row requires
+/// everything the routed rows do (typed `iceTimeout` on both halves,
+/// never `udpBlocked`; exact ledgers; receiver-observed nonces both
+/// ways; the anchor's application forwarding accounting for them;
+/// no replied flow at either gateway) plus the family witness read
+/// from the namespaces and the anchor's selected pair with each
+/// player on that player's own family.
+///
+/// `udpBlocked` refused is the slice 3 rule under test in a real
+/// browser: B's IPv4 probe of the anchor is unanswerable and its IPv6
+/// probe is answered, so the failure must stay `iceTimeout`.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_ipv4_only_meets_ipv6_only_through_a_dual_stack_anchor() {
+    browser_row(&rows::DUAL_STACK);
+}
+
+/// Firefox on the same topology: a **named support decision**, pinned.
+///
+/// Without a media permission Firefox cannot use WebRTC on an
+/// IPv6-only network with no IPv4 route — its default-address
+/// discovery connects one IPv4 socket, fails, and gathers nothing
+/// (measured from its own `moz_log`). The row asserts exactly that and
+/// no more: B's connect fails typed `ice-timeout`, never `udp-blocked`
+/// (its probes could not run), and A still connects. A Firefox that
+/// starts working fails this row, which is the prompt to flip it.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_firefox_cannot_reach_a_dual_stack_anchor_from_a_pure_ipv6_only_network() {
+    browser_row(&rows::DUAL_STACK_FIREFOX);
+}
+
+/// Firefox where B's IPv6-only network is **464XLAT**, as mobile
+/// IPv6-only networks are: a CLAT gives B an IPv4 route translated to
+/// IPv6, which is all Firefox's permission-free default-address
+/// discovery needs. The other side of the pinned limitation above: B
+/// gathers, reaches the anchor, and meets A directly through the NAT64.
+#[test]
+#[ignore = "requires root + Linux netns + tayga + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_firefox_works_on_a_dual_stack_anchor_from_a_464xlat_network() {
+    browser_row(&rows::DUAL_STACK_FIREFOX_464XLAT);
+}
+
 // =========================================================================
 // Configuration-validation guards (no root, no netns — run anywhere
 // the suite compiles). These pin the harness's fail-loudly behavior

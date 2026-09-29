@@ -54,7 +54,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::anchor_control_plane::AnchorControlPlane;
-use crate::bootstrap::{classify_ice_failure, gloo_timer_sleep, stun_probe_failed, Credential};
+use crate::bootstrap::{
+    classify_ice_failure_all, gloo_timer_sleep, stun_probe_outcomes, Credential,
+};
 use crate::clock;
 use crate::control_plane::{
     ControlEvent, ControlPlane, DialogId, IceCandidate, NodeId, Sdp, SignalKind,
@@ -1845,15 +1847,21 @@ impl LeafNode {
             // announced none leaves this empty, which is exactly
             // the pre-Stage-6 behaviour, and an explicit empty array
             // stays empty.
-            None => crate::bootstrap::default_stun_url(control.anchor_stun_addr().as_deref())
-                .map(|url| {
+            // One entry per announced STUN endpoint: a dual-stack
+            // anchor announces one per family, and a browser that
+            // cannot enumerate interfaces needs the one of its own.
+            None => {
+                let urls = crate::bootstrap::default_stun_urls(&control.anchor_stun_addrs());
+                if urls.is_empty() {
+                    Vec::new()
+                } else {
                     vec![IceServer {
-                        urls: vec![url],
+                        urls,
                         username: None,
                         credential: None,
                     }]
-                })
-                .unwrap_or_default(),
+                }
+            }
         };
         // **The EFFECTIVE list, not the caller's half of it.** The
         // check used to run inside the `Some` arm only, so the
@@ -1864,11 +1872,14 @@ impl LeafNode {
         // candidate, which is the deliberate misconfiguration
         // fail-fast validation exists to catch. Same check, same
         // equality, now over the list actually handed to the browser.
-        crate::bootstrap::check_ice_servers_against_peer(
+        // **Every** endpoint the anchor published: a dual-stack anchor
+        // has one per family, and a STUN entry naming the IPv6 one
+        // eats that family's checks as surely as one naming the IPv4.
+        crate::bootstrap::check_ice_servers_against_peers(
             ice_servers
                 .iter()
                 .flat_map(|server| server.urls.iter().map(String::as_str)),
-            anchor_rtc_addr.as_deref(),
+            &control.anchor_rtc_addrs(),
         )
         .map_err(js)?;
 
@@ -1879,6 +1890,7 @@ impl LeafNode {
         );
         let mut node = crate::node::LeafNode::new(identity, seed);
         node.set_peer_rtc_addr(anchor, anchor_rtc_addr);
+        node.set_peer_rtc_addrs(anchor, control.anchor_rtc_addrs());
 
         // The inbound queue in its own cell, shared with the sink
         // below: see [`Inner::inbox`].
@@ -4083,12 +4095,12 @@ impl LeafNode {
     /// charged to whatever attempt held the peer when it came back.
     /// [`Inner::settle`] refuses a term for any dialog but this one.
     async fn settle_peer_deadline(&self, attempt: Attempt) -> &'static str {
-        let rtc_addr = self.inner.borrow().control.anchor_rtc_addr();
-        let probe_failed = match &rtc_addr {
-            Some(addr) => stun_probe_failed(addr).await,
-            None => false,
-        };
-        let failure = classify_ice_failure(true, probe_failed, rtc_addr.as_deref());
+        // Every endpoint the anchor published, under one deadline: a
+        // dual-stack anchor is `udp-blocked` only if BOTH families
+        // went unanswered.
+        let endpoints = self.inner.borrow().control.anchor_rtc_addrs();
+        let outcomes = stun_probe_outcomes(&endpoints).await;
+        let failure = classify_ice_failure_all(true, &outcomes);
         let blocked = matches!(failure, crate::error::RtcError::UdpBlocked { .. });
         let (term, state) = if blocked {
             (IceTerm::UdpBlocked, "udpBlocked")
@@ -4579,15 +4591,12 @@ async fn wait_for_channel(inner: &Rc<RefCell<Inner>>, peer: NodeId) -> Result<()
     // The deadline passed. The HTTPS bootstrap demonstrably
     // succeeded (we have an answer), so the probe is the one thing
     // that can turn the classification.
-    let rtc_addr = inner.borrow().control.anchor_rtc_addr();
-    let probe_failed = match &rtc_addr {
-        Some(addr) => stun_probe_failed(addr).await,
-        None => false,
-    };
-    Err(js(LeafError::Rtc(classify_ice_failure(
-        true,
-        probe_failed,
-        rtc_addr.as_deref(),
+    // Every published endpoint, under one deadline (dual-stack plan,
+    // slice 3): one answered family keeps this an ICE timeout.
+    let endpoints = inner.borrow().control.anchor_rtc_addrs();
+    let outcomes = stun_probe_outcomes(&endpoints).await;
+    Err(js(LeafError::Rtc(classify_ice_failure_all(
+        true, &outcomes,
     ))))
 }
 

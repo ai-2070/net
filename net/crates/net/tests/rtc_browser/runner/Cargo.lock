@@ -1709,6 +1709,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snow",
+ "socket2",
  "str0m",
  "thiserror",
  "tokio",

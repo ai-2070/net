@@ -3206,6 +3206,10 @@ fn encode_error(error: &LeafError) -> Value {
                         Value::from(evidence.stun_probe_failed),
                     );
                     map.insert("probed".into(), Value::from(evidence.probed.clone()));
+                    map.insert(
+                        "probed_all".into(),
+                        Value::from(evidence.probed_all.clone()),
+                    );
                 }
                 RtcError::ChannelClosed(detail) => {
                     map.insert("rtc".into(), Value::from("channel_closed"));
@@ -3270,12 +3274,29 @@ fn decode_error(value: &Value) -> Result<LeafError> {
                 let bootstrap_ok = bool_field(value, "bootstrap_ok")?;
                 let stun_probe_failed = bool_field(value, "stun_probe_failed")?;
                 let probed = detail("probed")?;
-                // Reconstructed through the constructor, so the
+                // Every endpoint probed; `[probed]` from a sender that
+                // predates the list.
+                let probed_all = match value.get("probed_all").and_then(Value::as_array) {
+                    Some(list) => list
+                        .iter()
+                        .map(|entry| entry.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            LeafError::ControlPlane("probed_all holds a non-string".into())
+                        })?,
+                    None => vec![probed.clone()],
+                };
+                // Reconstructed through the constructors, so the
                 // "both observations or nothing" rule holds on this
                 // side of the channel too: a peer that sent
                 // `udp_blocked` without the evidence does not get to
                 // assert it here.
-                match UdpBlockedEvidence::new(bootstrap_ok, stun_probe_failed, probed) {
+                let evidence = if stun_probe_failed && probed_all.first() == Some(&probed) {
+                    UdpBlockedEvidence::for_endpoints(bootstrap_ok, probed_all)
+                } else {
+                    None
+                };
+                match evidence {
                     Some(evidence) => RtcError::udp_blocked(evidence),
                     None => RtcError::IceTimeout,
                 }
@@ -3518,6 +3539,13 @@ mod tests {
             },
             LeafError::Rtc(RtcError::IceTimeout),
             LeafError::Rtc(RtcError::udp_blocked(evidence.clone())),
+            LeafError::Rtc(RtcError::udp_blocked(
+                UdpBlockedEvidence::for_endpoints(
+                    true,
+                    vec!["203.0.113.7:9".into(), "[2001:db8::7]:9".into()],
+                )
+                .expect("both families unanswered"),
+            )),
             LeafError::Rtc(RtcError::ChannelClosed("closed".into())),
             LeafError::Rtc(RtcError::Unsupported("no RTCPeerConnection".into())),
             LeafError::Rpc(RpcError::Refused {

@@ -6328,7 +6328,8 @@ jobs:
             --test rtc_anchor_registry \
             --test rtc_proxy_boundary \
             --test natsim_browser \
-            --test rtc_stun_endpoint
+            --test rtc_stun_endpoint \
+            --test rtc_dual_stack
           st=$?
           cp target/nextest/default/junit.xml "$RUNNER_TEMP/rtc-junit.xml"
           exit "$st"
@@ -6372,8 +6373,9 @@ jobs:
             --floor rtc_admission=26 \
             --floor rtc_anchor_registry=2 \
             --floor rtc_proxy_boundary=2 \
-            --floor natsim_browser=41 \
+            --floor natsim_browser=49 \
             --floor rtc_stun_endpoint=14 \
+            --floor rtc_dual_stack=6 \
             --required-file - <<'REQUIRED'
           rtc_admission:a_registered_client_streaming_provider_refuses_a_provisional_caller
           rtc_admission:a_registered_duplex_provider_refuses_a_provisional_caller
@@ -6387,6 +6389,9 @@ jobs:
           rtc_stun_endpoint:announcing_one_endpoint_for_both_roles_is_refused
           rtc_stun_endpoint:binding_one_socket_for_both_roles_is_refused
           rtc_stun_endpoint:the_rtc_socket_still_answers_its_own_probe
+          rtc_dual_stack:a_dual_stack_anchor_serves_an_ipv4_and_an_ipv6_client_at_once
+          rtc_dual_stack:the_ipv6_socket_is_ipv6_only_and_shares_a_wildcard_port_with_ipv4
+          rtc_dual_stack:the_ipv6_stun_endpoint_answers_on_its_own_socket
           rtc_admission:an_outcome_that_only_looks_admitted_promotes_nothing
           rtc_admission:a_claimant_is_not_promoted_by_another_peers_enrollment
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
@@ -6746,14 +6751,14 @@ jobs:
           cargo test --features mock-control-plane 2>&1 | tee /tmp/leaf-native.log
           total=$(grep -c '^test .* \.\.\. ok$' /tmp/leaf-native.log || true)
           echo "leaf native tests: $total"
-          # FLOOR is the measured inventory of this exact command: 286 lib
-          # units + 183 across the fourteen native integration binaries (the four
+          # FLOOR is the measured inventory of this exact command: 299 lib
+          # units + 186 across the fifteen native integration binaries (the four
           # `wasm_*` binaries compile to 0 tests natively, by design, and
           # doctests are 0). No test in the leaf is `#[cfg(unix)]`/
           # `#[cfg(windows)]`, so the count is platform-independent.
           # Raise it in the SAME commit as the witnesses it counts.
-          if [ "$total" -lt 469 ]; then
-            echo "::error::the leaf's native surface ran $total tests, floor is 469 — \
+          if [ "$total" -lt 485 ]; then
+            echo "::error::the leaf's native surface ran $total tests, floor is 485 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi

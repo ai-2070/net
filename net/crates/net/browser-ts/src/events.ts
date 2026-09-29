@@ -61,6 +61,12 @@ export interface ConnectedEvent {
    * none.
    */
   readonly rtcAddr: string | null;
+  /**
+   * **Every** endpoint that anchor published, primary first: one per
+   * family on a dual-stack anchor, `[rtcAddr]` on any other, empty when
+   * it published none. The STUN probe aims at all of them.
+   */
+  readonly rtcAddrs: readonly string[];
 }
 
 /** The session went away. */
@@ -227,6 +233,7 @@ export function parseEvent(json: string): LeafEvent {
         nodeIdHex: str(fields, 'node_id_hex'),
         peerNode: str(fields, 'peer_node'),
         rtcAddr: optionalStr(fields, 'rtc_addr'),
+        rtcAddrs: rtcAddrsOf(fields),
       };
     case 'disconnected':
       return { type: 'disconnected', reason: str(fields, 'reason') };
@@ -411,6 +418,19 @@ function str(fields: Record<string, unknown>, key: string): string {
   if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   return '';
+}
+
+/**
+ * `rtc_addrs` when the leaf sent a list (a dual-stack anchor), else
+ * `[rtc_addr]`, else empty: the rule `GET /rtc/anchor` documents.
+ */
+function rtcAddrsOf(fields: Record<string, unknown>): string[] {
+  const list = fields.rtc_addrs;
+  if (Array.isArray(list)) {
+    return list.filter((addr): addr is string => typeof addr === 'string' && addr.length > 0);
+  }
+  const single = optionalStr(fields, 'rtc_addr');
+  return single === null ? [] : [single];
 }
 
 function optionalStr(fields: Record<string, unknown>, key: string): string | null {

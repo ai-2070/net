@@ -56,6 +56,34 @@ pub struct RtcConfig {
     /// Address to advertise as the host candidate when the bound
     /// address is not reachable as-is (NAT, container).
     pub public_addr: Option<SocketAddr>,
+    /// Bind address of a **second, IPv6 RTC socket** beside the one
+    /// [`Self::bind_addr`] names — a dual-stack anchor
+    /// (`ANCHOR_DUAL_STACK_PLAN.md`).
+    ///
+    /// A browser can only reach the families its network routes, so
+    /// an anchor with one socket locks out every player who cannot
+    /// reach that socket's family. With this set, every session
+    /// offers a host candidate per family and ICE picks the one that
+    /// works; sessions, identity and relay stay shared.
+    ///
+    /// Two sockets rather than one dual-stack `[::]` socket: IPv4
+    /// peers on a dual-stack socket arrive as IPv4-mapped addresses
+    /// (`::ffff:a.b.c.d`) that never equal the candidate a browser
+    /// signalled, and `IPV6_V6ONLY` defaults differently per
+    /// platform. The socket is bound with `IPV6_V6ONLY` set
+    /// explicitly, so it never claims the IPv4 port beside it.
+    ///
+    /// Must be IPv6, and the primary socket must then be IPv4
+    /// ([`Self::validate`]). `None` (the default) binds nothing and
+    /// advertises nothing: an anchor configured without it behaves
+    /// exactly as before.
+    pub bind_addr_v6: Option<SocketAddr>,
+    /// The externally reachable IPv6 endpoint to advertise for that
+    /// socket — [`Self::public_addr`]'s counterpart. Unset with a
+    /// bind, the socket's own bound address is advertised. Set
+    /// without [`Self::bind_addr_v6`], it names a socket nobody
+    /// binds, and [`Self::validate`] refuses it.
+    pub public_addr_v6: Option<SocketAddr>,
     /// How long a session may take to reach an open DataChannel.
     pub ice_deadline: Duration,
     /// Ceiling on concurrent RTC sessions.
@@ -102,6 +130,23 @@ pub struct RtcConfig {
     /// driver's resolved bound address, so `:0` works and the value
     /// is the actual endpoint rather than an adjacent-port guess.
     pub stun_public_addr: Option<SocketAddr>,
+    /// Bind address of an **IPv6** STUN-only socket, beside the one
+    /// [`Self::stun_addr`] names — a dual-stack anchor's STUN endpoint
+    /// in the other family.
+    ///
+    /// Needed, not optional, for an IPv6-only player whose browser
+    /// does not enumerate interfaces (Chromium without a media
+    /// permission): its only usable local candidate is a
+    /// server-reflexive one, and it can only gather that from a STUN
+    /// server of its own family. With nothing but an IPv4 STUN
+    /// endpoint announced, such a browser pairs nothing and sends no
+    /// ICE check at all — measured in natsim
+    /// (`ANCHOR_DUAL_STACK_PLAN.md`, slice 4). Bound `IPV6_V6ONLY`;
+    /// `None` binds and announces nothing.
+    pub stun_addr_v6: Option<SocketAddr>,
+    /// The externally reachable endpoint to announce for that socket —
+    /// [`Self::stun_public_addr`]'s counterpart.
+    pub stun_public_addr_v6: Option<SocketAddr>,
     /// Serve the browser bootstrap listener. Stage 3 carried the
     /// flag and nothing read it; Stage 4b's listener does.
     pub serve_bootstrap: bool,
@@ -130,6 +175,8 @@ impl Default for RtcConfig {
         Self {
             bind_addr: None,
             public_addr: None,
+            bind_addr_v6: None,
+            public_addr_v6: None,
             ice_deadline: DEFAULT_ICE_DEADLINE,
             max_peers: DEFAULT_MAX_PEERS,
             send_queue_packets: DEFAULT_SEND_QUEUE_PACKETS,
@@ -139,6 +186,8 @@ impl Default for RtcConfig {
             serve_stun: false,
             stun_addr: None,
             stun_public_addr: None,
+            stun_addr_v6: None,
+            stun_public_addr_v6: None,
             serve_bootstrap: false,
             bootstrap_url: None,
             max_provisional: DEFAULT_MAX_PROVISIONAL,
@@ -158,6 +207,24 @@ impl RtcConfig {
     #[inline]
     pub fn with_bind_addr(mut self, addr: SocketAddr) -> Self {
         self.bind_addr = Some(addr);
+        self
+    }
+
+    /// Bind a second, IPv6 RTC socket at `addr` (dual-stack anchor).
+    /// Port 0 is fine: the advertised address is what it bound.
+    #[must_use]
+    #[inline]
+    pub fn with_bind_addr_v6(mut self, addr: SocketAddr) -> Self {
+        self.bind_addr_v6 = Some(addr);
+        self
+    }
+
+    /// Advertise `addr` for the IPv6 RTC socket instead of the
+    /// address it bound — the NAT/container case.
+    #[must_use]
+    #[inline]
+    pub fn with_public_addr_v6(mut self, addr: SocketAddr) -> Self {
+        self.public_addr_v6 = Some(addr);
         self
     }
 
@@ -197,6 +264,23 @@ impl RtcConfig {
         self
     }
 
+    /// Bind an IPv6 STUN-only socket at `addr` (dual-stack anchor).
+    #[must_use]
+    #[inline]
+    pub fn with_stun_addr_v6(mut self, addr: SocketAddr) -> Self {
+        self.stun_addr_v6 = Some(addr);
+        self
+    }
+
+    /// Announce `addr` for the IPv6 STUN socket instead of what it
+    /// bound.
+    #[must_use]
+    #[inline]
+    pub fn with_stun_public_addr_v6(mut self, addr: SocketAddr) -> Self {
+        self.stun_public_addr_v6 = Some(addr);
+        self
+    }
+
     /// Serve the bootstrap listener at this externally reachable
     /// base URL (Stage 4b). Turns `serve_bootstrap` on: a URL to
     /// advertise and no listener would be worse than neither.
@@ -224,6 +308,17 @@ impl RtcConfig {
         self.public_addr.unwrap_or(rtc_bound)
     }
 
+    /// The endpoint this anchor advertises for its **IPv6** RTC
+    /// socket, given what that socket bound — `None` when there is
+    /// no such socket. The same bind-first rule as
+    /// [`Self::advertised_stun_addr`]: the override never stands in
+    /// for a socket that does not exist.
+    #[inline]
+    pub fn advertised_rtc_addr_v6(&self, v6_bound: Option<SocketAddr>) -> Option<SocketAddr> {
+        let bound = v6_bound?;
+        Some(self.public_addr_v6.unwrap_or(bound))
+    }
+
     /// The endpoint this anchor **advertises** as `rtc_stun_addr`,
     /// given the address its second socket bound — `None` when no
     /// second socket exists.
@@ -244,6 +339,15 @@ impl RtcConfig {
         Some(self.stun_public_addr.unwrap_or(bound))
     }
 
+    /// The endpoint announced for the **IPv6** STUN socket, given what
+    /// it bound — `None` without one. Bind first, as every other
+    /// endpoint here.
+    #[inline]
+    pub fn advertised_stun_addr_v6(&self, stun_v6_bound: Option<SocketAddr>) -> Option<SocketAddr> {
+        let bound = stun_v6_bound?;
+        Some(self.stun_public_addr_v6.unwrap_or(bound))
+    }
+
     /// Everything about this configuration that must refuse a
     /// startup, in one call: `Some(explanation)` when the anchor
     /// would come up unable to serve what it announces.
@@ -252,8 +356,151 @@ impl RtcConfig {
     /// with either defect below has one symptom at the peer — an
     /// ICE deadline — and none at all locally.
     pub fn validate(&self) -> Option<String> {
-        self.unserved_stun_endpoint()
+        self.dual_stack_conflict()
+            .or_else(|| self.dual_stack_stun_conflict())
+            .or_else(|| self.unserved_stun_endpoint())
             .or_else(|| self.stun_endpoint_conflict())
+    }
+
+    /// The IPv6 STUN socket's rules: an override needs its socket,
+    /// both must be IPv6, the primary STUN socket (when set) must then
+    /// be IPv4, and it may not be the IPv6 RTC endpoint (Stage 6's
+    /// rule: a peer cannot be its own STUN server).
+    pub fn dual_stack_stun_conflict(&self) -> Option<String> {
+        if let Some(public) = self.stun_public_addr_v6 {
+            if self.stun_addr_v6.is_none() {
+                return Some(format!(
+                    "rtc: stun_public_addr_v6 ({public}) is set without stun_addr_v6, so no IPv6 \
+                     STUN socket is bound and this anchor would announce an endpoint it never serves"
+                ));
+            }
+            if !public.is_ipv6() {
+                return Some(format!(
+                    "rtc: stun_public_addr_v6 ({public}) is not an IPv6 address"
+                ));
+            }
+        }
+        let bind = self.stun_addr_v6?;
+        if !bind.is_ipv6() {
+            return Some(format!(
+                "rtc: stun_addr_v6 ({bind}) is not an IPv6 address; the second STUN socket \
+                 carries IPv6"
+            ));
+        }
+        for (field, addr) in [
+            ("stun_addr", self.stun_addr),
+            ("stun_public_addr", self.stun_public_addr),
+        ] {
+            if let Some(addr) = addr {
+                if !addr.is_ipv4() {
+                    return Some(format!(
+                        "rtc: with stun_addr_v6 set, {field} ({addr}) must be IPv4: one family \
+                         per STUN socket"
+                    ));
+                }
+            }
+        }
+        let stun6_announced = self.stun_public_addr_v6.or(self.stun_addr_v6);
+        let rtc6_announced = self.public_addr_v6.or(self.bind_addr_v6);
+        for (stun6, rtc6) in [
+            (stun6_announced, rtc6_announced),
+            (self.stun_addr_v6, self.bind_addr_v6),
+        ] {
+            if let (Some(stun6), Some(rtc6)) = (stun6, rtc6) {
+                if stun6 == rtc6 && rtc6.port() != 0 {
+                    return Some(format!(
+                        "rtc: the IPv6 STUN endpoint ({stun6}) is the IPv6 RTC endpoint ({rtc6}); \
+                         they must be distinct UDP endpoints, because a peer cannot be its own \
+                         STUN server"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// [`Self::dual_stack_stun_conflict`]'s collision rule against the
+    /// resolved IPv6 sockets, once both exist.
+    pub fn resolved_v6_stun_conflict(
+        &self,
+        rtc_v6_bound: Option<SocketAddr>,
+        stun_v6_bound: Option<SocketAddr>,
+    ) -> Option<String> {
+        let stun6 = self.advertised_stun_addr_v6(stun_v6_bound)?;
+        let rtc6 = self.advertised_rtc_addr_v6(rtc_v6_bound)?;
+        (stun6 == rtc6).then(|| {
+            format!(
+                "rtc: the resolved IPv6 STUN endpoint ({stun6}) is the resolved IPv6 RTC \
+                 endpoint ({rtc6}); they must be distinct UDP endpoints"
+            )
+        })
+    }
+
+    /// `Some(explanation)` when the IPv6 RTC socket is configured in a
+    /// way the anchor cannot serve: an override with no socket
+    /// behind it, an address of the wrong family, or a primary socket
+    /// that is not IPv4.
+    ///
+    /// One family per socket is the whole design: the driver routes a
+    /// datagram to the socket of its destination's family, so two
+    /// sockets of one family would leave that choice ambiguous and an
+    /// IPv6 primary would make the second socket a duplicate.
+    ///
+    /// This sees only what is set. A primary left to default follows
+    /// the Net socket's IP, which is known only at spawn;
+    /// [`Self::dual_stack_primary_conflict`] checks that.
+    pub fn dual_stack_conflict(&self) -> Option<String> {
+        if let Some(public) = self.public_addr_v6 {
+            if self.bind_addr_v6.is_none() {
+                return Some(format!(
+                    "rtc: public_addr_v6 ({public}) is set without bind_addr_v6, so no IPv6 \
+                     socket is bound and this anchor would advertise an endpoint it never \
+                     serves; set bind_addr_v6 (`[::]:0` is fine) or drop the override"
+                ));
+            }
+            if !public.is_ipv6() {
+                return Some(format!(
+                    "rtc: public_addr_v6 ({public}) is not an IPv6 address; it advertises the \
+                     IPv6 RTC socket"
+                ));
+            }
+        }
+        let bind = self.bind_addr_v6?;
+        if !bind.is_ipv6() {
+            return Some(format!(
+                "rtc: bind_addr_v6 ({bind}) is not an IPv6 address; the second RTC socket \
+                 carries IPv6 and the primary one carries IPv4"
+            ));
+        }
+        for (field, addr) in [
+            ("bind_addr", self.bind_addr),
+            ("public_addr", self.public_addr),
+        ] {
+            if let Some(addr) = addr {
+                if !addr.is_ipv4() {
+                    return Some(format!(
+                        "rtc: with bind_addr_v6 set, {field} ({addr}) must be IPv4: the primary \
+                         RTC socket carries IPv4 and the second carries IPv6, one family each"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// [`Self::dual_stack_conflict`]'s rule against the primary
+    /// socket's **resolved** bind, which a default `bind_addr` takes
+    /// from the Net socket's IP and so cannot be checked before
+    /// spawn.
+    pub fn dual_stack_primary_conflict(&self, primary_bind: SocketAddr) -> Option<String> {
+        self.bind_addr_v6?;
+        if primary_bind.is_ipv4() {
+            return None;
+        }
+        Some(format!(
+            "rtc: with bind_addr_v6 set, the primary RTC socket must be IPv4, but it resolves to \
+             {primary_bind} (the Net socket's IP); set bind_addr to an IPv4 address"
+        ))
     }
 
     /// `Some(explanation)` when a STUN endpoint is announced that no
@@ -367,6 +614,26 @@ impl RtcConfig {
                 ));
             }
         }
+        // **The IPv6 RTC socket is an RTC endpoint too.** A dual-stack
+        // anchor has two, and a STUN endpoint on either one eats that
+        // family's connectivity checks exactly as above. Announced
+        // level first, bind level second, as for the primary.
+        let rtc6_announced = self.public_addr_v6.or(self.bind_addr_v6);
+        for (stun, rtc6) in [
+            (stun_announced, rtc6_announced),
+            (self.stun_addr, self.bind_addr_v6),
+        ] {
+            if let (Some(stun), Some(rtc6)) = (stun, rtc6) {
+                if stun == rtc6 && rtc6.port() != 0 {
+                    return Some(format!(
+                        "rtc: the STUN endpoint ({stun}) is the IPv6 RTC endpoint ({rtc6}); they \
+                         must be distinct UDP endpoints, because a peer cannot be its own STUN \
+                         server — libwebrtc consumes datagrams from a configured STUN server \
+                         before pairing, so the peer's ICE checks would be eaten"
+                    ));
+                }
+            }
+        }
         None
     }
 
@@ -394,6 +661,26 @@ impl RtcConfig {
              must be distinct UDP endpoints, because a peer cannot be its own STUN server — \
              libwebrtc consumes datagrams from a configured STUN server before pairing, so the \
              peer's ICE checks would be eaten"
+        ))
+    }
+
+    /// [`Self::resolved_endpoint_conflict`] for the **IPv6** RTC
+    /// socket: the resolved STUN endpoint may not be the IPv6 RTC
+    /// endpoint either, and a `:0` bind is only comparable once both
+    /// sockets exist.
+    pub fn resolved_v6_endpoint_conflict(
+        &self,
+        v6_bound: Option<SocketAddr>,
+        stun_bound: Option<SocketAddr>,
+    ) -> Option<String> {
+        let stun = self.advertised_stun_addr(stun_bound)?;
+        let rtc6 = self.advertised_rtc_addr_v6(v6_bound)?;
+        if stun != rtc6 {
+            return None;
+        }
+        Some(format!(
+            "rtc: the resolved STUN endpoint ({stun}) is the resolved IPv6 RTC endpoint ({rtc6}); \
+             they must be distinct UDP endpoints, because a peer cannot be its own STUN server"
         ))
     }
 }
@@ -430,6 +717,172 @@ mod tests {
         assert_ne!(
             resolved, net,
             "§6: a dedicated socket, never a demux of the Net socket"
+        );
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("addr")
+    }
+
+    #[test]
+    fn a_config_without_an_ipv6_socket_is_unchanged() {
+        let config = RtcConfig::new().with_bind_addr(addr("127.0.0.1:7101"));
+        assert_eq!(config.validate(), None);
+        assert_eq!(config.advertised_rtc_addr_v6(None), None);
+        assert_eq!(
+            config.dual_stack_primary_conflict(addr("[::1]:0")),
+            None,
+            "an IPv6 primary is only a conflict when a second socket exists"
+        );
+    }
+
+    #[test]
+    fn a_dual_stack_config_validates_and_advertises_its_override() {
+        let config = RtcConfig::new()
+            .with_bind_addr(addr("0.0.0.0:7101"))
+            .with_bind_addr_v6(addr("[::]:7101"))
+            .with_public_addr_v6(addr("[2001:db8::7]:7101"));
+        assert_eq!(config.validate(), None);
+        assert_eq!(
+            config.advertised_rtc_addr_v6(Some(addr("[::]:7101"))),
+            Some(addr("[2001:db8::7]:7101"))
+        );
+        assert_eq!(
+            config.advertised_rtc_addr_v6(None),
+            None,
+            "the override never stands in for a socket that does not exist"
+        );
+    }
+
+    #[test]
+    fn each_misconfigured_ipv6_socket_is_refused() {
+        let refused = [
+            (
+                "override without a socket",
+                RtcConfig::new().with_public_addr_v6(addr("[2001:db8::1]:1")),
+            ),
+            (
+                "an IPv4 override",
+                RtcConfig::new()
+                    .with_bind_addr_v6(addr("[::]:0"))
+                    .with_public_addr_v6(addr("198.51.100.1:1")),
+            ),
+            (
+                "an IPv4 bind",
+                RtcConfig::new().with_bind_addr_v6(addr("0.0.0.0:0")),
+            ),
+            (
+                "an IPv6 primary bind",
+                RtcConfig::new()
+                    .with_bind_addr(addr("[::1]:0"))
+                    .with_bind_addr_v6(addr("[::1]:0")),
+            ),
+            ("an IPv6 primary override", {
+                let mut config = RtcConfig::new()
+                    .with_bind_addr(addr("127.0.0.1:0"))
+                    .with_bind_addr_v6(addr("[::1]:0"));
+                config.public_addr = Some(addr("[2001:db8::1]:1"));
+                config
+            }),
+        ];
+        for (what, config) in refused {
+            assert!(config.validate().is_some(), "{what} must be refused");
+        }
+        assert!(
+            RtcConfig::new()
+                .with_bind_addr_v6(addr("[::]:0"))
+                .dual_stack_primary_conflict(addr("[::]:0"))
+                .is_some(),
+            "a primary that resolves to IPv6 is refused once a second socket exists"
+        );
+    }
+
+    /// Stage 6's rule, one socket further: a STUN endpoint may not be
+    /// the IPv6 RTC endpoint either, announced or bound, pre-bind or
+    /// resolved.
+    #[test]
+    fn a_stun_endpoint_on_the_ipv6_rtc_endpoint_is_refused() {
+        let base = || {
+            RtcConfig::new()
+                .with_bind_addr(addr("127.0.0.1:7101"))
+                .with_bind_addr_v6(addr("[::1]:7101"))
+        };
+        assert!(base()
+            .with_stun_addr(addr("[::1]:7101"))
+            .validate()
+            .is_some());
+        assert!(base()
+            .with_public_addr_v6(addr("[2001:db8::7]:7101"))
+            .with_stun_addr(addr("[::1]:3479"))
+            .with_stun_public_addr(addr("[2001:db8::7]:7101"))
+            .validate()
+            .is_some());
+        let resolved = base().with_stun_addr(addr("[::1]:0"));
+        assert_eq!(
+            resolved.validate(),
+            None,
+            "port 0 names no endpoint before binding"
+        );
+        assert!(resolved
+            .resolved_v6_endpoint_conflict(Some(addr("[::1]:7101")), Some(addr("[::1]:7101")))
+            .is_some());
+        assert_eq!(
+            resolved
+                .resolved_v6_endpoint_conflict(Some(addr("[::1]:7101")), Some(addr("[::1]:3479"))),
+            None
+        );
+    }
+
+    /// The IPv6 STUN-only socket: an override needs its socket, both
+    /// are IPv6, the primary STUN socket is then IPv4, and it may not
+    /// be the IPv6 RTC endpoint, pre-bind or resolved.
+    #[test]
+    fn the_ipv6_stun_socket_follows_the_per_family_rules() {
+        let base = || {
+            RtcConfig::new()
+                .with_bind_addr(addr("127.0.0.1:7101"))
+                .with_bind_addr_v6(addr("[::1]:7101"))
+                .with_stun_addr(addr("127.0.0.1:3479"))
+        };
+        assert_eq!(
+            base().with_stun_addr_v6(addr("[::1]:3479")).validate(),
+            None
+        );
+        for (what, config) in [
+            (
+                "override without a socket",
+                base().with_stun_public_addr_v6(addr("[2001:db8::7]:3479")),
+            ),
+            (
+                "an IPv4 bind",
+                base().with_stun_addr_v6(addr("127.0.0.1:3480")),
+            ),
+            (
+                "the IPv6 RTC endpoint",
+                base().with_stun_addr_v6(addr("[::1]:7101")),
+            ),
+            (
+                "an IPv6 primary STUN socket",
+                RtcConfig::new()
+                    .with_bind_addr(addr("127.0.0.1:7101"))
+                    .with_stun_addr(addr("[::1]:3479"))
+                    .with_stun_addr_v6(addr("[::1]:3480")),
+            ),
+        ] {
+            assert!(config.validate().is_some(), "{what} must be refused");
+        }
+        let resolved = base().with_stun_addr_v6(addr("[::1]:0"));
+        assert!(resolved
+            .resolved_v6_stun_conflict(Some(addr("[::1]:7101")), Some(addr("[::1]:7101")))
+            .is_some());
+        assert_eq!(
+            resolved.resolved_v6_stun_conflict(Some(addr("[::1]:7101")), Some(addr("[::1]:3479"))),
+            None
+        );
+        assert_eq!(
+            resolved.advertised_stun_addr_v6(None),
+            None,
+            "the override never stands in for a socket that does not exist"
         );
     }
 

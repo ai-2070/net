@@ -14,6 +14,38 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
+## Unreleased (0.38) — dual-stack anchors
+
+An anchor can now serve IPv4 and IPv6 players at once
+(`net-mesh anchor serve --rtc-bind 0.0.0.0:7101 --rtc-bind '[::]:7101'`).
+What a page sees:
+
+- **Connecting needs no change.** The anchor's answer offers a host
+  candidate per family, and the browser pairs with whichever its network
+  reaches.
+- **`udp-blocked` is stricter and says less.** The leaf now probes
+  **every** endpoint the anchor published, under one deadline, and
+  reports `udp-blocked` only when the anchor answered over HTTPS and
+  **every** probe went unanswered. One answered family, an unrun probe,
+  or no endpoints at all stays `ice-timeout`. So an IPv6-only player
+  whose IPv4 probe is silent is no longer told UDP is blocked.
+- **The `udp-blocked` message states the observation, not a cause.** It
+  now reads `no UDP response from the anchor's advertised endpoints: its
+  HTTPS bootstrap succeeded but STUN bindings to … went unanswered`,
+  because blocked UDP, a stopped UDP listener, a wrong advertised address
+  and loss all look the same. The `kind` is unchanged. Match on `kind`,
+  never on the message.
+- **`UdpBlockedEvidence.probedAll`** lists every endpoint probed; `probed`
+  is still the first.
+- **`ConnectedEvent.rtcAddrs`** lists every endpoint the anchor published,
+  primary first. `rtcAddr` is still the primary.
+- **The Rust and TypeScript probes agree** on what "answered" means: a
+  server-reflexive candidate, or a STUN error response (code below 700).
+  The wasm probe used to ignore error responses.
+- **New exports:** `classifyRtcFailureAll`, `probeStunBindings`,
+  `probeEventAnswers`, `stunProbeAnswered`, `candidateLineIsReflexive`,
+  and the `EndpointProbe` and `ProbeEvent` types.
+
 ## 0.37.0 — the first npm release
 
 Everything in this file ships in 0.37.0, the package's first release on npm.

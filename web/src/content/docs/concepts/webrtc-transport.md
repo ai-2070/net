@@ -64,10 +64,23 @@ The two endpoints an anchor publishes are distinct and easy to confuse:
 | Field | What it is |
 | --- | --- |
 | `rtc_addr` | The anchor's own RTC endpoint — the **ICE peer** of a connection to it |
+| `rtc_addrs` | On a **dual-stack** anchor, every RTC endpoint it publishes, one per family (IPv4 and IPv6), primary first. Absent otherwise |
 | `stun_addr` | The STUN endpoint a connection gathers against |
 
-Configuring a connection's ICE servers with its own peer's `rtc_addr` is refused
-before any ICE work, because a peer cannot be its own STUN server.
+Configuring a connection's ICE servers with any of its own peer's RTC endpoints
+is refused before any ICE work, because a peer cannot be its own STUN server.
+
+**Dual-stack anchors.** A browser can only pair with the address families its
+network routes, so an anchor with one IPv4 socket cannot reach a player on an
+IPv6-only network. An anchor given an RTC socket in each family offers a host
+candidate per family in every session, and ICE picks whichever works; sessions,
+identity and relay stay shared, so an IPv4-only player and an IPv6-only player
+still meet through the anchor. It also needs a STUN endpoint in each family
+(`stun_addrs`), because a browser without a media permission learns its
+candidate on a network only from a STUN server of that family. Firefox on an
+IPv6-only network with no IPv4 route gathers nothing and is not supported. On
+464XLAT networks, as mobile IPv6-only networks are, it connects. See
+[`anchor serve`](/docs/reference/cli#serve-ipv4-and-ipv6-players) for the flags.
 
 ## Bootstrap: the credential
 
@@ -166,11 +179,14 @@ saturated anchor produces the same symptom, so a failure is typed `ice-timeout`
 unless two observations hold together:
 
 1. the HTTPS bootstrap to **that anchor** succeeded — it is up and addressable;
-2. a STUN binding to the `rtc_addr` **that same anchor published** went
-   unanswered.
+2. a STUN binding to **every** RTC endpoint that same anchor published went
+   unanswered (one per family on a dual-stack anchor, probed together).
 
 `udp-blocked` is the name for exactly that pair of facts, and it is the only path
-to it. Networks that block UDP outright still work: the pair stays routed through
+to it. One answered family keeps a failure `ice-timeout`, and even when both
+observations hold the error states what was seen — no UDP response from the
+advertised endpoints — rather than a cause, because a stopped UDP listener or a
+wrong advertised address looks the same. Networks that block UDP outright still work: the pair stays routed through
 the anchor, and the page sees `udpBlocked` as an explanation rather than as a
 dead end. The classification, its probes and the measured browser behaviour
 behind the rules are documented with the [browser SDK errors](/docs/sdk/browser/errors).

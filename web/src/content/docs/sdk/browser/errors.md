@@ -67,15 +67,41 @@ misconfigured or saturated produces exactly the same symptom. So an ICE failure
 surfaces as `ice-timeout`, and only two observations together may narrow it:
 
 1. the HTTPS bootstrap to **that anchor** succeeded — it is up and addressable;
-2. a STUN binding to the `rtc_addr` **that same anchor published** went
-   unanswered.
+2. a STUN binding to **every** RTC endpoint that same anchor published went
+   unanswered. A dual-stack anchor publishes one per family (IPv4 and IPv6), and
+   all of them are probed at once, under one deadline.
 
-`classifyRtcFailure(observations)` is a pure function of those two facts and the
-only path to a `udp-blocked` error. `probeStunBinding(addr)` produces the second
-observation; `probeBootstrapReachable()` produces the first when no `connected`
-event has arrived yet.
+`classifyRtcFailureAll({ bootstrapOk, probes })` is a pure function of those facts
+and the only path to a `udp-blocked` error. `probeStunBindings(addrs)` produces
+the probes; `probeBootstrapReachable()` produces the first observation when no
+`connected` event has arrived yet. (`classifyRtcFailure` and `probeStunBinding`
+remain for a single endpoint.)
 
-What the probe keys on was **measured in headless Chromium**, not assumed:
+Anything short of **every** probe unanswered stays `ice-timeout`:
+
+- **One family answered.** UDP works there, so the failure is something else.
+  This is the IPv6-only player behind NAT64: HTTPS reaches the anchor, the IPv4
+  probe is silent, the IPv6 probe answers. That is not blocked UDP.
+- **A probe that did not run** (`notRun`, `unsupported`, an address that is not
+  one) observed nothing, so it is not evidence.
+- **No endpoints at all.**
+
+Even when every probe is silent, the claim is the **observation**, not a proven
+cause. Blocked UDP looks exactly like a stopped UDP listener, a wrong advertised
+address, a routing failure or loss, so the message says only what was seen:
+
+```text
+rtc: no UDP response from the anchor's advertised endpoints: its HTTPS bootstrap
+succeeded but STUN bindings to 203.0.113.7:7101, [2001:db8::7]:7101 went unanswered
+```
+
+The `kind` is `udp-blocked`, for compatibility. Match on `kind` (or
+`isUdpBlocked`), never on the message. `error.failure.evidence.probedAll` lists
+every endpoint probed.
+
+What each probe keys on was **measured in headless Chromium**, not assumed. The
+Rust (wasm) probe and the TypeScript probe apply the same rule (`probeEventAnswers`),
+held to one shared vector file by a test on each side:
 
 | What the engine did | Outcome | Classification |
 | --- | --- | --- |
@@ -97,9 +123,10 @@ Three details shape that table:
 
 ## The probe needs a subject
 
-The address comes from the `connected` event's `rtcAddr`, or from
-`connect({ anchorRtcAddr })` for a page that already knows it. With neither, there
-is no evidence and an ICE timeout correctly stays `ice-timeout`.
+The addresses come from the `connected` event's `rtcAddrs` (every endpoint the
+anchor published, primary first; `rtcAddr` is still the primary), or from
+`connect({ anchorRtcAddr })` for a page that already knows one. With neither,
+there is no evidence and an ICE timeout correctly stays `ice-timeout`.
 
 ```typescript
 await connect({
@@ -113,8 +140,9 @@ await connect({
 is for. It is **not** a source of `iceServers`: for a connection with that anchor,
 `rtc_addr` is the ICE peer, and a peer cannot be its own STUN server.
 `ConnectOptions.iceServers` defaults to the separate `stun_addr` the anchor
-announces, and an entry naming this connection's peer is refused with
-`ice-server-conflict` before any ICE work rather than silently stripped.
+announces, and an entry naming **any** of this connection's peer endpoints (either
+family, in any spelling of the address) is refused with `ice-server-conflict`
+before any ICE work rather than silently stripped.
 
 The one assumption this rests on is worth naming: the anchor's published
 `rtc_addr` must answer an unauthenticated STUN binding request, with a success or
@@ -132,8 +160,9 @@ try {
   // …
 } catch (error) {
   if (isUdpBlocked(error)) {
-    // Two observations, not one: this network blocks UDP, and the pair will
-    // stay routed through the anchor.
+    // Two observations, not one: the anchor answered HTTPS and no advertised
+    // UDP endpoint answered. Most often this network blocks UDP; the pair
+    // stays routed through the anchor either way.
   }
 }
 ```

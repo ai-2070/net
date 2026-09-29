@@ -70,6 +70,11 @@ pub enum LeafEvent {
         /// published one. The datum the `UdpBlocked` correction
         /// needs: the STUN probe aims here, never at an ICE server.
         rtc_addr: Option<String>,
+        /// **Every** endpoint the peer published, primary first, when
+        /// there is more than one (a dual-stack anchor); empty
+        /// otherwise, and then `rtc_addr` is the whole answer. The
+        /// STUN probe aims at all of them under one deadline.
+        rtc_addrs: Vec<String>,
     },
     /// A session with `peer` is gone.
     Disconnected {
@@ -217,10 +222,22 @@ impl LeafEvent {
                 node_id,
                 peer_node,
                 rtc_addr,
-            } => format!(
-                "{{\"type\":\"connected\",\"node_id\":\"{node_id}\",\"node_id_hex\":\"{node_id:016x}\",\"peer_node\":\"{peer_node}\",\"rtc_addr\":{}}}",
-                json_string_or_null(rtc_addr.as_deref())
-            ),
+                rtc_addrs,
+            } => {
+                // `rtc_addrs` only when there is more than one, so a
+                // single-stack anchor's event is unchanged byte for
+                // byte (the `GET /rtc/anchor` serialization rule).
+                let rtc_addrs = if rtc_addrs.len() > 1 {
+                    let list: Vec<String> = rtc_addrs.iter().map(|addr| json_string(addr)).collect();
+                    format!(",\"rtc_addrs\":[{}]", list.join(","))
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{{\"type\":\"connected\",\"node_id\":\"{node_id}\",\"node_id_hex\":\"{node_id:016x}\",\"peer_node\":\"{peer_node}\",\"rtc_addr\":{}{rtc_addrs}}}",
+                    json_string_or_null(rtc_addr.as_deref())
+                )
+            }
             Self::Disconnected { peer_node, reason } => format!(
                 "{{\"type\":\"disconnected\",\"peer_node\":\"{peer_node}\",\"reason\":{}}}",
                 json_string(reason)
@@ -558,6 +575,10 @@ pub struct LeafNode {
     /// The peer's published RTC socket, per peer, for the
     /// `UdpBlocked` evidence and the `connected` event.
     peer_rtc_addr: HashMap<NodeId, String>,
+    /// Every endpoint the peer published, when there is more than one
+    /// (a dual-stack anchor). Set and cleared beside
+    /// [`Self::peer_rtc_addr`], for the same establishment.
+    peer_rtc_addrs: HashMap<NodeId, Vec<String>>,
     /// `peer` → the peer that **relays** for it: every packet for
     /// `peer` leaves wrapped in a routing envelope and addressed to
     /// the relay's transport instead (plan §9 step 3).
@@ -732,6 +753,7 @@ impl LeafNode {
             events: Vec::new(),
             announcement_version: 1,
             peer_rtc_addr: HashMap::new(),
+            peer_rtc_addrs: HashMap::new(),
             relays: HashMap::new(),
             next_nonce: 1,
             pending_memberships: HashMap::new(),
@@ -781,6 +803,17 @@ impl LeafNode {
     /// Whether a session with `peer` is installed.
     pub fn has_session(&self, peer: NodeId) -> bool {
         self.sessions.get(peer).is_some()
+    }
+
+    /// Record **every** endpoint the bootstrap published for `peer`,
+    /// primary first. Kept only when there is more than one; a single
+    /// endpoint is [`Self::set_peer_rtc_addr`]'s alone.
+    pub fn set_peer_rtc_addrs(&mut self, peer: NodeId, addrs: Vec<String>) {
+        if addrs.len() > 1 {
+            self.peer_rtc_addrs.insert(peer, addrs);
+        } else {
+            self.peer_rtc_addrs.remove(&peer);
+        }
     }
 
     /// Record what the bootstrap published for `peer`.
@@ -1416,6 +1449,7 @@ impl LeafNode {
             node_id: self.identity.node_id(),
             peer_node: peer,
             rtc_addr: self.peer_rtc_addr.get(&peer).cloned(),
+            rtc_addrs: self.peer_rtc_addrs.get(&peer).cloned().unwrap_or_default(),
         });
     }
 
@@ -1524,6 +1558,7 @@ impl LeafNode {
         // address and can mint a false `udp_blocked`. The next
         // establishment re-supplies it via `set_peer_rtc_addr`.
         self.peer_rtc_addr.remove(&peer);
+        self.peer_rtc_addrs.remove(&peer);
         // The chain certified this session's admission — "the session
         // is no longer provisional" — so with the session gone the
         // claim is gone: `is_enrolled` must not keep reporting a
@@ -4395,8 +4430,13 @@ mod tests {
                 node_id: node.node_id(),
                 peer_node: ANCHOR,
                 rtc_addr: Some("198.51.100.7:4433".into()),
+                rtc_addrs: Vec::new(),
             }],
             "the rtc_addr is the datum the UdpBlocked correction needs"
+        );
+        assert!(
+            !events[0].to_json().contains("rtc_addrs"),
+            "a single-stack anchor's event is unchanged: no rtc_addrs key"
         );
         let json = events[0].to_json();
         assert!(json.contains("\"type\":\"connected\""), "{json}");
@@ -4407,6 +4447,25 @@ mod tests {
         assert!(
             json.contains("\"rtc_addr\":\"198.51.100.7:4433\""),
             "{json}"
+        );
+    }
+
+    /// A dual-stack anchor's `connected` event carries every published
+    /// endpoint, primary first, so the STUN probe can aim at all of
+    /// them; `rtc_addr` stays the primary.
+    #[test]
+    fn a_dual_stack_anchors_connected_event_lists_every_endpoint() {
+        let event = LeafEvent::Connected {
+            node_id: 7,
+            peer_node: ANCHOR,
+            rtc_addr: Some("203.0.113.7:7101".into()),
+            rtc_addrs: vec!["203.0.113.7:7101".into(), "[2001:db8::7]:7101".into()],
+        };
+        let json: serde_json::Value = serde_json::from_str(&event.to_json()).expect("valid JSON");
+        assert_eq!(json["rtc_addr"], "203.0.113.7:7101");
+        assert_eq!(
+            json["rtc_addrs"],
+            serde_json::json!(["203.0.113.7:7101", "[2001:db8::7]:7101"])
         );
     }
 

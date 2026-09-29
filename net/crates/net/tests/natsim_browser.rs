@@ -22,7 +22,8 @@ mod rows;
 
 use rows::{
     all_scenarios, AppExchange, Disposition, Enumeration, Forwarding, IceCounters, Media, Nat,
-    NatFlows, Row, RowVerdict, CONTROL, NO_MEDIA, NO_MEDIA_RELAYED, ROWS,
+    NatFlows, Row, RowVerdict, CONTROL, DUAL_STACK, DUAL_STACK_FIREFOX, DUAL_STACK_FIREFOX_464XLAT,
+    NO_MEDIA, NO_MEDIA_RELAYED, ROWS,
 };
 
 // =========================================================================
@@ -222,18 +223,63 @@ fn run_scenario_matrix_matches_the_rust_table() {
             row.scenario
         );
     }
-    // The matrix is Chromium's; exactly one scenario is the Firefox
-    // control. A second Firefox row would silently double the job's
-    // runtime for a second reading of the same netfilter behaviour.
+    // The NAT matrix is Chromium's; exactly one NAT scenario is the
+    // Firefox control. A second Firefox NAT row would silently double
+    // the job's runtime for a second reading of the same netfilter
+    // behaviour. The dual-stack rows are a different claim — support
+    // per ENGINE for IPv6-only players — so they run each supported
+    // engine by name and are pinned as their own exact set below.
+    let dual_stack = [
+        DUAL_STACK.scenario,
+        DUAL_STACK_FIREFOX.scenario,
+        DUAL_STACK_FIREFOX_464XLAT.scenario,
+    ];
     let firefox: Vec<&str> = arms
         .iter()
         .filter(|a| a.engine_a == "firefox" || a.engine_b == "firefox")
+        .filter(|a| !dual_stack.contains(&a.scenario.as_str()))
         .map(|a| a.scenario.as_str())
         .collect();
     assert_eq!(
         firefox,
         vec![CONTROL.scenario],
-        "exactly one scenario runs Firefox, and it is the control"
+        "exactly one NAT scenario runs Firefox, and it is the control"
+    );
+    // The dual-stack rows: one per supported engine, both sides the
+    // same engine, both permission-free, in this order. A Chromium
+    // pass cannot stand in for Firefox (Kyra's slice 4 bar), so each
+    // is pinned rather than "some engine".
+    let dual: Vec<(&str, &str, &str, &str)> = arms
+        .iter()
+        .filter(|a| dual_stack.contains(&a.scenario.as_str()))
+        .map(|a| {
+            (
+                a.scenario.as_str(),
+                a.engine_a.as_str(),
+                a.engine_b.as_str(),
+                a.media.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        dual,
+        vec![
+            (DUAL_STACK.scenario, "chromium", "chromium", "none"),
+            (DUAL_STACK_FIREFOX.scenario, "firefox", "firefox", "none"),
+            (
+                DUAL_STACK_FIREFOX_464XLAT.scenario,
+                "firefox",
+                "firefox",
+                "none"
+            ),
+        ],
+        "the dual-stack claim is per supported engine, each permission-free — Firefox's as a \
+         pinned support decision"
+    );
+    assert_eq!(
+        DUAL_STACK_FIREFOX.expect,
+        Disposition::Unreachable,
+        "the Firefox dual-stack row pins its limitation; flipping it is a deliberate edit"
     );
     let control = arms
         .iter()
@@ -259,6 +305,7 @@ fn run_scenario_matrix_matches_the_rust_table() {
     let ungranted: Vec<&str> = arms
         .iter()
         .filter(|a| a.media == "none" && a.engine_a == "chromium")
+        .filter(|a| !dual_stack.contains(&a.scenario.as_str()))
         .map(|a| a.scenario.as_str())
         .collect();
     assert_eq!(
@@ -337,6 +384,13 @@ fn the_anchor_bootstrap_dialog_is_counted_in_every_expectation() {
                 (want.direct, want.relayed),
                 (1, 1),
                 "{}: the anchor dialog is still direct on a relayed row",
+                row.scenario
+            ),
+            // Side A's anchor dialog only: B never reached the anchor.
+            Disposition::Unreachable => assert_eq!(
+                (want.attempted, want.direct, want.relayed),
+                (1, 1, 0),
+                "{}: an unreachable row counts side A's anchor dialog and nothing else",
                 row.scenario
             ),
         }
@@ -926,7 +980,7 @@ fn delivery_and_the_counter_disposition_are_two_assertions() {
 fn every_row_names_the_forwarding_disposition_its_expectation_implies() {
     for row in rows::all_scenarios() {
         let want = match row.expect {
-            Disposition::Direct => Forwarding::Flat,
+            Disposition::Direct | Disposition::Unreachable => Forwarding::Flat,
             Disposition::Relayed => Forwarding::Carried,
         };
         assert_eq!(
@@ -1072,4 +1126,157 @@ fn a_flow_witness_that_cannot_say_where_its_numbers_came_from_is_refused() {
         err.contains("a.source") && err.contains("opposite facts"),
         "an absent source must not default to readable: {err}"
     );
+}
+
+// =========================================================================
+// The dual-stack family witness (ANCHOR_DUAL_STACK_PLAN.md, slice 4)
+// =========================================================================
+
+/// The families a correct dual-stack verdict reports: A IPv4-only, B
+/// IPv6-only, and the anchor's session with each on that family.
+fn families_json() -> serde_json::Value {
+    serde_json::json!({
+        "a": { "ipv4": true, "ipv6": false },
+        "b": { "ipv4": false, "ipv6": true },
+        "anchor_pair": {
+            "a": { "local": "10.99.0.10:7100", "remote": "10.99.0.2:50001" },
+            "b": { "local": "[2001:db8:99::10]:7100", "remote": "[2001:db8:103::2]:50002" },
+        },
+    })
+}
+
+fn dual_stack_verdict(families: Option<serde_json::Value>) -> serde_json::Value {
+    let mut v = verdict_json(&DUAL_STACK, "iceTimeout", anchor_direct_peer_relayed());
+    if let Some(families) = families {
+        v["families"] = families;
+    }
+    v
+}
+
+#[test]
+fn a_dual_stack_verdict_with_disjoint_families_passes() {
+    RowVerdict::from_json(&dual_stack_verdict(Some(families_json())))
+        .expect("parse")
+        .check(&DUAL_STACK)
+        .expect("A IPv4-only, B IPv6-only, each on its own family to the anchor, relayed");
+}
+
+/// Without the witness a relayed result says nothing about the family
+/// bridge: it could be any unsolvable pair.
+#[test]
+fn a_dual_stack_verdict_without_the_family_witness_is_refused() {
+    let err = RowVerdict::from_json(&dual_stack_verdict(None))
+        .expect("parse")
+        .check(&DUAL_STACK)
+        .expect_err("no families witness");
+    assert!(err.contains("no `families` witness"), "{err}");
+}
+
+/// A player that has the other family after all could have paired
+/// directly, so a relayed result would not be the bridge's doing.
+#[test]
+fn a_shared_family_fails_the_dual_stack_row() {
+    for (side, family) in [("a", "ipv6"), ("b", "ipv4")] {
+        let mut families = families_json();
+        families[side][family] = serde_json::json!(true);
+        let err = RowVerdict::from_json(&dual_stack_verdict(Some(families)))
+            .expect("parse")
+            .check(&DUAL_STACK)
+            .expect_err("a shared family");
+        assert!(
+            err.contains(&format!("player {side} has {family}")),
+            "{err}"
+        );
+    }
+}
+
+/// The anchor must reach each player on that player's own family; an
+/// IPv6-only player on an IPv4 anchor session is a contradiction the
+/// row reports rather than averages away.
+#[test]
+fn an_anchor_session_on_the_wrong_family_fails() {
+    let mut families = families_json();
+    families["anchor_pair"]["b"] =
+        serde_json::json!({ "local": "10.99.0.10:7100", "remote": "10.99.0.3:50002" });
+    let err = RowVerdict::from_json(&dual_stack_verdict(Some(families)))
+        .expect("parse")
+        .check(&DUAL_STACK)
+        .expect_err("B's anchor session on IPv4");
+    assert!(err.contains("player b") && err.contains("IPv6"), "{err}");
+}
+
+/// Rows that do not assert families are unaffected by the field.
+#[test]
+fn a_nat_row_ignores_the_family_witness() {
+    let row = &ROWS[5];
+    let v = verdict_json(row, "iceTimeout", anchor_direct_peer_relayed());
+    RowVerdict::from_json(&v)
+        .expect("parse")
+        .check(row)
+        .expect("a NAT row asserts nothing about families");
+}
+
+// =========================================================================
+// The pinned engine limitation (Disposition::Unreachable)
+// =========================================================================
+
+/// What a correct unreachable-B verdict looks like: side A connected
+/// with its one anchor dialog direct, side B's connect ended as
+/// `b_kind`, no exchange, and the players' families from the
+/// namespaces (no anchor pair for B: it never had a session).
+fn unreachable_verdict(b_kind: &str) -> serde_json::Value {
+    let row = &DUAL_STACK_FIREFOX;
+    serde_json::json!({
+        "scenario": row.scenario,
+        "nat_a": row.nat_a.mode(),
+        "nat_b": row.nat_b.mode(),
+        "engine_a": "firefox",
+        "engine_b": "firefox",
+        "page_type": "",
+        "peer_page_type": "",
+        "page_detail": "",
+        "a": { "node_id": "00000000000000aa", "counters": counters_json(row.leaf_expectation()) },
+        "b": { "node_id": "", "counters": null },
+        // The runner reads the anchor's ledger on every path; this row
+        // asserts nothing about it (B's dialog may still be pending).
+        "anchor": { "counters": counters_json(row.anchor_expectation()) },
+        "media": row.media.flag(),
+        "app": null,
+        "families": {
+            "a": { "ipv4": true, "ipv6": false },
+            "b": { "ipv4": false, "ipv6": true },
+        },
+        "b_connect_kind": b_kind,
+        "errors": [],
+    })
+}
+
+#[test]
+fn a_pinned_unreachable_side_passes_as_a_typed_ice_timeout() {
+    RowVerdict::from_json(&unreachable_verdict("ice-timeout"))
+        .expect("parse")
+        .check(&DUAL_STACK_FIREFOX)
+        .expect("B failed typed ice-timeout, A connected, families disjoint");
+}
+
+/// `udp-blocked` from a browser whose probes could not run is exactly
+/// the false diagnosis the probes' `notRun` rule removes.
+#[test]
+fn a_pinned_unreachable_side_reporting_udp_blocked_fails() {
+    let err = RowVerdict::from_json(&unreachable_verdict("udp-blocked"))
+        .expect("parse")
+        .check(&DUAL_STACK_FIREFOX)
+        .expect_err("udp-blocked is a false diagnosis here");
+    assert!(err.contains("not typed `ice-timeout`"), "{err}");
+}
+
+/// The limitation disappearing must be LOUD: the row fails and says
+/// to flip it, rather than passing a result it did not predict.
+#[test]
+fn a_pinned_unreachable_side_that_connects_fails_so_it_gets_flipped() {
+    let err = RowVerdict::from_json(&unreachable_verdict("connected"))
+        .expect("parse")
+        .check(&DUAL_STACK_FIREFOX)
+        .expect_err("the engine limitation is gone");
+    assert!(err.contains("flip it deliberately"), "{err}");
 }
