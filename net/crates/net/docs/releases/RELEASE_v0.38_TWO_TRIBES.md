@@ -69,6 +69,17 @@ Tests: 6 registry tests cover keying, refusals, capacity with idle reclamation, 
 
 ---
 
+## Prebuilt anchor binaries
+
+Until now an anchor meant `cargo install net-cli --features rtc-bootstrap`: a Rust toolchain, cmake and a C compiler. That was a steep first step for a game developer. From v0.38 the GitHub release carries the anchor prebuilt, beside the regular CLI archives:
+
+- `net-mesh-anchor-v0.38.0-x86_64-unknown-linux-gnu.tar.gz`, for a server. It is built on Ubuntu 22.04 and runs on any host with glibc 2.35 or newer.
+- `net-mesh-anchor-v0.38.0-x86_64-pc-windows-msvc.zip`, for a local anchor while developing.
+
+The binary inside is the same `net-mesh`, built with the anchor feature. The regular `net-cli-v…` archives are unchanged: they still carry no WebRTC stack and no HTTPS server. Both kinds come from the same tag in the same workflow run, so a page and its anchor are always one release. Each anchor archive is smoke-tested before it is attached: `anchor serve` must exist and carry this release's flags. Other platforms still build from source. This is shape B of [`ANCHOR_PREBUILT_BINARIES_PLAN.md`](../../../../../docs/internal/plans/ANCHOR_PREBUILT_BINARIES_PLAN.md), for two targets. The container image and the remaining targets are still to come.
+
+---
+
 ## Rate limiting by /64
 
 - An IPv6 client is charged by its **/64 prefix**, since one subscriber can rotate through a whole /64. IPv4 is charged per address, and IPv4-mapped IPv6 addresses are unmapped first.
@@ -160,7 +171,7 @@ Bump to 0.38.0 and rebuild. To serve IPv6-only players:
 2. Add an IPv6 `--listen` and an IPv6 `--acme-challenge-addr`.
 3. Then publish an `AAAA` record.
 
-To run a public anchor, add `--open-games <state-file>` (and drop `--allow-origin` if you list no registered games).
+To run an anchor, download `net-mesh-anchor-v0.38.0-*` from the release. To run a public one, add `--open-games <state-file>` (and drop `--allow-origin` if you list no registered games).
 
 Pages and anchors ship together: upgrade `@net-mesh/browser` with the anchor to get the every-endpoint probe.
 
