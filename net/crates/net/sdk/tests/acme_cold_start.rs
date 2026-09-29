@@ -231,6 +231,65 @@ async fn a_cold_cache_orders_a_certificate_and_then_serves_tls() {
     );
 
     handle.shutdown().await;
+
+    // **The account is kept, and a second order reuses it.** Every
+    // order used to register a new account and discard it, so an
+    // anchor restarted before its first certificate cached registered
+    // one per start until the directory refused. Drop the cached
+    // certificate, order again with the same cache: the one saved
+    // account must be the one used, byte for byte.
+    let accounts = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        let mut found: Vec<_> = std::fs::read_dir(dir)
+            .expect("read the cache")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("acme-account-") && n.ends_with(".json"))
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    let saved = accounts(cache.path());
+    assert_eq!(
+        saved.len(),
+        1,
+        "one account saved for the directory: {saved:?}"
+    );
+    let before = std::fs::read(&saved[0]).expect("read the saved account");
+
+    std::fs::remove_dir_all(&domain_dir).expect("drop the cached certificate");
+    let again = AcmeConfig::new(
+        std::env::var("PEBBLE_DIRECTORY_URL").expect("PEBBLE_DIRECTORY_URL"),
+        domain(),
+        "operator@example.invalid",
+        cache.path().to_path_buf(),
+    )
+    .with_directory_roots(directory_roots());
+    let mut cfg = BootstrapConfig::new(
+        "0.0.0.0:0".parse().expect("addr"),
+        Psk::new(PSK),
+        issuer.entity_id().clone(),
+        BootstrapTls::Acme(again),
+        format!("https://{}", domain()),
+    );
+    cfg.acme_challenge_addr = challenge_addr();
+    let handle = serve_bootstrap(Arc::clone(&anchor), cfg)
+        .await
+        .expect("a second order with the saved account completes");
+    assert!(cert_path.exists(), "the second order cached a certificate");
+    assert_eq!(
+        accounts(cache.path()),
+        saved,
+        "no second account file appeared"
+    );
+    assert_eq!(
+        std::fs::read(&saved[0]).expect("re-read the saved account"),
+        before,
+        "the saved account was restored, not replaced by a new registration"
+    );
+    handle.shutdown().await;
 }
 
 async fn https_get(

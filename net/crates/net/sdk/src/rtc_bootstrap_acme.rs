@@ -15,6 +15,14 @@
 //! Let's Encrypt's rate limits make an anchor that orders on every
 //! boot a self-inflicted outage.
 //!
+//! **So is the ACME account.** Every order used to register a new
+//! account and throw its credentials away, so an anchor that kept
+//! failing before its first certificate (a crash loop under a
+//! supervisor, a validation path that did not work yet) registered a
+//! new account on every start, and Let's Encrypt refused it after ten
+//! in three hours. The account is created once per directory and
+//! restored from the cache from then on ([`ACCOUNT_FILE_PREFIX`]).
+//!
 //! **HTTP-01 on the same listener means the same socket answers
 //! `:443`.** The plan's constraint is that CI must not pass
 //! `--ignore-certificate-errors`; that is satisfied by there being
@@ -36,6 +44,13 @@ use crate::rtc_bootstrap::{read_pem_pair, AcmeConfig, AcmeState, BootstrapError}
 /// still be inside its validity window.
 const CERT_FILE: &str = "bootstrap-cert.pem";
 const KEY_FILE: &str = "bootstrap-key.pem";
+
+/// The ACME account's saved credentials live in `cache_dir` itself —
+/// an account belongs to a directory, not to a domain — one file per
+/// directory URL (`<prefix><hash>.json`), so a staging account is
+/// never presented to production. The file holds the account's
+/// private key and is written 0600 like the certificate key.
+const ACCOUNT_FILE_PREFIX: &str = "acme-account-";
 
 /// Renew this long before `not_after` (R4c). Let's Encrypt issues
 /// 90-day certificates and recommends renewing at 30 days left.
@@ -97,6 +112,39 @@ pub(crate) fn domain_cache_dir(config: &AcmeConfig) -> PathBuf {
 
 fn cache_paths(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join(CERT_FILE), dir.join(KEY_FILE))
+}
+
+/// Where the account for [`AcmeConfig::directory_url`] is saved.
+fn account_path(config: &AcmeConfig) -> PathBuf {
+    let digest = blake3::hash(config.directory_url.as_bytes());
+    let id: String = digest.as_bytes()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    config
+        .cache_dir
+        .join(format!("{ACCOUNT_FILE_PREFIX}{id}.json"))
+}
+
+/// The saved account for this directory, if there is one that parses.
+/// A file that does not parse is treated as absent: the next order
+/// creates an account and replaces it.
+fn load_account(config: &AcmeConfig) -> Option<instant_acme::AccountCredentials> {
+    let text = std::fs::read_to_string(account_path(config)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Save a newly created account for this directory, 0600.
+fn save_account(
+    config: &AcmeConfig,
+    credentials: &instant_acme::AccountCredentials,
+) -> Result<(), BootstrapError> {
+    std::fs::create_dir_all(&config.cache_dir).map_err(|e| {
+        BootstrapError::Acme(format!("creating {}: {e}", config.cache_dir.display()))
+    })?;
+    let json = serde_json::to_string(credentials)
+        .map_err(|e| BootstrapError::Acme(format!("encoding the ACME account: {e}")))?;
+    write_private_key(&account_path(config), &json)
 }
 
 /// Does `private` belong to `leaf`? (R4, round two.)
@@ -435,19 +483,43 @@ async fn order_certificate(
         AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
     };
 
-    let contact = format!("mailto:{}", config.contact_email);
-    let (account, _credentials) = account_builder(config)?
-        .create(
-            &NewAccount {
-                contact: &[&contact],
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            config.directory_url.clone(),
-            None,
-        )
-        .await
-        .map_err(|e| BootstrapError::Acme(format!("creating the ACME account: {e}")))?;
+    // The saved account when there is one. A restore that fails (the
+    // directory unreachable, say) fails the order: falling back to a
+    // fresh registration is exactly the churn this cache exists to
+    // stop. An operator retires a dead account by deleting its file.
+    let account = match load_account(config) {
+        Some(credentials) => account_builder(config)?
+            .from_credentials(credentials)
+            .await
+            .map_err(|e| BootstrapError::Acme(format!("restoring the ACME account: {e}")))?,
+        None => {
+            let contact = format!("mailto:{}", config.contact_email);
+            let (account, credentials) = account_builder(config)?
+                .create(
+                    &NewAccount {
+                        contact: &[&contact],
+                        terms_of_service_agreed: true,
+                        only_return_existing: false,
+                    },
+                    config.directory_url.clone(),
+                    None,
+                )
+                .await
+                .map_err(|e| BootstrapError::Acme(format!("creating the ACME account: {e}")))?;
+            // Saving can fail after the account exists. Carry on: this
+            // order still completes and caches its certificate, so a
+            // restart does not order again, where failing here would
+            // hand a supervisor another registration to make.
+            if let Err(e) = save_account(config, &credentials) {
+                tracing::warn!(
+                    error = %e,
+                    "the new ACME account could not be saved; the next order will \
+                     register another"
+                );
+            }
+            account
+        }
+    };
 
     let identifier = Identifier::Dns(config.domain.clone());
     let mut order = account
@@ -953,6 +1025,80 @@ mod tests {
             format!("{}{}", leaf.pem(), ca.pem()),
             leaf_key.serialize_pem(),
         )
+    }
+
+    fn staging(cache: &Path) -> AcmeConfig {
+        AcmeConfig::new(
+            "https://acme-staging-v02.api.letsencrypt.org/directory",
+            "anchor.example",
+            "o@example.invalid",
+            cache.to_path_buf(),
+        )
+    }
+
+    /// Credentials as instant-acme serializes them. The type is opaque
+    /// and only deserializes; the key bytes are never used here.
+    fn credentials() -> instant_acme::AccountCredentials {
+        serde_json::from_value(serde_json::json!({
+            "id": "https://acme.example/acct/1",
+            "key_pkcs8": "MFECAQEwBQYDK2VwBCIEIA",
+            "directory": "https://acme.example/directory",
+        }))
+        .expect("credentials parse")
+    }
+
+    /// A saved account comes back for the same directory, is private
+    /// on disk, and is never offered to a different directory: a
+    /// staging account must not be presented to production.
+    ///
+    /// Inverse: key the file on nothing (one name for every directory)
+    /// and the production lookup finds the staging account.
+    #[test]
+    fn an_account_is_saved_per_directory_and_restored() {
+        let cache = tempfile::tempdir().unwrap();
+        let config = staging(cache.path());
+        assert!(
+            load_account(&config).is_none(),
+            "an empty cache has no account"
+        );
+
+        save_account(&config, &credentials()).expect("save");
+        let back = load_account(&config).expect("the saved account loads");
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(credentials()).unwrap()
+        );
+        let path = account_path(&config);
+        assert!(path.starts_with(cache.path()));
+        assert_eq!(
+            observed_mode(&path).unwrap(),
+            0o600,
+            "the account key is private"
+        );
+
+        let production = AcmeConfig::new(
+            "https://acme-v02.api.letsencrypt.org/directory",
+            "anchor.example",
+            "o@example.invalid",
+            cache.path().to_path_buf(),
+        );
+        assert_ne!(account_path(&production), path);
+        assert!(
+            load_account(&production).is_none(),
+            "another directory's account is not reused"
+        );
+    }
+
+    /// A file that does not parse is no account, so the next order
+    /// registers one and overwrites it, rather than failing forever.
+    #[test]
+    fn an_unreadable_account_file_counts_as_none() {
+        let cache = tempfile::tempdir().unwrap();
+        let config = staging(cache.path());
+        std::fs::write(account_path(&config), "not json").unwrap();
+        assert!(load_account(&config).is_none());
+        save_account(&config, &credentials()).expect("replaces the junk");
+        assert!(load_account(&config).is_some());
     }
 
     /// **The failure this closes.** The hosted cold-start job died at
