@@ -193,7 +193,8 @@ A browser pairs only with the address families its network routes, so an anchor 
 
 ```sh
 net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
-  --acme-directory https://acme-v02.api.letsencrypt.org/directory --acme-email you@example.com \
+  --acme-directory https://acme-v02.api.letsencrypt.org/directory \
+  --acme-email you@example.com \
   --listen 0.0.0.0:443 --listen '[::]:443' \
   --acme-challenge-addr 0.0.0.0:80 --acme-challenge-addr '[::]:80' \
   --rtc-bind 0.0.0.0:7101 --rtc-bind '[::]:7101' \
