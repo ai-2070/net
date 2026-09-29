@@ -85,7 +85,8 @@ request at the wrong place.
 
 The credential is issued by the anchor (`net-mesh anchor credential mint` /
 `inspect`; the CLI's live `anchor` verbs need the `rtc-bootstrap` feature —
-`cargo install net-cli --features rtc-bootstrap`, see `cli.md`). It is **signed
+the release's `net-mesh-anchor-v<version>-*` archive (x86_64 Linux and
+Windows), or `cargo install net-cli --features rtc-bootstrap`, see `cli.md`). It is **signed
 and secret-bearing**, and the leaf's job is to present it unmodified: the anchor
 verifies the issuer signature.
 

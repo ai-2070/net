@@ -170,7 +170,7 @@ Identity `generate/show/fingerprint/revoke` supports `--inspect-target`. Generat
 
 ## Admit browsers for your games
 
-`anchor serve --game <id>` turns a standalone anchor into one browser players can join: it serves enrollment and issues an **anonymous credential per visitor** at `POST <url>/credential` with the body `{"game": "<id>"}`. The reply is `{credentialB64, bootstrapUrl, game}` — what `@net-mesh/browser`'s `connect()` takes, together with `rememberedIdentity()` so a returning player is the same node; `requestCredential({ anchorUrl, game })` makes the request for a page. The anchor verbs need a CLI built with the anchor feature: `cargo install net-cli --features rtc-bootstrap`.
+`anchor serve --game <id>` turns a standalone anchor into one browser players can join: it serves enrollment and issues an **anonymous credential per visitor** at `POST <url>/credential` with the body `{"game": "<id>"}`. The reply is `{credentialB64, bootstrapUrl, game}` — what `@net-mesh/browser`'s `connect()` takes, together with `rememberedIdentity()` so a returning player is the same node; `requestCredential({ anchorUrl, game })` makes the request for a page. The anchor verbs need a CLI built with the anchor feature. From 0.38 every GitHub release carries one prebuilt, `net-mesh-anchor-v<version>-x86_64-unknown-linux-gnu.tar.gz` and `net-mesh-anchor-v<version>-x86_64-pc-windows-msvc.zip`, beside the regular `net-cli-v…` archives. The binary inside is still `net-mesh`. Other platforms build it from source: `cargo install net-cli --features rtc-bootstrap`.
 
 ```sh
 net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \

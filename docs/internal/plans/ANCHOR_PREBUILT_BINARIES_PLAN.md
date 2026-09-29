@@ -2,9 +2,24 @@
 
 ## Status
 
-**Planned, not started. Target: 0.38.** Written 2026-09-27 while preparing
-0.37. In 0.37 an anchor is `cargo install net-cli --features rtc-bootstrap`.
-The release notes and docs say so, and this plan is how 0.38 removes that step.
+**Shape B shipped for two targets in 0.38 (2026-09-29).** Written 2026-09-27
+while preparing 0.37, when an anchor was `cargo install net-cli --features
+rtc-bootstrap`.
+
+- **What shipped:** `release-binaries-cli.yml` gained a `build-anchor` job. It
+  builds `net-mesh-anchor-v<version>-x86_64-unknown-linux-gnu.tar.gz` on
+  ubuntu-22.04 (glibc 2.35) and `…-x86_64-pc-windows-msvc.zip` on
+  windows-latest, with `--features rtc-bootstrap`. Both are attached to the
+  same `v<version>` release as the CLI archives, in the same run.
+- **Scope:** decided by the maintainer as these two targets only. Both were
+  proven to build and pass the smoke test in CI before the release
+  (throwaway branch `anchor-build-0.38`).
+- **Smoke test:** `--version`, and that `anchor serve --help` lists this
+  release's flags.
+- **Still open:** slice 2's loopback serve and browser-acceptance runs
+  against the released binary; the other targets (musl via zig, ARM,
+  macOS); the container image (C); and slice 4's docs sweep beyond the CLI
+  reference, the release note and the `net-event-bus` skill.
 
 ## The gap
 
