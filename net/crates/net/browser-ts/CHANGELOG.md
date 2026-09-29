@@ -14,12 +14,23 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
-## Unreleased (0.38) — dual-stack anchors
+## 0.38.0 — dual-stack anchors
 
 An anchor can now serve IPv4 and IPv6 players at once
 (`net-mesh anchor serve --rtc-bind 0.0.0.0:7101 --rtc-bind '[::]:7101'`).
 What a page sees:
 
+- **The anchor needs a STUN endpoint in each family too**
+  (`--rtc-stun-bind` of each family). Without a media permission a
+  browser's only candidate on a network is the server-reflexive one from
+  a STUN server of that family. The default ICE servers now use every
+  STUN endpoint the anchor publishes (`stun_addrs`).
+- **Firefox on a pure IPv6-only network (no IPv4 route) is unsupported.**
+  It gathers nothing there, and the connect fails `ice-timeout`, not
+  `udp-blocked`. On 464XLAT networks, as mobile IPv6-only networks are,
+  it connects. Chromium works on both.
+- **A probe the engine failed before it gathered reads `notRun`**, not
+  `unanswered`, so it can never produce `udp-blocked`.
 - **Connecting needs no change.** The anchor's answer offers a host
   candidate per family, and the browser pairs with whichever its network
   reaches.
