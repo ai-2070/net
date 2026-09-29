@@ -198,10 +198,14 @@ net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
   --acme-challenge-addr 0.0.0.0:80 --acme-challenge-addr '[::]:80' \
   --rtc-bind 0.0.0.0:7101 --rtc-bind '[::]:7101' \
   --rtc-public-addr 203.0.113.7:7101 --rtc-public-addr '[2001:db8::7]:7101' \
+  --rtc-stun-bind 0.0.0.0:3478 --rtc-stun-bind '[::]:3478' \
+  --rtc-stun-public-addr 203.0.113.7:3478 --rtc-stun-public-addr '[2001:db8::7]:3478' \
   --allow-origin https://game.example.com --issuer-identity issuer.json --game my-game
 ```
 
 - **`--rtc-bind` / `--rtc-public-addr`** take at most one address per family. An IPv4 and an IPv6 bind make a dual-stack anchor: every session offers a host candidate per family, and ICE picks the one that works. Each public address advertises the socket of its own family, whatever the flag order. One bind of either family is the single-socket anchor it always was. The IPv6 socket is bound IPv6-only, so it shares a port number with the IPv4 one.
+- **`--rtc-stun-bind` / `--rtc-stun-public-addr`** also take one address per family, and a dual-stack anchor needs both. A browser with no camera or microphone permission (every data-only game) does not list its interfaces: its only usable candidate on a network is the server-reflexive one a STUN server **of that family** reports. Without an IPv6 STUN endpoint, an IPv6-only Chromium player gathers nothing and never sends a check. The anchor then lists every STUN endpoint as `stun_addrs`, and the browser SDK's default ICE servers use them all.
+- **Firefox on an IPv6-only network with no IPv4 route is not supported.** Without a media permission Firefox looks for its default local address over IPv4 only, so on such a network it gathers nothing and the connect fails `ice-timeout`, never `udp-blocked`. Mobile IPv6-only networks are 464XLAT and give the device an IPv4 route, and there Firefox connects. Chromium works on both. Both cases are tested in the network simulator.
 - **`--listen`** is repeatable. Every listener serves one state, so the rate limits are one budget whichever family a request arrives on, and a signalling socket may use a different family than the offer that started it.
 - **`--acme-challenge-addr`** is repeatable. An ACME directory validates over IPv6 once the name has an `AAAA` record, so an anchor that publishes one needs an IPv6 challenge listener too, or issuance and renewal fail.
 - **Publish both addresses in DNS** (`A` and `AAAA`) and both `--rtc-public-addr`s. `GET /rtc/anchor` and the start report then list every published endpoint as `rtc_addrs`; a single-stack anchor's output is unchanged. Browsers probe every endpoint before calling a failure `udp-blocked` ([Errors](/docs/sdk/browser/errors)).

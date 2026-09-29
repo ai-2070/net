@@ -75,7 +75,11 @@ network routes, so an anchor with one IPv4 socket cannot reach a player on an
 IPv6-only network. An anchor given an RTC socket in each family offers a host
 candidate per family in every session, and ICE picks whichever works; sessions,
 identity and relay stay shared, so an IPv4-only player and an IPv6-only player
-still meet through the anchor. See
+still meet through the anchor. It also needs a STUN endpoint in each family
+(`stun_addrs`), because a browser without a media permission learns its
+candidate on a network only from a STUN server of that family. Firefox on an
+IPv6-only network with no IPv4 route gathers nothing and is not supported. On
+464XLAT networks, as mobile IPv6-only networks are, it connects. See
 [`anchor serve`](/docs/reference/cli#serve-ipv4-and-ipv6-players) for the flags.
 
 ## Bootstrap: the credential

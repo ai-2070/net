@@ -2,7 +2,7 @@
 
 ## Status
 
-**In progress. Target: 0.38.** Written 2026-09-28, after 0.37.1, while
+**All five slices done (2026-09-29); in review as PR #1103. Target: 0.38.** Written 2026-09-28, after 0.37.1, while
 working out how to deploy a game anchor. Amended the same day after Kyra's
 review (see [Review](#review-kyra-2026-09-28)); slice 1 started. Companion to
 [`ANCHOR_PREBUILT_BINARIES_PLAN.md`](ANCHOR_PREBUILT_BINARIES_PLAN.md); the two
@@ -458,7 +458,7 @@ dual-stack anchor. That is slice 4.
 
 ### Slice 4: a real IPv6-only player
 
-**In progress (2026-09-29), iterating in CI.** natsim runs only on Linux, so
+**Done (2026-09-29), iterated in CI.** natsim runs only on Linux, so
 this slice is developed against the `natsim` workflow. A dispatch-only
 `filter` input runs one row, and a filtered run skips the roster and floor
 checks and says so.
@@ -565,9 +565,21 @@ checks and says so.
   - **What it requires:** B's connect fails typed `ice-timeout`, A connects
     with an exact ledger, and the families are witnessed. A Firefox that
     starts connecting fails the row loudly, so it gets flipped.
-  - **The 464XLAT case gets its own row** (the next iteration), to show
-    Firefox works where the network gives the device an IPv4 route, as
-    mobile IPv6-only networks do.
+  - **The 464XLAT case gets its own row**, to show Firefox works where the
+    network gives the device an IPv4 route, as mobile IPv6-only networks do.
+- **Iteration 3 (natsim run 36503756903): all three rows PASS.**
+  - `browser_dualstack_firefox_464xlat`: Firefox B on `v6only-clat` connects
+    **direct** on the first run. `v6only-clat` has a tayga CLAT in B's
+    namespace (192.0.0.4, mapped to `2001:db8:103::c`) and a tayga NAT64 on
+    its gateway (`2001:db8:64::/96`, masqueraded out `10.99.0.3`).
+  - The families witness reads B as IPv6 plus a CLAT-provided IPv4.
+  - The pure-IPv6 Firefox row stays pinned unreachable, and the Chromium row
+    passes.
+  - The network-specific prefix is deliberate: RFC 6052 forbids the
+    well-known `64:ff9b::/96` for the lab's private IPv4 addresses.
+- **Slice 4 done.** Chromium carries the full witness: payloads both ways,
+  anchor counters, and a selected pair per family. Firefox is covered by the
+  named decision, with both of its sides pinned.
 - **Defect fixed (honesty, slice 3's probes).** A probe connection the engine
   fails before gathering a single candidate now reads `notRun`, not
   `unanswered`, in both the Rust and TypeScript probes. That was the path by
@@ -629,10 +641,10 @@ checks and says so.
 **Not done here:**
 
 - The 0.38 release note is written at release time, from this plan.
-- The docs say Chromium and Firefox are the engines under test (Decision in
-  slice 4), but no browser IPv6 witness exists until slice 4 lands. Until
-  then, dual-stack browser support is claimed from the native and unit
-  evidence of slices 1–3 only.
+- ~~No browser IPv6 witness until slice 4.~~ Slice 4 landed. The CLI
+  reference and transport concepts now document the per-family STUN
+  requirement (`--rtc-stun-bind` of each family, `stun_addrs`) and the
+  Firefox support decision (pure IPv6-only unsupported; 464XLAT works).
 
 - CLI reference, `concepts/webrtc-transport.md`, the browser quickstart and
   the "run an anchor" guide (prebuilt-binaries plan, slice 4) show the

@@ -88,7 +88,10 @@ model that a client-prediction habit will get wrong.
    that UDP is blocked — only a successful bootstrap *plus* an unanswered STUN
    binding to **every** endpoint the anchor published (one per family on a
    dual-stack anchor) is, and even then the message states the observation, not
-   a cause. And `rpc-indeterminate` from
+   a cause. (A dual-stack anchor also needs a STUN endpoint per family; Firefox
+   on an IPv6-only network with no IPv4 route gathers nothing, which reads as
+   `ice-timeout`. That is an unsupported network, not blocked UDP. On 464XLAT
+   it connects.) And `rpc-indeterminate` from
    a frozen leader means "the remote may have executed this"; retrying can cause
    the effect twice.
 7. **The package is published as `@net-mesh/browser`** (install with `npm
