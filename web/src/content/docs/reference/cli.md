@@ -199,7 +199,8 @@ net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
   --rtc-bind 0.0.0.0:7101 --rtc-bind '[::]:7101' \
   --rtc-public-addr 203.0.113.7:7101 --rtc-public-addr '[2001:db8::7]:7101' \
   --rtc-stun-bind 0.0.0.0:3478 --rtc-stun-bind '[::]:3478' \
-  --rtc-stun-public-addr 203.0.113.7:3478 --rtc-stun-public-addr '[2001:db8::7]:3478' \
+  --rtc-stun-public-addr 203.0.113.7:3478 \
+  --rtc-stun-public-addr '[2001:db8::7]:3478' \
   --allow-origin https://game.example.com --issuer-identity issuer.json --game my-game
 ```
 
