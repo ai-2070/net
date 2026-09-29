@@ -187,6 +187,28 @@ net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
 
 `--credential-issuer` becomes optional with `--issuer-identity` (it is that key's public half); given both, they must agree. `--game` requires `--issuer-identity`.
 
+### A public anchor: open games
+
+`--open-games <state-file>` lets **any game on any site** use the anchor, with no `--game` and no `--allow-origin` for it. A page calls `requestCredential({ anchorUrl, game })` with a game id of its choosing and gets a credential, the same as for a registered game.
+
+```sh
+net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
+  --issuer-identity issuer.json --open-games /var/lib/net-anchor/open-games.txt \
+  --rtc-bind 0.0.0.0:7101 --rtc-public-addr 203.0.113.7:7101
+```
+
+- **Each site gets its own games.** An open game is keyed on the page's `Origin` **and** the game id. Two sites that both call their game `chess` get two separate games: separate roots and separate lobbies, and neither can list, discover or reach the other's. Browsers send `Origin` truthfully. A native client can claim any origin, but all it gets is what a visitor to that site already gets: an anonymous credential.
+- **Registered games stay yours.** `--game` and `--allow-origin` still work beside open games. A listed origin asking for a registered game gets that game. Any other origin naming it gets its own open game of the same name, never the registered one.
+- **Any origin may call the endpoints.** CORS echoes the caller's origin. It is never `*` and never allows credentials. Nothing on the anchor carries ambient authority (no cookies, no HTTP authentication), so a page can only spend a credential it fetched itself. The trickle socket still requires an `Origin` and the attempt token.
+- **Limits.**
+  - `--open-games-max` sets how many open games are held at once (default 8192). Past it, a new game is refused `rate_limited` until one has had no credential issued for the invite lifetime (12 hours). A game still in use is never evicted.
+  - `--open-games-per-minute` caps credentials across all open games together (default 9000), so inventing game names cannot multiply the budget. Each open game also has the per-game ceiling of 600.
+  - By default one game may use every session the anchor holds (`--rtc-max-peers`). `--open-game-max-players` caps the players one open game may have connected at once, across all its lobbies and matches, to keep room for other games on a shared anchor. A visitor over the cap is refused at enrollment and may retry.
+  - The per-source-IP ceiling (`--credentials-per-minute`) applies as always.
+- **The state file** lists the open games held, one `<origin> <game>` per line. It lets a restarted anchor still admit a page that reconnects with a credential issued before the restart. Without it, such pages must fetch a new credential. Game roots are derived from `--issuer-identity`, not stored, so the file holds no secrets.
+- **Counters.** With `--game-stats-secs`, every game line carries its `origin` when it is an open game, and the line gains `open_games` (games held, capacity, state-file write errors). The start report shows `open_games: true`.
+- **Relay cost.** A public anchor relays for players whose networks cannot connect directly, and that bandwidth is yours. `--rtc-max-peers` (browser sessions held at once, default 1024; size it to the host) and, if set, the per-game player cap bound how many players it serves. They do not bound bytes, so watch the host's traffic.
+
 ## Serve IPv4 and IPv6 players
 
 A browser pairs only with the address families its network routes, so an anchor with one IPv4 RTC socket cannot reach a player on an IPv6-only network. Give it one in each family:

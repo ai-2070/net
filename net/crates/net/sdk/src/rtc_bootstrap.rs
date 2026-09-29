@@ -287,6 +287,19 @@ pub struct BootstrapConfig {
     /// send `Origin` on WebSocket handshakes but do **not** apply
     /// CORS to them, so this list is enforced by hand.
     pub ws_allowed_origins: Vec<String>,
+    /// **Any origin** may call the endpoints and open the trickle
+    /// socket — a public anchor, for open games
+    /// ([`crate::game_anchor::OpenGames`]). The lists above still say
+    /// which origins may use the registered games.
+    ///
+    /// Why this is not the wildcard the lists refuse: nothing here
+    /// carries ambient authority. No cookie or HTTP authentication is
+    /// ever read, and CORS is answered by echoing the caller's own
+    /// origin with no `Access-Control-Allow-Credentials`, so a page
+    /// can only spend what it holds itself — a credential it fetched,
+    /// an attempt token it was handed. A foreign page gains nothing a
+    /// visitor of its own does not already have.
+    pub any_origin: bool,
     /// Per-source-IP `POST /rtc/offer` ceiling per minute.
     pub offers_per_ip_per_minute: u32,
     /// ACME challenge store; ignored unless [`BootstrapTls::Acme`].
@@ -337,6 +350,7 @@ impl BootstrapConfig {
             tls,
             allowed_origins: vec![origin.clone()],
             ws_allowed_origins: vec![origin],
+            any_origin: false,
             offers_per_ip_per_minute: DEFAULT_OFFERS_PER_IP_PER_MINUTE,
             acme: AcmeState::new(),
             acme_challenge_addr: SocketAddr::from(([0, 0, 0, 0], 80)),
@@ -741,6 +755,10 @@ struct AppState {
     psk: Arc<Psk>,
     issuer: Arc<crate::identity::EntityId>,
     ws_allowed_origins: Arc<Vec<String>>,
+    /// The listed origins, which may use the registered games.
+    allowed_origins: Arc<Vec<String>>,
+    /// `BootstrapConfig::any_origin`.
+    any_origin: bool,
     rate: Arc<RateLimiter>,
     acme: AcmeState,
     dialogs: Arc<AtomicU64>,
@@ -910,16 +928,25 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
         .iter()
         .filter_map(|origin| HeaderValue::from_str(origin).ok())
         .collect();
+    // A public anchor echoes the caller's origin (never `*`, and never
+    // with credentials allowed; see `BootstrapConfig::any_origin`).
+    let allow_origin = if config.any_origin {
+        tower_http::cors::AllowOrigin::mirror_request()
+    } else {
+        tower_http::cors::AllowOrigin::list(origins)
+    };
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([axum::http::header::CONTENT_TYPE])
-        .allow_origin(tower_http::cors::AllowOrigin::list(origins));
+        .allow_origin(allow_origin);
     let noise_pubkey = *node.public_key();
     let state = AppState {
         node,
         psk: Arc::new(config.psk.clone()),
         issuer: Arc::new(config.credential_issuer.clone()),
         ws_allowed_origins: Arc::new(config.ws_allowed_origins.clone()),
+        allowed_origins: Arc::new(config.allowed_origins.clone()),
+        any_origin: config.any_origin,
         rate: Arc::new(RateLimiter::new(config.offers_per_ip_per_minute)),
         acme: config.acme.clone(),
         dialogs: Arc::new(AtomicU64::new(1)),
@@ -944,6 +971,7 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
     // before the check ran, and a refusal has to name the reason it
     // actually is.
     let ws_origins = Arc::clone(&state.ws_allowed_origins);
+    let ws_any_origin = state.any_origin;
     let ws_attempts = Arc::clone(&state.attempts);
     let ws_node_outer = Arc::clone(&state.node);
     let trickle = get(get_trickle).layer(axum::middleware::from_fn(
@@ -957,7 +985,14 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
                 // page: a browser reports it as a bare `1006` with
                 // no code and no reason, so the anchor's log is the
                 // only place the actual reason can be read.
-                if !origin_allowed(request.headers(), &allowed) {
+                // A public anchor admits any origin, but still only a
+                // handshake that carries one: no `Origin` is not a browser.
+                let origin_ok = if ws_any_origin {
+                    request.headers().contains_key(axum::http::header::ORIGIN)
+                } else {
+                    origin_allowed(request.headers(), &allowed)
+                };
+                if !origin_ok {
                     tracing::debug!(
                         origin = ?request.headers().get(axum::http::header::ORIGIN),
                         "trickle upgrade refused: origin not on the allow-list"
@@ -1066,9 +1101,15 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
 /// `connect()` takes. The credential's invite is single-use, so a page
 /// fetches one per `connect()`. Refusals: `unknown_game` (404),
 /// `rate_limited` (429, per source IP or per game), `malformed_request`.
+///
+/// **Which game.** A listed origin asking for a registered game gets
+/// that game. Otherwise, on an open registry, the page gets the OPEN
+/// game keyed on its own `Origin` and the id — so an unlisted page can
+/// never be handed a registered game by naming it.
 async fn post_credential(
     State(state): State<AppState>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     #[derive(Deserialize)]
@@ -1104,19 +1145,43 @@ async fn post_credential(
         );
     }
     use crate::game_anchor::GameAnchorError;
-    match issuance.config.registry.issue_credential(
-        &request.game,
-        &issuance.config.issuer,
-        &issuance.params,
-    ) {
+    let registry = &issuance.config.registry;
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+    let listed = origin_allowed(&headers, &state.allowed_origins);
+    let issued = if listed && registry.root_of(&request.game).is_some() {
+        registry.issue_credential(&request.game, &issuance.config.issuer, &issuance.params)
+    } else if registry.is_open() {
+        match origin {
+            Some(origin) => registry.issue_open_credential(
+                origin,
+                &request.game,
+                &issuance.config.issuer,
+                &issuance.params,
+            ),
+            None => {
+                return refuse(
+                    BootstrapRefusal::MalformedRequest,
+                    "an open game is keyed on the page's Origin, and this request sent none",
+                )
+            }
+        }
+    } else {
+        Err(GameAnchorError::UnknownGame(request.game.clone()))
+    };
+    match issued {
         Ok(credential) => Json(serde_json::json!({
             "credentialB64": credential.encode(),
             "bootstrapUrl": issuance.params.bootstrap_url,
             "game": request.game,
         }))
         .into_response(),
-        Err(e @ GameAnchorError::RateLimited(_)) => {
+        Err(e @ (GameAnchorError::RateLimited(_) | GameAnchorError::OpenGamesFull)) => {
             refuse(BootstrapRefusal::RateLimited, e.to_string())
+        }
+        Err(e @ (GameAnchorError::InvalidGameId(_) | GameAnchorError::InvalidOrigin(_))) => {
+            refuse(BootstrapRefusal::MalformedRequest, e.to_string())
         }
         Err(e) => refuse(BootstrapRefusal::UnknownGame, e.to_string()),
     }

@@ -3177,6 +3177,8 @@ jobs:
             an_http_offer_reaches_the_production_dialog_path_and_is_answered
             the_listener_serves_browser_trusted_tls_and_a_client_verifies_it
             the_trickle_socket_refuses_a_foreign_origin_before_upgrading
+            a_public_anchor_issues_any_page_its_own_open_game
+            a_public_anchor_admits_any_origin_to_the_trickle_gate_but_not_a_missing_one
           "
           out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
                   --retries 0 --features "$FEATURES" --test rtc_bootstrap_listener \

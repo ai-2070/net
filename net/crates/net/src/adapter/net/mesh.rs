@@ -40294,6 +40294,16 @@ impl MeshNode {
         self.peers.get(&node_id)?.admission.tenant()
     }
 
+    /// How many current sessions were enrolled for `tenant`. A scan of
+    /// the peer table, for an admission decision, not a hot path.
+    #[cfg(feature = "webrtc")]
+    pub fn tenant_peer_count(&self, tenant: super::rtc::TenantId) -> usize {
+        self.peers
+            .iter()
+            .filter(|peer| peer.admission.tenant() == Some(tenant))
+            .count()
+    }
+
     /// **R6-B: which node actually holds the reservation for this
     /// `(session, call)`?**
     ///
