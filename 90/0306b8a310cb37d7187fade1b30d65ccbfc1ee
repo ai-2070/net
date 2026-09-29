@@ -1,0 +1,24 @@
+net/crates/net/sdk/src/rtc_bootstrap_acme.rs
+  s_d8b00bedd146e9::t_b5024de95e10d1 18-25,48-54,117-149,486-522,1030-1059,1064-1072,1078-1102
+  s_d8b00bedd146e9::t_6258819a992ad0 1060-1063,1073-1077
+  s_d8b00bedd146e9::t_34ed6f3ffd2281 1103
+net/crates/net/sdk/tests/acme_cold_start.rs
+  s_d8b00bedd146e9::t_6258819a992ad0 234-291
+  s_d8b00bedd146e9::t_d58eeb2fe3324a 233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "900306b8a310cb37d7187fade1b30d65ccbfc1ee",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
