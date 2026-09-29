@@ -1,0 +1,52 @@
+net/crates/net/leaf/tests/stun_probe_parity.rs
+  s_d8b00bedd146e9::t_633a1a15fb24f5 31-33,54-58
+net/crates/net/tests/natsim_browser.rs
+  s_d8b00bedd146e9::t_1ef9cf48995595 266-272,379-385,973
+  s_d8b00bedd146e9::t_de323effd9f9ee 1230-1232
+  s_d8b00bedd146e9::t_5f07776b5f6c8e 1208-1229,1233-1272
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_67f054dbda447e 6376
+docs/internal/plans/ANCHOR_DUAL_STACK_PLAN.md
+  s_d8b00bedd146e9::t_d8592e5701478d 548-576
+net/crates/net/tests/natsim.rs
+  s_d8b00bedd146e9::t_1ef9cf48995595 819-827,830
+.github/workflows/natsim.yml
+  s_d8b00bedd146e9::t_1ef9cf48995595 249
+  s_d8b00bedd146e9::t_67f054dbda447e 140-142,151-152
+net/crates/net/browser-ts/test/classification.test.ts
+  s_d8b00bedd146e9::t_633a1a15fb24f5 30,112-113,331-345,506,508,545-547
+  s_d8b00bedd146e9::t_053cc2cd77a217 548-549
+net/crates/net/browser-ts/src/udp-probe.ts
+  s_d8b00bedd146e9::t_633a1a15fb24f5 58-62,85-101,106,241-253,260,300
+net/crates/net/leaf/src/bootstrap.rs
+  s_d8b00bedd146e9::t_633a1a15fb24f5 554,558,579-588,629,635-640,643-652,921,961-970,999
+net/crates/net/tests/natsim/browser/src/main.rs
+  s_d8b00bedd146e9::t_1b92b787433655 996-1002
+  s_d8b00bedd146e9::t_5ef2b1faca5beb 966-968,1004,1741-1744,1801-1835
+net/crates/net/browser-ts/test/fixtures/stun-probe-verdicts.json
+  s_d8b00bedd146e9::t_633a1a15fb24f5 2,6-11,15-20,24-29,33-38,42-47,51-56,60-65,69-74,78-83,87-92,97,102-107,109,114-119,121,125-163
+net/crates/net/tests/natsim/rows.rs
+  s_d8b00bedd146e9::t_1ef9cf48995595 1238-1241,1352-1354,1371,1376,1381-1382,1388-1406,1694
+  s_d8b00bedd146e9::t_5ef2b1faca5beb 1272-1278,1280,1282,1287,1330,1347
+  s_d8b00bedd146e9::t_214266ec031323 148-155,164,172,197-198,207,443-449,503-504,773-789,791,794-797,1407,1437-1482,1514-1516
+net/crates/net/browser-ts/src/index.ts
+  s_d8b00bedd146e9::t_633a1a15fb24f5 160
+net/crates/net/tests/natsim/run_scenario.sh
+  s_d8b00bedd146e9::t_1ef9cf48995595 221-225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "43a866d6f39c0c484024bbd88dacb13c7d0e7a4c",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
