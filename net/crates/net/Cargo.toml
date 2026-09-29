@@ -280,7 +280,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 bytes = "1"
 
 # Timestamp generation
-quanta = "0.12"
+quanta = "0.13"
 
 # Base64 encoding for cursors
 base64 = "0.23"
