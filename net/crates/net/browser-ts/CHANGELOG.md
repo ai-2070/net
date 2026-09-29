@@ -31,6 +31,11 @@ What a page sees:
   it connects. Chromium works on both.
 - **A probe the engine failed before it gathered reads `notRun`**, not
   `unanswered`, so it can never produce `udp-blocked`.
+- **Public anchors.** An anchor started with `--open-games` issues a
+  credential for any game id from any page, keyed on the page's origin
+  and the id, so no operator setup is needed. `requestCredential({
+  anchorUrl, game })` is unchanged. Two sites naming their game alike
+  get two separate games and never see each other's lobbies.
 - **Connecting needs no change.** The anchor's answer offers a host
   candidate per family, and the browser pairs with whichever its network
   reaches.

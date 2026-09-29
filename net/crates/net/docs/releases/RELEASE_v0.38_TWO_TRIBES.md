@@ -1,12 +1,14 @@
 # Net v0.38 — "Two Tribes"
 
-*Frankie Goes to Hollywood, 1984: two sides with nothing in common, meeting in one arena. An IPv4-only player and an IPv6-only player now meet through one anchor.*
+*Frankie Goes to Hollywood, 1984: two sides with nothing in common, meeting in one arena. An IPv4-only player and an IPv6-only player now meet through one anchor, and any game on any site can use it.*
 
 ## What's in it
 
 v0.38 makes the browser anchor **dual-stack**. Until now, an anchor had one IPv4 RTC socket, so a player on an IPv6-only network could not reach it at all. Worse, that player was told `udp-blocked`, which was not true. An anchor can now have an RTC socket and a STUN socket in each family. It serves both kinds of player from one process, one identity and one relay.
 
 The work is in five parts: the driver, the CLI and listener, honest diagnostics, a real IPv6-only browser in the network simulator, and docs. The full design and evidence are in [`ANCHOR_DUAL_STACK_PLAN.md`](../../../../../docs/internal/plans/ANCHOR_DUAL_STACK_PLAN.md).
+
+v0.38 also adds **open games**: `anchor serve --open-games` turns an anchor into a public one. Any game on any site can use it, with no per-game setup by the operator.
 
 ---
 
@@ -34,6 +36,36 @@ net-mesh anchor serve ... \
 - **The start report and `--inspect-target`** show the extra listeners and the IPv6 sockets (`also_listening_on`, `rtc_addrs`, `listen_additional`, `rtc_bind_v6`, …).
 - **The anchor trickles one candidate frame per family.**
 - **Configuration conflicts are refused at startup**: two binds of one family, a public address whose family has no socket, or an IPv6 STUN endpoint equal to the IPv6 RTC endpoint.
+
+---
+
+## Open games: a public anchor
+
+Until now, an anchor admitted only the games its operator listed (`--game`), and only from the sites listed with `--allow-origin`. `--open-games <state-file>` lifts both:
+
+```sh
+net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
+  --issuer-identity issuer.json --open-games /var/lib/net-anchor/open-games.txt \
+  --rtc-bind 0.0.0.0:7101 --rtc-public-addr 203.0.113.7:7101
+```
+
+A page calls `requestCredential({ anchorUrl, game })` with any game id and gets a credential, the same as for a registered game.
+
+- **Each site gets its own games.** An open game is keyed on the page's `Origin` **and** the game id. Its root and tenant are derived from the issuer key under their own domain separation, the same stateless way registered games are. Two sites that both call their game `chess` get two isolated games, with separate roots, lobbies and discovery.
+- **Registered games stay the operator's.** `--game` and `--allow-origin` work beside open games. A listed origin asking for a registered game gets that game. Any other origin naming it gets its own open game of the same name, never the registered one.
+- **Any origin may call the endpoints, in open mode only.** CORS echoes the caller's origin: never `*`, never with credentials allowed. Nothing on the anchor is ambient authority (no cookies, no HTTP authentication), so a page can only spend a credential it fetched itself. The trickle socket still requires an `Origin` and the attempt token.
+- **Bounded:**
+  - `--open-games-max` sets how many open games are held at once (default 8192). A new game is refused while the table is full, until one has had no credential issued for the invite lifetime. A game in use is never evicted.
+  - `--open-games-per-minute` is one issuance ceiling across all open games (default 9000), on top of each game's own 600, so inventing game names cannot multiply the budget.
+  - `--open-game-max-players` optionally caps one game's connected players across all its lobbies and matches. By default there is no cap, and one game may use the whole anchor.
+- **Survives restarts.** The state file lists the open games held, one `<origin> <game>` line each. A restarted anchor therefore still admits a page reconnecting with a credential issued before the restart. The file holds no secrets.
+- **Counters.** `--game-stats-secs` lines carry each open game's `origin`, plus an `open_games` summary (games held, capacity, state-file write errors).
+
+**`--rtc-max-peers`** is new too. It is the number of browser sessions the anchor holds at once, whatever their game. `anchor serve` now defaults to 1024 (the core's own default stays 256), and the flag lets a larger host raise it.
+
+A public anchor relays for players whose networks cannot connect directly, and that bandwidth is the operator's. The session and player caps bound how many players an anchor serves, not how many bytes it forwards.
+
+Tests: 6 registry tests cover keying, refusals, capacity with idle reclamation, the shared ceiling, restart through the state file, and the player cap. 2 end-to-end tests against the real HTTP listener are pinned in CI, plus CLI parse and default tests.
 
 ---
 
@@ -111,6 +143,13 @@ Each row checks the address families from the network namespaces themselves. A p
 
 None for code. A dual-stack anchor's `udp-blocked` message text changed, which matters only to code that parsed it, and it never should have. Single-stack anchors behave and serialize exactly as before.
 
+Two SDK signatures moved, both on `net_sdk::game_anchor::GameRegistry`:
+
+- `root_of` and `game_of_root` now return owned values (`Option<EntityId>`, `Option<String>`) instead of references, since the game table can now grow at run time.
+- `games()` returns `Vec<String>`.
+
+`anchor serve` holds up to 1024 browser sessions by default, up from 256.
+
 ---
 
 ## How to upgrade
@@ -120,6 +159,8 @@ Bump to 0.38.0 and rebuild. To serve IPv6-only players:
 1. Give the anchor an `--rtc-bind` **and** an `--rtc-stun-bind` in each family, plus the matching public addresses.
 2. Add an IPv6 `--listen` and an IPv6 `--acme-challenge-addr`.
 3. Then publish an `AAAA` record.
+
+To run a public anchor, add `--open-games <state-file>` (and drop `--allow-origin` if you list no registered games).
 
 Pages and anchors ship together: upgrade `@net-mesh/browser` with the anchor to get the every-endpoint probe.
 
