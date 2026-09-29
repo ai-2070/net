@@ -1,0 +1,26 @@
+net/crates/net/cli/src/commands/anchor.rs
+  s_d8b00bedd146e9::t_a9e5d4d32910b2 1143-1148
+  s_d8b00bedd146e9::t_c50cb2672fcfd8 971-974
+  s_d8b00bedd146e9::t_08bd07385b443d 1543
+net/crates/net/sdk/src/game_anchor.rs
+  s_d8b00bedd146e9::t_c50cb2672fcfd8 491-493
+  s_d8b00bedd146e9::t_08bd07385b443d 85,303-307,333,489
+web/src/content/docs/reference/cli.md
+  s_d8b00bedd146e9::t_c50cb2672fcfd8 206,210
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "185727597c09ef865ede738acea874ed7e3ee1d4",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
