@@ -40,6 +40,9 @@ model that a client-prediction habit will get wrong.
    `const { credentialB64, bootstrapUrl } = await requestCredential({ anchorUrl,
    game })`, then `connect({ credentialB64, bootstrapUrl, ...rememberedIdentity()
    })`. One credential is one player (another identity presenting it is refused).
+   A **public anchor** (`--open-games <state-file>`) admits any game id from any
+   page with no `--game`/`--allow-origin` for it; each open game is keyed on the
+   page's `Origin` plus the id, so two sites' `chess` are two separate games.
    Several games may share one anchor; it keeps their players apart.
 4. **Prototype game logic offline** with `createLocalMesh()` from
    `@net-mesh/browser/local` — several nodes in one page, the real store, no

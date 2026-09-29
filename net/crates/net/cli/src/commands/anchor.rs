@@ -861,6 +861,12 @@ pub struct ServeArgs {
     #[arg(long = "rtc-stun-public-addr", value_name = "ADDR")]
     pub rtc_stun_public_addr: Vec<String>,
 
+    /// Browser sessions this anchor holds at once (default 1024). Every
+    /// connected player is one, whatever its game, so a public anchor
+    /// (`--open-games`) sizes this to its host.
+    #[arg(long = "rtc-max-peers", value_name = "N")]
+    pub rtc_max_peers: Option<usize>,
+
     /// Operator-supplied certificate chain (PEM). With `--tls-key`.
     #[arg(long = "tls-cert", value_name = "PATH", requires = "tls_key")]
     pub tls_cert: Option<PathBuf>,
@@ -932,6 +938,47 @@ pub struct ServeArgs {
     )]
     pub game: Vec<String>,
 
+    /// Admit **open games**: any game id, from any page, without a
+    /// `--game` for it. An open game is keyed on the page's origin and
+    /// the id together, so two sites that both call their game `chess`
+    /// get two separate games. Any origin may then call the endpoints;
+    /// `--allow-origin` still says which may use the `--game` games.
+    /// STATE_FILE keeps the open games across restarts, so a page that
+    /// reconnects after one still enrolls. Needs `--issuer-identity`.
+    #[arg(
+        long = "open-games",
+        value_name = "STATE_FILE",
+        requires = "issuer_identity"
+    )]
+    pub open_games: Option<PathBuf>,
+
+    /// Open games held at once (default 8192). Past it a new game is
+    /// refused until one has been idle for the invite lifetime; a game
+    /// in use is never evicted.
+    #[arg(long = "open-games-max", value_name = "N", requires = "open_games")]
+    pub open_games_max: Option<usize>,
+
+    /// Credentials per minute across ALL open games together (default
+    /// 9000), so inventing game names cannot multiply the budget. Each
+    /// open game also has the per-game ceiling of 600.
+    #[arg(
+        long = "open-games-per-minute",
+        value_name = "N",
+        requires = "open_games"
+    )]
+    pub open_games_per_minute: Option<u32>,
+
+    /// Players one open game may have connected to this anchor at once,
+    /// across all its lobbies and matches. Unset (the default), one
+    /// game may use every session the anchor holds (`--rtc-max-peers`);
+    /// set it to keep room for other games on a shared anchor.
+    #[arg(
+        long = "open-game-max-players",
+        value_name = "N",
+        requires = "open_games"
+    )]
+    pub open_game_max_players: Option<usize>,
+
     /// Per-source-IP `POST /credential` ceiling per minute (default 30).
     #[arg(long = "credentials-per-minute")]
     pub credentials_per_minute: Option<u32>,
@@ -943,8 +990,13 @@ pub struct ServeArgs {
 
     /// Browser origins allowed to call the endpoints and open the
     /// trickle socket. Repeatable. **No wildcard** — an endpoint
-    /// that takes a credential does not get one.
-    #[arg(long = "allow-origin", value_name = "ORIGIN", required = true)]
+    /// that takes a credential does not get one. Optional with
+    /// `--open-games`, which admits every origin to its open games.
+    #[arg(
+        long = "allow-origin",
+        value_name = "ORIGIN",
+        required_unless_present = "open_games"
+    )]
     pub allow_origin: Vec<String>,
 
     /// Per-source-IP `POST /rtc/offer` ceiling per minute.
@@ -987,7 +1039,12 @@ struct ServeReport {
     /// Games this anchor admits browsers for; absent without `--game`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     games: Vec<String>,
-    /// Where pages ask for a visitor credential; absent without `--game`.
+    /// `true` when the anchor admits open games (`--open-games`);
+    /// absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    open_games: bool,
+    /// Where pages ask for a visitor credential; absent without
+    /// `--game` or `--open-games`.
     #[serde(skip_serializing_if = "Option::is_none")]
     credential_endpoint: Option<String>,
     /// Listeners beyond `listening_on`. Absent with one listener, so a
@@ -1083,6 +1140,12 @@ fn addrs_or_default(
         .collect()
 }
 
+#[cfg(feature = "rtc-bootstrap")]
+/// `anchor serve`'s browser-session ceiling. Higher than the core's
+/// own default (256): an anchor exists to hold browser sessions, and
+/// every connected player is one, whatever its game.
+const DEFAULT_ANCHOR_MAX_PEERS: usize = 1024;
+
 /// The RTC driver configuration `serve` runs with, from the
 /// operator's flags.
 ///
@@ -1107,6 +1170,11 @@ fn addrs_or_default(
 #[cfg(feature = "rtc-bootstrap")]
 fn rtc_config_from_args(args: &ServeArgs) -> Result<net::adapter::net::rtc::RtcConfig, CliError> {
     let mut rtc = net::adapter::net::rtc::RtcConfig::new().with_bootstrap_url(args.url.clone());
+    let max_peers = args.rtc_max_peers.unwrap_or(DEFAULT_ANCHOR_MAX_PEERS);
+    if max_peers == 0 {
+        return Err(invalid_args("--rtc-max-peers must be at least 1"));
+    }
+    rtc.max_peers = max_peers;
     rtc.serve_stun = true;
     let (bind, bind_v6) = one_per_family("--rtc-bind", &args.rtc_bind)?;
     let (public, public_v6) = one_per_family("--rtc-public-addr", &args.rtc_public_addr)?;
@@ -1438,6 +1506,7 @@ async fn run_serve(
     );
     listener_config.allowed_origins = args.allow_origin.clone();
     listener_config.ws_allowed_origins = args.allow_origin.clone();
+    listener_config.any_origin = args.open_games.is_some();
     listener_config.acme = AcmeState::new();
     listener_config.additional_bind_addrs = resolved.listen[1..].to_vec();
     listener_config.acme_challenge_addr = resolved.challenge[0];
@@ -1454,15 +1523,33 @@ async fn run_serve(
     // fold state, so only the node that owns it can answer for it.
     let _ice_stats = net_sdk::rtc_bootstrap::serve_anchor_ice_stats(&mesh)
         .map_err(|e| generic(format!("serving the anchor ICE stats: {e}")))?;
-    // Browsers for registered games: real enrollment (a game's
-    // visitors are rooted at that game) and anonymous credentials.
+    // Browsers for registered (and open) games: real enrollment (a
+    // game's visitors are rooted at that game) and anonymous credentials.
     let mut _enrollment = None;
     let mut _game_stats = None;
-    if let (false, Some(identity)) = (games.is_empty(), &issuer_identity) {
-        let registry = std::sync::Arc::new(
-            net_sdk::game_anchor::GameRegistry::from_identity(identity, games)
-                .map_err(|e| invalid_args(format!("--game: {e}")))?,
-        );
+    let admits_games = !games.is_empty() || args.open_games.is_some();
+    if let (true, Some(identity)) = (admits_games, &issuer_identity) {
+        let mut registry = net_sdk::game_anchor::GameRegistry::from_identity(identity, games)
+            .map_err(|e| invalid_args(format!("--game: {e}")))?;
+        if let Some(state_file) = &args.open_games {
+            let mut open = net_sdk::game_anchor::OpenGames::new(Some(state_file.clone()));
+            if let Some(max) = args.open_games_max {
+                open.capacity = max;
+            }
+            if let Some(limit) = args.open_games_per_minute {
+                open.total_per_minute = limit;
+            }
+            if let Some(players) = args.open_game_max_players {
+                open.max_players_per_game = Some(players);
+            }
+            registry = registry.with_open_games(open).map_err(|e| {
+                generic(format!(
+                    "--open-games: reading {}: {e}",
+                    state_file.display()
+                ))
+            })?;
+        }
+        let registry = std::sync::Arc::new(registry);
         _enrollment = Some(
             net_sdk::game_anchor::serve_game_enrollment(
                 &mesh,
@@ -1487,7 +1574,11 @@ async fn run_serve(
                 tick.tick().await;
                 loop {
                     tick.tick().await;
-                    println!("{}", serde_json::json!({ "game_stats": registry.stats() }));
+                    let mut line = serde_json::json!({ "game_stats": registry.stats() });
+                    if let Some(open) = registry.open_stats() {
+                        line["open_games"] = serde_json::json!(open);
+                    }
+                    println!("{line}");
                 }
             }));
         }
@@ -1521,7 +1612,8 @@ async fn run_serve(
                 .iter()
                 .map(|g| g.split(':').next().unwrap_or_default().to_string())
                 .collect(),
-            credential_endpoint: (!args.game.is_empty())
+            open_games: args.open_games.is_some(),
+            credential_endpoint: (!args.game.is_empty() || args.open_games.is_some())
                 .then(|| format!("{}/credential", args.url.trim_end_matches('/'))),
             also_listening_on: handle.local_addrs()[1..]
                 .iter()
@@ -1604,6 +1696,62 @@ mod tests {
         "--allow-origin",
         "https://app.example.com",
     ];
+
+    /// An anchor holds 1024 browser sessions unless told otherwise,
+    /// `--rtc-max-peers` overrides it, and zero is refused.
+    #[test]
+    fn the_session_ceiling_defaults_to_1024_and_zero_is_refused() {
+        let bare = rtc_config_from_args(&serve_args(&[])).expect("defaults parse");
+        assert_eq!(bare.max_peers, 1024);
+        let set = rtc_config_from_args(&serve_args(&["--rtc-max-peers", "32"])).expect("parses");
+        assert_eq!(set.max_peers, 32);
+        assert!(rtc_config_from_args(&serve_args(&["--rtc-max-peers", "0"])).is_err());
+    }
+
+    /// `--open-games` makes `--allow-origin` optional (every origin may
+    /// use the open games) and, like `--game`, needs the identity file;
+    /// its limits are refused without it. Without `--open-games`,
+    /// `--allow-origin` is still required.
+    #[test]
+    fn open_games_make_the_origin_list_optional_and_need_the_key() {
+        let open = [
+            "--psk-file",
+            "psk.hex",
+            "--url",
+            "https://anchor.example.com",
+            "--issuer-identity",
+            "issuer.json",
+            "--open-games",
+            "open-games.txt",
+            "--open-games-max",
+            "10",
+            "--open-game-max-players",
+            "32",
+        ];
+        let args = try_serve_args(&open).expect("no --allow-origin needed");
+        assert!(args.allow_origin.is_empty());
+        assert_eq!(
+            args.open_games.as_deref(),
+            Some(std::path::Path::new("open-games.txt"))
+        );
+        assert_eq!(
+            (args.open_games_max, args.open_game_max_players),
+            (Some(10), Some(32))
+        );
+        assert!(
+            try_serve_args(&open[..6]).is_err(),
+            "without --open-games, --allow-origin is required"
+        );
+        let mut no_key = open[..4].to_vec();
+        no_key.extend(["--credential-issuer", "00", "--open-games", "x"]);
+        assert!(try_serve_args(&no_key).is_err(), "open games need the key");
+        let mut limit_alone = BASE.to_vec();
+        limit_alone.extend(["--credential-issuer", "00", "--open-games-max", "10"]);
+        assert!(
+            try_serve_args(&limit_alone).is_err(),
+            "a limit needs --open-games"
+        );
+    }
 
     /// The issuer is named by its public half, its identity file, or
     /// both — but by one of them; and `--game` needs the identity file,
@@ -1805,13 +1953,16 @@ mod tests {
             trust_domain: "td".to_string(),
             noise_pubkey: "ab".to_string(),
             games: vec![],
+            open_games: false,
             credential_endpoint: None,
             also_listening_on: vec![],
             rtc_addrs: None,
         };
         let json = serde_json::to_string(&base).expect("serialize");
         assert!(
-            !json.contains("also_listening_on") && !json.contains("rtc_addrs"),
+            !json.contains("also_listening_on")
+                && !json.contains("rtc_addrs")
+                && !json.contains("open_games"),
             "a single-listener, single-socket anchor reports neither dual-stack key: {json}"
         );
         assert!(
