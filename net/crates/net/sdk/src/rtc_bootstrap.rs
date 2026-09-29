@@ -325,6 +325,17 @@ pub struct BootstrapConfig {
     pub additional_acme_challenge_addrs: Vec<SocketAddr>,
     /// Renew this long before the certificate expires (R4c).
     pub acme_renewal_horizon: Duration,
+    /// How long a connection may take to finish its TLS handshake
+    /// before it is dropped. A client that connects and never
+    /// completes one would otherwise hold its socket forever.
+    pub tls_handshake_timeout: Duration,
+    /// How long an HTTP connection may take to deliver a request's
+    /// headers, measured from when it starts waiting for them — which
+    /// includes sitting idle between keep-alive requests. A connection
+    /// that sends nothing for this long is closed, so idle pools and
+    /// slow senders cannot pile up until the process runs out of file
+    /// descriptors.
+    pub http_idle_timeout: Duration,
     /// Anonymous visitor credentials, served as `POST /credential`.
     /// `None` (the default) serves no such route: credentials are then
     /// minted out of band (`net-mesh anchor credential mint`).
@@ -356,10 +367,17 @@ impl BootstrapConfig {
             acme_challenge_addr: SocketAddr::from(([0, 0, 0, 0], 80)),
             additional_acme_challenge_addrs: Vec::new(),
             acme_renewal_horizon: crate::rtc_bootstrap_acme::DEFAULT_RENEWAL_HORIZON,
+            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
+            http_idle_timeout: DEFAULT_HTTP_IDLE_TIMEOUT,
             credential_issuance: None,
         }
     }
 }
+
+/// Default [`BootstrapConfig::tls_handshake_timeout`].
+pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default [`BootstrapConfig::http_idle_timeout`].
+pub const DEFAULT_HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default per-source-IP `POST /credential` ceiling per minute.
 pub const DEFAULT_CREDENTIALS_PER_IP_PER_MINUTE: u32 = 30;
@@ -1284,15 +1302,40 @@ pub async fn serve_bootstrap(
     };
     let local_addr = local_addrs[0];
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    let limits = ConnectionLimits {
+        tls_handshake: config.tls_handshake_timeout,
+        http_idle: config.http_idle_timeout,
+    };
     let task = tokio::spawn(async move {
         let service = router.into_make_service_with_connect_info::<SocketAddr>();
+        let mut backoff = AcceptBackoff::default();
         loop {
             let accepted = tokio::select! {
                 _ = &mut shutdown_rx => break,
                 accepted = accept_any(&listeners) => accepted,
             };
-            let Ok((stream, remote)) = accepted else {
-                continue;
+            let (stream, remote) = match accepted {
+                Ok(accepted) => {
+                    backoff.reset();
+                    accepted
+                }
+                Err(error) => {
+                    // **Never retry at once.** The usual error is
+                    // running out of file descriptors, and it does
+                    // not clear by asking again: an immediate retry
+                    // spins a core, and on a one-core host starves the
+                    // very tasks that would close connections and free
+                    // descriptors. That is how an anchor wedged at
+                    // 100% CPU serving nothing. Wait, doubling up to a
+                    // second, and let the runtime run.
+                    let pause = backoff.next();
+                    tracing::warn!(%error, ?pause, "bootstrap listener: accept failed; pausing");
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        () = tokio::time::sleep(pause) => {}
+                    }
+                    continue;
+                }
             };
             // Read the CURRENT acceptor per connection, so a
             // renewal swap takes effect on the next handshake
@@ -1300,7 +1343,7 @@ pub async fn serve_bootstrap(
             let tls = Arc::clone(&*tls.read());
             let service = service.clone();
             tokio::spawn(async move {
-                serve_one(stream, remote, tls, service).await;
+                serve_one(stream, remote, tls, service, limits).await;
             });
         }
         // Settled, not merely signalled: `shutdown().await`
@@ -1388,18 +1431,52 @@ fn spawn_renewal(
     }))
 }
 
+/// The per-connection deadlines [`serve_one`] enforces.
+#[derive(Debug, Clone, Copy)]
+struct ConnectionLimits {
+    tls_handshake: Duration,
+    http_idle: Duration,
+}
+
+/// The pause after a failed `accept`: 10 ms, doubling to a second,
+/// back to the start on the next success.
+#[derive(Debug, Default)]
+struct AcceptBackoff {
+    failures: u32,
+}
+
+impl AcceptBackoff {
+    const FIRST: Duration = Duration::from_millis(10);
+    const MAX: Duration = Duration::from_secs(1);
+
+    fn next(&mut self) -> Duration {
+        let pause = Self::FIRST
+            .saturating_mul(1u32 << self.failures.min(16))
+            .min(Self::MAX);
+        self.failures = self.failures.saturating_add(1);
+        pause
+    }
+
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
 async fn serve_one(
     stream: tokio::net::TcpStream,
     remote: SocketAddr,
     tls: Arc<tokio_rustls::TlsAcceptor>,
     mut service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
+    limits: ConnectionLimits,
 ) {
     use hyper_util::rt::TokioIo;
     use tower::Service as _;
 
-    let Ok(stream) = tls.accept(stream).await else {
-        // A browser that refuses our certificate lands here. There is
-        // nothing to say back over a handshake that did not complete.
+    // A browser that refuses our certificate, or a client that never
+    // finishes the handshake, lands in the `else`. There is nothing to
+    // say back over a handshake that did not complete.
+    let Ok(Ok(stream)) = tokio::time::timeout(limits.tls_handshake, tls.accept(stream)).await
+    else {
         return;
     };
     // `IntoMakeServiceWithConnectInfo`'s error is `Infallible`, so
@@ -1410,7 +1487,16 @@ async fn serve_one(
         hyper::service::service_fn(move |request: axum::http::Request<hyper::body::Incoming>| {
             tower_service.clone().call(request)
         });
-    let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    // Without a timer hyper enforces no header deadline at all, so a
+    // connection that stopped sending (an idle keep-alive pool, a slow
+    // sender) was held for as long as its peer liked.
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(limits.http_idle);
+    let _ = builder
         .serve_connection_with_upgrades(TokioIo::new(stream), hyper_service)
         .await;
 }
@@ -1979,6 +2065,32 @@ async fn trickle_socket(mut socket: WebSocket, state: AppState, attempt: Attempt
 
 fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod accept_backoff_tests {
+    use super::AcceptBackoff;
+    use std::time::Duration;
+
+    /// A failed `accept` is never retried at once: the pause starts
+    /// at 10 ms, doubles to a one-second ceiling, and a success starts
+    /// it over. A zero first pause is the busy loop that wedged a
+    /// one-core anchor at 100% CPU.
+    #[test]
+    fn a_failed_accept_pauses_doubling_to_a_second_and_a_success_resets() {
+        let mut backoff = AcceptBackoff::default();
+        let pauses: Vec<u64> = (0..10).map(|_| backoff.next().as_millis() as u64).collect();
+        assert_eq!(pauses, [10, 20, 40, 80, 160, 320, 640, 1000, 1000, 1000]);
+        for _ in 0..100 {
+            assert_eq!(
+                backoff.next(),
+                Duration::from_secs(1),
+                "never past the ceiling"
+            );
+        }
+        backoff.reset();
+        assert_eq!(backoff.next(), Duration::from_millis(10));
+    }
 }
 
 #[cfg(test)]

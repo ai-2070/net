@@ -21,7 +21,7 @@
 //! supervisor, a validation path that did not work yet) registered a
 //! new account on every start, and Let's Encrypt refused it after ten
 //! in three hours. The account is created once per directory and
-//! restored from the cache from then on ([`ACCOUNT_FILE_PREFIX`]).
+//! restored from the cache from then on (`acme-account-<hash>.json`).
 //!
 //! **HTTP-01 on the same listener means the same socket answers
 //! `:443`.** The plan's constraint is that CI must not pass

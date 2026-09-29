@@ -149,7 +149,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 # `nat-traversal` and `port-mapping`, so neither list subsumes the other and
 # both are hand-maintained. Keep it in step with that
 # step if the build set changes.
-RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-sdk  --no-deps --features full
+RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-sdk  --no-deps --features "full rtc-bootstrap"
 RUSTDOCFLAGS="-D warnings" cargo doc -p net-payments  --no-deps --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-wire --no-deps --features json
 RUSTDOCFLAGS="-D warnings" cargo doc -p net-python  --no-deps \
