@@ -1,0 +1,27 @@
+web/scripts/sync-releases.mjs
+  s_d8b00bedd146e9::t_ebcc526734758a 120
+web/src/docs.order.ts
+  s_d8b00bedd146e9::t_ebcc526734758a 177
+web/src/content/docs/releases/RELEASE_v0.38.1_TWO_TRIBES.md
+  s_d8b00bedd146e9::t_ebcc526734758a 1-88
+docs/data/tiers.yaml
+  s_d8b00bedd146e9::t_ebcc526734758a 85
+net/crates/net/docs/releases/RELEASE_v0.38.1_TWO_TRIBES.md
+  s_d8b00bedd146e9::t_2fbeb68617980d 1-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "825d66551d927bda4a6960412c9b7d1b896980ff",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
