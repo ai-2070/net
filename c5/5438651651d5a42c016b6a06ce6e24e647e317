@@ -1,0 +1,25 @@
+net/crates/net/sdk/src/rtc_bootstrap.rs
+  s_d8b00bedd146e9::t_e294d15ea2d0ba 332-334,1470,1480-1495,1561,1571-1576,1578-1593,1653-1657,2137-2184
+  s_d8b00bedd146e9::t_8ef0fbc806e503 1504-1513,1515-1517
+  s_d8b00bedd146e9::t_9da489dc98510a 2185
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_d9498c360cb652 3184
+net/crates/net/sdk/tests/rtc_bootstrap_listener.rs
+  s_d8b00bedd146e9::t_d9498c360cb652 2570-2609
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c55438651651d5a42c016b6a06ce6e24e647e317",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
