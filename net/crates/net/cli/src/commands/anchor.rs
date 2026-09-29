@@ -968,9 +968,10 @@ pub struct ServeArgs {
     )]
     pub open_games_per_minute: Option<u32>,
 
-    /// Players one open game may have enrolled on this anchor at once
-    /// (default 256), so no single game can take every peer slot
-    /// (`--rtc-max-peers`).
+    /// Players one open game may have connected to this anchor at once,
+    /// across all its lobbies and matches. Unset (the default), one
+    /// game may use every session the anchor holds (`--rtc-max-peers`);
+    /// set it to keep room for other games on a shared anchor.
     #[arg(
         long = "open-game-max-players",
         value_name = "N",
@@ -1139,6 +1140,12 @@ fn addrs_or_default(
         .collect()
 }
 
+#[cfg(feature = "rtc-bootstrap")]
+/// `anchor serve`'s browser-session ceiling. Higher than the core's
+/// own default (256): an anchor exists to hold browser sessions, and
+/// every connected player is one, whatever its game.
+const DEFAULT_ANCHOR_MAX_PEERS: usize = 1024;
+
 /// The RTC driver configuration `serve` runs with, from the
 /// operator's flags.
 ///
@@ -1161,11 +1168,6 @@ fn addrs_or_default(
 ///   additional to the first and never a replacement for it.
 ///   Neither flag given: no second socket, nothing announced.
 #[cfg(feature = "rtc-bootstrap")]
-/// `anchor serve`'s browser-session ceiling. Higher than the core's
-/// own default (256): an anchor exists to hold browser sessions, and
-/// every connected player is one, whatever its game.
-const DEFAULT_ANCHOR_MAX_PEERS: usize = 1024;
-
 fn rtc_config_from_args(args: &ServeArgs) -> Result<net::adapter::net::rtc::RtcConfig, CliError> {
     let mut rtc = net::adapter::net::rtc::RtcConfig::new().with_bootstrap_url(args.url.clone());
     let max_peers = args.rtc_max_peers.unwrap_or(DEFAULT_ANCHOR_MAX_PEERS);
@@ -1538,7 +1540,7 @@ async fn run_serve(
                 open.total_per_minute = limit;
             }
             if let Some(players) = args.open_game_max_players {
-                open.max_players_per_game = players;
+                open.max_players_per_game = Some(players);
             }
             registry = registry.with_open_games(open).map_err(|e| {
                 generic(format!(

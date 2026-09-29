@@ -82,7 +82,7 @@
 //! registered one and two sites naming their game alike never share
 //! one. What bounds them: a capacity with idle reclamation (never
 //! eviction of a game in use), a per-game and an all-open-games
-//! issuance ceiling, and a per-game cap on enrolled players. The games
+//! issuance ceiling, and an optional per-game cap on enrolled players. The games
 //! held are kept in a state file, so a restarted anchor still enrolls a
 //! page reconnecting with an invite issued before the restart.
 
@@ -300,9 +300,11 @@ pub struct OpenGames {
     /// inventing game names cannot multiply the budget.
     pub total_per_minute: u32,
     /// Enrolled players one open game may hold on this anchor at once,
-    /// so no single game can take every peer slot. Enforced by
-    /// [`serve_game_enrollment`].
-    pub max_players_per_game: usize,
+    /// counted across all its lobbies and matches, or `None` (the
+    /// default) for no per-game cap: one game may then use every
+    /// session the anchor holds. A shared anchor that must keep room for
+    /// several games sets it. Enforced by [`serve_game_enrollment`].
+    pub max_players_per_game: Option<usize>,
     /// How long an open game may go without an issuance before it is
     /// reclaimed. Must be at least the invite lifetime: a reclaimed
     /// game's outstanding invites no longer enroll.
@@ -318,8 +320,6 @@ pub struct OpenGames {
 pub const DEFAULT_OPEN_GAME_CAPACITY: usize = 8192;
 /// Default [`OpenGames::total_per_minute`].
 pub const DEFAULT_OPEN_TOTAL_PER_MINUTE: u32 = 9000;
-/// Default [`OpenGames::max_players_per_game`].
-pub const DEFAULT_OPEN_MAX_PLAYERS_PER_GAME: usize = 256;
 /// Longest page origin an open game may be keyed on.
 pub const MAX_ORIGIN_LEN: usize = 256;
 
@@ -330,7 +330,7 @@ impl OpenGames {
             capacity: DEFAULT_OPEN_GAME_CAPACITY,
             issue_per_minute: DEFAULT_ISSUE_PER_MINUTE,
             total_per_minute: DEFAULT_OPEN_TOTAL_PER_MINUTE,
-            max_players_per_game: DEFAULT_OPEN_MAX_PLAYERS_PER_GAME,
+            max_players_per_game: None,
             idle_after: DEFAULT_INVITE_TTL,
             state_file,
         }
@@ -486,9 +486,11 @@ impl GameRegistry {
         self.open.is_some()
     }
 
-    /// The per-game player cap for open games, if open.
+    /// The per-game player cap for open games, if open and capped.
     pub fn open_max_players_per_game(&self) -> Option<usize> {
-        self.open.as_ref().map(|o| o.config.max_players_per_game)
+        self.open
+            .as_ref()
+            .and_then(|o| o.config.max_players_per_game)
     }
 
     fn root_seed(secret: &[u8; 32], game: &str) -> [u8; 32] {
