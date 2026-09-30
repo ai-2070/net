@@ -1580,6 +1580,7 @@ jobs:
           --test integration_mesh_cancel
           --test integration_nrpc_loopback
           --test integration_nrpc_mesh
+          --test cold_start_smoke
           --test integration_nrpc_protected
           --test subnet_auth_e2e
           --test integration_nrpc_streaming
