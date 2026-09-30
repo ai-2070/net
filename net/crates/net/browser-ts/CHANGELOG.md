@@ -14,7 +14,7 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
-## 0.38.1 — dual-stack anchors
+## 0.38.2 — dual-stack anchors
 
 An anchor can now serve IPv4 and IPv6 players at once
 (`net-mesh anchor serve --rtc-bind 0.0.0.0:7101 --rtc-bind '[::]:7101'`).
