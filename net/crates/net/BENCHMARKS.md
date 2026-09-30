@@ -13,13 +13,13 @@ Benchmarks accurate as of 2026-06-12.
 Added 2026-09-30. Cost from "nothing" to a node that has seen its first
 peer — the complement of every other table here, which all measure an
 already-warm node. Rows are a custom main + hdrhistogram
-(`benches/cold_start.rs`), not Criterion: 30 samples per row (27
-recorded, 3 warmup; 2000/200 for the pure-CPU rows), in-process,
-warm-cache, loopback, mechanism-floor policy (`BenchConfig::wire_floor`
-— no announce debounce, no rate limit), 4 runtime workers. The endpoint
-is an exact-state read (`find_nodes_by_filter`) driven by the capability
-fold's watch, never a poll loop. M1 Max measurements; run-to-run spread
-on the heavy rows is a few percent.
+(`benches/cold_start.rs`), not Criterion: 100 samples per multi-node row
+(97 recorded, 3 warmup; 200 for node build, 2000 for identity),
+in-process, warm-cache, loopback, 4 runtime workers. The endpoint is an
+exact-state read (`find_nodes_by_filter`) driven by the capability
+fold's watch, never a poll loop. M1 Max measurements. At 100 samples the
+pair total's p50 repeats within ~2% across runs; at 30 it moved ±9%, so
+prefer this count when comparing.
 
 Run: `cargo bench --features "net cortex" --bench cold_start`.
 
@@ -27,50 +27,81 @@ Run: `cargo bench --features "net cortex" --bench cold_start`.
 
 | Stage | p50 | p95 | p99 | max |
 |---|---|---|---|---|
-| `EntityKeypair::generate` (identity) | 13.58 us | 15.46 us | 15.63 us | 53.89 us |
-| `MeshNode::new` (keypair + build, no tasks) | 114.69 us | 167.29 us | 242.30 us | 258.30 us |
-| `MeshNode::start()` alone (tasks spawn) | 9.58 us | 14.29 us | 15.75 us | 15.75 us |
+| `EntityKeypair::generate` (identity) | 13.67 us | 14.38 us | 16.75 us | 33.28 us |
+| `MeshNode::new` (keypair + build, no tasks) | 117.69 us | 159.36 us | 264.19 us | 315.65 us |
+| `MeshNode::start()` alone (tasks spawn) | 9.21 us | 13.58 us | 29.55 us | 29.55 us |
 
 ### Cold start → first peer visible (two nodes)
 
+Both policy modes: `wire_floor` isolates mechanism (no announce
+debounce, no rate limit); `default_policy` is what ships (100 ms
+announce debounce + 10 s announce rate limit).
+
 | Stage | p50 | p95 | p99 | max |
 |---|---|---|---|---|
-| build A | 145.66 us | 199.94 us | 235.90 us | 235.90 us |
-| build B | 153.22 us | 192.90 us | 209.41 us | 209.41 us |
-| handshake (`connect` + `accept`) | 401.66 us | 493.31 us | 495.36 us | 495.36 us |
-| `start()` both | 9.71 us | 19.71 us | 21.09 us | 21.09 us |
-| announce → first peer visible | 160.90 us | 214.78 us | 215.42 us | 215.42 us |
-| **TOTAL (build A → first peer visible)** | **858.62 us** | **1044.48 us** | **1054.72 us** | **1054.72 us** |
+| build A | 165.25 us | 234.50 us | 269.06 us | 269.06 us |
+| build B | 154.24 us | 211.33 us | 226.69 us | 226.69 us |
+| handshake (`connect` + `accept`) | 419.33 us | 468.74 us | 555.52 us | 555.52 us |
+| `start()` both | 16.05 us | 36.51 us | 57.47 us | 57.47 us |
+| announce → first peer visible | 176.00 us | 227.84 us | 247.42 us | 247.42 us |
+| **TOTAL (build A → first peer visible)** | **937.47 us** | **1076.22 us** | **1113.09 us** | **1113.09 us** |
+| *same, `default_policy`* | *957.44 us* | *1300.48 us* | *1573.89 us* | *1573.89 us* |
 
-Handshake dominates (~47% of the total); the announce→visible leg is
-~19%.
+Handshake dominates (~45% of the total). The shipped policy costs ~2% at
+p50 and ~40% at p99: it does **not** delay a fresh node's *first*
+announce (178 us vs 176 us) — the debounce window and the 10 s rate limit
+govern subsequent announces, not the boot announcement.
 
 ### Cold start → first nRPC, and peer restart
 
 | Measurement | p50 | p95 | p99 | max |
 |---|---|---|---|---|
-| cold start: build server + caller → session ready | 761.34 us | 879.10 us | 924.67 us | 924.67 us |
-| cold start: first `call` → reply | 262.14 us | 364.54 us | 426.50 us | 426.50 us |
-| **cold start: TOTAL (nothing → first nRPC reply)** | **1026.56 us** | **1177.60 us** | **1216.51 us** | **1216.51 us** |
-| peer restart: drop → session re-established | 602.62 us | 720.38 us | 732.16 us | 732.16 us |
-| peer restart: first nRPC after reconnect | 271.62 us | 389.89 us | 396.03 us | 396.03 us |
+| cold start: build server + caller → session ready | 841.73 us | 1005.57 us | 1146.88 us | 1146.88 us |
+| cold start: first `call` → reply | 285.95 us | 391.94 us | 482.56 us | 482.56 us |
+| cold start: second `call` → reply (warm, same pair) | 125.06 us | 186.11 us | 210.94 us | 210.94 us |
+| **cold start: TOTAL (nothing → first nRPC reply)** | **1260.54 us** | **1506.30 us** | **1640.45 us** | **1640.45 us** |
+| peer restart (fresh identity): drop → re-established | 708.61 us | 863.74 us | 995.33 us | 995.33 us |
+| peer restart (fresh identity): first nRPC | 300.80 us | 467.71 us | 573.44 us | 573.44 us |
+| peer restart (same identity): drop → re-established | 731.13 us | 1015.81 us | 1698.82 us | 1698.82 us |
+| peer restart (same identity): first nRPC | 305.92 us | 396.80 us | 436.48 us | 436.48 us |
 
-nRPC needs only the session, not the capability fold, so the nRPC rows
-skip the announce leg by construction. The peer-restart rows: the RPC
-server node is dropped and a replacement cold-starts (keypair, socket,
-handshake, `start`, re-registration ≈ 603 µs), then the survivor issues
-the first call (≈ 272 µs). That call costs the same as the cold-start
-first call (≈ 262 µs) — both are *first* calls, so both pay the lazy
-reply-subscription setup; reconnecting adds nothing at the RPC layer.
-The survivor initiates that handshake because `accept()` after `start()`
+The first-call leg minus the warm leg is the lazy reply-subscription
+setup: ~161 us of the 286 us first call. The two identity modes are
+indistinguishable at p50 — with the *same* identity the survivor's stale
+session is replaced (`connect()` passes no prior-session expectation, and
+`PriorSession::from_option(None)` is `PriorSession::Any`), so the peer
+count does not grow; with a *fresh* identity it does.
+
+**Caveat found while building these rows.** A call to a `(target,
+service)` pair that was *already* called before the restart does not
+complete within 5 s after a **same-identity** restart — 30/30 samples.
+The trigger is the service name, not the identity mode: moving the
+pre-restart liveness probe to its own service made the same-identity row
+pass 27/27. That points at per-`(target, service)` client state (the lazy
+reply subscription and route cache) surviving the session replacement.
+The mechanism is not verified, and the rows above deliberately measure a
+cold `(target, service)`.
+
+Reconnecting adds nothing at the RPC layer: the first call after a
+restart (301–306 us) is an ordinary first call (286 us), and the
+returning node's whole rejoin — keypair, socket, handshake, `start`,
+re-registration — is 709–731 us, against 937 us for a full two-node cold
+start (one node instead of two, and no announce leg).
+
+nRPC needs only the session, not the capability fold, so the nRPC and
+restart rows skip the announce leg by construction. The restart rows have
+the *survivor* initiate the handshake because `accept()` after `start()`
 is a documented error (CR-7 — the dispatch loop would race the responder
-for `msg1`), so a running node cannot admit a brand-new inbound
-handshake; the returning node arms `accept()` pre-`start()` instead.
+for `msg1`); a running node cannot admit a brand-new inbound handshake,
+so the returning node arms `accept()` pre-`start()`. Liveness probes in
+those rows use a separate service name: a first call to a
+`(target, service)` pair creates client-side state, so probing on the
+measured service would warm the very path the row claims is cold.
 
 **Not measured:** process exec / dynamic linking, the CLI
-(`net mcp serve`) start-to-ready path, and production announce policy
-(debounce + 10 s rate limit) — all need a spawned binary or a policy
-run, not this target.
+(`net mcp serve`) start-to-ready path, and a node booting against a
+non-empty log — all need a spawned binary or a different setup, not this
+target.
 
 ## Net Header Operations
 
