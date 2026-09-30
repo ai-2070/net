@@ -611,6 +611,14 @@ name = "capability_burst"
 harness = false
 required-features = ["net", "tool"]
 
+# Cold start: keypair → node build → start → first peer visible; plus
+# cold-start → first nRPC reply and drop → reconnect → first nRPC.
+# Custom main + hdrhistogram (per-stage rows plus decomposed totals).
+[[bench]]
+name = "cold_start"
+harness = false
+required-features = ["net", "cortex"]
+
 # ICB-0 harness self-test (island/gang claim benchmark). Not a measurement
 # bench — asserts the counting-router / delivery / exact-read witnesses.
 [[bench]]
