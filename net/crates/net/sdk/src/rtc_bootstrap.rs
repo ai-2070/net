@@ -329,8 +329,9 @@ pub struct BootstrapConfig {
     /// before it is dropped. A client that connects and never
     /// completes one would otherwise hold its socket forever.
     pub tls_handshake_timeout: Duration,
-    /// How long an HTTP connection may take to deliver a request's
-    /// headers, measured from when it starts waiting for them — which
+    /// How long an HTTP connection — on the HTTPS listeners and on the
+    /// plaintext ACME challenge port alike — may take to deliver a
+    /// request's headers, measured from when it starts waiting for them — which
     /// includes sitting idle between keep-alive requests. A connection
     /// that sends nothing for this long is closed, so idle pools and
     /// slow senders cannot pile up until the process runs out of file
@@ -1466,12 +1467,9 @@ async fn serve_one(
     stream: tokio::net::TcpStream,
     remote: SocketAddr,
     tls: Arc<tokio_rustls::TlsAcceptor>,
-    mut service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
+    service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
     limits: ConnectionLimits,
 ) {
-    use hyper_util::rt::TokioIo;
-    use tower::Service as _;
-
     // A browser that refuses our certificate, or a client that never
     // finishes the handshake, lands in the `else`. There is nothing to
     // say back over a handshake that did not complete.
@@ -1479,6 +1477,22 @@ async fn serve_one(
     else {
         return;
     };
+    serve_http(stream, remote, service, limits).await;
+}
+
+/// Serve HTTP on one accepted connection (TLS or plaintext), with the
+/// idle deadline enforced.
+async fn serve_http<I>(
+    io: I,
+    remote: SocketAddr,
+    mut service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
+    limits: ConnectionLimits,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use hyper_util::rt::TokioIo;
+    use tower::Service as _;
+
     // `IntoMakeServiceWithConnectInfo`'s error is `Infallible`, so
     // this cannot fail; unwrapping the `Ok` keeps that visible
     // rather than hiding a branch that can never run.
@@ -1487,17 +1501,20 @@ async fn serve_one(
         hyper::service::service_fn(move |request: axum::http::Request<hyper::body::Incoming>| {
             tower_service.clone().call(request)
         });
-    let mut builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    // Without a timer hyper enforces no header deadline at all, so a
-    // connection that stopped sending (an idle keep-alive pool, a slow
-    // sender) was held for as long as its peer liked.
-    builder
-        .http1()
+    // HTTP/1.1 only, from hyper itself. The auto (h1/h2) builder first
+    // waits for the bytes that tell the versions apart, and that wait
+    // has no deadline: a connection that never sent anything was held
+    // forever, whatever the header deadline said. Nothing here
+    // negotiates h2 (no ALPN), so browsers speak HTTP/1.1 anyway.
+    //
+    // And a timer, without which hyper enforces no header deadline at
+    // all: a connection that stopped sending (an idle keep-alive pool,
+    // a slow sender) was held for as long as its peer liked.
+    let _ = hyper::server::conn::http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(limits.http_idle);
-    let _ = builder
-        .serve_connection_with_upgrades(TokioIo::new(stream), hyper_service)
+        .header_read_timeout(limits.http_idle)
+        .serve_connection(TokioIo::new(io), hyper_service)
+        .with_upgrades()
         .await;
 }
 
@@ -1541,6 +1558,7 @@ async fn serve_challenge_ingress(
     addr: SocketAddr,
     acme: AcmeState,
     v6_only: bool,
+    limits: ConnectionLimits,
 ) -> Result<(tokio::task::JoinHandle<()>, SocketAddr), BootstrapError> {
     let router = Router::new()
         .route("/.well-known/acme-challenge/{token}", get(challenge_route))
@@ -1550,8 +1568,29 @@ async fn serve_challenge_ingress(
     let bound = listener
         .local_addr()
         .map_err(|e| BootstrapError::Bind(e.to_string()))?;
+    // Not `axum::serve`: it sets no deadline, and a public port 80
+    // collects connections that open and never send a byte (hundreds
+    // an hour on the public anchor), each held until the process ran
+    // out of descriptors. The same accept loop as the TLS listener:
+    // back off on errors, close a connection that sends no request
+    // within the idle deadline.
     let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        let service = router.into_make_service_with_connect_info::<SocketAddr>();
+        let mut backoff = AcceptBackoff::default();
+        loop {
+            match listener.accept().await {
+                Ok((stream, remote)) => {
+                    backoff.reset();
+                    let service = service.clone();
+                    tokio::spawn(serve_http(stream, remote, service, limits));
+                }
+                Err(error) => {
+                    let pause = backoff.next();
+                    tracing::warn!(%error, ?pause, "acme http-01 ingress: accept failed; pausing");
+                    tokio::time::sleep(pause).await;
+                }
+            }
+        }
     });
     Ok((task, bound))
 }
@@ -1611,7 +1650,11 @@ async fn tls_acceptor(
             let v6_only = addrs.len() > 1;
             let mut tasks = Vec::with_capacity(addrs.len());
             for addr in addrs {
-                match serve_challenge_ingress(addr, config.acme.clone(), v6_only).await {
+                let limits = ConnectionLimits {
+                    tls_handshake: config.tls_handshake_timeout,
+                    http_idle: config.http_idle_timeout,
+                };
+                match serve_challenge_ingress(addr, config.acme.clone(), v6_only, limits).await {
                     Ok((task, bound)) => {
                         tracing::info!(
                             %bound,
@@ -2090,6 +2133,55 @@ mod accept_backoff_tests {
         }
         backoff.reset();
         assert_eq!(backoff.next(), Duration::from_millis(10));
+    }
+
+    /// **The plaintext challenge port closes a silent connection.** It
+    /// used to be `axum::serve`, with no deadline: on the public anchor
+    /// connections that opened and never sent a byte reached ~1,800 an
+    /// hour, all held. A real challenge request is still answered.
+    ///
+    /// Inverse: serve the ingress with `axum::serve` again and the
+    /// silent connection outlives the read window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_challenge_port_closes_a_connection_that_sends_nothing() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let limits = super::ConnectionLimits {
+            tls_handshake: Duration::from_secs(1),
+            http_idle: Duration::from_secs(1),
+        };
+        let (task, addr) = super::serve_challenge_ingress(
+            "127.0.0.1:0".parse().unwrap(),
+            super::AcmeState::new(),
+            false,
+            limits,
+        )
+        .await
+        .expect("the ingress binds");
+
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(6), silent.read(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "a connection that never sends a request is closed by the deadline"
+        );
+
+        let mut asking = tokio::net::TcpStream::connect(addr).await.unwrap();
+        asking
+            .write_all(b"GET /.well-known/acme-challenge/unknown HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(5), asking.read(&mut buf))
+            .await
+            .expect("answered")
+            .unwrap();
+        assert!(
+            buf[..n].starts_with(b"HTTP/1.1 404"),
+            "a challenge request is still served: {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+        task.abort();
     }
 }
 

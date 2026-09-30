@@ -2567,3 +2567,43 @@ async fn an_idle_keep_alive_connection_is_closed_after_its_request() {
 
     handle.shutdown().await;
 }
+
+/// **A connection that completes its TLS handshake and then sends
+/// nothing is closed.** hyper's auto (h1/h2) builder waited, without a
+/// deadline, for the bytes that tell the versions apart, so such a
+/// connection was held forever whatever the header deadline said.
+///
+/// Inverse: serve with the auto builder again and the connection
+/// outlives the read window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tls_connection_that_never_sends_a_request_is_closed() {
+    let anchor = anchor().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, ca_der) = short_deadline_listener(&anchor, dir.path()).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca_der).unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(handle.local_addr())
+        .await
+        .expect("connect");
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            tcp,
+        )
+        .await
+        .expect("the handshake completes");
+
+    read_until_closed(&mut tls, Duration::from_secs(6))
+        .await
+        .expect("a connection that says nothing after its handshake is closed");
+
+    handle.shutdown().await;
+}
