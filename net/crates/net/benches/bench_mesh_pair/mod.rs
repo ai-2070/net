@@ -115,7 +115,11 @@ impl BenchConfig {
         }
     }
 
-    fn mesh_config(&self) -> MeshNodeConfig {
+    /// The `MeshNodeConfig` this `BenchConfig` resolves to. Public so a
+    /// bench can call `MeshNode::new` directly (the cold-start bench
+    /// decomposes keypair vs. node construction) instead of only through
+    /// [`node`].
+    pub fn mesh_config(&self) -> MeshNodeConfig {
         let addr: SocketAddr = "127.0.0.1:0".parse().expect("bind addr");
         let mut cfg =
             MeshNodeConfig::new(addr, PSK).with_sensing_coalescing(self.sensing_coalescing);
@@ -452,6 +456,17 @@ impl LatencyReport {
     /// print their own composite line instead of the standard row.
     pub fn quantile_us(&self, q: f64) -> f64 {
         self.hist.value_at_quantile(q) as f64 / 1_000.0
+    }
+
+    /// Maximum sample in microseconds — for benches whose rows are not
+    /// the capability-propagation shape and so print their own line.
+    pub fn max_us(&self) -> f64 {
+        self.hist.max() as f64 / 1_000.0
+    }
+
+    /// Mean sample in microseconds.
+    pub fn mean_us(&self) -> f64 {
+        self.hist.mean() / 1_000.0
     }
 
     /// Print a self-describing result block: what was measured, the

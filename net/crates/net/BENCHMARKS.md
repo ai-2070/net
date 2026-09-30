@@ -8,6 +8,70 @@ Benchmarks accurate as of 2026-06-12.
 - Apple M1 Max, macOS
 - Intel i9-14900K @5GHz, Windows 11
 
+## Cold Start
+
+Added 2026-09-30. Cost from "nothing" to a node that has seen its first
+peer — the complement of every other table here, which all measure an
+already-warm node. Rows are a custom main + hdrhistogram
+(`benches/cold_start.rs`), not Criterion: 30 samples per row (27
+recorded, 3 warmup; 2000/200 for the pure-CPU rows), in-process,
+warm-cache, loopback, mechanism-floor policy (`BenchConfig::wire_floor`
+— no announce debounce, no rate limit), 4 runtime workers. The endpoint
+is an exact-state read (`find_nodes_by_filter`) driven by the capability
+fold's watch, never a poll loop. M1 Max measurements; run-to-run spread
+on the heavy rows is a few percent.
+
+Run: `cargo bench --features "net cortex" --bench cold_start`.
+
+### Node stages
+
+| Stage | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| `EntityKeypair::generate` (identity) | 13.58 us | 15.46 us | 15.63 us | 53.89 us |
+| `MeshNode::new` (keypair + build, no tasks) | 114.69 us | 167.29 us | 242.30 us | 258.30 us |
+| `MeshNode::start()` alone (tasks spawn) | 9.58 us | 14.29 us | 15.75 us | 15.75 us |
+
+### Cold start → first peer visible (two nodes)
+
+| Stage | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| build A | 145.66 us | 199.94 us | 235.90 us | 235.90 us |
+| build B | 153.22 us | 192.90 us | 209.41 us | 209.41 us |
+| handshake (`connect` + `accept`) | 401.66 us | 493.31 us | 495.36 us | 495.36 us |
+| `start()` both | 9.71 us | 19.71 us | 21.09 us | 21.09 us |
+| announce → first peer visible | 160.90 us | 214.78 us | 215.42 us | 215.42 us |
+| **TOTAL (build A → first peer visible)** | **858.62 us** | **1044.48 us** | **1054.72 us** | **1054.72 us** |
+
+Handshake dominates (~47% of the total); the announce→visible leg is
+~19%.
+
+### Cold start → first nRPC, and peer restart
+
+| Measurement | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| cold start: build server + caller → session ready | 761.34 us | 879.10 us | 924.67 us | 924.67 us |
+| cold start: first `call` → reply | 262.14 us | 364.54 us | 426.50 us | 426.50 us |
+| **cold start: TOTAL (nothing → first nRPC reply)** | **1026.56 us** | **1177.60 us** | **1216.51 us** | **1216.51 us** |
+| peer restart: drop → session re-established | 602.62 us | 720.38 us | 732.16 us | 732.16 us |
+| peer restart: first nRPC after reconnect | 271.62 us | 389.89 us | 396.03 us | 396.03 us |
+
+nRPC needs only the session, not the capability fold, so the nRPC rows
+skip the announce leg by construction. The peer-restart rows: the RPC
+server node is dropped and a replacement cold-starts (keypair, socket,
+handshake, `start`, re-registration ≈ 603 µs), then the survivor issues
+the first call (≈ 272 µs). That call costs the same as the cold-start
+first call (≈ 262 µs) — both are *first* calls, so both pay the lazy
+reply-subscription setup; reconnecting adds nothing at the RPC layer.
+The survivor initiates that handshake because `accept()` after `start()`
+is a documented error (CR-7 — the dispatch loop would race the responder
+for `msg1`), so a running node cannot admit a brand-new inbound
+handshake; the returning node arms `accept()` pre-`start()` instead.
+
+**Not measured:** process exec / dynamic linking, the CLI
+(`net mcp serve`) start-to-ready path, and production announce policy
+(debounce + 10 s rate limit) — all need a spawned binary or a policy
+run, not this target.
+
 ## Net Header Operations
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
