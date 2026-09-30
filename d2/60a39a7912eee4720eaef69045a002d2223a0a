@@ -1,0 +1,21 @@
+net/crates/net/docs/releases/RELEASE_v0.38.2_TWO_TRIBES.md
+  s_d8b00bedd146e9::t_05e480141e351b 7,15-16,21-22,30-31,33,36-38,40,49-58
+web/src/content/docs/releases/RELEASE_v0.38.2_TWO_TRIBES.md
+  s_d8b00bedd146e9::t_4100a27c731923 11,19-20,25-26,34-35,37,40-42,44,53-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d260a39a7912eee4720eaef69045a002d2223a0a",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
