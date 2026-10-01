@@ -176,6 +176,16 @@ fn wait_for_token_err(e: InnerWaitForTokenError) -> Error {
 #[napi]
 pub struct Redex {
     inner: Arc<InnerRedex>,
+    /// The runtime of the mesh passed to `enableReplication` /
+    /// `enableGreedyDataforts` / `enableGravityForGreedy`.
+    ///
+    /// Those calls, and `openFile` on a replicated channel, spawn tokio
+    /// tasks, but napi runs sync methods on the JS thread, which has no
+    /// reactor. Spawning there panicked ("there is no reactor running")
+    /// and aborted the Node process on the first replicated `openFile`.
+    /// The mesh names the runtime; entering it makes the spawns land.
+    #[cfg(feature = "net")]
+    runtime: std::sync::OnceLock<tokio::runtime::Handle>,
 }
 
 impl Redex {
@@ -211,7 +221,21 @@ impl Redex {
         };
         Self {
             inner: Arc::new(inner),
+            #[cfg(feature = "net")]
+            runtime: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Enter the recorded mesh runtime, if any, for a call that may spawn.
+    #[cfg(feature = "net")]
+    fn enter_runtime(&self) -> Option<tokio::runtime::EnterGuard<'_>> {
+        self.runtime.get().map(tokio::runtime::Handle::enter)
+    }
+
+    /// Record `mesh`'s runtime and return a guard entering it.
+    #[cfg(feature = "net")]
+    fn adopt_runtime(&self, mesh: &crate::NetMesh) -> tokio::runtime::EnterGuard<'_> {
+        self.runtime.get_or_init(|| mesh.runtime_handle()).enter()
     }
 
     /// Install cross-node replication wiring rooted at `mesh`. After
@@ -238,6 +262,7 @@ impl Redex {
     #[cfg(feature = "net")]
     #[napi]
     pub fn enable_replication(&self, mesh: &crate::NetMesh) -> Result<()> {
+        let _enter = self.adopt_runtime(mesh);
         let arc = mesh.node_arc_clone()?;
         self.inner.enable_replication(arc);
         Ok(())
@@ -362,6 +387,7 @@ impl Redex {
             };
             cfg = cfg.with_colocation_policy(parsed);
         }
+        let _enter = self.adopt_runtime(mesh);
         let arc = mesh.node_arc_clone()?;
         let local_caps =
             Arc::new(net::adapter::net::behavior::capability::CapabilitySet::default());
@@ -472,6 +498,7 @@ impl Redex {
             Some(v) => std::time::Duration::from_millis(bigint_u64(v)?),
             None => std::time::Duration::from_millis(500),
         };
+        let _enter = self.adopt_runtime(mesh);
         let arc = mesh.node_arc_clone()?;
         self.inner
             .enable_gravity_for_greedy(arc, policy, tick)
@@ -524,6 +551,8 @@ impl Redex {
         let name =
             ChannelName::new(&channel_name).map_err(|e| redex_err("invalid channel name", e))?;
         let cfg = resolve_redex_file_config(config)?;
+        #[cfg(feature = "net")]
+        let _enter = self.enter_runtime();
         let file = self
             .inner
             .open_file(&name, cfg)

@@ -170,3 +170,32 @@ def test_retention_options_accepted() -> None:
         retention_max_age_ms=60_000,
     )
     assert len(file) == 0
+
+
+def test_replicated_open_file_runs_on_the_mesh_runtime():
+    """A replicated ``open_file`` spawns its replication runtime.
+
+    That spawn ran on the Python thread, which has no tokio reactor, so
+    the first replicated ``open_file`` raised ``PanicException: there is
+    no reactor running``. ``enable_replication`` now records the mesh's
+    runtime and ``open_file`` enters it.
+    """
+    net = pytest.importorskip("net")
+    if not hasattr(Redex, "enable_replication"):
+        pytest.fail("wheel built without the `net` feature")
+    mesh = net.NetMesh("127.0.0.1:0", "7a" * 32)
+    try:
+        r = Redex()
+        r.enable_replication(mesh)
+        file = r.open_file(
+            "py/repl",
+            replication=True,
+            replication_heartbeat_ms=150,
+            replication_placement="pinned",
+            replication_pinned_nodes=[mesh.node_id],
+        )
+        assert r.replication_runtime_count() == 1
+        assert 'channel="py/repl"' in r.replication_prometheus_text()
+        assert file.append(b"x") == 0
+    finally:
+        mesh.shutdown()

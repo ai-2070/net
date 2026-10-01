@@ -238,9 +238,29 @@ fn map_wait_for_token_err(e: InnerWaitForTokenError) -> PyErr {
 pub struct PyRedex {
     inner: Arc<InnerRedex>,
     persistent_dir: Option<String>,
+    /// The runtime of the mesh passed to `enable_replication` /
+    /// `enable_greedy_dataforts` / `enable_gravity_for_greedy`.
+    ///
+    /// Those calls, and `open_file` on a replicated channel, spawn tokio
+    /// tasks, but they run on the Python thread, which has no reactor:
+    /// the first replicated `open_file` raised `PanicException: there is
+    /// no reactor running`. Entering the mesh's runtime makes the spawns
+    /// land on it.
+    #[cfg(feature = "net")]
+    mesh_runtime: std::sync::OnceLock<Arc<crate::runtime_guard::GuardedRuntime>>,
 }
 
 impl PyRedex {
+    /// Record `mesh`'s runtime (first call wins) and return it, for a
+    /// call that may spawn tasks.
+    #[cfg(feature = "net")]
+    fn adopt_runtime(
+        &self,
+        mesh: &crate::mesh_bindings::NetMesh,
+    ) -> Arc<crate::runtime_guard::GuardedRuntime> {
+        self.mesh_runtime.get_or_init(|| mesh.runtime_arc()).clone()
+    }
+
     /// Crate-internal accessor for the underlying `Redex` Arc.
     /// Lets sibling binding modules (e.g. `blob::PyMeshBlobAdapter`)
     /// wire a substrate-owned blob adapter against the same handle
@@ -269,6 +289,8 @@ impl PyRedex {
         Self {
             inner: Arc::new(inner),
             persistent_dir,
+            #[cfg(feature = "net")]
+            mesh_runtime: std::sync::OnceLock::new(),
         }
     }
 
@@ -414,6 +436,8 @@ impl PyRedex {
                 replication_budget_fraction,
             )?);
         }
+        #[cfg(feature = "net")]
+        let _enter = self.mesh_runtime.get().map(|rt| rt.enter());
         let file = self
             .inner
             .open_file(&channel, cfg)
@@ -436,6 +460,8 @@ impl PyRedex {
     /// See `CONFIG_REPLICATION.md` for the full operator surface.
     #[cfg(feature = "net")]
     fn enable_replication(&self, mesh: &crate::mesh_bindings::NetMesh) -> PyResult<()> {
+        let rt = self.adopt_runtime(mesh);
+        let _enter = rt.enter();
         let arc = mesh.node_arc_clone()?;
         self.inner.enable_replication(arc);
         Ok(())
@@ -572,6 +598,8 @@ impl PyRedex {
             };
             cfg = cfg.with_colocation_policy(parsed);
         }
+        let rt = self.adopt_runtime(mesh);
+        let _enter = rt.enter();
         let arc = mesh.node_arc_clone()?;
         // Local-caps + intent-registry default to empty / substrate
         // defaults respectively. Application code refreshes via
@@ -679,6 +707,8 @@ impl PyRedex {
         if let Some(reference) = normalization_reference_rate {
             policy = policy.with_normalization_reference_rate(reference as f32);
         }
+        let rt = self.adopt_runtime(mesh);
+        let _enter = rt.enter();
         let arc = mesh.node_arc_clone()?;
         self.inner
             .enable_gravity_for_greedy(
@@ -2347,16 +2377,7 @@ impl PyNetDb {
         with_tasks: bool,
         with_memories: bool,
     ) -> PyResult<Self> {
-        let redex = match &persistent_dir {
-            Some(dir) => PyRedex {
-                inner: Arc::new(InnerRedex::new().with_persistent_dir(dir)),
-                persistent_dir: Some(dir.clone()),
-            },
-            None => PyRedex {
-                inner: Arc::new(InnerRedex::new()),
-                persistent_dir: None,
-            },
-        };
+        let redex = PyRedex::new(persistent_dir.clone());
 
         let tasks = if with_tasks {
             Some(PyTasksAdapter::open(py, &redex, origin_hash, persistent)?)
@@ -2402,16 +2423,7 @@ impl PyNetDb {
         let snapshot = InnerNetDbSnapshot::decode(bundle)
             .map_err(|e| NetDbError::new_err(format!("decode bundle: {}", e)))?;
 
-        let redex = match &persistent_dir {
-            Some(dir) => PyRedex {
-                inner: Arc::new(InnerRedex::new().with_persistent_dir(dir)),
-                persistent_dir: Some(dir.clone()),
-            },
-            None => PyRedex {
-                inner: Arc::new(InnerRedex::new()),
-                persistent_dir: None,
-            },
-        };
+        let redex = PyRedex::new(persistent_dir.clone());
 
         let tasks = if with_tasks {
             match snapshot.tasks {

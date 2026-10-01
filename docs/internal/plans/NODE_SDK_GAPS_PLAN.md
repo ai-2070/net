@@ -3,8 +3,9 @@
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/node-sdk`
-(the plan was written on `LZL0/python-sdk`, merged as #1133). S1–S7 done 2026-10-01
-(see each slice); S8 (N8, found during S6) not started.
+(the plan was written on `LZL0/python-sdk`, merged as #1133). S1–S8 done 2026-10-01
+(see each slice). S8 surfaced two core replication gaps (C1, C2 under S8)
+that are open and need a decision before they are fixed.
 
 **Checked before starting, 2026-10-01:** the two bug classes the Python work
 found don't apply here. The Node `poll` already sweeps every shard through
@@ -617,6 +618,74 @@ check the floor.
 - **Proves it:** a two-node test where a channel opened with `replication`
   on one node is readable on the other, and the guard's RED on today's
   `Redex`.
+
+- **Done 2026-10-01, with two core gaps left open (C1, C2 below).**
+  - **SDK:** the nine methods are on `Redex`, taking a `MeshNode` or the
+    native mesh (resolved through a new `_internal.napiMeshOf`, so
+    `cortex.ts` doesn't import `mesh.ts` at runtime). `RedexFileConfig`
+    gained `replication`, and `ReplicationConfig` / `GreedyConfig` /
+    `DataGravityConfig` are exported types.
+  - **The config mapper was the N2 bug again.** `toNapiFileConfig` listed
+    fields by hand, so `replication` was dropped even where a caller cast
+    past the type. It is now typed over every key of the native
+    `RedexFileConfigJs`, so a field the native gains and the mapper
+    doesn't forward is a compile error.
+  - **Guard:** S5's "every native method is wrapped" check now covers
+    `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`,
+    `WorkflowAdapter`, `ShardGroup` and `TriggerEngine`, with the
+    adapters' `watch*` methods allow-listed (wrapped as `watch` /
+    `snapshotAndWatch`). **RED** on the committed `cortex.ts`: the error
+    names exactly the nine `Redex` methods.
+  - **Bug found and fixed (Node and Python bindings): a replicated
+    `openFile` crashed.** The replication runtime is a `tokio::spawn`, and
+    `openFile` (and the `enable*` calls) run on the JS / Python thread,
+    which has no reactor: Node aborted the process, Python raised
+    `PanicException: there is no reactor running`. No test in either
+    binding had ever opened a replicated file. Both bindings' `Redex` now
+    record the mesh's runtime at `enableReplication` /
+    `enableGreedyDataforts` / `enableGravityForGreedy` and enter it there
+    and in `openFile` (the `MeshRpc` / `ServeHandle` pattern). The
+    Python `NetDb` constructors now build their `PyRedex` through
+    `PyRedex::new` rather than struct literals.
+  - **Tests:**
+    - `sdk-ts/test/redex_replication.test.ts` (3): a replicated config
+      without `enableReplication` is rejected; with it (given a
+      `MeshNode`, twice, idempotent) a replicated channel spawns its
+      runtime, shows in the Prometheus text, and still works as a local
+      log; greedy enable → gravity → disable round trip, after which the
+      node shuts down. **RED** with the old binding: the worker process
+      aborts on `openFile`.
+    - `bindings/python/tests/test_redex.py::test_replicated_open_file_runs_on_the_mesh_runtime`.
+      **RED** with the previous wheel: the `PanicException`.
+  - **GREEN:** sdk-ts **662 passed** (43 files); binding cortex / redex
+    tests 29/29; Python `test_redex.py` + `test_cortex.py` 33/33; smoke
+    test and `check-ts-consumer.sh` pass; `net-node` and `net-python`
+    clippy (ci.yml's ffi-clippy lists, all targets, `-D warnings`), fmt,
+    and `net-python` rustdoc clean. A cortex-only build of either binding
+    fails in `mesh_rpc.rs`, before this branch and in no CI job.
+  - **Not proved: data crossing nodes.** The planned two-node test
+    doesn't pass, for a core reason:
+    - **C1 — a replicated channel never leaves `Idle`.** Every role
+      transition into `Replica` / `Leader` outside `#[cfg(test)]` is a
+      reaction to an existing role (missed heartbeats, a peer leader,
+      close); nothing moves a fresh channel out of `Idle`, and an `Idle`
+      channel emits no heartbeats (`replication_step::tick`). The Rust e2e
+      test (`tests/redex_replication_e2e.rs`) drives roles by hand through
+      `replication_coordinator_for`, which no binding exposes.
+      `CONFIG_REPLICATION.md`'s lifecycle says a pinned set "selects this
+      node → `transition_to(Replica, CapabilitySelected)`"; that step isn't
+      implemented, for `Pinned` either. Measured from the SDK: two
+      connected nodes, pinned to both, `leaderPinned` set, eight appends
+      on one: the other stays at 0 and `leader_changes_total` stays 0.
+      So replication through the public `Redex` API replicates nothing,
+      in any language.
+    - **C2 — `enableReplication` can't be undone.** Core has
+      `disable_greedy_dataforts` but no `disable_replication`; only
+      dropping the `Redex` uninstalls it, and in Node that waits for V8
+      GC. The `Redex` holds the node's `Arc`, so `NetMesh.shutdown()` is
+      refused while it lives (Python's shutdown doesn't need sole
+      ownership and is unaffected). The S8 replication test doesn't shut
+      its node down for this reason.
 
 ## Risks
 

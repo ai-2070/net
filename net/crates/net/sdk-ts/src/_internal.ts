@@ -58,6 +58,17 @@ export function setNapiMesh(host: object, napi: NapiNetMesh): void {
   napiMeshes.set(host, napi);
 }
 
+/**
+ * The native mesh behind `mesh`: a `MeshNode`'s registered handle, or
+ * `mesh` itself when it is already native. For modules that accept
+ * either form and can't import `MeshNode` without a cycle.
+ *
+ * @internal
+ */
+export function napiMeshOf(mesh: object): NapiNetMesh {
+  return napiMeshes.get(mesh) ?? (mesh as NapiNetMesh);
+}
+
 /** @internal */
 export function getNapiMesh(host: object): NapiNetMesh {
   const r = napiMeshes.get(host);
