@@ -2,15 +2,33 @@
 
 Performance benchmarks for the Net Rust core and Net transport layer.
 
-Benchmarks accurate as of 2026-06-12.
+## Provenance
 
-**Test Systems:**
-- Apple M1 Max, macOS
-- Intel i9-14900K @5GHz, Windows 11
+Every number here was measured once, on one machine, at one commit. CI does
+not re-run benchmarks: shared runners are too noisy to gate on. So a number
+is only as current as its row below. Before relying on one, compare its
+commit with today's `master`, and re-run its command if the code on that
+path has changed since.
+
+| Section | Measured | Commit | Machine | Command |
+|---|---|---|---|---|
+| Cold Start | 2026-09-30 | `b2f5896ff` | Apple M1 Max, macOS | `cargo bench --features "net cortex" --bench cold_start` |
+| Everything else | 2026-06-12 | not recorded (published in `7d904ac16`, 2026-06-15) | Apple M1 Max, macOS; Intel i9-14900K @5GHz, Windows 11 | `cargo bench --features net --bench net` |
+
+**When you publish numbers**, add or update a row: the date, the commit you
+measured (`git rev-parse --short HEAD`, from a clean tree), the machine, and
+the command. Give a section its own row rather than letting the row above
+vouch for it.
+
+**What CI does check.** It type-checks every bench on each pull request
+(`cargo clippy --all-features --all-targets`), so a bench that stops
+compiling fails CI. The cold-start paths also have smoke ceilings,
+`tests/cold_start_smoke.rs`, which fail on an order-of-magnitude
+regression. Neither says whether the numbers below are still current.
 
 ## Cold Start
 
-Added 2026-09-30. Cost from "nothing" to a node that has seen its first
+Added 2026-09-30 (see [Provenance](#provenance)). Cost from "nothing" to a node that has seen its first
 peer — the complement of every other table here, which all measure an
 already-warm node. Rows are a custom main + hdrhistogram
 (`benches/cold_start.rs`), not Criterion: 100 samples per multi-node row
