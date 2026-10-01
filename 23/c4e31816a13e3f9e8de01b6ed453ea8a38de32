@@ -1,0 +1,33 @@
+docs/internal/plans/RUST_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_5852c482f716ad 5-7,189-204,212-241,248-252
+net/crates/net/sdk/src/mesh.rs
+  s_f9febccc288dd3::t_1c07f703f4d152 119-174
+  s_f9febccc288dd3::t_6c2e0fcda13c7c 47,50-53
+  s_f9febccc288dd3::t_65044be7237479 1345-1392
+CONTRIBUTING.md
+  s_f9febccc288dd3::t_052221f4b9de17 70-83
+net/crates/net/sdk/tests/stream_inbound.rs
+  s_f9febccc288dd3::t_926d0029c7bc66 1-22,24-185,191-274,278-280
+  s_f9febccc288dd3::t_915d8dcab09ab0 186-190,275-277
+  s_f9febccc288dd3::t_3e9f8b93a1d9b4 23
+net/crates/net/sdk/src/lib.rs
+  s_f9febccc288dd3::t_9b6dc341a3c2c3 310-312
+AGENTS.md
+  s_f9febccc288dd3::t_c50b4ea1278ab2 241-246
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "23c4e31816a13e3f9e8de01b6ed453ea8a38de32",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
