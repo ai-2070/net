@@ -101,6 +101,7 @@ typedef struct ArcMeshNode ArcMeshNode;
 extern RedexHandle* net_redex_new(const char* persistent_dir);
 extern void net_redex_free(RedexHandle* handle);
 extern int net_redex_enable_replication(RedexHandle* redex, ArcMeshNode* mesh_arc);
+extern int net_redex_disable_replication(RedexHandle* redex);
 extern uint32_t net_redex_replication_runtime_count(const RedexHandle* redex);
 extern char* net_redex_replication_prometheus_text(const RedexHandle* redex);
 
@@ -270,6 +271,11 @@ type ReplicationConfig struct {
 	Placement PlacementStrategy `json:"placement,omitempty"`
 	// PinnedNodes is required when Placement == PlacementPinned.
 	PinnedNodes []uint64 `json:"pinned_nodes,omitempty"`
+	// PlacementMetadata carries placement hints for Standard /
+	// ColocationStrict: "colocate-with", "colocate-with-strict"
+	// (required by ColocationStrict; a chain's 16-hex origin hash),
+	// "intent".
+	PlacementMetadata map[string]string `json:"placement_metadata,omitempty"`
 	// LeaderPinned, when non-nil, pins the leader to a specific
 	// NodeId. The deterministic election picks this node whenever
 	// it's healthy.
@@ -492,6 +498,23 @@ func (r *Redex) EnableGreedyDataforts(meshArcPtr unsafe.Pointer, config *GreedyC
 	return nil
 }
 
+// DisableReplication undoes EnableReplication: every channel's
+// replication shuts down (withdrawing its chain advertisement) and the
+// Redex releases its reference to the mesh. Idempotent; open files stay
+// open as local logs.
+func (r *Redex) DisableReplication() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return fmt.Errorf("%w: redex handle already closed", ErrRedex)
+	}
+	rc := C.net_redex_disable_replication(r.handle)
+	if rc != 0 {
+		return fmt.Errorf("%w: disable_replication failed (rc=%d)", ErrRedex, int(rc))
+	}
+	return nil
+}
+
 // DisableGreedyDataforts un-installs the greedy wiring. Idempotent.
 func (r *Redex) DisableGreedyDataforts() error {
 	r.mu.Lock()
@@ -638,6 +661,19 @@ const (
 	heartbeatMsMax       = uint64(300_000)
 )
 
+// isChainHex reports whether s is a chain origin hash in canonical form.
+func isChainHex(s string) bool {
+	if len(s) != 16 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func validateReplicationConfig(cfg *ReplicationConfig) error {
 	if cfg == nil {
 		return nil
@@ -654,9 +690,26 @@ func validateReplicationConfig(cfg *ReplicationConfig) error {
 			ErrInvalidReplicationConfig, cfg.HeartbeatMs, heartbeatMsMin, heartbeatMsMax,
 		)
 	}
+	// Colocation hints are chain origin hashes the substrate matches
+	// against causal: tags byte for byte: 16 lowercase hex digits.
+	for _, key := range []string{"colocate-with", "colocate-with-strict"} {
+		if v, ok := cfg.PlacementMetadata[key]; ok && !isChainHex(v) {
+			return fmt.Errorf(
+				"%w: PlacementMetadata[%q] = %q is not a 16-digit lowercase hex chain hash",
+				ErrInvalidReplicationConfig, key, v,
+			)
+		}
+	}
 	switch cfg.Placement {
-	case "", PlacementStandard, PlacementColocationStrict:
+	case "", PlacementStandard:
 		// OK.
+	case PlacementColocationStrict:
+		if _, ok := cfg.PlacementMetadata["colocate-with-strict"]; !ok {
+			return fmt.Errorf(
+				"%w: Placement %q requires PlacementMetadata[\"colocate-with-strict\"]",
+				ErrInvalidReplicationConfig, PlacementColocationStrict,
+			)
+		}
 	case PlacementPinned:
 		if len(cfg.PinnedNodes) == 0 {
 			return fmt.Errorf(

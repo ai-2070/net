@@ -156,6 +156,23 @@ describe('MeshNode channels (two-node handshake e2e)', () => {
     await b.shutdown();
   });
 
+  it('permissiveChannels reaches the native node: the same subscribe is admitted', async () => {
+    // The mirror of the test above. `MeshNode.create` used to drop this
+    // option (NODE_SDK_GAPS_PLAN.md S2), so the publisher stayed strict and
+    // this subscribe was refused. Permissive means no registry at all: ANY
+    // channel is reachable, which is why it is off by default.
+    const [aAddr, bAddr] = nextPortPair();
+    const a = await MeshNode.create({ bindAddr: aAddr, psk: PSK });
+    const b = await MeshNode.create({ bindAddr: bAddr, psk: PSK, permissiveChannels: true });
+    await handshake(a, b, bAddr);
+
+    b.registerChannel({ name: 'foo' });
+    await expect(a.subscribeChannel(b.nodeId(), 'bar')).resolves.toBeUndefined();
+
+    await a.shutdown();
+    await b.shutdown();
+  });
+
   it('unsubscribe of non-member is idempotent', async () => {
     const { a, b, bId } = await pair();
     b.registerChannel({ name: 'chan/x' });

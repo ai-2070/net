@@ -236,20 +236,33 @@ every feature enabled**, so this table matters only for source builds — a
 disabled feature's symbols are absent at runtime and the `import` resolves to
 `undefined`.
 
-**Everything below imports from the package root**, `@net-mesh/sdk`. The only
-other entry point is `@net-mesh/sdk/tool`; the package's `exports` map defines
-those two and nothing else, so a per-feature subpath such as
-`@net-mesh/sdk/mesh` fails with `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+**Everything below imports from the package root**, `@net-mesh/sdk`, unless
+its row names a subpath (`deck` is also on `@net-mesh/sdk/deck`; the MCP
+helpers are on `@net-mesh/sdk/tool`). The
+package's `exports` map defines three more entry points, `@net-mesh/sdk/tool`,
+`@net-mesh/sdk/org` and `@net-mesh/sdk/deck`, and nothing else, so a
+per-feature subpath such as `@net-mesh/sdk/mesh` fails with
+`ERR_PACKAGE_PATH_NOT_EXPORTED`. Subpath imports type-check under
+`moduleResolution` `node16` or `bundler`; the legacy `node` (node10) setting
+ignores `exports` and resolves only the root.
 
 | Cargo feature | Surface |
 |---|---|
-| `net` | `MeshNode`, `NetStream`, channel auth |
-| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb` |
+| `net` | `MeshNode`, channel auth, placement filters (`registerPlacementFilter`) |
+| `nat-traversal` | `MeshNode.natType` / `reflexAddr` / `probeReflex` / `connectDirect` / `connectDirectAuto` / `traversalStats`, reflex overrides |
+| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `WriteToken`, `MeshNode.rpc()`; with `net`, `Redex` replication (`enableReplication` / `await disableReplication()`) |
 | `meshdb` | `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream`, `QueryBuilder`, `InMemoryChainReader` |
 | `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `DaemonHealth`, `CapabilityAdvert` |
 | `compute` | `DaemonRuntime`, `DaemonHandle`, `MigrationHandle` |
 | `groups` | `ReplicaGroup`, `ForkGroup`, `StandbyGroup` |
-| `deck` | `DeckClient`, `OperatorIdentity`, admin / snapshot / status streams |
+| `deck` | `DeckClient`, `OperatorIdentity`, admin / snapshot / status streams (also `@net-mesh/sdk/deck`) |
+| `dataforts` | `MeshBlobAdapter` (build with `createMeshBlobAdapter`), `BlobRef`, the blob adapter registry, `MeshNode.storeDir` / `fetchDir` / `serveBlobTransfer` |
+| `aggregator` | `RegistryClient`, `FoldQueryClient` (build with `createRegistryClient` / `createFoldQueryClient`; `close()` before `shutdown()`) |
+| `consent` | `ConsentPolicy`, `PinStore`, `CapabilityGateway` |
+| `delegation` | `DelegationChain`, `RevocationRegistry`, `deriveChildIdentity`; enrollment: `OperatorEnrollment`, `DeviceEnrollment`, `InviteToken`, `MeshNode.join` / `renew` / `serveEnrollmentAuto` |
+| `a2a` | `MeshNode.serveA2a` / `submitTask` / `taskStatus` / `cancelTask` |
+| `publish` | `MeshNode.publishTools` |
+| `mcp` | `classifyMcpServer`, `lowerMcpTool` (in `@net-mesh/sdk/tool`) |
 | `redis` | `RedisStreamDedup` |
 
 The bus surface — `NetNode`, `EventStream`, capabilities, identity, predicates

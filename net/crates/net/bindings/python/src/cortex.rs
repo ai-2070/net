@@ -238,9 +238,42 @@ fn map_wait_for_token_err(e: InnerWaitForTokenError) -> PyErr {
 pub struct PyRedex {
     inner: Arc<InnerRedex>,
     persistent_dir: Option<String>,
+    /// The runtime of the mesh passed to `enable_replication` /
+    /// `enable_greedy_dataforts` / `enable_gravity_for_greedy`.
+    ///
+    /// Those calls, and `open_file` on a replicated channel, spawn tokio
+    /// tasks, but they run on the Python thread, which has no reactor:
+    /// the first replicated `open_file` raised `PanicException: there is
+    /// no reactor running`. Entering the mesh's runtime makes the spawns
+    /// land on it. Replaced on every enable (it follows the mesh most
+    /// recently passed in) and cleared by `disable_replication`.
+    #[cfg(feature = "net")]
+    mesh_runtime: parking_lot::Mutex<Option<Arc<crate::runtime_guard::GuardedRuntime>>>,
 }
 
 impl PyRedex {
+    /// Record `mesh`'s runtime (the latest call wins) and return it, for
+    /// a call that may spawn tasks.
+    #[cfg(feature = "net")]
+    fn adopt_runtime(
+        &self,
+        mesh: &crate::mesh_bindings::NetMesh,
+    ) -> Arc<crate::runtime_guard::GuardedRuntime> {
+        let rt = mesh.runtime_arc();
+        *self.mesh_runtime.lock() = Some(rt.clone());
+        rt
+    }
+
+    /// The runtime a spawning call should run on: the mesh's once
+    /// replication or greedy is enabled, else the shared binding runtime.
+    fn spawn_runtime(&self) -> PyResult<Arc<crate::runtime_guard::GuardedRuntime>> {
+        #[cfg(feature = "net")]
+        if let Some(rt) = self.mesh_runtime.lock().clone() {
+            return Ok(rt);
+        }
+        make_runtime()
+    }
+
     /// Crate-internal accessor for the underlying `Redex` Arc.
     /// Lets sibling binding modules (e.g. `blob::PyMeshBlobAdapter`)
     /// wire a substrate-owned blob adapter against the same handle
@@ -269,6 +302,8 @@ impl PyRedex {
         Self {
             inner: Arc::new(inner),
             persistent_dir,
+            #[cfg(feature = "net")]
+            mesh_runtime: parking_lot::Mutex::new(None),
         }
     }
 
@@ -315,6 +350,7 @@ impl PyRedex {
         replication_leader_pinned = None,
         replication_on_under_capacity = None,
         replication_budget_fraction = None,
+        replication_placement_metadata = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn open_file(
@@ -334,6 +370,7 @@ impl PyRedex {
         replication_leader_pinned: Option<u64>,
         replication_on_under_capacity: Option<String>,
         replication_budget_fraction: Option<f64>,
+        replication_placement_metadata: Option<std::collections::HashMap<String, String>>,
     ) -> PyResult<PyRedexFile> {
         let channel = ChannelName::new(name).map_err(|e| RedexError::new_err(format!("{}", e)))?;
         let mut cfg = RedexFileConfig {
@@ -394,6 +431,10 @@ impl PyRedex {
                     "replication_budget_fraction",
                     replication_budget_fraction.is_some(),
                 ),
+                (
+                    "replication_placement_metadata",
+                    replication_placement_metadata.is_some(),
+                ),
             ];
             let first_set = stray.iter().find(|(_, set)| *set).map(|(n, _)| *n);
             if let Some(name) = first_set {
@@ -412,13 +453,17 @@ impl PyRedex {
                 replication_leader_pinned,
                 replication_on_under_capacity,
                 replication_budget_fraction,
+                replication_placement_metadata,
             )?);
         }
+        // Opening can spawn: a replicated channel's runtime, or an
+        // interval fsync task. The Python thread has no reactor.
+        let runtime = self.spawn_runtime()?;
+        let _enter = runtime.enter();
         let file = self
             .inner
             .open_file(&channel, cfg)
             .map_err(|e| RedexError::new_err(format!("open_file: {}", e)))?;
-        let runtime = make_runtime()?;
         Ok(PyRedexFile {
             inner: Arc::new(file),
             runtime,
@@ -436,7 +481,11 @@ impl PyRedex {
     /// See `CONFIG_REPLICATION.md` for the full operator surface.
     #[cfg(feature = "net")]
     fn enable_replication(&self, mesh: &crate::mesh_bindings::NetMesh) -> PyResult<()> {
+        // Clone the node first: a shut-down mesh fails here, before its
+        // runtime is recorded for this Redex.
         let arc = mesh.node_arc_clone()?;
+        let rt = self.adopt_runtime(mesh);
+        let _enter = rt.enter();
         self.inner.enable_replication(arc);
         Ok(())
     }
@@ -457,6 +506,25 @@ impl PyRedex {
              rebuild with --features net",
         ))
     }
+
+    /// Undo `enable_replication`: shut down every channel's replication
+    /// (gracefully, withdrawing its chain advertisement) and release the
+    /// mesh. Idempotent. Open files stay open as local logs. Returns once
+    /// every channel's runtime has stopped; the GIL is released while
+    /// it waits.
+    #[cfg(feature = "net")]
+    fn disable_replication(&self, py: Python<'_>) -> PyResult<()> {
+        let rt = self.spawn_runtime()?;
+        let inner = self.inner.clone();
+        py.detach(move || rt.block_on(inner.disable_replication_and_wait()));
+        // A later enable follows its own mesh's runtime.
+        *self.mesh_runtime.lock() = None;
+        Ok(())
+    }
+
+    /// No-op without the `net` feature: replication can't be enabled.
+    #[cfg(not(feature = "net"))]
+    fn disable_replication(&self) {}
 
     /// Count of per-channel replication runtimes currently registered
     /// on this manager. `0` when replication isn't enabled. Useful
@@ -572,7 +640,11 @@ impl PyRedex {
             };
             cfg = cfg.with_colocation_policy(parsed);
         }
+        // Clone the node first: a shut-down mesh fails here, before its
+        // runtime is recorded for this Redex.
         let arc = mesh.node_arc_clone()?;
+        let rt = self.adopt_runtime(mesh);
+        let _enter = rt.enter();
         // Local-caps + intent-registry default to empty / substrate
         // defaults respectively. Application code refreshes via
         // `greedy_set_local_caps` and `greedy_register_intent`
@@ -679,7 +751,11 @@ impl PyRedex {
         if let Some(reference) = normalization_reference_rate {
             policy = policy.with_normalization_reference_rate(reference as f32);
         }
+        // Clone the node first: a shut-down mesh fails here, before its
+        // runtime is recorded for this Redex.
         let arc = mesh.node_arc_clone()?;
+        let rt = self.adopt_runtime(mesh);
+        let _enter = rt.enter();
         self.inner
             .enable_gravity_for_greedy(
                 arc,
@@ -710,8 +786,34 @@ impl PyRedex {
     fn disable_gravity_for_greedy(&self) {
         self.inner.disable_gravity_for_greedy();
     }
+    // Fallbacks for builds without `dataforts`, matching the Node
+    // binding: the stub (`_net.pyi`) declares these unconditionally, so
+    // a call reports "greedy not enabled" instead of an AttributeError.
+    // (`enable_greedy_dataforts` / `enable_gravity_for_greedy` have
+    // raising fallbacks above.)
+
+    /// No-op without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    fn disable_greedy_dataforts(&self) {}
+
+    /// `0` without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    fn greedy_cached_channel_count(&self) -> u32 {
+        0
+    }
+
+    /// Empty without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    fn greedy_prometheus_text(&self) -> String {
+        String::new()
+    }
+
+    /// No-op without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    fn disable_gravity_for_greedy(&self) {}
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_replication_config(
     factor: Option<u32>,
     heartbeat_ms: Option<u64>,
@@ -720,6 +822,7 @@ fn build_replication_config(
     leader_pinned: Option<u64>,
     on_under_capacity: Option<String>,
     budget_fraction: Option<f64>,
+    placement_metadata: Option<std::collections::HashMap<String, String>>,
 ) -> PyResult<InnerReplicationConfig> {
     let mut out = InnerReplicationConfig::new();
     if let Some(f) = factor {
@@ -784,6 +887,12 @@ fn build_replication_config(
     });
     if let Some(fr) = budget_fraction {
         out = out.with_replication_budget_fraction(fr as f32);
+    }
+    // `colocate-with` / `colocate-with-strict` (each a chain's 16-hex
+    // origin hash) and `intent`; `colocation_strict` requires the
+    // strict key.
+    for (key, value) in placement_metadata.unwrap_or_default() {
+        out = out.with_placement_metadata(key, value);
     }
     out.validate()
         .map_err(|e| RedexError::new_err(format!("replication config invalid: {e}")))?;
@@ -2347,16 +2456,7 @@ impl PyNetDb {
         with_tasks: bool,
         with_memories: bool,
     ) -> PyResult<Self> {
-        let redex = match &persistent_dir {
-            Some(dir) => PyRedex {
-                inner: Arc::new(InnerRedex::new().with_persistent_dir(dir)),
-                persistent_dir: Some(dir.clone()),
-            },
-            None => PyRedex {
-                inner: Arc::new(InnerRedex::new()),
-                persistent_dir: None,
-            },
-        };
+        let redex = PyRedex::new(persistent_dir.clone());
 
         let tasks = if with_tasks {
             Some(PyTasksAdapter::open(py, &redex, origin_hash, persistent)?)
@@ -2402,16 +2502,7 @@ impl PyNetDb {
         let snapshot = InnerNetDbSnapshot::decode(bundle)
             .map_err(|e| NetDbError::new_err(format!("decode bundle: {}", e)))?;
 
-        let redex = match &persistent_dir {
-            Some(dir) => PyRedex {
-                inner: Arc::new(InnerRedex::new().with_persistent_dir(dir)),
-                persistent_dir: Some(dir.clone()),
-            },
-            None => PyRedex {
-                inner: Arc::new(InnerRedex::new()),
-                persistent_dir: None,
-            },
-        };
+        let redex = PyRedex::new(persistent_dir.clone());
 
         let tasks = if with_tasks {
             match snapshot.tasks {

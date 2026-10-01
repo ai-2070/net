@@ -2,10 +2,11 @@
 //!
 //! Wires two `MeshNode`s + two `Redex` instances, calls
 //! `enable_replication` on both, opens the same channel name with
-//! a replication-enabled config, manually drives the role
-//! transitions (Phase F's placement filter is not yet wired), then
-//! appends events on the leader and asserts the replica catches up
-//! via the heartbeat-driven `SyncRequest` / `SyncResponse` cycle.
+//! a replication-enabled config, then appends events on the leader
+//! and asserts the replicas catch up via the heartbeat-driven
+//! `SyncRequest` / `SyncResponse` cycle. The older tests drive the
+//! roles past the bootstrap by hand; the later ones let the runtime
+//! bootstrap, place (`Standard` / `ColocationStrict`) and elect.
 //!
 //! Run: `cargo test --features redex --test redex_replication_e2e`
 
@@ -17,7 +18,7 @@ use std::time::Duration;
 
 use net::adapter::net::channel::ChannelName;
 use net::adapter::net::redex::{
-    PlacementStrategy, Redex, RedexFileConfig, ReplicaRole, ReplicationConfig, TransitionSignal,
+    PlacementStrategy, Redex, RedexFileConfig, ReplicaRole, ReplicationConfig,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
@@ -30,7 +31,11 @@ fn test_config() -> MeshNodeConfig {
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
         .with_handshake(3, Duration::from_secs(2))
-        .with_capability_gc_interval(Duration::from_millis(250));
+        .with_capability_gc_interval(Duration::from_millis(250))
+        // Replica placement follows capability announcements, which the
+        // origin rate-limits to one per window (default 10 s); a short
+        // window keeps the placement tests' convergence quick.
+        .with_min_announce_interval(Duration::from_millis(50));
     cfg.socket_buffers = SocketBufferConfig {
         send_buffer_size: TEST_BUFFER_SIZE,
         recv_buffer_size: TEST_BUFFER_SIZE,
@@ -75,6 +80,46 @@ fn cn(s: &str) -> ChannelName {
     ChannelName::new(s).unwrap()
 }
 
+/// Wait until the runtime's own election settles on `leader` as Leader
+/// and every one of `replicas` as Replica. The runtime bootstraps and
+/// elects by itself (the pinned leader wins when healthy), so tests wait
+/// for that rather than drive transitions that race it.
+async fn await_roles(
+    leader: &net::adapter::net::redex::ReplicationCoordinator,
+    replicas: &[&net::adapter::net::redex::ReplicationCoordinator],
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let settled = leader.role() == ReplicaRole::Leader
+            && replicas.iter().all(|c| c.role() == ReplicaRole::Replica);
+        if settled {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "election never settled: leader {:?}, replicas {:?}",
+            leader.role(),
+            replicas.iter().map(|c| c.role()).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Wait for the replication runtime to bootstrap a pinned member
+/// `Idle -> Replica`. The runtime does that itself now; a test that
+/// drove the step by hand would race it.
+async fn await_bootstrapped(coord: &net::adapter::net::redex::ReplicationCoordinator) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while coord.role() == ReplicaRole::Idle {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "replication runtime never bootstrapped the channel to Replica"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(coord.role(), ReplicaRole::Replica);
+}
+
 /// Two-node replication round-trip — appends on the leader's
 /// channel surface should land on the replica's local file via the
 /// inbox-driven catch-up cycle. The replica is driven into
@@ -106,7 +151,8 @@ async fn two_node_replication_catches_replica_up() {
     let cfg = RedexFileConfig::default().with_replication(Some(
         ReplicationConfig::new()
             .with_heartbeat_ms(150)
-            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id])),
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+            .with_leader_pinned(Some(a_id)),
     ));
     let file_a = redex_a.open_file(&name, cfg.clone()).expect("open A");
     let file_b = redex_b.open_file(&name, cfg).expect("open B");
@@ -118,22 +164,7 @@ async fn two_node_replication_catches_replica_up() {
     let coord_a = redex_a.replication_coordinator_for(&name).expect("coord A");
     let coord_b = redex_b.replication_coordinator_for(&name).expect("coord B");
     // State-machine path Idle → Replica → Candidate → Leader.
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .expect("A → Replica");
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .expect("A → Candidate");
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .expect("A → Leader");
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .expect("B → Replica");
+    await_roles(&coord_a, &[&coord_b]).await;
     assert_eq!(coord_a.role(), ReplicaRole::Leader);
     assert_eq!(coord_b.role(), ReplicaRole::Replica);
 
@@ -230,7 +261,8 @@ async fn two_node_heartbeat_records_believed_leader() {
     let cfg = RedexFileConfig::default().with_replication(Some(
         ReplicationConfig::new()
             .with_heartbeat_ms(150)
-            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id])),
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+            .with_leader_pinned(Some(a_id)),
     ));
     redex_a.open_file(&name, cfg.clone()).expect("open A");
     redex_b.open_file(&name, cfg).expect("open B");
@@ -240,22 +272,7 @@ async fn two_node_heartbeat_records_believed_leader() {
 
     // Bring both nodes to participating roles via the
     // state-machine path Idle → Replica → Candidate → Leader.
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .unwrap();
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_roles(&coord_a, &[&coord_b]).await;
 
     // Wait for B's coordinator metrics to observe a non-default
     // replica_lag — the gauge gets stamped when on_tick runs while
@@ -303,7 +320,8 @@ async fn leader_close_triggers_replica_election_and_promotion() {
     let cfg = RedexFileConfig::default().with_replication(Some(
         ReplicationConfig::new()
             .with_heartbeat_ms(150)
-            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id])),
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+            .with_leader_pinned(Some(a_id)),
     ));
     redex_a.open_file(&name, cfg.clone()).expect("open A");
     redex_b.open_file(&name, cfg).expect("open B");
@@ -312,22 +330,7 @@ async fn leader_close_triggers_replica_election_and_promotion() {
     let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
 
     // Drive A → Leader, B → Replica.
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .unwrap();
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_roles(&coord_a, &[&coord_b]).await;
 
     // R-41: poll until B has observed at least one leader
     // heartbeat from A, with a hard deadline. Replacing the
@@ -425,7 +428,8 @@ async fn three_node_replication_fans_out_to_every_replica() {
         ReplicationConfig::new()
             .with_factor(3)
             .with_heartbeat_ms(150)
-            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id, c_id])),
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id, c_id]))
+            .with_leader_pinned(Some(a_id)),
     ));
     let file_a = redex_a.open_file(&name, cfg.clone()).expect("open A");
     let file_b = redex_b.open_file(&name, cfg.clone()).expect("open B");
@@ -436,26 +440,7 @@ async fn three_node_replication_fans_out_to_every_replica() {
     let coord_c = redex_c.replication_coordinator_for(&name).unwrap();
 
     // Drive: A is Leader; B and C are Replicas.
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .unwrap();
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
-    coord_c
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_roles(&coord_a, &[&coord_b, &coord_c]).await;
 
     // Append on A; both B and C must catch up.
     const N: u64 = 24;
@@ -599,7 +584,8 @@ async fn replication_overhead_within_30_percent_budget() {
     let cfg = RedexFileConfig::default().with_replication(Some(
         ReplicationConfig::new()
             .with_heartbeat_ms(500)
-            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id])),
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+            .with_leader_pinned(Some(a_id)),
     ));
 
     let name = cn("perf/replicated");
@@ -611,22 +597,7 @@ async fn replication_overhead_within_30_percent_budget() {
     // them deterministically.
     let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
     let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .unwrap();
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_roles(&coord_a, &[&coord_b]).await;
 
     // Warmup so the replication runtime tasks have settled into
     // their steady-state cadence + the mesh handshake is fully
@@ -694,6 +665,7 @@ async fn bandwidth_budget_metric_field_is_plumbed() {
                 node_a.node_id(),
                 node_b.node_id(),
             ]))
+            .with_leader_pinned(Some(node_a.node_id()))
             // Sane production fraction. The bandwidth budget's
             // ENFORCEMENT path (NACK Backpressure on exceeded
             // budget) is unit-tested in replication_catchup; this
@@ -706,22 +678,7 @@ async fn bandwidth_budget_metric_field_is_plumbed() {
 
     let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
     let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .unwrap();
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_roles(&coord_a, &[&coord_b]).await;
 
     // Drive moderate append load.
     for i in 0..256u64 {
@@ -771,4 +728,585 @@ async fn bandwidth_budget_metric_field_is_plumbed() {
 
     redex_a.close_file(&name).ok();
     redex_b.close_file(&name).ok();
+}
+
+// ============================================================================
+// No hand-driven roles: the runtime bootstraps, elects and replicates.
+// ============================================================================
+//
+// Every test above drives the coordinator through `transition_to`. Before
+// the runtime learned to bootstrap a pinned member and to elect when a
+// replica has never heard from a leader, that was the ONLY way a channel
+// left `Idle`: through the public `Redex` API alone (every binding), a
+// replicated channel sat in `Idle` forever and replicated nothing.
+
+/// Poll until `f` holds, or fail with `what` after `secs`.
+async fn wait_until(secs: u64, what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_pair_elects_the_pinned_leader_and_replicates() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+    let redex_a = Arc::new(Redex::new());
+    let redex_b = Arc::new(Redex::new());
+    redex_a.enable_replication(node_a.clone());
+    redex_b.enable_replication(node_b.clone());
+
+    let name = cn("repl/auto-pinned");
+    let (a_id, b_id) = (node_a.node_id(), node_b.node_id());
+    // B is pinned as leader, the opposite of the RTT ranking's
+    // self-preference on A, so a pass proves `leader_pinned` decides.
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+            .with_leader_pinned(Some(b_id)),
+    ));
+    let file_a = redex_a.open_file(&name, cfg.clone()).expect("open A");
+    let file_b = redex_b.open_file(&name, cfg).expect("open B");
+    let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
+    let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
+
+    wait_until(5, "B never became leader", || {
+        coord_b.role() == ReplicaRole::Leader && coord_a.role() == ReplicaRole::Replica
+    })
+    .await;
+
+    for i in 0..16u32 {
+        file_b.append(format!("event-{i}").as_bytes()).unwrap();
+    }
+    wait_until(5, "A never caught up to the leader", || {
+        file_a.next_seq() == 16
+    })
+    .await;
+    let events = file_a.read_range(0, 16);
+    assert_eq!(events[15].payload.as_ref(), b"event-15");
+    assert_eq!(coord_b.role(), ReplicaRole::Leader, "leadership stayed put");
+
+    redex_a.close_file(&name).ok();
+    redex_b.close_file(&name).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_pair_without_a_pinned_leader_converges_on_one() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+    let redex_a = Arc::new(Redex::new());
+    let redex_b = Arc::new(Redex::new());
+    redex_a.enable_replication(node_a.clone());
+    redex_b.enable_replication(node_b.clone());
+
+    let name = cn("repl/auto-elect");
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::Pinned(vec![
+                node_a.node_id(),
+                node_b.node_id(),
+            ])),
+    ));
+    let file_a = redex_a.open_file(&name, cfg.clone()).expect("open A");
+    let file_b = redex_b.open_file(&name, cfg).expect("open B");
+    let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
+    let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
+
+    // Each node ranks itself first, so both may win their own election;
+    // the peer-leader rule then concedes one. Wait for a stable split.
+    let one_leader = || {
+        matches!(
+            (coord_a.role(), coord_b.role()),
+            (ReplicaRole::Leader, ReplicaRole::Replica)
+                | (ReplicaRole::Replica, ReplicaRole::Leader)
+        )
+    };
+    wait_until(5, "the pair never settled on one leader", one_leader).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(one_leader(), "leadership flapped after settling");
+
+    let (leader, replica) = if coord_a.role() == ReplicaRole::Leader {
+        (&file_a, &file_b)
+    } else {
+        (&file_b, &file_a)
+    };
+    for i in 0..8u32 {
+        leader.append(format!("event-{i}").as_bytes()).unwrap();
+    }
+    wait_until(5, "the replica never caught up", || replica.next_seq() == 8).await;
+
+    redex_a.close_file(&name).ok();
+    redex_b.close_file(&name).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disable_replication_releases_the_mesh() {
+    let node = build_node().await;
+    let baseline = Arc::strong_count(&node);
+    let redex = Redex::new();
+    redex.enable_replication(node.clone());
+    let name = cn("repl/disable");
+    let file = redex
+        .open_file(
+            &name,
+            RedexFileConfig::default().with_replication(Some(
+                ReplicationConfig::new()
+                    .with_heartbeat_ms(150)
+                    .with_placement(PlacementStrategy::Pinned(vec![node.node_id()])),
+            )),
+        )
+        .expect("open");
+    let coord = redex.replication_coordinator_for(&name).unwrap();
+    await_bootstrapped(&coord).await;
+    assert!(Arc::strong_count(&node) > baseline);
+
+    redex.disable_replication();
+    redex.disable_replication(); // idempotent
+    assert_eq!(redex.replication_runtime_count(), 0);
+    wait_until(2, "the shut-down runtime never withdrew to Idle", || {
+        coord.role() == ReplicaRole::Idle
+    })
+    .await;
+    // The coordinator handle carries its own mesh reference (its
+    // chain-tag sink); only Rust callers can hold one. Release it, then
+    // the runtime task's exit leaves the mesh with no extra owners.
+    drop(coord);
+    wait_until(2, "the Redex still holds the mesh", || {
+        Arc::strong_count(&node) == baseline
+    })
+    .await;
+
+    // The file is still a local log, and replication can come back.
+    file.append(b"local").unwrap();
+    redex.enable_replication(node.clone());
+    assert_eq!(redex.replication_runtime_count(), 0);
+}
+
+// ============================================================================
+// Standard / ColocationStrict placement (REDEX_REPLICA_PLACEMENT_PLAN.md)
+// ============================================================================
+//
+// Before the placement resolver, `Standard` (the default) and
+// `ColocationStrict` started with an empty replica set and every channel
+// sat in `Idle`: nothing replicated unless the set was pinned by hand.
+
+struct Trio {
+    nodes: [Arc<MeshNode>; 3],
+    redexes: [Arc<Redex>; 3],
+}
+
+async fn trio() -> Trio {
+    let a = build_node().await;
+    let b = build_node().await;
+    let c = build_node().await;
+    handshake_no_start(&a, &b).await;
+    handshake_no_start(&a, &c).await;
+    handshake_no_start(&b, &c).await;
+    start_all(&[&a, &b, &c]);
+    let redexes = [
+        Arc::new(Redex::new()),
+        Arc::new(Redex::new()),
+        Arc::new(Redex::new()),
+    ];
+    for (r, n) in redexes.iter().zip([&a, &b, &c]) {
+        r.enable_replication(n.clone());
+    }
+    Trio {
+        nodes: [a, b, c],
+        redexes,
+    }
+}
+
+fn roles(trio: &Trio, name: &ChannelName) -> Vec<ReplicaRole> {
+    trio.redexes
+        .iter()
+        .map(|r| {
+            r.replication_coordinator_for(name)
+                .map(|c| c.role())
+                .unwrap_or(ReplicaRole::Idle)
+        })
+        .collect()
+}
+
+/// The index of the node with the `rank`-th lowest NodeId.
+fn by_id_rank(trio: &Trio, rank: usize) -> usize {
+    let mut idx: Vec<usize> = (0..3).collect();
+    idx.sort_by_key(|&i| trio.nodes[i].node_id());
+    idx[rank]
+}
+
+fn settled(roles: &[ReplicaRole], members: &[usize]) -> bool {
+    let leaders = members
+        .iter()
+        .filter(|&&i| roles[i] == ReplicaRole::Leader)
+        .count();
+    let all_in = members
+        .iter()
+        .all(|&i| matches!(roles[i], ReplicaRole::Leader | ReplicaRole::Replica));
+    let others_idle = (0..roles.len())
+        .filter(|i| !members.contains(i))
+        .all(|i| roles[i] == ReplicaRole::Idle);
+    leaders == 1 && all_in && others_idle
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standard_placement_selects_factor_replicas_and_replicates() {
+    let t = trio().await;
+    let name = cn("repl/standard");
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_factor(2)
+            .with_heartbeat_ms(150),
+    ));
+    let files: Vec<_> = t
+        .redexes
+        .iter()
+        .map(|r| r.open_file(&name, cfg.clone()).expect("open"))
+        .collect();
+
+    // Equal scores (no placement hints, no resources announced) → the two
+    // lowest NodeIds, the same set on every node.
+    let members = [by_id_rank(&t, 0), by_id_rank(&t, 1)];
+    let outsider = by_id_rank(&t, 2);
+    wait_until(8, "the pair never settled with one leader", || {
+        settled(&roles(&t, &name), &members)
+    })
+    .await;
+    // Leadership can still flap right after settling (a node that briefly
+    // resolved a set of one); hold it before writing through the leader.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        settled(&roles(&t, &name), &members),
+        "leadership flapped after settling"
+    );
+
+    let r = roles(&t, &name);
+    let (leader, follower) = if r[members[0]] == ReplicaRole::Leader {
+        (members[0], members[1])
+    } else {
+        (members[1], members[0])
+    };
+    for i in 0..8u32 {
+        files[leader]
+            .append(format!("event-{i}").as_bytes())
+            .unwrap();
+    }
+    wait_until(5, "the other replica never caught up", || {
+        files[follower].next_seq() == 8
+    })
+    .await;
+    assert_eq!(
+        files[outsider].next_seq(),
+        0,
+        "the unselected node holds nothing"
+    );
+    assert_eq!(roles(&t, &name)[outsider], ReplicaRole::Idle);
+
+    for r in &t.redexes {
+        r.close_file(&name).ok();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standard_placement_reselects_when_a_replica_leaves() {
+    let t = trio().await;
+    let name = cn("repl/reselect");
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_factor(2)
+            .with_heartbeat_ms(150),
+    ));
+    let files: Vec<_> = t
+        .redexes
+        .iter()
+        .map(|r| r.open_file(&name, cfg.clone()).expect("open"))
+        .collect();
+    let first = [by_id_rank(&t, 0), by_id_rank(&t, 1)];
+    let outsider = by_id_rank(&t, 2);
+    wait_until(8, "the first set never settled", || {
+        settled(&roles(&t, &name), &first)
+    })
+    .await;
+    // Leadership can still flap right after settling (a node that briefly
+    // resolved a set of one); hold it before writing through the leader.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        settled(&roles(&t, &name), &first),
+        "leadership flapped after settling"
+    );
+
+    // The lowest-id member leaves; its candidacy is withdrawn, so the
+    // remaining nodes re-resolve to {the other member, the outsider}.
+    let leaving = first[0];
+    t.redexes[leaving].close_file(&name).expect("close");
+    let second = [first[1], outsider];
+    wait_until(
+        8,
+        "the set never re-resolved to take in the outsider",
+        || {
+            let r = roles(&t, &name);
+            let leaders = second
+                .iter()
+                .filter(|&&i| r[i] == ReplicaRole::Leader)
+                .count();
+            leaders == 1
+                && second
+                    .iter()
+                    .all(|&i| matches!(r[i], ReplicaRole::Leader | ReplicaRole::Replica))
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let r = roles(&t, &name);
+    assert_eq!(
+        second
+            .iter()
+            .filter(|&&i| r[i] == ReplicaRole::Leader)
+            .count(),
+        1,
+        "leadership flapped after the re-selection settled"
+    );
+
+    let (leader, follower) = if r[second[0]] == ReplicaRole::Leader {
+        (second[0], second[1])
+    } else {
+        (second[1], second[0])
+    };
+    let base = files[leader].next_seq();
+    for i in 0..4u32 {
+        files[leader]
+            .append(format!("after-{i}").as_bytes())
+            .unwrap();
+    }
+    wait_until(5, "the newly selected replica never caught up", || {
+        files[follower].next_seq() == base + 4
+    })
+    .await;
+
+    for (i, r) in t.redexes.iter().enumerate() {
+        if i != leaving {
+            r.close_file(&name).ok();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn colocation_strict_selects_only_holders_of_the_named_chain() {
+    let t = trio().await;
+    // Two of the three nodes hold an unrelated chain; the channel must
+    // replicate only onto them, even with factor 3.
+    const HOST_CHAIN: u64 = 0x00C0_FFEE_0000_0001;
+    let holders = [by_id_rank(&t, 0), by_id_rank(&t, 2)];
+    let outsider = by_id_rank(&t, 1);
+    for &i in &holders {
+        t.nodes[i].announce_chain(HOST_CHAIN, 1).await.unwrap();
+    }
+
+    let name = cn("repl/colocated");
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_factor(3)
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::ColocationStrict)
+            .with_placement_metadata(
+                net::adapter::net::redex::COLOCATE_WITH_STRICT_METADATA_KEY,
+                format!("{HOST_CHAIN:016x}"),
+            ),
+    ));
+    for r in &t.redexes {
+        r.open_file(&name, cfg.clone()).expect("open");
+    }
+    wait_until(8, "the holders never settled as the replica set", || {
+        settled(&roles(&t, &name), &holders)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        roles(&t, &name)[outsider],
+        ReplicaRole::Idle,
+        "a node without the chain is never selected"
+    );
+
+    for r in &t.redexes {
+        r.close_file(&name).ok();
+    }
+}
+
+/// Every channel on a `Redex` advertises the same origin (`causal:<origin>`),
+/// so closing one must not withdraw the tag while another still holds it.
+/// Before the per-origin holder count, `close_file(A)` shut A's runtime down
+/// gracefully, its `* → Idle` withdrew the shared tag, and B — still active —
+/// vanished from holder discovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_one_channel_keeps_the_shared_origin_advertised() {
+    let node = build_node().await;
+    node.start();
+    let redex = Redex::new();
+    redex.enable_replication(node.clone());
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::Pinned(vec![node.node_id()])),
+    ));
+    let (a, b) = (cn("repl/shared-a"), cn("repl/shared-b"));
+    redex.open_file(&a, cfg.clone()).expect("open A");
+    redex.open_file(&b, cfg).expect("open B");
+    let coord_b = redex.replication_coordinator_for(&b).unwrap();
+    let origin = coord_b.channel().origin_hash;
+    let self_id = node.node_id();
+    let advertised = || node.find_chain_holders(origin).contains(&self_id);
+    let coord_a = redex.replication_coordinator_for(&a).unwrap();
+    // Both settled (each a set of one, so each elects itself): no later
+    // transition of B's re-announces the tag behind A's back.
+    wait_until(5, "the channels never settled as leaders", || {
+        coord_a.role() == ReplicaRole::Leader && coord_b.role() == ReplicaRole::Leader
+    })
+    .await;
+    wait_until(5, "the shared origin was never advertised", advertised).await;
+    drop(coord_a);
+
+    redex.close_file(&a).expect("close A");
+    // Let A's graceful shutdown (and any withdraw it would issue) land.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_ne!(coord_b.role(), ReplicaRole::Idle, "B is still active");
+    assert!(advertised(), "closing A withdrew the tag B still holds");
+
+    redex.close_file(&b).expect("close B");
+    wait_until(5, "the last holder's close never withdrew the tag", || {
+        !advertised()
+    })
+    .await;
+}
+
+/// A runtime that is aborted rather than shut down (here: the `Redex` is
+/// dropped without `disable_replication`) must not leave its replica-
+/// candidate tag behind. The tag is part of the baseline every later
+/// announce re-sends, so a leaked one kept peers choosing this node as a
+/// replica of a channel it no longer serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_runtime_drops_its_replica_candidacy() {
+    let node = build_node().await;
+    node.start();
+    let redex = Redex::new();
+    redex.enable_replication(node.clone());
+    let name = cn("repl/abandoned");
+    redex
+        .open_file(
+            &name,
+            RedexFileConfig::default().with_replication(Some(
+                ReplicationConfig::new()
+                    .with_factor(1)
+                    .with_heartbeat_ms(150),
+            )),
+        )
+        .expect("open");
+    let cid = net::adapter::net::redex::ChannelId::from_name(&name);
+    wait_until(5, "the node never advertised candidacy", || {
+        node.advertises_replica_candidate(cid.as_bytes())
+    })
+    .await;
+
+    // No disable_replication: dropping the Redex drops its router, whose
+    // runtime handles abort their tasks.
+    drop(redex);
+    wait_until(
+        5,
+        "the aborted runtime left its candidate tag behind",
+        || !node.advertises_replica_candidate(cid.as_bytes()),
+    )
+    .await;
+}
+
+/// Two `Redex` managers on one node share the mesh, and with the default
+/// principal they share an origin too. A holder count scoped to one manager
+/// let a channel closing on one withdraw the tag the other's live channel
+/// still held; the count is on the mesh now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_manager_on_the_mesh_keeps_the_shared_origin_advertised() {
+    let node = build_node().await;
+    node.start();
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::Pinned(vec![node.node_id()])),
+    ));
+    let first = Redex::new();
+    first.enable_replication(node.clone());
+    let a = cn("repl/two-mgr-a");
+    first.open_file(&a, cfg.clone()).expect("open A");
+    let second = Redex::new();
+    second.enable_replication(node.clone());
+    let b = cn("repl/two-mgr-b");
+    second.open_file(&b, cfg).expect("open B");
+
+    let coord_a = first.replication_coordinator_for(&a).unwrap();
+    let coord_b = second.replication_coordinator_for(&b).unwrap();
+    let origin = coord_b.channel().origin_hash;
+    assert_eq!(
+        coord_a.channel().origin_hash,
+        origin,
+        "the managers share an origin"
+    );
+    wait_until(5, "the channels never settled as leaders", || {
+        coord_a.role() == ReplicaRole::Leader && coord_b.role() == ReplicaRole::Leader
+    })
+    .await;
+    drop(coord_a);
+    let self_id = node.node_id();
+    let advertised = || node.find_chain_holders(origin).contains(&self_id);
+    wait_until(5, "the shared origin was never advertised", advertised).await;
+
+    first.close_file(&a).expect("close A");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        advertised(),
+        "the first manager's close withdrew the second's tag"
+    );
+    second.close_file(&b).ok();
+}
+
+/// A channel closed and reopened at once briefly has two placement
+/// resolvers. The old one's release must not take the candidate tag away
+/// from the new one, even for a tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reopening_a_channel_never_drops_its_candidacy() {
+    let node = build_node().await;
+    node.start();
+    let redex = Redex::new();
+    redex.enable_replication(node.clone());
+    let name = cn("repl/reopen");
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_factor(1)
+            .with_heartbeat_ms(150),
+    ));
+    redex.open_file(&name, cfg.clone()).expect("open");
+    let cid = net::adapter::net::redex::ChannelId::from_name(&name);
+    let advertised = || node.advertises_replica_candidate(cid.as_bytes());
+    wait_until(5, "candidacy was never advertised", advertised).await;
+
+    redex.close_file(&name).expect("close");
+    redex.open_file(&name, cfg).expect("reopen");
+    wait_until(
+        5,
+        "the reopened channel never claimed candidacy",
+        advertised,
+    )
+    .await;
+    // The old runtime's graceful shutdown lands in this window.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    while tokio::time::Instant::now() < deadline {
+        assert!(
+            advertised(),
+            "the old runtime's release dropped the new claim"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    redex.close_file(&name).ok();
 }

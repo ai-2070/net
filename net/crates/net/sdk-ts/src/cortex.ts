@@ -48,6 +48,7 @@ import {
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
+  WriteToken,
 } from '@net-mesh/core';
 
 import type {
@@ -64,13 +65,25 @@ import type {
   WorkflowStatusCounts,
   JoinResult,
   TriggerAction,
+  NetMesh as NapiNetMesh,
+  ReplicationConfigJs,
+  GreedyConfigJs,
+  DataGravityConfigJs,
 } from '@net-mesh/core';
+
+/** Cross-node replication settings for one channel; see {@link RedexFileConfig.replication}. */
+export type ReplicationConfig = ReplicationConfigJs;
+/** Greedy-LRU dataforts settings; see {@link Redex.enableGreedyDataforts}. */
+export type GreedyConfig = GreedyConfigJs;
+/** Data-gravity settings; see {@link Redex.enableGravityForGreedy}. */
+export type DataGravityConfig = DataGravityConfigJs;
 
 // Re-export the NAPI value types so callers get them from one place.
 export {
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
+  WriteToken,
 };
 
 // Re-export NAPI type-only declarations.
@@ -107,6 +120,9 @@ export type WorkflowTaskStatus =
 // below use internally.
 export { CortexError, NetDbError } from '@net-mesh/core/errors';
 import { classifyError } from '@net-mesh/core/errors';
+
+import { napiMeshOf } from './_internal.js';
+import type { MeshNode } from './mesh.js';
 
 /**
  * Raised on `redex:` prefixed failures: append / tail / read / sync /
@@ -177,6 +193,92 @@ export class Redex {
       throw classifyWithRedex(e);
     }
   }
+
+  // ---- Replication -------------------------------------------------------
+  // `mesh` is the SDK's MeshNode or the native NetMesh.
+
+  /**
+   * Install cross-node replication rooted at `mesh`. Afterwards, files
+   * opened with `config.replication` run per-channel replication.
+   * Idempotent. Call before {@link openFile}, which otherwise rejects a
+   * replicated config.
+   */
+  enableReplication(mesh: MeshNode | NapiNetMesh): void {
+    try {
+      this.napi.enableReplication(napiMeshOf(mesh));
+    } catch (e) {
+      throw classifyWithRedex(e);
+    }
+  }
+
+  /**
+   * Undo {@link enableReplication}: shut every channel's replication down
+   * (withdrawing its chain advertisement) and release this manager's
+   * reference to the mesh. Idempotent; open files stay open as local
+   * logs. Resolves once every channel's runtime has stopped and released
+   * the node: `await` it before `node.shutdown()`, which needs the node's
+   * only reference.
+   */
+  async disableReplication(): Promise<void> {
+    await this.napi.disableReplication();
+  }
+
+  /** Per-channel replication runtimes on this manager; `0` when replication is off. */
+  replicationRuntimeCount(): number {
+    return this.napi.replicationRuntimeCount();
+  }
+
+  /** Replication metrics as Prometheus text; empty when replication is off. */
+  replicationPrometheusText(): string {
+    return this.napi.replicationPrometheusText();
+  }
+
+  // ---- Greedy dataforts --------------------------------------------------
+
+  /**
+   * Install greedy-LRU dataforts rooted at `mesh`: this node caches
+   * channels it reads and announces them. Idempotent; call
+   * {@link disableGreedyDataforts} first to reconfigure.
+   */
+  enableGreedyDataforts(mesh: MeshNode | NapiNetMesh, config?: GreedyConfig): void {
+    try {
+      this.napi.enableGreedyDataforts(napiMeshOf(mesh), config ?? null);
+    } catch (e) {
+      throw classifyWithRedex(e);
+    }
+  }
+
+  /** Uninstall greedy dataforts. Idempotent. */
+  disableGreedyDataforts(): void {
+    this.napi.disableGreedyDataforts();
+  }
+
+  /** Channels in the greedy cache; `0` when greedy is off. */
+  greedyCachedChannelCount(): number {
+    return this.napi.greedyCachedChannelCount();
+  }
+
+  /** Greedy metrics as Prometheus text; empty when greedy is off. */
+  greedyPrometheusText(): string {
+    return this.napi.greedyPrometheusText();
+  }
+
+  /**
+   * Add data-gravity heat emission to the running greedy cache. Requires
+   * {@link enableGreedyDataforts} first; rejects otherwise.
+   */
+  enableGravityForGreedy(mesh: MeshNode | NapiNetMesh, config?: DataGravityConfig): void {
+    try {
+      this.napi.enableGravityForGreedy(napiMeshOf(mesh), config ?? null);
+    } catch (e) {
+      throw classifyWithRedex(e);
+    }
+  }
+
+  /** Remove the gravity layer; greedy keeps running. Idempotent. */
+  disableGravityForGreedy(): void {
+    this.napi.disableGravityForGreedy();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -205,20 +307,29 @@ export interface RedexFileConfig {
   /** Drop entries older than this many milliseconds at the next
    *  retention sweep. */
   retentionMaxAgeMs?: bigint;
+  /** Replicate this channel across nodes. The owning `Redex` must have
+   *  called {@link Redex.enableReplication} first. Unset for a
+   *  single-node channel. */
+  replication?: ReplicationConfig;
 }
 
 function toNapiFileConfig(
   c: RedexFileConfig | undefined,
 ): RedexFileConfigJs | undefined {
   if (!c) return undefined;
-  return {
+  // Every native key, required: a field the native config gains and this
+  // mapper doesn't forward is a compile error, not a silent drop (how
+  // `replication` went missing until NODE_SDK_GAPS_PLAN.md S8).
+  const out: { [K in keyof Required<RedexFileConfigJs>]: RedexFileConfigJs[K] } = {
     persistent: c.persistent,
     fsyncEveryN: c.fsyncEveryN,
     fsyncIntervalMs: c.fsyncIntervalMs,
     retentionMaxEvents: c.retentionMaxEvents,
     retentionMaxBytes: c.retentionMaxBytes,
     retentionMaxAgeMs: c.retentionMaxAgeMs,
+    replication: c.replication,
   };
+  return out;
 }
 
 /** A materialized RedEX event. */
@@ -503,6 +614,35 @@ export class TasksAdapter {
     }
   }
 
+  /**
+   * Read-your-writes wait: resolve once this adapter's fold has applied the
+   * write `token` names, or reject after `deadlineMs`. A token from another
+   * origin, or a full wait queue, rejects at once. Pair with
+   * {@link WriteToken}: `new WriteToken(originHash, seq)`, or
+   * `WriteToken.fromString` for one carried over the wire.
+   */
+  async waitForToken(token: WriteToken, deadlineMs: number): Promise<void> {
+    try {
+      return await this.napi.waitForToken(token, deadlineMs);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Stop this adapter's fold task. Idempotent. */
+  close(): void {
+    try {
+      this.napi.close();
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Whether the fold task is still running (`false` after {@link close}). */
+  isRunning(): boolean {
+    return this.napi.isRunning();
+  }
+
   /** Snapshot query over the materialized state. */
   listTasks(filter?: TaskFilter | null): Task[] {
     try {
@@ -672,6 +812,35 @@ export class MemoriesAdapter {
     } catch (e) {
       throw classifyError(e);
     }
+  }
+
+  /**
+   * Read-your-writes wait: resolve once this adapter's fold has applied the
+   * write `token` names, or reject after `deadlineMs`. A token from another
+   * origin, or a full wait queue, rejects at once. Pair with
+   * {@link WriteToken}: `new WriteToken(originHash, seq)`, or
+   * `WriteToken.fromString` for one carried over the wire.
+   */
+  async waitForToken(token: WriteToken, deadlineMs: number): Promise<void> {
+    try {
+      return await this.napi.waitForToken(token, deadlineMs);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Stop this adapter's fold task. Idempotent. */
+  close(): void {
+    try {
+      this.napi.close();
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Whether the fold task is still running (`false` after {@link close}). */
+  isRunning(): boolean {
+    return this.napi.isRunning();
   }
 
   listMemories(filter?: MemoryFilter | null): Memory[] {
@@ -1096,3 +1265,49 @@ export class TriggerEngine {
     return this.napi.armedCount();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Compile-time guard: every native method is wrapped
+// ---------------------------------------------------------------------------
+//
+// The same check `mesh.ts` runs for MeshNode (NODE_SDK_GAPS_PLAN.md S5),
+// extended to the cortex classes in S8 after nine `Redex` methods and the
+// adapters' `close` / `isRunning` turned out to be missing. A native
+// method with no SDK member fails the build, and the error names it.
+// Each list is the native methods deliberately not wrapped by name.
+
+type NativeMethod<T> = {
+  [K in keyof T]: T[K] extends (...args: never[]) => unknown ? K : never;
+}[keyof T];
+type Unwrapped<N, S, Allowed extends PropertyKey = never> = Exclude<
+  NativeMethod<N>,
+  keyof S | Allowed
+>;
+type AllWrapped<U> = [U] extends [never] ? true : U;
+
+const everyRedexMethodIsWrapped: AllWrapped<Unwrapped<NapiRedex, Redex>> = true;
+const everyRedexFileMethodIsWrapped: AllWrapped<Unwrapped<NapiRedexFile, RedexFile>> = true;
+const everyTasksMethodIsWrapped: AllWrapped<
+  // Wrapped as `watch` / `snapshotAndWatch`.
+  Unwrapped<NapiTasksAdapter, TasksAdapter, 'watchTasks' | 'snapshotAndWatchTasks'>
+> = true;
+const everyMemoriesMethodIsWrapped: AllWrapped<
+  // Wrapped as `watch` / `snapshotAndWatch`.
+  Unwrapped<NapiMemoriesAdapter, MemoriesAdapter, 'watchMemories' | 'snapshotAndWatchMemories'>
+> = true;
+const everyNetDbMethodIsWrapped: AllWrapped<Unwrapped<NapiNetDb, NetDb>> = true;
+const everyWorkflowMethodIsWrapped: AllWrapped<Unwrapped<NapiWorkflowAdapter, WorkflowAdapter>> =
+  true;
+const everyShardGroupMethodIsWrapped: AllWrapped<Unwrapped<NapiShardGroup, ShardGroup>> = true;
+const everyTriggerEngineMethodIsWrapped: AllWrapped<Unwrapped<NapiTriggerEngine, TriggerEngine>> =
+  true;
+void [
+  everyRedexMethodIsWrapped,
+  everyRedexFileMethodIsWrapped,
+  everyTasksMethodIsWrapped,
+  everyMemoriesMethodIsWrapped,
+  everyNetDbMethodIsWrapped,
+  everyWorkflowMethodIsWrapped,
+  everyShardGroupMethodIsWrapped,
+  everyTriggerEngineMethodIsWrapped,
+];

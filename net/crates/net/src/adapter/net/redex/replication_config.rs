@@ -17,6 +17,14 @@
 
 use crate::adapter::net::behavior::placement::NodeId;
 
+/// The [`ReplicationConfig::placement_metadata`] key naming the chain a
+/// [`PlacementStrategy::ColocationStrict`] channel's replicas must hold.
+pub const COLOCATE_WITH_STRICT_METADATA_KEY: &str = "colocate-with-strict";
+
+/// The [`ReplicationConfig::placement_metadata`] key naming a chain the
+/// replicas should preferably hold.
+pub const COLOCATE_WITH_METADATA_KEY: &str = "colocate-with";
+
 /// Replication factor lower bound. `1` collapses to single-node-with-
 /// coordinator (the daemon runs but there's only one replica) — useful
 /// for testing and the brief moment between channel-open and the first
@@ -180,6 +188,18 @@ pub struct ReplicationConfig {
     /// the configured value). Default
     /// [`BACKGROUND_FRACTION_DEFAULT`].
     pub background_fraction: f32,
+    /// Placement hints for [`PlacementStrategy::Standard`] /
+    /// [`PlacementStrategy::ColocationStrict`], read by the placement
+    /// filter as the replica artifact's metadata:
+    ///
+    /// - `colocate-with` (soft) / `colocate-with-strict` (required by
+    ///   `ColocationStrict`): a chain's 16-hex origin hash; candidates
+    ///   already holding it (its `causal:` tag) are preferred / required.
+    /// - `intent`: an intent from the default intent registry; a
+    ///   candidate must satisfy it.
+    ///
+    /// Ignored by `Pinned`. Empty by default.
+    pub placement_metadata: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for ReplicationConfig {
@@ -202,7 +222,18 @@ impl ReplicationConfig {
             replication_budget_fraction: REPLICATION_BUDGET_FRACTION_DEFAULT,
             default_bandwidth_class: super::bandwidth::BandwidthClass::Foreground,
             background_fraction: BACKGROUND_FRACTION_DEFAULT,
+            placement_metadata: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Set one placement hint (see [`Self::placement_metadata`]).
+    pub fn with_placement_metadata(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.placement_metadata.insert(key.into(), value.into());
+        self
     }
 
     /// Set the replication factor. Validate via [`Self::validate`]
@@ -328,6 +359,34 @@ impl ReplicationConfig {
                 got: self.background_fraction,
             });
         }
+        if self.placement == PlacementStrategy::ColocationStrict
+            && !self
+                .placement_metadata
+                .contains_key(COLOCATE_WITH_STRICT_METADATA_KEY)
+        {
+            return Err(ReplicationConfigError::ColocationStrictWithoutChain);
+        }
+        // The colocation axis matches these against `causal:<hex>` tags
+        // byte for byte, so anything but the canonical 16 lowercase hex
+        // digits would validate yet never match: a strict channel would
+        // open and select no replicas.
+        for key in [
+            COLOCATE_WITH_METADATA_KEY,
+            COLOCATE_WITH_STRICT_METADATA_KEY,
+        ] {
+            if let Some(value) = self.placement_metadata.get(key) {
+                let canonical = value.len() == 16
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                if !canonical {
+                    return Err(ReplicationConfigError::PlacementChainInvalid {
+                        key: key.to_string(),
+                        value: value.clone(),
+                    });
+                }
+            }
+        }
         if let PlacementStrategy::Pinned(nodes) = &self.placement {
             if nodes.is_empty() {
                 return Err(ReplicationConfigError::PinnedSetEmpty);
@@ -446,11 +505,70 @@ pub enum ReplicationConfigError {
         /// The leader `NodeId` that lies outside the pinned set.
         leader: NodeId,
     },
+    /// `ColocationStrict` placement without a
+    /// `placement_metadata["colocate-with-strict"]` naming the chain
+    /// to colocate with: no candidate could ever qualify.
+    #[error("ColocationStrict placement requires placement_metadata[\"colocate-with-strict\"]")]
+    ColocationStrictWithoutChain,
+    /// A `colocate-with` / `colocate-with-strict` value isn't a chain's
+    /// origin hash in canonical form (16 lowercase hex digits).
+    #[error("placement_metadata[{key:?}] = {value:?} is not a 16-digit lowercase hex chain hash")]
+    PlacementChainInvalid {
+        /// The metadata key.
+        key: String,
+        /// The rejected value.
+        value: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colocation_chains_must_be_canonical_hex() {
+        for bad in [
+            "",
+            "ab",
+            "00000000000000AB",
+            "0x00000000000000ab",
+            "000000000000000g",
+        ] {
+            for key in [
+                COLOCATE_WITH_METADATA_KEY,
+                COLOCATE_WITH_STRICT_METADATA_KEY,
+            ] {
+                let cfg = ReplicationConfig::new()
+                    .with_placement(PlacementStrategy::ColocationStrict)
+                    .with_placement_metadata(COLOCATE_WITH_STRICT_METADATA_KEY, "00000000000000ab")
+                    .with_placement_metadata(key, bad);
+                assert!(
+                    matches!(
+                        cfg.validate(),
+                        Err(ReplicationConfigError::PlacementChainInvalid { .. })
+                    ),
+                    "{key}={bad:?} must be rejected"
+                );
+            }
+        }
+        let ok = ReplicationConfig::new()
+            .with_placement_metadata(COLOCATE_WITH_METADATA_KEY, "00c0ffee00000001");
+        assert_eq!(ok.validate(), Ok(()));
+    }
+
+    #[test]
+    fn colocation_strict_requires_a_named_chain() {
+        let bare = ReplicationConfig::new().with_placement(PlacementStrategy::ColocationStrict);
+        assert_eq!(
+            bare.validate(),
+            Err(ReplicationConfigError::ColocationStrictWithoutChain)
+        );
+        let named =
+            bare.with_placement_metadata(COLOCATE_WITH_STRICT_METADATA_KEY, "00000000000000ab");
+        assert_eq!(named.validate(), Ok(()));
+        // Standard needs no hints.
+        assert_eq!(ReplicationConfig::new().validate(), Ok(()));
+    }
 
     #[test]
     fn default_config_validates() {
@@ -472,8 +590,15 @@ mod tests {
             .with_placement(PlacementStrategy::ColocationStrict)
             .with_on_under_capacity(UnderCapacity::EvictOldest)
             .with_leader_pinned(Some(0xDEAD_BEEF))
-            .with_replication_budget_fraction(0.75);
+            .with_replication_budget_fraction(0.75)
+            .with_placement_metadata(COLOCATE_WITH_STRICT_METADATA_KEY, "00000000deadbeef");
         assert_eq!(cfg.factor, 5);
+        assert_eq!(
+            cfg.placement_metadata
+                .get(COLOCATE_WITH_STRICT_METADATA_KEY)
+                .map(String::as_str),
+            Some("00000000deadbeef")
+        );
         assert_eq!(cfg.heartbeat_ms, 250);
         assert_eq!(cfg.placement, PlacementStrategy::ColocationStrict);
         assert_eq!(cfg.on_under_capacity, UnderCapacity::EvictOldest);

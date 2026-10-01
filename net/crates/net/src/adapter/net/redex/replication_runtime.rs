@@ -279,6 +279,21 @@ pub struct RuntimeInputs {
     /// Default 0.3 via
     /// [`ReplicationConfig::background_fraction`](super::replication_config::ReplicationConfig).
     pub background_fraction: f32,
+    /// Move the channel `Idle → Replica` as soon as the runtime
+    /// starts, and arm the leader wait so the set elects a leader.
+    /// `Redex::open_file` sets it when this node is in a pinned
+    /// replica set; without it a replicated channel never left `Idle`
+    /// outside tests that drive the coordinator by hand.
+    pub bootstrap_replica: bool,
+    /// [`ReplicationConfig::leader_pinned`](super::replication_config::ReplicationConfig):
+    /// when this node is in the set and healthy, the election picks
+    /// it over the RTT ranking.
+    pub leader_pinned: Option<NodeId>,
+    /// Re-resolves the replica set every tick (`Standard` /
+    /// `ColocationStrict` placement). `None` keeps `replica_set` fixed
+    /// (`Pinned`). With a resolver, `replica_set` is only the starting
+    /// value.
+    pub replica_resolver: Option<Arc<dyn super::replication_placement::ReplicaSetResolver>>,
 }
 
 /// Handle the spawned task produces. Holds the inbox sender so
@@ -654,6 +669,31 @@ struct RuntimeState {
     budget: Arc<Mutex<BandwidthBudget>>,
     backoff: Arc<Mutex<CatchupBackoff>>,
     outstanding: Arc<Mutex<OutstandingRequests>>,
+    /// Present when a [`RuntimeInputs::replica_resolver`] drives the
+    /// replica set; `None` keeps `inputs.replica_set`.
+    placement: Option<PlacementState>,
+}
+
+/// The resolver-driven half of the runtime state.
+struct PlacementState {
+    /// The replica set as last resolved.
+    set: Mutex<Vec<NodeId>>,
+    /// When `set` last changed; a short set joins only once it has
+    /// been stable for the resolver's settle window.
+    set_since: Mutex<tokio::time::Instant>,
+    /// Set once this node withdrew under disk pressure: it stays out
+    /// (no candidacy, no re-bootstrap) instead of being re-selected on
+    /// the next tick.
+    withdrawn: AtomicBool,
+}
+
+/// The replica set in effect: the resolved one when placement is
+/// dynamic, else the configured one.
+fn current_replica_set(inputs: &RuntimeInputs, state: &RuntimeState) -> Vec<NodeId> {
+    match &state.placement {
+        Some(p) => p.set.lock().clone(),
+        None => inputs.replica_set.clone(),
+    }
 }
 
 /// Priority-lane inbox capacity. Smaller than the standard lane
@@ -703,6 +743,11 @@ pub fn spawn_replication_runtime(
         budget,
         backoff: Arc::new(Mutex::new(CatchupBackoff::new())),
         outstanding: Arc::new(Mutex::new(OutstandingRequests::new())),
+        placement: inputs.replica_resolver.as_ref().map(|_| PlacementState {
+            set: Mutex::new(inputs.replica_set.clone()),
+            set_since: Mutex::new(tokio::time::Instant::now()),
+            withdrawn: AtomicBool::new(false),
+        }),
     };
     let (tx, rx) = mpsc::channel::<Inbound>(RUNTIME_INBOX_CAPACITY);
     let (priority_tx, priority_rx) = mpsc::channel::<Inbound>(RUNTIME_PRIORITY_INBOX_CAPACITY);
@@ -743,6 +788,10 @@ async fn run(
     // initial state has had a chance to settle.
     interval.tick().await;
 
+    if inputs.bootstrap_replica && coordinator.role() == ReplicaRole::Idle {
+        bootstrap_replica(&coordinator, &state.tracker).await;
+    }
+
     loop {
         // `biased;` makes tokio::select poll branches top-to-
         // bottom rather than randomly. Priority lane is checked
@@ -755,12 +804,16 @@ async fn run(
             event = priority_inbox.recv() => {
                 match event {
                     Some(Inbound::Shutdown) | None => {
+                        if let Some(resolver) = &inputs.replica_resolver {
+                            resolver.withdraw_candidate().await;
+                        }
                         let _ = coordinator
                             .transition_to(
                                 ReplicaRole::Idle,
                                 super::replication_state::TransitionSignal::ChannelClose,
                             )
                             .await;
+                        retry_withdraw_on_exit(&coordinator).await;
                         return;
                     }
                     Some(event) => {
@@ -778,12 +831,16 @@ async fn run(
                         // a None here means the low-priority sender
                         // dropped (caller closed the handle without
                         // calling cancel). Treat as graceful exit.
+                        if let Some(resolver) = &inputs.replica_resolver {
+                            resolver.withdraw_candidate().await;
+                        }
                         let _ = coordinator
                             .transition_to(
                                 ReplicaRole::Idle,
                                 super::replication_state::TransitionSignal::ChannelClose,
                             )
                             .await;
+                        retry_withdraw_on_exit(&coordinator).await;
                         return;
                     }
                     Some(event) => {
@@ -856,6 +913,165 @@ fn observe_lag(
 /// (30 s). Under role thrash or rapid leader churn, the soft-cap
 /// GC then evicted entries from OTHER leaders to make room — the
 /// documented invariant on `OutstandingRequests::clear_leader`.
+/// The runtime is exiting: no later tick will retry a withdraw that just
+/// failed, so give it a few bounded attempts here. A withdraw that still
+/// fails leaves the tag until this node's announcement expires.
+async fn retry_withdraw_on_exit(coordinator: &Arc<ReplicationCoordinator>) {
+    for _ in 0..3 {
+        if !coordinator.advertisement_is_stale() {
+            return;
+        }
+        coordinator.reconcile_advertisement().await;
+        if !coordinator.advertisement_is_stale() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tracing::warn!("replication: chain withdraw still failing at runtime exit");
+}
+
+/// The per-tick placement step for resolver-driven channels. Re-resolves
+/// the replica set, then moves this node in or out of it: selected while
+/// `Idle` → bootstrap to `Replica`; not selected while participating →
+/// `Idle` (`PlacementDeselected`, which withdraws the chain
+/// advertisement). Keeps the candidacy advertised unless the node
+/// withdrew under disk pressure.
+///
+/// Returns `false` when the node was deselected this tick, so the
+/// caller skips the rest of the tick.
+async fn resolve_placement(
+    inputs: &RuntimeInputs,
+    coordinator: &Arc<ReplicationCoordinator>,
+    state: &RuntimeState,
+) -> bool {
+    let (Some(placement), Some(resolver)) = (&state.placement, &inputs.replica_resolver) else {
+        return true;
+    };
+    if placement.withdrawn.load(AtomicOrdering::Acquire) {
+        return true;
+    }
+    resolver.ensure_candidate().await;
+    let resolved = resolver.resolve();
+    let selected = resolved.contains(&inputs.self_node_id);
+    let full = resolved.len() >= resolver.factor();
+    let now = tokio::time::Instant::now();
+    let mut leader_left = false;
+    let stable_for = {
+        let mut set = placement.set.lock();
+        let mut since = placement.set_since.lock();
+        if *set != resolved {
+            tracing::debug!(
+                channel = ?inputs.channel_id,
+                from = ?*set,
+                to = ?resolved,
+                "replication: replica set re-resolved"
+            );
+            *set = resolved;
+            *since = now;
+            leader_left = state
+                .tracker
+                .lock()
+                .believed_leader()
+                .is_some_and(|leader| !set.contains(&leader));
+        }
+        now.saturating_duration_since(*since)
+    };
+    if leader_left {
+        // A believed leader that left the set no longer leads us: its
+        // frames are now dropped at the gate, so catch-up requests to it
+        // would stall until the missed-heartbeat window ran out. Forget
+        // it, and its outstanding request tokens (left behind, repeated
+        // set changes would crowd out valid catch-up requests), then wait
+        // for, or elect, the set's leader.
+        clear_leader_belief_and_tokens(&state.tracker, &state.outstanding);
+        if coordinator.role() == ReplicaRole::Replica {
+            state.tracker.lock().arm_leader_wait(now.into_std());
+        }
+    }
+    let role = coordinator.role();
+    if selected && role == ReplicaRole::Idle && (full || stable_for >= resolver.settle_window()) {
+        bootstrap_replica(coordinator, &state.tracker).await;
+    } else if !selected && role != ReplicaRole::Idle {
+        if let Err(e) = coordinator
+            .transition_to(
+                ReplicaRole::Idle,
+                super::replication_state::TransitionSignal::PlacementDeselected,
+            )
+            .await
+        {
+            tracing::warn!(error = ?e, "replication: placement deselection transition failed");
+        }
+        clear_leader_belief_and_tokens(&state.tracker, &state.outstanding);
+        return false;
+    }
+    true
+}
+
+/// Move a freshly opened channel `Idle → Replica` and arm the leader
+/// wait. The runtime's start-up half of the lifecycle in
+/// `CONFIG_REPLICATION.md` ("pinned set selects this node"); the
+/// leader wait then carries the set through `Candidate` to an
+/// elected leader. A transition rejected because the role moved
+/// meanwhile (a concurrent close, or a caller driving the coordinator
+/// by hand) is left alone.
+async fn bootstrap_replica(
+    coordinator: &Arc<ReplicationCoordinator>,
+    tracker: &Arc<Mutex<HeartbeatTracker>>,
+) {
+    let result = coordinator
+        .transition_to(
+            ReplicaRole::Replica,
+            super::replication_state::TransitionSignal::CapabilitySelected,
+        )
+        .await;
+    match result {
+        Ok(_) | Err(CoordinatorError::TagSink(_)) => {
+            // TagSink: the role moved; only the chain announcement
+            // failed (the coordinator counts the divergence).
+            tracker
+                .lock()
+                .arm_leader_wait(tokio::time::Instant::now().into_std());
+        }
+        Err(CoordinatorError::Transition(e)) => {
+            tracing::debug!(error = ?e, "replication: bootstrap skipped; role already moved");
+            // A caller moved it to Replica first (driving the
+            // coordinator by hand): still arm the wait, or a replica
+            // set with no leader yet never elects one.
+            if coordinator.role() == ReplicaRole::Replica {
+                tracker
+                    .lock()
+                    .arm_leader_wait(tokio::time::Instant::now().into_std());
+            }
+        }
+    }
+}
+
+/// The election outcome `leader_pinned` dictates, if it applies: the
+/// pinned node is in the replica set and healthy. `None` falls back
+/// to the RTT-ranked [`election_outcome`].
+fn pinned_leader_outcome(
+    self_node_id: NodeId,
+    replica_set: &[NodeId],
+    leader_pinned: Option<NodeId>,
+    is_healthy: impl Fn(NodeId) -> bool,
+) -> Option<super::replication_step::PendingTransition> {
+    let leader = leader_pinned?;
+    if !replica_set.contains(&leader) || !is_healthy(leader) {
+        return None;
+    }
+    Some(if leader == self_node_id {
+        super::replication_step::PendingTransition {
+            target: ReplicaRole::Leader,
+            signal: super::replication_state::TransitionSignal::ElectionWon,
+        }
+    } else {
+        super::replication_step::PendingTransition {
+            target: ReplicaRole::Replica,
+            signal: super::replication_state::TransitionSignal::ElectionLost,
+        }
+    })
+}
+
 fn clear_leader_belief_and_tokens(
     tracker: &Arc<Mutex<HeartbeatTracker>>,
     outstanding: &Arc<Mutex<OutstandingRequests>>,
@@ -890,6 +1106,7 @@ async fn on_tick(
         budget: _,
         backoff,
         outstanding,
+        placement: _,
     } = state;
     // Source `now` from tokio's clock so the silence-detection
     // pass inside the tracker tick honors tokio::time::pause() in
@@ -897,6 +1114,12 @@ async fn on_tick(
     // drives this on_tick call. Pre-fix std::Instant::now() kept
     // moving while virtual time was paused.
     let now = tokio::time::Instant::now().into_std();
+    if !resolve_placement(inputs, coordinator, state).await {
+        // Deselected this tick: the node is `Idle` now and has nothing
+        // to emit.
+        return;
+    }
+    let replica_set = current_replica_set(inputs, state);
     // Drop CatchupBackoff entries whose backoff window expired
     // more than a cap ago — protects the map from unbounded
     // growth under leader churn (a demoted leader's entry has
@@ -947,6 +1170,9 @@ async fn on_tick(
         tail_seq
     };
     coordinator.record_tail_seq(advertised_tail);
+    // After the tail refresh, so a retried announce carries the current
+    // tip, not the one cached when the original transition failed.
+    coordinator.reconcile_advertisement().await;
     let wall_clock_ms = (inputs.wall_clock_provider)();
     // R-10: capture `current_role` inside the same critical
     // section that holds the tracker lock so a concurrent
@@ -969,20 +1195,14 @@ async fn on_tick(
             current_role,
             channel_id: inputs.channel_id,
             tail_seq,
-            replica_set: &inputs.replica_set,
+            replica_set: &replica_set,
             tracker: &t,
             wall_clock_ms,
             chunk_max_bytes: SYNC_REQUEST_CHUNK_MAX_DEFAULT,
             now,
             default_bandwidth_class: inputs.default_bandwidth_class,
         });
-        let lag = observe_lag(
-            current_role,
-            &inputs.replica_set,
-            inputs.self_node_id,
-            &t,
-            now,
-        );
+        let lag = observe_lag(current_role, &replica_set, inputs.self_node_id, &t, now);
         (outcome, lag)
     };
     // Record lag gauges off the tracker lock.
@@ -1061,12 +1281,21 @@ async fn on_tick(
             // so self never appears in `healthy_peers` directly.
             // Include self explicitly so the election filter
             // doesn't accidentally exclude us.
-            let elect = election_outcome(
+            let is_healthy = |peer| peer == inputs.self_node_id || healthy.contains(&peer);
+            let elect = pinned_leader_outcome(
                 inputs.self_node_id,
-                &inputs.replica_set,
-                inputs.rtt_lookup.as_ref(),
-                |peer| peer == inputs.self_node_id || healthy.contains(&peer),
-            );
+                &replica_set,
+                inputs.leader_pinned,
+                is_healthy,
+            )
+            .or_else(|| {
+                election_outcome(
+                    inputs.self_node_id,
+                    &replica_set,
+                    inputs.rtt_lookup.as_ref(),
+                    is_healthy,
+                )
+            });
             if let Some(pt) = elect {
                 match coordinator.transition_to(pt.target, pt.signal).await {
                     Ok(_) => {
@@ -1077,6 +1306,12 @@ async fn on_tick(
                         // the believed leader would leave the
                         // coordinator with no recovery signal.
                         clear_leader_belief_and_tokens(tracker, outstanding);
+                        // Lost: wait for the winner's heartbeats, and
+                        // re-elect if they never come (the winner may
+                        // be down or may itself have conceded).
+                        if pt.target == ReplicaRole::Replica {
+                            tracker.lock().arm_leader_wait(now);
+                        }
                     }
                     Err(CoordinatorError::TagSink(e)) => {
                         // State moved to the target (Leader /
@@ -1129,6 +1364,7 @@ async fn on_inbound(
         budget,
         backoff,
         outstanding,
+        placement: _,
     } = state;
     // Peer-auth gate. Every inbound replication message must come
     // from a peer in the channel's configured replica_set; any
@@ -1151,7 +1387,7 @@ async fn on_inbound(
         Inbound::SyncNack { from, .. } => Some(*from),
     };
     if let Some(from) = from_node {
-        if !inputs.replica_set.contains(&from) {
+        if !current_replica_set(inputs, state).contains(&from) {
             tracing::trace!(
                 from = from,
                 channel = ?inputs.channel_id,
@@ -1514,7 +1750,22 @@ async fn on_inbound(
                     // at the 3 GB hard cap, or a disk write fail
                     // on the persistent tier). Consult the
                     // configured `UnderCapacity` policy and react.
-                    handle_disk_pressure(coordinator, &inputs.file, &detail, from).await;
+                    let withdrew =
+                        handle_disk_pressure(coordinator, &inputs.file, &detail, from).await;
+                    // Under `Withdraw` the node left its role; with
+                    // dynamic placement it must also leave the
+                    // candidate pool, or the next tick re-selects it
+                    // and the peers' re-selection never happens. Only
+                    // on an actual withdraw: `EvictOldest`, or a role
+                    // that was already Idle, must not opt the node out.
+                    if withdrew {
+                        if let (Some(p), Some(resolver)) =
+                            (&state.placement, &inputs.replica_resolver)
+                        {
+                            p.withdrawn.store(true, AtomicOrdering::Release);
+                            resolver.withdraw_candidate().await;
+                        }
+                    }
                 }
                 Err(super::replication_catchup::ApplyError::GapBeforeChunk {
                     first_seq,
@@ -1763,12 +2014,15 @@ async fn on_inbound(
 ///   no retention caps are configured the sweep is a no-op and
 ///   the next apply will fail again — operators who pick this
 ///   policy should pair it with `retention_max_*` settings.
+///
+/// Returns `true` when this call withdrew the role (`Withdraw` policy,
+/// from a participating role, transition accepted).
 async fn handle_disk_pressure(
     coordinator: &Arc<ReplicationCoordinator>,
     file: &super::file::RedexFile,
     detail: &str,
     from: NodeId,
-) {
+) -> bool {
     use super::replication_config::UnderCapacity;
     coordinator.metrics().incr_under_capacity();
     let policy = coordinator.config().on_under_capacity;
@@ -1785,6 +2039,7 @@ async fn handle_disk_pressure(
             // withdraw, pick the signal that's actually valid for
             // the current role so we don't silently log+drop the
             // transition and keep writing through pressure.
+            let was_idle = coordinator.role() == ReplicaRole::Idle;
             let signal = match coordinator.role() {
                 ReplicaRole::Replica => {
                     super::replication_state::TransitionSignal::DiskPressureWithdraw
@@ -1806,11 +2061,17 @@ async fn handle_disk_pressure(
                     super::replication_state::TransitionSignal::CandidateDiskPressureWithdraw
                 }
             };
-            if let Err(e) = coordinator.transition_to(ReplicaRole::Idle, signal).await {
-                tracing::warn!(
-                    error=?e,
-                    "replication: disk-pressure withdraw transition failed"
-                );
+            match coordinator.transition_to(ReplicaRole::Idle, signal).await {
+                // TagSink: the role did move; only the withdraw
+                // advertisement failed (retried by reconcile).
+                Ok(_) | Err(CoordinatorError::TagSink(_)) => !was_idle,
+                Err(e) => {
+                    tracing::warn!(
+                        error=?e,
+                        "replication: disk-pressure withdraw transition failed"
+                    );
+                    false
+                }
             }
         }
         UnderCapacity::EvictOldest => {
@@ -1820,6 +2081,7 @@ async fn handle_disk_pressure(
                 "replication: disk pressure → sweeping retention"
             );
             file.sweep_retention();
+            false
         }
     }
 }
@@ -2009,6 +2271,9 @@ mod tests {
             file: build_file_for_tests(),
             default_bandwidth_class: Default::default(),
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
+            replica_resolver: None,
         }
     }
 
@@ -2054,6 +2319,7 @@ mod tests {
             budget,
             backoff: Arc::new(Mutex::new(CatchupBackoff::new())),
             outstanding: Arc::new(Mutex::new(OutstandingRequests::new())),
+            placement: None,
         }
     }
 
@@ -2413,6 +2679,90 @@ mod tests {
         handle.cancel().await;
     }
 
+    /// A resolver returning a fixed set, for the placement step.
+    struct FixedResolver {
+        set: Vec<NodeId>,
+        factor: usize,
+        settle: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::replication_placement::ReplicaSetResolver for FixedResolver {
+        fn resolve(&self) -> Vec<NodeId> {
+            self.set.clone()
+        }
+        fn factor(&self) -> usize {
+            self.factor
+        }
+        fn settle_window(&self) -> Duration {
+            self.settle
+        }
+        async fn ensure_candidate(&self) {}
+        async fn withdraw_candidate(&self) {}
+    }
+
+    async fn role_after(resolver: FixedResolver, wait: Duration) -> ReplicaRole {
+        let mut inputs = build_inputs(0x10, Vec::new(), 100);
+        inputs.replica_resolver = Some(Arc::new(resolver));
+        let (coordinator, _registry) = build_coordinator(0x10, Vec::new());
+        let dispatcher = Arc::new(RecorderDispatcher::default());
+        let handle =
+            spawn_replication_runtime(inputs, coordinator.clone(), dispatcher, build_budget());
+        tokio::time::sleep(wait).await;
+        let role = coordinator.role();
+        handle.cancel().await;
+        role
+    }
+
+    /// A short set (fewer than `factor`) waits out the settle window
+    /// before joining: the missing candidates may just not have been
+    /// heard yet, and joining at once makes a leader of one beside
+    /// another elsewhere.
+    #[tokio::test]
+    async fn a_short_resolved_set_joins_only_after_it_settles() {
+        let short = || FixedResolver {
+            set: vec![0x10],
+            factor: 2,
+            settle: Duration::from_millis(600),
+        };
+        assert_eq!(
+            role_after(short(), Duration::from_millis(300)).await,
+            ReplicaRole::Idle
+        );
+        assert_ne!(
+            role_after(short(), Duration::from_millis(1000)).await,
+            ReplicaRole::Idle
+        );
+    }
+
+    /// A full set joins on the first tick.
+    #[tokio::test]
+    async fn a_full_resolved_set_joins_at_once() {
+        let full = FixedResolver {
+            set: vec![0x10, 0x20],
+            factor: 2,
+            settle: Duration::from_secs(60),
+        };
+        assert_ne!(
+            role_after(full, Duration::from_millis(300)).await,
+            ReplicaRole::Idle
+        );
+    }
+
+    /// Not selected: never joins, however long the set is stable.
+    #[tokio::test]
+    async fn an_unselected_node_stays_idle() {
+        let other = FixedResolver {
+            set: vec![0x20, 0x30],
+            factor: 2,
+            settle: Duration::ZERO,
+        };
+        assert_eq!(
+            role_after(other, Duration::from_millis(400)).await,
+            ReplicaRole::Idle
+        );
+    }
+
     #[tokio::test]
     async fn shutdown_drives_idle_transition() {
         let inputs = build_inputs(0x10, vec![0x10, 0x20], 100);
@@ -2469,6 +2819,9 @@ mod tests {
             file: build_file_for_tests(),
             default_bandwidth_class: Default::default(),
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
+            replica_resolver: None,
         };
         let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
         // Promote to Leader via the state machine.
@@ -2542,6 +2895,9 @@ mod tests {
             file: build_file_for_tests(),
             default_bandwidth_class: Default::default(),
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
+            replica_resolver: None,
         };
         let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
         for (role, signal) in [
@@ -2645,6 +3001,7 @@ mod tests {
                 budget: budget.clone(),
                 backoff: backoff.clone(),
                 outstanding: outstanding.clone(),
+                placement: None,
             },
             event,
         )
@@ -2683,6 +3040,7 @@ mod tests {
                     budget: budget.clone(),
                     backoff: backoff.clone(),
                     outstanding: outstanding.clone(),
+                    placement: None,
                 },
                 event,
             )
@@ -3606,6 +3964,7 @@ mod tests {
                 budget: budget.clone(),
                 backoff: build_backoff(),
                 outstanding: outstanding.clone(),
+                placement: None,
             },
             event,
         )
@@ -3674,6 +4033,7 @@ mod tests {
                 budget: budget.clone(),
                 backoff: build_backoff(),
                 outstanding: outstanding.clone(),
+                placement: None,
             },
             event,
         )
@@ -3801,6 +4161,9 @@ mod tests {
             // Non-default class — must round-trip onto the wire.
             default_bandwidth_class: BandwidthClass::Background,
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
+            replica_resolver: None,
         };
         let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, leader_id]);
         coordinator
@@ -3876,6 +4239,9 @@ mod tests {
             file: build_file_for_tests(),
             default_bandwidth_class: BandwidthClass::Foreground,
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
+            replica_resolver: None,
         };
         let cid = inputs.channel_id;
         let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
@@ -3968,6 +4334,9 @@ mod tests {
             file: build_file_for_tests(),
             default_bandwidth_class: BandwidthClass::Foreground,
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
+            replica_resolver: None,
         };
         let cid = inputs.channel_id;
         let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);

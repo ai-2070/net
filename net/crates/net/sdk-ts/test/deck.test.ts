@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const napi = require('@net-mesh/core') as { DeckClient?: { new?: unknown } };
-import { DeckClient } from '../src/deck';
+// Through the public root, not '../src/deck': importing the module directly is
+// how this test stayed green while deck was unreachable from the package.
+import { DeckClient } from '../src/index';
 
 // The napi binding exposes `DeckClient.new` only when the
 // compiled `.node` file is in sync with the SDK's `index.d.ts`

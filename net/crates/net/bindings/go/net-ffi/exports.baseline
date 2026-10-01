@@ -4,7 +4,8 @@
 # generated-at: 9f01c24cea6645516ba6ed11f2a91654a0360a01
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi --features net-ffi/test-helpers
-# count: 587
+# count: 588
+# edited: net_redex_disable_replication added by hand (intended C-ABI addition, PR #1138)
 net_blob_adapter_registered
 net_blob_free_buffer
 net_blob_publish
@@ -425,6 +426,7 @@ net_predicate_redact_trace_metadata_keys
 net_predicate_to_where_header
 net_redex_disable_gravity_for_greedy
 net_redex_disable_greedy_dataforts
+net_redex_disable_replication
 net_redex_enable_gravity_for_greedy
 net_redex_enable_greedy_dataforts
 net_redex_enable_replication

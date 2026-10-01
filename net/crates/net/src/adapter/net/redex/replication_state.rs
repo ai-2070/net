@@ -73,6 +73,11 @@ pub enum TransitionSignal {
     /// partition-heal converges to one leader rather than leaving
     /// both partitions claiming authority indefinitely.
     PeerLeaderObserved,
+    /// Replica-set re-resolution (`Standard` / `ColocationStrict`
+    /// placement) no longer selects this node. Valid from `Replica`,
+    /// `Candidate` and `Leader` to `Idle`; withdraws the chain
+    /// advertisement like every `* → Idle` transition.
+    PlacementDeselected,
 }
 
 /// Result of validating + applying a state transition.
@@ -172,6 +177,10 @@ impl StateTransition {
                 ReplicaRole::Leader,
                 ReplicaRole::Replica,
                 TransitionSignal::PeerLeaderObserved,
+            ) | (
+                ReplicaRole::Replica | ReplicaRole::Candidate | ReplicaRole::Leader,
+                ReplicaRole::Idle,
+                TransitionSignal::PlacementDeselected,
             )
         );
         if !permitted {
@@ -209,6 +218,35 @@ fn pair_is_valid_for_some_signal(from: ReplicaRole, to: ReplicaRole) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_deselected_takes_any_participating_role_to_idle() {
+        for from in [
+            ReplicaRole::Replica,
+            ReplicaRole::Candidate,
+            ReplicaRole::Leader,
+        ] {
+            StateTransition::apply(
+                from,
+                ReplicaRole::Idle,
+                TransitionSignal::PlacementDeselected,
+            )
+            .unwrap_or_else(|e| panic!("{from:?} -> Idle: {e:?}"));
+        }
+        // Only to Idle, and not from Idle.
+        assert!(StateTransition::apply(
+            ReplicaRole::Idle,
+            ReplicaRole::Idle,
+            TransitionSignal::PlacementDeselected
+        )
+        .is_err());
+        assert!(StateTransition::apply(
+            ReplicaRole::Leader,
+            ReplicaRole::Replica,
+            TransitionSignal::PlacementDeselected
+        )
+        .is_err());
+    }
 
     #[test]
     fn idle_to_replica_via_capability_selected() {
@@ -422,7 +460,7 @@ mod tests {
             ReplicaRole::Candidate,
             ReplicaRole::Idle,
         ];
-        const SIGNALS: [TransitionSignal; 7] = [
+        const SIGNALS: [TransitionSignal; 8] = [
             TransitionSignal::CapabilitySelected,
             TransitionSignal::MissedHeartbeats,
             TransitionSignal::ElectionWon,
@@ -430,6 +468,7 @@ mod tests {
             TransitionSignal::GracefulRelinquish,
             TransitionSignal::DiskPressureWithdraw,
             TransitionSignal::ChannelClose,
+            TransitionSignal::PlacementDeselected,
         ];
 
         let mut valid_pairs = 0;
@@ -449,9 +488,11 @@ mod tests {
                     // pair. The base specific-signal pair (e.g.
                     // Leader→Idle via GracefulRelinquish,
                     // Replica→Idle via DiskPressureWithdraw) adds
-                    // another for some from-states. Cap is 2.
+                    // another for some from-states, and
+                    // PlacementDeselected one more for every
+                    // participating role. Cap is 3.
                     assert!(
-                        signal_hits <= 2,
+                        signal_hits <= 3,
                         "{from:?} → Idle has too many valid signals: {signal_hits}",
                     );
                 } else {

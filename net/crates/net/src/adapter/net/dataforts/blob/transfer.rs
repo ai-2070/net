@@ -637,9 +637,15 @@ async fn serve_chunk(
     // session that owned this stream is gone, which reclaimed the
     // stream with it, and the successor's streams are not ours to
     // close.
-    let _ = mesh
-        .close_stream_graceful_handle(&stream, TRANSFER_TIMEOUT)
-        .await;
+    //
+    // Hold the node only WEAKLY across that wait. The drain can take up to
+    // `TRANSFER_TIMEOUT`; holding the `Arc` pinned the serving node for the
+    // whole of it (~7 s after a typical transfer), and the Node binding's
+    // `shutdown`, which needs sole ownership, refused with "outstanding
+    // references" until it ended.
+    let node = Arc::downgrade(&mesh);
+    drop(mesh);
+    let _ = MeshNode::close_stream_graceful_handle_weak(&node, &stream, TRANSFER_TIMEOUT).await;
 }
 
 fn postcard_event<T: Serialize>(value: &T) -> Bytes {

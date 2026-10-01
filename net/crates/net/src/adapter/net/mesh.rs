@@ -13195,6 +13195,30 @@ pub struct MeshNode {
     /// review Findings 8 + 11). Held only across the sync build, never
     /// across the peer broadcast.
     announce_mu: parking_lot::Mutex<()>,
+    /// Serializes the read-modify-write announce helpers
+    /// (`announce_chain` / `withdraw_chain`, the heat helpers, the
+    /// replica-candidate helpers): each reads the user-caps baseline,
+    /// edits one tag family and re-announces. Two of them interleaving
+    /// (e.g. two channels' replication runtimes) would each write back a
+    /// baseline missing the other's tag. Held across the announce, so
+    /// it is async; `announce_mu` alone is released before the edit.
+    baseline_rmw: tokio::sync::Mutex<()>,
+    /// Who currently claims each `causal:<origin>` advertisement made
+    /// through [`Self::announce_chain_held`]: origin → holder ids (one
+    /// per replication runtime). Mesh-scoped because the tag is: two
+    /// `Redex` managers, or two wiring generations across a quick
+    /// disable / re-enable, share an origin, and a per-manager count let
+    /// one withdraw the other's live tag. Held across the mesh call so an
+    /// announce can't land between a withdraw's holder check and its
+    /// effect.
+    chain_holders:
+        tokio::sync::Mutex<std::collections::HashMap<u64, std::collections::HashSet<u64>>>,
+    /// Who currently claims each channel's replica-candidate tag: channel
+    /// id → holder ids (one per placement resolver). A channel closed and
+    /// reopened at once has two resolvers for a moment; the old one's
+    /// release must not remove the tag the new one still needs.
+    replica_candidate_holders:
+        parking_lot::Mutex<std::collections::HashMap<[u8; 32], std::collections::HashSet<u64>>>,
     /// Local-origin capability change signal (RT-2). The generation
     /// bumps whenever THIS node's announced surface changes — a
     /// `serve_tool` register/unregister or an nRPC service
@@ -13747,6 +13771,20 @@ fn ingest_announcement_with_owner_projection(
             owner,
         );
     }
+}
+
+/// Outcome of [`MeshNode::release_replica_candidate_sync`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateRelease {
+    /// Another resolver still claims the channel; the tag stays.
+    StillClaimed,
+    /// The tag was removed from the baseline; re-announce to publish it.
+    Removed,
+    /// The tag wasn't in the baseline (withdrawn already, or never sent).
+    NotAdvertised,
+    /// The announce lock couldn't be taken in time; the tag is still in
+    /// the baseline and needs an async withdraw.
+    LockUnavailable,
 }
 
 impl MeshNode {
@@ -15016,6 +15054,9 @@ impl MeshNode {
             seen_announcements: Arc::new(DashMap::new()),
             relay_announcements: Arc::new(DashMap::new()),
             announce_mu: parking_lot::Mutex::new(()),
+            baseline_rmw: tokio::sync::Mutex::new(()),
+            chain_holders: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            replica_candidate_holders: parking_lot::Mutex::new(std::collections::HashMap::new()),
             announce_gate: Arc::new(parking_lot::Mutex::new(AnnounceGate {
                 last_broadcast_at: None,
                 deferred_scheduled: false,
@@ -45879,6 +45920,7 @@ impl MeshNode {
     pub async fn announce_chain(&self, origin_hash: u64, tip_seq: u64) -> Result<(), AdapterError> {
         let hex = Self::chain_hex(origin_hash);
         let replacement = Tag::parse(&format!("causal:{hex}:{tip_seq}")).ok();
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_causal_tags(&mut snapshot, origin_hash, replacement);
         self.announce_capabilities(snapshot).await
@@ -45904,6 +45946,7 @@ impl MeshNode {
         }
         let hex = Self::chain_hex(origin_hash);
         let replacement = Tag::parse(&format!("causal:{hex}[{start_seq}..{end_seq}]")).ok();
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_causal_tags(&mut snapshot, origin_hash, replacement);
         self.announce_capabilities(snapshot).await
@@ -45914,9 +45957,228 @@ impl MeshNode {
     /// converge to the same view (the chain tag absent from the
     /// announced set).
     pub async fn withdraw_chain(&self, origin_hash: u64) -> Result<(), AdapterError> {
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_causal_tags(&mut snapshot, origin_hash, None);
         self.announce_capabilities(snapshot).await
+    }
+
+    /// The reserved tag a node carries while it is a replica candidate
+    /// for a replicated channel: `dataforts:replica-candidate:<id>`,
+    /// `<id>` the channel id's 64 lowercase hex digits. A substrate-owned
+    /// body under the existing `dataforts:` reserved prefix.
+    pub(crate) fn replica_candidate_tag(channel_id: &[u8; 32]) -> String {
+        let mut s = String::with_capacity(28 + 64);
+        s.push_str("dataforts:replica-candidate:");
+        for b in channel_id {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    /// The origin-side capability-announce rate limit: changes inside
+    /// one window coalesce into a trailing flush at its end, so a peer
+    /// can see a change up to one window late.
+    pub fn min_announce_interval(&self) -> Duration {
+        self.config.min_announce_interval
+    }
+
+    /// Whether this node's announced capabilities carry the replica-
+    /// candidate tag for `channel_id`.
+    pub fn advertises_replica_candidate(&self, channel_id: &[u8; 32]) -> bool {
+        let tag = Self::replica_candidate_tag(channel_id);
+        self.user_caps_snapshot()
+            .tags
+            .iter()
+            .any(|t| t.to_string() == tag)
+    }
+
+    /// Advertise this node as a replica candidate for `channel_id` and
+    /// re-broadcast. Idempotent. `Standard` / `ColocationStrict`
+    /// replica placement draws its candidate pool from these tags.
+    pub async fn announce_replica_candidate(
+        &self,
+        channel_id: &[u8; 32],
+    ) -> Result<(), AdapterError> {
+        let Ok(tag) = Tag::parse(&Self::replica_candidate_tag(channel_id)) else {
+            return Err(AdapterError::Fatal(
+                "replica-candidate tag failed to parse".into(),
+            ));
+        };
+        let _rmw = self.baseline_rmw.lock().await;
+        let mut snapshot = self.user_caps_snapshot();
+        if snapshot.tags.contains(&tag) {
+            return Ok(());
+        }
+        snapshot.tags.insert(tag);
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// Stop advertising this node as a replica candidate for
+    /// `channel_id` and re-broadcast. Idempotent.
+    pub async fn withdraw_replica_candidate(
+        &self,
+        channel_id: &[u8; 32],
+    ) -> Result<(), AdapterError> {
+        let tag = Self::replica_candidate_tag(channel_id);
+        let _rmw = self.baseline_rmw.lock().await;
+        let mut snapshot = self.user_caps_snapshot();
+        let before = snapshot.tags.len();
+        snapshot.tags.retain(|t| t.to_string() != tag);
+        if snapshot.tags.len() == before {
+            return Ok(());
+        }
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// [`Self::announce_chain`] on behalf of `holder` (one replication
+    /// runtime), recording it as a claimant of `origin_hash`'s tag.
+    pub(crate) async fn announce_chain_held(
+        &self,
+        holder: u64,
+        origin_hash: u64,
+        tip_seq: u64,
+    ) -> Result<(), AdapterError> {
+        let mut holders = self.chain_holders.lock().await;
+        holders.entry(origin_hash).or_default().insert(holder);
+        self.announce_chain(origin_hash, tip_seq).await
+    }
+
+    /// Drop `holder`'s claim on `origin_hash`'s tag, and withdraw the tag
+    /// only if no other holder still claims it.
+    pub(crate) async fn withdraw_chain_held(
+        &self,
+        holder: u64,
+        origin_hash: u64,
+    ) -> Result<(), AdapterError> {
+        let mut holders = self.chain_holders.lock().await;
+        if let Some(set) = holders.get_mut(&origin_hash) {
+            set.remove(&holder);
+            if !set.is_empty() {
+                return Ok(());
+            }
+            holders.remove(&origin_hash);
+        }
+        self.withdraw_chain(origin_hash).await
+    }
+
+    /// Claim `channel_id`'s replica-candidate tag for `holder` (one
+    /// placement resolver) and make sure it's advertised. Cheap when it
+    /// already is.
+    pub(crate) async fn claim_replica_candidate(
+        &self,
+        holder: u64,
+        channel_id: &[u8; 32],
+    ) -> Result<(), AdapterError> {
+        self.replica_candidate_holders
+            .lock()
+            .entry(*channel_id)
+            .or_default()
+            .insert(holder);
+        if self.advertises_replica_candidate(channel_id) {
+            return Ok(());
+        }
+        self.announce_replica_candidate(channel_id).await
+    }
+
+    /// Drop `holder`'s claim, and withdraw the tag if it was the last one.
+    pub(crate) async fn release_replica_candidate(
+        &self,
+        holder: u64,
+        channel_id: &[u8; 32],
+    ) -> Result<(), AdapterError> {
+        if !self.release_candidate_holder(holder, channel_id) {
+            return Ok(());
+        }
+        self.withdraw_replica_candidate(channel_id).await
+    }
+
+    /// The synchronous [`Self::release_replica_candidate`], for a teardown
+    /// that can't await (a replication runtime aborted rather than shut
+    /// down). Edits the capability baseline without announcing; the caller
+    /// re-announces if it can.
+    pub(crate) fn release_replica_candidate_sync(
+        &self,
+        holder: u64,
+        channel_id: &[u8; 32],
+    ) -> CandidateRelease {
+        if !self.release_candidate_holder(holder, channel_id) {
+            return CandidateRelease::StillClaimed;
+        }
+        let tag = Self::replica_candidate_tag(channel_id);
+        let Some(_announce_guard) = self.lock_announce_mu() else {
+            return CandidateRelease::LockUnavailable;
+        };
+        let mut caps = self.user_caps.write();
+        let Some(caps) = caps.as_mut() else {
+            return CandidateRelease::NotAdvertised;
+        };
+        let before = caps.tags.len();
+        caps.tags.retain(|t| t.to_string() != tag);
+        if caps.tags.len() != before {
+            CandidateRelease::Removed
+        } else {
+            CandidateRelease::NotAdvertised
+        }
+    }
+
+    /// Record `holder`'s claim on `channel_id`'s candidate tag without
+    /// announcing. A resolver registers at construction (inside
+    /// `open_file`), before its runtime's first tick announces: a channel
+    /// closed and reopened at once would otherwise let the old runtime's
+    /// release, landing in between, find no other claimant and withdraw
+    /// the tag.
+    pub(crate) fn register_replica_candidate_holder(&self, holder: u64, channel_id: &[u8; 32]) {
+        self.replica_candidate_holders
+            .lock()
+            .entry(*channel_id)
+            .or_default()
+            .insert(holder);
+    }
+
+    /// Whether no resolver currently claims `channel_id`'s candidate tag.
+    pub(crate) fn replica_candidate_unclaimed(&self, channel_id: &[u8; 32]) -> bool {
+        !self
+            .replica_candidate_holders
+            .lock()
+            .contains_key(channel_id)
+    }
+
+    /// Remove `holder` from `channel_id`'s claimants; `true` when no
+    /// claimant is left (the tag should go).
+    fn release_candidate_holder(&self, holder: u64, channel_id: &[u8; 32]) -> bool {
+        let mut map = self.replica_candidate_holders.lock();
+        match map.get_mut(channel_id) {
+            Some(set) => {
+                set.remove(&holder);
+                if set.is_empty() {
+                    map.remove(channel_id);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
+    /// Every node (this one included, once self-indexed) currently
+    /// advertising the replica-candidate tag for `channel_id`, sorted
+    /// by ascending NodeId. Reads the capability fold; no broadcast.
+    pub fn find_replica_candidates(&self, channel_id: &[u8; 32]) -> Vec<u64> {
+        let tag = Self::replica_candidate_tag(channel_id);
+        let mut nodes: Vec<u64> = self.capability_fold.with_state(|state| {
+            let mut seen = std::collections::BTreeSet::new();
+            for entry in state.entries.values() {
+                if entry.payload.tags.contains(&tag) {
+                    seen.insert(entry.node_id);
+                }
+            }
+            seen.into_iter().collect()
+        });
+        nodes.sort_unstable();
+        nodes
     }
 
     /// Annotate the local capability set with a `heat:<hex>=<rate>`
@@ -45941,6 +46203,7 @@ impl MeshNode {
             return Err(AdapterError::Fatal("heat rate must be finite".to_string()));
         };
         let replacement = Tag::parse(&format!("heat:{hex}={clamped:.2}")).ok();
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_heat_tags(&mut snapshot, origin_hash, replacement);
         self.announce_capabilities(snapshot).await
@@ -45951,6 +46214,7 @@ impl MeshNode {
     /// chain's `causal:` advertisements are untouched.
     #[cfg(feature = "dataforts")]
     pub async fn withdraw_heat(&self, origin_hash: u64) -> Result<(), AdapterError> {
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_heat_tags(&mut snapshot, origin_hash, None);
         self.announce_capabilities(snapshot).await
@@ -45977,6 +46241,7 @@ impl MeshNode {
         if updates.is_empty() {
             return Ok(());
         }
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         for &(origin_hash, rate_opt) in updates {
             let replacement = match rate_opt {
@@ -46037,6 +46302,7 @@ impl MeshNode {
         };
         let hex = Self::blob_hex(&hash);
         let replacement = Tag::parse(&format!("heat:blob:{hex}={clamped:.2}")).ok();
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_blob_heat_tags(&mut snapshot, &hash, replacement);
         self.announce_capabilities(snapshot).await
@@ -46045,6 +46311,7 @@ impl MeshNode {
     /// Withdraw every `heat:blob:<hex>=*` tag for `hash` and
     /// re-broadcast. Peers drop the blob-heat annotation.
     pub async fn withdraw_blob_heat(&self, hash: [u8; 32]) -> Result<(), AdapterError> {
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_blob_heat_tags(&mut snapshot, &hash, None);
         self.announce_capabilities(snapshot).await
@@ -46063,6 +46330,7 @@ impl MeshNode {
         if updates.is_empty() {
             return Ok(());
         }
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         for (hash, rate_opt) in updates {
             let replacement = match rate_opt {
@@ -48215,28 +48483,66 @@ impl MeshNode {
     ) -> Result<(), StreamError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let drained = match self.peers.get(&stream.peer_node_id()) {
-                Some(p) => match p.session.drain_state_for_lifetime(
-                    stream.stream_id(),
-                    stream.session_id(),
-                    stream.epoch(),
-                ) {
-                    StreamDrainState::SessionSuperseded => {
-                        return Err(StreamError::SessionSuperseded)
-                    }
-                    StreamDrainState::LifetimeMismatch => return Err(StreamError::NotConnected),
-                    StreamDrainState::Pending => false,
-                    // Absent → nothing left to drain.
-                    StreamDrainState::Drained | StreamDrainState::Absent => true,
-                },
-                None => true, // peer gone → nothing to drain
-            };
-            if drained || std::time::Instant::now() >= deadline {
+            if self.graceful_drain_probe(stream)? || std::time::Instant::now() >= deadline {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         self.close_stream_handle(stream)
+    }
+
+    /// [`Self::close_stream_graceful_handle`] for a caller that holds the
+    /// node only **weakly**: the node is upgraded for each probe and for
+    /// the final close, and released across every sleep in between.
+    ///
+    /// The drain can last up to `timeout` (the blob-transfer server uses
+    /// 30 s), and a caller that held an `Arc<MeshNode>` across it pinned
+    /// the node for that long: a binding whose `shutdown` needs sole
+    /// ownership (Node's) then refused with "outstanding references" until
+    /// the drain ended. If the node is dropped mid-drain there is nothing
+    /// left to close, and this returns `Ok(())`.
+    pub async fn close_stream_graceful_handle_weak(
+        node: &std::sync::Weak<MeshNode>,
+        stream: &Stream,
+        timeout: Duration,
+    ) -> Result<(), StreamError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let drained = match node.upgrade() {
+                Some(n) => n.graceful_drain_probe(stream)?,
+                None => return Ok(()),
+            }; // the strong reference is dropped here, before the sleep
+            if drained || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        match node.upgrade() {
+            Some(n) => n.close_stream_handle(stream),
+            None => Ok(()),
+        }
+    }
+
+    /// One poll of the graceful drain: `Ok(true)` when the stream's
+    /// lifetime has nothing left unacked (or is gone), `Ok(false)` while
+    /// it is still pending, and the fencing errors of
+    /// [`Self::close_stream_graceful_handle`] when the lifetime it names
+    /// was superseded or replaced.
+    fn graceful_drain_probe(&self, stream: &Stream) -> Result<bool, StreamError> {
+        Ok(match self.peers.get(&stream.peer_node_id()) {
+            Some(p) => match p.session.drain_state_for_lifetime(
+                stream.stream_id(),
+                stream.session_id(),
+                stream.epoch(),
+            ) {
+                StreamDrainState::SessionSuperseded => return Err(StreamError::SessionSuperseded),
+                StreamDrainState::LifetimeMismatch => return Err(StreamError::NotConnected),
+                StreamDrainState::Pending => false,
+                // Absent → nothing left to drain.
+                StreamDrainState::Drained | StreamDrainState::Absent => true,
+            },
+            None => true, // peer gone → nothing to drain
+        })
     }
 
     /// Close whatever reliable stream is open under `(peer_node_id,

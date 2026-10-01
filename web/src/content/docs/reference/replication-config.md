@@ -27,9 +27,11 @@ let cfg = RedexFileConfig::default()
 let file = redex.open_file(&channel_name, cfg)?;
 ```
 
-`enable_replication` installs the per-`Redex` router on the mesh's `SUBPROTOCOL_REDEX` dispatch (`0x0E00`). Subsequent `open_file` calls with `replication: Some(_)` spawn one Tokio task per channel — a replication coordinator that handles leader election, heartbeats, and sync.
+`enable_replication` installs the per-`Redex` router on the mesh's `SUBPROTOCOL_REDEX` dispatch (`0x0E00`). Subsequent `open_file` calls with `replication: Some(_)` spawn one Tokio task per channel — a replication coordinator that handles placement, leader election, heartbeats, and sync.
 
-The same `RedexFileConfig` (with matching `ReplicationConfig`) should be used on every node that hosts a replica.
+Open the channel with the same `RedexFileConfig` (with matching `ReplicationConfig`) on every node that should take part. The nodes choose the replicas and elect a leader among themselves; write on the leader.
+
+The bindings take the same config: `replication: { factor: 3, heartbeatMs: 500n }` on Node's `openFile`, `replication=True, replication_factor=3` on Python's `open_file`, a `placement_metadata` / `PlacementMetadata` field in the C and Go JSON.
 
 ## `ReplicationConfig` fields
 
@@ -56,9 +58,29 @@ pub enum PlacementStrategy {
 }
 ```
 
-- **`Standard`** (default). The placement filter scores candidates based on `metadata.intent`, `metadata.colocate-with`, `scope:` tags, proximity, and resource availability. The production default for most channels.
-- **`Pinned(Vec<NodeId>)`**. Manual placement on a fixed `NodeId` set. The vector's length pins the effective replication factor regardless of `factor`. Useful for special-case topologies, integration tests, and recovery scenarios.
-- **`ColocationStrict`**. Every replica must live on a node already holding the chain referenced by `metadata.colocate-with-strict`. Refuses placement on nodes with insufficient coverage.
+- **`Standard`** (default). Every node that opens the channel is a candidate, and every node picks the same `factor` of them (below). The production default for most channels.
+- **`Pinned(Vec<NodeId>)`**. Manual placement on a fixed `NodeId` set, known at once. The vector's length pins the effective replication factor regardless of `factor`. Useful for special-case topologies, integration tests, and recovery scenarios.
+- **`ColocationStrict`**. `Standard`, but only candidates already holding the chain named by `placement_metadata["colocate-with-strict"]` qualify. Validation rejects the strategy without it.
+
+#### How `Standard` and `ColocationStrict` choose
+
+Nodes agree on the replica set without coordinating, by computing it from data every node sees the same way:
+
+1. **Candidates.** A node that opens the channel advertises a `dataforts:replica-candidate:<channel id>` capability tag, and withdraws it when it closes the channel, disables replication, or withdraws under disk pressure.
+2. **Scoring.** The placement filter scores each candidate on announced data only: colocation (`colocate-with` prefers, `colocate-with-strict` requires), `intent`, and advertised storage. RTT and leadership load differ from node to node, so they don't choose replicas; the election still ranks the chosen ones by RTT.
+3. **Selection.** The top `factor` by score, ties to the lower `NodeId`.
+
+Each node re-checks every heartbeat: a newly selected node joins, a node no longer selected leaves. Capability announcements are rate-limited per node (10 s windows by default), so a set can take up to about two windows to form. A node whose resolved set has *fewer* than `factor` eligible replicas (candidates that intent or colocation scoring excludes don't count) waits two windows before joining that short set, so it doesn't become the leader of a set of one beside another such leader; a full set joins at once.
+
+### `placement_metadata: BTreeMap<String, String>`
+
+Placement hints for `Standard` / `ColocationStrict`, read as the replica artifact's metadata. Ignored by `Pinned`.
+
+- `colocate-with`: a chain's origin hash; candidates holding it score above those that don't.
+- `colocate-with-strict`: the same, but required. Mandatory for `ColocationStrict`.
+- `intent`: an intent from the default intent registry; candidates that don't satisfy it are excluded.
+
+Chain hashes are 16 lowercase hex digits (the form in `causal:` tags); validation rejects anything else, since it could never match.
 
 ### `heartbeat_ms: u64`
 
@@ -87,7 +109,7 @@ Common reasons to pin:
 - An operator is running a blue/green deployment and wants to force traffic to a known canary.
 - Compliance: writes must originate from a node in a specific data center.
 
-If `placement = Pinned(set)` and `leader_pinned = Some(node)`, `node` must be in `set` — otherwise validation rejects.
+If `placement = Pinned(set)` and `leader_pinned = Some(node)`, `node` must be in `set` — otherwise validation rejects. Under `Standard` / `ColocationStrict` the pin applies only while `node` is in the resolved set.
 
 ### `on_under_capacity: UnderCapacity`
 
@@ -147,18 +169,19 @@ spawn ReplicationRuntime (one Tokio task per channel)
   ┌─────┐
   │ Idle│
   └──┬──┘
-     │  placement filter / pinned set selects this node
+     │  this node is selected: in the pinned set, or in the
+     │  set placement resolves (re-checked every heartbeat)
      ▼
   ┌──────────┐
-  │ Replica  │  ── advertises causal:<hex> capability tag
-  └────┬─────┘
+  │ Replica  │  ── advertises causal:<hex> capability tag;
+  └────┬─────┘     starts waiting for a leader
        │  heartbeat loop:
        │   - Leader emits heartbeats every heartbeat_ms
        │   - Replica observes leader's tail_seq
        │   - If replica is behind, emit SyncRequest
        │   - Leader returns SyncResponse; replica applies
        │
-       ▼  (leader silent for 3 × heartbeat_ms)
+       ▼  (no leader heard, or leader silent, for 3 × heartbeat_ms)
   ┌──────────┐
   │Candidate │  ── microseconds; deterministic election
   └────┬─────┘
@@ -173,12 +196,18 @@ spawn ReplicationRuntime (one Tokio task per channel)
   ┌──────────┐
   │ Leader   │
   └────┬─────┘
-       │  close_file(channel)
+       │  close_file(channel), or no longer selected
        ▼
   ┌─────┐
-  │ Idle│ + router unregisters
+  │ Idle│ + router unregisters, tag withdrawn
   └─────┘
 ```
+
+## Turning replication off
+
+`Redex::disable_replication()` undoes `enable_replication`: every channel's runtime shuts down (withdrawing its candidacy and chain tag), the router comes off the mesh, and the `Redex` releases the mesh. Open files stay open as local logs. `disable_replication_and_wait().await` returns once the runtimes have released the mesh; the bindings all wait (`await redex.disableReplication()` in Node, which must come before `NetMesh.shutdown()`; blocking in Python and C).
+
+`open_file` honors a channel's config only on its first open, so a channel that stayed open across a disable must be closed and reopened after re-enabling to replicate again.
 
 ## Observability
 
@@ -197,7 +226,7 @@ Per-channel atomic counters exposed via the `ReplicationMetricsRegistry`. Promet
 
 Render via `ReplicationMetricsRegistry::snapshot().prometheus_text()`.
 
-`announce_divergence_total` is the one to put an alert on. While it's non-zero, the mesh may still be advertising this node as a holder of a chain it no longer replicates — readers get routed to a node that won't serve them. Recovery is opportunistic on the next `transition_to`, so a brief blip is expected during churn but a value that stays stuck is a real problem.
+`announce_divergence_total` is the one to put an alert on. Until a retry lands, the mesh may still be advertising this node as a holder of a chain it no longer replicates — readers get routed to a node that won't serve them. The runtime retries a failed announce or withdraw every heartbeat, so a single bump during churn is expected; a counter that keeps climbing means the retries keep failing.
 
 The registry is bounded by `MAX_TRACKED_CHANNELS`; channels past the cap fold into a shared `__overflow__` bucket. If `__overflow__` shows up in a scrape, per-channel attribution has already been lost for some channels — treat it as a cardinality signal, not a channel name.
 

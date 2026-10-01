@@ -85,6 +85,7 @@ export {
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
+  WriteToken,
   CortexError,
   NetDbError,
   RedexError,
@@ -318,6 +319,70 @@ export type {
   PeerSnapshot,
 } from './meshos';
 
+// Trust surfaces (NODE_SDK_GAPS_PLAN.md S3): consent and pins, delegated
+// agent identity, device enrollment. Thin re-exports of @net-mesh/core,
+// mirroring Python's net_sdk.consent / .delegation / .enrollment. They take
+// the NATIVE Identity: pass an SDK Identity as `identity.toNapi()`.
+export {
+  CapabilityGateway,
+  CapabilityId,
+  ConsentPolicy,
+  PinStore,
+  credentialRequiresConsent,
+} from './consent';
+export type { PinRecord } from './consent';
+export {
+  DELEGATION_ERROR_PREFIX,
+  DelegationChain,
+  GATEWAY_DELEGATION_CHANNEL,
+  RevocationRegistry,
+  defaultRevocationStorePath,
+  deriveChildIdentity,
+  isDelegationError,
+} from './delegation';
+export {
+  DeviceEnrollment,
+  DeviceRecord,
+  ENROLLMENT_ERROR_PREFIX,
+  EnrollmentServeHandle,
+  InviteToken,
+  JoinOutcome,
+  JoinRequest,
+  OperatorEnrollment,
+  fingerprint,
+  isEnrollmentError,
+} from './enrollment';
+
+// Deck (the operator surface over MeshOS). Also published at the
+// `@net-mesh/sdk/deck` subpath, which the module's own docs import from.
+export {
+  AdminCommands,
+  AdminVerifier,
+  AuditQuery,
+  DeckClient,
+  DeckSdkError,
+  IceCommands,
+  IceProposal,
+  OperatorIdentity,
+  OperatorRegistry,
+  SimulatedIceProposal,
+} from './deck';
+export type {
+  AdminAuditRecord,
+  AvoidScope,
+  BlastRadius,
+  ChainCommit,
+  DaemonCounts,
+  DeckClientConfig,
+  FailureRecord,
+  LogFilter,
+  LogLevel,
+  LogRecord,
+  OperatorSignature,
+  PeerCounts,
+  StatusSummary,
+} from './deck';
+
 // Groups (HA / scaling overlays — Stage 2 of SDK_GROUPS_SURFACE_PLAN).
 export { ReplicaGroup, ForkGroup, StandbyGroup, GroupError } from './groups';
 export type {
@@ -349,6 +414,45 @@ export {
   isTransferStreamId,
   nextTransferStreamId,
 } from './transport';
+
+// Blob types and the adapter registry (NODE_SDK_GAPS_PLAN.md S4): what
+// MeshNode's blob methods take and return.
+export {
+  BandwidthClass,
+  BlobRef,
+  ChunkingStrategy,
+  Encoding,
+  MeshBlobAdapter,
+  blobAdapterIds,
+  blobAdapterRegistered,
+  blobPublish,
+  blobResolve,
+  createMeshBlobAdapter,
+  isBlobRef,
+  registerAsyncBlobAdapter,
+  registerBlobAdapter,
+  registerFilesystemBlobAdapter,
+  unregisterBlobAdapter,
+} from './blob';
+export type { MeshBlobAdapterOptions } from './blob';
+
+// Aggregator clients (aggregator.registry / fold.query) and their typed
+// errors. Build a client from a MeshNode with the create* helpers.
+export {
+  FoldQueryClient,
+  FoldQueryClientError,
+  RegistryClient,
+  RegistryClientError,
+  classifyAggregatorError,
+  createFoldQueryClient,
+  createRegistryClient,
+  parseAggregatorError,
+} from './aggregator';
+export type { FoldQueryErrorKind, RegistryErrorKind } from './aggregator';
+
+// The core's own GPU vendor normalizer, so a vendor string matches what
+// peers announce. `capabilities.ts` stays free of native imports.
+export { normalizeGpuVendor } from '@net-mesh/core';
 
 // Types.
 export type {

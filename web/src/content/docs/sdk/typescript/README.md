@@ -50,6 +50,37 @@ anchors are configured on the mesh constructor (`subnetExports`,
 failures classify through `classifySubnetError`
 ([reference](/docs/reference/error-codes)).
 
+## The rest of the surface
+
+Everything below imports from `@net-mesh/sdk`, with no reach into
+`@net-mesh/core`:
+
+- **Trust:** `ConsentPolicy` / `PinStore` / `CapabilityGateway` for consent;
+  `DelegationChain`, `RevocationRegistry` and `deriveChildIdentity` for
+  delegation; `OperatorEnrollment`, `InviteToken` and `DeviceEnrollment` for
+  enrolling devices, with `mesh.serveEnrollmentAuto`, `mesh.join` and
+  `mesh.renew` doing it over the mesh. These take the native identity:
+  pass `identity.toNapi()`.
+- **Blobs:** `createMeshBlobAdapter(redex, id)` builds the adapter that
+  `mesh.serveBlobTransfer` and `storeDir` take. `fetchDir(sourceId, manifest,
+  dest)` takes none, but the fetching node must have called
+  `serveBlobTransfer` first: it needs the transfer engine too.
+- **Agent tasks and tools:** `mesh.serveA2a` / `submitTask` / `taskStatus` /
+  `cancelTask`, and `mesh.publishTools` (needs `permissiveChannels: true`).
+- **NAT traversal:** `mesh.natType()`, `reflexAddr()`, `connectDirect`,
+  `traversalStats()` and reflex overrides.
+- **Aggregators:** `createRegistryClient(mesh)` / `createFoldQueryClient(mesh)`.
+- **Read-your-writes:** `tasks.waitForToken(new WriteToken(origin, seq), ms)`.
+- **Replicated logs:** `redex.enableReplication(mesh)`, then `openFile(name,
+  { replication: { factor: 3 } })` on every node that should take part; the
+  nodes pick the replicas and elect a leader
+  ([reference](/docs/reference/replication-config)).
+
+`node.shutdown()` needs the node's only reference. A `mesh.rpc()` handle, an
+aggregator client or a replicating `Redex` holds one, so release it first
+(`rpc.raw.close()`, `client.close()`, `await redex.disableReplication()`), or
+shutdown rejects with *outstanding references exist*.
+
 ## Serving browser games from Node
 
 A dedicated game host, a world region host or a netcode host can run in Node and

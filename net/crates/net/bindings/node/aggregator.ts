@@ -17,6 +17,10 @@ export type RegistryErrorKind =
   | 'duplicate-group-name'
   | 'spawn-rejected'
   | 'spawn-not-supported'
+  | 'unknown-group'
+  | 'scale-rejected'
+  | 'scale-not-supported'
+  | 'unauthorized'
   | 'invalid-args'
 
 export type FoldQueryErrorKind =
@@ -56,6 +60,10 @@ const REGISTRY_KINDS: ReadonlySet<string> = new Set([
   'duplicate-group-name',
   'spawn-rejected',
   'spawn-not-supported',
+  'unknown-group',
+  'scale-rejected',
+  'scale-not-supported',
+  'unauthorized',
   'invalid-args',
 ])
 
@@ -119,7 +127,14 @@ export function classifyAggregatorError(
     parsed.kind === 'unknown-template' ||
     parsed.kind === 'duplicate-group-name' ||
     parsed.kind === 'spawn-rejected' ||
-    parsed.kind === 'spawn-not-supported'
+    parsed.kind === 'spawn-not-supported' ||
+    // `unregister` / scale / the operator gate (`registry_err` in
+    // src/aggregator.rs). These were missing, so the classifier
+    // returned them as raw Errors.
+    parsed.kind === 'unknown-group' ||
+    parsed.kind === 'scale-rejected' ||
+    parsed.kind === 'scale-not-supported' ||
+    parsed.kind === 'unauthorized'
   ) {
     return new RegistryClientError(parsed.kind, parsed.detail)
   }

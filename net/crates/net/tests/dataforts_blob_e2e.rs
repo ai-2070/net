@@ -40,9 +40,7 @@ use net::adapter::net::dataforts::blob::{
     drive_blob_migration_tick, BlobAdapter, BlobRef, MeshBlobAdapter,
 };
 use net::adapter::net::dataforts::gravity::{BlobHeatRegistry, BlobHeatSink, DataGravityPolicy};
-use net::adapter::net::redex::{
-    PlacementStrategy, Redex, ReplicaRole, ReplicationConfig, TransitionSignal,
-};
+use net::adapter::net::redex::{PlacementStrategy, Redex, ReplicaRole, ReplicationConfig};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -174,22 +172,7 @@ async fn drive_chunk_roles_for(blob_ref: &BlobRef, redex_a: &Arc<Redex>, redex_b
         let coord_b = redex_b
             .replication_coordinator_for(&channel)
             .expect("coord B");
-        coord_a
-            .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-            .await
-            .expect("A → Replica");
-        coord_a
-            .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-            .await
-            .expect("A → Candidate");
-        coord_a
-            .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-            .await
-            .expect("A → Leader");
-        coord_b
-            .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-            .await
-            .expect("B → Replica");
+        await_roles(&coord_a, &[&coord_b]).await;
     }
 }
 
@@ -268,6 +251,32 @@ fn pinned_replication_cfg(a_id: u64, b_id: u64) -> ReplicationConfig {
     ReplicationConfig::new()
         .with_heartbeat_ms(150)
         .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+        .with_leader_pinned(Some(a_id))
+}
+
+/// Wait until the runtime's own election settles on `leader` as Leader
+/// and every one of `replicas` as Replica. The runtime bootstraps and
+/// elects by itself (the pinned leader wins when healthy), so tests wait
+/// for that rather than drive transitions that race it.
+async fn await_roles(
+    leader: &net::adapter::net::redex::ReplicationCoordinator,
+    replicas: &[&net::adapter::net::redex::ReplicationCoordinator],
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let settled = leader.role() == ReplicaRole::Leader
+            && replicas.iter().all(|c| c.role() == ReplicaRole::Replica);
+        if settled {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "election never settled: leader {:?}, replicas {:?}",
+            leader.role(),
+            replicas.iter().map(|c| c.role()).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// A stores a blob; B prefetches it; B reads back the original
@@ -645,7 +654,8 @@ async fn three_node_parallel_migration_lands_blob_on_two_peers() {
     let c_id = node_c.node_id();
     let rep_cfg = ReplicationConfig::new()
         .with_heartbeat_ms(150)
-        .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id, c_id]));
+        .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id, c_id]))
+        .with_leader_pinned(Some(a_id));
 
     // A's adapter feeds the heat registry via fetch-path bumps.
     let heat_registry_a = Arc::new(parking_lot::Mutex::new(BlobHeatRegistry::new()));
@@ -788,26 +798,7 @@ async fn three_node_parallel_migration_lands_blob_on_two_peers() {
     let coord_c = redex_c
         .replication_coordinator_for(&channel)
         .expect("coord C");
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .expect("A → Replica");
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .expect("A → Candidate");
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .expect("A → Leader");
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .expect("B → Replica");
-    coord_c
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .expect("C → Replica");
+    await_roles(&coord_a, &[&coord_b, &coord_c]).await;
 
     // Both B and C should converge their chunk files to seq=1
     // (the Small blob is one event). Use a generous deadline
@@ -923,8 +914,9 @@ async fn overflow_push_nudge_round_trips_through_mesh_rpc() {
 
     let a_id = node_a.node_id();
     let b_id = node_b.node_id();
-    let rep_cfg =
-        ReplicationConfig::new().with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]));
+    let rep_cfg = ReplicationConfig::new()
+        .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+        .with_leader_pinned(Some(a_id));
 
     let adapter_b =
         Arc::new(MeshBlobAdapter::new("mesh-b", redex_b.clone()).with_replication(rep_cfg.clone()));

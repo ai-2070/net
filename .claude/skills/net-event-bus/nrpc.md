@@ -253,8 +253,7 @@ The SDK's `MeshNode` wraps a `NetMesh` that nRPC consumes directly; the typed su
 import { MeshNode } from '@net-mesh/sdk'
 import { classifyError, RpcServerError } from '@net-mesh/core/errors'
 import {
-  CircuitBreaker, HedgePolicy, NRPC_TYPED_BAD_REQUEST,
-  RetryPolicy, TypedMeshRpc,
+  CircuitBreaker, HedgePolicy, NRPC_TYPED_BAD_REQUEST, RetryPolicy,
 } from '@net-mesh/core/mesh_rpc'
 
 interface EchoSumRequest  { text: string; numbers: number[] }
@@ -264,13 +263,13 @@ const server = await MeshNode.create({ bindAddr: '127.0.0.1:9001', psk })
 const client = await MeshNode.create({ bindAddr: '127.0.0.1:9000', psk })
 // (handshake omitted)
 
-const serverRpc = TypedMeshRpc.fromMesh((server as any)._native)
+const serverRpc = server.rpc()  // a TypedMeshRpc; hold one per node
 const handle = serverRpc.serve<EchoSumRequest, EchoSumResponse>(
   'echo_sum',
   async (req) => ({ echo: req.text, sum: req.numbers.reduce((a, b) => a + b, 0) }),
 )
 
-const clientRpc = TypedMeshRpc.fromMesh((client as any)._native)
+const clientRpc = client.rpc()
 try {
   const reply = await clientRpc.call<EchoSumRequest, EchoSumResponse>(
     server.nodeId(), 'echo_sum',
@@ -284,6 +283,8 @@ try {
   }
 }
 await handle.close()  // MUST close — node finalizers are non-deterministic
+// Each rpc() holds a node reference; release it before shutdown().
+serverRpc.raw.close(); clientRpc.raw.close()
 ```
 
 Streaming + resilience:

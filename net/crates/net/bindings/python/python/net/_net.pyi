@@ -275,6 +275,15 @@ class Redex:
         retention_max_events: Optional[int] = None,
         retention_max_bytes: Optional[int] = None,
         retention_max_age_ms: Optional[int] = None,
+        replication: bool = False,
+        replication_factor: Optional[int] = None,
+        replication_heartbeat_ms: Optional[int] = None,
+        replication_placement: Optional[str] = None,
+        replication_pinned_nodes: Optional[List[int]] = None,
+        replication_leader_pinned: Optional[int] = None,
+        replication_on_under_capacity: Optional[str] = None,
+        replication_budget_fraction: Optional[float] = None,
+        replication_placement_metadata: Optional[Dict[str, str]] = None,
     ) -> "RedexFile":
         """Open (or get) a raw RedEX file for domain-agnostic persistent
         logging. Bypasses the CortEX fold layer — use when you want an
@@ -286,8 +295,57 @@ class Redex:
 
         `persistent=True` requires this Redex to have been constructed
         with a `persistent_dir`; otherwise raises `RedexError`.
+
+        `replication=True` replicates the channel across nodes; call
+        `enable_replication` first. With `replication_placement="pinned"`
+        each node in `replication_pinned_nodes` joins as a replica and the
+        set elects a leader (`replication_leader_pinned` if healthy).
+        With `"standard"` (the default) or `"colocation_strict"`, every
+        node that opens the channel is a candidate and each picks the
+        same `replication_factor` replicas. `replication_placement_metadata`
+        carries the hints: `colocate-with` (prefer candidates holding that
+        chain) and `colocate-with-strict` (require it; mandatory for
+        `"colocation_strict"`), each a chain's 16 lowercase hex digit
+        origin hash, and `intent` (an intent from the default registry).
         """
         ...
+    def enable_replication(self, mesh: "NetMesh") -> None:
+        """Install cross-node replication rooted at `mesh`. Idempotent."""
+        ...
+    def disable_replication(self) -> None:
+        """Undo `enable_replication`: shut every channel's replication
+        down and release the mesh. Idempotent; open files stay open."""
+        ...
+    def replication_runtime_count(self) -> int: ...
+    def replication_prometheus_text(self) -> str: ...
+    def enable_greedy_dataforts(
+        self,
+        mesh: "NetMesh",
+        *,
+        scopes: Optional[List[str]] = None,
+        proximity_max_rtt_ms: Optional[int] = None,
+        per_channel_cap_bytes: Optional[int] = None,
+        total_cap_bytes: Optional[int] = None,
+        bandwidth_budget_fraction: Optional[float] = None,
+        nic_peak_bytes_per_s: Optional[int] = None,
+        observer_inflight_cap: Optional[int] = None,
+        intent_match: Optional[str] = None,
+        colocation_policy: Optional[str] = None,
+    ) -> None: ...
+    def disable_greedy_dataforts(self) -> None: ...
+    def greedy_cached_channel_count(self) -> int: ...
+    def greedy_prometheus_text(self) -> str: ...
+    def enable_gravity_for_greedy(
+        self,
+        mesh: "NetMesh",
+        *,
+        tick_interval_ms: int = 500,
+        enabled: bool = True,
+        emit_threshold_ratio: Optional[float] = None,
+        decay_half_life_secs: Optional[int] = None,
+        normalization_reference_rate: Optional[float] = None,
+    ) -> None: ...
+    def disable_gravity_for_greedy(self) -> None: ...
 
 class RedexEvent:
     """A materialized RedEX event: `seq` + `payload` + checksum /

@@ -16,6 +16,10 @@
     "./org": {
       "types": "./dist/org/index.d.ts",
       "default": "./dist/org/index.js"
+    },
+    "./deck": {
+      "types": "./dist/deck.d.ts",
+      "default": "./dist/deck.js"
     }
   },
   "license": "MIT OR Apache-2.0",

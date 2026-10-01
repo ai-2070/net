@@ -51,6 +51,48 @@ struct ReplicationWiring {
     metrics: Arc<ReplicationMetricsRegistry>,
 }
 
+/// The chain-tag sink a channel's coordinator uses.
+///
+/// Every channel on a `Redex` advertises the same origin
+/// (`causal:<principal>`), so one channel's `withdraw_chain` would remove
+/// the tag the others still need: closing channel A made an active
+/// channel B undiscoverable, and B's coordinator, unaware, never put it
+/// back. This sink claims the tag on the mesh's holder registry
+/// ([`MeshNode::announce_chain_held`]), which withdraws only when the last
+/// claimant lets go. The registry is mesh-scoped because the tag is: two
+/// managers on one mesh, or two wiring generations across a disable /
+/// re-enable, would otherwise withdraw each other's claims.
+///
+/// `holder` is unique per sink (per runtime), not per channel, so a
+/// channel closed and reopened at once can't lose its new claim to the
+/// old runtime's late withdraw.
+struct ChannelChainSink {
+    mesh: Arc<MeshNode>,
+    holder: u64,
+}
+
+/// Source of [`ChannelChainSink::holder`] keys.
+static NEXT_CHAIN_HOLDER: AtomicU64 = AtomicU64::new(0);
+
+#[async_trait::async_trait]
+impl super::ChainTagSink for ChannelChainSink {
+    async fn announce_chain(
+        &self,
+        origin_hash: u64,
+        tip_seq: u64,
+    ) -> Result<(), crate::error::AdapterError> {
+        self.mesh
+            .announce_chain_held(self.holder, origin_hash, tip_seq)
+            .await
+    }
+
+    async fn withdraw_chain(&self, origin_hash: u64) -> Result<(), crate::error::AdapterError> {
+        self.mesh
+            .withdraw_chain_held(self.holder, origin_hash)
+            .await
+    }
+}
+
 /// Per-channel replication status entry surfaced by
 /// [`Redex::replication_status_snapshot`]. Pairs with the
 /// [`ReplicationMetricsSnapshot`] atomic-counter view for the full
@@ -104,6 +146,35 @@ impl Drop for GreedyWiring {
             task.abort();
         }
         self.mesh.set_greedy_observer(None);
+    }
+}
+
+/// Shut replication runtimes down gracefully. `cancel` sends `Shutdown`
+/// and awaits the task, which withdraws the channel's replica candidacy
+/// and chain advertisement on its way to `Idle`; merely dropping a
+/// handle aborts the task and skips all of it, leaving the mesh
+/// advertising a channel this node no longer serves (and, for
+/// resolver-placed channels, keeping peers from re-selecting). Off a
+/// tokio runtime there is nothing to await on, so fall back to the
+/// abort.
+fn shut_down_runtimes(handles: Vec<Arc<super::replication_runtime::ReplicationRuntimeHandle>>) {
+    if handles.is_empty() {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => {
+            rt.spawn(async move {
+                for handle in handles {
+                    handle.cancel().await;
+                }
+            });
+        }
+        Err(_) => {
+            for handle in &handles {
+                let _ = handle.try_dispatch(super::replication_runtime::Inbound::Shutdown);
+            }
+            drop(handles);
+        }
     }
 }
 
@@ -249,6 +320,55 @@ impl Redex {
             router,
             metrics,
         }));
+    }
+
+    /// Uninstall the wiring [`Self::enable_replication`] installed.
+    /// Idempotent; a no-op when replication isn't enabled.
+    ///
+    /// Every per-channel replication runtime is unregistered and shut
+    /// down, the inbound router is removed from the mesh, and the
+    /// manager drops its `Arc<MeshNode>`. Called inside a tokio runtime,
+    /// each channel shuts down gracefully in a spawned task, withdrawing
+    /// its chain advertisement on the way to `Idle`; the runtime tasks'
+    /// own mesh references go when they finish, shortly after this
+    /// returns. Called outside one, the tasks are aborted instead. Open files stay open as
+    /// local logs. A later `enable_replication` installs fresh wiring;
+    /// channels opened before it stay unreplicated until reopened.
+    ///
+    /// Without this, only dropping the `Redex` released the mesh, so a
+    /// binding whose node shutdown needs sole ownership of the
+    /// `Arc<MeshNode>` (Node's) couldn't shut down while the `Redex`
+    /// lived.
+    pub fn disable_replication(&self) {
+        shut_down_runtimes(self.take_replication());
+    }
+
+    /// [`Self::disable_replication`], returning once every channel's
+    /// runtime has shut down and dropped its mesh reference.
+    ///
+    /// `disable_replication` only schedules that shutdown, so a caller
+    /// whose next step needs the mesh's only reference (the Node
+    /// binding's `NetMesh.shutdown`) should await this instead.
+    pub async fn disable_replication_and_wait(&self) {
+        for handle in self.take_replication() {
+            handle.cancel().await;
+        }
+    }
+
+    /// Uninstall the wiring and hand back the runtimes to shut down.
+    fn take_replication(&self) -> Vec<Arc<super::replication_runtime::ReplicationRuntimeHandle>> {
+        let Some(wiring) = self.replication.write().take() else {
+            return Vec::new();
+        };
+        let handles: Vec<_> = wiring
+            .router
+            .snapshot_handles()
+            .into_iter()
+            .filter_map(|(channel_id, _)| wiring.router.unregister(&channel_id))
+            .collect();
+        // `ReplicationWiring::drop` uninstalls the router from the mesh.
+        drop(wiring);
+        handles
     }
 
     /// Install greedy-LRU wiring rooted at `mesh`. Validates the
@@ -609,16 +729,19 @@ impl Redex {
             // Re-check the wiring under the read lock — a racing
             // call that disables replication after the precheck
             // surfaces a clean error rather than panicking on
-            // unwrap.
-            let wiring = match self.replication.read().as_ref() {
-                Some(w) => w.clone(),
-                None => {
-                    return Err(RedexError::Channel(
-                        "replication wiring removed between precheck and spawn".into(),
-                    ));
-                }
+            // unwrap. Hold the lock through registration: with only
+            // a cloned `Arc`, a concurrent `disable_replication` could
+            // take the wiring between the check and the router insert,
+            // and the new runtime would register on a router nobody
+            // shuts down (`spawn_replication_for` is synchronous and
+            // doesn't touch `self.replication`).
+            let guard = self.replication.read();
+            let Some(wiring) = guard.as_ref() else {
+                return Err(RedexError::Channel(
+                    "replication wiring removed between precheck and spawn".into(),
+                ));
             };
-            self.spawn_replication_for(name, &file, rep_cfg, &wiring);
+            self.spawn_replication_for(name, &file, rep_cfg, wiring);
         }
 
         Ok(file)
@@ -643,17 +766,31 @@ impl Redex {
             origin_hash: self.principal.raw(),
         };
 
-        // Compute the initial replica set. Pinned: the literal
-        // list. Standard / ColocationStrict: empty for now; Phase F
-        // wires placement-recomputation so the coordinator
-        // re-resolves the set on roster change.
+        // The replica set. Pinned: the literal list, fixed. Standard /
+        // ColocationStrict: resolved by the runtime every tick from the
+        // replica-candidate tags (REDEX_REPLICA_PLACEMENT_PLAN.md), so it
+        // starts empty and follows roster changes.
         let replica_set: Vec<crate::adapter::net::behavior::placement::NodeId> =
             match &cfg.placement {
                 PlacementStrategy::Pinned(nodes) => nodes.clone(),
                 _ => Vec::new(),
             };
+        let replica_resolver: Option<Arc<dyn super::replication_placement::ReplicaSetResolver>> =
+            match &cfg.placement {
+                PlacementStrategy::Pinned(_) => None,
+                strategy => Some(Arc::new(
+                    super::replication_placement::MeshReplicaPlacement::new(
+                        wiring.mesh.clone(),
+                        name.clone(),
+                        usize::from(cfg.effective_factor()),
+                        *strategy == PlacementStrategy::ColocationStrict,
+                        &cfg.placement_metadata,
+                    ),
+                )),
+            };
 
         let heartbeat_ms = cfg.heartbeat_ms;
+        let leader_pinned = cfg.leader_pinned;
         let budget_fraction = cfg.replication_budget_fraction;
         // v0.3 Phase D2: snapshot the bandwidth-class config
         // before `cfg` moves into the coordinator below.
@@ -677,11 +814,15 @@ impl Redex {
         let coordinator = Arc::new(ReplicationCoordinator::new(
             identity.clone(),
             cfg,
-            wiring.mesh.clone() as Arc<dyn super::ChainTagSink>,
+            Arc::new(ChannelChainSink {
+                mesh: wiring.mesh.clone(),
+                holder: NEXT_CHAIN_HOLDER.fetch_add(1, Ordering::Relaxed),
+            }) as Arc<dyn super::ChainTagSink>,
             wiring.metrics.as_ref(),
         ));
 
         let self_node_id = wiring.mesh.node_id();
+        let replica_set_has_self = replica_set.contains(&self_node_id);
         let proximity = wiring.mesh.proximity_graph().clone();
         let rtt_lookup: super::replication_runtime::RttLookup = Arc::new(
             move |node: crate::adapter::net::behavior::placement::NodeId| {
@@ -724,6 +865,11 @@ impl Redex {
             // above before `cfg` moved into the coordinator).
             default_bandwidth_class,
             background_fraction,
+            // Only a pinned set names its members up front; Standard /
+            // ColocationStrict members join through the resolver.
+            bootstrap_replica: replica_set_has_self,
+            leader_pinned,
+            replica_resolver,
         };
 
         let handle = Arc::new(spawn_replication_runtime(
@@ -793,7 +939,7 @@ impl Redex {
         if let Some(wiring) = self.replication.read().as_ref().cloned() {
             let channel_id = ChannelId::from_name(name);
             if let Some(handle) = wiring.router.unregister(&channel_id) {
-                let _ = handle.try_dispatch(super::replication_runtime::Inbound::Shutdown);
+                shut_down_runtimes(vec![handle]);
             }
         }
         if let Some((_, file)) = self.files.remove(name) {
@@ -824,7 +970,7 @@ impl Redex {
         if let Some(wiring) = self.replication.read().as_ref().cloned() {
             let channel_id = ChannelId::from_name(name);
             if let Some(handle) = wiring.router.unregister(&channel_id) {
-                let _ = handle.try_dispatch(super::replication_runtime::Inbound::Shutdown);
+                shut_down_runtimes(vec![handle]);
             }
         }
         // Hold the entry guard across close + unlink so a
@@ -1199,6 +1345,42 @@ mod tests {
                 .await
                 .expect("MeshNode::new"),
         )
+    }
+
+    /// Two resolvers claiming one channel's candidate tag (a close and an
+    /// immediate reopen): the first one's release, graceful or by drop,
+    /// leaves the tag to the second; the last release removes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_tag_outlives_all_but_the_last_resolver() {
+        use super::super::replication_placement::{MeshReplicaPlacement, ReplicaSetResolver};
+        let mesh = build_mesh_for_test().await;
+        let name = cn("repl/holders");
+        let id = *ChannelId::from_name(&name).as_bytes();
+        let none = std::collections::BTreeMap::new();
+        let old = MeshReplicaPlacement::new(mesh.clone(), name.clone(), 1, false, &none);
+        old.ensure_candidate().await;
+        assert!(mesh.advertises_replica_candidate(&id));
+        // The reopened channel's resolver exists before its first tick.
+        let new = MeshReplicaPlacement::new(mesh.clone(), name.clone(), 1, false, &none);
+
+        old.withdraw_candidate().await;
+        assert!(
+            mesh.advertises_replica_candidate(&id),
+            "graceful release kept the tag"
+        );
+
+        let newer = MeshReplicaPlacement::new(mesh.clone(), name, 1, false, &none);
+        drop(new);
+        assert!(
+            mesh.advertises_replica_candidate(&id),
+            "a dropped resolver kept the tag"
+        );
+
+        drop(newer);
+        assert!(
+            !mesh.advertises_replica_candidate(&id),
+            "the last release removed it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

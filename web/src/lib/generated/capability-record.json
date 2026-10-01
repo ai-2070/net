@@ -17,7 +17,6 @@
           "status": "not exposed"
         },
         "Node / TS": {
-          "mode": "core-only",
           "status": "supported"
         },
         "Python": {
@@ -566,7 +565,6 @@
           "status": "not exposed"
         },
         "Node / TS": {
-          "mode": "core-only",
           "status": "supported"
         },
         "Python": {

@@ -137,7 +137,9 @@ let cfg = RedexFileConfig::default()
 let file = redex.open_file(&ChannelName::new("sensors/lidar/front")?, cfg)?;
 ```
 
-`enable_replication` installs the per-`Redex` router on the mesh's replication subprotocol. After that, opening a channel with `replication: Some(_)` spawns a per-channel replication coordinator: leader election (deterministic by RTT and health), heartbeat-based liveness, and sync requests that bring replicas up to date.
+`enable_replication` installs the per-`Redex` router on the mesh's replication subprotocol. After that, opening a channel with `replication: Some(_)` spawns a per-channel replication coordinator: placement, leader election (deterministic by RTT and health), heartbeat-based liveness, and sync requests that bring replicas up to date.
+
+Open the channel with the same config on every node that should take part. With the default placement, the nodes that open it pick `factor` replicas among themselves and elect a leader; append on the leader. To name the replicas yourself, use `PlacementStrategy::Pinned`.
 
 Replication has its own [reference page](/docs/reference/replication-config) with
 placement strategies, bandwidth budgets, and failure modes. A configured factor

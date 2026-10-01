@@ -178,6 +178,18 @@ pub struct Redex {
     inner: Arc<InnerRedex>,
 }
 
+/// napi's tokio runtime, for a sync method that may spawn.
+///
+/// napi runs sync methods on the JS thread, which has no reactor, but
+/// several `Redex` calls spawn tokio tasks: `openFile` for a replicated
+/// channel or an interval fsync policy, and the replication / greedy /
+/// gravity switches. Spawning there panicked ("there is no reactor
+/// running") and aborted the Node process. `NetMesh.create` runs on this
+/// same runtime, so tasks spawned here sit beside the mesh's own.
+fn napi_runtime() -> tokio::runtime::Handle {
+    napi::bindgen_prelude::within_runtime_if_available(tokio::runtime::Handle::current)
+}
+
 impl Redex {
     /// Internal accessor — sibling Node binding modules (e.g.
     /// `blob` for `MeshBlobAdapter`) need a shared
@@ -238,6 +250,8 @@ impl Redex {
     #[cfg(feature = "net")]
     #[napi]
     pub fn enable_replication(&self, mesh: &crate::NetMesh) -> Result<()> {
+        let rt = napi_runtime();
+        let _enter = rt.enter();
         let arc = mesh.node_arc_clone()?;
         self.inner.enable_replication(arc);
         Ok(())
@@ -257,6 +271,25 @@ impl Redex {
             "binding built without `net` feature; rebuild with --features net",
         ))
     }
+
+    /// Undo `enableReplication`: shut down every channel's replication
+    /// (gracefully, withdrawing its chain advertisement) and release this
+    /// manager's reference to the mesh, so `NetMesh.shutdown()` can take
+    /// sole ownership. Idempotent. Open files stay open as local logs.
+    ///
+    /// Resolves once every channel's runtime has stopped and dropped its
+    /// mesh reference: `await` it before `shutdown()`, which otherwise can
+    /// still find those references and refuse.
+    #[cfg(feature = "net")]
+    #[napi]
+    pub async fn disable_replication(&self) {
+        self.inner.disable_replication_and_wait().await;
+    }
+
+    /// No-op without the `net` feature: replication can't be enabled.
+    #[cfg(not(feature = "net"))]
+    #[napi]
+    pub async fn disable_replication(&self) {}
 
     /// Count of per-channel replication runtimes currently registered
     /// on this manager. `0` when replication isn't enabled. Useful
@@ -362,6 +395,8 @@ impl Redex {
             };
             cfg = cfg.with_colocation_policy(parsed);
         }
+        let rt = napi_runtime();
+        let _enter = rt.enter();
         let arc = mesh.node_arc_clone()?;
         let local_caps =
             Arc::new(net::adapter::net::behavior::capability::CapabilitySet::default());
@@ -472,6 +507,8 @@ impl Redex {
             Some(v) => std::time::Duration::from_millis(bigint_u64(v)?),
             None => std::time::Duration::from_millis(500),
         };
+        let rt = napi_runtime();
+        let _enter = rt.enter();
         let arc = mesh.node_arc_clone()?;
         self.inner
             .enable_gravity_for_greedy(arc, policy, tick)
@@ -524,6 +561,8 @@ impl Redex {
         let name =
             ChannelName::new(&channel_name).map_err(|e| redex_err("invalid channel name", e))?;
         let cfg = resolve_redex_file_config(config)?;
+        let rt = napi_runtime();
+        let _enter = rt.enter();
         let file = self
             .inner
             .open_file(&name, cfg)
@@ -603,6 +642,11 @@ pub struct ReplicationConfigJs {
     /// measured NIC peak. Range `(0.0, 1.0]`. Defaults to `0.5`
     /// when omitted.
     pub replication_budget_fraction: Option<f64>,
+    /// Placement hints for `"standard"` / `"colocation-strict"`:
+    /// `colocate-with` (soft) or `colocate-with-strict` (required by
+    /// `"colocation-strict"`), each a chain's 16-hex origin hash, and
+    /// `intent`. Ignored by `"pinned"`.
+    pub placement_metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 /// JS-side config for `Redex.enableGravityForGreedy`. Locked
@@ -782,6 +826,9 @@ fn resolve_replication_config(cfg: ReplicationConfigJs) -> Result<InnerReplicati
     out = out.with_on_under_capacity(resolve_under_capacity(cfg.on_under_capacity)?);
     if let Some(fraction) = cfg.replication_budget_fraction {
         out = out.with_replication_budget_fraction(fraction as f32);
+    }
+    for (key, value) in cfg.placement_metadata.unwrap_or_default() {
+        out = out.with_placement_metadata(key, value);
     }
     // Validate fail-fast so a malformed config can't reach
     // `open_file`. The core revalidates there too, but the

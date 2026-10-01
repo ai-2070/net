@@ -27,6 +27,7 @@ use net::adapter::net::dataforts::dir::{
 };
 use net::adapter::net::redex::Redex;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::Adapter;
 
 const PSK: [u8; 32] = [0x42u8; 32];
 // 16 MiB so a few concurrent large-file transfers (5 MiB tx window each)
@@ -830,4 +831,62 @@ async fn store_dir_surfaces_file_store_error_and_recovers_after_fix() {
         .filter(|e| matches!(e.kind, EntryKind::File { .. }))
         .count();
     assert_eq!(file_count, 11, "all files present after recovery");
+}
+
+/// Serving a transfer must not pin the holder node past the transfer.
+///
+/// `serve_chunk` used to hold its `Arc<MeshNode>` across the graceful
+/// stream close, which waits (up to `TRANSFER_TIMEOUT`) for the receiver's
+/// acks. When the receiver goes away right after its fetch (a fetcher that
+/// shuts down, the common case), those acks never come and the drain waits
+/// for the session to die instead: ~7 s, measured. The Node binding's `shutdown`
+/// needs sole ownership of the node and refused with "outstanding
+/// references" for that whole window (found through `@net-mesh/sdk`,
+/// NODE_SDK_GAPS_PLAN.md S4). The close now holds the node weakly, so the
+/// holder's strong count is back to its pre-transfer baseline promptly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serving_a_transfer_releases_the_holder_node_promptly() {
+    let holder = build_node().await;
+    let fetcher = build_node().await;
+    handshake(&fetcher, &holder).await;
+    let holder_id = holder.node_id();
+
+    let adapter_h = Arc::new(MeshBlobAdapter::new("h", Arc::new(Redex::new())));
+    holder.serve_blob_transfer(adapter_h.clone());
+    fetcher.serve_blob_transfer(Arc::new(MeshBlobAdapter::new("f", Arc::new(Redex::new()))));
+
+    let src = TempDir::new("release-src");
+    write(
+        src.path(),
+        "f.bin",
+        &(0..20_000u32).map(|i| i as u8).collect::<Vec<_>>(),
+    );
+    let manifest_ref = store_dir(&adapter_h, src.path()).await.expect("store_dir");
+
+    // Settle, then take the baseline: the node's own long-lived holders.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let baseline = Arc::strong_count(&holder);
+
+    let dest = TempDir::new("release-dest");
+    fetch_dir(&fetcher, holder_id, &manifest_ref, dest.path(), 0)
+        .await
+        .expect("fetch_dir");
+    // The receiver leaves at once, so the holder's drain can't complete on
+    // acks: this is the case that pinned the node.
+    fetcher.shutdown().await.expect("fetcher shutdown");
+
+    // Well under the ~7 s the drain used to pin the node for.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let now = Arc::strong_count(&holder);
+        if now <= baseline {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder still has {now} strong refs (baseline {baseline}) 2 s after the transfer: \
+             a serve task is pinning the node"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

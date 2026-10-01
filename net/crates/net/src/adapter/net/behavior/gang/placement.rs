@@ -33,10 +33,14 @@ pub const COLOCATE_WITH_STRICT_KEY: &str = "colocate-with-strict";
 /// so this variant does not itself yield a [`ReplicaSet`] — use
 /// [`pinned_island_replicas`] when the concrete fault-domain node set
 /// is known up-front (the common case, and what the §6 quorum needs).
-pub fn colocated_island_config(factor: u8) -> ReplicationConfig {
+///
+/// `host_chain` is the island host's own chain (its `causal:` origin
+/// hash); replicas are drawn only from nodes holding it.
+pub fn colocated_island_config(factor: u8, host_chain: u64) -> ReplicationConfig {
     ReplicationConfig::new()
         .with_factor(factor)
         .with_placement(PlacementStrategy::ColocationStrict)
+        .with_placement_metadata(COLOCATE_WITH_STRICT_KEY, format!("{host_chain:016x}"))
 }
 
 /// Build an explicitly-pinned island reservation config **and** the
@@ -69,9 +73,16 @@ mod tests {
 
     #[test]
     fn colocated_config_uses_colocation_strict() {
-        let cfg = colocated_island_config(3);
+        let cfg = colocated_island_config(3, 0xABCD);
         assert_eq!(cfg.placement, PlacementStrategy::ColocationStrict);
         assert_eq!(cfg.factor, 3);
+        assert_eq!(
+            cfg.placement_metadata
+                .get(COLOCATE_WITH_STRICT_KEY)
+                .map(String::as_str),
+            Some("000000000000abcd"),
+            "names the host chain in causal-tag form",
+        );
         cfg.validate().expect("colocation-strict config is valid");
     }
 

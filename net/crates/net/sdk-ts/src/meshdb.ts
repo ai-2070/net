@@ -15,7 +15,7 @@
  *   MeshQuery,
  *   MeshQueryRunner,
  *   QueryBuilder,
- * } from '@net-mesh/sdk/meshdb';
+ * } from '@net-mesh/sdk';
  *
  * const reader = new InMemoryChainReader();
  * // …populate reader…
@@ -70,7 +70,7 @@ export function parseMeshDbErrorKind(raw: string): ParsedMeshDbError | null {
  *
  * ```typescript
  * import '@net-mesh/core/meshdb';
- * import { MeshQueryRunner } from '@net-mesh/sdk/meshdb';
+ * import { MeshQueryRunner } from '@net-mesh/sdk';
  * ```
  *
  * Without the side-effect import the stream still works via the

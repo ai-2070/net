@@ -6,6 +6,9 @@
 // SDK consumer relies on; it does NOT require the napi `.node`
 // (the classifier is pure TS) so vitest can run it on any host.
 
+import fs from 'node:fs'
+import path from 'node:path'
+
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -58,6 +61,10 @@ describe('classifyAggregatorError — registry kinds', () => {
     ['duplicate-group-name', 'res-1'],
     ['spawn-rejected', 'no_capacity'],
     ['spawn-not-supported', 'daemon is read-only'],
+    ['unknown-group', 'res-9'],
+    ['scale-rejected', 'below minimum'],
+    ['scale-not-supported', "daemon doesn't accept dynamic scale"],
+    ['unauthorized', 'caller is not an operator'],
   ] as const)('routes %s → RegistryClientError', (kind, detail) => {
     const typed = classifyAggregatorError(fakeErr(`agg:${kind}: ${detail}`))
     expect(typed).toBeInstanceOf(RegistryClientError)
@@ -66,6 +73,20 @@ describe('classifyAggregatorError — registry kinds', () => {
     expect(e.kind).toBe(kind)
     expect(e.serverDetail).toBe(detail)
     expect(e.name).toBe('RegistryClientError')
+  })
+})
+
+describe('classifyAggregatorError — every kind the binding emits', () => {
+  // `unknown-group`, `scale-*` and `unauthorized` were emitted by
+  // src/aggregator.rs but missing here, so they came back as raw Errors.
+  it('types every agg_err kind in src/aggregator.rs', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../src/aggregator.rs'), 'utf8')
+    const kinds = [...new Set([...src.matchAll(/agg_err\(\s*"([^"]+)"/g)].map((m) => m[1]))]
+    expect(kinds.length).toBeGreaterThanOrEqual(10)
+    for (const kind of kinds) {
+      const typed = classifyAggregatorError(fakeErr(`agg:${kind}: x`))
+      expect(typed instanceof RegistryClientError || typed instanceof FoldQueryClientError, kind).toBe(true)
+    }
   })
 })
 

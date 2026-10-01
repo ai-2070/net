@@ -34,6 +34,13 @@ fn agg_err(kind: &str, detail: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("{ERR_AGG_PREFIX}{kind}: {detail}"))
 }
 
+/// A call on a client after `close()`. Reuses `invalid-args` rather than
+/// minting a kind, which would ripple through the cross-language
+/// error-kind mirror for a purely local misuse.
+fn closed_err() -> Error {
+    agg_err("invalid-args", "client is closed")
+}
+
 fn registry_err(e: RegistryClientError) -> Error {
     match e {
         RegistryClientError::Transport(t) => agg_err("transport", t),
@@ -160,9 +167,13 @@ impl From<&::net::adapter::net::behavior::aggregator::SummaryAnnouncement>
 /// returns a fresh wrapper that **shares the inner state** —
 /// both the new and original wrapper observe the new deadline.
 /// Matches the C-FFI / Go shape.
+///
+/// The client holds a reference to the mesh node, and `NetMesh.shutdown`
+/// needs sole ownership: call `close()` before shutting the node down.
 #[napi]
 pub struct RegistryClient {
-    inner: Arc<ParkingRwLock<SdkRegistryClient>>,
+    /// `None` once closed.
+    inner: Arc<ParkingRwLock<Option<SdkRegistryClient>>>,
 }
 
 #[napi]
@@ -171,15 +182,15 @@ impl RegistryClient {
     pub fn create(mesh: &crate::NetMesh) -> Result<Self> {
         let mesh_arc = mesh.node_arc_clone()?;
         Ok(Self {
-            inner: Arc::new(ParkingRwLock::new(SdkRegistryClient::new(mesh_arc))),
+            inner: Arc::new(ParkingRwLock::new(Some(SdkRegistryClient::new(mesh_arc)))),
         })
     }
 
     #[napi]
     pub fn with_deadline(&self, millis: u32) -> Self {
-        self.inner
-            .write()
-            .set_deadline_mut(Duration::from_millis(u64::from(millis)));
+        if let Some(client) = self.inner.write().as_mut() {
+            client.set_deadline_mut(Duration::from_millis(u64::from(millis)));
+        }
         Self {
             inner: Arc::clone(&self.inner),
         }
@@ -188,7 +199,7 @@ impl RegistryClient {
     #[napi]
     pub async fn list(&self, target_node_id: BigInt) -> Result<Vec<RegistryGroupSummaryJs>> {
         let target = crate::common::bigint_u64(target_node_id)?;
-        let client = self.inner.read().clone();
+        let client = self.inner.read().clone().ok_or_else(closed_err)?;
         let groups = client.list(target).await.map_err(registry_err)?;
         Ok(groups.iter().map(Into::into).collect())
     }
@@ -208,7 +219,7 @@ impl RegistryClient {
                 format!("replicaCount must be 1..=255, got {replica_count}"),
             )
         })?;
-        let client = self.inner.read().clone();
+        let client = self.inner.read().clone().ok_or_else(closed_err)?;
         let summary = client
             .spawn(target, template_name, group_name, count)
             .await
@@ -219,11 +230,34 @@ impl RegistryClient {
     #[napi]
     pub async fn unregister(&self, target_node_id: BigInt, group_name: String) -> Result<bool> {
         let target = crate::common::bigint_u64(target_node_id)?;
-        let client = self.inner.read().clone();
+        let client = self.inner.read().clone().ok_or_else(closed_err)?;
         client
             .unregister(target, group_name)
             .await
             .map_err(registry_err)
+    }
+
+    /// Release this client's reference to the mesh node so
+    /// `NetMesh.shutdown` can take sole ownership. Idempotent; it closes
+    /// every alias `with*` returned, since they share state. Afterwards
+    /// each call rejects with `agg:invalid-args: client is closed`.
+    ///
+    /// A call already in flight holds its own reference until it
+    /// settles; await outstanding calls before `shutdown()`, or it may
+    /// still find the node shared.
+    ///
+    /// Without it the reference lived until V8 finalized the client, so
+    /// `shutdown()` failed with "outstanding references exist" on no
+    /// schedule the caller controls (the `MeshRpc.close()` precedent).
+    #[napi]
+    pub fn close(&self) {
+        let _ = self.inner.write().take();
+    }
+
+    /// `true` once [`Self::close`] has been called.
+    #[napi(getter)]
+    pub fn is_closed(&self) -> bool {
+        self.inner.read().is_none()
     }
 }
 
@@ -234,9 +268,12 @@ impl RegistryClient {
 /// Wire-shaped client for `fold.query` RPC. Same in-place
 /// builder shape as [`RegistryClient`]; the warmed cache
 /// survives `with_ttl` / `with_deadline` adjustments.
+///
+/// Like [`RegistryClient`], call `close()` before `NetMesh.shutdown`.
 #[napi]
 pub struct FoldQueryClient {
-    inner: Arc<ParkingRwLock<SdkFoldQueryClient>>,
+    /// `None` once closed.
+    inner: Arc<ParkingRwLock<Option<SdkFoldQueryClient>>>,
 }
 
 #[napi]
@@ -245,15 +282,15 @@ impl FoldQueryClient {
     pub fn create(mesh: &crate::NetMesh) -> Result<Self> {
         let mesh_arc = mesh.node_arc_clone()?;
         Ok(Self {
-            inner: Arc::new(ParkingRwLock::new(SdkFoldQueryClient::new(mesh_arc))),
+            inner: Arc::new(ParkingRwLock::new(Some(SdkFoldQueryClient::new(mesh_arc)))),
         })
     }
 
     #[napi]
     pub fn with_ttl(&self, millis: u32) -> Self {
-        self.inner
-            .write()
-            .set_ttl_mut(Duration::from_millis(u64::from(millis)));
+        if let Some(client) = self.inner.write().as_mut() {
+            client.set_ttl_mut(Duration::from_millis(u64::from(millis)));
+        }
         Self {
             inner: Arc::clone(&self.inner),
         }
@@ -261,9 +298,9 @@ impl FoldQueryClient {
 
     #[napi]
     pub fn with_deadline(&self, millis: u32) -> Self {
-        self.inner
-            .write()
-            .set_deadline_mut(Duration::from_millis(u64::from(millis)));
+        if let Some(client) = self.inner.write().as_mut() {
+            client.set_deadline_mut(Duration::from_millis(u64::from(millis)));
+        }
         Self {
             inner: Arc::clone(&self.inner),
         }
@@ -278,7 +315,7 @@ impl FoldQueryClient {
         let target = crate::common::bigint_u64(target_node_id)?;
         let kind_u16 = u16::try_from(kind)
             .map_err(|_| agg_err("invalid-args", format!("kind must fit in u16, got {kind}")))?;
-        let client = self.inner.read().clone();
+        let client = self.inner.read().clone().ok_or_else(closed_err)?;
         let summaries = client
             .query_latest(target, kind_u16)
             .await
@@ -295,7 +332,7 @@ impl FoldQueryClient {
         let target = crate::common::bigint_u64(target_node_id)?;
         let kind_u16 = u16::try_from(kind)
             .map_err(|_| agg_err("invalid-args", format!("kind must fit in u16, got {kind}")))?;
-        let client = self.inner.read().clone();
+        let client = self.inner.read().clone().ok_or_else(closed_err)?;
         let summaries = client
             .query_summarize_now(target, kind_u16)
             .await
@@ -304,14 +341,46 @@ impl FoldQueryClient {
     }
 
     #[napi]
-    pub fn invalidate_cache(&self) {
-        self.inner.read().invalidate_cache();
+    pub fn invalidate_cache(&self) -> Result<()> {
+        self.inner
+            .read()
+            .as_ref()
+            .ok_or_else(closed_err)?
+            .invalidate_cache();
+        Ok(())
     }
 
     #[napi]
     pub fn invalidate_target(&self, target_node_id: BigInt) -> Result<()> {
         let target = crate::common::bigint_u64(target_node_id)?;
-        self.inner.read().invalidate_target(target);
+        self.inner
+            .read()
+            .as_ref()
+            .ok_or_else(closed_err)?
+            .invalidate_target(target);
         Ok(())
+    }
+
+    /// Release this client's reference to the mesh node so
+    /// `NetMesh.shutdown` can take sole ownership. Idempotent; it closes
+    /// every alias `with*` returned, since they share state. Afterwards
+    /// each call rejects with `agg:invalid-args: client is closed`.
+    ///
+    /// A call already in flight holds its own reference until it
+    /// settles; await outstanding calls before `shutdown()`, or it may
+    /// still find the node shared.
+    ///
+    /// Without it the reference lived until V8 finalized the client, so
+    /// `shutdown()` failed with "outstanding references exist" on no
+    /// schedule the caller controls (the `MeshRpc.close()` precedent).
+    #[napi]
+    pub fn close(&self) {
+        let _ = self.inner.write().take();
+    }
+
+    /// `true` once [`Self::close`] has been called.
+    #[napi(getter)]
+    pub fn is_closed(&self) -> bool {
+        self.inner.read().is_none()
     }
 }

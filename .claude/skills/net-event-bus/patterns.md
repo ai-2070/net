@@ -77,11 +77,12 @@ let resp: Resp = client.call_typed(server_node_id, "echo_sum", &req,
 ```
 
 ```typescript
-// TS — TypedMeshRpc.serve + .call (from @net-mesh/core/mesh_rpc)
-const rpc = TypedMeshRpc.fromMesh((mesh as any)._native)
+// TS — TypedMeshRpc.serve + .call, from MeshNode.rpc()
+const rpc = mesh.rpc()
 const handle = rpc.serve('echo_sum', async (req) => handleSync(req))
 const resp = await rpc.call(serverNodeId, 'echo_sum', req, { deadlineMs: 200 })
 await handle.close()  // MUST close — finalizers are non-deterministic
+rpc.raw.close()       // release the node reference before shutdown()
 ```
 
 ```python
