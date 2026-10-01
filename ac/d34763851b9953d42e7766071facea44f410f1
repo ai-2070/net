@@ -1,0 +1,61 @@
+net/crates/net/sdk-ts/src/delegation.ts
+  s_f9febccc288dd3::t_3757e44a182256 19-20
+net/crates/net/sdk-ts/test/package_entry_points.test.ts
+  s_f9febccc288dd3::t_277e38b2f4dab9 42-44,102-103
+net/crates/net/bindings/node/src/cortex.rs
+  s_f9febccc288dd3::t_689c477489c876 181-190,253-254,282-284,397-398,509-510,563-564
+  s_f9febccc288dd3::t_458c0b3ffd4df4 179-180
+net/crates/net/bindings/node/src/aggregator.rs
+  s_f9febccc288dd3::t_b11f85b50348bd 245-248,344-350,356-360,369-372
+net/crates/net/bindings/python/tests/test_redex.py
+  s_f9febccc288dd3::t_51e4506b59cc4d 267-276
+  s_f9febccc288dd3::t_87b9fb9c7dd7b4 185-187
+net/crates/net/sdk-ts/test/mesh_node_surface.test.ts
+  s_f9febccc288dd3::t_045d617248a432 8-10,74-85
+docs/internal/plans/NODE_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_f940e8ba270525 775-819
+  s_f9febccc288dd3::t_48022c05112818 170-173,848-850
+web/src/content/docs/sdk/typescript/README.md
+  s_f9febccc288dd3::t_3757e44a182256 65-67
+net/crates/net/bindings/node/src/enrollment.rs
+  s_f9febccc288dd3::t_11e9285b7a6584 57-73,96,159,291-292,461,485,498,538,617
+net/crates/net/sdk-ts/src/mesh.ts
+  s_f9febccc288dd3::t_3a5212b527dbfa 1070
+net/crates/net/sdk-ts/src/_internal.ts
+  s_f9febccc288dd3::t_0e64251fff0950 63-67
+net/crates/net/bindings/node/test/aggregator.test.ts
+  s_f9febccc288dd3::t_5517f7172a7bb8 64-67,79-89
+  s_f9febccc288dd3::t_576481b297ce06 9-10
+  s_f9febccc288dd3::t_c0a797c890653b 11,90-92
+net/crates/net/sdk-ts/test/mesh_config_forwarding.test.ts
+  s_f9febccc288dd3::t_92bf6716c90c07 29-51,58,81-84
+net/crates/net/sdk-ts/README.md
+  s_f9febccc288dd3::t_3757e44a182256 239-241
+net/crates/net/sdk-ts/test/trust_surfaces.test.ts
+  s_f9febccc288dd3::t_0672894a621ad9 153-166
+net/crates/net/bindings/node/aggregator.ts
+  s_f9febccc288dd3::t_84dfdc86e3073c 20-23,63-66,130-137
+net/crates/net/sdk-ts/test/small_surfaces.test.ts
+  s_f9febccc288dd3::t_e7ccb0d3845007 57-62,64-70,72-85
+net/crates/net/bindings/python/src/cortex.rs
+  s_f9febccc288dd3::t_0a483422a9c31c 264-273,449-452,474-476,510-511,630-632,741-743
+net/crates/net/sdk-ts/test/redex_replication.test.ts
+  s_f9febccc288dd3::t_2f80e33badf65e 13-16,115-128
+  s_f9febccc288dd3::t_803d534dce46c1 129-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "acd34763851b9953d42e7766071facea44f410f1",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
