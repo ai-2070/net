@@ -998,6 +998,151 @@ export class MeshNode {
     return this.native.fetchDir(sourceId, manifestRef, dest);
   }
 
+  // ---- NAT traversal (nat-traversal builds) ----
+  //
+  // NODE_SDK_GAPS_PLAN.md S5: these, and every group below, forward to the
+  // native NetMesh with its exact signature (`Parameters<…>` keeps the
+  // parameter names). Methods a build was compiled without throw from the
+  // native layer.
+
+  /** This node's NAT class: `"open" | "cone" | "symmetric" | "unknown"`. `"unknown"` until classified (after `start()`, with 2+ peers), or `"open"` at once under a reflex override. */
+  natType(...args: Parameters<NapiNetMesh['natType']>): ReturnType<NapiNetMesh['natType']> {
+    return this.native.natType(...args);
+  }
+
+  /** This node's public `ip:port` as a peer observed it, or `null` before classification. A reflex override supplies it immediately. */
+  reflexAddr(...args: Parameters<NapiNetMesh['reflexAddr']>): ReturnType<NapiNetMesh['reflexAddr']> {
+    return this.native.reflexAddr(...args);
+  }
+
+  /** The NAT class `peerNodeId` last advertised, or `"unknown"`. */
+  peerNatType(...args: Parameters<NapiNetMesh['peerNatType']>): ReturnType<NapiNetMesh['peerNatType']> {
+    return this.native.peerNatType(...args);
+  }
+
+  /** Probe `peerNodeId` for this node's observed `ip:port`. Rejects with a `traversal: <kind>` message on failure. */
+  probeReflex(...args: Parameters<NapiNetMesh['probeReflex']>): ReturnType<NapiNetMesh['probeReflex']> {
+    return this.native.probeReflex(...args);
+  }
+
+  /** Re-run NAT classification now (e.g. after a suspected NAT rebind). */
+  reclassifyNat(...args: Parameters<NapiNetMesh['reclassifyNat']>): ReturnType<NapiNetMesh['reclassifyNat']> {
+    return this.native.reclassifyNat(...args);
+  }
+
+  /** Pin this node's public reflex to `external` (`"ip:port"`); classification is skipped. */
+  setReflexOverride(...args: Parameters<NapiNetMesh['setReflexOverride']>): ReturnType<NapiNetMesh['setReflexOverride']> {
+    return this.native.setReflexOverride(...args);
+  }
+
+  /** Drop a reflex override; the classifier resumes. No-op when none is set. */
+  clearReflexOverride(...args: Parameters<NapiNetMesh['clearReflexOverride']>): ReturnType<NapiNetMesh['clearReflexOverride']> {
+    return this.native.clearReflexOverride(...args);
+  }
+
+  /** Establish a session to `peerNodeId` via the rendezvous path, `coordinator` mediating. An optimization: a failed punch falls back to the routed path. */
+  connectDirect(...args: Parameters<NapiNetMesh['connectDirect']>): ReturnType<NapiNetMesh['connectDirect']> {
+    return this.native.connectDirect(...args);
+  }
+
+  /** `connectDirect` with the coordinator chosen for you. */
+  connectDirectAuto(...args: Parameters<NapiNetMesh['connectDirectAuto']>): ReturnType<NapiNetMesh['connectDirectAuto']> {
+    return this.native.connectDirectAuto(...args);
+  }
+
+  /** Cumulative NAT-traversal counters. */
+  traversalStats(...args: Parameters<NapiNetMesh['traversalStats']>): ReturnType<NapiNetMesh['traversalStats']> {
+    return this.native.traversalStats(...args);
+  }
+
+  // ---- Agent-to-agent tasks (a2a builds) ----
+
+  /** Serve the A2A task lifecycle, backed by an async executor `(brief) => Promise<artifactRef>`. Hold the returned handle to keep accepting tasks; the node must be started. */
+  serveA2a(...args: Parameters<NapiNetMesh['serveA2a']>): ReturnType<NapiNetMesh['serveA2a']> {
+    return this.native.serveA2a(...args);
+  }
+
+  /** Hand a task to the executor at `targetNodeId`; resolves to the accepted task id. A caller-chosen `taskId` makes a resubmission idempotent on a provider with durable admission. */
+  submitTask(...args: Parameters<NapiNetMesh['submitTask']>): ReturnType<NapiNetMesh['submitTask']> {
+    return this.native.submitTask(...args);
+  }
+
+  /** The executor's status for `taskId` as JSON (`{brief, state, updatedAt}`), or `null` if unknown. */
+  taskStatus(...args: Parameters<NapiNetMesh['taskStatus']>): ReturnType<NapiNetMesh['taskStatus']> {
+    return this.native.taskStatus(...args);
+  }
+
+  /** Cancel `taskId` on the executor; resolves to whether it was in flight. */
+  cancelTask(...args: Parameters<NapiNetMesh['cancelTask']>): ReturnType<NapiNetMesh['cancelTask']> {
+    return this.native.cancelTask(...args);
+  }
+
+  // ---- Publishing this node's own tools (publish builds) ----
+
+  /** Publish this node's own tools as mesh capabilities, invoked through `handler`. Hold the returned handle to keep them published. Needs a started node created with `permissiveChannels: true` (the tools ride dynamically named channels). */
+  publishTools(...args: Parameters<NapiNetMesh['publishTools']>): ReturnType<NapiNetMesh['publishTools']> {
+    return this.native.publishTools(...args);
+  }
+
+  // ---- Device enrollment over the mesh (delegation builds) ----
+  //
+  // These take the NATIVE enrollment objects and identity (see
+  // `enrollment.ts`): pass an SDK `Identity` as `identity.toNapi()`.
+
+  /** This node's invite rendezvous locator, for `OperatorEnrollment.invite`. */
+  rendezvousString(...args: Parameters<NapiNetMesh['rendezvousString']>): ReturnType<NapiNetMesh['rendezvousString']> {
+    return this.native.rendezvousString(...args);
+  }
+
+  /** Operator side: serve device enrollment (join + renew) on this node; the invite is the authorization. Hold the returned handle. */
+  serveEnrollmentAuto(...args: Parameters<NapiNetMesh['serveEnrollmentAuto']>): ReturnType<NapiNetMesh['serveEnrollmentAuto']> {
+    return this.native.serveEnrollmentAuto(...args);
+  }
+
+  /** Device side: enroll `device` into the mesh the `invite` string names; resolves to the verified `root → device` chain. */
+  join(...args: Parameters<NapiNetMesh['join']>): ReturnType<NapiNetMesh['join']> {
+    return this.native.join(...args);
+  }
+
+  /** Device side: refresh `enrollment`'s grant over the mesh; resolves to the fresh chain. */
+  renew(...args: Parameters<NapiNetMesh['renew']>): ReturnType<NapiNetMesh['renew']> {
+    return this.native.renew(...args);
+  }
+
+  // ---- Placement filters ----
+
+  /** Register a placement predicate under `id`; `false` if `id` is already registered. */
+  registerPlacementFilter(...args: Parameters<NapiNetMesh['registerPlacementFilter']>): ReturnType<NapiNetMesh['registerPlacementFilter']> {
+    return this.native.registerPlacementFilter(...args);
+  }
+
+  /** Drop the predicate under `id`; `true` if it existed. */
+  unregisterPlacementFilter(...args: Parameters<NapiNetMesh['unregisterPlacementFilter']>): ReturnType<NapiNetMesh['unregisterPlacementFilter']> {
+    return this.native.unregisterPlacementFilter(...args);
+  }
+
+  /** Whether a predicate is registered under `id`. */
+  hasPlacementFilter(...args: Parameters<NapiNetMesh['hasPlacementFilter']>): ReturnType<NapiNetMesh['hasPlacementFilter']> {
+    return this.native.hasPlacementFilter(...args);
+  }
+
+  // ---- Discovery and low-level routing ----
+
+  /** How many nodes this node's proximity graph knows about. */
+  discoveredNodes(...args: Parameters<NapiNetMesh['discoveredNodes']>): ReturnType<NapiNetMesh['discoveredNodes']> {
+    return this.native.discoveredNodes(...args);
+  }
+
+  /** Send a raw payload to a direct peer address. Low-level; prefer streams or channels. */
+  pushTo(...args: Parameters<NapiNetMesh['pushTo']>): ReturnType<NapiNetMesh['pushTo']> {
+    return this.native.pushTo(...args);
+  }
+
+  /** Add a routing-table entry. Low-level; routes are normally learned. */
+  addRoute(...args: Parameters<NapiNetMesh['addRoute']>): ReturnType<NapiNetMesh['addRoute']> {
+    return this.native.addRoute(...args);
+  }
+
   // ---- Gang-claim resource-island scheduler ----
   //
   // The peer-aware Thunderdome surface. `Reserved` is optimistic/AP;
@@ -1367,3 +1512,22 @@ function toChannelError(e: unknown): never {
   }
   throw e;
 }
+
+// Wrap guard (NODE_SDK_GAPS_PLAN.md S5). 24 native `NetMesh` methods once had
+// no `MeshNode` wrapper and nothing noticed. Now every native method must be
+// a public `MeshNode` member or be named here with its reason; one that is
+// neither fails `npm run build`, and the error names it.
+type NativeMeshMethod = {
+  [K in keyof NapiNetMesh]: NapiNetMesh[K] extends (...args: never[]) => unknown ? K : never;
+}[keyof NapiNetMesh];
+/** Native methods deliberately not wrapped under their own name. */
+type NotWrappedByName =
+  | 'poll' // wrapped as `recv`
+  | 'pollShard' // wrapped as `recvShard`
+  | 'testInjectSyntheticPeer' // test hook, exposed as `_testInjectSyntheticPeer`
+  | 'testInjectSyntheticPeerWithTags'; // test hook, as `_testInjectSyntheticPeerWithTags`
+type UnwrappedNativeMethod = Exclude<NativeMeshMethod, keyof MeshNode | NotWrappedByName>;
+const everyNativeMeshMethodIsWrapped: [UnwrappedNativeMethod] extends [never]
+  ? true
+  : UnwrappedNativeMethod = true;
+void everyNativeMeshMethodIsWrapped;

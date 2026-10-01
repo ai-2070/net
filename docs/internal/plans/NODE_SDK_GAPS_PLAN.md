@@ -3,8 +3,8 @@
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/node-sdk`
-(the plan was written on `LZL0/python-sdk`, merged as #1133). S1–S4 done 2026-10-01
-(see each slice); S5–S7 not started.
+(the plan was written on `LZL0/python-sdk`, merged as #1133). S1–S5 done 2026-10-01
+(see each slice); S6–S7 not started.
 
 **Checked before starting, 2026-10-01:** the two bug classes the Python work
 found don't apply here. The Node `poll` already sweeps every shard through
@@ -466,6 +466,41 @@ check the floor.
       clears it.
 - **Proves it:** the static check fails on today's `MeshNode` with the 24 names
   above.
+
+- **Done 2026-10-01.**
+  - **25 methods, not 24.** The N5 table missed `join` (device-side
+    enrollment), which the guard found. All 25 are now on `MeshNode` in
+    `src/mesh.ts`, each typed `Parameters<NapiNetMesh['x']>` /
+    `ReturnType<…>` so a native signature change flows through.
+  - **The static guard lives in `src/mesh.ts`, not the test**, so it runs
+    on every `tsc` build (the SDK's own and the package smoke test), not only
+    under vitest. It computes the function-typed keys of `NapiNetMesh` minus
+    `keyof MeshNode` minus a named allow-list, and the build error names
+    what's missing. The allow-list is four names: `poll` / `pollShard`
+    (`MeshNode` wraps them as `recv` / `recvShard`) and the two
+    `testInjectSyntheticPeer*` test hooks. **RED:** removing
+    `traversalStats` gives `Type 'true' is not assignable to type
+    '"traversalStats"'`.
+  - **Forwarding test:** `test/mesh_node_surface.test.ts` (26 tests).
+    `vi.mock('@net-mesh/core')` returns a `Proxy` native, one `vi.fn` per
+    method; each row passes sentinel objects and checks the native got them
+    by identity and the caller got the native's result. (The proxy returns
+    `undefined` for `then`, or `await MeshNode.create` never settles.)
+  - **Live test:** `test/mesh_node_live.test.ts` (4 tests), SDK root imports
+    only, no skips:
+    - NAT: `unknown` before classification, `open` with the override's
+      address under `setReflexOverride`, cleared by `clearReflexOverride`,
+      a bad address rejected;
+    - `serveA2a` → `submitTask` → `taskStatus` reaches `completed` with the
+      result ref across two nodes;
+    - placement filters register, refuse a duplicate id, and unregister;
+    - **the deferred S3 round trip:** a device `join`s over the mesh via
+      `rendezvousString` / `serveEnrollmentAuto`, the operator records it,
+      and `renew` returns a fresh chain rooted at the operator.
+  - **RED** with the committed `mesh.ts`: 29 of 30 fail (`… is not a
+    function`); the one that passes is the row-count check. **GREEN:** full
+    suite **647 passed** (40 files), the package smoke test and
+    `check-ts-consumer.sh` pass.
 
 ### S6 — N6, small items
 
