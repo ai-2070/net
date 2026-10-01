@@ -15,6 +15,9 @@ Amended 2026-10-01, same day:
   Python receive-side design.
 - Part B then moved to its own file,
   [`RUST_SDK_GAPS_PLAN.md`](RUST_SDK_GAPS_PLAN.md).
+- After review: G6 (dropped constructor options) and slice S1a, which owns it,
+  were added. The Node survey had handed G6 to this plan without a slice. S0
+  also gained the `NetMesh.__init__` stub fix.
 
 ## The gap
 
@@ -87,6 +90,35 @@ name and must not be confused in the new API.
 - **`net_sdk.identity`.** The wheel exports `Identity`, `TokenError`, `IdentityError`, `channel_hash`, `stream_id_from_label`, `verify_signature` and `delegate_token`. `net_sdk` only exposes the delegation helpers. Note: `_net.pyi` has no `Token` class (TS exports one). Tokens cross the Python boundary as `bytes`.
 - **`net_sdk.subnets`.** TS `subnets.ts` has `subnetId`, `GLOBAL_SUBNET`, `SubnetRule`, `SubnetPolicy`. Python takes subnets as raw `list` / `dict` constructor kwargs.
 - **Async SDK node.** `net_sdk` has no async `MeshNode`, although the wheel ships `AsyncNetMesh`, `AsyncDaemonRuntime`, `AsyncMeshBlobAdapter` and friends ([`PYTHON_ASYNC_SDK_SIDE_BY_SIDE.md`](PYTHON_ASYNC_SDK_SIDE_BY_SIDE.md) built the native half).
+
+### G6 — `MeshNode.__init__` drops six native options
+
+Found by the Node survey ([`NODE_SDK_GAPS_PLAN.md`](NODE_SDK_GAPS_PLAN.md)
+N2, where Node has the same class of bug). Checked by diffing the parameters
+of the native constructor (`#[pyo3(signature = …)]`,
+`bindings/python/src/lib.rs:1456`) against `net_sdk.MeshNode.__init__`
+(`sdk-py/src/net_sdk/mesh.py:98`).
+
+The native constructor accepts six keyword arguments that the SDK neither
+declares nor forwards:
+
+| Option | Effect when dropped |
+|---|---|
+| `capability_gc_interval_ms` | Capability-index GC cadence can't be tuned |
+| `require_signed_capabilities` | **Security-relevant:** an SDK user can't make the node reject unsigned capability announcements |
+| `reflex_override` | Can't pin the public reflex address |
+| `try_port_mapping` | Can't enable UPnP/NAT-PMP port mapping |
+| `auto_direct_upgrade` | Can't enable direct-path upgrade after relay |
+| `permissive_channels` | Can't opt into permissive channel admission |
+
+This is the second time this wrapper has dropped constructor options: the
+`mesh.py` comment "SSDK P4: forward the topology kwargs this wrapper used to
+drop" records the first. Nothing stops a third, hence the drift guard in S1a.
+
+**Related stub drift.** The `NetMesh.__init__` stub (`_net.pyi` ~line 828)
+omits `subnet_authorities`, `subnet_attachment`, `subnet_control_channel` and
+`subnet_exports`. The native signature (`lib.rs:1471–1474`) has all four, and
+the SDK already passes them. Type checkers reject a correct call. S0 fixes it.
 
 ## The design
 
@@ -202,6 +234,9 @@ the slice were wrong. Two test homes, with different jobs:
   in `compute.rs` / `groups.rs`.
 - Add `NetMesh.capability_aggregate` / `capability_capacity_ranking`.
 - Fix the `MigrationError` docstring to point at `net.migration_error_kind`.
+- Add `subnet_authorities`, `subnet_attachment`, `subnet_control_channel` and
+  `subnet_exports` to the `NetMesh.__init__` stub (G6, related stub drift).
+  S1a's guard checks the stub against the native signature from then on.
 - **Verified 2026-10-01: today's tests can't catch the empty stubs.** Two tests
   guard the stub, and neither checks that a declared class's methods are all
   stubbed:
@@ -228,6 +263,47 @@ the slice were wrong. Two test homes, with different jobs:
   `capability_aggregate`) and pass after the stub fill. Record the RED run in
   this plan when the slice lands. These tests skip when no wheel is built, so
   the RED/GREEN run needs `maturin develop` with the default features.
+
+### S1a — Forward every constructor option, with a drift guard (G6)
+
+- Add the six options from G6 to `MeshNode.__init__` as keyword-only
+  arguments, with the native types, and forward them to `_NetMesh(...)`.
+- **The drift guard:** new test `bindings/python/tests/test_sdk_mesh_ctor_parity.py`.
+  It lives with the wheel tests because it needs the real native signature.
+  - **The source of truth is the native constructor itself.** Read the
+    parameter names from `inspect.signature(net._net.NetMesh)`. PyO3 publishes
+    a `__text_signature__` for a `#[new]` with an explicit `signature`. If
+    that's unavailable, parse the `#[pyo3(signature = (…))]` block above
+    `NetMesh::new` in `bindings/python/src/lib.rs` instead. If **neither**
+    source yields a list, the test fails; it must never skip, because a
+    skipped drift guard is the silent no-op AGENTS.md warns about. Don't
+    hand-maintain the list.
+  - **Assertion 1:** native parameter names == `net_sdk.MeshNode.__init__`
+    parameter names, minus an explicit allow-list where each entry has a reason.
+    The allow-list starts empty.
+  - **Assertion 2:** native parameter names == the `NetMesh.__init__`
+    parameters in `_net.pyi`, parsed with `ast`. This catches the stub half of
+    G6.
+  - **Assertion 3 (forwarding, not just declaration):** construct a `MeshNode`
+    with every optional kwarg set to a distinct sentinel, with `_NetMesh`
+    monkeypatched to record its kwargs. Every sentinel must reach the native
+    call unchanged. A declared-but-not-forwarded option fails here.
+- **Behaviour is witnessed where it lives, not re-witnessed here.** What
+  `require_signed_capabilities` *does* (rejecting unsigned announcements) is
+  covered by the Rust integration suite (`tests/capability_broadcast.rs`,
+  `tests/capability_multihop.rs`, `tests/subnet_auth_e2e.rs`). The Python
+  binding only checks that the option constructs (`test_subnets.py:196`). A
+  Python-level rejection test isn't buildable through the public API, because
+  every Python node signs its own announcements. So this slice's claim is
+  exactly "the option reaches the native constructor", which Assertion 3
+  proves. A live smoke test constructs a `net_sdk.MeshNode` with all six
+  options set to valid values and shuts it down cleanly, proving the
+  forwarded values are accepted, not just passed along.
+- **Proves it:**
+  - Assertion 1 fails on today's tree, naming the six options.
+  - Assertion 2 fails on today's stub, naming the four `subnet_*` kwargs.
+  - Assertion 3 fails if a future option is declared but not forwarded.
+  - Record both RED runs here when the slice lands.
 
 ### S1 — Mesh channels on `MeshNode`
 

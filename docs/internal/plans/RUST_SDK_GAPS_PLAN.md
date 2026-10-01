@@ -5,6 +5,8 @@
 Planned, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
 No slice has landed yet.
 
+Amended 2026-10-01 after review: the R1 design now requires `StreamDataSubscription` to keep core's registration ownership (`Weak<MeshNode>`, unregister by stream id + registration id). S1 gained a stale-handle teardown witness and a no-keep-alive-past-shutdown witness.
+
 This plan was split out of
 [`PYTHON_SDK_WRAPPER_PARITY_PLAN.md`](PYTHON_SDK_WRAPPER_PARITY_PLAN.md), where
 the survey started as its Part B. The two plans touch at one point: R1 here
@@ -107,6 +109,29 @@ which the SDK already covers with `discovered_nodes`. No slice.
 - Add `Mesh::on_stream_data(stream_id, f) -> Option<StreamDataSubscription>`
   over `register_stream_inbound`. The subscription unregisters on drop,
   mirroring TS `StreamDataSubscription`.
+- **Registration ownership is preserved, not re-invented** (added 2026-10-01
+  after review). Core's ownership model is already right, and the SDK handle
+  must keep it exactly:
+  - `register_stream_inbound` returns a registration id, and
+    `unregister_stream_inbound(stream_id, registration_id)` removes the sink
+    only if that id still owns the slot. Its doc comment states the purpose:
+    "a stale teardown cannot evict a newer registration" (`mesh.rs` ~line
+    34170).
+  - `StreamInbox` holds `Weak<MeshNode>` plus its registration id
+    (`mesh.rs:2085`), and closes on drop.
+  - The Node binding's `StreamDataSubscription` (`bindings/node/src/lib.rs:1133`)
+    is the reference implementation. It holds `Weak<MeshNode>`, `stream_id`,
+    `registration_id` and an idempotent `closed` flag, and unregisters by
+    **both** ids. Its comment gives the reason for `Weak`: a live subscription
+    must not keep the node alive past `shutdown()`, because an outstanding
+    strong reference makes shutdown fail.
+
+  So the SDK's `StreamDataSubscription` stores `Weak<MeshNode>` (never an
+  `Arc`), `stream_id`, `registration_id` and a `closed` flag. Its
+  `close()` / `Drop` call `unregister_stream_inbound(stream_id,
+  registration_id)` once, and are a no-op when the node is gone. It never
+  calls a stream-id-only removal. `Mesh::open_stream_inbox` returns the core
+  `StreamInbox` unwrapped, so its `Weak` ownership carries through unchanged.
 - The doc comment carries core's contract: one sink per stream (`None` if one
   is already registered); events past `capacity` are dropped and counted, not
   queued.
@@ -145,6 +170,21 @@ already reach them through the `net` crate. Revisit if one gets wired into
   - A second `open_stream_inbox` on the same stream returns `None`.
   - Dropping the subscription returns events to `recv`.
   - Overflowing `capacity` increments `dropped()`.
+  - **Stale-handle teardown (the ownership witness).**
+    1. Subscribe A on stream S, then `close()` A.
+    2. Subscribe B on S. It succeeds, and the core issues a new registration id.
+    3. Drop A's (already closed) handle, and call `close()` on it again first,
+       to check repeat closes too. The handle is deliberately not `Clone`, so
+       there's no second copy to test.
+    4. B must still receive events on S.
+
+    Repeat with A as an inbox and B as a callback. This fails if the handle
+    ever unregisters by stream id alone, or by a registration id it doesn't
+    own.
+  - **No node keep-alive.** With a live subscription and a live inbox still
+    held, `mesh.shutdown()` succeeds. Afterwards, dropping both handles doesn't
+    panic, and `close()` returns without effect. This fails if either handle
+    holds an `Arc<MeshNode>`.
 - Run it with `cargo tf -p net-mesh-sdk --test stream_inbound` (TESTS.md
   idiom).
 - No `ci.yml` pin is needed: CI's nextest step auto-discovers every
@@ -168,6 +208,11 @@ already reach them through the `net` crate. Revisit if one gets wired into
   *Mitigation:* the doc comment says so and points at `open_stream_inbox` for
   any work that can block. This is the same split core already documents for
   the bindings.
+- **A handle that "simplifies" ownership.** Holding an `Arc<MeshNode>`, or
+  unregistering by stream id alone, both look harmless and both are wrong:
+  the first blocks `shutdown()`, the second lets a stale handle evict a
+  successor. *Mitigation:* the two S1 ownership witnesses fail on either
+  change.
 - **Sink conflicts with the bindings.** Core allows one sink per stream. A Rust
   SDK user who also hands the node to a binding could collide. *Mitigation:*
   `None` on conflict is already core's behaviour; the SDK passes it through and
