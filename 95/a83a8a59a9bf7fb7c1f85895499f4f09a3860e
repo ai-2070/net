@@ -1,0 +1,71 @@
+net/crates/net/rust-toolchain.toml
+  s_a9c38fc597b27f::t_96a1c91aff4aa2 2
+net/crates/net/sdk/tests/sensing_consumer.rs
+  s_a9c38fc597b27f::t_4a161e760aabc4 1969
+net/crates/net/sdk/src/gang.rs
+  s_a9c38fc597b27f::t_4c04f3eabb6d91 11
+AGENTS.md
+  s_a9c38fc597b27f::t_96a1c91aff4aa2 211
+net/crates/net/tests/loom_models.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 144
+.github/workflows/panic-probe-witness.yml
+  s_a9c38fc597b27f::t_96a1c91aff4aa2 50
+net/crates/net/cli/tests/fixtures/README.md
+  s_a9c38fc597b27f::t_96a1c91aff4aa2 3
+net/crates/net/src/adapter/net/rtc/driver.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 717
+net/crates/net/src/adapter/net/mesh.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 9962
+net/crates/net/src/shard/mapper.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 215,224
+  s_a9c38fc597b27f::t_136530c38ab416 238-246
+net/crates/net/src/adapter/net/failure.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 732,736,741
+net/crates/net/src/adapter/net/proxy.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 378,383,388,393
+net/crates/net/src/adapter/net/cortex/rpc_large_response.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 145
+net/crates/net/src/adapter/net/behavior/sensing/evaluator.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 520,525
+net/crates/net/src/adapter/net/rtc/stats.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 466
+net/crates/net/src/adapter/net/rtc/fragment.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 717
+net/crates/net/sdk/src/a2a_journal.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 2262
+net/crates/net/src/adapter/net/rtc/transport.rs
+  s_a9c38fc597b27f::t_136530c38ab416 558-560
+net/crates/net/src/adapter/net/behavior/context.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 879,903
+net/crates/net/tests/bus_shutdown_drain.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 180,184,188
+net/crates/net/wire/src/session.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 2897,2903,2943,2949,2964,2985,2990,3034-3035,3132
+net/crates/net/src/adapter/net/behavior/safety.rs
+  s_a9c38fc597b27f::t_136530c38ab416 1460-1465
+  s_a9c38fc597b27f::t_58cdf979bf7f74 403,407,485,538,735,792,1160,1202,1212,1386,1388,1436,1446,1469,1477,1480,2316,2511
+.github/workflows/ci.yml
+  s_a9c38fc597b27f::t_96a1c91aff4aa2 4081,4447,6119,6121,7211
+net/crates/net/src/adapter/net/behavior/sensing/lease.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 494
+net/crates/net/sdk/src/tool.rs
+  s_a9c38fc597b27f::t_1734c19f136b84 676,704
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  s_a9c38fc597b27f::t_58cdf979bf7f74 353,380,2139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "95a83a8a59a9bf7fb7c1f85895499f4f09a3860e",
+  "prompts": {},
+  "sessions": {
+    "s_a9c38fc597b27f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e4dc29cd-6729-4ba0-af4b-56e2d3daa30c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
