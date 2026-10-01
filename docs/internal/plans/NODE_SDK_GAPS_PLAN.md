@@ -3,8 +3,8 @@
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/node-sdk`
-(the plan was written on `LZL0/python-sdk`, merged as #1133). S1–S6 done 2026-10-01
-(see each slice); S7 and S8 (N8, found during S6) not started.
+(the plan was written on `LZL0/python-sdk`, merged as #1133). S1–S7 done 2026-10-01
+(see each slice); S8 (N8, found during S6) not started.
 
 **Checked before starting, 2026-10-01:** the two bug classes the Python work
 found don't apply here. The Node `poll` already sweeps every shard through
@@ -586,6 +586,27 @@ check the floor.
 - `web/src/content/docs/`: the Node tabs for consent, delegation, enrollment
   and blobs, where Python tabs exist and Node ones don't.
 - **Proves it:** `npm run check` in `web/` stays green.
+
+- **Done 2026-10-01.**
+  - **README surface table** (`sdk-ts/README.md`): rows for
+    `nat-traversal`, `dataforts`, `aggregator`, `consent`, `delegation`
+    (with enrollment), `a2a`, `publish` and `mcp`, and `WriteToken` /
+    `MeshNode.rpc()` under `cortex`, each checked against the binding's
+    `#[cfg(feature)]` gate. The `net` row listed `NetStream`, which the SDK
+    doesn't export (see *Ruled out*); removed. The entry-point sentence was
+    already corrected in S1.
+  - **Web docs: the premise was wrong.** No page has a Python tab without a
+    TypeScript one: every `sdk/<topic>/` directory has both, and the four
+    guides with Python blocks (`dataforts`, `discover-and-invoke`,
+    `event-bus`, `private-capabilities`) have one of each. Consent,
+    delegation and enrollment have no per-language pages in any language.
+    So there were no tabs to add; instead `sdk/typescript/README.md` gained
+    "The rest of the surface", naming what now imports from the root, and
+    the shutdown rule (release `rpc()` handles and aggregator clients
+    first).
+  - **Checks:** `npm run check` in `web/` (183 docs, links resolve, release
+    notes in sync, types); `check-readmes.py` shows only the two CLI README
+    failures that predate this branch.
 
 ### S8 — N8, `Redex` replication and greedy dataforts
 

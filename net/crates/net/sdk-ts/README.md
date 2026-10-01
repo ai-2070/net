@@ -246,13 +246,21 @@ ignores `exports` and resolves only the root.
 
 | Cargo feature | Surface |
 |---|---|
-| `net` | `MeshNode`, `NetStream`, channel auth |
-| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb` |
+| `net` | `MeshNode`, channel auth, placement filters (`registerPlacementFilter`) |
+| `nat-traversal` | `MeshNode.natType` / `reflexAddr` / `probeReflex` / `connectDirect` / `connectDirectAuto` / `traversalStats`, reflex overrides |
+| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `WriteToken`, `MeshNode.rpc()` |
 | `meshdb` | `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream`, `QueryBuilder`, `InMemoryChainReader` |
 | `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `DaemonHealth`, `CapabilityAdvert` |
 | `compute` | `DaemonRuntime`, `DaemonHandle`, `MigrationHandle` |
 | `groups` | `ReplicaGroup`, `ForkGroup`, `StandbyGroup` |
-| `deck` | `DeckClient`, `OperatorIdentity`, admin / snapshot / status streams |
+| `deck` | `DeckClient`, `OperatorIdentity`, admin / snapshot / status streams (also `@net-mesh/sdk/deck`) |
+| `dataforts` | `MeshBlobAdapter` (build with `createMeshBlobAdapter`), `BlobRef`, the blob adapter registry, `MeshNode.storeDir` / `fetchDir` / `serveBlobTransfer` |
+| `aggregator` | `RegistryClient`, `FoldQueryClient` (build with `createRegistryClient` / `createFoldQueryClient`; `close()` before `shutdown()`) |
+| `consent` | `ConsentPolicy`, `PinStore`, `CapabilityGateway` |
+| `delegation` | `DelegationChain`, `RevocationRegistry`, `deriveChildIdentity`; enrollment: `OperatorEnrollment`, `DeviceEnrollment`, `InviteToken`, `MeshNode.join` / `renew` / `serveEnrollmentAuto` |
+| `a2a` | `MeshNode.serveA2a` / `submitTask` / `taskStatus` / `cancelTask` |
+| `publish` | `MeshNode.publishTools` |
+| `mcp` | `classifyMcpServer`, `lowerMcpTool` (in `@net-mesh/sdk/tool`) |
 | `redis` | `RedisStreamDedup` |
 
 The bus surface — `NetNode`, `EventStream`, capabilities, identity, predicates
