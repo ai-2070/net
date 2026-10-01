@@ -316,7 +316,7 @@ the slice were wrong. Two test homes, with different jobs:
     `NetMesh stub parameters drift: ["publish_island_topology:
     runtime=[…, 'p50_latency_us'] stub=[…]"]`. It was the only mismatch
     across all eleven sampled classes. **GREEN:** 230 passed, 1 skipped.
-    The same fix corrected the stale `NetMesh.poll` docstring.
+    The same fix corrected the stale `NetMesh.poll` docstring.
   - **Second follow-up, from CI and review (2026-10-01).**
     - **CI's `Python wheel (shipped profile)` job failed** the reverse
       test. The shipped wheel builds default features, so it has
@@ -375,7 +375,7 @@ the slice were wrong. Two test homes, with different jobs:
     - **Docs:**
       - The README channel example now builds its `publisher` /
         `subscriber`, and a literal control character in its group seed is
-        now the escape `b""`.
+        now the escape `b"\x01"`.
       - The announce page builds its node with `permissive_channels=True`.
       - `net_sdk.blob` raises the same "rebuild with `dataforts`"
         `ImportError` as `net_sdk.transport`, and the artifacts page quotes
