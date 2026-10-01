@@ -550,6 +550,131 @@ class MeshNode:
 
         return fetch_dir(self._native, source_id, manifest_ref, dest)
 
+    # ── Agent-to-agent (A2A) tasks (``a2a`` builds) ──────────────────
+    #
+    # Optional arguments are forwarded only when set, so the wheel's own
+    # defaults (computed in Rust) stay the single source of truth.
+
+    def serve_a2a(self, callback: Callable[..., Any]) -> Any:
+        """Serve the A2A task lifecycle, backed by an **async** executor
+        ``async (task_id, prompt, context_refs, tags) -> str`` that returns
+        the result's artifact ref. Hold the returned handle to keep
+        accepting tasks. The node must be ``start()``ed."""
+        return self._native.serve_a2a(callback)
+
+    def submit_task(
+        self,
+        target_node_id: int,
+        prompt: str,
+        context_refs: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        *,
+        task_id: Optional[str] = None,
+        service: Optional[str] = None,
+        revision: Optional[str] = None,
+    ) -> str:
+        """Hand a task to the executor at ``target_node_id``; returns the
+        accepted task id. ``task_id`` keeps a caller-chosen id, which makes
+        a resubmission idempotent on a provider with durable admission.
+        ``service`` + ``revision`` (both or neither) name a catalog entry
+        on a configured provider. Raises if the executor rejects it."""
+        kwargs = _set_only(
+            context_refs=context_refs,
+            tags=tags,
+            task_id=task_id,
+            service=service,
+            revision=revision,
+        )
+        return self._native.submit_task(target_node_id, prompt, **kwargs)
+
+    def submit_task_paid(self, prepared_json: str, proof_json: str) -> str:
+        """Submit a prepared, paid task (a ``PreparedTask`` document plus
+        its ``TaskPaymentProof``). The raw verb: it keeps no records; use
+        ``CapabilityGateway.submit_task`` for the durable attempt. Safe to
+        resend. Raises ``PaymentRefused`` on a refusal."""
+        return self._native.submit_task_paid(prepared_json, proof_json)
+
+    def describe_a2a(self, target_node_id: int) -> str:
+        """What ``target_node_id`` serves, as a JSON array of ``A2aOffer``s.
+        Uncharged; the only sanctioned way to learn a price. A node serving
+        the free path (:meth:`serve_a2a`) has no describe service and
+        raises."""
+        return self._native.describe_a2a(target_node_id)
+
+    def task_status(self, target_node_id: int, task_id: str) -> Optional[str]:
+        """The executor's status for ``task_id`` as JSON
+        (``{brief, state, updated_at}``), or ``None`` if unknown."""
+        return self._native.task_status(target_node_id, task_id)
+
+    def cancel_task(self, target_node_id: int, task_id: str) -> bool:
+        """Cancel ``task_id`` on the executor (its coroutine is cancelled);
+        returns whether it was in flight."""
+        return self._native.cancel_task(target_node_id, task_id)
+
+    # ── Publishing this node's own tools (``publish`` builds) ────────
+
+    def publish_tools(
+        self,
+        tools: List[tuple],
+        callback: Callable[..., Any],
+        version: Optional[str] = None,
+        owner_origin: Optional[int] = None,
+        allow_any_caller: Optional[bool] = None,
+    ) -> Any:
+        """Publish this node's own tools as mesh capabilities. ``tools`` is
+        a list of ``(name, description | None, input_schema_json)``;
+        ``callback`` is an async ``(tool_name, args_json) -> str | (str,
+        bool)``. ``owner_origin=None`` admits only this node (fail-closed);
+        ``allow_any_caller=True`` admits every peer. Hold the returned
+        handle to keep the tools published. Needs ``start()`` and
+        ``permissive_channels=True``."""
+        kwargs = _set_only(
+            version=version,
+            owner_origin=owner_origin,
+            allow_any_caller=allow_any_caller,
+        )
+        return self._native.publish_tools(tools, callback, **kwargs)
+
+    # ── Device enrollment (``delegation`` builds) ────────────────────
+
+    def rendezvous_string(self) -> str:
+        """This node's invite rendezvous locator, for
+        ``OperatorEnrollment.invite``."""
+        return self._native.rendezvous_string()
+
+    def serve_enrollment_auto(
+        self,
+        operator: Any,
+        grant_ttl_seconds: int,
+        max_depth: Optional[int] = None,
+    ) -> Any:
+        """Operator side: serve device enrollment (join + renew) on this
+        node; the invite is the authorization. Hold the returned handle."""
+        kwargs = _set_only(max_depth=max_depth)
+        return self._native.serve_enrollment_auto(operator, grant_ttl_seconds, **kwargs)
+
+    def join(self, device: Any, invite: str, name: str, tags: List[str]) -> Any:
+        """Device side: enroll ``device``'s key into the mesh the ``invite``
+        names; returns the verified ``root -> device`` ``DelegationChain``."""
+        return self._native.join(device, invite, name, tags)
+
+    def renew(self, enrollment: Any) -> Any:
+        """Device side: refresh ``enrollment``'s grant over the mesh; returns
+        the fresh chain. Needs ``start()`` and ``permissive_channels=True``."""
+        return self._native.renew(enrollment)
+
+    # ── Low-level escape hatches ─────────────────────────────────────
+
+    def push_to(self, peer_addr: str, json: str) -> bool:
+        """Send a raw JSON payload to a direct peer address. Low-level;
+        prefer streams or channels."""
+        return self._native.push_to(peer_addr, json)
+
+    def add_route(self, dest_node_id: int, next_hop_addr: str) -> None:
+        """Add a routing-table entry. Low-level; routing is normally
+        learned."""
+        self._native.add_route(dest_node_id, next_hop_addr)
+
     # ── Connectivity ─────────────────────────────────────────────────
 
     def discovered_nodes(self) -> int:
@@ -813,6 +938,13 @@ class MeshNode:
 
     def __exit__(self, *_: object) -> None:
         self.shutdown()
+
+
+def _set_only(**kwargs: Any) -> dict:
+    """The keyword arguments the caller actually set. Optional native
+    parameters with Rust-computed defaults reject an explicit ``None``, so
+    unset ones are left out rather than forwarded as ``None``."""
+    return {k: v for k, v in kwargs.items() if v is not None}
 
 
 def _native_mesh(mesh: Any) -> Any:

@@ -28,7 +28,38 @@ ROWS = [
     ("traversal_stats", (), "traversal_stats", ()),
     ("connect_direct", (5, "ab" * 32, 9), "connect_direct", (5, "ab" * 32, 9)),
     ("connect_direct_auto", (5, "ab" * 32), "connect_direct_auto", (5, "ab" * 32)),
+    # S6
+    ("serve_a2a", ("cb",), "serve_a2a", ("cb",)),
+    ("submit_task_paid", ("{}", "{}"), "submit_task_paid", ("{}", "{}")),
+    ("describe_a2a", (9,), "describe_a2a", (9,)),
+    ("task_status", (9, "t"), "task_status", (9, "t")),
+    ("cancel_task", (9, "t"), "cancel_task", (9, "t")),
+    ("rendezvous_string", (), "rendezvous_string", ()),
+    ("join", ("dev", "inv", "n", ["t"]), "join", ("dev", "inv", "n", ["t"])),
+    ("renew", ("enr",), "renew", ("enr",)),
+    ("push_to", ("1.2.3.4:5", "{}"), "push_to", ("1.2.3.4:5", "{}")),
+    ("add_route", (9, "1.2.3.4:5"), "add_route", (9, "1.2.3.4:5")),
 ]
+
+
+def test_unset_optionals_are_omitted_not_forwarded_as_none(node) -> None:
+    """Native parameters with Rust-computed defaults reject an explicit
+    ``None``; the wrapper must leave unset ones out."""
+    mesh, native = node
+    mesh.submit_task(9, "p")
+    native.submit_task.assert_called_once_with(9, "p")
+    mesh.submit_task(9, "p", ["r"], task_id="id")
+    native.submit_task.assert_called_with(9, "p", context_refs=["r"], task_id="id")
+
+    mesh.publish_tools([("t", None, "{}")], "cb")
+    native.publish_tools.assert_called_once_with([("t", None, "{}")], "cb")
+    mesh.publish_tools([], "cb", allow_any_caller=True)
+    native.publish_tools.assert_called_with([], "cb", allow_any_caller=True)
+
+    mesh.serve_enrollment_auto("op", 60)
+    native.serve_enrollment_auto.assert_called_once_with("op", 60)
+    mesh.serve_enrollment_auto("op", 60, max_depth=2)
+    native.serve_enrollment_auto.assert_called_with("op", 60, max_depth=2)
 
 
 @pytest.mark.parametrize("method,args,native_method,native_args", ROWS)

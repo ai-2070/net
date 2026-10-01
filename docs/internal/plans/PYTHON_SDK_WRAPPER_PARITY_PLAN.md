@@ -6,7 +6,7 @@ The Rust SDK gaps found along the way have their own plan:
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-S0, S1a and S1–S5 done 2026-10-01 (see each slice). S6–S8 not started.
+S0, S1a and S1–S6 done 2026-10-01 (see each slice). S7–S8 not started.
 
 Amended 2026-10-01, same day:
 - The two open checks from the first draft were verified (see S0 and S5).
@@ -639,6 +639,35 @@ type signatures only.
 
 - **Proves it:** forwarding rows added to `test_mesh_node_surface.py`, and one
   live `serve_a2a` → `submit_task` round-trip through `net_sdk.MeshNode`.
+- **Done 2026-10-01.**
+  - `MeshNode` gained `serve_a2a`, `submit_task`, `submit_task_paid`,
+    `describe_a2a`, `task_status`, `cancel_task`, `publish_tools`,
+    `rendezvous_string`, `serve_enrollment_auto`, `join` and `renew`, plus
+    the low-level `push_to` / `add_route` from G4.
+  - **Signatures were read from the runtime** (`inspect.signature`), not
+    hand-copied; S0's `p50_latency_us` slip is why. Several native defaults
+    are Rust-computed (they show as `Ellipsis`) and reject an explicit
+    `None`, so a new `_set_only()` helper forwards only the optional
+    arguments the caller set. A forwarding test pins that unset ones are
+    **omitted**, not passed as `None`.
+  - **Live test:** `test_sdk_a2a_enroll.py`, 2 tests. An A2A task completes
+    through two SDK nodes, once with only `prompt` set (the wheel's defaults
+    apply) and once with `context_refs` / `tags` / a kept `task_id`; the
+    executor sees exactly what was sent. `rendezvous_string` returns a
+    locator. `join` / `renew` / `serve_enrollment_auto` / `publish_tools` /
+    `submit_task_paid` are forward-tested only; their behaviour is covered
+    by `test_enrollment.py`, `test_publish.py` and `test_a2a_paid.py`.
+  - **Forwarding:** 11 rows plus the omit-unset test, added to
+    `test_mesh_node_surface.py`.
+  - **RED** against the committed wrapper: 2/2 live and the 11 new
+    forwarding tests fail. **GREEN:** `sdk-py` 387 passed; binding SDK,
+    A2A, enrollment and stub tests 281 passed, 1 skipped.
+  - **Found, not fixed (native behaviour):** `describe_a2a` against a node
+    serving the free path (`serve_a2a`) doesn't fail fast. It waits out the
+    full RPC timeout (measured: 30.02 s) before raising. A live test of it
+    would trip CI's `--timeout=30`, so it was dropped. No test anywhere
+    covers that case. Worth a fast "no describe service" refusal in the
+    core, as a separate change.
 
 ### S7 — `net_sdk.AsyncMeshNode`
 
