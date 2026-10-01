@@ -3,8 +3,8 @@
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/node-sdk`
-(the plan was written on `LZL0/python-sdk`, merged as #1133). S1–S5 done 2026-10-01
-(see each slice); S6–S7 not started.
+(the plan was written on `LZL0/python-sdk`, merged as #1133). S1–S6 done 2026-10-01
+(see each slice); S7 and S8 (N8, found during S6) not started.
 
 **Checked before starting, 2026-10-01:** the two bug classes the Python work
 found don't apply here. The Node `poll` already sweeps every shard through
@@ -135,6 +135,21 @@ There are 24 native methods with no `MeshNode` wrapper:
   `TypedMeshRpc.fromMesh((mesh as any)._native)`, although TS `MeshNode`
   has `rpc()` (`sdk-ts/src/mesh.ts:546`). The S7 docs slice should switch
   them to `mesh.rpc()`.
+
+### N8 — `Redex` replication and greedy dataforts (gap, found during S6)
+
+The S6 drift probe (native methods minus SDK members, per cortex class)
+found nine native `Redex` methods with no SDK counterpart:
+`enableReplication`, `replicationRuntimeCount`, `replicationPrometheusText`,
+`enableGreedyDataforts`, `disableGreedyDataforts`, `greedyCachedChannelCount`,
+`greedyPrometheusText`, `enableGravityForGreedy`, `disableGravityForGreedy`.
+The SDK's `RedexFileConfig` also has no `replication` field, so even
+forwarding `enableReplication` would leave a TS caller unable to opt a
+channel in. It needs a config shape and a two-node test, so it is its own
+slice (S8), not an S6 small item. The same probe found `NetDb` and
+`WorkflowAdapter` complete, and `TasksAdapter` / `MemoriesAdapter` missing
+only `close` / `isRunning` (fixed in S6); their `watch*` methods are wrapped
+as `watch` / `snapshotAndWatch`.
 
 ### Ruled out (not gaps)
 
@@ -509,6 +524,61 @@ check the floor.
   the rest of the tool surface lives.
 - **Proves it:** a root-export presence check added to `trust_surfaces.test.ts`.
 
+- **Done 2026-10-01.**
+  - **Root exports:** `WriteToken`, `normalizeGpuVendor`, and a new
+    `src/aggregator.ts`: `RegistryClient` / `FoldQueryClient`, their typed
+    errors and classifier (from `@net-mesh/core/aggregator`), and
+    `createRegistryClient` / `createFoldQueryClient`, which take a
+    `MeshNode` (the native `create` takes the native mesh, which the SDK
+    wraps). `normalizeGpuVendor` is exported from the root directly, so
+    `capabilities.ts` stays free of native imports.
+  - **`WriteToken` needed somewhere to go.** No SDK adapter had
+    `waitForToken`, so the class alone was useless; `TasksAdapter` and
+    `MemoriesAdapter` gained it. The test then found they also lacked
+    `close()` / `isRunning()`, so a TS caller couldn't stop a fold task;
+    added.
+  - **MCP helpers:** `classifyMcpServer` / `lowerMcpTool` (and their
+    `EnvPairJs` / `LoweredToolJs` types) in `./tool`.
+  - **`MigrationErrorKind`:** `no-target-available`, `buffer-full` (with
+    `events` / `bytes`) and `wrong-peer` (with `originHash` / `from` /
+    `expected`) parse to themselves instead of `'unknown'`. **A second bug,
+    found writing the test:** `originHash` was a `number` parsed with
+    `parseInt`, but origin hashes are u64. Anything above 2^53 was rounded
+    (`0xfedcba9876543210` came back as `…064000`), so it never equalled
+    `DaemonHandle.originHash`, which is a `bigint`. Now `bigint`. This is a
+    type change on a public field; nothing in the repo read it.
+  - **Bug found and fixed (binding): the aggregator clients pinned the
+    node.** `RegistryClient.create` / `FoldQueryClient.create` clone the
+    node's `Arc` and hold it until V8 finalizes the client, so
+    `MeshNode.shutdown()` failed with "outstanding references exist" while a
+    client was alive; the first test run hit exactly that. Both now have
+    `close()` / `isClosed`, following the `MeshRpc.close()` precedent
+    (0.35). `close()` closes every `with*` alias, since they share state;
+    a closed client rejects with `agg:invalid-args: client is closed`,
+    reusing an existing kind so the cross-language error-kind mirror
+    (`tests/error_kind_mirror.rs`) is untouched.
+  - **Skill snippets:** `nrpc.md` and `patterns.md` used
+    `TypedMeshRpc.fromMesh((mesh as any)._native)`. `MeshNode` has no
+    `_native` property, so those snippets passed `undefined`: broken, not
+    just untidy. They now use `mesh.rpc()` and release it with
+    `rpc.raw.close()` before shutdown.
+  - **Tests:**
+    - `test/small_surfaces.test.ts` (6), SDK root and `../src/tool` imports
+      only: both clients build from a `MeshNode`; a failed call classifies
+      to `RegistryClientError`; `close()` lets shutdown succeed, closes
+      aliases, and a later call is `invalid-args`; `waitForToken` resolves
+      after a write and rejects a wrong-origin token; `normalizeGpuVendor`;
+      both MCP helpers. **RED** with the committed SDK source: 6/6 fail.
+    - `test/migration_error_kinds.test.ts` (6), including a drift check
+      that reads every `"migration: <kind>"` out of
+      `bindings/node/src/compute.rs` and requires each to parse to itself.
+      **RED** against the committed parser (with only `export` added so the
+      test can reach it): 5/6 fail, including the rounded `originHash`.
+  - **GREEN:** full suite **659 passed** (42 files); the binding's
+    `aggregator.test.ts` 17/17; the package smoke test and
+    `check-ts-consumer.sh` pass; `net-node` clippy (ci.yml's ffi-clippy
+    feature list, all targets, `-D warnings`) and fmt clean.
+
 ### S7 — Docs
 
 - README surface table: the new modules, the N5 method groups, and the
@@ -516,6 +586,16 @@ check the floor.
 - `web/src/content/docs/`: the Node tabs for consent, delegation, enrollment
   and blobs, where Python tabs exist and Node ones don't.
 - **Proves it:** `npm run check` in `web/` stays green.
+
+### S8 — N8, `Redex` replication and greedy dataforts
+
+- Forward the nine methods on the SDK `Redex`, taking a `MeshNode` where
+  the native takes `NetMesh`, and add `replication` to `RedexFileConfig`.
+- Extend S5's compile-time "everything is wrapped" guard to the cortex
+  classes, so the next missing method is a build error.
+- **Proves it:** a two-node test where a channel opened with `replication`
+  on one node is readable on the other, and the guard's RED on today's
+  `Redex`.
 
 ## Risks
 

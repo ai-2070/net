@@ -85,6 +85,7 @@ export {
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
+  WriteToken,
   CortexError,
   NetDbError,
   RedexError,
@@ -434,6 +435,24 @@ export {
   unregisterBlobAdapter,
 } from './blob';
 export type { MeshBlobAdapterOptions } from './blob';
+
+// Aggregator clients (aggregator.registry / fold.query) and their typed
+// errors. Build a client from a MeshNode with the create* helpers.
+export {
+  FoldQueryClient,
+  FoldQueryClientError,
+  RegistryClient,
+  RegistryClientError,
+  classifyAggregatorError,
+  createFoldQueryClient,
+  createRegistryClient,
+  parseAggregatorError,
+} from './aggregator';
+export type { FoldQueryErrorKind, RegistryErrorKind } from './aggregator';
+
+// The core's own GPU vendor normalizer, so a vendor string matches what
+// peers announce. `capabilities.ts` stays free of native imports.
+export { normalizeGpuVendor } from '@net-mesh/core';
 
 // Types.
 export type {

@@ -57,3 +57,10 @@ export {
   mcp,
   gemini,
 } from '@net-mesh/core/tool'
+
+// MCP bridge helpers: classify a wrapped MCP server's credential exposure,
+// and lower one `tools/list` entry to the Net discovery shape. Native (the
+// bridge's one Rust implementation), so they come from `@net-mesh/core`
+// rather than `@net-mesh/core/tool`.
+export { classifyMcpServer, lowerMcpTool } from '@net-mesh/core'
+export type { EnvPairJs, LoweredToolJs } from '@net-mesh/core'

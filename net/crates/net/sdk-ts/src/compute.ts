@@ -78,10 +78,18 @@ export class DaemonError extends Error {
  *   on the source node. Carries `originHash`.
  * - `target-unavailable` — target node ID isn't in the source's
  *   peer table. Carries `nodeId`.
+ * - `no-target-available` — auto-placement found no node satisfying
+ *   the daemon's requirements. Terminal; there is no node to report.
  * - `wrong-phase` — internal phase-machine violation (shouldn't
  *   surface in practice; carries expected + actual phase).
  * - `snapshot-too-large` — snapshot exceeds the transfer limit;
  *   carries `size` and `max`.
+ * - `buffer-full` — the target's out-of-order event buffer is at its
+ *   cap; carries `events` and `bytes`. The source should back off.
+ * - `wrong-peer` — a migration message came from a peer that isn't the
+ *   recorded participant; carries `originHash`, `from` and `expected`.
+ * - `unknown` — a kind this SDK doesn't recognise; the raw text is in
+ *   `message`.
  */
 export type MigrationErrorKind =
   | 'not-ready'
@@ -93,8 +101,11 @@ export type MigrationErrorKind =
   | 'not-ready-timeout'
   | 'daemon-not-found'
   | 'target-unavailable'
+  | 'no-target-available'
   | 'wrong-phase'
   | 'snapshot-too-large'
+  | 'buffer-full'
+  | 'wrong-peer'
   | 'unknown';
 
 /**
@@ -110,13 +121,23 @@ export class MigrationError extends DaemonError {
   readonly kind: MigrationErrorKind;
   /** Number of NotReady retries on `not-ready-timeout`. */
   readonly attempts?: number;
-  /** Daemon origin on `daemon-not-found` / `already-migrating`. */
-  readonly originHash?: number;
+  /**
+   * Daemon origin on `daemon-not-found` / `already-migrating` /
+   * `wrong-peer`. A u64, so a `bigint` comparable with
+   * `DaemonHandle.originHash`.
+   */
+  readonly originHash?: bigint;
   /** Node ID on `target-unavailable`. */
   readonly nodeId?: bigint;
   /** Size / max on `snapshot-too-large`. */
   readonly size?: number;
   readonly max?: number;
+  /** Buffered event count / byte total on `buffer-full`. */
+  readonly events?: number;
+  readonly bytes?: number;
+  /** On `wrong-peer`: the node that sent the message, and the one expected. */
+  readonly from?: bigint;
+  readonly expected?: bigint;
   /** Underlying string detail on `state-failed` / `identity-transport-failed`. */
   readonly detail?: string;
 
@@ -125,10 +146,14 @@ export class MigrationError extends DaemonError {
     message: string,
     extras: {
       attempts?: number;
-      originHash?: number;
+      originHash?: bigint;
       nodeId?: bigint;
       size?: number;
       max?: number;
+      events?: number;
+      bytes?: number;
+      from?: bigint;
+      expected?: bigint;
       detail?: string;
     } = {},
   ) {
@@ -140,6 +165,10 @@ export class MigrationError extends DaemonError {
     this.nodeId = extras.nodeId;
     this.size = extras.size;
     this.max = extras.max;
+    this.events = extras.events;
+    this.bytes = extras.bytes;
+    this.from = extras.from;
+    this.expected = extras.expected;
     this.detail = extras.detail;
     Object.setPrototypeOf(this, MigrationError.prototype);
   }
@@ -151,8 +180,11 @@ export class MigrationError extends DaemonError {
  * Unknown kinds fall back to `kind: 'unknown'` with the raw body
  * as the message — defensive default so the error surface stays
  * typed even if the Rust side adds new variants.
+ *
+ * Exported for `test/migration_error_kinds.test.ts`; not re-exported from
+ * the package root.
  */
-function parseMigrationError(body: string, fullMessage: string): MigrationError {
+export function parseMigrationError(body: string, fullMessage: string): MigrationError {
   // Body shape (after stripping `migration: `):
   //   <kind>
   //   <kind>: <detail>
@@ -173,7 +205,7 @@ function parseMigrationError(body: string, fullMessage: string): MigrationError 
       // orchestrator path; parse it when present.
       if (kind === 'already-migrating' && rest) {
         return new MigrationError(kind, fullMessage, {
-          originHash: parseMaybeHex(rest),
+          originHash: parseMaybeHexBigInt(rest),
         });
       }
       return new MigrationError(kind, fullMessage);
@@ -187,8 +219,10 @@ function parseMigrationError(body: string, fullMessage: string): MigrationError 
       });
     case 'daemon-not-found':
       return new MigrationError(kind, fullMessage, {
-        originHash: parseMaybeHex(rest),
+        originHash: parseMaybeHexBigInt(rest),
       });
+    case 'no-target-available':
+      return new MigrationError(kind, fullMessage);
     case 'target-unavailable':
       return new MigrationError(kind, fullMessage, {
         nodeId: parseMaybeHexBigInt(rest),
@@ -202,18 +236,26 @@ function parseMigrationError(body: string, fullMessage: string): MigrationError 
         max: Number.parseInt(maxStr ?? '', 10),
       });
     }
+    case 'buffer-full': {
+      // `<events> events / <bytes> bytes`
+      const m = /^(\d+) events \/ (\d+) bytes$/.exec(rest);
+      return new MigrationError(kind, fullMessage, {
+        events: m ? Number.parseInt(m[1], 10) : undefined,
+        bytes: m ? Number.parseInt(m[2], 10) : undefined,
+      });
+    }
+    case 'wrong-peer': {
+      // `<origin>: from=<node> expected=<node>`, all hex.
+      const m = /^(\S+): from=(\S+) expected=(\S+)$/.exec(rest);
+      return new MigrationError(kind, fullMessage, {
+        originHash: m ? parseMaybeHexBigInt(m[1]) : undefined,
+        from: m ? parseMaybeHexBigInt(m[2]) : undefined,
+        expected: m ? parseMaybeHexBigInt(m[3]) : undefined,
+      });
+    }
     default:
       return new MigrationError('unknown', fullMessage);
   }
-}
-
-function parseMaybeHex(s: string): number | undefined {
-  const trimmed = s.trim();
-  if (!trimmed) return undefined;
-  const n = trimmed.startsWith('0x')
-    ? Number.parseInt(trimmed.slice(2), 16)
-    : Number.parseInt(trimmed, 10);
-  return Number.isFinite(n) ? n : undefined;
 }
 
 function parseMaybeHexBigInt(s: string): bigint | undefined {

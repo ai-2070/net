@@ -48,6 +48,7 @@ import {
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
+  WriteToken,
 } from '@net-mesh/core';
 
 import type {
@@ -71,6 +72,7 @@ export {
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
+  WriteToken,
 };
 
 // Re-export NAPI type-only declarations.
@@ -503,6 +505,35 @@ export class TasksAdapter {
     }
   }
 
+  /**
+   * Read-your-writes wait: resolve once this adapter's fold has applied the
+   * write `token` names, or reject after `deadlineMs`. A token from another
+   * origin, or a full wait queue, rejects at once. Pair with
+   * {@link WriteToken}: `new WriteToken(originHash, seq)`, or
+   * `WriteToken.fromString` for one carried over the wire.
+   */
+  async waitForToken(token: WriteToken, deadlineMs: number): Promise<void> {
+    try {
+      return await this.napi.waitForToken(token, deadlineMs);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Stop this adapter's fold task. Idempotent. */
+  close(): void {
+    try {
+      this.napi.close();
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Whether the fold task is still running (`false` after {@link close}). */
+  isRunning(): boolean {
+    return this.napi.isRunning();
+  }
+
   /** Snapshot query over the materialized state. */
   listTasks(filter?: TaskFilter | null): Task[] {
     try {
@@ -672,6 +703,35 @@ export class MemoriesAdapter {
     } catch (e) {
       throw classifyError(e);
     }
+  }
+
+  /**
+   * Read-your-writes wait: resolve once this adapter's fold has applied the
+   * write `token` names, or reject after `deadlineMs`. A token from another
+   * origin, or a full wait queue, rejects at once. Pair with
+   * {@link WriteToken}: `new WriteToken(originHash, seq)`, or
+   * `WriteToken.fromString` for one carried over the wire.
+   */
+  async waitForToken(token: WriteToken, deadlineMs: number): Promise<void> {
+    try {
+      return await this.napi.waitForToken(token, deadlineMs);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Stop this adapter's fold task. Idempotent. */
+  close(): void {
+    try {
+      this.napi.close();
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Whether the fold task is still running (`false` after {@link close}). */
+  isRunning(): boolean {
+    return this.napi.isRunning();
   }
 
   listMemories(filter?: MemoryFilter | null): Memory[] {
