@@ -1,0 +1,56 @@
+net/crates/net/src/adapter/net/redex/replication_coordinator.rs
+  s_f9febccc288dd3::t_592ec2d27a92b1 335-365
+  s_f9febccc288dd3::t_15473440450a21 35,232-235,270,366,478-479
+  s_f9febccc288dd3::t_4d1f52f4820433 987-1033
+net/crates/net/sdk-ts/src/delegation.ts
+  s_f9febccc288dd3::t_7af8d3b8b3dd5d 18-19
+net/crates/net/tests/dataforts_blob_e2e.rs
+  s_f9febccc288dd3::t_74c5606ab2d457 175,257-271,274-276,278,657,801
+  s_f9febccc288dd3::t_6bb35d8bfef699 43,254,658,917-919
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_f9febccc288dd3::t_592ec2d27a92b1 1000-1007,1080
+net/crates/net/src/ffi/cortex.rs
+  s_f9febccc288dd3::t_8bd793e92f5bbe 505-506,520-524
+net/crates/net/bindings/python/src/cortex.rs
+  s_f9febccc288dd3::t_9952b331582ae7 248-249,251,255-256,262-264,271-272,306,512-514,516-522,529-531
+  s_f9febccc288dd3::t_4bb2ccc07d0f66 789-813
+net/crates/net/sdk-ts/src/cortex.ts
+  s_f9febccc288dd3::t_3f668d6204d4b3 218-220,222-223
+net/crates/net/sdk-ts/test/redex_replication.test.ts
+  s_f9febccc288dd3::t_915c0e5dff104a 13-15,17,19,21-22,40-72,80-81,83-85,87,90,98-103,109,113-116,121-147,150-151,155-189,193-194,197,200-204,212-213,224,229
+net/crates/net/bindings/python/tests/test_redex.py
+  s_f9febccc288dd3::t_cd2cf56a03ec03 224-247,289-311
+  s_f9febccc288dd3::t_5b3f3779558b21 252,268
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_f9febccc288dd3::t_8f5cad61db6e3e 301-317,319,329,690-700,702
+net/crates/net/bindings/node/src/cortex.rs
+  s_f9febccc288dd3::t_3f668d6204d4b3 279-282,285-286,292
+net/crates/net/bindings/node/test/aggregator.test.ts
+  s_f9febccc288dd3::t_7af8d3b8b3dd5d 84
+net/crates/net/tests/redex_replication_e2e.rs
+  s_f9febccc288dd3::t_6bb35d8bfef699 21
+  s_f9febccc288dd3::t_74c5606ab2d457 83-107,154-155,167,264-265,275,323-324,333,431-432,443,587-588,600,681,770
+  s_f9febccc288dd3::t_cb9c429259f94d 668
+net/crates/net/bindings/go/net-ffi/exports.baseline
+  s_f9febccc288dd3::t_8bd793e92f5bbe 428
+docs/internal/plans/NODE_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_aef07f4afe8d23 132-133,138-140
+net/crates/net/docs/CONFIG_REPLICATION.md
+  s_f9febccc288dd3::t_7af8d3b8b3dd5d 302-322
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6b0d2279c5ea46ab6511e5f52ca495acc9d8b023",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
