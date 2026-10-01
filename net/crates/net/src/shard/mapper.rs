@@ -212,7 +212,7 @@ impl ShardMetricsCollector {
     #[inline]
     pub fn record_latency_sample(&self, latency_ns: u64) {
         // Atomically add 1 to count (upper 32 bits) and
-        // `latency_ns` to sum (lower 32 bits). `fetch_update`
+        // `latency_ns` to sum (lower 32 bits). `try_update`
         // CAS-loops the load-and-store, so a concurrent
         // `collect_and_reset` swap on the same word either sees
         // both pre-add or both post-add — no `(sum, count)`
@@ -221,7 +221,7 @@ impl ShardMetricsCollector {
         // which is far beyond any sane metrics tick.
         let _ =
             self.push_latency
-                .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
+                .try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
                     let count = (v >> 32) as u32;
                     let sum = (v & 0xFFFF_FFFF) as u32;
                     let new_count = count.saturating_add(1) as u64;
@@ -235,17 +235,15 @@ impl ShardMetricsCollector {
     pub fn record_flush(&self, latency_us: u64) {
         // Same packed-`(count, sum)` shape as `record_push` —
         // see that function for the desync rationale.
-        let _ = self.flush_latency.fetch_update(
-            AtomicOrdering::Relaxed,
-            AtomicOrdering::Relaxed,
-            |v| {
-                let count = (v >> 32) as u32;
-                let sum = (v & 0xFFFF_FFFF) as u32;
-                let new_count = count.saturating_add(1) as u64;
-                let new_sum = sum.saturating_add(latency_us.min(u32::MAX as u64) as u32) as u64;
-                Some((new_count << 32) | new_sum)
-            },
-        );
+        let _ =
+            self.flush_latency
+                .try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
+                    let count = (v >> 32) as u32;
+                    let sum = (v & 0xFFFF_FFFF) as u32;
+                    let new_count = count.saturating_add(1) as u64;
+                    let new_sum = sum.saturating_add(latency_us.min(u32::MAX as u64) as u32) as u64;
+                    Some((new_count << 32) | new_sum)
+                });
     }
 
     /// Set drain mode.

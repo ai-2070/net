@@ -714,7 +714,7 @@ impl OwnershipCharge {
         let n = n as u64;
         let _ = self
             .charged
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
                 Some(c.saturating_sub(n))
             });
     }

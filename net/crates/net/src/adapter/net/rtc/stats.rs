@@ -463,7 +463,7 @@ impl RtcStats {
     pub(super) fn note_unretained(&self) {
         let _ = self
             .retained
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             });
     }

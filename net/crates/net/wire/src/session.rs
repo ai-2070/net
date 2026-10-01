@@ -2894,13 +2894,13 @@ impl StreamState {
         if self.tx_window == 0 {
             return;
         }
-        // `fetch_update` returns the PREVIOUS value on success, and
+        // `try_update` returns the PREVIOUS value on success, and
         // the closure is infallible, so `prev` is always the credit
         // this debit found. `prev.min(bytes)` is what the window
         // actually paid; the rest is the overdraft.
         let prev = self
             .tx_credit_remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 Some(v.saturating_sub(bytes))
             })
             .unwrap_or(bytes);
@@ -2940,13 +2940,13 @@ impl StreamState {
         let back = bytes - paid;
         if back > 0 {
             self.tx_credit_remaining
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                     Some(v.saturating_add(back))
                 })
                 .ok();
         }
         self.tx_bytes_sent
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(bytes as u64))
             })
             .ok();
@@ -2961,7 +2961,7 @@ impl StreamState {
         }
         let prev = self
             .overdraft
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |d| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |d| {
                 Some(d.saturating_sub(amount))
             })
             .unwrap_or(0);
@@ -2982,12 +2982,12 @@ impl StreamState {
             return;
         }
         self.tx_credit_remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 Some(v.saturating_add(bytes))
             })
             .ok();
         self.tx_bytes_sent
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(bytes as u64))
             })
             .ok();
@@ -3031,8 +3031,8 @@ impl StreamState {
     ///
     /// Reconciliation adds the **delta** of newly-acknowledged bytes
     /// (`total_consumed - prev_max_consumed`) to `tx_credit_remaining`
-    /// via `fetch_update`. The additive form composes atomically with
-    /// the CAS in `try_acquire_tx_credit` and the `fetch_update` in
+    /// via `try_update`. The additive form composes atomically with
+    /// the CAS in `try_acquire_tx_credit` and the `try_update` in
     /// `refund_tx_credit`: every operation preserves the invariant
     /// `remaining + (sent - max_consumed) == window + overdraft`
     /// regardless of interleaving. An earlier `.store()`-based
@@ -3129,7 +3129,7 @@ impl StreamState {
         }
         let window = self.tx_window;
         self.tx_credit_remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 Some(v.saturating_add(credit_add).min(window))
             })
             .ok();

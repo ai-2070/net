@@ -208,7 +208,7 @@ Production code is held at `-D warnings` with `unwrap_used`/`expect_used` denied
 
 ## Toolchain
 
-- Rust pinned to **1.98.0** via `net/crates/net/rust-toolchain.toml` (components: clippy, rustfmt, llvm-tools-preview for cargo-llvm-cov).
+- Rust pinned to **1.99.0** via `net/crates/net/rust-toolchain.toml` (components: clippy, rustfmt, llvm-tools-preview for cargo-llvm-cov).
 - Go 1.26. Web: Node 24, TypeScript 6, Next.js (turbopack dev).
 - `.cargo/config.toml` and `clippy.toml`/`rustfmt.toml` live in `net/crates/net/`.
 

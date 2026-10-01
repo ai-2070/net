@@ -491,7 +491,7 @@ impl SensingInterestLeases {
     /// every later reservation refuses with
     /// [`LeaseRefused::IdentityExhausted`], and no value is ever issued twice.
     ///
-    /// `compare_exchange_weak` rather than `fetch_update` so the exhaustion
+    /// `compare_exchange_weak` rather than `try_update` so the exhaustion
     /// verdict is re-read from the CAS's own observed value on every retry: two
     /// racing reservations at the last legal slot must produce exactly one
     /// token and one refusal.

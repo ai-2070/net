@@ -8,7 +8,7 @@
 //! with GPU specifics riding plain capability tags (`gpu:h100`,
 //! `model:<hex>`).
 //!
-//! The **live operations** hang off [`Mesh`](crate::mesh::Mesh) — they
+//! The **live operations** hang off [`Mesh`] — they
 //! need a connected node:
 //!
 //! - [`Mesh::publish_island_topology`](crate::mesh::Mesh::publish_island_topology)

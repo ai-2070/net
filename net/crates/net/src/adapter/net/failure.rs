@@ -729,16 +729,16 @@ impl LossSimulator {
 
     // Simple LCG random number generator (0.0 - 1.0).
     // Uses CAS loop so concurrent threads don't get identical random values.
-    // fetch_update returns Ok(previous_value); derive the output from the
+    // try_update returns Ok(previous_value); derive the output from the
     // new state (prev * M + 1) which the closure already stored atomically.
     #[expect(
         clippy::unwrap_used,
-        reason = "closure always returns Some, so fetch_update never returns Err"
+        reason = "closure always returns Some, so try_update never returns Err"
     )]
     fn next_random(&self) -> f32 {
         let prev = self
             .rng_state
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
                 Some(s.wrapping_mul(6364136223846793005).wrapping_add(1))
             })
             .unwrap();

@@ -673,7 +673,7 @@ impl Mesh {
     ///   tools served by EU-region hosts.
     ///
     /// Delegates to
-    /// [`net::adapter::net::MeshNode::list_tools`](net::adapter::net::MeshNode::list_tools).
+    /// [`net::adapter::net::MeshNode::list_tools`].
     pub fn list_tools(&self, matcher: Option<&TagMatcher>) -> Vec<ToolDescriptor> {
         self.inner().list_tools(matcher)
     }
@@ -701,7 +701,7 @@ impl Mesh {
     /// [`Self::list_tools`] first if you need the starting shape.
     ///
     /// Delegates to
-    /// [`net::adapter::net::MeshNode::watch_tools`](net::adapter::net::MeshNode::watch_tools).
+    /// [`net::adapter::net::MeshNode::watch_tools`].
     pub fn watch_tools(
         &self,
         matcher: Option<TagMatcher>,

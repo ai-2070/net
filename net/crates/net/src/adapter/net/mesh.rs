@@ -9959,7 +9959,7 @@ impl ScopedMutationPublication {
 /// else. Reaching it takes 2^64 node-local operations; the point is that the
 /// claim in the docs is now true of the code.
 fn advance_fenced_generation(counter: &std::sync::atomic::AtomicU64, what: &'static str) {
-    let outcome = counter.fetch_update(
+    let outcome = counter.try_update(
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
         |current| current.checked_add(1).filter(|next| *next != u64::MAX),

@@ -4078,7 +4078,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.98.1"
+          toolchain: "1.99.0"
           components: clippy, rustfmt, llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
@@ -4444,7 +4444,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.98.1"
+          toolchain: "1.99.0"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -6116,9 +6116,9 @@ jobs:
       # `targets:` on the toolchain action installs into the
       # **stable** installation, but every cargo command below runs
       # under `net/crates/net`, where `rust-toolchain.toml` pins
-      # 1.98.1 — a separate installation with its own target set. The
+      # 1.99.0 — a separate installation with its own target set. The
       # first candidate installed the target on stable and then asked
-      # 1.98.1 to build for it: `E0463: can't find crate for 'core'`.
+      # 1.99.0 to build for it: `E0463: can't find crate for 'core'`.
       # Install the toolchain the commands actually select, then add
       # the target FROM the pinned directory so rustup resolves the
       # same override file cargo does.
@@ -7208,7 +7208,7 @@ jobs:
       # `targets:` on the toolchain action, and a bare `rustup
       # target add` from the repo root, install into the STABLE
       # installation — but every cargo command here runs under
-      # `net/crates/net`, whose `rust-toolchain.toml` pins 1.98.1,
+      # `net/crates/net`, whose `rust-toolchain.toml` pins 1.99.0,
       # a separate installation with its own target set. The
       # candidate hit exactly that: `E0463: can't find crate for
       # 'core'` when building the leaf bundle. Add the target FROM

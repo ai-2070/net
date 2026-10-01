@@ -141,7 +141,7 @@ fn stream_stats_counter_battery_is_atomic_under_concurrent_record() {
 //
 // See also: `tests/bus_shutdown_drain.rs` where cubic flagged
 // the same pattern mis-implemented (P2 fix replaced `load;
-// fetch_sub` with `fetch_update`). This loom model is the
+// fetch_sub` with `try_update`). This loom model is the
 // pattern's reference implementation.
 // ─────────────────────────────────────────────────────────────
 
