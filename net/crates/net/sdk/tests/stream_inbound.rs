@@ -278,3 +278,31 @@ async fn handles_hold_the_node_weakly() {
     drop(sub);
     drop(inbox);
 }
+
+/// A panicking handler must not take the receive path down with it. The
+/// core calls the sink inline with no unwind guard, so without the SDK's
+/// `catch_unwind` the first panic would end the node's receive task and
+/// the second event would never arrive. (Tests build with unwinding; under
+/// `panic = "abort"` nothing can contain a panic.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_handler_is_contained_and_the_node_keeps_receiving() {
+    let (host, alice) = connected_pair().await;
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let sub = {
+        let seen = seen.clone();
+        host.on_stream_data(SID, move |event| {
+            if event.payload.as_ref() == b"boom" {
+                panic!("handler blew up");
+            }
+            seen.lock().push(event);
+        })
+        .expect("vacant stream")
+    };
+
+    let stream = stream_to_host(&alice, &host);
+    send(&alice, &stream, b"boom").await;
+    send(&alice, &stream, b"after").await;
+    eventually("the event after the panic", || seen.lock().len() == 1).await;
+    assert_eq!(seen.lock()[0].payload.as_ref(), b"after");
+    assert_eq!(sub.panics(), 1);
+}

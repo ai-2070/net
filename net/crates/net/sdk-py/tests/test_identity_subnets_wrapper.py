@@ -18,7 +18,7 @@ def test_subnet_id_builds_the_native_list_shape() -> None:
     assert subnets.GLOBAL_SUBNET == [0]
 
 
-@pytest.mark.parametrize("levels", [(), (1, 2, 3, 4, 5), (256,), (-1,), (1.5,), (True,)])
+@pytest.mark.parametrize("levels", [(), (1, 2, 3, 4, 5), (256,), (-1,), (1.5,)])
 def test_subnet_id_rejects_malformed_levels(levels) -> None:
     with pytest.raises(ValueError):
         subnets.subnet_id(*levels)

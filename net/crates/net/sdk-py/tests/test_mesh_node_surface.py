@@ -28,6 +28,13 @@ ROWS = [
     ("traversal_stats", (), "traversal_stats", ()),
     ("connect_direct", (5, "ab" * 32, 9), "connect_direct", (5, "ab" * 32, 9)),
     ("connect_direct_auto", (5, "ab" * 32), "connect_direct_auto", (5, "ab" * 32)),
+    ("nat_type", (), "nat_type", ()),
+    ("reflex_addr", (), "reflex_addr", ()),
+    ("peer_nat_type", (5,), "peer_nat_type", (5,)),
+    ("probe_reflex", (5,), "probe_reflex", (5,)),
+    ("reclassify_nat", (), "reclassify_nat", ()),
+    ("set_reflex_override", ("1.2.3.4:5",), "set_reflex_override", ("1.2.3.4:5",)),
+    ("clear_reflex_override", (), "clear_reflex_override", ()),
     # S6
     ("serve_a2a", ("cb",), "serve_a2a", ("cb",)),
     ("submit_task_paid", ("{}", "{}"), "submit_task_paid", ("{}", "{}")),

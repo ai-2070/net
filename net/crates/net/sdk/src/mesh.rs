@@ -117,7 +117,10 @@ pub struct SubscribeOptions {
 }
 
 /// Returned by [`Mesh::on_stream_data`]. Closing — or dropping — it
-/// stops delivery, and the stream's events go back to the shard queue.
+/// stops delivery for every event dispatched afterwards, and the
+/// stream's events go back to the shard queue. It does not wait for a
+/// callback already in flight: an event the receive path picked up
+/// before the close can still reach the handler after `close` returns.
 ///
 /// It owns exactly one registration: teardown removes the sink only if
 /// this subscription's registration id still holds the stream, so a
@@ -130,6 +133,7 @@ pub struct StreamDataSubscription {
     stream_id: u64,
     registration_id: u64,
     closed: std::sync::atomic::AtomicBool,
+    panics: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl StreamDataSubscription {
@@ -143,10 +147,17 @@ impl StreamDataSubscription {
         self.closed.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// How many times the handler panicked. Each panic was contained and
+    /// that one event dropped (unwinding builds only; see
+    /// [`Mesh::on_stream_data`]).
+    pub fn panics(&self) -> u64 {
+        self.panics.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Stop delivering. Idempotent; `true` only for the call that
     /// removed this subscription's registration. `false` when already
     /// closed, when the node is gone, or when the registration no longer
-    /// holds the stream.
+    /// holds the stream. Does not wait for a callback already in flight.
     pub fn close(&self) -> bool {
         if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
@@ -1351,9 +1362,10 @@ impl Mesh {
     /// is the peer whose installed session decrypted the packet: the
     /// identity a consumer may authorize on.
     ///
-    /// At most `capacity` events wait; beyond that an arriving event is
-    /// dropped and counted ([`StreamInbox::dropped`]) rather than
-    /// stalling the receive loop. One receiver per stream id: `None`
+    /// At most `capacity` events wait (at least one: a `capacity` of `0`
+    /// is treated as `1`); beyond that an arriving event is dropped and
+    /// counted ([`StreamInbox::dropped`]) rather than stalling the
+    /// receive loop. One receiver per stream id: `None`
     /// when the stream already has one (an inbox or an
     /// [`Self::on_stream_data`] subscription).
     ///
@@ -1372,6 +1384,12 @@ impl Mesh {
     /// delivery order. It must not block: hand the event to a channel and
     /// return. Use [`Self::open_stream_inbox`] for anything that can.
     ///
+    /// It must not panic either. In an unwinding build the SDK contains a
+    /// panic: that one event is dropped, the receive path carries on, and
+    /// [`StreamDataSubscription::panics`] counts it. Under
+    /// `panic = "abort"` (this workspace's `release` profile) a panic
+    /// aborts the process, and nothing can contain it.
+    ///
     /// One receiver per stream id: `None` when the stream already has
     /// one. Closing or dropping the returned [`StreamDataSubscription`]
     /// unregisters exactly this registration — never a later one on the
@@ -1380,13 +1398,26 @@ impl Mesh {
     where
         F: Fn(StreamInboundEvent) + Send + Sync + 'static,
     {
-        let sink: StreamInboundSink = Arc::new(handler);
+        let panics = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // The core calls the sink inline on the receive path, with no
+        // unwind guard: an escaping panic would end the receive task for
+        // every stream on the node, not just this one.
+        let sink: StreamInboundSink = {
+            let panics = panics.clone();
+            Arc::new(move |event| {
+                let call = std::panic::AssertUnwindSafe(|| handler(event));
+                if std::panic::catch_unwind(call).is_err() {
+                    panics.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
         let registration_id = self.node.register_stream_inbound(stream_id, sink)?;
         Some(StreamDataSubscription {
             node: Arc::downgrade(&self.node),
             stream_id,
             registration_id,
             closed: std::sync::atomic::AtomicBool::new(false),
+            panics,
         })
     }
 

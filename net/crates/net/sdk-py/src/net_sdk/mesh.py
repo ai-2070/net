@@ -696,6 +696,39 @@ class MeshNode:
         ``nat-traversal`` builds only."""
         self._native.connect_direct(peer_node_id, peer_public_key, coordinator)
 
+    def nat_type(self) -> str:
+        """``"open" | "cone" | "symmetric" | "unknown"``; ``"unknown"`` until
+        classified. ``nat-traversal`` builds only."""
+        return self._native.nat_type()
+
+    def reflex_addr(self) -> Optional[str]:
+        """This node's public ``ip:port`` as a peer saw it, or ``None``.
+        ``nat-traversal`` builds only."""
+        return self._native.reflex_addr()
+
+    def peer_nat_type(self, peer_node_id: int) -> str:
+        """The NAT class ``peer_node_id`` last advertised. ``nat-traversal``
+        builds only."""
+        return self._native.peer_nat_type(peer_node_id)
+
+    def probe_reflex(self, peer_node_id: int) -> str:
+        """Probe ``peer_node_id`` for this node's observed ``ip:port``.
+        ``nat-traversal`` builds only."""
+        return self._native.probe_reflex(peer_node_id)
+
+    def reclassify_nat(self) -> None:
+        """Re-run NAT classification now. ``nat-traversal`` builds only."""
+        self._native.reclassify_nat()
+
+    def set_reflex_override(self, external: str) -> None:
+        """Pin the public reflex to ``external`` (``"ip:port"``).
+        ``nat-traversal`` builds only."""
+        self._native.set_reflex_override(external)
+
+    def clear_reflex_override(self) -> None:
+        """Drop a reflex override. ``nat-traversal`` builds only."""
+        self._native.clear_reflex_override()
+
     def connect_direct_auto(self, peer_node_id: int, peer_public_key: str) -> None:
         """:meth:`connect_direct` with the coordinator chosen for you.
         ``nat-traversal`` builds only."""

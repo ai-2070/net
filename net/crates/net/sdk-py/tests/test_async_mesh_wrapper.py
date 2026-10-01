@@ -86,13 +86,18 @@ def test_sync_only_verbs_go_to_the_sync_node(anode) -> None:
     sync_native.num_shards.assert_called_once_with()
 
 
-def test_events_yields_batches_and_sleeps_when_idle(anode) -> None:
+def test_events_yields_batches_and_sleeps_when_idle(anode, monkeypatch) -> None:
     node, _, async_native, _ = anode
     async_native.poll.side_effect = [["e1", "e2"], [], ["e3"]]
+    # Without the idle sleep, `events()` would spin on an empty queue. Pin
+    # that it backs off exactly once, after the one empty batch, for the
+    # requested interval.
+    sleep = AsyncMock()
+    monkeypatch.setattr(mesh_mod.asyncio, "sleep", sleep)
 
     async def run() -> list:
         got = []
-        async for event in node.events(limit=4, idle_sleep=0):
+        async for event in node.events(limit=4, idle_sleep=0.25):
             got.append(event)
             if len(got) == 3:
                 break
@@ -100,6 +105,7 @@ def test_events_yields_batches_and_sleeps_when_idle(anode) -> None:
 
     assert asyncio.run(run()) == ["e1", "e2", "e3"]
     assert async_native.poll.await_count == 3
+    sleep.assert_awaited_once_with(0.25)
 
 
 def test_exported_from_the_root() -> None:

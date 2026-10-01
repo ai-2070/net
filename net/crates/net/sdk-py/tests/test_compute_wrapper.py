@@ -15,21 +15,35 @@ import net_sdk.compute as compute
 import net_sdk.mesh as mesh_mod
 
 
+class FakeNativeRuntime:
+    """Stands in for ``net.DaemonRuntime``. A real class, not a ``MagicMock``
+    instance: ``_native_runtime`` does ``isinstance(x, _NativeDaemonRuntime)``,
+    and ``isinstance`` against a mock *instance* raises ``TypeError`` by
+    itself, which would let a type-check test pass for the wrong reason.
+    Method calls go to a recording mock."""
+
+    def __init__(self, mesh) -> None:
+        self.mesh = mesh
+        self.calls = MagicMock(name="DaemonRuntime-methods")
+
+    def __getattr__(self, name):
+        return getattr(self.calls, name)
+
+
 @pytest.fixture
 def rt(monkeypatch: pytest.MonkeyPatch):
     native_mesh = MagicMock(name="NetMesh-instance")
     monkeypatch.setattr(mesh_mod, "_NetMesh", MagicMock(return_value=native_mesh))
     node = mesh_mod.MeshNode("127.0.0.1:0", "00" * 32)
-    native_rt = MagicMock(name="DaemonRuntime-instance")
-    ctor = MagicMock(return_value=native_rt)
-    monkeypatch.setattr(compute, "_NativeDaemonRuntime", ctor)
-    return compute.DaemonRuntime(node), native_rt, ctor, native_mesh
+    monkeypatch.setattr(compute, "_NativeDaemonRuntime", FakeNativeRuntime)
+    wrapper = compute.DaemonRuntime(node)
+    return wrapper, wrapper.native, FakeNativeRuntime, native_mesh
 
 
 def test_runtime_is_built_from_the_nodes_native_mesh(rt) -> None:
-    wrapper, native_rt, ctor, native_mesh = rt
-    ctor.assert_called_once_with(native_mesh)
-    assert wrapper.native is native_rt
+    wrapper, native_rt, _, native_mesh = rt
+    assert isinstance(native_rt, FakeNativeRuntime)
+    assert native_rt.mesh is native_mesh
 
 
 def test_a_non_mesh_argument_is_a_type_error() -> None:
@@ -71,9 +85,10 @@ def test_methods_forward_unchanged(rt) -> None:
 
 
 def test_native_runtime_unwraps_both_forms(rt) -> None:
-    wrapper, native_rt, ctor, _ = rt
-    assert compute._native_runtime(wrapper) is native_rt
-    with pytest.raises(TypeError):
+    wrapper, native_rt, _, _ = rt
+    assert compute._native_runtime(wrapper) is native_rt  # the SDK wrapper
+    assert compute._native_runtime(native_rt) is native_rt  # a raw native runtime
+    with pytest.raises(TypeError, match="expected a net_sdk.compute.DaemonRuntime"):
         compute._native_runtime(object())
 
 

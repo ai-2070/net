@@ -233,7 +233,7 @@ loop {
 
 ### TypeScript / Python — the receive surface
 
-The high-level `MeshNode` wrappers differ in what they expose. The TS SDK's `MeshNode` class (`sdk-ts/src/mesh.ts`) now carries the full receive shape — `recv(limit)` merges every shard, `recvShard(shardId, limit)` targets one, and `numShards()` / `shardForStream(streamId)` answer which. The Python SDK's `MeshNode` class (`sdk-py/src/net_sdk/mesh.py`) still has no `recv` / `poll` method — an ergonomic gap there, not a capability gap.
+Both high-level `MeshNode` wrappers carry the full receive shape: `recv(limit)` merges every shard, a single-shard poll targets one, and `numShards()` / `shardForStream(streamId)` (Python: `num_shards()` / `shard_for_stream(stream_id)`) answer which. The TS class is in `sdk-ts/src/mesh.ts`, the Python one in `sdk-py/src/net_sdk/mesh.py`.
 
 Both high-level SDKs expose receive, each delegating to its binding's shape:
 

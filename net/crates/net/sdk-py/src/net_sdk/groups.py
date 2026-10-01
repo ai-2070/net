@@ -63,11 +63,14 @@ GroupErrorKind = Literal[
 GroupStatus = Literal["healthy", "degraded", "dead"]
 
 
-class GroupHealth(TypedDict, total=False):
-    """A group's ``health``. ``healthy`` / ``total`` are present only when
-    ``status == "degraded"``."""
-
+class _GroupHealthRequired(TypedDict):
     status: GroupStatus
+
+
+class GroupHealth(_GroupHealthRequired, total=False):
+    """A group's ``health``. ``status`` is always present; ``healthy`` /
+    ``total`` only when ``status == "degraded"``."""
+
     healthy: int
     total: int
 

@@ -108,7 +108,12 @@ to the roster and reports what reached whom. (`NetNode.channel` is a different
 thing: a channel on the local bus.)
 
 ```python
-from net_sdk import ChannelAuthError
+from net_sdk import ChannelAuthError, MeshNode
+
+publisher = MeshNode("127.0.0.1:0", "42" * 32)
+subscriber = MeshNode("127.0.0.1:0", "42" * 32)
+# ...connect them (subscriber.connect(...) / publisher.accept(...)) and start
+# both, as in the quickstart.
 
 publisher.register_channel(
     "sensors/temp",
@@ -153,7 +158,7 @@ ident = Identity.generate()
 daemon = rt.spawn("counter", ident)
 rt.deliver(daemon.origin_hash, CausalEvent(ident.origin_hash, 1, b""))
 
-group = ReplicaGroup.spawn(rt, "counter", 3, b"" * 32, "consistent-hash")
+group = ReplicaGroup.spawn(rt, "counter", 3, b"\x01" * 32, "consistent-hash")
 target = group.route_event({"routing_key": "user-42"})
 ```
 

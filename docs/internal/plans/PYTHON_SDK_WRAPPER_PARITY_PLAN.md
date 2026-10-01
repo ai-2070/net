@@ -5,8 +5,8 @@ The Rust SDK gaps found along the way have their own plan:
 
 ## Status
 
-In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-Done, 2026-10-01: S0, S1a and S1–S8 all landed (see each slice). Open follow-ups are listed under each slice's "Found, not fixed" notes and in "Not in scope".
+Done, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
+S0, S1a and S1–S8 all landed (see each slice). Open follow-ups are listed under each slice's "Found, not fixed" notes and in "Not in scope".
 
 Amended 2026-10-01, same day:
 - The two open checks from the first draft were verified (see S0 and S5).
@@ -62,7 +62,7 @@ name and must not be confused in the new API.
 | Layer | State |
 |---|---|
 | Wheel | ✅ `compute.rs` (1,852 lines): `DaemonRuntime(mesh: NetMesh)` with `start` / `shutdown` / `is_ready` / `daemon_count` / `register_factory(kind, factory)` / `spawn` / `spawn_from_snapshot` / `stop` / `snapshot` / `deliver` / `start_migration(_with)` / `expect_migration` / `register_migration_target_identity` / `migration_phase`. Also `MigrationHandle` (`wait`, `wait_with_timeout`, `cancel`, `phases`), `CausalEvent`, `AsyncDaemonRuntime`, `AsyncMigrationHandle`. The `net.migration_error_kind(exc)` helper lives in `python/net/__init__.py:296`. Tests: `test_compute.py`. |
-| `_net.pyi` | ⚠️ `DaemonRuntime`, `DaemonHandle` and `MigrationHandle` (lines 2541–2551) are class shells with a docstring and **no methods**, so type checkers and IDEs see no callable surface. The async twins *are* typed (line 3635). |
+| `_net.pyi` | ~~⚠️ `DaemonRuntime`, `DaemonHandle` and `MigrationHandle` (lines 2541–2551) are class shells with a docstring and **no methods**, so type checkers and IDEs see no callable surface. The async twins *are* typed (line 3635).~~ **Fixed in S0:** all three now have full method stubs. |
 | `_net.pyi` | ⚠️ `MigrationError`'s docstring (line 2532) points to `net_sdk.compute.migration_error_kind`, which does not exist. The helper is `net.migration_error_kind`. |
 | `net_sdk` | ❌ No `compute` module. TS `compute.ts` ships `MeshDaemon` (interface), `DaemonFactory`, `DaemonHostConfig`, `DaemonStats`, `MigrationPhase`, `MigrationOptions`, `MigrationErrorKind`, `DaemonRuntime`, `DaemonHandle`, `MigrationHandle`. |
 | Wiring hazard | `DaemonRuntime.__init__` takes a native `NetMesh`. An `net_sdk.MeshNode` is not one; today the caller has to pass `node._native`. |
@@ -72,7 +72,7 @@ name and must not be confused in the new API.
 | Layer | State |
 |---|---|
 | Wheel | ✅ `groups.rs`: `ReplicaGroup` (`spawn`, `route_event`, `scale_to`, `on_node_failure` / `on_node_recovery`, counts), `ForkGroup` (`fork`, `verify_lineage`, …), `StandbyGroup` (`spawn`, `promote`, `sync_standbys`, `member_role`, `synced_through`, …). `net.group_error_kind(exc)` at `python/net/__init__.py:342`. Tests: `test_groups.py`. |
-| `_net.pyi` | ⚠️ All three group classes (lines 2556–2563) are method-less shells. |
+| `_net.pyi` | ~~⚠️ All three group classes (lines 2556–2563) are method-less shells.~~ **Fixed in S0:** full method stubs. |
 | `net_sdk` | ❌ No `groups` module. TS `groups.ts` ships `GroupErrorKind`, `GroupStrategy`, `GroupHealth`, `GroupMemberInfo`, `ForkRecord`, `RequestContext`, `GroupHostConfig`, `{Replica,Fork,Standby}GroupConfig` and the three classes. |
 
 ### G4 — Other `MeshNode` methods the wheel has but the wrapper drops
@@ -165,8 +165,9 @@ The publish path returns a `PublishReport` dict. For receiving, add:
   native methods. (Earlier drafts planned a new native getter, then a
   cached-kwarg fallback. Neither is needed: S0 found the native methods
   already exist, only unstubbed.)
-- `MeshNode.recv(limit=..., timeout=None) -> list[StoredEvent]`, which drains
-  every shard round-robin, matching TS `recv`.
+- ~~`MeshNode.recv(limit=..., timeout=None) -> list[StoredEvent]`, which drains
+  every shard round-robin, matching TS `recv`.~~ Landed as
+  `MeshNode.recv(limit) -> list[StoredEvent]`; see below.
   *Changed during S1:* native `NetMesh.poll(limit)` already sweeps every
   shard from a rotating start (`bindings/python/src/lib.rs` ~line 2188); its
   stub docstring wrongly said "shard 0". So `recv(limit)` forwards to it
@@ -315,7 +316,74 @@ the slice were wrong. Two test homes, with different jobs:
     `NetMesh stub parameters drift: ["publish_island_topology:
     runtime=[…, 'p50_latency_us'] stub=[…]"]`. It was the only mismatch
     across all eleven sampled classes. **GREEN:** 230 passed, 1 skipped.
-    The same fix corrected the stale `NetMesh.poll` docstring.
+    The same fix corrected the stale `NetMesh.poll` docstring.
+  - **Second follow-up, from CI and review (2026-10-01).**
+    - **CI's `Python wheel (shipped profile)` job failed** the reverse
+      test. The shipped wheel builds default features, so it has
+      `nat-traversal`, and its `NetMesh` exposes seven NAT methods the stub
+      never declared (`nat_type`, `reflex_addr`, `peer_nat_type`,
+      `probe_reflex`, `reclassify_nat`, `set_reflex_override`,
+      `clear_reflex_override`). The local wheel used the dev feature list,
+      which lacks `nat-traversal`, so it couldn't show them. Now stubbed,
+      and forwarded on `MeshNode`. Reproduced on a local wheel with the
+      shipped feature set: RED 1 failed (as in CI); GREEN 231 passed.
+    - **Review (cubic):** `FEATURE_GATED` missed the `tool`-gated
+      `list_tools` / `watch_tools` and the `a2a`+`org`-gated
+      `a2a_org_caller` pair, so it now lists them. It was also an
+      unconditional excuse, so a gated method that disappeared from a build
+      **with** its feature passed. Now a feature counts as compiled in if
+      any of its gated methods exists, and an absence is excused only when
+      its feature is off. Witness: on the `nat-traversal` wheel, a bogus
+      gated stub method fails the test.
+    - **Review:** the constructor real-values test now also passes
+      `reflex_override` (an `ip:port`).
+  - **Second review round (cubic, 16 comments, all valid, all fixed):**
+    - **P1, native bug:** `AsyncNetMesh.poll` read **shard 0 only**, the bug
+      the sync `poll` had already fixed. So `AsyncMeshNode.recv()` /
+      `events()` missed every stream on another shard. The S7 live test
+      passed by luck: its channel landed on shard 0. The native `poll` now
+      sweeps every shard from a rotating start, sharing the sync mesh's
+      `recv_cursor`. This is the plan's one native change; it fixes a bug
+      rather than adding surface. New test
+      `test_async_recv_sees_streams_on_every_shard`, which picks a stream
+      on a non-zero shard. **RED**, with `recv` mutated to read shard 0:
+      it times out.
+    - **Stub test reads kinds:** `test_sampled_class_method_parameters_match`
+      now compares each parameter's kind (positional-only,
+      positional-or-keyword, keyword-only, varargs) as well as its name.
+      **RED:** dropping `submit_task`'s `*,` in the stub fails it.
+    - **Test hygiene:**
+      - The `test_sdk_*.py` import fallback now applies only when `net_sdk`
+        isn't installed at all (`find_spec`). An `ImportError` *inside* an
+        installed package surfaces instead of being replaced by checkout
+        source.
+      - The groups and compute live tests skip on wheels built without
+        those features, keyed on the wheel's classes, not on an
+        `ImportError`.
+      - The compute forwarding test used a `MagicMock` instance where a
+        class belongs, so `isinstance` raised `TypeError` on its own and
+        the type-check test passed for the wrong reason. It's now a real
+        fake class, asserting the message, and it covers the raw-native
+        form too.
+      - The `events()` test asserts the idle `asyncio.sleep` is awaited.
+      - The `num_shards` forwarding is asserted.
+    - **Parity:** native accepts `True` / `False` as subnet levels, since
+      `bool` is an `int` subclass. `subnet_id` rejected them, which was
+      stricter than native. Fixed, and the bools (and `1.5`, which native
+      rejects) were added to the live parity candidates.
+    - **Types:** `GroupHealth.status` is required (native always sets it).
+    - **Docs:**
+      - The README channel example now builds its `publisher` /
+        `subscriber`, and a literal control character in its group seed is
+        now the escape `b""`.
+      - The announce page builds its node with `permissive_channels=True`.
+      - `net_sdk.blob` raises the same "rebuild with `dataforts`"
+        `ImportError` as `net_sdk.transport`, and the artifacts page quotes
+        it.
+      - `transport.py`'s example no longer imports the nonexistent
+        `net_sdk.dataforts`.
+      - A stale "Python has no `recv`" sentence in the skill is fixed.
+      - This plan's status and its `recv` signature are each stated once.
 
 ### S1a — Forward every constructor option, with a drift guard (G6)
 

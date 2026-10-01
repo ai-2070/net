@@ -2,8 +2,8 @@
 
 ## Status
 
-In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-S1 and S2 done 2026-10-01 (see each slice). Nothing else is planned here; R2's
+Done, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
+S1 and S2 landed 2026-10-01 (see each slice). Nothing else is planned here; R2's
 migration and R3 are deferred decisions, not open slices.
 
 Amended 2026-10-01 after review: the R1 design now requires `StreamDataSubscription` to keep core's registration ownership (`Weak<MeshNode>`, unregister by stream id + registration id). S1 gained a stale-handle teardown witness and a no-keep-alive-past-shutdown witness.
@@ -50,8 +50,8 @@ lacks X".
 | `verify_signature`, `delegate_token` free functions | Methods on re-exported types: `EntityId::verify` (`identity/entity.rs:79`), `PermissionToken::delegate` (`identity/token.rs:519`); re-exported by `sdk/src/identity.rs:56` |
 | `stream_id_from_label` | Core re-exports it at `net::adapter::net` (`mod.rs:250`). The SDK doesn't re-export it, but Rust users reach it through the `net` dependency they already have. Cosmetic. |
 | `publish_tools` | Lives in the MCP adapter (`net_mcp::wrap`), not `net_sdk`. Deliberate per the MCP adapter-boundary rule. |
-| `poll_shard` / `num_shards` | `Mesh::recv_shard` / `Mesh::num_shards` (`sdk/src/mesh.rs:909`, `:915`) |
-| `list_tools` / `watch_tools`, blob transfer, capability aggregation, A2A, enrollment, NAT traversal | All present (`tool.rs`, `transport.rs`, `mesh.rs:1433` / `:1497`, `mesh_a2a.rs`, `mesh_enroll.rs`, `mesh.rs:1667–1846`) |
+| `poll_shard` / `num_shards` | `Mesh::recv_shard` / `Mesh::num_shards` (`sdk/src/mesh.rs:980`, `:986` as of this PR's head) |
+| `list_tools` / `watch_tools`, blob transfer, capability aggregation, A2A, enrollment, NAT traversal | All present (`tool.rs`, `transport.rs`, `sdk/src/mesh.rs:1572` / `:1636`, `mesh_a2a.rs`, `mesh_enroll.rs`, `sdk/src/mesh.rs:1806–1985`) |
 
 ### R1 — per-stream receive with the authenticated sender (real gap)
 
@@ -69,7 +69,7 @@ Both bindings expose these: Node as `onStreamData`
 `Mesh::recv` / `recv_shard` return `StoredEvent`s, which don't carry the sender
 (TS documents exactly this: "What `MeshNode.recv` cannot tell you"). So a Rust
 SDK user is the only one who has to drop to `mesh.node()`
-(`sdk/src/mesh.rs:703`) to learn who sent a stream event. The Rust SDK sits
+(`sdk/src/mesh.rs:774`) to learn who sent a stream event. The Rust SDK sits
 *behind* its own bindings here.
 
 ### R2 — the bindings don't sit on the Rust SDK (structural)
@@ -182,10 +182,13 @@ already reach them through the `net` crate. Revisit if one gets wired into
     Repeat with A as an inbox and B as a callback. This fails if the handle
     ever unregisters by stream id alone, or by a registration id it doesn't
     own.
-  - **No node keep-alive.** With a live subscription and a live inbox still
-    held, `mesh.shutdown()` succeeds. Afterwards, dropping both handles doesn't
-    panic, and `close()` returns without effect. This fails if either handle
-    holds an `Arc<MeshNode>`.
+  - **No node keep-alive.** On a never-started node, opening an inbox and a
+    subscription must leave `Arc::strong_count(mesh.node())` unchanged. That
+    is the discriminator; it fails if either handle holds an
+    `Arc<MeshNode>`. Shutting down with both handles held, then dropping
+    them, is kept as a teardown safety check only. (The first draft used
+    shutdown itself as the discriminator; see the note below for why it
+    can't be.)
 
     *Changed during implementation (2026-10-01):* this witness, as written,
     can't tell `Weak` from `Arc`. Core `MeshNode::shutdown(&self)` succeeds
@@ -235,6 +238,22 @@ already reach them through the `net` crate. Revisit if one gets wired into
     variant are clean. `RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-sdk
     --no-deps --features "full rtc-bootstrap"` is clean; the only output is the
     existing `panic`-in-bench-profile manifest warning.
+  - **Review follow-up (2026-10-01), three findings, all fixed:**
+    - **A panicking `on_stream_data` handler killed the node's receive
+      path.** The core calls the sink inline in `dispatch_local_packet`
+      with no unwind guard. The SDK now wraps the handler in
+      `catch_unwind`: the one event is dropped, the panic is counted
+      (`StreamDataSubscription::panics()`), and receiving continues. New
+      test `a_panicking_handler_is_contained_and_the_node_keeps_receiving`.
+      **RED** with the guard removed: `timed out waiting for: the event
+      after the panic`. The docs state the limit: under `panic = "abort"`
+      (the workspace `release` profile) a panic still aborts the process.
+    - **`close()` doesn't wait for a callback in flight:** the receive path
+      clones the sink before calling it, so a concurrent close can return
+      first. Documented on the type and on `close()`.
+    - **`open_stream_inbox(capacity = 0)` holds one event,** since the core
+      clamps it to one. Documented.
+    - With the new test, `stream_inbound.rs` passes 7/7.
   - **Not run:** the full `net-mesh-sdk` suite and the workspace-wide pre-push
     checklist. The change is additive (two methods, one type, re-exports), so
     those are left to CI.

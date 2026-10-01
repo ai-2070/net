@@ -269,11 +269,18 @@ check the floor.
 ### S4 — N4, the blob types
 
 - `src/blob.ts`, re-exported from the root.
-- **Proves it:** `test/blob_surface.test.ts` builds a `MeshBlobAdapter` with
-  `registerFilesystemBlobAdapter`, imported **only** from `@net-mesh/sdk`
-  (`../src/index`). It then runs `storeDir` → `fetchDir` across two nodes and
-  checks the files round-trip. The witness is that nothing in the test imports
-  `@net-mesh/core`.
+- **Proves it:** `test/blob_surface.test.ts`, importing **only** from
+  `@net-mesh/sdk` (`../src/index`):
+  - Construct a `Redex` and then `new MeshBlobAdapter(redex, adapterId)`,
+    install it with `serveBlobTransfer` on **both** nodes (the fetching node
+    needs the transfer engine too, as the Python S4 test found), and run
+    `storeDir` → `fetchDir` across the two, checking the files round-trip.
+  - Separately, `registerFilesystemBlobAdapter(id, root)` →
+    `blobAdapterRegistered(id)` is true → `unregisterBlobAdapter(id)`. That
+    function registers a global `BlobAdapter`; it does **not** build the
+    `MeshBlobAdapter` `storeDir` / `fetchDir` need. (Corrected 2026-10-01
+    after review; the first draft conflated the two.)
+  - The witness is that nothing in the test imports `@net-mesh/core`.
 
 ### S5 — N5, the mesh methods
 
@@ -335,9 +342,8 @@ check the floor.
   the binding's declared scope.
 - New subpath exports other than `./deck`.
 - Any napi (native) change.
-- **The Python twin of N2.** `net_sdk.MeshNode.__init__` drops `reflex_override`,
-  `try_port_mapping`, `auto_direct_upgrade` and `permissive_channels`, plus
-  `capability_gc_interval_ms` and `require_signed_capabilities`, all of which
-  the native Python constructor accepts (`_net.pyi` ~line 826). It is owned by
+- **The Python twin of N2.** `net_sdk.MeshNode.__init__` dropped six native
+  options, including `require_signed_capabilities`. Fixed (2026-10-01) by
   slice S1a of
-  [`PYTHON_SDK_WRAPPER_PARITY_PLAN.md`](PYTHON_SDK_WRAPPER_PARITY_PLAN.md).
+  [`PYTHON_SDK_WRAPPER_PARITY_PLAN.md`](PYTHON_SDK_WRAPPER_PARITY_PLAN.md),
+  behind a drift guard; nothing left here.

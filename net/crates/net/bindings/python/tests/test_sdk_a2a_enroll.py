@@ -11,6 +11,7 @@ installed (CI's main run); it never skips for that.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import sys
 import threading
@@ -26,11 +27,12 @@ PSK = "8e" * 32
 
 
 def _sdk(module: str):
-    try:
-        return importlib.import_module(module)
-    except ImportError:
+    # Fall back to the checkout only when `net_sdk` is not installed at
+    # all. An ImportError raised *inside* an installed package is a real
+    # failure and must surface, not be papered over with source.
+    if importlib.util.find_spec("net_sdk") is None:
         sys.path.insert(0, str(SDK_SRC))
-        return importlib.import_module(module)
+    return importlib.import_module(module)
 
 
 @pytest.fixture

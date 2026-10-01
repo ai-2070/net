@@ -95,6 +95,7 @@ def test_receive_side_forwards(node) -> None:
 
     native.num_shards.return_value = 4
     assert mesh.num_shards() == 4
+    native.num_shards.assert_called_once_with()
     native.shard_for_stream.return_value = 3
     assert mesh.shard_for_stream(7) == 3
     native.shard_for_stream.assert_called_once_with(7)

@@ -17,7 +17,7 @@ Example::
 
     import net_sdk.transport as transport
     from net_sdk import MeshNode
-    from net_sdk.dataforts import MeshBlobAdapter  # storage side
+    from net_sdk.blob import MeshBlobAdapter  # storage side
 
     transport.serve_blob_transfer(mesh, adapter)   # install once
     data = transport.fetch_blob(mesh, holder_id, blob_ref)

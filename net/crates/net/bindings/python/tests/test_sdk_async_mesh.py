@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -24,11 +25,12 @@ PSK = "42" * 32
 
 
 def _sdk(module: str):
-    try:
-        return importlib.import_module(module)
-    except ImportError:
+    # Fall back to the checkout only when `net_sdk` is not installed at
+    # all. An ImportError raised *inside* an installed package is a real
+    # failure and must surface, not be papered over with source.
+    if importlib.util.find_spec("net_sdk") is None:
         sys.path.insert(0, str(SDK_SRC))
-        return importlib.import_module(module)
+    return importlib.import_module(module)
 
 
 async def _async_pair():
@@ -66,6 +68,35 @@ def test_channel_round_trip_under_asyncio() -> None:
         finally:
             await sub.shutdown()
             await pub.shutdown()
+
+    asyncio.run(run())
+
+
+def test_async_recv_sees_streams_on_every_shard() -> None:
+    """The native async ``poll`` read shard 0 only, so events on any other
+    shard were invisible to ``AsyncMeshNode.recv`` / ``events()``. Pick a
+    stream that lands on a non-zero shard and require it to arrive."""
+
+    async def run() -> None:
+        sender, receiver = await _async_pair()
+        try:
+            shards = receiver.num_shards()
+            assert shards > 1, "needs a multi-shard node to mean anything"
+            sid = next(s for s in range(1, 10_000) if receiver.shard_for_stream(s) != 0)
+            stream = sender.sync.open_stream(receiver.node_id, sid, reliability="reliable")
+            sender.sync.send_with_retry(stream, [b'{"off": "shard0"}'])
+
+            async def first_event():
+                async for event in receiver.events():
+                    return event
+
+            event = await asyncio.wait_for(first_event(), 5)
+            raw = event.raw
+            assert (raw.encode() if isinstance(raw, str) else bytes(raw)) == b'{"off": "shard0"}'
+            assert event.shard_id != 0
+        finally:
+            await sender.shutdown()
+            await receiver.shutdown()
 
     asyncio.run(run())
 

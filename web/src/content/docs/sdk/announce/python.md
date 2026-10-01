@@ -9,7 +9,8 @@
 ```python
 from net_sdk import MeshNode
 
-node = MeshNode(bind_addr="127.0.0.1:9001", psk="42" * 32)
+# permissive_channels: nRPC (and so the tool surface below) needs it.
+node = MeshNode(bind_addr="127.0.0.1:9001", psk="42" * 32, permissive_channels=True)
 node.announce_capabilities({"tags": ["gpu"], "hardware": {"memory_gb": 64}})
 ```
 

@@ -13,6 +13,7 @@ from the in-repo source; the test never skips for that.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sys
 import threading
 import time
@@ -27,11 +28,12 @@ PSK = "42" * 32
 
 
 def _net_sdk():
-    try:
-        return importlib.import_module("net_sdk")
-    except ImportError:
+    # Fall back to the checkout only when `net_sdk` is not installed at
+    # all. An ImportError raised *inside* an installed package is a real
+    # failure and must surface, not be papered over with source.
+    if importlib.util.find_spec("net_sdk") is None:
         sys.path.insert(0, str(SDK_SRC))
-        return importlib.import_module("net_sdk")
+    return importlib.import_module("net_sdk")
 
 
 @pytest.fixture

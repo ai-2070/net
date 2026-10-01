@@ -1356,6 +1356,38 @@ class NetMesh:
         ...
 
     # -- NAT traversal (requires the `nat-traversal` build) ---------
+    def nat_type(self) -> str:
+        """This node's NAT classification: ``"open" | "cone" | "symmetric" |
+        "unknown"``. ``"unknown"`` until the background classifier has run
+        (after ``start()``, with at least 2 peers)."""
+        ...
+    def reflex_addr(self) -> Optional[str]:
+        """This node's public ``ip:port`` as a peer observed it, or ``None``
+        before classification has produced an observation."""
+        ...
+    def peer_nat_type(self, peer_node_id: int) -> str:
+        """The NAT classification ``peer_node_id`` last advertised, or
+        ``"unknown"`` if it hasn't announced one."""
+        ...
+    def probe_reflex(self, peer_node_id: int) -> str:
+        """Send one reflex probe to ``peer_node_id``; returns the public
+        ``ip:port`` it observed. Raises ``RuntimeError`` with a
+        ``traversal: <kind>`` message (``reflex-timeout``,
+        ``peer-not-reachable``, ``transport``)."""
+        ...
+    def reclassify_nat(self) -> None:
+        """Re-run the classification sweep now (e.g. after a suspected NAT
+        rebind). No-op with fewer than 2 peers; never raises."""
+        ...
+    def set_reflex_override(self, external: str) -> None:
+        """Pin this node's public reflex to ``external`` (``"ip:port"``);
+        classification is skipped. Raises ``ValueError`` if it doesn't
+        parse."""
+        ...
+    def clear_reflex_override(self) -> None:
+        """Drop a reflex override; the classifier resumes. No-op when none
+        is set."""
+        ...
     def traversal_stats(self) -> dict:
         """Cumulative NAT-traversal counters — the full stage-5
         snapshot. Keys: ``punches_attempted``,

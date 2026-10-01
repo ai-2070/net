@@ -58,7 +58,9 @@ def subnet_id(*levels: int) -> SubnetId:
     if not 1 <= len(levels) <= 4:
         raise ValueError(f"subnet: levels must have 1-4 entries, got {len(levels)}")
     for i, value in enumerate(levels):
-        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255:
+        # `bool` is an `int` subclass and the native parser takes it as 0/1,
+        # so it is accepted here too: parity, not taste.
+        if not isinstance(value, int) or not 0 <= value <= 255:
             raise ValueError(f"subnet: level {i} value {value!r} must be an int in [0, 255]")
     return list(levels)
 

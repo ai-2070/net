@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import importlib.util
 import inspect
 import re
 import sys
@@ -45,11 +46,12 @@ def _net_mesh_cls():
 
 
 def _sdk_mesh_module():
-    try:
-        return importlib.import_module("net_sdk.mesh")
-    except ImportError:
+    # Fall back to the checkout only when `net_sdk` is not installed at
+    # all. An ImportError raised *inside* an installed package is a real
+    # failure and must surface, not be papered over with source.
+    if importlib.util.find_spec("net_sdk") is None:
         sys.path.insert(0, str(SDK_SRC))
-        return importlib.import_module("net_sdk.mesh")
+    return importlib.import_module("net_sdk.mesh")
 
 
 def _native_params() -> list[str]:
@@ -162,6 +164,9 @@ def test_sdk_meshnode_accepts_real_values_for_the_g6_options() -> None:
         "42" * 32,
         capability_gc_interval_ms=120_000,
         require_signed_capabilities=True,
+        # Parsed as `ip:port` natively; ignored (not rejected) by a build
+        # without `nat-traversal`, so it is safe on every wheel.
+        reflex_override="203.0.113.5:9000",
         try_port_mapping=False,
         auto_direct_upgrade=False,
         permissive_channels=False,

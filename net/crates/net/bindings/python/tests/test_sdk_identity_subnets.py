@@ -13,6 +13,7 @@ installed (CI's main run); it never skips for that.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sys
 import typing
 from pathlib import Path
@@ -29,11 +30,12 @@ PSK = "42" * 32
 
 
 def _sdk(module: str):
-    try:
-        return importlib.import_module(module)
-    except ImportError:
+    # Fall back to the checkout only when `net_sdk` is not installed at
+    # all. An ImportError raised *inside* an installed package is a real
+    # failure and must surface, not be papered over with source.
+    if importlib.util.find_spec("net_sdk") is None:
         sys.path.insert(0, str(SDK_SRC))
-        return importlib.import_module(module)
+    return importlib.import_module(module)
 
 
 def test_identity_names_are_the_wheels_own_objects() -> None:
@@ -66,6 +68,9 @@ CANDIDATE_SUBNETS = [
     [1, 2, 3, 4, 5],
     [256],
     [0, 300],
+    [True],  # bool is an int subclass; native takes it as 1
+    [False],
+    [1.5],
 ]
 
 
@@ -74,7 +79,9 @@ def test_subnet_id_rejects_exactly_what_native_rejects(levels) -> None:
     subnets = _sdk("net_sdk.subnets")
     try:
         mesh = NetMesh("127.0.0.1:0", PSK, subnet=levels)
-    except IdentityError:
+    except (IdentityError, TypeError, OverflowError):
+        # IdentityError for range/length; TypeError / OverflowError when a
+        # value isn't an int at all, or is negative (extracted as u32).
         native_ok = False
     else:
         native_ok = True

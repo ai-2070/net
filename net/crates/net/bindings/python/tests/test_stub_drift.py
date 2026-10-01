@@ -109,7 +109,32 @@ FEATURE_GATED: dict[tuple[str, str], str] = {
     ("NetMesh", "traversal_stats"): "nat-traversal",
     ("NetMesh", "connect_direct"): "nat-traversal",
     ("NetMesh", "connect_direct_auto"): "nat-traversal",
+    ("NetMesh", "nat_type"): "nat-traversal",
+    ("NetMesh", "reflex_addr"): "nat-traversal",
+    ("NetMesh", "peer_nat_type"): "nat-traversal",
+    ("NetMesh", "probe_reflex"): "nat-traversal",
+    ("NetMesh", "reclassify_nat"): "nat-traversal",
+    ("NetMesh", "set_reflex_override"): "nat-traversal",
+    ("NetMesh", "clear_reflex_override"): "nat-traversal",
+    ("NetMesh", "list_tools"): "tool",
+    ("NetMesh", "watch_tools"): "tool",
+    ("NetMesh", "set_a2a_org_caller"): "a2a+org",
+    ("NetMesh", "a2a_org_caller"): "a2a+org",
 }
+
+
+def _features_compiled_in() -> set[str]:
+    """The `FEATURE_GATED` features this wheel was built with, inferred
+    from the gated methods themselves: a feature is on if ANY of its
+    methods exists on the runtime class. The wheel exports no feature
+    list, and this is enough to catch one method going missing from a
+    build where its feature is on. (It can't catch every method of a
+    feature disappearing at once; that reads as "feature off".)"""
+    return {
+        feature
+        for (cls_name, method), feature in FEATURE_GATED.items()
+        if hasattr(getattr(_net, cls_name, None), method)
+    }
 
 
 @pytest.mark.parametrize("class_name", SAMPLED_CLASSES)
@@ -128,8 +153,12 @@ def test_sampled_class_methods_present(class_name: str) -> None:
     assert declared, f"stub declares no methods for {class_name}"
     missing: list[str] = []
     for name in declared:
-        if not hasattr(runtime_cls, name) and (class_name, name) not in FEATURE_GATED:
-            missing.append(name)
+        if hasattr(runtime_cls, name):
+            continue
+        feature = FEATURE_GATED.get((class_name, name))
+        if feature is not None and feature not in _features_compiled_in():
+            continue  # gated, and this wheel was built without the feature
+        missing.append(name)
     assert not missing, (
         f"{class_name}: stub declares {missing} but runtime "
         f"class has no such attribute(s)"
@@ -199,16 +228,25 @@ def test_sampled_class_method_parameters_match(class_name: str) -> None:
             continue  # absence is the name-level tests' concern
         try:
             runtime_params = [
-                p
-                for p in inspect.signature(runtime_attr).parameters
-                if p not in ("self", "$self", "cls")
+                (p.name, p.kind.name)
+                for p in inspect.signature(runtime_attr).parameters.values()
+                if p.name not in ("self", "$self", "cls")
             ]
         except (TypeError, ValueError):
             mismatched.append(f"{fn.name}: runtime signature unreadable")
             continue
+        # Name AND kind: a keyword-only native option stubbed as positional
+        # (or the reverse) type-checks calls the runtime rejects.
         args = fn.args
-        stub_params = [a.arg for a in args.posonlyargs + args.args + args.kwonlyargs]
-        if "staticmethod" not in decorators and stub_params[:1] == ["self"]:
+        P = inspect.Parameter
+        stub_params = (
+            [(a.arg, P.POSITIONAL_ONLY.name) for a in args.posonlyargs]
+            + [(a.arg, P.POSITIONAL_OR_KEYWORD.name) for a in args.args]
+            + ([(args.vararg.arg, P.VAR_POSITIONAL.name)] if args.vararg else [])
+            + [(a.arg, P.KEYWORD_ONLY.name) for a in args.kwonlyargs]
+            + ([(args.kwarg.arg, P.VAR_KEYWORD.name)] if args.kwarg else [])
+        )
+        if "staticmethod" not in decorators and stub_params[:1] and stub_params[0][0] == "self":
             stub_params = stub_params[1:]
         if stub_params != runtime_params:
             mismatched.append(f"{fn.name}: runtime={runtime_params} stub={stub_params}")

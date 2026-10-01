@@ -12,6 +12,7 @@ installed (CI's main run); it never skips for that.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -19,16 +20,23 @@ import pytest
 
 pytest.importorskip("net._net")
 
+# A wheel built without the `groups` feature has no ReplicaGroup, and `net_sdk.groups`
+# then cannot import. Skip on the wheel's own classes, never on an
+# ImportError, which would also hide a broken `net_sdk`.
+if not hasattr(importlib.import_module("net._net"), "ReplicaGroup"):
+    pytest.skip("wheel built without the `groups` feature", allow_module_level=True)
+
 SDK_SRC = Path(__file__).resolve().parents[3] / "sdk-py" / "src"
 PSK = "42" * 32
 
 
 def _sdk(module: str):
-    try:
-        return importlib.import_module(module)
-    except ImportError:
+    # Fall back to the checkout only when `net_sdk` is not installed at
+    # all. An ImportError raised *inside* an installed package is a real
+    # failure and must surface, not be papered over with source.
+    if importlib.util.find_spec("net_sdk") is None:
         sys.path.insert(0, str(SDK_SRC))
-        return importlib.import_module(module)
+    return importlib.import_module(module)
 
 
 class Echo:

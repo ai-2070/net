@@ -14,12 +14,13 @@ adapter = MeshBlobAdapter(Redex(), "my-node")
 ### The import can fail, and the message tells you why
 
 ```python
-ImportError: Transport SDK symbols not present in `net._net`. Rebuild the wheel
+ImportError: Blob SDK symbols not present in `net._net`. Rebuild the wheel
 with `--features dataforts`, e.g. `maturin develop --features dataforts`.
 ```
 
-`net_sdk.transport` re-exports from `net`, and raises this at import time when the
-wheel was built without the `dataforts` feature. It is the clearest feature-gate
+`net_sdk.blob` (and `net_sdk.transport`, with "Transport" in place of "Blob")
+re-export from `net`, and raise this at import time when the wheel was built
+without the `dataforts` feature. It is the clearest feature-gate
 message in any binding — treat it as instructions rather than a broken install.
 
 ### Install, then fetch

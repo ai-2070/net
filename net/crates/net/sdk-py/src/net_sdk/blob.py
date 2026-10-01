@@ -19,22 +19,28 @@ default build is).
 
 from __future__ import annotations
 
-from net import (  # type: ignore[attr-defined]
-    AsyncMeshBlobAdapter,
-    BlobError,
-    BlobRef,
-    MeshBlobAdapter,
-    TransferError,
-    async_blob_publish,
-    async_blob_resolve,
-    blob_adapter_ids,
-    blob_adapter_registered,
-    blob_publish,
-    blob_resolve,
-    register_blob_adapter,
-    register_filesystem_blob_adapter,
-    unregister_blob_adapter,
-)
+try:
+    from net import (  # type: ignore[attr-defined]
+        AsyncMeshBlobAdapter,
+        BlobError,
+        BlobRef,
+        MeshBlobAdapter,
+        TransferError,
+        async_blob_publish,
+        async_blob_resolve,
+        blob_adapter_ids,
+        blob_adapter_registered,
+        blob_publish,
+        blob_resolve,
+        register_blob_adapter,
+        register_filesystem_blob_adapter,
+        unregister_blob_adapter,
+    )
+except ImportError as e:  # pragma: no cover — surface a clean message
+    raise ImportError(
+        "Blob SDK symbols not present in `net._net`. Rebuild the wheel "
+        "with `--features dataforts`, e.g. `maturin develop --features dataforts`."
+    ) from e
 
 __all__ = [
     "AsyncMeshBlobAdapter",
