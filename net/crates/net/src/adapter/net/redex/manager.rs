@@ -49,9 +49,6 @@ struct ReplicationWiring {
     mesh: Arc<MeshNode>,
     router: Arc<RedexReplicationRouter>,
     metrics: Arc<ReplicationMetricsRegistry>,
-    /// The channels currently advertising this `Redex`'s origin (see
-    /// [`ChannelChainSink`]).
-    origin_holders: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
 }
 
 /// The chain-tag sink a channel's coordinator uses.
@@ -60,18 +57,17 @@ struct ReplicationWiring {
 /// (`causal:<principal>`), so one channel's `withdraw_chain` would remove
 /// the tag the others still need: closing channel A made an active
 /// channel B undiscoverable, and B's coordinator, unaware, never put it
-/// back. This sink records which channels hold the advertisement and
-/// only withdraws when the last one lets go. The lock is held across the
-/// mesh call so an announce can't slip between the holder check and a
-/// withdraw.
+/// back. This sink claims the tag on the mesh's holder registry
+/// ([`MeshNode::announce_chain_held`]), which withdraws only when the last
+/// claimant lets go. The registry is mesh-scoped because the tag is: two
+/// managers on one mesh, or two wiring generations across a disable /
+/// re-enable, would otherwise withdraw each other's claims.
 ///
-/// Holders are keyed per runtime (`holder`, unique per sink), not per
-/// channel name: a channel closed and reopened at once has two runtimes
-/// for a moment, and the old one's late withdraw must not erase the new
-/// one's claim.
+/// `holder` is unique per sink (per runtime), not per channel, so a
+/// channel closed and reopened at once can't lose its new claim to the
+/// old runtime's late withdraw.
 struct ChannelChainSink {
     mesh: Arc<MeshNode>,
-    holders: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
     holder: u64,
 }
 
@@ -85,19 +81,15 @@ impl super::ChainTagSink for ChannelChainSink {
         origin_hash: u64,
         tip_seq: u64,
     ) -> Result<(), crate::error::AdapterError> {
-        let mut holders = self.holders.lock().await;
-        holders.insert(self.holder);
-        self.mesh.announce_chain(origin_hash, tip_seq).await
+        self.mesh
+            .announce_chain_held(self.holder, origin_hash, tip_seq)
+            .await
     }
 
     async fn withdraw_chain(&self, origin_hash: u64) -> Result<(), crate::error::AdapterError> {
-        let mut holders = self.holders.lock().await;
-        holders.remove(&self.holder);
-        if !holders.is_empty() {
-            // Another channel on this node still advertises the origin.
-            return Ok(());
-        }
-        self.mesh.withdraw_chain(origin_hash).await
+        self.mesh
+            .withdraw_chain_held(self.holder, origin_hash)
+            .await
     }
 }
 
@@ -327,7 +319,6 @@ impl Redex {
             mesh,
             router,
             metrics,
-            origin_holders: Arc::default(),
         }));
     }
 
@@ -825,7 +816,6 @@ impl Redex {
             cfg,
             Arc::new(ChannelChainSink {
                 mesh: wiring.mesh.clone(),
-                holders: wiring.origin_holders.clone(),
                 holder: NEXT_CHAIN_HOLDER.fetch_add(1, Ordering::Relaxed),
             }) as Arc<dyn super::ChainTagSink>,
             wiring.metrics.as_ref(),
@@ -1355,6 +1345,42 @@ mod tests {
                 .await
                 .expect("MeshNode::new"),
         )
+    }
+
+    /// Two resolvers claiming one channel's candidate tag (a close and an
+    /// immediate reopen): the first one's release, graceful or by drop,
+    /// leaves the tag to the second; the last release removes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_tag_outlives_all_but_the_last_resolver() {
+        use super::super::replication_placement::{MeshReplicaPlacement, ReplicaSetResolver};
+        let mesh = build_mesh_for_test().await;
+        let name = cn("repl/holders");
+        let id = *ChannelId::from_name(&name).as_bytes();
+        let none = std::collections::BTreeMap::new();
+        let old = MeshReplicaPlacement::new(mesh.clone(), name.clone(), 1, false, &none);
+        old.ensure_candidate().await;
+        assert!(mesh.advertises_replica_candidate(&id));
+        // The reopened channel's resolver exists before its first tick.
+        let new = MeshReplicaPlacement::new(mesh.clone(), name.clone(), 1, false, &none);
+
+        old.withdraw_candidate().await;
+        assert!(
+            mesh.advertises_replica_candidate(&id),
+            "graceful release kept the tag"
+        );
+
+        let newer = MeshReplicaPlacement::new(mesh.clone(), name, 1, false, &none);
+        drop(new);
+        assert!(
+            mesh.advertises_replica_candidate(&id),
+            "a dropped resolver kept the tag"
+        );
+
+        drop(newer);
+        assert!(
+            !mesh.advertises_replica_candidate(&id),
+            "the last release removed it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

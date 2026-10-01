@@ -70,7 +70,7 @@ Nodes agree on the replica set without coordinating, by computing it from data e
 2. **Scoring.** The placement filter scores each candidate on announced data only: colocation (`colocate-with` prefers, `colocate-with-strict` requires), `intent`, and advertised storage. RTT and leadership load differ from node to node, so they don't choose replicas; the election still ranks the chosen ones by RTT.
 3. **Selection.** The top `factor` by score, ties to the lower `NodeId`.
 
-Each node re-checks every heartbeat: a newly selected node joins, a node no longer selected leaves. Capability announcements are rate-limited per node (10 s windows by default), so a set can take up to about two windows to form. A node that sees *fewer* than `factor` candidates waits two windows before joining that short set, so it doesn't become the leader of a set of one beside another such leader; a full set joins at once.
+Each node re-checks every heartbeat: a newly selected node joins, a node no longer selected leaves. Capability announcements are rate-limited per node (10 s windows by default), so a set can take up to about two windows to form. A node whose resolved set has *fewer* than `factor` eligible replicas (candidates that intent or colocation scoring excludes don't count) waits two windows before joining that short set, so it doesn't become the leader of a set of one beside another such leader; a full set joins at once.
 
 ### `placement_metadata: BTreeMap<String, String>`
 

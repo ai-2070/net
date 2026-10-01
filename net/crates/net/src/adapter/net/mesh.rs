@@ -13203,6 +13203,22 @@ pub struct MeshNode {
     /// baseline missing the other's tag. Held across the announce, so
     /// it is async; `announce_mu` alone is released before the edit.
     baseline_rmw: tokio::sync::Mutex<()>,
+    /// Who currently claims each `causal:<origin>` advertisement made
+    /// through [`Self::announce_chain_held`]: origin → holder ids (one
+    /// per replication runtime). Mesh-scoped because the tag is: two
+    /// `Redex` managers, or two wiring generations across a quick
+    /// disable / re-enable, share an origin, and a per-manager count let
+    /// one withdraw the other's live tag. Held across the mesh call so an
+    /// announce can't land between a withdraw's holder check and its
+    /// effect.
+    chain_holders:
+        tokio::sync::Mutex<std::collections::HashMap<u64, std::collections::HashSet<u64>>>,
+    /// Who currently claims each channel's replica-candidate tag: channel
+    /// id → holder ids (one per placement resolver). A channel closed and
+    /// reopened at once has two resolvers for a moment; the old one's
+    /// release must not remove the tag the new one still needs.
+    replica_candidate_holders:
+        parking_lot::Mutex<std::collections::HashMap<[u8; 32], std::collections::HashSet<u64>>>,
     /// Local-origin capability change signal (RT-2). The generation
     /// bumps whenever THIS node's announced surface changes — a
     /// `serve_tool` register/unregister or an nRPC service
@@ -13755,6 +13771,20 @@ fn ingest_announcement_with_owner_projection(
             owner,
         );
     }
+}
+
+/// Outcome of [`MeshNode::release_replica_candidate_sync`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateRelease {
+    /// Another resolver still claims the channel; the tag stays.
+    StillClaimed,
+    /// The tag was removed from the baseline; re-announce to publish it.
+    Removed,
+    /// The tag wasn't in the baseline (withdrawn already, or never sent).
+    NotAdvertised,
+    /// The announce lock couldn't be taken in time; the tag is still in
+    /// the baseline and needs an async withdraw.
+    LockUnavailable,
 }
 
 impl MeshNode {
@@ -15025,6 +15055,8 @@ impl MeshNode {
             relay_announcements: Arc::new(DashMap::new()),
             announce_mu: parking_lot::Mutex::new(()),
             baseline_rmw: tokio::sync::Mutex::new(()),
+            chain_holders: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            replica_candidate_holders: parking_lot::Mutex::new(std::collections::HashMap::new()),
             announce_gate: Arc::new(parking_lot::Mutex::new(AnnounceGate {
                 last_broadcast_at: None,
                 deferred_scheduled: false,
@@ -46000,23 +46032,135 @@ impl MeshNode {
         self.announce_capabilities(snapshot).await
     }
 
-    /// Remove the replica-candidate tag for `channel_id` from the
-    /// capability baseline without announcing; returns whether it was
-    /// there. For teardown paths that can't await (a replication runtime
-    /// aborted rather than shut down): the next announce, or a re-announce
-    /// the caller spawns, then carries the baseline without it.
-    pub(crate) fn forget_replica_candidate(&self, channel_id: &[u8; 32]) -> bool {
+    /// [`Self::announce_chain`] on behalf of `holder` (one replication
+    /// runtime), recording it as a claimant of `origin_hash`'s tag.
+    pub(crate) async fn announce_chain_held(
+        &self,
+        holder: u64,
+        origin_hash: u64,
+        tip_seq: u64,
+    ) -> Result<(), AdapterError> {
+        let mut holders = self.chain_holders.lock().await;
+        holders.entry(origin_hash).or_default().insert(holder);
+        self.announce_chain(origin_hash, tip_seq).await
+    }
+
+    /// Drop `holder`'s claim on `origin_hash`'s tag, and withdraw the tag
+    /// only if no other holder still claims it.
+    pub(crate) async fn withdraw_chain_held(
+        &self,
+        holder: u64,
+        origin_hash: u64,
+    ) -> Result<(), AdapterError> {
+        let mut holders = self.chain_holders.lock().await;
+        if let Some(set) = holders.get_mut(&origin_hash) {
+            set.remove(&holder);
+            if !set.is_empty() {
+                return Ok(());
+            }
+            holders.remove(&origin_hash);
+        }
+        self.withdraw_chain(origin_hash).await
+    }
+
+    /// Claim `channel_id`'s replica-candidate tag for `holder` (one
+    /// placement resolver) and make sure it's advertised. Cheap when it
+    /// already is.
+    pub(crate) async fn claim_replica_candidate(
+        &self,
+        holder: u64,
+        channel_id: &[u8; 32],
+    ) -> Result<(), AdapterError> {
+        self.replica_candidate_holders
+            .lock()
+            .entry(*channel_id)
+            .or_default()
+            .insert(holder);
+        if self.advertises_replica_candidate(channel_id) {
+            return Ok(());
+        }
+        self.announce_replica_candidate(channel_id).await
+    }
+
+    /// Drop `holder`'s claim, and withdraw the tag if it was the last one.
+    pub(crate) async fn release_replica_candidate(
+        &self,
+        holder: u64,
+        channel_id: &[u8; 32],
+    ) -> Result<(), AdapterError> {
+        if !self.release_candidate_holder(holder, channel_id) {
+            return Ok(());
+        }
+        self.withdraw_replica_candidate(channel_id).await
+    }
+
+    /// The synchronous [`Self::release_replica_candidate`], for a teardown
+    /// that can't await (a replication runtime aborted rather than shut
+    /// down). Edits the capability baseline without announcing; the caller
+    /// re-announces if it can.
+    pub(crate) fn release_replica_candidate_sync(
+        &self,
+        holder: u64,
+        channel_id: &[u8; 32],
+    ) -> CandidateRelease {
+        if !self.release_candidate_holder(holder, channel_id) {
+            return CandidateRelease::StillClaimed;
+        }
         let tag = Self::replica_candidate_tag(channel_id);
         let Some(_announce_guard) = self.lock_announce_mu() else {
-            return false;
+            return CandidateRelease::LockUnavailable;
         };
         let mut caps = self.user_caps.write();
         let Some(caps) = caps.as_mut() else {
-            return false;
+            return CandidateRelease::NotAdvertised;
         };
         let before = caps.tags.len();
         caps.tags.retain(|t| t.to_string() != tag);
-        caps.tags.len() != before
+        if caps.tags.len() != before {
+            CandidateRelease::Removed
+        } else {
+            CandidateRelease::NotAdvertised
+        }
+    }
+
+    /// Record `holder`'s claim on `channel_id`'s candidate tag without
+    /// announcing. A resolver registers at construction (inside
+    /// `open_file`), before its runtime's first tick announces: a channel
+    /// closed and reopened at once would otherwise let the old runtime's
+    /// release, landing in between, find no other claimant and withdraw
+    /// the tag.
+    pub(crate) fn register_replica_candidate_holder(&self, holder: u64, channel_id: &[u8; 32]) {
+        self.replica_candidate_holders
+            .lock()
+            .entry(*channel_id)
+            .or_default()
+            .insert(holder);
+    }
+
+    /// Whether no resolver currently claims `channel_id`'s candidate tag.
+    pub(crate) fn replica_candidate_unclaimed(&self, channel_id: &[u8; 32]) -> bool {
+        !self
+            .replica_candidate_holders
+            .lock()
+            .contains_key(channel_id)
+    }
+
+    /// Remove `holder` from `channel_id`'s claimants; `true` when no
+    /// claimant is left (the tag should go).
+    fn release_candidate_holder(&self, holder: u64, channel_id: &[u8; 32]) -> bool {
+        let mut map = self.replica_candidate_holders.lock();
+        match map.get_mut(channel_id) {
+            Some(set) => {
+                set.remove(&holder);
+                if set.is_empty() {
+                    map.remove(channel_id);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
     }
 
     /// Every node (this one included, once self-indexed) currently

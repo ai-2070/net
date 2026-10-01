@@ -159,7 +159,7 @@ from data every node sees the same way:
 
 Each node re-resolves every heartbeat. Selected while `Idle` → it
 joins as a replica; no longer selected → it leaves (`Idle`, chain
-tag withdrawn). A node that resolves *fewer* than `factor` replicas
+tag withdrawn). A node that resolves *fewer* than `factor` eligible replicas
 waits two announce windows before joining that short set: the other
 candidates may not have reached it yet, and joining at once would
 make it the leader of a set of one beside another such leader,

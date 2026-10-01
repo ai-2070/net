@@ -1222,3 +1222,91 @@ async fn an_aborted_runtime_drops_its_replica_candidacy() {
     )
     .await;
 }
+
+/// Two `Redex` managers on one node share the mesh, and with the default
+/// principal they share an origin too. A holder count scoped to one manager
+/// let a channel closing on one withdraw the tag the other's live channel
+/// still held; the count is on the mesh now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_manager_on_the_mesh_keeps_the_shared_origin_advertised() {
+    let node = build_node().await;
+    node.start();
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::Pinned(vec![node.node_id()])),
+    ));
+    let first = Redex::new();
+    first.enable_replication(node.clone());
+    let a = cn("repl/two-mgr-a");
+    first.open_file(&a, cfg.clone()).expect("open A");
+    let second = Redex::new();
+    second.enable_replication(node.clone());
+    let b = cn("repl/two-mgr-b");
+    second.open_file(&b, cfg).expect("open B");
+
+    let coord_a = first.replication_coordinator_for(&a).unwrap();
+    let coord_b = second.replication_coordinator_for(&b).unwrap();
+    let origin = coord_b.channel().origin_hash;
+    assert_eq!(
+        coord_a.channel().origin_hash,
+        origin,
+        "the managers share an origin"
+    );
+    wait_until(5, "the channels never settled as leaders", || {
+        coord_a.role() == ReplicaRole::Leader && coord_b.role() == ReplicaRole::Leader
+    })
+    .await;
+    drop(coord_a);
+    let self_id = node.node_id();
+    let advertised = || node.find_chain_holders(origin).contains(&self_id);
+    wait_until(5, "the shared origin was never advertised", advertised).await;
+
+    first.close_file(&a).expect("close A");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        advertised(),
+        "the first manager's close withdrew the second's tag"
+    );
+    second.close_file(&b).ok();
+}
+
+/// A channel closed and reopened at once briefly has two placement
+/// resolvers. The old one's release must not take the candidate tag away
+/// from the new one, even for a tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reopening_a_channel_never_drops_its_candidacy() {
+    let node = build_node().await;
+    node.start();
+    let redex = Redex::new();
+    redex.enable_replication(node.clone());
+    let name = cn("repl/reopen");
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_factor(1)
+            .with_heartbeat_ms(150),
+    ));
+    redex.open_file(&name, cfg.clone()).expect("open");
+    let cid = net::adapter::net::redex::ChannelId::from_name(&name);
+    let advertised = || node.advertises_replica_candidate(cid.as_bytes());
+    wait_until(5, "candidacy was never advertised", advertised).await;
+
+    redex.close_file(&name).expect("close");
+    redex.open_file(&name, cfg).expect("reopen");
+    wait_until(
+        5,
+        "the reopened channel never claimed candidacy",
+        advertised,
+    )
+    .await;
+    // The old runtime's graceful shutdown lands in this window.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    while tokio::time::Instant::now() < deadline {
+        assert!(
+            advertised(),
+            "the old runtime's release dropped the new claim"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    redex.close_file(&name).ok();
+}

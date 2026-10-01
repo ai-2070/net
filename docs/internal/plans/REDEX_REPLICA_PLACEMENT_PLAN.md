@@ -162,6 +162,21 @@ before its fix:
   when a runtime is available. **RED:**
   `an_aborted_runtime_drops_its_replica_candidacy` (e2e).
 
+**Follow-up (cubic on the fix):** the holder count was scoped too
+narrowly. Both registries now live on `MeshNode`, where the tags are:
+`chain_holders` (origin → runtimes, held across the mesh call) and
+`replica_candidate_holders` (channel → resolvers). A per-`Redex` count let
+two managers on one mesh, or two wiring generations across a disable /
+re-enable, withdraw each other's live tag. **RED:**
+`a_second_manager_on_the_mesh_keeps_the_shared_origin_advertised` (e2e).
+The candidate tag is now counted per resolver too, with each resolver
+registering its claim at construction (inside `open_file`), so a
+close-and-reopen's old release can't remove the new claim; **RED** by
+mutation (a release that ignores other claimants):
+`candidate_tag_outlives_all_but_the_last_resolver` (unit). The sync drop
+path reports an announce-lock timeout separately and falls back to an
+async withdraw instead of treating it as already withdrawn.
+
 **GREEN:** redex / gang / dataforts / placement / FFI / chain / heat units
 1500; the replication, dataforts-blob, chain-discovery and gravity e2e
 binaries 33/33 twice; SDK replication tests 6/6; Python `test_redex.py`

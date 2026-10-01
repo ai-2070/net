@@ -95,6 +95,12 @@ pub trait ReplicaSetResolver: Send + Sync {
 /// scored by [`StandardPlacement`] with the viewer-independent axes.
 pub struct MeshReplicaPlacement {
     mesh: Arc<MeshNode>,
+    /// This resolver's claim on the channel's candidate tag (see
+    /// `MeshNode::claim_replica_candidate`).
+    holder: u64,
+    /// Set once the graceful `withdraw_candidate` released the claim, so
+    /// `Drop` doesn't release it twice.
+    released: std::sync::atomic::AtomicBool,
     channel: ChannelName,
     channel_id: ChannelId,
     factor: usize,
@@ -119,9 +125,14 @@ impl MeshReplicaPlacement {
             metadata: placement_metadata.clone(),
             ..CapabilitySet::default()
         };
+        let holder = NEXT_CANDIDATE_HOLDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let channel_id = ChannelId::from_name(&channel);
+        mesh.register_replica_candidate_holder(holder, channel_id.as_bytes());
         Self {
             mesh,
-            channel_id: ChannelId::from_name(&channel),
+            holder,
+            released: std::sync::atomic::AtomicBool::new(false),
+            channel_id,
             channel,
             factor,
             strict,
@@ -166,19 +177,21 @@ impl ReplicaSetResolver for MeshReplicaPlacement {
     }
 
     async fn ensure_candidate(&self) {
-        let id = self.channel_id.as_bytes();
-        if self.mesh.advertises_replica_candidate(id) {
-            return;
-        }
-        if let Err(e) = self.mesh.announce_replica_candidate(id).await {
+        if let Err(e) = self
+            .mesh
+            .claim_replica_candidate(self.holder, self.channel_id.as_bytes())
+            .await
+        {
             tracing::warn!(error = ?e, "replication: announcing replica candidacy failed");
         }
     }
 
     async fn withdraw_candidate(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Err(e) = self
             .mesh
-            .withdraw_replica_candidate(self.channel_id.as_bytes())
+            .release_replica_candidate(self.holder, self.channel_id.as_bytes())
             .await
         {
             tracing::warn!(error = ?e, "replication: withdrawing replica candidacy failed");
@@ -195,22 +208,49 @@ impl ReplicaSetResolver for MeshReplicaPlacement {
 /// choosing this node as a replica) and, on a runtime, re-announces.
 impl Drop for MeshReplicaPlacement {
     fn drop(&mut self) {
-        if !self
-            .mesh
-            .forget_replica_candidate(self.channel_id.as_bytes())
-        {
-            return; // withdrawn already (the graceful path) or never announced
+        use crate::adapter::net::mesh::CandidateRelease;
+        if self.released.load(std::sync::atomic::Ordering::Acquire) {
+            return; // the graceful path released it
         }
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            let mesh = self.mesh.clone();
-            rt.spawn(async move {
-                if let Err(e) = mesh.reannounce_current_capabilities().await {
-                    tracing::warn!(error = ?e, "replication: re-announce after dropping candidacy failed");
-                }
-            });
+        let id = *self.channel_id.as_bytes();
+        let outcome = self.mesh.release_replica_candidate_sync(self.holder, &id);
+        let rt = tokio::runtime::Handle::try_current();
+        match (outcome, rt) {
+            (CandidateRelease::StillClaimed | CandidateRelease::NotAdvertised, _) => {}
+            // Out of the baseline; publish that.
+            (CandidateRelease::Removed, Ok(rt)) => {
+                let mesh = self.mesh.clone();
+                rt.spawn(async move {
+                    if let Err(e) = mesh.reannounce_current_capabilities().await {
+                        tracing::warn!(error = ?e, "replication: re-announce after dropping candidacy failed");
+                    }
+                });
+            }
+            // Still in the baseline: withdraw it properly, unless a new
+            // resolver claimed the channel meanwhile.
+            (CandidateRelease::LockUnavailable, Ok(rt)) => {
+                let mesh = self.mesh.clone();
+                rt.spawn(async move {
+                    if mesh.replica_candidate_unclaimed(&id) {
+                        if let Err(e) = mesh.withdraw_replica_candidate(&id).await {
+                            tracing::warn!(error = ?e, "replication: deferred candidacy withdraw failed");
+                        }
+                    }
+                });
+            }
+            (CandidateRelease::Removed, Err(_)) => {
+                // Removed from the baseline; peers learn at the next announce.
+            }
+            (CandidateRelease::LockUnavailable, Err(_)) => tracing::warn!(
+                "replication: couldn't drop replica candidacy (announce lock busy, no runtime); \
+                 it stays advertised until the channel is reopened or the node restarts"
+            ),
         }
     }
 }
+
+/// Source of [`MeshReplicaPlacement`] holder ids.
+static NEXT_CANDIDATE_HOLDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {
