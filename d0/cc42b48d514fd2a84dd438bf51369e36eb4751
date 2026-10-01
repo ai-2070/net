@@ -1,0 +1,40 @@
+docs/internal/plans/PYTHON_SDK_WRAPPER_PARITY_PLAN.md
+  s_f9febccc288dd3::t_5742993041f45e 387-414,662-664
+net/crates/net/sdk-py/README.md
+  s_f9febccc288dd3::t_97868a947031ea 56,122-124
+net/crates/net/sdk-py/tests/test_feature_gate_imports.py
+  s_f9febccc288dd3::t_05a23c922866d0 1-59
+net/crates/net/bindings/python/tests/test_sdk_mesh_surface.py
+  s_f9febccc288dd3::t_97868a947031ea 41-43,45
+net/crates/net/sdk-py/src/net_sdk/blob.py
+  s_f9febccc288dd3::t_adced673af63b7 22-42,46-49,64
+  s_f9febccc288dd3::t_2eb7cf354138ba 50-63
+web/src/content/docs/sdk/announce/python.md
+  s_f9febccc288dd3::t_97868a947031ea 12,22-25
+net/crates/net/sdk-py/src/net_sdk/transport.py
+  s_f9febccc288dd3::t_adced673af63b7 31-48,52-55,67
+  s_f9febccc288dd3::t_2eb7cf354138ba 56-66
+net/crates/net/bindings/python/src/lib.rs
+  s_f9febccc288dd3::t_6f1a21c3e05c1e 2215,3824
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_f9febccc288dd3::t_97868a947031ea 1362-1365,1369-1370,1384-1385
+net/crates/net/sdk-py/src/net_sdk/mesh.py
+  s_f9febccc288dd3::t_97868a947031ea 186-189,990
+  s_f9febccc288dd3::t_7e18518f5d9be0 702-703
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d0cc42b48d514fd2a84dd438bf51369e36eb4751",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
