@@ -369,7 +369,10 @@ jobs:
           shared-key: sdk-ts
           workspaces: net/crates/net -> target
 
-      # Feature list is ci.yml's, and `redis` is load-bearing rather than
+      # Feature list is ci.yml's sdk-ts-tests list, kept identical: the SDK
+      # re-exports consent / delegation / enrollment / gateway symbols too
+      # (NODE_SDK_GAPS_PLAN.md S3), so those features are load-bearing in the
+      # same way. And `redis` is load-bearing rather than
       # incidental: `sdk-ts/src/redis-dedup.ts` does a real
       # `export { RedisStreamDedup } from '@net-mesh/core'`, and the generated
       # `index.d.ts` only declares it when the binding was built with that
@@ -379,7 +382,7 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: |
           npm i --ignore-scripts
-          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,org,test-helpers,dataforts
+          npx napi build --platform --no-default-features --features redis,net,nat-traversal,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,delegation,a2a,org,test-helpers,dataforts
 
       - name: Install npm dependencies
         run: npm i

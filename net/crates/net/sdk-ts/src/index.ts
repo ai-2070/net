@@ -318,6 +318,40 @@ export type {
   PeerSnapshot,
 } from './meshos';
 
+// Trust surfaces (NODE_SDK_GAPS_PLAN.md S3): consent and pins, delegated
+// agent identity, device enrollment. Thin re-exports of @net-mesh/core,
+// mirroring Python's net_sdk.consent / .delegation / .enrollment. They take
+// the NATIVE Identity: pass an SDK Identity as `identity.toNapi()`.
+export {
+  CapabilityGateway,
+  CapabilityId,
+  ConsentPolicy,
+  PinStore,
+  credentialRequiresConsent,
+} from './consent';
+export type { PinRecord } from './consent';
+export {
+  DELEGATION_ERROR_PREFIX,
+  DelegationChain,
+  GATEWAY_DELEGATION_CHANNEL,
+  RevocationRegistry,
+  defaultRevocationStorePath,
+  deriveChildIdentity,
+  isDelegationError,
+} from './delegation';
+export {
+  DeviceEnrollment,
+  DeviceRecord,
+  ENROLLMENT_ERROR_PREFIX,
+  EnrollmentServeHandle,
+  InviteToken,
+  JoinOutcome,
+  JoinRequest,
+  OperatorEnrollment,
+  fingerprint,
+  isEnrollmentError,
+} from './enrollment';
+
 // Deck (the operator surface over MeshOS). Also published at the
 // `@net-mesh/sdk/deck` subpath, which the module's own docs import from.
 export {

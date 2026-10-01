@@ -3,8 +3,8 @@
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/node-sdk`
-(the plan was written on `LZL0/python-sdk`, merged as #1133). S1 and S2 done
-2026-10-01 (see each slice); S3–S7 not started.
+(the plan was written on `LZL0/python-sdk`, merged as #1133). S1, S2 and S3 done
+2026-10-01 (see each slice); S4–S7 not started.
 
 **Checked before starting, 2026-10-01:** the two bug classes the Python work
 found don't apply here. The Node `poll` already sweeps every shard through
@@ -333,6 +333,60 @@ check the floor.
     rejected after its root is revoked in `RevocationRegistry`.
   - A loopback enrollment `invite → join → approve` between two `MeshNode`s.
     This mirrors the Python acceptance test; reuse its fixture shape.
+
+- **Done 2026-10-01.**
+  - New `src/consent.ts`, `src/delegation.ts` and `src/enrollment.ts`, thin
+    re-exports of `@net-mesh/core` mirroring Python's modules. Everything is
+    re-exported from the root, with no name collisions. Delegation also
+    exports `GATEWAY_DELEGATION_CHANNEL` (Python has it; the first draft
+    missed it).
+  - **Decision: the identity boundary stays native.** Seven entry points
+    take the native `Identity` (`deriveChildIdentity`,
+    `DelegationChain.deriveGateway` / `extendToSubagent`,
+    `JoinRequest.create`, the `OperatorEnrollment` constructor and
+    `withDefaultPaths`, `DeviceEnrollment`). Accepting the SDK `Identity`
+    would mean wrapper classes over napi classes whose factories return
+    native instances, which breaks `instanceof`, for little gain. The
+    modules document passing `identity.toNapi()` and converting back with
+    `Identity.fromNapi()`, the same convention `compute.ts` uses.
+  - **Errors:** instead of typed classes, `isDelegationError` /
+    `isEnrollmentError` predicates check the native `delegation: ` /
+    `enrollment: ` prefixes. **Correction found by the test:** a malformed
+    *chain* (`DelegationChain.fromBytes`) throws with the token taxonomy
+    (`token: invalid_format`), not `delegation: `. The first draft's doc
+    said every failure was `delegation: `; the docs now name both
+    families, and the test pins both.
+  - **CI change:** `sdk-ts-tests` (`ci.yml`) and the TS skill-example job
+    (`skills.yml`, whose feature list must equal `ci.yml`'s) built
+    `@net-mesh/core` without `consent` / `delegation` / `payments`, so these
+    natives would have been `undefined`. Worse, the generated `index.d.ts`
+    lacked their types, so the SDK's own `tsc` build would fail in the
+    skills job. Both now build the binding-test job's feature set plus
+    `redis` + `dataforts`; this also covers S5's NAT / A2A / enrollment
+    methods. **Cost:** a longer native compile in those two jobs.
+    `release-npm-sdk.yml` needed no change: its build passes `--features`
+    without `--no-default-features`, so the defaults (all of these) are on.
+  - **Test:** `test/trust_surfaces.test.ts` (26 tests), importing only from
+    `../src/index`, and failing rather than skipping when a native is
+    absent. It covers:
+    - root presence for every name;
+    - a `PinStore` request → approve → read back;
+    - a `ConsentPolicy` gate;
+    - a derived gateway chain that verifies, then fails once its machine
+      is revoked;
+    - both error families;
+    - invite → `JoinRequest` → approve, rooted at the operator, with the
+      device recorded;
+    - a malformed invite classified as an enrollment error.
+
+    **RED** with the committed `index.ts`: 26/26 fail.
+  - **GREEN:** full suite **614 passed** (37 files). The package smoke
+    test, `check-ts-consumer.sh`, and the skill examples' type-check (9/9)
+    pass. The skill examples' *execution* half doesn't run on this Windows
+    box (a `FileNotFoundError` launching the runner); CI runs it on Linux.
+  - **Deferred to S5:** the over-the-mesh enrollment round trip
+    (`rendezvousString` / `join` / `renew`), because those are `MeshNode`
+    methods S5 wraps.
 
 ### S4 — N4, the blob types
 
