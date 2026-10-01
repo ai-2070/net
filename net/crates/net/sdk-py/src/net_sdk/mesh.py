@@ -110,11 +110,40 @@ class MeshNode:
         subnet_attachment: Optional[list] = None,
         subnet_control_channel: Optional[str] = None,
         subnet_exports: Optional[list] = None,
+        capability_gc_interval_ms: Optional[int] = None,
+        require_signed_capabilities: Optional[bool] = None,
+        reflex_override: Optional[str] = None,
+        try_port_mapping: Optional[bool] = None,
+        auto_direct_upgrade: Optional[bool] = None,
+        permissive_channels: Optional[bool] = None,
     ) -> None:
-        # SSDK P4: forward the topology kwargs this wrapper used to drop
-        # (`identity_seed`, `subnet`, `subnet_policy`) AND the new subnet
-        # AUTHORITY kwargs. All are validated by the native constructor —
-        # this layer only threads them through.
+        """Construct a mesh node. Every keyword is forwarded unchanged to
+        the native ``NetMesh`` constructor, which validates it.
+
+        - ``require_signed_capabilities``: reject capability
+          announcements that aren't signed.
+        - ``capability_gc_interval_ms``: capability-index GC cadence.
+        - ``reflex_override``: pin this node's public reflex to an
+          external ``"ip:port"`` (``nat-traversal`` builds; ignored
+          otherwise).
+        - ``try_port_mapping``: opportunistic UPnP / NAT-PMP / PCP at
+          startup (``port-mapping`` builds; ignored otherwise).
+        - ``auto_direct_upgrade``: migrate relay-routed sessions to a
+          direct path when one appears. Native default ``True``; pass
+          ``False`` to pin traffic to the relay.
+        - ``permissive_channels``: skip the strict channel registry, so
+          unregistered channels may be subscribed. Test-only; keep the
+          strict default in production.
+
+        ``tests/test_sdk_mesh_ctor_parity.py`` (in the binding's test
+        suite) fails if this signature drifts from the native one.
+        """
+        # SSDK P4 forwarded the topology kwargs this wrapper used to drop
+        # (`identity_seed`, `subnet`, `subnet_policy`) and the subnet
+        # AUTHORITY kwargs; the six options after `subnet_exports` were
+        # dropped the same way until `PYTHON_SDK_WRAPPER_PARITY_PLAN.md`
+        # S1a. All are validated by the native constructor — this layer
+        # only threads them through.
         self._native = _NetMesh(
             bind_addr,
             psk,
@@ -122,6 +151,12 @@ class MeshNode:
             session_timeout_ms=session_timeout_ms,
             num_shards=num_shards,
             identity_seed=identity_seed,
+            capability_gc_interval_ms=capability_gc_interval_ms,
+            require_signed_capabilities=require_signed_capabilities,
+            reflex_override=reflex_override,
+            try_port_mapping=try_port_mapping,
+            auto_direct_upgrade=auto_direct_upgrade,
+            permissive_channels=permissive_channels,
             subnet=subnet,
             subnet_policy=subnet_policy,
             subnet_authorities=subnet_authorities,

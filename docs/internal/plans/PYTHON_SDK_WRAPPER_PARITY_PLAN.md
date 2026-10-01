@@ -5,12 +5,15 @@ The Rust SDK gaps found along the way have their own plan:
 
 ## Status
 
-Planned, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-No slice has landed yet.
+In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
+S0 and S1a done 2026-10-01 (see each slice). S1–S8 not started.
 
 Amended 2026-10-01, same day:
 - The two open checks from the first draft were verified (see S0 and S5).
 - `NetMesh.num_shards` turned out to be a pure forward (Decision 3).
+  *Superseded during S0:* `NetMesh.num_shards` already exists natively
+  (`bindings/python/src/lib.rs` ~line 2165); only the stub was missing it. The
+  plan now adds **no** native method. See the S0 defects list.
 - A Rust SDK gap survey was added as Part B. Its one real gap (R1) feeds the
   Python receive-side design.
 - Part B then moved to its own file,
@@ -48,7 +51,7 @@ the `#[pyclass]`/`fn` lists of `compute.rs` and `groups.rs`.
 | Wheel `NetMesh` | ✅ `register_channel` (visibility, reliable, `require_token`, `token_roots`, priority, `max_rate_pps`, `publish_caps`, `subscribe_caps`), `subscribe_channel(publisher, channel, token=)`, `unsubscribe_channel`, `publish(channel, payload, reliability=, on_failure=, max_inflight=) -> dict`, `poll_shard`. `AsyncNetMesh` has async `subscribe_channel` / `unsubscribe_channel` / `publish`. Tests: `bindings/python/tests/test_channels.py`, `test_channel_auth.py`. |
 | Wheel exceptions | ✅ `ChannelError`, `ChannelAuthError(ChannelError)` re-exported from `net`. |
 | `net_sdk.MeshNode` | ❌ None of the five methods. `ChannelError` / `ChannelAuthError` are not exported from `net_sdk` (TS exports both from `@net-mesh/sdk`). |
-| Receive side | ❌ TS has `recv` / `recvShard` / `onStreamData`. The wheel has `poll_shard(shard_id, limit)` and `open_stream_inbox` (per-stream, with the authenticated sender). `NetMesh` has **no `num_shards` getter** (`_net.pyi` has one only on `Net`, line 239), so a wrapper can't tell how many shards to drain unless it remembers the constructor argument. Core already has `MeshNode::num_shards()`, and the Rust SDK forwards it (`sdk/src/mesh.rs:915`). Only the PyO3 forward is missing. |
+| Receive side | ❌ TS has `recv` / `recvShard` / `onStreamData`. The wheel has `poll_shard(shard_id, limit)` and `open_stream_inbox` (per-stream, with the authenticated sender). ~~`NetMesh` has no `num_shards` getter.~~ **Wrong, corrected in S0:** that came from reading the stub. The runtime `NetMesh` has `num_shards()` and `shard_for_stream()`; the stub omitted both. Only `net_sdk.MeshNode` lacks them. |
 
 `net_sdk.TypedChannel` exists, but it is bound to the local `NetNode` bus
 (`node.channel(...)`), not to mesh channels. The two "channel" concepts share a
@@ -125,8 +128,8 @@ the SDK already passes them. Type checkers reject a correct call. S0 fixes it.
 ### Principle: forward, don't reimplement
 
 Every new `net_sdk` member forwards to an existing native method. This plan adds
-**one** native method (`NetMesh.num_shards`, slice S1) and otherwise touches the
-binding only to fix `_net.pyi`. Validation, error mapping and wire encoding stay
+**no** native method (the first draft's `NetMesh.num_shards` already existed; see
+S0). It touches the binding only to fix `_net.pyi`. Validation, error mapping and wire encoding stay
 in Rust. The wrapper adds three things: typed signatures, `TypedDict`s for the
 dict-shaped inputs and outputs, and acceptance of `net_sdk` types where the
 wheel wants native ones. This is the pattern `meshos.py` and `deck.py` already
@@ -158,11 +161,10 @@ Callers who already hold a raw `NetMesh` keep working.
 The publish path returns a `PublishReport` dict. For receiving, add:
 
 - `MeshNode.poll_shard(shard_id, limit)`, forwarded as-is.
-- `MeshNode.num_shards`. Needs a native getter. This is a one-line forward to
-  core `MeshNode::num_shards()`, the same thing `net_sdk::Mesh::num_shards`
-  does in Rust, so there's no new behaviour to review. (The first draft offered
-  a cached-kwarg fallback. That fallback is dropped, because it would have to
-  guess the default the native constructor applies.)
+- `MeshNode.num_shards` / `shard_for_stream`, forwarded to the existing
+  native methods. (Earlier drafts planned a new native getter, then a
+  cached-kwarg fallback. Neither is needed: S0 found the native methods
+  already exist, only unstubbed.)
 - `MeshNode.recv(limit=..., timeout=None) -> list[StoredEvent]`, which drains
   every shard round-robin, matching TS `recv`.
 - `MeshNode.open_stream_inbox(stream_id, capacity)`, forwarded. It's the only
@@ -263,6 +265,40 @@ the slice were wrong. Two test homes, with different jobs:
   `capability_aggregate`) and pass after the stub fill. Record the RED run in
   this plan when the slice lands. These tests skip when no wheel is built, so
   the RED/GREEN run needs `maturin develop` with the default features.
+- **Done 2026-10-01.**
+  - **Wheel:** built with `maturin develop` and CI's exact `python-tests`
+    feature list (`net,cortex,compute,groups,meshdb,meshos,deck,aggregator,
+    tool,consent,mcp,delegation,publish,a2a,payments,payments-http,org,
+    dataforts,extension-module`), into a scratch venv (CPython 3.10). The
+    globally installed `net-mesh` is 0.36 and was not used.
+  - **RED**, with the HEAD `_net.pyi` and the new tests: every daemon and
+    group class failed `stub declares no methods for …` (`CausalEvent`,
+    `DaemonRuntime`, `DaemonHandle`, `MigrationHandle`, `ReplicaGroup`,
+    `ForkGroup`, `StandbyGroup`), and the reverse test failed for `NetMesh`
+    and all those classes.
+  - **GREEN:** `pytest tests/test_stub_drift.py
+    tests/test_sdk_mesh_ctor_parity.py tests/test_pyi_stub_coverage.py` gives
+    219 passed, 1 skipped. The skip is `RedisStreamDedup`, which needs the
+    `redis` feature this wheel doesn't build.
+  - **Defects found on the way, all fixed in this slice:**
+    - **14 runtime `NetMesh` methods had no stub:** `num_shards`,
+      `shard_for_stream`, the gang-claim scheduler (`publish_island_topology`,
+      `match_islands`, `reserve_island`, `release_island`, `claim_island`),
+      placement filters (`register_` / `unregister_` / `has_placement_filter`),
+      `list_tools` / `watch_tools`, and `set_a2a_org_caller` /
+      `a2a_org_caller`. Plus the two aggregation methods G4 already named.
+      This **invalidated the plan's G1 claim** that `NetMesh` lacks
+      `num_shards`; see the Status amendment.
+    - **`CausalEvent` had no `__init__` in the stub**, though Python code
+      constructs it (`CausalEvent(origin_hash, sequence, payload)`) to call
+      `deliver`.
+    - **The stub declared three `nat-traversal`-only methods**
+      (`traversal_stats`, `connect_direct`, `connect_direct_auto`), absent
+      from CI's wheel. They stay declared, and the test excuses them by an
+      explicit `FEATURE_GATED` map of `(class, method) -> feature`, never just
+      for being absent.
+  - **Not done:** an exhaustive check of every class in the stub. The
+    sampled set is the forwarded-to classes plus the original three.
 
 ### S1a — Forward every constructor option, with a drift guard (G6)
 
@@ -304,6 +340,34 @@ the slice were wrong. Two test homes, with different jobs:
   - Assertion 2 fails on today's stub, naming the four `subnet_*` kwargs.
   - Assertion 3 fails if a future option is declared but not forwarded.
   - Record both RED runs here when the slice lands.
+- **Done 2026-10-01.**
+  - `net_sdk.MeshNode.__init__` declares and forwards all six options, and
+    documents each one. The stub's `NetMesh.__init__` gained the four
+    `subnet_*` arguments (S0).
+  - **Signature source:** `inspect.signature(net._net.NetMesh)` returned the
+    full native list, so the `lib.rs` fallback parser wasn't needed in this
+    run. It is kept, and is checked only by reading it.
+  - **CI import path:** CI's main pytest run happens before the
+    `pip install -e ../../sdk-py` step (`ci.yml` ~lines 4190 and 4351), so the
+    test imports `net_sdk` from the in-repo `sdk-py/src` when it isn't
+    installed. The existing pattern (`test_meshos.py`) `pytest.skip`s instead,
+    which means those wrapper tests skip in CI's main run. This test
+    deliberately doesn't.
+  - **RED**, with the HEAD `sdk-py/.../mesh.py` and HEAD stub:
+    - Assertion 1 failed, naming the six options: `net_sdk.MeshNode.__init__
+      drops native options ['auto_direct_upgrade',
+      'capability_gc_interval_ms', 'permissive_channels', 'reflex_override',
+      'require_signed_capabilities', 'try_port_mapping']`.
+    - Assertion 2 failed: `_net.pyi NetMesh.__init__ is missing
+      ['subnet_attachment', 'subnet_authorities', 'subnet_control_channel',
+      'subnet_exports']`.
+    - The live real-values test failed too (unknown keyword).
+    - Assertion 3 passed on HEAD, as it should: it checks that every
+      *declared* option is forwarded, and the declared ones were.
+  - **GREEN:** all 5 tests in `test_sdk_mesh_ctor_parity.py` pass.
+  - **`sdk-py` suite:** `pytest tests` gives 345 passed. One file,
+    `test_packaging_metadata.py`, was excluded locally because it needs
+    Python 3.11's `tomllib`; CI's Python has it.
 
 ### S1 — Mesh channels on `MeshNode`
 
@@ -317,8 +381,8 @@ the slice were wrong. Two test homes, with different jobs:
   Do the same for `reliability` and `on_failure`, read from their parsers
   rather than from TS.
 - Re-export `ChannelError` and `ChannelAuthError` from `net_sdk`.
-- Native: add a `NetMesh.num_shards` getter (plus stub entry), forwarding to
-  `MeshNode::num_shards()`.
+- ~~Native: add a `NetMesh.num_shards` getter.~~ Not needed; it exists
+  (S0). `MeshNode.num_shards` / `shard_for_stream` forward to it.
 - **Proves it:**
   - `sdk-py/tests/test_mesh_channels_wrapper.py` (forwarding, every kwarg
     reaches the native call).
@@ -433,9 +497,8 @@ type signatures only.
 - **The conftest stub can't catch signature drift.** The forwarding tests run
   against an auto-stub that accepts any call. *Fallback:* every slice also has a
   live `bindings/python/tests/test_sdk_*.py` witness, which is the real gate.
-- **The `num_shards` getter is a native change.** It's a new public pyclass
-  method, but a pure forward to an existing core accessor. *Fallback:* none
-  needed. If review objects, `recv` can take an explicit `shards=` argument.
+- ~~**The `num_shards` getter is a native change.**~~ Retired: the native
+  method already exists (S0).
 - **The stub tests only cover what they sample.** S0 widens
   `SAMPLED_CLASSES`, but classes added later are still unchecked unless someone
   adds them. *Mitigation:* the reverse-direction test's docstring says to add
@@ -458,7 +521,7 @@ type signatures only.
 
 ## Not in scope
 
-- Any new **native** capability apart from `NetMesh.num_shards`. If a slice
+- Any new **native** capability. If a slice
   finds a wheel bug, it is recorded here and fixed in its own change.
 - Renaming or deprecating `net_sdk.TypedChannel`.
 - Python ports of TS `store-transport` / `store-persist`. Those serve the

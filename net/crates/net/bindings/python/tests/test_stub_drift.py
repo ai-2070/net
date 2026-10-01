@@ -81,9 +81,34 @@ def test_stub_class_exists_at_runtime(class_name: str) -> None:
 
 
 # Sampled subset — one representative class per major feature
-# region (MeshOS / MeshDB / Deck). The runtime surface for these
-# is most likely to drift relative to the Rust source.
-SAMPLED_CLASSES = ["MeshOsDaemonSdk", "DeckClient", "MeshQueryRunner"]
+# region (MeshOS / MeshDB / Deck), plus every class a `net_sdk`
+# wrapper forwards to (`PYTHON_SDK_WRAPPER_PARITY_PLAN.md` S0). Add a
+# class here when an sdk-py wrapper starts forwarding to it: the two
+# tests below then hold its stub to the runtime in BOTH directions.
+SAMPLED_CLASSES = [
+    "MeshOsDaemonSdk",
+    "DeckClient",
+    "MeshQueryRunner",
+    "NetMesh",
+    "CausalEvent",
+    "DaemonRuntime",
+    "DaemonHandle",
+    "MigrationHandle",
+    "ReplicaGroup",
+    "ForkGroup",
+    "StandbyGroup",
+]
+
+
+# Methods the stub declares that exist only under a Cargo feature the
+# wheel may be built without. Each is named with its feature, so a
+# missing method is excused only when it is KNOWN to be gated — never
+# because it is merely absent. `(class, method) -> feature`.
+FEATURE_GATED: dict[tuple[str, str], str] = {
+    ("NetMesh", "traversal_stats"): "nat-traversal",
+    ("NetMesh", "connect_direct"): "nat-traversal",
+    ("NetMesh", "connect_direct_auto"): "nat-traversal",
+}
 
 
 @pytest.mark.parametrize("class_name", SAMPLED_CLASSES)
@@ -102,12 +127,56 @@ def test_sampled_class_methods_present(class_name: str) -> None:
     assert declared, f"stub declares no methods for {class_name}"
     missing: list[str] = []
     for name in declared:
-        if not hasattr(runtime_cls, name):
+        if not hasattr(runtime_cls, name) and (class_name, name) not in FEATURE_GATED:
             missing.append(name)
     assert not missing, (
         f"{class_name}: stub declares {missing} but runtime "
         f"class has no such attribute(s)"
     )
+
+
+@pytest.mark.parametrize("class_name", SAMPLED_CLASSES)
+def test_sampled_class_runtime_methods_are_stubbed(class_name: str) -> None:
+    """The reverse of :func:`test_sampled_class_methods_present`: every
+    public attribute the runtime class exposes must be declared in the
+    stub. A method the wheel has but the stub omits is invisible to
+    type checkers, and nothing else in the suite looks for one — that
+    is how ``NetMesh.capability_aggregate`` went missing unnoticed.
+
+    "Public" = no leading underscore, defined on the class itself (not
+    inherited from ``object``)."""
+    runtime_cls = getattr(_net, class_name, None)
+    if runtime_cls is None:
+        pytest.skip(f"{class_name} not present at runtime")
+    declared = set(_collect_stub_methods(class_name)) | set(
+        _collect_stub_attributes(class_name)
+    )
+    public = sorted(
+        name
+        for name in vars(runtime_cls)
+        if not name.startswith("_")
+    )
+    unstubbed = [name for name in public if name not in declared]
+    assert not unstubbed, (
+        f"{class_name}: runtime exposes {unstubbed} but the stub does "
+        f"not declare them; add them to net/_net.pyi"
+    )
+
+
+def _collect_stub_attributes(class_name: str) -> list[str]:
+    """Annotated attributes (``name: type``) declared in
+    ``class_name``'s stub body — the stub form of a PyO3 ``#[pyo3(get)]``
+    field."""
+    tree = ast.parse(PYI_PATH.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return [
+                child.target.id
+                for child in node.body
+                if isinstance(child, ast.AnnAssign)
+                and isinstance(child.target, ast.Name)
+            ]
+    return []
 
 
 def test_at_least_one_class_collected() -> None:

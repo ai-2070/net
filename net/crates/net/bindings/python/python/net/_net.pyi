@@ -841,6 +841,10 @@ class NetMesh:
         try_port_mapping: Optional[bool] = None,
         auto_direct_upgrade: Optional[bool] = None,
         permissive_channels: Optional[bool] = None,
+        subnet_authorities: Optional[list] = None,
+        subnet_attachment: Optional[list] = None,
+        subnet_control_channel: Optional[str] = None,
+        subnet_exports: Optional[list] = None,
     ) -> None:
         """Construct a new mesh node.
 
@@ -1223,6 +1227,125 @@ class NetMesh:
         semantics of :meth:`find_nodes_scoped`. Scope narrows the
         candidate set before scoring, so a peer outside the scope
         cannot win on capacity."""
+        ...
+    def capability_aggregate(
+        self,
+        matcher_json: Optional[str],
+        group_by_json: str,
+        aggregation_json: str,
+    ) -> List[Dict[str, Any]]:
+        """Bucketed aggregation over the local capability fold
+        (``Fold::aggregate``). Arguments are JSON-encoded tagged unions;
+        ``net_sdk.capability_aggregation`` builds them. ``matcher_json =
+        None`` walks every entry. Returns rows sorted by bucket key."""
+        ...
+    def capability_capacity_ranking(
+        self,
+        query_json: str,
+        rtt_map: Optional[Dict[int, int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Per-bucket capacity ranking over the local capability fold
+        (``Fold::capacity_ranking``), sorted by available capacity.
+        ``query_json`` is a JSON-encoded ``CapacityQuery``; ``rtt_map``
+        optionally maps node id to RTT for the query's RTT filter."""
+        ...
+
+    # -- Shard routing ----------------------------------------------
+    def num_shards(self) -> int:
+        """Number of shards inbound stream traffic is spread across.
+        Inbound events land on ``stream_id % num_shards``."""
+        ...
+    def shard_for_stream(self, stream_id: int) -> int:
+        """The inbound shard a given stream's events land on; pair with
+        :meth:`poll_shard` to read one stream."""
+        ...
+
+    # -- Gang-claim scheduler ---------------------------------------
+    def publish_island_topology(
+        self, id: int, units: List[int], capabilities: List[str], load: float
+    ) -> int:
+        """Publish this node's island-topology record (host forced to
+        this node), self-indexed then broadcast. Returns the peer
+        count. ``capabilities`` are resident tags (e.g. ``"model:<hex>"``)."""
+        ...
+    def match_islands(
+        self,
+        tags_all: List[str],
+        tags_any: List[str] = ...,
+        tag_groups_all: List[List[str]] = ...,
+        region: Optional[str] = None,
+        min_units: Optional[int] = None,
+        max_load: Optional[float] = None,
+        max_p50_latency_us: Optional[int] = None,
+        require_all: List[str] = ...,
+        require_any: List[str] = ...,
+        selection: Optional[str] = None,
+        load_band_target: Optional[float] = None,
+        prefer_capability: Optional[str] = None,
+    ) -> List[int]:
+        """Match islands against the criteria over this node's folds
+        (read-only; no claim). Best island first."""
+        ...
+    def reserve_island(self, island: int, until_unix_us: int) -> str:
+        """Reserve ``island`` until ``until_unix_us`` (wall-clock
+        micros). Returns ``"won"`` / ``"lost"``."""
+        ...
+    def release_island(self, island: int) -> str:
+        """Release ``island``. Returns ``"won"`` / ``"lost"``
+        (``"lost"`` if this node wasn't the holder)."""
+        ...
+    def claim_island(
+        self,
+        tags_all: List[str],
+        until_unix_us: int,
+        tags_any: List[str] = ...,
+        tag_groups_all: List[List[str]] = ...,
+        region: Optional[str] = None,
+        min_units: Optional[int] = None,
+        max_load: Optional[float] = None,
+        max_p50_latency_us: Optional[int] = None,
+        require_all: List[str] = ...,
+        require_any: List[str] = ...,
+        selection: Optional[str] = None,
+        load_band_target: Optional[float] = None,
+        prefer_capability: Optional[str] = None,
+    ) -> Optional[int]:
+        """Match + reserve the first available island in one call.
+        Returns its id, or ``None`` when nothing matched / all
+        contended."""
+        ...
+
+    # -- Placement filters ------------------------------------------
+    def register_placement_filter(
+        self, id: str, predicate: Callable[..., Any]
+    ) -> bool:
+        """Register a placement-filter predicate under ``id``. ``False``
+        if ``id`` is already registered; see
+        ``net_sdk.placement_filter_from_fn``."""
+        ...
+    def unregister_placement_filter(self, id: str) -> bool:
+        """Drop the registration under ``id``; ``True`` if it existed."""
+        ...
+    def has_placement_filter(self, id: str) -> bool: ...
+
+    # -- Tools (requires the `tool` build) --------------------------
+    def list_tools(self) -> str:
+        """JSON-encoded list of tool descriptors; ``net.tool.list_tools``
+        parses it."""
+        ...
+    def watch_tools(self, interval_ms: Optional[int] = None) -> AsyncToolWatchIter:
+        """Event-driven watch over the local tool view; yields one
+        JSON-encoded ``ToolListChange`` per change. ``interval_ms`` is a
+        debounce ceiling, not a poll cadence."""
+        ...
+
+    # -- A2A organization identity ----------------------------------
+    def set_a2a_org_caller(self, org_client: Optional[OrgClient] = None) -> None:
+        """Install (or clear with ``None``) the organization identity
+        A2A calls act under. Install ``None`` before ``shutdown()``."""
+        ...
+    def a2a_org_caller(self) -> Optional[Tuple[bytes, bytes]]:
+        """The installed ``(acting_org, caller)`` ids, or ``None``."""
         ...
 
     # -- NAT traversal (requires the `nat-traversal` build) ---------
@@ -2529,7 +2652,7 @@ class DaemonError(Exception):
 
 class MigrationError(Exception):
     """Live-migration error. Carries a ``<<daemon: migration: KIND>>``
-    envelope; see ``net_sdk.compute.migration_error_kind``."""
+    envelope; see ``net.migration_error_kind``."""
 
 class CausalEvent:
     """A causal event delivered to a daemon's ``process`` method."""
@@ -2538,15 +2661,116 @@ class CausalEvent:
     sequence: int
     payload: bytes
 
+    def __init__(self, origin_hash: int, sequence: int, payload: bytes) -> None: ...
+
 class DaemonRuntime:
     """Substrate-owned daemon supervisor. ``spawn`` / ``spawn_from_snapshot``
     / ``snapshot`` / ``shutdown``."""
 
+    def __init__(self, mesh: NetMesh) -> None:
+        """Build a compute runtime against an existing ``NetMesh``."""
+        ...
+    def start(self) -> None:
+        """Transition to ``Ready`` and install the migration subprotocol
+        handler. Idempotent; raises on a runtime that is shutting down."""
+        ...
+    def shutdown(self) -> None:
+        """Drain daemons, clear factory registrations, uninstall the
+        migration handler. The underlying ``NetMesh`` is untouched."""
+        ...
+    def is_ready(self) -> bool: ...
+    def daemon_count(self) -> int: ...
+    def register_factory(self, kind: str, factory: Callable[[], Any]) -> None:
+        """Register a factory under ``kind``. It must return an object
+        with a ``process(event)`` method and optional ``snapshot()`` /
+        ``restore(state)``. Registering the same ``kind`` twice raises."""
+        ...
+    def spawn(
+        self,
+        kind: str,
+        identity: Identity,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> DaemonHandle:
+        """Spawn a daemon of ``kind`` under ``identity``. ``config`` keys:
+        ``auto_snapshot_interval`` (int), ``max_log_entries`` (int)."""
+        ...
+    def spawn_from_snapshot(
+        self,
+        kind: str,
+        identity: Identity,
+        snapshot_bytes: bytes,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> DaemonHandle:
+        """Like ``spawn``, seeding state via the daemon's ``restore``
+        before any event lands."""
+        ...
+    def stop(self, origin_hash: int) -> None: ...
+    def snapshot(self, origin_hash: int) -> Optional[bytes]: ...
+    def deliver(self, origin_hash: int, event: CausalEvent) -> List[bytes]:
+        """Deliver one event to the daemon; returns its output payloads."""
+        ...
+    def start_migration(
+        self, origin_hash: int, source_node: int, target_node: int
+    ) -> MigrationHandle: ...
+    def start_migration_with(
+        self,
+        origin_hash: int,
+        source_node: int,
+        target_node: int,
+        opts: Dict[str, Any],
+    ) -> MigrationHandle:
+        """``start_migration`` with options: ``transport_identity`` (bool),
+        ``retry_not_ready_ms`` (int)."""
+        ...
+    def expect_migration(
+        self,
+        kind: str,
+        origin_hash: int,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> None: ...
+    def register_migration_target_identity(
+        self,
+        kind: str,
+        identity: Identity,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> None: ...
+    def migration_phase(self, origin_hash: int) -> Optional[str]:
+        """``snapshot`` | ``transfer`` | ``restore`` | ``replay`` |
+        ``cutover`` | ``complete``, or ``None`` when none is in flight."""
+        ...
+
 class DaemonHandle:
     """Handle to a spawned daemon."""
 
+    @property
+    def origin_hash(self) -> int: ...
+    @property
+    def entity_id(self) -> bytes: ...
+
 class MigrationHandle:
     """Handle to an in-flight live-migration."""
+
+    @property
+    def origin_hash(self) -> int: ...
+    @property
+    def source_node(self) -> int: ...
+    @property
+    def target_node(self) -> int: ...
+    def phase(self) -> Optional[str]:
+        """Current phase, or ``None`` once the migration has left the
+        orchestrator's records (terminal success or abort)."""
+        ...
+    def wait(self) -> None:
+        """Block until terminal; raises ``MigrationError`` on abort."""
+        ...
+    def wait_with_timeout(self, timeout_ms: int) -> None: ...
+    def cancel(self) -> None:
+        """Best-effort cancel; past ``cutover`` this resolves without
+        aborting."""
+        ...
+    def phases(self) -> Iterator[str]:
+        """Yield each distinct phase until the migration is terminal."""
+        ...
 
 # ---- Groups (`groups.rs`) ---------------------------------------------------
 
@@ -2556,11 +2780,114 @@ class GroupError(Exception):
 class ReplicaGroup:
     """N-replica HA group. Each member sees every event."""
 
+    @staticmethod
+    def spawn(
+        runtime: DaemonRuntime,
+        kind: str,
+        replica_count: int,
+        group_seed: bytes,
+        lb_strategy: str,
+        host_config: Optional[Dict[str, Any]] = None,
+    ) -> ReplicaGroup:
+        """Spawn a group bound to a started ``runtime``; ``kind`` must be
+        registered via ``runtime.register_factory``."""
+        ...
+    def route_event(self, ctx: Optional[Dict[str, Any]] = None) -> int:
+        """Pick the best-available replica; returns its ``origin_hash``
+        for ``runtime.deliver``."""
+        ...
+    def scale_to(self, n: int) -> None: ...
+    def on_node_failure(self, failed_node_id: int) -> List[int]:
+        """Returns the indices of the replicas that were re-spawned."""
+        ...
+    def on_node_recovery(self, recovered_node_id: int) -> None: ...
+    @property
+    def health(self) -> Dict[str, Any]: ...
+    @property
+    def group_id(self) -> int: ...
+    @property
+    def replicas(self) -> List[Dict[str, Any]]: ...
+    @property
+    def replica_count(self) -> int: ...
+    @property
+    def healthy_count(self) -> int: ...
+
 class ForkGroup:
     """Fork-style group with deterministic event partitioning."""
 
+    @staticmethod
+    def fork(
+        runtime: DaemonRuntime,
+        kind: str,
+        parent_origin: int,
+        fork_seq: int,
+        fork_count: int,
+        lb_strategy: str,
+        host_config: Optional[Dict[str, Any]] = None,
+    ) -> ForkGroup:
+        """Fork ``fork_count`` new daemons from ``parent_origin`` at
+        ``fork_seq``."""
+        ...
+    def route_event(self, ctx: Optional[Dict[str, Any]] = None) -> int: ...
+    def scale_to(self, n: int) -> None: ...
+    def on_node_failure(self, failed_node_id: int) -> List[int]: ...
+    def on_node_recovery(self, recovered_node_id: int) -> None: ...
+    @property
+    def health(self) -> Dict[str, Any]: ...
+    @property
+    def parent_origin(self) -> int: ...
+    @property
+    def fork_seq(self) -> int: ...
+    @property
+    def fork_records(self) -> List[Dict[str, Any]]: ...
+    def verify_lineage(self) -> bool: ...
+    @property
+    def members(self) -> List[Dict[str, Any]]: ...
+    @property
+    def fork_count(self) -> int: ...
+    @property
+    def healthy_count(self) -> int: ...
+
 class StandbyGroup:
     """Active/standby group with leader election."""
+
+    @staticmethod
+    def spawn(
+        runtime: DaemonRuntime,
+        kind: str,
+        member_count: int,
+        group_seed: bytes,
+        host_config: Optional[Dict[str, Any]] = None,
+    ) -> StandbyGroup:
+        """Member 0 starts active; the rest start as standbys with no
+        snapshot (``synced_through == 0``)."""
+        ...
+    @property
+    def active_origin(self) -> int: ...
+    def sync_standbys(self) -> int: ...
+    def promote(self) -> int: ...
+    def on_node_failure(self, failed_node_id: int) -> Optional[int]: ...
+    def on_node_recovery(self, recovered_node_id: int) -> None: ...
+    @property
+    def health(self) -> Dict[str, Any]: ...
+    @property
+    def active_healthy(self) -> bool: ...
+    @property
+    def active_index(self) -> int: ...
+    def member_role(self, index: int) -> Optional[str]:
+        """``"active"`` | ``"standby"`` | ``None`` (out-of-range index)."""
+        ...
+    def synced_through(self, index: int) -> Optional[int]: ...
+    @property
+    def buffered_event_count(self) -> int: ...
+    @property
+    def group_id(self) -> int: ...
+    @property
+    def members(self) -> List[Dict[str, Any]]: ...
+    @property
+    def member_count(self) -> int: ...
+    @property
+    def standby_count(self) -> int: ...
 
 # ---- Deck operator SDK (`deck.rs`) ------------------------------------------
 
