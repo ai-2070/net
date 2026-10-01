@@ -1,0 +1,43 @@
+net/crates/net/src/adapter/net/failure.rs
+  s_a9c38fc597b27f::t_ed3be347bd60e6 737-739
+  s_a9c38fc597b27f::t_b6e542bca0c78a 732
+.github/workflows/ci.yml
+  s_a9c38fc597b27f::t_dc5de634b3f109 4075
+net/crates/net/src/shard/mapper.rs
+  s_a9c38fc597b27f::t_b6e542bca0c78a 215
+  s_a9c38fc597b27f::t_ed3be347bd60e6 222-229,237-244
+net/crates/net/src/adapter/net/rtc/stats.rs
+  s_a9c38fc597b27f::t_ed3be347bd60e6 464-466
+net/crates/net/wire/src/session.rs
+  s_a9c38fc597b27f::t_ed3be347bd60e6 2902-2904,2941-2943,2946-2948,2960-2962,2980-2982,2984-2986,3125-3127
+  s_a9c38fc597b27f::t_b6e542bca0c78a 2897-2898,3027-3028
+.github/workflows/release-npm.yml
+  s_a9c38fc597b27f::t_dc5de634b3f109 64,66
+net/crates/net/src/adapter/net/proxy.rs
+  s_a9c38fc597b27f::t_ed3be347bd60e6 378-380,382-384,386-388,390-392
+net/crates/net/src/adapter/net/rtc/fragment.rs
+  s_a9c38fc597b27f::t_ed3be347bd60e6 715-717
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  s_a9c38fc597b27f::t_ed3be347bd60e6 378-379
+net/crates/net/src/adapter/net/behavior/context.rs
+  s_a9c38fc597b27f::t_ed3be347bd60e6 903-905
+net/crates/net/src/adapter/net/behavior/safety.rs
+  s_a9c38fc597b27f::t_ed3be347bd60e6 407-412,1389-1393,1461,1463-1464,1466,1468-1469,1473,1475-1481
+  s_a9c38fc597b27f::t_b6e542bca0c78a 403,1387,1437,1447
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a06f5d1715f347e092d2c8ff3f24caf1e1cb10c4",
+  "prompts": {},
+  "sessions": {
+    "s_a9c38fc597b27f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e4dc29cd-6729-4ba0-af4b-56e2d3daa30c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
