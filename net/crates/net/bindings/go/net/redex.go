@@ -271,6 +271,11 @@ type ReplicationConfig struct {
 	Placement PlacementStrategy `json:"placement,omitempty"`
 	// PinnedNodes is required when Placement == PlacementPinned.
 	PinnedNodes []uint64 `json:"pinned_nodes,omitempty"`
+	// PlacementMetadata carries placement hints for Standard /
+	// ColocationStrict: "colocate-with", "colocate-with-strict"
+	// (required by ColocationStrict; a chain's 16-hex origin hash),
+	// "intent".
+	PlacementMetadata map[string]string `json:"placement_metadata,omitempty"`
 	// LeaderPinned, when non-nil, pins the leader to a specific
 	// NodeId. The deterministic election picks this node whenever
 	// it's healthy.

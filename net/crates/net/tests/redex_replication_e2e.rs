@@ -2,10 +2,11 @@
 //!
 //! Wires two `MeshNode`s + two `Redex` instances, calls
 //! `enable_replication` on both, opens the same channel name with
-//! a replication-enabled config, manually drives the role
-//! transitions (Phase F's placement filter is not yet wired), then
-//! appends events on the leader and asserts the replica catches up
-//! via the heartbeat-driven `SyncRequest` / `SyncResponse` cycle.
+//! a replication-enabled config, then appends events on the leader
+//! and asserts the replicas catch up via the heartbeat-driven
+//! `SyncRequest` / `SyncResponse` cycle. The older tests drive the
+//! roles past the bootstrap by hand; the later ones let the runtime
+//! bootstrap, place (`Standard` / `ColocationStrict`) and elect.
 //!
 //! Run: `cargo test --features redex --test redex_replication_e2e`
 
@@ -30,7 +31,11 @@ fn test_config() -> MeshNodeConfig {
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
         .with_handshake(3, Duration::from_secs(2))
-        .with_capability_gc_interval(Duration::from_millis(250));
+        .with_capability_gc_interval(Duration::from_millis(250))
+        // Replica placement follows capability announcements, which the
+        // origin rate-limits to one per window (default 10 s); a short
+        // window keeps the placement tests' convergence quick.
+        .with_min_announce_interval(Duration::from_millis(50));
     cfg.socket_buffers = SocketBufferConfig {
         send_buffer_size: TEST_BUFFER_SIZE,
         recv_buffer_size: TEST_BUFFER_SIZE,
@@ -905,4 +910,231 @@ async fn disable_replication_releases_the_mesh() {
     file.append(b"local").unwrap();
     redex.enable_replication(node.clone());
     assert_eq!(redex.replication_runtime_count(), 0);
+}
+
+// ============================================================================
+// Standard / ColocationStrict placement (REDEX_REPLICA_PLACEMENT_PLAN.md)
+// ============================================================================
+//
+// Before the placement resolver, `Standard` (the default) and
+// `ColocationStrict` started with an empty replica set and every channel
+// sat in `Idle`: nothing replicated unless the set was pinned by hand.
+
+struct Trio {
+    nodes: [Arc<MeshNode>; 3],
+    redexes: [Arc<Redex>; 3],
+}
+
+async fn trio() -> Trio {
+    let a = build_node().await;
+    let b = build_node().await;
+    let c = build_node().await;
+    handshake_no_start(&a, &b).await;
+    handshake_no_start(&a, &c).await;
+    handshake_no_start(&b, &c).await;
+    start_all(&[&a, &b, &c]);
+    let redexes = [
+        Arc::new(Redex::new()),
+        Arc::new(Redex::new()),
+        Arc::new(Redex::new()),
+    ];
+    for (r, n) in redexes.iter().zip([&a, &b, &c]) {
+        r.enable_replication(n.clone());
+    }
+    Trio {
+        nodes: [a, b, c],
+        redexes,
+    }
+}
+
+fn roles(trio: &Trio, name: &ChannelName) -> Vec<ReplicaRole> {
+    trio.redexes
+        .iter()
+        .map(|r| {
+            r.replication_coordinator_for(name)
+                .map(|c| c.role())
+                .unwrap_or(ReplicaRole::Idle)
+        })
+        .collect()
+}
+
+/// The index of the node with the `rank`-th lowest NodeId.
+fn by_id_rank(trio: &Trio, rank: usize) -> usize {
+    let mut idx: Vec<usize> = (0..3).collect();
+    idx.sort_by_key(|&i| trio.nodes[i].node_id());
+    idx[rank]
+}
+
+fn settled(roles: &[ReplicaRole], members: &[usize]) -> bool {
+    let leaders = members
+        .iter()
+        .filter(|&&i| roles[i] == ReplicaRole::Leader)
+        .count();
+    let all_in = members
+        .iter()
+        .all(|&i| matches!(roles[i], ReplicaRole::Leader | ReplicaRole::Replica));
+    let others_idle = (0..roles.len())
+        .filter(|i| !members.contains(i))
+        .all(|i| roles[i] == ReplicaRole::Idle);
+    leaders == 1 && all_in && others_idle
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standard_placement_selects_factor_replicas_and_replicates() {
+    let t = trio().await;
+    let name = cn("repl/standard");
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_factor(2)
+            .with_heartbeat_ms(150),
+    ));
+    let files: Vec<_> = t
+        .redexes
+        .iter()
+        .map(|r| r.open_file(&name, cfg.clone()).expect("open"))
+        .collect();
+
+    // Equal scores (no placement hints, no resources announced) → the two
+    // lowest NodeIds, the same set on every node.
+    let members = [by_id_rank(&t, 0), by_id_rank(&t, 1)];
+    let outsider = by_id_rank(&t, 2);
+    wait_until(8, "the pair never settled with one leader", || {
+        settled(&roles(&t, &name), &members)
+    })
+    .await;
+
+    let r = roles(&t, &name);
+    let (leader, follower) = if r[members[0]] == ReplicaRole::Leader {
+        (members[0], members[1])
+    } else {
+        (members[1], members[0])
+    };
+    for i in 0..8u32 {
+        files[leader]
+            .append(format!("event-{i}").as_bytes())
+            .unwrap();
+    }
+    wait_until(5, "the other replica never caught up", || {
+        files[follower].next_seq() == 8
+    })
+    .await;
+    assert_eq!(
+        files[outsider].next_seq(),
+        0,
+        "the unselected node holds nothing"
+    );
+    assert_eq!(roles(&t, &name)[outsider], ReplicaRole::Idle);
+
+    for r in &t.redexes {
+        r.close_file(&name).ok();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standard_placement_reselects_when_a_replica_leaves() {
+    let t = trio().await;
+    let name = cn("repl/reselect");
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_factor(2)
+            .with_heartbeat_ms(150),
+    ));
+    let files: Vec<_> = t
+        .redexes
+        .iter()
+        .map(|r| r.open_file(&name, cfg.clone()).expect("open"))
+        .collect();
+    let first = [by_id_rank(&t, 0), by_id_rank(&t, 1)];
+    let outsider = by_id_rank(&t, 2);
+    wait_until(8, "the first set never settled", || {
+        settled(&roles(&t, &name), &first)
+    })
+    .await;
+
+    // The lowest-id member leaves; its candidacy is withdrawn, so the
+    // remaining nodes re-resolve to {the other member, the outsider}.
+    let leaving = first[0];
+    t.redexes[leaving].close_file(&name).expect("close");
+    let second = [first[1], outsider];
+    wait_until(
+        8,
+        "the set never re-resolved to take in the outsider",
+        || {
+            let r = roles(&t, &name);
+            let leaders = second
+                .iter()
+                .filter(|&&i| r[i] == ReplicaRole::Leader)
+                .count();
+            leaders == 1
+                && second
+                    .iter()
+                    .all(|&i| matches!(r[i], ReplicaRole::Leader | ReplicaRole::Replica))
+        },
+    )
+    .await;
+
+    let r = roles(&t, &name);
+    let (leader, follower) = if r[second[0]] == ReplicaRole::Leader {
+        (second[0], second[1])
+    } else {
+        (second[1], second[0])
+    };
+    let base = files[leader].next_seq();
+    for i in 0..4u32 {
+        files[leader]
+            .append(format!("after-{i}").as_bytes())
+            .unwrap();
+    }
+    wait_until(5, "the newly selected replica never caught up", || {
+        files[follower].next_seq() == base + 4
+    })
+    .await;
+
+    for (i, r) in t.redexes.iter().enumerate() {
+        if i != leaving {
+            r.close_file(&name).ok();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn colocation_strict_selects_only_holders_of_the_named_chain() {
+    let t = trio().await;
+    // Two of the three nodes hold an unrelated chain; the channel must
+    // replicate only onto them, even with factor 3.
+    const HOST_CHAIN: u64 = 0x00C0_FFEE_0000_0001;
+    let holders = [by_id_rank(&t, 0), by_id_rank(&t, 2)];
+    let outsider = by_id_rank(&t, 1);
+    for &i in &holders {
+        t.nodes[i].announce_chain(HOST_CHAIN, 1).await.unwrap();
+    }
+
+    let name = cn("repl/colocated");
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_factor(3)
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::ColocationStrict)
+            .with_placement_metadata(
+                net::adapter::net::redex::COLOCATE_WITH_STRICT_METADATA_KEY,
+                format!("{HOST_CHAIN:016x}"),
+            ),
+    ));
+    for r in &t.redexes {
+        r.open_file(&name, cfg.clone()).expect("open");
+    }
+    wait_until(8, "the holders never settled as the replica set", || {
+        settled(&roles(&t, &name), &holders)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        roles(&t, &name)[outsider],
+        ReplicaRole::Idle,
+        "a node without the chain is never selected"
+    );
+
+    for r in &t.redexes {
+        r.close_file(&name).ok();
+    }
 }

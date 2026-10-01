@@ -347,6 +347,7 @@ impl PyRedex {
         replication_leader_pinned = None,
         replication_on_under_capacity = None,
         replication_budget_fraction = None,
+        replication_placement_metadata = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn open_file(
@@ -366,6 +367,7 @@ impl PyRedex {
         replication_leader_pinned: Option<u64>,
         replication_on_under_capacity: Option<String>,
         replication_budget_fraction: Option<f64>,
+        replication_placement_metadata: Option<std::collections::HashMap<String, String>>,
     ) -> PyResult<PyRedexFile> {
         let channel = ChannelName::new(name).map_err(|e| RedexError::new_err(format!("{}", e)))?;
         let mut cfg = RedexFileConfig {
@@ -426,6 +428,10 @@ impl PyRedex {
                     "replication_budget_fraction",
                     replication_budget_fraction.is_some(),
                 ),
+                (
+                    "replication_placement_metadata",
+                    replication_placement_metadata.is_some(),
+                ),
             ];
             let first_set = stray.iter().find(|(_, set)| *set).map(|(n, _)| *n);
             if let Some(name) = first_set {
@@ -444,6 +450,7 @@ impl PyRedex {
                 replication_leader_pinned,
                 replication_on_under_capacity,
                 replication_budget_fraction,
+                replication_placement_metadata,
             )?);
         }
         // Opening can spawn: a replicated channel's runtime, or an
@@ -775,6 +782,7 @@ impl PyRedex {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_replication_config(
     factor: Option<u32>,
     heartbeat_ms: Option<u64>,
@@ -783,6 +791,7 @@ fn build_replication_config(
     leader_pinned: Option<u64>,
     on_under_capacity: Option<String>,
     budget_fraction: Option<f64>,
+    placement_metadata: Option<std::collections::HashMap<String, String>>,
 ) -> PyResult<InnerReplicationConfig> {
     let mut out = InnerReplicationConfig::new();
     if let Some(f) = factor {
@@ -847,6 +856,12 @@ fn build_replication_config(
     });
     if let Some(fr) = budget_fraction {
         out = out.with_replication_budget_fraction(fr as f32);
+    }
+    // `colocate-with` / `colocate-with-strict` (each a chain's 16-hex
+    // origin hash) and `intent`; `colocation_strict` requires the
+    // strict key.
+    for (key, value) in placement_metadata.unwrap_or_default() {
+        out = out.with_placement_metadata(key, value);
     }
     out.validate()
         .map_err(|e| RedexError::new_err(format!("replication config invalid: {e}")))?;

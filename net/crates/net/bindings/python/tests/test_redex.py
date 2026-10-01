@@ -274,3 +274,55 @@ def test_interval_fsync_open_file_without_a_mesh(tmp_path):
     f = r.open_file("py/fsync", persistent=True, fsync_interval_ms=50)
     assert f.append(b"durable") == 0
     f.close()
+
+
+def test_standard_placement_replicates_without_a_node_list(mesh_pair):
+    """``replication_placement="standard"`` (the default) used to start
+    with an empty replica set and never replicate. Each node now
+    advertises candidacy, both pick the same two replicas, and the
+    pinned leader's writes reach the other."""
+    a, b = mesh_pair
+    ra, rb = Redex(), Redex()
+    ra.enable_replication(a)
+    rb.enable_replication(b)
+    kwargs = dict(
+        replication=True,
+        replication_factor=2,
+        replication_heartbeat_ms=150,
+        replication_leader_pinned=a.node_id,
+    )
+    fa = ra.open_file("py/repl-standard", **kwargs)
+    fb = rb.open_file("py/repl-standard", **kwargs)
+    _wait_for(
+        "A elected leader",
+        lambda: 'dataforts_leader_changes_total{channel="py/repl-standard"} 1'
+        in ra.replication_prometheus_text(),
+        timeout=30.0,
+    )
+    for i in range(4):
+        fa.append(f"event-{i}".encode())
+    _wait_for("B caught up", lambda: len(fb.read_range(0, 4)) == 4)
+    ra.disable_replication()
+    rb.disable_replication()
+
+
+def test_colocation_strict_without_a_chain_is_rejected():
+    mesh = net.NetMesh("127.0.0.1:0", "7a" * 32)
+    try:
+        r = Redex()
+        r.enable_replication(mesh)
+        with pytest.raises(net.RedexError, match="colocate-with-strict"):
+            r.open_file(
+                "py/colo",
+                replication=True,
+                replication_placement="colocation_strict",
+            )
+        f = r.open_file(
+            "py/colo-ok",
+            replication=True,
+            replication_placement="colocation_strict",
+            replication_placement_metadata={"colocate-with-strict": "00000000000000ab"},
+        )
+        assert f.append(b"x") == 0
+    finally:
+        mesh.shutdown()

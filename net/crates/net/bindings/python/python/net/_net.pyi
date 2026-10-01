@@ -283,6 +283,7 @@ class Redex:
         replication_leader_pinned: Optional[int] = None,
         replication_on_under_capacity: Optional[str] = None,
         replication_budget_fraction: Optional[float] = None,
+        replication_placement_metadata: Optional[Dict[str, str]] = None,
     ) -> "RedexFile":
         """Open (or get) a raw RedEX file for domain-agnostic persistent
         logging. Bypasses the CortEX fold layer — use when you want an
@@ -299,6 +300,11 @@ class Redex:
         `enable_replication` first. With `replication_placement="pinned"`
         each node in `replication_pinned_nodes` joins as a replica and the
         set elects a leader (`replication_leader_pinned` if healthy).
+        With `"standard"` (the default) or `"colocation_strict"`, every
+        node that opens the channel is a candidate and each picks the
+        same `replication_factor` replicas; `replication_placement_metadata`
+        carries the hints (`colocate-with-strict`, required by
+        `"colocation_strict"`, is a chain's 16-hex origin hash).
         """
         ...
     def enable_replication(self, mesh: "NetMesh") -> None:

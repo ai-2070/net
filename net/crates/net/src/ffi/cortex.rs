@@ -1027,6 +1027,10 @@ struct RedexReplicationConfigJson {
     /// `"withdraw"` (default), `"evict_oldest"`.
     on_under_capacity: Option<String>,
     replication_budget_fraction: Option<f32>,
+    /// Placement hints for `"standard"` / `"colocation_strict"`:
+    /// `colocate-with`, `colocate-with-strict` (required by
+    /// `"colocation_strict"`; a chain's 16-hex origin hash), `intent`.
+    placement_metadata: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl RedexReplicationConfigJson {
@@ -1067,6 +1071,9 @@ impl RedexReplicationConfigJson {
         cfg = cfg.with_on_under_capacity(policy);
         if let Some(fr) = self.replication_budget_fraction {
             cfg = cfg.with_replication_budget_fraction(fr);
+        }
+        for (key, value) in self.placement_metadata.unwrap_or_default() {
+            cfg = cfg.with_placement_metadata(key, value);
         }
         cfg.validate().map_err(|_| "replication config invalid")?;
         Ok(cfg)

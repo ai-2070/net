@@ -45919,6 +45919,91 @@ impl MeshNode {
         self.announce_capabilities(snapshot).await
     }
 
+    /// The reserved tag a node carries while it is a replica candidate
+    /// for a replicated channel: `dataforts:replica-candidate:<id>`,
+    /// `<id>` the channel id's 64 lowercase hex digits. A substrate-owned
+    /// body under the existing `dataforts:` reserved prefix.
+    pub(crate) fn replica_candidate_tag(channel_id: &[u8; 32]) -> String {
+        let mut s = String::with_capacity(28 + 64);
+        s.push_str("dataforts:replica-candidate:");
+        for b in channel_id {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    /// The origin-side capability-announce rate limit: changes inside
+    /// one window coalesce into a trailing flush at its end, so a peer
+    /// can see a change up to one window late.
+    pub fn min_announce_interval(&self) -> Duration {
+        self.config.min_announce_interval
+    }
+
+    /// Whether this node's announced capabilities carry the replica-
+    /// candidate tag for `channel_id`.
+    pub fn advertises_replica_candidate(&self, channel_id: &[u8; 32]) -> bool {
+        let tag = Self::replica_candidate_tag(channel_id);
+        self.user_caps_snapshot()
+            .tags
+            .iter()
+            .any(|t| t.to_string() == tag)
+    }
+
+    /// Advertise this node as a replica candidate for `channel_id` and
+    /// re-broadcast. Idempotent. `Standard` / `ColocationStrict`
+    /// replica placement draws its candidate pool from these tags.
+    pub async fn announce_replica_candidate(
+        &self,
+        channel_id: &[u8; 32],
+    ) -> Result<(), AdapterError> {
+        let Ok(tag) = Tag::parse(&Self::replica_candidate_tag(channel_id)) else {
+            return Err(AdapterError::Fatal(
+                "replica-candidate tag failed to parse".into(),
+            ));
+        };
+        let mut snapshot = self.user_caps_snapshot();
+        if snapshot.tags.contains(&tag) {
+            return Ok(());
+        }
+        snapshot.tags.insert(tag);
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// Stop advertising this node as a replica candidate for
+    /// `channel_id` and re-broadcast. Idempotent.
+    pub async fn withdraw_replica_candidate(
+        &self,
+        channel_id: &[u8; 32],
+    ) -> Result<(), AdapterError> {
+        let tag = Self::replica_candidate_tag(channel_id);
+        let mut snapshot = self.user_caps_snapshot();
+        let before = snapshot.tags.len();
+        snapshot.tags.retain(|t| t.to_string() != tag);
+        if snapshot.tags.len() == before {
+            return Ok(());
+        }
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// Every node (this one included, once self-indexed) currently
+    /// advertising the replica-candidate tag for `channel_id`, sorted
+    /// by ascending NodeId. Reads the capability fold; no broadcast.
+    pub fn find_replica_candidates(&self, channel_id: &[u8; 32]) -> Vec<u64> {
+        let tag = Self::replica_candidate_tag(channel_id);
+        let mut nodes: Vec<u64> = self.capability_fold.with_state(|state| {
+            let mut seen = std::collections::BTreeSet::new();
+            for entry in state.entries.values() {
+                if entry.payload.tags.contains(&tag) {
+                    seen.insert(entry.node_id);
+                }
+            }
+            seen.into_iter().collect()
+        });
+        nodes.sort_unstable();
+        nodes
+    }
+
     /// Annotate the local capability set with a `heat:<hex>=<rate>`
     /// reserved tag for `origin_hash` and re-broadcast. Replaces
     /// any prior heat tag for the same chain — the most recent

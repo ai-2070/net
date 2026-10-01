@@ -107,6 +107,35 @@ impl Drop for GreedyWiring {
     }
 }
 
+/// Shut replication runtimes down gracefully. `cancel` sends `Shutdown`
+/// and awaits the task, which withdraws the channel's replica candidacy
+/// and chain advertisement on its way to `Idle`; merely dropping a
+/// handle aborts the task and skips all of it, leaving the mesh
+/// advertising a channel this node no longer serves (and, for
+/// resolver-placed channels, keeping peers from re-selecting). Off a
+/// tokio runtime there is nothing to await on, so fall back to the
+/// abort.
+fn shut_down_runtimes(handles: Vec<Arc<super::replication_runtime::ReplicationRuntimeHandle>>) {
+    if handles.is_empty() {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => {
+            rt.spawn(async move {
+                for handle in handles {
+                    handle.cancel().await;
+                }
+            });
+        }
+        Err(_) => {
+            for handle in &handles {
+                let _ = handle.try_dispatch(super::replication_runtime::Inbound::Shutdown);
+            }
+            drop(handles);
+        }
+    }
+}
+
 /// Manager for a set of RedEX files bound to channel names.
 pub struct Redex {
     files: DashMap<ChannelName, RedexFile>,
@@ -280,21 +309,7 @@ impl Redex {
             .collect();
         // `ReplicationWiring::drop` uninstalls the router from the mesh.
         drop(wiring);
-        // Shut each runtime down gracefully: `cancel` sends `Shutdown`
-        // and awaits the task, which withdraws the channel's chain
-        // advertisement on its way to `Idle`. Dropping a handle instead
-        // aborts the task and skips both. Off a runtime there is
-        // nothing to await on, so fall back to that abort path.
-        match tokio::runtime::Handle::try_current() {
-            Ok(rt) => {
-                rt.spawn(async move {
-                    for handle in handles {
-                        handle.cancel().await;
-                    }
-                });
-            }
-            Err(_) => drop(handles),
-        }
+        shut_down_runtimes(handles);
     }
 
     /// Install greedy-LRU wiring rooted at `mesh`. Validates the
@@ -689,14 +704,27 @@ impl Redex {
             origin_hash: self.principal.raw(),
         };
 
-        // Compute the initial replica set. Pinned: the literal
-        // list. Standard / ColocationStrict: empty for now; Phase F
-        // wires placement-recomputation so the coordinator
-        // re-resolves the set on roster change.
+        // The replica set. Pinned: the literal list, fixed. Standard /
+        // ColocationStrict: resolved by the runtime every tick from the
+        // replica-candidate tags (REDEX_REPLICA_PLACEMENT_PLAN.md), so it
+        // starts empty and follows roster changes.
         let replica_set: Vec<crate::adapter::net::behavior::placement::NodeId> =
             match &cfg.placement {
                 PlacementStrategy::Pinned(nodes) => nodes.clone(),
                 _ => Vec::new(),
+            };
+        let replica_resolver: Option<Arc<dyn super::replication_placement::ReplicaSetResolver>> =
+            match &cfg.placement {
+                PlacementStrategy::Pinned(_) => None,
+                strategy => Some(Arc::new(
+                    super::replication_placement::MeshReplicaPlacement::new(
+                        wiring.mesh.clone(),
+                        name.clone(),
+                        usize::from(cfg.effective_factor()),
+                        *strategy == PlacementStrategy::ColocationStrict,
+                        &cfg.placement_metadata,
+                    ),
+                )),
             };
 
         let heartbeat_ms = cfg.heartbeat_ms;
@@ -773,10 +801,10 @@ impl Redex {
             default_bandwidth_class,
             background_fraction,
             // Only a pinned set names its members up front; Standard /
-            // ColocationStrict start with an empty set (Phase F) and
-            // stay `Idle`.
+            // ColocationStrict members join through the resolver.
             bootstrap_replica: replica_set_has_self,
             leader_pinned,
+            replica_resolver,
         };
 
         let handle = Arc::new(spawn_replication_runtime(
@@ -846,7 +874,7 @@ impl Redex {
         if let Some(wiring) = self.replication.read().as_ref().cloned() {
             let channel_id = ChannelId::from_name(name);
             if let Some(handle) = wiring.router.unregister(&channel_id) {
-                let _ = handle.try_dispatch(super::replication_runtime::Inbound::Shutdown);
+                shut_down_runtimes(vec![handle]);
             }
         }
         if let Some((_, file)) = self.files.remove(name) {
@@ -877,7 +905,7 @@ impl Redex {
         if let Some(wiring) = self.replication.read().as_ref().cloned() {
             let channel_id = ChannelId::from_name(name);
             if let Some(handle) = wiring.router.unregister(&channel_id) {
-                let _ = handle.try_dispatch(super::replication_runtime::Inbound::Shutdown);
+                shut_down_runtimes(vec![handle]);
             }
         }
         // Hold the entry guard across close + unlink so a

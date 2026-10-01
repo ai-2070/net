@@ -641,6 +641,11 @@ pub struct ReplicationConfigJs {
     /// measured NIC peak. Range `(0.0, 1.0]`. Defaults to `0.5`
     /// when omitted.
     pub replication_budget_fraction: Option<f64>,
+    /// Placement hints for `"standard"` / `"colocation-strict"`:
+    /// `colocate-with` (soft) or `colocate-with-strict` (required by
+    /// `"colocation-strict"`), each a chain's 16-hex origin hash, and
+    /// `intent`. Ignored by `"pinned"`.
+    pub placement_metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 /// JS-side config for `Redex.enableGravityForGreedy`. Locked
@@ -820,6 +825,9 @@ fn resolve_replication_config(cfg: ReplicationConfigJs) -> Result<InnerReplicati
     out = out.with_on_under_capacity(resolve_under_capacity(cfg.on_under_capacity)?);
     if let Some(fraction) = cfg.replication_budget_fraction {
         out = out.with_replication_budget_fraction(fraction as f32);
+    }
+    for (key, value) in cfg.placement_metadata.unwrap_or_default() {
+        out = out.with_placement_metadata(key, value);
     }
     // Validate fail-fast so a malformed config can't reach
     // `open_file`. The core revalidates there too, but the

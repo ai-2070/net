@@ -37,6 +37,7 @@ mod replication_coordinator;
 mod replication_election;
 mod replication_heartbeat;
 mod replication_metrics;
+mod replication_placement;
 mod replication_router;
 mod replication_runtime;
 mod replication_state;
@@ -70,9 +71,9 @@ pub use replication_catchup::{
 };
 pub use replication_config::{
     PlacementStrategy, ReplicationConfig, ReplicationConfigError, UnderCapacity,
-    BACKGROUND_FRACTION_DEFAULT, HEARTBEAT_MS_DEFAULT, HEARTBEAT_MS_MAX, HEARTBEAT_MS_MIN,
-    REPLICATION_BUDGET_FRACTION_DEFAULT, REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX,
-    REPLICATION_FACTOR_MIN,
+    BACKGROUND_FRACTION_DEFAULT, COLOCATE_WITH_STRICT_METADATA_KEY, HEARTBEAT_MS_DEFAULT,
+    HEARTBEAT_MS_MAX, HEARTBEAT_MS_MIN, REPLICATION_BUDGET_FRACTION_DEFAULT,
+    REPLICATION_FACTOR_DEFAULT, REPLICATION_FACTOR_MAX, REPLICATION_FACTOR_MIN,
 };
 pub use replication_coordinator::{
     ChainTagSink, ChannelIdentity, CoordinatorError, ReplicaTransitionEvent,
@@ -84,6 +85,7 @@ pub use replication_metrics::{
     ChannelMetrics, ChannelMetricsAtomic, ReplicationMetricsRegistry, ReplicationMetricsSnapshot,
     MAX_TRACKED_CHANNELS, OVERFLOW_CHANNEL_LABEL,
 };
+pub use replication_placement::{select_replica_set, MeshReplicaPlacement, ReplicaSetResolver};
 pub use replication_router::RedexReplicationRouter;
 pub use replication_runtime::{
     spawn_replication_runtime, Inbound, ReplicationDispatcher, ReplicationInboundRouter,

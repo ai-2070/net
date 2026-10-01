@@ -265,7 +265,7 @@ The earlier draft inconsistently named 3 states in some places and 4 in others. 
 
 Two distinct concerns. Keeping them separate is the load-bearing simplification.
 
-**Replica selection (Phase C — placement).** N nodes from the capability-advertising set, selected via `PlacementFilter::placement_score` for `Artifact::Replica`. The top-N by score become replicas. The locked Capability §7 tie-breaking (RTT → free-resource → lexicographic NodeId) applies on equal scores. Anti-affinity at 30% leadership-concentration threshold (`AntiAffinityConfig`) prevents central nodes from accumulating too much replica membership across channels.
+**Replica selection (Phase C — placement).** *Built 2026-10-01 as `REDEX_REPLICA_PLACEMENT_PLAN.md`, deterministic-local: candidates advertise `dataforts:replica-candidate:<id>`, scoring uses only the viewer-independent axes (no RTT or anti-affinity, which differ by viewer), and a short set waits two announce windows before joining.* N nodes from the capability-advertising set, selected via `PlacementFilter::placement_score` for `Artifact::Replica`. The top-N by score become replicas. The locked Capability §7 tie-breaking (RTT → free-resource → lexicographic NodeId) applies on equal scores. Anti-affinity at 30% leadership-concentration threshold (`AntiAffinityConfig`) prevents central nodes from accumulating too much replica membership across channels.
 
 Triggers:
 - First publish on a newly-replicated channel

@@ -17,6 +17,10 @@
 
 use crate::adapter::net::behavior::placement::NodeId;
 
+/// The [`ReplicationConfig::placement_metadata`] key naming the chain a
+/// [`PlacementStrategy::ColocationStrict`] channel's replicas must hold.
+pub const COLOCATE_WITH_STRICT_METADATA_KEY: &str = "colocate-with-strict";
+
 /// Replication factor lower bound. `1` collapses to single-node-with-
 /// coordinator (the daemon runs but there's only one replica) — useful
 /// for testing and the brief moment between channel-open and the first
@@ -180,6 +184,18 @@ pub struct ReplicationConfig {
     /// the configured value). Default
     /// [`BACKGROUND_FRACTION_DEFAULT`].
     pub background_fraction: f32,
+    /// Placement hints for [`PlacementStrategy::Standard`] /
+    /// [`PlacementStrategy::ColocationStrict`], read by the placement
+    /// filter as the replica artifact's metadata:
+    ///
+    /// - `colocate-with` (soft) / `colocate-with-strict` (required by
+    ///   `ColocationStrict`): a chain's 16-hex origin hash; candidates
+    ///   already holding it (its `causal:` tag) are preferred / required.
+    /// - `intent`: an intent from the default intent registry; a
+    ///   candidate must satisfy it.
+    ///
+    /// Ignored by `Pinned`. Empty by default.
+    pub placement_metadata: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for ReplicationConfig {
@@ -202,7 +218,18 @@ impl ReplicationConfig {
             replication_budget_fraction: REPLICATION_BUDGET_FRACTION_DEFAULT,
             default_bandwidth_class: super::bandwidth::BandwidthClass::Foreground,
             background_fraction: BACKGROUND_FRACTION_DEFAULT,
+            placement_metadata: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Set one placement hint (see [`Self::placement_metadata`]).
+    pub fn with_placement_metadata(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.placement_metadata.insert(key.into(), value.into());
+        self
     }
 
     /// Set the replication factor. Validate via [`Self::validate`]
@@ -328,6 +355,13 @@ impl ReplicationConfig {
                 got: self.background_fraction,
             });
         }
+        if self.placement == PlacementStrategy::ColocationStrict
+            && !self
+                .placement_metadata
+                .contains_key(COLOCATE_WITH_STRICT_METADATA_KEY)
+        {
+            return Err(ReplicationConfigError::ColocationStrictWithoutChain);
+        }
         if let PlacementStrategy::Pinned(nodes) = &self.placement {
             if nodes.is_empty() {
                 return Err(ReplicationConfigError::PinnedSetEmpty);
@@ -446,11 +480,30 @@ pub enum ReplicationConfigError {
         /// The leader `NodeId` that lies outside the pinned set.
         leader: NodeId,
     },
+    /// `ColocationStrict` placement without a
+    /// `placement_metadata["colocate-with-strict"]` naming the chain
+    /// to colocate with: no candidate could ever qualify.
+    #[error("ColocationStrict placement requires placement_metadata[\"colocate-with-strict\"]")]
+    ColocationStrictWithoutChain,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colocation_strict_requires_a_named_chain() {
+        let bare = ReplicationConfig::new().with_placement(PlacementStrategy::ColocationStrict);
+        assert_eq!(
+            bare.validate(),
+            Err(ReplicationConfigError::ColocationStrictWithoutChain)
+        );
+        let named =
+            bare.with_placement_metadata(COLOCATE_WITH_STRICT_METADATA_KEY, "00000000000000ab");
+        assert_eq!(named.validate(), Ok(()));
+        // Standard needs no hints.
+        assert_eq!(ReplicationConfig::new().validate(), Ok(()));
+    }
 
     #[test]
     fn default_config_validates() {
@@ -472,8 +525,15 @@ mod tests {
             .with_placement(PlacementStrategy::ColocationStrict)
             .with_on_under_capacity(UnderCapacity::EvictOldest)
             .with_leader_pinned(Some(0xDEAD_BEEF))
-            .with_replication_budget_fraction(0.75);
+            .with_replication_budget_fraction(0.75)
+            .with_placement_metadata(COLOCATE_WITH_STRICT_METADATA_KEY, "00000000deadbeef");
         assert_eq!(cfg.factor, 5);
+        assert_eq!(
+            cfg.placement_metadata
+                .get(COLOCATE_WITH_STRICT_METADATA_KEY)
+                .map(String::as_str),
+            Some("00000000deadbeef")
+        );
         assert_eq!(cfg.heartbeat_ms, 250);
         assert_eq!(cfg.placement, PlacementStrategy::ColocationStrict);
         assert_eq!(cfg.on_under_capacity, UnderCapacity::EvictOldest);

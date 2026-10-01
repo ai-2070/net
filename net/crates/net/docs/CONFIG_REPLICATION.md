@@ -43,23 +43,26 @@ let redex = Arc::new(Redex::new());
 // Idempotent — safe to call from multiple call sites.
 redex.enable_replication(mesh.clone());
 
-// Open a replicated channel with the SAME config on every node in
-// the replica set. Each listed node bootstraps itself as a replica
-// and the set elects a leader (the pinned one, if healthy) within a
-// few heartbeats; append on the leader.
+// Open the channel with the SAME config on every node that should be
+// a candidate. With the default `Standard` placement every such node
+// computes the same `factor` replicas; they join and elect a leader.
+// Append on the leader.
 let cfg = RedexFileConfig::default()
     .with_replication(Some(
         ReplicationConfig::new()
-            .with_heartbeat_ms(500)
-            .with_placement(PlacementStrategy::Pinned(vec![node_a, node_b, node_c]))
-            .with_leader_pinned(Some(node_a)),
+            .with_factor(3)
+            .with_heartbeat_ms(500),
     ));
 let file = redex.open_file(&channel_name, cfg)?;
+
+// Or name the replicas yourself:
+//   .with_placement(PlacementStrategy::Pinned(vec![node_a, node_b, node_c]))
 ```
 
-Use `Pinned` placement today: `Standard` and `ColocationStrict` start
-with an empty replica set, so their channels stay `Idle` and replicate
-nothing until Phase F lands placement (see `placement` below).
+Placement follows capability announcements, which each node
+rate-limits (`min_announce_interval`, 10 s by default), so a
+`Standard` set can take up to about two windows to form after the
+nodes open the channel. A `Pinned` set is known at once.
 
 `enable_replication` installs a per-`Redex` router on the mesh's
 `SUBPROTOCOL_REDEX` inbound dispatch; subsequent `open_file` calls
@@ -77,25 +80,23 @@ is exposed as methods on the binding's `Redex` handle.
 - **Node** (`@net-mesh/core`):
   ```ts
   redex.enableReplication(mesh);
-  redex.openFile("my/channel", {
-    replication: { heartbeatMs: 500n, placement: "pinned", pinnedNodes: [a, b, c] },
-  });
+  redex.openFile("my/channel", { replication: { factor: 3, heartbeatMs: 500n } });
+  // or { placement: "pinned", pinnedNodes: [a, b, c] }
   ```
 - **Python** (`net`):
   ```python
   redex.enable_replication(mesh)
   redex.open_file("my/channel",
-                  replication=True, replication_heartbeat_ms=500,
-                  replication_placement="pinned",
-                  replication_pinned_nodes=[a, b, c])
+                  replication=True, replication_factor=3,
+                  replication_heartbeat_ms=500)
+  # or replication_placement="pinned", replication_pinned_nodes=[a, b, c]
   ```
 - **Go** (cgo wrapper at `bindings/go/net/redex.go`):
   ```go
   redex.EnableReplication(meshArcPtr)
   redex.OpenFile("my/channel", &net.RedexFileConfig{
       Replication: &net.ReplicationConfig{
-          HeartbeatMs: 500, Placement: net.PlacementPinned,
-          PinnedNodes: []uint64{a, b, c},
+          Factor: 3, HeartbeatMs: 500,
       },
   })
   ```
@@ -124,24 +125,50 @@ hint.
 
 Where replicas live and how they're chosen. Three options:
 
-- **`Standard`** (default) — let `PlacementFilter` decide based on
-  `metadata.intent`, `metadata.colocate-with`, `scope:` tags,
-  proximity, and resource availability. Production default.
+- **`Standard`** (default) — every node that opens the channel is a
+  candidate, and every node picks the same `factor` of them (see
+  *How `Standard` and `ColocationStrict` choose* below). Production
+  default.
 - **`Pinned(Vec<NodeId>)`** — manual placement on a fixed `NodeId`
   set. Used for special-case topologies, integration tests, and
   recovery scenarios. The vector's length pins the effective
   replication factor regardless of `factor`.
-- **`ColocationStrict`** — every replica must live on a node
-  already holding the chain referenced by
-  `metadata.colocate-with-strict`. Refuses placement on nodes
-  with insufficient coverage.
+- **`ColocationStrict`** — like `Standard`, but only candidates
+  already holding the chain named by
+  `placement_metadata["colocate-with-strict"]` qualify; `validate()`
+  rejects the strategy without it.
 
-**Phase F gap**: `Standard` and `ColocationStrict` currently
-bootstrap with an empty replica set, so their channels stay `Idle`
-and replicate nothing; the placement filter's selection on roster
-change lands with Phase F. Until then, use `Pinned`: each listed
-node joins as a replica when it opens the channel, and the set
-elects a leader.
+#### How `Standard` and `ColocationStrict` choose
+
+Nodes agree on the replica set without coordinating, by computing it
+from data every node sees the same way:
+
+1. **Candidates.** A node that opens the channel advertises
+   `dataforts:replica-candidate:<channel id>` and withdraws it when
+   it closes the channel, disables replication, or withdraws under
+   disk pressure.
+2. **Scoring.** `StandardPlacement` over `Artifact::Replica`, using
+   only announced data: colocation (`colocate-with` prefers,
+   `colocate-with-strict` requires), `intent` (against the default
+   intent registry) and advertised storage. RTT proximity, leadership
+   anti-affinity and node-local custom filters differ by viewer, so
+   they don't choose replicas; the election still ranks the chosen
+   ones by RTT.
+3. **Selection.** The top `factor` by score, ties to the lower
+   NodeId.
+
+Each node re-resolves every heartbeat. Selected while `Idle` → it
+joins as a replica; no longer selected → it leaves (`Idle`, chain
+tag withdrawn). A node that resolves *fewer* than `factor` replicas
+waits two announce windows before joining that short set: the other
+candidates may not have reached it yet, and joining at once would
+make it the leader of a set of one beside another such leader,
+diverging writes. A full set joins at once.
+
+Views converge rather than agree instantly: until announcements
+propagate, nodes can briefly compute different sets, and a peer
+drops replication frames from a node outside its own set. A crashed
+candidate stays selected until its announcement expires.
 
 ### `heartbeat_ms: u64`
 
@@ -172,7 +199,24 @@ Common reasons to pin:
   a specific data center.
 
 If `placement = Pinned(set)` and `leader_pinned = Some(node)`,
-`node` must be in `set` — otherwise `validate()` rejects.
+`node` must be in `set` — otherwise `validate()` rejects. Under
+`Standard` / `ColocationStrict` the pin applies only while `node` is
+in the resolved set.
+
+### `placement_metadata: BTreeMap<String, String>`
+
+Placement hints for `Standard` / `ColocationStrict`, read as the
+replica artifact's metadata. Ignored by `Pinned`.
+
+- `colocate-with` — a chain's 16-hex origin hash; candidates
+  advertising it (`causal:<hex>`) score above those that don't.
+- `colocate-with-strict` — the same, but required; mandatory for
+  `ColocationStrict`.
+- `intent` — an intent from the default intent registry; candidates
+  that don't satisfy it are excluded.
+
+Bindings: `placementMetadata` (Node), `replication_placement_metadata`
+(Python), `placement_metadata` (C / Go JSON).
 
 ### `on_under_capacity: UnderCapacity`
 
@@ -214,8 +258,9 @@ open_file(channel, cfg with replication=Some(_))
 spawn ReplicationRuntime (tokio task per channel)
     │  ── Idle  (initial)
     ▼
-pinned set includes this node (the runtime checks at start;
-placement-filter selection for Standard is Phase F)
+this node is selected: in the pinned set (checked at start), or in
+the set placement resolves (Standard / ColocationStrict, re-checked
+every heartbeat; a short set waits two announce windows first)
     │
     ▼
 coordinator.transition_to(Replica, CapabilitySelected)
