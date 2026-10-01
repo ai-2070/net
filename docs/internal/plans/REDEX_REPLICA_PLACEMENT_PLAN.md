@@ -132,6 +132,41 @@ placement), `REDEX_DISTRIBUTED_PLAN.md` §4 status.
   the lifecycle's selection step, `leader_pinned` under placement.
   `REDEX_DISTRIBUTED_PLAN.md` §4 notes the built design.
 
+## Second review, 2026-10-01
+
+Three bugs in the replication core, each reproduced by a test that failed
+before its fix:
+
+- **Closing one channel withdrew every channel's advertisement.** All channels
+  on a `Redex` advertise one origin (`causal:<principal>`). Once `close_file`
+  shut runtimes down gracefully (this plan), a closing channel's
+  `* → Idle` withdrew the shared tag while other channels still held it, and
+  their coordinators never noticed. Each coordinator now gets a
+  `ChannelChainSink` that records it as a holder of the origin and withdraws
+  only when the last holder lets go; holders are keyed per runtime, so a
+  channel closed and reopened at once can't lose its new claim to the old
+  runtime's late withdraw. **RED:** `closing_one_channel_keeps_the_shared_origin_advertised`
+  (e2e) failed with "closing A withdrew the tag B still holds".
+- **A non-announcing transition cleared the pending-announce flag.**
+  `transition_to` stored `result.is_err()` on every transition, and
+  `Replica → Candidate` / `Candidate → Replica` never call the sink, so a
+  failed bootstrap announce was forgotten after a lost election. The flag
+  now changes only when the sink was called. **RED:**
+  `non_announcing_transitions_keep_a_failed_announce_pending` (unit).
+- **An aborted runtime leaked its replica-candidate tag.** Off a tokio
+  runtime, a `Redex` dropped without `disable_replication`, or a full
+  priority lane at `cancel()` all abort the task, skipping the graceful
+  withdraw, and the tag stays in the baseline every announce re-sends.
+  `MeshReplicaPlacement` now drops the tag from the baseline when it is
+  dropped (it lives in the task, so an abort drops it too) and re-announces
+  when a runtime is available. **RED:**
+  `an_aborted_runtime_drops_its_replica_candidacy` (e2e).
+
+**GREEN:** redex / gang / dataforts / placement / FFI / chain / heat units
+1500; the replication, dataforts-blob, chain-discovery and gravity e2e
+binaries 33/33 twice; SDK replication tests 6/6; Python `test_redex.py`
+18/18; clippy (three configurations), rustdoc and fmt clean.
+
 ## Risks
 
 - **Views converge, not agree instantly.** Until capability announcements

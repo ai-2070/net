@@ -186,6 +186,32 @@ impl ReplicaSetResolver for MeshReplicaPlacement {
     }
 }
 
+/// The graceful shutdown withdraws candidacy (`withdraw_candidate`), but a
+/// runtime can also be aborted: shut down off a tokio runtime, dropped
+/// with its `Redex` without `disable_replication`, or cancelled with a
+/// full priority lane. The resolver lives in that task, so it is dropped
+/// either way; dropping it takes the tag out of the baseline (every
+/// later announce would otherwise re-send it, and peers would keep
+/// choosing this node as a replica) and, on a runtime, re-announces.
+impl Drop for MeshReplicaPlacement {
+    fn drop(&mut self) {
+        if !self
+            .mesh
+            .forget_replica_candidate(self.channel_id.as_bytes())
+        {
+            return; // withdrawn already (the graceful path) or never announced
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let mesh = self.mesh.clone();
+            rt.spawn(async move {
+                if let Err(e) = mesh.reannounce_current_capabilities().await {
+                    tracing::warn!(error = ?e, "replication: re-announce after dropping candidacy failed");
+                }
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

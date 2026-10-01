@@ -49,6 +49,56 @@ struct ReplicationWiring {
     mesh: Arc<MeshNode>,
     router: Arc<RedexReplicationRouter>,
     metrics: Arc<ReplicationMetricsRegistry>,
+    /// The channels currently advertising this `Redex`'s origin (see
+    /// [`ChannelChainSink`]).
+    origin_holders: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
+}
+
+/// The chain-tag sink a channel's coordinator uses.
+///
+/// Every channel on a `Redex` advertises the same origin
+/// (`causal:<principal>`), so one channel's `withdraw_chain` would remove
+/// the tag the others still need: closing channel A made an active
+/// channel B undiscoverable, and B's coordinator, unaware, never put it
+/// back. This sink records which channels hold the advertisement and
+/// only withdraws when the last one lets go. The lock is held across the
+/// mesh call so an announce can't slip between the holder check and a
+/// withdraw.
+///
+/// Holders are keyed per runtime (`holder`, unique per sink), not per
+/// channel name: a channel closed and reopened at once has two runtimes
+/// for a moment, and the old one's late withdraw must not erase the new
+/// one's claim.
+struct ChannelChainSink {
+    mesh: Arc<MeshNode>,
+    holders: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
+    holder: u64,
+}
+
+/// Source of [`ChannelChainSink::holder`] keys.
+static NEXT_CHAIN_HOLDER: AtomicU64 = AtomicU64::new(0);
+
+#[async_trait::async_trait]
+impl super::ChainTagSink for ChannelChainSink {
+    async fn announce_chain(
+        &self,
+        origin_hash: u64,
+        tip_seq: u64,
+    ) -> Result<(), crate::error::AdapterError> {
+        let mut holders = self.holders.lock().await;
+        holders.insert(self.holder);
+        self.mesh.announce_chain(origin_hash, tip_seq).await
+    }
+
+    async fn withdraw_chain(&self, origin_hash: u64) -> Result<(), crate::error::AdapterError> {
+        let mut holders = self.holders.lock().await;
+        holders.remove(&self.holder);
+        if !holders.is_empty() {
+            // Another channel on this node still advertises the origin.
+            return Ok(());
+        }
+        self.mesh.withdraw_chain(origin_hash).await
+    }
 }
 
 /// Per-channel replication status entry surfaced by
@@ -277,6 +327,7 @@ impl Redex {
             mesh,
             router,
             metrics,
+            origin_holders: Arc::default(),
         }));
     }
 
@@ -772,7 +823,11 @@ impl Redex {
         let coordinator = Arc::new(ReplicationCoordinator::new(
             identity.clone(),
             cfg,
-            wiring.mesh.clone() as Arc<dyn super::ChainTagSink>,
+            Arc::new(ChannelChainSink {
+                mesh: wiring.mesh.clone(),
+                holders: wiring.origin_holders.clone(),
+                holder: NEXT_CHAIN_HOLDER.fetch_add(1, Ordering::Relaxed),
+            }) as Arc<dyn super::ChainTagSink>,
             wiring.metrics.as_ref(),
         ));
 

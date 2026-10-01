@@ -1137,3 +1137,88 @@ async fn colocation_strict_selects_only_holders_of_the_named_chain() {
         r.close_file(&name).ok();
     }
 }
+
+/// Every channel on a `Redex` advertises the same origin (`causal:<origin>`),
+/// so closing one must not withdraw the tag while another still holds it.
+/// Before the per-origin holder count, `close_file(A)` shut A's runtime down
+/// gracefully, its `* → Idle` withdrew the shared tag, and B — still active —
+/// vanished from holder discovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_one_channel_keeps_the_shared_origin_advertised() {
+    let node = build_node().await;
+    node.start();
+    let redex = Redex::new();
+    redex.enable_replication(node.clone());
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::Pinned(vec![node.node_id()])),
+    ));
+    let (a, b) = (cn("repl/shared-a"), cn("repl/shared-b"));
+    redex.open_file(&a, cfg.clone()).expect("open A");
+    redex.open_file(&b, cfg).expect("open B");
+    let coord_b = redex.replication_coordinator_for(&b).unwrap();
+    let origin = coord_b.channel().origin_hash;
+    let self_id = node.node_id();
+    let advertised = || node.find_chain_holders(origin).contains(&self_id);
+    let coord_a = redex.replication_coordinator_for(&a).unwrap();
+    // Both settled (each a set of one, so each elects itself): no later
+    // transition of B's re-announces the tag behind A's back.
+    wait_until(5, "the channels never settled as leaders", || {
+        coord_a.role() == ReplicaRole::Leader && coord_b.role() == ReplicaRole::Leader
+    })
+    .await;
+    wait_until(5, "the shared origin was never advertised", advertised).await;
+    drop(coord_a);
+
+    redex.close_file(&a).expect("close A");
+    // Let A's graceful shutdown (and any withdraw it would issue) land.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_ne!(coord_b.role(), ReplicaRole::Idle, "B is still active");
+    assert!(advertised(), "closing A withdrew the tag B still holds");
+
+    redex.close_file(&b).expect("close B");
+    wait_until(5, "the last holder's close never withdrew the tag", || {
+        !advertised()
+    })
+    .await;
+}
+
+/// A runtime that is aborted rather than shut down (here: the `Redex` is
+/// dropped without `disable_replication`) must not leave its replica-
+/// candidate tag behind. The tag is part of the baseline every later
+/// announce re-sends, so a leaked one kept peers choosing this node as a
+/// replica of a channel it no longer serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_runtime_drops_its_replica_candidacy() {
+    let node = build_node().await;
+    node.start();
+    let redex = Redex::new();
+    redex.enable_replication(node.clone());
+    let name = cn("repl/abandoned");
+    redex
+        .open_file(
+            &name,
+            RedexFileConfig::default().with_replication(Some(
+                ReplicationConfig::new()
+                    .with_factor(1)
+                    .with_heartbeat_ms(150),
+            )),
+        )
+        .expect("open");
+    let cid = net::adapter::net::redex::ChannelId::from_name(&name);
+    wait_until(5, "the node never advertised candidacy", || {
+        node.advertises_replica_candidate(cid.as_bytes())
+    })
+    .await;
+
+    // No disable_replication: dropping the Redex drops its router, whose
+    // runtime handles abort their tasks.
+    drop(redex);
+    wait_until(
+        5,
+        "the aborted runtime left its candidate tag behind",
+        || !node.advertises_replica_candidate(cid.as_bytes()),
+    )
+    .await;
+}

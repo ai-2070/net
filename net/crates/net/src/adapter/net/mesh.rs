@@ -46000,6 +46000,25 @@ impl MeshNode {
         self.announce_capabilities(snapshot).await
     }
 
+    /// Remove the replica-candidate tag for `channel_id` from the
+    /// capability baseline without announcing; returns whether it was
+    /// there. For teardown paths that can't await (a replication runtime
+    /// aborted rather than shut down): the next announce, or a re-announce
+    /// the caller spawns, then carries the baseline without it.
+    pub(crate) fn forget_replica_candidate(&self, channel_id: &[u8; 32]) -> bool {
+        let tag = Self::replica_candidate_tag(channel_id);
+        let Some(_announce_guard) = self.lock_announce_mu() else {
+            return false;
+        };
+        let mut caps = self.user_caps.write();
+        let Some(caps) = caps.as_mut() else {
+            return false;
+        };
+        let before = caps.tags.len();
+        caps.tags.retain(|t| t.to_string() != tag);
+        caps.tags.len() != before
+    }
+
     /// Every node (this one included, once self-indexed) currently
     /// advertising the replica-candidate tag for `channel_id`, sorted
     /// by ascending NodeId. Reads the capability fold; no broadcast.

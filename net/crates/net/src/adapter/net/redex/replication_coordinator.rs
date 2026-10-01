@@ -473,17 +473,25 @@ impl ReplicationCoordinator {
         // on every `* → Idle`.
         let origin = self.channel.origin_hash;
         let is_withdraw = transition.to == ReplicaRole::Idle;
-        let result = match (transition.from, transition.to) {
+        let sink_result = match (transition.from, transition.to) {
             (ReplicaRole::Idle, ReplicaRole::Replica)
             | (ReplicaRole::Candidate, ReplicaRole::Leader) => {
                 let tip = self.tail_seq.load(Ordering::Relaxed);
-                self.sink.announce_chain(origin, tip).await
+                Some(self.sink.announce_chain(origin, tip).await)
             }
-            (_, ReplicaRole::Idle) => self.sink.withdraw_chain(origin).await,
-            _ => Ok(()),
+            (_, ReplicaRole::Idle) => Some(self.sink.withdraw_chain(origin).await),
+            _ => None,
         };
-        self.advertisement_stale
-            .store(result.is_err(), Ordering::Release);
+        // Only a transition that called the sink says anything about the
+        // advertisement. `Replica → Candidate` and the like leave it as it
+        // was: clearing the flag there would forget a failed bootstrap
+        // announce, and a node that then lost the election would stay a
+        // replica the mesh never heard of.
+        if let Some(r) = &sink_result {
+            self.advertisement_stale
+                .store(r.is_err(), Ordering::Release);
+        }
+        let result = sink_result.unwrap_or(Ok(()));
         if let Err(e) = result {
             if is_withdraw {
                 // Local state already flipped to Idle but the
@@ -1016,6 +1024,35 @@ mod tests {
         // In sync now: no further sink calls.
         c.reconcile_advertisement().await;
         assert_eq!(sink.calls().len(), 1);
+    }
+
+    /// A transition that doesn't touch the sink must not clear a pending
+    /// retry: a failed bootstrap announce followed by `Replica →
+    /// Candidate → Replica` (an election lost) still owes the mesh an
+    /// announce.
+    #[tokio::test]
+    async fn non_announcing_transitions_keep_a_failed_announce_pending() {
+        let (sink, _, c) = build_coordinator();
+        sink.arm_failure(AdapterError::Transient("blip".to_string()));
+        c.transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+            .await
+            .expect_err("the announce failed");
+        c.transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
+            .await
+            .unwrap();
+        c.transition_to(ReplicaRole::Replica, TransitionSignal::ElectionLost)
+            .await
+            .unwrap();
+        assert!(c.advertisement_is_stale(), "still owes an announce");
+        c.reconcile_advertisement().await;
+        assert_eq!(
+            sink.calls(),
+            vec![SinkCall::Announce {
+                origin_hash: 0xCAFE_BABE_DEAD_BEEF,
+                tip_seq: 0
+            }]
+        );
+        assert!(!c.advertisement_is_stale());
     }
 
     /// A failed withdraw is retried as a withdraw.
