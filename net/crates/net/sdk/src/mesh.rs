@@ -44,9 +44,13 @@ use serde::Serialize;
 use net::adapter::net::{
     AckReason, ChannelConfig, ChannelConfigRegistry, ChannelName, ChannelPublisher, EntityKeypair,
     MeshNode, MeshNodeConfig, MigrationSubprotocolHandler, PublishConfig, PublishReport, Stream,
-    StreamConfig, StreamStats,
+    StreamConfig, StreamInboundSink, StreamStats,
 };
 use net::adapter::Adapter;
+
+/// Per-stream inbound types: one event with its authenticated sender,
+/// and the pull queue [`Mesh::open_stream_inbox`] returns.
+pub use net::adapter::net::{StreamInboundEvent, StreamInbox};
 use net::event::StoredEvent;
 
 use crate::error::{Result, SdkError};
@@ -110,6 +114,62 @@ pub struct SubscribeOptions {
     /// `token_roots`; the chain is never flattened. Set at most one of
     /// `token` and `chain`.
     pub chain: Option<net::adapter::net::identity::TokenChain>,
+}
+
+/// Returned by [`Mesh::on_stream_data`]. Closing — or dropping — it
+/// stops delivery, and the stream's events go back to the shard queue.
+///
+/// It owns exactly one registration: teardown removes the sink only if
+/// this subscription's registration id still holds the stream, so a
+/// stale handle can never evict a later receiver on the same stream id.
+/// It holds the node weakly — a live subscription never keeps the node
+/// alive — and teardown after the node is gone is a no-op. Deliberately
+/// not `Clone`: one handle, one teardown.
+pub struct StreamDataSubscription {
+    node: std::sync::Weak<MeshNode>,
+    stream_id: u64,
+    registration_id: u64,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl StreamDataSubscription {
+    /// The stream this subscription receives.
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// Whether [`Self::close`] has run.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Stop delivering. Idempotent; `true` only for the call that
+    /// removed this subscription's registration. `false` when already
+    /// closed, when the node is gone, or when the registration no longer
+    /// holds the stream.
+    pub fn close(&self) -> bool {
+        if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return false;
+        }
+        self.node.upgrade().is_some_and(|node| {
+            node.unregister_stream_inbound(self.stream_id, self.registration_id)
+        })
+    }
+}
+
+impl Drop for StreamDataSubscription {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl std::fmt::Debug for StreamDataSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamDataSubscription")
+            .field("stream_id", &self.stream_id)
+            .field("closed", &self.is_closed())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Builder for configuring a [`Mesh`] node.
@@ -1280,6 +1340,54 @@ impl Mesh {
     /// Snapshot stats for every stream in the session to `peer_node_id`.
     pub fn all_stream_stats(&self, peer_node_id: u64) -> Vec<(u64, StreamStats)> {
         self.node.all_stream_stats(peer_node_id)
+    }
+
+    // ---- Per-stream inbound (authenticated sender) ----
+
+    /// A pull-based receiver for every event arriving on `stream_id`,
+    /// from any peer, WITH the authenticated sender — instead of the
+    /// shard queue ([`Self::recv`] / [`Self::recv_shard`]), whose
+    /// [`StoredEvent`]s carry none. Each [`StreamInboundEvent::from_node`]
+    /// is the peer whose installed session decrypted the packet: the
+    /// identity a consumer may authorize on.
+    ///
+    /// At most `capacity` events wait; beyond that an arriving event is
+    /// dropped and counted ([`StreamInbox::dropped`]) rather than
+    /// stalling the receive loop. One receiver per stream id: `None`
+    /// when the stream already has one (an inbox or an
+    /// [`Self::on_stream_data`] subscription).
+    ///
+    /// Closing or dropping the inbox unregisters it, and the stream's
+    /// events go back to the shard queue. The inbox holds the node
+    /// weakly, so it never keeps the node alive.
+    pub fn open_stream_inbox(&self, stream_id: u64, capacity: usize) -> Option<StreamInbox> {
+        self.node.open_stream_inbox(stream_id, capacity)
+    }
+
+    /// Call `handler` for every event arriving on `stream_id`, from any
+    /// peer, WITH the authenticated sender — the push counterpart of
+    /// [`Self::open_stream_inbox`].
+    ///
+    /// `handler` runs **on the mesh's receive path**, once per event, in
+    /// delivery order. It must not block: hand the event to a channel and
+    /// return. Use [`Self::open_stream_inbox`] for anything that can.
+    ///
+    /// One receiver per stream id: `None` when the stream already has
+    /// one. Closing or dropping the returned [`StreamDataSubscription`]
+    /// unregisters exactly this registration — never a later one on the
+    /// same stream — and the stream's events go back to the shard queue.
+    pub fn on_stream_data<F>(&self, stream_id: u64, handler: F) -> Option<StreamDataSubscription>
+    where
+        F: Fn(StreamInboundEvent) + Send + Sync + 'static,
+    {
+        let sink: StreamInboundSink = Arc::new(handler);
+        let registration_id = self.node.register_stream_inbound(stream_id, sink)?;
+        Some(StreamDataSubscription {
+            node: Arc::downgrade(&self.node),
+            stream_id,
+            registration_id,
+            closed: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     // ---- Capability announcements ----

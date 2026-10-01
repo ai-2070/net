@@ -2,8 +2,9 @@
 
 ## Status
 
-Planned, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-No slice has landed yet.
+In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
+S1 and S2 done 2026-10-01 (see each slice). Nothing else is planned here; R2's
+migration and R3 are deferred decisions, not open slices.
 
 Amended 2026-10-01 after review: the R1 design now requires `StreamDataSubscription` to keep core's registration ownership (`Weak<MeshNode>`, unregister by stream id + registration id). S1 gained a stale-handle teardown witness and a no-keep-alive-past-shutdown witness.
 
@@ -185,8 +186,22 @@ already reach them through the `net` crate. Revisit if one gets wired into
     held, `mesh.shutdown()` succeeds. Afterwards, dropping both handles doesn't
     panic, and `close()` returns without effect. This fails if either handle
     holds an `Arc<MeshNode>`.
-- Run it with `cargo tf -p net-mesh-sdk --test stream_inbound` (TESTS.md
-  idiom).
+
+    *Changed during implementation (2026-10-01):* this witness, as written,
+    can't tell `Weak` from `Arc`. Core `MeshNode::shutdown(&self)` succeeds
+    with outstanding `Arc`s; it's the **Node binding's** `shutdown` that fails
+    on them (`Arc::try_unwrap`, `bindings/node/src/lib.rs` ~line 2631). That's
+    where the "a strong reference makes shutdown fail" comment comes from. A
+    background task may also keep the node alive after shutdown, so "close()
+    returns without effect" isn't deterministic either. The witness now
+    reads `Arc::strong_count(mesh.node())` on a never-started node before and
+    after opening each handle; the count must not change. Shutdown with both
+    handles still held, then dropping them, stays in the test as a safety
+    check (no panic), not as the discriminator.
+- Run it with `cargo nextest run -p net-mesh-sdk --features net --test
+  stream_inbound --no-tests=fail --retries 0`. (The first draft said
+  `cargo tf`, which wasn't used: `tf`'s feature list belongs to the root
+  crate, and this binary only needs the SDK's `net` feature.)
 - No `ci.yml` pin is needed: CI's nextest step auto-discovers every
   `sdk/tests/*.rs` (`ci.yml` ~line 2448), and the pin-guard treats `sdk` as
   auto-discovered (`ci.yml` ~line 1212). Gate the test on the `net` feature so
@@ -194,12 +209,47 @@ already reach them through the `net` crate. Revisit if one gets wired into
 - Pre-push: `cargo doc -p net-mesh-sdk --no-deps --features "full rtc-bootstrap"`
   with `-D warnings`, because the new doc comments link core types.
 
+- **Done 2026-10-01.**
+  - `Mesh::open_stream_inbox` and `Mesh::on_stream_data` are in
+    `sdk/src/mesh.rs`. `StreamDataSubscription` is defined there too: `Weak`
+    node, stream id + registration id, idempotent `close()`, `Drop`, not
+    `Clone`.
+  - `StreamInbox` / `StreamInboundEvent` are re-exported from
+    `net_sdk::mesh`, and all three from the crate root (`sdk/src/lib.rs`).
+  - **GREEN:** `sdk/tests/stream_inbound.rs` passes, 6/6, with the nextest
+    command above. The two ownership tests are
+    `a_stale_handle_cannot_evict_its_successor` and
+    `handles_hold_the_node_weakly`.
+  - **RED, by mutation** (each applied to `sdk/src/mesh.rs`, run, then
+    reverted):
+    1. The subscription also holds an `Arc<MeshNode>`.
+       `handles_hold_the_node_weakly` fails with `subscription is weak`,
+       `left: 2, right: 1`.
+    2. `close()` drops the closed guard and removes **any** registration on
+       the stream (it tries `registration_id..registration_id + 8`), i.e.
+       teardown that isn't owned. `a_stale_handle_cannot_evict_its_successor`
+       fails at its repeat-close assertion (`stream_inbound.rs:224`), where the
+       stale handle's second `close()` evicted B and returned `true`.
+  - **Gates:** `fmt.py --check` clean after formatting. `cargo clippy -p
+    net-mesh-sdk --features net --lib -- -D warnings` and the `--tests`
+    variant are clean. `RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-sdk
+    --no-deps --features "full rtc-bootstrap"` is clean; the only output is the
+    existing `panic`-in-bench-profile manifest warning.
+  - **Not run:** the full `net-mesh-sdk` suite and the workspace-wide pre-push
+    checklist. The change is additive (two methods, one type, re-exports), so
+    those are left to CI.
+
 ### S2 — record the R2 rule
 
 - Add the "new binding surface lands in `net_sdk` first" rule to `AGENTS.md`
   (Architecture notes) and to `CONTRIBUTING.md`, citing R1 as the incident.
 - **Proves it:** nothing mechanical. It's a reviewing rule; the next binding
   PR either follows it or says why not.
+- **Done 2026-10-01.** A new `AGENTS.md` subsection under Architecture
+  notes ("New binding surface lands in `net-mesh-sdk` first"), and a new
+  `CONTRIBUTING.md` subsection under Pull requests ("New binding surface goes
+  into the Rust SDK first"). Both cite R1 as the incident and point back at
+  this plan.
 
 ## Risks
 

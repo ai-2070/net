@@ -67,6 +67,20 @@ If an AI agent writes your change, ask it to write the plan first: *"Read
 `docs/internal/plans/README.md`, write the implementation plan as a new file in house-style
 there."*
 
+### New binding surface goes into the Rust SDK first
+
+The Python and Node bindings wrap the core node directly rather than the Rust
+SDK (`net-mesh-sdk`), so a feature added only to a binding leaves the other
+SDKs behind. That has already happened: per-stream receive with the
+authenticated sender shipped in both bindings before the Rust SDK had it.
+
+When you add a user-facing mesh capability, add it to `net-mesh-sdk` first and
+have the binding forward to it. If a binding needs its own shape (for example a
+pull queue that never runs on the receive path, for Python's GIL), add the SDK
+equivalent in the same pull request, or explain in the PR why the SDK shouldn't
+have one. Background:
+[`docs/internal/plans/RUST_SDK_GAPS_PLAN.md`](docs/internal/plans/RUST_SDK_GAPS_PLAN.md).
+
 Useful local checks before pushing (run from `net/crates/net/`):
 
 ```bash

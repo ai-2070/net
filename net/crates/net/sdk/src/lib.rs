@@ -307,7 +307,9 @@ pub use ::net::adapter::net::{
 };
 
 #[cfg(feature = "net")]
-pub use crate::mesh::{Mesh, MeshBuilder, SubscribeOptions};
+pub use crate::mesh::{
+    Mesh, MeshBuilder, StreamDataSubscription, StreamInboundEvent, StreamInbox, SubscribeOptions,
+};
 
 // Raw substrate handle. The SDK's `Mesh` is the ergonomic
 // front-door, but typed RPC clients (`RegistryClient`,
