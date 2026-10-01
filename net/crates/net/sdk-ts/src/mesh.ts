@@ -37,7 +37,12 @@
  */
 
 import { NetMesh as NapiNetMesh } from '@net-mesh/core';
-import type { IslandCriteria, IslandTopologyInput, StoredEvent } from '@net-mesh/core';
+import type {
+  IslandCriteria,
+  IslandTopologyInput,
+  MeshOptions as NapiMeshOptions,
+  StoredEvent,
+} from '@net-mesh/core';
 // The subnet AUTHORITY provider verb (SSDK §3.5). Imported from the
 // low-level package's `./subnet` entry, which classifies the stable
 // `subnet:` envelope; `getNapiMesh` supplies the handle.
@@ -324,7 +329,43 @@ export interface MeshNodeConfig {
    * node exists.
    */
   subnetExports?: SubnetNamedExport[];
+  /**
+   * Pin this node's public reflex to an external `"ip:port"`: NAT
+   * classification is skipped and the node reports `"open"` with this
+   * reflex. For port-forwarded servers. Ignored by a build without
+   * `nat-traversal`.
+   */
+  reflexOverride?: string;
+  /**
+   * Opportunistic UPnP-IGD / NAT-PMP / PCP port mapping at `start()`;
+   * degrades cleanly when no router answers. Ignored by a build without
+   * `port-mapping`.
+   */
+  tryPortMapping?: boolean;
+  /**
+   * Re-handshake relay-routed sessions over a direct path when one
+   * appears, and migrate them. Native default `true`; `false` pins traffic
+   * to the relay. Ignored by a build without `nat-traversal`.
+   */
+  autoDirectUpgrade?: boolean;
+  /**
+   * Install no channel registry. That turns channel authorization off for
+   * **every** channel on this node: any peer may subscribe to any channel.
+   * `publishTools` needs it (its channels are dynamically named); nRPC and
+   * the tool-calling surface do not. Leave it off unless you need it.
+   */
+  permissiveChannels?: boolean;
 }
+
+// Drift guard (NODE_SDK_GAPS_PLAN.md S2). `MeshNode.create` once dropped four
+// native options because nothing tied this interface to the native
+// `MeshOptions`. Now a native field missing here is a compile error that
+// names it: the assignment below fails with that field's name as the type.
+type MissingNativeMeshOptions = Exclude<keyof NapiMeshOptions, keyof MeshNodeConfig>;
+const everyNativeMeshOptionIsDeclared: [MissingNativeMeshOptions] extends [never]
+  ? true
+  : MissingNativeMeshOptions = true;
+void everyNativeMeshOptionIsDeclared;
 
 /**
  * A subnet trust anchor (mesh-construction input). Mirrors
@@ -490,6 +531,10 @@ export class MeshNode {
       subnet: config.subnet,
       subnetPolicy: config.subnetPolicy,
       identitySeed: config.identitySeed,
+      reflexOverride: config.reflexOverride,
+      tryPortMapping: config.tryPortMapping,
+      autoDirectUpgrade: config.autoDirectUpgrade,
+      permissiveChannels: config.permissiveChannels,
       ...subnetOptions,
     });
     return new MeshNode(native);
