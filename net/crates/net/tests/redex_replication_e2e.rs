@@ -75,6 +75,21 @@ fn cn(s: &str) -> ChannelName {
     ChannelName::new(s).unwrap()
 }
 
+/// Wait for the replication runtime to bootstrap a pinned member
+/// `Idle -> Replica`. The runtime does that itself now; a test that
+/// drove the step by hand would race it.
+async fn await_bootstrapped(coord: &net::adapter::net::redex::ReplicationCoordinator) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while coord.role() == ReplicaRole::Idle {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "replication runtime never bootstrapped the channel to Replica"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(coord.role(), ReplicaRole::Replica);
+}
+
 /// Two-node replication round-trip — appends on the leader's
 /// channel surface should land on the replica's local file via the
 /// inbox-driven catch-up cycle. The replica is driven into
@@ -118,10 +133,7 @@ async fn two_node_replication_catches_replica_up() {
     let coord_a = redex_a.replication_coordinator_for(&name).expect("coord A");
     let coord_b = redex_b.replication_coordinator_for(&name).expect("coord B");
     // State-machine path Idle → Replica → Candidate → Leader.
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .expect("A → Replica");
+    await_bootstrapped(&coord_a).await;
     coord_a
         .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
         .await
@@ -130,10 +142,7 @@ async fn two_node_replication_catches_replica_up() {
         .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
         .await
         .expect("A → Leader");
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .expect("B → Replica");
+    await_bootstrapped(&coord_b).await;
     assert_eq!(coord_a.role(), ReplicaRole::Leader);
     assert_eq!(coord_b.role(), ReplicaRole::Replica);
 
@@ -240,10 +249,7 @@ async fn two_node_heartbeat_records_believed_leader() {
 
     // Bring both nodes to participating roles via the
     // state-machine path Idle → Replica → Candidate → Leader.
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_bootstrapped(&coord_a).await;
     coord_a
         .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
         .await
@@ -252,10 +258,7 @@ async fn two_node_heartbeat_records_believed_leader() {
         .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
         .await
         .unwrap();
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_bootstrapped(&coord_b).await;
 
     // Wait for B's coordinator metrics to observe a non-default
     // replica_lag — the gauge gets stamped when on_tick runs while
@@ -312,10 +315,7 @@ async fn leader_close_triggers_replica_election_and_promotion() {
     let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
 
     // Drive A → Leader, B → Replica.
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_bootstrapped(&coord_a).await;
     coord_a
         .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
         .await
@@ -324,10 +324,7 @@ async fn leader_close_triggers_replica_election_and_promotion() {
         .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
         .await
         .unwrap();
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_bootstrapped(&coord_b).await;
 
     // R-41: poll until B has observed at least one leader
     // heartbeat from A, with a hard deadline. Replacing the
@@ -436,10 +433,7 @@ async fn three_node_replication_fans_out_to_every_replica() {
     let coord_c = redex_c.replication_coordinator_for(&name).unwrap();
 
     // Drive: A is Leader; B and C are Replicas.
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_bootstrapped(&coord_a).await;
     coord_a
         .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
         .await
@@ -448,14 +442,8 @@ async fn three_node_replication_fans_out_to_every_replica() {
         .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
         .await
         .unwrap();
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
-    coord_c
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_bootstrapped(&coord_b).await;
+    await_bootstrapped(&coord_c).await;
 
     // Append on A; both B and C must catch up.
     const N: u64 = 24;
@@ -611,10 +599,7 @@ async fn replication_overhead_within_30_percent_budget() {
     // them deterministically.
     let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
     let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_bootstrapped(&coord_a).await;
     coord_a
         .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
         .await
@@ -623,10 +608,7 @@ async fn replication_overhead_within_30_percent_budget() {
         .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
         .await
         .unwrap();
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_bootstrapped(&coord_b).await;
 
     // Warmup so the replication runtime tasks have settled into
     // their steady-state cadence + the mesh handshake is fully
@@ -706,10 +688,7 @@ async fn bandwidth_budget_metric_field_is_plumbed() {
 
     let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
     let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_bootstrapped(&coord_a).await;
     coord_a
         .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
         .await
@@ -718,10 +697,7 @@ async fn bandwidth_budget_metric_field_is_plumbed() {
         .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
         .await
         .unwrap();
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .unwrap();
+    await_bootstrapped(&coord_b).await;
 
     // Drive moderate append load.
     for i in 0..256u64 {
@@ -771,4 +747,162 @@ async fn bandwidth_budget_metric_field_is_plumbed() {
 
     redex_a.close_file(&name).ok();
     redex_b.close_file(&name).ok();
+}
+
+// ============================================================================
+// No hand-driven roles: the runtime bootstraps, elects and replicates.
+// ============================================================================
+//
+// Every test above drives the coordinator through `transition_to`. Before
+// the runtime learned to bootstrap a pinned member and to elect when a
+// replica has never heard from a leader, that was the ONLY way a channel
+// left `Idle`: through the public `Redex` API alone (every binding), a
+// replicated channel sat in `Idle` forever and replicated nothing.
+
+/// Poll until `f` holds, or fail with `what` after `secs`.
+async fn wait_until(secs: u64, what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_pair_elects_the_pinned_leader_and_replicates() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+    let redex_a = Arc::new(Redex::new());
+    let redex_b = Arc::new(Redex::new());
+    redex_a.enable_replication(node_a.clone());
+    redex_b.enable_replication(node_b.clone());
+
+    let name = cn("repl/auto-pinned");
+    let (a_id, b_id) = (node_a.node_id(), node_b.node_id());
+    // B is pinned as leader, the opposite of the RTT ranking's
+    // self-preference on A, so a pass proves `leader_pinned` decides.
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+            .with_leader_pinned(Some(b_id)),
+    ));
+    let file_a = redex_a.open_file(&name, cfg.clone()).expect("open A");
+    let file_b = redex_b.open_file(&name, cfg).expect("open B");
+    let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
+    let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
+
+    wait_until(5, "B never became leader", || {
+        coord_b.role() == ReplicaRole::Leader && coord_a.role() == ReplicaRole::Replica
+    })
+    .await;
+
+    for i in 0..16u32 {
+        file_b.append(format!("event-{i}").as_bytes()).unwrap();
+    }
+    wait_until(5, "A never caught up to the leader", || {
+        file_a.next_seq() == 16
+    })
+    .await;
+    let events = file_a.read_range(0, 16);
+    assert_eq!(events[15].payload.as_ref(), b"event-15");
+    assert_eq!(coord_b.role(), ReplicaRole::Leader, "leadership stayed put");
+
+    redex_a.close_file(&name).ok();
+    redex_b.close_file(&name).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_pair_without_a_pinned_leader_converges_on_one() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+    let redex_a = Arc::new(Redex::new());
+    let redex_b = Arc::new(Redex::new());
+    redex_a.enable_replication(node_a.clone());
+    redex_b.enable_replication(node_b.clone());
+
+    let name = cn("repl/auto-elect");
+    let cfg = RedexFileConfig::default().with_replication(Some(
+        ReplicationConfig::new()
+            .with_heartbeat_ms(150)
+            .with_placement(PlacementStrategy::Pinned(vec![
+                node_a.node_id(),
+                node_b.node_id(),
+            ])),
+    ));
+    let file_a = redex_a.open_file(&name, cfg.clone()).expect("open A");
+    let file_b = redex_b.open_file(&name, cfg).expect("open B");
+    let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
+    let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
+
+    // Each node ranks itself first, so both may win their own election;
+    // the peer-leader rule then concedes one. Wait for a stable split.
+    let one_leader = || {
+        matches!(
+            (coord_a.role(), coord_b.role()),
+            (ReplicaRole::Leader, ReplicaRole::Replica)
+                | (ReplicaRole::Replica, ReplicaRole::Leader)
+        )
+    };
+    wait_until(5, "the pair never settled on one leader", one_leader).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(one_leader(), "leadership flapped after settling");
+
+    let (leader, replica) = if coord_a.role() == ReplicaRole::Leader {
+        (&file_a, &file_b)
+    } else {
+        (&file_b, &file_a)
+    };
+    for i in 0..8u32 {
+        leader.append(format!("event-{i}").as_bytes()).unwrap();
+    }
+    wait_until(5, "the replica never caught up", || replica.next_seq() == 8).await;
+
+    redex_a.close_file(&name).ok();
+    redex_b.close_file(&name).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disable_replication_releases_the_mesh() {
+    let node = build_node().await;
+    let baseline = Arc::strong_count(&node);
+    let redex = Redex::new();
+    redex.enable_replication(node.clone());
+    let name = cn("repl/disable");
+    let file = redex
+        .open_file(
+            &name,
+            RedexFileConfig::default().with_replication(Some(
+                ReplicationConfig::new()
+                    .with_heartbeat_ms(150)
+                    .with_placement(PlacementStrategy::Pinned(vec![node.node_id()])),
+            )),
+        )
+        .expect("open");
+    let coord = redex.replication_coordinator_for(&name).unwrap();
+    await_bootstrapped(&coord).await;
+    assert!(Arc::strong_count(&node) > baseline);
+
+    redex.disable_replication();
+    redex.disable_replication(); // idempotent
+    assert_eq!(redex.replication_runtime_count(), 0);
+    wait_until(2, "the shut-down runtime never withdrew to Idle", || {
+        coord.role() == ReplicaRole::Idle
+    })
+    .await;
+    // The coordinator handle carries its own mesh reference (its
+    // chain-tag sink); only Rust callers can hold one. Release it, then
+    // the runtime task's exit leaves the mesh with no extra owners.
+    drop(coord);
+    wait_until(2, "the Redex still holds the mesh", || {
+        Arc::strong_count(&node) == baseline
+    })
+    .await;
+
+    // The file is still a local log, and replication can come back.
+    file.append(b"local").unwrap();
+    redex.enable_replication(node.clone());
+    assert_eq!(redex.replication_runtime_count(), 0);
 }

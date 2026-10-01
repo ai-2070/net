@@ -279,6 +279,16 @@ pub struct RuntimeInputs {
     /// Default 0.3 via
     /// [`ReplicationConfig::background_fraction`](super::replication_config::ReplicationConfig).
     pub background_fraction: f32,
+    /// Move the channel `Idle → Replica` as soon as the runtime
+    /// starts, and arm the leader wait so the set elects a leader.
+    /// `Redex::open_file` sets it when this node is in a pinned
+    /// replica set; without it a replicated channel never left `Idle`
+    /// outside tests that drive the coordinator by hand.
+    pub bootstrap_replica: bool,
+    /// [`ReplicationConfig::leader_pinned`](super::replication_config::ReplicationConfig):
+    /// when this node is in the set and healthy, the election picks
+    /// it over the RTT ranking.
+    pub leader_pinned: Option<NodeId>,
 }
 
 /// Handle the spawned task produces. Holds the inbox sender so
@@ -743,6 +753,10 @@ async fn run(
     // initial state has had a chance to settle.
     interval.tick().await;
 
+    if inputs.bootstrap_replica && coordinator.role() == ReplicaRole::Idle {
+        bootstrap_replica(&coordinator, &state.tracker).await;
+    }
+
     loop {
         // `biased;` makes tokio::select poll branches top-to-
         // bottom rather than randomly. Priority lane is checked
@@ -856,6 +870,63 @@ fn observe_lag(
 /// (30 s). Under role thrash or rapid leader churn, the soft-cap
 /// GC then evicted entries from OTHER leaders to make room — the
 /// documented invariant on `OutstandingRequests::clear_leader`.
+/// Move a freshly opened channel `Idle → Replica` and arm the leader
+/// wait. The runtime's start-up half of the lifecycle in
+/// `CONFIG_REPLICATION.md` ("pinned set selects this node"); the
+/// leader wait then carries the set through `Candidate` to an
+/// elected leader. A transition rejected because the role moved
+/// meanwhile (a concurrent close, or a caller driving the coordinator
+/// by hand) is left alone.
+async fn bootstrap_replica(
+    coordinator: &Arc<ReplicationCoordinator>,
+    tracker: &Arc<Mutex<HeartbeatTracker>>,
+) {
+    let result = coordinator
+        .transition_to(
+            ReplicaRole::Replica,
+            super::replication_state::TransitionSignal::CapabilitySelected,
+        )
+        .await;
+    match result {
+        Ok(_) | Err(CoordinatorError::TagSink(_)) => {
+            // TagSink: the role moved; only the chain announcement
+            // failed (the coordinator counts the divergence).
+            tracker
+                .lock()
+                .arm_leader_wait(tokio::time::Instant::now().into_std());
+        }
+        Err(CoordinatorError::Transition(e)) => {
+            tracing::debug!(error = ?e, "replication: bootstrap skipped; role already moved");
+        }
+    }
+}
+
+/// The election outcome `leader_pinned` dictates, if it applies: the
+/// pinned node is in the replica set and healthy. `None` falls back
+/// to the RTT-ranked [`election_outcome`].
+fn pinned_leader_outcome(
+    self_node_id: NodeId,
+    replica_set: &[NodeId],
+    leader_pinned: Option<NodeId>,
+    is_healthy: impl Fn(NodeId) -> bool,
+) -> Option<super::replication_step::PendingTransition> {
+    let leader = leader_pinned?;
+    if !replica_set.contains(&leader) || !is_healthy(leader) {
+        return None;
+    }
+    Some(if leader == self_node_id {
+        super::replication_step::PendingTransition {
+            target: ReplicaRole::Leader,
+            signal: super::replication_state::TransitionSignal::ElectionWon,
+        }
+    } else {
+        super::replication_step::PendingTransition {
+            target: ReplicaRole::Replica,
+            signal: super::replication_state::TransitionSignal::ElectionLost,
+        }
+    })
+}
+
 fn clear_leader_belief_and_tokens(
     tracker: &Arc<Mutex<HeartbeatTracker>>,
     outstanding: &Arc<Mutex<OutstandingRequests>>,
@@ -1061,12 +1132,21 @@ async fn on_tick(
             // so self never appears in `healthy_peers` directly.
             // Include self explicitly so the election filter
             // doesn't accidentally exclude us.
-            let elect = election_outcome(
+            let is_healthy = |peer| peer == inputs.self_node_id || healthy.contains(&peer);
+            let elect = pinned_leader_outcome(
                 inputs.self_node_id,
                 &inputs.replica_set,
-                inputs.rtt_lookup.as_ref(),
-                |peer| peer == inputs.self_node_id || healthy.contains(&peer),
-            );
+                inputs.leader_pinned,
+                is_healthy,
+            )
+            .or_else(|| {
+                election_outcome(
+                    inputs.self_node_id,
+                    &inputs.replica_set,
+                    inputs.rtt_lookup.as_ref(),
+                    is_healthy,
+                )
+            });
             if let Some(pt) = elect {
                 match coordinator.transition_to(pt.target, pt.signal).await {
                     Ok(_) => {
@@ -1077,6 +1157,12 @@ async fn on_tick(
                         // the believed leader would leave the
                         // coordinator with no recovery signal.
                         clear_leader_belief_and_tokens(tracker, outstanding);
+                        // Lost: wait for the winner's heartbeats, and
+                        // re-elect if they never come (the winner may
+                        // be down or may itself have conceded).
+                        if pt.target == ReplicaRole::Replica {
+                            tracker.lock().arm_leader_wait(now);
+                        }
                     }
                     Err(CoordinatorError::TagSink(e)) => {
                         // State moved to the target (Leader /
@@ -2009,6 +2095,8 @@ mod tests {
             file: build_file_for_tests(),
             default_bandwidth_class: Default::default(),
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
         }
     }
 
@@ -2469,6 +2557,8 @@ mod tests {
             file: build_file_for_tests(),
             default_bandwidth_class: Default::default(),
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
         };
         let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
         // Promote to Leader via the state machine.
@@ -2542,6 +2632,8 @@ mod tests {
             file: build_file_for_tests(),
             default_bandwidth_class: Default::default(),
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
         };
         let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, peer_id]);
         for (role, signal) in [
@@ -3801,6 +3893,8 @@ mod tests {
             // Non-default class — must round-trip onto the wire.
             default_bandwidth_class: BandwidthClass::Background,
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
         };
         let (coordinator, _registry) = build_coordinator(self_id, vec![self_id, leader_id]);
         coordinator
@@ -3876,6 +3970,8 @@ mod tests {
             file: build_file_for_tests(),
             default_bandwidth_class: BandwidthClass::Foreground,
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
         };
         let cid = inputs.channel_id;
         let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);
@@ -3968,6 +4064,8 @@ mod tests {
             file: build_file_for_tests(),
             default_bandwidth_class: BandwidthClass::Foreground,
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
         };
         let cid = inputs.channel_id;
         let (coordinator, _registry) = build_coordinator(0x10, vec![0x10, 0x20]);

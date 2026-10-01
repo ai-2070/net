@@ -492,7 +492,34 @@ pub unsafe extern "C" fn net_redex_enable_replication(
     };
     // SAFETY: take consumes the guard; subsequent exits no-op on Drop.
     let mesh = unsafe { arc_guard.take() };
+    // Spawns nothing today, but keep every replication entry point on
+    // the FFI runtime: a C / cgo caller's thread has no reactor.
+    let _rt = runtime().enter();
     redex_ref.inner.enable_replication(mesh);
+    0
+}
+
+/// Undo `net_redex_enable_replication`: shut every channel's
+/// replication down (gracefully, on the FFI runtime, withdrawing its
+/// chain advertisement) and release this `Redex`'s reference to the
+/// mesh. Idempotent; open files stay open as local logs.
+///
+/// Returns `0`, `NetError::NullPointer` (`-1`) on a NULL handle, or
+/// `NetError::ShuttingDown` while the `Redex` is in `_free`-quiesce.
+#[cfg(feature = "net")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_redex_disable_replication(redex: *mut RedexHandle) -> c_int {
+    let Some(h) = (unsafe { redex.as_ref() }) else {
+        return NetError::NullPointer.into();
+    };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    // The graceful shutdown is spawned on the current runtime; a C /
+    // cgo caller's thread has none.
+    let _rt = runtime().enter();
+    h.inner.disable_replication();
     0
 }
 
@@ -699,6 +726,7 @@ pub unsafe extern "C" fn net_redex_enable_greedy_dataforts(
     let mesh = unsafe { arc_guard.take() };
     let local_caps = Arc::new(crate::adapter::net::behavior::capability::CapabilitySet::default());
     let registry = crate::adapter::net::behavior::placement::IntentRegistry::defaults();
+    let _rt = runtime().enter();
     match redex_ref
         .inner
         .enable_greedy_dataforts(mesh, cfg, local_caps, registry)
@@ -865,6 +893,8 @@ pub unsafe extern "C" fn net_redex_enable_gravity_for_greedy(
     };
     let (policy, tick) = cfg_json.into_policy_and_tick();
     let mesh = unsafe { arc_guard.take() };
+    // Spawns the gravity tick loop.
+    let _rt = runtime().enter();
     match redex_ref
         .inner
         .enable_gravity_for_greedy(mesh, policy, tick)
@@ -1141,6 +1171,10 @@ pub unsafe extern "C" fn net_redex_open_file(
             Err(_) => return NET_ERR_REDEX,
         }
     }
+    // A replicated channel spawns its replication runtime here; a C /
+    // cgo caller's thread has no tokio reactor, and the spawn panicked
+    // across the FFI boundary. Enter the FFI runtime.
+    let _rt = runtime().enter();
     match redex.inner.open_file(&channel, cfg) {
         Ok(file) => {
             let handle = Box::new(RedexFileHandle {
@@ -5123,6 +5157,45 @@ mod tests {
             net_trigger_engine_free(eng);
             net_workflow_adapter_free(wf);
             net_redex_free(r);
+        }
+    }
+
+    /// A replicated `net_redex_open_file` spawns the channel's
+    /// replication runtime. Called from a plain C / cgo thread, which
+    /// has no tokio reactor, that spawn panicked ("there is no reactor
+    /// running") across the FFI boundary, the same bug the Node and
+    /// Python bindings had. Then `net_redex_disable_replication`
+    /// releases the mesh.
+    ///
+    /// A plain `#[test]` thread is the C caller here: no runtime.
+    #[cfg(feature = "net")]
+    #[test]
+    fn replicated_open_file_from_a_plain_thread_and_disable_replication() {
+        use crate::ffi::mesh::{net_mesh_arc_clone, net_mesh_free, net_mesh_new, net_mesh_node_id};
+        let cfg = CString::new(format!(
+            r#"{{"bind_addr":"127.0.0.1:0","psk_hex":"{}"}}"#,
+            "42".repeat(32)
+        ))
+        .unwrap();
+        let mut mesh = ptr::null_mut();
+        assert_eq!(unsafe { net_mesh_new(cfg.as_ptr(), &mut mesh) }, 0);
+        let node_id = unsafe { net_mesh_node_id(mesh) };
+        let r = redex();
+        unsafe {
+            assert_eq!(net_redex_enable_replication(r, net_mesh_arc_clone(mesh)), 0);
+        }
+        let repl = format!(
+            r#"{{"replication":{{"heartbeat_ms":150,"placement":"pinned","pinned_nodes":[{node_id}]}}}}"#
+        );
+        assert_eq!(open_file(r, "ffi/repl", Some(&repl)), 0);
+        assert_eq!(unsafe { net_redex_replication_runtime_count(r) }, 1);
+
+        assert_eq!(unsafe { net_redex_disable_replication(r) }, 0);
+        assert_eq!(unsafe { net_redex_disable_replication(r) }, 0, "idempotent");
+        assert_eq!(unsafe { net_redex_replication_runtime_count(r) }, 0);
+        unsafe {
+            net_redex_free(r);
+            net_mesh_free(mesh);
         }
     }
 }

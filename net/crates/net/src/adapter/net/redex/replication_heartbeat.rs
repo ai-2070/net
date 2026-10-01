@@ -74,6 +74,14 @@ pub struct HeartbeatTracker {
     /// coordinator clears it on `Replica → Candidate` so the next
     /// election cycle starts clean).
     believed_leader: Option<NodeId>,
+    /// When this replica started waiting for a leader it has never
+    /// heard from. Armed by [`Self::arm_leader_wait`] when the runtime
+    /// puts the channel into `Replica`; disarmed by
+    /// [`Self::clear_believed_leader`]. While armed and no leader is
+    /// believed, [`Self::is_leader_silent`] reports silence once the
+    /// wait reaches the miss threshold, so a freshly bootstrapped
+    /// replica set elects a leader instead of waiting forever.
+    leader_wait_since: Option<Instant>,
 }
 
 impl HeartbeatTracker {
@@ -95,6 +103,7 @@ impl HeartbeatTracker {
             miss_threshold: miss_threshold.max(1),
             peers: BTreeMap::new(),
             believed_leader: None,
+            leader_wait_since: None,
         }
     }
 
@@ -184,8 +193,15 @@ impl HeartbeatTracker {
     ///
     /// Caller drives this on every coordinator tick.
     pub fn is_leader_silent(&self, now: Instant) -> bool {
+        let threshold =
+            Duration::from_millis(self.heartbeat_ms.saturating_mul(self.miss_threshold as u64));
         let Some(leader_id) = self.believed_leader else {
-            return false;
+            // Never heard from a leader: silent only once an armed
+            // wait has run past the threshold. Unarmed (a role set
+            // by hand, or before the runtime bootstraps) stays false.
+            return self
+                .leader_wait_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= threshold);
         };
         let Some(leader) = self.peers.get(&leader_id) else {
             // Believed leader was set but the peer entry was
@@ -194,9 +210,12 @@ impl HeartbeatTracker {
             // slate.
             return true;
         };
-        let threshold =
-            Duration::from_millis(self.heartbeat_ms.saturating_mul(self.miss_threshold as u64));
         now.saturating_duration_since(leader.last_seen) >= threshold
+    }
+
+    /// Start waiting for a leader at `now` (see `leader_wait_since`).
+    pub fn arm_leader_wait(&mut self, now: Instant) {
+        self.leader_wait_since = Some(now);
     }
 
     /// Current believed leader. `None` if no heartbeat with
@@ -213,6 +232,7 @@ impl HeartbeatTracker {
     /// after the local node decided to run an election.
     pub fn clear_believed_leader(&mut self) {
         self.believed_leader = None;
+        self.leader_wait_since = None;
     }
 
     /// Drop a peer from the tracker — disconnect / withdraw /
@@ -283,6 +303,26 @@ mod tests {
 
     fn at(base: Instant, ms: u64) -> Instant {
         base + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn never_heard_leader_is_silent_only_once_an_armed_wait_expires() {
+        let base = t0();
+        let mut t = HeartbeatTracker::new(100);
+        // Unarmed: a replica whose role was set by hand never times out.
+        assert!(!t.is_leader_silent(at(base, 10_000)));
+
+        t.arm_leader_wait(base);
+        assert!(!t.is_leader_silent(at(base, 299)));
+        assert!(
+            t.is_leader_silent(at(base, 300)),
+            "3 x 100 ms with no leader"
+        );
+
+        // Clearing the believed leader (the Replica -> Candidate step)
+        // disarms, so a stale wait can't fire straight after an election.
+        t.clear_believed_leader();
+        assert!(!t.is_leader_silent(at(base, 10_000)));
     }
 
     #[test]

@@ -174,10 +174,7 @@ async fn drive_chunk_roles_for(blob_ref: &BlobRef, redex_a: &Arc<Redex>, redex_b
         let coord_b = redex_b
             .replication_coordinator_for(&channel)
             .expect("coord B");
-        coord_a
-            .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-            .await
-            .expect("A → Replica");
+        await_bootstrapped(&coord_a).await;
         coord_a
             .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
             .await
@@ -186,10 +183,7 @@ async fn drive_chunk_roles_for(blob_ref: &BlobRef, redex_a: &Arc<Redex>, redex_b
             .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
             .await
             .expect("A → Leader");
-        coord_b
-            .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-            .await
-            .expect("B → Replica");
+        await_bootstrapped(&coord_b).await;
     }
 }
 
@@ -268,6 +262,21 @@ fn pinned_replication_cfg(a_id: u64, b_id: u64) -> ReplicationConfig {
     ReplicationConfig::new()
         .with_heartbeat_ms(150)
         .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+}
+
+/// Wait for the replication runtime to bootstrap a pinned member
+/// `Idle -> Replica`. The runtime does that itself now; a test that
+/// drove the step by hand would race it.
+async fn await_bootstrapped(coord: &net::adapter::net::redex::ReplicationCoordinator) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while coord.role() == ReplicaRole::Idle {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "replication runtime never bootstrapped the channel to Replica"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(coord.role(), ReplicaRole::Replica);
 }
 
 /// A stores a blob; B prefetches it; B reads back the original
@@ -788,10 +797,7 @@ async fn three_node_parallel_migration_lands_blob_on_two_peers() {
     let coord_c = redex_c
         .replication_coordinator_for(&channel)
         .expect("coord C");
-    coord_a
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .expect("A → Replica");
+    await_bootstrapped(&coord_a).await;
     coord_a
         .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
         .await
@@ -800,14 +806,8 @@ async fn three_node_parallel_migration_lands_blob_on_two_peers() {
         .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
         .await
         .expect("A → Leader");
-    coord_b
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .expect("B → Replica");
-    coord_c
-        .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-        .await
-        .expect("C → Replica");
+    await_bootstrapped(&coord_b).await;
+    await_bootstrapped(&coord_c).await;
 
     // Both B and C should converge their chunk files to seq=1
     // (the Small blob is one event). Use a generous deadline

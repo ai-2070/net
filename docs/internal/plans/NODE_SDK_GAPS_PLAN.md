@@ -4,8 +4,8 @@
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/node-sdk`
 (the plan was written on `LZL0/python-sdk`, merged as #1133). S1–S8 done 2026-10-01
-(see each slice). S8 surfaced two core replication gaps (C1, C2 under S8)
-that are open and need a decision before they are fixed.
+(see each slice), including the two core replication gaps S8 surfaced (C1,
+C2), fixed the same day.
 
 **Checked before starting, 2026-10-01:** the two bug classes the Python work
 found don't apply here. The Node `poll` already sweeps every shard through
@@ -619,7 +619,8 @@ check the floor.
   on one node is readable on the other, and the guard's RED on today's
   `Redex`.
 
-- **Done 2026-10-01, with two core gaps left open (C1, C2 below).**
+- **Done 2026-10-01.** C1 and C2 below were found here and fixed after
+  (see "C1 and C2, fixed").
   - **SDK:** the nine methods are on `Redex`, taking a `MeshNode` or the
     native mesh (resolved through a new `_internal.napiMeshOf`, so
     `cortex.ts` doesn't import `mesh.ts` at runtime). `RedexFileConfig`
@@ -686,6 +687,87 @@ check the floor.
       refused while it lives (Python's shutdown doesn't need sole
       ownership and is unaffected). The S8 replication test doesn't shut
       its node down for this reason.
+
+- **C1 and C2, fixed 2026-10-01.**
+  - **C1, core** (`redex/replication_runtime.rs`, `replication_heartbeat.rs`,
+    `manager.rs`):
+    - *Bootstrap.* `RuntimeInputs` gained `bootstrap_replica`, which
+      `open_file` sets when this node is in the pinned replica set. The
+      runtime then moves `Idle → Replica` (`CapabilitySelected`, which
+      announces the chain) when it starts. `Standard` /
+      `ColocationStrict` still start with an empty set and stay `Idle`;
+      that is the documented Phase F gap, and the doc now says plainly
+      that they replicate nothing yet.
+    - *Leader wait.* `HeartbeatTracker::is_leader_silent` was `false`
+      whenever no leader had ever been heard, so a bootstrapped replica
+      would still never elect. The tracker now has an armed wait,
+      started on bootstrap and on losing an election. With no believed
+      leader, an expired wait (3 heartbeats) reads as silence and the
+      replica runs the existing `Candidate` → election path.
+      `clear_believed_leader` disarms it, so a stale wait can't fire
+      straight after an election.
+    - *`leader_pinned`.* It was validated and documented ("the election
+      picks `node` whenever it's healthy") but never read. It is now
+      `RuntimeInputs.leader_pinned`, and the election returns it when
+      it's in the set and healthy, before the RTT ranking.
+    - Without a pinned leader each node ranks itself first, so both may
+      win; the existing peer-leader rule concedes one. The test below
+      checks the pair settles and stays settled.
+  - **C2, core:** `Redex::disable_replication()`. It unregisters every
+    channel runtime, drops the wiring (whose `Drop` uninstalls the
+    router from the mesh) and with it the `Arc<MeshNode>`. Dropping a
+    runtime handle *aborts* its task, skipping the `Idle` transition and
+    the chain withdrawal, so inside a tokio runtime it hands the handles
+    to a task that awaits each graceful `cancel()`; outside one, it
+    falls back to the abort. Exposed as `disableReplication()` (Node
+    binding and TS SDK), `disable_replication()` (Python, with the
+    `.pyi` stub), and `net_redex_disable_replication` (C ABI, plus
+    `Redex.DisableReplication` in the reference cgo wrapper
+    `bindings/go/net/redex.go`; the `go/` module exposes no replication
+    at all). Each binding enters the mesh / FFI runtime so the
+    graceful path runs.
+  - **Bug found and fixed (C ABI):** the same no-reactor panic as Node
+    and Python. `net_redex_open_file` on a replicated channel, called
+    from a C / cgo thread, panicked across the `extern "C"` boundary.
+    It and the replication / greedy / gravity entry points now enter the
+    FFI's process-wide runtime.
+  - **Stubs:** the Python `Redex` stub lacked the whole replication and
+    greedy surface and `open_file`'s eight `replication*` kwargs, which
+    the stub-drift tests don't cover for this class; now stubbed.
+  - **Docs:** `CONFIG_REPLICATION.md`'s quick start and binding
+    examples used `Standard` placement, which replicates nothing; they
+    now use `Pinned`. The lifecycle shows the leader wait and the
+    election rules, and a new "Turning replication off" section covers
+    `disable_replication`. The Node example also dropped a needless
+    `await` (`openFile` is sync).
+  - **Tests:**
+    - `tests/redex_replication_e2e.rs`, three new tests with no
+      hand-driven roles: a pinned pair elects the pinned leader (B,
+      against A's self-preference) and replicates 16 events; a pair
+      without a pinned leader settles on exactly one and stays settled
+      (600 ms), then replicates; `disable_replication` (twice) leaves
+      no runtimes, the runtime withdraws to `Idle`, the mesh's strong
+      count returns to baseline, and the file still appends.
+    - The 18 hand-driven `Idle → Replica` steps in
+      `redex_replication_e2e.rs` (13) and `dataforts_blob_e2e.rs` (5)
+      now wait for the bootstrap instead: driving it by hand raced the
+      runtime (6 of 12 tests failed on that race).
+    - `replication_heartbeat` unit test for the armed wait.
+    - `ffi::cortex` test: replicated `open_file` from a plain thread,
+      then disable. **RED:** the no-reactor panic.
+    - sdk-ts `redex_replication.test.ts`: two-node replication through
+      the SDK, and shutdown succeeding after `disableReplication`.
+      Python: the same pair test plus a disable test.
+  - **RED** by mutation, each against the e2e binary: bootstrap off →
+    every test that waits for it fails, both auto tests included;
+    `leader_pinned` ignored → the pinned-leader test fails; leader wait
+    off → both auto tests fail.
+  - **GREEN:** core units **5942 passed**; redex 478 and dataforts 644
+    units; the two e2e binaries 15/15, three runs in a row; `ffi::cortex`
+    26/26; sdk-ts 663; Python 260 (incl. the stub-drift tests);
+    package smoke test. Clippy strict (`--all-features`, default,
+    `--no-default-features`), all-targets, both bindings' ffi-clippy
+    lists, root and `net-python` rustdoc, and fmt are clean.
 
 ## Risks
 

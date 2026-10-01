@@ -43,17 +43,23 @@ let redex = Arc::new(Redex::new());
 // Idempotent — safe to call from multiple call sites.
 redex.enable_replication(mesh.clone());
 
-// Open a replicated channel. The same RedexFileConfig (with
-// matching ReplicationConfig) should be used on every node that
-// hosts a replica.
+// Open a replicated channel with the SAME config on every node in
+// the replica set. Each listed node bootstraps itself as a replica
+// and the set elects a leader (the pinned one, if healthy) within a
+// few heartbeats; append on the leader.
 let cfg = RedexFileConfig::default()
     .with_replication(Some(
         ReplicationConfig::new()
-            .with_factor(3)
-            .with_heartbeat_ms(500),
+            .with_heartbeat_ms(500)
+            .with_placement(PlacementStrategy::Pinned(vec![node_a, node_b, node_c]))
+            .with_leader_pinned(Some(node_a)),
     ));
 let file = redex.open_file(&channel_name, cfg)?;
 ```
+
+Use `Pinned` placement today: `Standard` and `ColocationStrict` start
+with an empty replica set, so their channels stay `Idle` and replicate
+nothing until Phase F lands placement (see `placement` below).
 
 `enable_replication` installs a per-`Redex` router on the mesh's
 `SUBPROTOCOL_REDEX` inbound dispatch; subsequent `open_file` calls
@@ -71,23 +77,25 @@ is exposed as methods on the binding's `Redex` handle.
 - **Node** (`@net-mesh/core`):
   ```ts
   redex.enableReplication(mesh);
-  await redex.openFile("my/channel", {
-    replication: { factor: 3, heartbeatMs: 500n, placement: "standard" },
+  redex.openFile("my/channel", {
+    replication: { heartbeatMs: 500n, placement: "pinned", pinnedNodes: [a, b, c] },
   });
   ```
 - **Python** (`net`):
   ```python
   redex.enable_replication(mesh)
   redex.open_file("my/channel",
-                  replication=True, replication_factor=3,
-                  replication_heartbeat_ms=500)
+                  replication=True, replication_heartbeat_ms=500,
+                  replication_placement="pinned",
+                  replication_pinned_nodes=[a, b, c])
   ```
 - **Go** (cgo wrapper at `bindings/go/net/redex.go`):
   ```go
   redex.EnableReplication(meshArcPtr)
   redex.OpenFile("my/channel", &net.RedexFileConfig{
       Replication: &net.ReplicationConfig{
-          Factor: 3, HeartbeatMs: 500, Placement: net.PlacementStandard,
+          HeartbeatMs: 500, Placement: net.PlacementPinned,
+          PinnedNodes: []uint64{a, b, c},
       },
   })
   ```
@@ -129,10 +137,11 @@ Where replicas live and how they're chosen. Three options:
   with insufficient coverage.
 
 **Phase F gap**: `Standard` and `ColocationStrict` currently
-bootstrap with an empty replica set; the placement filter's
-re-selection on roster change lands with Phase F. Until then, use
-`Pinned` for production channels where you need deterministic
-membership.
+bootstrap with an empty replica set, so their channels stay `Idle`
+and replicate nothing; the placement filter's selection on roster
+change lands with Phase F. Until then, use `Pinned`: each listed
+node joins as a replica when it opens the channel, and the set
+elects a leader.
 
 ### `heartbeat_ms: u64`
 
@@ -205,11 +214,19 @@ open_file(channel, cfg with replication=Some(_))
 spawn ReplicationRuntime (tokio task per channel)
     │  ── Idle  (initial)
     ▼
-placement filter / pinned set selects this node
+pinned set includes this node (the runtime checks at start;
+placement-filter selection for Standard is Phase F)
     │
     ▼
 coordinator.transition_to(Replica, CapabilitySelected)
-    │  ── Replica  (advertises causal:<hex> capability tag)
+    │  ── Replica  (advertises causal:<hex> capability tag;
+    │               starts waiting for a leader)
+    ▼
+no leader heard within 3 × heartbeat_ms → Candidate → election
+    │  (leader_pinned wins when healthy; otherwise lowest RTT, and
+    │   self ranks first, so two may win: a leader that hears a peer
+    │   leader with a higher tail, or the same tail and a lower
+    │   node id, concedes to Replica)
     ▼
 heartbeat loop:
   - Leader emits heartbeats every heartbeat_ms
@@ -233,6 +250,22 @@ close_file(channel)
     ▼
 coordinator.transition_to(Idle, ChannelClose) + router unregisters
 ```
+
+## Turning replication off
+
+`Redex::disable_replication()` undoes `enable_replication`: every
+channel's runtime is unregistered and shut down, the router comes off
+the mesh, and the `Redex` drops its `Arc<MeshNode>`. Idempotent. Open
+files stay open as local logs; a later `enable_replication` installs
+fresh wiring, and channels opened before it stay unreplicated until
+reopened. Inside a tokio runtime each channel shuts down gracefully
+in a spawned task (withdrawing its chain advertisement on the way to
+`Idle`); outside one, the runtime tasks are aborted.
+
+Bindings: `redex.disableReplication()` (Node), `redex.disable_replication()`
+(Python). Call it before `NetMesh.shutdown()` in Node, which needs the
+node's only reference; dropping the `Redex` also releases it, but in
+JS only when the garbage collector gets to it.
 
 ## Observability
 

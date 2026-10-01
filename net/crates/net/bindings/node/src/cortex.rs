@@ -283,6 +283,24 @@ impl Redex {
         ))
     }
 
+    /// Undo `enableReplication`: shut down every channel's replication
+    /// (gracefully, withdrawing its chain advertisement) and release this
+    /// manager's reference to the mesh, so `NetMesh.shutdown()` can take
+    /// sole ownership. Idempotent. Open files stay open as local logs.
+    #[cfg(feature = "net")]
+    #[napi]
+    pub fn disable_replication(&self) {
+        // The graceful shutdown is spawned on the current runtime; the
+        // JS thread has none, so enter the mesh's.
+        let _enter = self.enter_runtime();
+        self.inner.disable_replication();
+    }
+
+    /// No-op without the `net` feature: replication can't be enabled.
+    #[cfg(not(feature = "net"))]
+    #[napi]
+    pub fn disable_replication(&self) {}
+
     /// Count of per-channel replication runtimes currently registered
     /// on this manager. `0` when replication isn't enabled. Useful
     /// for tests + operator observability.

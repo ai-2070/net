@@ -487,6 +487,21 @@ impl PyRedex {
     /// Count of per-channel replication runtimes currently registered
     /// on this manager. `0` when replication isn't enabled. Useful
     /// for tests and operator observability.
+    /// Undo `enable_replication`: shut down every channel's replication
+    /// (gracefully, withdrawing its chain advertisement) and release the
+    /// mesh. Idempotent. Open files stay open as local logs.
+    #[cfg(feature = "net")]
+    fn disable_replication(&self) {
+        // Enter the mesh runtime so the core spawns the graceful
+        // shutdown there instead of aborting the runtime tasks.
+        let _enter = self.mesh_runtime.get().map(|rt| rt.enter());
+        self.inner.disable_replication();
+    }
+
+    /// No-op without the `net` feature: replication can't be enabled.
+    #[cfg(not(feature = "net"))]
+    fn disable_replication(&self) {}
+
     fn replication_runtime_count(&self) -> u32 {
         self.inner.replication_runtime_count() as u32
     }

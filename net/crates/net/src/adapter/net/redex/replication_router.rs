@@ -310,6 +310,8 @@ mod tests {
             file,
             default_bandwidth_class: Default::default(),
             background_fraction: 0.3,
+            bootstrap_replica: false,
+            leader_pinned: None,
         };
         let budget = Arc::new(Mutex::new(BandwidthBudget::new(
             0.5,

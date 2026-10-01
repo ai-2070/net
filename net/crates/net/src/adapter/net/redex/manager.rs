@@ -251,6 +251,52 @@ impl Redex {
         }));
     }
 
+    /// Uninstall the wiring [`Self::enable_replication`] installed.
+    /// Idempotent; a no-op when replication isn't enabled.
+    ///
+    /// Every per-channel replication runtime is unregistered and shut
+    /// down, the inbound router is removed from the mesh, and the
+    /// manager drops its `Arc<MeshNode>`. Called inside a tokio runtime,
+    /// each channel shuts down gracefully in a spawned task, withdrawing
+    /// its chain advertisement on the way to `Idle`; the runtime tasks'
+    /// own mesh references go when they finish, shortly after this
+    /// returns. Called outside one, the tasks are aborted instead. Open files stay open as
+    /// local logs. A later `enable_replication` installs fresh wiring;
+    /// channels opened before it stay unreplicated until reopened.
+    ///
+    /// Without this, only dropping the `Redex` released the mesh, so a
+    /// binding whose node shutdown needs sole ownership of the
+    /// `Arc<MeshNode>` (Node's) couldn't shut down while the `Redex`
+    /// lived.
+    pub fn disable_replication(&self) {
+        let Some(wiring) = self.replication.write().take() else {
+            return;
+        };
+        let handles: Vec<_> = wiring
+            .router
+            .snapshot_handles()
+            .into_iter()
+            .filter_map(|(channel_id, _)| wiring.router.unregister(&channel_id))
+            .collect();
+        // `ReplicationWiring::drop` uninstalls the router from the mesh.
+        drop(wiring);
+        // Shut each runtime down gracefully: `cancel` sends `Shutdown`
+        // and awaits the task, which withdraws the channel's chain
+        // advertisement on its way to `Idle`. Dropping a handle instead
+        // aborts the task and skips both. Off a runtime there is
+        // nothing to await on, so fall back to that abort path.
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    for handle in handles {
+                        handle.cancel().await;
+                    }
+                });
+            }
+            Err(_) => drop(handles),
+        }
+    }
+
     /// Install greedy-LRU wiring rooted at `mesh`. Validates the
     /// supplied [`super::super::dataforts::GreedyConfig`], builds
     /// a [`super::super::dataforts::GreedyRuntime`] that opens
@@ -654,6 +700,7 @@ impl Redex {
             };
 
         let heartbeat_ms = cfg.heartbeat_ms;
+        let leader_pinned = cfg.leader_pinned;
         let budget_fraction = cfg.replication_budget_fraction;
         // v0.3 Phase D2: snapshot the bandwidth-class config
         // before `cfg` moves into the coordinator below.
@@ -682,6 +729,7 @@ impl Redex {
         ));
 
         let self_node_id = wiring.mesh.node_id();
+        let replica_set_has_self = replica_set.contains(&self_node_id);
         let proximity = wiring.mesh.proximity_graph().clone();
         let rtt_lookup: super::replication_runtime::RttLookup = Arc::new(
             move |node: crate::adapter::net::behavior::placement::NodeId| {
@@ -724,6 +772,11 @@ impl Redex {
             // above before `cfg` moved into the coordinator).
             default_bandwidth_class,
             background_fraction,
+            // Only a pinned set names its members up front; Standard /
+            // ColocationStrict start with an empty set (Phase F) and
+            // stay `Idle`.
+            bootstrap_replica: replica_set_has_self,
+            leader_pinned,
         };
 
         let handle = Arc::new(spawn_replication_runtime(

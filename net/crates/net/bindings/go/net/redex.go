@@ -101,6 +101,7 @@ typedef struct ArcMeshNode ArcMeshNode;
 extern RedexHandle* net_redex_new(const char* persistent_dir);
 extern void net_redex_free(RedexHandle* handle);
 extern int net_redex_enable_replication(RedexHandle* redex, ArcMeshNode* mesh_arc);
+extern int net_redex_disable_replication(RedexHandle* redex);
 extern uint32_t net_redex_replication_runtime_count(const RedexHandle* redex);
 extern char* net_redex_replication_prometheus_text(const RedexHandle* redex);
 
@@ -488,6 +489,23 @@ func (r *Redex) EnableGreedyDataforts(meshArcPtr unsafe.Pointer, config *GreedyC
 	)
 	if rc != 0 {
 		return fmt.Errorf("%w: enable_greedy_dataforts failed (rc=%d)", ErrRedex, int(rc))
+	}
+	return nil
+}
+
+// DisableReplication undoes EnableReplication: every channel's
+// replication shuts down (withdrawing its chain advertisement) and the
+// Redex releases its reference to the mesh. Idempotent; open files stay
+// open as local logs.
+func (r *Redex) DisableReplication() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle == nil {
+		return fmt.Errorf("%w: redex handle already closed", ErrRedex)
+	}
+	rc := C.net_redex_disable_replication(r.handle)
+	if rc != 0 {
+		return fmt.Errorf("%w: disable_replication failed (rc=%d)", ErrRedex, int(rc))
 	}
 	return nil
 }

@@ -10,6 +10,8 @@ import time
 
 import pytest
 
+import net
+
 from net import Redex, RedexError, RedexEvent, RedexFile
 
 
@@ -197,5 +199,67 @@ def test_replicated_open_file_runs_on_the_mesh_runtime():
         assert r.replication_runtime_count() == 1
         assert 'channel="py/repl"' in r.replication_prometheus_text()
         assert file.append(b"x") == 0
+    finally:
+        mesh.shutdown()
+
+
+def _wait_for(what, predicate, timeout=8.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            pytest.fail(f"timed out: {what}")
+        time.sleep(0.05)
+
+
+def test_replicated_channel_reaches_the_other_node(mesh_pair):
+    """A pinned pair bootstraps, elects the pinned leader and replicates.
+
+    Before the runtime bootstrapped pinned members, a replicated channel
+    never left ``Idle`` unless a test drove the coordinator by hand, so
+    nothing crossed nodes through this API.
+    """
+    a, b = mesh_pair
+    ra, rb = Redex(), Redex()
+    ra.enable_replication(a)
+    rb.enable_replication(b)
+    kwargs = dict(
+        replication=True,
+        replication_heartbeat_ms=150,
+        replication_placement="pinned",
+        replication_pinned_nodes=[a.node_id, b.node_id],
+        replication_leader_pinned=a.node_id,
+    )
+    fa = ra.open_file("py/repl-pair", **kwargs)
+    fb = rb.open_file("py/repl-pair", **kwargs)
+    _wait_for(
+        "A elected leader",
+        lambda: 'dataforts_leader_changes_total{channel="py/repl-pair"} 1'
+        in ra.replication_prometheus_text(),
+    )
+    for i in range(8):
+        fa.append(f"event-{i}".encode())
+    _wait_for("B caught up", lambda: len(fb.read_range(0, 8)) == 8)
+    assert bytes(fb.read_range(7, 8)[0].payload) == b"event-7"
+    ra.disable_replication()
+    rb.disable_replication()
+
+
+def test_disable_replication_stops_every_channel_runtime():
+    mesh = net.NetMesh("127.0.0.1:0", "7a" * 32)
+    try:
+        r = Redex()
+        r.enable_replication(mesh)
+        f = r.open_file(
+            "py/repl-off",
+            replication=True,
+            replication_placement="pinned",
+            replication_pinned_nodes=[mesh.node_id],
+        )
+        assert r.replication_runtime_count() == 1
+        r.disable_replication()
+        r.disable_replication()  # idempotent
+        assert r.replication_runtime_count() == 0
+        assert r.replication_prometheus_text() == ""
+        assert f.append(b"still a local log") == 0
     finally:
         mesh.shutdown()
