@@ -17,7 +17,7 @@ Example::
 
     import net_sdk.transport as transport
     from net_sdk import MeshNode
-    from net_sdk.dataforts import MeshBlobAdapter  # storage side
+    from net_sdk.blob import MeshBlobAdapter  # storage side
 
     transport.serve_blob_transfer(mesh, adapter)   # install once
     data = transport.fetch_blob(mesh, holder_id, blob_ref)
@@ -28,25 +28,43 @@ built with the ``dataforts`` Cargo feature.
 
 from __future__ import annotations
 
-try:
-    from net import (  # type: ignore[attr-defined]
-        TransferControl,
-        TransferError,
-        TransferHeader,
-        fetch_blob,
-        fetch_blob_discovered,
-        fetch_dir,
-        is_transfer_stream_id,
-        next_transfer_stream_id,
-        serve_blob_transfer,
-        store_dir,
-        transfer_stream_id,
-    )
-except ImportError as e:  # pragma: no cover — surface a clean message
+import net  # noqa: E402 — a failure HERE is a real load error (no `_net`,
+# a bad linked library): it surfaces unchanged, never as "missing feature".
+
+_REQUIRED = (
+    "TransferControl",
+    "TransferError",
+    "TransferHeader",
+    "fetch_blob",
+    "fetch_blob_discovered",
+    "fetch_dir",
+    "is_transfer_stream_id",
+    "next_transfer_stream_id",
+    "serve_blob_transfer",
+    "store_dir",
+    "transfer_stream_id",
+)
+_missing = [name for name in _REQUIRED if not hasattr(net, name)]
+if _missing:  # pragma: no cover — the extension loaded; the feature did not
     raise ImportError(
         "Transport SDK symbols not present in `net._net`. Rebuild the wheel "
         "with `--features dataforts`, e.g. `maturin develop --features dataforts`."
-    ) from e
+        f" Missing: {', '.join(_missing)}."
+    )
+
+from net import (  # type: ignore[attr-defined]  # noqa: E402
+    TransferControl,
+    TransferError,
+    TransferHeader,
+    fetch_blob,
+    fetch_blob_discovered,
+    fetch_dir,
+    is_transfer_stream_id,
+    next_transfer_stream_id,
+    serve_blob_transfer,
+    store_dir,
+    transfer_stream_id,
+)
 
 
 __all__ = [

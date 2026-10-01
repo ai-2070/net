@@ -350,7 +350,7 @@ target = node.find_best_node({
 ```
 
 **Key facts:**
-- Capability surface lives on the **native** `_net.NetMesh` PyO3 class — `from net import NetMesh`. The `net_sdk.MeshNode` wrapper does not re-export these methods today; reach through `mesh._native` if you're already holding a wrapper.
+- Capability surface is on `net_sdk.MeshNode` (`announce_capabilities`, `find_nodes(_scoped)`, `find_best_node(_scoped)`, `capability_aggregate`, `capability_capacity_ranking`), forwarding to the native `net.NetMesh` PyO3 class.
 - POJO shape is `dict`s with `snake_case` keys (mirrors the C/Go JSON contract). Source: `net/crates/net/bindings/python/src/capabilities.rs`.
 - `find_best_node(requirement)` takes `{"filter": {...}, "prefer_more_memory": …, "prefer_more_vram": …, "prefer_faster_inference": …, "prefer_loaded_models": …}` — every key optional — and returns `int | None`. Local and synchronous.
 - Weights must be **finite**: `nan` / `inf` raise `ValueError`, a non-numeric weight raises `TypeError`. Finite values outside `[0.0, 1.0]` are clamped by the substrate.

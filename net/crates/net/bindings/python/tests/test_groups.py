@@ -200,7 +200,10 @@ def test_replica_group_spawn_unknown_kind_errors_factory_not_found() -> None:
 def test_replica_group_invalid_seed_errors() -> None:
     rt, mesh = _runtime_with_peers(2)
     try:
-        with pytest.raises(DaemonError) as exc_info:
+        # A GroupError, so `except GroupError:` catches it. It used to be the
+        # base DaemonError, which slipped past that handler even though its
+        # message (and group_error_kind) said invalid-config.
+        with pytest.raises(GroupError) as exc_info:
             ReplicaGroup.spawn(
                 rt,
                 "noop",
@@ -208,10 +211,27 @@ def test_replica_group_invalid_seed_errors() -> None:
                 group_seed=b"too-short",
                 lb_strategy="round-robin",
             )
-        # Invalid-config may surface as GroupError or the base
-        # DaemonError depending on where the check fires. The
-        # important thing is the message identifies the cause.
         assert "group_seed must be 32 bytes" in str(exc_info.value)
+        assert group_error_kind(exc_info.value) == "invalid-config"
+        assert isinstance(exc_info.value, DaemonError)  # still a DaemonError
+    finally:
+        rt.shutdown()
+        mesh.shutdown()
+
+
+def test_replica_group_unknown_strategy_raises_group_error() -> None:
+    rt, mesh = _runtime_with_peers(2)
+    try:
+        with pytest.raises(GroupError) as exc_info:
+            ReplicaGroup.spawn(
+                rt,
+                "noop",
+                replica_count=2,
+                group_seed=_seed(0x44),
+                lb_strategy="roundrobin",  # the typo the docs warn about
+            )
+        assert "unknown lb strategy 'roundrobin'" in str(exc_info.value)
+        assert group_error_kind(exc_info.value) == "invalid-config"
     finally:
         rt.shutdown()
         mesh.shutdown()

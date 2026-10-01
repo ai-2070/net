@@ -1,36 +1,43 @@
 ## Move it — Python
 
-The transfer functions live in `net_sdk.transport` and take the **native** mesh
-handle first.
+The transfer verbs are methods on the node; the adapter and `BlobRef` types
+are in `net_sdk.blob`. (The same functions also exist module-level in
+`net_sdk.transport`, taking the native handle first.)
 
 ```python
-from net_sdk import transport
+from net import Redex
+from net_sdk.blob import MeshBlobAdapter
 
-native = node._native
+adapter = MeshBlobAdapter(Redex(), "my-node")
 ```
 
 ### The import can fail, and the message tells you why
 
 ```python
-ImportError: Transport SDK symbols not present in `net._net`. Rebuild the wheel
+ImportError: Blob SDK symbols not present in `net._net`. Rebuild the wheel
 with `--features dataforts`, e.g. `maturin develop --features dataforts`.
 ```
 
-`net_sdk.transport` re-exports from `net`, and raises this at import time when the
-wheel was built without the `dataforts` feature. It is the clearest feature-gate
+`net_sdk.blob` (and `net_sdk.transport`, with "Transport" in place of "Blob")
+re-export from `net`, and raise this at import time when the wheel was built
+without the `dataforts` feature. It is the clearest feature-gate
 message in any binding — treat it as instructions rather than a broken install.
 
 ### Install, then fetch
 
 ```python
-transport.serve_blob_transfer(native, adapter)              # once per node
+node.serve_blob_transfer(adapter)                 # once per node — fetchers too
 
-data = transport.fetch_blob(native, holder_id, blob_ref)    # from a known holder
-data = transport.fetch_blob_discovered(native, blob_ref)    # or let the mesh find one
+data = node.fetch_blob(holder_id, blob_ref)       # from a known holder
+data = node.fetch_blob_discovered(blob_ref)       # or let the mesh find one
 
-manifest_ref = transport.store_dir(native, adapter, "/tmp/src")
-files, written = transport.fetch_dir(native, source_id, manifest_ref, "/tmp/dest")
+manifest_ref = node.store_dir(adapter, "/tmp/src")
+files, written = node.fetch_dir(source_id, manifest_ref, "/tmp/dest")
 ```
+
+`serve_blob_transfer` installs the transfer engine, and a node needs it to
+**fetch** as well as to serve: without it a fetch raises "engine not
+installed".
 
 These are **synchronous** calls that block the calling thread while the transfer
 runs on the substrate's runtime — they are not coroutines and there is no `await`.
@@ -52,7 +59,7 @@ Fetch a tree from a known holder with `fetch_dir` instead of discovering it.
 ### Verify it worked
 
 ```python
-data = transport.fetch_blob_discovered(native, blob_ref)
+data = node.fetch_blob_discovered(blob_ref)
 assert len(data) > 0, "fetched nothing"
 print(f"fetched: {len(data)} bytes")
 ```

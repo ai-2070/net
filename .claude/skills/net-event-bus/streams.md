@@ -233,12 +233,12 @@ loop {
 
 ### TypeScript / Python — the receive surface
 
-The high-level `MeshNode` wrappers differ in what they expose. The TS SDK's `MeshNode` class (`sdk-ts/src/mesh.ts`) now carries the full receive shape — `recv(limit)` merges every shard, `recvShard(shardId, limit)` targets one, and `numShards()` / `shardForStream(streamId)` answer which. The Python SDK's `MeshNode` class (`sdk-py/src/net_sdk/mesh.py`) still has no `recv` / `poll` method — an ergonomic gap there, not a capability gap.
+Both high-level `MeshNode` wrappers carry the full receive shape: `recv(limit)` merges every shard, a single-shard poll targets one, and `numShards()` / `shardForStream(streamId)` (Python: `num_shards()` / `shard_for_stream(stream_id)`) answer which. The TS class is in `sdk-ts/src/mesh.ts`, the Python one in `sdk-py/src/net_sdk/mesh.py`.
 
-To receive on a stream from Python, drop to the underlying PyO3 binding, which has the full shape; the TS high-level methods delegate to the same napi shape:
+Both high-level SDKs expose receive, each delegating to its binding's shape:
 
 - **TypeScript:** `mesh.recv(limit)` drains **every** shard and `mesh.recvShard(shardId, limit)` targets one — the napi layer beneath is `_native.poll(limit)` / `pollShard(shardId, limit)`, with `numShards()` / `shardForStream(streamId)` answering which.
-- **Python:** `mesh._native.poll(limit)`, `poll_shard(shard_id, limit)`, `num_shards()`, `shard_for_stream(stream_id)` — same shape.
+- **Python:** `node.recv(limit)` drains every shard and `node.poll_shard(shard_id, limit)` targets one, with `node.num_shards()` / `node.shard_for_stream(stream_id)` — the same shape on `net_sdk.MeshNode` (and `await node.recv(limit)` / `async for event in node.events()` on `AsyncMeshNode`). To learn the authenticated sender, `node.open_stream_inbox(stream_id)`.
 
 Both underlying `poll` methods used to read shard 0 only, so a TS or Python consumer could not receive most stream traffic at all at the default of four shards. Rust's `Mesh::recv` had the same body under an all-shards doc comment.
 
@@ -338,7 +338,7 @@ Credit-grant math: `5 MB / 64 KB ≈ 80` round trips, each a `StreamWindow` pack
 - **`BackpressureError` / `NotConnectedError` are stream-only.** Bus `emit` / `publish` never throws them. Seeing them anywhere else means a wrong call site.
 - **Don't share a `stream_id` across peers.** `(peer_A, 7)` and `(peer_B, 7)` are distinct streams by design. No global stream namespace.
 - **Don't reuse stale handles after close + reopen.** Reopen the handle. The epoch guard fails closed with `NotConnected`.
-- **Don't assume both high-level SDKs expose receive.** The TS `MeshNode` now does (`recv` / `recvShard`); the Python `MeshNode` still does not — drop to `mesh._native.poll(limit)`, which merges every shard, plus `poll_shard` for a single one. Rust has `Mesh::recv_shard` / `Mesh::recv`.
+- **Don't expect `recv` to tell you who sent an event.** Every SDK's `recv` (Rust `Mesh::recv`, TS `recv`, Python `recv`) returns events with no sender. When you authorize by peer, use the per-stream inbox: Rust `Mesh::open_stream_inbox` / `on_stream_data`, TS `onStreamData`, Python `open_stream_inbox`.
 - **Don't pass `windowBytes: 0` casually.** It disables backpressure on that stream — escape hatch for tiny control channels, dangerous for bulk transfer.
 
 ---

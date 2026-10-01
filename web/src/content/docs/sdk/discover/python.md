@@ -15,19 +15,15 @@ best = node.find_best_node({"filter": {"require_tags": ["gpu"]},
 
 ### List tools
 
-The **tool** surface is separate and still takes the native handle:
+The **tool** view is on the node too:
 
 ```python
-from net_sdk import list_tools
-
-native = node._native          # tool surface only
-
-for t in list_tools(native):
+for t in node.list_tools():
     print(t.tool_id, "v" + t.version, "tags=", t.tags)
 ```
 
-Passing the `net_sdk.MeshNode` raises `AttributeError` — the wrapper does not
-carry the tool surface.
+The module-level `net_sdk.list_tools(mesh)` is the layer underneath: it takes
+the native handle, not the `MeshNode`.
 
 Schemas come back as **JSON-encoded strings** on `descriptor.input_schema` and
 `descriptor.output_schema`. `json.loads` them before use.
@@ -39,13 +35,12 @@ of your program is synchronous:
 
 ```python
 import asyncio
-from net_sdk import list_tools, watch_tools
 
-async def follow(native):
-    for t in list_tools(native):        # baseline, synchronous
+async def follow(node):
+    for t in node.list_tools():         # baseline, synchronous
         print("baseline", t.tool_id)
 
-    async for change in watch_tools(native):
+    async for change in node.watch_tools():
         match change.type:
             case "added":   print("+", change.descriptor.tool_id)
             case "removed": print("-", change.descriptor.tool_id)
@@ -53,7 +48,7 @@ async def follow(native):
                 print("~", change.descriptor.tool_id, change.prev_node_count,
                       "->", change.descriptor.node_count)
 
-asyncio.run(follow(native))
+asyncio.run(follow(node))
 ```
 
 `interval=` is a debounce ceiling **in seconds** — Python takes seconds where
@@ -68,18 +63,17 @@ so its `finally` closes it.
 ### Filtering nodes by capability
 
 ```python
-peers = native.find_nodes({"require_tags": ["gpu"], "min_vram_gb": 24})
+peers = node.find_nodes({"require_tags": ["gpu"], "min_vram_gb": 24})
 ```
 
-`find_nodes` is on the native handle too, and takes a plain dict rather than a
-typed filter object. The predicate model is identical across bindings — see
+`find_nodes` takes a plain dict rather than a typed filter object. The predicate model is identical across bindings — see
 [Capabilities](/docs/concepts/capabilities) for the full surface and the CLI
 equivalent.
 
 ### Picking one node
 
 ```python
-target = native.find_best_node({
+target = node.find_best_node({
     "filter": {"require_tags": ["gpu"]},
     "prefer_more_vram": 1.0,
 })
@@ -108,7 +102,7 @@ raises `TypeError`.
 ### Verify it worked
 
 ```python
-assert any(t.tool_id == "web_search" for t in list_tools(native)), \
+assert any(t.tool_id == "web_search" for t in node.list_tools()), \
     "web_search did not fold — is the pair handshaked and started?"
 ```
 

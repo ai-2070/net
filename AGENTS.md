@@ -238,6 +238,12 @@ The reverse holds on a Windows workstation: no local command compiles `#[cfg(uni
 
 `net-mesh-mcp` rides only on the public `net-mesh-sdk` surface; `adapters/mcp/tests/dependency_boundary.rs` fails if it reaches past the SDK.
 
+### New binding surface lands in `net-mesh-sdk` first
+
+The Python (`bindings/python`) and Node (`bindings/node`) bindings wrap the core `MeshNode` directly, not `net_sdk::Mesh`. Every user-facing behaviour is therefore implemented once per binding, and the SDKs drift. The incident: both bindings exposed per-stream inbound receive with the authenticated sender (Node `onStreamData`, Python `open_stream_inbox`) while the Rust SDK had neither, so Rust users had to reach through `mesh.node()` (`docs/internal/plans/RUST_SDK_GAPS_PLAN.md` R1).
+
+The rule: a new user-facing mesh capability is added to `net-mesh-sdk` first, and the binding forwards to it. If a binding has to go straight to core (an FFI-specific shape such as a GIL-safe pull queue), add the SDK equivalent in the same change, or say in the PR why the SDK shouldn't have one. Moving the existing bindings onto `net_sdk::Mesh` is a separate, deferred decision (same plan, R2), not something this rule asks for.
+
 ## CI layout
 
 - `.github/workflows/ci.yml` — the main suite (Rust unit/integration/FFI/CLI/MCP/Windows-security, fmt, doc, Go, Python, skill examples). Path-filtered: only `net/**`, `go/**`, skill example paths, and the checker scripts trigger it.

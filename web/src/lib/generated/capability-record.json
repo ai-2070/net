@@ -21,7 +21,6 @@
           "status": "supported"
         },
         "Python": {
-          "mode": "core-only",
           "status": "supported"
         },
         "Rust": {
@@ -42,7 +41,6 @@
           "status": "not exposed"
         },
         "Python": {
-          "mode": "core-only",
           "status": "supported"
         },
         "Rust": {
@@ -208,7 +206,6 @@
           "status": "supported"
         },
         "Python": {
-          "mode": "core-only",
           "status": "supported"
         },
         "Rust": {
@@ -229,7 +226,6 @@
           "status": "supported"
         },
         "Python": {
-          "mode": "core-only",
           "status": "supported"
         },
         "Rust": {
@@ -370,7 +366,6 @@
           "status": "supported"
         },
         "Python": {
-          "mode": "core-only",
           "status": "supported"
         },
         "Rust": {
@@ -575,7 +570,6 @@
           "status": "supported"
         },
         "Python": {
-          "mode": "core-only",
           "status": "supported"
         },
         "Rust": {

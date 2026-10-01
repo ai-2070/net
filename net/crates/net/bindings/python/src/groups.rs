@@ -50,7 +50,7 @@ use net_sdk::groups::{
     StandbyGroupConfig as SdkStandbyGroupConfig,
 };
 
-use crate::compute::{daemon_err, DaemonError, PyDaemonRuntime};
+use crate::compute::{DaemonError, PyDaemonRuntime};
 
 // =========================================================================
 // GroupError exception class — subclass of DaemonError
@@ -91,6 +91,14 @@ fn group_err(e: SdkGroupError) -> PyErr {
     PyErr::new::<GroupError, _>(format!("daemon: group: {}", group_err_str(&e)))
 }
 
+/// A `GroupError` for a config value this binding rejects before the SDK
+/// sees it (`invalid-config`). These used to raise the base `DaemonError`
+/// via `daemon_err`, so `except GroupError:` missed them even though the
+/// message (and `group_error_kind`) said `invalid-config`.
+fn group_config_err(detail: impl std::fmt::Display) -> PyErr {
+    PyErr::new::<GroupError, _>(format!("daemon: group: invalid-config: {detail}"))
+}
+
 // =========================================================================
 // Config parsing helpers
 // =========================================================================
@@ -102,16 +110,16 @@ fn parse_strategy(s: &str) -> PyResult<Strategy> {
         "least-load" => Ok(Strategy::LeastLoad),
         "least-connections" => Ok(Strategy::LeastConnections),
         "random" => Ok(Strategy::Random),
-        other => Err(daemon_err(format!(
-            "group: invalid-config: unknown lb strategy '{other}'"
+        other => Err(group_config_err(format_args!(
+            "unknown lb strategy '{other}'"
         ))),
     }
 }
 
 fn parse_seed(bytes: &[u8]) -> PyResult<[u8; 32]> {
     if bytes.len() != 32 {
-        return Err(daemon_err(format!(
-            "group: invalid-config: group_seed must be 32 bytes, got {}",
+        return Err(group_config_err(format_args!(
+            "group_seed must be 32 bytes, got {}",
             bytes.len()
         )));
     }

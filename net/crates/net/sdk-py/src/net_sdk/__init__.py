@@ -105,13 +105,22 @@ from net_sdk.channel import (
     validate_channel_name,
 )
 from net_sdk.mesh import (
+    AsyncMeshNode,
     BackpressureError,
+    ChannelAuthError,
+    ChannelConfig,
+    ChannelError,
     MeshNode,
     MeshStream,
     NotConnectedError,
+    OnFailure,
+    PublishConfig,
+    PublishError,
+    PublishReport,
     Reliability,
     SessionSupersededError,
     StreamStats,
+    Visibility,
 )
 from net_sdk.node import NetNode
 from net_sdk.org import (
@@ -146,12 +155,22 @@ __all__ = [
     "MAX_CHANNEL_NAME_LEN",
     "CHANNEL_TAG_KEY",
     "MeshNode",
+    "AsyncMeshNode",
     "MeshStream",
     "StreamStats",
     "Reliability",
     "BackpressureError",
     "NotConnectedError",
     "SessionSupersededError",
+    # Mesh channels (distributed pub/sub) on `MeshNode`.
+    "ChannelError",
+    "ChannelAuthError",
+    "ChannelConfig",
+    "PublishConfig",
+    "PublishError",
+    "PublishReport",
+    "Visibility",
+    "OnFailure",
     # Organization capability auth (the §4.4 facade — thin forwarding over
     # the wheel's org surface; the typed wrappers + the `org:` vocabulary
     # mirror live at `net_sdk.org.TypedOrgClient` / `.serve_org_typed` /
@@ -423,5 +442,126 @@ else:
         "OperatorEnrollment",
         "fingerprint",
     ]
+
+# Compute — daemons with snapshot + live migration (`net_sdk.compute`,
+# `PYTHON_SDK_WRAPPER_PARITY_PLAN.md` S2). Present iff the wheel was built
+# with the `compute` feature (the default one is).
+try:
+    from net_sdk.compute import (  # noqa: E402
+        CausalEvent,
+        DaemonError,
+        DaemonFactory,
+        DaemonHandle,
+        DaemonHostConfig,
+        DaemonRuntime,
+        MeshDaemon,
+        MigrationError,
+        MigrationErrorKind,
+        MigrationHandle,
+        MigrationOptions,
+        MigrationPhase,
+        migration_error_kind,
+    )
+except ImportError:  # pragma: no cover - minimal build
+    pass
+else:
+    __all__ += [
+        "CausalEvent",
+        "DaemonError",
+        "DaemonFactory",
+        "DaemonHandle",
+        "DaemonHostConfig",
+        "DaemonRuntime",
+        "MeshDaemon",
+        "MigrationError",
+        "MigrationErrorKind",
+        "MigrationHandle",
+        "MigrationOptions",
+        "MigrationPhase",
+        "migration_error_kind",
+    ]
+
+# Groups — HA / scaling overlays over compute daemons (`net_sdk.groups`,
+# `PYTHON_SDK_WRAPPER_PARITY_PLAN.md` S3). Present iff the wheel was built
+# with `compute` + `groups` (the default one is).
+try:
+    from net_sdk.groups import (  # noqa: E402
+        ForkGroup,
+        ForkRecord,
+        GroupError,
+        GroupErrorKind,
+        GroupHealth,
+        GroupMemberInfo,
+        GroupStatus,
+        LoadBalanceStrategy,
+        ReplicaGroup,
+        RequestContext,
+        StandbyGroup,
+        group_error_kind,
+    )
+except ImportError:  # pragma: no cover - minimal build
+    pass
+else:
+    __all__ += [
+        "ForkGroup",
+        "ForkRecord",
+        "GroupError",
+        "GroupErrorKind",
+        "GroupHealth",
+        "GroupMemberInfo",
+        "GroupStatus",
+        "LoadBalanceStrategy",
+        "ReplicaGroup",
+        "RequestContext",
+        "StandbyGroup",
+        "group_error_kind",
+    ]
+
+# Identity + tokens, and subnet helpers (`net_sdk.identity`,
+# `net_sdk.subnets`; `PYTHON_SDK_WRAPPER_PARITY_PLAN.md` S5). Identity is in
+# every build; the subnet helpers are pure Python.
+from net_sdk.identity import (  # noqa: E402
+    Identity,
+    IdentityError,
+    TokenError,
+    TokenScope,
+    channel_hash,
+    delegate_token,
+    normalize_gpu_vendor,
+    parse_token,
+    stream_id_from_label,
+    token_is_expired,
+    verify_signature,
+    verify_token,
+)
+from net_sdk.subnets import (  # noqa: E402
+    GLOBAL_SUBNET,
+    SubnetId,
+    SubnetPolicy,
+    SubnetRule,
+    subnet_id,
+    subnet_policy,
+)
+
+__all__ += [
+    "Identity",
+    "IdentityError",
+    "TokenError",
+    "TokenScope",
+    "channel_hash",
+    "delegate_token",
+    "normalize_gpu_vendor",
+    "parse_token",
+    "stream_id_from_label",
+    "token_is_expired",
+    "verify_signature",
+    "verify_token",
+    "GLOBAL_SUBNET",
+    "SubnetId",
+    "SubnetPolicy",
+    "SubnetRule",
+    "subnet_id",
+    "subnet_policy",
+]
 
 __version__ = "0.38.2"

@@ -3,10 +3,9 @@
 ### Call a tool
 
 ```python
-from net.mesh_rpc import TypedMeshRpc
 from net_sdk import call_tool
 
-rpc = TypedMeshRpc.from_mesh(node._native)
+rpc = node.rpc()
 
 resp = call_tool(rpc, "web_search", {"query": "how does the capability fold work"})
 print(resp)

@@ -2212,7 +2212,7 @@ mod mesh_bindings {
                 if events.len() >= limit {
                     break;
                 }
-                let shard = (start + offset) % shards;
+                let shard = net::shard::rotating_shard(start, offset, shards);
                 let remaining = limit - events.len();
                 let result = self
                     .runtime
@@ -3667,6 +3667,9 @@ mod mesh_bindings {
     #[pyclass(name = "AsyncNetMesh", module = "_net")]
     pub struct AsyncNetMesh {
         node: Arc<MeshNode>,
+        /// Shared with the source `NetMesh`, so the sync and async
+        /// `poll` rotate through the shards together.
+        recv_cursor: Arc<std::sync::atomic::AtomicU16>,
     }
 
     #[pymethods]
@@ -3680,7 +3683,10 @@ mod mesh_bindings {
                 .as_ref()
                 .cloned()
                 .ok_or_else(|| PyRuntimeError::new_err("NetMesh has been shut down"))?;
-            Ok(Self { node })
+            Ok(Self {
+                node,
+                recv_cursor: mesh.recv_cursor.clone(),
+            })
         }
 
         #[getter]
@@ -3795,16 +3801,34 @@ mod mesh_bindings {
             })
         }
 
-        /// Poll for received events.
+        /// Poll for received events across **every** shard.
+        ///
+        /// This read shard 0 only — the bug the sync `NetMesh.poll` had
+        /// and fixed — so at the default of several shards most stream
+        /// traffic was unreadable through the async binding. Same sweep
+        /// as the sync `poll`, from a rotating start shard (the cursor is
+        /// shared with the source `NetMesh`).
         fn poll<'py>(&self, py: Python<'py>, limit: usize) -> PyResult<Bound<'py, PyAny>> {
             let node = self.node.clone();
+            let shards = node.num_shards().max(1);
+            let start = self
+                .recv_cursor
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % shards;
             pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                let result = node
-                    .poll_shard(0, None, limit)
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
-                let events: Vec<StoredEvent> = result
-                    .events
+                let mut collected = Vec::new();
+                for offset in 0..shards {
+                    if collected.len() >= limit {
+                        break;
+                    }
+                    let shard = net::shard::rotating_shard(start, offset, shards);
+                    let result = node
+                        .poll_shard(shard, None, limit - collected.len())
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
+                    collected.extend(result.events);
+                }
+                let events: Vec<StoredEvent> = collected
                     .into_iter()
                     .map(|e| {
                         let raw = e.raw_str().unwrap_or("").to_string();
