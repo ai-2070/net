@@ -1,0 +1,90 @@
+net/crates/net/bindings/python/tests/test_sdk_a2a_enroll.py
+  s_f9febccc288dd3::t_11d754f3f7252b 14,30-33,35
+net/crates/net/sdk-py/tests/test_mesh_channels_wrapper.py
+  s_f9febccc288dd3::t_a07c59f00e3134 98
+net/crates/net/bindings/python/tests/test_sdk_groups.py
+  s_f9febccc288dd3::t_11d754f3f7252b 15,34-37,39
+  s_f9febccc288dd3::t_da6c697f5bad34 23-28
+net/crates/net/sdk-py/src/net_sdk/blob.py
+  s_f9febccc288dd3::t_0321e5c5b422d6 22-43
+net/crates/net/sdk-py/src/net_sdk/transport.py
+  s_f9febccc288dd3::t_0321e5c5b422d6 20
+net/crates/net/sdk-py/README.md
+  s_f9febccc288dd3::t_a07c59f00e3134 111-116,161
+net/crates/net/bindings/python/src/lib.rs
+  s_f9febccc288dd3::t_d5006f2d64cee2 3670-3672,3686-3689,3804-3810,3813-3817,3819-3831
+net/crates/net/bindings/python/tests/test_sdk_mesh_channels.py
+  s_f9febccc288dd3::t_11d754f3f7252b 16,31-34,36
+web/src/content/docs/sdk/announce/python.md
+  s_f9febccc288dd3::t_a07c59f00e3134 12-13
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_f9febccc288dd3::t_5691212ece5ec8 1359-1390
+net/crates/net/bindings/python/tests/test_sdk_mesh_ctor_parity.py
+  s_f9febccc288dd3::t_b2b51fbf8e0b14 167-169
+  s_f9febccc288dd3::t_11d754f3f7252b 21,49-52,54
+net/crates/net/bindings/python/tests/test_sdk_mesh_surface.py
+  s_f9febccc288dd3::t_11d754f3f7252b 14,31-34,36
+net/crates/net/sdk-py/tests/test_compute_wrapper.py
+  s_f9febccc288dd3::t_423e99bfca9186 18-32,38-40,44-46,88-91
+net/crates/net/sdk-py/tests/test_mesh_node_surface.py
+  s_f9febccc288dd3::t_b917962a222545 31-37
+net/crates/net/sdk/tests/stream_inbound.rs
+  s_f9febccc288dd3::t_fdc10740b9e621 281-308
+net/crates/net/sdk-py/src/net_sdk/mesh.py
+  s_f9febccc288dd3::t_21cc0b1c2bdfcf 699-731
+docs/internal/plans/RUST_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_1c6b2774401549 5-6,53-54,72,185-191,241-256
+net/crates/net/bindings/python/tests/test_stub_drift.py
+  s_f9febccc288dd3::t_5691212ece5ec8 112-118
+  s_f9febccc288dd3::t_f56cac6d8398d6 231-233,238-239,241-249
+  s_f9febccc288dd3::t_b2b51fbf8e0b14 119-122,126-139,156-161
+.claude/skills/net-event-bus/streams.md
+  s_f9febccc288dd3::t_a07c59f00e3134 236
+docs/internal/plans/PYTHON_SDK_WRAPPER_PARITY_PLAN.md
+  s_f9febccc288dd3::t_eb48876868bc9a 319-339
+  s_f9febccc288dd3::t_a07c59f00e3134 168-170
+  s_f9febccc288dd3::t_23eba01772aea4 340-386
+  s_f9febccc288dd3::t_b2b41affc8ef44 8-9
+  s_f9febccc288dd3::t_1c6b2774401549 1-7,10-167,171-318,387-868
+net/crates/net/bindings/python/tests/test_sdk_compute.py
+  s_f9febccc288dd3::t_11d754f3f7252b 15,36-39,41
+  s_f9febccc288dd3::t_da6c697f5bad34 23-28
+net/crates/net/sdk-py/src/net_sdk/groups.py
+  s_f9febccc288dd3::t_a07c59f00e3134 66,68-73
+net/crates/net/sdk-py/tests/test_identity_subnets_wrapper.py
+  s_f9febccc288dd3::t_a07c59f00e3134 21
+net/crates/net/sdk-py/src/net_sdk/subnets.py
+  s_f9febccc288dd3::t_a07c59f00e3134 61-63
+net/crates/net/bindings/python/tests/test_sdk_identity_subnets.py
+  s_f9febccc288dd3::t_b2b41affc8ef44 82-84
+  s_f9febccc288dd3::t_a07c59f00e3134 71-73
+  s_f9febccc288dd3::t_11d754f3f7252b 16,33-36,38
+docs/internal/plans/NODE_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_1c6b2774401549 272-283,345-346,348-349
+web/src/content/docs/sdk/artifacts/python.md
+  s_f9febccc288dd3::t_4852428bfd59bf 17,21-23
+net/crates/net/bindings/python/tests/test_sdk_async_mesh.py
+  s_f9febccc288dd3::t_11d754f3f7252b 13,28-31,33
+  s_f9febccc288dd3::t_acd6c2c85a825c 75-103
+net/crates/net/sdk-py/tests/test_async_mesh_wrapper.py
+  s_f9febccc288dd3::t_0235572d4c7d4a 89,92-96,100,108
+net/crates/net/sdk/src/mesh.rs
+  s_f9febccc288dd3::t_67fa5947d5427e 120-123,136,150-156,1365-1368,1387-1392,1401-1413,1420
+  s_f9febccc288dd3::t_fdc10740b9e621 160
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0dace16905696e26005e29f16f45b9d0d69182e3",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
