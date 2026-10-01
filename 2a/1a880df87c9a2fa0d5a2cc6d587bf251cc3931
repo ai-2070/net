@@ -1,0 +1,26 @@
+net/crates/net/bindings/python/tests/test_groups.py
+  s_f9febccc288dd3::t_83c93febc8611f 203-206,215-234
+net/crates/net/bindings/python/tests/test_sdk_groups.py
+  s_f9febccc288dd3::t_466f55b6cc3075 132-142
+docs/internal/plans/PYTHON_SDK_WRAPPER_PARITY_PLAN.md
+  s_f9febccc288dd3::t_3f10cb309d29a9 584-595
+net/crates/net/bindings/python/src/groups.rs
+  s_f9febccc288dd3::t_67fcb7b8a0d93d 94-101,113-114,121-122
+  s_f9febccc288dd3::t_83c93febc8611f 53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2a1a880df87c9a2fa0d5a2cc6d587bf251cc3931",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
