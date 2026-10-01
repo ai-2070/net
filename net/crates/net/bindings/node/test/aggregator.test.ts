@@ -81,7 +81,7 @@ describe('classifyAggregatorError — every kind the binding emits', () => {
   // src/aggregator.rs but missing here, so they came back as raw Errors.
   it('types every agg_err kind in src/aggregator.rs', () => {
     const src = fs.readFileSync(path.join(__dirname, '../src/aggregator.rs'), 'utf8')
-    const kinds = [...new Set([...src.matchAll(/agg_err\(\s*"([a-z-]+)"/g)].map((m) => m[1]))]
+    const kinds = [...new Set([...src.matchAll(/agg_err\(\s*"([^"]+)"/g)].map((m) => m[1]))]
     expect(kinds.length).toBeGreaterThanOrEqual(10)
     for (const kind of kinds) {
       const typed = classifyAggregatorError(fakeErr(`agg:${kind}: x`))

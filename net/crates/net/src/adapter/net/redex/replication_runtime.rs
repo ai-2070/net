@@ -997,6 +997,14 @@ async fn bootstrap_replica(
         }
         Err(CoordinatorError::Transition(e)) => {
             tracing::debug!(error = ?e, "replication: bootstrap skipped; role already moved");
+            // A caller moved it to Replica first (driving the
+            // coordinator by hand): still arm the wait, or a replica
+            // set with no leader yet never elects one.
+            if coordinator.role() == ReplicaRole::Replica {
+                tracker
+                    .lock()
+                    .arm_leader_wait(tokio::time::Instant::now().into_std());
+            }
         }
     }
 }
@@ -1069,6 +1077,7 @@ async fn on_tick(
     // drives this on_tick call. Pre-fix std::Instant::now() kept
     // moving while virtual time was paused.
     let now = tokio::time::Instant::now().into_std();
+    coordinator.reconcile_advertisement().await;
     if !resolve_placement(inputs, coordinator, state).await {
         // Deselected this tick: the node is `Idle` now and has nothing
         // to emit.

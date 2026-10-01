@@ -502,7 +502,8 @@ pub unsafe extern "C" fn net_redex_enable_replication(
 /// Undo `net_redex_enable_replication`: shut every channel's
 /// replication down (gracefully, on the FFI runtime, withdrawing its
 /// chain advertisement) and release this `Redex`'s reference to the
-/// mesh. Idempotent; open files stay open as local logs.
+/// mesh. Idempotent; open files stay open as local logs. Blocks until
+/// the shutdown completes; don't call it from a tokio worker thread.
 ///
 /// Returns `0`, `NetError::NullPointer` (`-1`) on a NULL handle, or
 /// `NetError::ShuttingDown` while the `Redex` is in `_free`-quiesce.
@@ -516,10 +517,11 @@ pub unsafe extern "C" fn net_redex_disable_replication(redex: *mut RedexHandle) 
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
-    // The graceful shutdown is spawned on the current runtime; a C /
-    // cgo caller's thread has none.
-    let _rt = runtime().enter();
-    h.inner.disable_replication();
+    // Block until every channel's runtime has stopped and dropped its
+    // mesh reference, on the FFI runtime (a C / cgo caller's thread has
+    // none of its own), so a following mesh free / shutdown sees the
+    // mesh released.
+    runtime().block_on(h.inner.disable_replication_and_wait());
     0
 }
 

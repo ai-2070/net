@@ -32,7 +32,7 @@
 //! `election_thrash_total` on `MissedHeartbeats` transitions within
 //! the 30 s window (window enforcement in the heartbeat-loop slice).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -229,6 +229,10 @@ pub struct ReplicationCoordinator {
     /// completes `withdraw_chain` first, leaving the mesh
     /// advertising a chain we've already withdrawn locally.
     transition_lock: tokio::sync::Mutex<()>,
+    /// Set when a transition's chain-tag announce / withdraw failed,
+    /// so the mesh's advertisement disagrees with the local role;
+    /// cleared by [`Self::reconcile_advertisement`] once it lands.
+    advertisement_stale: AtomicBool,
     /// Optional observer hook. When set, every successful state
     /// transition that crosses the Idle ↔ {Replica, Leader}
     /// boundary fires through it so consumers (MeshOS, audit,
@@ -263,6 +267,7 @@ impl ReplicationCoordinator {
             state: Mutex::new(ReplicaRole::Idle),
             tail_seq: AtomicU64::new(0),
             transition_lock: tokio::sync::Mutex::new(()),
+            advertisement_stale: AtomicBool::new(false),
             observer: RwLock::new(None),
         }
     }
@@ -325,6 +330,38 @@ impl ReplicationCoordinator {
     /// Channel identity (read-only — fixed at construction time).
     pub fn channel(&self) -> &ChannelIdentity {
         &self.channel
+    }
+
+    /// Re-send the chain-tag advertisement the current role implies if a
+    /// transition's announce / withdraw failed. Cheap when nothing
+    /// failed (one atomic load); the replication runtime calls it every
+    /// tick.
+    ///
+    /// Without it a transient sink failure during, say, the bootstrap
+    /// `Idle → Replica` left the node a replica the mesh never heard
+    /// of: it advanced its role, so no later transition re-announced,
+    /// and holder discovery skipped it until some unrelated transition.
+    pub async fn reconcile_advertisement(&self) {
+        if !self.advertisement_stale.load(Ordering::Acquire) {
+            return;
+        }
+        let _guard = self.transition_lock.lock().await;
+        let role = *self.state.lock();
+        let origin = self.channel.origin_hash;
+        let result = if role == ReplicaRole::Idle {
+            self.sink.withdraw_chain(origin).await
+        } else {
+            let tip = self.tail_seq.load(Ordering::Relaxed);
+            self.sink.announce_chain(origin, tip).await
+        };
+        match result {
+            Ok(()) => self.advertisement_stale.store(false, Ordering::Release),
+            Err(e) => tracing::debug!(
+                origin = format!("{origin:#x}"),
+                error = %e,
+                "replication coordinator: advertisement retry failed; retrying next tick"
+            ),
+        }
     }
 
     /// Replication config (read-only).
@@ -438,6 +475,8 @@ impl ReplicationCoordinator {
             (_, ReplicaRole::Idle) => self.sink.withdraw_chain(origin).await,
             _ => Ok(()),
         };
+        self.advertisement_stale
+            .store(result.is_err(), Ordering::Release);
         if let Err(e) = result {
             if is_withdraw {
                 // Local state already flipped to Idle but the
@@ -943,6 +982,53 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(matches!(calls[0], SinkCall::Announce { .. }));
         assert!(matches!(calls[1], SinkCall::Withdraw { .. }));
+    }
+
+    /// A failed bootstrap announce used to leave the node a replica the
+    /// mesh never heard of: the role had moved, so no later transition
+    /// re-announced. `reconcile_advertisement` re-sends it, and is a
+    /// no-op once the advertisement matches.
+    #[tokio::test]
+    async fn reconcile_resends_a_failed_announce_once() {
+        let (sink, _, c) = build_coordinator();
+        sink.arm_failure(AdapterError::Transient("blip".to_string()));
+        c.transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+            .await
+            .expect_err("the announce failed");
+        assert_eq!(c.role(), ReplicaRole::Replica);
+        assert!(sink.calls().is_empty(), "nothing reached the mesh");
+
+        c.reconcile_advertisement().await;
+        assert_eq!(
+            sink.calls(),
+            vec![SinkCall::Announce {
+                origin_hash: 0xCAFE_BABE_DEAD_BEEF,
+                tip_seq: 0
+            }]
+        );
+        // In sync now: no further sink calls.
+        c.reconcile_advertisement().await;
+        assert_eq!(sink.calls().len(), 1);
+    }
+
+    /// A failed withdraw is retried as a withdraw.
+    #[tokio::test]
+    async fn reconcile_resends_a_failed_withdraw() {
+        let (sink, _, c) = build_coordinator();
+        c.transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+            .await
+            .unwrap();
+        sink.arm_failure(AdapterError::Transient("blip".to_string()));
+        let _ = c
+            .transition_to(ReplicaRole::Idle, TransitionSignal::ChannelClose)
+            .await;
+        c.reconcile_advertisement().await;
+        assert_eq!(
+            sink.calls().last(),
+            Some(&SinkCall::Withdraw {
+                origin_hash: 0xCAFE_BABE_DEAD_BEEF
+            })
+        );
     }
 
     #[tokio::test]

@@ -129,13 +129,15 @@ There are 24 native methods with no `MeshNode` wrapper:
   `'unknown'`, but the core also emits `no-target-available`, `buffer-full`
   and `wrong-peer` (`format_migration_error` in
   `bindings/python/src/compute.rs`; check the napi formatter matches). A TS
-  caller sees those three as `'unknown'`.
+  caller saw those three as `'unknown'`. **Fixed in S6**, with a drift test
+  reading the kinds from the napi formatter.
 - **Skill snippets reach through `_native` for nRPC** (found 2026-10-01
   while updating the Python skill prose).
   `.claude/skills/net-event-bus/nrpc.md` and `patterns.md` show
   `TypedMeshRpc.fromMesh((mesh as any)._native)`, although TS `MeshNode`
-  has `rpc()` (`sdk-ts/src/mesh.ts:546`). The S7 docs slice should switch
-  them to `mesh.rpc()`.
+  has `rpc()` (`sdk-ts/src/mesh.ts:546`). **Fixed in S6**: `MeshNode` has
+  no `_native`, so those snippets passed `undefined`; they now use
+  `mesh.rpc()`.
 
 ### N8 — `Redex` replication and greedy dataforts (gap, found during S6)
 

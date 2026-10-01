@@ -245,28 +245,31 @@ pub struct PyRedex {
     /// tasks, but they run on the Python thread, which has no reactor:
     /// the first replicated `open_file` raised `PanicException: there is
     /// no reactor running`. Entering the mesh's runtime makes the spawns
-    /// land on it.
+    /// land on it. Replaced on every enable (it follows the mesh most
+    /// recently passed in) and cleared by `disable_replication`.
     #[cfg(feature = "net")]
-    mesh_runtime: std::sync::OnceLock<Arc<crate::runtime_guard::GuardedRuntime>>,
+    mesh_runtime: parking_lot::Mutex<Option<Arc<crate::runtime_guard::GuardedRuntime>>>,
 }
 
 impl PyRedex {
-    /// Record `mesh`'s runtime (first call wins) and return it, for a
-    /// call that may spawn tasks.
+    /// Record `mesh`'s runtime (the latest call wins) and return it, for
+    /// a call that may spawn tasks.
     #[cfg(feature = "net")]
     fn adopt_runtime(
         &self,
         mesh: &crate::mesh_bindings::NetMesh,
     ) -> Arc<crate::runtime_guard::GuardedRuntime> {
-        self.mesh_runtime.get_or_init(|| mesh.runtime_arc()).clone()
+        let rt = mesh.runtime_arc();
+        *self.mesh_runtime.lock() = Some(rt.clone());
+        rt
     }
 
     /// The runtime a spawning call should run on: the mesh's once
     /// replication or greedy is enabled, else the shared binding runtime.
     fn spawn_runtime(&self) -> PyResult<Arc<crate::runtime_guard::GuardedRuntime>> {
         #[cfg(feature = "net")]
-        if let Some(rt) = self.mesh_runtime.get() {
-            return Ok(rt.clone());
+        if let Some(rt) = self.mesh_runtime.lock().clone() {
+            return Ok(rt);
         }
         make_runtime()
     }
@@ -300,7 +303,7 @@ impl PyRedex {
             inner: Arc::new(inner),
             persistent_dir,
             #[cfg(feature = "net")]
-            mesh_runtime: std::sync::OnceLock::new(),
+            mesh_runtime: parking_lot::Mutex::new(None),
         }
     }
 
@@ -504,25 +507,28 @@ impl PyRedex {
         ))
     }
 
-    /// Count of per-channel replication runtimes currently registered
-    /// on this manager. `0` when replication isn't enabled. Useful
-    /// for tests and operator observability.
     /// Undo `enable_replication`: shut down every channel's replication
     /// (gracefully, withdrawing its chain advertisement) and release the
-    /// mesh. Idempotent. Open files stay open as local logs.
+    /// mesh. Idempotent. Open files stay open as local logs. Returns once
+    /// every channel's runtime has stopped; the GIL is released while
+    /// it waits.
     #[cfg(feature = "net")]
-    fn disable_replication(&self) {
-        // Enter the mesh runtime so the core spawns the graceful
-        // shutdown there instead of aborting the runtime tasks.
-        let rt = self.spawn_runtime();
-        let _enter = rt.as_ref().ok().map(|rt| rt.enter());
-        self.inner.disable_replication();
+    fn disable_replication(&self, py: Python<'_>) -> PyResult<()> {
+        let rt = self.spawn_runtime()?;
+        let inner = self.inner.clone();
+        py.detach(move || rt.block_on(inner.disable_replication_and_wait()));
+        // A later enable follows its own mesh's runtime.
+        *self.mesh_runtime.lock() = None;
+        Ok(())
     }
 
     /// No-op without the `net` feature: replication can't be enabled.
     #[cfg(not(feature = "net"))]
     fn disable_replication(&self) {}
 
+    /// Count of per-channel replication runtimes currently registered
+    /// on this manager. `0` when replication isn't enabled. Useful
+    /// for tests and operator observability.
     fn replication_runtime_count(&self) -> u32 {
         self.inner.replication_runtime_count() as u32
     }
@@ -780,6 +786,31 @@ impl PyRedex {
     fn disable_gravity_for_greedy(&self) {
         self.inner.disable_gravity_for_greedy();
     }
+    // Fallbacks for builds without `dataforts`, matching the Node
+    // binding: the stub (`_net.pyi`) declares these unconditionally, so
+    // a call reports "greedy not enabled" instead of an AttributeError.
+    // (`enable_greedy_dataforts` / `enable_gravity_for_greedy` have
+    // raising fallbacks above.)
+
+    /// No-op without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    fn disable_greedy_dataforts(&self) {}
+
+    /// `0` without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    fn greedy_cached_channel_count(&self) -> u32 {
+        0
+    }
+
+    /// Empty without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    fn greedy_prometheus_text(&self) -> String {
+        String::new()
+    }
+
+    /// No-op without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    fn disable_gravity_for_greedy(&self) {}
 }
 
 #[allow(clippy::too_many_arguments)]

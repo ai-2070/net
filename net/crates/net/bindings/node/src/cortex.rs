@@ -276,19 +276,20 @@ impl Redex {
     /// (gracefully, withdrawing its chain advertisement) and release this
     /// manager's reference to the mesh, so `NetMesh.shutdown()` can take
     /// sole ownership. Idempotent. Open files stay open as local logs.
+    ///
+    /// Resolves once every channel's runtime has stopped and dropped its
+    /// mesh reference: `await` it before `shutdown()`, which otherwise can
+    /// still find those references and refuse.
     #[cfg(feature = "net")]
     #[napi]
-    pub fn disable_replication(&self) {
-        // The graceful shutdown is spawned on the current runtime.
-        let rt = napi_runtime();
-        let _enter = rt.enter();
-        self.inner.disable_replication();
+    pub async fn disable_replication(&self) {
+        self.inner.disable_replication_and_wait().await;
     }
 
     /// No-op without the `net` feature: replication can't be enabled.
     #[cfg(not(feature = "net"))]
     #[napi]
-    pub fn disable_replication(&self) {}
+    pub async fn disable_replication(&self) {}
 
     /// Count of per-channel replication runtimes currently registered
     /// on this manager. `0` when replication isn't enabled. Useful

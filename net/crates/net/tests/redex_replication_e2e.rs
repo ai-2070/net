@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use net::adapter::net::channel::ChannelName;
 use net::adapter::net::redex::{
-    PlacementStrategy, Redex, RedexFileConfig, ReplicaRole, ReplicationConfig, TransitionSignal,
+    PlacementStrategy, Redex, RedexFileConfig, ReplicaRole, ReplicationConfig,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
@@ -80,6 +80,31 @@ fn cn(s: &str) -> ChannelName {
     ChannelName::new(s).unwrap()
 }
 
+/// Wait until the runtime's own election settles on `leader` as Leader
+/// and every one of `replicas` as Replica. The runtime bootstraps and
+/// elects by itself (the pinned leader wins when healthy), so tests wait
+/// for that rather than drive transitions that race it.
+async fn await_roles(
+    leader: &net::adapter::net::redex::ReplicationCoordinator,
+    replicas: &[&net::adapter::net::redex::ReplicationCoordinator],
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let settled = leader.role() == ReplicaRole::Leader
+            && replicas.iter().all(|c| c.role() == ReplicaRole::Replica);
+        if settled {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "election never settled: leader {:?}, replicas {:?}",
+            leader.role(),
+            replicas.iter().map(|c| c.role()).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Wait for the replication runtime to bootstrap a pinned member
 /// `Idle -> Replica`. The runtime does that itself now; a test that
 /// drove the step by hand would race it.
@@ -126,7 +151,8 @@ async fn two_node_replication_catches_replica_up() {
     let cfg = RedexFileConfig::default().with_replication(Some(
         ReplicationConfig::new()
             .with_heartbeat_ms(150)
-            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id])),
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+            .with_leader_pinned(Some(a_id)),
     ));
     let file_a = redex_a.open_file(&name, cfg.clone()).expect("open A");
     let file_b = redex_b.open_file(&name, cfg).expect("open B");
@@ -138,16 +164,7 @@ async fn two_node_replication_catches_replica_up() {
     let coord_a = redex_a.replication_coordinator_for(&name).expect("coord A");
     let coord_b = redex_b.replication_coordinator_for(&name).expect("coord B");
     // State-machine path Idle → Replica → Candidate → Leader.
-    await_bootstrapped(&coord_a).await;
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .expect("A → Candidate");
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .expect("A → Leader");
-    await_bootstrapped(&coord_b).await;
+    await_roles(&coord_a, &[&coord_b]).await;
     assert_eq!(coord_a.role(), ReplicaRole::Leader);
     assert_eq!(coord_b.role(), ReplicaRole::Replica);
 
@@ -244,7 +261,8 @@ async fn two_node_heartbeat_records_believed_leader() {
     let cfg = RedexFileConfig::default().with_replication(Some(
         ReplicationConfig::new()
             .with_heartbeat_ms(150)
-            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id])),
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+            .with_leader_pinned(Some(a_id)),
     ));
     redex_a.open_file(&name, cfg.clone()).expect("open A");
     redex_b.open_file(&name, cfg).expect("open B");
@@ -254,16 +272,7 @@ async fn two_node_heartbeat_records_believed_leader() {
 
     // Bring both nodes to participating roles via the
     // state-machine path Idle → Replica → Candidate → Leader.
-    await_bootstrapped(&coord_a).await;
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .unwrap();
-    await_bootstrapped(&coord_b).await;
+    await_roles(&coord_a, &[&coord_b]).await;
 
     // Wait for B's coordinator metrics to observe a non-default
     // replica_lag — the gauge gets stamped when on_tick runs while
@@ -311,7 +320,8 @@ async fn leader_close_triggers_replica_election_and_promotion() {
     let cfg = RedexFileConfig::default().with_replication(Some(
         ReplicationConfig::new()
             .with_heartbeat_ms(150)
-            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id])),
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+            .with_leader_pinned(Some(a_id)),
     ));
     redex_a.open_file(&name, cfg.clone()).expect("open A");
     redex_b.open_file(&name, cfg).expect("open B");
@@ -320,16 +330,7 @@ async fn leader_close_triggers_replica_election_and_promotion() {
     let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
 
     // Drive A → Leader, B → Replica.
-    await_bootstrapped(&coord_a).await;
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .unwrap();
-    await_bootstrapped(&coord_b).await;
+    await_roles(&coord_a, &[&coord_b]).await;
 
     // R-41: poll until B has observed at least one leader
     // heartbeat from A, with a hard deadline. Replacing the
@@ -427,7 +428,8 @@ async fn three_node_replication_fans_out_to_every_replica() {
         ReplicationConfig::new()
             .with_factor(3)
             .with_heartbeat_ms(150)
-            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id, c_id])),
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id, c_id]))
+            .with_leader_pinned(Some(a_id)),
     ));
     let file_a = redex_a.open_file(&name, cfg.clone()).expect("open A");
     let file_b = redex_b.open_file(&name, cfg.clone()).expect("open B");
@@ -438,17 +440,7 @@ async fn three_node_replication_fans_out_to_every_replica() {
     let coord_c = redex_c.replication_coordinator_for(&name).unwrap();
 
     // Drive: A is Leader; B and C are Replicas.
-    await_bootstrapped(&coord_a).await;
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .unwrap();
-    await_bootstrapped(&coord_b).await;
-    await_bootstrapped(&coord_c).await;
+    await_roles(&coord_a, &[&coord_b, &coord_c]).await;
 
     // Append on A; both B and C must catch up.
     const N: u64 = 24;
@@ -592,7 +584,8 @@ async fn replication_overhead_within_30_percent_budget() {
     let cfg = RedexFileConfig::default().with_replication(Some(
         ReplicationConfig::new()
             .with_heartbeat_ms(500)
-            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id])),
+            .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+            .with_leader_pinned(Some(a_id)),
     ));
 
     let name = cn("perf/replicated");
@@ -604,16 +597,7 @@ async fn replication_overhead_within_30_percent_budget() {
     // them deterministically.
     let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
     let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
-    await_bootstrapped(&coord_a).await;
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .unwrap();
-    await_bootstrapped(&coord_b).await;
+    await_roles(&coord_a, &[&coord_b]).await;
 
     // Warmup so the replication runtime tasks have settled into
     // their steady-state cadence + the mesh handshake is fully
@@ -681,6 +665,7 @@ async fn bandwidth_budget_metric_field_is_plumbed() {
                 node_a.node_id(),
                 node_b.node_id(),
             ]))
+            .with_leader_pinned(Some(node_a.node_id()))
             // Sane production fraction. The bandwidth budget's
             // ENFORCEMENT path (NACK Backpressure on exceeded
             // budget) is unit-tested in replication_catchup; this
@@ -693,16 +678,7 @@ async fn bandwidth_budget_metric_field_is_plumbed() {
 
     let coord_a = redex_a.replication_coordinator_for(&name).unwrap();
     let coord_b = redex_b.replication_coordinator_for(&name).unwrap();
-    await_bootstrapped(&coord_a).await;
-    coord_a
-        .transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-        .await
-        .unwrap();
-    coord_a
-        .transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-        .await
-        .unwrap();
-    await_bootstrapped(&coord_b).await;
+    await_roles(&coord_a, &[&coord_b]).await;
 
     // Drive moderate append load.
     for i in 0..256u64 {
@@ -791,6 +767,7 @@ async fn pinned_pair_elects_the_pinned_leader_and_replicates() {
         ReplicationConfig::new()
             .with_heartbeat_ms(150)
             .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+            .with_leader_pinned(Some(a_id))
             .with_leader_pinned(Some(b_id)),
     ));
     let file_a = redex_a.open_file(&name, cfg.clone()).expect("open A");

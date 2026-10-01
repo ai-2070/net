@@ -221,34 +221,36 @@ def test_replicated_channel_reaches_the_other_node(mesh_pair):
     """
     a, b = mesh_pair
     ra, rb = Redex(), Redex()
-    ra.enable_replication(a)
-    rb.enable_replication(b)
-    kwargs = dict(
-        replication=True,
-        replication_heartbeat_ms=150,
-        replication_placement="pinned",
-        replication_pinned_nodes=[a.node_id, b.node_id],
-        replication_leader_pinned=a.node_id,
-    )
-    fa = ra.open_file("py/repl-pair", **kwargs)
-    fb = rb.open_file("py/repl-pair", **kwargs)
-    _wait_for(
-        "A elected leader",
-        lambda: 'dataforts_leader_changes_total{channel="py/repl-pair"} 1'
-        in ra.replication_prometheus_text(),
-    )
-    for i in range(8):
-        fa.append(f"event-{i}".encode())
-    _wait_for("B caught up", lambda: len(fb.read_range(0, 8)) == 8)
-    assert bytes(fb.read_range(7, 8)[0].payload) == b"event-7"
-    ra.disable_replication()
-    rb.disable_replication()
+    try:
+        ra.enable_replication(a)
+        rb.enable_replication(b)
+        kwargs = dict(
+            replication=True,
+            replication_heartbeat_ms=150,
+            replication_placement="pinned",
+            replication_pinned_nodes=[a.node_id, b.node_id],
+            replication_leader_pinned=a.node_id,
+        )
+        fa = ra.open_file("py/repl-pair", **kwargs)
+        fb = rb.open_file("py/repl-pair", **kwargs)
+        _wait_for(
+            "A elected leader",
+            lambda: 'dataforts_leader_changes_total{channel="py/repl-pair"} 1'
+            in ra.replication_prometheus_text(),
+        )
+        for i in range(8):
+            fa.append(f"event-{i}".encode())
+        _wait_for("B caught up", lambda: len(fb.read_range(0, 8)) == 8)
+        assert bytes(fb.read_range(7, 8)[0].payload) == b"event-7"
+    finally:
+        ra.disable_replication()
+        rb.disable_replication()
 
 
 def test_disable_replication_stops_every_channel_runtime():
     mesh = net.NetMesh("127.0.0.1:0", "7a" * 32)
+    r = Redex()
     try:
-        r = Redex()
         r.enable_replication(mesh)
         f = r.open_file(
             "py/repl-off",
@@ -263,6 +265,7 @@ def test_disable_replication_stops_every_channel_runtime():
         assert r.replication_prometheus_text() == ""
         assert f.append(b"still a local log") == 0
     finally:
+        r.disable_replication()
         mesh.shutdown()
 
 
@@ -283,27 +286,29 @@ def test_standard_placement_replicates_without_a_node_list(mesh_pair):
     pinned leader's writes reach the other."""
     a, b = mesh_pair
     ra, rb = Redex(), Redex()
-    ra.enable_replication(a)
-    rb.enable_replication(b)
-    kwargs = dict(
-        replication=True,
-        replication_factor=2,
-        replication_heartbeat_ms=150,
-        replication_leader_pinned=a.node_id,
-    )
-    fa = ra.open_file("py/repl-standard", **kwargs)
-    fb = rb.open_file("py/repl-standard", **kwargs)
-    _wait_for(
-        "A elected leader",
-        lambda: 'dataforts_leader_changes_total{channel="py/repl-standard"} 1'
-        in ra.replication_prometheus_text(),
-        timeout=30.0,
-    )
-    for i in range(4):
-        fa.append(f"event-{i}".encode())
-    _wait_for("B caught up", lambda: len(fb.read_range(0, 4)) == 4)
-    ra.disable_replication()
-    rb.disable_replication()
+    try:
+        ra.enable_replication(a)
+        rb.enable_replication(b)
+        kwargs = dict(
+            replication=True,
+            replication_factor=2,
+            replication_heartbeat_ms=150,
+            replication_leader_pinned=a.node_id,
+        )
+        fa = ra.open_file("py/repl-standard", **kwargs)
+        fb = rb.open_file("py/repl-standard", **kwargs)
+        _wait_for(
+            "A elected leader",
+            lambda: 'dataforts_leader_changes_total{channel="py/repl-standard"} 1'
+            in ra.replication_prometheus_text(),
+            timeout=30.0,
+        )
+        for i in range(4):
+            fa.append(f"event-{i}".encode())
+        _wait_for("B caught up", lambda: len(fb.read_range(0, 4)) == 4)
+    finally:
+        ra.disable_replication()
+        rb.disable_replication()
 
 
 def test_colocation_strict_without_a_chain_is_rejected():

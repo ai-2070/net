@@ -215,11 +215,12 @@ export class Redex {
    * Undo {@link enableReplication}: shut every channel's replication down
    * (withdrawing its chain advertisement) and release this manager's
    * reference to the mesh. Idempotent; open files stay open as local
-   * logs. Call it before `node.shutdown()`, which needs the node's only
-   * reference.
+   * logs. Resolves once every channel's runtime has stopped and released
+   * the node: `await` it before `node.shutdown()`, which needs the node's
+   * only reference.
    */
-  disableReplication(): void {
-    this.napi.disableReplication();
+  async disableReplication(): Promise<void> {
+    await this.napi.disableReplication();
   }
 
   /** Per-channel replication runtimes on this manager; `0` when replication is off. */

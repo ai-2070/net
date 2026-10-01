@@ -299,18 +299,27 @@ coordinator.transition_to(Idle, ChannelClose) + router unregisters
 ## Turning replication off
 
 `Redex::disable_replication()` undoes `enable_replication`: every
-channel's runtime is unregistered and shut down, the router comes off
-the mesh, and the `Redex` drops its `Arc<MeshNode>`. Idempotent. Open
-files stay open as local logs; a later `enable_replication` installs
-fresh wiring, and channels opened before it stay unreplicated until
-reopened. Inside a tokio runtime each channel shuts down gracefully
-in a spawned task (withdrawing its chain advertisement on the way to
-`Idle`); outside one, the runtime tasks are aborted.
+channel's runtime is unregistered and shut down (withdrawing its
+replica candidacy and chain advertisement on the way to `Idle`), the
+router comes off the mesh, and the `Redex` drops its `Arc<MeshNode>`.
+Idempotent. Open files stay open as local logs.
 
-Bindings: `redex.disableReplication()` (Node), `redex.disable_replication()`
-(Python). Call it before `NetMesh.shutdown()` in Node, which needs the
-node's only reference; dropping the `Redex` also releases it, but in
-JS only when the garbage collector gets to it.
+The sync form only *schedules* each runtime's shutdown (on the current
+tokio runtime; outside one the tasks are aborted instead). When the
+next step needs the mesh released, await
+`Redex::disable_replication_and_wait()`, which returns once every
+runtime has stopped and dropped its mesh reference.
+
+A later `enable_replication` installs fresh wiring, but `open_file`
+honors a channel's config only on its first open: to replicate a
+channel that was open across a disable, **close it and open it again**
+after re-enabling.
+
+Bindings, all of which wait for the shutdown:
+`await redex.disableReplication()` (Node; it returns a promise —
+await it before `NetMesh.shutdown()`, which needs the node's only
+reference), `redex.disable_replication()` (Python, blocking with the
+GIL released), `net_redex_disable_replication` (C, blocking).
 
 ## Observability
 

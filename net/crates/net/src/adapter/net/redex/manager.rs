@@ -298,8 +298,25 @@ impl Redex {
     /// `Arc<MeshNode>` (Node's) couldn't shut down while the `Redex`
     /// lived.
     pub fn disable_replication(&self) {
+        shut_down_runtimes(self.take_replication());
+    }
+
+    /// [`Self::disable_replication`], returning once every channel's
+    /// runtime has shut down and dropped its mesh reference.
+    ///
+    /// `disable_replication` only schedules that shutdown, so a caller
+    /// whose next step needs the mesh's only reference (the Node
+    /// binding's `NetMesh.shutdown`) should await this instead.
+    pub async fn disable_replication_and_wait(&self) {
+        for handle in self.take_replication() {
+            handle.cancel().await;
+        }
+    }
+
+    /// Uninstall the wiring and hand back the runtimes to shut down.
+    fn take_replication(&self) -> Vec<Arc<super::replication_runtime::ReplicationRuntimeHandle>> {
         let Some(wiring) = self.replication.write().take() else {
-            return;
+            return Vec::new();
         };
         let handles: Vec<_> = wiring
             .router
@@ -309,7 +326,7 @@ impl Redex {
             .collect();
         // `ReplicationWiring::drop` uninstalls the router from the mesh.
         drop(wiring);
-        shut_down_runtimes(handles);
+        handles
     }
 
     /// Install greedy-LRU wiring rooted at `mesh`. Validates the
@@ -670,16 +687,19 @@ impl Redex {
             // Re-check the wiring under the read lock — a racing
             // call that disables replication after the precheck
             // surfaces a clean error rather than panicking on
-            // unwrap.
-            let wiring = match self.replication.read().as_ref() {
-                Some(w) => w.clone(),
-                None => {
-                    return Err(RedexError::Channel(
-                        "replication wiring removed between precheck and spawn".into(),
-                    ));
-                }
+            // unwrap. Hold the lock through registration: with only
+            // a cloned `Arc`, a concurrent `disable_replication` could
+            // take the wiring between the check and the router insert,
+            // and the new runtime would register on a router nobody
+            // shuts down (`spawn_replication_for` is synchronous and
+            // doesn't touch `self.replication`).
+            let guard = self.replication.read();
+            let Some(wiring) = guard.as_ref() else {
+                return Err(RedexError::Channel(
+                    "replication wiring removed between precheck and spawn".into(),
+                ));
             };
-            self.spawn_replication_for(name, &file, rep_cfg, &wiring);
+            self.spawn_replication_for(name, &file, rep_cfg, wiring);
         }
 
         Ok(file)
