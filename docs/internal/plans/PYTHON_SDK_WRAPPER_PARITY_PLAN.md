@@ -6,7 +6,7 @@ The Rust SDK gaps found along the way have their own plan:
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-S0, S1a and S1 done 2026-10-01 (see each slice). S2–S8 not started.
+S0, S1a, S1 and S2 done 2026-10-01 (see each slice). S3–S8 not started.
 
 Amended 2026-10-01, same day:
 - The two open checks from the first draft were verified (see S0 and S5).
@@ -449,6 +449,37 @@ the slice were wrong. Two test homes, with different jobs:
     A daemon whose `process` raises comes back as `DaemonError`, not a crash.
     That last point is the `SDK_COMPUTE_SURFACE_PLAN.md` "daemon panics in
     non-Rust code" requirement, re-witnessed through the wrapper.
+- **Done 2026-10-01.**
+  - New module `net_sdk.compute`. `DaemonRuntime` is a **wrapper**, not a
+    subclass: the wheel's `#[pyclass(name = "DaemonRuntime")]` isn't declared
+    `subclass`. It takes a `MeshNode` or a raw `NetMesh` through the new
+    `net_sdk.mesh._native_mesh`, forwards every method, and exposes
+    `.native` for `net.AsyncDaemonRuntime` and the S3 groups.
+    `_native_runtime()` unwraps either form.
+  - **Types:** the `MeshDaemon` Protocol, `DaemonFactory`,
+    `DaemonHostConfig` and `MigrationOptions`, plus
+    `MigrationPhase` / `MigrationErrorKind`, taken from the Rust formatters.
+    `MigrationErrorKind` has all 14 kinds the wheel can emit. Re-exported
+    from the package root behind an `ImportError` guard.
+  - **Correction while testing:** `DaemonRuntime.snapshot()` returns the
+    core's opaque `StateSnapshot` encoding (it starts `CDS1`), not the
+    daemon's own `snapshot()` bytes. The first live test asserted the raw
+    bytes and failed; the test and the SDK docstring now say "opaque,
+    round-trip through `spawn_from_snapshot`".
+  - **Live test:** `test_sdk_compute.py`, 5 tests: echo from an SDK node,
+    snapshot → `spawn_from_snapshot` restores state, a raising `process`
+    surfaces as `DaemonError` with the host still ready, a raw `NetMesh` is
+    accepted while a non-mesh is a `TypeError`, and `.native` drives
+    `net.AsyncDaemonRuntime`.
+  - **Forwarding test:** `test_compute_wrapper.py`, 5 tests.
+  - **RED** without the module: all 5 live tests error with
+    `ModuleNotFoundError`.
+  - **GREEN:** `sdk-py` suite 356 passed. The binding compute, SDK, ctor,
+    channel and stub tests: 276 passed, 1 skipped.
+  - **Found on the way, not fixed here:** the TS SDK's
+    `MigrationErrorKind` lacks three kinds the core emits
+    (`no-target-available`, `buffer-full`, `wrong-peer`). Recorded in
+    `NODE_SDK_GAPS_PLAN.md` N6.
 
 ### S3 — `net_sdk.groups`
 

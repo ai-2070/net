@@ -678,6 +678,20 @@ class MeshNode:
         self.shutdown()
 
 
+def _native_mesh(mesh: Any) -> Any:
+    """The native ``NetMesh`` behind ``mesh``, for native constructors
+    (``DaemonRuntime``, ``MeshRpc``, …) that need one. Accepts a
+    :class:`MeshNode` or a raw ``NetMesh``; anything else is a
+    ``TypeError`` here rather than an opaque extraction error in Rust."""
+    if isinstance(mesh, MeshNode):
+        return mesh._native
+    if isinstance(mesh, _NetMesh):
+        return mesh
+    raise TypeError(
+        f"expected a net_sdk.MeshNode or a net.NetMesh, got {type(mesh).__name__}"
+    )
+
+
 __all__ = [
     "MeshNode",
     "MeshStream",

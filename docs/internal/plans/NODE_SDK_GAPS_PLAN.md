@@ -116,6 +116,12 @@ There are 24 native methods with no `MeshNode` wrapper:
   wraps only their error helpers.
 - The MCP helpers `classifyMcpServer` / `lowerMcpTool`.
 - `WriteToken` (cortex read-your-writes) and `normalizeGpuVendor`.
+- **`MigrationErrorKind` is incomplete** (found 2026-10-01 while building the
+  Python equivalent). `sdk-ts/src/compute.ts:86` lists 11 kinds plus
+  `'unknown'`, but the core also emits `no-target-available`, `buffer-full`
+  and `wrong-peer` (`format_migration_error` in
+  `bindings/python/src/compute.rs`; check the napi formatter matches). A TS
+  caller sees those three as `'unknown'`.
 
 ### Ruled out (not gaps)
 

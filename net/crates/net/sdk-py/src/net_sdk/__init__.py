@@ -441,4 +441,42 @@ else:
         "fingerprint",
     ]
 
+# Compute — daemons with snapshot + live migration (`net_sdk.compute`,
+# `PYTHON_SDK_WRAPPER_PARITY_PLAN.md` S2). Present iff the wheel was built
+# with the `compute` feature (the default one is).
+try:
+    from net_sdk.compute import (  # noqa: E402
+        CausalEvent,
+        DaemonError,
+        DaemonFactory,
+        DaemonHandle,
+        DaemonHostConfig,
+        DaemonRuntime,
+        MeshDaemon,
+        MigrationError,
+        MigrationErrorKind,
+        MigrationHandle,
+        MigrationOptions,
+        MigrationPhase,
+        migration_error_kind,
+    )
+except ImportError:  # pragma: no cover - minimal build
+    pass
+else:
+    __all__ += [
+        "CausalEvent",
+        "DaemonError",
+        "DaemonFactory",
+        "DaemonHandle",
+        "DaemonHostConfig",
+        "DaemonRuntime",
+        "MeshDaemon",
+        "MigrationError",
+        "MigrationErrorKind",
+        "MigrationHandle",
+        "MigrationOptions",
+        "MigrationPhase",
+        "migration_error_kind",
+    ]
+
 __version__ = "0.38.2"
