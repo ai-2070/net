@@ -35,7 +35,7 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 - **Work runs where the resource lives.** A credential never leaves the machine that holds it; the caller invokes a capability, not a host.
 - **One identity, several authority planes.** Permission tokens and organization grants decide who may reach a capability; subnet membership comes from a node's published tags.
 
-**Status:** pre-1.0 (`0.36.0`). Minor releases may break APIs — pin a minor and read the
+**Status:** pre-1.0. Major releases may break APIs — pin and read the
 [release notes](https://ai2070.net/docs/releases). The wire format is versioned separately, and
 subprotocol IDs are permanent.
 
