@@ -129,3 +129,14 @@ def test_groups_accept_the_raw_native_runtime_too(env) -> None:
     assert group.replica_count == 2
     with pytest.raises(TypeError):
         groups.ReplicaGroup.spawn("not a runtime", "echo", 2, b"\x44" * 32, "random")
+
+
+def test_a_bad_strategy_or_seed_is_a_group_error(env) -> None:
+    """The docs promise GroupError (invalid-config) for these. Native used
+    to raise the base DaemonError, which `except GroupError:` misses."""
+    _, groups, rt = env
+    with pytest.raises(groups.GroupError) as exc_info:
+        groups.ReplicaGroup.spawn(rt, "echo", 2, b"\x55" * 32, "roundrobin")
+    assert groups.group_error_kind(exc_info.value) == "invalid-config"
+    with pytest.raises(groups.GroupError):
+        groups.StandbyGroup.spawn(rt, "counter", 2, b"too-short")

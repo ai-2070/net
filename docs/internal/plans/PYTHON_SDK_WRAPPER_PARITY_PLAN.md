@@ -581,6 +581,18 @@ the slice were wrong. Two test homes, with different jobs:
   - **Forwarding test:** `test_groups_wrapper.py`, 4 tests.
   - **RED** without the module: 5 errors. **GREEN:** `sdk-py` 360 passed;
     the binding groups, compute, SDK and stub tests 294 passed, 1 skipped.
+  - **Follow-up (2026-10-01, reported in review):** the module promised
+    `GroupError` (`invalid-config`) for an unknown strategy or a seed that
+    isn't 32 bytes. The binding's `parse_strategy` / `parse_seed` raised the
+    base `DaemonError` instead, so `except GroupError:` missed both, though
+    `group_error_kind` still read `invalid-config` off the message. The
+    native fix: a `group_config_err` helper raises `GroupError`, with the
+    message text unchanged. `test_groups.py`'s seed test used to accept
+    either class; it now requires `GroupError`, and a strategy case was
+    added, plus an SDK-level case in `test_sdk_groups.py`. **RED** on the
+    unfixed wheel: all three fail with `DaemonError`. The Node binding
+    raises a plain error that the TS SDK classifies by message, so this was
+    Python-only.
 
 ### S4 — Remaining `MeshNode` methods
 
