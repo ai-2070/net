@@ -129,7 +129,10 @@ the SDK already passes them. Type checkers reject a correct call. S0 fixes it.
 
 Every new `net_sdk` member forwards to an existing native method. This plan adds
 **no** native method (the first draft's `NetMesh.num_shards` already existed; see
-S0). It touches the binding only to fix `_net.pyi`. Validation, error mapping and wire encoding stay
+S0). It touches the binding to fix `_net.pyi`, and for three native **bug
+fixes** found along the way (the async `poll` shard sweep, `GroupError` for a
+bad group strategy or seed, and the overflow-safe shard rotation); none of
+them adds surface. Validation, error mapping and wire encoding stay
 in Rust. The wrapper adds three things: typed signatures, `TypedDict`s for the
 dict-shaped inputs and outputs, and acceptance of `net_sdk` types where the
 wheel wants native ones. This is the pattern `meshos.py` and `deck.py` already
@@ -343,8 +346,9 @@ the slice were wrong. Two test homes, with different jobs:
       `events()` missed every stream on another shard. The S7 live test
       passed by luck: its channel landed on shard 0. The native `poll` now
       sweeps every shard from a rotating start, sharing the sync mesh's
-      `recv_cursor`. This is the plan's one native change; it fixes a bug
-      rather than adding surface. New test
+      `recv_cursor`. A native bug fix, not new surface: one of three in this
+      plan, with the S3 `group_config_err` fix and the third round's
+      `rotating_shard` overflow fix. New test
       `test_async_recv_sees_streams_on_every_shard`, which picks a stream
       on a non-zero shard. **RED**, with `recv` mutated to read shard 0:
       it times out.
