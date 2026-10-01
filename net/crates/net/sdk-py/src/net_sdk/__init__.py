@@ -479,4 +479,40 @@ else:
         "migration_error_kind",
     ]
 
+# Groups — HA / scaling overlays over compute daemons (`net_sdk.groups`,
+# `PYTHON_SDK_WRAPPER_PARITY_PLAN.md` S3). Present iff the wheel was built
+# with `compute` + `groups` (the default one is).
+try:
+    from net_sdk.groups import (  # noqa: E402
+        ForkGroup,
+        ForkRecord,
+        GroupError,
+        GroupErrorKind,
+        GroupHealth,
+        GroupMemberInfo,
+        GroupStatus,
+        LoadBalanceStrategy,
+        ReplicaGroup,
+        RequestContext,
+        StandbyGroup,
+        group_error_kind,
+    )
+except ImportError:  # pragma: no cover - minimal build
+    pass
+else:
+    __all__ += [
+        "ForkGroup",
+        "ForkRecord",
+        "GroupError",
+        "GroupErrorKind",
+        "GroupHealth",
+        "GroupMemberInfo",
+        "GroupStatus",
+        "LoadBalanceStrategy",
+        "ReplicaGroup",
+        "RequestContext",
+        "StandbyGroup",
+        "group_error_kind",
+    ]
+
 __version__ = "0.38.2"

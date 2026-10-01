@@ -6,7 +6,7 @@ The Rust SDK gaps found along the way have their own plan:
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-S0, S1a, S1 and S2 done 2026-10-01 (see each slice). S3–S8 not started.
+S0, S1a, S1, S2 and S3 done 2026-10-01 (see each slice). S4–S8 not started.
 
 Amended 2026-10-01, same day:
 - The two open checks from the first draft were verified (see S0 and S5).
@@ -488,6 +488,31 @@ the slice were wrong. Two test homes, with different jobs:
   `ReplicaGroup` of 3 sees every event. `ForkGroup.verify_lineage()` is true.
   `StandbyGroup.promote()` changes `active_origin`. An unknown factory kind
   raises `GroupError` and `group_error_kind` classifies it.
+- **Done 2026-10-01.**
+  - New module `net_sdk.groups`: `ReplicaGroup`, `ForkGroup` and
+    `StandbyGroup` wrap the wheel's classes. Their `spawn` / `fork`
+    classmethods accept the `net_sdk.compute.DaemonRuntime` wrapper or a raw
+    `net.DaemonRuntime`, through `compute._native_runtime`, which is called
+    *before* the native constructor so a wrong argument is a `TypeError`.
+    Every method and property forwards; `.native` exposes the wheel's group.
+  - **Types:** `LoadBalanceStrategy` (exactly `parse_strategy`'s five
+    strings) and `GroupErrorKind` (the seven kinds `group_err_str` /
+    `core_group_err_str` emit), plus `GroupStatus`, `GroupHealth`,
+    `GroupMemberInfo`, `ForkRecord` and `RequestContext`, matching the dicts
+    `groups.rs` builds and reads. Re-exported from the root behind an
+    `ImportError` guard.
+  - **Live test:** `test_sdk_groups.py`, 5 tests. A 3-replica group routes
+    with `consistent-hash` and every routed replica delivers. A fork group's
+    lineage verifies. A standby group's `promote` changes the active origin.
+    An unknown kind is classified `factory-not-found`. The raw native runtime
+    is accepted too.
+  - **Correction while testing:** a standby group needs a **stateful**
+    daemon, because `sync_standbys` on a stateless one raises
+    `registry-failed: active daemon is stateless`. The test uses a
+    snapshotting daemon, and `StandbyGroup.spawn`'s docstring now says so.
+  - **Forwarding test:** `test_groups_wrapper.py`, 4 tests.
+  - **RED** without the module: 5 errors. **GREEN:** `sdk-py` 360 passed;
+    the binding groups, compute, SDK and stub tests 294 passed, 1 skipped.
 
 ### S4 — Remaining `MeshNode` methods
 
