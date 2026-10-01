@@ -1,0 +1,43 @@
+.claude/skills/net-event-bus/redex.md
+  s_f9febccc288dd3::t_f912ada511701f 283
+net/crates/net/docs/CONFIG_REPLICATION.md
+  s_f9febccc288dd3::t_f912ada511701f 162
+web/src/content/docs/reference/replication-config.md
+  s_f9febccc288dd3::t_f912ada511701f 73
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_f9febccc288dd3::t_1bb4b176b68abe 90-92
+  s_f9febccc288dd3::t_853b9584650554 1350-1366,1371-1373,1378-1379,1384-1385
+  s_f9febccc288dd3::t_ecc08a6bbc7073 60-64,66-68,84-86
+  s_f9febccc288dd3::t_5d3ce52372a8bd 1367-1370,1374-1377,1380-1383
+net/crates/net/src/adapter/net/mesh.rs
+  s_f9febccc288dd3::t_4854477d9b5ee7 13776-13787
+  s_f9febccc288dd3::t_ecc08a6bbc7073 13206-13213,13216-13221,15058-15059,46035-46108,46111,46115,46119-46125,46140-46141,46146-46163
+  s_f9febccc288dd3::t_5bb5a62ee06411 46126-46139
+  s_f9febccc288dd3::t_1bb4b176b68abe 13214-13215,46142-46145
+  s_f9febccc288dd3::t_e5850042d128c5 13788-13789
+net/crates/net/src/adapter/net/redex/replication_placement.rs
+  s_f9febccc288dd3::t_5bb5a62ee06411 128-130,133
+  s_f9febccc288dd3::t_0680f872ce8780 135
+  s_f9febccc288dd3::t_ecc08a6bbc7073 98-103,134,180-184,190-191,194,211-213,215-247,252-253
+  s_f9febccc288dd3::t_33eb8f1b2a7d5a 254
+net/crates/net/tests/redex_replication_e2e.rs
+  s_f9febccc288dd3::t_1bb4b176b68abe 1225-1312
+docs/internal/plans/REDEX_REPLICA_PLACEMENT_PLAN.md
+  s_f9febccc288dd3::t_dce233d2c5bd74 165-179
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "82a9b787ee574d6403d9d3befaf9327f6ec78d68",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
