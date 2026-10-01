@@ -92,13 +92,13 @@ A mode is written after the status: `supported · core-only`.
 | Channel token roots (require_token anchoring) | supported | supported | supported | supported | supported |
 | Distributed batch fan-out (publish_many) | supported | not exposed | not exposed | not exposed | not exposed |
 | Membership rejection reason (AckReason taxonomy) | supported | partial | partial | partial | partial |
-| Permissive channel registry (opt out of strict default) | not exposed | supported · core-only | supported | not exposed | not exposed |
+| Permissive channel registry (opt out of strict default) | not exposed | supported | supported | not exposed | not exposed |
 | Mesh streams | supported | supported | supported | supported | supported |
 | Capability announce | supported | supported | supported | supported | supported |
 | Capability discovery | supported | supported | supported | supported | supported |
 | nRPC — typed request/response + streaming | supported | supported | supported | supported | supported |
 | Gang-claim scheduler | supported | supported | supported | supported | supported |
-| A2A — agent task handoff | supported | supported · core-only | supported | not exposed | not exposed |
+| A2A — agent task handoff | supported | supported | supported | not exposed | not exposed |
 | A2A — paid task admission (prepare → purchase → submit) | supported | not exposed | supported | not exposed | not exposed |
 | Organization capability auth | supported | supported | supported | supported | supported |
 | Organization-scoped streaming RPC | supported | supported | supported | supported | supported |
@@ -188,6 +188,16 @@ C because those bindings deliberately discriminate on the consumer instead;
 this is a convenience layer, not a missing feature. *Distributed mesh channels*
 are the real thing and exist in all five. Do not read a claim about one as
 evidence about the other — `concepts.md` § Channel opens with the split.
+
+**Node reaches all of this from `@net-mesh/sdk` now; no Node cell is
+`core-only`.** A2A (`serveA2a`, `submitTask`, `taskStatus`, `cancelTask`), NAT
+traversal (`natType`, `connectDirect`, …), enrollment over the mesh (`join`,
+`renew`, `serveEnrollmentAuto`), `publishTools`, placement filters and every
+`MeshNode.create` option (`permissiveChannels` among them) are on the SDK's
+`MeshNode`, and a build-time check fails if a native `NetMesh` method is left
+unwrapped. Consent, delegation, enrollment, blobs, the aggregator clients and
+`Redex` replication are exported from the package root. Payments is not a gap:
+it lives in `@net-mesh/core` by design.
 
 **Python reaches all of this from `net_sdk` now; Redis dedup is the one
 `core-only` Python cell left.** Distributed channels (`register_channel`,

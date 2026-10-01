@@ -71,10 +71,15 @@ Everything below imports from `@net-mesh/sdk`, with no reach into
   `traversalStats()` and reflex overrides.
 - **Aggregators:** `createRegistryClient(mesh)` / `createFoldQueryClient(mesh)`.
 - **Read-your-writes:** `tasks.waitForToken(new WriteToken(origin, seq), ms)`.
+- **Replicated logs:** `redex.enableReplication(mesh)`, then `openFile(name,
+  { replication: { factor: 3 } })` on every node that should take part; the
+  nodes pick the replicas and elect a leader
+  ([reference](/docs/reference/replication-config)).
 
-`node.shutdown()` needs the node's only reference. A `mesh.rpc()` handle or an
-aggregator client holds one, so release it first (`rpc.raw.close()`,
-`client.close()`), or shutdown rejects with *outstanding references exist*.
+`node.shutdown()` needs the node's only reference. A `mesh.rpc()` handle, an
+aggregator client or a replicating `Redex` holds one, so release it first
+(`rpc.raw.close()`, `client.close()`, `await redex.disableReplication()`), or
+shutdown rejects with *outstanding references exist*.
 
 ## Serving browser games from Node
 

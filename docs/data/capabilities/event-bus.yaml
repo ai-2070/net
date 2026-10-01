@@ -211,7 +211,6 @@ operations:
       status: not exposed
     Node / TS:
       status: supported
-      mode: core-only
       anchor: permissiveChannels
     Python:
       status: supported
@@ -312,7 +311,6 @@ operations:
       anchor: serve_a2a
     Node / TS:
       status: supported
-      mode: core-only
       anchor: serveA2a
     Python:
       status: supported

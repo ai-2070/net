@@ -14,12 +14,13 @@ import { NetNode } from '@net-mesh/sdk';
 ```
 
 **Two packages, and the split matters.** `@net-mesh/sdk` is the ergonomic
-wrapper; `@net-mesh/core` is the napi binding underneath it. Several surfaces
-are reachable *only* from `@net-mesh/core` — payments is entirely there, and
-`bindings/coverage.md` marks each one `core-only`. But not every one: org has an
-SDK-level facade too (see **Protected services (org)** below). If an import from
-`@net-mesh/sdk` does not resolve, check the matrix before concluding the feature
-is missing.
+wrapper; `@net-mesh/core` is the napi binding underneath it. Payments is the
+one surface reachable *only* from `@net-mesh/core`, by design; everything else
+the matrix lists for Node is on `@net-mesh/sdk` (the root, plus the
+`@net-mesh/sdk/tool`, `/org` and `/deck` entry points). Native identity-taking
+calls (delegation, enrollment) take `identity.toNapi()`. If an import from
+`@net-mesh/sdk` does not resolve, check `bindings/coverage.md` before concluding
+the feature is missing.
 
 ## Construction and lifecycle
 
@@ -176,9 +177,9 @@ const saving = persistStore(host, { file, intervalMs: 5_000 });
 
 ## Gaps
 
-`bindings/coverage.md` is authoritative. The one to know up front: A2A is
-`core-only` here — `serveA2a` is on `@net-mesh/core`, not the wrapper. And it
-is the **free** A2A path only: `submitTask` gained optional `taskId` /
+`bindings/coverage.md` is authoritative. The one to know up front: A2A on
+Node (`mesh.serveA2a` / `submitTask` / `taskStatus` / `cancelTask`, all on the
+SDK's `MeshNode`) is the **free** A2A path only: `submitTask` gained optional `taskId` /
 `service` / `revision`, but those address a catalog's free entries. There is
 no paid A2A on Node in either direction — no `describeA2a`, no
 prepare/purchase pair, no `submitTaskPaid` — so a paid catalog entry refuses

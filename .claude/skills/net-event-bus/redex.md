@@ -142,7 +142,8 @@ await file.close(); // async — same
 **Key facts:**
 - `RedexFile.sync()` and `RedexFile.close()` are **async** (return `Promise<void>`). Awaiting them matters: an un-awaited `close()` can let the process exit before the fsync lands.
 - `BigInt` for sequence numbers and retention caps — JS numbers lose precision past 2^53. Don't pass plain `Number`.
-- Per-channel config naming is camelCase; the underlying core accepts both shapes but Node binding rejects snake_case for tagged enums (`'colocationStrict'`, not `'colocation_strict'`).
+- Per-channel config fields are camelCase (`heartbeatMs`, `pinnedNodes`, `placementMetadata`). Enum *values* are kebab-case strings: `placement` is `'standard'` / `'pinned'` / `'colocation-strict'`, `onUnderCapacity` is `'withdraw'` / `'evict-oldest'` (Python uses the snake-case forms, `'colocation_strict'`).
+- `redex.disableReplication()` returns a **Promise**. `await` it before `node.shutdown()`, which needs the node's only reference and otherwise can still find the replication runtimes holding it.
 
 ## Go
 
@@ -178,7 +179,7 @@ tail.Close()
 **Key facts:**
 - `RedexFile.mu` is a `sync.RWMutex` so concurrent appends / reads don't serialize. Earlier versions used a plain `sync.Mutex` which defeated the substrate's reader-counter.
 - `runtime.SetFinalizer` runs `Close()` on the GC thread; for predictable cleanup, call `Close()` explicitly. The finalizer is the last-resort safety net.
-- `OpenFile` returns `ErrInvalidReplicationConfig` for shape errors (factor / heartbeat ranges, empty pinned list) vs. `ErrReplicationRequiresEnable` for "you passed `Replication` but didn't call `EnableReplication(mesh)` first."
+- `OpenFile` returns `ErrInvalidReplicationConfig` for shape errors (factor / heartbeat ranges, empty pinned list, `PlacementColocationStrict` without `PlacementMetadata["colocate-with-strict"]`, a colocation hint that isn't 16 lowercase hex digits) vs. `ErrReplicationRequiresEnable` for "you passed `Replication` but didn't call `EnableReplication(mesh)` first."
 
 ## C
 
@@ -250,16 +251,17 @@ let file = redex.open_file(
 )?;
 ```
 
-Two things must happen. `enable_replication(mesh)` installs the per-`Redex` router on the mesh's `SUBPROTOCOL_REDEX` dispatch (`0x0E00`) — idempotent, safe from multiple call sites. Then each `open_file` with `replication: Some(_)` spawns **one Tokio task per channel** (the coordinator: election, heartbeats, sync). Use the *same* `RedexFileConfig` on every node hosting a replica.
+Two things must happen. `enable_replication(mesh)` installs the per-`Redex` router on the mesh's `SUBPROTOCOL_REDEX` dispatch (`0x0E00`) — idempotent, safe from multiple call sites. Then each `open_file` with `replication: Some(_)` spawns **one Tokio task per channel** (the coordinator: placement, election, heartbeats, sync). Use the *same* `RedexFileConfig` on every node that should take part. Nothing else is needed: the runtime picks the replicas, joins, and elects a leader by itself; write on the leader.
 
 ### `ReplicationConfig` fields — ranges, defaults, and what they cost
 
 | Field | Range | Default | Notes |
 |---|---|---|---|
 | `factor: u8` | `[1, 16]` | `3` | Replicas *including* the leader. `1` collapses to single-node-with-coordinator (useful for testing the daemon lifecycle without peers). The `16` ceiling is conservative — heartbeat fanout makes overhead superlinear above ~8. **When `placement = Pinned(nodes)`, `nodes.len()` wins over `factor`.** |
-| `placement: PlacementStrategy` | — | `Standard` | `Standard` scores candidates on `metadata.intent`, `metadata.colocate-with`, `scope:` tags, proximity, and resource availability. `Pinned(Vec<NodeId>)` is manual. `ColocationStrict` requires every replica to sit on a node already holding the chain named by `metadata.colocate-with-strict`, refusing insufficient-coverage nodes. |
+| `placement: PlacementStrategy` | — | `Standard` | `Standard`: every node that opens the channel advertises candidacy (`dataforts:replica-candidate:<channel id>`), and every node computes the **same** top-`factor` set from announced data only (colocation, `intent`, advertised storage; ties to the lower `NodeId`, never RTT, which differs by viewer). `Pinned(Vec<NodeId>)` is manual and known at once. `ColocationStrict` is `Standard` restricted to nodes already holding the chain named by `placement_metadata["colocate-with-strict"]`; validation rejects it without one. |
+| `placement_metadata: BTreeMap<String, String>` | — | empty | Hints for `Standard` / `ColocationStrict`: `colocate-with` (prefer holders of that chain) and `colocate-with-strict` (require it), each a chain's **16 lowercase hex digit** origin hash (anything else is rejected: it could never match a `causal:` tag), and `intent`. Ignored by `Pinned`. Node `placementMetadata`, Python `replication_placement_metadata`, C / Go `placement_metadata`. |
 | `heartbeat_ms: u64` | `>= 100` | `500` | **Failure detection is `3 × heartbeat_ms`** (three-missed hysteresis) — so the default declares a silent leader dead in ~1.5 s. Don't go below 100 ms; heartbeat traffic starts dominating the channel's throughput. |
-| `leader_pinned: Option<NodeId>` | — | `None` | `None` = the deterministic nearest-RTT election picks the lowest-RTT healthy replica. `Some(node)` favors `node` whenever it's healthy. If `placement = Pinned(set)`, the pinned leader **must** be in `set` or validation rejects. |
+| `leader_pinned: Option<NodeId>` | — | `None` | `None` = the deterministic nearest-RTT election picks the lowest-RTT healthy replica (each node ranks itself first, so two may win at once; the one that hears a peer leader with a higher tail, or the same tail and a lower `NodeId`, concedes). `Some(node)` wins whenever it's in the set and healthy. If `placement = Pinned(set)`, the pinned leader **must** be in `set` or validation rejects; under `Standard` it applies only while `node` is in the resolved set. |
 | `on_under_capacity: UnderCapacity` | — | `Withdraw` | See below. |
 | `replication_budget_fraction: f32` | `(0.0, 1.0]` | `0.5` | Fraction of measured NIC peak that sync I/O may consume, as a token bucket. Leaders reject `SyncRequest` with a `Backpressure` NACK when the bucket empties; replicas back off and retry the same request. (The denominator is a 1 Gbps placeholder today — the proximity-graph throughput probe wires the real measured peak in a follow-up.) |
 | `default_bandwidth_class` | — | `Foreground` | Per-channel default `BandwidthClass` stamped on emitted `SyncRequest`s. Receivers honor a per-request override in preference to this. |
@@ -276,7 +278,9 @@ Either branch increments `under_capacity_total`, so the operator metric reflects
 
 ### Lifecycle
 
-`Idle` → (placement selects this node) → `Replica` (advertises `causal:<hex>`) → (leader silent for `3 × heartbeat_ms`) → `Candidate` → `elect()` → `Leader` / back to `Replica` / stay `Candidate` and retry. `close_file` returns it to `Idle` and unregisters the router. In the steady state the leader heartbeats, replicas observe its `tail_seq`, and a behind replica pulls with `SyncRequest` → `SyncResponse`.
+`Idle` → (selected: in the pinned set at start, or in the set placement resolves, re-checked every heartbeat) → `Replica` (advertises `causal:<hex>`, starts a leader wait) → (no leader heard, or the leader silent, for `3 × heartbeat_ms`) → `Candidate` → `elect()` → `Leader` / back to `Replica`. A node that stops being selected goes back to `Idle` (`PlacementDeselected`, tag withdrawn). `close_file` returns it to `Idle` and unregisters the router. In the steady state the leader heartbeats, replicas observe its `tail_seq`, and a behind replica pulls with `SyncRequest` → `SyncResponse`.
+
+**Placement converges at capability-announce speed.** Each node rate-limits its own capability announcements (`min_announce_interval`, 10 s by default), so a `Standard` set can take up to about two windows to form. A node that resolves *fewer* than `factor` candidates waits two windows before joining that short set: joining at once would make it the leader of a set of one beside another such leader, and their writes would diverge. A full set joins at once. Don't write until the leader has emerged (`leader_changes_total` on it, or the coordinator's role in Rust).
 
 **There is no leader-election message on the wire.** Election is a deterministic function over each node's locally-known state (proximity-graph RTT, replica-set membership, `NodeId` ordering); what peers actually observe is the capability tag being announced or withdrawn by the resulting `transition_to`. That's why the replication subprotocol has no `LeaderElection` dispatch code.
 
@@ -295,7 +299,11 @@ When a leader refuses a `SyncRequest` it answers with a typed code, and the repl
 
 Per-channel counters via `ReplicationMetricsRegistry::snapshot().prometheus_text()`: `dataforts_replication_lag_seconds{channel,role}` (gauge), `..._sync_bytes_total`, `dataforts_leader_changes_total`, `..._under_capacity_total`, `..._skip_ahead_total`, `..._election_thrash_total`, `..._witness_withdrawals_total` (reserved for a future witness phase), and `..._announce_divergence_total`.
 
-That last one is easy to miss and worth an alert: it bumps when a `* → Idle` transition's withdraw-chain call **fails after the state cell already flipped to `Idle`**. While it's non-zero, the mesh may still be advertising this node as a chain holder for a channel it no longer replicates — readers get routed to a node that will not serve them. Recovery is opportunistic on the next `transition_to`, so a stuck non-zero value is a real problem, not a blip.
+That last one is easy to miss and worth an alert: it bumps when a `* → Idle` transition's withdraw-chain call **fails after the state cell already flipped to `Idle`**. Until a retry lands, the mesh may still be advertising this node as a chain holder for a channel it no longer replicates — readers get routed to a node that will not serve them. The runtime retries a failed announce or withdraw every heartbeat (and a few times as it exits), so one bump is a blip; a counter that keeps climbing means the retries keep failing.
+
+### Turning replication off
+
+`Redex::disable_replication()` undoes `enable_replication`: every channel's runtime shuts down gracefully (withdrawing its candidacy and chain tag), the router comes off the mesh, and the `Redex` drops its `Arc<MeshNode>`. Open files stay open as local logs. The sync Rust call only schedules the shutdown; `disable_replication_and_wait().await` returns once the runtimes have released the mesh. The bindings all wait: `await redex.disableReplication()` (Node), `redex.disable_replication()` (Python, blocking), `net_redex_disable_replication` (C). `open_file` honors a channel's config only on its first open, so a channel that was open across a disable must be **closed and reopened** after re-enabling to replicate again.
 
 The registry is bounded by `MAX_TRACKED_CHANNELS`; channels past the cap fold into a shared `__overflow__` bucket. If you see `__overflow__` in a scrape, per-channel attribution is already lost for some channels — that's a cardinality signal, not a channel name.
 

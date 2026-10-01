@@ -250,7 +250,7 @@ ignores `exports` and resolves only the root.
 |---|---|
 | `net` | `MeshNode`, channel auth, placement filters (`registerPlacementFilter`) |
 | `nat-traversal` | `MeshNode.natType` / `reflexAddr` / `probeReflex` / `connectDirect` / `connectDirectAuto` / `traversalStats`, reflex overrides |
-| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `WriteToken`, `MeshNode.rpc()` |
+| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `WriteToken`, `MeshNode.rpc()`; with `net`, `Redex` replication (`enableReplication` / `await disableReplication()`) |
 | `meshdb` | `MeshQuery`, `MeshQueryRunner`, `MeshQueryStream`, `QueryBuilder`, `InMemoryChainReader` |
 | `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, `DaemonHealth`, `CapabilityAdvert` |
 | `compute` | `DaemonRuntime`, `DaemonHandle`, `MigrationHandle` |
