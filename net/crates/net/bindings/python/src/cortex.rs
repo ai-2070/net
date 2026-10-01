@@ -261,6 +261,16 @@ impl PyRedex {
         self.mesh_runtime.get_or_init(|| mesh.runtime_arc()).clone()
     }
 
+    /// The runtime a spawning call should run on: the mesh's once
+    /// replication or greedy is enabled, else the shared binding runtime.
+    fn spawn_runtime(&self) -> PyResult<Arc<crate::runtime_guard::GuardedRuntime>> {
+        #[cfg(feature = "net")]
+        if let Some(rt) = self.mesh_runtime.get() {
+            return Ok(rt.clone());
+        }
+        make_runtime()
+    }
+
     /// Crate-internal accessor for the underlying `Redex` Arc.
     /// Lets sibling binding modules (e.g. `blob::PyMeshBlobAdapter`)
     /// wire a substrate-owned blob adapter against the same handle
@@ -436,13 +446,14 @@ impl PyRedex {
                 replication_budget_fraction,
             )?);
         }
-        #[cfg(feature = "net")]
-        let _enter = self.mesh_runtime.get().map(|rt| rt.enter());
+        // Opening can spawn: a replicated channel's runtime, or an
+        // interval fsync task. The Python thread has no reactor.
+        let runtime = self.spawn_runtime()?;
+        let _enter = runtime.enter();
         let file = self
             .inner
             .open_file(&channel, cfg)
             .map_err(|e| RedexError::new_err(format!("open_file: {}", e)))?;
-        let runtime = make_runtime()?;
         Ok(PyRedexFile {
             inner: Arc::new(file),
             runtime,
@@ -460,9 +471,11 @@ impl PyRedex {
     /// See `CONFIG_REPLICATION.md` for the full operator surface.
     #[cfg(feature = "net")]
     fn enable_replication(&self, mesh: &crate::mesh_bindings::NetMesh) -> PyResult<()> {
+        // Clone the node first: a shut-down mesh fails here, before its
+        // runtime is recorded for this Redex.
+        let arc = mesh.node_arc_clone()?;
         let rt = self.adopt_runtime(mesh);
         let _enter = rt.enter();
-        let arc = mesh.node_arc_clone()?;
         self.inner.enable_replication(arc);
         Ok(())
     }
@@ -494,7 +507,8 @@ impl PyRedex {
     fn disable_replication(&self) {
         // Enter the mesh runtime so the core spawns the graceful
         // shutdown there instead of aborting the runtime tasks.
-        let _enter = self.mesh_runtime.get().map(|rt| rt.enter());
+        let rt = self.spawn_runtime();
+        let _enter = rt.as_ref().ok().map(|rt| rt.enter());
         self.inner.disable_replication();
     }
 
@@ -613,9 +627,11 @@ impl PyRedex {
             };
             cfg = cfg.with_colocation_policy(parsed);
         }
+        // Clone the node first: a shut-down mesh fails here, before its
+        // runtime is recorded for this Redex.
+        let arc = mesh.node_arc_clone()?;
         let rt = self.adopt_runtime(mesh);
         let _enter = rt.enter();
-        let arc = mesh.node_arc_clone()?;
         // Local-caps + intent-registry default to empty / substrate
         // defaults respectively. Application code refreshes via
         // `greedy_set_local_caps` and `greedy_register_intent`
@@ -722,9 +738,11 @@ impl PyRedex {
         if let Some(reference) = normalization_reference_rate {
             policy = policy.with_normalization_reference_rate(reference as f32);
         }
+        // Clone the node first: a shut-down mesh fails here, before its
+        // runtime is recorded for this Redex.
+        let arc = mesh.node_arc_clone()?;
         let rt = self.adopt_runtime(mesh);
         let _enter = rt.enter();
-        let arc = mesh.node_arc_clone()?;
         self.inner
             .enable_gravity_for_greedy(
                 arc,

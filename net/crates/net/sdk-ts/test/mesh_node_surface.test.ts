@@ -5,6 +5,9 @@
 // caller's arguments by identity and the caller gets the native's result.
 // Behaviour is covered live in `mesh_node_live.test.ts`.
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
 const native = vi.hoisted(() => ({}) as Record<string, ReturnType<typeof vi.fn>>);
@@ -68,7 +71,17 @@ describe('MeshNode forwards every S5 method to the native node', async () => {
     expect(result).toEqual({ from: name });
   });
 
-  it('the table covers all 25 methods S5 added', () => {
-    expect(ROWS).toHaveLength(25);
+  it('the table covers every forwarding method in src/mesh.ts', () => {
+    // Read the forwarders out of the source rather than restating a count:
+    // a method added to MeshNode in this shape but not to ROWS fails here.
+    const src = readFileSync(join(__dirname, '../src/mesh.ts'), 'utf8');
+    const forwarders = [
+      ...src.matchAll(/^\s+(\w+)\(\.\.\.args: Parameters<NapiNetMesh\['(\w+)'\]>\)/gm),
+    ].map((m) => {
+      expect(m[2], `${m[1]} forwards to a different native method`).toBe(m[1]);
+      return m[1];
+    });
+    expect(forwarders.length).toBeGreaterThanOrEqual(25);
+    expect(ROWS.map(([name]) => name).sort()).toEqual(forwarders.sort());
   });
 });

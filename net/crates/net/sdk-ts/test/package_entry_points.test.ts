@@ -39,7 +39,9 @@ function allSourceFiles(dir: string): string[] {
 
 /** Resolve a relative import specifier from `fromFile` to a source file. */
 function resolveRelative(fromFile: string, spec: string): string | undefined {
-  const base = resolve(dirname(fromFile), spec);
+  // `src/` imports siblings both bare (`'./mesh'`) and with the emitted
+  // extension (`'./_internal.js'`); the latter names a `.ts` source.
+  const base = resolve(dirname(fromFile), spec.replace(/\.js$/, ''));
   for (const candidate of [`${base}.ts`, join(base, 'index.ts')]) {
     try {
       if (statSync(candidate).isFile()) return candidate;
@@ -97,6 +99,7 @@ describe('package entry points', () => {
       }
     }
     // The README names one deliberately, as the example of what fails.
-    expect(missing.filter((m) => !m.endsWith('@net-mesh/sdk/mesh'))).toEqual([]);
+    // Exempt exactly that entry, so the same subpath named elsewhere fails.
+    expect(missing.filter((m) => m !== 'README.md: @net-mesh/sdk/mesh')).toEqual([]);
   });
 });

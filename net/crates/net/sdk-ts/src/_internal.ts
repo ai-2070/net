@@ -60,8 +60,11 @@ export function setNapiMesh(host: object, napi: NapiNetMesh): void {
 
 /**
  * The native mesh behind `mesh`: a `MeshNode`'s registered handle, or
- * `mesh` itself when it is already native. For modules that accept
- * either form and can't import `MeshNode` without a cycle.
+ * `mesh` itself when it is already native. Lets a module accept either
+ * form without a runtime import of `mesh.ts` for an `instanceof` check;
+ * `cortex.ts` uses it and imports `MeshNode` as a type only. (The
+ * `instanceof` pattern in `aggregator.ts` works too; this keeps the
+ * low-level storage module independent of the mesh module at runtime.)
  *
  * @internal
  */

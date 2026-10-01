@@ -16,8 +16,8 @@
  * `delegation` feature; published packages ship every feature.
  *
  * **Errors, two families.** A bad argument (an entity id that isn't 32 bytes,
- * a revocation floor that would go backwards) throws an `Error` whose message
- * starts `delegation: `: see {@link isDelegationError}. A malformed or
+ * a negative or oversized `BigInt`) throws an `Error` whose message starts
+ * `delegation: `: see {@link isDelegationError}. A malformed or
  * unverifiable *chain* (`DelegationChain.fromBytes`) throws with the token
  * taxonomy instead, `token: <kind>` (for example `token: invalid_format`), the
  * same kinds as the SDK's `TokenErrorKind`.

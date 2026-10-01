@@ -62,8 +62,9 @@ Everything below imports from `@net-mesh/sdk`, with no reach into
   `mesh.renew` doing it over the mesh. These take the native identity:
   pass `identity.toNapi()`.
 - **Blobs:** `createMeshBlobAdapter(redex, id)` builds the adapter that
-  `mesh.serveBlobTransfer`, `storeDir` and `fetchDir` take. The fetching node
-  serves the transfer engine too.
+  `mesh.serveBlobTransfer` and `storeDir` take. `fetchDir(sourceId, manifest,
+  dest)` takes none, but the fetching node must have called
+  `serveBlobTransfer` first: it needs the transfer engine too.
 - **Agent tasks and tools:** `mesh.serveA2a` / `submitTask` / `taskStatus` /
   `cancelTask`, and `mesh.publishTools` (needs `permissiveChannels: true`).
 - **NAT traversal:** `mesh.natType()`, `reflexAddr()`, `connectDirect`,

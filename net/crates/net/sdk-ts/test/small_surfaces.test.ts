@@ -54,26 +54,36 @@ describe('aggregator clients', () => {
     // failed with "outstanding references exist" (the MeshRpc.close
     // precedent).
     const node = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: PSK });
-    const registry = createRegistryClient(node);
-    const fold = createFoldQueryClient(node);
-    const alias = registry.withDeadline(500);
-    expect(registry.isClosed).toBe(false);
-
-    registry.close();
-    fold.close();
-    // Aliases share state: closing one closes them all.
-    expect(alias.isClosed).toBe(true);
-    expect(fold.isClosed).toBe(true);
-    await node.shutdown();
-
-    let caught: unknown;
+    let shutDown = false;
     try {
-      await alias.list(1n);
-    } catch (e) {
-      caught = classifyAggregatorError(e, 'registry');
+      const registry = createRegistryClient(node);
+      const fold = createFoldQueryClient(node);
+      const alias = registry.withDeadline(500);
+      expect(registry.isClosed).toBe(false);
+
+      registry.close();
+      fold.close();
+      // Aliases share state: closing one closes them all.
+      expect(alias.isClosed).toBe(true);
+      expect(fold.isClosed).toBe(true);
+      await node.shutdown();
+      shutDown = true;
+
+      let caught: unknown;
+      try {
+        await alias.list(1n);
+      } catch (e) {
+        caught = classifyAggregatorError(e, 'registry');
+      }
+      expect(caught).toBeInstanceOf(RegistryClientError);
+      expect((caught as RegistryClientError).kind).toBe('invalid-args');
+      // The cache methods honour close() too.
+      expect(() => fold.invalidateCache()).toThrow(/client is closed/);
+    } finally {
+      // An assertion that failed before the planned shutdown must not
+      // leave the node bound for the rest of the worker.
+      if (!shutDown) await node.shutdown().catch(() => {});
     }
-    expect(caught).toBeInstanceOf(RegistryClientError);
-    expect((caught as RegistryClientError).kind).toBe('invalid-args');
   }, 15_000);
 });
 

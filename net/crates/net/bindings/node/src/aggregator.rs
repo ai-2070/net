@@ -242,6 +242,10 @@ impl RegistryClient {
     /// every alias `with*` returned, since they share state. Afterwards
     /// each call rejects with `agg:invalid-args: client is closed`.
     ///
+    /// A call already in flight holds its own reference until it
+    /// settles; await outstanding calls before `shutdown()`, or it may
+    /// still find the node shared.
+    ///
     /// Without it the reference lived until V8 finalized the client, so
     /// `shutdown()` failed with "outstanding references exist" on no
     /// schedule the caller controls (the `MeshRpc.close()` precedent).
@@ -337,18 +341,23 @@ impl FoldQueryClient {
     }
 
     #[napi]
-    pub fn invalidate_cache(&self) {
-        if let Some(client) = self.inner.read().as_ref() {
-            client.invalidate_cache();
-        }
+    pub fn invalidate_cache(&self) -> Result<()> {
+        self.inner
+            .read()
+            .as_ref()
+            .ok_or_else(closed_err)?
+            .invalidate_cache();
+        Ok(())
     }
 
     #[napi]
     pub fn invalidate_target(&self, target_node_id: BigInt) -> Result<()> {
         let target = crate::common::bigint_u64(target_node_id)?;
-        if let Some(client) = self.inner.read().as_ref() {
-            client.invalidate_target(target);
-        }
+        self.inner
+            .read()
+            .as_ref()
+            .ok_or_else(closed_err)?
+            .invalidate_target(target);
         Ok(())
     }
 
@@ -356,6 +365,10 @@ impl FoldQueryClient {
     /// `NetMesh.shutdown` can take sole ownership. Idempotent; it closes
     /// every alias `with*` returned, since they share state. Afterwards
     /// each call rejects with `agg:invalid-args: client is closed`.
+    ///
+    /// A call already in flight holds its own reference until it
+    /// settles; await outstanding calls before `shutdown()`, or it may
+    /// still find the node shared.
     ///
     /// Without it the reference lived until V8 finalized the client, so
     /// `shutdown()` failed with "outstanding references exist" on no

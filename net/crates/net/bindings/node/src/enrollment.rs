@@ -54,6 +54,23 @@ fn enroll_err(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("enrollment: {msg}"))
 }
 
+/// Re-prefix an argument error from the delegation module's shared
+/// helpers, so every failure an enrollment API throws carries
+/// `enrollment: ` (what the SDK's `isEnrollmentError` checks).
+fn as_enroll_err(e: Error) -> Error {
+    enroll_err(e.reason.trim_start_matches("delegation: "))
+}
+
+/// [`entity_id_from_buffer`] with an `enrollment: ` error.
+fn entity_id(buf: &Buffer) -> Result<net::adapter::net::identity::EntityId> {
+    entity_id_from_buffer(buf).map_err(as_enroll_err)
+}
+
+/// [`u64_arg`] with an `enrollment: ` error.
+fn u64_in(name: &str, value: BigInt) -> Result<u64> {
+    u64_arg(name, value).map_err(as_enroll_err)
+}
+
 /// Run synchronous store IO on the blocking pool — done inline in an
 /// `async fn` it would occupy a napi tokio worker for the duration,
 /// starving unrelated async binding work. The Node analog of the Python
@@ -76,7 +93,7 @@ fn to_node_identity(sdk: &SdkIdentity) -> Identity {
 /// confirm the mesh identity matches — `A1B2-C3D4-E5F6-0789`.
 #[napi]
 pub fn fingerprint(entity: Buffer) -> Result<String> {
-    Ok(sdk_fingerprint(&entity_id_from_buffer(&entity)?))
+    Ok(sdk_fingerprint(&entity_id(&entity)?))
 }
 
 /// A pre-authorization to *ask* to join a mesh — not a key. Carries the
@@ -139,7 +156,7 @@ impl InviteToken {
     /// Whether the invite has expired at `now` (unix secs).
     #[napi]
     pub fn is_expired(&self, now: BigInt) -> Result<bool> {
-        Ok(self.inner.is_expired(u64_arg("now", now)?))
+        Ok(self.inner.is_expired(u64_in("now", now)?))
     }
 
     /// Canonical wire bytes.
@@ -271,8 +288,8 @@ impl JoinOutcome {
     #[allow(clippy::wrong_self_convention)]
     #[napi]
     pub fn into_chain(&self, device: Buffer, invite_root: Buffer) -> Result<DelegationChain> {
-        let device_id = entity_id_from_buffer(&device)?;
-        let root_id = entity_id_from_buffer(&invite_root)?;
+        let device_id = entity_id(&device)?;
+        let root_id = entity_id(&invite_root)?;
         let chain = self
             .inner
             .clone()
@@ -441,7 +458,7 @@ impl OperatorEnrollment {
     /// delegations) and stamp the inventory. Reads the system clock.
     #[napi]
     pub async fn revoke(&self, device: Buffer) -> Result<()> {
-        let id = entity_id_from_buffer(&device)?;
+        let id = entity_id(&device)?;
         let inner = self.inner.clone();
         off_thread(move || inner.revoke(&id))
             .await?
@@ -465,7 +482,7 @@ impl OperatorEnrollment {
     /// its floor). Returns whether a record existed.
     #[napi]
     pub async fn forget(&self, device: Buffer) -> Result<bool> {
-        let id = entity_id_from_buffer(&device)?;
+        let id = entity_id(&device)?;
         let inner = self.inner.clone();
         off_thread(move || inner.forget(&id))
             .await?
@@ -478,7 +495,7 @@ impl OperatorEnrollment {
     pub fn pending_invites(&self, now: BigInt) -> Result<Vec<InviteToken>> {
         Ok(self
             .inner
-            .pending_invites(u64_arg("now", now)?)
+            .pending_invites(u64_in("now", now)?)
             .into_iter()
             .map(|inner| InviteToken { inner })
             .collect())
@@ -518,7 +535,7 @@ impl DeviceEnrollment {
                 device.to_sdk_identity(),
                 chain.inner_chain(),
                 rendezvous,
-                u64_arg("enrolledAt", enrolled_at)?,
+                u64_in("enrolledAt", enrolled_at)?,
             ),
         })
     }
@@ -597,7 +614,7 @@ impl DeviceEnrollment {
     pub fn needs_renewal(&self, window_seconds: u32, now: BigInt) -> Result<bool> {
         Ok(self
             .inner
-            .needs_renewal(u64::from(window_seconds), u64_arg("now", now)?))
+            .needs_renewal(u64::from(window_seconds), u64_in("now", now)?))
     }
 }
 

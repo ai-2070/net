@@ -26,32 +26,36 @@ vi.mock('@net-mesh/core', async (importOriginal) => {
 
 import { MeshNode, type MeshNodeConfig } from '../src/index';
 
+// Every option, once: the sentinel test sends each, and the coverage test
+// checks the native declaration against this list.
+const FORWARDED_KEYS: (keyof MeshNodeConfig)[] = [
+    'bindAddr',
+    'psk',
+    'heartbeatIntervalMs',
+    'sessionTimeoutMs',
+    'numShards',
+    'capabilityGcIntervalMs',
+    'requireSignedCapabilities',
+    'subnet',
+    'subnetPolicy',
+    'identitySeed',
+    'subnetAuthorities',
+    'subnetAttachment',
+    'subnetControlChannel',
+    'subnetExports',
+    'reflexOverride',
+    'tryPortMapping',
+    'autoDirectUpgrade',
+    'permissiveChannels',
+];
+
 describe('MeshNode.create option forwarding', () => {
   it('passes every config option to the native constructor unchanged', async () => {
     seen.length = 0;
     // Distinct sentinel objects: identity, not equality, so a swapped or
     // re-wrapped value is caught. The `as` reflects that the values are
     // deliberately not well-typed; only their identity matters here.
-    const keys: (keyof MeshNodeConfig)[] = [
-      'bindAddr',
-      'psk',
-      'heartbeatIntervalMs',
-      'sessionTimeoutMs',
-      'numShards',
-      'capabilityGcIntervalMs',
-      'requireSignedCapabilities',
-      'subnet',
-      'subnetPolicy',
-      'identitySeed',
-      'subnetAuthorities',
-      'subnetAttachment',
-      'subnetControlChannel',
-      'subnetExports',
-      'reflexOverride',
-      'tryPortMapping',
-      'autoDirectUpgrade',
-      'permissiveChannels',
-    ];
+    const keys = FORWARDED_KEYS;
     const sentinels = Object.fromEntries(keys.map((k) => [k, { sentinel: k }]));
     await MeshNode.create(sentinels as unknown as MeshNodeConfig);
 
@@ -74,27 +78,9 @@ describe('MeshNode.create option forwarding', () => {
     const body = /export interface MeshOptions \{([\s\S]*?)\n\}/.exec(decl)?.[1] ?? '';
     const native = [...body.matchAll(/^\s+(\w+)\??:/gm)].map((m) => m[1]).sort();
     expect(native.length).toBeGreaterThan(10);
-    expect(native).toEqual(
-      [
-        'bindAddr',
-        'psk',
-        'heartbeatIntervalMs',
-        'sessionTimeoutMs',
-        'numShards',
-        'capabilityGcIntervalMs',
-        'requireSignedCapabilities',
-        'subnet',
-        'subnetPolicy',
-        'identitySeed',
-        'subnetAuthorities',
-        'subnetAttachment',
-        'subnetControlChannel',
-        'subnetExports',
-        'reflexOverride',
-        'tryPortMapping',
-        'autoDirectUpgrade',
-        'permissiveChannels',
-      ].sort(),
-    );
+    // Every native option has a sentinel. A subset check, not equality: a
+    // core built without a feature (e.g. `org`, which carries the subnet
+    // options) declares fewer, and that build must still pass.
+    expect(native.filter((k) => !(FORWARDED_KEYS as string[]).includes(k))).toEqual([]);
   });
 });

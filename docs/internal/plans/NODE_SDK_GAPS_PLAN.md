@@ -167,7 +167,10 @@ as `watch` / `snapshotAndWatch`.
 ### Principle: forward, don't reimplement
 
 Same rule as the Python plan. Every new SDK member forwards to an existing napi
-export, and **no native change** is needed for anything in this plan. Types are
+export, and **no native change** was planned for anything here. (The slices
+then found native bugs, fixed where found: S4 in core `serve_chunk`, S6 in the
+aggregator clients' lifetime, S8 and C1/C2 in both bindings' `Redex`, core
+replication and the C ABI. Each is recorded in its slice.) Types are
 re-exported, or derived from the native signatures (`Parameters<…>` /
 `ReturnType<…>`), not hand-copied, so they can't drift.
 
@@ -769,6 +772,51 @@ check the floor.
     `--no-default-features`), all-targets, both bindings' ffi-clippy
     lists, root and `net-python` rustdoc, and fmt are clean.
 
+## Review round (cubic, PR #1138), 2026-10-01
+
+21 open threads; 20 fixed, one declined.
+
+- **Real bugs:**
+  - **`openFile` with an interval fsync policy still crashed.**
+    `RedexFile` spawns its fsync timer on open, and S8's fix entered a
+    runtime only once a mesh was adopted. Node aborted, Python raised
+    `PanicException`. Node now enters napi's own runtime (the one
+    `NetMesh.create` runs on) for every spawn-capable `Redex` call, which
+    also retires S8's recorded-runtime `OnceLock`; Python falls back to its
+    shared binding runtime. **RED** (Node): the worker aborts.
+  - **The registry classifier dropped four kinds.** `unknown-group`,
+    `scale-rejected`, `scale-not-supported` and `unauthorized` came back as
+    raw `Error`s. Added, plus a test that reads every `agg_err` kind out of
+    `src/aggregator.rs` and requires a typed result.
+  - **Enrollment APIs threw `delegation: `.** `fingerprint`,
+    `isExpired`, `pendingInvites`, `needsRenewal` and the other enrollment
+    entry points validated arguments through the delegation module's
+    helpers, so `isEnrollmentError` missed them. They now re-prefix.
+  - **Closed aggregator clients still invalidated caches.** After
+    `close()`, `invalidateCache` / `invalidateTarget` now reject like every
+    other call. `close()` documents that an in-flight call keeps its own
+    node reference until it settles.
+  - Python: the runtime is recorded only after `node_arc_clone` succeeds,
+    so a shut-down mesh can't bind a `Redex` to its runtime.
+- **Tests that could mislead:** the entry-point reachability walk now
+  follows `.js`-suffixed imports, and the README's `@net-mesh/sdk/mesh`
+  exemption matches only that README line; the config-coverage test is a
+  subset check (a core built without `org` declares fewer options); the S5
+  table is checked against the forwarders read from `src/mesh.ts`, not a
+  count; the aggregator close test always shuts its node down; the Python
+  replication test's feature guard keys on `NetMesh`, which actually goes
+  missing without `net`.
+- **Docs:** `taskStatus`'s field is `updated_at`; `delegation.ts` no longer
+  cites a revocation floor going backwards (it's a silent no-op); README and
+  web wording on subpaths and on what `fetchDir` takes; `_internal.ts`'s
+  reason; this plan's "no native change" statements.
+- **Declined:** `tests/dir_transfer.rs`'s timing. The suggested
+  `holder.shutdown()` assertion can't detect the bug in Rust, where
+  `MeshNode::shutdown` doesn't need sole ownership; the strong count is the
+  observable. The fetcher shuts down at once, so the pre-fix holder never
+  gets its final acks and is pinned for the whole 30 s drain: the RED
+  failed every run at 2.3 s against a 2 s window.
+
 ## Risks
 
 - **The static "everything is wrapped" checks need the generated native types.**
@@ -797,7 +845,9 @@ check the floor.
 - Paid A2A for Node (`submit_task_paid`, `describe_a2a`). Rust/Python only by
   the binding's declared scope.
 - New subpath exports other than `./deck`.
-- Any napi (native) change.
+- Any napi (native) change *as a design goal*. The native fixes recorded in
+  S4, S6 and S8 (with C1/C2) were bugs found while slicing, not planned
+  surface work.
 - **The Python twin of N2.** `net_sdk.MeshNode.__init__` dropped six native
   options, including `require_signed_capabilities`. Fixed (2026-10-01) by
   slice S1a of

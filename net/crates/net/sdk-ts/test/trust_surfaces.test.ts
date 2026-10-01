@@ -150,4 +150,18 @@ describe('enrollment', () => {
     }
     expect(isEnrollmentError(caught)).toBe(true);
   });
+
+  it('a bad argument to an enrollment API is an enrollment error too', () => {
+    // `fingerprint` validated through the delegation module's shared helper
+    // and threw `delegation: entity_id must be 32 bytes`, which
+    // isEnrollmentError missed.
+    let caught: unknown;
+    try {
+      fingerprint(Buffer.alloc(3));
+    } catch (err) {
+      caught = err;
+    }
+    expect(isEnrollmentError(caught)).toBe(true);
+    expect((caught as Error).message).toMatch(/^enrollment: entity_id must be 32 bytes/);
+  });
 });

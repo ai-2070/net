@@ -182,8 +182,9 @@ def test_replicated_open_file_runs_on_the_mesh_runtime():
     no reactor running``. ``enable_replication`` now records the mesh's
     runtime and ``open_file`` enters it.
     """
-    net = pytest.importorskip("net")
-    if not hasattr(Redex, "enable_replication"):
+    # `net` always imports and `enable_replication` exists either way (a
+    # stub raises without the feature); `NetMesh` is what goes missing.
+    if not hasattr(net, "NetMesh"):
         pytest.fail("wheel built without the `net` feature")
     mesh = net.NetMesh("127.0.0.1:0", "7a" * 32)
     try:
@@ -263,3 +264,13 @@ def test_disable_replication_stops_every_channel_runtime():
         assert f.append(b"still a local log") == 0
     finally:
         mesh.shutdown()
+
+
+def test_interval_fsync_open_file_without_a_mesh(tmp_path):
+    """``open_file`` spawns the interval fsync timer; with no mesh adopted
+    that ran on the Python thread and raised ``PanicException: there is
+    no reactor running``. It now runs on the shared binding runtime."""
+    r = Redex(persistent_dir=str(tmp_path))
+    f = r.open_file("py/fsync", persistent=True, fsync_interval_ms=50)
+    assert f.append(b"durable") == 0
+    f.close()

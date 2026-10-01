@@ -236,7 +236,9 @@ every feature enabled**, so this table matters only for source builds — a
 disabled feature's symbols are absent at runtime and the `import` resolves to
 `undefined`.
 
-**Everything below imports from the package root**, `@net-mesh/sdk`. The
+**Everything below imports from the package root**, `@net-mesh/sdk`, unless
+its row names a subpath (`deck` is also on `@net-mesh/sdk/deck`; the MCP
+helpers are on `@net-mesh/sdk/tool`). The
 package's `exports` map defines three more entry points, `@net-mesh/sdk/tool`,
 `@net-mesh/sdk/org` and `@net-mesh/sdk/deck`, and nothing else, so a
 per-feature subpath such as `@net-mesh/sdk/mesh` fails with

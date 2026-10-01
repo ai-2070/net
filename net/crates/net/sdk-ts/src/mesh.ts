@@ -1067,7 +1067,7 @@ export class MeshNode {
     return this.native.submitTask(...args);
   }
 
-  /** The executor's status for `taskId` as JSON (`{brief, state, updatedAt}`), or `null` if unknown. */
+  /** The executor's status for `taskId` as JSON (`{brief, state, updated_at}`), or `null` if unknown. */
   taskStatus(...args: Parameters<NapiNetMesh['taskStatus']>): ReturnType<NapiNetMesh['taskStatus']> {
     return this.native.taskStatus(...args);
   }

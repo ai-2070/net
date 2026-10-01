@@ -10,6 +10,10 @@
 // - C2: disableReplication releases the node, so shutdown succeeds; before,
 //   only garbage-collecting the Redex did.
 
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import { MeshNode, Redex } from '../src/index';
@@ -106,6 +110,22 @@ describe('Redex replication', () => {
     await a.shutdown();
     await b.shutdown();
   }, 30_000);
+});
+
+describe('Redex.openFile with an interval fsync policy', () => {
+  it('opens without a mesh (it spawns the fsync timer)', () => {
+    // RedexFile spawns its fsync timer on open. From the JS thread, with no
+    // mesh runtime adopted, that panicked and aborted the process.
+    const dir = mkdtempSync(join(tmpdir(), 'net-sdk-fsync-'));
+    try {
+      const redex = new Redex({ persistentDir: dir });
+      const file = redex.openFile('sdk/fsync', { persistent: true, fsyncIntervalMs: 50 });
+      expect(file.append(Buffer.from('durable'))).toBe(0n);
+      file.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('Redex greedy dataforts', () => {
