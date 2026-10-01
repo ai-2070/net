@@ -1,0 +1,19 @@
+docs/internal/plans/RUST_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_9c68f149c533da 1-184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d852bd9bb1e746b786cd0d44cb1d957c676a96ef",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
