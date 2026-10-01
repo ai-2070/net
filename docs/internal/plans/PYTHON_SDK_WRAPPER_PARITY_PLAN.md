@@ -6,7 +6,7 @@ The Rust SDK gaps found along the way have their own plan:
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-S0, S1a and S1–S4 done 2026-10-01 (see each slice). S5–S8 not started.
+S0, S1a and S1–S5 done 2026-10-01 (see each slice). S6–S8 not started.
 
 Amended 2026-10-01, same day:
 - The two open checks from the first draft were verified (see S0 and S5).
@@ -595,6 +595,40 @@ the slice were wrong. Two test homes, with different jobs:
     visibility string raises `net_sdk.ChannelError`.
   - `channel_hash` from `net_sdk.identity` matches the cross-lang fixture
     value.
+- **Done 2026-10-01.**
+  - New module `net_sdk.identity` re-exports the wheel's identity surface
+    (`Identity`, `IdentityError`, `TokenError`, `channel_hash`,
+    `delegate_token`, `parse_token`, `verify_token`, `token_is_expired`,
+    `verify_signature`, `stream_id_from_label`, `normalize_gpu_vendor`) and
+    adds `TokenScope`.
+  - New module `net_sdk.subnets`: `SubnetId`, `GLOBAL_SUBNET` (`[0]`, which
+    encodes to the core's `SubnetId::GLOBAL`), `SubnetRule` /
+    `SubnetPolicy` TypedDicts, `subnet_id(*levels)` and
+    `subnet_policy(*rules)`. Both modules are re-exported from the root.
+  - **Correction while building:** `TokenScope` has **five** values. The
+    wheel's `parse_scope` also accepts `"wildcard"`, and an unknown scope
+    raises `IdentityError`, not `TokenError`. The first draft had four and
+    named the wrong exception. (TS's `TokenScope` already has all five.)
+  - **Design note:** `subnet_id` validates in Python and raises
+    `ValueError`. Native raises `IdentityError` for the same inputs. The
+    live test pins that the two accept and reject the **same** inputs.
+    `subnet_policy` only shapes; its validation stays native, and a test
+    pins that too.
+  - **Live test:** `test_sdk_identity_subnets.py`, 11 tests: the identity
+    names are the wheel's own objects; every `TokenScope` value issues and
+    round-trips through `parse_token`, with `channel_hash` matching the
+    token's; an unknown scope raises `IdentityError`; `subnet_id` agrees with
+    `NetMesh(subnet=…)` on 7 candidate inputs; a node builds from the
+    helpers and registers a `subnet-local` channel; a native-rejected policy
+    is still rejected through the helper.
+  - **Native-free test:** `test_identity_subnets_wrapper.py` (`sdk-py`).
+  - **RED** without the two modules: 11/11 live tests fail. **GREEN:**
+    `sdk-py` 376 passed; the binding SDK, stub, identity and subnet tests
+    303 passed, 1 skipped.
+  - **Deviation from the slice text:** there was no pinned cross-language
+    `channel_hash` fixture value to compare against. The test checks
+    `channel_hash` against the hash embedded in a wheel-issued token
+    instead.
 
 ### S6 — The A2A / publish / enrollment methods
 

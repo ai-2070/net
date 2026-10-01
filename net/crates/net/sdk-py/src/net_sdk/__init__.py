@@ -515,4 +515,51 @@ else:
         "group_error_kind",
     ]
 
+# Identity + tokens, and subnet helpers (`net_sdk.identity`,
+# `net_sdk.subnets`; `PYTHON_SDK_WRAPPER_PARITY_PLAN.md` S5). Identity is in
+# every build; the subnet helpers are pure Python.
+from net_sdk.identity import (  # noqa: E402
+    Identity,
+    IdentityError,
+    TokenError,
+    TokenScope,
+    channel_hash,
+    delegate_token,
+    normalize_gpu_vendor,
+    parse_token,
+    stream_id_from_label,
+    token_is_expired,
+    verify_signature,
+    verify_token,
+)
+from net_sdk.subnets import (  # noqa: E402
+    GLOBAL_SUBNET,
+    SubnetId,
+    SubnetPolicy,
+    SubnetRule,
+    subnet_id,
+    subnet_policy,
+)
+
+__all__ += [
+    "Identity",
+    "IdentityError",
+    "TokenError",
+    "TokenScope",
+    "channel_hash",
+    "delegate_token",
+    "normalize_gpu_vendor",
+    "parse_token",
+    "stream_id_from_label",
+    "token_is_expired",
+    "verify_signature",
+    "verify_token",
+    "GLOBAL_SUBNET",
+    "SubnetId",
+    "SubnetPolicy",
+    "SubnetRule",
+    "subnet_id",
+    "subnet_policy",
+]
+
 __version__ = "0.38.2"
