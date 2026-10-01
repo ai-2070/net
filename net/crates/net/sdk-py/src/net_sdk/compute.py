@@ -38,6 +38,7 @@ from __future__ import annotations
 from typing import Any, Callable, List, Literal, Optional, Protocol, TypedDict
 
 from net import (  # type: ignore[attr-defined]
+    AsyncDaemonRuntime,
     CausalEvent,
     DaemonError,
     DaemonHandle,
@@ -126,10 +127,11 @@ class MigrationOptions(TypedDict, total=False):
 class DaemonRuntime:
     """The daemon supervisor for one mesh node.
 
-    Accepts a :class:`net_sdk.MeshNode` or a raw ``net.NetMesh``. Every
-    method forwards to the wheel's runtime, available as :attr:`native`
-    (pass that to ``net.AsyncDaemonRuntime`` or to the
-    :mod:`net_sdk.groups` constructors).
+    Accepts a :class:`net_sdk.MeshNode`, an :class:`net_sdk.AsyncMeshNode`
+    or a raw ``net.NetMesh``. Every method forwards to the wheel's runtime,
+    available as :attr:`native`. For ``await``-able spawn / deliver /
+    migration, wrap it: ``AsyncDaemonRuntime(rt.native)`` (re-exported
+    here).
     """
 
     def __init__(self, mesh: Any) -> None:
@@ -240,6 +242,7 @@ def _native_runtime(rt: Any) -> Any:
 
 
 __all__ = [
+    "AsyncDaemonRuntime",
     "CausalEvent",
     "DaemonError",
     "DaemonFactory",

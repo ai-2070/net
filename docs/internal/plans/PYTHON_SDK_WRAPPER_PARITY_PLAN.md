@@ -6,7 +6,7 @@ The Rust SDK gaps found along the way have their own plan:
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-S0, S1a and S1–S6 done 2026-10-01 (see each slice). S7–S8 not started.
+S0, S1a and S1–S7 done 2026-10-01 (see each slice). S8 (docs) not started.
 
 Amended 2026-10-01, same day:
 - The two open checks from the first draft were verified (see S0 and S5).
@@ -679,6 +679,38 @@ type signatures only.
   live scenarios re-run under `asyncio`. Cancelling a pending
   `subscribe_channel` propagates, per TX-2 in
   `PYTHON_ASYNC_SDK_SIDE_BY_SIDE.md`.
+- **Done 2026-10-01.**
+  - `net_sdk.AsyncMeshNode` composes a sync `MeshNode` (exposed as `.sync`)
+    with `net.AsyncNetMesh` over the same native node; `from_node()` wraps
+    an existing `MeshNode`.
+  - **Awaited:** the verbs the wheel has async versions of (`connect`,
+    `accept`, `subscribe_channel`, `unsubscribe_channel`, `publish`,
+    `recv`, `announce_capabilities`, `push_to`, `shutdown`).
+  - **Sync forwards:** everything else, including `register_channel` and
+    `open_stream_inbox`, which the native async class doesn't have (they
+    don't block on the network).
+  - `events()` is an `async for` receive loop. The shard queue has no push
+    notification, so it drains with `recv` and sleeps `idle_sleep` when
+    empty.
+  - `_native_mesh` accepts an `AsyncMeshNode`, so `net_sdk.compute` and
+    `groups` take one. `net_sdk.compute` re-exports `AsyncDaemonRuntime` for
+    awaitable spawn / deliver.
+  - **Deviation from the slice text:** the plan asked for "cancelling a
+    pending `subscribe_channel` propagates". A subscribe returns as soon as
+    the publisher answers, so it can't be held pending reliably, and the
+    native path's cancellation is already TX-2's subject
+    (`test_async_interop.py`). The witness instead covers what S7 itself
+    adds: cancelling a task consuming `events()` ends it with
+    `CancelledError`, and the node stays usable.
+  - **Live test:** `test_sdk_async_mesh.py`, 4 tests: the S1 channel round
+    trip under asyncio (handshake via `asyncio.gather`); cancelling an
+    `events()` loop; the S2 echo daemon via `DaemonRuntime(async_node)` +
+    `AsyncDaemonRuntime`; and `from_node` sharing the sync node.
+  - **Forwarding test:** `test_async_mesh_wrapper.py`, 5 tests (`AsyncMock`
+    for the awaited verbs).
+  - **RED** against the committed wrapper: 4/4 live fail. **GREEN:**
+    `sdk-py` 392 passed; binding SDK, stub and async-interop tests 275
+    passed, 1 skipped.
 
 ### S8 — Docs
 

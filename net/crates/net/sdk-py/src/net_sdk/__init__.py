@@ -105,6 +105,7 @@ from net_sdk.channel import (
     validate_channel_name,
 )
 from net_sdk.mesh import (
+    AsyncMeshNode,
     BackpressureError,
     ChannelAuthError,
     ChannelConfig,
@@ -154,6 +155,7 @@ __all__ = [
     "MAX_CHANNEL_NAME_LEN",
     "CHANNEL_TAG_KEY",
     "MeshNode",
+    "AsyncMeshNode",
     "MeshStream",
     "StreamStats",
     "Reliability",

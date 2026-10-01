@@ -29,6 +29,7 @@ Example:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, List, Literal, Optional, TypedDict
 
@@ -940,6 +941,173 @@ class MeshNode:
         self.shutdown()
 
 
+class AsyncMeshNode:
+    """The asyncio twin of :class:`MeshNode`.
+
+    Built over the same native node as a sync :class:`MeshNode` (available
+    as :attr:`sync`): the verbs the wheel has async versions of are
+    ``await``-able here (``connect``, ``accept``, ``subscribe_channel``,
+    ``unsubscribe_channel``, ``publish``, ``announce_capabilities``,
+    ``recv``, ``push_to``, ``shutdown``); everything else is a cheap sync
+    call forwarded to :attr:`sync`, or reachable through it.
+
+    Example:
+        >>> node = AsyncMeshNode("127.0.0.1:0", psk, permissive_channels=True)
+        >>> await node.connect(addr, pubkey, peer_id)
+        >>> node.start()
+        >>> await node.subscribe_channel(peer_id, "sensors/temp")
+        >>> async for event in node.events():
+        ...     handle(event.raw)
+    """
+
+    def __init__(self, bind_addr: str, psk: str, **options: Any) -> None:
+        """Same options as :class:`MeshNode`."""
+        self._attach(MeshNode(bind_addr, psk, **options))
+
+    @classmethod
+    def from_node(cls, node: "MeshNode") -> "AsyncMeshNode":
+        """An async view of an existing :class:`MeshNode`. Shares its
+        sessions; no second socket, no re-handshake."""
+        self = cls.__new__(cls)
+        self._attach(node)
+        return self
+
+    def _attach(self, node: "MeshNode") -> None:
+        from net import AsyncNetMesh  # type: ignore[attr-defined]
+
+        self._sync = node
+        self._native = AsyncNetMesh(node._native)
+
+    @property
+    def sync(self) -> "MeshNode":
+        """The sync :class:`MeshNode` over the same native node."""
+        return self._sync
+
+    # ── Identity and lifecycle ───────────────────────────────────────
+
+    @property
+    def node_id(self) -> int:
+        return self._native.node_id
+
+    @property
+    def public_key(self) -> str:
+        return self._native.public_key
+
+    @property
+    def entity_id(self) -> bytes:
+        return self._native.entity_id
+
+    @property
+    def local_addr(self) -> str:
+        return self._sync.local_addr
+
+    def start(self) -> None:
+        self._native.start()
+
+    def peer_count(self) -> int:
+        return self._native.peer_count()
+
+    def discovered_nodes(self) -> int:
+        return self._native.discovered_nodes()
+
+    async def connect(self, peer_addr: str, peer_public_key: str, peer_node_id: int) -> None:
+        await self._native.connect(peer_addr, peer_public_key, peer_node_id)
+
+    async def accept(self, peer_node_id: int) -> str:
+        return await self._native.accept(peer_node_id)
+
+    async def shutdown(self) -> None:
+        await self._native.shutdown()
+
+    # ── Channels ─────────────────────────────────────────────────────
+
+    def register_channel(self, name: str, **config: Any) -> None:
+        """Sync (the wheel has no async variant; it doesn't block on the
+        network). Same options as :meth:`MeshNode.register_channel`."""
+        self._sync.register_channel(name, **config)
+
+    async def subscribe_channel(
+        self, publisher_node_id: int, channel: str, token: Optional[bytes] = None
+    ) -> None:
+        await self._native.subscribe_channel(publisher_node_id, channel, token)
+
+    async def unsubscribe_channel(self, publisher_node_id: int, channel: str) -> None:
+        await self._native.unsubscribe_channel(publisher_node_id, channel)
+
+    async def publish(
+        self,
+        channel: str,
+        payload: bytes,
+        *,
+        reliability: Optional[Reliability] = None,
+        on_failure: Optional[OnFailure] = None,
+        max_inflight: Optional[int] = None,
+    ) -> PublishReport:
+        return await self._native.publish(
+            channel,
+            payload,
+            reliability=reliability,
+            on_failure=on_failure,
+            max_inflight=max_inflight,
+        )
+
+    # ── Receiving ────────────────────────────────────────────────────
+
+    async def recv(self, limit: int) -> list:
+        """Drain up to ``limit`` received events across every shard."""
+        return await self._native.poll(limit)
+
+    async def events(self, limit: int = 256, idle_sleep: float = 0.01) -> Any:
+        """Yield received events as they arrive, forever.
+
+        The shard queue has no push notification, so this drains with
+        :meth:`recv` and sleeps ``idle_sleep`` seconds when it comes back
+        empty. Cancel the consuming task (or ``break``) to stop.
+        """
+        while True:
+            batch = await self.recv(limit)
+            for event in batch:
+                yield event
+            if not batch:
+                await asyncio.sleep(idle_sleep)
+
+    def num_shards(self) -> int:
+        return self._sync.num_shards()
+
+    def shard_for_stream(self, stream_id: int) -> int:
+        return self._sync.shard_for_stream(stream_id)
+
+    def open_stream_inbox(self, stream_id: int, capacity: int = 4096) -> Any:
+        """Sync: returns the wheel's pull queue (see
+        :meth:`MeshNode.open_stream_inbox`)."""
+        return self._sync.open_stream_inbox(stream_id, capacity)
+
+    # ── Capabilities ─────────────────────────────────────────────────
+
+    async def announce_capabilities(self, caps: dict) -> None:
+        await self._native.announce_capabilities(caps)
+
+    def find_nodes(self, filter: dict) -> List[int]:
+        return self._native.find_nodes(filter)
+
+    def find_nodes_scoped(self, filter: dict, scope: dict) -> List[int]:
+        return self._native.find_nodes_scoped(filter, scope)
+
+    def find_best_node(self, requirement: dict) -> Optional[int]:
+        return self._native.find_best_node(requirement)
+
+    def find_best_node_scoped(self, requirement: dict, scope: dict) -> Optional[int]:
+        return self._native.find_best_node_scoped(requirement, scope)
+
+    # ── Low-level ────────────────────────────────────────────────────
+
+    async def push_to(self, peer_addr: str, json: str) -> bool:
+        return await self._native.push_to(peer_addr, json)
+
+    def __repr__(self) -> str:
+        return f"AsyncMeshNode(node_id={self.node_id:#x})"
+
+
 def _set_only(**kwargs: Any) -> dict:
     """The keyword arguments the caller actually set. Optional native
     parameters with Rust-computed defaults reject an explicit ``None``, so
@@ -950,10 +1118,12 @@ def _set_only(**kwargs: Any) -> dict:
 def _native_mesh(mesh: Any) -> Any:
     """The native ``NetMesh`` behind ``mesh``, for native constructors
     (``DaemonRuntime``, ``MeshRpc``, …) that need one. Accepts a
-    :class:`MeshNode` or a raw ``NetMesh``; anything else is a
+    :class:`MeshNode`, an :class:`AsyncMeshNode` or a raw ``NetMesh``; anything else is a
     ``TypeError`` here rather than an opaque extraction error in Rust."""
     if isinstance(mesh, MeshNode):
         return mesh._native
+    if isinstance(mesh, AsyncMeshNode):
+        return mesh.sync._native
     if isinstance(mesh, _NetMesh):
         return mesh
     raise TypeError(
@@ -962,6 +1132,7 @@ def _native_mesh(mesh: Any) -> Any:
 
 
 __all__ = [
+    "AsyncMeshNode",
     "MeshNode",
     "MeshStream",
     "StreamStats",
