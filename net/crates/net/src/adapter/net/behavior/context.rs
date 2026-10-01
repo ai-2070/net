@@ -900,10 +900,9 @@ impl ContextStore {
     fn release_slot(&self) {
         use std::sync::atomic::Ordering;
         self.active_count
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                Some(cur.saturating_sub(1))
-            })
-            .ok();
+            .update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                cur.saturating_sub(1)
+            });
     }
 }
 

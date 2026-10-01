@@ -2894,16 +2894,14 @@ impl StreamState {
         if self.tx_window == 0 {
             return;
         }
-        // `try_update` returns the PREVIOUS value on success, and
-        // the closure is infallible, so `prev` is always the credit
-        // this debit found. `prev.min(bytes)` is what the window
+        // `update` returns the PREVIOUS value, so `prev` is always
+        // the credit this debit found. `prev.min(bytes)` is what the window
         // actually paid; the rest is the overdraft.
         let prev = self
             .tx_credit_remaining
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                Some(v.saturating_sub(bytes))
-            })
-            .unwrap_or(bytes);
+            .update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                v.saturating_sub(bytes)
+            });
         let shortfall = bytes.saturating_sub(prev);
         if shortfall > 0 {
             self.overdraft.fetch_add(shortfall as u64, Ordering::AcqRel);
@@ -2940,16 +2938,14 @@ impl StreamState {
         let back = bytes - paid;
         if back > 0 {
             self.tx_credit_remaining
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                    Some(v.saturating_add(back))
-                })
-                .ok();
+                .update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                    v.saturating_add(back)
+                });
         }
         self.tx_bytes_sent
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(bytes as u64))
-            })
-            .ok();
+            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                v.saturating_sub(bytes as u64)
+            });
     }
 
     /// Pay up to `amount` off the outstanding control overdraft and
@@ -2961,10 +2957,9 @@ impl StreamState {
         }
         let prev = self
             .overdraft
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |d| {
-                Some(d.saturating_sub(amount))
-            })
-            .unwrap_or(0);
+            .update(Ordering::AcqRel, Ordering::Acquire, |d| {
+                d.saturating_sub(amount)
+            });
         prev.min(amount)
     }
 
@@ -2982,15 +2977,13 @@ impl StreamState {
             return;
         }
         self.tx_credit_remaining
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                Some(v.saturating_add(bytes))
-            })
-            .ok();
+            .update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                v.saturating_add(bytes)
+            });
         self.tx_bytes_sent
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(bytes as u64))
-            })
-            .ok();
+            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                v.saturating_sub(bytes as u64)
+            });
     }
 
     /// Attempt to roll back a TX sequence number that was allocated via
@@ -3031,8 +3024,8 @@ impl StreamState {
     ///
     /// Reconciliation adds the **delta** of newly-acknowledged bytes
     /// (`total_consumed - prev_max_consumed`) to `tx_credit_remaining`
-    /// via `try_update`. The additive form composes atomically with
-    /// the CAS in `try_acquire_tx_credit` and the `try_update` in
+    /// via `update`. The additive form composes atomically with
+    /// the CAS in `try_acquire_tx_credit` and the `update` in
     /// `refund_tx_credit`: every operation preserves the invariant
     /// `remaining + (sent - max_consumed) == window + overdraft`
     /// regardless of interleaving. An earlier `.store()`-based
@@ -3129,10 +3122,9 @@ impl StreamState {
         }
         let window = self.tx_window;
         self.tx_credit_remaining
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                Some(v.saturating_add(credit_add).min(window))
-            })
-            .ok();
+            .update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                v.saturating_add(credit_add).min(window)
+            });
     }
 
     /// Cumulative bytes committed to the wire on this stream.

@@ -4072,7 +4072,7 @@ jobs:
         run: python3 .github/scripts/check-python-wheel-features.py
 
       # Match `net/crates/net/rust-toolchain.toml` directly so the
-      # pinned 1.96.0 toolchain is installed up-front rather than
+      # pinned 1.99.0 toolchain is installed up-front rather than
       # auto-fetched mid-`maturin develop` by rustup (which has flaked
       # — partial download leaves `rustc` absent on the new toolchain).
       - name: Install Rust

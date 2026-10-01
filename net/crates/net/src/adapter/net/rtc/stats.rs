@@ -461,10 +461,9 @@ impl RtcStats {
     /// at close).
     #[inline]
     pub(super) fn note_unretained(&self) {
-        let _ = self
-            .retained
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
+        self.retained
+            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                v.saturating_sub(1)
             });
     }
 

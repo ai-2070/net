@@ -375,25 +375,21 @@ impl NetProxy {
                         // somehow reset between the bump and this
                         // rollback.
                         self.packets_forwarded
-                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                Some(v.saturating_sub(1))
-                            })
-                            .ok();
+                            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                v.saturating_sub(1)
+                            });
                         self.bytes_forwarded
-                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                Some(v.saturating_sub(packet_len))
-                            })
-                            .ok();
+                            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                v.saturating_sub(packet_len)
+                            });
                         self.total_latency_ns
-                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                Some(v.saturating_sub(latency_ns))
-                            })
-                            .ok();
+                            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                v.saturating_sub(latency_ns)
+                            });
                         self.latency_samples
-                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                Some(v.saturating_sub(1))
-                            })
-                            .ok();
+                            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                v.saturating_sub(1)
+                            });
                         Err(ProxyError::SendFailed(e.to_string()))
                     }
                 }

@@ -400,15 +400,16 @@ impl ResourceGuard {
                 .tokens
                 .fetch_add(diff as u64, Ordering::Relaxed);
         } else if diff < 0 {
-            // Use try_update with saturating subtraction to prevent
+            // Use update with saturating subtraction to prevent
             // underflow wrapping the u64 counter to near-MAX, which
             // would permanently lock out all subsequent requests.
             let sub = (-diff) as u64;
-            let _ = self.enforcer.usage.tokens.try_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| Some(current.saturating_sub(sub)),
-            );
+            self.enforcer
+                .usage
+                .tokens
+                .update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.saturating_sub(sub)
+                });
         }
         self.claim.tokens = actual_tokens;
     }
@@ -1383,13 +1384,13 @@ impl SafetyEnforcer {
             // failure on overflow — by definition this counter only
             // drives observability dashboards — so wrap is silent
             // corruption (operators see the counter reset to ~0 mid-
-            // window and conclude traffic dropped). `try_update`
+            // window and conclude traffic dropped). `update`
             // with saturating_add inside is the standard pattern.
-            let _ = self.rate_limiter.global_tokens.try_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| Some(v.saturating_add(claim.tokens as u64)),
-            );
+            self.rate_limiter
+                .global_tokens
+                .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    v.saturating_add(claim.tokens as u64)
+                });
         }
 
         // tokens (per-request `usage` counter) — free-running,
@@ -1433,7 +1434,7 @@ impl SafetyEnforcer {
 
     /// Release resources (called by ResourceGuard on drop)
     fn release(&self, claim: &ResourceClaim) {
-        // Use `try_update` + `saturating_sub` rather than raw
+        // Use `update` + `saturating_sub` rather than raw
         // `fetch_sub` on `concurrent` and `memory_gb`. `acquire()`
         // short-circuits in `EnforcementMode::Disabled` and returns
         // a guard WITHOUT incrementing those counters; a raw
@@ -1443,7 +1444,7 @@ impl SafetyEnforcer {
         // every request forever (mode is hot-swappable via
         // `update_envelope`, so warm-up in `Disabled` then flip to
         // `Enforce` is the real-world trigger). The matching
-        // tokens/cost paths already use `try_update` +
+        // tokens/cost paths already use `update` +
         // `saturating_sub` for exactly this reason.
         //
         // Use `AcqRel` (not `Relaxed`) to mirror the acquire path's
@@ -1457,31 +1458,28 @@ impl SafetyEnforcer {
         // still touching it. The total counter eventually
         // converges, but the ordering mismatch produced
         // observable drift on metrics readers.
-        let _ = self
-            .usage
+        self.usage
             .concurrent
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(claim.concurrent_slots))
+            .update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.saturating_sub(claim.concurrent_slots)
             });
-        let _ = self
-            .usage
+        self.usage
             .memory_gb
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(claim.memory_gb))
+            .update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.saturating_sub(claim.memory_gb)
             });
         // Release tokens and cost that were acquired — without this,
         // both counters grow monotonically, hitting limits prematurely.
-        let _ = self
-            .usage
+        self.usage
             .tokens
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(claim.tokens as u64))
+            .update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.saturating_sub(claim.tokens as u64)
             });
-        let _ = self.usage.cost_cents_per_hour.try_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| Some(current.saturating_sub(claim.cost_cents)),
-        );
+        self.usage
+            .cost_cents_per_hour
+            .update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.saturating_sub(claim.cost_cents)
+            });
     }
 
     /// Trigger the kill switch

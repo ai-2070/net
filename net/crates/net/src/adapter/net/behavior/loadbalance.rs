@@ -375,11 +375,8 @@ impl EndpointState {
         // forever - a silent, permanent removal from rotation with
         // no log, no metric, no recovery path. The test at the
         // bottom of this module explicitly acknowledged the hazard.
-        let _ = self
-            .connections
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                Some(c.saturating_sub(1))
-            });
+        self.connections
+            .update(Ordering::AcqRel, Ordering::Acquire, |c| c.saturating_sub(1));
 
         // If this completion is for the half-open probe, it decides the
         // circuit's fate. Clearing the flag with swap also guarantees only
