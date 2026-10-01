@@ -1,0 +1,29 @@
+net/crates/net/sdk-py/tests/test_identity_subnets_wrapper.py
+  s_f9febccc288dd3::t_029e97bc97c387 1-47
+net/crates/net/bindings/python/tests/test_sdk_identity_subnets.py
+  s_f9febccc288dd3::t_4f11f4a5d60623 1-115
+net/crates/net/sdk-py/src/net_sdk/identity.py
+  s_f9febccc288dd3::t_ddd720366f89ca 1-54
+net/crates/net/sdk-py/src/net_sdk/subnets.py
+  s_f9febccc288dd3::t_b61301d2761ac9 1-79
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_f9febccc288dd3::t_9735ec0cdf81d1 518-564
+docs/internal/plans/PYTHON_SDK_WRAPPER_PARITY_PLAN.md
+  s_f9febccc288dd3::t_dcc11c590f61b7 9,598-631
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "94e24150d8b31e30ae465c2c61d246036c28afc1",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
