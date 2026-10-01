@@ -1,0 +1,25 @@
+net/crates/net/tests/dir_transfer.rs
+  s_f9febccc288dd3::t_08ab3fe89ee875 859-863
+  s_f9febccc288dd3::t_f6747dd2bbc798 30,835-858,864-892
+net/crates/net/src/adapter/net/mesh.rs
+  s_f9febccc288dd3::t_d755d0a45caffb 48218,48226-48278
+  s_f9febccc288dd3::t_2a1db7cd308988 48279
+net/crates/net/src/adapter/net/dataforts/blob/transfer.rs
+  s_f9febccc288dd3::t_4abda0008b4f93 640-648
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6e0f784471d526bb5450c9e932decc5b1c17a8e5",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
