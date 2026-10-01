@@ -955,6 +955,7 @@ async fn resolve_placement(
     let selected = resolved.contains(&inputs.self_node_id);
     let full = resolved.len() >= resolver.factor();
     let now = tokio::time::Instant::now();
+    let mut leader_left = false;
     let stable_for = {
         let mut set = placement.set.lock();
         let mut since = placement.set_since.lock();
@@ -967,23 +968,26 @@ async fn resolve_placement(
             );
             *set = resolved;
             *since = now;
-            // A believed leader that left the set no longer leads us:
-            // its frames are now dropped at the gate, so catch-up
-            // requests to it would stall until the missed-heartbeat
-            // window ran out. Forget it and wait for (or elect) the
-            // set's leader instead.
-            let mut tracker = state.tracker.lock();
-            if let Some(leader) = tracker.believed_leader() {
-                if !set.contains(&leader) {
-                    tracker.clear_believed_leader();
-                    if coordinator.role() == ReplicaRole::Replica {
-                        tracker.arm_leader_wait(now.into_std());
-                    }
-                }
-            }
+            leader_left = state
+                .tracker
+                .lock()
+                .believed_leader()
+                .is_some_and(|leader| !set.contains(&leader));
         }
         now.saturating_duration_since(*since)
     };
+    if leader_left {
+        // A believed leader that left the set no longer leads us: its
+        // frames are now dropped at the gate, so catch-up requests to it
+        // would stall until the missed-heartbeat window ran out. Forget
+        // it, and its outstanding request tokens (left behind, repeated
+        // set changes would crowd out valid catch-up requests), then wait
+        // for, or elect, the set's leader.
+        clear_leader_belief_and_tokens(&state.tracker, &state.outstanding);
+        if coordinator.role() == ReplicaRole::Replica {
+            state.tracker.lock().arm_leader_wait(now.into_std());
+        }
+    }
     let role = coordinator.role();
     if selected && role == ReplicaRole::Idle && (full || stable_for >= resolver.settle_window()) {
         bootstrap_replica(coordinator, &state.tracker).await;
