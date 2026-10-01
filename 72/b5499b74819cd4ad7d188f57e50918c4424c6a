@@ -1,0 +1,28 @@
+net/crates/net/sdk-ts/test/mesh_node_surface.test.ts
+  s_f9febccc288dd3::t_c8dbc6f368fb10 1-74
+net/crates/net/sdk-ts/src/mesh.ts
+  s_f9febccc288dd3::t_9a06f4effd7a37 1515-1533
+  s_f9febccc288dd3::t_dd5c7ff0b1a3e6 1001-1145
+net/crates/net/sdk-ts/test/mesh_node_live.test.ts
+  s_f9febccc288dd3::t_043dff075f7187 1-170
+docs/internal/plans/NODE_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_d73ef0b6220530 6-7,470-479,481-503
+  s_f9febccc288dd3::t_713d2d6f4176f0 480
+  s_f9febccc288dd3::t_078ba2f09cacce 504
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "72b5499b74819cd4ad7d188f57e50918c4424c6a",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
