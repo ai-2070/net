@@ -438,6 +438,143 @@ class MeshNode:
         """
         return self._native.open_stream_inbox(stream_id, capacity)
 
+    # ── Identity and nRPC ────────────────────────────────────────────
+
+    @property
+    def entity_id(self) -> bytes:
+        """32-byte ed25519 entity id. Equals ``Identity.from_seed(seed)
+        .entity_id`` when the node was built with ``identity_seed=seed``."""
+        return self._native.entity_id
+
+    def rpc(self) -> Any:
+        """A ``net.mesh_rpc.TypedMeshRpc`` bound to this node: typed
+        request/response and streaming over the mesh, and the handle
+        ``net_sdk.tool.serve_tool`` / ``call_tool`` take.
+
+        Construction is cheap, but build one per node and reuse it.
+        Requires the ``cortex`` build (the default one is)."""
+        from net.mesh_rpc import TypedMeshRpc  # type: ignore[import-not-found]
+
+        return TypedMeshRpc.from_mesh(self._native)
+
+    # ── Capability aggregation ───────────────────────────────────────
+
+    def capability_aggregate(
+        self, matcher: Optional[Any], group_by: Any, aggregation: Any
+    ) -> List[Any]:
+        """Bucketed aggregation over this node's capability fold.
+
+        Takes the :mod:`net_sdk.capability_aggregation` dataclasses
+        (``TagMatcher`` or ``None`` for every entry, ``GroupBy``,
+        ``Aggregation``) and returns ``AggregateRow``s sorted by bucket.
+        """
+        from net_sdk import capability_aggregation as agg
+
+        rows = self._native.capability_aggregate(
+            None if matcher is None else agg.tag_matcher_to_json(matcher),
+            agg.group_by_to_json(group_by),
+            agg.aggregation_to_json(aggregation),
+        )
+        return [agg.AggregateRow(**row) for row in rows]
+
+    def capability_capacity_ranking(
+        self, query: Any, rtt_map: Optional[dict] = None
+    ) -> List[Any]:
+        """Per-bucket capacity ranking for a ``CapacityQuery``, most
+        available first. ``rtt_map`` maps node id to RTT (ms) for the
+        query's ``max_rtt_ms`` filter. Returns ``CapacityRow``s."""
+        from net_sdk import capability_aggregation as agg
+
+        rows = self._native.capability_capacity_ranking(
+            agg.capacity_query_to_json(query), rtt_map
+        )
+        return [agg.CapacityRow(**row) for row in rows]
+
+    # ── Tools ────────────────────────────────────────────────────────
+
+    def list_tools(self) -> List[Any]:
+        """Every AI tool published in this node's capability fold, as
+        ``ToolDescriptor``s. Same as ``net_sdk.tool.list_tools(node)``."""
+        from net_sdk import tool
+
+        return tool.list_tools(self._native)
+
+    def watch_tools(self, *, interval: Optional[float] = None) -> Any:
+        """Async iterator of ``ToolListChange``s for this node's tool view.
+        Same as ``net_sdk.tool.watch_tools(node)``; see it for the
+        lifecycle (consume or cancel it so the watch is closed)."""
+        from net_sdk import tool
+
+        return tool.watch_tools(self._native, interval=interval)
+
+    # ── Blob and directory transfer (dataforts builds) ───────────────
+    #
+    # The types these take and return (``MeshBlobAdapter``, ``BlobRef``)
+    # live in :mod:`net_sdk.blob`. Fetching needs the transfer engine on
+    # the FETCHING node too: call :meth:`serve_blob_transfer` on both ends,
+    # or a fetch raises ``TransferError`` / ``BlobError`` ("engine not
+    # installed").
+
+    def serve_blob_transfer(self, adapter: Any) -> None:
+        """Install the blob-transfer engine over ``adapter`` (a
+        ``MeshBlobAdapter``): serves its blobs to peers, and is required
+        before this node can fetch."""
+        from net import serve_blob_transfer  # type: ignore[attr-defined]
+
+        serve_blob_transfer(self._native, adapter)
+
+    def fetch_blob(self, holder_id: int, blob_ref: Any) -> bytes:
+        """Fetch ``blob_ref`` from the node ``holder_id``."""
+        from net import fetch_blob  # type: ignore[attr-defined]
+
+        return fetch_blob(self._native, holder_id, blob_ref)
+
+    def fetch_blob_discovered(self, blob_ref: Any) -> bytes:
+        """Fetch ``blob_ref`` from whichever node is discovered to hold it."""
+        from net import fetch_blob_discovered  # type: ignore[attr-defined]
+
+        return fetch_blob_discovered(self._native, blob_ref)
+
+    def store_dir(self, adapter: Any, root: str) -> Any:
+        """Store the directory tree at ``root`` through ``adapter``; returns
+        the manifest's ``BlobRef``."""
+        from net import store_dir  # type: ignore[attr-defined]
+
+        return store_dir(self._native, adapter, root)
+
+    def fetch_dir(self, source_id: int, manifest_ref: Any, dest: str) -> tuple:
+        """Rebuild the directory ``manifest_ref`` names, fetched from
+        ``source_id``, under ``dest``. Returns ``(files_written,
+        bytes_written)``."""
+        from net import fetch_dir  # type: ignore[attr-defined]
+
+        return fetch_dir(self._native, source_id, manifest_ref, dest)
+
+    # ── Connectivity ─────────────────────────────────────────────────
+
+    def discovered_nodes(self) -> int:
+        """How many nodes this node's proximity graph knows about."""
+        return self._native.discovered_nodes()
+
+    def traversal_stats(self) -> dict:
+        """Cumulative NAT-traversal counters. ``nat-traversal`` builds
+        only; ``AttributeError`` otherwise."""
+        return self._native.traversal_stats()
+
+    def connect_direct(
+        self, peer_node_id: int, peer_public_key: str, coordinator: int
+    ) -> None:
+        """Establish a session to ``peer_node_id`` via the rendezvous path,
+        ``coordinator`` mediating. An optimization: if the punch fails it
+        falls back to the routed path rather than raising.
+        ``nat-traversal`` builds only."""
+        self._native.connect_direct(peer_node_id, peer_public_key, coordinator)
+
+    def connect_direct_auto(self, peer_node_id: int, peer_public_key: str) -> None:
+        """:meth:`connect_direct` with the coordinator chosen for you.
+        ``nat-traversal`` builds only."""
+        self._native.connect_direct_auto(peer_node_id, peer_public_key)
+
     # ── Capabilities and discovery ───────────────────────────────────
     #
     # These forward to the low-level binding. Without them the whole

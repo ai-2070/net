@@ -6,7 +6,7 @@ The Rust SDK gaps found along the way have their own plan:
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-S0, S1a, S1, S2 and S3 done 2026-10-01 (see each slice). S4–S8 not started.
+S0, S1a and S1–S4 done 2026-10-01 (see each slice). S5–S8 not started.
 
 Amended 2026-10-01, same day:
 - The two open checks from the first draft were verified (see S0 and S5).
@@ -531,6 +531,39 @@ the slice were wrong. Two test homes, with different jobs:
   - `bindings/python/tests/test_sdk_mesh_surface.py`: `rpc()` round-trips a
     unary call; `store_dir` → `fetch_dir` across two nodes; `capability_capacity_ranking`
     returns rows for an announced capability set.
+- **Done 2026-10-01.**
+  - `MeshNode` gained `entity_id`; `rpc()` (returns
+    `net.mesh_rpc.TypedMeshRpc.from_mesh(self._native)`, matching TS);
+    `capability_aggregate` / `capability_capacity_ranking`, which take the
+    `capability_aggregation` dataclasses and return typed `AggregateRow` /
+    `CapacityRow`, making that module's docstring true; `list_tools` /
+    `watch_tools`; the five blob/dir methods; and `discovered_nodes`,
+    `traversal_stats`, `connect_direct(_auto)`.
+  - New module `net_sdk.blob` re-exports the adapter types and the
+    registry functions. It is module-level only, not root re-exported.
+  - **Bug found and fixed:** `net.tool.list_tools(node)` calls
+    `node.list_tools()`, so passing it an SDK `MeshNode` failed outright.
+    The new methods hand the helpers `self._native`.
+  - **Correction while testing:** fetching needs the blob-transfer engine on
+    the **fetching** node too. Core `transfer_fetch_chunk` refuses with
+    `engine not installed (serve_blob_transfer?)`, and `tests/dir_transfer.rs`
+    serves on both ends. The first live test served only the holder and
+    failed. The test now serves both, and the SDK docstrings say so.
+  - **Live test:** `test_sdk_mesh_surface.py`, 6 tests: `entity_id` matches
+    the seeded `Identity`; an `rpc()` unary round trip between two nodes
+    (built with `permissive_channels=True`, which only S1a made reachable
+    through the SDK); typed aggregation and ranking rows; `list_tools` on an
+    SDK node; `store_dir` → `fetch_dir` across two nodes, files and byte
+    counts checked; connectivity counters.
+  - **Forwarding test:** `test_mesh_node_surface.py`, 7 tests.
+  - **RED** against the committed wrapper: 6/6 live and 7/7 forwarding fail
+    (`'MeshNode' object has no attribute …`, `No module named
+    'net_sdk.blob'`). **GREEN:** `sdk-py` 367 passed; binding SDK, stub,
+    tool, blob and aggregation tests 308 passed, 10 skipped. All the skips
+    are in the existing `test_tool` / `test_blob` / aggregation files.
+  - **Not witnessed live:** `traversal_stats` / `connect_direct(_auto)`.
+    They're `nat-traversal`-only and CI's wheel doesn't build that feature;
+    they're forward-tested only.
 
 ### S5 — `net_sdk.identity` and `net_sdk.subnets`
 
