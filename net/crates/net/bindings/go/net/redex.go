@@ -661,6 +661,19 @@ const (
 	heartbeatMsMax       = uint64(300_000)
 )
 
+// isChainHex reports whether s is a chain origin hash in canonical form.
+func isChainHex(s string) bool {
+	if len(s) != 16 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func validateReplicationConfig(cfg *ReplicationConfig) error {
 	if cfg == nil {
 		return nil
@@ -677,9 +690,26 @@ func validateReplicationConfig(cfg *ReplicationConfig) error {
 			ErrInvalidReplicationConfig, cfg.HeartbeatMs, heartbeatMsMin, heartbeatMsMax,
 		)
 	}
+	// Colocation hints are chain origin hashes the substrate matches
+	// against causal: tags byte for byte: 16 lowercase hex digits.
+	for _, key := range []string{"colocate-with", "colocate-with-strict"} {
+		if v, ok := cfg.PlacementMetadata[key]; ok && !isChainHex(v) {
+			return fmt.Errorf(
+				"%w: PlacementMetadata[%q] = %q is not a 16-digit lowercase hex chain hash",
+				ErrInvalidReplicationConfig, key, v,
+			)
+		}
+	}
 	switch cfg.Placement {
-	case "", PlacementStandard, PlacementColocationStrict:
+	case "", PlacementStandard:
 		// OK.
+	case PlacementColocationStrict:
+		if _, ok := cfg.PlacementMetadata["colocate-with-strict"]; !ok {
+			return fmt.Errorf(
+				"%w: Placement %q requires PlacementMetadata[\"colocate-with-strict\"]",
+				ErrInvalidReplicationConfig, PlacementColocationStrict,
+			)
+		}
 	case PlacementPinned:
 		if len(cfg.PinnedNodes) == 0 {
 			return fmt.Errorf(

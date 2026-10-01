@@ -364,6 +364,13 @@ impl ReplicationCoordinator {
         }
     }
 
+    /// Whether the mesh's advertisement disagrees with the local role
+    /// because a chain-tag announce / withdraw failed and hasn't been
+    /// retried successfully yet.
+    pub fn advertisement_is_stale(&self) -> bool {
+        self.advertisement_stale.load(Ordering::Acquire)
+    }
+
     /// Replication config (read-only).
     pub fn config(&self) -> &ReplicationConfig {
         &self.config

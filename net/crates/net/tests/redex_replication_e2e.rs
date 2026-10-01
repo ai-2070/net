@@ -767,7 +767,6 @@ async fn pinned_pair_elects_the_pinned_leader_and_replicates() {
         ReplicationConfig::new()
             .with_heartbeat_ms(150)
             .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
-            .with_leader_pinned(Some(a_id))
             .with_leader_pinned(Some(b_id)),
     ));
     let file_a = redex_a.open_file(&name, cfg.clone()).expect("open A");
@@ -979,6 +978,13 @@ async fn standard_placement_selects_factor_replicas_and_replicates() {
         settled(&roles(&t, &name), &members)
     })
     .await;
+    // Leadership can still flap right after settling (a node that briefly
+    // resolved a set of one); hold it before writing through the leader.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        settled(&roles(&t, &name), &members),
+        "leadership flapped after settling"
+    );
 
     let r = roles(&t, &name);
     let (leader, follower) = if r[members[0]] == ReplicaRole::Leader {
@@ -1027,6 +1033,13 @@ async fn standard_placement_reselects_when_a_replica_leaves() {
         settled(&roles(&t, &name), &first)
     })
     .await;
+    // Leadership can still flap right after settling (a node that briefly
+    // resolved a set of one); hold it before writing through the leader.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        settled(&roles(&t, &name), &first),
+        "leadership flapped after settling"
+    );
 
     // The lowest-id member leaves; its candidacy is withdrawn, so the
     // remaining nodes re-resolve to {the other member, the outsider}.
@@ -1049,8 +1062,17 @@ async fn standard_placement_reselects_when_a_replica_leaves() {
         },
     )
     .await;
-
+    tokio::time::sleep(Duration::from_millis(600)).await;
     let r = roles(&t, &name);
+    assert_eq!(
+        second
+            .iter()
+            .filter(|&&i| r[i] == ReplicaRole::Leader)
+            .count(),
+        1,
+        "leadership flapped after the re-selection settled"
+    );
+
     let (leader, follower) = if r[second[0]] == ReplicaRole::Leader {
         (second[0], second[1])
     } else {

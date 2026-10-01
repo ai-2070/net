@@ -21,6 +21,10 @@ use crate::adapter::net::behavior::placement::NodeId;
 /// [`PlacementStrategy::ColocationStrict`] channel's replicas must hold.
 pub const COLOCATE_WITH_STRICT_METADATA_KEY: &str = "colocate-with-strict";
 
+/// The [`ReplicationConfig::placement_metadata`] key naming a chain the
+/// replicas should preferably hold.
+pub const COLOCATE_WITH_METADATA_KEY: &str = "colocate-with";
+
 /// Replication factor lower bound. `1` collapses to single-node-with-
 /// coordinator (the daemon runs but there's only one replica) — useful
 /// for testing and the brief moment between channel-open and the first
@@ -362,6 +366,27 @@ impl ReplicationConfig {
         {
             return Err(ReplicationConfigError::ColocationStrictWithoutChain);
         }
+        // The colocation axis matches these against `causal:<hex>` tags
+        // byte for byte, so anything but the canonical 16 lowercase hex
+        // digits would validate yet never match: a strict channel would
+        // open and select no replicas.
+        for key in [
+            COLOCATE_WITH_METADATA_KEY,
+            COLOCATE_WITH_STRICT_METADATA_KEY,
+        ] {
+            if let Some(value) = self.placement_metadata.get(key) {
+                let canonical = value.len() == 16
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                if !canonical {
+                    return Err(ReplicationConfigError::PlacementChainInvalid {
+                        key: key.to_string(),
+                        value: value.clone(),
+                    });
+                }
+            }
+        }
         if let PlacementStrategy::Pinned(nodes) = &self.placement {
             if nodes.is_empty() {
                 return Err(ReplicationConfigError::PinnedSetEmpty);
@@ -485,11 +510,51 @@ pub enum ReplicationConfigError {
     /// to colocate with: no candidate could ever qualify.
     #[error("ColocationStrict placement requires placement_metadata[\"colocate-with-strict\"]")]
     ColocationStrictWithoutChain,
+    /// A `colocate-with` / `colocate-with-strict` value isn't a chain's
+    /// origin hash in canonical form (16 lowercase hex digits).
+    #[error("placement_metadata[{key:?}] = {value:?} is not a 16-digit lowercase hex chain hash")]
+    PlacementChainInvalid {
+        /// The metadata key.
+        key: String,
+        /// The rejected value.
+        value: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colocation_chains_must_be_canonical_hex() {
+        for bad in [
+            "",
+            "ab",
+            "00000000000000AB",
+            "0x00000000000000ab",
+            "000000000000000g",
+        ] {
+            for key in [
+                COLOCATE_WITH_METADATA_KEY,
+                COLOCATE_WITH_STRICT_METADATA_KEY,
+            ] {
+                let cfg = ReplicationConfig::new()
+                    .with_placement(PlacementStrategy::ColocationStrict)
+                    .with_placement_metadata(COLOCATE_WITH_STRICT_METADATA_KEY, "00000000000000ab")
+                    .with_placement_metadata(key, bad);
+                assert!(
+                    matches!(
+                        cfg.validate(),
+                        Err(ReplicationConfigError::PlacementChainInvalid { .. })
+                    ),
+                    "{key}={bad:?} must be rejected"
+                );
+            }
+        }
+        let ok = ReplicationConfig::new()
+            .with_placement_metadata(COLOCATE_WITH_METADATA_KEY, "00c0ffee00000001");
+        assert_eq!(ok.validate(), Ok(()));
+    }
 
     #[test]
     fn colocation_strict_requires_a_named_chain() {

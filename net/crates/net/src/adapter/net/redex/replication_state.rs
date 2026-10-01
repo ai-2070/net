@@ -460,7 +460,7 @@ mod tests {
             ReplicaRole::Candidate,
             ReplicaRole::Idle,
         ];
-        const SIGNALS: [TransitionSignal; 7] = [
+        const SIGNALS: [TransitionSignal; 8] = [
             TransitionSignal::CapabilitySelected,
             TransitionSignal::MissedHeartbeats,
             TransitionSignal::ElectionWon,
@@ -468,6 +468,7 @@ mod tests {
             TransitionSignal::GracefulRelinquish,
             TransitionSignal::DiskPressureWithdraw,
             TransitionSignal::ChannelClose,
+            TransitionSignal::PlacementDeselected,
         ];
 
         let mut valid_pairs = 0;
@@ -487,9 +488,11 @@ mod tests {
                     // pair. The base specific-signal pair (e.g.
                     // Leader→Idle via GracefulRelinquish,
                     // Replica→Idle via DiskPressureWithdraw) adds
-                    // another for some from-states. Cap is 2.
+                    // another for some from-states, and
+                    // PlacementDeselected one more for every
+                    // participating role. Cap is 3.
                     assert!(
-                        signal_hits <= 2,
+                        signal_hits <= 3,
                         "{from:?} → Idle has too many valid signals: {signal_hits}",
                     );
                 } else {

@@ -13195,6 +13195,14 @@ pub struct MeshNode {
     /// review Findings 8 + 11). Held only across the sync build, never
     /// across the peer broadcast.
     announce_mu: parking_lot::Mutex<()>,
+    /// Serializes the read-modify-write announce helpers
+    /// (`announce_chain` / `withdraw_chain`, the heat helpers, the
+    /// replica-candidate helpers): each reads the user-caps baseline,
+    /// edits one tag family and re-announces. Two of them interleaving
+    /// (e.g. two channels' replication runtimes) would each write back a
+    /// baseline missing the other's tag. Held across the announce, so
+    /// it is async; `announce_mu` alone is released before the edit.
+    baseline_rmw: tokio::sync::Mutex<()>,
     /// Local-origin capability change signal (RT-2). The generation
     /// bumps whenever THIS node's announced surface changes — a
     /// `serve_tool` register/unregister or an nRPC service
@@ -15016,6 +15024,7 @@ impl MeshNode {
             seen_announcements: Arc::new(DashMap::new()),
             relay_announcements: Arc::new(DashMap::new()),
             announce_mu: parking_lot::Mutex::new(()),
+            baseline_rmw: tokio::sync::Mutex::new(()),
             announce_gate: Arc::new(parking_lot::Mutex::new(AnnounceGate {
                 last_broadcast_at: None,
                 deferred_scheduled: false,
@@ -45879,6 +45888,7 @@ impl MeshNode {
     pub async fn announce_chain(&self, origin_hash: u64, tip_seq: u64) -> Result<(), AdapterError> {
         let hex = Self::chain_hex(origin_hash);
         let replacement = Tag::parse(&format!("causal:{hex}:{tip_seq}")).ok();
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_causal_tags(&mut snapshot, origin_hash, replacement);
         self.announce_capabilities(snapshot).await
@@ -45904,6 +45914,7 @@ impl MeshNode {
         }
         let hex = Self::chain_hex(origin_hash);
         let replacement = Tag::parse(&format!("causal:{hex}[{start_seq}..{end_seq}]")).ok();
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_causal_tags(&mut snapshot, origin_hash, replacement);
         self.announce_capabilities(snapshot).await
@@ -45914,6 +45925,7 @@ impl MeshNode {
     /// converge to the same view (the chain tag absent from the
     /// announced set).
     pub async fn withdraw_chain(&self, origin_hash: u64) -> Result<(), AdapterError> {
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_causal_tags(&mut snapshot, origin_hash, None);
         self.announce_capabilities(snapshot).await
@@ -45962,6 +45974,7 @@ impl MeshNode {
                 "replica-candidate tag failed to parse".into(),
             ));
         };
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         if snapshot.tags.contains(&tag) {
             return Ok(());
@@ -45977,6 +45990,7 @@ impl MeshNode {
         channel_id: &[u8; 32],
     ) -> Result<(), AdapterError> {
         let tag = Self::replica_candidate_tag(channel_id);
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         let before = snapshot.tags.len();
         snapshot.tags.retain(|t| t.to_string() != tag);
@@ -46026,6 +46040,7 @@ impl MeshNode {
             return Err(AdapterError::Fatal("heat rate must be finite".to_string()));
         };
         let replacement = Tag::parse(&format!("heat:{hex}={clamped:.2}")).ok();
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_heat_tags(&mut snapshot, origin_hash, replacement);
         self.announce_capabilities(snapshot).await
@@ -46036,6 +46051,7 @@ impl MeshNode {
     /// chain's `causal:` advertisements are untouched.
     #[cfg(feature = "dataforts")]
     pub async fn withdraw_heat(&self, origin_hash: u64) -> Result<(), AdapterError> {
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_heat_tags(&mut snapshot, origin_hash, None);
         self.announce_capabilities(snapshot).await
@@ -46062,6 +46078,7 @@ impl MeshNode {
         if updates.is_empty() {
             return Ok(());
         }
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         for &(origin_hash, rate_opt) in updates {
             let replacement = match rate_opt {
@@ -46122,6 +46139,7 @@ impl MeshNode {
         };
         let hex = Self::blob_hex(&hash);
         let replacement = Tag::parse(&format!("heat:blob:{hex}={clamped:.2}")).ok();
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_blob_heat_tags(&mut snapshot, &hash, replacement);
         self.announce_capabilities(snapshot).await
@@ -46130,6 +46148,7 @@ impl MeshNode {
     /// Withdraw every `heat:blob:<hex>=*` tag for `hash` and
     /// re-broadcast. Peers drop the blob-heat annotation.
     pub async fn withdraw_blob_heat(&self, hash: [u8; 32]) -> Result<(), AdapterError> {
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_blob_heat_tags(&mut snapshot, &hash, None);
         self.announce_capabilities(snapshot).await
@@ -46148,6 +46167,7 @@ impl MeshNode {
         if updates.is_empty() {
             return Ok(());
         }
+        let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         for (hash, rate_opt) in updates {
             let replacement = match rate_opt {

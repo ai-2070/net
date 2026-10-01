@@ -503,7 +503,9 @@ pub unsafe extern "C" fn net_redex_enable_replication(
 /// replication down (gracefully, on the FFI runtime, withdrawing its
 /// chain advertisement) and release this `Redex`'s reference to the
 /// mesh. Idempotent; open files stay open as local logs. Blocks until
-/// the shutdown completes; don't call it from a tokio worker thread.
+/// the shutdown completes. Called from inside a tokio runtime it aborts
+/// the process (the module's `block_on` guard) rather than panic across
+/// the FFI boundary.
 ///
 /// Returns `0`, `NetError::NullPointer` (`-1`) on a NULL handle, or
 /// `NetError::ShuttingDown` while the `Redex` is in `_free`-quiesce.
@@ -521,7 +523,7 @@ pub unsafe extern "C" fn net_redex_disable_replication(redex: *mut RedexHandle) 
     // mesh reference, on the FFI runtime (a C / cgo caller's thread has
     // none of its own), so a following mesh free / shutdown sees the
     // mesh released.
-    runtime().block_on(h.inner.disable_replication_and_wait());
+    block_on(h.inner.disable_replication_and_wait());
     0
 }
 

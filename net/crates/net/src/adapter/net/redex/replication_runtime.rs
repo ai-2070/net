@@ -813,6 +813,7 @@ async fn run(
                                 super::replication_state::TransitionSignal::ChannelClose,
                             )
                             .await;
+                        retry_withdraw_on_exit(&coordinator).await;
                         return;
                     }
                     Some(event) => {
@@ -839,6 +840,7 @@ async fn run(
                                 super::replication_state::TransitionSignal::ChannelClose,
                             )
                             .await;
+                        retry_withdraw_on_exit(&coordinator).await;
                         return;
                     }
                     Some(event) => {
@@ -911,6 +913,23 @@ fn observe_lag(
 /// (30 s). Under role thrash or rapid leader churn, the soft-cap
 /// GC then evicted entries from OTHER leaders to make room — the
 /// documented invariant on `OutstandingRequests::clear_leader`.
+/// The runtime is exiting: no later tick will retry a withdraw that just
+/// failed, so give it a few bounded attempts here. A withdraw that still
+/// fails leaves the tag until this node's announcement expires.
+async fn retry_withdraw_on_exit(coordinator: &Arc<ReplicationCoordinator>) {
+    for _ in 0..3 {
+        if !coordinator.advertisement_is_stale() {
+            return;
+        }
+        coordinator.reconcile_advertisement().await;
+        if !coordinator.advertisement_is_stale() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tracing::warn!("replication: chain withdraw still failing at runtime exit");
+}
+
 /// The per-tick placement step for resolver-driven channels. Re-resolves
 /// the replica set, then moves this node in or out of it: selected while
 /// `Idle` → bootstrap to `Replica`; not selected while participating →
@@ -948,6 +967,20 @@ async fn resolve_placement(
             );
             *set = resolved;
             *since = now;
+            // A believed leader that left the set no longer leads us:
+            // its frames are now dropped at the gate, so catch-up
+            // requests to it would stall until the missed-heartbeat
+            // window ran out. Forget it and wait for (or elect) the
+            // set's leader instead.
+            let mut tracker = state.tracker.lock();
+            if let Some(leader) = tracker.believed_leader() {
+                if !set.contains(&leader) {
+                    tracker.clear_believed_leader();
+                    if coordinator.role() == ReplicaRole::Replica {
+                        tracker.arm_leader_wait(now.into_std());
+                    }
+                }
+            }
         }
         now.saturating_duration_since(*since)
     };
@@ -1077,7 +1110,6 @@ async fn on_tick(
     // drives this on_tick call. Pre-fix std::Instant::now() kept
     // moving while virtual time was paused.
     let now = tokio::time::Instant::now().into_std();
-    coordinator.reconcile_advertisement().await;
     if !resolve_placement(inputs, coordinator, state).await {
         // Deselected this tick: the node is `Idle` now and has nothing
         // to emit.
@@ -1134,6 +1166,9 @@ async fn on_tick(
         tail_seq
     };
     coordinator.record_tail_seq(advertised_tail);
+    // After the tail refresh, so a retried announce carries the current
+    // tip, not the one cached when the original transition failed.
+    coordinator.reconcile_advertisement().await;
     let wall_clock_ms = (inputs.wall_clock_provider)();
     // R-10: capture `current_role` inside the same critical
     // section that holds the tracker lock so a concurrent
@@ -1711,12 +1746,15 @@ async fn on_inbound(
                     // at the 3 GB hard cap, or a disk write fail
                     // on the persistent tier). Consult the
                     // configured `UnderCapacity` policy and react.
-                    handle_disk_pressure(coordinator, &inputs.file, &detail, from).await;
+                    let withdrew =
+                        handle_disk_pressure(coordinator, &inputs.file, &detail, from).await;
                     // Under `Withdraw` the node left its role; with
                     // dynamic placement it must also leave the
                     // candidate pool, or the next tick re-selects it
-                    // and the peers' re-selection never happens.
-                    if coordinator.role() == ReplicaRole::Idle {
+                    // and the peers' re-selection never happens. Only
+                    // on an actual withdraw: `EvictOldest`, or a role
+                    // that was already Idle, must not opt the node out.
+                    if withdrew {
                         if let (Some(p), Some(resolver)) =
                             (&state.placement, &inputs.replica_resolver)
                         {
@@ -1972,12 +2010,15 @@ async fn on_inbound(
 ///   no retention caps are configured the sweep is a no-op and
 ///   the next apply will fail again — operators who pick this
 ///   policy should pair it with `retention_max_*` settings.
+///
+/// Returns `true` when this call withdrew the role (`Withdraw` policy,
+/// from a participating role, transition accepted).
 async fn handle_disk_pressure(
     coordinator: &Arc<ReplicationCoordinator>,
     file: &super::file::RedexFile,
     detail: &str,
     from: NodeId,
-) {
+) -> bool {
     use super::replication_config::UnderCapacity;
     coordinator.metrics().incr_under_capacity();
     let policy = coordinator.config().on_under_capacity;
@@ -1994,6 +2035,7 @@ async fn handle_disk_pressure(
             // withdraw, pick the signal that's actually valid for
             // the current role so we don't silently log+drop the
             // transition and keep writing through pressure.
+            let was_idle = coordinator.role() == ReplicaRole::Idle;
             let signal = match coordinator.role() {
                 ReplicaRole::Replica => {
                     super::replication_state::TransitionSignal::DiskPressureWithdraw
@@ -2015,11 +2057,17 @@ async fn handle_disk_pressure(
                     super::replication_state::TransitionSignal::CandidateDiskPressureWithdraw
                 }
             };
-            if let Err(e) = coordinator.transition_to(ReplicaRole::Idle, signal).await {
-                tracing::warn!(
-                    error=?e,
-                    "replication: disk-pressure withdraw transition failed"
-                );
+            match coordinator.transition_to(ReplicaRole::Idle, signal).await {
+                // TagSink: the role did move; only the withdraw
+                // advertisement failed (retried by reconcile).
+                Ok(_) | Err(CoordinatorError::TagSink(_)) => !was_idle,
+                Err(e) => {
+                    tracing::warn!(
+                        error=?e,
+                        "replication: disk-pressure withdraw transition failed"
+                    );
+                    false
+                }
             }
         }
         UnderCapacity::EvictOldest => {
@@ -2029,6 +2077,7 @@ async fn handle_disk_pressure(
                 "replication: disk pressure → sweeping retention"
             );
             file.sweep_retention();
+            false
         }
     }
 }

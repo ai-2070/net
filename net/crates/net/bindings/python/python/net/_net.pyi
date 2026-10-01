@@ -302,9 +302,11 @@ class Redex:
         set elects a leader (`replication_leader_pinned` if healthy).
         With `"standard"` (the default) or `"colocation_strict"`, every
         node that opens the channel is a candidate and each picks the
-        same `replication_factor` replicas; `replication_placement_metadata`
-        carries the hints (`colocate-with-strict`, required by
-        `"colocation_strict"`, is a chain's 16-hex origin hash).
+        same `replication_factor` replicas. `replication_placement_metadata`
+        carries the hints: `colocate-with` (prefer candidates holding that
+        chain) and `colocate-with-strict` (require it; mandatory for
+        `"colocation_strict"`), each a chain's 16 lowercase hex digit
+        origin hash, and `intent` (an intent from the default registry).
         """
         ...
     def enable_replication(self, mesh: "NetMesh") -> None:
