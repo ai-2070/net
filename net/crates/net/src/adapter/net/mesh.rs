@@ -48215,28 +48215,66 @@ impl MeshNode {
     ) -> Result<(), StreamError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let drained = match self.peers.get(&stream.peer_node_id()) {
-                Some(p) => match p.session.drain_state_for_lifetime(
-                    stream.stream_id(),
-                    stream.session_id(),
-                    stream.epoch(),
-                ) {
-                    StreamDrainState::SessionSuperseded => {
-                        return Err(StreamError::SessionSuperseded)
-                    }
-                    StreamDrainState::LifetimeMismatch => return Err(StreamError::NotConnected),
-                    StreamDrainState::Pending => false,
-                    // Absent → nothing left to drain.
-                    StreamDrainState::Drained | StreamDrainState::Absent => true,
-                },
-                None => true, // peer gone → nothing to drain
-            };
-            if drained || std::time::Instant::now() >= deadline {
+            if self.graceful_drain_probe(stream)? || std::time::Instant::now() >= deadline {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         self.close_stream_handle(stream)
+    }
+
+    /// [`Self::close_stream_graceful_handle`] for a caller that holds the
+    /// node only **weakly**: the node is upgraded for each probe and for
+    /// the final close, and released across every sleep in between.
+    ///
+    /// The drain can last up to `timeout` (the blob-transfer server uses
+    /// 30 s), and a caller that held an `Arc<MeshNode>` across it pinned
+    /// the node for that long: a binding whose `shutdown` needs sole
+    /// ownership (Node's) then refused with "outstanding references" until
+    /// the drain ended. If the node is dropped mid-drain there is nothing
+    /// left to close, and this returns `Ok(())`.
+    pub async fn close_stream_graceful_handle_weak(
+        node: &std::sync::Weak<MeshNode>,
+        stream: &Stream,
+        timeout: Duration,
+    ) -> Result<(), StreamError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let drained = match node.upgrade() {
+                Some(n) => n.graceful_drain_probe(stream)?,
+                None => return Ok(()),
+            }; // the strong reference is dropped here, before the sleep
+            if drained || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        match node.upgrade() {
+            Some(n) => n.close_stream_handle(stream),
+            None => Ok(()),
+        }
+    }
+
+    /// One poll of the graceful drain: `Ok(true)` when the stream's
+    /// lifetime has nothing left unacked (or is gone), `Ok(false)` while
+    /// it is still pending, and the fencing errors of
+    /// [`Self::close_stream_graceful_handle`] when the lifetime it names
+    /// was superseded or replaced.
+    fn graceful_drain_probe(&self, stream: &Stream) -> Result<bool, StreamError> {
+        Ok(match self.peers.get(&stream.peer_node_id()) {
+            Some(p) => match p.session.drain_state_for_lifetime(
+                stream.stream_id(),
+                stream.session_id(),
+                stream.epoch(),
+            ) {
+                StreamDrainState::SessionSuperseded => return Err(StreamError::SessionSuperseded),
+                StreamDrainState::LifetimeMismatch => return Err(StreamError::NotConnected),
+                StreamDrainState::Pending => false,
+                // Absent → nothing left to drain.
+                StreamDrainState::Drained | StreamDrainState::Absent => true,
+            },
+            None => true, // peer gone → nothing to drain
+        })
     }
 
     /// Close whatever reliable stream is open under `(peer_node_id,
