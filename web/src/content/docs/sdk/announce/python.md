@@ -1,8 +1,8 @@
 ## Announce it — Python
 
-### Capabilities are on the wrapper; tools are one layer down
+### Everything starts from the node
 
-`net_sdk.MeshNode` now carries the capability lifecycle directly —
+`net_sdk.MeshNode` carries the capability lifecycle directly —
 `announce_capabilities`, `find_nodes` / `find_nodes_scoped`, and
 `find_best_node` / `find_best_node_scoped`:
 
@@ -13,19 +13,14 @@ node = MeshNode(bind_addr="127.0.0.1:9001", psk="42" * 32)
 node.announce_capabilities({"tags": ["gpu"], "hardware": {"memory_gb": 64}})
 ```
 
-The **tool** surface still lives on the native handle, and so does nRPC:
+The **tool** surface rides nRPC, and the node hands you the RPC handle:
 
 ```python
-from net.mesh_rpc import TypedMeshRpc
-
-native = node._native                       # tools/nRPC only
-rpc = TypedMeshRpc.from_mesh(native)
+rpc = node.rpc()                            # a TypedMeshRpc; build once, reuse
 ```
 
-Reaching a private attribute is not a recommendation, it is the current state of
-the binding for those surfaces. It is called out here rather than hidden because
-the alternative is a reader concluding Python cannot serve tools — it can, one
-layer down.
+nRPC needs the node built with `permissive_channels=True`: reply channels are
+per-caller and can't be pre-registered.
 
 ### Serve a tool
 
@@ -58,7 +53,7 @@ caps = add_tool_capabilities_to_announce(
     [descriptor_for("web_search", description="Search the web.",
                     tags=["web", "research"])],
 )
-native.announce_capabilities(caps)
+node.announce_capabilities(caps)
 ```
 
 `add_tool_capabilities_to_announce` adds an `ai-tool:<tool_id>` tag and a `tools[]`
@@ -70,7 +65,7 @@ then it is required, not optional.
 ### Tags without a tool
 
 ```python
-native.announce_capabilities({"tags": ["gpu", "inference", "region:eu-west"]})
+node.announce_capabilities({"tags": ["gpu", "inference", "region:eu-west"]})
 ```
 
 The capability set is a plain dict in Python — no builder, no typed class.
@@ -81,19 +76,16 @@ From a peer that folded the announcement:
 
 ```python
 import time
-from net_sdk import list_tools
-
-agent_native = agent._native
 
 deadline = time.monotonic() + 3.0
-while time.monotonic() < deadline and not list_tools(agent_native):
+while time.monotonic() < deadline and not agent.list_tools():
     time.sleep(0.02)
 
-assert list_tools(agent_native), "the announcement did not fold"
+assert agent.list_tools(), "the announcement did not fold"
 ```
 
-`list_tools` also takes the native handle. Passing the `MeshNode` raises
-`AttributeError: 'MeshNode' object has no attribute 'list_tools'` — which reads
-like a missing feature and is a wrong argument.
+Call the method, `agent.list_tools()`. The module-level
+`net_sdk.list_tools(mesh)` is the lower layer: it takes the native handle, and
+fails if you pass it a `MeshNode`.
 
 Next: [Discover a capability](/docs/sdk/python/discover).

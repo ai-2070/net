@@ -75,7 +75,6 @@ operations:
       anchor: subscribeChannel
     Python:
       status: supported
-      mode: core-only
       anchor: subscribe_channel
     Go:
       status: supported
@@ -169,7 +168,6 @@ operations:
       anchor: tokenRoots
     Python:
       status: supported
-      mode: core-only
       anchor: token_roots
     Go:
       status: supported
@@ -217,7 +215,6 @@ operations:
       anchor: permissiveChannels
     Python:
       status: supported
-      mode: core-only
       anchor: permissive_channels
     Go:
       status: not exposed
@@ -319,7 +316,6 @@ operations:
       anchor: serveA2a
     Python:
       status: supported
-      mode: core-only
       anchor: serve_a2a
     Go:
       status: not exposed
@@ -334,7 +330,6 @@ operations:
       status: not exposed
     Python:
       status: supported
-      mode: core-only
       anchor: serve_a2a_configured
     Go:
       status: not exposed
@@ -524,7 +519,6 @@ operations:
       anchor: groups
     Python:
       status: supported
-      mode: core-only
       anchor: daemon_count
     Go:
       status: supported

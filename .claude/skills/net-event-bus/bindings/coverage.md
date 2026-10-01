@@ -82,24 +82,24 @@ A mode is written after the status: `supported · core-only`.
 |---|---|---|---|---|---|
 | Event bus — ingest + poll | supported | supported | supported | supported | supported · poll |
 | Consumer-side filter DSL | supported | supported | supported | not exposed | supported |
-| Distributed mesh channels — register / subscribe / publish | supported | supported | supported · core-only | supported | supported |
+| Distributed mesh channels — register / subscribe / publish | supported | supported | supported | supported | supported |
 | Tagged EventBus topics (node.channel) | n/a | supported | supported | n/a | n/a |
 | Channel subscribe with a full TokenChain | not exposed | not exposed | not exposed | not exposed | not exposed |
 | Delegated publish chain (set_publish_chain) | not exposed | not exposed | not exposed | not exposed | not exposed |
 | Prefix-matched channel ACL registration | supported | not exposed | not exposed | not exposed | not exposed |
 | Channel policy — origin binding + queue-group policy | supported | not exposed | not exposed | not exposed | not exposed |
 | Queue-group channel subscription | not exposed | not exposed | not exposed | not exposed | not exposed |
-| Channel token roots (require_token anchoring) | supported | supported | supported · core-only | supported | supported |
+| Channel token roots (require_token anchoring) | supported | supported | supported | supported | supported |
 | Distributed batch fan-out (publish_many) | supported | not exposed | not exposed | not exposed | not exposed |
 | Membership rejection reason (AckReason taxonomy) | supported | partial | partial | partial | partial |
-| Permissive channel registry (opt out of strict default) | not exposed | supported · core-only | supported · core-only | not exposed | not exposed |
+| Permissive channel registry (opt out of strict default) | not exposed | supported · core-only | supported | not exposed | not exposed |
 | Mesh streams | supported | supported | supported | supported | supported |
 | Capability announce | supported | supported | supported | supported | supported |
 | Capability discovery | supported | supported | supported | supported | supported |
 | nRPC — typed request/response + streaming | supported | supported | supported | supported | supported |
 | Gang-claim scheduler | supported | supported | supported | supported | supported |
-| A2A — agent task handoff | supported | supported · core-only | supported · core-only | not exposed | not exposed |
-| A2A — paid task admission (prepare → purchase → submit) | supported | not exposed | supported · core-only | not exposed | not exposed |
+| A2A — agent task handoff | supported | supported · core-only | supported | not exposed | not exposed |
+| A2A — paid task admission (prepare → purchase → submit) | supported | not exposed | supported | not exposed | not exposed |
 | Organization capability auth | supported | supported | supported | supported | supported |
 | Organization-scoped streaming RPC | supported | supported | supported | supported | supported |
 | Subnet gateway provisioning | supported | supported | supported | supported | supported |
@@ -110,7 +110,7 @@ A mode is written after the status: `supported · core-only`.
 | RedEX — durable log | supported | supported | supported | supported | supported |
 | CortEX folds / NetDB | supported | supported | supported | supported | supported |
 | MeshDB — federated queries | supported | supported | supported | supported | supported |
-| Compute / groups / daemons | supported | supported | supported · core-only | supported | supported |
+| Compute / groups / daemons | supported | supported | supported | supported | supported |
 | Deck — operator surface | supported | supported | supported | supported | supported |
 | Redis Streams dedup | supported | supported | supported · core-only | supported | supported |
 
@@ -189,19 +189,18 @@ this is a convenience layer, not a missing feature. *Distributed mesh channels*
 are the real thing and exist in all five. Do not read a claim about one as
 evidence about the other — `concepts.md` § Channel opens with the split.
 
-**Python distributed channels are `core-only`.** `register_channel`,
-`subscribe_channel` and `publish_channel` live on the low-level `net.NetMesh` /
-`AsyncNetMesh` binding. The ergonomic `net_sdk.MeshNode` does not wrap them, so
-a Python program that only imports `net_sdk` cannot reach the channel surface
-at all. Same for `permissive_channels`, which is a constructor argument on the
-low-level binding.
-
-Capability announce and discovery **are** on the wrapper —
-`announce_capabilities`, `find_nodes` / `find_nodes_scoped`, `find_best_node` /
-`find_best_node_scoped` — so those rows are no longer `core-only`. They used to
-require reaching through the private `node._native`, which the published Python
-guides documented as the supported route. The **tool** surface (`list_tools`,
-`watch_tools`, `serve_tool`) still takes the native handle.
+**Python reaches all of this from `net_sdk` now; Redis dedup is the one
+`core-only` Python cell left.** Distributed channels (`register_channel`,
+`subscribe_channel`, `publish`, `recv`), `permissive_channels` and the other
+constructor options, A2A (`serve_a2a`, `submit_task`, `submit_task_paid`),
+compute (`net_sdk.compute`) and groups (`net_sdk.groups`) used to live only on
+the low-level `net` binding, and are now wrapped on `net_sdk.MeshNode` /
+`net_sdk.AsyncMeshNode`. So are the
+tool surface (`node.list_tools()`, `node.watch_tools()`), nRPC (`node.rpc()`)
+and blob transfer (`node.store_dir` / `fetch_dir`). The module-level
+`net_sdk.list_tools(mesh)` / `watch_tools(mesh)` are the layer underneath and
+still take the native handle. Capability announce and discovery were already on
+the wrapper.
 
 **Delegated channel credentials are `not exposed` everywhere.** Core has both
 halves — `MeshNode::subscribe_channel_with_chain(TokenChain)` and

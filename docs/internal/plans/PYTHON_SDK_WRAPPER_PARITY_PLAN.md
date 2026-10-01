@@ -6,7 +6,7 @@ The Rust SDK gaps found along the way have their own plan:
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-S0, S1a and S1–S7 done 2026-10-01 (see each slice). S8 (docs) not started.
+Done, 2026-10-01: S0, S1a and S1–S8 all landed (see each slice). Open follow-ups are listed under each slice's "Found, not fixed" notes and in "Not in scope".
 
 Amended 2026-10-01, same day:
 - The two open checks from the first draft were verified (see S0 and S5).
@@ -721,6 +721,41 @@ type signatures only.
   that now have an SDK path.
 - **Proves it:** `npm run check` in `web/` stays green, and any README or skill
   example that CI executes still runs.
+- **Done 2026-10-01.**
+  - **`sdk-py/README.md`:** new "Mesh channels", "Compute and groups" and
+    "Async" sections. "The loop" now uses `node.rpc()` and
+    `node.list_tools()` / `node.watch_tools()` instead of reaching through
+    `node._native`. The surface table names the new modules.
+  - **Web docs:** the four Python SDK pages (`sdk/{announce,discover,
+    invoke,artifacts}/python.md`) told readers to use `node._native`, and
+    two said outright that passing a `MeshNode` raises `AttributeError`.
+    Both are false now, and the pages use the node methods. The artifacts
+    page now says the fetching node needs `serve_blob_transfer` too (the S4
+    finding). No guide had a TS tab without a Python twin: the guides
+    covering these surfaces are Rust-only, so that part of the slice was
+    empty.
+  - **Skill:** the `net-event-bus` coverage record
+    (`docs/data/capabilities/event-bus.yaml`, the canonical source) drops
+    `core-only` from six Python cells: mesh channels, token roots,
+    permissive channels, A2A handoff, A2A paid, and compute / groups. Redis
+    dedup stays `core-only`. `coverage.md` and
+    `web/src/lib/generated/capability-record.json` were regenerated with
+    `capability_records.py --write`. The hand-written prose in
+    `coverage.md`, `capabilities.md` and `streams.md` was updated; its old
+    advice was "drop to `mesh._native`".
+  - **Checks run:** `capability_records.py --check` passes. `check-skills.sh`
+    passes; it first caught a plan-file reference in the new skill prose,
+    which was removed. `check-skill-source-paths.py` and the depth check
+    pass. `web` `check-doc-links.mjs` reports 183 docs, all internal links
+    resolving, and `sync-releases.mjs --check` passes.
+  - **Not run locally:** `check-skill-snippets.py` fails on this Windows box
+    before compiling anything; it writes a `C:\Users\…` path into TOML,
+    where `\U` is a bad escape. The slice changed no Rust snippet. `web`
+    `check:types` wasn't run (no `node_modules`). CI runs both.
+  - **Pre-existing, not this plan's:** `check-readmes.py` fails on
+    `cli/npm/README.md` and `cli/python/README.md` ("Subcommand surface block
+    differs"). This branch touches neither file, so the failure is on
+    `master`.
 
 ## Risks
 

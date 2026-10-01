@@ -122,6 +122,12 @@ There are 24 native methods with no `MeshNode` wrapper:
   and `wrong-peer` (`format_migration_error` in
   `bindings/python/src/compute.rs`; check the napi formatter matches). A TS
   caller sees those three as `'unknown'`.
+- **Skill snippets reach through `_native` for nRPC** (found 2026-10-01
+  while updating the Python skill prose).
+  `.claude/skills/net-event-bus/nrpc.md` and `patterns.md` show
+  `TypedMeshRpc.fromMesh((mesh as any)._native)`, although TS `MeshNode`
+  has `rpc()` (`sdk-ts/src/mesh.ts:546`). The S7 docs slice should switch
+  them to `mesh.rpc()`.
 
 ### Ruled out (not gaps)
 
