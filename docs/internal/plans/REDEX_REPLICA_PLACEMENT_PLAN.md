@@ -174,8 +174,10 @@ registering its claim at construction (inside `open_file`), so a
 close-and-reopen's old release can't remove the new claim; **RED** by
 mutation (a release that ignores other claimants):
 `candidate_tag_outlives_all_but_the_last_resolver` (unit). The sync drop
-path reports an announce-lock timeout separately and falls back to an
-async withdraw instead of treating it as already withdrawn.
+path reports an announce-lock timeout separately instead of treating it
+as already withdrawn: with a tokio runtime it schedules an async withdraw;
+without one it can only log a warning, and the tag stays advertised until
+the channel is reopened or the node restarts.
 
 **GREEN:** redex / gang / dataforts / placement / FFI / chain / heat units
 1500; the replication, dataforts-blob, chain-discovery and gravity e2e
