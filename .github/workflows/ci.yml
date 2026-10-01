@@ -3980,6 +3980,17 @@ jobs:
       # against the built pair, dependency declarations checked.
       - name: Type-check a trivial consumer against the shipped declarations
         run: "$GITHUB_WORKSPACE/.github/scripts/check-ts-consumer.sh"
+      # The vitest suite resolves `../src/*`, so it never sees what a consumer
+      # gets: the `exports` map, `dist/`, the `files` list, the `.d.ts`.
+      # `src/deck.ts` shipped unreachable from the package for exactly that
+      # reason (NODE_SDK_GAPS_PLAN.md S1). This packs @net-mesh/sdk and the
+      # in-tree @net-mesh/core, installs both tarballs into a throwaway
+      # consumer, and requires / imports / type-checks every entry point, plus
+      # a negative control that an unexported subpath is refused.
+      - name: Package-boundary smoke test (npm pack -> install -> require/import/tsc)
+        run: |
+          npm --prefix ../bindings/node run build:ts
+          node scripts/package-smoke.mjs
 
       # The skill's TypeScript hello-world, type-checked against this same
       # surface. It runs here because it needs the napi-generated `index.d.ts`

@@ -318,6 +318,36 @@ export type {
   PeerSnapshot,
 } from './meshos';
 
+// Deck (the operator surface over MeshOS). Also published at the
+// `@net-mesh/sdk/deck` subpath, which the module's own docs import from.
+export {
+  AdminCommands,
+  AdminVerifier,
+  AuditQuery,
+  DeckClient,
+  DeckSdkError,
+  IceCommands,
+  IceProposal,
+  OperatorIdentity,
+  OperatorRegistry,
+  SimulatedIceProposal,
+} from './deck';
+export type {
+  AdminAuditRecord,
+  AvoidScope,
+  BlastRadius,
+  ChainCommit,
+  DaemonCounts,
+  DeckClientConfig,
+  FailureRecord,
+  LogFilter,
+  LogLevel,
+  LogRecord,
+  OperatorSignature,
+  PeerCounts,
+  StatusSummary,
+} from './deck';
+
 // Groups (HA / scaling overlays — Stage 2 of SDK_GROUPS_SURFACE_PLAN).
 export { ReplicaGroup, ForkGroup, StandbyGroup, GroupError } from './groups';
 export type {

@@ -23,7 +23,7 @@
  * @example
  * ```ts
  * import { Identity } from '@net-mesh/core';
- * import { MeshOsDaemonSdk, type MeshOsDaemon } from '@net-mesh/sdk/meshos';
+ * import { MeshOsDaemonSdk, type MeshOsDaemon } from '@net-mesh/sdk';
  *
  * const daemon: MeshOsDaemon = {
  *   name: 'echo',

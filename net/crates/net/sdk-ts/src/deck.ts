@@ -16,7 +16,7 @@
  *
  * @example
  * ```ts
- * import { MeshOsDaemonSdk } from '@net-mesh/sdk/meshos';
+ * import { MeshOsDaemonSdk } from '@net-mesh/sdk';
  * import { DeckClient, OperatorIdentity } from '@net-mesh/sdk/deck';
  *
  * const sdk = await MeshOsDaemonSdk.start();
