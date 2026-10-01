@@ -3,8 +3,8 @@
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/node-sdk`
-(the plan was written on `LZL0/python-sdk`, merged as #1133). S1, S2 and S3 done
-2026-10-01 (see each slice); S4–S7 not started.
+(the plan was written on `LZL0/python-sdk`, merged as #1133). S1–S4 done 2026-10-01
+(see each slice); S5–S7 not started.
 
 **Checked before starting, 2026-10-01:** the two bug classes the Python work
 found don't apply here. The Node `poll` already sweeps every shard through
@@ -403,6 +403,53 @@ check the floor.
     `MeshBlobAdapter` `storeDir` / `fetchDir` need. (Corrected 2026-10-01
     after review; the first draft conflated the two.)
   - The witness is that nothing in the test imports `@net-mesh/core`.
+
+- **Done 2026-10-01.**
+  - New `src/blob.ts`, re-exported from the root. It carries the 14
+    native blob exports (the `BandwidthClass` / `Encoding` /
+    `ChunkingStrategy` classes, `BlobRef`, `MeshBlobAdapter` and the
+    adapter registry) plus `createMeshBlobAdapter(redex, id, options?)`.
+    The native `MeshBlobAdapter` constructor takes the *native* `Redex`,
+    which the SDK's `Redex` wraps (as `.napi`), so without the helper an
+    SDK caller couldn't build the adapter `storeDir` / `fetchDir` need.
+    The helper accepts either form.
+  - **Test:** `test/blob_surface.test.ts` (3 tests), importing only from
+    `../src/index`:
+    - the helper over an SDK `Redex`;
+    - `storeDir` → `fetchDir` across two nodes, files and byte counts
+      checked;
+    - the filesystem registry exercised separately, as the review asked.
+
+    **RED** with the committed `index.ts`: `createMeshBlobAdapter is not a
+    function`. **GREEN:** full suite 617 passed, smoke test passes.
+  - **Bug found and fixed (core).** The two-node test couldn't shut down the
+    *serving* node: `cannot shutdown: outstanding references exist`.
+    - **Measured:** the fetcher shuts down at once, but the holder only
+      after 7.3 s (three runs, all ~7.3 s); with a 3 s pause first, both
+      shut down.
+    - **Cause:** `serve_chunk` (`dataforts/blob/transfer.rs`) moved a
+      strong `Arc<MeshNode>` into its task and held it across the graceful
+      stream close, which waits up to `TRANSFER_TIMEOUT` (30 s) for the
+      receiver's acks. A receiver that leaves right after its fetch never
+      acks the tail, so the drain waits for the session instead.
+    - The Node binding's `NetMesh.shutdown` requires sole ownership by
+      design: its doc says serve tasks must drop their clones on teardown,
+      and it allows a 250 ms grace window. So the core task was the bug,
+      not the binding. Python's and Rust's shutdowns don't need sole
+      ownership, which is why the Python S4 test never saw it.
+    - **Fix:** a new `MeshNode::close_stream_graceful_handle_weak`, sharing
+      a factored-out `graceful_drain_probe` with the existing method,
+      upgrades the node only for each 2 ms probe and for the final close.
+      `serve_chunk` drops its `Arc` before the graceful close and uses it.
+      It was the only production caller holding an `Arc` across a
+      graceful close.
+    - **Witness:** new `tests/dir_transfer.rs` test
+      `serving_a_transfer_releases_the_holder_node_promptly`. The fetcher
+      shuts down right after `fetch_dir`, and the holder's `Arc` strong
+      count must return to its pre-transfer baseline within 2 s. **RED**
+      with the old `serve_chunk`: fails at 2.3 s. **GREEN:** all 11
+      `dir_transfer` tests pass. The TS test drops its retry workaround:
+      the holder now shuts down immediately after the fetch.
 
 ### S5 — N5, the mesh methods
 

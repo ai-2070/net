@@ -414,6 +414,27 @@ export {
   nextTransferStreamId,
 } from './transport';
 
+// Blob types and the adapter registry (NODE_SDK_GAPS_PLAN.md S4): what
+// MeshNode's blob methods take and return.
+export {
+  BandwidthClass,
+  BlobRef,
+  ChunkingStrategy,
+  Encoding,
+  MeshBlobAdapter,
+  blobAdapterIds,
+  blobAdapterRegistered,
+  blobPublish,
+  blobResolve,
+  createMeshBlobAdapter,
+  isBlobRef,
+  registerAsyncBlobAdapter,
+  registerBlobAdapter,
+  registerFilesystemBlobAdapter,
+  unregisterBlobAdapter,
+} from './blob';
+export type { MeshBlobAdapterOptions } from './blob';
+
 // Types.
 export type {
   NetNodeConfig,
