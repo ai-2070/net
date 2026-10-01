@@ -1,0 +1,36 @@
+net/crates/net/bindings/python/tests/test_redex.py
+  s_f9febccc288dd3::t_bab0cb6841e2d9 173-201
+net/crates/net/sdk-ts/src/_internal.ts
+  s_f9febccc288dd3::t_33f74361533258 61-71
+net/crates/net/sdk-ts/src/cortex.ts
+  s_f9febccc288dd3::t_33f74361533258 68-71,74-80,124-126,196-269,298-301
+  s_f9febccc288dd3::t_17ad9d2fb99bff 1256-1301
+  s_f9febccc288dd3::t_b2c0ead2e74300 308-311,318,320
+net/crates/net/sdk-ts/test/redex_replication.test.ts
+  s_f9febccc288dd3::t_c2a759acafab0f 1-2,15-20,22-23,74
+  s_f9febccc288dd3::t_f024bc345284bb 3-14,21,24-73
+net/crates/net/bindings/node/src/cortex.rs
+  s_f9febccc288dd3::t_2b508d91fb5ad4 179-188,224-225,229-240,265,390,501,554-555
+net/crates/net/bindings/python/src/cortex.rs
+  s_f9febccc288dd3::t_34e33c20a69d17 241-250,254-260,262-263,292-293,439-440,463-464,601-602,710-711
+  s_f9febccc288dd3::t_afea5fad6358b0 261
+  s_f9febccc288dd3::t_604d60cd429471 2380,2426
+docs/internal/plans/NODE_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_bfb8006c084c98 6-8,622-689
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3e980babf5f5910265d142dbb0b97f86bab895fd",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
