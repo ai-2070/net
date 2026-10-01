@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import inspect
 from pathlib import Path
 
 import pytest
@@ -161,6 +162,57 @@ def test_sampled_class_runtime_methods_are_stubbed(class_name: str) -> None:
         f"{class_name}: runtime exposes {unstubbed} but the stub does "
         f"not declare them; add them to net/_net.pyi"
     )
+
+
+@pytest.mark.parametrize("class_name", SAMPLED_CLASSES)
+def test_sampled_class_method_parameters_match(class_name: str) -> None:
+    """Names are not enough: a stubbed method whose parameters differ
+    from the runtime's type-checks wrong calls and rejects right ones.
+    That shipped once — ``NetMesh.publish_island_topology`` was stubbed
+    without its ``p50_latency_us`` parameter — and both name-level tests
+    above passed. Compares parameter names, in order, against
+    ``inspect.signature`` of the runtime (PyO3 publishes
+    ``__text_signature__``). Properties are skipped; a method whose
+    runtime signature is unreadable fails rather than skips."""
+    runtime_cls = getattr(_net, class_name, None)
+    if runtime_cls is None:
+        pytest.skip(f"{class_name} not present at runtime")
+    tree = ast.parse(PYI_PATH.read_text())
+    cls_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    mismatched: list[str] = []
+    for fn in cls_node.body:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        if fn.name.startswith("__") and fn.name != "__init__":
+            continue
+        decorators = {d.id for d in fn.decorator_list if isinstance(d, ast.Name)}
+        if "property" in decorators:
+            continue
+        runtime_attr = (
+            runtime_cls if fn.name == "__init__" else getattr(runtime_cls, fn.name, None)
+        )
+        if runtime_attr is None:
+            continue  # absence is the name-level tests' concern
+        try:
+            runtime_params = [
+                p
+                for p in inspect.signature(runtime_attr).parameters
+                if p not in ("self", "$self", "cls")
+            ]
+        except (TypeError, ValueError):
+            mismatched.append(f"{fn.name}: runtime signature unreadable")
+            continue
+        args = fn.args
+        stub_params = [a.arg for a in args.posonlyargs + args.args + args.kwonlyargs]
+        if "staticmethod" not in decorators and stub_params[:1] == ["self"]:
+            stub_params = stub_params[1:]
+        if stub_params != runtime_params:
+            mismatched.append(f"{fn.name}: runtime={runtime_params} stub={stub_params}")
+    assert not mismatched, f"{class_name} stub parameters drift: {mismatched}"
 
 
 def _collect_stub_attributes(class_name: str) -> list[str]:

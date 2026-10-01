@@ -106,12 +106,20 @@ from net_sdk.channel import (
 )
 from net_sdk.mesh import (
     BackpressureError,
+    ChannelAuthError,
+    ChannelConfig,
+    ChannelError,
     MeshNode,
     MeshStream,
     NotConnectedError,
+    OnFailure,
+    PublishConfig,
+    PublishError,
+    PublishReport,
     Reliability,
     SessionSupersededError,
     StreamStats,
+    Visibility,
 )
 from net_sdk.node import NetNode
 from net_sdk.org import (
@@ -152,6 +160,15 @@ __all__ = [
     "BackpressureError",
     "NotConnectedError",
     "SessionSupersededError",
+    # Mesh channels (distributed pub/sub) on `MeshNode`.
+    "ChannelError",
+    "ChannelAuthError",
+    "ChannelConfig",
+    "PublishConfig",
+    "PublishError",
+    "PublishReport",
+    "Visibility",
+    "OnFailure",
     # Organization capability auth (the §4.4 facade — thin forwarding over
     # the wheel's org surface; the typed wrappers + the `org:` vocabulary
     # mirror live at `net_sdk.org.TypedOrgClient` / `.serve_org_typed` /

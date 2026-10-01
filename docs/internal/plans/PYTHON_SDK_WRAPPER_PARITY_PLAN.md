@@ -6,7 +6,7 @@ The Rust SDK gaps found along the way have their own plan:
 ## Status
 
 In progress, 2026-10-01. Targets the release after 0.38. Branch `LZL0/python-sdk`.
-S0 and S1a done 2026-10-01 (see each slice). S1–S8 not started.
+S0, S1a and S1 done 2026-10-01 (see each slice). S2–S8 not started.
 
 Amended 2026-10-01, same day:
 - The two open checks from the first draft were verified (see S0 and S5).
@@ -167,6 +167,11 @@ The publish path returns a `PublishReport` dict. For receiving, add:
   already exist, only unstubbed.)
 - `MeshNode.recv(limit=..., timeout=None) -> list[StoredEvent]`, which drains
   every shard round-robin, matching TS `recv`.
+  *Changed during S1:* native `NetMesh.poll(limit)` already sweeps every
+  shard from a rotating start (`bindings/python/src/lib.rs` ~line 2188); its
+  stub docstring wrongly said "shard 0". So `recv(limit)` forwards to it
+  instead of reimplementing the sweep, and takes no `timeout`, matching native
+  and TS.
 - `MeshNode.open_stream_inbox(stream_id, capacity)`, forwarded. It's the only
   receive path that reports the **authenticated sender**, which TS
   `onStreamData` also exposes and `recv` can't. Rust gains the same in R1
@@ -299,6 +304,18 @@ the slice were wrong. Two test homes, with different jobs:
       for being absent.
   - **Not done:** an exhaustive check of every class in the stub. The
     sampled set is the forwarded-to classes plus the original three.
+  - **Follow-up defect, found during S1 (2026-10-01).** The S0 stub for
+    `NetMesh.publish_island_topology` omitted its fifth parameter,
+    `p50_latency_us`; the signature extraction used to write it truncated
+    the parameter list. Both name-level tests passed regardless. Fixed, and
+    a third test was added: `test_sampled_class_method_parameters_match`
+    compares each stubbed method's parameter names, in order, with
+    `inspect.signature` of the runtime method, and fails (doesn't skip) when
+    a runtime signature is unreadable. **RED** on the committed S0 stub:
+    `NetMesh stub parameters drift: ["publish_island_topology:
+    runtime=[…, 'p50_latency_us'] stub=[…]"]`. It was the only mismatch
+    across all eleven sampled classes. **GREEN:** 230 passed, 1 skipped.
+    The same fix corrected the stale `NetMesh.poll` docstring.
 
 ### S1a — Forward every constructor option, with a drift guard (G6)
 
@@ -390,6 +407,35 @@ the slice were wrong. Two test homes, with different jobs:
     register → subscribe → publish → `recv` returns the payload; a
     `subscribe_caps` mismatch raises `net_sdk.ChannelAuthError`; `publish` with
     no subscribers returns `attempted == 0`.
+- **Done 2026-10-01.**
+  - `MeshNode` gained `register_channel`, `subscribe_channel`,
+    `unsubscribe_channel`, `publish`, `recv` (forwards native `poll`, see the
+    Decision 3 amendment), `num_shards`, `shard_for_stream`, `poll_shard`
+    and `open_stream_inbox` (native default `capacity=4096`). `limit` is
+    required, as natively.
+  - New types `Visibility`, `OnFailure`, `ChannelConfig`, `PublishConfig`,
+    `PublishError` and `PublishReport`, plus `ChannelError` /
+    `ChannelAuthError`, are exported from `net_sdk.mesh` and the package
+    root.
+  - `TypedChannel`'s docstring now says it is a local-bus channel, not a
+    mesh channel.
+  - **Live test:** `test_sdk_mesh_channels.py` has 5 tests and is the first
+    two-node channel test in the Python suite. Beyond the three planned
+    cases, it checks that an invalid option raises `net_sdk.ChannelError`,
+    and that `shard_for_stream` and the stream inbox report the sender and
+    bypass the shard queue. It imports `net_sdk` from source when the wrapper
+    isn't installed, like the S1a test.
+  - **Forwarding test:** `test_mesh_channels_wrapper.py`, 6 tests.
+  - **RED** against the committed wrapper: all 6 forwarding tests and all 5
+    live tests fail (`'MeshNode' object has no attribute 'register_channel'`
+    / `'num_shards'`; `module 'net_sdk' has no attribute 'ChannelError'`).
+  - **GREEN:** `sdk-py` suite 351 passed (excluding the Python 3.11-only
+    `test_packaging_metadata.py`). The binding stub, ctor, channel,
+    channel-auth and stream-inbox tests: 256 passed, 1 skipped.
+  - **Not covered live:** the token path (`require_token` / `token_roots` /
+    `subscribe_channel(token=...)`). It is forwarded and checked by the
+    forwarding test only; the native behaviour is covered by
+    `test_channel_auth.py`.
 
 ### S2 — `net_sdk.compute`
 

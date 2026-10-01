@@ -157,6 +157,11 @@ class TypedChannel(Generic[T]):
     """
     A strongly typed channel for publishing and subscribing to events.
 
+    This is a channel on the node's *local* event bus
+    (``NetNode.channel``). It is not a mesh channel: for pub/sub between
+    peers, use :meth:`MeshNode.register_channel`,
+    :meth:`MeshNode.subscribe_channel` and :meth:`MeshNode.publish`.
+
     Deserialization picks one of three paths, in order: an explicit
     `parse` callable, a `model` (constructed as `model(**payload)`), or
     a plain dict. All three receive payload-only JSON — the `_channel`

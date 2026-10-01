@@ -1024,7 +1024,9 @@ class NetMesh:
         """Send a raw JSON payload to a direct peer address."""
         ...
     def poll(self, limit: int) -> List[StoredEvent]:
-        """Drain up to `limit` events from shard 0."""
+        """Drain up to `limit` received events across **every** shard,
+        sweeping from a rotating start shard so a busy shard can't starve
+        the others. Events are not returned in shard order."""
         ...
 
     def add_route(self, dest_node_id: int, next_hop_addr: str) -> None:
@@ -1262,7 +1264,12 @@ class NetMesh:
 
     # -- Gang-claim scheduler ---------------------------------------
     def publish_island_topology(
-        self, id: int, units: List[int], capabilities: List[str], load: float
+        self,
+        id: int,
+        units: List[int],
+        capabilities: List[str],
+        load: float,
+        p50_latency_us: int,
     ) -> int:
         """Publish this node's island-topology record (host forced to
         this node), self-indexed then broadcast. Returns the peer

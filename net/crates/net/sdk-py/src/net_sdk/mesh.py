@@ -30,7 +30,7 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, List, Literal, Optional
+from typing import Any, Callable, List, Literal, Optional, TypedDict
 
 # The PyO3 module is `_net`; binding classes and exceptions come from it.
 # `BackpressureError`, `NotConnectedError` and `SessionSupersededError`
@@ -40,12 +40,63 @@ from typing import Any, Callable, List, Literal, Optional
 from net import (  # type: ignore[attr-defined]
     NetMesh as _NetMesh,
     BackpressureError,
+    ChannelAuthError,
+    ChannelError,
     NotConnectedError,
     SessionSupersededError,
 )
 
 
 Reliability = Literal["fire_and_forget", "reliable"]
+
+# Mesh-channel vocabulary. Each `Literal` lists exactly the strings the
+# native parsers accept (`bindings/python/src/lib.rs`: `parse_visibility`,
+# `parse_reliability_cfg`, `parse_on_failure`); anything else raises
+# `ChannelError` there. Read from the parsers, not from TS.
+Visibility = Literal["subnet-local", "parent-visible", "exported", "global"]
+OnFailure = Literal["best_effort", "fail_fast", "collect"]
+
+
+class ChannelConfig(TypedDict, total=False):
+    """Keyword options for :meth:`MeshNode.register_channel`, so a config
+    can be built once and splatted: ``node.register_channel(name, **cfg)``."""
+
+    visibility: Visibility
+    reliable: bool
+    require_token: bool
+    token_roots: List[bytes]
+    """32-byte entity ids whose signature may root a presented chain."""
+    priority: int
+    max_rate_pps: int
+    publish_caps: dict
+    """``CapabilityFilter`` dict a publisher's announcement must satisfy."""
+    subscribe_caps: dict
+    """``CapabilityFilter`` dict a subscriber's announcement must satisfy."""
+
+
+class PublishConfig(TypedDict, total=False):
+    """Keyword options for :meth:`MeshNode.publish`."""
+
+    reliability: Reliability
+    on_failure: OnFailure
+    max_inflight: int
+
+
+class PublishError(TypedDict):
+    """One subscriber the publish didn't reach."""
+
+    node_id: int
+    message: str
+
+
+class PublishReport(TypedDict):
+    """What :meth:`MeshNode.publish` returns. ``attempted`` counts
+    subscribers on the roster when the publish ran; ``attempted == 0`` is
+    a successful publish to nobody, not an error."""
+
+    attempted: int
+    delivered: int
+    errors: List[PublishError]
 
 
 @dataclass(frozen=True)
@@ -265,6 +316,127 @@ class MeshNode:
     def peer_count(self) -> int:
         """Number of connected peers."""
         return self._native.peer_count()
+
+    # ── Mesh channels (distributed pub/sub) ──────────────────────────
+    #
+    # Not to be confused with :class:`net_sdk.TypedChannel`, which is a
+    # channel on the *local* event bus (``NetNode.channel``). These are
+    # mesh channels: a publisher registers one, remote peers subscribe to
+    # it, and :meth:`publish` fans a payload out to that roster.
+
+    def register_channel(
+        self,
+        name: str,
+        *,
+        visibility: Optional[Visibility] = None,
+        reliable: Optional[bool] = None,
+        require_token: Optional[bool] = None,
+        token_roots: Optional[List[bytes]] = None,
+        priority: Optional[int] = None,
+        max_rate_pps: Optional[int] = None,
+        publish_caps: Optional[dict] = None,
+        subscribe_caps: Optional[dict] = None,
+    ) -> None:
+        """Register ``name`` as a channel this node publishes. Subscribers
+        are validated against this config before joining the roster.
+
+        ``require_token`` on its own (no ``token_roots``) fails closed.
+        Raises :class:`ChannelError` for an invalid name or option.
+        See :class:`ChannelConfig` for the options as a dict.
+        """
+        self._native.register_channel(
+            name,
+            visibility=visibility,
+            reliable=reliable,
+            require_token=require_token,
+            token_roots=token_roots,
+            priority=priority,
+            max_rate_pps=max_rate_pps,
+            publish_caps=publish_caps,
+            subscribe_caps=subscribe_caps,
+        )
+
+    def subscribe_channel(
+        self,
+        publisher_node_id: int,
+        channel: str,
+        token: Optional[bytes] = None,
+    ) -> None:
+        """Subscribe to ``channel`` on ``publisher_node_id``.
+
+        ``token`` is a serialized ``PermissionToken``, needed when the
+        channel requires one or this node's capabilities don't satisfy
+        its ``subscribe_caps``. Raises :class:`ChannelAuthError` when the
+        publisher refuses, :class:`ChannelError` for other failures.
+        """
+        self._native.subscribe_channel(publisher_node_id, channel, token)
+
+    def unsubscribe_channel(self, publisher_node_id: int, channel: str) -> None:
+        """Idempotent counterpart of :meth:`subscribe_channel`."""
+        self._native.unsubscribe_channel(publisher_node_id, channel)
+
+    def publish(
+        self,
+        channel: str,
+        payload: bytes,
+        *,
+        reliability: Optional[Reliability] = None,
+        on_failure: Optional[OnFailure] = None,
+        max_inflight: Optional[int] = None,
+    ) -> PublishReport:
+        """Fan ``payload`` out to every subscriber of ``channel``.
+
+        ``payload`` is raw bytes; this method doesn't encode for you.
+        Subscribers receive it through :meth:`recv` /
+        :meth:`poll_shard`, or per stream through
+        :meth:`open_stream_inbox`.
+        """
+        return self._native.publish(
+            channel,
+            payload,
+            reliability=reliability,
+            on_failure=on_failure,
+            max_inflight=max_inflight,
+        )
+
+    # ── Receiving ────────────────────────────────────────────────────
+
+    def recv(self, limit: int) -> list:
+        """Drain up to ``limit`` received events across every shard.
+
+        The native sweep starts from a rotating shard so a busy shard
+        can't starve the others; events are not in shard order. Each is
+        a ``StoredEvent`` whose ``raw`` is the payload. It carries no
+        sender: use :meth:`open_stream_inbox` when you need one.
+        """
+        return self._native.poll(limit)
+
+    def num_shards(self) -> int:
+        """Number of shards inbound traffic is spread across. A stream's
+        events land on ``stream_id % num_shards``."""
+        return self._native.num_shards()
+
+    def shard_for_stream(self, stream_id: int) -> int:
+        """The inbound shard ``stream_id``'s events land on."""
+        return self._native.shard_for_stream(stream_id)
+
+    def poll_shard(self, shard_id: int, limit: int) -> list:
+        """Drain up to ``limit`` events from one shard. Pair with
+        :meth:`shard_for_stream` to read a single stream."""
+        return self._native.poll_shard(shard_id, limit)
+
+    def open_stream_inbox(self, stream_id: int, capacity: int = 4096) -> Any:
+        """A pull queue of every event arriving on ``stream_id``, from any
+        peer, WITH the authenticated sender (``StreamData.peer_node_id``),
+        instead of the shard queue.
+
+        One receiver per stream: raises ``RuntimeError`` if the stream
+        already has one. Past ``capacity``, events are dropped and
+        counted (``inbox.dropped``) rather than stalling the receive
+        loop. Close it, or use it as a context manager, to return the
+        stream's events to the shard queue.
+        """
+        return self._native.open_stream_inbox(stream_id, capacity)
 
     # ── Capabilities and discovery ───────────────────────────────────
     #
@@ -511,6 +683,14 @@ __all__ = [
     "MeshStream",
     "StreamStats",
     "Reliability",
+    "Visibility",
+    "OnFailure",
+    "ChannelConfig",
+    "PublishConfig",
+    "PublishError",
+    "PublishReport",
     "BackpressureError",
+    "ChannelAuthError",
+    "ChannelError",
     "NotConnectedError",
 ]
