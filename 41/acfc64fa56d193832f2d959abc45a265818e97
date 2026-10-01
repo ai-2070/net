@@ -1,0 +1,34 @@
+net/crates/net/sdk-ts/src/delegation.ts
+  s_f9febccc288dd3::t_fc88f6d16ec879 16,18-24,39,49-51
+  s_f9febccc288dd3::t_c0504cd8a07d39 1-15,17,25-38,40-48,52-55
+net/crates/net/sdk-ts/src/enrollment.ts
+  s_f9febccc288dd3::t_1730c89dd4cfd4 1-47
+net/crates/net/sdk-ts/src/index.ts
+  s_f9febccc288dd3::t_fc88f6d16ec879 321-354
+.github/workflows/ci.yml
+  s_f9febccc288dd3::t_46ffce07e61ab2 3954-3959
+.github/workflows/skills.yml
+  s_f9febccc288dd3::t_69f424213c614f 372-375,385
+net/crates/net/sdk-ts/test/trust_surfaces.test.ts
+  s_f9febccc288dd3::t_fc88f6d16ec879 1-153
+net/crates/net/sdk-ts/src/consent.ts
+  s_f9febccc288dd3::t_cc230d3f6aa546 1-34
+docs/internal/plans/NODE_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_6601a8dd08de52 6-7,337-390
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "41acfc64fa56d193832f2d959abc45a265818e97",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
