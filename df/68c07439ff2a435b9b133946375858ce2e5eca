@@ -1,0 +1,66 @@
+net/crates/net/sdk-ts/test/redex_replication.test.ts
+  s_f9febccc288dd3::t_89e3af057fd7fa 2,4-11,19-42,71-77,79-108
+net/crates/net/src/adapter/net/redex/replication_router.rs
+  s_f9febccc288dd3::t_d9d65961405407 313-314
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_f9febccc288dd3::t_0a57727dbc2247 703,732,775-778
+  s_f9febccc288dd3::t_d67c44b24c68ad 779
+  s_f9febccc288dd3::t_a6df162b1a7e41 257-263,275-280,283-297
+  s_f9febccc288dd3::t_04f8486b1555b7 254-256,264-274,281-282,298-299
+net/crates/net/tests/dataforts_blob_e2e.rs
+  s_f9febccc288dd3::t_fa8838ab89beda 177,186,267-281,800,809-810
+net/crates/net/bindings/python/tests/test_redex.py
+  s_f9febccc288dd3::t_e4b281a1cce84e 204-265
+  s_f9febccc288dd3::t_f23105012c0da2 13-14
+net/crates/net/src/ffi/cortex.rs
+  s_f9febccc288dd3::t_5214237ab1ae8f 5162-5200
+  s_f9febccc288dd3::t_41987c80724e7b 495-497,729,896-897,1174-1177
+  s_f9febccc288dd3::t_aec557e08dfdcc 502-525
+net/crates/net/bindings/node/src/cortex.rs
+  s_f9febccc288dd3::t_810942846c5757 286-303
+net/crates/net/tests/redex_replication_e2e.rs
+  s_f9febccc288dd3::t_fa8838ab89beda 78-92,136,145,252,261,318,327,436,445-446,602,611,691,700
+  s_f9febccc288dd3::t_40dd2237f8497a 891-898
+  s_f9febccc288dd3::t_e4c558f7e7df83 751-803,808-844,847-890,899-908
+  s_f9febccc288dd3::t_c8ade29d524ff0 804-807,845-846
+net/crates/net/src/adapter/net/redex/replication_heartbeat.rs
+  s_f9febccc288dd3::t_e140a18779e31c 309-316,321-327
+  s_f9febccc288dd3::t_c8ade29d524ff0 317-320
+  s_f9febccc288dd3::t_44441b66f8ecbd 77-84,106,196-197,199-204,216-220,235
+  s_f9febccc288dd3::t_52740b2e30e60e 308
+net/crates/net/sdk-ts/src/cortex.ts
+  s_f9febccc288dd3::t_951146d3833f19 214-224
+net/crates/net/docs/CONFIG_REPLICATION.md
+  s_f9febccc288dd3::t_f825482d2a2ae8 46-49,53-55,60-63,80-81,88-90,140-144,217-218,222-229,254-268
+  s_f9febccc288dd3::t_d35510d77f0c62 97-98
+  s_f9febccc288dd3::t_5c9cdb97b549ed 269
+docs/internal/plans/NODE_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_2616ee01cc2cc7 7-8,622-623,691-770
+  s_f9febccc288dd3::t_21b894d3545cc1 771
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_f9febccc288dd3::t_c8ade29d524ff0 1135
+  s_f9febccc288dd3::t_ff5bd1f87b48fc 282-291,756-759,873-929,1136,1139-1149,1160-1165,2098-2099,2560-2561,2635-2636,3896-3897,3973-3974,4067-4068
+net/crates/net/bindings/python/src/cortex.rs
+  s_f9febccc288dd3::t_810942846c5757 490-504
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_f9febccc288dd3::t_d210485d3820f4 278-285,297-301,304-340
+net/crates/net/bindings/go/net/redex.go
+  s_f9febccc288dd3::t_19bb42f1b0ea7b 104,496-509
+  s_f9febccc288dd3::t_ef7995c6ce65ff 510-512
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "df68c07439ff2a435b9b133946375858ce2e5eca",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
