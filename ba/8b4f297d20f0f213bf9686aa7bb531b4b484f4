@@ -1,0 +1,28 @@
+docs/internal/plans/RUST_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_ecd482e2d544c7 8-9,112-134,173-187,211-215
+docs/internal/plans/PYTHON_SDK_WRAPPER_PARITY_PLAN.md
+  s_f9febccc288dd3::t_824db68c64f6b1 291-301
+  s_f9febccc288dd3::t_2afc686598cc66 94-122
+  s_f9febccc288dd3::t_c5ad69ed4266ff 237-239
+  s_f9febccc288dd3::t_5ade513328efdf 267-274,281-290,302-307
+  s_f9febccc288dd3::t_c596ebfa23cf90 18-20
+  s_f9febccc288dd3::t_bf8325e4644202 275-280
+docs/internal/plans/NODE_SDK_GAPS_PLAN.md
+  s_f9febccc288dd3::t_ecd482e2d544c7 8-9,192-228,303-306,329-330
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ba8b4f297d20f0f213bf9686aa7bb531b4b484f4",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
