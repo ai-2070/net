@@ -1,0 +1,46 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_f9febccc288dd3::t_722d214aacaeb0 13198-13205,15027,45891,45917,45928,45977,45993,46043,46054,46081,46142,46151,46170
+net/crates/net/sdk-ts/test/redex_replication.test.ts
+  s_f9febccc288dd3::t_475d58c194e187 13-15,17,19,21-22,46,63,71-72,74,76,79,87,90,98,111,116,120-121,123,129-130,136-137,149-150,155,163-164,172-173,176,179,183,191-192,203,208
+  s_f9febccc288dd3::t_b74c31cfa440d5 165-167
+net/crates/net/tests/redex_replication_e2e.rs
+  s_f9febccc288dd3::t_7976f7763d11f0 981-987,1036-1042,1065,1067-1075
+net/crates/net/src/adapter/net/redex/replication_state.rs
+  s_f9febccc288dd3::t_484897c1795cf3 463,471,491-493,495
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_f9febccc288dd3::t_84f1ee6d27cfbe 816,843,916-932,970-983,1169-1171,1749-1750,1754-1757,2013-2015,2021,2038,2060-2070,2080
+net/crates/net/src/adapter/net/redex/replication_coordinator.rs
+  s_f9febccc288dd3::t_84f1ee6d27cfbe 367-373
+net/crates/net/bindings/go/net/redex.go
+  s_f9febccc288dd3::t_80fb8cf7672865 664-676,693-702,704,706-712
+net/crates/net/src/adapter/net/redex/mod.rs
+  s_f9febccc288dd3::t_7976f7763d11f0 74-75
+docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md
+  s_f9febccc288dd3::t_0f98a39b142e12 268
+net/crates/net/bindings/go/net-ffi/exports.baseline
+  s_f9febccc288dd3::t_5c127d44886f6b 7-8
+net/crates/net/src/adapter/net/redex/replication_config.rs
+  s_f9febccc288dd3::t_5c127d44886f6b 24-27,369-372,377-389,513-521,528-529,541-545,550-557
+  s_f9febccc288dd3::t_7976f7763d11f0 373-376,530-540,546-549
+  s_f9febccc288dd3::t_d6060e31146522 558
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_f9febccc288dd3::t_73981a92e19cce 305-309
+net/crates/net/src/ffi/cortex.rs
+  s_f9febccc288dd3::t_33dda5d71a2724 506-508,526
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "dd399797e32148fa4fb95b6c67cab2c5ff07de35",
+  "prompts": {},
+  "sessions": {
+    "s_f9febccc288dd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de66d1fb-448d-4fb8-8531-8f4560206947",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
