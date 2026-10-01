@@ -19,28 +19,49 @@ default build is).
 
 from __future__ import annotations
 
-try:
-    from net import (  # type: ignore[attr-defined]
-        AsyncMeshBlobAdapter,
-        BlobError,
-        BlobRef,
-        MeshBlobAdapter,
-        TransferError,
-        async_blob_publish,
-        async_blob_resolve,
-        blob_adapter_ids,
-        blob_adapter_registered,
-        blob_publish,
-        blob_resolve,
-        register_blob_adapter,
-        register_filesystem_blob_adapter,
-        unregister_blob_adapter,
-    )
-except ImportError as e:  # pragma: no cover — surface a clean message
+import net  # noqa: E402 — a failure HERE is a real load error (no `_net`,
+# a bad linked library): it surfaces unchanged, never as "missing feature".
+
+_REQUIRED = (
+    "AsyncMeshBlobAdapter",
+    "BlobError",
+    "BlobRef",
+    "MeshBlobAdapter",
+    "TransferError",
+    "async_blob_publish",
+    "async_blob_resolve",
+    "blob_adapter_ids",
+    "blob_adapter_registered",
+    "blob_publish",
+    "blob_resolve",
+    "register_blob_adapter",
+    "register_filesystem_blob_adapter",
+    "unregister_blob_adapter",
+)
+_missing = [name for name in _REQUIRED if not hasattr(net, name)]
+if _missing:  # pragma: no cover — the extension loaded; the feature did not
     raise ImportError(
         "Blob SDK symbols not present in `net._net`. Rebuild the wheel "
         "with `--features dataforts`, e.g. `maturin develop --features dataforts`."
-    ) from e
+        f" Missing: {', '.join(_missing)}."
+    )
+
+from net import (  # type: ignore[attr-defined]  # noqa: E402
+    AsyncMeshBlobAdapter,
+    BlobError,
+    BlobRef,
+    MeshBlobAdapter,
+    TransferError,
+    async_blob_publish,
+    async_blob_resolve,
+    blob_adapter_ids,
+    blob_adapter_registered,
+    blob_publish,
+    blob_resolve,
+    register_blob_adapter,
+    register_filesystem_blob_adapter,
+    unregister_blob_adapter,
+)
 
 __all__ = [
     "AsyncMeshBlobAdapter",

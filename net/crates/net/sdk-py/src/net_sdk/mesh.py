@@ -183,9 +183,10 @@ class MeshNode:
         - ``auto_direct_upgrade``: migrate relay-routed sessions to a
           direct path when one appears. Native default ``True``; pass
           ``False`` to pin traffic to the relay.
-        - ``permissive_channels``: skip the strict channel registry, so
-          unregistered channels may be subscribed. Test-only; keep the
-          strict default in production.
+        - ``permissive_channels``: install no channel registry, which
+          turns channel authorization off for **every** channel on this
+          node: any peer may subscribe to any channel. Test-only; nRPC and
+          the tool surface work with the strict default.
 
         ``tests/test_sdk_mesh_ctor_parity.py`` (in the binding's test
         suite) fails if this signature drifts from the native one.
@@ -698,7 +699,8 @@ class MeshNode:
 
     def nat_type(self) -> str:
         """``"open" | "cone" | "symmetric" | "unknown"``; ``"unknown"`` until
-        classified. ``nat-traversal`` builds only."""
+        classified, or ``"open"`` at once under a reflex override.
+        ``nat-traversal`` builds only."""
         return self._native.nat_type()
 
     def reflex_addr(self) -> Optional[str]:
@@ -985,7 +987,7 @@ class AsyncMeshNode:
     call forwarded to :attr:`sync`, or reachable through it.
 
     Example:
-        >>> node = AsyncMeshNode("127.0.0.1:0", psk, permissive_channels=True)
+        >>> node = AsyncMeshNode("127.0.0.1:0", psk)
         >>> await node.connect(addr, pubkey, peer_id)
         >>> node.start()
         >>> await node.subscribe_channel(peer_id, "sensors/temp")

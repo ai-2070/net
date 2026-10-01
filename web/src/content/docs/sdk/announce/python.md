@@ -9,8 +9,7 @@
 ```python
 from net_sdk import MeshNode
 
-# permissive_channels: nRPC (and so the tool surface below) needs it.
-node = MeshNode(bind_addr="127.0.0.1:9001", psk="42" * 32, permissive_channels=True)
+node = MeshNode(bind_addr="127.0.0.1:9001", psk="42" * 32)
 node.announce_capabilities({"tags": ["gpu"], "hardware": {"memory_gb": 64}})
 ```
 
@@ -20,8 +19,10 @@ The **tool** surface rides nRPC, and the node hands you the RPC handle:
 rpc = node.rpc()                            # a TypedMeshRpc; build once, reuse
 ```
 
-nRPC needs the node built with `permissive_channels=True`: reply channels are
-per-caller and can't be pre-registered.
+nRPC works with the default strict channel registry. Don't turn on
+`permissive_channels` for it: that removes channel authorization for **every**
+channel on the node, so any peer could subscribe to anything, including other
+callers' reply channels. It is a test-only switch.
 
 ### Serve a tool
 

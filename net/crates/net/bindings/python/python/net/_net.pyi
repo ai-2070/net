@@ -1359,11 +1359,15 @@ class NetMesh:
     def nat_type(self) -> str:
         """This node's NAT classification: ``"open" | "cone" | "symmetric" |
         "unknown"``. ``"unknown"`` until the background classifier has run
-        (after ``start()``, with at least 2 peers)."""
+        (after ``start()``, with at least 2 peers), unless
+        :meth:`set_reflex_override` (or the ``reflex_override`` constructor
+        option) is set: that skips classification and reports ``"open"``
+        immediately."""
         ...
     def reflex_addr(self) -> Optional[str]:
         """This node's public ``ip:port`` as a peer observed it, or ``None``
-        before classification has produced an observation."""
+        before classification has produced an observation. A reflex
+        override supplies it immediately."""
         ...
     def peer_nat_type(self, peer_node_id: int) -> str:
         """The NAT classification ``peer_node_id`` last advertised, or
@@ -1377,7 +1381,8 @@ class NetMesh:
         ...
     def reclassify_nat(self) -> None:
         """Re-run the classification sweep now (e.g. after a suspected NAT
-        rebind). No-op with fewer than 2 peers; never raises."""
+        rebind). No-op with fewer than 2 peers. Raises ``RuntimeError`` only
+        on a node that has been shut down."""
         ...
     def set_reflex_override(self, external: str) -> None:
         """Pin this node's public reflex to ``external`` (``"ip:port"``);

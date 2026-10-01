@@ -53,9 +53,7 @@ Publishes as `net-mesh-sdk`, imports as `net_sdk`. The native binding
 ```python
 from net_sdk import MeshNode, add_tool_capabilities_to_announce, serve_tool
 
-# 32-byte hex PSK. nRPC needs `permissive_channels=True`: reply channels are
-# per-caller and can't be pre-registered.
-node = MeshNode(bind_addr="127.0.0.1:0", psk="42" * 32, permissive_channels=True)
+node = MeshNode(bind_addr="127.0.0.1:0", psk="42" * 32)   # 32-byte hex PSK
 rpc = node.rpc()   # a TypedMeshRpc; the tool surface takes it. Build once, reuse.
 
 def web_search(req):
@@ -121,6 +119,9 @@ publisher.register_channel(
     reliable=True,
     subscribe_caps={"require_tags": ["reader"]},  # who may subscribe
 )
+# The publisher checks the subscriber's announced capabilities, so announce
+# the tag first (and let the announcement reach the publisher).
+subscriber.announce_capabilities({"tags": ["reader"]})
 subscriber.subscribe_channel(publisher.node_id, "sensors/temp")  # ChannelAuthError if refused
 
 report = publisher.publish("sensors/temp", b'{"c": 22.5}', reliability="reliable")

@@ -2212,7 +2212,7 @@ mod mesh_bindings {
                 if events.len() >= limit {
                     break;
                 }
-                let shard = (start + offset) % shards;
+                let shard = net::shard::rotating_shard(start, offset, shards);
                 let remaining = limit - events.len();
                 let result = self
                     .runtime
@@ -3821,7 +3821,7 @@ mod mesh_bindings {
                     if collected.len() >= limit {
                         break;
                     }
-                    let shard = (start + offset) % shards;
+                    let shard = net::shard::rotating_shard(start, offset, shards);
                     let result = node
                         .poll_shard(shard, None, limit - collected.len())
                         .await

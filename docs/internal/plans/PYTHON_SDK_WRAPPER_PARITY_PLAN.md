@@ -384,6 +384,34 @@ the slice were wrong. Two test homes, with different jobs:
         `net_sdk.dataforts`.
       - A stale "Python has no `recv`" sentence in the skill is fixed.
       - This plan's status and its `recv` signature are each stated once.
+  - **Third review round (cubic, 6 comments, all valid, all fixed):**
+    - **P1, wrong advice:** the README, the announce page and my S4 test
+      said nRPC needs `permissive_channels=True`. That came from a stale
+      `conftest.py` comment I didn't check. Tested 2026-10-01: a typed RPC
+      round trip between two SDK nodes works in the **default strict**
+      mode. The flag installs no channel registry at all, which turns
+      channel authorization off for every channel on the node, including
+      other callers' reply channels. Removed from every example, with a
+      warning on the announce page and in the `MeshNode` docstring. The S4
+      `rpc()` live test now runs on strict-registry nodes, which pins this.
+    - **Shard sweep overflow:** both the sync `poll` (pre-existing) and the
+      new async one computed `(start + offset) % shards` in `u16`, which
+      overflows for shard counts above 32768. Both now use
+      `net::shard::rotating_shard`, as the Node binding and the Rust SDK
+      already do.
+    - **README channel example:** the subscriber now announces the `reader`
+      tag the channel requires; without it the example raised
+      `ChannelAuthError`.
+    - **NAT stubs:** `nat_type` / `reflex_addr` mention that a reflex
+      override answers immediately, and `reclassify_nat` raises after
+      `shutdown()`.
+    - **Feature-gate errors:** `net_sdk.blob` (and `net_sdk.transport`,
+      which had the same pre-existing flaw) now import `net` outside the
+      check. A real load failure (no `_net`, a bad linked library) surfaces
+      as itself; only missing exports get the "rebuild with `dataforts`"
+      message, which now also lists them. New test
+      `test_feature_gate_imports.py`. **RED:** with the old `blob.py`, the
+      load-failure case is relabeled as a missing feature.
 
 ### S1a — Forward every constructor option, with a drift guard (G6)
 
@@ -631,8 +659,9 @@ the slice were wrong. Two test homes, with different jobs:
     failed. The test now serves both, and the SDK docstrings say so.
   - **Live test:** `test_sdk_mesh_surface.py`, 6 tests: `entity_id` matches
     the seeded `Identity`; an `rpc()` unary round trip between two nodes
-    (built with `permissive_channels=True`, which only S1a made reachable
-    through the SDK); typed aggregation and ranking rows; `list_tools` on an
+    (originally built with `permissive_channels=True` on a wrong belief that
+    nRPC needs it; corrected in the third review round below, and the test now
+    runs on strict-registry nodes); typed aggregation and ranking rows; `list_tools` on an
     SDK node; `store_dir` → `fetch_dir` across two nodes, files and byte
     counts checked; connectivity counters.
   - **Forwarding test:** `test_mesh_node_surface.py`, 7 tests.

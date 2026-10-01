@@ -38,11 +38,11 @@ def _sdk(module: str):
 
 @pytest.fixture
 def pair():
-    """Two connected, started SDK nodes, ``(a, b)``. ``permissive_channels``
-    because nRPC reply channels are per-caller and can't be pre-registered;
-    S1a is what made that option reachable through the SDK at all."""
+    """Two connected, started SDK nodes, ``(a, b)``, with the DEFAULT strict
+    channel registry. nRPC works without `permissive_channels`, and this
+    fixture pins that: the docs once said otherwise (2026-10-01)."""
     net_sdk = _sdk("net_sdk")
-    opts = dict(heartbeat_interval_ms=200, permissive_channels=True)
+    opts = dict(heartbeat_interval_ms=200)
     a = net_sdk.MeshNode("127.0.0.1:0", PSK, **opts)
     b = net_sdk.MeshNode("127.0.0.1:0", PSK, **opts)
     errors: list[Exception] = []
