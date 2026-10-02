@@ -32,25 +32,30 @@ net-mesh --help
 |---------------|---------------------------------------------------------------------------------|
 | `version`     | SDK version + build metadata.                                                   |
 | `identity`    | Generate / inspect / fingerprint operator identity files.                       |
-| `admin`       | Signed admin-chain commits — drain, cordon, maintenance, drop-replicas, etc.    |
-| `ice`         | Break-glass ICE — simulate then commit freeze-cluster / thaw-cluster / flush-avoid-lists / force-evict-replica / force-restart-daemon / force-cutover / kill-migration. |
+| `up` / `down` | Start one long-lived node for the profile (foreground); drain and stop it.      |
+| `invite`      | Create / inspect / list / revoke / approve / deny join links on `up --enroll`.  |
+| `join` / `leave` | Join a mesh from a link and run as it; leave it (local, durable).            |
+| `enrollment`  | Enrollment ledger setup for `up --enroll`.                                      |
+| `relay`       | Run a blind UDP relay (`serve`), the fallback path for unreachable devices.     |
+| `admin`       | Offline previews or signed commits against a temporary supervisor. |
+| `ice`         | Simulate/commit break-glass operations against a temporary supervisor. |
 | `snapshot`    | One-shot substrate reads, both requiring `--local`: `get` prints the `MeshOsSnapshot`; `status` prints the typed `StatusSummary`. |
-| `audit`       | Read-only queries against the RedEX-committed audit ledger.                     |
+| `audit`       | Read/stream the temporary supervisor's audit ring. |
 | `log tail`    | Substrate log stream (`--follow`, `--daemon`, `--min-level`).                   |
 | `failures tail` | Substrate failure stream — same shape as `log tail`.                          |
-| `cap`         | Capability advertisement + discovery.                                           |
-| `peer`        | Peer + NAT-traversal helpers (`peer ls` today; reflex/NAT in Phase 2).          |
+| `cap`         | Temporary snapshot reads; `announce` authors a signed artifact offline, not a broadcast. |
+| `peer`        | `ls` reads the temporary snapshot; no NAT-management verbs. |
 | `daemon`      | Per-daemon listing from the local snapshot.                                     |
 | `netdb`       | NetDB local KV adapter — Cortex-backed tasks + memories.                        |
-| `org`         | Organization root authority authoring (keygen / issue-cert / issue-floors).     |
-| `node`        | Node ownership provisioning (`adopt`).                                          |
-| `subnet`      | Hierarchical subnet inspection (`show`, `ls`, `tree`).                          |
-| `gateway`     | `SubnetGateway` stats + export-table operator surface.                          |
-| `channel`     | `ChannelConfigRegistry` inspection (`visibility`, `ls`).                        |
-| `aggregator`  | `AggregatorDaemon` inspection + remote query.                                   |
-| `transfer`    | Blob + directory transfer (`recv-blob` / `send-blob` / `recv-dir` / `send-dir` / `ls` / `status` / `cancel`). |
-| `wrap`        | Wrap a local stdio MCP server as owner-only mesh capabilities.                  |
-| `mcp`         | MCP bridge — expose mesh capabilities to a local MCP host (`serve`).            |
+| `org`         | Offline org root tools; org links (`invite` / `approve` / `join`), `remove`, `leave`, `members`. |
+| `node`        | `status` of this profile's node; ownership provisioning (`adopt`).             |
+| `subnet`      | Offline authority issuance; subnet links (`invite` / `join`), `remove`, `leave`, `members`; temporary topology reads. |
+| `gateway`     | Temporary-context reads; `export` refuses without a live gateway. |
+| `channel`     | Offline `issue-grant`; standalone links (`invite` / `join`); `serve`, `status`, `publish`, `leave` on the running node; registry reads (`visibility`, `ls`). |
+| `aggregator`  | Temporary inspect/list with `--local`; remote query/spawn/scale and list selected by flags or profile. Remote verbs and `ls` support `--inspect-target`. |
+| `transfer`    | Receive/admin via mesh; send computes references or stages local content, not hosting or publication. |
+| `wrap`        | Wrap a local stdio MCP server as owner-only mesh capabilities (`--joined` runs as an enrolled device). |
+| `mcp`         | MCP bridge — expose mesh capabilities to a local MCP host (`serve`, `--joined`). |
 | `forwarding`  | Caller-side credential/header forwarding policy + audit (deny-by-default).      |
 | `typegen`     | Generate typed language bindings from discovered tool descriptors.              |
 | `completion`  | Emit a shell-completion script (`bash` / `zsh` / `fish` / `powershell`).        |

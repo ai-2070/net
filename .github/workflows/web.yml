@@ -28,6 +28,10 @@ on:
       - ".github/scripts/check-one-library-docs.py"
       - ".github/scripts/check-header-count.py"
       - "net/crates/net/include/**"
+      # The README drift check reads every README outside web/, wherever it
+      # lives; ci.yml's `net/**` / `go/**` filter misses the root one.
+      - "**/README.md"
+      - ".github/scripts/check-readmes.py"
   pull_request:
     paths:
       - "web/**"
@@ -50,6 +54,10 @@ on:
       - ".github/scripts/check-one-library-docs.py"
       - ".github/scripts/check-header-count.py"
       - "net/crates/net/include/**"
+      # The README drift check reads every README outside web/, wherever it
+      # lives; ci.yml's `net/**` / `go/**` filter misses the root one.
+      - "**/README.md"
+      - ".github/scripts/check-readmes.py"
 
 jobs:
   check:
@@ -156,6 +164,14 @@ jobs:
       # runs off the right edge, and a reader who does not think to scroll
       # sideways reads a truncated statement as the whole thing. 94 characters
       # fit at the widest layout (measured, not guessed); the limit is 90.
+      # Relative links resolve, licenses are named, and the CLI and Deck
+      # READMEs shipped to npm and PyPI carry the same command table as their
+      # source. Written to gate CI and never wired in, master drifted: the
+      # npm and PyPI CLI READMEs kept an older command table.
+      - name: Check the READMEs outside web/ have not drifted
+        working-directory: .
+        run: python3 .github/scripts/check-readmes.py
+
       - name: Check no code line is wider than the column that renders it
         working-directory: .
         run: .github/scripts/check-doc-code-width.py
