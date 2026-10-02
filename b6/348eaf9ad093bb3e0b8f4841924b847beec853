@@ -1,0 +1,31 @@
+net/crates/net/browser-ts/test/peer-driver.test.ts
+  s_d8b00bedd146e9::t_7f368a815ee5a1 255-256,269-270,278-287,289-296,298-304,306-307,309-310,312-331,347-349,351,360-361
+net/crates/net/browser-ts/src/peer-driver.ts
+  s_d8b00bedd146e9::t_ba2d017aa20577 90-124,143-145,155-169,174,177,179-180
+net/crates/net/browser-ts/src/node.ts
+  s_d8b00bedd146e9::t_ba2d017aa20577 858-860,868-880
+net/crates/net/browser-ts/src/leader/session.ts
+  s_d8b00bedd146e9::t_ba2d017aa20577 364-367,370-381
+.claude/skills/net-browser/session.md
+  s_d8b00bedd146e9::t_30d4c6e014da4c 137-142
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_30d4c6e014da4c 30-40
+web/src/content/docs/sdk/browser/session.md
+  s_d8b00bedd146e9::t_30d4c6e014da4c 78-81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b6348eaf9ad093bb3e0b8f4841924b847beec853",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
