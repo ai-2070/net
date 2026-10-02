@@ -4,6 +4,7 @@
 Run from anywhere in the repository::
 
     python3 .github/scripts/check-readmes.py
+    python3 .github/scripts/check-readmes.py --self-test  # plant defects
 
 Checks, all offline and deterministic:
 
@@ -98,10 +99,11 @@ def section_block(text: str, header: str) -> list[str]:
     return out
 
 
-def main() -> int:
-    root = repo_root()
+def check(
+    root: str, files: list[str], families: list[tuple[str, list[str]]]
+) -> list[str]:
+    """Every problem in `files` (paths relative to `root`) and `families`."""
     failures: list[str] = []
-    files = readmes(root)
 
     for rel in files:
         path = os.path.join(root, rel)
@@ -130,7 +132,7 @@ def main() -> int:
                 f"{rel}: License section does not name both MIT and Apache"
             )
 
-    for header, family in FAMILIES:
+    for header, family in families:
         blocks: list[tuple[str, list[str]]] = []
         for rel in family:
             path = os.path.join(root, rel)
@@ -147,6 +149,90 @@ def main() -> int:
                 failures.append(
                     f"{rel}: {header} block differs from {blocks[0][0]}"
                 )
+    return failures
+
+
+def self_test() -> int:
+    """Plant one defect per rule in a scratch tree; require each reported."""
+    import tempfile
+
+    print("==> Self-test: planting defects in a scratch tree")
+    table = "## Table\n\n| a | b |\n|---|---|\n| x | y |\n\n## Next\n"
+    licensed = "## License\n\nMIT or Apache-2.0.\n"
+    clean = {
+        "README.md": "[sibling](one/README.md)\n\n" + licensed,
+        "one/README.md": table + licensed,
+        "two/README.md": table,
+    }
+    family = [("## Table", ["one/README.md", "two/README.md"])]
+
+    def run(tree: dict[str, str], fam: list[tuple[str, list[str]]]) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel, text in tree.items():
+                path = os.path.join(tmp, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            return check(tmp, sorted(tree), fam)
+
+    cases = [
+        (
+            "a relative link that does not resolve",
+            "relative link does not resolve",
+            {**clean, "README.md": "[gone](nowhere/README.md)\n"},
+            family,
+        ),
+        (
+            "a License section naming one license",
+            "does not name both MIT and Apache",
+            {**clean, "README.md": "## License\n\nMIT.\n"},
+            family,
+        ),
+        (
+            "a family member whose table drifted",
+            "block differs from",
+            {**clean, "two/README.md": table.replace("| x |", "| z |")},
+            family,
+        ),
+        (
+            "a family member that does not exist",
+            "missing (family",
+            clean,
+            [("## Table", ["one/README.md", "three/README.md"])],
+        ),
+    ]
+
+    failed = 0
+    for label, expect, tree, fam in cases:
+        found = run(tree, fam)
+        if any(expect in item for item in found):
+            print(f"  ok      reported {label}")
+        else:
+            print(f"  MISSED  did NOT report {label}: {found}")
+            failed += 1
+
+    # And the clean tree passes, so each case above is caught for its
+    # planted defect rather than for a fixture that was already broken.
+    found = run(clean, family)
+    if found:
+        print(f"  MISSED  the clean scratch tree fails: {found}")
+        failed += 1
+    else:
+        print("  ok      the clean scratch tree passes")
+
+    if failed:
+        print(f"{failed} self-test failure(s).", file=sys.stderr)
+        return 1
+    print("The checker reports every planted defect.")
+    return 0
+
+
+def main() -> int:
+    if "--self-test" in sys.argv:
+        return self_test()
+    root = repo_root()
+    files = readmes(root)
+    failures = check(root, files, FAMILIES)
 
     if failures:
         print(f"README checks failed ({len(failures)}):", file=sys.stderr)
