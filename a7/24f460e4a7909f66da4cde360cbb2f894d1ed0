@@ -1,0 +1,28 @@
+net/crates/net/examples/browser-demo/run.ps1
+  s_d8b00bedd146e9::t_e1cf011ea10ef0 14
+net/crates/net/examples/browser-demo/host/src/main.rs
+  s_d8b00bedd146e9::t_e1cf011ea10ef0 1224-1233
+  s_d8b00bedd146e9::t_0073500c27dcf1 53,143-152,194-195,197-205
+net/crates/net/examples/browser-demo/page/demo.js
+  s_d8b00bedd146e9::t_0073500c27dcf1 41,467-468,485,516,518-531,533-540,542-549,552-559,566,572
+net/crates/net/examples/browser-demo/README.md
+  s_d8b00bedd146e9::t_0073500c27dcf1 124,145-149
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_0073500c27dcf1 7724
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a724f460e4a7909f66da4cde360cbb2f894d1ed0",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
