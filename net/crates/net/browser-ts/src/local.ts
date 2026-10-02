@@ -111,11 +111,16 @@ export function createLocalMesh(options: LocalMeshOptions = {}): LocalMesh {
   function deliver(to: string, from: string, payload: Uint8Array, streamId: string | undefined): void {
     const targets = listeners.get(to);
     if (targets === undefined) throw new Error(`no local node ${to} on this mesh`);
+    // Exact decimal, as the real node's `stream_data` carries it. Hex
+    // here was wrong in a way that hid itself: a hex id with no letters
+    // in it (one random id in ~1,800) reads as a DIFFERENT node's
+    // decimal, so the store answered a joiner at an id not on the mesh.
+    const peerNode = BigInt(`0x${from}`).toString(10);
     for (const handler of [...targets]) {
       // A copy per receiver, as a network would hand each its own
       // bytes: a receiver that mutates its payload must not change
       // what another receiver — or the sender — holds.
-      handler({ type: 'stream_data', streamId, peerNode: from, payload: payload.slice() });
+      handler({ type: 'stream_data', streamId, peerNode, payload: payload.slice() });
     }
   }
 
