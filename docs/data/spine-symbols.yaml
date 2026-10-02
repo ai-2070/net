@@ -50,9 +50,11 @@ pages:
       - addToolCapabilitiesToAnnounce
       - listTools
     python:
+      # `rpc`, not `from_mesh`: the page builds its handle with
+      # `node.rpc()` now, as the TypeScript invoke page does (466767bb3).
       - MeshNode
       - TypedMeshRpc
-      - from_mesh
+      - rpc
       - serve_tool
       - descriptor_for
       - add_tool_capabilities_to_announce
