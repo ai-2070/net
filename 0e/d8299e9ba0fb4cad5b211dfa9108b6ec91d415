@@ -1,0 +1,27 @@
+net/crates/net/docs/releases/RELEASE_v0.39_KICKSTART_MY_HEART.md
+  s_d8b00bedd146e9::t_772c90805fde91 1-135
+docs/data/tiers.yaml
+  s_d8b00bedd146e9::t_da1e57552f501b 87
+web/scripts/sync-releases.mjs
+  s_d8b00bedd146e9::t_75231999020868 120
+web/src/content/docs/releases/RELEASE_v0.39_KICKSTART_MY_HEART.md
+  s_d8b00bedd146e9::t_fc77a259fe5860 1-139
+web/src/docs.order.ts
+  s_d8b00bedd146e9::t_42fb2efec4a2ff 177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0ed8299e9ba0fb4cad5b211dfa9108b6ec91d415",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
