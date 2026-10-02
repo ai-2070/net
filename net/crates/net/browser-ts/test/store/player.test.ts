@@ -304,7 +304,19 @@ describe('createLocalMesh', () => {
     b.onEvent(event => seen.push({ peer: event.peerNode, bytes: [...(event.payload ?? [])] }));
     const stream = await a.openStream({ reliability: 'reliable', peer: b.nodeIdHex(), label: 'x' });
     await stream.send(new Uint8Array([1, 2]));
-    expect(seen).toEqual([{ peer: a.nodeIdHex(), bytes: [1, 2] }]);
+    // Exact decimal, as the real node reports a peer: 0xa is 10.
+    expect(seen).toEqual([{ peer: '10', bytes: [1, 2] }]);
+  });
+
+  it('reports a sender whose hex id is all digits as its decimal, not as itself', async () => {
+    const mesh = createLocalMesh();
+    const a = mesh.node('6059197541404148');
+    const b = mesh.node();
+    const seen: unknown[] = [];
+    b.onEvent(event => seen.push(event.peerNode));
+    const stream = await a.openStream({ reliability: 'reliable', peer: b.nodeIdHex(), label: 'x' });
+    await stream.send(new Uint8Array([1]));
+    expect(seen).toEqual([BigInt('0x6059197541404148').toString(10)]);
   });
 
   it('refuses a duplicate id, and a send to a node that is gone', async () => {
