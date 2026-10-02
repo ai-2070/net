@@ -1,0 +1,23 @@
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_66f58a2f74f70a 49-56
+net/crates/net/docs/releases/RELEASE_v0.39_KICKSTART_MY_HEART.md
+  s_d8b00bedd146e9::t_09407f32893346 98
+web/src/content/docs/releases/RELEASE_v0.39_KICKSTART_MY_HEART.md
+  s_d8b00bedd146e9::t_266cd525c53246 102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "21e66541c407b291d49ed2a5cfa325b506229e3a",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
