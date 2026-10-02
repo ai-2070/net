@@ -834,3 +834,75 @@ async fn rpc_error_replies_carry_headers_to_the_caller() {
         other => panic!("expected ServerError, got {other:?}"),
     }
 }
+
+/// A call naming a service the target does not serve is answered
+/// `NotFound` at once instead of waiting out the caller's deadline.
+///
+/// Before this, nothing on the server answered it: with no dispatcher
+/// for `<service>.requests` the REQUEST fell through to the
+/// application's shard queue as an ordinary event, and the caller sat
+/// on its pending entry until the deadline. On a node with no channel
+/// registry (this pair) the reply-channel subscribe is admitted, so
+/// nothing earlier fails fast either — that is how a Python
+/// `describe_a2a` against a free-path `serve_a2a` node took 30.02 s to
+/// raise.
+#[tokio::test]
+async fn rpc_unserved_service_is_answered_not_found_promptly() {
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake_pair(&a, &b).await;
+
+    let opts = CallOptions {
+        deadline: Some(Instant::now() + Duration::from_secs(20)),
+        ..CallOptions::default()
+    };
+    let started = Instant::now();
+    let err = a
+        .call(
+            b.node_id(),
+            "nobody.serves.this",
+            Bytes::from_static(b"req"),
+            opts,
+        )
+        .await
+        .expect_err("an unserved service cannot answer Ok");
+    let elapsed = started.elapsed();
+    match err {
+        RpcError::ServerError {
+            status, message, ..
+        } => {
+            assert_eq!(
+                status,
+                RpcStatus::NotFound.to_wire(),
+                "expected NotFound, got status {status:#x}: {message}"
+            );
+            assert!(
+                message.contains("nobody.serves.this"),
+                "the refusal names the service: {message}"
+            );
+        }
+        other => panic!("expected ServerError(NotFound), got {other:?} after {elapsed:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "NotFound must arrive promptly, not at the deadline: {elapsed:?}"
+    );
+
+    // A served service on the same node is unaffected.
+    let _serve = b
+        .serve_rpc("echo", Arc::new(EchoHandler))
+        .expect("serve echo");
+    let reply = a
+        .call(
+            b.node_id(),
+            "echo",
+            Bytes::from_static(b"still here"),
+            CallOptions {
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                ..CallOptions::default()
+            },
+        )
+        .await
+        .expect("echo");
+    assert_eq!(&reply.body[..], b"still here");
+}

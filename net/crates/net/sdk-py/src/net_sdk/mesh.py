@@ -600,7 +600,7 @@ class MeshNode:
         """What ``target_node_id`` serves, as a JSON array of ``A2aOffer``s.
         Uncharged; the only sanctioned way to learn a price. A node serving
         the free path (:meth:`serve_a2a`) has no describe service and
-        raises."""
+        raises at once: it answers the request ``NotFound``."""
         return self._native.describe_a2a(target_node_id)
 
     def task_status(self, target_node_id: int, task_id: str) -> Optional[str]:

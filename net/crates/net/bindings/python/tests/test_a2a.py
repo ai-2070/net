@@ -197,3 +197,38 @@ def test_a2a_task_completes_with_an_artifact_ref():
                 m.shutdown()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def test_describe_a2a_against_the_free_path_fails_fast():
+    """The free path serves no describe service, and the node now says so:
+    ``describe_a2a`` raises at once instead of waiting out its 30 s RPC
+    timeout. On these permissive meshes the reply-channel subscribe is
+    admitted, so nothing failed early before the node answered unserved
+    requests ``NotFound``; the call took 30.02 s to raise."""
+    executor = _mesh_unstarted()
+    requester = _mesh_unstarted()
+
+    async def run_task(task_id, prompt, context_refs, tags):
+        return "blob://unused"
+
+    handle = None
+    try:
+        _handshake(requester, executor)
+        executor.start()
+        requester.start()
+        handle = executor.serve_a2a(run_task)
+
+        started = time.monotonic()
+        with pytest.raises(Exception) as raised:
+            requester.describe_a2a(executor.node_id)
+        elapsed = time.monotonic() - started
+        assert elapsed < 10.0, f"describe_a2a took {elapsed:.2f}s to fail"
+        assert "net.a2a.describe" in str(raised.value), str(raised.value)
+    finally:
+        if handle is not None:
+            handle.stop()
+        for m in (requester, executor):
+            try:
+                m.shutdown()
+            except Exception:  # noqa: BLE001
+                pass

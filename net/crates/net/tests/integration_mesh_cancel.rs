@@ -25,10 +25,14 @@
 //! # Test mesh setup
 //!
 //! Two `MeshNode`s connected via handshake. Caller (`a`) issues
-//! calls against responder (`b`) for services `b` doesn't serve.
-//! That gets the REQUEST onto the wire (so the call is genuinely
+//! calls against responder (`b`) for services `b` serves with
+//! [`Silent`] handlers, which never answer. That gets the REQUEST onto
+//! the wire and into a running handler (so the call is genuinely
 //! mid-flight) but ensures no response ever arrives, so the call
 //! hangs until cancel fires.
+//!
+//! Not a service nobody serves: that is answered `NotFound` at once,
+//! so a call to one resolves before a cancel can reach it.
 
 #![cfg(feature = "cortex")]
 
@@ -37,7 +41,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use net::adapter::net::mesh_rpc::{CallOptions, RpcError};
+use net::adapter::net::cortex::{
+    RequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler, RpcHandler,
+    RpcHandlerError, RpcResponsePayload, RpcResponseSink, RpcStatus, RpcStreamingContext,
+    RpcStreamingHandler,
+};
+use net::adapter::net::mesh_rpc::{CallOptions, RpcError, ServeHandle};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -84,13 +93,71 @@ async fn build_node() -> Arc<MeshNode> {
     Arc::new(node)
 }
 
+/// A provider that takes the call and never answers it: every shape
+/// parks on the call's cancellation token, which only a wire CANCEL
+/// flips. What keeps a call mid-flight for the cancel to land on.
+struct Silent;
+
+#[async_trait::async_trait]
+impl RpcHandler for Silent {
+    async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        ctx.cancellation.cancelled().await;
+        Err(RpcHandlerError::Internal("cancelled by caller".into()))
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcStreamingHandler for Silent {
+    async fn call(&self, ctx: RpcContext, _sink: RpcResponseSink) -> Result<(), RpcHandlerError> {
+        ctx.cancellation.cancelled().await;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcClientStreamingHandler for Silent {
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        _requests: RequestStream,
+    ) -> Result<RpcResponsePayload, RpcHandlerError> {
+        ctx.cancellation.cancelled().await;
+        Err(RpcHandlerError::Internal("cancelled by caller".into()))
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcDuplexHandler for Silent {
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        _requests: RequestStream,
+        _responses: RpcResponseSink,
+    ) -> Result<(), RpcHandlerError> {
+        ctx.cancellation.cancelled().await;
+        Ok(())
+    }
+}
+
 /// Two nodes with a handshake so caller-side cancel tests have a
-/// real peer to publish to. The responder doesn't register any
-/// services, so calls hang on the response receiver until the
-/// caller-side cancel fires.
-async fn build_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
+/// real peer to publish to. The responder serves `silent.svc`,
+/// `silent.stream`, `silent.cs` and `silent.dx` with [`Silent`], so
+/// calls hang on the response receiver until the caller-side cancel
+/// fires. The handles keep those registrations alive for the test.
+async fn build_pair() -> (Arc<MeshNode>, Arc<MeshNode>, Vec<ServeHandle>) {
     let a = build_node().await;
     let b = build_node().await;
+    let silent = Arc::new(Silent);
+    let serving = vec![
+        b.serve_rpc("silent.svc", silent.clone())
+            .expect("serve silent.svc"),
+        b.serve_rpc_streaming("silent.stream", silent.clone())
+            .expect("serve silent.stream"),
+        b.serve_rpc_client_stream("silent.cs", silent.clone())
+            .expect("serve silent.cs"),
+        b.serve_rpc_duplex("silent.dx", silent)
+            .expect("serve silent.dx"),
+    ];
     let a_id = a.node_id();
     let b_pub = *b.public_key();
     let b_addr = b.local_addr();
@@ -106,7 +173,7 @@ async fn build_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
         .expect("accept failed");
     a.start();
     b.start();
-    (a, b)
+    (a, b, serving)
 }
 
 // =====================================================================
@@ -148,7 +215,7 @@ async fn cancel_unknown_token_is_noop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_unary_mid_flight_surfaces_cancelled_error() {
-    let (a, b) = build_pair().await;
+    let (a, b, _serving) = build_pair().await;
     let target = b.node_id();
     let token = a.reserve_cancel_token();
     let opts = CallOptions {
@@ -156,13 +223,13 @@ async fn cancel_unary_mid_flight_surfaces_cancelled_error() {
         ..CallOptions::default()
     };
 
-    // Spawn the call. The publish lands on `b` but `b` doesn't
-    // serve `unserved.svc`, so the caller's rx hangs on the
+    // Spawn the call. The publish lands on `b`, whose `silent.svc`
+    // handler never answers, so the caller's rx hangs on the
     // response oneshot indefinitely until we cancel.
     let a_clone = a.clone();
     let call_task = tokio::spawn(async move {
         a_clone
-            .call(target, "unserved.svc", Bytes::from_static(b"req"), opts)
+            .call(target, "silent.svc", Bytes::from_static(b"req"), opts)
             .await
     });
 
@@ -188,7 +255,7 @@ async fn cancel_before_call_aborts_immediately() {
     // the select! arm. The registry latches pre_cancelled = true;
     // when the call registers, the returned Notify is pre-armed so
     // notified().await fires immediately.
-    let (a, b) = build_pair().await;
+    let (a, b, _serving) = build_pair().await;
     let target = b.node_id();
     let token = a.reserve_cancel_token();
     a.cancel(token); // Cancel BEFORE the call.
@@ -199,7 +266,7 @@ async fn cancel_before_call_aborts_immediately() {
     };
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        a.call(target, "unserved.svc", Bytes::from_static(b"req"), opts),
+        a.call(target, "silent.svc", Bytes::from_static(b"req"), opts),
     )
     .await
     .expect("pre-cancelled call should resolve within 2s");
@@ -215,7 +282,7 @@ async fn cancel_after_unary_resolution_is_noop() {
     // After a call resolves naturally, late cancels on its token
     // are harmless — no panic, no double-emit. The registry entry
     // was already released on resolution.
-    let (a, b) = build_pair().await;
+    let (a, b, _serving) = build_pair().await;
     let target = b.node_id();
     let token = a.reserve_cancel_token();
 
@@ -228,7 +295,7 @@ async fn cancel_after_unary_resolution_is_noop() {
     let a_clone = a.clone();
     let call_task = tokio::spawn(async move {
         a_clone
-            .call(target, "unserved.svc", Bytes::from_static(b"req"), opts)
+            .call(target, "silent.svc", Bytes::from_static(b"req"), opts)
             .await
     });
     wait_for_cancel_entries(&a, 1).await;
@@ -250,7 +317,7 @@ async fn cancel_after_unary_resolution_is_noop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_unary_call_service_mid_flight_surfaces_cancelled() {
-    let (a, _b) = build_pair().await;
+    let (a, _b, _serving) = build_pair().await;
     let token = a.reserve_cancel_token();
     let opts = CallOptions {
         cancel_token: Some(token),
@@ -266,7 +333,7 @@ async fn cancel_unary_call_service_mid_flight_surfaces_cancelled() {
     // NoRoute early-return).
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        a.call_service("unserved.svc", Bytes::from_static(b"req"), opts),
+        a.call_service("advertised.by.nobody", Bytes::from_static(b"req"), opts),
     )
     .await
     .expect("call_service should resolve within 2s");
@@ -290,7 +357,7 @@ async fn cancel_unary_call_service_mid_flight_surfaces_cancelled() {
 async fn cancel_streaming_mid_drain_terminates_stream() {
     use futures::StreamExt;
 
-    let (a, b) = build_pair().await;
+    let (a, b, _serving) = build_pair().await;
     let target = b.node_id();
     let token = a.reserve_cancel_token();
     let opts = CallOptions {
@@ -299,7 +366,7 @@ async fn cancel_streaming_mid_drain_terminates_stream() {
     };
 
     let stream = a
-        .call_streaming(target, "unserved.stream", Bytes::from_static(b"req"), opts)
+        .call_streaming(target, "silent.stream", Bytes::from_static(b"req"), opts)
         .await
         .expect("call_streaming should at least open against a reachable peer");
 
@@ -329,7 +396,7 @@ async fn cancel_streaming_mid_drain_terminates_stream() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_client_stream_mid_finish_surfaces_terminal() {
-    let (a, b) = build_pair().await;
+    let (a, b, _serving) = build_pair().await;
     let target = b.node_id();
     let token = a.reserve_cancel_token();
     let opts = CallOptions {
@@ -338,7 +405,7 @@ async fn cancel_client_stream_mid_finish_surfaces_terminal() {
     };
 
     let mut call = a
-        .call_client_stream(target, "unserved.cs", opts)
+        .call_client_stream(target, "silent.cs", opts)
         .await
         .expect("call_client_stream should open against a reachable peer");
 
@@ -373,7 +440,7 @@ async fn cancel_client_stream_mid_finish_surfaces_terminal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_duplex_mid_recv_terminates_stream() {
-    let (a, b) = build_pair().await;
+    let (a, b, _serving) = build_pair().await;
     let target = b.node_id();
     let token = a.reserve_cancel_token();
     let opts = CallOptions {
@@ -382,7 +449,7 @@ async fn cancel_duplex_mid_recv_terminates_stream() {
     };
 
     let mut call = a
-        .call_duplex(target, "unserved.dx", opts)
+        .call_duplex(target, "silent.dx", opts)
         .await
         .expect("call_duplex should open against a reachable peer");
 
@@ -412,7 +479,7 @@ async fn cancel_duplex_mid_recv_terminates_stream() {
 async fn cancel_duplex_after_split_terminates_both_halves() {
     use futures::StreamExt;
 
-    let (a, b) = build_pair().await;
+    let (a, b, _serving) = build_pair().await;
     let target = b.node_id();
     let token = a.reserve_cancel_token();
     let opts = CallOptions {
@@ -421,7 +488,7 @@ async fn cancel_duplex_after_split_terminates_both_halves() {
     };
 
     let call = a
-        .call_duplex(target, "unserved.dx", opts)
+        .call_duplex(target, "silent.dx", opts)
         .await
         .expect("call_duplex should open against a reachable peer");
 
@@ -473,11 +540,6 @@ async fn cancel_duplex_after_split_terminates_both_halves() {
 // =====================================================================
 
 use parking_lot::Mutex;
-
-use net::adapter::net::cortex::{
-    RequestStream, RpcClientStreamingHandler, RpcDuplexHandler, RpcHandlerError,
-    RpcResponsePayload, RpcResponseSink, RpcStatus, RpcStreamingContext,
-};
 
 /// A provider handler that drains its request stream until EOF and
 /// then signals — the §2.2 retirement observable ("request input
@@ -550,7 +612,7 @@ impl RpcClientStreamingHandler for CsCancelProbe {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_duplex_consume_terminal_still_fences_provider_input() {
-    let (a, b) = build_pair().await;
+    let (a, b, _serving) = build_pair().await;
     let target = b.node_id();
     let (handler, eof_rx) = FenceProbe::new();
     let _serve = b
@@ -598,7 +660,7 @@ async fn cancel_duplex_consume_terminal_still_fences_provider_input() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_client_stream_consume_terminal_still_fires_the_wire_cancel() {
-    let (a, b) = build_pair().await;
+    let (a, b, _serving) = build_pair().await;
     let target = b.node_id();
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let handler = CsCancelProbe {

@@ -2643,6 +2643,12 @@ struct DispatchCtx {
     >,
     /// Bound on concurrently served verifier-side admission legs.
     subnet_admission_permits: Arc<tokio::sync::Semaphore>,
+    /// Bound on concurrently sent `NotFound` answers to nRPC requests
+    /// for services this node does not serve. Past it, the request is
+    /// left unanswered (the caller waits out its deadline, as before),
+    /// so a flood of unserved requests costs a bounded number of tasks.
+    #[cfg(feature = "cortex")]
+    rpc_not_found_permits: Arc<tokio::sync::Semaphore>,
     /// The node itself, for handlers that must run node-owned
     /// transitions (subnet admission installs a routing-id pin).
     self_weak: Arc<std::sync::OnceLock<std::sync::Weak<MeshNode>>>,
@@ -12916,6 +12922,9 @@ pub struct MeshNode {
     >,
     /// Bound on concurrently served verifier-side admission legs.
     subnet_admission_permits: Arc<tokio::sync::Semaphore>,
+    /// Shared with every `DispatchCtx`: see its field.
+    #[cfg(feature = "cortex")]
+    rpc_not_found_permits: Arc<tokio::sync::Semaphore>,
     pending_identity_proofs: Arc<DashMap<u64, (u64, oneshot::Sender<IdentityProofReply>)>>,
     /// `node_id → session_id` at which each peer's entity pin was
     /// established. Shared with `DispatchCtx`; see the field of the
@@ -14991,6 +15000,8 @@ impl MeshNode {
             pending_identity_proofs: Arc::new(DashMap::new()),
             pending_subnet_admissions: Arc::new(DashMap::new()),
             subnet_admission_permits: Arc::new(tokio::sync::Semaphore::new(64)),
+            #[cfg(feature = "cortex")]
+            rpc_not_found_permits: Arc::new(tokio::sync::Semaphore::new(64)),
             peer_identity_sessions,
             proven_identity_sessions: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
@@ -27249,6 +27260,8 @@ impl MeshNode {
             pending_identity_proofs: self.pending_identity_proofs.clone(),
             pending_subnet_admissions: self.pending_subnet_admissions.clone(),
             subnet_admission_permits: self.subnet_admission_permits.clone(),
+            #[cfg(feature = "cortex")]
+            rpc_not_found_permits: self.rpc_not_found_permits.clone(),
             self_weak: self.self_weak.clone(),
             peer_identity_sessions: self.peer_identity_sessions.clone(),
             #[cfg(feature = "nat-traversal")]
@@ -31917,34 +31930,9 @@ impl MeshNode {
             // mismatch; the drop here closes the loopback hole
             // without affecting production routing.
             let session_id = session.session_id();
-            // Per-packet session→NodeId resolution. Fast path is a
-            // single Relaxed atomic load against the per-session
-            // cache populated by the first successful resolution;
-            // see `NetSession::cached_node_id` for the rationale
-            // (discovery-routing perf #108). Cache miss runs the
-            // legacy chain (`addr_to_node` lookup + session_id
-            // verification, then full peer scan on stale addr) and
-            // publishes the result for subsequent packets.
-            let from_node = session.cached_node_id().or_else(|| {
-                let resolved = ctx
-                    .addr_to_node
-                    .get(&session.peer_addr())
-                    .and_then(|nid| {
-                        ctx.peers.get(&*nid).and_then(|p| {
-                            (p.value().session.session_id() == session_id).then_some(*nid)
-                        })
-                    })
-                    .or_else(|| {
-                        ctx.peers
-                            .iter()
-                            .find(|e| e.value().session.session_id() == session_id)
-                            .map(|e| e.value().node_id)
-                    });
-                if let Some(nid) = resolved {
-                    session.cache_node_id(nid);
-                }
-                resolved
-            });
+            // Per-packet session→NodeId resolution: see
+            // `rpc_session_peer`.
+            let from_node = Self::rpc_session_peer(session, ctx);
             let Some(from_node) = from_node else {
                 tracing::warn!(
                     target: "mesh.rpc",
@@ -32161,6 +32149,18 @@ impl MeshNode {
         if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
             return;
         }
+
+        // **An nRPC REQUEST nobody serves is answered, not queued.**
+        // A frame for a served service never gets here: the dispatcher
+        // above took it. One that does reach this point names a
+        // service with no registration, and nothing used to answer
+        // it: it went into the application's queue as an ordinary
+        // event and the caller waited out its whole deadline. It is
+        // answered `NotFound` now. After the admission gate on
+        // purpose: a provisional peer still gets nothing (R1).
+        #[cfg(feature = "cortex")]
+        let events =
+            Self::answer_unserved_rpc_requests(events, session, parsed.header.origin_hash, ctx);
 
         // A stream with a registered sink is delivered to it, WITH the
         // authenticated sender, instead of the shard queue — the queue's
@@ -36153,6 +36153,129 @@ impl MeshNode {
                 });
             }
         }
+    }
+
+    /// The node id behind `session`, for binding nRPC traffic to the
+    /// AEAD-authenticated peer that carried it.
+    ///
+    /// Fast path is a single Relaxed atomic load against the
+    /// per-session cache populated by the first successful resolution;
+    /// see `NetSession::cached_node_id` for the rationale
+    /// (discovery-routing perf #108). A cache miss runs the legacy
+    /// chain (`addr_to_node` lookup + session_id verification, then a
+    /// full peer scan on a stale addr) and publishes the result for
+    /// subsequent packets. `None` when neither resolves: callers drop
+    /// rather than bind to a sentinel.
+    #[cfg(feature = "cortex")]
+    fn rpc_session_peer(session: &NetSession, ctx: &DispatchCtx) -> Option<u64> {
+        let session_id = session.session_id();
+        session.cached_node_id().or_else(|| {
+            let resolved = ctx
+                .addr_to_node
+                .get(&session.peer_addr())
+                .and_then(|nid| {
+                    ctx.peers.get(&*nid).and_then(|p| {
+                        (p.value().session.session_id() == session_id).then_some(*nid)
+                    })
+                })
+                .or_else(|| {
+                    ctx.peers
+                        .iter()
+                        .find(|e| e.value().session.session_id() == session_id)
+                        .map(|e| e.value().node_id)
+                });
+            if let Some(nid) = resolved {
+                session.cache_node_id(nid);
+            }
+            resolved
+        })
+    }
+
+    /// Answer `NotFound` to every nRPC REQUEST in `events` that names a
+    /// service this node does not serve, and return the rest.
+    ///
+    /// A frame is answered only when all of this holds, and is
+    /// otherwise returned untouched (it goes on to the queue exactly as
+    /// before):
+    ///
+    /// - [`unserved_rpc_request`] says it is a well-formed REQUEST for
+    ///   a route nothing serves (read from the dispatcher map now,
+    ///   rather than trusting the packet header's wire bucket);
+    /// - the sending session resolves to a node, and that node is not
+    ///   auth-throttled;
+    /// - a permit is free (see `rpc_not_found_permits`).
+    ///
+    /// The answer goes only to the authenticated session peer
+    /// ([`super::mesh_rpc::emit_rpc_not_found`]).
+    #[cfg(feature = "cortex")]
+    fn answer_unserved_rpc_requests(
+        events: Vec<Bytes>,
+        session: &NetSession,
+        claimed_origin: u64,
+        ctx: &DispatchCtx,
+    ) -> Vec<Bytes> {
+        use crate::adapter::net::cortex::{EventMeta, DISPATCH_RPC_REQUEST, EVENT_META_SIZE};
+        let is_request = |frame: &Bytes| {
+            frame
+                .get(..EVENT_META_SIZE)
+                .and_then(EventMeta::from_bytes)
+                .is_some_and(|m| m.dispatch == DISPATCH_RPC_REQUEST)
+        };
+        // Nearly every packet here is application data: one header
+        // read per event and out, before any allocation.
+        if !events.iter().any(is_request) {
+            return events;
+        }
+        let mut kept = Vec::with_capacity(events.len());
+        for frame in events {
+            if !Self::answer_if_unserved(&frame, session, claimed_origin, ctx) {
+                kept.push(frame);
+            }
+        }
+        kept
+    }
+
+    /// One frame of [`Self::answer_unserved_rpc_requests`]: `true` when
+    /// it was an unserved REQUEST and a `NotFound` is on its way.
+    #[cfg(feature = "cortex")]
+    fn answer_if_unserved(
+        frame: &Bytes,
+        session: &NetSession,
+        claimed_origin: u64,
+        ctx: &DispatchCtx,
+    ) -> bool {
+        let Some((service, call_id)) = unserved_rpc_request(frame, |route| {
+            ctx.rpc_inbound_dispatchers
+                .get(&(route as u16))
+                .is_some_and(|bucket| bucket.iter().any(|(canonical, _, _)| *canonical == route))
+        }) else {
+            return false;
+        };
+        let Some(from_node) = Self::rpc_session_peer(session, ctx) else {
+            return false;
+        };
+        if Self::is_auth_throttled(from_node, ctx) {
+            return false;
+        }
+        let Some(node) = ctx.self_weak.get().and_then(std::sync::Weak::upgrade) else {
+            return false;
+        };
+        let Ok(permit) = ctx.rpc_not_found_permits.clone().try_acquire_owned() else {
+            return false;
+        };
+        let service = service.to_owned();
+        tokio::spawn(async move {
+            let _permit = permit;
+            super::mesh_rpc::emit_rpc_not_found(
+                &node,
+                &service,
+                claimed_origin,
+                call_id,
+                from_node,
+            )
+            .await;
+        });
+        true
     }
 
     /// Verifier side of one admission leg: mint a challenge, or run the
@@ -64864,5 +64987,111 @@ mod unresolvable_endpoint_gate_tests {
             1,
             "a resolvable destination is not an unresolvable refusal"
         );
+    }
+}
+
+/// The `(service, call_id)` to answer `NotFound` for, when `frame` is
+/// an nRPC REQUEST for a service nothing on this node serves; `None`
+/// for anything else.
+///
+/// All of this must hold:
+///
+/// - the frame is a `DISPATCH_RPC_REQUEST` with a readable route and a
+///   readable `service`;
+/// - the route is the canonical hash of `<service>.requests`, so the
+///   name the refusal quotes is the one the caller routed by, and a
+///   frame whose route and payload disagree (a probe, or a forgery)
+///   gets no answer at all;
+/// - `served(route)` is false.
+#[cfg(feature = "cortex")]
+fn unserved_rpc_request(frame: &[u8], served: impl FnOnce(u64) -> bool) -> Option<(&str, u64)> {
+    use crate::adapter::net::cortex::{
+        decode_rpc_route, peek_request_service, EventMeta, DISPATCH_RPC_REQUEST, EVENT_META_SIZE,
+    };
+    let meta = frame
+        .get(..EVENT_META_SIZE)
+        .and_then(EventMeta::from_bytes)
+        .filter(|m| m.dispatch == DISPATCH_RPC_REQUEST)?;
+    let route = decode_rpc_route(frame)?;
+    let service = peek_request_service(frame)?;
+    let requests = ChannelName::new(&format!("{service}.requests")).ok()?;
+    if requests.hash() != route || served(route) {
+        return None;
+    }
+    Some((service, meta.seq_or_ts))
+}
+
+#[cfg(all(test, feature = "cortex"))]
+mod unserved_rpc_request_tests {
+    use super::*;
+    use crate::adapter::net::cortex::{
+        encode_rpc_route, EventMeta, RpcRequestPayload, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
+    };
+
+    fn route_of(service: &str) -> u64 {
+        ChannelName::new(&format!("{service}.requests"))
+            .expect("name")
+            .hash()
+    }
+
+    fn frame(dispatch: u8, route: u64, service: &str, call_id: u64) -> Vec<u8> {
+        let mut buf = EventMeta::new(dispatch, 0, 0xC0FFEE, call_id, 0)
+            .to_bytes()
+            .to_vec();
+        encode_rpc_route(&mut buf, route);
+        buf.extend_from_slice(
+            &RpcRequestPayload {
+                service: service.to_string(),
+                deadline_ns: 0,
+                flags: 0,
+                headers: vec![],
+                body: Bytes::from_static(b"req"),
+            }
+            .encode(),
+        );
+        buf
+    }
+
+    #[test]
+    fn an_unserved_well_formed_request_is_answered_with_its_own_name_and_call_id() {
+        let f = frame(DISPATCH_RPC_REQUEST, route_of("svc.a"), "svc.a", 77);
+        assert_eq!(unserved_rpc_request(&f, |_| false), Some(("svc.a", 77)));
+    }
+
+    #[test]
+    fn a_served_route_is_left_to_its_dispatcher() {
+        let route = route_of("svc.a");
+        let f = frame(DISPATCH_RPC_REQUEST, route, "svc.a", 77);
+        assert_eq!(unserved_rpc_request(&f, |r| r == route), None);
+    }
+
+    /// A route naming one service and a payload naming another is not a
+    /// request anyone made in good faith: no answer, so it cannot be used
+    /// to make this node quote an arbitrary name at the sender.
+    #[test]
+    fn a_route_that_disagrees_with_the_named_service_gets_no_answer() {
+        let f = frame(DISPATCH_RPC_REQUEST, route_of("svc.a"), "svc.b", 77);
+        assert_eq!(unserved_rpc_request(&f, |_| false), None);
+    }
+
+    #[test]
+    fn only_the_initial_request_is_answered() {
+        let f = frame(DISPATCH_RPC_CANCEL, route_of("svc.a"), "svc.a", 77);
+        assert_eq!(unserved_rpc_request(&f, |_| false), None);
+    }
+
+    #[test]
+    fn a_malformed_request_gets_no_answer() {
+        let full = frame(DISPATCH_RPC_REQUEST, route_of("svc.a"), "svc.a", 77);
+        // Meta only: no route, no payload.
+        let meta_only = &full[..crate::adapter::net::cortex::EVENT_META_SIZE];
+        assert_eq!(unserved_rpc_request(meta_only, |_| false), None);
+        // Route but no service length byte.
+        let no_service = &full[..crate::adapter::net::cortex::RPC_FRAME_BODY_OFFSET];
+        assert_eq!(unserved_rpc_request(no_service, |_| false), None);
+        // An application event (not an nRPC dispatch byte).
+        let mut app = full.clone();
+        app[0] = 0x80;
+        assert_eq!(unserved_rpc_request(&app, |_| false), None);
     }
 }

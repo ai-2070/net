@@ -2049,8 +2049,10 @@ mod mesh_bindings {
         /// Uncharged, and the only sanctioned way to learn a price: a
         /// commitment is computed against the offer, so a caller that paid
         /// against one can prove which one. A node serving the legacy free
-        /// path (:meth:`serve_a2a`) has no describe service and raises.
-        /// (Requires the `a2a` feature.)
+        /// path (:meth:`serve_a2a`) has no describe service and raises at
+        /// once: the node answers the request ``NotFound``. (A node from
+        /// before that answer stays silent, and the call waits out its
+        /// timeout.) (Requires the `a2a` feature.)
         #[cfg(feature = "a2a")]
         fn describe_a2a(&self, py: Python<'_>, target_node_id: u64) -> PyResult<String> {
             crate::a2a::mesh_describe_a2a(

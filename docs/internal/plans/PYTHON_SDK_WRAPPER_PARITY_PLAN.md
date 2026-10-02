@@ -775,12 +775,14 @@ type signatures only.
   - **RED** against the committed wrapper: 2/2 live and the 11 new
     forwarding tests fail. **GREEN:** `sdk-py` 387 passed; binding SDK,
     A2A, enrollment and stub tests 281 passed, 1 skipped.
-  - **Found, not fixed (native behaviour):** `describe_a2a` against a node
-    serving the free path (`serve_a2a`) doesn't fail fast. It waits out the
-    full RPC timeout (measured: 30.02 s) before raising. A live test of it
-    would trip CI's `--timeout=30`, so it was dropped. No test anywhere
-    covers that case. Worth a fast "no describe service" refusal in the
-    core, as a separate change.
+  - **Found here, fixed in the core since (native behaviour):**
+    `describe_a2a` against a node serving the free path (`serve_a2a`)
+    didn't fail fast. It waited out the full RPC timeout (measured:
+    30.02 s) before raising, on a node with no channel registry
+    (`permissive_channels=True`), where the reply-channel subscribe is
+    admitted. The cause was general: nothing answered an nRPC REQUEST
+    for a service the node does not serve. The node now answers it
+    `NotFound` (`integration_nrpc_mesh::rpc_unserved_service_is_answered_not_found_promptly`).
 
 ### S7 — `net_sdk.AsyncMeshNode`
 
