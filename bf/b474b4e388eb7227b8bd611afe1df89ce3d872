@@ -1,0 +1,20 @@
+docs/internal/plans/NODE_A2A_PAID_ADMISSION_PLAN.md
+  s_36e6a9decc3647::t_d82d5146a13d41 22-37,429-434,687-739,760-761,777,794-795,852-854
+  s_36e6a9decc3647::t_0bc5b5b65abc9d 440
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bfb474b4e388eb7227b8bd611afe1df89ce3d872",
+  "prompts": {},
+  "sessions": {
+    "s_36e6a9decc3647": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "46b7ea03-5ec0-4fb4-8bef-0e4bfe61231c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
