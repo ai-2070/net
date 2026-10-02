@@ -1,0 +1,23 @@
+.github/workflows/web.yml
+  s_d8b00bedd146e9::t_2fed46640e25d8 31-34,57-60,167-174
+net/crates/net/cli/npm/README.md
+  s_d8b00bedd146e9::t_e7f4671b781097 30-36,38,41-42,45-53
+net/crates/net/cli/python/README.md
+  s_d8b00bedd146e9::t_ba8221f323ab51 35-41,43,46-47,50-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b81911e3a52faeecf3e626a68f93f4e4539d2bac",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
