@@ -75,8 +75,10 @@ re-offers.)
 
 **Nor does it cancel an attempt still under way.** A `connectPeer` while another
 for the same peer is connecting resolves with that attempt's outcome, and one
-while an `acceptPeer` for the peer is answering waits for it, offering only if
-the answer did not end `direct`. Concurrent `acceptPeer` calls share one answer.
+while an `acceptPeer` for the peer is answering waits for it. When that answer
+settles the pair (`direct`, `iceTimeout`, `udpBlocked`, or `superseded` by a
+newer attempt) it is the call's outcome too; only after an inconclusive one does
+the call offer. Concurrent `acceptPeer` calls share one answer.
 So a lobby, a store and netcode can each call `connectPeer` for the same host
 without knocking out each other's attempt. This holds per node: another tab's
 node is outside it.

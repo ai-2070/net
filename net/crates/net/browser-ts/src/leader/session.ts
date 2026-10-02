@@ -361,20 +361,24 @@ export class MeshSession {
    * **And on a pair still connecting**, as `BrowserNode.connectPeer` is:
    * a call while this session's own `connectPeer` or `acceptPeer` for the
    * peer is under way is answered by it rather than by a second offer.
-   * See {@link PeerAttempts}.
+   * The healthy-pair reading runs inside that gate, just before any
+   * offer: it is a proxy round trip here, and read ahead of the gate it
+   * could be stale by the time the offer went out. See
+   * {@link PeerAttempts}.
    */
   async connectPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
-    let settled: string | undefined;
-    try {
-      settled = (await this.inner.peer_direct_dialog(nodeIdHex)) ?? undefined;
-    } catch {
-      // A closed session is refused by the offer below, typed; an older
-      // leader simply has no such reading.
-      settled = undefined;
-    }
-    if (settled !== undefined) return { type: 'direct', peer: nodeIdHex, dialog: settled };
-    return this.attempts.connect(nodeIdHex, () =>
-      driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
+    return this.attempts.connect(
+      nodeIdHex,
+      async () => {
+        try {
+          return (await this.inner.peer_direct_dialog(nodeIdHex)) ?? undefined;
+        } catch {
+          // A closed session is refused by the offer below, typed; an
+          // older leader simply has no such reading.
+          return undefined;
+        }
+      },
+      () => driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
     );
   }
 

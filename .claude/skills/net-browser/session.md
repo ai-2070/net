@@ -134,9 +134,12 @@ Rules that bite:
   "to be sure" is safe. (A follower whose leader is from an older release
   still re-offers.) Nor does it cancel an attempt still under way: a second
   `connectPeer` for a connecting peer resolves with that attempt's outcome, and
-  one during an `acceptPeer` waits for it (offering only if it did not end
-  `direct`). Every offer replaces the pair's link, so this is what lets a
-  lobby, a store and netcode each reach the same host.
+  one during an `acceptPeer` waits for it and takes its outcome when that
+  settles the pair (`direct`, `iceTimeout`, `udpBlocked`, or `superseded` by a
+  newer attempt), offering only after an inconclusive one. Every offer replaces
+  the pair's link, so this is what lets a lobby, a store and netcode each reach
+  the same host. This holds per node: another tab's node is outside the rule,
+  as it is outside the surface.
 - **ICE may fail.** `outcome` is a reading, not a promise of connectivity; see
   `errors.md` for what an ICE failure does and does not prove, and
   `refineIceFailure` (a `BrowserNode` method) for turning a raw failure into a

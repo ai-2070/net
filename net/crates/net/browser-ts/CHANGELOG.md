@@ -27,8 +27,17 @@ the README on why it is a sibling package rather than a sub-path.
   - a call while another `connectPeer` for the same peer is in flight
     resolves with that attempt's outcome, without offering again;
   - a call while an `acceptPeer` for the peer is in flight waits for it,
-    and offers only if that answer did not end `direct`;
-  - concurrent `acceptPeer` calls share one answer.
+    and takes its outcome when that settles the pair: `direct`;
+    `iceTimeout` or `udpBlocked` (an offer straight after would almost
+    surely end the same way, a whole ICE deadline later, and the routed
+    session stays in place); or `superseded` naming a newer attempt
+    (an offer would cancel it). Only after an inconclusive answer
+    (`handshakeFailed`, `noAnnouncement`, a supersession with no
+    successor) does it offer;
+  - concurrent `acceptPeer` calls share one answer;
+  - the healthy-pair reading is taken inside that gate, just before any
+    offer. On a `MeshSession` it is a proxy round trip, and read ahead of
+    the gate it could go stale while an answer finished.
 
   This completes the healthy-pair rule from 0.37.0 (a pair already
   direct is never re-offered): a page or library may call `connectPeer`

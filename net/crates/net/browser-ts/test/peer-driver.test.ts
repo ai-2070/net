@@ -252,7 +252,8 @@ describe('proxy traffic per attempt, measured not promised', () => {
 
 describe('one attempt per peer at a time (PeerAttempts)', () => {
   const direct: PeerConnectOutcome = { type: 'direct', peer: PEER, dialog: D1 };
-  const timedOut: PeerConnectOutcome = { type: 'iceTimeout', peer: PEER, dialog: D1 };
+  /** No healthy direct pair: the reading every case below starts from. */
+  const notDirect = () => undefined;
 
   /** A drive that settles when told to. */
   function parked(outcome: PeerConnectOutcome) {
@@ -265,8 +266,8 @@ describe('one attempt per peer at a time (PeerAttempts)', () => {
     const attempts = new PeerAttempts();
     const first = parked(direct);
     const second = vi.fn(async () => direct);
-    const a = attempts.connect(PEER, first.drive);
-    const b = attempts.connect(PEER.toUpperCase(), second);
+    const a = attempts.connect(PEER, notDirect, first.drive);
+    const b = attempts.connect(PEER.toUpperCase(), notDirect, second);
     first.settle();
     expect(await a).toBe(direct);
     expect(await b).toBe(direct);
@@ -274,24 +275,60 @@ describe('one attempt per peer at a time (PeerAttempts)', () => {
     expect(second).not.toHaveBeenCalled();
   });
 
-  it('lets an answer in flight finish, and offers only when it did not end direct', async () => {
+  // An answer that settles the pair is the connect's answer too: offering
+  // after `direct` would replace the link, after an ICE verdict would only
+  // repeat it a deadline later, and after a supersession naming its
+  // successor would cancel that successor.
+  it.each<[string, PeerConnectOutcome]>([
+    ['direct', direct],
+    ['iceTimeout', { type: 'iceTimeout', peer: PEER, dialog: D1 }],
+    ['udpBlocked', { type: 'udpBlocked', peer: PEER, dialog: D1 }],
+    ['superseded by a named successor', { type: 'superseded', peer: PEER, dialog: D1, liveDialog: D2 }],
+  ])('takes an answer that ended %s without offering', async (_name, outcome) => {
     const attempts = new PeerAttempts();
-
-    const answered = parked(direct);
-    void attempts.accept(PEER, answered.drive);
+    const answer = parked(outcome);
+    void attempts.accept(PEER, answer.drive);
     const offer = vi.fn(async () => direct);
-    const connecting = attempts.connect(PEER, offer);
-    answered.settle();
-    expect(await connecting).toBe(direct);
+    const connecting = attempts.connect(PEER, notDirect, offer);
+    answer.settle();
+    expect(await connecting).toBe(outcome);
     expect(offer).not.toHaveBeenCalled();
+  });
 
-    const failed = parked(timedOut);
-    void attempts.accept(PEER, failed.drive);
-    const retry = vi.fn(async () => direct);
-    const reconnecting = attempts.connect(PEER, retry);
-    failed.settle();
-    expect(await reconnecting).toBe(direct);
-    expect(retry).toHaveBeenCalledTimes(1);
+  it.each<[string, PeerConnectOutcome]>([
+    ['handshakeFailed', { type: 'handshakeFailed', peer: PEER, dialog: D1, detail: 'no session' }],
+    ['superseded with no successor', { type: 'superseded', peer: PEER, dialog: D1, liveDialog: null }],
+  ])('offers after an answer that ended %s', async (_name, outcome) => {
+    const attempts = new PeerAttempts();
+    const answer = parked(outcome);
+    void attempts.accept(PEER, answer.drive);
+    const offer = vi.fn(async () => direct);
+    const connecting = attempts.connect(PEER, notDirect, offer);
+    answer.settle();
+    expect(await connecting).toBe(direct);
+    expect(offer).toHaveBeenCalledTimes(1);
+  });
+
+  // Read inside the gate, after any answer it waited on: a reading taken
+  // ahead of it could be stale by the time the offer went out.
+  it('reads the healthy pair inside the gate, after the answer it waited on', async () => {
+    const attempts = new PeerAttempts();
+    const answer = parked({ type: 'handshakeFailed', peer: PEER, dialog: D1, detail: 'x' });
+    void attempts.accept(PEER, answer.drive);
+    let readAt = 0;
+    let settledAt = 0;
+    let clock = 0;
+    const healthy = vi.fn(() => {
+      readAt = ++clock;
+      return D2;
+    });
+    const offer = vi.fn(async () => direct);
+    const connecting = attempts.connect(PEER, healthy, offer);
+    settledAt = ++clock;
+    answer.settle();
+    expect(await connecting).toEqual({ type: 'direct', peer: PEER, dialog: D2 });
+    expect(readAt).toBeGreaterThan(settledAt);
+    expect(offer).not.toHaveBeenCalled();
   });
 
   it('shares one answer between concurrent accepts', async () => {
@@ -307,9 +344,11 @@ describe('one attempt per peer at a time (PeerAttempts)', () => {
 
   it('forgets a settled attempt, including one that rejected', async () => {
     const attempts = new PeerAttempts();
-    await expect(attempts.connect(PEER, async () => Promise.reject(new Error('closed')))).rejects.toThrow('closed');
+    await expect(
+      attempts.connect(PEER, notDirect, async () => Promise.reject(new Error('closed'))),
+    ).rejects.toThrow('closed');
     const fresh = vi.fn(async () => direct);
-    await expect(attempts.connect(PEER, fresh)).resolves.toBe(direct);
+    await expect(attempts.connect(PEER, notDirect, fresh)).resolves.toBe(direct);
     expect(fresh).toHaveBeenCalledTimes(1);
   });
 
@@ -318,8 +357,8 @@ describe('one attempt per peer at a time (PeerAttempts)', () => {
     const other = 'ffffffffffffffff';
     const first = parked(direct);
     const second = vi.fn(async (): Promise<PeerConnectOutcome> => ({ type: 'direct', peer: other, dialog: D2 }));
-    const a = attempts.connect(PEER, first.drive);
-    await attempts.connect(other, second);
+    const a = attempts.connect(PEER, notDirect, first.drive);
+    await attempts.connect(other, notDirect, second);
     first.settle();
     await a;
     expect(second).toHaveBeenCalledTimes(1);

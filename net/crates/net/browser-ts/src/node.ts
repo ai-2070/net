@@ -855,7 +855,9 @@ export class BrowserNode {
    * `connectPeer` for the same peer is under way resolves with that
    * attempt's outcome instead of offering again (a new offer would cancel
    * it), and a call while an {@link acceptPeer} for the peer is under way
-   * waits for it, offering only if it did not end `direct`. See
+   * waits for it and takes its outcome when that settles the pair
+   * (`direct`, `iceTimeout`, `udpBlocked`, or `superseded` by a newer
+   * attempt), offering only after an inconclusive one. See
    * {@link PeerAttempts}.
    *
    * Returns a {@link PeerConnectOutcome}. It **rejects** only for
@@ -863,17 +865,19 @@ export class BrowserNode {
    * node, a peer that answered `Reject`, a malformed peer id.
    */
   async connectPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
-    // Already direct and open: the pair it has. A new offer would
-    // replace the working link and close it under the other side.
-    let settled: string | undefined;
-    try {
-      settled = this.inner.peer_direct_dialog(idArg(nodeIdHex, 'peer'));
-    } catch (error) {
-      throw fromWasmError(error);
-    }
-    if (settled !== undefined && settled !== null) return { type: 'direct', peer: nodeIdHex, dialog: settled };
-    return this.attempts.connect(nodeIdHex, () =>
-      driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
+    const peer = idArg(nodeIdHex, 'peer');
+    return this.attempts.connect(
+      nodeIdHex,
+      // Already direct and open: the pair it has. A new offer would
+      // replace the working link and close it under the other side.
+      () => {
+        try {
+          return this.inner.peer_direct_dialog(peer);
+        } catch (error) {
+          throw fromWasmError(error);
+        }
+      },
+      () => driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
     );
   }
 
