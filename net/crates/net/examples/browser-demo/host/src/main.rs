@@ -50,7 +50,7 @@
 //!
 //! So the demo runs a third leaf whose whole job is public
 //! signalling. Tab C discovers tab B by a capability tag and calls
-//! the public `connectPeer` on it every `PROBE_MS`; nothing in this
+//! the public `connectPeer` on it back to back; nothing in this
 //! demo ever arms `acceptPeer` for C, so the attempt is never
 //! answered, C↔B stays RELAYED for its whole life, and every offer C
 //! signs transits this anchor as `0x0D02` and lands in
@@ -140,7 +140,16 @@ const DEFAULT_HZ: u32 = 60;
 
 /// How long `--check` watches the direct phase before reading the
 /// counter again.
-const DEFAULT_CHECK_SECONDS: u64 = 6;
+///
+/// Longer than [`PROBE_PERIOD_MS`], so the window always holds at
+/// least one fresh offer from the prober: see
+/// `demo_public_signalling_moves_the_anchor_signal_counter_in_the_flat_window`.
+const DEFAULT_CHECK_SECONDS: u64 = 14;
+
+/// The prober's period: one unanswered attempt runs out the leaf's
+/// ICE deadline (`PEER_ICE_DEADLINE_MS`, 10 s) before the next offer
+/// can go out.
+const PROBE_PERIOD_MS: u64 = 10_000;
 
 /// The floor `--check` holds the measured send rate to.
 ///
@@ -182,15 +191,18 @@ const TICK_FRESH_MS: u64 = 3 * ANNOUNCE_MS;
 const PROBE_TARGET_TAG: &str = "demo.probe.target";
 const PROBER_TAG: &str = "demo.probe.source";
 
-/// How often the prober starts a FRESH public peer attempt.
+/// How often the prober reads its live attempt for a newly signed
+/// offer.
 ///
-/// Fresh, not repaired: `peer_offer` supersedes its predecessor (one
-/// live attempt per peer), and each call signs a NEW offer envelope
-/// and hands it to the relayed C↔B session — so this cadence is what
-/// puts `0x0D02` frames on the anchor's forwarding path while the
-/// pair's application path is idle. The superseded attempt's
-/// `connectPeer` resolves as `superseded`, which the page records as
-/// the expected outcome rather than as a failure.
+/// The prober runs FRESH public peer attempts back to back: a
+/// `connectPeer` while one for the same peer is under way joins it
+/// rather than offering again, so each attempt runs out its ICE
+/// deadline (nobody answers C, and `iceTimeout` is the expected
+/// outcome rather than a failure) before the next call signs a NEW
+/// offer envelope and hands it to the relayed C↔B session. That is
+/// what puts `0x0D02` frames on the anchor's forwarding path while
+/// the pair's application path is idle, once per
+/// [`PROBE_PERIOD_MS`].
 const PROBE_MS: u64 = 1000;
 
 /// The floor the flat window holds the prober's PUBLIC offers to.
@@ -1208,6 +1220,16 @@ fn parse_args() -> Args {
                 std::process::exit(2);
             }
         }
+    }
+    // A window no longer than the prober's period can hold no offer
+    // at all, and the signalling row would fail for the window's
+    // length rather than for anything it is about.
+    if args.check && args.seconds * 1000 <= PROBE_PERIOD_MS {
+        eprintln!(
+            "--seconds {} is too short for --check: the window must be longer than the              prober's {PROBE_PERIOD_MS} ms period",
+            args.seconds
+        );
+        std::process::exit(2);
     }
     args
 }

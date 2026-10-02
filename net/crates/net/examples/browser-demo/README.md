@@ -121,7 +121,7 @@ watch.
 ## Is it actually true?
 
 ```sh
-net/crates/net/examples/browser-demo/run.sh --check --seconds 6
+net/crates/net/examples/browser-demo/run.sh --check --seconds 14
 ```
 
 Headless Chromium, driven by Playwright, three isolated browsing
@@ -142,9 +142,11 @@ numbers; any failure exits non-zero. The roster is a `const` in
 `host/src/main.rs`, so a dropped row is a missing line rather than a
 smaller green count.
 
-`--seconds N` lengthens the flat window; at 60 Hz the default 6 s puts
-about 360 frames per direction across the direct path while the
-counter must not move once.
+`--seconds N` sets the flat window; at 60 Hz the default 14 s puts
+about 840 frames per direction across the direct path while the
+counter must not move once. It must stay longer than the prober's
+10 s period (one unanswered attempt runs out its ICE deadline before
+the next offer), or the window can miss every offer.
 
 ## The public API, and what it could not do
 
