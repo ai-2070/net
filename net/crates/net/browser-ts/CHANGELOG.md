@@ -14,15 +14,7 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
-## Unreleased (0.39)
-
-- **`createLocalMesh` reports a frame's peer as exact decimal**, as the
-  real node's `stream_data` does; it used to hand out the sender's hex
-  id. A hex id with no letters in it (about one random id in 1,800)
-  then read as a different node's decimal, and a store hosted on the
-  local mesh answered that joiner at an id that was not on the mesh. A
-  test that compared `peerNode` with `nodeIdHex()` compares it with the
-  decimal now.
+## 0.39.0 — connectPeer waits for an attempt under way
 
 - **`connectPeer` no longer cancels an attempt that is still under
   way.** Every offer replaces the pair's link, so a second
@@ -53,6 +45,14 @@ the README on why it is a sibling package rather than a sub-path.
   about. Settled attempts are not remembered, so a later call after a
   failure is a fresh attempt. Another tab's node is outside the rule, as
   it is outside the surface.
+
+- **`createLocalMesh` reports a frame's peer as exact decimal**, as the
+  real node's `stream_data` does; it used to hand out the sender's hex
+  id. A hex id with no letters in it (about one random id in 1,800)
+  then read as a different node's decimal, and a store hosted on the
+  local mesh answered that joiner at an id that was not on the mesh. A
+  test that compared `peerNode` with `nodeIdHex()` compares it with the
+  decimal now.
 
 ## 0.38.2 — dual-stack anchors
 
