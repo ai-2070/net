@@ -1,6 +1,6 @@
 # Implementation Plan: Node/TS paid A2A task admission (Python parity)
 
-**Status: PLANNED, revision 2 — 2026-10-03** (branch `LZL0/node-a2a`),
+**Status: PLANNED, revision 2.3 — 2026-10-03** (r2.2 re-reviewed HOLD for bounded follow-up; S1–S4 repaired, awaiting sign-off) (branch `LZL0/node-a2a`),
 targeting the first release after 0.39.0. Scope captured from a survey of the
 tree at `2ecac31c0`; nothing below is implemented yet. Revision 1
 (`b71d27c4a`) was reviewed **HOLD** (architecture retained); r2 repairs the
@@ -35,6 +35,24 @@ the TS defect in a milder form: Python has a reachable escape hatch
 exactly what `mesh.py:739-745` says application code must not be pushed onto.
 The fix is WS-G.
 
+**r2.3 (2026-10-03): re-review of r2.2 (`bfb474b4e`), HOLD for a bounded
+follow-up.** The reviewer accepted the r2 architecture, the TS factories and
+the Python handle-adaptation goal, and raised three findings plus a prose
+reconciliation. All four were verified against the source and repaired in
+place, tagged **r2.3 (Sn)**:
+
+| # | Finding (r2.2) | Severity | Where repaired | Status |
+|---|---|---|---|---|
+| S1 | The R1 recovery witness used a pointer that does not exist (`/0/provider_node`; caller rows nest it under `key`) and treated a caller `generation` as a universal selector; the precision control needs a genuinely non-representable id | Medium | D2a, WS-F R1 bullet | repaired in r2.3 |
+| S2 | WS-G conflated adapting an `AsyncMeshNode` with async paid-A2A support; the native `AsyncCapabilityGateway` has no paid verbs and refuses `a2a_purchase_path` | Medium | WS-G | repaired in r2.3 |
+| S3 | An installed wheel does not make an `sdk-py` pytest live: `conftest.py` stubs `net` unconditionally | Medium | WS-G | repaired in r2.3 |
+| S4 | Active prose still contradicted the revised contract (byte-identical, "read-only" prepare, D7 heading, idle-only stop/refusal wording, core-only examples, D1 fallback, sequencing without WS-G) | — | headline, D1, D7, WS-F, sequencing | repaired in r2.3 |
+
+The reviewer's accepted boundary holds: no reopening of the Rust
+payment/admission lifecycle; WS-A (with the pre-move compatibility test and
+vector capture) is the coherent first implementation slice once this text is
+signed off.
+
 **Review ledger.**
 
 | # | Finding (r1) | Severity | Where repaired | Status |
@@ -65,11 +83,14 @@ made for free A2A: a napi marshaling layer over the one Rust lifecycle.
 
 **The sentence:** a Node provider serves a catalog-driven A2A service that is
 explicitly free or paid, gated by its `PaymentProvider`'s engine and journalled
-under lifetime-exclusive ownership; a Node caller **prepares** (read-only),
-**purchases** (durable, resumable, never re-quoted) and **submits** with the
-evidence through its `CapabilityGateway` — every verdict decided by
+under lifetime-exclusive ownership; a Node caller **prepares** (no funds
+move, though it does reserve capacity, obtain a quote and persist the
+attempt), **purchases** (durable, resumable, never re-quoted) and **submits**
+with the evidence through its `CapabilityGateway` — every verdict decided by
 `net_sdk::{mesh_a2a, a2a_journal}` and `net_payments::flow::a2a`, every
-document that crosses byte-identical to what the Python binding returns.
+document that crosses carrying the same schema and values as the Python
+binding's (r2.3, S4: r1 said "byte-identical"; see Doctrine for why values,
+not bytes, are the contract).
 
 **Why this is a port, not a flag:** the build already has everything. Node's
 `default` features include `payments`, `payments-http`, `a2a` and `org`
@@ -212,10 +233,9 @@ edits allowed).
   JSON envelopes — makes every future change to the paid flow a two-binding
   edit with a silent-drift failure mode.
 
-**Fallback if D1 is rejected:** port the projections into
-`bindings/node/src/a2a_paid.rs` by hand and rely on the WS-F cross-binding
-vector test alone to catch drift. Costs roughly +500 napi lines and the
-ongoing double edit.
+~~**Fallback if D1 is rejected:** port the projections into
+`bindings/node/src/a2a_paid.rs` by hand …~~ **Historical (r2.3, S4):** D1 was
+adopted at review; there is no hand-port path.
 
 ### D2 — Node surface shape: typed objects in, JSON documents out
 
@@ -255,7 +275,7 @@ The envelope is JSON, and `JSON.parse` turns every number into an IEEE
 double. Fields above 2⁵³ round silently — the reviewer's probe on Node v26.7.0
 turned `provider_node: 9007199254740993` into `…992`. In the paid surface those
 fields are `prepared.provider_node`, the `Peer(u64)` owner in journal rows,
-recovery `generation`s, attempt-row `provider_node`, and
+recovery `generation`s, the caller attempt row's `key.provider_node`, and
 `quote.expires_at_ns`. A corrupted `provider_node` points the purchase or
 submit at the wrong node; a corrupted owner or generation resolves the wrong
 record or none.
@@ -265,12 +285,33 @@ documents in JS:
 
 - `a2aDocument(json: string, pointer: string): string` — the sub-document at
   an RFC 6901 JSON Pointer, re-serialized by `serde_json` (whose `Value` keeps
-  u64 exactly). `a2aDocument(env, '/prepared')`, `a2aDocument(env, '/proof')`,
-  `a2aDocument(rows, '/0/owner')`, `a2aDocument(rows, '/0/generation')`.
+  u64 exactly). `a2aDocument(env, '/prepared')`, `a2aDocument(env, '/proof')`.
   Rejects with `a2a:invalid_argument:` when the pointer names nothing.
-- `a2aU64(json: string, pointer: string): bigint` — a u64 leaf as `bigint`
-  (`provider_node`, `expires_at_ns`, a provider-journal `generation`), for
-  display or to pass to a `bigint` parameter.
+- `a2aU64(json: string, pointer: string): bigint` — a u64 leaf as `bigint`,
+  for display or to pass to a `bigint` parameter.
+
+**r2.3 (S1): the exact frozen paths, per row kind.** r2 guessed at row
+shapes and got one wrong. The real ones:
+
+| Row source | Field | Shape | Read with | Passed to |
+|---|---|---|---|---|
+| `prepareTask` envelope | `/prepared`, `/proof` (from `purchaseTask`) | object | `a2aDocument` | `purchaseTask` / `submitTask` / `submitTaskPaid` |
+| `prepareTask` envelope | `/quote/expires_at_ns` | u64 | `a2aU64` | display |
+| caller `a2aAttempts()` row *i* | `/i/key/provider_node` (nested under `key`: `PurchaseAttempt.key: PurchaseKey`, `payments/src/flow/a2a.rs:142-148`; Python tests read `a['key']['provider_node']`) | u64 | `a2aU64` | `a2aResolveAttempt(…, providerNode)` |
+| caller `a2aAttempts()` row *i* | `/i/retained` | bool | `JSON.parse` is safe | selects the dispatch below |
+| caller `a2aAttempts()` row *i* | `/i/generation` | object `{seq, incarnation}` | `a2aDocument` | `a2aResolveAttempt(…, generationJson)` **only when `retained` is true** |
+| provider `a2aUnresolved()` row *i* | `/i/owner` | object (`{"kind":"peer",…}` carries a u64) | `a2aDocument` | `a2aResolve(ownerJson, …)` |
+| provider `a2aUnresolved()` row *i* | `/i/generation` | u64 scalar | `a2aU64` | `a2aResolve(…, generation)` |
+
+**Caller generation is a dispatch, not a universal selector.** Supplying
+`generationJson` always routes to `resolve_superseded_attempt`, the
+archive-only exit (`bindings/python/src/a2a_paid.rs:956-965,1000-1005`). So a
+`retained: false` row is resolved by **omitting** `generationJson`. Passing
+the live row's own generation does not resolve it; it is refused as naming
+no archived incarnation. A `retained: true` row is resolved by passing its
+complete `generation` document. The provider's journal generation is a
+different thing, a scalar that names one exact incarnation in
+`a2aResolve`.
 
 Every verb that takes a handle takes that string: `purchaseTask(preparedJson)`,
 `submitTask(preparedJson)`, `submitTaskPaid(preparedJson, proofJson)`,
@@ -367,7 +408,7 @@ caller; out of scope here, noted for the next gateway revision.
   call this expected and give the remedy as "let running tasks finish (or
   cancel them)", never "delete the `.owner` sidecar".
 
-### D7 — Paid A2A is a `@net-mesh/core` surface in this port (r2, R7)
+### D7 — Paid A2A from both `@net-mesh/core` and `@net-mesh/sdk` (r2 R7, amended r2.1)
 
 r1 said `PaymentProvider` / `CapabilityGateway` "are native re-exports" of the
 ergonomic SDK, so new methods would arrive with the typings. Half of that was
@@ -437,7 +478,8 @@ from the binding.
 
 ## The slices
 
-A depends on nothing; B–D depend on A (or its fallback); E on B–D; F last. G (Python SDK, r2.2) depends only on A.
+A depends on nothing; B–D depend on A; E on B–D; F last. G (Python SDK,
+r2.2) depends only on A and is in scope for the same release.
 
 ### WS-A — Hoist the shared projection (D1)
 
@@ -606,7 +648,10 @@ the concrete flow `Arc`).
   where the property is reachable from JS — free success through the catalog,
   price-it-cannot-enforce refusal, second provider on one journal (in-process
   **and** a child `node` process), stop releases the journal with the provider
-  alive, operator queue refuses with no live handle, oversized brief refused
+  alive *in the idle case* (no launched task or terminal write still holding
+  the owner; the under-work case is the R2 witness below), the operator queue
+  refuses *once no writer retains the store* (D6: it keeps answering while
+  one does), oversized brief refused
   before any quote, unknown service is rejected not busy, prepare moves no
   money, paid runs exactly once, retained-id retry converges, altered brief
   refused, lapsed reservation keeps its `admission_id`, unpaid submission
@@ -620,16 +665,45 @@ the concrete flow `Arc`).
   refusal. Plus Node-only: the preflight throw refuses (D3), a paid
   task past `handlerTimeoutMs` ends `failed` and is not re-run.
 - [ ] **r2 additions** (each named for the finding it witnesses):
-  - **R1 lossless handoff:** provider and caller node ids above
-    `Number.MAX_SAFE_INTEGER`. If the harness cannot pin a node id, it searches
-    for a keypair whose derived id is (cheap). The test drives prepare →
-    `a2aDocument('/prepared')` → purchase → `a2aDocument('/proof')` → raw
-    `submitTaskPaid`, then the recovery path `a2aAttempts` →
-    `a2aU64('/0/provider_node')` / `a2aDocument('/0/generation')` →
-    `a2aResolveAttempt`, and the provider side `a2aUnresolved` →
-    `a2aDocument('/0/owner')` → `a2aResolve`. A negative control asserts that
-    `JSON.stringify(JSON.parse(prepared))` *does* change `provider_node` for
-    the same document, so the test cannot pass vacuously.
+  - **R1 lossless handoff** (rewritten in r2.3, S1). Ids: the harness
+    searches keypairs until the derived node id is **not representable as a
+    double**: `BigInt(Number(id)) !== id`. Being above
+    `Number.MAX_SAFE_INTEGER` is not enough, because some larger integers are
+    exactly representable (every even integer in [2⁵³, 2⁵⁴), for one). For a
+    uniform u64 id the check almost always passes on the first key. Both the
+    provider node and the paying caller's peer id are chosen this way, so the
+    provider-side `owner` carries one too. Three legs follow, each with its own
+    setup, because a successfully submitted attempt is not eligible for
+    operator resolution:
+    1. **Happy path:** prepare → `a2aDocument(env, '/prepared')` → purchase →
+       `a2aDocument(env, '/proof')` → raw `submitTaskPaid`; the task runs once
+       on the right provider.
+    2. **Caller recovery, live vs retained.** Stage one key holding both a
+       retained incarnation and its live replacement, with the live
+       replacement driven to `unexecutable` so it is genuinely eligible for the
+       same `closed` resolution. This uses the production-store seeder that
+       `bindings/python/tests/test_a2a_history_boundary.py` builds and runs
+       (it archives real mock-rail evidence through `retain_superseded`;
+       the Python boundary cannot manufacture the supersession race either,
+       and that test says so). Then: `a2aAttempts` → for the `retained: true`
+       row, `a2aU64('/i/key/provider_node')` + `a2aDocument('/i/generation')`
+       → `a2aResolveAttempt(taskId, closed, providerNode, generationJson)`.
+       Assert the retained row is closed and the live row is **unchanged**
+       (its `a2aDocument('/j')` string equal before and after). Then resolve
+       the live row by **omitting** `generationJson` and assert it closes.
+       Passing the live row's own generation is asserted to be refused. This
+       is the routing discrimination the Python C5 witness carries: wrong
+       routing would close the live row and fail the test.
+    3. **Provider recovery:** a post-payment revocation (the preflight-at-submit
+       path) leaves a `Reconcile` row → `a2aUnresolved` →
+       `a2aDocument('/i/owner')` + `a2aU64('/i/generation')` → `a2aResolve`
+       with that exact scalar generation, closing that incarnation only (twin
+       of `test_an_admission_is_resolvable_by_its_exact_generation`).
+
+    **Negative control:** for the same `prepared` document,
+    `JSON.stringify(JSON.parse(prepared))` changes `provider_node`. The
+    selection rule above guarantees it does, so the test cannot pass
+    vacuously.
   - **R2 ownership under work:** park a launched executor on a barrier;
     `stop()` the handle and `close()` the provider; a second
     `serveA2aConfigured` on the same journal (in-process and child process) is
@@ -670,10 +744,13 @@ the concrete flow `Arc`).
   `event-bus.yaml` with anchor `serveA2aConfigured`, skill `coverage.md`
   both tables); `web/src/content/docs/guides/agent-to-agent.md` "paid
   services" section gains the TS snippets; `.claude/skills/net-event-bus/a2a.md`
-  §"Paid A2A" gains the Node prepare/purchase/submit example. Every example
-  imports from `@net-mesh/core` (D7) and reads handles with `a2aDocument`,
-  never `JSON.parse`/`JSON.stringify` (D2a); the paid-timeout and one-sided
-  cancellation caveats sit beside it (D3); release note
+  §"Paid A2A" gains the Node prepare/purchase/submit example. r2.3 (S4):
+  the **ergonomic example uses the SDK route** (`MeshNode.create`,
+  `createPaymentProvider`, `createCapabilityGateway`, and `a2aDocument` /
+  `classifyError` from `@net-mesh/sdk`). The `@net-mesh/core` route is shown
+  beside it as the native variant (D7: both are supported). Both read handles
+  with `a2aDocument`, never `JSON.parse`/`JSON.stringify` (D2a), and the
+  paid-timeout and one-sided cancellation caveats sit beside them (D3); release note
   under `net/crates/net/docs/releases/` mirrored via `npm run sync:releases`.
 - [ ] CI: no feature-list change (already `payments,a2a,org`); the new vitest
   file is auto-discovered. If WS-F adds `tests/cross_lang_a2a_paid/` fixtures
@@ -692,7 +769,8 @@ as D7: **adapt handles and return native objects; implement nothing.**
 - [ ] `sdk-py/src/net_sdk/payments.py`, re-exported from `net_sdk`:
   `create_payment_provider(mesh, state_path, **kwargs)`,
   `create_capability_gateway(mesh, **kwargs)` and
-  `create_async_capability_gateway(mesh, **kwargs)`. Each resolves `mesh`
+  `create_async_capability_gateway(mesh, **kwargs)` (scope in the matrix
+  below). Each resolves `mesh`
   through the existing `_native_mesh` (`mesh.py:1153-1166`, which accepts
   `MeshNode`, `AsyncMeshNode` or a raw `NetMesh` and raises a clear
   `TypeError` otherwise) and passes `**kwargs` through untouched. Because
@@ -707,7 +785,26 @@ as D7: **adapt handles and return native objects; implement nothing.**
   helper `set_a2a_org_caller(gateway, org)`. Both accept a
   `net_sdk.org.OrgClient` (unwrapped via its `.raw`, `org/__init__.py:119-128`),
   a native `OrgClient`, or `None`, and set the right slot: the `NetMesh` slot
-  for a mesh, the gateway's own slot for a gateway (D6's two-slot rule).
+  for a mesh, the gateway's own slot for a gateway (D6's two-slot rule). The
+  gateway helper accepts **only the sync `CapabilityGateway`**. Given an
+  `AsyncCapabilityGateway` it raises `TypeError`, naming the sync gateway as
+  the paid-A2A surface.
+- [ ] **r2.3 (S2): the async matrix, stated rather than implied.** Adapting
+  an `AsyncMeshNode` is not async paid A2A. The native
+  `AsyncCapabilityGateway` refuses `a2a_purchase_path` and has no paid verbs
+  or org setter (`bindings/python/src/capability_gateway.rs:1402-1440`,
+  methods `:1452-1566`); paid A2A is sync-gateway-only by the native
+  contract, driven from asyncio with `asyncio.to_thread`.
+
+  | Mesh handed in | Factory | Returns | Paid A2A? |
+  |---|---|---|---|
+  | `MeshNode` / `AsyncMeshNode` / `NetMesh` | `create_capability_gateway(…, a2a_purchase_path=…)` | native sync `CapabilityGateway` | yes; from asyncio, `await asyncio.to_thread(gw.prepare_task, …)` and the same for purchase/submit/attempts/resolve |
+  | `MeshNode` / `AsyncMeshNode` / `NetMesh` | `create_async_capability_gateway(…)` | native `AsyncCapabilityGateway` | **no.** It adapts the handle for the existing `search`/`describe`/`invoke` surface only; `a2a_purchase_path=` raises the native `TypeError` |
+  | any | `create_payment_provider(…)` | native `PaymentProvider` | provider side (sync verbs, as natively) |
+
+  No SDK-side async wrapper around the financial verbs is added. Wrapping
+  them in an automatic thread hop would be new behavior on a money path, and
+  native async paid parity is not owed by this plan (named in Not in scope).
 - [ ] **No D2a analog, on purpose.** Python ints are arbitrary precision and
   `json.loads` / `json.dumps` round-trip u64 exactly, so R1 is a JavaScript
   defect. The Python docs keep the frozen pattern
@@ -719,23 +816,50 @@ as D7: **adapt handles and return native objects; implement nothing.**
   `examples/a2a_paid.py` (CI-executed) is left on raw `net`, so it keeps
   witnessing the native surface unchanged.
 
-**Proved by:** `sdk-py/tests/test_paid_a2a_sdk.py`, live against the built
-extension. Two `net_sdk.MeshNode`s →
-`create_payment_provider(...).serve_a2a_configured(...)` →
-`create_capability_gateway(..., a2a_purchase_path=...)` → prepare → purchase →
-submit, with the task running once. The `AsyncMeshNode` and raw-`NetMesh` arms
-of the adaptation are also exercised. An SDK `OrgClient` passed to both setters
-on the same-org scenario covers the R6 case from the SDK, and `None` clears and
-denies before launch. Teardown ends in `shutdown()` succeeding. Two negative
-controls: a `net_sdk.MeshNode` passed to the **native** `net.CapabilityGateway`
-still raises `TypeError` (native unchanged), and an unknown keyword to a
-factory raises the native constructor's own error. The test runs where the
-org facade witnesses already run, in the `python-tests` job after `pip
-install -e ../../sdk-py` (`ci.yml:4364-4390`), because that is the only job
-with both the built extension (`ci.yml:4152`, which already has
-`payments,a2a,org`) and the wrapper. The `sdk-py-tests` job installs the
-wrapper `--no-deps`, so it would skip the test. Add it to that step's witness
-roster so a silent skip fails the floor.
+**Proved by:** `sdk-py/tests/test_paid_a2a_sdk.py` driving an **SDK-only
+consumer subprocess**. r2.3 (S3): r2.2 said "live against the built
+extension", but that does not follow from installing a wheel.
+`sdk-py/tests/conftest.py:50-90` installs an auto-stub `net` module whenever
+`net` is not already imported, without first trying a real wheel (the reviewer's
+probe saw `net.__file__ is None` and a generated `NetMesh`), so an in-process
+pytest here can silently test the stub. The vehicle follows the org facade
+precedent (`tests/test_org_streaming.py:5-10,60-106`):
+
+- `sdk-py/examples/paid_a2a_consumer.py` imports only the standard library
+  and `net_sdk`: no `net` import and no private attribute. It runs in a fresh
+  interpreter, outside the stubbed pytest process, and does the live work:
+  two `net_sdk.MeshNode`s →
+  `create_payment_provider(...).serve_a2a_configured(...)` →
+  `create_capability_gateway(..., a2a_purchase_path=...)` → prepare → purchase
+  → submit, with the task running once. It runs once with an `AsyncMeshNode`
+  (paid verbs via `asyncio.to_thread`, per the matrix) and once with a raw
+  `NetMesh`. An SDK `OrgClient` goes to both setters on the same-org
+  scenario, and `None` clears and denies before launch. Teardown ends in
+  `shutdown()` succeeding. Each row prints a structured receipt that the
+  pytest side asserts.
+- **Native evidence before any row, failing on a stub or a partial surface.**
+  A probe subprocess (the `_PROBE` shape) separates three cases. No loadable
+  extension means **skip**: that is the native-free `sdk-py-tests` job, which
+  keeps its existing skip behavior. An extension whose facade fails to import
+  means **fail**. An extension that loads but lacks any required name means
+  **fail**: `PaymentProvider`, `CapabilityGateway.prepare_task`,
+  `NetMesh.set_a2a_org_caller`, `PaymentRefused`, `JournalOwnedElsewhere`,
+  each checked one by one against the native module and the facade. The
+  consumer additionally asserts that `net._net.__file__` names a real
+  extension file.
+- Negative controls, in the consumer: a `net_sdk.MeshNode` passed to the
+  **native** `net.CapabilityGateway` still raises `TypeError` (native
+  unchanged); an unknown keyword to a factory raises the native constructor's
+  own error; `create_async_capability_gateway(..., a2a_purchase_path=...)`
+  raises; and `set_a2a_org_caller(async_gw, org)` raises `TypeError` (S2).
+- **CI: executed and floored, not only declared.** A new step in the
+  `python-tests` job after `Install the sdk-py wrapper` (`ci.yml:4367-4368`),
+  modeled on `Witness roster + floor — sdk-py org facade` (`:4386-4412`):
+  `check-roster.py --mode decl` pins every row name. Then
+  `python -m pytest -q tests/test_paid_a2a_sdk.py` **runs** them, and the step
+  fails unless the passed count reaches the floor. A run that skipped (stub or
+  no wheel) reports 0 passed and fails the floor. `ci.yml:4152` already builds
+  that job's extension with `payments,a2a,org`.
 
 ### Decisions (resolved at review, r2)
 
@@ -759,6 +883,10 @@ roster so a silent skip fails the floor.
    wrappers).
 7. **Python SDK** (r2.2, WS-G): same adaptation, handle half only. It needs no
    options mapping and no lossless reader.
+8. **Python async boundary** (r2.3, S2): paid A2A stays sync-gateway-only,
+   driven from asyncio by `to_thread`. `create_async_capability_gateway` is a
+   handle adapter for search/describe/invoke and nothing more. Option 1 of
+   the reviewer's three.
 
 ### Test matrix (target)
 
@@ -774,7 +902,9 @@ roster so a silent skip fails the floor.
 | SDK factories + handle adaptation (r2.1), `MeshNode` and native arms, clean `shutdown()` | — | ✓ `sdk-ts/test/paid_a2a.test.ts` | — |
 | SDK `OrgClient` → both org slots (r2.1) | — | ✓ live same-org | R6 |
 | options ↔ native ctor coverage (r2.1) | — | ✓ type-level + per-option | — |
-| Python SDK factories + org setter (r2.2) | — | — | ✓ `sdk-py/tests/test_paid_a2a_sdk.py` (python-tests job) |
+| Python SDK factories + org setter (r2.2), via SDK-only consumer subprocess with native-evidence probe (r2.3) | — | — | ✓ `sdk-py/tests/test_paid_a2a_sdk.py`, executed + floored in `python-tests` |
+| Python async matrix (r2.3, S2) | — | — | ✓ to_thread arm + async-gateway refusals |
+| caller live-vs-retained routing over a seeded store (r2.3, S1) | — | ✓ | `test_a2a_history_boundary.py` (C5) |
 | prepare → purchase → submit, once-only | — | ✓ (two-node) | `test_a2a_paid.py`, `a2a_paid_end_to_end` |
 | approval / reject / restart / resolve | — | ✓ | `test_a2a_paid.py` |
 | org-admitted principal, same-org (R6) | — | ✓ live, both setters | `a2a_admission_identity` |
@@ -796,9 +926,13 @@ included), one small Python compatibility test. r2.1 adds ~200 lines of
 
 Commit sequence, each compiling and green on its own: capture the
 cross-binding fixtures and land `test_a2a_paid_config_compat.py` against
-today's code → WS-A (both Python suites unedited) → WS-B → WS-C → WS-D → WS-E → WS-F. Run the node vitest suite once
-after WS-D against a freshly built `.node` with the CI feature list
-(`ci.yml:3746`), then the full pre-push checklist once before review.
+today's code → WS-A (both Python suites unedited) → WS-B → WS-C → WS-D →
+WS-E → WS-G → WS-F (r2.3, S4: WS-G is in the release; it may land any time
+after WS-A, but WS-F's docs and matrix flip describe it, so it lands before
+them). Run the node vitest suite once after WS-D against a freshly built
+`.node` with the CI feature list (`ci.yml:3746`), the WS-G consumer once
+against a `maturin develop` build with `ci.yml:4152`'s list, then the full
+pre-push checklist once before review.
 
 ## Risks
 
@@ -852,4 +986,6 @@ after WS-D against a freshly built `.node` with the CI feature list
   **r2.1:** now in scope (WS-E); the Python twin is in scope as of r2.2 (WS-G).
   Still out of scope: forwarding wrapper classes over the native
   provider/gateway in either SDK.
+- Native async paid A2A in Python (`AsyncCapabilityGateway` paid verbs), and
+  any SDK-side automatic async wrapper over the financial verbs (r2.3, S2).
 - Force-unlocking or draining the journal on `stop()`/`close()` (D6).
