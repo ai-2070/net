@@ -36,7 +36,7 @@ Net calls two independently implemented things a "channel". They share a name gr
 | Authorization | none | cap filters, `require_token` + `token_roots`, origin binding |
 | Crosses the network | only if the node's transport carries the events | yes, that is the point |
 | Return value | `boolean` (TS) / `Receipt` (Python) | per-peer `PublishReport` |
-| Available in | TypeScript, Python | Rust, TypeScript, Python (low-level `NetMesh`), Go, C |
+| Available in | TypeScript, Python | Rust, TypeScript, Python (`net_sdk.MeshNode` / `AsyncMeshNode`), Go, C |
 
 The tagged topic is a **convenience label over generic ingestion**. It is genuinely useful — one node, many logical streams, no discrimination code on the consumer — and it is not distributed pub/sub. It has no roster, sends no membership message, and consults no ACL. Two processes do not talk to each other through `node.channel()` unless the node's transport was already carrying every event between them.
 
