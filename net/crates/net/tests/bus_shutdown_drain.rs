@@ -177,15 +177,15 @@ impl Adapter for FlakyAdapter {
     }
     async fn on_batch(&self, batch: std::sync::Arc<Batch>) -> Result<(), AdapterError> {
         self.attempts.fetch_add(1, Ordering::Relaxed);
-        // Atomic check-and-decrement via fetch_update — a racy
+        // Atomic check-and-decrement via try_update — a racy
         // `load > 0` + `fetch_sub(1)` pair lets two concurrent
         // retries both pass the check when only one slot remains
         // and underflow the counter to u64::MAX (cubic-flagged
-        // P2). `fetch_update` returns Ok iff the closure returned
+        // P2). `try_update` returns Ok iff the closure returned
         // Some, which is exactly "we won the slot" semantics.
         let injected = self
             .failures_remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 if v > 0 {
                     Some(v - 1)
                 } else {

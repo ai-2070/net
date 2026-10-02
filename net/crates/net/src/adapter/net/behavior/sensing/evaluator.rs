@@ -517,12 +517,12 @@ impl ReadinessEvaluators {
     ///
     /// Checked and non-reusing: the counter saturates at the reserved
     /// `u64::MAX` sentinel instead of wrapping, so no id is ever issued
-    /// twice and a stale id can never alias a live one. A `fetch_update`
+    /// twice and a stale id can never alias a live one. A `try_update`
     /// rather than `fetch_add` because the terminal state must be
     /// reached exactly once and never stepped past.
     fn mint(&self) -> Option<EvaluatorRegistrationId> {
         self.next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 if current > MAX_REGISTRATION_ID {
                     None
                 } else {

@@ -350,7 +350,7 @@ impl EndpointState {
     fn try_record_request(&self, max_connections: u32) -> bool {
         let reserved = self
             .connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |c| {
                 if c >= max_connections {
                     None
                 } else {
@@ -375,11 +375,8 @@ impl EndpointState {
         // forever - a silent, permanent removal from rotation with
         // no log, no metric, no recovery path. The test at the
         // bottom of this module explicitly acknowledged the hazard.
-        let _ = self
-            .connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                Some(c.saturating_sub(1))
-            });
+        self.connections
+            .update(Ordering::AcqRel, Ordering::Acquire, |c| c.saturating_sub(1));
 
         // If this completion is for the half-open probe, it decides the
         // circuit's fate. Clearing the flag with swap also guarantees only
@@ -2136,7 +2133,7 @@ mod tests {
         // Regression: the select() path loaded `connections` with Relaxed
         // then incremented in record_request, allowing N concurrent
         // selectors to all pass the check and collectively exceed the cap.
-        // Now reservation is atomic via fetch_update.
+        // Now reservation is atomic via try_update.
         use std::sync::Arc;
         use std::thread;
 

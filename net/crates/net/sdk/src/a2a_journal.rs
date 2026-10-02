@@ -2259,7 +2259,7 @@ impl JournalFiles {
             }
             let armed = self
                 .fail_write
-                .fetch_update(SeqCst, SeqCst, |n| (n > 0).then(|| n - 1))
+                .try_update(SeqCst, SeqCst, |n| (n > 0).then(|| n - 1))
                 .unwrap_or(0);
             if armed == 1 {
                 return Err(self.io_err("injected write failure (testing seam)"));

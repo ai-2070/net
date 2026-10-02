@@ -555,9 +555,9 @@ impl RtcTransport {
     fn release_install_intent(&self, id: RtcPeerId) {
         if let Some(slot) = self.slots.get(&id.slot) {
             if slot.generation == id.generation {
-                let _ =
-                    slot.install_intents
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+                let _ = slot
+                    .install_intents
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
             }
         }
     }

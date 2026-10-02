@@ -714,7 +714,7 @@ impl RtcInstallPause {
     pub(crate) async fn wait_if_armed(&self) {
         let taken = self
             .park_budget
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n > 0).then(|| n - 1)
             })
             .is_ok();

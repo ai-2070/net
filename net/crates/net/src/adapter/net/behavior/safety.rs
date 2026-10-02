@@ -400,15 +400,16 @@ impl ResourceGuard {
                 .tokens
                 .fetch_add(diff as u64, Ordering::Relaxed);
         } else if diff < 0 {
-            // Use fetch_update with saturating subtraction to prevent
+            // Use update with saturating subtraction to prevent
             // underflow wrapping the u64 counter to near-MAX, which
             // would permanently lock out all subsequent requests.
             let sub = (-diff) as u64;
-            let _ = self.enforcer.usage.tokens.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| Some(current.saturating_sub(sub)),
-            );
+            self.enforcer
+                .usage
+                .tokens
+                .update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.saturating_sub(sub)
+                });
         }
         self.claim.tokens = actual_tokens;
     }
@@ -482,7 +483,7 @@ impl RateBucket {
         let mut last_observed = 0u32;
         match self
             .packed
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 let (cur_floor, cur_count) = Self::split(current);
                 if cur_floor != current_floor {
                     // Window rolled over for this entry; this
@@ -535,7 +536,7 @@ impl RateBucket {
     fn rollback(&self, current_floor: u32) {
         let _ = self
             .packed
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 let (cur_floor, cur_count) = Self::split(current);
                 if cur_floor == current_floor && cur_count > 0 {
                     Some(Self::pack(cur_floor, cur_count - 1))
@@ -732,7 +733,7 @@ impl RateLimiter {
         let effective_limit = (limit as f32 * burst) as u64;
         match self
             .global_requests
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current >= effective_limit {
                     None
                 } else {
@@ -789,7 +790,7 @@ impl RateLimiter {
         let effective_limit = (limit as f64 * burst as f64) as u64;
         match self
             .global_tokens
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 let next = current.checked_add(tokens)?;
                 if next > effective_limit {
                     None
@@ -1157,7 +1158,7 @@ impl SafetyEnforcer {
     /// `check_resource_limits`, then unconditionally `fetch_add`'d
     /// each counter. N concurrent acquirers all observed `current=0`
     /// and all proceeded past the cap — the kill-switch / safety
-    /// envelope was breakable under load. The fix uses `fetch_update`
+    /// envelope was breakable under load. The fix uses `try_update`
     /// (compare-and-swap loop) for each cumulative counter so the
     /// check + add is atomic per resource, and rolls back any partial
     /// successes if a later resource fails. `tokens` is per-request
@@ -1199,7 +1200,7 @@ impl SafetyEnforcer {
         // after the hour rollover.
         self.usage.maybe_reset_hourly();
 
-        // Helper: atomically `fetch_update` an `AtomicU32`
+        // Helper: atomically `try_update` an `AtomicU32`
         // counter so that `add` only commits if `current + add
         // <= max`. Returns Err with the current value on cap
         // exceeded.
@@ -1209,7 +1210,7 @@ impl SafetyEnforcer {
             max: u32,
         ) -> Result<(), u32> {
             counter
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     let next = current.saturating_add(add);
                     if next > max {
                         None
@@ -1383,13 +1384,13 @@ impl SafetyEnforcer {
             // failure on overflow — by definition this counter only
             // drives observability dashboards — so wrap is silent
             // corruption (operators see the counter reset to ~0 mid-
-            // window and conclude traffic dropped). `fetch_update`
+            // window and conclude traffic dropped). `update`
             // with saturating_add inside is the standard pattern.
-            let _ = self.rate_limiter.global_tokens.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| Some(v.saturating_add(claim.tokens as u64)),
-            );
+            self.rate_limiter
+                .global_tokens
+                .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    v.saturating_add(claim.tokens as u64)
+                });
         }
 
         // tokens (per-request `usage` counter) — free-running,
@@ -1433,7 +1434,7 @@ impl SafetyEnforcer {
 
     /// Release resources (called by ResourceGuard on drop)
     fn release(&self, claim: &ResourceClaim) {
-        // Use `fetch_update` + `saturating_sub` rather than raw
+        // Use `update` + `saturating_sub` rather than raw
         // `fetch_sub` on `concurrent` and `memory_gb`. `acquire()`
         // short-circuits in `EnforcementMode::Disabled` and returns
         // a guard WITHOUT incrementing those counters; a raw
@@ -1443,7 +1444,7 @@ impl SafetyEnforcer {
         // every request forever (mode is hot-swappable via
         // `update_envelope`, so warm-up in `Disabled` then flip to
         // `Enforce` is the real-world trigger). The matching
-        // tokens/cost paths already use `fetch_update` +
+        // tokens/cost paths already use `update` +
         // `saturating_sub` for exactly this reason.
         //
         // Use `AcqRel` (not `Relaxed`) to mirror the acquire path's
@@ -1457,31 +1458,28 @@ impl SafetyEnforcer {
         // still touching it. The total counter eventually
         // converges, but the ordering mismatch produced
         // observable drift on metrics readers.
-        let _ =
-            self.usage
-                .concurrent
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    Some(current.saturating_sub(claim.concurrent_slots))
-                });
-        let _ = self
-            .usage
+        self.usage
+            .concurrent
+            .update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.saturating_sub(claim.concurrent_slots)
+            });
+        self.usage
             .memory_gb
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(claim.memory_gb))
+            .update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.saturating_sub(claim.memory_gb)
             });
         // Release tokens and cost that were acquired — without this,
         // both counters grow monotonically, hitting limits prematurely.
-        let _ = self
-            .usage
+        self.usage
             .tokens
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(claim.tokens as u64))
+            .update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.saturating_sub(claim.tokens as u64)
             });
-        let _ = self.usage.cost_cents_per_hour.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| Some(current.saturating_sub(claim.cost_cents)),
-        );
+        self.usage
+            .cost_cents_per_hour
+            .update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.saturating_sub(claim.cost_cents)
+            });
     }
 
     /// Trigger the kill switch
@@ -2313,7 +2311,7 @@ mod tests {
     /// `load + compare` (`check_resource_limits`) then
     /// `fetch_add`. N concurrent acquirers all observed the same
     /// pre-add value and all proceeded past the cap. The fix
-    /// uses `fetch_update` per cumulative resource so the check +
+    /// uses `try_update` per cumulative resource so the check +
     /// add is atomic per counter.
     ///
     /// We pin this by spawning many threads that each try to
@@ -2508,7 +2506,7 @@ mod tests {
     /// End-to-end: under concurrent rate-limit pressure across
     /// multiple sources, no source ever exceeds its per-source
     /// cap by more than 1 (the single race window is between
-    /// fetch_update's load and CAS, NOT the previously-unbounded
+    /// try_update's load and CAS, NOT the previously-unbounded
     /// clear-and-reinsert race).
     ///
     /// Pre-fix this test would intermittently fail because the

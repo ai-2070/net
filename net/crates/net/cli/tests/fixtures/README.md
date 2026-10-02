@@ -1,6 +1,6 @@
 # Two-node capability journey
 
-From a source checkout, install the pinned Rust toolchain (currently 1.98.1),
+From a source checkout, install the pinned Rust toolchain (currently 1.99.0),
 Python 3 (`python` on Windows, `python3` elsewhere), and cargo-nextest. No Python
 packages, running mesh, credentials, or extra CLI features are required.
 Run from `net/crates/net/`:

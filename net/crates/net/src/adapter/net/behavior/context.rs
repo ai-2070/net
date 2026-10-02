@@ -876,7 +876,7 @@ impl ContextStore {
         // Fetch-update CAS loop: only commit if `cur < max`.
         let ok = self
             .active_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 if cur < self.max_traces {
                     Some(cur + 1)
                 } else {
@@ -900,10 +900,9 @@ impl ContextStore {
     fn release_slot(&self) {
         use std::sync::atomic::Ordering;
         self.active_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                Some(cur.saturating_sub(1))
-            })
-            .ok();
+            .update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                cur.saturating_sub(1)
+            });
     }
 }
 
