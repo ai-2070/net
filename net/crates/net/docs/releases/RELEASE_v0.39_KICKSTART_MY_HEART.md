@@ -95,6 +95,7 @@ It runs under both the wire-floor policy and the shipped announce policy. On an 
 
 - **Rust 1.99.0.** `Atomic*::fetch_update` is renamed `try_update` across the tree, and the infallible sites use the new `update`.
 - **The CLI's npm and PyPI READMEs** carry the current subcommand table, and CI now holds every README outside the website to its checks (`check-readmes.py`, with a self-test).
+- **`createLocalMesh` reports a frame's peer as exact decimal**, as the real node does. It handed out the sender's hex id, and a hex id with no letters in it (about one random id in 1,800) then read as a different node, so a store on the local mesh answered that joiner at an id not on the mesh.
 - **The browser demo's** signalling prober runs its attempts back to back, and the check window is 14 s.
 
 ---
