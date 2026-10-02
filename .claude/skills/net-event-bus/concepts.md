@@ -81,7 +81,7 @@ Wire collisions are benign because they only cost filter precision. ACL, config,
 
 - **Rust** — `Mesh::register_channel` / `subscribe_channel` / `publish_channel` (`sdk/src/mesh.rs`).
 - **TypeScript** — `MeshNode.registerChannel` / `subscribeChannel` / `publishChannel` (`sdk-ts/src/mesh.ts`).
-- **Python** — on the low-level `net.NetMesh` / `AsyncNetMesh` binding. The ergonomic `net_sdk.MeshNode` does **not** wrap them, so this is `core-only` for Python.
+- **Python** — `MeshNode.register_channel` / `subscribe_channel` / `publish` (`sdk-py/src/net_sdk/mesh.py`), and the same on `AsyncMeshNode`.
 - **Go** — `MeshNode.RegisterChannel` / `SubscribeChannel` / `Publish` (`go/mesh.go`).
 - **C** — `net_mesh_register_channel` / `net_mesh_subscribe_channel` / `net_mesh_publish`.
 

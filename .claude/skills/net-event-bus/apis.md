@@ -44,7 +44,7 @@ the split.
 | Surface | What it is | Available in |
 |---|---|---|
 | **Tagged EventBus topics** (`node.channel("name")` → publish/subscribe) | A label over local ingestion: the name is written into the payload as `_channel` and used as an exact subscribe filter. **No roster, no registration, no authorization, no cross-process delivery of its own.** | TypeScript, Python |
-| **Distributed mesh channels** (`registerChannel` → `subscribeChannel` → `publishChannel`) | Real pub/sub. The publisher registers a config, subscribers join a roster via an acked membership request, publish is a per-peer unicast returning a `PublishReport`. Cap filters and `require_token` gate joins. | Rust, TypeScript, Go, C; Python `core-only` (on `net.NetMesh`, not `net_sdk.MeshNode`) |
+| **Distributed mesh channels** (`registerChannel` → `subscribeChannel` → `publishChannel`) | Real pub/sub. The publisher registers a config, subscribers join a roster via an acked membership request, publish is a per-peer unicast returning a `PublishReport`. Cap filters and `require_token` gate joins. | All five: Rust, TypeScript, Python (`net_sdk.MeshNode`), Go, C |
 | **Raw typed firehose** (`node.emit(struct)` → `node.subscribe()`) | One stream of typed events. Consumers receive everything and discriminate on the receive side. | Rust, TypeScript, Python |
 | **Raw poll** (`bus.IngestRaw` → `bus.Poll(cursor)`) | Push JSON in, poll JSON out with a cursor. No async, no channels. | Go, C |
 | **nRPC** (`TypedMeshRpc.serve` + `TypedMeshRpc.call`) | Typed call → typed reply, with deadlines, retries, hedging and response streaming. **A different surface from this file** — see `nrpc.md`. | all five |

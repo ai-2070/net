@@ -335,7 +335,7 @@ behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/m
 | Feature | Rust | Node / TS | Python | Go | C |
 |---|---|---|---|---|---|
 | Event bus — ingest + poll | ✓ | ✓ | ✓ | ✓ | ✓ `poll` |
-| Mesh channels — register / subscribe / publish | ✓ | ✓ | core-only | ✓ | ✓ |
+| Mesh channels — register / subscribe / publish | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Capability announce + discovery | ✓ | ✓ | ✓ | ✓ | ✓ |
 | nRPC — typed request/response + streaming | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Gang-claim scheduler | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -343,11 +343,11 @@ behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/m
 | Subnet exports — serve + call | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Dataforts — blobs | ✓ | ✓ | ✓ | partial | ✓ |
 | RedEX / CortEX / MeshDB | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Compute / groups / daemons | ✓ | ✓ | core-only | ✓ | ✓ |
+| Compute / groups / daemons | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Deck — operator surface | ✓ | ✓ | ✓ | ✓ | ✓ |
 | MCP bridge | ✓ | ✓ | ✓ | ✓ | ✓ |
-| A2A — agent task handoff | ✓ | core-only | core-only | – | – |
-| A2A — paid task admission | ✓ | – | core-only | – | – |
+| A2A — agent task handoff | ✓ | ✓ | ✓ | – | – |
+| A2A — paid task admission | ✓ | – | ✓ | – | – |
 | Consumer-side filter DSL | ✓ | ✓ | ✓ | – | ✓ |
 
 `✓` supported · `core-only` reachable only through the low-level binding (`@net-mesh/core`,
