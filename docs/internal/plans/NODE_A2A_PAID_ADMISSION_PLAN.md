@@ -1,8 +1,29 @@
 # Implementation Plan: Node/TS paid A2A task admission (Python parity)
 
-**Status: PLANNED 2026-10-03** (branch `LZL0/node-a2a`), targeting the first
-release after 0.39.0. Scope captured from a survey of the tree at
-`2ecac31c0`; nothing below is implemented yet.
+**Status: PLANNED, revision 2 — 2026-10-03** (branch `LZL0/node-a2a`),
+targeting the first release after 0.39.0. Scope captured from a survey of the
+tree at `2ecac31c0`; nothing below is implemented yet. Revision 1
+(`b71d27c4a`) was reviewed **HOLD** (architecture retained); r2 repairs the
+seven findings in place. Each repair is tagged **r2 (R*n*)** next to the text
+it changed, and the reviewer's four decisions are adopted (§Decisions).
+Awaiting re-review before implementation.
+
+**Review ledger.**
+
+| # | Finding (r1) | Severity | Where repaired | Status |
+|---|---|---|---|---|
+| R1 | JSON-string handles are not a lossless JS handoff: `prepared`/`proof` are nested objects in the envelope, and `provider_node` (also owner ids, generations, `expires_at_ns`) is u64 and corrupts under `JSON.parse` → `JSON.stringify` | High | D2a (new), Doctrine, WS-C/D/F | repaired in r2 |
+| R2 | `stop()`/`close()` promised journal release, but launched executors and terminal writes retain the owner | High | Doctrine, D6 (new), WS-B, WS-F | repaired in r2 |
+| R3 | A 30 s preflight deadline loses the race to the caller's earlier-started 30 s `A2A_CALL_TIMEOUT` | Medium | D3, WS-F | repaired in r2 |
+| R4 | Catalog bounds/durations narrowed from u64 to `number`/u32 with no validation policy | Medium | D2, WS-B, WS-F | repaired in r2 |
+| R5 | The catalog parser is not binding-neutral; a whole-dict `dict → Value` move changes Python input behavior | Medium | D1, WS-A | repaired in r2 |
+| R6 | The source-only org fallback is unnecessary — `org_live.test.ts` already drives a live org harness | Medium | WS-C/D, WS-F, Risks | repaired in r2 |
+| R7 | `PaymentProvider` is not exported from `sdk-ts`; both ctors take a native `NetMesh` | Medium | D7 (new), WS-E | repaired in r2 |
+
+One defect found while checking R1 that the review did not name:
+`quote.expires_at_ns` in the `prepare_task` envelope (`a2a_paid.rs:575-591`) is
+a u64 nanosecond timestamp (~1.8×10¹⁸), so even the *display* fields of the
+envelope lose precision under `JSON.parse`. The D2a reader covers it.
 
 **Implements:** the one Node/TS gap left in the A2A row of the binding matrix —
 **"A2A — paid task admission"** is `✓` for Rust and Python and `–` for Node/TS
@@ -86,11 +107,21 @@ Three structural facts:
   parses config, bridges two JS callbacks, and projects typed results.
 - **One JSON contract, two bindings.** Every document a Node caller sees
   (`prepared`, `proof`, the `{status: …}` envelopes, attempt rows, unresolved
-  rows) is byte-identical to Python's for the same state. Parity is
-  structural (D1), and a vector test pins it.
+  rows) has the same schema and the same values as Python's for the same
+  state — the frozen envelope schema is kept, with `prepared` and `proof`
+  nested as objects. Parity is structural (D1), and a vector test pins it.
+  **r2 (R1):** r1 said "byte-identical", which conflated two things. Output
+  equality is equality of JSON *values*. Exact *bytes* matter only where
+  something is signed, and those bytes never round-trip through JS: the quote
+  and payment payload live base64-encoded in the purchase store
+  (`quote_bytes`/`payload_bytes`), and the brief commitment is Rust's
+  canonical typed JSON (parent plan D3), so outer whitespace or key order in a
+  `prepared` document carries no evidence.
 - **Every handle is a complete document** (frozen in the parent plan's WS-E):
   a crashed Node caller reloads its stored `prepared` and submits; nothing is
-  re-derived from a hash.
+  re-derived from a hash. **r2 (R1):** in JS a handle is handed on as the
+  string the D2a reader extracts, never as a `JSON.parse`d object re-serialized
+  with `JSON.stringify` — that path silently rounds u64 fields above 2⁵³.
 - **Non-custodial; keys never cross.** The payer is the node's mesh identity,
   borrowed in-process; real networks sign through the existing per-scheme JS
   signer callbacks (`payment_signer.rs`). Briefs, offers, quotes and signatures
@@ -100,16 +131,25 @@ Three structural facts:
   the existing gateway already does for `invoke` (`errors.ts:40-43`). Throws
   are reserved for caller-shape errors, transport, and the two named
   refusals (`PaymentRefused` on the raw path, `JournalOwnedElsewhere`).
-- **Handle lifecycle.** The configured serve handle **is** the journal owner.
-  `A2aServeHandle.stop()` releases the journal's `.owner` lock and the node
-  clone; `PaymentProvider.close()` must also stop any configured serve it
-  started, or `NetMesh.shutdown()` fails until GC (the `close()` gotcha).
+- **Handle lifecycle.** ~~The configured serve handle **is** the journal
+  owner; `stop()` releases the `.owner` lock.~~ **r2 (R2):** that was wrong.
+  `stop()` / `PaymentProvider.close()` **retire the registration** and drop
+  the binding's own references (the serve handles, the node clone, the
+  binding's store reference). Journal ownership ends only when every Rust
+  writer has let go. A launched executor holds the owner (`OwnedExecutor`,
+  `sdk/src/mesh_a2a.rs:2363-2378`) and the terminal hook holds store + owner
+  through its write (`:2555-2579`), by design, so a second owner can never
+  open the journal while a paid task can still record its outcome. The
+  binding does not force-unlock and does not promise immediate release while
+  application work remains. See D6. `PaymentProvider.close()` must still stop
+  any configured serve it started, or `NetMesh.shutdown()` fails until GC (the
+  `close()` gotcha).
 
 ---
 
 ## The design
 
-### D1 — Hoist the binding-neutral projection before porting (recommended)
+### D1 — Hoist the binding-neutral projection before porting (adopted at review)
 
 Move the pure half of `bindings/python/src/a2a_paid.rs` into one shared Rust
 home that both bindings call, then make the Python module a thin caller of it
@@ -122,15 +162,23 @@ edits allowed).
   `net-payments` already depends on `net-sdk`, so `A2aOffer` / `PreparedTask`
   / `TaskOwner` are in reach. Provider-side owner/state parsing for the
   journal operator verbs goes to `net_sdk::a2a_journal` (no payments types).
-- **What moves:** `owner_to_json`/`owner_from_json`, the services catalog
-  parser from a `serde_json::Value` (the Python dict path becomes
-  `dict → Value → shared parser`, keeping its error strings), `offer_for`,
+- **What moves:** `owner_to_json`/`owner_from_json`, `offer_for`,
   `do_prepare`/`do_purchase`/`do_submit`/`do_attempts`/`do_resolve_attempt`,
   `unresolved_json`/`resolve_admission`'s non-GIL body, the three document
   parsers. Errors return a small `A2aJsonError { kind: Shape | Journal(..) |
   Flow(..), message }` each binding maps to its own exception/prefix.
 - **What stays per-binding:** the executor + preflight callback bridges, the
-  error mapping, dict/object argument plumbing, handle classes.
+  error mapping, dict/object argument plumbing, handle classes — **and the
+  services catalog parser.** **r2 (R5):** r1 moved the catalog parser too, via
+  `dict → Value → shared parser`. That does not preserve behavior. Python
+  treats a missing key and `None` alike (`a2a_paid.rs:127-130`), extracts with
+  PyO3's per-field diagnostics (`:133-165`), requires real dicts for an entry
+  and its `bounds` (`:168-182,208-218`), and reads only recognized keys
+  (`:219-227`), so a service dict carrying an unused `object()` is accepted
+  today and would fail to serialize under a whole-dict conversion. Each
+  binding therefore keeps its own field selection, extraction and messages,
+  and hands the SDK the typed `BTreeMap<String, A2aServicePolicy>` it already
+  takes. `A2aOffer` is an SDK type, so nothing neutral is left to share.
 - **Why this is not scope creep:** AGENTS.md's "new binding surface lands in
   `net-mesh-sdk` first" exists because per-binding reimplementation drifted
   (the R1 incident). The alternative — a ~600-line napi re-typing of the
@@ -138,7 +186,7 @@ edits allowed).
   edit with a silent-drift failure mode.
 
 **Fallback if D1 is rejected:** port the projections into
-`bindings/node/src/a2a_paid.rs` by hand and rely on the WS-5 cross-binding
+`bindings/node/src/a2a_paid.rs` by hand and rely on the WS-F cross-binding
 vector test alone to catch drift. Costs roughly +500 napi lines and the
 ongoing double edit.
 
@@ -152,15 +200,63 @@ inputs; "Landed" note under its WS-3):
   — the JSON string `buildPricingTerms` already returns — `bounds`,
   `reservationTtlSecs`, `reservationRetentionSecs`, `retentionSecs`,
   `description?`), and a `ServeA2aConfiguredOptions { principal?,
-  preflight?, handlerTimeoutMs? }`. Seconds fields are `number` (u32 is ample;
-  the `handlerTimeoutMs` precedent); bounds are `number`.
-- **Outputs and round-tripped handles stay JSON strings**: `prepared`,
-  `proof`, status envelopes, attempt rows. They are documents a caller
-  persists and hands back verbatim; typing them on the JS side would invite
-  re-serialization that breaks byte-exactness.
+  preflight?, handlerTimeoutMs? }`.
+- **r2 (R4): the five bounds and three durations are `bigint`, checked to
+  u64.** r1 made them `number`/u32 on the grounds that u32 was "ample". That
+  narrows the core domain: all eight are u64 (`sdk/src/a2a.rs:275-287,313-320`)
+  and Python extracts them as u64 (`a2a_paid.rs:133-143,183-188,219-227`).
+  These terms are part of the offer commitment, so a silent truncation would
+  change the offer hash.
+  Each field goes through `common::bigint_u64` (`bindings/node/src/common.rs:27-52`)
+  via the field-naming `u64_arg` wrapper, which refuses negatives and values
+  past `u64::MAX` with the field named. A `number` where a `bigint` is
+  declared is a napi type refusal, so fractions, `NaN` and `±Infinity` cannot
+  be coerced. Limits stricter than u64 (e.g. bounds that would be
+  undeliverable, `ServeError::A2aUndeliverableBounds`) are for core to refuse,
+  the same way for every binding. `handlerTimeoutMs` stays a u32 `number`: it is
+  a Node-local execution knob, not an offer term.
+- **Outputs stay JSON strings in the frozen Python schema**: status
+  envelopes, attempt rows, unresolved rows, offers. Nested handles are read
+  out with the D2a reader, not `JSON.parse`.
 - **Names:** `js_name` pinned where napi's camelCase mangles `A2a`
   (`serveA2aConfigured`, `describeA2a`, `submitTaskPaid`, `a2aUnresolved`,
   `a2aResolve`, `a2aAttempts`, `a2aResolveAttempt`, `setA2aOrgCaller`).
+
+### D2a — Lossless handoff of nested documents and u64 fields (r2, R1)
+
+The envelope is JSON, and `JSON.parse` turns every number into an IEEE
+double. Fields above 2⁵³ round silently — the reviewer's probe on Node v26.7.0
+turned `provider_node: 9007199254740993` into `…992`. In the paid surface those
+fields are `prepared.provider_node`, the `Peer(u64)` owner in journal rows,
+recovery `generation`s, attempt-row `provider_node`, and
+`quote.expires_at_ns`. A corrupted `provider_node` points the purchase or
+submit at the wrong node; a corrupted owner or generation resolves the wrong
+record or none.
+
+Two Rust-backed free functions are the only supported way to read those
+documents in JS:
+
+- `a2aDocument(json: string, pointer: string): string` — the sub-document at
+  an RFC 6901 JSON Pointer, re-serialized by `serde_json` (whose `Value` keeps
+  u64 exactly). `a2aDocument(env, '/prepared')`, `a2aDocument(env, '/proof')`,
+  `a2aDocument(rows, '/0/owner')`, `a2aDocument(rows, '/0/generation')`.
+  Rejects with `a2a:invalid_argument:` when the pointer names nothing.
+- `a2aU64(json: string, pointer: string): bigint` — a u64 leaf as `bigint`
+  (`provider_node`, `expires_at_ns`, a provider-journal `generation`), for
+  display or to pass to a `bigint` parameter.
+
+Every verb that takes a handle takes that string: `purchaseTask(preparedJson)`,
+`submitTask(preparedJson)`, `submitTaskPaid(preparedJson, proofJson)`,
+`a2aResolve(ownerJson, taskId, stateJson, generation?: bigint)`,
+`a2aResolveAttempt(taskId, outcomeJson, providerNode?: bigint,
+generationJson?: string)`. r1 left `providerNode` untyped; it is now `bigint`.
+Status strings and messages are safe to read with `JSON.parse`. The docs name
+exactly which fields are not, and every example uses the reader for those.
+
+Considered and rejected: changing the envelope to carry handles as
+pre-serialized strings (breaks the frozen Python schema the reviewer asked to
+keep); a lossless JS JSON library (a new runtime dependency for a problem
+Rust already solves, and every caller would have to remember to use it).
 
 ### D3 — Executor and preflight callbacks
 
@@ -178,8 +274,26 @@ inputs; "Landed" note under its WS-3):
   `null`/`undefined` admits; a string refuses with that reason verbatim; a
   throw or rejection **refuses** with the error text (fail-closed, matching
   `PyPreflight`, `a2a_paid.rs:313-365`). A preflight has its own bounded
-  deadline (proposed 30 s) that also refuses — a wedged event loop must not
-  hold a `Preparing` reservation open.
+  deadline that also refuses, because a wedged event loop must not hold a
+  `Preparing` reservation open.
+- **r2 (R3): the preflight budget is 5 s, not 30 s.** r1's 30 s equalled
+  `A2A_CALL_TIMEOUT` (`sdk/src/mesh_a2a.rs:185`). The caller's deadline starts
+  before dispatch (`:445-452`) and the provider's preflight starts later, so a
+  never-settling callback would surface as a **caller transport timeout**
+  before the refusal could arrive. Those are two different outcomes, and the
+  r1 test would have conflated them. 5 s covers TSFN dispatch plus Promise
+  settlement and leaves the reply ~25 s of headroom under the current
+  control-call budget. That is headroom, not a guarantee: a slow network can
+  still turn a refusal into a caller timeout. The docs present the two
+  separately. A received refusal is a definite "not admitted"; a transport
+  timeout is "unknown, retry the same verb". Once the budget expires the
+  callback's future is dropped, so a late `null` from JS has nowhere to land
+  and cannot revive the refused attempt.
+- **Preflight at submit.** The configured submit re-checks authority after
+  payment (parent plan S5). A preflight timeout there is a refusal *after*
+  money, so it lands as `Reconcile` with the `admission_revoked` schematic and
+  stays unresolved until an operator resolves it. It is never an unpaid
+  rejection and never a launch.
 
 ### D4 — Errors: stable prefixes + typed classes in `errors.ts`
 
@@ -206,6 +320,44 @@ store with no spend policy records payments nothing authorized). An options
 object would be the nicer API but is a breaking change to every existing
 caller; out of scope here, noted for the next gateway revision.
 
+### D6 — Stop, close and operator access follow the Rust ownership contract (r2, R2)
+
+- `A2aServeHandle.stop()` unregisters the five services and drops the
+  handle's `Mesh` and `ServeHandle`s (the Python `stop`,
+  `python/src/a2a.rs:370-380,410-414`). It does not drain launched work.
+- The provider keeps a `Weak` store reference for the operator verbs, as
+  Python does (`payment_provider.rs:389`). **Decision: operator access follows
+  store lifetime, not registration lifetime**, as in Python. While a
+  launched task still holds the store, `a2aUnresolved()` keeps answering, which
+  is when an operator most needs it. Once the last writer drops it, the verbs
+  refuse with the Python wording. The docs and the refusal text say "no live
+  journal", not "no live serve handle"; r1's "once no configured serve handle
+  is live" described only the idle case. A registration-liveness check
+  separate from the store was considered and rejected: it would hide unresolved
+  rows during exactly the window they are still being written.
+- A second `serveA2aConfigured` on the same path, after a `stop()`, keeps
+  getting `JournalOwnedElsewhereError` until the last writer exits. The docs
+  call this expected and give the remedy as "let running tasks finish (or
+  cancel them)", never "delete the `.owner` sidecar".
+
+### D7 — Paid A2A is a `@net-mesh/core` surface in this port (r2, R7)
+
+r1 said `PaymentProvider` / `CapabilityGateway` "are native re-exports" of the
+ergonomic SDK, so new methods would arrive with the typings. Half of that was
+wrong. `CapabilityGateway` is re-exported (`sdk-ts/src/consent.ts:27-33`), but
+`PaymentProvider` is exported nowhere in `sdk-ts/src`, and **both**
+constructors take a native `NetMesh` (`payment_provider.rs:365-375`,
+`capability_gateway.rs:528-540`). The `sdk-ts` `MeshNode` keeps its native
+handle private (`mesh.ts:443-449`), so it cannot supply one.
+
+Decision (the smaller option, which keeps scope fixed): paid A2A is documented as a
+`@net-mesh/core` surface. `NetMesh`, `PaymentProvider`, `CapabilityGateway`,
+`a2aDocument` and `a2aU64` come from `@net-mesh/core`; typed errors come from
+`@net-mesh/core/errors` via an explicit `classifyError(e)`. Native errors stay
+plain prefixed `Error`s until classified; exporting the classes changes
+nothing on its own. An ergonomic `sdk-ts` provider surface, with the handle
+adaptation it needs, is a named follow-up and out of scope.
+
 ---
 
 ## The slices
@@ -217,13 +369,23 @@ A depends on nothing; B–D depend on A (or its fallback); E on B–D; F last.
 - [ ] `net_payments::flow::a2a::json` (feature `mesh`) + the `a2a_journal`
   operator-JSON helpers in `net_sdk`, moved out of `python/src/a2a_paid.rs`
   with their doc comments.
-- [ ] `python/src/a2a_paid.rs` reduced to dict plumbing, the two callback
-  bridges, and error mapping over the shared functions.
+- [ ] **First, before anything moves (r2, R5):**
+  `bindings/python/tests/test_a2a_paid_config_compat.py`, written and green
+  against today's code, pinning the input behaviors the unedited suite does
+  not reach: an unused extra key holding a non-JSON value (`object()`) is
+  ignored; missing and `None` are equivalent for `pricing_terms` and
+  `description`; a non-dict service entry and a non-dict `bounds` are refused
+  with today's messages; a wrong-typed field (string for a u64, negative, float)
+  is refused with today's field-named message.
+- [ ] `python/src/a2a_paid.rs` reduced to dict plumbing (its catalog parser
+  stays here, unchanged), the two callback bridges, and error mapping over the
+  shared functions.
 - [ ] Rust unit tests on the shared module for each envelope status and each
   parser's refusal (these did not exist — the Python suite was the only
   witness of the shapes).
 
-**Proved by:** `tests/test_a2a_paid.py` green **unedited**;
+**Proved by:** `tests/test_a2a_paid.py` green **unedited** and
+`test_a2a_paid_config_compat.py` green unedited across the move;
 `cargo clippy -p net-payments --features mesh -- -D warnings` and
 `cargo doc -p net-payments --no-deps --all-features` clean (the `--all-features`
 requirement in AGENTS.md); `cargo doc -p net-python` with the hand-maintained
@@ -238,18 +400,21 @@ feature list clean.
   "no reactor running" lesson from the free port), principal
   `"session_peer" | "same_org" | "granted"`, preflight bridge (D3),
   `JournalOwnedElsewhereError` (D4). Refuses if the provider is closed.
+- [ ] Catalog fields as checked `bigint` (D2, r2 R4), each refusal naming
+  the service and field.
 - [ ] `A2aServeHandle` grows a `Registered::Configured` arm (the Python
   enum, `python/src/a2a.rs:363-430`) and a `services` getter; `stop()`
-  releases the journal owner.
+  retires the registration and drops the handle's references (D6). **r2
+  (R2):** r1 said it "releases the journal owner".
 - [ ] Operator verbs: `a2aUnresolved() => Promise<string>`,
   `a2aResolve(ownerJson, taskId, stateJson, generation?: bigint) =>
-  Promise<void>` over a `Weak` store reference, refusing with the Python
-  wording once no configured serve handle is live.
+  Promise<void>` over a `Weak` store reference, answering while any writer
+  holds the store and refusing once none does (D6).
 - [ ] `PaymentProvider.close()` stops a live configured serve.
 
 **Proved by:** the provider-side cases of WS-F's `a2a_paid.test.ts` (catalog
-refusals, journal ownership in-process and cross-process, stop releases the
-journal, operator queue) — runnable from this slice with a raw Rust-side
+refusals incl. the R4 numeric cases, journal ownership in-process and
+cross-process, the parked-executor ownership witness, operator queue) — runnable from this slice with a raw Rust-side
 caller, completed once WS-D lands; `cargo clippy -p net-node --all-targets`
 clean.
 
@@ -261,16 +426,21 @@ clean.
   from the proof, brief from the prepared document, no store;
   `PaymentRefusedError` on refusal.
 - [ ] `setA2aOrgCaller(orgClient: OrgClient | null)` — needs a crate-internal
-  `OrgClient::shared()` accessor over its `ArcSwapOption`; `mesh_over` in the
-  A2A verbs becomes the org-aware variant (Python's `mesh_over_as`,
-  `python/src/a2a.rs:122`). Applies to describe/submit/status/cancel.
+  `OrgClient::shared()` accessor over its `ArcSwapOption`. **r2 (R6):** the
+  raw verbs build a fresh SDK `Mesh` per call, so the installed caller must
+  live in a slot on `NetMesh` itself (Python's `a2a_org_caller` field,
+  `lib.rs:1384`), and every fresh wrapper reads it. `mesh_over` becomes the
+  org-aware variant (Python's `mesh_over_as`, `python/src/a2a.rs:122`).
+  Sharing the core node does not share the slot. Applies to
+  describe/submit/submitTaskPaid/status/cancel.
+- [ ] `a2aDocument` / `a2aU64` free functions (D2a).
 - [ ] Rewrite the `submitTask` doc comment that currently says paid A2A is out
   of scope for this binding.
 
 **Proved by:** `submitTaskPaid` refusal cases (unpaid → `PaymentRefusedError`
 with a parseable schematic; oversized brief → `a2a:invalid_argument:`) and a
-`describeA2a` round-trip against a WS-B provider; existing `a2a.test.ts`
-green unedited (free path unchanged).
+`describeA2a` round-trip against a WS-B provider; the D2a reader cases;
+existing `a2a.test.ts` green unedited (free path unchanged).
 
 ### WS-D — Caller flow on `CapabilityGateway`
 
@@ -281,10 +451,14 @@ green unedited (free path unchanged).
 - [ ] Ctor arg `a2aPurchasePath` (D5) with the two loud refusals Python has.
 - [ ] `prepareTask(targetNodeId, service, prompt, contextRefs?, tags?,
   taskId?)`, `purchaseTask(preparedJson)`, `submitTask(preparedJson)`,
-  `a2aAttempts()`, `a2aResolveAttempt(taskId, outcomeJson, providerNode?,
-  generationJson?)`, `setA2aOrgCaller(orgClient | null)` — all `async`,
-  resolving to the shared envelopes; a gateway built without a purchase store
-  rejects with the Python wording.
+  `a2aAttempts()`, `a2aResolveAttempt(taskId, outcomeJson, providerNode?:
+  bigint, generationJson?)`, `setA2aOrgCaller(orgClient | null)` — all
+  `async`, resolving to the shared envelopes; a gateway built without a
+  purchase store rejects with the Python wording. `targetNodeId` is `bigint`.
+- [ ] **r2 (R6):** the gateway's setter updates the org-caller slot of the
+  gateway's **own persistent** SDK `Mesh`, the one its `A2aCallerFlow`
+  composes over (Python: `self.state.mesh.set_a2a_org_caller`). It does not
+  touch the `NetMesh` slot of WS-C. Two slots, two setters, both witnessed.
 - [ ] `close()` drops the A2A flow with the rest of `Live`.
 
 **Proved by:** the caller-side cases of WS-F's suite (prepare moves no money,
@@ -298,13 +472,22 @@ the concrete flow `Arc`).
 - [ ] `index.d.ts` regenerates (gitignored); verify every new shape.
 - [ ] `errors.ts`: the two classes + prefixes (D4), wired into
   `classifyError`; `errors.test.ts` cases.
-- [ ] `sdk-ts`: forward `describeA2a` / `submitTaskPaid` / `setA2aOrgCaller`
-  on the `mesh.ts` wrapper beside `serveA2a`/`submitTask` (`mesh.ts:1058`);
-  re-export the error classes. `PaymentProvider` / `CapabilityGateway` are
-  native re-exports, so their new methods arrive with the typings.
+- [ ] ~~`sdk-ts`: forward `describeA2a` / `submitTaskPaid` / `setA2aOrgCaller`
+  …; `PaymentProvider` / `CapabilityGateway` are native re-exports, so their
+  new methods arrive with the typings.~~ **r2 (R7):** false for
+  `PaymentProvider`, and the ctors need a native `NetMesh` anyway. No `sdk-ts`
+  change in this port (D7); the paid surface is documented from
+  `@net-mesh/core`.
+- [ ] A consumer-compile case (the `test/consumer/` + `consumer_compile.test.ts`
+  precedent) that compiles **and runs** the exact documented imports against
+  the built package entry points: `NetMesh`, `PaymentProvider`,
+  `CapabilityGateway`, `a2aDocument`, `a2aU64` from `@net-mesh/core`, and
+  `classifyError`, `PaymentRefusedError`, `JournalOwnedElsewhereError` from
+  `@net-mesh/core/errors`. It asserts that a native rejection is a plain
+  prefixed `Error` until `classifyError` turns it into the class.
 
-**Proved by:** `errors.test.ts` classification cases; `npm run typecheck:tests`
-in `bindings/node` and the `sdk-ts` typecheck clean.
+**Proved by:** `errors.test.ts` classification cases; the consumer case above;
+`npm run typecheck:tests` in `bindings/node` clean.
 
 ### WS-F — Tests, docs, matrix
 
@@ -324,17 +507,63 @@ in `bindings/node` and the `sdk-ts` typecheck clean.
   resumes from the store, paid verbs refuse a store-less gateway, same id on
   two providers resolvable by naming the provider, two identities sharing one
   store see only their own, generation-scoped resolve + its unknown-incarnation
-  refusal. Plus Node-only: the preflight throw/timeout refuses (D3), a paid
+  refusal. Plus Node-only: the preflight throw refuses (D3), a paid
   task past `handlerTimeoutMs` ends `failed` and is not re-run.
+- [ ] **r2 additions** (each named for the finding it witnesses):
+  - **R1 lossless handoff:** provider and caller node ids above
+    `Number.MAX_SAFE_INTEGER`. If the harness cannot pin a node id, it searches
+    for a keypair whose derived id is (cheap). The test drives prepare →
+    `a2aDocument('/prepared')` → purchase → `a2aDocument('/proof')` → raw
+    `submitTaskPaid`, then the recovery path `a2aAttempts` →
+    `a2aU64('/0/provider_node')` / `a2aDocument('/0/generation')` →
+    `a2aResolveAttempt`, and the provider side `a2aUnresolved` →
+    `a2aDocument('/0/owner')` → `a2aResolve`. A negative control asserts that
+    `JSON.stringify(JSON.parse(prepared))` *does* change `provider_node` for
+    the same document, so the test cannot pass vacuously.
+  - **R2 ownership under work:** park a launched executor on a barrier;
+    `stop()` the handle and `close()` the provider; a second
+    `serveA2aConfigured` on the same journal (in-process and child process) is
+    still `JournalOwnedElsewhereError` and `a2aUnresolved()` still answers;
+    release the executor, await its terminal row; the reopen then succeeds.
+    The idle stop/reopen case stays as a separate test.
+  - **R3 preflight timing:** a never-settling preflight during **prepare**
+    yields a received refusal inside the caller's budget, with no quote, no
+    spend reservation and no launch. A never-settling preflight at **submit
+    after purchase** yields no launch and an unresolved `Reconcile` record
+    with the paid evidence intact on both sides. In both cases the callback
+    then resolves `null` late, and the refused attempt stays refused.
+  - **R4 catalog numerics:** `0n` where core accepts it; the largest value core
+    accepts per field; `u64::MAX` behaving exactly as in Rust/Python; `-1n`
+    and `2n**64n` refused naming the field; `1.5`, `NaN`, `Infinity` and a
+    plain `number` refused by type, never coerced. The `describeA2a` offer
+    hash for a fixed catalog equals the Python fixture's for the same input.
+  - **R6 live same-org principal** (`principal: "same_org"`), on the
+    generated scenario `org_live.test.ts` already mints
+    (`:120-205`, same-org setup `:273-310`). The raw `NetMesh` setter and the
+    gateway setter each drive a real prepare → purchase → submit, plus
+    `taskStatus`/`cancelTask`, and the preflight sees the admitted entity as
+    the owner. With no identity installed, and again after clearing it with
+    `null`, the call is denied before launch (run counter 0). Teardown stops
+    handles, closes gateway/provider/`OrgClient` and shuts the meshes down. The
+    cross-org `granted` principal stays explicitly qualified as covered only
+    by the SDK's `a2a_admission_identity`, unless this harness's cross-org
+    scenario extends to it cheaply.
 - [ ] **Cross-binding vector test:** drive one scripted lifecycle and assert
   the Node envelopes equal checked-in JSON fixtures that the Python suite
-  asserts too (`tests/cross_lang_a2a_paid/`, the `cross_lang_*` convention).
-  Under D1 this is a tripwire; under the fallback it is the only guard.
+  asserts too (`tests/cross_lang_a2a_paid/`, the `cross_lang_*` convention),
+  volatile fields (ids, timestamps) masked. **r2 (R1):** equality is of JSON
+  values read losslessly (via `a2aDocument`/`a2aU64` in Node), not of bytes,
+  and never via `JSON.parse`. The fixtures are captured from today's Python
+  output before WS-A starts. Under D1 this is a tripwire; under the fallback
+  it is the only guard.
 - [ ] Matrix flips to `✓` for Node/TS in all three sources (README table,
   `event-bus.yaml` with anchor `serveA2aConfigured`, skill `coverage.md`
   both tables); `web/src/content/docs/guides/agent-to-agent.md` "paid
   services" section gains the TS snippets; `.claude/skills/net-event-bus/a2a.md`
-  §"Paid A2A" gains the Node prepare/purchase/submit example; release note
+  §"Paid A2A" gains the Node prepare/purchase/submit example. Every example
+  imports from `@net-mesh/core` (D7) and reads handles with `a2aDocument`,
+  never `JSON.parse`/`JSON.stringify` (D2a); the paid-timeout and one-sided
+  cancellation caveats sit beside it (D3); release note
   under `net/crates/net/docs/releases/` mirrored via `npm run sync:releases`.
 - [ ] CI: no feature-list change (already `payments,a2a,org`); the new vitest
   file is auto-discovered. If WS-F adds `tests/cross_lang_a2a_paid/` fixtures
@@ -345,18 +574,23 @@ releases sync); the skill-snippet checker.
 
 ---
 
-### Decisions for the reviewer
+### Decisions (resolved at review, r2)
 
-1. **D1 (hoist) vs. hand-port.** Recommended: hoist. It is the only option
-   where the Python suite keeps guarding the shapes Node returns.
-2. **Preflight deadline value.** Proposed 30 s, not configurable in the first
-   cut; configurable later via `ServeA2aConfiguredOptions` if a consumer
-   needs it.
-3. **Default `handlerTimeoutMs` on the configured path.** Keep the free path's
-   1 hour (parity within Node) vs. default to `0` (parity with Python, where
-   cancellation is the only control). Recommended: keep 1 hour and document
-   it — a stranded paid task in `Running` forever is the worse failure.
-4. **Gateway options object.** Deferred (D5).
+1. **D1 — hoist.** Adopted: the shared projection, with Python-specific
+   extraction (incl. the catalog parser) kept at the edge (R5). No
+   hand-maintained second JSON implementation.
+2. **Preflight deadline.** Adopted: 5 s, below the 30 s control-call budget,
+   not configurable in the first cut; transport timeout documented separately
+   from a received refusal (R3).
+3. **Default `handlerTimeoutMs` on the configured path.** Adopted: keep 1 hour.
+   A paid timeout is documented as a terminal execution failure, never a
+   refund. One-sided JS cancellation stays explicit: a discarded Promise
+   result does not stop external effects. No core lifecycle change.
+4. **Gateway constructor.** Adopted: append-only for this port; no
+   options-object migration.
+5. **Operator access lifetime** (new, D6): follows store lifetime, as in
+   Python.
+6. **Package boundary** (new, D7): `@net-mesh/core` only for this port.
 
 ### Test matrix (target)
 
@@ -364,22 +598,30 @@ releases sync); the skill-snippet checker.
 |---|---|---|---|
 | shared envelopes + parsers | ✓ (new, WS-A) | via every case below | `test_a2a_paid.py` (unedited) |
 | configured serve, catalog refusals | — | ✓ | `test_a2a_paid.py` |
-| journal ownership (in-process + child process) | — | ✓ | `test_a2a_paid.py`, `a2a_admission_journal` |
+| journal ownership (in-process + child process), incl. parked-executor witness | — | ✓ | `test_a2a_paid.py`, `a2a_admission_journal` |
+| lossless handoff above 2⁵³ (D2a) | ✓ (pointer reader) | ✓ | — |
+| catalog numeric domain (R4) | — | ✓ | Python fixture (offer hash) |
+| Python input compatibility (R5) | — | — | `test_a2a_paid_config_compat.py` (new, pre-move) |
+| documented imports against built entry points (R7) | — | ✓ consumer case | — |
 | prepare → purchase → submit, once-only | — | ✓ (two-node) | `test_a2a_paid.py`, `a2a_paid_end_to_end` |
 | approval / reject / restart / resolve | — | ✓ | `test_a2a_paid.py` |
-| org-admitted principal | — | ✓ (if the org harness is reachable from vitest; else source-established, as in the parent plan) | `a2a_admission_identity` |
-| preflight + handler deadline | — | ✓ (Node-only) | — |
+| org-admitted principal, same-org (R6) | — | ✓ live, both setters | `a2a_admission_identity` |
+| org-admitted principal, cross-org `granted` | — | qualified (SDK witness only) unless cheap | `a2a_admission_identity` |
+| preflight timing at prepare and at submit (R3) + handler deadline | — | ✓ (Node-only) | — |
 | error classification | — | ✓ `errors.test.ts` | — |
 | JSON parity | — | ✓ fixtures | `cross_lang_a2a_paid/` |
 
 ### Effort + sequencing
 
-With D1: ~400 lines moved (not new) into the shared module, ~350 lines of new
-napi (`a2a_paid.rs` + gateway/provider/`NetMesh` methods), ~60 lines of
-`errors.ts`, one ~900-line vitest suite. Without D1: add ~500 napi lines.
+With D1: ~350 lines moved (not new) into the shared module (r2: the catalog
+parser no longer moves), ~400 lines of new napi (`a2a_paid.rs` +
+gateway/provider/`NetMesh` methods + the D2a reader + the catalog parser),
+~60 lines of `errors.ts`, one ~1,100-line vitest suite (r2 witnesses
+included), one small Python compatibility test.
 
-Commit sequence, each compiling and green on its own: WS-A (Python suite
-unedited) → WS-B → WS-C → WS-D → WS-E → WS-F. Run the node vitest suite once
+Commit sequence, each compiling and green on its own: capture the
+cross-binding fixtures and land `test_a2a_paid_config_compat.py` against
+today's code → WS-A (both Python suites unedited) → WS-B → WS-C → WS-D → WS-E → WS-F. Run the node vitest suite once
 after WS-D against a freshly built `.node` with the CI feature list
 (`ci.yml:3746`), then the full pre-push checklist once before review.
 
@@ -398,10 +640,22 @@ after WS-D against a freshly built `.node` with the CI feature list
   `LockFileEx` vs `flock(2)` legs; the parent plan witnessed only the former
   on its host). *Fallback:* the cross-process vitest case runs on the ubuntu
   CI node job, so the `flock` leg gets its first binding-level witness there.
-- **Org-admitted principal is hard to drive from vitest** (needs an org
-  authority harness). *Fallback:* witness it at the registration seam and
-  mark it source-established, exactly as the parent plan did; the SDK's
-  `a2a_admission_identity` test remains the live witness.
+- ~~**Org-admitted principal is hard to drive from vitest** … *Fallback:*
+  source-established.~~ **r2 (R6):** withdrawn. `org_live.test.ts` already
+  mints a scenario and drives protected calls, so the same-org path gets a live
+  witness. The remaining risk is that the scenario mint (`cargo run --example
+  gen_org_scenario`) is slow and its certs expire, so the suite mints per run
+  as `org_live.test.ts` does. *Fallback* for a flaky mint is that suite's
+  existing timeout budget, not a weaker witness.
+- **Someone reads stop() as "the journal is free".** (r2, R2) An operator
+  restarts a provider while a paid task runs and gets
+  `JournalOwnedElsewhereError`. *Fallback:* the error text and docs say why
+  and what to do (let tasks finish or cancel them); the binding never offers a
+  force-unlock.
+- **A caller uses `JSON.parse` on a handle anyway.** (r2, R1) *Fallback:*
+  every example and doc snippet uses the reader, each verb's doc comment
+  names its u64 fields, and the D2a negative-control test shows the failure
+  concretely.
 - **napi argument-count growth on the gateway constructor** (D5) becomes
   unreadable. *Fallback:* the options-object reshape is a named follow-up, not
   a blocker.
@@ -415,3 +669,6 @@ after WS-D against a freshly built `.node` with the CI feature list
   ownership — non-goals inherited from the parent plan §6.
 - Reshaping the `CapabilityGateway` / `PaymentProvider` constructors into
   options objects.
+- An ergonomic `sdk-ts` paid-A2A / `PaymentProvider` surface and the native
+  handle adaptation it needs (D7).
+- Force-unlocking or draining the journal on `stop()`/`close()` (D6).
