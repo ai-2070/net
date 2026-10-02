@@ -19,6 +19,22 @@ the native `NetMesh` either constructor requires. That is already true of the
 exported and unconstructible from an SDK mesh, a pre-existing defect this
 port would otherwise inherit. See D7 and WS-E.
 
+**r2.2 (2026-10-03): the Python SDK has the same gap, and r2.1 said
+otherwise.** r2.1 claimed Python's `net_sdk` "has no payments or A2A surface",
+repeating the parent plan's baseline, and that claim is stale. `net_sdk` today
+forwards `submit_task_paid` / `describe_a2a` on `MeshNode`
+(`sdk-py/src/net_sdk/mesh.py:592-604`) and re-exports `CapabilityGateway` /
+`AsyncCapabilityGateway` (`consent.py:51-55`). But the gateway's constructor
+extracts a native `net.NetMesh` (`bindings/python/src/capability_gateway.rs:1005-1008`),
+so passing a `net_sdk.MeshNode` is a `TypeError`. `PaymentProvider` is not in
+`net_sdk` at all, and there is no `set_a2a_org_caller` on the SDK mesh. Every
+paid example therefore imports the raw `net` wheel
+(`.claude/skills/net-event-bus/a2a.md:122`, `examples/a2a_paid.py:35`). It is
+the TS defect in a milder form: Python has a reachable escape hatch
+(`node._native`), but it is a private name with no stability promise, which is
+exactly what `mesh.py:739-745` says application code must not be pushed onto.
+The fix is WS-G.
+
 **Review ledger.**
 
 | # | Finding (r1) | Severity | Where repaired | Status |
@@ -410,17 +426,18 @@ from the binding.
   that retain the node, so `stop()`/`close()` (D6) must run before
   `MeshNode.shutdown()`, the same as for every other native handle the SDK
   hands out.
-- **Beyond Python parity, deliberately.** Python's ergonomic `net_sdk` has no
-  payments or A2A surface either (parent plan baseline). The TS SDK gets one
-  here because it already exports `CapabilityGateway` and so promises a
-  surface it cannot deliver; Python's SDK makes no such promise. Recorded so
-  the asymmetry is not read as drift.
+- ~~**Beyond Python parity, deliberately.** Python's ergonomic `net_sdk` has
+  no payments or A2A surface either …~~ **r2.2:** wrong; see the r2.2 note
+  under Status. Python's SDK makes the same promise and gets the same
+  adaptation in WS-G. It needs only the handle half, because Python already
+  has keyword arguments (no options mapping) and arbitrary-precision ints (no
+  D2a reader).
 
 ---
 
 ## The slices
 
-A depends on nothing; B–D depend on A (or its fallback); E on B–D; F last.
+A depends on nothing; B–D depend on A (or its fallback); E on B–D; F last. G (Python SDK, r2.2) depends only on A.
 
 ### WS-A — Hoist the shared projection (D1)
 
@@ -667,6 +684,59 @@ releases sync); the skill-snippet checker.
 
 ---
 
+### WS-G — Python SDK handle adaptation (r2.2)
+
+Independent of the Node slices; it may land any time after WS-A. Same rule
+as D7: **adapt handles and return native objects; implement nothing.**
+
+- [ ] `sdk-py/src/net_sdk/payments.py`, re-exported from `net_sdk`:
+  `create_payment_provider(mesh, state_path, **kwargs)`,
+  `create_capability_gateway(mesh, **kwargs)` and
+  `create_async_capability_gateway(mesh, **kwargs)`. Each resolves `mesh`
+  through the existing `_native_mesh` (`mesh.py:1153-1166`, which accepts
+  `MeshNode`, `AsyncMeshNode` or a raw `NetMesh` and raises a clear
+  `TypeError` otherwise) and passes `**kwargs` through untouched. Because
+  nothing is mapped, a keyword the native constructor gains later works with
+  no SDK edit, and the native constructor stays the single source of truth for
+  validation. Imports are guarded like `consent.py`, so a wheel built without
+  `payments` / `a2a` still imports `net_sdk`.
+- [ ] Re-export `PaymentProvider`, `PaymentRefused` and
+  `JournalOwnedElsewhere` from `net_sdk` (guarded), so a paid-A2A program
+  never imports `net`.
+- [ ] `MeshNode.set_a2a_org_caller(org)` / `AsyncMeshNode` twin, and a module
+  helper `set_a2a_org_caller(gateway, org)`. Both accept a
+  `net_sdk.org.OrgClient` (unwrapped via its `.raw`, `org/__init__.py:119-128`),
+  a native `OrgClient`, or `None`, and set the right slot: the `NetMesh` slot
+  for a mesh, the gateway's own slot for a gateway (D6's two-slot rule).
+- [ ] **No D2a analog, on purpose.** Python ints are arbitrary precision and
+  `json.loads` / `json.dumps` round-trip u64 exactly, so R1 is a JavaScript
+  defect. The Python docs keep the frozen pattern
+  (`json.dumps(env["prepared"])`). A regression case pins it (a
+  `provider_node` above 2⁵³ survives that round-trip).
+- [ ] Docs: `.claude/skills/net-event-bus/a2a.md` §"Paid A2A" and the
+  agent-to-agent guide show the `net_sdk` form first; the raw-`net` form
+  stays valid and is kept as the low-level variant.
+  `examples/a2a_paid.py` (CI-executed) is left on raw `net`, so it keeps
+  witnessing the native surface unchanged.
+
+**Proved by:** `sdk-py/tests/test_paid_a2a_sdk.py`, live against the built
+extension. Two `net_sdk.MeshNode`s →
+`create_payment_provider(...).serve_a2a_configured(...)` →
+`create_capability_gateway(..., a2a_purchase_path=...)` → prepare → purchase →
+submit, with the task running once. The `AsyncMeshNode` and raw-`NetMesh` arms
+of the adaptation are also exercised. An SDK `OrgClient` passed to both setters
+on the same-org scenario covers the R6 case from the SDK, and `None` clears and
+denies before launch. Teardown ends in `shutdown()` succeeding. Two negative
+controls: a `net_sdk.MeshNode` passed to the **native** `net.CapabilityGateway`
+still raises `TypeError` (native unchanged), and an unknown keyword to a
+factory raises the native constructor's own error. The test runs where the
+org facade witnesses already run, in the `python-tests` job after `pip
+install -e ../../sdk-py` (`ci.yml:4364-4390`), because that is the only job
+with both the built extension (`ci.yml:4152`, which already has
+`payments,a2a,org`) and the wrapper. The `sdk-py-tests` job installs the
+wrapper `--no-deps`, so it would skip the test. Add it to that step's witness
+roster so a silent skip fails the floor.
+
 ### Decisions (resolved at review, r2)
 
 1. **D1 — hoist.** Adopted: the shared projection, with Python-specific
@@ -687,6 +757,8 @@ releases sync); the skill-snippet checker.
    **r2.1:** both. Core stays native, and `@net-mesh/sdk` gains factory +
    handle-adaptation helpers that return native objects (no forwarding
    wrappers).
+7. **Python SDK** (r2.2, WS-G): same adaptation, handle half only. It needs no
+   options mapping and no lossless reader.
 
 ### Test matrix (target)
 
@@ -702,6 +774,7 @@ releases sync); the skill-snippet checker.
 | SDK factories + handle adaptation (r2.1), `MeshNode` and native arms, clean `shutdown()` | — | ✓ `sdk-ts/test/paid_a2a.test.ts` | — |
 | SDK `OrgClient` → both org slots (r2.1) | — | ✓ live same-org | R6 |
 | options ↔ native ctor coverage (r2.1) | — | ✓ type-level + per-option | — |
+| Python SDK factories + org setter (r2.2) | — | — | ✓ `sdk-py/tests/test_paid_a2a_sdk.py` (python-tests job) |
 | prepare → purchase → submit, once-only | — | ✓ (two-node) | `test_a2a_paid.py`, `a2a_paid_end_to_end` |
 | approval / reject / restart / resolve | — | ✓ | `test_a2a_paid.py` |
 | org-admitted principal, same-org (R6) | — | ✓ live, both setters | `a2a_admission_identity` |
@@ -718,7 +791,8 @@ gateway/provider/`NetMesh` methods + the D2a reader + the catalog parser),
 ~60 lines of `errors.ts`, one ~1,100-line vitest suite (r2 witnesses
 included), one small Python compatibility test. r2.1 adds ~200 lines of
 `sdk-ts` (`payments.ts`, two `MeshNode` forwards, the options mappings) and a
-~300-line `sdk-ts` live suite.
+~300-line `sdk-ts` live suite. r2.2 adds ~80 lines of `net_sdk`
+(`payments.py` + two setters) and a ~200-line live pytest.
 
 Commit sequence, each compiling and green on its own: capture the
 cross-binding fixtures and land `test_a2a_paid_config_compat.py` against
@@ -775,7 +849,7 @@ after WS-D against a freshly built `.node` with the CI feature list
 - Reshaping the `CapabilityGateway` / `PaymentProvider` constructors into
   options objects.
 - ~~An ergonomic `sdk-ts` paid-A2A / `PaymentProvider` surface (D7).~~
-  **r2.1:** now in scope (WS-E). Still out of scope: forwarding wrapper
-  classes over the native provider/gateway, and an ergonomic payments surface
-  for Python's `net_sdk`.
+  **r2.1:** now in scope (WS-E); the Python twin is in scope as of r2.2 (WS-G).
+  Still out of scope: forwarding wrapper classes over the native
+  provider/gateway in either SDK.
 - Force-unlocking or draining the journal on `stop()`/`close()` (D6).
