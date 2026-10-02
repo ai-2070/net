@@ -906,12 +906,68 @@ async fn emit_capability_denial(
     call_id: u64,
     from_node: u64,
 ) {
-    let resp = crate::adapter::net::cortex::RpcResponsePayload {
-        status: RpcStatus::CapabilityDenied,
-        headers: vec![],
-        body: Bytes::from(format!(
+    emit_terminal_refusal(
+        mesh,
+        service,
+        RpcStatus::CapabilityDenied,
+        Bytes::from(format!(
             "callee-side capability-auth gate denied nrpc:{service}"
         )),
+        claimed_origin,
+        call_id,
+        from_node,
+    )
+    .await;
+}
+
+/// Emit a terminal `NotFound` for a REQUEST naming a service this node
+/// does not serve, so the caller fails at once instead of waiting out
+/// its deadline.
+///
+/// Routed exactly like [`emit_capability_denial`]: unicast ONLY to the
+/// AEAD-authenticated session peer `from_node`, on the reply channel
+/// for that peer's PINNED origin when known, so a request carrying a
+/// forged origin cannot aim the refusal at a victim's reply channel.
+/// The mesh's dispatch path decides a frame is unserved (see
+/// `MeshNode::answer_unserved_rpc_requests`); this only answers.
+pub(crate) async fn emit_rpc_not_found(
+    mesh: &MeshNode,
+    service: &str,
+    claimed_origin: u64,
+    call_id: u64,
+    from_node: u64,
+) {
+    emit_terminal_refusal(
+        mesh,
+        service,
+        RpcStatus::NotFound,
+        Bytes::from(format!(
+            "no nRPC service {service:?} is served on this node"
+        )),
+        claimed_origin,
+        call_id,
+        from_node,
+    )
+    .await;
+}
+
+/// The shared body of [`emit_capability_denial`] and
+/// [`emit_rpc_not_found`]: a terminal response with `status` and
+/// `body`, sent before any handler ran, to the authenticated session
+/// peer only.
+async fn emit_terminal_refusal(
+    mesh: &MeshNode,
+    service: &str,
+    status: RpcStatus,
+    body: Bytes,
+    claimed_origin: u64,
+    call_id: u64,
+    from_node: u64,
+) {
+    let resp = crate::adapter::net::cortex::RpcResponsePayload {
+        status,
+        headers: vec![],
+        body,
     };
     let meta = EventMeta::new(
         crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
@@ -942,13 +998,14 @@ async fn emit_capability_denial(
     let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
     // `target_hint = Some(from_node)` + `DirectOnly` force a direct
     // unicast to the AEAD-authenticated session peer and NOTHING else:
-    // if that session is gone the denial is dropped, never reflected onto
-    // the (possibly forged) claimed origin's roster channel (NC2 / R2-7).
+    // if that session is gone the refusal is dropped, never reflected
+    // onto the (possibly forged) claimed origin's roster channel (NC2 /
+    // R2-7).
     let _ = publish_response_to_caller(
         mesh,
         reply_origin,
         call_id,
-        // A denial is emitted before any handler ran; it answers no
+        // A refusal is emitted before any handler ran; it answers no
         // reservation, so it carries no receiving incarnation.
         0,
         Some(from_node),
