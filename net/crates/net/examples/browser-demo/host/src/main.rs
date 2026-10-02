@@ -1224,7 +1224,7 @@ fn parse_args() -> Args {
     // A window no longer than the prober's period can hold no offer
     // at all, and the signalling row would fail for the window's
     // length rather than for anything it is about.
-    if args.check && args.seconds * 1000 <= PROBE_PERIOD_MS {
+    if args.check && args.seconds.saturating_mul(1000) <= PROBE_PERIOD_MS {
         eprintln!(
             "--seconds {} is too short for --check: the window must be longer than the              prober's {PROBE_PERIOD_MS} ms period",
             args.seconds

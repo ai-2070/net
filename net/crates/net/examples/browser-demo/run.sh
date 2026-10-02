@@ -7,7 +7,7 @@
 # Everything below is the documented build: the wasm leaf, the
 # `@net-mesh/browser` bundle, the demo's two npm dependencies
 # (three.js and playwright-core), and the host. Arguments are passed
-# through to the host, so `--check --seconds 10` works.
+# through to the host, so `--check --seconds 20` works (`--check` needs more than 10).
 set -eu
 
 demo=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

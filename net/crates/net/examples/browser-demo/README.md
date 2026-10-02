@@ -102,8 +102,9 @@ being read as evidence for.
 So tab C runs a third leaf whose entire job is public signalling. It
 is handed a **tag** and never an id, like every other page here: it
 discovers tab B by `demo.probe.target`, calls the public
-`connectPeer` on it every second, and **nothing in the demo ever
-answers it** — so that pair stays routed for its whole life, every
+`connectPeer` on it back to back (each unanswered attempt runs out
+its 10 s ICE deadline before the next offer goes out), and
+**nothing in the demo ever answers it** — so that pair stays routed for its whole life, every
 offer it signs transits the anchor as `0x0D02`, and
 `note_signal_forwarded` keeps climbing inside the very window the
 A↔B pair counter is asserted flat in.

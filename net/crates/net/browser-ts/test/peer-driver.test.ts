@@ -296,6 +296,7 @@ describe('one attempt per peer at a time (PeerAttempts)', () => {
   });
 
   it.each<[string, PeerConnectOutcome]>([
+    ['noAnnouncement', { type: 'noAnnouncement', peer: PEER, detail: 'x' }],
     ['handshakeFailed', { type: 'handshakeFailed', peer: PEER, dialog: D1, detail: 'no session' }],
     ['superseded with no successor', { type: 'superseded', peer: PEER, dialog: D1, liveDialog: null }],
   ])('offers after an answer that ended %s', async (_name, outcome) => {

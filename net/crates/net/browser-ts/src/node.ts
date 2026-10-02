@@ -865,7 +865,12 @@ export class BrowserNode {
    * node, a peer that answered `Reject`, a malformed peer id.
    */
   async connectPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
-    const peer = idArg(nodeIdHex, 'peer');
+    let peer: string;
+    try {
+      peer = idArg(nodeIdHex, 'peer');
+    } catch (error) {
+      throw fromWasmError(error);
+    }
     return this.attempts.connect(
       nodeIdHex,
       // Already direct and open: the pair it has. A new offer would
