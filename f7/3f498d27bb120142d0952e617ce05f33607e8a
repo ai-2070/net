@@ -1,0 +1,25 @@
+net/crates/net/browser-ts/test/lobby.test.ts
+  s_d8b00bedd146e9::t_61173e35cab94c 160-176
+net/crates/net/browser-ts/test/store/player.test.ts
+  s_d8b00bedd146e9::t_74fa4343dc8177 307-319
+net/crates/net/browser-ts/src/local.ts
+  s_d8b00bedd146e9::t_74fa4343dc8177 114-118,123
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_b43b5795fd6ac0 19-26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f73f498d27bb120142d0952e617ce05f33607e8a",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
