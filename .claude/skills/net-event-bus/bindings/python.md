@@ -18,7 +18,7 @@ called `net-sdk`; `pip install net-sdk` does not work.
 
 Underneath sits `net-mesh`, the PyO3 binding, which **imports as `net`**. A few
 surfaces live only there and `bindings/coverage.md` marks them `core-only` —
-`RedisStreamDedup`, the whole payments surface, compute/groups. `node.bus`
+`RedisStreamDedup`, and the whole payments surface (by design). `node.bus`
 exposes the native module as the escape hatch.
 
 ## Construction and lifecycle
@@ -48,8 +48,9 @@ with NetNode(shards=4, redis_url='redis://127.0.0.1:6379') as node:
 
 That is a **tagged EventBus topic** — one node, many logical streams over its
 own bus. It is not distributed pub/sub: for two nodes to exchange events by
-channel name, use the `net.NetMesh` channel methods (`core-only` in Python —
-`net_sdk.MeshNode` does not wrap them). See `concepts.md` § Channel.
+channel name, use the distributed channel methods on `net_sdk.MeshNode`
+(`register_channel`, `subscribe_channel`, `publish`). See `concepts.md` §
+Channel.
 
 **`NetNode(...)` is synchronous** — no `await`, no factory. Use the context
 manager for automatic shutdown.
@@ -134,8 +135,9 @@ failure. Full contract: `org.md`.
 
 ## Gaps
 
-`bindings/coverage.md` is authoritative. Compute/groups and Redis dedup are
-`core-only`; import them from `net`.
+`bindings/coverage.md` is authoritative. Redis dedup is the one `core-only`
+cell; import it from `net`. Compute and groups are `net_sdk.compute` and
+`net_sdk.groups`.
 
 ## Where to look when this page is not enough
 
