@@ -87,6 +87,125 @@ export const PEER_TICK_MS = 50;
  */
 export const PEER_OFFER_WAIT_MS = 5_000;
 
+/**
+ * The pair's live dialog when it is already direct and open, `undefined`
+ * (or `null`) otherwise: the healthy-pair reading a surface's
+ * `connectPeer` must not offer over.
+ */
+export type HealthyDialog = () => Promise<string | null | undefined> | string | null | undefined;
+
+/**
+ * Whether an answer's outcome settles the pair for a `connectPeer` that
+ * waited on it, rather than calling for an offer of its own.
+ *
+ * - `direct`: the pair has its link.
+ * - `iceTimeout`, `udpBlocked`: this network could not go direct just
+ *   now, and the routed session the answer ran over is still in place.
+ *   An offer straight after would almost surely end the same way, a whole
+ *   ICE deadline later, so the caller gets the answer's verdict instead.
+ * - `superseded` naming a successor: a newer attempt is live, and an
+ *   offer would cancel it.
+ *
+ * Anything else (`handshakeFailed`, `noAnnouncement`, a `superseded`
+ * with no successor) says nothing about the pair, so the waiter offers.
+ */
+function answerSettles(outcome: PeerConnectOutcome): boolean {
+  switch (outcome.type) {
+    case 'direct':
+    case 'iceTimeout':
+    case 'udpBlocked':
+      return true;
+    case 'superseded':
+      return outcome.liveDialog !== null;
+    default:
+      return false;
+  }
+}
+
+/**
+ * One attempt per peer at a time, per surface.
+ *
+ * **Every offer replaces the pair's link.** The leaf retires whatever
+ * attempt is live for the peer and replaces its DataChannel, so a
+ * second `connectPeer` while the first is still under way cancels it,
+ * and both callers end on the relay or in `iceTimeout`. Nothing about
+ * that is exotic: `joinLobby` reaches the host and then the store it
+ * joins reaches it again before its first stream, and netcode beside a
+ * store does the same. The healthy-direct check in
+ * `BrowserNode.connectPeer` covers a pair that has already arrived; this
+ * covers one that is still arriving.
+ *
+ * So, on one surface:
+ *
+ * - a `connectPeer` while another for the same peer is in flight is
+ *   answered by that one's outcome, not by a second offer;
+ * - a `connectPeer` while an `acceptPeer` for the peer is in flight
+ *   waits for it (offering over it would cancel the attempt it is
+ *   answering), and takes its outcome when that settles the pair
+ *   ({@link answerSettles}): it offers only after an inconclusive one;
+ * - concurrent `acceptPeer`s share one answer.
+ *
+ * Settled attempts are forgotten: the next call starts fresh. Another
+ * tab's node is outside this gate, as it is outside this surface.
+ */
+export class PeerAttempts {
+  readonly #connecting = new Map<string, Promise<PeerConnectOutcome>>();
+  readonly #accepting = new Map<string, Promise<PeerConnectOutcome>>();
+
+  /**
+   * Run `drive` as this peer's offer, unless one is already under way,
+   * the pair is already direct, or an answer under way settles it.
+   *
+   * `healthy` is read HERE, inside the gate and just before the offer,
+   * never by the caller ahead of it: on a proxied surface the reading is
+   * a round trip, and an `acceptPeer` could take the pair direct and
+   * leave the gate between a caller's early reading and its offer, which
+   * would then replace the healthy link.
+   */
+  connect(
+    peer: string,
+    healthy: HealthyDialog,
+    drive: () => Promise<PeerConnectOutcome>,
+  ): Promise<PeerConnectOutcome> {
+    const key = peer.toLowerCase();
+    const joining = this.#connecting.get(key);
+    if (joining !== undefined) return joining;
+    const answering = this.#accepting.get(key);
+    const started = (async (): Promise<PeerConnectOutcome> => {
+      if (answering !== undefined) {
+        const answered = await answering.catch(() => null);
+        if (answered !== null && answerSettles(answered)) return answered;
+      }
+      const dialog = await healthy();
+      if (dialog !== undefined && dialog !== null) return { type: 'direct', peer, dialog };
+      return drive();
+    })();
+    return PeerAttempts.#track(this.#connecting, key, started);
+  }
+
+  /** Run `drive` as this peer's answer, unless one is already under way. */
+  accept(peer: string, drive: () => Promise<PeerConnectOutcome>): Promise<PeerConnectOutcome> {
+    const key = peer.toLowerCase();
+    const joining = this.#accepting.get(key);
+    if (joining !== undefined) return joining;
+    return PeerAttempts.#track(this.#accepting, key, drive());
+  }
+
+  static #track(
+    map: Map<string, Promise<PeerConnectOutcome>>,
+    key: string,
+    started: Promise<PeerConnectOutcome>,
+  ): Promise<PeerConnectOutcome> {
+    map.set(key, started);
+    // Forget it once settled, and only if no newer one took its place.
+    const forget = () => {
+      if (map.get(key) === started) map.delete(key);
+    };
+    started.then(forget, forget);
+    return started;
+  }
+}
+
 /** Offer, drive to an open channel, then handshake (§9 steps 3-4). */
 export async function connectPeer(
   peer: string,

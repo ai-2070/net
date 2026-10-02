@@ -102,8 +102,9 @@ being read as evidence for.
 So tab C runs a third leaf whose entire job is public signalling. It
 is handed a **tag** and never an id, like every other page here: it
 discovers tab B by `demo.probe.target`, calls the public
-`connectPeer` on it every second, and **nothing in the demo ever
-answers it** — so that pair stays routed for its whole life, every
+`connectPeer` on it back to back (each unanswered attempt runs out
+its 10 s ICE deadline before the next offer goes out), and
+**nothing in the demo ever answers it** — so that pair stays routed for its whole life, every
 offer it signs transits the anchor as `0x0D02`, and
 `note_signal_forwarded` keeps climbing inside the very window the
 A↔B pair counter is asserted flat in.
@@ -121,7 +122,7 @@ watch.
 ## Is it actually true?
 
 ```sh
-net/crates/net/examples/browser-demo/run.sh --check --seconds 6
+net/crates/net/examples/browser-demo/run.sh --check --seconds 14
 ```
 
 Headless Chromium, driven by Playwright, three isolated browsing
@@ -142,9 +143,11 @@ numbers; any failure exits non-zero. The roster is a `const` in
 `host/src/main.rs`, so a dropped row is a missing line rather than a
 smaller green count.
 
-`--seconds N` lengthens the flat window; at 60 Hz the default 6 s puts
-about 360 frames per direction across the direct path while the
-counter must not move once.
+`--seconds N` sets the flat window; at 60 Hz the default 14 s puts
+about 840 frames per direction across the direct path while the
+counter must not move once. It must stay longer than the prober's
+10 s period (one unanswered attempt runs out its ICE deadline before
+the next offer), or the window can miss every offer.
 
 ## The public API, and what it could not do
 

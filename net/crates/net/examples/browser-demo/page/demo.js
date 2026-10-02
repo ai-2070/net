@@ -38,7 +38,7 @@
 //
 // So a THIRD context loads this same page in the `prober` role. It
 // discovers tab B by a tag, calls the public `connectPeer` on it
-// every `probeMs`, and is never answered — so that pair stays
+// back to back, and is never answered — so that pair stays
 // RELAYED, every offer it signs transits the anchor as `0x0D02`, and
 // the anchor's signalling counter keeps moving INSIDE the window the
 // pair counter is flat in. Two counters, two different true things,
@@ -464,8 +464,8 @@ async function discoverPeer(tag) {
  * sees it.
  *
  * So this tab keeps one pair RELAYED on purpose. It discovers tab B
- * by `probeTargetTag` and calls the public `connectPeer` on it every
- * `probeMs`; nothing in this demo ever arms `acceptPeer` for this
+ * by `probeTargetTag` and calls the public `connectPeer` on it back
+ * to back; nothing in this demo ever arms `acceptPeer` for this
  * tab, so the attempt is never answered, the pair never goes direct,
  * and every offer keeps transiting the anchor as signalling. It
  * announces its own tag and never the pair's, and it never opens a
@@ -482,7 +482,7 @@ async function runProber() {
   await waitForProbeWindow();
 
   state.phase = 'probing';
-  probeForever(targetHex);
+  void probeForever(targetHex);
 }
 
 /**
@@ -513,42 +513,63 @@ async function waitForProbeWindow() {
 }
 
 /**
- * One FRESH public attempt every `probeMs`, outcomes recorded.
+ * One FRESH public attempt after another, outcomes recorded.
  *
- * Fresh, not repaired: `peer_offer` retires its predecessor — one
- * live attempt per peer — so each call signs a new offer envelope and
- * hands it to the relayed session, which is what puts `0x0D02` on the
- * anchor's forwarding path at a known cadence. The superseded
- * attempt's `connectPeer` then resolves as `superseded`, and that is
- * the EXPECTED outcome here rather than a failure: nobody is ever
- * going to answer this tab.
+ * Back to back, not on a timer: a `connectPeer` while one for the
+ * same peer is under way joins it rather than offering again (an
+ * offer would cancel the attempt in flight), so a timer would only
+ * pile calls onto one attempt. Nobody is ever going to answer this
+ * tab, so each attempt runs out its ICE deadline (`iceTimeout`, the
+ * EXPECTED outcome here rather than a failure), and the next call
+ * signs a new offer envelope and hands it to the relayed session:
+ * that is what puts `0x0D02` on the anchor's forwarding path, once
+ * per deadline.
+ *
+ * An offer is counted when its dialog first shows up in
+ * `peerAttempt`, read every `probeMs` while the attempt runs, so it
+ * lands in the window it was signed in rather than the one its
+ * deadline ends in.
  */
-function probeForever(targetHex) {
-  const once = async () => {
+async function probeForever(targetHex) {
+  let counted = null;
+  const note = (dialog) => {
+    if (!dialog || dialog === counted) return;
+    counted = dialog;
+    state.probeDialogs += 1;
+  };
+  for (;;) {
     state.probeOffers += 1;
-    try {
-      const outcome = await node.connectPeer(targetHex);
-      state.probeLastOutcome = outcome.type;
+    let settled = false;
+    const run = node.connectPeer(targetHex);
+    run.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    while (!settled) {
+      await sleep(cfg.probeMs);
       // A dialog id means `peer_offer` got all the way through: the
       // envelope was signed and handed to the relayed session, which
-      // is the transit the anchor counts. `noAnnouncement` carries
-      // none, because nothing was sent.
-      if (outcome.dialog) state.probeDialogs += 1;
+      // is the transit the anchor counts.
+      await node.peerAttempt(targetHex).then((attempt) => note(attempt.dialog), () => {});
+    }
+    try {
+      const outcome = await run;
+      state.probeLastOutcome = outcome.type;
+      // `noAnnouncement` carries none, because nothing was sent.
+      note(outcome.dialog);
       if (outcome.type === 'noAnnouncement') {
         state.probeFailed += 1;
         state.probeLastError = outcome.detail;
         log(`probe target's announcement is gone: ${outcome.detail}`);
       }
     } catch (error) {
-      // Never thrown out of the timer: a probe that failed is a
+      // Never thrown out of the loop: a probe that failed is a
       // number the host prints, not a dead tab.
       state.probeFailed += 1;
       state.probeLastError = error && error.message ? error.message : String(error);
       log(`probe offer failed: ${state.probeLastError}`);
     }
-  };
-  void once();
-  setInterval(() => void once(), cfg.probeMs);
+  }
 }
 
 /**

@@ -47,6 +47,7 @@ import {
   acceptPeer as driveAccept,
   connectPeer as driveConnect,
   handshakePeer as driveHandshake,
+  PeerAttempts,
   type PeerPrimitives,
 } from './peer-driver.js';
 import {
@@ -342,6 +343,8 @@ export class BrowserNode {
    * handle.
    */
   private readonly streams = new Set<LeafStream>();
+  /** One attempt per peer at a time: see {@link PeerAttempts}. */
+  private readonly attempts = new PeerAttempts();
   /**
    * The live org handles (plan §4.5), so {@link BrowserNode.close}
    * can retire ownership: pending calls fail typed and each dropped
@@ -848,21 +851,39 @@ export class BrowserNode {
    * and close it under the other side. So a library may call it "to be
    * sure" before opening a stream.
    *
+   * **And on a pair that is still connecting.** A call while another
+   * `connectPeer` for the same peer is under way resolves with that
+   * attempt's outcome instead of offering again (a new offer would cancel
+   * it), and a call while an {@link acceptPeer} for the peer is under way
+   * waits for it and takes its outcome when that settles the pair
+   * (`direct`, `iceTimeout`, `udpBlocked`, or `superseded` by a newer
+   * attempt), offering only after an inconclusive one. See
+   * {@link PeerAttempts}.
+   *
    * Returns a {@link PeerConnectOutcome}. It **rejects** only for
    * something that is not a disposition of the attempt — a closed
    * node, a peer that answered `Reject`, a malformed peer id.
    */
   async connectPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
-    // Already direct and open: the pair it has. A new offer would
-    // replace the working link and close it under the other side.
-    let settled: string | undefined;
+    let peer: string;
     try {
-      settled = this.inner.peer_direct_dialog(idArg(nodeIdHex, 'peer'));
+      peer = idArg(nodeIdHex, 'peer');
     } catch (error) {
       throw fromWasmError(error);
     }
-    if (settled !== undefined && settled !== null) return { type: 'direct', peer: nodeIdHex, dialog: settled };
-    return driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus);
+    return this.attempts.connect(
+      nodeIdHex,
+      // Already direct and open: the pair it has. A new offer would
+      // replace the working link and close it under the other side.
+      () => {
+        try {
+          return this.inner.peer_direct_dialog(peer);
+        } catch (error) {
+          throw fromWasmError(error);
+        }
+      },
+      () => driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
+    );
   }
 
   /**
@@ -923,7 +944,9 @@ export class BrowserNode {
    * {@link PeerConnectOutcome}, same meanings.
    */
   async acceptPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
-    return driveAccept(nodeIdHex, this.peerPrimitives(), parseAttemptStatus);
+    return this.attempts.accept(nodeIdHex, () =>
+      driveAccept(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
+    );
   }
 
   /**

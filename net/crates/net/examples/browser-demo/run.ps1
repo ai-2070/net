@@ -11,7 +11,7 @@
 [CmdletBinding()]
 param(
   [switch]$Check,
-  [int]$Seconds = 6,
+  [int]$Seconds = 14,
   [int]$Hz = 60,
   [string]$BrowserPath
 )

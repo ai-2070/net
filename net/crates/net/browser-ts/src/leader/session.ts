@@ -69,6 +69,7 @@ import {
 import {
   acceptPeer as driveAccept,
   connectPeer as driveConnect,
+  PeerAttempts,
   type PeerPrimitives,
 } from '../peer-driver.js';
 import { LeafStream, type OpenStreamOptions } from '../stream.js';
@@ -143,6 +144,8 @@ export class MeshSession {
    * iteration a page is already written to handle.
    */
   private readonly streams = new Set<LeafStream>();
+  /** One attempt per peer at a time: see {@link PeerAttempts}. */
+  private readonly attempts = new PeerAttempts();
   /**
    * The generation the streams in that set were opened under.
    *
@@ -354,18 +357,29 @@ export class MeshSession {
    * nothing is offered — a second offer would replace the working link
    * and close it under the peer. A leader too old to answer that reading
    * is asked for an offer, as before.
+   *
+   * **And on a pair still connecting**, as `BrowserNode.connectPeer` is:
+   * a call while this session's own `connectPeer` or `acceptPeer` for the
+   * peer is under way is answered by it rather than by a second offer.
+   * The healthy-pair reading runs inside that gate, just before any
+   * offer: it is a proxy round trip here, and read ahead of the gate it
+   * could be stale by the time the offer went out. See
+   * {@link PeerAttempts}.
    */
   async connectPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
-    let settled: string | undefined;
-    try {
-      settled = (await this.inner.peer_direct_dialog(nodeIdHex)) ?? undefined;
-    } catch {
-      // A closed session is refused by the offer below, typed; an older
-      // leader simply has no such reading.
-      settled = undefined;
-    }
-    if (settled !== undefined) return { type: 'direct', peer: nodeIdHex, dialog: settled };
-    return driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus);
+    return this.attempts.connect(
+      nodeIdHex,
+      async () => {
+        try {
+          return (await this.inner.peer_direct_dialog(nodeIdHex)) ?? undefined;
+        } catch {
+          // A closed session is refused by the offer below, typed; an
+          // older leader simply has no such reading.
+          return undefined;
+        }
+      },
+      () => driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
+    );
   }
 
   /**
@@ -373,7 +387,9 @@ export class MeshSession {
    * counterpart, on whichever tab holds the lock.
    */
   async acceptPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
-    return driveAccept(nodeIdHex, this.peerPrimitives(), parseAttemptStatus);
+    return this.attempts.accept(nodeIdHex, () =>
+      driveAccept(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
+    );
   }
 
   /**

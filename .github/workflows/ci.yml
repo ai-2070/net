@@ -7721,7 +7721,7 @@ jobs:
         run: |
           set -uo pipefail
           net/crates/net/examples/browser-demo/host/target/release/net-browser-demo \
-            --check --seconds 6 2>&1 | tee "$RUNNER_TEMP/demo.log"
+            --check --seconds 14 2>&1 | tee "$RUNNER_TEMP/demo.log"
           exit "${PIPESTATUS[0]}"
 
       # Same discipline as the browser matrix: the roster is checked
