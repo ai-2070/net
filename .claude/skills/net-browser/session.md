@@ -132,7 +132,11 @@ Rules that bite:
 - **`connectPeer` on an already-direct, open pair is a no-op** that resolves
   `direct`, on `connect()`'s node and on a `MeshSession` alike, so calling it
   "to be sure" is safe. (A follower whose leader is from an older release
-  still re-offers.)
+  still re-offers.) Nor does it cancel an attempt still under way: a second
+  `connectPeer` for a connecting peer resolves with that attempt's outcome, and
+  one during an `acceptPeer` waits for it (offering only if it did not end
+  `direct`). Every offer replaces the pair's link, so this is what lets a
+  lobby, a store and netcode each reach the same host.
 - **ICE may fail.** `outcome` is a reading, not a promise of connectivity; see
   `errors.md` for what an ICE failure does and does not prove, and
   `refineIceFailure` (a `BrowserNode` method) for turning a raw failure into a

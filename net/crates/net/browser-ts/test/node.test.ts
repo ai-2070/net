@@ -787,6 +787,40 @@ describe('peer attempts', () => {
     expect(inner.peerHandshakes).toEqual([]);
   });
 
+  // Every offer replaces the pair's link, so a second `connectPeer`
+  // while the first is still under way would cancel it. `joinLobby`
+  // reaches the host and the store it joins reaches it again, netcode
+  // beside a store does the same: one attempt, both callers answered.
+  it('answers a concurrent connectPeer with the attempt already under way', async () => {
+    const inner = new FakeNode({ peerOfferDialog: OLD });
+    const node = await connected(inner);
+    const [first, second] = await Promise.all([node.connectPeer(PEER), node.connectPeer(PEER)]);
+    expect(first).toEqual({ type: 'direct', peer: PEER, dialog: OLD });
+    expect(second).toBe(first);
+    expect(inner.peerOffers).toEqual([PEER]);
+    expect(inner.peerHandshakes).toEqual([PEER]);
+  });
+
+  // An answer in flight is an attempt too: offering over it cancels it.
+  it('waits for an answer under way and does not offer when it ends direct', async () => {
+    const inner = new FakeNode({ peerOfferDialog: OLD });
+    const node = await connected(inner);
+    const answering = node.acceptPeer(PEER);
+    await expect(node.connectPeer(PEER)).resolves.toEqual({ type: 'direct', peer: PEER, dialog: OLD });
+    await answering;
+    expect(inner.peerAccepts).toEqual([PEER]);
+    expect(inner.peerOffers).toEqual([]);
+  });
+
+  // Settled attempts are not remembered: a later call is a fresh one.
+  it('starts a fresh attempt once the earlier one has settled', async () => {
+    const inner = new FakeNode({ peerOfferDialog: OLD });
+    const node = await connected(inner);
+    await node.connectPeer(PEER);
+    await node.connectPeer(PEER);
+    expect(inner.peerOffers).toEqual([PEER, PEER]);
+  });
+
   it('reports the dialog it handshook when nothing replaced it', async () => {
     const inner = new FakeNode({ peerOfferDialog: OLD });
     const node = await connected(inner);

@@ -14,6 +14,29 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
+## Unreleased (0.39)
+
+- **`connectPeer` no longer cancels an attempt that is still under
+  way.** Every offer replaces the pair's link, so a second
+  `connectPeer` while the first was connecting cancelled it, and both
+  callers ended on the relay or in `iceTimeout`. That happened without
+  any page doing anything unusual: `joinLobby` reaches the host, then
+  the store it joins reaches it again before its first stream, and
+  netcode beside a store does the same. Now, per node (`BrowserNode`
+  and `MeshSession` alike):
+  - a call while another `connectPeer` for the same peer is in flight
+    resolves with that attempt's outcome, without offering again;
+  - a call while an `acceptPeer` for the peer is in flight waits for it,
+    and offers only if that answer did not end `direct`;
+  - concurrent `acceptPeer` calls share one answer.
+
+  This completes the healthy-pair rule from 0.37.0 (a pair already
+  direct is never re-offered): a page or library may call `connectPeer`
+  "to be sure" at any point, without knocking out the link it is asking
+  about. Settled attempts are not remembered, so a later call after a
+  failure is a fresh attempt. Another tab's node is outside the rule, as
+  it is outside the surface.
+
 ## 0.38.2 — dual-stack anchors
 
 An anchor can now serve IPv4 and IPv6 players at once

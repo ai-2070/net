@@ -22,8 +22,10 @@ import {
   driveAttempt,
   connectPeer,
   handshakePeer,
+  PeerAttempts,
   type PeerPrimitives,
 } from '../src/peer-driver.js';
+import type { PeerConnectOutcome } from '../src/node.js';
 import { parseAttemptStatus } from '../src/node.js';
 
 const PEER = 'a1b2c3d4e5f60718';
@@ -245,5 +247,81 @@ describe('proxy traffic per attempt, measured not promised', () => {
     // So an accept costs 1..N accept steps plus the poll steps, and N
     // is bounded by PEER_OFFER_WAIT_MS rather than by a count.
     expect(acceptOffer).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('one attempt per peer at a time (PeerAttempts)', () => {
+  const direct: PeerConnectOutcome = { type: 'direct', peer: PEER, dialog: D1 };
+  const timedOut: PeerConnectOutcome = { type: 'iceTimeout', peer: PEER, dialog: D1 };
+
+  /** A drive that settles when told to. */
+  function parked(outcome: PeerConnectOutcome) {
+    const settle = Promise.withResolvers<PeerConnectOutcome>();
+    const drive = vi.fn(() => settle.promise);
+    return { drive, settle: () => settle.resolve(outcome) };
+  }
+
+  it('answers a connect in flight with its own outcome, never a second drive', async () => {
+    const attempts = new PeerAttempts();
+    const first = parked(direct);
+    const second = vi.fn(async () => direct);
+    const a = attempts.connect(PEER, first.drive);
+    const b = attempts.connect(PEER.toUpperCase(), second);
+    first.settle();
+    expect(await a).toBe(direct);
+    expect(await b).toBe(direct);
+    expect(first.drive).toHaveBeenCalledTimes(1);
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  it('lets an answer in flight finish, and offers only when it did not end direct', async () => {
+    const attempts = new PeerAttempts();
+
+    const answered = parked(direct);
+    void attempts.accept(PEER, answered.drive);
+    const offer = vi.fn(async () => direct);
+    const connecting = attempts.connect(PEER, offer);
+    answered.settle();
+    expect(await connecting).toBe(direct);
+    expect(offer).not.toHaveBeenCalled();
+
+    const failed = parked(timedOut);
+    void attempts.accept(PEER, failed.drive);
+    const retry = vi.fn(async () => direct);
+    const reconnecting = attempts.connect(PEER, retry);
+    failed.settle();
+    expect(await reconnecting).toBe(direct);
+    expect(retry).toHaveBeenCalledTimes(1);
+  });
+
+  it('shares one answer between concurrent accepts', async () => {
+    const attempts = new PeerAttempts();
+    const first = parked(direct);
+    const second = vi.fn(async () => direct);
+    const a = attempts.accept(PEER, first.drive);
+    const b = attempts.accept(PEER, second);
+    first.settle();
+    expect(await b).toBe(await a);
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  it('forgets a settled attempt, including one that rejected', async () => {
+    const attempts = new PeerAttempts();
+    await expect(attempts.connect(PEER, async () => Promise.reject(new Error('closed')))).rejects.toThrow('closed');
+    const fresh = vi.fn(async () => direct);
+    await expect(attempts.connect(PEER, fresh)).resolves.toBe(direct);
+    expect(fresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps peers apart', async () => {
+    const attempts = new PeerAttempts();
+    const other = 'ffffffffffffffff';
+    const first = parked(direct);
+    const second = vi.fn(async (): Promise<PeerConnectOutcome> => ({ type: 'direct', peer: other, dialog: D2 }));
+    const a = attempts.connect(PEER, first.drive);
+    await attempts.connect(other, second);
+    first.settle();
+    await a;
+    expect(second).toHaveBeenCalledTimes(1);
   });
 });

@@ -73,6 +73,14 @@ opening a stream is safe. A second offer would replace the working link and
 close it under the peer. (A follower whose leader runs an older release still
 re-offers.)
 
+**Nor does it cancel an attempt still under way.** A `connectPeer` while another
+for the same peer is connecting resolves with that attempt's outcome, and one
+while an `acceptPeer` for the peer is answering waits for it, offering only if
+the answer did not end `direct`. Concurrent `acceptPeer` calls share one answer.
+So a lobby, a store and netcode can each call `connectPeer` for the same host
+without knocking out each other's attempt. This holds per node: another tab's
+node is outside it.
+
 ## A player that comes back
 
 A game's page usually does not hold a credential of its own. It asks a game
