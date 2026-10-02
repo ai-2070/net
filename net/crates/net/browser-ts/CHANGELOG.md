@@ -16,6 +16,14 @@ the README on why it is a sibling package rather than a sub-path.
 
 ## 0.39.0 — connectPeer waits for an attempt under way
 
+- **`createLocalMesh` reports a frame's peer as exact decimal**, as the
+  real node's `stream_data` does; it used to hand out the sender's hex
+  id. A hex id with no letters in it (about one random id in 1,800)
+  then read as a different node's decimal, and a store hosted on the
+  local mesh answered that joiner at an id that was not on the mesh. A
+  test that compared `peerNode` with `nodeIdHex()` compares it with the
+  decimal now.
+
 - **`connectPeer` no longer cancels an attempt that is still under
   way.** Every offer replaces the pair's link, so a second
   `connectPeer` while the first was connecting cancelled it, and both

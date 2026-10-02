@@ -157,6 +157,23 @@ describe('lobbies', () => {
     await world.ready();
   });
 
+  // A random id is all digits about once in 1,800 draws, and that is
+  // the id a decimal reading turns into a DIFFERENT node: the host's
+  // reply to this joiner went to 001586cedd144df4, which is not on the
+  // mesh (CI, release 0.39). Pinned with that id so it is not luck.
+  it('joins from a node whose hex id has no letters in it', async () => {
+    const mesh = createLocalMesh();
+    const lobby = await lobbyOn(mesh);
+    await settle();
+    const world = await joinLobby({
+      node: mesh.node('6059197541404148'),
+      definition: room,
+      game: 'lobby-test',
+      code: lobby.code,
+    });
+    await world.ready();
+  });
+
   it('refuses a code two nodes claim, rather than guessing which host is real', async () => {
     const mesh = createLocalMesh();
     const lobby = await lobbyOn(mesh);
