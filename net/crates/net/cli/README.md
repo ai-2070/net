@@ -162,7 +162,7 @@ script has to do differently. Temporary-supervisor scripts must now add
 | `org`         | Offline org root tools; org links (`invite` / `approve` / `join`), `remove`, `leave`, `members`. |
 | `node`        | `status` of this profile's node; ownership provisioning (`adopt`).             |
 | `subnet`      | Offline authority issuance; subnet links (`invite` / `join`), `remove`, `leave`, `members`; temporary topology reads. |
-| `gateway`     | Temporary-context reads; `export` refuses without a live gateway. |
+| `gateway`     | Temporary-context reads; `export` validates its arguments, then refuses: not supported yet. |
 | `channel`     | Offline `issue-grant`; standalone links (`invite` / `join`); `serve`, `status`, `publish`, `leave` on the running node; registry reads (`visibility`, `ls`). |
 | `aggregator`  | Temporary inspect/list with `--local`; remote query/spawn/scale and list selected by flags or profile. Remote verbs and `ls` support `--inspect-target`. |
 | `transfer`    | Receive/admin via mesh; send computes references or stages local content, not hosting or publication. |

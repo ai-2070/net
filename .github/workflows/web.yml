@@ -28,6 +28,11 @@ on:
       - ".github/scripts/check-one-library-docs.py"
       - ".github/scripts/check-header-count.py"
       - "net/crates/net/include/**"
+      # The README drift check reads every README*.md outside web/,
+      # wherever it lives; ci.yml's `net/**` / `go/**` filter misses the root
+      # one and everything under docs/.
+      - "**/README*.md"
+      - ".github/scripts/check-readmes.py"
   pull_request:
     paths:
       - "web/**"
@@ -50,6 +55,11 @@ on:
       - ".github/scripts/check-one-library-docs.py"
       - ".github/scripts/check-header-count.py"
       - "net/crates/net/include/**"
+      # The README drift check reads every README*.md outside web/,
+      # wherever it lives; ci.yml's `net/**` / `go/**` filter misses the root
+      # one and everything under docs/.
+      - "**/README*.md"
+      - ".github/scripts/check-readmes.py"
 
 jobs:
   check:
@@ -163,6 +173,18 @@ jobs:
       - name: Check the width checker still catches defects
         working-directory: .
         run: .github/scripts/check-doc-code-width.py --self-test
+
+      # Relative links resolve, licenses are named, and the CLI and Deck
+      # READMEs shipped to npm and PyPI carry the same command table as their
+      # source. Written to gate CI and never wired in, master drifted: the
+      # npm and PyPI CLI READMEs kept an older command table.
+      - name: Check the READMEs outside web/ have not drifted
+        working-directory: .
+        run: python3 .github/scripts/check-readmes.py
+
+      - name: Check the README checker still catches defects
+        working-directory: .
+        run: python3 .github/scripts/check-readmes.py --self-test
 
       # ALSO in `install-version.yml`, on the `v*.*.*` tag push and daily.
       # This copy catches a PR that types the wrong number; that one catches
