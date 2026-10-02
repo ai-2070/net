@@ -14,7 +14,7 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
-## Unreleased (0.39)
+## 0.39.0 — connectPeer waits for an attempt under way
 
 - **`connectPeer` no longer cancels an attempt that is still under
   way.** Every offer replaces the pair's link, so a second
