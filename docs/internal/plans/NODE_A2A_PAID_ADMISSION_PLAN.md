@@ -8,6 +8,17 @@ seven findings in place. Each repair is tagged **r2 (R*n*)** next to the text
 it changed, and the reviewer's four decisions are adopted (§Decisions).
 Awaiting re-review before implementation.
 
+**r2.1 (2026-10-03, author decision on R7):** the reviewer offered two
+repairs for R7: document the core-only boundary, or add a supported ergonomic
+provider surface. r2 chose the first. r2.1 switches to the second, because
+the first turned out to leave `@net-mesh/sdk` users with **no** path at all:
+`MeshNode.create` is the SDK's only mesh factory, and the SDK seals the native
+handle on purpose (`sdk-ts/src/_internal.ts`), so an SDK user cannot produce
+the native `NetMesh` either constructor requires. That is already true of the
+`CapabilityGateway` the SDK root re-exports today (`consent.ts:27-33`): it is
+exported and unconstructible from an SDK mesh, a pre-existing defect this
+port would otherwise inherit. See D7 and WS-E.
+
 **Review ledger.**
 
 | # | Finding (r1) | Severity | Where repaired | Status |
@@ -18,7 +29,7 @@ Awaiting re-review before implementation.
 | R4 | Catalog bounds/durations narrowed from u64 to `number`/u32 with no validation policy | Medium | D2, WS-B, WS-F | repaired in r2 |
 | R5 | The catalog parser is not binding-neutral; a whole-dict `dict → Value` move changes Python input behavior | Medium | D1, WS-A | repaired in r2 |
 | R6 | The source-only org fallback is unnecessary — `org_live.test.ts` already drives a live org harness | Medium | WS-C/D, WS-F, Risks | repaired in r2 |
-| R7 | `PaymentProvider` is not exported from `sdk-ts`; both ctors take a native `NetMesh` | Medium | D7 (new), WS-E | repaired in r2 |
+| R7 | `PaymentProvider` is not exported from `sdk-ts`; both ctors take a native `NetMesh` | Medium | D7 (new, amended r2.1), WS-E | repaired in r2; r2.1 adds the ergonomic surface |
 
 One defect found while checking R1 that the review did not name:
 `quote.expires_at_ns` in the `prepare_task` envelope (`a2a_paid.rs:575-591`) is
@@ -350,13 +361,60 @@ constructors take a native `NetMesh` (`payment_provider.rs:365-375`,
 `capability_gateway.rs:528-540`). The `sdk-ts` `MeshNode` keeps its native
 handle private (`mesh.ts:443-449`), so it cannot supply one.
 
-Decision (the smaller option, which keeps scope fixed): paid A2A is documented as a
-`@net-mesh/core` surface. `NetMesh`, `PaymentProvider`, `CapabilityGateway`,
-`a2aDocument` and `a2aU64` come from `@net-mesh/core`; typed errors come from
-`@net-mesh/core/errors` via an explicit `classifyError(e)`. Native errors stay
-plain prefixed `Error`s until classified; exporting the classes changes
-nothing on its own. An ergonomic `sdk-ts` provider surface, with the handle
-adaptation it needs, is a named follow-up and out of scope.
+~~Decision (the smaller option, which keeps scope fixed): paid A2A is
+documented as a `@net-mesh/core` surface … An ergonomic `sdk-ts` provider
+surface … is a named follow-up and out of scope.~~
+
+**r2.1 decision: both entry points are supported.** `@net-mesh/core` stays
+the native surface unchanged (everything in WS-B…WS-D). `@net-mesh/sdk` gains
+an ergonomic layer that **adapts handles and nothing else**. It follows the
+SDK's existing adaptation precedent (`aggregator.ts:57-68`,
+`org/index.ts:122-129`): accept `MeshNode | NetMesh`, resolve a `MeshNode`
+through the sealed `getNapiMesh`, and hand back the **native** object. No
+method is re-implemented or forwarded one by one, so the SDK cannot drift
+from the binding.
+
+- **Factories, not wrapper classes.** `createPaymentProvider(mesh, options)`
+  and `createCapabilityGateway(mesh, options)` return the native
+  `PaymentProvider` / `CapabilityGateway`. Subclassing a napi class from JS
+  was rejected: napi-rs's construction path does not reliably support
+  `extends`, and a subclass would add a second type for the same object.
+  Forwarding wrappers were rejected because the provider and the gateway
+  together carry ~20 methods, and each one would be a drift point.
+- **Options objects at the SDK layer only.** The factories take named
+  options (`PaymentProviderOptions { statePath, billingLogPath?,
+  facilitatorUrl?, facilitatorAuthToken?, unsafeDevMockFacilitator?,
+  requireInvocationBinding? }`; `CapabilityGatewayOptions { pinStorePath?,
+  paymentPolicyPath?, paymentProfile?, paymentUnsafeMockAutoAllow?,
+  paymentSigner?: { address, sign }, paymentSignerSvm?, paymentSignerXrpl?,
+  a2aPurchasePath? }`) and map them onto the native positional constructors
+  in one function each. This gives SDK users the options-object API that D5
+  defers for core, without breaking a single core caller.
+- **Org identity adaptation.** `setA2aOrgCaller(target, org)` accepts
+  `target: MeshNode | NetMesh | CapabilityGateway` and
+  `org: OrgClient (SDK) | TypedOrgClient | native OrgClient | null`. It
+  resolves the SDK client through `org.typed.raw`, the typed client through
+  `.raw`, and calls the native setter on the right slot (D6's two-slot
+  rule: a mesh target sets the `NetMesh` slot, a gateway target sets the
+  gateway's own slot). The native setters cannot take the SDK wrapper
+  themselves, because napi only accepts its own class instances.
+- **`MeshNode` forwards** for the raw requester verbs, in the existing
+  `Parameters<NapiNetMesh[...]>` style beside `serveA2a`/`submitTask`
+  (`mesh.ts:1058-1078`): `describeA2a`, `submitTaskPaid`.
+- **Re-exports:** `a2aDocument`, `a2aU64` (D2a) and the D4 error classes
+  plus `classifyError` from the SDK root, so an SDK user never imports
+  `@net-mesh/core` for paid A2A. Errors stay plain prefixed `Error`s until
+  `classifyError(e)` is applied, exactly as at the core layer; the docs say
+  so rather than implying that exporting the classes converts anything.
+- **Lifecycle is unchanged and stated:** the factories return native objects
+  that retain the node, so `stop()`/`close()` (D6) must run before
+  `MeshNode.shutdown()`, the same as for every other native handle the SDK
+  hands out.
+- **Beyond Python parity, deliberately.** Python's ergonomic `net_sdk` has no
+  payments or A2A surface either (parent plan baseline). The TS SDK gets one
+  here because it already exports `CapabilityGateway` and so promises a
+  surface it cannot deliver; Python's SDK makes no such promise. Recorded so
+  the asymmetry is not read as drift.
 
 ---
 
@@ -475,9 +533,20 @@ the concrete flow `Arc`).
 - [ ] ~~`sdk-ts`: forward `describeA2a` / `submitTaskPaid` / `setA2aOrgCaller`
   …; `PaymentProvider` / `CapabilityGateway` are native re-exports, so their
   new methods arrive with the typings.~~ **r2 (R7):** false for
-  `PaymentProvider`, and the ctors need a native `NetMesh` anyway. No `sdk-ts`
-  change in this port (D7); the paid surface is documented from
-  `@net-mesh/core`.
+  `PaymentProvider`, and the ctors need a native `NetMesh` anyway.
+- [ ] **r2.1 (D7): the `@net-mesh/sdk` ergonomic layer.** New
+  `sdk-ts/src/payments.ts`, exported from the SDK root:
+  `createPaymentProvider`, `createCapabilityGateway`, the two options types,
+  `setA2aOrgCaller`, and re-exports of `a2aDocument`, `a2aU64`,
+  `PaymentRefusedError`, `JournalOwnedElsewhereError`, `classifyError`.
+  `MeshNode` gains `describeA2a` / `submitTaskPaid` forwards. The existing
+  root `CapabilityGateway` re-export stays as it is (no symbol changes type).
+  Its doc comment points SDK users at `createCapabilityGateway`.
+- [ ] A type-level guard that each options mapping covers the native
+  constructor exactly. The test asserts the mapped tuple type equals
+  `ConstructorParameters<typeof NapiPaymentProvider>` /
+  `<typeof NapiCapabilityGateway>` minus the mesh, so a parameter added to a
+  native ctor without an options key fails `typecheck`, not a user.
 - [ ] A consumer-compile case (the `test/consumer/` + `consumer_compile.test.ts`
   precedent) that compiles **and runs** the exact documented imports against
   the built package entry points: `NetMesh`, `PaymentProvider`,
@@ -487,7 +556,31 @@ the concrete flow `Arc`).
   prefixed `Error` until `classifyError` turns it into the class.
 
 **Proved by:** `errors.test.ts` classification cases; the consumer case above;
-`npm run typecheck:tests` in `bindings/node` clean.
+`npm run typecheck:tests` in `bindings/node` clean; and for r2.1:
+- `sdk-ts/test/paid_a2a.test.ts`, live, SDK-only imports: two
+  `MeshNode.create` nodes; `createPaymentProvider(meshNode, { …,
+  unsafeDevMockFacilitator: true })` → `serveA2aConfigured`;
+  `createCapabilityGateway(meshNode, { paymentPolicyPath, a2aPurchasePath,
+  paymentUnsafeMockAutoAllow: true })` → prepare → `a2aDocument` → purchase →
+  submit, task runs once; a native `NetMesh` passed to the same factories
+  also works (both arms of the adaptation). Teardown is `stop()` →
+  `close()` ×2 → `MeshNode.shutdown()`, and **shutdown must succeed**, which
+  proves the factories retain nothing beyond the native objects' documented
+  references.
+- the same-org case of R6 rerun from the SDK with an SDK `OrgClient`
+  passed to `setA2aOrgCaller` for both a `MeshNode` target and a gateway
+  target, on the generated scenario `sdk-ts/test/org_live.test.ts` already
+  uses; plus `null` clears and denies before launch.
+- an options-mapping case per option, each reaching the native behavior it
+  names (e.g. omitting both facilitator options throws the native "a
+  settlement backend must be chosen" error; `a2aPurchasePath` without
+  `paymentPolicyPath` throws the native refusal), so a mis-ordered mapping
+  fails a test.
+- `package_entry_points.test.ts` and `trust_surfaces.test.ts` extended with
+  the new root exports; `sdk-ts` typecheck clean. CI: no change. The `sdk-ts-tests` job
+  (`ci.yml:3850`) already builds the native module with
+  `payments,payments-http,delegation,a2a,org` (`ci.yml:3959`), and the new
+  suite is auto-discovered.
 
 ### WS-F — Tests, docs, matrix
 
@@ -590,7 +683,10 @@ releases sync); the skill-snippet checker.
    options-object migration.
 5. **Operator access lifetime** (new, D6): follows store lifetime, as in
    Python.
-6. **Package boundary** (new, D7): `@net-mesh/core` only for this port.
+6. **Package boundary** (new, D7): ~~`@net-mesh/core` only for this port.~~
+   **r2.1:** both. Core stays native, and `@net-mesh/sdk` gains factory +
+   handle-adaptation helpers that return native objects (no forwarding
+   wrappers).
 
 ### Test matrix (target)
 
@@ -603,6 +699,9 @@ releases sync); the skill-snippet checker.
 | catalog numeric domain (R4) | — | ✓ | Python fixture (offer hash) |
 | Python input compatibility (R5) | — | — | `test_a2a_paid_config_compat.py` (new, pre-move) |
 | documented imports against built entry points (R7) | — | ✓ consumer case | — |
+| SDK factories + handle adaptation (r2.1), `MeshNode` and native arms, clean `shutdown()` | — | ✓ `sdk-ts/test/paid_a2a.test.ts` | — |
+| SDK `OrgClient` → both org slots (r2.1) | — | ✓ live same-org | R6 |
+| options ↔ native ctor coverage (r2.1) | — | ✓ type-level + per-option | — |
 | prepare → purchase → submit, once-only | — | ✓ (two-node) | `test_a2a_paid.py`, `a2a_paid_end_to_end` |
 | approval / reject / restart / resolve | — | ✓ | `test_a2a_paid.py` |
 | org-admitted principal, same-org (R6) | — | ✓ live, both setters | `a2a_admission_identity` |
@@ -617,7 +716,9 @@ With D1: ~350 lines moved (not new) into the shared module (r2: the catalog
 parser no longer moves), ~400 lines of new napi (`a2a_paid.rs` +
 gateway/provider/`NetMesh` methods + the D2a reader + the catalog parser),
 ~60 lines of `errors.ts`, one ~1,100-line vitest suite (r2 witnesses
-included), one small Python compatibility test.
+included), one small Python compatibility test. r2.1 adds ~200 lines of
+`sdk-ts` (`payments.ts`, two `MeshNode` forwards, the options mappings) and a
+~300-line `sdk-ts` live suite.
 
 Commit sequence, each compiling and green on its own: capture the
 cross-binding fixtures and land `test_a2a_paid_config_compat.py` against
@@ -652,6 +753,10 @@ after WS-D against a freshly built `.node` with the CI feature list
   `JournalOwnedElsewhereError`. *Fallback:* the error text and docs say why
   and what to do (let tasks finish or cancel them); the binding never offers a
   force-unlock.
+- **The SDK options mapping drifts from a native positional constructor**
+  (r2.1). A new native parameter gets no option, or two are swapped.
+  *Fallback:* the type-level `ConstructorParameters` guard fails `typecheck`
+  on a missing one; the per-option behavior cases catch a swap.
 - **A caller uses `JSON.parse` on a handle anyway.** (r2, R1) *Fallback:*
   every example and doc snippet uses the reader, each verb's doc comment
   names its u64 fields, and the D2a negative-control test shows the failure
@@ -669,6 +774,8 @@ after WS-D against a freshly built `.node` with the CI feature list
   ownership — non-goals inherited from the parent plan §6.
 - Reshaping the `CapabilityGateway` / `PaymentProvider` constructors into
   options objects.
-- An ergonomic `sdk-ts` paid-A2A / `PaymentProvider` surface and the native
-  handle adaptation it needs (D7).
+- ~~An ergonomic `sdk-ts` paid-A2A / `PaymentProvider` surface (D7).~~
+  **r2.1:** now in scope (WS-E). Still out of scope: forwarding wrapper
+  classes over the native provider/gateway, and an ergonomic payments surface
+  for Python's `net_sdk`.
 - Force-unlocking or draining the journal on `stop()`/`close()` (D6).
