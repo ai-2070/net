@@ -1,0 +1,27 @@
+net/crates/net/browser-ts/test/peer-driver.test.ts
+  s_d8b00bedd146e9::t_260d35001c0cd5 299
+net/crates/net/browser-ts/src/node.ts
+  s_d8b00bedd146e9::t_260d35001c0cd5 868-873
+net/crates/net/examples/browser-demo/README.md
+  s_d8b00bedd146e9::t_260d35001c0cd5 105-107
+net/crates/net/examples/browser-demo/host/src/main.rs
+  s_d8b00bedd146e9::t_260d35001c0cd5 1227
+net/crates/net/examples/browser-demo/run.sh
+  s_d8b00bedd146e9::t_260d35001c0cd5 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2e8e447c1c1868e2d6c5ab0f64d03337d9439c20",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
