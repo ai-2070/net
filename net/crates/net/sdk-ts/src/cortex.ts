@@ -264,6 +264,21 @@ export class Redex {
   }
 
   /**
+   * The greedy cache's copy of a peer's `channel`, or `null` when it isn't
+   * cached or greedy is off. A hit counts as a served read (and, under
+   * gravity, heat). The file belongs to the greedy runtime: `close()` on it
+   * releases only this handle and leaves the cache running.
+   */
+  greedyCacheFor(channel: string): RedexFile | null {
+    try {
+      const file = this.napi.greedyCacheFor(channel);
+      return file ? new RedexFile(file) : null;
+    } catch (e) {
+      throw classifyWithRedex(e);
+    }
+  }
+
+  /**
    * Add data-gravity heat emission to the running greedy cache. Requires
    * {@link enableGreedyDataforts} first; rejects otherwise.
    */
