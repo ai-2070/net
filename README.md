@@ -42,17 +42,6 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 [release notes](https://ai2070.net/docs/releases). The wire format is versioned separately, and
 subprotocol IDs are permanent.
 
-**Benchmarks**
-
-- Header serialize — `2.19 ns`, `456 M ops/sec`
-- Routing lookup (hit) — `37.7 ns`, `26.5 M ops/sec`
-- 1-hop forward — `61.7 ns`, `16.2 M ops/sec`
-- Heartbeat from a known peer — `39.8 ns`, `25.2 M ops/sec`
-- Full fail + recover cycle — `291 ns`, `3.44 M ops/sec`
-- Capability filter match (single tag) — `57.1 ns`, `17.5 M ops/sec`
-
-These measure local operations on an M1 Max — not NIC transfer, wire latency, or propagation. More under [Performance](#performance).
-
 ## Install
 
 One engine, several bindings — start with the package for your language:
@@ -69,6 +58,17 @@ Published names and source imports differ on purpose: the crates/registries use
 `from net_sdk import ...`. Lower-level bindings that skip the SDK ergonomics are in
 [SDKs](#sdks). Full per-language setup:
 [Install](https://ai2070.net/docs/start/install), [Quickstart](https://ai2070.net/docs/start/quickstart).
+
+**Benchmarks**
+
+- Header serialize — `2.19 ns`, `456 M ops/sec`
+- Routing lookup (hit) — `37.7 ns`, `26.5 M ops/sec`
+- 1-hop forward — `61.7 ns`, `16.2 M ops/sec`
+- Heartbeat from a known peer — `39.8 ns`, `25.2 M ops/sec`
+- Full fail + recover cycle — `291 ns`, `3.44 M ops/sec`
+- Capability filter match (single tag) — `57.1 ns`, `17.5 M ops/sec`
+
+These measure local operations on an M1 Max — not NIC transfer, wire latency, or propagation. More under [Performance](#performance).
 
 ## Claude Code Skill
 
