@@ -4384,6 +4384,30 @@ jobs:
       # both layers: sdk-py-tests installs the wrapper `--no-deps` on purpose
       # (so its suite needs no maturin), and this job had the binding but not
       # the wrapper. One pure-Python editable install closes the gap.
+      # === the cross-language BlobRef describe fixture (Python half) ======
+      # The pytest run above EXECUTED these; this step PINS the names and
+      # COUNTS the rows (floor 9 = 1 coverage row + 4 vectors x {decode,
+      # re-encode}). The Go half is TestCrossLangBlobDescribeVectors in the
+      # Go job. (GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md, S6.)
+      - name: Witness roster + floor — Python cross-lang blob describe (9)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_cross_lang_blob_describe --mode decl \
+            --source net/crates/net/bindings/python/tests/test_cross_lang_blob_describe.py \
+            test_fixture_covers_small_and_tree_refs \
+            test_python_decodes_go_refs_identically \
+            test_python_reencodes_go_refs_byte_for_byte || exit 1
+          out=$(cd net/crates/net/bindings/python && python -m pytest -q \
+                  tests/test_cross_lang_blob_describe.py 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "python cross-lang blob describe: ${n:-0} (floor 9)"
+          if [ -z "$n" ] || [ "$n" -lt 9 ]; then
+            echo "::error::the python cross-lang blob describe ran ${n:-0} rows, floor is 9 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+
       - name: Install the sdk-py wrapper
         run: pip install --no-deps -e ../../sdk-py
 
@@ -4855,35 +4879,80 @@ jobs:
         working-directory: go
         run: |
           set -uo pipefail
-          python3 ../.github/scripts/check-roster.py --label transfer_test --mode decl             --source transfer_test.go             TestTransferDirRoundTrip             TestTransferDirManifestRead             TestTransferDirManifestMissingContent             TestTransferDirManifestNotAManifest             TestTransferFetchDirRefusesRootDestination             TestTransferFetchBlobDiscovered             TestTransferEmptyManifestRefIsRefusedBeforeCgo             TestTransferStoreDirAfterClose             TestTransferStoreDirMissingRoot || exit 1
+          python3 ../.github/scripts/check-roster.py --label transfer_test --mode decl \
+            --source transfer_test.go \
+            TestTransferDirRoundTrip \
+            TestTransferDirManifestRead \
+            TestTransferDirManifestMissingContent \
+            TestTransferDirManifestNotAManifest \
+            TestTransferFetchDirRefusesRootDestination \
+            TestTransferFetchBlobDiscovered \
+            TestTransferEmptyManifestRefIsRefusedBeforeCgo \
+            TestTransferStoreDirAfterClose \
+            TestTransferStoreDirMissingRoot || exit 1
 
       - name: Witness roster — Go RedEX replication / greedy / gravity (7)
         working-directory: go
         run: |
           set -uo pipefail
-          python3 ../.github/scripts/check-roster.py --label redex_dataforts_test --mode decl             --source redex_dataforts_test.go             TestRedexReplicatedFileRequiresEnable             TestRedexReplicationRuntimeCountFollowsChannels             TestRedexReplicationCarriesDataBetweenNodes             TestRedexGreedyCachesAPeersChannel             TestRedexGreedyConfigRefusals             TestRedexGravityInstallRules             TestRedexDatafortsLifecycleRefusals || exit 1
+          python3 ../.github/scripts/check-roster.py --label redex_dataforts_test --mode decl \
+            --source redex_dataforts_test.go \
+            TestRedexReplicatedFileRequiresEnable \
+            TestRedexReplicationRuntimeCountFollowsChannels \
+            TestRedexReplicationCarriesDataBetweenNodes \
+            TestRedexGreedyCachesAPeersChannel \
+            TestRedexGreedyConfigRefusals \
+            TestRedexGravityInstallRules \
+            TestRedexDatafortsLifecycleRefusals || exit 1
 
       - name: Witness roster — Go CortEX write tokens (7)
         working-directory: go
         run: |
           set -uo pipefail
-          python3 ../.github/scripts/check-roster.py --label write_token_test --mode decl             --source write_token_test.go             TestWriteTokenTasksReadYourWrites             TestWriteTokenMemoriesReadYourWrites             TestWriteTokenOriginNotIdentity             TestWriteTokenZeroTimeoutPolls             TestWriteTokenContext             TestWriteTokenNetDbAdaptersInheritOrigin             TestWriteTokenAfterClose || exit 1
+          python3 ../.github/scripts/check-roster.py --label write_token_test --mode decl \
+            --source write_token_test.go \
+            TestWriteTokenTasksReadYourWrites \
+            TestWriteTokenMemoriesReadYourWrites \
+            TestWriteTokenOriginNotIdentity \
+            TestWriteTokenZeroTimeoutPolls \
+            TestWriteTokenContext \
+            TestWriteTokenNetDbAdaptersInheritOrigin \
+            TestWriteTokenAfterClose || exit 1
 
       - name: Witness roster — Go blob adapter registry (6)
         working-directory: go
         run: |
           set -uo pipefail
-          python3 ../.github/scripts/check-roster.py --label blob_registry_test --mode decl             --source blob_registry_test.go             TestBlobRegistryFilesystemRoundTrip             TestBlobRegistryDuplicateAndUnregister             TestBlobRegistryResolveUsesTheNamedAdapter             TestBlobRegistryRefusals             TestBlobRegistryRefusesEmbeddedNUL             TestABIStabilityBlobRegistryCodes || exit 1
+          python3 ../.github/scripts/check-roster.py --label blob_registry_test --mode decl \
+            --source blob_registry_test.go \
+            TestBlobRegistryFilesystemRoundTrip \
+            TestBlobRegistryDuplicateAndUnregister \
+            TestBlobRegistryResolveUsesTheNamedAdapter \
+            TestBlobRegistryRefusals \
+            TestBlobRegistryRefusesEmbeddedNUL \
+            TestABIStabilityBlobRegistryCodes || exit 1
 
       # The v0.3 tree / range / repair surface. The two repair witnesses are
       # `-tags test_helpers` (they drive fixtures-only seams) and run in the
       # "Run Go tests (test_helpers)" step above; the rest run untagged and
       # under the -race step's ^TestBlob filter.
-      - name: Witness roster — Go blob trees, ranges, repair (9)
+      - name: Witness roster — Go blob trees, ranges, repair (10)
         working-directory: go
         run: |
           set -uo pipefail
-          python3 ../.github/scripts/check-roster.py --label blob_tree_test --mode decl             --source blob_tree_test.go --source blob_repair_test.go --source abi_stability_test.go             TestBlobTreeStoreAndFetchRange             TestBlobTreeRangeContract             TestBlobTreeEncodingRefusals             TestBlobRefDescribeSmall             TestBlobTreeNodeCacheStates             TestBlobFeatureTagsMatchCore             TestBlobRepairRestoresADroppedDataShard             TestBlobRepairCountsAnUnrecoverableStripe             TestABIStabilityBlobV3ArityMatchesRust || exit 1
+          python3 ../.github/scripts/check-roster.py --label blob_tree_test --mode decl \
+            --source blob_tree_test.go --source blob_repair_test.go --source abi_stability_test.go \
+            --source blob_describe_vectors_test.go \
+            TestBlobTreeStoreAndFetchRange \
+            TestBlobTreeRangeContract \
+            TestBlobTreeEncodingRefusals \
+            TestBlobRefDescribeSmall \
+            TestBlobTreeNodeCacheStates \
+            TestBlobFeatureTagsMatchCore \
+            TestBlobRepairRestoresADroppedDataShard \
+            TestBlobRepairCountsAnUnrecoverableStripe \
+            TestABIStabilityBlobV3ArityMatchesRust \
+            TestCrossLangBlobDescribeVectors || exit 1
 
       # === the Go org facade live cells ==
       # The run above EXECUTED these 6 live cells (3 shapes x {same-org,

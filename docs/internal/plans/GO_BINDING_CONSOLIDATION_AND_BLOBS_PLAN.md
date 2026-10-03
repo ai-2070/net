@@ -5,14 +5,14 @@
 In progress, 2026-10-03. Targets the release after 0.39. Branch
 `LZL0/go-blobs`. Plan accepted for implementation at `e33ede5`. **S1–S5
 done 2026-10-03** (S1 `aaa797c`, S2 `bb775f6`, S3 `3773b36`, S4 `ab12cff`,
-S5 `6e7f8e7`; evidence under each slice). **S6 done locally** except the
+S5 `6e7f8e7`; evidence under each slice). **S6 done**, including the
 cross-language fixture. CI: S1's head ran green on every Go job, including the new
 `-race` step and its roster. Its one failure was the Firefox browser
 witness `stage5_a_refused_connect_closes_rtc_and_hands_back_its_attempt`
 (wasm leaf), which no Go change reaches and which also fails
 intermittently on `master` (run 36970267483). S5b deferred (see S5b); S7 done (classification and ledger; the large
 ports are deferred, see S7); S8 done (full deletion, by the user's decision;
-see S8). Owed: the S6 cross-language fixture and the release notes.
+see S8). Owed: the release notes.
 
 Reviewed twice before implementation (`d1b6f29`, then `317168c`). The first
 review accepted the direction and held on nine findings (R1–R9). The second
@@ -1013,11 +1013,37 @@ Evidence (Windows, `libnet` rebuilt with the change):
   (`clippy::manual_dangling_ptr` on `1usize as *mut T` poison pointers);
   they now use `std::ptr::dangling_mut()`.
 
-**Still owed: the cross-language `describe` fixture.** A Go-encoded ref,
-frozen in a fixture with its normalized description and validated by the
-Python suite (test-only), is not in this commit. It needs a local maturin
-build of the Python binding to run before committing, and an unrun test
-shouldn't be committed as evidence. Tracked here until it lands.
+**Cross-language `describe` fixture: done, 2026-10-03.**
+`net/crates/net/tests/cross_lang_blob/describe_vectors.json` holds four refs
+produced by the Go binding: a small ref, a small ref with a non-ASCII URI, a
+replicated tree, and an RS(4,2) tree over 16 MiB of distinct chunks. Each
+carries its normalized description: `hash` only for small refs,
+`tree_root_hash` + `tree_depth` only for trees, `encoding` only for chunked
+refs, and hashes in lowercase hex.
+
+- **Go** (`go/blob_describe_vectors_test.go`, `TestCrossLangBlobDescribeVectors`)
+  decodes each ref through `DescribeBlobRef`, encoding included, and
+  regenerates the file only under `NET_REGEN_BLOB_DESCRIBE_VECTORS=1`.
+- **Python** (`bindings/python/tests/test_cross_lang_blob_describe.py`,
+  test-only, no production API change) decodes each ref with
+  `BlobRef.from_encoded`, compares every field except `encoding` (Python
+  has no getter for it), reading shape-specific getters by shape, and
+  checks that re-encoding gives the original bytes.
+- The small ref's hash is BLAKE3("abc"), the official test vector.
+
+Evidence: Go passes. Python 9/9 against a local `maturin develop` with ci.yml's
+exact feature list, in a scratch venv outside the repo. Mutation: bumping
+the replicated tree's expected `tree_depth` fails Go and one Python row.
+CI: "Witness roster + floor — Python cross-lang blob describe (9)" pins the
+three Python test names and requires at least 9 passing rows; the Go test
+joins the blob-trees roster (now 10).
+
+Found while wiring it: five of the roster steps added in S2–S6 had been
+written to `ci.yml` as single collapsed lines. A heredoc ate their
+backslash-newlines. They still ran, because the shell reads one long command,
+and S6's CI passed with them, but they were unreadable. They're rewrapped,
+and every roster step this plan owns was re-executed from the YAML as
+written: 7/7 pass.
 
 ### S7: classify and port the rest of the reference package
 
