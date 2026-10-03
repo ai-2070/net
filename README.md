@@ -59,6 +59,17 @@ Published names and source imports differ on purpose: the crates/registries use
 [SDKs](#sdks). Full per-language setup:
 [Install](https://ai2070.net/docs/start/install), [Quickstart](https://ai2070.net/docs/start/quickstart).
 
+**Benchmarks**
+
+- Header serialize — `2.19 ns`, `456 M ops/sec`
+- Routing lookup (hit) — `37.7 ns`, `26.5 M ops/sec`
+- 1-hop forward — `61.7 ns`, `16.2 M ops/sec`
+- Heartbeat from a known peer — `39.8 ns`, `25.2 M ops/sec`
+- Full fail + recover cycle — `291 ns`, `3.44 M ops/sec`
+- Capability filter match (single tag) — `57.1 ns`, `17.5 M ops/sec`
+
+These measure local operations on an M1 Max — not NIC transfer, wire latency, or propagation. More under [Performance](#performance).
+
 ## Claude Code Skill
 
 An agent working from surface familiarity will write integration code that runs and is quietly
@@ -293,24 +304,9 @@ The rest of the surface, one line each; every entry links to the page that goes 
 
 ## Performance
 
-The full measured set and methodology live in
-[`net/crates/net/BENCHMARKS.md`](net/crates/net/BENCHMARKS.md). The rows below are **local
-operation microbenchmarks** on an M1 Max: each measures one operation in isolation, not the cost
-of a packet path. None includes NIC transfer, wire latency, or propagation, and summing them
-would not produce a round trip. Desktop-class figures and per-subsystem tables — multi-hop,
-encryption, capability folds, SDK ingestion, binary size — are in the linked file.
-
-| Operation, measured in isolation | M1 Max |
-|---|---|
-| Header serialize — encode the 64-byte header | 2.19 ns / 456M ops/sec |
-| Routing lookup (hit) — resolve a next hop from the local routing table | 37.73 ns / 26.5M ops/sec |
-| 1-hop forward — the forwarding path for a single hop | 61.66 ns / 16.2M ops/sec |
-| Heartbeat — process one heartbeat from a known peer | 39.76 ns / 25.2M ops/sec |
-| Evaluate alternates — pick a replacement from local state | 257.51 ns / 3.88M ops/sec |
-
-The last two are **local computations over local state**; they are not measurements of detecting
-a failure across the network or of completing distributed recovery. The full table separates
-heartbeat processing, status check, circuit-breaker check, and alternate selection.
+Full set and methodology in
+[`net/crates/net/BENCHMARKS.md`](net/crates/net/BENCHMARKS.md). Each measures one operation in isolation, not the cost
+of a packet path. None includes NIC transfer, wire latency, or propagation.
 
 ## SDKs
 
