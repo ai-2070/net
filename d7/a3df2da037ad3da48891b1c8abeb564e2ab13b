@@ -1,0 +1,22 @@
+net/crates/net/bindings/node/src/lib.rs
+  s_b3a4389dffe7a9::t_81b8bcf1acaf12 2641-2649,2651-2655,2684
+  s_b3a4389dffe7a9::t_1b21846e494a5c 2677-2683,2685-2686
+net/crates/net/bindings/node/test/a2a_paid_org_live.test.ts
+  s_b3a4389dffe7a9::t_4f0ab1d2517729 258-265
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d7a3df2da037ad3da48891b1c8abeb564e2ab13b",
+  "prompts": {},
+  "sessions": {
+    "s_b3a4389dffe7a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d84c0f0d-cc37-4675-8edb-32c0a7dd59f5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
