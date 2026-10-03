@@ -76,7 +76,7 @@ func tokenErrorFromCode(code C.int) error {
 		return ErrWaitQueueFull
 	case -106:
 		return ErrFoldStopped
-	case -109:
+	case -160:
 		return ErrWrongChannel
 	default:
 		return cortexErrorFromCode(code)

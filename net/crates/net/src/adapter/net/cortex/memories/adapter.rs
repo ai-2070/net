@@ -330,7 +330,9 @@ impl MemoriesAdapter {
 
     /// Non-blocking RYW poll. See
     /// [`super::super::tasks::TasksAdapter::poll_for_token`] for the
-    /// full contract — identical shape for Memories.
+    /// full contract — identical shape for Memories, including
+    /// `WrongChannel` for a token issued for another channel (a Tasks
+    /// token, say).
     pub fn poll_for_token(&self, token: WriteToken) -> Result<(), WaitForTokenError> {
         if token.origin_hash != self.origin_hash {
             self.inner.note_wrong_origin();

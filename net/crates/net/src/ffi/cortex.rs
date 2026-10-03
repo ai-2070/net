@@ -120,7 +120,12 @@ pub(crate) const NET_ERR_PANIC: c_int = -108;
 /// different channel than the adapter folds. Sequence numbers are per
 /// channel, so its seq names nothing here. See
 /// `WaitForTokenError::WrongChannel`.
-pub(crate) const NET_ERR_WRONG_CHANNEL: c_int = -109;
+///
+/// `-160`, not the next code in this surface's `-100..-109` band: `-109`
+/// is `NET_ERR_MESH_STREAM_OCCUPIED` in the shared C enum, and a wait
+/// that can return either would make the two indistinguishable. `-160` is
+/// used by no surface.
+pub(crate) const NET_ERR_WRONG_CHANNEL: c_int = -160;
 
 /// Non-blocking poll variant of wait_for_token: checks origin
 /// binding and the applied watermark, returns immediately. Maps
@@ -1900,7 +1905,7 @@ pub unsafe extern "C" fn net_tasks_wait_for_seq(
 /// Read-your-writes wait on the token `(origin_hash, channel_hash, seq)`.
 /// Returns `0` on success, `NET_ERR_TIMEOUT` (`1`) on deadline,
 /// `NET_ERR_WRONG_ORIGIN` (`-104`) if the token's origin does not match
-/// this adapter, `NET_ERR_WRONG_CHANNEL` (`-109`) if it was issued for
+/// this adapter, `NET_ERR_WRONG_CHANNEL` (`-160`) if it was issued for
 /// another channel (see [`net_tasks_channel_hash`]), or
 /// `NET_ERR_QUEUE_FULL` (`-105`) if the per-channel wait queue is
 /// saturated.

@@ -44,14 +44,16 @@
 use std::fmt;
 use std::str::FromStr;
 
-/// Address of a write — origin (which chain) + seq (which event on
-/// that chain). Round-trips through every binding as a typed value.
+/// Address of a write — origin (which chain), channel (which RedEX
+/// file) and seq (which event in that channel). Sequence numbers are per
+/// channel, so all three are its identity. Round-trips through every
+/// binding as a typed value.
 ///
 /// Treat tokens as **opaque, in-process data**. They are not
 /// signed. The fields are `pub` so FFI / binding layers can
 /// marshal them; application code should not synthesise tokens.
-/// See module-level docs for the trust model — origin-bound
-/// adapters reject mismatched tokens at `wait_for_token`.
+/// See module-level docs for the trust model — adapters reject a
+/// token from another origin or another channel at `wait_for_token`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct WriteToken {
     /// 64-bit hash of the entity whose chain this write landed on

@@ -297,6 +297,9 @@ impl TasksAdapter {
     /// - `Ok(())` — the write is observable; subsequent reads see it.
     /// - `Err(WaitForTokenError::WrongOrigin {..})` — the token's
     ///   `origin_hash` doesn't match this adapter's bound origin.
+    /// - `Err(WaitForTokenError::WrongChannel {..})` — the token was
+    ///   issued for another channel (a Memories token, say); its seq
+    ///   counts that channel's events, not this one's.
     /// - `Err(WaitForTokenError::FoldStopped {..})` — the fold task
     ///   has stopped before reaching the target seq; the write will
     ///   never become observable.

@@ -481,8 +481,9 @@ func TestABIStabilityBlobOwnedRegistrationMatchesRust(t *testing.T) {
 
 // TestABIStabilityWriteTokenCarriesTheChannel pins the channel-bound token
 // surface: both waits take (origin, channel, seq) plus the timeout, the
-// channel accessors exist with the Rust arity, and -109 is ErrWrongChannel
-// on this surface. Before, a token was (origin, seq), and a Tasks token
+// channel accessors exist with the Rust arity, and -160 is ErrWrongChannel.
+// -160 is pinned as unused by every other surface: the first choice, -109,
+// is NET_ERR_MESH_STREAM_OCCUPIED in the shared enum (cubic, #1167). Before, a token was (origin, seq), and a Tasks token
 // could be satisfied by Memories' unrelated numbering.
 func TestABIStabilityWriteTokenCarriesTheChannel(t *testing.T) {
 	requireCrateTree(t)
@@ -520,10 +521,31 @@ func TestABIStabilityWriteTokenCarriesTheChannel(t *testing.T) {
 			t.Errorf("%s: Rust takes %d parameters, want %d", name, got, want)
 		}
 	}
-	if !strings.Contains(string(src), "pub(crate) const NET_ERR_WRONG_CHANNEL: c_int = -109;") {
-		t.Error("NET_ERR_WRONG_CHANNEL is no longer -109 in src/ffi/cortex.rs")
+	if !strings.Contains(string(src), "pub(crate) const NET_ERR_WRONG_CHANNEL: c_int = -160;") {
+		t.Error("NET_ERR_WRONG_CHANNEL is no longer -160 in src/ffi/cortex.rs")
 	}
-	if err := tokenErrorFromInt(-109); !errors.Is(err, ErrWrongChannel) {
-		t.Errorf("code -109 maps to %v, want ErrWrongChannel", err)
+	if err := tokenErrorFromInt(-160); !errors.Is(err, ErrWrongChannel) {
+		t.Errorf("code -160 maps to %v, want ErrWrongChannel", err)
+	}
+	// The mesh surface's -109 must not read as a wrong channel.
+	if err := tokenErrorFromInt(-109); errors.Is(err, ErrWrongChannel) {
+		t.Error("code -109 (NET_ERR_MESH_STREAM_OCCUPIED) maps to ErrWrongChannel")
+	}
+	// No constant in any shared header may also be -160.
+	for _, hdr := range []string{"net.h", "net_cortex.h"} {
+		for name, value := range parseHeader(t, hdr).consts {
+			if value == "-160" {
+				t.Errorf("%s defines %s = -160, colliding with NET_ERR_WRONG_CHANNEL", hdr, name)
+			}
+		}
+	}
+	for _, f := range []string{"blob.rs", "mesh.rs", "transport.rs", "cortex.rs"} {
+		other, err := os.ReadFile("../net/crates/net/src/ffi/" + f)
+		if err != nil {
+			continue
+		}
+		if n := regexp.MustCompile(`c_int = -160;`).FindAllIndex(other, -1); len(n) != map[bool]int{true: 1, false: 0}[f == "cortex.rs"] {
+			t.Errorf("src/ffi/%s defines -160 %d time(s); only NET_ERR_WRONG_CHANNEL may", f, len(n))
+		}
 	}
 }

@@ -126,14 +126,15 @@ int  net_tasks_wait_for_seq(net_tasks_adapter_t* handle, uint64_t seq,
 
 /* The adapter's channel hash: the middle field of every token it issues.
  * Sequence numbers are per channel, so a token is (origin, channel, seq).
- * Returns 0, or -1 for a NULL argument (nothing written). */
+ * Returns 0, -1 for a NULL argument (nothing written), or -8
+ * (NET_ERR_SHUTTING_DOWN) while the adapter is being freed. */
 int  net_tasks_channel_hash(net_tasks_adapter_t* handle, uint64_t* out_hash);
 
 /* Read-your-writes: wait until the fold has applied the write named by
  * (origin_hash, channel_hash, seq). timeout_ms 0 POLLS once (unlike
  * wait_for_seq, where 0 waits indefinitely). Returns 0; 1
  * (NET_ERR_TIMEOUT) on deadline; -104 (NET_ERR_WRONG_ORIGIN) if
- * origin_hash is not this adapter's; -109 (NET_ERR_WRONG_CHANNEL) if
+ * origin_hash is not this adapter's; -160 (NET_ERR_WRONG_CHANNEL) if
  * channel_hash is not this adapter's; -105 (NET_ERR_QUEUE_FULL); -106
  * (NET_ERR_FOLD_STOPPED). */
 int  net_tasks_wait_for_token(net_tasks_adapter_t* handle, uint64_t origin_hash,
@@ -281,14 +282,15 @@ int  net_memories_wait_for_seq(net_memories_adapter_t* handle, uint64_t seq,
 
 /* The adapter's channel hash: the middle field of every token it issues.
  * Sequence numbers are per channel, so a token is (origin, channel, seq).
- * Returns 0, or -1 for a NULL argument (nothing written). */
+ * Returns 0, -1 for a NULL argument (nothing written), or -8
+ * (NET_ERR_SHUTTING_DOWN) while the adapter is being freed. */
 int  net_memories_channel_hash(net_memories_adapter_t* handle, uint64_t* out_hash);
 
 /* Read-your-writes: wait until the fold has applied the write named by
  * (origin_hash, channel_hash, seq). timeout_ms 0 POLLS once (unlike
  * wait_for_seq, where 0 waits indefinitely). Returns 0; 1
  * (NET_ERR_TIMEOUT) on deadline; -104 (NET_ERR_WRONG_ORIGIN) if
- * origin_hash is not this adapter's; -109 (NET_ERR_WRONG_CHANNEL) if
+ * origin_hash is not this adapter's; -160 (NET_ERR_WRONG_CHANNEL) if
  * channel_hash is not this adapter's; -105 (NET_ERR_QUEUE_FULL); -106
  * (NET_ERR_FOLD_STOPPED). */
 int  net_memories_wait_for_token(net_memories_adapter_t* handle, uint64_t origin_hash,

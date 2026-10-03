@@ -67,7 +67,7 @@ let _ = tasks.complete(1, now_ns)?;
 
 // Wait for the fold to apply your write deterministically (read-your-writes).
 // Simplest is to wait on the seq `create` returned. For a deadline or the
-// origin-bound WriteToken primitive, see `dataforts.md` § Read-your-writes.
+// channel-bound WriteToken primitive (`tasks.token(seq)`), see `dataforts.md` § Read-your-writes.
 let _ = tasks.wait_for_seq(seq).await;
 
 // React to changes
@@ -190,7 +190,7 @@ all, _ := tasks.List(nil) // includes task 1 once its token was applied
 **Key facts:**
 - `WaitForToken(token, timeout)` blocks the calling goroutine; a zero timeout is a non-blocking applied-vs-token check (`ErrTokenTimeout` if not yet applied).
 - `WaitForTokenContext(ctx, token)` checks `ctx` before every native wait and waits in slices of at most 50 ms, so cancellation is noticed within one slice, and a context that is already done returns its error even for an applied token.
-- The origin check is on the **origin hash**, not the adapter object: another adapter opened with the same origin accepts the token, but only once its own fold has applied that seq. A different origin is `ErrWrongOrigin`.
+- The origin check is on the **origin hash**, not the adapter object: another adapter opened with the same origin **on the same channel** accepts the token, but only once its own fold has applied that seq. A different origin is `ErrWrongOrigin`.
 - **A token is `(origin, channel, seq)`.** Sequence numbers are per channel, so `Token(seq)` stamps the adapter's channel (`ChannelHash()`), and an adapter refuses a token from another channel with `ErrWrongChannel` — a `Tasks` token waited on through a `Memories` adapter with the same origin fails at once instead of comparing against Memories' unrelated numbering.
 
 ## C
@@ -207,7 +207,7 @@ net_tasks_channel_hash(tasks, &channel);  // the token's middle field
 
 // RYW: the token is (origin_hash, channel_hash, seq)
 int rc = net_tasks_wait_for_token(tasks, 0xDEADBEEFULL, channel, seq, /*timeout_ms*/ 250);
-// timeout_ms == 0 is a non-blocking poll; -104 wrong origin, -109 wrong channel
+// timeout_ms == 0 is a non-blocking poll; -104 wrong origin, -160 wrong channel
 
 net_tasks_adapter_close(tasks);
 net_tasks_adapter_free(tasks);
