@@ -316,6 +316,17 @@ mod provider {
         /// so without an explicit release the retained node clone would keep
         /// `NetMesh.shutdown()` (which needs sole ownership) failing until GC ran.
         serving: Mutex<Option<Serving>>,
+        /// The admission journal `serveA2aConfigured` opened, held `Weak`:
+        /// the serve handle and every task it launched own the journal, so
+        /// the operator verbs answer for exactly as long as one of them does
+        /// (plan D6). `None` before any configured serve.
+        #[cfg(feature = "a2a")]
+        a2a_store: Arc<Mutex<Option<std::sync::Weak<dyn net_sdk::a2a_journal::AdmissionStore>>>>,
+        /// The registrations `serveA2aConfigured` created, so `close()` can
+        /// retire them too — otherwise a JS caller that closed the provider
+        /// but not the handle would keep the node referenced until GC.
+        #[cfg(feature = "a2a")]
+        a2a_serves: Arc<Mutex<Vec<crate::a2a::SharedRegistration>>>,
     }
 
     #[napi]
@@ -430,6 +441,10 @@ mod provider {
                     node,
                     _serve: serve,
                 })),
+                #[cfg(feature = "a2a")]
+                a2a_store: Arc::new(Mutex::new(None)),
+                #[cfg(feature = "a2a")]
+                a2a_serves: Arc::new(Mutex::new(Vec::new())),
             })
         }
 
@@ -442,6 +457,13 @@ mod provider {
         #[napi]
         pub fn close(&self) {
             let _ = self.serving.lock().take();
+            // Retire every configured A2A registration this provider
+            // created. Like `A2aServeHandle.stop()`, this does not release
+            // the admission journal while launched tasks still hold it.
+            #[cfg(feature = "a2a")]
+            for registration in self.a2a_serves.lock().drain(..) {
+                let _ = registration.lock().take();
+            }
         }
 
         /// The node's 32-byte mesh entity id — the provider identity these tools
@@ -611,6 +633,107 @@ mod provider {
             let admission: Arc<dyn net_mcp::serve::payment::PaymentAdmission> =
                 Arc::new(EnginePaymentAdmission::new(self.engine.clone()));
             spawn_publish_tools(env, node, tools, handler, options, pricing, Some(admission))
+        }
+    }
+
+    // Paid A2A, provider half (NODE_A2A_PAID_ADMISSION_PLAN.md WS-B). Its own
+    // `#[napi] impl` block, cfg'd as a whole: napi-derive registers every
+    // method of a block, so a per-method `#[cfg]` leaves a dangling
+    // registration in builds without `a2a`.
+    #[cfg(feature = "a2a")]
+    #[napi]
+    impl PaymentProvider {
+        /// Serve a **catalog-driven** A2A lifecycle — free and paid entries
+        /// side by side — gated by this provider's payment engine, every
+        /// admission recorded in the durable journal at `journalPath`.
+        ///
+        /// `executor` is the `serveA2a` handler; on this path its brief also
+        /// carries `service` and `revision`. `services` maps a service id to
+        /// its entry: `pricingTerms` (from `pricingTerms(...)`) makes it paid,
+        /// its absence free. Every bound and duration is a `bigint`.
+        ///
+        /// `preflight`, if given, is `({ownerJson, offerJson, briefJson}) =>
+        /// Promise<string | null>`: `null` admits, a string refuses with that
+        /// reason. It runs before any quote exists and again at submit; a
+        /// throw, a rejection or no answer within 5 s refuses. A refusal at
+        /// submit after payment is not an unpaid rejection — it leaves an
+        /// unresolved record for `a2aUnresolved()`.
+        ///
+        /// Rejects with `a2a:journal_owned_elsewhere:` when another holder
+        /// owns the journal, and `a2a:invalid_argument:` on a catalog it
+        /// cannot serve (a paid entry is never served free). The node must be
+        /// `start()`ed. Hold the resolved handle; `stop()` it (or `close()`
+        /// this provider) before `mesh.shutdown()`.
+        #[napi(js_name = "serveA2aConfigured")]
+        #[allow(clippy::too_many_arguments)]
+        pub fn serve_a2a_configured<'env>(
+            &self,
+            env: &'env Env,
+            executor: Function<'_, crate::a2a::TaskBriefJs, Promise<String>>,
+            services: std::collections::HashMap<String, crate::a2a_paid::A2aServicePolicyJs>,
+            journal_path: String,
+            options: Option<crate::a2a_paid::ServeA2aConfiguredOptions>,
+            preflight: Option<
+                Function<'_, crate::a2a_paid::A2aPreflightArgs, Promise<Option<String>>>,
+            >,
+        ) -> Result<PromiseRaw<'env, crate::a2a::A2aServeHandle>> {
+            // Every refusal — a closed provider, a catalog it cannot serve —
+            // arrives as a rejection of the returned Promise, never as a
+            // synchronous throw, so a caller handles one failure channel.
+            // Only the JS-thread work happens here (the callbacks become
+            // TSFNs, which must be built on this thread); the verdict is
+            // carried into the future.
+            let spec = match self.serving.lock().as_ref().map(|s| s.node.clone()) {
+                None => Err(Error::from_reason(
+                    "payment provider has been closed — construct a new one to serve A2A",
+                )),
+                Some(node) => crate::a2a_paid::prepare_serve(
+                    node,
+                    self.engine.clone(),
+                    executor,
+                    services,
+                    journal_path,
+                    options,
+                    preflight,
+                ),
+            };
+            let store_slot = Arc::clone(&self.a2a_store);
+            let serves = Arc::clone(&self.a2a_serves);
+            env.spawn_future(async move {
+                let (handle, store) = crate::a2a_paid::serve(spec?).await?;
+                *store_slot.lock() = Some(Arc::downgrade(&store));
+                serves.lock().push(handle.shared());
+                Ok(handle)
+            })
+        }
+
+        /// The unresolved-financial admissions (`paid`, `launched`,
+        /// `reconcile`) as a JSON array — the operator's queue. Each row's
+        /// `owner` and `generation` are what `a2aResolve` takes back; the
+        /// `peer` owner's node and the `generation` are u64, so read them
+        /// with `a2aDocument` / `a2aU64`, not `JSON.parse`. Rejects
+        /// `a2a:invalid_argument:` when no journal is live.
+        #[napi(js_name = "a2aUnresolved")]
+        pub async fn a2a_unresolved(&self) -> Result<String> {
+            let store = crate::a2a_paid::live_store(&self.a2a_store)?;
+            crate::a2a_paid::unresolved(store).await
+        }
+
+        /// Resolve one unresolved admission to a terminal `TaskState`
+        /// (`stateJson`, e.g. `{"state":"failed","error":"refunded"}`) — the
+        /// only exit from the queue. `ownerJson` is the row's `owner`
+        /// document; `generation`, the row's own, closes exactly that
+        /// incarnation when one key carries two charges.
+        #[napi(js_name = "a2aResolve")]
+        pub async fn a2a_resolve(
+            &self,
+            owner_json: String,
+            task_id: String,
+            state_json: String,
+            generation: Option<BigInt>,
+        ) -> Result<()> {
+            let store = crate::a2a_paid::live_store(&self.a2a_store)?;
+            crate::a2a_paid::resolve(store, owner_json, task_id, state_json, generation).await
         }
     }
 }

@@ -5053,8 +5053,12 @@ jobs:
             # included because the TS-SDK ships with `dataforts` (and the
             # transfer / traversal NAPI surfaces would otherwise go
             # unlinted — that gap hid a dead-code lint on the transfer
-            # stream-id helpers).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers,dataforts,nat-traversal,port-mapping,org
+            # stream-id helpers). `delegation` / `a2a` add the Hermes
+            # delegation + A2A modules, including the paid provider surface
+            # (`src/a2a_paid.rs`, gated on `a2a` + `payments` + `publish`) —
+            # without them neither A2A module was linted, though both ship
+            # in the default build (NODE_A2A_PAID_ADMISSION_PLAN.md WS-B).
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers,dataforts,nat-traversal,port-mapping,org,delegation,a2a
           - name: python
             path: net/crates/net/bindings/python
             # The widest service-free pyo3 surface. `meshdb` /

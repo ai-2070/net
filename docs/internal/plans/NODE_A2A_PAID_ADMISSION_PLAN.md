@@ -549,30 +549,72 @@ feature list clean.
 
 ### WS-B — Provider: `PaymentProvider.serveA2aConfigured` (`node/src/a2a_paid.rs`)
 
-- [ ] New module gated `#[cfg(all(feature = "a2a", feature = "payments"))]`.
-- [ ] `PaymentProvider.serveA2aConfigured(executor, services, journalPath,
-  options?) => Promise<A2aServeHandle>`: async (journal `open` is file IO and
-  takes the `.owner` lock; registration needs the tokio context — the
-  "no reactor running" lesson from the free port), principal
-  `"session_peer" | "same_org" | "granted"`, preflight bridge (D3),
-  `JournalOwnedElsewhereError` (D4). Refuses if the provider is closed.
-- [ ] Catalog fields as checked `bigint` (D2, r2 R4), each refusal naming
-  the service and field.
-- [ ] `A2aServeHandle` grows a `Registered::Configured` arm (the Python
-  enum, `python/src/a2a.rs:363-430`) and a `services` getter; `stop()`
-  retires the registration and drops the handle's references (D6). **r2
-  (R2):** r1 said it "releases the journal owner".
-- [ ] Operator verbs: `a2aUnresolved() => Promise<string>`,
+- [x] New module gated `#[cfg(all(feature = "a2a", feature = "payments",
+  feature = "publish"))]` — `publish` too, because `PaymentProvider` itself
+  lives behind it (`payment_provider.rs` `mod provider`).
+- [x] `PaymentProvider.serveA2aConfigured(executor, services, journalPath,
+  options?, preflight?) => Promise<A2aServeHandle>`: async (journal `open`
+  and registration run in `env.spawn_future`; the TSFNs are built on the JS
+  thread), principal `"session_peer" | "same_org" | "granted"` through the
+  shared `parse_principal`, preflight bridge (D3), `a2a:journal_owned_elsewhere:`
+  (D4). **Deviations:** (1) `preflight` is a trailing positional argument, not
+  an `options` field — the `CapabilityGateway` signer-callback precedent, and a
+  `Function` cannot ride a plain `#[napi(object)]`; (2) the preflight receives
+  one object `{ownerJson, offerJson, briefJson}`, the `TaskBriefJs` precedent,
+  rather than three positionals. **Every refusal is a rejection of the
+  returned Promise, never a synchronous throw** (found by the first test run:
+  catalog and closed-provider refusals threw synchronously, so a caller would
+  have needed two failure channels).
+- [x] Catalog fields as checked `bigint` (D2, r2 R4), each refusal naming
+  the service and field (`a2a:invalid_argument: services["echo"].bounds.maxTags: …`).
+  `delegation::u64_arg` was not reused: its refusals carry the `delegation:`
+  prefix.
+- [x] `A2aServeHandle` grows a `Registered::{Legacy, Configured}` enum (the
+  Python one) and a `services` getter; `stop()` retires the registration and
+  drops the handle's references (D6). The registration is an
+  `Arc<Mutex<…>>` shared with the provider so `close()` can retire it.
+  `TaskBriefJs` gains `service` / `revision` (absent on the free path).
+- [x] Operator verbs: `a2aUnresolved() => Promise<string>`,
   `a2aResolve(ownerJson, taskId, stateJson, generation?: bigint) =>
   Promise<void>` over a `Weak` store reference, answering while any writer
-  holds the store and refusing once none does (D6).
-- [ ] `PaymentProvider.close()` stops a live configured serve.
+  holds the store and refusing once none does (D6). **Observed:** an operator
+  call's own store clone outlives its Promise by a few ms (≈30 ms measured),
+  so the refusal after an idle `stop()` is *eventual*; the test polls for it.
+- [x] `PaymentProvider.close()` stops a live configured serve.
+- [x] **Defect found:** `#[cfg]` on individual methods of a `#[napi] impl`
+  leaves napi-derive's registration of them dangling in builds without the
+  feature (`a2a_resolve_c_callback` not found under
+  `net,cortex,tool,publish,payments,consent`). The three A2A methods live in
+  their own `#[cfg(feature = "a2a")] #[napi] impl PaymentProvider` block.
+- [x] **CI gap closed:** the `ffi-clippy` node entry lacked `delegation,a2a`,
+  so neither the existing free `a2a.rs` nor this module was linted though
+  both ship by default. Added (`ci.yml` node entry).
 
-**Proved by:** the provider-side cases of WS-F's `a2a_paid.test.ts` (catalog
-refusals incl. the R4 numeric cases, journal ownership in-process and
-cross-process, the parked-executor ownership witness, operator queue) — runnable from this slice with a raw Rust-side
-caller, completed once WS-D lands; `cargo clippy -p net-node --all-targets`
-clean.
+**Proved by:** `bindings/node/test/a2a_paid.test.ts` (9, WS-B part):
+serving a catalog — the free entry runs through `submitTask` with
+`service`/`revision` on the brief, the paid one is refused unpaid
+(`status 0x8006: no admission reservation exists`) before the executor;
+catalog refusals; R4 numerics (`-1n`, `2⁶⁴`, `2⁶⁴+5` refused naming the field;
+`600`, `1.5`, `NaN`, `Infinity`, `'600'` refused by type); in-process journal
+ownership with idle reopen; **cross-process** ownership via a child `node`
+process (`REFUSED:a2a:journal_owned_elsewhere:` while held, `SERVED` after);
+**the R2 under-work witness** (a parked executor; `stop()` + `close()`; a
+second owner in-process and in a child process is refused and the operator
+queue still answers; releasing the task lets the reopen through); the
+operator queue lifecycle; `close()` retiring the registration; and the
+preflight (admit with the exact u64 owner read from the raw document,
+string refusal, throw, and a never-settling callback refused in < 15 s with
+`did not answer within 5000 ms`).
+
+> **Status: WS-B landed 2026-10-03.** 9/9 on five consecutive runs; the
+> whole node suite 759 passed / 9 skipped (pre-existing skips), the existing
+> `a2a` / `payment_provider` / `capability_gateway` suites unedited;
+> `cargo clippy` on `net-node` with the CI list **plus** `delegation,a2a`,
+> `--all-targets -D warnings`, clean; `cargo check` clean under
+> `net,cortex,delegation,a2a` and `net,cortex,tool,publish,payments,consent`;
+> `typecheck:tests` and rustfmt clean. Not yet witnessed (needs WS-C/D): the
+> paid prepare → purchase → submit path, and a preflight refusal at submit
+> after payment (`Reconcile`).
 
 ### WS-C — Requester raw verbs on `NetMesh` (`node/src/a2a.rs`)
 

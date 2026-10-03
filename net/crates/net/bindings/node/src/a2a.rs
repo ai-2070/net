@@ -86,21 +86,46 @@ pub struct TaskBriefJs {
     pub context_refs: Vec<String>,
     /// Routing / bookkeeping tags.
     pub tags: Vec<String>,
+    /// The catalog service this task was admitted under. Set only on the
+    /// configured path (`PaymentProvider.serveA2aConfigured`); absent on the
+    /// free `serveA2a` path, so a handler written for that ignores it.
+    pub service: Option<String>,
+    /// The catalog revision this task was admitted under (configured path
+    /// only, like `service`).
+    pub revision: Option<String>,
 }
 
 /// The bridged JS task executor:
 /// `(brief: TaskBriefJs) => Promise<string>` resolving to the result's
 /// artifact ref.
-type ExecutorTsfn = ThreadsafeFunction<TaskBriefJs, Promise<String>, TaskBriefJs, Status, false>;
+pub(crate) type ExecutorTsfn =
+    ThreadsafeFunction<TaskBriefJs, Promise<String>, TaskBriefJs, Status, false>;
+
+/// `handlerTimeoutMs` to a deadline: absent is the default, `0` is the
+/// explicit opt-out (cancellation is then the only control). Shared by the
+/// free and the configured serving paths so they cannot disagree.
+pub(crate) fn executor_timeout(handler_timeout_ms: Option<u32>) -> Option<std::time::Duration> {
+    match handler_timeout_ms {
+        Some(0) => None,
+        Some(ms) => Some(std::time::Duration::from_millis(u64::from(ms))),
+        None => Some(DEFAULT_TASK_HANDLER_TIMEOUT),
+    }
+}
 
 /// A [`TaskExecutor`] backed by a JS **async** callback. A mesh-side cancel
 /// trips the select below; the registry records `Cancelled` and the JS
 /// handler's result (if it ever resolves) is discarded. `timeout` bounds
 /// how long the JS side may take to settle (`None` = unbounded, the
 /// explicit `handlerTimeoutMs: 0` opt-out).
-struct NodeTaskExecutor {
+pub(crate) struct NodeTaskExecutor {
     callback: ExecutorTsfn,
     timeout: Option<std::time::Duration>,
+}
+
+impl NodeTaskExecutor {
+    pub(crate) fn new(callback: ExecutorTsfn, timeout: Option<std::time::Duration>) -> Self {
+        Self { callback, timeout }
+    }
 }
 
 #[async_trait::async_trait]
@@ -115,6 +140,8 @@ impl TaskExecutor for NodeTaskExecutor {
             prompt: brief.prompt.clone(),
             context_refs: brief.context_refs.clone(),
             tags: brief.tags.clone(),
+            service: brief.service.clone(),
+            revision: brief.revision.clone(),
         };
         // Enqueue the JS call; the oneshot resolves with the handler's
         // returned Promise (or its synchronous throw).
@@ -175,24 +202,75 @@ impl TaskExecutor for NodeTaskExecutor {
     }
 }
 
-/// Keeps the served A2A services alive (returned by `NetMesh.serveA2a`).
-/// Dropping it or calling [`stop`](Self::stop) unregisters them.
+/// What a serve call registered — held opaquely, because dropping it is
+/// the whole contract (the Python binding's `Registered`).
+pub(crate) enum Registered {
+    /// The free path: one `ServeHandle` per service (task/status/cancel).
+    Legacy(Vec<ServeHandle>),
+    /// The configured path: five registrations plus the journal's
+    /// exclusive-ownership handle, kept alive for exactly as long as the
+    /// handlers that can still write.
+    #[cfg(all(feature = "payments", feature = "publish"))]
+    Configured(net_sdk::mesh_a2a::A2aServing),
+}
+
+impl Registered {
+    /// Three on the free path, five on the configured one (plus prepare and
+    /// describe).
+    fn services(&self) -> usize {
+        match self {
+            Registered::Legacy(handles) => handles.len(),
+            #[cfg(all(feature = "payments", feature = "publish"))]
+            Registered::Configured(serving) => serving.handles.len(),
+        }
+    }
+}
+
+/// The registration a handle owns, shared with the `PaymentProvider` that
+/// created it so `provider.close()` can retire it too.
+pub(crate) type SharedRegistration = Arc<Mutex<Option<(SdkMesh, Registered)>>>;
+
+/// Keeps the served A2A services alive (returned by `NetMesh.serveA2a` or
+/// `PaymentProvider.serveA2aConfigured`). Dropping it or calling
+/// [`stop`](Self::stop) unregisters them.
 // `js_name` pinned: napi's auto-camelCase would emit `A2AServeHandle` /
 // `serveA2A`; the plan + Python parity spell the surface `A2aServeHandle`
 // / `serveA2a`.
 #[napi(js_name = "A2aServeHandle")]
 pub struct A2aServeHandle {
     // The `Mesh` holds the channel registry the services registered against,
-    // and each `ServeHandle` one dispatcher registration (task/status/
-    // cancel). A `parking_lot::Mutex` because napi hands out `&self`; a
-    // `#[napi]` class is GC-finalized, not scope-dropped, so `stop()` is the
-    // deterministic release (the `close()` gotcha in `bindings.md`).
-    inner: Mutex<Option<(SdkMesh, Vec<ServeHandle>)>>,
+    // and the registrations are whatever the serving path returned. A
+    // `parking_lot::Mutex` because napi hands out `&self`; a `#[napi]` class
+    // is GC-finalized, not scope-dropped, so `stop()` is the deterministic
+    // release (the `close()` gotcha in `bindings.md`).
+    inner: SharedRegistration,
+}
+
+impl A2aServeHandle {
+    pub(crate) fn new(mesh: SdkMesh, registered: Registered) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Some((mesh, registered)))),
+        }
+    }
+
+    /// The registration, for the provider that created it.
+    pub(crate) fn shared(&self) -> SharedRegistration {
+        Arc::clone(&self.inner)
+    }
 }
 
 #[napi]
 impl A2aServeHandle {
-    /// Stop accepting A2A tasks (unregister the services). Idempotent.
+    /// Stop accepting A2A tasks: unregister the services and release this
+    /// handle's references. Idempotent.
+    ///
+    /// On the configured path this **retires the registration; it does not
+    /// release the admission journal** while work remains. A task already
+    /// launched, and the terminal write that records its outcome, keep
+    /// their hold on the journal until they finish — so a second provider
+    /// on the same journal path is still refused until then. That is the
+    /// guarantee that no two owners ever both believe they may launch paid
+    /// work.
     #[napi]
     pub fn stop(&self) {
         let _ = self.inner.lock().take();
@@ -202,6 +280,17 @@ impl A2aServeHandle {
     #[napi(getter)]
     pub fn serving(&self) -> bool {
         self.inner.lock().is_some()
+    }
+
+    /// How many nRPC services are registered: three on the free `serveA2a`
+    /// path, five on the configured one (which also serves
+    /// `net.a2a.prepare` and `net.a2a.describe`). `0` once stopped.
+    #[napi(getter)]
+    pub fn services(&self) -> u32 {
+        self.inner
+            .lock()
+            .as_ref()
+            .map_or(0, |(_, r)| r.services() as u32)
     }
 }
 
@@ -232,24 +321,15 @@ impl NetMesh {
     ) -> Result<PromiseRaw<'env, A2aServeHandle>> {
         let node = self.node_arc_clone()?;
         let tsfn: ExecutorTsfn = executor.build_threadsafe_function().build()?;
-        let timeout = match options.and_then(|o| o.handler_timeout_ms) {
-            Some(0) => None, // explicit opt-out: cancellation is the only control
-            Some(ms) => Some(std::time::Duration::from_millis(u64::from(ms))),
-            None => Some(DEFAULT_TASK_HANDLER_TIMEOUT),
-        };
+        let timeout = executor_timeout(options.and_then(|o| o.handler_timeout_ms));
         env.spawn_future(async move {
             let mesh = mesh_over(node, None);
             let registry = TaskRegistry::new();
-            let executor: Arc<dyn TaskExecutor> = Arc::new(NodeTaskExecutor {
-                callback: tsfn,
-                timeout,
-            });
+            let executor: Arc<dyn TaskExecutor> = Arc::new(NodeTaskExecutor::new(tsfn, timeout));
             let handles = mesh
                 .serve_a2a(registry, executor)
                 .map_err(|e| a2a_err(format!("serveA2a failed: {e}")))?;
-            Ok(A2aServeHandle {
-                inner: Mutex::new(Some((mesh, handles))),
-            })
+            Ok(A2aServeHandle::new(mesh, Registered::Legacy(handles)))
         })
     }
 
