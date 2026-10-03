@@ -1,0 +1,45 @@
+go/netdb.go
+  s_391b90f341d6c6::t_8f74f28038c7ec 189
+go/capabilities.go
+  s_391b90f341d6c6::t_8f74f28038c7ec 193-196,269-272,375
+go/mesh_rpc.go
+  s_391b90f341d6c6::t_a3a597ff87fbee 558-560,563
+go/meshdb.go
+  s_391b90f341d6c6::t_8f74f28038c7ec 286,288-291
+go/stream_inbox.go
+  s_391b90f341d6c6::t_8f74f28038c7ec 97,99-102
+go/compute_dispatch.go
+  s_391b90f341d6c6::t_8f74f28038c7ec 400-406
+go/identity.go
+  s_391b90f341d6c6::t_8f74f28038c7ec 599-602,736-737
+go/cortex.go
+  s_391b90f341d6c6::t_8f74f28038c7ec 300-303,370,372-375,585-588,633-637,665,667-670,905-908,942-946,974,976-979
+go/tool.go
+  s_391b90f341d6c6::t_8f74f28038c7ec 997-1000,1126,1128-1134
+go/cbuf.go
+  s_391b90f341d6c6::t_a3a597ff87fbee 56-85
+go/mesh.go
+  s_391b90f341d6c6::t_8f74f28038c7ec 518,595,686,707,729,753,1127-1130,1166-1169,1312-1315
+go/mesh_rpc_typed.go
+  s_391b90f341d6c6::t_8f74f28038c7ec 954,956,969,971,1117,1119-1121
+go/blob_test.go
+  s_391b90f341d6c6::t_7bbc0f120b9592 18,577-598
+  s_391b90f341d6c6::t_f460c5337e1511 106-109,111,113,115-131
+  s_391b90f341d6c6::t_48e7cb1f6319ed 599
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0634fd9661701ea0d2c74f3480a3f1a1273391d6",
+  "prompts": {},
+  "sessions": {
+    "s_391b90f341d6c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e008671-9702-4db4-b22a-abb85b691773",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
