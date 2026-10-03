@@ -31,21 +31,6 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 - **Sharded ingestion.** Events stripe across per-shard buffers, merged for cross-shard consumption; the shard count defaults to CPU count and can scale at runtime.
 - **Optionally-reliable, optionally-ordered.** Delivery guarantees and ordering are chosen per channel — the mesh defaults to the fastest path and lets a caller pay only for the guarantees it needs.
 
-**Performance**
-
-On an M1 Max, one operation measured alone:
-
-- Header serialize — `2.19 ns`, `456 M ops/sec`
-- Routing lookup (hit) — `37.7 ns`, `26.5 M ops/sec`
-- 1-hop forward — `61.7 ns`, `16.2 M ops/sec`
-- Heartbeat from a known peer — `39.8 ns`, `25.2 M ops/sec`
-- Full fail + recover cycle — `291 ns`, `3.44 M ops/sec`
-- Capability lookup, selective tag — `~1.9 µs`, flat from 1k to 50k nodes
-- Capability filter match (single tag) — `57.1 ns`, `17.5 M ops/sec`
-- Start a node → first peer — `937 µs`
-
-These measure local operations — not NIC transfer, wire latency, or propagation. The full set is under [Performance](#performance).
-
 **What that gives you**
 
 - **No broker, no registry, no coordinator.** Peers find each other by what they can do.
@@ -56,6 +41,19 @@ These measure local operations — not NIC transfer, wire latency, or propagatio
 **Status:** pre-1.0. Major releases may break APIs — pin and read the
 [release notes](https://ai2070.net/docs/releases). The wire format is versioned separately, and
 subprotocol IDs are permanent.
+
+**Benchmarks**
+
+- Header serialize — `2.19 ns`, `456 M ops/sec`
+- Routing lookup (hit) — `37.7 ns`, `26.5 M ops/sec`
+- 1-hop forward — `61.7 ns`, `16.2 M ops/sec`
+- Heartbeat from a known peer — `39.8 ns`, `25.2 M ops/sec`
+- Full fail + recover cycle — `291 ns`, `3.44 M ops/sec`
+- Capability lookup, selective tag — `~1.9 µs`, flat from 1k to 50k nodes
+- Capability filter match (single tag) — `57.1 ns`, `17.5 M ops/sec`
+- Start a node → first peer — `937 µs`
+
+These measure local operations on an M1 Max — not NIC transfer, wire latency, or propagation. The full set is under [Performance](#performance).
 
 ## Install
 
