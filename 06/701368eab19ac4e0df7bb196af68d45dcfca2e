@@ -1,0 +1,29 @@
+net/crates/net/sdk-py/tests/test_wrapper_modules.py
+  s_17a2ac60d914fc::t_40cb06c6162ed6 201-236
+  s_17a2ac60d914fc::t_d6ce1b330f2d1b 153-158,166,180-182,189
+docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md
+  s_17a2ac60d914fc::t_bd995333dcc198 795-812
+net/crates/net/sdk-py/src/net_sdk/cortex.py
+  s_17a2ac60d914fc::t_d6ce1b330f2d1b 113
+  s_17a2ac60d914fc::t_26e6527d2f7bcc 94-97
+  s_17a2ac60d914fc::t_49a7eb96787b90 19,91,98,110,114
+go/abi_stability_test.go
+  s_17a2ac60d914fc::t_e7801072467788 34,36,488-491,546-573,575,577-578,581-582
+  s_17a2ac60d914fc::t_66b4a9a1077bad 583
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "06701368eab19ac4e0df7bb196af68d45dcfca2e",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
