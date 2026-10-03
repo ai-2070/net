@@ -1,0 +1,23 @@
+.github/workflows/ci.yml
+  s_391b90f341d6c6::t_0531736e76bd99 4857
+  s_391b90f341d6c6::t_0a44abd8e58327 4865
+docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md
+  s_391b90f341d6c6::t_9307921ac9cf35 1249-1274
+  s_391b90f341d6c6::t_1458785796c280 794
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b65d98afda43a7081bfb4532541ebd010c2d6aef",
+  "prompts": {},
+  "sessions": {
+    "s_391b90f341d6c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e008671-9702-4db4-b22a-abb85b691773",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
