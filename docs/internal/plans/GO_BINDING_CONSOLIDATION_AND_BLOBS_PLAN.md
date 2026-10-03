@@ -10,7 +10,8 @@ cross-language fixture. CI: S1's head ran green on every Go job, including the n
 `-race` step and its roster. Its one failure was the Firefox browser
 witness `stage5_a_refused_connect_closes_rtc_and_hands_back_its_attempt`
 (wasm leaf), which no Go change reaches and which also fails
-intermittently on `master` (run 36970267483). S5b deferred (see S5b); S7–S8 not started.
+intermittently on `master` (run 36970267483). S5b deferred (see S5b); S7 done (classification and ledger; the large
+ports are deferred, see S7); S8 not started.
 
 Reviewed twice before implementation (`d1b6f29`, then `317168c`). The first
 review accepted the direction and held on nine findings (R1–R9). The second
@@ -1036,6 +1037,48 @@ exactly once, after the last scheduler-held clone drops.
 **Proves it:** the ledger is complete, and a receiver-qualified symbol diff
 (reference vs. `go/`) leaves nothing unaccounted for.
 
+**Done, 2026-10-03 (classification and ledger; the deferred ports are
+listed below and are not done).**
+
+How the ledger was built: a `go/parser` walk of both packages lists every
+exported symbol, with methods qualified by receiver (`(Type).Method`). The
+reference exports 618, and **366 have no same-named definition in `go/`**.
+A name diff overstates the gap, because the shipped ports renamed things,
+so each cgo file was also checked by **C coverage**: which `C.net_*`
+functions the reference calls that `go/` never calls. The per-symbol rows
+(signature and first doc sentence, or the shipped equivalent) are in
+[the appendix](#appendix-s7-per-symbol-ledger), pinned to `610cd4e` so the
+design survives S8.
+
+| Reference file | Missing names | C functions it calls that `go/` never calls | Disposition |
+|---|---|---|---|
+| `transport.go` | 8 | 0 | **Already ported** (S2): methods instead of `unsafe.Pointer` functions; the `ErrTransfer` sentinel tree instead of `TransferError`. |
+| `redex.go` | 8 | 0 | **Already ported** (S3 plus existing `cortex.go`). The Go-side replication validator was deliberately not ported: native `NET_ERR_REDEX` validates. |
+| `tasks.go`, `memories.go` | 21 + 19 | 0 | **Superseded:** `go/cortex.go` reaches every C function they call, with a different shape (`SnapshotAndWatch` channels instead of `*Watch` types, string `OrderBy`/`Status`, positional `Store`/`Retag`). `PollForToken` is `WaitForToken(tok, 0)` (S4). |
+| `netdb.go`, `tool.go`, `mesh_rpc_typed.go` | 0 | 0 | Already ported. |
+| `mesh_rpc.go` | not countable | 0 | Already ported as far as the C surface goes (every C function it calls, `go/mesh_rpc.go` calls). Its names can't be diffed: the reference copy **does not parse**: a `/* … */` C comment nested in its cgo preamble (opened at line 52) closes the Go comment at line 156. Concrete evidence that nothing ever compiled this package. |
+| `meshos.go` | 0 | 1 (`net_meshos_register_daemon_with_vtable`) | **Deferred:** the vtable registration path, which needs the same callback-lifetime design as S5b. |
+| `placement.go` | 6 | 4 (`net_compute_*placement_filter*`) | **Deferred** under "Decision: placement-filter lifetime". The per-registration-token bridge isn't built, so a port would carry the old-filter-calls-new-predicate race. |
+| `deck.go` | 106 | 61 (admin verifier, audit query/stream, ice commands, operator identity/registry, log and failure streams) | **Deferred** to a Deck plan. The shipped `go/deck.go` covers the client read path only. |
+| `meshdb.go` | 68 | 14 (count, join, window, numeric aggregation, percentile, lineage, JSON filter, cached runner, payload decode, last-error accessors) | **Deferred** to a MeshDB plan. The shipped `go/meshdb.go` covers reader, at/between/latest and iteration. |
+| `capability.go` | 87 | — (pure Go) | **Deferred.** A Go re-implementation of the predicate builder and evaluator, placement builder, tag taxonomy and capability diff. TS ships the equivalents; Go has `CapabilitySet`/`CapabilityFilter` only. |
+| `capability_schema.go` | 25 | — (pure Go) | **Deferred**, with `capability.go` (schema validation; TS ships it). |
+| `resilience.go` | 18 | — (pure Go) | **Deferred:** retry/hedge/circuit-breaker helpers. Neither TS nor Python ships them; the Rust SDK has `mesh_rpc_resilience.rs`. They belong with an nRPC resilience plan, not here. |
+
+Why the large surfaces are deferred rather than ported here: deck,
+meshdb and capability total 261 missing names and 75 unreached C
+functions, none of them blob or transfer surface. Porting them is three
+features' worth of new public Go API, each owing its own plan, tests and
+review. The reference code can't be trusted as a starting point anyway (it
+never compiled; see `mesh_rpc.go`). Deferring them is what S7 allows,
+provided the design is preserved before deletion. The appendix does that,
+row by row, and its pinned commit keeps the full source retrievable.
+
+**Proves it:** the receiver-qualified diff has 366 rows, and every one
+appears in the appendix under a file with a disposition. Re-run:
+`go run` the scratch `symdiff` walker over both directories (the method is
+described above; the walker isn't committed).
+
 ### S8: delete `bindings/go/net/`
 
 Remove the directory. Repoint the comments in `go/*.go` that cite it
@@ -1120,6 +1163,446 @@ CI Go job are green.
   observed from any language binding. Found while building S3's gravity
   witness. Adding it is a new capability, so per the SDK-first rule it
   starts in `net-mesh-sdk`, not in this plan.
+
+## Appendix: S7 per-symbol ledger
+
+Generated from the reference package at `610cd4e`, the last commit before S8 deletes it. Each row is an exported symbol of `net/crates/net/bindings/go/net/` with **no same-named definition in `go/`**, matched by receiver (`(Type).Method`). The signature is the reference's declaration with its body stripped, and the note is the first sentence of its doc comment. To read a whole file after S8: `git show 610cd4e:net/crates/net/bindings/go/net/<file>`. `mesh_rpc_typed.go`, `meshos.go`, `netdb.go` and `tool.go` have no rows: every symbol they export already exists in `go/`. `mesh_rpc.go` has no rows because it doesn't parse (see S7); its C surface is fully covered by `go/mesh_rpc.go`.
+
+<details><summary><code>capability.go</code>: 87 symbols, deferred</summary>
+
+| Symbol | Reference signature | Intent (first doc sentence) |
+|---|---|---|
+| `TaxonomyAxes` | `var TaxonomyAxes` | TaxonomyAxes lists every axis the substrate knows about. |
+| `ReservedPrefixes` | `var ReservedPrefixes` | ReservedPrefixes — substrate-privileged-path cross-axis prefixes. |
+| `AxisSeparator` | `type AxisSeparator byte` | AxisSeparator is the character between an axis-tag's key and value. |
+| `SepEq` | `const SepEq` |  |
+| `SepColon` | `const SepColon` |  |
+| `TagKey` | `type TagKey struct{2 fields}` | TagKey is the {axis, key} addressing pair for axis-prefixed tags and axis-keyed predicates. |
+| `NewTagKey` | `// NewTagKey constructs a TagKey. Returns an error on empty key. func NewTagKey(axis TaxonomyAxis, key string) (TagKey, error)` | NewTagKey constructs a TagKey. |
+| `MustTagKey` | `// MustTagKey is the panicking variant — use only in test code or for // compile-time-known constants. func MustTagKey(axis TaxonomyAxis, key string) TagKey` | MustTagKey is the panicking variant — use only in test code or for compile-time-known constants. |
+| `TagKind` | `type TagKind uint8` | TagKind discriminates the Tag struct. |
+| `TagKindAxisPresent` | `const TagKindAxisPresent` |  |
+| `TagKindAxisValue` | `const TagKindAxisValue` |  |
+| `TagKindReserved` | `const TagKindReserved` |  |
+| `TagKindLegacy` | `const TagKindLegacy` |  |
+| `Tag` | `type Tag struct{8 fields}` | Tag is the typed capability tag. |
+| `NewAxisPresentTag` | `// NewAxisPresentTag builds an axis-present tag (`<axis>.<key>`). func NewAxisPresentTag(axis TaxonomyAxis, key string) Tag` | NewAxisPresentTag builds an axis-present tag (`<axis>.<key>`). |
+| `NewAxisValueTag` | `// NewAxisValueTag builds an axis-value tag (`<axis>.<key><sep><value>`). func NewAxisValueTag(axis TaxonomyAxis, key, value string, sep AxisSeparator) Tag` | NewAxisValueTag builds an axis-value tag (`<axis>.<key><sep><value>`). |
+| `NewReservedTag` | `// NewReservedTag builds a reserved-prefix tag. func NewReservedTag(prefix, body string) Tag` | NewReservedTag builds a reserved-prefix tag. |
+| `NewLegacyTag` | `// NewLegacyTag builds a free-form legacy tag. func NewLegacyTag(raw string) Tag` | NewLegacyTag builds a free-form legacy tag. |
+| `(Tag).String` | `// String renders to canonical wire form. Matches the substrate's // `Display` impl byte-for-byte. func (t Tag) String() string` | String renders to canonical wire form. |
+| `StartsWithReservedPrefix` | `// StartsWithReservedPrefix returns the matched prefix or empty // string if none matches. func StartsWithReservedPrefix(s string) string` | StartsWithReservedPrefix returns the matched prefix or empty string if none matches. |
+| `TagFromString` | `// TagFromString parses a wire string into a Tag. Privileged path — // accepts reserved prefixes. User code should use TagFromUserString. func TagFromString(s string) (Tag, error)` | TagFromString parses a wire string into a Tag. |
+| `TagFromUserString` | `// TagFromUserString rejects reserved prefixes, mirroring // `Tag::parse_user`. func TagFromUserString(s string) (Tag, error)` | TagFromUserString rejects reserved prefixes, mirroring `Tag::parse_user`. |
+| `PredicateNode` | `type PredicateNode struct{11 fields}` | PredicateNode is the wire representation of a single AST node. |
+| `PredicateWire` | `type PredicateWire struct{2 fields}` | PredicateWire is the canonical JSON shape — pinned by the `predicate_nrpc_envelope.json` cross-binding fixture. |
+| `Predicate` | `type Predicate struct{12 fields}` | Predicate is the in-memory AST. |
+| `Pred` | `var Pred` | Pred is the fluent predicate-builder namespace. |
+| `(predBuilder).Exists` | `func (predBuilder) Exists(k TagKey) *Predicate` |  |
+| `(predBuilder).Equals` | `func (predBuilder) Equals(k TagKey, v string) *Predicate` |  |
+| `(predBuilder).NumericAtLeast` | `func (predBuilder) NumericAtLeast(k TagKey, t float64) *Predicate` |  |
+| `(predBuilder).NumericAtMost` | `func (predBuilder) NumericAtMost(k TagKey, t float64) *Predicate` |  |
+| `(predBuilder).NumericInRange` | `func (predBuilder) NumericInRange(k TagKey, mn, mx float64) *Predicate` |  |
+| `(predBuilder).SemverAtLeast` | `func (predBuilder) SemverAtLeast(k TagKey, v string) *Predicate` |  |
+| `(predBuilder).SemverAtMost` | `func (predBuilder) SemverAtMost(k TagKey, v string) *Predicate` |  |
+| `(predBuilder).SemverCompatible` | `func (predBuilder) SemverCompatible(k TagKey, v string) *Predicate` |  |
+| `(predBuilder).StringPrefix` | `func (predBuilder) StringPrefix(k TagKey, p string) *Predicate` |  |
+| `(predBuilder).StringMatches` | `func (predBuilder) StringMatches(k TagKey, p string) *Predicate` |  |
+| `(predBuilder).MetadataExists` | `func (predBuilder) MetadataExists(k string) *Predicate` |  |
+| `(predBuilder).MetadataEquals` | `func (predBuilder) MetadataEquals(k, v string) *Predicate` |  |
+| `(predBuilder).MetadataMatches` | `func (predBuilder) MetadataMatches(k, p string) *Predicate` |  |
+| `(predBuilder).MetadataNumericAtLeast` | `func (predBuilder) MetadataNumericAtLeast(k string, t float64) *Predicate` |  |
+| `(predBuilder).And` | `func (predBuilder) And(children ...*Predicate) *Predicate` |  |
+| `(predBuilder).Or` | `func (predBuilder) Or(children ...*Predicate) *Predicate` |  |
+| `(predBuilder).Not` | `func (predBuilder) Not(child *Predicate) *Predicate` |  |
+| `PredicateToWire` | `// PredicateToWire flattens an AST into wire form. Children always // sit at strictly lower indices than their parents (post-order). func PredicateToWire(p *Predicate) PredicateWire` | PredicateToWire flattens an AST into wire form. |
+| `PredicateFromWire` | `// PredicateFromWire is the inverse of PredicateToWire. Returns an // error on out-of-range indices or unknown node kinds. func PredicateFromWire(w PredicateWire) (*Predicate, error)` | PredicateFromWire is the inverse of PredicateToWire. |
+| `RPCWhereHeader` | `const RPCWhereHeader` | RPCWhereHeader is the header the substrate uses to carry a predicate over nRPC. |
+| `PredicateToRPCHeader` | `// PredicateToRPCHeader encodes a predicate to the request-header // value (canonical JSON-encoded PredicateWire). func PredicateToRPCHeader(p *Predicate) (string, error)` | PredicateToRPCHeader encodes a predicate to the request-header value (canonical JSON-encoded PredicateWire). |
+| `PredicateFromRPCHeader` | `// PredicateFromRPCHeader decodes a `net-where` header value // into a predicate AST. func PredicateFromRPCHeader(value string) (*Predicate, error)` | PredicateFromRPCHeader decodes a `net-where` header value into a predicate AST. |
+| `DaemonCapabilities` | `type DaemonCapabilities struct{2 fields}` | DaemonCapabilities groups the two capability declarations a Phase 6 (`CAPABILITY_SYSTEM_SDK_PLAN.md`) Go daemon factory returns alongside its `process` / `sn... |
+| `WhereHeader` | `// WhereHeader builds the canonical `net-where:` request-header // entry for Phase 9b predicate-pushdown calls. // // The returned `(name, value)` pair drops into any `request_headers`- // shaped option list once `Mes...` | WhereHeader builds the canonical `net-where:` request-header entry for Phase 9b predicate-pushdown calls. |
+| `MetadataChangeKind` | `type MetadataChangeKind string` | MetadataChangeKind discriminates the change variant. |
+| `MetadataChangeAdded` | `const MetadataChangeAdded` |  |
+| `MetadataChangeRemoved` | `const MetadataChangeRemoved` |  |
+| `MetadataChangeUpdated` | `const MetadataChangeUpdated` |  |
+| `MetadataChange` | `type MetadataChange struct{5 fields}` | MetadataChange captures a per-key add / remove / update. |
+| `CapabilitySetDiff` | `type CapabilitySetDiff struct{3 fields}` | CapabilitySetDiff is the output of DiffCapabilities. |
+| `DiffCapabilities` | `// DiffCapabilities computes `curr.diff(prev)`. Tag arrays are // sorted by wire string; metadata changes sorted by key (BTreeMap // semantics in the substrate). // // Semantics: a key rename surfaces as Removed + Add...` | DiffCapabilities computes `curr.diff(prev)`. |
+| `EmptyCapabilities` | `// EmptyCapabilities returns an empty wire-format capability set. func EmptyCapabilities() CapabilitySetWire` | EmptyCapabilities returns an empty wire-format capability set. |
+| `RequireTag` | `// RequireTag adds an axis-tag (no value) to the wire shape. // Idempotent; no-op if the tag is already present. func RequireTag(caps CapabilitySetWire, axis TaxonomyAxis, key string) (CapabilitySetWire, error)` | RequireTag adds an axis-tag (no value) to the wire shape. |
+| `RequireAxisValue` | `// RequireAxisValue adds `<axis>.<key><sep><value>` to the wire shape. // Idempotent for the exact (axis, key, value, separator) tuple. func RequireAxisValue( caps CapabilitySetWire, axis TaxonomyAxis, key, value stri...` | RequireAxisValue adds `<axis>.<key><sep><value>` to the wire shape. |
+| `WithMetadata` | `// WithMetadata sets / overwrites a metadata entry. func WithMetadata(caps CapabilitySetWire, key, value string) (CapabilitySetWire, error)` | WithMetadata sets / overwrites a metadata entry. |
+| `StandardPlacement` | `type StandardPlacement struct{6 fields}` | StandardPlacement is the JSON-serializable configuration for the substrate's placement filter. |
+| `StandardPlacementBuilder` | `type StandardPlacementBuilder struct{6 fields}` | StandardPlacementBuilder is the fluent builder for StandardPlacement. |
+| `NewStandardPlacementBuilder` | `// NewStandardPlacementBuilder constructs an empty builder. func NewStandardPlacementBuilder() *StandardPlacementBuilder` | NewStandardPlacementBuilder constructs an empty builder. |
+| `(StandardPlacementBuilder).RequireTag` | `func (b *StandardPlacementBuilder) RequireTag(axis TaxonomyAxis, key string) *StandardPlacementBuilder` |  |
+| `(StandardPlacementBuilder).RequireAxisValue` | `func (b *StandardPlacementBuilder) RequireAxisValue( axis TaxonomyAxis, key, value string, sep AxisSeparator, ) *StandardPlacementBuilder` |  |
+| `(StandardPlacementBuilder).ForbidTag` | `func (b *StandardPlacementBuilder) ForbidTag(axis TaxonomyAxis, key string) *StandardPlacementBuilder` |  |
+| `(StandardPlacementBuilder).RequireMetadata` | `func (b *StandardPlacementBuilder) RequireMetadata(key, value string) *StandardPlacementBuilder` |  |
+| `(StandardPlacementBuilder).WithPredicate` | `// WithPredicate accepts either an AST or a pre-built PredicateWire. func (b *StandardPlacementBuilder) WithPredicate(p *Predicate) *StandardPlacementBuilder` | WithPredicate accepts either an AST or a pre-built PredicateWire. |
+| `(StandardPlacementBuilder).WithPredicateWire` | `// WithPredicateWire accepts a pre-built wire form (e.g. one // deserialized from somewhere else). func (b *StandardPlacementBuilder) WithPredicateWire(w PredicateWire) *StandardPlacementBuilder` | WithPredicateWire accepts a pre-built wire form (e.g. |
+| `(StandardPlacementBuilder).WithLimit` | `// WithLimit caps the candidate count. n must be non-negative. func (b *StandardPlacementBuilder) WithLimit(n int) (*StandardPlacementBuilder, error)` | WithLimit caps the candidate count. |
+| `(StandardPlacementBuilder).WithCustomFilterID` | `func (b *StandardPlacementBuilder) WithCustomFilterID(id string) (*StandardPlacementBuilder, error)` |  |
+| `(StandardPlacementBuilder).Build` | `// Build produces the immutable StandardPlacement config. func (b *StandardPlacementBuilder) Build() StandardPlacement` | Build produces the immutable StandardPlacement config. |
+| `PlacementCandidate` | `type PlacementCandidate struct{3 fields}` | PlacementCandidate is the per-candidate context passed to a custom placement filter. |
+| `PlacementFilterFn` | `type PlacementFilterFn func(PlacementCandidate) bool` | PlacementFilterFn is a synchronous predicate: true to keep, false to drop. |
+| `RegisteredPlacementFilter` | `type RegisteredPlacementFilter struct{2 fields}` | RegisteredPlacementFilter is the registration record returned by PlacementFilterFromFn. |
+| `PlacementFilterFromFn` | `// PlacementFilterFromFn wraps a user predicate as a registered // placement filter. If `explicitID` is empty, an auto-incremented // id is assigned. func PlacementFilterFromFn(fn PlacementFilterFn, explicitID string)...` | PlacementFilterFromFn wraps a user predicate as a registered placement filter. |
+| `EvaluatePredicate` | `// EvaluatePredicate evaluates a Predicate against a wire-format // (tags, metadata) context. Mirrors the substrate's // `Predicate::evaluate_unplanned`; children of And / Or evaluate in // declaration order with shor...` | EvaluatePredicate evaluates a Predicate against a wire-format (tags, metadata) context. |
+| `ClauseTrace` | `type ClauseTrace struct{3 fields}` | ClauseTrace is the wire-format trace tree. |
+| `EvaluatePredicateWithTrace` | `// EvaluatePredicateWithTrace evaluates a predicate against (tags, // metadata) and produces a trace tree. Mirrors the substrate's // `Predicate::evaluate_with_trace`: cost-ordered, short-circuiting, // drops siblings...` | EvaluatePredicateWithTrace evaluates a predicate against (tags, metadata) and produces a trace tree. |
+| `ClauseStats` | `type ClauseStats struct{3 fields}` | ClauseStats is the wire-format per-clause aggregated stats record. |
+| `PredicateDebugReport` | `type PredicateDebugReport struct{3 fields}` | PredicateDebugReport is the aggregate report from running a predicate across a corpus of evaluation contexts. |
+| `EvalContextWire` | `type EvalContextWire struct{2 fields}` | EvalContextWire is the wire-format input to the aggregator — what `evaluate*` consumes. |
+| `PredicateDebugReportFromEvaluations` | `// PredicateDebugReportFromEvaluations runs `pred` against each // context in `contexts`, accumulating per-clause hit / miss stats. // Mirrors the substrate's `PredicateDebugReport::from_evaluations`. // // `ClauseSta...` | PredicateDebugReportFromEvaluations runs `pred` against each context in `contexts`, accumulating per-clause hit / miss stats. |
+| `RedactMetadataKeys` | `// RedactMetadataKeys rewrites metadata-clause values in a debug // report to hide sensitive predicate values before persistence. // // Walks the report's ClauseStats and rewrites any label whose // metadata key is in...` | RedactMetadataKeys rewrites metadata-clause values in a debug report to hide sensitive predicate values before persistence. |
+| `PredicateDebugReportFromWire` | `// PredicateDebugReportFromWire reconstructs a PredicateDebugReport // from its wire JSON form. Symmetric inverse of // `json.Marshal(report)`. // // Use case: load a previously-saved debug report from disk for // ins...` | PredicateDebugReportFromWire reconstructs a PredicateDebugReport from its wire JSON form. |
+| `(PredicateDebugReport).Render` | `// Render formats a one-line-per-clause summary suitable for CLI output. func (r PredicateDebugReport) Render() string` | Render formats a one-line-per-clause summary suitable for CLI output. |
+
+</details>
+
+<details><summary><code>capability_schema.go</code>: 25 symbols, deferred</summary>
+
+| Symbol | Reference signature | Intent (first doc sentence) |
+|---|---|---|
+| `ValueType` | `type ValueType string` | ValueType discriminates the value shape of an axis key. |
+| `ValueTypePresence` | `const ValueTypePresence` |  |
+| `ValueTypeNumber` | `const ValueTypeNumber` |  |
+| `ValueTypeString` | `const ValueTypeString` |  |
+| `ValueTypeEnumeration` | `const ValueTypeEnumeration` |  |
+| `ValueTypeBool` | `const ValueTypeBool` |  |
+| `ValueTypeCsv` | `const ValueTypeCsv` |  |
+| `SchemaKeyEntry` | `type SchemaKeyEntry struct{2 fields}` | SchemaKeyEntry describes a fixed key under an axis. |
+| `SchemaShapeKind` | `type SchemaShapeKind uint8` | SchemaShapeKind discriminates KeyShape. |
+| `SchemaShapeIndexedCollection` | `const SchemaShapeIndexedCollection` |  |
+| `SchemaShapeKeyedMap` | `const SchemaShapeKeyedMap` |  |
+| `SchemaKeyShape` | `type SchemaKeyShape struct{4 fields}` | SchemaKeyShape describes an indexed / keyed sub-namespace under an axis. |
+| `SchemaAxisEntry` | `type SchemaAxisEntry struct{2 fields}` | AxisEntry holds the fixed keys + shape patterns for one axis. |
+| `AxisSchema` | `type AxisSchema struct{6 fields}` | AxisSchema is the top-level schema bundle. |
+| `MetadataReservedKeys` | `var MetadataReservedKeys` | MetadataReservedKeys lists substrate-defined reserved metadata keys. |
+| `MetadataReservedPrefixes` | `var MetadataReservedPrefixes` | MetadataReservedPrefixes lists reserved metadata-key prefixes. |
+| `MetadataSoftCapBytes` | `const MetadataSoftCapBytes` | MetadataSoftCapBytes is the default soft cap for `metadata` total size. |
+| `AxisSchemaCanonical` | `var AxisSchemaCanonical` | AxisSchemaCanonical mirrors `behavior::schema::AXIS_SCHEMA`. |
+| `SchemaError` | `type SchemaError struct{9 fields}` | SchemaError is the wire-format schema-violation record. |
+| `ValidationWarning` | `type ValidationWarning struct{7 fields}` | ValidationWarning is the wire-format forward-compat / hygiene record. |
+| `ValidationReport` | `type ValidationReport struct{2 fields}` | ValidationReport is the validator's output. |
+| `(ValidationReport).IsClean` | `// IsClean returns true iff there are zero errors and zero warnings. func (r ValidationReport) IsClean() bool` | IsClean returns true iff there are zero errors and zero warnings. |
+| `(ValidationReport).IsValid` | `// IsValid returns true iff there are zero errors. Warnings are allowed. func (r ValidationReport) IsValid() bool` | IsValid returns true iff there are zero errors. |
+| `ValidateCapabilities` | `// ValidateCapabilities runs the canonical validator against the // canonical AxisSchemaCanonical. func ValidateCapabilities(caps CapabilitySetWire) ValidationReport` | ValidateCapabilities runs the canonical validator against the canonical AxisSchemaCanonical. |
+| `ValidateCapabilitiesAgainst` | `// ValidateCapabilitiesAgainst runs the validator against a custom schema. func ValidateCapabilitiesAgainst( caps CapabilitySetWire, schema *AxisSchema, ) ValidationReport` | ValidateCapabilitiesAgainst runs the validator against a custom schema. |
+
+</details>
+
+<details><summary><code>deck.go</code>: 106 symbols, deferred</summary>
+
+| Symbol | Reference signature | Intent (first doc sentence) |
+|---|---|---|
+| `ErrDeckInvalidArg` | `var ErrDeckInvalidArg` |  |
+| `ErrDeckAlreadyShutdown` | `var ErrDeckAlreadyShutdown` |  |
+| `ErrDeckCallFailed` | `var ErrDeckCallFailed` |  |
+| `DeckSdkError` | `type DeckSdkError struct{3 fields}` | DeckSdkError carries the substrate's structured envelope. |
+| `(DeckSdkError).Error` | `func (e *DeckSdkError) Error() string` |  |
+| `(DeckSdkError).Unwrap` | `func (e *DeckSdkError) Unwrap() error` |  |
+| `EventKind` | `type EventKind int` | EventKind discriminates the AdminEvent variant carried by a ChainCommit. |
+| `EventKindUnknown` | `const EventKindUnknown` |  |
+| `EventKindDrain` | `const EventKindDrain` |  |
+| `EventKindEnterMaintenance` | `const EventKindEnterMaintenance` |  |
+| `EventKindExitMaintenance` | `const EventKindExitMaintenance` |  |
+| `EventKindCordon` | `const EventKindCordon` |  |
+| `EventKindUncordon` | `const EventKindUncordon` |  |
+| `EventKindDropReplicas` | `const EventKindDropReplicas` |  |
+| `EventKindInvalidatePlacement` | `const EventKindInvalidatePlacement` |  |
+| `EventKindRestartAllDaemons` | `const EventKindRestartAllDaemons` |  |
+| `EventKindClearAvoidList` | `const EventKindClearAvoidList` |  |
+| `(EventKind).String` | `func (k EventKind) String() string` |  |
+| `DeckStatusSummary` | `type DeckStatusSummary struct{9 fields}` | DeckStatusSummary mirrors the substrate's StatusSummary. |
+| `(DeckSnapshotStream).Close` | `// Close + free the stream. Safe to call concurrently with `Next`; // blocks at most one in-flight `Next(timeoutMs)` worth of time. // Repeated calls are no-ops via `sync.Once`. func (s *DeckSnapshotStream) Close()` | Close + free the stream. |
+| `(DeckStatusSummaryStream).Close` | `func (s *DeckStatusSummaryStream) Close()` |  |
+| `DeckLogLevel` | `type DeckLogLevel int` | DeckLogLevel mirrors the FFI `NET_DECK_LOG_*` constants. |
+| `DeckLogTrace` | `const DeckLogTrace` |  |
+| `DeckLogDebug` | `const DeckLogDebug` |  |
+| `DeckLogInfo` | `const DeckLogInfo` |  |
+| `DeckLogWarn` | `const DeckLogWarn` |  |
+| `DeckLogError` | `const DeckLogError` |  |
+| `(DeckLogLevel).String` | `func (l DeckLogLevel) String() string` |  |
+| `DeckLogFilter` | `type DeckLogFilter struct{4 fields}` | DeckLogFilter restricts the log stream. |
+| `DeckLogRecord` | `type DeckLogRecord struct{6 fields}` | DeckLogRecord is one log line. |
+| `DeckFailureRecord` | `type DeckFailureRecord struct{4 fields}` | DeckFailureRecord is one executor-failure record. |
+| `DeckLogStream` | `type DeckLogStream struct{3 fields}` | DeckLogStream — handle for the live log stream. |
+| `(DeckClient).SubscribeLogs` | `// SubscribeLogs opens a log stream. `filter == nil` matches // every record. func (c *DeckClient) SubscribeLogs(filter *DeckLogFilter) (*DeckLogStream, error)` | SubscribeLogs opens a log stream. |
+| `(DeckLogStream).Next` | `// Next blocks up to `timeoutMs` for the next log record. Returns // `(nil, nil)` on timeout, `(nil, ErrDeckEndOfStream)` on stream // end. Pass `0` for an unbounded wait. func (s *DeckLogStream) Next(timeoutMs uint64...` | Next blocks up to `timeoutMs` for the next log record. |
+| `(DeckLogStream).Close` | `func (s *DeckLogStream) Close()` |  |
+| `(DeckLogStream).Free` | `func (s *DeckLogStream) Free()` |  |
+| `DeckFailureStream` | `type DeckFailureStream struct{3 fields}` | DeckFailureStream — handle for the live failure stream. |
+| `(DeckClient).SubscribeFailures` | `func (c *DeckClient) SubscribeFailures(sinceSeq uint64) (*DeckFailureStream, error)` |  |
+| `(DeckFailureStream).Next` | `func (s *DeckFailureStream) Next(timeoutMs uint64) (*DeckFailureRecord, error)` |  |
+| `(DeckFailureStream).Close` | `func (s *DeckFailureStream) Close()` |  |
+| `(DeckFailureStream).Free` | `func (s *DeckFailureStream) Free()` |  |
+| `DeckAuditQuery` | `type DeckAuditQuery struct{1 fields}` | DeckAuditQuery is the Go-side handle for the audit query builder. |
+| `(DeckClient).Audit` | `func (c *DeckClient) Audit() (*DeckAuditQuery, error)` |  |
+| `(DeckAuditQuery).Recent` | `func (q *DeckAuditQuery) Recent(limit uint) *DeckAuditQuery` |  |
+| `(DeckAuditQuery).ByOperator` | `func (q *DeckAuditQuery) ByOperator(operatorID uint64) *DeckAuditQuery` |  |
+| `(DeckAuditQuery).Between` | `func (q *DeckAuditQuery) Between(startMs, endMs uint64) *DeckAuditQuery` |  |
+| `(DeckAuditQuery).ForceOnly` | `func (q *DeckAuditQuery) ForceOnly() *DeckAuditQuery` |  |
+| `(DeckAuditQuery).Since` | `func (q *DeckAuditQuery) Since(seq uint64) *DeckAuditQuery` |  |
+| `(DeckAuditQuery).Collect` | `// Collect returns the audit records as parsed `map[string]any` // objects. JSON parsing happens in Go; the FFI returns an array // of CString JSON payloads which we free immediately after copy. func (q *DeckAuditQuer...` | Collect returns the audit records as parsed `map[string]any` objects. |
+| `(DeckAuditQuery).Stream` | `func (q *DeckAuditQuery) Stream(client *DeckClient) (*DeckAuditStream, error)` |  |
+| `(DeckAuditQuery).Free` | `func (q *DeckAuditQuery) Free()` |  |
+| `DeckAuditStream` | `type DeckAuditStream struct{3 fields}` | DeckAuditStream — sync iterator over audit records (returned as parsed `map[string]any`). |
+| `(DeckAuditStream).Next` | `func (s *DeckAuditStream) Next(timeoutMs uint64) (map[string]any, error)` |  |
+| `(DeckAuditStream).Close` | `func (s *DeckAuditStream) Close()` |  |
+| `(DeckAuditStream).Free` | `func (s *DeckAuditStream) Free()` |  |
+| `AvoidScope` | `type AvoidScope struct{3 fields}` | AvoidScope is the discriminator for `Ice.FlushAvoidLists`. |
+| `AvoidScopeGlobal` | `func AvoidScopeGlobal() AvoidScope` |  |
+| `AvoidScopeLocal` | `func AvoidScopeLocal(node uint64) AvoidScope` |  |
+| `AvoidScopeOnPeer` | `func AvoidScopeOnPeer(peer uint64) AvoidScope` |  |
+| `DeckOperatorSignature` | `type DeckOperatorSignature struct{2 fields}` | DeckOperatorSignature is one entry in the bundle passed to `SimulatedIceProposal.Commit`. |
+| `DeckIceCommands` | `type DeckIceCommands struct{1 fields}` | DeckIceCommands — operator-side break-glass surface. |
+| `(DeckClient).Ice` | `// Ice returns the break-glass surface for the deck client. func (c *DeckClient) Ice() *DeckIceCommands` | Ice returns the break-glass surface for the deck client. |
+| `(DeckIceCommands).FreezeCluster` | `func (ic *DeckIceCommands) FreezeCluster(ttlMs uint64) (*DeckIceProposal, error)` |  |
+| `(DeckIceCommands).FlushAvoidLists` | `func (ic *DeckIceCommands) FlushAvoidLists(scope AvoidScope) (*DeckIceProposal, error)` |  |
+| `(DeckIceCommands).ForceEvictReplica` | `func (ic *DeckIceCommands) ForceEvictReplica(chain, victim uint64) (*DeckIceProposal, error)` |  |
+| `(DeckIceCommands).ForceRestartDaemon` | `// ForceRestartDaemon — `name` is the daemon's `MeshDaemon::name()`. func (ic *DeckIceCommands) ForceRestartDaemon(id uint64, name string) (*DeckIceProposal, error)` | ForceRestartDaemon — `name` is the daemon's `MeshDaemon::name()`. |
+| `(DeckIceCommands).ForceCutover` | `func (ic *DeckIceCommands) ForceCutover(chain, target uint64) (*DeckIceProposal, error)` |  |
+| `(DeckIceCommands).KillMigration` | `func (ic *DeckIceCommands) KillMigration(migration uint64) (*DeckIceProposal, error)` |  |
+| `(DeckIceCommands).ThawCluster` | `func (ic *DeckIceCommands) ThawCluster() (*DeckIceProposal, error)` |  |
+| `DeckIceProposal` | `type DeckIceProposal struct{1 fields}` | DeckIceProposal — pre-simulation. |
+| `(DeckIceProposal).IssuedAtMs` | `func (p *DeckIceProposal) IssuedAtMs() uint64` |  |
+| `(DeckIceProposal).Simulate` | `// Simulate consumes the proposal and runs the substrate // simulator. Subsequent calls return `DeckSdkError(kind: // "already_simulated")`. The caller still must `Free()` the // proposal husk after Simulate. func (p ...` | Simulate consumes the proposal and runs the substrate simulator. |
+| `(DeckIceProposal).Free` | `func (p *DeckIceProposal) Free()` |  |
+| `DeckSimulatedIceProposal` | `type DeckSimulatedIceProposal struct{1 fields}` | DeckSimulatedIceProposal — the only handle exposing Commit. |
+| `(DeckSimulatedIceProposal).IssuedAtMs` | `func (s *DeckSimulatedIceProposal) IssuedAtMs() uint64` |  |
+| `(DeckSimulatedIceProposal).BlastRadius` | `// BlastRadius returns the simulator's pre-execution preview as // a parsed map. JSON parsing happens Go-side; the FFI emits a // heap CString which we free immediately. func (s *DeckSimulatedIceProposal) BlastRadius(...` | BlastRadius returns the simulator's pre-execution preview as a parsed map. |
+| `(DeckSimulatedIceProposal).BlastHash` | `// BlastHash returns the 32-byte Blake3 digest signers must cover. func (s *DeckSimulatedIceProposal) BlastHash() ([32]byte, error)` | BlastHash returns the 32-byte Blake3 digest signers must cover. |
+| `(DeckSimulatedIceProposal).Commit` | `// Commit publishes the simulated proposal with the supplied // signatures. Consumes the proposal — subsequent calls return // `DeckSdkError(kind: "already_committed")`. func (s *DeckSimulatedIceProposal) Commit(cli...` | Commit publishes the simulated proposal with the supplied signatures. |
+| `(DeckSimulatedIceProposal).Free` | `func (s *DeckSimulatedIceProposal) Free()` |  |
+| `(DeckSimulatedIceProposal).SigningPayload` | `// SigningPayload returns the deterministic ICE signing payload // bytes (`ICE_SIGNING_DOMAIN // issued_at_ms (LE u64) // // blast_hash (32) // postcard(action)`). Useful for the offline // / cross-deck signing workfl...` | SigningPayload returns the deterministic ICE signing payload bytes (`ICE_SIGNING_DOMAIN // issued_at_ms (LE u64) // blast_hash (32) // postcard(action)`). |
+| `DeckOperatorIdentity` | `type DeckOperatorIdentity struct{1 fields}` | DeckOperatorIdentity is an operator's ed25519 keypair wrapped as an opaque handle. |
+| `GenerateDeckOperatorIdentity` | `// GenerateDeckOperatorIdentity creates a fresh keypair. func GenerateDeckOperatorIdentity() *DeckOperatorIdentity` | GenerateDeckOperatorIdentity creates a fresh keypair. |
+| `NewDeckOperatorIdentityFromSeed` | `// NewDeckOperatorIdentityFromSeed loads an identity from a // 32-byte ed25519 seed. func NewDeckOperatorIdentityFromSeed(seed []byte) (*DeckOperatorIdentity, error)` | NewDeckOperatorIdentityFromSeed loads an identity from a 32-byte ed25519 seed. |
+| `(DeckOperatorIdentity).OperatorID` | `// OperatorID returns the keypair's origin hash. func (i *DeckOperatorIdentity) OperatorID() uint64` | OperatorID returns the keypair's origin hash. |
+| `(DeckOperatorIdentity).PublicKey` | `// PublicKey returns the 32-byte ed25519 verifying key. Used to // author an `OperatorRegistry` from a set of known identities. func (i *DeckOperatorIdentity) PublicKey() ([]byte, error)` | PublicKey returns the 32-byte ed25519 verifying key. |
+| `(DeckOperatorIdentity).SignProposal` | `// SignProposal signs a simulated ICE proposal. Returns the // operator id + 64-byte ed25519 signature shaped as a // `DeckOperatorSignature` that `Commit` accepts directly. // // Returns `DeckSdkError(kind: "already_...` | SignProposal signs a simulated ICE proposal. |
+| `(DeckOperatorIdentity).SignPayload` | `// SignPayload signs raw payload bytes with this identity's // ed25519 key. Useful for offline / cross-deck signing flows // where the deterministic ICE signing payload is exchanged // out-of-band (see `DeckSimulatedI...` | SignPayload signs raw payload bytes with this identity's ed25519 key. |
+| `(DeckOperatorIdentity).Free` | `// Free releases the identity handle. Idempotent. func (i *DeckOperatorIdentity) Free()` | Free releases the identity handle. |
+| `DeckOperatorRegistry` | `type DeckOperatorRegistry struct{1 fields}` | DeckOperatorRegistry holds known operator public keys keyed by 64-bit operator id. |
+| `NewDeckOperatorRegistry` | `// NewDeckOperatorRegistry creates an empty registry. func NewDeckOperatorRegistry() *DeckOperatorRegistry` | NewDeckOperatorRegistry creates an empty registry. |
+| `(DeckOperatorRegistry).Insert` | `// Insert an operator's 32-byte ed25519 public key under // `operatorID`. func (r *DeckOperatorRegistry) Insert(operatorID uint64, publicKey []byte) error` | Insert an operator's 32-byte ed25519 public key under `operatorID`. |
+| `(DeckOperatorRegistry).Register` | `// Register an identity under its derived operator id (the // keypair's origin hash). func (r *DeckOperatorRegistry) Register(identity *DeckOperatorIdentity) error` | Register an identity under its derived operator id (the keypair's origin hash). |
+| `(DeckOperatorRegistry).Contains` | `// Contains reports whether `operatorID` is registered. func (r *DeckOperatorRegistry) Contains(operatorID uint64) bool` | Contains reports whether `operatorID` is registered. |
+| `(DeckOperatorRegistry).Len` | `// Len returns the number of registered operators. func (r *DeckOperatorRegistry) Len() int` | Len returns the number of registered operators. |
+| `(DeckOperatorRegistry).Verify` | `// Verify a single signature over `payload`. Returns a // `DeckSdkError` carrying the substrate's stable kind // discriminator (`not_authorized`, `signature_invalid`) on // failure. func (r *DeckOperatorRegistry) Veri...` | Verify a single signature over `payload`. |
+| `(DeckOperatorRegistry).VerifyBundle` | `// VerifyBundle confirms every signature over `payload` and that // at least `threshold` *distinct* operator ids signed it. The // distinct-operator dedup gate is the M-of-N guarantee. func (r *DeckOperatorRegistry) V...` | VerifyBundle confirms every signature over `payload` and that at least `threshold` *distinct* operator ids signed it. |
+| `(DeckOperatorRegistry).Free` | `// Free releases the registry. Idempotent. func (r *DeckOperatorRegistry) Free()` | Free releases the registry. |
+| `DeckAdminVerifier` | `type DeckAdminVerifier struct{1 fields}` | DeckAdminVerifier bundles a snapshotted OperatorRegistry with the cluster's policy knobs (signature threshold, freshness window, future-skew tolerance, ICE c... |
+| `NewDeckAdminVerifier` | `// NewDeckAdminVerifier builds a verifier with the substrate's // default freshness (300s), future-skew (30s), and ICE cooldown // (300s) windows. `threshold = 0` is clamped to `1`. func NewDeckAdminVerifier(registry ...` | NewDeckAdminVerifier builds a verifier with the substrate's default freshness (300s), future-skew (30s), and ICE cooldown (300s) windows. |
+| `NewDeckAdminVerifierWithFreshness` | `// NewDeckAdminVerifierWithFreshness uses explicit freshness + // future-skew windows and the default ICE cooldown. func NewDeckAdminVerifierWithFreshness(registry *DeckOperatorRegistry, threshold int, freshnessWindow...` | NewDeckAdminVerifierWithFreshness uses explicit freshness + future-skew windows and the default ICE cooldown. |
+| `NewDeckAdminVerifierWithFullPolicy` | `// NewDeckAdminVerifierWithFullPolicy sets every policy knob. // Primarily for tests that need a short cooldown window. func NewDeckAdminVerifierWithFullPolicy(registry *DeckOperatorRegistry, threshold int, freshnessW...` | NewDeckAdminVerifierWithFullPolicy sets every policy knob. |
+| `(DeckAdminVerifier).Threshold` | `func (v *DeckAdminVerifier) Threshold() int` |  |
+| `(DeckAdminVerifier).FreshnessWindowMs` | `func (v *DeckAdminVerifier) FreshnessWindowMs() uint64` |  |
+| `(DeckAdminVerifier).FutureSkewMs` | `func (v *DeckAdminVerifier) FutureSkewMs() uint64` |  |
+| `(DeckAdminVerifier).IceCooldownMs` | `func (v *DeckAdminVerifier) IceCooldownMs() uint64` |  |
+| `(DeckAdminVerifier).Free` | `func (v *DeckAdminVerifier) Free()` |  |
+
+</details>
+
+<details><summary><code>memories.go</code>: 19 symbols, superseded</summary>
+
+| Symbol | Reference signature | Shipped equivalent |
+|---|---|---|
+| `ErrMemories` | `var ErrMemories` | ErrCortex* sentinels (cortex.go) |
+| `ErrMemoriesTimeout` | `var ErrMemoriesTimeout` | ErrTokenTimeout (S4) |
+| `ErrMemoriesWrongOrigin` | `var ErrMemoriesWrongOrigin` | ErrWrongOrigin (S4) |
+| `ErrMemoriesQueueFull` | `var ErrMemoriesQueueFull` | ErrWaitQueueFull (S4) |
+| `ErrMemoriesFoldStopped` | `var ErrMemoriesFoldStopped` | ErrFoldStopped (S4) |
+| `ErrMemoriesPanic` | `var ErrMemoriesPanic` | cortexErrorFromCode default branch |
+| `MemoriesOrderBy` | `type MemoriesOrderBy string` | MemoriesFilter.OrderBy string |
+| `MemoriesOrderByCreatedAsc` | `const MemoriesOrderByCreatedAsc` | see the file row in S7 |
+| `MemoriesOrderByCreatedDesc` | `const MemoriesOrderByCreatedDesc` | see the file row in S7 |
+| `MemoriesOrderByUpdatedAsc` | `const MemoriesOrderByUpdatedAsc` | see the file row in S7 |
+| `MemoriesOrderByUpdatedDesc` | `const MemoriesOrderByUpdatedDesc` | see the file row in S7 |
+| `MemoryStoreInput` | `type MemoryStoreInput struct{5 fields}` | (*MemoriesAdapter).Store positional arguments |
+| `MemoryRetagInput` | `type MemoryRetagInput struct{3 fields}` | (*MemoriesAdapter).Retag positional arguments |
+| `OpenMemoriesAdapter` | `// OpenMemoriesAdapter opens a Memories adapter against the supplied // Redex. Same lifecycle pattern as TasksAdapter. func OpenMemoriesAdapter(redex *Redex, originHash uint64, persistent bool) (*MemoriesAdapter, error)` | OpenMemories (cortex.go) |
+| `(MemoriesAdapter).PollForToken` | `// PollForToken is a single non-blocking RYW poll. Mirrors // TasksAdapter.PollForToken. func (a *MemoriesAdapter) PollForToken(token WriteToken) error` | (*MemoriesAdapter).WaitForToken(tok, 0) (write_token.go, S4) |
+| `MemoriesWatch` | `type MemoriesWatch struct{2 fields}` | (*MemoriesAdapter).SnapshotAndWatch channels (cortex.go) |
+| `(MemoriesWatch).Next` | `// Next pulls the next delta batch. func (w *MemoriesWatch) Next(timeout time.Duration) ([]Memory, error)` | SnapshotAndWatch channels |
+| `(MemoriesWatch).NextContext` | `// NextContext is the cancellable variant of `Next`. func (w *MemoriesWatch) NextContext(ctx context.Context) ([]Memory, error)` | SnapshotAndWatch channels + context |
+| `(MemoriesWatch).Close` | `// Close releases the cursor. Idempotent. func (w *MemoriesWatch) Close() error` | context cancellation |
+
+</details>
+
+<details><summary><code>meshdb.go</code>: 68 symbols, deferred</summary>
+
+| Symbol | Reference signature | Intent (first doc sentence) |
+|---|---|---|
+| `ErrMeshDB` | `var ErrMeshDB` | ErrMeshDB is the discriminator for MeshDB-side errors. |
+| `ErrMeshDBInvalidArg` | `var ErrMeshDBInvalidArg` | ErrMeshDBInvalidArg covers null-pointer / out-of-range inputs that the FFI rejects synchronously. |
+| `ErrMeshDBRuntime` | `var ErrMeshDBRuntime` | ErrMeshDBRuntime covers planner / executor failures surfaced through `NET_MESHDB_RUNTIME_ERR`. |
+| `MeshDBError` | `type MeshDBError struct{3 fields}` | MeshDBError wraps a sentinel (ErrMeshDBInvalidArg / ErrMeshDBRuntime) with the FFI-supplied structured detail. |
+| `(MeshDBError).Error` | `// Error renders as "meshdb: <sentinel> (kind=KIND): MSG" — falls // back to just the sentinel when the FFI didn't populate the // last-error pair. func (e *MeshDBError) Error() string` | Error renders as "meshdb: <sentinel> (kind=KIND): MSG" — falls back to just the sentinel when the FFI didn't populate the last-error pair. |
+| `(MeshDBError).Unwrap` | `// Unwrap exposes the sentinel for `errors.Is` routing. func (e *MeshDBError) Unwrap() error` | Unwrap exposes the sentinel for `errors.Is` routing. |
+| `MeshDBResultRow` | `type MeshDBResultRow struct{3 fields}` | MeshDBResultRow is one row from a query result. |
+| `MeshDBResult` | `type MeshDBResult struct{2 fields}` | MeshDBResult pairs a row or error onto the channel returned by `(*MeshQueryRunner).Execute`. |
+| `MeshDBReader` | `type MeshDBReader struct{1 fields}` | MeshDBReader is the Go-side handle for the FFI's in-memory `ChainReader`. |
+| `NewMeshDBReader` | `// NewMeshDBReader allocates a fresh in-memory chain reader. Free // via `(*MeshDBReader).Free()` (or rely on the finalizer). func NewMeshDBReader() *MeshDBReader` | NewMeshDBReader allocates a fresh in-memory chain reader. |
+| `(MeshDBReader).Append` | `// Append a single event to the in-memory store. Payload bytes are // copied into the FFI; the caller retains ownership of `payload`. func (r *MeshDBReader) Append(origin, seq uint64, payload []byte) error` | Append a single event to the in-memory store. |
+| `(MeshDBReader).Free` | `// Free releases the FFI handle. Idempotent + safe on a nil // receiver. Subsequent method calls return `ErrMeshDBInvalidArg`. func (r *MeshDBReader) Free()` | Free releases the FFI handle. |
+| `MeshDBQuery` | `type MeshDBQuery struct{1 fields}` | MeshDBQuery is the Go-side handle for a planned MeshDB query. |
+| `MeshDBQueryAt` | `// MeshDBQueryAt builds an `At(origin, seq)` query. func MeshDBQueryAt(origin, seq uint64) *MeshDBQuery` | MeshDBQueryAt builds an `At(origin, seq)` query. |
+| `MeshDBQueryBetween` | `// MeshDBQueryBetween builds a `Between(origin, start, end)` query // (half-open). Returns `nil, ErrMeshDBInvalidArg` when `start >= // end`. func MeshDBQueryBetween(origin, start, end uint64) (*MeshDBQuery, error)` | MeshDBQueryBetween builds a `Between(origin, start, end)` query (half-open). |
+| `MeshDBQueryLatest` | `// MeshDBQueryLatest builds a `Latest(origin)` query. func MeshDBQueryLatest(origin uint64) *MeshDBQuery` | MeshDBQueryLatest builds a `Latest(origin)` query. |
+| `(MeshDBQuery).Free` | `// Free releases the FFI handle. func (q *MeshDBQuery) Free()` | Free releases the FFI handle. |
+| `MeshDBRunner` | `type MeshDBRunner struct{1 fields}` | MeshDBRunner is the Go-side handle for a query runner. |
+| `NewMeshDBRunner` | `// NewMeshDBRunner constructs a runner over the given reader. // Returns `nil` when `reader` is nil or already freed. func NewMeshDBRunner(reader *MeshDBReader) *MeshDBRunner` | NewMeshDBRunner constructs a runner over the given reader. |
+| `NewMeshDBRunnerCached` | `// NewMeshDBRunnerCached constructs a runner with the Phase F // LRU result cache wired in. Pass `MeshDBExecuteOptions` to // `ExecuteWith` to control per-query policy (Permanent vs // TimeBound, bypass for diagnostic...` | NewMeshDBRunnerCached constructs a runner with the Phase F LRU result cache wired in. |
+| `(MeshDBRunner).Execute` | `// Execute runs `query` and returns a channel of results. The // channel is closed on EOF (success) or after the first error. // Callers stop reading + drop the channel reference to cancel; // the goroutine notices th...` | Execute runs `query` and returns a channel of results. |
+| `(MeshDBRunner).ExecuteContext` | `// ExecuteContext runs `query` and pumps rows onto the returned // channel until EOF, the first error, or `ctx.Done()` fires. // The FFI execute call itself runs inside the spawned goroutine, // so the caller is never...` | ExecuteContext runs `query` and pumps rows onto the returned channel until EOF, the first error, or `ctx.Done()` fires. |
+| `MeshDBCachePolicyKind` | `type MeshDBCachePolicyKind int` | MeshDBCachePolicyKind discriminates the Phase F cache policies. |
+| `MeshDBCachePermanent` | `const MeshDBCachePermanent` | MeshDBCachePermanent caches until LRU eviction. |
+| `MeshDBCacheTimeBound` | `const MeshDBCacheTimeBound` | MeshDBCacheTimeBound applies a wall-clock TTL. |
+| `MeshDBExecuteOptions` | `type MeshDBExecuteOptions struct{3 fields}` | MeshDBExecuteOptions is the Phase F per-execute options surface. |
+| `(MeshDBRunner).ExecuteWith` | `// ExecuteWith runs `query` with explicit Phase F options. See // `Execute` for the channel semantics. The options struct's // zero value is `{TimeBound, 0 s}` — caller should set TTLSecs // to 5.0 for the canonical...` | ExecuteWith runs `query` with explicit Phase F options. |
+| `(MeshDBRunner).ExecuteWithContext` | `// ExecuteWithContext is the cancellable variant of `ExecuteWith`. // Same channel-and-EOF semantics as `ExecuteContext`: the FFI // execute call runs inside the spawned goroutine, never on the // caller's stack, so c...` | ExecuteWithContext is the cancellable variant of `ExecuteWith`. |
+| `(MeshDBRunner).Free` | `// Free releases the FFI handle. func (r *MeshDBRunner) Free()` | Free releases the FFI handle. |
+| `MeshDBQueryWindow` | `// MeshDBQueryWindow constructs a tumbling-on-seq window with // the given bucket size. Errors when size == 0. func MeshDBQueryWindow(inner *MeshDBQuery, size uint64) (*MeshDBQuery, error)` | MeshDBQueryWindow constructs a tumbling-on-seq window with the given bucket size. |
+| `MeshDBQueryCount` | `// MeshDBQueryCount counts the rows produced by `inner`. `groupBy` // is a slice of row-intrinsic field names: empty / nil for a // single-bucket count, ["origin"], ["seq"], or ["origin","seq"] // for grouped counts. ...` | MeshDBQueryCount counts the rows produced by `inner`. |
+| `MeshDBQueryNumericAgg` | `// MeshDBQuerySum / Avg / Min / Max / DistinctCount: numeric // aggregates over `field`. `kind` is one of: "sum", "avg", // "min", "max", "distinct_count". func MeshDBQueryNumericAgg( inner *MeshDBQuery, kind, field s...` | MeshDBQuerySum / Avg / Min / Max / DistinctCount: numeric aggregates over `field`. |
+| `MeshDBQueryPercentile` | `// MeshDBQueryPercentile: nearest-rank exact percentile. `p` is // clamped at the FFI boundary — must be finite in [0, 1]. func MeshDBQueryPercentile( inner *MeshDBQuery, field string, p float64, groupBy []string, )...` | MeshDBQueryPercentile: nearest-rank exact percentile. |
+| `MeshDBQueryJoin` | `// MeshDBQueryJoin: hash-join two queries. `kind` is one of // "inner" / "left_outer" / "right_outer" / "full_outer". // `key` is "origin", "seq", "origin,seq", or a JSON payload // path. `strategy` is "hash_broadcast...` | MeshDBQueryJoin: hash-join two queries. |
+| `MeshDBLineageEntry` | `type MeshDBLineageEntry struct{3 fields}` | MeshDBLineageEntry describes one chain reached during a lineage walk. |
+| `MeshDBQueryLineageEmit` | `// MeshDBQueryLineageEmit constructs a `LineageEmit(origin, // entries, direction)` query. `direction` is "back" or // "forward". Each entry produces one ResultRow with origin = // entry.Origin, seq = entry.TipSeq (or...` | MeshDBQueryLineageEmit constructs a `LineageEmit(origin, entries, direction)` query. |
+| `DecodedPayload` | `type DecodedPayload struct{4 fields}` | DecodedPayload is a tagged union over the three sentinel envelope shapes. |
+| `DecodedAggregate` | `type DecodedAggregate struct{2 fields}` | DecodedAggregate is the decoded form of an aggregate sentinel row. |
+| `DecodedGroupKey` | `type DecodedGroupKey struct{3 fields}` | DecodedGroupKey identifies which group an aggregate row belongs to. |
+| `DecodedAggregateValue` | `type DecodedAggregateValue struct{3 fields}` | DecodedAggregateValue carries the numeric output of an aggregate. |
+| `DecodedJoined` | `type DecodedJoined struct{2 fields}` | DecodedJoined holds the (left, right) pair from a join sentinel row. |
+| `DecodedWindowBoundary` | `type DecodedWindowBoundary struct{3 fields}` | DecodedWindowBoundary holds a window bucket: half-open `[Start, End)` over seq, plus the rows that landed in it. |
+| `DecodePayload` | `// DecodePayload parses a result-row's payload as a postcard- // encoded sentinel envelope. Returns (nil, nil) for plain // event-payload rows; (nil, err) on malformed FFI output. func DecodePayload(row MeshDBResultRo...` | DecodePayload parses a result-row's payload as a postcard- encoded sentinel envelope. |
+| `MeshDBPredicate` | `type MeshDBPredicate struct{11 fields}` | MeshDBPredicate is the Go-side predicate builder. |
+| `MeshDBPredicateExists` | `// MeshDBPredicateExists matches rows where `field` is present. func MeshDBPredicateExists(field string) MeshDBPredicate` | MeshDBPredicateExists matches rows where `field` is present. |
+| `MeshDBPredicateEquals` | `// MeshDBPredicateEquals matches rows where `field == value` (string equality). func MeshDBPredicateEquals(field, value string) MeshDBPredicate` | MeshDBPredicateEquals matches rows where `field == value` (string equality). |
+| `MeshDBPredicateNumericAtLeast` | `// MeshDBPredicateNumericAtLeast: `field >= threshold`. func MeshDBPredicateNumericAtLeast(field string, threshold float64) MeshDBPredicate` | MeshDBPredicateNumericAtLeast: `field >= threshold`. |
+| `MeshDBPredicateNumericAtMost` | `// MeshDBPredicateNumericAtMost: `field <= threshold`. func MeshDBPredicateNumericAtMost(field string, threshold float64) MeshDBPredicate` | MeshDBPredicateNumericAtMost: `field <= threshold`. |
+| `MeshDBPredicateNumericInRange` | `// MeshDBPredicateNumericInRange: `min <= field <= max`. func MeshDBPredicateNumericInRange(field string, min, max float64) MeshDBPredicate` | MeshDBPredicateNumericInRange: `min <= field <= max`. |
+| `MeshDBPredicateStringPrefix` | `// MeshDBPredicateStringPrefix: `field.startsWith(prefix)`. func MeshDBPredicateStringPrefix(field, prefix string) MeshDBPredicate` | MeshDBPredicateStringPrefix: `field.startsWith(prefix)`. |
+| `MeshDBPredicateStringMatches` | `// MeshDBPredicateStringMatches: substring match (regex behind a // feature flag in the substrate; not exposed at the FFI yet). func MeshDBPredicateStringMatches(field, pattern string) MeshDBPredicate` | MeshDBPredicateStringMatches: substring match (regex behind a feature flag in the substrate; not exposed at the FFI yet). |
+| `MeshDBPredicateSemverAtLeast` | `// MeshDBPredicateSemverAtLeast: `field >= version` (semver). func MeshDBPredicateSemverAtLeast(field, version string) MeshDBPredicate` | MeshDBPredicateSemverAtLeast: `field >= version` (semver). |
+| `MeshDBPredicateAnd` | `// MeshDBPredicateAnd: conjunction. Empty list is vacuously true // (substrate semantics). func MeshDBPredicateAnd(children ...MeshDBPredicate) MeshDBPredicate` | MeshDBPredicateAnd: conjunction. |
+| `MeshDBPredicateOr` | `// MeshDBPredicateOr: disjunction. Empty list is vacuously false. func MeshDBPredicateOr(children ...MeshDBPredicate) MeshDBPredicate` | MeshDBPredicateOr: disjunction. |
+| `MeshDBPredicateNot` | `// MeshDBPredicateNot: negation. func MeshDBPredicateNot(child MeshDBPredicate) MeshDBPredicate` | MeshDBPredicateNot: negation. |
+| `MeshDBQueryFilter` | `// MeshDBQueryFilter wraps `inner` in a Filter operator over // `predicate`. The predicate is JSON-encoded and passed across // the FFI boundary. func MeshDBQueryFilter( inner *MeshDBQuery, predicate MeshDBPredicate, ...` | MeshDBQueryFilter wraps `inner` in a Filter operator over `predicate`. |
+| `MeshDBQueryBuilder` | `type MeshDBQueryBuilder struct{2 fields}` | MeshDBQueryBuilder is the fluent builder handle. |
+| `NewMeshDBQueryBuilder` | `// NewMeshDBQueryBuilder returns an empty builder. Use one of // the source methods (At / Between / Latest) to seed it, then // chain transformations and call Build. func NewMeshDBQueryBuilder() *MeshDBQueryBuilder` | NewMeshDBQueryBuilder returns an empty builder. |
+| `(MeshDBQueryBuilder).At` | `// At resets the builder to a fresh source: read seq at origin. // // Any prior chain step's state on the receiver is explicitly // freed (Python / Node get away with GC; Go's FFI handle is // not GC-managed and final...` | At resets the builder to a fresh source: read seq at origin. |
+| `(MeshDBQueryBuilder).Between` | `// Between resets the builder to a fresh source: read events in // the half-open seq range. Same lifetime / aliasing semantics // as `At`. Errors from `MeshDBQueryBetween` are combined with // any prior accumulated er...` | Between resets the builder to a fresh source: read events in the half-open seq range. |
+| `(MeshDBQueryBuilder).Latest` | `// Latest resets the builder to a fresh source: read the tip // event of origin. Same lifetime / aliasing semantics as `At`. func (b *MeshDBQueryBuilder) Latest(origin uint64) *MeshDBQueryBuilder` | Latest resets the builder to a fresh source: read the tip event of origin. |
+| `(MeshDBQueryBuilder).Filter` | `// Filter wraps the current pipeline in a row filter. func (b *MeshDBQueryBuilder) Filter(predicate MeshDBPredicate) *MeshDBQueryBuilder` | Filter wraps the current pipeline in a row filter. |
+| `(MeshDBQueryBuilder).Count` | `// Count over the current pipeline. `groupBy` is the same // row-intrinsic field-list as the factory. func (b *MeshDBQueryBuilder) Count(groupBy []string) *MeshDBQueryBuilder` | Count over the current pipeline. |
+| `(MeshDBQueryBuilder).NumericAgg` | `// Sum / Avg / Min / Max over the current pipeline. `kind` is // one of "sum"/"avg"/"min"/"max"/"distinct_count". func (b *MeshDBQueryBuilder) NumericAgg( kind, field string, groupBy []string, ) *MeshDBQueryBuilder` | Sum / Avg / Min / Max over the current pipeline. |
+| `(MeshDBQueryBuilder).Percentile` | `// Percentile over the current pipeline. func (b *MeshDBQueryBuilder) Percentile( field string, p float64, groupBy []string, ) *MeshDBQueryBuilder` | Percentile over the current pipeline. |
+| `(MeshDBQueryBuilder).Window` | `// Window over the current pipeline. func (b *MeshDBQueryBuilder) Window(size uint64) *MeshDBQueryBuilder` | Window over the current pipeline. |
+| `(MeshDBQueryBuilder).Join` | `// Join the current pipeline (left) with `right`. See // `MeshDBQueryJoin` for the parameter docs. func (b *MeshDBQueryBuilder) Join( right *MeshDBQuery, kind, key, strategy string, watermarkSecs float64, ) *MeshDBQue...` | Join the current pipeline (left) with `right`. |
+| `(MeshDBQueryBuilder).Build` | `// Build returns the accumulated MeshDBQuery. Returns the first // error encountered during chaining, or an error if no source // was seeded. func (b *MeshDBQueryBuilder) Build() (*MeshDBQuery, error)` | Build returns the accumulated MeshDBQuery. |
+
+</details>
+
+<details><summary><code>placement.go</code>: 6 symbols, deferred</summary>
+
+| Symbol | Reference signature | Intent (first doc sentence) |
+|---|---|---|
+| `MeshArcPtr` | `type MeshArcPtr unsafe.Pointer` | MeshArcPtr is an opaque handle obtained from `net_mesh_arc_clone` (defined in `net::ffi::mesh`, exposed by upstream consumers). |
+| `PlacementFilterError` | `type PlacementFilterError struct{2 fields}` | PlacementFilterError categorizes register-side failures. |
+| `(PlacementFilterError).Error` | `func (e *PlacementFilterError) Error() string` |  |
+| `RegisterPlacementFilter` | `// RegisterPlacementFilter wires a `RegisteredPlacementFilter` (from // capability.go's `PlacementFilterFromFn`) to the substrate, so any // subsequent placement decision whose // `StandardPlacement.CustomFilterID` eq...` | RegisterPlacementFilter wires a `RegisteredPlacementFilter` (from capability.go's `PlacementFilterFromFn`) to the substrate, so any subsequent placement deci... |
+| `UnregisterPlacementFilter` | `// UnregisterPlacementFilter drops the Go-side and substrate-side // registrations under `id`. Returns `true` if the substrate had a // matching registration (Rust returns `1`); `false` otherwise. Any // in-flight sch...` | UnregisterPlacementFilter drops the Go-side and substrate-side registrations under `id`. |
+| `HasPlacementFilter` | `// HasPlacementFilter reports whether the substrate has a // registration for `id`. Mainly diagnostic. func HasPlacementFilter(id string) bool` | HasPlacementFilter reports whether the substrate has a registration for `id`. |
+
+</details>
+
+<details><summary><code>redex.go</code>: 8 symbols, already ported</summary>
+
+| Symbol | Reference signature | Shipped equivalent |
+|---|---|---|
+| `ErrReplicationRequiresEnable` | `var ErrReplicationRequiresEnable` | ErrRedex (native NET_ERR_REDEX) |
+| `ErrInvalidReplicationConfig` | `var ErrInvalidReplicationConfig` | ErrRedex (native NET_ERR_REDEX; S3 did not port the Go-side validator) |
+| `(Redex).Handle` | `// Handle returns the underlying C pointer as `unsafe.Pointer` for // cross-file cgo consumers (Tasks / Memories adapters live in // separate .go files and each defines its own opaque // `RedexHandle` typedef; their c...` | none: the shipped binding never hands out raw handles |
+| `ReplicationConfig` | `type ReplicationConfig struct{8 fields}` | RedexReplicationConfig (redex_dataforts.go, S3) |
+| `NewRedexWithPersistentDir` | `// NewRedexWithPersistentDir constructs a Redex with `dir` set as // the persistent base directory for `Persistent: true` channels. func NewRedexWithPersistentDir(dir string) *Redex` | NewRedex(dir) (cortex.go) |
+| `(Redex).Close` | `// Close releases the underlying `Redex` handle. Idempotent. func (r *Redex) Close() error` | (*Redex).Free (cortex.go) |
+| `ErrInvalidGreedyConfig` | `var ErrInvalidGreedyConfig` | ErrInvalidRedexConfig / ErrRedex (S3) |
+| `(RedexFile).NextSeq` | `// NextSeq returns the next sequence number the file will assign // (== total append count since open). func (f *RedexFile) NextSeq() uint64` | (*RedexFile).Len (cortex.go) |
+
+</details>
+
+<details><summary><code>resilience.go</code>: 18 symbols, deferred</summary>
+
+| Symbol | Reference signature | Intent (first doc sentence) |
+|---|---|---|
+| `RetryPolicy` | `type RetryPolicy struct{6 fields}` | RetryPolicy controls how `CallWithRetry` re-attempts on retriable failures. |
+| `DefaultRetryPolicy` | `// DefaultRetryPolicy returns a sensible-default policy: 3 // attempts, 50ms initial, 2.0 multiplier, 1s cap, 20% jitter. func DefaultRetryPolicy() RetryPolicy` | DefaultRetryPolicy returns a sensible-default policy: 3 attempts, 50ms initial, 2.0 multiplier, 1s cap, 20% jitter. |
+| `DefaultIsRetriable` | `// DefaultIsRetriable returns true for `*RpcError` instances whose // kind is `RpcKindNoRoute` or `RpcKindTransport`. Used when // `RetryPolicy.IsRetriable` is nil. func DefaultIsRetriable(err error) bool` | DefaultIsRetriable returns true for `*RpcError` instances whose kind is `RpcKindNoRoute` or `RpcKindTransport`. |
+| `CallFn` | `type CallFn func(ctx context.Context) ([]byte, error)` | CallFn is the unary call signature retry / hedge wrappers operate on. |
+| `CallWithRetry` | `// CallWithRetry invokes `call` up to `policy.MaxAttempts` times, // sleeping with exponential backoff (clamped + jittered) between // attempts. Stops early on a non-retriable error or context // cancellation. func Ca...` | CallWithRetry invokes `call` up to `policy.MaxAttempts` times, sleeping with exponential backoff (clamped + jittered) between attempts. |
+| `HedgePolicy` | `type HedgePolicy struct{3 fields}` | HedgePolicy controls how `CallWithHedge` races parallel attempts. |
+| `DefaultHedgePolicy` | `// DefaultHedgePolicy returns a sensible-default policy: 2 // parallel, 50ms hedge delay, cancel losers. func DefaultHedgePolicy() HedgePolicy` | DefaultHedgePolicy returns a sensible-default policy: 2 parallel, 50ms hedge delay, cancel losers. |
+| `CallWithHedge` | `// CallWithHedge fans out hedge requests on a delay until one // succeeds, all attempts fail, or `ctx` cancels. Returns the // first successful response. If every attempt errors, returns the // last attempt's error (m...` | CallWithHedge fans out hedge requests on a delay until one succeeds, all attempts fail, or `ctx` cancels. |
+| `BreakerState` | `type BreakerState int` | BreakerState is the breaker's current operating state. |
+| `BreakerClosed` | `const BreakerClosed` |  |
+| `BreakerOpen` | `const BreakerOpen` |  |
+| `BreakerHalfOpen` | `const BreakerHalfOpen` |  |
+| `(BreakerState).String` | `func (s BreakerState) String() string` |  |
+| `ErrBreakerOpen` | `var ErrBreakerOpen` | ErrBreakerOpen is returned by `CircuitBreaker.Call` when the breaker is open and refuses to admit a call. |
+| `CircuitBreaker` | `type CircuitBreaker struct{7 fields}` | CircuitBreaker tracks consecutive failures and trips open after a threshold. |
+| `NewCircuitBreaker` | `// NewCircuitBreaker constructs a breaker. `failureThreshold` MUST // be >= 1. Pass nil `isFailure` for the default (any error // counts). func NewCircuitBreaker( failureThreshold int, resetAfter time.Duration, isFail...` | NewCircuitBreaker constructs a breaker. |
+| `(CircuitBreaker).State` | `// State returns the breaker's current state. Note: the underlying // state is mutated lazily on `Call` — observers may see a stale // `Open` value until the next `Call` triggers the half-open // transition. func (b...` | State returns the breaker's current state. |
+| `(CircuitBreaker).Call` | `// Call admits the call iff the breaker isn't open (or has aged // past `ResetAfter` for a half-open probe). On success, resets // the failure count + closes the breaker. On failure, increments // the count + may trip...` | Call admits the call iff the breaker isn't open (or has aged past `ResetAfter` for a half-open probe). |
+
+</details>
+
+<details><summary><code>tasks.go</code>: 21 symbols, superseded</summary>
+
+| Symbol | Reference signature | Shipped equivalent |
+|---|---|---|
+| `ErrTasks` | `var ErrTasks` | ErrCortex* sentinels (cortex.go) |
+| `ErrTasksTimeout` | `var ErrTasksTimeout` | ErrTokenTimeout (S4) |
+| `ErrTasksWrongOrigin` | `var ErrTasksWrongOrigin` | ErrWrongOrigin (S4) |
+| `ErrTasksQueueFull` | `var ErrTasksQueueFull` | ErrWaitQueueFull (S4) |
+| `ErrTasksFoldStopped` | `var ErrTasksFoldStopped` | ErrFoldStopped (S4) |
+| `ErrTasksPanic` | `var ErrTasksPanic` | cortexErrorFromCode default branch |
+| `TaskStatus` | `type TaskStatus string` | Task.Status string |
+| `TaskStatusPending` | `const TaskStatusPending` | see the file row in S7 |
+| `TaskStatusCompleted` | `const TaskStatusCompleted` | see the file row in S7 |
+| `TasksOrderBy` | `type TasksOrderBy string` | TasksFilter.OrderBy string |
+| `TasksOrderByCreatedAsc` | `const TasksOrderByCreatedAsc` | see the file row in S7 |
+| `TasksOrderByCreatedDesc` | `const TasksOrderByCreatedDesc` | see the file row in S7 |
+| `TasksOrderByUpdatedAsc` | `const TasksOrderByUpdatedAsc` | see the file row in S7 |
+| `TasksOrderByUpdatedDesc` | `const TasksOrderByUpdatedDesc` | see the file row in S7 |
+| `TasksOrderByTitleAsc` | `const TasksOrderByTitleAsc` | see the file row in S7 |
+| `OpenTasksAdapter` | `// OpenTasksAdapter opens a Tasks adapter against the supplied Redex. // `persistent = true` routes writes through the Redex's persistent // directory (the Redex must have been created with // `NewRedexWithPersistentD...` | OpenTasks (cortex.go) |
+| `(TasksAdapter).PollForToken` | `// PollForToken is a single non-blocking RYW poll. Checks the // adapter's applied watermark + origin binding and returns // immediately. `nil` means the write is observable; `ErrTasksTimeout` // means it isn't (yet)....` | (*TasksAdapter).WaitForToken(tok, 0) (write_token.go, S4) |
+| `TasksWatch` | `type TasksWatch struct{2 fields}` | (*TasksAdapter).SnapshotAndWatch channels (cortex.go) |
+| `(TasksWatch).Next` | `// Next pulls the next change batch from the watch cursor. // `timeout == 0` blocks indefinitely. Returns `(batch, nil)` on // event, `(nil, ErrTasksTimeout)` on timeout, `(nil, io.EOF`-style // stream-ended sentinel)...` | SnapshotAndWatch channels |
+| `(TasksWatch).NextContext` | `// NextContext is the cancellable variant of `Next`. Polls with a // short FFI timeout in a loop; checks `ctx.Done()` between polls // so a long-cancelled wait doesn't pin a thread. func (w *TasksWatch) NextContext(ct...` | SnapshotAndWatch channels + context |
+| `(TasksWatch).Close` | `// Close releases the cursor. Idempotent. func (w *TasksWatch) Close() error` | context cancellation |
+
+</details>
+
+<details><summary><code>transport.go</code>: 8 symbols, already ported</summary>
+
+| Symbol | Reference signature | Shipped equivalent |
+|---|---|---|
+| `TransferError` | `type TransferError struct{2 fields}` | ErrTransfer sentinel tree (blob.go; S2 design: errors.Is, not a struct) |
+| `(TransferError).Error` | `func (e *TransferError) Error() string` | ErrTransfer sentinel tree |
+| `ServeBlobTransfer` | `// ServeBlobTransfer installs the blob-transfer engine on the node over // the adapter. Required before the node can serve chunks OR fetch. // Idempotent. `meshNode` / `adapter` are handles from the mesh / blob // wra...` | (*MeshNode).ServeBlobTransfer (blob.go) |
+| `FetchBlob` | `// FetchBlob fetches the blob addressed by the 32-byte hash from the known // holder, returning the reassembled, BLAKE3-verified bytes. func FetchBlob(meshNode unsafe.Pointer, holderID uint64, hash []byte) ([]byte, er...` | (*MeshNode).FetchBlob (blob.go) |
+| `FetchBlobDiscovered` | `// FetchBlobDiscovered is like FetchBlob but discovers the holder among // connected peers. Returns an "all-peers-failed" TransferError if no peer // has the content. func FetchBlobDiscovered(meshNode unsafe.Pointer, ...` | (*MeshNode).FetchBlobDiscovered (transfer.go, S2) |
+| `StoreDir` | `// StoreDir stores the local directory at root as content-addressed blobs // in the adapter, returning the encoded directory-manifest BlobRef (the // token a receiver passes to FetchDir / DirManifestRead). func StoreD...` | (*MeshBlobAdapter).StoreDir (transfer.go, S2) |
+| `FetchDir` | `// FetchDir fetches the directory whose encoded manifest BlobRef is // manifestRef from sourceID and reconstructs it under dest. func FetchDir(meshNode unsafe.Pointer, sourceID uint64, manifestRef []byte, dest string)...` | (*MeshNode).FetchDir (transfer.go, S2) |
+| `DirManifestRead` | `// DirManifestRead fetches + decodes the directory manifest at manifestRef // from sourceID WITHOUT reconstructing the tree, returning it as a JSON // string for introspection. func DirManifestRead(meshNode unsafe.Poi...` | (*MeshNode).DirManifestRead → *DirManifest (transfer.go, S2) |
+
+</details>
 
 ## Review history
 
