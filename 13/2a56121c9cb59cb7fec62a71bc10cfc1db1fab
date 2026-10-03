@@ -1,0 +1,39 @@
+net/crates/net/payments/src/flow/a2a/json.rs
+  s_36e6a9decc3647::t_805ff5007c3714 591-593,767-770,772-783,794-797,827-842
+  s_36e6a9decc3647::t_2808576478cec9 1-590,594-766,771,784-793,798-826,843-874
+net/crates/net/tests/cross_lang_a2a_paid/envelopes.json
+  s_36e6a9decc3647::t_c6601cb9e721b0 1-342
+net/crates/net/bindings/python/src/a2a_paid.rs
+  s_36e6a9decc3647::t_25b51bf73d912c 284
+  s_36e6a9decc3647::t_c9fca06a4ae75a 35,37,44-45
+  s_36e6a9decc3647::t_192fbfbe72d57d 66,69-73,75-84,204-205,207,391-392,395-397,407,409-415,417,431,434,436,447,452,457,460-461,463,468,471,473,476,484,486
+net/crates/net/payments/src/flow/a2a.rs
+  s_36e6a9decc3647::t_791ab51d27e36d 88-89
+  s_36e6a9decc3647::t_13a4a5ed8c8ac9 90-91
+net/crates/net/bindings/python/tests/test_a2a_paid_config_compat.py
+  s_36e6a9decc3647::t_5ccb34e372988d 1-222
+net/crates/net/bindings/python/tests/test_a2a_paid_cross_lang.py
+  s_36e6a9decc3647::t_e6eb3b5307eec5 1-29,31-34,36-98,111-153
+  s_36e6a9decc3647::t_c6601cb9e721b0 35,99,104
+  s_36e6a9decc3647::t_77c042bd382e4a 30,100-103,105-110
+docs/internal/plans/NODE_A2A_PAID_ADMISSION_PLAN.md
+  s_36e6a9decc3647::t_2e9a406e153046 525
+  s_36e6a9decc3647::t_28e397659c0d77 486-496,504,506-524,534-548
+  s_36e6a9decc3647::t_666b619530c447 549
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "132a56121c9cb59cb7fec62a71bc10cfc1db1fab",
+  "prompts": {},
+  "sessions": {
+    "s_36e6a9decc3647": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "46b7ea03-5ec0-4fb4-8bef-0e4bfe61231c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
