@@ -1,0 +1,26 @@
+net/crates/net/bindings/node/test/a2a_paid_org_live.test.ts
+  s_36e6a9decc3647::t_8790a474ec194f 1-260
+.github/workflows/ci.yml
+  s_36e6a9decc3647::t_cbec5baa0d4bdc 4445,4455-4456,4467-4469
+  s_36e6a9decc3647::t_d3400fe149471c 4460
+net/crates/net/sdk-py/tests/test_paid_a2a_sdk.py
+  s_36e6a9decc3647::t_cbec5baa0d4bdc 26,29-30,118,120,157-199
+net/crates/net/sdk-py/examples/paid_a2a_consumer.py
+  s_36e6a9decc3647::t_07899b1c36bae2 20-24,303-448,454,461,463-468
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ff8e98cd63366b3cfe31c4d75f06cde9dba18dbd",
+  "prompts": {},
+  "sessions": {
+    "s_36e6a9decc3647": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "46b7ea03-5ec0-4fb4-8bef-0e4bfe61231c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
