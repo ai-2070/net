@@ -1,0 +1,37 @@
+web/src/content/docs/guides/agent-to-agent.md
+  s_36e6a9decc3647::t_635a2a7aa16130 173
+  s_36e6a9decc3647::t_019668f00d3a5c 172,253-254,257-306
+  s_36e6a9decc3647::t_e78ddbac934150 307
+web/src/lib/generated/capability-record.json
+  s_36e6a9decc3647::t_96f21b4896f761 40
+README.md
+  s_36e6a9decc3647::t_47051e2abb66a7 350
+docs/data/capabilities/event-bus.yaml
+  s_36e6a9decc3647::t_96f21b4896f761 328-329
+.claude/skills/net-event-bus/bindings/coverage.md
+  s_36e6a9decc3647::t_1fe2d326ac10ac 215-218
+  s_36e6a9decc3647::t_96f21b4896f761 102,146
+  s_36e6a9decc3647::t_dbaea14a08f9da 199-202
+.claude/skills/net-event-bus/a2a.md
+  s_36e6a9decc3647::t_768291ed9e3be9 102-103,117,123,128-133,199-224
+  s_36e6a9decc3647::t_bf63b06dc43f2f 225
+docs/internal/plans/NODE_A2A_PAID_ADMISSION_PLAN.md
+  s_36e6a9decc3647::t_bb9672ebc0d851 3,5-6,956-1026
+  s_36e6a9decc3647::t_2f26c1a591e167 1027
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "795288b1e5600e7099227eac4800247b6a499854",
+  "prompts": {},
+  "sessions": {
+    "s_36e6a9decc3647": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "46b7ea03-5ec0-4fb4-8bef-0e4bfe61231c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
