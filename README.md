@@ -313,18 +313,6 @@ of a packet path. None includes NIC transfer, wire latency, or propagation, and 
 would not produce a round trip. Desktop-class figures and per-subsystem tables — multi-hop,
 encryption, capability folds, SDK ingestion, binary size — are in the linked file.
 
-| Operation, measured in isolation | M1 Max |
-|---|---|
-| Header serialize — encode the 64-byte header | 2.19 ns / 456M ops/sec |
-| Routing lookup (hit) — resolve a next hop from the local routing table | 37.73 ns / 26.5M ops/sec |
-| 1-hop forward — the forwarding path for a single hop | 61.66 ns / 16.2M ops/sec |
-| Heartbeat — process one heartbeat from a known peer | 39.76 ns / 25.2M ops/sec |
-| Evaluate alternates — pick a replacement from local state | 257.51 ns / 3.88M ops/sec |
-
-The last two are **local computations over local state**; they are not measurements of detecting
-a failure across the network or of completing distributed recovery. The full table separates
-heartbeat processing, status check, circuit-breaker check, and alternate selection.
-
 ## SDKs
 
 All SDKs wrap the same Rust core. The SDK is the developer experience; the engine is Rust.
