@@ -1,0 +1,36 @@
+docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md
+  s_391b90f341d6c6::t_c389a6b83e4325 491-496
+  s_391b90f341d6c6::t_6a8ba9bc49c26d 507-513
+  s_391b90f341d6c6::t_0948cab6977eae 606-617
+  s_391b90f341d6c6::t_f967a61a46cf35 448-480
+  s_391b90f341d6c6::t_a9f241a64663b4 408-437
+  s_391b90f341d6c6::t_bf06d8be4da8a3 65,69-79
+  s_391b90f341d6c6::t_fa9440016b9759 43-47
+  s_391b90f341d6c6::t_f47acec090755c 177-214
+  s_391b90f341d6c6::t_a74059cb0388f6 236-237,244-302
+  s_391b90f341d6c6::t_3bf34b62a88569 130-140
+  s_391b90f341d6c6::t_a776c065ceae2d 649-653,659-666,677-707
+  s_391b90f341d6c6::t_810092a040095c 630-636
+  s_391b90f341d6c6::t_1de108182d18b4 546-595
+  s_391b90f341d6c6::t_64f69e355e74ad 93-105
+  s_391b90f341d6c6::t_3dce1f37e5da0e 369-390
+  s_391b90f341d6c6::t_9c3ab09331b395 8-16
+  s_391b90f341d6c6::t_713570074b9543 330-355
+  s_391b90f341d6c6::t_5f18a8555096b4 80,303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "317168c78708e671e940c665000f490f798248a9",
+  "prompts": {},
+  "sessions": {
+    "s_391b90f341d6c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e008671-9702-4db4-b22a-abb85b691773",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
