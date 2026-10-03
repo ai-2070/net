@@ -40,9 +40,12 @@ cross-peer path, and both verify the bytes against the hash.
 ### Whole directories
 
 ```go
-manifestRef, err := adapter.StoreDir("/data/model-v3")              // on the holder
-stats, err := node.FetchDir(holderID, manifestRef, "/srv/model-v3") // on the receiver
-manifest, err := node.DirManifestRead(holderID, manifestRef)        // inspect without copying
+// On the holder:
+manifestRef, err := adapter.StoreDir("/data/model-v3")
+// On the receiver:
+stats, err := node.FetchDir(holderID, manifestRef, "/srv/model-v3")
+// Inspect without copying:
+manifest, err := node.DirManifestRead(holderID, manifestRef)
 ```
 
 `FetchDir` installs the tree atomically and refuses paths that escape the
