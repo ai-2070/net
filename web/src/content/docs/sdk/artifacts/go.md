@@ -90,7 +90,12 @@ if !bytes.Equal(got, data) {
 fmt.Println("fetched:", len(got), "bytes")
 ```
 
-Go cannot yet register a blob adapter written in Go (Python and Node can); the
-process-wide registry takes filesystem adapters (`RegisterFilesystemBlobAdapter`).
+A blob store written in Go goes into the process-wide registry with
+`net.RegisterBlobAdapter(id, a)`, where `a` implements `net.BlobAdapter`
+(`Store`, `Fetch`, `FetchRange`, `Exists`). Methods run on substrate threads
+and may overlap, so the adapter must be safe for concurrent use; return
+`net.ErrBlobNotFound` for content it does not hold. `net.UnregisterBlobAdapter(id)`
+removes it, and a call already in flight still completes against it. For a
+plain directory, `RegisterFilesystemBlobAdapter` needs no Go code.
 
 Next: [Errors and recovery](/docs/sdk/go/errors).
