@@ -15,6 +15,11 @@ intermittently on `master` (run 36970267483). S5b done in the gap closure
 ports are deferred, see S7); S8 done (full deletion, by the user's decision;
 see S8). Owed: the release notes.
 
+**Merged 2026-10-03** as PR #1165 (`4656690`). One follow-up is in flight:
+**write tokens bind their channel**, PR #1167 (branch
+`LZL0/write-token-channel`), a breaking change that S4's token API
+inherits. See the S4 amendment and "Defects found on the way".
+
 Reviewed twice before implementation (`d1b6f29`, then `317168c`). The first
 review accepted the direction and held on nine findings (R1–R9). The second
 accepted those corrections and held on four contract and witness issues
@@ -762,6 +767,36 @@ Evidence (Windows):
     bound, and the mutant fails three named subtests in seconds.
 - CI: the race filter adds `TestWriteToken`, and a 7-name roster is added.
 
+**Amended by PR #1167 (2026-10-03): the token carries its channel.** The
+`(origin, seq)` token above had a hole S4's witnesses didn't cover: sequence
+numbers are per channel, so a Tasks token waited on through a Memories
+adapter with the same origin succeeded once Memories passed that number.
+"Origin, not identity" still holds, but only within one channel. The change
+is breaking across every binding, by decision, with no compatibility path:
+
+- **Core:** `WriteToken{origin_hash, channel_hash, seq}`, where the channel
+  hash is `ChannelName::hash()`. Every wait and poll refuses another
+  channel's token with `WaitForTokenError::WrongChannel`, before taking a
+  permit. The string form is `<origin>:<channel>:<seq>`; the two-part form
+  is refused.
+- **C:** `net_{tasks,memories}_wait_for_token(handle, origin, channel, seq,
+  timeout)`, plus new `net_{tasks,memories}_channel_hash` accessors.
+  `NET_ERR_WRONG_CHANNEL` is **−160**. The first choice, −109, is
+  `NET_ERR_MESH_STREAM_OCCUPIED` in the shared enum (cubic on #1167).
+  `TestABIStabilityWriteTokenCarriesTheChannel` pins the code as unique.
+- **Go:**
+  - `WriteToken{OriginHash, ChannelHash, Seq}`.
+  - Adapters read the channel hash at open, through one constructor
+    shared by `OpenTasks`/`OpenMemories` and `NetDb`. Pre-existing
+    `TestWriteTokenNetDbAdaptersInheritOrigin` caught that `NetDb` built
+    adapters without reading it.
+  - `Token(seq)` stamps the channel hash. `ChannelHash()` and
+    `ErrWrongChannel` are new.
+- **Witness:** `TestWriteTokenWrongChannelIsRefused`. Memories is past the
+  Tasks seq, and a poll and a wait both return `ErrWrongChannel`. #1167 pins
+  it in the S4 roster ("Go CortEX write tokens", now 9). The same witness exists in
+  core (RED with the check disabled), `net_sdk`, TypeScript and Python.
+
 ### S5: blob adapter registry: filesystem + publish/resolve
 
 Header closure: declare the six registry functions in `include/net.go.h` and
@@ -1490,6 +1525,16 @@ Plus a Rust test of the release-once contract under a cancelled future.
   witness. Adding it is a new capability, so per the SDK-first rule it
   starts in `net-mesh-sdk`, not in this plan. *Resolved:* the SDK already
   re-exported it, and G-A added the C, napi and pyo3 entry points.
+
+- **Write tokens didn't carry their channel (found by cubic on `fbe8015`;
+  documented in #1165, fixed in #1167).** A token was `(origin, seq)` in
+  core and every binding, but sequence numbers are per channel. Two
+  adapters with the same origin over different channels (Tasks and
+  Memories) count independently, so one could satisfy the other's token
+  without the write ever being applied. #1165 only documented the limit,
+  because the fix is a core design change. #1167 makes the token
+  `(origin, channel, seq)` everywhere and refuses a mismatch with
+  `WrongChannel` / `ErrWrongChannel` (C code −160). See S4's amendment.
 
 - **Greedy cache views closed the shared file (found by cubic on
   `fbe8015`, fixed in the follow-up).** `GreedyCacheFor` returned an
