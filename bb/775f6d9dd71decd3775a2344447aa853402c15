@@ -1,0 +1,39 @@
+go/net.h
+  s_391b90f341d6c6::t_a0a46128ac5c83 1844-1845,1848-1890
+  s_391b90f341d6c6::t_a81ee94766e1cc 1891
+go/abi_stability_test.go
+  s_391b90f341d6c6::t_3841274ebc3fc8 34,234-312
+docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md
+  s_391b90f341d6c6::t_c24d74c41339ed 6-8,471-527
+  s_391b90f341d6c6::t_c53a7931069ccc 528
+go/blob.go
+  s_391b90f341d6c6::t_5d4c4f35140240 466-477,480-484,501,516-523
+  s_391b90f341d6c6::t_3841274ebc3fc8 486-492,525
+net/crates/net/include/net.go.h
+  s_391b90f341d6c6::t_a0a46128ac5c83 1870-1871,1874-1916
+  s_391b90f341d6c6::t_10f3e7996dce5a 1917
+go/transfer.go
+  s_391b90f341d6c6::t_50ff408111d6f9 1-248
+.github/workflows/ci.yml
+  s_391b90f341d6c6::t_1c9c22715dbf62 4854
+  s_391b90f341d6c6::t_a95c1fe3198bbf 4823,4828,4855-4858
+  s_391b90f341d6c6::t_6558b26e2c86f7 4859
+go/transfer_test.go
+  s_391b90f341d6c6::t_7f2305f17baf05 1-302
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bb775f6d9dd71decd3775a2344447aa853402c15",
+  "prompts": {},
+  "sessions": {
+    "s_391b90f341d6c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e008671-9702-4db4-b22a-abb85b691773",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
