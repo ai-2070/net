@@ -1,0 +1,58 @@
+docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md
+  s_391b90f341d6c6::t_8f3d7a99976330 1266-1304
+go/net_cortex.h
+  s_391b90f341d6c6::t_541c21ae8a840e 72-79
+.github/workflows/ci.yml
+  s_391b90f341d6c6::t_a9aa10a2ddbe58 4916
+  s_391b90f341d6c6::t_5ff3f5f0e95fbb 4928-4931
+  s_391b90f341d6c6::t_ab6ab9d3a2c9fb 4392-4412
+net/crates/net/include/net_cortex.h
+  s_391b90f341d6c6::t_541c21ae8a840e 72-79
+go/redex_dataforts.go
+  s_391b90f341d6c6::t_233d7d24ef082d 18-20,33
+  s_391b90f341d6c6::t_bf4354a101017c 346-372
+net/crates/net/src/ffi/cortex.rs
+  s_391b90f341d6c6::t_9e2e63c2846340 5018-5021
+  s_391b90f341d6c6::t_aa637ecac27d11 4995-5017,5022-5029
+  s_391b90f341d6c6::t_f0bc19936ced60 776-828,1016-1027
+  s_391b90f341d6c6::t_2b4e56052183c2 1028
+go/redex_dataforts_test.go
+  s_391b90f341d6c6::t_775f14a6ecf585 17-18,329-362,365-461
+  s_391b90f341d6c6::t_90ea8487292b1a 363-364
+net/crates/net/bindings/go/net-ffi/exports.baseline
+  s_391b90f341d6c6::t_541c21ae8a840e 7,10,451
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_391b90f341d6c6::t_5aeadb11c4dcbe 337
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_391b90f341d6c6::t_79c9abf7f555cb 682-688
+  s_391b90f341d6c6::t_c6bd690e33f754 1430-1434,1443-1451
+  s_391b90f341d6c6::t_f72c66630efa91 1452,1539-1542
+net/crates/net/bindings/node/src/cortex.rs
+  s_391b90f341d6c6::t_5aeadb11c4dcbe 458-481
+net/crates/net/src/adapter/net/dataforts/greedy/metrics.rs
+  s_391b90f341d6c6::t_79c9abf7f555cb 125-129,214-219,413-416,492-493,619-633
+  s_391b90f341d6c6::t_95e250b6b1bef8 634
+net/crates/net/bindings/python/tests/test_greedy_cache.py
+  s_391b90f341d6c6::t_ada11c05a1b43b 1-92
+net/crates/net/bindings/python/src/cortex.rs
+  s_391b90f341d6c6::t_5aeadb11c4dcbe 694-710,822-826
+  s_391b90f341d6c6::t_7cc0356add42d5 827
+go/abi_stability_test.go
+  s_391b90f341d6c6::t_62c455dfc3a3b5 382-412
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "535bbca5744f74a9375593c956a360f368590748",
+  "prompts": {},
+  "sessions": {
+    "s_391b90f341d6c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e008671-9702-4db4-b22a-abb85b691773",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
