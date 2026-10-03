@@ -27,6 +27,7 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 - **End-to-end encrypted forwarding.** Relays forward ciphertext they cannot read — there is no trusted middle.
 - **Reachable through NATs.** Nodes try a direct path first and fall back to a relay; a browser tab joins as a full node over WebRTC.
 - **Latency-first.** Transport, routing, and placement all prefer the fastest path available.
+- **Optionally-reliable, optionally-typed, optionally-ordered.** Delivery guarantees, schema, and ordering are chosen per channel — the mesh defaults to the fastest path and lets a caller pay only for the guarantees it needs.
 
 **What that gives you**
 
