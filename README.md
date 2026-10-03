@@ -33,10 +33,17 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 
 **Performance**
 
-- Build a packet from one event in 299 ns; encrypt 1 KB with ChaCha20-Poly1305 in 908 ns; forward one hop in 61.7 ns (M1 Max).
-- Header encode 2.19 ns, routing lookup 37.7 ns, a 50-event packet build 2.44 µs.
-- Cold start: first peer visible in ~0.9 ms, first typed RPC reply in ~1.3 ms — two nodes, loopback, p50.
-- Per-operation microbenchmarks on one machine, not round-trip or NIC figures; the full measured set is under [Performance](#performance).
+| On an M1 Max (one operation, measured alone) | Result |
+|---|---|
+| Encode a packet header | 456 M/sec |
+| Resolve a next hop | 26 M/sec |
+| Forward one hop | 16 M/sec |
+| Encrypt a 1 KB payload | ~1 GiB/sec |
+| Build a packet from 50 events | 2.4 µs |
+| Start a node → first peer | under 1 ms |
+| Start a node → first RPC reply | ~1.3 ms |
+
+These measure single operations on one machine — not a round trip, and not NIC transfer. The full set is under [Performance](#performance).
 
 **What that gives you**
 
