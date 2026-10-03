@@ -1,0 +1,19 @@
+web/src/content/docs/sdk/artifacts/go.md
+  s_092c965c3a6772::t_c8e7c86ac8300e 93-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7409685554a12ac323ba52ffbb38d2a69adf831a",
+  "prompts": {},
+  "sessions": {
+    "s_092c965c3a6772": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8c9a491a-d0ff-4b6a-994d-d25ca2612503",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
