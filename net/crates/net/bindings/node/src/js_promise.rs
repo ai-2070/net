@@ -11,14 +11,23 @@
 //! reason `"oneshot canceled"` (`napi`'s `Promise::poll`), folded into the
 //! same `Result` a JS rejection arrives in.
 //!
-//! Such a Promise provably can never settle, so a bridge should say so, at
-//! once, instead of calling it a rejection or waiting out a deadline. Each
-//! bridge keeps its own error variant and status — only the reason changes —
-//! so nothing about how a caller classifies the failure moves.
+//! Such a Promise can never settle, so a bridge says what happened — the
+//! Promise was dropped before it settled — at once, instead of calling it a
+//! rejection or waiting out a deadline. Each bridge keeps its own error
+//! variant and status — only the reason changes — so nothing about how a
+//! caller classifies the failure moves.
 //!
-//! The detection is the exact status and reason napi uses. A JS rejection
-//! whose message is literally `oneshot canceled` would be classified the
-//! same way; it is still a failure, only the reason text differs.
+//! **The one ambiguity, kept deliberately.** The detection is the exact
+//! status and reason napi uses. napi's public `Error` does not say whether
+//! it came from a JS rejection (that error holds a reference to the JS error
+//! object, but the field is crate-private) or from the dropped channel, so a
+//! JS rejection whose message is literally `oneshot canceled` is classified
+//! the same way. That is why the reason states only what the bridge knows —
+//! the result channel was lost — and names V8 collecting an unreferenced
+//! Promise as the usual cause rather than asserting it. Telling the two
+//! apart structurally would mean re-implementing napi's Promise bridging
+//! (our own `then`/`catch` on a `PromiseRaw`) in every bridge; the
+//! trade-off is pinned by `test/js_promise_abandoned.test.ts`.
 
 /// Whether awaiting a JS Promise failed because the Promise was abandoned
 /// (collected while pending) rather than rejected.
@@ -28,8 +37,9 @@ pub(crate) fn is_abandoned(e: &napi::Error) -> bool {
 
 /// The reason a bridge gives when [`is_abandoned`] holds, after the name of
 /// what returned the Promise ("a2a task handler", "JS handler", …).
-pub(crate) const NEVER_SETTLES: &str = "returned a Promise that can never settle \
-     (nothing references its resolve or reject, so V8 collected it)";
+pub(crate) const NEVER_SETTLES: &str = "returned a Promise that was dropped before it \
+     settled (napi lost its result channel — what happens when V8 collects a pending \
+     Promise that nothing references)";
 
 /// `"{subject} {NEVER_SETTLES}"` for an abandoned Promise, otherwise the
 /// bridge's own rejection text — the one-line form every bridge uses.

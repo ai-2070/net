@@ -24,7 +24,8 @@
 //! that did not answer admitted nothing. So does an **abandoned** Promise:
 //! one that is pending and that nothing references can never settle, and V8
 //! may collect it before the budget runs out. That is reported as such — "a
-//! Promise that can never settle" — at once, rather than as a rejection
+//! Promise that was dropped before it settled" — at once, rather than as a
+//! rejection
 //! (`crate::js_promise::is_abandoned`).
 //!
 //! **Stop is retirement, not release** (plan D6). Stopping the returned

@@ -159,8 +159,8 @@ function rivalOwner(journalPath: string): string {
       const p = new PaymentProvider(mesh, join(mkdtempSync(join(tmpdir(), 'rival-')), 'e.json'), undefined, undefined, undefined, true);
       const b = { maxPromptBytes: 1024n, maxContextRefs: 8n, maxTags: 8n, maxTagBytes: 64n, maxInFlight: 4n };
       const svc = { echo: { revision: 'r1', bounds: b, reservationTtlSecs: 600n, reservationRetentionSecs: 604800n, retentionSecs: 3600n } };
-      try { const h = await p.serveA2aConfigured(async () => 'x', svc, ${JSON.stringify(journalPath)}); console.log('SERVED'); h.stop(); }
-      catch (e) { console.log('REFUSED:' + String(e.message).split(' ')[0]); }
+      try { const h = await p.serveA2aConfigured(async () => 'x', svc, ${JSON.stringify(journalPath)}); require('node:fs').writeSync(1, 'SERVED\\n'); h.stop(); }
+      catch (e) { require('node:fs').writeSync(1, 'REFUSED:' + String(e.message).split(' ')[0] + '\\n'); }
       p.close(); await mesh.shutdown(); process.exit(0);
     })();`
   return execFileSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 60000 }).trim().split('\n').pop()!
@@ -557,11 +557,11 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — provider (WS-B)', () => {
         const hangMsg = await rejection(submit('pf-hang'))
         // A never-settling Promise is refused either at the 5 s budget or —
         // when nothing references it and V8 collects it first, which a busy
-        // run makes likely — as a Promise that can never settle (the
+        // run makes likely — as a Promise that was dropped before it settled (the
         // abandoned-Promise witness below forces that path). Both fail closed
         // and neither launches.
         expect(hangMsg).toMatch(
-          /preflight refused: the preflight (did not answer within 5000 ms|returned a Promise that can never settle)/,
+          /preflight refused: the preflight (did not answer within 5000 ms|returned a Promise that was dropped before it settled)/,
         )
         // A received refusal, inside the caller's 30 s budget (review R3).
         expect(Date.now() - t0).toBeLessThan(15000)
@@ -1449,9 +1449,9 @@ function abandonedPromiseScenario(): { preflight: string; preflightMs: number; e
       }
       clearInterval(gcLoop);
       legacy.stop(); provider.close();
-      console.log('RESULT ' + JSON.stringify({ preflight, preflightMs, executor }));
+      require('node:fs').writeSync(1, 'RESULT ' + JSON.stringify({ preflight, preflightMs, executor }) + '\\n');
       process.exit(0);
-    })().catch((e) => { console.log('ERROR ' + e.message); process.exit(1); });`
+    })().catch((e) => { require('node:fs').writeSync(1, 'ERROR ' + e.message + '\\n'); process.exit(1); });`
   const out = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
     encoding: 'utf8',
     timeout: 120000,
@@ -1468,10 +1468,10 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — abandoned Promises (PR review)', ()
   // rejection — while still refusing (preflight) or failing (executor).
   it('a collected preflight or executor Promise is reported as never settling', () => {
     const r = abandonedPromiseScenario()
-    expect(r.preflight).toMatch(/preflight refused: the preflight returned a Promise that can never settle/)
+    expect(r.preflight).toMatch(/preflight refused: the preflight returned a Promise that was dropped before it settled/)
     // Reported when V8 collected it, well before the 5 s budget.
     expect(r.preflightMs).toBeGreaterThanOrEqual(0)
     expect(r.preflightMs).toBeLessThan(5000)
-    expect(r.executor).toMatch(/a2a task handler returned a Promise that can never settle/)
+    expect(r.executor).toMatch(/a2a task handler returned a Promise that was dropped before it settled/)
   }, 180000)
 })

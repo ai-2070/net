@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import gc
 import json
 import os
@@ -57,6 +58,10 @@ PSK = "b4" * 32
 # when a `TemporaryDirectory` could not clean up while unwinding (on Windows
 # a live native handle can still hold a file open at that point).
 _SCRATCH = tempfile.mkdtemp(prefix="paid-a2a-consumer-")
+# Every ordinary exit removes it too — including the ones argparse takes
+# (`--help`, a bad argument) before `main` reaches its own cleanup. The hard
+# exit after a failed cell bypasses atexit, so it removes the root itself.
+atexit.register(shutil.rmtree, _SCRATCH, ignore_errors=True)
 PAID = "summarize"
 MOCK_REQS = json.dumps(
     [

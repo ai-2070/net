@@ -26,7 +26,7 @@ const HAS_RPC = typeof binding.MeshRpc?.fromMesh === 'function'
 const here = dirname(fileURLToPath(import.meta.url))
 const INDEX = resolve(here, '..', 'index.js')
 
-function scenario(): { unary: string; streaming: string } {
+function scenario(): { unary: string; streaming: string; literal: string } {
   const script = `
     const { NetMesh, MeshRpc } = require(${JSON.stringify(INDEX)});
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -45,6 +45,9 @@ function scenario(): { unary: string; streaming: string } {
       // Handlers returning a Promise nothing else references.
       const unaryHandle = serverRpc.serve('gc.unary', () => new Promise(() => {}));
       const streamHandle = serverRpc.serveStreaming('gc.streaming', () => new Promise(() => {}));
+      // The documented ambiguity: a genuine rejection whose message is
+      // literally napi's dropped-channel reason cannot be told apart.
+      const literalHandle = serverRpc.serve('gc.literal', async () => { throw new Error('oneshot canceled'); });
 
       // The callee's capability-auth gate treats a caller as untrusted until
       // the signed announcements have been exchanged (TOFU-pinned); on a busy
@@ -76,12 +79,17 @@ function scenario(): { unary: string; streaming: string } {
         } catch (e) { return String(e.message); }
       });
 
+      const literal = await attempt(async () => {
+        try { await clientRpc.call(server.nodeId(), 'gc.literal', Buffer.from('x')); return 'RESOLVED'; }
+        catch (e) { return String(e.message); }
+      });
+
       clearInterval(gcLoop);
-      unaryHandle.close(); streamHandle.close();
+      unaryHandle.close(); streamHandle.close(); literalHandle.close();
       serverRpc.close(); clientRpc.close();
-      console.log('RESULT ' + JSON.stringify({ unary, streaming }));
+      require('node:fs').writeSync(1, 'RESULT ' + JSON.stringify({ unary, streaming, literal }) + '\\n');
       process.exit(0);
-    })().catch((e) => { console.log('ERROR ' + e.message); process.exit(1); });`
+    })().catch((e) => { require('node:fs').writeSync(1, 'ERROR ' + e.message + '\\n'); process.exit(1); });`
   const out = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
     encoding: 'utf8',
     timeout: 120000,
@@ -92,9 +100,21 @@ function scenario(): { unary: string; streaming: string } {
 }
 
 describe.skipIf(!HAS_RPC)('abandoned JS Promises are named, not called rejections', () => {
-  it('nRPC unary and server-streaming handlers report a Promise that can never settle', () => {
+  it('nRPC unary and server-streaming handlers report a Promise that was dropped before it settled', () => {
     const r = scenario()
-    expect(r.unary).toMatch(/JS handler returned a Promise that can never settle/)
-    expect(r.streaming).toMatch(/JS streaming handler returned a Promise that can never settle/)
+    expect(r.unary).toMatch(/JS handler returned a Promise that was dropped before it settled/)
+    expect(r.streaming).toMatch(/JS streaming handler returned a Promise that was dropped before it settled/)
+  }, 180000)
+
+  // PR review (cubic): the classification is by napi's exact status and
+  // reason, and napi's public Error does not say whether a rejection came
+  // from JS. So a handler that genuinely rejects with the literal message
+  // `oneshot canceled` is reported the same way. Pinned so the trade-off is
+  // deliberate: the reason text says only that the result channel was lost,
+  // not that V8 collected anything (src/js_promise.rs).
+  it('a rejection with the literal dropped-channel message is reported the same way (the documented ambiguity)', () => {
+    const r = scenario()
+    expect(r.literal).toMatch(/JS handler returned a Promise that was dropped before it settled/)
+    expect(r.literal).toMatch(/napi lost its result channel/)
   }, 180000)
 })
