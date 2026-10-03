@@ -5,14 +5,13 @@
 Planned, 2026-10-03. Targets the release after 0.39. Branch `LZL0/go-blobs`.
 No slice has landed.
 
-**Amended 2026-10-03 after a source-grounded review at `d1b6f29`.** The
-review accepted the direction (one Go module at `go/`, the Rust FFI crates
-stay put, one `libnet`, port rather than copy) and held implementation on
-nine findings, R1–R9. All nine were re-checked against source before this
-amendment and confirmed. Each change below is marked *Amended (Rn)* next to
-the text it corrects. The summary is in
-[Review amendments](#review-amendments-2026-10-03) at the end.
-Implementation waits on a re-read of this version.
+Reviewed twice before implementation (`d1b6f29`, then `317168c`). The first
+review accepted the direction and held on nine findings (R1–R9). The second
+accepted those corrections and held on four contract and witness issues
+(Q1–Q4) plus consistency cleanup. Both are applied. Following that review's
+request, the slice lists below show **only the adopted versions**. What each
+review changed, and why, is kept in [Review history](#review-history) at
+the end, so the reasoning isn't lost.
 
 ## The gap
 
@@ -36,15 +35,15 @@ C ABI.
 ### How this was checked
 
 - Every exported `func` / `type` name in `bindings/go/net/*.go` was grepped
-  for as a definition in `go/*.go`.
+  for as a definition in `go/*.go`. (Name-only. S7's ledger redoes this per
+  receiver type.)
 - Every `C.net_*` symbol the reference files call was checked against the
   `extern "C" fn` definitions in `src/ffi/*.rs` and
   `bindings/go/*-ffi/src/lib.rs`.
-- ~~`go/net.h` was diffed against `include/net.go.h`; they're identical.~~
-  *Amended (R2):* that check compared only the set of declared
-  `net_*(` names, and the two files' text differs (mostly comments).
-  It also didn't ask whether the G2 symbols are declared at all. They aren't;
-  see G2.
+- Each G2 symbol was grepped for **as a declaration** in `go/net.h`, its one
+  local include `go/net_cortex.h`, and every header in `include/`.
+  (`go/net.h` and `include/net.go.h` declare the same function names, but
+  their text differs, mostly in comments.)
 - The blob surface of `go/blob.go` was diffed against the Node binding
   (`bindings/node/src/blob.rs`) and the Python binding
   (`bindings/python/src/blob.rs`).
@@ -60,83 +59,76 @@ glue (buffer ownership through `net_blob_free_buffer` /
 `net_transport_free_buffer`, the overflow JSON round-trip, `Close` racing an
 in-flight call) is not.
 
-### G2: functions the C ABI exports that `go/` doesn't call (gap)
+Its three buffer copies pass `C.int(outLen)` to `C.GoBytes`
+(`go/blob.go:265,291,556`). `C.GoBytes` takes a `C.int`, so a `size_t` length
+over 2³¹−1 wraps negative on amd64. The same pattern appears at 21 more
+`C.GoBytes` sites across `go/` (cortex, mesh_rpc, tool, …). This plan fixes
+the blob sites and records the rest as a defect (see "Defects found on the
+way").
+
+### G2: C ABI functions that `go/` neither declares nor calls (gap)
 
 The C entry points exist and are listed in
-`bindings/go/net-ffi/exports.baseline`. The reference package already wraps
-most of them.
-
-*Amended (R2):* the original text said these were also declared in
-`go/net.h`. That was false. A per-symbol grep of `go/net.h` and its one
-local include, `go/net_cortex.h`, finds none of the directory-transfer,
-registry, replication, greedy/gravity or token-wait functions. Of the
-canonical headers, only `include/net_transport.h` declares the four
-directory-transfer functions, and it isn't in the Go include chain. The
-registry, replication, greedy and token-wait functions are declared in **no**
-header under `include/`. The reference package got around this with local
-`extern` declarations in its cgo preambles. The placement-filter functions
-are the exception: `go/net.h` declares them. So every G2 slice starts with
-header work, not just Go wrappers (see "Header closure" under the design).
+`bindings/go/net-ffi/exports.baseline`. **None of them is declared in the
+headers the Go module compiles against.** `include/net_transport.h` declares
+the four directory-transfer functions, but it isn't in the Go include chain.
+The registry, replication, greedy/gravity and token-wait functions are
+declared in no header under `include/` at all. The reference package got
+around this with local `extern` declarations in its cgo preambles. The one
+exception is the placement-filter functions, which `go/net.h` does declare.
 
 | Area | C symbols | Reference wrapper |
 |---|---|---|
-| Directory transfer | `net_store_dir`, `net_fetch_dir`, `net_dir_manifest_read`, `net_fetch_blob_discovered` | `transport.go`: `StoreDir`, `FetchDir`, `DirManifestRead`, `FetchBlobDiscovered`, `DirStats`, `TransferError` |
+| Directory transfer | `net_store_dir`, `net_fetch_dir`, `net_dir_manifest_read`, `net_fetch_blob_discovered` | `transport.go` |
 | Blob adapter registry | `net_blob_register_fs_adapter`, `net_blob_register_callback_adapter`, `net_blob_unregister_adapter`, `net_blob_adapter_registered`, `net_blob_publish`, `net_blob_resolve` | none |
 | RedEX replication | `net_redex_enable_replication`, `net_redex_disable_replication`, `net_redex_replication_runtime_count`, `net_redex_replication_prometheus_text` | `redex.go` |
-| Greedy Dataforts / data gravity | `net_redex_{enable,disable}_greedy_dataforts`, `net_redex_greedy_cached_channel_count`, `net_redex_greedy_prometheus_text`, `net_redex_{enable,disable}_gravity_for_greedy` | `redex.go`: `DataGravityConfig` and friends |
-| CortEX read-your-writes | `net_tasks_wait_for_token`, `net_memories_wait_for_token` | `tasks.go` / `memories.go`: `WaitForToken`, `PollForToken`, `WaitForTokenContext` |
+| Greedy Dataforts / data gravity | `net_redex_{enable,disable}_greedy_dataforts`, `net_redex_greedy_cached_channel_count`, `net_redex_greedy_prometheus_text`, `net_redex_{enable,disable}_gravity_for_greedy` | `redex.go` |
+| CortEX read-your-writes | `net_tasks_wait_for_token`, `net_memories_wait_for_token` | `tasks.go` / `memories.go` |
 | Placement filters | `net_compute_{register,unregister,has}_placement_filter`, `net_compute_set_placement_filter_dispatcher` (`compute-ffi/src/lib.rs:3194–3423`) | `placement.go` |
 
-`go/cortex.go` defines `Redex` with only `Free` and `OpenFile`; the replication
-and greedy methods above are absent.
+Related gaps in the shipped Go types:
 
-*Amended (R5):* the shipped Go `RedexFileConfig` (`go/cortex.go:142–150`) also
-has no `Replication` field, although the C JSON parser accepts one
-(`src/ffi/cortex.rs:995–1038`). `enable_replication` only installs an empty
-router. A per-channel runtime starts when a file is opened with
-`RedexFileConfig.replication` set (`src/adapter/net/redex/manager.rs:298–323`).
-Without the field, a Go caller can't replicate a channel at all.
-
-*Amended (R6):* Go CRUD returns `(uint64 seq, error)`
-(`go/cortex.go:487–524`), and the adapter doesn't keep the `originHash` it was
-opened with (`OpenTasks(redex, originHash, persistent)`, `:426`). The
-reference package's CRUD returned `WriteToken{OriginHash, Seq}` instead, so
-copying it would be a source break.
+- `go/cortex.go`'s `Redex` has only `Free` and `OpenFile`.
+- `RedexFileConfig` (`go/cortex.go:142–150`) has no `Replication` field,
+  although the C JSON parser accepts one (`src/ffi/cortex.rs:995–1038`).
+  `enable_replication` only installs an empty router; a per-channel runtime
+  starts when a file is opened with a replication config
+  (`src/adapter/net/redex/manager.rs:298–323`). Without the field, a Go
+  caller can't replicate a channel at all.
+- Go CRUD returns `(uint64 seq, error)` (`go/cortex.go:487–524`), and the
+  adapter doesn't keep the `originHash` it was opened with
+  (`OpenTasks`, `:426`). The reference CRUD returned
+  `WriteToken{OriginHash, Seq}`, so copying it would be a source break.
 
 ### G3: blob features the C ABI doesn't reach (gap)
 
 Node and Python both expose these on `MeshBlobAdapter` and `BlobRef`. There is
-no `extern "C"` function for any of them, so Go can't reach them yet.
+no `extern "C"` function for any of them.
 
 | Feature | Core | Node / Python |
 |---|---|---|
-| Range fetch | `MeshBlobAdapter` via `BlobAdapter::fetch_range` | `fetchRange` / `fetch_range` |
-| Tree store with encoding (Replicated / Reed-Solomon k,m) | `store_stream_tree` (`dataforts/blob/mesh.rs:1322`) | `storeStreamTreeFromBytes(data, encoding?)` |
+| Range fetch | `fetch_range` (`dataforts/blob/mesh.rs:3663–3708`) | `fetchRange` / `fetch_range` |
+| Tree store with encoding | `store_stream_tree` (`mesh.rs:1322`) | `storeStreamTreeFromBytes(data, encoding?)` |
 | Repair | `repair_blob` (`mesh.rs:2856`) → `RepairReport` | `repairBlob` / `repair_blob` |
 | Tree-node cache | `with_tree_node_cache`, `tree_node_cache_stats` | `treeNodeCacheBytes` option, `treeNodeCacheStats` |
-| `BlobRef` tree accessors | `BlobRef` | `isTree`, `isChunked`, `treeRootHash`, `treeDepth`, `version`, `uri`, `size` |
+| `BlobRef` accessors | `BlobRef` | `isTree`, `isChunked`, `treeRootHash`, `treeDepth`, `version`, `uri`, `size` |
 | Feature tags | `DATAFORTS_BLOB_{TREE,CDC,ERASURE,BANDWIDTH_CLASS}_SUPPORTED` | exported constants |
 
-Go handles a `BlobRef` only as opaque encoded bytes, so it can't tell a tree
-ref from a flat one.
+Go handles a `BlobRef` only as opaque encoded bytes. `Fetch` on a tree ref is
+deliberately unsupported in core (`mesh.rs:3624–3634`, "use fetch_range for
+Tree blobs"), so once Go can store a tree, `FetchRange` is the only way to
+read it back.
+
+The feature tags are capability-advertisement **strings**
+(`"dataforts:blob-tree-supported"`, `blob/blob_tree.rs:65`, and the sibling
+cdc/erasure/bandwidth modules). They describe what a peer advertises, not
+what the local build supports.
 
 **Not a gap, recorded so nobody builds it:** Node exports `ChunkingStrategy`
 and `BandwidthClass` as value types, but **no Node method takes either one**.
 `store_stream_tree_from_bytes` hard-codes `ChunkingStrategy::default()`
-(`bindings/node/src/blob.rs:1408`). Python is the same. Go matches that
-posture: the feature-tag constants, and no chunking or bandwidth parameters
-until a binding has a method that uses them.
-
-*Amended (R9):* the four `DATAFORTS_BLOB_*_SUPPORTED` constants are
-capability-advertisement **strings** (`"dataforts:blob-tree-supported"`,
-`blob/blob_tree.rs:65`, and the sibling cdc/erasure/bandwidth modules), not
-bits. They describe what a *peer* advertises, not what the local build
-supports. Go exports them as string constants with the same values, for
-parity. S6 no longer proposes a mask function.
-
-*Amended (R3):* `Fetch` on a tree ref is deliberately unsupported
-(`blob/mesh.rs:3624–3634`: "use fetch_range for Tree blobs"). Go can store a
-tree only after S6, and can then read it back only through `FetchRange`.
+(`bindings/node/src/blob.rs:1408`). Python is the same. Go matches that: the
+tag strings, and no chunking or bandwidth parameters.
 
 ### G4: the rest of the reference package
 
@@ -145,9 +137,8 @@ Reference symbols with no `go/` definition, outside blobs:
 `capability_schema.go` (`AxisSchema`, `SchemaError`, …), and parts of
 `capability.go` (`DiffCapabilities`, `CapabilitySetDiff`, clause tracing),
 `deck.go` (`BlastRadius`, `AvoidScope`, `Audit`, …) and `meshdb.go` (the
-`Decoded*` aggregate types, builder helpers). Each must be classified as
-**port** (the C ABI supports it and another binding ships it) or **drop**
-(superseded, or never had a C entry point) before the package is deleted.
+`Decoded*` aggregate types, builder helpers). Each is classified as **port**,
+**drop** or **deferred** before the package is deleted.
 
 ## The design
 
@@ -155,553 +146,622 @@ Reference symbols with no `go/` definition, outside blobs:
 under `net/crates/net/bindings/go/`. They are workspace members
 (`Cargo.toml:14–23`), and `ci.yml` names their paths in about 15 places
 (clippy and test matrices, the `libnet` export check at `ci.yml:4777`).
-Moving them would churn CI for no gain. "Bindings" there means the Rust side
-of the C ABI; the Go side lives in `go/`.
+"Bindings" there means the Rust side of the C ABI; the Go side lives in `go/`.
 
 **Port, don't copy.** Nothing has compiled the reference files, so each one
-is rewritten against the current `go/` conventions instead of copied in:
-the `ErrBlob`-style sentinel errors, `runtime.SetFinalizer` plus an explicit
-`Close`, the RW-lock handle guard that `go/cortex.go` uses so `Close` can't
-free a handle another goroutine is inside, and `go/net.h` as the only header.
-Each ported file gets a test file. That is what makes this more than a move.
-
-**New C ABI for G3 follows the existing blob FFI shape.** Each function takes
-the opaque `net_mesh_blob_adapter_t*`, returns `c_int` from the `NET_ERR_*`
-space, and hands out buffers freed by `net_blob_free_buffer`. Structured
-results (`RepairReport`, tree-cache stats, `BlobRef` fields) cross as JSON
-strings freed by `net_free_string`, the same choice
-`net_mesh_blob_adapter_overflow_config` already made, so the ABI has no new
-C structs to version. Each function goes in `src/ffi/blob.rs` with a
-`blob_stubs.rs` twin returning `NET_ERR_FEATURE_NOT_BUILT`.
-
-*Amended (R9):* a list of names and allocators leaves the observable contract
-open. S6 starts by committing a normative table to this plan, covering every
-new function, before any code:
-
-| Contract item | Rule |
-|---|---|
-| Widths | Lengths and offsets are `size_t` / `uint64_t`. Go never narrows a length to `C.int`; it checks against `math.MaxInt` before `C.GoBytes`. |
-| Ranges | `[start, end)` half-open, `uint64_t`. `start > end` or `end > size` → the existing invalid-argument code. `start == end` → empty buffer, success. |
-| Null / empty pointers | Null handle or null out-pointer → `NetError::NullPointer`. A `(NULL, 0)` input pair is allowed where the core accepts empty input; `(NULL, n>0)` → null-pointer error. |
-| Failure outputs | Every out-pointer is set to `NULL` / `0` **before** the first early return. Existing blob functions are not uniform here, so this is stated for the new ones and tested, not assumed. |
-| Encoding | `encoding_kind`: `0` = Replicated, `1` = Reed-Solomon. Any other value → invalid argument. For RS, `k ≥ 1`, `m ≥ 1`, `k + m ≤ 255`, computed in a widened integer. `k = m = 0` means use the core defaults (`DEFAULT_RS_K` / `DEFAULT_RS_M`). |
-| JSON DTOs | Field names are the core struct's snake_case names; counters are JSON integers (`u64`). Go decodes them into `uint64` fields **without** `omitempty`. |
-| Optional state | Tree-cache stats when no cache is installed → success with JSON `null`, which Go maps to `(nil, nil)`. Not an error. |
-| `describe` | Variant-specific fields (`tree_root_hash`, `tree_depth`) are **absent** for a small ref, never zero placeholders. Go uses pointer fields for them. |
-| Errors in Go | New codes map into the existing `ErrBlob` tree with `errors.Is` sentinels. Feature-off (`NET_ERR_FEATURE_NOT_BUILT`) gets its own sentinel. |
-| Handles | Functions borrow the adapter handle under the same guard as the existing blob functions, so `Close` waits for in-flight calls. Every body runs inside the existing `adapter_guard` panic containment. |
-
-**Header closure.** *Amended (R2).* Every slice that calls a C function
-declares it in the canonical header and its Go mirror in the **same** slice,
-not in S6. For each function, the slice records which canonical header owns
-it (`include/net_transport.h` for directory transfer, `include/net.go.h` or a
-new section of it for the rest), how it reaches cgo (`go/net.h` either
-mirrors it or includes the canonical header), its error constants, and its
-feature-off behavior. No local `extern` declarations in Go preambles.
-Existing exported signatures don't change. Evidence: `go vet` plus a link
-against the single built `libnet`, and an extension to
-`go/abi_stability_*_test.go` that pins each new declaration's signature.
-The export baseline changes **only** in S6, and only by adding the new
-symbols. It is never regenerated wholesale to hide a missing export.
-
-**Error mapping.** *Amended (R8).* `go/blob.go:432–479` already exports
-`ErrTransfer` and its sentinels (`ErrTransferNotFound`,
-`ErrTransferHashMismatch`, …) with a code mapper. Ports extend that mapper
-rather than replace it. The `NET_ERR_DIR_*` codes (`src/ffi/transport.rs:82–114`)
-and feature-off get new sentinels under `ErrTransfer`. The reference
-`TransferError` type isn't ported, so every existing `errors.Is` check keeps
-working.
+is rewritten against current `go/` conventions instead of copied in:
+`errors.Is` sentinel trees, `runtime.SetFinalizer` plus an explicit `Close`,
+the RW-lock handle guard `go/cortex.go` uses so `Close` can't free a handle
+another goroutine is inside, and no local `extern` declarations. Each ported
+file gets a test file.
 
 **SDK-first rule.** AGENTS.md requires new user-facing mesh capability to land
-in `net-mesh-sdk` first. G3 adds no capability: every feature already exists
-in core and ships in Node and Python, and `sdk/src/dataforts.rs` already
-covers it for Rust. The Go binding sits on the C ABI over core, as Node and
-Python sit on core. The rule doesn't apply. The PR should say so.
+in `net-mesh-sdk` first. This plan adds no capability: every feature already
+exists in core and ships in Node and Python, and `sdk/src/dataforts.rs`
+already covers it for Rust. The rule doesn't apply. The PR says so.
+
+### Header closure and the export baseline
+
+Every slice that calls a C function declares it in the canonical header and
+in the Go include chain **in that slice**. For each function, the slice
+records which canonical header owns it (`include/net_transport.h` for
+directory transfer, `include/net.go.h` for the rest), how it reaches cgo
+(`go/net.h` either mirrors it or includes the canonical header), its error
+constants, and its feature-off behavior. Existing exported signatures don't
+change. Evidence: a link against the single built `libnet`, plus an
+extension to `go/abi_stability_*_test.go` that pins each new declaration's
+signature.
+
+**Every slice that adds an exported symbol adds exactly that symbol to
+`bindings/go/net-ffi/exports.baseline` in the same commit**, with the reason
+in the commit message. That covers S5b's owned registration, S6's blob
+functions, and S7's placement registration if it isn't deferred. The baseline
+is never regenerated wholesale. The checker
+(`.github/scripts/check-ffi-exports.py`) compares one platform-neutral name
+set, so an unexpected Linux mismatch is investigated as a missing or extra
+export, never answered by regenerating.
+
+### Buffers and lengths
+
+`C.GoBytes(unsafe.Pointer, C.int)` truncates any length over 2³¹−1, and
+checking against `math.MaxInt` doesn't prevent that, because Go `int` is
+wider than `C.int` on 64-bit targets. **Decision: an int-sized checked copy,
+never `C.GoBytes`, in new and ported code.**
+
+```go
+// checkedLen converts a C length to a Go int, or fails. Pure: testable at
+// the boundary without allocating.
+func checkedLen(n C.size_t) (int, error)
+// copyCBuf copies n bytes out of a C buffer. (nil, 0) → empty slice;
+// (nil, n>0) → error. Does not free; the caller frees with the matching
+// allocator.
+func copyCBuf(p unsafe.Pointer, n C.size_t) ([]byte, error)
+```
+
+`copyCBuf` uses `unsafe.Slice((*byte)(p), n)` plus `copy` into a Go slice, so
+the length never passes through `C.int`. The supported size is whatever
+`checkedLen` accepts (`n ≤ math.MaxInt`), and core's own per-call limits stay
+in force. For example, `MAX_FETCH_RANGE_BYTES` is 1 GiB (`mesh.rs:113`).
+Pointer/length consistency and ownership (which allocator frees the buffer)
+are checked separately from the length. Boundary tests call `checkedLen`
+directly with 2³¹−1, 2³¹, 2³²+1 and `math.MaxInt`+1 (where representable), so
+none of them allocates. S1 adds the helpers and moves the three blob copy
+sites onto them.
+
+### Error mapping
+
+`go/blob.go:432–479` already exports `ErrTransfer` and its sentinels, with a
+code mapper covering −200…−209. Ports **extend** that mapper rather than
+replace it, so every existing `errors.Is` check keeps working. The reference
+`TransferError` type isn't ported. New sentinels (exact names fixed in the
+slice):
+
+- `NET_ERR_DIR_INVALID_MANIFEST` (−210), `NET_ERR_DIR_PATH_INVALID` (−211)
+  and `NET_ERR_DIR_IO` (−213): new sentinels under `ErrTransfer`.
+- `NET_ERR_FEATURE_NOT_BUILT`: one sentinel shared by every feature-off stub.
+- The blob-registry codes (`NET_ERR_BLOB_*`, −110…−120 in `src/ffi/blob.rs`):
+  sentinels under `ErrBlob`.
+
+The native mapping is never changed to make a witness pass. In particular,
+`net_dir_manifest_read` returns the **fetch** error (`blob_err_code`, so a
+missing blob is `NET_ERR_TRANSFER_NOT_FOUND`) and returns
+`NET_ERR_DIR_INVALID_MANIFEST` only for bytes that were fetched but don't
+decode (`src/ffi/transport.rs:429–440`). Both classifications are preserved
+and tested separately (S2).
+
+### New C ABI contract (S6)
+
+Each new function takes the opaque `net_mesh_blob_adapter_t*` (or encoded ref
+bytes), returns `c_int`, and has a `blob_stubs.rs` twin returning
+`NET_ERR_FEATURE_NOT_BUILT`. Structured results cross as JSON strings freed
+with `net_free_string`, the choice `net_mesh_blob_adapter_overflow_config`
+already made, so there are no new C structs to version. Byte results are
+freed with `net_blob_free_buffer`.
+
+**Normative rules for every S6 function:**
+
+| Item | Rule |
+|---|---|
+| Widths | Lengths: `size_t`. Offsets and ranges: `uint64_t`. `encoding_kind`: `uint8_t`. `rs_k`, `rs_m`: `uint8_t`. Cache capacity: `uint64_t`. |
+| Output storage | Required out-pointers are null-checked **before** any dereference. Null → `NetError::NullPointer` (−1), and nothing is written through any pointer. After that check, every out slot is initialized (`NULL` / `0`) before any later failure can return. If one pointer of a pair (`out_ptr`, `out_len`) is null, that's a null-pointer error and **neither** slot is written. Tested per function, with each pointer nulled in turn. |
+| Input pairs | `(NULL, 0)` is an empty input where core accepts empty input. `(NULL, n>0)` → null-pointer error. |
+| Range order | **Preserves core's order** (`mesh.rs:3663–3708`), evaluated in this sequence: (1) `start > end` → invalid argument. (2) `start == end` → success with an empty buffer, **even if `start` is beyond the blob's size**, as core does. (3) Non-empty: `end - start > MAX_FETCH_RANGE_BYTES` → invalid argument. (4) Non-empty: `end > size` → invalid argument. The accept/reject decisions are identical to core. The only difference is **classification**: core reports (1), (3) and (4) as `BlobError::Backend`, and the new C function pre-checks them in the same order and returns a dedicated invalid-argument code instead. That is a deliberate tightening of the error code, named here, not pure forwarding. |
+| Invalid-argument code | A new `NET_ERR_BLOB_INVALID_ARGUMENT`, numbered from a fresh inventory of the `src/ffi` code space. `−120` is **not** free (see "Defects found on the way"). |
+| Encoding | `encoding_kind`: `0` = Replicated, `1` = Reed-Solomon, any other value → invalid argument. For Replicated, `rs_k` and `rs_m` **must both be 0**; anything else is invalid argument (no silent ignore). For Reed-Solomon, `rs_k == 0 && rs_m == 0` together means use the core defaults (`DEFAULT_RS_K` / `DEFAULT_RS_M`). That is the only default, and exactly one of them being 0 is invalid argument. Otherwise `k ≥ 1`, `m ≥ 1`, and `k + m ≤ 255`, computed in `u16`. |
+| JSON DTOs | Field names are the core struct's snake_case names, and counters are JSON integers (`u64`). Go decodes them into `uint64` fields **without** `omitempty`. |
+| Optional state | Tree-cache stats with no cache installed → success with JSON `null`, which Go maps to `(nil, nil)`. Not an error. |
+| `describe` | Variant-specific fields (`tree_root_hash`, `tree_depth`) are **absent** for a non-tree ref, never zero placeholders. Go uses pointer fields for them. |
+| Go errors | New codes join the `ErrBlob` tree. Feature-off uses the shared sentinel. |
+| Handles and panics | Borrow the adapter under the same guard as the existing blob functions, so `Close` waits for in-flight calls. Every body runs inside the existing `adapter_guard` panic containment. |
 
 **Alternatives rejected:**
 
 - *Give `bindings/go/net/` its own `go.mod` and test it in CI.* That leaves two
-  Go packages covering the same surface, which is the drift problem this plan
-  exists to end.
+  Go packages covering the same surface, which is the drift this plan ends.
 - *Delete `bindings/go/net/` now and port later from git history.* It is the
-  only record of how several surfaces were meant to look in Go (dir transfer,
-  greedy and gravity config). Port first, delete last (S8).
-- *Pass `BlobRef` as a C struct.* It versions badly, and the encoded-bytes
-  form plus a JSON accessor is what the existing functions already use.
+  only record of how several surfaces were meant to look in Go. Port first,
+  delete last (S8).
+- *Pass `BlobRef` as a C struct.* It versions badly. Encoded bytes plus a
+  JSON accessor is what the existing functions already use.
+- *Keep `C.GoBytes` behind a `C.int` maximum check.* Workable, but it caps
+  every buffer at 2 GiB for no reason core imposes. The checked copy costs
+  nothing more.
 
-### Decision: callback blob adapters (S5)
+### Decision: callback blob adapters (S5b)
 
-`net_blob_register_callback_adapter` lets Go implement a `BlobAdapter`.
-Rust calls back into Go on Rust-owned threads, the same shape as the MCP
-consent callbacks, where the `mcp-sdk` branch review found use-after-free
-and cgo thread races.
+`net_blob_register_callback_adapter` lets Go implement a `BlobAdapter`, with
+Rust calling back into Go on Rust-owned threads. That's the same shape as the
+MCP consent callbacks, where the `mcp-sdk` branch review found
+use-after-free and cgo thread races.
 
-**Recommendation:** ship the filesystem adapter and `Publish` / `Resolve` in S5,
-and put the callback adapter in its own slice (S5b) behind a `runtime/cgo.Handle`
-registry, with a `-race` test that unregisters mid-call. If S5b slips, S5 still
-stands on its own.
+A `cgo.Handle` table alone is not an ownership contract. Unregister removes
+only the registry's `Arc` (`blob/registry.rs:74–83`). `net_blob_resolve`
+already holds a clone (`src/ffi/blob.rs:316–352`), and the adapter clones its
+`Arc<OpaqueCtx>` into `spawn_blocking`, where it stays in use through `fetch`
+and the later `free_buffer` callback (`:664–756`). The vtable has no context
+destructor (`:509–522`), and `OpaqueCtx` gives no drop notification
+(`:551–567`).
 
-*Amended (R1): a handle table is not an ownership contract.* Unregister
-removes only the registry's `Arc` (`blob/registry.rs:74–83`).
-`net_blob_resolve` already holds a clone (`src/ffi/blob.rs:316–352`), and the
-adapter clones its `Arc<OpaqueCtx>` into `spawn_blocking`, where it stays in
-use through `fetch` and the later `free_buffer` callback (`:664–756`). The
-vtable has no context destructor (`:509–522`), and `OpaqueCtx` gives no drop
-notification (`:551–567`). So deleting the `cgo.Handle` when unregister
-returns can race a later Rust→Go lookup, and never deleting it leaks.
-Revised S5b design:
+**Decision:**
 
 - **Additive owned-context registration.** A new
   `net_blob_register_callback_adapter_owned(id, vtable, ctx, release_fn)`
   leaves the existing function and the `NetBlobAdapterVtable` layout
   untouched. `release_fn(ctx)` runs exactly once, from the `Drop` of the
-  **shared context** that the blocking work retains, not the outer adapter.
-  A cancelled future can drop the adapter while `spawn_blocking` is still
-  running.
+  **shared context** that blocking work retains, not the outer adapter,
+  because a cancelled future can drop the adapter while `spawn_blocking` is
+  still running.
 - **Ownership on failure.** If registration fails (duplicate id, null
   pointer, feature off), ownership stays with the caller, `release_fn` is not
   called, and Go deletes the handle. On success, Rust owns the context until
   `release_fn` runs, and only then does Go call `Handle.Delete`.
 - **Buffers.** Callback-produced buffers are allocated and freed by matching
-  C helpers in the Go module's cgo preamble (`C.malloc` / `C.free`), never by
-  the Go GC.
+  C helpers in the Go module's cgo preamble (`C.malloc` / `C.free`), never
+  by the Go GC.
 - **Panic containment.** `recover` wraps the entire exported trampoline,
   including the handle lookup and type assertion, not just the user method.
-- **Witnesses.** Deterministic, not `-race` alone. A test-helper barrier
-  holds a Rust worker (a) before the handle lookup and (b) before
-  `free_buffer`. The test unregisters while it is held, releases it, and
-  asserts that the callback completes against the original adapter and that
-  `release_fn` fires exactly once, after the release. It also covers: a
-  failed registration leaves the handle owned by Go; a cancelled resolve; and
-  a same-id re-registration while an old call is held, where each call reaches
-  its own adapter. `-race` runs are supporting evidence only.
 
-S5b staying deferrable doesn't make S7's placement port safe. That has its
-own generation problem (below).
+S5b can be deferred without affecting S5. Deferring it doesn't make the S7
+placement port safe.
 
 ### Decision: placement-filter lifetime (S7)
 
-*Added (R1).* The reference wrapper maps a string id to a Go predicate
-(`bindings/go/net/placement.go:135–148`) and deletes the map entry as soon as
-Rust unregister returns (`:290–329`). A scheduler-held `CgoPlacementFilter`
-holds only the id (`compute-ffi/src/lib.rs:3209–3216`) and dispatches it
-later (`:3265–3280`). So an old filter can veto after removal, or call a
-**new** predicate registered under the same id. The registration mutex
-doesn't cover scheduler-held `Arc` clones.
+The reference wrapper maps a string id to a Go predicate
+(`bindings/go/net/placement.go:135–148`) and deletes the entry as soon as Rust
+unregister returns (`:290–329`). A scheduler-held `CgoPlacementFilter` holds
+only the id (`compute-ffi/src/lib.rs:3209–3216`) and dispatches it later
+(`:3265–3280`). So an old filter can veto after removal, or call a **new**
+predicate registered under the same id. The registration mutex doesn't cover
+scheduler-held `Arc` clones.
 
-**Recommendation:** bind each native bridge to a per-registration token
-(an id plus a generation, or a `cgo.Handle`) through an additive
-registration entry point with an owned-context release, the same pattern as
-S5b. The original predicate stays alive until the bridge's last owner
-releases it. Panic containment wraps the whole trampoline. If that is
-too much for this track, S7 records placement as **deferred**, with this
-reason in the ledger, and S8 preserves the reference API design in that row
-before deleting the file. Either way, the placement port doesn't land
-without the witness: old filter acquired → unregister → same-id
-replacement registered → the old invocation still runs its original
-predicate.
+**Decision:** bind each native bridge to a per-registration token through an
+additive registration entry point, with an owned-context release (the S5b
+pattern). The original predicate stays alive until the bridge's last owner
+releases it, and whole-trampoline panic containment applies. If that is too
+much for this track, S7 records placement as **deferred**, with this reason
+and the reference API design preserved in its ledger row before S8 deletes
+the file.
 
 ## The slices
 
 Each slice leaves `go test ./...` green (cgo enabled, `libnet` from
-`cargo build --release -p net-ffi --features net-ffi/test-helpers`).
+`cargo build --release -p net-ffi --features net-ffi/test-helpers`), and
+does its own header closure and export-baseline additions.
 
-### S1: tests for the existing `go/blob.go`
+### S1: tests for the existing `go/blob.go`, plus checked buffer copies
+
+The one non-test change: add `checkedLen` / `copyCBuf` and move
+`go/blob.go`'s three `C.GoBytes` sites onto them. Everything else pins
+**current** behavior and adds no new policy.
 
 `go/blob_test.go`, on a `Redex` from `NewRedex` with a temp `persistentDir`:
-- `Store` then `Fetch` round-trips, and `Exists` flips from false to true.
-- `Publish(uri, data)` returns a ref that `BlobRefHash` decodes to the
-  BLAKE3 of the data.
-- With `Persistent: true`, a ref fetches after closing and reopening the
-  `Redex` on the same directory.
-- `OverflowConfig` set → get round-trips every field; an out-of-range ratio
-  returns an `ErrBlob`-wrapped error.
-- `PrometheusText` contains the `dataforts_blob_` prefix (the same witness as
-  `tests/net_blob_cli.rs:302`).
-- `Close` racing 32 `Fetch` goroutines under `-race` doesn't crash, and every
+
+- **Round-trip.** `Store` then `Fetch` returns the same bytes.
+- **Exists.** A known ref is `false` on a fresh, empty adapter. After `Store`
+  on that adapter, it's `true`. (`Publish` also stores, so it can't supply
+  the `false` half.)
+- **Publish.** `Publish(uri, data)` returns a ref that `BlobRefHash` decodes to
+  the BLAKE3 of the data.
+- **Persistence.** With `Persistent: true`: store, `Close` the **adapter**,
+  free the `Redex`, reopen both on the same directory, and fetch. The adapter
+  holds its own `Arc<Redex>`, so closing only the `Redex` isn't a restart.
+- **Overflow config, current behavior.** Set → get round-trips with
+  **non-zero** values. Explicit zeros are pinned separately: `omitempty` sends
+  them as absent, and they come back as native defaults. A finite
+  out-of-range ratio is pinned as **accepted** (the parser assigns finite
+  ratios as given, `src/ffi/blob.rs:952–986`). Refusal is covered with inputs
+  that really are refused: an unknown `scope` and malformed JSON.
+- **Metrics.** `PrometheusText` contains the `dataforts_blob_` prefix (the
+  witness at `tests/net_blob_cli.rs:302`).
+- **Close race.** `Close` racing 32 `Fetch` goroutines doesn't crash, and every
   call after `Close` returns an error.
-- Two-node `ServeBlobTransfer` + `FetchBlob` on `meshHandshakePair`
-  (`go/mesh_test.go:38`).
+- **Two nodes.** `ServeBlobTransfer` on both peers of `meshHandshakePair`
+  (`go/mesh_test.go:38`), then `FetchBlob` returns the bytes.
+- **Length boundaries.** `checkedLen` at 2³¹−1, 2³¹ and 2³²+1, and `copyCBuf`
+  with `(nil, 0)` and `(nil, 1)`. No large allocation.
 
-**Proves it:** the file runs green under `go test -race -run Blob`. Mutation
-check: swapping `Store`'s ref and data arguments, or dropping the
-`Persistent` flag from the options JSON, must turn a test red.
+**Proves it:** green under `-race`. Mutations that must turn a test red:
+swapping `Store`'s ref and data arguments; passing `0` instead of the
+`persistent` **C int argument** to `net_mesh_blob_adapter_new`
+(`src/ffi/blob.rs:1008–1065`); and reverting one copy site to
+`C.GoBytes(…, C.int(n))` (a `checkedLen` unit test catches the helper, and a
+grep test fails if `C.GoBytes` reappears in `go/blob.go`).
 
-*Amended (R7, R4).* Corrections to the list above. S1 is tests only, so it
-pins **current** behavior and adds no new policy:
-- **Overflow validation.** The parser assigns any finite ratio as given
-  (`src/ffi/blob.rs:952–986`), and the core setter doesn't range-check it, so
-  "an out-of-range ratio returns an error" isn't true today. The test pins
-  that a finite out-of-range ratio is **accepted**, and covers refusal with
-  inputs that really are refused: an unknown `scope` string and malformed
-  JSON. Ratio validation, if wanted, is a separate behavior change with its
-  own range and compatibility note. It isn't in this plan.
-- **Round-trip.** `OverflowConfig`'s numeric fields are `omitempty`, so an
-  explicit zero goes over the wire as "absent" and comes back as the native
-  default. The round-trip test uses non-zero values and pins the zero →
-  default behavior separately.
-- **Exists.** `Publish` stores the object, so "false then true" uses a known
-  ref against an independent, empty adapter for the `false` half.
-- **Persistence.** Close the **adapter** and then the `Redex` before
-  reopening; the adapter holds its own `Arc<Redex>`.
-- **Mutation target.** Persistence is a separate C `int` argument
-  (`net_mesh_blob_adapter_new`, `src/ffi/blob.rs:1008–1065`), not a JSON
-  field. The mutation drops that argument.
-- **Race evidence.** CI's Go runner (`.github/scripts/go-test-with-native-stacks.sh`,
-  `ci.yml:4815,4870`) doesn't pass `-race`, so the normal Go job is not race
-  evidence. This slice adds an explicit `-race` step that runs the blob tests
-  (and, from S5b on, the callback tests) through the same native-stack
-  runner, so hangs still report native frames.
+**CI:** CI's Go runner (`.github/scripts/go-test-with-native-stacks.sh`,
+`ci.yml:4815,4870`) doesn't pass `-race`, so the normal Go job isn't race
+evidence. S1 adds an explicit `-race` step through the same native-stack
+runner, so hangs still report native frames. It runs the blob tests, and
+from S5b on the callback tests too.
 
-### S2: directory transfer (G2)
+### S2: directory transfer
 
-Port `transport.go` into `go/blob.go` (or `go/transfer.go`): `StoreDir`,
-`FetchDir` (returns `DirStats{Files, Bytes}`), `DirManifestRead` (decodes the
-JSON), `FetchBlobDiscovered`, and `TransferError` mapping the
-`NET_ERR_TRANSFER_*` codes.
+Header closure: the four functions reach cgo from `include/net_transport.h`,
+either mirrored as `go/net_transport.h` and included from `go/net.h`, or with
+the declarations moved into `net.go.h`. Port `StoreDir`, `FetchDir`
+(returns `DirStats{Files, Bytes}`), `DirManifestRead` (decodes the JSON into
+typed entries) and `FetchBlobDiscovered`. Errors use the extended
+`ErrTransfer` mapper.
 
-**Proves it:** a two-node test stores a 3-file tree with a nested
-subdirectory, fetches it into a temp dir, and byte-compares every file.
-`DirStats` matches the file count and byte total. `FetchBlobDiscovered` finds
-a blob without a holder id. A missing manifest returns `TransferError`, not a
-panic.
+Allocators: byte outputs are freed with `net_transport_free_buffer`; the
+manifest JSON is freed with `net_free_string`.
 
-*Amended (R2, R8).*
-- **Header.** Declare the four functions for cgo from
-  `include/net_transport.h`, either by mirroring it as `go/net_transport.h`
-  and including it from `go/net.h`, or by moving the declarations. Whichever
-  is chosen, the ABI-stability test pins the signatures.
-- **No `TransferError` type.** Extend the existing `ErrTransfer` mapper with
-  `NET_ERR_DIR_*` and feature-off sentinels (see "Error mapping").
-  "A missing manifest returns `TransferError`" becomes
-  `errors.Is(err, ErrDirInvalidManifest)` (name final in the slice) **and**
-  `errors.Is(err, ErrTransfer)`.
-- **The JSON boundary gets its own witness.** The test calls
-  `DirManifestRead` directly and asserts the decoded entries: paths, sizes,
-  the externally tagged entry kind (file vs. dir), and that each embedded
-  encoded ref decodes with `BlobRefHash`. A byte-compare after `FetchDir`
-  never touches that JSON.
-- **Allocators.** Byte outputs are freed with `net_transport_free_buffer`;
-  the manifest JSON is freed with `net_free_string`. A Go test helper counts
-  the frees.
-- **Fixture.** Both peers install the transfer engine (`ServeBlobTransfer`).
-  `FetchBlobDiscovered` keeps the exact 32-byte hash check: 31- and 33-byte
-  hashes are refused in Go before the cgo call.
+**Proves it**, on a two-node fixture with the transfer engine installed on
+both peers:
 
-### S3: RedEX replication and greedy Dataforts (G2)
+- **Directory round-trip.** Store a 3-file tree with a nested subdirectory,
+  `FetchDir` into a temp dir, and byte-compare every file. `DirStats`
+  matches the file count and byte total.
+- **The manifest JSON itself.** Call `DirManifestRead` directly and assert
+  the decoded entries: paths, sizes, the externally tagged entry kind (file
+  vs. dir), and that each embedded encoded ref decodes with `BlobRefHash`. A
+  byte-compare after `FetchDir` never touches that JSON.
+- **Missing content.** `DirManifestRead` with a well-formed ref to content
+  the reachable holder doesn't have: `errors.Is(err, ErrTransferNotFound)`
+  and `errors.Is(err, ErrTransfer)`.
+- **Not a manifest.** `DirManifestRead` with a ref to a blob that exists and
+  fetches but holds non-manifest bytes (for example, an ordinary file blob):
+  `errors.Is(err, ErrDirInvalidManifest)` and `errors.Is(err, ErrTransfer)`.
+  The two classifications come from different native paths
+  (`src/ffi/transport.rs:429–440`). Neither is remapped.
+- **Discovered fetch.** `FetchBlobDiscovered` finds a blob without a holder
+  id. It refuses 31- and 33-byte hashes in Go before the cgo call. A hash
+  nobody holds pins its current code (`NET_ERR_TRANSFER_ALL_PEERS_FAILED`,
+  `transport.rs:293`) under `ErrTransfer`.
+- **Path refusal.** A `FetchDir` destination with no final name component
+  (for example, a filesystem root) is refused as `DirError::UnsafePath`
+  (`dataforts/dir.rs:737`), which maps to `NET_ERR_DIR_PATH_INVALID`, and
+  Go matches that sentinel. Manifest-entry path refusal (`dir.rs:906`) is
+  covered by the Rust tests, because a hostile manifest can't be built from
+  Go.
 
-Methods on `go/cortex.go`'s `Redex`: `EnableReplication` /
-`DisableReplication` / `ReplicationRuntimeCount` /
-`ReplicationPrometheusText`, and `EnableGreedyDataforts` /
-`DisableGreedyDataforts` / `GreedyCachedChannelCount` /
-`GreedyPrometheusText` / `EnableGravityForGreedy(DataGravityConfig)` /
-`DisableGravityForGreedy`. The Node SDK's N8 slice in
-[`NODE_SDK_GAPS_PLAN.md`](NODE_SDK_GAPS_PLAN.md) covers the same surface
-(less `DisableReplication`, which has a C entry point but no Node method);
-match its names and defaults.
+### S3: RedEX replication and greedy Dataforts
 
-**Proves it:** enable → runtime count goes to 1, disable → back to 0, and the
-Prometheus text names the channel. Calling enable twice is idempotent or a
-typed error, whichever the C side does; the test pins that. Gravity
-config round-trips.
+Header closure: declare the replication, greedy and gravity functions in
+`include/net.go.h` and `go/net_cortex.h`.
 
-*Amended (R5): that witness was invalid.* `enable_replication` installs an
-**empty** router. `replication_runtime_count` counts router entries, not an
-enabled flag (`redex/manager.rs:541–549`). The count reaches 1 only once a
-file is opened with a replication config, and Go can't express that today.
-Revised scope and witness:
-- **Scope adds** a `Replication *RedexReplicationConfig` field on
+- **Scope.** Methods on `Redex`: `EnableReplication` /
+  `DisableReplication` / `ReplicationRuntimeCount` /
+  `ReplicationPrometheusText`, and `EnableGreedyDataforts` /
+  `DisableGreedyDataforts` / `GreedyCachedChannelCount` /
+  `GreedyPrometheusText` / `EnableGravityForGreedy(DataGravityConfig)` /
+  `DisableGravityForGreedy`. A `Replication *RedexReplicationConfig` field on
   `RedexFileConfig`, forwarded through `OpenFile` to the JSON the C parser
-  already accepts (`src/ffi/cortex.rs:995–1038`). The DTO mirrors that
-  parser's keys exactly. A nil pointer leaves the key out, which is the
-  current behavior.
-- **Header.** Declare the replication, greedy and gravity functions in the
-  canonical header and `go/net_cortex.h` (none are declared anywhere today).
-- **Ownership.** `EnableReplication`, `EnableGreedyDataforts` and
-  `EnableGravityForGreedy` take a `net_mesh_arc_clone` box, which C
+  already accepts. The DTO mirrors that parser's keys exactly, and nil leaves
+  the key out (today's behavior). Names and defaults match the Node SDK's N8
+  slice in [`NODE_SDK_GAPS_PLAN.md`](NODE_SDK_GAPS_PLAN.md), which has the
+  same surface minus `DisableReplication`.
+- **Ownership.** The enable functions take a `net_mesh_arc_clone` box, which C
   **consumes on every return code** (`src/ffi/cortex.rs:459–499`). Go clones
-  it immediately before the call and never frees it afterward, including on
-  error. A test helper counts live Arcs, and the error-path test asserts no
-  double free and no leak.
-- **Witness.** Disabled → count 0. Enable → still 0 (empty router). Open a
-  file with a replication config → 1. Append on node A, then bounded
-  (≤ 10 s) reads on node B return the same events: replication is proven
-  by data arriving, not by the metric. Disable → count drains to 0.
-  Calling enable twice pins the documented idempotence.
-- **Gravity.** There is no C getter, so "config round-trips" was
-  unobservable. The witness becomes: invalid configs are refused at the C
-  boundary (pinning whichever validation the C side does), a valid config
-  takes effect (greedy cached-channel count and Prometheus text change as
-  documented), and disable reverts it. If a getter turns out to be needed,
-  it's recorded here as a missing accessor for S6, not assumed.
+  it immediately before the call and never frees it afterward, error included.
 
-### S4: CortEX read-your-writes (G2)
+**Proves it:**
 
-`TasksAdapter.WaitForToken` / `MemoriesAdapter.WaitForToken`, plus the
-`context.Context` variant from the reference package.
+- **Replication.** Disabled: the count is 0. Enable: still 0, because the
+  router starts empty and the count counts router entries
+  (`redex/manager.rs:541–549`). Open a file with a replication config: 1.
+  Append on node A; bounded (≤ 10 s) reads on node B return the same events,
+  so replication is proven by the data, not the metric. Disable: the count
+  drains to 0. Enable twice pins the documented idempotence.
+- **Arc ownership.** A test-helper live-Arc count shows no leak and no double
+  free on the success path or the error path (a shutting-down `Redex`).
+- **Greedy.** Admission is event-driven. A peer's event on a channel whose
+  chain capabilities pass the greedy policy is cached (the
+  `admitted_event_caches_and_announces_chain` path,
+  `greedy/runtime.rs:1218`). Enable greedy on node B, publish from node A,
+  and `GreedyCachedChannelCount` rises within a bounded wait. Disable stops
+  new admissions. The fixture sets the scope / intent-match config so
+  admission doesn't depend on defaults.
+- **Gravity: forwarding, plus the real observable.** Gravity doesn't create
+  or delete cache entries. Enabling it installs a heat registry and a tick
+  task, and disabling clears the slot while greedy caching keeps running
+  (`greedy/runtime.rs:390–407`, `redex/manager.rs:448–492`). What gravity
+  does is turn reads into heat announcements: `gravity_tick` builds
+  emissions and calls `announce_heat_batch` (`greedy/runtime.rs:628–701`),
+  which writes a `heat:<chain-hex>=<rate>` tag into the node's announced
+  capability set (`mesh.rs:46360`). The witness:
+  1. Enable greedy and gravity, with a short tick and a low emit threshold in
+     the config JSON (`emit_threshold_ratio`, plus the tick and decay knobs
+     `into_policy_and_tick` reads, `src/ffi/cortex.rs:828`).
+  2. Get a cached channel admitted, and drive reads through it with a
+     publisher-stamped `origin_hash`. Unstamped reads only bump
+     `dataforts_greedy_gravity_heat_unattributed_total`.
+  3. Within a bounded wait (a few ticks), observe the `heat:<hex>=…` tag on
+     that node's capabilities through a supported surface: the peer's
+     capability view, or the local announced set.
+  4. Disable gravity, keep reading, wait the same number of ticks, and
+     assert **no newer emission** for that chain. Already-announced tags and
+     cumulative counters aren't expected to reset.
 
-**Proves it:** a write's token, waited on immediately, returns, and the
-following `List` includes the write. An already-cancelled context returns
-`context.Canceled` without blocking. A token from a different adapter is
-rejected.
+  Invalid-config refusal is pinned separately (malformed JSON →
+  `InvalidJson`; whichever range checks `into_policy_and_tick` applies).
+  **If Go can't read a node's announced tags by prefix,** the smallest hook
+  is a `test-helpers`-only C accessor for the local announced capability
+  tags. It's declared in this slice and added to the baseline only under
+  `test-helpers`. Until it exists, the evidence is stated honestly as
+  "forwarding plus the native gravity tests", not as a cache-count toggle.
 
-*Amended (R6).* **Decision: additive, no source break (recommended).** The
-existing CRUD signatures stay `(uint64, error)`. Adapters keep the
-`originHash` they were opened with and gain:
-- `OriginHash() uint64`
-- `Token(seq uint64) WriteToken`, where `WriteToken{OriginHash, Seq}` is a
-  new exported struct
-- `WaitForToken(tok, timeout)` and `WaitForTokenContext(ctx, tok)`
+### S4: CortEX read-your-writes
 
-A caller writes `seq, _ := t.Create(...)` and then
-`t.WaitForToken(t.Token(seq), d)`. Changing the CRUD signatures to return
-tokens, as the reference package did, would need explicit authorization as
-a breaking change. This plan doesn't take it.
+Header closure: declare both wait functions in `go/net_cortex.h` and its
+canonical source.
 
-Semantics to pin, each with a test:
-- **Zero timeout.** In C, `timeout_ms == 0` means poll once
-  (`src/ffi/cortex.rs:1830`), but Go `WaitForSeq(…, 0)` means wait
-  indefinitely. `WaitForToken` documents and tests its own zero: zero
-  polls, matching C. Waiting without a deadline goes through the context
-  variant.
+**Additive API, no source break.** The CRUD signatures stay
+`(uint64, error)`. Adapters keep the `originHash` they were opened with and
+gain `OriginHash() uint64`, `Token(seq uint64) WriteToken` (a new exported
+`WriteToken{OriginHash, Seq}`), `WaitForToken(tok, timeout)` and
+`WaitForTokenContext(ctx, tok)`. A caller writes `seq, _ := t.Create(...)`,
+then `t.WaitForToken(t.Token(seq), d)`.
+
+Semantics:
+
+- **Zero timeout polls.** In C, `timeout_ms == 0` means check once
+  (`src/ffi/cortex.rs:1830`), and `WaitForToken` matches that. This is
+  documented as a deliberate contrast with `WaitForSeq`, where zero means wait
+  indefinitely. An unbounded wait goes through the context variant.
 - **Errors.** `NET_ERR_TIMEOUT`, `NET_ERR_WRONG_ORIGIN`, `NET_ERR_QUEUE_FULL`
-  and `NET_ERR_FOLD_STOPPED` each map to a distinct `errors.Is` sentinel.
-- **Wrong origin.** C checks the **origin**, not adapter identity. The
-  negative witness uses a token with a **different origin hash**; a second
-  adapter opened with the same origin is expected to succeed, and the test
-  pins that too.
+  and `NET_ERR_FOLD_STOPPED` each map to a distinct sentinel.
+- **Origin, not identity.** C checks the token's origin against the
+  adapter's, not which object issued it (`src/ffi/cortex.rs:1806–1847`).
 - **Cancellation.** `WaitForTokenContext` checks `ctx.Err()` **before** the
-  first poll (the reference loop polled first), so a pre-cancelled context
-  returns `context.Canceled` even when the token is already satisfied.
-  Polling slices are bounded, so cancellation is noticed within one slice
-  (≤ 50 ms), and the test asserts that bound.
-- **Header.** Declare both wait functions in `go/net_cortex.h` and its
-  canonical source.
+  first poll (the reference loop polled first). Poll slices are bounded
+  (≤ 50 ms).
 
-### S5: blob adapter registry: filesystem + publish/resolve (G2)
+**Proves it:**
 
-`RegisterFilesystemBlobAdapter(id, root)`, `UnregisterBlobAdapter`,
-`BlobAdapterRegistered`, `BlobPublish(adapterID, uri, data)`,
-`BlobResolve(ref)`.
+- **Read-your-writes.** `Create`, then `WaitForToken(t.Token(seq), 1s)`
+  returns nil, and an immediate `List` includes the write.
+- **Wrong origin.** A token with a **different origin hash** →
+  `ErrWrongOrigin`.
+- **Same origin, other adapter.** A second adapter opened with the same
+  origin on the same `Redex` is given a token whose sequence **that adapter
+  has applied** (it waits on its own fold, `WaitForSeq`, first): success. A
+  matching origin alone isn't a visibility guarantee, so the witness never
+  relies on it. A same-origin token for a sequence the receiving adapter
+  hasn't applied, with a zero timeout, returns `ErrTimeout`.
+- **Zero timeout.** On an unapplied sequence, returns `ErrTimeout`
+  immediately (bounded under 50 ms).
+- **Pre-cancelled context.** Returns `context.Canceled` even when the token
+  is already satisfied. Cancelling mid-wait returns within one poll slice.
 
-**Proves it:** publish through a filesystem adapter writes under `root`, and
-resolve returns the bytes. After unregister, resolve fails with a typed error.
-Registering a duplicate id fails.
+### S5: blob adapter registry: filesystem + publish/resolve
 
-*Amended (R8, R2).* `net_blob_resolve` takes an explicit adapter id
-(`src/ffi/blob.rs:316–352`). The Go API is `BlobResolve(adapterID, ref)`,
-not a global `BlobResolve(ref)`; no discovery mechanism is added. All six
-registry functions get declarations in the canonical header and `go/net.h`
-in this slice. S5 doesn't depend on S5b.
+Header closure: declare the six registry functions in `include/net.go.h` and
+`go/net.h`. The Go API: `RegisterFilesystemBlobAdapter(id, root)`,
+`UnregisterBlobAdapter(id)`, `BlobAdapterRegistered(id)`,
+`BlobPublish(adapterID, uri, data)` and `BlobResolve(adapterID, payload)`.
+`net_blob_resolve` takes an explicit adapter id (`src/ffi/blob.rs:316–352`);
+no discovery mechanism is added. Errors are `ErrBlob` sentinels from the
+`NET_ERR_BLOB_*` codes.
+
+**Proves it:** a publish through a filesystem adapter writes under `root`, and
+resolve returns the bytes. After unregister, resolve fails with the
+adapter-not-registered sentinel. A duplicate id fails with the duplicate-id
+sentinel. Resolving through the wrong adapter id fails without touching the
+right one. S5 doesn't depend on S5b.
 
 ### S5b: callback blob adapters
 
 `RegisterBlobAdapter(id, BlobAdapter)`: a Go interface with `Store`, `Fetch`,
-`FetchRange`, `Exists`, dispatched through a `cgo.Handle` table.
+`FetchRange` and `Exists`, registered through
+`net_blob_register_callback_adapter_owned` (the design above). Adds that one
+symbol to the export baseline in the same commit.
 
-**Proves it:** a Go map-backed adapter round-trips through `BlobPublish` /
-`BlobResolve`. A Go adapter that panics surfaces as an error, not a process
-abort (reuse `callback_recover.go`). Unregistering during 16 concurrent
-resolves under `-race` is clean.
+**Proves it:** deterministic barrier tests. `-race` runs only support them.
 
-*Amended (R1):* superseded by the owned-context design under "Decision:
-callback blob adapters". S5b now adds one additive C entry point
-(`net_blob_register_callback_adapter_owned`). It's the only new export
-outside S6, and it lands with its own additive export-baseline update. The
-deterministic barrier witnesses listed there are the proof; the `-race` run
-supports them.
+- **Round-trip.** A Go map-backed adapter round-trips through `BlobPublish` /
+  `BlobResolve`.
+- **Unregister while held.** A `test-helpers` barrier holds a Rust worker
+  (a) before the handle lookup and (b) before `free_buffer`. The test
+  unregisters while it's held, then releases it, and asserts the callback
+  completes against the **original** adapter and `release_fn` fires exactly
+  once, after the release.
+- **Failure ownership.** A failed registration (duplicate id) leaves the
+  handle owned by Go and never calls `release_fn`.
+- **Cancellation.** A resolve cancelled mid-callback still ends with exactly
+  one `release_fn`.
+- **Same-id re-registration.** Re-registering the same id while an old call is
+  held: each call reaches its own adapter.
+- **Panics.** A panicking Go adapter, including a panic injected into the
+  trampoline's lookup path, surfaces as an error, not a process abort.
 
-### S6: new C ABI for tree, erasure, range and repair (G3)
+### S6: new C ABI for tree, erasure, range and repair
 
-Rust (`src/ffi/blob.rs` and stubs), with `include/net.go.h` and `go/net.h`
-mirrored in the same commit:
+Rust in `src/ffi/blob.rs` plus stubs, with `include/net.go.h` and `go/net.h`
+mirrored and the new symbols added to the baseline, all in one commit.
+Every function follows the normative contract table above.
 
-- `net_mesh_blob_adapter_fetch_range(h, ref, ref_len, start, end, out, out_len)`
-- `net_mesh_blob_adapter_store_tree(h, data, len, encoding_kind, rs_k, rs_m, out_ref, out_ref_len)`
-- `net_mesh_blob_adapter_repair_blob(h, ref, ref_len, out_json)`
-- `net_mesh_blob_adapter_tree_node_cache_stats(h, out_json)`
-- `net_blob_ref_describe(ref, ref_len, out_json)`: version, uri, hash, size,
-  is_tree, is_chunked, tree_root_hash, tree_depth
-- `net_blob_feature_tags(out_mask)`: the four `DATAFORTS_BLOB_*_SUPPORTED` bits
-- `tree_node_cache_bytes` added to `net_mesh_blob_adapter_new`'s options JSON
-  (an additive key, so no signature change)
+| Function | Notes |
+|---|---|
+| `net_mesh_blob_adapter_fetch_range(h, ref, ref_len, uint64_t start, uint64_t end, uint8_t** out, size_t* out_len)` | Range order per the table |
+| `net_mesh_blob_adapter_store_tree(h, data, size_t len, uint8_t encoding_kind, uint8_t rs_k, uint8_t rs_m, uint8_t** out_ref, size_t* out_ref_len)` | Default chunking, as in Node/Python |
+| `net_mesh_blob_adapter_repair_blob(h, ref, ref_len, char** out_json)` | `RepairReport` JSON |
+| `net_mesh_blob_adapter_tree_node_cache_stats(h, char** out_json)` | `null` when no cache |
+| `net_blob_ref_describe(ref, ref_len, char** out_json)` | version, uri, hash, size, is_tree, is_chunked; tree fields absent for non-tree refs |
+| `net_mesh_blob_adapter_new_v2(redex, id, int persistent, const char* options_json)` | Additive constructor; the legacy one is unchanged |
+
+`new_v2`'s JSON has `overflow` (the legacy overflow object, unchanged) and
+`tree_node_cache_bytes` as top-level keys. The legacy constructor takes
+`persistent` as a C `int` plus an **overflow-only** JSON
+(`src/ffi/blob.rs:1008–1065`), so it has no room for a cache option. An
+absent `tree_node_cache_bytes` means no cache. An explicit `0` installs a
+zero-capacity cache. Core treats these as distinct, and Go keeps them
+distinct with `TreeNodeCacheBytes *uint64`.
 
 Go: `FetchRange`, `StoreTree(data, Encoding)`, `RepairBlob → RepairReport`,
-`TreeNodeCacheStats`, `DescribeBlobRef → BlobRefInfo`, feature-tag consts,
-`MeshBlobAdapterOpts.TreeNodeCacheBytes`.
+`TreeNodeCacheStats`, `DescribeBlobRef → BlobRefInfo`, the four tag strings as
+`const`s, and `MeshBlobAdapterOpts.TreeNodeCacheBytes`, which routes
+construction through `new_v2` when set.
 
 **Proves it:**
-- A Rust unit test per C function in `src/ffi/blob.rs`.
-- `bindings/go/net-ffi/exports.baseline` regenerated, with the intent stated
-  in the commit message (`.github/scripts/check-ffi-exports.py`).
-- `go/abi_stability_*_test.go` extended to the new symbols.
-- Go tests: a 3 MiB blob stored with `ReedSolomon{4,2}` describes as a tree,
-  `FetchRange(1<<20, 1<<20+4096)` equals the source slice, `RepairBlob`
-  after deleting one chunk reports one repaired chunk and the blob then
-  fetches, and a `start > end` range is a typed error.
-- A cross-language check: a `BlobRef` encoded by Go decodes in the Python
-  test suite with identical `describe` fields (extend `tests/cross_lang_*`
-  if a blob fixture exists, otherwise add one).
 
-*Amended (R3, R4, R9).* Corrections to the S6 list above:
-- **No `net_blob_feature_tags(out_mask)`.** The tags are strings (see G3), and
-  Go exports them as string constants. No mask is defined. A local
-  runtime-capability mask, if ever needed, gets its own names, bit
-  assignments and width, and must not suggest anything about remote-peer
-  support.
-- **Tree-node cache option.** `net_mesh_blob_adapter_new` takes `persistent`
-  as a C `int` plus an **overflow-only** JSON (`src/ffi/blob.rs:1008–1065`),
-  and Go marshals only `opts.Overflow` (`go/blob.go:148–165`). There is no
-  general options JSON to add a key to. **Decision (recommended): an
-  additive constructor**,
-  `net_mesh_blob_adapter_new_v2(redex, id, persistent, options_json)`, whose
-  JSON has `overflow` and `tree_node_cache_bytes` as top-level keys.
-  The legacy constructor stays as it is. An absent key means no cache. An
-  explicit `0` installs a zero-capacity cache; the core treats these as
-  distinct states, and Go keeps them distinct with
-  `TreeNodeCacheBytes *uint64`. The rejected alternative was to overload
-  the overflow JSON with a constructor-specific key: it's compatible, but it
-  turns an overflow config parser into a general options parser.
-  Witnesses: cache enabled with nil overflow; cache omitted (stats → `nil`);
-  explicit zero (stats present, capacity 0); and legacy overflow-only
+- **Rust unit tests per C function**, including every row of the contract
+  table: each out-pointer nulled in turn; mixed-null pairs; `(NULL, n>0)`
+  inputs; every encoding edge (unknown kind, Replicated with non-zero k/m,
+  exactly one of k/m zero, `k + m = 256`, both zero → defaults); and the range
+  sequence (reversed → invalid; `start == end` beyond size → empty success;
+  over-cap → invalid; `end > size` → invalid).
+- **Constructor.** Cache enabled with nil overflow; cache omitted (stats →
+  `nil`); explicit zero (stats present, capacity 0); and legacy overflow-only
   construction unchanged.
-- **Repair witness, corrected.** RS closes a stripe only at `k` full chunks,
-  and an incomplete trailing stripe is stored Replicated with no parity
-  (`blob/erasure.rs:493–543`). Default chunks are 4 MiB
-  (`blob/blob_tree.rs:155–160`, `blob/blob_ref.rs:131`), so 3 MiB under
-  `ReedSolomon{4,2}` has **no** parity to repair. The fixture is at least
-  16 MiB (16,777,216 bytes, four full chunks), each chunk with distinct
-  content so content addressing can't collapse them. The test identifies a
-  real **data** shard and makes it unavailable through a narrowly gated
-  test seam (a `test-helpers`-only C function, or a
-  shutdown → delete → reopen fixture that also clears RedEX/cache state).
-  Deleting a file while live state can still serve the shard proves nothing.
-  It then proves the shard is unavailable **before** repair. No production
-  deletion authority is added to make the test convenient. Assertions:
-  `chunks_restored == 1` and `stripes_repaired == 1`. A second `RepairBlob`
-  restores nothing. `FetchRange(ref, 0, size)` equals the source; plain
-  `Fetch` is unsupported for tree refs. Because an unrecoverable stripe is
-  reported in the counters rather than always as an error
-  (`blob/mesh.rs:3197–3229`), Go documents that a nil error doesn't mean a
-  complete repair, and a test with more than `m` shards lost pins that.
-- **Cross-language fixture.** Core's describe fields are optional per
-  variant, and Python's getters fall back to zero values, so the two aren't
-  automatically identical JSON. The fixture freezes a **normalized** form
-  (absent fields omitted, hashes as lowercase hex). Python changes are
-  **test-only**: fixture validation in the Python suite, with no change to
-  the Python binding's production API, which stays in "Not in scope".
-- **Export baseline.** Only the new symbols are added, with the reason in the
-  commit message. The baseline isn't regenerated wholesale.
+- **Repair.**
+  - Fixture: at least 16 MiB (16,777,216 bytes), four full 4 MiB chunks
+    (`blob/blob_tree.rs:155–160`, `blob/blob_ref.rs:131`) with distinct
+    content, stored with Reed-Solomon `k=4`, `m=2`. RS closes a stripe only at
+    `k` full chunks, and an incomplete trailing stripe is stored Replicated
+    with no parity (`blob/erasure.rs:493–543`), so anything smaller has
+    nothing to repair.
+  - Remove a real **data** shard through a narrowly gated test seam: a
+    `test-helpers`-only C function, or a shutdown → delete → reopen fixture
+    that also clears RedEX and cache state. Deleting a file while live state
+    can still serve it proves nothing. No production deletion authority is
+    added.
+  - Prove the shard is unavailable **before** repair.
+  - `RepairBlob` reports `chunks_restored == 1` and `stripes_repaired == 1`;
+    a second `RepairBlob` restores nothing; `FetchRange(ref, 0, size)` equals
+    the source.
+  - Losing more than `m` shards of one stripe: the counters report it
+    unrecovered, and Go documents that a nil error doesn't mean a complete
+    repair (`mesh.rs:3197–3229`).
+- **Describe.** A tree ref has the tree fields set; a small ref has them
+  absent (Go `nil`).
+- **ABI pins.** `go/abi_stability_*_test.go` covers all six signatures.
+- **Cross-language fixture.** A `BlobRef` encoded by Go describes identically
+  in the Python test suite, using a frozen **normalized** form: absent
+  fields omitted, hashes as lowercase hex. Core's fields are optional per
+  variant, while Python's getters fall back to zero values, so raw outputs
+  aren't comparable. The Python change is **test-only** fixture validation,
+  with no change to the Python production API.
 
-### S7: classify and port the rest of the reference package (G4)
+### S7: classify and port the rest of the reference package
 
-One table in this plan, filled in when the slice lands, with a row per
-reference file: port / drop / already ported, and the reason. Ports land with
-tests. `resilience.go` is pure Go and needs no FFI. `placement.go` needs the
-cgo dispatcher, the same handle care as S5b.
+A ledger in this plan, filled in when the slice lands: one row per public
+symbol, **methods qualified by receiver** (`(*CircuitBreaker).Call`, not
+`Call`), each marked port / drop / deferred / already-ported with a reason.
+Every drop or deferred row keeps the relevant API design (signatures and the
+doc-comment intent) in the ledger itself, because S8 deletes the only copy.
+Ports land with tests. `resilience.go` is pure Go.
 
-**Proves it:** the table is complete, and the S1–S6 grep (every exported
-reference symbol has a `go/` definition or a "drop" row) comes back empty.
+Placement is gated on the lifetime decision above, or on a recorded,
+justified deferral. If ported, it adds its registration symbol to the
+baseline in the same commit and lands with this witness: old filter
+acquired → unregister → same-id replacement registered → the old invocation
+still runs its **original** predicate, and the original's release fires
+exactly once, after the last scheduler-held clone drops.
 
-*Amended (R1, review notes).*
-- **Ledger granularity.** The ledger accounts for methods under their
-  receiver types and public names (`(*CircuitBreaker).Call`, not `Call`).
-  The original name-only grep missed same-named methods on different
-  receivers.
-- **Preserve before deleting.** Every "drop" or "deferred" row keeps the
-  relevant API design (signatures and the doc-comment intent) in the ledger
-  itself, because S8 deletes the only copy.
-- **Placement is gated** on the lifetime design under "Decision:
-  placement-filter lifetime", or on a recorded, justified deferral. S5b's
-  status doesn't decide it either way.
+**Proves it:** the ledger is complete, and a receiver-qualified symbol diff
+(reference vs. `go/`) leaves nothing unaccounted for.
 
 ### S8: delete `bindings/go/net/`
 
 Remove the directory. Repoint the comments in `go/*.go` that cite it
 (`go/deck.go:13`, `go/meshdb.go:12`, `go/meshos.go:15`,
-`go/meshos_test.go:128,144`) and the stale paths in
-[`SDK_GO_PARITY_PLAN.md`](SDK_GO_PARITY_PLAN.md) with an amendment note,
-not a rewrite. Update `go/README.md` to list blobs and directory transfer.
+`go/meshos_test.go:128,144`), and amend the stale paths in
+[`SDK_GO_PARITY_PLAN.md`](SDK_GO_PARITY_PLAN.md) with a note rather than a
+rewrite. User-facing docs move with the surface: `go/README.md`, the Go
+section of the docs site (`web/src/content/docs/`), Go snippets in the
+`net-event-bus` skill's Dataforts material, any capability or support
+matrix that lists Go blob support, and the release notes for the shipping
+version (mirrored with `npm run sync:releases`).
 
 **Proves it:** `grep -rn "bindings/go/net/" --include=*.go --include=*.md`
-returns only historical plan text. `go test ./...` and the CI Go job are
-green.
-
-*Amended (review notes):* user-facing docs move with the surface, not only
-the deleted paths. That covers the Go section of the docs site
-(`web/src/content/docs/`), Go snippets in the `net-event-bus` skill's
-Dataforts material, any capability or support matrices that list Go blob
-support, and the release notes for the shipping version (mirrored with
-`npm run sync:releases`).
+returns only historical plan text. `go test ./...`, the `-race` step and the
+CI Go job are green.
 
 ## Risks
 
 - **The reference code is wrong against today's ABI.** It has never been
-  compiled in CI. *Fallback:* port means rewrite against `go/net.h`; the C
-  signature wins every disagreement, and S7 records each one.
-- **Callback adapters reintroduce the cgo races the MCP binding had.**
-  *Fallback:* S5b is separate and optional; S5 doesn't depend on it.
+  compiled in CI. *Fallback:* port means rewrite; the C signature wins every
+  disagreement, and S7 records each one.
+- **Callback lifetime needs new native ownership.** *Fallback:* S5b and the
+  placement port are each deferrable with a ledger entry. S1–S5 and S6 don't
+  depend on either.
 - **Windows dev box vs Linux CI.** cgo runs locally (WinLibs gcc, `net.dll`
-  on PATH), but `exports.baseline` is generated from the Windows PE artifact
-  and CI checks `libnet.so`. *Fallback:* regenerate on the platform the
-  checker reads, and treat a CI export-check failure as a baseline
-  regeneration issue first.
-  *Amended (review notes): that fallback was wrong.* The checker
-  (`.github/scripts/check-ffi-exports.py`) compares one platform-neutral
-  name set. A Linux mismatch is investigated as an unexpected missing or
-  extra export, and only the intended additive set is updated, with the
-  reason stated. Regenerating is never the first response.
+  on PATH), and CI checks `libnet.so`. *Fallback:* the export checker
+  compares a platform-neutral name set. A Linux mismatch is investigated as
+  an unexpected missing or extra export and fixed at the source.
 - **The disk fills mid-build.** S6 rebuilds `net-ffi` with its full feature
   set. *Fallback:* one target directory, check free space before the gates.
-- **The RS repair test is slow or flaky** on a loopback two-node mesh.
-  *Fallback:* run repair on a single node (delete a local chunk file), which
-  is what the Rust `repair_blob` tests do.
-  *Amended (R3):* deleting a local file isn't enough while live RedEX or
-  cache state can still serve the shard. The single-node fallback uses the
-  gated test seam or the shutdown → delete → reopen fixture from S6, which is
-  what the Rust precedent does through the adapter's deletion path
-  (`blob/mesh.rs:1269–1291`, `:6590–6628`).
-- **Callback lifetime needs new native ownership** (R1). *Fallback:* S5b and
-  the placement port are both deferrable with a ledger entry. S1–S5 and S6 don't
-  depend on either.
+- **The RS repair fixture is slow** (16 MiB, two-node). *Fallback:* run repair
+  on a single node with the gated seam or the shutdown → delete → reopen
+  fixture, which is what the Rust precedent does through the adapter's
+  deletion path (`blob/mesh.rs:1269–1291`, `:6590–6628`).
+- **The gravity witness can't observe heat from Go.** *Fallback:* the
+  `test-helpers` accessor named in S3, or evidence scoped to forwarding plus
+  native tests, stated as such.
 
 ## Not in scope
 
 - Moving or renaming the Rust `*-ffi` crates.
 - Chunking-strategy or bandwidth-class parameters on any Go method (see G3).
-  Go gets them when a binding first has a method that takes them.
-- Streaming blob store/fetch (`io.Reader` / `io.Writer` over the C ABI). This
-  plan is byte-slice in, byte-slice out, as the existing functions are.
+- Streaming blob store/fetch (`io.Reader` / `io.Writer` over the C ABI).
 - Blob GC, pin / unpin, and auth-guarded operations (`pin_authorized`,
   `delete_chunk_authorized`). Node and Python don't expose them either.
-- Any change to the Node or Python bindings. *Amended (R9):* test-only
-  fixture validation in the Python suite (S6) is allowed; production APIs
-  stay unchanged.
-- Overflow ratio validation (R7). It would be a behavior change, with its own
-  plan entry if wanted.
-- Changing Go CRUD signatures to return tokens (R6). That needs explicit
+- Production API changes to the Node or Python bindings. Test-only fixture
+  validation in the Python suite (S6) is allowed.
+- Overflow ratio validation. It would be a behavior change, with its own plan
+  entry if wanted.
+- Changing Go CRUD signatures to return tokens. That needs explicit
   authorization as a breaking change.
-- Making `Fetch` accept tree refs (R3). That's a core behavior change.
+- Making `Fetch` accept tree refs. That's a core behavior change.
+- Changing any existing native error mapping.
+- Moving the 21 non-blob `C.GoBytes(…, C.int(n))` sites onto the checked
+  copy (recorded below).
 
-## Review amendments, 2026-10-03
+## Defects found on the way
 
-Review at `d1b6f29`. Verdict: hold for implementation authorization, with
-the consolidation direction accepted. Each finding was re-checked against
-source before this amendment.
+- **`C.GoBytes` length truncation, outside blobs (deferred).** 21 call sites
+  across `go/cortex.go`, `go/mesh_rpc.go`, `go/mesh_rpc_typed.go`,
+  `go/tool.go` and others pass `C.int(n)` for a `size_t` length. Each is
+  reachable only if that path can return more than 2 GiB, which most core
+  limits prevent, but the pattern is wrong in general. Fix: move them onto
+  `copyCBuf` in a follow-up. The blob sites are fixed in S1.
+- **Duplicate error code −120 (deferred, not ours).**
+  `NET_ERR_BLOB_UNAUTHORIZED = -120` (`src/ffi/blob.rs:99`) and
+  `NET_ERR_IDENTITY = -120` (`src/ffi/mesh.rs:109`). A caller that maps codes
+  without knowing which function returned them can't tell them apart. S6
+  numbers its new code from a fresh inventory. Renumbering either constant is
+  an ABI change and is out of scope here.
 
-| # | Severity | Finding | Where it changed the plan |
+## Review history
+
+### Round 1: `d1b6f29`, 2026-10-03
+
+Verdict: hold for implementation authorization; direction accepted. All nine
+findings were re-checked against source and confirmed.
+
+| # | Sev. | Finding | Resolution |
 |---|---|---|---|
-| R1 | High | A `cgo.Handle` table can't know when Rust drops its last reference to a callback context; the placement bridge dispatches by a reusable string id | Callback decision rewritten (owned context, `release_fn` once from the shared context's drop, barrier witnesses); new placement-lifetime decision; S5b, S7 |
-| R2 | Medium | The G2 functions aren't declared in the shipped Go headers; `go/net.h` ≠ `net.go.h` textually | "How this was checked" corrected; G2; "Header closure" moved into each slice |
-| R3 | Medium | 3 MiB under RS{4,2} has no parity; deleting a file doesn't remove a shard; `Fetch` refuses tree refs | G3; S6 repair witness (≥ 16 MiB, gated seam, `FetchRange`, counters); Risks |
-| R4 | Medium | The constructor has no general options JSON; persistence is a C `int` | S1 mutation target; S6 additive constructor with absent vs. zero cache |
-| R5 | Medium | Enabling replication installs an empty router; Go `RedexFileConfig` has no replication field; the Arc is consumed on every return | G2; S3 scope, ownership and data-arrival witness; gravity witness without a getter |
-| R6 | Medium | No way to get a bound token without a source break; C checks origin, not identity; zero timeout means poll | G2; S4 additive token decision and pinned semantics |
-| R7 | Medium | Ratio validation doesn't exist; `omitempty` zeros; persistence and `Exists` fixtures | S1 corrections; Not in scope |
-| R8 | Medium | Resolve needs an adapter id; `ErrTransfer` already exists; `NET_ERR_DIR_*`; allocators | "Error mapping"; S2; S5 |
-| R9 | Medium | The new ABI's observable contract was unspecified; feature tags are strings, not bits | Normative contract table; G3; S6; Not in scope |
+| R1 | High | A `cgo.Handle` table can't know when Rust drops its last reference to a callback context; the placement bridge dispatches by a reusable string id | Owned-context registration with `release_fn` from the shared context's drop; per-registration placement identity or recorded deferral; barrier witnesses |
+| R2 | Med | The G2 functions aren't declared in the shipped Go headers. The original plan said they were, and called `go/net.h` and `net.go.h` identical | "How this was checked" corrected; header closure per slice |
+| R3 | Med | 3 MiB under RS{4,2} has no parity; deleting a file doesn't remove a shard; `Fetch` refuses tree refs | 16 MiB distinct-chunk fixture, gated seam, absence proven first, `FetchRange`, counter checks |
+| R4 | Med | No general constructor options JSON; persistence is a C `int` | `new_v2` with absent vs. zero cache; the S1 mutation targets the C argument |
+| R5 | Med | Enabling replication installs an empty router; no Go replication config; the Arc is consumed on every return | Replication field through `OpenFile`; data-arrival witness; Arc ownership |
+| R6 | Med | No bound token without a source break; C checks origin, not identity; zero timeout polls | Additive `Token(seq)`; pinned semantics |
+| R7 | Med | Ratio validation doesn't exist; `omitempty` zeros; persistence and `Exists` fixtures | S1 pins current behavior |
+| R8 | Med | Resolve needs an adapter id; `ErrTransfer` already exists; `NET_ERR_DIR_*`; allocators | Extended mapper; S2/S5 shapes |
+| R9 | Med | The new ABI contract was unspecified; feature tags are strings, not bits | Normative table; tag strings; no mask |
 
-Review notes also adopted: an explicit `-race` CI step through the
-native-stack runner (S1); export-baseline discipline (design, S6, Risks);
-a receiver-qualified S7 ledger that preserves designs before deletion; and
-user-facing docs and release notes in S8.
+Notes also adopted: an explicit `-race` CI step through the native-stack
+runner; no wholesale baseline regeneration; a receiver-qualified S7 ledger;
+user-facing docs in S8.
+
+### Round 2: `317168c`, 2026-10-03
+
+Verdict: hold for a bounded correction pass. Round-1 corrections accepted:
+owned contexts, placement identity, header closure, additive tokens, `new_v2`,
+the production-sized RS fixture. All four findings were re-checked against
+source and confirmed.
+
+| # | Sev. | Finding | Resolution |
+|---|---|---|---|
+| Q1 | Med | "Check `math.MaxInt` before `C.GoBytes`" still truncates: `C.GoBytes` takes `C.int` | `checkedLen` / `copyCBuf` design with allocation-free boundary tests; the 21 other sites recorded as a defect |
+| Q2 | Med | S2 mapped a missing manifest to `ErrDirInvalidManifest`; natively, missing content is `NET_ERR_TRANSFER_NOT_FOUND`, and only undecodable fetched bytes are `NET_ERR_DIR_INVALID_MANIFEST` | Two fixtures, two classifications, no native remap |
+| Q3 | Med | ABI table contradictions: range precedence (empty beyond size), writing through null out-pointers, k/m under Replicated, unassigned widths | Range order preserves core, with the error-classification tightening named; null-checks before deref; Replicated requires k = m = 0; RS default only for both zero; all widths fixed |
+| Q4 | Med | The gravity witness watched cache counts, which gravity doesn't change | Heat-tag witness (stamped reads → tick → `heat:` tag; disable → no newer emission), with a named `test-helpers` fallback |
+
+Cleanup also applied: every slice adds its own export-baseline entries (not
+just S6); superseded lists replaced by the adopted versions; the same-origin
+token witness now uses a sequence the receiving adapter has applied.
+
+While checking Q3's error codes, this pass found the duplicate −120 (see
+"Defects found on the way").
