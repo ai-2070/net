@@ -3,9 +3,13 @@
 ## Status
 
 In progress, 2026-10-03. Targets the release after 0.39. Branch
-`LZL0/go-blobs`. Plan accepted for implementation at `e33ede5`. **S1–S3
-done locally 2026-10-03** (S1 `aaa797c`, S2 `bb775f6`; evidence under each
-slice; exact-head CI still owed). S4–S8 not started.
+`LZL0/go-blobs`. Plan accepted for implementation at `e33ede5`. **S1–S4
+done 2026-10-03** (S1 `aaa797c`, S2 `bb775f6`, S3 `3773b36`; evidence under
+each slice). CI: S1's head ran green on every Go job, including the new
+`-race` step and its roster. Its one failure was the Firefox browser
+witness `stage5_a_refused_connect_closes_rtc_and_hands_back_its_attempt`
+(wasm leaf), which no Go change reaches and which also fails
+intermittently on `master` (run 36970267483). S5–S8 not started.
 
 Reviewed twice before implementation (`d1b6f29`, then `317168c`). The first
 review accepted the direction and held on nine findings (R1–R9). The second
@@ -710,6 +714,46 @@ Semantics:
   immediately (bounded under 50 ms).
 - **Pre-cancelled context.** Returns `context.Canceled` even when the token
   is already satisfied. Cancelling mid-wait returns within one poll slice.
+
+**Done locally, 2026-10-03.**
+
+- **Header closure.** Both wait functions are declared in the two cortex
+  headers beside their `wait_for_seq` siblings, pinned by
+  `TestABIStabilityCortexDeclsMatchCanonicalHeader`.
+- **API** (`go/write_token.go`), as decided: `WriteToken{OriginHash, Seq}`
+  and `OriginHash()`, `Token(seq)`, `WaitForToken(tok, timeout)` and
+  `WaitForTokenContext(ctx, tok)` on both `TasksAdapter` and
+  `MemoriesAdapter`. CRUD signatures are unchanged. Adapters now keep the
+  origin they were opened with, and `NetDb` adapters inherit
+  `NetDbConfig.OriginHash`.
+- **Errors.** `ErrTokenTimeout` (wraps `ErrStreamTimeout`, since the native
+  timeout code 1 already mapped there), `ErrWrongOrigin` (−104),
+  `ErrWaitQueueFull` (−105), `ErrFoldStopped` (−106).
+- **Timeouts.** Zero or negative polls once. A positive timeout under 1 ms
+  rounds up to 1 ms, so it still waits instead of quietly becoming a poll.
+
+Evidence (Windows):
+
+- `go test -count=1 -run '^TestWriteToken' -v .`: 7/7 pass
+  (`go/write_token_test.go`). Covers read-your-writes on both adapter kinds;
+  a different origin refused; a same-origin second adapter accepted only
+  after `WaitForSeq` on its own fold, while an unapplied same-origin seq
+  times out; zero timeout returns in < 50 ms and a 120 ms timeout really
+  waits; pre-cancelled, deadline and mid-wait cancellation (noticed in
+  < 200 ms); NetDb origin inheritance; and `ErrShuttingDown` after Close.
+- `go test -race -count=2 -run '^(TestBlob|TestTransfer|TestRedex|TestWriteToken)' .`: ok.
+- Full package: ok.
+- Mutations (each compiles), all killed:
+  - `Token` dropping the origin: 5 tests
+  - NetDb not passing the origin: `TestWriteTokenNetDbAdaptersInheritOrigin`
+  - zero timeout made to wait: `TestWriteTokenZeroTimeoutPolls`
+  - −104 mapped as a timeout: two tests
+  - the poll slice made 5 s: the mid-wait cancellation subtest
+  - `ctx` checked only after polling (the reference order): first killed
+    only by the 10-minute binary timeout, because the `deadline` subtest
+    spun forever. That subtest now runs the wait in a goroutine with a 2 s
+    bound, and the mutant fails three named subtests in seconds.
+- CI: the race filter adds `TestWriteToken`, and a 7-name roster is added.
 
 ### S5: blob adapter registry: filesystem + publish/resolve
 

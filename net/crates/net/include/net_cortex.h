@@ -112,6 +112,14 @@ int  net_tasks_delete(net_tasks_adapter_t* handle, uint64_t id,
                       uint64_t* out_seq);
 int  net_tasks_wait_for_seq(net_tasks_adapter_t* handle, uint64_t seq,
                             uint32_t timeout_ms);
+
+/* Read-your-writes: wait until the fold has applied the write named by
+ * (origin_hash, seq). timeout_ms 0 POLLS once (unlike wait_for_seq, where
+ * 0 waits indefinitely). Returns 0; 1 (NET_ERR_TIMEOUT) on deadline;
+ * -104 (NET_ERR_WRONG_ORIGIN) if origin_hash is not this adapter's;
+ * -105 (NET_ERR_QUEUE_FULL); -106 (NET_ERR_FOLD_STOPPED). */
+int  net_tasks_wait_for_token(net_tasks_adapter_t* handle, uint64_t origin_hash,
+                          uint64_t seq, uint32_t timeout_ms);
 int  net_tasks_list(net_tasks_adapter_t* handle, const char* filter_json,
                     char** out_json, size_t* out_len);
 int  net_tasks_snapshot_and_watch(net_tasks_adapter_t* handle,
@@ -251,6 +259,14 @@ int  net_memories_delete(net_memories_adapter_t* handle, uint64_t id,
                          uint64_t* out_seq);
 int  net_memories_wait_for_seq(net_memories_adapter_t* handle, uint64_t seq,
                                uint32_t timeout_ms);
+
+/* Read-your-writes: wait until the fold has applied the write named by
+ * (origin_hash, seq). timeout_ms 0 POLLS once (unlike wait_for_seq, where
+ * 0 waits indefinitely). Returns 0; 1 (NET_ERR_TIMEOUT) on deadline;
+ * -104 (NET_ERR_WRONG_ORIGIN) if origin_hash is not this adapter's;
+ * -105 (NET_ERR_QUEUE_FULL); -106 (NET_ERR_FOLD_STOPPED). */
+int  net_memories_wait_for_token(net_memories_adapter_t* handle, uint64_t origin_hash,
+                          uint64_t seq, uint32_t timeout_ms);
 int  net_memories_list(net_memories_adapter_t* handle, const char* filter_json,
                        char** out_json, size_t* out_len);
 int  net_memories_snapshot_and_watch(net_memories_adapter_t* handle,

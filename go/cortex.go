@@ -424,6 +424,9 @@ type TasksFilter struct {
 type TasksAdapter struct {
 	mu     sync.RWMutex
 	handle *C.net_tasks_adapter_t
+	// origin is the origin hash this adapter stamps on its writes, which
+	// is what a WriteToken from Token() carries.
+	origin uint64
 }
 
 // OpenTasks opens the tasks adapter against a Redex. `persistent`
@@ -445,7 +448,7 @@ func OpenTasks(redex *Redex, originHash uint64, persistent bool) (*TasksAdapter,
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	t := &TasksAdapter{handle: out}
+	t := &TasksAdapter{handle: out, origin: originHash}
 	runtime.SetFinalizer(t, (*TasksAdapter).free)
 	return t, nil
 }
@@ -704,6 +707,8 @@ type MemoriesFilter struct {
 type MemoriesAdapter struct {
 	mu     sync.RWMutex
 	handle *C.net_memories_adapter_t
+	// origin is the origin hash this adapter stamps on its writes.
+	origin uint64
 }
 
 func OpenMemories(redex *Redex, originHash uint64, persistent bool) (*MemoriesAdapter, error) {
@@ -721,7 +726,7 @@ func OpenMemories(redex *Redex, originHash uint64, persistent bool) (*MemoriesAd
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	m := &MemoriesAdapter{handle: out}
+	m := &MemoriesAdapter{handle: out, origin: originHash}
 	runtime.SetFinalizer(m, (*MemoriesAdapter).free)
 	return m, nil
 }
