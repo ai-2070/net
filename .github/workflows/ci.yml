@@ -3762,6 +3762,26 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: npm run build:ts
 
+      # The Node twin of C5 (`test/a2a_paid.test.ts`, "retained vs live
+      # resolution", NODE_A2A_PAID_ADMISSION_PLAN.md WS-F / review S1) shells
+      # out to the same Rust fixture seeder the Python job builds: it archives
+      # a retained incarnation through the production `retain_superseded` API.
+      # Built here so `npm test` does not compile a Rust target inside a
+      # test; the test builds it itself when the variable is unset (the local
+      # path) and hard-fails rather than skipping. `--tests` for the same
+      # pin-guard reason as the Python job's step.
+      - name: Build the A2A history-boundary fixture seeder
+        working-directory: net/crates/net
+        run: |
+          exe=$(cargo test -p net-payments --features mesh \
+                  --tests --no-run --message-format json \
+                | jq -r 'select(.reason=="compiler-artifact")
+                         | select(.target.name=="review_python_seed")
+                         | .executable' | tail -1)
+          test -n "$exe" && test -x "$exe" \
+            || { echo "::error::the C5 fixture seeder did not build"; exit 1; }
+          echo "NET_A2A_SEEDER_EXE=$exe" >> "$GITHUB_ENV"
+
       - name: Run tests
         run: npm test
 

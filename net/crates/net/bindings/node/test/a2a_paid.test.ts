@@ -13,7 +13,7 @@
 // is about, with a deadline and a message naming what it last saw.
 
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -1094,4 +1094,220 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — caller flow (WS-D)', () => {
       await mesh.shutdown()
     }
   }, 30000)
+})
+
+// ---------------------------------------------------------------------------
+// WS-F — the cross-binding shape fixture
+// ---------------------------------------------------------------------------
+
+// `tests/cross_lang_a2a_paid/envelopes.json` was captured from the Python
+// binding before WS-A moved the projection into shared Rust; Python's
+// `test_a2a_paid_cross_lang.py` asserts the same file. Same scenario, same
+// masking: every key and list length, booleans and the closed vocabularies
+// literally, every per-run value masked to its type. Every integer masks to
+// "<int>", so a u64 a JS double would round is pinned by position without any
+// reader holding its value — which is why `JSON.parse` is safe *here* and
+// nowhere a document is handed back.
+const FIXTURE = resolve(__dirname, '..', '..', '..', 'tests', 'cross_lang_a2a_paid', 'envelopes.json')
+const STABLE = new Set([
+  'status',
+  'state',
+  'admission',
+  'kind',
+  'network',
+  'asset',
+  'amount',
+  'scheme',
+  'outcome',
+  'resolution',
+  'reason',
+  'service',
+  'service_id',
+  'revision',
+  'task_id',
+])
+
+function shape(value: unknown, key?: string): unknown {
+  if (Array.isArray(value)) return value.map((v) => shape(v, key))
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value as object)
+        .sort()
+        .map((k) => [k, shape((value as Record<string, unknown>)[k], k)]),
+    )
+  }
+  if (typeof value === 'boolean' || value === null) return value
+  if (typeof value === 'number') return Number.isInteger(value) ? '<int>' : '<float>'
+  if (typeof value === 'string') return key !== undefined && STABLE.has(key) ? value : '<str>'
+  return `<${typeof value}>`
+}
+
+describe.skipIf(!HAS_PAID_A2A)('paid a2a — cross-binding fixture (WS-F)', () => {
+  it('the paid-A2A documents keep the shape the Python binding pins', async () => {
+    const docs: Record<string, unknown> = {}
+
+    await withTopology({}, async (provider, [caller]) => {
+      const env = await caller.prepare('summarize the cross-lang fixture', 'xl-ok')
+      expect(JSON.parse(env).status).toBe('ok')
+      docs.prepare_ok = JSON.parse(env)
+      docs.prepare_unknown_service = JSON.parse(await caller.prepare('summarize', 'xl-none', 'no-such-service'))
+      const prepared = Caller.prepared(env)
+      const bought = await caller.purchase(prepared)
+      expect(bought.status).toBe('paid')
+      docs.purchase_paid = bought
+      await provider.waitBilling(1)
+      const sent = await caller.submit(prepared)
+      expect(sent.status).toBe('accepted')
+      docs.submit_accepted = sent
+      docs.attempts_after_submit = JSON.parse(await caller.gateway.a2aAttempts())
+      // A launched task is in the unresolved class until the terminal hook
+      // writes its row, which lands after the registry reports `completed`:
+      // poll the queue itself (the race the Python capture hit).
+      await waitState(caller.mesh, caller.providerNode, 'xl-ok', 'completed')
+      const deadline = Date.now() + 8000
+      let queue = JSON.parse(await provider.provider.a2aUnresolved())
+      while (queue.length > 0 && Date.now() < deadline) {
+        await sleep(20)
+        queue = JSON.parse(await provider.provider.a2aUnresolved())
+      }
+      docs.unresolved_empty = queue
+    })
+
+    let calls = 0
+    const preflight = async () => (++calls === 1 ? null : 'authority revoked before execution')
+    await withTopology({ preflight }, async (provider, [caller]) => {
+      const prepared = Caller.prepared(await caller.prepare('summarize then revoke', 'xl-revoked'))
+      expect((await caller.purchase(prepared)).status).toBe('paid')
+      await provider.waitBilling(1)
+      const sent = await caller.submit(prepared)
+      expect(sent.status).toBe('unexecutable')
+      docs.submit_unexecutable = sent
+      docs.attempts_paid_unexecutable = JSON.parse(await caller.gateway.a2aAttempts())
+      docs.purchase_after_unexecutable = await caller.purchase(prepared)
+      docs.unresolved_reconcile = JSON.parse(await provider.provider.a2aUnresolved())
+    })
+
+    const want = JSON.parse(readFileSync(FIXTURE, 'utf8')) as Record<string, unknown>
+    expect(Object.keys(docs).sort()).toEqual(Object.keys(want).sort())
+    for (const name of Object.keys(want)) {
+      expect(shape(docs[name]), `${name} drifted from the Python-captured shape`).toEqual(want[name])
+    }
+  }, 120000)
+})
+
+// ---------------------------------------------------------------------------
+// WS-F — R1's caller recovery leg: live vs retained, over a seeded store
+// ---------------------------------------------------------------------------
+
+/**
+ * The fixture seeder `bindings/python/tests/test_a2a_history_boundary.py`
+ * uses: it archives real mock-rail payment evidence through the production
+ * `retain_superseded` API and removes the live entry, so one key holds a
+ * retained incarnation beside the live one that replaces it. No binding verb
+ * can manufacture that supersession race; this is explicit fixture
+ * supersession, not a claim the race was reproduced.
+ *
+ * `NET_A2A_SEEDER_EXE` is set by CI's build step; locally it is built here.
+ * Hard-fails rather than skipping — a skip would make the witness vacuous on
+ * exactly the machines that run it.
+ */
+function seederExecutable(): string {
+  const prebuilt = process.env.NET_A2A_SEEDER_EXE
+  if (prebuilt) return prebuilt
+  const crateRoot = resolve(__dirname, '..', '..', '..')
+  const out = execFileSync(
+    'cargo',
+    ['test', '-p', 'net-payments', '--features', 'mesh', '--tests', '--no-run', '--message-format', 'json'],
+    { cwd: crateRoot, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 },
+  )
+  for (const line of out.split('\n')) {
+    try {
+      const msg = JSON.parse(line)
+      if (msg.reason === 'compiler-artifact' && msg.executable && msg.target?.name === 'review_python_seed') {
+        return msg.executable as string
+      }
+    } catch {
+      // not a JSON line
+    }
+  }
+  throw new Error('cargo reported no executable for review_python_seed')
+}
+
+describe.skipIf(!HAS_PAID_A2A)('paid a2a — retained vs live resolution (WS-F, R1)', () => {
+  // Review S1: a caller generation is a dispatch, not a universal selector.
+  // The retained row is resolved by passing its generation; the live row is
+  // resolved by omitting it; passing the live row's own generation is
+  // refused. The live replacement is driven to `paid_unexecutable` first, so
+  // it is eligible for the very same `closed` resolution — wrong routing
+  // would close it, and this test would see that.
+  it('resolving the retained incarnation leaves the live replacement exactly as it was', async () => {
+    const exe = seederExecutable()
+    let calls = 0
+    const preflight = async () => (++calls <= 2 ? null : 'revoked before execution')
+    await withTopology({ preflight }, async (provider, [caller]) => {
+      const first = Caller.prepared(await caller.prepare('summarize history', 'history-key'))
+      expect((await caller.purchase(first)).status).toBe('paid')
+      await provider.waitBilling(1)
+      const original = await caller.gateway.a2aAttempts()
+
+      execFileSync(exe, ['--exact', 'review_seed_python_history', '--nocapture'], {
+        env: { ...process.env, NET_REVIEW_PURCHASE_PATH: join(caller.dir, 'a2a-purchases.json') },
+        encoding: 'utf8',
+      })
+
+      const second = Caller.prepared(await caller.prepare('summarize history', 'history-key'))
+      expect((await caller.purchase(second)).status).toBe('paid')
+      expect((await caller.submit(second)).status).toBe('unexecutable')
+
+      const rows = await caller.gateway.a2aAttempts()
+      const parsed = JSON.parse(rows) as Any[]
+      expect(parsed.length, rows).toBe(2)
+      const hi = parsed.findIndex((r) => r.retained === true)
+      const li = parsed.findIndex((r) => r.retained === false)
+      expect(hi).toBeGreaterThanOrEqual(0)
+      expect(li).toBeGreaterThanOrEqual(0)
+      // Same complete key; the retained row is the original incarnation.
+      expect(a2aDocument(rows, `/${hi}/key`)).toBe(a2aDocument(rows, `/${li}/key`))
+      expect(a2aDocument(rows, `/${hi}/generation`)).toBe(a2aDocument(original, '/0/generation'))
+      expect(a2aDocument(rows, `/${hi}/generation`)).not.toBe(a2aDocument(rows, `/${li}/generation`))
+      expect(parsed[hi].state.state).toBe('paid_unexecutable')
+      expect(parsed[li].state.state).toBe('paid_unexecutable')
+
+      const providerNode = a2aU64(rows, `/${li}/key/provider_node`)
+      expect(providerNode).toBe(caller.providerNode)
+      const liveBefore = a2aDocument(rows, `/${li}`)
+      const closed = '{"resolution":"closed","outcome":"history-only","evidence":{"review":true}}'
+
+      // The live row's own generation names no archived incarnation.
+      expect(
+        await rejection(
+          caller.gateway.a2aResolveAttempt('history-key', closed, providerNode, a2aDocument(rows, `/${li}/generation`)),
+        ),
+      ).toMatch(/resolve_superseded_attempt/)
+
+      // The retained row, by its generation.
+      await caller.gateway.a2aResolveAttempt(
+        'history-key',
+        closed,
+        a2aU64(rows, `/${hi}/key/provider_node`),
+        a2aDocument(rows, `/${hi}/generation`),
+      )
+      const after = await caller.gateway.a2aAttempts()
+      const afterParsed = JSON.parse(after) as Any[]
+      const ai = afterParsed.findIndex((r) => r.retained === true)
+      const al = afterParsed.findIndex((r) => r.retained === false)
+      expect(afterParsed[ai].state.state).toBe('resolved')
+      expect(afterParsed[ai].state.outcome).toBe('history-only')
+      expect(a2aDocument(after, `/${al}`), 'the live replacement must be untouched').toBe(liveBefore)
+
+      // The live row, by omitting the generation.
+      await caller.gateway.a2aResolveAttempt(
+        'history-key',
+        '{"resolution":"closed","outcome":"refunded"}',
+        providerNode,
+      )
+      const done = JSON.parse(await caller.gateway.a2aAttempts()) as Any[]
+      expect(done.find((r) => r.retained === false).state.state).toBe('resolved')
+    })
+  }, 900000)
 })
