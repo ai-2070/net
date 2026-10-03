@@ -47,6 +47,7 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 
+use net::adapter::net::mesh_rpc::ServeError;
 use net::adapter::net::MeshNode;
 use net_sdk::a2a::{A2aBounds, A2aOffer, TaskBrief, TaskExecutor, TaskOwner, TaskRegistry};
 use net_sdk::a2a_journal::{
@@ -358,12 +359,30 @@ pub(crate) async fn serve(spec: ConfiguredServe) -> Result<(A2aServeHandle, Shar
         Arc::new(NodeTaskExecutor::new(spec.executor, spec.executor_timeout));
     let serving = mesh
         .serve_a2a_configured(TaskRegistry::new(), executor, config)
-        .map_err(|e| invalid(format!("serveA2aConfigured refused to start: {e}")))?;
+        .map_err(serve_err)?;
     let store = Arc::clone(&serving.store);
     Ok((
         A2aServeHandle::new(mesh, Registered::Configured(serving)),
         store,
     ))
+}
+
+/// [`ServeError`] from the configured serve onto the binding's prefixes.
+///
+/// A refused catalog is the caller's input (`a2a:invalid_argument:`). A
+/// registration conflict — another A2A serve already holds these services on
+/// this node — or a node authority not yet installed is a lifecycle state:
+/// the same call succeeds once the other handle stops or the authority is
+/// installed. So the plain `a2a:` family, never "retrying unchanged cannot
+/// succeed" (the same split `live_store` makes).
+fn serve_err(e: ServeError) -> Error {
+    let msg = format!("serveA2aConfigured refused to start: {e}");
+    match e {
+        ServeError::AlreadyServing(_) | ServeError::ProtectedAuthorityRequired(_) => {
+            Error::from_reason(format!("a2a: {msg}"))
+        }
+        _ => invalid(msg),
+    }
 }
 
 // ---------------------------------------------------------------------------

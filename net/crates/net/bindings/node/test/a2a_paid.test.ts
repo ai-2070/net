@@ -358,6 +358,27 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — provider (WS-B)', () => {
     })
   }, 30000)
 
+  // Code review: a node already serving the A2A services (here the legacy
+  // `mesh.serveA2a`) is a lifecycle conflict, not bad input — the unchanged
+  // call succeeds once that handle stops — so it must not classify as
+  // `A2aInvalidArgumentError` ("retrying unchanged cannot succeed").
+  it('a registration conflict on the node is a lifecycle refusal, not an invalid argument', async () => {
+    await withLone(async (mesh, provider) => {
+      const legacy = await mesh.serveA2a(async () => 'blob://legacy')
+      let refusal: string
+      try {
+        refusal = await rejection(provider.serveA2aConfigured(executor([]), { [FREE]: offer() }, tmp('j.json')))
+      } finally {
+        legacy.stop()
+      }
+      expect(refusal).toMatch(/^a2a: serveA2aConfigured refused to start: already serving/)
+      expect(refusal).not.toMatch(/^a2a:invalid_argument:/)
+      const handle = await provider.serveA2aConfigured(executor([]), { [FREE]: offer() }, tmp('j2.json'))
+      expect(handle.serving).toBe(true)
+      handle.stop()
+    })
+  }, 30000)
+
   // PR review (cubic): a serve still opening its journal when close() lands
   // must not leave the provider serving a node it was told to release. The
   // race goes either way, so either outcome is accepted — the serve rejects
