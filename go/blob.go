@@ -70,6 +70,10 @@ var ErrBlobClosed = fmt.Errorf("%w: adapter handle already closed", ErrBlob)
 // boundary (unknown scope, malformed JSON).
 var ErrBlobInvalidConfig = fmt.Errorf("%w: invalid overflow config", ErrBlob)
 
+// netErrInvalidJSON is `NetError::InvalidJson` (`src/ffi/mod.rs`), the code
+// the overflow-config parser returns for a body it refuses.
+const netErrInvalidJSON = -3
+
 // OverflowConfig mirrors the typed Rust + Python config shape.
 //
 // Pass to `NewMeshBlobAdapter` at construction or to
@@ -109,7 +113,7 @@ type OverflowConfig struct {
 type MeshBlobAdapterOpts struct {
 	// Opt every per-chunk file into disk persistence. Requires
 	// the underlying `Redex` to have been constructed with a
-	// `persistent_dir` (i.e. via `NewRedexWithPersistentDir`).
+	// `persistent_dir` (i.e. `NewRedex(dir)` with a non-empty dir).
 	Persistent bool
 
 	// Initial overflow configuration. Pass `nil` for the v0.2
@@ -262,7 +266,10 @@ func (a *MeshBlobAdapter) Publish(uri string, data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: publish failed with rc=%d", ErrBlob, int(rc))
 	}
 	defer C.net_blob_free_buffer(outRef, outLen)
-	encoded := C.GoBytes(unsafe.Pointer(outRef), C.int(outLen))
+	encoded, err := copyCBuf(unsafe.Pointer(outRef), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("%w: publish: %w", ErrBlob, err)
+	}
 	return encoded, nil
 }
 
@@ -288,7 +295,10 @@ func (a *MeshBlobAdapter) Fetch(blobRefBytes []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: fetch failed with rc=%d", ErrBlob, int(rc))
 	}
 	defer C.net_blob_free_buffer(outPtr, outLen)
-	body := C.GoBytes(unsafe.Pointer(outPtr), C.int(outLen))
+	body, err := copyCBuf(unsafe.Pointer(outPtr), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("%w: fetch: %w", ErrBlob, err)
+	}
 	return body, nil
 }
 
@@ -418,6 +428,12 @@ func (a *MeshBlobAdapter) SetOverflowConfig(cfg *OverflowConfig) error {
 		rc = C.net_mesh_blob_adapter_set_overflow_config(handle, cBody)
 	}) {
 		return ErrBlobClosed
+	}
+	if rc == netErrInvalidJSON {
+		// The parser's refusal (unknown scope, malformed body) is the
+		// operator-typo case ErrBlobInvalidConfig exists for; it still
+		// matches ErrBlob, which it wraps.
+		return fmt.Errorf("%w: set_overflow_config rc=%d", ErrBlobInvalidConfig, int(rc))
 	}
 	if rc != 0 {
 		return fmt.Errorf("%w: set_overflow_config rc=%d", ErrBlob, int(rc))
@@ -553,5 +569,9 @@ func (m *MeshNode) FetchBlob(holderID uint64, hash []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer C.net_transport_free_buffer(out, outLen)
-	return C.GoBytes(unsafe.Pointer(out), C.int(outLen)), nil
+	body, err := copyCBuf(unsafe.Pointer(out), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("%w: fetch: %w", ErrTransfer, err)
+	}
+	return body, nil
 }

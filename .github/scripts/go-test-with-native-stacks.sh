@@ -19,14 +19,25 @@
 #
 # Usage: go-test-with-native-stacks.sh [build-tags]
 # Run from the `go` module directory. Exits with the test binary's status.
+#
+# Optional environment:
+#   GO_TEST_RACE=1   build the test binary with -race. The ordinary runs do
+#                    not, so they are not race evidence; a step that claims
+#                    race coverage sets this.
+#   GO_TEST_RUN=re   pass -test.run=re. A filter that matches no test makes
+#                    a Go test binary exit 0 ("no tests to run"), which is the
+#                    silent-skip hazard AGENTS.md warns about, so this script
+#                    fails the run instead.
 
 set -euo pipefail
 
 TAGS="${1:-}"
-# Distinct binary AND distinct core name per tag set — `%e` in the core pattern
-# is the executable name, so symbolizing one tag set's core against the other's
-# binary is exactly the mix-up this avoids.
-NAME="go-net${TAGS:+-${TAGS}}"
+RACE="${GO_TEST_RACE:-}"
+RUN="${GO_TEST_RUN:-}"
+# Distinct binary AND distinct core name per tag set (and per race mode) — `%e`
+# in the core pattern is the executable name, so symbolizing one build's core
+# against another's binary is exactly the mix-up this avoids.
+NAME="go-net${TAGS:+-${TAGS}}${RACE:+-race}"
 BIN="/tmp/${NAME}.test"
 
 # `crash` is what promotes the timeout panic to an abort; without it the panic
@@ -48,16 +59,23 @@ rm -f /tmp/core.* || true
 # go.mod), so coverage is unchanged. `-test.timeout` must be spelled out: a test
 # binary run directly has NO timeout by default, and inheriting `go test`'s
 # implicit 10m silently is what would stop the alarm from ever firing.
-if [ -n "$TAGS" ]; then
-  go test -c -tags "$TAGS" -o "$BIN" .
-else
-  go test -c -o "$BIN" .
-fi
+build_flags=()
+[ -n "$TAGS" ] && build_flags+=(-tags "$TAGS")
+[ -n "$RACE" ] && build_flags+=(-race)
+go test -c "${build_flags[@]}" -o "$BIN" .
 
+run_flags=(-test.v -test.timeout 10m)
+[ -n "$RUN" ] && run_flags+=("-test.run=$RUN")
+
+LOG="/tmp/${NAME}.log"
 set +e
-"$BIN" -test.v -test.timeout 10m
-rc=$?
+"$BIN" "${run_flags[@]}" 2>&1 | tee "$LOG"
+rc=${PIPESTATUS[0]}
 set -e
+if [ $rc -eq 0 ] && [ -n "$RUN" ] && ! grep -q '^=== RUN' "$LOG"; then
+  echo "::error::-test.run='$RUN' matched no tests; refusing a vacuous green"
+  exit 1
+fi
 [ $rc -eq 0 ] && exit 0
 
 shopt -s nullglob

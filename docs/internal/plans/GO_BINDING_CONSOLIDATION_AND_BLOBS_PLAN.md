@@ -2,8 +2,10 @@
 
 ## Status
 
-Planned, 2026-10-03. Targets the release after 0.39. Branch `LZL0/go-blobs`.
-No slice has landed.
+In progress, 2026-10-03. Targets the release after 0.39. Branch
+`LZL0/go-blobs`. Plan accepted for implementation at `e33ede5`. **S1 done
+locally 2026-10-03** (evidence under S1; exact-head CI still owed). S2–S8 not
+started.
 
 Reviewed twice before implementation (`d1b6f29`, then `317168c`). The first
 review accepted the direction and held on nine findings (R1–R9). The second
@@ -373,6 +375,58 @@ evidence. S1 adds an explicit `-race` step through the same native-stack
 runner, so hangs still report native frames. It runs the blob tests, and
 from S5b on the callback tests too.
 
+**Done locally, 2026-10-03.** Exact-head CI is still owed: the new `-race`
+step and roster have run only as their local equivalents. On Windows
+(go1.26.2, WinLibs gcc, `net.dll` from
+`cargo build --release -p net-ffi --features net-ffi/test-helpers`):
+
+- `go test -count=1 -run '^TestBlob' -v .`: 14/14 pass (`go/blob_test.go`).
+- `go test -race -count=3 -run '^TestBlob' .`: ok, no races.
+- `go test -count=1 .` (the whole package, without
+  `RUN_INTEGRATION_TESTS`): ok, 188 s.
+- Mutations, each applied to `go/blob.go`, confirmed to compile with
+  `go vet`, and confirmed killed by a named test:
+  - `persistent` → `persistent*0`: `TestBlobPersistenceAcrossReopen/persistent`
+  - Store's ref and data arguments swapped:
+    `TestBlobExistsAndStoreOnIndependentAdapter`,
+    `TestBlobStoreRefusesMismatchedBytes`
+  - `Fetch` reverted to `C.GoBytes(…, C.int(n))`: `TestBlobSourceHasNoGoBytes`
+  - the `InvalidJson` → `ErrBlobInvalidConfig` mapping removed:
+    `TestBlobOverflowConfigRefusals`
+
+  A first pass reported two false results. The persistence mutant didn't
+  compile (it left `persistent` unused), and the swap mutant never applied (a
+  whitespace mismatch). Both were rerun with an apply check and a compile
+  gate, and are killed as listed above.
+- The persistence test carries an in-memory control subtest, so it fails if
+  persistence stops mattering.
+- `check-roster.py --label blob_test --mode decl`: 14 pinned names exist.
+- Runner guard: a test binary run with a non-matching `-test.run` exits 0
+  and prints no `=== RUN` line (checked locally). That is the condition
+  `go-test-with-native-stacks.sh` now fails on when `GO_TEST_RUN` is set.
+  The script itself is Linux-only (`sudo sysctl`); it passes `bash -n`, and
+  CI runs it for real.
+
+Changes: `go/cbuf.go` (new: `checkedLen`, `copyCBuf`); `go/blob.go` (three
+copy sites moved to `copyCBuf`, plus the two fixes below); `go/blob_test.go`
+(new); `.github/scripts/go-test-with-native-stacks.sh` (opt-in
+`GO_TEST_RACE` / `GO_TEST_RUN`, and the no-match guard); `ci.yml` (the
+"Run Go blob tests (-race)" step and the "Witness roster — Go blob binding
+(14)" step).
+
+Defects found and fixed in S1:
+- `SetOverflowConfig` returned plain `ErrBlob` for the parser's refusal
+  (`InvalidJson`, for example an unknown scope), although the
+  `ErrBlobInvalidConfig` doc promises that sentinel for exactly this case.
+  The error now wraps `ErrBlobInvalidConfig`, which still matches `ErrBlob`,
+  so the change is additive.
+- The `MeshBlobAdapterOpts.Persistent` doc pointed to a nonexistent
+  `NewRedexWithPersistentDir`. It now says `NewRedex(dir)`.
+
+Observed, not changed: at construction an unknown scope comes back only as a
+null handle, so `NewMeshBlobAdapter` can report only the generic `ErrBlob`
+(pinned in `TestBlobOverflowConfigRefusals`).
+
 ### S2: directory transfer
 
 Header closure: the four functions reach cgo from `include/net_transport.h`,
@@ -721,6 +775,13 @@ CI Go job are green.
   without knowing which function returned them can't tell them apart. S6
   numbers its new code from a fresh inventory. Renumbering either constant is
   an ABI change and is out of scope here.
+
+- **gofmt drift in eight existing `go/` files (deferred, not ours).**
+  `gofmt -l` lists `abi_stability_test.go`, `capabilities.go`,
+  `capabilities_test.go`, `groups.go`, `meshdb_test.go`, `migration.go`,
+  `org_test.go` and `subnets_test.go` (LF line endings, so this is real
+  formatting drift). No CI gate runs gofmt on `go/`. The files touched by
+  this plan are gofmt-clean.
 
 ## Review history
 

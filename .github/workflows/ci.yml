@@ -4814,6 +4814,43 @@ jobs:
           RUN_INTEGRATION_TESTS: "1"
         run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh
 
+      # The run above is NOT race evidence: the runner builds without -race.
+      # The blob binding's handle lifetime (Close racing in-flight calls)
+      # is only meaningfully checked under the race detector, so its tests
+      # run again with it — through the same runner, so a hang still reports
+      # native frames. GO_TEST_RUN makes the runner fail a filter that
+      # matches nothing. (GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md, S1.)
+      - name: Run Go blob tests (-race)
+        working-directory: go
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
+          GO_TEST_RACE: "1"
+          GO_TEST_RUN: "^TestBlob"
+        run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh
+
+      # Pins the blob witnesses the two runs above execute: lexical
+      # name-existence, fail-closed.
+      - name: Witness roster — Go blob binding (14)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label blob_test --mode decl \
+            --source blob_test.go \
+            TestBlobCheckedLenBoundaries \
+            TestBlobCopyCBuf \
+            TestBlobSourceHasNoGoBytes \
+            TestBlobPublishFetchRoundTrip \
+            TestBlobExistsAndStoreOnIndependentAdapter \
+            TestBlobStoreRefusesMismatchedBytes \
+            TestBlobPersistenceAcrossReopen \
+            TestBlobOverflowConfigRoundTrip \
+            TestBlobOverflowConfigZeroMeansDefault \
+            TestBlobOverflowOutOfRangeRatioIsAccepted \
+            TestBlobOverflowConfigRefusals \
+            TestBlobPrometheusText \
+            TestBlobCloseRacesInFlightFetches \
+            TestBlobTwoNodeFetch || exit 1
+
       # === the Go org facade live cells ==
       # The run above EXECUTED these 6 live cells (3 shapes x {same-org,
       # granted}, call+serve live two-node with verified-caller attribution
