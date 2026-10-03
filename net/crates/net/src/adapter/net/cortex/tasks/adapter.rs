@@ -314,6 +314,7 @@ impl TasksAdapter {
                 adapter_origin: self.origin_hash,
             });
         }
+        self.inner.check_token_channel(&token)?;
         match self.inner.applied_through_seq() {
             Some(applied) if applied >= token.seq => Ok(()),
             _ if !self.inner.is_running() => Err(WaitForTokenError::FoldStopped {
@@ -344,6 +345,22 @@ impl TasksAdapter {
     /// at `wait_for_token`.
     pub fn origin_hash(&self) -> u64 {
         self.origin_hash
+    }
+
+    /// Canonical hash of this adapter's channel
+    /// (`cortex/tasks`). Every token this adapter issues
+    /// carries it; a token for another channel is refused with
+    /// [`WaitForTokenError::WrongChannel`].
+    pub fn channel_hash(&self) -> u64 {
+        self.inner.channel_hash()
+    }
+
+    /// The token naming the write that returned `seq` on this adapter:
+    /// its origin, its channel and `seq`. Pass it to
+    /// [`Self::wait_for_token`] (or [`Self::poll_for_token`]) to wait
+    /// until that write is visible to reads.
+    pub fn token(&self, seq: u64) -> WriteToken {
+        WriteToken::new(self.origin_hash, self.inner.channel_hash(), seq)
     }
 
     /// Start building a reactive watcher. See
@@ -677,7 +694,7 @@ mod tests {
     }
 
     /// Cross-origin aliasing protection on the RYW surface. A
-    /// `WriteToken` is `(origin_hash, seq)`; if the adapter accepted
+    /// `WriteToken` is `(origin_hash, channel_hash, seq)`; if the adapter accepted
     /// a token bound to a different origin, a wait would either
     /// resolve against someone else's chain (silent RYW
     /// violation) or block forever (the targeted seq never
@@ -696,7 +713,7 @@ mod tests {
         // Counter starts at 0.
         assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 0);
 
-        let foreign_token = WriteToken::new(FOREIGN_ORIGIN, 0);
+        let foreign_token = WriteToken::new(FOREIGN_ORIGIN, adapter.channel_hash(), 0);
 
         // Synchronous poll: must reject with WrongOrigin and
         // bump the counter (proves the guard fired, not just that
@@ -726,7 +743,7 @@ mod tests {
         // Sanity: a token with the right origin (even at a seq we
         // haven't reached) returns Timeout, not WrongOrigin —
         // proves the guard is keyed on origin, not on seq.
-        let our_token = WriteToken::new(OUR_ORIGIN, 999);
+        let our_token = adapter.token(999);
         match adapter.poll_for_token(our_token) {
             Err(WaitForTokenError::Timeout) => {}
             other => panic!("expected Timeout for matched-origin token, got {:?}", other),

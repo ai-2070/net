@@ -33,7 +33,7 @@ func TestWriteTokenTasksReadYourWrites(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	tok := tasks.Token(seq)
-	if tok != (WriteToken{OriginHash: testOrigin, Seq: seq}) {
+	if tok != (WriteToken{OriginHash: testOrigin, ChannelHash: tasks.ChannelHash(), Seq: seq}) {
 		t.Fatalf("Token(%d) = %+v", seq, tok)
 	}
 	if err := tasks.WaitForToken(tok, time.Second); err != nil {
@@ -71,7 +71,7 @@ func TestWriteTokenMemoriesReadYourWrites(t *testing.T) {
 	if len(list) != 1 || list[0].ID != 3 {
 		t.Fatalf("List right after WaitForToken = %+v, want memory 3", list)
 	}
-	other := WriteToken{OriginHash: testOrigin + 1, Seq: seq}
+	other := WriteToken{OriginHash: testOrigin + 1, ChannelHash: mem.ChannelHash(), Seq: seq}
 	if err := mem.WaitForToken(other, 100*time.Millisecond); !errors.Is(err, ErrWrongOrigin) {
 		t.Fatalf("memories token from another origin: want ErrWrongOrigin, got %v", err)
 	}
@@ -88,7 +88,7 @@ func TestWriteTokenOriginNotIdentity(t *testing.T) {
 	}
 
 	// A different origin is refused, whatever the sequence.
-	foreign := WriteToken{OriginHash: testOrigin ^ 0xFF, Seq: seq}
+	foreign := WriteToken{OriginHash: testOrigin ^ 0xFF, ChannelHash: writer.ChannelHash(), Seq: seq}
 	if err := writer.WaitForToken(foreign, 100*time.Millisecond); !errors.Is(err, ErrWrongOrigin) {
 		t.Fatalf("token from a different origin: want ErrWrongOrigin, got %v", err)
 	}
@@ -278,5 +278,50 @@ func TestWriteTokenContextCancelledDuringASuccessfulWait(t *testing.T) {
 	// Uncancelled, a successful wait is a success.
 	if err := waitForTokenContext(context.Background(), func(uint32) error { return nil }); err != nil {
 		t.Fatalf("waitForTokenContext without cancellation = %v, want nil", err)
+	}
+}
+
+// The defect a channel-less token allowed: Tasks and Memories with the same
+// origin number their writes independently, so a Tasks token was "applied"
+// on Memories as soon as Memories reached the same seq. It must be refused
+// with ErrWrongChannel, by a poll and by a wait, while Tasks still accepts it.
+func TestWriteTokenWrongChannelIsRefused(t *testing.T) {
+	r := NewRedex("")
+	defer r.Free()
+	tasks := openTasksFor(t, r, testOrigin)
+	mem, err := OpenMemories(r, testOrigin, false)
+	if err != nil {
+		t.Fatalf("OpenMemories: %v", err)
+	}
+	defer mem.Close()
+	if tasks.ChannelHash() == mem.ChannelHash() || tasks.ChannelHash() == 0 {
+		t.Fatalf("channel hashes: tasks %#x, memories %#x", tasks.ChannelHash(), mem.ChannelHash())
+	}
+
+	var memSeq uint64
+	for id := uint64(0); id < 3; id++ {
+		if memSeq, err = mem.Store(id, "m", nil, "go-test", 1); err != nil {
+			t.Fatalf("Store: %v", err)
+		}
+	}
+	if err := mem.WaitForToken(mem.Token(memSeq), time.Second); err != nil {
+		t.Fatalf("memories WaitForToken: %v", err)
+	}
+	taskSeq, err := tasks.Create(1, "t", 1)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if taskSeq > memSeq {
+		t.Fatalf("test setup: memories (%d) must be past the task seq (%d)", memSeq, taskSeq)
+	}
+	tok := tasks.Token(taskSeq)
+	if err := mem.WaitForToken(tok, 0); !errors.Is(err, ErrWrongChannel) {
+		t.Fatalf("poll a tasks token on memories: want ErrWrongChannel, got %v", err)
+	}
+	if err := mem.WaitForToken(tok, time.Second); !errors.Is(err, ErrWrongChannel) {
+		t.Fatalf("wait on a tasks token on memories: want ErrWrongChannel, got %v", err)
+	}
+	if err := tasks.WaitForToken(tok, time.Second); err != nil {
+		t.Fatalf("tasks WaitForToken on its own token: %v", err)
 	}
 }

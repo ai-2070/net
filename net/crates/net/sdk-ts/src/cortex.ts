@@ -629,11 +629,25 @@ export class TasksAdapter {
     }
   }
 
+  /** Hash of this adapter's channel: the `channelHash` of every token it issues. */
+  channelHash(): bigint {
+    return this.napi.channelHash();
+  }
+
+  /**
+   * The {@link WriteToken} naming the write that returned `seq` on this
+   * adapter (its origin, its channel and `seq`). Pass it to
+   * {@link waitForToken}.
+   */
+  token(seq: bigint): WriteToken {
+    return this.napi.token(seq);
+  }
+
   /**
    * Read-your-writes wait: resolve once this adapter's fold has applied the
    * write `token` names, or reject after `deadlineMs`. A token from another
-   * origin, or a full wait queue, rejects at once. Pair with
-   * {@link WriteToken}: `new WriteToken(originHash, seq)`, or
+   * origin or another channel, or a full wait queue, rejects at once. Get
+   * the token from the adapter that made the write ({@link token}), or
    * `WriteToken.fromString` for one carried over the wire.
    */
   async waitForToken(token: WriteToken, deadlineMs: number): Promise<void> {
@@ -829,11 +843,25 @@ export class MemoriesAdapter {
     }
   }
 
+  /** Hash of this adapter's channel: the `channelHash` of every token it issues. */
+  channelHash(): bigint {
+    return this.napi.channelHash();
+  }
+
+  /**
+   * The {@link WriteToken} naming the write that returned `seq` on this
+   * adapter (its origin, its channel and `seq`). Pass it to
+   * {@link waitForToken}.
+   */
+  token(seq: bigint): WriteToken {
+    return this.napi.token(seq);
+  }
+
   /**
    * Read-your-writes wait: resolve once this adapter's fold has applied the
    * write `token` names, or reject after `deadlineMs`. A token from another
-   * origin, or a full wait queue, rejects at once. Pair with
-   * {@link WriteToken}: `new WriteToken(originHash, seq)`, or
+   * origin or another channel, or a full wait queue, rejects at once. Get
+   * the token from the adapter that made the write ({@link token}), or
    * `WriteToken.fromString` for one carried over the wire.
    */
   async waitForToken(token: WriteToken, deadlineMs: number): Promise<void> {

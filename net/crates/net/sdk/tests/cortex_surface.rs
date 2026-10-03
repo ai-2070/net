@@ -8,7 +8,9 @@
 #![cfg(feature = "cortex")]
 
 use futures::StreamExt;
-use net_sdk::cortex::{MemoriesAdapter, NetDb, Redex, TaskStatus, TasksAdapter};
+use net_sdk::cortex::{
+    MemoriesAdapter, NetDb, Redex, TaskStatus, TasksAdapter, WaitForTokenError, WriteToken,
+};
 
 const ORIGIN: u64 = 0xABCD_EF01;
 
@@ -114,4 +116,52 @@ async fn netdb_snapshot_bundle_round_trips() {
 
     assert_eq!(db_b.tasks().count(), 1);
     assert_eq!(db_b.memories().count(), 1);
+}
+
+/// Read-your-writes through the SDK: an adapter's `token(seq)` names the
+/// write by origin, channel and seq, and a token from another channel is
+/// refused with the re-exported `WaitForTokenError::WrongChannel`, even with
+/// the same origin and a seq this adapter has already passed.
+#[tokio::test]
+async fn write_tokens_are_bound_to_their_channel() {
+    let redex = Redex::new();
+    let db = NetDb::builder(redex)
+        .origin(ORIGIN)
+        .with_tasks()
+        .with_memories()
+        .build()
+        .await
+        .expect("builder completes");
+    let (tasks, memories) = (db.tasks(), db.memories());
+
+    let mut m_seq = 0;
+    for id in 0..3 {
+        m_seq = memories
+            .store(id, "m", Vec::<String>::new(), "alice", 100)
+            .unwrap();
+    }
+    memories
+        .wait_for_token(memories.token(m_seq), std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    let t_seq = tasks.create(1, "t", 100).unwrap();
+    let token: WriteToken = tasks.token(t_seq);
+    assert_eq!(
+        (token.origin_hash, token.channel_hash, token.seq),
+        (ORIGIN, tasks.channel_hash(), t_seq)
+    );
+    assert_eq!(token.to_string().parse::<WriteToken>().unwrap(), token);
+
+    assert!(t_seq <= m_seq);
+    assert_eq!(
+        memories.poll_for_token(token),
+        Err(WaitForTokenError::WrongChannel {
+            token_channel: tasks.channel_hash(),
+            adapter_channel: memories.channel_hash(),
+        })
+    );
+    tasks
+        .wait_for_token(token, std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
 }

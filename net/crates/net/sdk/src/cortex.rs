@@ -69,14 +69,14 @@
 
 pub use ::net::adapter::net::redex::{
     FsyncPolicy, OrderedAppender, Redex, RedexError, RedexEvent, RedexFile, RedexFileConfig,
-    TypedRedexFile,
+    TypedRedexFile, WriteToken, WriteTokenParseError,
 };
 
 // ---- CortEX domain adapters ------------------------------------------------
 
 pub use ::net::adapter::net::cortex::{
     compute_checksum, CortexAdapterError, EventEnvelope, EventMeta, IntoRedexPayload,
-    EVENT_META_SIZE,
+    RywMetricsSnapshot, WaitForTokenError, EVENT_META_SIZE,
 };
 
 pub use ::net::adapter::net::cortex::tasks::{

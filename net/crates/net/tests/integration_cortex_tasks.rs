@@ -1191,6 +1191,7 @@ async fn test_regression_snapshot_and_watch_forwards_divergent_stream_initial() 
 /// 1. Return Ok(()) immediately when the watermark covers `seq`.
 /// 2. Return Timeout (NOT block) when it doesn't yet.
 /// 3. Return WrongOrigin when the token's origin_hash mismatches.
+/// 4. Return WrongChannel when the token was issued for another channel.
 ///
 /// Pins the contract every binding's `wait_for_token(deadline=0)`
 /// is routed through.
@@ -1200,7 +1201,7 @@ async fn poll_for_token_synchronous_non_blocking_check() {
     let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let seq = tasks.create(1, "ping", now_ns()).unwrap();
-    let token = WriteToken::new(ORIGIN, seq);
+    let token = tasks.token(seq);
 
     // Wait for the fold to apply through `seq` so poll can succeed.
     tasks.wait_for_seq(seq).await.unwrap();
@@ -1210,14 +1211,21 @@ async fn poll_for_token_synchronous_non_blocking_check() {
 
     // Future seq beyond the watermark must surface Timeout, not
     // block, not error otherwise.
-    let future_token = WriteToken::new(ORIGIN, seq + 1_000_000);
+    let future_token = tasks.token(seq + 1_000_000);
     let err = tasks.poll_for_token(future_token).unwrap_err();
     assert!(matches!(err, WaitForTokenError::Timeout));
 
     // Mismatched origin must surface WrongOrigin.
-    let alien_token = WriteToken::new(0xDEAD_BEEF, seq);
+    let alien_token = WriteToken::new(0xDEAD_BEEF, tasks.channel_hash(), seq);
     let err = tasks.poll_for_token(alien_token).unwrap_err();
     assert!(matches!(err, WaitForTokenError::WrongOrigin { .. }));
+
+    // Same origin and seq, another channel: must surface WrongChannel,
+    // not Ok — the seq is already applied *here*, which is exactly what a
+    // channel-less token used to be fooled by.
+    let other_channel = WriteToken::new(ORIGIN, tasks.channel_hash() ^ 1, seq);
+    let err = tasks.poll_for_token(other_channel).unwrap_err();
+    assert!(matches!(err, WaitForTokenError::WrongChannel { .. }));
 }
 
 #[tokio::test]

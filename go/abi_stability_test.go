@@ -478,3 +478,52 @@ func TestABIStabilityBlobOwnedRegistrationMatchesRust(t *testing.T) {
 		t.Errorf("C vtable fields = %v, want %v", cFields, want)
 	}
 }
+
+// TestABIStabilityWriteTokenCarriesTheChannel pins the channel-bound token
+// surface: both waits take (origin, channel, seq) plus the timeout, the
+// channel accessors exist with the Rust arity, and -109 is ErrWrongChannel
+// on this surface. Before, a token was (origin, seq), and a Tasks token
+// could be satisfied by Memories' unrelated numbering.
+func TestABIStabilityWriteTokenCarriesTheChannel(t *testing.T) {
+	requireCrateTree(t)
+	src, err := os.ReadFile("../net/crates/net/src/ffi/cortex.rs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := parseHeader(t, "net_cortex.h")
+	for name, want := range map[string]int{
+		"net_tasks_wait_for_token":    5,
+		"net_memories_wait_for_token": 5,
+		"net_tasks_channel_hash":      2,
+		"net_memories_channel_hash":   2,
+	} {
+		params, ok := h.fns[name]
+		if !ok {
+			t.Errorf("%s is not declared in go/net_cortex.h", name)
+			continue
+		}
+		if got := strings.Count(params, ",") + 1; got != want {
+			t.Errorf("%s: header declares %d parameters, want %d", name, got, want)
+		}
+		def := regexp.MustCompile(`pub unsafe extern "C" fn ` + name + `\(([^)]*)\)`).FindStringSubmatch(string(src))
+		if def == nil {
+			t.Errorf("%s is not defined in src/ffi/cortex.rs", name)
+			continue
+		}
+		got := 0
+		for _, p := range strings.Split(def[1], ",") {
+			if strings.TrimSpace(p) != "" {
+				got++
+			}
+		}
+		if got != want {
+			t.Errorf("%s: Rust takes %d parameters, want %d", name, got, want)
+		}
+	}
+	if !strings.Contains(string(src), "pub(crate) const NET_ERR_WRONG_CHANNEL: c_int = -109;") {
+		t.Error("NET_ERR_WRONG_CHANNEL is no longer -109 in src/ffi/cortex.rs")
+	}
+	if err := tokenErrorFromInt(-109); !errors.Is(err, ErrWrongChannel) {
+		t.Errorf("code -109 maps to %v, want ErrWrongChannel", err)
+	}
+}

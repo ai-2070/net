@@ -18,8 +18,8 @@ Example::
     r = redex.Redex(persistent_dir="/var/lib/net/redex")
     with cortex.tasks_cm(r, channel="app/tasks", origin_hash=0xDEADBEEF,
                          persistent=True) as tasks:
-        result = tasks.create(1, "first", now_ns=1_000_000_000)
-        tasks.wait_for_token(result.token, deadline_ms=250)
+        seq = tasks.create(1, "first", 1_000_000_000)
+        tasks.wait_for_token(tasks.token(seq), deadline_ms=250)
         for snap in tasks.watch():
             ...
 """

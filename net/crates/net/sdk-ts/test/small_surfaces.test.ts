@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   FoldQueryClient,
+  MemoriesAdapter,
   MeshNode,
   Redex,
   RegistryClient,
@@ -93,15 +94,49 @@ describe('WriteToken', () => {
     const tasks = await TasksAdapter.open(new Redex(), origin);
     try {
       const seq = tasks.create(1n, 'write me', 1n);
-      const token = new WriteToken(origin, seq);
-      expect(WriteToken.fromString(token.toString()).seq).toBe(seq);
+      const token = tasks.token(seq);
+      expect(token.originHash).toBe(origin);
+      expect(token.channelHash).toBe(tasks.channelHash());
+      expect(token.seq).toBe(seq);
+      const parsed = WriteToken.fromString(token.toString());
+      expect([parsed.originHash, parsed.channelHash, parsed.seq]).toEqual([
+        origin,
+        tasks.channelHash(),
+        seq,
+      ]);
       await tasks.waitForToken(token, 2_000);
       expect(tasks.count()).toBe(1);
 
       // A token from another origin is rejected at once.
-      await expect(tasks.waitForToken(new WriteToken(origin + 1n, seq), 2_000)).rejects.toThrow();
+      const hex = (n: bigint) => n.toString(16).padStart(16, '0');
+      const foreign = WriteToken.fromString(`${hex(origin + 1n)}:${hex(tasks.channelHash())}:${seq}`);
+      await expect(tasks.waitForToken(foreign, 2_000)).rejects.toThrow(/origin/);
+      // The two-part form from before tokens carried a channel is refused.
+      expect(() => WriteToken.fromString(`${hex(origin)}:${seq}`)).toThrow();
     } finally {
       tasks.close();
+    }
+  });
+
+  it('a token from another channel is refused, even with the same origin', async () => {
+    const origin = 0x5eedn;
+    const redex = new Redex();
+    const tasks = await TasksAdapter.open(redex, origin);
+    const memories = await MemoriesAdapter.open(redex, origin);
+    try {
+      expect(tasks.channelHash()).not.toBe(memories.channelHash());
+      let memSeq = 0n;
+      for (let id = 0n; id < 3n; id++) memSeq = memories.store(id, 'm', [], 'src', 1n);
+      await memories.waitForToken(memories.token(memSeq), 2_000);
+      const taskSeq = tasks.create(1n, 't', 1n);
+      expect(taskSeq <= memSeq).toBe(true);
+
+      // Memories is past the task's seq; only the channel tells them apart.
+      await expect(memories.waitForToken(tasks.token(taskSeq), 2_000)).rejects.toThrow(/channel/);
+      await tasks.waitForToken(tasks.token(taskSeq), 2_000);
+    } finally {
+      tasks.close();
+      memories.close();
     }
   });
 });
