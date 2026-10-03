@@ -1,0 +1,42 @@
+net/crates/net/sdk-ts/src/index.ts
+  s_36e6a9decc3647::t_0fcd43404bc4e7 334-351
+net/crates/net/bindings/node/test/consumer/paid_a2a_consumer.ts
+  s_36e6a9decc3647::t_b98fad08ed030d 1-120
+net/crates/net/sdk-ts/test/mesh_node_surface.test.ts
+  s_36e6a9decc3647::t_3354eff059344b 49-50
+  s_36e6a9decc3647::t_e2278291da3387 89-107
+net/crates/net/sdk-ts/test/paid_a2a.test.ts
+  s_36e6a9decc3647::t_baa9fef1acb8ae 1-273
+net/crates/net/sdk-ts/src/mesh.ts
+  s_36e6a9decc3647::t_5dcd9169e12ff2 87-90,1086-1095
+  s_36e6a9decc3647::t_0fcd43404bc4e7 1083-1085,1096-1102
+net/crates/net/sdk-ts/src/_internal.ts
+  s_36e6a9decc3647::t_5dcd9169e12ff2 86-102
+net/crates/net/sdk-ts/src/payments.ts
+  s_36e6a9decc3647::t_1a4ffd70d47817 1-54,56,58,60-211,213-218
+  s_36e6a9decc3647::t_5dcd9169e12ff2 55,57,59,212
+net/crates/net/bindings/node/src/a2a_paid.rs
+  s_36e6a9decc3647::t_6baa9579b01a85 206-207
+net/crates/net/sdk-ts/src/consent.ts
+  s_36e6a9decc3647::t_fb641eb38178db 16-20
+net/crates/net/bindings/node/test/consumer/tsconfig.json
+  s_36e6a9decc3647::t_0dacc2e0dfaae7 17
+docs/internal/plans/NODE_A2A_PAID_ADMISSION_PLAN.md
+  s_36e6a9decc3647::t_2d14db36cc3f0c 790-834
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c2f56dddc1a896fcd9b2dbbb0d3f14ea48ad14bc",
+  "prompts": {},
+  "sessions": {
+    "s_36e6a9decc3647": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "46b7ea03-5ec0-4fb4-8bef-0e4bfe61231c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
