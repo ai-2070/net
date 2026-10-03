@@ -1,0 +1,102 @@
+go/abi_stability_test.go
+  s_391b90f341d6c6::t_5782e6c0bbc2fb 244,325,353,395,428
+  s_391b90f341d6c6::t_72d3cf29b7f982 259-261,341-343
+docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md
+  s_391b90f341d6c6::t_1ffb353e55cc16 678-679,1300-1305,1412-1413,1486,1490-1502
+web/src/lib/generated/capability-record.json
+  s_391b90f341d6c6::t_f85e0a40ff8e35 282
+go/meshos_test.go
+  s_391b90f341d6c6::t_2fb9ab51ff58a8 124-125,129-131,133-164,167-174
+  s_391b90f341d6c6::t_559970c7d9789e 175
+go/transfer_test.go
+  s_391b90f341d6c6::t_0885f38498ab3d 283-298
+net/crates/net/bindings/node/src/cortex.rs
+  s_391b90f341d6c6::t_7c90d1b56b908d 472,597,951-953,1063-1065,1068-1070
+go/net_cortex.h
+  s_391b90f341d6c6::t_d7245f031396b1 56-58
+  s_391b90f341d6c6::t_6086c3354e0713 77-79
+go/blob_registry.go
+  s_391b90f341d6c6::t_0d7bcf95b21bf7 47-50
+net/crates/net/bindings/python/src/cortex.rs
+  s_391b90f341d6c6::t_7c90d1b56b908d 470,709,980-982,1056-1058,1060-1062
+go/header_parity_test.go
+  s_391b90f341d6c6::t_72d3cf29b7f982 181-183,238-263
+  s_391b90f341d6c6::t_5782e6c0bbc2fb 52,69,74-78,102-129,264
+  s_391b90f341d6c6::t_2abb9a290fbe8c 130
+.github/workflows/ci.yml
+  s_391b90f341d6c6::t_3c22e3df8c2456 4915-4916,4933-4934,4948-4949
+  s_391b90f341d6c6::t_6086c3354e0713 4408-4409
+  s_391b90f341d6c6::t_a8973e45f25660 4901,4918,4936
+  s_391b90f341d6c6::t_d7245f031396b1 4393-4394,4402,4404,4407
+net/crates/net/include/net_cortex.h
+  s_391b90f341d6c6::t_6086c3354e0713 77-79
+  s_391b90f341d6c6::t_d7245f031396b1 56-58
+.claude/skills/net-event-bus/dataforts.md
+  s_391b90f341d6c6::t_d7245f031396b1 247,351
+go/transfer.go
+  s_391b90f341d6c6::t_31f2a5ccf09520 31
+  s_391b90f341d6c6::t_0885f38498ab3d 126-135,140-142,171-173
+.claude/skills/net-event-bus/cortex.md
+  s_391b90f341d6c6::t_d7245f031396b1 194
+docs/data/capabilities/event-bus.yaml
+  s_391b90f341d6c6::t_a4f569b38f79e9 455
+.claude/skills/net-event-bus/bindings/go.md
+  s_391b90f341d6c6::t_d7245f031396b1 121-125,142-145
+.claude/skills/net-event-bus/patterns.md
+  s_391b90f341d6c6::t_d7245f031396b1 95
+go/cortex.go
+  s_391b90f341d6c6::t_643ea60b022b03 241-243
+  s_391b90f341d6c6::t_f111d06a2b6e02 191-194,250-253
+  s_391b90f341d6c6::t_3db9879d8025aa 254-255
+go/redex_dataforts_test.go
+  s_391b90f341d6c6::t_a2284b1df851bb 387-397
+  s_391b90f341d6c6::t_fc06654bc1c1a2 155-164
+  s_391b90f341d6c6::t_f4be58f01020d6 357-363,399,470-498,508-511
+  s_391b90f341d6c6::t_c8f86d5e86586c 356
+go/write_token_test.go
+  s_391b90f341d6c6::t_1fa963ac8ffddb 126-129,260-281
+  s_391b90f341d6c6::t_33158802ac62e6 282
+net/crates/net/bindings/python/tests/test_greedy_cache.py
+  s_391b90f341d6c6::t_a2284b1df851bb 50-55,89-104
+  s_391b90f341d6c6::t_7510eab4b52f2f 105-106
+go/identity.go
+  s_391b90f341d6c6::t_0d7bcf95b21bf7 734-736
+README.md
+  s_391b90f341d6c6::t_a4f569b38f79e9 343
+.claude/skills/net-event-bus/nrpc.md
+  s_391b90f341d6c6::t_d7245f031396b1 187
+.claude/skills/net-event-bus/bindings/coverage.md
+  s_391b90f341d6c6::t_a4f569b38f79e9 106
+  s_391b90f341d6c6::t_d7245f031396b1 174,177-180
+go/blob_tree_test.go
+  s_391b90f341d6c6::t_0d7bcf95b21bf7 106-112,115-117,285-299
+  s_391b90f341d6c6::t_38456ff9942f43 10
+  s_391b90f341d6c6::t_54208cfee75a28 300
+go/abi_stability_reference_removal_test.go
+  s_391b90f341d6c6::t_5782e6c0bbc2fb 23
+  s_391b90f341d6c6::t_0885f38498ab3d 114-119
+go/write_token.go
+  s_391b90f341d6c6::t_1fa963ac8ffddb 89-95,106-109,134,165
+  s_391b90f341d6c6::t_2392aeefc3133f 29-32
+net/crates/net/src/ffi/blob_stubs.rs
+  s_391b90f341d6c6::t_c83c3cd54937e7 32,308-393,521-598
+go/redex_dataforts.go
+  s_391b90f341d6c6::t_643ea60b022b03 34
+  s_391b90f341d6c6::t_f111d06a2b6e02 351-352,358-361,376
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1457d80b69c704a8801eed717b2f2fd65f7a870d",
+  "prompts": {},
+  "sessions": {
+    "s_391b90f341d6c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e008671-9702-4db4-b22a-abb85b691773",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
