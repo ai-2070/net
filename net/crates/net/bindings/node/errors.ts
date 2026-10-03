@@ -20,6 +20,11 @@ const ERR_CORTEX_PREFIX = 'cortex:'
 const ERR_NETDB_PREFIX = 'netdb:'
 const ERR_NRPC_PREFIX = 'nrpc:'
 const ERR_GATEWAY_PREFIX = 'gateway:'
+// Paid A2A (NODE_A2A_PAID_ADMISSION_PLAN.md D4). Mirror the `ERR_*`
+// constants in `bindings/node/src/a2a.rs` / `src/a2a_paid.rs`.
+const ERR_A2A_PAYMENT_REFUSED_PREFIX = 'a2a:payment_refused:'
+const ERR_A2A_JOURNAL_OWNED_ELSEWHERE_PREFIX = 'a2a:journal_owned_elsewhere:'
+const ERR_A2A_INVALID_ARGUMENT_PREFIX = 'a2a:invalid_argument:'
 
 export class CortexError extends Error {
   constructor(detail?: string) {
@@ -47,6 +52,58 @@ export class GatewayError extends Error {
     this.name = 'GatewayError'
     Object.setPrototypeOf(this, GatewayError.prototype)
   }
+}
+
+// Paid A2A. A provider's payment or admission refusal on the raw paid submit
+// (`NetMesh.submitTaskPaid`). The native message is the prefix, the
+// provider's `net.payment.failure@1` schematic as compact JSON (or `null`), a
+// newline, and the human message. `schematic` keeps that JSON byte-for-byte —
+// it is never re-encoded here, because its `extra` map is open and a JS
+// parse/stringify round trip could round a number in it.
+export class PaymentRefusedError extends Error {
+  /** The provider's `net.payment.failure@1` schematic as JSON, if it sent one. */
+  readonly schematic: string | undefined
+  constructor(detail?: string, schematic?: string) {
+    super(detail ?? 'payment refused')
+    this.name = 'PaymentRefusedError'
+    this.schematic = schematic
+    Object.setPrototypeOf(this, PaymentRefusedError.prototype)
+  }
+}
+
+// Another holder owns the A2A admission journal: another PaymentProvider in
+// this process or another, or tasks launched under a stopped handle that are
+// still running. Let them finish (or cancel them); never delete the
+// `.owner` sidecar.
+export class JournalOwnedElsewhereError extends Error {
+  constructor(detail?: string) {
+    super(detail ?? 'a2a admission journal owned elsewhere')
+    this.name = 'JournalOwnedElsewhereError'
+    Object.setPrototypeOf(this, JournalOwnedElsewhereError.prototype)
+  }
+}
+
+// The caller's own input was refused (a malformed document, a selector naming
+// nothing, a catalog value out of range, a brief the wire cannot carry). Not a
+// transport failure: retrying unchanged cannot succeed.
+export class A2aInvalidArgumentError extends Error {
+  constructor(detail?: string) {
+    super(detail ?? 'a2a invalid argument')
+    this.name = 'A2aInvalidArgumentError'
+    Object.setPrototypeOf(this, A2aInvalidArgumentError.prototype)
+  }
+}
+
+function classifyPaymentRefused(msg: string): PaymentRefusedError {
+  const tail = msg.slice(ERR_A2A_PAYMENT_REFUSED_PREFIX.length).replace(/^ /, '')
+  const nl = tail.indexOf('\n')
+  if (nl === -1) {
+    // Not the documented shape; the whole message is the detail rather than
+    // an invented one.
+    return new PaymentRefusedError(msg)
+  }
+  const schematic = tail.slice(0, nl)
+  return new PaymentRefusedError(tail.slice(nl + 1), schematic === 'null' ? undefined : schematic)
 }
 
 // nRPC error hierarchy. Mirrors net::adapter::net::mesh_rpc::RpcError;
@@ -405,6 +462,15 @@ export function classifyError(e: unknown): unknown {
   }
   if (msg.startsWith(ERR_ORG_PREFIX)) {
     return classifyOrgError(e)
+  }
+  if (msg.startsWith(ERR_A2A_PAYMENT_REFUSED_PREFIX)) {
+    return classifyPaymentRefused(msg)
+  }
+  if (msg.startsWith(ERR_A2A_JOURNAL_OWNED_ELSEWHERE_PREFIX)) {
+    return new JournalOwnedElsewhereError(msg)
+  }
+  if (msg.startsWith(ERR_A2A_INVALID_ARGUMENT_PREFIX)) {
+    return new A2aInvalidArgumentError(msg)
   }
   // Scanned, not prefix-matched — the serve-registration wrap carries the
   // envelope mid-message. Runs LAST so a leading `org:` / `nrpc:` / … wins

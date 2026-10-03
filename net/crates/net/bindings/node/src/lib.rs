@@ -1691,6 +1691,14 @@ mod mesh_bindings {
         #[cfg(feature = "org")]
         #[cfg_attr(test, allow(dead_code))]
         subnet_exports: Arc<net_sdk::subnet::NamedSubnetExports>,
+        /// The organization identity the A2A requester verbs present to a
+        /// PROTECTED provider (`setA2aOrgCaller`). A slot on the native mesh,
+        /// not on an SDK `Mesh`, because every requester verb builds a fresh
+        /// SDK `Mesh` over the live node — sharing the node is not sharing
+        /// this slot (NODE_A2A_PAID_ADMISSION_PLAN.md WS-C, review R6).
+        #[cfg(all(feature = "a2a", feature = "org"))]
+        #[cfg_attr(test, allow(dead_code))]
+        a2a_org_caller: Arc<parking_lot::Mutex<Option<Arc<net_sdk::org::OrgClient>>>>,
     }
 
     #[napi]
@@ -1858,6 +1866,8 @@ mod mesh_bindings {
                 recv_cursor: Arc::new(std::sync::atomic::AtomicU16::new(0)),
                 #[cfg(feature = "org")]
                 subnet_exports,
+                #[cfg(all(feature = "a2a", feature = "org"))]
+                a2a_org_caller: Arc::new(parking_lot::Mutex::new(None)),
             })
         }
 
@@ -2692,6 +2702,14 @@ mod mesh_bindings {
                 Some(arc) => Ok(arc.clone()),
                 None => Err(Error::from_reason("MeshNode has been shut down")),
             }
+        }
+
+        /// The A2A organization-identity slot (`setA2aOrgCaller`).
+        #[cfg(all(feature = "a2a", feature = "org"))]
+        pub(crate) fn a2a_org_caller_slot(
+            &self,
+        ) -> &Arc<parking_lot::Mutex<Option<Arc<net_sdk::org::OrgClient>>>> {
+            &self.a2a_org_caller
         }
 
         /// The runtime `create()` ran on, for sibling modules whose

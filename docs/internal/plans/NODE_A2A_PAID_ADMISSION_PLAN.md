@@ -618,27 +618,60 @@ string refusal, throw, and a never-settling callback refused in < 15 s with
 
 ### WS-C — Requester raw verbs on `NetMesh` (`node/src/a2a.rs`)
 
-- [ ] `describeA2a(targetNodeId: bigint) => Promise<string>` (JSON
-  `A2aOffer[]`; the legacy free path has no describe service and rejects).
-- [ ] `submitTaskPaid(preparedJson, proofJson) => Promise<string>` — headers
-  from the proof, brief from the prepared document, no store;
-  `PaymentRefusedError` on refusal.
-- [ ] `setA2aOrgCaller(orgClient: OrgClient | null)` — needs a crate-internal
-  `OrgClient::shared()` accessor over its `ArcSwapOption`. **r2 (R6):** the
-  raw verbs build a fresh SDK `Mesh` per call, so the installed caller must
-  live in a slot on `NetMesh` itself (Python's `a2a_org_caller` field,
-  `lib.rs:1384`), and every fresh wrapper reads it. `mesh_over` becomes the
-  org-aware variant (Python's `mesh_over_as`, `python/src/a2a.rs:122`).
-  Sharing the core node does not share the slot. Applies to
-  describe/submit/submitTaskPaid/status/cancel.
-- [ ] `a2aDocument` / `a2aU64` free functions (D2a).
-- [ ] Rewrite the `submitTask` doc comment that currently says paid A2A is out
-  of scope for this binding.
+- [x] `describeA2a(targetNodeId: bigint) => Promise<string>` (JSON
+  `A2aOffer[]`; the legacy free path has no describe service and rejects
+  `a2a: describeA2a: …`).
+- [x] `submitTaskPaid(preparedJson, proofJson) => Promise<string>` — headers
+  from the proof, brief from the prepared document, no store; a refusal
+  rejects `a2a:payment_refused:` (→ `PaymentRefusedError`), a malformed
+  document, an unpresentable proof or an over-long brief rejects
+  `a2a:invalid_argument:` before any packet.
+- [x] `setA2aOrgCaller(orgClient: OrgClient | null)` — `OrgClient::shared()`
+  (crate-internal, over its `ArcSwapOption`); the slot lives on the native
+  `NetMesh` and every requester verb (`describeA2a`, `submitTask`,
+  `submitTaskPaid`, `taskStatus`, `cancelTask`) now builds its SDK `Mesh`
+  through `NetMesh::a2a_requester`, which applies it per call. In its own
+  `#[cfg(feature = "org")] #[napi] impl` block (the WS-B lesson).
+- [x] `a2aDocument` / `a2aU64` free functions (D2a).
+- [x] The `submitTask` doc comment no longer says paid A2A is out of scope;
+  it says what a Node caller actually sees for a paid entry (status
+  `0x8006`) and names the verbs that buy one.
+- [x] **Pulled forward from WS-E:** the D4 classes in `errors.ts` —
+  `PaymentRefusedError { schematic }`, `JournalOwnedElsewhereError`, and an
+  `A2aInvalidArgumentError` for the `a2a:invalid_argument:` prefix (D4 named
+  the prefix but no class) — wired into `classifyError`.
+- [x] **Design change to D4's wire format (found while writing it).** D4 put
+  the schematic inside a JSON tail `{"message":…,"schematic":…}` for the
+  classifier to `JSON.parse`. The schematic's `extra` map is an open
+  `Value`, so that parse → re-stringify could round a number in it — the R1
+  defect again, one layer down. The native message is now
+  `a2a:payment_refused: <schematic JSON as encoded | null>
+<message>`
+  (compact JSON has no raw newline), and `PaymentRefusedError.schematic` is
+  that JSON byte-for-byte, never re-encoded.
 
-**Proved by:** `submitTaskPaid` refusal cases (unpaid → `PaymentRefusedError`
-with a parseable schematic; oversized brief → `a2a:invalid_argument:`) and a
-`describeA2a` round-trip against a WS-B provider; the D2a reader cases;
-existing `a2a.test.ts` green unedited (free path unchanged).
+**Proved by:** `test/a2a_paid.test.ts` WS-C part (5) — the readers keep
+`2⁵³+1` and `u64::MAX` exact where the negative control shows
+`JSON.parse`/`stringify` does not, and every bad pointer / non-u64 is
+`A2aInvalidArgumentError`; `describeA2a` returns the catalog with the
+announced terms and a free-path provider rejects; a raw unpaid
+`submitTaskPaid` against a paid entry is a `PaymentRefusedError` whose
+schematic says `stage: admission`, `reason: no_reservation`,
+`handler_executed: false`, `funds_moved: unknown` (no reservation means the
+provider cannot rule out a payment made elsewhere — Python's twin sees `no`
+only because it prepares first), with the executor never run; malformed
+documents and a 256 KB brief refused locally; `setA2aOrgCaller(null)` keeps
+the verbs working. `test/errors.test.ts` (+3): the split keeps a schematic
+number above 2⁵³ byte-for-byte; `null` and malformed tails; the plain `a2a:`
+prefix passes through unclassified.
+
+> **Status: WS-C landed 2026-10-03.** Paid suite 14/14 on three consecutive
+> runs; the whole node suite 769 passed / 9 skipped; `existing a2a.test.ts`
+> unedited and green; clippy (CI list + `delegation,a2a`, all targets,
+> `-D warnings`), `cargo check` under `net,cortex,delegation,a2a` and
+> `net,cortex,tool,publish,payments,consent,org`, `typecheck:tests` and
+> rustfmt clean. The live org-admitted principal (R6) is WS-F's: it needs the
+> gateway setter (WS-D) as well.
 
 ### WS-D — Caller flow on `CapabilityGateway`
 

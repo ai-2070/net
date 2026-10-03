@@ -54,16 +54,14 @@ use net_payments::flow::a2a::json::{self as boundary, A2aBoundaryError};
 use net_payments::flow::mesh::EngineTaskAdmissionGate;
 
 use crate::a2a::{
-    executor_timeout, A2aServeHandle, ExecutorTsfn, NodeTaskExecutor, Registered, TaskBriefJs,
+    executor_timeout, invalid, A2aServeHandle, ExecutorTsfn, NodeTaskExecutor, Registered,
+    TaskBriefJs,
 };
 use crate::enrollment::mesh_over;
 
 /// The stable prefix of a journal-ownership refusal; `errors.ts` maps it to
 /// `JournalOwnedElsewhereError`.
 pub(crate) const ERR_JOURNAL_OWNED_ELSEWHERE: &str = "a2a:journal_owned_elsewhere:";
-/// The stable prefix of a refusal of the caller's own input — never a
-/// transport failure, never worth retrying unchanged.
-pub(crate) const ERR_INVALID_ARGUMENT: &str = "a2a:invalid_argument:";
 
 /// How long a JS preflight may take (dispatch + Promise settlement) before
 /// it counts as a refusal. Below the caller's 30 s `A2A_CALL_TIMEOUT`, which
@@ -71,10 +69,6 @@ pub(crate) const ERR_INVALID_ARGUMENT: &str = "a2a:invalid_argument:";
 /// rather than a transport timeout (plan D3, review R3). Headroom, not a
 /// guarantee: a slow network can still turn it into a caller timeout.
 pub(crate) const PREFLIGHT_BUDGET: Duration = Duration::from_secs(5);
-
-pub(crate) fn invalid(msg: impl std::fmt::Display) -> Error {
-    Error::from_reason(format!("{ERR_INVALID_ARGUMENT} {msg}"))
-}
 
 /// The admission journal's refusal, with `OwnedElsewhere` on its own prefix
 /// — it is the one an operator acts on directly (stop the other holder, or

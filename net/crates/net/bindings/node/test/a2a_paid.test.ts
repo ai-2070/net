@@ -21,7 +21,8 @@ import { describe, expect, it } from 'vitest'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const binding: any = await import('../index')
-const { NetMesh, PaymentProvider } = binding
+const { NetMesh, PaymentProvider, a2aDocument, a2aU64 } = binding
+const { classifyError, PaymentRefusedError, A2aInvalidArgumentError } = await import('../errors')
 const HAS_PAID_A2A = typeof PaymentProvider?.prototype?.serveA2aConfigured === 'function'
 
 const PSK = 'a7'.repeat(32)
@@ -490,4 +491,191 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — provider (WS-B)', () => {
       }
     })
   }, 60000)
+})
+
+/** The native message of a rejection, wrapped back into an Error. */
+async function rejected(p: Promise<unknown>): Promise<Error> {
+  return new Error(await rejection(p))
+}
+
+/**
+ * A `prepared` document naming a reservation the provider never minted.
+ * Built as text so the u64 node id is written exactly.
+ */
+function fakePrepared(providerNode: bigint, taskId: string, prompt: string, service = PAID): string {
+  return (
+    `{"provider_node":${providerNode},` +
+    `"brief":{"task_id":"${taskId}","prompt":"${prompt}","context_refs":[],"tags":[],` +
+    `"service":"${service}","revision":"${REVISION}"},` +
+    `"offer_hash":"00",` +
+    `"reservation":{"task_id":"${taskId}","admission_id":"00",` +
+    `"capability":"${providerNode}/net.a2a.task/${service}","commitment":"00",` +
+    `"purchase_hash":"00","pricing_terms":null,"expires_at":0}}`
+  )
+}
+
+describe.skipIf(!HAS_PAID_A2A)('paid a2a — requester raw verbs (WS-C)', () => {
+  // Review R1 / plan D2a: the documents carry u64 integers a JS double
+  // cannot hold. The readers keep them exact; JSON.parse does not.
+  it('reads nested documents and u64 fields losslessly', () => {
+    const big = 9007199254740993n // 2^53 + 1: not representable as a double
+    expect(BigInt(Number(big))).not.toBe(big)
+    const env =
+      `{"status":"ok","prepared":{"provider_node":${big},"brief":{"task_id":"t"}},` +
+      `"quote":{"expires_at_ns":18446744073709551615}}`
+
+    const prepared = a2aDocument(env, '/prepared')
+    expect(a2aU64(prepared, '/provider_node')).toBe(big)
+    expect(a2aU64(env, '/quote/expires_at_ns')).toBe(18446744073709551615n)
+    expect(a2aDocument(env, '')).toContain(`"provider_node":${big}`)
+    // The negative control: the ordinary JS round trip changes the id.
+    expect(JSON.stringify(JSON.parse(prepared))).not.toContain(String(big))
+
+    const refusals: Array<() => unknown> = [
+      () => a2aDocument(env, '/nope'),
+      () => a2aDocument('not json', ''),
+      () => a2aU64(env, '/status'),
+      () => a2aU64('{"n":-1}', '/n'),
+      () => a2aU64('{"n":1.5}', '/n'),
+    ]
+    for (const call of refusals) {
+      let caught: unknown
+      try {
+        call()
+      } catch (e) {
+        caught = e
+      }
+      expect(classifyError(caught)).toBeInstanceOf(A2aInvalidArgumentError)
+    }
+  })
+
+  it('describes a configured catalog, and a free-path provider has nothing to describe', async () => {
+    await withPair(async (p, provider, r) => {
+      const terms = await paidTerms(p, provider)
+      const handle = await provider.serveA2aConfigured(
+        executor([]),
+        { [PAID]: offer(terms), [FREE]: offer() },
+        tmp('journal.json'),
+      )
+      try {
+        let raw: string | undefined
+        for (let i = 0; i < 8 && raw === undefined; i++) {
+          try {
+            raw = await r.describeA2a(p.nodeId())
+          } catch {
+            await sleep(100)
+          }
+        }
+        expect(raw).toBeDefined()
+        const offers = Object.fromEntries(JSON.parse(raw!).map((o: Any) => [o.service_id, o]))
+        expect(Object.keys(offers).sort()).toEqual([FREE, PAID].sort())
+        expect(offers[PAID].pricing_terms).toBe(terms)
+        expect(offers[FREE].pricing_terms ?? null).toBeNull()
+        expect(a2aU64(raw!, '/0/bounds/max_in_flight')).toBe(4n)
+      } finally {
+        handle.stop()
+      }
+      // The legacy free path serves no describe service.
+      const legacy = await p.serveA2a(async () => 'blob://x')
+      try {
+        expect(await rejection(r.describeA2a(p.nodeId()))).toMatch(/^a2a: describeA2a: /)
+      } finally {
+        legacy.stop()
+      }
+    })
+  }, 60000)
+
+  it('submitTaskPaid: an unpaid proof is a PaymentRefusedError with its schematic, before the executor', async () => {
+    await withPair(async (p, provider, r) => {
+      const ran: Ran[] = []
+      const terms = await paidTerms(p, provider)
+      const handle = await provider.serveA2aConfigured(
+        executor(ran),
+        { [PAID]: offer(terms) },
+        tmp('journal.json'),
+      )
+      const prepared = fakePrepared(p.nodeId(), 'raw-unpaid', 'summarize')
+      const proof = '{"quote_id":"","binding_sig":[]}'
+      try {
+        // Retry only transport noise from the freshly connected pair.
+        let caught: unknown
+        for (let i = 0; i < 8; i++) {
+          try {
+            await r.submitTaskPaid(prepared, proof)
+            caught = undefined
+            break
+          } catch (e) {
+            caught = e
+            if (!(e as Error).message.startsWith('a2a: ')) break
+          }
+          await sleep(100)
+        }
+        const typed = classifyError(caught) as InstanceType<typeof PaymentRefusedError>
+        expect(typed, String((caught as Error)?.message)).toBeInstanceOf(PaymentRefusedError)
+        expect(typed.message.length).toBeGreaterThan(0)
+        expect(typed.schematic).toBeDefined()
+        const schematic = JSON.parse(typed.schematic!)
+        expect(schematic.object).toBe('net.payment.failure@1')
+        expect(schematic.handler_executed).toBe(false)
+        expect(schematic.stage).toBe('admission')
+        expect(schematic.reason).toBe('no_reservation')
+        // No reservation means the provider cannot rule out a payment made
+        // elsewhere, so it does not claim one did not happen: `unknown`, the
+        // conservative row (Python's twin submits after a real prepare and
+        // so sees `no`).
+        expect(schematic.funds_moved).toBe('unknown')
+        expect(ran).toEqual([])
+      } finally {
+        handle.stop()
+      }
+    })
+  }, 60000)
+
+  it('submitTaskPaid refuses malformed documents and an undeliverable brief locally', async () => {
+    const mesh = await meshUnstarted()
+    await mesh.start()
+    try {
+      const proof = '{"quote_id":"q","binding_sig":[]}'
+      for (const bad of ['{}', 'not json']) {
+        expect(classifyError(await rejected(mesh.submitTaskPaid(bad, proof)))).toBeInstanceOf(
+          A2aInvalidArgumentError,
+        )
+      }
+      expect(
+        classifyError(await rejected(mesh.submitTaskPaid(fakePrepared(mesh.nodeId(), 'p', 'x'), 'nope'))),
+      ).toBeInstanceOf(A2aInvalidArgumentError)
+      // Past the encoded-brief limit: refused before any packet.
+      const huge = fakePrepared(mesh.nodeId(), 'big', 'x'.repeat(256 * 1024))
+      expect(await rejection(mesh.submitTaskPaid(huge, proof))).toMatch(
+        /^a2a:invalid_argument: submitTaskPaid: /,
+      )
+    } finally {
+      await mesh.shutdown()
+    }
+  }, 30000)
+
+  it('setA2aOrgCaller(null) is accepted and the requester verbs keep working', async () => {
+    await withPair(async (p, provider, r) => {
+      const handle = await provider.serveA2aConfigured(
+        executor([]),
+        { [FREE]: offer() },
+        tmp('journal.json'),
+      )
+      try {
+        r.setA2aOrgCaller(null)
+        let taskId: string | undefined
+        for (let i = 0; i < 8 && taskId === undefined; i++) {
+          try {
+            taskId = await r.submitTask(p.nodeId(), 'echo', [], [], 'org-null', FREE, REVISION)
+          } catch {
+            await sleep(100)
+          }
+        }
+        expect(taskId).toBe('org-null')
+        await waitState(r, p.nodeId(), 'org-null', 'completed')
+      } finally {
+        handle.stop()
+      }
+    })
+  }, 30000)
 })

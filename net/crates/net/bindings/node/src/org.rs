@@ -121,6 +121,15 @@ pub struct OrgClient {
     inner: ArcSwapOption<net_sdk::org::OrgClient>,
 }
 
+impl OrgClient {
+    /// The SDK client behind this handle, for the A2A requester verbs that
+    /// present it (`setA2aOrgCaller`). `None` once closed.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn shared(&self) -> Option<Arc<net_sdk::org::OrgClient>> {
+        self.inner.load_full()
+    }
+}
+
 #[napi]
 impl OrgClient {
     /// Bind credentials to a mesh.
