@@ -3,9 +3,9 @@
 ## Status
 
 In progress, 2026-10-03. Targets the release after 0.39. Branch
-`LZL0/go-blobs`. Plan accepted for implementation at `e33ede5`. **S1 done
-locally 2026-10-03** (evidence under S1; exact-head CI still owed). S2–S8 not
-started.
+`LZL0/go-blobs`. Plan accepted for implementation at `e33ede5`. **S1 and S2
+done locally 2026-10-03** (S1 committed as `aaa797c`; evidence under each
+slice; exact-head CI still owed). S3–S8 not started.
 
 Reviewed twice before implementation (`d1b6f29`, then `317168c`). The first
 review accepted the direction and held on nine findings (R1–R9). The second
@@ -467,6 +467,64 @@ both peers:
   Go matches that sentinel. Manifest-entry path refusal (`dir.rs:906`) is
   covered by the Rust tests, because a hostile manifest can't be built from
   Go.
+
+**Done locally, 2026-10-03.** Exact-head CI is still owed.
+
+- **Header closure.** The four functions are declared in the transfer
+  section of `go/net.h` and `include/net.go.h`, the same place
+  `net_fetch_blob` / `net_serve_blob_transfer` already were. No
+  `#define NET_*` was added: Go maps the codes numerically, as `blob.go`
+  already did, so the ABI-commit rule's constant trigger doesn't apply.
+- **Signature pin.** `TestABIStabilityTransportDeclsMatchCanonicalHeader`
+  checks that every function in the canonical `include/net_transport.h` is
+  declared in `go/net.h` with identical parameters. `header_parity_test.go`
+  only keeps `go/net.h` and `net.go.h` in step, and neither of those is the
+  transport surface's own header.
+- **Code pin.** `TestABIStabilityTransferCodes` maps every `NET_ERR_*` in
+  `net_transport.h` through the Go mapper. To make that possible, the mapper
+  now takes a plain `int` (`transferErrorFromInt`).
+- **API.** `(*MeshBlobAdapter).StoreDir`, `(*MeshNode).FetchDir`,
+  `(*MeshNode).DirManifestRead → *DirManifest`, and
+  `(*MeshNode).FetchBlobDiscovered`, in `go/transfer.go`. `StoreDir` hangs
+  off the adapter, not the node (Node's `storeDir` is on the mesh), because
+  the C call takes only the adapter.
+- **New sentinels**, all wrapping `ErrTransfer`: `ErrTransferAllPeersFailed`,
+  `ErrDirInvalidManifest`, `ErrDirPathInvalid`, `ErrDirIO`; plus
+  `ErrFeatureNotBuilt` (−107). Existing sentinels and messages are
+  unchanged, apart from −202, which now returns
+  `ErrTransferAllPeersFailed` (same message, still an `ErrTransfer`).
+- **Correction to the S2 witness text above:** the manifest has **no
+  per-entry size** (`DirEntry` is `path` plus an externally tagged `kind`).
+  The manifest test instead checks path order, the one-kind-per-entry
+  decode, the `Dir` entry for the empty directory, the file mode (0 on
+  Windows), and that each embedded ref's hash equals a fresh publish of the
+  same bytes. Content addressing makes that the oracle.
+
+Evidence (Windows, same toolchain as S1):
+
+- `go test -count=1 -run '^(TestABIStability|TestTransfer|TestBlob|TestHeaderParity)' .`:
+  ok (9 transfer tests in `go/transfer_test.go`).
+- `go test -race -count=3 -run '^(TestBlob|TestTransfer)' .`: ok.
+- `go test -count=1 -v .`: 366 pass, 13 skip, 0 fail, 7.2 s. (S1's 188 s
+  full run was a slow outlier, not a different test set.)
+- Mutations, each confirmed to compile and confirmed killed:
+  - −200 mapped to `ErrDirInvalidManifest`: `TestABIStabilityTransferCodes`,
+    `TestTransferDirManifestMissingContent`
+  - −210 unmapped: `TestABIStabilityTransferCodes`,
+    `TestTransferDirManifestNotAManifest`
+  - `Dir` kind dropped in decode: `TestTransferDirManifestRead`
+  - embedded blob bytes corrupted in decode: `TestTransferDirManifestRead`
+  - `DirStats` fields swapped: `TestTransferDirRoundTrip`
+  - `go/net.h`'s `net_fetch_dir` losing a `const`:
+    `TestABIStabilityTransportDeclsMatchCanonicalHeader`,
+    `TestHeaderParityWithCrateHeader`
+
+  A `uint64_t → uint32_t` drift doesn't compile (cgo type-checks the call),
+  so the compile is the guard for width changes and the tests guard what
+  cgo accepts.
+- CI: the race step is now "Run Go blob + transfer tests (-race)" with
+  `GO_TEST_RUN="^(TestBlob|TestTransfer)"`, and a "Witness roster — Go
+  transfer binding (9)" step is added.
 
 ### S3: RedEX replication and greedy Dataforts
 

@@ -463,9 +463,33 @@ var (
 	ErrTransferInvalidArgument = fmt.Errorf("%w: invalid argument", ErrTransfer)
 	// ErrTransferBackend - some other substrate transfer failure.
 	ErrTransferBackend = fmt.Errorf("%w: backend failure", ErrTransfer)
+	// ErrTransferAllPeersFailed - a discovered fetch found no connected
+	// peer that served the content.
+	ErrTransferAllPeersFailed = fmt.Errorf("%w: no connected peer served it", ErrTransfer)
+	// ErrDirInvalidManifest - the manifest ref named bytes that were
+	// fetched but are not a directory manifest. A manifest the holder
+	// does not have is ErrTransferNotFound instead.
+	ErrDirInvalidManifest = fmt.Errorf("%w: not a directory manifest", ErrTransfer)
+	// ErrDirPathInvalid - a destination or manifest path that cannot be
+	// written safely (for example a destination with no final name).
+	ErrDirPathInvalid = fmt.Errorf("%w: unsafe directory path", ErrTransfer)
+	// ErrDirIO - filesystem I/O failed while reconstructing a tree.
+	ErrDirIO = fmt.Errorf("%w: directory I/O failed", ErrTransfer)
 )
 
+// ErrFeatureNotBuilt - libnet was built without the features this call
+// needs, so its symbol resolves to a stub (NET_ERR_FEATURE_NOT_BUILT).
+// Transfer calls wrap it in ErrTransfer as well.
+var ErrFeatureNotBuilt = errors.New("libnet was built without this feature")
+
 func transferErrorFromCode(code C.int) error {
+	return transferErrorFromInt(int(code))
+}
+
+// transferErrorFromInt is the mapping itself, on a plain int so the ABI
+// tests can drive it from the header's constants (a _test.go file cannot
+// construct a C.int).
+func transferErrorFromInt(code int) error {
 	switch code {
 	case 0:
 		return nil
@@ -474,7 +498,7 @@ func transferErrorFromCode(code C.int) error {
 	case -201:
 		return ErrTransferHashMismatch
 	case -202:
-		return fmt.Errorf("%w: no connected peer served it", ErrTransfer)
+		return ErrTransferAllPeersFailed
 	case -203:
 		return fmt.Errorf("%w: cancelled", ErrTransfer)
 	case -204:
@@ -489,8 +513,16 @@ func transferErrorFromCode(code C.int) error {
 		return fmt.Errorf("%w: panic at the FFI boundary", ErrTransfer)
 	case -209:
 		return ErrTransferInvalidArgument
+	case -210:
+		return ErrDirInvalidManifest
+	case -211:
+		return ErrDirPathInvalid
+	case -213:
+		return ErrDirIO
+	case -107:
+		return fmt.Errorf("%w: %w", ErrTransfer, ErrFeatureNotBuilt)
 	default:
-		return fmt.Errorf("%w: unknown code %d", ErrTransfer, int(code))
+		return fmt.Errorf("%w: unknown code %d", ErrTransfer, code)
 	}
 }
 

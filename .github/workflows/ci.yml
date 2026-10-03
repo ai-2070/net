@@ -4820,12 +4820,12 @@ jobs:
       # run again with it — through the same runner, so a hang still reports
       # native frames. GO_TEST_RUN makes the runner fail a filter that
       # matches nothing. (GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md, S1.)
-      - name: Run Go blob tests (-race)
+      - name: Run Go blob + transfer tests (-race)
         working-directory: go
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
           GO_TEST_RACE: "1"
-          GO_TEST_RUN: "^TestBlob"
+          GO_TEST_RUN: "^(TestBlob|TestTransfer)"
         run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh
 
       # Pins the blob witnesses the two runs above execute: lexical
@@ -4850,6 +4850,12 @@ jobs:
             TestBlobPrometheusText \
             TestBlobCloseRacesInFlightFetches \
             TestBlobTwoNodeFetch || exit 1
+
+      - name: Witness roster — Go transfer binding (9)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label transfer_test --mode decl             --source transfer_test.go             TestTransferDirRoundTrip             TestTransferDirManifestRead             TestTransferDirManifestMissingContent             TestTransferDirManifestNotAManifest             TestTransferFetchDirRefusesRootDestination             TestTransferFetchBlobDiscovered             TestTransferEmptyManifestRefIsRefusedBeforeCgo             TestTransferStoreDirAfterClose             TestTransferStoreDirMissingRoot || exit 1
 
       # === the Go org facade live cells ==
       # The run above EXECUTED these 6 live cells (3 shapes x {same-org,

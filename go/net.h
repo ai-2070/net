@@ -1841,8 +1841,53 @@ int net_fetch_blob(const net_meshnode_t* node,
                    uint8_t** out_bytes,
                    size_t* out_len);
 
-/* Free a buffer returned by net_fetch_blob. */
+/* Free a buffer returned by net_fetch_blob / net_fetch_blob_discovered /
+ * net_store_dir. */
 void net_transport_free_buffer(uint8_t* ptr, size_t len);
+
+/* Like net_fetch_blob, but discovers the holder among connected peers.
+ * Returns NET_ERR_TRANSFER_ALL_PEERS_FAILED (-202) if no connected peer
+ * has the content. */
+int net_fetch_blob_discovered(const net_meshnode_t* node,
+                              const uint8_t* hash,
+                              uint8_t** out_bytes,
+                              size_t* out_len);
+
+/* ---- Directory transfer (mirrors net_transport.h) ----
+ *
+ * Errors are the transfer band plus NET_ERR_DIR_INVALID_MANIFEST (-210),
+ * NET_ERR_DIR_PATH_INVALID (-211) and NET_ERR_DIR_IO (-213); the
+ * constants themselves are defined in net_transport.h.
+ */
+
+/* Store the tree at `root_path` as blobs in `adapter`. Writes the encoded
+ * manifest BlobRef to (*out_manifest_ref, *out_len); free it with
+ * net_transport_free_buffer. */
+int net_store_dir(const net_mesh_blob_adapter_t* adapter,
+                  const char* root_path,
+                  uint8_t** out_manifest_ref,
+                  size_t* out_len);
+
+/* Fetch the tree named by the encoded manifest ref from `source_id` and
+ * reconstruct it under `dest_path`. *out_files / *out_bytes may be NULL;
+ * both are set to 0 on entry. */
+int net_fetch_dir(const net_meshnode_t* node,
+                  uint64_t source_id,
+                  const uint8_t* manifest_ref,
+                  size_t manifest_ref_len,
+                  const char* dest_path,
+                  uint64_t* out_files,
+                  uint64_t* out_bytes);
+
+/* Fetch + decode the manifest without reconstructing the tree, as JSON
+ * in (*out_json, *out_len); free with net_free_string. (NULL, 0) on
+ * entry, so a failed call reads (NULL, 0). */
+int net_dir_manifest_read(const net_meshnode_t* node,
+                          uint64_t source_id,
+                          const uint8_t* manifest_ref,
+                          size_t manifest_ref_len,
+                          char** out_json,
+                          size_t* out_len);
 
 /* Caller frees *out_data via net_blob_free_buffer when 0 is returned. */
 int net_mesh_blob_adapter_fetch(

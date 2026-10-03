@@ -31,6 +31,7 @@ package net
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -230,3 +231,82 @@ func TestABIStabilityParseMigrationErrorRoundTrip(t *testing.T) {
 	}
 }
 
+
+// TestABIStabilityTransportDeclsMatchCanonicalHeader pins go/net.h's
+// copies of the transport functions to the canonical
+// include/net_transport.h. header_parity_test.go keeps go/net.h and
+// net.go.h in step, but neither of those is the transport surface's
+// own header, so without this a parameter edit there would leave the
+// Go mirror silently stale. (GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md,
+// "Header closure".)
+func TestABIStabilityTransportDeclsMatchCanonicalHeader(t *testing.T) {
+	canonical := parseHeader(t, "../net/crates/net/include/net_transport.h")
+	mirror := parseHeader(t, "net.h")
+	if len(canonical.fns) == 0 {
+		t.Fatal("parsed no functions from net_transport.h")
+	}
+	for name, params := range canonical.fns {
+		got, ok := mirror.fns[name]
+		if !ok {
+			t.Errorf("go/net.h does not declare %s (declared in net_transport.h)", name)
+			continue
+		}
+		if got != params {
+			t.Errorf("%s parameters differ:\n  net_transport.h: (%s)\n  go/net.h:        (%s)", name, params, got)
+		}
+	}
+}
+
+// TestABIStabilityTransferCodes pins every transfer-band constant in
+// net_transport.h to the Go sentinel callers match with errors.Is, and
+// that each one is still an ErrTransfer.
+func TestABIStabilityTransferCodes(t *testing.T) {
+	want := map[string]error{
+		"NET_ERR_TRANSFER_NOT_FOUND":            ErrTransferNotFound,
+		"NET_ERR_TRANSFER_HASH_MISMATCH":        ErrTransferHashMismatch,
+		"NET_ERR_TRANSFER_ALL_PEERS_FAILED":     ErrTransferAllPeersFailed,
+		"NET_ERR_TRANSFER_ENGINE_NOT_INSTALLED": ErrTransferEngineNotInstalled,
+		"NET_ERR_TRANSFER_BACKEND":              ErrTransferBackend,
+		"NET_ERR_TRANSFER_INVALID_ARGUMENT":     ErrTransferInvalidArgument,
+		"NET_ERR_DIR_INVALID_MANIFEST":          ErrDirInvalidManifest,
+		"NET_ERR_DIR_PATH_INVALID":              ErrDirPathInvalid,
+		"NET_ERR_DIR_IO":                        ErrDirIO,
+		// Mapped, but to a message rather than a dedicated sentinel.
+		"NET_ERR_TRANSFER_CANCELLED":     ErrTransfer,
+		"NET_ERR_TRANSFER_NULL_POINTER":  ErrTransfer,
+		"NET_ERR_TRANSFER_SHUTTING_DOWN": ErrTransfer,
+		"NET_ERR_TRANSFER_PANIC":         ErrTransfer,
+	}
+	h := parseHeader(t, "../net/crates/net/include/net_transport.h")
+	seen := 0
+	for name, raw := range h.consts {
+		if !strings.HasPrefix(name, "NET_ERR_") {
+			continue
+		}
+		seen++
+		sentinel, ok := want[name]
+		if !ok {
+			t.Errorf("%s (%s) has no pinned Go mapping; add it here and to transferErrorFromInt", name, raw)
+			continue
+		}
+		code, err := strconv.Atoi(raw)
+		if err != nil {
+			t.Fatalf("%s = %q is not an integer", name, raw)
+		}
+		got := transferErrorFromInt(code)
+		if !errors.Is(got, sentinel) || !errors.Is(got, ErrTransfer) {
+			t.Errorf("%s (%d) maps to %v, want %v (and ErrTransfer)", name, code, got, sentinel)
+		}
+		if strings.Contains(got.Error(), "unknown code") {
+			t.Errorf("%s (%d) falls through to the unknown-code branch", name, code)
+		}
+	}
+	if seen != len(want) {
+		t.Errorf("net_transport.h has %d NET_ERR_* constants, the pin table has %d", seen, len(want))
+	}
+	// NET_ERR_FEATURE_NOT_BUILT (-107) lives in net.h, not the transport
+	// band; the feature-off transport stubs return it.
+	if got := transferErrorFromInt(-107); !errors.Is(got, ErrFeatureNotBuilt) || !errors.Is(got, ErrTransfer) {
+		t.Errorf("-107 maps to %v, want ErrFeatureNotBuilt (and ErrTransfer)", got)
+	}
+}
