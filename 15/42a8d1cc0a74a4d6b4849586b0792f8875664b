@@ -1,0 +1,23 @@
+net/crates/net/bindings/node/test/a2a_paid.test.ts
+  s_b3a4389dffe7a9::t_6dce5b8269e628 361-381
+net/crates/net/bindings/node/src/a2a_paid.rs
+  s_b3a4389dffe7a9::t_7cfe11832c33ad 362,370-385
+  s_b3a4389dffe7a9::t_bfb1fc1e5a4208 50
+  s_b3a4389dffe7a9::t_5d0ca30346c7f3 386-387
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1542a8d1cc0a74a4d6b4849586b0792f8875664b",
+  "prompts": {},
+  "sessions": {
+    "s_b3a4389dffe7a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d84c0f0d-cc37-4675-8edb-32c0a7dd59f5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
