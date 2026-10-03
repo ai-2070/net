@@ -210,9 +210,18 @@ export function setA2aOrgCaller(
   org: OrgClient | TypedOrgClient | NapiOrgClient | null,
 ): void {
   const native = nativeOrgClientOf(org) as NapiOrgClient | null;
-  if (target instanceof NapiCapabilityGateway) {
+  if (isCapabilityGateway(target)) {
     target.setA2aOrgCaller(native);
     return;
   }
   nativeMesh(target).setA2aOrgCaller(native);
+}
+
+/**
+ * Guarded: a `@net-mesh/core` built without `payments` exports no
+ * `CapabilityGateway`, and `instanceof undefined` throws — which would break
+ * the mesh slot too, though it needs only `a2a` + `org`.
+ */
+function isCapabilityGateway(target: object): target is NapiCapabilityGateway {
+  return typeof NapiCapabilityGateway === 'function' && target instanceof NapiCapabilityGateway;
 }
