@@ -17,6 +17,11 @@ Cells:
   imports ``net`` because a native object is what it tests.
 - ``refusals`` — the boundary's refusals. Also imports ``net``: the first
   control is that the *native* gateway still refuses an SDK ``MeshNode``.
+- ``same_org`` — review R6 from the SDK: a provider serving under
+  ``principal="same_org"`` (all five services PROTECTED), an SDK
+  ``OrgClient`` installed on BOTH slots — the ``MeshNode``'s (raw verbs) and
+  the gateway's (the paid lifecycle) — then cleared, denying before launch.
+  Needs ``--scenario-dir``: the generated same-org artifacts.
 
 ``sync`` and ``async`` import the standard library and ``net_sdk`` only.
 Every cell prints ``CELL_OK <json receipt>`` on success and exits 0; any
@@ -295,19 +300,172 @@ def cell_refusals() -> dict:
         return receipt
 
 
+def _converge(provider, caller, attempt, timeout: float = 60.0):
+    """Scoped discovery ships on the announce path: announce, retry."""
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        for node in (provider, caller):
+            try:
+                node.announce_capabilities({})
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            got = attempt()
+            if got is not None:
+                return got
+        except Exception as e:  # noqa: BLE001
+            last = e
+        time.sleep(0.5)
+    raise AssertionError(f"never converged (last: {last!r})")
+
+
+def _refused(fn) -> bool:
+    try:
+        fn()
+    except Exception:  # noqa: BLE001
+        return True
+    return False
+
+
+def cell_same_org(scenario_dir: str) -> dict:
+    import net_sdk.org as org
+
+    with open(os.path.join(scenario_dir, "manifest.json"), encoding="utf-8") as f:
+        m = json.load(f)
+
+    def path(rel: str) -> str:
+        return os.path.join(scenario_dir, rel)
+
+    def mesh(seed_hex: str):
+        return net_sdk.MeshNode(
+            bind_addr="127.0.0.1:0",
+            psk=m["psk_hex"],
+            identity_seed=bytes.fromhex(seed_hex),
+            heartbeat_interval_ms=200,
+        )
+
+    with tempfile.TemporaryDirectory() as d:
+        provider_node = mesh(m["provider"]["seed_hex"])
+        caller = mesh(m["caller"]["seed_hex"])
+        org.install_org_authority(provider_node, path(m["provider"]["authority_dir"]))
+        org.install_org_authority(caller, path(m["caller"]["authority_dir"]))
+        _handshake(caller, provider_node)
+        provider_node.start()
+        caller.start()
+        target = provider_node.node_id
+
+        ran: list = []
+        owners: list = []
+        provider = create_payment_provider(
+            provider_node,
+            os.path.join(d, "engine.json"),
+            billing_log_path=os.path.join(d, "billing.jsonl"),
+            unsafe_dev_mock_facilitator=True,
+        )
+        terms = provider.pricing_terms(f"{target}/net.a2a.task/{PAID}", MOCK_REQS)
+
+        async def run_task(task_id, prompt, refs, tags, *, service, revision):
+            ran.append(task_id)
+            return f"blob://{task_id}"
+
+        async def preflight(owner_json, offer_json, brief_json):
+            owners.append(owner_json)
+            return None
+
+        handle = provider.serve_a2a_configured(
+            run_task,
+            {PAID: _offer(terms)},
+            os.path.join(d, "journal.json"),
+            principal="same_org",
+            preflight=preflight,
+        )
+        gateway = create_capability_gateway(
+            caller,
+            payment_policy_path=os.path.join(d, "spend-policy.json"),
+            payment_profile="dev_test",
+            a2a_purchase_path=os.path.join(d, "a2a-purchases.json"),
+        )
+
+        # Control: PROTECTED really is protected.
+        assert _refused(lambda: caller.describe_a2a(target)), "an un-admitted describe got in"
+        denied0 = json.loads(gateway.prepare_task(target, PAID, "x", task_id="org-denied-0"))
+        assert denied0["status"] != "ok", denied0
+
+        with open(path(m["caller"]["membership_path"]), "rb") as f:
+            membership = f.read()
+        with open(path(m["caller"]["dispatcher_path"]), "rb") as f:
+            dispatcher = f.read()
+        client = org.OrgClient.bind(caller, org.OrgCredentials(membership, dispatcher, [], []))
+        caller.set_a2a_org_caller(client)  # the MeshNode's slot (raw verbs)
+        set_a2a_org_caller(gateway, client)  # the gateway's slot (paid lifecycle)
+
+        offers = _converge(provider_node, caller, lambda: caller.describe_a2a(target))
+        assert [o["service_id"] for o in json.loads(offers)] == [PAID], offers
+
+        def prepared_ok():
+            env = json.loads(
+                gateway.prepare_task(target, PAID, "summarize under org", task_id="org-task-1")
+            )
+            return env if env["status"] == "ok" else None
+
+        env = _converge(provider_node, caller, prepared_ok)
+        prepared = json.dumps(env["prepared"])
+        bought = json.loads(gateway.purchase_task(prepared))
+        assert bought["status"] == "paid", bought
+        sent = json.loads(gateway.submit_task(prepared))
+        assert sent["status"] == "accepted", sent
+
+        def completed():
+            raw = caller.task_status(target, "org-task-1")
+            if raw is not None and json.loads(raw)["state"]["state"] == "completed":
+                return raw
+            return None
+
+        _converge(provider_node, caller, completed)
+        assert caller.cancel_task(target, "org-task-1") is False  # already terminal
+        assert ran == ["org-task-1"], ran
+        owner = json.loads(owners[-1])
+        assert owner["kind"] == "entity", owner
+        assert owner["entity"] == m["caller"]["entity_id_hex"], owner
+
+        # Clear both slots: denied before launch.
+        set_a2a_org_caller(gateway, None)
+        denied1 = json.loads(gateway.prepare_task(target, PAID, "x", task_id="org-denied-1"))
+        assert denied1["status"] != "ok", denied1
+        caller.set_a2a_org_caller(None)
+        assert _refused(lambda: caller.describe_a2a(target)), "a cleared identity still got in"
+        assert ran == ["org-task-1"], ran
+
+        handle.stop()
+        client.close()
+        handle = provider = gateway = client = None
+        gc.collect()
+        caller.shutdown()
+        provider_node.shutdown()
+        return {"ran": ran, "owner_kind": owner["kind"]}
+
+
 CELLS = {
     "sync": cell_sync,
     "async": cell_async,
     "native": cell_native,
     "refusals": cell_refusals,
+    "same_org": cell_same_org,
 }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cell", required=True, choices=sorted(CELLS))
+    parser.add_argument("--scenario-dir", help="the same-org artifacts (same_org cell)")
     args = parser.parse_args()
-    receipt = CELLS[args.cell]()
+    if args.cell == "same_org":
+        if not args.scenario_dir:
+            parser.error("--scenario-dir is required for the same_org cell")
+        receipt = cell_same_org(args.scenario_dir)
+    else:
+        receipt = CELLS[args.cell]()
     print("CELL_OK " + json.dumps(receipt, sort_keys=True))
     sys.stdout.flush()
     return 0

@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -112,9 +115,9 @@ def _probe_wheel() -> None:
 _probe_wheel()
 
 
-def _run(cell: str) -> dict:
+def _run(cell: str, *extra: str) -> dict:
     result = subprocess.run(
-        [sys.executable, str(_CONSUMER), "--cell", cell],
+        [sys.executable, str(_CONSUMER), "--cell", cell, *extra],
         env=_child_env(),
         capture_output=True,
         text=True,
@@ -151,3 +154,46 @@ def test_the_boundary_refusals_are_the_native_ones():
         "set_a2a_org_caller: AsyncCapabilityGateway has no paid-A2A lifecycle"
     ), r
     assert r["purchase_needs_policy"].startswith("a2a_purchase_path requires payment_policy_path"), r
+
+
+@pytest.fixture(scope="module")
+def same_org_scenario():
+    """Mint the same-org artifacts (`gen_subnet_scenario`'s org half) and
+    stage the shared owner audience — the Node twin's setup. Fresh per run:
+    the credentials expire. Plain ``makedirs``, not ``mkdtemp``: on Windows
+    an mkdtemp directory's owner-only ACL is refused by the audience-secret
+    loader."""
+    if shutil.which("cargo") is None:
+        pytest.skip("cargo not on PATH (scenario generation needs a Rust toolchain)")
+    outdir = os.path.join(tempfile.gettempdir(), f"paid-a2a-org-{uuid.uuid4().hex}")
+    os.makedirs(outdir)
+    subprocess.run(
+        [
+            "cargo", "run", "-q", "-p", "net-mesh-sdk",
+            "--features", "net,cortex,fixtures",
+            "--example", "gen_subnet_scenario", "--", outdir,
+        ],
+        cwd=str(_CRATE_ROOT),
+        check=True,
+        env=dict(_child_env(), CARGO_INCREMENTAL="0"),
+        timeout=1200,
+    )
+    with open(os.path.join(outdir, "manifest.json"), encoding="utf-8") as f:
+        m = json.load(f)
+    shutil.copyfile(
+        os.path.join(outdir, m["provider"]["authority_dir"], "owner-audience.key"),
+        os.path.join(outdir, m["caller"]["authority_dir"], "owner-audience.key"),
+    )
+    yield outdir
+    shutil.rmtree(outdir, ignore_errors=True)
+
+
+def test_a_same_org_identity_reaches_the_paid_lifecycle_on_both_slots(same_org_scenario):
+    """Review R6 from the SDK: an SDK OrgClient on the MeshNode's slot and
+    the gateway's, a paid task through a PROTECTED catalog, the preflight
+    seeing the admitted entity, and clearing both slots denying before
+    launch (the consumer asserts each step)."""
+    assert _run("same_org", "--scenario-dir", same_org_scenario) == {
+        "owner_kind": "entity",
+        "ran": ["org-task-1"],
+    }

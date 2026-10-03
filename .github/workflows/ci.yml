@@ -4442,7 +4442,7 @@ jobs:
       # SKIPS where no wheel loads (the sdk-py-tests job), so the floor and the
       # by-name check below are what keep a skip from reading as a pass, and
       # it FAILS on a partial or stubbed paid surface.
-      - name: Witness roster + floor — sdk-py paid A2A (4)
+      - name: Witness roster + floor — sdk-py paid A2A (5)
         working-directory: net/crates/net/sdk-py
         env:
           PYTHONFAULTHANDLER: "1"
@@ -4452,20 +4452,21 @@ jobs:
           pins="test_paid_a2a_runs_once_from_sdk_mesh_nodes
             test_paid_a2a_runs_from_async_mesh_nodes_via_to_thread
             test_the_factories_accept_a_native_net_mesh
-            test_the_boundary_refusals_are_the_native_ones"
+            test_the_boundary_refusals_are_the_native_ones
+            test_a_same_org_identity_reaches_the_paid_lifecycle_on_both_slots"
           # shellcheck disable=SC2086 # word-splitting $pins is the point
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_paid_a2a_sdk --mode decl \
             --source tests/test_paid_a2a_sdk.py $pins || exit 1
-          out=$(python -m pytest -v --timeout=300 --timeout-method=thread \
+          out=$(python -m pytest -v --timeout=900 --timeout-method=thread \
                   tests/test_paid_a2a_sdk.py 2>&1 | tee /dev/stderr)
           for pin in $pins; do
             printf '%s\n' "$out" | grep -qE "::${pin} PASSED" || {
               echo "::error::pinned paid-A2A witness ${pin} did not pass"; exit 1; }
           done
           n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
-          echo "sdk-py paid A2A: ${n:-0} (floor 4)"
-          if [ -z "$n" ] || [ "$n" -lt 4 ]; then
-            echo "::error::the sdk-py paid-A2A suite ran ${n:-0} rows, floor is 4 — \
+          echo "sdk-py paid A2A: ${n:-0} (floor 5)"
+          if [ -z "$n" ] || [ "$n" -lt 5 ]; then
+            echo "::error::the sdk-py paid-A2A suite ran ${n:-0} rows, floor is 5 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
