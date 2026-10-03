@@ -4875,6 +4875,16 @@ jobs:
           set -uo pipefail
           python3 ../.github/scripts/check-roster.py --label blob_registry_test --mode decl             --source blob_registry_test.go             TestBlobRegistryFilesystemRoundTrip             TestBlobRegistryDuplicateAndUnregister             TestBlobRegistryResolveUsesTheNamedAdapter             TestBlobRegistryRefusals             TestBlobRegistryRefusesEmbeddedNUL             TestABIStabilityBlobRegistryCodes || exit 1
 
+      # The v0.3 tree / range / repair surface. The two repair witnesses are
+      # `-tags test_helpers` (they drive fixtures-only seams) and run in the
+      # "Run Go tests (test_helpers)" step above; the rest run untagged and
+      # under the -race step's ^TestBlob filter.
+      - name: Witness roster — Go blob trees, ranges, repair (9)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label blob_tree_test --mode decl             --source blob_tree_test.go --source blob_repair_test.go --source abi_stability_test.go             TestBlobTreeStoreAndFetchRange             TestBlobTreeRangeContract             TestBlobTreeEncodingRefusals             TestBlobRefDescribeSmall             TestBlobTreeNodeCacheStates             TestBlobFeatureTagsMatchCore             TestBlobRepairRestoresADroppedDataShard             TestBlobRepairCountsAnUnrecoverableStripe             TestABIStabilityBlobV3ArityMatchesRust || exit 1
+
       # === the Go org facade live cells ==
       # The run above EXECUTED these 6 live cells (3 shapes x {same-org,
       # granted}, call+serve live two-node with verified-caller attribution

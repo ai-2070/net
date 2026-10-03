@@ -4,12 +4,13 @@
 
 In progress, 2026-10-03. Targets the release after 0.39. Branch
 `LZL0/go-blobs`. Plan accepted for implementation at `e33ede5`. **S1–S5
-done 2026-10-03** (S1 `aaa797c`, S2 `bb775f6`, S3 `3773b36`, S4 `ab12cff`;
-evidence under each slice). CI: S1's head ran green on every Go job, including the new
+done 2026-10-03** (S1 `aaa797c`, S2 `bb775f6`, S3 `3773b36`, S4 `ab12cff`,
+S5 `6e7f8e7`; evidence under each slice). **S6 done locally** except the
+cross-language fixture. CI: S1's head ran green on every Go job, including the new
 `-race` step and its roster. Its one failure was the Firefox browser
 witness `stage5_a_refused_connect_closes_rtc_and_hands_back_its_attempt`
 (wasm leaf), which no Go change reaches and which also fails
-intermittently on `master` (run 36970267483). S5b deferred (see S5b); S6–S8 not started.
+intermittently on `master` (run 36970267483). S5b deferred (see S5b); S7–S8 not started.
 
 Reviewed twice before implementation (`d1b6f29`, then `317168c`). The first
 review accepted the direction and held on nine findings (R1–R9). The second
@@ -918,6 +919,103 @@ construction through `new_v2` when set.
   variant, while Python's getters fall back to zero values, so raw outputs
   aren't comparable. The Python change is **test-only** fixture validation,
   with no change to the Python production API.
+
+**Done locally, 2026-10-03, with one item still owed** (the cross-language
+fixture, below).
+
+What landed, and where it differs from the text above:
+
+- **Six production entry points** in `src/ffi/blob.rs`, each with a
+  `blob_stubs.rs` twin, declared in `include/net.go.h` and `go/net.h`.
+- **`net_mesh_blob_adapter_new_v2` returns a code**, not a bare handle
+  (amended, as the acceptance review asked that constructor return handling
+  be settled at implementation). The signature is
+  `int new_v2(redex, id, int persistent, const char* options_json, net_mesh_blob_adapter_t** out_handle)`.
+  The legacy constructor returns NULL without saying why; `new_v2` returns
+  −1, −2, −3, −8 or −150, with `*out_handle` set to NULL first. Unknown
+  option keys are refused (`deny_unknown_fields`), so a misspelled
+  `tree_node_cache_bytes` fails instead of silently building an uncached
+  adapter. The nested `overflow` object is parsed exactly as the legacy
+  argument, through a shared `overflow_from_raw`.
+- **`NET_ERR_BLOB_INVALID_ARGUMENT = −150`.** From an inventory of every
+  `src/ffi` code: −120 is double-booked, −121…−128 are the mesh token
+  codes, −130…−137 NAT, and −140 the gang scheduler. −150 is unused
+  anywhere. It isn't `#define`d in a header (no `NET_ERR_BLOB_*` is), so
+  `TestABIStabilityBlobRegistryCodes`, which parses `src/ffi/blob.rs`,
+  forces it a mapping (`ErrBlobInvalidArgument`).
+- **`describe` adds an `encoding` field** for chunked refs
+  (`{"kind":"replicated"}` / `{"kind":"reed_solomon","k","m"}`). The
+  repair witness needs it to confirm RS(4,2) was really applied.
+- **Two `fixtures`-only seams, not one.** `net_mesh_blob_adapter_test_drop_data_chunk`
+  walks to the erasure leaf, deletes data chunk *i* of stripe *s* through
+  `MeshBlobAdapter::delete_chunk` (which drops the tree-node and chunk-file
+  cache entries too), and refuses to report success if the chunk still
+  fetches. `net_mesh_blob_adapter_test_chunk_present` lets Go prove
+  absence before repair and presence after. Both follow the
+  `net_mesh_test_send_refusal_attribution` precedent: gated on `fixtures`,
+  declared only in `go/blob_repair_testhelpers.go` (`//go:build test_helpers`),
+  absent from production headers, and present in the baseline (which is
+  generated from a test-helpers build).
+- **Export baseline:** exactly those 8 names added by hand, plus the
+  header's `# count` and an `# edited:` line, following the existing
+  convention. `check-ffi-exports.py --artifact …/net.dll` reports a match.
+- **Go** (`go/blob_tree.go`): `FetchRange`, `StoreTree(data, BlobEncoding)`,
+  `RepairBlob → *RepairReport`, `TreeNodeCacheStats → *TreeNodeCacheStats`
+  (nil without a cache), `DescribeBlobRef → *BlobRefInfo` (pointer fields
+  nil where absent), the four tag-string constants, and
+  `MeshBlobAdapterOpts.TreeNodeCacheBytes *uint64`, which routes
+  construction through `new_v2` only when set.
+
+Evidence (Windows, `libnet` rebuilt with the change):
+
+- Rust: `cargo tfl --retries 0 -E 'test(/^ffi::blob::/)'`: 10/10 pass,
+  including the five new `ffi::blob::tests::v3_contract` tests. Those cover
+  every contract row: each out-pointer nulled in turn, with the other half
+  of the pair left unwritten; outputs reset before a later failure; the
+  encoding rows (kind 2, Replicated with k or m, exactly one of k/m zero,
+  k+m = 256 refused; 0/0 defaults and 200+55 accepted); the range rows in
+  core's order (reversed, empty past the end, past the end, over the cap);
+  `describe` fields present or absent by shape; the cache absent / zero /
+  real; and unknown option keys refused.
+- Go untagged: 7 new tests in `go/blob_tree_test.go` pass. Among them:
+  the cross-chunk range, `Fetch` of a tree refused, and the five cache
+  states including legacy overflow-only construction unchanged.
+- Go `-tags test_helpers`: both repair witnesses pass.
+  - `TestBlobRepairRestoresADroppedDataShard`: 16 MiB, four distinct 4 MiB
+    chunks, RS(4,2). Data shard 1 of stripe 0 is dropped and proven
+    absent. Repair reports `chunks_restored == 1`, `stripes_repaired == 1`,
+    `stripes_unrecoverable == 0`. The shard is present again,
+    `FetchRange(0, size)` matches, and a second repair restores nothing
+    with the stripe already healthy.
+  - `TestBlobRepairCountsAnUnrecoverableStripe`: three shards dropped
+    (more than m), giving a nil error and `stripes_unrecoverable == 1`.
+- Mutations (Go side, each compiles), all killed: `FetchRange` start/end
+  swapped (6 tests); encoding ignored (3, including both repair tests);
+  `describe`'s encoding dropped (3); the cache option ignored (4
+  subtests); −150 unmapped (3); `new_v2` dropping the overflow object (1).
+- Header pins: `TestHeaderParityWithCrateHeader` and the new
+  `TestABIStabilityBlobV3ArityMatchesRust` (Rust parameter count = header
+  parameter count for all six) pass. The arity pin is **not
+  mutation-verified**. Any header arity change already breaks the cgo build
+  at the call site, and showing a Rust-side drift would need a deliberate
+  Rust rebuild. Its value is the Rust half, which nothing else checks.
+- CI: "Witness roster — Go blob trees, ranges, repair (9)".
+- Pre-push (AGENTS.md checklist, the parts this change can reach):
+  `fmt.py --check` clean; `cargo clippy --all-features --lib --bins -D warnings`
+  clean (covers the `fixtures` seams); `cargo clippy --all-features --lib --tests`
+  with CI's `-A` set clean; both clippy runs again in the dataforts-off
+  configuration (`--no-default-features --features netdb,redex-disk,fixtures`),
+  the only one that compiles `blob_stubs.rs`, plus its stub contract test
+  (1/1); and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`
+  clean. The first test-target clippy failed on my own test code
+  (`clippy::manual_dangling_ptr` on `1usize as *mut T` poison pointers);
+  they now use `std::ptr::dangling_mut()`.
+
+**Still owed: the cross-language `describe` fixture.** A Go-encoded ref,
+frozen in a fixture with its normalized description and validated by the
+Python suite (test-only), is not in this commit. It needs a local maturin
+build of the Python binding to run before committing, and an unrun test
+shouldn't be committed as evidence. Tracked here until it lands.
 
 ### S7: classify and port the rest of the reference package
 

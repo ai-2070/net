@@ -44,9 +44,11 @@ var (
 	ErrBlobUnsupportedScheme = fmt.Errorf("%w: unsupported URI scheme", ErrBlob)
 	// ErrBlobUnauthorized - an auth gate refused the operation.
 	ErrBlobUnauthorized = fmt.Errorf("%w: unauthorized", ErrBlob)
-	// ErrBlobInvalidArgument - an argument the binding refuses before the
-	// C call (for example, a string with an embedded NUL, which C would
-	// silently truncate into a different id).
+	// ErrBlobInvalidArgument - an argument refused before the operation
+	// runs: by the binding (an empty ref, or a string with an embedded NUL,
+	// which C would silently truncate into a different id), or natively
+	// as NET_ERR_BLOB_INVALID_ARGUMENT (a reversed or out-of-extent range,
+	// a bad encoding).
 	ErrBlobInvalidArgument = fmt.Errorf("%w: invalid argument", ErrBlob)
 )
 
@@ -81,6 +83,8 @@ func blobRegistryOpError(op string, code int) error {
 		return fmt.Errorf("%s: %w", op, ErrBlobUnsupportedScheme)
 	case -120:
 		return fmt.Errorf("%s: %w", op, ErrBlobUnauthorized)
+	case -150:
+		return fmt.Errorf("%s: %w", op, ErrBlobInvalidArgument)
 	case -107:
 		return fmt.Errorf("%w: %s: %w", ErrBlob, op, ErrFeatureNotBuilt)
 	default:

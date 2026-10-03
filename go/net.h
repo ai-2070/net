@@ -1813,6 +1813,76 @@ int net_blob_resolve(const char* adapter_id,
                      uint8_t** out_content,
                      size_t* out_content_len);
 
+/* ---- v0.3 tree / erasure / range / repair ----
+ *
+ * Contract (docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md,
+ * "New C ABI contract (S6)"): required out-pointers are checked before
+ * anything is written (NULL -> -1), then every out slot is set to NULL / 0
+ * before any later failure. A well-formed call refused on its arguments
+ * returns NET_ERR_BLOB_INVALID_ARGUMENT (-150). JSON results are freed with
+ * net_free_string, byte results with net_blob_free_buffer. Feature-off
+ * builds return NET_ERR_FEATURE_NOT_BUILT (-107).
+ */
+
+/* Like net_mesh_blob_adapter_new, plus a handle out-param and an options
+ * object: NULL / "" or {"overflow": {...legacy overflow object...},
+ * "tree_node_cache_bytes": N}. Unknown keys are refused (-3). An absent
+ * cache key means no cache; 0 installs a zero-capacity cache. */
+int net_mesh_blob_adapter_new_v2(
+    net_redex_t* redex,
+    const char* adapter_id,
+    int persistent,
+    const char* options_json,
+    net_mesh_blob_adapter_t** out_handle);
+
+/* Bytes [start, end) of any ref shape (tree refs included). start > end,
+ * a non-empty range over 1 GiB, or end past the blob's size: -150.
+ * start == end: 0 with (NULL, 0), even beyond the size. */
+int net_mesh_blob_adapter_fetch_range(
+    const net_mesh_blob_adapter_t* handle,
+    const uint8_t* blob_ref_bytes,
+    size_t blob_ref_len,
+    uint64_t start,
+    uint64_t end,
+    uint8_t** out_data,
+    size_t* out_len);
+
+/* Store as a tree blob. encoding_kind 0 = Replicated (rs_k = rs_m = 0),
+ * 1 = Reed-Solomon (rs_k = rs_m = 0 for the defaults, else both >= 1 and
+ * rs_k + rs_m <= 255). Anything else: -150. */
+int net_mesh_blob_adapter_store_tree(
+    const net_mesh_blob_adapter_t* handle,
+    const uint8_t* data,
+    size_t data_len,
+    uint8_t encoding_kind,
+    uint8_t rs_k,
+    uint8_t rs_m,
+    uint8_t** out_ref,
+    size_t* out_ref_len);
+
+/* Repair a Reed-Solomon tree blob in place; the report is JSON with u64
+ * fields stripes_walked, stripes_already_healthy, stripes_repaired,
+ * chunks_restored, stripes_unrecoverable, replicated_stripes_skipped,
+ * replicated_leaves_skipped. Unrecoverable stripes are counted, not an
+ * error. */
+int net_mesh_blob_adapter_repair_blob(
+    const net_mesh_blob_adapter_t* handle,
+    const uint8_t* blob_ref_bytes,
+    size_t blob_ref_len,
+    char** out_json);
+
+/* {"hits","misses","bytes","entries"} (u64), or JSON null with no cache. */
+int net_mesh_blob_adapter_tree_node_cache_stats(
+    const net_mesh_blob_adapter_t* handle,
+    char** out_json);
+
+/* Describe an encoded ref as JSON: version, uri, size, is_tree, is_chunked;
+ * hash (small refs), tree_root_hash + tree_depth (tree refs) and encoding
+ * (chunked refs) only where the shape has them. */
+int net_blob_ref_describe(const uint8_t* encoded,
+                          size_t encoded_len,
+                          char** out_json);
+
 /*
  * Construct a MeshBlobAdapter against `redex`.
  *

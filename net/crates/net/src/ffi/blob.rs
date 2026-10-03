@@ -97,6 +97,14 @@ pub const NET_ERR_BLOB_PANIC: c_int = -117;
 /// `NET_ERR_BLOB_BACKEND` so bindings can route 401-style hits
 /// without parsing the error string.
 pub const NET_ERR_BLOB_UNAUTHORIZED: c_int = -120;
+/// An argument the v0.3 tree / range / repair entry points refuse before
+/// touching the adapter: a reversed, over-cap or out-of-extent range, an
+/// unknown encoding kind, Reed-Solomon parameters out of range, or a cache
+/// capacity this target cannot address. Numbered outside the blob band
+/// (`-121..=-128` and `-130..` are other modules' codes, and `-120` is
+/// already shared with `NET_ERR_IDENTITY`) from an inventory of every
+/// `src/ffi` code, so it collides with nothing.
+pub const NET_ERR_BLOB_INVALID_ARGUMENT: c_int = -150;
 
 fn runtime() -> &'static Arc<Runtime> {
     use std::sync::OnceLock;
@@ -955,6 +963,11 @@ fn parse_overflow_json(s: &str) -> Result<InnerOverflowConfig, c_int> {
     }
     let raw: OverflowConfigJson =
         serde_json::from_str(s).map_err(|_| -> c_int { NetError::InvalidJson.into() })?;
+    overflow_from_raw(raw)
+}
+
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+fn overflow_from_raw(raw: OverflowConfigJson) -> Result<InnerOverflowConfig, c_int> {
     let mut cfg = InnerOverflowConfig {
         enabled: raw.enabled,
         ..InnerOverflowConfig::default()
@@ -1583,6 +1596,590 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_config(
     })
 }
 
+// =========================================================================
+// v0.3 tree / erasure / range / repair surface (C-ABI parity with the
+// Node and Python bindings). Contract:
+// docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md, "New C
+// ABI contract (S6)". In short: required out-pointers are null-checked
+// before anything is written, then every out slot is initialised before
+// any later failure; refusals of a well-formed call are
+// NET_ERR_BLOB_INVALID_ARGUMENT; structured results are JSON freed with
+// net_free_string; byte results are freed with net_blob_free_buffer.
+// =========================================================================
+
+/// Write `json` to `*out` as a heap C string (freed with `net_free_string`).
+///
+/// # Safety
+/// `out` must be writable.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+unsafe fn write_json_out(json: String, out: *mut *mut c_char) -> c_int {
+    match std::ffi::CString::new(json) {
+        Ok(c) => {
+            unsafe { *out = c.into_raw() };
+            0
+        }
+        Err(_) => NetError::InvalidJson.into(),
+    }
+}
+
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+fn hex32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Decode an encoded ref from a caller buffer. `Err` carries the code.
+///
+/// # Safety
+/// `ptr` points to `len` readable bytes (checked non-null by the caller).
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+unsafe fn decode_ref_arg(ptr: *const u8, len: usize) -> Result<InnerBlobRef, c_int> {
+    if len > isize::MAX as usize {
+        return Err(NET_ERR_BLOB_INVALID_ARGUMENT);
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    match InnerBlobRef::decode(slice) {
+        Ok(Some(b)) => Ok(b),
+        _ => Err(NET_ERR_BLOB_DECODE),
+    }
+}
+
+/// Options object for [`net_mesh_blob_adapter_new_v2`]. Unknown keys are
+/// refused, so a misspelled option fails loudly instead of being ignored.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct MeshBlobAdapterOptionsJson {
+    /// The legacy overflow object, parsed exactly as
+    /// [`net_mesh_blob_adapter_new`] parses its `overflow_json`.
+    #[serde(default)]
+    overflow: Option<OverflowConfigJson>,
+    /// Tree-node cache capacity in bytes. Absent: no cache. `0`: a cache
+    /// of capacity zero (every lookup misses), which is a distinct state.
+    #[serde(default)]
+    tree_node_cache_bytes: Option<u64>,
+}
+
+/// Construct a `MeshBlobAdapter` with the full option set. Additive: the
+/// legacy [`net_mesh_blob_adapter_new`] is unchanged.
+///
+/// `options_json` may be NULL or empty for the defaults, or a JSON object
+/// with `overflow` (the legacy overflow object) and `tree_node_cache_bytes`.
+/// On success writes the handle to `*out_handle` and returns `0`; free it
+/// with `net_mesh_blob_adapter_free`. Errors: `NetError::NullPointer` (NULL
+/// `out_handle` or `redex`), `NetError::InvalidUtf8`,
+/// `NetError::InvalidJson` (malformed or unknown option, bad overflow
+/// object), `NET_ERR_BLOB_INVALID_ARGUMENT` (a cache capacity this target
+/// cannot address), `NetError::ShuttingDown` (redex being freed). On any
+/// error `*out_handle` is NULL.
+///
+/// # Safety
+/// `redex` is a live `RedexHandle*`; `adapter_id` and (when non-NULL)
+/// `options_json` are NUL-terminated UTF-8; `out_handle` is writable.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_new_v2(
+    redex: *mut super::cortex::RedexHandle,
+    adapter_id: *const c_char,
+    persistent: c_int,
+    options_json: *const c_char,
+    out_handle: *mut *mut MeshBlobAdapterHandle,
+) -> c_int {
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_new_v2", null_rc, || {
+        if out_handle.is_null() {
+            return NetError::NullPointer.into();
+        }
+        unsafe { *out_handle = ptr::null_mut() };
+        if redex.is_null() {
+            return NetError::NullPointer.into();
+        }
+        let Some(id) = (unsafe { c_str_to_owned(adapter_id) }) else {
+            return NetError::InvalidUtf8.into();
+        };
+        let opts = if options_json.is_null() {
+            MeshBlobAdapterOptionsJson::default()
+        } else {
+            let Some(text) = (unsafe { c_str_to_owned(options_json) }) else {
+                return NetError::InvalidUtf8.into();
+            };
+            if text.is_empty() {
+                MeshBlobAdapterOptionsJson::default()
+            } else {
+                match serde_json::from_str(&text) {
+                    Ok(o) => o,
+                    Err(_) => return NetError::InvalidJson.into(),
+                }
+            }
+        };
+        let overflow = match opts.overflow.map(overflow_from_raw).transpose() {
+            Ok(o) => o,
+            Err(code) => return code,
+        };
+        let cache = match opts.tree_node_cache_bytes.map(usize::try_from).transpose() {
+            Ok(c) => c,
+            Err(_) => return NET_ERR_BLOB_INVALID_ARGUMENT,
+        };
+        let Some(redex_inner) = (unsafe { (*redex).redex_arc() }) else {
+            return NetError::ShuttingDown.into();
+        };
+        let mut builder =
+            InnerMeshBlobAdapter::new(id, redex_inner).with_persistent(persistent != 0);
+        if let Some(cfg) = overflow {
+            builder = builder.with_overflow(cfg);
+        }
+        if let Some(cap) = cache {
+            builder = builder.with_tree_node_cache(cap);
+        }
+        unsafe {
+            *out_handle = Box::into_raw(Box::new(MeshBlobAdapterHandle {
+                inner: ManuallyDrop::new(Arc::new(builder)),
+                guard: HandleGuard::new(),
+            }));
+        }
+        0
+    })
+}
+
+/// Fetch the half-open byte range `[start, end)` of the blob named by the
+/// encoded ref. Works for every ref shape, including tree refs that
+/// [`net_mesh_blob_adapter_fetch`] refuses; partial ranges are not
+/// verified against the whole-content hash (as in the Node and Python
+/// bindings).
+///
+/// Checks run in core's order and accept or refuse exactly as core does:
+/// `start > end` is refused; `start == end` succeeds with `(NULL, 0)`, even
+/// beyond the blob's size; a non-empty range longer than
+/// `MAX_FETCH_RANGE_BYTES` (1 GiB) or ending past the blob's size is
+/// refused. Where core reports those refusals as a generic backend error,
+/// this returns `NET_ERR_BLOB_INVALID_ARGUMENT`.
+///
+/// # Safety
+/// `handle` is a live handle; `blob_ref_bytes` points to `blob_ref_len`
+/// readable bytes; `out_data` / `out_len` are writable.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_fetch_range(
+    handle: *const MeshBlobAdapterHandle,
+    blob_ref_bytes: *const u8,
+    blob_ref_len: usize,
+    start: u64,
+    end: u64,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_fetch_range", null_rc, || {
+        if out_data.is_null() || out_len.is_null() {
+            return NetError::NullPointer.into();
+        }
+        unsafe {
+            *out_data = ptr::null_mut();
+            *out_len = 0;
+        }
+        if handle.is_null() || blob_ref_bytes.is_null() {
+            return NetError::NullPointer.into();
+        }
+        let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let blob_ref = match unsafe { decode_ref_arg(blob_ref_bytes, blob_ref_len) } {
+            Ok(b) => b,
+            Err(code) => return code,
+        };
+        if start > end {
+            return NET_ERR_BLOB_INVALID_ARGUMENT;
+        }
+        if start == end {
+            return 0;
+        }
+        if end - start > crate::adapter::net::dataforts::blob::mesh::MAX_FETCH_RANGE_BYTES
+            || end > blob_ref.size()
+        {
+            return NET_ERR_BLOB_INVALID_ARGUMENT;
+        }
+        let adapter = Arc::clone(&h.inner);
+        match block_on(async move { (*adapter).fetch_range(&blob_ref, start..end).await }) {
+            Ok(bytes) => unsafe { write_bytes_out(&bytes, out_data, out_len) },
+            Err(e) => err_to_code(&e),
+        }
+    })
+}
+
+/// Store `data` as a tree blob with default chunking and write the encoded
+/// tree ref. `encoding_kind`: `0` Replicated (then `rs_k` and `rs_m` must
+/// both be 0), `1` Reed-Solomon (`rs_k == rs_m == 0` selects the core
+/// defaults; otherwise both are at least 1 and `rs_k + rs_m <= 255`).
+/// Anything else is `NET_ERR_BLOB_INVALID_ARGUMENT`. Reed-Solomon closes a
+/// stripe only at `k` full chunks; a short trailing stripe is stored
+/// Replicated.
+///
+/// # Safety
+/// `handle` is a live handle; `data` points to `data_len` readable bytes
+/// (or is NULL with `data_len == 0`); `out_ref` / `out_ref_len` are
+/// writable.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_store_tree(
+    handle: *const MeshBlobAdapterHandle,
+    data: *const u8,
+    data_len: usize,
+    encoding_kind: u8,
+    rs_k: u8,
+    rs_m: u8,
+    out_ref: *mut *mut u8,
+    out_ref_len: *mut usize,
+) -> c_int {
+    use crate::adapter::net::dataforts::blob::blob_tree::ChunkingStrategy;
+    use crate::adapter::net::dataforts::blob::erasure::{DEFAULT_RS_K, DEFAULT_RS_M};
+    use crate::adapter::net::dataforts::Encoding as InnerEncoding;
+
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_store_tree", null_rc, || {
+        if out_ref.is_null() || out_ref_len.is_null() {
+            return NetError::NullPointer.into();
+        }
+        unsafe {
+            *out_ref = ptr::null_mut();
+            *out_ref_len = 0;
+        }
+        if handle.is_null() || (data.is_null() && data_len > 0) {
+            return NetError::NullPointer.into();
+        }
+        if data_len > isize::MAX as usize {
+            return NET_ERR_BLOB_INVALID_ARGUMENT;
+        }
+        let encoding = match (encoding_kind, rs_k, rs_m) {
+            (0, 0, 0) => InnerEncoding::Replicated,
+            (1, 0, 0) => InnerEncoding::ReedSolomon {
+                k: DEFAULT_RS_K,
+                m: DEFAULT_RS_M,
+            },
+            (1, k, m) if k >= 1 && m >= 1 && (u16::from(k) + u16::from(m)) <= 255 => {
+                InnerEncoding::ReedSolomon { k, m }
+            }
+            _ => return NET_ERR_BLOB_INVALID_ARGUMENT,
+        };
+        let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let owned = if data_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(data, data_len) }.to_vec()
+        };
+        let adapter = Arc::clone(&h.inner);
+        let result = block_on(async move {
+            let stream =
+                futures::stream::once(async move { Ok::<_, InnerBlobError>(Bytes::from(owned)) });
+            (*adapter)
+                .store_stream_tree(Box::pin(stream), encoding, ChunkingStrategy::default())
+                .await
+        });
+        match result {
+            Ok(blob_ref) => unsafe { write_bytes_out(&blob_ref.encode(), out_ref, out_ref_len) },
+            Err(e) => err_to_code(&e),
+        }
+    })
+}
+
+/// Repair a Reed-Solomon tree blob in place: rebuild missing data chunks
+/// from parity and re-store them. Writes the report as JSON (all fields
+/// `u64`): `stripes_walked`, `stripes_already_healthy`, `stripes_repaired`,
+/// `chunks_restored`, `stripes_unrecoverable`,
+/// `replicated_stripes_skipped`, `replicated_leaves_skipped`. A stripe that
+/// cannot be rebuilt is counted, not an error: success does not mean the
+/// blob is whole.
+///
+/// # Safety
+/// As [`net_mesh_blob_adapter_fetch_range`]; `out_json` is writable.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_repair_blob(
+    handle: *const MeshBlobAdapterHandle,
+    blob_ref_bytes: *const u8,
+    blob_ref_len: usize,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_repair_blob", null_rc, || {
+        if out_json.is_null() {
+            return NetError::NullPointer.into();
+        }
+        unsafe { *out_json = ptr::null_mut() };
+        if handle.is_null() || blob_ref_bytes.is_null() {
+            return NetError::NullPointer.into();
+        }
+        let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let blob_ref = match unsafe { decode_ref_arg(blob_ref_bytes, blob_ref_len) } {
+            Ok(b) => b,
+            Err(code) => return code,
+        };
+        let adapter = Arc::clone(&h.inner);
+        match block_on(async move { adapter.repair_blob(&blob_ref).await }) {
+            Ok(r) => {
+                let json = serde_json::json!({
+                    "stripes_walked": r.stripes_walked,
+                    "stripes_already_healthy": r.stripes_already_healthy,
+                    "stripes_repaired": r.stripes_repaired,
+                    "chunks_restored": r.chunks_restored,
+                    "stripes_unrecoverable": r.stripes_unrecoverable,
+                    "replicated_stripes_skipped": r.replicated_stripes_skipped,
+                    "replicated_leaves_skipped": r.replicated_leaves_skipped,
+                });
+                unsafe { write_json_out(json.to_string(), out_json) }
+            }
+            Err(e) => err_to_code(&e),
+        }
+    })
+}
+
+/// Tree-node cache statistics as JSON: `{"hits","misses","bytes","entries"}`
+/// (all `u64`), or the JSON literal `null` when the adapter was built
+/// without a cache. Either way returns `0`.
+///
+/// # Safety
+/// `handle` is a live handle; `out_json` is writable.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_tree_node_cache_stats(
+    handle: *const MeshBlobAdapterHandle,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard(
+        "net_mesh_blob_adapter_tree_node_cache_stats",
+        null_rc,
+        || {
+            if out_json.is_null() {
+                return NetError::NullPointer.into();
+            }
+            unsafe { *out_json = ptr::null_mut() };
+            if handle.is_null() {
+                return NetError::NullPointer.into();
+            }
+            let h = unsafe { &*handle };
+            let _op = match h.guard.try_enter() {
+                Some(op) => op,
+                None => return NetError::NullPointer.into(),
+            };
+            let json = match h.inner.tree_node_cache_stats() {
+                Some((hits, misses, bytes, entries)) => serde_json::json!({
+                    "hits": hits,
+                    "misses": misses,
+                    "bytes": bytes as u64,
+                    "entries": entries as u64,
+                }),
+                None => serde_json::Value::Null,
+            };
+            unsafe { write_json_out(json.to_string(), out_json) }
+        },
+    )
+}
+
+/// Describe an encoded ref as JSON. Always present: `version` (u8), `uri`,
+/// `size` (u64), `is_tree`, `is_chunked`. Present only where the shape has
+/// them (absent, never zero-filled, otherwise): `hash` (lowercase hex, small
+/// refs), `tree_root_hash` (hex) and `tree_depth` (u8) for tree refs, and
+/// `encoding` (`{"kind":"replicated"}` or
+/// `{"kind":"reed_solomon","k":..,"m":..}`) for chunked refs.
+///
+/// # Safety
+/// `encoded` points to `encoded_len` readable bytes; `out_json` is
+/// writable.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_ref_describe(
+    encoded: *const u8,
+    encoded_len: usize,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    use crate::adapter::net::dataforts::Encoding as InnerEncoding;
+
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_blob_ref_describe", null_rc, || {
+        if out_json.is_null() {
+            return NetError::NullPointer.into();
+        }
+        unsafe { *out_json = ptr::null_mut() };
+        if encoded.is_null() {
+            return NetError::NullPointer.into();
+        }
+        let blob_ref = match unsafe { decode_ref_arg(encoded, encoded_len) } {
+            Ok(b) => b,
+            Err(code) => return code,
+        };
+        let mut obj = serde_json::Map::new();
+        obj.insert("version".into(), blob_ref.version().into());
+        obj.insert("uri".into(), blob_ref.uri().into());
+        obj.insert("size".into(), blob_ref.size().into());
+        obj.insert("is_tree".into(), blob_ref.is_tree().into());
+        obj.insert("is_chunked".into(), blob_ref.is_chunked().into());
+        if let Some(h) = blob_ref.small_hash() {
+            obj.insert("hash".into(), hex32(h).into());
+        }
+        if let Some(h) = blob_ref.tree_root_hash() {
+            obj.insert("tree_root_hash".into(), hex32(h).into());
+        }
+        if let Some(d) = blob_ref.tree_depth() {
+            obj.insert("tree_depth".into(), d.into());
+        }
+        if let Some(enc) = blob_ref.encoding() {
+            let v = match enc {
+                InnerEncoding::Replicated => serde_json::json!({ "kind": "replicated" }),
+                InnerEncoding::ReedSolomon { k, m } => {
+                    serde_json::json!({ "kind": "reed_solomon", "k": k, "m": m })
+                }
+            };
+            obj.insert("encoding".into(), v);
+        }
+        unsafe { write_json_out(serde_json::Value::Object(obj).to_string(), out_json) }
+    })
+}
+
+/// TEST SEAM (`fixtures` only, absent from production builds): make one
+/// data shard of a Reed-Solomon tree blob unavailable, for the repair
+/// witness. Walks to the first erasure leaf, picks data chunk `data_index`
+/// of stripe `stripe_index`, deletes it through the adapter's own deletion
+/// path (which also drops its cached tree-node and chunk-file entries),
+/// then confirms it no longer fetches. Writes its 32-byte hash to
+/// `out_hash`. `NET_ERR_BLOB_INVALID_ARGUMENT` for a non-tree ref, a
+/// non-erasure tree, or an index out of range; `NET_ERR_BLOB_BACKEND` if
+/// the chunk still fetches after deletion.
+///
+/// # Safety
+/// As [`net_mesh_blob_adapter_fetch_range`]; `out_hash` has 32 writable
+/// bytes.
+#[cfg(all(
+    feature = "dataforts",
+    feature = "netdb",
+    feature = "redex-disk",
+    feature = "fixtures"
+))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_test_drop_data_chunk(
+    handle: *const MeshBlobAdapterHandle,
+    blob_ref_bytes: *const u8,
+    blob_ref_len: usize,
+    stripe_index: u32,
+    data_index: u32,
+    out_hash: *mut u8,
+) -> c_int {
+    use crate::adapter::net::dataforts::blob::blob_tree::TreeNode;
+
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard(
+        "net_mesh_blob_adapter_test_drop_data_chunk",
+        null_rc,
+        || {
+            if handle.is_null() || blob_ref_bytes.is_null() || out_hash.is_null() {
+                return NetError::NullPointer.into();
+            }
+            let h = unsafe { &*handle };
+            let _op = match h.guard.try_enter() {
+                Some(op) => op,
+                None => return NetError::NullPointer.into(),
+            };
+            let blob_ref = match unsafe { decode_ref_arg(blob_ref_bytes, blob_ref_len) } {
+                Ok(b) => b,
+                Err(code) => return code,
+            };
+            let Some(root) = blob_ref.tree_root_hash().copied() else {
+                return NET_ERR_BLOB_INVALID_ARGUMENT;
+            };
+            let adapter = Arc::clone(&h.inner);
+            let outcome: Result<[u8; 32], c_int> = block_on(async move {
+                let code = |e: InnerBlobError| err_to_code(&e);
+                let root_bytes = adapter.fetch_chunk(&root).await.map_err(code)?;
+                let mut node = TreeNode::decode(&root_bytes).map_err(code)?;
+                let stripes = loop {
+                    match node {
+                        TreeNode::ErasureLeaf { stripes } => break stripes,
+                        TreeNode::Internal { children } => {
+                            let Some((child, _)) = children.first() else {
+                                return Err(NET_ERR_BLOB_INVALID_ARGUMENT);
+                            };
+                            let bytes = adapter.fetch_chunk(child).await.map_err(code)?;
+                            node = TreeNode::decode(&bytes).map_err(code)?;
+                        }
+                        _ => return Err(NET_ERR_BLOB_INVALID_ARGUMENT),
+                    }
+                };
+                let stripe = stripes
+                    .get(stripe_index as usize)
+                    .ok_or(NET_ERR_BLOB_INVALID_ARGUMENT)?;
+                let hash = stripe
+                    .chunks
+                    .iter()
+                    .filter(|c| c.is_data())
+                    .nth(data_index as usize)
+                    .map(|c| c.hash)
+                    .ok_or(NET_ERR_BLOB_INVALID_ARGUMENT)?;
+                adapter.delete_chunk(&hash).await.map_err(code)?;
+                if adapter.fetch_chunk(&hash).await.is_ok() {
+                    return Err(NET_ERR_BLOB_BACKEND);
+                }
+                Ok(hash)
+            });
+            match outcome {
+                Ok(hash) => {
+                    unsafe { ptr::copy_nonoverlapping(hash.as_ptr(), out_hash, 32) };
+                    0
+                }
+                Err(code) => code,
+            }
+        },
+    )
+}
+
+/// TEST SEAM (`fixtures` only): `1` if the chunk with this 32-byte hash
+/// fetches from the adapter, `0` if not, negative on error.
+///
+/// # Safety
+/// `handle` is a live handle; `hash` points to 32 readable bytes.
+#[cfg(all(
+    feature = "dataforts",
+    feature = "netdb",
+    feature = "redex-disk",
+    feature = "fixtures"
+))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_test_chunk_present(
+    handle: *const MeshBlobAdapterHandle,
+    hash: *const u8,
+) -> c_int {
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_test_chunk_present", null_rc, || {
+        if handle.is_null() || hash.is_null() {
+            return NetError::NullPointer.into();
+        }
+        let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let mut key = [0u8; 32];
+        unsafe { ptr::copy_nonoverlapping(hash, key.as_mut_ptr(), 32) };
+        let adapter = Arc::clone(&h.inner);
+        c_int::from(block_on(
+            async move { adapter.fetch_chunk(&key).await.is_ok() },
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1944,6 +2541,425 @@ mod tests {
             );
 
             net_redex_free(redex);
+        }
+    }
+
+    /// Contract witnesses for the v0.3 entry points: every row of the S6
+    /// table in GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md ("New C ABI
+    /// contract (S6)").
+    #[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+    mod v3_contract {
+        use super::super::*;
+        use crate::ffi::cortex::{net_redex_free, net_redex_new, RedexHandle};
+        use crate::ffi::net_free_string;
+        use std::ffi::{CStr, CString};
+
+        const NULL_RC: c_int = -1;
+        const INVALID_JSON: c_int = -3;
+
+        struct Fixture {
+            redex: *mut RedexHandle,
+            adapter: *mut MeshBlobAdapterHandle,
+        }
+
+        impl Fixture {
+            fn new(options: Option<&str>) -> Self {
+                let id = CString::new(super::unique_id("ffi-v3")).unwrap();
+                let opts = options.map(|o| CString::new(o).unwrap());
+                unsafe {
+                    let redex = net_redex_new(std::ptr::null());
+                    assert!(!redex.is_null());
+                    let mut adapter = std::ptr::null_mut();
+                    let rc = net_mesh_blob_adapter_new_v2(
+                        redex,
+                        id.as_ptr(),
+                        0,
+                        opts.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                        &mut adapter,
+                    );
+                    assert_eq!(rc, 0, "new_v2({options:?})");
+                    assert!(!adapter.is_null());
+                    Fixture { redex, adapter }
+                }
+            }
+
+            /// Store `data` as a tree and return the encoded ref.
+            fn store_tree(&self, data: &[u8], kind: u8, k: u8, m: u8) -> Result<Vec<u8>, c_int> {
+                let mut out = std::ptr::null_mut();
+                let mut len = 0usize;
+                let rc = unsafe {
+                    net_mesh_blob_adapter_store_tree(
+                        self.adapter,
+                        data.as_ptr(),
+                        data.len(),
+                        kind,
+                        k,
+                        m,
+                        &mut out,
+                        &mut len,
+                    )
+                };
+                if rc != 0 {
+                    assert!(
+                        out.is_null() && len == 0,
+                        "failed store_tree left its outputs set"
+                    );
+                    return Err(rc);
+                }
+                let v = unsafe { std::slice::from_raw_parts(out, len) }.to_vec();
+                unsafe { net_blob_free_buffer(out, len) };
+                Ok(v)
+            }
+
+            fn range(&self, r: &[u8], start: u64, end: u64) -> Result<Vec<u8>, c_int> {
+                let mut out = std::ptr::dangling_mut::<u8>(); // poison: must be reset
+                let mut len = 7usize;
+                let rc = unsafe {
+                    net_mesh_blob_adapter_fetch_range(
+                        self.adapter,
+                        r.as_ptr(),
+                        r.len(),
+                        start,
+                        end,
+                        &mut out,
+                        &mut len,
+                    )
+                };
+                if rc != 0 {
+                    assert!(
+                        out.is_null() && len == 0,
+                        "failed fetch_range left its outputs set"
+                    );
+                    return Err(rc);
+                }
+                if len == 0 {
+                    assert!(out.is_null(), "empty result must be (NULL, 0)");
+                    return Ok(Vec::new());
+                }
+                let v = unsafe { std::slice::from_raw_parts(out, len) }.to_vec();
+                unsafe { net_blob_free_buffer(out, len) };
+                Ok(v)
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                unsafe {
+                    net_mesh_blob_adapter_free(self.adapter);
+                    net_redex_free(self.redex);
+                }
+            }
+        }
+
+        fn take_json(p: *mut c_char) -> serde_json::Value {
+            assert!(!p.is_null());
+            let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned();
+            unsafe { net_free_string(p) };
+            serde_json::from_str(&s).unwrap()
+        }
+
+        fn describe(r: &[u8]) -> Result<serde_json::Value, c_int> {
+            let mut out = std::ptr::dangling_mut::<c_char>();
+            let rc = unsafe { net_blob_ref_describe(r.as_ptr(), r.len(), &mut out) };
+            if rc != 0 {
+                assert!(out.is_null());
+                return Err(rc);
+            }
+            Ok(take_json(out))
+        }
+
+        fn cache_stats(f: &Fixture) -> serde_json::Value {
+            let mut out = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { net_mesh_blob_adapter_tree_node_cache_stats(f.adapter, &mut out) },
+                0
+            );
+            take_json(out)
+        }
+
+        #[test]
+        fn new_v2_refusals_and_options() {
+            let id = CString::new("ffi-v3-new").unwrap();
+            unsafe {
+                let redex = net_redex_new(std::ptr::null());
+                // NULL out_handle: nothing written, -1.
+                assert_eq!(
+                    net_mesh_blob_adapter_new_v2(
+                        redex,
+                        id.as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null_mut()
+                    ),
+                    NULL_RC
+                );
+                let mut out = std::ptr::dangling_mut::<MeshBlobAdapterHandle>();
+                assert_eq!(
+                    net_mesh_blob_adapter_new_v2(
+                        std::ptr::null_mut(),
+                        id.as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        &mut out
+                    ),
+                    NULL_RC
+                );
+                assert!(out.is_null(), "out_handle reset before a later failure");
+                for bad in [
+                    "{",
+                    r#"{"tree_node_cache_byte": 1}"#,
+                    r#"{"overflow": {"scope": "galaxy"}}"#,
+                ] {
+                    let c = CString::new(bad).unwrap();
+                    let mut out = std::ptr::dangling_mut::<MeshBlobAdapterHandle>();
+                    assert_eq!(
+                        net_mesh_blob_adapter_new_v2(redex, id.as_ptr(), 0, c.as_ptr(), &mut out),
+                        INVALID_JSON,
+                        "{bad}"
+                    );
+                    assert!(out.is_null());
+                }
+                net_redex_free(redex);
+            }
+            // Absent cache, zero cache, and a real cache are distinct.
+            assert!(cache_stats(&Fixture::new(None)).is_null());
+            assert!(cache_stats(&Fixture::new(Some(""))).is_null());
+            let zero = cache_stats(&Fixture::new(Some(r#"{"tree_node_cache_bytes": 0}"#)));
+            assert_eq!(zero["bytes"], 0);
+            assert!(
+                !cache_stats(&Fixture::new(Some(r#"{"tree_node_cache_bytes": 1048576}"#)))
+                    .is_null()
+            );
+            // The legacy overflow object rides along unchanged.
+            let f = Fixture::new(Some(r#"{"overflow": {"enabled": true, "scope": "zone"}}"#));
+            assert_eq!(
+                unsafe { net_mesh_blob_adapter_overflow_enabled(f.adapter) },
+                1
+            );
+        }
+
+        #[test]
+        fn store_tree_encoding_rows() {
+            let f = Fixture::new(None);
+            let data = b"encoding rows";
+            for (kind, k, m) in [
+                (2u8, 0u8, 0u8),
+                (0, 1, 0),
+                (0, 0, 1),
+                (1, 0, 2),
+                (1, 4, 0),
+                (1, 200, 56),
+            ] {
+                assert_eq!(
+                    f.store_tree(data, kind, k, m),
+                    Err(NET_ERR_BLOB_INVALID_ARGUMENT),
+                    "kind {kind} k {k} m {m}"
+                );
+            }
+            for (kind, k, m) in [(0u8, 0u8, 0u8), (1, 0, 0), (1, 4, 2), (1, 200, 55)] {
+                let r = f
+                    .store_tree(data, kind, k, m)
+                    .unwrap_or_else(|rc| panic!("kind {kind} k {k} m {m}: {rc}"));
+                let d = describe(&r).unwrap();
+                assert_eq!(d["is_tree"], true);
+                let expect_kind = if kind == 0 {
+                    "replicated"
+                } else {
+                    "reed_solomon"
+                };
+                assert_eq!(d["encoding"]["kind"], expect_kind);
+                if kind == 1 && k != 0 {
+                    assert_eq!(d["encoding"]["k"], k);
+                    assert_eq!(d["encoding"]["m"], m);
+                }
+            }
+            // (NULL, n > 0) input, and NULL out-pointers.
+            let mut out = std::ptr::null_mut();
+            let mut len = 0usize;
+            unsafe {
+                assert_eq!(
+                    net_mesh_blob_adapter_store_tree(
+                        f.adapter,
+                        std::ptr::null(),
+                        3,
+                        0,
+                        0,
+                        0,
+                        &mut out,
+                        &mut len
+                    ),
+                    NULL_RC
+                );
+                assert_eq!(
+                    net_mesh_blob_adapter_store_tree(
+                        f.adapter,
+                        data.as_ptr(),
+                        data.len(),
+                        0,
+                        0,
+                        0,
+                        std::ptr::null_mut(),
+                        &mut len
+                    ),
+                    NULL_RC
+                );
+            }
+        }
+
+        #[test]
+        fn fetch_range_rows_in_core_order() {
+            let f = Fixture::new(None);
+            let data = b"0123456789abcdef";
+            let r = f.store_tree(data, 0, 0, 0).unwrap();
+            let size = data.len() as u64;
+            assert_eq!(
+                f.range(&r, 5, 4),
+                Err(NET_ERR_BLOB_INVALID_ARGUMENT),
+                "reversed"
+            );
+            assert_eq!(
+                f.range(&r, size + 100, size + 100),
+                Ok(Vec::new()),
+                "empty beyond size"
+            );
+            assert_eq!(
+                f.range(&r, 0, size + 1),
+                Err(NET_ERR_BLOB_INVALID_ARGUMENT),
+                "past the end"
+            );
+            assert_eq!(
+                f.range(
+                    &r,
+                    0,
+                    crate::adapter::net::dataforts::blob::mesh::MAX_FETCH_RANGE_BYTES + 1
+                ),
+                Err(NET_ERR_BLOB_INVALID_ARGUMENT),
+                "over the cap"
+            );
+            assert_eq!(f.range(&r, 3, 9), Ok(data[3..9].to_vec()));
+            assert_eq!(f.range(b"garbage", 0, 1), Err(NET_ERR_BLOB_DECODE));
+            // Each out-pointer nulled in turn: -1, and the other untouched.
+            let mut out = std::ptr::null_mut();
+            let mut len = 7usize;
+            unsafe {
+                assert_eq!(
+                    net_mesh_blob_adapter_fetch_range(
+                        f.adapter,
+                        r.as_ptr(),
+                        r.len(),
+                        0,
+                        1,
+                        std::ptr::null_mut(),
+                        &mut len
+                    ),
+                    NULL_RC
+                );
+                assert_eq!(len, 7, "the non-NULL half of a NULL pair is not written");
+                assert_eq!(
+                    net_mesh_blob_adapter_fetch_range(
+                        f.adapter,
+                        r.as_ptr(),
+                        r.len(),
+                        0,
+                        1,
+                        &mut out,
+                        std::ptr::null_mut()
+                    ),
+                    NULL_RC
+                );
+                // NULL handle with valid outputs: outputs reset, -1.
+                let mut out = std::ptr::dangling_mut::<u8>();
+                let mut len = 7usize;
+                assert_eq!(
+                    net_mesh_blob_adapter_fetch_range(
+                        std::ptr::null(),
+                        r.as_ptr(),
+                        r.len(),
+                        0,
+                        1,
+                        &mut out,
+                        &mut len
+                    ),
+                    NULL_RC
+                );
+                assert!(out.is_null() && len == 0);
+            }
+        }
+
+        #[test]
+        fn describe_rows() {
+            let f = Fixture::new(None);
+            let tree = describe(&f.store_tree(b"tree", 0, 0, 0).unwrap()).unwrap();
+            for key in [
+                "version",
+                "uri",
+                "size",
+                "is_tree",
+                "is_chunked",
+                "tree_root_hash",
+                "tree_depth",
+                "encoding",
+            ] {
+                assert!(tree.get(key).is_some(), "tree ref lacks {key}: {tree}");
+            }
+            assert!(
+                tree.get("hash").is_none(),
+                "tree ref must not carry a small hash: {tree}"
+            );
+            let small = InnerBlobRef::small("mesh://x", [7u8; 32], 3).encode();
+            let d = describe(&small).unwrap();
+            assert_eq!(d["hash"], "07".repeat(32));
+            for key in ["tree_root_hash", "tree_depth", "encoding"] {
+                assert!(d.get(key).is_none(), "small ref carries {key}: {d}");
+            }
+            assert_eq!(
+                describe(&[0xB0, 0xB1, 0xB2, 0xB3, 1]),
+                Err(NET_ERR_BLOB_DECODE)
+            );
+            unsafe {
+                assert_eq!(
+                    net_blob_ref_describe(small.as_ptr(), small.len(), std::ptr::null_mut()),
+                    NULL_RC
+                );
+            }
+        }
+
+        #[test]
+        fn repair_and_stats_null_and_decode_rows() {
+            let f = Fixture::new(None);
+            unsafe {
+                assert_eq!(
+                    net_mesh_blob_adapter_repair_blob(
+                        f.adapter,
+                        b"x".as_ptr(),
+                        1,
+                        std::ptr::null_mut()
+                    ),
+                    NULL_RC
+                );
+                let mut out = std::ptr::dangling_mut::<c_char>();
+                assert_eq!(
+                    net_mesh_blob_adapter_repair_blob(f.adapter, b"garbage".as_ptr(), 7, &mut out),
+                    NET_ERR_BLOB_DECODE
+                );
+                assert!(out.is_null());
+                assert_eq!(
+                    net_mesh_blob_adapter_tree_node_cache_stats(f.adapter, std::ptr::null_mut()),
+                    NULL_RC
+                );
+            }
+            // A healthy replicated tree: walked, nothing to repair.
+            let r = f.store_tree(b"healthy", 0, 0, 0).unwrap();
+            let mut out = std::ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    net_mesh_blob_adapter_repair_blob(f.adapter, r.as_ptr(), r.len(), &mut out)
+                },
+                0
+            );
+            let report = take_json(out);
+            assert_eq!(report["chunks_restored"], 0);
+            assert_eq!(report["stripes_unrecoverable"], 0);
         }
     }
 }

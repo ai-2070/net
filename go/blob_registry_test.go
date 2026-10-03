@@ -191,6 +191,7 @@ func TestABIStabilityBlobRegistryCodes(t *testing.T) {
 		"NET_ERR_BLOB_UNSUPPORTED_SCHEME":     ErrBlobUnsupportedScheme,
 		"NET_ERR_BLOB_ADAPTER_NOT_REGISTERED": ErrBlobNotRegistered,
 		"NET_ERR_BLOB_UNAUTHORIZED":           ErrBlobUnauthorized,
+		"NET_ERR_BLOB_INVALID_ARGUMENT":       ErrBlobInvalidArgument,
 		"NET_ERR_BLOB_PANIC":                  ErrBlob, // message only
 		"NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED": ErrBlob, // message only
 	}

@@ -31,6 +31,8 @@ package net
 
 import (
 	"errors"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -331,6 +333,49 @@ func TestABIStabilityCortexDeclsMatchCanonicalHeader(t *testing.T) {
 	for name, params := range canonical.fns {
 		if got, ok := mirror.fns[name]; ok && got != params {
 			t.Errorf("%s parameters differ:\n  include: (%s)\n  go:      (%s)", name, params, got)
+		}
+	}
+}
+
+// TestABIStabilityBlobV3ArityMatchesRust pins the six S6 declarations in
+// go/net.h to their Rust definitions in src/ffi/blob.rs by parameter count.
+// The header-parity tests compare the two headers with each other but never
+// with Rust, and cgo only checks the header: an extra or missing Rust
+// parameter would link and then read garbage.
+func TestABIStabilityBlobV3ArityMatchesRust(t *testing.T) {
+	src, err := os.ReadFile("../net/crates/net/src/ffi/blob.rs")
+	if err != nil {
+		t.Fatalf("read src/ffi/blob.rs: %v", err)
+	}
+	h := parseHeader(t, "net.h")
+	for _, name := range []string{
+		"net_mesh_blob_adapter_new_v2",
+		"net_mesh_blob_adapter_fetch_range",
+		"net_mesh_blob_adapter_store_tree",
+		"net_mesh_blob_adapter_repair_blob",
+		"net_mesh_blob_adapter_tree_node_cache_stats",
+		"net_blob_ref_describe",
+	} {
+		re := regexp.MustCompile(`pub unsafe extern "C" fn ` + name + `\(([^)]*)\)`)
+		m := re.FindStringSubmatch(string(src))
+		if m == nil {
+			t.Errorf("%s: no Rust definition in src/ffi/blob.rs", name)
+			continue
+		}
+		rustParams := 0
+		for _, p := range strings.Split(m[1], ",") {
+			if strings.TrimSpace(p) != "" {
+				rustParams++
+			}
+		}
+		params, ok := h.fns[name]
+		if !ok {
+			t.Errorf("%s: not declared in go/net.h", name)
+			continue
+		}
+		headerParams := strings.Count(params, ",") + 1
+		if rustParams != headerParams {
+			t.Errorf("%s: Rust takes %d parameters, go/net.h declares %d (%s)", name, rustParams, headerParams, params)
 		}
 	}
 }

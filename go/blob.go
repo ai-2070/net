@@ -121,6 +121,13 @@ type MeshBlobAdapterOpts struct {
 	// to opt in at defaults; pass a fully-populated struct to
 	// tune thresholds at construction.
 	Overflow *OverflowConfig
+
+	// TreeNodeCacheBytes, when set, gives the adapter a tree-node LRU
+	// cache of that many bytes. Nil means no cache; a pointer to 0 means
+	// a zero-capacity cache (every lookup misses), which is a different
+	// state. Setting it routes construction through
+	// net_mesh_blob_adapter_new_v2.
+	TreeNodeCacheBytes *uint64
 }
 
 // MeshBlobAdapter wraps `*net_mesh_blob_adapter_t`. Cheap to
@@ -150,11 +157,22 @@ func NewMeshBlobAdapter(redex *Redex, adapterID string, opts *MeshBlobAdapterOpt
 		return nil, fmt.Errorf("%w: redex handle is nil", ErrBlob)
 	}
 	persistent := C.int(0)
+	if opts != nil && opts.Persistent {
+		persistent = 1
+	}
+	if opts != nil && opts.TreeNodeCacheBytes != nil {
+		cID := C.CString(adapterID)
+		defer C.free(unsafe.Pointer(cID))
+		h, err := newMeshBlobAdapterV2(redex, cID, persistent, opts)
+		if err != nil {
+			return nil, err
+		}
+		a := &MeshBlobAdapter{handle: h}
+		runtime.SetFinalizer(a, func(a *MeshBlobAdapter) { _ = a.Close() })
+		return a, nil
+	}
 	overflowJSON := (*C.char)(nil)
 	if opts != nil {
-		if opts.Persistent {
-			persistent = 1
-		}
 		if opts.Overflow != nil {
 			body, err := json.Marshal(opts.Overflow)
 			if err != nil {
