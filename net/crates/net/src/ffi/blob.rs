@@ -509,6 +509,13 @@ pub type NetBlobAdapterExistsFn = unsafe extern "C" fn(
 /// returned bytes.
 pub type NetBlobAdapterFreeFn = unsafe extern "C" fn(ctx: *mut c_void, data: *mut u8, len: usize);
 
+/// Releases the caller's `ctx` once the substrate holds no reference to
+/// it. Passed to [`net_blob_register_callback_adapter_owned`]; called
+/// exactly once, from the drop of the last shared reference to the
+/// context, which every in-flight vtable call holds until it returns
+/// (after `free_buffer`, for fetches).
+pub type NetBlobAdapterReleaseFn = unsafe extern "C" fn(ctx: *mut c_void);
+
 /// Function-pointer-table the C-side caller passes to
 /// [`net_blob_register_callback_adapter`]. The struct is `#[repr(C)]`
 /// for cross-ABI stability.
@@ -556,7 +563,14 @@ pub struct NetBlobAdapterVtable {
 /// Python adapter that uses the GIL) MUST serialize their own
 /// dispatch behind a `Mutex` before passing control to the
 /// language runtime.
-struct OpaqueCtx(*mut c_void);
+struct OpaqueCtx {
+    ptr: *mut c_void,
+    /// Owned-context registrations only: called once from `Drop`, and
+    /// only once `armed` (set after the registry accepted the adapter, so
+    /// a refused registration leaves `ctx` owned by the caller).
+    release: Option<NetBlobAdapterReleaseFn>,
+    armed: std::sync::atomic::AtomicBool,
+}
 
 // SAFETY: opaque-pointer transport — see `OpaqueCtx` doc above.
 // Cross-thread coherence of the pointee is the C-side caller's
@@ -567,11 +581,102 @@ unsafe impl Sync for OpaqueCtx {}
 
 impl OpaqueCtx {
     fn new(ptr: *mut c_void) -> Self {
-        Self(ptr)
+        Self {
+            ptr,
+            release: None,
+            armed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn owned(ptr: *mut c_void, release: NetBlobAdapterReleaseFn) -> Self {
+        Self {
+            ptr,
+            release: Some(release),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::Release);
     }
     fn get(&self) -> *mut c_void {
-        self.0
+        self.ptr
     }
+}
+
+impl Drop for OpaqueCtx {
+    fn drop(&mut self) {
+        if !self.armed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        if let Some(release) = self.release {
+            // SAFETY: `release` came from the registrant, who promised it
+            // stays callable until it has run; `Drop` runs once.
+            unsafe { release(self.ptr) };
+        }
+    }
+}
+
+/// Test barriers (`fixtures` only): hold a vtable dispatch at a stage so a
+/// test can act while a call is in flight. Stage 1 is "about to invoke the
+/// callback"; stage 2 is "about to call `free_buffer`". An arm targets one
+/// context (or any, with `0`), so concurrent tests on other adapters never
+/// trip it. Compiled for unit tests and `fixtures`; no-ops otherwise.
+#[cfg(any(test, feature = "fixtures"))]
+mod callback_barrier {
+    use parking_lot::{Condvar, Mutex};
+
+    struct State {
+        /// `Some(target ctx address)`, `Some(0)` for any context.
+        armed: [Option<usize>; 3],
+        held: [bool; 3],
+        released: [bool; 3],
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        armed: [None; 3],
+        held: [false; 3],
+        released: [false; 3],
+    });
+    static CV: Condvar = Condvar::new();
+
+    pub(super) fn checkpoint(stage: usize, ctx: usize) {
+        let mut st = STATE.lock();
+        match st.armed[stage] {
+            Some(target) if target == 0 || target == ctx => {}
+            _ => return,
+        }
+        st.armed[stage] = None; // single-shot
+        st.held[stage] = true;
+        CV.notify_all();
+        while !st.released[stage] {
+            CV.wait(&mut st);
+        }
+        st.held[stage] = false;
+        st.released[stage] = false;
+    }
+
+    pub(super) fn arm(stage: usize, target: usize) {
+        let mut st = STATE.lock();
+        st.armed[stage] = Some(target);
+        st.released[stage] = false;
+    }
+
+    pub(super) fn wait_held(stage: usize, timeout: std::time::Duration) -> bool {
+        let mut st = STATE.lock();
+        CV.wait_while_for(&mut st, |s| !s.held[stage], timeout);
+        st.held[stage]
+    }
+
+    pub(super) fn release(stage: usize) {
+        let mut st = STATE.lock();
+        st.released[stage] = true;
+        CV.notify_all();
+    }
+}
+
+#[inline]
+fn callback_checkpoint(_stage: usize, _ctx: *mut c_void) {
+    #[cfg(any(test, feature = "fixtures"))]
+    callback_barrier::checkpoint(_stage, _ctx as usize);
 }
 
 /// `BlobAdapter` impl that calls into a vtable of C function
@@ -679,6 +784,7 @@ impl BlobAdapter for CallbackBlobAdapter {
         tokio::task::spawn_blocking(move || -> std::result::Result<Bytes, InnerBlobError> {
             let mut out_data: *mut u8 = ptr::null_mut();
             let mut out_len: usize = 0;
+            callback_checkpoint(1, ctx.get());
             let code = unsafe {
                 (vtable.fetch)(
                     ctx.get(),
@@ -709,6 +815,7 @@ impl BlobAdapter for CallbackBlobAdapter {
             // mesh/fs/noop adapters; FFI callbacks pay the copy
             // at the boundary in either direction).
             let buf = unsafe { std::slice::from_raw_parts(out_data, out_len).to_vec() };
+            callback_checkpoint(2, ctx.get());
             unsafe { (vtable.free_buffer)(ctx.get(), out_data, out_len) };
             Ok(Bytes::from(buf))
         })
@@ -733,6 +840,7 @@ impl BlobAdapter for CallbackBlobAdapter {
         tokio::task::spawn_blocking(move || -> std::result::Result<Bytes, InnerBlobError> {
             let mut out_data: *mut u8 = ptr::null_mut();
             let mut out_len: usize = 0;
+            callback_checkpoint(1, ctx.get());
             let code = unsafe {
                 (vtable.fetch_range)(
                     ctx.get(),
@@ -757,6 +865,7 @@ impl BlobAdapter for CallbackBlobAdapter {
                 ));
             }
             let buf = unsafe { std::slice::from_raw_parts(out_data, out_len).to_vec() };
+            callback_checkpoint(2, ctx.get());
             unsafe { (vtable.free_buffer)(ctx.get(), out_data, out_len) };
             Ok(Bytes::from(buf))
         })
@@ -876,6 +985,99 @@ pub unsafe extern "C" fn net_blob_register_callback_adapter(
     match global_blob_adapter_registry().register(adapter) {
         Ok(()) => 0,
         Err(_) => NET_ERR_BLOB_DUPLICATE_ID,
+    }
+}
+
+/// Like [`net_blob_register_callback_adapter`], but the substrate takes
+/// ownership of `ctx` and tells the caller when it is done with it:
+/// `release_fn(ctx)` runs **exactly once**, after the adapter is
+/// unregistered (or replaced) **and** the last in-flight vtable call
+/// holding the context has returned — including its `free_buffer`. That
+/// is the point at which the caller may reclaim whatever `ctx` names (a
+/// cgo handle, a refcount). Additive: the existing registration function
+/// and the vtable layout are unchanged.
+///
+/// Ownership on failure: if this returns non-zero (NULL vtable or
+/// `release_fn`, a NULL vtable entry, bad UTF-8, a duplicate id),
+/// `release_fn` is **never** called and `ctx` stays the caller's.
+///
+/// # Safety
+/// As [`net_blob_register_callback_adapter`]; additionally `release_fn`
+/// must stay callable until it has run.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_register_callback_adapter_owned(
+    adapter_id: *const c_char,
+    vtable: *const NetBlobAdapterVtable,
+    ctx: *mut c_void,
+    release_fn: Option<NetBlobAdapterReleaseFn>,
+) -> c_int {
+    let Some(release_fn) = release_fn else {
+        return NetError::NullPointer.into();
+    };
+    if vtable.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let id = match unsafe { c_str_to_owned(adapter_id) } {
+        Some(s) => s,
+        None => return NetError::InvalidUtf8.into(),
+    };
+    {
+        let raw = vtable as *const c_void as *const *const c_void;
+        for i in 0..5 {
+            if unsafe { *raw.add(i) }.is_null() {
+                return NET_ERR_BLOB_BACKEND;
+            }
+        }
+    }
+    let vtable = unsafe { *vtable };
+    // Not armed yet: if the registry refuses the adapter, dropping it
+    // drops this context without calling release_fn.
+    let ctx = Arc::new(OpaqueCtx::owned(ctx, release_fn));
+    let adapter: Arc<dyn BlobAdapter> = Arc::new(CallbackBlobAdapter {
+        id,
+        vtable,
+        ctx: Arc::clone(&ctx),
+    });
+    match global_blob_adapter_registry().register(adapter) {
+        Ok(()) => {
+            ctx.arm();
+            0
+        }
+        Err(_) => NET_ERR_BLOB_DUPLICATE_ID,
+    }
+}
+
+/// TEST SEAM (`fixtures` only): arm a single-shot hold at `stage` (1 =
+/// before the next vtable fetch callback, 2 = before its `free_buffer`)
+/// for the adapter registered with `ctx` (NULL: any adapter).
+#[cfg(feature = "fixtures")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_blob_test_barrier_arm(stage: c_int, ctx: *mut c_void) {
+    if (1..=2).contains(&stage) {
+        callback_barrier::arm(stage as usize, ctx as usize);
+    }
+}
+
+/// TEST SEAM (`fixtures` only): wait up to `timeout_ms` for a dispatch to
+/// be held at `stage`. `1` held, `0` not.
+#[cfg(feature = "fixtures")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_blob_test_barrier_wait_held(stage: c_int, timeout_ms: u32) -> c_int {
+    if !(1..=2).contains(&stage) {
+        return 0;
+    }
+    c_int::from(callback_barrier::wait_held(
+        stage as usize,
+        std::time::Duration::from_millis(u64::from(timeout_ms)),
+    ))
+}
+
+/// TEST SEAM (`fixtures` only): let the dispatch held at `stage` continue.
+#[cfg(feature = "fixtures")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_blob_test_barrier_release(stage: c_int) {
+    if (1..=2).contains(&stage) {
+        callback_barrier::release(stage as usize);
     }
 }
 
@@ -2284,6 +2486,7 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::Mutex;
 
+        #[repr(C)]
         struct CallbackCtx {
             store: Mutex<HashMap<[u8; 32], Vec<u8>>>,
         }
@@ -2444,6 +2647,266 @@ mod tests {
                 // Reclaim the leaked ctx box.
                 drop(Box::from_raw(ctx_ptr as *mut CallbackCtx));
             }
+        }
+
+        // ---- owned-context registration (plan gap G-B / S5b) ----------
+
+        /// Counts release_fn calls for one registration's context.
+        #[repr(C)]
+        struct OwnedCtx {
+            inner: CallbackCtx,
+            released: std::sync::atomic::AtomicUsize,
+        }
+
+        unsafe extern "C" fn owned_release(ctx: *mut c_void) {
+            let ctx = &*(ctx as *const OwnedCtx);
+            ctx.released
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        // The vtable entries reinterpret ctx as CallbackCtx; OwnedCtx is
+        // repr(C) with CallbackCtx first, so the same pointer serves both.
+        fn owned_ctx() -> *mut OwnedCtx {
+            Box::into_raw(Box::new(OwnedCtx {
+                inner: CallbackCtx {
+                    store: Mutex::new(HashMap::new()),
+                },
+                released: std::sync::atomic::AtomicUsize::new(0),
+            }))
+        }
+
+        fn released(ctx: *mut OwnedCtx) -> usize {
+            unsafe { &*ctx }
+                .released
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn vtable() -> NetBlobAdapterVtable {
+            NetBlobAdapterVtable {
+                store: cb_store,
+                fetch: cb_fetch,
+                fetch_range: cb_fetch_range,
+                exists: cb_exists,
+                free_buffer: cb_free,
+            }
+        }
+
+        /// Publish `payload` through adapter `id`, returning the encoded ref.
+        fn publish(id: &std::ffi::CStr, payload: &[u8]) -> Vec<u8> {
+            let uri = std::ffi::CString::new("cb://owned").unwrap();
+            let mut out: *mut u8 = std::ptr::null_mut();
+            let mut len = 0usize;
+            let rc = unsafe {
+                net_blob_publish(
+                    id.as_ptr(),
+                    uri.as_ptr(),
+                    payload.as_ptr(),
+                    payload.len(),
+                    &mut out,
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0);
+            let v = unsafe { std::slice::from_raw_parts(out, len) }.to_vec();
+            unsafe { net_blob_free_buffer(out, len) };
+            v
+        }
+
+        fn resolve(id: &std::ffi::CStr, encoded: &[u8]) -> c_int {
+            let mut out: *mut u8 = std::ptr::null_mut();
+            let mut len = 0usize;
+            let rc = unsafe {
+                net_blob_resolve(
+                    id.as_ptr(),
+                    encoded.as_ptr(),
+                    encoded.len(),
+                    &mut out,
+                    &mut len,
+                )
+            };
+            if rc == 0 {
+                unsafe { net_blob_free_buffer(out, len) };
+            }
+            rc
+        }
+
+        /// Barrier tests share process-global state; serialize them (CI
+        /// runs lib tests with `cargo test`, i.e. threads in one process).
+        static BARRIER_TESTS: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn owned_ctx_releases_once_on_unregister_and_never_on_refusal() {
+            let id = std::ffi::CString::new("ffi-cb-owned-basic").unwrap();
+            let ctx = owned_ctx();
+            let vt = vtable();
+            unsafe {
+                assert_eq!(
+                    net_blob_register_callback_adapter_owned(
+                        id.as_ptr(),
+                        &vt,
+                        ctx as *mut c_void,
+                        Some(owned_release)
+                    ),
+                    0
+                );
+            }
+            // A second registration under the same id is refused: its
+            // context stays the caller's and is never released.
+            let dup = owned_ctx();
+            unsafe {
+                assert_eq!(
+                    net_blob_register_callback_adapter_owned(
+                        id.as_ptr(),
+                        &vt,
+                        dup as *mut c_void,
+                        Some(owned_release)
+                    ),
+                    NET_ERR_BLOB_DUPLICATE_ID
+                );
+            }
+            assert_eq!(
+                released(dup),
+                0,
+                "a refused registration must not release ctx"
+            );
+            // A NULL release_fn is refused too.
+            unsafe {
+                assert_eq!(
+                    net_blob_register_callback_adapter_owned(
+                        id.as_ptr(),
+                        &vt,
+                        dup as *mut c_void,
+                        None
+                    ),
+                    c_int::from(NetError::NullPointer)
+                );
+            }
+
+            let encoded = publish(&id, b"owned-basic");
+            assert_eq!(resolve(&id, &encoded), 0);
+            assert_eq!(released(ctx), 0, "registered and idle: not released");
+            assert_eq!(unsafe { net_blob_unregister_adapter(id.as_ptr()) }, 1);
+            assert_eq!(released(ctx), 1, "released exactly once after unregister");
+            assert_eq!(released(dup), 0);
+            unsafe {
+                drop(Box::from_raw(ctx));
+                drop(Box::from_raw(dup));
+            }
+        }
+
+        /// Unregister while a fetch is held inside the callback: release
+        /// waits for the in-flight call, then fires exactly once.
+        #[test]
+        fn owned_ctx_release_waits_for_a_held_fetch() {
+            let _serial = BARRIER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+            for stage in [1usize, 2] {
+                let id = std::ffi::CString::new(format!("ffi-cb-owned-held-{stage}")).unwrap();
+                let ctx = owned_ctx();
+                let vt = vtable();
+                unsafe {
+                    assert_eq!(
+                        net_blob_register_callback_adapter_owned(
+                            id.as_ptr(),
+                            &vt,
+                            ctx as *mut c_void,
+                            Some(owned_release)
+                        ),
+                        0
+                    );
+                }
+                let encoded = publish(&id, format!("held at {stage}").as_bytes());
+
+                crate::ffi::blob::callback_barrier::arm(stage, ctx as usize);
+                let id2 = id.clone();
+                let enc2 = encoded.clone();
+                let worker = std::thread::spawn(move || resolve(&id2, &enc2));
+                assert!(
+                    crate::ffi::blob::callback_barrier::wait_held(
+                        stage,
+                        std::time::Duration::from_secs(5)
+                    ),
+                    "stage {stage}: never held"
+                );
+
+                assert_eq!(unsafe { net_blob_unregister_adapter(id.as_ptr()) }, 1);
+                assert_eq!(
+                    released(ctx),
+                    0,
+                    "stage {stage}: released while a call still held ctx"
+                );
+
+                crate::ffi::blob::callback_barrier::release(stage);
+                assert_eq!(
+                    worker.join().unwrap(),
+                    0,
+                    "stage {stage}: the held fetch must complete"
+                );
+                // The worker's resolve returned after the blocking task
+                // dropped its reference, so release has run.
+                assert_eq!(
+                    released(ctx),
+                    1,
+                    "stage {stage}: released exactly once after the call"
+                );
+                unsafe { drop(Box::from_raw(ctx)) };
+            }
+        }
+
+        /// The awaiting future is dropped while the blocking callback is
+        /// held; release still runs exactly once, after the callback.
+        #[test]
+        fn owned_ctx_release_once_when_the_future_is_cancelled() {
+            let _serial = BARRIER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+            let ctx = owned_ctx();
+            let payload = b"cancelled mid-callback";
+            let hash = *blake3::hash(payload).as_bytes();
+            unsafe { &*ctx }
+                .inner
+                .store
+                .lock()
+                .unwrap()
+                .insert(hash, payload.to_vec());
+            let octx = Arc::new(OpaqueCtx::owned(ctx as *mut c_void, owned_release));
+            octx.arm();
+            let adapter = CallbackBlobAdapter {
+                id: "ffi-cb-owned-cancel".into(),
+                vtable: vtable(),
+                ctx: Arc::clone(&octx),
+            };
+            drop(octx);
+            let blob = crate::adapter::net::dataforts::BlobRef::small(
+                "cb://cancel",
+                hash,
+                payload.len() as u64,
+            );
+
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            crate::ffi::blob::callback_barrier::arm(1, ctx as usize);
+            let task = rt.spawn(async move {
+                let _ = adapter.fetch(&blob).await;
+            });
+            assert!(crate::ffi::blob::callback_barrier::wait_held(
+                1,
+                std::time::Duration::from_secs(5)
+            ));
+            task.abort(); // cancel the awaiting future; drops the adapter
+            rt.block_on(async {
+                let _ = task.await;
+            });
+            assert_eq!(released(ctx), 0, "the blocking callback still holds ctx");
+            crate::ffi::blob::callback_barrier::release(1);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while released(ctx) == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                released(ctx),
+                1,
+                "released exactly once after the cancelled call finished"
+            );
+            drop(rt);
+            assert_eq!(released(ctx), 1);
+            unsafe { drop(Box::from_raw(ctx)) };
         }
     }
 

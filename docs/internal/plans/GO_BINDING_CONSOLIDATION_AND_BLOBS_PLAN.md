@@ -10,7 +10,8 @@ cross-language fixture. CI: S1's head ran green on every Go job, including the n
 `-race` step and its roster. Its one failure was the Firefox browser
 witness `stage5_a_refused_connect_closes_rtc_and_hands_back_its_attempt`
 (wasm leaf), which no Go change reaches and which also fails
-intermittently on `master` (run 36970267483). S5b deferred (see S5b); S7 done (classification and ledger; the large
+intermittently on `master` (run 36970267483). S5b done in the gap closure
+(G-B); S7 done (classification and ledger; the large
 ports are deferred, see S7); S8 done (full deletion, by the user's decision;
 see S8). Owed: the release notes.
 
@@ -823,9 +824,10 @@ Evidence (Windows):
 
 ### S5b: callback blob adapters
 
-**Deferred, 2026-10-03.** The plan allows this: S5 stands without it. The
-design under "Decision: callback blob adapters" is unchanged and still
-owed: an additive owned-context registration with a release from the
+**Deferred, 2026-10-03, then done as gap G-B the same day** (see
+[G-B](#g-b-go-implemented-blob-adapters-s5b) for what landed). The deferral
+note, kept for the record: the design under "Decision: callback blob
+adapters" was unchanged and still owed: an additive owned-context registration with a release from the
 shared context's drop, plus `test-helpers` barriers for the
 unregister-while-held witnesses. That is native work (a new export, new
 test hooks) of the same size as S6, so it waits until S6's ABI table and
@@ -1315,6 +1317,75 @@ The design under "Decision: callback blob adapters" stands as written:
 **Proves it:** the S5b list, implemented through `fixtures`-gated barrier
 seams (hold a worker before the handle lookup, and before `free_buffer`).
 Plus a Rust test of the release-once contract under a cancelled future.
+
+**G-B done, 2026-10-03.**
+
+- **C ABI (additive):** `net_blob_register_callback_adapter_owned(id,
+  vtable, ctx, release_fn)`. `OpaqueCtx` carries an optional release and
+  an `armed` flag; `release_fn` runs from its `Drop`, and only once armed,
+  which happens after the registry accepts the adapter. So a refusal
+  (NULL vtable or `release_fn`: −1; NULL entry: −115; duplicate id: −111)
+  never calls it. The existing registration and the vtable layout are
+  unchanged. Both net headers now declare `net_blob_adapter_vtable_t` (it
+  was never in a header before) and the new function. Four symbols were
+  added to `exports.baseline` by hand: the registration plus three
+  `fixtures` seams. `check-ffi-exports.py` matches the built `net.dll`
+  (601).
+- **Barrier:** `callback_barrier`, compiled under `cfg(test)` or
+  `fixtures`, a no-op otherwise. Stage 1 is before the fetch or
+  fetch_range callback; stage 2 is before `free_buffer`. An arm targets one
+  context address (NULL/0 = any), so concurrent tests on other adapters
+  never trip it. Seams: `net_blob_test_barrier_{arm,wait_held,release}`.
+- **Rust witnesses** (in `callback_adapter_round_trip`, so they run in the
+  unit job):
+  - `owned_ctx_releases_once_on_unregister_and_never_on_refusal`: killed by
+    the mutant "Drop ignores `armed`";
+  - `owned_ctx_release_waits_for_a_held_fetch`: both stages;
+  - `owned_ctx_release_once_when_the_future_is_cancelled`: aborts the
+    awaiting task while the blocking callback is held. Release is 0 until
+    the barrier opens, then exactly 1.
+- **Go:** `BlobAdapter` (`Store`/`Fetch`/`FetchRange`/`Exists` over a
+  `BlobKey{URI, Hash, Size}`) and `RegisterBlobAdapter`, in
+  `go/blob_adapter.go`.
+  - The context is a `cgo.Handle`, crossing as `uintptr_t`. The integer to
+    pointer cast happens in `blob_adapter_bridge.c`, so no Go code converts
+    an integer to `unsafe.Pointer`.
+  - The vtable thunks live in C. `free_buffer` is a plain C `free` of the
+    `C.malloc` buffer `writeBlobOut` filled.
+  - Every exported trampoline starts with the `recoverCallback` guard, and
+    `TestEveryUserCallbackTrampolineContainsPanics` audits them.
+  - The release trampoline deletes the handle.
+  - Adapter errors map `ErrBlobNotFound` → −113, `ErrBlobUnsupportedScheme`
+    → −116, anything else → −115.
+- **Go witnesses** (roster "Go blob adapters, owned handles", 12):
+  - untagged:
+    - round-trip, including the exact `BlobKey`;
+    - empty blob;
+    - release exactly once after unregister;
+    - a duplicate id keeps the handle in Go and is never released;
+    - unregister while a `Fetch` is blocked in Go;
+    - same-id re-registration while the old call is held (each call
+      reaches its own adapter; only the old one is released);
+    - an adapter panic gives `ErrBlobBackend` and counts;
+    - error mapping;
+    - refusals (nil adapter, NUL id);
+    - `TestABIStabilityBlobOwnedRegistrationMatchesRust`, which checks the
+      arity and the vtable entry order on both sides.
+  - `-tags test_helpers`:
+    - the native barrier at stage 1 and stage 2, unregistering while held;
+    - a panic in the trampoline's own handle lookup (deleted handle) is
+      contained.
+- **Cancellation from Go** has no surface: `BlobResolve` is synchronous
+  and takes no context. The cancelled-future case is therefore witnessed
+  in Rust, where it can occur (an async caller dropping the resolve).
+- Evidence:
+  - the full Go package with `-tags test_helpers` passes, as does `-race
+    -count=3` over the adapter tests;
+  - Rust `ffi::blob::` passes 13/13;
+  - clippy is strict for lib/bins in all three feature configurations,
+    and the lib-test target is clean;
+  - rustdoc `-D warnings` passes;
+  - all roster steps this plan owns pass from the YAML.
 
 ## Risks
 

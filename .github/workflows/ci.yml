@@ -4979,6 +4979,31 @@ jobs:
             TestABIStabilityBlobV3ArityMatchesRust \
             TestCrossLangBlobDescribeVectors || exit 1
 
+      # Go-implemented blob adapters (plan gap G-B / S5b): the substrate owns
+      # the cgo.Handle and releases it exactly once, after unregister AND the
+      # last in-flight call. The stage-1/stage-2 barrier and lookup-panic
+      # witnesses are `-tags test_helpers` (fixtures-only native barrier, a
+      # cgo call into the trampoline); the rest run
+      # untagged and under the -race step's ^TestBlob filter.
+      - name: Witness roster — Go blob adapters, owned handles (12)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label blob_adapter_test --mode decl \
+            --source blob_adapter_test.go --source blob_adapter_barrier_test.go \
+            --source abi_stability_test.go \
+            TestBlobAdapterGoRoundTrip \
+            TestBlobAdapterGoEmptyBlob \
+            TestBlobAdapterGoReleasedOnceAfterUnregister \
+            TestBlobAdapterGoDuplicateIDKeepsHandleInGo \
+            TestBlobAdapterGoUnregisterWaitsForAnInFlightFetch \
+            TestBlobAdapterGoReRegisterWhileOldCallHeld \
+            TestBlobAdapterGoPanicIsContained \
+            TestBlobAdapterGoErrorsMap \
+            TestBlobAdapterGoRefusals \
+            TestBlobAdapterGoReleaseWaitsForAHeldNativeCall             TestBlobAdapterGoLookupPanicIsContained \
+            TestABIStabilityBlobOwnedRegistrationMatchesRust || exit 1
+
       # === the Go org facade live cells ==
       # The run above EXECUTED these 6 live cells (3 shapes x {same-org,
       # granted}, call+serve live two-node with verified-caller attribution

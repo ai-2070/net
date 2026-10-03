@@ -410,3 +410,61 @@ func TestABIStabilityGreedyCacheForArityMatchesRust(t *testing.T) {
 		}
 	}
 }
+
+// TestABIStabilityBlobOwnedRegistrationMatchesRust pins the S5b surface
+// (gap G-B): the owned registration's arity, and the vtable's entry order,
+// which C reads positionally. A field added, dropped or reordered on either
+// side would make the substrate call the wrong Go trampoline.
+func TestABIStabilityBlobOwnedRegistrationMatchesRust(t *testing.T) {
+	srcBytes, err := os.ReadFile("../net/crates/net/src/ffi/blob.rs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(srcBytes)
+	def := regexp.MustCompile(`pub unsafe extern "C" fn net_blob_register_callback_adapter_owned\(([^)]*)\)`).FindStringSubmatch(src)
+	if def == nil {
+		t.Fatal("net_blob_register_callback_adapter_owned is not defined in src/ffi/blob.rs")
+	}
+	h := parseHeader(t, "net.h")
+	params, ok := h.fns["net_blob_register_callback_adapter_owned"]
+	if !ok {
+		t.Fatal("net_blob_register_callback_adapter_owned is not declared in go/net.h")
+	}
+	got := 0
+	for _, p := range strings.Split(def[1], ",") {
+		if strings.TrimSpace(p) != "" {
+			got++
+		}
+	}
+	if want := strings.Count(params, ",") + 1; got != want {
+		t.Errorf("Rust definition takes %d parameters, the header declares %d", got, want)
+	}
+
+	rustStruct := regexp.MustCompile(`(?s)pub struct NetBlobAdapterVtable \{(.*?)\n\}`).FindStringSubmatch(src)
+	if rustStruct == nil {
+		t.Fatal("NetBlobAdapterVtable not found in src/ffi/blob.rs")
+	}
+	var rustFields []string
+	for _, m := range regexp.MustCompile(`(?m)^\s*pub (\w+):`).FindAllStringSubmatch(rustStruct[1], -1) {
+		rustFields = append(rustFields, m[1])
+	}
+	hdr, err := os.ReadFile("net.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cStruct := regexp.MustCompile(`(?s)typedef struct net_blob_adapter_vtable_s \{(.*?)\} net_blob_adapter_vtable_t;`).FindStringSubmatch(string(hdr))
+	if cStruct == nil {
+		t.Fatal("net_blob_adapter_vtable_t not found in go/net.h")
+	}
+	var cFields []string
+	for _, m := range regexp.MustCompile(`\(\*(\w+)\)`).FindAllStringSubmatch(cStruct[1], -1) {
+		cFields = append(cFields, m[1])
+	}
+	want := []string{"store", "fetch", "fetch_range", "exists", "free_buffer"}
+	if strings.Join(rustFields, ",") != strings.Join(want, ",") {
+		t.Errorf("Rust vtable fields = %v, want %v", rustFields, want)
+	}
+	if strings.Join(cFields, ",") != strings.Join(want, ",") {
+		t.Errorf("C vtable fields = %v, want %v", cFields, want)
+	}
+}

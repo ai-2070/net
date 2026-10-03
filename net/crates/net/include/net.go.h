@@ -1828,6 +1828,36 @@ int net_blob_resolve(const char* adapter_id,
                      uint8_t** out_content,
                      size_t* out_content_len);
 
+/* Callback-backed adapter: the substrate dispatches BlobAdapter calls into a
+ * caller-supplied function table. Every entry must be non-NULL (-115
+ * otherwise). Calls arrive on substrate worker threads and may overlap.
+ * fetch / fetch_range return a buffer the substrate hands back to
+ * free_buffer once it has copied the bytes. */
+typedef struct net_blob_adapter_vtable_s {
+    int (*store)(void* ctx, const char* uri, const uint8_t* hash, uint64_t size,
+                 const uint8_t* data, size_t data_len);
+    int (*fetch)(void* ctx, const char* uri, const uint8_t* hash, uint64_t size,
+                 uint8_t** out_data, size_t* out_len);
+    int (*fetch_range)(void* ctx, const char* uri, const uint8_t* hash, uint64_t size,
+                       uint64_t range_start, uint64_t range_end,
+                       uint8_t** out_data, size_t* out_len);
+    int (*exists)(void* ctx, const char* uri, const uint8_t* hash, uint64_t size,
+                  int* out_exists);
+    void (*free_buffer)(void* ctx, uint8_t* data, size_t len);
+} net_blob_adapter_vtable_t;
+
+typedef void (*net_blob_adapter_release_fn)(void* ctx);
+
+/* Register a callback adapter that takes ownership of `ctx`: release_fn(ctx)
+ * runs exactly once, after the adapter is unregistered AND the last in-flight
+ * call holding ctx has returned (including its free_buffer). On any non-zero
+ * return (NULL vtable or release_fn: -1; NULL entry: -115; duplicate id:
+ * -111) release_fn is never called and ctx stays the caller's. */
+int net_blob_register_callback_adapter_owned(const char* adapter_id,
+                                             const net_blob_adapter_vtable_t* vtable,
+                                             void* ctx,
+                                             net_blob_adapter_release_fn release_fn);
+
 /* ---- v0.3 tree / erasure / range / repair ----
  *
  * Contract (docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md,

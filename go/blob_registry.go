@@ -6,9 +6,8 @@
 // registry the RedEX blob-overflow path consults; it is separate from a
 // MeshBlobAdapter value, which you hold directly.
 //
-// Only the filesystem adapter is registrable from Go today. Go-implemented
-// (callback) adapters need a native ownership contract that does not exist
-// yet; see GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md, S5b.
+// The filesystem adapter is built in; a Go-implemented adapter registers
+// through RegisterBlobAdapter (blob_adapter.go).
 
 package net
 
