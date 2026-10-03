@@ -311,7 +311,8 @@ destructor (`:509–522`), and `OpaqueCtx` gives no drop notification
 - **Panic containment.** `recover` wraps the entire exported trampoline,
   including the handle lookup and type assertion, not just the user method.
 
-S5b can be deferred without affecting S5. Deferring it doesn't make the S7
+*Historical (S5b is done, see G-B):* S5b could be deferred without
+affecting S5. Deferring it didn't make the S7
 placement port safe.
 
 ### Decision: placement-filter lifetime (S7)
@@ -826,14 +827,12 @@ Evidence (Windows):
 
 ### S5b: callback blob adapters
 
-**Deferred, 2026-10-03, then done as gap G-B the same day** (see
-[G-B](#g-b-go-implemented-blob-adapters-s5b) for what landed). The deferral
-note, kept for the record: the design under "Decision: callback blob
-adapters" was unchanged and still owed: an additive owned-context registration with a release from the
-shared context's drop, plus `test-helpers` barriers for the
-unregister-while-held witnesses. That is native work (a new export, new
-test hooks) of the same size as S6, so it waits until S6's ABI table and
-export-baseline discipline are in practice.
+**Done, 2026-10-03, as gap G-B** (see
+[G-B](#g-b-go-implemented-blob-adapters-s5b) for what landed and its
+evidence). *Historical:* the slice was first deferred until S6's ABI table
+and export-baseline discipline were in practice, since it is native work
+of the same size (a new export, new test hooks). The specification below
+is the one G-B implemented.
 
 `RegisterBlobAdapter(id, BlobAdapter)`: a Go interface with `Store`, `Fetch`,
 `FetchRange` and `Exists`, registered through
@@ -1396,7 +1395,9 @@ Plus a Rust test of the release-once contract under a cancelled future.
   disagreement, and S7 records each one.
 - **Callback lifetime needs new native ownership.** *Fallback:* S5b and the
   placement port are each deferrable with a ledger entry. S1–S5 and S6 don't
-  depend on either.
+  depend on either. **Retired for S5b by G-B:** the owned-context
+  registration is that native ownership. The placement port is still
+  deferred (S7).
 - **Windows dev box vs Linux CI.** cgo runs locally (WinLibs gcc, `net.dll`
   on PATH), and CI checks `libnet.so`. *Fallback:* the export checker
   compares a platform-neutral name set. A Linux mismatch is investigated as

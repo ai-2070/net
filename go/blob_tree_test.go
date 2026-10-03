@@ -112,8 +112,8 @@ func TestBlobTreeRangeContract(t *testing.T) {
 	if _, err := a.FetchRange(big, 0, 1<<30+1); !errors.Is(err, ErrBlobInvalidArgument) {
 		t.Fatalf("range over the 1 GiB cap: want ErrBlobInvalidArgument, got %v", err)
 	}
-	if _, err := a.FetchRange(big, 0, 1<<30); errors.Is(err, ErrBlobInvalidArgument) || err == nil {
-		t.Fatalf("range of exactly 1 GiB: want a not-found failure past the checks, got %v", err)
+	if _, err := a.FetchRange(big, 0, 1<<30); !errors.Is(err, ErrBlobNotFound) {
+		t.Fatalf("range of exactly 1 GiB: want ErrBlobNotFound past the checks, got %v", err)
 	}
 	if _, err := a.FetchRange(nil, 0, 1); !errors.Is(err, ErrBlobInvalidArgument) {
 		t.Fatalf("empty ref: want ErrBlobInvalidArgument, got %v", err)

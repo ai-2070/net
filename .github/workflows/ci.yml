@@ -4987,9 +4987,10 @@ jobs:
       # the cgo.Handle and releases it exactly once, after unregister AND the
       # last in-flight call. The stage-1/stage-2 barrier and lookup-panic
       # witnesses are `-tags test_helpers` (fixtures-only native barrier, a
-      # cgo call into the trampoline); the rest run
-      # untagged and under the -race step's ^TestBlob filter.
-      - name: Witness roster — Go blob adapters, owned handles (12)
+      # cgo call into the trampoline); the untagged TestBlob* witnesses also
+      # run under the -race step's ^TestBlob filter. The TestABI parity
+      # witness runs in the full suite only.
+      - name: Witness roster — Go blob adapters, owned handles (13)
         working-directory: go
         run: |
           set -uo pipefail
@@ -5005,6 +5006,7 @@ jobs:
             TestBlobAdapterGoPanicIsContained \
             TestBlobAdapterGoErrorsMap \
             TestBlobAdapterGoRefusals \
+            TestBlobAdapterGoAllocationFailureIsAnError \
             TestBlobAdapterGoReleaseWaitsForAHeldNativeCall             TestBlobAdapterGoLookupPanicIsContained \
             TestABIStabilityBlobOwnedRegistrationMatchesRust || exit 1
 

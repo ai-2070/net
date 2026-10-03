@@ -35,7 +35,13 @@ static int blobExists(void* ctx, const char* uri, const uint8_t* hash, uint64_t 
     return goBlobExists((uintptr_t)ctx, (char*)uri, (uint8_t*)hash, size, out_exists);
 }
 
-// Fetch buffers are C.malloc'd by writeBlobOut; no Go call needed to free.
+// Fetch buffers come from here (via writeBlobOut), so free_buffer below is
+// the matching free. Plain malloc: NULL on failure, reported as -115.
+void* netGoBlobMalloc(size_t n) {
+    return malloc(n);
+}
+
+// Fetch buffers are malloc'd by writeBlobOut; no Go call needed to free.
 static void blobFreeBuffer(void* ctx, uint8_t* data, size_t len) {
     (void)ctx;
     (void)len;

@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // memAdapter is an in-memory BlobAdapter. A non-nil hold makes every Fetch
@@ -374,7 +375,36 @@ func TestBlobAdapterGoRefusals(t *testing.T) {
 	if err := RegisterBlobAdapter("go-test/nil", nil); !errors.Is(err, ErrBlobInvalidArgument) {
 		t.Fatalf("nil adapter = %v, want ErrBlobInvalidArgument", err)
 	}
+	// A typed nil passes `a == nil`; it must be refused too, not registered
+	// to panic on its first callback (cubic review, PR #1165).
+	var typedNil *memAdapter
+	if err := RegisterBlobAdapter("go-test/typed-nil", typedNil); !errors.Is(err, ErrBlobInvalidArgument) {
+		t.Fatalf("typed-nil adapter = %v, want ErrBlobInvalidArgument", err)
+	}
+	if ok, _ := BlobAdapterRegistered("go-test/typed-nil"); ok {
+		t.Fatal("the typed-nil adapter was registered")
+	}
 	if err := RegisterBlobAdapter("go-test/\x00nul", newMemAdapter()); !errors.Is(err, ErrBlobInvalidArgument) {
 		t.Fatalf("NUL id = %v, want ErrBlobInvalidArgument", err)
+	}
+}
+
+// A failed result allocation is a backend error from the callback, not a
+// NULL handed to memcpy (cubic review, PR #1165).
+func TestBlobAdapterGoAllocationFailureIsAnError(t *testing.T) {
+	id := registerGoAdapter(t, newMemAdapter())
+	ref, err := BlobPublish(id, "mem://go/oom", []byte("needs a buffer"))
+	if err != nil {
+		t.Fatalf("BlobPublish: %v", err)
+	}
+	failing := func(int) unsafe.Pointer { return nil }
+	blobOutAllocHook.Store(&failing)
+	defer blobOutAllocHook.Store(nil)
+	if _, err := BlobResolve(id, ref); !errors.Is(err, ErrBlobBackend) {
+		t.Fatalf("BlobResolve with a failing allocator = %v, want ErrBlobBackend", err)
+	}
+	blobOutAllocHook.Store(nil)
+	if _, err := BlobResolve(id, ref); err != nil {
+		t.Fatalf("BlobResolve after the allocator recovers: %v", err)
 	}
 }

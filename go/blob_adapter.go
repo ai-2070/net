@@ -29,12 +29,18 @@ package net
 // handle as ctx. The uintptr_t-to-pointer cast happens in C, so no Go code
 // converts an integer to unsafe.Pointer.
 extern int netGoRegisterBlobAdapter(const char* adapter_id, uintptr_t handle);
+
+// Also in blob_adapter_bridge.c: plain malloc, which may return NULL. cgo's
+// own C.malloc never returns NULL; it aborts the process instead, which a
+// fetch callback must not do.
+extern void* netGoBlobMalloc(size_t n);
 */
 import "C"
 
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime/cgo"
 	"sync/atomic"
 	"unsafe"
@@ -78,7 +84,7 @@ func RegisterBlobAdapter(id string, a BlobAdapter) error {
 // registerBlobAdapter returns the handle the substrate now owns (tests use
 // it to target a barrier at this registration).
 func registerBlobAdapter(id string, a BlobAdapter) (cgo.Handle, error) {
-	if a == nil {
+	if isNilAdapter(a) {
 		return 0, fmt.Errorf("%w: nil BlobAdapter", ErrBlobInvalidArgument)
 	}
 	cID, err := cStringArg("adapter id", id)
@@ -94,6 +100,20 @@ func registerBlobAdapter(id string, a BlobAdapter) (cgo.Handle, error) {
 		return 0, err
 	}
 	return h, nil
+}
+
+// isNilAdapter reports a nil interface or a typed nil inside one (a nil
+// *T), which would register fine and then panic on the first callback.
+func isNilAdapter(a BlobAdapter) bool {
+	if a == nil {
+		return true
+	}
+	v := reflect.ValueOf(a)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+		return v.IsNil()
+	}
+	return false
 }
 
 // blobCallbackCode maps an adapter error to the code the substrate expects.
@@ -121,18 +141,37 @@ func blobKeyFrom(uri *C.char, hash *C.uint8_t, size C.uint64_t) BlobKey {
 	return k
 }
 
-// writeBlobOut copies b into a C.malloc buffer the bridge's free_buffer
+// blobOutAllocHook, when set, replaces the result-buffer allocator, so a
+// test can simulate allocation failure. Atomic: callbacks read it on
+// substrate threads. Nil in production.
+var blobOutAllocHook atomic.Pointer[func(n int) unsafe.Pointer]
+
+// blobOutAlloc allocates a fetch result buffer, nil on failure.
+func blobOutAlloc(n int) unsafe.Pointer {
+	if hook := blobOutAllocHook.Load(); hook != nil {
+		return (*hook)(n)
+	}
+	return C.netGoBlobMalloc(C.size_t(n))
+}
+
+// writeBlobOut copies b into a malloc'd buffer the bridge's free_buffer
 // frees. An empty result is (NULL, 0), which the substrate reads as empty.
-func writeBlobOut(b []byte, outData **C.uint8_t, outLen *C.size_t) {
+// It reports false, with the outputs still (NULL, 0), when the allocation
+// fails.
+func writeBlobOut(b []byte, outData **C.uint8_t, outLen *C.size_t) bool {
 	*outData = nil
 	*outLen = 0
 	if len(b) == 0 {
-		return
+		return true
 	}
-	p := C.malloc(C.size_t(len(b)))
+	p := blobOutAlloc(len(b))
+	if p == nil {
+		return false
+	}
 	C.memcpy(p, unsafe.Pointer(&b[0]), C.size_t(len(b)))
 	*outData = (*C.uint8_t)(p)
 	*outLen = C.size_t(len(b))
+	return true
 }
 
 //export goBlobStore
@@ -174,7 +213,9 @@ func goBlobFetch(h C.uintptr_t, uri *C.char, hash *C.uint8_t, size C.uint64_t,
 	if err != nil {
 		return blobCallbackCode(err)
 	}
-	writeBlobOut(b, outData, outLen)
+	if !writeBlobOut(b, outData, outLen) {
+		return -115
+	}
 	return 0
 }
 
@@ -197,7 +238,9 @@ func goBlobFetchRange(h C.uintptr_t, uri *C.char, hash *C.uint8_t, size C.uint64
 	if err != nil {
 		return blobCallbackCode(err)
 	}
-	writeBlobOut(b, outData, outLen)
+	if !writeBlobOut(b, outData, outLen) {
+		return -115
+	}
 	return 0
 }
 
