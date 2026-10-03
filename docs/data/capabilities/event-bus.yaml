@@ -325,7 +325,8 @@ operations:
       status: supported
       anchor: serve_a2a_configured
     Node / TS:
-      status: not exposed
+      status: supported
+      anchor: serveA2aConfigured
     Python:
       status: supported
       anchor: serve_a2a_configured

@@ -1,8 +1,9 @@
 # Implementation Plan: Node/TS paid A2A task admission (Python parity)
 
-**Status: PLANNED, revision 2.3 — 2026-10-03** (r2.2 re-reviewed HOLD for bounded follow-up; S1–S4 repaired, awaiting sign-off) (branch `LZL0/node-a2a`),
+**Status: IMPLEMENTED 2026-10-03 — revision 2.3 (r2.2 re-reviewed HOLD for bounded follow-up; S1–S4 repaired). All slices WS-A…WS-G landed (commits `132a56121` … see each slice's status block); the release note awaits its codename at release time. Awaiting the reviewer's sign-off on the implementation.** (branch `LZL0/node-a2a`),
 targeting the first release after 0.39.0. Scope captured from a survey of the
-tree at `2ecac31c0`; nothing below is implemented yet. Revision 1
+tree at `2ecac31c0` (the survey text below is kept as written; each slice
+carries its landed status). Revision 1
 (`b71d27c4a`) was reviewed **HOLD** (architecture retained); r2 repairs the
 seven findings in place. Each repair is tagged **r2 (R*n*)** next to the text
 it changed, and the reviewer's four decisions are adopted (§Decisions).
@@ -951,6 +952,78 @@ malformed-document refusals.
 releases sync); the skill-snippet checker.
 
 ---
+
+> **Status: WS-F landed 2026-10-03, except the release note (below).**
+>
+> - **Cross-binding fixture.** The Node half is in `test/a2a_paid.test.ts`
+>   ("cross-binding fixture"): the Node binding reproduces all 11 documents of
+>   the Python-captured `tests/cross_lang_a2a_paid/envelopes.json` exactly.
+>   That is the D1 tripwire, and it passed on the first run. Shapes mask every
+>   integer to `"<int>"`, so the comparison is precision-free by construction.
+>   It uses the same drained-queue poll as the Python capture.
+> - **R1, the caller's live-vs-retained leg** (`test/a2a_paid.test.ts`,
+>   "retained vs live resolution"), over the C5 seeder:
+>   - Both rows sit under one key and both are `paid_unexecutable`. The
+>     retained row resolves by its `generation` document.
+>   - The live row's own generation is refused (`resolve_superseded_attempt`).
+>   - After the historical resolution, the live row's `a2aDocument` string is
+>     unchanged byte for byte. The live row then resolves with no generation.
+>
+>   `ci.yml`'s node job now builds the seeder and exports `NET_A2A_SEEDER_EXE`,
+>   as the Python job does.
+> - **R6, live same-org, both slots, both SDKs**:
+>   - Node: `test/a2a_paid_org_live.test.ts`.
+>   - Python SDK: the `same_org` consumer cell, the fifth pinned row of the
+>     `python-tests` step (floor 5).
+>
+>   Each run checks the following. An un-admitted describe and prepare are
+>   refused. An org client on the mesh slot reaches
+>   describe/taskStatus/cancelTask, and on the gateway slot carries prepare →
+>   purchase → submit through the protected catalog, running the task once.
+>   The preflight sees `kind: "entity"` with the caller's entity id. Clearing
+>   both slots denies again before launch. The cross-org `granted` principal
+>   remains SDK-witness-only (`a2a_admission_identity`), as qualified.
+> - **Matrix**:
+>   - `docs/data/capabilities/event-bus.yaml` flips the Node cell to
+>     `supported` / `serveA2aConfigured`. `capability_records.py --write`
+>     regenerated `coverage.md` and `capability-record.json`, and `--check`
+>     passes, including anchor resolution in the Node tree.
+>   - `README.md:350` flips to ✓.
+>   - The hand-written `coverage.md` prose no longer calls Node payments
+>     core-only, and it names the Python factories.
+> - **Docs**:
+>   - The agent-to-agent guide's paid rows are rewritten. It gains an SDK-route
+>     TypeScript example and the three Node rules (the `a2aDocument`/`a2aU64`
+>     handoff, `classifyError`, and the one-sided cancellation and
+>     paid-timeout caveat). Its prepare/purchase rows now say prepare quotes and
+>     persists while purchase consumes that quote; the old purchase row said
+>     purchase quoted.
+>   - `.claude/skills/net-event-bus/a2a.md` "Paid A2A" shows the `net_sdk` form
+>     first, with the raw form noted as valid, plus the Node example (WS-G's
+>     deferred docs bullet).
+>   - `examples/a2a_paid.py` (CI-executed) is untouched.
+> - **Not done, deliberately: the release note.** `RELEASE_STEPS.md` drafts the
+>   note at release time under the codename chosen in step 2, and inventing a
+>   0.40 codename is not this change's call. Ready-to-paste entry for that note:
+>
+>   > **Paid A2A on Node and through both SDKs.** A Node `PaymentProvider`
+>   > serves catalog-driven paid A2A (`serveA2aConfigured`, with the
+>   > `a2aUnresolved` / `a2aResolve` operator queue). A Node
+>   > `CapabilityGateway` buys it (`prepareTask` → `purchaseTask` →
+>   > `submitTask`, with `a2aAttempts` / `a2aResolveAttempt`); the raw
+>   > requester verbs are `describeA2a` / `submitTaskPaid`. Paid-A2A
+>   > documents carry u64 fields, so hand them back with `a2aDocument` /
+>   > `a2aU64`, never `JSON.parse` + `JSON.stringify`. `@net-mesh/sdk` and
+>   > `net_sdk` gain factories (`createPaymentProvider` /
+>   > `createCapabilityGateway`, `create_payment_provider` /
+>   > `create_capability_gateway`) that build both from a `MeshNode`.
+>   > `CapabilityGateway` takes a new twelfth constructor argument,
+>   > `a2aPurchasePath`.
+> - **Not run locally:** `web`'s `npm run check` (doc links), which needs the
+>   full web dependency install. The guide edits add no links or anchors.
+>   `check-skill-snippets.py` cannot run on this Windows host (it writes a
+>   backslash path into a TOML string) and compiles `rust` fences only; these
+>   edits are Python and TypeScript.
 
 ### WS-G — Python SDK handle adaptation (r2.2)
 

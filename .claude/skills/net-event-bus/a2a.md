@@ -99,7 +99,8 @@ Two traps:
 **Free or paid is the provider's configuration, never the caller's
 choice.** `serve_a2a` is the free path and is unchanged. The catalog-driven
 path (`serve_a2a_configured` in Rust, `PaymentProvider.serve_a2a_configured`
-in Python) requires every service to be *explicitly* free or paid, and
+in Python, `PaymentProvider.serveA2aConfigured` in Node) requires every
+service to be *explicitly* free or paid, and
 **refuses to start** rather than degrade: a paid service with no pricing
 terms, a free service carrying pricing terms, or a paid service with no
 payment gate or no admission journal are all serve-time errors.
@@ -113,18 +114,23 @@ executor is spawned.
 
 | Verb | Does | Money |
 |---|---|---|
-| `prepare_task` | validate, preflight, reserve capacity, mint the admission id, quote | none — read-only on the money side |
+| `prepare_task` | validate, preflight, reserve capacity, mint the admission id, quote, persist the attempt | none — no funds move |
 | `purchase_task` | spend policy, author the payload once, pay | the one charge |
 | `submit_task` | send the brief + the stored proof; provider redeems, claims, runs | none |
 
 ```python
 import json, time
-from net import CapabilityGateway
+from net_sdk import create_capability_gateway
 
 # All three paths are required for a paid purchase: the spend policy and
 # profile authorize it, the purchase store makes the attempt resumable.
 # A gateway built without the policy raises ValueError on prepare_task.
-gw = CapabilityGateway(
+# `mesh` is a net_sdk.MeshNode (or AsyncMeshNode, or a raw net.NetMesh): the
+# factory adapts the handle and returns the native CapabilityGateway. The
+# low-level form, `net.CapabilityGateway(native_mesh, ...)`, still works.
+# Paid A2A is sync-gateway-only; from asyncio, wrap each verb in
+# asyncio.to_thread.
+gw = create_capability_gateway(
     mesh,
     payment_policy_path="state/payment-policy.json",
     payment_profile="dev_test",
@@ -189,6 +195,33 @@ print("accepted", ack["task_id"])
 
 Only now is there a task to watch: poll
 `mesh.task_status(provider_node_id, ack["task_id"])` until it is terminal.
+
+The same lifecycle from Node, through `@net-mesh/sdk`. The one rule that is
+Node's own: **hand documents back with `a2aDocument`, never
+`JSON.parse` + `JSON.stringify`** — `prepared.provider_node` is a u64, and a JS
+double rounds it, so a round-tripped `prepared` can name another provider. Read
+u64 fields for display with `a2aU64`; statuses and messages are safe to
+`JSON.parse`.
+
+```typescript
+import { createCapabilityGateway, a2aDocument, classifyError, PaymentRefusedError } from '@net-mesh/sdk';
+
+const gw = createCapabilityGateway(meshNode, {
+  paymentPolicyPath: 'state/payment-policy.json',
+  paymentProfile: 'dev_test',
+  a2aPurchasePath: 'state/a2a-purchases.json',
+});
+const env = await gw.prepareTask(providerNodeId, 'research', 'summarize the quarterly filings',
+                                 ['artifact:q3-filings']);
+if (JSON.parse(env).status !== 'ok') throw new Error(env);   // retry only `busy`
+const prepared = a2aDocument(env, '/prepared');               // the complete handle
+const buy = JSON.parse(await gw.purchaseTask(prepared));      // same statuses as Python
+if (buy.status === 'paid') {
+  const ack = JSON.parse(await gw.submitTask(prepared));      // accepted | retry | unexecutable
+}
+// Native rejections are prefixed Errors until classified:
+//   classifyError(e) instanceof PaymentRefusedError   -> e.schematic (byte-exact JSON)
+```
 
 The snippet above is the caller half against an already-running provider. For
 a complete, **runnable** version that stands up both sides — provider with a
