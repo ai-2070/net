@@ -107,7 +107,7 @@
 //! The hazard is documented per-binding in:
 //!   - Python: `bindings/python/README.md` (caller-mutex notes)
 //!   - Node:   `bindings/node/README.md`
-//!   - Go:     `bindings/go/net/redex.go` lifecycle docs
+//!   - Go:     `go/cortex.go` lifecycle docs
 //!   - C:      `include/net.h` (every wait-family declaration)
 //!
 //! # Memory Management
@@ -232,7 +232,7 @@ pub mod transport;
 /// (`net_serve_blob_transfer` / `net_fetch_blob*` / `net_store_dir` /
 /// `net_fetch_dir` / `net_dir_manifest_read` / `net_transport_free_buffer`)
 /// when the quad above is not fully built. The Go binding
-/// (`bindings/go/net/transport.go`) links these unconditionally, so a
+/// (`go/blob.go`, `go/transfer.go`) links these unconditionally, so a
 /// libnet without the quad must still satisfy them — each stub returns
 /// `NET_ERR_FEATURE_NOT_BUILT` (or null / no-op) so Go programs route to
 /// a clean error rather than fail at program load. Empty (compiled out)
@@ -2729,7 +2729,7 @@ mod tests {
             );
             assert!(
                 go_vals.contains(&v),
-                "CR-22 regression: bindings/go/net/net.h is missing the value {} \
+                "CR-22 regression: include/net.go.h is missing the value {} \
                  (Rust NetError defines it).",
                 v
             );

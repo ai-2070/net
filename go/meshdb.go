@@ -8,9 +8,10 @@
 // This file exposes the minimal Reader / Runner / Query / Iterator path:
 // build an in-memory chain reader, append events, construct a runner,
 // execute a query, drain rows. The full surface (window aggregates,
-// joins, filter predicates, cache options) lives in the reference Go
-// binding at `net/crates/net/bindings/go/net/meshdb.go` — extend this
-// file as you need additional operators.
+// joins, filter predicates, cache options) is not in the Go module yet.
+// The removed reference binding's design is kept in the S7 ledger of
+// docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md (source: `git show 610cd4e:net/crates/net/bindings/go/net/meshdb.go`).
+// Extend this file as you need additional operators.
 
 package net
 
@@ -282,8 +283,12 @@ func (it *MeshDbIter) Next() (MeshDbRow, error) {
 		// Copy payload into Go memory and free the substrate-side buffer.
 		var payload []byte
 		if payloadPtr != nil && payloadLen > 0 {
-			payload = C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen))
+			p, perr := copyCBuf(unsafe.Pointer(payloadPtr), uint64(payloadLen))
 			C.net_meshdb_payload_free(payloadPtr, payloadLen)
+			if perr != nil {
+				return MeshDbRow{}, fmt.Errorf("%w: %w", ErrMeshDb, perr)
+			}
+			payload = p
 		}
 		return MeshDbRow{
 			Origin:  uint64(origin),

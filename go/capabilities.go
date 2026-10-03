@@ -190,7 +190,10 @@ func (m *MeshNode) FindNodes(filter CapabilityFilter) ([]uint64, error) {
 		return nil, err
 	}
 	defer C.net_free_string(outJSON)
-	raw := C.GoStringN(outJSON, C.int(outLen))
+	raw, err := copyCString(unsafe.Pointer(outJSON), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("find_nodes response: %w", err)
+	}
 	var ids []uint64
 	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
 		return nil, fmt.Errorf("parse find_nodes response: %w", err)
@@ -263,7 +266,10 @@ func (m *MeshNode) FindNodesScoped(filter CapabilityFilter, scope ScopeFilter) (
 		return nil, err
 	}
 	defer C.net_free_string(outJSON)
-	raw := C.GoStringN(outJSON, C.int(outLen))
+	raw, err := copyCString(unsafe.Pointer(outJSON), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("find_nodes_scoped response: %w", err)
+	}
 	var ids []uint64
 	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
 		return nil, fmt.Errorf("parse find_nodes_scoped response: %w", err)
@@ -366,5 +372,5 @@ func NormalizeGPUVendor(raw string) (string, error) {
 		return "", err
 	}
 	defer C.net_free_string(out)
-	return C.GoStringN(out, C.int(outLen)), nil
+	return copyCString(unsafe.Pointer(out), uint64(outLen))
 }

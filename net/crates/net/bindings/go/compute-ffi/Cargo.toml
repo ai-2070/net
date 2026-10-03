@@ -36,7 +36,7 @@ test-helpers = []
 [dependencies]
 # Core mesh types — needed because we expose C-ABI handles that wrap
 # `NetHandle`-style MeshNode refs handed in by the existing
-# `bindings/go/net` (via the `net_mesh` FFI), and because daemons
+# Go binding in `go/` (via the `net_mesh` FFI), and because daemons
 # reach into `adapter::net::compute::MeshDaemon` / `CausalEvent`
 # types at the bridge layer.
 #

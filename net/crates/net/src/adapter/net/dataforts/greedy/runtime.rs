@@ -679,7 +679,13 @@ impl GreedyRuntime {
         let mut committed = false;
         if !batch.is_empty() {
             match sink.announce_heat_batch(&batch).await {
-                Ok(()) => committed = true,
+                Ok(()) => {
+                    committed = true;
+                    self.inner
+                        .metrics
+                        .cluster()
+                        .add_gravity_heat_emissions(batch.len() as u64);
+                }
                 Err(e) => {
                     tracing::trace!(
                         error = ?e,
@@ -1421,6 +1427,11 @@ mod tests {
         assert_eq!(emissions.len(), 1, "first tick must emit");
         assert_eq!(emissions[0].0, 0xCAFE);
         assert!(emissions[0].1 > 0.0);
+        assert_eq!(
+            rt.metrics().snapshot().cluster.gravity_heat_emissions_total,
+            1,
+            "the confirmed announcement is counted"
+        );
 
         // Second tick — suppress (rate hasn't moved).
         rt.gravity_tick().await;
@@ -1428,6 +1439,16 @@ mod tests {
             heat_sink.announces.lock().len(),
             1,
             "second tick must suppress when rate is unchanged"
+        );
+        let snap = rt.metrics().snapshot();
+        assert_eq!(
+            snap.cluster.gravity_heat_emissions_total, 1,
+            "a suppressed tick announces nothing, so the counter holds"
+        );
+        assert!(
+            snap.prometheus_text()
+                .contains("dataforts_greedy_gravity_heat_emissions_total 1"),
+            "the counter is rendered for scraping"
         );
     }
 
@@ -1515,6 +1536,10 @@ mod tests {
         // Operator-facing signal is the unattributed counter.
         let snap = rt.metrics().snapshot();
         assert_eq!(snap.cluster.gravity_heat_unattributed_total, 2);
+        assert_eq!(
+            snap.cluster.gravity_heat_emissions_total, 0,
+            "nothing announced, nothing counted"
+        );
     }
 
     /// Colocation hints (`metadata.colocate-with-strict`) must be

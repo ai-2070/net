@@ -1409,7 +1409,7 @@ int                     net_compute_set_daemon_caps_dispatcher(
  * `{"node_id": uint64, "tags": [string], "metadata": map}`
  * — keeps the C ABI tight (one byte buffer per call) at the
  * cost of a per-call serde roundtrip on the consumer side. The
- * Go binding's reference impl (`bindings/go/net/placement.go`)
+ * removed Go reference impl (S7 ledger, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md)
  * decodes inside the trampoline before invoking the user
  * predicate; non-Go consumers parse the JSON the same way. The
  * filter id and JSON buffers are owned by Rust for the call's
@@ -1795,6 +1795,139 @@ void net_blob_free_buffer(uint8_t* ptr, size_t len);
  * the encoded wire form, so this is the join between the two. */
 int net_blob_ref_hash(const uint8_t* encoded, size_t encoded_len, uint8_t* out_hash);
 
+/* ---- Process-wide blob adapter registry ----
+ *
+ * Adapters are addressed by id across the whole process. Error codes are
+ * the NET_ERR_BLOB_* band (-110..-120, src/ffi/blob.rs). Buffers written to
+ * the out-params are freed with net_blob_free_buffer; on error they are
+ * left at (NULL, 0). Null or non-UTF-8 strings return -2 (InvalidUtf8).
+ */
+
+/* Register a filesystem adapter rooted at `root` (accepts file: URIs; a blob
+ * is stored at <root>/<hash[0:2]>/<hash>). 0, or -111 for a duplicate id. */
+int net_blob_register_fs_adapter(const char* adapter_id, const char* root);
+
+/* 1 if an adapter was removed, 0 if none was registered under the id. */
+int net_blob_unregister_adapter(const char* adapter_id);
+
+/* 1 if the id is registered, 0 otherwise. */
+int net_blob_adapter_registered(const char* adapter_id);
+
+/* Store `data` through the adapter and write the encoded BlobRef. */
+int net_blob_publish(const char* adapter_id,
+                     const char* uri,
+                     const uint8_t* data,
+                     size_t data_len,
+                     uint8_t** out_payload,
+                     size_t* out_payload_len);
+
+/* Resolve an encoded BlobRef through the adapter to its content. */
+int net_blob_resolve(const char* adapter_id,
+                     const uint8_t* payload,
+                     size_t payload_len,
+                     uint8_t** out_content,
+                     size_t* out_content_len);
+
+/* Callback-backed adapter: the substrate dispatches BlobAdapter calls into a
+ * caller-supplied function table. Every entry must be non-NULL (-115
+ * otherwise). Calls arrive on substrate worker threads and may overlap.
+ * fetch / fetch_range return a buffer the substrate hands back to
+ * free_buffer once it has copied the bytes. */
+typedef struct net_blob_adapter_vtable_s {
+    int (*store)(void* ctx, const char* uri, const uint8_t* hash, uint64_t size,
+                 const uint8_t* data, size_t data_len);
+    int (*fetch)(void* ctx, const char* uri, const uint8_t* hash, uint64_t size,
+                 uint8_t** out_data, size_t* out_len);
+    int (*fetch_range)(void* ctx, const char* uri, const uint8_t* hash, uint64_t size,
+                       uint64_t range_start, uint64_t range_end,
+                       uint8_t** out_data, size_t* out_len);
+    int (*exists)(void* ctx, const char* uri, const uint8_t* hash, uint64_t size,
+                  int* out_exists);
+    void (*free_buffer)(void* ctx, uint8_t* data, size_t len);
+} net_blob_adapter_vtable_t;
+
+typedef void (*net_blob_adapter_release_fn)(void* ctx);
+
+/* Register a callback adapter that takes ownership of `ctx`: release_fn(ctx)
+ * runs exactly once, after the adapter is unregistered AND the last in-flight
+ * call holding ctx has returned (including its free_buffer). On any non-zero
+ * return (NULL vtable or release_fn: -1; NULL entry: -115; duplicate id:
+ * -111) release_fn is never called and ctx stays the caller's. */
+int net_blob_register_callback_adapter_owned(const char* adapter_id,
+                                             const net_blob_adapter_vtable_t* vtable,
+                                             void* ctx,
+                                             net_blob_adapter_release_fn release_fn);
+
+/* ---- v0.3 tree / erasure / range / repair ----
+ *
+ * Contract (docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md,
+ * "New C ABI contract (S6)"): required out-pointers are checked before
+ * anything is written (NULL -> -1), then every out slot is set to NULL / 0
+ * before any later failure. A well-formed call refused on its arguments
+ * returns NET_ERR_BLOB_INVALID_ARGUMENT (-150). JSON results are freed with
+ * net_free_string, byte results with net_blob_free_buffer. Feature-off
+ * builds return NET_ERR_FEATURE_NOT_BUILT (-107).
+ */
+
+/* Like net_mesh_blob_adapter_new, plus a handle out-param and an options
+ * object: NULL / "" or {"overflow": {...legacy overflow object...},
+ * "tree_node_cache_bytes": N}. Unknown keys are refused (-3). An absent
+ * cache key means no cache; 0 installs a zero-capacity cache. */
+int net_mesh_blob_adapter_new_v2(
+    net_redex_t* redex,
+    const char* adapter_id,
+    int persistent,
+    const char* options_json,
+    net_mesh_blob_adapter_t** out_handle);
+
+/* Bytes [start, end) of any ref shape (tree refs included). start > end,
+ * a non-empty range over 1 GiB, or end past the blob's size: -150.
+ * start == end: 0 with (NULL, 0), even beyond the size. */
+int net_mesh_blob_adapter_fetch_range(
+    const net_mesh_blob_adapter_t* handle,
+    const uint8_t* blob_ref_bytes,
+    size_t blob_ref_len,
+    uint64_t start,
+    uint64_t end,
+    uint8_t** out_data,
+    size_t* out_len);
+
+/* Store as a tree blob. encoding_kind 0 = Replicated (rs_k = rs_m = 0),
+ * 1 = Reed-Solomon (rs_k = rs_m = 0 for the defaults, else both >= 1 and
+ * rs_k + rs_m <= 255). Anything else: -150. */
+int net_mesh_blob_adapter_store_tree(
+    const net_mesh_blob_adapter_t* handle,
+    const uint8_t* data,
+    size_t data_len,
+    uint8_t encoding_kind,
+    uint8_t rs_k,
+    uint8_t rs_m,
+    uint8_t** out_ref,
+    size_t* out_ref_len);
+
+/* Repair a Reed-Solomon tree blob in place; the report is JSON with u64
+ * fields stripes_walked, stripes_already_healthy, stripes_repaired,
+ * chunks_restored, stripes_unrecoverable, replicated_stripes_skipped,
+ * replicated_leaves_skipped. Unrecoverable stripes are counted, not an
+ * error. */
+int net_mesh_blob_adapter_repair_blob(
+    const net_mesh_blob_adapter_t* handle,
+    const uint8_t* blob_ref_bytes,
+    size_t blob_ref_len,
+    char** out_json);
+
+/* {"hits","misses","bytes","entries"} (u64), or JSON null with no cache. */
+int net_mesh_blob_adapter_tree_node_cache_stats(
+    const net_mesh_blob_adapter_t* handle,
+    char** out_json);
+
+/* Describe an encoded ref as JSON: version, uri, size, is_tree, is_chunked;
+ * hash (small refs), tree_root_hash + tree_depth (tree refs) and encoding
+ * (chunked refs) only where the shape has them. */
+int net_blob_ref_describe(const uint8_t* encoded,
+                          size_t encoded_len,
+                          char** out_json);
+
 net_mesh_blob_adapter_t* net_mesh_blob_adapter_new(
     net_redex_t* redex,
     const char* adapter_id,
@@ -1867,8 +2000,53 @@ int net_fetch_blob(const net_meshnode_t* node,
                    uint8_t** out_bytes,
                    size_t* out_len);
 
-/* Free a buffer returned by net_fetch_blob. */
+/* Free a buffer returned by net_fetch_blob / net_fetch_blob_discovered /
+ * net_store_dir. */
 void net_transport_free_buffer(uint8_t* ptr, size_t len);
+
+/* Like net_fetch_blob, but discovers the holder among connected peers.
+ * Returns NET_ERR_TRANSFER_ALL_PEERS_FAILED (-202) if no connected peer
+ * has the content. */
+int net_fetch_blob_discovered(const net_meshnode_t* node,
+                              const uint8_t* hash,
+                              uint8_t** out_bytes,
+                              size_t* out_len);
+
+/* ---- Directory transfer (mirrors net_transport.h) ----
+ *
+ * Errors are the transfer band plus NET_ERR_DIR_INVALID_MANIFEST (-210),
+ * NET_ERR_DIR_PATH_INVALID (-211) and NET_ERR_DIR_IO (-213); the
+ * constants themselves are defined in net_transport.h.
+ */
+
+/* Store the tree at `root_path` as blobs in `adapter`. Writes the encoded
+ * manifest BlobRef to (*out_manifest_ref, *out_len); free it with
+ * net_transport_free_buffer. */
+int net_store_dir(const net_mesh_blob_adapter_t* adapter,
+                  const char* root_path,
+                  uint8_t** out_manifest_ref,
+                  size_t* out_len);
+
+/* Fetch the tree named by the encoded manifest ref from `source_id` and
+ * reconstruct it under `dest_path`. *out_files / *out_bytes may be NULL;
+ * both are set to 0 on entry. */
+int net_fetch_dir(const net_meshnode_t* node,
+                  uint64_t source_id,
+                  const uint8_t* manifest_ref,
+                  size_t manifest_ref_len,
+                  const char* dest_path,
+                  uint64_t* out_files,
+                  uint64_t* out_bytes);
+
+/* Fetch + decode the manifest without reconstructing the tree, as JSON
+ * in (*out_json, *out_len); free with net_free_string. (NULL, 0) on
+ * entry, so a failed call reads (NULL, 0). */
+int net_dir_manifest_read(const net_meshnode_t* node,
+                          uint64_t source_id,
+                          const uint8_t* manifest_ref,
+                          size_t manifest_ref_len,
+                          char** out_json,
+                          size_t* out_len);
 
 /* ============================================================
  * Capability aggregation — Phase 6c of

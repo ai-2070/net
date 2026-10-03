@@ -184,7 +184,7 @@ Server-side handler panics are caught, counted on `ServiceMetrics::handler_panic
 
 ## Per-binding API
 
-The typed surface ships in the **native binding**, not the SDK wrapper. Each language has the same five methods (`serve` / `call` / `callService` / `callStreaming` / `findServiceNodes`) plus the resilience helpers (`RetryPolicy` + `callWithRetry`, `HedgePolicy` + `callWithHedge`, `CircuitBreaker`).
+The typed surface ships in the **native binding**, not the SDK wrapper. Each language has the same five methods (`serve` / `call` / `callService` / `callStreaming` / `findServiceNodes`). Rust, TypeScript and Python also ship the resilience helpers (`RetryPolicy` + `callWithRetry`, `HedgePolicy` + `callWithHedge`, `CircuitBreaker`); Go does not (see the Go section).
 
 ### Rust (`net-mesh-sdk`, feature = "cortex")
 
@@ -345,13 +345,9 @@ with server_rpc.serve("echo_sum", echo_sum):
 
 ### Go
 
-Two Go trees exist and they are not the same thing:
-
-- **The shipped module**, `github.com/ai-2070/net/go`, source at `go/`. This is
-  what `go get` gives you, and `go/mesh_rpc_typed.go` carries the typed surface.
-- **A reference implementation** at `net/crates/net/bindings/go/net/`, with no
-  `go.mod` — meant to be vendored or copied into your own module. It covers
-  some surfaces the shipped module does not.
+The Go binding is the module `github.com/ai-2070/net/go`, source at `go/`.
+This is what `go get` gives you, and `go/mesh_rpc_typed.go` carries the typed
+surface. An older, uncompiled Go reference tree (no `go.mod`) used to sit beside the Rust FFI crates; it was removed. What it had either ships in `go/` now or is not available from Go, and its source stays in git history at commit `610cd4e`.
 
 The C ABI is written in `net/crates/net/bindings/go/rpc-ffi/` and linked into the single `libnet` cdylib by `bindings/go/net-ffi`.
 
@@ -391,7 +387,7 @@ for {
 }
 ```
 
-Pure-Go resilience helpers (`RetryPolicy` + `CallWithRetry`, `HedgePolicy` + `CallWithHedge`, `CircuitBreaker`) live in `net/crates/net/bindings/go/net/resilience.go` — the reference tree, **not** the shipped module, so `go get github.com/ai-2070/net/go` does not bring them. Vendor that file or write your own. ABI version drift is detected via `net.ABIVersion()` vs `net.ExpectedABIVersion`, currently `0x0004`.
+Go has **no resilience helpers** (`RetryPolicy` + `CallWithRetry`, `HedgePolicy` + `CallWithHedge`, `CircuitBreaker`): they lived only in the removed reference tree and are deferred to their own plan. Use your own retry / breaker (the old pure-Go helpers remain in git history at commit `610cd4e`). ABI version drift is detected via `net.ABIVersion()` vs `net.ExpectedABIVersion`, currently `0x0004`.
 
 ### C — a separate header, the same library
 
@@ -589,7 +585,7 @@ True subprocess-based interop (Node caller → Rust server, Python caller → Ru
 - **Rust SDK** — `net/crates/net/sdk/src/mesh_rpc.rs` (typed wrappers), `net/crates/net/sdk/src/mesh_rpc_resilience.rs` (`RetryPolicy` / `HedgePolicy` / `CircuitBreaker`).
 - **Node binding** — `net/crates/net/bindings/node/src/mesh_rpc.rs` (napi cdylib), `net/crates/net/bindings/node/mesh_rpc.ts` (wrapper class), `net/crates/net/bindings/node/errors.ts` (`classifyError`).
 - **Python binding** — `net/crates/net/bindings/python/src/mesh_rpc.rs` (PyO3 cdylib), `net/crates/net/bindings/python/python/net/mesh_rpc.py` (Python wrapper).
-- **Go C-ABI** — `net/crates/net/bindings/go/rpc-ffi/src/lib.rs` (cdylib), `net/crates/net/bindings/go/net/mesh_rpc.go` (reference cgo wrapper), `net/crates/net/bindings/go/net/resilience.go` (pure-Go resilience helpers).
+- **Go C-ABI** — `net/crates/net/bindings/go/rpc-ffi/src/lib.rs` (linked into the `libnet` cdylib), `go/mesh_rpc.go` and `go/mesh_rpc_typed.go` (the shipped cgo wrapper).
 - **Cross-binding contract** — `net/crates/net/tests/cross_lang_nrpc/golden_vectors.json` (shared fixture), the three binding compat tests (paths above).
 - **Tool discovery + `tool.watch`** — `net/crates/net/sdk/src/tool.rs` (`list_tools` / `watch_tools` / `serve_tool_watch`), `net/crates/net/src/adapter/net/cortex/tool.rs` (`TOOL_WATCH_SERVICE`, `WatchToolsRequest`, `ToolWatchFrame`).
 - **Org-protected calls** — `net_sdk::mesh_rpc::OrgProofIntent` on `CallOptions` is the low-level seam under `mesh.org(..).call(..)` (the unary verb); under the streaming verbs the seam is the streaming proof value, which carries the call kind and the session binding rather than the unary proof's shape-agnostic fields. The session binding is a precondition there, not a knob: a streaming opening is only admitted when the proof's binding equals the Noise handshake hash of the receiving session, so a hand-built session admits no protected stream at all. Use either seam when you need an exact provider, a specific grant, or an unusual proof TTL. See `org.md`.

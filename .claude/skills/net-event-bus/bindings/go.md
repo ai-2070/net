@@ -9,18 +9,12 @@ is only what is Go-specific.
 import "github.com/ai-2070/net/go"
 ```
 
-**Two Go trees exist and they are not the same thing.**
-
-| Tree | What it is |
-|---|---|
-| `go/` | The shipped module, `github.com/ai-2070/net/go`. This is what `go get` gives you. |
-| `net/crates/net/bindings/go/net/` | A reference implementation with **no `go.mod`**, meant to be vendored or copied into your own module. |
-
-The reference tree covers some surfaces the shipped module does not — the
-resilience helpers (`RetryPolicy`, `CallWithRetry`, `HedgePolicy`,
-`CallWithHedge`, `CircuitBreaker`) are there and **not** in the shipped module.
-`go get` will not bring them. Everything on this page describes the shipped
-module unless it says otherwise.
+**There is one Go tree: `go/`**, the module `github.com/ai-2070/net/go`, which
+is what `go get` gives you. An older, uncompiled Go reference tree (no `go.mod`) used to sit beside the Rust FFI crates; it was removed. What it had either ships in `go/` now or is not available from Go, and its source stays in git history at commit `610cd4e`. Surfaces that were only in the reference
+tree and are not yet in the module — the resilience helpers (`RetryPolicy`,
+`CallWithRetry`, `HedgePolicy`, `CallWithHedge`, `CircuitBreaker`), the capability
+predicate and placement builders, Deck ICE / audit / log streams, and the richer
+MeshDB operators — are not available from Go.
 
 Go is cgo: it links against the Rust cdylibs. A build needs those built first,
 which is why CI type-checks the example with `go vet` rather than `go build`.
@@ -124,9 +118,11 @@ Check `bindings/coverage.md` before promising anything. The three to know:
   `CapabilityFilter` in `go/mesh.go` is channel *authorisation*, and
   `go/meshdb.go`'s "filter predicates" are MeshDB query predicates — neither is
   the bus filter DSL. Filter in your handler.
-- **Blobs are partial.** `MeshBlobAdapter` does `Store` / `Fetch` / `Exists` and
-  the overflow controls, but there is no discovery-driven fetch, so Go cannot
-  retrieve a blob it holds only a reference to.
+- **Blobs are complete.** `MeshBlobAdapter` does `Store` / `Fetch` / `Exists`,
+  trees, range reads, repair and the overflow controls; `MeshNode.FetchBlob`
+  and `FetchBlobDiscovered` (no known holder) retrieve over the mesh; and
+  `RegisterBlobAdapter` puts a Go-implemented adapter in the process-wide
+  registry.
 - **Payments: none.** The only payments file in the module is a golden-vector
   test. See `../../net-payments/bindings/coverage.md`.
 
@@ -143,7 +139,7 @@ Check `bindings/coverage.md` before promising anything. The three to know:
 - There are **no named channels and no async iteration**. A TypeScript
   `for await (const x of ch.subscribe())` has no Go equivalent; you poll.
 - Errors are returned, never thrown.
-- The resilience helpers documented for Go live in the *reference* tree, not the
-  module you imported.
-- Absence of a surface in `go/` does not mean it is absent from the reference
-  tree — check there before filing a gap.
+- Go has **no nRPC resilience helpers** (`RetryPolicy`, `HedgePolicy`,
+  `CircuitBreaker`). They lived only in the reference tree, which has been
+  removed; do not tell a user to look for them there.
+- `go/` is the whole Go surface. A symbol absent from it is absent from Go.

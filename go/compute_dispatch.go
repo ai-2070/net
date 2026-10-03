@@ -397,9 +397,13 @@ func goComputeFactory(runtimeID C.uint64_t, kindPtr *C.char, kindLen C.size_t, o
 	}
 	kind := ""
 	if kindLen > 0 && kindPtr != nil {
-		// `C.GoStringN` copies — safer than GoString which stops at
-		// the first NUL.
-		kind = C.GoStringN(kindPtr, C.int(kindLen))
+		// A length-exact copy (not GoString, which stops at the first
+		// NUL, and not GoStringN, which narrows the length to C.int).
+		k, err := copyCString(unsafe.Pointer(kindPtr), uint64(kindLen))
+		if err != nil {
+			return -1
+		}
+		kind = k
 	}
 	fn := lookupFactoryFunc(uint64(runtimeID), kind)
 	if fn == nil {

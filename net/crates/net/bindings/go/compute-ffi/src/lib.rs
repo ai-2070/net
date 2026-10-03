@@ -1,6 +1,6 @@
 //! C ABI for the compute (MeshDaemon + migration) surface — Stage 6 of
 //! `SDK_COMPUTE_SURFACE_PLAN.md`. Consumed by the Go binding at
-//! `bindings/go/net/compute.go`.
+//! `go/compute.go`.
 //!
 //! **Sub-step 1** (this file): lifecycle skeleton. A Go caller can
 //! build a `DaemonRuntime` bound to an existing `MeshNodeHandle`

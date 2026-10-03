@@ -52,6 +52,9 @@ type NetDbConfig struct {
 type NetDb struct {
 	mu     sync.RWMutex
 	handle *C.net_netdb_t
+	// origin is NetDbConfig.OriginHash, which the bundled adapters stamp;
+	// they inherit it so their Token() names their writes.
+	origin uint64
 }
 
 // OpenNetDb opens a fresh bundle. Failure-atomic: if the second
@@ -78,7 +81,7 @@ func OpenNetDb(redex *Redex, cfg NetDbConfig) (*NetDb, error) {
 	if errFromCode := cortexErrorFromCode(code); errFromCode != nil {
 		return nil, errFromCode
 	}
-	db := &NetDb{handle: out}
+	db := &NetDb{handle: out, origin: cfg.OriginHash}
 	runtime.SetFinalizer(db, (*NetDb).Free)
 	return db, nil
 }
@@ -119,7 +122,7 @@ func OpenNetDbFromSnapshot(redex *Redex, cfg NetDbConfig, bundle []byte) (*NetDb
 	if errFromCode := cortexErrorFromCode(code); errFromCode != nil {
 		return nil, errFromCode
 	}
-	db := &NetDb{handle: out}
+	db := &NetDb{handle: out, origin: cfg.OriginHash}
 	runtime.SetFinalizer(db, (*NetDb).Free)
 	return db, nil
 }
@@ -139,7 +142,7 @@ func (db *NetDb) Tasks() (*TasksAdapter, error) {
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	t := &TasksAdapter{handle: out}
+	t := &TasksAdapter{handle: out, origin: db.origin}
 	runtime.SetFinalizer(t, (*TasksAdapter).free)
 	return t, nil
 }
@@ -157,7 +160,7 @@ func (db *NetDb) Memories() (*MemoriesAdapter, error) {
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	m := &MemoriesAdapter{handle: out}
+	m := &MemoriesAdapter{handle: out, origin: db.origin}
 	runtime.SetFinalizer(m, (*MemoriesAdapter).free)
 	return m, nil
 }
@@ -183,8 +186,7 @@ func (db *NetDb) Snapshot() ([]byte, error) {
 	// Defensively free the substrate-side buffer regardless of how
 	// we exit — Go-side copy below survives.
 	defer C.net_netdb_free_bundle(bytes, n)
-	out := C.GoBytes(unsafe.Pointer(bytes), C.int(n))
-	return out, nil
+	return copyCBuf(unsafe.Pointer(bytes), uint64(n))
 }
 
 // Close closes every enabled adapter on the NetDb. The underlying

@@ -1,0 +1,63 @@
+{
+  "description": "Cross-language BlobRef describe fixture. Refs are produced by the Go binding (go/blob_describe_vectors_test.go). Go (DescribeBlobRef) and Python (BlobRef.from_encoded getters) must decode each to `expected`, and Python must re-encode it to the same bytes. Normalized: hash only for small refs, tree_root_hash and tree_depth only for tree refs, encoding only for chunked refs (Go checks it; Python has no encoding getter). Hashes are lowercase hex.",
+  "vectors": [
+    {
+      "name": "small",
+      "encoded_hex": "b0b1b2b3016437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d8503000000000000006d6573683a2f2f66697874757265732f736d616c6c",
+      "expected": {
+        "hash": "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+        "is_chunked": false,
+        "is_tree": false,
+        "size": 3,
+        "uri": "mesh://fixtures/small",
+        "version": 1
+      }
+    },
+    {
+      "name": "small_unicode_uri",
+      "encoded_hex": "b0b1b2b301121d4faf8152ad3040c5e26a834bb28f21e4066b166063aa30f0bf00f86d0a9e0b000000000000006d6573683a2f2f66697874757265732fc3bc6ec3af63c3b664c3a92fcebacebbceb5ceb9ceb4ceaf",
+      "expected": {
+        "hash": "121d4faf8152ad3040c5e26a834bb28f21e4066b166063aa30f0bf00f86d0a9e",
+        "is_chunked": false,
+        "is_tree": false,
+        "size": 11,
+        "uri": "mesh://fixtures/ünïcödé/κλειδί",
+        "version": 1
+      }
+    },
+    {
+      "name": "tree_replicated",
+      "encoded_hex": "b0b1b2b30301476d6573683a2f2f6536613839343733353035383536396562336232393365666437633166323562613930373637383638623866393838333932636333373631343663623930633400e6a894735058569eb3b293efd7c1f25ba90767868b8f988392cc376146cb90c48080c00401",
+      "expected": {
+        "encoding": {
+          "kind": "replicated"
+        },
+        "is_chunked": true,
+        "is_tree": true,
+        "size": 9437184,
+        "tree_depth": 1,
+        "tree_root_hash": "e6a894735058569eb3b293efd7c1f25ba90767868b8f988392cc376146cb90c4",
+        "uri": "mesh://e6a894735058569eb3b293efd7c1f25ba90767868b8f988392cc376146cb90c4",
+        "version": 3
+      }
+    },
+    {
+      "name": "tree_reed_solomon_4_2",
+      "encoded_hex": "b0b1b2b30301476d6573683a2f2f306632653764636639313862366163353536303132623064376639636331616238616333653431323435383764653932373336613961336336393663663861610104020f2e7dcf918b6ac556012b0d7f9cc1ab8ac3e4124587de92736a9a3c696cf8aa8080800801",
+      "expected": {
+        "encoding": {
+          "k": 4,
+          "kind": "reed_solomon",
+          "m": 2
+        },
+        "is_chunked": true,
+        "is_tree": true,
+        "size": 16777216,
+        "tree_depth": 1,
+        "tree_root_hash": "0f2e7dcf918b6ac556012b0d7f9cc1ab8ac3e4124587de92736a9a3c696cf8aa",
+        "uri": "mesh://0f2e7dcf918b6ac556012b0d7f9cc1ab8ac3e4124587de92736a9a3c696cf8aa",
+        "version": 3
+      }
+    }
+  ]
+}

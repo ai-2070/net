@@ -4,15 +4,23 @@
 # generated-at: 9f01c24cea6645516ba6ed11f2a91654a0360a01
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi --features net-ffi/test-helpers
-# count: 588
+# count: 601
 # edited: net_redex_disable_replication added by hand (intended C-ABI addition, PR #1138)
+# edited: 8 v0.3 blob symbols added by hand (intended C-ABI addition, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md S6): net_blob_ref_describe, net_mesh_blob_adapter_{new_v2,fetch_range,store_tree,repair_blob,tree_node_cache_stats}, and the fixtures-only seams net_mesh_blob_adapter_test_{drop_data_chunk,chunk_present}
+# edited: net_redex_greedy_cache_for added by hand (intended C-ABI addition, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md gap G-A)
+# edited: 4 S5b symbols added by hand (intended C-ABI addition, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md gap G-B): net_blob_register_callback_adapter_owned, and the fixtures-only seams net_blob_test_barrier_{arm,wait_held,release}
 net_blob_adapter_registered
 net_blob_free_buffer
 net_blob_publish
+net_blob_ref_describe
 net_blob_ref_hash
 net_blob_register_callback_adapter
+net_blob_register_callback_adapter_owned
 net_blob_register_fs_adapter
 net_blob_resolve
+net_blob_test_barrier_arm
+net_blob_test_barrier_release
+net_blob_test_barrier_wait_held
 net_blob_unregister_adapter
 net_capability_aggregate
 net_capability_capacity_ranking
@@ -265,16 +273,23 @@ net_mesh_arc_clone
 net_mesh_arc_free
 net_mesh_blob_adapter_exists
 net_mesh_blob_adapter_fetch
+net_mesh_blob_adapter_fetch_range
 net_mesh_blob_adapter_free
 net_mesh_blob_adapter_new
+net_mesh_blob_adapter_new_v2
 net_mesh_blob_adapter_overflow_active
 net_mesh_blob_adapter_overflow_config
 net_mesh_blob_adapter_overflow_enabled
 net_mesh_blob_adapter_prometheus_text
 net_mesh_blob_adapter_publish
+net_mesh_blob_adapter_repair_blob
 net_mesh_blob_adapter_set_overflow_config
 net_mesh_blob_adapter_set_overflow_enabled
 net_mesh_blob_adapter_store
+net_mesh_blob_adapter_store_tree
+net_mesh_blob_adapter_test_chunk_present
+net_mesh_blob_adapter_test_drop_data_chunk
+net_mesh_blob_adapter_tree_node_cache_stats
 net_mesh_channel_configs_arc_clone
 net_mesh_channel_configs_arc_free
 net_mesh_claim_island
@@ -438,6 +453,7 @@ net_redex_file_read_range
 net_redex_file_sync
 net_redex_file_tail
 net_redex_free
+net_redex_greedy_cache_for
 net_redex_greedy_cached_channel_count
 net_redex_greedy_prometheus_text
 net_redex_new

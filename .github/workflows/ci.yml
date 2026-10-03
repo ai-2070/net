@@ -4384,6 +4384,52 @@ jobs:
       # both layers: sdk-py-tests installs the wrapper `--no-deps` on purpose
       # (so its suite needs no maturin), and this job had the binding but not
       # the wrapper. One pure-Python editable install closes the gap.
+      # === the cross-language BlobRef describe fixture (Python half) ======
+      # The pytest run above EXECUTED these; this step PINS the names and
+      # COUNTS the rows (floor 9 = 1 coverage row + 4 vectors x {decode,
+      # re-encode}). The Go half is TestCrossLangBlobDescribeVectors in the
+      # Go job. (GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md, S6.)
+      # === the greedy read path + gravity (Python half, plan gap G-A) =====
+      # Executed by the pytest run above; pinned and counted here (floor 4).
+      - name: Witness roster + floor — Python greedy read path (4)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_greedy_cache --mode decl \
+            --source net/crates/net/bindings/python/tests/test_greedy_cache.py \
+            test_greedy_cache_for_without_greedy \
+            test_greedy_cache_for_reads_a_peers_channel \
+            test_greedy_cache_view_close_keeps_the_cache_live \
+            test_gravity_config_is_forwarded || exit 1
+          out=$(cd net/crates/net/bindings/python && python -m pytest -q --timeout=30 --timeout-method=thread \
+                  tests/test_greedy_cache.py 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "python greedy read path: ${n:-0} (floor 4)"
+          if [ -z "$n" ] || [ "$n" -lt 4 ]; then
+            echo "::error::the python greedy read path ran ${n:-0} rows, floor is 4 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+
+      - name: Witness roster + floor — Python cross-lang blob describe (9)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_cross_lang_blob_describe --mode decl \
+            --source net/crates/net/bindings/python/tests/test_cross_lang_blob_describe.py \
+            test_fixture_covers_small_and_tree_refs \
+            test_python_decodes_go_refs_identically \
+            test_python_reencodes_go_refs_byte_for_byte || exit 1
+          out=$(cd net/crates/net/bindings/python && python -m pytest -q \
+                  tests/test_cross_lang_blob_describe.py 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "python cross-lang blob describe: ${n:-0} (floor 9)"
+          if [ -z "$n" ] || [ "$n" -lt 9 ]; then
+            echo "::error::the python cross-lang blob describe ran ${n:-0} rows, floor is 9 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+
       - name: Install the sdk-py wrapper
         run: pip install --no-deps -e ../../sdk-py
 
@@ -4813,6 +4859,156 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
           RUN_INTEGRATION_TESTS: "1"
         run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh
+
+      # The run above is NOT race evidence: the runner builds without -race.
+      # The blob binding's handle lifetime (Close racing in-flight calls)
+      # is only meaningfully checked under the race detector, so its tests
+      # run again with it — through the same runner, so a hang still reports
+      # native frames. GO_TEST_RUN makes the runner fail a filter that
+      # matches nothing. (GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md, S1.)
+      - name: Run Go blob / transfer / RedEX dataforts / write-token tests (-race)
+        working-directory: go
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
+          GO_TEST_RACE: "1"
+          GO_TEST_RUN: "^(TestBlob|TestTransfer|TestRedex|TestWriteToken)"
+        run: $GITHUB_WORKSPACE/.github/scripts/go-test-with-native-stacks.sh
+
+      # Pins the blob witnesses the two runs above execute: lexical
+      # name-existence, fail-closed.
+      - name: Witness roster — Go blob binding (15)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label blob_test --mode decl \
+            --source blob_test.go \
+            TestBlobCheckedLenBoundaries \
+            TestBlobCopyCBuf \
+            TestBlobCopyCStringAndOrEmpty \
+            TestBlobSourceHasNoGoBytes \
+            TestBlobPublishFetchRoundTrip \
+            TestBlobExistsAndStoreOnIndependentAdapter \
+            TestBlobStoreRefusesMismatchedBytes \
+            TestBlobPersistenceAcrossReopen \
+            TestBlobOverflowConfigRoundTrip \
+            TestBlobOverflowConfigZeroMeansDefault \
+            TestBlobOverflowOutOfRangeRatioIsAccepted \
+            TestBlobOverflowConfigRefusals \
+            TestBlobPrometheusText \
+            TestBlobCloseRacesInFlightFetches \
+            TestBlobTwoNodeFetch || exit 1
+
+      - name: Witness roster — Go transfer binding (10)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label transfer_test --mode decl \
+            --source transfer_test.go \
+            TestTransferDirRoundTrip \
+            TestTransferDirManifestRead \
+            TestTransferDirManifestMissingContent \
+            TestTransferDirManifestNotAManifest \
+            TestTransferFetchDirRefusesRootDestination \
+            TestTransferFetchBlobDiscovered \
+            TestTransferEmptyManifestRefIsRefusedBeforeCgo \
+            TestTransferStoreDirAfterClose \
+            TestTransferStoreDirMissingRoot \
+            TestTransferRefusesNULPaths || exit 1
+
+      - name: Witness roster — Go RedEX replication / greedy / gravity (11)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label redex_dataforts_test --mode decl \
+            --source redex_dataforts_test.go \
+            TestRedexReplicatedFileRequiresEnable \
+            TestRedexReplicationRuntimeCountFollowsChannels \
+            TestRedexReplicationCarriesDataBetweenNodes \
+            TestRedexGreedyCachesAPeersChannel \
+            TestRedexGreedyConfigRefusals \
+            TestRedexGravityInstallRules \
+            TestRedexDatafortsLifecycleRefusals \
+            TestRedexGreedyCacheForReadsAPeersChannel \
+            TestRedexGravityConfigIsForwarded \
+            TestRedexGreedyCacheForWithoutGreedy \
+            TestRedexGreedyCacheViewCloseKeepsTheCacheLive || exit 1
+
+      - name: Witness roster — Go CortEX write tokens (8)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label write_token_test --mode decl \
+            --source write_token_test.go \
+            TestWriteTokenTasksReadYourWrites \
+            TestWriteTokenMemoriesReadYourWrites \
+            TestWriteTokenOriginNotIdentity \
+            TestWriteTokenZeroTimeoutPolls \
+            TestWriteTokenContext \
+            TestWriteTokenNetDbAdaptersInheritOrigin \
+            TestWriteTokenAfterClose \
+            TestWriteTokenContextCancelledDuringASuccessfulWait || exit 1
+
+      - name: Witness roster — Go blob adapter registry (6)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label blob_registry_test --mode decl \
+            --source blob_registry_test.go \
+            TestBlobRegistryFilesystemRoundTrip \
+            TestBlobRegistryDuplicateAndUnregister \
+            TestBlobRegistryResolveUsesTheNamedAdapter \
+            TestBlobRegistryRefusals \
+            TestBlobRegistryRefusesEmbeddedNUL \
+            TestABIStabilityBlobRegistryCodes || exit 1
+
+      # The v0.3 tree / range / repair surface. The two repair witnesses are
+      # `-tags test_helpers` (they drive fixtures-only seams) and run in the
+      # "Run Go tests (test_helpers)" step above; the rest run untagged and
+      # under the -race step's ^TestBlob filter.
+      - name: Witness roster — Go blob trees, ranges, repair (10)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label blob_tree_test --mode decl \
+            --source blob_tree_test.go --source blob_repair_test.go --source abi_stability_test.go \
+            --source blob_describe_vectors_test.go \
+            TestBlobTreeStoreAndFetchRange \
+            TestBlobTreeRangeContract \
+            TestBlobTreeEncodingRefusals \
+            TestBlobRefDescribeSmall \
+            TestBlobTreeNodeCacheStates \
+            TestBlobFeatureTagsMatchCore \
+            TestBlobRepairRestoresADroppedDataShard \
+            TestBlobRepairCountsAnUnrecoverableStripe \
+            TestABIStabilityBlobV3ArityMatchesRust \
+            TestCrossLangBlobDescribeVectors || exit 1
+
+      # Go-implemented blob adapters (plan gap G-B / S5b): the substrate owns
+      # the cgo.Handle and releases it exactly once, after unregister AND the
+      # last in-flight call. The stage-1/stage-2 barrier and lookup-panic
+      # witnesses are `-tags test_helpers` (fixtures-only native barrier, a
+      # cgo call into the trampoline); the untagged TestBlob* witnesses also
+      # run under the -race step's ^TestBlob filter. The TestABI parity
+      # witness runs in the full suite only.
+      - name: Witness roster — Go blob adapters, owned handles (13)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label blob_adapter_test --mode decl \
+            --source blob_adapter_test.go --source blob_adapter_barrier_test.go \
+            --source abi_stability_test.go \
+            TestBlobAdapterGoRoundTrip \
+            TestBlobAdapterGoEmptyBlob \
+            TestBlobAdapterGoReleasedOnceAfterUnregister \
+            TestBlobAdapterGoDuplicateIDKeepsHandleInGo \
+            TestBlobAdapterGoUnregisterWaitsForAnInFlightFetch \
+            TestBlobAdapterGoReRegisterWhileOldCallHeld \
+            TestBlobAdapterGoPanicIsContained \
+            TestBlobAdapterGoErrorsMap \
+            TestBlobAdapterGoRefusals \
+            TestBlobAdapterGoAllocationFailureIsAnError \
+            TestBlobAdapterGoReleaseWaitsForAHeldNativeCall             TestBlobAdapterGoLookupPanicIsContained \
+            TestABIStabilityBlobOwnedRegistrationMatchesRust || exit 1
 
       # === the Go org facade live cells ==
       # The run above EXECUTED these 6 live cells (3 shapes x {same-org,

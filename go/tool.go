@@ -994,7 +994,10 @@ func (r *MeshRpc) ListTools() ([]ToolDescriptor, error) {
 		return []ToolDescriptor{}, nil
 	}
 	defer C.net_rpc_response_free((*C.uint8_t)(unsafe.Pointer(outJSON)), outLen)
-	body := C.GoBytes(unsafe.Pointer(outJSON), C.int(outLen))
+	body, err := copyCBuf(unsafe.Pointer(outJSON), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("list_tools: %w", err)
+	}
 	var out []ToolDescriptor
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, fmt.Errorf("list_tools: decode payload: %w", err)
@@ -1120,8 +1123,15 @@ func WatchTools(
 			rc := C.net_rpc_watch_tools_next(wh, &outJSON, &outLen, &nextErr)
 			switch {
 			case rc == 0:
-				body := C.GoBytes(unsafe.Pointer(outJSON), C.int(outLen))
+				body, berr := copyCBuf(unsafe.Pointer(outJSON), uint64(outLen))
 				C.net_rpc_response_free(outJSON, outLen)
+				if berr != nil {
+					select {
+					case errCh <- fmt.Errorf("watch_tools: %w", berr):
+					default:
+					}
+					return
+				}
 				var change ToolListChange
 				if uerr := json.Unmarshal(body, &change); uerr != nil {
 					select {

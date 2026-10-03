@@ -41,7 +41,7 @@ typedef void* net_handle_t;
  * Error codes.
  *
  * Kept in sync with the Rust-side `NetError` enum and with the Go
- * binding's copy at `bindings/go/net/net.h`. The library has a
+ * binding's copies at `include/net.go.h` and `go/net.h`. The library has a
  * regression test that scans both headers to detect drift.
  */
 typedef enum {

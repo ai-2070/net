@@ -455,6 +455,31 @@ impl Redex {
         0
     }
 
+    /// Read path into the greedy cache: the cached copy of
+    /// `channelName` (the real channel name), or `null` when it isn't
+    /// cached or greedy isn't enabled. A hit counts as a served read
+    /// and, under data gravity, as heat — gravity's announcements are
+    /// counted in `dataforts_greedy_gravity_heat_emissions_total`.
+    #[cfg(feature = "dataforts")]
+    #[napi]
+    pub fn greedy_cache_for(&self, channel_name: String) -> Result<Option<RedexFile>> {
+        let name =
+            ChannelName::new(&channel_name).map_err(|e| redex_err("invalid channel name", e))?;
+        let rt = napi_runtime();
+        let _enter = rt.enter();
+        Ok(self.inner.greedy_cache_for(&name).map(|file| RedexFile {
+            inner: Arc::new(file),
+            cache_view: true,
+        }))
+    }
+
+    /// `null` without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    #[napi]
+    pub fn greedy_cache_for(&self, _channel_name: String) -> Result<Option<RedexFile>> {
+        Ok(None)
+    }
+
     /// Render the greedy metrics as Prometheus text. Empty string
     /// when greedy isn't enabled.
     #[cfg(feature = "dataforts")]
@@ -569,6 +594,7 @@ impl Redex {
             .map_err(|e| redex_err("open_file", e))?;
         Ok(RedexFile {
             inner: Arc::new(file),
+            cache_view: false,
         })
     }
 }
@@ -922,6 +948,9 @@ impl From<InnerRedexEvent> for RedexEventJs {
 #[napi]
 pub struct RedexFile {
     inner: Arc<InnerRedexFile>,
+    /// From `Redex.greedyCacheFor`: the greedy runtime owns the file, so
+    /// `close` must not close it (that would stop the cache admitting).
+    cache_view: bool,
 }
 
 #[napi]
@@ -1031,8 +1060,14 @@ impl RedexFile {
     ///
     /// Declared `async` for the same reason as `sync` — close
     /// flushes pending writes on persistent files.
+    ///
+    /// A no-op on a file from `Redex.greedyCacheFor`: the cached file
+    /// belongs to the greedy runtime and stays open.
     #[napi]
     pub async fn close(&self) -> Result<()> {
+        if self.cache_view {
+            return Ok(());
+        }
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.close())
             .await

@@ -70,6 +70,10 @@ var ErrBlobClosed = fmt.Errorf("%w: adapter handle already closed", ErrBlob)
 // boundary (unknown scope, malformed JSON).
 var ErrBlobInvalidConfig = fmt.Errorf("%w: invalid overflow config", ErrBlob)
 
+// netErrInvalidJSON is `NetError::InvalidJson` (`src/ffi/mod.rs`), the code
+// the overflow-config parser returns for a body it refuses.
+const netErrInvalidJSON = -3
+
 // OverflowConfig mirrors the typed Rust + Python config shape.
 //
 // Pass to `NewMeshBlobAdapter` at construction or to
@@ -109,7 +113,7 @@ type OverflowConfig struct {
 type MeshBlobAdapterOpts struct {
 	// Opt every per-chunk file into disk persistence. Requires
 	// the underlying `Redex` to have been constructed with a
-	// `persistent_dir` (i.e. via `NewRedexWithPersistentDir`).
+	// `persistent_dir` (i.e. `NewRedex(dir)` with a non-empty dir).
 	Persistent bool
 
 	// Initial overflow configuration. Pass `nil` for the v0.2
@@ -117,6 +121,13 @@ type MeshBlobAdapterOpts struct {
 	// to opt in at defaults; pass a fully-populated struct to
 	// tune thresholds at construction.
 	Overflow *OverflowConfig
+
+	// TreeNodeCacheBytes, when set, gives the adapter a tree-node LRU
+	// cache of that many bytes. Nil means no cache; a pointer to 0 means
+	// a zero-capacity cache (every lookup misses), which is a different
+	// state. Setting it routes construction through
+	// net_mesh_blob_adapter_new_v2.
+	TreeNodeCacheBytes *uint64
 }
 
 // MeshBlobAdapter wraps `*net_mesh_blob_adapter_t`. Cheap to
@@ -146,11 +157,22 @@ func NewMeshBlobAdapter(redex *Redex, adapterID string, opts *MeshBlobAdapterOpt
 		return nil, fmt.Errorf("%w: redex handle is nil", ErrBlob)
 	}
 	persistent := C.int(0)
+	if opts != nil && opts.Persistent {
+		persistent = 1
+	}
+	if opts != nil && opts.TreeNodeCacheBytes != nil {
+		cID := C.CString(adapterID)
+		defer C.free(unsafe.Pointer(cID))
+		h, err := newMeshBlobAdapterV2(redex, cID, persistent, opts)
+		if err != nil {
+			return nil, err
+		}
+		a := &MeshBlobAdapter{handle: h}
+		runtime.SetFinalizer(a, func(a *MeshBlobAdapter) { _ = a.Close() })
+		return a, nil
+	}
 	overflowJSON := (*C.char)(nil)
 	if opts != nil {
-		if opts.Persistent {
-			persistent = 1
-		}
 		if opts.Overflow != nil {
 			body, err := json.Marshal(opts.Overflow)
 			if err != nil {
@@ -262,7 +284,10 @@ func (a *MeshBlobAdapter) Publish(uri string, data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: publish failed with rc=%d", ErrBlob, int(rc))
 	}
 	defer C.net_blob_free_buffer(outRef, outLen)
-	encoded := C.GoBytes(unsafe.Pointer(outRef), C.int(outLen))
+	encoded, err := copyCBuf(unsafe.Pointer(outRef), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("%w: publish: %w", ErrBlob, err)
+	}
 	return encoded, nil
 }
 
@@ -288,7 +313,10 @@ func (a *MeshBlobAdapter) Fetch(blobRefBytes []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: fetch failed with rc=%d", ErrBlob, int(rc))
 	}
 	defer C.net_blob_free_buffer(outPtr, outLen)
-	body := C.GoBytes(unsafe.Pointer(outPtr), C.int(outLen))
+	body, err := copyCBuf(unsafe.Pointer(outPtr), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("%w: fetch: %w", ErrBlob, err)
+	}
 	return body, nil
 }
 
@@ -419,6 +447,12 @@ func (a *MeshBlobAdapter) SetOverflowConfig(cfg *OverflowConfig) error {
 	}) {
 		return ErrBlobClosed
 	}
+	if rc == netErrInvalidJSON {
+		// The parser's refusal (unknown scope, malformed body) is the
+		// operator-typo case ErrBlobInvalidConfig exists for; it still
+		// matches ErrBlob, which it wraps.
+		return fmt.Errorf("%w: set_overflow_config rc=%d", ErrBlobInvalidConfig, int(rc))
+	}
 	if rc != 0 {
 		return fmt.Errorf("%w: set_overflow_config rc=%d", ErrBlob, int(rc))
 	}
@@ -447,9 +481,33 @@ var (
 	ErrTransferInvalidArgument = fmt.Errorf("%w: invalid argument", ErrTransfer)
 	// ErrTransferBackend - some other substrate transfer failure.
 	ErrTransferBackend = fmt.Errorf("%w: backend failure", ErrTransfer)
+	// ErrTransferAllPeersFailed - a discovered fetch found no connected
+	// peer that served the content.
+	ErrTransferAllPeersFailed = fmt.Errorf("%w: no connected peer served it", ErrTransfer)
+	// ErrDirInvalidManifest - the manifest ref named bytes that were
+	// fetched but are not a directory manifest. A manifest the holder
+	// does not have is ErrTransferNotFound instead.
+	ErrDirInvalidManifest = fmt.Errorf("%w: not a directory manifest", ErrTransfer)
+	// ErrDirPathInvalid - a destination or manifest path that cannot be
+	// written safely (for example a destination with no final name).
+	ErrDirPathInvalid = fmt.Errorf("%w: unsafe directory path", ErrTransfer)
+	// ErrDirIO - filesystem I/O failed while reconstructing a tree.
+	ErrDirIO = fmt.Errorf("%w: directory I/O failed", ErrTransfer)
 )
 
+// ErrFeatureNotBuilt - libnet was built without the features this call
+// needs, so its symbol resolves to a stub (NET_ERR_FEATURE_NOT_BUILT).
+// Transfer calls wrap it in ErrTransfer as well.
+var ErrFeatureNotBuilt = errors.New("libnet was built without this feature")
+
 func transferErrorFromCode(code C.int) error {
+	return transferErrorFromInt(int(code))
+}
+
+// transferErrorFromInt is the mapping itself, on a plain int so the ABI
+// tests can drive it from the header's constants (a _test.go file cannot
+// construct a C.int).
+func transferErrorFromInt(code int) error {
 	switch code {
 	case 0:
 		return nil
@@ -458,7 +516,7 @@ func transferErrorFromCode(code C.int) error {
 	case -201:
 		return ErrTransferHashMismatch
 	case -202:
-		return fmt.Errorf("%w: no connected peer served it", ErrTransfer)
+		return ErrTransferAllPeersFailed
 	case -203:
 		return fmt.Errorf("%w: cancelled", ErrTransfer)
 	case -204:
@@ -473,8 +531,16 @@ func transferErrorFromCode(code C.int) error {
 		return fmt.Errorf("%w: panic at the FFI boundary", ErrTransfer)
 	case -209:
 		return ErrTransferInvalidArgument
+	case -210:
+		return ErrDirInvalidManifest
+	case -211:
+		return ErrDirPathInvalid
+	case -213:
+		return ErrDirIO
+	case -107:
+		return fmt.Errorf("%w: %w", ErrTransfer, ErrFeatureNotBuilt)
 	default:
-		return fmt.Errorf("%w: unknown code %d", ErrTransfer, int(code))
+		return fmt.Errorf("%w: unknown code %d", ErrTransfer, code)
 	}
 }
 
@@ -553,5 +619,9 @@ func (m *MeshNode) FetchBlob(holderID uint64, hash []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer C.net_transport_free_buffer(out, outLen)
-	return C.GoBytes(unsafe.Pointer(out), C.int(outLen)), nil
+	body, err := copyCBuf(unsafe.Pointer(out), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("%w: fetch: %w", ErrTransfer, err)
+	}
+	return body, nil
 }

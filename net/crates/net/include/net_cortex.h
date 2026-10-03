@@ -45,6 +45,48 @@ typedef struct net_netdb_s           net_netdb_t;
 net_redex_t* net_redex_new(const char* persistent_dir);
 void         net_redex_free(net_redex_t* handle);
 
+/* ---- Replication, greedy Dataforts, data gravity -------------------------
+ *
+ * `mesh_arc` is the boxed Arc from net_mesh_arc_clone (net.go.h, where it is
+ * typedef'd net_compute_mesh_arc_t). Each enable function CONSUMES it on
+ * every return code: never free it afterwards. Returns 0, -1 (NULL
+ * handle), -8 (ShuttingDown), -2/-3 (bad config string / JSON), -103
+ * (NET_ERR_REDEX: validation or install failure), or -107 when libnet was
+ * built without the feature. Prometheus text is freed with net_free_string;
+ * it is "" when the surface isn't enabled and NULL on a NULL / closing
+ * handle; the greedy text is also NULL when libnet was built without
+ * dataforts.
+ */
+struct net_compute_mesh_arc_s;
+
+int      net_redex_enable_replication(net_redex_t* redex,
+                                      struct net_compute_mesh_arc_s* mesh_arc);
+int      net_redex_disable_replication(net_redex_t* redex);
+uint32_t net_redex_replication_runtime_count(const net_redex_t* redex);
+char*    net_redex_replication_prometheus_text(const net_redex_t* redex);
+
+int      net_redex_enable_greedy_dataforts(net_redex_t* redex,
+                                           struct net_compute_mesh_arc_s* mesh_arc,
+                                           const char* config_json);
+int      net_redex_disable_greedy_dataforts(net_redex_t* redex);
+uint32_t net_redex_greedy_cached_channel_count(const net_redex_t* redex);
+/* Read path into the greedy cache: 0 with *out_file set on a hit (read with
+ * net_redex_file_read_range / _tail, free with net_redex_file_free), 0 with
+ * *out_file = NULL when the channel isn't cached or greedy is off. A hit
+ * counts as a served read and, under gravity, heat. -1 for a NULL argument
+ * (nothing written through a NULL out_file), -103 for an invalid name. The
+ * file belongs to the greedy runtime: free the handle, never
+ * net_redex_file_close it, or the cache stops admitting that channel. */
+int      net_redex_greedy_cache_for(const net_redex_t* redex,
+                                    const char* channel,
+                                    net_redex_file_t** out_file);
+char*    net_redex_greedy_prometheus_text(const net_redex_t* redex);
+
+int      net_redex_enable_gravity_for_greedy(net_redex_t* redex,
+                                             struct net_compute_mesh_arc_s* mesh_arc,
+                                             const char* config_json);
+int      net_redex_disable_gravity_for_greedy(net_redex_t* redex);
+
 /* ---- RedexFile ---- */
 int  net_redex_open_file(net_redex_t* redex, const char* name,
                          const char* config_json,
@@ -81,6 +123,14 @@ int  net_tasks_delete(net_tasks_adapter_t* handle, uint64_t id,
                       uint64_t* out_seq);
 int  net_tasks_wait_for_seq(net_tasks_adapter_t* handle, uint64_t seq,
                             uint32_t timeout_ms);
+
+/* Read-your-writes: wait until the fold has applied the write named by
+ * (origin_hash, seq). timeout_ms 0 POLLS once (unlike wait_for_seq, where
+ * 0 waits indefinitely). Returns 0; 1 (NET_ERR_TIMEOUT) on deadline;
+ * -104 (NET_ERR_WRONG_ORIGIN) if origin_hash is not this adapter's;
+ * -105 (NET_ERR_QUEUE_FULL); -106 (NET_ERR_FOLD_STOPPED). */
+int  net_tasks_wait_for_token(net_tasks_adapter_t* handle, uint64_t origin_hash,
+                          uint64_t seq, uint32_t timeout_ms);
 int  net_tasks_list(net_tasks_adapter_t* handle, const char* filter_json,
                     char** out_json, size_t* out_len);
 int  net_tasks_snapshot_and_watch(net_tasks_adapter_t* handle,
@@ -220,6 +270,14 @@ int  net_memories_delete(net_memories_adapter_t* handle, uint64_t id,
                          uint64_t* out_seq);
 int  net_memories_wait_for_seq(net_memories_adapter_t* handle, uint64_t seq,
                                uint32_t timeout_ms);
+
+/* Read-your-writes: wait until the fold has applied the write named by
+ * (origin_hash, seq). timeout_ms 0 POLLS once (unlike wait_for_seq, where
+ * 0 waits indefinitely). Returns 0; 1 (NET_ERR_TIMEOUT) on deadline;
+ * -104 (NET_ERR_WRONG_ORIGIN) if origin_hash is not this adapter's;
+ * -105 (NET_ERR_QUEUE_FULL); -106 (NET_ERR_FOLD_STOPPED). */
+int  net_memories_wait_for_token(net_memories_adapter_t* handle, uint64_t origin_hash,
+                          uint64_t seq, uint32_t timeout_ms);
 int  net_memories_list(net_memories_adapter_t* handle, const char* filter_json,
                        char** out_json, size_t* out_len);
 int  net_memories_snapshot_and_watch(net_memories_adapter_t* handle,

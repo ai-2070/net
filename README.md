@@ -340,7 +340,7 @@ behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/m
 | Gang-claim scheduler | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Organization capability auth | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Subnet exports — serve + call | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Dataforts — blobs | ✓ | ✓ | ✓ | partial | ✓ |
+| Dataforts — blobs | ✓ | ✓ | ✓ | ✓ | ✓ |
 | RedEX / CortEX / MeshDB | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Compute / groups / daemons | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Deck — operator surface | ✓ | ✓ | ✓ | ✓ | ✓ |

@@ -1,5 +1,12 @@
 # Go parity plan — Stage G of the SDK security surface
 
+> **Amended 2026-10-03.** The `bindings/go/net/...` paths below name the
+> uncompiled Go reference tree, which
+> [`GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md`](GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md)
+> removed in its S8. The shipped Go binding is `go/` (`go/identity.go`,
+> `go/capabilities.go`, `go/subnets.go`, `go/net.h`, and their tests); read the
+> paths below as those. The text is left as written, as a record of the plan.
+
 ## Context
 
 [`SDK_SECURITY_SURFACE_PLAN.md`](SDK_SECURITY_SURFACE_PLAN.md) Stage G

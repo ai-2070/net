@@ -121,28 +121,57 @@ func TestRegisterDaemonRejectsBadSeed(t *testing.T) {
 		t.Errorf("nil SDK should return ErrMeshOsInvalidArg, got %v", err)
 	}
 
-	// Wrong seed length — caught before any FFI call.
-	s = &MeshOsDaemonSdk{} // ptr is nil, but the test below hits the
-	// ptr==nil branch before the length check; we need a non-nil
-	// pointer for the seed-length check to execute. Skip if we can't
-	// construct one without crossing FFI; the bindings/go/net test
-	// covers this path.
-	_ = s
+	// The seed-length check needs a live SDK; it is covered by
+	// TestRegisterDaemonWithCallbacksRejectsBadInputs.
 }
 
 // TestRegisterDaemonWithCallbacksRejectsBadInputs covers the
-// validation gauntlet before the FFI call: nil daemon, empty name,
-// wrong seed length. None of these reach the cdylib.
+// validation gauntlet against a live SDK: nil daemon, wrong seed length,
+// empty name. It used to skip for want of an SDK pointer, and no live test
+// covered these paths either (cubic review, PR #1165).
 func TestRegisterDaemonWithCallbacksRejectsBadInputs(t *testing.T) {
-	// We construct an SDK with a dummy non-nil ptr so the early
-	// nil-check passes, but every other failure path must short-
-	// circuit before any C.net_meshos_* call.
-	//
-	// In practice this requires the cdylib to actually start the
-	// SDK; testing it pure-Go-side without a built cdylib means
-	// stubbing. Skip the SDK-pointer-required tests.
-	t.Skip("RegisterDaemonWithCallbacks input validation depends on a live SDK ptr; covered by the live integration suite in bindings/go/net")
+	sdk, err := StartMeshOsDaemonSdk(MeshOsConfig{
+		ThisNode:            1,
+		TickIntervalMs:      50,
+		EventQueueCapacity:  16,
+		ActionQueueCapacity: 16,
+		ControlCapacity:     16,
+	})
+	if err != nil {
+		t.Fatalf("StartMeshOsDaemonSdk: %v", err)
+	}
+	defer sdk.Free()
+	defer sdk.Shutdown()
+
+	seed := make([]byte, 32)
+	if _, err := sdk.RegisterDaemonWithCallbacks(nil, seed); !errors.Is(err, ErrMeshOsInvalidArg) {
+		t.Errorf("nil daemon: want ErrMeshOsInvalidArg, got %v", err)
+	}
+	if _, err := sdk.RegisterDaemonWithCallbacks(namedTestDaemon{name: "short-seed"}, seed[:31]); !errors.Is(err, ErrMeshOsInvalidArg) {
+		t.Errorf("31-byte seed: want ErrMeshOsInvalidArg, got %v", err)
+	}
+	if _, err := sdk.RegisterDaemonWithCallbacks(namedTestDaemon{name: ""}, seed); !errors.Is(err, ErrMeshOsInvalidArg) {
+		t.Errorf("empty Name(): want ErrMeshOsInvalidArg, got %v", err)
+	}
+	if _, err := sdk.RegisterDaemon("short-seed", seed[:31]); !errors.Is(err, ErrMeshOsInvalidArg) {
+		t.Errorf("RegisterDaemon with a 31-byte seed: want ErrMeshOsInvalidArg, got %v", err)
+	}
+	// The same SDK still accepts a valid registration afterwards.
+	h, err := sdk.RegisterDaemonWithCallbacks(namedTestDaemon{name: "valid"}, seed)
+	if err != nil {
+		t.Fatalf("valid registration after the refusals: %v", err)
+	}
+	h.Free()
 }
+
+type namedTestDaemon struct {
+	MeshOsDefaultDaemon
+	name string
+}
+
+func (d namedTestDaemon) Name() string { return d.name }
+
+func (namedTestDaemon) Process(MeshOsCausalEvent) ([][]byte, error) { return nil, nil }
 
 // TestMeshosControlFromC sanity-checks the C → Go projection.
 func TestMeshosControlFromC(t *testing.T) {

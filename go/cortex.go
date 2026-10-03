@@ -148,6 +148,11 @@ type RedexFileConfig struct {
 	RetentionMaxEvents uint64 `json:"retention_max_events,omitempty"`
 	RetentionMaxBytes  uint64 `json:"retention_max_bytes,omitempty"`
 	RetentionMaxAgeMs  uint64 `json:"retention_max_age_ms,omitempty"`
+	// Replication, when set, opts the channel into cross-node
+	// replication. The owning Redex must have called EnableReplication
+	// first; otherwise OpenFile fails with ErrRedex. Nil keeps the
+	// channel single-node.
+	Replication *RedexReplicationConfig `json:"replication,omitempty"`
 }
 
 // RedexEvent is one materialized event yielded by a tail / range read.
@@ -183,6 +188,10 @@ func (e *redexEventWire) toEvent() (RedexEvent, error) {
 type RedexFile struct {
 	mu     sync.RWMutex
 	handle *C.net_redex_file_t
+	// cacheView marks a file from Redex.GreedyCacheFor. The greedy runtime
+	// owns the underlying file, so Close releases only this handle and
+	// never closes the shared file.
+	cacheView bool
 }
 
 // OpenFile opens (or gets) a RedEX file on `redex`. `config` may be
@@ -229,11 +238,19 @@ func (f *RedexFile) free() {
 }
 
 // Close flushes and closes the file. Subsequent operations error with
-// ErrRedex. Idempotent.
+// ErrRedex. Idempotent. On a file from Redex.GreedyCacheFor it releases
+// only this handle: the cached file stays open for the greedy runtime and
+// for other lookups.
 func (f *RedexFile) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.handle == nil {
+		return nil
+	}
+	if f.cacheView {
+		C.net_redex_file_free(f.handle)
+		f.handle = nil
+		runtime.SetFinalizer(f, nil)
 		return nil
 	}
 	code := C.net_redex_file_close(f.handle)
@@ -292,7 +309,10 @@ func (f *RedexFile) ReadRange(start, end uint64) ([]RedexEvent, error) {
 	// slice. Previous form (`C.GoStringN` + `[]byte(js)`) copied
 	// the payload twice — once into a Go string, then again into a
 	// fresh byte slice for `json.Unmarshal`.
-	payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+	payload, err := copyCBuf(unsafe.Pointer(out), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("read_range: %w", err)
+	}
 	var wire []redexEventWire
 	if err := json.Unmarshal(payload, &wire); err != nil {
 		return nil, fmt.Errorf("decode read_range: %w", err)
@@ -359,8 +379,12 @@ func (f *RedexFile) Tail(ctx context.Context, fromSeq uint64) (<-chan RedexEvent
 			code := C.net_redex_tail_next(cursor, 50, &out, &outLen)
 			switch code {
 			case 0:
-				payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+				payload, perr := copyCBuf(unsafe.Pointer(out), uint64(outLen))
 				C.net_free_string(out)
+				if perr != nil {
+					errs <- perr
+					return
+				}
 				var wire redexEventWire
 				if err := json.Unmarshal(payload, &wire); err != nil {
 					errs <- fmt.Errorf("decode tail event: %w", err)
@@ -419,6 +443,9 @@ type TasksFilter struct {
 type TasksAdapter struct {
 	mu     sync.RWMutex
 	handle *C.net_tasks_adapter_t
+	// origin is the origin hash this adapter stamps on its writes, which
+	// is what a WriteToken from Token() carries.
+	origin uint64
 }
 
 // OpenTasks opens the tasks adapter against a Redex. `persistent`
@@ -440,7 +467,7 @@ func OpenTasks(redex *Redex, originHash uint64, persistent bool) (*TasksAdapter,
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	t := &TasksAdapter{handle: out}
+	t := &TasksAdapter{handle: out, origin: originHash}
 	runtime.SetFinalizer(t, (*TasksAdapter).free)
 	return t, nil
 }
@@ -567,7 +594,10 @@ func (t *TasksAdapter) List(filter *TasksFilter) ([]Task, error) {
 		return nil, err
 	}
 	defer C.net_free_string(out)
-	payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+	payload, err := copyCBuf(unsafe.Pointer(out), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
 	var tasks []Task
 	if err := json.Unmarshal(payload, &tasks); err != nil {
 		return nil, fmt.Errorf("decode list: %w", err)
@@ -612,7 +642,11 @@ func (t *TasksAdapter) SnapshotAndWatch(
 		return nil, nil, nil, err
 	}
 	defer C.net_free_string(snap)
-	snapPayload := C.GoBytes(unsafe.Pointer(snap), C.int(snapLen))
+	snapPayload, err := copyCBuf(unsafe.Pointer(snap), uint64(snapLen))
+	if err != nil {
+		C.net_tasks_watch_free(cursor)
+		return nil, nil, nil, fmt.Errorf("snapshot: %w", err)
+	}
 	var snapshot []Task
 	if err := json.Unmarshal(snapPayload, &snapshot); err != nil {
 		C.net_tasks_watch_free(cursor)
@@ -640,8 +674,12 @@ func pumpTasksWatch(ctx context.Context, cursor *C.net_tasks_watch_t) (<-chan []
 			code := C.net_tasks_watch_next(cursor, 50, &out, &outLen)
 			switch code {
 			case 0:
-				payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+				payload, perr := copyCBuf(unsafe.Pointer(out), uint64(outLen))
 				C.net_free_string(out)
+				if perr != nil {
+					errs <- perr
+					return
+				}
 				var batch []Task
 				if err := json.Unmarshal(payload, &batch); err != nil {
 					errs <- fmt.Errorf("decode watch batch: %w", err)
@@ -699,6 +737,8 @@ type MemoriesFilter struct {
 type MemoriesAdapter struct {
 	mu     sync.RWMutex
 	handle *C.net_memories_adapter_t
+	// origin is the origin hash this adapter stamps on its writes.
+	origin uint64
 }
 
 func OpenMemories(redex *Redex, originHash uint64, persistent bool) (*MemoriesAdapter, error) {
@@ -716,7 +756,7 @@ func OpenMemories(redex *Redex, originHash uint64, persistent bool) (*MemoriesAd
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	m := &MemoriesAdapter{handle: out}
+	m := &MemoriesAdapter{handle: out, origin: originHash}
 	runtime.SetFinalizer(m, (*MemoriesAdapter).free)
 	return m, nil
 }
@@ -874,7 +914,10 @@ func (m *MemoriesAdapter) List(filter *MemoriesFilter) ([]Memory, error) {
 		return nil, err
 	}
 	defer C.net_free_string(out)
-	payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+	payload, err := copyCBuf(unsafe.Pointer(out), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
 	var memories []Memory
 	if err := json.Unmarshal(payload, &memories); err != nil {
 		return nil, fmt.Errorf("decode list: %w", err)
@@ -908,7 +951,11 @@ func (m *MemoriesAdapter) SnapshotAndWatch(
 		return nil, nil, nil, err
 	}
 	defer C.net_free_string(snap)
-	snapPayload := C.GoBytes(unsafe.Pointer(snap), C.int(snapLen))
+	snapPayload, err := copyCBuf(unsafe.Pointer(snap), uint64(snapLen))
+	if err != nil {
+		C.net_memories_watch_free(cursor)
+		return nil, nil, nil, fmt.Errorf("snapshot: %w", err)
+	}
 	var snapshot []Memory
 	if err := json.Unmarshal(snapPayload, &snapshot); err != nil {
 		C.net_memories_watch_free(cursor)
@@ -936,8 +983,12 @@ func pumpMemoriesWatch(ctx context.Context, cursor *C.net_memories_watch_t) (<-c
 			code := C.net_memories_watch_next(cursor, 50, &out, &outLen)
 			switch code {
 			case 0:
-				payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+				payload, perr := copyCBuf(unsafe.Pointer(out), uint64(outLen))
 				C.net_free_string(out)
+				if perr != nil {
+					errs <- perr
+					return
+				}
 				var batch []Memory
 				if err := json.Unmarshal(payload, &batch); err != nil {
 					errs <- fmt.Errorf("decode watch batch: %w", err)

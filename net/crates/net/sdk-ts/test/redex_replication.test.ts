@@ -208,4 +208,18 @@ describe('Redex greedy dataforts', () => {
     expect(redex.greedyPrometheusText()).toBe('');
     await n.shutdown();
   });
+
+  it('greedyCacheFor is a miss for an uncached channel and refuses a bad name', async () => {
+    const n = await node();
+    const redex = new Redex();
+    try {
+      expect(redex.greedyCacheFor('sdk/greedy/off')).toBeNull();
+      redex.enableGreedyDataforts(n);
+      expect(redex.greedyCacheFor('sdk/greedy/never-published')).toBeNull();
+      expect(() => redex.greedyCacheFor('')).toThrow(/redex/);
+    } finally {
+      redex.disableGreedyDataforts();
+      await n.shutdown();
+    }
+  });
 });

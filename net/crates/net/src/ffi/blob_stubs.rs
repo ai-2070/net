@@ -29,7 +29,7 @@
 
 #![cfg(all(feature = "netdb", feature = "redex-disk", not(feature = "dataforts")))]
 
-use std::ffi::{c_char, c_int};
+use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
 use super::cortex::NET_ERR_FEATURE_NOT_BUILT;
@@ -167,6 +167,230 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_config(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_blob_free_buffer(_ptr: *mut u8, _len: usize) {}
 
+// ---- v0.3 tree / range / repair surface (net_mesh_blob_adapter_new_v2 and
+// friends). Same posture as the stubs above, plus the S6 contract: any
+// non-NULL out-pointer is initialised before returning, so a caller that
+// ignores the code still reads (NULL, 0).
+
+/// # Safety
+/// `out_handle` may be null; if non-null it must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_new_v2(
+    _redex: *mut super::cortex::RedexHandle,
+    _adapter_id: *const c_char,
+    _persistent: c_int,
+    _options_json: *const c_char,
+    out_handle: *mut *mut MeshBlobAdapterHandle,
+) -> c_int {
+    if !out_handle.is_null() {
+        unsafe { *out_handle = ptr::null_mut() };
+    }
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+/// # Safety
+/// `out_data` / `out_len` may be null; if non-null they must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_fetch_range(
+    _handle: *const MeshBlobAdapterHandle,
+    _blob_ref_bytes: *const u8,
+    _blob_ref_len: usize,
+    _start: u64,
+    _end: u64,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    if !out_data.is_null() && !out_len.is_null() {
+        unsafe {
+            *out_data = ptr::null_mut();
+            *out_len = 0;
+        }
+    }
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+/// # Safety
+/// `out_ref` / `out_ref_len` may be null; if non-null they must be writable.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_store_tree(
+    _handle: *const MeshBlobAdapterHandle,
+    _data: *const u8,
+    _data_len: usize,
+    _encoding_kind: u8,
+    _rs_k: u8,
+    _rs_m: u8,
+    out_ref: *mut *mut u8,
+    out_ref_len: *mut usize,
+) -> c_int {
+    if !out_ref.is_null() && !out_ref_len.is_null() {
+        unsafe {
+            *out_ref = ptr::null_mut();
+            *out_ref_len = 0;
+        }
+    }
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+/// # Safety
+/// `out_json` may be null; if non-null it must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_repair_blob(
+    _handle: *const MeshBlobAdapterHandle,
+    _blob_ref_bytes: *const u8,
+    _blob_ref_len: usize,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    if !out_json.is_null() {
+        unsafe { *out_json = ptr::null_mut() };
+    }
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+/// # Safety
+/// `out_json` may be null; if non-null it must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_tree_node_cache_stats(
+    _handle: *const MeshBlobAdapterHandle,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    if !out_json.is_null() {
+        unsafe { *out_json = ptr::null_mut() };
+    }
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+/// # Safety
+/// `out_json` may be null; if non-null it must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_ref_describe(
+    _encoded: *const u8,
+    _encoded_len: usize,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    if !out_json.is_null() {
+        unsafe { *out_json = ptr::null_mut() };
+    }
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+/// Test seam stub (`fixtures` only), so a `test_helpers` Go binary still
+/// links against a dataforts-off `libnet`.
+///
+/// # Safety
+/// Never dereferences its arguments.
+#[cfg(feature = "fixtures")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_test_drop_data_chunk(
+    _handle: *const MeshBlobAdapterHandle,
+    _blob_ref_bytes: *const u8,
+    _blob_ref_len: usize,
+    _stripe_index: u32,
+    _data_index: u32,
+    _out_hash: *mut u8,
+) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+/// Test seam stub (`fixtures` only).
+///
+/// # Safety
+/// Never dereferences its arguments.
+#[cfg(feature = "fixtures")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_test_chunk_present(
+    _handle: *const MeshBlobAdapterHandle,
+    _hash: *const u8,
+) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+// ---- Process-wide adapter registry (S5, S5b). `go/blob_registry.go` and
+// `go/blob_adapter.go` link these unconditionally too. Same posture: the
+// code, every non-NULL out slot reset, and an owned registration that never
+// calls its release_fn (the context stays the caller's, as on any refusal).
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_register_fs_adapter(
+    _adapter_id: *const c_char,
+    _root: *const c_char,
+) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_unregister_adapter(_adapter_id: *const c_char) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_adapter_registered(_adapter_id: *const c_char) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+/// # Safety
+/// `out_payload` / `out_payload_len` may be null; if non-null they must be
+/// writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_publish(
+    _adapter_id: *const c_char,
+    _uri: *const c_char,
+    _data: *const u8,
+    _data_len: usize,
+    out_payload: *mut *mut u8,
+    out_payload_len: *mut usize,
+) -> c_int {
+    unsafe { reset_buf(out_payload, out_payload_len) };
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+/// # Safety
+/// `out_content` / `out_content_len` may be null; if non-null they must be
+/// writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_resolve(
+    _adapter_id: *const c_char,
+    _payload: *const u8,
+    _payload_len: usize,
+    out_content: *mut *mut u8,
+    out_content_len: *mut usize,
+) -> c_int {
+    unsafe { reset_buf(out_content, out_content_len) };
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_register_callback_adapter(
+    _adapter_id: *const c_char,
+    _vtable: *const c_void,
+    _ctx: *mut c_void,
+) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_register_callback_adapter_owned(
+    _adapter_id: *const c_char,
+    _vtable: *const c_void,
+    _ctx: *mut c_void,
+    _release_fn: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
+) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+/// Reset a (pointer, length) out pair, skipping NULL slots.
+///
+/// # Safety
+/// Each non-null argument must be writable.
+unsafe fn reset_buf(data: *mut *mut u8, len: *mut usize) {
+    if !data.is_null() {
+        unsafe { *data = ptr::null_mut() };
+    }
+    if !len.is_null() {
+        unsafe { *len = 0 };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Contract checks on the stub bodies — every `c_int`
@@ -227,9 +451,149 @@ mod tests {
                 std::ptr::null()
             )
             .is_null());
+            // v0.3 surface: the code, and every non-NULL out slot reset.
+            let mut out_handle = std::ptr::dangling_mut::<MeshBlobAdapterHandle>();
+            assert_eq!(
+                net_mesh_blob_adapter_new_v2(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut out_handle
+                ),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert!(out_handle.is_null());
+            let mut out_data = std::ptr::dangling_mut::<u8>();
+            let mut out_len = 7usize;
+            assert_eq!(
+                net_mesh_blob_adapter_fetch_range(
+                    null_handle,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    1,
+                    &mut out_data,
+                    &mut out_len
+                ),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert!(out_data.is_null() && out_len == 0);
+            let mut out_ref = std::ptr::dangling_mut::<u8>();
+            let mut out_ref_len = 7usize;
+            assert_eq!(
+                net_mesh_blob_adapter_store_tree(
+                    null_handle,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    &mut out_ref,
+                    &mut out_ref_len
+                ),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert!(out_ref.is_null() && out_ref_len == 0);
+            let mut out_json = std::ptr::dangling_mut::<c_char>();
+            assert_eq!(
+                net_mesh_blob_adapter_repair_blob(null_handle, std::ptr::null(), 0, &mut out_json),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert!(out_json.is_null());
+            let mut out_json = std::ptr::dangling_mut::<c_char>();
+            assert_eq!(
+                net_mesh_blob_adapter_tree_node_cache_stats(null_handle, &mut out_json),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert!(out_json.is_null());
+            let mut out_json = std::ptr::dangling_mut::<c_char>();
+            assert_eq!(
+                net_blob_ref_describe(std::ptr::null(), 0, &mut out_json),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert!(out_json.is_null());
             assert!(net_mesh_blob_adapter_prometheus_text(null_handle).is_null());
             assert!(net_mesh_blob_adapter_overflow_config(null_handle).is_null());
             net_mesh_blob_adapter_free(std::ptr::null_mut());
         }
+    }
+
+    #[test]
+    fn registry_stubs_refuse_and_never_release() {
+        static RELEASED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "C" fn release(_ctx: *mut c_void) {
+            RELEASED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let id = c"stub-id";
+        // SAFETY: the stubs never dereference their inputs; the out slots
+        // are live locals.
+        unsafe {
+            assert_eq!(
+                net_blob_register_fs_adapter(id.as_ptr(), c"/tmp".as_ptr()),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert_eq!(
+                net_blob_unregister_adapter(id.as_ptr()),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert_eq!(
+                net_blob_adapter_registered(id.as_ptr()),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            let mut out = std::ptr::dangling_mut::<u8>();
+            let mut out_len = 7usize;
+            assert_eq!(
+                net_blob_publish(
+                    id.as_ptr(),
+                    c"file:///x".as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    &mut out,
+                    &mut out_len
+                ),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert!(out.is_null() && out_len == 0);
+            let mut out = std::ptr::dangling_mut::<u8>();
+            let mut out_len = 7usize;
+            assert_eq!(
+                net_blob_resolve(id.as_ptr(), std::ptr::null(), 0, &mut out, &mut out_len),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert!(out.is_null() && out_len == 0);
+            assert_eq!(
+                net_blob_resolve(
+                    id.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert_eq!(
+                net_blob_register_callback_adapter(
+                    id.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null_mut()
+                ),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert_eq!(
+                net_blob_register_callback_adapter_owned(
+                    id.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::dangling_mut(),
+                    Some(release)
+                ),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+        }
+        assert_eq!(
+            RELEASED.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refusal keeps ctx with the caller"
+        );
     }
 }

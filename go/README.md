@@ -268,7 +268,7 @@ carrying a `Kind` for `errors.As`:
 | Channels — hierarchical pub/sub with capability auth | [Channels](https://ai2070.net/docs/concepts/channels) |
 | RedEX / CortEX / NetDB — logs, folds, queries | [Durable logs](https://ai2070.net/docs/guides/durable-logs), [Folds](https://ai2070.net/docs/guides/cortex-folds), [NetDB](https://ai2070.net/docs/guides/netdb-queries) |
 | MeshDB — federated queries | [MeshDB](https://ai2070.net/docs/guides/netdb-queries#federated-queries-meshdb) |
-| Dataforts — blobs, greedy cache, data gravity | [Blob storage](https://ai2070.net/docs/guides/dataforts) |
+| Dataforts — blobs (trees, Reed-Solomon, repair, range reads), directory transfer, greedy cache, data gravity | [Blob storage](https://ai2070.net/docs/guides/dataforts), [Move it — Go](https://ai2070.net/docs/sdk/go/artifacts) |
 | Compute + Groups — daemons, migration, replica/fork/standby | [Daemons](https://ai2070.net/docs/guides/daemons-and-placement), [Continuity](https://ai2070.net/docs/guides/continuity-and-migration) |
 | Deck — the operator surface | [Deck](https://ai2070.net/docs/reference/deck) |
 | Organizations — capabilities only your org can discover | [Private capabilities](https://ai2070.net/docs/guides/private-capabilities) |

@@ -49,6 +49,7 @@ var (
 
 type headerSurface struct {
 	fns      map[string]string   // name -> normalized parameter list
+	rets     map[string]string   // name -> normalized return type
 	consts   map[string]string   // name -> value
 	typedefs map[string]bool     // opaque + inline typedef names
 	structs  map[string][]string // inline struct name -> ordered "type name[arr]" fields
@@ -65,13 +66,16 @@ func parseHeader(t *testing.T, path string) headerSurface {
 
 	s := headerSurface{
 		fns:      map[string]string{},
+		rets:     map[string]string{},
 		consts:   map[string]string{},
 		typedefs: map[string]bool{},
 		structs:  map[string][]string{},
 	}
-	for _, m := range fnDeclRe.FindAllStringSubmatch(src, -1) {
-		args := strings.TrimSpace(whitespaceRe.ReplaceAllString(m[2], " "))
-		s.fns[m[1]] = args
+	for _, idx := range fnDeclRe.FindAllStringSubmatchIndex(src, -1) {
+		name := src[idx[2]:idx[3]]
+		args := strings.TrimSpace(whitespaceRe.ReplaceAllString(src[idx[4]:idx[5]], " "))
+		s.fns[name] = args
+		s.rets[name] = returnTypeBefore(src, idx[2])
 	}
 	for _, m := range constRe.FindAllStringSubmatch(src, -1) {
 		s.consts[m[1]] = m[2]
@@ -93,6 +97,35 @@ func parseHeader(t *testing.T, path string) headerSurface {
 		s.structs[name] = fields
 	}
 	return s
+}
+
+// returnTypeBefore is the declaration text between the previous `;`, `{`
+// or `}` and a function name, minus preprocessor lines, with whitespace and
+// pointer spacing normalized ("char *" and "char*" compare equal). The
+// return type is part of the C ABI: `int net_x(...)` and `void net_x(...)`
+// must not compare equal just because their parameters do.
+func returnTypeBefore(src string, nameAt int) string {
+	start := strings.LastIndexAny(src[:nameAt], ";{}") + 1
+	var kept []string
+	for _, line := range strings.Split(src[start:nameAt], "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "#") {
+			kept = append(kept, line)
+		}
+	}
+	ret := strings.TrimSpace(whitespaceRe.ReplaceAllString(strings.Join(kept, " "), " "))
+	ret = strings.ReplaceAll(ret, " *", "*")
+	return strings.TrimPrefix(ret, "extern ")
+}
+
+// requireCrateTree skips a test that reads the Rust crate (sources or
+// canonical headers) when the Go module is checked out on its own, as
+// TestHeaderParityWithCrateHeader does. In the monorepo, and so in CI, the
+// tree is always there.
+func requireCrateTree(t *testing.T) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join("..", "net", "crates", "net", "src")); err != nil {
+		t.Skipf("crate tree not present (%v) — standalone checkout", err)
+	}
 }
 
 func onlyIn(a, b map[string]string) []string {
@@ -144,6 +177,9 @@ func TestHeaderParityWithCrateHeader(t *testing.T) {
 	for name, args := range crate.fns {
 		if got, ok := goHeader.fns[name]; ok && got != args {
 			t.Errorf("signature drift for %s:\n  include: (%s)\n  go:      (%s)", name, args, got)
+		}
+		if got, ok := goHeader.rets[name]; ok && got != crate.rets[name] {
+			t.Errorf("return type drift for %s: include %q, go %q", name, crate.rets[name], got)
 		}
 	}
 
@@ -197,5 +233,32 @@ func TestHeaderParityWithCrateHeader(t *testing.T) {
 		if _, ok := crate.structs[name]; !ok {
 			t.Errorf("struct %s in go/net.h but missing from include/net.go.h", name)
 		}
+	}
+}
+
+// TestHeaderParserReadsReturnTypes pins the return-type pass: without it the
+// parity checks compare parameters only, and `int net_x(...)` against
+// `void net_x(...)` passes (cubic review, PR #1165).
+func TestHeaderParserReadsReturnTypes(t *testing.T) {
+	h := parseHeader(t, "net.h")
+	for name, want := range map[string]string{
+		"net_blob_publish":                         "int",
+		"net_blob_free_buffer":                     "void",
+		"net_mesh_blob_adapter_new":                "net_mesh_blob_adapter_t*",
+		"net_mesh_blob_adapter_prometheus_text":    "char*",
+		"net_blob_register_callback_adapter_owned": "int",
+	} {
+		if got := h.rets[name]; got != want {
+			t.Errorf("return type of %s = %q, want %q", name, got, want)
+		}
+	}
+	src := "#include <x.h>\nint net_a(void);\n/* c */ const char *  net_b(int x);\n"
+	src = blockCommentRe.ReplaceAllString(src, "")
+	got := map[string]string{}
+	for _, idx := range fnDeclRe.FindAllStringSubmatchIndex(src, -1) {
+		got[src[idx[2]:idx[3]]] = returnTypeBefore(src, idx[2])
+	}
+	if got["net_a"] != "int" || got["net_b"] != "const char*" {
+		t.Errorf("returnTypeBefore = %v; want net_a int, net_b const char*", got)
 	}
 }

@@ -596,7 +596,10 @@ func ParseToken(token []byte) (*ParsedToken, error) {
 		return nil, err
 	}
 	defer C.net_free_string(outJSON)
-	raw := C.GoStringN(outJSON, C.int(outLen))
+	raw, err := copyCString(unsafe.Pointer(outJSON), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("parse token: %w", err)
+	}
 	var parsed ParsedToken
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		return nil, fmt.Errorf("parse token json: %w", err)
@@ -728,9 +731,10 @@ func consumeBytes(ptr *C.uint8_t, length C.size_t) []byte {
 	if ptr == nil || length == 0 {
 		return nil
 	}
-	// GoBytes copies the buffer into Go memory; we can free the Rust
-	// allocation immediately after.
-	out := C.GoBytes(unsafe.Pointer(ptr), C.int(length))
+	// cBytesOrEmpty copies the buffer into Go memory (with no C.int
+	// narrowing of the length, unlike C.GoBytes), so the Rust allocation
+	// can be freed immediately after.
+	out := cBytesOrEmpty(unsafe.Pointer(ptr), uint64(length))
 	C.net_free_bytes(ptr, length)
 	return out
 }
