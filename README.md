@@ -33,20 +33,18 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 
 **Performance**
 
-| On an M1 Max (one operation, measured alone) | Time | Rate |
-|---|---|---|
-| Encode a packet header | 2.2 ns | 456 M/sec |
-| Resolve a next hop | 37.7 ns | 26 M/sec |
-| Forward one hop | 61.7 ns | 16 M/sec |
-| Encrypt a 1 KB payload | 908 ns | ~1 GiB/sec |
-| Build a packet from 50 events | 2.4 µs | 1.2 GiB/sec |
-| Process a heartbeat from a known peer | 39.8 ns | 25 M/sec |
-| Recover from a failed peer | 291 ns | 3.4 M/sec |
-| Sweep 5,000 peers for failures | 55 µs | once per 5 s |
-| Start a node → first peer | 937 µs | — |
-| Start a node → first RPC reply | 1.3 ms | — |
+| On an M1 Max (one operation, measured alone) | Time / rate |
+|---|---|
+| Header serialize | 2.19 ns / 456 M ops/sec |
+| Routing lookup (hit) | 37.7 ns / 26.5 M ops/sec |
+| 1-hop forward | 61.7 ns / 16.2 M ops/sec |
+| Encrypt 1 KB (ChaCha20-Poly1305) | 908 ns / 1.05 GiB/sec |
+| Heartbeat from a known peer | 39.8 ns / 25.2 M ops/sec |
+| Full fail + recover cycle | 291 ns / 3.44 M ops/sec |
+| Start a node → first peer | 937 µs |
+| Start a node → first RPC reply | 1.26 ms |
 
-These measure single operations on one machine — not a round trip, and not NIC transfer. The peer sweep is an O(nodes) scan run on the heartbeat interval, not a per-packet cost. The full set is under [Performance](#performance).
+These measure packet scheduling on one machine — not NIC transfer, wire latency, or propagation. The full set is under [Performance](#performance).
 
 **What that gives you**
 
