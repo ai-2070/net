@@ -28,6 +28,7 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 - **Reachable through NATs.** Nodes try a direct path first and fall back to a relay; a browser tab joins as a full node over WebRTC.
 - **Latency-first.** Transport, routing, and placement all prefer the fastest path available.
 - **Zero-copy ring buffers.** Each shard drains a lock-free, pre-allocated ring buffer — no allocation on push or pop — and event payloads are refcounted `Bytes`, so moving them through the bus is a pointer bump, not a copy.
+- **Sharded ingestion.** Events stripe across per-shard buffers, merged for cross-shard consumption; the shard count defaults to CPU count and can scale at runtime.
 - **Optionally-reliable, optionally-typed, optionally-ordered.** Delivery guarantees, schema, and ordering are chosen per channel — the mesh defaults to the fastest path and lets a caller pay only for the guarantees it needs.
 
 **What that gives you**
