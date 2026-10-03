@@ -532,11 +532,11 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — provider (WS-B)', () => {
         const hangMsg = await rejection(submit('pf-hang'))
         // A never-settling Promise is refused either at the 5 s budget or —
         // when nothing references it and V8 collects it first, which a busy
-        // run makes likely — as an abandoned Promise (napi's "oneshot
-        // canceled"). Found at PR review; both paths fail closed and neither
-        // launches, which is the property.
+        // run makes likely — as a Promise that can never settle (the
+        // abandoned-Promise witness below forces that path). Both fail closed
+        // and neither launches.
         expect(hangMsg).toMatch(
-          /preflight refused: (the preflight did not answer within 5000 ms|the preflight rejected or did not return null or a string: .*oneshot canceled)/,
+          /preflight refused: the preflight (did not answer within 5000 ms|returned a Promise that can never settle)/,
         )
         // A received refusal, inside the caller's 30 s budget (review R3).
         expect(Date.now() - t0).toBeLessThan(15000)
@@ -1365,4 +1365,88 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — retained vs live resolution (WS-F, 
       expect(done.find((r) => r.retained === false).state.state).toBe('resolved')
     })
   }, 900000)
+})
+
+// ---------------------------------------------------------------------------
+// An abandoned Promise is reported as one (found at PR review)
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the GC scenario in a child `node --expose-gc`: V8 collects a pending
+ * Promise nothing references, and the only way to make that deterministic is
+ * to call `gc()` while the bridge awaits it.
+ */
+function abandonedPromiseScenario(): { preflight: string; preflightMs: number; executor: string } {
+  const script = `
+    const { NetMesh, PaymentProvider } = require(${JSON.stringify(resolve(__dirname, '..', 'index.js'))});
+    const { mkdtempSync } = require('node:fs'); const { tmpdir } = require('node:os'); const { join } = require('node:path');
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    (async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'abandoned-'));
+      const mk = () => NetMesh.create({ bindAddr: '127.0.0.1:0', psk: '${PSK}', permissiveChannels: true });
+      const p = await mk(); const r = await mk();
+      const accepted = p.accept(r.nodeId()); await sleep(50);
+      await r.connect(p.localAddr(), p.publicKey(), p.nodeId()); await accepted;
+      await p.start(); await r.start();
+      const provider = new PaymentProvider(p, join(dir, 'e.json'), undefined, undefined, undefined, true);
+      const bounds = { maxPromptBytes: 1024n, maxContextRefs: 8n, maxTags: 8n, maxTagBytes: 64n, maxInFlight: 4n };
+      const svc = { echo: { revision: 'r1', bounds, reservationTtlSecs: 600n, reservationRetentionSecs: 604800n, retentionSecs: 3600n } };
+      const gcLoop = setInterval(() => global.gc(), 20);
+
+      // 1. A preflight returning a Promise nothing else references.
+      const handle = await provider.serveA2aConfigured(async () => 'x', svc, join(dir, 'j.json'), undefined,
+        () => new Promise(() => {}));
+      let preflight = 'ADMITTED'; let preflightMs = -1;
+      for (let i = 0; i < 8; i++) {
+        const t0 = Date.now();
+        try { await r.submitTask(p.nodeId(), 'x', [], [], 'pf-gc', 'echo', 'r1'); break; }
+        catch (e) {
+          preflight = String(e.message); preflightMs = Date.now() - t0;
+          if (preflight.includes('preflight')) break;
+          await sleep(100);
+        }
+      }
+      handle.stop();
+
+      // 2. A task executor returning the same kind of Promise.
+      const legacy = await p.serveA2a(() => new Promise(() => {}));
+      let id;
+      for (let i = 0; i < 8 && !id; i++) {
+        try { id = await r.submitTask(p.nodeId(), 'x', [], [], 'ex-gc'); } catch { await sleep(100); }
+      }
+      let executor = 'NEVER_FAILED';
+      const deadline = Date.now() + 20000;
+      while (Date.now() < deadline) {
+        const raw = await r.taskStatus(p.nodeId(), 'ex-gc');
+        const st = raw && JSON.parse(raw).state;
+        if (st && st.state === 'failed') { executor = st.error; break; }
+        await sleep(50);
+      }
+      clearInterval(gcLoop);
+      legacy.stop(); provider.close();
+      console.log('RESULT ' + JSON.stringify({ preflight, preflightMs, executor }));
+      process.exit(0);
+    })().catch((e) => { console.log('ERROR ' + e.message); process.exit(1); });`
+  const out = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
+    encoding: 'utf8',
+    timeout: 120000,
+  })
+  const line = out.split('\n').find((l) => l.startsWith('RESULT '))
+  if (!line) throw new Error(`scenario produced no result:\n${out}`)
+  return JSON.parse(line.slice('RESULT '.length))
+}
+
+describe.skipIf(!HAS_PAID_A2A)('paid a2a — abandoned Promises (PR review)', () => {
+  // A pending Promise that nothing references can never settle; V8 may
+  // collect it, and napi then reports a dropped channel. Both JS bridges
+  // name that for what it is — at once, not after the budget, and not as a
+  // rejection — while still refusing (preflight) or failing (executor).
+  it('a collected preflight or executor Promise is reported as never settling', () => {
+    const r = abandonedPromiseScenario()
+    expect(r.preflight).toMatch(/preflight refused: the preflight returned a Promise that can never settle/)
+    // Reported when V8 collected it, well before the 5 s budget.
+    expect(r.preflightMs).toBeGreaterThanOrEqual(0)
+    expect(r.preflightMs).toBeLessThan(5000)
+    expect(r.executor).toMatch(/a2a task handler returned a Promise that can never settle/)
+  }, 180000)
 })

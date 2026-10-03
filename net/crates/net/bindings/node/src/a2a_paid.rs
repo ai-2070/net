@@ -21,10 +21,11 @@
 //! Promise<string | null>`. `null` / `undefined` admits; a string refuses
 //! with that reason verbatim; a throw, a rejection, a non-string result or
 //! missing the [`PREFLIGHT_BUDGET`] all **refuse** — an application check
-//! that did not answer admitted nothing. So does an abandoned Promise: one
-//! that never settles and that nothing references can be collected by V8
-//! before the budget runs out, and napi then reports it as `oneshot
-//! canceled` — refused like a rejection.
+//! that did not answer admitted nothing. So does an **abandoned** Promise:
+//! one that is pending and that nothing references can never settle, and V8
+//! may collect it before the budget runs out. That is reported as such — "a
+//! Promise that can never settle" — at once, rather than as a rejection
+//! (`crate::a2a::is_abandoned_promise`).
 //!
 //! **Stop is retirement, not release** (plan D6). Stopping the returned
 //! handle unregisters the services; the journal's ownership ends only once
@@ -261,9 +262,15 @@ impl TaskPreflight for NodePreflight {
                     return Err("preflight refused: the preflight callback was dropped".to_string())
                 }
             };
-            promise
-                .await
-                .map_err(|e| format!("preflight refused: the preflight rejected or did not return null or a string: {e}"))
+            promise.await.map_err(|e| {
+                if crate::a2a::is_abandoned_promise(&e) {
+                    format!("preflight refused: the preflight {}", crate::a2a::NEVER_SETTLES)
+                } else {
+                    format!(
+                        "preflight refused: the preflight rejected or did not return null or a string: {e}"
+                    )
+                }
+            })
         };
         // On expiry the future — and with it the oneshot — is dropped, so a
         // late answer from JS has nowhere to land and cannot revive the

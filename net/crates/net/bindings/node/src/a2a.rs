@@ -68,6 +68,27 @@ pub(crate) const ERR_INVALID_ARGUMENT: &str = "a2a:invalid_argument:";
 /// `PaymentRefusedError`.
 pub(crate) const ERR_PAYMENT_REFUSED: &str = "a2a:payment_refused:";
 
+/// Whether awaiting a JS `Promise` failed because the Promise was
+/// **abandoned** rather than rejected.
+///
+/// A napi `Promise<T>` keeps only the receiving end of a channel; its
+/// `then`/`catch` callbacks live on the JS Promise. When a Promise is pending
+/// and nothing references it — so nothing can ever call its `resolve` or
+/// `reject` — V8 collects it, the callbacks are finalized, the sender drops,
+/// and napi reports `GenericFailure` with the futures-oneshot reason
+/// `"oneshot canceled"` (`napi` `Promise::poll`). Such a Promise provably
+/// can never settle, so the bridges report that, at once, instead of waiting
+/// out a deadline or calling it a rejection. A JS rejection whose message is
+/// literally `oneshot canceled` would be classified the same way; it is still
+/// a refusal or a failure, only the reason text differs.
+pub(crate) fn is_abandoned_promise(e: &Error) -> bool {
+    e.status == Status::GenericFailure && e.reason == "oneshot canceled"
+}
+
+/// The reason a bridge gives when [`is_abandoned_promise`] holds.
+pub(crate) const NEVER_SETTLES: &str = "returned a Promise that can never settle \
+     (nothing references its resolve or reject, so V8 collected it)";
+
 pub(crate) fn invalid(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("{ERR_INVALID_ARGUMENT} {msg}"))
 }
@@ -270,6 +291,9 @@ impl TaskExecutor for NodeTaskExecutor {
             };
             match promise.await {
                 Ok(v) => Ok(v),
+                Err(e) if is_abandoned_promise(&e) => {
+                    Err(format!("a2a task handler {NEVER_SETTLES}"))
+                }
                 Err(e) => Err(format!("a2a task handler Promise rejected: {e}")),
             }
         };
