@@ -145,6 +145,26 @@ async function paidTerms(mesh: Any, provider: Any): Promise<string> {
 }
 
 /**
+ * Run a child `node` script and return its stdout. A child that exits
+ * non-zero or outlives `timeout` makes `execFileSync` throw an error that,
+ * on its own, says only ETIMEDOUT / the exit status — so rethrow it carrying
+ * the child's stdout and stderr (both populated even on a timeout), which is
+ * where a stalled scenario shows how far it got.
+ */
+function runChild(args: string[], timeout: number): string {
+  try {
+    return execFileSync(process.execPath, args, { encoding: 'utf8', timeout })
+  } catch (e) {
+    const err = e as { message?: string; stdout?: string | Buffer; stderr?: string | Buffer }
+    throw new Error(
+      `child scenario failed: ${err.message ?? String(e)}\n` +
+        `--- child stdout ---\n${String(err.stdout ?? '')}\n` +
+        `--- child stderr ---\n${String(err.stderr ?? '')}`,
+    )
+  }
+}
+
+/**
  * Try to own `journalPath` from a separate Node process. Prints `SERVED` or
  * `REFUSED:<prefix>` — the OS-level lock is what is under test, so the rival
  * must not share this process's in-process owner registry.
@@ -163,7 +183,7 @@ function rivalOwner(journalPath: string): string {
       catch (e) { require('node:fs').writeSync(1, 'REFUSED:' + String(e.message).split(' ')[0] + '\\n'); }
       p.close(); await mesh.shutdown(); process.exit(0);
     })();`
-  return execFileSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 60000 }).trim().split('\n').pop()!
+  return runChild(['-e', script], 60000).trim().split('\n').pop()!
 }
 
 async function rejection(p: Promise<unknown>): Promise<string> {
@@ -1452,10 +1472,7 @@ function abandonedPromiseScenario(): { preflight: string; preflightMs: number; e
       require('node:fs').writeSync(1, 'RESULT ' + JSON.stringify({ preflight, preflightMs, executor }) + '\\n');
       process.exit(0);
     })().catch((e) => { require('node:fs').writeSync(1, 'ERROR ' + e.message + '\\n'); process.exit(1); });`
-  const out = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
-    encoding: 'utf8',
-    timeout: 120000,
-  })
+  const out = runChild(['--expose-gc', '-e', script], 120000)
   const line = out.split('\n').find((l) => l.startsWith('RESULT '))
   if (!line) throw new Error(`scenario produced no result:\n${out}`)
   return JSON.parse(line.slice('RESULT '.length))

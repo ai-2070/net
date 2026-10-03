@@ -26,6 +26,26 @@ const HAS_RPC = typeof binding.MeshRpc?.fromMesh === 'function'
 const here = dirname(fileURLToPath(import.meta.url))
 const INDEX = resolve(here, '..', 'index.js')
 
+/**
+ * Run a child `node` script and return its stdout. A child that exits
+ * non-zero or outlives `timeout` makes `execFileSync` throw an error that,
+ * on its own, says only ETIMEDOUT / the exit status — so rethrow it carrying
+ * the child's stdout and stderr (both populated even on a timeout), which is
+ * where a stalled scenario shows how far it got.
+ */
+function runChild(args: string[], timeout: number): string {
+  try {
+    return execFileSync(process.execPath, args, { encoding: 'utf8', timeout })
+  } catch (e) {
+    const err = e as { message?: string; stdout?: string | Buffer; stderr?: string | Buffer }
+    throw new Error(
+      `child scenario failed: ${err.message ?? String(e)}\n` +
+        `--- child stdout ---\n${String(err.stdout ?? '')}\n` +
+        `--- child stderr ---\n${String(err.stderr ?? '')}`,
+    )
+  }
+}
+
 function scenario(): { unary: string; streaming: string; literal: string } {
   const script = `
     const { NetMesh, MeshRpc } = require(${JSON.stringify(INDEX)});
@@ -90,10 +110,7 @@ function scenario(): { unary: string; streaming: string; literal: string } {
       require('node:fs').writeSync(1, 'RESULT ' + JSON.stringify({ unary, streaming, literal }) + '\\n');
       process.exit(0);
     })().catch((e) => { require('node:fs').writeSync(1, 'ERROR ' + e.message + '\\n'); process.exit(1); });`
-  const out = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
-    encoding: 'utf8',
-    timeout: 120000,
-  })
+  const out = runChild(['--expose-gc', '-e', script], 120000)
   const line = out.split('\n').find((l) => l.startsWith('RESULT '))
   if (!line) throw new Error(`scenario produced no result:\n${out}`)
   return JSON.parse(line.slice('RESULT '.length))
@@ -117,4 +134,24 @@ describe.skipIf(!HAS_RPC)('abandoned JS Promises are named, not called rejection
     expect(r.literal).toMatch(/JS handler returned a Promise that was dropped before it settled/)
     expect(r.literal).toMatch(/napi lost its result channel/)
   }, 180000)
+})
+
+// PR review (cubic): a stalled scenario must be diagnosable, not a bare
+// ETIMEDOUT — the helper rethrows with the child's own output.
+describe('child scenario diagnostics', () => {
+  it('a child that hangs past its timeout surfaces what it printed', () => {
+    let message = ''
+    try {
+      runChild(['-e', "process.stdout.write('got as far as step 2'); setInterval(() => {}, 1000)"], 2000)
+    } catch (e) {
+      message = (e as Error).message
+    }
+    expect(message).toMatch(/^child scenario failed: /)
+    // The timeout path, not a crash: and the line arrives through the child's
+    // STDOUT section — a syntax error echoing the source on stderr must not
+    // be able to satisfy this.
+    expect(message).toMatch(/ETIMEDOUT/)
+    expect(message).toMatch(/--- child stdout ---\ngot as far as step 2/)
+    expect(message).not.toMatch(/SyntaxError/)
+  }, 30000)
 })
