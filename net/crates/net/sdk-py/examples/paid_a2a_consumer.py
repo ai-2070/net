@@ -35,6 +35,7 @@ import asyncio
 import gc
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -50,6 +51,12 @@ from net_sdk.payments import (
 )
 
 PSK = "b4" * 32
+
+# Every cell's scratch directory lives under one per-process root, so a
+# failing cell's files can be removed before the hard exit in `main` even
+# when a `TemporaryDirectory` could not clean up while unwinding (on Windows
+# a live native handle can still hold a file open at that point).
+_SCRATCH = tempfile.mkdtemp(prefix="paid-a2a-consumer-")
 PAID = "summarize"
 MOCK_REQS = json.dumps(
     [
@@ -161,7 +168,7 @@ class _Stage:
 
 
 def cell_sync() -> dict:
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=_SCRATCH) as d:
         provider_node = net_sdk.MeshNode(bind_addr="127.0.0.1:0", psk=PSK)
         caller = net_sdk.MeshNode(bind_addr="127.0.0.1:0", psk=PSK)
         _handshake(caller, provider_node)
@@ -205,7 +212,7 @@ def cell_sync() -> dict:
 
 def cell_async() -> dict:
     async def run() -> dict:
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(dir=_SCRATCH) as d:
             provider_node = net_sdk.AsyncMeshNode(bind_addr="127.0.0.1:0", psk=PSK)
             caller = net_sdk.AsyncMeshNode(bind_addr="127.0.0.1:0", psk=PSK)
             accepted = asyncio.ensure_future(provider_node.accept(caller.node_id))
@@ -240,7 +247,7 @@ def cell_async() -> dict:
 def cell_native() -> dict:
     import net  # a native NetMesh is what this cell tests
 
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=_SCRATCH) as d:
         mesh = net.NetMesh("127.0.0.1:0", PSK)
         mesh.start()
         provider = create_payment_provider(
@@ -268,7 +275,7 @@ def _raises(exc_type, fn, *args, **kwargs) -> str:
 def cell_refusals() -> dict:
     import net  # the first control is the NATIVE gateway's own refusal
 
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=_SCRATCH) as d:
         node = net_sdk.MeshNode(bind_addr="127.0.0.1:0", psk=PSK)
         node.start()
         receipt = {}
@@ -346,7 +353,7 @@ def cell_same_org(scenario_dir: str) -> dict:
             heartbeat_interval_ms=200,
         )
 
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=_SCRATCH) as d:
         provider_node = mesh(m["provider"]["seed_hex"])
         caller = mesh(m["caller"]["seed_hex"])
         org.install_org_authority(provider_node, path(m["provider"]["authority_dir"]))
@@ -477,9 +484,11 @@ def main() -> int:
         traceback.print_exc()
         sys.stdout.flush()
         sys.stderr.flush()
+        shutil.rmtree(_SCRATCH, ignore_errors=True)
         os._exit(1)
     print("CELL_OK " + json.dumps(receipt, sort_keys=True))
     sys.stdout.flush()
+    shutil.rmtree(_SCRATCH, ignore_errors=True)
     return 0
 
 

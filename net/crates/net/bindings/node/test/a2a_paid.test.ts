@@ -284,18 +284,21 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — provider (WS-B)', () => {
       const services = { [FREE]: offer() }
       const first = await provider.serveA2aConfigured(executor([]), services, path)
       // The rival needs a node of its own: a node serves the payments wire
-      // once, so a second PaymentProvider cannot share this one.
-      const rivalMesh = await meshUnstarted()
-      await rivalMesh.start()
-      const rival = devProvider(rivalMesh, tmp('engine-rival.json'))
+      // once, so a second PaymentProvider cannot share this one. Acquired
+      // inside the `try`, so a setup failure still releases it.
+      let rivalMesh: Any
+      let rival: Any
       try {
+        rivalMesh = await meshUnstarted()
+        await rivalMesh.start()
+        rival = devProvider(rivalMesh, tmp('engine-rival.json'))
         expect(await rejection(rival.serveA2aConfigured(executor([]), services, path))).toMatch(
           /^a2a:journal_owned_elsewhere: /,
         )
       } finally {
         first.stop()
-        rival.close()
-        await rivalMesh.shutdown()
+        rival?.close()
+        await rivalMesh?.shutdown()
       }
       // Idle case: nothing was launched, so retiring the registration is
       // what releases the journal (the under-work case is a later witness).
@@ -321,6 +324,17 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — provider (WS-B)', () => {
       const second = await provider.serveA2aConfigured(executor([]), { [FREE]: offer() }, tmp('j3.json'))
       expect(second.serving).toBe(true)
       second.stop()
+      // Stopped handles the caller still holds are not live registrations:
+      // stop/serve cycles keep working, and each stopped handle stays
+      // stopped (the provider prunes them rather than accumulating them).
+      const held: Any[] = [first, second]
+      for (let i = 0; i < 10; i++) {
+        const h = await provider.serveA2aConfigured(executor([]), { [FREE]: offer() }, tmp(`cycle-${i}.json`))
+        expect(h.serving).toBe(true)
+        h.stop()
+        held.push(h)
+      }
+      expect(held.every((h) => h.serving === false)).toBe(true)
     })
   }, 30000)
 
@@ -332,16 +346,27 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — provider (WS-B)', () => {
   it('a close() racing an in-flight serve retires it, so the mesh can shut down', async () => {
     for (let round = 0; round < 5; round++) {
       const mesh = await meshUnstarted()
-      await mesh.start()
-      const provider = devProvider(mesh, tmp('engine.json'))
-      const pending = provider.serveA2aConfigured(executor([]), { [FREE]: offer() }, tmp('journal.json'))
-      provider.close()
-      const outcome = await pending.then(
-        (h: Any) => (h.serving ? 'still serving' : 'retired'),
-        (e: Error) => e.message,
-      )
-      expect(outcome).toMatch(/^retired$|has been closed/)
-      await mesh.shutdown()
+      let shutDown = false
+      let provider: Any
+      try {
+        await mesh.start()
+        provider = devProvider(mesh, tmp('engine.json'))
+        const pending = provider.serveA2aConfigured(executor([]), { [FREE]: offer() }, tmp('journal.json'))
+        provider.close()
+        const outcome = await pending.then(
+          (h: Any) => (h.serving ? 'still serving' : 'retired'),
+          (e: Error) => e.message,
+        )
+        expect(outcome).toMatch(/^retired$|has been closed/)
+        // The property itself: nothing the race left behind holds the node.
+        await mesh.shutdown()
+        shutDown = true
+      } finally {
+        if (!shutDown) {
+          provider?.close()
+          await mesh.shutdown().catch(() => {})
+        }
+      }
     }
   }, 60000)
 

@@ -753,7 +753,11 @@ mod provider {
                     return Err(refusal);
                 }
                 let registrations = guard.get_or_insert_with(Vec::new);
-                registrations.retain(|w| w.strong_count() > 0);
+                // Keep only registrations still serving: a stopped one whose
+                // handle the caller still holds would otherwise stay listed,
+                // and repeated stop/serve cycles would grow the list that
+                // every later check and `close()` scans.
+                registrations.retain(|w| w.upgrade().is_some_and(|r| r.lock().is_some()));
                 registrations.push(Arc::downgrade(&handle.shared()));
                 *store_slot.lock() = Some(Arc::downgrade(&store));
                 Ok(handle)
@@ -764,8 +768,9 @@ mod provider {
         /// `reconcile`) as a JSON array — the operator's queue. Each row's
         /// `owner` and `generation` are what `a2aResolve` takes back; the
         /// `peer` owner's node and the `generation` are u64, so read them
-        /// with `a2aDocument` / `a2aU64`, not `JSON.parse`. Rejects
-        /// `a2a:invalid_argument:` when no journal is live.
+        /// with `a2aDocument` / `a2aU64`, not `JSON.parse`. Rejects with the
+        /// plain `a2a:` family when no journal is live — a lifecycle state
+        /// (`serveA2aConfigured` opens one), not the caller's input.
         #[napi(js_name = "a2aUnresolved")]
         pub async fn a2a_unresolved(&self) -> Result<String> {
             let store = crate::a2a_paid::live_store(&self.a2a_store)?;
@@ -776,7 +781,9 @@ mod provider {
         /// (`stateJson`, e.g. `{"state":"failed","error":"refunded"}`) — the
         /// only exit from the queue. `ownerJson` is the row's `owner`
         /// document; `generation`, the row's own, closes exactly that
-        /// incarnation when one key carries two charges.
+        /// incarnation when one key carries two charges. Rejects with the
+        /// plain `a2a:` family when no journal is live, and
+        /// `a2a:invalid_argument:` for a malformed owner / state document.
         #[napi(js_name = "a2aResolve")]
         pub async fn a2a_resolve(
             &self,
