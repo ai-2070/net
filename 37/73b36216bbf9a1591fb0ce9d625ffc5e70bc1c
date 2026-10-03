@@ -1,0 +1,37 @@
+go/cortex.go
+  s_391b90f341d6c6::t_1322c6692e296a 151-155
+go/net_cortex.h
+  s_391b90f341d6c6::t_6feb035b66dec3 48-78
+go/redex_dataforts_test.go
+  s_391b90f341d6c6::t_fed293856e2c99 293
+  s_391b90f341d6c6::t_a9a0c59af522f7 1-292,294-326
+docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md
+  s_391b90f341d6c6::t_efaae319c11ecb 6-8,595-670,920-925
+  s_391b90f341d6c6::t_76c745de2bde92 926
+go/redex_dataforts.go
+  s_391b90f341d6c6::t_1322c6692e296a 19,36-40,54-55
+  s_391b90f341d6c6::t_9becf639df2e77 1-18,20-35,41-53,56-344
+go/abi_stability_test.go
+  s_391b90f341d6c6::t_fed293856e2c99 313-336
+.github/workflows/ci.yml
+  s_391b90f341d6c6::t_5a9325009af695 4823,4828,4860-4864
+  s_391b90f341d6c6::t_92c169a5035b0c 4865
+net/crates/net/include/net_cortex.h
+  s_391b90f341d6c6::t_6feb035b66dec3 48-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3773b36216bbf9a1591fb0ce9d625ffc5e70bc1c",
+  "prompts": {},
+  "sessions": {
+    "s_391b90f341d6c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e008671-9702-4db4-b22a-abb85b691773",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
