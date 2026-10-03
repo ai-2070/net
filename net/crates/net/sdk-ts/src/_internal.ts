@@ -83,3 +83,20 @@ export function getNapiMesh(host: object): NapiNetMesh {
   }
   return r;
 }
+
+/**
+ * The native org client behind any of the three org-client forms: the SDK's
+ * `OrgClient` (`.typed.raw`), a `TypedOrgClient` (`.raw`), or the native
+ * client itself; `null` stays `null`. By shape rather than `instanceof`, so
+ * `mesh.ts` can use it without a runtime import of `org/index.ts` (which
+ * imports `mesh.ts`).
+ *
+ * @internal
+ */
+export function nativeOrgClientOf(org: unknown): unknown {
+  if (org === null || org === undefined) return null;
+  const o = org as { typed?: { raw?: unknown }; raw?: unknown };
+  if (o.typed !== undefined && o.typed.raw !== undefined) return o.typed.raw;
+  if (o.raw !== undefined) return o.raw;
+  return org;
+}

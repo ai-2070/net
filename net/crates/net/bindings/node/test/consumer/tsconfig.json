@@ -14,5 +14,5 @@
     "skipLibCheck": false,
     "types": ["node"]
   },
-  "include": ["./org_streaming_consumer.ts"]
+  "include": ["./org_streaming_consumer.ts", "./paid_a2a_consumer.ts"]
 }

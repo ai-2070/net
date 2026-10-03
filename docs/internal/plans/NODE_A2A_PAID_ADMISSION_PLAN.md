@@ -787,6 +787,51 @@ malformed-document refusals.
   `payments,payments-http,delegation,a2a,org` (`ci.yml:3959`), and the new
   suite is auto-discovered.
 
+
+> **Status: WS-E landed 2026-10-03.** What shipped against the bullets above:
+>
+> - `index.d.ts` regenerated and checked. **Defect found:** napi auto-cased the
+>   preflight's argument struct to `A2APreflightArgs`; the new consumer probe
+>   caught it, and `js_name = "A2aPreflightArgs"` now pins it like every other
+>   A2A name. No auto-cased `A2A…` export remains.
+> - `errors.ts`: already landed with WS-C (the classes, plus
+>   `A2aInvalidArgumentError`).
+> - `sdk-ts/src/payments.ts` (r2.1): `createPaymentProvider` /
+>   `createCapabilityGateway` (named options mapped onto the native positional
+>   constructors; native objects returned), `setA2aOrgCaller(target, org)`, and
+>   re-exports of `a2aDocument`, `a2aU64`, `classifyError` and the three error
+>   classes, all from the SDK root. `MeshNode` gains the `describeA2a` /
+>   `submitTaskPaid` forwards and a `setA2aOrgCaller` that unwraps.
+>   **Deviation:** the org-client unwrap is by shape (`.typed.raw` → `.raw` →
+>   itself) in `_internal.ts`, not `instanceof`: `mesh.ts` cannot import
+>   `org/index.ts` at runtime (that module imports `mesh.ts`), and one helper
+>   serves both call sites. The existing `CapabilityGateway` re-export is
+>   unchanged; its doc names `createCapabilityGateway`.
+> - **The arity guard is mutation-checked.** It is a compile-time equality
+>   between `Required<ConstructorParameters<…>>['length']` minus the mesh and
+>   a named constant, so `tsc` (CI's `npm run build`) fails the moment a native
+>   constructor gains or loses an argument. Setting the gateway constant to 10
+>   fails the build (`TS2322`), and 11 passes.
+> - **Proved by:** `sdk-ts/test/paid_a2a.test.ts` (13). It checks the nine root
+>   exports, then runs a live paid task from two `MeshNode`s through the
+>   factories, once each, ending in **both `MeshNode.shutdown()` calls
+>   succeeding** after stop/close (so the factories retain nothing extra). The
+>   factories also accept a native `NetMesh`. Each option reaches the native
+>   behaviour it names: the backend choice, the billing log, the pin store,
+>   the profile and mock flag needing a policy, an unknown profile, the
+>   purchase path needing a policy, each of the three signer pairs by name, and
+>   the purchase store reaching the paid verbs. `setA2aOrgCaller` takes both
+>   targets and `null`. `mesh_node_surface.test.ts` gains the two forwarding
+>   rows, plus an unwrap witness for all three org-client forms and `null`.
+>   `bindings/node/test/consumer/paid_a2a_consumer.ts` is the documented
+>   `@net-mesh/core` route, compiled with `skipLibCheck: false` by the existing
+>   consumer probe. Whole sdk-ts suite 682 passed (CI floor 567); `sdk-ts`
+>   `npm run build`, node `typecheck:tests` and rustfmt clean.
+> - **Environment note:** `sdk-ts` type-checks against the `.node` built with
+>   its CI job's list (`redis,…,dataforts`, `ci.yml:3959`), not the vitest
+>   job's. With the narrower one, its unrelated `redis-dedup.ts` /
+>   `transport.ts` / blob forwards do not type-check.
+
 ### WS-F — Tests, docs, matrix
 
 - [ ] `bindings/node/test/a2a_paid.test.ts`: the twin of `test_a2a_paid.py`

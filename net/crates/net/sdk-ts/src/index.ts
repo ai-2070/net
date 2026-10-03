@@ -331,6 +331,24 @@ export {
   credentialRequiresConsent,
 } from './consent';
 export type { PinRecord } from './consent';
+// Payments + paid A2A over the SDK's MeshNode (NODE_A2A_PAID_ADMISSION_PLAN.md
+// D7): factories that adapt the mesh handle and return the native objects.
+export {
+  A2aInvalidArgumentError,
+  JournalOwnedElsewhereError,
+  PaymentRefusedError,
+  a2aDocument,
+  a2aU64,
+  classifyError,
+  createCapabilityGateway,
+  createPaymentProvider,
+  setA2aOrgCaller,
+} from './payments';
+export type {
+  CapabilityGatewayOptions,
+  PaymentProviderOptions,
+  PaymentSignerOptions,
+} from './payments';
 export {
   DELEGATION_ERROR_PREFIX,
   DelegationChain,

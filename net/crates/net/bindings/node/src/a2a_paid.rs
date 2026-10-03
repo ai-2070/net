@@ -203,7 +203,8 @@ fn parse_services(
 // ---------------------------------------------------------------------------
 
 /// What the JS preflight is called with — three complete JSON documents.
-#[napi(object)]
+// `js_name` pinned: napi's auto-camelCase would emit `A2APreflightArgs`.
+#[napi(object, js_name = "A2aPreflightArgs")]
 pub struct A2aPreflightArgs {
     /// The owner, as an unresolved row spells it (`{"kind":"peer",...}`).
     /// A `peer` node id is a u64 — read it with `a2aU64`, not `JSON.parse`.
