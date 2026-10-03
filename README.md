@@ -38,13 +38,12 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 | Header serialize | 2.19 ns / 456 M ops/sec |
 | Routing lookup (hit) | 37.7 ns / 26.5 M ops/sec |
 | 1-hop forward | 61.7 ns / 16.2 M ops/sec |
-| Encrypt 1 KB (ChaCha20-Poly1305) | 908 ns / 1.05 GiB/sec |
 | Heartbeat from a known peer | 39.8 ns / 25.2 M ops/sec |
 | Full fail + recover cycle | 291 ns / 3.44 M ops/sec |
+| Capability announcement → fold | 3.41 µs / 293 K ops/sec |
 | Start a node → first peer | 937 µs |
-| Start a node → first RPC reply | 1.26 ms |
 
-These measure packet scheduling on one machine — not NIC transfer, wire latency, or propagation. The full set is under [Performance](#performance).
+These measure local operations on one machine — not NIC transfer, wire latency, or propagation. The full set is under [Performance](#performance).
 
 **What that gives you**
 
