@@ -92,7 +92,7 @@ with rpc.serve('echo_sum', handler):
     resp = rpc.call(server_node_id, 'echo_sum', req, opts={'deadline_ms': 200})
 ```
 
-If the user is in **Go**, the nRPC wrapper is `go/mesh_rpc.go` / `go/mesh_rpc_typed.go` in the module `github.com/ai-2070/net/go`, over the C ABI in `bindings/go/rpc-ffi/` (linked into the single `libnet`).
+If the user is in **Go**, the nRPC wrapper is `go/mesh_rpc.go` / `go/mesh_rpc_typed.go` in the module `github.com/ai-2070/net/go`, over the C ABI in `net/crates/net/bindings/go/rpc-ffi/` (linked into the single `libnet`).
 
 If the user is in **C**, nRPC is **not in `net.h`** — it has its own header, `net_rpc.h`, though it links out of the same `libnet`. See `nrpc.md` § C-not-in-net.h.
 

@@ -20,6 +20,7 @@ import (
 )
 
 func TestABIStabilityRemovedReferenceConstantsSurvive(t *testing.T) {
+	requireCrateTree(t)
 	removed := []struct{ name, value string }{
 		{"NET_RPC_DIRECTION_INBOUND_C", "1"},
 		{"NET_RPC_DIRECTION_OUTBOUND_C", "0"},
@@ -110,8 +111,12 @@ func TestABIStabilityRemovedReferenceConstantsSurvive(t *testing.T) {
 			t.Errorf("%s is no longer defined anywhere a consumer reads", c.name)
 			continue
 		}
-		if _, ok := values[c.value]; !ok {
-			t.Errorf("%s survives with a different value: had %s, now %v", c.name, c.value, values)
+		// Every copy must keep the value: one matching header must not mask
+		// a cgo definition that drifted (cubic review, PR #1165).
+		for value, file := range values {
+			if value != c.value {
+				t.Errorf("%s in %s has value %s, want %s", c.name, file, value, c.value)
+			}
 		}
 	}
 }

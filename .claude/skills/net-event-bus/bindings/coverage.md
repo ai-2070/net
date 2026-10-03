@@ -103,7 +103,7 @@ A mode is written after the status: `supported · core-only`.
 | Subnet-exported nRPC serve | supported | supported | supported | supported | supported |
 | Subnet-exported organization call | supported | supported | supported | supported | supported |
 | MCP bridge | supported | supported | supported | supported | supported |
-| Dataforts — blobs | supported | supported | supported | partial | supported |
+| Dataforts — blobs | supported | supported | supported | supported | supported |
 | RedEX — durable log | supported | supported | supported | supported | supported |
 | CortEX folds / NetDB | supported | supported | supported | supported | supported |
 | MeshDB — federated queries | supported | supported | supported | supported | supported |
@@ -171,13 +171,13 @@ predicates. Filter in your handler, or call from a binding that has it. This is
 could perfectly well have a C ABI — it does not have one *yet*, which is exactly
 why this is `not exposed` and not `n/a`.
 
-**Go blobs are `partial`.** `MeshBlobAdapter` covers `Store` / `Fetch` /
+**Go blobs are `supported`.** `MeshBlobAdapter` covers `Store` / `Fetch` /
 `Exists` / `Publish`, the overflow controls, trees (`StoreTree` with Replicated or
 Reed-Solomon encoding, `FetchRange`, `RepairBlob`, the tree-node cache) and
-`DescribeBlobRef`; `MeshNode` has `FetchBlob`, `FetchBlobDiscovered` and directory
-transfer (`StoreDir` / `FetchDir` / `DirManifestRead`); the process-wide registry
-takes filesystem adapters. What is missing is a **Go-implemented adapter**: Python
-and Node can register a blob adapter written in the host language, Go cannot yet.
+`StoreDir`, and `DescribeBlobRef` decodes refs; `MeshNode` has `FetchBlob`,
+`FetchBlobDiscovered`, `FetchDir` and `DirManifestRead`; the process-wide
+registry takes filesystem adapters and, through `RegisterBlobAdapter`, adapters
+written in Go.
 
 **Two rows are called "channels" and they are different mechanisms.**
 *Tagged EventBus topics* (`node.channel("name")`) tag a locally-ingested event

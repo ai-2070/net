@@ -675,6 +675,8 @@ produce heat, and none can observe a config's effect on it. Native evidence:
 accessor named above wouldn't help without a read driver, so it wasn't
 added. Exposing greedy reads is a new capability (SDK-first rule) and is
 recorded under "Defects found on the way" rather than built here.
+**Resolved by gap G-A:** `GreedyCacheFor` is the read driver, and
+`TestRedexGravityConfigIsForwarded` now kills the dropped-config mutant.
 
 ### S4: CortEX read-your-writes
 
@@ -1295,12 +1297,12 @@ none can see gravity do anything (S3's surviving mutant).
   run against a CI-feature `maturin develop` build. CI pins it with a
   3-row floor.
 - **Node:** `Redex.greedyCacheFor`, compile-checked with clippy
-  `-D warnings` in both configurations. **Found a CI gap, recorded
-  rather than fixed here:** Node's CI build (`ci.yml`, `napi build
-  --no-default-features --features …`) has no `dataforts`. So Node's
-  greedy, gravity and blob surfaces only ever run as stubs in CI, and a
-  Node behaviour test would be vacuous there. Go and Python carry the
-  behaviour witnesses.
+  `-D warnings` in both configurations. **CI gap, recorded rather than
+  fixed here:** the Node *binding* test build (`ci.yml`, `napi build
+  --no-default-features --features …`) has no `dataforts`, so a behaviour
+  test in the binding's suite would only ever exercise the stub. The *SDK*
+  test job builds the addon with `dataforts`, but no test in either suite
+  is a G-A witness. Go and Python carry the behaviour witnesses.
 - Evidence: the full Go package passes, `-race` over `TestRedex*` passes,
   and all 8 roster steps this plan owns run from the YAML as written.
 
@@ -1407,7 +1409,8 @@ Plus a Rust test of the release-once contract under a cancelled future.
   deletion path (`blob/mesh.rs:1269–1291`, `:6590–6628`).
 - **The gravity witness can't observe heat from Go.** *Fallback:* the
   `test-helpers` accessor named in S3, or evidence scoped to forwarding plus
-  native tests, stated as such.
+  native tests, stated as such. **Retired by G-A:** Go observes heat through
+  `dataforts_greedy_gravity_heat_emissions_total`.
 
 ## Not in scope
 
@@ -1480,11 +1483,23 @@ Plus a Rust test of the release-once contract under a cancelled future.
   this plan are gofmt-clean.
 
 - **No binding can read through the greedy cache (cross-binding gap,
-  deferred).** `Redex::greedy_cache_for` has no C, napi or pyo3 entry point,
+  resolved by G-A).** `Redex::greedy_cache_for` has no C, napi or pyo3 entry point,
   so gravity heat (which comes from those reads) can't be produced or
   observed from any language binding. Found while building S3's gravity
   witness. Adding it is a new capability, so per the SDK-first rule it
-  starts in `net-mesh-sdk`, not in this plan.
+  starts in `net-mesh-sdk`, not in this plan. *Resolved:* the SDK already
+  re-exported it, and G-A added the C, napi and pyo3 entry points.
+
+- **Greedy cache views closed the shared file (found by cubic on
+  `fbe8015`, fixed in the follow-up).** `GreedyCacheFor` returned an
+  ordinary `RedexFile`, and its `Close` called `net_redex_file_close` on
+  the greedy runtime's own file, so one lookup's cleanup stopped the cache
+  admitting that channel. Python's and Node's `close` did the same. Cache
+  views now release only their handle in all three bindings, and the C
+  header says not to close one. Witnesses:
+  `TestRedexGreedyCacheViewCloseKeepsTheCacheLive` (RED with the fix
+  reverted: the post-close event never arrives) and Python's
+  `test_greedy_cache_view_close_keeps_the_cache_live`.
 
 ## Appendix: S7 per-symbol ledger
 

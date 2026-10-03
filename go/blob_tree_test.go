@@ -7,6 +7,7 @@ package net
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"os"
@@ -102,8 +103,17 @@ func TestBlobTreeRangeContract(t *testing.T) {
 	if _, err := a.FetchRange(ref, 0, size+1); !errors.Is(err, ErrBlobInvalidArgument) {
 		t.Fatalf("range past the end: want ErrBlobInvalidArgument, got %v", err)
 	}
-	if _, err := a.FetchRange(ref, 0, 1<<30+1); !errors.Is(err, ErrBlobInvalidArgument) {
+	// The cap needs a ref whose extent covers the range, or the
+	// past-the-end check refuses it first and the cap goes untested. A small
+	// ref (the cross-lang `small` vector) re-encoded to claim 2 GiB: the cap
+	// refuses 1 GiB + 1, and exactly 1 GiB passes the checks and fails only
+	// as not found, since the adapter holds no such content.
+	big := bigSmallRef(t, 2<<30)
+	if _, err := a.FetchRange(big, 0, 1<<30+1); !errors.Is(err, ErrBlobInvalidArgument) {
 		t.Fatalf("range over the 1 GiB cap: want ErrBlobInvalidArgument, got %v", err)
+	}
+	if _, err := a.FetchRange(big, 0, 1<<30); errors.Is(err, ErrBlobInvalidArgument) || err == nil {
+		t.Fatalf("range of exactly 1 GiB: want a not-found failure past the checks, got %v", err)
 	}
 	if _, err := a.FetchRange(nil, 0, 1); !errors.Is(err, ErrBlobInvalidArgument) {
 		t.Fatalf("empty ref: want ErrBlobInvalidArgument, got %v", err)
@@ -271,4 +281,20 @@ func TestBlobFeatureTagsMatchCore(t *testing.T) {
 			t.Fatalf("%s does not define the tag %q", file, tag)
 		}
 	}
+}
+
+// bigSmallRef is the cross-lang `small` describe vector (magic, tag 0x01,
+// 32-byte hash, little-endian u64 size, empty URI) with its size replaced.
+func bigSmallRef(t *testing.T, size uint64) []byte {
+	t.Helper()
+	ref, err := hex.DecodeString("b0b1b2b3016437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d850300000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint64(ref[5+32:5+32+8], size)
+	info, err := DescribeBlobRef(ref)
+	if err != nil || info.Size != size {
+		t.Fatalf("re-encoded ref describes as %+v, %v; want size %d", info, err, size)
+	}
+	return ref
 }

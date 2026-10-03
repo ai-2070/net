@@ -47,7 +47,12 @@ def _cached_peer_channel(mesh_pair, channel: str, **gravity) -> Redex:
 
     def admitted() -> bool:
         a.publish(channel, b"observed", reliability="reliable", on_failure="best_effort")
-        return redex.greedy_cached_channel_count() >= 1
+        # The cached-channel count rises at admission, before the event is
+        # appended, so wait for the cached file to hold an event as well.
+        if redex.greedy_cached_channel_count() < 1:
+            return False
+        f = redex.greedy_cache_for(channel)
+        return f is not None and len(f) > 0
 
     _wait("greedy cached A's channel", admitted)
     return redex
@@ -79,6 +84,24 @@ def test_greedy_cache_for_reads_a_peers_channel(mesh_pair) -> None:
         return _emissions(redex) > 0
 
     _wait("gravity announced heat from served reads", heated)
+
+
+def test_greedy_cache_view_close_keeps_the_cache_live(mesh_pair) -> None:
+    # Closing a cache view must not close the greedy runtime's file, or the
+    # cache stops admitting the peer's later events (cubic review, #1165).
+    a, _ = mesh_pair
+    channel = "py/greedy/close-view"
+    redex = _cached_peer_channel(mesh_pair, channel)
+    view = redex.greedy_cache_for(channel)
+    assert view is not None
+    view.close()
+    view.close()
+
+    def after_close_cached() -> bool:
+        a.publish(channel, b"after-close", reliability="reliable", on_failure="best_effort")
+        return any(bytes(e.payload) == b"after-close" for e in _read_cached(redex, channel))
+
+    _wait("the cache admitted an event published after a view was closed", after_close_cached)
 
 
 def test_gravity_config_is_forwarded(mesh_pair) -> None:

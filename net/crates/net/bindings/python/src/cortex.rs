@@ -467,6 +467,7 @@ impl PyRedex {
         Ok(PyRedexFile {
             inner: Arc::new(file),
             runtime,
+            cache_view: false,
         })
     }
 
@@ -705,6 +706,7 @@ impl PyRedex {
         Ok(self.inner.greedy_cache_for(&name).map(|file| PyRedexFile {
             inner: Arc::new(file),
             runtime: runtime.clone(),
+            cache_view: true,
         }))
     }
 
@@ -975,6 +977,9 @@ impl PyRedexEvent {
 pub struct PyRedexFile {
     inner: Arc<InnerRedexFile>,
     runtime: Arc<GuardedRuntime>,
+    /// From `Redex.greedy_cache_for`: the greedy runtime owns the file, so
+    /// `close` must not close it (that would stop the cache admitting).
+    cache_view: bool,
 }
 
 #[pymethods]
@@ -1048,8 +1053,13 @@ impl PyRedexFile {
     }
 
     /// Close the file. Outstanding tail iterators terminate on their
-    /// next `__next__` call with `StopIteration`.
+    /// next `__next__` call with `StopIteration`. On a file from
+    /// `Redex.greedy_cache_for` this is a no-op: the cached file belongs
+    /// to the greedy runtime and stays open.
     fn close(&self) -> PyResult<()> {
+        if self.cache_view {
+            return Ok(());
+        }
         self.inner
             .close()
             .map_err(|e| RedexError::new_err(format!("close: {}", e)))

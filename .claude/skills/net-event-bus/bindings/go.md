@@ -118,9 +118,11 @@ Check `bindings/coverage.md` before promising anything. The three to know:
   `CapabilityFilter` in `go/mesh.go` is channel *authorisation*, and
   `go/meshdb.go`'s "filter predicates" are MeshDB query predicates — neither is
   the bus filter DSL. Filter in your handler.
-- **Blobs are partial.** `MeshBlobAdapter` does `Store` / `Fetch` / `Exists` and
-  the overflow controls, but there is no discovery-driven fetch, so Go cannot
-  retrieve a blob it holds only a reference to.
+- **Blobs are complete.** `MeshBlobAdapter` does `Store` / `Fetch` / `Exists`,
+  trees, range reads, repair and the overflow controls; `MeshNode.FetchBlob`
+  and `FetchBlobDiscovered` (no known holder) retrieve over the mesh; and
+  `RegisterBlobAdapter` puts a Go-implemented adapter in the process-wide
+  registry.
 - **Payments: none.** The only payments file in the module is a golden-vector
   test. See `../../net-payments/bindings/coverage.md`.
 
@@ -137,7 +139,7 @@ Check `bindings/coverage.md` before promising anything. The three to know:
 - There are **no named channels and no async iteration**. A TypeScript
   `for await (const x of ch.subscribe())` has no Go equivalent; you poll.
 - Errors are returned, never thrown.
-- The resilience helpers documented for Go live in the *reference* tree, not the
-  module you imported.
-- Absence of a surface in `go/` does not mean it is absent from the reference
-  tree — check there before filing a gap.
+- Go has **no nRPC resilience helpers** (`RetryPolicy`, `HedgePolicy`,
+  `CircuitBreaker`). They lived only in the reference tree, which has been
+  removed; do not tell a user to look for them there.
+- `go/` is the whole Go surface. A symbol absent from it is absent from Go.

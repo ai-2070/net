@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"strings"
 	"unsafe"
 )
 
@@ -347,11 +348,17 @@ func (r *Redex) DisableGravityForGreedy() error {
 // GreedyCacheFor opens the greedy cache's copy of channel (the real channel
 // name), or returns (nil, nil) when it isn't cached or greedy isn't enabled.
 // Read it like any RedexFile (ReadRange, Tail) and Close it when done.
+// The file is the greedy runtime's, shared by every lookup: Close releases
+// only this handle and leaves the cached file open and receiving updates.
 //
 // A hit counts as a served read: it bumps the greedy serve-count metric and,
 // with gravity enabled, the chain's heat, which gravity then announces
 // (dataforts_greedy_gravity_heat_emissions_total in GreedyPrometheusText).
 func (r *Redex) GreedyCacheFor(channel string) (*RedexFile, error) {
+	// cgo would truncate at the NUL and look up a different channel.
+	if strings.IndexByte(channel, 0) >= 0 {
+		return nil, fmt.Errorf("%w: greedy_cache_for: channel name contains a NUL byte", ErrRedex)
+	}
 	cName := C.CString(channel)
 	defer C.free(unsafe.Pointer(cName))
 	r.mu.RLock()
@@ -366,7 +373,7 @@ func (r *Redex) GreedyCacheFor(channel string) (*RedexFile, error) {
 	if out == nil {
 		return nil, nil
 	}
-	f := &RedexFile{handle: out}
+	f := &RedexFile{handle: out, cacheView: true}
 	runtime.SetFinalizer(f, (*RedexFile).free)
 	return f, nil
 }

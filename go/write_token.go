@@ -26,7 +26,10 @@ import (
 )
 
 // WriteToken names one write: the origin that made it and its sequence
-// number.
+// number. Like core's token it carries no channel, so it is meaningful only
+// on an adapter over the channel that issued it: a Tasks token waited on
+// through a Memories adapter with the same origin compares against the
+// other channel's sequence numbers.
 type WriteToken struct {
 	OriginHash uint64
 	Seq        uint64
@@ -83,8 +86,13 @@ func tokenTimeoutMs(d time.Duration) C.uint32_t {
 
 // waitForTokenContext is the shared context loop: check ctx before every
 // native wait (so a cancelled context never reports success, even for a
-// token that is already applied), then wait at most one slice.
-func waitForTokenContext(ctx context.Context, wait func(C.uint32_t) error) error {
+// token that is already applied), then wait at most one slice. ctx is
+// checked again after a successful wait, so a cancellation that lands
+// during the slice is not reported as success either.
+//
+// wait takes the slice in milliseconds as a plain uint32 so tests can
+// drive this loop without cgo.
+func waitForTokenContext(ctx context.Context, wait func(ms uint32) error) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -95,7 +103,10 @@ func waitForTokenContext(ctx context.Context, wait func(C.uint32_t) error) error
 				slice = left
 			}
 		}
-		err := wait(tokenTimeoutMs(slice))
+		err := wait(uint32(tokenTimeoutMs(slice)))
+		if err == nil {
+			return ctx.Err()
+		}
 		if !errors.Is(err, ErrTokenTimeout) {
 			return err
 		}
@@ -120,7 +131,7 @@ func (t *TasksAdapter) WaitForToken(tok WriteToken, timeout time.Duration) error
 // WaitForTokenContext waits for tok until it is applied or ctx ends.
 // A context that is already done returns its error without checking tok.
 func (t *TasksAdapter) WaitForTokenContext(ctx context.Context, tok WriteToken) error {
-	return waitForTokenContext(ctx, func(ms C.uint32_t) error { return t.waitForToken(tok, ms) })
+	return waitForTokenContext(ctx, func(ms uint32) error { return t.waitForToken(tok, C.uint32_t(ms)) })
 }
 
 func (t *TasksAdapter) waitForToken(tok WriteToken, ms C.uint32_t) error {
@@ -151,7 +162,7 @@ func (m *MemoriesAdapter) WaitForToken(tok WriteToken, timeout time.Duration) er
 // WaitForTokenContext waits for tok until it is applied or ctx ends.
 // A context that is already done returns its error without checking tok.
 func (m *MemoriesAdapter) WaitForTokenContext(ctx context.Context, tok WriteToken) error {
-	return waitForTokenContext(ctx, func(ms C.uint32_t) error { return m.waitForToken(tok, ms) })
+	return waitForTokenContext(ctx, func(ms uint32) error { return m.waitForToken(tok, C.uint32_t(ms)) })
 }
 
 func (m *MemoriesAdapter) waitForToken(tok WriteToken, ms C.uint32_t) error {

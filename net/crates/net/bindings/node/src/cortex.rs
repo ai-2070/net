@@ -469,6 +469,7 @@ impl Redex {
         let _enter = rt.enter();
         Ok(self.inner.greedy_cache_for(&name).map(|file| RedexFile {
             inner: Arc::new(file),
+            cache_view: true,
         }))
     }
 
@@ -593,6 +594,7 @@ impl Redex {
             .map_err(|e| redex_err("open_file", e))?;
         Ok(RedexFile {
             inner: Arc::new(file),
+            cache_view: false,
         })
     }
 }
@@ -946,6 +948,9 @@ impl From<InnerRedexEvent> for RedexEventJs {
 #[napi]
 pub struct RedexFile {
     inner: Arc<InnerRedexFile>,
+    /// From `Redex.greedyCacheFor`: the greedy runtime owns the file, so
+    /// `close` must not close it (that would stop the cache admitting).
+    cache_view: bool,
 }
 
 #[napi]
@@ -1055,8 +1060,14 @@ impl RedexFile {
     ///
     /// Declared `async` for the same reason as `sync` — close
     /// flushes pending writes on persistent files.
+    ///
+    /// A no-op on a file from `Redex.greedyCacheFor`: the cached file
+    /// belongs to the greedy runtime and stays open.
     #[napi]
     pub async fn close(&self) -> Result<()> {
+        if self.cache_view {
+            return Ok(());
+        }
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.close())
             .await

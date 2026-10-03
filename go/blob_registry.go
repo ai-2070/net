@@ -44,8 +44,10 @@ var (
 	// ErrBlobUnauthorized - an auth gate refused the operation.
 	ErrBlobUnauthorized = fmt.Errorf("%w: unauthorized", ErrBlob)
 	// ErrBlobInvalidArgument - an argument refused before the operation
-	// runs: by the binding (an empty ref, or a string with an embedded NUL,
-	// which C would silently truncate into a different id), or natively
+	// runs: by the binding (an empty ref to a MeshBlobAdapter call, or a
+	// string with an embedded NUL, which C would silently truncate into a
+	// different id; BlobResolve takes an empty payload as an empty inline
+	// value, not an error), or natively
 	// as NET_ERR_BLOB_INVALID_ARGUMENT (a reversed or out-of-extent range,
 	// a bad encoding).
 	ErrBlobInvalidArgument = fmt.Errorf("%w: invalid argument", ErrBlob)

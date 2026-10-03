@@ -452,7 +452,7 @@ operations:
       status: supported
       anchor: fetch_blob
     Go:
-      status: partial
+      status: supported
       anchor: NewMeshBlobAdapter
     C:
       status: supported

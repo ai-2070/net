@@ -184,7 +184,7 @@ Server-side handler panics are caught, counted on `ServiceMetrics::handler_panic
 
 ## Per-binding API
 
-The typed surface ships in the **native binding**, not the SDK wrapper. Each language has the same five methods (`serve` / `call` / `callService` / `callStreaming` / `findServiceNodes`) plus the resilience helpers (`RetryPolicy` + `callWithRetry`, `HedgePolicy` + `callWithHedge`, `CircuitBreaker`).
+The typed surface ships in the **native binding**, not the SDK wrapper. Each language has the same five methods (`serve` / `call` / `callService` / `callStreaming` / `findServiceNodes`). Rust, TypeScript and Python also ship the resilience helpers (`RetryPolicy` + `callWithRetry`, `HedgePolicy` + `callWithHedge`, `CircuitBreaker`); Go does not (see the Go section).
 
 ### Rust (`net-mesh-sdk`, feature = "cortex")
 

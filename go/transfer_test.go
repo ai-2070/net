@@ -280,6 +280,22 @@ func TestTransferEmptyManifestRefIsRefusedBeforeCgo(t *testing.T) {
 	}
 }
 
+// A path with an embedded NUL is refused before cgo, which would otherwise
+// truncate it and act on the prefix (cubic review, PR #1165).
+func TestTransferRefusesNULPaths(t *testing.T) {
+	p := newTransferPair(t)
+	prefix := t.TempDir()
+	if _, err := p.b.FetchDir(p.a.NodeID(), []byte{1}, prefix+"\x00/elsewhere"); !errors.Is(err, ErrTransferInvalidArgument) {
+		t.Fatalf("FetchDir(dest with NUL): want ErrTransferInvalidArgument, got %v", err)
+	}
+	r, a := newBlobAdapter(t, "", "go-transfer-nul-root", nil)
+	defer r.Free()
+	defer a.Close()
+	if _, err := a.StoreDir(prefix + "\x00/elsewhere"); !errors.Is(err, ErrTransferInvalidArgument) {
+		t.Fatalf("StoreDir(root with NUL): want ErrTransferInvalidArgument, got %v", err)
+	}
+}
+
 // StoreDir runs on the adapter handle, so it obeys Close like the rest.
 func TestTransferStoreDirAfterClose(t *testing.T) {
 	r, a := newBlobAdapter(t, "", "go-transfer-closed", nil)

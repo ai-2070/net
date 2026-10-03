@@ -4390,8 +4390,8 @@ jobs:
       # re-encode}). The Go half is TestCrossLangBlobDescribeVectors in the
       # Go job. (GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md, S6.)
       # === the greedy read path + gravity (Python half, plan gap G-A) =====
-      # Executed by the pytest run above; pinned and counted here (floor 3).
-      - name: Witness roster + floor — Python greedy read path (3)
+      # Executed by the pytest run above; pinned and counted here (floor 4).
+      - name: Witness roster + floor — Python greedy read path (4)
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
@@ -4399,13 +4399,14 @@ jobs:
             --source net/crates/net/bindings/python/tests/test_greedy_cache.py \
             test_greedy_cache_for_without_greedy \
             test_greedy_cache_for_reads_a_peers_channel \
+            test_greedy_cache_view_close_keeps_the_cache_live \
             test_gravity_config_is_forwarded || exit 1
-          out=$(cd net/crates/net/bindings/python && python -m pytest -q \
+          out=$(cd net/crates/net/bindings/python && python -m pytest -q --timeout=30 --timeout-method=thread \
                   tests/test_greedy_cache.py 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
-          echo "python greedy read path: ${n:-0} (floor 3)"
-          if [ -z "$n" ] || [ "$n" -lt 3 ]; then
-            echo "::error::the python greedy read path ran ${n:-0} rows, floor is 3 — \
+          echo "python greedy read path: ${n:-0} (floor 4)"
+          if [ -z "$n" ] || [ "$n" -lt 4 ]; then
+            echo "::error::the python greedy read path ran ${n:-0} rows, floor is 4 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
@@ -4897,7 +4898,7 @@ jobs:
             TestBlobCloseRacesInFlightFetches \
             TestBlobTwoNodeFetch || exit 1
 
-      - name: Witness roster — Go transfer binding (9)
+      - name: Witness roster — Go transfer binding (10)
         working-directory: go
         run: |
           set -uo pipefail
@@ -4911,9 +4912,10 @@ jobs:
             TestTransferFetchBlobDiscovered \
             TestTransferEmptyManifestRefIsRefusedBeforeCgo \
             TestTransferStoreDirAfterClose \
-            TestTransferStoreDirMissingRoot || exit 1
+            TestTransferStoreDirMissingRoot \
+            TestTransferRefusesNULPaths || exit 1
 
-      - name: Witness roster — Go RedEX replication / greedy / gravity (10)
+      - name: Witness roster — Go RedEX replication / greedy / gravity (11)
         working-directory: go
         run: |
           set -uo pipefail
@@ -4928,9 +4930,10 @@ jobs:
             TestRedexDatafortsLifecycleRefusals \
             TestRedexGreedyCacheForReadsAPeersChannel \
             TestRedexGravityConfigIsForwarded \
-            TestRedexGreedyCacheForWithoutGreedy || exit 1
+            TestRedexGreedyCacheForWithoutGreedy \
+            TestRedexGreedyCacheViewCloseKeepsTheCacheLive || exit 1
 
-      - name: Witness roster — Go CortEX write tokens (7)
+      - name: Witness roster — Go CortEX write tokens (8)
         working-directory: go
         run: |
           set -uo pipefail
@@ -4942,7 +4945,8 @@ jobs:
             TestWriteTokenZeroTimeoutPolls \
             TestWriteTokenContext \
             TestWriteTokenNetDbAdaptersInheritOrigin \
-            TestWriteTokenAfterClose || exit 1
+            TestWriteTokenAfterClose \
+            TestWriteTokenContextCancelledDuringASuccessfulWait || exit 1
 
       - name: Witness roster — Go blob adapter registry (6)
         working-directory: go

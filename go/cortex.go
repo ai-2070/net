@@ -188,6 +188,10 @@ func (e *redexEventWire) toEvent() (RedexEvent, error) {
 type RedexFile struct {
 	mu     sync.RWMutex
 	handle *C.net_redex_file_t
+	// cacheView marks a file from Redex.GreedyCacheFor. The greedy runtime
+	// owns the underlying file, so Close releases only this handle and
+	// never closes the shared file.
+	cacheView bool
 }
 
 // OpenFile opens (or gets) a RedEX file on `redex`. `config` may be
@@ -234,11 +238,19 @@ func (f *RedexFile) free() {
 }
 
 // Close flushes and closes the file. Subsequent operations error with
-// ErrRedex. Idempotent.
+// ErrRedex. Idempotent. On a file from Redex.GreedyCacheFor it releases
+// only this handle: the cached file stays open for the greedy runtime and
+// for other lookups.
 func (f *RedexFile) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.handle == nil {
+		return nil
+	}
+	if f.cacheView {
+		C.net_redex_file_free(f.handle)
+		f.handle = nil
+		runtime.SetFinalizer(f, nil)
 		return nil
 	}
 	code := C.net_redex_file_close(f.handle)

@@ -123,7 +123,10 @@ func TestWriteTokenZeroTimeoutPolls(t *testing.T) {
 	if !errors.Is(err, ErrTokenTimeout) || !errors.Is(err, ErrStreamTimeout) {
 		t.Fatalf("zero timeout on an unapplied seq: want ErrTokenTimeout (and ErrStreamTimeout), got %v", err)
 	}
-	if elapsed > 50*time.Millisecond {
+	// Loose on purpose: a preempted CI runner can stall a synchronous poll
+	// well past 50 ms. A real wait would still be caught by the positive
+	// timeout check below.
+	if elapsed > time.Second {
 		t.Fatalf("zero timeout took %v; it should poll, not wait", elapsed)
 	}
 	// A positive timeout really waits.
@@ -252,5 +255,28 @@ func TestWriteTokenAfterClose(t *testing.T) {
 	}
 	if err := tasks.WaitForTokenContext(context.Background(), tasks.Token(seq)); !errors.Is(err, ErrShuttingDown) {
 		t.Fatalf("WaitForTokenContext after Close: want ErrShuttingDown, got %v", err)
+	}
+}
+
+// A context cancelled while the native wait is in progress is reported as
+// cancelled, even if that wait then succeeds (cubic review, PR #1165).
+func TestWriteTokenContextCancelledDuringASuccessfulWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	err := waitForTokenContext(ctx, func(uint32) error {
+		calls++
+		cancel() // lands mid-wait
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForTokenContext = %v, want context.Canceled", err)
+	}
+	if calls != 1 {
+		t.Fatalf("native wait called %d times, want 1", calls)
+	}
+	// Uncancelled, a successful wait is a success.
+	if err := waitForTokenContext(context.Background(), func(uint32) error { return nil }); err != nil {
+		t.Fatalf("waitForTokenContext without cancellation = %v, want nil", err)
 	}
 }

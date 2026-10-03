@@ -244,7 +244,7 @@ This composes with `BlobRef`: `store_dir` writes chunks **into** a `BlobAdapter`
 
 Rust `DirStats` is `{ files: usize, dirs: usize, symlinks: usize, bytes: u64 }` — the Node `{files, bytes}` / Python `(files, bytes)` rows above project to those two fields. `concurrency = 0` → `DEFAULT_FETCH_CONCURRENCY = 16` leaf files in flight. `BlobRef::Small` is one chunk; `BlobRef::Manifest` is its ordered chunk list; **`BlobRef::Tree` is not supported by the transport wrappers** (use the substrate tree walk). The SDK stays thin — no retry policy, no rollback machinery beyond `fetch_dir`'s atomic rename, no directory-sync primitives; applications compose policy above.
 
-**Go / C:** the FFI symbols ship in `src/ffi/transport.rs` (`net_serve_blob_transfer`, `net_fetch_blob`, `net_fetch_blob_discovered`, `net_store_dir`, `net_fetch_dir`, `net_dir_manifest_read`) and Go binds them over cgo as methods (`ServeBlobTransfer`, `FetchBlob`, `FetchBlobDiscovered`, `StoreDir`, `FetchDir`, `DirManifestRead`). C consumers: `#include <net_transport.h>` — the prototypes and the `NET_TRANSPORT_OK` / `NET_ERR_TRANSFER_*` / `NET_ERR_DIR_*` codes are declared there; do not hand-declare them. The ergonomic wrappers are Rust / Node / Python.
+**Go / C:** the FFI symbols ship in `src/ffi/transport.rs` (`net_serve_blob_transfer`, `net_fetch_blob`, `net_fetch_blob_discovered`, `net_store_dir`, `net_fetch_dir`, `net_dir_manifest_read`) and Go binds them over cgo as methods (`ServeBlobTransfer`, `FetchBlob`, `FetchBlobDiscovered`, `StoreDir`, `FetchDir`, `DirManifestRead`). C consumers: `#include <net_transport.h>` — the prototypes and the `NET_TRANSPORT_OK` / `NET_ERR_TRANSFER_*` / `NET_ERR_DIR_*` codes are declared there; do not hand-declare them. The ergonomic wrappers are Rust / Node / Python / Go.
 
 ### Rust
 
@@ -348,7 +348,7 @@ if err := tasks.WaitForToken(tasks.Token(seq), 250*time.Millisecond); err != nil
 - **`FoldStopped` is a real error.** When `running == false` (fold task crashed under `FoldErrorPolicy::Stop`), the wait surfaces `WaitForTokenError::FoldStopped { applied_through_seq }` rather than resolving every pending RYW wait with a silent `Ok(())`.
 - **`deadline_ms == 0` is a non-blocking poll** across every binding. Synchronous applied-vs-token check; no wait scheduled.
 - **Process-wide in-flight cap.** `set_global_ryw_inflight_cap(usize)` sets a process-wide bound on outstanding RYW waiters; every `wait_for_token` does a two-tier acquire (process-wide then per-adapter). The default per-adapter cap is 1024 (`ryw_inflight_cap`, non-FIFO).
-- **Go builds tokens from seqs.** CRUD returns `(seq, error)`; `Token(seq)` pairs it with the adapter's origin, and `WaitForToken` / `WaitForTokenContext` wait on it. Note Go's zero-timeout split: `WaitForToken(tok, 0)` polls once, while `WaitForSeq(seq, 0)` waits indefinitely.
+- **Go tokens are on `TasksAdapter` and `MemoriesAdapter`.** CRUD returns `(seq, error)`; `Token(seq)` pairs it with the adapter's origin, and `WaitForToken` / `WaitForTokenContext` wait on it. `WorkflowAdapter` has no tokens, only `WaitForSeq`. Note the zero-timeout split: `WaitForToken(tok, 0)` polls once, while `WaitForSeq(seq, 0)` waits indefinitely.
 
 ---
 

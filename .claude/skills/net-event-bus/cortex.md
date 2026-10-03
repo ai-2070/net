@@ -191,6 +191,7 @@ all, _ := tasks.List(nil) // includes task 1 once its token was applied
 - `WaitForToken(token, timeout)` blocks the calling goroutine; a zero timeout is a non-blocking applied-vs-token check (`ErrTokenTimeout` if not yet applied).
 - `WaitForTokenContext(ctx, token)` checks `ctx` before every native wait and waits in slices of at most 50 ms, so cancellation is noticed within one slice, and a context that is already done returns its error even for an applied token.
 - The origin check is on the **origin hash**, not the adapter object: another adapter opened with the same origin accepts the token, but only once its own fold has applied that seq. A different origin is `ErrWrongOrigin`.
+- **A token means something only on the channel it came from.** It carries `(origin, seq)` and nothing else, as in core. `Tasks` and `Memories` are separate RedEX channels with their own sequence numbers, so waiting on a `Tasks` token through a `Memories` adapter (same origin) can succeed once *that* fold passes the number, without the write ever being applied. Wait on the adapter that issued the token, or one over the same channel.
 
 ## C
 

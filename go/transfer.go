@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"strings"
 	"unsafe"
 )
 
@@ -122,10 +123,23 @@ func (e *DirEntry) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// refuseNULPath rejects a path with an embedded NUL. C.CString would cut it
+// at the NUL, and the native call would act on that prefix instead: for
+// FetchDir, an existing directory the caller never named.
+func refuseNULPath(op, name, path string) error {
+	if strings.IndexByte(path, 0) >= 0 {
+		return fmt.Errorf("%w: %s: %s contains a NUL byte", ErrTransferInvalidArgument, op, name)
+	}
+	return nil
+}
+
 // StoreDir stores the local directory tree at root as content-addressed
 // blobs in this adapter and returns the encoded manifest BlobRef: the token
 // a receiver passes to FetchDir or DirManifestRead.
 func (a *MeshBlobAdapter) StoreDir(root string) ([]byte, error) {
+	if err := refuseNULPath("store_dir", "root", root); err != nil {
+		return nil, err
+	}
 	cRoot := C.CString(root)
 	defer C.free(unsafe.Pointer(cRoot))
 	var out *C.uint8_t
@@ -153,6 +167,9 @@ func (a *MeshBlobAdapter) StoreDir(root string) ([]byte, error) {
 func (m *MeshNode) FetchDir(sourceID uint64, manifestRef []byte, dest string) (DirStats, error) {
 	if len(manifestRef) == 0 {
 		return DirStats{}, fmt.Errorf("%w: manifest ref is empty", ErrTransferInvalidArgument)
+	}
+	if err := refuseNULPath("fetch_dir", "dest", dest); err != nil {
+		return DirStats{}, err
 	}
 	cDest := C.CString(dest)
 	defer C.free(unsafe.Pointer(cDest))

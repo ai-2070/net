@@ -53,8 +53,9 @@ void         net_redex_free(net_redex_t* handle);
  * handle), -8 (ShuttingDown), -2/-3 (bad config string / JSON), -103
  * (NET_ERR_REDEX: validation or install failure), or -107 when libnet was
  * built without the feature. Prometheus text is freed with net_free_string;
- * it is "" when the surface isn't enabled and NULL only on a NULL / closing
- * handle.
+ * it is "" when the surface isn't enabled and NULL on a NULL / closing
+ * handle; the greedy text is also NULL when libnet was built without
+ * dataforts.
  */
 struct net_compute_mesh_arc_s;
 
@@ -73,7 +74,9 @@ uint32_t net_redex_greedy_cached_channel_count(const net_redex_t* redex);
  * net_redex_file_read_range / _tail, free with net_redex_file_free), 0 with
  * *out_file = NULL when the channel isn't cached or greedy is off. A hit
  * counts as a served read and, under gravity, heat. -1 for a NULL argument
- * (nothing written through a NULL out_file), -103 for an invalid name. */
+ * (nothing written through a NULL out_file), -103 for an invalid name. The
+ * file belongs to the greedy runtime: free the handle, never
+ * net_redex_file_close it, or the cache stops admitting that channel. */
 int      net_redex_greedy_cache_for(const net_redex_t* redex,
                                     const char* channel,
                                     net_redex_file_t** out_file);

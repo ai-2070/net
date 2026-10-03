@@ -233,7 +233,6 @@ func TestABIStabilityParseMigrationErrorRoundTrip(t *testing.T) {
 	}
 }
 
-
 // TestABIStabilityTransportDeclsMatchCanonicalHeader pins go/net.h's
 // copies of the transport functions to the canonical
 // include/net_transport.h. header_parity_test.go keeps go/net.h and
@@ -242,6 +241,7 @@ func TestABIStabilityParseMigrationErrorRoundTrip(t *testing.T) {
 // Go mirror silently stale. (GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md,
 // "Header closure".)
 func TestABIStabilityTransportDeclsMatchCanonicalHeader(t *testing.T) {
+	requireCrateTree(t)
 	canonical := parseHeader(t, "../net/crates/net/include/net_transport.h")
 	mirror := parseHeader(t, "net.h")
 	if len(canonical.fns) == 0 {
@@ -255,6 +255,9 @@ func TestABIStabilityTransportDeclsMatchCanonicalHeader(t *testing.T) {
 		}
 		if got != params {
 			t.Errorf("%s parameters differ:\n  net_transport.h: (%s)\n  go/net.h:        (%s)", name, params, got)
+		}
+		if want, got := canonical.rets[name], mirror.rets[name]; got != want {
+			t.Errorf("%s return type differs: net_transport.h %q, go/net.h %q", name, want, got)
 		}
 	}
 }
@@ -319,6 +322,7 @@ func TestABIStabilityTransferCodes(t *testing.T) {
 // an S3/S4 declaration added to one copy only would otherwise go unseen
 // until a C consumer of the other tripped on it.
 func TestABIStabilityCortexDeclsMatchCanonicalHeader(t *testing.T) {
+	requireCrateTree(t)
 	canonical := parseHeader(t, "../net/crates/net/include/net_cortex.h")
 	mirror := parseHeader(t, "net_cortex.h")
 	if len(canonical.fns) == 0 {
@@ -334,6 +338,9 @@ func TestABIStabilityCortexDeclsMatchCanonicalHeader(t *testing.T) {
 		if got, ok := mirror.fns[name]; ok && got != params {
 			t.Errorf("%s parameters differ:\n  include: (%s)\n  go:      (%s)", name, params, got)
 		}
+		if got, ok := mirror.rets[name]; ok && got != canonical.rets[name] {
+			t.Errorf("%s return type differs: include %q, go %q", name, canonical.rets[name], got)
+		}
 	}
 }
 
@@ -343,6 +350,7 @@ func TestABIStabilityCortexDeclsMatchCanonicalHeader(t *testing.T) {
 // with Rust, and cgo only checks the header: an extra or missing Rust
 // parameter would link and then read garbage.
 func TestABIStabilityBlobV3ArityMatchesRust(t *testing.T) {
+	requireCrateTree(t)
 	src, err := os.ReadFile("../net/crates/net/src/ffi/blob.rs")
 	if err != nil {
 		t.Fatalf("read src/ffi/blob.rs: %v", err)
@@ -384,6 +392,7 @@ func TestABIStabilityBlobV3ArityMatchesRust(t *testing.T) {
 // point: declared in go/net_cortex.h with the same parameter count as its
 // Rust definition (both the dataforts and the feature-off stub).
 func TestABIStabilityGreedyCacheForArityMatchesRust(t *testing.T) {
+	requireCrateTree(t)
 	src, err := os.ReadFile("../net/crates/net/src/ffi/cortex.rs")
 	if err != nil {
 		t.Fatal(err)
@@ -416,6 +425,7 @@ func TestABIStabilityGreedyCacheForArityMatchesRust(t *testing.T) {
 // which C reads positionally. A field added, dropped or reordered on either
 // side would make the substrate call the wrong Go trampoline.
 func TestABIStabilityBlobOwnedRegistrationMatchesRust(t *testing.T) {
+	requireCrateTree(t)
 	srcBytes, err := os.ReadFile("../net/crates/net/src/ffi/blob.rs")
 	if err != nil {
 		t.Fatal(err)

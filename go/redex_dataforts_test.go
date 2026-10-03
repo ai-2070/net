@@ -152,12 +152,16 @@ func TestRedexReplicationCarriesDataBetweenNodes(t *testing.T) {
 		events, err := fB.ReadRange(0, n)
 		return err == nil && len(events) == n
 	})
-	events, err := fB.ReadRange(n-1, n)
-	if err != nil || len(events) != 1 {
-		t.Fatalf("ReadRange(b) last = %v, %v", events, err)
+	// Every entry, in order: a check of the last one alone would pass a
+	// replica that corrupted or reordered the first seven.
+	events, err := fB.ReadRange(0, n)
+	if err != nil || len(events) != n {
+		t.Fatalf("ReadRange(b) = %v, %v; want %d events", events, err, n)
 	}
-	if got := string(events[0].Payload); got != fmt.Sprintf("event-%d", n-1) {
-		t.Fatalf("B's last event = %q, want %q", got, fmt.Sprintf("event-%d", n-1))
+	for i, event := range events {
+		if got, want := string(event.Payload), fmt.Sprintf("event-%d", i); got != want {
+			t.Fatalf("B's event %d = %q, want %q", i, got, want)
+		}
 	}
 }
 
@@ -350,6 +354,14 @@ func gravityEmissions(t *testing.T, r *Redex) uint64 {
 // config) on B, and returns once B's greedy cache holds A's channel.
 func cachedPeerChannel(t *testing.T, gravity *DataGravityConfig) (*Redex, string) {
 	t.Helper()
+	rB, _, channel := cachedPeerChannelFrom(t, gravity)
+	return rB, channel
+}
+
+// cachedPeerChannelFrom is cachedPeerChannel that also returns A, the
+// publishing node.
+func cachedPeerChannelFrom(t *testing.T, gravity *DataGravityConfig) (*Redex, *MeshNode, string) {
+	t.Helper()
 	a, b, cleanup := meshHandshakePair(t)
 	t.Cleanup(cleanup)
 	rB := NewRedex("")
@@ -372,9 +384,19 @@ func cachedPeerChannel(t *testing.T, gravity *DataGravityConfig) (*Redex, string
 		if _, err := a.Publish(channel, []byte("observed"), PublishConfig{Reliability: "reliable", OnFailure: "best_effort"}); err != nil {
 			t.Fatalf("Publish: %v", err)
 		}
-		return rB.GreedyCachedChannelCount() >= 1
+		// The count rises at admission, before the event is appended, so
+		// also wait for the cached file to hold one.
+		if rB.GreedyCachedChannelCount() < 1 {
+			return false
+		}
+		f, err := rB.GreedyCacheFor(channel)
+		if err != nil || f == nil {
+			return false
+		}
+		defer f.Close()
+		return f.Len() > 0
 	})
-	return rB, channel
+	return rB, a, channel
 }
 
 // readCached opens and reads the cached channel once (one served read).
@@ -445,6 +467,35 @@ func TestRedexGravityConfigIsForwarded(t *testing.T) {
 	}
 }
 
+// Closing a cache view releases only the caller's handle. The cached file
+// is the greedy runtime's: closing it would stop it admitting the peer's
+// later events (cubic review, PR #1165).
+func TestRedexGreedyCacheViewCloseKeepsTheCacheLive(t *testing.T) {
+	rB, a, channel := cachedPeerChannelFrom(t, nil)
+	f, err := rB.GreedyCacheFor(channel)
+	if err != nil || f == nil {
+		t.Fatalf("GreedyCacheFor = %v, %v", f, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close on a cache view: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("second Close on a cache view: %v", err)
+	}
+
+	waitUntil(t, "the cache admitted an event published after a view was closed", 10*time.Second, func() bool {
+		if _, err := a.Publish(channel, []byte("after-close"), PublishConfig{Reliability: "reliable", OnFailure: "best_effort"}); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		for _, e := range readCached(t, rB, channel) {
+			if string(e.Payload) == "after-close" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
 func TestRedexGreedyCacheForWithoutGreedy(t *testing.T) {
 	r := NewRedex("")
 	defer r.Free()
@@ -453,6 +504,10 @@ func TestRedexGreedyCacheForWithoutGreedy(t *testing.T) {
 	}
 	if _, err := r.GreedyCacheFor(""); !errors.Is(err, ErrRedex) {
 		t.Fatalf("GreedyCacheFor with an invalid name: want ErrRedex, got %v", err)
+	}
+	// An embedded NUL is refused, not truncated into another channel name.
+	if _, err := r.GreedyCacheFor("go/greedy/off\x00/other"); !errors.Is(err, ErrRedex) {
+		t.Fatalf("GreedyCacheFor with an embedded NUL: want ErrRedex, got %v", err)
 	}
 	r.Free()
 	if _, err := r.GreedyCacheFor("go/greedy/off"); !errors.Is(err, ErrShuttingDown) {
