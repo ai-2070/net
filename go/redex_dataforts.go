@@ -15,9 +15,9 @@
 // # Gravity heat
 //
 // Gravity turns reads served from the greedy cache into `heat:` capability
-// tags. No binding exposes the greedy read path (Redex::greedy_cache_for)
-// yet, so from Go, EnableGravityForGreedy configures and starts the tick
-// but cannot itself produce heat.
+// tags. GreedyCacheFor is that read path; each confirmed announcement is
+// counted in dataforts_greedy_gravity_heat_emissions_total, which
+// GreedyPrometheusText renders.
 
 package net
 
@@ -30,6 +30,7 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"unsafe"
 )
 
@@ -341,4 +342,31 @@ func (r *Redex) DisableGravityForGreedy() error {
 	return r.redexCall("disable_gravity_for_greedy", func(h *C.net_redex_t) C.int {
 		return C.net_redex_disable_gravity_for_greedy(h)
 	})
+}
+
+// GreedyCacheFor opens the greedy cache's copy of channel (the real channel
+// name), or returns (nil, nil) when it isn't cached or greedy isn't enabled.
+// Read it like any RedexFile (ReadRange, Tail) and Close it when done.
+//
+// A hit counts as a served read: it bumps the greedy serve-count metric and,
+// with gravity enabled, the chain's heat, which gravity then announces
+// (dataforts_greedy_gravity_heat_emissions_total in GreedyPrometheusText).
+func (r *Redex) GreedyCacheFor(channel string) (*RedexFile, error) {
+	cName := C.CString(channel)
+	defer C.free(unsafe.Pointer(cName))
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.handle == nil {
+		return nil, fmt.Errorf("%w: greedy_cache_for: %w", ErrRedex, ErrShuttingDown)
+	}
+	var out *C.net_redex_file_t
+	if err := redexOpError("greedy_cache_for", C.net_redex_greedy_cache_for(r.handle, cName, &out)); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		return nil, nil
+	}
+	f := &RedexFile{handle: out}
+	runtime.SetFinalizer(f, (*RedexFile).free)
+	return f, nil
 }

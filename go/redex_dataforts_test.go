@@ -14,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -322,5 +324,138 @@ func TestRedexDatafortsLifecycleRefusals(t *testing.T) {
 	gone.Shutdown()
 	if err := r.EnableReplication(gone); !errors.Is(err, ErrRedex) {
 		t.Fatalf("EnableReplication on a shut-down mesh: want ErrRedex, got %v", err)
+	}
+}
+
+// gravityEmissions reads dataforts_greedy_gravity_heat_emissions_total from
+// the greedy metrics.
+func gravityEmissions(t *testing.T, r *Redex) uint64 {
+	t.Helper()
+	text, err := r.GreedyPrometheusText()
+	if err != nil {
+		t.Fatalf("GreedyPrometheusText: %v", err)
+	}
+	m := regexp.MustCompile(`(?m)^dataforts_greedy_gravity_heat_emissions_total (\d+)$`).FindStringSubmatch(text)
+	if m == nil {
+		t.Fatalf("greedy metrics have no gravity emissions counter:\n%s", text)
+	}
+	n, err := strconv.ParseUint(m[1], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// cachedPeerChannel stands up A -> B with greedy (and the given gravity
+// config) on B, and returns once B's greedy cache holds A's channel.
+func cachedPeerChannel(t *testing.T, gravity *DataGravityConfig) (*Redex, string) {
+	t.Helper()
+	a, b, cleanup := meshHandshakePair(t)
+	t.Cleanup(cleanup)
+	rB := NewRedex("")
+	t.Cleanup(rB.Free)
+	if err := rB.EnableGreedyDataforts(b, &GreedyConfig{IntentMatch: "disabled"}); err != nil {
+		t.Fatalf("EnableGreedyDataforts: %v", err)
+	}
+	if err := rB.EnableGravityForGreedy(b, gravity); err != nil {
+		t.Fatalf("EnableGravityForGreedy: %v", err)
+	}
+	// Channel names are lowercase (RegisterChannel refuses otherwise).
+	channel := "go/greedy/" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "_"))
+	if err := a.RegisterChannel(ChannelConfig{Name: channel, Visibility: "global", Reliable: true}); err != nil {
+		t.Fatalf("RegisterChannel: %v", err)
+	}
+	if err := b.SubscribeChannel(a.NodeID(), channel); err != nil {
+		t.Fatalf("SubscribeChannel: %v", err)
+	}
+	waitUntil(t, "greedy cached A's channel", 10*time.Second, func() bool {
+		if _, err := a.Publish(channel, []byte("observed"), PublishConfig{Reliability: "reliable", OnFailure: "best_effort"}); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		return rB.GreedyCachedChannelCount() >= 1
+	})
+	return rB, channel
+}
+
+// readCached opens and reads the cached channel once (one served read).
+func readCached(t *testing.T, r *Redex, channel string) []RedexEvent {
+	t.Helper()
+	f, err := r.GreedyCacheFor(channel)
+	if err != nil {
+		t.Fatalf("GreedyCacheFor: %v", err)
+	}
+	if f == nil {
+		t.Fatal("GreedyCacheFor: a cached channel came back as a miss")
+	}
+	defer f.Close()
+	events, err := f.ReadRange(0, f.Len())
+	if err != nil {
+		t.Fatalf("ReadRange on the cached channel: %v", err)
+	}
+	return events
+}
+
+// G-A: the read path returns the peer's events, and the reads it serves are
+// what gravity turns into announced heat.
+func TestRedexGreedyCacheForReadsAPeersChannel(t *testing.T) {
+	rB, channel := cachedPeerChannel(t, &DataGravityConfig{TickIntervalMs: 50, EmitThresholdRatio: 1.01})
+
+	events := readCached(t, rB, channel)
+	if len(events) == 0 || string(events[0].Payload) != "observed" {
+		t.Fatalf("cached channel events = %+v, want A's published payload", events)
+	}
+	if f, err := rB.GreedyCacheFor("go/greedy/never-published"); err != nil || f != nil {
+		t.Fatalf("GreedyCacheFor of an uncached channel = %v, %v; want nil, nil", f, err)
+	}
+
+	waitUntil(t, "gravity announced heat from served reads", 10*time.Second, func() bool {
+		readCached(t, rB, channel)
+		return gravityEmissions(t, rB) > 0
+	})
+
+	if err := rB.DisableGravityForGreedy(); err != nil {
+		t.Fatalf("DisableGravityForGreedy: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond) // let an in-flight tick land
+	settled := gravityEmissions(t, rB)
+	for i := 0; i < 10; i++ {
+		readCached(t, rB, channel)
+		time.Sleep(50 * time.Millisecond)
+	}
+	if after := gravityEmissions(t, rB); after != settled {
+		t.Fatalf("gravity emitted after DisableGravityForGreedy: %d -> %d", settled, after)
+	}
+	// The read path itself keeps working without gravity.
+	if events := readCached(t, rB, channel); len(events) == 0 {
+		t.Fatal("cached channel unreadable after disabling gravity")
+	}
+}
+
+// The S3 forwarding gap, closed: a config that disables emission must reach
+// the policy. If the binding dropped it, the defaults would emit.
+func TestRedexGravityConfigIsForwarded(t *testing.T) {
+	off := false
+	rB, channel := cachedPeerChannel(t, &DataGravityConfig{Enabled: &off, TickIntervalMs: 50, EmitThresholdRatio: 1.01})
+	for i := 0; i < 20; i++ {
+		readCached(t, rB, channel)
+		time.Sleep(25 * time.Millisecond)
+	}
+	if n := gravityEmissions(t, rB); n != 0 {
+		t.Fatalf("gravity with Enabled=false announced %d heat updates; the config was not forwarded", n)
+	}
+}
+
+func TestRedexGreedyCacheForWithoutGreedy(t *testing.T) {
+	r := NewRedex("")
+	defer r.Free()
+	if f, err := r.GreedyCacheFor("go/greedy/off"); err != nil || f != nil {
+		t.Fatalf("GreedyCacheFor with greedy off = %v, %v; want nil, nil", f, err)
+	}
+	if _, err := r.GreedyCacheFor(""); !errors.Is(err, ErrRedex) {
+		t.Fatalf("GreedyCacheFor with an invalid name: want ErrRedex, got %v", err)
+	}
+	r.Free()
+	if _, err := r.GreedyCacheFor("go/greedy/off"); !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("GreedyCacheFor on a freed Redex: want ErrShuttingDown, got %v", err)
 	}
 }

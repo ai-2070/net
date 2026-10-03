@@ -69,6 +69,14 @@ int      net_redex_enable_greedy_dataforts(net_redex_t* redex,
                                            const char* config_json);
 int      net_redex_disable_greedy_dataforts(net_redex_t* redex);
 uint32_t net_redex_greedy_cached_channel_count(const net_redex_t* redex);
+/* Read path into the greedy cache: 0 with *out_file set on a hit (read with
+ * net_redex_file_read_range / _tail, free with net_redex_file_free), 0 with
+ * *out_file = NULL when the channel isn't cached or greedy is off. A hit
+ * counts as a served read and, under gravity, heat. -1 for a NULL argument
+ * (nothing written through a NULL out_file), -103 for an invalid name. */
+int      net_redex_greedy_cache_for(const net_redex_t* redex,
+                                    const char* channel,
+                                    net_redex_file_t** out_file);
 char*    net_redex_greedy_prometheus_text(const net_redex_t* redex);
 
 int      net_redex_enable_gravity_for_greedy(net_redex_t* redex,

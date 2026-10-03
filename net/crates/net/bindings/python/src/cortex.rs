@@ -691,6 +691,23 @@ impl PyRedex {
             .unwrap_or(0)
     }
 
+    /// Read path into the greedy cache: the cached copy of `channel`
+    /// (the real channel name), or `None` when it isn't cached or
+    /// greedy isn't enabled. A hit counts as a served read and, under
+    /// data gravity, as heat — gravity's announcements are counted in
+    /// `dataforts_greedy_gravity_heat_emissions_total`.
+    #[cfg(feature = "dataforts")]
+    fn greedy_cache_for(&self, channel: &str) -> PyResult<Option<PyRedexFile>> {
+        let name = ChannelName::new(channel)
+            .map_err(|e| RedexError::new_err(format!("invalid channel name: {}", e)))?;
+        let runtime = self.spawn_runtime()?;
+        let _enter = runtime.enter();
+        Ok(self.inner.greedy_cache_for(&name).map(|file| PyRedexFile {
+            inner: Arc::new(file),
+            runtime: runtime.clone(),
+        }))
+    }
+
     /// Render the greedy metrics as Prometheus text. Returns the
     /// empty string when greedy isn't enabled.
     ///
@@ -800,6 +817,12 @@ impl PyRedex {
     #[cfg(not(feature = "dataforts"))]
     fn greedy_cached_channel_count(&self) -> u32 {
         0
+    }
+
+    /// `None` without the `dataforts` feature.
+    #[cfg(not(feature = "dataforts"))]
+    fn greedy_cache_for(&self, _channel: &str) -> PyResult<Option<PyRedexFile>> {
+        Ok(None)
     }
 
     /// Empty without the `dataforts` feature.

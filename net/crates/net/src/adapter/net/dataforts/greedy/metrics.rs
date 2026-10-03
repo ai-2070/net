@@ -122,6 +122,11 @@ pub struct GreedyClusterMetricsAtomic {
     /// and surface the count instead. Operators see this rising
     /// when their publishers aren't configured to stamp origins.
     pub gravity_heat_unattributed_total: AtomicU64,
+    /// Cumulative heat updates gravity has announced: per-chain rate
+    /// changes and withdrawals that `gravity_tick` shipped in a batch the
+    /// sink confirmed. This is gravity's whole observable effect, so it
+    /// is what a binding watches to see gravity run.
+    pub gravity_heat_emissions_total: AtomicU64,
     /// Cumulative G-1 blob-pull verdicts that returned `Admit` —
     /// the local node would have speculatively pulled the blob
     /// referenced by an admitted chain event. The actual fetch
@@ -204,6 +209,12 @@ impl GreedyClusterMetricsAtomic {
     pub fn incr_gravity_heat_unattributed(&self) {
         self.gravity_heat_unattributed_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add `n` confirmed gravity heat announcements.
+    pub fn add_gravity_heat_emissions(&self, n: u64) {
+        self.gravity_heat_emissions_total
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     /// Bump the G-1 blob-pull admitted counter.
@@ -399,6 +410,10 @@ impl GreedyMetricsRegistry {
                     .cluster
                     .gravity_heat_unattributed_total
                     .load(Ordering::Relaxed),
+                gravity_heat_emissions_total: self
+                    .cluster
+                    .gravity_heat_emissions_total
+                    .load(Ordering::Relaxed),
                 blob_pulls_admitted_total: self
                     .cluster
                     .blob_pulls_admitted_total
@@ -474,6 +489,8 @@ pub struct GreedyClusterMetrics {
     /// Cumulative gravity heat bumps skipped because the chain's
     /// `origin_hash == 0` (publisher didn't stamp identity).
     pub gravity_heat_unattributed_total: u64,
+    /// Cumulative gravity heat announcements the sink confirmed.
+    pub gravity_heat_emissions_total: u64,
     /// Cumulative G-1 blob-pull admit verdicts.
     pub blob_pulls_admitted_total: u64,
     /// G-1 blob-pull veto: no `dataforts.blob.storage`.
@@ -597,6 +614,22 @@ impl GreedyMetricsSnapshot {
             out,
             "dataforts_greedy_gravity_heat_unattributed_total {}",
             self.cluster.gravity_heat_unattributed_total,
+        );
+
+        // Gravity heat announcements confirmed by the sink: gravity's
+        // observable effect.
+        let _ = writeln!(
+            out,
+            "# HELP dataforts_greedy_gravity_heat_emissions_total Cumulative gravity heat updates (rate changes and withdrawals) announced in a batch the sink confirmed."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE dataforts_greedy_gravity_heat_emissions_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "dataforts_greedy_gravity_heat_emissions_total {}",
+            self.cluster.gravity_heat_emissions_total,
         );
 
         // G-1 blob-pull admit counter.

@@ -1263,6 +1263,45 @@ none can see gravity do anything (S3's surviving mutant).
   single-process test drives admission through two in-process nodes where
   the binding's tests already do that.
 
+**G-A done, 2026-10-03.**
+
+- **Core:** `dataforts_greedy_gravity_heat_emissions_total`, bumped by the
+  batch size when the sink confirms (`greedy/runtime.rs`, `gravity_tick`).
+  Witnessed by the extended `gravity_tick_emits_then_suppresses`: 1 after
+  the emitting tick, still 1 after the suppressed tick, and rendered in the
+  Prometheus text. `gravity_skips_unattributed_origin_zero` now also
+  asserts 0.
+- **C:** `net_redex_greedy_cache_for`, with a dataforts-off stub, declared
+  in both cortex headers and added to the baseline by hand
+  (`check-ffi-exports.py` matches the built `net.dll`).
+  `greedy_cache_for_contract` covers the NULL out-pointer, the
+  outputs-reset-before-failure rule, an invalid name, and greedy-off as a
+  miss.
+- **Go:** `(*Redex).GreedyCacheFor`. Three live tests:
+  - `TestRedexGreedyCacheForReadsAPeersChannel`: B reads A's events from
+    the cache; the emissions counter rises from served reads and stops
+    rising after `DisableGravityForGreedy`.
+  - `TestRedexGravityConfigIsForwarded`: `Enabled: false` gives zero
+    emissions under the same reads.
+  - `TestRedexGreedyCacheForWithoutGreedy`.
+- **The S3 gap is closed.** The dropped-gravity-config mutant that
+  survived in S3 is now killed by `TestRedexGravityConfigIsForwarded`, and
+  an always-miss `GreedyCacheFor` is killed by two tests.
+- **Python:** `Redex.greedy_cache_for` plus its `_net.pyi` entry (the
+  stub-coverage tests pass). `tests/test_greedy_cache.py` has 3/3 live
+  tests (greedy off and invalid name; reads plus heat; config forwarded),
+  run against a CI-feature `maturin develop` build. CI pins it with a
+  3-row floor.
+- **Node:** `Redex.greedyCacheFor`, compile-checked with clippy
+  `-D warnings` in both configurations. **Found a CI gap, recorded
+  rather than fixed here:** Node's CI build (`ci.yml`, `napi build
+  --no-default-features --features …`) has no `dataforts`. So Node's
+  greedy, gravity and blob surfaces only ever run as stubs in CI, and a
+  Node behaviour test would be vacuous there. Go and Python carry the
+  behaviour witnesses.
+- Evidence: the full Go package passes, `-race` over `TestRedex*` passes,
+  and all 8 roster steps this plan owns run from the YAML as written.
+
 ### G-B: Go-implemented blob adapters (S5b)
 
 The design under "Decision: callback blob adapters" stands as written:

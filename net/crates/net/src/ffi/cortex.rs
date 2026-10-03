@@ -773,6 +773,59 @@ pub unsafe extern "C" fn net_redex_greedy_cached_channel_count(redex: *const Red
         .unwrap_or(0)
 }
 
+/// Read path into the greedy cache: open the cached copy of `channel` (the
+/// *real* channel name; the cache-name synthesis happens inside). A hit
+/// counts as a served read — it bumps the serve-count metric and, under
+/// data gravity, the chain's heat — which is what makes gravity observable
+/// from a binding.
+///
+/// Returns `0` and writes a file handle to `*out_file` on a hit (read it
+/// with `net_redex_file_read_range` / `_tail`, free it with
+/// `net_redex_file_free`), or `0` with `*out_file = NULL` when the channel
+/// isn't cached or greedy isn't enabled. `NetError::NullPointer` for a NULL
+/// `redex` / `channel` / `out_file` (nothing is written through a NULL
+/// `out_file`), `NetError::InvalidUtf8`, `NET_ERR_REDEX` for an invalid
+/// channel name, `NetError::ShuttingDown` while the Redex is being freed.
+///
+/// # Safety
+/// `redex` is a live handle; `channel` is NUL-terminated UTF-8; `out_file`
+/// is writable.
+#[cfg(feature = "dataforts")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_redex_greedy_cache_for(
+    redex: *const RedexHandle,
+    channel: *const c_char,
+    out_file: *mut *mut RedexFileHandle,
+) -> c_int {
+    if out_file.is_null() {
+        return NetError::NullPointer.into();
+    }
+    unsafe { *out_file = ptr::null_mut() };
+    if redex.is_null() || channel.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*redex };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let Some(name) = (unsafe { c_str_to_owned(channel) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let Ok(channel) = ChannelName::new(&name) else {
+        return NET_ERR_REDEX;
+    };
+    let _rt = runtime().enter();
+    if let Some(file) = h.inner.greedy_cache_for(&channel) {
+        let handle = Box::new(RedexFileHandle {
+            inner: ManuallyDrop::new(Arc::new(file)),
+            guard: HandleGuard::new(),
+        });
+        unsafe { *out_file = Box::into_raw(handle) };
+    }
+    0
+}
+
 /// Render greedy metrics as Prometheus text. Caller frees via
 /// [`crate::ffi::net_free_string`]. Empty string when greedy
 /// isn't enabled; NULL on a NULL handle or shutting-down Redex.
@@ -958,6 +1011,19 @@ pub unsafe extern "C" fn net_redex_disable_greedy_dataforts(_redex: *mut RedexHa
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_redex_greedy_cached_channel_count(_redex: *const RedexHandle) -> u32 {
     0
+}
+
+#[cfg(not(feature = "dataforts"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_redex_greedy_cache_for(
+    _redex: *const RedexHandle,
+    _channel: *const c_char,
+    out_file: *mut *mut RedexFileHandle,
+) -> c_int {
+    if !out_file.is_null() {
+        unsafe { *out_file = ptr::null_mut() };
+    }
+    NET_ERR_FEATURE_NOT_BUILT
 }
 
 #[cfg(not(feature = "dataforts"))]
@@ -4924,6 +4990,41 @@ mod tests {
         );
 
         unsafe { net_redex_free(r) };
+    }
+
+    /// `net_redex_greedy_cache_for` contract (plan G-A): NULL out-pointer
+    /// refused before any write; outputs reset before later failures; an
+    /// invalid channel name is NET_ERR_REDEX; greedy off is a clean miss.
+    /// The hit path needs a live mesh and is covered by the Go end-to-end
+    /// test (TestRedexGreedyCacheForReadsAPeersChannel).
+    #[cfg(feature = "dataforts")]
+    #[test]
+    fn greedy_cache_for_contract() {
+        let r = redex();
+        let ch = CString::new("go/greedy/contract").unwrap();
+        let bad = CString::new("").unwrap();
+        unsafe {
+            assert_eq!(
+                net_redex_greedy_cache_for(r, ch.as_ptr(), ptr::null_mut()),
+                c_int::from(NetError::NullPointer)
+            );
+            let mut out = std::ptr::dangling_mut::<RedexFileHandle>();
+            assert_eq!(
+                net_redex_greedy_cache_for(ptr::null(), ch.as_ptr(), &mut out),
+                c_int::from(NetError::NullPointer)
+            );
+            assert!(out.is_null(), "out_file reset before a later failure");
+            let mut out = std::ptr::dangling_mut::<RedexFileHandle>();
+            assert_eq!(
+                net_redex_greedy_cache_for(r, bad.as_ptr(), &mut out),
+                NET_ERR_REDEX
+            );
+            assert!(out.is_null());
+            let mut out = std::ptr::dangling_mut::<RedexFileHandle>();
+            assert_eq!(net_redex_greedy_cache_for(r, ch.as_ptr(), &mut out), 0);
+            assert!(out.is_null(), "greedy off: a miss, not an error");
+            net_redex_free(r);
+        }
     }
 
     // =====================================================================

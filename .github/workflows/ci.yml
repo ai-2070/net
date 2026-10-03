@@ -4389,6 +4389,27 @@ jobs:
       # COUNTS the rows (floor 9 = 1 coverage row + 4 vectors x {decode,
       # re-encode}). The Go half is TestCrossLangBlobDescribeVectors in the
       # Go job. (GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md, S6.)
+      # === the greedy read path + gravity (Python half, plan gap G-A) =====
+      # Executed by the pytest run above; pinned and counted here (floor 3).
+      - name: Witness roster + floor — Python greedy read path (3)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_greedy_cache --mode decl \
+            --source net/crates/net/bindings/python/tests/test_greedy_cache.py \
+            test_greedy_cache_for_without_greedy \
+            test_greedy_cache_for_reads_a_peers_channel \
+            test_gravity_config_is_forwarded || exit 1
+          out=$(cd net/crates/net/bindings/python && python -m pytest -q \
+                  tests/test_greedy_cache.py 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "python greedy read path: ${n:-0} (floor 3)"
+          if [ -z "$n" ] || [ "$n" -lt 3 ]; then
+            echo "::error::the python greedy read path ran ${n:-0} rows, floor is 3 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+
       - name: Witness roster + floor — Python cross-lang blob describe (9)
         working-directory: ${{ github.workspace }}
         run: |
@@ -4892,7 +4913,7 @@ jobs:
             TestTransferStoreDirAfterClose \
             TestTransferStoreDirMissingRoot || exit 1
 
-      - name: Witness roster — Go RedEX replication / greedy / gravity (7)
+      - name: Witness roster — Go RedEX replication / greedy / gravity (10)
         working-directory: go
         run: |
           set -uo pipefail
@@ -4904,7 +4925,10 @@ jobs:
             TestRedexGreedyCachesAPeersChannel \
             TestRedexGreedyConfigRefusals \
             TestRedexGravityInstallRules \
-            TestRedexDatafortsLifecycleRefusals || exit 1
+            TestRedexDatafortsLifecycleRefusals \
+            TestRedexGreedyCacheForReadsAPeersChannel \
+            TestRedexGravityConfigIsForwarded \
+            TestRedexGreedyCacheForWithoutGreedy || exit 1
 
       - name: Witness roster — Go CortEX write tokens (7)
         working-directory: go

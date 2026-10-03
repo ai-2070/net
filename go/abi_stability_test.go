@@ -379,3 +379,34 @@ func TestABIStabilityBlobV3ArityMatchesRust(t *testing.T) {
 		}
 	}
 }
+
+// TestABIStabilityGreedyCacheForArityMatchesRust pins the gap G-A entry
+// point: declared in go/net_cortex.h with the same parameter count as its
+// Rust definition (both the dataforts and the feature-off stub).
+func TestABIStabilityGreedyCacheForArityMatchesRust(t *testing.T) {
+	src, err := os.ReadFile("../net/crates/net/src/ffi/cortex.rs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defs := regexp.MustCompile(`pub unsafe extern "C" fn net_redex_greedy_cache_for\(([^)]*)\)`).FindAllStringSubmatch(string(src), -1)
+	if len(defs) != 2 {
+		t.Fatalf("want the dataforts definition and its stub, found %d", len(defs))
+	}
+	h := parseHeader(t, "net_cortex.h")
+	params, ok := h.fns["net_redex_greedy_cache_for"]
+	if !ok {
+		t.Fatal("net_redex_greedy_cache_for is not declared in go/net_cortex.h")
+	}
+	want := strings.Count(params, ",") + 1
+	for _, d := range defs {
+		got := 0
+		for _, p := range strings.Split(d[1], ",") {
+			if strings.TrimSpace(p) != "" {
+				got++
+			}
+		}
+		if got != want {
+			t.Errorf("Rust definition takes %d parameters, the header declares %d", got, want)
+		}
+	}
+}
