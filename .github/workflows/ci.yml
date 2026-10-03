@@ -4414,6 +4414,42 @@ jobs:
             exit 1
           fi
 
+      # === the sdk-py paid-A2A witnesses (NODE_A2A_PAID_ADMISSION_PLAN.md WS-G)
+      # Here, not in `sdk-py-tests`, for the org facade step's reason: these
+      # are live rows through `net_sdk` — an executed consumer subprocess,
+      # because the sdk-py conftest stubs `net` — and need the built extension
+      # and the installed wrapper only this job has. The test's own probe
+      # SKIPS where no wheel loads (the sdk-py-tests job), so the floor and the
+      # by-name check below are what keep a skip from reading as a pass, and
+      # it FAILS on a partial or stubbed paid surface.
+      - name: Witness roster + floor — sdk-py paid A2A (4)
+        working-directory: net/crates/net/sdk-py
+        env:
+          PYTHONFAULTHANDLER: "1"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -uo pipefail
+          pins="test_paid_a2a_runs_once_from_sdk_mesh_nodes
+            test_paid_a2a_runs_from_async_mesh_nodes_via_to_thread
+            test_the_factories_accept_a_native_net_mesh
+            test_the_boundary_refusals_are_the_native_ones"
+          # shellcheck disable=SC2086 # word-splitting $pins is the point
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_paid_a2a_sdk --mode decl \
+            --source tests/test_paid_a2a_sdk.py $pins || exit 1
+          out=$(python -m pytest -v --timeout=300 --timeout-method=thread \
+                  tests/test_paid_a2a_sdk.py 2>&1 | tee /dev/stderr)
+          for pin in $pins; do
+            printf '%s\n' "$out" | grep -qE "::${pin} PASSED" || {
+              echo "::error::pinned paid-A2A witness ${pin} did not pass"; exit 1; }
+          done
+          n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "sdk-py paid A2A: ${n:-0} (floor 4)"
+          if [ -z "$n" ] || [ "$n" -lt 4 ]; then
+            echo "::error::the sdk-py paid-A2A suite ran ${n:-0} rows, floor is 4 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+
       # Executed, not just type-checked. hello.py's siblings in Rust and
       # TypeScript both compiled clean for months while hanging forever on a
       # subscribe that could never yield; only running them found it. The

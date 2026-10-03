@@ -596,6 +596,16 @@ class MeshNode:
         resend. Raises ``PaymentRefused`` on a refusal."""
         return self._native.submit_task_paid(prepared_json, proof_json)
 
+    def set_a2a_org_caller(self, org: Any) -> None:
+        """Install (or clear with ``None``) the organization identity this
+        mesh's A2A requester verbs present to a PROTECTED provider. ``org`` is
+        a :class:`net_sdk.org.OrgClient` or a native ``net.OrgClient``. A
+        ``CapabilityGateway`` has its own slot
+        (:func:`net_sdk.payments.set_a2a_org_caller`)."""
+        from net_sdk.payments import _native_org_client
+
+        self._native.set_a2a_org_caller(_native_org_client(org))
+
     def describe_a2a(self, target_node_id: int) -> str:
         """What ``target_node_id`` serves, as a JSON array of ``A2aOffer``s.
         Uncharged; the only sanctioned way to learn a price. A node serving
@@ -1012,6 +1022,11 @@ class AsyncMeshNode:
 
         self._sync = node
         self._native = AsyncNetMesh(node._native)
+
+    def set_a2a_org_caller(self, org: Any) -> None:
+        """:meth:`MeshNode.set_a2a_org_caller` on the wrapped node (the slot
+        is the node's; installing it does not block)."""
+        self._sync.set_a2a_org_caller(org)
 
     @property
     def sync(self) -> "MeshNode":

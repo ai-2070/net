@@ -1052,6 +1052,51 @@ precedent (`tests/test_org_streaming.py:5-10,60-106`):
   no wheel) reports 0 passed and fails the floor. `ci.yml:4152` already builds
   that job's extension with `payments,a2a,org`.
 
+
+> **Status: WS-G landed 2026-10-03.** What shipped against the bullets above:
+>
+> - `net_sdk/payments.py`: the three factories (`**kwargs` passed through
+>   unchanged; `_native_mesh` takes `MeshNode`, `AsyncMeshNode` or a raw
+>   `NetMesh`) and `set_a2a_org_caller(target, org)`. The guarded re-exports
+>   of `PaymentProvider`, `PaymentRefused` and `JournalOwnedElsewhere` are at
+>   the `net_sdk` root, beside the factories.
+> - `MeshNode.set_a2a_org_caller` / `AsyncMeshNode.set_a2a_org_caller`. Both
+>   accept `net_sdk.org.OrgClient` (`.raw`) or a native client. The SDK's
+>   `AsyncOrgClient` is **refused by name**: the native slot takes the sync
+>   client, and PyO3 would otherwise reject it with an opaque extraction error.
+> - Async matrix as specified (S2): paid verbs only on the sync gateway, from
+>   asyncio via `to_thread`. `create_async_capability_gateway(…,
+>   a2a_purchase_path=…)` raises the native `TypeError`, and
+>   `set_a2a_org_caller(async_gw, …)` raises `TypeError`, naming the sync
+>   gateway.
+> - **Proved by:** `sdk-py/tests/test_paid_a2a_sdk.py` (4 rows) over the
+>   consumer `sdk-py/examples/paid_a2a_consumer.py`, each cell in its own
+>   interpreter behind the three-verdict probe (skip / broken facade / partial
+>   or stubbed paid surface).
+>   - `sync`: the paid task runs once from two `net_sdk.MeshNode`s, with one
+>     billing event, and both nodes shut down after stop/release. The `MeshNode`
+>     forwards and both setter targets accept `None`.
+>   - `async`: the same over `AsyncMeshNode`, with `to_thread`.
+>   - `native`: the factories take a raw `NetMesh`.
+>   - `refusals`: the native gateway still refuses a `MeshNode`; an unknown
+>     keyword raises the native error; a non-mesh is refused by the adapter;
+>     there is no async paid A2A and no async org target; a purchase store
+>     without a policy is refused.
+>
+>   `sync` and `async` import `net_sdk` and the standard library only. `native`
+>   and `refusals` import `net`, because a native object is what they test. The
+>   whole `sdk-py` suite passes (412) in the built venv, including the stubbed
+>   rows that now import `net_sdk.payments`.
+> - **CI:** a new `python-tests` step, `Witness roster + floor — sdk-py paid
+>   A2A (4)`, pins the four rows with `check-roster.py --mode decl`, runs them,
+>   requires each pin `PASSED` **by name**, and floors the count at 4. The
+>   by-name check is stronger than the org step's count-only floor. It was
+>   simulated locally against a real run: all four pins found.
+> - **Moved to WS-F (not done here):** (1) the live same-org cell with an SDK
+>   `OrgClient` on both setters, which shares the scenario harness with the
+>   Node R6 witness, so both are written there; (2) the docs bullet (`net_sdk`
+>   form first in `a2a.md` and the guide), which joins WS-F's docs batch.
+
 ### Decisions (resolved at review, r2)
 
 1. **D1 — hoist.** Adopted: the shared projection, with Python-specific
