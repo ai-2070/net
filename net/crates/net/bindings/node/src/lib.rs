@@ -2638,8 +2638,21 @@ mod mesh_bindings {
             // The A2A org caller installed by `setA2aOrgCaller` is an SDK
             // org client, which holds a node reference of its own; release
             // it here so an installed identity never blocks shutdown.
+            //
+            // Only a `Weak` is kept: a shutdown that fails on a genuine
+            // outstanding reference leaves the mesh usable, and must leave
+            // its identity installed with it. The client is still alive then
+            // whenever anything else holds it (the JS `OrgClient` it came
+            // from, a gateway slot) — and an open JS `OrgClient` is itself an
+            // outstanding node reference, so that is the usual failure. Only
+            // a client the slot alone kept alive (its JS handle already
+            // closed) is gone for good, exactly as `close()` intended.
             #[cfg(all(feature = "a2a", feature = "org"))]
-            let _ = self.a2a_org_caller.lock().take();
+            let org_caller = self
+                .a2a_org_caller
+                .lock()
+                .take()
+                .map(|client| Arc::downgrade(&client));
             // ~250 ms total (50 × 5 ms) — imperceptible in the common
             // path (first `try_unwrap` succeeds), ample for a handful of
             // serve-task teardown ticks in the race path.
@@ -2661,6 +2674,16 @@ mod mesh_bindings {
                             // so a later shutdown (after the caller
                             // releases it) can still succeed.
                             self.node.store(Some(arc));
+                            // Restore the identity too — unless a concurrent
+                            // `setA2aOrgCaller` installed one meanwhile, which
+                            // is the newer intent and wins.
+                            #[cfg(all(feature = "a2a", feature = "org"))]
+                            {
+                                let mut slot = self.a2a_org_caller.lock();
+                                if slot.is_none() {
+                                    *slot = org_caller.as_ref().and_then(std::sync::Weak::upgrade);
+                                }
+                            }
                             return Err(Error::from_reason(
                                 "cannot shutdown: outstanding references exist",
                             ));

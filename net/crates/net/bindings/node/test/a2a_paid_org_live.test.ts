@@ -255,6 +255,14 @@ describe.skipIf(!HAS)('paid a2a — org-admitted principal, live (WS-F, R6)', ()
       // reference, and `shutdown()` releases it. Re-install, release the
       // documented handles, and require the shutdown to succeed.
       callerMesh.setA2aOrgCaller(client)
+
+      // Code review: a shutdown REFUSED for a genuine outstanding reference
+      // (the open gateway and client) leaves the mesh usable — and must
+      // leave its identity installed with it, not silently strip it.
+      await expect(callerMesh.shutdown()).rejects.toThrow(/outstanding references/)
+      const still = await converge(providerMesh, callerMesh, async () => callerMesh.describeA2a(target))
+      expect(JSON.parse(still)[0].service_id).toBe(SERVICE)
+
       handle.stop()
       provider.close()
       gateway.close()
