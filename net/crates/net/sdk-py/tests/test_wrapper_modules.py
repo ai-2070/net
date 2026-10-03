@@ -150,7 +150,12 @@ def test_tasks_cm_closes_on_normal_exit_and_swallows_idempotent_close() -> None:
 
     captured: list[_StubTasks] = []
 
-    def fake_open(_redex: object, **_kwargs: object) -> _StubTasks:
+    # The stub takes exactly the native signature, `open(redex,
+    # origin_hash, persistent=False)`: a stub swallowing `**kwargs` hid
+    # that tasks_cm forwarded a `channel=` the native open rejects.
+    def fake_open(
+        _redex: object, origin_hash: int, persistent: bool = False
+    ) -> _StubTasks:
         a = _StubTasks()
         captured.append(a)
         return a
@@ -158,7 +163,7 @@ def test_tasks_cm_closes_on_normal_exit_and_swallows_idempotent_close() -> None:
     original = getattr(cortex.TasksAdapter, "open", None)
     cortex.TasksAdapter.open = fake_open  # type: ignore[method-assign,assignment]
     try:
-        with cortex.tasks_cm(object(), channel="t", origin_hash=1):
+        with cortex.tasks_cm(object(), origin_hash=1):
             pass
     finally:
         if original is not None:
@@ -172,14 +177,16 @@ def test_tasks_cm_closes_on_normal_exit_and_swallows_idempotent_close() -> None:
     # swallows the second-time-already-closed error.
     captured2: list[_StubTasks] = []
 
-    def fake_open2(_redex: object, **_kwargs: object) -> _StubTasks:
+    def fake_open2(
+        _redex: object, origin_hash: int, persistent: bool = False
+    ) -> _StubTasks:
         a = _StubTasks()
         captured2.append(a)
         return a
 
     cortex.TasksAdapter.open = fake_open2  # type: ignore[method-assign,assignment]
     try:
-        with cortex.tasks_cm(object(), channel="t", origin_hash=1) as adapter:
+        with cortex.tasks_cm(object(), origin_hash=1) as adapter:
             adapter.close()  # first close
         # second close (via cm) raises CortexError, must be swallowed
     finally:
@@ -189,6 +196,42 @@ def test_tasks_cm_closes_on_normal_exit_and_swallows_idempotent_close() -> None:
     # First close from inside body + cm-side close attempt = 2 calls;
     # the cm swallowed the CortexError that the second raised.
     assert captured2[0].close_calls == 2
+
+
+def test_memories_cm_forwards_only_what_the_native_open_takes() -> None:
+    """memories_cm opens with the native signature (no `channel`: the
+    channel is fixed) and closes on scope exit."""
+    cortex = importlib.import_module("net_sdk.cortex")
+
+    class _StubMemories:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    opened: list[tuple[int, bool, _StubMemories]] = []
+
+    def fake_open(
+        _redex: object, origin_hash: int, persistent: bool = False
+    ) -> _StubMemories:
+        a = _StubMemories()
+        opened.append((origin_hash, persistent, a))
+        return a
+
+    original = getattr(cortex.MemoriesAdapter, "open", None)
+    cortex.MemoriesAdapter.open = fake_open  # type: ignore[method-assign,assignment]
+    try:
+        with cortex.memories_cm(object(), origin_hash=7, persistent=True):
+            pass
+    finally:
+        if original is not None:
+            cortex.MemoriesAdapter.open = original  # type: ignore[method-assign,assignment]
+        else:
+            del cortex.MemoriesAdapter.open  # type: ignore[attr-defined]
+
+    assert [(o, p) for o, p, _ in opened] == [(7, True)]
+    assert opened[0][2].close_calls == 1
 
 
 def test_runner_cm_constructs_and_releases() -> None:

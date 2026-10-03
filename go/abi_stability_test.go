@@ -31,7 +31,9 @@ package net
 
 import (
 	"errors"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -483,8 +485,10 @@ func TestABIStabilityBlobOwnedRegistrationMatchesRust(t *testing.T) {
 // surface: both waits take (origin, channel, seq) plus the timeout, the
 // channel accessors exist with the Rust arity, and -160 is ErrWrongChannel.
 // -160 is pinned as unused by every other surface: the first choice, -109,
-// is NET_ERR_MESH_STREAM_OCCUPIED in the shared enum (cubic, #1167). Before, a token was (origin, seq), and a Tasks token
-// could be satisfied by Memories' unrelated numbering.
+// is NET_ERR_MESH_STREAM_OCCUPIED in the shared enum (cubic, #1167).
+//
+// Before, a token was (origin, seq), and a Tasks token could be satisfied
+// by Memories' unrelated numbering.
 func TestABIStabilityWriteTokenCarriesTheChannel(t *testing.T) {
 	requireCrateTree(t)
 	src, err := os.ReadFile("../net/crates/net/src/ffi/cortex.rs")
@@ -539,13 +543,42 @@ func TestABIStabilityWriteTokenCarriesTheChannel(t *testing.T) {
 			}
 		}
 	}
-	for _, f := range []string{"blob.rs", "mesh.rs", "transport.rs", "cortex.rs"} {
-		other, err := os.ReadFile("../net/crates/net/src/ffi/" + f)
+	// No Rust FFI source may define -160 either, except the one constant.
+	// Every .rs file under both trees is scanned, so a new or renamed file
+	// cannot fall outside the check, and a missing tree fails the test
+	// instead of passing it with nothing scanned.
+	defines := regexp.MustCompile(`=\s*-160\s*;`)
+	var found []string
+	for _, root := range []string{"../net/crates/net/src/ffi", "../net/crates/net/bindings/go"} {
+		scanned := 0
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() && d.Name() == "target" {
+				return filepath.SkipDir
+			}
+			if d.IsDir() || filepath.Ext(path) != ".rs" {
+				return nil
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			scanned++
+			for range defines.FindAllIndex(body, -1) {
+				found = append(found, filepath.ToSlash(path))
+			}
+			return nil
+		})
 		if err != nil {
-			continue
+			t.Fatalf("scanning %s: %v", root, err)
 		}
-		if n := regexp.MustCompile(`c_int = -160;`).FindAllIndex(other, -1); len(n) != map[bool]int{true: 1, false: 0}[f == "cortex.rs"] {
-			t.Errorf("src/ffi/%s defines -160 %d time(s); only NET_ERR_WRONG_CHANNEL may", f, len(n))
+		if scanned == 0 {
+			t.Fatalf("scanned no .rs files under %s", root)
 		}
+	}
+	if want := []string{"../net/crates/net/src/ffi/cortex.rs"}; strings.Join(found, ",") != strings.Join(want, ",") {
+		t.Errorf("-160 is defined at %v; only NET_ERR_WRONG_CHANNEL in src/ffi/cortex.rs may", found)
 	}
 }

@@ -792,6 +792,24 @@ is breaking across every binding, by decision, with no compatibility path:
     adapters without reading it.
   - `Token(seq)` stamps the channel hash. `ChannelHash()` and
     `ErrWrongChannel` are new.
+- **Node, TypeScript, Python:** `WriteToken` loses its public constructor
+  (`new WriteToken(origin, seq)`, `WriteToken(origin, seq)`). Tokens come
+  from the new `adapter.token(seq)`, or `fromString` / `from_string` for
+  the three-part string. `channelHash` / `channel_hash` is new on the token
+  and on both adapters.
+- **Precedence:** origin is checked before channel, so a token wrong on both
+  is `WrongOrigin` and counts in `wrong_origin_total`, not
+  `wrong_channel_total`.
+- **Release notes must carry all of the above:** the string form (old
+  logged or stored tokens no longer parse), the lost constructors, and the
+  C signature change.
+- **Found in review, fixed on the branch:** `net_sdk.cortex.tasks_cm` /
+  `memories_cm` forwarded a `channel=` keyword the native `open` has never
+  taken, so both raised `TypeError` against a real wheel. Their test stubs
+  accepted `**kwargs` and hid it; the stubs now take the native signature.
+  The channel is fixed (`cortex/tasks`, `cortex/memories`), so the argument
+  is gone. The ABI test's `-160` scan now walks every `.rs` file under
+  `src/ffi` and `bindings/go`, and fails if a tree has nothing to scan.
 - **Witness:** `TestWriteTokenWrongChannelIsRefused`. Memories is past the
   Tasks seq, and a poll and a wait both return `ErrWrongChannel`. #1167 pins
   it in the S4 roster ("Go CortEX write tokens", now 9). The same witness exists in
