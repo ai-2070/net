@@ -696,10 +696,7 @@ pub(crate) async fn dispatch_to_js(
     // handler promise cannot hold the request (and its worker) open forever.
     match tokio::time::timeout_at(deadline, promise).await {
         Ok(Ok(buf)) => Ok(bytes::Bytes::from(buf.to_vec())),
-        Ok(Err(e)) => Err(net_sdk::org::OrgHandlerError::Application {
-            code: ORG_HANDLER_ERROR,
-            message: format!("org handler rejected: {e}"),
-        }),
+        Ok(Err(e)) => Err(org_handler_rejection(e)),
         Err(_) => Err(net_sdk::org::OrgHandlerError::Internal(format!(
             "JS org handler promise did not resolve within {} ms",
             timeout.as_millis()
@@ -872,7 +869,9 @@ type OrgDuplexHandlerTsfn =
 fn org_handler_rejection(e: napi::Error) -> net_sdk::org::OrgHandlerError {
     net_sdk::org::OrgHandlerError::Application {
         code: ORG_HANDLER_ERROR,
-        message: format!("org handler rejected: {e}"),
+        message: crate::js_promise::failure_reason("org handler", &e, |e| {
+            format!("org handler rejected: {e}")
+        }),
     }
 }
 

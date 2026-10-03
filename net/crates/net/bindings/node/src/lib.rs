@@ -11,6 +11,11 @@
 // over `net_sdk::{a2a, mesh_a2a}`; gated on `a2a` (delegation + cortex).
 #[cfg(feature = "a2a")]
 mod a2a;
+// Abandoned-vs-rejected classification for every JS-Promise bridge.
+// Ungated: its callers span many features, so builds that use none of
+// them would otherwise warn about dead code.
+#[allow(dead_code)]
+mod js_promise;
 // Paid A2A, provider half (NODE_A2A_PAID_ADMISSION_PLAN.md WS-B):
 // `PaymentProvider.serveA2aConfigured` + the operator queue, over the
 // shared `net_payments::flow::a2a::json` boundary.

@@ -177,8 +177,10 @@ async fn call_js_handler(
     };
     match tokio::time::timeout_at(deadline, promise).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(McpError::Transport(format!(
-            "local tool handler Promise rejected: {e}"
+        Ok(Err(e)) => Err(McpError::Transport(crate::js_promise::failure_reason(
+            "local tool handler",
+            &e,
+            |e| format!("local tool handler Promise rejected: {e}"),
         ))),
         Err(_) => Err(McpError::Transport(format!(
             "local tool handler Promise did not resolve within {} ms",

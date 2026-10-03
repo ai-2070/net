@@ -942,9 +942,10 @@ where
     };
     match tokio::time::timeout_at(deadline, promise).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(e)) => Err(InnerBlobError::Backend(format!(
-            "{}: Promise rejected: {}",
-            label, e
+        Ok(Err(e)) => Err(InnerBlobError::Backend(crate::js_promise::failure_reason(
+            &format!("{label}:"),
+            &e,
+            |e| format!("{label}: Promise rejected: {e}"),
         ))),
         Err(_) => Err(InnerBlobError::Backend(format!(
             "{}: Promise did not resolve within {} ms (total budget)",

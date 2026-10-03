@@ -25,7 +25,7 @@
 //! one that is pending and that nothing references can never settle, and V8
 //! may collect it before the budget runs out. That is reported as such — "a
 //! Promise that can never settle" — at once, rather than as a rejection
-//! (`crate::a2a::is_abandoned_promise`).
+//! (`crate::js_promise::is_abandoned`).
 //!
 //! **Stop is retirement, not release** (plan D6). Stopping the returned
 //! handle unregisters the services; the journal's ownership ends only once
@@ -263,13 +263,11 @@ impl TaskPreflight for NodePreflight {
                 }
             };
             promise.await.map_err(|e| {
-                if crate::a2a::is_abandoned_promise(&e) {
-                    format!("preflight refused: the preflight {}", crate::a2a::NEVER_SETTLES)
-                } else {
+                crate::js_promise::failure_reason("preflight refused: the preflight", &e, |e| {
                     format!(
                         "preflight refused: the preflight rejected or did not return null or a string: {e}"
                     )
-                }
+                })
             })
         };
         // On expiry the future — and with it the oneshot — is dropped, so a

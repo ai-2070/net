@@ -89,8 +89,10 @@ async fn call_js_signer(
     };
     match tokio::time::timeout_at(deadline, promise).await {
         Ok(Ok(sig)) => Ok(sig),
-        Ok(Err(e)) => Err(SignerError::new(format!(
-            "{label}: signer Promise rejected: {e}"
+        Ok(Err(e)) => Err(SignerError::new(crate::js_promise::failure_reason(
+            &format!("{label}: signer"),
+            &e,
+            |e| format!("{label}: signer Promise rejected: {e}"),
         ))),
         Err(_) => Err(SignerError::new(format!(
             "{label}: signer Promise did not resolve within {} ms",
