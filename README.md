@@ -51,7 +51,7 @@ subprotocol IDs are permanent.
 - Full fail + recover cycle — `291 ns`, `3.44 M ops/sec`
 - Capability filter match (single tag) — `57.1 ns`, `17.5 M ops/sec`
 
-These measure local operations on an M1 Max — not NIC transfer, wire latency, or propagation. The full set is under [Performance](#performance).
+These measure local operations on an M1 Max — not NIC transfer, wire latency, or propagation. More under [Performance](#performance).
 
 ## Install
 
@@ -304,7 +304,7 @@ The rest of the surface, one line each; every entry links to the page that goes 
 
 ## Performance
 
-The full measured set and methodology live in
+Full set and methodology in
 [`net/crates/net/BENCHMARKS.md`](net/crates/net/BENCHMARKS.md). Each measures one operation in isolation, not the cost
 of a packet path. None includes NIC transfer, wire latency, or propagation.
 
