@@ -41,6 +41,7 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 | Heartbeat from a known peer | 39.8 ns / 25.2 M ops/sec |
 | Full fail + recover cycle | 291 ns / 3.44 M ops/sec |
 | Capability lookup, selective tag | ~1.9 µs, flat from 1k to 50k nodes |
+| Capability filter match (single tag) | 57.1 ns / 17.5 M ops/sec |
 | Start a node → first peer | 937 µs |
 
 These measure local operations on one machine — not NIC transfer, wire latency, or propagation. The full set is under [Performance](#performance).
