@@ -1,0 +1,33 @@
+go/cbuf.go
+  s_391b90f341d6c6::t_e96dc1ea2cddb1 1-55
+docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md
+  s_391b90f341d6c6::t_763fb1d38afc41 5-8,378-429,779-784
+  s_391b90f341d6c6::t_7305393453d67d 785
+.github/scripts/go-test-with-native-stacks.sh
+  s_391b90f341d6c6::t_717eaeac19d74e 22-30,35-40,62-65,67-70,72-73,75-78
+go/blob_test.go
+  s_391b90f341d6c6::t_183a48a69723ad 1-60,65-559
+  s_391b90f341d6c6::t_eb6e2c317ae8c0 61-64
+go/blob.go
+  s_391b90f341d6c6::t_a6ed63f8de2b77 73-76,116,269-272,298-301,432-437,572-576
+.github/workflows/ci.yml
+  s_391b90f341d6c6::t_d4bc25dbb090ca 4817-4832,4834-4849,4853
+  s_391b90f341d6c6::t_eb10170b6f8d1a 4850-4852
+  s_391b90f341d6c6::t_9608b40da94fa7 4833
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "aaa797c7f8d1a5e5204305c1c49d13c16b8226cf",
+  "prompts": {},
+  "sessions": {
+    "s_391b90f341d6c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e008671-9702-4db4-b22a-abb85b691773",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
