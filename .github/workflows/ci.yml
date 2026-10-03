@@ -4869,6 +4869,12 @@ jobs:
           set -uo pipefail
           python3 ../.github/scripts/check-roster.py --label write_token_test --mode decl             --source write_token_test.go             TestWriteTokenTasksReadYourWrites             TestWriteTokenMemoriesReadYourWrites             TestWriteTokenOriginNotIdentity             TestWriteTokenZeroTimeoutPolls             TestWriteTokenContext             TestWriteTokenNetDbAdaptersInheritOrigin             TestWriteTokenAfterClose || exit 1
 
+      - name: Witness roster — Go blob adapter registry (6)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label blob_registry_test --mode decl             --source blob_registry_test.go             TestBlobRegistryFilesystemRoundTrip             TestBlobRegistryDuplicateAndUnregister             TestBlobRegistryResolveUsesTheNamedAdapter             TestBlobRegistryRefusals             TestBlobRegistryRefusesEmbeddedNUL             TestABIStabilityBlobRegistryCodes || exit 1
+
       # === the Go org facade live cells ==
       # The run above EXECUTED these 6 live cells (3 shapes x {same-org,
       # granted}, call+serve live two-node with verified-caller attribution

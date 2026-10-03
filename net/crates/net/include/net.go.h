@@ -1795,6 +1795,39 @@ void net_blob_free_buffer(uint8_t* ptr, size_t len);
  * the encoded wire form, so this is the join between the two. */
 int net_blob_ref_hash(const uint8_t* encoded, size_t encoded_len, uint8_t* out_hash);
 
+/* ---- Process-wide blob adapter registry ----
+ *
+ * Adapters are addressed by id across the whole process. Error codes are
+ * the NET_ERR_BLOB_* band (-110..-120, src/ffi/blob.rs). Buffers written to
+ * the out-params are freed with net_blob_free_buffer; on error they are
+ * left at (NULL, 0). Null or non-UTF-8 strings return -2 (InvalidUtf8).
+ */
+
+/* Register a filesystem adapter rooted at `root` (accepts file: URIs; a blob
+ * is stored at <root>/<hash[0:2]>/<hash>). 0, or -111 for a duplicate id. */
+int net_blob_register_fs_adapter(const char* adapter_id, const char* root);
+
+/* 1 if an adapter was removed, 0 if none was registered under the id. */
+int net_blob_unregister_adapter(const char* adapter_id);
+
+/* 1 if the id is registered, 0 otherwise. */
+int net_blob_adapter_registered(const char* adapter_id);
+
+/* Store `data` through the adapter and write the encoded BlobRef. */
+int net_blob_publish(const char* adapter_id,
+                     const char* uri,
+                     const uint8_t* data,
+                     size_t data_len,
+                     uint8_t** out_payload,
+                     size_t* out_payload_len);
+
+/* Resolve an encoded BlobRef through the adapter to its content. */
+int net_blob_resolve(const char* adapter_id,
+                     const uint8_t* payload,
+                     size_t payload_len,
+                     uint8_t** out_content,
+                     size_t* out_content_len);
+
 net_mesh_blob_adapter_t* net_mesh_blob_adapter_new(
     net_redex_t* redex,
     const char* adapter_id,

@@ -3,13 +3,13 @@
 ## Status
 
 In progress, 2026-10-03. Targets the release after 0.39. Branch
-`LZL0/go-blobs`. Plan accepted for implementation at `e33ede5`. **S1–S4
-done 2026-10-03** (S1 `aaa797c`, S2 `bb775f6`, S3 `3773b36`; evidence under
-each slice). CI: S1's head ran green on every Go job, including the new
+`LZL0/go-blobs`. Plan accepted for implementation at `e33ede5`. **S1–S5
+done 2026-10-03** (S1 `aaa797c`, S2 `bb775f6`, S3 `3773b36`, S4 `ab12cff`;
+evidence under each slice). CI: S1's head ran green on every Go job, including the new
 `-race` step and its roster. Its one failure was the Firefox browser
 witness `stage5_a_refused_connect_closes_rtc_and_hands_back_its_attempt`
 (wasm leaf), which no Go change reaches and which also fails
-intermittently on `master` (run 36970267483). S5–S8 not started.
+intermittently on `master` (run 36970267483). S5b deferred (see S5b); S6–S8 not started.
 
 Reviewed twice before implementation (`d1b6f29`, then `317168c`). The first
 review accepted the direction and held on nine findings (R1–R9). The second
@@ -771,7 +771,62 @@ adapter-not-registered sentinel. A duplicate id fails with the duplicate-id
 sentinel. Resolving through the wrong adapter id fails without touching the
 right one. S5 doesn't depend on S5b.
 
+**Done locally, 2026-10-03.**
+
+- **Header closure.** The five non-callback registry functions are declared
+  in the blob section of `go/net.h` and `include/net.go.h` (pinned by
+  `TestHeaderParityWithCrateHeader`). `net_blob_register_callback_adapter`
+  stays undeclared until S5b.
+- **API** (`go/blob_registry.go`): `RegisterFilesystemBlobAdapter(id, root)`,
+  `UnregisterBlobAdapter(id) (bool, error)`, `BlobAdapterRegistered(id)`,
+  `BlobPublish(adapterID, uri, data)`, `BlobResolve(adapterID, ref)`.
+- **Errors.** Every `NET_ERR_BLOB_*` code maps to an `ErrBlob` sentinel:
+  `ErrBlobDecode`, `ErrBlobDuplicateID`, `ErrBlobNotRegistered` (both −112
+  and −119), `ErrBlobNotFound`, `ErrBlobHashMismatch`, `ErrBlobBackend`,
+  `ErrBlobUnsupportedScheme`, `ErrBlobUnauthorized`. Those codes exist only
+  as Rust `pub const`s, in no header, so `TestABIStabilityBlobRegistryCodes`
+  parses `src/ffi/blob.rs` and fails if a code gains no mapping.
+- **Binding-side refusal:** an id or URI containing a NUL byte is refused
+  with `ErrBlobInvalidArgument`. `C.CString` would otherwise truncate
+  `"a b"` to `"a"` and address a different adapter. This follows the
+  existing precedent in `go/mcp.go`.
+
+Found while writing the witnesses (behavior pinned, not changed):
+
+- `net_blob_resolve` returns any payload without the `BLOB_REF_MAGIC`
+  prefix **unchanged** (the documented "inline payloads round-trip").
+  Garbage is therefore not a decode error, and the test pins the
+  round-trip.
+- A ref with a few trailing bytes cut off still decodes. The URI is the
+  trailing field, so the cut ref names a shorter URI with the same hash, and
+  content is still verified against the hash. Decode errors start once the
+  cut reaches the fixed 40-byte body (the test uses `ref[:7]`).
+
+Evidence (Windows):
+
+- `go test -count=1 -run '^(TestBlobRegistry|TestABIStabilityBlobRegistry)' -v .`:
+  6/6 pass (`go/blob_registry_test.go`). Covers: the blob is on disk at
+  `<root>/<hash[0:2]>/<hash>` and resolves; duplicate id; unregister, then
+  resolve fails `ErrBlobNotRegistered`, and the id can be re-registered;
+  resolving through another adapter is `ErrBlobNotFound` and writes nothing
+  there; an unknown id is refused; `mesh:` on a filesystem adapter is
+  `ErrBlobUnsupportedScheme`; a tampered on-disk blob is
+  `ErrBlobHashMismatch`; NUL refusals; and the code pin.
+- `-race` (the existing `^TestBlob` filter covers these): ok. Full package:
+  ok.
+- Mutations, all killed: −112 unmapped (3 tests); NUL check removed;
+  unregister's result inverted; −114 mapped as backend (2 tests).
+- CI: "Witness roster — Go blob adapter registry (6)".
+
 ### S5b: callback blob adapters
+
+**Deferred, 2026-10-03.** The plan allows this: S5 stands without it. The
+design under "Decision: callback blob adapters" is unchanged and still
+owed: an additive owned-context registration with a release from the
+shared context's drop, plus `test-helpers` barriers for the
+unregister-while-held witnesses. That is native work (a new export, new
+test hooks) of the same size as S6, so it waits until S6's ABI table and
+export-baseline discipline are in practice.
 
 `RegisterBlobAdapter(id, BlobAdapter)`: a Go interface with `Store`, `Fetch`,
 `FetchRange` and `Exists`, registered through
