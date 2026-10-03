@@ -85,6 +85,10 @@ use crate::core::quote::PaymentQuote;
 use crate::policy::spend::{ApprovalOutcome, SpendDecision};
 use crate::policy::store::{load_json, mutate_json_if_changed, StoreError};
 
+// The JSON documents every language binding hands across for this
+// lifecycle (documented inside the module, so its links resolve there).
+pub mod json;
+
 /// How long a `Preparing` or `Paying` lease is honored before another
 /// caller may take it over. Two minutes: long enough that no live
 /// prepare round trip (or pay round trip whose payload never got

@@ -483,10 +483,17 @@ r2.2) depends only on A and is in scope for the same release.
 
 ### WS-A — Hoist the shared projection (D1)
 
-- [ ] `net_payments::flow::a2a::json` (feature `mesh`) + the `a2a_journal`
-  operator-JSON helpers in `net_sdk`, moved out of `python/src/a2a_paid.rs`
-  with their doc comments.
-- [ ] **First, before anything moves (r2, R5):**
+- [x] `net_payments::flow::a2a::json` (feature `mesh`), moved out of
+  `python/src/a2a_paid.rs` with their doc comments. **Deviation:** the
+  provider-side operator helpers (`owner_to_json` / `owner_from_json`,
+  `unresolved_json`, `resolve_admission`) and `parse_principal` went into the
+  same `net-payments` module, **not** `net_sdk::a2a_journal`. Every provider
+  verb that uses them hangs off `PaymentProvider`, which only exists with
+  `payments`, so a second home in the SDK would only have split one boundary
+  in two. One error type, `A2aBoundaryError { Invalid | Failed | Journal }`,
+  maps to Python's `ValueError` / `RuntimeError` / journal mapping exactly
+  as before.
+- [x] **First, before anything moves (r2, R5):**
   `bindings/python/tests/test_a2a_paid_config_compat.py`, written and green
   against today's code, pinning the input behaviors the unedited suite does
   not reach: an unused extra key holding a non-JSON value (`object()`) is
@@ -494,12 +501,28 @@ r2.2) depends only on A and is in scope for the same release.
   `description`; a non-dict service entry and a non-dict `bounds` are refused
   with today's messages; a wrong-typed field (string for a u64, negative, float)
   is refused with today's field-named message.
-- [ ] `python/src/a2a_paid.rs` reduced to dict plumbing (its catalog parser
+- [x] `python/src/a2a_paid.rs` reduced to dict plumbing (its catalog parser
   stays here, unchanged), the two callback bridges, and error mapping over the
-  shared functions.
-- [ ] Rust unit tests on the shared module for each envelope status and each
-  parser's refusal (these did not exist — the Python suite was the only
-  witness of the shapes).
+  shared functions (1,034 → ~490 lines; the wrappers keep their names and
+  signatures, so `capability_gateway.rs` / `payment_provider.rs` are
+  untouched).
+- [~] Rust unit tests on the shared module: **parsers done, envelopes not.**
+  7 tests cover every parser refusal, the owner round trip (incl. a u64 above
+  2⁵³ kept exactly), and the principal vocabulary. The per-status envelopes
+  need a live `A2aCallerFlow` + mesh, so they are witnessed by the Python
+  suites and the cross-binding fixture instead, not by a Rust unit test.
+- [x] **Cross-binding fixture captured before the move** (pulled forward from
+  WS-F): `bindings/python/tests/test_a2a_paid_cross_lang.py` writes / checks
+  `tests/cross_lang_a2a_paid/envelopes.json`, the shapes of 11 documents
+  (happy path + post-payment revocation), with per-run values masked by type.
+  **Defect found in the capture, fixed:** `unresolved_empty` was captured as
+  a `launched` row. A launched task stays in the provider's unresolved class
+  until the terminal hook writes its row, and that write lands *after* the
+  registry already reports `completed`. Waiting on task state was therefore
+  not enough (1 failure in 3 runs, then 2 in 12). The fixture now polls the
+  queue itself until it drains (0 failures in 20 runs). Only that one entry
+  was corrected by hand; the other ten are the pre-move capture. **The Node
+  suite must use the same poll.**
 
 **Proved by:** `tests/test_a2a_paid.py` green **unedited** and
 `test_a2a_paid_config_compat.py` green unedited across the move;
@@ -507,6 +530,22 @@ r2.2) depends only on A and is in scope for the same release.
 `cargo doc -p net-payments --no-deps --all-features` clean (the `--all-features`
 requirement in AGENTS.md); `cargo doc -p net-python` with the hand-maintained
 feature list clean.
+
+> **Status: WS-A landed 2026-10-03 (uncommitted at time of writing).**
+> Witnessed on a `maturin develop` build with `ci.yml:4152`'s feature list:
+> before the move, `test_a2a_paid.py` (27) + `test_a2a_paid_config_compat.py`
+> (16) = 43 passed. After it: those two plus `test_a2a_paid_cross_lang.py`,
+> `test_a2a_history_boundary.py` and `test_a2a.py` all pass (49 rows), with
+> no edits to any pre-existing test; the paid trio passed 20/20 consecutive
+> runs. `cargo test -p net-payments --features mesh --lib flow::a2a::json`:
+> 7 passed. Gates clean: `cargo clippy --all-features --lib --bins -D warnings`
+> and `--all-targets` (CI's `-A` set) on `net-payments`, the `ffi-clippy`
+> python entry (`--all-targets -D warnings`, `ci.yml:5076`), rustdoc
+> `-D warnings` for `net-payments --all-features` and `net-python`, and
+> rustfmt. One rustdoc defect was found and fixed: an outer `///` on
+> `pub mod json;` made rustdoc resolve the module's inner docs in the
+> parent's scope. No CI change is needed: the `python-tests` job runs the
+> whole `tests/` directory, and the new files pick up automatically.
 
 ### WS-B — Provider: `PaymentProvider.serveA2aConfigured` (`node/src/a2a_paid.rs`)
 
