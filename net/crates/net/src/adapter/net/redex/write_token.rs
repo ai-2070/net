@@ -52,8 +52,10 @@ use std::str::FromStr;
 /// Treat tokens as **opaque, in-process data**. They are not
 /// signed. The fields are `pub` so FFI / binding layers can
 /// marshal them; application code should not synthesise tokens.
-/// See module-level docs for the trust model — adapters reject a
-/// token from another origin or another channel at `wait_for_token`.
+/// See module-level docs for the trust model — origin-bound adapters
+/// (`TasksAdapter`, `MemoriesAdapter`) reject a token from another
+/// origin, and every adapter rejects one from another channel, at
+/// `wait_for_token`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct WriteToken {
     /// 64-bit hash of the entity whose chain this write landed on
