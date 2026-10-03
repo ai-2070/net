@@ -297,7 +297,10 @@ func (f *RedexFile) ReadRange(start, end uint64) ([]RedexEvent, error) {
 	// slice. Previous form (`C.GoStringN` + `[]byte(js)`) copied
 	// the payload twice — once into a Go string, then again into a
 	// fresh byte slice for `json.Unmarshal`.
-	payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+	payload, err := copyCBuf(unsafe.Pointer(out), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("read_range: %w", err)
+	}
 	var wire []redexEventWire
 	if err := json.Unmarshal(payload, &wire); err != nil {
 		return nil, fmt.Errorf("decode read_range: %w", err)
@@ -364,8 +367,12 @@ func (f *RedexFile) Tail(ctx context.Context, fromSeq uint64) (<-chan RedexEvent
 			code := C.net_redex_tail_next(cursor, 50, &out, &outLen)
 			switch code {
 			case 0:
-				payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+				payload, perr := copyCBuf(unsafe.Pointer(out), uint64(outLen))
 				C.net_free_string(out)
+				if perr != nil {
+					errs <- perr
+					return
+				}
 				var wire redexEventWire
 				if err := json.Unmarshal(payload, &wire); err != nil {
 					errs <- fmt.Errorf("decode tail event: %w", err)
@@ -575,7 +582,10 @@ func (t *TasksAdapter) List(filter *TasksFilter) ([]Task, error) {
 		return nil, err
 	}
 	defer C.net_free_string(out)
-	payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+	payload, err := copyCBuf(unsafe.Pointer(out), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
 	var tasks []Task
 	if err := json.Unmarshal(payload, &tasks); err != nil {
 		return nil, fmt.Errorf("decode list: %w", err)
@@ -620,7 +630,11 @@ func (t *TasksAdapter) SnapshotAndWatch(
 		return nil, nil, nil, err
 	}
 	defer C.net_free_string(snap)
-	snapPayload := C.GoBytes(unsafe.Pointer(snap), C.int(snapLen))
+	snapPayload, err := copyCBuf(unsafe.Pointer(snap), uint64(snapLen))
+	if err != nil {
+		C.net_tasks_watch_free(cursor)
+		return nil, nil, nil, fmt.Errorf("snapshot: %w", err)
+	}
 	var snapshot []Task
 	if err := json.Unmarshal(snapPayload, &snapshot); err != nil {
 		C.net_tasks_watch_free(cursor)
@@ -648,8 +662,12 @@ func pumpTasksWatch(ctx context.Context, cursor *C.net_tasks_watch_t) (<-chan []
 			code := C.net_tasks_watch_next(cursor, 50, &out, &outLen)
 			switch code {
 			case 0:
-				payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+				payload, perr := copyCBuf(unsafe.Pointer(out), uint64(outLen))
 				C.net_free_string(out)
+				if perr != nil {
+					errs <- perr
+					return
+				}
 				var batch []Task
 				if err := json.Unmarshal(payload, &batch); err != nil {
 					errs <- fmt.Errorf("decode watch batch: %w", err)
@@ -884,7 +902,10 @@ func (m *MemoriesAdapter) List(filter *MemoriesFilter) ([]Memory, error) {
 		return nil, err
 	}
 	defer C.net_free_string(out)
-	payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+	payload, err := copyCBuf(unsafe.Pointer(out), uint64(outLen))
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
 	var memories []Memory
 	if err := json.Unmarshal(payload, &memories); err != nil {
 		return nil, fmt.Errorf("decode list: %w", err)
@@ -918,7 +939,11 @@ func (m *MemoriesAdapter) SnapshotAndWatch(
 		return nil, nil, nil, err
 	}
 	defer C.net_free_string(snap)
-	snapPayload := C.GoBytes(unsafe.Pointer(snap), C.int(snapLen))
+	snapPayload, err := copyCBuf(unsafe.Pointer(snap), uint64(snapLen))
+	if err != nil {
+		C.net_memories_watch_free(cursor)
+		return nil, nil, nil, fmt.Errorf("snapshot: %w", err)
+	}
 	var snapshot []Memory
 	if err := json.Unmarshal(snapPayload, &snapshot); err != nil {
 		C.net_memories_watch_free(cursor)
@@ -946,8 +971,12 @@ func pumpMemoriesWatch(ctx context.Context, cursor *C.net_memories_watch_t) (<-c
 			code := C.net_memories_watch_next(cursor, 50, &out, &outLen)
 			switch code {
 			case 0:
-				payload := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+				payload, perr := copyCBuf(unsafe.Pointer(out), uint64(outLen))
 				C.net_free_string(out)
+				if perr != nil {
+					errs <- perr
+					return
+				}
 				var batch []Memory
 				if err := json.Unmarshal(payload, &batch); err != nil {
 					errs <- fmt.Errorf("decode watch batch: %w", err)

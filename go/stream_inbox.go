@@ -94,8 +94,12 @@ func (i *StreamInbox) Recv(timeout time.Duration) (*StreamData, error) {
 	}
 	var payload []byte
 	if buf != nil && length > 0 {
-		payload = C.GoBytes(unsafe.Pointer(buf), C.int(length))
+		p, perr := copyCBuf(unsafe.Pointer(buf), uint64(length))
 		C.net_free_bytes(buf, length)
+		if perr != nil {
+			return nil, perr
+		}
+		payload = p
 	}
 	return &StreamData{PeerNodeID: uint64(from), StreamID: i.streamID, Payload: payload}, nil
 }

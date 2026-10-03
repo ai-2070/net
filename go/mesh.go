@@ -515,7 +515,7 @@ func (m *MeshNode) PublicKey() (string, error) {
 		return "", err
 	}
 	defer C.net_free_string(out)
-	return C.GoStringN(out, C.int(outLen)), nil
+	return copyCString(unsafe.Pointer(out), uint64(outLen))
 }
 
 // NodeID returns this node's u64 id.
@@ -592,7 +592,7 @@ func (m *MeshNode) Accept(peerNodeID uint64) (string, error) {
 		return "", err
 	}
 	defer C.net_free_string(out)
-	return C.GoStringN(out, C.int(outLen)), nil
+	return copyCString(unsafe.Pointer(out), uint64(outLen))
 }
 
 // Start the receive loop, heartbeats, and router.
@@ -683,7 +683,7 @@ func (m *MeshNode) NatType() (string, error) {
 		return "", err
 	}
 	defer C.net_free_string(out)
-	return C.GoStringN(out, C.int(outLen)), nil
+	return copyCString(unsafe.Pointer(out), uint64(outLen))
 }
 
 // ReflexAddr returns this mesh's public-facing "ip:port" as
@@ -704,7 +704,7 @@ func (m *MeshNode) ReflexAddr() (string, error) {
 		return "", err
 	}
 	defer C.net_free_string(out)
-	return C.GoStringN(out, C.int(outLen)), nil
+	return copyCString(unsafe.Pointer(out), uint64(outLen))
 }
 
 // PeerNatType returns peerNodeID's NAT classification as
@@ -726,7 +726,7 @@ func (m *MeshNode) PeerNatType(peerNodeID uint64) (string, error) {
 		return "", err
 	}
 	defer C.net_free_string(out)
-	return C.GoStringN(out, C.int(outLen)), nil
+	return copyCString(unsafe.Pointer(out), uint64(outLen))
 }
 
 // ProbeReflex sends one reflex probe to peerNodeID and returns
@@ -750,7 +750,7 @@ func (m *MeshNode) ProbeReflex(peerNodeID uint64) (string, error) {
 		return "", err
 	}
 	defer C.net_free_string(out)
-	return C.GoStringN(out, C.int(outLen)), nil
+	return copyCString(unsafe.Pointer(out), uint64(outLen))
 }
 
 // ReclassifyNat explicitly re-runs the classification sweep.
@@ -1124,7 +1124,10 @@ func (m *MeshNode) StreamStats(peerNodeID, streamID uint64) (*StreamStats, error
 		return nil, err
 	}
 	defer C.net_free_string(out)
-	js := C.GoStringN(out, C.int(outLen))
+	js, err := copyCString(unsafe.Pointer(out), uint64(outLen))
+	if err != nil {
+		return nil, err
+	}
 	if js == "null" {
 		return nil, nil
 	}
@@ -1160,7 +1163,10 @@ func (m *MeshNode) RecvShard(shardID uint16, limit uint32) ([]RecvdEvent, error)
 		return nil, err
 	}
 	defer C.net_free_string(out)
-	js := C.GoStringN(out, C.int(outLen))
+	js, err := copyCString(unsafe.Pointer(out), uint64(outLen))
+	if err != nil {
+		return nil, err
+	}
 	var wire []recvEventWire
 	if err := json.Unmarshal([]byte(js), &wire); err != nil {
 		return nil, fmt.Errorf("decode recv_shard: %w", err)
@@ -1303,7 +1309,10 @@ func (m *MeshNode) Publish(channel string, payload []byte, cfg PublishConfig) (*
 		return nil, err
 	}
 	defer C.net_free_string(out)
-	js := C.GoStringN(out, C.int(outLen))
+	js, err := copyCString(unsafe.Pointer(out), uint64(outLen))
+	if err != nil {
+		return nil, err
+	}
 	var report PublishReport
 	if err := json.Unmarshal([]byte(js), &report); err != nil {
 		return nil, fmt.Errorf("decode publish report: %w", err)

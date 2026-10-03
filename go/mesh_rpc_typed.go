@@ -951,9 +951,9 @@ func rpcCallEventFromC(evt *C.RpcCallEventC) RpcCallEvent {
 	case C.uint8_t(C.NET_RPC_STATUS_ERROR_C):
 		msg := ""
 		if evt.status_message_ptr != nil && evt.status_message_len > 0 {
-			msg = string(C.GoBytes(
+			msg = string(cBytesOrEmpty(
 				unsafe.Pointer(evt.status_message_ptr),
-				C.int(evt.status_message_len),
+				uint64(evt.status_message_len),
 			))
 		}
 		status = RpcCallStatusError{Message: msg}
@@ -966,9 +966,9 @@ func rpcCallEventFromC(evt *C.RpcCallEventC) RpcCallEvent {
 	}
 	method := ""
 	if evt.method_ptr != nil && evt.method_len > 0 {
-		method = string(C.GoBytes(
+		method = string(cBytesOrEmpty(
 			unsafe.Pointer(evt.method_ptr),
-			C.int(evt.method_len),
+			uint64(evt.method_len),
 		))
 	}
 	direction := RpcDirectionOutbound
@@ -1114,8 +1114,11 @@ func MetricsSnapshot(t *TypedMeshRpc) (*RpcMetricsSnapshot, error) {
 	if outPtr == nil || outLen == 0 {
 		return &RpcMetricsSnapshot{Services: nil}, nil
 	}
-	bytes := C.GoBytes(unsafe.Pointer(outPtr), C.int(outLen))
+	bytes, cerr := copyCBuf(unsafe.Pointer(outPtr), uint64(outLen))
 	C.net_rpc_response_free(outPtr, outLen)
+	if cerr != nil {
+		return nil, &RpcError{Kind: RpcKindCodecDecode, Message: cerr.Error()}
+	}
 	var snap RpcMetricsSnapshot
 	if err := json.Unmarshal(bytes, &snap); err != nil {
 		return nil, &RpcError{Kind: RpcKindCodecDecode, Message: err.Error()}

@@ -283,8 +283,12 @@ func (it *MeshDbIter) Next() (MeshDbRow, error) {
 		// Copy payload into Go memory and free the substrate-side buffer.
 		var payload []byte
 		if payloadPtr != nil && payloadLen > 0 {
-			payload = C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen))
+			p, perr := copyCBuf(unsafe.Pointer(payloadPtr), uint64(payloadLen))
 			C.net_meshdb_payload_free(payloadPtr, payloadLen)
+			if perr != nil {
+				return MeshDbRow{}, fmt.Errorf("%w: %w", ErrMeshDb, perr)
+			}
+			payload = p
 		}
 		return MeshDbRow{
 			Origin:  uint64(origin),

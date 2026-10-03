@@ -53,3 +53,33 @@ func copyCBuf(p unsafe.Pointer, n uint64) ([]byte, error) {
 	copy(out, unsafe.Slice((*byte)(p), l))
 	return out, nil
 }
+
+// copyCString is copyCBuf for text: the same length rule, returned as a Go
+// string (one copy). It replaces `C.GoStringN(p, C.int(n))`, which narrows
+// the length exactly as `C.GoBytes` does.
+func copyCString(p unsafe.Pointer, n uint64) (string, error) {
+	l, err := checkedLen(n)
+	if err != nil {
+		return "", err
+	}
+	if l == 0 {
+		return "", nil
+	}
+	if p == nil {
+		return "", fmt.Errorf("%w: null pointer with length %d", errCBuf, l)
+	}
+	return string(unsafe.Slice((*byte)(p), l)), nil
+}
+
+// cBytesOrEmpty is copyCBuf for the few call sites that cannot return an
+// error (cgo callbacks, event conversions). The length still never passes
+// through C.int. The only refusals are a length above math.MaxInt, which on
+// a 64-bit host no allocation can have, and (nil, n>0); both yield an empty
+// slice rather than a crash inside a callback.
+func cBytesOrEmpty(p unsafe.Pointer, n uint64) []byte {
+	b, err := copyCBuf(p, n)
+	if err != nil {
+		return []byte{}
+	}
+	return b
+}

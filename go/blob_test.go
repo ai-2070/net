@@ -15,6 +15,7 @@ import (
 	"errors"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -102,16 +103,32 @@ func TestBlobCopyCBuf(t *testing.T) {
 	}
 }
 
-// Every blob buffer copy goes through copyCBuf. A reintroduced
-// `C.GoBytes(…, C.int(n))` would compile and pass every functional test
-// below with small payloads, so it is pinned at the source.
+// No C buffer copy in the module narrows its length through C.int.
+// `C.GoBytes(…, C.int(n))` and `C.GoStringN(…, C.int(n))` would compile
+// and pass every functional test with small payloads, so they are pinned at
+// the source: every non-test file, comment lines excepted.
 func TestBlobSourceHasNoGoBytes(t *testing.T) {
-	src, err := os.ReadFile("blob.go")
+	files, err := filepath.Glob("*.go")
 	if err != nil {
-		t.Fatalf("read blob.go: %v", err)
+		t.Fatal(err)
 	}
-	if strings.Contains(string(src), "C.GoBytes(") {
-		t.Fatal("blob.go calls C.GoBytes; use copyCBuf (C.GoBytes truncates lengths through C.int)")
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for i, line := range strings.Split(string(src), "\n") {
+			code := strings.TrimSpace(line)
+			if strings.HasPrefix(code, "//") {
+				continue
+			}
+			if strings.Contains(code, "C.GoBytes(") || strings.Contains(code, "C.GoStringN(") {
+				t.Errorf("%s:%d narrows a C length through C.int; use copyCBuf / copyCString / cBytesOrEmpty (cbuf.go)", f, i+1)
+			}
+		}
 	}
 }
 
@@ -555,5 +572,28 @@ func TestBlobTwoNodeFetch(t *testing.T) {
 		if _, err := b.FetchBlob(a.NodeID(), make([]byte, n)); !errors.Is(err, ErrTransferInvalidArgument) {
 			t.Fatalf("FetchBlob with a %d-byte hash: want ErrTransferInvalidArgument, got %v", n, err)
 		}
+	}
+}
+
+func TestBlobCopyCStringAndOrEmpty(t *testing.T) {
+	if s, err := copyCString(nil, 0); err != nil || s != "" {
+		t.Fatalf("copyCString(nil, 0) = %q, %v", s, err)
+	}
+	if _, err := copyCString(nil, 3); !errors.Is(err, errCBuf) {
+		t.Fatalf("copyCString(nil, 3): want errCBuf, got %v", err)
+	}
+	if _, err := copyCString(nil, math.MaxUint64); !errors.Is(err, errCBuf) {
+		t.Fatalf("copyCString(nil, MaxUint64): want errCBuf, got %v", err)
+	}
+	src := []byte("na\x00me") // an embedded NUL must survive (GoString would stop)
+	got, err := copyCString(unsafe.Pointer(&src[0]), uint64(len(src)))
+	if err != nil || got != "na\x00me" {
+		t.Fatalf("copyCString = %q, %v", got, err)
+	}
+	if b := cBytesOrEmpty(nil, 5); b == nil || len(b) != 0 {
+		t.Fatalf("cBytesOrEmpty(nil, 5) = %v, want empty non-nil", b)
+	}
+	if b := cBytesOrEmpty(unsafe.Pointer(&src[0]), 2); string(b) != "na" {
+		t.Fatalf("cBytesOrEmpty = %q", b)
 	}
 }

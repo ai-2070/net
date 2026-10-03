@@ -186,8 +186,7 @@ func (db *NetDb) Snapshot() ([]byte, error) {
 	// Defensively free the substrate-side buffer regardless of how
 	// we exit — Go-side copy below survives.
 	defer C.net_netdb_free_bundle(bytes, n)
-	out := C.GoBytes(unsafe.Pointer(bytes), C.int(n))
-	return out, nil
+	return copyCBuf(unsafe.Pointer(bytes), uint64(n))
 }
 
 // Close closes every enabled adapter on the NetDb. The underlying

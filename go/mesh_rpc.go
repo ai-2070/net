@@ -358,7 +358,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"runtime"
 	"runtime/cgo"
@@ -556,10 +555,12 @@ func goBytesChecked(ptr *C.uint8_t, length C.size_t) ([]byte, bool) {
 	if length == 0 || ptr == nil {
 		return nil, true
 	}
-	if uint64(length) > uint64(math.MaxInt) {
+	// The same length rule as copyCBuf (cbuf.go), kept in one place.
+	l, err := checkedLen(uint64(length))
+	if err != nil {
 		return nil, false
 	}
-	view := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), int(length))
+	view := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), l)
 	return bytes.Clone(view), true
 }
 
