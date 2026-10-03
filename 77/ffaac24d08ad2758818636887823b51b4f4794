@@ -1,0 +1,31 @@
+go/blob_describe_vectors_test.go
+  s_391b90f341d6c6::t_298a265f65c4f6 1-169
+.github/workflows/ci.yml
+  s_391b90f341d6c6::t_3c67e0a4f4c9f5 4955
+  s_391b90f341d6c6::t_71b3d42a723ddc 4939
+  s_391b90f341d6c6::t_d0869e99629240 4882-4892,4898-4906,4912-4920,4926-4933,4943-4944,4946-4954
+  s_391b90f341d6c6::t_fba992b64c5a17 4387-4410
+  s_391b90f341d6c6::t_a42f2527dee0e8 4945
+net/crates/net/bindings/python/tests/test_cross_lang_blob_describe.py
+  s_391b90f341d6c6::t_690fb64350fb19 1-80
+docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md
+  s_391b90f341d6c6::t_af4112b6b70041 8,15,1016-1046
+net/crates/net/tests/cross_lang_blob/describe_vectors.json
+  s_391b90f341d6c6::t_03b2c8be9e709e 1-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "77ffaac24d08ad2758818636887823b51b4f4794",
+  "prompts": {},
+  "sessions": {
+    "s_391b90f341d6c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e008671-9702-4db4-b22a-abb85b691773",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
