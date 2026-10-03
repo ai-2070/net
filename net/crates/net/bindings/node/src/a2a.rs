@@ -144,7 +144,7 @@ impl NetMesh {
         let node = self.node_arc_clone()?;
         let mesh = mesh_over(node, None);
         #[cfg(feature = "org")]
-        mesh.set_a2a_org_caller(self.a2a_org_caller_slot().lock().clone());
+        mesh.set_a2a_org_caller(self.a2a_org_caller_slot().lock().client());
         Ok(mesh)
     }
 }
@@ -640,7 +640,7 @@ impl NetMesh {
             })?),
             None => None,
         };
-        *self.a2a_org_caller_slot().lock() = installed;
+        self.a2a_org_caller_slot().lock().install(installed);
         Ok(())
     }
 }

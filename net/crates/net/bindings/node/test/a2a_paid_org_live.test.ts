@@ -263,6 +263,16 @@ describe.skipIf(!HAS)('paid a2a — org-admitted principal, live (WS-F, R6)', ()
       const still = await converge(providerMesh, callerMesh, async () => callerMesh.describeA2a(target))
       expect(JSON.parse(still)[0].service_id).toBe(SERVICE)
 
+      // PR review (cubic): that restore must not undo a clear issued while
+      // the refused shutdown was still draining (the slot is empty either
+      // way; only the clear is the caller's intent). 50 ms lands inside the
+      // drain window, after shutdown has released the identity.
+      const refused = callerMesh.shutdown()
+      await sleep(50)
+      callerMesh.setA2aOrgCaller(null)
+      await expect(refused).rejects.toThrow(/outstanding references/)
+      await expect(callerMesh.describeA2a(target)).rejects.toThrow()
+
       handle.stop()
       provider.close()
       gateway.close()
