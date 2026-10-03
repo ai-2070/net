@@ -1,0 +1,58 @@
+.claude/skills/net-event-bus/a2a.md
+  s_36e6a9decc3647::t_9419151de74727 265-270
+net/crates/net/bindings/node/src/a2a.rs
+  s_36e6a9decc3647::t_0be78cce74a037 329,332-336
+  s_36e6a9decc3647::t_5eb8707041c481 337
+net/crates/net/payments/src/flow/a2a/json.rs
+  s_36e6a9decc3647::t_f8e026a20528f0 552-554,558
+net/crates/net/sdk-ts/src/consent.ts
+  s_36e6a9decc3647::t_170b42ee03a3d5 18-19
+net/crates/net/sdk-py/examples/paid_a2a_consumer.py
+  s_36e6a9decc3647::t_65cd9af15fc70e 42,464-480
+net/crates/net/bindings/node/src/capability_gateway.rs
+  s_36e6a9decc3647::t_0be78cce74a037 684-690
+net/crates/net/bindings/node/src/payment_provider.rs
+  s_36e6a9decc3647::t_0be78cce74a037 329-333,451,468-473,648-671,698-706,743-757
+net/crates/net/bindings/node/test/a2a_paid_org_live.test.ts
+  s_36e6a9decc3647::t_29c7204263225c 136-140,145,149-151,252-265,275-279
+net/crates/net/bindings/node/test/errors.test.ts
+  s_36e6a9decc3647::t_fc9c7a9e354564 8-15,146-147
+net/crates/net/sdk-ts/test/paid_a2a.test.ts
+  s_36e6a9decc3647::t_a797eb3b16fec8 102-107,110-131,162-164,168-178
+net/crates/net/sdk-py/src/net_sdk/payments.py
+  s_36e6a9decc3647::t_170b42ee03a3d5 146-151,154
+net/crates/net/bindings/node/test/a2a_paid.test.ts
+  s_36e6a9decc3647::t_da27d44b6709b2 532
+  s_36e6a9decc3647::t_61d070987e74fd 286-290,298
+  s_36e6a9decc3647::t_021a216355b3d0 533-540
+  s_36e6a9decc3647::t_205bdd062972ab 281,292,297,308-347,351
+net/crates/net/sdk-py/tests/test_paid_a2a_sdk.py
+  s_36e6a9decc3647::t_65cd9af15fc70e 170-181
+net/crates/net/sdk-ts/test/mesh_node_surface.test.ts
+  s_36e6a9decc3647::t_a797eb3b16fec8 108-123
+docs/internal/plans/NODE_A2A_PAID_ADMISSION_PLAN.md
+  s_36e6a9decc3647::t_9419151de74727 517,525,736-737,739,743,751,756,838,859,927,935,947,959,1033,1045,1048,1056,1072,1077
+net/crates/net/bindings/node/src/a2a_paid.rs
+  s_36e6a9decc3647::t_0be78cce74a037 376-378,380-381
+  s_36e6a9decc3647::t_6798a25352c114 24-27
+net/crates/net/bindings/node/src/lib.rs
+  s_36e6a9decc3647::t_0be78cce74a037 2633-2637
+net/crates/net/sdk-ts/src/_internal.ts
+  s_36e6a9decc3647::t_170b42ee03a3d5 98-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "711ac46fbc8e09f8c8a5f767ca9189aff10369d0",
+  "prompts": {},
+  "sessions": {
+    "s_36e6a9decc3647": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "46b7ea03-5ec0-4fb4-8bef-0e4bfe61231c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
