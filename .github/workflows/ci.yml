@@ -4854,7 +4854,7 @@ jobs:
 
       # Pins the blob witnesses the two runs above execute: lexical
       # name-existence, fail-closed.
-      - name: Witness roster — Go blob binding (14)
+      - name: Witness roster — Go blob binding (15)
         working-directory: go
         run: |
           set -uo pipefail
@@ -4862,6 +4862,7 @@ jobs:
             --source blob_test.go \
             TestBlobCheckedLenBoundaries \
             TestBlobCopyCBuf \
+            TestBlobCopyCStringAndOrEmpty \
             TestBlobSourceHasNoGoBytes \
             TestBlobPublishFetchRoundTrip \
             TestBlobExistsAndStoreOnIndependentAdapter \

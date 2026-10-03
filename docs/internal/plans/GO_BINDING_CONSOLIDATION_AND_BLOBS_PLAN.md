@@ -791,7 +791,7 @@ right one. S5 doesn't depend on S5b.
   parses `src/ffi/blob.rs` and fails if a code gains no mapping.
 - **Binding-side refusal:** an id or URI containing a NUL byte is refused
   with `ErrBlobInvalidArgument`. `C.CString` would otherwise truncate
-  `"a b"` to `"a"` and address a different adapter. This follows the
+  `"a\x00b"` to `"a"` and address a different adapter. This follows the
   existing precedent in `go/mcp.go`.
 
 Found while writing the witnesses (behavior pinned, not changed):
@@ -1246,12 +1246,32 @@ Evidence (Windows):
 
 ## Defects found on the way
 
-- **`C.GoBytes` length truncation, outside blobs (deferred).** 21 call sites
-  across `go/cortex.go`, `go/mesh_rpc.go`, `go/mesh_rpc_typed.go`,
-  `go/tool.go` and others pass `C.int(n)` for a `size_t` length. Each is
-  reachable only if that path can return more than 2 GiB, which most core
-  limits prevent, but the pattern is wrong in general. Fix: move them onto
-  `copyCBuf` in a follow-up. The blob sites are fixed in S1.
+- **`C.GoBytes` / `C.GoStringN` length truncation across `go/` (fixed,
+  2026-10-03, `0634fd9`, after PR #1165 opened).** The count was larger
+  than first recorded: 21 `C.GoBytes(…, C.int(n))` plus 14
+  `C.GoStringN(…, C.int(n))` sites, in cortex, capabilities, mesh, nRPC,
+  tool, meshdb, netdb, stream inbox, identity and the compute factory
+  callback. All now copy through `copyCBuf` / `copyCString`.
+  - Error-returning functions surface a refused length as an error.
+  - The five sites that can't return one (two cgo callbacks, two pump
+    goroutines, `consumeBytes`) use `cBytesOrEmpty`. Its only refusal is a
+    length above `math.MaxInt`, which no real allocation has on 64-bit.
+  - `mesh_rpc.go` already had a correct `goBytesChecked`, which predates
+    S1 (S1 should have reused it). It now shares `checkedLen`, so the
+    length rule exists once.
+  - `TestBlobSourceHasNoGoBytes` now scans every non-test file. Mutation:
+    restoring one `C.GoStringN(…, C.int(n))` in `mesh.go` fails it by file
+    and line.
+  - `TestBlobCopyCStringAndOrEmpty` covers the new helpers, including an
+    embedded NUL surviving the copy.
+  - Evidence: the full package passes untagged and with `test_helpers`;
+    `-race` passes over the blob, transfer, RedEX, token, nRPC, tool,
+    cortex and mesh families.
+- **A NUL byte in this plan (fixed).** S5's evidence text quoted the escape
+  `"a\x00b"`, and a shell heredoc turned it into a real NUL byte, so `grep`
+  treated this file as binary from `6e7f8e7` on. It's now the literal
+  escape again, and no other tracked text file contains a NUL. The same
+  heredoc backslash handling is what collapsed the S2–S6 CI roster steps.
 - **Duplicate error code −120 (deferred, not ours).**
   `NET_ERR_BLOB_UNAUTHORIZED = -120` (`src/ffi/blob.rs:99`) and
   `NET_ERR_IDENTITY = -120` (`src/ffi/mesh.rs:109`). A caller that maps codes
