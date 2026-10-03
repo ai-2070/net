@@ -91,19 +91,18 @@ is exposed as methods on the binding's `Redex` handle.
                   replication_heartbeat_ms=500)
   # or replication_placement="pinned", replication_pinned_nodes=[a, b, c]
   ```
-- **Go** (cgo wrapper at `bindings/go/net/redex.go`):
+- **Go** (`go/redex_dataforts.go`, module `github.com/ai-2070/net/go`):
   ```go
-  redex.EnableReplication(meshArcPtr)
+  redex.EnableReplication(mesh) // *net.MeshNode; the binding manages the Arc
   redex.OpenFile("my/channel", &net.RedexFileConfig{
-      Replication: &net.ReplicationConfig{
+      Replication: &net.RedexReplicationConfig{
           Factor: 3, HeartbeatMs: 500,
       },
   })
   ```
 - **C/FFI**: the `libnet` cdylib exports `net_redex_*` symbols
-  directly. See `bindings/go/net/redex.go`'s cgo header block for
-  the canonical extern signatures; non-Go consumers wire to the
-  same symbols. Config rides as a JSON string through
+  directly, declared in `include/net_cortex.h`; non-Go consumers
+  wire to the same symbols. Config rides as a JSON string through
   `net_redex_open_file` to keep the C surface narrow.
 
 ## `ReplicationConfig` fields

@@ -12,7 +12,7 @@
 //     PublishLog / PublishCapabilities / Metadata / RefreshMetadata /
 //     GracefulShutdown / ControlEvents (channel + context.Context).
 //
-// Port of the reference impl at net/crates/net/bindings/go/net/meshos.go.
+// Ported from the old reference binding (removed; `git show 610cd4e:net/crates/net/bindings/go/net/meshos.go`).
 // Same C ABI, same callback model. Build prerequisite: `cargo build
 // --release -p net-ffi` — `bindings/go/meshos-ffi` is an rlib linked into
 // that library and emits nothing of its own.

@@ -1409,7 +1409,7 @@ int                     net_compute_set_daemon_caps_dispatcher(
  * `{"node_id": uint64, "tags": [string], "metadata": map}`
  * — keeps the C ABI tight (one byte buffer per call) at the
  * cost of a per-call serde roundtrip on the consumer side. The
- * Go binding's reference impl (`bindings/go/net/placement.go`)
+ * removed Go reference impl (S7 ledger, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md)
  * decodes inside the trampoline before invoking the user
  * predicate; non-Go consumers parse the JSON the same way. The
  * filter id and JSON buffers are owned by Rust for the call's

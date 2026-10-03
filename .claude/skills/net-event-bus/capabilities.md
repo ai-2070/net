@@ -236,11 +236,10 @@ example across languages:
 Two availability traps the tables above would otherwise hide:
 
 - **Go has no predicate surface in the published module.** `github.com/ai-2070/net/go`
-  ships none of this. A `predBuilder` with `Exists` / `Equals` / `NumericAtLeast`
-  exists at `net/crates/net/bindings/go/net/capability.go`, but that tree carries
-  no `go.mod` — it is a *reference* binding (the phrasing `go/meshdb.go` uses for
-  its own richer surface), not something a Go user can import. Use the
-  `net-where:` header from another language, or filter server-side.
+  ships none of this. (A `predBuilder` once existed in an uncompiled Go
+  reference tree, since removed; its source stays in git history at commit
+  `610cd4e`.) Use the `net-where:` header from another language, or filter
+  server-side.
 - **The C predicate functions are declared in `include/net.go.h`, not `net.h`.**
   Those are two separate headers — neither includes the other, and `net.h` is the
   one this skill tells C users to `#include`. `net_predicate_evaluate`,

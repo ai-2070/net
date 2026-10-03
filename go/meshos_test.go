@@ -125,8 +125,8 @@ func TestRegisterDaemonRejectsBadSeed(t *testing.T) {
 	s = &MeshOsDaemonSdk{} // ptr is nil, but the test below hits the
 	// ptr==nil branch before the length check; we need a non-nil
 	// pointer for the seed-length check to execute. Skip if we can't
-	// construct one without crossing FFI; the bindings/go/net test
-	// covers this path.
+	// construct one without crossing FFI; the live integration tests
+	// cover this path.
 	_ = s
 }
 
@@ -141,7 +141,7 @@ func TestRegisterDaemonWithCallbacksRejectsBadInputs(t *testing.T) {
 	// In practice this requires the cdylib to actually start the
 	// SDK; testing it pure-Go-side without a built cdylib means
 	// stubbing. Skip the SDK-pointer-required tests.
-	t.Skip("RegisterDaemonWithCallbacks input validation depends on a live SDK ptr; covered by the live integration suite in bindings/go/net")
+	t.Skip("RegisterDaemonWithCallbacks input validation depends on a live SDK ptr; covered by the live integration suite")
 }
 
 // TestMeshosControlFromC sanity-checks the C → Go projection.

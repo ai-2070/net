@@ -19,11 +19,8 @@ operation works; they are not a coverage record.
 | Go | `github.com/ai-2070/net/go` | `net` | `go/` |
 | C | — (link `libnet`) | `net.h` and friends | `net/crates/net/include/` |
 
-**The Go row means the shipped module only.** A second Go tree exists at
-`net/crates/net/bindings/go/net/` — a reference implementation with no `go.mod`,
-meant to be vendored or copied into your own module. It covers surfaces the
-shipped module does not. Nothing below describes it; if a cell says `not
-exposed`, check there before concluding the work has not been done.
+**The Go row is the shipped module, and it is the only Go tree.** An older, uncompiled Go reference tree (no `go.mod`) used to sit beside the Rust FFI crates; it was removed. What it had either ships in `go/` now or is not available from Go, and its source stays in git history at commit `610cd4e`.
+A Go cell that says `not exposed` means exactly that.
 
 ### C is eleven headers over one library, not one SDK
 
@@ -175,10 +172,12 @@ could perfectly well have a C ABI — it does not have one *yet*, which is exact
 why this is `not exposed` and not `n/a`.
 
 **Go blobs are `partial`.** `MeshBlobAdapter` covers `Store` / `Fetch` /
-`Exists` and the overflow controls, which is enough to put bytes in and get them
-back. What is missing is the discovery-driven path — no equivalent of
-`fetch_blob_discovered`, so Go cannot fetch a blob it has only a reference to
-without knowing who holds it.
+`Exists` / `Publish`, the overflow controls, trees (`StoreTree` with Replicated or
+Reed-Solomon encoding, `FetchRange`, `RepairBlob`, the tree-node cache) and
+`DescribeBlobRef`; `MeshNode` has `FetchBlob`, `FetchBlobDiscovered` and directory
+transfer (`StoreDir` / `FetchDir` / `DirManifestRead`); the process-wide registry
+takes filesystem adapters. What is missing is a **Go-implemented adapter**: Python
+and Node can register a blob adapter written in the host language, Go cannot yet.
 
 **Two rows are called "channels" and they are different mechanisms.**
 *Tagged EventBus topics* (`node.channel("name")`) tag a locally-ingested event

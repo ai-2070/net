@@ -744,7 +744,7 @@ async fn subnet_local_provider_is_not_visible_cross_subnet_via_relay() {
 // Regression coverage lives in the language test suites:
 //   - TypeScript: `sdk-ts/test/capabilities.test.ts`
 //   - Python:     `bindings/python/tests/test_capabilities.py`
-//   - Go:         `bindings/go/net/capabilities_test.go`
+//   - Go:         `go/capabilities_test.go`
 //
 // (Go transitively covers the C ABI since it consumes the same
 // `net_mesh_find_nodes_scoped` symbol.)

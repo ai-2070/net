@@ -9,18 +9,12 @@ is only what is Go-specific.
 import "github.com/ai-2070/net/go"
 ```
 
-**Two Go trees exist and they are not the same thing.**
-
-| Tree | What it is |
-|---|---|
-| `go/` | The shipped module, `github.com/ai-2070/net/go`. This is what `go get` gives you. |
-| `net/crates/net/bindings/go/net/` | A reference implementation with **no `go.mod`**, meant to be vendored or copied into your own module. |
-
-The reference tree covers some surfaces the shipped module does not — the
-resilience helpers (`RetryPolicy`, `CallWithRetry`, `HedgePolicy`,
-`CallWithHedge`, `CircuitBreaker`) are there and **not** in the shipped module.
-`go get` will not bring them. Everything on this page describes the shipped
-module unless it says otherwise.
+**There is one Go tree: `go/`**, the module `github.com/ai-2070/net/go`, which
+is what `go get` gives you. An older, uncompiled Go reference tree (no `go.mod`) used to sit beside the Rust FFI crates; it was removed. What it had either ships in `go/` now or is not available from Go, and its source stays in git history at commit `610cd4e`. Surfaces that were only in the reference
+tree and are not yet in the module — the resilience helpers (`RetryPolicy`,
+`CallWithRetry`, `HedgePolicy`, `CallWithHedge`, `CircuitBreaker`), the capability
+predicate and placement builders, Deck ICE / audit / log streams, and the richer
+MeshDB operators — are not available from Go.
 
 Go is cgo: it links against the Rust cdylibs. A build needs those built first,
 which is why CI type-checks the example with `go vet` rather than `go build`.

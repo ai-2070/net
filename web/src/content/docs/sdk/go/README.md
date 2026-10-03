@@ -57,5 +57,5 @@ Subnet **trust anchors** are construction-time state on `MeshConfig`:
 every other SDK uses, before the node exists, so a standalone Go program can
 stand up a subnet *gateway* on its own.
 
-The [Artifacts](/docs/sdk/go/artifacts) page records the current cross-peer transfer
-gap rather than substituting another language's API.
+The [Artifacts](/docs/sdk/go/artifacts) page covers cross-peer blob and directory
+transfer, trees with erasure coding, range reads and repair.

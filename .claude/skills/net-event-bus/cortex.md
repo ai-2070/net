@@ -165,32 +165,32 @@ await tasks.close();
 ```go
 import "github.com/ai-2070/net/go"
 
-redex := net.NewRedex(net.RedexConfig{PersistentDir: "/var/lib/net/redex"})
-defer redex.Close()
+redex := net.NewRedex("/var/lib/net/redex") // "" for heap-only
+defer redex.Free()
 
 tasks, err := net.OpenTasks(redex, /*originHash*/ uint64(0xDEADBEEF), /*persistent*/ true)
 if err != nil { /* … */ }
 defer tasks.Close()
 
-result, _ := tasks.Create(1, "first", uint64(time.Now().UnixNano()))
+seq, _ := tasks.Create(1, "first", uint64(time.Now().UnixNano())) // CRUD returns the seq
 tasks.Complete(1, uint64(time.Now().UnixNano()))
 
-state, _ := tasks.State()       // snapshot
-// state.FindMany(...) — depends on the adapter's query method shape
-
-// RYW
-if err := tasks.WaitForToken(result.Token, 250*time.Millisecond); err != nil { /* … */ }
-// PollForToken — non-blocking
-if err := tasks.PollForToken(result.Token); err != nil { /* … */ }
-// Context-aware variant (see the cancellation caveat below)
+// RYW: Token(seq) names the write by this adapter's origin + seq
+if err := tasks.WaitForToken(tasks.Token(seq), 250*time.Millisecond); err != nil { /* … */ }
+// timeout 0 = non-blocking poll (unlike WaitForSeq, where 0 waits forever)
+if err := tasks.WaitForToken(tasks.Token(seq), 0); err != nil { /* net.ErrTokenTimeout if not yet applied */ }
+// Context-aware variant
 ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 defer cancel()
-if err := tasks.WaitForTokenContext(ctx, result.Token); err != nil { /* … */ }
+if err := tasks.WaitForTokenContext(ctx, tasks.Token(seq)); err != nil { /* … */ }
+
+all, _ := tasks.List(nil) // includes task 1 once its token was applied
 ```
 
 **Key facts:**
-- `WaitForToken(token, timeout)` blocks the calling goroutine; `PollForToken(token)` is a non-blocking applied-vs-token check.
-- `WaitForTokenContext(ctx, token)` accepts a Go `context.Context`, but **context cancellation isn't propagated into the FFI wait** — the FFI's blocking call continues until the underlying deadline expires. Use it for ergonomics, not for sub-deadline cancellation.
+- `WaitForToken(token, timeout)` blocks the calling goroutine; a zero timeout is a non-blocking applied-vs-token check (`ErrTokenTimeout` if not yet applied).
+- `WaitForTokenContext(ctx, token)` checks `ctx` before every native wait and waits in slices of at most 50 ms, so cancellation is noticed within one slice, and a context that is already done returns its error even for an applied token.
+- The origin check is on the **origin hash**, not the adapter object: another adapter opened with the same origin accepts the token, but only once its own fold has applied that seq. A different origin is `ErrWrongOrigin`.
 
 ## C
 

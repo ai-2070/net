@@ -8,10 +8,11 @@
 // This file covers the operator-side admin + status surface (slice 1):
 // client lifecycle, all 9 AdminCommands verbs, one-shot status reads,
 // and live snapshot + status-summary streams. The richer slice 2 (log
-// + failure + audit streams) and slice 3 (ICE break-glass) lives in
-// the reference Go binding at
-// `net/crates/net/bindings/go/net/deck.go`; extend this file as you
-// need additional surfaces.
+// + failure + audit streams) and slice 3 (ICE break-glass) are not in
+// the Go module yet. The old uncompiled reference binding sketched them;
+// it was removed, and its signatures are kept in the S7 ledger of
+// docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md (source: `git show 610cd4e:net/crates/net/bindings/go/net/deck.go`).
+// Extend this file as you need additional surfaces.
 //
 // # Example
 //

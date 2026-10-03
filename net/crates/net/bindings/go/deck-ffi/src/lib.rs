@@ -1,6 +1,6 @@
 //! C ABI for the Deck SDK — operator-side bindings.
 //!
-//! Consumed by the Go binding at `bindings/go/net/deck.go` and by
+//! Consumed by the Go binding at `go/deck.go` and by
 //! the C SDK header at `include/net_deck.h` (Phase 7).
 //!
 //! # Scope (slice 1)

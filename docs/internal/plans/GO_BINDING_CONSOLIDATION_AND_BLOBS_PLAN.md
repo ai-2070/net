@@ -11,7 +11,8 @@ cross-language fixture. CI: S1's head ran green on every Go job, including the n
 witness `stage5_a_refused_connect_closes_rtc_and_hands_back_its_attempt`
 (wasm leaf), which no Go change reaches and which also fails
 intermittently on `master` (run 36970267483). S5b deferred (see S5b); S7 done (classification and ledger; the large
-ports are deferred, see S7); S8 not started.
+ports are deferred, see S7); S8 done (full deletion, by the user's decision;
+see S8). Owed: the S6 cross-language fixture and the release notes.
 
 Reviewed twice before implementation (`d1b6f29`, then `317168c`). The first
 review accepted the direction and held on nine findings (R1–R9). The second
@@ -1094,6 +1095,75 @@ version (mirrored with `npm run sync:releases`).
 **Proves it:** `grep -rn "bindings/go/net/" --include=*.go --include=*.md`
 returns only historical plan text. `go test ./...`, the `-race` step and the
 CI Go job are green.
+
+**Done, 2026-10-03: full deletion, as decided.** Before deleting, the
+reference turned out to be load-bearing documentation: the skill pages told
+Go users to vendor `resilience.go`, `capability.go` and the reference
+`mesh_rpc.go`, and several of those are surfaces S7 deferred. Three options
+were put to the user: partial delete (keep the files of deferred surfaces),
+full delete, or hold S8 until the ports land. The user chose **full delete
+per plan**. Consequence, stated plainly: the resilience helpers, the
+capability predicate and placement builders, Deck ICE / audit / log streams,
+the richer MeshDB operators, placement filters and the MeshOS vtable path
+are **not available from Go** until their own plans port them. Their designs
+are in the S7 ledger, and their source is retrievable from git at `610cd4e`.
+
+What changed:
+
+- `net/crates/net/bindings/go/net/` removed (21 files).
+- Code and comments repointed: `go/deck.go`, `go/meshdb.go`,
+  `go/meshos.go`, `go/meshos_test.go`, `go/net.h` / `include/net.go.h`
+  (a placement comment), `include/net.h`, three `*-ffi` crate docs,
+  `compute-ffi/Cargo.toml`, `src/ffi/mod.rs` (two doc comments, and the
+  CR-22 test's failure message, which named a header that no longer
+  exists), `src/ffi/predicate.rs`, and two `tests/*.rs` comments. The two
+  `cross_lang_tool_formats` fixtures' description text now names
+  `go/tool.go` (descriptions only; nothing hashes or byte-pins those files).
+- User-facing docs:
+  - Skills (`bindings/coverage.md`, `bindings/go.md`, `capabilities.md`,
+    `nrpc.md`, `patterns.md`) say there is one Go tree, and stop pointing
+    at the reference.
+  - The coverage prose now gives Go blobs' real gap: Go-implemented
+    adapters (S5b).
+  - The stale Go read-your-writes passages in `cortex.md` and
+    `dataforts.md` are corrected. The `cortex.md` example used the
+    reference API (`result.Token`, `PollForToken`, `State()`) and didn't
+    compile against the module.
+  - `docs/CONFIG_REPLICATION.md` has the real S3 API.
+  - The docs-site page `sdk/artifacts/go.md` is rewritten. It claimed "Go
+    exposes none of" the transfer calls, which was already partly false
+    before this branch, since `ServeBlobTransfer` and `FetchBlob` existed.
+  - The `sdk/go/README.md` pointer and the `go/README.md` row are updated.
+  - `SDK_GO_PARITY_PLAN.md` gets an amendment note.
+- Left as written: release notes for v0.9–v0.23 (and their web mirrors),
+  which describe what shipped then.
+
+Two guards caught my first draft of the skill edits. `check-skills.sh`
+refuses internal-plan references in skills, and has its own path-existence
+check. The notes now cite only git history (`610cd4e`), and a temporary
+`ALLOW` entry I'd added to `check-skill-source-paths.py` was reverted
+because it was no longer needed.
+
+Evidence (Windows):
+
+- `check-skills.sh`: "Skills agree with the tree".
+  `check-skill-source-paths.py`: every cited path resolves.
+  `capability_records.py --check`: copies match.
+  `check-header-count.py` and `check-one-library-docs.py`: pass.
+- `fmt.py --check` clean; `cargo check --all-features --lib --tests` clean;
+  `cr22_c_header_parity_with_rust_neterror` passes.
+- Go: header parity and ABI pins pass; `-tags test_helpers` repair tests
+  pass. The full package passed in four of five runs. One run failed, and
+  its output was truncated to the last line, so the failing test is
+  **unattributed**. S8 changed only comments in `go/`, and three further
+  `-v` runs were clean.
+- The web link checker (`web/scripts/check-doc-links.mjs`) needs
+  `npm install` in `web/`, which this worktree doesn't have. CI's `web.yml`
+  runs it. The rewritten page links only to `/docs/sdk/go/errors`, which
+  existed before.
+- **Owed:** release notes for the version that ships this, written at
+  release time (codename and file are the release's call), plus their web
+  mirror.
 
 ## Risks
 

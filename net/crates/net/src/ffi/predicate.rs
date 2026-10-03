@@ -139,7 +139,8 @@ pub unsafe extern "C" fn net_predicate_evaluate(
 //
 // Builds the canonical `net-where:` request-header pair for a
 // wire-format predicate. Mirrors the Go SDK's `WhereHeader` helper
-// (`bindings/go/net/capability.go`). The returned `(name, value)`
+// (the removed Go reference `capability.go`; see the S7 ledger in
+// GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md). The returned `(name, value)`
 // pair drops into any `request_headers`-shaped option list once a
 // header-bearing call variant ships in `libnet_rpc`; today's C
 // ABI in `net_rpc.h` doesn't accept request headers yet, so the

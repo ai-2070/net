@@ -1,6 +1,6 @@
 //! C ABI for the MeshOS daemon-author SDK.
 //!
-//! Consumed by the Go binding at `bindings/go/net/meshos.go` and
+//! Consumed by the Go binding at `go/meshos.go` and
 //! by the C SDK header at `include/net_meshos.h` (Phase 5).
 //!
 //! # Scope (slice 1a)

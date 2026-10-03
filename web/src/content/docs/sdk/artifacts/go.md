@@ -1,77 +1,93 @@
 ## Move it — Go
 
-### Cross-peer blob transfer is not in the Go binding
-
-Rust, TypeScript and Python each expose `serve_blob_transfer`, `fetch_blob`,
-`fetch_blob_discovered` and `fetch_dir`. **Go exposes none of them.** There is no
-`net_transport.h` binding in the Go module, and no transfer stream helpers.
-
-What Go does have is `MeshBlobAdapter`, and it is worth being precise about what
-that is, because its name suggests more than it does:
+The transfer verbs are methods on the node (`*net.MeshNode`) and the adapter
+(`*net.MeshBlobAdapter`), in the module `github.com/ai-2070/net/go`.
 
 ```go
-adapter, err := net.NewMeshBlobAdapter(redex, "my-adapter", nil)
+redex := net.NewRedex("")
+defer redex.Free()
+adapter, err := net.NewMeshBlobAdapter(redex, "my-node", nil)
 if err != nil {
     log.Fatal(err)
 }
 defer adapter.Close()
 
-err = adapter.Store(blobRefBytes, data)     // local content-addressed store
-data, err := adapter.Fetch(blobRefBytes)    // local read
-ok, err := adapter.Exists(blobRefBytes)
+// Both ends install the transfer engine: a fetch needs it as much as a serve.
+if err := node.ServeBlobTransfer(adapter); err != nil {
+    log.Fatal(err)
+}
 ```
 
-`Store`, `Fetch` and `Exists` are **local** operations against this node's own
-blob store. They do not reach a peer. A `Fetch` for content this node has never
-stored returns not-found; it does not go looking.
+The adapter is feature-gated on `dataforts,netdb,redex-disk`. Built without
+them, the constructor returns `ErrBlob` and the transfer calls return
+`ErrFeatureNotBuilt`.
 
-The adapter is feature-gated server-side on `dataforts,netdb,redex-disk`. Built
-without them, the FFI returns null and the constructor returns `ErrBlob`.
+### Publish, then move by reference
 
-### What to do instead
+```go
+ref, err := adapter.Publish("mesh://frames/abc123", data) // stores + mints the BlobRef
+hash, err := net.BlobRefHash(ref)                          // the 32-byte address
 
-**Shell out to the CLI.** `net-mesh transfer send-blob / recv-blob / send-dir /
-recv-dir` drives the same substrate transfer path, and from Go this is currently
-the supported route for moving bytes between peers. See the
-[CLI Reference](/docs/reference/cli).
+// On the other peer:
+got, err := node.FetchBlob(holderID, hash[:])        // from a known holder
+got, err = node.FetchBlobDiscovered(hash[:])         // or let the mesh find one
+```
 
-**Or put the transfer on a node in another binding.** A Rust or Python sidecar
-that owns the artifact path, coordinated over nRPC from Go, keeps your Go service
-in charge without needing a binding that does not exist.
+`Fetch` / `Exists` on the adapter are **local**: they read this node's own
+store and never go looking. `FetchBlob` and `FetchBlobDiscovered` are the
+cross-peer path, and both verify the bytes against the hash.
 
-**Do not** put the bytes in an event to work around this. That converts a
-coordination message into a broadcast transfer for every subscriber, which is the
-failure mode this whole page exists to prevent.
+### Whole directories
+
+```go
+manifestRef, err := adapter.StoreDir("/data/model-v3")              // on the holder
+stats, err := node.FetchDir(holderID, manifestRef, "/srv/model-v3") // on the receiver
+manifest, err := node.DirManifestRead(holderID, manifestRef)        // inspect without copying
+```
+
+`FetchDir` installs the tree atomically and refuses paths that escape the
+destination (`ErrDirPathInvalid`). A manifest the holder doesn't have is
+`ErrTransferNotFound`; bytes that aren't a manifest are `ErrDirInvalidManifest`.
+
+### Large blobs: trees, erasure coding, ranges
+
+```go
+ref, err := adapter.StoreTree(data, net.EncodingReedSolomon(4, 2))
+part, err := adapter.FetchRange(ref, 0, 1<<20) // first MiB; Fetch refuses a tree ref
+report, err := adapter.RepairBlob(ref)         // rebuild lost data shards from parity
+```
+
+A Reed-Solomon stripe only gets parity once `k` full chunks have arrived (4 MiB
+each by default), so a blob smaller than `k` chunks is stored replicated.
+`RepairBlob` returning nil does not mean the blob is whole: check
+`report.StripesUnrecoverable`.
 
 ### Reference, don't embed
 
-The reference half works normally — Go can carry and pass a `BlobRef` even where
-it cannot fetch one:
+Put the `BlobRef` in the event, not the bytes:
 
 ```go
-_ = bus.Ingest(map[string]any{"frame_id": "abc123", "blob": blobRef})
+_ = bus.Ingest(map[string]any{"frame_id": "abc123", "blob": ref})
 ```
+
+Putting the bytes in an event converts a coordination message into a broadcast
+transfer for every subscriber, which is the failure mode this page exists to
+prevent.
 
 ### Verify it worked
 
-For the local adapter path:
-
 ```go
-if err := adapter.Store(blobRefBytes, data); err != nil {
-    log.Fatal(err)
-}
-ok, err := adapter.Exists(blobRefBytes)
+got, err := node.FetchBlobDiscovered(hash[:])
 if err != nil {
     log.Fatal(err)
 }
-if !ok {
-    log.Fatal("stored, but not readable back")
+if !bytes.Equal(got, data) {
+    log.Fatal("fetched bytes differ") // unreachable: the fetch verifies the hash
 }
-fmt.Println("stored:", len(data), "bytes")
+fmt.Println("fetched:", len(got), "bytes")
 ```
 
-There is no Go-side verification for a cross-peer fetch, because there is no
-cross-peer fetch. This page will not show you another language's code in its
-place.
+Go cannot yet register a blob adapter written in Go (Python and Node can); the
+process-wide registry takes filesystem adapters (`RegisterFilesystemBlobAdapter`).
 
 Next: [Errors and recovery](/docs/sdk/go/errors).

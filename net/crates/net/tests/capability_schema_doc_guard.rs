@@ -4,7 +4,8 @@
 //! The doc is the canonical source of truth. The substrate const +
 //! per-binding mirrors (`sdk-ts/src/capability-schema.ts`,
 //! `sdk-py/src/net_sdk/capability_schema.py`,
-//! `bindings/go/net/capability_schema.go`) are hand-maintained
+//! and, until it was removed, the Go reference `capability_schema.go`)
+//! are hand-maintained
 //! mirrors. This test parses the markdown table rows under the
 //! `## hardware axis` and `## software axis` sections, normalizes
 //! both sides to a `(axis, canonical_key)` set, and asserts the two
