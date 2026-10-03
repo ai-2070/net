@@ -1164,6 +1164,19 @@ Evidence (Windows):
 - **Owed:** release notes for the version that ships this, written at
   release time (codename and file are the release's call), plus their web
   mirror.
+- **The S8 commit (`b863b9a`) breaks the ABI one-commit rule, by
+  decision.** `check-abi-commit.py` counts the deletion as changing 56
+  `NET_*` constants: local `#define`s in the deleted cgo preambles. The
+  rule wants a Go ABI test in the same commit, and I ran the guard only
+  after pushing. The witness landed as a **follow-up commit**, chosen over
+  amending and force-pushing: `go/abi_stability_reference_removal_test.go`,
+  `TestABIStabilityRemovedReferenceConstantsSurvive`. It shows all 56 are
+  still defined, with identical values, where consumers read them
+  (24 in `include/net_deck.h`, 6 in `include/net_meshdb.h`, 20 in
+  `go/meshos.go`, 6 in `go/mesh_rpc_typed.go`), so the deletion changed no
+  ABI. Mutation-checked: a wrong value for `NET_DECK_LOG_WARN` fails by
+  name. `b863b9a` stays a rule-breaking commit on the branch (a bisect
+  window) unless the PR is squash-merged.
 
 ## Risks
 
