@@ -31,6 +31,12 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 - **Sharded ingestion.** Events stripe across per-shard buffers, merged for cross-shard consumption; the shard count defaults to CPU count and can scale at runtime.
 - **Optionally-reliable, optionally-ordered.** Delivery guarantees and ordering are chosen per channel — the mesh defaults to the fastest path and lets a caller pay only for the guarantees it needs.
 
+**Performance**
+
+- The hot paths are allocation-free: header encode 2.19 ns, routing lookup 37.7 ns, one-hop forward 61.7 ns (M1 Max).
+- A node reaches its first peer in ~0.9 ms and its first typed RPC reply in ~1.3 ms — two nodes, loopback, p50.
+- These are per-operation microbenchmarks on one machine, not round-trip or NIC figures; the full measured set is under [Performance](#performance).
+
 **What that gives you**
 
 - **No broker, no registry, no coordinator.** Peers find each other by what they can do.
