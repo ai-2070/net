@@ -33,9 +33,10 @@ mesh runs vehicular, industrial, robotics, and edge workloads.
 
 **Performance**
 
-- The hot paths are allocation-free: header encode 2.19 ns, routing lookup 37.7 ns, one-hop forward 61.7 ns (M1 Max).
-- A node reaches its first peer in ~0.9 ms and its first typed RPC reply in ~1.3 ms — two nodes, loopback, p50.
-- These are per-operation microbenchmarks on one machine, not round-trip or NIC figures; the full measured set is under [Performance](#performance).
+- Build a packet from one event in 299 ns; encrypt 1 KB with ChaCha20-Poly1305 in 908 ns; forward one hop in 61.7 ns (M1 Max).
+- Header encode 2.19 ns, routing lookup 37.7 ns, a 50-event packet build 2.44 µs.
+- Cold start: first peer visible in ~0.9 ms, first typed RPC reply in ~1.3 ms — two nodes, loopback, p50.
+- Per-operation microbenchmarks on one machine, not round-trip or NIC figures; the full measured set is under [Performance](#performance).
 
 **What that gives you**
 
