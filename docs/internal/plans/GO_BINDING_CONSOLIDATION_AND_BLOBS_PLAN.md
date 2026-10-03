@@ -1204,6 +1204,79 @@ Evidence (Windows):
   name. `b863b9a` stays a rule-breaking commit on the branch (a bisect
   window) unless the PR is squash-merged.
 
+## Gap closure (added 2026-10-03, after PR #1165 opened)
+
+The user asked for the known gaps to be fixed inside #1165. Two were closed
+directly: the `C.int` length copies (`0634fd9`, `b65d98a`) and the "−120
+collision", which turned out to be per-surface code spaces by design
+(`ae651ef`). The release notes are still owed at release time. The other
+two are new features, so they get a design here before any code.
+
+### G-A: a greedy-cache read path, which makes gravity observable
+
+**The gap.** Gravity heat comes only from reads served by the greedy cache
+(`Redex::greedy_cache_for`, which bumps `note_read`), and no C, napi or pyo3
+entry point exposes that read. So no binding can read a cached channel, and
+none can see gravity do anything (S3's surviving mutant).
+
+**Design.**
+
+- **SDK-first is already satisfied.** `net_sdk::dataforts` re-exports core's
+  `Redex` (`sdk/src/dataforts.rs:34`), so `greedy_cache_for` is already on
+  the Rust SDK surface. The bindings forward to it; no SDK code is needed.
+- **C:** `int net_redex_greedy_cache_for(net_redex_t*, const char* channel,
+  net_redex_file_t** out_file)`. It returns 0 with `*out_file` set to a file
+  handle (the existing type, read with `read_range` / `tail` and freed with
+  `net_redex_file_free`), or 0 with `*out_file = NULL` when the channel isn't
+  cached or greedy is off. `*out_file` is NULL-checked first and then
+  initialised. An invalid name is `NET_ERR_REDEX`. Gated on
+  `net + dataforts`, with a stub returning `NET_ERR_FEATURE_NOT_BUILT`.
+  Declared in `include/net_cortex.h` and `go/net_cortex.h`, and added by
+  hand to `exports.baseline`.
+- **Go:** `(*Redex).GreedyCacheFor(channel string) (*RedexFile, error)`,
+  returning `(nil, nil)` when not cached.
+- **Node:** `Redex.greedyCacheFor(channel): RedexFile | null`.
+  **Python:** `Redex.greedy_cache_for(channel) -> RedexFile | None`.
+- **Observability without new API:** a core counter,
+  `dataforts_greedy_gravity_heat_emissions_total`, bumped by the number of
+  heat updates `gravity_tick` successfully announces. Every binding already
+  renders greedy metrics (`GreedyPrometheusText` and equivalents). Gravity's
+  effect is exactly these announcements, so counting them is the observable
+  the S3 witness lacked. A capability-tag read API was rejected: it would be
+  a second new public surface, and the only existing accessor is a
+  `#[doc(hidden)]` test helper.
+
+**Proves it:**
+
+- Rust: the counter rises on a gravity tick with heat and stays flat without
+  gravity, next to the existing `tests/dataforts_gravity_e2e.rs`. The C
+  function has a test for each case: found, not cached, greedy off, NULL
+  out-pointer, invalid name.
+- Go: B subscribes to A's channel, A publishes, and B's greedy cache admits
+  it. `GreedyCacheFor` returns a file whose `ReadRange` holds A's events.
+  With gravity on (short tick, low threshold), repeated reads make the
+  emissions counter rise within a bounded wait. With `Enabled: false`
+  forwarded, it stays 0. That is the S3 dropped-config mutant, which must
+  now be killed. After `DisableGravityForGreedy`, the counter stops rising.
+- Node and Python: `greedyCacheFor` / `greedy_cache_for` returns null/None
+  with greedy off, and a readable file once a channel is cached. A
+  single-process test drives admission through two in-process nodes where
+  the binding's tests already do that.
+
+### G-B: Go-implemented blob adapters (S5b)
+
+The design under "Decision: callback blob adapters" stands as written:
+- an additive `net_blob_register_callback_adapter_owned(id, vtable, ctx, release_fn)`;
+- `release_fn` runs exactly once, from the drop of the shared context
+  retained by the blocking work;
+- ownership stays with Go on any registration failure;
+- C-allocated callback buffers;
+- whole-trampoline `recover`.
+
+**Proves it:** the S5b list, implemented through `fixtures`-gated barrier
+seams (hold a worker before the handle lookup, and before `free_buffer`).
+Plus a Rust test of the release-once contract under a cancelled future.
+
 ## Risks
 
 - **The reference code is wrong against today's ABI.** It has never been
