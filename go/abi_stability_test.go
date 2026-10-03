@@ -310,3 +310,27 @@ func TestABIStabilityTransferCodes(t *testing.T) {
 		t.Errorf("-107 maps to %v, want ErrFeatureNotBuilt (and ErrTransfer)", got)
 	}
 }
+
+// TestABIStabilityCortexDeclsMatchCanonicalHeader pins go/net_cortex.h to
+// the canonical include/net_cortex.h function-for-function. No other test
+// compares that pair (header_parity_test.go covers net.h / net.go.h), so
+// an S3/S4 declaration added to one copy only would otherwise go unseen
+// until a C consumer of the other tripped on it.
+func TestABIStabilityCortexDeclsMatchCanonicalHeader(t *testing.T) {
+	canonical := parseHeader(t, "../net/crates/net/include/net_cortex.h")
+	mirror := parseHeader(t, "net_cortex.h")
+	if len(canonical.fns) == 0 {
+		t.Fatal("parsed no functions from net_cortex.h")
+	}
+	for _, name := range onlyIn(canonical.fns, mirror.fns) {
+		t.Errorf("%s is declared in include/net_cortex.h but not go/net_cortex.h", name)
+	}
+	for _, name := range onlyIn(mirror.fns, canonical.fns) {
+		t.Errorf("%s is declared in go/net_cortex.h but not include/net_cortex.h", name)
+	}
+	for name, params := range canonical.fns {
+		if got, ok := mirror.fns[name]; ok && got != params {
+			t.Errorf("%s parameters differ:\n  include: (%s)\n  go:      (%s)", name, params, got)
+		}
+	}
+}

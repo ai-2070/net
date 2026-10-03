@@ -3,9 +3,9 @@
 ## Status
 
 In progress, 2026-10-03. Targets the release after 0.39. Branch
-`LZL0/go-blobs`. Plan accepted for implementation at `e33ede5`. **S1 and S2
-done locally 2026-10-03** (S1 committed as `aaa797c`; evidence under each
-slice; exact-head CI still owed). S3–S8 not started.
+`LZL0/go-blobs`. Plan accepted for implementation at `e33ede5`. **S1–S3
+done locally 2026-10-03** (S1 `aaa797c`, S2 `bb775f6`; evidence under each
+slice; exact-head CI still owed). S4–S8 not started.
 
 Reviewed twice before implementation (`d1b6f29`, then `317168c`). The first
 review accepted the direction and held on nine findings (R1–R9). The second
@@ -592,6 +592,82 @@ Header closure: declare the replication, greedy and gravity functions in
   `test-helpers`. Until it exists, the evidence is stated honestly as
   "forwarding plus the native gravity tests", not as a cache-count toggle.
 
+**Done locally, 2026-10-03.** Exact-head CI is still owed.
+
+- **Header closure.** The ten functions are declared in
+  `include/net_cortex.h` and `go/net_cortex.h`, beside `net_redex_new`.
+  The mesh-Arc parameter is a forward-declared
+  `struct net_compute_mesh_arc_s*`: that's the struct `net.go.h`'s
+  `net_compute_mesh_arc_t` names, and it needs no typedef or `NET_*` guard
+  macro in the self-contained cortex header. (A guard macro would have
+  tripped the ABI-commit rule's `#define NET_*` trigger.) No test compared
+  the cortex header pair before; `TestABIStabilityCortexDeclsMatchCanonicalHeader`
+  now does, function-for-function, and the existing declarations already
+  agreed.
+- **API.** In `go/redex_dataforts.go`: the ten `Redex` methods take
+  `*MeshNode` and clone the Arc themselves, under the mesh's read lock, just
+  before the consuming call (`withMeshArc`), and never free it. The
+  reference package made the caller pass a raw Arc pointer.
+  `RedexFileConfig.Replication *RedexReplicationConfig` is forwarded through
+  `OpenFile`. `GreedyConfig` and `DataGravityConfig` mirror the native
+  JSON. Every failure is an `ErrRedex`; encode or parse refusals are also
+  `ErrInvalidRedexConfig`; a closed Redex or shut-down mesh is also
+  `ErrShuttingDown`; feature-off is also `ErrFeatureNotBuilt`.
+- **Not ported:** the reference's binding-side `validateReplicationConfig`.
+  The native side validates and refuses with `NET_ERR_REDEX`, and a second
+  copy of the bounds in Go would drift. This gets an S7 ledger row.
+- **Arc ownership evidence.** The native tests pin consumption on error
+  paths (`enable_replication_drops_mesh_arc_on_null_redex` and the greedy
+  twin in `src/ffi/cortex.rs`). The Go side has no free to get wrong, and no
+  Arc strong-count accessor exists, so the plan's live-Arc-count witness is
+  **not built**. It would need a new `test-helpers` symbol, and the native
+  tests already cover the contract.
+
+Evidence (Windows):
+
+- `go test -count=1 -run '^TestRedex(Replicat|Greedy|Gravity|Dataforts)' -v .`:
+  7/7 pass (`go/redex_dataforts_test.go`).
+  - Replication: refused without enable; count 0 → 0 after enable → 1 on
+    opening a replicated channel → 0 after disable; and **data arrival**:
+    pinned placement with A as leader, 8 appends on A, all 8 read back on
+    B.
+  - Greedy: B subscribes to A's channel, A publishes, and
+    `GreedyCachedChannelCount` reaches ≥ 1. After disable, the count is 0,
+    the metrics are `""`, and a later publish admits nothing.
+- `go test -race -count=2 -run '^(TestBlob|TestTransfer|TestRedex)' .`: ok.
+- Mutations (each compiles):
+  - `Replication` not forwarded (`json:"-"`): killed by three replication
+    tests
+  - greedy config dropped: killed by `TestRedexGreedyCachesAPeersChannel`
+    (the default intent policy doesn't admit) and
+    `TestRedexGreedyConfigRefusals`
+  - `DisableGreedyDataforts` a no-op: killed by
+    `TestRedexGreedyCachesAPeersChannel`
+  - `DisableReplication` a no-op: killed by
+    `TestRedexReplicationRuntimeCountFollowsChannels`
+  - `go/net_cortex.h` losing a `const`: killed by
+    `TestABIStabilityCortexDeclsMatchCanonicalHeader`
+  - **gravity config dropped: SURVIVES.** See the gravity note below.
+- CI: the race step's filter is now `^(TestBlob|TestTransfer|TestRedex)`,
+  which also puts the existing RedEX file tests under `-race`, and a 7-name
+  roster is added.
+
+**Gravity, scoped honestly (as Q4 allowed).** Go's gravity evidence is
+forwarding and install rules only: refused without greedy; nil, tuned and
+`Enabled: false` configs accepted; NaN refused before the C call;
+idempotent disable; greedy survives a gravity disable. **Whether a gravity
+config reaches the policy is not observable from Go**, and the
+dropped-config mutant above survives to show it. The reason: heat comes
+from reads served by the greedy cache (`Redex::greedy_cache_for`), and no
+binding (Go, Node or Python) exposes that read path. So no binding can
+produce heat, and none can observe a config's effect on it. Native evidence:
+`tests/dataforts_gravity_e2e.rs`
+(`read_hot_chain_emits_heat_tag_into_local_caps`,
+`greedy_without_gravity_emits_no_heat_tags`). The `test-helpers` tag
+accessor named above wouldn't help without a read driver, so it wasn't
+added. Exposing greedy reads is a new capability (SDK-first rule) and is
+recorded under "Defects found on the way" rather than built here.
+
 ### S4: CortEX read-your-writes
 
 Header closure: declare both wait functions in `go/net_cortex.h` and its
@@ -840,6 +916,13 @@ CI Go job are green.
   `org_test.go` and `subnets_test.go` (LF line endings, so this is real
   formatting drift). No CI gate runs gofmt on `go/`. The files touched by
   this plan are gofmt-clean.
+
+- **No binding can read through the greedy cache (cross-binding gap,
+  deferred).** `Redex::greedy_cache_for` has no C, napi or pyo3 entry point,
+  so gravity heat (which comes from those reads) can't be produced or
+  observed from any language binding. Found while building S3's gravity
+  witness. Adding it is a new capability, so per the SDK-first rule it
+  starts in `net-mesh-sdk`, not in this plan.
 
 ## Review history
 

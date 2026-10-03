@@ -148,6 +148,11 @@ type RedexFileConfig struct {
 	RetentionMaxEvents uint64 `json:"retention_max_events,omitempty"`
 	RetentionMaxBytes  uint64 `json:"retention_max_bytes,omitempty"`
 	RetentionMaxAgeMs  uint64 `json:"retention_max_age_ms,omitempty"`
+	// Replication, when set, opts the channel into cross-node
+	// replication. The owning Redex must have called EnableReplication
+	// first; otherwise OpenFile fails with ErrRedex. Nil keeps the
+	// channel single-node.
+	Replication *RedexReplicationConfig `json:"replication,omitempty"`
 }
 
 // RedexEvent is one materialized event yielded by a tail / range read.

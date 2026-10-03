@@ -45,6 +45,37 @@ typedef struct net_memories_watch_s  net_memories_watch_t;
 net_redex_t* net_redex_new(const char* persistent_dir);
 void         net_redex_free(net_redex_t* handle);
 
+/* ---- Replication, greedy Dataforts, data gravity -------------------------
+ *
+ * `mesh_arc` is the boxed Arc from net_mesh_arc_clone (net.go.h, where it is
+ * typedef'd net_compute_mesh_arc_t). Each enable function CONSUMES it on
+ * every return code: never free it afterwards. Returns 0, -1 (NULL
+ * handle), -8 (ShuttingDown), -2/-3 (bad config string / JSON), -103
+ * (NET_ERR_REDEX: validation or install failure), or -107 when libnet was
+ * built without the feature. Prometheus text is freed with net_free_string;
+ * it is "" when the surface isn't enabled and NULL only on a NULL / closing
+ * handle.
+ */
+struct net_compute_mesh_arc_s;
+
+int      net_redex_enable_replication(net_redex_t* redex,
+                                      struct net_compute_mesh_arc_s* mesh_arc);
+int      net_redex_disable_replication(net_redex_t* redex);
+uint32_t net_redex_replication_runtime_count(const net_redex_t* redex);
+char*    net_redex_replication_prometheus_text(const net_redex_t* redex);
+
+int      net_redex_enable_greedy_dataforts(net_redex_t* redex,
+                                           struct net_compute_mesh_arc_s* mesh_arc,
+                                           const char* config_json);
+int      net_redex_disable_greedy_dataforts(net_redex_t* redex);
+uint32_t net_redex_greedy_cached_channel_count(const net_redex_t* redex);
+char*    net_redex_greedy_prometheus_text(const net_redex_t* redex);
+
+int      net_redex_enable_gravity_for_greedy(net_redex_t* redex,
+                                             struct net_compute_mesh_arc_s* mesh_arc,
+                                             const char* config_json);
+int      net_redex_disable_gravity_for_greedy(net_redex_t* redex);
+
 /* ---- RedexFile ---- */
 int  net_redex_open_file(net_redex_t* redex, const char* name,
                          const char* config_json,
