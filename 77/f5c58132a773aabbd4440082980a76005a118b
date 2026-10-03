@@ -1,0 +1,37 @@
+go/abi_stability_test.go
+  s_391b90f341d6c6::t_344b49933eafd4 484-486,524-525,527-549
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  s_391b90f341d6c6::t_344b49933eafd4 333-335
+net/crates/net/include/net_cortex.h
+  s_391b90f341d6c6::t_344b49933eafd4 129-130,137,285-286,293
+go/net_cortex.h
+  s_391b90f341d6c6::t_344b49933eafd4 129-130,137,268-269,276
+.claude/skills/net-event-bus/cortex.md
+  s_391b90f341d6c6::t_e18078c94461e9 70
+  s_391b90f341d6c6::t_344b49933eafd4 193,210
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  s_391b90f341d6c6::t_344b49933eafd4 300-302
+go/write_token.go
+  s_391b90f341d6c6::t_344b49933eafd4 79
+net/crates/net/src/adapter/net/redex/write_token.rs
+  s_391b90f341d6c6::t_e18078c94461e9 55-56
+  s_391b90f341d6c6::t_344b49933eafd4 47-50
+net/crates/net/src/ffi/cortex.rs
+  s_391b90f341d6c6::t_344b49933eafd4 123-128,1908
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "77f5c58132a773aabbd4440082980a76005a118b",
+  "prompts": {},
+  "sessions": {
+    "s_391b90f341d6c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e008671-9702-4db4-b22a-abb85b691773",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
