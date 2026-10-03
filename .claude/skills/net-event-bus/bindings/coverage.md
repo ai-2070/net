@@ -99,7 +99,7 @@ A mode is written after the status: `supported · core-only`.
 | nRPC — typed request/response + streaming | supported | supported | supported | supported | supported |
 | Gang-claim scheduler | supported | supported | supported | supported | supported |
 | A2A — agent task handoff | supported | supported | supported | not exposed | not exposed |
-| A2A — paid task admission (prepare → purchase → submit) | supported | not exposed | supported | not exposed | not exposed |
+| A2A — paid task admission (prepare → purchase → submit) | supported | supported | supported | not exposed | not exposed |
 | Organization capability auth | supported | supported | supported | supported | supported |
 | Organization-scoped streaming RPC | supported | supported | supported | supported | supported |
 | Subnet gateway provisioning | supported | supported | supported | supported | supported |
@@ -143,7 +143,7 @@ should not infer one binding's API from another's.
 | nRPC — typed request/response + streaming | `call_typed` | `TypedMeshRpc` | `call_streaming` | `NewTypedMeshRpc` | `net_rpc_call` |
 | Gang-claim scheduler | `claim_island` | `claimIsland` | `claim_island` | `ClaimIsland` | `net_mesh_claim_island` |
 | A2A — agent task handoff | `serve_a2a` | `serveA2a` | `serve_a2a` | — | — |
-| A2A — paid task admission (prepare → purchase → submit) | `serve_a2a_configured` | — | `serve_a2a_configured` | — | — |
+| A2A — paid task admission (prepare → purchase → submit) | `serve_a2a_configured` | `serveA2aConfigured` | `serve_a2a_configured` | — | — |
 | Organization capability auth | `serve_org` | `serveOrgTyped` | `serve_org_typed` | `ServeOrgBytes` | `net_org_call` |
 | Organization-scoped streaming RPC | `call_streaming` | `callStreaming` | `call_streaming` | `CallStreaming` | `net_org_call_streaming` |
 | Subnet gateway provisioning | `install_gateway_credentials_node` | `installSubnetGatewayCredentials` | `install_subnet_gateway_credentials` | `InstallSubnetGatewayCredentials` | `net_subnet_install_gateway_credentials` |
@@ -196,8 +196,10 @@ traversal (`natType`, `connectDirect`, …), enrollment over the mesh (`join`,
 `MeshNode.create` option (`permissiveChannels` among them) are on the SDK's
 `MeshNode`, and a build-time check fails if a native `NetMesh` method is left
 unwrapped. Consent, delegation, enrollment, blobs, the aggregator clients and
-`Redex` replication are exported from the package root. Payments is not a gap:
-it lives in `@net-mesh/core` by design.
+`Redex` replication are exported from the package root. Payments and paid A2A
+are reachable from the SDK too: `createPaymentProvider` / `createCapabilityGateway`
+adapt a `MeshNode` and return the native objects, and `a2aDocument` / `a2aU64`
+read paid-A2A documents without rounding their u64 fields (`JSON.parse` does).
 
 **Python reaches all of this from `net_sdk` now; Redis dedup is the one
 `core-only` Python cell left.** Distributed channels (`register_channel`,
@@ -210,7 +212,10 @@ tool surface (`node.list_tools()`, `node.watch_tools()`), nRPC (`node.rpc()`)
 and blob transfer (`node.store_dir` / `fetch_dir`). The module-level
 `net_sdk.list_tools(mesh)` / `watch_tools(mesh)` are the layer underneath and
 still take the native handle. Capability announce and discovery were already on
-the wrapper.
+the wrapper. Paid A2A's `PaymentProvider` and `CapabilityGateway` are built from
+a `MeshNode` with `net_sdk.create_payment_provider` /
+`create_capability_gateway` (paid A2A is sync-gateway-only; drive it from
+asyncio with `asyncio.to_thread`).
 
 **Delegated channel credentials are `not exposed` everywhere.** Core has both
 halves — `MeshNode::subscribe_channel_with_chain(TokenChain)` and

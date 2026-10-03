@@ -83,3 +83,39 @@ export function getNapiMesh(host: object): NapiNetMesh {
   }
   return r;
 }
+
+/**
+ * The native org client behind any of the three org-client forms: the SDK's
+ * `OrgClient` (`.typed.raw`), a `TypedOrgClient` (`.raw`), or the native
+ * client itself; `null` stays `null`. By shape rather than `instanceof`, so
+ * `mesh.ts` can use it without a runtime import of `org/index.ts` (which
+ * imports `mesh.ts`).
+ *
+ * @internal
+ */
+export function nativeOrgClientOf(org: unknown): unknown {
+  if (org === null || org === undefined) return null;
+  if (typeof org !== 'object') {
+    throw new TypeError(
+      `setA2aOrgCaller: expected an OrgClient, a TypedOrgClient, the native client or null, got ${typeof org}`,
+    );
+  }
+  const o = org as { typed?: unknown; raw?: unknown };
+  // A wrapper whose inner handle is missing is a broken client, not a
+  // native one: refuse it here with a clear message rather than handing it
+  // to the native boundary as if it were the client.
+  if ('typed' in o) {
+    const raw = (o.typed as { raw?: unknown } | null | undefined)?.raw;
+    if (raw === null || raw === undefined) {
+      throw new TypeError('setA2aOrgCaller: this OrgClient has no native client (typed.raw is missing)');
+    }
+    return raw;
+  }
+  if ('raw' in o) {
+    if (o.raw === null || o.raw === undefined) {
+      throw new TypeError('setA2aOrgCaller: this TypedOrgClient has no native client (raw is missing)');
+    }
+    return o.raw;
+  }
+  return org;
+}

@@ -466,9 +466,11 @@ impl RpcHandler for NodeRpcHandler {
                         message: body,
                     });
                 }
-                return Err(RpcHandlerError::Internal(format!(
-                    "JS handler promise rejected: {e}"
-                )));
+                return Err(RpcHandlerError::Internal(
+                    crate::js_promise::failure_reason("JS handler", &e, |e| {
+                        format!("JS handler promise rejected: {e}")
+                    }),
+                ));
             }
         };
 
@@ -1711,9 +1713,11 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
                         message: body,
                     });
                 }
-                Err(RpcHandlerError::Internal(format!(
-                    "JS streaming handler promise rejected: {e}"
-                )))
+                Err(RpcHandlerError::Internal(
+                    crate::js_promise::failure_reason("JS streaming handler", &e, |e| {
+                        format!("JS streaming handler promise rejected: {e}")
+                    }),
+                ))
             }
             Err(_) => Err(RpcHandlerError::Internal(format!(
                 "JS streaming handler promise did not resolve within {} ms",
@@ -1796,9 +1800,11 @@ impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
                         message: body,
                     });
                 }
-                return Err(RpcHandlerError::Internal(format!(
-                    "JS client-streaming handler promise rejected: {e}"
-                )));
+                return Err(RpcHandlerError::Internal(
+                    crate::js_promise::failure_reason("JS client-streaming handler", &e, |e| {
+                        format!("JS client-streaming handler promise rejected: {e}")
+                    }),
+                ));
             }
             Err(_) => {
                 return Err(RpcHandlerError::Internal(format!(
@@ -1911,9 +1917,11 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
                         message: body,
                     });
                 }
-                Err(RpcHandlerError::Internal(format!(
-                    "JS duplex handler promise rejected: {e}"
-                )))
+                Err(RpcHandlerError::Internal(
+                    crate::js_promise::failure_reason("JS duplex handler", &e, |e| {
+                        format!("JS duplex handler promise rejected: {e}")
+                    }),
+                ))
             }
             Err(_) => Err(RpcHandlerError::Internal(format!(
                 "JS duplex handler did not resolve within {} ms",

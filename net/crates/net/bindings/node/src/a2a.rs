@@ -37,9 +37,12 @@ use napi_derive::napi;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-use net_sdk::a2a::{CancelToken, TaskBrief, TaskExecutor, TaskRegistry};
+use net_sdk::a2a::{CancelToken, PreparedTask, TaskBrief, TaskExecutor, TaskRegistry};
+use net_sdk::a2a_payment::TaskPaymentProof;
 use net_sdk::mesh::Mesh as SdkMesh;
+use net_sdk::mesh_a2a::A2aFlowError;
 use net_sdk::mesh_rpc::ServeHandle;
+use serde_json::Value;
 
 use crate::delegation::u64_arg;
 use crate::enrollment::mesh_over;
@@ -47,6 +50,103 @@ use crate::NetMesh;
 
 fn a2a_err(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("a2a: {msg}"))
+}
+
+/// The stable prefix of a refusal of the caller's own input — a document of
+/// the wrong shape, a selector that names nothing, a brief the wire cannot
+/// carry. Never a transport failure and never worth retrying unchanged.
+/// `errors.ts` maps it to `A2aInvalidArgumentError`.
+pub(crate) const ERR_INVALID_ARGUMENT: &str = "a2a:invalid_argument:";
+
+/// The stable prefix of a provider's payment or admission refusal on the
+/// raw paid submit. Then one space, the provider's `net.payment.failure@1`
+/// schematic as compact JSON exactly as it was encoded (or `null`), a
+/// newline, and the human message. The schematic is never re-encoded on the
+/// JS side — its `extra` map is open, so a JS parse/stringify round trip
+/// could round a number in it — and compact JSON has no raw newline, so the
+/// first newline is the boundary. `errors.ts` splits it into
+/// `PaymentRefusedError`.
+pub(crate) const ERR_PAYMENT_REFUSED: &str = "a2a:payment_refused:";
+
+pub(crate) fn invalid(msg: impl std::fmt::Display) -> Error {
+    Error::from_reason(format!("{ERR_INVALID_ARGUMENT} {msg}"))
+}
+
+/// [`A2aFlowError`] from the raw paid submit onto the binding's prefixes.
+fn paid_submit_err(e: A2aFlowError) -> Error {
+    match e {
+        A2aFlowError::PaymentRefused { message, schematic } => {
+            let schematic = schematic
+                .and_then(|s| serde_json::to_string(&*s).ok())
+                .unwrap_or_else(|| "null".to_string());
+            Error::from_reason(format!("{ERR_PAYMENT_REFUSED} {schematic}\n{message}"))
+        }
+        // Refused locally, before any packet: no retry and no fresh quote
+        // can make an over-long brief or an unpresentable proof deliverable.
+        local @ (A2aFlowError::ProofUndeliverable(_) | A2aFlowError::BriefTooLarge { .. }) => {
+            invalid(format!("submitTaskPaid: {local}"))
+        }
+        other => a2a_err(format!("submitTaskPaid: {other}")),
+    }
+}
+
+/// The value at an RFC 6901 pointer in a JSON document, read by `serde_json`
+/// — which keeps u64 integers exact, unlike a JavaScript double.
+fn pointed(json: &str, pointer: &str, verb: &str) -> Result<Value> {
+    let doc: Value = serde_json::from_str(json)
+        .map_err(|e| invalid(format!("{verb}: the document is not JSON: {e}")))?;
+    doc.pointer(pointer).cloned().ok_or_else(|| {
+        invalid(format!(
+            "{verb}: the pointer {pointer:?} names nothing in the document"
+        ))
+    })
+}
+
+/// The sub-document at `pointer` (RFC 6901, e.g. `/prepared`, `/0/owner`) of
+/// a paid-A2A JSON document, as a JSON string.
+///
+/// **The supported way to hand a nested document back.** Paid-A2A documents
+/// carry u64 integers — a provider node id, an owner's node id, a recovery
+/// generation, a quote expiry in nanoseconds — and `JSON.parse` turns every
+/// number into a double, so a value above 2^53 is silently rounded and
+/// `JSON.stringify` writes the rounded one back. A `prepared` document whose
+/// `provider_node` was rounded names the wrong provider. This reads and
+/// re-serializes in Rust, where those integers stay exact.
+///
+/// Rejects `a2a:invalid_argument:` when `json` is not JSON or the pointer
+/// names nothing. `""` is the whole document.
+#[napi(js_name = "a2aDocument")]
+pub fn a2a_document(json: String, pointer: String) -> Result<String> {
+    let value = pointed(&json, &pointer, "a2aDocument")?;
+    serde_json::to_string(&value).map_err(|e| a2a_err(format!("a2aDocument: encode: {e}")))
+}
+
+/// The u64 integer at `pointer` in a paid-A2A JSON document, as a `bigint` —
+/// exact, where `JSON.parse` would round anything above 2^53. Rejects
+/// `a2a:invalid_argument:` when the pointer names nothing or names anything
+/// but a non-negative integer.
+#[napi(js_name = "a2aU64")]
+pub fn a2a_u64(json: String, pointer: String) -> Result<BigInt> {
+    match pointed(&json, &pointer, "a2aU64")?.as_u64() {
+        Some(v) => Ok(BigInt::from(v)),
+        None => Err(invalid(format!(
+            "a2aU64: the value at {pointer:?} is not a non-negative integer that fits a u64"
+        ))),
+    }
+}
+
+impl NetMesh {
+    /// The SDK `Mesh` every A2A requester verb calls through: a fresh one
+    /// over the live node, carrying the organization identity
+    /// `setA2aOrgCaller` installed — applied per call, so a later
+    /// `setA2aOrgCaller(null)` takes effect on the next verb.
+    pub(crate) fn a2a_requester(&self) -> Result<SdkMesh> {
+        let node = self.node_arc_clone()?;
+        let mesh = mesh_over(node, None);
+        #[cfg(feature = "org")]
+        mesh.set_a2a_org_caller(self.a2a_org_caller_slot().lock().client());
+        Ok(mesh)
+    }
 }
 
 /// Default budget for one task-executor call (JS returning the Promise +
@@ -86,21 +186,46 @@ pub struct TaskBriefJs {
     pub context_refs: Vec<String>,
     /// Routing / bookkeeping tags.
     pub tags: Vec<String>,
+    /// The catalog service this task was admitted under. Set only on the
+    /// configured path (`PaymentProvider.serveA2aConfigured`); absent on the
+    /// free `serveA2a` path, so a handler written for that ignores it.
+    pub service: Option<String>,
+    /// The catalog revision this task was admitted under (configured path
+    /// only, like `service`).
+    pub revision: Option<String>,
 }
 
 /// The bridged JS task executor:
 /// `(brief: TaskBriefJs) => Promise<string>` resolving to the result's
 /// artifact ref.
-type ExecutorTsfn = ThreadsafeFunction<TaskBriefJs, Promise<String>, TaskBriefJs, Status, false>;
+pub(crate) type ExecutorTsfn =
+    ThreadsafeFunction<TaskBriefJs, Promise<String>, TaskBriefJs, Status, false>;
+
+/// `handlerTimeoutMs` to a deadline: absent is the default, `0` is the
+/// explicit opt-out (cancellation is then the only control). Shared by the
+/// free and the configured serving paths so they cannot disagree.
+pub(crate) fn executor_timeout(handler_timeout_ms: Option<u32>) -> Option<std::time::Duration> {
+    match handler_timeout_ms {
+        Some(0) => None,
+        Some(ms) => Some(std::time::Duration::from_millis(u64::from(ms))),
+        None => Some(DEFAULT_TASK_HANDLER_TIMEOUT),
+    }
+}
 
 /// A [`TaskExecutor`] backed by a JS **async** callback. A mesh-side cancel
 /// trips the select below; the registry records `Cancelled` and the JS
 /// handler's result (if it ever resolves) is discarded. `timeout` bounds
 /// how long the JS side may take to settle (`None` = unbounded, the
 /// explicit `handlerTimeoutMs: 0` opt-out).
-struct NodeTaskExecutor {
+pub(crate) struct NodeTaskExecutor {
     callback: ExecutorTsfn,
     timeout: Option<std::time::Duration>,
+}
+
+impl NodeTaskExecutor {
+    pub(crate) fn new(callback: ExecutorTsfn, timeout: Option<std::time::Duration>) -> Self {
+        Self { callback, timeout }
+    }
 }
 
 #[async_trait::async_trait]
@@ -115,6 +240,8 @@ impl TaskExecutor for NodeTaskExecutor {
             prompt: brief.prompt.clone(),
             context_refs: brief.context_refs.clone(),
             tags: brief.tags.clone(),
+            service: brief.service.clone(),
+            revision: brief.revision.clone(),
         };
         // Enqueue the JS call; the oneshot resolves with the handler's
         // returned Promise (or its synchronous throw).
@@ -143,7 +270,11 @@ impl TaskExecutor for NodeTaskExecutor {
             };
             match promise.await {
                 Ok(v) => Ok(v),
-                Err(e) => Err(format!("a2a task handler Promise rejected: {e}")),
+                Err(e) => Err(crate::js_promise::failure_reason(
+                    "a2a task handler",
+                    &e,
+                    |e| format!("a2a task handler Promise rejected: {e}"),
+                )),
             }
         };
 
@@ -175,24 +306,80 @@ impl TaskExecutor for NodeTaskExecutor {
     }
 }
 
-/// Keeps the served A2A services alive (returned by `NetMesh.serveA2a`).
-/// Dropping it or calling [`stop`](Self::stop) unregisters them.
+/// What a serve call registered — held opaquely, because dropping it is
+/// the whole contract (the Python binding's `Registered`).
+pub(crate) enum Registered {
+    /// The free path: one `ServeHandle` per service (task/status/cancel).
+    Legacy(Vec<ServeHandle>),
+    /// The configured path: five registrations plus the journal's
+    /// exclusive-ownership handle, kept alive for exactly as long as the
+    /// handlers that can still write.
+    #[cfg(all(feature = "payments", feature = "publish"))]
+    Configured(net_sdk::mesh_a2a::A2aServing),
+}
+
+impl Registered {
+    /// Three on the free path, five on the configured one (plus prepare and
+    /// describe).
+    fn services(&self) -> usize {
+        match self {
+            Registered::Legacy(handles) => handles.len(),
+            #[cfg(all(feature = "payments", feature = "publish"))]
+            Registered::Configured(serving) => serving.handles.len(),
+        }
+    }
+}
+
+/// The registration a handle owns.
+pub(crate) type SharedRegistration = Arc<Mutex<Option<(SdkMesh, Registered)>>>;
+
+/// The `PaymentProvider`'s view of a registration it created: **weak**, so
+/// the handle stays the only owner and dropping it (a `#[napi]` class is
+/// GC-finalized) still unregisters the services, while `provider.close()` can
+/// retire any registration that is still alive.
+pub(crate) type WeakRegistration = std::sync::Weak<Mutex<Option<(SdkMesh, Registered)>>>;
+
+/// Keeps the served A2A services alive (returned by `NetMesh.serveA2a` or
+/// `PaymentProvider.serveA2aConfigured`). Dropping it or calling
+/// [`stop`](Self::stop) unregisters them.
 // `js_name` pinned: napi's auto-camelCase would emit `A2AServeHandle` /
 // `serveA2A`; the plan + Python parity spell the surface `A2aServeHandle`
 // / `serveA2a`.
 #[napi(js_name = "A2aServeHandle")]
 pub struct A2aServeHandle {
     // The `Mesh` holds the channel registry the services registered against,
-    // and each `ServeHandle` one dispatcher registration (task/status/
-    // cancel). A `parking_lot::Mutex` because napi hands out `&self`; a
-    // `#[napi]` class is GC-finalized, not scope-dropped, so `stop()` is the
-    // deterministic release (the `close()` gotcha in `bindings.md`).
-    inner: Mutex<Option<(SdkMesh, Vec<ServeHandle>)>>,
+    // and the registrations are whatever the serving path returned. A
+    // `parking_lot::Mutex` because napi hands out `&self`; a `#[napi]` class
+    // is GC-finalized, not scope-dropped, so `stop()` is the deterministic
+    // release (the `close()` gotcha in `bindings.md`).
+    inner: SharedRegistration,
+}
+
+impl A2aServeHandle {
+    pub(crate) fn new(mesh: SdkMesh, registered: Registered) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Some((mesh, registered)))),
+        }
+    }
+
+    /// The registration, for the provider that created it.
+    pub(crate) fn shared(&self) -> SharedRegistration {
+        Arc::clone(&self.inner)
+    }
 }
 
 #[napi]
 impl A2aServeHandle {
-    /// Stop accepting A2A tasks (unregister the services). Idempotent.
+    /// Stop accepting A2A tasks: unregister the services and release this
+    /// handle's references. Idempotent.
+    ///
+    /// On the configured path this **retires the registration; it does not
+    /// release the admission journal** while work remains. A task already
+    /// launched, and the terminal write that records its outcome, keep
+    /// their hold on the journal until they finish — so a second provider
+    /// on the same journal path is still refused until then. That is the
+    /// guarantee that no two owners ever both believe they may launch paid
+    /// work.
     #[napi]
     pub fn stop(&self) {
         let _ = self.inner.lock().take();
@@ -202,6 +389,17 @@ impl A2aServeHandle {
     #[napi(getter)]
     pub fn serving(&self) -> bool {
         self.inner.lock().is_some()
+    }
+
+    /// How many nRPC services are registered: three on the free `serveA2a`
+    /// path, five on the configured one (which also serves
+    /// `net.a2a.prepare` and `net.a2a.describe`). `0` once stopped.
+    #[napi(getter)]
+    pub fn services(&self) -> u32 {
+        self.inner
+            .lock()
+            .as_ref()
+            .map_or(0, |(_, r)| r.services() as u32)
     }
 }
 
@@ -232,24 +430,15 @@ impl NetMesh {
     ) -> Result<PromiseRaw<'env, A2aServeHandle>> {
         let node = self.node_arc_clone()?;
         let tsfn: ExecutorTsfn = executor.build_threadsafe_function().build()?;
-        let timeout = match options.and_then(|o| o.handler_timeout_ms) {
-            Some(0) => None, // explicit opt-out: cancellation is the only control
-            Some(ms) => Some(std::time::Duration::from_millis(u64::from(ms))),
-            None => Some(DEFAULT_TASK_HANDLER_TIMEOUT),
-        };
+        let timeout = executor_timeout(options.and_then(|o| o.handler_timeout_ms));
         env.spawn_future(async move {
             let mesh = mesh_over(node, None);
             let registry = TaskRegistry::new();
-            let executor: Arc<dyn TaskExecutor> = Arc::new(NodeTaskExecutor {
-                callback: tsfn,
-                timeout,
-            });
+            let executor: Arc<dyn TaskExecutor> = Arc::new(NodeTaskExecutor::new(tsfn, timeout));
             let handles = mesh
                 .serve_a2a(registry, executor)
                 .map_err(|e| a2a_err(format!("serveA2a failed: {e}")))?;
-            Ok(A2aServeHandle {
-                inner: Mutex::new(Some((mesh, handles))),
-            })
+            Ok(A2aServeHandle::new(mesh, Registered::Legacy(handles)))
         })
     }
 
@@ -269,16 +458,13 @@ impl NetMesh {
     /// `service` + `revision` (both or neither) name a catalog entry on
     /// such a provider, and address that catalog's **free** entries only:
     /// this is the uncharged submit verb. Naming a *paid* entry is refused
-    /// by the provider (`ERR_PAYMENT`, schematic reason `missing_quote`)
-    /// before the executor runs, because a paid admission needs a quote id
-    /// and a signed binding — and buying one is Rust/Python only
-    /// (`submit_task_paid` has no Node twin; paid A2A serving and
-    /// purchasing are out of scope for this binding). That refusal is the
-    /// provider's to make: pricing lives in its catalog, so this binding
-    /// cannot tell a free entry from a paid one without a `describeA2a`
-    /// round-trip it does not expose, and it therefore does not pretend to
-    /// reject the pair client-side. A provider serving the legacy free
-    /// path ignores both fields.
+    /// by the provider (payment status `0x8006`) before the executor runs,
+    /// because a paid admission needs a reservation, a quote id and a signed
+    /// binding: buy one through `CapabilityGateway.prepareTask` /
+    /// `purchaseTask` / `submitTask`, or present one with `submitTaskPaid`.
+    /// This verb does not consult `describeA2a` to refuse a paid entry
+    /// client-side — pricing is the provider's, and it says so on the wire.
+    /// A provider serving the legacy free path ignores both fields.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub async fn submit_task(
@@ -292,7 +478,7 @@ impl NetMesh {
         revision: Option<String>,
     ) -> Result<String> {
         let target = u64_arg("targetNodeId", target_node_id)?;
-        let mesh = mesh_over(self.node_arc_clone()?, None);
+        let mesh = self.a2a_requester()?;
         let mut brief = TaskBrief::new(prompt)
             .with_context_refs(context_refs.unwrap_or_default())
             .with_tags(tags.unwrap_or_default());
@@ -339,7 +525,7 @@ impl NetMesh {
         task_id: String,
     ) -> Result<Option<String>> {
         let target = u64_arg("targetNodeId", target_node_id)?;
-        let mesh = mesh_over(self.node_arc_clone()?, None);
+        let mesh = self.a2a_requester()?;
         let record = mesh
             .task_status(target, &task_id)
             .await
@@ -361,9 +547,100 @@ impl NetMesh {
     #[napi]
     pub async fn cancel_task(&self, target_node_id: BigInt, task_id: String) -> Result<bool> {
         let target = u64_arg("targetNodeId", target_node_id)?;
-        let mesh = mesh_over(self.node_arc_clone()?, None);
+        let mesh = self.a2a_requester()?;
         mesh.cancel_task(target, &task_id)
             .await
             .map_err(|e| a2a_err(format!("cancelTask: {e}")))
+    }
+
+    /// **Requester side.** What `targetNodeId` serves, as a JSON array of
+    /// `A2aOffer`s — one per catalog entry, with bounds, retention terms and,
+    /// for a paid entry, its `net.pricing.terms@1`. Uncharged; the only
+    /// sanctioned way to learn a price. A provider on the legacy free path
+    /// (`serveA2a`) has no describe service and rejects. The bounds are u64:
+    /// read them with `a2aU64` where exactness matters.
+    #[napi(js_name = "describeA2a")]
+    pub async fn describe_a2a(&self, target_node_id: BigInt) -> Result<String> {
+        let target = u64_arg("targetNodeId", target_node_id)?;
+        let mesh = self.a2a_requester()?;
+        let offers = mesh
+            .describe_a2a(target)
+            .await
+            .map_err(|e| a2a_err(format!("describeA2a: {e}")))?;
+        serde_json::to_string(&offers).map_err(|e| a2a_err(format!("encode offers: {e}")))
+    }
+
+    /// **Requester side, raw.** Submit a prepared task with its payment
+    /// proof: the brief from `preparedJson`, the quote id and binding
+    /// signature from `proofJson`, to the prepared provider. Keeps no
+    /// records — `CapabilityGateway.submitTask` is the durable verb. Safe to
+    /// resend.
+    ///
+    /// Pass both documents exactly as `a2aDocument` extracted them (never
+    /// through `JSON.parse` / `JSON.stringify`, which rounds the u64
+    /// provider node). Resolves the accepted task id. A payment or admission
+    /// refusal rejects with `a2a:payment_refused:` followed by
+    /// `{"message", "schematic"}` (`classifyError` turns it into
+    /// `PaymentRefusedError`); an over-long brief or an unpresentable proof
+    /// rejects `a2a:invalid_argument:` before any packet.
+    #[napi(js_name = "submitTaskPaid")]
+    pub async fn submit_task_paid(
+        &self,
+        prepared_json: String,
+        proof_json: String,
+    ) -> Result<String> {
+        let prepared: PreparedTask = serde_json::from_str(&prepared_json).map_err(|e| {
+            invalid(format!(
+                "preparedJson is not a PreparedTask document (pass \
+                 a2aDocument(prepareEnvelope, '/prepared') verbatim): {e}"
+            ))
+        })?;
+        let proof: TaskPaymentProof = serde_json::from_str(&proof_json).map_err(|e| {
+            invalid(format!(
+                "proofJson is not a TaskPaymentProof document (pass \
+                 a2aDocument(purchaseEnvelope, '/proof') verbatim): {e}"
+            ))
+        })?;
+        let mesh = self.a2a_requester()?;
+        let ack = mesh
+            .submit_task_paid(&prepared, &proof)
+            .await
+            .map_err(paid_submit_err)?;
+        if !ack.accepted {
+            return Err(a2a_err(format!(
+                "executor rejected the task: {}",
+                ack.reason.unwrap_or_else(|| "no reason given".to_string())
+            )));
+        }
+        Ok(ack.task_id)
+    }
+}
+
+// Its own `#[napi] impl` block, cfg'd as a whole: napi-derive registers every
+// method of a block, so a per-method `#[cfg]` leaves a dangling registration
+// in builds without `org`.
+#[cfg(feature = "org")]
+#[napi]
+impl NetMesh {
+    /// Install (or clear with `null`) the organization identity the A2A
+    /// requester verbs on **this mesh** present to a PROTECTED provider — one
+    /// serving its catalog under `principal: "same_org"` or `"granted"`.
+    /// Applies to `describeA2a`, `submitTask`, `submitTaskPaid`,
+    /// `taskStatus` and `cancelTask` from the next call on.
+    ///
+    /// A `CapabilityGateway` has its own slot (`gateway.setA2aOrgCaller`) for
+    /// the prepare → purchase → submit lifecycle it composes; setting one does
+    /// not set the other. Rejects with `org:credentials:closed` for a closed
+    /// client.
+    #[napi(js_name = "setA2aOrgCaller")]
+    pub fn set_a2a_org_caller(&self, org_client: Option<&crate::org::OrgClient>) -> Result<()> {
+        let installed = match org_client {
+            Some(client) => Some(client.shared().ok_or_else(|| {
+                Error::from_reason("org:credentials:closed: this OrgClient has been closed")
+            })?),
+            None => None,
+        };
+        self.a2a_org_caller_slot().lock().install(installed);
+        Ok(())
     }
 }

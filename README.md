@@ -346,7 +346,7 @@ behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/m
 | Deck — operator surface | ✓ | ✓ | ✓ | ✓ | ✓ |
 | MCP bridge | ✓ | ✓ | ✓ | ✓ | ✓ |
 | A2A — agent task handoff | ✓ | ✓ | ✓ | – | – |
-| A2A — paid task admission | ✓ | – | ✓ | – | – |
+| A2A — paid task admission | ✓ | ✓ | ✓ | – | – |
 | Consumer-side filter DSL | ✓ | ✓ | ✓ | – | ✓ |
 
 `✓` supported · `core-only` reachable only through the low-level binding (`@net-mesh/core`,

@@ -84,7 +84,10 @@ export type ClaimOutcome = 'won' | 'lost';
 /** Selection policy for {@link MeshNode.matchIslands}. */
 export type SelectionPolicy = 'least_loaded' | 'pack' | 'load_band' | 'lowest_id';
 
-import { getNapiMesh, setNapiMesh } from './_internal.js';
+import { getNapiMesh, nativeOrgClientOf, setNapiMesh } from './_internal.js';
+import type { OrgClient as SdkOrgClient } from './org/index.js';
+import type { OrgClient as NapiOrgClient } from '@net-mesh/core';
+import type { TypedOrgClient } from '@net-mesh/core/org';
 import {
   capabilityFilterToNapi,
   capabilityRequirementToNapi,
@@ -1075,6 +1078,26 @@ export class MeshNode {
   /** Cancel `taskId` on the executor; resolves to whether it was in flight. */
   cancelTask(...args: Parameters<NapiNetMesh['cancelTask']>): ReturnType<NapiNetMesh['cancelTask']> {
     return this.native.cancelTask(...args);
+  }
+
+  /** What `targetNodeId` serves, as a JSON array of `A2aOffer`s — uncharged; the only sanctioned way to learn a price. Read u64 fields with `a2aU64`. */
+  describeA2a(...args: Parameters<NapiNetMesh['describeA2a']>): ReturnType<NapiNetMesh['describeA2a']> {
+    return this.native.describeA2a(...args);
+  }
+
+  /**
+   * Install (or clear with `null`) the organization identity this mesh's A2A
+   * requester verbs present to a PROTECTED provider. Accepts the SDK's
+   * `OrgClient`, a `TypedOrgClient`, or the native client. A
+   * `CapabilityGateway` has its own slot (`setA2aOrgCaller(gateway, org)`).
+   */
+  setA2aOrgCaller(org: SdkOrgClient | TypedOrgClient | NapiOrgClient | null): void {
+    this.native.setA2aOrgCaller(nativeOrgClientOf(org) as NapiOrgClient | null);
+  }
+
+  /** Raw paid submit: a `prepared` document plus its payment `proof`, both passed exactly as `a2aDocument` extracted them. Keeps no records (`CapabilityGateway.submitTask` is the durable verb). A refusal is a `PaymentRefusedError` after `classifyError`. */
+  submitTaskPaid(...args: Parameters<NapiNetMesh['submitTaskPaid']>): ReturnType<NapiNetMesh['submitTaskPaid']> {
+    return this.native.submitTaskPaid(...args);
   }
 
   // ---- Publishing this node's own tools (publish builds) ----

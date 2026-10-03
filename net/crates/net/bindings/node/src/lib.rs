@@ -11,6 +11,16 @@
 // over `net_sdk::{a2a, mesh_a2a}`; gated on `a2a` (delegation + cortex).
 #[cfg(feature = "a2a")]
 mod a2a;
+// Abandoned-vs-rejected classification for every JS-Promise bridge.
+// Ungated: its callers span many features, so builds that use none of
+// them would otherwise warn about dead code.
+#[allow(dead_code)]
+mod js_promise;
+// Paid A2A, provider half (NODE_A2A_PAID_ADMISSION_PLAN.md WS-B):
+// `PaymentProvider.serveA2aConfigured` + the operator queue, over the
+// shared `net_payments::flow::a2a::json` boundary.
+#[cfg(all(feature = "a2a", feature = "payments", feature = "publish"))]
+mod a2a_paid;
 #[cfg(feature = "dataforts")]
 mod blob;
 #[cfg(feature = "net")]
@@ -1686,6 +1696,44 @@ mod mesh_bindings {
         #[cfg(feature = "org")]
         #[cfg_attr(test, allow(dead_code))]
         subnet_exports: Arc<net_sdk::subnet::NamedSubnetExports>,
+        /// The organization identity the A2A requester verbs present to a
+        /// PROTECTED provider (`setA2aOrgCaller`). A slot on the native mesh,
+        /// not on an SDK `Mesh`, because every requester verb builds a fresh
+        /// SDK `Mesh` over the live node — sharing the node is not sharing
+        /// this slot (NODE_A2A_PAID_ADMISSION_PLAN.md WS-C, review R6).
+        #[cfg(all(feature = "a2a", feature = "org"))]
+        #[cfg_attr(test, allow(dead_code))]
+        a2a_org_caller: Arc<parking_lot::Mutex<A2aOrgCallerSlot>>,
+    }
+
+    /// The `setA2aOrgCaller` slot: the installed org client, and a
+    /// generation every install (including a clear) advances.
+    ///
+    /// The generation is what lets a refused `shutdown()` put back the
+    /// identity it released without overriding a newer intent: an empty
+    /// slot cannot say whether `shutdown()` emptied it or a concurrent
+    /// `setA2aOrgCaller(null)` did, and restoring over the latter would
+    /// leave the mesh identified after an explicit clear.
+    #[cfg(all(feature = "a2a", feature = "org"))]
+    #[derive(Default)]
+    pub(crate) struct A2aOrgCallerSlot {
+        client: Option<Arc<net_sdk::org::OrgClient>>,
+        generation: u64,
+    }
+
+    #[cfg(all(feature = "a2a", feature = "org"))]
+    impl A2aOrgCallerSlot {
+        /// The installed client, for a requester verb.
+        pub(crate) fn client(&self) -> Option<Arc<net_sdk::org::OrgClient>> {
+            self.client.clone()
+        }
+
+        /// Install (or clear, with `None`) — the user's intent, so it
+        /// advances the generation.
+        pub(crate) fn install(&mut self, client: Option<Arc<net_sdk::org::OrgClient>>) {
+            self.client = client;
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     #[napi]
@@ -1853,6 +1901,8 @@ mod mesh_bindings {
                 recv_cursor: Arc::new(std::sync::atomic::AtomicU16::new(0)),
                 #[cfg(feature = "org")]
                 subnet_exports,
+                #[cfg(all(feature = "a2a", feature = "org"))]
+                a2a_org_caller: Arc::new(parking_lot::Mutex::new(A2aOrgCallerSlot::default())),
             })
         }
 
@@ -2615,6 +2665,29 @@ mod mesh_bindings {
         /// still fails — just after the window, never hanging.
         #[napi]
         pub async fn shutdown(&self) -> Result<()> {
+            // The A2A org caller installed by `setA2aOrgCaller` is an SDK
+            // org client, which holds a node reference of its own; release
+            // it here so an installed identity never blocks shutdown.
+            //
+            // Only a `Weak` is kept: a shutdown that fails on a genuine
+            // outstanding reference leaves the mesh usable, and must leave
+            // its identity installed with it. The client is still alive then
+            // whenever anything else holds it (the JS `OrgClient` it came
+            // from, a gateway slot) — and an open JS `OrgClient` is itself an
+            // outstanding node reference, so that is the usual failure. Only
+            // a client the slot alone kept alive (its JS handle already
+            // closed) is gone for good, exactly as `close()` intended.
+            //
+            // Released without advancing the generation (this is not the
+            // user's intent), and the generation it was released at is
+            // recorded: the restore below happens only if no
+            // `setA2aOrgCaller` landed in between.
+            #[cfg(all(feature = "a2a", feature = "org"))]
+            let (org_caller, org_caller_generation) = {
+                let mut slot = self.a2a_org_caller.lock();
+                let released = slot.client.take().map(|client| Arc::downgrade(&client));
+                (released, slot.generation)
+            };
             // ~250 ms total (50 × 5 ms) — imperceptible in the common
             // path (first `try_unwrap` succeeds), ample for a handful of
             // serve-task teardown ticks in the race path.
@@ -2636,6 +2709,17 @@ mod mesh_bindings {
                             // so a later shutdown (after the caller
                             // releases it) can still succeed.
                             self.node.store(Some(arc));
+                            // Restore the identity too — unless a concurrent
+                            // `setA2aOrgCaller` (an install OR a clear) landed
+                            // meanwhile, which is the newer intent and wins.
+                            #[cfg(all(feature = "a2a", feature = "org"))]
+                            {
+                                let mut slot = self.a2a_org_caller.lock();
+                                if slot.generation == org_caller_generation {
+                                    slot.client =
+                                        org_caller.as_ref().and_then(std::sync::Weak::upgrade);
+                                }
+                            }
                             return Err(Error::from_reason(
                                 "cannot shutdown: outstanding references exist",
                             ));
@@ -2687,6 +2771,12 @@ mod mesh_bindings {
                 Some(arc) => Ok(arc.clone()),
                 None => Err(Error::from_reason("MeshNode has been shut down")),
             }
+        }
+
+        /// The A2A organization-identity slot (`setA2aOrgCaller`).
+        #[cfg(all(feature = "a2a", feature = "org"))]
+        pub(crate) fn a2a_org_caller_slot(&self) -> &Arc<parking_lot::Mutex<A2aOrgCallerSlot>> {
+            &self.a2a_org_caller
         }
 
         /// The runtime `create()` ran on, for sibling modules whose

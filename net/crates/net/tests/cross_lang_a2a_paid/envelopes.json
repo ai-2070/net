@@ -1,0 +1,342 @@
+{
+  "attempts_after_submit": [
+    {
+      "commitment": "<str>",
+      "generation": {
+        "incarnation": "<str>",
+        "seq": "<int>"
+      },
+      "key": {
+        "caller_hex": "<str>",
+        "provider_node": "<int>",
+        "task_id": "xl-ok"
+      },
+      "payload_bytes": "<str>",
+      "prepared": {
+        "brief": {
+          "context_refs": [],
+          "prompt": "<str>",
+          "revision": "r1",
+          "service": "summarize",
+          "tags": [],
+          "task_id": "xl-ok"
+        },
+        "offer_hash": "<str>",
+        "provider_node": "<int>",
+        "reservation": {
+          "admission_id": "<str>",
+          "capability": "<str>",
+          "commitment": "<str>",
+          "expires_at": "<int>",
+          "pricing_terms": "<str>",
+          "purchase_hash": "<str>",
+          "task_id": "xl-ok"
+        }
+      },
+      "quote_bytes": "<str>",
+      "quote_expires_at_ns": "<int>",
+      "quote_id": "<str>",
+      "retained": false,
+      "state": {
+        "state": "submitted",
+        "task_id": "xl-ok"
+      },
+      "updated_at_ns": "<int>"
+    }
+  ],
+  "attempts_paid_unexecutable": [
+    {
+      "commitment": "<str>",
+      "generation": {
+        "incarnation": "<str>",
+        "seq": "<int>"
+      },
+      "key": {
+        "caller_hex": "<str>",
+        "provider_node": "<int>",
+        "task_id": "xl-revoked"
+      },
+      "payload_bytes": "<str>",
+      "prepared": {
+        "brief": {
+          "context_refs": [],
+          "prompt": "<str>",
+          "revision": "r1",
+          "service": "summarize",
+          "tags": [],
+          "task_id": "xl-revoked"
+        },
+        "offer_hash": "<str>",
+        "provider_node": "<int>",
+        "reservation": {
+          "admission_id": "<str>",
+          "capability": "<str>",
+          "commitment": "<str>",
+          "expires_at": "<int>",
+          "pricing_terms": "<str>",
+          "purchase_hash": "<str>",
+          "task_id": "xl-revoked"
+        }
+      },
+      "quote_bytes": "<str>",
+      "quote_expires_at_ns": "<int>",
+      "quote_id": "<str>",
+      "retained": false,
+      "state": {
+        "billing": {
+          "billing_event": "<str>",
+          "quote_id": "<str>",
+          "transaction": "<str>"
+        },
+        "proof": {
+          "binding_sig": [
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>",
+            "<int>"
+          ],
+          "quote_id": "<str>"
+        },
+        "refusal": {
+          "at_ns": "<int>",
+          "message": "<str>",
+          "reason": "admission_revoked",
+          "safe_to_requote": false,
+          "safe_to_retry": false
+        },
+        "state": "paid_unexecutable"
+      },
+      "updated_at_ns": "<int>"
+    }
+  ],
+  "prepare_ok": {
+    "prepared": {
+      "brief": {
+        "context_refs": [],
+        "prompt": "<str>",
+        "revision": "r1",
+        "service": "summarize",
+        "tags": [],
+        "task_id": "xl-ok"
+      },
+      "offer_hash": "<str>",
+      "provider_node": "<int>",
+      "reservation": {
+        "admission_id": "<str>",
+        "capability": "<str>",
+        "commitment": "<str>",
+        "expires_at": "<int>",
+        "pricing_terms": "<str>",
+        "purchase_hash": "<str>",
+        "task_id": "xl-ok"
+      }
+    },
+    "quote": {
+      "amount": "2500",
+      "asset": "musd",
+      "expires_at_ns": "<int>",
+      "network": "mock:net",
+      "quote_id": "<str>"
+    },
+    "status": "ok"
+  },
+  "prepare_unknown_service": {
+    "message": "<str>",
+    "retryable": false,
+    "status": "rejected"
+  },
+  "purchase_after_unexecutable": {
+    "message": "<str>",
+    "quote_id": "<str>",
+    "retryable": false,
+    "status": "failed",
+    "task_id": "xl-revoked"
+  },
+  "purchase_paid": {
+    "billing": {
+      "billing_event": "<str>",
+      "quote_id": "<str>",
+      "transaction": "<str>"
+    },
+    "proof": {
+      "binding_sig": [
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>",
+        "<int>"
+      ],
+      "quote_id": "<str>"
+    },
+    "quote_id": "<str>",
+    "status": "paid",
+    "task_id": "xl-ok"
+  },
+  "submit_accepted": {
+    "status": "accepted",
+    "task_id": "xl-ok"
+  },
+  "submit_unexecutable": {
+    "message": "<str>",
+    "schematic": {
+      "reason": "admission_revoked",
+      "safe_to_requote": false,
+      "safe_to_retry": false
+    },
+    "status": "unexecutable",
+    "task_id": "xl-revoked"
+  },
+  "unresolved_empty": [],
+  "unresolved_reconcile": [
+    {
+      "admission_id": "<str>",
+      "attempts": [],
+      "brief": {
+        "context_refs": [],
+        "prompt": "<str>",
+        "revision": "r1",
+        "service": "summarize",
+        "tags": [],
+        "task_id": "xl-revoked"
+      },
+      "commitment": "<str>",
+      "deciding": false,
+      "generation": "<int>",
+      "owner": {
+        "kind": "peer",
+        "node": "<int>"
+      },
+      "paid": true,
+      "reservation_retention_secs": "<int>",
+      "retention_secs": "<int>",
+      "revision": "r1",
+      "service_id": "summarize",
+      "state": {
+        "admission": "reconcile",
+        "claimed_quote_id": "<str>",
+        "reason": "authority revoked before execution"
+      },
+      "task_id": "xl-revoked",
+      "updated_at": "<int>"
+    }
+  ]
+}

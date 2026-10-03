@@ -13,6 +13,12 @@
  * (`CapabilityGateway` additionally needs `payments`); published packages
  * ship every feature.
  *
+ * `CapabilityGateway`'s constructor takes a **native** `NetMesh`, which a
+ * {@link MeshNode} does not hand out: from the SDK, build it with
+ * `createCapabilityGateway(meshNode, options)` (exported from the package
+ * root, `@net-mesh/sdk`), which adapts
+ * the handle and returns this same native class.
+ *
  * @example
  * ```typescript
  * import { PinStore } from '@net-mesh/sdk';

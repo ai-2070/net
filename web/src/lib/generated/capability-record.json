@@ -37,7 +37,7 @@
           "status": "not exposed"
         },
         "Node / TS": {
-          "status": "not exposed"
+          "status": "supported"
         },
         "Python": {
           "status": "supported"

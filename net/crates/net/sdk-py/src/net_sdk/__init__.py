@@ -394,6 +394,30 @@ except ImportError:  # pragma: no cover - minimal build
 else:
     __all__ += ["AsyncCapabilityGateway", "CapabilityGateway"]
 
+# Payments + paid A2A over the SDK's MeshNode (NODE_A2A_PAID_ADMISSION_PLAN.md
+# WS-G): factories that adapt the mesh handle and return the native objects,
+# plus the native classes and refusals, so a paid-A2A program never imports
+# `net`. Each native name is present iff the wheel has its feature.
+from net_sdk import payments as _payments  # noqa: E402
+from net_sdk.payments import (  # noqa: E402
+    create_async_capability_gateway,
+    create_capability_gateway,
+    create_payment_provider,
+    set_a2a_org_caller,
+)
+
+__all__ += [
+    "create_async_capability_gateway",
+    "create_capability_gateway",
+    "create_payment_provider",
+    "set_a2a_org_caller",
+]
+for _name in ("PaymentProvider", "PaymentRefused", "JournalOwnedElsewhere"):
+    if _name in _payments.__all__:
+        globals()[_name] = getattr(_payments, _name)
+        __all__.append(_name)
+del _name
+
 # Delegated agent identity (`HERMES_INTEGRATION_PLAN.md` Phase 3): the
 # DelegationChain (`root -> machine -> gateway -> subagent`) + shared
 # RevocationRegistry + child-`Identity` derivation. Present iff the wheel was

@@ -46,6 +46,8 @@ const ROWS: [string, unknown[]][] = [
   ['submitTask', [S('target'), S('prompt'), S('refs'), S('tags'), S('taskId')]],
   ['taskStatus', [S('target'), S('taskId')]],
   ['cancelTask', [S('target'), S('taskId')]],
+  ['describeA2a', [S('target')]],
+  ['submitTaskPaid', [S('prepared'), S('proof')]],
   ['publishTools', [S('tools'), S('handler'), S('options')]],
   ['rendezvousString', []],
   ['serveEnrollmentAuto', [S('operator'), S('ttl'), S('depth')]],
@@ -83,5 +85,40 @@ describe('MeshNode forwards every S5 method to the native node', async () => {
     });
     expect(forwarders.length).toBeGreaterThanOrEqual(25);
     expect(ROWS.map(([name]) => name).sort()).toEqual(forwarders.sort());
+  });
+
+  // Not a pure forward: it unwraps whichever org-client form it is handed to
+  // the native client (NODE_A2A_PAID_ADMISSION_PLAN.md D7).
+  it('setA2aOrgCaller unwraps the SDK, typed and native org clients', () => {
+    const raw = S('native-org-client');
+    const forms: [string, unknown][] = [
+      ['sdk OrgClient', { typed: { raw } }],
+      ['TypedOrgClient', { raw }],
+      ['native client', raw],
+    ];
+    for (const [label, form] of forms) {
+      native.setA2aOrgCaller?.mockClear();
+      (node as unknown as { setA2aOrgCaller(o: unknown): void }).setA2aOrgCaller(form);
+      expect(native.setA2aOrgCaller.mock.calls[0][0], label).toBe(raw);
+    }
+    native.setA2aOrgCaller.mockClear();
+    (node as unknown as { setA2aOrgCaller(o: unknown): void }).setA2aOrgCaller(null);
+    expect(native.setA2aOrgCaller.mock.calls[0][0]).toBeNull();
+  });
+
+  // PR review (cubic): a wrapper whose inner handle is missing, or a value
+  // that is no client at all, is refused here with a clear TypeError rather
+  // than handed to the native boundary as if it were the native client.
+  it('setA2aOrgCaller refuses a broken wrapper or a non-object', () => {
+    const set = (o: unknown) =>
+      (node as unknown as { setA2aOrgCaller(o: unknown): void }).setA2aOrgCaller(o);
+    native.setA2aOrgCaller?.mockClear();
+    for (const broken of [{ typed: null }, { typed: {} }, { typed: { raw: undefined } }, { raw: undefined }, { raw: null }]) {
+      expect(() => set(broken), JSON.stringify(broken)).toThrow(TypeError);
+    }
+    for (const notAClient of [42, 'client', true]) {
+      expect(() => set(notAClient), String(notAClient)).toThrow(TypeError);
+    }
+    expect(native.setA2aOrgCaller?.mock.calls.length ?? 0).toBe(0);
   });
 });

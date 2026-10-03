@@ -169,8 +169,8 @@ happens **before a quote exists**, and the launch is claimed durably
 
 | Step | What it does | Money |
 |---|---|---|
-| `prepare` | validates the brief, runs the provider's preflight, reserves capacity, mints the admission id | none — read-only on the money side |
-| `purchase` | quotes against *that* reservation, runs spend policy, pays once, stores the evidence | the one charge |
+| `prepare` | validates the brief, runs the provider's preflight, reserves capacity, mints the admission id, quotes, and persists the attempt | none — no funds move |
+| `purchase` | consumes the quote prepare stored against *that* reservation, runs spend policy, pays once, stores the evidence | the one charge |
 | `submit` | sends the brief with its evidence; the provider redeems, claims the launch, then runs it | none |
 
 `prepare` answers `busy` when the service is at `max_in_flight`. Nothing was
@@ -250,9 +250,60 @@ and a durable journal beside it:
 | Binding | Paid surface |
 |---|---|
 | Rust | `serve_a2a_configured`, `describe_a2a`, `prepare_a2a`, `submit_task_paid` |
-| Python | serve with `PaymentProvider.serve_a2a_configured`; buy with `CapabilityGateway.prepare_task` / `purchase_task` / `submit_task` |
-| Node / TypeScript | **Not available** — neither serving nor purchasing is bound. `submitTask` is the free verb only; there is no `describeA2a`, no prepare/purchase pair, and no `submitTaskPaid`. |
+| Python | serve with `PaymentProvider.serve_a2a_configured`; buy with `CapabilityGateway.prepare_task` / `purchase_task` / `submit_task`; from `net_sdk`, build both with `create_payment_provider` / `create_capability_gateway` |
+| Node / TypeScript | serve with `PaymentProvider.serveA2aConfigured`; buy with `CapabilityGateway.prepareTask` / `purchaseTask` / `submitTask`; raw `NetMesh.describeA2a` / `submitTaskPaid`; from `@net-mesh/sdk`, build both with `createPaymentProvider` / `createCapabilityGateway` |
 | Go | **Not available** |
+
+From TypeScript, through the SDK:
+
+```typescript
+import {
+  MeshNode, createPaymentProvider, createCapabilityGateway, a2aDocument, classifyError,
+} from '@net-mesh/sdk';
+
+const provider = createPaymentProvider(node, {
+  statePath: 'state/engine.json',
+  facilitatorUrl: 'https://facilitator.example.com',
+});
+const terms = await provider.pricingTerms(`${node.nodeId()}/net.a2a.task/summarize`, requirementsJson);
+const handle = await provider.serveA2aConfigured(
+  async (brief) => runTheJob(brief),               // brief.service / brief.revision are set
+  { summarize: { revision: 'r1', pricingTerms: terms,
+                 bounds: { maxPromptBytes: 1024n, maxContextRefs: 8n, maxTags: 8n,
+                           maxTagBytes: 64n, maxInFlight: 4n },
+                 reservationTtlSecs: 600n, reservationRetentionSecs: 604800n,
+                 retentionSecs: 3600n } },
+  'state/a2a-journal.json',
+);
+
+const gateway = createCapabilityGateway(caller, {
+  paymentPolicyPath: 'state/spend-policy.json',
+  paymentProfile: 'production',
+  a2aPurchasePath: 'state/a2a-purchases.json',
+});
+const env = await gateway.prepareTask(providerNodeId, 'summarize', 'the filings');
+const prepared = a2aDocument(env, '/prepared');   // never JSON.parse + JSON.stringify
+const bought = JSON.parse(await gateway.purchaseTask(prepared));
+if (bought.status === 'paid') await gateway.submitTask(prepared);
+```
+
+Three Node-specific rules:
+
+- **Hand documents back with `a2aDocument`, read u64 fields with `a2aU64`.**
+  Paid-A2A documents carry u64 integers — `prepared.provider_node`, a quote's
+  `expires_at_ns`, recovery generations — and `JSON.parse` rounds anything
+  above 2^53, so a `prepared` document round-tripped through it can name a
+  different provider. Status strings and messages are safe to `JSON.parse`.
+- **Errors are prefixed native `Error`s until `classifyError` types them**:
+  `PaymentRefusedError` (with the provider's schematic, kept byte-exact),
+  `JournalOwnedElsewhereError`, `A2aInvalidArgumentError`.
+- **A JS executor cannot be aborted from outside.** A cancel — or the
+  `handlerTimeoutMs` deadline (default one hour) — records the task's terminal
+  state and discards the handler's eventual result, but the handler's own side
+  effects continue unless it cooperates. On a paid service a timeout is a
+  terminal execution failure, never a refund. And `stop()` / `close()` retire
+  the registration without releasing the admission journal while a launched
+  task can still record its outcome.
 
 ## See also
 

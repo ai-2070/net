@@ -3762,6 +3762,26 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: npm run build:ts
 
+      # The Node twin of C5 (`test/a2a_paid.test.ts`, "retained vs live
+      # resolution", NODE_A2A_PAID_ADMISSION_PLAN.md WS-F / review S1) shells
+      # out to the same Rust fixture seeder the Python job builds: it archives
+      # a retained incarnation through the production `retain_superseded` API.
+      # Built here so `npm test` does not compile a Rust target inside a
+      # test; the test builds it itself when the variable is unset (the local
+      # path) and hard-fails rather than skipping. `--tests` for the same
+      # pin-guard reason as the Python job's step.
+      - name: Build the A2A history-boundary fixture seeder
+        working-directory: net/crates/net
+        run: |
+          exe=$(cargo test -p net-payments --features mesh \
+                  --tests --no-run --message-format json \
+                | jq -r 'select(.reason=="compiler-artifact")
+                         | select(.target.name=="review_python_seed")
+                         | .executable' | tail -1)
+          test -n "$exe" && test -x "$exe" \
+            || { echo "::error::the C5 fixture seeder did not build"; exit 1; }
+          echo "NET_A2A_SEEDER_EXE=$exe" >> "$GITHUB_ENV"
+
       - name: Run tests
         run: npm test
 
@@ -4414,6 +4434,43 @@ jobs:
             exit 1
           fi
 
+      # === the sdk-py paid-A2A witnesses (NODE_A2A_PAID_ADMISSION_PLAN.md WS-G)
+      # Here, not in `sdk-py-tests`, for the org facade step's reason: these
+      # are live rows through `net_sdk` — an executed consumer subprocess,
+      # because the sdk-py conftest stubs `net` — and need the built extension
+      # and the installed wrapper only this job has. The test's own probe
+      # SKIPS where no wheel loads (the sdk-py-tests job), so the floor and the
+      # by-name check below are what keep a skip from reading as a pass, and
+      # it FAILS on a partial or stubbed paid surface.
+      - name: Witness roster + floor — sdk-py paid A2A (5)
+        working-directory: net/crates/net/sdk-py
+        env:
+          PYTHONFAULTHANDLER: "1"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -uo pipefail
+          pins="test_paid_a2a_runs_once_from_sdk_mesh_nodes
+            test_paid_a2a_runs_from_async_mesh_nodes_via_to_thread
+            test_the_factories_accept_a_native_net_mesh
+            test_the_boundary_refusals_are_the_native_ones
+            test_a_same_org_identity_reaches_the_paid_lifecycle_on_both_slots"
+          # shellcheck disable=SC2086 # word-splitting $pins is the point
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" --label test_paid_a2a_sdk --mode decl \
+            --source tests/test_paid_a2a_sdk.py $pins || exit 1
+          out=$(python -m pytest -v --timeout=900 --timeout-method=thread \
+                  tests/test_paid_a2a_sdk.py 2>&1 | tee /dev/stderr)
+          for pin in $pins; do
+            printf '%s\n' "$out" | grep -qE "::${pin} PASSED" || {
+              echo "::error::pinned paid-A2A witness ${pin} did not pass"; exit 1; }
+          done
+          n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "sdk-py paid A2A: ${n:-0} (floor 5)"
+          if [ -z "$n" ] || [ "$n" -lt 5 ]; then
+            echo "::error::the sdk-py paid-A2A suite ran ${n:-0} rows, floor is 5 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+
       # Executed, not just type-checked. hello.py's siblings in Rust and
       # TypeScript both compiled clean for months while hanging forever on a
       # subscribe that could never yield; only running them found it. The
@@ -5053,8 +5110,12 @@ jobs:
             # included because the TS-SDK ships with `dataforts` (and the
             # transfer / traversal NAPI surfaces would otherwise go
             # unlinted — that gap hid a dead-code lint on the transfer
-            # stream-id helpers).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers,dataforts,nat-traversal,port-mapping,org
+            # stream-id helpers). `delegation` / `a2a` add the Hermes
+            # delegation + A2A modules, including the paid provider surface
+            # (`src/a2a_paid.rs`, gated on `a2a` + `payments` + `publish`) —
+            # without them neither A2A module was linted, though both ship
+            # in the default build (NODE_A2A_PAID_ADMISSION_PLAN.md WS-B).
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers,dataforts,nat-traversal,port-mapping,org,delegation,a2a
           - name: python
             path: net/crates/net/bindings/python
             # The widest service-free pyo3 surface. `meshdb` /
