@@ -549,10 +549,13 @@ fn attempt_row(attempt: &PurchaseAttempt, retained: bool) -> Result<Value, A2aBo
 /// A key is the only thing taken from the class-blind listing — never a
 /// class, which is what the listing cannot answer.
 async fn my_keys(flow: &A2aCallerFlow) -> Result<Vec<(u64, String)>, A2aBoundaryError> {
+    // A set for the membership test, a Vec for the order: the store is
+    // machine-shared, so a linear `contains` made every queue read quadratic.
+    let mut seen: std::collections::HashSet<(u64, String)> = std::collections::HashSet::new();
     let mut keys: Vec<(u64, String)> = Vec::new();
     for attempt in mine(flow).await? {
         let key = (attempt.key.provider_node, attempt.key.task_id);
-        if !keys.contains(&key) {
+        if seen.insert(key.clone()) {
             keys.push(key);
         }
     }

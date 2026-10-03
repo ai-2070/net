@@ -15,7 +15,8 @@
  *
  * `CapabilityGateway`'s constructor takes a **native** `NetMesh`, which a
  * {@link MeshNode} does not hand out: from the SDK, build it with
- * `createCapabilityGateway(meshNode, options)` (`./payments`), which adapts
+ * `createCapabilityGateway(meshNode, options)` (exported from the package
+ * root, `@net-mesh/sdk`), which adapts
  * the handle and returns this same native class.
  *
  * @example

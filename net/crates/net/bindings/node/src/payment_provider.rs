@@ -326,7 +326,11 @@ mod provider {
         /// retire them too — otherwise a JS caller that closed the provider
         /// but not the handle would keep the node referenced until GC.
         #[cfg(feature = "a2a")]
-        a2a_serves: Arc<Mutex<Vec<crate::a2a::SharedRegistration>>>,
+        ///
+        /// Held **weakly** (the handle is the owner), and `None` once
+        /// `close()` has run, so a serve that resolves after `close()` sees
+        /// the provider closed and retires its own registration.
+        a2a_serves: Arc<Mutex<Option<Vec<crate::a2a::WeakRegistration>>>>,
     }
 
     #[napi]
@@ -444,7 +448,7 @@ mod provider {
                 #[cfg(feature = "a2a")]
                 a2a_store: Arc::new(Mutex::new(None)),
                 #[cfg(feature = "a2a")]
-                a2a_serves: Arc::new(Mutex::new(Vec::new())),
+                a2a_serves: Arc::new(Mutex::new(Some(Vec::new()))),
             })
         }
 
@@ -461,8 +465,12 @@ mod provider {
             // created. Like `A2aServeHandle.stop()`, this does not release
             // the admission journal while launched tasks still hold it.
             #[cfg(feature = "a2a")]
-            for registration in self.a2a_serves.lock().drain(..) {
-                let _ = registration.lock().take();
+            if let Some(registrations) = self.a2a_serves.lock().take() {
+                for weak in registrations {
+                    if let Some(registration) = weak.upgrade() {
+                        let _ = registration.lock().take();
+                    }
+                }
             }
         }
 
@@ -637,6 +645,30 @@ mod provider {
     }
 
     // Paid A2A, provider half (NODE_A2A_PAID_ADMISSION_PLAN.md WS-B). Its own
+    /// Whether a configured serve may register: the provider is not closed,
+    /// and no configured catalog it created is still serving.
+    #[cfg(feature = "a2a")]
+    fn a2a_slot_open(slot: &Option<Vec<crate::a2a::WeakRegistration>>) -> Result<()> {
+        let Some(registrations) = slot else {
+            return Err(Error::from_reason(
+                "payment provider has been closed — construct a new one to serve A2A",
+            ));
+        };
+        let serving = registrations
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .any(|r| r.lock().is_some());
+        if serving {
+            return Err(Error::from_reason(
+                "a2a: this PaymentProvider already serves a configured A2A catalog — \
+                 stop() its handle first, or use a second PaymentProvider (one \
+                 configured catalog per provider: its journal is the one \
+                 a2aUnresolved / a2aResolve read)",
+            ));
+        }
+        Ok(())
+    }
+
     // `#[napi] impl` block, cfg'd as a whole: napi-derive registers every
     // method of a block, so a per-method `#[cfg]` leaves a dangling
     // registration in builds without `a2a`.
@@ -663,7 +695,15 @@ mod provider {
         /// owns the journal, and `a2a:invalid_argument:` on a catalog it
         /// cannot serve (a paid entry is never served free). The node must be
         /// `start()`ed. Hold the resolved handle; `stop()` it (or `close()`
-        /// this provider) before `mesh.shutdown()`.
+        /// this provider) before `mesh.shutdown()`. Dropping the handle also
+        /// unregisters (the provider holds it only weakly).
+        ///
+        /// **One configured catalog per provider.** While one is serving, a
+        /// second call rejects `a2a:` — its journal is the one `a2aUnresolved`
+        /// / `a2aResolve` read, so a silent second one would hide the first's
+        /// queue. `stop()` the first, or use a second `PaymentProvider`. A
+        /// `close()` that lands while this call is still opening wins: the
+        /// new registration is retired and the call rejects.
         #[napi(js_name = "serveA2aConfigured")]
         #[allow(clippy::too_many_arguments)]
         pub fn serve_a2a_configured<'env>(
@@ -700,9 +740,22 @@ mod provider {
             let store_slot = Arc::clone(&self.a2a_store);
             let serves = Arc::clone(&self.a2a_serves);
             env.spawn_future(async move {
-                let (handle, store) = crate::a2a_paid::serve(spec?).await?;
+                let spec = spec?;
+                // Cheap pre-check, so a refused serve does not first open
+                // (and run the recovery pass over) a journal it will drop.
+                a2a_slot_open(&serves.lock())?;
+                let (handle, store) = crate::a2a_paid::serve(spec).await?;
+                // Re-checked under the lock: `close()` or a concurrent serve
+                // may have landed while the journal was opening.
+                let mut guard = serves.lock();
+                if let Err(refusal) = a2a_slot_open(&guard) {
+                    handle.stop();
+                    return Err(refusal);
+                }
+                let registrations = guard.get_or_insert_with(Vec::new);
+                registrations.retain(|w| w.strong_count() > 0);
+                registrations.push(Arc::downgrade(&handle.shared()));
                 *store_slot.lock() = Some(Arc::downgrade(&store));
-                serves.lock().push(handle.shared());
                 Ok(handle)
             })
         }

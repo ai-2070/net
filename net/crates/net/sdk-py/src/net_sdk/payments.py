@@ -143,10 +143,15 @@ def set_a2a_org_caller(target: Any, org: Any) -> None:
     one does not set the other. An ``AsyncCapabilityGateway`` is refused: it
     has no paid-A2A lifecycle to present an identity to.
     """
-    from net import CapabilityGateway as _CapabilityGateway
+    # Each class guarded on its own: a wheel built without `payments` / `mcp`
+    # has no gateway at all, and the mesh path below must still work there.
+    try:
+        from net import CapabilityGateway as _CapabilityGateway
+    except ImportError:  # pragma: no cover - build without payments
+        _CapabilityGateway = None
 
     native_org = _native_org_client(org)
-    if isinstance(target, _CapabilityGateway):
+    if _CapabilityGateway is not None and isinstance(target, _CapabilityGateway):
         target.set_a2a_org_caller(native_org)
         return
     try:

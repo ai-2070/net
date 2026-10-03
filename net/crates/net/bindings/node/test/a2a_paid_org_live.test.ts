@@ -133,16 +133,22 @@ describe.skipIf(!HAS)('paid a2a — org-admitted principal, live (WS-F, R6)', ()
 
   it('both org-caller slots carry a same-org identity through a paid lifecycle, and clearing them denies before launch', async () => {
     const p = (rel: string) => join(dir, rel)
-    const state = mkdtempSync(join(tmpdir(), 'a2a-org-state-'))
-    const providerMesh = await meshFromSeed(m.provider.seed_hex, m.psk_hex)
-    const callerMesh = await meshFromSeed(m.caller.seed_hex, m.psk_hex)
+    // Everything acquired inside the `try`, so a failure anywhere in setup
+    // still reaches the cleanup below (PR review).
+    let state: string | undefined
+    let providerMesh: Any
+    let callerMesh: Any
     let provider: Any
     let handle: Any
     let gateway: Any
     let client: Any
+    let shutDown = false
     const ran: string[] = []
     const owners: string[] = []
     try {
+      state = mkdtempSync(join(tmpdir(), 'a2a-org-state-'))
+      providerMesh = await meshFromSeed(m.provider.seed_hex, m.psk_hex)
+      callerMesh = await meshFromSeed(m.caller.seed_hex, m.psk_hex)
       installOrgAuthority(providerMesh, p(m.provider.authority_dir))
       installOrgAuthority(callerMesh, p(m.caller.authority_dir))
       await handshake(callerMesh, providerMesh)
@@ -243,6 +249,20 @@ describe.skipIf(!HAS)('paid a2a — org-admitted principal, live (WS-F, R6)', ()
       callerMesh.setA2aOrgCaller(null)
       await expect(callerMesh.describeA2a(target)).rejects.toThrow()
       expect(ran).toEqual(['org-task-1'])
+
+      // PR review (cubic): an identity left installed must not block
+      // shutdown — the slot holds an SDK org client with its own node
+      // reference, and `shutdown()` releases it. Re-install, release the
+      // documented handles, and require the shutdown to succeed.
+      callerMesh.setA2aOrgCaller(client)
+      handle.stop()
+      provider.close()
+      gateway.close()
+      client.close()
+      handle = provider = gateway = client = undefined
+      await callerMesh.shutdown()
+      await providerMesh.shutdown()
+      shutDown = true
     } finally {
       handle?.stop()
       provider?.close()
@@ -252,9 +272,11 @@ describe.skipIf(!HAS)('paid a2a — org-admitted principal, live (WS-F, R6)', ()
       } catch {
         /* already closed */
       }
-      await callerMesh.shutdown().catch(() => {})
-      await providerMesh.shutdown().catch(() => {})
-      rmSync(state, { recursive: true, force: true })
+      if (!shutDown) {
+        await callerMesh?.shutdown().catch(() => {})
+        await providerMesh?.shutdown().catch(() => {})
+      }
+      if (state) rmSync(state, { recursive: true, force: true })
     }
   }, 300_000)
 })

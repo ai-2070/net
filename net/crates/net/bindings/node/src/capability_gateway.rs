@@ -681,6 +681,13 @@ impl CapabilityGateway {
     /// `close()`, `search` / `describe` / `invoke` resolve to a structured
     /// `closed` status (never a throw). The operator approval verbs still work —
     /// they reopen the spend-policy store, independent of the node.
+    ///
+    /// A call already in flight (an `invoke`, a `prepareTask` /
+    /// `purchaseTask` / `submitTask`) keeps the handles it cloned until it
+    /// settles: await your outstanding calls before `mesh.shutdown()`. That
+    /// is deliberate — a paid call cut off mid-flight would leave its
+    /// purchase attempt in an ambiguous state, which is worse than a
+    /// shutdown that waits.
     #[napi]
     pub fn close(&self) {
         let _ = self.live.lock().take();

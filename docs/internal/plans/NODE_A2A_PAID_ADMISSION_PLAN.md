@@ -514,7 +514,7 @@ r2.2) depends only on A and is in scope for the same release.
   suites and the cross-binding fixture instead, not by a Rust unit test.
 - [x] **Cross-binding fixture captured before the move** (pulled forward from
   WS-F): `bindings/python/tests/test_a2a_paid_cross_lang.py` writes / checks
-  `tests/cross_lang_a2a_paid/envelopes.json`, the shapes of 11 documents
+  `tests/cross_lang_a2a_paid/envelopes.json`, the shapes of 10 documents
   (happy path + post-payment revocation), with per-run values masked by type.
   **Defect found in the capture, fixed:** `unresolved_empty` was captured as
   a `launched` row. A launched task stays in the provider's unresolved class
@@ -522,7 +522,7 @@ r2.2) depends only on A and is in scope for the same release.
   registry already reports `completed`. Waiting on task state was therefore
   not enough (1 failure in 3 runs, then 2 in 12). The fixture now polls the
   queue itself until it drains (0 failures in 20 runs). Only that one entry
-  was corrected by hand; the other ten are the pre-move capture. **The Node
+  was corrected by hand; the other nine are the pre-move capture. **The Node
   suite must use the same poll.**
 
 **Proved by:** `tests/test_a2a_paid.py` green **unedited** and
@@ -733,14 +733,14 @@ malformed-document refusals.
 
 ### WS-E — TS surface
 
-- [ ] `index.d.ts` regenerates (gitignored); verify every new shape.
-- [ ] `errors.ts`: the two classes + prefixes (D4), wired into
+- [x] `index.d.ts` regenerates (gitignored); verify every new shape.
+- [x] `errors.ts`: the two classes + prefixes (D4), wired into
   `classifyError`; `errors.test.ts` cases.
-- [ ] ~~`sdk-ts`: forward `describeA2a` / `submitTaskPaid` / `setA2aOrgCaller`
+- ~~`sdk-ts`: forward `describeA2a` / `submitTaskPaid` / `setA2aOrgCaller`
   …; `PaymentProvider` / `CapabilityGateway` are native re-exports, so their
   new methods arrive with the typings.~~ **r2 (R7):** false for
   `PaymentProvider`, and the ctors need a native `NetMesh` anyway.
-- [ ] **r2.1 (D7): the `@net-mesh/sdk` ergonomic layer.** New
+- [x] **r2.1 (D7): the `@net-mesh/sdk` ergonomic layer.** New
   `sdk-ts/src/payments.ts`, exported from the SDK root:
   `createPaymentProvider`, `createCapabilityGateway`, the two options types,
   `setA2aOrgCaller`, and re-exports of `a2aDocument`, `a2aU64`,
@@ -748,12 +748,12 @@ malformed-document refusals.
   `MeshNode` gains `describeA2a` / `submitTaskPaid` forwards. The existing
   root `CapabilityGateway` re-export stays as it is (no symbol changes type).
   Its doc comment points SDK users at `createCapabilityGateway`.
-- [ ] A type-level guard that each options mapping covers the native
+- [x] A type-level guard that each options mapping covers the native
   constructor exactly. The test asserts the mapped tuple type equals
   `ConstructorParameters<typeof NapiPaymentProvider>` /
   `<typeof NapiCapabilityGateway>` minus the mesh, so a parameter added to a
   native ctor without an options key fails `typecheck`, not a user.
-- [ ] A consumer-compile case (the `test/consumer/` + `consumer_compile.test.ts`
+- [x] A consumer-compile case (the `test/consumer/` + `consumer_compile.test.ts`
   precedent) that compiles **and runs** the exact documented imports against
   the built package entry points: `NetMesh`, `PaymentProvider`,
   `CapabilityGateway`, `a2aDocument`, `a2aU64` from `@net-mesh/core`, and
@@ -835,7 +835,7 @@ malformed-document refusals.
 
 ### WS-F — Tests, docs, matrix
 
-- [ ] `bindings/node/test/a2a_paid.test.ts`: the twin of `test_a2a_paid.py`
+- [~] **Partial (recorded at PR review):** not every Python case has a Node twin. Missing in Node: lapsed reservation keeps its `admission_id`, gate denial then a valid retry, a rejected approval re-opening the key, a malformed `outcomeJson` refused, one id on two providers resolved by naming the provider, two identities sharing one store, and the unknown-incarnation refusal. Each is decided in the shared projection or the Rust core, which `test_a2a_paid.py` and the cross-binding fixture exercise; the Node suite covers the binding seams. Original bullet: `bindings/node/test/a2a_paid.test.ts`: the twin of `test_a2a_paid.py`
   over the mock facilitator (`unsafeDevMockFacilitator: true`), case for case
   where the property is reachable from JS — free success through the catalog,
   price-it-cannot-enforce refusal, second provider on one journal (in-process
@@ -856,7 +856,7 @@ malformed-document refusals.
   store see only their own, generation-scoped resolve + its unknown-incarnation
   refusal. Plus Node-only: the preflight throw refuses (D3), a paid
   task past `handlerTimeoutMs` ends `failed` and is not re-run.
-- [ ] **r2 additions** (each named for the finding it witnesses):
+- [x] **r2 additions** (each named for the finding it witnesses):
   - **R1 lossless handoff** (rewritten in r2.3, S1). Ids: the harness
     searches keypairs until the derived node id is **not representable as a
     double**: `BigInt(Number(id)) !== id`. Being above
@@ -924,7 +924,7 @@ malformed-document refusals.
     cross-org `granted` principal stays explicitly qualified as covered only
     by the SDK's `a2a_admission_identity`, unless this harness's cross-org
     scenario extends to it cheaply.
-- [ ] **Cross-binding vector test:** drive one scripted lifecycle and assert
+- [x] **Cross-binding vector test:** drive one scripted lifecycle and assert
   the Node envelopes equal checked-in JSON fixtures that the Python suite
   asserts too (`tests/cross_lang_a2a_paid/`, the `cross_lang_*` convention),
   volatile fields (ids, timestamps) masked. **r2 (R1):** equality is of JSON
@@ -932,7 +932,7 @@ malformed-document refusals.
   and never via `JSON.parse`. The fixtures are captured from today's Python
   output before WS-A starts. Under D1 this is a tripwire; under the fallback
   it is the only guard.
-- [ ] Matrix flips to `✓` for Node/TS in all three sources (README table,
+- [x] Matrix flips to `✓` for Node/TS in all three sources (README table,
   `event-bus.yaml` with anchor `serveA2aConfigured`, skill `coverage.md`
   both tables); `web/src/content/docs/guides/agent-to-agent.md` "paid
   services" section gains the TS snippets; `.claude/skills/net-event-bus/a2a.md`
@@ -944,7 +944,7 @@ malformed-document refusals.
   with `a2aDocument`, never `JSON.parse`/`JSON.stringify` (D2a), and the
   paid-timeout and one-sided cancellation caveats sit beside them (D3); release note
   under `net/crates/net/docs/releases/` mirrored via `npm run sync:releases`.
-- [ ] CI: no feature-list change (already `payments,a2a,org`); the new vitest
+- [x] **Corrected:** CI did change — the `ffi-clippy` node entry gained `delegation,a2a` (WS-B), the node job builds the C5 seeder (WS-F), and `python-tests` pins the sdk-py paid rows (WS-G). Original bullet: CI: no feature-list change (already `payments,a2a,org`); the new vitest
   file is auto-discovered. If WS-F adds `tests/cross_lang_a2a_paid/` fixtures
   read by a Rust test, pin that test in `ci.yml` per the pin-guard rule.
 
@@ -956,7 +956,7 @@ releases sync); the skill-snippet checker.
 > **Status: WS-F landed 2026-10-03, except the release note (below).**
 >
 > - **Cross-binding fixture.** The Node half is in `test/a2a_paid.test.ts`
->   ("cross-binding fixture"): the Node binding reproduces all 11 documents of
+>   ("cross-binding fixture"): the Node binding reproduces all 10 documents of
 >   the Python-captured `tests/cross_lang_a2a_paid/envelopes.json` exactly.
 >   That is the D1 tripwire, and it passed on the first run. Shapes mask every
 >   integer to `"<int>"`, so the comparison is precision-free by construction.
@@ -1030,7 +1030,7 @@ releases sync); the skill-snippet checker.
 Independent of the Node slices; it may land any time after WS-A. Same rule
 as D7: **adapt handles and return native objects; implement nothing.**
 
-- [ ] `sdk-py/src/net_sdk/payments.py`, re-exported from `net_sdk`:
+- [x] `sdk-py/src/net_sdk/payments.py`, re-exported from `net_sdk`:
   `create_payment_provider(mesh, state_path, **kwargs)`,
   `create_capability_gateway(mesh, **kwargs)` and
   `create_async_capability_gateway(mesh, **kwargs)` (scope in the matrix
@@ -1042,10 +1042,10 @@ as D7: **adapt handles and return native objects; implement nothing.**
   no SDK edit, and the native constructor stays the single source of truth for
   validation. Imports are guarded like `consent.py`, so a wheel built without
   `payments` / `a2a` still imports `net_sdk`.
-- [ ] Re-export `PaymentProvider`, `PaymentRefused` and
+- [x] Re-export `PaymentProvider`, `PaymentRefused` and
   `JournalOwnedElsewhere` from `net_sdk` (guarded), so a paid-A2A program
   never imports `net`.
-- [ ] `MeshNode.set_a2a_org_caller(org)` / `AsyncMeshNode` twin, and a module
+- [x] `MeshNode.set_a2a_org_caller(org)` / `AsyncMeshNode` twin, and a module
   helper `set_a2a_org_caller(gateway, org)`. Both accept a
   `net_sdk.org.OrgClient` (unwrapped via its `.raw`, `org/__init__.py:119-128`),
   a native `OrgClient`, or `None`, and set the right slot: the `NetMesh` slot
@@ -1053,7 +1053,7 @@ as D7: **adapt handles and return native objects; implement nothing.**
   gateway helper accepts **only the sync `CapabilityGateway`**. Given an
   `AsyncCapabilityGateway` it raises `TypeError`, naming the sync gateway as
   the paid-A2A surface.
-- [ ] **r2.3 (S2): the async matrix, stated rather than implied.** Adapting
+- [x] **r2.3 (S2): the async matrix, stated rather than implied.** Adapting
   an `AsyncMeshNode` is not async paid A2A. The native
   `AsyncCapabilityGateway` refuses `a2a_purchase_path` and has no paid verbs
   or org setter (`bindings/python/src/capability_gateway.rs:1402-1440`,
@@ -1069,12 +1069,12 @@ as D7: **adapt handles and return native objects; implement nothing.**
   No SDK-side async wrapper around the financial verbs is added. Wrapping
   them in an automatic thread hop would be new behavior on a money path, and
   native async paid parity is not owed by this plan (named in Not in scope).
-- [ ] **No D2a analog, on purpose.** Python ints are arbitrary precision and
+- [x] **No D2a analog, on purpose.** Python ints are arbitrary precision and
   `json.loads` / `json.dumps` round-trip u64 exactly, so R1 is a JavaScript
   defect. The Python docs keep the frozen pattern
   (`json.dumps(env["prepared"])`). A regression case pins it (a
   `provider_node` above 2⁵³ survives that round-trip).
-- [ ] Docs: `.claude/skills/net-event-bus/a2a.md` §"Paid A2A" and the
+- [x] (Done in WS-F.) Docs: `.claude/skills/net-event-bus/a2a.md` §"Paid A2A" and the
   agent-to-agent guide show the `net_sdk` form first; the raw-`net` form
   stays valid and is kept as the low-level variant.
   `examples/a2a_paid.py` (CI-executed) is left on raw `net`, so it keeps

@@ -99,30 +99,36 @@ describe('paid A2A is exported from the SDK root', () => {
 describe('paid A2A over MeshNode', () => {
   it('a provider and a caller built from MeshNodes run a paid task once, then shut down cleanly', async () => {
     const [caller, providerNode] = await connectedPair();
-    const provider = createPaymentProvider(providerNode, {
-      statePath: path('engine.json'),
-      billingLogPath: path('billing.jsonl'),
-      unsafeDevMockFacilitator: true,
-    });
+    // Every handle is acquired inside the `try`, so a failure anywhere in
+    // setup still releases them and shuts both nodes down (PR review).
+    let provider: ReturnType<typeof createPaymentProvider> | undefined;
+    let handle: { stop(): void } | undefined;
+    let gateway: ReturnType<typeof createCapabilityGateway> | undefined;
+    let shutDown = false;
     const ran: string[] = [];
-    const terms = await provider.pricingTerms(
-      `${providerNode.nodeId()}/net.a2a.task/summarize`,
-      MOCK_REQS,
-    );
-    const handle = await provider.serveA2aConfigured(
-      async (brief: { taskId: string }) => {
-        ran.push(brief.taskId);
-        return `blob://${brief.taskId}`;
-      },
-      { summarize: offer(terms) },
-      path('journal.json'),
-    );
-    const gateway = createCapabilityGateway(caller, {
-      paymentPolicyPath: path('spend-policy.json'),
-      paymentProfile: 'dev_test',
-      a2aPurchasePath: path('a2a-purchases.json'),
-    });
     try {
+      provider = createPaymentProvider(providerNode, {
+        statePath: path('engine.json'),
+        billingLogPath: path('billing.jsonl'),
+        unsafeDevMockFacilitator: true,
+      });
+      const terms = await provider.pricingTerms(
+        `${providerNode.nodeId()}/net.a2a.task/summarize`,
+        MOCK_REQS,
+      );
+      handle = await provider.serveA2aConfigured(
+        async (brief: { taskId: string }) => {
+          ran.push(brief.taskId);
+          return `blob://${brief.taskId}`;
+        },
+        { summarize: offer(terms) },
+        path('journal.json'),
+      );
+      gateway = createCapabilityGateway(caller, {
+        paymentPolicyPath: path('spend-policy.json'),
+        paymentProfile: 'dev_test',
+        a2aPurchasePath: path('a2a-purchases.json'),
+      });
       let env = '';
       for (let i = 0; i < 8; i++) {
         env = await gateway.prepareTask(providerNode.nodeId(), 'summarize', 'sdk paid', [], [], 'sdk-1');
@@ -153,15 +159,24 @@ describe('paid A2A over MeshNode', () => {
       // the native classes.
       const refused = await rejectionOf(gateway.purchaseTask('{}'));
       expect(classifyError(refused)).toBeInstanceOf(A2aInvalidArgumentError);
-    } finally {
+
+      // The factories retained nothing beyond the native objects' documented
+      // references: once those are released, both nodes shut down.
       handle.stop();
       provider.close();
       gateway.close();
+      await caller.shutdown();
+      await providerNode.shutdown();
+      shutDown = true;
+    } finally {
+      if (!shutDown) {
+        handle?.stop();
+        provider?.close();
+        gateway?.close();
+        await caller.shutdown().catch(() => {});
+        await providerNode.shutdown().catch(() => {});
+      }
     }
-    // The factories retained nothing beyond the native objects' documented
-    // references: once those are released, both nodes shut down.
-    await caller.shutdown();
-    await providerNode.shutdown();
   }, 60000);
 
   it('a native NetMesh is accepted by the same factories', async () => {

@@ -278,17 +278,24 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — provider (WS-B)', () => {
     })
   }, 30000)
 
-  it('owns its journal: a second serve on the same path is refused until the first stops', async () => {
+  it('owns its journal: a second owner of the same path is refused until the first stops', async () => {
     await withLone(async (mesh, provider) => {
       const path = tmp('journal.json')
       const services = { [FREE]: offer() }
       const first = await provider.serveA2aConfigured(executor([]), services, path)
+      // The rival needs a node of its own: a node serves the payments wire
+      // once, so a second PaymentProvider cannot share this one.
+      const rivalMesh = await meshUnstarted()
+      await rivalMesh.start()
+      const rival = devProvider(rivalMesh, tmp('engine-rival.json'))
       try {
-        expect(await rejection(provider.serveA2aConfigured(executor([]), services, path))).toMatch(
+        expect(await rejection(rival.serveA2aConfigured(executor([]), services, path))).toMatch(
           /^a2a:journal_owned_elsewhere: /,
         )
       } finally {
         first.stop()
+        rival.close()
+        await rivalMesh.shutdown()
       }
       // Idle case: nothing was launched, so retiring the registration is
       // what releases the journal (the under-work case is a later witness).
@@ -298,10 +305,50 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — provider (WS-B)', () => {
     })
   }, 30000)
 
+  // PR review (cubic): one provider, one configured catalog. A second one
+  // would replace the journal the operator verbs read and hide the first's
+  // queue, so it is refused while the first serves — on any journal path.
+  it('serves one configured catalog per provider at a time', async () => {
+    await withLone(async (_mesh, provider) => {
+      const first = await provider.serveA2aConfigured(executor([]), { [FREE]: offer() }, tmp('j1.json'))
+      try {
+        expect(
+          await rejection(provider.serveA2aConfigured(executor([]), { [FREE]: offer() }, tmp('j2.json'))),
+        ).toMatch(/^a2a: this PaymentProvider already serves a configured A2A catalog/)
+      } finally {
+        first.stop()
+      }
+      const second = await provider.serveA2aConfigured(executor([]), { [FREE]: offer() }, tmp('j3.json'))
+      expect(second.serving).toBe(true)
+      second.stop()
+    })
+  }, 30000)
+
+  // PR review (cubic): a serve still opening its journal when close() lands
+  // must not leave the provider serving a node it was told to release. The
+  // race goes either way, so either outcome is accepted — the serve rejects
+  // (closed before it registered), or it resolved first and close() retired
+  // it — and in both the mesh then shuts down, which is the property.
+  it('a close() racing an in-flight serve retires it, so the mesh can shut down', async () => {
+    for (let round = 0; round < 5; round++) {
+      const mesh = await meshUnstarted()
+      await mesh.start()
+      const provider = devProvider(mesh, tmp('engine.json'))
+      const pending = provider.serveA2aConfigured(executor([]), { [FREE]: offer() }, tmp('journal.json'))
+      provider.close()
+      const outcome = await pending.then(
+        (h: Any) => (h.serving ? 'still serving' : 'retired'),
+        (e: Error) => e.message,
+      )
+      expect(outcome).toMatch(/^retired$|has been closed/)
+      await mesh.shutdown()
+    }
+  }, 60000)
+
   it('answers the operator queue only while a journal is live', async () => {
     await withLone(async (mesh, provider) => {
       expect(await rejection(provider.a2aUnresolved())).toMatch(
-        /^a2a:invalid_argument: no A2A admission journal is live/,
+        /^a2a: no A2A admission journal is live/,
       )
       const handle = await provider.serveA2aConfigured(
         executor([]),
@@ -482,7 +529,15 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — provider (WS-B)', () => {
         expect(await rejection(submit('pf-throw'))).toMatch(/preflight refused: the preflight (threw|rejected)/)
         mode = 'hang'
         const t0 = Date.now()
-        expect(await rejection(submit('pf-hang'))).toMatch(/did not answer within 5000 ms/)
+        const hangMsg = await rejection(submit('pf-hang'))
+        // A never-settling Promise is refused either at the 5 s budget or —
+        // when nothing references it and V8 collects it first, which a busy
+        // run makes likely — as an abandoned Promise (napi's "oneshot
+        // canceled"). Found at PR review; both paths fail closed and neither
+        // launches, which is the property.
+        expect(hangMsg).toMatch(
+          /preflight refused: (the preflight did not answer within 5000 ms|the preflight rejected or did not return null or a string: .*oneshot canceled)/,
+        )
         // A received refusal, inside the caller's 30 s budget (review R3).
         expect(Date.now() - t0).toBeLessThan(15000)
         expect(ran.map((x) => x.taskId)).toEqual(['pf-admit'])

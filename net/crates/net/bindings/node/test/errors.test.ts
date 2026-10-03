@@ -5,7 +5,14 @@
 import { describe, expect, it } from 'vitest'
 
 import { MemoriesAdapter, NetDb, Redex, TasksAdapter } from '../index'
-import { classifyError, CortexError, NetDbError } from '../errors'
+import {
+  A2aInvalidArgumentError,
+  classifyError,
+  CortexError,
+  JournalOwnedElsewhereError,
+  NetDbError,
+  PaymentRefusedError,
+} from '../errors'
 
 const ORIGIN = 0xabcdef01n
 
@@ -136,13 +143,8 @@ describe('regression: BigInt boundary validation', () => {
 // Paid A2A (NODE_A2A_PAID_ADMISSION_PLAN.md D4). Pure classification of the
 // native prefixes; the live refusals that produce them are pinned in
 // a2a_paid.test.ts.
-describe('paid a2a error classification', async () => {
-  const {
-    classifyError: classify,
-    PaymentRefusedError,
-    JournalOwnedElsewhereError,
-    A2aInvalidArgumentError,
-  } = await import('../errors')
+describe('paid a2a error classification', () => {
+  const classify = classifyError
 
   it('splits a payment refusal into its message and its untouched schematic', () => {
     // A schematic number above 2^53 in the open `extra` map must survive

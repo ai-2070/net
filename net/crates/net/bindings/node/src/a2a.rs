@@ -326,9 +326,14 @@ impl Registered {
     }
 }
 
-/// The registration a handle owns, shared with the `PaymentProvider` that
-/// created it so `provider.close()` can retire it too.
+/// The registration a handle owns.
 pub(crate) type SharedRegistration = Arc<Mutex<Option<(SdkMesh, Registered)>>>;
+
+/// The `PaymentProvider`'s view of a registration it created: **weak**, so
+/// the handle stays the only owner and dropping it (a `#[napi]` class is
+/// GC-finalized) still unregisters the services, while `provider.close()` can
+/// retire any registration that is still alive.
+pub(crate) type WeakRegistration = std::sync::Weak<Mutex<Option<(SdkMesh, Registered)>>>;
 
 /// Keeps the served A2A services alive (returned by `NetMesh.serveA2a` or
 /// `PaymentProvider.serveA2aConfigured`). Dropping it or calling

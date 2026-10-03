@@ -2630,6 +2630,11 @@ mod mesh_bindings {
         /// still fails — just after the window, never hanging.
         #[napi]
         pub async fn shutdown(&self) -> Result<()> {
+            // The A2A org caller installed by `setA2aOrgCaller` is an SDK
+            // org client, which holds a node reference of its own; release
+            // it here so an installed identity never blocks shutdown.
+            #[cfg(all(feature = "a2a", feature = "org"))]
+            let _ = self.a2a_org_caller.lock().take();
             // ~250 ms total (50 × 5 ms) — imperceptible in the common
             // path (first `try_unwrap` succeeds), ample for a handful of
             // serve-task teardown ticks in the race path.

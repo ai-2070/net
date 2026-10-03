@@ -39,6 +39,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 
 import net_sdk
 from net_sdk.payments import (
@@ -460,12 +461,23 @@ def main() -> int:
     parser.add_argument("--cell", required=True, choices=sorted(CELLS))
     parser.add_argument("--scenario-dir", help="the same-org artifacts (same_org cell)")
     args = parser.parse_args()
-    if args.cell == "same_org":
-        if not args.scenario_dir:
-            parser.error("--scenario-dir is required for the same_org cell")
-        receipt = cell_same_org(args.scenario_dir)
-    else:
-        receipt = CELLS[args.cell]()
+    if args.cell == "same_org" and not args.scenario_dir:
+        parser.error("--scenario-dir is required for the same_org cell")
+    try:
+        if args.cell == "same_org":
+            receipt = cell_same_org(args.scenario_dir)
+        else:
+            receipt = CELLS[args.cell]()
+    except BaseException:  # noqa: BLE001
+        # A cell that fails part-way can leave a serve handle and live meshes
+        # whose native threads would keep this interpreter from exiting — the
+        # wrapper would then see a 300 s timeout instead of this failure.
+        # Report the failure and exit hard: every resource is this process's,
+        # so it is released with it, on every cell and every failure path.
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
     print("CELL_OK " + json.dumps(receipt, sort_keys=True))
     sys.stdout.flush()
     return 0

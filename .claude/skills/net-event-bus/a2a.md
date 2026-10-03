@@ -262,9 +262,12 @@ launches once), `outcome_unknown` (never relaunched), `admission_revoked`
 requester built before it existed cannot decode it**. It is the one wire
 addition of the paid path, and only a configured catalog emits it.
 
-**Paid serving is Rust and Python only.** Node/TypeScript is requester-side
-(free) and Go has no A2A at all — say so rather than generating a call that
-does not exist.
+**Paid serving and purchasing are Rust, Python and Node/TypeScript.** Node
+serves with `PaymentProvider.serveA2aConfigured` and buys through
+`CapabilityGateway.prepareTask` / `purchaseTask` / `submitTask` (from
+`@net-mesh/sdk`, build both with `createPaymentProvider` /
+`createCapabilityGateway`). Go has no A2A at all — say so rather than
+generating a call that does not exist.
 
 ---
 

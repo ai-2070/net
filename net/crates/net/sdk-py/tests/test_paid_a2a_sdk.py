@@ -167,6 +167,18 @@ def same_org_scenario():
         pytest.skip("cargo not on PATH (scenario generation needs a Rust toolchain)")
     outdir = os.path.join(tempfile.gettempdir(), f"paid-a2a-org-{uuid.uuid4().hex}")
     os.makedirs(outdir)
+    try:
+        _mint_same_org(outdir)
+    except BaseException:
+        # A failed mint (broken build, timeout, missing manifest key) must not
+        # leave a scenario directory behind on every failed run.
+        shutil.rmtree(outdir, ignore_errors=True)
+        raise
+    yield outdir
+    shutil.rmtree(outdir, ignore_errors=True)
+
+
+def _mint_same_org(outdir: str) -> None:
     subprocess.run(
         [
             "cargo", "run", "-q", "-p", "net-mesh-sdk",
@@ -184,8 +196,6 @@ def same_org_scenario():
         os.path.join(outdir, m["provider"]["authority_dir"], "owner-audience.key"),
         os.path.join(outdir, m["caller"]["authority_dir"], "owner-audience.key"),
     )
-    yield outdir
-    shutil.rmtree(outdir, ignore_errors=True)
 
 
 def test_a_same_org_identity_reaches_the_paid_lifecycle_on_both_slots(same_org_scenario):

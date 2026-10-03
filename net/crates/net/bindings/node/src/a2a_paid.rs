@@ -21,7 +21,10 @@
 //! Promise<string | null>`. `null` / `undefined` admits; a string refuses
 //! with that reason verbatim; a throw, a rejection, a non-string result or
 //! missing the [`PREFLIGHT_BUDGET`] all **refuse** — an application check
-//! that did not answer admitted nothing.
+//! that did not answer admitted nothing. So does an abandoned Promise: one
+//! that never settles and that nothing references can be collected by V8
+//! before the budget runs out, and napi then reports it as `oneshot
+//! canceled` — refused like a rejection.
 //!
 //! **Stop is retirement, not release** (plan D6). Stopping the returned
 //! handle unregisters the services; the journal's ownership ends only once
@@ -370,9 +373,12 @@ pub(crate) async fn serve(spec: ConfiguredServe) -> Result<(A2aServeHandle, Shar
 pub(crate) fn live_store(
     slot: &parking_lot::Mutex<Option<Weak<dyn AdmissionStore>>>,
 ) -> Result<SharedAdmissionStore> {
+    // A lifecycle state, not the caller's input: the same call succeeds once
+    // `serveA2aConfigured` has opened a journal. So the plain `a2a:` family,
+    // never `a2a:invalid_argument:` ("retrying unchanged cannot succeed").
     slot.lock().as_ref().and_then(Weak::upgrade).ok_or_else(|| {
-        invalid(
-            "no A2A admission journal is live — serveA2aConfigured(...) opens one, \
+        Error::from_reason(
+            "a2a: no A2A admission journal is live — serveA2aConfigured(...) opens one, \
              and it stays live while its serve handle, or any task launched under \
              it, still holds it",
         )
