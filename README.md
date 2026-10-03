@@ -305,11 +305,8 @@ The rest of the surface, one line each; every entry links to the page that goes 
 ## Performance
 
 The full measured set and methodology live in
-[`net/crates/net/BENCHMARKS.md`](net/crates/net/BENCHMARKS.md). The rows below are **local
-operation microbenchmarks** on an M1 Max: each measures one operation in isolation, not the cost
-of a packet path. None includes NIC transfer, wire latency, or propagation, and summing them
-would not produce a round trip. Desktop-class figures and per-subsystem tables — multi-hop,
-encryption, capability folds, SDK ingestion, binary size — are in the linked file.
+[`net/crates/net/BENCHMARKS.md`](net/crates/net/BENCHMARKS.md). Each measures one operation in isolation, not the cost
+of a packet path. None includes NIC transfer, wire latency, or propagation.
 
 ## SDKs
 
