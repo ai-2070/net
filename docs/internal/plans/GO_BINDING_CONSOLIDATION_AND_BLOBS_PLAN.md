@@ -1272,12 +1272,22 @@ Evidence (Windows):
   treated this file as binary from `6e7f8e7` on. It's now the literal
   escape again, and no other tracked text file contains a NUL. The same
   heredoc backslash handling is what collapsed the S2–S6 CI roster steps.
-- **Duplicate error code −120 (deferred, not ours).**
-  `NET_ERR_BLOB_UNAUTHORIZED = -120` (`src/ffi/blob.rs:99`) and
-  `NET_ERR_IDENTITY = -120` (`src/ffi/mesh.rs:109`). A caller that maps codes
-  without knowing which function returned them can't tell them apart. S6
-  numbers its new code from a fresh inventory. Renumbering either constant is
-  an ABI change and is out of scope here.
+- **~~Duplicate error code −120~~: not a defect; error codes are
+  per-surface (reclassified 2026-10-03).** `NET_ERR_BLOB_UNAUTHORIZED = -120`
+  and `NET_ERR_IDENTITY = -120` do share a value, but so do nine more:
+  `NET_ERR_BLOB_DECODE … NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED` are −110…−118,
+  exactly the values of `NET_ERR_MESH_INIT … NET_ERR_MESH_EVENT_TOO_LARGE`,
+  and those mesh codes are the ones published in `include/net.go.h`'s enum.
+  A code's meaning depends on the function that returned it, and no caller
+  receives a code without knowing which surface it called. Renumbering
+  `-120` alone was implemented and then **reverted before commit**: it would
+  have changed an emitted value without making the code space any more
+  consistent, since the other nine overlaps would remain. The real
+  observation is narrower: the `NET_ERR_BLOB_*` codes appear in **no
+  header**, so a C consumer can't name them (Go maps them numerically,
+  pinned by `TestABIStabilityBlobRegistryCodes`). Publishing them is a
+  possible header addition, not a collision fix. S6's −150 was still chosen
+  from a fresh inventory.
 
 - **gofmt drift in eight existing `go/` files (deferred, not ours).**
   `gofmt -l` lists `abi_stability_test.go`, `capabilities.go`,
