@@ -679,3 +679,419 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — requester raw verbs (WS-C)', () => 
     })
   }, 30000)
 })
+
+// ---------------------------------------------------------------------------
+// WS-D — the caller flow on CapabilityGateway
+// ---------------------------------------------------------------------------
+
+const { CapabilityGateway } = binding
+
+/** A live paid provider: node + engine + billing log + journal + catalog. */
+class Provider {
+  readonly ran: Ran[] = []
+  readonly dir = mkdtempSync(join(tmpdir(), 'net-a2a-provider-'))
+  provider: Any
+  handle: Any
+  constructor(
+    readonly mesh: Any,
+    readonly preflight?: (args: Any) => Promise<string | null>,
+  ) {}
+
+  async serve(): Promise<void> {
+    this.provider = new PaymentProvider(
+      this.mesh,
+      join(this.dir, 'engine.json'),
+      join(this.dir, 'billing.jsonl'),
+      undefined,
+      undefined,
+      true,
+    )
+    const terms = await paidTerms(this.mesh, this.provider)
+    this.handle = await this.provider.serveA2aConfigured(
+      executor(this.ran),
+      { [PAID]: offer(terms), [FREE]: offer() },
+      join(this.dir, 'journal.json'),
+      undefined,
+      this.preflight,
+    )
+  }
+
+  /** Full restart over the same engine + journal paths. */
+  async restart(): Promise<void> {
+    this.handle.stop()
+    this.provider.close()
+    // The journal is released once the stopped registration's holders let
+    // go; poll the re-serve rather than assume an instant.
+    const deadline = Date.now() + 5000
+    for (;;) {
+      try {
+        await this.serve()
+        return
+      } catch (e) {
+        if (Date.now() > deadline) throw e
+        await sleep(50)
+      }
+    }
+  }
+
+  async billing(): Promise<Any[]> {
+    return (await this.provider.readBilling()).map((e: string) => JSON.parse(e))
+  }
+
+  async waitBilling(n: number): Promise<void> {
+    const deadline = Date.now() + 8000
+    let seen = 0
+    while (Date.now() < deadline) {
+      seen = (await this.billing()).length
+      if (seen >= n) return
+      await sleep(50)
+    }
+    throw new Error(`billing never reached ${n} events (saw ${seen})`)
+  }
+
+  close(): void {
+    this.handle?.stop()
+    this.provider?.close()
+  }
+}
+
+/** A live paid caller: node + spend policy + purchase store + gateway. */
+class Caller {
+  readonly dir = mkdtempSync(join(tmpdir(), 'net-a2a-caller-'))
+  gateway: Any
+  constructor(
+    readonly mesh: Any,
+    readonly providerNode: bigint,
+    readonly profile = 'dev_test',
+  ) {
+    this.gateway = this.makeGateway()
+  }
+
+  makeGateway(): Any {
+    return new CapabilityGateway(
+      this.mesh,
+      undefined, // pinStorePath
+      join(this.dir, 'spend-policy.json'),
+      this.profile,
+      undefined, // paymentUnsafeMockAutoAllow
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      join(this.dir, 'a2a-purchases.json'),
+    )
+  }
+
+  /** `prepareTask`, retrying only `busy` (nothing reserved, nothing quoted). */
+  async prepare(prompt: string, taskId?: string, service = PAID): Promise<string> {
+    let last = ''
+    for (let i = 0; i < 8; i++) {
+      last = await this.gateway.prepareTask(this.providerNode, service, prompt, [], [], taskId)
+      if (JSON.parse(last).status !== 'busy') return last
+      await sleep(100)
+    }
+    return last
+  }
+
+  /** The `prepared` handle, read losslessly (D2a). */
+  static prepared(envelope: string): string {
+    return a2aDocument(envelope, '/prepared')
+  }
+
+  async purchase(prepared: string): Promise<Any> {
+    return JSON.parse(await this.gateway.purchaseTask(prepared))
+  }
+
+  async submit(prepared: string): Promise<Any> {
+    return JSON.parse(await this.gateway.submitTask(prepared))
+  }
+
+  close(): void {
+    this.gateway?.close()
+  }
+}
+
+/** One provider and N callers, handshaken while unstarted, then started. */
+async function withTopology(
+  opts: { profiles?: string[]; preflight?: (args: Any) => Promise<string | null> },
+  fn: (provider: Provider, callers: Caller[]) => Promise<void>,
+): Promise<void> {
+  const pmesh = await meshUnstarted()
+  const cmeshes: Any[] = []
+  for (const _ of opts.profiles ?? ['dev_test']) {
+    const c = await meshUnstarted()
+    await handshake(c, pmesh)
+    cmeshes.push(c)
+  }
+  await pmesh.start()
+  for (const c of cmeshes) await c.start()
+  const provider = new Provider(pmesh, opts.preflight)
+  const callers: Caller[] = []
+  try {
+    await provider.serve()
+    ;(opts.profiles ?? ['dev_test']).forEach((profile, i) =>
+      callers.push(new Caller(cmeshes[i], pmesh.nodeId(), profile)),
+    )
+    await fn(provider, callers)
+  } finally {
+    for (const c of callers) c.close()
+    provider.close()
+    for (const c of cmeshes) await c.shutdown()
+    await pmesh.shutdown()
+  }
+}
+
+describe.skipIf(!HAS_PAID_A2A)('paid a2a — caller flow (WS-D)', () => {
+  it('prepare is a complete handle and moves no money', async () => {
+    await withTopology({}, async (provider, [caller]) => {
+      const env = await caller.prepare('summarize this', 'prep-1')
+      const parsed = JSON.parse(env)
+      expect(parsed.status, env).toBe('ok')
+      expect(parsed.quote.network).toBe('mock:net')
+      expect(parsed.quote.amount).toBe('2500')
+      expect(a2aU64(env, '/quote/expires_at_ns')).toBeGreaterThan(0n)
+      const prepared = Caller.prepared(env)
+      expect(a2aU64(prepared, '/provider_node')).toBe(caller.providerNode)
+      expect(JSON.parse(prepared).brief.task_id).toBe('prep-1')
+      expect(await provider.billing()).toEqual([])
+      expect(provider.ran).toEqual([])
+    })
+  }, 60000)
+
+  // Review R1, the happy-path leg: the provider's node id is (almost always)
+  // not representable as a double, and the handoff below never parses it.
+  it('a paid task is purchased once and runs exactly once, handed off losslessly', async () => {
+    await withTopology({}, async (provider, [caller]) => {
+      const env = await caller.prepare('summarize this', 'paid-1')
+      const prepared = Caller.prepared(env)
+      if (BigInt(Number(caller.providerNode)) !== caller.providerNode) {
+        // The negative control: the ordinary JS round trip names another
+        // node in `provider_node` (the copy inside the `capability` string
+        // survives, which is why the field itself is compared).
+        const roundTripped = JSON.stringify(JSON.parse(prepared))
+        expect(a2aU64(roundTripped, '/provider_node')).not.toBe(caller.providerNode)
+      }
+      const bought = await caller.purchase(prepared)
+      expect(bought.status, JSON.stringify(bought)).toBe('paid')
+      await provider.waitBilling(1)
+      const sent = await caller.submit(prepared)
+      expect(sent.status, JSON.stringify(sent)).toBe('accepted')
+      await waitState(caller.mesh, caller.providerNode, 'paid-1', 'completed')
+      expect(provider.ran).toEqual([{ taskId: 'paid-1', service: PAID, revision: REVISION }])
+
+      // An identical resubmit converges on the original admission: no second
+      // run, no second charge.
+      expect((await caller.submit(prepared)).status).toBe('accepted')
+      expect(provider.ran.length).toBe(1)
+      expect((await provider.billing()).length).toBe(1)
+    })
+  }, 60000)
+
+  it('a retained-id retry converges on one admission and one quote; an altered brief is refused', async () => {
+    await withTopology({}, async (_provider, [caller]) => {
+      const first = JSON.parse(await caller.prepare('summarize this', 'retain-1'))
+      const again = JSON.parse(await caller.prepare('summarize this', 'retain-1'))
+      expect(first.status).toBe('ok')
+      expect(again.status).toBe('ok')
+      expect(again.quote.quote_id).toBe(first.quote.quote_id)
+      expect(again.prepared.reservation.admission_id).toBe(first.prepared.reservation.admission_id)
+      const altered = JSON.parse(await caller.prepare('something else', 'retain-1'))
+      expect(['conflict', 'rejected']).toContain(altered.status)
+    })
+  }, 60000)
+
+  it('a service the provider does not serve is rejected, not busy', async () => {
+    await withTopology({}, async (_provider, [caller]) => {
+      const env = JSON.parse(await caller.prepare('x', 'none-1', 'no-such-service'))
+      expect(env.status).toBe('rejected')
+      expect(env.retryable).toBe(false)
+    })
+  }, 60000)
+
+  it('production profile holds the purchase until the operator approves', async () => {
+    await withTopology({ profiles: ['production'] }, async (provider, [caller]) => {
+      const env = await caller.prepare('summarize held', 'hold-1')
+      const prepared = Caller.prepared(env)
+      const held = await caller.purchase(prepared)
+      expect(held.status, JSON.stringify(held)).toBe('requires_payment_approval')
+      expect(held.quote_id).toBe(JSON.parse(env).quote.quote_id)
+      expect(await provider.billing()).toEqual([])
+      const approved = JSON.parse(await caller.gateway.approvePayment(held.quote_id))
+      expect(approved.status).toBe('ok')
+      const bought = await caller.purchase(prepared)
+      expect(bought.status).toBe('paid')
+      expect(bought.quote_id).toBe(held.quote_id)
+      expect((await caller.submit(prepared)).status).toBe('accepted')
+      await waitState(caller.mesh, caller.providerNode, 'hold-1', 'completed')
+      await provider.waitBilling(1)
+    })
+  }, 60000)
+
+  it('a proof bought by one caller is worthless from another', async () => {
+    await withTopology({ profiles: ['dev_test', 'dev_test'] }, async (provider, [buyer, thief]) => {
+      const prepared = Caller.prepared(await buyer.prepare('summarize mine', 'cross-1'))
+      const bought = await buyer.purchase(prepared)
+      expect(bought.status).toBe('paid')
+      const proof = a2aDocument(JSON.stringify(bought), '/proof')
+      const refused = classifyError(await rejected(thief.mesh.submitTaskPaid(prepared, proof)))
+      expect(refused, String((refused as Error).message)).toBeInstanceOf(PaymentRefusedError)
+      expect(JSON.parse((refused as Any).schematic).handler_executed).toBe(false)
+      expect(provider.ran).toEqual([])
+      // Positive control: the buyer's own presentation of the same documents.
+      expect(await buyer.mesh.submitTaskPaid(prepared, proof)).toBe('cross-1')
+      await waitState(buyer.mesh, buyer.providerNode, 'cross-1', 'completed')
+      expect(provider.ran.map((r) => r.taskId)).toEqual(['cross-1'])
+    })
+  }, 60000)
+
+  it('a re-created gateway resumes the purchase from the store; a provider restart keeps the payment', async () => {
+    await withTopology({}, async (provider, [caller]) => {
+      const prepared = Caller.prepared(await caller.prepare('across restarts', 'restart-1'))
+      const bought = await caller.purchase(prepared)
+      expect(bought.status).toBe('paid')
+      await provider.waitBilling(1)
+
+      caller.close()
+      caller.gateway = caller.makeGateway()
+      const rows = await caller.gateway.a2aAttempts()
+      expect(JSON.parse(rows)[0].state.state).toBe('paid')
+      expect(a2aU64(rows, '/0/key/provider_node')).toBe(caller.providerNode)
+      const again = await caller.purchase(prepared)
+      expect(again.status).toBe('paid')
+      expect(again.proof).toEqual(bought.proof)
+
+      await provider.restart()
+      expect((await caller.submit(prepared)).status).toBe('accepted')
+      await waitState(caller.mesh, caller.providerNode, 'restart-1', 'completed')
+      expect(provider.ran.map((r) => r.taskId)).toEqual(['restart-1'])
+      expect((await provider.billing()).length).toBe(1)
+    })
+  }, 90000)
+
+  // The unresolved-financial class end to end, with the R1 recovery leg on
+  // the frozen paths: the provider's row is resolved by its `owner` document
+  // and scalar `generation`; the caller's live row (`retained: false`) by
+  // `key.provider_node` with NO generation.
+  it('a post-payment revocation is unresolved on both sides until each operator resolves it', async () => {
+    let calls = 0
+    const preflight = async () => (++calls === 1 ? null : 'authority revoked before execution')
+    await withTopology({ preflight }, async (provider, [caller]) => {
+      const prepared = Caller.prepared(await caller.prepare('summarize then revoke', 'revoke-1'))
+      expect((await caller.purchase(prepared)).status).toBe('paid')
+      await provider.waitBilling(1)
+      const sent = await caller.submit(prepared)
+      expect(sent.status, JSON.stringify(sent)).toBe('unexecutable')
+      expect(sent.message).toMatch(/revoked/)
+      expect(provider.ran).toEqual([])
+
+      const queue = await provider.provider.a2aUnresolved()
+      expect(JSON.parse(queue)[0].state.admission).toBe('reconcile')
+      await provider.provider.a2aResolve(
+        a2aDocument(queue, '/0/owner'),
+        'revoke-1',
+        '{"state":"failed","error":"refunded out of band"}',
+        a2aU64(queue, '/0/generation'),
+      )
+      expect(JSON.parse(await provider.provider.a2aUnresolved())).toEqual([])
+
+      const rows = await caller.gateway.a2aAttempts()
+      expect(JSON.parse(rows)[0].state.state).toBe('paid_unexecutable')
+      expect(JSON.parse(rows)[0].retained).toBe(false)
+      await caller.gateway.a2aResolveAttempt(
+        'revoke-1',
+        '{"resolution":"closed","outcome":"refunded","evidence":{"ticket":"OPS-1"}}',
+        a2aU64(rows, '/0/key/provider_node'),
+      )
+      const closed = JSON.parse(await caller.gateway.a2aAttempts())
+      expect(closed[0].state.state).toBe('resolved')
+      expect(closed[0].state.outcome).toBe('refunded')
+    })
+  }, 90000)
+
+  // Review R3, the after-payment leg: a preflight that never settles at
+  // submit is a refusal inside the budget — no launch, and the paid evidence
+  // is kept as an unresolved record rather than dropped.
+  it('a never-settling preflight at submit after payment launches nothing and leaves it unresolved', async () => {
+    let calls = 0
+    const preflight = async () => {
+      if (++calls === 1) return null
+      return new Promise<string | null>(() => {})
+    }
+    await withTopology({ preflight }, async (provider, [caller]) => {
+      const prepared = Caller.prepared(await caller.prepare('summarize then hang', 'hang-1'))
+      expect((await caller.purchase(prepared)).status).toBe('paid')
+      await provider.waitBilling(1)
+      const t0 = Date.now()
+      const sent = await caller.submit(prepared)
+      expect(Date.now() - t0).toBeLessThan(20000)
+      expect(sent.status, JSON.stringify(sent)).toBe('unexecutable')
+      // After payment a preflight refusal — here, its timeout — reaches the
+      // caller as the provider's admission revocation (parent plan: a
+      // post-payment refusal is reconciliation, never an unpaid rejection).
+      expect(sent.message).toMatch(/revoked/)
+      expect(sent.schematic?.reason).toBe('admission_revoked')
+      expect(provider.ran).toEqual([])
+      expect(JSON.parse(await provider.provider.a2aUnresolved())[0].state.admission).toBe(
+        'reconcile',
+      )
+      expect(JSON.parse(await caller.gateway.a2aAttempts())[0].state.state).toBe(
+        'paid_unexecutable',
+      )
+    })
+  }, 90000)
+
+  it('the paid verbs refuse a gateway without a purchase store, and a closed gateway', async () => {
+    const mesh = await meshUnstarted()
+    await mesh.start()
+    const dir = mkdtempSync(join(tmpdir(), 'net-a2a-gw-'))
+    try {
+      // A purchase path with no spend policy is refused at construction.
+      expect(
+        () =>
+          new CapabilityGateway(
+            mesh,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            join(dir, 'p.json'),
+          ),
+      ).toThrow(/^gateway: a2aPurchasePath requires paymentPolicyPath/)
+
+      const noStore = new CapabilityGateway(mesh, undefined, join(dir, 'policy.json'), 'dev_test')
+      expect(await rejection(noStore.prepareTask(mesh.nodeId(), PAID, 'x'))).toMatch(
+        /^gateway: paid A2A needs a2aPurchasePath/,
+      )
+      noStore.close()
+
+      const bare = new CapabilityGateway(mesh)
+      expect(await rejection(bare.a2aAttempts())).toMatch(
+        /^gateway: paid A2A needs paymentPolicyPath and a2aPurchasePath/,
+      )
+      bare.close()
+
+      const full = new Caller(mesh, mesh.nodeId())
+      full.close()
+      expect(JSON.parse(await full.gateway.prepareTask(mesh.nodeId(), PAID, 'x')).status).toBe(
+        'closed',
+      )
+      expect(await rejection(full.gateway.a2aResolveAttempt('t', '{}'))).toMatch(/^gateway: /)
+      // A malformed prepared document is the caller's input.
+      const open = new Caller(mesh, mesh.nodeId())
+      expect(classifyError(await rejected(open.gateway.purchaseTask('{}')))).toBeInstanceOf(
+        A2aInvalidArgumentError,
+      )
+      open.close()
+    } finally {
+      await mesh.shutdown()
+    }
+  }, 30000)
+})

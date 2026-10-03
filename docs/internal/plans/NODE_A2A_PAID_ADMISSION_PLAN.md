@@ -675,28 +675,60 @@ prefix passes through unclassified.
 
 ### WS-D — Caller flow on `CapabilityGateway`
 
-- [ ] `build_payment_flow` keeps the concrete `Arc<CallerPaymentFlow>` and,
-  when `a2aPurchasePath` is set, builds the `A2aCallerFlow` over it (one flow,
-  one spend store, one signer set — a budget spent on a paid tool is a budget
-  spent on a paid task).
-- [ ] Ctor arg `a2aPurchasePath` (D5) with the two loud refusals Python has.
-- [ ] `prepareTask(targetNodeId, service, prompt, contextRefs?, tags?,
+- [x] `build_payment_flow` keeps the concrete `Arc<CallerPaymentFlow>`; the
+  invoke gate gets it as `Arc<dyn PaymentFlow>` and, when `a2aPurchasePath`
+  is set, the `A2aCallerFlow` is built over the same `Arc` through the shared
+  `json::build_flow` (one flow, one spend store, one signer set).
+- [x] Ctor arg `a2aPurchasePath` (D5, twelfth positional). Refusals: a
+  purchase path without `paymentPolicyPath` throws at construction; a build
+  without `a2a` throws if it is given; a gateway built without either makes
+  the paid verbs reject `gateway: paid A2A needs …`, naming what is missing.
+- [x] `prepareTask(targetNodeId: bigint, service, prompt, contextRefs?, tags?,
   taskId?)`, `purchaseTask(preparedJson)`, `submitTask(preparedJson)`,
   `a2aAttempts()`, `a2aResolveAttempt(taskId, outcomeJson, providerNode?:
-  bigint, generationJson?)`, `setA2aOrgCaller(orgClient | null)` — all
-  `async`, resolving to the shared envelopes; a gateway built without a
-  purchase store rejects with the Python wording. `targetNodeId` is `bigint`.
-- [ ] **r2 (R6):** the gateway's setter updates the org-caller slot of the
-  gateway's **own persistent** SDK `Mesh`, the one its `A2aCallerFlow`
-  composes over (Python: `self.state.mesh.set_a2a_org_caller`). It does not
-  touch the `NetMesh` slot of WS-C. Two slots, two setters, both witnessed.
-- [ ] `close()` drops the A2A flow with the rest of `Live`.
+  bigint, generationJson?)` — `async`, resolving to the shared envelopes; in
+  their own `#[cfg(feature = "a2a")] #[napi] impl` block. After `close()` the
+  four document verbs resolve to the gateway's existing `closed` status; the
+  void `a2aResolveAttempt` rejects `gateway:` instead (it has no status to
+  resolve to).
+- [x] `setA2aOrgCaller(orgClient | null)` (`#[cfg(all(a2a, org))]` block) sets
+  the slot of the gateway's **own** SDK mesh — the one its `A2aCallerFlow`
+  composes over (`Live.mesh`), not the native `NetMesh`'s.
+- [x] `close()` drops the A2A flow and the mesh with the rest of `Live`.
 
-**Proved by:** the caller-side cases of WS-F's suite (prepare moves no money,
-paid runs once, retry convergence, restart resumption, approval flow,
-resolve-attempt); existing `capability_gateway.test.ts` and
-`payment_provider.test.ts` green unedited (invoke path unchanged by keeping
-the concrete flow `Arc`).
+**Proved by:** `test/a2a_paid.test.ts` WS-D part (10): prepare is a complete
+handle and moves no money (`quote.expires_at_ns` and `provider_node` read by
+`a2aU64`); **paid runs exactly once, handed off losslessly** — the handles
+travel only as `a2aDocument` strings, and a negative control shows the JS
+round trip changes `provider_node` (the copy inside the `capability` string
+survives `JSON.parse`, so the control compares the field, not a substring); an
+identical resubmit converges (one run, one billing event); retained-id retry
+converges on one admission and one quote, an altered brief is refused; an
+unserved service is `rejected` (not `busy`); production profile holds until
+`approvePayment`; a proof bought by one caller is a `PaymentRefusedError` from
+another, the buyer's own presentation runs; a re-created gateway resumes from
+the store and a full provider restart keeps the one payment; **the
+post-payment revocation leg of R1** — the provider's `reconcile` row resolved
+by its `owner` document and scalar `generation`, the caller's `retained:
+false` row resolved by `key.provider_node` with **no** generation; **R3 after
+payment** — a never-settling preflight at submit returns `unexecutable` with
+schematic `admission_revoked` within 20 s, launches nothing, and leaves
+`reconcile` / `paid_unexecutable` rows; and the construction / closed /
+malformed-document refusals.
+
+> **Status: WS-D landed 2026-10-03.** Paid suite 24/24 on three consecutive
+> runs; whole node suite 779 passed / 9 skipped; existing
+> `capability_gateway.test.ts` / `payment_provider.test.ts` unedited and green;
+> clippy (CI list + `delegation,a2a`, all targets, `-D warnings`), `cargo
+> check` under `net,cortex,tool,publish,payments,consent,mcp` (no `a2a`) and
+> `net,cortex,delegation,a2a,payments,consent,mcp` (no `org`/`publish`),
+> `typecheck:tests` and rustfmt clean. **Observed:** after payment, a
+> preflight refusal (including its timeout) reaches the caller as the
+> provider's `admission_revoked`, not the preflight's own text — the
+> reconciliation contract, recorded so the docs do not promise the reason
+> string. Still owed by WS-F: the live org-admitted principal on both setters
+> (R6), the retained-vs-live caller leg over a seeded store (R1), and the Node
+> side of the cross-binding fixture.
 
 ### WS-E — TS surface
 
