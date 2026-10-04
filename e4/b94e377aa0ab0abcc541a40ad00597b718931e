@@ -1,0 +1,33 @@
+net/crates/net/examples/c/FLOORS
+  s_9023e047bdb7d7::t_b0272d40a1243d 6-7,14-16,21
+net/crates/net/examples/c/redis_dedup.c
+  s_9023e047bdb7d7::t_90d19133b5cfa8 75,87
+net/crates/net/examples/c/aggregator.c
+  s_9023e047bdb7d7::t_83caf03b49a417 134-135
+net/crates/net/examples/c/support/consumer_util.h
+  s_9023e047bdb7d7::t_1fe5bb4154a451 53-62
+net/crates/net/examples/c/mcp.c
+  s_9023e047bdb7d7::t_90d19133b5cfa8 95,179
+net/crates/net/examples/c/lifecycle.c
+  s_9023e047bdb7d7::t_90d19133b5cfa8 98,101
+net/crates/net/examples/c/meshdb.c
+  s_9023e047bdb7d7::t_90d19133b5cfa8 309
+net/crates/net/examples/c/transfer.c
+  s_9023e047bdb7d7::t_90d19133b5cfa8 128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e4b94e377aa0ab0abcc541a40ad00597b718931e",
+  "prompts": {},
+  "sessions": {
+    "s_9023e047bdb7d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13ae6289-5780-436a-aa27-88954cc36586",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
