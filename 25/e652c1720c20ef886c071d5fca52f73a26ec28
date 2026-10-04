@@ -1,0 +1,40 @@
+.claude/skills/net-event-bus/bindings/c.md
+  s_17a2ac60d914fc::t_5c70e040876685 81,88-90,95-102,162-165
+web/src/content/docs/sdk/c/quickstart.md
+  s_17a2ac60d914fc::t_6b1671a5a426a6 88,90,96-100
+.claude/skills/net-event-bus/dataforts.md
+  s_17a2ac60d914fc::t_ac25b439e8074f 218-219
+web/src/content/docs/sdk/c/headers-and-linking.md
+  s_17a2ac60d914fc::t_9f545c5c7b76ba 182-198,201-203,206-214
+web/src/content/docs/sdk/c/memory-and-threading.md
+  s_17a2ac60d914fc::t_07a6a8ac026498 8-13,15,25-63
+  s_17a2ac60d914fc::t_9f545c5c7b76ba 3
+  s_17a2ac60d914fc::t_5c70e040876685 129
+  s_17a2ac60d914fc::t_ccb729c3af14ce 64
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_0f890166183bb9 1091-1121,1127-1151
+  s_17a2ac60d914fc::t_f8bfa44c65d137 1122-1126,1242
+net/crates/net/include/README.md
+  s_17a2ac60d914fc::t_5c70e040876685 112,119-129
+  s_17a2ac60d914fc::t_aa567ee31ba8e8 138-145,149-166
+.github/scripts/check-c-abi.py
+  s_17a2ac60d914fc::t_9e7caa125b7510 729-733
+  s_17a2ac60d914fc::t_1c0a820421a39c 1019
+  s_17a2ac60d914fc::t_cb939f4dbe8047 715-718
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "25e652c1720c20ef886c071d5fca52f73a26ec28",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
