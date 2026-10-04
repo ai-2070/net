@@ -222,6 +222,9 @@ def render(record: dict) -> tuple[str, str]:
     return "\n".join(status_lines), "\n".join(anchor_lines)
 
 
+C_EVIDENCE_HEADER = ("| Operation | C status | Run by CI | Not yet exercised from C |", "|---|---|---|---|")
+
+
 def render_c_evidence(record: dict) -> str | None:
     """The C evidence table, or None when the record has no positive C cell."""
     rows = []
@@ -229,20 +232,25 @@ def render_c_evidence(record: dict) -> str | None:
         b = op["bindings"].get("C") or {}
         if b.get("status") not in ("supported", "partial", "experimental"):
             continue
-        ev = ", ".join(f"`{p.rsplit('/', 1)[-1]}`" for p in b.get("evidence") or []) or "—"
+        evidence = b.get("evidence") or []
+        if isinstance(evidence, str):  # one path, as check() accepts it
+            evidence = [evidence]
+        ev = ", ".join(f"`{p.rsplit('/', 1)[-1]}`" for p in evidence) or "—"
         rows.append(f"| {op['operation']} | {b['status']} | {ev} | {b.get('gap') or '—'} |")
     if not rows:
         return None
-    return "\n".join(["| Operation | C status | Run by CI | Not yet exercised from C |",
-                      "|---|---|---|---|", *rows])
+    return "\n".join([*C_EVIDENCE_HEADER, *rows])
 
 
 def spliced(current: str, record: dict) -> str:
     """`current` with every generated table replaced from `record`."""
     status_tbl, anchor_tbl = render(record)
     out = splice(splice(current, STATUS_MARK, status_tbl), ANCHOR_MARK, anchor_tbl)
-    c_tbl = render_c_evidence(record)
-    if c_tbl is not None and C_EVIDENCE_MARK in out:
+    if C_EVIDENCE_MARK in out:
+        # With no positive C cell left, the table keeps its header and loses
+        # every row: a stale row must not survive a regeneration, and a
+        # header-only table splices idempotently.
+        c_tbl = render_c_evidence(record) or "\n".join(C_EVIDENCE_HEADER)
         out = splice(out, C_EVIDENCE_MARK, c_tbl)
     return out
 

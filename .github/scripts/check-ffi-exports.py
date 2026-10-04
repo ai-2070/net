@@ -346,6 +346,13 @@ def main() -> int:
 
     if args.self_test:
         return self_test(args.baseline)
+    # The shipped baseline is built WITHOUT the test helpers; its header must
+    # not record the helper recipe by default.
+    if args.update and "shipped" in Path(args.baseline).name and not any(
+            a == "--build" or a.startswith("--build=") for a in sys.argv[1:]):
+        print("✗ --update of the shipped baseline needs --build naming the command that built "
+              "--artifact (the default is the test-helpers recipe)")
+        return 2
 
     artifact = args.artifact or next((c for c in CANDIDATES if c.exists()), None)
     if artifact is None or not artifact.exists():

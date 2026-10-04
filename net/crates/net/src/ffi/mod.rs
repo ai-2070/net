@@ -2780,6 +2780,19 @@ mod tests {
             fields.contains("inner"),
             "the scan found no ManuallyDrop<Arc<_>> fields; it is not reading the sources"
         );
+        // Code only: a trailing `//` comment is cut off, and a match inside a
+        // string literal (an odd number of unescaped quotes before it) does
+        // not count.
+        fn in_code(line: &str, needle: &str) -> bool {
+            let code = line.split("//").next().unwrap_or("");
+            code.match_indices(needle).any(|(at, _)| {
+                let before = code[..at].as_bytes();
+                let quotes = (0..before.len())
+                    .filter(|&i| before[i] == b'"' && (i == 0 || before[i - 1] != b'\\'))
+                    .count();
+                quotes % 2 == 0
+            })
+        }
         let mut found = Vec::new();
         for (file, text) in &sources {
             for (n, line) in text.lines().enumerate() {
@@ -2787,12 +2800,18 @@ mod tests {
                     continue;
                 }
                 for f in &fields {
-                    if line.contains(&format!(".{f}.clone()")) {
+                    if in_code(line, &format!(".{f}.clone()")) {
                         found.push(format!("src/ffi/{file}:{}: {}", n + 1, line.trim()));
                     }
                 }
             }
         }
+        assert!(
+            in_code("let n = h.inner.clone();", ".inner.clone()")
+                && !in_code("let n = x; // h.inner.clone() leaks", ".inner.clone()")
+                && !in_code("panic!(\"h.inner.clone() leaks\");", ".inner.clone()"),
+            "the code/comment/string split is not working"
+        );
         assert!(
             found.is_empty(),
             "`.clone()` on a ManuallyDrop<Arc<_>> field leaks a strong reference; \

@@ -151,6 +151,7 @@ jobs:
       - run: python3 .github/scripts/planted-interpreted.py
       # Via the per-runner interpreter variable — does not either.
       - run: '"$PY" .github/scripts/planted-py-var.py'
+      - run: $PY .github/scripts/planted-py-bare.py
       - name: workspace-prefixed, still direct
         run: $GITHUB_WORKSPACE/.github/scripts/planted-workspace.sh
     # A paths filter naming a script means nothing about invocation.
@@ -181,6 +182,7 @@ def self_test() -> int:
     for unexpected in (
         ".github/scripts/planted-interpreted.py",
         ".github/scripts/planted-py-var.py",
+        ".github/scripts/planted-py-bare.py",
     ):
         if unexpected in names:
             print(f"FAIL  flagged {unexpected}, which runs through an interpreter")

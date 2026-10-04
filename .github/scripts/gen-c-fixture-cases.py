@@ -47,8 +47,21 @@ def as_returned(value) -> str:
 
 
 def c_str(text: str) -> str:
-    out = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-    return '"' + out.encode("ascii", "backslashreplace").decode("ascii").replace("\\\\u", "\\u") + '"'
+    """A C string literal with exactly `text`'s UTF-8 bytes. Printable ASCII
+    passes through (backslash and quote escaped); every other byte is a
+    three-digit octal escape, which cannot run into the next character the
+    way a hex escape can, and leaves a literal backslash-u in the data
+    alone."""
+    out = []
+    for byte in text.encode("utf-8"):
+        ch = chr(byte)
+        if ch in '\\"':
+            out.append("\\" + ch)
+        elif 0x20 <= byte < 0x7F:
+            out.append(ch)
+        else:
+            out.append(f"\\{byte:03o}")
+    return '"' + "".join(out) + '"'
 
 
 def load(name: str) -> list[dict]:

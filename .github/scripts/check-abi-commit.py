@@ -78,13 +78,17 @@ _RUST_CONST = re.compile(
 )
 # A `#define` that carries a value (or is function-like). A bare
 # `#define NET_X_H` is an include guard or a flag: it has no ABI value to
-# drift, and a new header's guard must not demand an ABI-change commit.
-_C_DEFINE = re.compile(r"^\s*#\s*define\s+(NET_[A-Z0-9_]+)(?:\(|[ \t]+\S)")
+# drift, and a new header's guard must not demand an ABI-change commit; a
+# trailing comment (`#define NET_X_H /* guard */`) is not a value either.
+_C_DEFINE = re.compile(r"^\s*#\s*define\s+(NET_[A-Z0-9_]+)(?:\(|[ \t]+(?!/[/*])\S)")
 _C_ENUM = re.compile(r"^\s*(NET_[A-Z0-9_]+)\s*=")
+# C definitions live in headers and C sources, and ALSO in Go cgo preambles
+# (go/aggregator.go defines NET_REGISTRY_* there): `.go` is scanned for the
+# C patterns. Rust constants stay `.rs`-only.
 _CONST_PATTERNS = (
     (_RUST_CONST, (".rs",)),
-    (_C_DEFINE, (".h", ".c")),
-    (_C_ENUM, (".h", ".c")),
+    (_C_DEFINE, (".h", ".c", ".go")),
+    (_C_ENUM, (".h", ".c", ".go")),
 )
 _EXTERN_C = re.compile(r'\bextern\s+"C"')
 _EXTERN_C_BLOCK = re.compile(r'\bextern\s+"C"\s*\{\s*$')
@@ -460,6 +464,26 @@ def self_test() -> int:
         "an include guard (#define with no value) does not trigger; a function-like macro does",
         consts == {"NET_DEMO_MAX"},
     )
+
+    commented_guard = (
+        "--- /dev/null\n"
+        "+++ b/net/crates/net/include/net_demo2.h\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+#define NET_DEMO2_H /* include guard */\n"
+        "+#define NET_DEMO2_H2 // also a guard\n"
+    )
+    _, consts, _ = diff_changes(commented_guard)
+    expect("an include guard with a trailing comment does not trigger", consts == set())
+
+    cgo = (
+        "--- a/go/aggregator.go\n"
+        "+++ b/go/aggregator.go\n"
+        "@@ -1 +1 @@\n"
+        "-#define NET_REGISTRY_ERR_CODEC                2\n"
+        "+#define NET_REGISTRY_ERR_CODEC                3\n"
+    )
+    _, consts, _ = diff_changes(cgo)
+    expect("a #define in a Go cgo preamble is detected", consts == {"NET_REGISTRY_ERR_CODEC"})
 
     in_python = (
         "--- a/.github/scripts/check-demo.py\n"

@@ -460,6 +460,28 @@ def cfg_exprs(attr_text: str, pattern: re.Pattern = _CFG_ATTR) -> list[str]:
     return out
 
 
+_HOST_CFG: dict[str, str] | None = None
+
+
+def host_cfg() -> dict[str, str]:
+    """`target_arch` and `target_pointer_width` of the host rustc (the target
+    the audited bundle was built for), from `rustc --print cfg`. Falls back
+    to x86_64 / 64 when rustc is unavailable."""
+    global _HOST_CFG
+    if _HOST_CFG is None:
+        cfg = {"target_arch": "x86_64", "target_pointer_width": "64"}
+        try:
+            out = subprocess.run(["rustc", "--print", "cfg"], capture_output=True, text=True).stdout
+        except OSError:
+            out = ""
+        for line in out.splitlines():
+            m = re.fullmatch(r'(target_arch|target_pointer_width)="([^"]+)"', line.strip())
+            if m:
+                cfg[m.group(1)] = m.group(2)
+        _HOST_CFG = cfg
+    return _HOST_CFG
+
+
 def eval_cfg(expr: str, features: set[str], target_os: str) -> bool:
     """Evaluate a cfg predicate. Unknown predicates raise, so a new kind of
     gate is noticed rather than silently guessed."""
@@ -486,7 +508,7 @@ def eval_cfg(expr: str, features: set[str], target_os: str) -> bool:
         return m.group(1) == ("windows" if target_os == "windows" else "unix")
     m = re.fullmatch(r'target_pointer_width\s*=\s*"(\d+)"', expr)
     if m:
-        return m.group(1) == "64"
+        return m.group(1) == host_cfg()["target_pointer_width"]
     if expr == "windows":
         return target_os == "windows"
     if expr == "unix":
@@ -495,7 +517,7 @@ def eval_cfg(expr: str, features: set[str], target_os: str) -> bool:
         return False
     m = re.fullmatch(r'target_arch\s*=\s*"([^"]+)"', expr)
     if m:
-        return m.group(1) == "x86_64"
+        return m.group(1) == host_cfg()["target_arch"]
     raise ValueError(f"unknown cfg predicate: {expr}")
 
 

@@ -21,6 +21,13 @@
 //! ```text
 //! NET_ABI_LAYOUT_WRITE=1 cargo test --release -p net-ffi --test abi_layout
 //! ```
+//!
+//! The fixture records a 64-bit target's sizes and offsets (pointers and
+//! `size_t` are 8 bytes), the only width the C SDK is built and audited for,
+//! so the test compiles only there: on a 32-bit target it would fail against
+//! headers and code that are consistent, and regenerating would overwrite
+//! the 64-bit fixture.
+#![cfg(target_pointer_width = "64")]
 
 use std::collections::BTreeMap;
 use std::mem::{align_of, offset_of, size_of};
