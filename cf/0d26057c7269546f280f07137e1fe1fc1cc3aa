@@ -1,0 +1,31 @@
+net/crates/net/tests/rtc_signalling.rs
+  s_598a2462cc770b::t_d292870fd348f2 1483-1556
+.github/workflows/ci.yml
+  s_598a2462cc770b::t_4810a85a612f18 6674
+net/crates/net/tests/rtc_browser/page/leaf5.js
+  s_598a2462cc770b::t_f1bf7549b96eec 706-717
+net/crates/net/src/adapter/net/mesh.rs
+  s_598a2462cc770b::t_6b0e0c666a8f75 24455-24462,24464-24479
+  s_598a2462cc770b::t_6f59ed09d60e3b 28315-28340,28342
+  s_598a2462cc770b::t_2f35b2b85bd122 932,960,966,975
+  s_598a2462cc770b::t_ab4e091712e7f5 928-931,933
+  s_598a2462cc770b::t_a434530ba4510d 961,965,967-974,976-977
+  s_598a2462cc770b::t_e0ab6b32b16bba 978,1392-1410
+  s_598a2462cc770b::t_ee6a2fb2318cc0 979
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cf0d26057c7269546f280f07137e1fe1fc1cc3aa",
+  "prompts": {},
+  "sessions": {
+    "s_598a2462cc770b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83d8136c-f4b9-496a-a434-7d2d5fb91615",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
