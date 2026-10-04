@@ -71,9 +71,10 @@ operations:
     Go:
       status: not exposed
     C:
-      status: partial
+      status: supported
       anchor: net_predicate_evaluate
-      gap: 'No C program CI runs calls it; its C evidence is the C1 header audit only.'
+      evidence:
+      - net/crates/net/examples/c/capabilities.c
 - operation: Distributed mesh channels — register / subscribe / publish
   bindings:
     Rust:

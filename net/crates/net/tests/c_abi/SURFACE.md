@@ -10,7 +10,7 @@ both.
 
 | Header | Declared | Called by a consumer | Called by any C program |
 | --- | ---: | ---: | ---: |
-| `net.go.h` | 218 | 35 | 52 |
+| `net.go.h` | 218 | 41 | 58 |
 | `net.h` | 41 | 2 | 6 |
 | `net_cortex.h` | 92 | 2 | 8 |
 | `net_deck.h` | 84 | 0 | 0 |
@@ -122,7 +122,7 @@ both.
 | `net_fetch_dir` | transfer | – | – |
 | `net_flush` | – | – | – |
 | `net_free_bytes` | – | – | tokenchannel |
-| `net_free_string` | consumer_util, lifecycle, repair, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_free_string` | capabilities, consumer_util, lifecycle, repair, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_generate_keypair` | – | – | – |
 | `net_identity_at_generation` | – | – | – |
 | `net_identity_entity_id` | – | – | tokenchannel |
@@ -220,12 +220,12 @@ both.
 | `net_num_shards` | – | – | – |
 | `net_parse_token` | – | – | – |
 | `net_poll` | – | – | – |
-| `net_predicate_aggregate_debug_report` | – | – | – |
-| `net_predicate_evaluate` | – | – | – |
-| `net_predicate_evaluate_with_trace` | – | – | – |
-| `net_predicate_redact_metadata_keys` | – | – | – |
+| `net_predicate_aggregate_debug_report` | capabilities | – | – |
+| `net_predicate_evaluate` | capabilities | – | – |
+| `net_predicate_evaluate_with_trace` | capabilities | – | – |
+| `net_predicate_redact_metadata_keys` | capabilities | – | – |
 | `net_predicate_redact_trace_metadata_keys` | – | – | – |
-| `net_predicate_to_where_header` | – | – | – |
+| `net_predicate_to_where_header` | capabilities | – | – |
 | `net_redis_dedup_capacity` | – | – | – |
 | `net_redis_dedup_clear` | – | – | – |
 | `net_redis_dedup_free` | – | – | – |
@@ -240,7 +240,7 @@ both.
 | `net_stream_id_from_label` | – | – | – |
 | `net_token_is_expired` | – | – | – |
 | `net_transport_free_buffer` | transfer | double_free_fetch_blob | objectstore |
-| `net_validate_capabilities` | – | – | – |
+| `net_validate_capabilities` | capabilities | – | – |
 | `net_verify_signature` | – | – | – |
 | `net_verify_token` | – | – | – |
 | `net_version` | smoke | debugcrt_leak, debugcrt_overrun | – |
@@ -260,7 +260,7 @@ both.
 | `net_fold_query_client_set_ttl` | – | – | – |
 | `net_fold_query_last_error_detail` | – | – | – |
 | `net_free_poll_result` | – | – | – |
-| `net_free_string` | consumer_util, lifecycle, repair, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_free_string` | capabilities, consumer_util, lifecycle, repair, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_generate_keypair` | – | – | – |
 | `net_ingest` | – | – | – |
 | `net_ingest_batch` | – | – | – |

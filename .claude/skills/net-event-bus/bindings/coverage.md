@@ -78,7 +78,7 @@ A mode is written after the status: `supported · core-only`.
 | Operation | Rust | Node / TS | Python | Go | C |
 |---|---|---|---|---|---|
 | Event bus — ingest + poll | supported | supported | supported | supported | supported · poll |
-| Consumer-side filter DSL | supported | supported | supported | not exposed | partial |
+| Consumer-side filter DSL | supported | supported | supported | not exposed | supported |
 | Distributed mesh channels — register / subscribe / publish | supported | supported | supported | supported | supported |
 | Tagged EventBus topics (node.channel) | n/a | supported | supported | n/a | n/a |
 | Channel subscribe with a full TokenChain | not exposed | not exposed | not exposed | not exposed | not exposed |
@@ -169,7 +169,7 @@ per-function record behind this is `net/crates/net/tests/c_abi/SURFACE.md`.
 | Operation | C status | Run by CI | Not yet exercised from C |
 |---|---|---|---|
 | Event bus — ingest + poll | supported | `hello.c`, `observe.c` | — |
-| Consumer-side filter DSL | partial | — | No C program CI runs calls it; its C evidence is the C1 header audit only. |
+| Consumer-side filter DSL | supported | `capabilities.c` | — |
 | Distributed mesh channels — register / subscribe / publish | supported | `tokenchannel.c` | — |
 | Channel token roots (require_token anchoring) | supported | `liveconfig.c`, `tokenchannel.c` | — |
 | Membership rejection reason (AckReason taxonomy) | partial | — | No C program CI runs checks for this code. Partial regardless: C maps every rejection reason except unauthorized to NET_ERR_CHANNEL. |

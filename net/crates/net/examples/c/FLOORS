@@ -10,3 +10,4 @@ repair 34
 blob_callbacks 31
 rpc_callbacks 26
 rpc_no_free 4
+capabilities 287

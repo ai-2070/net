@@ -236,7 +236,7 @@
     "Consumer-side filter DSL": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
           "status": "not exposed"

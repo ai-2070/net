@@ -5320,11 +5320,14 @@ jobs:
       # skill examples). The C column of the capability matrix may claim no
       # more than it shows, so it must be current: regenerated here from the
       # same header model as the audit, and any difference fails.
-      - name: Guard — the C surface record is current (C5b)
+      - name: Guard — the C surface record and fixture cases are current (C5b)
         if: runner.os == 'Linux'
         run: |
           "$PY" .github/scripts/c-surface-record.py --self-test
           "$PY" .github/scripts/c-surface-record.py --check
+          # capabilities.c runs the cross-language capability fixtures from a
+          # generated header; a fixture change must reach it in the same commit.
+          "$PY" .github/scripts/gen-c-fixture-cases.py --check
 
       - name: Consumers — production bundle
         run: |
