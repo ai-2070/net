@@ -1133,12 +1133,14 @@ jobs:
                   if (dir == "net/crates/net") return "root"
                   if (dir == "net/crates/net/sdk") return "sdk"
                   if (dir == "net/crates/net/cli") return "cli"
+                  if (dir == "net/crates/net/bindings/go/net-ffi") return "ffi"
                   return "dir:" (dir == "" ? "<repo root>" : dir)
                 }
                 function crate_of_pkg(pkg) {
                   if (pkg == "net-mesh") return "root"
                   if (pkg == "net-mesh-sdk") return "sdk"
                   if (pkg == "net-cli") return "cli"
+                  if (pkg == "net-ffi") return "ffi"
                   return "pkg:" pkg
                 }
                 function package_on(line) {
@@ -1203,7 +1205,9 @@ jobs:
             | sort -u > /tmp/pinned_sdk.txt
           awk -F'\t' '$1 == "cli" { print $2 }' /tmp/pinned_by_crate.txt \
             | sort -u > /tmp/pinned_cli.txt
-          awk -F'\t' '$1 != "root" && $1 != "sdk" && $1 != "cli" { print $1 ": " $2 }' \
+          awk -F'\t' '$1 == "ffi" { print $2 }' /tmp/pinned_by_crate.txt \
+            | sort -u > /tmp/pinned_ffi.txt
+          awk -F'\t' '$1 != "root" && $1 != "sdk" && $1 != "cli" && $1 != "ffi" { print $1 ": " $2 }' \
             /tmp/pinned_by_crate.txt | sort -u > /tmp/pinned_foreign.txt
           printf '%s\n' "$UNPINNED_OK" | awk '{print $1}' | grep -v '^$' | sort -u > /tmp/allowed.txt
           # One inventory per crate. The root crate's `tests/` are the ones
@@ -1215,10 +1219,13 @@ jobs:
           # step's `--test local_target_inspection` exist without leaving a
           # silent hole behind it: rename that binary and this guard names
           # the break instead of cargo. The next crate that needs a scoped
-          # pin joins here and in the two crate maps above.
+          # pin joins here and in the two crate maps above. net-ffi joined for
+          # `c-consumers`' scoped `--test abi_layout` (C SDK plan, C1 check 4).
           ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present_root.txt
           ls sdk/tests/*.rs | sed 's|sdk/tests/||; s|\.rs$||' | sort -u > /tmp/present_sdk.txt
           ls cli/tests/*.rs | sed 's|cli/tests/||; s|\.rs$||' | sort -u > /tmp/present_cli.txt
+          ls bindings/go/net-ffi/tests/*.rs | sed 's|bindings/go/net-ffi/tests/||; s|\.rs$||' \
+            | sort -u > /tmp/present_ffi.txt
           # UNATTRIBUTABLE pins first, because they are the CAUSE of any
           # inventory verdict below: a pin this read cannot resolve to a crate
           # covers nothing, so the tests it was meant to cover would otherwise
@@ -1254,6 +1261,7 @@ jobs:
             comm -13 /tmp/present_root.txt /tmp/pinned_root.txt | sed 's/^/root: /'
             comm -13 /tmp/present_sdk.txt /tmp/pinned_sdk.txt | sed 's/^/sdk: /'
             comm -13 /tmp/present_cli.txt /tmp/pinned_cli.txt | sed 's/^/cli: /'
+            comm -13 /tmp/present_ffi.txt /tmp/pinned_ffi.txt | sed 's/^/ffi: /'
             cat /tmp/pinned_foreign.txt
           )
           if [ -n "$stale" ]; then
@@ -1261,7 +1269,7 @@ jobs:
             printf '%s\n' "$stale" | sed 's/^/  /'
             exit 1
           fi
-          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk + $(wc -l < /tmp/present_cli.txt) cli test files; $(wc -l < /tmp/pinned_root.txt) root pin(s) + $(wc -l < /tmp/pinned_sdk.txt) sdk pin(s) + $(wc -l < /tmp/pinned_cli.txt) cli pin(s), each attributed to its own crate."
+          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk + $(wc -l < /tmp/present_cli.txt) cli + $(wc -l < /tmp/present_ffi.txt) net-ffi test files; $(wc -l < /tmp/pinned_root.txt) root pin(s) + $(wc -l < /tmp/pinned_sdk.txt) sdk pin(s) + $(wc -l < /tmp/pinned_cli.txt) cli pin(s) + $(wc -l < /tmp/pinned_ffi.txt) net-ffi pin(s), each attributed to its own crate."
 
   # --- Family A: bare bus/FFI + net mesh -------------------------------
   integration-net-core:
