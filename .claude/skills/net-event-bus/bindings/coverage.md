@@ -189,7 +189,7 @@ per-function record behind this is `net/crates/net/tests/c_abi/SURFACE.md`.
 | CortEX folds / NetDB | partial | — | No C program CI runs calls it (Go reaches it through go/aggregator.go). |
 | MeshDB — federated queries | supported | `meshdb.c` | — |
 | Compute / groups / daemons | supported | `compute.c` | — |
-| Deck — operator surface | partial | — | No C program CI runs calls it (Go reaches it through go/deck.go). |
+| Deck — operator surface | partial | `deck.c` | A C deck client attaches no operator registry (net_deck_client_new takes none), so a signed ICE commit takes the unsigned admin path: it is neither verified nor attributed to its signers. |
 | Redis Streams dedup | supported | `redis_dedup.c` | — |
 
 ## Why the negative cells are negative

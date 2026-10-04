@@ -1269,6 +1269,18 @@ Found by the C6 follow-up programs:
     still be ambiguous. The cure is a tagged envelope or typed C decoders,
     an ABI change.
 
+- **D-C6-2 (open, an ABI gap): a C deck client cannot verify or
+  attribute a signed ICE commit.** `net_deck_client_new` takes no operator
+  registry, and nothing in `net_deck.h` attaches one. Without a registry
+  the SDK's `IceSimulated::commit` routes every commit through the unsigned
+  admin path (`deck.rs`), so the signatures a C caller passes are dropped:
+  the audit ring records the freeze with no operator ids and outcome
+  `Unverified`, and `by_operator` cannot find it. The commit itself
+  succeeds. `deck.c` checks what holds today and says so; the matrix's
+  Deck C cell stays `partial` with this gap, now with `deck.c` as its
+  evidence. The fix is an ABI addition (a registry or verifier on the
+  client), not a test.
+
 Found by C1, stage 1:
 
 - **`net.go.h` failed to compile under `-Wall -Werror`.** A doc comment

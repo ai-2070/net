@@ -586,7 +586,9 @@ operations:
     C:
       status: partial
       anchor: net_deck_admin_cordon
-      gap: 'No C program CI runs calls it (Go reaches it through go/deck.go).'
+      evidence:
+      - net/crates/net/examples/c/deck.c
+      gap: 'A C deck client attaches no operator registry (net_deck_client_new takes none), so a signed ICE commit takes the unsigned admin path: it is neither verified nor attributed to its signers.'
 - operation: Redis Streams dedup
   bindings:
     Rust:
