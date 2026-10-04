@@ -372,6 +372,43 @@ stages the bundle.
   exception.
 - The existing test-helpers baseline stays as it is.
 
+**Status: built, verified on Windows, Linux pending CI (2026-10-04).**
+- **What landed:**
+  - `make-c-bundle.py` (`--profile production|helper`, `--self-test`:
+    13 planted cases);
+  - `run-c-consumers.py` (`--self-test`: 10 cases);
+  - `examples/c/support/loaded_module.{c,h}`, the identity check;
+  - `examples/c/smoke.c`;
+  - `tests/c_abi/helpers/net_test_helpers.h`;
+  - `exports.shipped.baseline`;
+  - the `c-consumers` CI job (ubuntu, windows).
+  - `check-ffi-exports.py` gained `--build`, so a baseline records the
+    recipe that built it. It also no longer crashes on a relative
+    `--baseline`.
+  - `check-script-permissions.py` treats `"$PY"` (the job's per-runner
+    interpreter: `python3` isn't on every Windows image's PATH) as an
+    interpreter, with a self-test case that fails without the rule.
+- **Bundles on Windows:**
+  - production: 11 headers, `net.dll` + `net.dll.lib`, 593 exports, no
+    seams;
+  - helper: 12 headers, 601 exports.
+  - The helper set minus the shipped set is exactly the eight test seams:
+    `net_blob_test_barrier_{arm,release,wait_held}`,
+    `net_compute_test_inject_synthetic_peer{,_with_tags}`,
+    `net_mesh_blob_adapter_test_{chunk_present,drop_data_chunk}` and
+    `net_mesh_test_send_refusal_attribution`. Nothing is shipped-only.
+- **Runs on Windows:** `smoke.c` under MSVC `/W4 /WX /MD` and MinGW-w64
+  UCRT (GCC 16.1, `-Werror`), against both bundles. Each loaded its own
+  staged `net.dll` with a matching SHA-256. In every combination, the
+  shadowing control (the other bundle's `net.dll` beside the executable)
+  was refused by name before any Net call.
+- **Not yet run anywhere:** the ELF identity path and the `LD_PRELOAD`
+  control. This box has no Linux environment; the ubuntu leg of
+  `c-consumers` is their first run.
+- **Found:** `net_ffi_abi_version` is exported (`net-ffi/src/lib.rs:52`)
+  but declared in no shipped header. It is the first entry for C1's
+  exported ⇒ declared check.
+
 ### C1: the audit
 
 `check-c-abi.py` runs checks 1–7 against the C0 bundle, in CI next to
@@ -423,8 +460,9 @@ the bundle on both platforms.
 
 **Proves it:**
 - Both programs build against the bundle only and run under
-  `run-c-consumers.sh`, which reuses `run-skill-examples.sh`'s run
-  contract.
+  `run-c-consumers.py` (C0), which keeps `run-skill-examples.sh`'s run
+  contract: bounded timeouts, no retries. It is Python rather than shell
+  because one runner drives GCC, MSVC and MinGW.
 - Each assertion is a named check printed on success. CI fails if the
   number of named checks drops below the recorded floor; that's the
   roster pattern.

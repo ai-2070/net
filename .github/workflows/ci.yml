@@ -5176,6 +5176,117 @@ jobs:
           .github/scripts/run-skill-examples.sh --lang go
           .github/scripts/run-skill-examples.sh --lang c
 
+  c-consumers:
+    # C SDK consumer verification, slice C0
+    # (docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md).
+    #
+    # Every other build of libnet in this workflow passes
+    # `--features net-ffi/test-helpers` and lands in the ordinary
+    # `target/release`, so the library a C consumer gets from the documented
+    # `cargo build --release -p net-ffi` was never built, staged or checked.
+    # This job builds that default library (and, separately, the helper one)
+    # in their OWN target directories, stages each as a bundle of headers +
+    # one library + EXPORTS + PROVENANCE, pins the shipped export set, and
+    # runs C programs against the bundle only.
+    #
+    # Building against a bundle proves nothing about what loaded. Windows
+    # searches the program's directory before PATH, and ELF loading follows
+    # DT_RPATH and LD_PRELOAD, not only LD_LIBRARY_PATH. So each program's
+    # first act reports the module its Net imports resolved to, and the
+    # runner requires that path and its SHA-256 to be the staged library's.
+    # Two negative controls (a shadowing library where the loader prefers it,
+    # and on Linux an LD_PRELOAD interposer) must be refused by name before
+    # any Net call; without them a green run could mean the check never
+    # looked.
+    name: C consumers (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # `python3` is not on every Windows image's PATH; `python` is.
+      - name: Pick the Python interpreter
+        run: |
+          if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' 2>/dev/null; then
+            echo "PY=python3" >> "$GITHUB_ENV"
+          else
+            echo "PY=python" >> "$GITHUB_ENV"
+          fi
+
+      # Pure Python, before the toolchains: each plants its defects (a test
+      # seam in the shipped exports, an extra header, a second library; a
+      # wrong module path, a wrong hash, a missing module line) and requires
+      # rejection, so a green step means the checks can fail.
+      - name: Self-tests — bundle stager and consumer runner
+        run: |
+          "$PY" .github/scripts/make-c-bundle.py --self-test
+          "$PY" .github/scripts/run-c-consumers.py --self-test
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: c-consumers
+          workspaces: |
+            net/crates/net -> target/c-bundle
+            net/crates/net -> target/c-bundle-helper
+
+      - name: Build and stage the production bundle (default features)
+        run: |
+          "$PY" .github/scripts/make-c-bundle.py --profile production --build | tee "$RUNNER_TEMP/prod.out"
+          echo "PROD_BUNDLE=$(tail -n 1 "$RUNNER_TEMP/prod.out")" >> "$GITHUB_ENV"
+
+      # The shipped export set is pinned name for name, separately from the
+      # test-helpers baseline the go-tests job checks. A change to what a
+      # consumer can link shows in review as a diff of this file.
+      - name: Guard — shipped libnet exports match their baseline
+        run: |
+          lib="$PROD_BUNDLE/$(sed -n 's/^library: //p' "$PROD_BUNDLE/PROVENANCE")"
+          "$PY" .github/scripts/check-ffi-exports.py --artifact "$lib" \
+            --baseline net/crates/net/bindings/go/net-ffi/exports.shipped.baseline
+
+      - name: Build and stage the helper bundle (test-helpers)
+        run: |
+          "$PY" .github/scripts/make-c-bundle.py --profile helper --build | tee "$RUNNER_TEMP/helper.out"
+          echo "HELPER_BUNDLE=$(tail -n 1 "$RUNNER_TEMP/helper.out")" >> "$GITHUB_ENV"
+
+      - name: Consumers — production bundle
+        run: |
+          shadow="$HELPER_BUNDLE/$(sed -n 's/^library: //p' "$HELPER_BUNDLE/PROVENANCE")"
+          if [ "$RUNNER_OS" = "Windows" ]; then compilers="msvc"; else compilers="gcc"; fi
+          for c in $compilers; do
+            "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler "$c" \
+              --negative-controls --shadow-library "$shadow"
+          done
+
+      # The runner image's MinGW is whatever it ships; C5 adds pinned
+      # MinGW-w64 UCRT and MSVCRT lanes. Run it when present and say so when
+      # not, rather than passing silently.
+      - name: Consumers — production bundle, MinGW (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          if ! command -v gcc >/dev/null 2>&1; then
+            echo "::notice::no MinGW gcc on this runner image; the MinGW lane did not run"
+            exit 0
+          fi
+          gcc -v 2>&1 | tail -n 1
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler mingw
+
+      - name: Consumers — helper bundle
+        run: |
+          shadow="$PROD_BUNDLE/$(sed -n 's/^library: //p' "$PROD_BUNDLE/PROVENANCE")"
+          if [ "$RUNNER_OS" = "Windows" ]; then c=msvc; else c=gcc; fi
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$HELPER_BUNDLE" --compiler "$c" \
+            --negative-controls --shadow-library "$shadow"
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
