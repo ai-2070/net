@@ -9,12 +9,16 @@ Planned, 2026-10-04. Targets the release after 0.39. Branch
 repair, the blob registry, Go-implemented adapters) only through cgo, from
 Go. This plan checks them from C.
 
-**Reviewed once: HOLD at `8192253`, revised.** The review kept the
-direction (a default-feature bundle and real C programs) and held on seven
-findings, R1–R7, all verified against the source before this revision. The
-ledger under "Review" maps each one to the change it made. The largest: the
+**Reviewed twice, revised after each.** The first review (HOLD at
+`8192253`) kept the direction (a default-feature bundle and real C
+programs) and held on seven findings, R1–R7. The largest: the
 cross-allocator repair this plan proposed already exists, so C4 and C5 now
-test the existing contract instead of predicting its failure.
+test the existing contract instead of predicting its failure. The second
+(HOLD at `491237b`) kept those corrections and held on two execution
+contracts, S1–S2, plus one C4 wording fix: which library actually loaded,
+and how `repair.c` gets declarations for the helper functions. Every
+finding was verified against the source before revising; the ledger under
+"Review" maps each one to its change.
 
 **Prerequisite:** #1167 (channel-bound write tokens) must be merged before
 C3b. At this branch's base, `net_cortex.h` still declares the four-argument
@@ -127,15 +131,62 @@ the docs give. It is kept apart from the existing helper build:
   ordinary `target/release` (where CI's helper library lives) can be
   picked up.
 - **Exports come from the staged library**, not from a build directory.
-- **The loader is pinned to the bundle.** Consumer runs set the library
-  path to `bundle/lib` only, and the runner first fails if another
-  `libnet`/`net.dll` is reachable on `PATH` or `LD_LIBRARY_PATH`.
+- **Loader settings are sanitized, as setup.** Consumer runs set the
+  library path to `bundle/lib` only, and the runner refuses to start if
+  another `libnet`/`net.dll` is reachable on `PATH` or `LD_LIBRARY_PATH`.
+  That is not proof of what loaded: Windows also searches the
+  application's directory and others, and ELF loading follows
+  `DT_RPATH`/`DT_RUNPATH`, explicit dependency paths and preloads.
 - **`PROVENANCE` tells the two artifacts apart.** It records the exact
-  cargo command and feature set, and every consumer program prints it at
-  start, so a log shows which library ran.
+  cargo command, the feature set and the library's SHA-256.
+- **The loaded library is identified, not assumed.** See "Loaded-library
+  identity" below.
 - **Windows stages the runtime DLL and its import library.** "Exactly one
   library" means one Net implementation library; `net.dll.lib` is part of
   it, not a second one.
+
+### Loaded-library identity
+
+Every consumer program, production or helper, starts with one identity
+check, before it calls any Net function. It is a shared C file the runner
+compiles in (`examples/c/support/loaded_module.c`), not a Net API.
+
+1. **Resolve the address the program actually calls.** For each Net
+   function the program uses, take the address its imports resolved to:
+   - **Linux:** the function's address as the executable sees it, then
+     `dladdr` for the module that contains it. An `LD_PRELOAD` or
+     interposed definition resolves to the interposer, so it is the
+     interposer that gets reported.
+   - **Windows:** the function's entry in the executable's import address
+     table, then `GetModuleHandleExW` (`FROM_ADDRESS`,
+     `UNCHANGED_REFCOUNT`) and `GetModuleFileNameW`. A thunk's address
+     isn't used: it belongs to the executable.
+
+   The check never opens the expected library by path and inspects that,
+   which would examine the right module whatever the program called.
+2. **Report one module.** Every resolved address must fall in a single
+   module. The program prints `NET-LOADED-MODULE: <path>`, and fails if
+   the addresses span more than one.
+3. **Compare with the staged artifact.** The runner resolves that path
+   (real path, no links) and requires it to equal the staged library's
+   path, and its SHA-256 to equal the one in that bundle's `PROVENANCE`.
+   A missing line, a second module, or a mismatch fails the run.
+
+Production and helper bundles are checked separately, each against its
+own staged library and `PROVENANCE`.
+
+**Negative controls, benign by construction.** Each must fail the
+identity check by name, before any Net call, rather than relying on a
+mismatched ABI to crash:
+- **Shadowing:** the helper bundle's library (same ABI, different hash)
+  placed where the loader prefers it: the application directory on
+  Windows, an `RPATH` entry on Linux. The run must fail on the hash.
+- **Interposition (Linux):** an `LD_PRELOAD` library defining one Net
+  function the program uses. The run must fail with that function
+  resolving outside the staged module. The interposed function is never
+  called, because the check only takes addresses.
+
+### Building against the bundle
 
 CI builds the bundle on Linux and Windows; every later slice compiles
 against it and nothing else. A consumer program may include headers only
@@ -264,7 +315,8 @@ delete.
 - **(a)** A disk fixture: known distinct chunk contents and a test-side
   map of the storage layout.
 - **(b)** A separate test-helpers bundle for `repair.c` alone, using
-  `net_mesh_blob_adapter_test_drop_data_chunk` and `_chunk_present`.
+  `net_mesh_blob_adapter_test_drop_data_chunk` and `_chunk_present`
+  (`src/ffi/blob.rs:2275`, `:2362`).
 
 **Decided: (b).** The on-disk layout isn't a supported contract, so (a)
 would make a production-bundle claim rest on an internal detail. (b) is
@@ -272,6 +324,25 @@ labelled as helper-build evidence everywhere it's cited. Every other
 consumer stays on the production bundle, and repair is never marked as
 executed against the default artifact. No production inspection or
 deletion surface is added to save the demo's shape.
+
+**The helper bundle needs its own header.** Neither function is declared
+in any shipped header. The Go witness declares them locally
+(`go/blob_repair_testhelpers.go:22-36`), but consumer files may not carry
+prototypes, so that route is closed to `repair.c`. Changing the feature
+set alone supplies symbols, not declarations. So:
+- **`net_test_helpers.h`** declares exactly those two functions. It lives
+  outside the shipped header directory
+  (`net/crates/net/tests/c_abi/helpers/`), so the production header count
+  and its source of truth are unchanged.
+- **Only the helper bundle stages it.** That bundle is built with
+  `--features net-ffi/test-helpers` in its own target directory, and has
+  its own inventory (the eleven headers plus `net_test_helpers.h`), its
+  own `EXPORTS` and `PROVENANCE`, and its own identity check.
+- **`repair.c` includes it by name**, like any other header.
+- **C1 checks it.** Under the helper profile, its declarations are
+  compared with the gated exports by the same exact-signature check.
+  Under the production profile, the header and both symbols must be
+  absent.
 
 ## The slices
 
@@ -291,7 +362,14 @@ stages the bundle.
   recipe; the update tool's provenance text, which today describes the
   helper build, is changed to match whichever baseline it writes.
 - The runner refuses to start if another Net library is reachable on the
-  loader path.
+  loader path. That is setup; the proof is the next item.
+- The loaded-library identity check passes for a trivial program against
+  the production bundle, and both negative controls fail it with their
+  named reasons.
+- The helper bundle is staged separately with its own inventory and
+  identity check. The production bundle's eleven-header and no-test-seam
+  assertions are unchanged; the helper bundle is the one documented
+  exception.
 - The existing test-helpers baseline stays as it is.
 
 ### C1: the audit
@@ -364,8 +442,8 @@ the bundle on both platforms.
     - an exact sub-range;
     - output storage: valid outputs are initialised on a later failure,
       and a mixed-null pair is refused with both slots untouched.
-- **`repair.c`** (helper bundle, D3(b)). It keeps the Go plan's S6
-  shape:
+- **`repair.c`** (helper bundle, D3(b)), including
+  `net_test_helpers.h` by name. It keeps the Go plan's S6 shape:
   - the production-sized Reed-Solomon input the Go plan used;
   - before the drop, the stored tree is fully closed (every chunk
     present);
@@ -409,8 +487,18 @@ headers must rebuild.
   - `release_fn` runs exactly once, after unregister;
   - a duplicate-id registration never calls `release_fn` and leaves the
     context with the caller;
-  - a callback that returns an error surfaces as the matching
-    `NET_ERR_BLOB_*` code, by name.
+  - a callback's error code surfaces as the public code it maps to,
+    which is not always the same one (`code_to_err`,
+    `src/ffi/blob.rs:697-707`, then `err_to_code`, `:141-160`). The
+    witness drives these pairs, by name:
+
+    | Callback returns | Caller sees |
+    | --- | --- |
+    | `NET_ERR_BLOB_NOT_FOUND` | `NET_ERR_BLOB_NOT_FOUND` |
+    | `NET_ERR_BLOB_HASH_MISMATCH` | `NET_ERR_BLOB_BACKEND` |
+    | an unlisted code | `NET_ERR_BLOB_BACKEND` |
+
+    The table records current behaviour; no native change is made.
 - **`rpc_callbacks.c`**, written against the existing contract:
   - it calls `net_rpc_set_callback_free` with its own counting
     deallocator before any dispatcher registration;
@@ -585,8 +673,10 @@ Known before C1 runs:
 
 ## Review
 
-One review, HOLD at `8192253`. Every finding was checked against the
-source before this revision.
+Two reviews. Every finding was checked against the source before the
+revision that answered it.
+
+### First review: HOLD at `8192253`
 
 | Finding | Verdict | Change |
 | --- | --- | --- |
@@ -600,3 +690,13 @@ source before this revision.
 | D1 | Agreed | CI-only first; the release asset is C7 (the earlier text said C6) |
 | D2 | Agreed | A per-topic ledger replaces "delete and list" |
 | D3 | Agreed | (b), as R5 |
+
+### Second review: HOLD at `491237b`
+
+Kept every first-review correction and asked for no redesign.
+
+| Finding | Verdict | Change |
+| --- | --- | --- |
+| S1 (medium): loader-path isolation and printed provenance don't identify the loaded library | Accepted: `PATH`/`LD_LIBRARY_PATH` are not the whole search order on either platform | New "Loaded-library identity": the address each Net function resolved to, its module, then path and SHA-256 against the staged artifact, per bundle. Sanitized loader settings kept as setup. Shadowing and `LD_PRELOAD` negative controls fail the check by name. C0 proves it |
+| S2 (medium): `repair.c` has no declared route to the helper functions | Confirmed: neither function is in a shipped header; Go declares them locally | `net_test_helpers.h`, outside `include/`, staged only in the helper bundle with its own inventory, and checked by C1 under the helper profile. The production bundle's assertions are unchanged |
+| C4 wording: callback codes don't all round-trip | Confirmed: `HASH_MISMATCH` maps to `Backend`, then `NET_ERR_BLOB_BACKEND` | C4 names the input/output pairs the witness drives. No native change |
