@@ -14,11 +14,11 @@ capabilities 293
 mcp 77
 redis_dedup 23
 meshdb 68
-compute 58
+compute 60
 deck 77
 streams 36
 islands 31
 aggregator 21
 meshos 39
-org_call 41
+org_call 40
 subnet 43

@@ -161,7 +161,7 @@ int main(void) {
     size_t resp_len = 0;
     char* err = NULL;
     uint64_t handler_id;
-    int rc, attempt;
+    int rc, attempt, released;
 
     if (clm_check_loaded_module(used, sizeof used / sizeof used[0]) != 0) {
         return 2;
@@ -277,8 +277,9 @@ int main(void) {
     CU_CHECK("handler: served by the provider's organization (the manifest's)",
              memcmp(seen.provider_org, provider_org, 32) == 0);
     CU_CHECK("handler: cross-org, so the two differ", memcmp(seen.acting_org, seen.provider_org, 32) != 0);
+    released = frees;
     cu_mutex_unlock(lock);
-    CU_CHECK("the response buffer came back through the registered free", frees >= 1);
+    CU_CHECK("the response buffer came back through the registered free", released >= 1);
 
     err = NULL;
     resp = NULL;
@@ -289,13 +290,10 @@ int main(void) {
     CU_CHECK_RC("net_org_call: the handler's application error is NET_ORG_ERR_RPC", rc, NET_ORG_ERR_RPC);
     CU_CHECK("application error: the org: wire", err != NULL && strncmp(err, "org:", 4) == 0);
     net_org_free_cstring(err);
-    {
-        int released;
-        cu_mutex_lock(lock);
-        released = frees;
-        cu_mutex_unlock(lock);
-        CU_CHECK("the handler's error string came back through the registered free too", released >= 2);
-    }
+    cu_mutex_lock(lock);
+    released = frees;
+    cu_mutex_unlock(lock);
+    CU_CHECK("the handler's error string came back through the registered free too", released >= 2);
 
     err = NULL;
     rc = net_org_call(client, "no.such.service", 15, (const uint8_t*)"x", 1, 3000, 0, &resp, &resp_len, &err);
@@ -314,7 +312,7 @@ int main(void) {
     net_org_client_free(NULL);
     net_org_credentials_free(NULL);
     net_org_free_cstring(NULL);
-    CU_CHECK("every free accepts NULL and a pointer to NULL", 1);
+    CU_SURVIVED("every free accepts NULL and a pointer to NULL");
     CU_CHECK_RC("net_mesh_shutdown: caller", net_mesh_shutdown(caller), 0);
     CU_CHECK_RC("net_mesh_shutdown: provider", net_mesh_shutdown(provider), 0);
     net_mesh_free(caller);

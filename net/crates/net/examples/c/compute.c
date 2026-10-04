@@ -43,9 +43,37 @@ static uint64_t next_daemon_id = 1;
 static int frees, restores, factory_calls;
 static unsigned long callback_frees;
 
+/* Runs on the library's worker threads, like every callback here: the
+ * counters it and they write are read under `lock` (locked_*). */
 static void callback_free(void* p) {
+    cu_mutex_lock(lock);
     callback_frees++;
+    cu_mutex_unlock(lock);
     free(p);
+}
+
+static int locked_int(const int* v) {
+    int x;
+    cu_mutex_lock(lock);
+    x = *v;
+    cu_mutex_unlock(lock);
+    return x;
+}
+
+static uint64_t locked_u64(const uint64_t* v) {
+    uint64_t x;
+    cu_mutex_lock(lock);
+    x = *v;
+    cu_mutex_unlock(lock);
+    return x;
+}
+
+static unsigned long locked_ulong(const unsigned long* v) {
+    unsigned long x;
+    cu_mutex_lock(lock);
+    x = *v;
+    cu_mutex_unlock(lock);
+    return x;
 }
 
 static int on_process(uint64_t daemon_id, uint64_t origin, uint64_t seq, const uint8_t* payload,
@@ -180,6 +208,7 @@ static int daemons(net_compute_runtime_t* rt) {
     net_compute_daemon_handle_t* h = NULL;
     net_compute_daemon_handle_t* restored = NULL;
     net_compute_outputs_t* snap = NULL;
+    net_compute_outputs_t* unknown;
     char* err = NULL;
     char out[256];
     uint8_t entity[32];
@@ -204,8 +233,17 @@ static int daemons(net_compute_runtime_t* rt) {
     CU_CHECK_RC("deliver 2", deliver(rt, origin, 2, "beta", out, sizeof out), 0);
     CU_CHECK_RC("deliver 3", deliver(rt, origin, 3, "gamma", out, sizeof out), 0);
     CU_CHECK("deliver 3: the count carried across events", strcmp(out, "n=3:gamma") == 0);
-    CU_CHECK("deliver: an unknown origin is refused",
-             deliver(rt, 0xDEADBEEF, 1, "x", out, sizeof out) != 0);
+    /* The raw call, not deliver(): deliver() also fails a call that
+     * succeeds with no output, which would pass this check for a runtime
+     * that silently accepted the origin. */
+    unknown = NULL;
+    rc = net_compute_runtime_deliver(rt, 0xDEADBEEF, 0x5EED, 1, (const uint8_t*)"x", 1, &unknown, &err);
+    CU_CHECK_RC("deliver: an unknown origin is refused", rc, NET_COMPUTE_ERR_CALL_FAILED);
+    CU_CHECK("deliver: the refusal writes no outputs", unknown == NULL);
+    net_compute_outputs_free(unknown);
+    CU_CHECK("deliver: refused because no daemon has that origin",
+             error_mentions(rc, err, "daemon not found: 0xdeadbeef"));
+    err = NULL;
 
     rc = net_compute_runtime_snapshot(rt, origin, &snap, &err);
     net_compute_free_cstring(err);
@@ -215,7 +253,7 @@ static int daemons(net_compute_runtime_t* rt) {
              net_compute_outputs_len(snap) == 1 && net_compute_outputs_at(snap, 0, &snap_ptr, &snap_len) == 0 &&
                  snap_len > sizeof(uint64_t));
     CU_CHECK("snapshot: the library released this program's state buffer through the registered free",
-             callback_frees >= 1);
+             locked_ulong(&callback_frees) >= 1);
     snap_copy = (uint8_t*)malloc(snap_len);
     CU_CHECK("snapshot: copied", snap_copy != NULL);
     memcpy(snap_copy, snap_ptr, snap_len);
@@ -227,14 +265,15 @@ static int daemons(net_compute_runtime_t* rt) {
     CU_CHECK_RC("net_compute_runtime_stop", rc, 0);
     net_compute_daemon_handle_free(h);
     CU_CHECK_RC("net_compute_runtime_daemon_count: 0 after stop", net_compute_runtime_daemon_count(rt), 0);
-    CU_CHECK("free: the dropped daemon's free callback ran", frees >= 1 && !live[d1]);
+    CU_CHECK("free: the dropped daemon's free callback ran", locked_int(&frees) >= 1 && !locked_int(&live[d1]));
 
     d2 = new_daemon();
     rc = net_compute_spawn_from_snapshot(rt, "counter", 7, seed, snap_copy, snap_len, d2, 0, 0, &restored, &err);
     net_compute_free_cstring(err);
     err = NULL;
     CU_CHECK_RC("net_compute_spawn_from_snapshot", rc, 0);
-    CU_CHECK("spawn_from_snapshot: restore received the state", restores == 1 && counts[d2] == 3);
+    CU_CHECK("spawn_from_snapshot: restore received the state",
+             locked_int(&restores) == 1 && locked_u64(&counts[d2]) == 3);
     origin2 = net_compute_daemon_handle_origin_hash(restored);
     CU_CHECK("spawn_from_snapshot: the same identity, the same origin", origin2 == origin);
     CU_CHECK_RC("deliver after restore", deliver(rt, origin2, 4, "delta", out, sizeof out), 0);
@@ -272,7 +311,7 @@ static int groups(net_compute_runtime_t* rt) {
     char* members;
     char needle[64];
     uint64_t routed = 0;
-    int status = -1, before = factory_calls, rc;
+    int status = -1, before = locked_int(&factory_calls), rc;
     uint32_t healthy = 0, total = 0;
 
     rc = net_compute_fork_group_spawn(rt, "counter", 7, 0xABCDEF01, 42, 1, "round-robin", 11, 0, 0, &fork, &err);
@@ -284,7 +323,7 @@ static int groups(net_compute_runtime_t* rt) {
     CU_CHECK("net_compute_fork_group_parent_origin", net_compute_fork_group_parent_origin(fork) == 0xABCDEF01);
     CU_CHECK("net_compute_fork_group_fork_seq", net_compute_fork_group_fork_seq(fork) == 42);
     CU_CHECK_RC("net_compute_fork_group_verify_lineage", net_compute_fork_group_verify_lineage(fork), 1);
-    CU_CHECK("fork group: its member was built by this program's factory", factory_calls > before);
+    CU_CHECK("fork group: its member was built by this program's factory", locked_int(&factory_calls) > before);
     net_compute_fork_group_free(fork);
 
     rc = net_compute_replica_group_spawn(rt, "counter", 7, 1, group_seed, "consistent-hash", 15, 0, 0, &replica,
