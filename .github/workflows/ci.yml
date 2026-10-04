@@ -5253,6 +5253,18 @@ jobs:
           "$PY" .github/scripts/check-ffi-exports.py --artifact "$lib" \
             --baseline net/crates/net/bindings/go/net-ffi/exports.shipped.baseline
 
+      # C1 check 4, the Rust half: rustc's layout (size, alignment, every
+      # field offset) of each struct the headers publish equals the reviewed
+      # fixture tests/c_abi/layout.json. The C1 audit step compiles the same
+      # numbers as C _Static_asserts against the headers, so the two compilers
+      # meet at the fixture. `--release` in the bundle's target directory
+      # reuses the libraries the step above just built.
+      - name: Guard — Rust struct layouts match the reviewed fixture (C1 check 4)
+        working-directory: net/crates/net
+        env:
+          CARGO_TARGET_DIR: target/c-bundle
+        run: cargo test --release -p net-ffi --test abi_layout
+
       - name: Build and stage the helper bundle (test-helpers)
         run: |
           "$PY" .github/scripts/make-c-bundle.py --profile helper --build | tee "$RUNNER_TEMP/helper.out"

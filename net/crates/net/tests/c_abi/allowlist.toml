@@ -22,26 +22,6 @@ net_ffi_abi_version = "bundle-composition marker, not a consumer API; see C0 loa
 # not offered to new C code (.claude/skills/net-event-bus/dataforts.md).
 net_blob_register_callback_adapter = "superseded by the declared _owned form; exported for existing binaries"
 
-# The nRPC call observer. Its dispatcher receives `RpcCallEventC` by pointer,
-# a #[repr(C)] struct that would have to be published in net_rpc.h. Deferred
-# until C1's layout check (check 4) can compile-check that struct's layout
-# from the header, so the declaration never ships unverified. Go declares
-# both locally today (go/mesh_rpc_typed.go).
-net_rpc_set_observer_dispatcher = "deferred to the C1 layout check: needs RpcCallEventC published and layout-checked"
-net_rpc_observer_install = "deferred to the C1 layout check: needs RpcCallEventC published and layout-checked"
-
-[constants]
-
-# The status and direction fields of the nRPC observer's RpcCallEventC.
-# Published with that struct and its two functions (see [exported] above),
-# once check 4 can layout-check it.
-NET_RPC_STATUS_OK = "observer event field; published with RpcCallEventC (layout stage)"
-NET_RPC_STATUS_ERROR = "observer event field; published with RpcCallEventC (layout stage)"
-NET_RPC_STATUS_TIMEOUT = "observer event field; published with RpcCallEventC (layout stage)"
-NET_RPC_STATUS_CANCELED = "observer event field; published with RpcCallEventC (layout stage)"
-NET_RPC_DIRECTION_OUTBOUND = "observer event field; published with RpcCallEventC (layout stage)"
-NET_RPC_DIRECTION_INBOUND = "observer event field; published with RpcCallEventC (layout stage)"
-
 [mentioned]
 
 # net_transport.h:88 reserves -212 for a planned code by name; the name is

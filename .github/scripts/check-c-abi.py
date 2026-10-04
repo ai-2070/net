@@ -41,6 +41,7 @@ default `gcc`).
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -59,6 +60,7 @@ if hasattr(sys.stdout, "reconfigure"):
 ROOT = Path(__file__).resolve().parents[2]
 CRATE = ROOT / "net" / "crates" / "net"
 ALLOWLIST = CRATE / "tests" / "c_abi" / "allowlist.toml"
+LAYOUT = CRATE / "tests" / "c_abi" / "layout.json"
 SEAM_PATTERNS = ("_test_", "net_blob_test_barrier_")
 PROFILE_FEATURES = {"production": [], "helper": ["net-ffi/test-helpers"]}
 
@@ -99,6 +101,10 @@ class Comparer:
             return [("abi", f"{where}: {c} in C, {r} in Rust")]
         if isinstance(c, M.Ptr) and isinstance(r, M.Ptr):
             return self.diff(c.to, r.to, where + "*")
+        if isinstance(c, M.Arr) and isinstance(r, M.Arr):
+            if c.n != r.n:
+                return [("abi", f"{where}: {c} in C, {r} in Rust")]
+            return self.diff(c.of, r.of, where + "[]")
         if isinstance(c, M.Fn) and isinstance(r, M.Fn):
             if len(c.args) != len(r.args):
                 return [("abi", f"{where}: callback takes {len(c.args)} arg(s) in C ({c}), {len(r.args)} in Rust ({r})")]
@@ -134,6 +140,12 @@ class Model:
     # header name -> {NET_* name a comment mentions -> line}
     mentions: dict[str, dict[str, int]] = field(default_factory=dict)
     include_dir: Path | None = None
+    # C struct (typedef name or `struct tag`) -> (header, line, [(field, Type)])
+    c_structs: dict[str, tuple[str, int, list]] = field(default_factory=dict)
+    crates: dict[str, M.Crate] = field(default_factory=dict)
+    lib_names: dict[str, str] = field(default_factory=dict)  # Rust lib name -> package
+    # The reviewed layout fixture, tests/c_abi/layout.json; None skips the check.
+    layout: dict | None = None
 
 
 def ffi_crates(crate_dir: Path) -> dict[str, M.Crate]:
@@ -193,7 +205,17 @@ def load_model(bundle: Path, crate_dir: Path = CRATE) -> Model:
         if line.strip()
     }
     model = Model(headers, decls, load_rust(crate_dir, profile, target_os), exports, profile)
-    model.rust_consts = load_rust_consts(crate_dir, ffi_crates(crate_dir))
+    crates = ffi_crates(crate_dir)
+    model.rust_consts = load_rust_consts(crate_dir, crates)
+    model.crates = crates
+    model.lib_names = lib_names(crate_dir)
+    model.c_structs = {
+        name: (h.path.name, line, fields)
+        for h in headers.values()
+        for name, (line, fields) in h.structs.items()
+    }
+    if LAYOUT.exists():
+        model.layout = json.loads(LAYOUT.read_text(encoding="utf-8"))
     model.mentions = {h.name: M.comment_mentions(h) for h in sorted(inc.glob("*.h"))}
     model.include_dir = inc
     return model
@@ -250,6 +272,8 @@ def run_checks(model: Model, compile_assertions: bool = True) -> tuple[list[Find
             f"{name} is exported but declared in no shipped header"
             + (f" (defined at {_loc(model.defs[name][0])})" if model.defs.get(name) else "")))
 
+    findings += run_layout_checks(model, cmp, compile_assertions)
+    stats["layout_structs"] = len(model.c_structs)
     stats["erased"] = len(cmp.erased)
     stats["erased_list"] = cmp.erased
     stats["handle_types"] = len(cmp.pairs)
@@ -393,6 +417,168 @@ def compile_constant_assertions(model: Model) -> list[Finding]:
     return findings
 
 
+def lib_names(crate_dir: Path) -> dict[str, str]:
+    """Rust lib name (what a path starts with) -> package name."""
+    # Paths are as abi_layout.rs (in net-ffi) writes them, where `net::` is the
+    # net-mesh dependency. net-ffi's own lib is also named `net`; it defines
+    # no structs, so it is left out rather than shadowing net-mesh.
+    out = {"net": "net-mesh"}
+    for d in sorted((crate_dir / "bindings" / "go").glob("*-ffi")):
+        if d.name == "net-ffi":
+            continue
+        toml = (d / "Cargo.toml").read_text(encoding="utf-8")
+        pkg = M.package_name(d / "Cargo.toml")
+        m = re.search(r'^\[lib\][^\[]*?^name\s*=\s*"([^"]+)"', toml, re.M | re.S)
+        out[m.group(1) if m else pkg.replace("-", "_")] = pkg
+    return out
+
+
+def module_path(crate: M.Crate, file: Path) -> list[str]:
+    parts = list(file.resolve().relative_to(crate.root.parent.resolve()).with_suffix("").parts)
+    return parts[:-1] if parts and parts[-1] in ("mod", "lib") else parts
+
+
+def c_type_spelling(name: str) -> str:
+    return name  # a typedef name, or already `struct tag`
+
+
+def run_layout_checks(model: Model, cmp: "Comparer", compile_assertions: bool = True) -> list[Finding]:
+    """Check 4. The fixture is the meeting point: the Rust test
+    (bindings/go/net-ffi/tests/abi_layout.rs) requires rustc's layout to
+    equal it, and the C assertions compiled here require the headers' layout
+    to equal it. This function makes sure the fixture covers exactly the
+    published structs and that each entry pairs the right fields."""
+    if model.layout is None:
+        return []
+    findings: list[Finding] = []
+    entries: dict = model.layout.get("structs", {})
+    for name in sorted(set(model.c_structs) - set(entries)):
+        h, line, _ = model.c_structs[name]
+        findings.append(Finding("layout", name,
+            f"{name} ({h}:{line}) is published with a body but has no entry in tests/c_abi/layout.json"))
+    for name in sorted(set(entries) - set(model.c_structs)):
+        findings.append(Finding("layout", name,
+            f"tests/c_abi/layout.json has {name}, which no shipped header defines"))
+
+    for name in sorted(set(entries) & set(model.c_structs)):
+        entry = entries[name]
+        h, line, cfields = model.c_structs[name]
+        path = entry["rust"].split("::")
+        pkg = model.lib_names.get(path[0])
+        crate = model.crates.get(pkg) if pkg else None
+        if crate is None:
+            findings.append(Finding("layout", name, f"{name}: fixture path {entry['rust']} names no FFI crate"))
+            continue
+        found = M.rust_struct_fields(crate, path[-1])
+        if found is None:
+            findings.append(Finding("layout", name, f"{name}: no `struct {path[-1]}` in {pkg}"))
+            continue
+        rfile, rline, rfields = found
+        if module_path(crate, rfile) != path[1:-1]:
+            findings.append(Finding("layout", name,
+                f"{name}: fixture says {entry['rust']}, but {path[-1]} is in "
+                f"{'::'.join([path[0], *module_path(crate, rfile)])}"))
+        if len(cfields) != len(rfields):
+            findings.append(Finding("layout", name,
+                f"{name}: {len(cfields)} fields in {h}:{line}, {len(rfields)} in {path[-1]} ({_rel(rfile)}:{rline})"))
+            continue
+        pairs = [[cf, rf] for (cf, _), (rf, _) in zip(cfields, rfields)]
+        if [f[:2] for f in entry["fields"]] != pairs:
+            findings.append(Finding("layout", name,
+                f"{name}: fixture field pairs {[f[:2] for f in entry['fields']]} differ from the "
+                f"definitions' {pairs}"))
+        parser = M.RustTypeParser(crate, model.crates)
+        for (cf, ct), (rf, rt) in zip(cfields, rfields):
+            for kind, msg in cmp.diff(ct, parser.parse(rt), f"{name}.{cf}"):
+                findings.append(Finding("layout" if kind == "abi" else "char", name,
+                    f"{msg}  [{h}:{line} vs {_rel(rfile)}:{rline}]"))
+
+    if compile_assertions and model.include_dir is not None:
+        findings += compile_layout_assertions(model, entries)
+    return findings
+
+
+def layout_assertions(model: Model, headers: list[str], entries: dict) -> str:
+    lines = ["/* Generated by check-c-abi.py: header layouts equal tests/c_abi/layout.json. */",
+             "#include <stddef.h>"]
+    lines += [f'#include "{h}"' for h in headers]
+    for name, entry in sorted(entries.items()):
+        if name not in model.c_structs or model.c_structs[name][0] not in headers:
+            continue
+        t = c_type_spelling(name)
+        lines.append(f'_Static_assert(sizeof({t}) == {entry["size"]}, "sizeof({t}) is not {entry["size"]}");')
+        lines.append(f'_Static_assert(_Alignof({t}) == {entry["align"]}, "_Alignof({t}) is not {entry["align"]}");')
+        for cf, _, off in entry["fields"]:
+            lines.append(f'_Static_assert(offsetof({t}, {cf}) == {off}, "offsetof({t}, {cf}) is not {off}");')
+    return "\n".join(lines) + "\n"
+
+
+def compile_layout_assertions(model: Model, entries: dict) -> list[Finding]:
+    findings = []
+    others = [h for h in model.headers if h not in ("net.h", "net.go.h")]
+    units = [[b, *others] for b in ("net.h", "net.go.h") if b in model.headers] or [others]
+    with tempfile.TemporaryDirectory() as td:
+        for headers in units:
+            tu = Path(td) / ("abi_layout_" + headers[0].replace(".", "_") + ".c")
+            tu.write_text(layout_assertions(model, headers, entries), encoding="utf-8")
+            run = subprocess.run(
+                [M.default_cc(), "-std=c11", "-fsyntax-only", "-I", str(model.include_dir), str(tu)],
+                capture_output=True, text=True,
+            )
+            if run.returncode != 0:
+                out = (run.stdout + run.stderr).splitlines()[:20]
+                findings.append(Finding("compiled", "layout:" + headers[0],
+                    f"layout assertions through {headers[0]} do not compile:\n"
+                    + "\n".join("      " + line for line in out)))
+    return findings
+
+
+def emit_layout_table(model: Model) -> str:
+    """The `measure!` table for abi_layout.rs, one line per published struct,
+    with the Rust counterpart found through the same pairing the handle rule
+    uses (signatures first, then fields of already-paired structs)."""
+    cmp = Comparer()
+    for n, ds in model.decls.items():
+        for d in ds:
+            for r in model.defs.get(n, []):
+                cmp.signature(n, d.sig, r.sig)
+    lines = []
+    done: set[str] = set()
+    progress = True
+    while progress:
+        progress = False
+        for name, (h, line, cfields) in sorted(model.c_structs.items()):
+            if name in done or len(cmp.pairs.get(name, {})) != 1:
+                continue
+            rname = next(iter(cmp.pairs[name]))
+            for lib, pkg in model.lib_names.items():
+                crate = model.crates.get(pkg)
+                found = M.rust_struct_fields(crate, rname) if crate else None
+                if not found:
+                    continue
+                rfile, _, rfields = found
+                parser = M.RustTypeParser(crate, model.crates)
+                for (cf, ct), (rf, rt) in zip(cfields, rfields):
+                    cmp.diff(ct, parser.parse(rt), f"{name}.{cf}")
+                path = "::".join([lib, *module_path(crate, rfile), rname])
+                fields = ", ".join(f'"{cf}": {rf}' for (cf, _), (rf, _) in zip(cfields, rfields))
+                lines.append(f'        measure!("{name}" => {path} {{ {fields} }}),')
+                break
+            done.add(name)
+            progress = True
+    missing = sorted(set(model.c_structs) - done)
+    for name in missing:
+        lines.append(f"        // {name}: no unique Rust counterpart found")
+    return "\n".join(lines)
+
+
+def _rel(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 def _loc_const(c: M.RustConst) -> str:
     try:
         rel = c.file.resolve().relative_to(ROOT)
@@ -444,7 +630,7 @@ def report(findings: list[Finding], stats: dict, stale: list[str], profile: str,
     for f in findings:
         by[f.check].append(f)
     for check in ("declared", "exported", "signature", "char", "handles", "seams",
-                  "constants", "mentioned", "collision", "compiled"):
+                  "constants", "mentioned", "collision", "layout", "compiled"):
         items = by.get(check, [])
         mark = "✓" if not items else "✗"
         print(f"{mark} {check}: {len(items)} finding(s)")
@@ -470,6 +656,11 @@ int net_demo_open(demo_t** out);
 int net_demo_serve(demo_t* d, other_t* o, demo_cb cb);
 void net_demo_free(demo_t* d);
 uint32_t net_demo_count(const demo_t* d);
+typedef struct {
+    uint64_t id;
+    uint32_t len;
+} demo_pair_t;
+uint32_t net_demo_pair_len(const demo_pair_t* p);
 """
 
 _ST_RUST = """\
@@ -486,15 +677,27 @@ pub unsafe extern "C" fn net_demo_serve(d: *mut DemoHandle, o: *mut OtherHandle,
 pub unsafe extern "C" fn net_demo_free(d: *mut DemoHandle) { }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_demo_count(d: *const DemoHandle) -> u32 { 0 }
+#[repr(C)]
+pub struct DemoPair {
+    pub id: u64,
+    pub len: u32,
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_demo_pair_len(p: *const DemoPair) -> u32 { 0 }
 #[cfg(feature = "absent")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_demo_gated(d: *mut DemoHandle) -> c_int { 0 }
 """
 
-_ST_EXPORTS = {"net_demo_open", "net_demo_serve", "net_demo_free", "net_demo_count"}
+_ST_EXPORTS = {"net_demo_open", "net_demo_serve", "net_demo_free", "net_demo_count", "net_demo_pair_len"}
+_ST_LAYOUT = {"structs": {"demo_pair_t": {
+    "rust": "demo::DemoPair", "size": 16, "align": 8,
+    "fields": [["id", "id", 0], ["len", "len", 8]],
+}}}
 
 
-def _self_test_model(tmp: Path, header: str, rust: str, exports: set[str], profile: str = "production") -> Model:
+def _self_test_model(tmp: Path, header: str, rust: str, exports: set[str], profile: str = "production",
+                     layout: dict | None = None) -> Model:
     inc = tmp / "include"
     src = tmp / "crate" / "src"
     inc.mkdir(parents=True, exist_ok=True)
@@ -520,6 +723,10 @@ def _self_test_model(tmp: Path, header: str, rust: str, exports: set[str], profi
     model.rust_consts = consts
     model.mentions = {"net_demo.h": M.comment_mentions(inc / "net_demo.h")}
     model.include_dir = inc
+    model.crates = {"demo": crate}
+    model.lib_names = {"demo": "demo"}
+    model.c_structs = {name: ("net_demo.h", line, fields) for name, (line, fields) in h.structs.items()}
+    model.layout = _ST_LAYOUT if layout is None else layout
     return model
 
 
@@ -557,12 +764,23 @@ def self_test() -> int:
          ("mentioned", "NET_DEMO_ERR_GHOST")),
         ("two codes share a value in one domain", H + "#define NET_DEMO_ERR_TWIN -1\n", R, E,
          ("collision", "NET_DEMO_ERR_CLOSED and NET_DEMO_ERR_TWIN are both -1")),
+        ("a published struct with no layout entry", H, R, E, ("layout", "has no entry"), {"structs": {}}),
+        ("a layout entry with a wrong offset fails the compiled assertions", H, R, E,
+         ("compiled", "offsetof(demo_pair_t, len) is not 4"),
+         {"structs": {"demo_pair_t": {**_ST_LAYOUT["structs"]["demo_pair_t"],
+                                       "fields": [["id", "id", 0], ["len", "len", 4]]}}}),
+        ("a struct field whose width changed",
+         H.replace("    uint32_t len;\n} demo_pair_t;", "    uint64_t len;\n} demo_pair_t;"), R, E,
+         ("layout", "demo_pair_t.len: u64 in C, u32 in Rust")),
+        ("struct fields reordered",
+         H.replace("    uint64_t id;\n    uint32_t len;", "    uint32_t len;\n    uint64_t id;"), R, E,
+         ("layout", "fixture field pairs")),
     ]
     failures = 0
     with tempfile.TemporaryDirectory() as td:
-        for i, (label, header, rust, exports, expect) in enumerate(cases):
+        for i, (label, header, rust, exports, expect, *layout) in enumerate(cases):
             tmp = Path(td) / f"c{i}"
-            model = _self_test_model(tmp, header, rust, exports)
+            model = _self_test_model(tmp, header, rust, exports, layout=layout[0] if layout else None)
             findings, _ = run_checks(model)
             if expect is None:
                 ok = not findings
@@ -595,12 +813,17 @@ def main() -> int:
     ap.add_argument("--allowlist", type=Path, default=ALLOWLIST)
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--verbose", action="store_true", help="list every position where one side is void*")
+    ap.add_argument("--emit-layout-table", action="store_true",
+                    help="print the measure! table for bindings/go/net-ffi/tests/abi_layout.rs")
     args = ap.parse_args()
     if args.self_test:
         return self_test()
     if not args.bundle:
         ap.error("--bundle is required")
     model = load_model(args.bundle.resolve())
+    if args.emit_layout_table:
+        print(emit_layout_table(model))
+        return 0
     findings, stats = run_checks(model)
     left, stale = apply_allowlist(findings, load_allowlist(args.allowlist))
     return report(left, stats, stale, model.profile, args.verbose)

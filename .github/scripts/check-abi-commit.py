@@ -65,6 +65,11 @@ RUST_FFI_PREFIXES = (
     "net/crates/net/bindings/go/net-ffi/",
 )
 C_HEADER_PREFIX = "net/crates/net/include/"
+# The C headers that have a Go mirror header (go/net.h, go/net_cortex.h).
+MIRRORED_HEADERS = {
+    "net/crates/net/include/net.go.h",
+    "net/crates/net/include/net_cortex.h",
+}
 GO_HEADER_RE = re.compile(r"^go/[^/]+\.h$")
 GO_ABI_TEST_RE = re.compile(r"^go/(abi_stability.*|header_parity)_test\.go$")
 
@@ -242,6 +247,16 @@ def violations(consts: set[str], extern_c: bool, touched: set[str]) -> list[str]
         "go_headers": any(bool(GO_HEADER_RE.match(f)) for f in touched),
         "go_tests": any(bool(GO_ABI_TEST_RE.match(f)) for f in touched),
     }
+    # Only net.go.h and net_cortex.h have Go mirror headers. A change whose C
+    # side is confined to other headers (net_rpc.h, net_org.h, ...) has no
+    # mirror to touch; Go keeps those surfaces in cgo preambles, which the Go
+    # ABI test group covers. A change touching no header at all still needs
+    # every group.
+    headers_touched = {
+        f for f in touched if f.startswith(C_HEADER_PREFIX) and f.endswith(".h")
+    }
+    if headers_touched and not headers_touched & MIRRORED_HEADERS:
+        groups["go_headers"] = True
     missing = [label for key, label in _GROUP_LABELS.items() if not groups[key]]
     if not missing:
         return []
@@ -395,6 +410,22 @@ def self_test() -> int:
     expect(
         "both headers without a Go ABI test still violates",
         violations(consts, extern_c, both_headers) != [],
+    )
+    unmirrored = files | {"net/crates/net/include/net_rpc.h", "go/abi_stability_test.go"}
+    expect(
+        "a change confined to an unmirrored header (net_rpc.h) needs no Go mirror header",
+        violations(consts, extern_c, unmirrored) == [],
+    )
+    expect(
+        "the same change without its Go ABI test still violates",
+        violations(consts, extern_c, files | {"net/crates/net/include/net_rpc.h"}) != [],
+    )
+    expect(
+        "a mirrored header (net.go.h) without go/net.h still violates",
+        violations(
+            consts, extern_c,
+            files | {"net/crates/net/include/net.go.h", "go/abi_stability_test.go"},
+        ) != [],
     )
     expect(
         "all four groups landing together passes",

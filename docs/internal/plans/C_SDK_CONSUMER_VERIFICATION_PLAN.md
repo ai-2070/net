@@ -545,6 +545,55 @@ compatibility (check 7).
   `check-rpc-abi-parity.py` and the header-count, one-library and
   C-snippet guards.
 
+**Stage 3 landed (2026-10-04): layout (check 4).**
+- **Two compilers meet at a reviewed fixture,**
+  `tests/c_abi/layout.json`. It records size, alignment and every field
+  offset of each struct the headers publish with a body.
+  - **Rust:** `bindings/go/net-ffi/tests/abi_layout.rs` measures each
+    `#[repr(C)]` struct with `size_of`, `align_of` and `offset_of!`, and
+    requires the fixture to match. `NET_ABI_LAYOUT_WRITE=1` regenerates
+    it.
+  - **C:** the audit compiles `_Static_assert`s on `sizeof`, `_Alignof`
+    and `offsetof` from the bundle headers.
+  - **Coverage:** the audit requires the fixture to cover exactly the
+    published structs, and pairs C and Rust fields in order. Field types
+    go through the same comparison as signatures, so nested structs join
+    the one-to-one handle map.
+  - **Which Rust struct goes with which C struct** comes from that map:
+    signatures first, then fields of already-paired structs.
+    `--emit-layout-table` prints the test's table.
+- **Where it runs:** CI runs the Rust test on both legs of `c-consumers`
+  (`--release` in the bundle's target directory, reusing its libraries).
+- **Plan deviation, recorded:** the fixture is JSON rather than
+  generated C. Both sides read the same file, which is what the plan
+  required.
+- **21 structs, all clean** on the first run, after two audit fixes: array
+  fields, and a comment inside a Rust `type` alias.
+- **Proved on the real headers:** two swapped `RpcCallEventC` fields in a
+  bundle copy were reported as a field-order mismatch, two type
+  mismatches and two failed `offsetof` assertions. A narrowed `net_stats_t`
+  field was reported by the type comparison alone; its offsets and size
+  happen not to move, which is why both methods are kept. A wrong size
+  planted in the fixture failed the Rust test.
+- **`--self-test`** adds four cases: a published struct with no entry, a
+  wrong offset, a changed field width, and reordered fields. 22 in all.
+- **The nRPC call observer is now published** in `net_rpc.h`:
+  `RpcCallEventC`, `RpcObserverFn`, `net_rpc_set_observer_dispatcher`,
+  `net_rpc_observer_install` and the six status/direction constants. The
+  eight allowlist entries deferring them are gone. The new Go test
+  `TestABIStabilityObserverPreambleMatchesNetRpcHeader` pins Go's own
+  preamble copy to the header, all 12 fields and the 6 values, and fails
+  when a preamble field is widened.
+- **`check-abi-commit.py` refined:** it no longer demands a Go mirror
+  header for a change confined to headers that have none (`net_rpc.h`,
+  `net_org.h`, …). The Rust, header and Go-ABI-test groups are still
+  required. Three self-test cases cover it.
+- **Unrelated CI flakes seen on this branch:**
+  `mesh_rpc_hedge::hedge_loser_handler_observes_cancellation` (passed on
+  retry) and
+  `review_a2a_provider::the_owner_outlives_a_running_executor` (a loopback
+  `handshake timeout`). Neither touches code changed here.
+
 ### C2: lifecycle and transfer programs
 
 - **`lifecycle.c`.** Two in-process nodes go through `net_mesh_new`,

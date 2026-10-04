@@ -77,7 +77,16 @@ class Fn:
         return f"fn({', '.join(map(str, self.args))}) -> {self.ret}"
 
 
-Type = Prim | Ptr | Named | Fn
+@dataclass(frozen=True)
+class Arr:
+    of: "Type"
+    n: int
+
+    def __str__(self) -> str:
+        return f"[{self.of}; {self.n}]"
+
+
+Type = Prim | Ptr | Named | Fn | Arr
 
 VOID = Prim("void")
 
@@ -161,6 +170,8 @@ class CHeader:
     typedefs: dict[str, Type] = field(default_factory=dict)
     # NAME -> (int value, header line) for `#define NAME <int>` and enumerators.
     constants: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Struct (typedef name, or `struct tag`) with a body -> (line, [(field, Type)]).
+    structs: dict[str, tuple[int, list[tuple[str, "Type"]]]] = field(default_factory=dict)
 
 
 FAKE_LIBC = {
@@ -238,12 +249,14 @@ def parse_c_header(header: Path, include_dirs: list[Path], fake_libc: Path, cc: 
             if isinstance(inner, (c_ast.Struct, c_ast.Union)) and inner.name:
                 struct_typedef.setdefault(inner.name, ext.name)
 
-    def conv(node, depth: int = 0) -> Type:
+    def conv(node, depth: int = 0, field: bool = False) -> Type:
         if depth > 40:
             raise RuntimeError("typedef cycle")
         if isinstance(node, c_ast.PtrDecl):
             return Ptr(conv(node.type, depth + 1))
         if isinstance(node, c_ast.ArrayDecl):
+            if field and node.dim is not None:
+                return Arr(conv(node.type, depth + 1, field=True), _eval_c_int(node.dim, out))
             return Ptr(conv(node.type, depth + 1))
         if isinstance(node, c_ast.FuncDecl):
             args = []
@@ -302,6 +315,20 @@ def parse_c_header(header: Path, include_dirs: list[Path], fake_libc: Path, cc: 
             t = ext.type.type if isinstance(ext.type, c_ast.TypeDecl) else None
             if isinstance(t, c_ast.Enum) and t.values:
                 _collect_enum(t, out)
+
+    # Struct bodies this header defines (not ones it includes).
+    for ext in ast.ext:
+        if not isinstance(ext, (c_ast.Typedef, c_ast.Decl)):
+            continue
+        t = ext.type.type if isinstance(ext.type, c_ast.TypeDecl) else ext.type
+        if not isinstance(t, c_ast.Struct) or not t.decls:
+            continue
+        coord = ext.coord
+        if coord and coord.file and Path(coord.file).name != header_name:
+            continue
+        name = ext.name if isinstance(ext, c_ast.Typedef) else f"struct {t.name}"
+        fields = [(d.name, conv(d.type, field=True)) for d in t.decls]
+        out.structs.setdefault(name, (coord.line if coord else 0, fields))
 
     raw = header.read_text(encoding="utf-8")
     for m in _DEFINE_INT.finditer(raw):
@@ -474,10 +501,11 @@ def eval_cfg(expr: str, features: set[str], target_os: str) -> bool:
 
 def _split_top(s: str) -> list[str]:
     out, depth, cur = [], 0, ""
-    for ch in s:
+    for k, ch in enumerate(s):
         if ch in "(<[":
             depth += 1
-        elif ch in ")>]":
+        elif ch in ")]" or (ch == ">" and (k == 0 or s[k - 1] != "-")):
+            # the `>` of a `->` return arrow closes nothing
             depth -= 1
         if ch == "," and depth == 0:
             out.append(cur)
@@ -547,7 +575,8 @@ def discover_crate(name: str, root: Path) -> Crate:
         masked = mask_rust(src)
         for m in _TYPE_ALIAS.finditer(masked):
             end = masked.index(";", m.end())
-            crate.aliases.setdefault(m.group("name"), src[m.end():end].strip())
+            # masked: a comment inside the aliased type is not part of it
+            crate.aliases.setdefault(m.group("name"), masked[m.end():end].strip())
         for m in _ENUM_ITEM.finditer(masked):
             rep = _REPR.search(src[m.start("attrs"):m.end("attrs")])
             if rep:
@@ -685,6 +714,13 @@ class RustTypeParser:
             self._eat()
             self._eat(")")
             return VOID
+        if t == "[":
+            self._eat()
+            of = self._type()
+            self._eat(";")
+            n = int(self._eat(), 0)
+            self._eat("]")
+            return Arr(of, n)
         if t == "!":
             self._eat()
             return VOID
@@ -858,3 +894,32 @@ def comment_mentions(header: Path) -> dict[str, int]:
                 continue  # `NET_ERR_BLOB_*` / `NET_ERR_TOKEN_x`-style families
             out.setdefault(t.group(0), raw.count("\n", 0, c.start() + t.start()) + 1)
     return out
+
+
+# ---------------------------------------------------------- Rust structs ----
+
+_STRUCT_BODY = re.compile(_ATTRS + _VIS + r"struct\s+(?P<name>\w+)\s*\{")
+
+
+def rust_struct_fields(crate: "Crate", name: str) -> tuple[Path, int, list[tuple[str, str]]] | None:
+    """(file, line, [(field name, type text)]) of `struct name { ... }` in
+    the crate, fields in declaration order; None if it is not there."""
+    for path in crate.files:
+        src = path.read_text(encoding="utf-8")
+        masked = mask_rust(src)
+        for m in _STRUCT_BODY.finditer(masked):
+            if m.group("name") != name:
+                continue
+            open_at = m.end() - 1
+            close = match_close(masked, open_at, "{", "}")
+            body = re.sub(r"#\[[^\]]*\]", " ", masked[open_at + 1:close])
+            fields = []
+            for part in _split_top(body):
+                part = part.strip()
+                if not part:
+                    continue
+                part = re.sub(r"^pub(?:\s*\([^)]*\))?\s+", "", part)
+                fname, ftype = part.split(":", 1)
+                fields.append((fname.strip(), ftype.strip()))
+            return path, src.count("\n", 0, m.start("name")) + 1, fields
+    return None

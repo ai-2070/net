@@ -555,3 +555,61 @@ func TestABIStabilityHeadersDeclareReturnedCodes(t *testing.T) {
 		}
 	}
 }
+
+// TestABIStabilityObserverPreambleMatchesNetRpcHeader pins the nRPC call
+// observer Go declares in its own cgo preamble (go/mesh_rpc_typed.go) to the
+// declaration net_rpc.h now publishes for C consumers: the RpcCallEventC
+// fields in order, and the status / direction discriminants. Go does not
+// include net_rpc.h, so the two copies can drift; rustc's layout of the
+// struct is pinned separately by tests/c_abi/layout.json (C1 check 4).
+func TestABIStabilityObserverPreambleMatchesNetRpcHeader(t *testing.T) {
+	requireCrateTree(t)
+	header, err := os.ReadFile("../net/crates/net/include/net_rpc.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preamble, err := os.ReadFile("mesh_rpc_typed.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	structRe := regexp.MustCompile(`typedef\s+struct\s+RpcCallEventC\s*\{([^}]*)\}\s*RpcCallEventC\s*;`)
+	// The header's field lines carry comments; the preamble lives inside a Go
+	// block comment (that is what a cgo preamble is), so only the header is
+	// stripped.
+	fields := func(src []byte, what string, strip bool) []string {
+		body := string(src)
+		if strip {
+			body = blockCommentRe.ReplaceAllString(body, "")
+			body = lineCommentRe.ReplaceAllString(body, "")
+		}
+		m := structRe.FindStringSubmatch(body)
+		if m == nil {
+			t.Fatalf("%s declares no RpcCallEventC", what)
+		}
+		// Every field, pointers included: structFieldRe skips pointer
+		// fields, and this struct has two.
+		var out []string
+		for _, f := range strings.Split(m[1], ";") {
+			if f = whitespaceRe.ReplaceAllString(strings.TrimSpace(f), " "); f != "" {
+				out = append(out, strings.ReplaceAll(f, " *", "*"))
+			}
+		}
+		return out
+	}
+	h, g := fields(header, "net_rpc.h", true), fields(preamble, "go/mesh_rpc_typed.go", false)
+	if len(h) != 12 || strings.Join(h, ";") != strings.Join(g, ";") {
+		t.Errorf("RpcCallEventC fields differ:\n  net_rpc.h:             %v\n  go/mesh_rpc_typed.go:  %v", h, g)
+	}
+	consts := parseHeader(t, "../net/crates/net/include/net_rpc.h").consts
+	enumRe := regexp.MustCompile(`(NET_RPC_(?:STATUS|DIRECTION)_\w+)_C\s*=\s*(\d+)`)
+	seen := 0
+	for _, m := range enumRe.FindAllStringSubmatch(string(preamble), -1) {
+		seen++
+		if got, ok := consts[m[1]]; !ok || got != m[2] {
+			t.Errorf("Go's %s_C = %s, net_rpc.h's %s = %q (declared: %v)", m[1], m[2], m[1], got, ok)
+		}
+	}
+	if seen != 6 {
+		t.Errorf("found %d NET_RPC_STATUS/DIRECTION discriminants in the Go preamble, want 6", seen)
+	}
+}

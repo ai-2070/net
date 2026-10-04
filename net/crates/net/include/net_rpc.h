@@ -617,6 +617,52 @@ int net_rpc_metrics_snapshot(
 uint64_t net_rpc_observer_dropped_total(void);
 
 /* =========================================================================
+ * Call observer
+ * ========================================================================= */
+
+/* Discriminants for RpcCallEventC.status_kind. */
+#define NET_RPC_STATUS_OK           0  /* status_message_ptr is NULL        */
+#define NET_RPC_STATUS_ERROR        1  /* status_message_ptr/len: diagnostic */
+#define NET_RPC_STATUS_TIMEOUT      2  /* status_message_ptr is NULL        */
+#define NET_RPC_STATUS_CANCELED     3  /* status_message_ptr is NULL        */
+
+/* Discriminants for RpcCallEventC.direction. v1 emits only OUTBOUND. */
+#define NET_RPC_DIRECTION_OUTBOUND  0  /* this node made the call           */
+#define NET_RPC_DIRECTION_INBOUND   1  /* reserved                          */
+
+/* One completed call, as the observer sees it. Every pointer is borrowed
+ * for the duration of the dispatcher call: copy out what you keep before
+ * returning. Strings are UTF-8 and not NUL-terminated. */
+typedef struct RpcCallEventC {
+    uint64_t caller;                    /* node id of the calling node     */
+    uint64_t callee;                    /* node id of the responding node  */
+    const uint8_t* method_ptr;          /* method / service name           */
+    size_t method_len;
+    uint32_t latency_ms;                /* elapsed time                    */
+    uint8_t status_kind;                /* one of NET_RPC_STATUS_*         */
+    const uint8_t* status_message_ptr;  /* non-NULL only for STATUS_ERROR  */
+    size_t status_message_len;
+    uint32_t request_bytes;             /* request body size; 0 if unknown */
+    uint32_t response_bytes;            /* response body size; 0 if unknown */
+    uint8_t direction;                  /* one of NET_RPC_DIRECTION_*      */
+    uint64_t ts_unix_ms;                /* fire time, best effort          */
+} RpcCallEventC;
+
+/* Fired synchronously on the dispatch path for every completed outbound
+ * call, so it must be cheap: queue the event and return. */
+typedef void (*RpcObserverFn)(const RpcCallEventC* evt);
+
+/* Register the process-wide observer dispatcher. First call wins; later
+ * calls are ignored. */
+void net_rpc_set_observer_dispatcher(RpcObserverFn observer);
+
+/* Enable (`enabled != 0`) or clear (`enabled == 0`) the observer on one
+ * MeshRpc. Returns NET_RPC_OK; NET_RPC_ERR_NULL for a NULL handle;
+ * NET_RPC_ERR_NO_DISPATCHER when enabling before
+ * net_rpc_set_observer_dispatcher has been called. */
+int net_rpc_observer_install(const MeshRpcHandle* handle, int enabled);
+
+/* =========================================================================
  * Serve (handler registration)
  * ========================================================================= */
 
