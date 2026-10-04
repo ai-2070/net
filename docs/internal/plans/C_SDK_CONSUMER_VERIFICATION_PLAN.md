@@ -2,8 +2,9 @@
 
 ## Status
 
-Planned, 2026-10-04. Targets the release after 0.39. Branch
-`LZL0/c-consumer-plan`. Follows
+In progress, 2026-10-04: C0 through C6 have landed (each slice's status
+block below says how); C3b waits on #1167 and C7 is optional. Targets the
+release after 0.39. Branch `LZL0/c-consumer-plan`. Follows
 [`GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md`](GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md)
 (merged as #1165). That plan reached the new C surfaces (trees, ranges,
 repair, the blob registry, Go-implemented adapters) only through cgo, from
@@ -40,7 +41,7 @@ Checked on `master` at `4656690`:
 2. **CI never builds that default library.** Every CI build of `libnet`
    passes `--features net-ffi/test-helpers` (`ci.yml:4749`) and puts it in
    the ordinary `target/release`. The export baseline
-   (`bindings/go/net-ffi/exports.baseline`) is generated from that build,
+   (`net/crates/net/bindings/go/net-ffi/exports.baseline`) is generated from that build,
    so it includes test-only seams such as
    `net_mesh_blob_adapter_test_drop_data_chunk` and
    `net_blob_test_barrier_*`. Nothing checks the export set of the library
@@ -357,7 +358,7 @@ stages the bundle.
   and one Net implementation library (plus its import library on
   Windows).
 - `EXPORTS` is extracted from the staged library, then pinned as
-  `bindings/go/net-ffi/exports.shipped.baseline`, so a change to the
+  `net/crates/net/bindings/go/net-ffi/exports.shipped.baseline`, so a change to the
   shipped surface shows in review. Its header records the default-feature
   recipe; the update tool's provenance text, which today describes the
   helper build, is changed to match whichever baseline it writes.

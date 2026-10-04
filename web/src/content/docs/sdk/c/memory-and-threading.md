@@ -30,10 +30,10 @@ header names for them:
 | You got it from | You free it with |
 |---|---|
 | A blob adapter or the blob registry (`net_mesh_blob_adapter_*`, `net_blob_*`): refs, fetched bytes | `net_blob_free_buffer(ptr, len)` |
-| Transfer (`net_transport.h`): `net_fetch_blob`, directory manifests | `net_transport_free_buffer(ptr, len)` |
+| Transfer (`net_transport.h`): `net_fetch_blob` / `_discovered` bytes, `net_store_dir`'s manifest ref | `net_transport_free_buffer(ptr, len)` |
 | An nRPC response | `net_rpc_response_free(ptr, len)` |
 | An nRPC error string | `net_rpc_free_cstring(s)` |
-| A JSON result | `net_free_string(s)` |
+| A JSON result (`net_dir_manifest_read`, `net_blob_ref_describe`, ...) | `net_free_string(s)` |
 
 Never `free()` one of them. The library allocated it with its own allocator,
 and whether your C runtime's `free` happens to accept the pointer depends on

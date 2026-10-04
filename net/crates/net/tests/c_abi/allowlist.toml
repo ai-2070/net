@@ -9,7 +9,8 @@
 
 [exported]
 
-# The bundle-composition marker of the umbrella crate (net-ffi/src/lib.rs:41).
+# The bundle-composition marker of the umbrella crate (fn net_ffi_abi_version
+# in bindings/go/net-ffi/src/lib.rs).
 # It records which surfaces are linked together, not a signature generation,
 # so declaring it would invite consumers to treat it as an ABI version. Which
 # library a program loaded is answered by the loaded-library identity check
@@ -24,8 +25,9 @@ net_blob_register_callback_adapter = "superseded by the declared _owned form; ex
 
 [mentioned]
 
-# net_transport.h:88 reserves -212 for a planned code by name; the name is
-# deliberately not declared until the code exists.
+# net_transport.h's reserved-codes comment (after the NET_ERR_DIR_* block)
+# reserves -212 for a planned code by name; the name is deliberately not
+# declared until the code exists.
 NET_ERR_DIR_SYMLINK_UNSUPPORTED = "reserved name for a planned code (-212 kept unassigned)"
 
 [collision]

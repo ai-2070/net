@@ -86,8 +86,9 @@ double-freeing.
 | `net_poll_ex()` | `net_free_poll_result()` |
 | `net_generate_keypair()` and similar string returns | `net_free_string()` |
 | A blob adapter or the blob registry: refs, fetched bytes | `net_blob_free_buffer(ptr, len)` |
-| Transfer (`net_transport.h`): `net_fetch_blob`, manifests | `net_transport_free_buffer(ptr, len)` |
-| An nRPC response / error string | `net_rpc_response_free(ptr, len)` / `net_rpc_free_cstring()` |
+| Transfer (`net_transport.h`): `net_fetch_blob` / `_discovered` bytes, `net_store_dir`'s manifest ref | `net_transport_free_buffer(ptr, len)` |
+| An nRPC response / error string | `net_rpc_response_free(ptr, len)` / `net_rpc_free_cstring(s)` |
+| A JSON result (`net_dir_manifest_read`, `net_blob_ref_describe`, ...) | `net_free_string(s)` |
 
 `net_version()` returns a **static** string — do not free it.
 `net_free_poll_result` is idempotent and `NULL`-safe.

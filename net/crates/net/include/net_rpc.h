@@ -575,7 +575,8 @@ int net_rpc_watch_tools(
 
 /* Block until the next change and write it as JSON to
  * (*out_json_ptr, *out_json_len): {"type": "added" | "removed" |
- * "node_count_changed", "descriptor": {...}, "prev_node_count": N}.
+ * "node_count_changed", "descriptor": {...}}, with "prev_node_count": N
+ * present only on "node_count_changed".
  * Caller frees via net_rpc_response_free(ptr, len). Returns NET_RPC_OK;
  * NET_RPC_ERR_STREAM_DONE once the watch is closed; NET_RPC_ERR_CALL_FAILED
  * with *out_err set on error. */
@@ -604,7 +605,9 @@ void net_rpc_watch_tools_free(ToolWatchHandleC* watch);
  * "latency_buckets", "handler_invocations_total", "handler_panics_total",
  * "handler_in_flight", "handler_duration_sum_ns", "handler_duration_count",
  * "handler_duration_buckets", "streaming_chunks_emitted_total",
- * "streaming_chunks_dropped_total", "capability_denied_total"}]}. Caller
+ * "streaming_chunks_dropped_total", "capability_denied_total"}],
+ * "observer_dropped_total": N} (the process-wide count of observer events
+ * dropped on a full queue; see RpcObserverFn). Caller
  * frees via net_rpc_response_free(ptr, len). Returns NET_RPC_OK;
  * NET_RPC_ERR_NULL for a NULL argument; NET_RPC_ERR_CALL_FAILED with
  * *out_err set if serialising fails. */
@@ -650,8 +653,13 @@ typedef struct RpcCallEventC {
     uint64_t ts_unix_ms;                /* fire time, best effort          */
 } RpcCallEventC;
 
-/* Fired synchronously on the dispatch path for every completed outbound
- * call, so it must be cheap: queue the event and return. */
+/* Called asynchronously, from a worker: each completed outbound call is
+ * queued on a bounded channel on the dispatch path, and the worker hands
+ * the queued events to this function in order. When the queue is full an
+ * event is dropped, not waited for, and counted in
+ * net_rpc_observer_dropped_total (and `observer_dropped_total` in the
+ * metrics snapshot), so do not rely on receiving every call. Keep it cheap
+ * all the same: a slow observer is what fills the queue. */
 typedef void (*RpcObserverFn)(const RpcCallEventC* evt);
 
 /* Register the process-wide observer dispatcher. First call wins; later

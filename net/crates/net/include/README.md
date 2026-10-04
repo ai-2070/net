@@ -117,8 +117,9 @@ int main(void) {
 | `net_poll_ex()` | `net_free_poll_result()` |
 | `net_generate_keypair()` and similar | `net_free_string()` |
 | A blob adapter or the blob registry: refs, fetched bytes | `net_blob_free_buffer(ptr, len)` |
-| Transfer (`net_transport.h`): `net_fetch_blob`, manifests | `net_transport_free_buffer(ptr, len)` |
-| An nRPC response / error string | `net_rpc_response_free(ptr, len)` / `net_rpc_free_cstring()` |
+| Transfer (`net_transport.h`): `net_fetch_blob` / `_discovered` bytes, `net_store_dir`'s manifest ref | `net_transport_free_buffer(ptr, len)` |
+| An nRPC response / error string | `net_rpc_response_free(ptr, len)` / `net_rpc_free_cstring(s)` |
+| A JSON result (`net_dir_manifest_read`, `net_blob_ref_describe`, ...) | `net_free_string(s)` |
 
 Never `free()` a buffer the library returned. A buffer **your** callback
 returns (an nRPC or organization handler's response, a blob vtable's
@@ -136,8 +137,9 @@ length validation, alignment checks, idempotent free) are in
 ## Examples
 
 Every C program below is built and run by CI against the staged C SDK
-bundle: headers included by name, `-lnet` and nothing else, and a check at
-start-up that the library it loaded is the staged one.
+bundle: headers included by name, linked against `libnet` and no other Net
+library (plus the platform's own, `-lpthread -ldl -lm` on Linux), and a
+check at start-up that the library it loaded is the staged one.
 
 **Consumer programs**, in `net/crates/net/examples/c/`. Each runs on Linux
 (GCC, then again under ASan, UBSan and LeakSanitizer) and on Windows (MSVC
@@ -160,10 +162,10 @@ the skill-examples job: `hello.c` (the event-bus loop above), `observe.c`,
 `registry.c`, `jobqueue.c`, `objectstore.c`, `liveconfig.c`, `eventlog.c`,
 `tokenchannel.c`, `failover.c` and `net_org_streaming.c`.
 
-Not every header has a C program yet. `net/crates/net/tests/c_abi/SURFACE.md`
-lists, for each declared function, the programs that call it. MeshDB,
-MeshOS, Deck, MCP and subnet functions are declared, exported and checked
-against their Rust definitions, but no C program calls them yet.
+Every header now has a C program that calls it.
+`net/crates/net/tests/c_abi/SURFACE.md` lists, for each declared function,
+the programs that call it; a function with none is declared, exported and
+checked against its Rust definition, but not yet exercised from C.
 
 ## Claude Code Skill
 

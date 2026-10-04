@@ -63,10 +63,11 @@ on:
 
 # One run per workflow per branch (per PR for pull_request events): a newer
 # push cancels this workflow's older run on the same ref, and nothing else.
-# master is exempt, so every commit that lands there gets a complete result;
-# its runs queue instead (GitHub keeps only the newest pending run per group).
+# On master every commit gets a group of its own (its SHA), so no run there
+# is cancelled or replaced: a shared group would still let GitHub discard a
+# queued master run when a newer one arrives, even without cancel-in-progress.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
