@@ -10,8 +10,6 @@ Rust live suite.
 
 from __future__ import annotations
 
-import itertools
-
 import pytest
 
 net = pytest.importorskip("net", reason="net wheel not built")
@@ -23,11 +21,15 @@ from net.subnet import admin, classify_subnet_error, parse_subnet_kind  # noqa: 
 
 PSK = "42" * 32
 AUTHORITY = "d7" * 32
-_ports = itertools.count(36_100)
 
 
 def _addr() -> str:
-    return f"127.0.0.1:{next(_ports)}"
+    # Port 0: the kernel picks a free one. A fixed counter from 36_100
+    # sat inside Linux's ephemeral range and hit EADDRINUSE in CI on a
+    # port another process held (conftest.py's `next_port` records the
+    # same incident). Nothing here dials these meshes, so no caller
+    # needs the number.
+    return "127.0.0.1:0"
 
 
 def _mesh(**subnet_kwargs):
