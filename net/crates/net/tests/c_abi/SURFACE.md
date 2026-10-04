@@ -16,7 +16,7 @@ both.
 | `net_deck.h` | 84 | 62 | 62 |
 | `net_mcp.h` | 22 | 20 | 20 |
 | `net_meshdb.h` | 27 | 24 | 24 |
-| `net_meshos.h` | 23 | 0 | 0 |
+| `net_meshos.h` | 23 | 21 | 21 |
 | `net_org.h` | 30 | 0 | 15 |
 | `net_rpc.h` | 70 | 10 | 17 |
 | `net_subnet.h` | 4 | 0 | 0 |
@@ -540,29 +540,29 @@ both.
 
 | Function | Consumers | Arming | Skill examples |
 | --- | --- | --- | --- |
-| `net_meshos_clear_last_error` | – | – | – |
-| `net_meshos_free_string` | – | – | – |
-| `net_meshos_graceful_shutdown` | – | – | – |
-| `net_meshos_handle_daemon_id` | – | – | – |
-| `net_meshos_handle_daemon_name` | – | – | – |
-| `net_meshos_handle_free` | – | – | – |
-| `net_meshos_last_error_kind` | – | – | – |
+| `net_meshos_clear_last_error` | meshos | – | – |
+| `net_meshos_free_string` | meshos | – | – |
+| `net_meshos_graceful_shutdown` | meshos | – | – |
+| `net_meshos_handle_daemon_id` | meshos | – | – |
+| `net_meshos_handle_daemon_name` | meshos | – | – |
+| `net_meshos_handle_free` | meshos | – | – |
+| `net_meshos_last_error_kind` | meshos | – | – |
 | `net_meshos_last_error_message` | – | – | – |
-| `net_meshos_metadata` | – | – | – |
-| `net_meshos_next_control` | – | – | – |
-| `net_meshos_process_emit` | – | – | – |
-| `net_meshos_publish_capabilities` | – | – | – |
-| `net_meshos_publish_log` | – | – | – |
-| `net_meshos_refresh_metadata` | – | – | – |
-| `net_meshos_register_daemon` | – | – | – |
-| `net_meshos_register_daemon_with_vtable` | – | – | – |
-| `net_meshos_register_daemon_with_vtable_v2` | – | – | – |
-| `net_meshos_sdk_dropped_control_events` | – | – | – |
-| `net_meshos_sdk_free` | – | – | – |
-| `net_meshos_sdk_shutdown` | – | – | – |
-| `net_meshos_sdk_start` | – | – | – |
+| `net_meshos_metadata` | meshos | – | – |
+| `net_meshos_next_control` | meshos | – | – |
+| `net_meshos_process_emit` | meshos | – | – |
+| `net_meshos_publish_capabilities` | meshos | – | – |
+| `net_meshos_publish_log` | meshos | – | – |
+| `net_meshos_refresh_metadata` | meshos | – | – |
+| `net_meshos_register_daemon` | meshos | – | – |
+| `net_meshos_register_daemon_with_vtable` | meshos | – | – |
+| `net_meshos_register_daemon_with_vtable_v2` | meshos | – | – |
+| `net_meshos_sdk_dropped_control_events` | meshos | – | – |
+| `net_meshos_sdk_free` | meshos | – | – |
+| `net_meshos_sdk_shutdown` | meshos | – | – |
+| `net_meshos_sdk_start` | meshos | – | – |
 | `net_meshos_snapshot_emit` | – | – | – |
-| `net_meshos_try_next_control` | – | – | – |
+| `net_meshos_try_next_control` | meshos | – | – |
 
 ## `net_org.h`
 
