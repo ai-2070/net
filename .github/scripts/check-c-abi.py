@@ -453,7 +453,11 @@ def run_layout_checks(model: Model, cmp: "Comparer", compile_assertions: bool = 
     to equal it. This function makes sure the fixture covers exactly the
     published structs and that each entry pairs the right fields."""
     if model.layout is None:
-        return []
+        # A deleted fixture must not retire the check: no fixture is a
+        # finding whenever a header publishes a struct with a body.
+        return [Finding("layout", "layout.json",
+            f"{_rel(LAYOUT)} is missing, but the headers publish {len(model.c_structs)} struct(s) "
+            "with a body; regenerate it (NET_ABI_LAYOUT_WRITE=1, see abi_layout.rs)")] if model.c_structs else []
     findings: list[Finding] = []
     entries: dict = model.layout.get("structs", {})
     for name in sorted(set(model.c_structs) - set(entries)):
@@ -599,7 +603,14 @@ def load_release_baseline(ref: str) -> Baseline:
                                   capture_output=True, text=True, check=True, encoding="utf-8").stdout
             (inc / Path(path).name).write_text(text, encoding="utf-8")
     fake = M.write_fake_libc(td / "fake_libc")
-    return Baseline(ref, {h.name: M.parse_c_header(h, [inc], fake, M.default_cc()) for h in sorted(inc.glob("*.h"))})
+    headers = {h.name: M.parse_c_header(h, [inc], fake, M.default_cc()) for h in sorted(inc.glob("*.h"))}
+    # `git ls-tree` exits 0 on a path the ref does not have: a moved include
+    # directory, or a release with another layout, would otherwise compare
+    # against nothing and pass.
+    if not headers or not any(h.functions for h in headers.values()):
+        raise SystemExit(f"FAIL  {ref} has no C headers with declarations under net/crates/net/include/; "
+                         "the compatibility baseline would be empty")
+    return Baseline(ref, headers)
 
 
 def load_fixture_baselines(current_include: Path, fixtures: Path = FIXTURES) -> list[Baseline]:
@@ -985,7 +996,8 @@ def _self_test_model(tmp: Path, header: str, rust: str, exports: set[str], profi
     model.crates = {"demo": crate}
     model.lib_names = {"demo": "demo"}
     model.c_structs = {name: ("net_demo.h", line, fields) for name, (line, fields) in h.structs.items()}
-    model.layout = _ST_LAYOUT if layout is None else layout
+    # "missing" stands for a deleted layout.json.
+    model.layout = _ST_LAYOUT if layout is None else (None if layout == "missing" else layout)
     return model
 
 
@@ -1024,6 +1036,7 @@ def self_test() -> int:
         ("two codes share a value in one domain", H + "#define NET_DEMO_ERR_TWIN -1\n", R, E,
          ("collision", "NET_DEMO_ERR_CLOSED and NET_DEMO_ERR_TWIN are both -1")),
         ("a published struct with no layout entry", H, R, E, ("layout", "has no entry"), {"structs": {}}),
+        ("a deleted layout fixture", H, R, E, ("layout", "is missing"), "missing"),
         ("a layout entry with a wrong offset fails the compiled assertions", H, R, E,
          ("compiled", "offsetof(demo_pair_t, len) is not 4"),
          {"structs": {"demo_pair_t": {**_ST_LAYOUT["structs"]["demo_pair_t"],
