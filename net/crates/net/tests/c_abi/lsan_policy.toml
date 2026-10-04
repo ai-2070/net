@@ -25,8 +25,9 @@ max_block_bytes = 64
 # NOT intended: an open defect, recorded so the lane can run while it is
 # fixed, and printed on every run so it stays visible.
 #
-# After net_mesh_shutdown + net_mesh_free, the MeshNode (about 120 KB per node:
-# the allocations of MeshNode::new, task buffers, maps) is still allocated in
+# After net_mesh_shutdown + net_mesh_free, the MeshNode (0.2 to 0.6 MB per
+# program, varying run to run: the allocations of MeshNode::new, task
+# buffers, maps) is still allocated in
 # lifecycle.c and rpc_callbacks.c, and LSan finds it reachable only through
 # the freed handle's tombstone, through the stale bits of the Arc that
 # net_mesh_free moved out of it. So no live reference remains and the memory

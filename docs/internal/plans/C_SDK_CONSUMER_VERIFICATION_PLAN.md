@@ -981,8 +981,17 @@ lane needs an elevated process, so it is proved in CI, not on the dev box.
   - **Replayed against the first run's real reports:**
     - `transfer` and `tree_range`: only tombstones (16 to 24 bytes per
       handle);
-    - `lifecycle`: tombstones plus the defect, 508 KB in 482 blocks;
-    - `rpc_callbacks`: tombstones plus the defect, 236 KB in 259 blocks.
+    - `lifecycle`: tombstones plus the defect, 508 KB in 482 blocks
+      (second run: 552 KB in 517);
+    - `rpc_callbacks`: tombstones plus the defect, 236 KB in 259 blocks
+      (second run: 557 KB in 367). The defect's size varies between runs,
+      so the policy bounds the programs it may appear in, not its bytes.
+  - **Correction, found by the second run:** a leak-only report was never
+    judged at all. LSan's summary line reads `SUMMARY: AddressSanitizer:
+    N byte(s) leaked`, and the gate excluded any output naming
+    AddressSanitizer. It now recognises an ASan error by its `ERROR:` line
+    (`leak_only`, with a self-test). The first replay had exercised the
+    classifier and not this gate.
   - **Self-tests:** the parser and the policy, including "a leaked
     library-returned buffer is never an accepted class".
 - **Windows debug CRT lane (`--debug-crt`, MSVC `/MDd`).**
@@ -1202,8 +1211,8 @@ Found by C5:
 
 - **D-C5-1 (open): a `MeshNode` is not reclaimed after `net_mesh_shutdown`
   and `net_mesh_free`.** In `lifecycle.c` and `rpc_callbacks.c`, the node's
-  memory (allocations of `MeshNode::new`, task buffers, maps: about 120 KB
-  to 250 KB per node) is still allocated at exit.
+  memory (allocations of `MeshNode::new`, task buffers, maps: 0.2 MB to
+  0.6 MB per program, varying run to run) is still allocated at exit.
   - LSan reaches it only through the freed handle's tombstone, via the
     stale bits of the `Arc` that `net_mesh_free` moved out. So no live
     reference remains and the memory was never released: a leaked `Arc` or

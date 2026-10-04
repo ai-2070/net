@@ -196,6 +196,14 @@ def parse_leaks(out: str) -> list[Leak]:
     return leaks
 
 
+def leak_only(out: str) -> bool:
+    """True when the run's only sanitizer report is LeakSanitizer's. Its
+    summary line says `SUMMARY: AddressSanitizer: N byte(s) leaked`, so an
+    ASan error is recognised by its ERROR line, not by the tool's name."""
+    return ("ERROR: LeakSanitizer" in out and "ERROR: AddressSanitizer" not in out
+            and "runtime error:" not in out)
+
+
 def load_lsan_policy(path: Path = LSAN_POLICY) -> dict:
     import tomllib
     return tomllib.loads(path.read_text(encoding="utf-8"))
@@ -555,7 +563,7 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
         refuse_strays(bundle, env, exe.parent)
         rc, out = execute(args, exe, env)
         v = classify(out, rc, bundle.library, bundle.sha256)
-        if args.sanitize and v.kind == "sanitizer" and "LeakSanitizer" in v.reason                 and "AddressSanitizer" not in out and "runtime error:" not in out:
+        if args.sanitize and v.kind == "sanitizer" and leak_only(out):
             lines, bad = judge_leaks(name, parse_leaks(out), load_lsan_policy())
             if bad:
                 v.reason = "unaccepted leaks: " + "; ".join(bad[:6]) + (" …" if len(bad) > 6 else "")
@@ -762,6 +770,13 @@ def self_test() -> int:
             "    #1 0x7f in net_fetch_blob (libnet.so+0x4)\n\n"
         )
         leaks = parse_leaks(report)
+        summary = "\nSUMMARY: AddressSanitizer: 4117 byte(s) leaked in 3 allocation(s).\n"
+        ok = (leak_only(report + summary)
+              and not leak_only("==1==ERROR: AddressSanitizer: attempting double-free\n" + report + summary)
+              and not leak_only("x.c:3:5: runtime error: signed integer overflow\n" + report))
+        print(f"{'✓' if ok else '✗'} self-test: a leak-only report (with its AddressSanitizer summary) "
+              "goes to the policy; an ASan or UBSan error does not")
+        failures += 0 if ok else 1
         ok = [(lk.kind, lk.bytes, lk.origin) for lk in leaks] == [
             ("Direct", 24, "net_mesh_new"), ("Indirect", 4096, "_RNCNvMs10_xMeshNode3new0Be_"),
             ("Direct", 4093, "net_fetch_blob")]
