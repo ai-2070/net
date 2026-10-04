@@ -1,0 +1,19 @@
+net/crates/net/bindings/python/tests/test_subnet_binding.py
+  s_598a2462cc770b::t_bf6ad648b829e4 27-32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "27d92e10017959edbd07c66972799687ec386d85",
+  "prompts": {},
+  "sessions": {
+    "s_598a2462cc770b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83d8136c-f4b9-496a-a434-7d2d5fb91615",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
