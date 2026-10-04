@@ -159,6 +159,58 @@ void cu_sleep_ms(unsigned ms) {
 #endif
 }
 
+struct cu_mutex {
+#ifdef _WIN32
+    CRITICAL_SECTION cs;
+#else
+    pthread_mutex_t mu;
+#endif
+};
+
+cu_mutex* cu_mutex_new(void) {
+    cu_mutex* m = (cu_mutex*)calloc(1, sizeof *m);
+    if (m == NULL) {
+        return NULL;
+    }
+#ifdef _WIN32
+    InitializeCriticalSection(&m->cs);
+#else
+    if (pthread_mutex_init(&m->mu, NULL) != 0) {
+        free(m);
+        return NULL;
+    }
+#endif
+    return m;
+}
+
+void cu_mutex_lock(cu_mutex* m) {
+#ifdef _WIN32
+    EnterCriticalSection(&m->cs);
+#else
+    pthread_mutex_lock(&m->mu);
+#endif
+}
+
+void cu_mutex_unlock(cu_mutex* m) {
+#ifdef _WIN32
+    LeaveCriticalSection(&m->cs);
+#else
+    pthread_mutex_unlock(&m->mu);
+#endif
+}
+
+void cu_mutex_free(cu_mutex* m) {
+    if (m == NULL) {
+        return;
+    }
+#ifdef _WIN32
+    DeleteCriticalSection(&m->cs);
+#else
+    pthread_mutex_destroy(&m->mu);
+#endif
+    free(m);
+}
+
 unsigned long cu_pid(void) {
 #ifdef _WIN32
     return (unsigned long)GetCurrentProcessId();

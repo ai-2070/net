@@ -7,3 +7,6 @@ lifecycle 26
 transfer 55
 tree_range 61
 repair 34
+blob_callbacks 31
+rpc_callbacks 26
+rpc_no_free 4

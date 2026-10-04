@@ -861,6 +861,39 @@ headers must rebuild.
 **Proves it:** the release counts above. The barrier-held cases stay in
 Go; they need the test seams, and the shipped bundle has none.
 
+**Status: landed (2026-10-04); verified on Windows, Linux pending CI.**
+- **`blob_callbacks.c`, 31 checks.** A C adapter backed by an in-memory
+  map, with every buffer from this program's malloc and back through its
+  own `free_buffer`.
+  - Refused registrations never run `release_fn`, and leave the id
+    unregistered: a NULL vtable or `release_fn` (-1), a NULL entry
+    (-115), and a duplicate id (-111, checked on the second context).
+  - Publish and resolve go through the C callbacks. Five fetches hand out
+    five buffers, and all five come back.
+  - The error pairs: `NOT_FOUND` stays `NOT_FOUND`; `HASH_MISMATCH` and
+    an unlisted -999 both become `BACKEND`.
+  - `release_fn` runs exactly once, after unregister and not before; a
+    second unregister is 0. Resolving a real ref afterwards is
+    `NOT_REGISTERED`.
+- **`rpc_callbacks.c`, 26 checks.** The counting deallocator is registered
+  first (NULL is refused at -1), then the dispatcher. Two handlers are
+  served on one node and called from another: three echo responses and
+  one error string, all malloc'd. The caller sees the handler's error
+  text. All four buffers are released exactly once through the registered
+  deallocator, and nothing is released that was not handed out.
+- **`rpc_no_free.c`, 4 checks,** in its own process because registration
+  is first-call-wins. The dispatcher is refused (-1) without a
+  deallocator, and stays refused after a NULL one.
+- **Header fix:** `net_rpc.h`'s "Rust frees with `free(3)`" and its
+  "On Windows, returns -1" are rewritten to the registered-release
+  contract and the all-platform refusal; `net_org.h`'s two counterparts
+  likewise. Both libraries refuse on every platform (no `cfg(windows)`
+  in either). `check-callback-buffer-ownership.py` still passes.
+- **Floors:** blob_callbacks 31, rpc_callbacks 26, rpc_no_free 4.
+- **Verified:** all eight programs, both bundles, MSVC and MinGW, with the
+  shadowing control. `support/consumer_util` gained a portable mutex for
+  state the callbacks share with worker threads.
+
 ### C5: compatibility lanes and memory-checker lanes
 
 Two kinds of lane, kept apart. A compatibility lane shows the programs

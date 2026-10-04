@@ -263,10 +263,11 @@ void     net_rpc_cancel_call(MeshRpcHandle* handle, uint64_t token);
  * returning and the consumer's `Store` would otherwise hit an
  * empty registry slot.
  *
- * Response-buffer ownership: the consumer allocates via
- * `malloc(3)`; Rust copies the bytes into its own `Bytes` and
- * frees the consumer's buffer via `free(3)`. Same for the
- * `out_err` CString.
+ * Response-buffer ownership: the consumer allocates the response
+ * (and any `out_err` string) with its own allocator. Rust copies
+ * the bytes, then releases the consumer's buffer through the
+ * deallocator registered with net_rpc_set_callback_free (below),
+ * never with a free() of its own.
  * ========================================================================= */
 
 typedef int (*RpcHandlerFn)(
@@ -298,10 +299,11 @@ int net_rpc_set_callback_free(RpcCallbackFreeFn free_fn);
 /* Idempotent first-call-wins. The Go binding calls this once in
  * its package init; non-Go consumers do the same at startup.
  *
- * Returns 0 on success. On Windows, returns -1 if
- * net_rpc_set_callback_free has not been called — see above; without
- * it this library cannot release a handler's response buffer safely,
- * and refusing here beats corrupting a heap at the first call. */
+ * Returns 0 on success, or -1 on every platform if
+ * net_rpc_set_callback_free has not been called: without it this
+ * library has no way to release a handler's buffers (and on Windows
+ * freeing them itself would corrupt another module's CRT heap), so it
+ * refuses here rather than leak or corrupt at the first call. */
 int net_rpc_set_handler_dispatcher(RpcHandlerFn dispatcher);
 
 /* Reserve the next monotonic handler id without registering

@@ -68,6 +68,14 @@ void cu_thread_join(cu_thread* t);
 
 void cu_sleep_ms(unsigned ms);
 
+/* A mutex, for state shared with callbacks that run on Net's worker
+ * threads. NULL from cu_mutex_new on failure. */
+typedef struct cu_mutex cu_mutex;
+cu_mutex* cu_mutex_new(void);
+void cu_mutex_lock(cu_mutex* m);
+void cu_mutex_unlock(cu_mutex* m);
+void cu_mutex_free(cu_mutex* m);
+
 /* This process's id, for unique scratch names. */
 unsigned long cu_pid(void);
 
