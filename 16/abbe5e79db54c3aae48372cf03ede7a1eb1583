@@ -1,0 +1,35 @@
+.github/workflows/skills.yml
+  s_17a2ac60d914fc::t_f7a12207e0ec7b 64-65,124-125
+docs/data/capabilities/payments.yaml
+  s_17a2ac60d914fc::t_513f9ee63d90af 23-27
+.github/scripts/capability_records.py
+  s_17a2ac60d914fc::t_32f153ddb8920a 45,76-84,184-188,225-263,393-453,494,657,703-712
+.github/scripts/c_abi_model.py
+  s_17a2ac60d914fc::t_258cb7f61bac5c 930-932
+  s_17a2ac60d914fc::t_38656772af9523 926-929,933-944
+docs/data/capabilities/event-bus.yaml
+  s_17a2ac60d914fc::t_723af078afa3f5 23-27,222
+  s_17a2ac60d914fc::t_e329f663a0e078 57-59,74,76,94-95,189-191,252,254,272-273,291-292,310-312,328,330,376,378,400-401,417,419,435,437,453,455,471,473,491-493,511-513,529,531,547,549,565,567,583,585,602,604
+.claude/skills/net-event-bus/bindings/coverage.md
+  s_17a2ac60d914fc::t_242069d42f217d 81,93,97,100,102-105,108-112,158-194,340-341
+web/src/lib/generated/capability-record.json
+  s_17a2ac60d914fc::t_4098a4280d2cea 219,239,259,299,422,442,482,502,522,730,773,793,813
+.github/scripts/c-surface-record.py
+  s_17a2ac60d914fc::t_7fa8ed6bd7566c 53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "16abbe5e79db54c3aae48372cf03ede7a1eb1583",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
