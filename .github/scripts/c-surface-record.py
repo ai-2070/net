@@ -49,18 +49,8 @@ SOURCES = {
     "skills": [ROOT / ".claude" / "skills" / "net-event-bus" / "examples"],
 }
 
-_COMMENT_OR_STRING = re.compile(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.S)
-_CLM_FN = re.compile(r"\bCLM_FN\s*\(\s*\w+\s*\)")
-_CALL = re.compile(r"\b(net_\w+)\s*\(")
-
-
-def code_of(text: str) -> str:
-    """Source with comments, string literals and CLM_FN references removed."""
-    return _CLM_FN.sub(" ", _COMMENT_OR_STRING.sub(" ", text))
-
-
 def calls_in(text: str) -> set[str]:
-    return set(_CALL.findall(code_of(text)))
+    return M.c_calls(text)
 
 
 def callers() -> dict[str, dict[str, set[str]]]:

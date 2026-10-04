@@ -42,6 +42,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from docs_pages import DEFAULT_DOCS, page_slugs  # noqa: E402  (after sys.path)
+import c_abi_model as M  # noqa: E402  (the C call finder c-surface-record.py uses)
 
 # Every check in this suite prints its verdict with U+2713 / U+2717, and some
 # of the identifiers it echoes carry em-dashes. Python picks stdout's encoding
@@ -72,6 +73,15 @@ DOMAIN_SKILL = {
 
 STATUS_MARK = "<!-- coverage:status -->"
 ANCHOR_MARK = "<!-- coverage:anchors -->"
+C_EVIDENCE_MARK = "<!-- coverage:c-evidence -->"
+
+# C has no binding test suite: its evidence is the C programs CI runs. So a
+# positive C cell must name one that calls its anchor (C SDK consumer
+# verification plan, C6). A consumer program in examples/c is run by
+# run-c-consumers.py in every lane; a skill example counts when
+# docs/data/examples.yaml runs its C file.
+C_CONSUMERS = "net/crates/net/examples/c/"
+EXAMPLES_INDEX = os.environ.get("EXAMPLES_INDEX", "docs/data/examples.yaml")
 
 STATUSES = {"supported", "partial", "experimental", "not exposed", "n/a"}
 MODES = {"poll", "verify-only", "core-only"}
@@ -171,6 +181,11 @@ HEADER = """\
 #           carry one; negative cells must not. An anchor proves a symbol
 #           exists, NOT that the operation is supported — the status is
 #           editorial, the anchor is its evidence.
+# evidence  C cells only: the C programs CI runs that call the anchor (a
+#           consumer program in net/crates/net/examples/c/, or a skill example
+#           docs/data/examples.yaml runs). A `supported` C cell needs one.
+# gap       C cells only: what no C program exercises yet. A positive C cell
+#           with no evidence is `partial` and states its gap.
 #
 # NOT YET POPULATED: `reason` and `alternative` per negative cell, which D5's
 # generated absence state needs. Until Phase 3/4 renders that state, the prose
@@ -205,6 +220,45 @@ def render(record: dict) -> tuple[str, str]:
         status_lines.append(f"| {op['operation']} | " + " | ".join(scells) + " |")
         anchor_lines.append(f"| {op['operation']} | " + " | ".join(acells) + " |")
     return "\n".join(status_lines), "\n".join(anchor_lines)
+
+
+def render_c_evidence(record: dict) -> str | None:
+    """The C evidence table, or None when the record has no positive C cell."""
+    rows = []
+    for op in record["operations"]:
+        b = op["bindings"].get("C") or {}
+        if b.get("status") not in ("supported", "partial", "experimental"):
+            continue
+        ev = ", ".join(f"`{p.rsplit('/', 1)[-1]}`" for p in b.get("evidence") or []) or "—"
+        rows.append(f"| {op['operation']} | {b['status']} | {ev} | {b.get('gap') or '—'} |")
+    if not rows:
+        return None
+    return "\n".join(["| Operation | C status | Run by CI | Not yet exercised from C |",
+                      "|---|---|---|---|", *rows])
+
+
+def spliced(current: str, record: dict) -> str:
+    """`current` with every generated table replaced from `record`."""
+    status_tbl, anchor_tbl = render(record)
+    out = splice(splice(current, STATUS_MARK, status_tbl), ANCHOR_MARK, anchor_tbl)
+    c_tbl = render_c_evidence(record)
+    if c_tbl is not None and C_EVIDENCE_MARK in out:
+        out = splice(out, C_EVIDENCE_MARK, c_tbl)
+    return out
+
+
+def c_run_files(tracked: set[str]) -> dict[str, str]:
+    """Repo path -> how CI runs it, for every C file that counts as evidence."""
+    out = {p: "consumer program (run-c-consumers.py)" for p in tracked
+           if p.startswith(C_CONSUMERS) and p.endswith(".c") and "/" not in p[len(C_CONSUMERS):]}
+    with open(os.path.join(ROOT, EXAMPLES_INDEX), encoding="utf-8") as fh:
+        index = yaml.safe_load(fh)
+    for ex in index.get("examples", []):
+        name = (ex.get("files") or {}).get("c")
+        not_wired = ((ex.get("run") or {}).get("not_wired") or {})
+        if name and ex.get("level") == "run" and "c" not in not_wired:
+            out[f"{ex['dir'].rstrip('/')}/{name}"] = f"skill example {ex['id']} (run)"
+    return out
 
 
 def splice(text: str, marker: str, table: str) -> str:
@@ -336,6 +390,67 @@ def check() -> int:
             print(f"  {GREEN}✓{OFF} {resolved}/{anchored} positive-cell anchors "
                   f"resolve")
 
+        # 2b. C evidence. An anchor proves a symbol exists; for C, a positive
+        #     cell must also name a C program CI runs that CALLS it, because C
+        #     has no binding test suite and the programs are its only proof.
+        #     A cell nothing exercises is `partial` and states its gap.
+        runnable = c_run_files(tracked)
+        c_cells = c_backed = 0
+        for op in record["operations"]:
+            b = op["bindings"].get("C") or {}
+            where = f"{op['operation']} / C"
+            if b.get("status") not in ("supported", "partial", "experimental"):
+                if b.get("evidence") or b.get("gap"):
+                    print(f"  {RED}✗{OFF} {where}: {b.get('status')} carries evidence or a gap; "
+                          f"only positive cells do")
+                    fail += 1
+                continue
+            c_cells += 1
+            evidence = b.get("evidence") or []
+            if isinstance(evidence, str):
+                evidence = [evidence]
+            anchor = b.get("anchor") or ""
+            ok_files = 0
+            for path in evidence:
+                if path not in tracked:
+                    print(f"  {RED}✗{OFF} {where}: evidence {path} is not tracked in git")
+                    fail += 1
+                    continue
+                if path not in runnable:
+                    print(f"  {RED}✗{OFF} {where}: evidence {path} is not a C program CI runs "
+                          f"(a consumer program in {C_CONSUMERS}, or a skill example "
+                          f"{EXAMPLES_INDEX} runs)")
+                    fail += 1
+                    continue
+                with open(os.path.join(ROOT, path), encoding="utf-8") as fh:
+                    text = fh.read()
+                calls = M.c_calls(text)
+                uses = anchor in calls if anchor.startswith("net_") else bool(
+                    re.search(rf"\b{re.escape(anchor)}\b", M.c_code(text)))
+                if not uses:
+                    print(f"  {RED}✗{OFF} {where}: evidence {path} never "
+                          f"{'calls' if anchor.startswith('net_') else 'uses'} the anchor `{anchor}`")
+                    fail += 1
+                    continue
+                ok_files += 1
+            if b["status"] == "supported" and not evidence:
+                print(f"  {RED}✗{OFF} {where}: supported with no evidence — name the C program "
+                      f"CI runs that calls `{anchor}`, or make it partial and state the gap")
+                fail += 1
+            elif not evidence and not b.get("gap"):
+                print(f"  {RED}✗{OFF} {where}: {b['status']} with neither evidence nor a gap")
+                fail += 1
+            elif evidence and ok_files == len(evidence):
+                c_backed += 1
+        if c_cells:
+            print(f"  {GREEN}✓{OFF} {c_backed}/{c_cells} positive C cells name a C program CI "
+                  f"runs that calls their anchor; the rest state their gap")
+            md = os.path.join(ROOT, SKILLS, skill, "bindings", "coverage.md")
+            if C_EVIDENCE_MARK not in open(md, encoding="utf-8").read():
+                print(f"  {RED}✗{OFF} {skill}/bindings/coverage.md has positive C cells but no "
+                      f"{C_EVIDENCE_MARK} table")
+                fail += 1
+
         # 3. absence links resolve. D5 renders the generated absence state from
         #    `alternative.href`, which makes a docs link live inside a data file —
         #    the one place a broken link could hide from `check-doc-links.mjs`,
@@ -376,9 +491,7 @@ def check() -> int:
         # 4. the generated copy matches what is committed
         md_path = os.path.join(ROOT, SKILLS, skill, "bindings", "coverage.md")
         current = open(md_path, encoding="utf-8").read()
-        status_tbl, anchor_tbl = render(record)
-        want = splice(splice(current, STATUS_MARK, status_tbl),
-                      ANCHOR_MARK, anchor_tbl)
+        want = spliced(current, record)
         if want == current:
             print(f"  {GREEN}✓{OFF} {skill}/bindings/coverage.md matches the record")
         else:
@@ -541,9 +654,7 @@ def write() -> int:
         record = load_record(domain)
         md_path = os.path.join(ROOT, SKILLS, skill, "bindings", "coverage.md")
         current = open(md_path, encoding="utf-8").read()
-        status_tbl, anchor_tbl = render(record)
-        out = splice(splice(current, STATUS_MARK, status_tbl),
-                     ANCHOR_MARK, anchor_tbl)
+        out = spliced(current, record)
         if out != current:
             with open(md_path, "w", encoding="utf-8") as fh:
                 fh.write(out)
@@ -589,6 +700,16 @@ def self_test() -> int:
          lambda r: r["operations"][8]["bindings"]["Go"].update(
              alternative={"label": "Use something else",
                           "href": "/docs/sdk/go/no-such-page"})),
+        ("a supported C cell with no evidence", "supported with no evidence",
+         lambda r: r["operations"][0]["bindings"]["C"].pop("evidence", None)),
+        ("C evidence that never calls the anchor", "never calls the anchor",
+         lambda r: r["operations"][0]["bindings"]["C"].update(
+             evidence=[".claude/skills/net-event-bus/examples/registry.c"])),
+        ("C evidence CI does not run", "is not a C program CI runs",
+         lambda r: r["operations"][0]["bindings"]["C"].update(
+             evidence=["net/crates/net/examples/c/support/consumer_util.c"])),
+        ("a partial C cell with neither evidence nor a gap", "neither evidence nor a gap",
+         lambda r: r["operations"][0]["bindings"]["C"].update(status="partial", evidence=[])),
         ("an absence link that is not a /docs path", "must be a /docs path",
          lambda r: r["operations"][8]["bindings"]["Go"].update(
              alternative={"label": "Elsewhere", "href": "sdk/go/watch"})),

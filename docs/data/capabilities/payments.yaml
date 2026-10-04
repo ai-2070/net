@@ -20,6 +20,11 @@
 #           carry one; negative cells must not. An anchor proves a symbol
 #           exists, NOT that the operation is supported — the status is
 #           editorial, the anchor is its evidence.
+# evidence  C cells only: the C programs CI runs that call the anchor (a
+#           consumer program in net/crates/net/examples/c/, or a skill example
+#           docs/data/examples.yaml runs). A `supported` C cell needs one.
+# gap       C cells only: what no C program exercises yet. A positive C cell
+#           with no evidence is `partial` and states its gap.
 #
 # NOT YET POPULATED: `reason` and `alternative` per negative cell, which D5's
 # generated absence state needs. Until Phase 3/4 renders that state, the prose

@@ -923,3 +923,22 @@ def rust_struct_fields(crate: "Crate", name: str) -> tuple[Path, int, list[tuple
                 fields.append((fname.strip(), ftype.strip()))
             return path, src.count("\n", 0, m.start("name")) + 1, fields
     return None
+
+
+# ------------------------------------------------- calls in C program source
+
+_C_COMMENT_OR_STRING = re.compile(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.S)
+_CLM_FN = re.compile(r"\bCLM_FN\s*\(\s*\w+\s*\)")
+_C_CALL = re.compile(r"\b(net_\w+)\s*\(")
+
+
+def c_code(text: str) -> str:
+    """C program source with comments, string literals and `CLM_FN(name)`
+    references (the loaded-module check's import list) removed."""
+    return _CLM_FN.sub(" ", _C_COMMENT_OR_STRING.sub(" ", text))
+
+
+def c_calls(text: str) -> set[str]:
+    """The `net_*` functions a C program calls: a name followed by `(` in
+    its code."""
+    return set(_C_CALL.findall(c_code(text)))

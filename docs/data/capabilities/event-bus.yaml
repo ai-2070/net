@@ -20,6 +20,11 @@
 #           carry one; negative cells must not. An anchor proves a symbol
 #           exists, NOT that the operation is supported — the status is
 #           editorial, the anchor is its evidence.
+# evidence  C cells only: the C programs CI runs that call the anchor (a
+#           consumer program in net/crates/net/examples/c/, or a skill example
+#           docs/data/examples.yaml runs). A `supported` C cell needs one.
+# gap       C cells only: what no C program exercises yet. A positive C cell
+#           with no evidence is `partial` and states its gap.
 #
 # NOT YET POPULATED: `reason` and `alternative` per negative cell, which D5's
 # generated absence state needs. Until Phase 3/4 renders that state, the prose
@@ -49,6 +54,9 @@ operations:
       status: supported
       mode: poll
       anchor: net_ingest_raw
+      evidence:
+      - .claude/skills/net-event-bus/examples/hello.c
+      - .claude/skills/net-event-bus/examples/observe.c
 - operation: Consumer-side filter DSL
   bindings:
     Rust:
@@ -63,8 +71,9 @@ operations:
     Go:
       status: not exposed
     C:
-      status: supported
+      status: partial
       anchor: net_predicate_evaluate
+      gap: 'No C program CI runs calls it; its C evidence is the C1 header audit only.'
 - operation: Distributed mesh channels — register / subscribe / publish
   bindings:
     Rust:
@@ -82,6 +91,8 @@ operations:
     C:
       status: supported
       anchor: net_mesh_subscribe_channel_with_token
+      evidence:
+      - .claude/skills/net-event-bus/examples/tokenchannel.c
 - operation: Tagged EventBus topics (node.channel)
   bindings:
     Rust:
@@ -175,6 +186,9 @@ operations:
     C:
       status: supported
       anchor: net_mesh_register_channel
+      evidence:
+      - .claude/skills/net-event-bus/examples/liveconfig.c
+      - .claude/skills/net-event-bus/examples/tokenchannel.c
 - operation: Distributed batch fan-out (publish_many)
   bindings:
     Rust:
@@ -205,6 +219,7 @@ operations:
     C:
       status: partial
       anchor: NET_ERR_CHANNEL_AUTH
+      gap: 'No C program CI runs checks for this code. Partial regardless: C maps every rejection reason except unauthorized to NET_ERR_CHANNEL.'
 - operation: Permissive channel registry (opt out of strict default)
   bindings:
     Rust:
@@ -234,8 +249,9 @@ operations:
       status: supported
       anchor: OpenStream
     C:
-      status: supported
+      status: partial
       anchor: net_mesh_open_stream
+      gap: 'No C program CI runs calls it (Go reaches it through go/mesh.go).'
 - operation: Capability announce
   bindings:
     Rust:
@@ -253,6 +269,8 @@ operations:
     C:
       status: supported
       anchor: net_mesh_announce_capabilities
+      evidence:
+      - .claude/skills/net-event-bus/examples/registry.c
 - operation: Capability discovery
   bindings:
     Rust:
@@ -270,6 +288,8 @@ operations:
     C:
       status: supported
       anchor: net_mesh_find_best_node
+      evidence:
+      - .claude/skills/net-event-bus/examples/registry.c
 - operation: nRPC — typed request/response + streaming
   bindings:
     Rust:
@@ -287,6 +307,9 @@ operations:
     C:
       status: supported
       anchor: net_rpc_call
+      evidence:
+      - net/crates/net/examples/c/rpc_callbacks.c
+      - .claude/skills/net-event-bus/examples/jobqueue.c
 - operation: Gang-claim scheduler
   bindings:
     Rust:
@@ -302,8 +325,9 @@ operations:
       status: supported
       anchor: ClaimIsland
     C:
-      status: supported
+      status: partial
       anchor: net_mesh_claim_island
+      gap: 'No C program CI runs calls it (Go reaches it through go/mesh.go).'
 - operation: A2A — agent task handoff
   bindings:
     Rust:
@@ -349,8 +373,9 @@ operations:
       status: supported
       anchor: ServeOrgBytes
     C:
-      status: supported
+      status: partial
       anchor: net_org_call
+      gap: 'No C program CI runs calls it (Go reaches it through go/org.go); net_org_streaming.c covers only the streaming call.'
 # The streaming half of the org surface, recorded separately from the unary row
 # above because the anchors are disjoint: a binding can have `serve_org` and no
 # streaming verb (a frozen pre-streaming provider), which is exactly the
@@ -372,6 +397,8 @@ operations:
     C:
       status: supported
       anchor: net_org_call_streaming
+      evidence:
+      - .claude/skills/net-event-bus/examples/net_org_streaming.c
 - operation: Subnet gateway provisioning
   bindings:
     Rust:
@@ -387,8 +414,9 @@ operations:
       status: supported
       anchor: InstallSubnetGatewayCredentials
     C:
-      status: supported
+      status: partial
       anchor: net_subnet_install_gateway_credentials
+      gap: 'No C program CI runs calls it (Go reaches it through go/subnet.go).'
 - operation: Subnet-exported nRPC serve
   bindings:
     Rust:
@@ -404,8 +432,9 @@ operations:
       status: supported
       anchor: ServeSubnetExported
     C:
-      status: supported
+      status: partial
       anchor: net_subnet_serve_exported
+      gap: 'No C program CI runs calls it (Go reaches it through go/subnet.go).'
 - operation: Subnet-exported organization call
   bindings:
     Rust:
@@ -421,8 +450,9 @@ operations:
       status: supported
       anchor: CallExportedBytes
     C:
-      status: supported
+      status: partial
       anchor: net_org_call_exported
+      gap: 'No C program CI runs calls it (Go reaches it through go/org.go).'
 - operation: MCP bridge
   bindings:
     Rust:
@@ -438,8 +468,9 @@ operations:
       status: supported
       anchor: McpError
     C:
-      status: supported
+      status: partial
       anchor: net_mcp_classify
+      gap: 'No C program CI runs calls it (Go reaches it through go/mcp.go).'
 - operation: Dataforts — blobs
   bindings:
     Rust:
@@ -457,6 +488,9 @@ operations:
     C:
       status: supported
       anchor: net_fetch_blob
+      evidence:
+      - net/crates/net/examples/c/transfer.c
+      - .claude/skills/net-event-bus/examples/objectstore.c
 - operation: RedEX — durable log
   bindings:
     Rust:
@@ -474,6 +508,9 @@ operations:
     C:
       status: supported
       anchor: net_redex_file_append
+      evidence:
+      - .claude/skills/net-event-bus/examples/eventlog.c
+      - .claude/skills/net-event-bus/examples/jobqueue.c
 - operation: CortEX folds / NetDB
   bindings:
     Rust:
@@ -489,8 +526,9 @@ operations:
       status: supported
       anchor: OpenNetDb
     C:
-      status: supported
+      status: partial
       anchor: net_fold_query_client_query_latest
+      gap: 'No C program CI runs calls it (Go reaches it through go/aggregator.go).'
 - operation: MeshDB — federated queries
   bindings:
     Rust:
@@ -506,8 +544,9 @@ operations:
       status: supported
       anchor: MeshDB
     C:
-      status: supported
+      status: partial
       anchor: net_meshdb_decode_payload_json
+      gap: 'No C program CI runs calls it; its C evidence is the C1 header audit only.'
 - operation: Compute / groups / daemons
   bindings:
     Rust:
@@ -523,8 +562,9 @@ operations:
       status: supported
       anchor: Groups
     C:
-      status: supported
+      status: partial
       anchor: net_compute_fork_group_fork_count
+      gap: 'No C program CI runs calls it (Go reaches it through go/groups.go).'
 - operation: Deck — operator surface
   bindings:
     Rust:
@@ -540,8 +580,9 @@ operations:
       status: supported
       anchor: Deck
     C:
-      status: supported
+      status: partial
       anchor: net_deck_admin_cordon
+      gap: 'No C program CI runs calls it (Go reaches it through go/deck.go).'
 - operation: Redis Streams dedup
   bindings:
     Rust:
@@ -558,5 +599,6 @@ operations:
       status: supported
       anchor: RedisStreamDedup
     C:
-      status: supported
+      status: partial
       anchor: net_redis_dedup_new
+      gap: 'No C program CI runs calls it (Go reaches it through go/redis_dedup.go).'

@@ -216,7 +216,7 @@
     "Compute / groups / daemons": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -236,7 +236,7 @@
     "Consumer-side filter DSL": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "not exposed"
@@ -256,7 +256,7 @@
     "CortEX folds / NetDB": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -296,7 +296,7 @@
     "Deck — operator surface": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -419,7 +419,7 @@
     "Gang-claim scheduler": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -439,7 +439,7 @@
     "MCP bridge": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -479,7 +479,7 @@
     "Mesh streams": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -499,7 +499,7 @@
     "MeshDB — federated queries": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -519,7 +519,7 @@
     "Organization capability auth": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -727,7 +727,7 @@
     "Redis Streams dedup": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -770,7 +770,7 @@
     "Subnet gateway provisioning": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -790,7 +790,7 @@
     "Subnet-exported nRPC serve": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -810,7 +810,7 @@
     "Subnet-exported organization call": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
