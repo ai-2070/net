@@ -1,0 +1,21 @@
+.github/scripts/run-c-consumers.py
+  s_17a2ac60d914fc::t_84e8ac3175bfe0 292-308,424-430,621-626,651-652,671-672
+.github/workflows/ci.yml
+  s_17a2ac60d914fc::t_15ee4d8acdd5bb 5327-5336,5338-5350,5352-5361
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e6360917bf612401a8fde4977294021ad91be6d2",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
