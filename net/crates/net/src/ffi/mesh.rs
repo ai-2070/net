@@ -4576,6 +4576,8 @@ pub unsafe extern "C" fn net_normalize_gpu_vendor(
 // strings (the codebase's `_json` convention), so the C ABI stays one
 // `const char*` instead of a struct + string-array marshaling.
 
+// Declared for C in include/net.go.h (mirrored in go/net.h).
+// `.github/scripts/check-c-abi.py` fails if a value here and its header differ.
 /// Returned for a bad / unparseable criteria or record JSON.
 pub(crate) const NET_ERR_GANG_INVALID: c_int = -140;
 

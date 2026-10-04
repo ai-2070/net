@@ -486,6 +486,65 @@ compatibility (check 7).
   `net_test_helpers.h`), with six undeclared Go-test seams listed by
   name.
 
+**Stage 2 landed (2026-10-04): constants (check 5).**
+- **What it checks:**
+  - Every `NET_*` const in the Rust FFI (`src/ffi/**` and the `*-ffi`
+    crates) is declared in a shipped header, with the Rust value.
+  - A name declared twice has one value.
+  - Every complete `NET_*` name a header comment mentions is declared.
+    A family written `NET_ERR_BLOB_*` is a prefix, not a name.
+  - No two codes share a value within one return domain. All of
+    `NET_ERR_*` is one domain (`net_error_t`, which every surface
+    returning `NetError` draws from); `NET_RPC_*`, `NET_ORG_*` and so on
+    are each their own.
+- **Compiled, not only parsed:** the audit generates
+  `_Static_assert(NAME == value)` for every declared constant with a Rust
+  value and compiles it from the bundle's headers. There is one unit for
+  `net.h` and one for `net.go.h`, since they share a guard.
+- **`--self-test`** adds five cases: an undeclared Rust code, a value
+  mismatch, the same mismatch failing the compiled assertions, a comment
+  naming an undeclared code, and a collision.
+- **Proved on the real headers:** a copy of the bundle with
+  `NET_ERR_QUEUE_FULL` changed to -109 was refused three ways: the value
+  mismatch, the failed `_Static_assert`, and a collision with
+  `NET_ERR_MESH_STREAM_OCCUPIED`. That collision is #1167's -109 incident,
+  now caught by a tool rather than a reviewer.
+- **First run:**
+  - 30 Rust codes were declared nowhere. That covers the whole
+    `NET_ERR_BLOB_*` band, the cortex read-your-writes codes,
+    `NET_ERR_GANG_INVALID`, four registry codes and the observer's
+    status/direction values.
+  - Seven comment mentions named undeclared codes; six were codes the
+    headers told callers to compare against (`NET_ERR_WRONG_ORIGIN`,
+    `NET_ERR_QUEUE_FULL`, …).
+  - Ten collisions: the blob band against mesh codes.
+- **Fixed in the same commit, under the one-commit ABI rule:**
+  - **Headers:**
+    - `net.go.h` / `go/net.h`: the 12 blob codes,
+      `NET_ERR_GANG_INVALID` and `NET_ERR_FEATURE_NOT_BUILT`.
+    - `net_cortex.h` / `go/net_cortex.h`: `NET_ERR_TIMEOUT`,
+      `_STREAM_ENDED`, `_WRONG_ORIGIN`, `_QUEUE_FULL`, `_FOLD_STOPPED`,
+      `_PANIC` and `_FEATURE_NOT_BUILT`.
+    - `net_transport.h`: `_FEATURE_NOT_BUILT`, which the transport stubs
+      return.
+    - `net.h`: registry codes 8–11.
+    - `NET_ERR_FEATURE_NOT_BUILT` is `#ifndef`-guarded in its three
+      headers; the three compile together.
+  - **Rust:** a note at each code group names its header.
+  - **Go:** the new `TestABIStabilityHeadersDeclareReturnedCodes` pins
+    each declared value to Rust, and the blob band to its Go sentinel.
+    `TestABIStabilityTransferCodes` pins the new transport declaration,
+    and its stale "-107 lives in net.h" note is gone.
+- **Allowlisted, with reasons:**
+  - The ten blob/mesh pairs, as the per-surface decision of `ae651ef9b`.
+    Any other collision fails.
+  - `NET_ERR_DIR_SYMLINK_UNSUPPORTED`, a reserved name.
+  - The six observer constants, deferred with the observer to stage 3.
+- **Verified on Windows:** both bundles audit clean; 18/18 self-test;
+  `smoke.c` under MSVC and MinGW; 18 Go ABI and header-parity tests;
+  `check-rpc-abi-parity.py` and the header-count, one-library and
+  C-snippet guards.
+
 ### C2: lifecycle and transfer programs
 
 - **`lifecycle.c`.** Two in-process nodes go through `net_mesh_new`,

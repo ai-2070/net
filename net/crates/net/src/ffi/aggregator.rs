@@ -32,6 +32,9 @@ use crate::adapter::net::{ChannelConfig, ChannelId, ChannelName, Visibility};
 use super::mesh::MeshNodeHandle;
 
 // ─── Error-kind discriminants (locked across SDKs) ───
+//
+// Declared for C in include/net.h. `.github/scripts/check-c-abi.py`
+// fails if a value here and its header differ.
 
 /// Server handler rejected: no summarizer registered under the
 /// requested fold kind. Only emitted by

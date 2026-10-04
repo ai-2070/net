@@ -810,3 +810,51 @@ def host_triple(crate_dir: Path) -> str:
 
 def default_cc() -> str:
     return os.environ.get("CC", "gcc")
+
+
+# -------------------------------------------------------------- constants ----
+
+_RUST_CONST = re.compile(
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?const\s+(?P<name>NET_[A-Z0-9_]+)\s*:\s*(?P<ty>[^=]+?)\s*=\s*(?P<val>[^;]+);"
+)
+_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+_NET_TOKEN = re.compile(r"\bNET_[A-Z0-9_]*[A-Z0-9]\b")
+
+
+@dataclass
+class RustConst:
+    name: str
+    value: int | None  # None when the initialiser is not an integer literal
+    expr: str
+    file: Path
+    line: int
+
+
+def rust_consts(crate: Crate) -> list[RustConst]:
+    out = []
+    for path in crate.files:
+        src = path.read_text(encoding="utf-8")
+        masked = mask_rust(src)
+        for m in _RUST_CONST.finditer(masked):
+            expr = masked[m.start("val"):m.end("val")].strip()
+            try:
+                value = int(expr.replace("_", ""), 0)
+            except ValueError:
+                value = None
+            out.append(RustConst(m.group("name"), value, expr, path,
+                                 src.count("\n", 0, m.start("name")) + 1))
+    return out
+
+
+def comment_mentions(header: Path) -> dict[str, int]:
+    """NET_* names a header's comments mention, with the first line of each.
+    A name ending in `_` (`NET_ERR_BLOB_*` written as a family) is a prefix,
+    not a name, and is skipped by the pattern."""
+    raw = header.read_text(encoding="utf-8")
+    out: dict[str, int] = {}
+    for c in _COMMENT.finditer(raw):
+        for t in _NET_TOKEN.finditer(c.group(0)):
+            if raw[c.start() + t.end():c.start() + t.end() + 1] in ("_", "*"):
+                continue  # `NET_ERR_BLOB_*` / `NET_ERR_TOKEN_x`-style families
+            out.setdefault(t.group(0), raw.count("\n", 0, c.start() + t.start()) + 1)
+    return out

@@ -281,6 +281,10 @@ func TestABIStabilityTransferCodes(t *testing.T) {
 		"NET_ERR_TRANSFER_NULL_POINTER":  ErrTransfer,
 		"NET_ERR_TRANSFER_SHUTTING_DOWN": ErrTransfer,
 		"NET_ERR_TRANSFER_PANIC":         ErrTransfer,
+		// Not in the transport band: the feature-off transport stubs return
+		// it, so net_transport.h declares it (guarded; net.go.h and
+		// net_cortex.h declare the same value).
+		"NET_ERR_FEATURE_NOT_BUILT": ErrFeatureNotBuilt,
 	}
 	h := parseHeader(t, "../net/crates/net/include/net_transport.h")
 	seen := 0
@@ -308,11 +312,6 @@ func TestABIStabilityTransferCodes(t *testing.T) {
 	}
 	if seen != len(want) {
 		t.Errorf("net_transport.h has %d NET_ERR_* constants, the pin table has %d", seen, len(want))
-	}
-	// NET_ERR_FEATURE_NOT_BUILT (-107) lives in net.h, not the transport
-	// band; the feature-off transport stubs return it.
-	if got := transferErrorFromInt(-107); !errors.Is(got, ErrFeatureNotBuilt) || !errors.Is(got, ErrTransfer) {
-		t.Errorf("-107 maps to %v, want ErrFeatureNotBuilt (and ErrTransfer)", got)
 	}
 }
 
@@ -476,5 +475,83 @@ func TestABIStabilityBlobOwnedRegistrationMatchesRust(t *testing.T) {
 	}
 	if strings.Join(cFields, ",") != strings.Join(want, ",") {
 		t.Errorf("C vtable fields = %v, want %v", cFields, want)
+	}
+}
+
+// TestABIStabilityHeadersDeclareReturnedCodes pins the return codes C1's
+// audit found declared nowhere (C_SDK_CONSUMER_VERIFICATION_PLAN.md) to the
+// headers Go compiles against. Each is declared in go/net.h or
+// go/net_cortex.h with the value the Rust FFI returns, and the blob band and
+// NET_ERR_FEATURE_NOT_BUILT map to their Go sentinels. Before, the whole
+// NET_ERR_BLOB_* band and the cortex read-your-writes codes existed only in
+// Rust and as bare numbers in Go, and header comments told C callers to
+// compare against names no header declared.
+func TestABIStabilityHeadersDeclareReturnedCodes(t *testing.T) {
+	requireCrateTree(t)
+	rust := map[string]string{}
+	re := regexp.MustCompile(`(?m)^\s*pub(?:\(crate\))? const (NET_ERR_\w+): c_int = (-?\d+);`)
+	for _, f := range []string{"blob.rs", "cortex.rs", "mesh.rs"} {
+		src, err := os.ReadFile("../net/crates/net/src/ffi/" + f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+			rust[m[1]] = m[2]
+		}
+	}
+	blob := map[string]error{
+		"NET_ERR_BLOB_DECODE":                 ErrBlobDecode,
+		"NET_ERR_BLOB_DUPLICATE_ID":           ErrBlobDuplicateID,
+		"NET_ERR_BLOB_NOT_REGISTERED":         ErrBlobNotRegistered,
+		"NET_ERR_BLOB_NOT_FOUND":              ErrBlobNotFound,
+		"NET_ERR_BLOB_HASH_MISMATCH":          ErrBlobHashMismatch,
+		"NET_ERR_BLOB_BACKEND":                ErrBlobBackend,
+		"NET_ERR_BLOB_UNSUPPORTED_SCHEME":     ErrBlobUnsupportedScheme,
+		"NET_ERR_BLOB_PANIC":                  ErrBlob,
+		"NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED": ErrBlob,
+		"NET_ERR_BLOB_ADAPTER_NOT_REGISTERED": ErrBlobNotRegistered,
+		"NET_ERR_BLOB_UNAUTHORIZED":           ErrBlobUnauthorized,
+		"NET_ERR_BLOB_INVALID_ARGUMENT":       ErrBlobInvalidArgument,
+		"NET_ERR_FEATURE_NOT_BUILT":           ErrFeatureNotBuilt,
+	}
+	declared := map[string][]string{
+		"net.h": {"NET_ERR_GANG_INVALID"},
+		"net_cortex.h": {
+			"NET_ERR_TIMEOUT", "NET_ERR_STREAM_ENDED", "NET_ERR_WRONG_ORIGIN",
+			"NET_ERR_QUEUE_FULL", "NET_ERR_FOLD_STOPPED", "NET_ERR_FEATURE_NOT_BUILT",
+			"NET_ERR_PANIC",
+		},
+	}
+	for name := range blob {
+		declared["net.h"] = append(declared["net.h"], name)
+	}
+	for file, names := range declared {
+		h := parseHeader(t, file)
+		for _, name := range names {
+			got, ok := h.consts[name]
+			if !ok {
+				t.Errorf("go/%s does not declare %s", file, name)
+				continue
+			}
+			want, ok := rust[name]
+			if !ok {
+				t.Errorf("%s is declared in go/%s but defined in no src/ffi file read here", name, file)
+				continue
+			}
+			if got != want {
+				t.Errorf("%s is %s in go/%s but %s in Rust", name, got, file, want)
+			}
+			sentinel, ok := blob[name]
+			if !ok || file != "net.h" {
+				continue
+			}
+			code, err := strconv.Atoi(got)
+			if err != nil {
+				t.Fatalf("%s = %q is not an integer", name, got)
+			}
+			if err := blobRegistryErrorFromInt(code); !errors.Is(err, sentinel) || !errors.Is(err, ErrBlob) {
+				t.Errorf("%s (%d) maps to %v, want %v (and ErrBlob)", name, code, err, sentinel)
+			}
+		}
 	}
 }

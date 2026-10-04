@@ -395,6 +395,8 @@ int      net_mesh_start(net_meshnode_t* handle);
  *
  * reserve/release write the outcome to *out_outcome: 0 = won, 1 = lost.
  */
+#define NET_ERR_GANG_INVALID  -140  /* bad or unparseable criteria / record JSON */
+
 int      net_mesh_publish_island_topology(net_meshnode_t* handle,
                                           const char* record_json,
                                           size_t* out_count);
@@ -1802,6 +1804,26 @@ int net_blob_ref_hash(const uint8_t* encoded, size_t encoded_len, uint8_t* out_h
  * the out-params are freed with net_blob_free_buffer; on error they are
  * left at (NULL, 0). Null or non-UTF-8 strings return -2 (InvalidUtf8).
  */
+
+/* The NET_ERR_BLOB_* band (src/ffi/blob.rs). Its values overlap the mesh
+ * codes of net_error_t (-110..-118, -120) on purpose: a code's meaning is
+ * the surface that returned it, and these are returned only by the
+ * net_blob_* and net_mesh_blob_adapter_* functions. */
+#define NET_ERR_BLOB_DECODE                  -110  /* BlobRef decode failed       */
+#define NET_ERR_BLOB_DUPLICATE_ID            -111  /* adapter id already in use   */
+#define NET_ERR_BLOB_NOT_REGISTERED          -112  /* adapter id not registered   */
+#define NET_ERR_BLOB_NOT_FOUND               -113  /* adapter has no such blob    */
+#define NET_ERR_BLOB_HASH_MISMATCH           -114  /* bytes failed verification   */
+#define NET_ERR_BLOB_BACKEND                 -115  /* other backend error         */
+#define NET_ERR_BLOB_UNSUPPORTED_SCHEME      -116  /* unknown scheme or adapter   */
+#define NET_ERR_BLOB_PANIC                   -117  /* panic caught at the boundary */
+#define NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED  -118  /* channel names no adapter    */
+#define NET_ERR_BLOB_ADAPTER_NOT_REGISTERED  -119  /* channel's adapter missing   */
+#define NET_ERR_BLOB_UNAUTHORIZED            -120  /* backend refused the caller  */
+#define NET_ERR_BLOB_INVALID_ARGUMENT        -150  /* argument out of contract    */
+#ifndef NET_ERR_FEATURE_NOT_BUILT
+#define NET_ERR_FEATURE_NOT_BUILT  -107  /* the feature behind this call was not built */
+#endif
 
 /* Register a filesystem adapter rooted at `root` (accepts file: URIs; a blob
  * is stored at <root>/<hash[0:2]>/<hash>). 0, or -111 for a duplicate id. */

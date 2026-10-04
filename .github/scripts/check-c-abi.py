@@ -41,11 +41,13 @@ default `gcc`).
 from __future__ import annotations
 
 import argparse
+import re
+import subprocess
 import sys
 import tempfile
 import tomllib
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -127,13 +129,36 @@ class Model:
     defs: dict[str, list[M.RustDef]]
     exports: set[str]
     profile: str
+    # Rust NET_* consts of the FFI crates, by name.
+    rust_consts: dict[str, list[M.RustConst]] = field(default_factory=dict)
+    # header name -> {NET_* name a comment mentions -> line}
+    mentions: dict[str, dict[str, int]] = field(default_factory=dict)
+    include_dir: Path | None = None
 
 
-def load_rust(crate_dir: Path, profile: str, target_os: str) -> dict[str, list[M.RustDef]]:
+def ffi_crates(crate_dir: Path) -> dict[str, M.Crate]:
     crates = {"net-mesh": M.discover_crate("net-mesh", crate_dir / "src" / "lib.rs")}
     for d in sorted((crate_dir / "bindings" / "go").glob("*-ffi")):
         name = M.package_name(d / "Cargo.toml")
         crates[name] = M.discover_crate(name, d / "src" / "lib.rs")
+    return crates
+
+
+def load_rust_consts(crate_dir: Path, crates: dict[str, M.Crate]) -> dict[str, list[M.RustConst]]:
+    """NET_* consts of the FFI code only: the codes the C ABI can return."""
+    ffi_root = (crate_dir / "src" / "ffi").resolve()
+    out: dict[str, list[M.RustConst]] = defaultdict(list)
+    for crate in crates.values():
+        for c in M.rust_consts(crate):
+            path = c.file.resolve()
+            if crate.name == "net-mesh" and ffi_root not in path.parents:
+                continue
+            out[c.name].append(c)
+    return out
+
+
+def load_rust(crate_dir: Path, profile: str, target_os: str) -> dict[str, list[M.RustDef]]:
+    crates = ffi_crates(crate_dir)
     feats = M.resolved_features(crate_dir, "net-ffi", PROFILE_FEATURES[profile])
     defs: dict[str, list[M.RustDef]] = defaultdict(list)
     for crate in crates.values():
@@ -167,13 +192,17 @@ def load_model(bundle: Path, crate_dir: Path = CRATE) -> Model:
         for line in (bundle / "EXPORTS").read_text(encoding="utf-8").splitlines()
         if line.strip()
     }
-    return Model(headers, decls, load_rust(crate_dir, profile, target_os), exports, profile)
+    model = Model(headers, decls, load_rust(crate_dir, profile, target_os), exports, profile)
+    model.rust_consts = load_rust_consts(crate_dir, ffi_crates(crate_dir))
+    model.mentions = {h.name: M.comment_mentions(h) for h in sorted(inc.glob("*.h"))}
+    model.include_dir = inc
+    return model
 
 
 # ----------------------------------------------------------------- checks ----
 
 
-def run_checks(model: Model) -> tuple[list[Finding], dict[str, int]]:
+def run_checks(model: Model, compile_assertions: bool = True) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
     stats = {"declared": len(model.decls), "real": 0, "stub": 0, "erased": 0, "handle_types": 0}
     cmp = Comparer()
@@ -235,7 +264,141 @@ def run_checks(model: Model) -> tuple[list[Finding], dict[str, int]]:
         for name in sorted(model.exports):
             if any(p in name for p in SEAM_PATTERNS):
                 findings.append(Finding("seams", name, f"test seam {name} is in the production export set"))
+    findings += run_constant_checks(model, compile_assertions)
     return findings, stats
+
+
+_CODE_NAME = re.compile(r"^NET_(?:[A-Z0-9]+_)?ERR_|^NET_SUCCESS$|^NET_[A-Z0-9]+_OK$")
+
+
+def family(name: str) -> str:
+    """The return domain a code belongs to: every `NET_ERR_*` (and
+    `NET_SUCCESS`) is one domain, the shared `net_error_t` space every surface
+    returning `NetError` draws from; `NET_RPC_*`, `NET_ORG_*` and so on are
+    each their own."""
+    if name.startswith("NET_ERR_") or name == "NET_SUCCESS":
+        return "NET_ERR"
+    m = re.match(r"^(NET_[A-Z0-9]+)_", name)
+    return m.group(1) if m else name
+
+
+def declared_constants(model: Model) -> dict[str, list[tuple[int, str, int]]]:
+    out: dict[str, list[tuple[int, str, int]]] = defaultdict(list)
+    for hname, h in model.headers.items():
+        for name, (value, line) in h.constants.items():
+            out[name].append((value, hname, line))
+    return out
+
+
+def run_constant_checks(model: Model, compile_assertions: bool = True) -> list[Finding]:
+    findings: list[Finding] = []
+    declared = declared_constants(model)
+
+    # One name, one value, in every header that declares it.
+    for name, decls in sorted(declared.items()):
+        if len({v for v, _, _ in decls}) > 1:
+            findings.append(Finding("constants", name,
+                f"{name} is declared with different values: "
+                + ", ".join(f"{v} ({h}:{ln})" for v, h, ln in decls)))
+
+    # Every code the Rust FFI defines is declared, with the Rust value.
+    for name, consts in sorted(model.rust_consts.items()):
+        rvalues = {c.value for c in consts}
+        where = ", ".join(sorted({_loc_const(c) for c in consts}))
+        if None in rvalues:
+            findings.append(Finding("constants", name,
+                f"{name} ({where}) has a non-literal initialiser {consts[0].expr!r}; "
+                "the audit cannot compare it"))
+            continue
+        if len(rvalues) > 1:
+            findings.append(Finding("constants", name,
+                f"{name} has different values in Rust: {sorted(rvalues)} ({where})"))
+            continue
+        rv = rvalues.pop()
+        if name not in declared:
+            findings.append(Finding("constants", name,
+                f"{name} = {rv} ({where}) is defined by the Rust FFI but declared in no shipped header"))
+            continue
+        hv = {v for v, _, _ in declared[name]}
+        if hv != {rv}:
+            findings.append(Finding("constants", name,
+                f"{name} is {sorted(hv)} in the headers but {rv} in Rust ({where})"))
+
+    # A name a header's comments tell the reader to compare against exists.
+    for hname, mentioned in sorted(model.mentions.items()):
+        for name, line in sorted(mentioned.items()):
+            if name in declared or name.endswith("_H"):
+                continue
+            findings.append(Finding("mentioned", name,
+                f"{hname}:{line} mentions {name}, which no shipped header declares"))
+
+    # Two meanings with one value in one return domain.
+    by_value: dict[tuple[str, int], set[str]] = defaultdict(set)
+    for name, decls in declared.items():
+        if _CODE_NAME.search(name):
+            for v, _, _ in decls:
+                by_value[(family(name), v)].add(name)
+    for name, consts in model.rust_consts.items():
+        if _CODE_NAME.search(name) and consts[0].value is not None:
+            by_value[(family(name), consts[0].value)].add(name)
+    for (fam, v), names in sorted(by_value.items()):
+        names = sorted(names)
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                findings.append(Finding("collision", f"{names[i]}|{names[j]}",
+                    f"{names[i]} and {names[j]} are both {v} in the {fam} return domain"))
+
+    if compile_assertions and model.include_dir is not None:
+        findings += compile_constant_assertions(model)
+    return findings
+
+
+def constant_assertions(model: Model, headers: list[str]) -> str:
+    """A C translation unit asserting, through `headers`, every constant
+    they declare that has a Rust value."""
+    lines = ["/* Generated by check-c-abi.py: header constants equal their Rust values. */"]
+    lines += [f'#include "{h}"' for h in headers]
+    names: set[str] = set()
+    for h in headers:
+        names |= set(model.headers[h].constants)
+    for name in sorted(names):
+        consts = model.rust_consts.get(name)
+        if consts and consts[0].value is not None:
+            v = consts[0].value
+            lines.append(f'_Static_assert(({name}) == ({v}), "{name} is not {v}");')
+    return "\n".join(lines) + "\n"
+
+
+def compile_constant_assertions(model: Model) -> list[Finding]:
+    """`net.h` and `net.go.h` share an include guard, so each gets its own
+    translation unit, with every other header."""
+    findings = []
+    others = [h for h in model.headers if h not in ("net.h", "net.go.h")]
+    # One unit per guard-sharing base; with neither present, one unit of all.
+    units = [[b, *others] for b in ("net.h", "net.go.h") if b in model.headers] or [others]
+    with tempfile.TemporaryDirectory() as td:
+        for headers in units:
+            base = headers[0]
+            tu = Path(td) / ("abi_constants_" + base.replace(".", "_") + ".c")
+            tu.write_text(constant_assertions(model, headers), encoding="utf-8")
+            run = subprocess.run(
+                [M.default_cc(), "-std=c11", "-fsyntax-only", "-I", str(model.include_dir), str(tu)],
+                capture_output=True, text=True,
+            )
+            if run.returncode != 0:
+                out = (run.stdout + run.stderr).splitlines()[:20]
+                findings.append(Finding("compiled", base,
+                    f"constant assertions through {base} do not compile:\n"
+                    + "\n".join("      " + line for line in out)))
+    return findings
+
+
+def _loc_const(c: M.RustConst) -> str:
+    try:
+        rel = c.file.resolve().relative_to(ROOT)
+    except ValueError:
+        rel = c.file
+    return f"{rel.as_posix()}:{c.line}"
 
 
 def _loc(d: M.RustDef) -> str:
@@ -280,7 +443,8 @@ def report(findings: list[Finding], stats: dict, stale: list[str], profile: str,
     by = defaultdict(list)
     for f in findings:
         by[f.check].append(f)
-    for check in ("declared", "exported", "signature", "char", "handles", "seams"):
+    for check in ("declared", "exported", "signature", "char", "handles", "seams",
+                  "constants", "mentioned", "collision", "compiled"):
         items = by.get(check, [])
         mark = "✓" if not items else "✗"
         print(f"{mark} {check}: {len(items)} finding(s)")
@@ -300,6 +464,8 @@ typedef struct demo_s demo_t;
 typedef struct other_s other_t;
 typedef int (*demo_cb)(uint64_t id, const uint8_t* data, size_t len);
 #define NET_DEMO_OK 0
+#define NET_DEMO_ERR_CLOSED -1
+/* Returns NET_DEMO_OK, or NET_DEMO_ERR_CLOSED. */
 int net_demo_open(demo_t** out);
 int net_demo_serve(demo_t* d, other_t* o, demo_cb cb);
 void net_demo_free(demo_t* d);
@@ -307,6 +473,8 @@ uint32_t net_demo_count(const demo_t* d);
 """
 
 _ST_RUST = """\
+pub const NET_DEMO_OK: c_int = 0;
+pub const NET_DEMO_ERR_CLOSED: c_int = -1;
 pub struct DemoHandle { x: u8 }
 pub struct OtherHandle { y: u8 }
 pub type DemoCb = Option<unsafe extern "C" fn(id: u64, data: *const u8, len: usize) -> c_int>;
@@ -345,7 +513,14 @@ def _self_test_model(tmp: Path, header: str, rust: str, exports: set[str], profi
     decls = defaultdict(list)
     for d in h.functions.values():
         decls[d.name].append(d)
-    return Model({"net_demo.h": h}, decls, defs, set(exports), profile)
+    model = Model({"net_demo.h": h}, decls, defs, set(exports), profile)
+    consts: dict[str, list[M.RustConst]] = defaultdict(list)
+    for c in M.rust_consts(crate):
+        consts[c.name].append(c)
+    model.rust_consts = consts
+    model.mentions = {"net_demo.h": M.comment_mentions(inc / "net_demo.h")}
+    model.include_dir = inc
+    return model
 
 
 def self_test() -> int:
@@ -372,6 +547,16 @@ def self_test() -> int:
         ("a pointer became a value", H.replace("void net_demo_free(demo_t* d)", "void net_demo_free(uint64_t d)"), R, E,
          ("signature", "net_demo_free.arg0")),
         ("a test seam in production exports", H, R, E | {"net_demo_test_seam"}, ("seams", "net_demo_test_seam")),
+        ("a Rust code declared in no header", H, R + "pub const NET_DEMO_ERR_GONE: c_int = -2;\n", E,
+         ("constants", "NET_DEMO_ERR_GONE = -2")),
+        ("a header value that differs from Rust", H.replace("NET_DEMO_ERR_CLOSED -1", "NET_DEMO_ERR_CLOSED -3"), R, E,
+         ("constants", "is [-3] in the headers but -1 in Rust")),
+        ("the same mismatch fails the compiled assertions", H.replace("NET_DEMO_ERR_CLOSED -1", "NET_DEMO_ERR_CLOSED -3"), R, E,
+         ("compiled", "static assertion failed")),
+        ("a comment names a code nobody declares", H.replace("or NET_DEMO_ERR_CLOSED.", "or NET_DEMO_ERR_GHOST."), R, E,
+         ("mentioned", "NET_DEMO_ERR_GHOST")),
+        ("two codes share a value in one domain", H + "#define NET_DEMO_ERR_TWIN -1\n", R, E,
+         ("collision", "NET_DEMO_ERR_CLOSED and NET_DEMO_ERR_TWIN are both -1")),
     ]
     failures = 0
     with tempfile.TemporaryDirectory() as td:

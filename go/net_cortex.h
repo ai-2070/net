@@ -24,6 +24,18 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Return codes of this surface (src/ffi/cortex.rs), beside the shared
+ * net_error_t codes of net.h. */
+#define NET_ERR_TIMEOUT        1     /* deadline passed; a token wait or poll */
+#define NET_ERR_STREAM_ENDED   2     /* the stream or cursor ended            */
+#define NET_ERR_WRONG_ORIGIN   -104  /* token from another origin             */
+#define NET_ERR_QUEUE_FULL     -105  /* read-your-writes wait queue saturated */
+#define NET_ERR_FOLD_STOPPED   -106  /* the fold stopped; the write never lands */
+#define NET_ERR_PANIC          -108  /* panic caught at the boundary          */
+#ifndef NET_ERR_FEATURE_NOT_BUILT
+#define NET_ERR_FEATURE_NOT_BUILT  -107  /* the feature behind this call was not built */
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
