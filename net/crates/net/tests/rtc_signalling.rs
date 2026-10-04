@@ -1480,3 +1480,77 @@ async fn a_forced_direct_loss_is_cleaned_up_on_the_far_side_too() {
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");
 }
+
+/// **The responder's handshake inbox exists before its channel can
+/// carry msg1.** The driver hands the initiator's msg1 to ingress in
+/// the same pass that reports channel-open, while the responder's
+/// completion still has `await_open`, the claim and the dialog-table
+/// lock ahead of `accept_rtc`. A handshake datagram with no
+/// registered inbox is dropped by the dispatcher, and a browser sends
+/// msg1 exactly ONCE — so a responder that lost that race failed the
+/// attempt on `timeout: noise msg2` (seen in the browser matrix
+/// whenever teardown work on the anchor delayed its completion by a
+/// few milliseconds).
+///
+/// The interleaving is forced, not raced: B's completion parks at the
+/// claim seam with its channel open while A (no retransmits — the
+/// browser's shape; the native initiator's retransmit after a full
+/// `handshake_timeout` would otherwise mask the drop) sends msg1.
+/// B is released only after that, and the exchange must complete.
+///
+/// Inverse: drop the early registration in `spawn_dialog_completion`
+/// (`early_inbox`) — msg1 lands with no inbox, A never gets msg2, and
+/// the direct install below never happens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_msg1_that_arrives_before_the_responder_registers_is_not_lost() {
+    let unhurried = || RtcConfig {
+        ice_deadline: Duration::from_secs(120),
+        ..rtc_config()
+    };
+    let mut a_cfg = config(Some(unhurried()));
+    a_cfg.handshake_retries = 0;
+    let a = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), a_cfg)
+            .await
+            .expect("MeshNode::new"),
+    );
+    let b = node(Some(unhurried())).await;
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    connect_udp(&a, &b).await;
+    a.start();
+    b.start();
+
+    // B answers; ITS completion (the responder) parks at channel-open.
+    b.rtc_dialog_claim_pause().arm_once();
+    a.offer_direct_path(b_id).await.expect("offer sent");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        b.rtc_dialog_claim_pause().wait_until_reached(),
+    )
+    .await
+    .expect("B's completion must reach the claim seam, i.e. its channel opened");
+
+    // A's completion is not parked: it claims and sends its single
+    // msg1 while B has not reached `accept_rtc`.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    b.rtc_dialog_claim_pause().release();
+
+    assert!(
+        wait_for(
+            || {
+                matches!(a.peer_endpoint(b_id), Some(PeerAddr::Rtc(_)))
+                    && matches!(b.peer_endpoint(a_id), Some(PeerAddr::Rtc(_)))
+            },
+            Duration::from_secs(20)
+        )
+        .await,
+        "the msg1 sent before B registered must still complete the exchange \
+         (A endpoint {:?}, B endpoint {:?})",
+        a.peer_endpoint(b_id),
+        b.peer_endpoint(a_id)
+    );
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}

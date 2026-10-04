@@ -6671,6 +6671,7 @@ jobs:
           rtc_admission:a_provisional_peer_cannot_drive_migration
           rtc_admission:a_promotion_inside_the_teardown_window_survives
           rtc_signalling:each_signalling_refusal_is_counted_under_its_own_cause
+          rtc_signalling:a_msg1_that_arrives_before_the_responder_registers_is_not_lost
           rtc_anchor_registry:an_announced_anchor_is_listed_with_its_addresses_and_a_plain_peer_is_not
           rtc_proxy_boundary:an_rtc_peers_routed_envelope_never_reaches_the_proxy
           rtc_proxy_boundary:a_proxy_socket_cannot_become_the_authenticated_adjacency_a_relay_needs

@@ -703,6 +703,18 @@ async function execute(step) {
           while (node.nodeIdHex() == null && performance.now() < deadline) {
             await new Promise((resolve) => setTimeout(resolve, 50));
           }
+          if (node.nodeIdHex() == null) {
+            // Kept, so a later step can still inspect or close it.
+            nodes.set(step.session, node);
+            return {
+              ok: false,
+              error:
+                'openSession resolved as ' +
+                (typeof node.role === 'function' ? node.role() : '?') +
+                ' but no Leadership reply named the node within 15 s',
+              elapsed_ms: performance.now() - started,
+            };
+          }
         } else {
           node = await connect(opts);
         }

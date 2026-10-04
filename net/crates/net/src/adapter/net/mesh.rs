@@ -925,6 +925,12 @@ struct DirectHandshakeInbox {
     state: parking_lot::Mutex<DirectHandshakeInboxState>,
     /// Wakes the waiter on deposit or close.
     signal: Notify,
+    /// Set on an inbox a dialog completion registered AHEAD of its
+    /// responder (see [`MeshNode::spawn_dialog_completion`]); cleared
+    /// by the one `accept_rtc` that adopts it. An unreserved inbox is
+    /// never adopted — a second accept displaces, exactly as before.
+    #[cfg(feature = "webrtc")]
+    reserved: std::sync::atomic::AtomicBool,
 }
 
 /// Interior of a [`DirectHandshakeInbox`].
@@ -951,7 +957,24 @@ impl DirectHandshakeInbox {
                 closed: false,
             }),
             signal: Notify::new(),
+            #[cfg(feature = "webrtc")]
+            reserved: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// An inbox registered ahead of the responder that will read it.
+    #[cfg(feature = "webrtc")]
+    fn reserved() -> Self {
+        let inbox = Self::new();
+        inbox.reserved.store(true, Ordering::Release);
+        inbox
+    }
+
+    /// Claim a reserved inbox. True exactly once, and never for a
+    /// retired one.
+    #[cfg(feature = "webrtc")]
+    fn adopt(&self) -> bool {
+        !self.state.lock().closed && self.reserved.swap(false, Ordering::AcqRel)
     }
 
     /// Queue a candidate, evicting the oldest if the ring is full.
@@ -1359,6 +1382,25 @@ struct DirectInboxGuard<'a> {
 }
 
 impl Drop for DirectInboxGuard<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .remove_if(&self.addr, |_, cur| Arc::ptr_eq(cur, &self.inbox));
+        self.inbox.close();
+    }
+}
+
+/// [`DirectInboxGuard`] for a registration that has to outlive the
+/// call that made it — a dialog completion's early responder inbox,
+/// held by the spawned task. Same identity-conditional removal.
+#[cfg(feature = "webrtc")]
+struct OwnedDirectInboxGuard {
+    registry: Arc<DirectHandshakeRegistry>,
+    addr: PeerAddr,
+    inbox: Arc<DirectHandshakeInbox>,
+}
+
+#[cfg(feature = "webrtc")]
+impl Drop for OwnedDirectInboxGuard {
     fn drop(&mut self) {
         self.registry
             .remove_if(&self.addr, |_, cur| Arc::ptr_eq(cur, &self.inbox));
@@ -24410,13 +24452,31 @@ impl MeshNode {
         )
         .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {e}")))?;
 
-        let inbox = Arc::new(DirectHandshakeInbox::new());
-        if let Some(displaced) = self
+        // The dialog completion that drives this call registered a
+        // RESERVED inbox before its answer left, so a msg1 that
+        // arrives in the same driver pass as channel-open is queued
+        // rather than dropped (no registration = the dispatcher
+        // discards the handshake, and the initiator sends msg1 once).
+        // Adopt it — once; anything else gets a fresh registration
+        // that displaces whatever held the slot, as before.
+        let reserved = self
             .pending_direct_initiators
-            .insert(peer_addr, inbox.clone())
-        {
-            displaced.close();
-        }
+            .get(&peer_addr)
+            .map(|entry| Arc::clone(entry.value()))
+            .filter(|inbox| inbox.adopt());
+        let inbox = match reserved {
+            Some(inbox) => inbox,
+            None => {
+                let inbox = Arc::new(DirectHandshakeInbox::new());
+                if let Some(displaced) = self
+                    .pending_direct_initiators
+                    .insert(peer_addr, inbox.clone())
+                {
+                    displaced.close();
+                }
+                inbox
+            }
+        };
         // R3-E: reclaim the registration even if this future is
         // *cancelled*. The explicit `deregister` below only runs when
         // the future completes; a dropped `accept_rtc` used to leave
@@ -28252,7 +28312,34 @@ impl MeshNode {
         // wait, Noise and the install share it, so the table can no
         // longer expire an attempt that is already installing.
         let deadline = tokio::time::Instant::now() + ice_deadline;
+        // **The responder's inbox exists before the answer leaves.**
+        // The driver hands the browser's msg1 to ingress in the SAME
+        // pass that fires channel-open, while this task still has
+        // `await_open`, the claim and the dialog-table lock ahead of
+        // `accept_rtc`'s registration. A handshake with no
+        // registration is dropped, and the initiator sends msg1 once,
+        // so losing that race was a silent `timeout: noise msg2` —
+        // won almost always, lost whenever teardown work on the
+        // anchor delayed this task by a few milliseconds. Registered
+        // here, reserved for the one `accept_rtc` below; the guard
+        // retires it on every exit, cancellation included.
+        let early_inbox = (!offerer).then(|| {
+            let inbox = Arc::new(DirectHandshakeInbox::reserved());
+            let addr = PeerAddr::Rtc(peer);
+            if let Some(displaced) = self
+                .pending_direct_initiators
+                .insert(addr, Arc::clone(&inbox))
+            {
+                displaced.close();
+            }
+            OwnedDirectInboxGuard {
+                registry: Arc::clone(&self.pending_direct_initiators),
+                addr,
+                inbox,
+            }
+        });
         let handle = tokio::spawn(async move {
+            let _early_inbox = early_inbox;
             // 1. The dialog's own DataChannel-open event, under the
             //    attempt's own deadline, and cancellable by
             //    shutdown.
