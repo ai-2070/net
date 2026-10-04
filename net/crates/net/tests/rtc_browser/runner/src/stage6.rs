@@ -2168,11 +2168,46 @@ async fn direct_path_witness(cx: &Cx6<'_>, ledger: &mut Ledger) {
     let restored_nonces = nonces(run, "restored", 2);
     let restore_before = Forwarded::read(cx.anchor, &a, &b, &c);
     let restore_sent = p2_send(&mut script, P2_TAB_A, "a2b", &restored_nonces).await;
-    let restored_at_b = p2_inbox(&mut script, P2_TAB_B, "b2a", 2, 0, P2_INBOX_MS).await;
-    let restored_echo = p2_inbox(&mut script, P2_TAB_A, "a2b", 0, 2, P2_INBOX_MS).await;
+    // The streams are RELIABLE: the `down` send that reached nobody
+    // while the path was gone may be retransmitted once the relay is
+    // back, and land in B's inbox (and, echoed, in A's) beside the
+    // restored traffic. That late delivery is the reliable stream
+    // doing its job, not a leak — but ONLY the down nonces may appear
+    // late; anything else is still a failure. The inbox step returns
+    // at a COUNT, so a late down nonce can take one of the restored
+    // slots: read again until the restored nonces themselves are in.
+    let mut restored_arrived = Vec::new();
+    let mut restored_echoed_all = Vec::new();
+    for _ in 0..=down_nonces.len() {
+        let fresh = |all: &[String]| all.iter().filter(|n| !down_nonces.contains(n)).count();
+        let want_data = restored_nonces
+            .len()
+            .saturating_sub(fresh(&restored_arrived));
+        let want_echo = restored_nonces
+            .len()
+            .saturating_sub(fresh(&restored_echoed_all));
+        if want_data == 0 && want_echo == 0 {
+            break;
+        }
+        if want_data > 0 {
+            let at_b = p2_inbox(&mut script, P2_TAB_B, "b2a", want_data, 0, P2_INBOX_MS).await;
+            restored_arrived.extend(stat_list(&at_b, "data"));
+        }
+        if want_echo > 0 {
+            let echo = p2_inbox(&mut script, P2_TAB_A, "a2b", 0, want_echo, P2_INBOX_MS).await;
+            restored_echoed_all.extend(stat_list(&echo, "echoes"));
+        }
+    }
     let restore_after = Forwarded::read(cx.anchor, &a, &b, &c);
-    let restored_arrived = stat_list(&restored_at_b, "data");
-    let restored_echoed = stat_list(&restored_echo, "echoes");
+    let (late_down, restored_fresh): (Vec<String>, Vec<String>) = restored_arrived
+        .iter()
+        .cloned()
+        .partition(|n| down_nonces.contains(n));
+    let restored_echoed: Vec<String> = restored_echoed_all
+        .iter()
+        .filter(|n| !down_nonces.contains(n))
+        .cloned()
+        .collect();
 
     let inverse_ok = closed.ok
         && stat_u64(&closed, "closed") >= 1
@@ -2183,7 +2218,7 @@ async fn direct_path_witness(cx: &Cx6<'_>, ledger: &mut Ledger) {
         && a_restored.ok
         && b_restored.ok
         && stat_u64(&restore_sent, "sent") == 2
-        && restored_arrived == restored_nonces
+        && restored_fresh == restored_nonces
         && restored_echoed == restored_nonces
         && restore_after.ab > restore_before.ab
         && restore_after.ba > restore_before.ba;
@@ -2200,7 +2235,9 @@ async fn direct_path_witness(cx: &Cx6<'_>, ledger: &mut Ledger) {
              MANUALLY through the production surface: peer_offer {restore_dialog} + \
              peer_accept_offer {restore_answer:?} put the relay addressing back on both \
              sides, with no candidate serviced and no handshake run. A sent \
-             {restored_nonces:?}; B's inbox reports {restored_arrived:?}, A holds the echoes \
+             {restored_nonces:?}; B's inbox reports {restored_arrived:?} (fresh \
+             {restored_fresh:?}; the down send, retransmitted late: {late_down:?}), A holds \
+             the echoes \
              {restored_echoed:?}, and THE SAME counter that stayed flat moved again: \
              (a→b) {} → {}, (b→a) {} → {}. Without this leg part 2 could not tell direct \
              from broken. {}",

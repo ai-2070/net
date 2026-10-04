@@ -694,6 +694,15 @@ async function execute(step) {
             };
           }
           node = await open(opts);
+          // A FOLLOWER's `openSession` resolves once its `Attach` is
+          // POSTED, not answered: `nodeIdHex()` stays null until the
+          // leader's `Leadership` reply lands a moment later. Reading
+          // it straight away reported "tab b reported nothing" in the
+          // two-tabs witness. Wait, bounded, for the reply.
+          const deadline = performance.now() + 15000;
+          while (node.nodeIdHex() == null && performance.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
         } else {
           node = await connect(opts);
         }

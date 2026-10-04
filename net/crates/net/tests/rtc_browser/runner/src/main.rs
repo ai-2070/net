@@ -2641,6 +2641,44 @@ async fn run(
         ledger.record("mdns_on_pair_formed", formed.is_some(), detail);
     }
 
+    // The probes are DIAGNOSTICS, and their sessions must not outlive
+    // the sweep. Left open, they idled until the anchors reclaimed
+    // them ~36 s after they formed — which lands in the middle of the
+    // §12 witnesses below. Measured in CI (two Chromium runs, same
+    // relative timing): `other-service`'s handshake was in flight
+    // when both probes were reclaimed, its DataChannel never
+    // completed on the anchor side, and the witness failed on
+    // `timeout: noise msg2`. Close them here and wait for the anchors
+    // to drop them, so that teardown happens BEFORE any witness runs.
+    for probe in &probes {
+        let _ = script
+            .run(Step::Close {
+                id: 0,
+                session: format!("mdns-{}", probe.label),
+            })
+            .await;
+    }
+    let probes_gone = wait_for(
+        || {
+            probes.iter().all(|probe| {
+                let node = if probe.base == loop_base {
+                    &loop_anchor
+                } else {
+                    &anchor
+                };
+                node.peer_session_id(probe.node_id).is_none()
+            })
+        },
+        Duration::from_secs(45),
+    )
+    .await;
+    if !probes_gone {
+        println!(
+            "[mdns] WARNING: an anchor still held a probe session 45 s after the browser \
+             closed it; the §12 witnesses below may overlap its reclaim"
+        );
+    }
+
     // ================================================================
     // The §12 witnesses
     // ================================================================
