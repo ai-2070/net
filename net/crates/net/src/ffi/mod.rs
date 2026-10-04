@@ -2786,7 +2786,7 @@ mod tests {
         fn in_code(line: &str, needle: &str) -> bool {
             let code = line.split("//").next().unwrap_or("");
             code.match_indices(needle).any(|(at, _)| {
-                let before = code[..at].as_bytes();
+                let before = &code.as_bytes()[..at];
                 let quotes = (0..before.len())
                     .filter(|&i| before[i] == b'"' && (i == 0 || before[i - 1] != b'\\'))
                     .count();
