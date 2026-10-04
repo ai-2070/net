@@ -1,0 +1,39 @@
+net/crates/net/tests/c_abi/SURFACE.md
+  s_9023e047bdb7d7::t_91b3843646f81d 18,513
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_9023e047bdb7d7::t_1f5b8ce08e8796 977-1019,1034-1039,1051,1055,1057-1076
+  s_9023e047bdb7d7::t_bdedd4442d5fdf 2008-2015,2018-2023,2025-2029,2031-2035
+  s_9023e047bdb7d7::t_bc6345182721d2 1043-1049,1052-1054
+  s_9023e047bdb7d7::t_f69c21bbfad65e 1983-2007,2016-2017,2024,2030,2036-2042
+  s_9023e047bdb7d7::t_cc59a058aefb13 2043-2044
+net/crates/net/bindings/go/net-ffi/exports.shipped.baseline
+  s_9023e047bdb7d7::t_34bd318b0881d4 7
+  s_9023e047bdb7d7::t_f4b02b40a20916 333
+net/crates/net/bindings/go/net-ffi/exports.baseline
+  s_9023e047bdb7d7::t_f4b02b40a20916 345
+  s_9023e047bdb7d7::t_34bd318b0881d4 7
+net/crates/net/include/net_meshdb.h
+  s_9023e047bdb7d7::t_bea5e18e0e0ebf 242-243,428-433,464-483
+go/abi_stability_test.go
+  s_9023e047bdb7d7::t_68cf3f3ca72327 616-656
+net/crates/net/examples/c/FLOORS
+  s_9023e047bdb7d7::t_804156dd67e0b5 16
+net/crates/net/examples/c/meshdb.c
+  s_9023e047bdb7d7::t_85485ad0c316c7 45-46,49-53,83-85,161-165,195,197,199-201,216,218,220-221,284
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "30dc42b597fc9b9aeaa56e211e2b0c8c268a59d5",
+  "prompts": {},
+  "sessions": {
+    "s_9023e047bdb7d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13ae6289-5780-436a-aa27-88954cc36586",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
