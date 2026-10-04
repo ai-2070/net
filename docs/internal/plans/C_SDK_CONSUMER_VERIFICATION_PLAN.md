@@ -1088,6 +1088,67 @@ At this commit:
   `evidence:` field and checks that the named file exists and runs in CI.
 - The existing guards stay green: skills, header count, doc code width.
 
+**Status: done (2026-10-04).**
+- **The matrix.** Every positive C cell in `docs/data/capabilities/*.yaml`
+  now carries `evidence:` (the C programs CI runs that call its anchor) or
+  a `gap:`. `capability_records.py --check` requires:
+  - a `supported` C cell to name evidence;
+  - each evidence file to be tracked, run by CI (a consumer program in
+    `examples/c/`, or a C skill example `examples.yaml` runs) and to
+    **call** the anchor, by the same call finder as C5b;
+  - a `partial` cell without evidence to state its gap.
+
+  Four self-test cases plant each defect. Result: 9 of 23 positive C cells
+  are backed by a running program. 13 dropped from `supported` to
+  `partial`: filter DSL, streams, gang-claim, org call, the three subnet
+  cells, MCP, CortEX folds, MeshDB, compute, Deck and Redis dedup. Each
+  states its gap, and names the Go cgo wrapper where one exists. The
+  membership-rejection cell was already `partial`. `coverage.md` gains a
+  generated C evidence table.
+- **The docs.**
+  - `include/README.md` and `sdk/c/headers-and-linking.md` list only
+    programs CI runs.
+  - `headers-and-linking.md` gains the Windows toolchains C5 ran
+    (`/MD`, `/MDd`, MinGW-w64 UCRT and MSVCRT) and why mixing C runtimes
+    is safe.
+  - `memory-and-threading.md` gains the library-buffer free functions and
+    the registered-release contract for callbacks.
+  - "Three memory rules" was true of the event bus only. It is corrected
+    in the quickstart, the README and the skill's `bindings/c.md`. The
+    skill's "no callback" line is also corrected: C has handler and
+    vtable callbacks.
+- **Not done here.** The plan's "snippets taken from code that runs" is
+  met for the examples tables, not for every prose snippet. The quickstart
+  snippet is already compile-checked by the snippet ratchet.
+- **The skill's C blob section** (`dataforts.md`, defect below) now
+  documents `net_blob_register_callback_adapter_owned`: its vtable, the
+  `free_buffer` release, and `ctx` ownership. `blob_callbacks.c` is the
+  running program behind it.
+- **CR-5 moved.** A Rust unit test pinned that `examples/capability.c`
+  did not include both `net.h` and `net.go.h`. The property is now a C1
+  lint rule over every consumer program (with a self-test), and the test
+  went with the file.
+
+**D2 ledger.** The eight pre-plan `examples/*.c` are deleted. None was
+built or run by CI, and `capability_aggregation.c` no longer compiled: it
+called three `net_meshnode_*` functions that no header declares. Per
+topic:
+
+| Stale file | API the headers provide | C-runtime evidence now | Documentation gap |
+| --- | --- | --- | --- |
+| `basic.c` | Event bus, `net.h` | `hello.c` and `observe.c` (skill examples, run) | none; the quickstart is compile-checked |
+| `transport.c` | Blob and directory transfer, `net_transport.h` | `transfer.c` (consumer, every lane); `objectstore.c` | none |
+| `capability.c` | Capability validation, predicate evaluate/trace, `net-where:` headers, debug-report aggregation, `net.go.h` | `registry.c` covers announce and discovery only | the stateless helpers (`net_validate_capabilities`, `net_predicate_*`) have no C caller; matrix: filter DSL `partial` |
+| `capability_aggregation.c` | Capability aggregation and capacity ranking, `net.go.h` | none | no C caller; the old example used removed functions |
+| `scheduler.c` | Task-lifecycle workflow (`net_cortex.h`) and gang-claim reserve/release (`net.go.h`) | none for either | matrix: gang-claim `partial` |
+| `meshdb.c` | MeshDB factory AST, runner, iterator, `net_meshdb.h` | none | matrix: MeshDB `partial` |
+| `meshos.c` | MeshOS daemon-author vtable, `net_meshos.h` | none | no matrix row of its own (compute/daemons `partial`) |
+| `deck.c` | Deck operator workflow, `net_deck.h` | none | matrix: Deck `partial` |
+
+Each retired topic stays named here and in `tests/c_abi/SURFACE.md`, whose
+per-function record shows its functions with no C caller. Deleting the
+files changed what is documented as run, not what is implemented.
+
 ### C7 (optional, D1(b)): the bundle as a release asset
 
 Attach the C0 bundle to GitHub releases for Linux x86_64 and Windows
@@ -1178,7 +1239,7 @@ Found by C1, stage 1:
   `.claude/skills/net-event-bus/dataforts.md:218` says no host-language
   adapter registration is exposed to C, but
   `net_blob_register_callback_adapter_owned` is declared in `net.go.h`
-  since #1165. Left for C6, which rebuilds the C docs.
+  since #1165. Fixed in C6.
 
 Known before C1 runs:
 

@@ -78,16 +78,27 @@ exceptions: `net_redis_dedup_t` is per-thread (one helper per consumer thread),
 and concurrent `net_shutdown` on the same handle is serialised rather than
 double-freeing.
 
-## Ownership — three rules
+## Ownership
 
 | You got it from | You free it with |
 |---|---|
 | `net_init()` | `net_shutdown()` |
 | `net_poll_ex()` | `net_free_poll_result()` |
 | `net_generate_keypair()` and similar string returns | `net_free_string()` |
+| A blob adapter or the blob registry: refs, fetched bytes | `net_blob_free_buffer(ptr, len)` |
+| Transfer (`net_transport.h`): `net_fetch_blob`, manifests | `net_transport_free_buffer(ptr, len)` |
+| An nRPC response / error string | `net_rpc_response_free(ptr, len)` / `net_rpc_free_cstring()` |
 
 `net_version()` returns a **static** string — do not free it.
 `net_free_poll_result` is idempotent and `NULL`-safe.
+
+Never `free()` a buffer the library returned. A buffer **your** callback
+returns (an nRPC or organization handler's response, a blob vtable's
+`fetch` result) comes back to you: through the deallocator you register with
+`net_rpc_set_callback_free` / `net_org_set_callback_free` before the
+dispatcher (which is refused without it), or through the vtable's
+`free_buffer`. Each buffer returns to the allocator that made it, so the
+program's C runtime does not matter.
 
 ## The buffer-capacity rule no compiler enforces
 
@@ -148,8 +159,10 @@ and no payments cdylib.
 
 ## Never infer from another binding
 
-- There is **no async anything**. No subscribe, no iterator, no callback.
-- Memory is yours to free, on the three rules above. Every other binding manages
+- The event bus has **no async anything**: no subscribe, no iterator. The
+  callbacks C does have (nRPC and organization handlers, blob adapter
+  vtables) follow the ownership rule above.
+- Memory is yours to free, on the rules above. Every other binding manages
   it for you.
 - A symbol existing in one header does not make it reachable from your
   translation unit — see the guard collision above.

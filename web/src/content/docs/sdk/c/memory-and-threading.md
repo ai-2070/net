@@ -1,16 +1,18 @@
 ---
 title: Memory and Threading
-description: Who owns what, the three free functions, the polling loop's cursor trap, and the safety guarantees the FFI boundary makes.
+description: Who frees each buffer (the library's and your callbacks'), the polling loop's cursor trap, and the safety guarantees the FFI boundary makes.
 ---
 
 # C — Memory and Threading
 
-The C ABI hands you memory and expects it back. There are exactly three
-ownership rules, one non-obvious trap in the polling loop, and a set of
-guarantees the boundary makes so that a mistake returns an error instead of
-corrupting your process.
+The C ABI hands you memory and expects it back. Each buffer goes back to the
+allocator that made it: the library's buffers through the free function its
+header names, and your buffers through the deallocator you register. There is
+one non-obvious trap in the polling loop, and a set of guarantees the
+boundary makes so that a mistake returns an error instead of corrupting your
+process.
 
-## The three rules
+## The event-bus rules
 
 | You got it from | You free it with |
 |---|---|
@@ -19,6 +21,46 @@ corrupting your process.
 | `net_generate_keypair()` and similar string returns | `net_free_string()` |
 
 `net_version()` returns a **static** string. Do not free it.
+
+## Buffers the library hands you
+
+Byte buffers carry their length, and go back with it, to the function the
+header names for them:
+
+| You got it from | You free it with |
+|---|---|
+| A blob adapter or the blob registry (`net_mesh_blob_adapter_*`, `net_blob_*`): refs, fetched bytes | `net_blob_free_buffer(ptr, len)` |
+| Transfer (`net_transport.h`): `net_fetch_blob`, directory manifests | `net_transport_free_buffer(ptr, len)` |
+| An nRPC response | `net_rpc_response_free(ptr, len)` |
+| An nRPC error string | `net_rpc_free_cstring(s)` |
+| A JSON result | `net_free_string(s)` |
+
+Never `free()` one of them. The library allocated it with its own allocator,
+and whether your C runtime's `free` happens to accept the pointer depends on
+your toolchain, not on anything Net promises. Every other surface's header
+names its own free functions in the same way.
+
+## Buffers your callbacks hand back
+
+When you implement a callback — an nRPC or organization handler, or a blob
+adapter's vtable — the response you return is memory **you** allocated. The
+library copies the bytes and gives the buffer back to you; it never frees it
+itself.
+
+- **nRPC handlers:** register the deallocator with
+  `net_rpc_set_callback_free` *before* `net_rpc_set_handler_dispatcher`.
+  Without it, the dispatcher registration returns `-1`, on every platform,
+  because the library would have no way to release your buffers.
+- **Organization handlers:** the same rule, with
+  `net_org_set_callback_free` before the org dispatchers.
+- **Blob callback adapters:** the vtable's `free_buffer` receives each
+  buffer your `fetch` returned, once the library has copied it.
+
+Free a buffer yourself after handing it over and you free it twice.
+
+Because each buffer returns to the allocator that made it, the program's C
+runtime does not matter. CI runs the C consumer programs built with MSVC
+`/MD` and `/MDd`, and with MinGW-w64 against both UCRT and MSVCRT.
 
 ## The cursor trap
 
@@ -84,7 +126,7 @@ net_redis_dedup_free(dedup);
 returns `1` for a duplicate the caller should skip, `0` for first sight. Also
 `net_redis_dedup_len`, `net_redis_dedup_capacity`, and `net_redis_dedup_free`.
 
-It follows the three rules above: you own the handle, `free` exactly once, and do
+It follows the event-bus rules above: you own the handle, `free` exactly once, and do
 not touch it afterwards. It is not internally synchronised — one handle per
 consumer thread, or your own lock around it.
 

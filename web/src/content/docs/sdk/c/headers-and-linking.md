@@ -179,13 +179,39 @@ Nothing there says the link succeeded and only the loader failed, so it is
 worth recognizing: exit 127 naming `net.dll` means the DLL is not on the
 search path, not that anything is wrong with your build.
 
+## Windows toolchains CI runs
+
+The C consumer programs are built and run on Windows with each of these, so
+any of them is a supported way to build against `net.dll`:
+
+| Toolchain | C runtime | Link |
+|---|---|---|
+| MSVC, `/MD` | UCRT | `net.dll.lib` |
+| MSVC, `/MDd` (debug) | debug UCRT | `net.dll.lib` |
+| MinGW-w64 (MSYS2 `ucrt64`) | UCRT | `net.dll` directly |
+| MinGW-w64 (MSYS2 `mingw64`) | MSVCRT | `net.dll` directly |
+
+Mixing C runtimes with `net.dll` is safe because no buffer crosses from one
+allocator to another: the library's buffers go back through its own free
+functions, and your callbacks' buffers through the deallocator you register.
+See [Memory and Threading](/docs/sdk/c/memory-and-threading#buffers-your-callbacks-hand-back).
+
 ## Examples in the repo
+
+Every program here is built and run by CI against the C SDK bundle, using
+only what this page describes: headers by name, and `-lnet`.
 
 | File | What it shows |
 |---|---|
-| `include/examples/basic.c` | The event-bus quickstart loop |
-| `include/examples/capability.c` | Stateless capability, predicate and where-header helpers |
-| `include/examples/meshdb.c` | MeshDB factory AST, runner, iterator, sentinel-envelope decoder |
+| `.claude/skills/net-event-bus/examples/hello.c` | The event-bus quickstart loop |
+| `net/crates/net/examples/c/lifecycle.c` | A mesh node's lifecycle: new, handshake, start, shutdown, free |
+| `net/crates/net/examples/c/transfer.c` | Blob and directory transfer between two nodes |
+| `net/crates/net/examples/c/tree_range.c` | Tree blobs, Reed-Solomon encoding and range reads |
+| `net/crates/net/examples/c/blob_callbacks.c` | A blob adapter written in C |
+| `net/crates/net/examples/c/rpc_callbacks.c` | nRPC handlers written in C |
+
+The other skill examples (`.claude/skills/net-event-bus/examples/*.c`) cover
+capabilities, channels, RedEX and organization streaming.
 
 ## Next
 

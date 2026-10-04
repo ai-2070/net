@@ -712,7 +712,10 @@ _EXTERN_NET = re.compile(r"^[ \t]*extern\b[^;]*\bnet_\w+", re.M)
 def lint_consumer_sources(root: Path = EXAMPLES_C) -> list[Finding]:
     """The consumer programs must test the shipped headers, not their own
     copies of them: a Net header is included by name only (resolved through
-    `-I bundle/include`), and no file declares a net_* function itself."""
+    `-I bundle/include`), and no file declares a net_* function itself.
+    Nor does one file include both `net.h` and `net.go.h`: they share the
+    `NET_SDK_H` guard, so the second is silently skipped and its functions
+    become implicit declarations (formerly CR-5, pinned on one example)."""
     findings = []
     for f in sorted(root.rglob("*.c")) + sorted(root.rglob("*.h")):
         text = M._COMMENT.sub(" ", f.read_text(encoding="utf-8"))
@@ -723,6 +726,11 @@ def lint_consumer_sources(root: Path = EXAMPLES_C) -> list[Finding]:
             if Path(inc).name.startswith("net") and ("/" in inc or "\\" in inc):
                 findings.append(Finding("lint", f"{rel}:{inc}",
                     f"{rel} includes {inc} by path; include Net headers by name only"))
+        names = {Path(m.group(1)).name for m in _INCLUDE.finditer(text)}
+        if {"net.h", "net.go.h"} <= names:
+            findings.append(Finding("lint", f"{rel}:NET_SDK_H",
+                f"{rel} includes both net.h and net.go.h; they share the NET_SDK_H guard, so the "
+                "second is skipped and its functions are implicitly declared. Split the translation unit"))
         for m in _NET_PROTO.finditer(text):
             findings.append(Finding("lint", f"{rel}:{m.group(1)}",
                 f"{rel} declares {m.group(1)} itself; use the shipped header's declaration"))
@@ -1008,6 +1016,7 @@ def self_test() -> int:
             ("a Net header included by path", '#include "../include/net.h"\n', "by path"),
             ("a program declaring a net_* function", "int net_mesh_start(void* h);\n", "declares net_mesh_start"),
             ("an extern declaration of a Net symbol", "extern int net_secret;\n", "extern declaration"),
+            ("both NET_SDK_H headers in one file", '#include "net.h"\n#include "net.go.h"\n', "includes both"),
         ]:
             (lint_root / "bad.c").write_text(body, encoding="utf-8")
             got = lint_consumer_sources(lint_root)

@@ -85,11 +85,16 @@ loop is in the C header's `README.md`.
 This program compiles clean under `-std=c11 -Wall -Wextra -Werror`, and CI checks
 that on every commit.
 
-## The three memory rules
+## The event-bus memory rules
 
-The header states them, and they're the whole discipline of the C ABI:
+The header states them, and they're all this program needs:
 
 - Handles from `net_init()` are freed with **`net_shutdown()`**.
 - Poll results from `net_poll_ex()` are freed with **`net_free_poll_result()`**.
 - Strings from `net_generate_keypair()` (and similar) are freed with
   **`net_free_string()`**.
+
+The other surfaces follow the same principle, with their own free functions.
+Blob and transfer buffers, nRPC responses, and the buffers your own callbacks
+hand back are covered in
+[Memory and Threading](/docs/sdk/c/memory-and-threading#buffers-the-library-hands-you).
