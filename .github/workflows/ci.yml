@@ -5396,6 +5396,22 @@ jobs:
           "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler msvc --debug-crt --arming
           "$PY" .github/scripts/run-c-consumers.py --bundle "$HELPER_BUNDLE" --compiler msvc --debug-crt
 
+      # C5, the Windows Application Verifier lane: every consumer program,
+      # built /MD, run under full PageHeap with the Handles, Locks and Memory
+      # checks, which cover the program and the release net.dll in the same
+      # process. appverif needs an elevated process (runners are), and its
+      # settings are machine-wide per image name, so the runner sets them per
+      # run and always removes them. A run with no exported verifier log
+      # fails, so a lane that silently did not verify cannot pass. Not
+      # claimed: leaks (no Leak layer). Arming: a double release of a
+      # net_fetch_blob buffer, and a program free() of a callback buffer the
+      # library already released, each caught as a heap stop.
+      - name: Consumers — Application Verifier lane (full PageHeap)
+        if: runner.os == 'Windows'
+        run: |
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler msvc --appverif --arming --timeout 600
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$HELPER_BUNDLE" --compiler msvc --appverif --timeout 600
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

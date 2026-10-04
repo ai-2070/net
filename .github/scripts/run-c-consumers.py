@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import os
 import re
 import shutil
@@ -85,7 +86,9 @@ SANITIZER_RE = re.compile(
     r"^(?:==\d+==)?ERROR: (?:AddressSanitizer|LeakSanitizer)[^\n]*|^[^\n]*runtime error:[^\n]*"
     # The MSVC debug CRT (the /MDd lane): its leak dump and heap reports.
     r"|^Detected memory leaks![^\n]*|^[^\n]*HEAP CORRUPTION DETECTED[^\n]*"
-    r"|^[^\n]*_CrtIsValidHeapPointer[^\n]*",
+    r"|^[^\n]*_CrtIsValidHeapPointer[^\n]*"
+    # Application Verifier stops, as run_verified() renders them from its log.
+    r"|^APPVERIFIER STOP [^\n]*",
     re.M,
 )
 # LSan's `print_suppressions=1` table: `   <count>   <bytes> <template>`.
@@ -392,6 +395,9 @@ def classify(stdout: str, rc: int, expected_lib: Path, expected_sha: str, hash_o
     actual = hash_of(Path(module))
     if actual != expected_sha:
         return Verdict("identity", f"{module} SHA-256 {actual[:12]}… != PROVENANCE {expected_sha[:12]}…", module, 0, calls)
+    noverif = re.search(r"^NET-APPVERIF-ERROR: (.+?)\s*$", stdout, re.M)
+    if noverif:
+        return Verdict("failed", noverif.group(1), module, 0, calls)
     san = SANITIZER_RE.search(stdout)
     if san:
         return Verdict("sanitizer", san.group(0).strip(), module, 0, calls)
@@ -413,6 +419,69 @@ def run_exe(exe: Path, env: dict[str, str], timeout: int) -> tuple[int, str]:
         out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
         return 124, out + f"\n(timed out after {timeout}s)\n"
     return p.returncode, p.stdout + p.stderr
+
+
+APPVERIF = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "appverif.exe"
+# Full PageHeap plus the handle, lock and virtual-memory checks. Not the Leak
+# layer: the lane claims no leak result (the plan's lane table).
+APPVERIF_LAYERS = ["Heaps", "Handles", "Locks", "Memory"]
+AVRF_ENTRY_RE = re.compile(r"<avrf:logEntry\b([^>]*)>(.*?)</avrf:logEntry>", re.S)
+AVRF_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+AVRF_MSG_RE = re.compile(r"<avrf:message>(.*?)</avrf:message>", re.S)
+
+
+def appverif_stops(xml: str) -> list[str]:
+    """One line per error-severity entry of an exported verifier log."""
+    stops = []
+    for m in AVRF_ENTRY_RE.finditer(xml):
+        a = dict(AVRF_ATTR_RE.findall(m.group(1)))
+        if a.get("Severity", "Error") != "Error":
+            continue
+        msg = AVRF_MSG_RE.search(m.group(2))
+        text = html.unescape(msg.group(1).strip()) if msg else ""
+        stops.append(f"APPVERIFIER STOP {a.get('StopCode', '?')} ({a.get('LayerName', '?')}): {text}")
+    return stops
+
+
+def _appverif(*argv: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run([str(APPVERIF), *argv], capture_output=True, text=True)
+    except OSError as e:  # WinError 740: appverif.exe requires elevation
+        raise SystemExit(f"FAIL  {APPVERIF.name} could not start ({e}); the --appverif lane needs an "
+                         "elevated process (CI runners are; a developer shell usually is not)")
+
+
+def run_verified(exe: Path, env: dict[str, str], timeout: int) -> tuple[int, str]:
+    """run_exe under Application Verifier. Its settings are per image name
+    and machine-wide (they need an elevated process), so they are set for
+    this one run and always removed. The exported log is the proof the
+    verifier was active: a run without one fails, so a lane that silently
+    did not verify cannot pass. Each error entry is appended to the output
+    as an `APPVERIFIER STOP` line, which classify() treats as a checker
+    report."""
+    name = exe.name
+    _appverif("-delete", "logs", "-for", name)
+    en = _appverif("-enable", *APPVERIF_LAYERS, "-for", name, "-with", "Heaps.Full=true")
+    if en.returncode != 0:
+        return 1, f"appverif -enable failed (exit {en.returncode}):\n{en.stdout}{en.stderr}"
+    try:
+        rc, out = run_exe(exe, env, timeout)
+        log = exe.with_suffix(".avrf.xml")
+        log.unlink(missing_ok=True)
+        ex = _appverif("-export", "log", "-for", name, "-with", f"To={log}")
+    finally:
+        _appverif("-disable", "*", "-for", name)
+    if not log.is_file() or "avrf:" not in log.read_text(encoding="utf-8", errors="replace"):
+        return (rc or 1), out + (f"\nNET-APPVERIF-ERROR: no verifier log for {name}, so it did not run "
+                                 f"(export exit {ex.returncode}: {(ex.stdout + ex.stderr).strip()[:300]})\n")
+    stops = appverif_stops(log.read_text(encoding="utf-8", errors="replace"))
+    return rc, out + "".join(f"\n{line}" for line in stops) + (f"\n(verifier log: {log})\n")
+
+
+def execute(args, exe: Path, env: dict[str, str]) -> tuple[int, str]:
+    if getattr(args, "appverif", False):
+        return run_verified(exe, env, args.timeout)
+    return run_exe(exe, env, args.timeout)
 
 
 def refuse_strays(bundle: Bundle, env: dict[str, str], app_dir: Path) -> None:
@@ -484,7 +553,7 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
                 continue
         env = child_env(bundle, sanitizer_env() if args.sanitize else None)
         refuse_strays(bundle, env, exe.parent)
-        rc, out = run_exe(exe, env, args.timeout)
+        rc, out = execute(args, exe, env)
         v = classify(out, rc, bundle.library, bundle.sha256)
         if args.sanitize and v.kind == "sanitizer" and "LeakSanitizer" in v.reason                 and "AddressSanitizer" not in out and "runtime error:" not in out:
             lines, bad = judge_leaks(name, parse_leaks(out), load_lsan_policy())
@@ -511,13 +580,22 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
     return failures
 
 
-EXPECT_RE = re.compile(r"NET-EXPECT:\s*(.+?)\s*$", re.M)
-LANE_RE = re.compile(r"NET-LANE:\s*([\w-]+)")
+EXPECT_RE = re.compile(r"NET-EXPECT(?:\(([\w-]+)\))?:\s*(.+?)\s*$", re.M)
+LANE_RE = re.compile(r"NET-LANE:\s*([\w -]+?)\s*$", re.M)
 
 
-def lane_of(src: Path) -> str:
-    m = LANE_RE.search(src.read_text(encoding="utf-8")[:4000])
-    return m.group(1) if m else "sanitize"
+def lanes_of(text: str) -> list[str]:
+    """`NET-LANE: sanitize appverif`: the lanes a program arms."""
+    m = LANE_RE.search(text[:4000])
+    return m.group(1).split() if m else ["sanitize"]
+
+
+def expects_for(text: str, lane: str) -> list[str]:
+    """`NET-EXPECT(<lane>): <regex>` lines for this lane if it has any,
+    else the plain `NET-EXPECT: <regex>` lines."""
+    found = EXPECT_RE.findall(text[:4000])
+    own = [e for ln, e in found if ln == lane]
+    return own or [e for ln, e in found if not ln]
 
 
 def arming_runs(args, bundle: Bundle, compiler: str, work: Path) -> int:
@@ -527,26 +605,28 @@ def arming_runs(args, bundle: Bundle, compiler: str, work: Path) -> int:
     its header; a crash during setup, a failed check, or a sanitizer report
     about something else does not count."""
     failures = 0
-    lane = "debug-crt" if args.debug_crt else "sanitize"
-    programs = [p for p in sorted(ARMING.glob("*.c")) if lane_of(p) == lane]
+    lane = "debug-crt" if args.debug_crt else "appverif" if args.appverif else "sanitize"
+    programs = [p for p in sorted(ARMING.glob("*.c")) if lane in lanes_of(p.read_text(encoding="utf-8"))]
     if not programs:
         print(f"✗ no {lane} arming programs in {ARMING}")
         return 1
     for src in programs:
-        expects = EXPECT_RE.findall(src.read_text(encoding="utf-8")[:4000])
+        expects = expects_for(src.read_text(encoding="utf-8"), lane)
         if not expects:
             print(f"✗ arming {src.stem}: no NET-EXPECT line")
             failures += 1
             continue
         exe = compile_program(compiler, bundle, src, work / "arming" / src.stem,
-                              sanitize=not args.debug_crt, debug_crt=args.debug_crt)
-        rc, out = run_exe(exe, child_env(bundle, None if args.debug_crt else sanitizer_env()), args.timeout)
+                              sanitize=lane == "sanitize", debug_crt=args.debug_crt)
+        rc, out = execute(args, exe, child_env(bundle, sanitizer_env() if lane == "sanitize" else None))
         v = classify(out, rc, bundle.library, bundle.sha256)
         missing = [e for e in expects if not re.search(e, out)]
         # ASan/LSan exit non-zero (exitcode=23). The debug CRT dumps leaks at
-        # exit without touching the status, so there the failing result is
-        # the runner's sanitizer verdict alone, which fails any normal run.
-        exit_ok = rc != 0 or args.debug_crt
+        # exit without touching the status, and a verifier stop's exit status
+        # depends on whether a debugger is attached, so in those lanes the
+        # failing result is the runner's checker verdict alone, which fails
+        # any normal run.
+        exit_ok = rc != 0 or lane != "sanitize"
         if exit_ok and v.kind == "sanitizer" and not missing:
             print(f"  ▶ arming {src.stem}: caught — {v.reason[:110]}")
         else:
@@ -708,6 +788,26 @@ def self_test() -> int:
         print(f"{'✓' if ok else '✗'} self-test: a program without a floor, and a floor without a program, are refused")
         failures += 0 if ok else 1
 
+        xml = ('<?xml version="1.0"?><avrf:logfile xmlns:avrf="Application Verifier"><avrf:logSession>'
+               '<avrf:logEntry Time="t" LayerName="Heaps" StopCode="0x7" Severity="Error">'
+               '<avrf:message>Heap block already freed &amp; reused.</avrf:message></avrf:logEntry>'
+               '<avrf:logEntry Time="t" LayerName="Handles" StopCode="0x300" Severity="Warning">'
+               '<avrf:message>w</avrf:message></avrf:logEntry></avrf:logSession></avrf:logfile>')
+        stops = appverif_stops(xml)
+        ok = stops == ["APPVERIFIER STOP 0x7 (Heaps): Heap block already freed & reused."]
+        print(f"{'✓' if ok else '✗'} self-test: verifier log errors become stop lines; warnings do not")
+        failures += 0 if ok else 1
+        case("a verifier stop is a checker report",
+             classify(f"NET-LOADED-MODULE: {good}\nok a\nNET-CHECKS: 1\n{stops[0]}\n", 0, good, gsha), "sanitizer")
+        case("a run the verifier did not see fails",
+             classify(f"NET-LOADED-MODULE: {good}\nok a\nNET-CHECKS: 1\nNET-APPVERIF-ERROR: no log\n", 0, good, gsha),
+             "failed", mention="no log")
+        text = "NET-LANE: sanitize appverif\nNET-EXPECT: ASan text\nNET-EXPECT(appverif): APPVERIFIER STOP\n"
+        ok = (lanes_of(text) == ["sanitize", "appverif"] and expects_for(text, "sanitize") == ["ASan text"]
+              and expects_for(text, "appverif") == ["APPVERIFIER STOP"] and lanes_of("x") == ["sanitize"])
+        print(f"{'✓' if ok else '✗'} self-test: a program arms several lanes, each with its own expectation")
+        failures += 0 if ok else 1
+
         cases = [({"kernel32.dll", "api-ms-win-crt-heap-l1-1-0.dll"}, "ucrt"), ({"msvcrt.dll"}, "msvcrt"),
                  ({"msvcrt.dll", "ucrtbase.dll"}, "both"), ({"kernel32.dll"}, "none")]
         ok = all(crt_of(d) == want for d, want in cases)
@@ -738,6 +838,9 @@ def main() -> int:
     ap.add_argument("--debug-crt", action="store_true",
                     help="C5 Windows lane: MSVC /MDd and the debug CRT's leak and heap checks "
                     "(this program's own heap only)")
+    ap.add_argument("--appverif", action="store_true",
+                    help="C5 Windows lane: MSVC /MD under Application Verifier (full PageHeap, Handles, "
+                    "Locks, Memory) on the program and the release net.dll; needs an elevated process")
     ap.add_argument("--expect-crt", choices=["ucrt", "msvcrt"],
                     help="MinGW lanes: require every program to import this C runtime (proves the toolchain)")
     ap.add_argument("--arming", action="store_true",
@@ -765,6 +868,13 @@ def main() -> int:
         work = work.parent / (work.name + "-sanitize")
     if args.debug_crt:
         work = work.parent / (work.name + "-debugcrt")
+    if args.appverif:
+        if not IS_WINDOWS or compiler != "msvc":
+            ap.error("--appverif is the Windows MSVC lane")
+        if not APPVERIF.is_file():
+            print(f"✗ {APPVERIF} not found")
+            return 1
+        work = work.parent / (work.name + "-appverif")
     failures = run_programs(args, bundle, compiler, work)
     if args.arming:
         failures += arming_runs(args, bundle, compiler, work)

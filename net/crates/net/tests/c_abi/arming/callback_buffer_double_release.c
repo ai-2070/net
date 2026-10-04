@@ -1,17 +1,21 @@
 /*
- * Arming negative for the Linux sanitizer lane (C SDK plan, C5): a buffer a
- * C CALLBACK handed to the library is released by the library through the
- * callback's free_buffer, and then freed again by the program. Not a consumer
- * program; run only by run-c-consumers.py --arming, which requires it to be
- * caught.
+ * Arming negative for the Linux sanitizer and Windows Application Verifier
+ * lanes (C SDK plan, C5): a buffer a C CALLBACK handed to the library is
+ * released by the library through the callback's free_buffer, and then freed
+ * again by the program. Not a consumer program; run only by
+ * run-c-consumers.py --arming, which requires it to be caught.
  *
- * NET-LANE: sanitize
+ * NET-LANE: sanitize appverif
  * NET-EXPECT: ERROR: AddressSanitizer: attempting double-free
+ * NET-EXPECT(appverif): ^APPVERIFIER STOP \S+ \(Heaps\)
  *
  * The callback adapter's fetch returns a malloc'd buffer and also keeps a
  * pointer to it. net_blob_resolve copies the bytes and hands the buffer back
  * to free_buffer, which frees it (correctly). The program then frees the kept
  * pointer itself: the consumer-owned side of the release contract, broken.
+ *
+ * In the Windows Application Verifier lane the program's free() reaches
+ * HeapFree on a block the library already released, which is a heap stop.
  */
 
 #include <stdlib.h>

@@ -1,16 +1,20 @@
 /*
- * Arming negative for the Linux sanitizer lane (C SDK plan, C5): a buffer
- * libnet returned is released twice through its own free function. Not a
- * consumer program; run only by run-c-consumers.py --arming, which requires
- * it to be caught.
+ * Arming negative for the Linux sanitizer and Windows Application Verifier
+ * lanes (C SDK plan, C5): a buffer libnet returned is released twice
+ * through its own free function. Not a consumer program; run only by
+ * run-c-consumers.py --arming, which requires it to be caught.
  *
- * NET-LANE: sanitize
+ * NET-LANE: sanitize appverif
  * NET-EXPECT: ERROR: AddressSanitizer: attempting double-free
+ * NET-EXPECT(appverif): ^APPVERIFIER STOP \S+ \(Heaps\)
  *
  * A real net_fetch_blob output is passed to net_transport_free_buffer twice
  * (net_transport.h: "Do not call twice on the same pointer"). The second
  * release reaches the system allocator inside the uninstrumented library,
  * which ASan intercepts.
+ *
+ * In the Windows Application Verifier lane the same second release reaches
+ * HeapFree on a block full PageHeap has already freed, which is a heap stop.
  */
 
 #include <string.h>

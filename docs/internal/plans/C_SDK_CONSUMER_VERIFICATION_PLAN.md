@@ -916,7 +916,7 @@ domain it can see, and claims nothing outside that domain.
 | Lane | Checker | Domain it can see | Not claimed |
 | --- | --- | --- | --- |
 | Linux | ASan + UBSan on the C program, LSan | consumer memory access; library-returned buffers, through the intercepted system allocator Rust uses | accesses inside Rust code, which isn't instrumented |
-| Windows | Application Verifier with full PageHeap, on the consumer and the release `net.dll` | heap corruption and wrong-heap frees across the module boundary | leaks |
+| Windows | Application Verifier with full PageHeap, on the consumer and the release `net.dll` | heap corruption and double frees across the module boundary (wrong-heap frees only where the heaps differ; see C5's status) | leaks |
 | Windows | consumer built `/MDd`, `_CrtSetDbgFlag` leak and heap checks | the consumer's own CRT allocations | anything the release DLL allocates |
 
 `_CrtSetDbgFlag` is compiled out without `_DEBUG`, which `/MD` doesn't
@@ -955,9 +955,8 @@ it does.
 - Clean runs in each checker lane, within its stated domain.
 - Each arming negative fails with its named diagnostic.
 
-**Status: three of four lanes built (2026-10-04).** Application Verifier is
-still to come: it needs an elevated process, so it cannot run on the dev
-box and will be iterated through CI.
+**Status: all four lanes built (2026-10-04).** The Application Verifier
+lane needs an elevated process, so it is proved in CI, not on the dev box.
 - **Linux sanitizer lane (`--sanitize`).** Every program again, built with
   ASan and UBSan with no error recovery, and LeakSanitizer at exit, against
   the uninstrumented `libnet.so`.
@@ -1002,6 +1001,27 @@ box and will be iterated through CI.
   binary's import table and fails a lane whose binaries do not link the
   runtime it claims. Locally, the UCRT gcc passes as `ucrt` and is refused
   as `msvcrt`. The MSVCRT lane is measured, not predicted.
+- **Application Verifier lane (`--appverif`, MSVC `/MD`).**
+  - **What it does:** each program runs with full PageHeap and the
+    Handles, Locks and Memory layers (not Leak: the lane claims no leak
+    result). The settings are per image name and machine-wide, so the
+    runner enables them for one run and always removes them. It exports
+    the verifier's log, and a run with no log fails, so a run that
+    silently was not verified cannot pass. Each error entry becomes an
+    `APPVERIFIER STOP` line, a checker report.
+  - **Arming:** `double_free_fetch_blob.c` and
+    `callback_buffer_double_release.c` arm this lane as well as the
+    sanitizer lane (`NET-LANE: sanitize appverif`, with a per-lane
+    `NET-EXPECT(appverif):`). Each must produce a heap stop.
+  - **Correction to the lane table: no wrong-heap claim between the
+    release UCRT and `net.dll`.** Measured: with `/MD`, the UCRT's
+    `_get_heap_handle()` is the process heap, and Rust's `System`
+    allocator on Windows also allocates from `GetProcessHeap()`. So a
+    program that `free()`s a library buffer frees it on the heap that
+    made it. That is a contract breach (the headers name the free
+    function), but no heap check can see it, and this lane does not claim
+    it. A real cross-heap free (a `/MDd` program, or a static CRT with its
+    own heap) remains a stop the verifier can report.
 
 ### C5b: unexercised surfaces (record only)
 
