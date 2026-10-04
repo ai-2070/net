@@ -988,18 +988,30 @@ pub unsafe extern "C" fn net_meshdb_free_string(s: *mut std::ffi::c_char) {
     })
 }
 
+/// The envelopes carry no type tag, so the decoder tries each type in turn,
+/// and a type counts only if it consumes EVERY byte. `postcard::from_bytes`
+/// accepts any valid prefix and ignores the rest, which let a window
+/// boundary whose bytes began like an aggregate (`start = 0`, a one-row
+/// bucket) decode as an `avg` aggregate with a denormal garbage value. The
+/// C consumer meshdb.c found it.
 fn decode_to_json(bytes: &[u8]) -> Option<String> {
     use net::adapter::net::behavior::meshdb::query::{
         AggregateRowPayload, JoinedRowPayload, WindowBoundary,
     };
-    if let Ok(p) = postcard::from_bytes::<AggregateRowPayload>(bytes) {
-        return Some(aggregate_to_json(&p));
+    if let Ok((p, rest)) = postcard::take_from_bytes::<AggregateRowPayload>(bytes) {
+        if rest.is_empty() {
+            return Some(aggregate_to_json(&p));
+        }
     }
-    if let Ok(p) = postcard::from_bytes::<JoinedRowPayload>(bytes) {
-        return Some(joined_to_json(&p));
+    if let Ok((p, rest)) = postcard::take_from_bytes::<JoinedRowPayload>(bytes) {
+        if rest.is_empty() {
+            return Some(joined_to_json(&p));
+        }
     }
-    if let Ok(p) = postcard::from_bytes::<WindowBoundary>(bytes) {
-        return Some(window_to_json(&p));
+    if let Ok((p, rest)) = postcard::take_from_bytes::<WindowBoundary>(bytes) {
+        if rest.is_empty() {
+            return Some(window_to_json(&p));
+        }
     }
     None
 }
@@ -1873,6 +1885,38 @@ mod tests {
             net_meshdb_runner_free(runner);
             net_meshdb_reader_free(reader);
         }
+    }
+
+    /// A one-row bucket starting at seq 0 is a valid PREFIX of an
+    /// `AggregateRowPayload`; the decoder used to take the first type that
+    /// parsed a prefix and reported this window as an `avg` aggregate with
+    /// a denormal value (found by the C consumer meshdb.c). Every envelope
+    /// type must consume the whole payload.
+    #[test]
+    fn a_window_that_prefixes_as_an_aggregate_decodes_as_a_window() {
+        use net::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, ResultRow, SeqNum, WindowBoundary,
+        };
+        let boundary = WindowBoundary {
+            start: SeqNum(0),
+            end: SeqNum(2),
+            rows: vec![ResultRow {
+                origin: 0xAB,
+                seq: SeqNum(1),
+                payload: br#"{"v":10}"#.to_vec(),
+            }],
+        };
+        let bytes = postcard::to_allocvec(&boundary).unwrap();
+        // The precondition that made the old decoder wrong.
+        assert!(
+            postcard::from_bytes::<AggregateRowPayload>(&bytes).is_ok(),
+            "this payload must still prefix-parse as an aggregate, or the test proves nothing"
+        );
+        let json = decode_to_json(&bytes).expect("a window boundary decodes");
+        assert!(
+            json.starts_with(r#"{"kind":"window","start":0,"end":2,"#),
+            "got: {json}"
+        );
     }
 
     #[test]

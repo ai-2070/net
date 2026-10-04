@@ -546,9 +546,10 @@ operations:
       status: supported
       anchor: MeshDB
     C:
-      status: partial
+      status: supported
       anchor: net_meshdb_decode_payload_json
-      gap: 'No C program CI runs calls it; its C evidence is the C1 header audit only.'
+      evidence:
+      - net/crates/net/examples/c/meshdb.c
 - operation: Compute / groups / daemons
   bindings:
     Rust:

@@ -15,7 +15,7 @@ both.
 | `net_cortex.h` | 92 | 2 | 8 |
 | `net_deck.h` | 84 | 0 | 0 |
 | `net_mcp.h` | 22 | 20 | 20 |
-| `net_meshdb.h` | 27 | 0 | 0 |
+| `net_meshdb.h` | 27 | 24 | 24 |
 | `net_meshos.h` | 23 | 0 | 0 |
 | `net_org.h` | 30 | 0 | 15 |
 | `net_rpc.h` | 70 | 10 | 17 |
@@ -509,32 +509,32 @@ both.
 | Function | Consumers | Arming | Skill examples |
 | --- | --- | --- | --- |
 | `net_meshdb_clear_last_error` | – | – | – |
-| `net_meshdb_decode_payload_json` | – | – | – |
-| `net_meshdb_free_string` | – | – | – |
-| `net_meshdb_iter_free` | – | – | – |
-| `net_meshdb_iter_next` | – | – | – |
+| `net_meshdb_decode_payload_json` | meshdb | – | – |
+| `net_meshdb_free_string` | meshdb | – | – |
+| `net_meshdb_iter_free` | meshdb | – | – |
+| `net_meshdb_iter_next` | meshdb | – | – |
 | `net_meshdb_last_error_kind` | – | – | – |
 | `net_meshdb_last_error_message` | – | – | – |
-| `net_meshdb_payload_free` | – | – | – |
-| `net_meshdb_query_at` | – | – | – |
-| `net_meshdb_query_between` | – | – | – |
-| `net_meshdb_query_count` | – | – | – |
-| `net_meshdb_query_filter_json` | – | – | – |
-| `net_meshdb_query_free` | – | – | – |
-| `net_meshdb_query_join` | – | – | – |
-| `net_meshdb_query_latest` | – | – | – |
-| `net_meshdb_query_lineage_emit` | – | – | – |
-| `net_meshdb_query_numeric_agg` | – | – | – |
-| `net_meshdb_query_percentile` | – | – | – |
-| `net_meshdb_query_window` | – | – | – |
-| `net_meshdb_reader_append` | – | – | – |
-| `net_meshdb_reader_free` | – | – | – |
-| `net_meshdb_reader_new` | – | – | – |
-| `net_meshdb_runner_execute` | – | – | – |
-| `net_meshdb_runner_execute_with` | – | – | – |
-| `net_meshdb_runner_free` | – | – | – |
-| `net_meshdb_runner_new` | – | – | – |
-| `net_meshdb_runner_new_cached` | – | – | – |
+| `net_meshdb_payload_free` | meshdb | – | – |
+| `net_meshdb_query_at` | meshdb | – | – |
+| `net_meshdb_query_between` | meshdb | – | – |
+| `net_meshdb_query_count` | meshdb | – | – |
+| `net_meshdb_query_filter_json` | meshdb | – | – |
+| `net_meshdb_query_free` | meshdb | – | – |
+| `net_meshdb_query_join` | meshdb | – | – |
+| `net_meshdb_query_latest` | meshdb | – | – |
+| `net_meshdb_query_lineage_emit` | meshdb | – | – |
+| `net_meshdb_query_numeric_agg` | meshdb | – | – |
+| `net_meshdb_query_percentile` | meshdb | – | – |
+| `net_meshdb_query_window` | meshdb | – | – |
+| `net_meshdb_reader_append` | meshdb | – | – |
+| `net_meshdb_reader_free` | meshdb | – | – |
+| `net_meshdb_reader_new` | meshdb | – | – |
+| `net_meshdb_runner_execute` | meshdb | – | – |
+| `net_meshdb_runner_execute_with` | meshdb | – | – |
+| `net_meshdb_runner_free` | meshdb | – | – |
+| `net_meshdb_runner_new` | meshdb | – | – |
+| `net_meshdb_runner_new_cached` | meshdb | – | – |
 
 ## `net_meshos.h`
 

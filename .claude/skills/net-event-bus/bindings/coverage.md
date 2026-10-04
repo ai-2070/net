@@ -106,7 +106,7 @@ A mode is written after the status: `supported · core-only`.
 | Dataforts — blobs | supported | supported | supported | supported | supported |
 | RedEX — durable log | supported | supported | supported | supported | supported |
 | CortEX folds / NetDB | supported | supported | supported | supported | partial |
-| MeshDB — federated queries | supported | supported | supported | supported | partial |
+| MeshDB — federated queries | supported | supported | supported | supported | supported |
 | Compute / groups / daemons | supported | supported | supported | supported | partial |
 | Deck — operator surface | supported | supported | supported | supported | partial |
 | Redis Streams dedup | supported | supported | supported · core-only | supported | supported |
@@ -187,7 +187,7 @@ per-function record behind this is `net/crates/net/tests/c_abi/SURFACE.md`.
 | Dataforts — blobs | supported | `transfer.c`, `objectstore.c` | — |
 | RedEX — durable log | supported | `eventlog.c`, `jobqueue.c` | — |
 | CortEX folds / NetDB | partial | — | No C program CI runs calls it (Go reaches it through go/aggregator.go). |
-| MeshDB — federated queries | partial | — | No C program CI runs calls it; its C evidence is the C1 header audit only. |
+| MeshDB — federated queries | supported | `meshdb.c` | — |
 | Compute / groups / daemons | partial | — | No C program CI runs calls it (Go reaches it through go/groups.go). |
 | Deck — operator surface | partial | — | No C program CI runs calls it (Go reaches it through go/deck.go). |
 | Redis Streams dedup | supported | `redis_dedup.c` | — |

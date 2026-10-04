@@ -1249,6 +1249,26 @@ Found by C5:
       leaking clone is reintroduced.
     - `lsan_policy.toml` no longer accepts any indirect leak.
 
+Found by the C6 follow-up programs:
+
+- **D-C6-1 (fixed): `net_meshdb_decode_payload_json` misread a window as
+  an aggregate.** The sentinel envelopes carry no type tag, so the decoder
+  tries Aggregate, Joined and Window in turn and took the first that
+  parsed. `postcard::from_bytes` accepts any valid prefix, and a one-row
+  window bucket starting at seq 0 prefix-parses as an Aggregate. `meshdb.c`
+  saw it as `{"kind":"aggregate", ... "avg", "value":1.1e-310}` for the
+  bucket [0, 2). C and Go use this decoder; Python and Node decode by an
+  explicitly chosen type and were not affected.
+  - Fix: each type counts only if it consumes every byte
+    (`postcard::take_from_bytes` with an empty remainder).
+  - Witness: `a_window_that_prefixes_as_an_aggregate_decodes_as_a_window`
+    in `net-meshdb-ffi`, which asserts its own precondition (the payload
+    still prefix-parses as an aggregate), and `meshdb.c`'s per-bucket
+    checks.
+  - Not fixed: a payload that exactly parses as two envelope types would
+    still be ambiguous. The cure is a tagged envelope or typed C decoders,
+    an ABI change.
+
 Found by C1, stage 1:
 
 - **`net.go.h` failed to compile under `-Wall -Werror`.** A doc comment

@@ -499,7 +499,7 @@
     "MeshDB — federated queries": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
           "status": "supported"
