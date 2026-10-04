@@ -631,6 +631,15 @@ changes to the real headers.
   - the ten blob/mesh value overlaps;
   - one reserved name.
 
+- **A regression this slice caused, and fixed:** stage 2 declared
+  `NET_REGISTRY_ERR_*` 8–11 in `net.h` without updating
+  `tests/error_kind_mirror.rs`, which keeps its own table of that band and
+  rejects an unknown `#define`. CI's net-core integration job caught it.
+  The table, and the kebab-case names the bindings already raise
+  (`unknown-group`, `scale-rejected`, `scale-not-supported`,
+  `unauthorized`), now include them. No other test that reads the headers
+  rejects additions: the transport, nRPC and `NetError` header tests, and
+  the Go parity tests.
 - **Unrelated CI flakes seen on this branch:**
   `mesh_rpc_hedge::hedge_loser_handler_observes_cancellation` (passed on
   retry) and
