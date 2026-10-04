@@ -24836,6 +24836,18 @@ impl MeshNode {
         self.pending_direct_initiators.contains_key(&addr)
     }
 
+    /// Handshake payloads queued, unread, in inboxes registered for
+    /// RTC endpoints. A witness reads it to know a msg1 really did
+    /// arrive before its responder reached `accept_rtc`.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn queued_rtc_handshakes(&self) -> usize {
+        self.pending_direct_initiators
+            .iter()
+            .filter(|entry| matches!(entry.key(), PeerAddr::Rtc(_)))
+            .map(|entry| entry.value().state.lock().queue.len())
+            .sum()
+    }
+
     /// Install a callback fired between the commit-time liveness
     /// check and the `peers` insert (R-B witnesses).
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -56882,6 +56894,46 @@ mod direct_handshake_inbox_tests {
             .expect("waiter task panicked");
 
         assert_eq!(got, Some(candidate(7)));
+    }
+
+    /// A dialog completion's early inbox is adopted by exactly ONE
+    /// `accept_rtc`, and adoption keeps the msg1 it was registered to
+    /// catch. A second adopter would be two responders reading one
+    /// endpoint's handshake; it must displace instead, as before.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_reserved_inbox_is_adopted_once_and_keeps_its_early_msg1() {
+        let inbox = DirectHandshakeInbox::reserved();
+        assert!(
+            inbox.deposit(candidate(1)),
+            "msg1 arriving before accept_rtc"
+        );
+
+        assert!(inbox.adopt(), "the first responder adopts the reservation");
+        assert!(!inbox.adopt(), "a second responder must not adopt it too");
+        assert_eq!(
+            inbox.next().await,
+            Some(candidate(1)),
+            "the msg1 queued before adoption is what the responder reads",
+        );
+    }
+
+    /// Only a reservation is adoptable: an ordinary registration (a
+    /// connect's or an accept's own) keeps the displace-and-replace
+    /// contract, and a retired reservation is gone.
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn only_a_live_reservation_is_adoptable() {
+        assert!(
+            !DirectHandshakeInbox::new().adopt(),
+            "an unreserved inbox must never be adopted",
+        );
+        let retired = DirectHandshakeInbox::reserved();
+        retired.close();
+        assert!(
+            !retired.adopt(),
+            "a retired reservation must not be adopted"
+        );
     }
 }
 

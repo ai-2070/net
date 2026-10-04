@@ -1499,8 +1499,8 @@ async fn a_forced_direct_loss_is_cleaned_up_on_the_far_side_too() {
 /// B is released only after that, and the exchange must complete.
 ///
 /// Inverse: drop the early registration in `spawn_dialog_completion`
-/// (`early_inbox`) — msg1 lands with no inbox, A never gets msg2, and
-/// the direct install below never happens.
+/// (`early_inbox`) — msg1 lands with no inbox, so nothing is ever
+/// queued on B and the `msg1_queued` assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_msg1_that_arrives_before_the_responder_registers_is_not_lost() {
     let unhurried = || RtcConfig {
@@ -1532,9 +1532,19 @@ async fn a_msg1_that_arrives_before_the_responder_registers_is_not_lost() {
     .expect("B's completion must reach the claim seam, i.e. its channel opened");
 
     // A's completion is not parked: it claims and sends its single
-    // msg1 while B has not reached `accept_rtc`.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // msg1 while B has not reached `accept_rtc`. Release B only once
+    // that msg1 is OBSERVED queued on B — not after a sleep, which
+    // could let B register first and pass this witness vacuously.
+    // Without the early registration there is no inbox to queue in,
+    // so this wait is where the inverse fails.
+    let msg1_queued = wait_for(|| b.queued_rtc_handshakes() > 0, Duration::from_secs(10)).await;
     b.rtc_dialog_claim_pause().release();
+    assert!(
+        msg1_queued,
+        "A's msg1 must reach B while B's completion is parked before accept_rtc, \
+         and be held for it (B queued {} RTC handshake payloads)",
+        b.queued_rtc_handshakes()
+    );
 
     assert!(
         wait_for(
