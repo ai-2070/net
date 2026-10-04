@@ -1,0 +1,38 @@
+.github/scripts/c_abi_model.py
+  s_17a2ac60d914fc::t_1547ff9f2f3cf4 463-484,511,520
+.github/scripts/check-script-permissions.py
+  s_17a2ac60d914fc::t_1547ff9f2f3cf4 154,185
+net/crates/net/bindings/go/net-ffi/tests/abi_layout.rs
+  s_17a2ac60d914fc::t_3e71a0b530fb54 24-30
+.github/scripts/check-abi-commit.py
+  s_17a2ac60d914fc::t_c4209714eacb68 81-83,85-87,90-91
+  s_17a2ac60d914fc::t_d2036478d87284 468-487
+.github/scripts/gen-c-fixture-cases.py
+  s_17a2ac60d914fc::t_a0d209e2f33021 50-64
+net/crates/net/examples/c/support/mcp_cases.h
+  s_17a2ac60d914fc::t_ca3a3863a32a15 31-32
+.github/scripts/check-ffi-exports.py
+  s_17a2ac60d914fc::t_1547ff9f2f3cf4 349-355
+net/crates/net/src/ffi/mod.rs
+  s_17a2ac60d914fc::t_2ab6a734f7209b 2783,2786-2787,2795,2803,2809-2811,2813-2814
+  s_17a2ac60d914fc::t_12e94f7a89b95d 2812
+  s_17a2ac60d914fc::t_1019f766b67a5c 2784-2785,2788-2794
+.github/scripts/capability_records.py
+  s_17a2ac60d914fc::t_a69fcf119b9bef 225-227,235-238,242,249-253
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4ce66b0c37d8977e721de436bc158807a1ec4dd4",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
