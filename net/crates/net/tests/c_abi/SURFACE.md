@@ -10,7 +10,7 @@ both.
 
 | Header | Declared | Called by a consumer | Called by any C program |
 | --- | ---: | ---: | ---: |
-| `net.go.h` | 218 | 48 | 65 |
+| `net.go.h` | 218 | 86 | 103 |
 | `net.h` | 41 | 9 | 13 |
 | `net_cortex.h` | 92 | 2 | 8 |
 | `net_deck.h` | 84 | 0 | 0 |
@@ -38,22 +38,22 @@ both.
 | `net_capability_aggregate` | – | – | – |
 | `net_capability_capacity_ranking` | – | – | – |
 | `net_channel_hash` | – | – | – |
-| `net_compute_daemon_handle_entity_id` | – | – | – |
-| `net_compute_daemon_handle_free` | – | – | – |
-| `net_compute_daemon_handle_origin_hash` | – | – | – |
+| `net_compute_daemon_handle_entity_id` | compute | – | – |
+| `net_compute_daemon_handle_free` | compute | – | – |
+| `net_compute_daemon_handle_origin_hash` | compute | – | – |
 | `net_compute_expect_migration` | – | – | – |
-| `net_compute_fork_group_fork_count` | – | – | – |
+| `net_compute_fork_group_fork_count` | compute | – | – |
 | `net_compute_fork_group_fork_records_json` | – | – | – |
-| `net_compute_fork_group_fork_seq` | – | – | – |
-| `net_compute_fork_group_free` | – | – | – |
-| `net_compute_fork_group_healthy_count` | – | – | – |
+| `net_compute_fork_group_fork_seq` | compute | – | – |
+| `net_compute_fork_group_free` | compute | – | – |
+| `net_compute_fork_group_healthy_count` | compute | – | – |
 | `net_compute_fork_group_members_json` | – | – | – |
 | `net_compute_fork_group_on_node_recovery` | – | – | – |
-| `net_compute_fork_group_parent_origin` | – | – | – |
+| `net_compute_fork_group_parent_origin` | compute | – | – |
 | `net_compute_fork_group_scale_to` | – | – | – |
-| `net_compute_fork_group_spawn` | – | – | – |
-| `net_compute_fork_group_verify_lineage` | – | – | – |
-| `net_compute_free_cstring` | – | – | – |
+| `net_compute_fork_group_spawn` | compute | – | – |
+| `net_compute_fork_group_verify_lineage` | compute | – | – |
+| `net_compute_free_cstring` | compute | – | – |
 | `net_compute_has_placement_filter` | – | – | – |
 | `net_compute_migration_handle_cancel` | – | – | – |
 | `net_compute_migration_handle_free` | – | – | – |
@@ -64,41 +64,41 @@ both.
 | `net_compute_migration_handle_wait` | – | – | – |
 | `net_compute_migration_handle_wait_with_timeout` | – | – | – |
 | `net_compute_migration_phase` | – | – | – |
-| `net_compute_outputs_at` | – | – | – |
-| `net_compute_outputs_free` | – | – | – |
-| `net_compute_outputs_len` | – | – | – |
-| `net_compute_outputs_push` | – | – | – |
+| `net_compute_outputs_at` | compute | – | – |
+| `net_compute_outputs_free` | compute | – | – |
+| `net_compute_outputs_len` | compute | – | – |
+| `net_compute_outputs_push` | compute | – | – |
 | `net_compute_register_factory` | – | – | – |
-| `net_compute_register_factory_with_func` | – | – | – |
+| `net_compute_register_factory_with_func` | compute | – | – |
 | `net_compute_register_migration_target_identity` | – | – | – |
 | `net_compute_register_placement_filter` | – | – | – |
-| `net_compute_replica_group_free` | – | – | – |
+| `net_compute_replica_group_free` | compute | – | – |
 | `net_compute_replica_group_group_id` | – | – | – |
-| `net_compute_replica_group_health` | – | – | – |
-| `net_compute_replica_group_healthy_count` | – | – | – |
-| `net_compute_replica_group_members_json` | – | – | – |
+| `net_compute_replica_group_health` | compute | – | – |
+| `net_compute_replica_group_healthy_count` | compute | – | – |
+| `net_compute_replica_group_members_json` | compute | – | – |
 | `net_compute_replica_group_on_node_recovery` | – | – | – |
-| `net_compute_replica_group_replica_count` | – | – | – |
-| `net_compute_replica_group_route_event` | – | – | – |
+| `net_compute_replica_group_replica_count` | compute | – | – |
+| `net_compute_replica_group_route_event` | compute | – | – |
 | `net_compute_replica_group_scale_to` | – | – | – |
-| `net_compute_replica_group_spawn` | – | – | – |
-| `net_compute_runtime_daemon_count` | – | – | – |
-| `net_compute_runtime_deliver` | – | – | – |
-| `net_compute_runtime_free` | – | – | – |
-| `net_compute_runtime_id` | – | – | – |
-| `net_compute_runtime_is_ready` | – | – | – |
-| `net_compute_runtime_new` | – | – | – |
-| `net_compute_runtime_shutdown` | – | – | – |
-| `net_compute_runtime_snapshot` | – | – | – |
-| `net_compute_runtime_start` | – | – | – |
-| `net_compute_runtime_stop` | – | – | – |
-| `net_compute_set_callback_free` | – | – | – |
+| `net_compute_replica_group_spawn` | compute | – | – |
+| `net_compute_runtime_daemon_count` | compute | – | – |
+| `net_compute_runtime_deliver` | compute | – | – |
+| `net_compute_runtime_free` | compute | – | – |
+| `net_compute_runtime_id` | compute | – | – |
+| `net_compute_runtime_is_ready` | compute | – | – |
+| `net_compute_runtime_new` | compute | – | – |
+| `net_compute_runtime_shutdown` | compute | – | – |
+| `net_compute_runtime_snapshot` | compute | – | – |
+| `net_compute_runtime_start` | compute | – | – |
+| `net_compute_runtime_stop` | compute | – | – |
+| `net_compute_set_callback_free` | compute | – | – |
 | `net_compute_set_daemon_caps_dispatcher` | – | – | – |
-| `net_compute_set_dispatcher` | – | – | – |
+| `net_compute_set_dispatcher` | compute | – | – |
 | `net_compute_set_placement_filter_dispatcher` | – | – | – |
 | `net_compute_snapshot_bytes_free` | – | – | – |
-| `net_compute_spawn` | – | – | – |
-| `net_compute_spawn_from_snapshot` | – | – | – |
+| `net_compute_spawn` | compute | – | – |
+| `net_compute_spawn_from_snapshot` | compute | – | – |
 | `net_compute_standby_group_active_healthy` | – | – | – |
 | `net_compute_standby_group_active_index` | – | – | – |
 | `net_compute_standby_group_active_origin` | – | – | – |
@@ -148,7 +148,7 @@ both.
 | `net_init` | – | – | hello, observe |
 | `net_mesh_accept` | consumer_util | – | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_announce_capabilities` | – | – | registry |
-| `net_mesh_arc_clone` | rpc_callbacks | – | failover, jobqueue, net_org_streaming |
+| `net_mesh_arc_clone` | compute, rpc_callbacks | – | failover, jobqueue, net_org_streaming |
 | `net_mesh_arc_free` | – | – | – |
 | `net_mesh_blob_adapter_exists` | – | – | – |
 | `net_mesh_blob_adapter_fetch` | tree_range | – | – |
@@ -167,7 +167,7 @@ both.
 | `net_mesh_blob_adapter_store` | – | – | – |
 | `net_mesh_blob_adapter_store_tree` | repair, tree_range | – | – |
 | `net_mesh_blob_adapter_tree_node_cache_stats` | tree_range | – | – |
-| `net_mesh_channel_configs_arc_clone` | – | – | – |
+| `net_mesh_channel_configs_arc_clone` | compute | – | – |
 | `net_mesh_channel_configs_arc_free` | – | – | – |
 | `net_mesh_claim_island` | – | – | – |
 | `net_mesh_clear_reflex_override` | – | – | – |
@@ -180,7 +180,7 @@ both.
 | `net_mesh_find_best_node_scoped` | – | – | – |
 | `net_mesh_find_nodes` | – | – | registry |
 | `net_mesh_find_nodes_scoped` | – | – | – |
-| `net_mesh_free` | lifecycle, rpc_callbacks, transfer | leak_fetch_blob | jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_free` | compute, lifecycle, rpc_callbacks, transfer | leak_fetch_blob | jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_match_islands` | – | – | – |
 | `net_mesh_max_event_size` | – | – | – |
 | `net_mesh_nat_type` | – | – | – |
@@ -203,8 +203,8 @@ both.
 | `net_mesh_send_blocking` | – | – | – |
 | `net_mesh_send_with_retry` | – | – | – |
 | `net_mesh_set_reflex_override` | – | – | – |
-| `net_mesh_shutdown` | lifecycle, rpc_callbacks, transfer | leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
-| `net_mesh_start` | lifecycle, rpc_callbacks, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_shutdown` | compute, lifecycle, rpc_callbacks, transfer | leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_start` | compute, lifecycle, rpc_callbacks, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_stream_free` | – | – | – |
 | `net_mesh_stream_inbox_close` | – | – | – |
 | `net_mesh_stream_inbox_dropped` | – | – | – |

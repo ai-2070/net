@@ -344,8 +344,9 @@ func goComputeSnapshot(daemonID C.uint64_t, outPtr **C.uint8_t, outLen *C.size_t
 		*outLen = 0
 		return C.NET_COMPUTE_OK
 	}
-	// Copy into a C.malloc buffer so Rust can free via libc::free
-	// (matches `net_compute_snapshot_bytes_free`'s contract).
+	// Copy into a C.malloc buffer. Rust releases it through the
+	// deallocator registered with `net_compute_set_callback_free`
+	// (never its own libc::free, which on Windows is another CRT's heap).
 	buf := C.malloc(C.size_t(len(state)))
 	if buf == nil {
 		*outPtr = nil

@@ -216,7 +216,7 @@
     "Compute / groups / daemons": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
           "status": "supported"

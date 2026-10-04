@@ -565,9 +565,10 @@ operations:
       status: supported
       anchor: Groups
     C:
-      status: partial
+      status: supported
       anchor: net_compute_fork_group_fork_count
-      gap: 'No C program CI runs calls it (Go reaches it through go/groups.go).'
+      evidence:
+      - net/crates/net/examples/c/compute.c
 - operation: Deck — operator surface
   bindings:
     Rust:

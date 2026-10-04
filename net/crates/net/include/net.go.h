@@ -1692,7 +1692,9 @@ int  net_compute_replica_group_replica_count(const net_compute_replica_group_t* 
 int  net_compute_replica_group_healthy_count(const net_compute_replica_group_t* h);
 uint32_t net_compute_replica_group_group_id(const net_compute_replica_group_t* h);
 
-/* status: 0=healthy 1=degraded 2=dead */
+/* status: 0=healthy 1=degraded 2=dead. `out_healthy` / `out_total` are
+ * filled only when degraded; otherwise both are 0 (use `_healthy_count`
+ * and `_replica_count`). */
 int  net_compute_replica_group_health(
     const net_compute_replica_group_t* h,
     int* out_status, uint32_t* out_healthy, uint32_t* out_total);

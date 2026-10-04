@@ -107,7 +107,7 @@ A mode is written after the status: `supported · core-only`.
 | RedEX — durable log | supported | supported | supported | supported | supported |
 | CortEX folds / NetDB | supported | supported | supported | supported | partial |
 | MeshDB — federated queries | supported | supported | supported | supported | supported |
-| Compute / groups / daemons | supported | supported | supported | supported | partial |
+| Compute / groups / daemons | supported | supported | supported | supported | supported |
 | Deck — operator surface | supported | supported | supported | supported | partial |
 | Redis Streams dedup | supported | supported | supported · core-only | supported | supported |
 
@@ -188,7 +188,7 @@ per-function record behind this is `net/crates/net/tests/c_abi/SURFACE.md`.
 | RedEX — durable log | supported | `eventlog.c`, `jobqueue.c` | — |
 | CortEX folds / NetDB | partial | — | No C program CI runs calls it (Go reaches it through go/aggregator.go). |
 | MeshDB — federated queries | supported | `meshdb.c` | — |
-| Compute / groups / daemons | partial | — | No C program CI runs calls it (Go reaches it through go/groups.go). |
+| Compute / groups / daemons | supported | `compute.c` | — |
 | Deck — operator surface | partial | — | No C program CI runs calls it (Go reaches it through go/deck.go). |
 | Redis Streams dedup | supported | `redis_dedup.c` | — |
 
