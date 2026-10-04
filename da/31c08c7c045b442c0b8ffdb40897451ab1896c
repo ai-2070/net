@@ -1,0 +1,23 @@
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_695d92acf80ca2 22
+net/crates/net/examples/c/meshos.c
+  s_17a2ac60d914fc::t_cb6b780ef89c94 1-183
+net/crates/net/tests/c_abi/SURFACE.md
+  s_17a2ac60d914fc::t_751527ceb73b85 19,543-549,551-563,565
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "da31c08c7c045b442c0b8ffdb40897451ab1896c",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
