@@ -974,8 +974,8 @@ lane needs an elevated process, so it is proved in CI, not on the dev box.
     - direct blocks of 64 bytes or less from a handle constructor are
       handle tombstones (the intended keep-the-outer-box pattern of
       `net_mesh_free`, `net_redex_free` and `net_mesh_blob_adapter_free`);
-    - indirect blocks are accepted only in the programs named by the open
-      defect.
+    - indirect blocks were accepted only in the programs the open
+      defect D-C5-1 named; since its fix, none are.
     - Anything else fails, and every accepted class is printed with its
       blocks and bytes on every run.
   - **Replayed against the first run's real reports:**
@@ -1209,7 +1209,7 @@ Not a prerequisite for any other slice.
 
 Found by C5:
 
-- **D-C5-1 (open): a `MeshNode` is not reclaimed after `net_mesh_shutdown`
+- **D-C5-1 (fixed): a `MeshNode` is not reclaimed after `net_mesh_shutdown`
   and `net_mesh_free`.** In `lifecycle.c` and `rpc_callbacks.c`, the node's
   memory (allocations of `MeshNode::new`, task buffers, maps: 0.2 MB to
   0.6 MB per program, varying run to run) is still allocated at exit.
@@ -1217,12 +1217,28 @@ Found by C5:
     stale bits of the `Arc` that `net_mesh_free` moved out. So no live
     reference remains and the memory was never released: a leaked `Arc` or
     a reference cycle.
-  - `transfer.c` also brings up two nodes and frees them, and does not
-    show it, so the leak is not inherent to a node's lifetime. Which call
-    path retains the node is not yet known.
-  - Out of this plan's scope to fix (core Rust). Tracked in
-    `lsan_policy.toml` so the sanitizer lane can run, and printed on every
-    run. Remove that entry with the fix.
+  - **Fixed (2026-10-04).** The cause was in the FFI, not the core.
+    Nineteen entry points in `src/ffi/mesh.rs` (`net_mesh_start`,
+    `_connect`, `_accept` and others) took their node with
+    `h.inner.clone()`, where `inner` is a `ManuallyDrop<Arc<MeshNode>>`.
+    `ManuallyDrop<T>: Clone` clones the wrapper, so every call leaked one
+    strong count, and any started node outlived its free. `src/ffi/blob.rs`
+    had already been fixed for the same pattern; `mesh.rs` had not.
+    - Found by bisection: a strong count of 2 after start, constant
+      through shutdown and free, and unchanged with every spawned loop
+      skipped and with `start` itself a no-op, which left only
+      `net_mesh_start`'s own clone.
+    - `transfer.c` leaked the same way. LSan scans conservatively, and a
+      stale pointer it could still reach hid that program's leak; the
+      leak was in every started node.
+    - Now `Arc::clone(&h.inner)` at all nineteen sites.
+      `ffi::mesh::tests::node_reclaim_c_abi` requires a started node, and
+      a connected pair in `lifecycle.c`'s sequence, to be reclaimed after
+      free. `ffi::tests::no_clone_of_a_manually_drop_arc_field` refuses a
+      `.clone()` on any `ManuallyDrop<Arc<_>>` field in `src/ffi`, with
+      the field names read from the declarations. Both fail when one
+      leaking clone is reintroduced.
+    - `lsan_policy.toml` no longer accepts any indirect leak.
 
 Found by C1, stage 1:
 

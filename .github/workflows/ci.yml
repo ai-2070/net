@@ -5384,7 +5384,7 @@ jobs:
       # library-returned buffers, through the intercepted system allocator
       # Rust uses. What it cannot: accesses inside the Rust code. The runner
       # classifies every LSan leak block against tests/c_abi/lsan_policy.toml
-      # (handle tombstones; one open, tracked defect) and prints what each
+      # (handle tombstones only; no indirect leak) and prints what each
       # accepted class holds on every run; any other leak fails.
       # The arming programs then plant a leaked net_fetch_blob buffer, a
       # double release of one, and a double release of a callback buffer;

@@ -2736,6 +2736,71 @@ mod tests {
         }
     }
 
+    /// No `.clone()` on a `ManuallyDrop<Arc<_>>` handle field anywhere in
+    /// the FFI. `ManuallyDrop<T>: Clone` clones the WRAPPER, so the bumped
+    /// strong count is never released: every call leaks one reference.
+    /// Nineteen `h.inner.clone()` calls in `mesh.rs` did exactly that
+    /// (`net_mesh_start`, `_connect`, `_accept`, ...), so a node that had
+    /// been started was never reclaimed after `net_mesh_shutdown` +
+    /// `net_mesh_free` (D-C5-1, found by the C consumer sanitizer lane;
+    /// `blob.rs` had already been fixed). Use `Arc::clone(&h.field)`.
+    ///
+    /// The field names come from the declarations themselves, so a new
+    /// `ManuallyDrop<Arc<_>>` field is covered without editing this test.
+    #[test]
+    fn no_clone_of_a_manually_drop_arc_field() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ffi");
+        let sources: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .expect("src/ffi")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .map(|p| {
+                let text = std::fs::read_to_string(&p).expect("read");
+                (p.file_name().unwrap().to_string_lossy().into_owned(), text)
+            })
+            .collect();
+        let mut fields = std::collections::BTreeSet::new();
+        for (_, text) in &sources {
+            for line in text.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                for marker in [": ManuallyDrop<Arc<", ": Option<ManuallyDrop<Arc<"] {
+                    if let Some(i) = t.find(marker) {
+                        let mut name = t[..i].rsplit(|c: char| !(c.is_alphanumeric() || c == '_'));
+                        if let Some(name) = name.next().filter(|n| !n.is_empty()) {
+                            fields.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            fields.contains("inner"),
+            "the scan found no ManuallyDrop<Arc<_>> fields; it is not reading the sources"
+        );
+        let mut found = Vec::new();
+        for (file, text) in &sources {
+            for (n, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for f in &fields {
+                    if line.contains(&format!(".{f}.clone()")) {
+                        found.push(format!("src/ffi/{file}:{}: {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "`.clone()` on a ManuallyDrop<Arc<_>> field leaks a strong reference; \
+             use Arc::clone(&h.field):\n{}",
+            found.join("\n")
+        );
+    }
+
     /// `handle_is_valid` rejects null and any pointer not aligned for
     /// `NetHandle`. A foreign caller producing a misaligned pointer
     /// (e.g. via an over-eager `void *` cast on a packed struct) hits
