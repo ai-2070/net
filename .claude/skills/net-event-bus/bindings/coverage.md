@@ -186,7 +186,7 @@ per-function record behind this is `net/crates/net/tests/c_abi/SURFACE.md`.
 | MCP bridge | supported | `mcp.c` | — |
 | Dataforts — blobs | supported | `transfer.c`, `objectstore.c` | — |
 | RedEX — durable log | supported | `eventlog.c`, `jobqueue.c` | — |
-| CortEX folds / NetDB | partial | — | No C program CI runs calls it (Go reaches it through go/aggregator.go). |
+| CortEX folds / NetDB | partial | `aggregator.c` | The fold-query and registry clients are client-side only, and serving them is the aggregator daemon's job, which no C program can stand up. aggregator.c checks their error contract against a peer that serves neither; a successful query is not exercised from C. |
 | MeshDB — federated queries | supported | `meshdb.c` | — |
 | Compute / groups / daemons | supported | `compute.c` | — |
 | Deck — operator surface | partial | `deck.c` | A C deck client attaches no operator registry (net_deck_client_new takes none), so a signed ICE commit takes the unsigned admin path: it is neither verified nor attributed to its signers. |

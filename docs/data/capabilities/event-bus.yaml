@@ -532,7 +532,9 @@ operations:
     C:
       status: partial
       anchor: net_fold_query_client_query_latest
-      gap: 'No C program CI runs calls it (Go reaches it through go/aggregator.go).'
+      evidence:
+      - net/crates/net/examples/c/aggregator.c
+      gap: 'The fold-query and registry clients are client-side only, and serving them is the aggregator daemon''s job, which no C program can stand up. aggregator.c checks their error contract against a peer that serves neither; a successful query is not exercised from C.'
 - operation: MeshDB — federated queries
   bindings:
     Rust:

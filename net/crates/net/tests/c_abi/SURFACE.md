@@ -11,7 +11,7 @@ both.
 | Header | Declared | Called by a consumer | Called by any C program |
 | --- | ---: | ---: | ---: |
 | `net.go.h` | 218 | 105 | 120 |
-| `net.h` | 41 | 9 | 13 |
+| `net.h` | 41 | 26 | 30 |
 | `net_cortex.h` | 92 | 2 | 8 |
 | `net_deck.h` | 84 | 62 | 62 |
 | `net_mcp.h` | 22 | 20 | 20 |
@@ -122,7 +122,7 @@ both.
 | `net_fetch_dir` | transfer | – | – |
 | `net_flush` | – | – | – |
 | `net_free_bytes` | streams | – | tokenchannel |
-| `net_free_string` | capabilities, consumer_util, lifecycle, repair, streams, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_free_string` | aggregator, capabilities, consumer_util, lifecycle, repair, streams, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_generate_keypair` | – | – | – |
 | `net_identity_at_generation` | – | – | – |
 | `net_identity_entity_id` | – | – | tokenchannel |
@@ -180,12 +180,12 @@ both.
 | `net_mesh_find_best_node_scoped` | – | – | – |
 | `net_mesh_find_nodes` | – | – | registry |
 | `net_mesh_find_nodes_scoped` | – | – | – |
-| `net_mesh_free` | compute, islands, lifecycle, rpc_callbacks, streams, transfer | leak_fetch_blob | jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_free` | compute, islands, lifecycle, mesh_opaque, rpc_callbacks, streams, transfer | leak_fetch_blob | jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_match_islands` | islands | – | – |
 | `net_mesh_max_event_size` | streams | – | – |
 | `net_mesh_nat_type` | – | – | – |
 | `net_mesh_new` | consumer_util, lifecycle | – | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
-| `net_mesh_node_id` | consumer_util, lifecycle, rpc_callbacks, streams, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_node_id` | consumer_util, lifecycle, mesh_opaque, rpc_callbacks, streams, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_open_stream` | streams | – | – |
 | `net_mesh_open_stream_inbox` | streams | – | – |
 | `net_mesh_peer_nat_type` | – | – | – |
@@ -203,8 +203,8 @@ both.
 | `net_mesh_send_blocking` | – | – | – |
 | `net_mesh_send_with_retry` | – | – | – |
 | `net_mesh_set_reflex_override` | – | – | – |
-| `net_mesh_shutdown` | compute, islands, lifecycle, rpc_callbacks, streams, transfer | leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
-| `net_mesh_start` | compute, islands, lifecycle, rpc_callbacks, streams, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_shutdown` | compute, islands, lifecycle, mesh_opaque, rpc_callbacks, streams, transfer | leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_start` | compute, islands, lifecycle, mesh_opaque, rpc_callbacks, streams, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_stream_free` | streams | – | – |
 | `net_mesh_stream_inbox_close` | streams | – | – |
 | `net_mesh_stream_inbox_dropped` | streams | – | – |
@@ -250,17 +250,17 @@ both.
 | Function | Consumers | Arming | Skill examples |
 | --- | --- | --- | --- |
 | `net_flush` | – | – | – |
-| `net_fold_query_client_free` | – | – | – |
-| `net_fold_query_client_invalidate_cache` | – | – | – |
-| `net_fold_query_client_invalidate_target` | – | – | – |
-| `net_fold_query_client_new` | – | – | – |
-| `net_fold_query_client_query_latest` | – | – | – |
-| `net_fold_query_client_query_summarize_now` | – | – | – |
-| `net_fold_query_client_set_deadline` | – | – | – |
-| `net_fold_query_client_set_ttl` | – | – | – |
-| `net_fold_query_last_error_detail` | – | – | – |
+| `net_fold_query_client_free` | aggregator | – | – |
+| `net_fold_query_client_invalidate_cache` | aggregator | – | – |
+| `net_fold_query_client_invalidate_target` | aggregator | – | – |
+| `net_fold_query_client_new` | aggregator | – | – |
+| `net_fold_query_client_query_latest` | aggregator | – | – |
+| `net_fold_query_client_query_summarize_now` | aggregator | – | – |
+| `net_fold_query_client_set_deadline` | aggregator | – | – |
+| `net_fold_query_client_set_ttl` | aggregator | – | – |
+| `net_fold_query_last_error_detail` | aggregator | – | – |
 | `net_free_poll_result` | – | – | – |
-| `net_free_string` | capabilities, consumer_util, lifecycle, repair, streams, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_free_string` | aggregator, capabilities, consumer_util, lifecycle, repair, streams, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_generate_keypair` | – | – | – |
 | `net_ingest` | – | – | – |
 | `net_ingest_batch` | – | – | – |
@@ -278,14 +278,14 @@ both.
 | `net_redis_dedup_is_empty` | redis_dedup | – | – |
 | `net_redis_dedup_len` | redis_dedup | – | – |
 | `net_redis_dedup_new` | redis_dedup | – | – |
-| `net_register_channel` | – | – | – |
-| `net_registry_client_free` | – | – | – |
-| `net_registry_client_list` | – | – | – |
-| `net_registry_client_new` | – | – | – |
-| `net_registry_client_set_deadline` | – | – | – |
-| `net_registry_client_spawn` | – | – | – |
-| `net_registry_client_unregister` | – | – | – |
-| `net_registry_last_error_detail` | – | – | – |
+| `net_register_channel` | aggregator | – | – |
+| `net_registry_client_free` | aggregator | – | – |
+| `net_registry_client_list` | aggregator | – | – |
+| `net_registry_client_new` | aggregator | – | – |
+| `net_registry_client_set_deadline` | aggregator | – | – |
+| `net_registry_client_spawn` | aggregator | – | – |
+| `net_registry_client_unregister` | aggregator | – | – |
+| `net_registry_last_error_detail` | aggregator | – | – |
 | `net_shutdown` | – | – | hello, observe |
 | `net_stats` | – | – | – |
 | `net_stats_ex` | – | – | hello, observe |
