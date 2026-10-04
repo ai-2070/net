@@ -1,0 +1,19 @@
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_391b90f341d6c6::t_f78e413932fcf3 1-361
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8192253e4d5d23cbd49a0adfd1e1099b074e4d70",
+  "prompts": {},
+  "sessions": {
+    "s_391b90f341d6c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e008671-9702-4db4-b22a-abb85b691773",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
