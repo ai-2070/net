@@ -102,6 +102,13 @@ static int hex32(const char* hex, uint8_t* out) {
 /* The integers of the first `[a, b, ...]` after `"key":`, at or after
  * `from`. A list of lists (`[[a, b]]`) must hold exactly one inner list:
  * a second would otherwise be dropped unread. Returns the count, or -1. */
+static const char* skip_ws(const char* p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+        p++;
+    }
+    return p;
+}
+
 static int int_list(const char* from, const char* key, int* out, int max) {
     char pat[64];
     const char* p;
@@ -113,8 +120,13 @@ static int int_list(const char* from, const char* key, int* out, int max) {
     if (p == NULL) {
         return -1;
     }
-    p++;
+    /* The manifest is pretty-printed: whitespace may sit between any two
+     * tokens, so the nesting is judged on the next non-blank character. */
+    p = skip_ws(p + 1);
     nested = *p == '[';
+    if (nested) {
+        p++;
+    }
     while (*p && *p != ']') {
         if (*p >= '0' && *p <= '9') {
             if (n == max) {
@@ -122,6 +134,8 @@ static int int_list(const char* from, const char* key, int* out, int max) {
             }
             out[n] = (int)strtol(p, (char**)&p, 10);
             n++;
+        } else if (*p == '[') {
+            return -1; /* deeper than one inner list */
         } else {
             p++;
         }
@@ -129,8 +143,8 @@ static int int_list(const char* from, const char* key, int* out, int max) {
     if (*p != ']') {
         return -1;
     }
-    if (nested && p[1] != ']') {
-        return -1;
+    if (nested && *skip_ws(p + 1) != ']') {
+        return -1; /* a second inner list */
     }
     return n;
 }
