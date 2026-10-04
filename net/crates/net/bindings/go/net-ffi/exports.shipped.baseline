@@ -4,7 +4,7 @@
 # generated-at: 13fe95dbc9c57b4d4e64209f6a299614ad5dcc7f
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi
-# count: 594
+# count: 596
 net_blob_adapter_registered
 net_blob_free_buffer
 net_blob_publish
@@ -247,6 +247,7 @@ net_mcp_pin_state
 net_memories_adapter_close
 net_memories_adapter_free
 net_memories_adapter_open
+net_memories_channel_hash
 net_memories_delete
 net_memories_list
 net_memories_pin
@@ -551,6 +552,7 @@ net_subnet_serve_exported
 net_tasks_adapter_close
 net_tasks_adapter_free
 net_tasks_adapter_open
+net_tasks_channel_hash
 net_tasks_complete
 net_tasks_create
 net_tasks_delete

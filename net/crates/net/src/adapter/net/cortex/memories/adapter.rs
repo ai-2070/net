@@ -330,7 +330,9 @@ impl MemoriesAdapter {
 
     /// Non-blocking RYW poll. See
     /// [`super::super::tasks::TasksAdapter::poll_for_token`] for the
-    /// full contract — identical shape for Memories.
+    /// full contract — identical shape for Memories, including
+    /// `WrongChannel` for a token issued for another channel (a Tasks
+    /// token, say).
     pub fn poll_for_token(&self, token: WriteToken) -> Result<(), WaitForTokenError> {
         if token.origin_hash != self.origin_hash {
             self.inner.note_wrong_origin();
@@ -339,6 +341,7 @@ impl MemoriesAdapter {
                 adapter_origin: self.origin_hash,
             });
         }
+        self.inner.check_token_channel(&token)?;
         match self.inner.applied_through_seq() {
             Some(applied) if applied >= token.seq => Ok(()),
             _ if !self.inner.is_running() => Err(WaitForTokenError::FoldStopped {
@@ -369,6 +372,22 @@ impl MemoriesAdapter {
     /// at `wait_for_token`.
     pub fn origin_hash(&self) -> u64 {
         self.origin_hash
+    }
+
+    /// Canonical hash of this adapter's channel
+    /// (`cortex/memories`). Every token this adapter issues
+    /// carries it; a token for another channel is refused with
+    /// [`WaitForTokenError::WrongChannel`].
+    pub fn channel_hash(&self) -> u64 {
+        self.inner.channel_hash()
+    }
+
+    /// The token naming the write that returned `seq` on this adapter:
+    /// its origin, its channel and `seq`. Pass it to
+    /// [`Self::wait_for_token`] (or [`Self::poll_for_token`]) to wait
+    /// until that write is visible to reads.
+    pub fn token(&self, seq: u64) -> WriteToken {
+        WriteToken::new(self.origin_hash, self.inner.channel_hash(), seq)
     }
 
     /// Start building a reactive watcher.
@@ -686,7 +705,7 @@ mod tests {
 
         assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 0);
 
-        let foreign_token = WriteToken::new(FOREIGN_ORIGIN, 0);
+        let foreign_token = WriteToken::new(FOREIGN_ORIGIN, adapter.channel_hash(), 0);
 
         match adapter.poll_for_token(foreign_token) {
             Err(WaitForTokenError::WrongOrigin {
@@ -710,13 +729,62 @@ mod tests {
         assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 2);
 
         // Sanity: matched-origin token does NOT bump the counter.
-        let our_token = WriteToken::new(OUR_ORIGIN, 999);
+        let our_token = adapter.token(999);
         match adapter.poll_for_token(our_token) {
             Err(WaitForTokenError::Timeout) => {}
             other => panic!("expected Timeout for matched-origin token, got {:?}", other),
         }
         assert_eq!(adapter.as_cortex().ryw_metrics().wrong_origin_total, 2);
 
+        adapter.close().unwrap();
+    }
+
+    /// The defect a channel-less token allowed: Tasks and Memories with
+    /// the same origin count sequence numbers independently, so a Tasks
+    /// token for seq 0 was "applied" here as soon as this channel's own
+    /// seq 0 was. It must be refused, by poll and by wait, and the Tasks
+    /// adapter must still accept its own token.
+    #[tokio::test]
+    async fn a_tasks_token_is_refused_here_despite_the_same_origin() {
+        const ORIGIN: u64 = 0x1234_5678_9ABC_DEF0;
+        let redex = Redex::new();
+        let tasks = super::super::super::tasks::TasksAdapter::open(&redex, ORIGIN)
+            .await
+            .unwrap();
+        let adapter = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+        assert_ne!(tasks.channel_hash(), adapter.channel_hash());
+
+        let mut mem_seq = 0;
+        for id in 0..3 {
+            mem_seq = adapter.store(id, "m", vec![], "src", 100 + id).unwrap();
+        }
+        adapter
+            .wait_for_token(adapter.token(mem_seq), Duration::from_secs(2))
+            .await
+            .unwrap();
+        let task_seq = tasks.create(1, "t", 100).unwrap();
+        assert!(task_seq <= mem_seq, "Memories is past the Tasks seq");
+        let task_token = tasks.token(task_seq);
+        assert_eq!(task_token.origin_hash, adapter.origin_hash(), "same origin");
+
+        let wrong = Err(WaitForTokenError::WrongChannel {
+            token_channel: tasks.channel_hash(),
+            adapter_channel: adapter.channel_hash(),
+        });
+        assert_eq!(adapter.poll_for_token(task_token), wrong);
+        assert_eq!(
+            adapter
+                .wait_for_token(task_token, Duration::from_secs(2))
+                .await,
+            wrong
+        );
+        assert_eq!(adapter.as_cortex().ryw_metrics().wrong_channel_total, 2);
+
+        tasks
+            .wait_for_token(task_token, Duration::from_secs(2))
+            .await
+            .unwrap();
+        tasks.close().unwrap();
         adapter.close().unwrap();
     }
 }

@@ -4,11 +4,13 @@
 # generated-at: 9f01c24cea6645516ba6ed11f2a91654a0360a01
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi --features net-ffi/test-helpers
-# count: 602
+# count: 604
 # edited: net_redex_disable_replication added by hand (intended C-ABI addition, PR #1138)
 # edited: 8 v0.3 blob symbols added by hand (intended C-ABI addition, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md S6): net_blob_ref_describe, net_mesh_blob_adapter_{new_v2,fetch_range,store_tree,repair_blob,tree_node_cache_stats}, and the fixtures-only seams net_mesh_blob_adapter_test_{drop_data_chunk,chunk_present}
 # edited: net_redex_greedy_cache_for added by hand (intended C-ABI addition, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md gap G-A)
 # edited: 4 S5b symbols added by hand (intended C-ABI addition, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md gap G-B): net_blob_register_callback_adapter_owned, and the fixtures-only seams net_blob_test_barrier_{arm,wait_held,release}
+# edited: net_tasks_channel_hash, net_memories_channel_hash added by hand (intended C-ABI addition: write tokens carry their channel)
+# edited: net_meshdb_decode_payload_json_as added by hand (intended C-ABI addition: decode a meshdb envelope by kind)
 net_blob_adapter_registered
 net_blob_free_buffer
 net_blob_publish
@@ -256,6 +258,7 @@ net_mcp_pin_state
 net_memories_adapter_close
 net_memories_adapter_free
 net_memories_adapter_open
+net_memories_channel_hash
 net_memories_delete
 net_memories_list
 net_memories_pin
@@ -563,6 +566,7 @@ net_subnet_serve_exported
 net_tasks_adapter_close
 net_tasks_adapter_free
 net_tasks_adapter_open
+net_tasks_channel_hash
 net_tasks_complete
 net_tasks_create
 net_tasks_delete

@@ -228,9 +228,10 @@ let view = adapter.state().read();
 
 ### `WriteToken` — the portable form
 
-A bare `seq` only means something if you already know which chain it's on. The
-ingest paths also hand back a **`WriteToken`**: the address of a write as
-`(origin_hash, seq)` — which chain, and which event on it. Pass it to
+A bare `seq` only means something if you already know which channel it's in.
+The ingest paths also hand back a **`WriteToken`**, and the typed adapters build
+one with `token(seq)`: the address of a write as `(origin_hash, channel_hash,
+seq)` — which chain, which channel, and which event in it. Pass it to
 `wait_for_token` instead:
 
 ```rust
@@ -246,7 +247,9 @@ on it.
 > **Tokens are not capabilities.** A `WriteToken` is plain in-process data with
 > public fields — unsigned, and forgeable by anything in the same process. The
 > guarantee comes from the _adapter_, not the token: an adapter bound to origin
-> X rejects any token whose `origin_hash` isn't X, with `WrongOrigin`. So a
+> X rejects any token whose `origin_hash` isn't X, with `WrongOrigin`, and any
+> token issued for another channel, with `WrongChannel` (sequence numbers are
+> per channel, so a Tasks token must not pass on Memories). So a
 > token arriving over the wire is untrusted input that the receiving side
 > validates by virtue of which adapter it hands the token to. Don't synthesise
 > tokens in application code — a hand-rolled one that matches no real ingest

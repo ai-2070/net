@@ -88,6 +88,11 @@ pub enum ChangeEvent {
 
 struct AdapterInner<State> {
     file: RedexFile,
+    /// Canonical hash of the channel this adapter folds
+    /// ([`ChannelName::hash`]). Stamped on every token it issues and
+    /// required of every token it waits on: sequence numbers are per
+    /// channel, so a token from another channel names nothing here.
+    channel_hash: u64,
     state: Arc<RwLock<State>>,
     /// Highest RedEX seq applied to state, as a signed i64 so we can
     /// sentinel "nothing folded yet" with `start_seq - 1` (can be
@@ -175,6 +180,7 @@ struct RywMetricsAtomic {
     timeouts_total: AtomicU64,
     queue_full_total: AtomicU64,
     wrong_origin_total: AtomicU64,
+    wrong_channel_total: AtomicU64,
     wait_duration_nanos_sum: AtomicU64,
 }
 
@@ -199,6 +205,9 @@ pub struct RywMetricsSnapshot {
     /// and `MemoriesAdapter::wait_for_token` do, when their guard
     /// fires.
     pub wrong_origin_total: u64,
+    /// Cumulative waits and polls rejected with `WrongChannel`: the
+    /// token was issued for a different channel than this adapter folds.
+    pub wrong_channel_total: u64,
     /// Sum of nanoseconds spent inside `wait_for_token` past the
     /// permit acquisition. Divide by `waits_total` for the mean.
     pub wait_duration_nanos_sum: u64,
@@ -498,7 +507,30 @@ impl<State> CortexAdapter<State> {
         buf.extend_from_slice(&meta.to_bytes());
         buf.extend_from_slice(&tail);
         let seq = self.inner.file.append(&buf)?;
-        Ok(WriteToken::new(origin_hash, seq))
+        Ok(WriteToken::new(origin_hash, self.inner.channel_hash, seq))
+    }
+
+    /// Canonical hash of the channel this adapter folds — the
+    /// `channel_hash` every token it issues carries.
+    pub fn channel_hash(&self) -> u64 {
+        self.inner.channel_hash
+    }
+
+    /// Refuse a token issued for another channel, bumping
+    /// `wrong_channel_total`. Every wait and poll runs this before
+    /// looking at `token.seq`, which means nothing outside its channel.
+    pub(super) fn check_token_channel(&self, token: &WriteToken) -> Result<(), WaitForTokenError> {
+        if token.channel_hash == self.inner.channel_hash {
+            return Ok(());
+        }
+        self.inner
+            .ryw_metrics
+            .wrong_channel_total
+            .fetch_add(1, Ordering::Relaxed);
+        Err(WaitForTokenError::WrongChannel {
+            token_channel: token.channel_hash,
+            adapter_channel: self.inner.channel_hash,
+        })
     }
 
     /// Block until the fold task has processed every event up
@@ -506,6 +538,11 @@ impl<State> CortexAdapter<State> {
     /// `Err(WaitForTokenError::Timeout)` on deadline; `Ok(())`
     /// once the watermark catches up (or the fold task stops —
     /// see [`Self::wait_for_seq`] for the same caveat).
+    ///
+    /// A token for another channel is refused with
+    /// [`WaitForTokenError::WrongChannel`] before anything else: its seq
+    /// counts another file's events, so waiting on it here could succeed
+    /// without the write ever being applied.
     ///
     /// The token's `origin_hash` is informational at this layer
     /// — the generic [`CortexAdapter`] folds every event in its
@@ -518,6 +555,7 @@ impl<State> CortexAdapter<State> {
         token: WriteToken,
         deadline: Duration,
     ) -> Result<(), WaitForTokenError> {
+        self.check_token_channel(&token)?;
         // Try-acquire FIRST so backpressure surfaces before the timer
         // arms — under saturation a `QueueFull` is the correct
         // diagnostic, not a `Timeout` masking it.
@@ -591,6 +629,7 @@ impl<State> CortexAdapter<State> {
             timeouts_total: m.timeouts_total.load(Ordering::Relaxed),
             queue_full_total: m.queue_full_total.load(Ordering::Relaxed),
             wrong_origin_total: m.wrong_origin_total.load(Ordering::Relaxed),
+            wrong_channel_total: m.wrong_channel_total.load(Ordering::Relaxed),
             wait_duration_nanos_sum: m.wait_duration_nanos_sum.load(Ordering::Relaxed),
         }
     }
@@ -626,6 +665,16 @@ pub enum WaitForTokenError {
         /// origin this adapter is bound to.
         adapter_origin: u64,
     },
+    /// Token was issued for a different channel than this adapter
+    /// folds. Sequence numbers are per channel, so the token's seq says
+    /// nothing about this adapter's state: without this check a wait
+    /// could succeed once this channel's fold merely passed the number.
+    WrongChannel {
+        /// channel hash the token was issued for.
+        token_channel: u64,
+        /// channel hash this adapter folds.
+        adapter_channel: u64,
+    },
     /// Per-channel in-flight cap is saturated — back-pressure for
     /// callers who can shed load instead of stacking unbounded
     /// pending waits. See
@@ -656,6 +705,14 @@ impl std::fmt::Display for WaitForTokenError {
                 f,
                 "token origin {:016x} != adapter origin {:016x}",
                 token_origin, adapter_origin
+            ),
+            Self::WrongChannel {
+                token_channel,
+                adapter_channel,
+            } => write!(
+                f,
+                "token channel {:016x} != adapter channel {:016x}",
+                token_channel, adapter_channel
             ),
             Self::QueueFull => f.write_str("read-your-writes wait-queue saturated; retry later"),
             Self::FoldStopped {
@@ -764,6 +821,7 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
         };
         let inner = Arc::new(AdapterInner {
             file: file.clone(),
+            channel_hash: name.hash(),
             state: state.clone(),
             folded_through_seq: AtomicU64::new(initial_watermark),
             // Mirror folded's initial watermark: the snapshot/restore
@@ -1339,6 +1397,8 @@ mod tests {
         let token = adapter.ingest_with_token(env).unwrap();
 
         assert_eq!(token.origin_hash, origin);
+        assert_eq!(token.channel_hash, cn("cortex/ryw-token").hash());
+        assert_eq!(token.channel_hash, adapter.channel_hash());
         assert_eq!(token.seq, 0);
 
         adapter
@@ -1346,6 +1406,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*adapter.state().read(), 1);
+    }
+
+    /// Sequence numbers are per channel: a token from channel A must not be
+    /// satisfied by channel B's fold passing the same number. B has applied
+    /// seq 0..=2, so a seq-0 token from A would have passed before the
+    /// channel became part of the token.
+    #[tokio::test]
+    async fn wait_for_token_refuses_a_token_for_another_channel() {
+        let redex = Redex::new();
+        let open = |name: &str| {
+            CortexAdapter::<u64>::open(
+                &redex,
+                &cn(name),
+                RedexFileConfig::default(),
+                CortexAdapterConfig::default(),
+                CountFold,
+                0u64,
+            )
+            .unwrap()
+        };
+        let a = open("cortex/channel-a");
+        let b = open("cortex/channel-b");
+        assert_ne!(a.channel_hash(), b.channel_hash());
+
+        let env = || EventEnvelope::new(EventMeta::new(1, 0, 7, 0, 0), Bytes::from_static(b""));
+        let a_token = a.ingest_with_token(env()).unwrap();
+        let mut last = None;
+        for _ in 0..3 {
+            last = Some(b.ingest_with_token(env()).unwrap());
+        }
+        let b_token = last.unwrap();
+        b.wait_for_token(b_token, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(a_token.seq <= b_token.seq, "B is past A's seq");
+
+        assert_eq!(
+            b.wait_for_token(a_token, Duration::from_secs(2)).await,
+            Err(WaitForTokenError::WrongChannel {
+                token_channel: a.channel_hash(),
+                adapter_channel: b.channel_hash(),
+            })
+        );
+        let m = b.ryw_metrics();
+        assert_eq!(m.wrong_channel_total, 1);
+        // Refused before taking a permit: not counted as a wait.
+        assert_eq!(m.waits_total, 1, "only B's own wait above");
+
+        a.wait_for_token(a_token, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(a.ryw_metrics().wrong_channel_total, 0);
     }
 
     #[tokio::test]
@@ -1366,7 +1478,7 @@ mod tests {
 
         // Pin two waiters on a seq that never lands — they hold the
         // permits until their deadline elapses.
-        let token = WriteToken::new(0xABCD_EF01, 999);
+        let token = WriteToken::new(0xABCD_EF01, adapter.channel_hash(), 999);
         let a = adapter.clone();
         let h1 = tokio::spawn(async move { a.wait_for_token(token, Duration::from_secs(5)).await });
         let a = adapter.clone();
@@ -1415,7 +1527,7 @@ mod tests {
 
         // Pin a long waiter to hold the only permit, then attempt a
         // second wait — it must hit QueueFull and bump that counter.
-        let token = WriteToken::new(0xABCD_EF01, 999);
+        let token = WriteToken::new(0xABCD_EF01, adapter.channel_hash(), 999);
         let a = adapter.clone();
         let holder = tokio::spawn(async move {
             let _ = a.wait_for_token(token, Duration::from_secs(2)).await;
@@ -1457,7 +1569,7 @@ mod tests {
 
         // With cap=0 the semaphore is None; the path goes straight
         // to the deadline.
-        let token = WriteToken::new(0xABCD_EF01, 999);
+        let token = WriteToken::new(0xABCD_EF01, adapter.channel_hash(), 999);
         let err = adapter
             .wait_for_token(token, Duration::from_millis(20))
             .await
@@ -1478,7 +1590,7 @@ mod tests {
         )
         .unwrap();
 
-        let unreachable = WriteToken::new(0xDEAD_BEEF, 999);
+        let unreachable = WriteToken::new(0xDEAD_BEEF, adapter.channel_hash(), 999);
         let err = adapter
             .wait_for_token(unreachable, Duration::from_millis(50))
             .await

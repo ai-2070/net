@@ -300,7 +300,7 @@ The `net-mesh` CLI (crate `net-cli`) moves blobs without writing code. **Receive
 
 ## Read-your-writes
 
-Every successful `Tasks::create` / `Memories::insert` / etc. returns the RedEX **seq** (a `u64`). The simplest read-your-writes wait is `wait_for_seq(seq)` — it blocks until the local fold has actually *applied* that sequence number, not just folded it. When you need a deadline or the origin-bound token primitive, wrap the seq in a `WriteToken { origin_hash, seq }` and call `wait_for_token(token, deadline)`. Either way, a producer reads its own write through the cache deterministically; no busy-poll, no time-window heuristic.
+Every successful `Tasks::create` / `Memories::insert` / etc. returns the RedEX **seq** (a `u64`). The simplest read-your-writes wait is `wait_for_seq(seq)` — it blocks until the local fold has actually *applied* that sequence number, not just folded it. When you need a deadline or the token primitive, ask the adapter for `token(seq)` — a `WriteToken { origin_hash, channel_hash, seq }` — and call `wait_for_token(token, deadline)`. Either way, a producer reads its own write through the cache deterministically; no busy-poll, no time-window heuristic.
 
 This piece composes with `cortex.md` — the WriteToken is what flows out of every CortEX write; the wait_for_token call is what reads block on.
 
@@ -309,11 +309,12 @@ This piece composes with `cortex.md` — the WriteToken is what flows out of eve
 ```rust
 pub struct WriteToken {
     pub origin_hash: u64,
+    pub channel_hash: u64, // ChannelName::hash() of the channel written to
     pub seq: u64,
 }
 ```
 
-Fields are `pub` — build one with a struct literal, or `WriteToken::new(origin_hash, seq)` (a `#[doc(hidden)]` constructor). `impl FromStr` is available unconditionally; there is no `version` field. **Tokens are unforgeable only against the adapter that issued them** — origin-bound. A token claiming `origin_hash = X` passed to an adapter whose `origin_hash = Y` rejects with `WaitForTokenError::WrongOrigin`.
+Get one from the adapter that made the write: `tasks.token(seq)` (every binding has it; Go spells it `Token`). The string form is `<origin_hex>:<channel_hex>:<seq>` (`Display` / `FromStr`); the old two-part form is refused. **Tokens are checked against the adapter you wait on**: a token whose `origin_hash` isn't the adapter's rejects with `WaitForTokenError::WrongOrigin`, and one whose `channel_hash` isn't the adapter's channel with `WaitForTokenError::WrongChannel`. The channel check is what stops a `Tasks` token being satisfied by `Memories`' unrelated sequence numbers.
 
 ### Wire-up
 
@@ -322,25 +323,25 @@ let tasks = Tasks::open(redex, channel, origin_hash, cfg)?;
 let seq = tasks.create(1, "first", now_ns)?;      // now_ns: u64 wall-clock nanoseconds
 let _ = tasks.wait_for_seq(seq).await;            // block until the fold applied it
 // State now reflects the create — read tasks.state() safely.
-// For a deadline, wrap the seq: wait_for_token(WriteToken { origin_hash, seq }, dur).
+// For a deadline: tasks.wait_for_token(tasks.token(seq), dur).await
 ```
 
 ```python
 seq = tasks.create(1, 'first', now_ns())
 tasks.wait_for_seq(seq)
-# For a deadline: tasks.wait_for_token(token, deadline_ms=250)  (deadline_ms=0 = non-blocking poll)
+# For a deadline: tasks.wait_for_token(tasks.token(seq), deadline_ms=250)  (deadline_ms=0 = non-blocking poll)
 ```
 
 ```ts
 const seq = tasks.create(1n, 'first', BigInt(now()));
 await tasks.waitForSeq(seq);
-// For a deadline: await tasks.waitForToken(token, 250);  (deadlineMs === 0 = non-blocking poll)
+// For a deadline: await tasks.waitForToken(tasks.token(seq), 250);  (deadlineMs === 0 = non-blocking poll)
 ```
 
 ```go
 seq, _ := tasks.Create(1, "first", uint64(time.Now().UnixNano()))
 if err := tasks.WaitForToken(tasks.Token(seq), 250*time.Millisecond); err != nil { /* … */ }
-// Token(seq) = WriteToken{OriginHash, Seq}; a zero timeout polls once.
+// Token(seq) = WriteToken{OriginHash, ChannelHash, Seq}; a zero timeout polls once.
 ```
 
 ### Operational notes
@@ -349,7 +350,7 @@ if err := tasks.WaitForToken(tasks.Token(seq), 250*time.Millisecond); err != nil
 - **`FoldStopped` is a real error.** When `running == false` (fold task crashed under `FoldErrorPolicy::Stop`), the wait surfaces `WaitForTokenError::FoldStopped { applied_through_seq }` rather than resolving every pending RYW wait with a silent `Ok(())`.
 - **`deadline_ms == 0` is a non-blocking poll** across every binding. Synchronous applied-vs-token check; no wait scheduled.
 - **Process-wide in-flight cap.** `set_global_ryw_inflight_cap(usize)` sets a process-wide bound on outstanding RYW waiters; every `wait_for_token` does a two-tier acquire (process-wide then per-adapter). The default per-adapter cap is 1024 (`ryw_inflight_cap`, non-FIFO).
-- **Go tokens are on `TasksAdapter` and `MemoriesAdapter`.** CRUD returns `(seq, error)`; `Token(seq)` pairs it with the adapter's origin, and `WaitForToken` / `WaitForTokenContext` wait on it. `WorkflowAdapter` has no tokens, only `WaitForSeq`. Note the zero-timeout split: `WaitForToken(tok, 0)` polls once, while `WaitForSeq(seq, 0)` waits indefinitely.
+- **Go tokens are on `TasksAdapter` and `MemoriesAdapter`.** CRUD returns `(seq, error)`; `Token(seq)` pairs it with the adapter's origin and channel, and `WaitForToken` / `WaitForTokenContext` wait on it. `WorkflowAdapter` has no tokens, only `WaitForSeq`. Note the zero-timeout split: `WaitForToken(tok, 0)` polls once, while `WaitForSeq(seq, 0)` waits indefinitely.
 
 ---
 
@@ -360,7 +361,7 @@ if err := tasks.WaitForToken(tasks.Token(seq), 250*time.Millisecond); err != nil
 - **Gravity without greedy is allowed.** A node with `enable_gravity_for_greedy` but no `enable_greedy_dataforts` is the "drift-only" quadrant — already-placed replicas emit heat, but the node doesn't speculatively cache.
 - **`Redex::greedy_cache_for(channel) -> Option<RedexFile>`** returns the cache file if greedy admitted that chain; the caller falls back to a network fetch / substrate read path on `None`. The substrate doesn't auto-route reads through the cache — it's an explicit lookup.
 - **Blob refs aren't transactionally tied to the bus.** A `BlobRef` riding on a published event references bytes that the adapter must have stored *before* the event was published; if the consumer reads the event before the adapter persists the bytes, `blob_resolve` fails until the persist completes.
-- **`WriteToken` must come from the same adapter you wait on.** Cross-adapter tokens fail with `WrongOrigin`. The token isn't a generic "future state" handle — it's bound to one adapter's fold.
+- **`WriteToken` must come from an adapter over the same channel as the one you wait on.** A token from another origin fails with `WrongOrigin`, one from another channel with `WrongChannel`. The token isn't a generic "future state" handle — its seq only means something in its own channel.
 
 ---
 

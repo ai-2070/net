@@ -142,9 +142,7 @@ func (db *NetDb) Tasks() (*TasksAdapter, error) {
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	t := &TasksAdapter{handle: out, origin: db.origin}
-	runtime.SetFinalizer(t, (*TasksAdapter).free)
-	return t, nil
+	return newTasksAdapter(out, db.origin)
 }
 
 // Memories returns an independent MemoriesAdapter handle. Same
@@ -160,9 +158,7 @@ func (db *NetDb) Memories() (*MemoriesAdapter, error) {
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	m := &MemoriesAdapter{handle: out, origin: db.origin}
-	runtime.SetFinalizer(m, (*MemoriesAdapter).free)
-	return m, nil
+	return newMemoriesAdapter(out, db.origin)
 }
 
 // Snapshot captures a postcard-encoded `NetDbSnapshot` bundle. The

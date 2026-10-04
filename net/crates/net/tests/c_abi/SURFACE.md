@@ -12,7 +12,7 @@ both.
 | --- | ---: | ---: | ---: |
 | `net.go.h` | 218 | 105 | 120 |
 | `net.h` | 41 | 26 | 30 |
-| `net_cortex.h` | 92 | 2 | 8 |
+| `net_cortex.h` | 94 | 2 | 8 |
 | `net_deck.h` | 84 | 62 | 62 |
 | `net_mcp.h` | 22 | 20 | 20 |
 | `net_meshdb.h` | 28 | 25 | 25 |
@@ -298,6 +298,7 @@ both.
 | `net_memories_adapter_close` | – | – | – |
 | `net_memories_adapter_free` | – | – | – |
 | `net_memories_adapter_open` | – | – | – |
+| `net_memories_channel_hash` | – | – | – |
 | `net_memories_delete` | – | – | – |
 | `net_memories_list` | – | – | – |
 | `net_memories_pin` | – | – | – |
@@ -345,6 +346,7 @@ both.
 | `net_tasks_adapter_close` | – | – | – |
 | `net_tasks_adapter_free` | – | – | – |
 | `net_tasks_adapter_open` | – | – | – |
+| `net_tasks_channel_hash` | – | – | – |
 | `net_tasks_complete` | – | – | – |
 | `net_tasks_create` | – | – | – |
 | `net_tasks_delete` | – | – | – |

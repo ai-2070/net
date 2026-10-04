@@ -120,6 +120,16 @@ pub(crate) const NET_ERR_FEATURE_NOT_BUILT: c_int = -107;
 /// call. Caught with `catch_unwind` and reported here rather than
 /// unwinding across the FFI boundary (UB for C / cgo / Python).
 pub(crate) const NET_ERR_PANIC: c_int = -108;
+/// Read-your-writes wait rejected because the token was issued for a
+/// different channel than the adapter folds. Sequence numbers are per
+/// channel, so its seq names nothing here. See
+/// `WaitForTokenError::WrongChannel`.
+///
+/// `-160`, not the next code in this surface's `-100..-109` band: `-109`
+/// is `NET_ERR_MESH_STREAM_OCCUPIED` in the shared C enum, and a wait
+/// that can return either would make the two indistinguishable. `-160` is
+/// used by no surface.
+pub(crate) const NET_ERR_WRONG_CHANNEL: c_int = -160;
 
 /// Non-blocking poll variant of wait_for_token: checks origin
 /// binding and the applied watermark, returns immediately. Maps
@@ -137,6 +147,7 @@ fn tasks_poll_for_token(adapter: &Arc<InnerTasksAdapter>, token: InnerWriteToken
     match adapter.poll_for_token(token) {
         Ok(()) => 0,
         Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+        Err(InnerWaitForTokenError::WrongChannel { .. }) => NET_ERR_WRONG_CHANNEL,
         Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
         Err(_) => NET_ERR_TIMEOUT,
     }
@@ -146,6 +157,7 @@ fn memories_poll_for_token(adapter: &Arc<InnerMemoriesAdapter>, token: InnerWrit
     match adapter.poll_for_token(token) {
         Ok(()) => 0,
         Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+        Err(InnerWaitForTokenError::WrongChannel { .. }) => NET_ERR_WRONG_CHANNEL,
         Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
         Err(_) => NET_ERR_TIMEOUT,
     }
@@ -1663,6 +1675,27 @@ pub unsafe extern "C" fn net_tasks_adapter_open(
     }
 }
 
+/// Canonical hash of this adapter's channel, written to `*out_hash`: the
+/// `channel_hash` half of every token the adapter issues, and what
+/// [`net_tasks_wait_for_token`] requires. Returns `0`, `-1` for a NULL
+/// argument (nothing written), or the shutting-down code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_tasks_channel_hash(
+    handle: *mut TasksAdapterHandle,
+    out_hash: *mut u64,
+) -> c_int {
+    if handle.is_null() || out_hash.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let tasks = unsafe { &*handle };
+    let _op = match tasks.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    unsafe { *out_hash = tasks.inner.channel_hash() };
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_tasks_adapter_close(handle: *mut TasksAdapterHandle) -> c_int {
     if handle.is_null() {
@@ -1873,14 +1906,18 @@ pub unsafe extern "C" fn net_tasks_wait_for_seq(
     })
 }
 
-/// Read-your-writes wait. Returns `0` on success, `NET_ERR_TIMEOUT`
-/// (`1`) on deadline, `NET_ERR_WRONG_ORIGIN` (`-104`) if the token's
-/// origin does not match this adapter, or `NET_ERR_QUEUE_FULL`
-/// (`-105`) if the per-channel wait queue is saturated.
+/// Read-your-writes wait on the token `(origin_hash, channel_hash, seq)`.
+/// Returns `0` on success, `NET_ERR_TIMEOUT` (`1`) on deadline,
+/// `NET_ERR_WRONG_ORIGIN` (`-104`) if the token's origin does not match
+/// this adapter, `NET_ERR_WRONG_CHANNEL` (`-160`) if it was issued for
+/// another channel (see [`net_tasks_channel_hash`]), or
+/// `NET_ERR_QUEUE_FULL` (`-105`) if the per-channel wait queue is
+/// saturated.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_tasks_wait_for_token(
     handle: *mut TasksAdapterHandle,
     origin_hash: u64,
+    channel_hash: u64,
     seq: u64,
     timeout_ms: u32,
 ) -> c_int {
@@ -1893,7 +1930,7 @@ pub unsafe extern "C" fn net_tasks_wait_for_token(
         None => return NetError::ShuttingDown.into(),
     };
     let adapter: Arc<InnerTasksAdapter> = Arc::clone(&tasks.inner);
-    let token = InnerWriteToken::new(origin_hash, seq);
+    let token = InnerWriteToken::new(origin_hash, channel_hash, seq);
     // timeout_ms == 0 means "poll, don't wait": check the applied
     // watermark and origin without scheduling a Notified future.
     // Callers who want a minimum wait must pass at least 1.
@@ -1909,6 +1946,7 @@ pub unsafe extern "C" fn net_tasks_wait_for_token(
                 Ok(()) => 0,
                 Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
                 Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+                Err(InnerWaitForTokenError::WrongChannel { .. }) => NET_ERR_WRONG_CHANNEL,
                 Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
                 Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
             }
@@ -2272,6 +2310,27 @@ pub unsafe extern "C" fn net_memories_adapter_open(
     }
 }
 
+/// Canonical hash of this adapter's channel, written to `*out_hash`: the
+/// `channel_hash` half of every token the adapter issues, and what
+/// [`net_memories_wait_for_token`] requires. Returns `0`, `-1` for a NULL
+/// argument (nothing written), or the shutting-down code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_memories_channel_hash(
+    handle: *mut MemoriesAdapterHandle,
+    out_hash: *mut u64,
+) -> c_int {
+    if handle.is_null() || out_hash.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let mem = unsafe { &*handle };
+    let _op = match mem.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    unsafe { *out_hash = mem.inner.channel_hash() };
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_memories_adapter_close(handle: *mut MemoriesAdapterHandle) -> c_int {
     if handle.is_null() {
@@ -2554,6 +2613,7 @@ pub unsafe extern "C" fn net_memories_wait_for_seq(
 pub unsafe extern "C" fn net_memories_wait_for_token(
     handle: *mut MemoriesAdapterHandle,
     origin_hash: u64,
+    channel_hash: u64,
     seq: u64,
     timeout_ms: u32,
 ) -> c_int {
@@ -2566,7 +2626,7 @@ pub unsafe extern "C" fn net_memories_wait_for_token(
         None => return NetError::ShuttingDown.into(),
     };
     let adapter: Arc<InnerMemoriesAdapter> = Arc::clone(&mem.inner);
-    let token = InnerWriteToken::new(origin_hash, seq);
+    let token = InnerWriteToken::new(origin_hash, channel_hash, seq);
     // timeout_ms == 0 means "poll, don't wait" (mirrors the
     // contract on net_tasks_wait_for_token).
     if timeout_ms == 0 {
@@ -2579,6 +2639,7 @@ pub unsafe extern "C" fn net_memories_wait_for_token(
                 Ok(()) => 0,
                 Err(InnerWaitForTokenError::Timeout) => NET_ERR_TIMEOUT,
                 Err(InnerWaitForTokenError::WrongOrigin { .. }) => NET_ERR_WRONG_ORIGIN,
+                Err(InnerWaitForTokenError::WrongChannel { .. }) => NET_ERR_WRONG_CHANNEL,
                 Err(InnerWaitForTokenError::QueueFull) => NET_ERR_QUEUE_FULL,
                 Err(InnerWaitForTokenError::FoldStopped { .. }) => NET_ERR_FOLD_STOPPED,
             }

@@ -21,17 +21,25 @@
 # the matched pair (headers and library ship together, and a break means
 # rebuilding), recorded in the plan's "Compatibility boundary".
 #
-# #1167 (write tokens carry their channel) is not on this branch yet. When it
-# lands, it needs this entry, and one for net_memories_wait_for_token:
-#
-#   [[break]]
-#   symbol = "net_tasks_wait_for_token"
-#   baseline = "pre1167"
-#   old = "fn(*net_tasks_adapter_t, u64, u64, u32) -> i32"
-#   new = "fn(*net_tasks_adapter_t, u64, u64, u64, u32) -> i32"
-#   release = "0.40.0"
-#   reason = "#1167: a token is (origin, channel, seq); callers rebuild"
-#
 # Fields: symbol, old, new, release, reason (all required), baseline
 # (optional: the baseline name the change is against; omitted, it matches
 # any).
+
+# #1167: write tokens carry their channel, so both token waits take
+# (origin, channel, seq). Merged from master with this branch.
+
+[[break]]
+symbol = "net_tasks_wait_for_token"
+baseline = "pre1167"
+old = "fn(*net_tasks_adapter_t, u64, u64, u32) -> i32"
+new = "fn(*net_tasks_adapter_t, u64, u64, u64, u32) -> i32"
+release = "0.40.0"
+reason = "#1167: a token is (origin, channel, seq); callers rebuild"
+
+[[break]]
+symbol = "net_memories_wait_for_token"
+baseline = "pre1167"
+old = "fn(*net_memories_adapter_t, u64, u64, u32) -> i32"
+new = "fn(*net_memories_adapter_t, u64, u64, u64, u32) -> i32"
+release = "0.40.0"
+reason = "#1167: a token is (origin, channel, seq); callers rebuild"

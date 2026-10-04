@@ -31,7 +31,9 @@ package net
 
 import (
 	"errors"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -519,7 +521,7 @@ func TestABIStabilityHeadersDeclareReturnedCodes(t *testing.T) {
 		"net_cortex.h": {
 			"NET_ERR_TIMEOUT", "NET_ERR_STREAM_ENDED", "NET_ERR_WRONG_ORIGIN",
 			"NET_ERR_QUEUE_FULL", "NET_ERR_FOLD_STOPPED", "NET_ERR_FEATURE_NOT_BUILT",
-			"NET_ERR_PANIC",
+			"NET_ERR_PANIC", "NET_ERR_WRONG_CHANNEL",
 		},
 	}
 	for name := range blob {
@@ -652,5 +654,112 @@ func TestABIStabilityMeshDbPayloadKindsMatchRust(t *testing.T) {
 	}
 	if !strings.Contains(string(src), "pub unsafe extern \"C\" fn net_meshdb_decode_payload_json_as(\n    kind: c_int,\n    payload: *const u8,\n    payload_len: usize,\n)") {
 		t.Error("meshdb-ffi's net_meshdb_decode_payload_json_as is not (kind: c_int, payload: *const u8, payload_len: usize)")
+	}
+}
+
+// TestABIStabilityWriteTokenCarriesTheChannel pins the channel-bound token
+// surface: both waits take (origin, channel, seq) plus the timeout, the
+// channel accessors exist with the Rust arity, and -160 is ErrWrongChannel.
+// -160 is pinned as unused by every other surface: the first choice, -109,
+// is NET_ERR_MESH_STREAM_OCCUPIED in the shared enum (cubic, #1167).
+//
+// Before, a token was (origin, seq), and a Tasks token could be satisfied
+// by Memories' unrelated numbering.
+func TestABIStabilityWriteTokenCarriesTheChannel(t *testing.T) {
+	requireCrateTree(t)
+	src, err := os.ReadFile("../net/crates/net/src/ffi/cortex.rs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := parseHeader(t, "net_cortex.h")
+	for name, want := range map[string]int{
+		"net_tasks_wait_for_token":    5,
+		"net_memories_wait_for_token": 5,
+		"net_tasks_channel_hash":      2,
+		"net_memories_channel_hash":   2,
+	} {
+		params, ok := h.fns[name]
+		if !ok {
+			t.Errorf("%s is not declared in go/net_cortex.h", name)
+			continue
+		}
+		if got := strings.Count(params, ",") + 1; got != want {
+			t.Errorf("%s: header declares %d parameters, want %d", name, got, want)
+		}
+		def := regexp.MustCompile(`pub unsafe extern "C" fn ` + name + `\(([^)]*)\)`).FindStringSubmatch(string(src))
+		if def == nil {
+			t.Errorf("%s is not defined in src/ffi/cortex.rs", name)
+			continue
+		}
+		got := 0
+		for _, p := range strings.Split(def[1], ",") {
+			if strings.TrimSpace(p) != "" {
+				got++
+			}
+		}
+		if got != want {
+			t.Errorf("%s: Rust takes %d parameters, want %d", name, got, want)
+		}
+	}
+	if !strings.Contains(string(src), "pub(crate) const NET_ERR_WRONG_CHANNEL: c_int = -160;") {
+		t.Error("NET_ERR_WRONG_CHANNEL is no longer -160 in src/ffi/cortex.rs")
+	}
+	if err := tokenErrorFromInt(-160); !errors.Is(err, ErrWrongChannel) {
+		t.Errorf("code -160 maps to %v, want ErrWrongChannel", err)
+	}
+	// The mesh surface's -109 must not read as a wrong channel.
+	if err := tokenErrorFromInt(-109); errors.Is(err, ErrWrongChannel) {
+		t.Error("code -109 (NET_ERR_MESH_STREAM_OCCUPIED) maps to ErrWrongChannel")
+	}
+	// net_cortex.h declares the code by name (the C SDK audit requires every
+	// returned code to be declared), and no other constant in a shared
+	// header may also be -160.
+	if got := parseHeader(t, "net_cortex.h").consts["NET_ERR_WRONG_CHANNEL"]; got != "-160" {
+		t.Errorf("go/net_cortex.h declares NET_ERR_WRONG_CHANNEL as %q, want -160", got)
+	}
+	for _, hdr := range []string{"net.h", "net_cortex.h"} {
+		for name, value := range parseHeader(t, hdr).consts {
+			if value == "-160" && name != "NET_ERR_WRONG_CHANNEL" {
+				t.Errorf("%s defines %s = -160, colliding with NET_ERR_WRONG_CHANNEL", hdr, name)
+			}
+		}
+	}
+	// No Rust FFI source may define -160 either, except the one constant.
+	// Every .rs file under both trees is scanned, so a new or renamed file
+	// cannot fall outside the check, and a missing tree fails the test
+	// instead of passing it with nothing scanned.
+	defines := regexp.MustCompile(`=\s*-160\s*;`)
+	var found []string
+	for _, root := range []string{"../net/crates/net/src/ffi", "../net/crates/net/bindings/go"} {
+		scanned := 0
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() && d.Name() == "target" {
+				return filepath.SkipDir
+			}
+			if d.IsDir() || filepath.Ext(path) != ".rs" {
+				return nil
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			scanned++
+			for range defines.FindAllIndex(body, -1) {
+				found = append(found, filepath.ToSlash(path))
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("scanning %s: %v", root, err)
+		}
+		if scanned == 0 {
+			t.Fatalf("scanned no .rs files under %s", root)
+		}
+	}
+	if want := []string{"../net/crates/net/src/ffi/cortex.rs"}; strings.Join(found, ",") != strings.Join(want, ",") {
+		t.Errorf("-160 is defined at %v; only NET_ERR_WRONG_CHANNEL in src/ffi/cortex.rs may", found)
 	}
 }

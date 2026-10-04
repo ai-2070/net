@@ -14,6 +14,7 @@ from net._net import (
     MemoriesAdapter,
     Redex,
     TasksAdapter,
+    WriteToken,
 )
 
 ORIGIN = 0xABCDEF01
@@ -387,3 +388,45 @@ def test_multi_model_coexistence() -> None:
     assert tasks.count() == 1
     assert memories.count() == 2
     assert [m.id for m in memories.list_memories(pinned=True)] == [1]
+
+
+# =========================================================================
+# Write tokens carry their channel
+# =========================================================================
+
+
+def test_write_token_names_origin_channel_and_seq() -> None:
+    redex = Redex()
+    tasks = TasksAdapter.open(redex, ORIGIN)
+    seq = tasks.create(1, "token me", 100)
+    tok = tasks.token(seq)
+    assert (tok.origin_hash, tok.channel_hash, tok.seq) == (ORIGIN, tasks.channel_hash(), seq)
+    assert WriteToken.from_string(str(tok)) == tok
+    tasks.wait_for_token(tok, deadline_ms=2000)
+    assert tasks.count() == 1
+    # No public constructor, and the old two-part string form is refused.
+    with pytest.raises(TypeError):
+        WriteToken(ORIGIN, seq)  # type: ignore[call-arg]
+    with pytest.raises(ValueError):
+        WriteToken.from_string(f"{ORIGIN:016x}:{seq}")
+
+
+def test_a_tasks_token_is_refused_by_memories_with_the_same_origin() -> None:
+    # Tasks and Memories number their writes independently. Memories is
+    # past the task's seq below, so a channel-less token passed here.
+    redex = Redex()
+    tasks = TasksAdapter.open(redex, ORIGIN)
+    memories = MemoriesAdapter.open(redex, ORIGIN)
+    assert tasks.channel_hash() != memories.channel_hash()
+    mem_seq = 0
+    for i in range(3):
+        mem_seq = memories.store(i, "m", [], "src", 100 + i)
+    memories.wait_for_token(memories.token(mem_seq), deadline_ms=2000)
+    task_seq = tasks.create(1, "t", 100)
+    assert task_seq <= mem_seq
+
+    tok = tasks.token(task_seq)
+    for deadline in (0, 2000):
+        with pytest.raises(CortexError, match="channel"):
+            memories.wait_for_token(tok, deadline_ms=deadline)
+    tasks.wait_for_token(tok, deadline_ms=2000)

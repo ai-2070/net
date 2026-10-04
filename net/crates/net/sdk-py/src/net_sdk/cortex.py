@@ -16,10 +16,9 @@ Example::
     import net_sdk.redex as redex
 
     r = redex.Redex(persistent_dir="/var/lib/net/redex")
-    with cortex.tasks_cm(r, channel="app/tasks", origin_hash=0xDEADBEEF,
-                         persistent=True) as tasks:
-        result = tasks.create(1, "first", now_ns=1_000_000_000)
-        tasks.wait_for_token(result.token, deadline_ms=250)
+    with cortex.tasks_cm(r, origin_hash=0xDEADBEEF, persistent=True) as tasks:
+        seq = tasks.create(1, "first", 1_000_000_000)
+        tasks.wait_for_token(tasks.token(seq), deadline_ms=250)
         for snap in tasks.watch():
             ...
 """
@@ -89,14 +88,14 @@ __all__ = [
 
 @contextmanager
 def tasks_cm(
-    redex: Redex, *, channel: str, origin_hash: int, **config: Any
+    redex: Redex, *, origin_hash: int, **config: Any
 ) -> Iterator[TasksAdapter]:
     """Open a TasksAdapter and close it on scope exit. ``config`` kwargs
-    mirror the underlying ``TasksAdapter.open`` signature
-    (``persistent``, ``retention_max_age_secs``, ...)."""
-    adapter = TasksAdapter.open(
-        redex, channel=channel, origin_hash=origin_hash, **config
-    )
+    are forwarded to ``TasksAdapter.open`` (today only ``persistent``).
+    The channel is fixed (``cortex/tasks``), so there is no ``channel``
+    argument: the native ``open`` has none, and passing one raised
+    ``TypeError``."""
+    adapter = TasksAdapter.open(redex, origin_hash=origin_hash, **config)
     try:
         yield adapter
     finally:
@@ -108,13 +107,11 @@ def tasks_cm(
 
 @contextmanager
 def memories_cm(
-    redex: Redex, *, channel: str, origin_hash: int, **config: Any
+    redex: Redex, *, origin_hash: int, **config: Any
 ) -> Iterator[MemoriesAdapter]:
     """Open a MemoriesAdapter and close it on scope exit. Same shape
-    as :func:`tasks_cm`."""
-    adapter = MemoriesAdapter.open(
-        redex, channel=channel, origin_hash=origin_hash, **config
-    )
+    as :func:`tasks_cm`; the channel is fixed (``cortex/memories``)."""
+    adapter = MemoriesAdapter.open(redex, origin_hash=origin_hash, **config)
     try:
         yield adapter
     finally:

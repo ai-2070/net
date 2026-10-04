@@ -159,10 +159,13 @@ fn parse_memories_order_by(s: &str) -> PyResult<InnerMemoriesOrderBy> {
 // paths and consumed by read-your-writes wait primitives.
 // =========================================================================
 
-/// Address of a single write on a specific origin's chain. Pair it
-/// with a typed adapter's `wait_for_token(token, deadline_ms=...)`
-/// to make sure that adapter's fold has caught up to the write
-/// before reading state.
+/// Address of a single write: its origin, the channel it was written
+/// to, and its sequence number there. Get one from the adapter that made
+/// the write (`tasks.token(seq)`) and pair it with that adapter's
+/// `wait_for_token(token, deadline_ms=...)` to make sure the fold has
+/// caught up before reading state. There is no public constructor:
+/// sequence numbers are per channel, so a token is only meaningful with
+/// the channel its adapter stamps on it.
 #[pyclass(name = "WriteToken", frozen, eq, hash, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PyWriteToken {
@@ -171,16 +174,14 @@ pub struct PyWriteToken {
 
 #[pymethods]
 impl PyWriteToken {
-    #[new]
-    fn new(origin_hash: u64, seq: u64) -> Self {
-        Self {
-            inner: InnerWriteToken::new(origin_hash, seq),
-        }
-    }
-
     #[getter]
     fn origin_hash(&self) -> u64 {
         self.inner.origin_hash
+    }
+
+    #[getter]
+    fn channel_hash(&self) -> u64 {
+        self.inner.channel_hash
     }
 
     #[getter]
@@ -188,7 +189,8 @@ impl PyWriteToken {
         self.inner.seq
     }
 
-    /// Parse a token from its `<16-hex-origin>:<seq>` string form.
+    /// Parse a token from its `<16-hex-origin>:<16-hex-channel>:<seq>`
+    /// string form (what `str(token)` produces).
     #[staticmethod]
     fn from_string(s: &str) -> PyResult<Self> {
         s.parse::<InnerWriteToken>()
@@ -202,8 +204,8 @@ impl PyWriteToken {
 
     fn __repr__(&self) -> String {
         format!(
-            "WriteToken(origin_hash=0x{:x}, seq={})",
-            self.inner.origin_hash, self.inner.seq
+            "WriteToken(origin_hash=0x{:x}, channel_hash=0x{:x}, seq={})",
+            self.inner.origin_hash, self.inner.channel_hash, self.inner.seq
         )
     }
 }
@@ -1536,9 +1538,25 @@ impl PyTasksAdapter {
         })
     }
 
+    /// Hash of this adapter's channel: the ``channel_hash`` of every
+    /// token it issues. A token for another channel is refused.
+    fn channel_hash(&self) -> u64 {
+        self.inner.channel_hash()
+    }
+
+    /// The ``WriteToken`` naming the write that returned ``seq`` on this
+    /// adapter: its origin, its channel and ``seq``. Pass it to
+    /// ``wait_for_token``.
+    fn token(&self, seq: u64) -> PyWriteToken {
+        PyWriteToken {
+            inner: self.inner.token(seq),
+        }
+    }
+
     /// Read-your-writes wait. Blocks until this adapter's fold has
     /// applied through `token.seq`, or `deadline_ms` elapses.
-    /// Raises `CortexError` on timeout, on a wrong-origin token, or
+    /// Raises `CortexError` on timeout, on a wrong-origin or
+    /// wrong-channel token, or
     /// when the per-channel wait queue is saturated. GIL is released
     /// for the wait.
     ///
@@ -2080,8 +2098,23 @@ impl PyMemoriesAdapter {
         })
     }
 
+    /// Hash of this adapter's channel: the ``channel_hash`` of every
+    /// token it issues. A token for another channel is refused.
+    fn channel_hash(&self) -> u64 {
+        self.inner.channel_hash()
+    }
+
+    /// The ``WriteToken`` naming the write that returned ``seq`` on this
+    /// adapter: its origin, its channel and ``seq``. Pass it to
+    /// ``wait_for_token``.
+    fn token(&self, seq: u64) -> PyWriteToken {
+        PyWriteToken {
+            inner: self.inner.token(seq),
+        }
+    }
+
     /// Read-your-writes wait. Mirrors `TasksAdapter.wait_for_token`
-    /// — raises `CortexError` on timeout, wrong-origin, or queue-
+    /// — raises `CortexError` on timeout, wrong-origin, wrong-channel, or queue-
     /// full saturation. `deadline_ms == 0` is a non-blocking poll
     /// (same contract as the FFI / Node / Go bindings).
     #[pyo3(signature = (token, deadline_ms = 1000))]
@@ -2735,6 +2768,21 @@ impl PyAsyncMemoriesAdapter {
         })
     }
 
+    /// Hash of this adapter's channel: the ``channel_hash`` of every
+    /// token it issues. A token for another channel is refused.
+    fn channel_hash(&self) -> u64 {
+        self.inner.channel_hash()
+    }
+
+    /// The ``WriteToken`` naming the write that returned ``seq`` on this
+    /// adapter: its origin, its channel and ``seq``. Pass it to
+    /// ``wait_for_token``.
+    fn token(&self, seq: u64) -> PyWriteToken {
+        PyWriteToken {
+            inner: self.inner.token(seq),
+        }
+    }
+
     /// Read-your-writes wait. `deadline_ms == 0` is a non-blocking
     /// poll (raises immediately if the token isn't ready).
     #[pyo3(signature = (token, deadline_ms = 1000))]
@@ -3151,6 +3199,21 @@ impl PyAsyncTasksAdapter {
             })?;
             Ok::<(), PyErr>(())
         })
+    }
+
+    /// Hash of this adapter's channel: the ``channel_hash`` of every
+    /// token it issues. A token for another channel is refused.
+    fn channel_hash(&self) -> u64 {
+        self.inner.channel_hash()
+    }
+
+    /// The ``WriteToken`` naming the write that returned ``seq`` on this
+    /// adapter: its origin, its channel and ``seq``. Pass it to
+    /// ``wait_for_token``.
+    fn token(&self, seq: u64) -> PyWriteToken {
+        PyWriteToken {
+            inner: self.inner.token(seq),
+        }
     }
 
     /// Read-your-writes wait. `deadline_ms == 0` is non-blocking.
