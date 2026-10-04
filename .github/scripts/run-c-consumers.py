@@ -65,6 +65,13 @@ if hasattr(sys.stdout, "reconfigure"):
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = ROOT / "net" / "crates" / "net" / "examples" / "c"
 SUPPORT = EXAMPLES / "support"
+C_ABI = ROOT / "net" / "crates" / "net" / "tests" / "c_abi"
+ARMING = C_ABI / "arming"
+LSAN_SUPP = C_ABI / "lsan.supp"
+SANITIZE_FLAGS = [
+    "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+    "-fno-omit-frame-pointer", "-g", "-O1",
+]
 FLOORS = EXAMPLES / "FLOORS"
 LIB_NAMES = ("libnet.so", "libnet.dylib", "net.dll")
 IS_WINDOWS = os.name == "nt"
@@ -73,6 +80,12 @@ MODULE_RE = re.compile(r"^NET-LOADED-MODULE: (.+?)\s*$", re.M)
 MODULE_ERR_RE = re.compile(r"^NET-LOADED-MODULE-ERROR: (.+?)\s*$", re.M)
 CHECKS_RE = re.compile(r"^NET-CHECKS: (\d+)\s*$", re.M)
 OK_LINE_RE = re.compile(r"^ok ", re.M)
+# The first line of an ASan / LSan / UBSan report.
+SANITIZER_RE = re.compile(
+    r"^(?:==\d+==)?ERROR: (?:AddressSanitizer|LeakSanitizer)[^\n]*|^[^\n]*runtime error:[^\n]*", re.M
+)
+# LSan's `print_suppressions=1` table: `   <count>   <bytes> <template>`.
+SUPP_ROW_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s*$", re.M)
 
 
 # ---------------------------------------------------------------- bundle ----
@@ -128,6 +141,28 @@ def same_path(a: str | Path, b: str | Path) -> bool:
 
 
 # ----------------------------------------------------------- environment ----
+
+
+def sanitizer_env() -> dict[str, str]:
+    """ASan + LSan + UBSan settings for a sanitized run. Full unwinding on
+    malloc, so a leak's allocation stack reaches into the uninstrumented
+    library; LSan intercepts the system allocator Rust uses, which is what
+    lets it see a buffer libnet returned and the program never freed."""
+    return {
+        "ASAN_OPTIONS": "detect_leaks=1:fast_unwind_on_malloc=0:malloc_context_size=40:"
+                        "halt_on_error=1:exitcode=23:symbolize=1",
+        "LSAN_OPTIONS": f"suppressions={LSAN_SUPP}:print_suppressions=1:exitcode=23",
+        "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1",
+    }
+
+
+def suppression_summary(out: str) -> list[str]:
+    """`<template>: <count> block(s), <bytes> bytes` for each suppression
+    LSan used, so retained allocations are reported, not hidden."""
+    if "Suppressions used:" not in out:
+        return []
+    table = out.split("Suppressions used:", 1)[1]
+    return [f"{t}: {c} block(s), {b} bytes" for c, b, t in SUPP_ROW_RE.findall(table)]
 
 
 def child_env(bundle: Bundle, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -190,7 +225,8 @@ def pick_compiler(requested: str) -> str:
 
 
 def compile_program(
-    compiler: str, bundle: Bundle, src: Path, out_dir: Path, extra_link: list[str] | None = None
+    compiler: str, bundle: Bundle, src: Path, out_dir: Path, extra_link: list[str] | None = None,
+    sanitize: bool = False,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     exe = out_dir / (src.stem + (".exe" if IS_WINDOWS else ""))
@@ -201,6 +237,7 @@ def compile_program(
         cc = os.environ.get("CC", "cc")
         cmd = [
             cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-fPIE", "-pie",
+            *(SANITIZE_FLAGS if sanitize else []),
             "-I", str(bundle.include), "-I", str(SUPPORT),
             str(src), *support,
             "-L", str(bundle.lib), "-lnet", "-ldl", "-lpthread", "-lm",
@@ -235,6 +272,8 @@ def compile_program(
         cmd = [cl]
     else:
         raise SystemExit(f"FAIL  unknown compiler {compiler}")
+    if sanitize and compiler != "gcc":
+        raise SystemExit("FAIL  --sanitize is the Linux GCC lane (ASan/UBSan/LSan)")
     if run.returncode != 0:
         print(f"✗ {src.name}: compile failed ({compiler})")
         print("    " + " ".join(cmd))
@@ -252,7 +291,7 @@ def _indent(text: str) -> str:
 
 @dataclass
 class Verdict:
-    kind: str  # "ok" | "identity" | "failed"
+    kind: str  # "ok" | "identity" | "sanitizer" | "failed"
     reason: str
     module: str | None = None
     checks: int = 0
@@ -275,6 +314,9 @@ def classify(stdout: str, rc: int, expected_lib: Path, expected_sha: str, hash_o
     actual = hash_of(Path(module))
     if actual != expected_sha:
         return Verdict("identity", f"{module} SHA-256 {actual[:12]}… != PROVENANCE {expected_sha[:12]}…", module, 0, calls)
+    san = SANITIZER_RE.search(stdout)
+    if san:
+        return Verdict("sanitizer", san.group(0).strip(), module, 0, calls)
     if rc != 0:
         return Verdict("failed", f"exit {rc}", module, 0, calls)
     c = CHECKS_RE.search(stdout)
@@ -353,8 +395,8 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
         if need is not None and need != bundle.profile:
             print(f"  – {name}: needs the {need} bundle; not run against the {bundle.profile} bundle")
             continue
-        exe = compile_program(compiler, bundle, src, work / name)
-        env = child_env(bundle)
+        exe = compile_program(compiler, bundle, src, work / name, sanitize=args.sanitize)
+        env = child_env(bundle, sanitizer_env() if args.sanitize else None)
         refuse_strays(bundle, env, exe.parent)
         rc, out = run_exe(exe, env, args.timeout)
         v = classify(out, rc, bundle.library, bundle.sha256)
@@ -366,9 +408,45 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
         elif v.kind == "ok":
             print(f"  ▶ {name}: {v.checks} named checks (floor {floors.get(name, 0)}); "
                   f"loaded {v.module} (SHA-256 matches PROVENANCE)")
+            for line in suppression_summary(out):
+                print(f"      retained (suppressed): {line}")
         else:
             print(f"✗ {name}: {v.kind}: {v.reason}")
             sys.stdout.write(_indent(out))
+            failures += 1
+    return failures
+
+
+EXPECT_RE = re.compile(r"NET-EXPECT:\s*(.+?)\s*$", re.M)
+
+
+def arming_runs(args, bundle: Bundle, compiler: str, work: Path) -> int:
+    """C5's arming negatives. Each program plants one defect at the boundary
+    the sanitizer lane claims to cover. Each must exit non-zero with a
+    SANITIZER verdict whose report matches every `NET-EXPECT: <regex>` in
+    its header; a crash during setup, a failed check, or a sanitizer report
+    about something else does not count."""
+    failures = 0
+    programs = sorted(ARMING.glob("*.c"))
+    if not programs:
+        print(f"✗ no arming programs in {ARMING}")
+        return 1
+    for src in programs:
+        expects = EXPECT_RE.findall(src.read_text(encoding="utf-8")[:4000])
+        if not expects:
+            print(f"✗ arming {src.stem}: no NET-EXPECT line")
+            failures += 1
+            continue
+        exe = compile_program(compiler, bundle, src, work / "arming" / src.stem, sanitize=True)
+        rc, out = run_exe(exe, child_env(bundle, sanitizer_env()), args.timeout)
+        v = classify(out, rc, bundle.library, bundle.sha256)
+        missing = [e for e in expects if not re.search(e, out)]
+        if rc != 0 and v.kind == "sanitizer" and not missing:
+            print(f"  ▶ arming {src.stem}: caught — {v.reason[:110]}")
+        else:
+            print(f"✗ arming {src.stem}: expected a sanitizer report matching {expects}; "
+                  f"got exit {rc}, {v.kind} ({v.reason}); unmatched: {missing}")
+            sys.stdout.write(_indent(out[-4000:]))
             failures += 1
     return failures
 
@@ -475,6 +553,20 @@ def self_test() -> int:
              classify(f"NET-LOADED-MODULE: {good}\nNET-CHECKS: 0\n", 0, good, gsha), "failed")
         case("a non-zero exit fails",
              classify(f"NET-LOADED-MODULE: {good}\nNET-CHECKS: 3\n", 1, good, gsha), "failed")
+        case("an ASan report is a sanitizer verdict, even after the checks passed",
+             classify(f"NET-LOADED-MODULE: {good}\nok a\nNET-CHECKS: 1\n==4242==ERROR: AddressSanitizer: "
+                      "attempting double-free on 0x602\n", 23, good, gsha), "sanitizer", "double-free")
+        case("an LSan report is a sanitizer verdict",
+             classify(f"NET-LOADED-MODULE: {good}\nNET-CHECKS: 1\n==1==ERROR: LeakSanitizer: detected "
+                      "memory leaks\n", 23, good, gsha), "sanitizer", "detected memory leaks")
+        case("a UBSan report is a sanitizer verdict",
+             classify(f"NET-LOADED-MODULE: {good}\nNET-CHECKS: 1\nx.c:3:5: runtime error: signed integer "
+                      "overflow\n", 1, good, gsha), "sanitizer", "runtime error")
+        rows = suppression_summary("...\nSuppressions used:\n  count      bytes template\n"
+                                   "      1         24 net_mesh_free\n      3        512 tokio\n")
+        ok = rows == ["net_mesh_free: 1 block(s), 24 bytes", "tokio: 3 block(s), 512 bytes"]
+        print(f"{'✓' if ok else '✗'} self-test: LSan's suppression table is reported per class")
+        failures += 0 if ok else 1
         case("a call after a wrong module is recorded",
              classify(f"NET-LOADED-MODULE: {other}\nok a\n", 0, good, gsha), "identity", calls=True)
 
@@ -501,6 +593,10 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=120, help="seconds per run")
     ap.add_argument("--negative-controls", action="store_true", help="also run the identity negative controls")
     ap.add_argument("--shadow-library", type=Path, help="a different libnet, for the shadowing control")
+    ap.add_argument("--sanitize", action="store_true",
+                    help="C5 Linux lane: build with ASan/UBSan, run with LSan and tests/c_abi/lsan.supp")
+    ap.add_argument("--arming", action="store_true",
+                    help="also run tests/c_abi/arming/*.c, each of which must be caught by the sanitizers")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
@@ -519,7 +615,11 @@ def main() -> int:
     work = (args.work or bundle.root.parent / f"consumers-{compiler}").resolve()
     print(f"==> {bundle.profile} bundle {bundle.root.name}, compiler {compiler}")
 
+    if args.sanitize:
+        work = work.parent / (work.name + "-sanitize")
     failures = run_programs(args, bundle, compiler, work)
+    if args.arming:
+        failures += arming_runs(args, bundle, compiler, work)
     if args.negative_controls:
         failures += negative_controls(args, bundle, compiler, work)
     if failures:

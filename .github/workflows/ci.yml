@@ -5344,6 +5344,22 @@ jobs:
           "$PY" .github/scripts/run-c-consumers.py --bundle "$HELPER_BUNDLE" --compiler "$c" \
             --negative-controls --shadow-library "$shadow"
 
+      # C5, the Linux checker lane. Every consumer program again, built with
+      # ASan + UBSan and run with LeakSanitizer against the UNINSTRUMENTED
+      # libnet.so. What it can see: the programs' own memory access, and
+      # library-returned buffers, through the intercepted system allocator
+      # Rust uses. What it cannot: accesses inside the Rust code. Retained
+      # library allocations are suppressed one class at a time
+      # (tests/c_abi/lsan.supp), and each run prints what each class absorbed.
+      # The arming programs then plant a leaked net_fetch_blob buffer, a
+      # double release of one, and a double release of a callback buffer;
+      # each must be caught with its named report, or the lane is not armed.
+      - name: Consumers — sanitizer lane (ASan, UBSan, LSan)
+        if: runner.os == 'Linux'
+        run: |
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler gcc --sanitize --arming
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$HELPER_BUNDLE" --compiler gcc --sanitize
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
