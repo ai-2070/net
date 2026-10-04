@@ -1,0 +1,34 @@
+net/crates/net/examples/c/islands.c
+  s_17a2ac60d914fc::t_210cecda3db623 55
+  s_17a2ac60d914fc::t_b65483062b2c0e 121-124
+  s_17a2ac60d914fc::t_88032514f85b86 1-54,56-120,125-134
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_6d2d1414e9bdeb 19
+  s_17a2ac60d914fc::t_58552428d7d301 20
+net/crates/net/examples/c/streams.c
+  s_17a2ac60d914fc::t_abed2af576ae89 1-151
+.claude/skills/net-event-bus/bindings/coverage.md
+  s_17a2ac60d914fc::t_743b8e1e5d2f39 93,97,176,180
+docs/data/capabilities/event-bus.yaml
+  s_17a2ac60d914fc::t_2c429a232d8a1e 253,255-256,330,332-333
+net/crates/net/tests/c_abi/SURFACE.md
+  s_17a2ac60d914fc::t_c593ca3d0eee33 13,124-125,150,172,174,183-185,188-190,195,200-202,206-213,240,263
+web/src/lib/generated/capability-record.json
+  s_17a2ac60d914fc::t_26e858290adde4 422,482
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7dc6d082b884d1e7e7ab1175a6486e88df896374",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
