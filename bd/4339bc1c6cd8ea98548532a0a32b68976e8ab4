@@ -1,0 +1,21 @@
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_6c7c1892ca682c 634-642
+net/crates/net/tests/error_kind_mirror.rs
+  s_17a2ac60d914fc::t_94f5861600a075 30,32-33,119-136,193-198
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bd4339bc1c6cd8ea98548532a0a32b68976e8ab4",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
