@@ -607,7 +607,7 @@ def load_release_baseline(ref: str) -> Baseline:
     # `git ls-tree` exits 0 on a path the ref does not have: a moved include
     # directory, or a release with another layout, would otherwise compare
     # against nothing and pass.
-    if not headers or not any(h.functions for h in headers.values()):
+    if not any(h.functions or h.constants or h.structs for h in headers.values()):
         raise SystemExit(f"FAIL  {ref} has no C headers with declarations under net/crates/net/include/; "
                          "the compatibility baseline would be empty")
     return Baseline(ref, headers)
@@ -819,7 +819,9 @@ def lint_consumer_sources(root: Path = EXAMPLES_C) -> list[Finding]:
             reached, via_support = _calls_through_support(M.c_code(raw), support)
             for fn in reached:
                 if fn.endswith("_fns"):
-                    owner = support[fn][0].read_text(encoding="utf-8")
+                    # Comments and string literals removed, CLM_FN entries
+                    # kept: a mention in prose lists nothing.
+                    owner = M._C_COMMENT_OR_STRING.sub(" ", support[fn][0].read_text(encoding="utf-8"))
                     listed |= set(_CLM_FN_NAME.findall(owner))
                     for macro, fns in macros.items():
                         if re.search(rf"\b{macro}\b", owner):
@@ -1151,6 +1153,20 @@ def self_test() -> int:
         print(f"{'✓' if ok else '✗'} self-test: a support header's CU_*_FNS list covers its helper's calls"
               + ("" if ok else f" (got {got})"))
         failures += 0 if ok else 1
+        # An accessor whose comment merely names a list macro lists nothing.
+        (lint_root / "support" / "lister.c").write_text(
+            "/* not CU_HELP_FNS, and not CLM_FN(net_mesh_start) */\n"
+            "size_t cu_list_fns(clm_fn_t* out, size_t cap) { return 0; }\n", encoding="utf-8")
+        (lint_root / "bad.c").write_text(
+            "static const clm_fn_t used[] = {CLM_FN(net_version)};\n"
+            "int main(void) { clm_check_loaded_module(used, 1); cu_list_fns(0, 0); return cu_help(0); }\n",
+            encoding="utf-8")
+        got = lint_consumer_sources(lint_root)
+        ok = any("net_mesh_start through a support helper" in f.message for f in got)
+        print(f"{'✓' if ok else '✗'} self-test: a list macro or CLM_FN named only in an accessor's comment "
+              "lists nothing" + ("" if ok else f" (got {got})"))
+        failures += 0 if ok else 1
+        (lint_root / "support" / "lister.c").unlink()
         (lint_root / "bad.c").unlink()
 
         # Allowlist: an entry suppresses exactly its finding, and a stale entry fails.
