@@ -1,0 +1,21 @@
+.github/scripts/check-c-abi.py
+  s_9023e047bdb7d7::t_8899239a26d634 999-1000
+  s_9023e047bdb7d7::t_75d3d57dac5888 1039
+  s_9023e047bdb7d7::t_87d6c26591202e 456-460,606-613
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1fb33914d0a539e23bd35e25a585453fca2f532b",
+  "prompts": {},
+  "sessions": {
+    "s_9023e047bdb7d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13ae6289-5780-436a-aa27-88954cc36586",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
