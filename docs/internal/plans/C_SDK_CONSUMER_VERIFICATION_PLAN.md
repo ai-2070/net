@@ -1147,6 +1147,38 @@ At this commit:
   lint rule over every consumer program (with a self-test), and the test
   went with the file.
 
+**Follow-up (2026-10-04): the partial cells closed.** Twelve new
+consumer programs, each run in every C5 lane:
+
+| Program | Covers | Named checks |
+| --- | --- | ---: |
+| `capabilities.c` | filter DSL and capability helpers, against six cross-language fixtures | 287 |
+| `mcp.c` | MCP helpers and consent / pin store, against the MCP fixtures | 79 |
+| `redis_dedup.c` | the consumer-side dedup window | 25 |
+| `meshdb.c` | the MeshDB query layer (found D-C6-1) | 69 |
+| `compute.c` | a C daemon behind the compute dispatcher; fork and replica groups | 58 |
+| `deck.c` | the Deck operator surface (found D-C6-2) | 78 |
+| `streams.c` | per-peer streams and the stream inbox | 36 |
+| `islands.c` | the gang-claim scheduler | 31 |
+| `aggregator.c` | registry and fold-query clients, from a `net.h`-only unit | 22 |
+| `meshos.c` | the MeshOS daemon-author SDK | 39 |
+| `org_call.c` | a unary protected org call, cross-org (org scenario) | 40 |
+| `subnet.c` | gateway provisioning, exported serve and call (subnet scenario) | 43 |
+
+- **Scenarios.** Org and subnet credentials are issued material, so the
+  runner generates them per invocation with the in-repo generators the
+  other bindings' live tests load. A program declares
+  `NET-NEEDS: org-scenario | subnet-scenario`.
+- **Result.** 22 of 23 positive C cells name a running program: 20
+  `supported`; Deck and CortEX folds `partial` with evidence and their
+  stated gaps (D-C6-2; a successful fold query needs the aggregator
+  daemon, which C cannot serve); membership rejection `partial` for its
+  collapsed taxonomy. Every header now has a C caller
+  (`tests/c_abi/SURFACE.md`).
+- **D-C5-1** was fixed in two halves along the way (see Defects).
+- **Generated fixture headers.** `gen-c-fixture-cases.py` renders the
+  capability and MCP fixtures as C data, with `--check` in CI.
+
 **D2 ledger.** The eight pre-plan `examples/*.c` are deleted. None was
 built or run by CI, and `capability_aggregation.c` no longer compiled: it
 called three `net_meshnode_*` functions that no header declares. Per

@@ -5220,7 +5220,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 50
+    # 50 was the budget before org_call.c / subnet.c: their scenarios come
+    # from a release build of net-mesh-sdk's generators (one per leg, then
+    # cached), and the Windows leg already ran about 40 minutes.
+    timeout-minutes: 75
     defaults:
       run:
         shell: bash
