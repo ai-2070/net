@@ -406,7 +406,7 @@ semver = "1"
 # is inlined directly (see `portmap/natpmp.rs`); UPnP involves
 # SSDP discovery + SOAP XML + URL dispatch, which is
 # considerably more ceremony than is worth re-implementing.
-igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"], optional = true }
+igd-next = { version = "0.18", default-features = false, features = ["aio_tokio"], optional = true }
 
 # Redis adapter (optional)
 redis = { version = "1.2", features = ["tokio-comp", "connection-manager"], optional = true }
