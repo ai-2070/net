@@ -88,6 +88,13 @@ MODULE_RE = re.compile(r"^NET-LOADED-MODULE: (.+?)\s*$", re.M)
 MODULE_ERR_RE = re.compile(r"^NET-LOADED-MODULE-ERROR: (.+?)\s*$", re.M)
 CHECKS_RE = re.compile(r"^NET-CHECKS: (\d+)\s*$", re.M)
 OK_LINE_RE = re.compile(r"^ok ", re.M)
+# A failed check (CU_CHECK, a program's own CHECK, a setup step). A check
+# failing inside a helper whose result the caller ignores still lets the
+# program reach cu_finish and exit 0, so the line itself is the verdict.
+FAIL_LINE_RE = re.compile(r"^FAIL (.+?)\s*$", re.M)
+# LSAN_OPTIONS / ASAN_OPTIONS exitcode (sanitizer_env): a leak report
+# replaces the program's own exit status with it.
+LSAN_EXITCODE = 23
 # The first line of an ASan / LSan / UBSan report.
 SANITIZER_RE = re.compile(
     r"^(?:==\d+==)?ERROR: (?:AddressSanitizer|LeakSanitizer)[^\n]*|^[^\n]*runtime error:[^\n]*"
@@ -164,8 +171,8 @@ def sanitizer_env() -> dict[str, str]:
     lets it see a buffer libnet returned and the program never freed."""
     return {
         "ASAN_OPTIONS": "detect_leaks=1:fast_unwind_on_malloc=0:malloc_context_size=40:"
-                        "halt_on_error=1:exitcode=23:symbolize=1",
-        "LSAN_OPTIONS": "exitcode=23",
+                        f"halt_on_error=1:exitcode={LSAN_EXITCODE}:symbolize=1",
+        "LSAN_OPTIONS": f"exitcode={LSAN_EXITCODE}",
         "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1",
     }
 
@@ -416,12 +423,37 @@ def classify(stdout: str, rc: int, expected_lib: Path, expected_sha: str, hash_o
     san = SANITIZER_RE.search(stdout)
     if san:
         return Verdict("sanitizer", san.group(0).strip(), module, 0, calls)
+    failed = FAIL_LINE_RE.search(stdout)
+    if failed:
+        return Verdict("failed", f"a check failed: {failed.group(1)}", module, 0, calls)
     if rc != 0:
         return Verdict("failed", f"exit {rc}", module, 0, calls)
     c = CHECKS_RE.search(stdout)
     if not c or int(c.group(1)) < 1:
         return Verdict("failed", "no NET-CHECKS line, or zero checks", module, 0, calls)
     return Verdict("ok", "", module, int(c.group(1)), calls)
+
+
+def accepted_leak_verdict(stdout: str, rc: int, v: Verdict, retained: list[str]) -> Verdict:
+    """The verdict of a run whose only report is leaks the policy accepts.
+
+    LeakSanitizer replaces the program's exit status with its own, so the
+    status cannot say whether the program succeeded. What can: the exit is
+    LeakSanitizer's (any other code is a crash or an early exit of the
+    program's own), no check printed FAIL, and the program reached cu_finish.
+    """
+    failed = FAIL_LINE_RE.search(stdout)
+    if failed:
+        return Verdict("failed", f"a check failed: {failed.group(1)}", v.module, 0, v.calls_made)
+    if rc != LSAN_EXITCODE:
+        return Verdict("failed", f"exit {rc} with a leak report, not LeakSanitizer's {LSAN_EXITCODE}",
+                       v.module, 0, v.calls_made)
+    c = CHECKS_RE.search(stdout)
+    if not c or int(c.group(1)) < 1:
+        return Verdict("failed", "no NET-CHECKS line, or zero checks", v.module, 0, v.calls_made)
+    ok = Verdict("ok", "", v.module, int(c.group(1)), v.calls_made)
+    ok.retained = retained
+    return ok
 
 
 def run_exe(exe: Path, env: dict[str, str], timeout: int) -> tuple[int, str]:
@@ -639,9 +671,7 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
             elif bad:
                 v.reason = "unaccepted leaks: " + "; ".join(bad[:6]) + (" …" if len(bad) > 6 else "")
             else:
-                c = CHECKS_RE.search(out)
-                v = Verdict("ok", "", v.module, int(c.group(1)) if c else 0, v.calls_made)
-                v.retained = lines
+                v = accepted_leak_verdict(out, rc, v, lines)
         if v.kind == "ok" and v.checks < floors.get(name, 0):
             print(f"✗ {name}: {v.checks} named checks, below its floor of {floors[name]} "
                   "(examples/c/FLOORS) — a check stopped running")
@@ -818,6 +848,19 @@ def self_test() -> int:
              classify(f"NET-LOADED-MODULE: {good}\nNET-CHECKS: 0\n", 0, good, gsha), "failed")
         case("a non-zero exit fails",
              classify(f"NET-LOADED-MODULE: {good}\nNET-CHECKS: 3\n", 1, good, gsha), "failed")
+        case("a FAIL line fails a run that exited 0 above its floor",
+             classify(f"NET-LOADED-MODULE: {good}\nok a\nFAIL b: `x` is false (p.c:9)\nok c\nNET-CHECKS: 30\n",
+                      0, good, gsha), "failed", "a check failed")
+        leaky = Verdict("sanitizer", "leak", str(good), 0, True)
+        case("accepted leaks with LeakSanitizer's exit and a full run pass",
+             accepted_leak_verdict("ok a\nNET-CHECKS: 4\n", LSAN_EXITCODE, leaky, []), "ok")
+        case("accepted leaks do not excuse a FAIL line",
+             accepted_leak_verdict("FAIL a: no\nNET-CHECKS: 4\n", LSAN_EXITCODE, leaky, []), "failed",
+             "a check failed")
+        case("accepted leaks do not excuse an exit that is not LeakSanitizer's",
+             accepted_leak_verdict("ok a\nNET-CHECKS: 4\n", 139, leaky, []), "failed", "not LeakSanitizer")
+        case("accepted leaks do not excuse a run that never reached cu_finish",
+             accepted_leak_verdict("ok a\n", LSAN_EXITCODE, leaky, []), "failed", "NET-CHECKS")
         case("an ASan report is a sanitizer verdict, even after the checks passed",
              classify(f"NET-LOADED-MODULE: {good}\nok a\nNET-CHECKS: 1\n==4242==ERROR: AddressSanitizer: "
                       "attempting double-free on 0x602\n", 23, good, gsha), "sanitizer", "double-free")
