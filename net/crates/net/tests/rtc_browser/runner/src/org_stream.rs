@@ -5014,12 +5014,22 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 leaves.insert(tab, leaf);
             }
             other => {
+                // An `ok` step with no node id has no error to quote:
+                // name that shape rather than "<no reason reported>".
+                let reason = if r.ok && r.node_id.is_none() {
+                    "the step succeeded but reported no node id".to_string()
+                } else {
+                    why(&r)
+                };
+                // The leader trio shares ONE node id, so for a follower
+                // this view is the LEADER's session, not evidence the
+                // follower itself connected.
                 let detail = format!(
                     "the {tab} leaf did not connect as its provisioned identity {} (got {:?}): {} \
                      [{}]",
                     hex32(id.entity.as_bytes()),
                     other.map(|l| l.node_hex),
-                    why(&r),
+                    reason,
                     anchor_peer_view(cx.anchor, id.entity.node_id())
                 );
                 for name in &WITNESSES[..BROWSER_WITNESSES] {

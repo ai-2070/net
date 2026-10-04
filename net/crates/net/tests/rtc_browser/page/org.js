@@ -263,10 +263,33 @@ async function execute(step) {
         });
         nodes.set(step.session, session);
         surfaceKinds.set(step.session, 'session');
-        await log(`opened session ${step.session} role=${session.role && session.role()}`);
+        // A FOLLOWER's `openSession` resolves once its `Attach` is
+        // POSTED, not answered: the node id arrives with the leader's
+        // `Leadership` reply a moment later, and `nodeIdHex()` is
+        // null until then. Returning that null read as "connected as
+        // no identity" (`got None`, no reason) — the of1 flake. Wait,
+        // bounded, for the reply; a follower that never hears from
+        // its leader is a NAMED failure, not a silent one.
+        const nodeId = () => (session.nodeIdHex ? session.nodeIdHex() : null);
+        const deadline = performance.now() + 15000;
+        while (nodeId() === null && performance.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        await log(
+          `opened session ${step.session} role=${session.role && session.role()} node=${nodeId()}`,
+        );
+        if (nodeId() === null) {
+          return {
+            ok: false,
+            error:
+              `openSession resolved as ${session.role && session.role()} but no ` +
+              'Leadership reply named the node within 15 s',
+            role: session.role ? session.role() : null,
+          };
+        }
         return {
           ok: true,
-          node_id: session.nodeIdHex ? session.nodeIdHex() : null,
+          node_id: nodeId(),
           role: session.role ? session.role() : null,
           generation: session.generation ? session.generation() : null,
         };
