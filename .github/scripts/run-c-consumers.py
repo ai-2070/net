@@ -289,6 +289,23 @@ def compile_program(
     return exe
 
 
+def imported_dlls(exe: Path) -> set[str]:
+    """Lower-cased DLL names a PE executable imports, via the toolchain's
+    objdump (next to $CC) or one on PATH."""
+    cc = os.environ.get("CC", "gcc")
+    cand = Path(cc).with_name("objdump.exe") if Path(cc).parent != Path(".") else None
+    tool = str(cand) if cand and cand.exists() else (shutil.which("objdump") or "objdump")
+    out = subprocess.run([tool, "-p", str(exe)], capture_output=True, text=True).stdout
+    return {m.group(1).lower() for m in re.finditer(r"DLL Name:\s*(\S+)", out)}
+
+
+def crt_of(dlls: set[str]) -> str:
+    """`ucrt`, `msvcrt`, `both` or `none`, from an import list."""
+    ucrt = any(d.startswith("api-ms-win-crt-") or d == "ucrtbase.dll" for d in dlls)
+    msvcrt = "msvcrt.dll" in dlls
+    return "both" if ucrt and msvcrt else "ucrt" if ucrt else "msvcrt" if msvcrt else "none"
+
+
 def _indent(text: str) -> str:
     return "".join(f"      {line}\n" for line in text.splitlines())
 
@@ -404,6 +421,13 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
             continue
         exe = compile_program(compiler, bundle, src, work / name, sanitize=args.sanitize,
                               debug_crt=args.debug_crt)
+        if args.expect_crt:
+            got = crt_of(imported_dlls(exe))
+            if got != args.expect_crt:
+                print(f"✗ {name}: links the {got} C runtime, not {args.expect_crt} — the lane is "
+                      "not the toolchain it claims")
+                failures += 1
+                continue
         env = child_env(bundle, sanitizer_env() if args.sanitize else None)
         refuse_strays(bundle, env, exe.parent)
         rc, out = run_exe(exe, env, args.timeout)
@@ -594,6 +618,12 @@ def self_test() -> int:
         print(f"{'✓' if ok else '✗'} self-test: a program without a floor, and a floor without a program, are refused")
         failures += 0 if ok else 1
 
+        cases = [({"kernel32.dll", "api-ms-win-crt-heap-l1-1-0.dll"}, "ucrt"), ({"msvcrt.dll"}, "msvcrt"),
+                 ({"msvcrt.dll", "ucrtbase.dll"}, "both"), ({"kernel32.dll"}, "none")]
+        ok = all(crt_of(d) == want for d, want in cases)
+        print(f"{'✓' if ok else '✗'} self-test: the C runtime is read from the import list")
+        failures += 0 if ok else 1
+
         strays = stray_libraries([str(other.parent), str(good.parent)], good.parent)
         ok = strays == [str(other)]
         print(f"{'✓' if ok else '✗'} self-test: a Net library outside bundle/lib on the loader path is found")
@@ -618,6 +648,8 @@ def main() -> int:
     ap.add_argument("--debug-crt", action="store_true",
                     help="C5 Windows lane: MSVC /MDd and the debug CRT's leak and heap checks "
                     "(this program's own heap only)")
+    ap.add_argument("--expect-crt", choices=["ucrt", "msvcrt"],
+                    help="MinGW lanes: require every program to import this C runtime (proves the toolchain)")
     ap.add_argument("--arming", action="store_true",
                     help="also run tests/c_abi/arming/*.c, each of which must be caught by the sanitizers")
     ap.add_argument("--self-test", action="store_true")
@@ -636,7 +668,8 @@ def main() -> int:
         return 1
     compiler = pick_compiler(args.compiler)
     work = (args.work or bundle.root.parent / f"consumers-{compiler}").resolve()
-    print(f"==> {bundle.profile} bundle {bundle.root.name}, compiler {compiler}")
+    print(f"==> {bundle.profile} bundle {bundle.root.name}, compiler {compiler}"
+          + (f", C runtime {args.expect_crt}" if args.expect_crt else ""))
 
     if args.sanitize:
         work = work.parent / (work.name + "-sanitize")

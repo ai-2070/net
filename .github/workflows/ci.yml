@@ -5324,18 +5324,41 @@ jobs:
               --negative-controls --shadow-library "$shadow"
           done
 
-      # The runner image's MinGW is whatever it ships; C5 adds pinned
-      # MinGW-w64 UCRT and MSVCRT lanes. Run it when present and say so when
-      # not, rather than passing silently.
-      - name: Consumers — production bundle, MinGW (Windows)
+      # C5 compatibility lanes: pinned MinGW-w64 toolchains from MSYS2, one
+      # per C runtime, rather than whatever gcc the runner image ships.
+      #   ucrt64  — UCRT, the runtime the MSVC-built net.dll itself uses;
+      #   mingw64 — the legacy msvcrt.dll. Measured, not predicted: with the
+      #             registered-release contract every callback buffer is
+      #             freed by the allocator that made it, so this is expected
+      #             to pass, and a failure is a finding with its evidence.
+      # --expect-crt reads each program's import table and fails a lane whose
+      # binaries do not link the runtime it claims.
+      - name: Install pinned MinGW-w64 toolchains (UCRT and MSVCRT)
         if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-x86_64-gcc
+
+      - name: Consumers — MinGW-w64 UCRT and MSVCRT lanes
+        if: runner.os == 'Windows'
+        env:
+          MSYS2_ROOT: ${{ steps.msys2.outputs.msys2-location }}
         run: |
-          if ! command -v gcc >/dev/null 2>&1; then
-            echo "::notice::no MinGW gcc on this runner image; the MinGW lane did not run"
-            exit 0
-          fi
-          gcc -v 2>&1 | tail -n 1
-          "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler mingw
+          shadow="$HELPER_BUNDLE/$(sed -n 's/^library: //p' "$HELPER_BUNDLE/PROVENANCE")"
+          for lane in ucrt64:ucrt mingw64:msvcrt; do
+            prefix="${lane%%:*}"; crt="${lane##*:}"
+            bin="$(cygpath -u "$MSYS2_ROOT")/$prefix/bin"
+            "$bin/gcc" --version | head -n 1
+            CC="$bin/gcc.exe" PATH="$bin:$PATH" "$PY" .github/scripts/run-c-consumers.py \
+              --bundle "$PROD_BUNDLE" --compiler mingw --expect-crt "$crt" \
+              --work "$RUNNER_TEMP/consumers-mingw-$crt" \
+              --negative-controls --shadow-library "$shadow"
+          done
 
       - name: Consumers — helper bundle
         run: |
