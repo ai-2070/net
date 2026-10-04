@@ -1,0 +1,28 @@
+net/crates/net/examples/c/org_call.c
+  s_17a2ac60d914fc::t_3535d56bd3ce18 292-298
+net/crates/net/examples/c/capabilities.c
+  s_17a2ac60d914fc::t_550b5dd3f27a99 211-220
+  s_17a2ac60d914fc::t_496b4fc84dae27 61,63-69
+  s_17a2ac60d914fc::t_abd75997a094ef 175-184
+  s_17a2ac60d914fc::t_ab2733c3fc3ef4 242-250
+net/crates/net/examples/c/lifecycle.c
+  s_17a2ac60d914fc::t_49f53dec2316a2 19-20
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_9ff18a2b23b923 13,23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "74da33e3065273187d9cf5431a6a57b95f33463b",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
