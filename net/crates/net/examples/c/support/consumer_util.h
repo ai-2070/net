@@ -80,6 +80,22 @@ unsigned char* cu_read_file(const char* path, size_t* out_len);
 /* 1 if `path` exists. */
 int cu_exists(const char* path);
 
+/* ---- JSON results ----
+ * Enough to read the flat objects Net returns (describe, repair reports,
+ * cache stats). Not a JSON parser: `key` is matched as `"key":`. */
+
+/* 0 and *out set when `"key":<unsigned integer>` is present. */
+int cu_json_u64(const char* json, const char* key, uint64_t* out);
+/* 1 if `"key":true`, 0 if `"key":false`, -1 if absent or neither. */
+int cu_json_bool(const char* json, const char* key);
+/* 1 if `"key":` appears at all. */
+int cu_json_has(const char* json, const char* key);
+
+/* `n` chunks of `size` bytes, each a distinct repeating 4-byte pattern —
+ * the same bytes as Go's distinctChunks (go/blob_tree_test.go), so the
+ * two bindings test identical content. malloc'd; NULL on failure. */
+unsigned char* cu_distinct_chunks(size_t n, size_t size);
+
 /* ---- Mesh ---- */
 
 /* The PSK every consumer node shares (64 hex characters). */

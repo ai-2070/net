@@ -753,6 +753,54 @@ changes to the real headers.
 the same re-encoded ref as Go's `bigSmallRef`, so both bindings test the
 same boundary. Matrix evidence for repair says "helper build".
 
+**Status: landed (2026-10-04); verified on Windows, Linux pending CI.**
+- **`tree_range.c`, 61 checks, production bundle.** It mirrors
+  `go/blob_tree_test.go` on the same bytes (`cu_distinct_chunks` is Go's
+  `distinctChunks`):
+  - `new_v2`: a NULL out-pointer is -1, and an unknown option key is -3
+    with the handle slot left NULL. Cache stats read `null` without a
+    cache and carry counters with one.
+  - A 9 MiB replicated tree, described (tree, chunked, size, root and
+    depth, no single hash) and read whole and across a chunk boundary. A
+    whole-tree `fetch` is refused.
+  - A 16 MiB Reed-Solomon(4, 2) tree, described and read whole.
+  - Six encoding refusals at -150. The defaults (k = m = 0) are non-zero.
+  - The range contract in core's order:
+    - reversed is -150;
+    - empty succeeds anywhere with `(NULL, 0)`;
+    - past the end is -150;
+    - Go's 2 GiB ref is refused past the 1 GiB cap and is `NOT_FOUND` at
+      exactly 1 GiB;
+    - an exact sub-range reads back.
+  - **Output storage:** valid outputs read `(NULL, 0)` after a later
+    failure, and a mixed-null pair is -1 with the non-NULL slot untouched.
+- **Found here, recorded rather than changed:** an empty ref is not -150
+  from C. A NULL ref pointer is -1 (checked with the handle), and a real
+  empty buffer is `NET_ERR_BLOB_DECODE`. Go's `FetchRange(nil)` returns
+  -150 only because `refArg` refuses it before calling in. The two
+  bindings report the same case differently, and that's by design.
+- **`repair.c`, 34 checks, helper bundle only** (`NET-BUNDLE: helper`; the
+  runner skips it on the production bundle and says so). It keeps the Go
+  S6 shape on one 16 MiB RS(4, 2) stripe:
+  - full closure before the drop;
+  - the dropped shard proved absent through `_test_chunk_present`;
+  - repair restores exactly one chunk in one stripe, the shard is present
+    again, the full range matches, and a second repair finds the stripe
+    healthy;
+  - three drops (m = 2) make the stripe unrecoverable, counted and not an
+    error.
+  - The seam refuses a real small ref at -150. Arbitrary bytes would fail
+    earlier as undecodable.
+- **Plan correction:** the plan said that after one drop, "a fetch that
+  would need it fails". It does not: one loss is within RS(4, 2)'s
+  tolerance, and a whole read reconstructs from parity, byte for byte.
+  `repair.c` asserts that degraded read, and proves absence through the
+  seam. A read that must fail is checked where it really fails, after
+  three drops, with `(NULL, 0)` outputs.
+- **Floors:** tree_range 61, repair 34.
+- **Verified:** every program, both bundles, MSVC and MinGW, with the
+  shadowing control.
+
 ### C3b: write tokens (after #1167)
 
 - **`write_tokens.c`** (production bundle), against the five-argument

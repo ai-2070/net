@@ -318,6 +318,17 @@ def read_floors(path: Path = FLOORS) -> dict[str, int]:
     return out
 
 
+BUNDLE_MARK = re.compile(r"NET-BUNDLE:\s*(\w+)")
+
+
+def required_profile(src: Path) -> str | None:
+    """The bundle profile a program needs, from a `NET-BUNDLE: <profile>`
+    line in its header comment (repair.c needs the helper build's seams).
+    None: any bundle."""
+    m = BUNDLE_MARK.search(src.read_text(encoding="utf-8")[:4000])
+    return m.group(1) if m else None
+
+
 def floor_problems(programs: list[str], floors: dict[str, int]) -> list[str]:
     problems = [f"{p} has no line in examples/c/FLOORS" for p in programs if p not in floors]
     problems += [f"examples/c/FLOORS names {p}, which is not a program" for p in floors if p not in programs]
@@ -337,6 +348,10 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
         if not src.exists():
             print(f"✗ {name}: no such program {src}")
             failures += 1
+            continue
+        need = required_profile(src)
+        if need is not None and need != bundle.profile:
+            print(f"  – {name}: needs the {need} bundle; not run against the {bundle.profile} bundle")
             continue
         exe = compile_program(compiler, bundle, src, work / name)
         env = child_env(bundle)

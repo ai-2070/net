@@ -234,6 +234,74 @@ int cu_exists(const char* path) {
 #endif
 }
 
+/* ---- JSON results ---- */
+
+static const char* cu_json_value(const char* json, const char* key) {
+    char pat[96];
+    const char* at;
+    if (json == NULL) {
+        return NULL;
+    }
+    snprintf(pat, sizeof pat, "\"%s\":", key);
+    at = strstr(json, pat);
+    if (at == NULL) {
+        return NULL;
+    }
+    at += strlen(pat);
+    while (*at == ' ') {
+        at++;
+    }
+    return at;
+}
+
+int cu_json_u64(const char* json, const char* key, uint64_t* out) {
+    const char* v = cu_json_value(json, key);
+    uint64_t n = 0;
+    if (v == NULL || *v < '0' || *v > '9') {
+        return -1;
+    }
+    while (*v >= '0' && *v <= '9') {
+        n = n * 10 + (uint64_t)(*v - '0');
+        v++;
+    }
+    *out = n;
+    return 0;
+}
+
+int cu_json_bool(const char* json, const char* key) {
+    const char* v = cu_json_value(json, key);
+    if (v == NULL) {
+        return -1;
+    }
+    if (strncmp(v, "true", 4) == 0) {
+        return 1;
+    }
+    if (strncmp(v, "false", 5) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+int cu_json_has(const char* json, const char* key) {
+    return cu_json_value(json, key) != NULL;
+}
+
+unsigned char* cu_distinct_chunks(size_t n, size_t size) {
+    unsigned char* out = (unsigned char*)malloc(n * size);
+    size_t i, j;
+    if (out == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < n; i++) {
+        const unsigned char pat[4] = {(unsigned char)(0x10 + i), (unsigned char)(i * 7), 0xA5,
+                                      (unsigned char)(255 - i)};
+        for (j = 0; j < size; j++) {
+            out[i * size + j] = pat[j % 4];
+        }
+    }
+    return out;
+}
+
 /* ---- Mesh ---- */
 
 #define CU_BIND_ATTEMPTS 8
