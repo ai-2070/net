@@ -1032,6 +1032,41 @@ For the rest (`net_meshdb.h`, `net_meshos.h`, `net_deck.h`, `net_mcp.h`,
 records, per header, whether any C program now exercises it. The matrix in
 C6 must not claim more than that.
 
+**Status: done (2026-10-04).** The record is generated, not written:
+`.github/scripts/c-surface-record.py` lists every function each header
+declares (from C1's header model) and the C programs CI runs that call it:
+consumer programs and their support files, arming programs, and the skill
+examples. A call is the name followed by `(` in code, outside comments and
+strings. `CLM_FN` import lists do not count. The output is
+`tests/c_abi/SURFACE.md`, and CI regenerates it and fails on any
+difference, so it cannot go stale in either direction.
+
+At this commit:
+
+| Header | Declared | Called by a consumer | Called by any C program |
+| --- | ---: | ---: | ---: |
+| `net.go.h` | 218 | 35 | 52 |
+| `net.h` | 41 | 2 | 6 |
+| `net_cortex.h` | 92 | 2 | 8 |
+| `net_deck.h` | 84 | 0 | 0 |
+| `net_mcp.h` | 22 | 0 | 0 |
+| `net_meshdb.h` | 27 | 0 | 0 |
+| `net_meshos.h` | 23 | 0 | 0 |
+| `net_org.h` | 30 | 0 | 15 |
+| `net_rpc.h` | 70 | 10 | 17 |
+| `net_subnet.h` | 4 | 0 | 0 |
+| `net_transport.h` | 7 | 7 | 7 |
+
+- Five headers have no C caller at all: `net_deck.h`, `net_mcp.h`,
+  `net_meshdb.h`, `net_meshos.h` and `net_subnet.h` (and C3b's
+  write-token waits in `net_cortex.h` are still to come). Their C evidence
+  is C1's audit only: declared, exported and type-matched, never called.
+- `net_org.h` is called only by the skill examples
+  (`net_org_streaming.c`), not by a consumer program, so it has no
+  sanitizer, debug-CRT or verifier lane.
+- `net.h` and `net.go.h` both declare the core surface, so a function in
+  both is counted under both.
+
 ### C6: docs, the support matrix and the D2 ledger
 
 - The C docs (`include/README.md`, `web/src/content/docs/sdk/c/*.md`,

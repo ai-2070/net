@@ -5315,6 +5315,17 @@ jobs:
           "$PY" .github/scripts/check-c-abi.py --bundle "$PROD_BUNDLE"
           "$PY" .github/scripts/check-c-abi.py --bundle "$HELPER_BUNDLE"
 
+      # C5b: tests/c_abi/SURFACE.md records, per header, every declared
+      # function and the C programs CI runs that call it (consumers, arming,
+      # skill examples). The C column of the capability matrix may claim no
+      # more than it shows, so it must be current: regenerated here from the
+      # same header model as the audit, and any difference fails.
+      - name: Guard — the C surface record is current (C5b)
+        if: runner.os == 'Linux'
+        run: |
+          "$PY" .github/scripts/c-surface-record.py --self-test
+          "$PY" .github/scripts/c-surface-record.py --check
+
       - name: Consumers — production bundle
         run: |
           shadow="$HELPER_BUNDLE/$(sed -n 's/^library: //p' "$HELPER_BUNDLE/PROVENANCE")"
