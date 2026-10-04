@@ -40,8 +40,10 @@ introduces an ABI change of its own is not detected. A constant whose homes
 grow beyond the file lists above needs those lists extended in the same
 commit.
 
-RANGE. `--range A..B` (default `HEAD^..HEAD`); in CI the step passes the
-push's `before..sha`. When the base is unresolvable (a new branch or a
+RANGE. `--range A..B` (default `HEAD^..HEAD`); in CI the step passes
+`merge-base(origin/master, sha)..sha` on a branch (a newer push cancels the
+older run, so a per-push range would skip the cancelled push's commits) and
+the push's `before..sha` on master. When the base is unresolvable (a new branch or a
 force push) the guard checks the tip commit and says so — an unevaluable
 base must not silently retire the check.
 

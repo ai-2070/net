@@ -4696,13 +4696,27 @@ jobs:
       # was red in between and a bisect inside the window yields a header
       # pair that silently drifts. Text and git only, so it runs before the
       # toolchains like its neighbours above.
+      #
+      # On a branch the range is every commit since the merge-base with
+      # master, not this push's `before..sha`: a newer push cancels the older
+      # run (the `concurrency` block above), so a per-push range would never
+      # check the cancelled push's commits. Master runs are never cancelled
+      # and keep the per-push range.
       - name: Guard — ABI changes land atomically
         if: ${{ !cancelled() }}
         env:
           BASE_SHA: ${{ github.event.before }}
         run: |
           python3 .github/scripts/check-abi-commit.py --self-test
-          python3 .github/scripts/check-abi-commit.py --range "$BASE_SHA..$GITHUB_SHA"
+          base="$BASE_SHA"
+          if [ "$GITHUB_REF" != "refs/heads/master" ]; then
+            if mb=$(git merge-base origin/master "$GITHUB_SHA"); then
+              base="$mb"
+            else
+              echo "::warning::no merge-base with origin/master; checking only this push's commits"
+            fi
+          fi
+          python3 .github/scripts/check-abi-commit.py --range "$base..$GITHUB_SHA"
 
       # Also pure text, also before the toolchains. A `libc::free` on a
       # Go-allocated callback buffer is a wrong-heap free on Windows —
