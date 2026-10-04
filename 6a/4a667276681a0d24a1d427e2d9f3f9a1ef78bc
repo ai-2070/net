@@ -1,0 +1,40 @@
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_ff71e6627370c3 14-15
+net/crates/net/examples/c/mcp.c
+  s_17a2ac60d914fc::t_0f0b7a594a1739 1-248
+.claude/skills/net-event-bus/bindings/coverage.md
+  s_17a2ac60d914fc::t_ff71e6627370c3 105,112,186,193
+docs/data/capabilities/event-bus.yaml
+  s_17a2ac60d914fc::t_ff71e6627370c3 472,474-475,604,606-607
+web/src/lib/generated/capability-record.json
+  s_17a2ac60d914fc::t_ff71e6627370c3 442,730
+net/crates/net/tests/c_abi/SURFACE.md
+  s_17a2ac60d914fc::t_ff71e6627370c3 13-14,17,229-235,274-280,484-496,498-502,504-505
+net/crates/net/examples/c/redis_dedup.c
+  s_17a2ac60d914fc::t_f34dde64b018b2 36
+  s_17a2ac60d914fc::t_f72130cc53f7fd 1-35,37-89
+.github/scripts/gen-c-fixture-cases.py
+  s_17a2ac60d914fc::t_4274f2bf96ace9 206
+  s_17a2ac60d914fc::t_25e5c2dd93d63f 50
+  s_17a2ac60d914fc::t_d940499762210e 5-13,32-34,123-168,170-182,184-188,193-205,207-208
+  s_17a2ac60d914fc::t_8881f22fb7757e 183
+  s_17a2ac60d914fc::t_538866f5f81d5d 169
+net/crates/net/examples/c/support/mcp_cases.h
+  s_17a2ac60d914fc::t_9d0bf1b90dbb9a 1-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6a4a667276681a0d24a1d427e2d9f3f9a1ef78bc",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
