@@ -15,7 +15,7 @@ mcp 77
 redis_dedup 23
 meshdb 68
 compute 58
-deck 78
+deck 77
 streams 36
 islands 31
 aggregator 21

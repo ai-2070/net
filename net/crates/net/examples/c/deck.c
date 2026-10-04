@@ -57,7 +57,7 @@ static int admin(const NetDeckClient* client, uint64_t op) {
                                    "clear_avoid_list"};
     const uint64_t node = 0xABCD;
     char label[96];
-    int i, j;
+    int i, j, dups = 0;
     memset(c, 0, sizeof c);
     CU_CHECK_RC("net_deck_admin_drain", net_deck_admin_drain(client, node, 60000, &c[0]), NET_DECK_OK);
     CU_CHECK_RC("net_deck_admin_enter_maintenance",
@@ -78,12 +78,12 @@ static int admin(const NetDeckClient* client, uint64_t op) {
         CU_CHECK(label, c[i].event_kind == kinds[i] && c[i].operator_id == op);
         for (j = 0; j < i; j++) {
             if (c[j].commit_id == c[i].commit_id) {
-                snprintf(label, sizeof label, "%s: a fresh commit id", names[i]);
-                CU_CHECK(label, 0);
+                printf("  (%s reuses %s's commit id)\n", names[i], names[j]);
+                dups++;
             }
         }
     }
-    CU_CHECK("admin: nine distinct commit ids", 1);
+    CU_CHECK_RC("admin: nine distinct commit ids", dups, 0);
     CU_CHECK_RC("net_deck_admin_drop_replicas: no chains (NULL, 0) is accepted",
                 net_deck_admin_drop_replicas(client, node, NULL, 0, &c[0]), NET_DECK_OK);
     CU_CHECK_RC("net_deck_admin_cordon: NULL client is NET_DECK_ERR_NULL", net_deck_admin_cordon(NULL, node, &c[0]),
@@ -129,7 +129,13 @@ static int audit(const NetDeckClient* client, uint64_t op) {
      * the SDK routes every ICE commit through the unsigned admin path
      * (deck.rs, IceSimulated::commit), so the ring records it with no
      * operator ids. Recorded as D-C6-2 in the C SDK plan. */
-    CU_CHECK_RC("audit: nothing from an operator that never acted", audit_count(client, 1, op ^ 0xFFFF), 0);
+    /* So a by-operator filter has nothing to select today: filtering by the
+     * operator who DID act returns the same 0 as one who never did, and a
+     * check that the latter is 0 proves nothing about the filter. This pins
+     * D-C6-2 instead; when it is fixed this count becomes 11 and the check
+     * must change to assert the filter (op selects 11, another id 0). */
+    CU_CHECK_RC("audit: D-C6-2, the ring attributes nothing to the operator who acted",
+                audit_count(client, 1, op), 0);
     CU_CHECK_RC("net_deck_audit_query_recent: NULL builder is NET_DECK_ERR_NULL", net_deck_audit_query_recent(NULL, 1),
                 NET_DECK_ERR_NULL);
     return 0;
@@ -167,18 +173,19 @@ static int ice(const NetDeckClient* client, const NetDeckOperatorIdentity* id, u
     uint8_t hash[32], zero[32], sig[64], pk[32];
     uint8_t* payload = NULL;
     size_t payload_len = 0;
-    uint64_t signer = 0;
+    uint64_t signer = 0, stamp;
     char* blast;
 
     CU_CHECK_RC("net_deck_ice_freeze_cluster", net_deck_ice_freeze_cluster(client, 60000, &proposal), NET_DECK_OK);
-    CU_CHECK("net_deck_ice_proposal_issued_at_ms: stamped", net_deck_ice_proposal_issued_at_ms(proposal) > 0);
+    stamp = net_deck_ice_proposal_issued_at_ms(proposal);
+    CU_CHECK("net_deck_ice_proposal_issued_at_ms: stamped", stamp > 0);
     CU_CHECK_RC("net_deck_ice_proposal_simulate", net_deck_ice_proposal_simulate(proposal, client, &sim), NET_DECK_OK);
     CU_CHECK_RC("net_deck_ice_proposal_simulate: again is NET_DECK_ERR_CALL_FAILED",
                 net_deck_ice_proposal_simulate(proposal, client, &again), NET_DECK_ERR_CALL_FAILED);
     CU_CHECK("simulate again: kind already_simulated", last_kind_is("already_simulated"));
-    CU_CHECK("net_deck_simulated_issued_at_ms: the proposal's stamp",
-             net_deck_simulated_issued_at_ms(sim) == net_deck_ice_proposal_issued_at_ms(proposal) ||
-                 net_deck_simulated_issued_at_ms(sim) > 0);
+    /* Compared with the stamp read before simulate: the proposal is spent
+     * by it. */
+    CU_CHECK_RC("net_deck_simulated_issued_at_ms: the proposal's stamp", net_deck_simulated_issued_at_ms(sim), stamp);
     blast = net_deck_simulated_blast_radius(sim);
     CU_CHECK("net_deck_simulated_blast_radius: JSON", blast != NULL && (blast[0] == '{' || blast[0] == '['));
     net_deck_free_string(blast);
@@ -372,6 +379,6 @@ int main(void) {
     net_deck_operator_registry_free(NULL);
     net_deck_admin_verifier_free(NULL);
     net_deck_signing_payload_free(NULL, 0);
-    CU_CHECK("every free accepts NULL", 1);
+    CU_SURVIVED("every free accepts NULL");
     return cu_finish();
 }
