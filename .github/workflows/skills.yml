@@ -165,6 +165,14 @@ on:
         type: boolean
         default: false
 
+# One run per workflow per branch (per PR for pull_request events): a newer
+# push cancels this workflow's older run on the same ref, and nothing else.
+# master is exempt, so every commit that lands there gets a complete result;
+# its runs queue instead (GitHub keeps only the newest pending run per group).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   drift:
     name: Drift check
