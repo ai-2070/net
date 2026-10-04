@@ -1,0 +1,32 @@
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_7046e9e5e23bb1 591-633
+net/crates/net/tests/c_abi/fixtures/net_cortex.pre1167.h
+  s_17a2ac60d914fc::t_68e419c8fef089 1-323
+.github/workflows/ci.yml
+  s_17a2ac60d914fc::t_31f1dd3fba27e7 5278-5286
+  s_17a2ac60d914fc::t_e0193e0244b8ee 5287-5292,5296
+.github/scripts/check-c-abi.py
+  s_17a2ac60d914fc::t_68e419c8fef089 64-66,578-633,637-638,643-644,647,650,653,655-657,660-661,663-700,761,987-989,1003-1004
+  s_17a2ac60d914fc::t_113231ee96abbc 634-636,639-642,645-646,648-649,651-652,654,658-659,662
+  s_17a2ac60d914fc::t_6975dce496c8c5 990,1005
+  s_17a2ac60d914fc::t_3bc62f96ed1221 921-963
+  s_17a2ac60d914fc::t_c1859dd5744bdc 749-750,1006-1011
+net/crates/net/tests/c_abi/breaks.toml
+  s_17a2ac60d914fc::t_44b9dd263cad10 1-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "382325370e5446cad23093879e644c06fbc49931",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
