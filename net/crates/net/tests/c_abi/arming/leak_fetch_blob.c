@@ -38,6 +38,10 @@ int main(void) {
     if (clm_check_loaded_module(used, sizeof used / sizeof used[0]) != 0) {
         return 2;
     }
+    if (cu_net_init() != 0) { /* WSAStartup on Windows, before any socket */
+        printf("FAIL setup: cu_net_init\n");
+        return 1;
+    }
     memset(payload, 0x5C, sizeof payload);
     if (cu_mesh_build(0xE1, &holder, ha, sizeof ha) || cu_mesh_build(0xE2, &reader, ra, sizeof ra) ||
         cu_mesh_handshake(holder, reader, ha) || net_mesh_start(holder) || net_mesh_start(reader)) {

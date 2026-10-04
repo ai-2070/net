@@ -7,7 +7,7 @@
  *
  * NET-LANE: sanitize appverif
  * NET-EXPECT: ERROR: AddressSanitizer: attempting double-free
- * NET-EXPECT(appverif): ^APPVERIFIER STOP \S+ \(Heaps\)
+ * NET-EXPECT(appverif): APPVERIFIER STOP \S+ \(Heaps\)
  *
  * The callback adapter's fetch returns a malloc'd buffer and also keeps a
  * pointer to it. net_blob_resolve copies the bytes and hands the buffer back

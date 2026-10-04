@@ -1022,6 +1022,15 @@ lane needs an elevated process, so it is proved in CI, not on the dev box.
     `callback_buffer_double_release.c` arm this lane as well as the
     sanitizer lane (`NET-LANE: sanitize appverif`, with a per-lane
     `NET-EXPECT(appverif):`). Each must produce a heap stop.
+  - **First CI run (37192704417):** every production program ran clean
+    under full PageHeap, each with a verifier log. Arming caught
+    `callback_buffer_double_release` (stop 0x7, "Heap block already
+    freed"). Two runner defects showed, both fixed:
+    - the expectation was anchored with `^`, which the runner's search
+      only matches at the start of the output;
+    - `double_free_fetch_blob.c` and `leak_fetch_blob.c` never called
+      `cu_net_init`, so on Windows (no WSAStartup) their node setup
+      failed. They had only run on Linux before.
   - **Correction to the lane table: no wrong-heap claim between the
     release UCRT and `net.dll`.** Measured: with `/MD`, the UCRT's
     `_get_heap_handle()` is the process heap, and Rust's `System`

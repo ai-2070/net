@@ -6,7 +6,7 @@
  *
  * NET-LANE: sanitize appverif
  * NET-EXPECT: ERROR: AddressSanitizer: attempting double-free
- * NET-EXPECT(appverif): ^APPVERIFIER STOP \S+ \(Heaps\)
+ * NET-EXPECT(appverif): APPVERIFIER STOP \S+ \(Heaps\)
  *
  * A real net_fetch_blob output is passed to net_transport_free_buffer twice
  * (net_transport.h: "Do not call twice on the same pointer"). The second
@@ -37,6 +37,10 @@ int main(void) {
     net_mesh_blob_adapter_t *sh, *sr;
     if (clm_check_loaded_module(used, sizeof used / sizeof used[0]) != 0) {
         return 2;
+    }
+    if (cu_net_init() != 0) { /* WSAStartup on Windows, before any socket */
+        printf("FAIL setup: cu_net_init\n");
+        return 1;
     }
     memset(payload, 0x6D, sizeof payload);
     if (cu_mesh_build(0xE3, &holder, ha, sizeof ha) || cu_mesh_build(0xE4, &reader, ra, sizeof ra) ||
