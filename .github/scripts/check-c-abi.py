@@ -64,6 +64,7 @@ LAYOUT = CRATE / "tests" / "c_abi" / "layout.json"
 BREAKS = CRATE / "tests" / "c_abi" / "breaks.toml"
 FIXTURES = CRATE / "tests" / "c_abi" / "fixtures"
 DEFAULT_RELEASE = "v0.39.0"
+EXAMPLES_C = CRATE / "examples" / "c"
 SEAM_PATTERNS = ("_test_", "net_blob_test_barrier_")
 PROFILE_FEATURES = {"production": [], "helper": ["net-ffi/test-helpers"]}
 
@@ -698,6 +699,39 @@ def run_compat_checks(model: Model, baselines: list[Baseline], breaks: list[dict
     return findings
 
 
+_INCLUDE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.M)
+# A file-scope declaration of a net_* function: a return type, then the
+# name, then a parameter list closed by `;`. `return net_x(...)` is a call.
+_NET_PROTO = re.compile(
+    r"^[ \t]*(?:extern[ \t]+)?(?!return\b)(?:const[ \t]+)?[A-Za-z_]\w*[ \t\*]+\**[ \t]*(net_\w+)[ \t]*\([^;{]*\)[ \t]*;",
+    re.M,
+)
+_EXTERN_NET = re.compile(r"^[ \t]*extern\b[^;]*\bnet_\w+", re.M)
+
+
+def lint_consumer_sources(root: Path = EXAMPLES_C) -> list[Finding]:
+    """The consumer programs must test the shipped headers, not their own
+    copies of them: a Net header is included by name only (resolved through
+    `-I bundle/include`), and no file declares a net_* function itself."""
+    findings = []
+    for f in sorted(root.rglob("*.c")) + sorted(root.rglob("*.h")):
+        text = M._COMMENT.sub(" ", f.read_text(encoding="utf-8"))
+        text = re.sub(r"//[^\n]*", " ", text)
+        rel = _rel(f)
+        for m in _INCLUDE.finditer(text):
+            inc = m.group(1)
+            if Path(inc).name.startswith("net") and ("/" in inc or "\\" in inc):
+                findings.append(Finding("lint", f"{rel}:{inc}",
+                    f"{rel} includes {inc} by path; include Net headers by name only"))
+        for m in _NET_PROTO.finditer(text):
+            findings.append(Finding("lint", f"{rel}:{m.group(1)}",
+                f"{rel} declares {m.group(1)} itself; use the shipped header's declaration"))
+        for m in _EXTERN_NET.finditer(text):
+            findings.append(Finding("lint", f"{rel}:extern",
+                f"{rel} has an extern declaration of a Net symbol: {m.group(0).strip()[:80]}"))
+    return findings
+
+
 def _rel(path: Path) -> str:
     try:
         return path.resolve().relative_to(ROOT).as_posix()
@@ -758,7 +792,7 @@ def report(findings: list[Finding], stats: dict, stale: list[str], profile: str,
     for f in findings:
         by[f.check].append(f)
     for check in ("declared", "exported", "signature", "char", "handles", "seams",
-                  "constants", "mentioned", "collision", "layout", "compiled", "compat", "breaks"):
+                  "constants", "mentioned", "collision", "layout", "compiled", "compat", "breaks", "lint"):
         items = by.get(check, [])
         mark = "✓" if not items else "✗"
         print(f"{mark} {check}: {len(items)} finding(s)")
@@ -961,6 +995,27 @@ def self_test() -> int:
                   + ("" if ok else f"  (got: {[f'{f.check}: {f.message}' for f in got]})"))
             failures += 0 if ok else 1
 
+        # The consumer-source lint.
+        lint_root = Path(td) / "lint"
+        lint_root.mkdir()
+        (lint_root / "clean.c").write_text(
+            '#include "net.h"\n#include "net_transport.h"\n/* net_fake(void); in a comment */\n'
+            "int main(void) { net_free_string(0); return net_version() != 0; }\n", encoding="utf-8")
+        ok = lint_consumer_sources(lint_root) == []
+        print(f"{'✓' if ok else '✗'} self-test: a program using the headers by name is lint-clean")
+        failures += 0 if ok else 1
+        for label, body, want in [
+            ("a Net header included by path", '#include "../include/net.h"\n', "by path"),
+            ("a program declaring a net_* function", "int net_mesh_start(void* h);\n", "declares net_mesh_start"),
+            ("an extern declaration of a Net symbol", "extern int net_secret;\n", "extern declaration"),
+        ]:
+            (lint_root / "bad.c").write_text(body, encoding="utf-8")
+            got = lint_consumer_sources(lint_root)
+            ok = any(want in f.message for f in got)
+            print(f"{'✓' if ok else '✗'} self-test: {label} is refused" + ("" if ok else f" (got {got})"))
+            failures += 0 if ok else 1
+        (lint_root / "bad.c").unlink()
+
         # Allowlist: an entry suppresses exactly its finding, and a stale entry fails.
         f = [Finding("exported", "net_x", "m")]
         left, stale = apply_allowlist(f, {"exported": {"net_x": "reason", "net_gone": "reason"}})
@@ -1003,6 +1058,7 @@ def main() -> int:
     baselines = [] if args.baseline_ref == "none" else [load_release_baseline(args.baseline_ref)]
     baselines += load_fixture_baselines(model.include_dir)
     findings += run_compat_checks(model, baselines, load_breaks(args.breaks))
+    findings += lint_consumer_sources()
     stats["baselines"] = [
         f"{b.name} ({sum(len(h.functions) for h in b.headers.values())} functions, "
         f"{sum(len(h.constants) for h in b.headers.values())} constants, "

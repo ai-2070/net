@@ -676,6 +676,56 @@ changes to the real headers.
   number of named checks drops below the recorded floor; that's the
   roster pattern.
 
+**Status: landed (2026-10-04); verified on Windows, Linux pending CI.**
+- **`lifecycle.c`, 26 checks:**
+  - **Refusals from `net_mesh_new`:** NULL, malformed JSON and a zero
+    heartbeat (`NET_ERR_INVALID_JSON`), a short PSK and an unparseable
+    address (`NET_ERR_MESH_INIT`). None of them produces a handle.
+  - **Bring-up:** two nodes, a handshake, start.
+  - **Argument checks:** NULL handles.
+  - **Shutdown, then the operations with a defined result after it.**
+    Shutdown runs inside the handle's guard and only `net_mesh_free`
+    closes it, so a second shutdown returns 0 (documented as idempotent in
+    `src/ffi/mesh.rs`), and the node id and public key are unchanged.
+  - **NULL frees:** `net_free_string(NULL)`, the only free these programs
+    use that a header documents as NULL-safe.
+  - **Nothing after `net_mesh_free`:** no header documents that as safe,
+    whatever the handle tombstone does.
+- **`transfer.c`, 55 checks:**
+  - **Fetch before the engine is installed:** `ENGINE_NOT_INSTALLED`.
+  - **Blob fetch,** from the holder and by discovery, byte for byte.
+  - **Unknown address:** `NOT_FOUND` from the holder, `ALL_PEERS_FAILED`
+    by discovery. A NULL hash is `NULL_POINTER`.
+  - **A directory tree:** a file, a nested 5000-byte file and an empty
+    directory. Stored, read as a manifest, fetched; files compared byte
+    for byte, and the empty directory survives.
+  - **Path escape:** a manifest built in the program as the postcard
+    bytes of `DirManifest{1, [Dir "../escape"]}` and published as a plain
+    blob is refused with `DIR_PATH_INVALID`, not `INVALID_MANIFEST`. So
+    the encoding decoded, and the refusal is the path check. The counters
+    read 0, and nothing appears outside the destination.
+  - **Unknown ref:** a manifest only the reader stores is `NOT_FOUND` from
+    the holder, with `(NULL, 0)` outputs per `net_transport.h`.
+  - **The two empty manifests:** a zero-length ref is `INVALID_ARGUMENT`
+    (`read_blob_ref` decodes it to no ref); a stored empty directory reads
+    as `"entries":[]` and fetches 0 files.
+- **Shared support:** `support/consumer_util.{c,h}` holds the named-check
+  macros, port reservation, threads, sleep and files (Winsock and Win32
+  on Windows, POSIX elsewhere), and node build and handshake. The runner
+  compiles every support file and links `ws2_32` on Windows.
+- **Floors:** `examples/c/FLOORS` (smoke 2, lifecycle 26, transfer 55).
+  The runner fails a run below its floor, a program without a floor, and
+  a floor without a program; a self-test case covers the last two.
+  Raising transfer's floor to 56 failed the run with "a check stopped
+  running".
+- **The consumer lint from C1 landed here:** `check-c-abi.py` refuses a
+  Net header included by path, a `net_*` prototype, or an `extern` Net
+  declaration in any `examples/c` file. There are four self-test cases,
+  36 in all, and the current programs are clean.
+- **Verified:** MSVC `/W4 /WX` and MinGW `-Werror`, both bundles, every
+  program, with the shadowing control. The ubuntu leg of `c-consumers`
+  is the first GCC/POSIX build of `consumer_util.c`.
+
 ### C3: tree, range and repair programs
 
 - **`tree_range.c`** (production bundle).

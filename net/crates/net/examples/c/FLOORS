@@ -1,0 +1,7 @@
+# Minimum named checks per C consumer program (C SDK plan, C2 "roster pattern").
+# run-c-consumers.py fails a run that reports fewer, and fails if a program
+# here is missing or a program has no line. Raise a floor when checks are
+# added; lowering one needs a reason in the commit that does it.
+smoke 2
+lifecycle 26
+transfer 55

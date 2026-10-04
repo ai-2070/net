@@ -65,6 +65,7 @@ if hasattr(sys.stdout, "reconfigure"):
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = ROOT / "net" / "crates" / "net" / "examples" / "c"
 SUPPORT = EXAMPLES / "support"
+FLOORS = EXAMPLES / "FLOORS"
 LIB_NAMES = ("libnet.so", "libnet.dylib", "net.dll")
 IS_WINDOWS = os.name == "nt"
 
@@ -193,14 +194,15 @@ def compile_program(
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     exe = out_dir / (src.stem + (".exe" if IS_WINDOWS else ""))
-    support_c = SUPPORT / "loaded_module.c"
+    # Every support file: the loaded-module check and the shared utilities.
+    support = [str(p) for p in sorted(SUPPORT.glob("*.c"))]
     extra_link = extra_link or []
     if compiler == "gcc":
         cc = os.environ.get("CC", "cc")
         cmd = [
             cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-fPIE", "-pie",
             "-I", str(bundle.include), "-I", str(SUPPORT),
-            str(src), str(support_c),
+            str(src), *support,
             "-L", str(bundle.lib), "-lnet", "-ldl", "-lpthread", "-lm",
             *extra_link, "-o", str(exe),
         ]
@@ -212,8 +214,8 @@ def compile_program(
         cmd = [
             cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
             "-I", str(bundle.include), "-I", str(SUPPORT),
-            str(src), str(support_c), str(bundle.library),
-            "-static", *extra_link, "-o", str(exe),
+            str(src), *support, str(bundle.library),
+            "-static", "-lws2_32", *extra_link, "-o", str(exe),
         ]
         run = subprocess.run(cmd, capture_output=True, text=True)
     elif compiler == "msvc":
@@ -221,10 +223,11 @@ def compile_program(
         if bat is None:
             raise SystemExit("FAIL  MSVC requested but vcvars64.bat was not found")
         implib = bundle.lib / "net.dll.lib"
+        quoted_support = " ".join('"' + x + '"' for x in support)
         cl = (
             f'cl /nologo /W4 /WX /std:c11 /MD /I "{bundle.include}" /I "{SUPPORT}" '
-            f'"{src}" "{support_c}" /Fo"{out_dir}\\\\" /Fe"{exe}" '
-            f'/link "{implib}" {" ".join(extra_link)}'
+            f'"{src}" {quoted_support} /Fo"{out_dir}\\\\" /Fe"{exe}" '
+            f'/link "{implib}" ws2_32.lib {" ".join(extra_link)}'
         )
         run = subprocess.run(
             f'call "{bat}" >nul && {cl}', shell=True, capture_output=True, text=True
@@ -303,9 +306,32 @@ def refuse_strays(bundle: Bundle, env: dict[str, str], app_dir: Path) -> None:
         raise SystemExit(1)
 
 
+def read_floors(path: Path = FLOORS) -> dict[str, int]:
+    """program -> minimum named checks (the roster: a check that silently
+    stops running shows as a lower count)."""
+    out = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            name, n = line.split()
+            out[name] = int(n)
+    return out
+
+
+def floor_problems(programs: list[str], floors: dict[str, int]) -> list[str]:
+    problems = [f"{p} has no line in examples/c/FLOORS" for p in programs if p not in floors]
+    problems += [f"examples/c/FLOORS names {p}, which is not a program" for p in floors if p not in programs]
+    return problems
+
+
 def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
-    names = args.program or sorted(p.stem for p in EXAMPLES.glob("*.c"))
-    failures = 0
+    every = sorted(p.stem for p in EXAMPLES.glob("*.c"))
+    floors = read_floors()
+    problems = floor_problems(every, floors)
+    for p in problems:
+        print(f"✗ {p}")
+    names = args.program or every
+    failures = len(problems)
     for name in names:
         src = EXAMPLES / f"{name}.c"
         if not src.exists():
@@ -317,8 +343,14 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
         refuse_strays(bundle, env, exe.parent)
         rc, out = run_exe(exe, env, args.timeout)
         v = classify(out, rc, bundle.library, bundle.sha256)
-        if v.kind == "ok":
-            print(f"  ▶ {name}: {v.checks} named checks; loaded {v.module} (SHA-256 matches PROVENANCE)")
+        if v.kind == "ok" and v.checks < floors.get(name, 0):
+            print(f"✗ {name}: {v.checks} named checks, below its floor of {floors[name]} "
+                  "(examples/c/FLOORS) — a check stopped running")
+            sys.stdout.write(_indent(out))
+            failures += 1
+        elif v.kind == "ok":
+            print(f"  ▶ {name}: {v.checks} named checks (floor {floors.get(name, 0)}); "
+                  f"loaded {v.module} (SHA-256 matches PROVENANCE)")
         else:
             print(f"✗ {name}: {v.kind}: {v.reason}")
             sys.stdout.write(_indent(out))
@@ -430,6 +462,10 @@ def self_test() -> int:
              classify(f"NET-LOADED-MODULE: {good}\nNET-CHECKS: 3\n", 1, good, gsha), "failed")
         case("a call after a wrong module is recorded",
              classify(f"NET-LOADED-MODULE: {other}\nok a\n", 0, good, gsha), "identity", calls=True)
+
+        ok = floor_problems(["a", "b"], {"a": 1}) == ["b has no line in examples/c/FLOORS"] and             floor_problems(["a"], {"a": 1, "gone": 3}) == ["examples/c/FLOORS names gone, which is not a program"]
+        print(f"{'✓' if ok else '✗'} self-test: a program without a floor, and a floor without a program, are refused")
+        failures += 0 if ok else 1
 
         strays = stray_libraries([str(other.parent), str(good.parent)], good.parent)
         ok = strays == [str(other)]
