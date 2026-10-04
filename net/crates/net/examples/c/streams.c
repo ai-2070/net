@@ -43,6 +43,10 @@ int main(void) {
         CLM_FN(net_mesh_stream_stats),
         CLM_FN(net_mesh_max_event_size),
         CLM_FN(net_free_bytes),
+        CLM_FN(net_mesh_stream_free),
+        CLM_FN(net_mesh_stream_inbox_close),
+        CLM_FN(net_mesh_stream_inbox_dropped),
+        CLM_FN(net_mesh_stream_inbox_free),
     };
     static const char* bodies[3] = {"first", "second", "third"};
     net_meshnode_t *a = NULL, *b = NULL;

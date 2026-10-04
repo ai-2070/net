@@ -241,6 +241,10 @@ int main(void) {
         CLM_FN(net_org_serve_handle_close),
         CLM_FN(net_org_response_free),
         CLM_FN(net_org_free_cstring),
+        CLM_FN(net_org_check_abi_version),
+        CLM_FN(net_org_client_free),
+        CLM_FN(net_org_reserve_handler_id),
+        CLM_FN(net_org_serve_handle_free),
     };
     const char* dir = getenv("NET_SUBNET_SCENARIO");
     char psk[80], service[128], export_name[128], unknown_export[128], access[32], auth_hex[80], root_hex[80];

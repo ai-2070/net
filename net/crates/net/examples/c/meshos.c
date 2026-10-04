@@ -74,6 +74,14 @@ int main(void) {
         CLM_FN(net_meshos_metadata),           CLM_FN(net_meshos_graceful_shutdown),
         CLM_FN(net_meshos_handle_free),        CLM_FN(net_meshos_last_error_kind),
         CLM_FN(net_meshos_free_string),
+        CLM_FN(net_meshos_clear_last_error),
+        CLM_FN(net_meshos_handle_daemon_name),
+        CLM_FN(net_meshos_process_emit),
+        CLM_FN(net_meshos_publish_capabilities),
+        CLM_FN(net_meshos_refresh_metadata),
+        CLM_FN(net_meshos_register_daemon_with_vtable),
+        CLM_FN(net_meshos_sdk_dropped_control_events),
+        CLM_FN(net_meshos_try_next_control),
     };
     uint8_t seed_a[32], seed_b[32];
     NetMeshOsSdk* sdk = NULL;

@@ -268,10 +268,26 @@ unsigned char* cu_read_file(const char* path, size_t* out_len) {
         n = fread(buf + len, 1, cap - len, f);
         len += n;
         if (n == 0) {
+            if (ferror(f)) { /* a read error is not end of file */
+                free(buf);
+                fclose(f);
+                return NULL;
+            }
             break;
         }
     }
     fclose(f);
+    /* NUL-terminated (not counted in *out_len), so a text file such as a
+     * scenario manifest can be searched as a C string. */
+    if (len == cap) {
+        unsigned char* grown = (unsigned char*)realloc(buf, cap + 1);
+        if (grown == NULL) {
+            free(buf);
+            return NULL;
+        }
+        buf = grown;
+    }
+    buf[len] = '\0';
     *out_len = len;
     return buf;
 }
@@ -347,7 +363,7 @@ int cu_json_str(const char* from, const char* end, const char* key, char* out, s
     }
     v++;
     close = strchr(v, '"');
-    if (close == NULL || (size_t)(close - v) + 1 > cap) {
+    if (close == NULL || (end != NULL && close >= end) || (size_t)(close - v) + 1 > cap) {
         return -1;
     }
     n = (size_t)(close - v);

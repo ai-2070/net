@@ -129,9 +129,12 @@ static int run(void) {
              net_mesh_blob_adapter_fetch(cached, ref, ref_len, &out, &out_len) != 0);
     CU_CHECK_RC("tree_node_cache_stats: with a cache",
                 net_mesh_blob_adapter_tree_node_cache_stats(cached, &json), 0);
-    CU_CHECK("tree_node_cache_stats: the reads went through it",
-             cu_json_u64(json, "hits", &v) == 0 && cu_json_u64(json, "misses", &v) == 0 &&
-                 cu_json_has(json, "bytes") && cu_json_has(json, "entries"));
+    {
+        uint64_t hits = 0, misses = 0;
+        CU_CHECK("tree_node_cache_stats: the reads went through it (lookups counted)",
+                 cu_json_u64(json, "hits", &hits) == 0 && cu_json_u64(json, "misses", &misses) == 0 &&
+                     hits + misses > 0 && cu_json_has(json, "bytes") && cu_json_has(json, "entries"));
+    }
     net_free_string(json);
     json = NULL;
 

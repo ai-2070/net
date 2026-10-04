@@ -50,8 +50,9 @@ static void callback_free(void* p) {
 
 static int on_process(uint64_t daemon_id, uint64_t origin, uint64_t seq, const uint8_t* payload,
                       size_t payload_len, net_compute_outputs_t* outputs) {
-    char out[256];
-    int n;
+    char prefix[32];
+    unsigned char* out;
+    int n, rc;
     uint64_t count;
     (void)origin, (void)seq;
     if (daemon_id >= MAX_DAEMONS) {
@@ -60,9 +61,23 @@ static int on_process(uint64_t daemon_id, uint64_t origin, uint64_t seq, const u
     cu_mutex_lock(lock);
     count = ++counts[daemon_id];
     cu_mutex_unlock(lock);
-    n = snprintf(out, sizeof out, "n=%llu:%.*s", (unsigned long long)count, (int)payload_len,
-                 (const char*)payload);
-    return net_compute_outputs_push(outputs, (const uint8_t*)out, (size_t)n);
+    /* "n=<count>:" then the payload, sized exactly: a payload of any length
+     * is emitted whole, and nothing is read past a buffer. */
+    n = snprintf(prefix, sizeof prefix, "n=%llu:", (unsigned long long)count);
+    if (n < 0 || (size_t)n >= sizeof prefix) {
+        return -1;
+    }
+    out = (unsigned char*)malloc((size_t)n + payload_len + 1);
+    if (!out) {
+        return -1;
+    }
+    memcpy(out, prefix, (size_t)n);
+    if (payload_len) {
+        memcpy(out + n, payload, payload_len);
+    }
+    rc = net_compute_outputs_push(outputs, out, (size_t)n + payload_len);
+    free(out);
+    return rc;
 }
 
 static int on_snapshot(uint64_t daemon_id, uint8_t** out_ptr, size_t* out_len) {
@@ -233,9 +248,14 @@ static int daemons(net_compute_runtime_t* rt) {
     snap_copy[snap_len / 2] ^= 0xFF;
     snap_copy[0] ^= 0xFF;
     restored = NULL;
-    rc = net_compute_spawn_from_snapshot(rt, "counter", 7, seed, snap_copy, snap_len, new_daemon(), 0, 0,
-                                         &restored, &err);
+    d2 = new_daemon();
+    rc = net_compute_spawn_from_snapshot(rt, "counter", 7, seed, snap_copy, snap_len, d2, 0, 0, &restored, &err);
     CU_CHECK("spawn_from_snapshot: corrupt bytes are refused", rc != 0 && restored == NULL);
+    if (d2 < MAX_DAEMONS) {
+        cu_mutex_lock(lock);
+        live[d2] = 0; /* the refused spawn never ran: retire its id */
+        cu_mutex_unlock(lock);
+    }
     net_compute_free_cstring(err);
     free(snap_copy);
     return 0;
@@ -314,6 +334,31 @@ int main(void) {
         CLM_FN(net_compute_fork_group_fork_count),
         CLM_FN(net_compute_replica_group_spawn),
         CLM_FN(net_compute_free_cstring),
+        CLM_FN(net_compute_daemon_handle_entity_id),
+        CLM_FN(net_compute_daemon_handle_free),
+        CLM_FN(net_compute_daemon_handle_origin_hash),
+        CLM_FN(net_compute_fork_group_fork_seq),
+        CLM_FN(net_compute_fork_group_free),
+        CLM_FN(net_compute_fork_group_healthy_count),
+        CLM_FN(net_compute_fork_group_parent_origin),
+        CLM_FN(net_compute_fork_group_verify_lineage),
+        CLM_FN(net_compute_outputs_at),
+        CLM_FN(net_compute_outputs_free),
+        CLM_FN(net_compute_outputs_len),
+        CLM_FN(net_compute_outputs_push),
+        CLM_FN(net_compute_register_factory_with_func),
+        CLM_FN(net_compute_replica_group_free),
+        CLM_FN(net_compute_replica_group_health),
+        CLM_FN(net_compute_replica_group_healthy_count),
+        CLM_FN(net_compute_replica_group_members_json),
+        CLM_FN(net_compute_replica_group_replica_count),
+        CLM_FN(net_compute_replica_group_route_event),
+        CLM_FN(net_compute_runtime_daemon_count),
+        CLM_FN(net_compute_runtime_free),
+        CLM_FN(net_compute_runtime_id),
+        CLM_FN(net_compute_runtime_is_ready),
+        CLM_FN(net_compute_runtime_shutdown),
+        CLM_FN(net_compute_runtime_stop),
     };
     net_meshnode_t* node = NULL;
     net_compute_runtime_t* rt;

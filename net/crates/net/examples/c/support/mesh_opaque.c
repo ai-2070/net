@@ -12,6 +12,15 @@ int cu_opaque_pair(unsigned char seed_a, unsigned char seed_b, void** out_a, voi
     if (cu_net_init() != 0 || cu_mesh_build(seed_a, &a, a_addr, sizeof a_addr) != 0 ||
         cu_mesh_build(seed_b, &b, b_addr, sizeof b_addr) != 0 || cu_mesh_handshake(a, b, a_addr) != 0 ||
         net_mesh_start(a) != 0 || net_mesh_start(b) != 0) {
+        /* Release whatever was built before the step that failed. */
+        if (b != NULL) {
+            net_mesh_shutdown(b);
+            net_mesh_free(b);
+        }
+        if (a != NULL) {
+            net_mesh_shutdown(a);
+            net_mesh_free(a);
+        }
         return -1;
     }
     *out_a = a;

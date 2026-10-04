@@ -709,6 +709,18 @@ _NET_PROTO = re.compile(
 _EXTERN_NET = re.compile(r"^[ \t]*extern\b[^;]*\bnet_\w+", re.M)
 
 
+_CLM_FN_NAME = re.compile(r"\bCLM_FN\s*\(\s*(\w+)\s*\)")
+
+
+def _cu_mesh_fns(root: Path) -> str:
+    """The CU_MESH_FNS macro body from support/consumer_util.h ("" if none)."""
+    header = root / "support" / "consumer_util.h"
+    if not header.is_file():
+        return ""
+    m = re.search(r"#define\s+CU_MESH_FNS\b((?:[^\n]*\\\n)*[^\n]*)", header.read_text(encoding="utf-8"))
+    return m.group(1) if m else ""
+
+
 def lint_consumer_sources(root: Path = EXAMPLES_C) -> list[Finding]:
     """The consumer programs must test the shipped headers, not their own
     copies of them: a Net header is included by name only (resolved through
@@ -718,7 +730,8 @@ def lint_consumer_sources(root: Path = EXAMPLES_C) -> list[Finding]:
     become implicit declarations (formerly CR-5, pinned on one example)."""
     findings = []
     for f in sorted(root.rglob("*.c")) + sorted(root.rglob("*.h")):
-        text = M._COMMENT.sub(" ", f.read_text(encoding="utf-8"))
+        raw = f.read_text(encoding="utf-8")
+        text = M._COMMENT.sub(" ", raw)
         text = re.sub(r"//[^\n]*", " ", text)
         rel = _rel(f)
         for m in _INCLUDE.finditer(text):
@@ -731,6 +744,17 @@ def lint_consumer_sources(root: Path = EXAMPLES_C) -> list[Finding]:
             findings.append(Finding("lint", f"{rel}:NET_SDK_H",
                 f"{rel} includes both net.h and net.go.h; they share the NET_SDK_H guard, so the "
                 "second is skipped and its functions are implicitly declared. Split the translation unit"))
+        # The loaded-module check proves where each LISTED import resolved;
+        # a call left off the list is never checked. So every net_* a
+        # program calls must be listed (CLM_FN, or CU_MESH_FNS for the mesh
+        # helpers' imports). Support files carry no list of their own.
+        if f.suffix == ".c" and f.parent == root and "clm_check_loaded_module" in text:
+            listed = set(_CLM_FN_NAME.findall(text))
+            if "CU_MESH_FNS" in text:
+                listed |= set(_CLM_FN_NAME.findall(_cu_mesh_fns(root)))
+            for fn in sorted(M.c_calls(raw) - listed):
+                findings.append(Finding("lint", f"{rel}:{fn}",
+                    f"{rel} calls {fn} but its loaded-module list (CLM_FN) does not name it"))
         for m in _NET_PROTO.finditer(text):
             findings.append(Finding("lint", f"{rel}:{m.group(1)}",
                 f"{rel} declares {m.group(1)} itself; use the shipped header's declaration"))
@@ -1017,6 +1041,10 @@ def self_test() -> int:
             ("a program declaring a net_* function", "int net_mesh_start(void* h);\n", "declares net_mesh_start"),
             ("an extern declaration of a Net symbol", "extern int net_secret;\n", "extern declaration"),
             ("both NET_SDK_H headers in one file", '#include "net.h"\n#include "net.go.h"\n', "includes both"),
+            ("a call the loaded-module list does not name",
+             "static const clm_fn_t used[] = {CLM_FN(net_version)};\n"
+             "int main(void) { clm_check_loaded_module(used, 1); net_free_string(0); return 0; }\n",
+             "does not name it"),
         ]:
             (lint_root / "bad.c").write_text(body, encoding="utf-8")
             got = lint_consumer_sources(lint_root)

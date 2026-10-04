@@ -50,6 +50,11 @@ int main(void) {
         CLM_FN(net_fold_query_client_query_summarize_now), CLM_FN(net_fold_query_last_error_detail),
         CLM_FN(net_fold_query_client_free),  CLM_FN(net_register_channel),
         CLM_FN(net_free_string),
+        CLM_FN(net_fold_query_client_invalidate_cache),
+        CLM_FN(net_fold_query_client_invalidate_target),
+        CLM_FN(net_fold_query_client_set_deadline),
+        CLM_FN(net_fold_query_client_set_ttl),
+        CLM_FN(net_registry_client_set_deadline),
     };
     void *a = NULL, *b = NULL;
     net_registry_client_handle_t* reg;

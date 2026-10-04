@@ -237,6 +237,16 @@ int main(void) {
         CLM_FN(net_mcp_pin_list),
         CLM_FN(net_mcp_last_error_message),
         CLM_FN(net_mcp_free_string),
+        CLM_FN(net_mcp_clear_last_error),
+        CLM_FN(net_mcp_consent_policy_allow),
+        CLM_FN(net_mcp_consent_policy_free),
+        CLM_FN(net_mcp_consent_policy_is_pinned),
+        CLM_FN(net_mcp_consent_policy_pin),
+        CLM_FN(net_mcp_consent_policy_pinned),
+        CLM_FN(net_mcp_consent_policy_unpin),
+        CLM_FN(net_mcp_pin_approve),
+        CLM_FN(net_mcp_pin_is_approved),
+        CLM_FN(net_mcp_pin_state),
     };
     if (clm_check_loaded_module(used, sizeof used / sizeof used[0]) != 0) {
         return 2;

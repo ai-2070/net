@@ -83,7 +83,8 @@ unsigned long cu_pid(void);
 int cu_mkdir(const char* path);
 /* Write `len` bytes to `path`. 0 on success. */
 int cu_write_file(const char* path, const void* data, size_t len);
-/* The whole file, malloc'd (free it); NULL if unreadable. */
+/* The whole file, malloc'd (free it), with a NUL after the last byte that
+ * *out_len does not count; NULL if unreadable or on a read error. */
 unsigned char* cu_read_file(const char* path, size_t* out_len);
 /* 1 if `path` exists. */
 int cu_exists(const char* path);

@@ -65,7 +65,12 @@ static void counting_free(void* p) {
         n_bad_release++;
     }
     cu_mutex_unlock(mu);
-    free(p);
+    /* Only a buffer this program handed out is freed: a second release of
+     * the same pointer must reach the "bad release" check, not abort in the
+     * allocator first. */
+    if (found) {
+        free(p);
+    }
 }
 
 static int dispatch(uint64_t handler_id, const uint8_t* req, size_t req_len, uint8_t** out_resp,

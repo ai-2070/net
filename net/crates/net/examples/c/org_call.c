@@ -139,6 +139,11 @@ int main(void) {
         CLM_FN(net_org_call),
         CLM_FN(net_org_response_free),
         CLM_FN(net_org_free_cstring),
+        CLM_FN(net_org_client_free),
+        CLM_FN(net_org_credentials_free),
+        CLM_FN(net_org_reserve_cancel_token),
+        CLM_FN(net_org_reserve_handler_id),
+        CLM_FN(net_org_serve_handle_free),
     };
     const char* dir = getenv("NET_ORG_SCENARIO");
     char psk[80], service[128], p_seed[80], p_org[80], p_auth[256], p_grant[256], p_secret[256];

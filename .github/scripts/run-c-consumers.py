@@ -76,6 +76,13 @@ SANITIZE_FLAGS = [
 FLOORS = EXAMPLES / "FLOORS"
 LIB_NAMES = ("libnet.so", "libnet.dylib", "net.dll")
 IS_WINDOWS = os.name == "nt"
+# Loader variables that can put another library in the process; none reaches
+# a consumer (the runner sets the loader path itself).
+LOADER_VARS = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+               "DYLD_FALLBACK_LIBRARY_PATH")
+# Generating a scenario builds net-mesh-sdk's generators (release) the first
+# time; bounded so a hung build is a named failure, not a lost job.
+SCENARIO_TIMEOUT = 1800
 
 MODULE_RE = re.compile(r"^NET-LOADED-MODULE: (.+?)\s*$", re.M)
 MODULE_ERR_RE = re.compile(r"^NET-LOADED-MODULE-ERROR: (.+?)\s*$", re.M)
@@ -236,7 +243,7 @@ def judge_leaks(program: str, leaks: list[Leak], policy: dict) -> tuple[list[str
 
 def child_env(bundle: Bundle, extra: dict[str, str] | None = None) -> dict[str, str]:
     """The environment a consumer runs in: loader path = bundle/lib alone."""
-    env = {k: v for k, v in os.environ.items() if k not in ("LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH")}
+    env = {k: v for k, v in os.environ.items() if k not in LOADER_VARS}
     if IS_WINDOWS:
         sysroot = os.environ.get("SystemRoot", r"C:\Windows")
         env["PATH"] = os.pathsep.join(
@@ -297,6 +304,10 @@ def compile_program(
     compiler: str, bundle: Bundle, src: Path, out_dir: Path, extra_link: list[str] | None = None,
     sanitize: bool = False, debug_crt: bool = False,
 ) -> Path:
+    if sanitize and compiler != "gcc":
+        raise SystemExit("FAIL  --sanitize is the Linux GCC lane (ASan/UBSan/LSan)")
+    if debug_crt and compiler != "msvc":
+        raise SystemExit("FAIL  --debug-crt is the MSVC /MDd lane")
     out_dir.mkdir(parents=True, exist_ok=True)
     exe = out_dir / (src.stem + (".exe" if IS_WINDOWS else ""))
     # Every support file: the loaded-module check and the shared utilities.
@@ -342,10 +353,6 @@ def compile_program(
         cmd = [cl]
     else:
         raise SystemExit(f"FAIL  unknown compiler {compiler}")
-    if sanitize and compiler != "gcc":
-        raise SystemExit("FAIL  --sanitize is the Linux GCC lane (ASan/UBSan/LSan)")
-    if debug_crt and compiler != "msvc":
-        raise SystemExit("FAIL  --debug-crt is the MSVC /MDd lane")
     if run.returncode != 0:
         print(f"✗ {src.name}: compile failed ({compiler})")
         print("    " + " ".join(cmd))
@@ -530,6 +537,22 @@ SCENARIOS = {
 _scenario_dirs: dict[str, Path] = {}
 
 
+def private_dir(path: Path) -> None:
+    """Restrict `path` to this user (Windows: an owner-only DACL, inherited by
+    everything created inside; elsewhere 0700). The org layer refuses an
+    audience secret anyone else can read, and a CI work directory inherits
+    broader entries."""
+    if IS_WINDOWS:
+        user = os.environ.get("USERNAME", "")
+        cmd = ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F",
+               "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", "*S-1-5-32-544:(OI)(CI)F"]
+        run = subprocess.run(cmd, capture_output=True, text=True)
+        if run.returncode != 0:
+            raise SystemExit(f"FAIL  icacls {path}: {run.stdout}{run.stderr}")
+    else:
+        os.chmod(path, 0o700)
+
+
 def scenario_env(src: Path, work: Path) -> dict[str, str]:
     """The environment variables naming the scenarios `src` needs,
     generating each the first time it is asked for."""
@@ -542,10 +565,16 @@ def scenario_env(src: Path, work: Path) -> dict[str, str]:
             out = (work / "scenarios" / need).resolve()
             if out.exists():
                 shutil.rmtree(out)
+            out.mkdir(parents=True)
+            private_dir(out)
             cmd = ["cargo", "run", "-q", "--release", "--manifest-path",
                    str(ROOT / "net" / "crates" / "net" / "Cargo.toml"), "-p", "net-mesh-sdk",
                    "--features", "net,cortex,fixtures", "--example", example, "--", str(out)]
-            run = subprocess.run(cmd, capture_output=True, text=True)
+            try:
+                run = subprocess.run(cmd, capture_output=True, text=True, timeout=SCENARIO_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                print(f"✗ {src.stem}: generating {need} timed out after {SCENARIO_TIMEOUT}s")
+                raise SystemExit(1)
             if run.returncode != 0 or not (out / "manifest.json").is_file():
                 print(f"✗ {src.stem}: generating {need} failed")
                 sys.stdout.write(_indent(run.stdout + run.stderr))
@@ -601,8 +630,13 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
         rc, out = execute(args, exe, env)
         v = classify(out, rc, bundle.library, bundle.sha256)
         if args.sanitize and v.kind == "sanitizer" and leak_only(out):
-            lines, bad = judge_leaks(name, parse_leaks(out), load_lsan_policy())
-            if bad:
+            leaks = parse_leaks(out)
+            lines, bad = judge_leaks(name, leaks, load_lsan_policy())
+            if not leaks:
+                # A LeakSanitizer report the parser cannot read (truncated, or
+                # a changed format) is not evidence of anything: fail closed.
+                v.reason = "a LeakSanitizer report with no parseable leak block"
+            elif bad:
                 v.reason = "unaccepted leaks: " + "; ".join(bad[:6]) + (" …" if len(bad) > 6 else "")
             else:
                 c = CHECKS_RE.search(out)

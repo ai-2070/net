@@ -69,13 +69,19 @@ static int cb_store(void* ctx, const char* uri, const uint8_t* hash, uint64_t si
     if (slot < 0) {
         rc = NET_ERR_BLOB_BACKEND;
     } else {
-        s->uri[slot] = (char*)malloc(strlen(uri) + 1);
-        s->data[slot] = (unsigned char*)malloc(data_len ? data_len : 1);
-        if (!s->uri[slot] || !s->data[slot]) {
+        /* Publish into the slot only once both allocations succeed, so an
+         * out-of-memory store leaves no half-filled slot for find(). */
+        char* u = (char*)malloc(strlen(uri) + 1);
+        unsigned char* d = (unsigned char*)malloc(data_len ? data_len : 1);
+        if (!u || !d) {
+            free(u);
+            free(d);
             rc = NET_ERR_BLOB_BACKEND;
         } else {
-            memcpy(s->uri[slot], uri, strlen(uri) + 1);
-            memcpy(s->data[slot], data, data_len);
+            memcpy(u, uri, strlen(uri) + 1);
+            memcpy(d, data, data_len);
+            s->uri[slot] = u;
+            s->data[slot] = d;
             s->len[slot] = data_len;
         }
     }

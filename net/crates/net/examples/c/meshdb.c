@@ -258,6 +258,14 @@ int main(void) {
         CLM_FN(net_meshdb_runner_execute),    CLM_FN(net_meshdb_iter_next),
         CLM_FN(net_meshdb_iter_free),         CLM_FN(net_meshdb_payload_free),
         CLM_FN(net_meshdb_decode_payload_json), CLM_FN(net_meshdb_free_string),
+        CLM_FN(net_meshdb_query_filter_json),
+        CLM_FN(net_meshdb_query_free),
+        CLM_FN(net_meshdb_query_numeric_agg),
+        CLM_FN(net_meshdb_query_percentile),
+        CLM_FN(net_meshdb_query_window),
+        CLM_FN(net_meshdb_runner_execute_with),
+        CLM_FN(net_meshdb_runner_free),
+        CLM_FN(net_meshdb_runner_new_cached),
     };
     MeshDbReader* reader;
     MeshDbRunner* runner;
