@@ -222,6 +222,14 @@ const TAB_FOLLOW2: &str = "of2";
 /// The leader trio's Web Lock scope: ONE identity, ONE locks
 /// namespace — the proxied-attribution topology.
 const LEADER_SCOPE: &str = "s4-leader-lock";
+/// The trio's tabs. No witness outside [`LEADER_WITNESSES`] drives them.
+const LEADER_TRIO: [&str; 3] = [TAB_LEAD, TAB_FOLLOW1, TAB_FOLLOW2];
+/// The witnesses that run on the leader trio, and only those.
+const LEADER_WITNESSES: [&str; 3] = [
+    "org_leader_proxied_call_preserves_follower_attribution",
+    "org_leader_replacement_preserves_attribution",
+    "org_leader_teardown_fails_pending_typed",
+];
 const TAB_OLD: &str = "oo1";
 const TAB_NEW: &str = "oo2";
 
@@ -4989,7 +4997,18 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
         (TAB_FOLLOW2, &world.leader, Some(LEADER_SCOPE)),
     ];
     let mut leaves: HashMap<&str, LeafInfo> = HashMap::new();
+    // A leader-trio connect failure fails the three LEADER witnesses
+    // only: those tabs are used by nothing else, so failing all 35
+    // over one of them made a single race read as 70 failures. Every
+    // other tab is shared across the matrix and still fails the lot.
+    let mut leader_trio_failure: Option<String> = None;
     for (tab, id, lock) in connects {
+        let in_trio = LEADER_TRIO.contains(&tab);
+        if in_trio && leader_trio_failure.is_some() {
+            // The trio is one identity on one lock scope: with one of
+            // its tabs down, the rest prove nothing on their own.
+            continue;
+        }
         let r = script
             .run(tab, connect_step(&cx, &world, id, SESSION, lock, tab))
             .await;
@@ -5014,14 +5033,29 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 leaves.insert(tab, leaf);
             }
             other => {
+                // An `ok` step with no node id has no error to quote:
+                // name that shape rather than "<no reason reported>".
+                let reason = if r.ok && r.node_id.is_none() {
+                    "the step succeeded but reported no node id".to_string()
+                } else {
+                    why(&r)
+                };
+                // The leader trio shares ONE node id, so for a follower
+                // this view is the LEADER's session, not evidence the
+                // follower itself connected.
                 let detail = format!(
                     "the {tab} leaf did not connect as its provisioned identity {} (got {:?}): {} \
                      [{}]",
                     hex32(id.entity.as_bytes()),
                     other.map(|l| l.node_hex),
-                    why(&r),
+                    reason,
                     anchor_peer_view(cx.anchor, id.entity.node_id())
                 );
+                if in_trio {
+                    println!("[org] leader trio down, leader witnesses only: {detail}");
+                    leader_trio_failure = Some(detail);
+                    continue;
+                }
                 for name in &WITNESSES[..BROWSER_WITNESSES] {
                     ledger.record(name, false, detail.clone());
                 }
@@ -5156,9 +5190,15 @@ pub async fn run(cx: CxOrg<'_>, ledger: &mut Ledger) -> Result<(), String> {
 
     // ── G: teardown / leader (4) ──
     tab_teardown(&cx, &world, &mut script, ledger).await;
-    leader_attribution(&cx, &world, &mut script, ledger, &services.log).await;
-    leader_replacement(&cx, &world, &mut script, ledger, &services.log, TAB_FOLLOW2).await;
-    leader_teardown(&cx, &world, &mut script, ledger, &services.log).await;
+    if let Some(detail) = &leader_trio_failure {
+        for name in LEADER_WITNESSES {
+            ledger.record(name, false, detail.clone());
+        }
+    } else {
+        leader_attribution(&cx, &world, &mut script, ledger, &services.log).await;
+        leader_replacement(&cx, &world, &mut script, ledger, &services.log, TAB_FOLLOW2).await;
+        leader_teardown(&cx, &world, &mut script, ledger, &services.log).await;
+    }
 
     // ── H: handler level (1) ──
     handler_completion_after_retirement(&cx, &world, &mut script, ledger).await;

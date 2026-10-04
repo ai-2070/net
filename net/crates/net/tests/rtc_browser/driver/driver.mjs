@@ -252,6 +252,18 @@ async function opLaunch(req) {
       // loopback-only host does need the loopback candidate.
       'media.peerconnection.ice.loopback': true,
       'network.proxy.type': 0,
+      // RFC 6455 §7.2.3 reconnect backoff, OFF. This suite fails
+      // trickle upgrades ON PURPOSE (a dialog that already ended
+      // answers 404), and every failure grows Firefox's per-host
+      // delay for the NEXT upgrade to the same anchor — measured in
+      // CI: a later trickle socket still CONNECTING seconds after
+      // its offer was accepted. That starved
+      // `stage5_a_refused_connect…` (readyState 0 at rejection, no
+      // handback within 20 s) and the Noise handshake of the §12
+      // witnesses that followed a run of 404s. The backoff is a
+      // browser courtesy to a remote server, not behaviour under
+      // test; Chromium has none.
+      'network.websocket.delay-failed-reconnects': false,
     };
     if (seeded.enterpriseRoots) prefs['security.enterprise_roots.enabled'] = true;
     // Firefox's counterpart: ICE may only use a proxy, and none is
