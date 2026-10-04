@@ -5387,7 +5387,9 @@ jobs:
             prefix="${lane%%:*}"; crt="${lane##*:}"
             bin="$(cygpath -u "$MSYS2_ROOT")/$prefix/bin"
             "$bin/gcc" --version | head -n 1
-            CC="$bin/gcc.exe" PATH="$bin:$PATH" "$PY" .github/scripts/run-c-consumers.py \
+            # A Windows path for native Python's subprocess, rather than
+            # relying on the shell converting a /c/... value on the way in.
+            CC="$(cygpath -w "$bin/gcc.exe")" PATH="$bin:$PATH" "$PY" .github/scripts/run-c-consumers.py \
               --bundle "$PROD_BUNDLE" --compiler mingw --expect-crt "$crt" \
               --work "$RUNNER_TEMP/consumers-mingw-$crt" \
               --negative-controls --shadow-library "$shadow"
