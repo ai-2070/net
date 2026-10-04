@@ -42,8 +42,14 @@ typedef struct {
     uint64_t origin, seq;
     char payload[64];
     size_t payload_len;
-    char json[512]; /* the decoded sentinel, or "" for a raw row */
+    char json[512];    /* the decoded sentinel, or "" for a raw row */
+    char json_as[512]; /* the same payload decoded as `decode_kind`, or "" */
 } row_t;
+
+/* The envelope kind the next drain() also decodes each row as
+ * (net_meshdb_decode_payload_json_as), or -1 for none. The untagged
+ * decoder guesses; the program knows which operator its query ends in. */
+static int decode_kind = -1;
 
 /* Drain `it` into rows (freeing every buffer). Returns the row count, or
  * -1 on a non-END failure. Frees the iterator. */
@@ -73,6 +79,9 @@ static int drain(MeshDbIter* it, row_t* rows) {
         memcpy(rows[n].payload, payload, len < sizeof rows[n].payload - 1 ? len : sizeof rows[n].payload - 1);
         json = net_meshdb_decode_payload_json(payload, len);
         snprintf(rows[n].json, sizeof rows[n].json, "%s", json ? json : "");
+        net_meshdb_free_string(json);
+        json = decode_kind < 0 ? NULL : net_meshdb_decode_payload_json_as(decode_kind, payload, len);
+        snprintf(rows[n].json_as, sizeof rows[n].json_as, "%s", json ? json : "");
         net_meshdb_free_string(json);
         net_meshdb_payload_free(payload, len);
         n++;
@@ -149,6 +158,11 @@ static int composites(MeshDbRunner* runner) {
     MeshDbQuery* b = net_meshdb_query_between(CHAIN_B, 1, 3);
     CU_CHECK("Between(A) and Between(B) for the composites", a != NULL && b != NULL);
 
+    decode_kind = NET_MESHDB_PAYLOAD_AGGREGATE;
+    n = run(runner, net_meshdb_query_count(a, NULL), rows);
+    decode_kind = -1;
+    CU_CHECK("decode_payload_json_as(AGGREGATE): the Count row, as the untagged decoder reads it",
+             n == 1 && rows[0].json_as[0] != '\0' && strcmp(rows[0].json_as, rows[0].json) == 0);
     CU_CHECK_RC("Count(Between(A))", aggregate(runner, net_meshdb_query_count(a, NULL), json, sizeof json), 0);
     CU_CHECK("Count: an aggregate sentinel of kind count",
              strstr(json, "\"kind\":\"aggregate\"") && strstr(json, "\"kind\":\"count\""));
@@ -178,8 +192,13 @@ static int composites(MeshDbRunner* runner) {
     /* Seqs 1..3 in tumbling buckets of 2: [0, 2) holds seq 1, [2, 4) holds
      * 2 and 3. The first is the payload that once decoded as an aggregate
      * (the decoder took any type that parsed a prefix). */
+    decode_kind = NET_MESHDB_PAYLOAD_WINDOW;
     n = run(runner, net_meshdb_query_window(a, 2), rows);
+    decode_kind = -1;
     CU_CHECK_RC("Window(Between(A), 2): two buckets", n, 2);
+    CU_CHECK("decode_payload_json_as(WINDOW): each bucket, as the untagged decoder reads it",
+             strcmp(rows[0].json_as, rows[0].json) == 0 && strcmp(rows[1].json_as, rows[1].json) == 0 &&
+                 rows[0].json_as[0] != '\0');
     CU_CHECK("Window: [0, 2) is a window sentinel",
              strstr(rows[0].json, "{\"kind\":\"window\",\"start\":0,\"end\":2,") == rows[0].json);
     CU_CHECK("Window: [2, 4) is a window sentinel",
@@ -194,8 +213,12 @@ static int composites(MeshDbRunner* runner) {
     CU_CHECK_RC("Filter(not exists seq): no rows", n, 0);
     CU_CHECK("Filter: unparseable JSON is NULL", net_meshdb_query_filter_json(a, "{\"kind\":") == NULL);
 
+    decode_kind = NET_MESHDB_PAYLOAD_AGGREGATE;
     n = run(runner, net_meshdb_query_join(a, b, "inner", "seq", NULL, 5.0), rows);
+    decode_kind = -1;
     CU_CHECK_RC("Join(A, B, inner, seq): the two seqs both chains have", n, 2);
+    CU_CHECK("decode_payload_json_as(AGGREGATE): a joined row is not an aggregate",
+             rows[0].json_as[0] == '\0' && rows[1].json_as[0] == '\0');
     CU_CHECK("Join: each row is a joined sentinel with both sides",
              strstr(rows[0].json, "\"kind\":\"joined\"") && !strstr(rows[0].json, "\"left\":null") &&
                  !strstr(rows[0].json, "\"right\":null"));
@@ -258,6 +281,7 @@ int main(void) {
         CLM_FN(net_meshdb_runner_execute),    CLM_FN(net_meshdb_iter_next),
         CLM_FN(net_meshdb_iter_free),         CLM_FN(net_meshdb_payload_free),
         CLM_FN(net_meshdb_decode_payload_json), CLM_FN(net_meshdb_free_string),
+        CLM_FN(net_meshdb_decode_payload_json_as),
         CLM_FN(net_meshdb_query_filter_json),
         CLM_FN(net_meshdb_query_free),
         CLM_FN(net_meshdb_query_numeric_agg),

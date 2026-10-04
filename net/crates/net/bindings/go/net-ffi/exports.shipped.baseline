@@ -4,7 +4,7 @@
 # generated-at: 13fe95dbc9c57b4d4e64209f6a299614ad5dcc7f
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi
-# count: 593
+# count: 594
 net_blob_adapter_registered
 net_blob_free_buffer
 net_blob_publish
@@ -330,6 +330,7 @@ net_mesh_traversal_stats_v2
 net_mesh_unsubscribe_channel
 net_meshdb_clear_last_error
 net_meshdb_decode_payload_json
+net_meshdb_decode_payload_json_as
 net_meshdb_free_string
 net_meshdb_iter_free
 net_meshdb_iter_next

@@ -4,7 +4,7 @@
 # generated-at: 9f01c24cea6645516ba6ed11f2a91654a0360a01
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi --features net-ffi/test-helpers
-# count: 601
+# count: 602
 # edited: net_redex_disable_replication added by hand (intended C-ABI addition, PR #1138)
 # edited: 8 v0.3 blob symbols added by hand (intended C-ABI addition, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md S6): net_blob_ref_describe, net_mesh_blob_adapter_{new_v2,fetch_range,store_tree,repair_blob,tree_node_cache_stats}, and the fixtures-only seams net_mesh_blob_adapter_test_{drop_data_chunk,chunk_present}
 # edited: net_redex_greedy_cache_for added by hand (intended C-ABI addition, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md gap G-A)
@@ -342,6 +342,7 @@ net_mesh_traversal_stats_v2
 net_mesh_unsubscribe_channel
 net_meshdb_clear_last_error
 net_meshdb_decode_payload_json
+net_meshdb_decode_payload_json_as
 net_meshdb_free_string
 net_meshdb_iter_free
 net_meshdb_iter_next

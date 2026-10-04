@@ -613,3 +613,44 @@ func TestABIStabilityObserverPreambleMatchesNetRpcHeader(t *testing.T) {
 		t.Errorf("found %d NET_RPC_STATUS/DIRECTION discriminants in the Go preamble, want 6", seen)
 	}
 }
+
+// TestABIStabilityMeshDbPayloadKindsMatchRust pins the envelope kinds of
+// net_meshdb_decode_payload_json_as (net_meshdb.h) to the Rust constants in
+// meshdb-ffi, and the declaration to its Rust signature's arity. The kind is
+// how a C caller decodes a composite row without guessing: the envelopes
+// carry no tag, and some byte strings are valid as more than one of them.
+func TestABIStabilityMeshDbPayloadKindsMatchRust(t *testing.T) {
+	requireCrateTree(t)
+	src, err := os.ReadFile("../net/crates/net/bindings/go/meshdb-ffi/src/lib.rs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`(?m)^pub const (NET_MESHDB_PAYLOAD_\w+): c_int = (-?\d+);`)
+	rust := map[string]string{}
+	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+		rust[m[1]] = m[2]
+	}
+	h := parseHeader(t, "../net/crates/net/include/net_meshdb.h")
+	for _, name := range []string{
+		"NET_MESHDB_PAYLOAD_AGGREGATE", "NET_MESHDB_PAYLOAD_JOINED", "NET_MESHDB_PAYLOAD_WINDOW",
+	} {
+		want, ok := rust[name]
+		if !ok {
+			t.Errorf("meshdb-ffi does not define %s", name)
+			continue
+		}
+		if got, ok := h.consts[name]; !ok || got != want {
+			t.Errorf("%s is %q in net_meshdb.h, %s in Rust", name, got, want)
+		}
+	}
+	params, ok := h.fns["net_meshdb_decode_payload_json_as"]
+	if !ok {
+		t.Fatal("net_meshdb.h does not declare net_meshdb_decode_payload_json_as")
+	}
+	if n := len(strings.Split(params, ",")); n != 3 {
+		t.Errorf("net_meshdb_decode_payload_json_as declares %d parameters (%s), Rust takes 3", n, params)
+	}
+	if !strings.Contains(string(src), "pub unsafe extern \"C\" fn net_meshdb_decode_payload_json_as(\n    kind: c_int,\n    payload: *const u8,\n    payload_len: usize,\n)") {
+		t.Error("meshdb-ffi's net_meshdb_decode_payload_json_as is not (kind: c_int, payload: *const u8, payload_len: usize)")
+	}
+}

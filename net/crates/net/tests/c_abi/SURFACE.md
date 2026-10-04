@@ -15,7 +15,7 @@ both.
 | `net_cortex.h` | 92 | 2 | 8 |
 | `net_deck.h` | 84 | 62 | 62 |
 | `net_mcp.h` | 22 | 20 | 20 |
-| `net_meshdb.h` | 27 | 24 | 24 |
+| `net_meshdb.h` | 28 | 25 | 25 |
 | `net_meshos.h` | 23 | 22 | 22 |
 | `net_org.h` | 30 | 18 | 22 |
 | `net_rpc.h` | 70 | 10 | 17 |
@@ -510,6 +510,7 @@ both.
 | --- | --- | --- | --- |
 | `net_meshdb_clear_last_error` | – | – | – |
 | `net_meshdb_decode_payload_json` | meshdb | – | – |
+| `net_meshdb_decode_payload_json_as` | meshdb | – | – |
 | `net_meshdb_free_string` | meshdb | – | – |
 | `net_meshdb_iter_free` | meshdb | – | – |
 | `net_meshdb_iter_next` | meshdb | – | – |

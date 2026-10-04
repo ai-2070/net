@@ -13,7 +13,7 @@ rpc_no_free 4
 capabilities 293
 mcp 77
 redis_dedup 23
-meshdb 68
+meshdb 71
 compute 60
 deck 77
 streams 36
