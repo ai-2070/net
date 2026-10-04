@@ -1,0 +1,41 @@
+net/crates/net/examples/c/repair.c
+  s_17a2ac60d914fc::t_398b7a9cfc2fea 18-19,23-25
+  s_17a2ac60d914fc::t_a820deb7a0802c 74-87
+  s_17a2ac60d914fc::t_87b9b67ac5f217 92-99
+  s_17a2ac60d914fc::t_b4de9d955b11e1 134-136
+  s_17a2ac60d914fc::t_392d75a0108f53 163
+  s_17a2ac60d914fc::t_2871271a4fe2ac 1-17,20-22,26-73,88-91,100-133,137-162,164-177
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_cad2bad98b72c9 9
+  s_17a2ac60d914fc::t_6bd371565896e9 8
+net/crates/net/examples/c/tree_range.c
+  s_17a2ac60d914fc::t_ea16bf06a33d0a 228-232,235,237
+  s_17a2ac60d914fc::t_7c711f3115c263 233-234,236
+  s_17a2ac60d914fc::t_1265c5616e3ffd 39-48,55-59
+  s_17a2ac60d914fc::t_43987160ec8fd4 1-38,49-54,60-227,238-292
+.github/scripts/run-c-consumers.py
+  s_17a2ac60d914fc::t_6bd371565896e9 321-331,352-354
+  s_17a2ac60d914fc::t_c5bac4e3b4e5b8 355
+net/crates/net/examples/c/support/consumer_util.c
+  s_17a2ac60d914fc::t_1e84af4517b39b 237-304
+net/crates/net/examples/c/support/consumer_util.h
+  s_17a2ac60d914fc::t_1e84af4517b39b 83-98
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_a0d6d5ae07aee7 756-803
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "52e6dee8a83055bd87f4a22e222fa92020646968",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
