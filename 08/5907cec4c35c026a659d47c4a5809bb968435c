@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_17a2ac60d914fc::t_2d2cfba2ec0158 14708-14716,14719,14721-14723
+  s_17a2ac60d914fc::t_874d6d60691396 65109-65165,65168-65191
+  s_17a2ac60d914fc::t_81b39910939ef7 65166-65167
+net/crates/net/tests/c_abi/lsan_policy.toml
+  s_17a2ac60d914fc::t_4d68ae1a437c0c 25-32
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_6b32cdcb81e44b 1251-1266
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "085907cec4c35c026a659d47c4a5809bb968435c",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
