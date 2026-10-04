@@ -1,0 +1,57 @@
+net/crates/net/examples/c/org_call.c
+  s_17a2ac60d914fc::t_d7e391bbee8db3 142-146
+net/crates/net/examples/c/support/consumer_util.c
+  s_17a2ac60d914fc::t_95a47caa2dae76 271-275,280-290
+  s_17a2ac60d914fc::t_97be7aa8cec0e9 366
+net/crates/net/examples/c/support/mesh_opaque.c
+  s_17a2ac60d914fc::t_1f23eafa46e8dc 15-23
+net/crates/net/examples/c/aggregator.c
+  s_17a2ac60d914fc::t_d7e391bbee8db3 53-57
+net/crates/net/examples/c/meshdb.c
+  s_17a2ac60d914fc::t_d7e391bbee8db3 261-268
+net/crates/net/examples/c/meshos.c
+  s_17a2ac60d914fc::t_d7e391bbee8db3 77-84
+.github/scripts/check-c-abi.py
+  s_17a2ac60d914fc::t_f55946d1cd4b61 733-734
+  s_17a2ac60d914fc::t_9c22e6d88557b2 1044-1047
+  s_17a2ac60d914fc::t_912682d5d2d1b4 712-723
+  s_17a2ac60d914fc::t_e17e1ab4bfe378 747-757
+net/crates/net/examples/c/mcp.c
+  s_17a2ac60d914fc::t_d7e391bbee8db3 240-249
+net/crates/net/examples/c/blob_callbacks.c
+  s_17a2ac60d914fc::t_2542f4f77883e6 72-78,81-84
+net/crates/net/examples/c/compute.c
+  s_17a2ac60d914fc::t_9d8da0b0925e58 53-55,64-80
+  s_17a2ac60d914fc::t_711387bb5f66bd 251-252,254-258
+  s_17a2ac60d914fc::t_d7e391bbee8db3 337-361
+net/crates/net/examples/c/support/consumer_util.h
+  s_17a2ac60d914fc::t_d88f2f5182d8ac 86-87
+.github/scripts/run-c-consumers.py
+  s_17a2ac60d914fc::t_cb5d6e8d2c3bdc 79-85,246,307-310,540-555,568-569,573-577,633-639
+net/crates/net/examples/c/rpc_callbacks.c
+  s_17a2ac60d914fc::t_82a04ee728b8cd 68-73
+net/crates/net/examples/c/subnet.c
+  s_17a2ac60d914fc::t_d7e391bbee8db3 244-247
+net/crates/net/examples/c/streams.c
+  s_17a2ac60d914fc::t_d7e391bbee8db3 46-49
+net/crates/net/examples/c/tree_range.c
+  s_17a2ac60d914fc::t_82693ff31ec49e 132-137
+net/crates/net/examples/c/deck.c
+  s_17a2ac60d914fc::t_d7e391bbee8db3 283-330
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d372d021ea34945924ec1f100b08adac13cd8e7f",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
