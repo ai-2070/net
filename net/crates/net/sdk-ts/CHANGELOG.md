@@ -12,7 +12,7 @@ upgraded together — the SDK is a thin typed layer over the native binding, so
 a version skew shows up as a missing method at the call site rather than at
 install time.
 
-## Unreleased
+## Unreleased — targets 0.40.0
 
 ### Added
 

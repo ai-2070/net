@@ -50,7 +50,7 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@net-mesh/core": ">=0.39.0"
+    "@net-mesh/core": ">=0.40.0"
   },
   "devDependencies": {
     "@net-mesh/core": "file:../bindings/node",
