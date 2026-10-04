@@ -4710,11 +4710,12 @@ jobs:
           python3 .github/scripts/check-abi-commit.py --self-test
           base="$BASE_SHA"
           if [ "$GITHUB_REF" != "refs/heads/master" ]; then
-            if mb=$(git merge-base origin/master "$GITHUB_SHA"); then
-              base="$mb"
-            else
-              echo "::warning::no merge-base with origin/master; checking only this push's commits"
-            fi
+            # Fetched explicitly, not assumed from the checkout: without it
+            # the merge-base fails and the guard would quietly fall back to
+            # the per-push range this exists to replace. A failure here
+            # fails the step.
+            git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
+            base=$(git merge-base origin/master "$GITHUB_SHA")
           fi
           python3 .github/scripts/check-abi-commit.py --range "$base..$GITHUB_SHA"
 
