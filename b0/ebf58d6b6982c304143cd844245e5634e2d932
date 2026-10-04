@@ -1,0 +1,43 @@
+.github/scripts/check-c-abi.py
+  s_9023e047bdb7d7::t_5c0e475804ef11 795-801,803,805-810,816,819-822
+  s_9023e047bdb7d7::t_f38e06f4991156 1120-1141
+  s_9023e047bdb7d7::t_1e43dfd2b03d7c 748
+  s_9023e047bdb7d7::t_7f70f71b33210b 715-716,718-747,749-750,754-764
+  s_9023e047bdb7d7::t_4a1f8f2df02ace 751-753
+  s_9023e047bdb7d7::t_f8ae5839272e58 775-777
+  s_9023e047bdb7d7::t_6f6f5c9d92ed0d 811-815
+  s_9023e047bdb7d7::t_8cb6f0b8c2dfed 717
+net/crates/net/examples/c/support/mesh_opaque.h
+  s_9023e047bdb7d7::t_6bdd148332138f 19,22
+  s_9023e047bdb7d7::t_e36d9f7e427928 34-38
+  s_598a2462cc770b::t_59a70a8811ab3e 23
+net/crates/net/examples/c/support/mesh_opaque.c
+  s_9023e047bdb7d7::t_42e4c7f9f11018 40-54
+net/crates/net/examples/c/aggregator.c
+  s_9023e047bdb7d7::t_a2258b5748531f 75
+  s_9023e047bdb7d7::t_11df5f5828c7a3 59-63,72-74,76-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b0ebf58d6b6982c304143cd844245e5634e2d932",
+  "prompts": {},
+  "sessions": {
+    "s_598a2462cc770b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83d8136c-f4b9-496a-a434-7d2d5fb91615",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_9023e047bdb7d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13ae6289-5780-436a-aa27-88954cc36586",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
