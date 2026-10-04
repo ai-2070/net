@@ -2,9 +2,10 @@
 
 ## Status
 
-In progress, 2026-10-04: C0 through C6 have landed (each slice's status
-block below says how); C3b waits on #1167 and C7 is optional. Targets the
-release after 0.39. Branch `LZL0/c-consumer-plan`. Follows
+Merged, 2026-10-04: C0 through C6 landed on master as #1171 (each
+slice's status block below says how). C3b is unblocked (#1167 is on master)
+and not yet written; C7 is optional. D-C6-2 is open. Targets the release
+after 0.39. Follows
 [`GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md`](GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md)
 (merged as #1165). That plan reached the new C surfaces (trees, ranges,
 repair, the blob registry, Go-implemented adapters) only through cgo, from
@@ -21,9 +22,10 @@ and how `repair.c` gets declarations for the helper functions. Every
 finding was verified against the source before revising; the ledger under
 "Review" maps each one to its change.
 
-**Prerequisite:** #1167 (channel-bound write tokens) must be merged before
-C3b. At this branch's base, `net_cortex.h` still declares the four-argument
-waits.
+**Prerequisite (met):** C3b needed #1167 (channel-bound write tokens).
+#1167 merged before #1171, and the merge of master into this branch made the
+audit accept it: both `breaks.toml` entries, and `NET_ERR_WRONG_CHANNEL`
+(-160) declared in `net_cortex.h` (see "After the merge").
 
 ## The gap
 
@@ -615,9 +617,10 @@ compatibility (check 7).
     `net_free_string` removal, because `net.go.h` still declares it.
     That is why the comparison is per header.
 - **`--self-test`** adds ten cases, 32 in all.
-- **#1167 needs `breaks.toml` entries when it lands** for both token
-  waits. `breaks.toml`'s header carries the entry to add. Until then the
-  check is red on any branch carrying #1167, which is the point.
+- **#1167 needed `breaks.toml` entries when it landed** for both token
+  waits, and the check was red on the branch carrying it until they were
+  added, which was the point. Done in the merge of master (see "After the
+  merge").
 
 **C1, all four stages.** Every check in the plan's list runs on both
 bundles, with self-tests for each, and each was shown to fail on planted
@@ -714,7 +717,8 @@ changes to the real headers.
   macros, port reservation, threads, sleep and files (Winsock and Win32
   on Windows, POSIX elsewhere), and node build and handshake. The runner
   compiles every support file and links `ws2_32` on Windows.
-- **Floors:** `examples/c/FLOORS` (smoke 2, lifecycle 26, transfer 55).
+- **Floors:** `examples/c/FLOORS` (smoke 2, lifecycle 26, transfer 55;
+  now 24 and 54, see "After the merge").
   The runner fails a run below its floor, a program without a floor, and
   a floor without a program; a self-test case covers the last two.
   Raising transfer's floor to 56 failed the run with "a check stopped
@@ -798,11 +802,15 @@ same boundary. Matrix evidence for repair says "helper build".
   `repair.c` asserts that degraded read, and proves absence through the
   seam. A read that must fail is checked where it really fails, after
   three drops, with `(NULL, 0)` outputs.
-- **Floors:** tree_range 61, repair 34.
+- **Floors:** tree_range 61 (now 62), repair 34.
 - **Verified:** every program, both bundles, MSVC and MinGW, with the
   shadowing control.
 
 ### C3b: write tokens (after #1167)
+
+**Status: unblocked, not started.** #1167 is on master; the pre-#1167
+fixture and both `breaks.toml` entries are in place, so only
+`write_tokens.c` (and its FLOORS line) remains.
 
 - **`write_tokens.c`** (production bundle), against the five-argument
   waits. Tasks and Memories adapters over one Redex with the same origin:
@@ -1149,19 +1157,20 @@ At this commit:
   went with the file.
 
 **Follow-up (2026-10-04): the partial cells closed.** Twelve new
-consumer programs, each run in every C5 lane:
+consumer programs, each run in every C5 lane. The counts are the floors
+after the post-review hardening (see "After the merge"):
 
 | Program | Covers | Named checks |
 | --- | --- | ---: |
-| `capabilities.c` | filter DSL and capability helpers, against six cross-language fixtures | 287 |
-| `mcp.c` | MCP helpers and consent / pin store, against the MCP fixtures | 79 |
-| `redis_dedup.c` | the consumer-side dedup window | 25 |
-| `meshdb.c` | the MeshDB query layer (found D-C6-1) | 69 |
-| `compute.c` | a C daemon behind the compute dispatcher; fork and replica groups | 58 |
-| `deck.c` | the Deck operator surface (found D-C6-2) | 78 |
+| `capabilities.c` | filter DSL and capability helpers, against six cross-language fixtures | 293 |
+| `mcp.c` | MCP helpers and consent / pin store, against the MCP fixtures | 77 |
+| `redis_dedup.c` | the consumer-side dedup window | 23 |
+| `meshdb.c` | the MeshDB query layer (found D-C6-1) | 71 |
+| `compute.c` | a C daemon behind the compute dispatcher; fork and replica groups | 60 |
+| `deck.c` | the Deck operator surface (found D-C6-2) | 77 |
 | `streams.c` | per-peer streams and the stream inbox | 36 |
 | `islands.c` | the gang-claim scheduler | 31 |
-| `aggregator.c` | registry and fold-query clients, from a `net.h`-only unit | 22 |
+| `aggregator.c` | registry and fold-query clients, from a `net.h`-only unit | 21 |
 | `meshos.c` | the MeshOS daemon-author SDK | 39 |
 | `org_call.c` | a unary protected org call, cross-org (org scenario) | 40 |
 | `subnet.c` | gateway provisioning, exported serve and call (subnet scenario) | 43 |
@@ -1314,9 +1323,17 @@ Found by the C6 follow-up programs:
     in `net-meshdb-ffi`, which asserts its own precondition (the payload
     still prefix-parses as an aggregate), and `meshdb.c`'s per-bucket
     checks.
-  - Not fixed: a payload that exactly parses as two envelope types would
-    still be ambiguous. The cure is a tagged envelope or typed C decoders,
-    an ABI change.
+  - Second half (cubic on #1171): consuming every byte was not enough.
+    Some byte strings are whole envelopes of two kinds (an empty window is
+    also a whole aggregate; the test
+    `an_ambiguous_payload_is_refused_untagged_and_decoded_by_kind` finds
+    one). Fix: a typed decoder,
+    `net_meshdb_decode_payload_json_as(kind, ...)` with
+    `NET_MESHDB_PAYLOAD_AGGREGATE | _JOINED | _WINDOW`, the way Python and
+    Node decode; and the untagged decoder now returns NULL for an ambiguous
+    payload instead of guessing (a behaviour change, marked `!`). One ABI
+    commit with a Go ABI test and both export baselines; `meshdb.c`
+    decodes Count, Window and Join rows by kind.
 
 - **D-C6-2 (open, an ABI gap): a C deck client cannot verify or
   attribute a signed ICE commit.** `net_deck_client_new` takes no operator
@@ -1370,6 +1387,48 @@ Known before C1 runs:
   C1 finds. Declared in C1.
 - **`check-rpc-abi-parity.py` can't see pointer depth** (gap 3, R3).
   Fixed in C1 when its parser is extended.
+
+## After the merge
+
+A code review of the branch and cubic's review of #1171 found gates that
+could pass without checking anything, and checks that could not fail. All
+were fixed before the merge.
+
+- **Runner.** A `FAIL ` line fails the run, whatever the exit code and
+  floor. A run whose only sanitizer report is policy-accepted leaks must
+  also exit with LeakSanitizer's code (23), print no `FAIL`, and reach
+  `NET-CHECKS`.
+- **Loaded-module lint.** It parses `support/*.c` and follows every helper
+  a program references (called or passed by address, transitively). The
+  `net_*` those helpers call must be listed too. `aggregator.c`'s mesh
+  bring-up was the case it caught; `mesh_opaque.c` hands over its list
+  through `cu_opaque_fns`.
+- **Audit.** An empty release baseline or a missing `layout.json` fails.
+  `target_arch` / `target_pointer_width` come from the bundle's target
+  triple, not the host's.
+- **ABI one-commit guard.** On a branch it checks every commit since the
+  merge-base with master, fetched explicitly, because a newer push cancels
+  the older run. The Go-mirror waiver follows where each changed constant
+  is declared.
+- **Programs.**
+  - Thirteen `CU_CHECK(name, 1)` lines asserted nothing. They became
+    `CU_SURVIVED`, which prints the step but does not count it, and the
+    floors were lowered by exactly those lines.
+  - Weak refusals now assert their reason: `subnet.c` (a foreign-org
+    caller is refused by authority with at least one considered candidate,
+    not a discovery miss), `compute.c`, `meshos.c` and `tree_range.c`.
+  - `deck.c`'s stamp check is an equality. Its operator-filter check pins
+    D-C6-2 instead of passing vacuously, and must flip when D-C6-2 is
+    fixed.
+  - Counters written by library threads are read under their lock.
+  - A failed handshake connect fails the program instead of hanging it.
+  - `subnet.c` reads the pretty-printed manifest's nesting and refuses a
+    second boundary path.
+- **The merge of master (#1167).** `NET_ERR_WRONG_CHANNEL` (-160) is
+  declared in `net_cortex.h` and `go/net_cortex.h`, since the audit
+  requires every returned code to be declared. `breaks.toml` authorizes
+  both token-wait changes against the pre-#1167 fixture. The shipped export
+  baseline gained `net_{tasks,memories}_channel_hash`.
 
 ## Review
 
