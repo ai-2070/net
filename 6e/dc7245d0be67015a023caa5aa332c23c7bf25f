@@ -1,0 +1,30 @@
+net/crates/net/tests/c_abi/arming/callback_buffer_double_release.c
+  s_17a2ac60d914fc::t_70c9705a6ea235 3-6
+  s_17a2ac60d914fc::t_b4c8f1a22b0241 2,8,10,16-18
+net/crates/net/tests/c_abi/arming/double_free_fetch_blob.c
+  s_17a2ac60d914fc::t_70c9705a6ea235 3-5
+  s_17a2ac60d914fc::t_b4c8f1a22b0241 2,7,9,15-17
+.github/scripts/run-c-consumers.py
+  s_17a2ac60d914fc::t_42394c67125097 447-451,467
+  s_17a2ac60d914fc::t_0bdf89840362ca 52,89-91,398-400,424-446,452-466,468-486,556,583-585,587-590,592-598,608-609,614,620-621,625-629,791-810,841-843,871-877
+.github/workflows/ci.yml
+  s_17a2ac60d914fc::t_55d020fe2d737d 5399-5414
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_726516895cc174 919,958-959,1004-1024
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6edc7245d0be67015a023caa5aa332c23c7bf25f",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
