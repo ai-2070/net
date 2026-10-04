@@ -1,0 +1,40 @@
+net/crates/net/tests/c_abi/SURFACE.md
+  s_17a2ac60d914fc::t_42e940b6927459 13,125,223-226,228,243,263
+net/crates/net/examples/c/capabilities.c
+  s_17a2ac60d914fc::t_f6fb0ac57b5118 1-56,58-178,180-181,185,188-265
+  s_17a2ac60d914fc::t_527e0c5fdb6bb8 179,182-184,186-187
+  s_17a2ac60d914fc::t_71252a4e9f00af 57
+net/crates/net/examples/c/support/capability_cases.h
+  s_17a2ac60d914fc::t_148bb754bd135a 3-4
+  s_17a2ac60d914fc::t_f6230d0547c17c 1-2,5-140
+.github/scripts/gen-c-fixture-cases.py
+  s_17a2ac60d914fc::t_3e7b9473a2751b 1-35,37-39,47-63,66-101,103-106,108-110,112-140
+  s_17a2ac60d914fc::t_f6230d0547c17c 36,40-46,102,107,111
+  s_17a2ac60d914fc::t_148bb754bd135a 64-65
+.github/workflows/ci.yml
+  s_17a2ac60d914fc::t_f5d12af464d6cf 5323,5328-5330
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_f5d12af464d6cf 13
+docs/data/capabilities/event-bus.yaml
+  s_17a2ac60d914fc::t_f5d12af464d6cf 74,76-77
+.claude/skills/net-event-bus/bindings/coverage.md
+  s_17a2ac60d914fc::t_42e940b6927459 81,172
+web/src/lib/generated/capability-record.json
+  s_17a2ac60d914fc::t_42e940b6927459 239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9a709e6e5880b311613572f80c9808de6321964c",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
