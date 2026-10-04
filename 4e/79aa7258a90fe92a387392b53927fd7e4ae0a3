@@ -1,0 +1,28 @@
+net/crates/net/tests/c_abi/arming/callback_buffer_double_release.c
+  s_17a2ac60d914fc::t_1c1c23ec7dc9f0 10
+net/crates/net/tests/c_abi/arming/leak_fetch_blob.c
+  s_17a2ac60d914fc::t_1c1c23ec7dc9f0 41,43-44
+  s_17a2ac60d914fc::t_e80b5af1e62722 42
+net/crates/net/tests/c_abi/arming/double_free_fetch_blob.c
+  s_17a2ac60d914fc::t_1c1c23ec7dc9f0 9,41,43
+  s_17a2ac60d914fc::t_5609cb9f7aec0f 42
+  s_17a2ac60d914fc::t_a190ea5ce95b5e 44
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_5ff67f22147833 1025-1033
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4e79aa7258a90fe92a387392b53927fd7e4ae0a3",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
