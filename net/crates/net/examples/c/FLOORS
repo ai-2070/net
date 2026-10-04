@@ -10,7 +10,7 @@ repair 34
 blob_callbacks 31
 rpc_callbacks 26
 rpc_no_free 4
-capabilities 287
+capabilities 293
 mcp 79
 redis_dedup 25
 meshdb 69
@@ -20,5 +20,5 @@ streams 36
 islands 31
 aggregator 22
 meshos 39
-org_call 40
+org_call 41
 subnet 43

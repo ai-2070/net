@@ -58,8 +58,15 @@ static int has_kinds(const char* begin, const char* end, const char* kinds) {
     char* save = NULL;
     char* k;
     size_t len = (size_t)(end - begin);
-    char* seg = (char*)malloc(len + 1);
+    char* seg;
     int ok = 1;
+    /* A kind list that does not fit is a failure, never a silent truncation
+     * that could drop (or half-check) a kind. */
+    if (strlen(kinds) >= sizeof buf) {
+        printf("  (kind list longer than %u bytes)\n", (unsigned)sizeof buf);
+        return 0;
+    }
+    seg = (char*)malloc(len + 1);
     if (!seg) {
         return 0;
     }
@@ -165,6 +172,16 @@ static int trace_cases(void) {
                  trace != NULL && len == strlen(trace) && strcmp(trace, c->expected_trace) == 0);
         net_free_string(trace);
     }
+    {
+        char* trace = NULL;
+        size_t len = 0;
+        int result = 0;
+        CU_CHECK_RC("net_predicate_evaluate_with_trace: NULL output is NET_ERR_NULL_POINTER",
+                    net_predicate_evaluate_with_trace(cu_trace_cases[0].wire, "[]", "{}", &result, NULL, &len),
+                    NET_ERR_NULL_POINTER);
+        CU_CHECK_RC("net_predicate_evaluate_with_trace: unparseable predicate is NET_ERR_INVALID_JSON",
+                    net_predicate_evaluate_with_trace("{", "[]", "{}", &result, &trace, &len), NET_ERR_INVALID_JSON);
+    }
     return 0;
 }
 
@@ -191,6 +208,16 @@ static int report_cases(void) {
                  strstr(report, want) != NULL);
         net_free_string(report);
     }
+    {
+        char* report = NULL;
+        size_t len = 0;
+        CU_CHECK_RC("net_predicate_aggregate_debug_report: NULL output is NET_ERR_NULL_POINTER",
+                    net_predicate_aggregate_debug_report(cu_report_cases[0].wire, "[]", NULL, &len),
+                    NET_ERR_NULL_POINTER);
+        CU_CHECK_RC("net_predicate_aggregate_debug_report: unparseable contexts are NET_ERR_INVALID_JSON",
+                    net_predicate_aggregate_debug_report(cu_report_cases[0].wire, "[{", &report, &len),
+                    NET_ERR_INVALID_JSON);
+    }
     return 0;
 }
 
@@ -211,6 +238,15 @@ static int redact_cases(void) {
                  again != NULL && strcmp(again, out) == 0);
         net_free_string(out);
         net_free_string(again);
+    }
+    {
+        char* out = NULL;
+        size_t len = 0;
+        CU_CHECK_RC("net_predicate_redact_metadata_keys: NULL output is NET_ERR_NULL_POINTER",
+                    net_predicate_redact_metadata_keys(cu_redact_cases[0].report, "[]", NULL, &len),
+                    NET_ERR_NULL_POINTER);
+        CU_CHECK_RC("net_predicate_redact_metadata_keys: an unparseable report is NET_ERR_INVALID_JSON",
+                    net_predicate_redact_metadata_keys("{", "[]", &out, &len), NET_ERR_INVALID_JSON);
     }
     return 0;
 }

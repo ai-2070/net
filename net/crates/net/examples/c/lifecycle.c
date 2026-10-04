@@ -16,6 +16,8 @@
  * Built and run by .github/scripts/run-c-consumers.py.
  */
 
+#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "net.go.h"

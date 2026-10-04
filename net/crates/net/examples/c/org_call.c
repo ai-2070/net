@@ -289,6 +289,13 @@ int main(void) {
     CU_CHECK_RC("net_org_call: the handler's application error is NET_ORG_ERR_RPC", rc, NET_ORG_ERR_RPC);
     CU_CHECK("application error: the org: wire", err != NULL && strncmp(err, "org:", 4) == 0);
     net_org_free_cstring(err);
+    {
+        int released;
+        cu_mutex_lock(lock);
+        released = frees;
+        cu_mutex_unlock(lock);
+        CU_CHECK("the handler's error string came back through the registered free too", released >= 2);
+    }
 
     err = NULL;
     rc = net_org_call(client, "no.such.service", 15, (const uint8_t*)"x", 1, 3000, 0, &resp, &resp_len, &err);
