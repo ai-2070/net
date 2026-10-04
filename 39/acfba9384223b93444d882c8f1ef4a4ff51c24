@@ -1,0 +1,37 @@
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_f60c2a14710510 10-12
+net/crates/net/examples/c/support/consumer_util.h
+  s_17a2ac60d914fc::t_075d2339fabaca 71-78
+net/crates/net/examples/c/rpc_callbacks.c
+  s_17a2ac60d914fc::t_157a3ebfbe7cb9 1-209
+net/crates/net/include/net_org.h
+  s_17a2ac60d914fc::t_26e3b174f958b5 388-389,391-392,422-426
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_053ba0aa03be8c 864-896
+net/crates/net/include/net_rpc.h
+  s_17a2ac60d914fc::t_26e3b174f958b5 266-270,302-306
+net/crates/net/examples/c/rpc_no_free.c
+  s_17a2ac60d914fc::t_47632b348542c2 1-49
+net/crates/net/examples/c/support/consumer_util.c
+  s_17a2ac60d914fc::t_075d2339fabaca 162-213
+net/crates/net/examples/c/blob_callbacks.c
+  s_17a2ac60d914fc::t_28552323543a1c 77
+  s_17a2ac60d914fc::t_120a3319d9e648 1-76,78-232,243-255,259-285
+  s_17a2ac60d914fc::t_c9018d40747a19 233-242,256-258
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "39acfba9384223b93444d882c8f1ef4a4ff51c24",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
