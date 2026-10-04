@@ -37,3 +37,18 @@ int cu_opaque_teardown(void* node) {
     net_mesh_free((net_meshnode_t*)node);
     return rc;
 }
+
+size_t cu_opaque_fns(clm_fn_t* out, size_t cap) {
+    static const clm_fn_t fns[] = {
+        CU_MESH_FNS,
+        CLM_FN(net_mesh_start),
+        CLM_FN(net_mesh_shutdown),
+        CLM_FN(net_mesh_free),
+    };
+    size_t n = sizeof fns / sizeof fns[0];
+    size_t i;
+    for (i = 0; i < n && i < cap; i++) {
+        out[i] = fns[i];
+    }
+    return n;
+}

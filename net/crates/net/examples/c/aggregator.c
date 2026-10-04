@@ -56,6 +56,11 @@ int main(void) {
         CLM_FN(net_fold_query_client_set_ttl),
         CLM_FN(net_registry_client_set_deadline),
     };
+    /* The mesh bring-up runs in mesh_opaque.c, whose calls this unit
+     * cannot address; it hands over its list, checked with this one. */
+    clm_fn_t all[sizeof used / sizeof used[0] + 16];
+    size_t n_all = sizeof used / sizeof used[0];
+    size_t n_opaque;
     void *a = NULL, *b = NULL;
     net_registry_client_handle_t* reg;
     net_fold_query_client_handle_t* fq;
@@ -64,7 +69,14 @@ int main(void) {
     char* detail;
     int kind;
 
-    if (clm_check_loaded_module(used, sizeof used / sizeof used[0]) != 0) {
+    memcpy(all, used, sizeof used);
+    n_opaque = cu_opaque_fns(all + n_all, sizeof all / sizeof all[0] - n_all);
+    if (n_opaque > sizeof all / sizeof all[0] - n_all) {
+        printf("NET-LOADED-MODULE-ERROR: the combined loaded-module list overflows\n");
+        return 2;
+    }
+    n_all += n_opaque;
+    if (clm_check_loaded_module(all, n_all) != 0) {
         return 2;
     }
     CHECK("net_registry_client_new: NULL mesh is NULL", net_registry_client_new(NULL) == NULL);

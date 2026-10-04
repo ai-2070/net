@@ -712,13 +712,56 @@ _EXTERN_NET = re.compile(r"^[ \t]*extern\b[^;]*\bnet_\w+", re.M)
 _CLM_FN_NAME = re.compile(r"\bCLM_FN\s*\(\s*(\w+)\s*\)")
 
 
-def _cu_mesh_fns(root: Path) -> str:
-    """The CU_MESH_FNS macro body from support/consumer_util.h ("" if none)."""
-    header = root / "support" / "consumer_util.h"
-    if not header.is_file():
-        return ""
-    m = re.search(r"#define\s+CU_MESH_FNS\b((?:[^\n]*\\\n)*[^\n]*)", header.read_text(encoding="utf-8"))
-    return m.group(1) if m else ""
+_FNS_MACRO = re.compile(r"#define\s+(CU_\w+_FNS)\b((?:[^\n]*\\\n)*[^\n]*)")
+# A function definition at file scope: its name, its parameter list, then `{`.
+_C_FN_DEF = re.compile(r"^[A-Za-z_][\w \t\*]*?\b([A-Za-z_]\w*)[ \t]*\((?:[^;{}()]|\([^()]*\))*\)[ \t\n]*\{", re.M)
+
+
+def _fns_macros(root: Path) -> dict[str, set[str]]:
+    """Each support header's `CU_*_FNS` list macro: name -> the functions it lists."""
+    out: dict[str, set[str]] = {}
+    for header in sorted((root / "support").glob("*.h")):
+        for m in _FNS_MACRO.finditer(header.read_text(encoding="utf-8")):
+            out[m.group(1)] = set(_CLM_FN_NAME.findall(m.group(2)))
+    return out
+
+
+def _support_functions(root: Path) -> dict[str, tuple[Path, str]]:
+    """Every function a support `.c` file defines: name -> (file, body code).
+
+    A name defined twice (one definition per platform branch) keeps both
+    bodies, so whatever either one calls is attributed to it."""
+    out: dict[str, tuple[Path, str]] = {}
+    for f in sorted((root / "support").glob("*.c")):
+        code = M.c_code(f.read_text(encoding="utf-8"))
+        for m in _C_FN_DEF.finditer(code):
+            depth, i = 1, m.end()
+            while i < len(code) and depth:
+                depth += {"{": 1, "}": -1}.get(code[i], 0)
+                i += 1
+            prev = out.get(m.group(1), (f, ""))[1]
+            out[m.group(1)] = (f, prev + "\n" + code[m.end():i])
+    return out
+
+
+def _calls_through_support(code: str, support: dict[str, tuple[Path, str]]) -> tuple[set[str], set[str]]:
+    """(support functions `code` references, transitively; the net_* they call)."""
+    if not support:
+        return set(), set()
+    # A reference, not only a call: a helper handed to a thread by address
+    # (`cu_thread_start(cu_accept, ...)`) runs all the same.
+    names = re.compile(r"\b(" + "|".join(map(re.escape, sorted(support))) + r")\b")
+    reached: set[str] = set()
+    todo = set(names.findall(code))
+    while todo:
+        fn = todo.pop()
+        if fn not in reached:
+            reached.add(fn)
+            todo |= set(names.findall(support[fn][1])) - reached
+    net: set[str] = set()
+    for fn in reached:
+        net |= set(M._C_CALL.findall(support[fn][1]))
+    return reached, net
 
 
 def lint_consumer_sources(root: Path = EXAMPLES_C) -> list[Finding]:
@@ -729,6 +772,9 @@ def lint_consumer_sources(root: Path = EXAMPLES_C) -> list[Finding]:
     `NET_SDK_H` guard, so the second is silently skipped and its functions
     become implicit declarations (formerly CR-5, pinned on one example)."""
     findings = []
+    has_support = (root / "support").is_dir()
+    macros = _fns_macros(root) if has_support else {}
+    support = _support_functions(root) if has_support else {}
     for f in sorted(root.rglob("*.c")) + sorted(root.rglob("*.h")):
         raw = f.read_text(encoding="utf-8")
         text = M._COMMENT.sub(" ", raw)
@@ -746,15 +792,34 @@ def lint_consumer_sources(root: Path = EXAMPLES_C) -> list[Finding]:
                 "second is skipped and its functions are implicitly declared. Split the translation unit"))
         # The loaded-module check proves where each LISTED import resolved;
         # a call left off the list is never checked. So every net_* a
-        # program calls must be listed (CLM_FN, or CU_MESH_FNS for the mesh
-        # helpers' imports). Support files carry no list of their own.
+        # program calls must be listed, and so must every net_* reached
+        # through the support helpers it calls (transitively): a helper's
+        # call runs in the program just the same. A list is built from CLM_FN
+        # entries, a support header's CU_*_FNS macro, or a support file's
+        # `cu_*_fns` accessor (for a translation unit that cannot take the
+        # helpers' addresses itself), which contributes every CLM_FN in its
+        # file.
         if f.suffix == ".c" and f.parent == root and "clm_check_loaded_module" in text:
+            direct = M.c_calls(raw)
             listed = set(_CLM_FN_NAME.findall(text))
-            if "CU_MESH_FNS" in text:
-                listed |= set(_CLM_FN_NAME.findall(_cu_mesh_fns(root)))
-            for fn in sorted(M.c_calls(raw) - listed):
+            for macro, fns in macros.items():
+                if re.search(rf"\b{macro}\b", text):
+                    listed |= fns
+            reached, via_support = _calls_through_support(M.c_code(raw), support)
+            for fn in reached:
+                if fn.endswith("_fns"):
+                    owner = support[fn][0].read_text(encoding="utf-8")
+                    listed |= set(_CLM_FN_NAME.findall(owner))
+                    for macro, fns in macros.items():
+                        if re.search(rf"\b{macro}\b", owner):
+                            listed |= fns
+            for fn in sorted(direct - listed):
                 findings.append(Finding("lint", f"{rel}:{fn}",
                     f"{rel} calls {fn} but its loaded-module list (CLM_FN) does not name it"))
+            for fn in sorted(via_support - direct - listed):
+                findings.append(Finding("lint", f"{rel}:{fn}",
+                    f"{rel} reaches {fn} through a support helper, but its loaded-module list "
+                    "does not name it"))
         for m in _NET_PROTO.finditer(text):
             findings.append(Finding("lint", f"{rel}:{m.group(1)}",
                 f"{rel} declares {m.group(1)} itself; use the shipped header's declaration"))
@@ -1051,6 +1116,28 @@ def self_test() -> int:
             ok = any(want in f.message for f in got)
             print(f"{'✓' if ok else '✗'} self-test: {label} is refused" + ("" if ok else f" (got {got})"))
             failures += 0 if ok else 1
+        (lint_root / "bad.c").unlink()
+        # A call a support helper makes for the program must be listed too.
+        (lint_root / "support").mkdir()
+        (lint_root / "support" / "helper.h").write_text(
+            "#define CU_HELP_FNS CLM_FN(net_mesh_start)\n", encoding="utf-8")
+        (lint_root / "support" / "helper.c").write_text(
+            "static void cu_inner(void* p) { net_mesh_start(p); }\n"
+            "int cu_help(void* p) { cu_thread_start(cu_inner, p); return 0; }\n", encoding="utf-8")
+        prog = ("static const clm_fn_t used[] = {CLM_FN(net_version)%s};\n"
+                "int main(void) { clm_check_loaded_module(used, 1); return cu_help(0); }\n")
+        (lint_root / "bad.c").write_text(prog % "", encoding="utf-8")
+        got = lint_consumer_sources(lint_root)
+        ok = any("net_mesh_start through a support helper" in f.message for f in got)
+        print(f"{'✓' if ok else '✗'} self-test: a call reached through a support helper (by address) "
+              "must be listed" + ("" if ok else f" (got {got})"))
+        failures += 0 if ok else 1
+        (lint_root / "bad.c").write_text(prog % ", CU_HELP_FNS", encoding="utf-8")
+        got = lint_consumer_sources(lint_root)
+        ok = not [f for f in got if "bad.c" in f.message]
+        print(f"{'✓' if ok else '✗'} self-test: a support header's CU_*_FNS list covers its helper's calls"
+              + ("" if ok else f" (got {got})"))
+        failures += 0 if ok else 1
         (lint_root / "bad.c").unlink()
 
         # Allowlist: an entry suppresses exactly its finding, and a stale entry fails.
