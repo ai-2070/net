@@ -1,0 +1,37 @@
+net/crates/net/tests/c_abi/arming/double_free_fetch_blob.c
+  s_17a2ac60d914fc::t_ac830119b240ea 7
+net/crates/net/tests/c_abi/arming/leak_fetch_blob.c
+  s_17a2ac60d914fc::t_ac830119b240ea 6
+.github/scripts/run-c-consumers.py
+  s_17a2ac60d914fc::t_a8c75cb2a415fd 85-89,233,269-270,282-283,405-406,429-434,444-445,447,455-457,618-620,643-644
+  s_17a2ac60d914fc::t_afdef4cbca739b 460-464
+net/crates/net/examples/c/support/loaded_module.c
+  s_17a2ac60d914fc::t_1ca8c6a3f9f264 50-71
+  s_17a2ac60d914fc::t_ac830119b240ea 124
+net/crates/net/tests/c_abi/arming/callback_buffer_double_release.c
+  s_17a2ac60d914fc::t_ac830119b240ea 8
+net/crates/net/examples/c/rpc_callbacks.c
+  s_17a2ac60d914fc::t_059c480a256df2 177-179
+net/crates/net/tests/c_abi/arming/debugcrt_leak.c
+  s_17a2ac60d914fc::t_11e25bd5f077af 1-33
+net/crates/net/tests/c_abi/arming/debugcrt_overrun.c
+  s_17a2ac60d914fc::t_8e971f40d0e659 1-32
+.github/workflows/ci.yml
+  s_17a2ac60d914fc::t_1c9d231a5ca31d 5363-5374
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b28e60b477c5be0e388fbba6d0725614b984cc3b",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
