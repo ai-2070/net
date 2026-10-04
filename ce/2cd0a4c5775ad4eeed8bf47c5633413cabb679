@@ -1,0 +1,38 @@
+docs/data/capabilities/event-bus.yaml
+  s_17a2ac60d914fc::t_4eac712aebf2bc 549,551-552
+.claude/skills/net-event-bus/bindings/coverage.md
+  s_17a2ac60d914fc::t_4eac712aebf2bc 109,190
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_4eac712aebf2bc 1252-1271
+web/src/lib/generated/capability-record.json
+  s_17a2ac60d914fc::t_4eac712aebf2bc 502
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_c39d6e7f8c5d83 16
+net/crates/net/bindings/go/meshdb-ffi/src/lib.rs
+  s_17a2ac60d914fc::t_093000239e0005 1898,1901-1902,1905
+  s_17a2ac60d914fc::t_883bcf885a6fb3 1001-1004,1006-1009,1011-1014
+  s_17a2ac60d914fc::t_b22a33780f4efc 991-996
+  s_17a2ac60d914fc::t_5991b49848fc85 1890-1897,1899-1900,1903-1904,1906-1915,1920-1921
+  s_17a2ac60d914fc::t_1f147de518a6b8 1916-1919
+net/crates/net/examples/c/meshdb.c
+  s_17a2ac60d914fc::t_61d851ab3ff339 1-177,181,187-303
+  s_17a2ac60d914fc::t_095c7268722c98 178-180,182-186
+net/crates/net/tests/c_abi/SURFACE.md
+  s_17a2ac60d914fc::t_4eac712aebf2bc 18,512-515,518-537
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ce2cd0a4c5775ad4eeed8bf47c5633413cabb679",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
