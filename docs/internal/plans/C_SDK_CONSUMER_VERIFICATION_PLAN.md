@@ -1248,6 +1248,22 @@ Found by C5:
       the field names read from the declarations. Both fail when one
       leaking clone is reintroduced.
     - `lsan_policy.toml` no longer accepts any indirect leak.
+  - **Second half (fixed the same day).** With the node itself reclaimed,
+    the next sanitizer run (37194875653) still found its components
+    alive at exit, now in `transfer.c` too: the failure detector, the
+    reroute policy, session routing, the roster, the scoped publication,
+    the subnet challenge store, reachable only from one another. They
+    formed a strong cycle that `MeshNode::new` builds itself: the
+    detector's callbacks hold the reroute policy, and the policy's verdict
+    check held an `Arc` to the detector. No drop could break it, so every
+    node ever built left these behind for the life of the process.
+    - The verdict check now holds the detector weakly; a detector that is
+      gone has no current verdict, so the check answers false.
+    - Witness: `adapter::net::mesh::component_reclaim_tests` (a connected,
+      started pair, shut down and dropped, must leave none of the six
+      components alive). It fails without the fix. The reroute, verdict,
+      failure and peer-death suites pass with it (148 unit tests, 69
+      integration).
 
 Found by the C6 follow-up programs:
 

@@ -22,6 +22,14 @@ name = "handle tombstone"
 constructors = ["net_mesh_new", "net_mesh_blob_adapter_new", "net_mesh_blob_adapter_new_v2", "net_redex_new"]
 max_block_bytes = 64
 
+# The same keep-the-outer-box tombstone (src/ffi/redis_dedup.rs
+# net_redis_dedup_free: "Box stays leaked"), larger because this handle
+# holds its inner value inline in the box rather than behind a pointer.
+[[direct]]
+name = "handle tombstone, inline inner"
+constructors = ["net_redis_dedup_new"]
+max_block_bytes = 128
+
 # No indirect leak is accepted. D-C5-1 (a MeshNode never reclaimed after
 # net_mesh_shutdown + net_mesh_free) was accepted here, in two named programs,
 # until its fix: nineteen FFI entry points cloned the handle's
