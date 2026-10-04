@@ -770,7 +770,7 @@
     "Subnet gateway provisioning": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
           "status": "supported"
@@ -790,7 +790,7 @@
     "Subnet-exported nRPC serve": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
           "status": "supported"
@@ -810,7 +810,7 @@
     "Subnet-exported organization call": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
           "status": "supported"

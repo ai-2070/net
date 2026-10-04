@@ -418,9 +418,10 @@ operations:
       status: supported
       anchor: InstallSubnetGatewayCredentials
     C:
-      status: partial
+      status: supported
       anchor: net_subnet_install_gateway_credentials
-      gap: 'No C program CI runs calls it (Go reaches it through go/subnet.go).'
+      evidence:
+      - net/crates/net/examples/c/subnet.c
 - operation: Subnet-exported nRPC serve
   bindings:
     Rust:
@@ -436,9 +437,10 @@ operations:
       status: supported
       anchor: ServeSubnetExported
     C:
-      status: partial
+      status: supported
       anchor: net_subnet_serve_exported
-      gap: 'No C program CI runs calls it (Go reaches it through go/subnet.go).'
+      evidence:
+      - net/crates/net/examples/c/subnet.c
 - operation: Subnet-exported organization call
   bindings:
     Rust:
@@ -454,9 +456,10 @@ operations:
       status: supported
       anchor: CallExportedBytes
     C:
-      status: partial
+      status: supported
       anchor: net_org_call_exported
-      gap: 'No C program CI runs calls it (Go reaches it through go/org.go).'
+      evidence:
+      - net/crates/net/examples/c/subnet.c
 - operation: MCP bridge
   bindings:
     Rust:

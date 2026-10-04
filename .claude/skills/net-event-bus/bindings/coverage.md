@@ -99,9 +99,9 @@ A mode is written after the status: `supported · core-only`.
 | A2A — paid task admission (prepare → purchase → submit) | supported | supported | supported | not exposed | not exposed |
 | Organization capability auth | supported | supported | supported | supported | supported |
 | Organization-scoped streaming RPC | supported | supported | supported | supported | supported |
-| Subnet gateway provisioning | supported | supported | supported | supported | partial |
-| Subnet-exported nRPC serve | supported | supported | supported | supported | partial |
-| Subnet-exported organization call | supported | supported | supported | supported | partial |
+| Subnet gateway provisioning | supported | supported | supported | supported | supported |
+| Subnet-exported nRPC serve | supported | supported | supported | supported | supported |
+| Subnet-exported organization call | supported | supported | supported | supported | supported |
 | MCP bridge | supported | supported | supported | supported | supported |
 | Dataforts — blobs | supported | supported | supported | supported | supported |
 | RedEX — durable log | supported | supported | supported | supported | supported |
@@ -180,9 +180,9 @@ per-function record behind this is `net/crates/net/tests/c_abi/SURFACE.md`.
 | Gang-claim scheduler | supported | `islands.c` | — |
 | Organization capability auth | supported | `org_call.c` | — |
 | Organization-scoped streaming RPC | supported | `net_org_streaming.c` | — |
-| Subnet gateway provisioning | partial | — | No C program CI runs calls it (Go reaches it through go/subnet.go). |
-| Subnet-exported nRPC serve | partial | — | No C program CI runs calls it (Go reaches it through go/subnet.go). |
-| Subnet-exported organization call | partial | — | No C program CI runs calls it (Go reaches it through go/org.go). |
+| Subnet gateway provisioning | supported | `subnet.c` | — |
+| Subnet-exported nRPC serve | supported | `subnet.c` | — |
+| Subnet-exported organization call | supported | `subnet.c` | — |
 | MCP bridge | supported | `mcp.c` | — |
 | Dataforts — blobs | supported | `transfer.c`, `objectstore.c` | — |
 | RedEX — durable log | supported | `eventlog.c`, `jobqueue.c` | — |

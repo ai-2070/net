@@ -17,9 +17,9 @@ both.
 | `net_mcp.h` | 22 | 20 | 20 |
 | `net_meshdb.h` | 27 | 24 | 24 |
 | `net_meshos.h` | 23 | 21 | 21 |
-| `net_org.h` | 30 | 16 | 21 |
+| `net_org.h` | 30 | 18 | 22 |
 | `net_rpc.h` | 70 | 10 | 17 |
-| `net_subnet.h` | 4 | 0 | 0 |
+| `net_subnet.h` | 4 | 3 | 3 |
 | `net_transport.h` | 7 | 7 | 7 |
 
 ## `net.go.h`
@@ -147,8 +147,8 @@ both.
 | `net_ingest_raw_batch` | – | – | – |
 | `net_init` | – | – | hello, observe |
 | `net_mesh_accept` | consumer_util | – | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
-| `net_mesh_announce_capabilities` | islands | – | registry |
-| `net_mesh_arc_clone` | compute, org_call, rpc_callbacks | – | failover, jobqueue, net_org_streaming |
+| `net_mesh_announce_capabilities` | islands, subnet | – | registry |
+| `net_mesh_arc_clone` | compute, org_call, rpc_callbacks, subnet | – | failover, jobqueue, net_org_streaming |
 | `net_mesh_arc_free` | – | – | – |
 | `net_mesh_blob_adapter_exists` | – | – | – |
 | `net_mesh_blob_adapter_fetch` | tree_range | – | – |
@@ -180,11 +180,11 @@ both.
 | `net_mesh_find_best_node_scoped` | – | – | – |
 | `net_mesh_find_nodes` | – | – | registry |
 | `net_mesh_find_nodes_scoped` | – | – | – |
-| `net_mesh_free` | compute, islands, lifecycle, mesh_opaque, org_call, rpc_callbacks, streams, transfer | leak_fetch_blob | jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_free` | compute, islands, lifecycle, mesh_opaque, org_call, rpc_callbacks, streams, subnet, transfer | leak_fetch_blob | jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_match_islands` | islands | – | – |
 | `net_mesh_max_event_size` | streams | – | – |
 | `net_mesh_nat_type` | – | – | – |
-| `net_mesh_new` | consumer_util, lifecycle, org_call | – | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_new` | consumer_util, lifecycle, org_call, subnet | – | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_node_id` | consumer_util, lifecycle, mesh_opaque, rpc_callbacks, streams, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_open_stream` | streams | – | – |
 | `net_mesh_open_stream_inbox` | streams | – | – |
@@ -203,8 +203,8 @@ both.
 | `net_mesh_send_blocking` | – | – | – |
 | `net_mesh_send_with_retry` | – | – | – |
 | `net_mesh_set_reflex_override` | – | – | – |
-| `net_mesh_shutdown` | compute, islands, lifecycle, mesh_opaque, org_call, rpc_callbacks, streams, transfer | leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
-| `net_mesh_start` | compute, islands, lifecycle, mesh_opaque, org_call, rpc_callbacks, streams, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_shutdown` | compute, islands, lifecycle, mesh_opaque, org_call, rpc_callbacks, streams, subnet, transfer | leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_start` | compute, islands, lifecycle, mesh_opaque, org_call, rpc_callbacks, streams, subnet, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_stream_free` | streams | – | – |
 | `net_mesh_stream_inbox_close` | streams | – | – |
 | `net_mesh_stream_inbox_dropped` | streams | – | – |
@@ -569,34 +569,34 @@ both.
 | Function | Consumers | Arming | Skill examples |
 | --- | --- | --- | --- |
 | `net_org_abi_version` | – | – | net_org_streaming |
-| `net_org_bind` | org_call | – | net_org_streaming |
+| `net_org_bind` | org_call, subnet | – | net_org_streaming |
 | `net_org_call` | org_call | – | – |
 | `net_org_call_client_stream` | – | – | – |
 | `net_org_call_duplex` | – | – | – |
-| `net_org_call_exported` | – | – | – |
+| `net_org_call_exported` | subnet | – | – |
 | `net_org_call_streaming` | – | – | net_org_streaming |
 | `net_org_cancel_call` | – | – | – |
-| `net_org_check_abi_version` | org_call | – | net_org_streaming |
-| `net_org_client_free` | org_call | – | net_org_streaming |
+| `net_org_check_abi_version` | org_call, subnet | – | net_org_streaming |
+| `net_org_client_free` | org_call, subnet | – | net_org_streaming |
 | `net_org_credentials_free` | org_call | – | – |
-| `net_org_credentials_new` | org_call | – | net_org_streaming |
-| `net_org_free_cstring` | org_call | – | net_org_streaming |
-| `net_org_install_authority` | org_call | – | net_org_streaming |
+| `net_org_credentials_new` | org_call, subnet | – | net_org_streaming |
+| `net_org_free_cstring` | org_call, subnet | – | net_org_streaming |
+| `net_org_install_authority` | org_call, subnet | – | net_org_streaming |
 | `net_org_install_provider_grant_audience` | org_call | – | net_org_streaming |
 | `net_org_reserve_cancel_token` | org_call | – | – |
-| `net_org_reserve_handler_id` | org_call | – | net_org_streaming |
-| `net_org_response_free` | org_call | – | – |
+| `net_org_reserve_handler_id` | org_call, subnet | – | net_org_streaming |
+| `net_org_response_free` | org_call, subnet | – | – |
 | `net_org_serve` | org_call | – | – |
 | `net_org_serve_client_stream` | – | – | – |
 | `net_org_serve_duplex` | – | – | – |
-| `net_org_serve_handle_close` | – | – | net_org_streaming |
-| `net_org_serve_handle_free` | org_call | – | net_org_streaming |
+| `net_org_serve_handle_close` | subnet | – | net_org_streaming |
+| `net_org_serve_handle_free` | org_call, subnet | – | net_org_streaming |
 | `net_org_serve_handle_id` | – | – | – |
 | `net_org_serve_streaming` | – | – | net_org_streaming |
-| `net_org_set_callback_free` | org_call | – | net_org_streaming |
+| `net_org_set_callback_free` | org_call, subnet | – | net_org_streaming |
 | `net_org_set_client_streaming_handler_dispatcher` | – | – | – |
 | `net_org_set_duplex_handler_dispatcher` | – | – | – |
-| `net_org_set_handler_dispatcher` | org_call | – | – |
+| `net_org_set_handler_dispatcher` | org_call, subnet | – | – |
 | `net_org_set_streaming_handler_dispatcher` | – | – | net_org_streaming |
 
 ## `net_rpc.h`
@@ -679,9 +679,9 @@ both.
 | Function | Consumers | Arming | Skill examples |
 | --- | --- | --- | --- |
 | `net_subnet_apply_control_fact` | – | – | – |
-| `net_subnet_declare_boundaries` | – | – | – |
-| `net_subnet_install_gateway_credentials` | – | – | – |
-| `net_subnet_serve_exported` | – | – | – |
+| `net_subnet_declare_boundaries` | subnet | – | – |
+| `net_subnet_install_gateway_credentials` | subnet | – | – |
+| `net_subnet_serve_exported` | subnet | – | – |
 
 ## `net_transport.h`
 
