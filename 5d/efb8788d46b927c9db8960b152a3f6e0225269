@@ -1,0 +1,36 @@
+net/crates/net/examples/c/lifecycle.c
+  s_17a2ac60d914fc::t_a3ddeed7371afa 1-121
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_98ec3038c1dc9f 679-728
+net/crates/net/examples/c/support/consumer_util.c
+  s_17a2ac60d914fc::t_8de6870006ba25 1-300
+net/crates/net/examples/c/transfer.c
+  s_17a2ac60d914fc::t_9a7eb4c1b9d9c5 1-288
+.github/scripts/run-c-consumers.py
+  s_17a2ac60d914fc::t_153d32d3e0cd6e 68,309-326,328-334,346-353,466-468
+  s_17a2ac60d914fc::t_9738fccf811463 226,229
+  s_17a2ac60d914fc::t_c6b03c7a581147 197-198,205,217-218,230
+  s_17a2ac60d914fc::t_fef49cd153ad8d 469
+net/crates/net/examples/c/support/consumer_util.h
+  s_17a2ac60d914fc::t_39c18a5e500a02 1-107
+.github/scripts/check-c-abi.py
+  s_17a2ac60d914fc::t_665c18a3d2eb0c 67,702-734,795,998-1018,1061
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_153d32d3e0cd6e 1-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5defb8788d46b927c9db8960b152a3f6e0225269",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
