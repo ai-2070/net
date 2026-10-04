@@ -125,7 +125,7 @@ static int run(void) {
                 net_fetch_blob(reader, holder_id, NULL, &out, &out_len), NET_ERR_TRANSFER_NULL_POINTER);
     /* net_transport.h: "NULL or zero-length is a no-op". */
     net_transport_free_buffer(NULL, 0);
-    CU_CHECK("net_transport_free_buffer: NULL is a no-op", 1);
+    CU_SURVIVED("net_transport_free_buffer: NULL is a no-op");
 
     /* ---- a directory tree, store -> inspect -> fetch ---- */
 

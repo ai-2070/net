@@ -92,7 +92,7 @@ static int helper_cases(void) {
     CU_CHECK("net_mcp_lower_tool: an unknown substitutability is refused",
              net_mcp_lower_tool(cu_lower_cases[0].tool, "1.0.0", "none", "anything") == NULL);
     net_mcp_free_string(NULL);
-    CU_CHECK("net_mcp_free_string: NULL is a no-op", 1);
+    CU_SURVIVED("net_mcp_free_string: NULL is a no-op");
     return 0;
 }
 
@@ -176,7 +176,7 @@ static int consent_cases(void) {
                  net_mcp_consent_policy_decide(policy, "no-slash", "credentialed") == NULL);
         net_mcp_consent_policy_free(policy);
         net_mcp_consent_policy_free(NULL);
-        CU_CHECK("net_mcp_consent_policy_free: NULL is a no-op", 1);
+        CU_SURVIVED("net_mcp_consent_policy_free: NULL is a no-op");
     }
     return 0;
 }

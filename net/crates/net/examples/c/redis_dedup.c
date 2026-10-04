@@ -72,7 +72,7 @@ int main(void) {
     CU_CHECK_RC("net_redis_dedup_capacity: NULL is 0", net_redis_dedup_capacity(NULL), 0);
     CU_CHECK_RC("net_redis_dedup_is_empty: NULL is -1", net_redis_dedup_is_empty(NULL), -1);
     net_redis_dedup_clear(NULL);
-    CU_CHECK("net_redis_dedup_clear: NULL is a no-op", 1);
+    CU_SURVIVED("net_redis_dedup_clear: NULL is a no-op");
 
     small = net_redis_dedup_new(2);
     CU_CHECK_RC("net_redis_dedup_capacity: as configured", net_redis_dedup_capacity(small), 2);
@@ -84,6 +84,6 @@ int main(void) {
     net_redis_dedup_free(small);
     net_redis_dedup_free(d);
     net_redis_dedup_free(NULL);
-    CU_CHECK("net_redis_dedup_free: NULL is a no-op", 1);
+    CU_SURVIVED("net_redis_dedup_free: NULL is a no-op");
     return cu_finish();
 }

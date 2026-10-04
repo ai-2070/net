@@ -306,6 +306,6 @@ int main(void) {
     net_meshdb_iter_free(NULL);
     net_meshdb_payload_free(NULL, 0);
     net_meshdb_free_string(NULL);
-    CU_CHECK("every free accepts NULL", 1);
+    CU_SURVIVED("every free accepts NULL");
     return cu_finish();
 }

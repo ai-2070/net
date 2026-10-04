@@ -50,6 +50,16 @@ extern int cu_checks;
         cu_checks++;                                                         \
     } while (0)
 
+/* A step whose only evidence is that the program got past it: a free that
+ * accepts NULL, a second close. Nothing is asserted, so it is printed but
+ * not counted toward the program's floor; the sanitizer and heap-check
+ * lanes are what would catch it misbehaving. */
+#define CU_SURVIVED(name)                                                    \
+    do {                                                                     \
+        printf("survived %s\n", name);                                       \
+        fflush(stdout);                                                      \
+    } while (0)
+
 /* Print `NET-CHECKS: <n>` and return 0. */
 int cu_finish(void);
 

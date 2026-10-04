@@ -131,7 +131,8 @@ int main(void) {
     net_registry_client_free(reg);
     net_fold_query_client_free(NULL);
     net_registry_client_free(NULL);
-    CHECK("both clients' free accepts NULL", 1);
+    /* Not a check: nothing is asserted (see CU_SURVIVED). */
+    printf("survived both clients' free accepts NULL\n");
     CHECK("teardown A", cu_opaque_teardown(a) == 0);
     CHECK("teardown B", cu_opaque_teardown(b) == 0);
     printf("NET-CHECKS: %d\n", checks);

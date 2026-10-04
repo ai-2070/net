@@ -95,10 +95,10 @@ static int run(void) {
     net_free_string(key_after);
     /* net.go.h: "String to free (may be NULL)". */
     net_free_string(NULL);
-    CU_CHECK("net_free_string: NULL is accepted", 1);
+    CU_SURVIVED("net_free_string: NULL is accepted");
     net_mesh_free(a);
     net_mesh_free(b);
-    CU_CHECK("net_mesh_free: both nodes freed after shutdown", 1);
+    CU_SURVIVED("net_mesh_free: both nodes freed after shutdown");
     return 0;
 }
 
