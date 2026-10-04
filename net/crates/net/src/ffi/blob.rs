@@ -67,6 +67,10 @@ use crate::adapter::net::dataforts::publish_blob_ref;
 
 use super::NetError;
 
+// The NET_ERR_BLOB_* band is declared for C in include/net.go.h (mirrored in
+// go/net.h). `.github/scripts/check-c-abi.py` fails if a value here and
+// its header differ.
+
 /// BlobRef decode failed (truncated / unsupported version).
 pub const NET_ERR_BLOB_DECODE: c_int = -110;
 /// Adapter registry: adapter id already registered.

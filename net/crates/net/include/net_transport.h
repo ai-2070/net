@@ -70,9 +70,15 @@ extern "C" {
 #endif
 
 /* ── Status / error codes ────────────────────────────────────────── *
- * Kept in sync with the Rust `pub const NET_ERR_*` in
- * src/ffi/transport.rs by tests/transport_error_codes.rs.            */
+ * The NET_ERR_TRANSFER_* / NET_ERR_DIR_* codes are kept in sync with
+ * the Rust `pub const NET_ERR_*` in src/ffi/transport.rs by
+ * tests/transport_error_codes.rs. NET_ERR_FEATURE_NOT_BUILT is the
+ * shared code from src/ffi/cortex.rs (guarded: net.go.h declares it
+ * too); check-c-abi.py checks its value.                             */
 #define NET_TRANSPORT_OK                       0
+#ifndef NET_ERR_FEATURE_NOT_BUILT
+#define NET_ERR_FEATURE_NOT_BUILT  -107  /* the feature behind this call was not built */
+#endif
 #define NET_ERR_TRANSFER_NOT_FOUND          -200  /* holder lacked the content        */
 #define NET_ERR_TRANSFER_HASH_MISMATCH      -201  /* bytes did not hash to the address */
 #define NET_ERR_TRANSFER_ALL_PEERS_FAILED   -202  /* discovery: no peer served it      */

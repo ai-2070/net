@@ -1,0 +1,742 @@
+{
+  "comment": "rustc layout of every struct the C headers publish; written by bindings/go/net-ffi/tests/abi_layout.rs, compiled as C assertions by .github/scripts/check-c-abi.py",
+  "structs": {
+    "NetDeckChainCommit": {
+      "align": 8,
+      "fields": [
+        [
+          "commit_id",
+          "commit_id",
+          0
+        ],
+        [
+          "operator_id",
+          "operator_id",
+          8
+        ],
+        [
+          "event_kind",
+          "event_kind",
+          16
+        ],
+        [
+          "committed_at_ms",
+          "committed_at_ms",
+          24
+        ]
+      ],
+      "rust": "net_deck::NetDeckChainCommit",
+      "size": 32
+    },
+    "NetDeckDaemonCounts": {
+      "align": 4,
+      "fields": [
+        [
+          "running",
+          "running",
+          0
+        ],
+        [
+          "starting",
+          "starting",
+          4
+        ],
+        [
+          "stopping",
+          "stopping",
+          8
+        ],
+        [
+          "stopped",
+          "stopped",
+          12
+        ],
+        [
+          "backing_off",
+          "backing_off",
+          16
+        ],
+        [
+          "crash_looping",
+          "crash_looping",
+          20
+        ]
+      ],
+      "rust": "net_deck::NetDeckDaemonCounts",
+      "size": 24
+    },
+    "NetDeckFailureRecord": {
+      "align": 8,
+      "fields": [
+        [
+          "seq",
+          "seq",
+          0
+        ],
+        [
+          "source",
+          "source",
+          8
+        ],
+        [
+          "reason",
+          "reason",
+          16
+        ],
+        [
+          "recorded_at_ms",
+          "recorded_at_ms",
+          24
+        ]
+      ],
+      "rust": "net_deck::NetDeckFailureRecord",
+      "size": 32
+    },
+    "NetDeckLogFilter": {
+      "align": 8,
+      "fields": [
+        [
+          "min_level_present",
+          "min_level_present",
+          0
+        ],
+        [
+          "min_level",
+          "min_level",
+          4
+        ],
+        [
+          "daemon_id_present",
+          "daemon_id_present",
+          8
+        ],
+        [
+          "daemon_id",
+          "daemon_id",
+          16
+        ],
+        [
+          "node_id_present",
+          "node_id_present",
+          24
+        ],
+        [
+          "node_id",
+          "node_id",
+          32
+        ],
+        [
+          "since_seq_present",
+          "since_seq_present",
+          40
+        ],
+        [
+          "since_seq",
+          "since_seq",
+          48
+        ]
+      ],
+      "rust": "net_deck::NetDeckLogFilter",
+      "size": 56
+    },
+    "NetDeckLogRecord": {
+      "align": 8,
+      "fields": [
+        [
+          "seq",
+          "seq",
+          0
+        ],
+        [
+          "ts_ms",
+          "ts_ms",
+          8
+        ],
+        [
+          "level",
+          "level",
+          16
+        ],
+        [
+          "daemon_id_present",
+          "daemon_id_present",
+          20
+        ],
+        [
+          "daemon_id",
+          "daemon_id",
+          24
+        ],
+        [
+          "node_id_present",
+          "node_id_present",
+          32
+        ],
+        [
+          "node_id",
+          "node_id",
+          40
+        ],
+        [
+          "message",
+          "message",
+          48
+        ]
+      ],
+      "rust": "net_deck::NetDeckLogRecord",
+      "size": 56
+    },
+    "NetDeckOperatorSignature": {
+      "align": 8,
+      "fields": [
+        [
+          "operator_id",
+          "operator_id",
+          0
+        ],
+        [
+          "signature_ptr",
+          "signature_ptr",
+          8
+        ],
+        [
+          "signature_len",
+          "signature_len",
+          16
+        ]
+      ],
+      "rust": "net_deck::NetDeckOperatorSignature",
+      "size": 24
+    },
+    "NetDeckPeerCounts": {
+      "align": 4,
+      "fields": [
+        [
+          "healthy",
+          "healthy",
+          0
+        ],
+        [
+          "degraded",
+          "degraded",
+          4
+        ],
+        [
+          "unreachable",
+          "unreachable",
+          8
+        ],
+        [
+          "unknown",
+          "unknown",
+          12
+        ]
+      ],
+      "rust": "net_deck::NetDeckPeerCounts",
+      "size": 16
+    },
+    "NetDeckStatusSummary": {
+      "align": 8,
+      "fields": [
+        [
+          "peers",
+          "peers",
+          0
+        ],
+        [
+          "daemons",
+          "daemons",
+          16
+        ],
+        [
+          "replica_chains",
+          "replica_chains",
+          40
+        ],
+        [
+          "avoid_list_entries",
+          "avoid_list_entries",
+          44
+        ],
+        [
+          "recently_emitted_count",
+          "recently_emitted_count",
+          48
+        ],
+        [
+          "recent_failure_count",
+          "recent_failure_count",
+          52
+        ],
+        [
+          "admin_audit_ring_depth",
+          "admin_audit_ring_depth",
+          56
+        ],
+        [
+          "freeze_remaining_present",
+          "freeze_remaining_present",
+          60
+        ],
+        [
+          "freeze_remaining_ms",
+          "freeze_remaining_ms",
+          64
+        ],
+        [
+          "local_maintenance_active",
+          "local_maintenance_active",
+          72
+        ]
+      ],
+      "rust": "net_deck::NetDeckStatusSummary",
+      "size": 80
+    },
+    "NetMeshOsDaemonControl": {
+      "align": 8,
+      "fields": [
+        [
+          "kind",
+          "kind",
+          0
+        ],
+        [
+          "grace_period_ms",
+          "grace_period_ms",
+          8
+        ],
+        [
+          "level",
+          "level",
+          16
+        ]
+      ],
+      "rust": "net_meshos::NetMeshOsDaemonControl",
+      "size": 24
+    },
+    "NetMeshOsDaemonVtable": {
+      "align": 8,
+      "fields": [
+        [
+          "process",
+          "process",
+          0
+        ],
+        [
+          "snapshot",
+          "snapshot",
+          8
+        ],
+        [
+          "restore",
+          "restore",
+          16
+        ],
+        [
+          "on_control",
+          "on_control",
+          24
+        ],
+        [
+          "health",
+          "health",
+          32
+        ],
+        [
+          "saturation",
+          "saturation",
+          40
+        ]
+      ],
+      "rust": "net_meshos::NetMeshOsDaemonVtable",
+      "size": 48
+    },
+    "RpcCallEventC": {
+      "align": 8,
+      "fields": [
+        [
+          "caller",
+          "caller",
+          0
+        ],
+        [
+          "callee",
+          "callee",
+          8
+        ],
+        [
+          "method_ptr",
+          "method_ptr",
+          16
+        ],
+        [
+          "method_len",
+          "method_len",
+          24
+        ],
+        [
+          "latency_ms",
+          "latency_ms",
+          32
+        ],
+        [
+          "status_kind",
+          "status_kind",
+          36
+        ],
+        [
+          "status_message_ptr",
+          "status_message_ptr",
+          40
+        ],
+        [
+          "status_message_len",
+          "status_message_len",
+          48
+        ],
+        [
+          "request_bytes",
+          "request_bytes",
+          56
+        ],
+        [
+          "response_bytes",
+          "response_bytes",
+          60
+        ],
+        [
+          "direction",
+          "direction",
+          64
+        ],
+        [
+          "ts_unix_ms",
+          "ts_unix_ms",
+          72
+        ]
+      ],
+      "rust": "net_rpc::RpcCallEventC",
+      "size": 80
+    },
+    "net_blob_adapter_vtable_t": {
+      "align": 8,
+      "fields": [
+        [
+          "store",
+          "store",
+          0
+        ],
+        [
+          "fetch",
+          "fetch",
+          8
+        ],
+        [
+          "fetch_range",
+          "fetch_range",
+          16
+        ],
+        [
+          "exists",
+          "exists",
+          24
+        ],
+        [
+          "free_buffer",
+          "free_buffer",
+          32
+        ]
+      ],
+      "rust": "net::ffi::blob::NetBlobAdapterVtable",
+      "size": 40
+    },
+    "net_event_t": {
+      "align": 8,
+      "fields": [
+        [
+          "id",
+          "id",
+          0
+        ],
+        [
+          "id_len",
+          "id_len",
+          8
+        ],
+        [
+          "raw",
+          "raw",
+          16
+        ],
+        [
+          "raw_len",
+          "raw_len",
+          24
+        ],
+        [
+          "insertion_ts",
+          "insertion_ts",
+          32
+        ],
+        [
+          "shard_id",
+          "shard_id",
+          40
+        ]
+      ],
+      "rust": "net::ffi::NetEvent",
+      "size": 48
+    },
+    "net_org_caller_t": {
+      "align": 1,
+      "fields": [
+        [
+          "caller",
+          "caller",
+          0
+        ],
+        [
+          "acting_org",
+          "acting_org",
+          32
+        ],
+        [
+          "provider_org",
+          "provider_org",
+          64
+        ],
+        [
+          "provider",
+          "provider",
+          96
+        ],
+        [
+          "capability",
+          "capability",
+          128
+        ]
+      ],
+      "rust": "net_org::NetOrgCaller",
+      "size": 160
+    },
+    "net_poll_result_t": {
+      "align": 8,
+      "fields": [
+        [
+          "events",
+          "events",
+          0
+        ],
+        [
+          "count",
+          "count",
+          8
+        ],
+        [
+          "next_id",
+          "next_id",
+          16
+        ],
+        [
+          "has_more",
+          "has_more",
+          24
+        ]
+      ],
+      "rust": "net::ffi::NetPollResult",
+      "size": 32
+    },
+    "net_receipt_t": {
+      "align": 8,
+      "fields": [
+        [
+          "shard_id",
+          "shard_id",
+          0
+        ],
+        [
+          "timestamp",
+          "timestamp",
+          8
+        ]
+      ],
+      "rust": "net::ffi::NetReceipt",
+      "size": 16
+    },
+    "net_rpc_header_t": {
+      "align": 8,
+      "fields": [
+        [
+          "name_ptr",
+          "name_ptr",
+          0
+        ],
+        [
+          "name_len",
+          "name_len",
+          8
+        ],
+        [
+          "value_ptr",
+          "value_ptr",
+          16
+        ],
+        [
+          "value_len",
+          "value_len",
+          24
+        ]
+      ],
+      "rust": "net_rpc::NetRpcHeader",
+      "size": 32
+    },
+    "net_stats_t": {
+      "align": 8,
+      "fields": [
+        [
+          "events_ingested",
+          "events_ingested",
+          0
+        ],
+        [
+          "events_dropped",
+          "events_dropped",
+          8
+        ],
+        [
+          "batches_dispatched",
+          "batches_dispatched",
+          16
+        ]
+      ],
+      "rust": "net::ffi::NetStats",
+      "size": 24
+    },
+    "net_subnet_path_t": {
+      "align": 1,
+      "fields": [
+        [
+          "depth",
+          "depth",
+          0
+        ],
+        [
+          "levels",
+          "levels",
+          1
+        ]
+      ],
+      "rust": "net_org::NetSubnetPath",
+      "size": 5
+    },
+    "net_traversal_stats_v2_t": {
+      "align": 8,
+      "fields": [
+        [
+          "punches_attempted",
+          "punches_attempted",
+          0
+        ],
+        [
+          "punches_succeeded",
+          "punches_succeeded",
+          8
+        ],
+        [
+          "punches_failed",
+          "punches_failed",
+          16
+        ],
+        [
+          "relay_fallbacks",
+          "relay_fallbacks",
+          24
+        ],
+        [
+          "punch_timeouts",
+          "punch_timeouts",
+          32
+        ],
+        [
+          "punch_rejections",
+          "punch_rejections",
+          40
+        ],
+        [
+          "rendezvous_no_relay",
+          "rendezvous_no_relay",
+          48
+        ],
+        [
+          "upgrades_attempted",
+          "upgrades_attempted",
+          56
+        ],
+        [
+          "upgrades_succeeded",
+          "upgrades_succeeded",
+          64
+        ],
+        [
+          "upgrades_deferred_busy",
+          "upgrades_deferred_busy",
+          72
+        ],
+        [
+          "port_mapping_renewals",
+          "port_mapping_renewals",
+          80
+        ],
+        [
+          "port_mapping_active",
+          "port_mapping_active",
+          88
+        ],
+        [
+          "port_mapping_external",
+          "port_mapping_external",
+          89
+        ]
+      ],
+      "rust": "net::ffi::mesh::NetTraversalStatsV2",
+      "size": 160
+    },
+    "net_workflow_status_counts_t": {
+      "align": 8,
+      "fields": [
+        [
+          "submitted",
+          "submitted",
+          0
+        ],
+        [
+          "running",
+          "running",
+          8
+        ],
+        [
+          "waiting",
+          "waiting",
+          16
+        ],
+        [
+          "blocked",
+          "blocked",
+          24
+        ],
+        [
+          "done",
+          "done",
+          32
+        ],
+        [
+          "failed",
+          "failed",
+          40
+        ]
+      ],
+      "rust": "net::ffi::cortex::NetWorkflowStatusCounts",
+      "size": 48
+    }
+  }
+}

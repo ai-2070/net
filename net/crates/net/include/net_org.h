@@ -385,10 +385,11 @@ int net_org_call_duplex(NetOrgClient* client,
 
 /* The process-wide handler dispatcher Rust calls when an admitted request
  * lands. It receives the reserved `handler_id`, the verified caller, and
- * the request bytes; on success it returns a response the caller allocated
- * with malloc via `(*out_resp_ptr, *out_resp_len)` and returns
+ * the request bytes; on success it returns a response it allocated with
+ * its own allocator via `(*out_resp_ptr, *out_resp_len)` and returns
  * NET_ORG_OK; on failure it writes `*out_err` and returns non-zero. Rust
- * copies the response and frees it with the C runtime's free. To signal a
+ * copies the response, then releases it (and any `*out_err` string)
+ * through the deallocator registered with net_org_set_callback_free. To signal a
  * typed application status, write an "nrpc:app_error:0x<code>:<body>"
  * message to `*out_err`. `<code>` MUST be in the application band
  * 0x8000-0xFFFF; any lower code surfaces to the caller as Internal. */
@@ -418,10 +419,11 @@ int net_org_set_callback_free(NetOrgCallbackFreeFn free_fn);
 /* Register the process-wide dispatcher. First call wins; later calls are
  * no-ops. Call once at init before net_org_serve.
  *
- * Returns 0 on success. On Windows, returns NET_ORG_ERR_NULL if
- * net_org_set_callback_free has not been called — without it this
- * library cannot release a handler's response buffer safely, and
- * refusing here beats corrupting a heap at the first call. */
+ * Returns 0 on success, or NET_ORG_ERR_NULL on every platform if
+ * net_org_set_callback_free has not been called: without it this library
+ * has no way to release a handler's buffers (and on Windows freeing them
+ * itself would corrupt another module's CRT heap), so it refuses here
+ * rather than leak or corrupt at the first call. */
 int net_org_set_handler_dispatcher(NetOrgHandlerFn dispatcher);
 
 /* ======================================================================

@@ -61,6 +61,15 @@ on:
       - "**/README*.md"
       - ".github/scripts/check-readmes.py"
 
+# One run per workflow per branch (per PR for pull_request events): a newer
+# push cancels this workflow's older run on the same ref, and nothing else.
+# On master every commit gets a group of its own (its SHA), so no run there
+# is cancelled or replaced: a shared group would still let GitHub discard a
+# queued master run when a newer one arrives, even without cancel-in-progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   check:
     name: Lint, links, types

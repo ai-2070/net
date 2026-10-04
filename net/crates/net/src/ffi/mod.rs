@@ -2736,32 +2736,87 @@ mod tests {
         }
     }
 
-    /// CR-5: pin that `examples/capability.c` does not double-include
-    /// `net.h` and `net.go.h`. Both files use the `NET_SDK_H` include
-    /// guard, so when both are included in one TU the second is
-    /// silently skipped — every `net_validate_capabilities` /
-    /// `net_predicate_*` call the example makes becomes an
-    /// implicit-declaration error on GCC 14+/Clang 16+, and a silent
-    /// `int`-return miscompile on older toolchains. The deeper fix
-    /// (renaming one guard so they compose cleanly) is tracked as
-    /// CR-28; this test catches the example-level regression.
+    /// No `.clone()` on a `ManuallyDrop<Arc<_>>` handle field anywhere in
+    /// the FFI. `ManuallyDrop<T>: Clone` clones the WRAPPER, so the bumped
+    /// strong count is never released: every call leaks one reference.
+    /// Nineteen `h.inner.clone()` calls in `mesh.rs` did exactly that
+    /// (`net_mesh_start`, `_connect`, `_accept`, ...), so a node that had
+    /// been started was never reclaimed after `net_mesh_shutdown` +
+    /// `net_mesh_free` (D-C5-1, found by the C consumer sanitizer lane;
+    /// `blob.rs` had already been fixed). Use `Arc::clone(&h.field)`.
+    ///
+    /// The field names come from the declarations themselves, so a new
+    /// `ManuallyDrop<Arc<_>>` field is covered without editing this test.
     #[test]
-    fn cr5_example_does_not_double_include_net_headers() {
-        let example = include_str!("../../examples/capability.c");
-        let net_h_included = example.contains("#include \"../include/net.h\"");
-        let net_go_h_included = example.contains("#include \"../include/net.go.h\"");
+    fn no_clone_of_a_manually_drop_arc_field() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ffi");
+        let sources: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .expect("src/ffi")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .map(|p| {
+                let text = std::fs::read_to_string(&p).expect("read");
+                (p.file_name().unwrap().to_string_lossy().into_owned(), text)
+            })
+            .collect();
+        let mut fields = std::collections::BTreeSet::new();
+        for (_, text) in &sources {
+            for line in text.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                for marker in [": ManuallyDrop<Arc<", ": Option<ManuallyDrop<Arc<"] {
+                    if let Some(i) = t.find(marker) {
+                        let mut name = t[..i].rsplit(|c: char| !(c.is_alphanumeric() || c == '_'));
+                        if let Some(name) = name.next().filter(|n| !n.is_empty()) {
+                            fields.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
         assert!(
-            net_go_h_included,
-            "examples/capability.c must include net.go.h to declare \
-             net_validate_capabilities + net_predicate_* symbols"
+            fields.contains("inner"),
+            "the scan found no ManuallyDrop<Arc<_>> fields; it is not reading the sources"
+        );
+        // Code only: a trailing `//` comment is cut off, and a match inside a
+        // string literal (an odd number of unescaped quotes before it) does
+        // not count.
+        fn in_code(line: &str, needle: &str) -> bool {
+            let code = line.split("//").next().unwrap_or("");
+            code.match_indices(needle).any(|(at, _)| {
+                let before = &code.as_bytes()[..at];
+                let quotes = (0..before.len())
+                    .filter(|&i| before[i] == b'"' && (i == 0 || before[i - 1] != b'\\'))
+                    .count();
+                quotes % 2 == 0
+            })
+        }
+        let mut found = Vec::new();
+        for (file, text) in &sources {
+            for (n, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for f in &fields {
+                    if in_code(line, &format!(".{f}.clone()")) {
+                        found.push(format!("src/ffi/{file}:{}: {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            in_code("let n = h.inner.clone();", ".inner.clone()")
+                && !in_code("let n = x; // h.inner.clone() leaks", ".inner.clone()")
+                && !in_code("panic!(\"h.inner.clone() leaks\");", ".inner.clone()"),
+            "the code/comment/string split is not working"
         );
         assert!(
-            !net_h_included,
-            "examples/capability.c must NOT also include net.h: \
-             both headers share the NET_SDK_H guard, so the second \
-             include is silently skipped, leaving the example's \
-             net_predicate_* calls implicitly declared. Drop the \
-             redundant include — net.go.h is a superset."
+            found.is_empty(),
+            "`.clone()` on a ManuallyDrop<Arc<_>> field leaks a strong reference; \
+             use Arc::clone(&h.field):\n{}",
+            found.join("\n")
         );
     }
 

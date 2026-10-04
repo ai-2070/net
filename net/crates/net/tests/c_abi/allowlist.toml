@@ -1,0 +1,52 @@
+# Accepted findings of .github/scripts/check-c-abi.py, each with its reason.
+#
+# A key is the finding's subject (a symbol, or a C type name for `handles`).
+# An entry that matches nothing fails the check, so this file cannot outlive
+# the reason it records. Add an entry only with a reason a reviewer can
+# check; fixing the finding is always the better answer.
+#
+# See docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md, C1.
+
+[exported]
+
+# The bundle-composition marker of the umbrella crate (fn net_ffi_abi_version
+# in bindings/go/net-ffi/src/lib.rs).
+# It records which surfaces are linked together, not a signature generation,
+# so declaring it would invite consumers to treat it as an ABI version. Which
+# library a program loaded is answered by the loaded-library identity check
+# (C0), not by this symbol.
+net_ffi_abi_version = "bundle-composition marker, not a consumer API; see C0 loaded-library identity"
+
+# The non-owning predecessor of net_blob_register_callback_adapter_owned,
+# which is the declared registration (net.go.h) and whose release contract C4
+# tests. Kept exported for binaries linked before the owned form; deliberately
+# not offered to new C code (.claude/skills/net-event-bus/dataforts.md).
+net_blob_register_callback_adapter = "superseded by the declared _owned form; exported for existing binaries"
+
+[mentioned]
+
+# net_transport.h's reserved-codes comment (after the NET_ERR_DIR_* block)
+# reserves -212 for a planned code by name; the name is deliberately not
+# declared until the code exists.
+NET_ERR_DIR_SYMLINK_UNSUPPORTED = "reserved name for a planned code (-212 kept unassigned)"
+
+[collision]
+
+# The NET_ERR_BLOB_* band shares ten values with mesh codes of net_error_t.
+# Accepted as per-surface by design: a code's meaning is the surface that
+# returned it, and the blob codes are returned only by net_blob_* and
+# net_mesh_blob_adapter_* functions. Renumbering one would change an emitted
+# value without making the space consistent. Decided and recorded in
+# GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md ("Duplicate error code -120:
+# not a defect", ae651ef9b). A collision NOT listed here fails, which is
+# what caught -109 for NET_ERR_WRONG_CHANNEL (#1167).
+"NET_ERR_BLOB_DECODE|NET_ERR_MESH_INIT" = "per-surface overlap (ae651ef9b)"
+"NET_ERR_BLOB_DUPLICATE_ID|NET_ERR_MESH_HANDSHAKE" = "per-surface overlap (ae651ef9b)"
+"NET_ERR_BLOB_NOT_REGISTERED|NET_ERR_MESH_BACKPRESSURE" = "per-surface overlap (ae651ef9b)"
+"NET_ERR_BLOB_NOT_FOUND|NET_ERR_MESH_NOT_CONNECTED" = "per-surface overlap (ae651ef9b)"
+"NET_ERR_BLOB_HASH_MISMATCH|NET_ERR_MESH_TRANSPORT" = "per-surface overlap (ae651ef9b)"
+"NET_ERR_BLOB_BACKEND|NET_ERR_CHANNEL" = "per-surface overlap (ae651ef9b)"
+"NET_ERR_BLOB_UNSUPPORTED_SCHEME|NET_ERR_CHANNEL_AUTH" = "per-surface overlap (ae651ef9b)"
+"NET_ERR_BLOB_PANIC|NET_ERR_MESH_SESSION_SUPERSEDED" = "per-surface overlap (ae651ef9b)"
+"NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED|NET_ERR_MESH_EVENT_TOO_LARGE" = "per-surface overlap (ae651ef9b)"
+"NET_ERR_BLOB_UNAUTHORIZED|NET_ERR_IDENTITY" = "per-surface overlap (ae651ef9b)"

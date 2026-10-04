@@ -27,9 +27,10 @@ use std::path::PathBuf;
 
 use net::ffi::aggregator::{
     NET_REGISTRY_ERR_CODEC, NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME, NET_REGISTRY_ERR_INVALID_ARGS,
+    NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED, NET_REGISTRY_ERR_SCALE_REJECTED,
     NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED, NET_REGISTRY_ERR_SPAWN_REJECTED,
-    NET_REGISTRY_ERR_TRANSPORT, NET_REGISTRY_ERR_UNKNOWN_KIND, NET_REGISTRY_ERR_UNKNOWN_TEMPLATE,
-    NET_REGISTRY_OK,
+    NET_REGISTRY_ERR_TRANSPORT, NET_REGISTRY_ERR_UNAUTHORIZED, NET_REGISTRY_ERR_UNKNOWN_GROUP,
+    NET_REGISTRY_ERR_UNKNOWN_KIND, NET_REGISTRY_ERR_UNKNOWN_TEMPLATE, NET_REGISTRY_OK,
 };
 
 fn header_path() -> PathBuf {
@@ -115,6 +116,24 @@ fn every_registry_error_define_matches_rust_constant() {
             "NET_REGISTRY_ERR_UNKNOWN_KIND",
             NET_REGISTRY_ERR_UNKNOWN_KIND,
         ),
+        // Declared in net.h by the C SDK audit (C1 stage 2); returned by
+        // the Scale operation and the operator gate.
+        (
+            "NET_REGISTRY_ERR_UNKNOWN_GROUP",
+            NET_REGISTRY_ERR_UNKNOWN_GROUP,
+        ),
+        (
+            "NET_REGISTRY_ERR_SCALE_REJECTED",
+            NET_REGISTRY_ERR_SCALE_REJECTED,
+        ),
+        (
+            "NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED",
+            NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED,
+        ),
+        (
+            "NET_REGISTRY_ERR_UNAUTHORIZED",
+            NET_REGISTRY_ERR_UNAUTHORIZED,
+        ),
         (
             "NET_REGISTRY_ERR_INVALID_ARGS",
             NET_REGISTRY_ERR_INVALID_ARGS,
@@ -171,6 +190,12 @@ fn every_registry_error_kind_has_stable_string_discriminant() {
         (NET_REGISTRY_ERR_SPAWN_REJECTED, "spawn-rejected"),
         (NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED, "spawn-not-supported"),
         (NET_REGISTRY_ERR_UNKNOWN_KIND, "unknown-kind"),
+        // The strings the Node and Python bindings already raise
+        // (bindings/{node,python}/src/aggregator.rs).
+        (NET_REGISTRY_ERR_UNKNOWN_GROUP, "unknown-group"),
+        (NET_REGISTRY_ERR_SCALE_REJECTED, "scale-rejected"),
+        (NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED, "scale-not-supported"),
+        (NET_REGISTRY_ERR_UNAUTHORIZED, "unauthorized"),
         (NET_REGISTRY_ERR_INVALID_ARGS, "invalid-args"),
     ];
 

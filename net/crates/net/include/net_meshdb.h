@@ -239,7 +239,8 @@ void net_meshdb_query_free(MeshDbQuery* query);
 /* `Window(inner, size)` — tumbling-on-seq window. Returns NULL
  * when `size == 0`. `inner` is NOT consumed (caller still owns).
  * The emitted rows carry postcard-encoded `WindowBoundary`
- * envelopes — decode via `net_meshdb_decode_payload_json`. */
+ * envelopes — decode via `net_meshdb_decode_payload_json_as`
+ * with NET_MESHDB_PAYLOAD_WINDOW. */
 MeshDbQuery* net_meshdb_query_window(
     const MeshDbQuery* inner,
     uint64_t size
@@ -424,7 +425,12 @@ void net_meshdb_iter_free(MeshDbIter* iter);
 /* Decode a result-row payload into a JSON description of the
  * sentinel envelope. Returns NULL when the payload doesn't
  * deserialize as any known envelope (atomic-operator rows return
- * NULL — their payload is the raw event body, not a sentinel).
+ * NULL — their payload is the raw event body, not a sentinel), and
+ * also when it is a whole envelope of MORE than one kind: the
+ * envelopes carry no type tag, and some byte strings (a window with
+ * no rows, for one) are also valid aggregates. A caller that knows
+ * which composite operator its query ends in should use
+ * `net_meshdb_decode_payload_json_as`, which never guesses.
  *
  * JSON shape per variant:
  *
@@ -455,7 +461,26 @@ char* net_meshdb_decode_payload_json(
     size_t payload_len
 );
 
-/* Free a C-string returned by `net_meshdb_decode_payload_json`.
+/* Envelope kinds for `net_meshdb_decode_payload_json_as`: the
+ * composite operator the query ends in. */
+#define NET_MESHDB_PAYLOAD_AGGREGATE  0  /* Count / Sum / Avg / Min / Max / DistinctCount / Percentile */
+#define NET_MESHDB_PAYLOAD_JOINED     1  /* Join */
+#define NET_MESHDB_PAYLOAD_WINDOW     2  /* Window */
+
+/* Decode a result-row payload as the envelope `kind` names
+ * (NET_MESHDB_PAYLOAD_*), with the same JSON shapes as
+ * `net_meshdb_decode_payload_json`. Returns NULL for an unknown
+ * `kind`, a NULL payload or `payload_len == 0`, or bytes that are
+ * not exactly one envelope of that kind. Free the returned string
+ * with `net_meshdb_free_string`. */
+char* net_meshdb_decode_payload_json_as(
+    int kind,
+    const uint8_t* payload,
+    size_t payload_len
+);
+
+/* Free a C-string returned by `net_meshdb_decode_payload_json`
+ * or `net_meshdb_decode_payload_json_as`.
  * No-op on NULL. */
 void net_meshdb_free_string(char* s);
 

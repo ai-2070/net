@@ -41,6 +41,15 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# One run per workflow per branch (per PR for pull_request events): a newer
+# push cancels this workflow's older run on the same ref, and nothing else.
+# On master every commit gets a group of its own (its SHA), so no run there
+# is cancelled or replaced: a shared group would still let GitHub discard a
+# queued master run when a newer one arrives, even without cancel-in-progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   unit-tests:
     name: Unit tests
@@ -1133,12 +1142,14 @@ jobs:
                   if (dir == "net/crates/net") return "root"
                   if (dir == "net/crates/net/sdk") return "sdk"
                   if (dir == "net/crates/net/cli") return "cli"
+                  if (dir == "net/crates/net/bindings/go/net-ffi") return "ffi"
                   return "dir:" (dir == "" ? "<repo root>" : dir)
                 }
                 function crate_of_pkg(pkg) {
                   if (pkg == "net-mesh") return "root"
                   if (pkg == "net-mesh-sdk") return "sdk"
                   if (pkg == "net-cli") return "cli"
+                  if (pkg == "net-ffi") return "ffi"
                   return "pkg:" pkg
                 }
                 function package_on(line) {
@@ -1203,7 +1214,9 @@ jobs:
             | sort -u > /tmp/pinned_sdk.txt
           awk -F'\t' '$1 == "cli" { print $2 }' /tmp/pinned_by_crate.txt \
             | sort -u > /tmp/pinned_cli.txt
-          awk -F'\t' '$1 != "root" && $1 != "sdk" && $1 != "cli" { print $1 ": " $2 }' \
+          awk -F'\t' '$1 == "ffi" { print $2 }' /tmp/pinned_by_crate.txt \
+            | sort -u > /tmp/pinned_ffi.txt
+          awk -F'\t' '$1 != "root" && $1 != "sdk" && $1 != "cli" && $1 != "ffi" { print $1 ": " $2 }' \
             /tmp/pinned_by_crate.txt | sort -u > /tmp/pinned_foreign.txt
           printf '%s\n' "$UNPINNED_OK" | awk '{print $1}' | grep -v '^$' | sort -u > /tmp/allowed.txt
           # One inventory per crate. The root crate's `tests/` are the ones
@@ -1215,10 +1228,13 @@ jobs:
           # step's `--test local_target_inspection` exist without leaving a
           # silent hole behind it: rename that binary and this guard names
           # the break instead of cargo. The next crate that needs a scoped
-          # pin joins here and in the two crate maps above.
+          # pin joins here and in the two crate maps above. net-ffi joined for
+          # `c-consumers`' scoped `--test abi_layout` (C SDK plan, C1 check 4).
           ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present_root.txt
           ls sdk/tests/*.rs | sed 's|sdk/tests/||; s|\.rs$||' | sort -u > /tmp/present_sdk.txt
           ls cli/tests/*.rs | sed 's|cli/tests/||; s|\.rs$||' | sort -u > /tmp/present_cli.txt
+          ls bindings/go/net-ffi/tests/*.rs | sed 's|bindings/go/net-ffi/tests/||; s|\.rs$||' \
+            | sort -u > /tmp/present_ffi.txt
           # UNATTRIBUTABLE pins first, because they are the CAUSE of any
           # inventory verdict below: a pin this read cannot resolve to a crate
           # covers nothing, so the tests it was meant to cover would otherwise
@@ -1254,6 +1270,7 @@ jobs:
             comm -13 /tmp/present_root.txt /tmp/pinned_root.txt | sed 's/^/root: /'
             comm -13 /tmp/present_sdk.txt /tmp/pinned_sdk.txt | sed 's/^/sdk: /'
             comm -13 /tmp/present_cli.txt /tmp/pinned_cli.txt | sed 's/^/cli: /'
+            comm -13 /tmp/present_ffi.txt /tmp/pinned_ffi.txt | sed 's/^/ffi: /'
             cat /tmp/pinned_foreign.txt
           )
           if [ -n "$stale" ]; then
@@ -1261,7 +1278,7 @@ jobs:
             printf '%s\n' "$stale" | sed 's/^/  /'
             exit 1
           fi
-          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk + $(wc -l < /tmp/present_cli.txt) cli test files; $(wc -l < /tmp/pinned_root.txt) root pin(s) + $(wc -l < /tmp/pinned_sdk.txt) sdk pin(s) + $(wc -l < /tmp/pinned_cli.txt) cli pin(s), each attributed to its own crate."
+          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk + $(wc -l < /tmp/present_cli.txt) cli + $(wc -l < /tmp/present_ffi.txt) net-ffi test files; $(wc -l < /tmp/pinned_root.txt) root pin(s) + $(wc -l < /tmp/pinned_sdk.txt) sdk pin(s) + $(wc -l < /tmp/pinned_cli.txt) cli pin(s) + $(wc -l < /tmp/pinned_ffi.txt) net-ffi pin(s), each attributed to its own crate."
 
   # --- Family A: bare bus/FFI + net mesh -------------------------------
   integration-net-core:
@@ -4679,13 +4696,28 @@ jobs:
       # was red in between and a bisect inside the window yields a header
       # pair that silently drifts. Text and git only, so it runs before the
       # toolchains like its neighbours above.
+      #
+      # On a branch the range is every commit since the merge-base with
+      # master, not this push's `before..sha`: a newer push cancels the older
+      # run (the `concurrency` block above), so a per-push range would never
+      # check the cancelled push's commits. Master runs are never cancelled
+      # and keep the per-push range.
       - name: Guard — ABI changes land atomically
         if: ${{ !cancelled() }}
         env:
           BASE_SHA: ${{ github.event.before }}
         run: |
           python3 .github/scripts/check-abi-commit.py --self-test
-          python3 .github/scripts/check-abi-commit.py --range "$BASE_SHA..$GITHUB_SHA"
+          base="$BASE_SHA"
+          if [ "$GITHUB_REF" != "refs/heads/master" ]; then
+            # Fetched explicitly, not assumed from the checkout: without it
+            # the merge-base fails and the guard would quietly fall back to
+            # the per-push range this exists to replace. A failure here
+            # fails the step.
+            git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
+            base=$(git merge-base origin/master "$GITHUB_SHA")
+          fi
+          python3 .github/scripts/check-abi-commit.py --range "$base..$GITHUB_SHA"
 
       # Also pure text, also before the toolchains. A `libc::free` on a
       # Go-allocated callback buffer is a wrong-heap free on Windows —
@@ -5179,6 +5211,245 @@ jobs:
         run: |
           .github/scripts/run-skill-examples.sh --lang go
           .github/scripts/run-skill-examples.sh --lang c
+
+  c-consumers:
+    # C SDK consumer verification, slice C0
+    # (docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md).
+    #
+    # Every other build of libnet in this workflow passes
+    # `--features net-ffi/test-helpers` and lands in the ordinary
+    # `target/release`, so the library a C consumer gets from the documented
+    # `cargo build --release -p net-ffi` was never built, staged or checked.
+    # This job builds that default library (and, separately, the helper one)
+    # in their OWN target directories, stages each as a bundle of headers +
+    # one library + EXPORTS + PROVENANCE, pins the shipped export set, and
+    # runs C programs against the bundle only.
+    #
+    # Building against a bundle proves nothing about what loaded. Windows
+    # searches the program's directory before PATH, and ELF loading follows
+    # DT_RPATH and LD_PRELOAD, not only LD_LIBRARY_PATH. So each program's
+    # first act reports the module its Net imports resolved to, and the
+    # runner requires that path and its SHA-256 to be the staged library's.
+    # Two negative controls (a shadowing library where the loader prefers it,
+    # and on Linux an LD_PRELOAD interposer) must be refused by name before
+    # any Net call; without them a green run could mean the check never
+    # looked.
+    name: C consumers (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # 50 was the budget before org_call.c / subnet.c: their scenarios come
+    # from a release build of net-mesh-sdk's generators (one per leg, then
+    # cached), and the Windows leg already ran about 40 minutes.
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # `python3` is not on every Windows image's PATH; `python` is.
+      - name: Pick the Python interpreter
+        run: |
+          if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' 2>/dev/null; then
+            echo "PY=python3" >> "$GITHUB_ENV"
+          else
+            echo "PY=python" >> "$GITHUB_ENV"
+          fi
+
+      # Pure Python, before the toolchains: each plants its defects (a test
+      # seam in the shipped exports, an extra header, a second library; a
+      # wrong module path, a wrong hash, a missing module line) and requires
+      # rejection, so a green step means the checks can fail.
+      - name: Self-tests — bundle stager and consumer runner
+        run: |
+          "$PY" .github/scripts/make-c-bundle.py --self-test
+          "$PY" .github/scripts/run-c-consumers.py --self-test
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: c-consumers
+          workspaces: |
+            net/crates/net -> target/c-bundle
+            net/crates/net -> target/c-bundle-helper
+
+      - name: Build and stage the production bundle (default features)
+        run: |
+          "$PY" .github/scripts/make-c-bundle.py --profile production --build | tee "$RUNNER_TEMP/prod.out"
+          echo "PROD_BUNDLE=$(tail -n 1 "$RUNNER_TEMP/prod.out")" >> "$GITHUB_ENV"
+
+      # The shipped export set is pinned name for name, separately from the
+      # test-helpers baseline the go-tests job checks. A change to what a
+      # consumer can link shows in review as a diff of this file.
+      - name: Guard — shipped libnet exports match their baseline
+        run: |
+          lib="$PROD_BUNDLE/$(sed -n 's/^library: //p' "$PROD_BUNDLE/PROVENANCE")"
+          "$PY" .github/scripts/check-ffi-exports.py --artifact "$lib" \
+            --baseline net/crates/net/bindings/go/net-ffi/exports.shipped.baseline
+
+      # C1 check 4, the Rust half: rustc's layout (size, alignment, every
+      # field offset) of each struct the headers publish equals the reviewed
+      # fixture tests/c_abi/layout.json. The C1 audit step compiles the same
+      # numbers as C _Static_asserts against the headers, so the two compilers
+      # meet at the fixture. `--release` in the bundle's target directory
+      # reuses the libraries the step above just built.
+      - name: Guard — Rust struct layouts match the reviewed fixture (C1 check 4)
+        working-directory: net/crates/net
+        env:
+          CARGO_TARGET_DIR: target/c-bundle
+        run: cargo test --release -p net-ffi --test abi_layout
+
+      - name: Build and stage the helper bundle (test-helpers)
+        run: |
+          "$PY" .github/scripts/make-c-bundle.py --profile helper --build | tee "$RUNNER_TEMP/helper.out"
+          echo "HELPER_BUNDLE=$(tail -n 1 "$RUNNER_TEMP/helper.out")" >> "$GITHUB_ENV"
+
+      # C1: every declared function is exported and backed by exactly one
+      # Rust definition compiled in that bundle's profile; every export is
+      # declared (or allowlisted with a reason in tests/c_abi/allowlist.toml);
+      # each declaration matches every Rust definition of its name by
+      # primitive width, pointer depth and expanded callback prototype; and
+      # each C handle type corresponds to one Rust type. Every NET_* code the
+      # Rust FFI defines is declared with its value, with no unlisted
+      # collision in one return domain, and both the constants and the
+      # struct layouts in tests/c_abi/layout.json are compiled as C
+      # _Static_asserts from the headers. Text, preprocessor and C compiler
+      # only, so it runs once, on Linux. `--self-test` plants each kind of
+      # drift (swapped handles, a narrowed width, a dropped pointer level, a
+      # changed callback prototype, a wrong code value, a collision, a
+      # moved field offset, ...) and requires each to be reported.
+      #
+      # It also compares the headers, header by header, with the last
+      # release's (v0.39.0) and with the pinned fixtures in
+      # tests/c_abi/fixtures/. A removed or changed declaration fails unless
+      # tests/c_abi/breaks.toml authorizes exactly that change. The checkout
+      # is shallow and tagless, so the release tag is fetched first.
+      - name: Guard — headers, exports and Rust definitions agree (C1 audit)
+        if: runner.os == 'Linux'
+        run: |
+          git fetch --no-tags --depth=1 origin +refs/tags/v0.39.0:refs/tags/v0.39.0
+          "$PY" -m pip install --quiet pycparser
+          "$PY" .github/scripts/check-c-abi.py --self-test
+          "$PY" .github/scripts/check-c-abi.py --bundle "$PROD_BUNDLE"
+          "$PY" .github/scripts/check-c-abi.py --bundle "$HELPER_BUNDLE"
+
+      # C5b: tests/c_abi/SURFACE.md records, per header, every declared
+      # function and the C programs CI runs that call it (consumers, arming,
+      # skill examples). The C column of the capability matrix may claim no
+      # more than it shows, so it must be current: regenerated here from the
+      # same header model as the audit, and any difference fails.
+      - name: Guard — the C surface record and fixture cases are current (C5b)
+        if: runner.os == 'Linux'
+        run: |
+          "$PY" .github/scripts/c-surface-record.py --self-test
+          "$PY" .github/scripts/c-surface-record.py --check
+          # capabilities.c runs the cross-language capability fixtures from a
+          # generated header; a fixture change must reach it in the same commit.
+          "$PY" .github/scripts/gen-c-fixture-cases.py --check
+
+      - name: Consumers — production bundle
+        run: |
+          shadow="$HELPER_BUNDLE/$(sed -n 's/^library: //p' "$HELPER_BUNDLE/PROVENANCE")"
+          if [ "$RUNNER_OS" = "Windows" ]; then compilers="msvc"; else compilers="gcc"; fi
+          for c in $compilers; do
+            "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler "$c" \
+              --negative-controls --shadow-library "$shadow"
+          done
+
+      # C5 compatibility lanes: pinned MinGW-w64 toolchains from MSYS2, one
+      # per C runtime, rather than whatever gcc the runner image ships.
+      #   ucrt64  — UCRT, the runtime the MSVC-built net.dll itself uses;
+      #   mingw64 — the legacy msvcrt.dll. Measured, not predicted: with the
+      #             registered-release contract every callback buffer is
+      #             freed by the allocator that made it, so this is expected
+      #             to pass, and a failure is a finding with its evidence.
+      # --expect-crt reads each program's import table and fails a lane whose
+      # binaries do not link the runtime it claims.
+      - name: Install pinned MinGW-w64 toolchains (UCRT and MSVCRT)
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-x86_64-gcc
+
+      - name: Consumers — MinGW-w64 UCRT and MSVCRT lanes
+        if: runner.os == 'Windows'
+        env:
+          MSYS2_ROOT: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          shadow="$HELPER_BUNDLE/$(sed -n 's/^library: //p' "$HELPER_BUNDLE/PROVENANCE")"
+          for lane in ucrt64:ucrt mingw64:msvcrt; do
+            prefix="${lane%%:*}"; crt="${lane##*:}"
+            bin="$(cygpath -u "$MSYS2_ROOT")/$prefix/bin"
+            "$bin/gcc" --version | head -n 1
+            # A Windows path for native Python's subprocess, rather than
+            # relying on the shell converting a /c/... value on the way in.
+            CC="$(cygpath -w "$bin/gcc.exe")" PATH="$bin:$PATH" "$PY" .github/scripts/run-c-consumers.py \
+              --bundle "$PROD_BUNDLE" --compiler mingw --expect-crt "$crt" \
+              --work "$RUNNER_TEMP/consumers-mingw-$crt" \
+              --negative-controls --shadow-library "$shadow"
+          done
+
+      - name: Consumers — helper bundle
+        run: |
+          shadow="$PROD_BUNDLE/$(sed -n 's/^library: //p' "$PROD_BUNDLE/PROVENANCE")"
+          if [ "$RUNNER_OS" = "Windows" ]; then c=msvc; else c=gcc; fi
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$HELPER_BUNDLE" --compiler "$c" \
+            --negative-controls --shadow-library "$shadow"
+
+      # C5, the Linux checker lane. Every consumer program again, built with
+      # ASan + UBSan and run with LeakSanitizer against the UNINSTRUMENTED
+      # libnet.so. What it can see: the programs' own memory access, and
+      # library-returned buffers, through the intercepted system allocator
+      # Rust uses. What it cannot: accesses inside the Rust code. The runner
+      # classifies every LSan leak block against tests/c_abi/lsan_policy.toml
+      # (handle tombstones only; no indirect leak) and prints what each
+      # accepted class holds on every run; any other leak fails.
+      # The arming programs then plant a leaked net_fetch_blob buffer, a
+      # double release of one, and a double release of a callback buffer;
+      # each must be caught with its named report, or the lane is not armed.
+      - name: Consumers — sanitizer lane (ASan, UBSan, LSan)
+        if: runner.os == 'Linux'
+        run: |
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler gcc --sanitize --arming
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$HELPER_BUNDLE" --compiler gcc --sanitize
+
+      # C5, the Windows /MDd checker lane: every consumer program built
+      # against the debug CRT, which checks the heap periodically and dumps
+      # leaks at exit. Its domain is THIS program's own CRT allocations; the
+      # release net.dll keeps its own heap, which this lane does not see (and
+      # claims nothing about). Arming: a leaked 777-byte block and a write past
+      # the end of an allocation, each caught with its debug-CRT report.
+      - name: Consumers — debug CRT lane (MSVC /MDd)
+        if: runner.os == 'Windows'
+        run: |
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler msvc --debug-crt --arming
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$HELPER_BUNDLE" --compiler msvc --debug-crt
+
+      # C5, the Windows Application Verifier lane: every consumer program,
+      # built /MD, run under full PageHeap with the Handles, Locks and Memory
+      # checks, which cover the program and the release net.dll in the same
+      # process. appverif needs an elevated process (runners are), and its
+      # settings are machine-wide per image name, so the runner sets them per
+      # run and always removes them. A run with no exported verifier log
+      # fails, so a lane that silently did not verify cannot pass. Not
+      # claimed: leaks (no Leak layer). Arming: a double release of a
+      # net_fetch_blob buffer, and a program free() of a callback buffer the
+      # library already released, each caught as a heap stop.
+      - name: Consumers — Application Verifier lane (full PageHeap)
+        if: runner.os == 'Windows'
+        run: |
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler msvc --appverif --arming --timeout 600
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$HELPER_BUNDLE" --compiler msvc --appverif --timeout 600
 
   clippy:
     name: Clippy

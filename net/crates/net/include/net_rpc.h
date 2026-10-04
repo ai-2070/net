@@ -263,10 +263,11 @@ void     net_rpc_cancel_call(MeshRpcHandle* handle, uint64_t token);
  * returning and the consumer's `Store` would otherwise hit an
  * empty registry slot.
  *
- * Response-buffer ownership: the consumer allocates via
- * `malloc(3)`; Rust copies the bytes into its own `Bytes` and
- * frees the consumer's buffer via `free(3)`. Same for the
- * `out_err` CString.
+ * Response-buffer ownership: the consumer allocates the response
+ * (and any `out_err` string) with its own allocator. Rust copies
+ * the bytes, then releases the consumer's buffer through the
+ * deallocator registered with net_rpc_set_callback_free (below),
+ * never with a free() of its own.
  * ========================================================================= */
 
 typedef int (*RpcHandlerFn)(
@@ -298,10 +299,11 @@ int net_rpc_set_callback_free(RpcCallbackFreeFn free_fn);
 /* Idempotent first-call-wins. The Go binding calls this once in
  * its package init; non-Go consumers do the same at startup.
  *
- * Returns 0 on success. On Windows, returns -1 if
- * net_rpc_set_callback_free has not been called — see above; without
- * it this library cannot release a handler's response buffer safely,
- * and refusing here beats corrupting a heap at the first call. */
+ * Returns 0 on success, or -1 on every platform if
+ * net_rpc_set_callback_free has not been called: without it this
+ * library has no way to release a handler's buffers (and on Windows
+ * freeing them itself would corrupt another module's CRT heap), so it
+ * refuses here rather than leak or corrupt at the first call. */
 int net_rpc_set_handler_dispatcher(RpcHandlerFn dispatcher);
 
 /* Reserve the next monotonic handler id without registering
@@ -554,6 +556,121 @@ int net_rpc_list_tools(
     const MeshRpcHandle* handle,
     uint8_t** out_json_ptr, size_t* out_json_len,
     char** out_err);
+
+/* Event-driven watch over the same tool list. */
+typedef struct ToolWatchHandleC ToolWatchHandleC;
+
+/* Open a tool-list watch. `interval_ms == 0` is purely event-driven;
+ * non-zero also re-diffs at most every `interval_ms`. The baseline is
+ * taken inside this call, so the first net_rpc_watch_tools_next reports
+ * the first change AFTER it; call net_rpc_list_tools for the baseline.
+ * Writes the handle to *out_watch. Returns NET_RPC_OK, or
+ * NET_RPC_ERR_NULL (with *out_err set) for a NULL `handle` or
+ * `out_watch`. Gated on rpc-ffi's `tool` feature (default-on). */
+int net_rpc_watch_tools(
+    const MeshRpcHandle* handle,
+    uint64_t interval_ms,
+    ToolWatchHandleC** out_watch,
+    char** out_err);
+
+/* Block until the next change and write it as JSON to
+ * (*out_json_ptr, *out_json_len): {"type": "added" | "removed" |
+ * "node_count_changed", "descriptor": {...}}, with "prev_node_count": N
+ * present only on "node_count_changed".
+ * Caller frees via net_rpc_response_free(ptr, len). Returns NET_RPC_OK;
+ * NET_RPC_ERR_STREAM_DONE once the watch is closed; NET_RPC_ERR_CALL_FAILED
+ * with *out_err set on error. */
+int net_rpc_watch_tools_next(
+    ToolWatchHandleC* watch,
+    uint8_t** out_json_ptr, size_t* out_json_len,
+    char** out_err);
+
+/* Close the watch: a next() blocked on another thread returns
+ * NET_RPC_ERR_STREAM_DONE promptly. Idempotent on NULL or closed. The
+ * handle stays valid until net_rpc_watch_tools_free. */
+void net_rpc_watch_tools_close(ToolWatchHandleC* watch);
+
+/* Free the watch handle; closes it first if needed. Idempotent on NULL.
+ * No next() may be in flight on another thread. */
+void net_rpc_watch_tools_free(ToolWatchHandleC* watch);
+
+/* =========================================================================
+ * Metrics
+ * ========================================================================= */
+
+/* Per-service nRPC metrics as JSON, written to (*out_json_ptr,
+ * *out_json_len): {"services": [{"service", "calls_total",
+ * "errors_no_route", "errors_timeout", "errors_server",
+ * "errors_transport", "in_flight", "latency_sum_ns", "latency_count",
+ * "latency_buckets", "handler_invocations_total", "handler_panics_total",
+ * "handler_in_flight", "handler_duration_sum_ns", "handler_duration_count",
+ * "handler_duration_buckets", "streaming_chunks_emitted_total",
+ * "streaming_chunks_dropped_total", "capability_denied_total"}],
+ * "observer_dropped_total": N} (the process-wide count of observer events
+ * dropped on a full queue; see RpcObserverFn). Caller
+ * frees via net_rpc_response_free(ptr, len). Returns NET_RPC_OK;
+ * NET_RPC_ERR_NULL for a NULL argument; NET_RPC_ERR_CALL_FAILED with
+ * *out_err set if serialising fails. */
+int net_rpc_metrics_snapshot(
+    const MeshRpcHandle* handle,
+    uint8_t** out_json_ptr, size_t* out_json_len,
+    char** out_err);
+
+/* Process-wide count of call-observer events dropped because the
+ * observer fell behind. The same number as the metrics snapshot's
+ * `observer_dropped_total`, without the JSON decode. */
+uint64_t net_rpc_observer_dropped_total(void);
+
+/* =========================================================================
+ * Call observer
+ * ========================================================================= */
+
+/* Discriminants for RpcCallEventC.status_kind. */
+#define NET_RPC_STATUS_OK           0  /* status_message_ptr is NULL        */
+#define NET_RPC_STATUS_ERROR        1  /* status_message_ptr/len: diagnostic */
+#define NET_RPC_STATUS_TIMEOUT      2  /* status_message_ptr is NULL        */
+#define NET_RPC_STATUS_CANCELED     3  /* status_message_ptr is NULL        */
+
+/* Discriminants for RpcCallEventC.direction. v1 emits only OUTBOUND. */
+#define NET_RPC_DIRECTION_OUTBOUND  0  /* this node made the call           */
+#define NET_RPC_DIRECTION_INBOUND   1  /* reserved                          */
+
+/* One completed call, as the observer sees it. Every pointer is borrowed
+ * for the duration of the dispatcher call: copy out what you keep before
+ * returning. Strings are UTF-8 and not NUL-terminated. */
+typedef struct RpcCallEventC {
+    uint64_t caller;                    /* node id of the calling node     */
+    uint64_t callee;                    /* node id of the responding node  */
+    const uint8_t* method_ptr;          /* method / service name           */
+    size_t method_len;
+    uint32_t latency_ms;                /* elapsed time                    */
+    uint8_t status_kind;                /* one of NET_RPC_STATUS_*         */
+    const uint8_t* status_message_ptr;  /* non-NULL only for STATUS_ERROR  */
+    size_t status_message_len;
+    uint32_t request_bytes;             /* request body size; 0 if unknown */
+    uint32_t response_bytes;            /* response body size; 0 if unknown */
+    uint8_t direction;                  /* one of NET_RPC_DIRECTION_*      */
+    uint64_t ts_unix_ms;                /* fire time, best effort          */
+} RpcCallEventC;
+
+/* Called asynchronously, from a worker: each completed outbound call is
+ * queued on a bounded channel on the dispatch path, and the worker hands
+ * the queued events to this function in order. When the queue is full an
+ * event is dropped, not waited for, and counted in
+ * net_rpc_observer_dropped_total (and `observer_dropped_total` in the
+ * metrics snapshot), so do not rely on receiving every call. Keep it cheap
+ * all the same: a slow observer is what fills the queue. */
+typedef void (*RpcObserverFn)(const RpcCallEventC* evt);
+
+/* Register the process-wide observer dispatcher. First call wins; later
+ * calls are ignored. */
+void net_rpc_set_observer_dispatcher(RpcObserverFn observer);
+
+/* Enable (`enabled != 0`) or clear (`enabled == 0`) the observer on one
+ * MeshRpc. Returns NET_RPC_OK; NET_RPC_ERR_NULL for a NULL handle;
+ * NET_RPC_ERR_NO_DISPATCHER when enabling before
+ * net_rpc_set_observer_dispatcher has been called. */
+int net_rpc_observer_install(const MeshRpcHandle* handle, int enabled);
 
 /* =========================================================================
  * Serve (handler registration)

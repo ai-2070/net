@@ -256,7 +256,7 @@
     "CortEX folds / NetDB": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"
@@ -296,7 +296,7 @@
     "Deck — operator surface": {
       "bindings": {
         "C": {
-          "status": "supported"
+          "status": "partial"
         },
         "Go": {
           "status": "supported"

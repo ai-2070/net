@@ -3245,6 +3245,7 @@ dependencies = [
  "net-meshos-ffi",
  "net-org-ffi",
  "net-rpc-ffi",
+ "serde_json",
 ]
 
 [[package]]

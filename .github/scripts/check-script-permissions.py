@@ -53,8 +53,12 @@ _SCRIPT = r"\.github/scripts/[\w.-]+\.(?:sh|py)"
 # A path invoked on its own — optionally via $GITHUB_WORKSPACE or ./ — with no
 # interpreter in front of it.
 _DIRECT = re.compile(rf'(?<![\w./-])(?:\$GITHUB_WORKSPACE/|"\$GITHUB_WORKSPACE"/|\./)?({_SCRIPT})')
-# Anything run through an explicit interpreter does NOT need the bit.
-_VIA_INTERPRETER = re.compile(rf"(?:python3?|bash|sh|node|npx)\s+[^\n|;&]*?({_SCRIPT})")
+# Anything run through an explicit interpreter does NOT need the bit. `"$PY"`
+# is the interpreter a cross-platform job picks per runner (`python3` is not on
+# every Windows image's PATH; `python` is), so it counts as one too.
+_VIA_INTERPRETER = re.compile(
+    rf'(?:python3?|bash|sh|node|npx|"\$PY"|\$PY)\s+[^\n|;&]*?({_SCRIPT})'
+)
 
 
 def _run_blocks(path: Path) -> list[str]:
@@ -145,6 +149,9 @@ jobs:
       - run: .github/scripts/planted-direct.sh
       # Via an interpreter — does not.
       - run: python3 .github/scripts/planted-interpreted.py
+      # Via the per-runner interpreter variable — does not either.
+      - run: '"$PY" .github/scripts/planted-py-var.py'
+      - run: $PY .github/scripts/planted-py-bare.py
       - name: workspace-prefixed, still direct
         run: $GITHUB_WORKSPACE/.github/scripts/planted-workspace.sh
     # A paths filter naming a script means nothing about invocation.
@@ -172,16 +179,19 @@ def self_test() -> int:
         ".github/scripts/planted-direct.sh",
         ".github/scripts/planted-workspace.sh",
     }
-    unexpected = ".github/scripts/planted-interpreted.py"
-
-    if unexpected in names:
-        print(f"FAIL  flagged {unexpected}, which runs through an interpreter")
-        return 1
+    for unexpected in (
+        ".github/scripts/planted-interpreted.py",
+        ".github/scripts/planted-py-var.py",
+        ".github/scripts/planted-py-bare.py",
+    ):
+        if unexpected in names:
+            print(f"FAIL  flagged {unexpected}, which runs through an interpreter")
+            return 1
     if names != expected:
         print(f"FAIL  matched {sorted(names)}, expected {sorted(expected)}")
         return 1
 
-    print("  ok    direct and $GITHUB_WORKSPACE forms caught, interpreted form ignored")
+    print("  ok    direct and $GITHUB_WORKSPACE forms caught, interpreted forms ignored")
     return 0
 
 

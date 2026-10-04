@@ -14747,11 +14747,22 @@ impl MeshNode {
         // built first and cannot take this as a constructor argument —
         // but a verdict is only ever issued from a running detector,
         // and this is wired before one exists.
+        //
+        // The check holds the detector WEAKLY. A strong handle closed a
+        // cycle (detector -> its callbacks -> reroute policy -> this check
+        // -> detector) that no drop could break: the detector, the policy
+        // and everything the callbacks capture (session routing, the
+        // roster, the scoped publication, ...) outlived every node that had
+        // been built, for the life of the process (D-C5-1, found by the C
+        // consumer sanitizer lane). A detector that is gone has no current
+        // verdict, so the check then answers false.
         let failure_detector = Arc::new(failure_detector);
         reroute_policy.set_verdict_check({
-            let detector = failure_detector.clone();
+            let detector = Arc::downgrade(&failure_detector);
             Arc::new(move |node_id: u64, verdict_seq: u64| {
-                detector.verdict_is_current(node_id, verdict_seq)
+                detector
+                    .upgrade()
+                    .is_some_and(|d| d.verdict_is_current(node_id, verdict_seq))
             })
         });
 
@@ -65232,5 +65243,88 @@ mod unserved_rpc_request_tests {
         let mut app = full.clone();
         app[0] = 0x80;
         assert_eq!(unserved_rpc_request(&app, |_| false), None);
+    }
+}
+
+/// D-C5-1, second half: after a started, connected node is shut down and
+/// dropped, none of its components may outlive it. LeakSanitizer found the
+/// failure detector, roster, channel registry, session routing, scoped
+/// publication and subnet challenge store still allocated at exit,
+/// reachable only from one another (a cycle), after the node itself had
+/// been freed.
+#[cfg(test)]
+mod component_reclaim_tests {
+    use super::*;
+    use std::sync::Weak;
+    use std::time::{Duration, Instant};
+
+    async fn node() -> Arc<MeshNode> {
+        let cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [0x42; 32])
+            .with_heartbeat_interval(Duration::from_millis(200));
+        Arc::new(MeshNode::new(EntityKeypair::generate(), cfg).await.unwrap())
+    }
+
+    struct Weaks {
+        node: Weak<MeshNode>,
+        failure_detector: Weak<FailureDetector>,
+        scoped_publication: Weak<ScopedMutationPublication>,
+        session_routing: Weak<NodeSessionRouting>,
+        roster: Weak<SubscriberRoster>,
+        subnet_challenges: Weak<SubnetChallengeStore>,
+    }
+
+    fn weaks(n: &Arc<MeshNode>) -> Weaks {
+        Weaks {
+            node: Arc::downgrade(n),
+            failure_detector: Arc::downgrade(&n.failure_detector),
+            scoped_publication: Arc::downgrade(&n.scoped_publication),
+            session_routing: Arc::downgrade(&n.session_routing),
+            roster: Arc::downgrade(&n.roster),
+            subnet_challenges: Arc::downgrade(&n.subnet_challenges),
+        }
+    }
+
+    fn alive(w: &Weaks) -> Vec<(&'static str, usize)> {
+        [
+            ("node", w.node.strong_count()),
+            ("failure_detector", w.failure_detector.strong_count()),
+            ("scoped_publication", w.scoped_publication.strong_count()),
+            ("session_routing", w.session_routing.strong_count()),
+            ("roster", w.roster.strong_count()),
+            ("subnet_challenges", w.subnet_challenges.strong_count()),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shut_down_connected_pair_leaves_no_component_alive() {
+        let a = node().await;
+        let b = node().await;
+        let (a_id, b_id, b_addr, b_pub) =
+            (a.node_id(), b.node_id(), b.local_addr(), *b.public_key());
+        let b2 = b.clone();
+        let accept = tokio::spawn(async move { b2.accept(a_id).await });
+        a.connect(b_addr, &b_pub, b_id).await.unwrap();
+        accept.await.unwrap().unwrap();
+        a.start();
+        b.start();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (wa, wb) = (weaks(&a), weaks(&b));
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+        drop(a);
+        drop(b);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !(alive(&wa).is_empty() && alive(&wb).is_empty()) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            alive(&wa).is_empty() && alive(&wb).is_empty(),
+            "components still alive 5 s after drop: A {:?}, B {:?}",
+            alive(&wa),
+            alive(&wb)
+        );
     }
 }

@@ -109,13 +109,25 @@ int main(void) {
 }
 ```
 
-## The three memory rules
+## Memory rules
 
 | You got it from | Free it with |
 |---|---|
 | `net_init()` | `net_shutdown()` |
 | `net_poll_ex()` | `net_free_poll_result()` |
 | `net_generate_keypair()` and similar | `net_free_string()` |
+| A blob adapter or the blob registry: refs, fetched bytes | `net_blob_free_buffer(ptr, len)` |
+| Transfer (`net_transport.h`): `net_fetch_blob` / `_discovered` bytes, `net_store_dir`'s manifest ref | `net_transport_free_buffer(ptr, len)` |
+| An nRPC response / error string | `net_rpc_response_free(ptr, len)` / `net_rpc_free_cstring(s)` |
+| A JSON result (`net_dir_manifest_read`, `net_blob_ref_describe`, ...) | `net_free_string(s)` |
+
+Never `free()` a buffer the library returned. A buffer **your** callback
+returns (an nRPC or organization handler's response, a blob vtable's
+`fetch` result) comes back to you: through the deallocator you register with
+`net_rpc_set_callback_free` / `net_org_set_callback_free` before the
+dispatcher (which is refused without it), or through the vtable's
+`free_buffer`. Each buffer returns to the allocator that made it, so the
+program's C runtime does not matter.
 
 `net_version()` returns a static string — do not free it. The polling cursor
 trap, the threading rules, and the guarantees the boundary makes (no unwinding,
@@ -124,18 +136,36 @@ length validation, alignment checks, idempotent free) are in
 
 ## Examples
 
-Eight C examples ship in `../examples/`:
+Every C program below is built and run by CI against the staged C SDK
+bundle: headers included by name, linked against `libnet` and no other Net
+library (plus the platform's own, `-lpthread -ldl -lm` on Linux), and a
+check at start-up that the library it loaded is the staged one.
+
+**Consumer programs**, in `net/crates/net/examples/c/`. Each runs on Linux
+(GCC, then again under ASan, UBSan and LeakSanitizer) and on Windows (MSVC
+`/MD`, MSVC `/MDd` with the debug CRT's heap checks, MinGW-w64 UCRT and
+MSVCRT, and Application Verifier with full PageHeap):
 
 | File | Shows |
 |---|---|
-| `../examples/basic.c` | The event-bus loop above |
-| `../examples/capability.c` | Capability validation, predicate evaluate / trace, `net-where:` header, debug-report aggregation and redaction |
-| `../examples/capability_aggregation.c` | Capability aggregation and capacity ranking |
-| `../examples/meshdb.c` | MeshDB factory AST, runner, iterator, sentinel decoder |
-| `../examples/scheduler.c` | Task-lifecycle workflow plus gang-claim island reserve / release |
-| `../examples/meshos.c` | MeshOS daemon-author vtable lifecycle |
-| `../examples/deck.c` | Deck operator workflow — snapshot, status, maintenance commit, stream |
-| `../examples/transport.c` | Transport API walkthrough — `net_store_dir` / `net_fetch_dir` call shapes with node bring-up shown in outline; prints that outline and does not transfer |
+| `smoke.c` | The smallest consumer: link, load, call |
+| `lifecycle.c` | A mesh node's lifecycle: new, handshake, start, shutdown, free |
+| `transfer.c` | Blob and directory transfer between two nodes, and its refusals |
+| `tree_range.c` | Tree blobs, Reed-Solomon encoding and range reads |
+| `repair.c` | Reed-Solomon repair of a damaged blob (test-helper build only) |
+| `blob_callbacks.c` | A blob adapter written in C, and who frees its buffers |
+| `rpc_callbacks.c` | nRPC handlers written in C, and who frees their buffers |
+| `rpc_no_free.c` | A handler dispatcher without a deallocator is refused |
+
+**Skill examples**, in `.claude/skills/net-event-bus/examples/`, run by
+the skill-examples job: `hello.c` (the event-bus loop above), `observe.c`,
+`registry.c`, `jobqueue.c`, `objectstore.c`, `liveconfig.c`, `eventlog.c`,
+`tokenchannel.c`, `failover.c` and `net_org_streaming.c`.
+
+Every header now has a C program that calls it.
+`net/crates/net/tests/c_abi/SURFACE.md` lists, for each declared function,
+the programs that call it; a function with none is declared, exported and
+checked against its Rust definition, but not yet exercised from C.
 
 ## Claude Code Skill
 
