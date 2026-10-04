@@ -555,6 +555,67 @@ int net_rpc_list_tools(
     uint8_t** out_json_ptr, size_t* out_json_len,
     char** out_err);
 
+/* Event-driven watch over the same tool list. */
+typedef struct ToolWatchHandleC ToolWatchHandleC;
+
+/* Open a tool-list watch. `interval_ms == 0` is purely event-driven;
+ * non-zero also re-diffs at most every `interval_ms`. The baseline is
+ * taken inside this call, so the first net_rpc_watch_tools_next reports
+ * the first change AFTER it; call net_rpc_list_tools for the baseline.
+ * Writes the handle to *out_watch. Returns NET_RPC_OK, or
+ * NET_RPC_ERR_NULL (with *out_err set) for a NULL `handle` or
+ * `out_watch`. Gated on rpc-ffi's `tool` feature (default-on). */
+int net_rpc_watch_tools(
+    const MeshRpcHandle* handle,
+    uint64_t interval_ms,
+    ToolWatchHandleC** out_watch,
+    char** out_err);
+
+/* Block until the next change and write it as JSON to
+ * (*out_json_ptr, *out_json_len): {"type": "added" | "removed" |
+ * "node_count_changed", "descriptor": {...}, "prev_node_count": N}.
+ * Caller frees via net_rpc_response_free(ptr, len). Returns NET_RPC_OK;
+ * NET_RPC_ERR_STREAM_DONE once the watch is closed; NET_RPC_ERR_CALL_FAILED
+ * with *out_err set on error. */
+int net_rpc_watch_tools_next(
+    ToolWatchHandleC* watch,
+    uint8_t** out_json_ptr, size_t* out_json_len,
+    char** out_err);
+
+/* Close the watch: a next() blocked on another thread returns
+ * NET_RPC_ERR_STREAM_DONE promptly. Idempotent on NULL or closed. The
+ * handle stays valid until net_rpc_watch_tools_free. */
+void net_rpc_watch_tools_close(ToolWatchHandleC* watch);
+
+/* Free the watch handle; closes it first if needed. Idempotent on NULL.
+ * No next() may be in flight on another thread. */
+void net_rpc_watch_tools_free(ToolWatchHandleC* watch);
+
+/* =========================================================================
+ * Metrics
+ * ========================================================================= */
+
+/* Per-service nRPC metrics as JSON, written to (*out_json_ptr,
+ * *out_json_len): {"services": [{"service", "calls_total",
+ * "errors_no_route", "errors_timeout", "errors_server",
+ * "errors_transport", "in_flight", "latency_sum_ns", "latency_count",
+ * "latency_buckets", "handler_invocations_total", "handler_panics_total",
+ * "handler_in_flight", "handler_duration_sum_ns", "handler_duration_count",
+ * "handler_duration_buckets", "streaming_chunks_emitted_total",
+ * "streaming_chunks_dropped_total", "capability_denied_total"}]}. Caller
+ * frees via net_rpc_response_free(ptr, len). Returns NET_RPC_OK;
+ * NET_RPC_ERR_NULL for a NULL argument; NET_RPC_ERR_CALL_FAILED with
+ * *out_err set if serialising fails. */
+int net_rpc_metrics_snapshot(
+    const MeshRpcHandle* handle,
+    uint8_t** out_json_ptr, size_t* out_json_len,
+    char** out_err);
+
+/* Process-wide count of call-observer events dropped because the
+ * observer fell behind. The same number as the metrics snapshot's
+ * `observer_dropped_total`, without the JSON decode. */
+uint64_t net_rpc_observer_dropped_total(void);
+
 /* =========================================================================
  * Serve (handler registration)
  * ========================================================================= */

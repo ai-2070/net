@@ -71,8 +71,16 @@ GO_ABI_TEST_RE = re.compile(r"^go/(abi_stability.*|header_parity)_test\.go$")
 _RUST_CONST = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+(NET_[A-Z0-9_]+)\b"
 )
-_C_DEFINE = re.compile(r"^\s*#\s*define\s+(NET_[A-Z0-9_]+)\b")
+# A `#define` that carries a value (or is function-like). A bare
+# `#define NET_X_H` is an include guard or a flag: it has no ABI value to
+# drift, and a new header's guard must not demand an ABI-change commit.
+_C_DEFINE = re.compile(r"^\s*#\s*define\s+(NET_[A-Z0-9_]+)(?:\(|[ \t]+\S)")
 _C_ENUM = re.compile(r"^\s*(NET_[A-Z0-9_]+)\s*=")
+_CONST_PATTERNS = (
+    (_RUST_CONST, (".rs",)),
+    (_C_DEFINE, (".h", ".c")),
+    (_C_ENUM, (".h", ".c")),
+)
 _EXTERN_C = re.compile(r'\bextern\s+"C"')
 _EXTERN_C_BLOCK = re.compile(r'\bextern\s+"C"\s*\{\s*$')
 _COMMENT_LINE = re.compile(r"^\s*(?://|/\*|\*)")
@@ -202,7 +210,12 @@ def diff_changes(
         body = line[1:]
         if _COMMENT_LINE.match(body):
             continue
-        for rx in (_RUST_CONST, _C_DEFINE, _C_ENUM):
+        # Each pattern only in the language it describes: a `#define` line
+        # inside a Python string (a checker's self-test) or a Markdown code
+        # block is not an ABI constant.
+        for rx, exts in _CONST_PATTERNS:
+            if not current.endswith(exts):
+                continue
             m = rx.match(body)
             if m:
                 consts.add(m.group(1))
@@ -402,6 +415,30 @@ def self_test() -> int:
     )
     _, consts, extern_c = diff_changes(define)
     expect("a changed #define is detected", consts == {"NET_STREAM_TIMEOUT"})
+
+    guard = (
+        "--- /dev/null\n"
+        "+++ b/net/crates/net/tests/c_abi/helpers/net_demo.h\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+#ifndef NET_DEMO_H\n"
+        "+#define NET_DEMO_H\n"
+        "+#define NET_DEMO_MAX(a, b) ((a) > (b) ? (a) : (b))\n"
+    )
+    _, consts, _ = diff_changes(guard)
+    expect(
+        "an include guard (#define with no value) does not trigger; a function-like macro does",
+        consts == {"NET_DEMO_MAX"},
+    )
+
+    in_python = (
+        "--- a/.github/scripts/check-demo.py\n"
+        "+++ b/.github/scripts/check-demo.py\n"
+        "@@ -1 +1,2 @@\n"
+        ' _HEADER = """\n'
+        "+#define NET_DEMO_OK 0\n"
+    )
+    _, consts, _ = diff_changes(in_python)
+    expect("a #define line inside a Python file does not trigger", consts == set())
 
     enum = (
         "--- a/net/crates/net/include/net.go.h\n"

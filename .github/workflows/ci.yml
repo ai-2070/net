@@ -5258,6 +5258,23 @@ jobs:
           "$PY" .github/scripts/make-c-bundle.py --profile helper --build | tee "$RUNNER_TEMP/helper.out"
           echo "HELPER_BUNDLE=$(tail -n 1 "$RUNNER_TEMP/helper.out")" >> "$GITHUB_ENV"
 
+      # C1: every declared function is exported and backed by exactly one
+      # Rust definition compiled in that bundle's profile; every export is
+      # declared (or allowlisted with a reason in tests/c_abi/allowlist.toml);
+      # each declaration matches every Rust definition of its name by
+      # primitive width, pointer depth and expanded callback prototype; and
+      # each C handle type corresponds to one Rust type. Text-and-preprocessor
+      # only, so it runs once, on Linux. `--self-test` plants same-arity drift
+      # (swapped handles, a narrowed width, a dropped pointer level, a changed
+      # callback prototype) and requires each to be reported.
+      - name: Guard — headers, exports and Rust definitions agree (C1 audit)
+        if: runner.os == 'Linux'
+        run: |
+          "$PY" -m pip install --quiet pycparser
+          "$PY" .github/scripts/check-c-abi.py --self-test
+          "$PY" .github/scripts/check-c-abi.py --bundle "$PROD_BUNDLE"
+          "$PY" .github/scripts/check-c-abi.py --bundle "$HELPER_BUNDLE"
+
       - name: Consumers — production bundle
         run: |
           shadow="$HELPER_BUNDLE/$(sed -n 's/^library: //p' "$HELPER_BUNDLE/PROVENANCE")"

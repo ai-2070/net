@@ -1,0 +1,31 @@
+# Accepted findings of .github/scripts/check-c-abi.py, each with its reason.
+#
+# A key is the finding's subject (a symbol, or a C type name for `handles`).
+# An entry that matches nothing fails the check, so this file cannot outlive
+# the reason it records. Add an entry only with a reason a reviewer can
+# check; fixing the finding is always the better answer.
+#
+# See docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md, C1.
+
+[exported]
+
+# The bundle-composition marker of the umbrella crate (net-ffi/src/lib.rs:41).
+# It records which surfaces are linked together, not a signature generation,
+# so declaring it would invite consumers to treat it as an ABI version. Which
+# library a program loaded is answered by the loaded-library identity check
+# (C0), not by this symbol.
+net_ffi_abi_version = "bundle-composition marker, not a consumer API; see C0 loaded-library identity"
+
+# The non-owning predecessor of net_blob_register_callback_adapter_owned,
+# which is the declared registration (net.go.h) and whose release contract C4
+# tests. Kept exported for binaries linked before the owned form; deliberately
+# not offered to new C code (.claude/skills/net-event-bus/dataforts.md).
+net_blob_register_callback_adapter = "superseded by the declared _owned form; exported for existing binaries"
+
+# The nRPC call observer. Its dispatcher receives `RpcCallEventC` by pointer,
+# a #[repr(C)] struct that would have to be published in net_rpc.h. Deferred
+# until C1's layout check (check 4) can compile-check that struct's layout
+# from the header, so the declaration never ships unverified. Go declares
+# both locally today (go/mesh_rpc_typed.go).
+net_rpc_set_observer_dispatcher = "deferred to the C1 layout check: needs RpcCallEventC published and layout-checked"
+net_rpc_observer_install = "deferred to the C1 layout check: needs RpcCallEventC published and layout-checked"

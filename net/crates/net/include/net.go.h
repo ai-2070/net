@@ -1946,7 +1946,7 @@ int net_mesh_blob_adapter_store(
 );
 
 /* Mint a content address for `data` (BLAKE3), store it through the
- * adapter, and write the encoded BlobRef to *out_ref/*out_ref_len for
+ * adapter, and write the encoded BlobRef to (*out_ref, *out_ref_len) for
  * the caller to free via net_blob_free_buffer. This is the producer
  * half: net_mesh_blob_adapter_store needs an already-encoded ref. */
 int net_mesh_blob_adapter_publish(

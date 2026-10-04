@@ -437,6 +437,55 @@ the bundle on both platforms.
   deferred under "Defects found on the way". The four undeclared codes
   in gap 3 are expected findings and are declared in this slice.
 
+**Status: stage 1 of 4 landed (2026-10-04): checks 1, 2, 3, 6 and the
+handle rule.** Stages 2–4 are constants (check 5, with
+`abi_constants.c`), layout (check 4, with `abi_layout.c`) and
+compatibility (check 7).
+- **What landed:**
+  - `c_abi_model.py`: the type model. C goes through pycparser on `cc -E`
+    output with stand-in libc headers. Rust is lexed with comments and
+    strings masked, and a definition counts as compiled if its own
+    `#[cfg]`s, its inline modules' and its file's (including inner
+    `#![cfg]`) all hold under the features `cargo tree` resolves for the
+    profile.
+  - `check-c-abi.py`: audits a staged bundle. `--self-test` covers 13
+    cases: same-arity swapped handles, a narrowed width, a dropped
+    pointer level, a callback prototype and a callback arity changed
+    under one typedef name, a stale allowlist entry, and an unknown cfg
+    predicate.
+  - `tests/c_abi/allowlist.toml`.
+  - The CI step on the ubuntu leg of `c-consumers`.
+- **Opaque handles have no alias table.** Each C type name must
+  correspond to one Rust type across every function. The first run
+  matched 80 C types one-to-one. 42 positions meet a `void*` on one side
+  (the event-bus API's untyped handle; the transport stubs). They are
+  ABI-identical, are listed by `--verbose`, and are not handle-checked.
+- **Proved on the real headers, not just the self-test:** a copy of the
+  production bundle with four planted changes in `net.go.h`,
+  `net_cortex.h` and `net_transport.h`. A narrowed width, a dropped
+  pointer level, two reordered `net_tasks_wait_for_token` arguments and
+  swapped `net_serve_blob_transfer` handles were each reported, against
+  the real bodies and their stubs.
+- **First run, production (Windows):** 583 declared functions, all
+  exported and all backed by exactly one compiled, non-stub definition.
+  No signature or handle findings. Ten exports were declared nowhere:
+  - **Declared now** in `net_rpc.h` (documented to users, called by Go
+    through local preamble declarations): `net_rpc_watch_tools`,
+    `_next`, `_close`, `_free`, `net_rpc_metrics_snapshot` and
+    `net_rpc_observer_dropped_total`. Each now passes this audit and
+    `check-rpc-abi-parity.py`.
+  - **Allowlisted, with reasons:** `net_ffi_abi_version` (bundle
+    composition, not a signature generation; C0 answers which library
+    loaded) and `net_blob_register_callback_adapter` (the non-owning
+    predecessor of the declared `_owned` form).
+  - **Deferred to stage 3:** `net_rpc_set_observer_dispatcher` and
+    `net_rpc_observer_install`. Their dispatcher takes `RpcCallEventC`,
+    which would have to be published and layout-checked first.
+- **After the fixes:** production has 589 declared functions, all real
+  and matching. Helper has 591 (adding the two repair seams from
+  `net_test_helpers.h`), with six undeclared Go-test seams listed by
+  name.
+
 ### C2: lifecycle and transfer programs
 
 - **`lifecycle.c`.** Two in-process nodes go through `net_mesh_new`,
@@ -693,6 +742,32 @@ Not a prerequisite for any other slice.
 - The Go binding, which has its own plan, and the browser/wasm surfaces.
 
 ## Defects found on the way
+
+Found by C1, stage 1:
+
+- **`net.go.h` failed to compile under `-Wall -Werror`.** A doc comment
+  read `*out_ref/*out_ref_len`, and the `/*` inside it trips GCC's
+  `-Wcomment`. Any C consumer including `net.go.h` (or Go's `go/net.h`
+  mirror) with warnings as errors stopped there. Fixed in both. Every
+  shipped and mirror header now compiles alone under `-std=c11 -Wall
+  -Wextra -Werror -pedantic`.
+- **Six nRPC exports had no C declaration**, though the skill guide and
+  the web docs tell users about `net_rpc_watch_tools` and
+  `net_rpc_observer_dropped_total`. Declared in `net_rpc.h`.
+- **`check-abi-commit.py` read an include guard as an ABI constant.** C0's
+  `net_test_helpers.h` opens with `#define NET_TEST_HELPERS_H`, and the
+  guard demanded header, Go-mirror and Go-ABI-test changes in the same
+  commit, failing the `go-tests` job on C0's push. It now counts a
+  `#define` only when it carries a value or is function-like, and reads
+  each constant pattern only in its own language (`.rs` for Rust consts;
+  `.h` and `.c` for defines and enum members). Before that, a `#define`
+  line inside a Python self-test string counted. Two self-test cases pin
+  this; the include-guard one fails under the old pattern.
+- **The skill's C blob section is stale.**
+  `.claude/skills/net-event-bus/dataforts.md:218` says no host-language
+  adapter registration is exposed to C, but
+  `net_blob_register_callback_adapter_owned` is declared in `net.go.h`
+  since #1165. Left for C6, which rebuilds the C docs.
 
 Known before C1 runs:
 
