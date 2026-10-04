@@ -1,0 +1,48 @@
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_1420e43fa39f09 440-488
+  s_17a2ac60d914fc::t_51c75a699672ab 746-756,763-768
+  s_17a2ac60d914fc::t_69bc586165c25e 757-762
+.github/workflows/ci.yml
+  s_17a2ac60d914fc::t_f40f1dc916fdbf 5261-5277
+net/crates/net/tests/c_abi/allowlist.toml
+  s_17a2ac60d914fc::t_6f249742c6f360 1-31
+net/crates/net/include/net_rpc.h
+  s_17a2ac60d914fc::t_68302baba75a28 558-564,568-618
+  s_17a2ac60d914fc::t_81ab3043368aa6 565-567
+.github/scripts/check-c-abi.py
+  s_17a2ac60d914fc::t_beb93157e7e045 1-79,83-89,92-177,179-210,212,220-223,227-268,270,280-411,413-420,422-425
+  s_17a2ac60d914fc::t_22f2219521652a 225,269,277-279,412,421
+  s_17a2ac60d914fc::t_d3d6552773adb2 80-82,90-91,178,224,226,271-273
+  s_17a2ac60d914fc::t_0005a8123e9201 211,213-219,274-276
+.github/scripts/c_abi_model.py
+  s_17a2ac60d914fc::t_8a6317d975c073 421-423,427,429,525-526,575-583,585-596
+  s_17a2ac60d914fc::t_c79ecd1a3eae25 618-619,621,627
+  s_17a2ac60d914fc::t_e2b6097512ee30 1-420,424-426,428,430-524,527-574,584,597-617,620,622-626,628-812
+net/crates/net/include/net.go.h
+  s_17a2ac60d914fc::t_b887fd651d99bb 1949
+go/net.h
+  s_17a2ac60d914fc::t_b887fd651d99bb 1948
+.github/scripts/check-abi-commit.py
+  s_17a2ac60d914fc::t_0b616b356e50d9 419-430
+  s_17a2ac60d914fc::t_6a6086c8eabb4f 79-83
+  s_17a2ac60d914fc::t_a7fd1f1184da81 213-218
+  s_17a2ac60d914fc::t_29e24491956c40 431,433-442
+  s_17a2ac60d914fc::t_cf1d8c06a921b2 74-77
+  s_17a2ac60d914fc::t_e256e3cfc63ba8 432
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4edcd635a0d0518884f10f54e0caec8f2c353536",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": null
+    }
+  }
+}
