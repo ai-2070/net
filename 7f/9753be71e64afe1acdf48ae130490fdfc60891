@@ -1,0 +1,30 @@
+web/src/lib/generated/capability-record.json
+  s_17a2ac60d914fc::t_573cd891ad2dda 773,793,813
+net/crates/net/tests/c_abi/SURFACE.md
+  s_17a2ac60d914fc::t_573cd891ad2dda 20,22,150-151,183,187,206-207,572,576,579-580,582-584,587-588,592-593,596,599,682-684
+docs/data/capabilities/event-bus.yaml
+  s_17a2ac60d914fc::t_573cd891ad2dda 421,423-424,440,442-443,459,461-462
+.claude/skills/net-event-bus/bindings/coverage.md
+  s_17a2ac60d914fc::t_573cd891ad2dda 102-104,183-185
+net/crates/net/examples/c/subnet.c
+  s_17a2ac60d914fc::t_ea0ba40dc7ec28 1-105,108-130,134-458
+  s_17a2ac60d914fc::t_073aee674b9832 106-107,131-133
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_573cd891ad2dda 24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7f9753be71e64afe1acdf48ae130490fdfc60891",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
