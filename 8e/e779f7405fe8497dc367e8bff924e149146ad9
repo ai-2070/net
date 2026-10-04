@@ -1,0 +1,32 @@
+.github/workflows/ci.yml
+  s_17a2ac60d914fc::t_cedc28b01beab1 5387
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_cedc28b01beab1 977-978,1212,1220-1241
+net/crates/net/src/ffi/mesh.rs
+  s_17a2ac60d914fc::t_97b7ec9fa8ace4 1026,1050,1067,1222,1244,1316,1351,1906,1955,2004,2372,2590,2621,2747,4161,4699,4770,4798,4847
+  s_17a2ac60d914fc::t_847b07137a90e1 4992-4998,5000-5001
+  s_17a2ac60d914fc::t_df3c8555b3ddba 4873-4986,5002-5017
+  s_17a2ac60d914fc::t_32db808961d5ad 4987-4991,4999
+net/crates/net/src/ffi/mod.rs
+  s_17a2ac60d914fc::t_1b8696dd3c91ab 2739-2770,2772-2803
+  s_17a2ac60d914fc::t_89a8fca7a0ac2b 2771
+net/crates/net/tests/c_abi/lsan_policy.toml
+  s_17a2ac60d914fc::t_06630947bf3d1c 25-30
+  s_17a2ac60d914fc::t_cedc28b01beab1 6-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8ee779f7405fe8497dc367e8bff924e149146ad9",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
