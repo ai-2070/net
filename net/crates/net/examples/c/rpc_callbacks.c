@@ -174,6 +174,9 @@ static int run(void) {
     CU_CHECK_RC("net_mesh_shutdown: caller", net_mesh_shutdown(caller), 0);
     net_mesh_free(prov);
     net_mesh_free(caller);
+    /* No handler can run any more, so nothing can reach counting_free. */
+    cu_mutex_free(mu);
+    mu = NULL;
     return 0;
 }
 

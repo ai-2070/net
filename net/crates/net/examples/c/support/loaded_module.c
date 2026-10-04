@@ -47,6 +47,28 @@ static int clm_report(const char* path) {
 
 #include <windows.h>
 
+#if defined(_MSC_VER) && defined(_DEBUG)
+#include <crtdbg.h>
+/* The /MDd checker lane (C SDK plan, C5): the debug CRT's leak check at exit
+ * and periodic heap validation, for THIS program's own CRT allocations only
+ * (the release net.dll has its own heap, out of this lane's domain). Every
+ * report goes to stdout instead of a dialog, so the runner can read it and
+ * a CI runner never blocks on a message box. */
+static void clm_debug_crt(void) {
+    int kinds[] = {_CRT_WARN, _CRT_ERROR, _CRT_ASSERT};
+    int i;
+    for (i = 0; i < 3; i++) {
+        _CrtSetReportMode(kinds[i], _CRTDBG_MODE_FILE);
+        _CrtSetReportFile(kinds[i], _CRTDBG_FILE_STDOUT);
+    }
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    _CrtSetDbgFlag(_CrtSetDbgFlag(_CRTDBG_REPORT_FLAG) | _CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF |
+                   _CRTDBG_CHECK_EVERY_128_DF);
+}
+#else
+static void clm_debug_crt(void) {}
+#endif
+
 static int clm_same_path(const char* a, const char* b) {
     return _stricmp(a, b) == 0;
 }
@@ -99,6 +121,7 @@ static int clm_module_of(void* addr, HMODULE* module, char* out, size_t out_len)
 
 int clm_check_loaded_module(const clm_fn_t* fns, size_t count) {
     HMODULE exe = GetModuleHandleW(NULL);
+    clm_debug_crt();
     HMODULE first = NULL;
     char first_path[CLM_PATH_MAX];
     size_t i;

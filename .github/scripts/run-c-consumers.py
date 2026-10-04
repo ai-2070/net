@@ -82,7 +82,11 @@ CHECKS_RE = re.compile(r"^NET-CHECKS: (\d+)\s*$", re.M)
 OK_LINE_RE = re.compile(r"^ok ", re.M)
 # The first line of an ASan / LSan / UBSan report.
 SANITIZER_RE = re.compile(
-    r"^(?:==\d+==)?ERROR: (?:AddressSanitizer|LeakSanitizer)[^\n]*|^[^\n]*runtime error:[^\n]*", re.M
+    r"^(?:==\d+==)?ERROR: (?:AddressSanitizer|LeakSanitizer)[^\n]*|^[^\n]*runtime error:[^\n]*"
+    # The MSVC debug CRT (the /MDd lane): its leak dump and heap reports.
+    r"|^Detected memory leaks![^\n]*|^[^\n]*HEAP CORRUPTION DETECTED[^\n]*"
+    r"|^[^\n]*_CrtIsValidHeapPointer[^\n]*",
+    re.M,
 )
 # LSan's `print_suppressions=1` table: `   <count>   <bytes> <template>`.
 SUPP_ROW_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s*$", re.M)
@@ -226,7 +230,7 @@ def pick_compiler(requested: str) -> str:
 
 def compile_program(
     compiler: str, bundle: Bundle, src: Path, out_dir: Path, extra_link: list[str] | None = None,
-    sanitize: bool = False,
+    sanitize: bool = False, debug_crt: bool = False,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     exe = out_dir / (src.stem + (".exe" if IS_WINDOWS else ""))
@@ -262,7 +266,8 @@ def compile_program(
         implib = bundle.lib / "net.dll.lib"
         quoted_support = " ".join('"' + x + '"' for x in support)
         cl = (
-            f'cl /nologo /W4 /WX /std:c11 /MD /I "{bundle.include}" /I "{SUPPORT}" '
+            f'cl /nologo /W4 /WX /std:c11 {"/MDd /D_DEBUG /Zi" if debug_crt else "/MD"} '
+            f'/I "{bundle.include}" /I "{SUPPORT}" '
             f'"{src}" {quoted_support} /Fo"{out_dir}\\\\" /Fe"{exe}" '
             f'/link "{implib}" ws2_32.lib {" ".join(extra_link)}'
         )
@@ -274,6 +279,8 @@ def compile_program(
         raise SystemExit(f"FAIL  unknown compiler {compiler}")
     if sanitize and compiler != "gcc":
         raise SystemExit("FAIL  --sanitize is the Linux GCC lane (ASan/UBSan/LSan)")
+    if debug_crt and compiler != "msvc":
+        raise SystemExit("FAIL  --debug-crt is the MSVC /MDd lane")
     if run.returncode != 0:
         print(f"✗ {src.name}: compile failed ({compiler})")
         print("    " + " ".join(cmd))
@@ -395,7 +402,8 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
         if need is not None and need != bundle.profile:
             print(f"  – {name}: needs the {need} bundle; not run against the {bundle.profile} bundle")
             continue
-        exe = compile_program(compiler, bundle, src, work / name, sanitize=args.sanitize)
+        exe = compile_program(compiler, bundle, src, work / name, sanitize=args.sanitize,
+                              debug_crt=args.debug_crt)
         env = child_env(bundle, sanitizer_env() if args.sanitize else None)
         refuse_strays(bundle, env, exe.parent)
         rc, out = run_exe(exe, env, args.timeout)
@@ -418,6 +426,12 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
 
 
 EXPECT_RE = re.compile(r"NET-EXPECT:\s*(.+?)\s*$", re.M)
+LANE_RE = re.compile(r"NET-LANE:\s*([\w-]+)")
+
+
+def lane_of(src: Path) -> str:
+    m = LANE_RE.search(src.read_text(encoding="utf-8")[:4000])
+    return m.group(1) if m else "sanitize"
 
 
 def arming_runs(args, bundle: Bundle, compiler: str, work: Path) -> int:
@@ -427,9 +441,10 @@ def arming_runs(args, bundle: Bundle, compiler: str, work: Path) -> int:
     its header; a crash during setup, a failed check, or a sanitizer report
     about something else does not count."""
     failures = 0
-    programs = sorted(ARMING.glob("*.c"))
+    lane = "debug-crt" if args.debug_crt else "sanitize"
+    programs = [p for p in sorted(ARMING.glob("*.c")) if lane_of(p) == lane]
     if not programs:
-        print(f"✗ no arming programs in {ARMING}")
+        print(f"✗ no {lane} arming programs in {ARMING}")
         return 1
     for src in programs:
         expects = EXPECT_RE.findall(src.read_text(encoding="utf-8")[:4000])
@@ -437,11 +452,16 @@ def arming_runs(args, bundle: Bundle, compiler: str, work: Path) -> int:
             print(f"✗ arming {src.stem}: no NET-EXPECT line")
             failures += 1
             continue
-        exe = compile_program(compiler, bundle, src, work / "arming" / src.stem, sanitize=True)
-        rc, out = run_exe(exe, child_env(bundle, sanitizer_env()), args.timeout)
+        exe = compile_program(compiler, bundle, src, work / "arming" / src.stem,
+                              sanitize=not args.debug_crt, debug_crt=args.debug_crt)
+        rc, out = run_exe(exe, child_env(bundle, None if args.debug_crt else sanitizer_env()), args.timeout)
         v = classify(out, rc, bundle.library, bundle.sha256)
         missing = [e for e in expects if not re.search(e, out)]
-        if rc != 0 and v.kind == "sanitizer" and not missing:
+        # ASan/LSan exit non-zero (exitcode=23). The debug CRT dumps leaks at
+        # exit without touching the status, so there the failing result is
+        # the runner's sanitizer verdict alone, which fails any normal run.
+        exit_ok = rc != 0 or args.debug_crt
+        if exit_ok and v.kind == "sanitizer" and not missing:
             print(f"  ▶ arming {src.stem}: caught — {v.reason[:110]}")
         else:
             print(f"✗ arming {src.stem}: expected a sanitizer report matching {expects}; "
@@ -595,6 +615,9 @@ def main() -> int:
     ap.add_argument("--shadow-library", type=Path, help="a different libnet, for the shadowing control")
     ap.add_argument("--sanitize", action="store_true",
                     help="C5 Linux lane: build with ASan/UBSan, run with LSan and tests/c_abi/lsan.supp")
+    ap.add_argument("--debug-crt", action="store_true",
+                    help="C5 Windows lane: MSVC /MDd and the debug CRT's leak and heap checks "
+                    "(this program's own heap only)")
     ap.add_argument("--arming", action="store_true",
                     help="also run tests/c_abi/arming/*.c, each of which must be caught by the sanitizers")
     ap.add_argument("--self-test", action="store_true")
@@ -617,6 +640,8 @@ def main() -> int:
 
     if args.sanitize:
         work = work.parent / (work.name + "-sanitize")
+    if args.debug_crt:
+        work = work.parent / (work.name + "-debugcrt")
     failures = run_programs(args, bundle, compiler, work)
     if args.arming:
         failures += arming_runs(args, bundle, compiler, work)

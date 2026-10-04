@@ -3,6 +3,7 @@
  * libnet RETURNED is leaked. Not a consumer program; run only by
  * run-c-consumers.py --arming, which requires it to be caught.
  *
+ * NET-LANE: sanitize
  * NET-EXPECT: ERROR: LeakSanitizer: detected memory leaks
  * NET-EXPECT: Direct leak of 4093 byte\(s\) in 1 object\(s\)
  *

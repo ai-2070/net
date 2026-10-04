@@ -5360,6 +5360,18 @@ jobs:
           "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler gcc --sanitize --arming
           "$PY" .github/scripts/run-c-consumers.py --bundle "$HELPER_BUNDLE" --compiler gcc --sanitize
 
+      # C5, the Windows /MDd checker lane: every consumer program built
+      # against the debug CRT, which checks the heap periodically and dumps
+      # leaks at exit. Its domain is THIS program's own CRT allocations; the
+      # release net.dll keeps its own heap, which this lane does not see (and
+      # claims nothing about). Arming: a leaked 777-byte block and a write past
+      # the end of an allocation, each caught with its debug-CRT report.
+      - name: Consumers — debug CRT lane (MSVC /MDd)
+        if: runner.os == 'Windows'
+        run: |
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$PROD_BUNDLE" --compiler msvc --debug-crt --arming
+          "$PY" .github/scripts/run-c-consumers.py --bundle "$HELPER_BUNDLE" --compiler msvc --debug-crt
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

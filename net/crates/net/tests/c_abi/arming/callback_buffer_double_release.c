@@ -5,6 +5,7 @@
  * program; run only by run-c-consumers.py --arming, which requires it to be
  * caught.
  *
+ * NET-LANE: sanitize
  * NET-EXPECT: ERROR: AddressSanitizer: attempting double-free
  *
  * The callback adapter's fetch returns a malloc'd buffer and also keeps a

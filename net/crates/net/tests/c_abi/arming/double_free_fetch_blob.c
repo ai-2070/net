@@ -4,6 +4,7 @@
  * consumer program; run only by run-c-consumers.py --arming, which requires
  * it to be caught.
  *
+ * NET-LANE: sanitize
  * NET-EXPECT: ERROR: AddressSanitizer: attempting double-free
  *
  * A real net_fetch_blob output is passed to net_transport_free_buffer twice
