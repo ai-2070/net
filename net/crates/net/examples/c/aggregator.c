@@ -118,5 +118,8 @@ int main(void) {
     CHECK("teardown A", cu_opaque_teardown(a) == 0);
     CHECK("teardown B", cu_opaque_teardown(b) == 0);
     printf("NET-CHECKS: %d\n", checks);
+    /* LeakSanitizer reports at exit and leaves through _exit, which does not
+     * flush stdio: without this, the sanitizer lane sees no NET-CHECKS. */
+    fflush(stdout);
     return 0;
 }
