@@ -1,0 +1,42 @@
+# What the C consumer sanitizer lane accepts in a LeakSanitizer report (C SDK
+# plan, C5), read by run-c-consumers.py --sanitize.
+#
+# The runner parses every leak block LSan prints and classifies it here. It
+# does not use LSan suppressions: they match any frame of a stack, and the
+# handle tombstones below share `net_mesh_new` with a real leak of the node
+# itself (D-C5-1, now fixed), so a suppression could not tell them apart. A block that matches nothing here
+# fails the program. Each accepted class is printed on every run with its
+# blocks and bytes, so retained memory is reported, never hidden.
+#
+# Being reachable from a static is not a claim that teardown reclaims it;
+# nothing here claims that.
+
+# Intended. Each FFI handle's free drops its inner value and keeps the outer
+# box, so a call racing the free fails cleanly instead of touching freed
+# memory ("Box stays leaked. See super::handle_guard":
+# src/ffi/mesh.rs net_mesh_free, src/ffi/cortex.rs net_redex_free,
+# src/ffi/blob.rs net_mesh_blob_adapter_free; src/ffi/mesh.rs
+# net_mesh_stream_free; src/ffi/aggregator.rs net_registry_client_free). One
+# small direct block per freed handle, allocated by the handle's
+# constructor.
+[[direct]]
+name = "handle tombstone"
+constructors = ["net_mesh_new", "net_mesh_blob_adapter_new", "net_mesh_blob_adapter_new_v2", "net_redex_new",
+                "net_mesh_open_stream", "net_registry_client_new"]
+max_block_bytes = 64
+
+# The same keep-the-outer-box tombstone, larger because these handles carry
+# more in the box itself (src/ffi/redis_dedup.rs net_redis_dedup_free holds
+# its inner value inline; src/ffi/mesh.rs net_mesh_stream_inbox_free and
+# src/ffi/aggregator.rs net_fold_query_client_free).
+[[direct]]
+name = "handle tombstone, larger box"
+constructors = ["net_redis_dedup_new", "net_mesh_open_stream_inbox", "net_fold_query_client_new"]
+max_block_bytes = 128
+
+# No indirect leak is accepted. D-C5-1 (a MeshNode never reclaimed after
+# net_mesh_shutdown + net_mesh_free) was accepted here, in two named programs,
+# until its fix: nineteen FFI entry points cloned the handle's
+# ManuallyDrop<Arc<MeshNode>> wrapper instead of the Arc, leaking one strong
+# reference per call. Guarded by ffi::tests::no_clone_of_a_manually_drop_arc_field
+# and ffi::mesh::tests::node_reclaim_c_abi.

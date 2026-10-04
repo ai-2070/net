@@ -1,0 +1,45 @@
+# Authorized C-ABI breaks, checked by .github/scripts/check-c-abi.py (C1 check 7).
+#
+# The audit compares the shipped headers, header by header, with two kinds of
+# baseline:
+#   * the last release tag's headers (--baseline-ref, default v0.39.0);
+#   * pinned fixtures in tests/c_abi/fixtures/, `<header>.<label>.h`, which
+#     stand in for one header at a point between releases. The first one,
+#     net_cortex.pre1167.h, exists because v0.39.0 never declared the token
+#     waits: against the release alone, #1167's four-to-five-argument change
+#     would read as an addition.
+#
+# A removed or changed function, constant or struct fails, unless ONE entry
+# below names exactly its symbol, its old and new form (as the failure
+# prints them), and the release that ships it. An entry excuses only that
+# change: a second, unrelated removal in the same commit still fails. An
+# entry that matches no change fails too, so this list cannot outlive its
+# breaks.
+#
+# This file guards source compatibility. It cannot stop an old binary from
+# loading a library whose same-named function changed; the policy for that is
+# the matched pair (headers and library ship together, and a break means
+# rebuilding), recorded in the plan's "Compatibility boundary".
+#
+# Fields: symbol, old, new, release, reason (all required), baseline
+# (optional: the baseline name the change is against; omitted, it matches
+# any).
+
+# #1167: write tokens carry their channel, so both token waits take
+# (origin, channel, seq). Merged from master with this branch.
+
+[[break]]
+symbol = "net_tasks_wait_for_token"
+baseline = "pre1167"
+old = "fn(*net_tasks_adapter_t, u64, u64, u32) -> i32"
+new = "fn(*net_tasks_adapter_t, u64, u64, u64, u32) -> i32"
+release = "0.40.0"
+reason = "#1167: a token is (origin, channel, seq); callers rebuild"
+
+[[break]]
+symbol = "net_memories_wait_for_token"
+baseline = "pre1167"
+old = "fn(*net_memories_adapter_t, u64, u64, u32) -> i32"
+new = "fn(*net_memories_adapter_t, u64, u64, u64, u32) -> i32"
+release = "0.40.0"
+reason = "#1167: a token is (origin, channel, seq); callers rebuild"

@@ -283,6 +283,10 @@ func TestABIStabilityTransferCodes(t *testing.T) {
 		"NET_ERR_TRANSFER_NULL_POINTER":  ErrTransfer,
 		"NET_ERR_TRANSFER_SHUTTING_DOWN": ErrTransfer,
 		"NET_ERR_TRANSFER_PANIC":         ErrTransfer,
+		// Not in the transport band: the feature-off transport stubs return
+		// it, so net_transport.h declares it (guarded; net.go.h and
+		// net_cortex.h declare the same value).
+		"NET_ERR_FEATURE_NOT_BUILT": ErrFeatureNotBuilt,
 	}
 	h := parseHeader(t, "../net/crates/net/include/net_transport.h")
 	seen := 0
@@ -310,11 +314,6 @@ func TestABIStabilityTransferCodes(t *testing.T) {
 	}
 	if seen != len(want) {
 		t.Errorf("net_transport.h has %d NET_ERR_* constants, the pin table has %d", seen, len(want))
-	}
-	// NET_ERR_FEATURE_NOT_BUILT (-107) lives in net.h, not the transport
-	// band; the feature-off transport stubs return it.
-	if got := transferErrorFromInt(-107); !errors.Is(got, ErrFeatureNotBuilt) || !errors.Is(got, ErrTransfer) {
-		t.Errorf("-107 maps to %v, want ErrFeatureNotBuilt (and ErrTransfer)", got)
 	}
 }
 
@@ -481,6 +480,183 @@ func TestABIStabilityBlobOwnedRegistrationMatchesRust(t *testing.T) {
 	}
 }
 
+// TestABIStabilityHeadersDeclareReturnedCodes pins the return codes C1's
+// audit found declared nowhere (C_SDK_CONSUMER_VERIFICATION_PLAN.md) to the
+// headers Go compiles against. Each is declared in go/net.h or
+// go/net_cortex.h with the value the Rust FFI returns, and the blob band and
+// NET_ERR_FEATURE_NOT_BUILT map to their Go sentinels. Before, the whole
+// NET_ERR_BLOB_* band and the cortex read-your-writes codes existed only in
+// Rust and as bare numbers in Go, and header comments told C callers to
+// compare against names no header declared.
+func TestABIStabilityHeadersDeclareReturnedCodes(t *testing.T) {
+	requireCrateTree(t)
+	rust := map[string]string{}
+	re := regexp.MustCompile(`(?m)^\s*pub(?:\(crate\))? const (NET_ERR_\w+): c_int = (-?\d+);`)
+	for _, f := range []string{"blob.rs", "cortex.rs", "mesh.rs"} {
+		src, err := os.ReadFile("../net/crates/net/src/ffi/" + f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+			rust[m[1]] = m[2]
+		}
+	}
+	blob := map[string]error{
+		"NET_ERR_BLOB_DECODE":                 ErrBlobDecode,
+		"NET_ERR_BLOB_DUPLICATE_ID":           ErrBlobDuplicateID,
+		"NET_ERR_BLOB_NOT_REGISTERED":         ErrBlobNotRegistered,
+		"NET_ERR_BLOB_NOT_FOUND":              ErrBlobNotFound,
+		"NET_ERR_BLOB_HASH_MISMATCH":          ErrBlobHashMismatch,
+		"NET_ERR_BLOB_BACKEND":                ErrBlobBackend,
+		"NET_ERR_BLOB_UNSUPPORTED_SCHEME":     ErrBlobUnsupportedScheme,
+		"NET_ERR_BLOB_PANIC":                  ErrBlob,
+		"NET_ERR_BLOB_ADAPTER_NOT_CONFIGURED": ErrBlob,
+		"NET_ERR_BLOB_ADAPTER_NOT_REGISTERED": ErrBlobNotRegistered,
+		"NET_ERR_BLOB_UNAUTHORIZED":           ErrBlobUnauthorized,
+		"NET_ERR_BLOB_INVALID_ARGUMENT":       ErrBlobInvalidArgument,
+		"NET_ERR_FEATURE_NOT_BUILT":           ErrFeatureNotBuilt,
+	}
+	declared := map[string][]string{
+		"net.h": {"NET_ERR_GANG_INVALID"},
+		"net_cortex.h": {
+			"NET_ERR_TIMEOUT", "NET_ERR_STREAM_ENDED", "NET_ERR_WRONG_ORIGIN",
+			"NET_ERR_QUEUE_FULL", "NET_ERR_FOLD_STOPPED", "NET_ERR_FEATURE_NOT_BUILT",
+			"NET_ERR_PANIC", "NET_ERR_WRONG_CHANNEL",
+		},
+	}
+	for name := range blob {
+		declared["net.h"] = append(declared["net.h"], name)
+	}
+	for file, names := range declared {
+		h := parseHeader(t, file)
+		for _, name := range names {
+			got, ok := h.consts[name]
+			if !ok {
+				t.Errorf("go/%s does not declare %s", file, name)
+				continue
+			}
+			want, ok := rust[name]
+			if !ok {
+				t.Errorf("%s is declared in go/%s but defined in no src/ffi file read here", name, file)
+				continue
+			}
+			if got != want {
+				t.Errorf("%s is %s in go/%s but %s in Rust", name, got, file, want)
+			}
+			sentinel, ok := blob[name]
+			if !ok || file != "net.h" {
+				continue
+			}
+			code, err := strconv.Atoi(got)
+			if err != nil {
+				t.Fatalf("%s = %q is not an integer", name, got)
+			}
+			if err := blobRegistryErrorFromInt(code); !errors.Is(err, sentinel) || !errors.Is(err, ErrBlob) {
+				t.Errorf("%s (%d) maps to %v, want %v (and ErrBlob)", name, code, err, sentinel)
+			}
+		}
+	}
+}
+
+// TestABIStabilityObserverPreambleMatchesNetRpcHeader pins the nRPC call
+// observer Go declares in its own cgo preamble (go/mesh_rpc_typed.go) to the
+// declaration net_rpc.h now publishes for C consumers: the RpcCallEventC
+// fields in order, and the status / direction discriminants. Go does not
+// include net_rpc.h, so the two copies can drift; rustc's layout of the
+// struct is pinned separately by tests/c_abi/layout.json (C1 check 4).
+func TestABIStabilityObserverPreambleMatchesNetRpcHeader(t *testing.T) {
+	requireCrateTree(t)
+	header, err := os.ReadFile("../net/crates/net/include/net_rpc.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preamble, err := os.ReadFile("mesh_rpc_typed.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	structRe := regexp.MustCompile(`typedef\s+struct\s+RpcCallEventC\s*\{([^}]*)\}\s*RpcCallEventC\s*;`)
+	// The header's field lines carry comments; the preamble lives inside a Go
+	// block comment (that is what a cgo preamble is), so only the header is
+	// stripped.
+	fields := func(src []byte, what string, strip bool) []string {
+		body := string(src)
+		if strip {
+			body = blockCommentRe.ReplaceAllString(body, "")
+			body = lineCommentRe.ReplaceAllString(body, "")
+		}
+		m := structRe.FindStringSubmatch(body)
+		if m == nil {
+			t.Fatalf("%s declares no RpcCallEventC", what)
+		}
+		// Every field, pointers included: structFieldRe skips pointer
+		// fields, and this struct has two.
+		var out []string
+		for _, f := range strings.Split(m[1], ";") {
+			if f = whitespaceRe.ReplaceAllString(strings.TrimSpace(f), " "); f != "" {
+				out = append(out, strings.ReplaceAll(f, " *", "*"))
+			}
+		}
+		return out
+	}
+	h, g := fields(header, "net_rpc.h", true), fields(preamble, "go/mesh_rpc_typed.go", false)
+	if len(h) != 12 || strings.Join(h, ";") != strings.Join(g, ";") {
+		t.Errorf("RpcCallEventC fields differ:\n  net_rpc.h:             %v\n  go/mesh_rpc_typed.go:  %v", h, g)
+	}
+	consts := parseHeader(t, "../net/crates/net/include/net_rpc.h").consts
+	enumRe := regexp.MustCompile(`(NET_RPC_(?:STATUS|DIRECTION)_\w+)_C\s*=\s*(\d+)`)
+	seen := 0
+	for _, m := range enumRe.FindAllStringSubmatch(string(preamble), -1) {
+		seen++
+		if got, ok := consts[m[1]]; !ok || got != m[2] {
+			t.Errorf("Go's %s_C = %s, net_rpc.h's %s = %q (declared: %v)", m[1], m[2], m[1], got, ok)
+		}
+	}
+	if seen != 6 {
+		t.Errorf("found %d NET_RPC_STATUS/DIRECTION discriminants in the Go preamble, want 6", seen)
+	}
+}
+
+// TestABIStabilityMeshDbPayloadKindsMatchRust pins the envelope kinds of
+// net_meshdb_decode_payload_json_as (net_meshdb.h) to the Rust constants in
+// meshdb-ffi, and the declaration to its Rust signature's arity. The kind is
+// how a C caller decodes a composite row without guessing: the envelopes
+// carry no tag, and some byte strings are valid as more than one of them.
+func TestABIStabilityMeshDbPayloadKindsMatchRust(t *testing.T) {
+	requireCrateTree(t)
+	src, err := os.ReadFile("../net/crates/net/bindings/go/meshdb-ffi/src/lib.rs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`(?m)^pub const (NET_MESHDB_PAYLOAD_\w+): c_int = (-?\d+);`)
+	rust := map[string]string{}
+	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+		rust[m[1]] = m[2]
+	}
+	h := parseHeader(t, "../net/crates/net/include/net_meshdb.h")
+	for _, name := range []string{
+		"NET_MESHDB_PAYLOAD_AGGREGATE", "NET_MESHDB_PAYLOAD_JOINED", "NET_MESHDB_PAYLOAD_WINDOW",
+	} {
+		want, ok := rust[name]
+		if !ok {
+			t.Errorf("meshdb-ffi does not define %s", name)
+			continue
+		}
+		if got, ok := h.consts[name]; !ok || got != want {
+			t.Errorf("%s is %q in net_meshdb.h, %s in Rust", name, got, want)
+		}
+	}
+	params, ok := h.fns["net_meshdb_decode_payload_json_as"]
+	if !ok {
+		t.Fatal("net_meshdb.h does not declare net_meshdb_decode_payload_json_as")
+	}
+	if n := len(strings.Split(params, ",")); n != 3 {
+		t.Errorf("net_meshdb_decode_payload_json_as declares %d parameters (%s), Rust takes 3", n, params)
+	}
+	if !strings.Contains(string(src), "pub unsafe extern \"C\" fn net_meshdb_decode_payload_json_as(\n    kind: c_int,\n    payload: *const u8,\n    payload_len: usize,\n)") {
+		t.Error("meshdb-ffi's net_meshdb_decode_payload_json_as is not (kind: c_int, payload: *const u8, payload_len: usize)")
+	}
+}
+
 // TestABIStabilityWriteTokenCarriesTheChannel pins the channel-bound token
 // surface: both waits take (origin, channel, seq) plus the timeout, the
 // channel accessors exist with the Rust arity, and -160 is ErrWrongChannel.
@@ -535,10 +711,15 @@ func TestABIStabilityWriteTokenCarriesTheChannel(t *testing.T) {
 	if err := tokenErrorFromInt(-109); errors.Is(err, ErrWrongChannel) {
 		t.Error("code -109 (NET_ERR_MESH_STREAM_OCCUPIED) maps to ErrWrongChannel")
 	}
-	// No constant in any shared header may also be -160.
+	// net_cortex.h declares the code by name (the C SDK audit requires every
+	// returned code to be declared), and no other constant in a shared
+	// header may also be -160.
+	if got := parseHeader(t, "net_cortex.h").consts["NET_ERR_WRONG_CHANNEL"]; got != "-160" {
+		t.Errorf("go/net_cortex.h declares NET_ERR_WRONG_CHANNEL as %q, want -160", got)
+	}
 	for _, hdr := range []string{"net.h", "net_cortex.h"} {
 		for name, value := range parseHeader(t, hdr).consts {
-			if value == "-160" {
+			if value == "-160" && name != "NET_ERR_WRONG_CHANNEL" {
 				t.Errorf("%s defines %s = -160, colliding with NET_ERR_WRONG_CHANNEL", hdr, name)
 			}
 		}

@@ -85,3 +85,7 @@ net-meshdb-ffi = { version = "0.39.0", path = "../meshdb-ffi" }
 net-meshos-ffi = { version = "0.39.0", path = "../meshos-ffi" }
 net-org-ffi = { version = "0.39.0", path = "../org-ffi" }
 net-rpc-ffi = { version = "0.39.0", path = "../rpc-ffi" }
+
+[dev-dependencies]
+# tests/abi_layout.rs reads and writes the layout fixture.
+serde_json = "1"

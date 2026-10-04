@@ -265,9 +265,13 @@ const provider = createPaymentProvider(node, {
   statePath: 'state/engine.json',
   facilitatorUrl: 'https://facilitator.example.com',
 });
-const terms = await provider.pricingTerms(`${node.nodeId()}/net.a2a.task/summarize`, requirementsJson);
+const terms = await provider.pricingTerms(
+  `${node.nodeId()}/net.a2a.task/summarize`,
+  requirementsJson,
+);
 const handle = await provider.serveA2aConfigured(
-  async (brief) => runTheJob(brief),               // brief.service / brief.revision are set
+  // brief.service and brief.revision are set
+  async (brief) => runTheJob(brief),
   { summarize: { revision: 'r1', pricingTerms: terms,
                  bounds: { maxPromptBytes: 1024n, maxContextRefs: 8n, maxTags: 8n,
                            maxTagBytes: 64n, maxInFlight: 4n },

@@ -974,6 +974,49 @@ pub unsafe extern "C" fn net_meshdb_decode_payload_json(
     })
 }
 
+/// Envelope kind for [`net_meshdb_decode_payload_json_as`]: the row came
+/// from an aggregate operator (Count / Sum / Avg / Min / Max /
+/// DistinctCount / Percentile).
+pub const NET_MESHDB_PAYLOAD_AGGREGATE: c_int = 0;
+/// Envelope kind: the row came from a Join.
+pub const NET_MESHDB_PAYLOAD_JOINED: c_int = 1;
+/// Envelope kind: the row came from a Window.
+pub const NET_MESHDB_PAYLOAD_WINDOW: c_int = 2;
+
+/// Decode a result-row payload as the envelope `kind` names
+/// (`NET_MESHDB_PAYLOAD_*`): the composite operator the caller's query
+/// ends in. The envelopes carry no type tag, and some byte strings are
+/// valid as more than one of them, so the caller's knowledge of its own
+/// query is what makes the decode unambiguous (the Python and Node
+/// bindings decode the same way, by kind). Returns NULL for an unknown
+/// `kind`, a NULL or empty payload, or bytes that are not exactly one
+/// envelope of that kind. Free with `net_meshdb_free_string`.
+///
+/// # Safety
+/// `payload` must be a valid pointer to `payload_len` bytes
+/// (or null when `payload_len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn net_meshdb_decode_payload_json_as(
+    kind: c_int,
+    payload: *const u8,
+    payload_len: usize,
+) -> *mut std::ffi::c_char {
+    ffi_guard!(ptr::null_mut(), {
+        if payload_len == 0 || payload.is_null() || payload_len > isize::MAX as usize {
+            return ptr::null_mut();
+        }
+        let bytes = slice::from_raw_parts(payload, payload_len);
+        let json = match decode_as(kind, bytes) {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
+        match std::ffi::CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    })
+}
+
 /// Free a string returned by `net_meshdb_decode_payload_json`.
 ///
 /// # Safety
@@ -988,20 +1031,50 @@ pub unsafe extern "C" fn net_meshdb_free_string(s: *mut std::ffi::c_char) {
     })
 }
 
-fn decode_to_json(bytes: &[u8]) -> Option<String> {
+/// `bytes` as exactly one envelope of `kind`. A type counts only if it
+/// consumes EVERY byte: `postcard::from_bytes` accepts any valid prefix and
+/// ignores the rest, which let a window boundary whose bytes began like an
+/// aggregate (`start = 0`, a one-row bucket) decode as an `avg` aggregate
+/// with a denormal garbage value. The C consumer meshdb.c found it.
+fn decode_as(kind: c_int, bytes: &[u8]) -> Option<String> {
     use net::adapter::net::behavior::meshdb::query::{
         AggregateRowPayload, JoinedRowPayload, WindowBoundary,
     };
-    if let Ok(p) = postcard::from_bytes::<AggregateRowPayload>(bytes) {
-        return Some(aggregate_to_json(&p));
+    macro_rules! whole {
+        ($ty:ty, $to_json:ident) => {
+            match postcard::take_from_bytes::<$ty>(bytes) {
+                Ok((p, rest)) if rest.is_empty() => Some($to_json(&p)),
+                _ => None,
+            }
+        };
     }
-    if let Ok(p) = postcard::from_bytes::<JoinedRowPayload>(bytes) {
-        return Some(joined_to_json(&p));
+    match kind {
+        NET_MESHDB_PAYLOAD_AGGREGATE => whole!(AggregateRowPayload, aggregate_to_json),
+        NET_MESHDB_PAYLOAD_JOINED => whole!(JoinedRowPayload, joined_to_json),
+        NET_MESHDB_PAYLOAD_WINDOW => whole!(WindowBoundary, window_to_json),
+        _ => None,
     }
-    if let Ok(p) = postcard::from_bytes::<WindowBoundary>(bytes) {
-        return Some(window_to_json(&p));
+}
+
+/// The untagged decode: the envelope the bytes are, if they are exactly
+/// one. Consuming every byte is not enough on its own: some byte strings
+/// are valid as more than one envelope (a window with no rows is also a
+/// whole aggregate), and picking the first that parses returned wrong
+/// JSON for them. An ambiguous payload decodes to nothing, so the caller
+/// learns to name the kind (`net_meshdb_decode_payload_json_as`) instead
+/// of being handed the wrong one.
+fn decode_to_json(bytes: &[u8]) -> Option<String> {
+    let mut found = [
+        NET_MESHDB_PAYLOAD_AGGREGATE,
+        NET_MESHDB_PAYLOAD_JOINED,
+        NET_MESHDB_PAYLOAD_WINDOW,
+    ]
+    .into_iter()
+    .filter_map(|kind| decode_as(kind, bytes));
+    match (found.next(), found.next()) {
+        (Some(json), None) => Some(json),
+        _ => None,
     }
-    None
 }
 
 fn row_to_json_value(r: &ResultRow) -> String {
@@ -1873,6 +1946,100 @@ mod tests {
             net_meshdb_runner_free(runner);
             net_meshdb_reader_free(reader);
         }
+    }
+
+    /// A one-row bucket starting at seq 0 is a valid PREFIX of an
+    /// `AggregateRowPayload`; the decoder used to take the first type that
+    /// parsed a prefix and reported this window as an `avg` aggregate with
+    /// a denormal value (found by the C consumer meshdb.c). Every envelope
+    /// type must consume the whole payload.
+    #[test]
+    fn a_window_that_prefixes_as_an_aggregate_decodes_as_a_window() {
+        use net::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, ResultRow, SeqNum, WindowBoundary,
+        };
+        let boundary = WindowBoundary {
+            start: SeqNum(0),
+            end: SeqNum(2),
+            rows: vec![ResultRow {
+                origin: 0xAB,
+                seq: SeqNum(1),
+                payload: br#"{"v":10}"#.to_vec(),
+            }],
+        };
+        let bytes = postcard::to_allocvec(&boundary).unwrap();
+        // The precondition that made the old decoder wrong.
+        assert!(
+            postcard::from_bytes::<AggregateRowPayload>(&bytes).is_ok(),
+            "this payload must still prefix-parse as an aggregate, or the test proves nothing"
+        );
+        let json = decode_to_json(&bytes).expect("a window boundary decodes");
+        assert!(
+            json.starts_with(r#"{"kind":"window","start":0,"end":2,"#),
+            "got: {json}"
+        );
+    }
+
+    /// Consuming every byte does not make the untagged envelopes
+    /// unambiguous: some windows are also whole aggregates. The untagged
+    /// decoder refuses such a payload rather than guess, and the kind-aware
+    /// decoder reads it as the kind its caller names.
+    #[test]
+    fn an_ambiguous_payload_is_refused_untagged_and_decoded_by_kind() {
+        use net::adapter::net::behavior::meshdb::query::{
+            AggregateRowPayload, SeqNum, WindowBoundary,
+        };
+        let ambiguous = (0..8u64)
+            .flat_map(|start| (start..start + 8).map(move |end| (start, end)))
+            .map(|(start, end)| {
+                postcard::to_allocvec(&WindowBoundary {
+                    start: SeqNum(start),
+                    end: SeqNum(end),
+                    rows: vec![],
+                })
+                .unwrap()
+            })
+            .find(|bytes| {
+                matches!(
+                    postcard::take_from_bytes::<AggregateRowPayload>(bytes),
+                    Ok((_, rest)) if rest.is_empty()
+                )
+            })
+            .expect(
+                "some empty window must also be a whole aggregate, or this test proves nothing",
+            );
+        assert_eq!(
+            decode_to_json(&ambiguous),
+            None,
+            "an ambiguous payload must not be guessed"
+        );
+        let window = decode_as(NET_MESHDB_PAYLOAD_WINDOW, &ambiguous).expect("decodes as a window");
+        assert!(window.starts_with(r#"{"kind":"window","#), "got: {window}");
+        let aggregate =
+            decode_as(NET_MESHDB_PAYLOAD_AGGREGATE, &ambiguous).expect("and as an aggregate");
+        assert!(
+            aggregate.starts_with(r#"{"kind":"aggregate","#),
+            "got: {aggregate}"
+        );
+        assert_eq!(decode_as(NET_MESHDB_PAYLOAD_JOINED, &ambiguous), None);
+        assert_eq!(
+            decode_as(99, &ambiguous),
+            None,
+            "an unknown kind decodes nothing"
+        );
+        let c = unsafe {
+            net_meshdb_decode_payload_json_as(
+                NET_MESHDB_PAYLOAD_WINDOW,
+                ambiguous.as_ptr(),
+                ambiguous.len(),
+            )
+        };
+        assert!(!c.is_null());
+        unsafe { net_meshdb_free_string(c) };
+        assert!(unsafe {
+            net_meshdb_decode_payload_json_as(NET_MESHDB_PAYLOAD_WINDOW, std::ptr::null(), 0)
+        }
+        .is_null());
     }
 
     #[test]

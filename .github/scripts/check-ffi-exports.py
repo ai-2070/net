@@ -226,7 +226,12 @@ def report(added: list[str], removed: list[str], artifact: str) -> bool:
     return False
 
 
-def write_baseline(path: Path, names: set[str], artifact: Path, pin: str | None) -> None:
+HELPER_RECIPE = "cargo build --release -p net-ffi --features net-ffi/test-helpers"
+
+
+def write_baseline(
+    path: Path, names: set[str], artifact: Path, pin: str | None, recipe: str = HELPER_RECIPE
+) -> None:
     sha = "unknown"
     try:
         sha = _run(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).strip()
@@ -250,11 +255,11 @@ def write_baseline(path: Path, names: set[str], artifact: Path, pin: str | None)
         f"# generated-at: {sha}",
         *( [f"# pinned-to: {pin} (net/ identical between pin and generated-at)"] if pin else [] ),
         f"# artifact: {artifact.name} ({_magic(artifact)}, {platform.system()} {platform.machine()})",
-        "# build: cargo build --release -p net-ffi --features net-ffi/test-helpers",
+        f"# build: {recipe}",
         f"# count: {len(names)}",
     ]
     path.write_text("\n".join(header + sorted(names)) + "\n", encoding="utf-8")
-    print(f"✓ wrote {path.relative_to(ROOT)} ({len(names)} exports) at {sha[:9]}")
+    print(f"✓ wrote {path.resolve().relative_to(ROOT)} ({len(names)} exports) at {sha[:9]}")
 
 
 def self_test(baseline_path: Path) -> int:
@@ -330,10 +335,24 @@ def main() -> int:
     ap.add_argument("--update", action="store_true", help="rewrite the baseline from the artifact")
     ap.add_argument("--pin", help="with --update: record this SHA as the baseline's pin; refused if net/ differs from HEAD")
     ap.add_argument("--self-test", action="store_true", help="plant an added and a removed export and require rejection")
+    ap.add_argument(
+        "--build",
+        default=HELPER_RECIPE,
+        help="with --update: the cargo command that built --artifact, recorded in the "
+        "baseline header (default: the test-helpers build; the shipped baseline "
+        "passes the default-feature command)",
+    )
     args = ap.parse_args()
 
     if args.self_test:
         return self_test(args.baseline)
+    # The shipped baseline is built WITHOUT the test helpers; its header must
+    # not record the helper recipe by default.
+    if args.update and "shipped" in Path(args.baseline).name and not any(
+            a == "--build" or a.startswith("--build=") for a in sys.argv[1:]):
+        print("✗ --update of the shipped baseline needs --build naming the command that built "
+              "--artifact (the default is the test-helpers recipe)")
+        return 2
 
     artifact = args.artifact or next((c for c in CANDIDATES if c.exists()), None)
     if artifact is None or not artifact.exists():
@@ -377,7 +396,7 @@ def main() -> int:
     )
 
     if args.update:
-        write_baseline(args.baseline, current, artifact, args.pin)
+        write_baseline(args.baseline, current, artifact, args.pin, args.build)
         return 0
 
     if not args.baseline.exists():

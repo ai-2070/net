@@ -20,6 +20,11 @@
 #           carry one; negative cells must not. An anchor proves a symbol
 #           exists, NOT that the operation is supported — the status is
 #           editorial, the anchor is its evidence.
+# evidence  C cells only: the C programs CI runs that call the anchor (a
+#           consumer program in net/crates/net/examples/c/, or a skill example
+#           docs/data/examples.yaml runs). A `supported` C cell needs one.
+# gap       C cells only: what no C program exercises yet. A positive C cell
+#           with no evidence is `partial` and states its gap.
 #
 # NOT YET POPULATED: `reason` and `alternative` per negative cell, which D5's
 # generated absence state needs. Until Phase 3/4 renders that state, the prose
@@ -49,6 +54,9 @@ operations:
       status: supported
       mode: poll
       anchor: net_ingest_raw
+      evidence:
+      - .claude/skills/net-event-bus/examples/hello.c
+      - .claude/skills/net-event-bus/examples/observe.c
 - operation: Consumer-side filter DSL
   bindings:
     Rust:
@@ -65,6 +73,8 @@ operations:
     C:
       status: supported
       anchor: net_predicate_evaluate
+      evidence:
+      - net/crates/net/examples/c/capabilities.c
 - operation: Distributed mesh channels — register / subscribe / publish
   bindings:
     Rust:
@@ -82,6 +92,8 @@ operations:
     C:
       status: supported
       anchor: net_mesh_subscribe_channel_with_token
+      evidence:
+      - .claude/skills/net-event-bus/examples/tokenchannel.c
 - operation: Tagged EventBus topics (node.channel)
   bindings:
     Rust:
@@ -175,6 +187,9 @@ operations:
     C:
       status: supported
       anchor: net_mesh_register_channel
+      evidence:
+      - .claude/skills/net-event-bus/examples/liveconfig.c
+      - .claude/skills/net-event-bus/examples/tokenchannel.c
 - operation: Distributed batch fan-out (publish_many)
   bindings:
     Rust:
@@ -205,6 +220,7 @@ operations:
     C:
       status: partial
       anchor: NET_ERR_CHANNEL_AUTH
+      gap: 'No C program CI runs checks for this code. Partial regardless: C maps every rejection reason except unauthorized to NET_ERR_CHANNEL.'
 - operation: Permissive channel registry (opt out of strict default)
   bindings:
     Rust:
@@ -236,6 +252,8 @@ operations:
     C:
       status: supported
       anchor: net_mesh_open_stream
+      evidence:
+      - net/crates/net/examples/c/streams.c
 - operation: Capability announce
   bindings:
     Rust:
@@ -253,6 +271,8 @@ operations:
     C:
       status: supported
       anchor: net_mesh_announce_capabilities
+      evidence:
+      - .claude/skills/net-event-bus/examples/registry.c
 - operation: Capability discovery
   bindings:
     Rust:
@@ -270,6 +290,8 @@ operations:
     C:
       status: supported
       anchor: net_mesh_find_best_node
+      evidence:
+      - .claude/skills/net-event-bus/examples/registry.c
 - operation: nRPC — typed request/response + streaming
   bindings:
     Rust:
@@ -287,6 +309,9 @@ operations:
     C:
       status: supported
       anchor: net_rpc_call
+      evidence:
+      - net/crates/net/examples/c/rpc_callbacks.c
+      - .claude/skills/net-event-bus/examples/jobqueue.c
 - operation: Gang-claim scheduler
   bindings:
     Rust:
@@ -304,6 +329,8 @@ operations:
     C:
       status: supported
       anchor: net_mesh_claim_island
+      evidence:
+      - net/crates/net/examples/c/islands.c
 - operation: A2A — agent task handoff
   bindings:
     Rust:
@@ -351,6 +378,8 @@ operations:
     C:
       status: supported
       anchor: net_org_call
+      evidence:
+      - net/crates/net/examples/c/org_call.c
 # The streaming half of the org surface, recorded separately from the unary row
 # above because the anchors are disjoint: a binding can have `serve_org` and no
 # streaming verb (a frozen pre-streaming provider), which is exactly the
@@ -372,6 +401,8 @@ operations:
     C:
       status: supported
       anchor: net_org_call_streaming
+      evidence:
+      - .claude/skills/net-event-bus/examples/net_org_streaming.c
 - operation: Subnet gateway provisioning
   bindings:
     Rust:
@@ -389,6 +420,8 @@ operations:
     C:
       status: supported
       anchor: net_subnet_install_gateway_credentials
+      evidence:
+      - net/crates/net/examples/c/subnet.c
 - operation: Subnet-exported nRPC serve
   bindings:
     Rust:
@@ -406,6 +439,8 @@ operations:
     C:
       status: supported
       anchor: net_subnet_serve_exported
+      evidence:
+      - net/crates/net/examples/c/subnet.c
 - operation: Subnet-exported organization call
   bindings:
     Rust:
@@ -423,6 +458,8 @@ operations:
     C:
       status: supported
       anchor: net_org_call_exported
+      evidence:
+      - net/crates/net/examples/c/subnet.c
 - operation: MCP bridge
   bindings:
     Rust:
@@ -440,6 +477,8 @@ operations:
     C:
       status: supported
       anchor: net_mcp_classify
+      evidence:
+      - net/crates/net/examples/c/mcp.c
 - operation: Dataforts — blobs
   bindings:
     Rust:
@@ -457,6 +496,9 @@ operations:
     C:
       status: supported
       anchor: net_fetch_blob
+      evidence:
+      - net/crates/net/examples/c/transfer.c
+      - .claude/skills/net-event-bus/examples/objectstore.c
 - operation: RedEX — durable log
   bindings:
     Rust:
@@ -474,6 +516,9 @@ operations:
     C:
       status: supported
       anchor: net_redex_file_append
+      evidence:
+      - .claude/skills/net-event-bus/examples/eventlog.c
+      - .claude/skills/net-event-bus/examples/jobqueue.c
 - operation: CortEX folds / NetDB
   bindings:
     Rust:
@@ -489,8 +534,11 @@ operations:
       status: supported
       anchor: OpenNetDb
     C:
-      status: supported
+      status: partial
       anchor: net_fold_query_client_query_latest
+      evidence:
+      - net/crates/net/examples/c/aggregator.c
+      gap: 'The fold-query and registry clients are client-side only, and serving them is the aggregator daemon''s job, which no C program can stand up. aggregator.c checks their error contract against a peer that serves neither; a successful query is not exercised from C.'
 - operation: MeshDB — federated queries
   bindings:
     Rust:
@@ -508,6 +556,8 @@ operations:
     C:
       status: supported
       anchor: net_meshdb_decode_payload_json
+      evidence:
+      - net/crates/net/examples/c/meshdb.c
 - operation: Compute / groups / daemons
   bindings:
     Rust:
@@ -525,6 +575,8 @@ operations:
     C:
       status: supported
       anchor: net_compute_fork_group_fork_count
+      evidence:
+      - net/crates/net/examples/c/compute.c
 - operation: Deck — operator surface
   bindings:
     Rust:
@@ -540,8 +592,11 @@ operations:
       status: supported
       anchor: Deck
     C:
-      status: supported
+      status: partial
       anchor: net_deck_admin_cordon
+      evidence:
+      - net/crates/net/examples/c/deck.c
+      gap: 'A C deck client attaches no operator registry (net_deck_client_new takes none), so a signed ICE commit takes the unsigned admin path: it is neither verified nor attributed to its signers.'
 - operation: Redis Streams dedup
   bindings:
     Rust:
@@ -560,3 +615,5 @@ operations:
     C:
       status: supported
       anchor: net_redis_dedup_new
+      evidence:
+      - net/crates/net/examples/c/redis_dedup.c

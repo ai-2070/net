@@ -105,10 +105,10 @@ A mode is written after the status: `supported · core-only`.
 | MCP bridge | supported | supported | supported | supported | supported |
 | Dataforts — blobs | supported | supported | supported | supported | supported |
 | RedEX — durable log | supported | supported | supported | supported | supported |
-| CortEX folds / NetDB | supported | supported | supported | supported | supported |
+| CortEX folds / NetDB | supported | supported | supported | supported | partial |
 | MeshDB — federated queries | supported | supported | supported | supported | supported |
 | Compute / groups / daemons | supported | supported | supported | supported | supported |
-| Deck — operator surface | supported | supported | supported | supported | supported |
+| Deck — operator surface | supported | supported | supported | supported | partial |
 | Redis Streams dedup | supported | supported | supported · core-only | supported | supported |
 
 ## Evidence
@@ -154,6 +154,43 @@ should not infer one binding's API from another's.
 | Compute / groups / daemons | `groups` | `groups` | `daemon_count` | `Groups` | `net_compute_fork_group_fork_count` |
 | Deck — operator surface | `deck` | `deck` | `deck` | `Deck` | `net_deck_admin_cordon` |
 | Redis Streams dedup | `RedisStreamDedup` | `RedisStreamDedup` | `RedisStreamDedup` | `RedisStreamDedup` | `net_redis_dedup_new` |
+
+### C evidence: a program CI runs, not just a symbol
+
+C has no binding test suite, so its evidence is the C programs CI runs: the
+consumer programs in `net/crates/net/examples/c/` (run against the staged C
+SDK bundle in every compatibility and checker lane) and the C skill examples
+in this skill's `examples/`. A `supported` C cell names one that **calls** its
+anchor. A cell no C program exercises is `partial`, with what is missing. The
+per-function record behind this is `net/crates/net/tests/c_abi/SURFACE.md`.
+
+<!-- coverage:c-evidence -->
+
+| Operation | C status | Run by CI | Not yet exercised from C |
+|---|---|---|---|
+| Event bus — ingest + poll | supported | `hello.c`, `observe.c` | — |
+| Consumer-side filter DSL | supported | `capabilities.c` | — |
+| Distributed mesh channels — register / subscribe / publish | supported | `tokenchannel.c` | — |
+| Channel token roots (require_token anchoring) | supported | `liveconfig.c`, `tokenchannel.c` | — |
+| Membership rejection reason (AckReason taxonomy) | partial | — | No C program CI runs checks for this code. Partial regardless: C maps every rejection reason except unauthorized to NET_ERR_CHANNEL. |
+| Mesh streams | supported | `streams.c` | — |
+| Capability announce | supported | `registry.c` | — |
+| Capability discovery | supported | `registry.c` | — |
+| nRPC — typed request/response + streaming | supported | `rpc_callbacks.c`, `jobqueue.c` | — |
+| Gang-claim scheduler | supported | `islands.c` | — |
+| Organization capability auth | supported | `org_call.c` | — |
+| Organization-scoped streaming RPC | supported | `net_org_streaming.c` | — |
+| Subnet gateway provisioning | supported | `subnet.c` | — |
+| Subnet-exported nRPC serve | supported | `subnet.c` | — |
+| Subnet-exported organization call | supported | `subnet.c` | — |
+| MCP bridge | supported | `mcp.c` | — |
+| Dataforts — blobs | supported | `transfer.c`, `objectstore.c` | — |
+| RedEX — durable log | supported | `eventlog.c`, `jobqueue.c` | — |
+| CortEX folds / NetDB | partial | `aggregator.c` | The fold-query and registry clients are client-side only, and serving them is the aggregator daemon's job, which no C program can stand up. aggregator.c checks their error contract against a peer that serves neither; a successful query is not exercised from C. |
+| MeshDB — federated queries | supported | `meshdb.c` | — |
+| Compute / groups / daemons | supported | `compute.c` | — |
+| Deck — operator surface | partial | `deck.c` | A C deck client attaches no operator registry (net_deck_client_new takes none), so a signed ICE commit takes the unsigned admin path: it is neither verified nor attributed to its signers. |
+| Redis Streams dedup | supported | `redis_dedup.c` | — |
 
 ## Why the negative cells are negative
 
@@ -300,7 +337,8 @@ handle you construct first (`NewTypedMeshRpc` in Go), and C goes through
 ## What CI proves here, precisely
 
 Every anchor above resolves in its binding's tree, and the status vocabulary is
-closed. That is all.
+closed. For C, one thing more: every positive C cell names a C program CI runs
+that calls its anchor, or is `partial` and says what is missing.
 
 It does **not** prove `supported`. And it deliberately does not infer absence,
 because a missing symbol is weak evidence: a binding may alias, project under

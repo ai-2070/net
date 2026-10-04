@@ -400,6 +400,10 @@ typedef struct net_registry_client_handle_t net_registry_client_handle_t;
 #define NET_REGISTRY_ERR_SPAWN_REJECTED       5
 #define NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED  6
 #define NET_REGISTRY_ERR_UNKNOWN_KIND         7
+#define NET_REGISTRY_ERR_UNKNOWN_GROUP        8
+#define NET_REGISTRY_ERR_SCALE_REJECTED       9
+#define NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED  10
+#define NET_REGISTRY_ERR_UNAUTHORIZED         11
 #define NET_REGISTRY_ERR_INVALID_ARGS         99
 
 /* Visibility discriminants, mirroring the substrate's `Visibility` enum.

@@ -40,8 +40,10 @@ introduces an ABI change of its own is not detected. A constant whose homes
 grow beyond the file lists above needs those lists extended in the same
 commit.
 
-RANGE. `--range A..B` (default `HEAD^..HEAD`); in CI the step passes the
-push's `before..sha`. When the base is unresolvable (a new branch or a
+RANGE. `--range A..B` (default `HEAD^..HEAD`); in CI the step passes
+`merge-base(origin/master, sha)..sha` on a branch (a newer push cancels the
+older run, so a per-push range would skip the cancelled push's commits) and
+the push's `before..sha` on master. When the base is unresolvable (a new branch or a
 force push) the guard checks the tip commit and says so — an unevaluable
 base must not silently retire the check.
 
@@ -65,14 +67,31 @@ RUST_FFI_PREFIXES = (
     "net/crates/net/bindings/go/net-ffi/",
 )
 C_HEADER_PREFIX = "net/crates/net/include/"
+# The C headers that have a Go mirror header (go/net.h, go/net_cortex.h).
+MIRRORED_HEADERS = {
+    "net/crates/net/include/net.go.h",
+    "net/crates/net/include/net_cortex.h",
+}
 GO_HEADER_RE = re.compile(r"^go/[^/]+\.h$")
 GO_ABI_TEST_RE = re.compile(r"^go/(abi_stability.*|header_parity)_test\.go$")
 
 _RUST_CONST = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+(NET_[A-Z0-9_]+)\b"
 )
-_C_DEFINE = re.compile(r"^\s*#\s*define\s+(NET_[A-Z0-9_]+)\b")
+# A `#define` that carries a value (or is function-like). A bare
+# `#define NET_X_H` is an include guard or a flag: it has no ABI value to
+# drift, and a new header's guard must not demand an ABI-change commit; a
+# trailing comment (`#define NET_X_H /* guard */`) is not a value either.
+_C_DEFINE = re.compile(r"^\s*#\s*define\s+(NET_[A-Z0-9_]+)(?:\(|[ \t]+(?!/[/*])\S)")
 _C_ENUM = re.compile(r"^\s*(NET_[A-Z0-9_]+)\s*=")
+# C definitions live in headers and C sources, and ALSO in Go cgo preambles
+# (go/aggregator.go defines NET_REGISTRY_* there): `.go` is scanned for the
+# C patterns. Rust constants stay `.rs`-only.
+_CONST_PATTERNS = (
+    (_RUST_CONST, (".rs",)),
+    (_C_DEFINE, (".h", ".c", ".go")),
+    (_C_ENUM, (".h", ".c", ".go")),
+)
 _EXTERN_C = re.compile(r'\bextern\s+"C"')
 _EXTERN_C_BLOCK = re.compile(r'\bextern\s+"C"\s*\{\s*$')
 _COMMENT_LINE = re.compile(r"^\s*(?://|/\*|\*)")
@@ -202,7 +221,12 @@ def diff_changes(
         body = line[1:]
         if _COMMENT_LINE.match(body):
             continue
-        for rx in (_RUST_CONST, _C_DEFINE, _C_ENUM):
+        # Each pattern only in the language it describes: a `#define` line
+        # inside a Python string (a checker's self-test) or a Markdown code
+        # block is not an ABI constant.
+        for rx, exts in _CONST_PATTERNS:
+            if not current.endswith(exts):
+                continue
             m = rx.match(body)
             if m:
                 consts.add(m.group(1))
@@ -217,8 +241,20 @@ def diff_changes(
     return files, consts, extern_c
 
 
-def violations(consts: set[str], extern_c: bool, touched: set[str]) -> list[str]:
-    """Rule verdict for one commit; empty means it landed atomically."""
+def violations(
+    consts: set[str],
+    extern_c: bool,
+    touched: set[str],
+    mirrored: set[str] | None = None,
+) -> list[str]:
+    """Rule verdict for one commit; empty means it landed atomically.
+
+    `mirrored` names the constants a mirrored header (net.go.h,
+    net_cortex.h) declares before or after the commit. A changed constant
+    in that set needs its Go mirror whatever other headers the commit
+    touched. `None` (synthetic diffs) means no constant is known to be
+    mirrored.
+    """
     if not consts and not extern_c:
         return []
     groups = {
@@ -229,6 +265,23 @@ def violations(consts: set[str], extern_c: bool, touched: set[str]) -> list[str]
         "go_headers": any(bool(GO_HEADER_RE.match(f)) for f in touched),
         "go_tests": any(bool(GO_ABI_TEST_RE.match(f)) for f in touched),
     }
+    # Only net.go.h and net_cortex.h have Go mirror headers. A change whose C
+    # side is confined to other headers (net_rpc.h, net_org.h, ...) has no
+    # mirror to touch; Go keeps those surfaces in cgo preambles, which the Go
+    # ABI test group covers. A change touching no header at all still needs
+    # every group. The waiver is decided by where each changed constant is
+    # declared, not only by which files the commit touched: a mirrored
+    # constant (NET_ERR_MESH_INIT, in net.go.h) changed beside an incidental
+    # net_rpc.h edit still needs go/net.h.
+    headers_touched = {
+        f for f in touched if f.startswith(C_HEADER_PREFIX) and f.endswith(".h")
+    }
+    if (
+        headers_touched
+        and not headers_touched & MIRRORED_HEADERS
+        and not consts & (mirrored or set())
+    ):
+        groups["go_headers"] = True
     missing = [label for key, label in _GROUP_LABELS.items() if not groups[key]]
     if not missing:
         return []
@@ -275,6 +328,26 @@ def ffi_sources(sha: str, patch: str) -> dict[str, tuple[str | None, str | None]
         if path and path.endswith(".rs") and path.startswith(RUST_FFI_PREFIXES):
             out[path] = (_show_at(f"{sha}^", path), _show_at(sha, path))
     return out
+
+
+def mirrored_consts(sha: str) -> set[str]:
+    """Every `NET_*` constant a mirrored header declares at `sha` or `sha^`.
+
+    Both sides: a constant the commit removes from net.go.h was mirrored,
+    and so was one it adds there.
+    """
+    names: set[str] = set()
+    for rev in (f"{sha}^", sha):
+        for path in sorted(MIRRORED_HEADERS):
+            text = _show_at(rev, path)
+            if text is None:
+                continue
+            for line in text.splitlines():
+                for rx in (_C_DEFINE, _C_ENUM):
+                    m = rx.match(line)
+                    if m:
+                        names.add(m.group(1))
+    return names
 
 
 def default_range() -> str:
@@ -332,7 +405,9 @@ def main() -> int:
             _error(f"could not read commit {sha}: {exc}")
             return 1
         files, consts, extern_c = diff_changes(patch, ffi_sources(sha, patch))
-        problems = violations(consts, extern_c, files)
+        problems = violations(
+            consts, extern_c, files, mirrored_consts(sha) if consts else None
+        )
         if problems:
             failed = 1
             _error(f"commit {sha[:9]} breaks the ABI one-commit rule", *problems)
@@ -383,6 +458,29 @@ def self_test() -> int:
         "both headers without a Go ABI test still violates",
         violations(consts, extern_c, both_headers) != [],
     )
+    unmirrored = files | {"net/crates/net/include/net_rpc.h", "go/abi_stability_test.go"}
+    expect(
+        "a change confined to an unmirrored header (net_rpc.h) needs no Go mirror header",
+        violations(consts, extern_c, unmirrored) == [],
+    )
+    expect(
+        "a MIRRORED constant changed beside an unmirrored header still needs its Go mirror",
+        violations(consts, extern_c, unmirrored, {"NET_ERR_FOO"}) != []
+        and violations(
+            consts, extern_c, unmirrored | {"go/net.h"}, {"NET_ERR_FOO"}
+        ) == [],
+    )
+    expect(
+        "the same change without its Go ABI test still violates",
+        violations(consts, extern_c, files | {"net/crates/net/include/net_rpc.h"}) != [],
+    )
+    expect(
+        "a mirrored header (net.go.h) without go/net.h still violates",
+        violations(
+            consts, extern_c,
+            files | {"net/crates/net/include/net.go.h", "go/abi_stability_test.go"},
+        ) != [],
+    )
     expect(
         "all four groups landing together passes",
         violations(
@@ -402,6 +500,50 @@ def self_test() -> int:
     )
     _, consts, extern_c = diff_changes(define)
     expect("a changed #define is detected", consts == {"NET_STREAM_TIMEOUT"})
+
+    guard = (
+        "--- /dev/null\n"
+        "+++ b/net/crates/net/tests/c_abi/helpers/net_demo.h\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+#ifndef NET_DEMO_H\n"
+        "+#define NET_DEMO_H\n"
+        "+#define NET_DEMO_MAX(a, b) ((a) > (b) ? (a) : (b))\n"
+    )
+    _, consts, _ = diff_changes(guard)
+    expect(
+        "an include guard (#define with no value) does not trigger; a function-like macro does",
+        consts == {"NET_DEMO_MAX"},
+    )
+
+    commented_guard = (
+        "--- /dev/null\n"
+        "+++ b/net/crates/net/include/net_demo2.h\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+#define NET_DEMO2_H /* include guard */\n"
+        "+#define NET_DEMO2_H2 // also a guard\n"
+    )
+    _, consts, _ = diff_changes(commented_guard)
+    expect("an include guard with a trailing comment does not trigger", consts == set())
+
+    cgo = (
+        "--- a/go/aggregator.go\n"
+        "+++ b/go/aggregator.go\n"
+        "@@ -1 +1 @@\n"
+        "-#define NET_REGISTRY_ERR_CODEC                2\n"
+        "+#define NET_REGISTRY_ERR_CODEC                3\n"
+    )
+    _, consts, _ = diff_changes(cgo)
+    expect("a #define in a Go cgo preamble is detected", consts == {"NET_REGISTRY_ERR_CODEC"})
+
+    in_python = (
+        "--- a/.github/scripts/check-demo.py\n"
+        "+++ b/.github/scripts/check-demo.py\n"
+        "@@ -1 +1,2 @@\n"
+        ' _HEADER = """\n'
+        "+#define NET_DEMO_OK 0\n"
+    )
+    _, consts, _ = diff_changes(in_python)
+    expect("a #define line inside a Python file does not trigger", consts == set())
 
     enum = (
         "--- a/net/crates/net/include/net.go.h\n"

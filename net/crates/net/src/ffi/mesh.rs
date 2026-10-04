@@ -1023,7 +1023,7 @@ pub unsafe extern "C" fn net_mesh_connect(
         Err(code) => return code,
     };
 
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move { node.connect(addr, &pk, peer_node_id).await }) {
         Ok(_) => 0,
         Err(e) => adapter_err_to_code(&e),
@@ -1047,7 +1047,7 @@ pub unsafe extern "C" fn net_mesh_accept(
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move { node.accept(peer_node_id).await }) {
         Ok((addr, _)) => write_string_out(addr.to_string(), out_addr, out_len),
         Err(e) => adapter_err_to_code(&e),
@@ -1064,7 +1064,7 @@ pub unsafe extern "C" fn net_mesh_start(handle: *mut MeshNodeHandle) -> c_int {
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     // `start` spawns internal tasks via tokio::spawn; run under the
     // shared runtime. `start` also enables the periodic capability
     // re-announce (keeps the node discoverable past one TTL).
@@ -1219,7 +1219,7 @@ pub unsafe extern "C" fn net_mesh_probe_reflex(
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move { node.probe_reflex(peer_node_id).await }) {
         Ok(addr) => write_string_out(addr.to_string(), out_str, out_len),
         Err(e) => traversal_err_to_code(&e),
@@ -1241,7 +1241,7 @@ pub unsafe extern "C" fn net_mesh_reclassify_nat(handle: *mut MeshNodeHandle) ->
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     block_on(async move { node.reclassify_nat().await });
     0
 }
@@ -1313,7 +1313,7 @@ pub unsafe extern "C" fn net_mesh_connect_direct(
         Err(code) => return code,
     };
 
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move { node.connect_direct(peer_node_id, &pk, coordinator).await }) {
         Ok(_) => 0,
         Err(e) => traversal_err_to_code(&e),
@@ -1348,7 +1348,7 @@ pub unsafe extern "C" fn net_mesh_connect_direct_auto(
         Err(code) => return code,
     };
 
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move { node.connect_direct_auto(peer_node_id, &pk).await }) {
         Ok(_) => 0,
         Err(e) => traversal_err_to_code(&e),
@@ -1903,7 +1903,7 @@ pub unsafe extern "C" fn net_mesh_send(
         Some(v) => v,
         None => return NetError::NullPointer.into(),
     };
-    let node = nh.inner.clone();
+    let node = Arc::clone(&nh.inner);
     let stream = sh.stream.clone();
     match block_on(async move { node.send_on_stream(&stream, &payloads).await }) {
         Ok(()) => 0,
@@ -1952,7 +1952,7 @@ pub unsafe extern "C" fn net_mesh_send_with_retry(
         Some(v) => v,
         None => return NetError::NullPointer.into(),
     };
-    let node = nh.inner.clone();
+    let node = Arc::clone(&nh.inner);
     let stream = sh.stream.clone();
     match block_on(async move {
         node.send_with_retry(&stream, &payloads, max_retries as usize)
@@ -2001,7 +2001,7 @@ pub unsafe extern "C" fn net_mesh_send_blocking(
         Some(v) => v,
         None => return NetError::NullPointer.into(),
     };
-    let node = nh.inner.clone();
+    let node = Arc::clone(&nh.inner);
     let stream = sh.stream.clone();
     match block_on(async move { node.send_blocking(&stream, &payloads).await }) {
         Ok(()) => 0,
@@ -2369,7 +2369,7 @@ pub unsafe extern "C" fn net_mesh_recv_shard(
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     let result = block_on(async move { node.poll_shard(shard_id, None, limit as usize).await });
     let result = match result {
         Ok(r) => r,
@@ -2587,7 +2587,7 @@ pub unsafe extern "C" fn net_mesh_subscribe_channel_with_token(
         Ok(t) => t,
         Err(e) => return token_err_to_code(&e),
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move {
         node.subscribe_channel_with_token(publisher_node_id, name, parsed)
             .await
@@ -2618,7 +2618,7 @@ fn subscribe_or_unsubscribe(
         Ok(n) => n,
         Err(_) => return NET_ERR_CHANNEL,
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     let outcome = if subscribe {
         block_on(async move { node.subscribe_channel(publisher_node_id, name).await })
     } else {
@@ -2744,7 +2744,7 @@ pub unsafe extern "C" fn net_mesh_publish(
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(payload, len) })
     };
 
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move { node.publish(&publisher, bytes).await }) {
         Ok(report) => {
             let js = to_publish_report_json(report);
@@ -4158,7 +4158,7 @@ pub unsafe extern "C" fn net_mesh_announce_capabilities(
         Ok(c) => c,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move { node.announce_capabilities(caps).await }) {
         Ok(()) => 0,
         Err(_) => NET_ERR_CAPABILITY,
@@ -4576,6 +4576,8 @@ pub unsafe extern "C" fn net_normalize_gpu_vendor(
 // strings (the codebase's `_json` convention), so the C ABI stays one
 // `const char*` instead of a struct + string-array marshaling.
 
+// Declared for C in include/net.go.h (mirrored in go/net.h).
+// `.github/scripts/check-c-abi.py` fails if a value here and its header differ.
 /// Returned for a bad / unparseable criteria or record JSON.
 pub(crate) const NET_ERR_GANG_INVALID: c_int = -140;
 
@@ -4694,7 +4696,7 @@ pub unsafe extern "C" fn net_mesh_publish_island_topology(
         load: rec.load,
         p50_latency_us: rec.p50_latency_us,
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move { node.publish_island_topology(record).await }) {
         Ok(n) => {
             if !out_count.is_null() {
@@ -4765,7 +4767,7 @@ pub unsafe extern "C" fn net_mesh_reserve_island(
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move { node.reserve_island(island, until_unix_us).await }) {
         Ok(outcome) => {
             unsafe {
@@ -4793,7 +4795,7 @@ pub unsafe extern "C" fn net_mesh_release_island(
         Some(op) => op,
         None => return NetError::ShuttingDown.into(),
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move { node.release_island(island).await }) {
         Ok(outcome) => {
             unsafe {
@@ -4842,7 +4844,7 @@ pub unsafe extern "C" fn net_mesh_claim_island(
     let Some(criteria) = build_gang_criteria(parsed) else {
         return NET_ERR_GANG_INVALID;
     };
-    let node = h.inner.clone();
+    let node = Arc::clone(&h.inner);
     match block_on(async move { node.claim_island(&criteria, until_unix_us).await }) {
         Ok(Some(id)) => {
             unsafe {
@@ -4867,6 +4869,151 @@ fn claim_outcome_code(o: crate::adapter::net::behavior::gang::ClaimOutcome) -> c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-C5-1 (C SDK plan, C5): after `net_mesh_shutdown` + `net_mesh_free`
+    /// the node must be reclaimed. LeakSanitizer found two in-process nodes
+    /// still allocated at exit, reachable only through the freed handles'
+    /// tombstones — a strong reference nobody holds.
+    mod node_reclaim_c_abi {
+        use super::super::*;
+        use std::ffi::CString;
+        use std::ptr::null_mut;
+        use std::sync::Weak;
+        use std::time::{Duration, Instant};
+
+        fn free_port() -> String {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            socket.local_addr().expect("addr").to_string()
+        }
+
+        fn new_node(addr: &str, seed: u8) -> *mut MeshNodeHandle {
+            let cfg = CString::new(format!(
+                r#"{{"bind_addr":"{addr}","psk_hex":"{}","heartbeat_ms":200,"identity_seed_hex":"{}"}}"#,
+                "42".repeat(32),
+                format!("{seed:02x}").repeat(32)
+            ))
+            .unwrap();
+            let mut handle = null_mut();
+            assert_eq!(unsafe { net_mesh_new(cfg.as_ptr(), &mut handle) }, 0);
+            handle
+        }
+
+        fn public_key(handle: *mut MeshNodeHandle) -> CString {
+            let (mut out, mut len) = (null_mut(), 0usize);
+            assert_eq!(
+                unsafe { net_mesh_public_key_hex(handle, &mut out, &mut len) },
+                0
+            );
+            let key = unsafe { std::ffi::CStr::from_ptr(out) }.to_owned();
+            unsafe { crate::ffi::net_free_string(out) };
+            key
+        }
+
+        /// Two started, connected nodes, as `cu_mesh_build` +
+        /// `cu_mesh_handshake` make them.
+        fn connected_pair() -> (*mut MeshNodeHandle, *mut MeshNodeHandle) {
+            let (a_addr, b_addr) = (free_port(), free_port());
+            let a = new_node(&a_addr, 0xA1);
+            let b = new_node(&b_addr, 0xB2);
+            let (a_id, b_id) = unsafe { (net_mesh_node_id(a), net_mesh_node_id(b)) };
+            let b_ptr = b as usize;
+            let accept = std::thread::spawn(move || {
+                let (mut out, mut len) = (null_mut(), 0usize);
+                let rc = unsafe {
+                    net_mesh_accept(b_ptr as *mut MeshNodeHandle, a_id, &mut out, &mut len)
+                };
+                if !out.is_null() {
+                    unsafe { crate::ffi::net_free_string(out) };
+                }
+                rc
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            let b_key = public_key(b);
+            let b_at = CString::new(b_addr).unwrap();
+            assert_eq!(
+                unsafe { net_mesh_connect(a, b_at.as_ptr(), b_key.as_ptr(), b_id) },
+                0
+            );
+            assert_eq!(accept.join().unwrap(), 0);
+            unsafe {
+                assert_eq!(net_mesh_start(a), 0);
+                assert_eq!(net_mesh_start(b), 0);
+            }
+            (a, b)
+        }
+
+        fn weak_of(handle: *mut MeshNodeHandle) -> Weak<MeshNode> {
+            Arc::downgrade(unsafe { &*(*handle).inner })
+        }
+
+        fn reclaimed(weak: &Weak<MeshNode>) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if weak.upgrade().is_none() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        }
+
+        fn assert_reclaimed(label: &str, weak: &Weak<MeshNode>) {
+            assert!(
+                reclaimed(weak),
+                "{label}: the MeshNode is still alive 5 s after net_mesh_free \
+                 (strong count {}): something retains a strong reference",
+                weak.strong_count()
+            );
+        }
+
+        /// lifecycle.c's sequence: shutdown twice, a query after shutdown,
+        /// then free.
+        #[test]
+        fn nodes_are_reclaimed_after_the_lifecycle_sequence() {
+            let (a, b) = connected_pair();
+            let (wa, wb) = (weak_of(a), weak_of(b));
+            unsafe {
+                assert_eq!(net_mesh_shutdown(a), 0);
+                assert_eq!(net_mesh_shutdown(a), 0);
+                let _ = public_key(a);
+                assert_eq!(net_mesh_shutdown(b), 0);
+                net_mesh_free(a);
+                net_mesh_free(b);
+            }
+            assert_reclaimed("A", &wa);
+            assert_reclaimed("B", &wb);
+        }
+
+        /// The smallest case: one node, started, shut down and freed. Each
+        /// `h.inner.clone()` in an entry point (start, connect, accept, ...)
+        /// cloned the `ManuallyDrop` wrapper and so leaked one strong count.
+        #[test]
+        fn a_started_node_is_reclaimed_after_shutdown_and_free() {
+            let a = new_node(&free_port(), 0xC3);
+            let w = weak_of(a);
+            unsafe {
+                assert_eq!(net_mesh_start(a), 0);
+                assert_eq!(net_mesh_shutdown(a), 0);
+                net_mesh_free(a)
+            };
+            assert_reclaimed("start+shutdown+free", &w);
+        }
+
+        /// The minimal sequence: one shutdown each, then free.
+        #[test]
+        fn nodes_are_reclaimed_after_shutdown_and_free() {
+            let (a, b) = connected_pair();
+            let (wa, wb) = (weak_of(a), weak_of(b));
+            unsafe {
+                assert_eq!(net_mesh_shutdown(a), 0);
+                assert_eq!(net_mesh_shutdown(b), 0);
+                net_mesh_free(a);
+                net_mesh_free(b);
+            }
+            assert_reclaimed("A", &wa);
+            assert_reclaimed("B", &wb);
+        }
+    }
 
     /// The stream inbox through the C ABI, end to end over real UDP:
     /// what the Go binding calls, witnessed here because cgo cannot be

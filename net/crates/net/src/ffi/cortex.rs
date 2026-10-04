@@ -88,6 +88,10 @@ use super::NetError;
 // (NetError::Unknown) so they never collide with the base surface.
 // =========================================================================
 
+// Declared for C in two places: -100..-103 in the shared `net_error_t` enum
+// of include/net.h and include/net.go.h (mirrored in go/net.h), and the rest
+// in include/net_cortex.h (mirrored in go/net_cortex.h).
+// `.github/scripts/check-c-abi.py` fails if a value here and its header differ.
 pub(crate) const NET_ERR_CORTEX_CLOSED: c_int = -100;
 pub(crate) const NET_ERR_CORTEX_FOLD: c_int = -101;
 pub(crate) const NET_ERR_NETDB: c_int = -102;
