@@ -28,7 +28,7 @@ If you want to query across multiple CortEX adapters as one handle, see **NetDB*
 | "I want to react to changes in derived state" | `adapter.changes()` (`u64` per applied seq) or `changes_with_lag()` |
 | "Tasks list / memories list with status filters" | `Tasks` / `Memories` adapters directly |
 | "Fast restart with hot state" | `adapter.snapshot()` → persist bytes; `CortexAdapter::open_from_snapshot(bytes)` on startup |
-| "Read my own write deterministically" | `tasks.create(...)` returns the RedEX **seq**; `tasks.wait_for_seq(seq)` — or wrap the seq in a `WriteToken` for `wait_for_token(token, deadline)` (see `dataforts.md` § Read-your-writes) |
+| "Read my own write deterministically" | `tasks.create(...)` returns the RedEX **seq**; `tasks.wait_for_seq(seq)` — or `tasks.token(seq)` for `wait_for_token(token, deadline)` (see `dataforts.md` § Read-your-writes) |
 
 ---
 
@@ -67,7 +67,7 @@ let _ = tasks.complete(1, now_ns)?;
 
 // Wait for the fold to apply your write deterministically (read-your-writes).
 // Simplest is to wait on the seq `create` returned. For a deadline or the
-// origin-bound WriteToken primitive, see `dataforts.md` § Read-your-writes.
+// channel-bound WriteToken primitive (`tasks.token(seq)`), see `dataforts.md` § Read-your-writes.
 let _ = tasks.wait_for_seq(seq).await;
 
 // React to changes
@@ -81,7 +81,7 @@ tasks.close()?;
 ```
 
 **Key facts:**
-- `Tasks::open` / `Memories::open` take `(redex, channel, origin_hash, RedexFileConfig)`. The `origin_hash` is what `WriteToken`s bind to — `wait_for_token` rejects tokens from a different origin.
+- `Tasks::open` / `Memories::open` take `(redex, channel, origin_hash, RedexFileConfig)`. A `WriteToken` is `(origin_hash, channel_hash, seq)` — `wait_for_token` rejects a token from a different origin (`WrongOrigin`) or a different channel (`WrongChannel`).
 - The fold loop runs on a tokio task; `tasks.is_running()` reports liveness. `tasks.close()` joins the task cleanly.
 - `state()` returns `Arc<RwLock<TasksState>>`. Queries take `state.read()` and use methods like `find_unique` / `find_many(&filter)` / `count_where`. Writes go through `tasks.create / .complete / .delete / .rename` — never mutate `state.write()` directly (you'd diverge from the RedEX log).
 - `changes()` returns a `Stream<Item = u64>`; `changes_with_lag()` returns `Stream<Item = ChangeEvent>`. `ChangeEvent` has exactly two **tuple** variants — `Seq(u64)` per applied seq, and `Lagged(u64)` carrying how many notifications were dropped when the broadcast buffer overflowed. Match with parens, not braces. Use the latter when you can't tolerate dropped change notifications. Note that by the time you see `Lagged`, `state()` already reflects past those events — the value is observability, not a gap you have to replay.
@@ -110,7 +110,7 @@ print(len(pending), 'pending')
 
 # RYW — block until the fold has applied your write
 tasks.wait_for_seq(seq)
-# For a deadline / the WriteToken primitive: tasks.wait_for_token(token, deadline_ms=250)
+# For a deadline / the WriteToken primitive: tasks.wait_for_token(tasks.token(seq), deadline_ms=250)
 # (deadline_ms=0 is a non-blocking poll — raises CortexError if not yet applied)
 
 # Changes
@@ -140,13 +140,13 @@ const tasks = await Tasks.open(redex, {
   persistent: true,
 });
 
-const result = tasks.create(1n, 'first', BigInt(Date.now()) * 1_000_000n);
+const seq = tasks.create(1n, 'first', BigInt(Date.now()) * 1_000_000n);
 tasks.complete(1n, BigInt(Date.now()) * 1_000_000n);
 
 const state = tasks.state();
 const pending = state.findMany({ status: TaskStatus.PENDING });
 
-await tasks.waitForToken(result.token, 250);  // deadlineMs; 0 = non-blocking poll
+await tasks.waitForToken(tasks.token(seq), 250);  // deadlineMs; 0 = non-blocking poll
 
 for await (const seq of tasks.watch()) {
   // tasks.state().findMany(...)
@@ -158,7 +158,7 @@ await tasks.close();
 **Key facts:**
 - `BigInt` everywhere ids / origin_hashes / timestamps live — JS `Number` loses precision past 2^53.
 - `watch()` returns an async iterable; cancelling the for-await loop drops the subscription cleanly.
-- `waitForToken(token, deadlineMs)` rejects with `CortexError` on timeout / fold-stopped; `deadlineMs === 0` is a non-blocking poll.
+- `waitForToken(token, deadlineMs)` rejects with `CortexError` on timeout / fold-stopped / a token from another origin or channel; `deadlineMs === 0` is a non-blocking poll. Tokens come from `tasks.token(seq)` (or `WriteToken.fromString`); `WriteToken` has no public constructor.
 
 ## Go
 
@@ -175,7 +175,7 @@ defer tasks.Close()
 seq, _ := tasks.Create(1, "first", uint64(time.Now().UnixNano())) // CRUD returns the seq
 tasks.Complete(1, uint64(time.Now().UnixNano()))
 
-// RYW: Token(seq) names the write by this adapter's origin + seq
+// RYW: Token(seq) names the write by this adapter's origin, channel and seq
 if err := tasks.WaitForToken(tasks.Token(seq), 250*time.Millisecond); err != nil { /* … */ }
 // timeout 0 = non-blocking poll (unlike WaitForSeq, where 0 waits forever)
 if err := tasks.WaitForToken(tasks.Token(seq), 0); err != nil { /* net.ErrTokenTimeout if not yet applied */ }
@@ -190,27 +190,27 @@ all, _ := tasks.List(nil) // includes task 1 once its token was applied
 **Key facts:**
 - `WaitForToken(token, timeout)` blocks the calling goroutine; a zero timeout is a non-blocking applied-vs-token check (`ErrTokenTimeout` if not yet applied).
 - `WaitForTokenContext(ctx, token)` checks `ctx` before every native wait and waits in slices of at most 50 ms, so cancellation is noticed within one slice, and a context that is already done returns its error even for an applied token.
-- The origin check is on the **origin hash**, not the adapter object: another adapter opened with the same origin accepts the token, but only once its own fold has applied that seq. A different origin is `ErrWrongOrigin`.
-- **A token means something only on the channel it came from.** It carries `(origin, seq)` and nothing else, as in core. `Tasks` and `Memories` are separate RedEX channels with their own sequence numbers, so waiting on a `Tasks` token through a `Memories` adapter (same origin) can succeed once *that* fold passes the number, without the write ever being applied. Wait on the adapter that issued the token, or one over the same channel.
+- The origin check is on the **origin hash**, not the adapter object: another adapter opened with the same origin **on the same channel** accepts the token, but only once its own fold has applied that seq. A different origin is `ErrWrongOrigin`.
+- **A token is `(origin, channel, seq)`.** Sequence numbers are per channel, so `Token(seq)` stamps the adapter's channel (`ChannelHash()`), and an adapter refuses a token from another channel with `ErrWrongChannel` — a `Tasks` token waited on through a `Memories` adapter with the same origin fails at once instead of comparing against Memories' unrelated numbering.
 
 ## C
 
 ```c
-#include "net.h"
+#include "net_cortex.h"
 
-CortexHandle* tasks;
-net_tasks_open(redex, /*origin_hash*/ 0xDEADBEEFULL, /*persistent*/ 1, &tasks);
+net_tasks_adapter_t* tasks;
+net_tasks_adapter_open(redex, /*origin_hash*/ 0xDEADBEEFULL, /*persistent*/ 1, &tasks);
 
-uint64_t seq;
-uint64_t token_origin; uint64_t token_seq;
-net_tasks_create(tasks, /*id*/ 1, "first", /*now_ns*/ 0, &seq, &token_origin, &token_seq);
-net_tasks_complete(tasks, 1, 0, &seq);
+uint64_t seq, channel;
+net_tasks_create(tasks, /*id*/ 1, "first", /*now_ns*/ 0, &seq);
+net_tasks_channel_hash(tasks, &channel);  // the token's middle field
 
-// RYW
-int rc = net_tasks_wait_for_token(tasks, token_origin, token_seq, /*deadline_ms*/ 250);
-// deadline_ms == 0 is a non-blocking poll
+// RYW: the token is (origin_hash, channel_hash, seq)
+int rc = net_tasks_wait_for_token(tasks, 0xDEADBEEFULL, channel, seq, /*timeout_ms*/ 250);
+// timeout_ms == 0 is a non-blocking poll; -104 wrong origin, -160 wrong channel
 
-net_tasks_close(tasks);
+net_tasks_adapter_close(tasks);
+net_tasks_adapter_free(tasks);
 ```
 
 **Key facts:**

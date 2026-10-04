@@ -25,14 +25,16 @@ import (
 	"time"
 )
 
-// WriteToken names one write: the origin that made it and its sequence
-// number. Like core's token it carries no channel, so it is meaningful only
-// on an adapter over the channel that issued it: a Tasks token waited on
-// through a Memories adapter with the same origin compares against the
-// other channel's sequence numbers.
+// WriteToken names one write: the origin that made it, the channel it was
+// written to, and its sequence number there. Sequence numbers are per
+// channel, so the channel is part of the name: an adapter refuses a token
+// for another channel with ErrWrongChannel instead of comparing the seq
+// against its own, unrelated, numbering. Get tokens from an adapter's
+// Token(seq).
 type WriteToken struct {
-	OriginHash uint64
-	Seq        uint64
+	OriginHash  uint64
+	ChannelHash uint64
+	Seq         uint64
 }
 
 var (
@@ -43,6 +45,10 @@ var (
 	// is on the origin, not on which adapter issued the token: another
 	// adapter opened with the same origin accepts it.
 	ErrWrongOrigin = errors.New("write token is from a different origin")
+	// ErrWrongChannel - the token was issued for a different channel than
+	// this adapter's (a Tasks token waited on through a Memories adapter,
+	// say). Its seq counts another channel's writes.
+	ErrWrongChannel = errors.New("write token is from a different channel")
 	// ErrWaitQueueFull - too many waiters on this adapter's channel.
 	ErrWaitQueueFull = errors.New("write token wait queue is full")
 	// ErrFoldStopped - the adapter's fold stopped (for example, it was
@@ -53,6 +59,10 @@ var (
 // tokenWaitSlice bounds one native wait inside WaitForTokenContext, which is
 // therefore how quickly a cancellation is noticed.
 const tokenWaitSlice = 50 * time.Millisecond
+
+// tokenErrorFromInt is tokenErrorFromCode on a plain int, so the ABI test
+// can drive it (a _test.go file cannot construct a C.int).
+func tokenErrorFromInt(code int) error { return tokenErrorFromCode(C.int(code)) }
 
 func tokenErrorFromCode(code C.int) error {
 	switch code {
@@ -66,6 +76,8 @@ func tokenErrorFromCode(code C.int) error {
 		return ErrWaitQueueFull
 	case -106:
 		return ErrFoldStopped
+	case -160:
+		return ErrWrongChannel
 	default:
 		return cortexErrorFromCode(code)
 	}
@@ -116,9 +128,13 @@ func waitForTokenContext(ctx context.Context, wait func(ms uint32) error) error 
 // OriginHash is the origin this adapter stamps on its writes.
 func (t *TasksAdapter) OriginHash() uint64 { return t.origin }
 
+// ChannelHash is the hash of this adapter's channel, which every token
+// from Token carries.
+func (t *TasksAdapter) ChannelHash() uint64 { return t.channel }
+
 // Token names the write that returned seq on this adapter.
 func (t *TasksAdapter) Token(seq uint64) WriteToken {
-	return WriteToken{OriginHash: t.origin, Seq: seq}
+	return WriteToken{OriginHash: t.origin, ChannelHash: t.channel, Seq: seq}
 }
 
 // WaitForToken blocks until the fold has applied tok, or timeout passes.
@@ -141,15 +157,19 @@ func (t *TasksAdapter) waitForToken(tok WriteToken, ms C.uint32_t) error {
 		return ErrShuttingDown
 	}
 	return tokenErrorFromCode(C.net_tasks_wait_for_token(
-		t.handle, C.uint64_t(tok.OriginHash), C.uint64_t(tok.Seq), ms))
+		t.handle, C.uint64_t(tok.OriginHash), C.uint64_t(tok.ChannelHash), C.uint64_t(tok.Seq), ms))
 }
 
 // OriginHash is the origin this adapter stamps on its writes.
 func (m *MemoriesAdapter) OriginHash() uint64 { return m.origin }
 
+// ChannelHash is the hash of this adapter's channel, which every token
+// from Token carries.
+func (m *MemoriesAdapter) ChannelHash() uint64 { return m.channel }
+
 // Token names the write that returned seq on this adapter.
 func (m *MemoriesAdapter) Token(seq uint64) WriteToken {
-	return WriteToken{OriginHash: m.origin, Seq: seq}
+	return WriteToken{OriginHash: m.origin, ChannelHash: m.channel, Seq: seq}
 }
 
 // WaitForToken blocks until the fold has applied tok, or timeout passes.
@@ -172,5 +192,5 @@ func (m *MemoriesAdapter) waitForToken(tok WriteToken, ms C.uint32_t) error {
 		return ErrShuttingDown
 	}
 	return tokenErrorFromCode(C.net_memories_wait_for_token(
-		m.handle, C.uint64_t(tok.OriginHash), C.uint64_t(tok.Seq), ms))
+		m.handle, C.uint64_t(tok.OriginHash), C.uint64_t(tok.ChannelHash), C.uint64_t(tok.Seq), ms))
 }

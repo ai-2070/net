@@ -111,11 +111,14 @@ fn redex_config_from_persistent(persistent: Option<bool>) -> RedexFileConfig {
 // paths and consumed by read-your-writes wait primitives.
 // =========================================================================
 
-/// Address of a single write. Pair with a typed adapter's
-/// `waitForToken(token, deadlineMs)` to make sure the local fold has
-/// caught up to the write before reading state. `originHash` is the
-/// 64-bit chain identifier; `seq` is the per-chain monotonic
-/// sequence assigned by `RedexFile.append`.
+/// Address of a single write. Get one from the adapter that made the
+/// write (`tasks.token(seq)` / `memories.token(seq)`) and pair it with
+/// that adapter's `waitForToken(token, deadlineMs)` to make sure the local
+/// fold has caught up before reading state. `originHash` is the 64-bit
+/// chain identifier, `channelHash` the channel the write went to, and
+/// `seq` the per-channel sequence assigned by `RedexFile.append`. There is
+/// no public constructor: sequence numbers are per channel, so a token is
+/// only meaningful with the channel the adapter stamps on it.
 #[napi]
 #[derive(Clone, Copy)]
 pub struct WriteToken {
@@ -124,16 +127,14 @@ pub struct WriteToken {
 
 #[napi]
 impl WriteToken {
-    #[napi(constructor)]
-    pub fn new(origin_hash: BigInt, seq: BigInt) -> Result<Self> {
-        Ok(Self {
-            inner: InnerWriteToken::new(bigint_u64(origin_hash)?, bigint_u64(seq)?),
-        })
-    }
-
     #[napi(getter)]
     pub fn origin_hash(&self) -> BigInt {
         BigInt::from(self.inner.origin_hash)
+    }
+
+    #[napi(getter)]
+    pub fn channel_hash(&self) -> BigInt {
+        BigInt::from(self.inner.channel_hash)
     }
 
     #[napi(getter)]
@@ -141,7 +142,8 @@ impl WriteToken {
         BigInt::from(self.inner.seq)
     }
 
-    /// Parse a token from its `<16-hex-origin>:<seq>` string form.
+    /// Parse a token from its `<16-hex-origin>:<16-hex-channel>:<seq>`
+    /// string form (what `toString()` produces).
     #[napi(factory)]
     pub fn from_string(s: String) -> Result<Self> {
         s.parse::<InnerWriteToken>()
@@ -1420,11 +1422,27 @@ impl TasksAdapter {
             })
     }
 
+    /// Hash of this adapter's channel: the `channelHash` of every token
+    /// it issues. A token for another channel is refused.
+    #[napi]
+    pub fn channel_hash(&self) -> BigInt {
+        BigInt::from(self.inner.channel_hash())
+    }
+
+    /// The token naming the write that returned `seq` on this adapter:
+    /// its origin, its channel and `seq`. Pass it to `waitForToken`.
+    #[napi]
+    pub fn token(&self, seq: BigInt) -> Result<WriteToken> {
+        Ok(WriteToken {
+            inner: self.inner.token(bigint_u64(seq)?),
+        })
+    }
+
     /// Read-your-writes wait. Blocks until this adapter's fold has
     /// applied through `token.seq`, or `deadlineMs` elapses. Rejects
-    /// a wrong-origin token or a saturated wait queue (default cap
-    /// 1024) immediately. All three failure variants surface as a
-    /// `cortex:` prefixed napi `Error`.
+    /// a wrong-origin token, a token for another channel, or a saturated
+    /// wait queue (default cap 1024) immediately. Every failure surfaces
+    /// as a `cortex:` prefixed napi `Error`.
     #[napi]
     pub async fn wait_for_token(&self, token: &WriteToken, deadline_ms: u32) -> Result<()> {
         let inner_token = token.as_inner();
@@ -1955,6 +1973,22 @@ impl MemoriesAdapter {
                     format!("fold task stopped; folded_through={folded:?}"),
                 )
             })
+    }
+
+    /// Hash of this adapter's channel: the `channelHash` of every token
+    /// it issues. A token for another channel is refused.
+    #[napi]
+    pub fn channel_hash(&self) -> BigInt {
+        BigInt::from(self.inner.channel_hash())
+    }
+
+    /// The token naming the write that returned `seq` on this adapter:
+    /// its origin, its channel and `seq`. Pass it to `waitForToken`.
+    #[napi]
+    pub fn token(&self, seq: BigInt) -> Result<WriteToken> {
+        Ok(WriteToken {
+            inner: self.inner.token(bigint_u64(seq)?),
+        })
     }
 
     /// Read-your-writes wait. See `TasksAdapter.waitForToken` for

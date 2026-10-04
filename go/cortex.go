@@ -446,6 +446,9 @@ type TasksAdapter struct {
 	// origin is the origin hash this adapter stamps on its writes, which
 	// is what a WriteToken from Token() carries.
 	origin uint64
+	// channel is the hash of the adapter's channel, read once at open:
+	// the middle field of every WriteToken from Token().
+	channel uint64
 }
 
 // OpenTasks opens the tasks adapter against a Redex. `persistent`
@@ -467,7 +470,19 @@ func OpenTasks(redex *Redex, originHash uint64, persistent bool) (*TasksAdapter,
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	t := &TasksAdapter{handle: out, origin: originHash}
+	return newTasksAdapter(out, originHash)
+}
+
+// newTasksAdapter wraps a native handle from any open path (OpenTasks,
+// NetDb.Tasks), reading the channel hash its tokens carry. On failure it
+// frees out.
+func newTasksAdapter(out *C.net_tasks_adapter_t, origin uint64) (*TasksAdapter, error) {
+	var channel C.uint64_t
+	if err := cortexErrorFromCode(C.net_tasks_channel_hash(out, &channel)); err != nil {
+		C.net_tasks_adapter_free(out)
+		return nil, err
+	}
+	t := &TasksAdapter{handle: out, origin: origin, channel: uint64(channel)}
 	runtime.SetFinalizer(t, (*TasksAdapter).free)
 	return t, nil
 }
@@ -739,6 +754,8 @@ type MemoriesAdapter struct {
 	handle *C.net_memories_adapter_t
 	// origin is the origin hash this adapter stamps on its writes.
 	origin uint64
+	// channel is the hash of the adapter's channel; see TasksAdapter.
+	channel uint64
 }
 
 func OpenMemories(redex *Redex, originHash uint64, persistent bool) (*MemoriesAdapter, error) {
@@ -756,7 +773,17 @@ func OpenMemories(redex *Redex, originHash uint64, persistent bool) (*MemoriesAd
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	m := &MemoriesAdapter{handle: out, origin: originHash}
+	return newMemoriesAdapter(out, originHash)
+}
+
+// newMemoriesAdapter is newTasksAdapter for memories.
+func newMemoriesAdapter(out *C.net_memories_adapter_t, origin uint64) (*MemoriesAdapter, error) {
+	var channel C.uint64_t
+	if err := cortexErrorFromCode(C.net_memories_channel_hash(out, &channel)); err != nil {
+		C.net_memories_adapter_free(out)
+		return nil, err
+	}
+	m := &MemoriesAdapter{handle: out, origin: origin, channel: uint64(channel)}
 	runtime.SetFinalizer(m, (*MemoriesAdapter).free)
 	return m, nil
 }

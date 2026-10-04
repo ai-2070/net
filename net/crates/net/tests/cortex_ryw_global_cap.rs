@@ -66,13 +66,16 @@ async fn global_ryw_cap_dominates_per_adapter_cap() {
         .unwrap(),
     );
 
-    let token = WriteToken::new(0xDEAD_BEEF, 999);
+    // One token per adapter: a token names a seq within its own channel,
+    // and a token for another channel is refused before taking a permit.
+    let token_a = WriteToken::new(0xDEAD_BEEF, adapter_a.channel_hash(), 999);
+    let token_b = WriteToken::new(0xDEAD_BEEF, adapter_b.channel_hash(), 999);
     // Two waiters take the two global permits.
     let a_handle = {
         let adapter_a = adapter_a.clone();
         tokio::spawn(async move {
             let _ = adapter_a
-                .wait_for_token(token, Duration::from_secs(2))
+                .wait_for_token(token_a, Duration::from_secs(2))
                 .await;
         })
     };
@@ -80,7 +83,7 @@ async fn global_ryw_cap_dominates_per_adapter_cap() {
         let adapter_b = adapter_b.clone();
         tokio::spawn(async move {
             let _ = adapter_b
-                .wait_for_token(token, Duration::from_secs(2))
+                .wait_for_token(token_b, Duration::from_secs(2))
                 .await;
         })
     };
@@ -88,7 +91,7 @@ async fn global_ryw_cap_dominates_per_adapter_cap() {
 
     // Third waiter — either adapter — must reject on the global cap.
     let third = adapter_a
-        .wait_for_token(token, Duration::from_secs(1))
+        .wait_for_token(token_a, Duration::from_secs(1))
         .await;
     assert_eq!(third.unwrap_err(), WaitForTokenError::QueueFull);
 

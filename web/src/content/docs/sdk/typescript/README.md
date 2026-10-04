@@ -70,7 +70,7 @@ Everything below imports from `@net-mesh/sdk`, with no reach into
 - **NAT traversal:** `mesh.natType()`, `reflexAddr()`, `connectDirect`,
   `traversalStats()` and reflex overrides.
 - **Aggregators:** `createRegistryClient(mesh)` / `createFoldQueryClient(mesh)`.
-- **Read-your-writes:** `tasks.waitForToken(new WriteToken(origin, seq), ms)`.
+- **Read-your-writes:** `tasks.waitForToken(tasks.token(seq), ms)`.
 - **Replicated logs:** `redex.enableReplication(mesh)`, then `openFile(name,
   { replication: { factor: 3 } })` on every node that should take part; the
   nodes pick the replicas and elect a leader

@@ -4933,12 +4933,16 @@ jobs:
             TestRedexGreedyCacheForWithoutGreedy \
             TestRedexGreedyCacheViewCloseKeepsTheCacheLive || exit 1
 
-      - name: Witness roster — Go CortEX write tokens (8)
+      # TestWriteTokenWrongChannelIsRefused is the channel-bound token
+      # witness (PR #1167): a Tasks token on a Memories adapter with the same
+      # origin, after Memories has passed the seq, must be ErrWrongChannel.
+      - name: Witness roster — Go CortEX write tokens (9)
         working-directory: go
         run: |
           set -uo pipefail
           python3 ../.github/scripts/check-roster.py --label write_token_test --mode decl \
             --source write_token_test.go \
+            TestWriteTokenWrongChannelIsRefused \
             TestWriteTokenTasksReadYourWrites \
             TestWriteTokenMemoriesReadYourWrites \
             TestWriteTokenOriginNotIdentity \
