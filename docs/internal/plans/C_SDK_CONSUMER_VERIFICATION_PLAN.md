@@ -588,6 +588,49 @@ compatibility (check 7).
   header for a change confined to headers that have none (`net_rpc.h`,
   `net_org.h`, …). The Rust, header and Go-ABI-test groups are still
   required. Three self-test cases cover it.
+**Stage 4 landed (2026-10-04): compatibility (check 7). C1 is complete.**
+- **Two baselines, compared header by header.** A declaration moved to
+  another header is gone for a consumer of the first one.
+  - **The release tag's headers** (`--baseline-ref`, default `v0.39.0`;
+    CI fetches the tag). 581 functions, 172 constants, 19 structs.
+  - **Pinned fixtures**, `tests/c_abi/fixtures/<header>.<label>.h`. The
+    first is `net_cortex.pre1167.h`, `net_cortex.h` as of `b77886c22`
+    (master with #1165, before #1167).
+- **The rule:** a removed or changed function, constant or struct fails,
+  unless `tests/c_abi/breaks.toml` has one entry with exactly its symbol,
+  old form, new form, release and reason. An entry excuses only its own
+  change. An entry that matches nothing fails, and so does one without a
+  reason. No commit-message marker is read.
+- **First run:** clean. Since v0.39.0 this branch has only added
+  declarations, and it predates #1167.
+- **Proved on a bundle copy:**
+  - #1167's change, applied to `net_tasks_wait_for_token`, was reported
+    against the pre-#1167 fixture, and only there: v0.39.0 never declared
+    the waits.
+  - With that change authorized in a scratch `breaks.toml`, an unrelated
+    removal of `net_free_string` from `net.h` was still reported.
+  - Against the clean bundle, the same entry was reported as stale.
+  - An earlier draft compared across all headers and missed the
+    `net_free_string` removal, because `net.go.h` still declares it.
+    That is why the comparison is per header.
+- **`--self-test`** adds ten cases, 32 in all.
+- **#1167 needs `breaks.toml` entries when it lands** for both token
+  waits. `breaks.toml`'s header carries the entry to add. Until then the
+  check is red on any branch carrying #1167, which is the point.
+
+**C1, all four stages.** Every check in the plan's list runs on both
+bundles, with self-tests for each, and each was shown to fail on planted
+changes to the real headers.
+- **What the first runs found and fixed:**
+  - six undeclared nRPC functions plus the observer surface;
+  - 30 undeclared return codes;
+  - a header that failed `-Wall -Werror`;
+  - two `check-abi-commit.py` false positives.
+- **Still allowlisted, with reasons:**
+  - `net_ffi_abi_version` and `net_blob_register_callback_adapter`;
+  - the ten blob/mesh value overlaps;
+  - one reserved name.
+
 - **Unrelated CI flakes seen on this branch:**
   `mesh_rpc_hedge::hedge_loser_handler_observes_cancellation` (passed on
   retry) and

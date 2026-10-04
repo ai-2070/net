@@ -61,6 +61,9 @@ ROOT = Path(__file__).resolve().parents[2]
 CRATE = ROOT / "net" / "crates" / "net"
 ALLOWLIST = CRATE / "tests" / "c_abi" / "allowlist.toml"
 LAYOUT = CRATE / "tests" / "c_abi" / "layout.json"
+BREAKS = CRATE / "tests" / "c_abi" / "breaks.toml"
+FIXTURES = CRATE / "tests" / "c_abi" / "fixtures"
+DEFAULT_RELEASE = "v0.39.0"
 SEAM_PATTERNS = ("_test_", "net_blob_test_barrier_")
 PROFILE_FEATURES = {"production": [], "helper": ["net-ffi/test-helpers"]}
 
@@ -572,6 +575,129 @@ def emit_layout_table(model: Model) -> str:
     return "\n".join(lines)
 
 
+@dataclass
+class Baseline:
+    """Headers a consumer may have compiled against: a release tag's, or a
+    pinned fixture standing in for one header at a point between releases."""
+    name: str
+    headers: dict[str, M.CHeader]
+
+
+def load_release_baseline(ref: str) -> Baseline:
+    """Every shipped header at `ref`, parsed as a consumer of that release saw it."""
+    out = subprocess.run(["git", "-C", str(ROOT), "ls-tree", "--name-only", ref, "net/crates/net/include/"],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        raise SystemExit(f"FAIL  cannot read {ref}'s headers (is the tag fetched?): {out.stderr.strip()}")
+    td = Path(tempfile.mkdtemp())
+    inc = td / "include"
+    inc.mkdir()
+    for path in out.stdout.split():
+        if path.endswith(".h"):
+            text = subprocess.run(["git", "-C", str(ROOT), "show", f"{ref}:{path}"],
+                                  capture_output=True, text=True, check=True, encoding="utf-8").stdout
+            (inc / Path(path).name).write_text(text, encoding="utf-8")
+    fake = M.write_fake_libc(td / "fake_libc")
+    return Baseline(ref, {h.name: M.parse_c_header(h, [inc], fake, M.default_cc()) for h in sorted(inc.glob("*.h"))})
+
+
+def load_fixture_baselines(current_include: Path, fixtures: Path = FIXTURES) -> list[Baseline]:
+    """`<header stem>.<label>.h` pins one header at a point between releases,
+    e.g. net_cortex.pre1167.h. It is parsed in place of that header, beside
+    the current others (so its own includes resolve)."""
+    out = []
+    for f in sorted(fixtures.glob("*.*.h")):
+        stem, label, _ = f.name.split(".", 2)
+        td = Path(tempfile.mkdtemp())
+        inc = td / "include"
+        inc.mkdir()
+        for h in current_include.glob("*.h"):
+            (inc / h.name).write_text(h.read_text(encoding="utf-8"), encoding="utf-8")
+        target = inc / f"{stem}.h"
+        target.write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
+        fake = M.write_fake_libc(td / "fake_libc")
+        out.append(Baseline(label, {target.name: M.parse_c_header(target, [inc], fake, M.default_cc())}))
+    return out
+
+
+@dataclass
+class Change:
+    baseline: str
+    symbol: str
+    old: str
+    new: str
+    where: str
+
+
+def compat_changes(model: Model, baseline: Baseline) -> list[Change]:
+    """Every declaration, constant or struct of `baseline` that is gone or
+    different now, header by header: a consumer includes a header, so a
+    declaration that moved to another one is gone for it. Additions are not
+    changes."""
+    changes: list[Change] = []
+    for hname, h in sorted(baseline.headers.items()):
+        cur = model.headers.get(hname)
+        if cur is None:
+            changes.append(Change(baseline.name, hname, "(header)", "(removed)", hname))
+            continue
+        for name, decl in sorted(h.functions.items()):
+            old = str(decl.sig)
+            now = cur.functions.get(name)
+            if now is None:
+                changes.append(Change(baseline.name, name, old, "(removed)", f"{hname}:{decl.line}"))
+            elif str(now.sig) != old:
+                changes.append(Change(baseline.name, name, old, str(now.sig), f"{hname}:{decl.line}"))
+        for name, (value, line) in sorted(h.constants.items()):
+            now = cur.constants.get(name)
+            if now is None:
+                changes.append(Change(baseline.name, name, str(value), "(removed)", f"{hname}:{line}"))
+            elif now[0] != value:
+                changes.append(Change(baseline.name, name, str(value), str(now[0]), f"{hname}:{line}"))
+        for name, (line, fields) in sorted(h.structs.items()):
+            old = "{" + ", ".join(f"{f}: {t}" for f, t in fields) + "}"
+            now = cur.structs.get(name)
+            if now is None:
+                changes.append(Change(baseline.name, name, old, "(removed)", f"{hname}:{line}"))
+                continue
+            new = "{" + ", ".join(f"{f}: {t}" for f, t in now[1]) + "}"
+            if new != old:
+                changes.append(Change(baseline.name, name, old, new, f"{hname}:{line}"))
+    return changes
+
+
+def load_breaks(path: Path = BREAKS) -> list[dict]:
+    if not path.exists():
+        return []
+    return list(tomllib.loads(path.read_text(encoding="utf-8")).get("break", []))
+
+
+def run_compat_checks(model: Model, baselines: list[Baseline], breaks: list[dict]) -> list[Finding]:
+    """Check 7. A change fails unless ONE breaks.toml entry names exactly its
+    symbol, old and new signature (and baseline, if the entry gives one). An
+    entry excuses only that change, and an entry matching nothing fails."""
+    findings = []
+    used: set[int] = set()
+    for b in baselines:
+        for c in compat_changes(model, b):
+            hit = next((i for i, e in enumerate(breaks)
+                        if e.get("symbol") == c.symbol and e.get("old") == c.old and e.get("new") == c.new
+                        and e.get("baseline", c.baseline) == c.baseline), None)
+            if hit is not None:
+                used.add(hit)
+                continue
+            findings.append(Finding("compat", f"{c.baseline}:{c.symbol}",
+                f"{c.symbol} ({c.baseline}, {c.where}) changed: {c.old}  ->  {c.new}"))
+    for i, e in enumerate(breaks):
+        missing = [k for k in ("symbol", "old", "new", "release", "reason") if not e.get(k)]
+        if missing:
+            findings.append(Finding("breaks", str(e.get("symbol")),
+                f"breaks.toml entry for {e.get('symbol')!r} lacks {missing}"))
+        elif i not in used:
+            findings.append(Finding("breaks", e["symbol"],
+                f"breaks.toml entry for {e['symbol']} ({e['old']} -> {e['new']}) matches no change; remove it"))
+    return findings
+
+
 def _rel(path: Path) -> str:
     try:
         return path.resolve().relative_to(ROOT).as_posix()
@@ -620,6 +746,8 @@ def report(findings: list[Finding], stats: dict, stale: list[str], profile: str,
           f"{stats['real']} real, {stats['stub']} stubs; {stats['handle_types']} C handle/struct "
           f"types matched one-to-one; {stats['erased']} positions where one side is void* "
           f"(ABI-identical, not handle-checked)")
+    if stats.get("baselines"):
+        print(f"    compatibility baselines: {'; '.join(stats['baselines'])}")
     if stats.get("helper_seams"):
         print(f"    {len(stats['helper_seams'])} undeclared test seams in the helper build "
               f"(declared by their Go test helpers): {', '.join(stats['helper_seams'])}")
@@ -630,7 +758,7 @@ def report(findings: list[Finding], stats: dict, stale: list[str], profile: str,
     for f in findings:
         by[f.check].append(f)
     for check in ("declared", "exported", "signature", "char", "handles", "seams",
-                  "constants", "mentioned", "collision", "layout", "compiled"):
+                  "constants", "mentioned", "collision", "layout", "compiled", "compat", "breaks"):
         items = by.get(check, [])
         mark = "✓" if not items else "✗"
         print(f"{mark} {check}: {len(items)} finding(s)")
@@ -790,6 +918,49 @@ def self_test() -> int:
             print(f"{'✓' if ok else '✗'} self-test: {label}"
                   + ("" if ok else f"  (got: {[f'{f.check}: {f.message}' for f in findings]})"))
             failures += 0 if ok else 1
+        # Check 7: compatibility against a baseline, and breaks.toml entries.
+        def baseline(tmp: Path, header: str) -> Baseline:
+            inc = tmp / "base"
+            inc.mkdir(parents=True, exist_ok=True)
+            (inc / "net_demo.h").write_text(header, encoding="utf-8")
+            fake = M.write_fake_libc(tmp / "base_fake")
+            return Baseline("old", {"net_demo.h": M.parse_c_header(inc / "net_demo.h", [inc], fake, M.default_cc())})
+
+        sig = "fn(*demo_t) -> void"
+        free_entry = {"symbol": "net_demo_free", "old": sig, "new": "fn(*demo_t, u32) -> void",
+                      "release": "9.9.9", "reason": "demo"}
+        changed_free = H.replace("void net_demo_free(demo_t* d);", "void net_demo_free(demo_t* d, uint32_t flags);")
+        compat_cases = [
+            ("an unchanged baseline is clean", H, H, [], None),
+            ("an addition is not a change", H.replace("uint32_t net_demo_count(const demo_t* d);\n", ""), H, [], None),
+            ("a removed function is reported", H + "int net_demo_gone(void);\n", H, [], ("compat", "net_demo_gone")),
+            ("a changed signature is reported", H, changed_free, [], ("compat", "net_demo_free")),
+            ("an exact breaks.toml entry authorizes that change", H, changed_free, [free_entry], None),
+            ("an authorized break does not excuse an unrelated removal",
+             H + "int net_demo_gone(void);\n", changed_free, [free_entry], ("compat", "net_demo_gone")),
+            ("an entry matching no change is stale", H, H, [free_entry], ("breaks", "matches no change")),
+            ("an entry without a reason is refused", H, changed_free,
+             [{k: v for k, v in free_entry.items() if k != "reason"}], ("breaks", "lacks")),
+            ("a changed constant value is reported", H.replace("NET_DEMO_ERR_CLOSED -1", "NET_DEMO_ERR_CLOSED -9"), H, [],
+             ("compat", "NET_DEMO_ERR_CLOSED")),
+            ("a changed struct is reported", H.replace("uint32_t len;\n} demo_pair_t;", "uint16_t len;\n} demo_pair_t;"),
+             H, [], ("compat", "demo_pair_t")),
+        ]
+        for i, (label, old_h, new_h, breaks, expect) in enumerate(compat_cases):
+            tmp = Path(td) / f"k{i}"
+            model = _self_test_model(tmp, new_h, R, E)
+            got = run_compat_checks(model, [baseline(tmp, old_h)], breaks)
+            if expect is None:
+                ok = not got
+            else:
+                ok = any(f.check == expect[0] and expect[1] in f.message for f in got)
+                # The authorized change itself must not be among the findings.
+                if "unrelated" in label:
+                    ok = ok and not any("net_demo_free" in f.message for f in got)
+            print(f"{'✓' if ok else '✗'} self-test: {label}"
+                  + ("" if ok else f"  (got: {[f'{f.check}: {f.message}' for f in got]})"))
+            failures += 0 if ok else 1
+
         # Allowlist: an entry suppresses exactly its finding, and a stale entry fails.
         f = [Finding("exported", "net_x", "m")]
         left, stale = apply_allowlist(f, {"exported": {"net_x": "reason", "net_gone": "reason"}})
@@ -813,6 +984,10 @@ def main() -> int:
     ap.add_argument("--allowlist", type=Path, default=ALLOWLIST)
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--verbose", action="store_true", help="list every position where one side is void*")
+    ap.add_argument("--baseline-ref", default=DEFAULT_RELEASE,
+                    help=f"release tag whose headers are a compatibility baseline (default {DEFAULT_RELEASE}; "
+                    "'none' skips it). Fixtures in tests/c_abi/fixtures always apply")
+    ap.add_argument("--breaks", type=Path, default=BREAKS, help="the authorized-break list (tests/c_abi/breaks.toml)")
     ap.add_argument("--emit-layout-table", action="store_true",
                     help="print the measure! table for bindings/go/net-ffi/tests/abi_layout.rs")
     args = ap.parse_args()
@@ -825,6 +1000,15 @@ def main() -> int:
         print(emit_layout_table(model))
         return 0
     findings, stats = run_checks(model)
+    baselines = [] if args.baseline_ref == "none" else [load_release_baseline(args.baseline_ref)]
+    baselines += load_fixture_baselines(model.include_dir)
+    findings += run_compat_checks(model, baselines, load_breaks(args.breaks))
+    stats["baselines"] = [
+        f"{b.name} ({sum(len(h.functions) for h in b.headers.values())} functions, "
+        f"{sum(len(h.constants) for h in b.headers.values())} constants, "
+        f"{sum(len(h.structs) for h in b.headers.values())} structs)"
+        for b in baselines
+    ]
     left, stale = apply_allowlist(findings, load_allowlist(args.allowlist))
     return report(left, stats, stale, model.profile, args.verbose)
 

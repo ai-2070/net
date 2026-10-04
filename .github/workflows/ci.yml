@@ -5275,13 +5275,25 @@ jobs:
       # declared (or allowlisted with a reason in tests/c_abi/allowlist.toml);
       # each declaration matches every Rust definition of its name by
       # primitive width, pointer depth and expanded callback prototype; and
-      # each C handle type corresponds to one Rust type. Text-and-preprocessor
-      # only, so it runs once, on Linux. `--self-test` plants same-arity drift
-      # (swapped handles, a narrowed width, a dropped pointer level, a changed
-      # callback prototype) and requires each to be reported.
+      # each C handle type corresponds to one Rust type. Every NET_* code the
+      # Rust FFI defines is declared with its value, with no unlisted
+      # collision in one return domain, and both the constants and the
+      # struct layouts in tests/c_abi/layout.json are compiled as C
+      # _Static_asserts from the headers. Text, preprocessor and C compiler
+      # only, so it runs once, on Linux. `--self-test` plants each kind of
+      # drift (swapped handles, a narrowed width, a dropped pointer level, a
+      # changed callback prototype, a wrong code value, a collision, a
+      # moved field offset, ...) and requires each to be reported.
+      #
+      # It also compares the headers, header by header, with the last
+      # release's (v0.39.0) and with the pinned fixtures in
+      # tests/c_abi/fixtures/. A removed or changed declaration fails unless
+      # tests/c_abi/breaks.toml authorizes exactly that change. The checkout
+      # is shallow and tagless, so the release tag is fetched first.
       - name: Guard — headers, exports and Rust definitions agree (C1 audit)
         if: runner.os == 'Linux'
         run: |
+          git fetch --no-tags --depth=1 origin +refs/tags/v0.39.0:refs/tags/v0.39.0
           "$PY" -m pip install --quiet pycparser
           "$PY" .github/scripts/check-c-abi.py --self-test
           "$PY" .github/scripts/check-c-abi.py --bundle "$PROD_BUNDLE"
