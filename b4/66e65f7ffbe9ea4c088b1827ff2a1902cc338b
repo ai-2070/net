@@ -1,0 +1,52 @@
+net/crates/net/tests/c_abi/layout.json
+  s_17a2ac60d914fc::t_f17ce57df17d61 1-742
+.github/scripts/c_abi_model.py
+  s_17a2ac60d914fc::t_64ae0d32dcd98e 80-89,173-174,252,258-259,319-331,717-723,897-925
+  s_17a2ac60d914fc::t_091e204ef70517 504,507-508
+  s_17a2ac60d914fc::t_89d8aad7b7e6fe 578-579
+  s_17a2ac60d914fc::t_f9db356a1a65bd 332
+go/abi_stability_test.go
+  s_17a2ac60d914fc::t_e9f5af446f24f5 576-584,599
+  s_17a2ac60d914fc::t_2f983ba996f229 589-590,592-595
+  s_17a2ac60d914fc::t_657102890df256 558-575,585-588,591,596-598,600-615
+net/crates/net/bindings/go/net-ffi/Cargo.toml
+  s_17a2ac60d914fc::t_13c4c917824ad5 88-91
+net/crates/net/include/net_rpc.h
+  s_17a2ac60d914fc::t_7d0329fe1549e7 620-664
+  s_17a2ac60d914fc::t_dc2dc1e140ff92 619
+.github/scripts/check-abi-commit.py
+  s_17a2ac60d914fc::t_d3c5ba338a62ce 68-72
+  s_17a2ac60d914fc::t_54fdd2dec79792 250-259
+  s_17a2ac60d914fc::t_609a23e81d9a80 414-429
+.github/workflows/ci.yml
+  s_17a2ac60d914fc::t_3853e8fbe29b83 5256-5267
+net/crates/net/bindings/go/net-ffi/tests/abi_layout.rs
+  s_17a2ac60d914fc::t_13c4c917824ad5 1-30,32-38,40-41,47-52,74-91,93-117,120-121,124-130
+  s_17a2ac60d914fc::t_c9b40962e8391c 118-119,122-123
+  s_17a2ac60d914fc::t_f17ce57df17d61 31,39,42-46,53-73,92
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_1d55103cf07693 548-596
+.github/scripts/check-c-abi.py
+  s_17a2ac60d914fc::t_cdd6353756c779 44,63,143-148,208-218,275-276,420-421,425-426,429-581,633,816-817,824-826
+  s_17a2ac60d914fc::t_4222f09eeb20dd 422-424,427-428
+  s_17a2ac60d914fc::t_89d8aad7b7e6fe 104-107
+  s_17a2ac60d914fc::t_96ed6ec0466f16 659-663,680-686,692-696,699-700,726-729,767-777,781,783
+net/crates/net/Cargo.lock
+  s_17a2ac60d914fc::t_eca6dc80a49f19 3248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b466e65f7ffbe9ea4c088b1827ff2a1902cc338b",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
