@@ -1,0 +1,28 @@
+net/crates/net/docs/releases/RELEASE_v0.40_HIGHWAY_STAR.md
+  s_d8b00bedd146e9::t_a0f3c7c79160d7 11
+  s_d8b00bedd146e9::t_d92dbcfb4b6560 1-10,12-108
+docs/data/tiers.yaml
+  s_d8b00bedd146e9::t_725ffe5f4d7a63 88
+web/scripts/sync-releases.mjs
+  s_d8b00bedd146e9::t_15ce299a15d809 120
+web/src/content/docs/releases/RELEASE_v0.40_HIGHWAY_STAR.md
+  s_d8b00bedd146e9::t_eb970e2f590c19 1-112
+web/src/docs.order.ts
+  s_d8b00bedd146e9::t_623e947e91967f 177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9d65a3ffc6ca1c5693c0c1586538673089dd8c7f",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
