@@ -1,0 +1,38 @@
+.claude/skills/net-event-bus/bindings/coverage.md
+  s_17a2ac60d914fc::t_aaa95af83946c6 100,181
+net/crates/net/examples/c/org_call.c
+  s_17a2ac60d914fc::t_645695f432700f 36,83-89,93-94,97
+  s_17a2ac60d914fc::t_48a3894c906aeb 1-35,37-82,90-92,95-96,98-312
+net/crates/net/tests/c_abi/SURFACE.md
+  s_17a2ac60d914fc::t_aaa95af83946c6 20,151,183,187,206-207,572-573,579-589,593,596,599
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_aaa95af83946c6 23
+net/crates/net/tests/c_abi/lsan_policy.toml
+  s_17a2ac60d914fc::t_ca0d5c33fe5caf 18-21,24-25,28-31,33-34
+docs/data/capabilities/event-bus.yaml
+  s_17a2ac60d914fc::t_aaa95af83946c6 379,381-382
+net/crates/net/examples/c/support/consumer_util.c
+  s_17a2ac60d914fc::t_6de2cf257146f5 341-358
+web/src/lib/generated/capability-record.json
+  s_17a2ac60d914fc::t_aaa95af83946c6 522
+net/crates/net/examples/c/support/consumer_util.h
+  s_17a2ac60d914fc::t_d335281c9727d3 101-105
+.github/scripts/run-c-consumers.py
+  s_17a2ac60d914fc::t_fdfce1b8f156cd 519-555,599
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8c24e7b9d4e74a57b997a38051dfef54ed1a8585",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
