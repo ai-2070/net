@@ -460,36 +460,52 @@ def cfg_exprs(attr_text: str, pattern: re.Pattern = _CFG_ATTR) -> list[str]:
     return out
 
 
-_HOST_CFG: dict[str, str] | None = None
+_TARGET_CFG: dict[str | None, dict[str, str]] = {}
+
+# Pointer width by the triple's architecture, for when rustc cannot answer.
+_ARCH_WIDTH = {"x86_64": "64", "aarch64": "64", "riscv64": "64", "powerpc64": "64",
+               "s390x": "64", "loongarch64": "64", "x86": "32", "arm": "32", "riscv32": "32",
+               "wasm32": "32"}
 
 
-def host_cfg() -> dict[str, str]:
-    """`target_arch` and `target_pointer_width` of the host rustc (the target
-    the audited bundle was built for), from `rustc --print cfg`. Falls back
-    to x86_64 / 64 when rustc is unavailable."""
-    global _HOST_CFG
-    if _HOST_CFG is None:
-        cfg = {"target_arch": "x86_64", "target_pointer_width": "64"}
+def target_cfg(triple: str | None = None) -> dict[str, str]:
+    """`target_arch` and `target_pointer_width` of `triple` (the target the
+    audited bundle was built for, from its PROVENANCE), from
+    `rustc --print cfg --target`, which answers for any built-in target
+    without its standard library installed. With no triple, the host
+    rustc's. If rustc cannot answer, the triple's own architecture field
+    decides; only with neither is it x86_64 / 64."""
+    if triple not in _TARGET_CFG:
+        cfg: dict[str, str] = {}
+        cmd = ["rustc", "--print", "cfg"] + (["--target", triple] if triple else [])
         try:
-            out = subprocess.run(["rustc", "--print", "cfg"], capture_output=True, text=True).stdout
+            out = subprocess.run(cmd, capture_output=True, text=True).stdout
         except OSError:
             out = ""
         for line in out.splitlines():
             m = re.fullmatch(r'(target_arch|target_pointer_width)="([^"]+)"', line.strip())
             if m:
                 cfg[m.group(1)] = m.group(2)
-        _HOST_CFG = cfg
-    return _HOST_CFG
+        if triple and "target_arch" not in cfg:
+            arch = triple.split("-", 1)[0]
+            arch = "x86" if re.fullmatch(r"i[3-6]86", arch) else arch
+            arch = "arm" if arch.startswith(("arm", "thumb")) else arch
+            cfg = {"target_arch": arch, "target_pointer_width": _ARCH_WIDTH.get(arch, "64")}
+        cfg.setdefault("target_arch", "x86_64")
+        cfg.setdefault("target_pointer_width", "64")
+        _TARGET_CFG[triple] = cfg
+    return _TARGET_CFG[triple]
 
 
-def eval_cfg(expr: str, features: set[str], target_os: str) -> bool:
-    """Evaluate a cfg predicate. Unknown predicates raise, so a new kind of
-    gate is noticed rather than silently guessed."""
+def eval_cfg(expr: str, features: set[str], target_os: str, triple: str | None = None) -> bool:
+    """Evaluate a cfg predicate for `triple` (the host when None). Unknown
+    predicates raise, so a new kind of gate is noticed rather than silently
+    guessed."""
     expr = expr.strip()
     m = re.fullmatch(r"(all|any|not)\s*\((.*)\)", expr, re.S)
     if m:
         parts = _split_top(m.group(2))
-        vals = [eval_cfg(p, features, target_os) for p in parts if p.strip()]
+        vals = [eval_cfg(p, features, target_os, triple) for p in parts if p.strip()]
         if m.group(1) == "all":
             return all(vals)
         if m.group(1) == "any":
@@ -508,7 +524,7 @@ def eval_cfg(expr: str, features: set[str], target_os: str) -> bool:
         return m.group(1) == ("windows" if target_os == "windows" else "unix")
     m = re.fullmatch(r'target_pointer_width\s*=\s*"(\d+)"', expr)
     if m:
-        return m.group(1) == host_cfg()["target_pointer_width"]
+        return m.group(1) == target_cfg(triple)["target_pointer_width"]
     if expr == "windows":
         return target_os == "windows"
     if expr == "unix":
@@ -517,7 +533,7 @@ def eval_cfg(expr: str, features: set[str], target_os: str) -> bool:
         return False
     m = re.fullmatch(r'target_arch\s*=\s*"([^"]+)"', expr)
     if m:
-        return m.group(1) == host_cfg()["target_arch"]
+        return m.group(1) == target_cfg(triple)["target_arch"]
     raise ValueError(f"unknown cfg predicate: {expr}")
 
 

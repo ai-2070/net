@@ -173,7 +173,7 @@ def load_rust_consts(crate_dir: Path, crates: dict[str, M.Crate]) -> dict[str, l
     return out
 
 
-def load_rust(crate_dir: Path, profile: str, target_os: str) -> dict[str, list[M.RustDef]]:
+def load_rust(crate_dir: Path, profile: str, target_os: str, triple: str | None = None) -> dict[str, list[M.RustDef]]:
     crates = ffi_crates(crate_dir)
     feats = M.resolved_features(crate_dir, "net-ffi", PROFILE_FEATURES[profile])
     defs: dict[str, list[M.RustDef]] = defaultdict(list)
@@ -182,7 +182,7 @@ def load_rust(crate_dir: Path, profile: str, target_os: str) -> dict[str, list[M
         for d in M.rust_defs(crate):
             if not d.exported:
                 continue
-            d.active = all(M.eval_cfg(e, feats.get(d.crate, set()), target_os) for e in d.cfgs)
+            d.active = all(M.eval_cfg(e, feats.get(d.crate, set()), target_os, triple) for e in d.cfgs)
             d.sig = M.Fn(parser.parse(d.sig_text[1]), tuple(parser.parse(a) for a in d.sig_text[0]))
             defs[d.name].append(d)
     return defs
@@ -208,7 +208,7 @@ def load_model(bundle: Path, crate_dir: Path = CRATE) -> Model:
         for line in (bundle / "EXPORTS").read_text(encoding="utf-8").splitlines()
         if line.strip()
     }
-    model = Model(headers, decls, load_rust(crate_dir, profile, target_os), exports, profile)
+    model = Model(headers, decls, load_rust(crate_dir, profile, target_os, prov["target"]), exports, profile)
     crates = ffi_crates(crate_dir)
     model.rust_consts = load_rust_consts(crate_dir, crates)
     model.crates = crates
@@ -1182,6 +1182,12 @@ def self_test() -> int:
         except ValueError:
             ok = True
         print(f"{'✓' if ok else '✗'} self-test: an unknown cfg predicate is an error, not a guess")
+        failures += 0 if ok else 1
+        # Arch and pointer width come from the bundle's target, not the host.
+        ok = (M.eval_cfg('target_pointer_width = "32"', set(), "windows", "i686-pc-windows-msvc")
+              and M.eval_cfg('target_arch = "aarch64"', set(), "linux", "aarch64-unknown-linux-gnu")
+              and not M.eval_cfg('target_arch = "x86_64"', set(), "linux", "aarch64-unknown-linux-gnu"))
+        print(f"{'✓' if ok else '✗'} self-test: target_arch / target_pointer_width follow the bundle's target triple")
         failures += 0 if ok else 1
     return 1 if failures else 0
 
