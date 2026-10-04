@@ -10,11 +10,11 @@ both.
 
 | Header | Declared | Called by a consumer | Called by any C program |
 | --- | ---: | ---: | ---: |
-| `net.go.h` | 218 | 41 | 58 |
-| `net.h` | 41 | 2 | 6 |
+| `net.go.h` | 218 | 48 | 65 |
+| `net.h` | 41 | 9 | 13 |
 | `net_cortex.h` | 92 | 2 | 8 |
 | `net_deck.h` | 84 | 0 | 0 |
-| `net_mcp.h` | 22 | 0 | 0 |
+| `net_mcp.h` | 22 | 20 | 20 |
 | `net_meshdb.h` | 27 | 0 | 0 |
 | `net_meshos.h` | 23 | 0 | 0 |
 | `net_org.h` | 30 | 0 | 15 |
@@ -226,13 +226,13 @@ both.
 | `net_predicate_redact_metadata_keys` | capabilities | – | – |
 | `net_predicate_redact_trace_metadata_keys` | – | – | – |
 | `net_predicate_to_where_header` | capabilities | – | – |
-| `net_redis_dedup_capacity` | – | – | – |
-| `net_redis_dedup_clear` | – | – | – |
-| `net_redis_dedup_free` | – | – | – |
-| `net_redis_dedup_is_duplicate` | – | – | – |
-| `net_redis_dedup_is_empty` | – | – | – |
-| `net_redis_dedup_len` | – | – | – |
-| `net_redis_dedup_new` | – | – | – |
+| `net_redis_dedup_capacity` | redis_dedup | – | – |
+| `net_redis_dedup_clear` | redis_dedup | – | – |
+| `net_redis_dedup_free` | redis_dedup | – | – |
+| `net_redis_dedup_is_duplicate` | redis_dedup | – | – |
+| `net_redis_dedup_is_empty` | redis_dedup | – | – |
+| `net_redis_dedup_len` | redis_dedup | – | – |
+| `net_redis_dedup_new` | redis_dedup | – | – |
 | `net_serve_blob_transfer` | transfer | double_free_fetch_blob, leak_fetch_blob | objectstore |
 | `net_shutdown` | – | – | hello, observe |
 | `net_stats` | – | – | – |
@@ -271,13 +271,13 @@ both.
 | `net_num_shards` | – | – | – |
 | `net_poll` | – | – | – |
 | `net_poll_ex` | – | – | – |
-| `net_redis_dedup_capacity` | – | – | – |
-| `net_redis_dedup_clear` | – | – | – |
-| `net_redis_dedup_free` | – | – | – |
-| `net_redis_dedup_is_duplicate` | – | – | – |
-| `net_redis_dedup_is_empty` | – | – | – |
-| `net_redis_dedup_len` | – | – | – |
-| `net_redis_dedup_new` | – | – | – |
+| `net_redis_dedup_capacity` | redis_dedup | – | – |
+| `net_redis_dedup_clear` | redis_dedup | – | – |
+| `net_redis_dedup_free` | redis_dedup | – | – |
+| `net_redis_dedup_is_duplicate` | redis_dedup | – | – |
+| `net_redis_dedup_is_empty` | redis_dedup | – | – |
+| `net_redis_dedup_len` | redis_dedup | – | – |
+| `net_redis_dedup_new` | redis_dedup | – | – |
 | `net_register_channel` | – | – | – |
 | `net_registry_client_free` | – | – | – |
 | `net_registry_client_list` | – | – | – |
@@ -481,28 +481,28 @@ both.
 
 | Function | Consumers | Arming | Skill examples |
 | --- | --- | --- | --- |
-| `net_mcp_cap_id_canonicalize` | – | – | – |
-| `net_mcp_classify` | – | – | – |
-| `net_mcp_clear_last_error` | – | – | – |
-| `net_mcp_consent_policy_allow` | – | – | – |
-| `net_mcp_consent_policy_decide` | – | – | – |
-| `net_mcp_consent_policy_free` | – | – | – |
-| `net_mcp_consent_policy_is_pinned` | – | – | – |
-| `net_mcp_consent_policy_new` | – | – | – |
-| `net_mcp_consent_policy_pin` | – | – | – |
-| `net_mcp_consent_policy_pinned` | – | – | – |
-| `net_mcp_consent_policy_unpin` | – | – | – |
-| `net_mcp_credential_requires_consent` | – | – | – |
-| `net_mcp_free_string` | – | – | – |
+| `net_mcp_cap_id_canonicalize` | mcp | – | – |
+| `net_mcp_classify` | mcp | – | – |
+| `net_mcp_clear_last_error` | mcp | – | – |
+| `net_mcp_consent_policy_allow` | mcp | – | – |
+| `net_mcp_consent_policy_decide` | mcp | – | – |
+| `net_mcp_consent_policy_free` | mcp | – | – |
+| `net_mcp_consent_policy_is_pinned` | mcp | – | – |
+| `net_mcp_consent_policy_new` | mcp | – | – |
+| `net_mcp_consent_policy_pin` | mcp | – | – |
+| `net_mcp_consent_policy_pinned` | mcp | – | – |
+| `net_mcp_consent_policy_unpin` | mcp | – | – |
+| `net_mcp_credential_requires_consent` | mcp | – | – |
+| `net_mcp_free_string` | mcp | – | – |
 | `net_mcp_last_error_kind` | – | – | – |
-| `net_mcp_last_error_message` | – | – | – |
-| `net_mcp_lower_tool` | – | – | – |
-| `net_mcp_pin_approve` | – | – | – |
-| `net_mcp_pin_is_approved` | – | – | – |
-| `net_mcp_pin_list` | – | – | – |
+| `net_mcp_last_error_message` | mcp | – | – |
+| `net_mcp_lower_tool` | mcp | – | – |
+| `net_mcp_pin_approve` | mcp | – | – |
+| `net_mcp_pin_is_approved` | mcp | – | – |
+| `net_mcp_pin_list` | mcp | – | – |
 | `net_mcp_pin_reject` | – | – | – |
-| `net_mcp_pin_request` | – | – | – |
-| `net_mcp_pin_state` | – | – | – |
+| `net_mcp_pin_request` | mcp | – | – |
+| `net_mcp_pin_state` | mcp | – | – |
 
 ## `net_meshdb.h`
 

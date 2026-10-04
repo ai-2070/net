@@ -11,3 +11,5 @@ blob_callbacks 31
 rpc_callbacks 26
 rpc_no_free 4
 capabilities 287
+mcp 79
+redis_dedup 25

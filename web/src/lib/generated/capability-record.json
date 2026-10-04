@@ -439,7 +439,7 @@
     "MCP bridge": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
           "status": "supported"
@@ -727,7 +727,7 @@
     "Redis Streams dedup": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
           "status": "supported"

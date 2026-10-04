@@ -469,9 +469,10 @@ operations:
       status: supported
       anchor: McpError
     C:
-      status: partial
+      status: supported
       anchor: net_mcp_classify
-      gap: 'No C program CI runs calls it (Go reaches it through go/mcp.go).'
+      evidence:
+      - net/crates/net/examples/c/mcp.c
 - operation: Dataforts — blobs
   bindings:
     Rust:
@@ -600,6 +601,7 @@ operations:
       status: supported
       anchor: RedisStreamDedup
     C:
-      status: partial
+      status: supported
       anchor: net_redis_dedup_new
-      gap: 'No C program CI runs calls it (Go reaches it through go/redis_dedup.go).'
+      evidence:
+      - net/crates/net/examples/c/redis_dedup.c
