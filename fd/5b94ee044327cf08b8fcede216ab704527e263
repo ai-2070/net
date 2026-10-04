@@ -1,0 +1,25 @@
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_b6680f73489ae4 984-994,1214-1215
+.github/scripts/run-c-consumers.py
+  s_17a2ac60d914fc::t_7be4ff787c4ea8 199-206,566,774,777-779
+  s_17a2ac60d914fc::t_2976164dd02611 773,775-776
+net/crates/net/tests/c_abi/lsan_policy.toml
+  s_17a2ac60d914fc::t_b6680f73489ae4 28
+  s_17a2ac60d914fc::t_ea3f0ced2c647c 29-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fd5b94ee044327cf08b8fcede216ab704527e263",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
