@@ -1,0 +1,47 @@
+.github/workflows/skills.yml
+  s_17a2ac60d914fc::t_48815f4afa43bc 174-176,178
+net/crates/net/include/net_transport.h
+  s_17a2ac60d914fc::t_d9193009129cb1 73-77
+.claude/skills/net-event-bus/bindings/c.md
+  s_17a2ac60d914fc::t_46e8a5f59b683d 89-91
+.github/workflows/ci.yml
+  s_17a2ac60d914fc::t_48815f4afa43bc 46-48,50
+.github/workflows/docs-api.yml
+  s_17a2ac60d914fc::t_48815f4afa43bc 66-68,70
+.github/workflows/web.yml
+  s_17a2ac60d914fc::t_48815f4afa43bc 66-68,70
+net/crates/net/src/ffi/cortex.rs
+  s_17a2ac60d914fc::t_d9193009129cb1 91-93
+net/crates/net/tests/c_abi/allowlist.toml
+  s_17a2ac60d914fc::t_d9193009129cb1 12-13,28-30
+net/crates/net/include/README.md
+  s_17a2ac60d914fc::t_46e8a5f59b683d 120-122,140-142,165-168
+.github/workflows/coverage.yml
+  s_17a2ac60d914fc::t_48815f4afa43bc 42-44,46
+net/crates/net/include/net_rpc.h
+  s_17a2ac60d914fc::t_fca7cd9b420966 656-662
+  s_17a2ac60d914fc::t_7f1eebb5d9310a 578-579
+  s_17a2ac60d914fc::t_09b4f8ba0b3f81 608-610
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_11dbf56e92f9ad 5-7,44,361
+.github/workflows/panic-probe-witness.yml
+  s_17a2ac60d914fc::t_48815f4afa43bc 36-38,40
+web/src/content/docs/sdk/c/memory-and-threading.md
+  s_17a2ac60d914fc::t_46e8a5f59b683d 33,36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f504c5057e18b5284f20dcdc769689fe1930c1bc",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
