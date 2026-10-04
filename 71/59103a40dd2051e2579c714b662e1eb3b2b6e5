@@ -1,0 +1,35 @@
+net/crates/net/tests/rtc_browser/driver/driver.mjs
+  s_598a2462cc770b::t_f31d43e4700141 255-266
+net/crates/net/tests/rtc_browser/runner/src/stage6.rs
+  s_598a2462cc770b::t_794cf739c514a4 2238-2240
+  s_598a2462cc770b::t_9c6439c4474d8f 2171-2172,2202-2205
+  s_598a2462cc770b::t_07624f62c7085b 2173-2200,2206-2210
+  s_598a2462cc770b::t_3f9bcd825b0dbe 2221
+.github/workflows/ci.yml
+  s_598a2462cc770b::t_e366a15a6db838 7525-7534
+net/crates/net/tests/rtc_browser/runner/src/main.rs
+  s_598a2462cc770b::t_13300286bd36b9 2644-2681
+net/crates/net/tests/rtc_browser/runner/src/org_stream.rs
+  s_598a2462cc770b::t_3bdb108c02b538 5000-5004,5006-5011
+  s_598a2462cc770b::t_b399080d35fe03 5054-5058
+  s_598a2462cc770b::t_0c1481beb76730 225-232
+  s_598a2462cc770b::t_b12502e7abc02e 5193-5201
+net/crates/net/tests/rtc_browser/page/leaf5.js
+  s_598a2462cc770b::t_3fd3141403bd00 697-705
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7159103a40dd2051e2579c714b662e1eb3b2b6e5",
+  "prompts": {},
+  "sessions": {
+    "s_598a2462cc770b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83d8136c-f4b9-496a-a434-7d2d5fb91615",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
