@@ -1,0 +1,32 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_598a2462cc770b::t_58e66e42be4ed8 24839-24850
+  s_598a2462cc770b::t_d3fbe6f58f4f79 56898-56931
+  s_9023e047bdb7d7::t_9b4b318b21a7db 56932-56937
+net/crates/net/tests/rtc_signalling.rs
+  s_598a2462cc770b::t_3190fc25404080 1535-1540,1542-1547
+  s_598a2462cc770b::t_b2cb6d0ec4eae7 1502-1503
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "695b58acf378c86da1686f08ad86ee7fc4d64720",
+  "prompts": {},
+  "sessions": {
+    "s_598a2462cc770b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83d8136c-f4b9-496a-a434-7d2d5fb91615",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_9023e047bdb7d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13ae6289-5780-436a-aa27-88954cc36586",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
