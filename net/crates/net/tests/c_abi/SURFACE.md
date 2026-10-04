@@ -16,7 +16,7 @@ both.
 | `net_deck.h` | 84 | 62 | 62 |
 | `net_mcp.h` | 22 | 20 | 20 |
 | `net_meshdb.h` | 27 | 24 | 24 |
-| `net_meshos.h` | 23 | 21 | 21 |
+| `net_meshos.h` | 23 | 22 | 22 |
 | `net_org.h` | 30 | 18 | 22 |
 | `net_rpc.h` | 70 | 10 | 17 |
 | `net_subnet.h` | 4 | 3 | 3 |
@@ -547,7 +547,7 @@ both.
 | `net_meshos_handle_daemon_name` | meshos | – | – |
 | `net_meshos_handle_free` | meshos | – | – |
 | `net_meshos_last_error_kind` | meshos | – | – |
-| `net_meshos_last_error_message` | – | – | – |
+| `net_meshos_last_error_message` | meshos | – | – |
 | `net_meshos_metadata` | meshos | – | – |
 | `net_meshos_next_control` | meshos | – | – |
 | `net_meshos_process_emit` | meshos | – | – |

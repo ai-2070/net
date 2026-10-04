@@ -73,7 +73,7 @@ static int run(void) {
     const uint64_t small_size = sizeof small - 1;
     uint8_t big[64];
     size_t big_len;
-    int i;
+    int i, rc;
 
     /* ---- adapters (net_mesh_blob_adapter_new_v2) ---- */
 
@@ -125,8 +125,12 @@ static int run(void) {
              out_len == 4196 && memcmp(out, nine + 4 * MIB - 100, out_len) == 0);
     net_blob_free_buffer(out, out_len);
     out = NULL;
-    CU_CHECK("net_mesh_blob_adapter_fetch: a whole tree is refused (fetch_range is the way)",
-             net_mesh_blob_adapter_fetch(cached, ref, ref_len, &out, &out_len) != 0);
+    /* The backend's refusal, not an argument error (-1) or a miss: the
+     * adapter has the tree and will not return it whole. */
+    rc = net_mesh_blob_adapter_fetch(cached, ref, ref_len, &out, &out_len);
+    CU_CHECK_RC("net_mesh_blob_adapter_fetch: a whole tree is refused (fetch_range is the way)", rc,
+                NET_ERR_BLOB_BACKEND);
+    CU_CHECK("whole-tree refusal: no buffer", out == NULL);
     CU_CHECK_RC("tree_node_cache_stats: with a cache",
                 net_mesh_blob_adapter_tree_node_cache_stats(cached, &json), 0);
     {

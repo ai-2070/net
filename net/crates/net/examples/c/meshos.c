@@ -72,7 +72,7 @@ int main(void) {
         CLM_FN(net_meshos_register_daemon_with_vtable_v2), CLM_FN(net_meshos_handle_daemon_id),
         CLM_FN(net_meshos_next_control),       CLM_FN(net_meshos_publish_log),
         CLM_FN(net_meshos_metadata),           CLM_FN(net_meshos_graceful_shutdown),
-        CLM_FN(net_meshos_handle_free),        CLM_FN(net_meshos_last_error_kind),
+        CLM_FN(net_meshos_handle_free),        CLM_FN(net_meshos_last_error_kind), CLM_FN(net_meshos_last_error_message),
         CLM_FN(net_meshos_free_string),
         CLM_FN(net_meshos_clear_last_error),
         CLM_FN(net_meshos_handle_daemon_name),
@@ -83,7 +83,7 @@ int main(void) {
         CLM_FN(net_meshos_sdk_dropped_control_events),
         CLM_FN(net_meshos_try_next_control),
     };
-    uint8_t seed_a[32], seed_b[32];
+    uint8_t seed_a[32], seed_b[32], seed_c[32];
     NetMeshOsSdk* sdk = NULL;
     NetMeshOsHandle *plain = NULL, *daemon = NULL, *refused = NULL;
     NetMeshOsDaemonVtable vt, no_process;
@@ -100,6 +100,7 @@ int main(void) {
     CU_CHECK("a mutex for the destroy count", lock != NULL);
     memset(seed_a, 0x31, sizeof seed_a);
     memset(seed_b, 0x32, sizeof seed_b);
+    memset(seed_c, 0x33, sizeof seed_c);
 
     CU_CHECK_RC("net_meshos_sdk_start: defaults", net_meshos_sdk_start(0, 50, 0, 0, 0, &sdk), NET_MESHOS_OK);
     CU_CHECK("net_meshos_sdk_dropped_control_events: 0", net_meshos_sdk_dropped_control_events(sdk) == 0);
@@ -121,9 +122,13 @@ int main(void) {
     CU_CHECK("vtable daemon: its own id", net_meshos_handle_daemon_id(daemon) != 0 &&
                                               net_meshos_handle_daemon_id(daemon) != id);
     memset(&no_process, 0, sizeof no_process);
-    CU_CHECK("register: a vtable without process is refused",
-             net_meshos_register_daemon_with_vtable(sdk, "c-bad", 5, seed_b, &no_process, NULL, &refused) !=
-                 NET_MESHOS_OK);
+    /* A seed no daemon holds, so nothing but the missing `process` can be
+     * the reason for the refusal. */
+    CU_CHECK_RC("register: a vtable without process is NET_MESHOS_ERR_INVALID_ARG",
+                net_meshos_register_daemon_with_vtable(sdk, "c-bad", 5, seed_c, &no_process, NULL, &refused),
+                NET_MESHOS_ERR_INVALID_ARG);
+    CU_CHECK("register refused: for the missing process callback",
+             net_meshos_last_error_message() != NULL && strstr(net_meshos_last_error_message(), "process") != NULL);
     CU_CHECK("register refused: no handle", refused == NULL);
 
     memset(&ctl, 0xFF, sizeof ctl);
@@ -140,7 +145,8 @@ int main(void) {
     }
     CU_CHECK("net_meshos_publish_log: an unknown level is refused",
              net_meshos_publish_log(plain, 77, "x", 1) != NET_MESHOS_OK);
-    CU_CHECK("the refusal sets the last error kind", net_meshos_last_error_kind() != NULL);
+    CU_CHECK("the refusal sets the last error kind: invalid_log_level",
+             net_meshos_last_error_kind() != NULL && strcmp(net_meshos_last_error_kind(), "invalid_log_level") == 0);
     net_meshos_clear_last_error();
     CU_CHECK("net_meshos_clear_last_error", net_meshos_last_error_kind() == NULL);
 
@@ -185,7 +191,7 @@ int main(void) {
     net_meshos_sdk_free(NULL);
     net_meshos_handle_free(NULL);
     net_meshos_free_string(NULL);
-    CU_CHECK("every free accepts NULL", 1);
+    CU_SURVIVED("every free accepts NULL");
     cu_mutex_free(lock);
     return cu_finish();
 }
