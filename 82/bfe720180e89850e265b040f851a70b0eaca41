@@ -1,0 +1,29 @@
+.github/workflows/skills.yml
+  s_17a2ac60d914fc::t_6f98e0bf6c975f 168-175
+.github/workflows/ci.yml
+  s_17a2ac60d914fc::t_6f98e0bf6c975f 44-51
+.github/workflows/docs-api.yml
+  s_17a2ac60d914fc::t_6f98e0bf6c975f 64-71
+.github/workflows/panic-probe-witness.yml
+  s_17a2ac60d914fc::t_6f98e0bf6c975f 34-41
+.github/workflows/web.yml
+  s_17a2ac60d914fc::t_6f98e0bf6c975f 64-71
+.github/workflows/coverage.yml
+  s_17a2ac60d914fc::t_6f98e0bf6c975f 40-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "82bfe720180e89850e265b040f851a70b0eaca41",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
