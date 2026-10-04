@@ -1,0 +1,34 @@
+docs/data/capabilities/event-bus.yaml
+  s_17a2ac60d914fc::t_0cec4c7c6245d4 589-591
+net/crates/net/tests/c_abi/SURFACE.md
+  s_17a2ac60d914fc::t_0cec4c7c6245d4 16,395-409,411,413-414,416-418,421,424-427,431,436,438-443,447-448,450-451,453-474,477-478
+net/crates/net/examples/c/FLOORS
+  s_17a2ac60d914fc::t_0cec4c7c6245d4 18
+.claude/skills/net-event-bus/bindings/coverage.md
+  s_17a2ac60d914fc::t_0cec4c7c6245d4 192
+net/crates/net/examples/c/deck.c
+  s_17a2ac60d914fc::t_c5f17fff73a386 191-198
+  s_17a2ac60d914fc::t_80f4ca060a281a 1-11,16-93,97-99,107-108,111,133-190,199-294,296-311,313-329
+  s_17a2ac60d914fc::t_b520577d5f2f3d 105
+  s_17a2ac60d914fc::t_af7e8c8d3c8790 12,94-96,100-104,106,109-110,112-113,115-126,132,295,312
+  s_17a2ac60d914fc::t_9ddf90ae0b666e 13-15
+  s_17a2ac60d914fc::t_d586a23971489c 114,127-131
+docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md
+  s_17a2ac60d914fc::t_0cec4c7c6245d4 1272-1283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c86d193a9071d42020e1c006530cb449d200deff",
+  "prompts": {},
+  "sessions": {
+    "s_17a2ac60d914fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53b86739-5010-4147-8a83-687788225cd4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
