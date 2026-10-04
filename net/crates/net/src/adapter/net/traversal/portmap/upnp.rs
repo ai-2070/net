@@ -158,10 +158,10 @@ impl UpnpMapper {
         if let Some(gw) = self.cached_gateway() {
             return Ok(gw);
         }
-        let opts = SearchOptions {
-            timeout: Some(UPNP_SEARCH_TIMEOUT),
-            ..Default::default()
-        };
+        // `SearchOptions` is `#[non_exhaustive]` (igd-next 0.18), so
+        // it can't be built with a struct expression.
+        let mut opts = SearchOptions::default();
+        opts.timeout = Some(UPNP_SEARCH_TIMEOUT);
         let gw = igd_next::aio::tokio::search_gateway(opts)
             .await
             .map_err(search_err_to_port_mapping)?;
