@@ -419,7 +419,7 @@
     "Gang-claim scheduler": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
           "status": "supported"
@@ -479,7 +479,7 @@
     "Mesh streams": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
           "status": "supported"

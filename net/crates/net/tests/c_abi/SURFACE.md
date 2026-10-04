@@ -10,7 +10,7 @@ both.
 
 | Header | Declared | Called by a consumer | Called by any C program |
 | --- | ---: | ---: | ---: |
-| `net.go.h` | 218 | 86 | 103 |
+| `net.go.h` | 218 | 105 | 120 |
 | `net.h` | 41 | 9 | 13 |
 | `net_cortex.h` | 92 | 2 | 8 |
 | `net_deck.h` | 84 | 62 | 62 |
@@ -121,8 +121,8 @@ both.
 | `net_fetch_blob_discovered` | transfer | – | – |
 | `net_fetch_dir` | transfer | – | – |
 | `net_flush` | – | – | – |
-| `net_free_bytes` | – | – | tokenchannel |
-| `net_free_string` | capabilities, consumer_util, lifecycle, repair, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_free_bytes` | streams | – | tokenchannel |
+| `net_free_string` | capabilities, consumer_util, lifecycle, repair, streams, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_generate_keypair` | – | – | – |
 | `net_identity_at_generation` | – | – | – |
 | `net_identity_entity_id` | – | – | tokenchannel |
@@ -147,7 +147,7 @@ both.
 | `net_ingest_raw_batch` | – | – | – |
 | `net_init` | – | – | hello, observe |
 | `net_mesh_accept` | consumer_util | – | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
-| `net_mesh_announce_capabilities` | – | – | registry |
+| `net_mesh_announce_capabilities` | islands | – | registry |
 | `net_mesh_arc_clone` | compute, rpc_callbacks | – | failover, jobqueue, net_org_streaming |
 | `net_mesh_arc_free` | – | – | – |
 | `net_mesh_blob_adapter_exists` | – | – | – |
@@ -169,9 +169,9 @@ both.
 | `net_mesh_blob_adapter_tree_node_cache_stats` | tree_range | – | – |
 | `net_mesh_channel_configs_arc_clone` | compute | – | – |
 | `net_mesh_channel_configs_arc_free` | – | – | – |
-| `net_mesh_claim_island` | – | – | – |
+| `net_mesh_claim_island` | islands | – | – |
 | `net_mesh_clear_reflex_override` | – | – | – |
-| `net_mesh_close_stream` | – | – | – |
+| `net_mesh_close_stream` | streams | – | – |
 | `net_mesh_connect` | consumer_util | – | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_connect_direct` | – | – | – |
 | `net_mesh_connect_direct_auto` | – | – | – |
@@ -180,37 +180,37 @@ both.
 | `net_mesh_find_best_node_scoped` | – | – | – |
 | `net_mesh_find_nodes` | – | – | registry |
 | `net_mesh_find_nodes_scoped` | – | – | – |
-| `net_mesh_free` | compute, lifecycle, rpc_callbacks, transfer | leak_fetch_blob | jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
-| `net_mesh_match_islands` | – | – | – |
-| `net_mesh_max_event_size` | – | – | – |
+| `net_mesh_free` | compute, islands, lifecycle, rpc_callbacks, streams, transfer | leak_fetch_blob | jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_match_islands` | islands | – | – |
+| `net_mesh_max_event_size` | streams | – | – |
 | `net_mesh_nat_type` | – | – | – |
 | `net_mesh_new` | consumer_util, lifecycle | – | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
-| `net_mesh_node_id` | consumer_util, lifecycle, rpc_callbacks, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
-| `net_mesh_open_stream` | – | – | – |
-| `net_mesh_open_stream_inbox` | – | – | – |
+| `net_mesh_node_id` | consumer_util, lifecycle, rpc_callbacks, streams, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_open_stream` | streams | – | – |
+| `net_mesh_open_stream_inbox` | streams | – | – |
 | `net_mesh_peer_nat_type` | – | – | – |
 | `net_mesh_probe_reflex` | – | – | – |
 | `net_mesh_public_key_hex` | consumer_util, lifecycle | – | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_mesh_publish` | – | – | liveconfig |
-| `net_mesh_publish_island_topology` | – | – | – |
+| `net_mesh_publish_island_topology` | islands | – | – |
 | `net_mesh_reclassify_nat` | – | – | – |
 | `net_mesh_recv_shard` | – | – | liveconfig |
 | `net_mesh_reflex_addr` | – | – | – |
 | `net_mesh_register_channel` | – | – | liveconfig, tokenchannel |
-| `net_mesh_release_island` | – | – | – |
-| `net_mesh_reserve_island` | – | – | – |
-| `net_mesh_send` | – | – | – |
+| `net_mesh_release_island` | islands | – | – |
+| `net_mesh_reserve_island` | islands | – | – |
+| `net_mesh_send` | streams | – | – |
 | `net_mesh_send_blocking` | – | – | – |
 | `net_mesh_send_with_retry` | – | – | – |
 | `net_mesh_set_reflex_override` | – | – | – |
-| `net_mesh_shutdown` | compute, lifecycle, rpc_callbacks, transfer | leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
-| `net_mesh_start` | compute, lifecycle, rpc_callbacks, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
-| `net_mesh_stream_free` | – | – | – |
-| `net_mesh_stream_inbox_close` | – | – | – |
-| `net_mesh_stream_inbox_dropped` | – | – | – |
-| `net_mesh_stream_inbox_free` | – | – | – |
-| `net_mesh_stream_inbox_recv` | – | – | – |
-| `net_mesh_stream_stats` | – | – | – |
+| `net_mesh_shutdown` | compute, islands, lifecycle, rpc_callbacks, streams, transfer | leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_start` | compute, islands, lifecycle, rpc_callbacks, streams, transfer | double_free_fetch_blob, leak_fetch_blob | failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_mesh_stream_free` | streams | – | – |
+| `net_mesh_stream_inbox_close` | streams | – | – |
+| `net_mesh_stream_inbox_dropped` | streams | – | – |
+| `net_mesh_stream_inbox_free` | streams | – | – |
+| `net_mesh_stream_inbox_recv` | streams | – | – |
+| `net_mesh_stream_stats` | streams | – | – |
 | `net_mesh_subscribe_channel` | – | – | liveconfig, tokenchannel |
 | `net_mesh_subscribe_channel_with_token` | – | – | tokenchannel |
 | `net_mesh_traversal_stats` | – | – | – |
@@ -237,7 +237,7 @@ both.
 | `net_shutdown` | – | – | hello, observe |
 | `net_stats` | – | – | – |
 | `net_store_dir` | transfer | – | – |
-| `net_stream_id_from_label` | – | – | – |
+| `net_stream_id_from_label` | streams | – | – |
 | `net_token_is_expired` | – | – | – |
 | `net_transport_free_buffer` | transfer | double_free_fetch_blob | objectstore |
 | `net_validate_capabilities` | capabilities | – | – |
@@ -260,7 +260,7 @@ both.
 | `net_fold_query_client_set_ttl` | – | – | – |
 | `net_fold_query_last_error_detail` | – | – | – |
 | `net_free_poll_result` | – | – | – |
-| `net_free_string` | capabilities, consumer_util, lifecycle, repair, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
+| `net_free_string` | capabilities, consumer_util, lifecycle, repair, streams, transfer, tree_range | – | eventlog, failover, jobqueue, liveconfig, net_org_streaming, objectstore, registry, tokenchannel |
 | `net_generate_keypair` | – | – | – |
 | `net_ingest` | – | – | – |
 | `net_ingest_batch` | – | – | – |

@@ -90,11 +90,11 @@ A mode is written after the status: `supported · core-only`.
 | Distributed batch fan-out (publish_many) | supported | not exposed | not exposed | not exposed | not exposed |
 | Membership rejection reason (AckReason taxonomy) | supported | partial | partial | partial | partial |
 | Permissive channel registry (opt out of strict default) | not exposed | supported | supported | not exposed | not exposed |
-| Mesh streams | supported | supported | supported | supported | partial |
+| Mesh streams | supported | supported | supported | supported | supported |
 | Capability announce | supported | supported | supported | supported | supported |
 | Capability discovery | supported | supported | supported | supported | supported |
 | nRPC — typed request/response + streaming | supported | supported | supported | supported | supported |
-| Gang-claim scheduler | supported | supported | supported | supported | partial |
+| Gang-claim scheduler | supported | supported | supported | supported | supported |
 | A2A — agent task handoff | supported | supported | supported | not exposed | not exposed |
 | A2A — paid task admission (prepare → purchase → submit) | supported | supported | supported | not exposed | not exposed |
 | Organization capability auth | supported | supported | supported | supported | partial |
@@ -173,11 +173,11 @@ per-function record behind this is `net/crates/net/tests/c_abi/SURFACE.md`.
 | Distributed mesh channels — register / subscribe / publish | supported | `tokenchannel.c` | — |
 | Channel token roots (require_token anchoring) | supported | `liveconfig.c`, `tokenchannel.c` | — |
 | Membership rejection reason (AckReason taxonomy) | partial | — | No C program CI runs checks for this code. Partial regardless: C maps every rejection reason except unauthorized to NET_ERR_CHANNEL. |
-| Mesh streams | partial | — | No C program CI runs calls it (Go reaches it through go/mesh.go). |
+| Mesh streams | supported | `streams.c` | — |
 | Capability announce | supported | `registry.c` | — |
 | Capability discovery | supported | `registry.c` | — |
 | nRPC — typed request/response + streaming | supported | `rpc_callbacks.c`, `jobqueue.c` | — |
-| Gang-claim scheduler | partial | — | No C program CI runs calls it (Go reaches it through go/mesh.go). |
+| Gang-claim scheduler | supported | `islands.c` | — |
 | Organization capability auth | partial | — | No C program CI runs calls it (Go reaches it through go/org.go); net_org_streaming.c covers only the streaming call. |
 | Organization-scoped streaming RPC | supported | `net_org_streaming.c` | — |
 | Subnet gateway provisioning | partial | — | No C program CI runs calls it (Go reaches it through go/subnet.go). |

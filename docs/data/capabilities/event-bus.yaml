@@ -250,9 +250,10 @@ operations:
       status: supported
       anchor: OpenStream
     C:
-      status: partial
+      status: supported
       anchor: net_mesh_open_stream
-      gap: 'No C program CI runs calls it (Go reaches it through go/mesh.go).'
+      evidence:
+      - net/crates/net/examples/c/streams.c
 - operation: Capability announce
   bindings:
     Rust:
@@ -326,9 +327,10 @@ operations:
       status: supported
       anchor: ClaimIsland
     C:
-      status: partial
+      status: supported
       anchor: net_mesh_claim_island
-      gap: 'No C program CI runs calls it (Go reaches it through go/mesh.go).'
+      evidence:
+      - net/crates/net/examples/c/islands.c
 - operation: A2A — agent task handoff
   bindings:
     Rust:
