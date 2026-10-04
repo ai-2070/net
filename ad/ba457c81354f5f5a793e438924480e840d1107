@@ -1,0 +1,21 @@
+net/crates/net/examples/c/support/consumer_util.h
+  s_9023e047bdb7d7::t_563fa35f2d7911 137-138
+net/crates/net/examples/c/support/consumer_util.c
+  s_9023e047bdb7d7::t_56f7121ea51f96 451-459
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "adba457c81354f5f5a793e438924480e840d1107",
+  "prompts": {},
+  "sessions": {
+    "s_9023e047bdb7d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13ae6289-5780-436a-aa27-88954cc36586",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
