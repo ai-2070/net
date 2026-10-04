@@ -134,7 +134,8 @@ int cu_mesh_build(unsigned char seed_byte, net_meshnode_t** out, char* addr, siz
 /* Handshake `initiator` to `responder` (listening at `responder_addr`):
  * accept on a thread, connect from this one. Uses net_mesh_public_key_hex,
  * net_mesh_node_id, net_mesh_accept, net_mesh_connect and net_free_string.
- * 0 when both sides succeed. */
+ * 0 when both sides succeed. A failed connect prints FAIL and ends the
+ * process: the parked accept could not be joined or abandoned. */
 int cu_mesh_handshake(net_meshnode_t* responder, net_meshnode_t* initiator,
                       const char* responder_addr);
 

@@ -448,6 +448,15 @@ int cu_mesh_handshake(net_meshnode_t* responder, net_meshnode_t* initiator,
     /* Let the accept park before the initiator dials. */
     cu_sleep_ms(50);
     rc = net_mesh_connect(initiator, responder_addr, pub, net_mesh_node_id(responder));
+    if (rc != 0) {
+        /* The accept thread is parked until a connector dials, which now
+         * never happens, and it holds `a` on this stack frame: neither
+         * joining nor returning is safe. Fail the program here rather than
+         * hang until the runner's timeout. */
+        printf("FAIL cu_mesh_handshake: net_mesh_connect returned %d\n", rc);
+        fflush(stdout);
+        _Exit(1);
+    }
     cu_thread_join(t);
     net_free_string(pub);
     return (rc == 0 && a.rc == 0) ? 0 : -1;
