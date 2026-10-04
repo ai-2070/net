@@ -15,19 +15,23 @@
 # box, so a call racing the free fails cleanly instead of touching freed
 # memory ("Box stays leaked. See super::handle_guard":
 # src/ffi/mesh.rs net_mesh_free, src/ffi/cortex.rs net_redex_free,
-# src/ffi/blob.rs net_mesh_blob_adapter_free). One small direct block per
-# freed handle, allocated by the handle's constructor.
+# src/ffi/blob.rs net_mesh_blob_adapter_free; src/ffi/mesh.rs
+# net_mesh_stream_free; src/ffi/aggregator.rs net_registry_client_free). One
+# small direct block per freed handle, allocated by the handle's
+# constructor.
 [[direct]]
 name = "handle tombstone"
-constructors = ["net_mesh_new", "net_mesh_blob_adapter_new", "net_mesh_blob_adapter_new_v2", "net_redex_new"]
+constructors = ["net_mesh_new", "net_mesh_blob_adapter_new", "net_mesh_blob_adapter_new_v2", "net_redex_new",
+                "net_mesh_open_stream", "net_registry_client_new"]
 max_block_bytes = 64
 
-# The same keep-the-outer-box tombstone (src/ffi/redis_dedup.rs
-# net_redis_dedup_free: "Box stays leaked"), larger because this handle
-# holds its inner value inline in the box rather than behind a pointer.
+# The same keep-the-outer-box tombstone, larger because these handles carry
+# more in the box itself (src/ffi/redis_dedup.rs net_redis_dedup_free holds
+# its inner value inline; src/ffi/mesh.rs net_mesh_stream_inbox_free and
+# src/ffi/aggregator.rs net_fold_query_client_free).
 [[direct]]
-name = "handle tombstone, inline inner"
-constructors = ["net_redis_dedup_new"]
+name = "handle tombstone, larger box"
+constructors = ["net_redis_dedup_new", "net_mesh_open_stream_inbox", "net_fold_query_client_new"]
 max_block_bytes = 128
 
 # No indirect leak is accepted. D-C5-1 (a MeshNode never reclaimed after

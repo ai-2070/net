@@ -519,7 +519,7 @@
     "Organization capability auth": {
       "bindings": {
         "C": {
-          "status": "partial"
+          "status": "supported"
         },
         "Go": {
           "status": "supported"

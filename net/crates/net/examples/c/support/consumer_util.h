@@ -98,6 +98,11 @@ int cu_json_u64(const char* json, const char* key, uint64_t* out);
 int cu_json_bool(const char* json, const char* key);
 /* 1 if `"key":` appears at all. */
 int cu_json_has(const char* json, const char* key);
+/* The string value of the first `"key":"..."` at or after `from` (and
+ * before `end`, when not NULL), copied into `out`. 0 on success; -1 if
+ * absent, not a string, or longer than `cap - 1`. Escapes are not decoded:
+ * enough for the generated scenario manifests (hex, names, relative paths). */
+int cu_json_str(const char* from, const char* end, const char* key, char* out, size_t cap);
 
 /* `n` chunks of `size` bytes, each a distinct repeating 4-byte pattern —
  * the same bytes as Go's distinctChunks (go/blob_tree_test.go), so the

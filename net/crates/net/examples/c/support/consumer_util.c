@@ -338,6 +338,24 @@ int cu_json_has(const char* json, const char* key) {
     return cu_json_value(json, key) != NULL;
 }
 
+int cu_json_str(const char* from, const char* end, const char* key, char* out, size_t cap) {
+    const char* v = cu_json_value(from, key);
+    const char* close;
+    size_t n;
+    if (v == NULL || (end != NULL && v >= end) || *v != '"') {
+        return -1;
+    }
+    v++;
+    close = strchr(v, '"');
+    if (close == NULL || (size_t)(close - v) + 1 > cap) {
+        return -1;
+    }
+    n = (size_t)(close - v);
+    memcpy(out, v, n);
+    out[n] = '\0';
+    return 0;
+}
+
 unsigned char* cu_distinct_chunks(size_t n, size_t size) {
     unsigned char* out = (unsigned char*)malloc(n * size);
     size_t i, j;

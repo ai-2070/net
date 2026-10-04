@@ -97,7 +97,7 @@ A mode is written after the status: `supported · core-only`.
 | Gang-claim scheduler | supported | supported | supported | supported | supported |
 | A2A — agent task handoff | supported | supported | supported | not exposed | not exposed |
 | A2A — paid task admission (prepare → purchase → submit) | supported | supported | supported | not exposed | not exposed |
-| Organization capability auth | supported | supported | supported | supported | partial |
+| Organization capability auth | supported | supported | supported | supported | supported |
 | Organization-scoped streaming RPC | supported | supported | supported | supported | supported |
 | Subnet gateway provisioning | supported | supported | supported | supported | partial |
 | Subnet-exported nRPC serve | supported | supported | supported | supported | partial |
@@ -178,7 +178,7 @@ per-function record behind this is `net/crates/net/tests/c_abi/SURFACE.md`.
 | Capability discovery | supported | `registry.c` | — |
 | nRPC — typed request/response + streaming | supported | `rpc_callbacks.c`, `jobqueue.c` | — |
 | Gang-claim scheduler | supported | `islands.c` | — |
-| Organization capability auth | partial | — | No C program CI runs calls it (Go reaches it through go/org.go); net_org_streaming.c covers only the streaming call. |
+| Organization capability auth | supported | `org_call.c` | — |
 | Organization-scoped streaming RPC | supported | `net_org_streaming.c` | — |
 | Subnet gateway provisioning | partial | — | No C program CI runs calls it (Go reaches it through go/subnet.go). |
 | Subnet-exported nRPC serve | partial | — | No C program CI runs calls it (Go reaches it through go/subnet.go). |

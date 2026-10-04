@@ -376,9 +376,10 @@ operations:
       status: supported
       anchor: ServeOrgBytes
     C:
-      status: partial
+      status: supported
       anchor: net_org_call
-      gap: 'No C program CI runs calls it (Go reaches it through go/org.go); net_org_streaming.c covers only the streaming call.'
+      evidence:
+      - net/crates/net/examples/c/org_call.c
 # The streaming half of the org surface, recorded separately from the unary row
 # above because the anchors are disjoint: a binding can have `serve_org` and no
 # streaming verb (a frozen pre-streaming provider), which is exactly the

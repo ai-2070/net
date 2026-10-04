@@ -516,6 +516,43 @@ def read_floors(path: Path = FLOORS) -> dict[str, int]:
 
 
 BUNDLE_MARK = re.compile(r"NET-BUNDLE:\s*(\w+)")
+NEEDS_MARK = re.compile(r"NET-NEEDS:\s*([\w-]+)")
+
+# Scenarios a program can need (`NET-NEEDS: <name>` in its header comment):
+# issued credentials no C program can mint, from the in-repo generators the
+# other bindings' live tests load. Generated fresh (the credentials expire),
+# once per runner invocation, and handed over as an environment variable
+# naming the manifest's directory.
+SCENARIOS = {
+    "org-scenario": ("gen_org_scenario", "NET_ORG_SCENARIO"),
+    "subnet-scenario": ("gen_subnet_scenario", "NET_SUBNET_SCENARIO"),
+}
+_scenario_dirs: dict[str, Path] = {}
+
+
+def scenario_env(src: Path, work: Path) -> dict[str, str]:
+    """The environment variables naming the scenarios `src` needs,
+    generating each the first time it is asked for."""
+    env = {}
+    for need in NEEDS_MARK.findall(src.read_text(encoding="utf-8")[:4000]):
+        if need not in SCENARIOS:
+            raise SystemExit(f"FAIL  {src.name}: unknown NET-NEEDS {need!r}")
+        example, var = SCENARIOS[need]
+        if need not in _scenario_dirs:
+            out = (work / "scenarios" / need).resolve()
+            if out.exists():
+                shutil.rmtree(out)
+            cmd = ["cargo", "run", "-q", "--release", "--manifest-path",
+                   str(ROOT / "net" / "crates" / "net" / "Cargo.toml"), "-p", "net-mesh-sdk",
+                   "--features", "net,cortex,fixtures", "--example", example, "--", str(out)]
+            run = subprocess.run(cmd, capture_output=True, text=True)
+            if run.returncode != 0 or not (out / "manifest.json").is_file():
+                print(f"✗ {src.stem}: generating {need} failed")
+                sys.stdout.write(_indent(run.stdout + run.stderr))
+                raise SystemExit(1)
+            _scenario_dirs[need] = out
+        env[var] = str(_scenario_dirs[need])
+    return env
 
 
 def required_profile(src: Path) -> str | None:
@@ -559,7 +596,7 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
                       "not the toolchain it claims")
                 failures += 1
                 continue
-        env = child_env(bundle, sanitizer_env() if args.sanitize else None)
+        env = child_env(bundle, {**(sanitizer_env() if args.sanitize else {}), **scenario_env(src, work)})
         refuse_strays(bundle, env, exe.parent)
         rc, out = execute(args, exe, env)
         v = classify(out, rc, bundle.library, bundle.sha256)
