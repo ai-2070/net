@@ -239,8 +239,20 @@ def diff_changes(
     return files, consts, extern_c
 
 
-def violations(consts: set[str], extern_c: bool, touched: set[str]) -> list[str]:
-    """Rule verdict for one commit; empty means it landed atomically."""
+def violations(
+    consts: set[str],
+    extern_c: bool,
+    touched: set[str],
+    mirrored: set[str] | None = None,
+) -> list[str]:
+    """Rule verdict for one commit; empty means it landed atomically.
+
+    `mirrored` names the constants a mirrored header (net.go.h,
+    net_cortex.h) declares before or after the commit. A changed constant
+    in that set needs its Go mirror whatever other headers the commit
+    touched. `None` (synthetic diffs) means no constant is known to be
+    mirrored.
+    """
     if not consts and not extern_c:
         return []
     groups = {
@@ -255,11 +267,18 @@ def violations(consts: set[str], extern_c: bool, touched: set[str]) -> list[str]
     # side is confined to other headers (net_rpc.h, net_org.h, ...) has no
     # mirror to touch; Go keeps those surfaces in cgo preambles, which the Go
     # ABI test group covers. A change touching no header at all still needs
-    # every group.
+    # every group. The waiver is decided by where each changed constant is
+    # declared, not only by which files the commit touched: a mirrored
+    # constant (NET_ERR_MESH_INIT, in net.go.h) changed beside an incidental
+    # net_rpc.h edit still needs go/net.h.
     headers_touched = {
         f for f in touched if f.startswith(C_HEADER_PREFIX) and f.endswith(".h")
     }
-    if headers_touched and not headers_touched & MIRRORED_HEADERS:
+    if (
+        headers_touched
+        and not headers_touched & MIRRORED_HEADERS
+        and not consts & (mirrored or set())
+    ):
         groups["go_headers"] = True
     missing = [label for key, label in _GROUP_LABELS.items() if not groups[key]]
     if not missing:
@@ -307,6 +326,26 @@ def ffi_sources(sha: str, patch: str) -> dict[str, tuple[str | None, str | None]
         if path and path.endswith(".rs") and path.startswith(RUST_FFI_PREFIXES):
             out[path] = (_show_at(f"{sha}^", path), _show_at(sha, path))
     return out
+
+
+def mirrored_consts(sha: str) -> set[str]:
+    """Every `NET_*` constant a mirrored header declares at `sha` or `sha^`.
+
+    Both sides: a constant the commit removes from net.go.h was mirrored,
+    and so was one it adds there.
+    """
+    names: set[str] = set()
+    for rev in (f"{sha}^", sha):
+        for path in sorted(MIRRORED_HEADERS):
+            text = _show_at(rev, path)
+            if text is None:
+                continue
+            for line in text.splitlines():
+                for rx in (_C_DEFINE, _C_ENUM):
+                    m = rx.match(line)
+                    if m:
+                        names.add(m.group(1))
+    return names
 
 
 def default_range() -> str:
@@ -364,7 +403,9 @@ def main() -> int:
             _error(f"could not read commit {sha}: {exc}")
             return 1
         files, consts, extern_c = diff_changes(patch, ffi_sources(sha, patch))
-        problems = violations(consts, extern_c, files)
+        problems = violations(
+            consts, extern_c, files, mirrored_consts(sha) if consts else None
+        )
         if problems:
             failed = 1
             _error(f"commit {sha[:9]} breaks the ABI one-commit rule", *problems)
@@ -419,6 +460,13 @@ def self_test() -> int:
     expect(
         "a change confined to an unmirrored header (net_rpc.h) needs no Go mirror header",
         violations(consts, extern_c, unmirrored) == [],
+    )
+    expect(
+        "a MIRRORED constant changed beside an unmirrored header still needs its Go mirror",
+        violations(consts, extern_c, unmirrored, {"NET_ERR_FOO"}) != []
+        and violations(
+            consts, extern_c, unmirrored | {"go/net.h"}, {"NET_ERR_FOO"}
+        ) == [],
     )
     expect(
         "the same change without its Go ABI test still violates",
