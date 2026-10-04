@@ -955,6 +955,54 @@ it does.
 - Clean runs in each checker lane, within its stated domain.
 - Each arming negative fails with its named diagnostic.
 
+**Status: three of four lanes built (2026-10-04).** Application Verifier is
+still to come: it needs an elevated process, so it cannot run on the dev
+box and will be iterated through CI.
+- **Linux sanitizer lane (`--sanitize`).** Every program again, built with
+  ASan and UBSan with no error recovery, and LeakSanitizer at exit, against
+  the uninstrumented `libnet.so`.
+  - **Arming, all three caught on the first CI run:**
+    - a leaked `net_fetch_blob` buffer, matched by its odd 4093-byte size
+      so the report is that buffer's;
+    - a double `net_transport_free_buffer`;
+    - a callback buffer freed by the program after the library already
+      released it through `free_buffer`.
+  - **Leak accounting is a classifier, not suppressions.** LSan
+    suppressions match any frame of a stack, and the handle tombstones
+    share `net_mesh_new` with the defect below, so a suppression could not
+    tell them apart. The runner parses every leak block and judges it
+    against `tests/c_abi/lsan_policy.toml`:
+    - direct blocks of 64 bytes or less from a handle constructor are
+      handle tombstones (the intended keep-the-outer-box pattern of
+      `net_mesh_free`, `net_redex_free` and `net_mesh_blob_adapter_free`);
+    - indirect blocks are accepted only in the programs named by the open
+      defect.
+    - Anything else fails, and every accepted class is printed with its
+      blocks and bytes on every run.
+  - **Replayed against the first run's real reports:**
+    - `transfer` and `tree_range`: only tombstones (16 to 24 bytes per
+      handle);
+    - `lifecycle`: tombstones plus the defect, 508 KB in 482 blocks;
+    - `rpc_callbacks`: tombstones plus the defect, 236 KB in 259 blocks.
+  - **Self-tests:** the parser and the policy, including "a leaked
+    library-returned buffer is never an accepted class".
+- **Windows debug CRT lane (`--debug-crt`, MSVC `/MDd`).**
+  - **What it does:** the identity check enables the leak check at exit
+    and heap validation every 128 allocations, with all reports on stdout
+    (never a dialog).
+  - **Domain:** the program's own CRT heap only.
+  - **Arming:** a leaked 777-byte block, and a write past an allocation's
+    end. Both are caught.
+  - **Correction:** the debug CRT dumps leaks without changing the exit
+    status, so for this lane the runner's verdict is the failing result.
+  - **First run:** a real leak in `rpc_callbacks.c` (its mutex, 40 bytes).
+    Fixed. All eight programs are clean on both bundles.
+- **Pinned MinGW-w64 lanes.** `ucrt64` (UCRT) and `mingw64` (msvcrt), from
+  MSYS2, replace the runner image's unpinned gcc. `--expect-crt` reads each
+  binary's import table and fails a lane whose binaries do not link the
+  runtime it claims. Locally, the UCRT gcc passes as `ucrt` and is refused
+  as `msvcrt`. The MSVCRT lane is measured, not predicted.
+
 ### C5b: unexercised surfaces (record only)
 
 The audit (C1) covers all eleven headers, but C2–C4 exercise only
@@ -1033,6 +1081,23 @@ Not a prerequisite for any other slice.
 - The Go binding, which has its own plan, and the browser/wasm surfaces.
 
 ## Defects found on the way
+
+Found by C5:
+
+- **D-C5-1 (open): a `MeshNode` is not reclaimed after `net_mesh_shutdown`
+  and `net_mesh_free`.** In `lifecycle.c` and `rpc_callbacks.c`, the node's
+  memory (allocations of `MeshNode::new`, task buffers, maps: about 120 KB
+  to 250 KB per node) is still allocated at exit.
+  - LSan reaches it only through the freed handle's tombstone, via the
+    stale bits of the `Arc` that `net_mesh_free` moved out. So no live
+    reference remains and the memory was never released: a leaked `Arc` or
+    a reference cycle.
+  - `transfer.c` also brings up two nodes and frees them, and does not
+    show it, so the leak is not inherent to a node's lifetime. Which call
+    path retains the node is not yet known.
+  - Out of this plan's scope to fix (core Rust). Tracked in
+    `lsan_policy.toml` so the sanitizer lane can run, and printed on every
+    run. Remove that entry with the fix.
 
 Found by C1, stage 1:
 

@@ -1,0 +1,42 @@
+# What the C consumer sanitizer lane accepts in a LeakSanitizer report (C SDK
+# plan, C5), read by run-c-consumers.py --sanitize.
+#
+# The runner parses every leak block LSan prints and classifies it here. It
+# does not use LSan suppressions: they match any frame of a stack, and the
+# handle tombstones below share `net_mesh_new` with the open defect, so a
+# suppression could not tell them apart. A block that matches nothing here
+# fails the program. Each accepted class is printed on every run with its
+# blocks and bytes, so retained memory is reported, never hidden.
+#
+# Being reachable from a static is not a claim that teardown reclaims it;
+# nothing here claims that.
+
+# Intended. Each FFI handle's free drops its inner value and keeps the outer
+# box, so a call racing the free fails cleanly instead of touching freed
+# memory ("Box stays leaked. See super::handle_guard":
+# src/ffi/mesh.rs net_mesh_free, src/ffi/cortex.rs net_redex_free,
+# src/ffi/blob.rs net_mesh_blob_adapter_free). One small direct block per
+# freed handle, allocated by the handle's constructor.
+[[direct]]
+name = "handle tombstone"
+constructors = ["net_mesh_new", "net_mesh_blob_adapter_new", "net_mesh_blob_adapter_new_v2", "net_redex_new"]
+max_block_bytes = 64
+
+# NOT intended: an open defect, recorded so the lane can run while it is
+# fixed, and printed on every run so it stays visible.
+#
+# After net_mesh_shutdown + net_mesh_free, the MeshNode (about 120 KB per node:
+# the allocations of MeshNode::new, task buffers, maps) is still allocated in
+# lifecycle.c and rpc_callbacks.c, and LSan finds it reachable only through
+# the freed handle's tombstone, through the stale bits of the Arc that
+# net_mesh_free moved out of it. So no live reference remains and the memory
+# was never released: a leaked Arc or a reference cycle. transfer.c, which
+# also brings up two nodes and frees them, does not show it, so it is not
+# inherent to a node's lifetime.
+#
+# Found by this lane's first run (CI run 37189633008). Allowed ONLY as
+# indirect leaks, ONLY in the programs listed; any other program with an
+# indirect leak fails. Remove this entry with the fix.
+[[indirect]]
+name = "OPEN DEFECT D-C5-1: MeshNode not reclaimed after net_mesh_shutdown + net_mesh_free"
+programs = ["lifecycle", "rpc_callbacks"]

@@ -5371,9 +5371,10 @@ jobs:
       # ASan + UBSan and run with LeakSanitizer against the UNINSTRUMENTED
       # libnet.so. What it can see: the programs' own memory access, and
       # library-returned buffers, through the intercepted system allocator
-      # Rust uses. What it cannot: accesses inside the Rust code. Retained
-      # library allocations are suppressed one class at a time
-      # (tests/c_abi/lsan.supp), and each run prints what each class absorbed.
+      # Rust uses. What it cannot: accesses inside the Rust code. The runner
+      # classifies every LSan leak block against tests/c_abi/lsan_policy.toml
+      # (handle tombstones; one open, tracked defect) and prints what each
+      # accepted class holds on every run; any other leak fails.
       # The arming programs then plant a leaked net_fetch_blob buffer, a
       # double release of one, and a double release of a callback buffer;
       # each must be caught with its named report, or the lane is not armed.

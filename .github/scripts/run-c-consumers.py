@@ -67,7 +67,7 @@ EXAMPLES = ROOT / "net" / "crates" / "net" / "examples" / "c"
 SUPPORT = EXAMPLES / "support"
 C_ABI = ROOT / "net" / "crates" / "net" / "tests" / "c_abi"
 ARMING = C_ABI / "arming"
-LSAN_SUPP = C_ABI / "lsan.supp"
+LSAN_POLICY = C_ABI / "lsan_policy.toml"
 SANITIZE_FLAGS = [
     "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
     "-fno-omit-frame-pointer", "-g", "-O1",
@@ -155,18 +155,72 @@ def sanitizer_env() -> dict[str, str]:
     return {
         "ASAN_OPTIONS": "detect_leaks=1:fast_unwind_on_malloc=0:malloc_context_size=40:"
                         "halt_on_error=1:exitcode=23:symbolize=1",
-        "LSAN_OPTIONS": f"suppressions={LSAN_SUPP}:print_suppressions=1:exitcode=23",
+        "LSAN_OPTIONS": "exitcode=23",
         "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1",
     }
 
 
-def suppression_summary(out: str) -> list[str]:
-    """`<template>: <count> block(s), <bytes> bytes` for each suppression
-    LSan used, so retained allocations are reported, not hidden."""
-    if "Suppressions used:" not in out:
-        return []
-    table = out.split("Suppressions used:", 1)[1]
-    return [f"{t}: {c} block(s), {b} bytes" for c, b, t in SUPP_ROW_RE.findall(table)]
+LEAK_HEAD_RE = re.compile(r"^\s*(Direct|Indirect) leak of (\d+) byte\(s\) in (\d+) object\(s\)", re.M)
+FRAME_RE = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+)", re.M)
+ALLOCATOR_FRAME = re.compile(
+    r"^(?:malloc|calloc|realloc|posix_memalign|aligned_alloc|memalign|operator new|__rust_\w+|__rdl_\w+)$"
+    r"|5alloc[0-9]+\w*(?:alloc|box_new|raw_vec|RawVec)", re.I)
+
+
+@dataclass
+class Leak:
+    kind: str  # Direct | Indirect
+    bytes: int
+    objects: int
+    frames: list
+
+    @property
+    def origin(self) -> str:
+        """The first frame that is not the allocator itself."""
+        for f in self.frames:
+            if not ALLOCATOR_FRAME.search(f):
+                return f
+        return self.frames[-1] if self.frames else "?"
+
+
+def parse_leaks(out: str) -> list[Leak]:
+    leaks = []
+    heads = list(LEAK_HEAD_RE.finditer(out))
+    for i, h in enumerate(heads):
+        body = out[h.end(): heads[i + 1].start() if i + 1 < len(heads) else len(out)]
+        body = body.split("\n\n", 1)[0] if "\n\n" in body else body
+        leaks.append(Leak(h.group(1), int(h.group(2)), int(h.group(3)), FRAME_RE.findall(body)))
+    return leaks
+
+
+def load_lsan_policy(path: Path = LSAN_POLICY) -> dict:
+    import tomllib
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def judge_leaks(program: str, leaks: list[Leak], policy: dict) -> tuple[list[str], list[str]]:
+    """(accepted-class report lines, unaccepted leak lines). A program
+    passes the leak check only if the second list is empty."""
+    accepted: dict[str, list[int]] = {}
+    bad = []
+    for lk in leaks:
+        cls = None
+        if lk.kind == "Direct":
+            for c in policy.get("direct", []):
+                if lk.origin in c["constructors"] and lk.bytes <= c["max_block_bytes"] * lk.objects:
+                    cls = f"{c['name']} ({lk.origin})"
+        else:
+            for c in policy.get("indirect", []):
+                if program in c["programs"]:
+                    cls = c["name"]
+        if cls is None:
+            bad.append(f"{lk.kind} leak of {lk.bytes} bytes in {lk.objects} object(s) from {lk.origin}")
+        else:
+            acc = accepted.setdefault(cls, [0, 0])
+            acc[0] += lk.objects
+            acc[1] += lk.bytes
+    lines = [f"{name}: {n} block(s), {b} bytes" for name, (n, b) in sorted(accepted.items())]
+    return lines, bad
 
 
 def child_env(bundle: Bundle, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -432,6 +486,14 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
         refuse_strays(bundle, env, exe.parent)
         rc, out = run_exe(exe, env, args.timeout)
         v = classify(out, rc, bundle.library, bundle.sha256)
+        if args.sanitize and v.kind == "sanitizer" and "LeakSanitizer" in v.reason                 and "AddressSanitizer" not in out and "runtime error:" not in out:
+            lines, bad = judge_leaks(name, parse_leaks(out), load_lsan_policy())
+            if bad:
+                v.reason = "unaccepted leaks: " + "; ".join(bad[:6]) + (" …" if len(bad) > 6 else "")
+            else:
+                c = CHECKS_RE.search(out)
+                v = Verdict("ok", "", v.module, int(c.group(1)) if c else 0, v.calls_made)
+                v.retained = lines
         if v.kind == "ok" and v.checks < floors.get(name, 0):
             print(f"✗ {name}: {v.checks} named checks, below its floor of {floors[name]} "
                   "(examples/c/FLOORS) — a check stopped running")
@@ -440,8 +502,8 @@ def run_programs(args, bundle: Bundle, compiler: str, work: Path) -> int:
         elif v.kind == "ok":
             print(f"  ▶ {name}: {v.checks} named checks (floor {floors.get(name, 0)}); "
                   f"loaded {v.module} (SHA-256 matches PROVENANCE)")
-            for line in suppression_summary(out):
-                print(f"      retained (suppressed): {line}")
+            for line in getattr(v, "retained", []):
+                print(f"      retained (lsan_policy.toml): {line}")
         else:
             print(f"✗ {name}: {v.kind}: {v.reason}")
             sys.stdout.write(_indent(out))
@@ -606,10 +668,38 @@ def self_test() -> int:
         case("a UBSan report is a sanitizer verdict",
              classify(f"NET-LOADED-MODULE: {good}\nNET-CHECKS: 1\nx.c:3:5: runtime error: signed integer "
                       "overflow\n", 1, good, gsha), "sanitizer", "runtime error")
-        rows = suppression_summary("...\nSuppressions used:\n  count      bytes template\n"
-                                   "      1         24 net_mesh_free\n      3        512 tokio\n")
-        ok = rows == ["net_mesh_free: 1 block(s), 24 bytes", "tokio: 3 block(s), 512 bytes"]
-        print(f"{'✓' if ok else '✗'} self-test: LSan's suppression table is reported per class")
+        report = (
+            "==1==ERROR: LeakSanitizer: detected memory leaks\n\n"
+            "Direct leak of 24 byte(s) in 1 object(s) allocated from:\n"
+            "    #0 0x7f in malloc asan_malloc_linux.cpp:69\n"
+            "    #1 0x7f in _RNvNtCs1C1lLj4PWSY_5alloc5boxed14box_new_uninit (libnet.so+0x1)\n"
+            "    #2 0x7f in net_mesh_new (libnet.so+0x2)\n\n"
+            "Indirect leak of 4096 byte(s) in 1 object(s) allocated from:\n"
+            "    #0 0x7f in malloc asan_malloc_linux.cpp:69\n"
+            "    #1 0x7f in _RNCNvMs10_xMeshNode3new0Be_ (libnet.so+0x3)\n\n"
+            "Direct leak of 4093 byte(s) in 1 object(s) allocated from:\n"
+            "    #0 0x7f in malloc asan_malloc_linux.cpp:69\n"
+            "    #1 0x7f in net_fetch_blob (libnet.so+0x4)\n\n"
+        )
+        leaks = parse_leaks(report)
+        ok = [(lk.kind, lk.bytes, lk.origin) for lk in leaks] == [
+            ("Direct", 24, "net_mesh_new"), ("Indirect", 4096, "_RNCNvMs10_xMeshNode3new0Be_"),
+            ("Direct", 4093, "net_fetch_blob")]
+        print(f"{'✓' if ok else '✗'} self-test: LSan leak blocks parse, with their origin frame")
+        failures += 0 if ok else 1
+        policy = {"direct": [{"name": "tomb", "constructors": ["net_mesh_new"], "max_block_bytes": 64}],
+                  "indirect": [{"name": "defect", "programs": ["lifecycle"]}]}
+        lines, bad = judge_leaks("lifecycle", leaks[:2], policy)
+        ok = not bad and lines == ["defect: 1 block(s), 4096 bytes", "tomb (net_mesh_new): 1 block(s), 24 bytes"]
+        print(f"{'✓' if ok else '✗'} self-test: accepted classes are reported, not failed")
+        failures += 0 if ok else 1
+        _, bad = judge_leaks("transfer", leaks[:2], policy)
+        ok = len(bad) == 1 and "Indirect" in bad[0]
+        print(f"{'✓' if ok else '✗'} self-test: an indirect leak in a program the policy does not name fails")
+        failures += 0 if ok else 1
+        _, bad = judge_leaks("lifecycle", leaks, policy)
+        ok = len(bad) == 1 and "4093" in bad[0]
+        print(f"{'✓' if ok else '✗'} self-test: a leaked library-returned buffer is never an accepted class")
         failures += 0 if ok else 1
         case("a call after a wrong module is recorded",
              classify(f"NET-LOADED-MODULE: {other}\nok a\n", 0, good, gsha), "identity", calls=True)
@@ -644,7 +734,7 @@ def main() -> int:
     ap.add_argument("--negative-controls", action="store_true", help="also run the identity negative controls")
     ap.add_argument("--shadow-library", type=Path, help="a different libnet, for the shadowing control")
     ap.add_argument("--sanitize", action="store_true",
-                    help="C5 Linux lane: build with ASan/UBSan, run with LSan and tests/c_abi/lsan.supp")
+                    help="C5 Linux lane: build with ASan/UBSan, run with LSan, judged by tests/c_abi/lsan_policy.toml")
     ap.add_argument("--debug-crt", action="store_true",
                     help="C5 Windows lane: MSVC /MDd and the debug CRT's leak and heap checks "
                     "(this program's own heap only)")
