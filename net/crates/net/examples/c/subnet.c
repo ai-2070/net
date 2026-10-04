@@ -22,14 +22,18 @@
  *   - net_org_call_exported, from the same-org caller, reaches the handler,
  *     which sees the provider-verified facts the manifest names (the
  *     caller entity, acting for the provider's org);
- *   - a FOREIGN-org caller with valid credentials is refused, and the
- *     handler never runs for it — twice (a denial is not retried);
- *   - after net_org_serve_handle_close (idempotent) a call is refused.
+ *   - a FOREIGN-org caller with valid credentials is refused by authority
+ *     (org:discovery:no_authorized_provider with the provider among the
+ *     candidates it considered, not a discovery miss or a timeout), and
+ *     the handler never runs for it — twice (a denial is not retried);
+ *   - after net_org_serve_handle_close (idempotent) a call is refused
+ *     because nothing serves the service.
  *
  * Discovery: the exported service is announced on the public plane; the
  * first call retries, bounded, re-announcing each round — the same
- * convergence the other bindings' S4 harnesses use. The refused calls
- * carry a 5 s deadline, so a correct refusal cannot hang the program.
+ * convergence the other bindings' S4 harnesses use. Every call carries a
+ * 5 s deadline (0 would mean the 300 s default), so neither a lost reply
+ * nor a refusal can stall the program.
  */
 
 #define _CRT_SECURE_NO_WARNINGS /* getenv, on MSVC */
@@ -96,11 +100,13 @@ static int hex32(const char* hex, uint8_t* out) {
 }
 
 /* The integers of the first `[a, b, ...]` after `"key":`, at or after
- * `from`. Returns the count, or -1. */
+ * `from`. A list of lists (`[[a, b]]`) must hold exactly one inner list:
+ * a second would otherwise be dropped unread. Returns the count, or -1. */
 static int int_list(const char* from, const char* key, int* out, int max) {
     char pat[64];
     const char* p;
     int n = 0;
+    int nested;
     snprintf(pat, sizeof pat, "\"%s\":", key);
     p = strstr(from, pat);
     p = p ? strchr(p, '[') : NULL;
@@ -108,6 +114,7 @@ static int int_list(const char* from, const char* key, int* out, int max) {
         return -1;
     }
     p++;
+    nested = *p == '[';
     while (*p && *p != ']') {
         if (*p >= '0' && *p <= '9') {
             if (n == max) {
@@ -119,7 +126,13 @@ static int int_list(const char* from, const char* key, int* out, int max) {
             p++;
         }
     }
-    return *p == ']' ? n : -1;
+    if (*p != ']') {
+        return -1;
+    }
+    if (nested && p[1] != ']') {
+        return -1;
+    }
+    return n;
 }
 
 /* The first string inside the array that follows `"key":`. */
@@ -206,19 +219,62 @@ static NetOrgClient* bind_client(net_meshnode_t* n, const char* dir, const char*
     return client;
 }
 
-/* A call that must be refused (5 s deadline); 1 if it was. */
-static int refused(NetOrgClient* c, const char* service, const char* body) {
+/* A call that must be refused (5 s deadline). Returns its code (NET_ORG_OK
+ * only if it was served) and copies the error text into `why`. Any non-OK
+ * code is not yet a refusal: a discovery miss or a timeout would also be
+ * one, so the callers assert which refusal it was. */
+static int call_refused(NetOrgClient* c, const char* service, const char* body, char* why, size_t cap) {
     uint8_t* out = NULL;
     size_t out_len = 0;
     char* err = NULL;
     int rc = net_org_call_exported(c, service, strlen(service), (const uint8_t*)body, strlen(body), 5000, 0, &out,
                                    &out_len, &err);
+    snprintf(why, cap, "%s", err ? err : "");
     net_org_free_cstring(err);
     if (rc == NET_ORG_OK) {
         net_org_response_free(out, out_len);
-        return 0;
     }
-    return 1;
+    return rc;
+}
+
+/* The `considered` count of an org:discovery:no_authorized_provider error:
+ * the verified private candidates seen BEFORE authority filtering. 0 means
+ * nothing was discovered; 1 or more means the provider was seen and this
+ * caller's credentials could not call it. -1 if the error is another kind. */
+static int candidates_considered(const char* why) {
+    const char* p;
+    if (strncmp(why, "org:discovery:no_authorized_provider:", 37) != 0) {
+        return -1;
+    }
+    /* "... (<n> private candidate(s) considered)": back from the phrase to
+     * the parenthesis that opens the count. */
+    p = strstr(why, " private candidate(s) considered)");
+    while (p != NULL && p > why && p[-1] >= '0' && p[-1] <= '9') {
+        p--;
+    }
+    return p != NULL && p > why && p[-1] == '(' && *p >= '0' && *p <= '9' ? (int)strtol(p, NULL, 10) : -1;
+}
+
+/* A foreign-org caller's call, refused by authority and not by reachability:
+ * retried (never served) until the caller has seen the provider, so the
+ * refusal counts at least one considered candidate. Returns the count, or -1
+ * if a call was served or refused for any other reason. */
+static int foreign_refusal(NetOrgClient* c, const char* service, const char* body, char* why, size_t cap) {
+    int attempt, n = -1;
+    for (attempt = 0; attempt < 40; attempt++) {
+        int rc = call_refused(c, service, body, why, cap);
+        n = candidates_considered(why);
+        if (rc != NET_ORG_ERR_DISCOVERY || n < 0) {
+            printf("  (foreign call: rc %d, err %s)\n", rc, why);
+            return -1;
+        }
+        if (n > 0) {
+            return n;
+        }
+        cu_sleep_ms(250);
+    }
+    printf("  (foreign call: the provider was never discovered: %s)\n", why);
+    return 0;
 }
 
 int main(void) {
@@ -250,7 +306,7 @@ int main(void) {
     char psk[80], service[128], export_name[128], unknown_export[128], access[32], auth_hex[80], root_hex[80];
     char bind_auth_hex[80], p_seed[80], p_org[80], p_auth[256], p_gw[256];
     char c_seed[80], c_entity[80], c_org[80], c_auth[256], c_mem[256], c_disp[256];
-    char f_seed[80], f_auth[256], f_mem[256], f_disp[256];
+    char f_seed[80], f_auth[256], f_mem[256], f_disp[256], why[512];
     char attach_json[64], bind_path_json[64], tail[1536], prov_addr[32], c_addr[32], f_addr[32];
     int attach[4], bind_path[4], boundary[4], n_attach, n_bind, n_boundary, attempt;
     uint64_t life = 0, epoch = 0;
@@ -413,7 +469,7 @@ int main(void) {
         net_mesh_announce_capabilities(provider, "{}");
         net_mesh_announce_capabilities(caller, "{}");
         err = NULL;
-        rc = net_org_call_exported(client, service, strlen(service), (const uint8_t*)"{\"n\":1}", 7, 0, 0, &resp,
+        rc = net_org_call_exported(client, service, strlen(service), (const uint8_t*)"{\"n\":1}", 7, 5000, 0, &resp,
                                    &resp_len, &err);
         if (rc == NET_ORG_OK) {
             break;
@@ -436,15 +492,20 @@ int main(void) {
              memcmp(seen.acting_org, provider_org, 32) == 0 && memcmp(seen.provider_org, provider_org, 32) == 0);
     cu_mutex_unlock(lock);
 
-    CU_CHECK("a foreign-org caller with valid credentials is refused", refused(foreign_client, service, "{\"n\":50}"));
+    CU_CHECK("a foreign-org caller with valid credentials is refused by authority (the provider was seen)",
+             foreign_refusal(foreign_client, service, "{\"n\":50}", why, sizeof why) > 0);
     CU_CHECK_RC("the handler never ran for it", call_count(), admitted_calls);
-    CU_CHECK("refused again (a denial is not retried into the handler)", refused(foreign_client, service, "{\"n\":51}"));
+    CU_CHECK("refused again by authority (a denial is not retried into the handler)",
+             foreign_refusal(foreign_client, service, "{\"n\":51}", why, sizeof why) > 0);
     CU_CHECK_RC("the handler still never ran for it", call_count(), admitted_calls);
 
     net_org_serve_handle_close(serve);
     net_org_serve_handle_close(serve);
-    CU_CHECK("net_org_serve_handle_close: idempotent", 1);
-    CU_CHECK("after close: a call is not served", refused(client, service, "{\"n\":99}"));
+    CU_SURVIVED("net_org_serve_handle_close: idempotent");
+    rc = call_refused(client, service, "{\"n\":99}", why, sizeof why);
+    CU_CHECK_RC("after close: a call is not served", rc, NET_ORG_ERR_RPC);
+    CU_CHECK("after close: refused because nothing serves the service",
+             strstr(why, "org:rpc:server_error:") == why && strstr(why, "is served on this node") != NULL);
     CU_CHECK_RC("after close: the handler did not run", call_count(), admitted_calls);
 
     net_org_serve_handle_free(&serve);
