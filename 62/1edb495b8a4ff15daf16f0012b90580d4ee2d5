@@ -1,0 +1,106 @@
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 91-95,183,208-210,510-533,542-546,558,632,668-677,709-716,824,1400-1401,1411-1462,1481,1530,1572,1593
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 333-335,344,377-392,708,732,741-787,789
+  s_9023e047bdb7d7::t_fc0a1649478abe 788
+go/cortex.go
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 449-451,473-485,757-758,776-786
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 429-431,526-528,3941,3943-3945,3953-3954,3986-3987,4018-4019
+net/crates/net/bindings/go/net-ffi/exports.baseline
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 12,261,569
+  s_9023e047bdb7d7::t_81d080ea707b38 7,13
+go/netdb.go
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 145,161
+net/crates/net/sdk-py/src/net_sdk/cortex.py
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 19-21,91,94-98,110,113-114
+net/crates/net/sdk-py/tests/test_wrapper_modules.py
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 153-158,166,180-182,189,201-234
+  s_9023e047bdb7d7::t_d42b90c2a86ead 235-236
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 300-302,320,353-368,700,719,749
+net/crates/net/include/net_cortex.h
+  s_9023e047bdb7d7::t_bf243d123808d5 35
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 140-145,147-152,154-155,296-301,303-308,310-311
+net/crates/net/sdk/src/cortex.rs
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 72,79
+net/crates/net/sdk/tests/cortex_surface.rs
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 11-13,120-166
+  s_9023e047bdb7d7::t_df4c407f88a98e 167
+net/crates/net/tests/c_abi/breaks.toml
+  s_9023e047bdb7d7::t_d7f821e6944fcd 27-45
+.claude/skills/net-event-bus/cortex.md
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 31,70,84,113,143,149,161,178,193-194,199,201-202,204-206,208-210,212-213
+net/crates/net/src/ffi/cortex.rs
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 123-132,150,160,1678-1698,1909-1915,1920,1933,1949,2313-2333,2616,2629,2642
+net/crates/net/sdk-ts/test/small_surfaces.test.ts
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 13,97-106,111-115,120-139
+  s_9023e047bdb7d7::t_ff598fb158e382 140-141
+net/crates/net/tests/integration_cortex_tasks.rs
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 1194,1204,1214,1219,1222-1228
+go/net_cortex.h
+  s_9023e047bdb7d7::t_bf243d123808d5 35
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 140-145,147-152,154-155,279-284,286-291,293-294
+web/src/content/docs/guides/cortex-folds.md
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 231-234,250-252
+net/crates/net/bindings/go/net-ffi/exports.shipped.baseline
+  s_9023e047bdb7d7::t_81d080ea707b38 7,250,555
+net/crates/net/bindings/python/src/cortex.rs
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 162-168,182-186,192-193,207-208,1541-1555,1558-1559,2101-2115,2117,2771-2785,3204-3217
+  s_9023e047bdb7d7::t_94f0c3888a4420 3218
+net/crates/net/bindings/python/tests/test_cortex.py
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 17,391-432
+net/crates/net/sdk-ts/src/cortex.ts
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 632-645,649-650,846-859,863-864
+web/package.json
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 63
+web/src/content/docs/sdk/typescript/README.md
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 73
+net/crates/net/tests/c_abi/SURFACE.md
+  s_9023e047bdb7d7::t_e0fb3202074a92 15,301,349
+docs/internal/plans/GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 18-22,770-817,1547-1555
+  s_9023e047bdb7d7::t_128c5a6df54a42 1556
+go/write_token.go
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 28-33,35-37,48-51,63-66,79-80,131-134,137,160,166-169,172,195
+go/abi_stability_test.go
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 34,36,660-713,720-721,723-764
+  s_9023e047bdb7d7::t_251d1c48b6e808 714-719,722
+  s_9023e047bdb7d7::t_a66fa9c92bf682 659
+  s_9023e047bdb7d7::t_22705b5fc91dd4 524
+  s_9023e047bdb7d7::t_a580a50f1cc2cb 765
+.claude/skills/net-event-bus/dataforts.md
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 303,312,317,326,332,338,344,353,364
+net/crates/net/src/adapter/net/redex/write_token.rs
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 2-16,47-50,55-58,64-68,74-79,81-86,90-93,96-100,107,109,111-112,120-122,134-141,143,147-154,160-162,167,173-185,189-199,203-214,220,227-235
+net/crates/net/bindings/node/src/cortex.rs
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 114-121,135-139,145-146,1425-1440,1443-1445,1978-1992
+  s_9023e047bdb7d7::t_e05d86a81ade95 1993
+net/crates/net/tests/cortex_ryw_global_cap.rs
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 69-72,78,86,94
+go/write_token_test.go
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 36,74,91,283-326
+  s_9023e047bdb7d7::t_4f9964c1a3f55d 327
+.github/workflows/ci.yml
+  s_9023e047bdb7d7::t_b9dbe9daa8001e 4968-4971,4977
+net/crates/net/Cargo.lock
+  s_9023e047bdb7d7::t_23f4c90e7c933c 151,162,1530,1722,3669,4855,4921,5418,5460,5462,5624,5637,6551
+web/package-lock.json
+  s_9023e047bdb7d7::t_b15d52be6b1a93 53,5786-5788,5791,5804-5806,5809-5810,5824-5826,5834-5836,5839
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "621edb495b8a4ff15daf16f0012b90580d4ee2d5",
+  "prompts": {},
+  "sessions": {
+    "s_9023e047bdb7d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13ae6289-5780-436a-aa27-88954cc36586",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
