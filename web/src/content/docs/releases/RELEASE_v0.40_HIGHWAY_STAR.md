@@ -105,7 +105,7 @@ Bump to 0.40.0 and rebuild. Then:
 
 ---
 
-Released 2026-10-04.
+Released 2026-10-05.
 
 ## License
 
