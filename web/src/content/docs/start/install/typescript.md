@@ -5,7 +5,7 @@ npm install @net-mesh/core     # the native addon
 npm install @net-mesh/sdk      # the ergonomic SDK, if you want typed channels
 ```
 
-Both publish at **0.39**. `@net-mesh/core` is a native addon built with `napi-rs`;
+Both publish at **0.40**. `@net-mesh/core` is a native addon built with `napi-rs`;
 prebuilt binaries ship for Windows, macOS and Linux on x86-64 and aarch64,
 including musl. **Node 20 or newer.**
 
@@ -41,7 +41,7 @@ would fail on a `.node` file. A page uses **`@net-mesh/browser`** instead —
 TypeScript over a WebAssembly leaf, with a WebRTC DataChannel to a native anchor
 and no native binding anywhere in its dependency graph.
 
-It is on npm at **0.39**, with the leaf's WebAssembly inside the package:
+It is on npm at **0.40**, with the leaf's WebAssembly inside the package:
 
 ```bash
 npm install @net-mesh/browser
