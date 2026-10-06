@@ -125,7 +125,8 @@ export interface StoreTransport {
 }
 
 /**
- * A peer id in the spelling `openStream` takes: 16 lowercase hex.
+ * The peer ON AN EVENT, in the spelling `openStream` takes: 16
+ * lowercase hex. For an id the caller holds, see {@link nodeHexOf}.
  *
  * Events carry the authenticated peer as an EXACT DECIMAL string, and
  * `openStream({ peer })` requires 16 hex digits. Handing the decimal
@@ -147,11 +148,24 @@ export function peerHexOf(peer: string): string | null {
   return null;
 }
 
-/** Whether two peer spellings name the same node. */
-export function samePeer(left: string, right: string): boolean {
-  const a = peerHexOf(left);
-  const b = peerHexOf(right);
-  return a !== null && a === b;
+/**
+ * A node id the CALLER holds, in the same spelling: 16 lowercase hex.
+ *
+ * Not {@link peerHexOf}, which reads an event's peer and takes digits
+ * to mean decimal. An id a caller holds is nearly always one this
+ * package printed — `nodeIdHex()`, a descriptor's `peerIdHex`, a
+ * lobby's `host` — and one such id in ~1,800 has no letter in it. Read
+ * as decimal it names a DIFFERENT node: a joiner addressed its host
+ * 4798628394172323 as 00110c53bcd7ffa3, and nothing was there. So
+ * sixteen hex digits are hex, whatever they are made of.
+ *
+ * Any other length is read as {@link peerHexOf} reads it, so an app
+ * may still hand back the decimal `peerNode` an event gave it. A
+ * decimal exactly sixteen digits long is the one spelling that cannot
+ * be told from the canonical hex, and it is read as hex.
+ */
+export function nodeHexOf(id: string): string | null {
+  return /^[0-9a-f]{16}$/i.test(id) ? id.toLowerCase() : peerHexOf(id);
 }
 
 /**
@@ -886,7 +900,7 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     owner: owner as unknown as StoreOwner<object, ActionSpec, InputSpec>,
     // The spelling `AccessRequest.peer` and `ActionContext.peer`
     // promise: 16 lowercase hex, as a replica's frames are handed.
-    peer: peerHexOf(authority) ?? authority,
+    peer: nodeHexOf(authority) ?? authority,
     maxEventBytes: options.maxEventBytes,
     dispatched,
     isClosed: () => closed,

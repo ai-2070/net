@@ -174,6 +174,23 @@ describe('lobbies', () => {
     await world.ready();
   });
 
+  // The same id, on the HOST's side. A joiner holds its host as HEX
+  // (the lobby list's `peerIdHex`), and a reader that takes digits to
+  // mean decimal addressed its first frame to 00110c53bcd7ffa3 — the
+  // decimal reading of the host that was really there (CI, after
+  // 0.40: "no local node 00110c53bcd7ffa3 on this mesh", in whichever
+  // lobby test drew such a host). Pinned with that host.
+  it('joins a lobby whose host hex id has no letters in it', async () => {
+    const mesh = createLocalMesh();
+    const lobby = await lobbyOn(mesh, { node: mesh.node('4798628394172323') });
+    const node = mesh.node();
+    const world = await joinLobby({ node, definition: room, game: 'lobby-test', code: lobby.code });
+    await world.ready();
+    await expect(world.act('sit', {})).resolves.toEqual({ seat: 1 });
+    await settle();
+    expect(lobby.players()).toEqual(['4798628394172323', node.nodeIdHex()]);
+  });
+
   it('refuses a code two nodes claim, rather than guessing which host is real', async () => {
     const mesh = createLocalMesh();
     const lobby = await lobbyOn(mesh);

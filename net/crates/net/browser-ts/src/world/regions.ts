@@ -28,7 +28,7 @@
  * otherwise a node that announces a region could also send offers as it.
  */
 
-import { peerHexOf } from '../store/host.js';
+import { nodeHexOf } from '../store/host.js';
 import type { NodeDescriptor } from '../node.js';
 import { joinStore, type JoinedStoreHandle } from '../store/join.js';
 import type { StoreTransport } from '../store/host.js';
@@ -122,7 +122,7 @@ export function regionDirectory(options: RegionDirectoryOptions): RegionDirector
   const trusted =
     options.trustedHosts === undefined
       ? null
-      : new Set(options.trustedHosts.map(id => peerHexOf(id)).filter((id): id is string => id !== null));
+      : new Set(options.trustedHosts.map(id => nodeHexOf(id)).filter((id): id is string => id !== null));
   const cache = new Map<string, RegionLookup>();
   return {
     async lookup(region) {
@@ -135,7 +135,7 @@ export function regionDirectory(options: RegionDirectoryOptions): RegionDirector
       const hosts = [
         ...new Set(
           found
-            .map(descriptor => peerHexOf(descriptor.peerIdHex))
+            .map(descriptor => nodeHexOf(descriptor.peerIdHex))
             .filter((id): id is string => id !== null && (trusted === null || trusted.has(id))),
         ),
       ].sort();

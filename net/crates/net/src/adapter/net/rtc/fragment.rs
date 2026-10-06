@@ -810,7 +810,10 @@ impl RtcReassembly {
     /// session is still live, so the NR3 schedule — a frame captured
     /// under an incarnation that is retired while the frame waits —
     /// is scheduled rather than hoped for. No lock is held while it
-    /// runs.
+    /// runs, and on a multi-thread runtime it may block:
+    /// [`Self::run_dispatch_pause`] takes it off the scheduler first.
+    /// On a current-thread runtime it runs inline, and a hook that
+    /// blocks there stops the runtime and the test with it.
     #[cfg(any(test, feature = "fixtures"))]
     pub fn set_dispatch_pause(&self, pause: Option<IngressPause>) {
         *self.dispatch_pause.lock() = pause;
@@ -820,10 +823,47 @@ impl RtcReassembly {
     /// under its lock first: the hook blocks by design, and blocking
     /// with the lock held would serialize the retirement this seam
     /// exists to let through.
+    ///
+    /// **On a multi-thread runtime the hook runs off the scheduler.**
+    /// Its caller is the receive loop, a task, so a hook that parks
+    /// is parking a runtime worker — and a parked worker takes more
+    /// with it than its own task. Whatever it last woke sits in its
+    /// LIFO slot, which no
+    /// other worker steals from; and if it was the worker that came
+    /// off the I/O driver to run this packet, the rest are asleep on
+    /// condvars and nobody is left to turn the driver, so no timer
+    /// fires and no socket is read for as long as the hook holds.
+    /// The test that installed the hook is by then waiting on a
+    /// `sleep` to release it, so what it produces is a hang with no
+    /// output rather than a failure: the shape of the one CI
+    /// reported (`rtc_repairs`, killed at 180 s), and with a single
+    /// worker the outcome of every run.
+    /// `block_in_place` hands the worker's core — queue, LIFO slot
+    /// and its turn at the driver — to another thread first, so only
+    /// the receive loop is held, which is all the seam promises.
+    ///
+    /// That is the whole guarantee. A current-thread runtime has no
+    /// second thread to take the core, so there the hook runs inline
+    /// (as it does off a runtime altogether) and a hook that blocks
+    /// blocks everything: a pause that must hold needs
+    /// `flavor = "multi_thread"`.
+    ///
+    /// Witness: `a_held_dispatch_pause_does_not_take_the_runtime_with_it`,
+    /// on one worker, where the worker that parks is the only one.
     #[cfg(any(test, feature = "fixtures"))]
     pub fn run_dispatch_pause(&self) {
         let hook = self.dispatch_pause.lock().clone();
-        if let Some(hook) = hook {
+        let Some(hook) = hook else {
+            return;
+        };
+        // `block_in_place` panics on a current-thread runtime, where
+        // there is no second thread to hand the core to; off a runtime
+        // altogether there is no scheduler to protect.
+        let on_multi_thread_runtime = tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+        if on_multi_thread_runtime {
+            tokio::task::block_in_place(|| (hook.0)());
+        } else {
             (hook.0)();
         }
     }
@@ -2205,6 +2245,75 @@ mod tests {
         let released = r.take_abandoned();
         assert_eq!(released.len(), 1, "and said so");
         assert_eq!(released[0].reason, AbandonReason::SessionRetired);
+    }
+
+    /// A held dispatch pause holds its caller and nothing else: the
+    /// runtime the receive loop runs on keeps turning.
+    ///
+    /// ONE worker on purpose. With several, another worker usually
+    /// picks up what the parked one cannot, which is why the NR3
+    /// witness in `tests/rtc_repairs.rs` (six workers) hung in one
+    /// CI run and passed everywhere else. With one, the worker
+    /// inside the hook is the whole scheduler, so whether the seam
+    /// handed its core on is the only thing that decides if a timer
+    /// can fire while the hook is held.
+    ///
+    /// The test thread stays outside the runtime and waits on std
+    /// channels, so a seam that does park the worker is a named
+    /// failure here after five seconds rather than a hang.
+    ///
+    /// Inverse: call `(hook.0)()` directly in `run_dispatch_pause` —
+    /// the timer never fires and the assertion goes red.
+    #[test]
+    fn a_held_dispatch_pause_does_not_take_the_runtime_with_it() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a one-worker runtime");
+        let r = Arc::new(RtcReassembly::new());
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        r.set_dispatch_pause(Some(IngressPause::new(move || {
+            entered_tx.send(()).expect("the test is waiting for this");
+            release_rx
+                .lock()
+                .recv()
+                .expect("the test releases the dispatch");
+        })));
+
+        // The receive loop's position: a task, calling the seam.
+        let held = {
+            let r = Arc::clone(&r);
+            runtime.spawn(async move { r.run_dispatch_pause() })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the dispatch must reach the hook");
+
+        // A timer needs a worker to run its task and to turn the
+        // driver, and the only worker is inside the hook.
+        let (fired_tx, fired_rx) = mpsc::channel::<()>();
+        runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = fired_tx.send(());
+        });
+        let fired = fired_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+
+        // Released BEFORE the assertion: a failure must not leave the
+        // worker parked, or dropping the runtime would wait on it.
+        release_tx.send(()).expect("release the dispatch");
+        runtime.block_on(held).expect("the held dispatch returns");
+        assert!(
+            fired,
+            "a timer did not fire while the dispatch pause was held: the hook \
+             parked the runtime's worker instead of running off the scheduler, \
+             and a test that releases the hook after a `sleep` never gets there"
+        );
     }
 
     /// **NR6.** Two pieces that cover their bytes exactly but arrived

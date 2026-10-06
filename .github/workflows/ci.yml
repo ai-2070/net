@@ -5243,6 +5243,26 @@ jobs:
     # 50 was the budget before org_call.c / subnet.c: their scenarios come
     # from a release build of net-mesh-sdk's generators (one per leg, then
     # cached), and the Windows leg already ran about 40 minutes.
+    #
+    # Where the Windows leg's time goes, measured on master (2026-10-05/06;
+    # the Ubuntu leg runs the same steps in about 22 minutes):
+    #   10-12 min  each of FOUR release builds, all from cold: the production
+    #              bundle, the layout test (see that step), the helper bundle,
+    #              and the scenario generators inside the first consumer run;
+    #   ~1 min     each consumer lane after that, the generators being built.
+    # "One per leg" was not what happened. The MinGW lanes set `CC`, cargo's
+    # build scripts track it, and the generators were rebuilt in the UCRT
+    # lane, the MSVCRT lane and the MSVC lane after them: three more builds,
+    # which is 74 minutes on a good run (80e7cc04b) and a timeout otherwise.
+    # run-c-consumers.py now strips the lane's `CC` from that build
+    # (`generator_env`) and prints how long each scenario took to generate,
+    # so a lane that rebuilds them again shows in its log. That should leave
+    # about 50 minutes; lower this once a few runs have confirmed it.
+    #
+    # None of the four builds is restored from a cache. rust-cache reports
+    # "No cache found" for this key on master, hours after a run that saved
+    # one, and no entry with the key exists: the repository holds 11.2 GB of
+    # caches (2026-10-06) against GitHub's default 10 GB.
     timeout-minutes: 75
     defaults:
       run:
@@ -5296,8 +5316,11 @@ jobs:
       # field offset) of each struct the headers publish equals the reviewed
       # fixture tests/c_abi/layout.json. The C1 audit step compiles the same
       # numbers as C _Static_asserts against the headers, so the two compilers
-      # meet at the fixture. `--release` in the bundle's target directory
-      # reuses the libraries the step above just built.
+      # meet at the fixture. `--release` so the layouts measured are the
+      # shipped profile's. It shares the bundle's target directory but reuses
+      # nothing in it: the release profile is `panic = "abort"`, a test target
+      # must unwind, and cargo rebuilds every dependency to match (176 crates,
+      # as long again as the bundle build above).
       - name: Guard — Rust struct layouts match the reviewed fixture (C1 check 4)
         working-directory: net/crates/net
         env:
