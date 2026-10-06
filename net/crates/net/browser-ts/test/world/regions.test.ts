@@ -188,4 +188,30 @@ describe('joinWorld', () => {
     await until(() => trusting.regions()[0]?.phase === 'ready', 'trusted region ready');
     expect(trusting.regions()[0]?.host).toBe(H1);
   });
+
+  // One hex id in ~1,800 has no letter in it. The directory read such a
+  // host as a DECIMAL, so the region resolved to 00110c53bcd7ffa3: a node
+  // that is not on the mesh, and not the one `trustedHosts` names either.
+  it('finds a region whose host hex id has no letters in it', async () => {
+    const DIGITS = '4798628394172323';
+    const mesh = createLocalMesh();
+    region(mesh, DIGITS, 'r:0:0');
+    stops.push(announceRegions(nodeOf(mesh, DIGITS), WORLD, ['r:0:0']));
+    const view = joinWorld<Region, Actions, Record<string, never>, Ship>({
+      node: nodeOf(mesh, PLAYER),
+      world: WORLD,
+      definition,
+      collection: 'ships',
+      position: { x: 50, z: 50 },
+      size: SIZE,
+      radius: 0,
+      key: 'player',
+      maxEventBytes: 8104,
+      trustedHosts: [DIGITS],
+    });
+    views.push(view);
+    await until(() => view.regions()[0]?.phase === 'ready', 'all-digit region ready');
+    expect(view.regions()[0]?.host).toBe(DIGITS);
+    expect(await view.act('poke', {})).toEqual({ region: 'r:0:0' });
+  });
 });

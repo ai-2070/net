@@ -15,7 +15,7 @@
  * ```
  */
 
-import { peerHexOf } from '../store/host.js';
+import { nodeHexOf, peerHexOf } from '../store/host.js';
 import {
   type ActRecord,
   type ActionResult,
@@ -217,7 +217,7 @@ export function handoffLink<E>(options: HandoffLinkOptions): HandoffLink<E> {
     // handoff on another region's behalf.
     const sender = typeof event.peerNode === 'string' ? peerHexOf(event.peerNode) : null;
     const expected = options.peerOf(body.from);
-    if (sender === null || expected === null || peerHexOf(expected) !== sender) {
+    if (sender === null || expected === null || nodeHexOf(expected) !== sender) {
       drop('unauthenticated');
       refresh(body.from);
       return;
@@ -229,7 +229,7 @@ export function handoffLink<E>(options: HandoffLinkOptions): HandoffLink<E> {
     send(message) {
       if (closed) return;
       const peer = options.peerOf(message.to);
-      const hex = peer === null ? null : peerHexOf(peer);
+      const hex = peer === null ? null : nodeHexOf(peer);
       if (hex === null) {
         drop('unknown-region');
         refresh(message.to);

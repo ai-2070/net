@@ -24,7 +24,7 @@
 
 import { StoreCore } from './core.js';
 import { isStaleStream, StoreError } from './errors.js';
-import { peerHexOf, samePeer, type StoreTransport, type TransportFrame, type TransportStream } from './host.js';
+import { nodeHexOf, peerHexOf, type StoreTransport, type TransportFrame, type TransportStream } from './host.js';
 import { StoreReplica, type Request } from './replica.js';
 import type {
   ActionSpec,
@@ -75,7 +75,12 @@ export const MAX_OUTSTANDING = 64;
 export interface JoinStoreOptions<S extends object, A extends ActionSpec, I extends InputSpec> {
   readonly definition: StoreDefinition<S, A, I>;
   readonly transport: StoreTransport;
-  /** The node hosting the store. */
+  /**
+   * The node hosting the store: 16 hex digits, as `nodeIdHex()` and a
+   * descriptor's `peerIdHex` print it. The decimal `peerNode` of an
+   * event is accepted too, unless it is exactly sixteen digits long —
+   * that is the hex spelling, and it is read as hex.
+   */
   readonly host: string;
   /** The audience this caller wants. */
   readonly audience: readonly string[];
@@ -195,7 +200,10 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
   // had already accepted the subscription. Refused here instead,
   // where the caller can read what it did wrong.
   const selfId = options.transport.nodeIdHex();
-  if (selfId !== null && samePeer(selfId, options.host)) {
+  // Read ONCE, as an id the caller holds: hex when it is the sixteen
+  // digits `nodeIdHex()` prints, even when none of them is a letter.
+  const hostHex = nodeHexOf(options.host);
+  if (selfId !== null && hostHex !== null && nodeHexOf(selfId) === hostHex) {
     throw new StoreError(
       'invalid-data',
       'a replica cannot join the node it runs on: hold the hostStore handle instead',
@@ -241,8 +249,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
   async function stream(): Promise<TransportStream> {
     if (upstream !== null) return upstream;
     if (opening !== null) return opening;
-    const addressable = peerHexOf(options.host);
-    if (addressable === null) {
+    if (hostHex === null) {
       return Promise.reject(
         new StoreError('invalid-data', `the host id is not a node id: ${options.host}`),
       );
@@ -258,12 +265,12 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     // the relay is installed before the direct half is even tried, so
     // the open below is the thing that decides, and its refusal is
     // typed.
-    opening = Promise.resolve(options.transport.connectPeer?.(addressable))
+    opening = Promise.resolve(options.transport.connectPeer?.(hostHex))
       .catch(() => undefined)
       .then(() =>
         options.transport.openStream({
           reliability: 'reliable',
-          peer: addressable,
+          peer: hostHex,
           label: streamId,
         }),
       )
@@ -472,8 +479,11 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     // is what identifies this store's traffic.
     // The host's identity, compared as a NUMBER: the event carries an
     // exact decimal and `options.host` is hex, so `!==` on the strings
-    // rejected every frame the host ever sent.
-    if (typeof event.peerNode !== 'string' || !samePeer(event.peerNode, options.host)) return;
+    // rejected every frame the host ever sent. Each side is read in
+    // its OWN spelling: one reader for both took an all-digit hex host
+    // for a decimal, and then no frame of that host's ever matched.
+    if (typeof event.peerNode !== 'string' || hostHex === null) return;
+    if (peerHexOf(event.peerNode) !== hostHex) return;
     const payload = event.payload;
     if (payload === undefined) return;
 
