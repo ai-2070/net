@@ -5254,7 +5254,7 @@ jobs:
     # build scripts track it, and the generators were rebuilt in the UCRT
     # lane, the MSVCRT lane and the MSVC lane after them: three more builds,
     # which is 74 minutes on a good run (80e7cc04b) and a timeout otherwise.
-    # run-c-consumers.py now keeps `CC` from that build
+    # run-c-consumers.py now strips the lane's `CC` from that build
     # (`generator_env`) and prints how long each scenario took to generate,
     # so a lane that rebuilds them again shows in its log. That should leave
     # about 50 minutes; lower this once a few runs have confirmed it.
