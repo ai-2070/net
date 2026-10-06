@@ -36,10 +36,16 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Maximum number of entries evicted per write-lock acquisition.
 /// Larger batches amortize the lock-acquire cost; smaller batches
-/// shorten the worst-case window during which applies + queries
-/// block. 1024 is a compromise that on a 100k-entry fold caps
-/// each write-lock hold to sub-millisecond while still finishing
-/// a full sweep in ~100 read-then-write cycles.
+/// shorten the window during which applies + queries block.
+///
+/// This bounds the entry count per hold, not the hold's duration:
+/// each eviction runs the fold's index removal and drops the
+/// entry's payload, so a hold costs `SWEEP_CHUNK_SIZE` times the
+/// per-entry removal cost of the fold's payload. For the
+/// capability fold that cost is several microseconds per entry
+/// (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 0), which puts a full
+/// chunk in the milliseconds, not below one. No hold-duration
+/// guarantee is made until chunk holds are measured directly.
 const SWEEP_CHUNK_SIZE: usize = 1024;
 
 /// Synchronous core of the expiry sweep. Walks the primary store

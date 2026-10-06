@@ -2,7 +2,7 @@
 
 ## Status
 
-**Slice 0 authorized.** Written 2026-10-06 against `LZL0/scaling` at
+**Slice 0 implemented; awaiting re-review after harness repairs.** Written 2026-10-06 against `LZL0/scaling` at
 `806635756`. No slice has landed. The 2026-10-06 design review of revision
 `ad4225dee` returned HOLD: the optimization direction stands, but several
 selected mechanisms and acceptance gates either changed supported semantics
@@ -26,13 +26,27 @@ bitmaps, the expiry wheel) stay held, each pending its own decisions.
 
 ### Slice 0 baseline (2026-10-06)
 
-Measured on Intel i9-14900K, Windows 11, Rust 1.99.0, on `LZL0/scaling` at
-`00730817d` plus the uncommitted Slice 0 change (benches and counters
-only, no behavior change). Clock-speed control taken right after the runs:
-`routing_table/is_local` 214 ps and `net_encryption/encrypt/64` 214 ns,
-matching BENCHMARKS.md's i9 column (201 ps, 213 ns). Fixture:
-`sample_capability_set`, **31.4 tags per entry** (not ~35 as Gap §2
-assumed).
+Slice 0 landed in `b76cfb445`. Its review returned HOLD on full acceptance
+and asked for three harness repairs, S0-1 to S0-3, plus some reporting
+corrections. This baseline was re-measured after those repairs.
+
+- **S0-1:** the mixed workload's expiry is now armed relative to a common
+  start.
+- **S0-2:** every outcome is asserted.
+- **S0-3:** each value below carries one of four labels:
+  - **measured:** a timer or the counting allocator read it directly;
+  - **counted:** from a `FoldMetrics` or cache counter;
+  - **estimated:** computed from a table's capacity;
+  - **inferred:** an interpretation, not instrumented.
+
+Rows that only Criterion produced, and rows that only the custom reporter
+produced, are named as such.
+
+Measured on Intel i9-14900K, Windows 11, Rust 1.99.0. Clock-speed control
+taken around the runs: `routing_table/is_local` 214 ps and
+`net_encryption/encrypt/64` 214 ns, matching BENCHMARKS.md's i9 column
+(201 ps, 213 ns). Fixture: `sample_capability_set`, **31.4 tags per entry**
+(not ~35 as Gap §2 assumed).
 
 Commands:
 
@@ -41,131 +55,199 @@ cargo bench --features "net fixtures" --bench fold_scale
 cargo bench --features "net fixtures" --bench fold_scale_report   # -- footprint cache sweep mixed
 ```
 
-Two deviations from Slice 0 as written, both deliberate:
+`fold_scale_report` rejects an unknown section name with exit code 2, so a
+typo cannot pass as a green run.
+
+Deviations from Slice 0 as written, all deliberate. The first two were
+accepted in review.
 
 - The benches live in two new targets, not in `benches/net.rs`.
-  `fold_scale` holds the Criterion timings. `fold_scale_report` is a
-  custom main for the counted workloads. Building two 1M-entry folds would
-  add minutes and several GB to every `net` bench run.
+  `fold_scale` holds the Criterion timings. `fold_scale_report` is a custom
+  main for the counted workloads. Building two 1M-entry folds would add
+  minutes and several GB to every `net` bench run.
 - The footprint probe is part of `fold_scale_report`, not a `#[ignore]`
-  test in `fold/tests.rs`. A counting global allocator installed in the
-  library's unit-test binary would tax every lib test; in a bench binary it
-  taxes only the report.
+  test in `fold/tests.rs`. Its counting allocator is switched on **only**
+  while the footprint section runs; every timed section in the reporter
+  runs with counting off.
+- **Lock-hold tails are not measured.** The reporter gives per-operation
+  service latency and the duration of whole `sweep_expired_now` calls. A
+  sweep call spans many write-locked chunks, so it is not one hold.
+  Measuring chunk holds directly is a prerequisite for choosing any
+  hold-duration guarantee or retuning `SWEEP_CHUNK_SIZE`. It is not part
+  of this slice.
 
 Library changes, instrumentation only:
 
 - `FoldMetrics::{sweep_walks, sweep_yielded}`: per-walk counters, not
   added to the serialized `FoldStats`.
 - `CapabilitySetCache::stats()`: hits, stale misses and absent misses.
+- A corrected `SWEEP_CHUNK_SIZE` doc comment. It bounds entries per lock
+  acquisition, not hold duration.
 
-Each has a unit test.
+The two counters each have a unit test.
 
-**Apply and translate** (Criterion, fresh owned envelope per iteration,
-`BatchSize::PerIteration`, outcome asserted every iteration):
+**Apply and translate** (Criterion only; measured). Each iteration gets a
+fresh owned envelope under `BatchSize::PerIteration`, and its outcome is
+asserted. The 1,024 apply targets are sampled uniformly at random with a
+fixed seed. The first run's fixed stride aliased with the 4,800-entry
+template period at 1M, where no target carried `inference`. The sampled
+targets carry `inference` at 51.1% / 50.6% / 50.7% (10k / 100k / 1M),
+against 50% across the fleet. These are timings of a warm, randomly
+sampled target subset.
 
 | operation | 10k | 100k | 1M |
 |---|---|---|---|
-| `capability_fold_apply/insert` | 5.90 µs | 5.93 µs | 5.93 µs |
-| `capability_fold_apply/refresh_equivalent` | 1.26 µs | 1.37 µs | 1.35 µs |
-| `capability_fold_apply/replace_changed` | 12.3 µs | 14.9 µs | 16.2 µs |
-| `capability_translate/announcement` | 9.79 µs | | |
+| `capability_fold_apply/insert` | 5.94 µs | 6.29 µs | 5.99 µs |
+| `capability_fold_apply/refresh_equivalent` | 1.27 µs | 1.35 µs | 1.40 µs |
+| `capability_fold_apply/replace_changed` | 12.9 µs | 14.8 µs | 16.4 µs |
+| `capability_translate/announcement` | 9.79 µs (first run; inputs unchanged) | | |
 
-**Sweep** (Criterion times; counts from `fold_scale_report`). "Evict same
-set" removes the same entries through `evict_node`, with no candidate walk:
+**Sweep.**
 
-| entries | case | walks | yielded | sweep | evict same set |
+- Steady and 10% rows exist in both targets. The Criterion times
+  (measured) are 0.18 ms / 92 ms at 100k and 5.47 ms / 1.43 s at 1M.
+- Whole-fleet and evict-only rows exist **only** in the reporter.
+- The table is the reporter's run with counting off. Walks and yielded are
+  counted; times are measured.
+- The 1M 10% sweep measured 1.43 s in Criterion and 1.44 s and 1.83 s in
+  two reporter runs. Treat it as 1.4–1.8 s, run to run.
+
+| entries | case | walks | yielded | sweep | evict same set (diagnostic) |
 |---|---|---|---|---|---|
-| 100k | steady | 1 | 100,000 | 0.18 ms | – |
-| 100k | 10% expired | 11 | 601,158 | 92 ms | 90 ms |
-| 100k | whole fleet | 99 | 100,000 | 971 ms | 913 ms |
-| 1M | steady | 1 | 1,000,000 | 5.47 ms | – |
-| 1M | 10% expired | 99 | 45,500,209 | 1.43 s | 1.14 s |
-| 1M | whole fleet | 978 | 1,000,000 | 14.3 s | 11.9 s |
+| 100k | steady | 1 | 100,000 | 0.49 ms | – |
+| 100k | 10% expired | 11 | 608,455 | 92 ms | 87 ms |
+| 100k | whole fleet | 99 | 100,000 | 959 ms | 854 ms |
+| 1M | steady | 1 | 1,000,000 | 5.66 ms | – |
+| 1M | 10% expired | 99 | 45,736,877 | 1.83 s | 1.10 s |
+| 1M | whole fleet | 978 | 1,000,000 | 14.1 s | 11.7 s |
 
-**Footprint** (100k entries, bytes per entry). Retained and cumulative
-are measured with a counting allocator. Primary and reverse are estimated
-from table capacity. Index is the remainder.
+The evict column removes the same entries through `evict_node`. That is
+one per-node lock acquisition at a time, in node order, after the sweep's
+removal and re-insertion have changed the table's history. **The gap
+between the two columns is a diagnostic comparison, not a measurement of
+walk cost and not a lower bound.** No gate depends on it.
 
-| configuration | retained | payload heap | primary | reverse | index | cumulative |
+**Footprint** (bytes per entry). Retained, payload heap and cumulative are
+measured by the counting allocator. Primary and reverse are estimated from
+table capacity. Index is the remainder, so it absorbs any estimation error.
+
+| configuration | entries | retained | payload heap | primary (est.) | reverse (est.) | index (remainder) | cumulative |
+|---|---|---|---|---|---|---|---|
+| fixture repetition | 100k | 3,293 | 1,641 | 662 | 159 | 832 | 6,582 |
+| after 3× 20% churn | 100k | 4,048 | 1,641 | 1,324 | 233 | 849 | 10,606 |
+| +7 unique tags per node | 100k | 5,441 | 2,506 | 662 | 159 | 2,114 | 10,178 |
+| fixture repetition | **1M** | **4,184** | 1,641 | 1,059 | 204 | 1,280 | 8,363 |
+
+At 1M the fold retains **4.2 GB** (measured). The first baseline's
+"3.3 GB at 1M" was a linear extrapolation from 100k. It missed capacity
+steps: the primary table rises from 662 to 1,059 B/entry and the index
+remainder from 832 to 1,280. It is withdrawn.
+
+**Cache** (reporter; counts). The fold has 10k publishers. The cache has
+its default capacity of 256. Lookups run at 100k/s, uniform over the hot
+set, for 5 s. Load applies are asserted accepted Replaces. The achieved
+rate is reported, not just the requested one.
+
+The fixture keeps the operating point's fleet-wide rate (6,667/s) over 10k
+publishers. Each publisher therefore refreshes ~100× more often than in a
+real 1M fleet. That does not matter for today's global-generation cache.
+It will once validity is per publisher, so re-measure after Slice 1.
+
+| hot set | target apply rate | achieved | hit rate | coherence misses | capacity misses |
+|---|---|---|---|---|---|
+| 200 | 0 | – | 100.0% | 0 | 0 |
+| 200 | 6,667/s | 6,664/s | 33.8% | 330,565 | 0 |
+| 1,000 | 0 | – | 25.7% | 0 | 370,590 |
+| 1,000 | 6,667/s | 6,664/s | 7.2% | 92,069 | 370,470 |
+
+**Mixed** (reporter; measured; counting off). The workload runs at 1M
+resident for 20 s, with all workers released together by a barrier:
+
+- refreshes at 6,667/s, each asserted an accepted Replace;
+- a selective query (100 matches, each result size asserted) at 1,000/s;
+- a broad query at 2/s, each result checked against the population: no id
+  outside the pre-expiry set, and every post-expiry carrier present;
+- the 500 ms sweeper.
+
+The 10k-entry batch was built live with the rest of the fold. It was armed
+in the first 41 ms after the common start with a 10 s TTL, so every
+deadline falls in [10.00 s, 10.04 s). The run asserts:
+
+- every tick that reaped ended at or after the 10 s boundary;
+- the sweeps reaped exactly the batch, and no batch node remains;
+- final residency is 1M − 10k.
+
+The expiry event was **one tick at 10.15 s that reaped all 10,000 entries
+in 160 ms.**
+
+Latency is per-call service time from each op's start, with no
+coordinated-omission correction. Streams with under 1,000 samples report
+only p50 and max.
+
+| stream | achieved | samples | p50 | p99 | p99.9 | max |
 |---|---|---|---|---|---|---|
-| fixture repetition | 3,293 | 1,641 | 662 | 159 | 832 | 6,582 |
-| after 3× 20% churn | 4,048 | 1,641 | 1,324 | 233 | 849 | 10,606 |
-| +7 unique tags per node | 5,441 | 2,506 | 662 | 159 | 2,114 | 10,178 |
+| refresh apply | 6,666/s | 133,325 | 21.7 µs | 52.6 µs | 202 µs | 37.1 ms |
+| selective query | 1,000/s | 19,999 | 6.7 µs | 253 µs | 33.5 ms | 36.2 ms |
+| broad query (495k–500k matches) | 1.9/s | 39 | 40.5 ms | – | – | 43.4 ms |
+| sweep tick | 2.0/s | 40 | 5.8 ms | – | – | 160 ms |
 
-**Cache** (10k publishers, default capacity 256, 100k uniform lookups/s
-over the hot set for 5 s; fleet apply rate 6,667/s is the operating
-point's):
-
-| hot set | apply rate | hit rate | coherence misses | capacity misses |
-|---|---|---|---|---|
-| 200 | 0 | 100.0% | 0 | 0 |
-| 200 | 6,667/s | 32.2% | 338,677 | 0 |
-| 1,000 | 0 | 25.7% | 0 | 370,488 |
-| 1,000 | 6,667/s | 6.9% | 93,907 | 370,293 |
-
-**Mixed** (1M resident, 20 s). Refreshes at 6,667/s; a selective query
-(100 matches) at 1,000/s; a broad query (~500k matches) at 2/s; 10k entries
-expiring together 10 s in; the 500 ms sweeper. Latency is from each op's
-start, with no coordinated-omission correction.
-
-| stream | achieved | p50 | p99 | p99.9 | max |
-|---|---|---|---|---|---|
-| refresh apply | 6,666/s | 22 µs | 50 µs | 162 µs | 37.8 ms |
-| selective query | 1,000/s | 6.3 µs | 253 µs | 33.8 ms | 37.4 ms |
-| broad query | 1.9/s | 40.6 ms | 43.4 ms | 43.4 ms | 43.4 ms |
-| sweep tick | 2/s | 5.8 ms | 192 ms (the 10k expiry) | | |
+The run before the S0-1 repair armed the batch during fixture
+construction. Its expiry was not a 10 s in-run event, and that row is
+withdrawn.
 
 ### What Slice 0 changes about the later slices
 
-These are findings, not yet-accepted plan changes. Items 1 and 2 alter
-accepted proof gates and need a reviewer's acknowledgement before Slice 2
-or 3 starts.
+The Slice 0 review acknowledged items 1 and 2 and set their bounds.
 
-1. **Removal, not the walk restart, dominates mass expiry.** Removing one
-   entry costs ~9 µs at 100k and ~11–12 µs at 1M. That is more than an
-   insert (5.9 µs). The `evict_node` column shows the walks are only
-   ~20% of a 1M 10%-expiry sweep: 0.29 s of 1.43 s. The yielded-entry
-   count does match Gap §1's corrected estimate: 45.5M against
-   (N − E)·E/2048 ≈ 44M. Consequences:
-   - **Slice 2's proof gate cannot pass as written.** "Drops by at least an
-     order of magnitude" is reachable for the yielded-entry count, not for
-     time. Proposed gate: yielded entries ≤ the pre-sweep entry count (the
-     pinned witness), and the sweep-minus-evict gap removed.
-   - **Each 1024-entry write-locked chunk holds the lock for ~9–12 ms.**
-     The `SWEEP_CHUNK_SIZE` comment in `expiry.rs` promises
-     "sub-millisecond". The comment is wrong at this payload size; the chunk
-     size or its doc needs correcting.
-   - **Track C should cover the remove path as well as insert:**
-     `on_remove`, synthetic derivation on remove, and the payload drop.
-     Today it names only insert-side work.
-2. **The cache has two problems, and Slice 1 fixes one.** Fleet-wide
-   announcements cut a 200-node hot set from 100% to 32% hits, which is the
-   coherence problem Slice 1 targets. A hot set above the 256-entry
-   capacity loses ~74% of lookups to capacity misses with **no**
-   announcements at all, which Slice 1 does not touch. Slice 1's gate
-   (coherence misses from other publishers → 0) stands. Capacity sizing
-   needs its own decision.
-3. **Fold CPU is not the bottleneck at the operating point.**
-   Translate plus refresh is ~11 µs per announcement, about 7% of one core
-   at 6,667/s. Translate (9.8 µs) costs more than the apply it feeds, so
-   Track C's single-pass translate is worth more than its apply-side items
-   on the steady-state path.
-4. **Memory is ~3.3 KB per entry, ~3.3 GB at 1M.**
-   - Payload heap is half of it, the index a quarter, and the primary table
-     a fifth (`FoldEntry` is 488 B inline).
-   - Churn grows retained bytes 23%, almost all from the primary table
-     doubling its capacity.
-   - Seven unique tags per node add 2.1 KB, mostly index. Interning would not
-     help unique tags, which supports R7's separate payload and index
-     targets.
-5. **The worst tails come from long reads, not the sweep.**
-   - Apply and selective-query maxima (~37 ms) sit at the broad query's
-     ~40 ms read hold. The inferred mechanism is a writer waiting behind
-     the broad read and new readers queueing behind that writer (fair
-     `RwLock`). That is not instrumented.
-   - The one sweep tick that reaped the 10k batch took 192 ms in chunks.
-   - Lock-hold instrumentation would confirm the attribution. It is not
-     part of this slice.
+1. **Removal work is substantial; Slice 2 is a scan repair, not a
+   wall-time 10×.**
+   - Removing an entry through `evict_node` takes ~9 µs at 100k and
+     ~12 µs at 1M (measured diagnostic), against a 6 µs insert.
+   - The yielded-entry count matches Gap §1's corrected estimate: 45.7M
+     counted, against (N − E)·E/2048 ≈ 44M.
+   - **Slice 2's normative gate is unchanged** and already counts visits:
+     one candidate walk, yielded entries at most the captured pre-sweep
+     cardinality, exact eviction, and the refreshed-entry re-check. The
+     first baseline's reference to a "10× wall-time" gate pointed at
+     the retired first draft and is withdrawn.
+   - Slice 2 measures whole-sweep duration and reader/writer tails
+     separately. It uses the evict-only arm as a diagnostic only.
+   - `SWEEP_CHUNK_SIZE`'s doc now says it bounds entries per hold, with a
+     workload-dependent duration. Chunk holds must be measured directly
+     before any hold guarantee or retuning.
+   - **Track C extends to the removal path** (accepted): see Track C.
+2. **The cache has two problems; Slice 1 fixes coherence only**
+   (accepted).
+   - Fleet-wide announcements cut a 200-node hot set from 100% to 34%
+     hits.
+   - A hot set larger than the 256-entry capacity hits 26% with no
+     announcements at all.
+   - Slice 1 stays focused on publisher revisions and its
+     zero-other-publisher-coherence-miss witness. It leaves the capacity
+     at 256 and does not auto-grow the cache with fleet size.
+   - Operator capacity configuration is a separate, bounded follow-up,
+     sized against observed hot sets and retained synthesized-set bytes.
+     `CapabilitySetCache::with_capacity` exists, but `MeshNode` builds the
+     cache with `CapabilitySetCache::new()` (`mesh.rs:14125`). Operators
+     cannot configure it today, and that follow-up must add the plumbing.
+3. **Fold CPU is not the bottleneck at the operating point** (inferred
+   from measured per-op times). Translate plus refresh is ~11 µs per
+   announcement, about 7% of one core at 6,667/s. Translate (9.8 µs) costs
+   more than the apply it feeds.
+4. **Memory is 4.2 GB at 1M** (measured).
+   - Payload heap is ~40% of it, the index remainder ~31%, and the primary
+     table ~25% (`FoldEntry` is 488 B inline).
+   - At 100k, churn grows retained bytes 23%, mostly from the primary
+     table doubling its capacity (estimated).
+   - Seven unique tags per node add 2.1 KB at 100k, mostly index. Interning
+     would not help unique tags, which supports R7's separate payload and
+     index targets.
+5. **The worst tails sit at the broad query's read hold** (inferred, not
+   instrumented). Apply and selective-query maxima (~36–37 ms) are just
+   under the broad query's ~40 ms service time. The suspected mechanism is
+   a writer queued behind the broad read, and readers queued behind that
+   writer (fair `RwLock`). Lock-hold instrumentation would confirm it; see
+   the deviation above.
 
 What the repairs changed, in short:
 
@@ -610,6 +692,20 @@ The allocation claim is narrowed to a measured boundary. Zero allocations
 inside `Fold::apply` on a **warm, index-equivalent refresh**: the same owner
 and key, an already-resident entry, and no table growth. Changed-index
 replacements and cold table growth are reported, not gated at zero.
+
+**Removal path (added after Slice 0).** Slice 0 measured removing one entry
+at 9–12 µs, more than an insert. Track C therefore also benchmarks and
+optimizes the removal side:
+
+- `on_remove`;
+- the borrowing synthetic derivation on removal;
+- the cost of destroying or retiring the payload.
+
+Primary, reverse and index consistency, audit and watch behavior, and
+publisher-revision maintenance are preserved. The zero-allocation gate
+above does **not** extend to removal. A cold removal frees the entry's
+allocations by definition, so no "no deallocation" promise is made.
+Removal is reported against its Slice 0 baseline.
 
 ### Track D: publisher-revision cache validity
 

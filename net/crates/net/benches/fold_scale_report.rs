@@ -7,36 +7,43 @@
 //! - `sweep`: how many entries the expiry sweep's candidate walks yield
 //!   (from `FoldMetrics::sweep_yielded`) and how many walks it makes,
 //!   against the entry table's capacity, for a steady sweep, a 10% mass
-//!   expiry and a whole-fleet expiry.
+//!   expiry and a whole-fleet expiry. A diagnostic column times removing
+//!   the same entries through `evict_node`.
 //! - `footprint`: retained and cumulative heap bytes per entry, from a
 //!   counting global allocator, split into payload heap, primary table,
-//!   reverse index and secondary index. Three configurations: the
-//!   fixture's tag repetition, a mixed fixture where ~20% of each
-//!   node's tags are unique to it, and a churn run.
+//!   reverse index and secondary index. The fixture's tag repetition at
+//!   100k and 1M; a churn run and a mixed fixture where ~20% of each
+//!   node's tags are unique to it, at 100k.
 //! - `cache`: `CapabilitySetCache` hits, coherence (stale) misses and
 //!   capacity misses, for a hot set below and above the default
 //!   capacity, with and without fleet-wide announcement load.
 //! - `mixed`: one concurrent workload at 1M residency. Refreshes at the
-//!   operating point's rate, selective and broad queries, a mass expiry
-//!   partway through, and the 500 ms sweeper, with latency histograms.
+//!   operating point's rate, selective and broad queries, a batch of
+//!   entries armed at the workload's start to expire ten seconds later,
+//!   and a 500 ms sweeper, with per-call service-latency histograms.
+//!
+//! Every section asserts its outcomes: an apply that should replace must
+//! replace, a sweep must reap exactly the armed batch, query results must
+//! match the population, so a broken workload fails instead of printing
+//! a plausible table.
 //!
 //! Run: `cargo bench --features "net fixtures" --bench fold_scale_report`
 //! (all sections), or name sections after `--`, e.g.
-//! `-- footprint cache`. `sweep` and `mixed` build 1M-entry folds and
-//! need several GB of RAM.
+//! `-- footprint cache`. An unknown section name is an error. `sweep`,
+//! `mixed` and the 1M footprint row build 1M-entry folds and need several
+//! GB of RAM.
 //!
 //! This is a custom-main target (`harness = false`) so it can install a
 //! counting global allocator without slowing the Criterion timings in
 //! `fold_scale`, and without installing one into the library's unit-test
-//! binary, where every test would pay for it.
+//! binary, where every test would pay for it. Counting is switched on only
+//! while the `footprint` section runs; every timed section runs with it off.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
-
-use parking_lot::Mutex;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,13 +52,17 @@ use net::adapter::net::behavior::fold::capability_bridge::{
     self, CapabilitySetCache, CapabilitySetCacheStats,
 };
 use net::adapter::net::behavior::fold::{
-    CapabilityFold, CapabilityMembership, Fold, FoldEntry, FoldKind, NodeId,
+    ApplyOutcome, CapabilityFold, CapabilityMembership, Fold, FoldEntry, FoldKind, NodeId,
+    SignedAnnouncement,
 };
 use net::adapter::net::behavior::CapabilityFilter;
+use parking_lot::Mutex;
 
 #[path = "fold_scale_fixture/mod.rs"]
 mod fold_scale_fixture;
 use fold_scale_fixture::*;
+
+const SECTIONS: [&str; 4] = ["footprint", "cache", "sweep", "mixed"];
 
 // ---------------------------------------------------------------------------
 // Counting allocator
@@ -59,9 +70,14 @@ use fold_scale_fixture::*;
 
 struct Counting;
 
-/// Bytes currently allocated (allocations minus deallocations).
+/// Whether allocations are being counted. Off except in `footprint`, so
+/// the timed sections pay one relaxed load per allocation, not two
+/// read-modify-write atomics.
+static COUNTING: AtomicBool = AtomicBool::new(false);
+/// Bytes currently allocated (allocations minus deallocations) while
+/// counting was on.
 static LIVE: AtomicI64 = AtomicI64::new(0);
-/// Bytes ever allocated.
+/// Bytes allocated while counting was on.
 static CUMULATIVE: AtomicU64 = AtomicU64::new(0);
 
 // SAFETY: every method forwards to `System` with the caller's own
@@ -69,22 +85,28 @@ static CUMULATIVE: AtomicU64 = AtomicU64::new(0);
 // are only bookkeeping beside the forwarded call.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        LIVE.fetch_add(layout.size() as i64, Ordering::Relaxed);
-        CUMULATIVE.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        if COUNTING.load(Ordering::Relaxed) {
+            LIVE.fetch_add(layout.size() as i64, Ordering::Relaxed);
+            CUMULATIVE.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        }
         // SAFETY: forwarded verbatim; the caller upholds `alloc`'s contract.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size() as i64, Ordering::Relaxed);
+        if COUNTING.load(Ordering::Relaxed) {
+            LIVE.fetch_sub(layout.size() as i64, Ordering::Relaxed);
+        }
         // SAFETY: forwarded verbatim; `ptr` came from this allocator,
         // which is `System`.
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        LIVE.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
-        CUMULATIVE.fetch_add(new_size as u64, Ordering::Relaxed);
+        if COUNTING.load(Ordering::Relaxed) {
+            LIVE.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
+            CUMULATIVE.fetch_add(new_size as u64, Ordering::Relaxed);
+        }
         // SAFETY: forwarded verbatim; `ptr` came from this allocator,
         // which is `System`.
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -107,6 +129,7 @@ fn cumulative_bytes() -> u64 {
 // ---------------------------------------------------------------------------
 
 type Key = <CapabilityFold as FoldKind>::Key;
+type Envelope = SignedAnnouncement<CapabilityMembership>;
 
 /// Heap bytes of a std `HashMap`/`HashSet` table holding `T` slots, from
 /// its reported capacity. std's table is hashbrown's: buckets are a power
@@ -156,18 +179,33 @@ fn paced(rate: f64, duration: Duration, stop: &AtomicBool, mut op: impl FnMut())
     done
 }
 
-fn quantiles_us(h: &Histogram<u64>) -> String {
+/// Below this many samples a p99 or p99.9 is one or two observations, not
+/// a tail; those columns print `–` and only p50 and max are reported.
+const MIN_TAIL_SAMPLES: u64 = 1000;
+
+/// `samples | p50 | p99 | p99.9 | max`, in microseconds.
+fn latency_row(h: &Histogram<u64>) -> String {
+    let us = |q: f64| format!("{:.1}", h.value_at_quantile(q) as f64 / 1e3);
+    let (p99, p999) = if h.len() >= MIN_TAIL_SAMPLES {
+        (us(0.99), us(0.999))
+    } else {
+        ("–".to_string(), "–".to_string())
+    };
     format!(
-        "{:.1} | {:.1} | {:.1} | {:.1}",
-        h.value_at_quantile(0.50) as f64 / 1e3,
-        h.value_at_quantile(0.99) as f64 / 1e3,
-        h.value_at_quantile(0.999) as f64 / 1e3,
-        h.max() as f64 / 1e3,
+        "{} | {} | {p99} | {p999} | {:.1}",
+        h.len(),
+        us(0.50),
+        h.max() as f64 / 1e3
     )
 }
 
 fn histogram() -> Histogram<u64> {
     Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).expect("histogram bounds")
+}
+
+fn apply_expect(fold: &Fold<CapabilityFold>, ann: Envelope, expected: ApplyOutcome, what: &str) {
+    let outcome = fold.apply(ann).expect(what);
+    assert_eq!(outcome, expected, "{what}");
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +214,13 @@ fn histogram() -> Histogram<u64> {
 
 fn section_sweep(templates: &Templates) {
     println!("\n## sweep: candidate-walk visits\n");
+    println!(
+        "Counting allocator off. Walks and yielded are counted by `FoldMetrics`. \
+         \"Evict same set\" is a diagnostic: it removes the same entries through \
+         `evict_node`, one per-node lock acquisition at a time, in node order, after \
+         the sweep's removal and re-insertion. Its gap to the sweep column is not an \
+         exact measurement of walk cost.\n"
+    );
     println!(
         "| entries | case | expired | walks | yielded | yielded / entry | table capacity | sweep (ms) | evict same set (ms) |"
     );
@@ -187,36 +232,51 @@ fn section_sweep(templates: &Templates) {
         let mut generation = 1u64;
 
         let mut row = |case: &str, expired: &[NodeId]| {
-            generation += 1;
-            for &node in expired {
-                fold.apply(templates.envelope(node, generation, 0, 0))
-                    .expect("re-arm apply");
-            }
+            let mut rearm = |ttl: u32| {
+                generation += 1;
+                for &node in expired {
+                    apply_expect(
+                        &fold,
+                        templates.envelope(node, generation, ttl, 0),
+                        ApplyOutcome::Replaced,
+                        "re-arm apply",
+                    );
+                }
+            };
+            rearm(0);
             let walks0 = fold.metrics().sweep_walks();
             let yielded0 = fold.metrics().sweep_yielded();
+            let before = fold.metrics().entries();
             let start = Instant::now();
             let reaped = fold.sweep_expired_now();
             let elapsed = start.elapsed();
-            assert_eq!(reaped, expired.len(), "{case} at {n}");
+            assert_eq!(reaped, expired.len(), "{case} at {n}: reaped");
+            assert_eq!(
+                fold.metrics().entries(),
+                before - expired.len() as u64,
+                "{case} at {n}: residency after sweep"
+            );
             let walks = fold.metrics().sweep_walks() - walks0;
             let yielded = fold.metrics().sweep_yielded() - yielded0;
-            // The same removals with no candidate walk: `evict_node`
-            // drops each entry through the same `by_node` + index
-            // removal the sweep's write pass does. The gap between the
-            // two columns is what the walks cost.
-            let mut restore = |ttl: u32| {
-                generation += 1;
-                for &node in expired {
-                    fold.apply(templates.envelope(node, generation, ttl, 0))
-                        .expect("restore apply");
-                }
-            };
-            restore(LIVE_TTL_SECS);
+
+            // Put the batch back (as Inserts: the sweep removed it), then
+            // remove it again through `evict_node`.
+            generation += 1;
+            for &node in expired {
+                apply_expect(
+                    &fold,
+                    templates.envelope(node, generation, LIVE_TTL_SECS, 0),
+                    ApplyOutcome::Inserted,
+                    "restore apply",
+                );
+            }
             let start = Instant::now();
             for &node in expired {
                 fold.evict_node(node, "removal-cost probe");
             }
             let evict_elapsed = start.elapsed();
+            assert_eq!(fold.metrics().entries(), before - expired.len() as u64);
+
             println!(
                 "| {n} | {case} | {} | {walks} | {yielded} | {:.2} | {capacity} | {:.2} | {:.2} |",
                 expired.len(),
@@ -224,8 +284,18 @@ fn section_sweep(templates: &Templates) {
                 ms(elapsed),
                 ms(evict_elapsed),
             );
+
             // Restore residency so the next case starts from `n` live.
-            restore(LIVE_TTL_SECS);
+            generation += 1;
+            for &node in expired {
+                apply_expect(
+                    &fold,
+                    templates.envelope(node, generation, LIVE_TTL_SECS, 0),
+                    ApplyOutcome::Inserted,
+                    "restore apply",
+                );
+            }
+            assert_eq!(fold.metrics().entries(), n);
         };
 
         row("steady", &[]);
@@ -247,14 +317,8 @@ struct Footprint {
     reverse: u64,
 }
 
-/// Measure retained bytes for a fold built from `envelopes`.
-fn measure_fold(
-    n: u64,
-    make: &dyn Fn(
-        u64,
-    )
-        -> net::adapter::net::behavior::fold::SignedAnnouncement<CapabilityMembership>,
-) -> (Fold<CapabilityFold>, Footprint) {
+/// Measure retained bytes for a fold built from `make(0..n)`.
+fn measure_fold(n: u64, make: &dyn Fn(u64) -> Envelope) -> (Fold<CapabilityFold>, Footprint) {
     // Payload heap: build the payloads alone and subtract their inline
     // size (which lives inside the primary table once applied).
     let before = live_bytes();
@@ -267,7 +331,7 @@ fn measure_fold(
     let cumulative_before = cumulative_bytes();
     let fold = empty_fold();
     for i in 0..n {
-        fold.apply(make(i)).expect("footprint apply");
+        apply_expect(&fold, make(i), ApplyOutcome::Inserted, "footprint apply");
     }
     let retained = live_bytes() - before;
     let cumulative = cumulative_bytes() - cumulative_before;
@@ -317,63 +381,79 @@ fn section_footprint(templates: &Templates) {
     // ~20% of the fixture's tags, added per node and unique to it.
     const UNIQUE: usize = 7;
 
+    COUNTING.store(true, Ordering::Relaxed);
+
     let tags: f64 = (0..TEMPLATE_PERIOD)
         .map(|i| templates.envelope(i, 1, 1, 0).payload.tags.len() as f64)
         .sum::<f64>()
         / TEMPLATE_PERIOD as f64;
     println!("\n## footprint: bytes per entry\n");
     println!(
-        "Fixture carries {tags:.1} tags per entry. Primary and reverse are estimated \
-         from table capacity; retained and cumulative are measured; index is the \
-         remainder (retained − payload heap − primary − reverse). Sizes: \
+        "Fixture carries {tags:.1} tags per entry. Retained, payload heap and \
+         cumulative are measured by the counting allocator. Primary and reverse are \
+         estimated from table capacity. Index is the remainder (retained − payload \
+         heap − primary − reverse), so it absorbs any estimation error. Sizes: \
          CapabilityMembership {} B, FoldEntry {} B, key {} B.\n",
         size_of::<CapabilityMembership>(),
         size_of::<FoldEntry<CapabilityFold>>(),
         size_of::<Key>(),
     );
     println!(
-        "| configuration | entries | retained | payload heap | primary | reverse | index | cumulative alloc |"
+        "| configuration | entries | retained | payload heap | primary (est.) | reverse (est.) | index (remainder) | cumulative alloc |"
     );
     println!("|---|---|---|---|---|---|---|---|");
 
-    let (fold, fp) = measure_fold(N, &|i| templates.envelope(node_id(i), 1, LIVE_TTL_SECS, 0));
-    print_footprint("fixture repetition", &fp);
-
-    // Churn: three rounds, each replacing 20% of publishers with new
-    // node ids. Retained bytes after churn show what departed publishers
-    // leave behind (today: table capacity; with an interner: its
-    // dictionary).
-    let before = live_bytes() - fp.retained;
-    let cumulative_before = cumulative_bytes();
-    let mut next_id = N;
-    let mut resident: Vec<NodeId> = (0..N).map(node_id).collect();
-    for round in 0..3u64 {
-        for slot in (round as usize..resident.len()).step_by(5) {
-            fold.evict_node(resident[slot], "churn");
-            let fresh = node_id(next_id);
-            next_id += 1;
-            fold.apply(templates.envelope(fresh, 1, LIVE_TTL_SECS, 0))
-                .expect("churn apply");
-            resident[slot] = fresh;
+    for n in [N, 1_000_000] {
+        let (fold, fp) = measure_fold(n, &|i| templates.envelope(node_id(i), 1, LIVE_TTL_SECS, 0));
+        print_footprint("fixture repetition", &fp);
+        if n != N {
+            drop(fold);
+            continue;
         }
-    }
-    let (primary, reverse) = fold_tables(&fold);
-    let churned = Footprint {
-        entries: N,
-        retained: live_bytes() - before,
-        cumulative: fp.cumulative + (cumulative_bytes() - cumulative_before),
-        payload_heap: fp.payload_heap,
-        primary,
-        reverse,
-    };
-    print_footprint("after 3× 20% churn", &churned);
-    drop(fold);
 
-    let (fold, fp) = measure_fold(N, &|i| {
-        templates.envelope_with_unique_tags(node_id(i), 1, UNIQUE)
-    });
-    print_footprint(&format!("mixed: +{UNIQUE} unique tags"), &fp);
-    drop(fold);
+        // Churn: three rounds, each replacing 20% of publishers with new
+        // node ids. Retained bytes after churn show what departed
+        // publishers leave behind (today: table capacity; with an
+        // interner: its dictionary).
+        let before = live_bytes() - fp.retained;
+        let cumulative_before = cumulative_bytes();
+        let mut next_id = N;
+        let mut resident: Vec<NodeId> = (0..N).map(node_id).collect();
+        for round in 0..3u64 {
+            for slot in (round as usize..resident.len()).step_by(5) {
+                fold.evict_node(resident[slot], "churn");
+                let fresh = node_id(next_id);
+                next_id += 1;
+                apply_expect(
+                    &fold,
+                    templates.envelope(fresh, 1, LIVE_TTL_SECS, 0),
+                    ApplyOutcome::Inserted,
+                    "churn apply",
+                );
+                resident[slot] = fresh;
+            }
+        }
+        assert_eq!(fold.metrics().entries(), N, "churn keeps residency");
+        let (primary, reverse) = fold_tables(&fold);
+        let churned = Footprint {
+            entries: N,
+            retained: live_bytes() - before,
+            cumulative: fp.cumulative + (cumulative_bytes() - cumulative_before),
+            payload_heap: fp.payload_heap,
+            primary,
+            reverse,
+        };
+        print_footprint("after 3× 20% churn", &churned);
+        drop(fold);
+
+        let (fold, fp) = measure_fold(N, &|i| {
+            templates.envelope_with_unique_tags(node_id(i), 1, UNIQUE)
+        });
+        print_footprint(&format!("mixed: +{UNIQUE} unique tags"), &fp);
+        drop(fold);
+    }
+
+    COUNTING.store(false, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -386,21 +466,24 @@ fn section_cache(templates: &Templates) {
     // The operating point's fleet-wide apply rate: 1M publishers at a
     // 150 s re-announce interval. Coherence damage depends on the
     // fleet-wide rate (the cache keys on one fold-wide generation), so
-    // the rate is applied over the smaller fixture fleet.
+    // the rate is applied over the smaller fixture fleet. Each publisher
+    // therefore refreshes ~100x more often than a real 1M-publisher
+    // fleet's would, which matters once validity is per publisher.
     const OPERATING_APPLY_RATE: f64 = 1_000_000.0 / 150.0;
     const RUN: Duration = Duration::from_secs(5);
 
     println!("\n## cache: CapabilitySetCache outcomes\n");
     println!(
-        "{PUBLISHERS} resident publishers, default cache capacity (256), uniform lookups \
-         over the hot set at {LOOKUP_RATE:.0}/s for {}s. Capacity misses = absent \
-         misses − distinct nodes looked up.\n",
+        "Counting allocator off. {PUBLISHERS} resident publishers, default cache \
+         capacity (256), uniform lookups over the hot set at {LOOKUP_RATE:.0}/s for \
+         {}s. Every load apply is asserted to be an accepted Replace. Capacity misses \
+         = absent misses − distinct nodes looked up.\n",
         RUN.as_secs()
     );
     println!(
-        "| hot set | fleet apply rate | lookups | hits | coherence misses | capacity misses | first-lookup misses | hit rate |"
+        "| hot set | target apply rate | accepted applies/s | lookups | hits | coherence misses | capacity misses | first-lookup misses | hit rate |"
     );
-    println!("|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|");
 
     let fold = Arc::new(live_fold(templates, PUBLISHERS));
     let generations = Arc::new(Mutex::new(vec![1u64; PUBLISHERS as usize]));
@@ -414,27 +497,28 @@ fn section_cache(templates: &Templates) {
                 let fold = Arc::clone(&fold);
                 let generations = Arc::clone(&generations);
                 let stop = Arc::clone(&stop);
-                let templates_anns = Templates::new();
                 thread::spawn(move || {
                     if apply_rate == 0.0 {
-                        return 0;
+                        return (0u64, Duration::ZERO);
                     }
+                    let templates = Templates::new();
                     let mut rng = Rng::new(7);
-                    paced(apply_rate, RUN + Duration::from_secs(1), &stop, || {
+                    let start = Instant::now();
+                    let accepted = paced(apply_rate, RUN + Duration::from_secs(1), &stop, || {
                         let i = rng.below(PUBLISHERS);
                         let generation = {
                             let mut g = generations.lock();
                             g[i as usize] += 1;
                             g[i as usize]
                         };
-                        fold.apply(templates_anns.envelope(
-                            node_id(i),
-                            generation,
-                            LIVE_TTL_SECS,
-                            0,
-                        ))
-                        .expect("cache-load apply");
-                    })
+                        apply_expect(
+                            &fold,
+                            templates.envelope(node_id(i), generation, LIVE_TTL_SECS, 0),
+                            ApplyOutcome::Replaced,
+                            "cache-load apply",
+                        );
+                    });
+                    (accepted, start.elapsed())
                 })
             };
 
@@ -446,16 +530,26 @@ fn section_cache(templates: &Templates) {
                 std::hint::black_box(cache.get_or_synthesize(&fold, node));
             });
             stop.store(true, Ordering::Relaxed);
-            mutator.join().expect("mutator thread");
+            let (accepted, mutator_elapsed) = mutator.join().expect("mutator thread");
+            let achieved = if mutator_elapsed.is_zero() {
+                0.0
+            } else {
+                accepted as f64 / mutator_elapsed.as_secs_f64()
+            };
 
             let CapabilitySetCacheStats {
                 hits,
                 stale_misses,
                 absent_misses,
             } = cache.stats();
+            assert_eq!(
+                hits + stale_misses + absent_misses,
+                lookups,
+                "every lookup has exactly one outcome"
+            );
             let distinct = seen.len() as u64;
             println!(
-                "| {hot} | {apply_rate:.0}/s | {lookups} | {hits} | {stale_misses} | {} | {distinct} | {:.1}% |",
+                "| {hot} | {apply_rate:.0}/s | {achieved:.0} | {lookups} | {hits} | {stale_misses} | {} | {distinct} | {:.1}% |",
                 absent_misses.saturating_sub(distinct),
                 100.0 * hits as f64 / lookups.max(1) as f64,
             );
@@ -474,146 +568,255 @@ fn section_mixed(templates: &Templates) {
     const BROAD_RATE: f64 = 2.0;
     const RUN: Duration = Duration::from_secs(20);
     // Indices [0, SELECTIVE) carry the variant tag (the selective
-    // query's 100 matches); [SELECTIVE, SELECTIVE + EXPIRING) expire
-    // together EXPIRE_AFTER into the run; the rest are refreshed.
+    // query's 100 matches); [SELECTIVE, SELECTIVE + EXPIRING) are armed
+    // at the workload's start to expire EXPIRE_AFTER later; the rest are
+    // refreshed.
     const SELECTIVE: u64 = 100;
     const EXPIRING: u64 = 10_000;
-    const EXPIRE_AFTER_SECS: u32 = 10;
+    const EXPIRE_AFTER: Duration = Duration::from_secs(10);
+    const SWEEP_EVERY: Duration = Duration::from_millis(500);
 
     println!("\n## mixed: concurrent workload at 1M residency\n");
 
+    // 1. The complete live population, every entry on the long TTL.
     let fold = empty_fold();
     for i in 0..N {
-        let (ttl, variant) = if i < SELECTIVE {
-            (LIVE_TTL_SECS, 1)
-        } else if i < SELECTIVE + EXPIRING {
-            (EXPIRE_AFTER_SECS, 0)
-        } else {
-            (LIVE_TTL_SECS, 0)
-        };
-        fold.apply(templates.envelope(node_id(i), 1, ttl, variant))
-            .expect("mixed fixture apply");
+        let variant = u8::from(i < SELECTIVE);
+        apply_expect(
+            &fold,
+            templates.envelope(node_id(i), 1, LIVE_TTL_SECS, variant),
+            ApplyOutcome::Inserted,
+            "mixed fixture apply",
+        );
     }
+    let expiring: Vec<NodeId> = (SELECTIVE..SELECTIVE + EXPIRING).map(node_id).collect();
+
+    // The broad query's expected populations: every "inference" carrier
+    // before the batch expires, and the same minus the batch after.
+    // Between the two, a chunked sweep exposes intermediate states, so a
+    // result must contain every post-expiry carrier and nothing outside
+    // the pre-expiry set.
+    let broad_filter = CapabilityFilter::new().require_tag("inference");
+    let pre: HashSet<NodeId> = capability_bridge::find_nodes_matching(&fold, &broad_filter)
+        .into_iter()
+        .collect();
+    let expiring_set: HashSet<NodeId> = expiring.iter().copied().collect();
+    let post: HashSet<NodeId> = pre.difference(&expiring_set).copied().collect();
+    assert!(
+        pre.len() > post.len(),
+        "the batch includes broad-query carriers"
+    );
+
     let fold = Arc::new(fold);
     let stop = Arc::new(AtomicBool::new(false));
-    let start = Instant::now();
+    // Workers + the arming main thread start together.
+    let barrier = Arc::new(Barrier::new(5));
+    let epoch: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
     let applier = {
         let fold = Arc::clone(&fold);
         let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
         thread::spawn(move || {
             let templates = Templates::new();
             let mut generations: HashMap<NodeId, u64> = HashMap::new();
             let mut rng = Rng::new(3);
             let mut h = histogram();
-            let ops = paced(APPLY_RATE, RUN, &stop, || {
+            barrier.wait();
+            let accepted = paced(APPLY_RATE, RUN, &stop, || {
                 let i = SELECTIVE + EXPIRING + rng.below(N - SELECTIVE - EXPIRING);
                 let node = node_id(i);
                 let g = generations.entry(node).or_insert(1);
                 *g += 1;
                 let ann = templates.envelope(node, *g, LIVE_TTL_SECS, 0);
                 let t = Instant::now();
-                fold.apply(ann).expect("mixed apply");
+                let outcome = fold.apply(ann).expect("mixed apply");
                 h.saturating_record(t.elapsed().as_nanos() as u64);
+                assert_eq!(outcome, ApplyOutcome::Replaced, "mixed refresh");
+            });
+            (accepted, h)
+        })
+    };
+
+    let selective = {
+        let fold = Arc::clone(&fold);
+        let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            let filter = CapabilityFilter::new().require_tag("bench-variant-b");
+            let mut h = histogram();
+            barrier.wait();
+            let ops = paced(SELECTIVE_RATE, RUN, &stop, || {
+                let t = Instant::now();
+                let found = capability_bridge::find_nodes_matching(&fold, &filter);
+                h.saturating_record(t.elapsed().as_nanos() as u64);
+                assert_eq!(found.len(), SELECTIVE as usize, "selective result size");
             });
             (ops, h)
         })
     };
 
-    let query_thread = |rate: f64, filter: CapabilityFilter, expect: Option<usize>| {
+    let broad = {
         let fold = Arc::clone(&fold);
         let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
+        let filter = broad_filter.clone();
         thread::spawn(move || {
             let mut h = histogram();
-            let ops = paced(rate, RUN, &stop, || {
+            let mut sizes = (usize::MAX, 0usize);
+            barrier.wait();
+            let ops = paced(BROAD_RATE, RUN, &stop, || {
                 let t = Instant::now();
                 let found = capability_bridge::find_nodes_matching(&fold, &filter);
                 h.saturating_record(t.elapsed().as_nanos() as u64);
-                if let Some(expected) = expect {
-                    assert_eq!(found.len(), expected, "selective query result size");
+                // Membership check, outside the timed call.
+                let mut post_found = 0usize;
+                for id in &found {
+                    assert!(pre.contains(id), "broad result {id} outside the population");
+                    post_found += usize::from(post.contains(id));
                 }
+                assert_eq!(post_found, post.len(), "broad result missing live carriers");
+                sizes = (sizes.0.min(found.len()), sizes.1.max(found.len()));
             });
-            (ops, h)
+            (ops, h, sizes, pre.len(), post.len())
         })
     };
-    let selective = query_thread(
-        SELECTIVE_RATE,
-        CapabilityFilter::new().require_tag("bench-variant-b"),
-        Some(SELECTIVE as usize),
-    );
-    let broad = query_thread(
-        BROAD_RATE,
-        CapabilityFilter::new().require_tag("inference"),
-        None,
-    );
 
     let sweeper = {
         let fold = Arc::clone(&fold);
         let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
+        let epoch = Arc::clone(&epoch);
         thread::spawn(move || {
             let mut h = histogram();
-            let mut reaped_total = 0usize;
-            let mut worst = (Duration::ZERO, 0usize);
+            // (tick start since epoch, tick duration, reaped) for every
+            // tick that reaped anything.
+            let mut reaps: Vec<(Duration, Duration, usize)> = Vec::new();
+            barrier.wait();
+            let start = loop {
+                if let Some(e) = *epoch.lock() {
+                    break e;
+                }
+                thread::yield_now();
+            };
             while !stop.load(Ordering::Relaxed) {
+                let at = start.elapsed();
                 let t = Instant::now();
                 let reaped = fold.sweep_expired_now();
                 let d = t.elapsed();
                 h.saturating_record(d.as_nanos() as u64);
-                reaped_total += reaped;
-                if d > worst.0 {
-                    worst = (d, reaped);
+                if reaped > 0 {
+                    reaps.push((at, d, reaped));
                 }
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(SWEEP_EVERY);
             }
-            (h, reaped_total, worst)
+            (h, reaps)
         })
     };
 
+    // 2. Common start, then arm the batch relative to it. Each entry's
+    //    deadline is its own apply time + EXPIRE_AFTER, so the batch's
+    //    deadlines fall in [EXPIRE_AFTER, EXPIRE_AFTER + arm duration).
+    barrier.wait();
+    let start = Instant::now();
+    *epoch.lock() = Some(start);
+    for &node in &expiring {
+        apply_expect(
+            &fold,
+            templates.envelope(node, 2, EXPIRE_AFTER.as_secs() as u32, 0),
+            ApplyOutcome::Replaced,
+            "arm expiring batch",
+        );
+    }
+    let armed_by = start.elapsed();
+
     let (applies, apply_h) = applier.join().expect("applier");
     let (sel_ops, sel_h) = selective.join().expect("selective");
-    let (broad_ops, broad_h) = broad.join().expect("broad");
+    let (broad_ops, broad_h, broad_sizes, pre_len, post_len) = broad.join().expect("broad");
     stop.store(true, Ordering::Relaxed);
-    let (sweep_h, reaped, worst) = sweeper.join().expect("sweeper");
+    let (sweep_h, reaps) = sweeper.join().expect("sweeper");
     let elapsed = start.elapsed();
 
-    println!(
-        "{N} resident, {:.1}s run. Pacing is catch-up bursts on a 1 ms tick, and \
-         latency is measured from each op's start, so queueing behind a burst is \
-         not counted. Sweep time is the full `sweep_expired_now` call (read walks \
-         plus write-locked eviction chunks), the closest available proxy for the \
-         sweeper's lock holds.\n",
-        elapsed.as_secs_f64()
+    // 3. The expiry event happened in the run, at the boundary, and
+    //    removed exactly the batch.
+    let reaped: usize = reaps.iter().map(|r| r.2).sum();
+    assert_eq!(
+        reaped, EXPIRING as usize,
+        "sweeps reap exactly the armed batch"
     );
-    println!("| stream | target rate | achieved | p50 µs | p99 µs | p99.9 µs | max µs |");
-    println!("|---|---|---|---|---|---|---|");
+    let first = reaps.first().expect("an expiry event in the run");
+    let last = reaps.last().expect("an expiry event in the run");
+    // Every batch deadline is >= start + EXPIRE_AFTER, so no tick that
+    // ended before the boundary can have reaped (tick end, not start:
+    // the sweep reads its own `now` after the tick's start stamp).
+    assert!(
+        first.0 + first.1 >= EXPIRE_AFTER,
+        "a sweep reaped in a tick ending at {:?}, before the {EXPIRE_AFTER:?} boundary",
+        first.0 + first.1
+    );
+    assert!(
+        last.0 + last.1 < RUN,
+        "the batch's removal finished inside the run"
+    );
+    assert_eq!(fold.metrics().entries(), N - EXPIRING, "final residency");
+    fold.with_state(|s| {
+        for node in &expiring {
+            assert!(
+                !s.by_node.contains_key(node),
+                "batch node {node} still resident"
+            );
+        }
+    });
+    assert_eq!(fold.with_state(|s| s.entries.len()) as u64, N - EXPIRING);
+
     let secs = RUN.as_secs_f64();
     println!(
-        "| refresh apply | {APPLY_RATE:.0}/s | {:.0}/s | {} |",
+        "{N} resident, {:.1}s run from a common start. Counting allocator off. The \
+         {EXPIRING}-entry batch was armed between 0 and {:.0} ms with a {}s TTL. \
+         Latency is per-call service time from each op's start; pacing is catch-up \
+         bursts on a 1 ms tick, so time queued behind a burst is not counted \
+         (no coordinated-omission correction). Streams with fewer than \
+         {MIN_TAIL_SAMPLES} samples report only p50 and max. Sweep tick is the whole \
+         `sweep_expired_now` call (read walks plus every write-locked eviction chunk), \
+         not one lock hold.\n",
+        elapsed.as_secs_f64(),
+        ms(armed_by),
+        EXPIRE_AFTER.as_secs(),
+    );
+    println!("| stream | target rate | achieved | samples | p50 µs | p99 µs | p99.9 µs | max µs |");
+    println!("|---|---|---|---|---|---|---|---|");
+    println!(
+        "| refresh apply (accepted Replace) | {APPLY_RATE:.0}/s | {:.0}/s | {} |",
         applies as f64 / secs,
-        quantiles_us(&apply_h)
+        latency_row(&apply_h)
     );
     println!(
         "| selective query (100 matches) | {SELECTIVE_RATE:.0}/s | {:.0}/s | {} |",
         sel_ops as f64 / secs,
-        quantiles_us(&sel_h)
+        latency_row(&sel_h)
     );
     println!(
-        "| broad query (~{} matches) | {BROAD_RATE:.0}/s | {:.1}/s | {} |",
-        N / 2,
+        "| broad query ({}–{} matches) | {BROAD_RATE:.0}/s | {:.1}/s | {} |",
+        broad_sizes.0,
+        broad_sizes.1,
         broad_ops as f64 / secs,
-        quantiles_us(&broad_h)
+        latency_row(&broad_h)
     );
     println!(
         "| sweep tick | 2/s | {:.1}/s | {} |",
         sweep_h.len() as f64 / elapsed.as_secs_f64(),
-        quantiles_us(&sweep_h)
+        latency_row(&sweep_h)
     );
     println!(
-        "\nSweeps reaped {reaped} entries (expected {EXPIRING}); slowest tick {:.1} ms \
-         reaped {}.",
-        ms(worst.0),
-        worst.1
+        "\nBroad query population: {pre_len} carriers before the batch expired, \
+         {post_len} after; every result was checked against both."
     );
+    println!("\nExpiry events (ticks that reaped anything):\n");
+    println!("| tick at (s) | tick duration (ms) | reaped |");
+    println!("|---|---|---|");
+    for (at, d, n) in &reaps {
+        println!("| {:.2} | {:.1} | {n} |", at.as_secs_f64(), ms(*d));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -623,6 +826,14 @@ fn main() {
         .skip(1)
         .filter(|a| !a.starts_with('-'))
         .collect();
+    let unknown: Vec<&String> = requested
+        .iter()
+        .filter(|r| !SECTIONS.contains(&r.as_str()))
+        .collect();
+    if !unknown.is_empty() {
+        eprintln!("unknown section(s) {unknown:?}; expected any of {SECTIONS:?}");
+        std::process::exit(2);
+    }
     let wants = |name: &str| requested.is_empty() || requested.iter().any(|r| r == name);
 
     println!("# Capability fold scale report");

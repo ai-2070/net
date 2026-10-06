@@ -39,8 +39,13 @@ const APPLY_SIZES: [u64; 3] = [10_000, 100_000, 1_000_000];
 /// Resident fold sizes for the sweep benches.
 const SWEEP_SIZES: [u64; 2] = [100_000, 1_000_000];
 
-/// Apply targets rotate through this many residents spread across the
-/// fold, so no single entry's cache lines stay hot across iterations.
+/// Apply targets rotate through this many residents, sampled uniformly
+/// at random (fixed seed) across the fold. A fixed stride would alias with
+/// the fixture's 4800-entry template period: at 1M a stride of 976 shares a
+/// factor of 16 with it, and every selected target lands on an odd template
+/// index without the `inference` tag. Random sampling keeps the targets'
+/// payload mix the fleet's at every size; `Targets::new` prints the share
+/// carrying `inference` so the mix is visible next to the numbers.
 const TARGETS: u64 = 1024;
 
 /// Per-target apply state: the next generation to use and the payload
@@ -53,10 +58,31 @@ struct Targets {
 }
 
 impl Targets {
-    fn new(n: u64) -> Self {
-        let stride = (n / TARGETS).max(1);
-        let nodes: Vec<NodeId> = (0..TARGETS.min(n)).map(|i| node_id(i * stride)).collect();
+    fn new(templates: &Templates, n: u64) -> Self {
+        let mut rng = Rng::new(0x5EED);
+        let mut picked = std::collections::HashSet::new();
+        while (picked.len() as u64) < TARGETS.min(n) {
+            picked.insert(rng.below(n));
+        }
+        let mut indices: Vec<u64> = picked.into_iter().collect();
+        indices.sort_unstable();
+        let nodes: Vec<NodeId> = indices.into_iter().map(node_id).collect();
         let len = nodes.len();
+        let with_inference = nodes
+            .iter()
+            .filter(|&&node| {
+                templates
+                    .envelope(node, 1, LIVE_TTL_SECS, 0)
+                    .payload
+                    .tags
+                    .iter()
+                    .any(|t| t == "inference")
+            })
+            .count();
+        eprintln!(
+            "apply targets at {n}: {len} sampled, {:.1}% carry `inference` (fleet: 50%)",
+            100.0 * with_inference as f64 / len as f64
+        );
         Self {
             nodes,
             // Every resident starts at generation 1 (see `live_fold`).
@@ -85,7 +111,7 @@ fn bench_capability_fold_apply(c: &mut Criterion) {
         // One fold per size, shared by the three benches. Each leaves
         // the fold at size `n` with every resident live.
         let fold = live_fold(&templates, n);
-        let mut targets = Targets::new(n);
+        let mut targets = Targets::new(&templates, n);
 
         // Insert into a fold of `n - 1`: setup evicts the target, the
         // timed apply re-inserts it, so residency is `n` again after
