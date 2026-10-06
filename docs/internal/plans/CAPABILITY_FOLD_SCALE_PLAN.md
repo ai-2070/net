@@ -614,6 +614,96 @@ Also green:
 - rustdoc;
 - `cargo check --workspace --all-targets`.
 
+### Slice 4 (cheap query fixes)
+
+Implemented as Track E1 specifies. The general path of
+`resolve_candidate_keys` now gathers every indexed constraint as a key set:
+
+- **Borrowed index buckets** wherever one exists: each `tags_all` tag, a
+  single-tag group (against `by_synthetic`, as before), the state, the
+  region, a single `tags_any` tag.
+- **An owned union** only for a multi-tag group or a multi-tag
+  `tags_any`.
+- **Intersection.** The smallest set seeds. The result is the seed's
+  keys that every other set holds and the class predicate accepts,
+  collected once into a set pre-sized to the seed.
+- **One constraint.** With exactly one set constraint and no class
+  predicate, that set is returned as is, borrowed when it is a bucket.
+
+Previously the resolver cloned the `tags_all` seed or built an owned
+union per group, then narrowed with repeated `retain` passes. Output is
+the same key set. Callers still sort and deduplicate `NodeId`s as before.
+
+**A regression found and fixed before landing.** The first version
+collected the intersection through `.filter()`. That loses the size hint,
+so the result set regrew and rehashed repeatedly. Single-constraint
+queries regressed by 25–70% against the old `extend` copy, which
+reserves its size up front:
+
+| query | before | regressed |
+|---|---|---|
+| `query_require_gpu` | 251 µs | 419 µs |
+| `query_tool` | 254 µs | 428 µs |
+| `find_best_simple` | 256 µs | 425 µs |
+
+Returning a lone constraint borrowed, and pre-sizing the intersection,
+fixed it. The numbers below are the fixed version.
+
+**Proof** (Criterion `net` bench, same machine; the before column is a
+saved baseline of the pre-Slice-4 resolver built from the same tree):
+
+| query | before | after |
+|---|---|---|
+| `capability_fold_scaling/query_complex/50000` | 1.52 ms | **1.02 ms** (−33%) |
+| `capability_fold_scaling/query_tag/50000` | 737 µs | 744 µs (flat) |
+| `capability_fold_scaling/query_tag_rare/*` | 1.63–1.65 µs | 1.65–1.68 µs (flat) |
+| `capability_fold_scaling/query_complex/{1k,5k,10k}` | 17.0 / 91.2 / 210 µs | **12.3 / 68.6 / 155 µs** (about −26%) |
+| `capability_fold_query/query_complex` | 202 µs | **147 µs** |
+| `capability_fold_query/query_model` | 61.9 µs | **46.9 µs** |
+| `capability_fold_query/query_require_gpu` | 251 µs | **210 µs** |
+| `capability_fold_query/query_tool` | 254 µs | **205 µs** |
+| `capability_fold_query/query_gpu_vendor` | 350 µs | **293 µs** |
+| `capability_fold_find_best/find_best_simple` | 256 µs | **207 µs** |
+| `capability_fold_find_best/find_best_with_prefs` | 178 µs | **132 µs** |
+| `capability_fold_query/query_single_tag` | 98.5 µs | 103.6 µs (fast path unchanged; +4%, noise) |
+| `capability_fold_query/query_min_memory` | 320 µs | 318 µs (flat) |
+
+`query_complex/50000` is now 1.37× `query_tag/50000`, down from 2.06×.
+
+**Witness:** `resolve_candidate_keys_matches_pre_slice4_resolver`
+(`fold/capability.rs`). It stays in the suite permanently, and the old
+resolver is kept as a `#[cfg(test)]` oracle.
+
+- **Matrix:** 720 filters, every combination of:
+  - `tags_all`: none, one tag, two tags, or a rare pair;
+  - groups: none, single-tag, multi-tag including a cross-class model,
+    two groups, or a multi-tag group plus an empty group;
+  - state;
+  - region;
+  - `tags_any`: none, one tag, or two tags;
+  - class: none, `0x100` or `0x200`.
+- **Fixture:** 10k publishers. Every 7th has a second class whose tags
+  differ, so entry-level split predicates are exercised.
+- **Arrival order:** built forward and in reverse. New and old key sets
+  must be identical in both, and the two orders must agree.
+- More than a quarter of the combinations are non-empty (asserted), so
+  the matrix is not vacuous.
+
+Inverse checks, each caught by the witness, with the code restored
+afterwards:
+
+- Dropping the class predicate from the intersection.
+- Resolving single-tag groups against `by_tag` instead of `by_synthetic`.
+
+Also green:
+
+- fold tests: 222;
+- the full library unit suite, `cargo tl`: 5,992 passed;
+- 23 capability-related integration binaries: 282 passed;
+- fmt; clippy across all targets and features; strict lib clippy at
+  all, default and no-default features;
+- rustdoc.
+
 ### What Slice 0 changes about the later slices
 
 The Slice 0 review acknowledged items 1 and 2 and set their bounds.

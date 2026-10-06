@@ -813,6 +813,183 @@ pub(crate) fn resolve_candidate_keys<'a>(
         }
     }
 
+    // General path (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 4). Every
+    // indexed constraint becomes a key set: a borrowed index bucket
+    // wherever one exists (each `tags_all` tag, a single-tag group, the
+    // state, the region, a single `tags_any` tag), an owned union only
+    // for a multi-tag group or multi-tag `tags_any`. The smallest set
+    // seeds; the result is the seed's keys that every other set holds,
+    // collected once. Nothing is cloned and then narrowed.
+    let mut sets: Vec<KeySet<'a>> = Vec::new();
+    for tag in &filter.tags_all {
+        match index.by_tag.get(tag) {
+            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
+            None => return CandidateKeys::Owned(HashSet::default()),
+        }
+    }
+    // Empty groups carry no constraint and are skipped.
+    for group in filter.tag_groups_all.iter().filter(|g| !g.is_empty()) {
+        if let [tag] = &group[..] {
+            // Synthetic axes resolve against `by_synthetic` only; see
+            // `group_union`.
+            match index.by_synthetic.get(tag) {
+                Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
+                None => return CandidateKeys::Owned(HashSet::default()),
+            }
+        } else {
+            let union = group_union(index, group);
+            if union.is_empty() {
+                return CandidateKeys::Owned(HashSet::default());
+            }
+            sets.push(KeySet::Owned(union));
+        }
+    }
+    if let Some(state_filter) = filter.state {
+        match index.by_state.get(&state_filter) {
+            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
+            None => return CandidateKeys::Owned(HashSet::default()),
+        }
+    }
+    if let Some(region) = &filter.region {
+        match index.by_region.get(region) {
+            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
+            None => return CandidateKeys::Owned(HashSet::default()),
+        }
+    }
+    if let [tag] = &filter.tags_any[..] {
+        match index.by_tag.get(tag) {
+            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
+            None => return CandidateKeys::Owned(HashSet::default()),
+        }
+    } else if !filter.tags_any.is_empty() {
+        let mut union: HashSet<(u64, NodeId), BuildU64TupleHasher> = HashSet::default();
+        for tag in &filter.tags_any {
+            if let Some(bucket) = index.by_tag.get(tag) {
+                union.extend(bucket.iter().copied());
+            }
+        }
+        if union.is_empty() {
+            return CandidateKeys::Owned(HashSet::default());
+        }
+        sets.push(KeySet::Owned(union));
+    }
+
+    let Some(class) = filter.class else {
+        // Exactly one set constraint and no class predicate: that set
+        // IS the answer. Return it as is, borrowed when it is an index
+        // bucket, instead of copying it.
+        if sets.len() == 1 {
+            if let Some(only) = sets.pop() {
+                return match only {
+                    KeySet::Borrowed(bucket) => CandidateKeys::Borrowed(bucket),
+                    KeySet::Owned(set) => CandidateKeys::Owned(set),
+                };
+            }
+        }
+        if sets.is_empty() {
+            // No constraint at all: every key.
+            return CandidateKeys::Owned(state.entries.keys().copied().collect());
+        }
+        return CandidateKeys::Owned(intersect(sets, |_| true));
+    };
+    if sets.is_empty() {
+        // Only a class predicate: a class scan.
+        return CandidateKeys::Owned(
+            state
+                .entries
+                .keys()
+                .filter(|(c, _)| *c == class)
+                .copied()
+                .collect(),
+        );
+    }
+    CandidateKeys::Owned(intersect(sets, |k| k.0 == class))
+}
+
+/// The keys of the smallest set in `sets` that every other set holds
+/// and `keep` accepts. `sets` must be non-empty. The output is sized
+/// for the seed up front: collecting through a filter loses the size
+/// hint, and regrowing a set of up to M keys costs more than reserving
+/// it once.
+fn intersect(
+    mut sets: Vec<KeySet<'_>>,
+    keep: impl Fn(&(u64, NodeId)) -> bool,
+) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
+    let Some(seed_at) = (0..sets.len()).min_by_key(|&i| sets[i].set().len()) else {
+        return HashSet::default();
+    };
+    let seed = sets.swap_remove(seed_at);
+    let mut out =
+        HashSet::with_capacity_and_hasher(seed.set().len(), BuildU64TupleHasher::default());
+    out.extend(
+        seed.set()
+            .iter()
+            .filter(|k| keep(k) && sets.iter().all(|other| other.set().contains(*k)))
+            .copied(),
+    );
+    out
+}
+
+/// One indexed constraint of a [`CapabilityFilter`], as the key set a
+/// candidate must belong to: a borrowed index bucket, or a union built
+/// for a multi-tag group.
+enum KeySet<'a> {
+    Borrowed(&'a HashSet<(u64, NodeId), BuildU64TupleHasher>),
+    Owned(HashSet<(u64, NodeId), BuildU64TupleHasher>),
+}
+
+impl KeySet<'_> {
+    fn set(&self) -> &HashSet<(u64, NodeId), BuildU64TupleHasher> {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Owned(s) => s,
+        }
+    }
+}
+
+/// The resolver before Slice 4: clone the seed, then `retain` through
+/// every other constraint. Kept as the oracle for
+/// `resolve_candidate_keys_matches_pre_slice4_resolver`.
+#[cfg(test)]
+fn resolve_candidate_keys_pre_slice4<'a>(
+    state: &FoldState<CapabilityFold>,
+    index: &'a CapabilityIndexInner,
+    filter: &CapabilityFilter,
+) -> CandidateKeys<'a> {
+    // Single-constraint fast path (2026-06-11 service-discovery
+    // follow-up): when the filter constrains exactly one indexed
+    // dimension and nothing else would tighten the seed, the index
+    // bucket already IS the final candidate set. Borrow it instead
+    // of cloning every key into an owned set — and, for the state /
+    // region shapes, instead of also running the general path's
+    // redundant self-retain against the very bucket it seeded from.
+    // `tags_all` resolves against `by_tag` only (synthetic model /
+    // tool / gpu axes ride `tag_groups_all` → `by_synthetic`), so
+    // borrowing the raw-tag bucket cannot leak a synthetic match.
+    if filter.tag_groups_all.is_empty() && filter.tags_any.is_empty() && filter.class.is_none() {
+        match (&filter.tags_all[..], filter.state, &filter.region) {
+            ([tag], None, None) => {
+                return match index.by_tag.get(tag) {
+                    Some(bucket) => CandidateKeys::Borrowed(bucket),
+                    None => CandidateKeys::Owned(HashSet::default()),
+                };
+            }
+            ([], Some(state_filter), None) => {
+                return match index.by_state.get(&state_filter) {
+                    Some(bucket) => CandidateKeys::Borrowed(bucket),
+                    None => CandidateKeys::Owned(HashSet::default()),
+                };
+            }
+            ([], None, Some(region)) => {
+                return match index.by_region.get(region) {
+                    Some(bucket) => CandidateKeys::Borrowed(bucket),
+                    None => CandidateKeys::Owned(HashSet::default()),
+                };
+            }
+            _ => {}
+        }
+    }
+
     // Each group's union (OR within a group) is needed both to seed
     // (when no `tags_all` is present) and to tighten further down.
     // `group_unions` holds the ones that still need to be applied as
@@ -920,6 +1097,7 @@ pub(crate) fn resolve_candidate_keys<'a>(
 /// `tag_groups_all` (OR within a group). Empty groups carry no
 /// constraint, so they're skipped rather than producing an empty
 /// union that would wrongly clear every candidate.
+#[cfg(test)]
 fn build_group_unions(
     index: &CapabilityIndexInner,
     groups: &[Vec<String>],
@@ -1094,6 +1272,150 @@ pub fn reflex_addr_for(
 
 #[cfg(test)]
 mod tests {
+    /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 4, kept permanently: the
+    /// streaming resolver returns exactly the pre-Slice-4 resolver's
+    /// key set over a filter matrix on a 10k fixture. The fixture has
+    /// multi-class publishers (a second class whose tags differ, so an
+    /// entry-level split predicate is exercised), and is built in both
+    /// arrival orders, which must agree with each other too.
+    #[test]
+    fn resolve_candidate_keys_matches_pre_slice4_resolver() {
+        use std::collections::BTreeMap;
+        const N: u64 = 10_000;
+
+        let membership = |class: u64, i: u64| {
+            let mut tags = vec![format!("a{}", i % 4), format!("b{}", i % 7)];
+            if i.is_multiple_of(997) {
+                tags.push("rare".into());
+            }
+            tags.push(format!("software.model.0.id=m{}", i % 3));
+            tags.push(format!("software.tool.0.tool_id:x{}", i % 2));
+            if class == 0x200 {
+                tags = vec!["a0".into(), "cross".into(), "software.model.0.id=m9".into()];
+            }
+            CapabilityMembership {
+                class_hash: class,
+                tags,
+                hardware: (!i.is_multiple_of(3)).then(|| HardwareSummary {
+                    gpu_vendor: Some(if i.is_multiple_of(2) { "nvidia" } else { "amd" }.into()),
+                    gpu_count: 1,
+                    memory_gb: Some(64),
+                    vram_gb: Some(24),
+                }),
+                state: if i.is_multiple_of(2) {
+                    NodeState::Idle
+                } else {
+                    NodeState::Busy
+                },
+                region: (!i.is_multiple_of(11)).then(|| format!("r{}", i % 5)),
+                price_quote: None,
+                reflex_addr: None,
+                noise_pubkey: None,
+                rtc_bootstrap: None,
+                rtc_addr: None,
+                rtc_stun_addr: None,
+                allowed_nodes: Vec::new(),
+                allowed_subnets: Vec::new(),
+                allowed_groups: Vec::new(),
+                metadata: BTreeMap::new(),
+                owner: None,
+            }
+        };
+        let build = |order: &mut dyn Iterator<Item = u64>| {
+            let fold = new_fold();
+            for i in order {
+                let mut classes = vec![0x100];
+                if i.is_multiple_of(7) {
+                    classes.push(0x200);
+                }
+                for class in classes {
+                    fold.apply(SignedAnnouncement::placeholder(
+                        CapabilityFold::KIND_ID,
+                        class,
+                        i + 1,
+                        1,
+                        EnvelopeMeta::default(),
+                        membership(class, i),
+                    ))
+                    .expect("fixture apply");
+                }
+            }
+            fold
+        };
+        let forward = build(&mut (0..N));
+        let reverse = build(&mut (0..N).rev());
+
+        let tags_all: [&[&str]; 4] = [&[], &["a0"], &["a0", "b3"], &["a1", "rare"]];
+        let groups: [&[&[&str]]; 5] = [
+            &[],
+            &[&["model:m0"]],
+            &[&["model:m0", "model:m9"]],
+            &[&["model:m1"], &["tool:x1"]],
+            &[&["gpu:vendor:nvidia", "gpu:present"], &[]],
+        ];
+        let states = [None, Some(NodeState::Idle)];
+        let regions = [None, Some("r2")];
+        let tags_any: [&[&str]; 3] = [&[], &["b1"], &["b1", "cross"]];
+        let classes = [None, Some(0x100), Some(0x200)];
+        let to_vec = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let sorted = |keys: &HashSet<(u64, NodeId), BuildU64TupleHasher>| {
+            let mut v: Vec<_> = keys.iter().copied().collect();
+            v.sort_unstable();
+            v
+        };
+
+        let mut combos = 0usize;
+        let mut nonempty = 0usize;
+        for ta in tags_all {
+            for g in groups {
+                for st in states {
+                    for rg in regions {
+                        for tany in tags_any {
+                            for cl in classes {
+                                let filter = CapabilityFilter {
+                                    tags_all: to_vec(ta),
+                                    tag_groups_all: g.iter().map(|grp| to_vec(grp)).collect(),
+                                    state: st,
+                                    region: rg.map(String::from),
+                                    tags_any: to_vec(tany),
+                                    class: cl,
+                                    ..CapabilityFilter::default()
+                                };
+                                let mut results = Vec::new();
+                                for fold in [&forward, &reverse] {
+                                    fold.with_state_and_index(|state, index| {
+                                        let new = sorted(
+                                            resolve_candidate_keys(state, index, &filter).as_set(),
+                                        );
+                                        let old = sorted(
+                                            resolve_candidate_keys_pre_slice4(
+                                                state, index, &filter,
+                                            )
+                                            .as_set(),
+                                        );
+                                        assert_eq!(new, old, "resolvers differ for {filter:?}");
+                                        results.push(new);
+                                    });
+                                }
+                                assert_eq!(
+                                    results[0], results[1],
+                                    "arrival order changed {filter:?}"
+                                );
+                                combos += 1;
+                                nonempty += usize::from(!results[0].is_empty());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(combos, 4 * 5 * 2 * 2 * 3 * 3);
+        assert!(
+            nonempty > combos / 4,
+            "the matrix must exercise non-empty results"
+        );
+    }
+
     /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 3: the borrowing synthetic
     /// derivation must match the `Tag::parse` path it replaced, over
     /// both separators, embedded delimiters, empty values, bundle-key
