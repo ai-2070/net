@@ -1,0 +1,35 @@
+net/crates/net/browser-ts/test/lobby.test.ts
+  s_3ddfe9bece20b7::t_6beacd45a5ab9e 177-193
+net/crates/net/browser-ts/src/store/join.ts
+  s_3ddfe9bece20b7::t_a03284c3fdd89e 482-486
+  s_3ddfe9bece20b7::t_421025ea487422 252,268,273
+  s_3ddfe9bece20b7::t_3a9079cd6409e5 27
+  s_3ddfe9bece20b7::t_f0ec80e639167a 203-206
+  s_3ddfe9bece20b7::t_73c64c88716c24 78-83
+net/crates/net/browser-ts/src/store/host.ts
+  s_3ddfe9bece20b7::t_bdeb8bbb069946 151-168
+  s_3ddfe9bece20b7::t_199a8677d26a71 903
+  s_3ddfe9bece20b7::t_b1b506d7dac88d 128-129
+net/crates/net/browser-ts/test/world/regions.test.ts
+  s_3ddfe9bece20b7::t_bf1ea219d7719f 191-216
+net/crates/net/browser-ts/src/world/regions.ts
+  s_3ddfe9bece20b7::t_421025ea487422 31,125,138
+net/crates/net/browser-ts/src/world/link.ts
+  s_3ddfe9bece20b7::t_421025ea487422 18,220,232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "02f7d7bfb5f4cbd6630878fe703d63237b60baca",
+  "prompts": {},
+  "sessions": {
+    "s_3ddfe9bece20b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24299a3f-d39b-43a8-8881-3b531da3196f",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
