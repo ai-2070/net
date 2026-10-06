@@ -404,7 +404,7 @@ export function GamesHero() {
       </div>
 
       {/* HUD stat bar */}
-      <div className="relative border-t border-line bg-bg/70 backdrop-blur-md">
+      {/*<div className="relative border-t border-line bg-bg/70 backdrop-blur-md">
         <div className="grid grid-cols-2 md:grid-cols-4 max-w-[1440px] mx-auto">
           {HUD_STATS.map((s) => (
             <div
@@ -425,7 +425,7 @@ export function GamesHero() {
             </div>
           ))}
         </div>
-      </div>
+      </div>*/}
 
       <div className="absolute top-5 right-6 hidden md:flex items-center gap-2 text-[10px] tracking-[0.14em] uppercase text-ink-dim">
         <span className="w-1.5 h-1.5 rounded-full bg-warn inline-block animate-pulse-dot" />

@@ -23,30 +23,30 @@ const SPEED: ReadonlyArray<SpeedStat> = [
     title: "input delay",
     body: "Your character moves on the same frame you press the key. The host confirms it in the background.",
   },
-  {
-    value: "1",
-    unit: "hop",
-    title: "player to player",
-    body: "Players connect directly over WebRTC. There is no game server in the middle adding its own ping.",
-  },
-  {
-    value: "30",
-    unit: "/ sec",
-    title: "world updates",
-    body: "The default tick rate. Raise it for a twitch shooter, lower it for a strategy game.",
-  },
+  // {
+  //   value: "1",
+  //   unit: "hop",
+  //   title: "player to player",
+  //   body: "Players connect directly over WebRTC. There is no game server in the middle adding its own ping.",
+  // },
+  // {
+  //   value: "30",
+  //   unit: "/ sec",
+  //   title: "world updates",
+  //   body: "The default tick rate. Raise it for a twitch shooter, lower it for a strategy game.",
+  // },
   {
     value: "~2",
     unit: "ms",
     title: "to update 8,000 npcs",
-    body: "Measured on one host. Only the entities that changed are checked and sent.",
+    body: "Only the entities that changed are checked and sent.",
   },
-  {
-    value: "16",
-    unit: "players",
-    title: "on one host",
-    body: "Tested with 16 players and 8,000 entities. For a bigger world, split the map across more hosts.",
-  },
+  // {
+  //   value: "16",
+  //   unit: "players",
+  //   title: "on one host",
+  //   body: "Tested with 16 players and 8,000 entities. Host splitting for bigger worlds is supported.",
+  // },
   {
     value: "240",
     unit: "kB",
@@ -60,16 +60,15 @@ export function GamesSpeedSection() {
     <section id="speed" className="border-b border-line px-6 py-20">
       <SectionLabel>§01 / speed</SectionLabel>
       <DisplayHeading>
-        fast enough to
+        it's natively fast
         <br />
         <span className="text-accent">forget the network.</span>
       </DisplayHeading>
 
       <p className="font-sans text-[18px] text-ink max-w-[700px] leading-[1.55] mb-12">
-        A normal online game sends every move to a server somewhere and waits
+        Most online game sends every move to a server somewhere and waits
         for the answer. With NET, you see your own moves right away, players
-        talk directly to each other, and the only delay left is the distance
-        between them.
+        talk directly to each other. There's no server round-trip.
       </p>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
