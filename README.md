@@ -352,6 +352,28 @@ behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/m
 `✓` supported · `core-only` reachable only through the low-level binding (`@net-mesh/core`,
 `net`) · `partial` · `–` not exposed.
 
+## WebRTC
+
+A browser cannot open a UDP socket, so a tab joins the mesh as a WebAssembly leaf over an
+`RTCPeerConnection` to a native **anchor** — a node built with the `webrtc` feature. Against the
+[binding coverage](#sdks) surface, a browser leaf gets:
+
+- Event bus — ingest + poll
+- Mesh channels — subscribe / publish
+- Capability announce + discovery
+- nRPC — typed request / response + streaming, including org-scoped calls and serving
+- Organization capability auth
+- Plus the browser-only additions: a replicated store, lossy netcode, world handoff, Three.js binding
+
+Not exposed to a browser leaf:
+
+- Subnet exports · Dataforts · RedEX / CortEX / MeshDB · compute / groups / daemons
+- Gang-claim scheduler · Deck · MCP bridge · A2A · consumer-side filter DSL
+
+Read: [WebRTC transport](https://ai2070.net/docs/concepts/webrtc-transport),
+[Browser SDK](https://ai2070.net/docs/sdk/browser),
+[NAT and traversal](https://ai2070.net/docs/guides/nat-and-traversal).
+
 ## Origin
 
 Net (Network Event Transport) is loosely inspired by the Net from the Cyberpunk universe — a
