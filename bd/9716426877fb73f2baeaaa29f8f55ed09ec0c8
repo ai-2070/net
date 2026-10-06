@@ -1,0 +1,35 @@
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_24d871c23f1085::t_cc6b373d3a2976 325-330
+net/crates/net/src/adapter/net/behavior/fold/state.rs
+  s_24d871c23f1085::t_cc6b373d3a2976 233-238
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_24d871c23f1085::t_27d7055d497f5e 1358-1359,1387-1393,1395-1398,1403-1406,1408-1427,1430-1431,1435-1475
+  s_24d871c23f1085::t_0628d94b9a5e80 1399-1402,1407
+  s_24d871c23f1085::t_07f4c1bbd46a59 1476
+net/crates/net/src/adapter/net/behavior/fold/expiry.rs
+  s_24d871c23f1085::t_27d7055d497f5e 51-52,61-82,90-95,97-149,151-152,155-156,158
+net/crates/net/src/adapter/net/behavior/fold/metrics.rs
+  s_24d871c23f1085::t_27d7055d497f5e 112-113,116-117,177-179
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_24d871c23f1085::t_cc6b373d3a2976 891-896
+docs/internal/plans/CAPABILITY_FOLD_SCALE_PLAN.md
+  s_24d871c23f1085::t_cc6b373d3a2976 254-258,285-333
+  s_24d871c23f1085::t_bf589f552c2234 5,366-467
+  s_24d871c23f1085::t_d9393afba62319 334,468
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bd9716426877fb73f2baeaaa29f8f55ed09ec0c8",
+  "prompts": {},
+  "sessions": {
+    "s_24d871c23f1085": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e35c8197-0611-44d8-b124-600af36bf427",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
