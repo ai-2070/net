@@ -4,8 +4,8 @@
 
 **Planned.** Written 2026-10-06 against `LZL0/scaling` at `806635756`. No
 slice has landed. Targets the release after the next one; the first two slices
-(Slice 0 measurement, Slice 1 expiry) are the ones worth pulling forward if
-the schedule tightens.
+(Slice 0 measurement, Slice 1 per-entry cache validity) are the ones worth
+pulling forward if the schedule tightens.
 
 Successor to [`CAPABILITY_QUERY_FAST_PATH_PLAN.md`](CAPABILITY_QUERY_FAST_PATH_PLAN.md),
 which made the bulk query path O(matches). This plan is about everything that
@@ -46,14 +46,18 @@ let candidates: Vec<K::Key> = {
 };
 ```
 
-With N live entries and E expired ones spread through the map, each chunk
-scans roughly N·1024/E_remaining entries to find its 1024, so the whole sweep
-visits about N·1024·ln(E/1024) entries. At N = 1M, E = 100k (a partition
-heals, or a wave of nodes goes quiet together) that is on the order of
-5·10⁹ entry visits across ~100 separate read-lock acquisitions, which is
-tens of seconds of CPU on the sweeper and a long stall ladder for every
-concurrent apply and query. The steady-state cost is smaller but still a
-multi-millisecond full scan twice a second that produces nothing.
+With N live entries and E expired ones spread uniformly through the map,
+chunk k restarts at the first bucket, re-walks the prefix the earlier chunks
+already cleared, and stops at roughly position k·1024·N/E. Summed over the
+E/1024 chunks, the sweep visits about **N·E/2048** entries: linear in E, not
+logarithmic. At N = 1M, E = 100k (a partition heals, or a wave of nodes goes
+quiet together) that is ~5·10⁷ entry visits across ~100 separate read-lock
+acquisitions, on the order of 0.3–0.5 s of sweeper CPU. A whole-fleet expiry
+(E = N = 1M) is ~5·10⁸ visits, a few seconds. The steady-state cost is a
+full scan of `entries` twice a second that produces nothing: about 1% of a
+core at 1M entries, under the read lock. These figures are arithmetic from
+the loop's shape at ~5–10 ns per visit; Slice 0 replaces them with a
+measurement.
 
 `sweep_evicts_across_multiple_chunks_when_count_exceeds_chunk_size`
 (`fold/tests.rs:1328`) proves the chunking is correct; nothing proves it is
@@ -145,6 +149,24 @@ wins:
   is already a digest. `by_node` also holds a full `HashSet` per node for
   what the legacy path makes exactly one key (`capability_bridge.rs:748`).
 
+## Operating point
+
+The plan's finish line is **1M publishers at the default 150 s re-announce
+interval, with the full fold held on server-class nodes.** That is ~6.7k
+applies per second per receiving node. Every slice's proof is ultimately
+read against that figure.
+
+What the plan cannot move, even with every slice landed: every node that
+holds the full fold still ingests every other node's announcement. At the
+operating point and ~1.5 KB per announcement that is ~10 MB/s (~80 Mbit/s)
+of announcement traffic into each such node, plus one Ed25519 verification
+per announcement (out of scope; see below). Those costs are O(fleet) per
+node by construction. Beyond the operating point, or for nodes that cannot
+afford that ingest (browser leaves, mobile, constrained devices), the answer
+is not more fold optimization but not holding the full fold: aggregators
+hold it and leaves query them (`behavior/aggregator/`). A follow-up plan
+that pushes past 1M starts there, not here.
+
 ## Design
 
 Five independent tracks. Each is shippable on its own and each has a
@@ -152,9 +174,31 @@ measurement that would catch it being wrong. Order is by payoff per risk; the
 dependency between tracks is only that Slice 0 must land first so every later
 slice has a before number.
 
-### Track A: time-ordered expiry
+### Track A: expiry without the restart penalty
 
-Keep a side structure ordered by `expires_at`, maintained wherever
+Two steps. A1 is cheap and fixes the mass-expiry shape on its own; A2 is
+built only if Slice 0 shows the steady-state scan matters.
+
+**A1: single-pass candidate collection.** Walk `entries` once under the read
+lock and collect every key with `expires_at <= now` into a `Vec`, then evict
+that list in `SWEEP_CHUNK_SIZE` slices, each under its own write-lock
+acquisition, with the existing per-key re-check. The read-lock walk is
+O(N), the write side O(E), so mass expiry drops from N·E/2048 visits to
+N + E with no new structure and no new invariant to keep in sync. The
+write-lock hold per chunk is unchanged. The one cost is a single read-lock
+hold for the whole walk instead of ~100 shorter ones; at 1M entries that is
+a few milliseconds, during which applies wait and queries proceed (they take
+read locks too). If that hold measures as a problem, walk in fixed-size
+stretches of the map and release the read lock between them. A resize
+between stretches can make the walk skip or repeat entries: a repeat is
+absorbed by the per-key re-check, and a skipped expired entry is caught on
+the next tick, 500 ms later.
+
+A1 does nothing for the steady state: the walk still runs twice a second
+and still finds nothing. At ~1% of a core for 1M entries that is not worth
+an invariant on its own, which is why A2 is conditional.
+
+**A2: time-ordered expiry (conditional).** Keep a side structure ordered by `expires_at`, maintained wherever
 `expires_at` is set or an entry is removed: `Fold::apply` (Insert and
 Replace), `Fold::evict_node`, `Fold::restore`, and the sweep itself.
 
@@ -174,7 +218,8 @@ Why not a heap: a refresh cannot cheaply move an entry, and lazy deletion
 leaves a heap the size of the refresh history, not the fleet.
 
 Why not just lower `SWEEP_CHUNK_SIZE` or raise the interval: both change the
-constant, neither changes the N·ln(E) shape.
+constant, neither changes the N·E shape. A1 changes the shape; A2 removes
+the N.
 
 The chunked write-lock discipline stays. Buckets are drained in
 `SWEEP_CHUNK_SIZE` slices with the lock released between them, so the
@@ -200,7 +245,13 @@ Decision to make, with a recommendation: whether `FoldEntry.payload` keeps the
 strings (`capability_tags_for`, `tags_union_for`, the snapshot envelope,
 `PreparedScope::matches`) resolve ids through the interner, which is one
 `Arc<str>` clone per tag. Keeping both would halve the memory win for no
-reader that cannot be served by resolve.
+reader that cannot be served by resolve. This recommendation is conditional
+on no reader needing the original signed bytes; see the corresponding risk.
+
+Interning is bounded before it lands: a per-announcement cap on tag count
+and length, and a per-publisher cap on distinct interned tags (see Risks).
+Without them the interner is a memory sink that any admitted publisher can
+fill.
 
 **B2: roaring bitmaps over dense node slots.** Assign each `NodeId` a `u32`
 slot on first sight (the `by_node` map already exists and is the natural
@@ -286,13 +337,22 @@ against. In `benches/net.rs`:
 
 - `capability_fold_apply/{insert,refresh_equivalent,replace_changed}`: signed
   envelopes built once outside `b.iter`, measuring `Fold::apply` alone at
-  10k and 100k resident entries.
-- `capability_fold_sweep/{steady,mass_expiry}`: 100k entries, sweep with 0
-  expired and with 10% expired, measuring `sweep_expired_now`.
+  10k, 100k and 1M resident entries. The 1M point is the operating target
+  and is where cache effects show: the existing query benches already lose
+  ~45% of their per-node speed between 1k and 50k nodes.
+- `capability_fold_sweep/{steady,mass_expiry}`: 100k and 1M entries, sweep
+  with 0 expired and with 10% expired, measuring `sweep_expired_now`. The 1M
+  `steady` number is what decides whether Slice 7 is built.
 - `capability_fold_footprint`: not a Criterion bench. A `#[test] #[ignore]`
   under `fold/tests.rs` that builds 100k entries and reports bytes via a
   counting global allocator, printed per entry, run by hand with
   `cargo test --lib --features "$UNIT_FEATURES" -- --ignored fold_footprint --nocapture`.
+  Interning's payoff depends entirely on how often tags repeat across
+  nodes, so the probe runs twice: once with `sample_capability_set`'s
+  repetition and once with a fixture where a fixed fraction of each node's
+  tags is unique to it. Report both; a single number measured on the
+  fixture's repetition would overstate B1 the way the old insert bench
+  overstated apply.
 - `capability_set_cache/hit_rate_under_announce_load`: 1k nodes scoring
   while a second thread applies refreshes at 1k/s; reports hits per
   `get_or_synthesize`.
@@ -300,20 +360,35 @@ against. In `benches/net.rs`:
 Proof: the numbers land in this file's Status section with the command and
 the machine. Slice 0 is done when the four tables exist.
 
-### Slice 1: time-ordered expiry (Track A)
+### Slice 1: per-entry cache validity (Track D)
 
-Delivers the per-second wheel in `FoldState`, maintained by apply, evict,
-restore, and the sweep.
+First after measurement because it has the best payoff per risk in the plan:
+a `u64` stamp per entry and a different cache key, fixing a cost on the
+per-packet admission path that already bites at ten thousand nodes (~67
+invalidations per second at the 150 s default), long before fleet scale.
 
-Proof: `capability_fold_sweep/steady` drops from a full-map walk to
-microseconds; `mass_expiry` at 100k/10% drops by at least an order of
-magnitude; the three existing sweep tests at `fold/tests.rs:1248`, `:1315`,
+Delivers the entry stamp and the re-keyed cache.
+
+Proof: `capability_set_cache/hit_rate_under_announce_load` goes from ~0 to
+near 100%. Existing cache tests at `capability_bridge.rs:2867-3003` stay
+green. New witness `cache_survives_other_publishers_announcements`: cache
+node A, apply a refresh from node B, assert A hits; apply a refresh from A,
+assert A misses once.
+
+### Slice 2: single-pass expiry sweep (Track A1)
+
+Delivers one read-locked walk that collects every expired key, then chunked
+write-locked eviction with the existing re-check.
+
+Proof: `capability_fold_sweep/mass_expiry` at 100k/10% drops by at least an
+order of magnitude (from ~N·E/2048 visits to ~N + E); `steady` is unchanged,
+by design. The three existing sweep tests at `fold/tests.rs:1248`, `:1315`,
 `:1328` and `background_sweeper_evicts_expired_entries_on_tick` stay green.
-New witness `sweep_cost_is_independent_of_live_entry_count`: two folds, 1k
-and 100k live entries, same 100 expired, assert the sweep's entry-visit
-counter (exposed on `FoldMetrics` for this purpose) is equal.
+New witness `mass_expiry_visits_each_entry_once`: 100k entries, 10% expired,
+assert the sweep's entry-visit counter (exposed on `FoldMetrics` for this
+purpose) is at most `entries + expired`.
 
-### Slice 2: allocation-free apply (Track C)
+### Slice 3: allocation-free apply (Track C)
 
 Delivers the `get_mut`-first insert, the borrowing synthetic derivation, and
 the single-pass translate.
@@ -323,16 +398,6 @@ Proof: `capability_fold_apply/insert` and `replace_changed` improve;
 agreement test at `capability_bridge.rs:2457` and the synthetic-tags-stay-
 index-only test stay green. An allocation-counting assertion in the apply
 bench's harness pins zero allocations on the `refresh_equivalent` path.
-
-### Slice 3: per-entry cache validity (Track D)
-
-Delivers the entry stamp and the re-keyed cache.
-
-Proof: `capability_set_cache/hit_rate_under_announce_load` goes from ~0 to
-near 100%. Existing cache tests at `capability_bridge.rs:2867-3003` stay
-green. New witness `cache_survives_other_publishers_announcements`: cache
-node A, apply a refresh from node B, assert A hits; apply a refresh from A,
-assert A misses once.
 
 ### Slice 4: tag interning (Track B1)
 
@@ -366,9 +431,26 @@ Proof: the existing `capability_fold_query` and `capability_fold_scaling`
 benches; `find_nodes_matching_dedupes_publisher_across_classes`
 (`capability_bridge.rs:2402`) for the `by_node` shape change.
 
+### Slice 7: time-ordered expiry wheel (Track A2, conditional)
+
+Built only if Slice 0's `capability_fold_sweep/steady` at 1M entries, or a
+profile of a production-sized fold, shows the twice-a-second empty walk
+costs more than the wheel's invariant is worth. Otherwise this slice is
+dropped and the plan is complete at Slice 6.
+
+Delivers the per-second wheel in `FoldState`, maintained by apply, evict,
+restore, and the sweep.
+
+Proof: `capability_fold_sweep/steady` drops from a full-map walk to
+microseconds; `mass_expiry` holds Slice 2's number or better; the existing
+sweep tests stay green. New witness
+`sweep_cost_is_independent_of_live_entry_count`: two folds, 1k and 100k
+live entries, same 100 expired, assert the entry-visit counter is equal.
+
 ## Risks
 
-- **The wheel desynchronizes from `entries`.** A code path sets or clears
+- **The wheel desynchronizes from `entries`** (Slice 7 only; A1 has no side
+  structure to desynchronize, which is most of why it goes first). A code path sets or clears
   `expires_at` without touching the wheel, and an entry either never expires
   or is visited forever as a stale slot. Fallback: the sweep's per-key
   re-check already tolerates stale slots, and a `debug_assert` after every
@@ -376,12 +458,33 @@ benches; `find_nodes_matching_dedupes_publisher_across_classes`
   the leak in tests. `restore` is the path most likely to be forgotten; its
   test rebuilds the wheel and asserts the first sweep after restore evicts
   exactly the entries whose TTL elapsed.
-- **Interner growth is unbounded.** Tags are publisher-controlled strings,
-  and the interner never forgets one. Fallback: the interner is per fold and
-  dies with it, ids are `u32` so 4 billion distinct tags is the ceiling, and
-  Slice 4 adds a gauge (`FoldStats::interned_tags`) so an operator sees a
-  fleet emitting unique tags per announcement. A compaction pass is noted
-  under Not in scope.
+- **Interner growth is unbounded, and the publisher controls it.** This is
+  a security risk, not only an operational one. Tags are publisher-chosen
+  strings and the interner never forgets one, so a single admitted node that
+  emits fresh unique tags in every announcement grows every receiver's
+  memory permanently, for the life of the fold. The `FoldStats::interned_tags`
+  gauge detects that; it does not prevent it. Slice 4 does not land without
+  a stated bound, made of two parts: a per-announcement cap on tag count and
+  tag byte length, enforced before interning (no capability-tag cap was
+  found under `behavior/` when this was written; the only tag cap there is
+  `MAX_METADATA_TAGS` in `metadata.rs`, which does not cover
+  `CapabilityMembership`), and a per-publisher cap on distinct interned tags,
+  past which that publisher's new tags are rejected or counted against it
+  rather than interned. With both, interner size is bounded by
+  `publishers × per-publisher cap` instead of by attacker patience. Ids are
+  `u32`, so 4 billion distinct tags is the hard ceiling either way. A
+  compaction pass is noted under Not in scope.
+- **Dropping the payload strings breaks something that needs the signed
+  bytes.** Track B1 recommends storing only `Vec<TagId>`. That is safe only
+  if nothing re-serves, forwards, or re-verifies the original signed
+  announcement from the fold entry's payload, for example a snapshot sync to
+  a peer that checks the publisher's signature. This was not verified when
+  the plan was written. Slice 4 starts by listing every reader of
+  `FoldEntry.payload` and stating, per reader, whether it needs the original
+  bytes; if any does, the entry keeps the signed envelope (or its bytes)
+  and the memory target is revised. `snapshot_round_trips_via_restore`
+  proves ids do not leak into the envelope; it does not prove signatures
+  still verify after a round trip, and Slice 4 adds a test that does.
 - **Dense node slots are never reclaimed.** A slot allocated for a node that
   leaves is held until the fold is restored. At the operating range that is
   4 bytes per departed node per bucket at worst (bitmaps are sparse where a
@@ -394,7 +497,7 @@ benches; `find_nodes_matching_dedupes_publisher_across_classes`
 - **The stamp-keyed cache serves stale after `with_state_mut`.** The
   owner-projection retraction through `with_state_mut` at `mod.rs:691` mutates a payload field in
   place without going through apply. Fallback: `notify_projection_retracted`
-  already bumps the change generation; Slice 3 makes it also bump the
+  already bumps the change generation; Slice 1 makes it also bump the
   entry's stamp, and the retraction tests at `capability_bridge.rs:3786`
   extend to assert the cache misses afterwards.
 - **A benchmark that measures the fixture again.** Slice 0 builds every
