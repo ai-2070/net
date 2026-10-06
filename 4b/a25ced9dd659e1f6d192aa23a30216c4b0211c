@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/rtc/fragment.rs
+  s_3ddfe9bece20b7::t_aa2f0d6522279d 824-833,838-845,849-856,858-859
+  s_3ddfe9bece20b7::t_ddcfc9be04323c 857
+  s_3ddfe9bece20b7::t_d16041f17db10e 834-837
+  s_3ddfe9bece20b7::t_f551cb6bbcb695 813-814
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4ba25ced9dd659e1f6d192aa23a30216c4b0211c",
+  "prompts": {},
+  "sessions": {
+    "s_3ddfe9bece20b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24299a3f-d39b-43a8-8881-3b531da3196f",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
