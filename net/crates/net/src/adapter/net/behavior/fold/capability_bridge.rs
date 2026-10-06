@@ -659,7 +659,7 @@ pub fn retract_floored_ownership(
         let Some(keys) = state.keys_for(node_id) else {
             return 0;
         };
-        let keys: Vec<_> = keys.iter().copied().collect();
+        let keys: Vec<_> = keys.to_vec();
         let mut retracted = 0;
         for key in keys {
             if let Some(entry) = state.entries.get_mut(&key) {
@@ -1314,8 +1314,34 @@ pub fn translate_announcement(
     ann: &CapabilityAnnouncement,
     verified_owner: Option<VerifiedOwner>,
 ) -> SignedAnnouncement<CapabilityMembership> {
-    let views = ann.capabilities.views();
-    let hw_view = views.hardware();
+    // One pass over the tag set builds the payload's tag strings, finds
+    // the region, and collects the hardware-axis tags. The hardware
+    // projection decodes only those: `hardware_from_tags` skips every
+    // other axis, and tags in a set are distinct, so sorting the
+    // hardware subset gives the same projection as sorting all of them.
+    let mut tags: Vec<String> = Vec::with_capacity(ann.capabilities.tags.len());
+    let mut region: Option<String> = None;
+    let mut hardware_tags: Vec<super::super::tag::Tag> = Vec::new();
+    for tag in &ann.capabilities.tags {
+        // Pre-sized: rendering through `Display` into an empty String
+        // regrows it several times per tag.
+        let mut rendered = String::with_capacity(48);
+        let _ = std::fmt::Write::write_fmt(&mut rendered, format_args!("{tag}"));
+        if region.is_none() {
+            if let Some(r) = rendered.strip_prefix("scope:region:") {
+                region = Some(r.to_owned());
+            }
+        }
+        tags.push(rendered);
+        if matches!(
+            tag.axis_key_ref(),
+            Some((super::super::tag::TaxonomyAxis::Hardware, _))
+        ) {
+            hardware_tags.push(tag.clone());
+        }
+    }
+    hardware_tags.sort_unstable();
+    let hw_view = super::super::tag_codec::hardware_from_tags(&hardware_tags);
     let primary_gpu = hw_view.gpu.as_ref();
     let gpu_count =
         (primary_gpu.is_some() as u8).saturating_add(hw_view.additional_gpus.len() as u8);
@@ -1341,16 +1367,6 @@ pub fn translate_announcement(
     } else {
         None
     };
-
-    let tags: Vec<String> = ann
-        .capabilities
-        .tags
-        .iter()
-        .map(|t| t.to_string())
-        .collect();
-    let region = tags
-        .iter()
-        .find_map(|t| t.strip_prefix("scope:region:").map(String::from));
 
     SignedAnnouncement::placeholder(
         CapabilityFold::KIND_ID,
@@ -2815,6 +2831,145 @@ mod tests {
         assert_eq!(hw.gpu_count, 1);
         assert_eq!(hw.gpu_vendor.as_deref(), Some("nvidia"));
         assert_eq!(hw.vram_gb, Some(80));
+    }
+
+    /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 3 (pinned in review): an
+    /// accepted Replace from the same owner and key leaves the reverse
+    /// index's `keys` untouched, yet still advances the publisher
+    /// revision, so the cached set misses exactly once.
+    #[test]
+    fn same_key_replace_advances_rev_without_touching_membership() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(cache_member(&kp, 0xA, 0x100, 1, vec!["gpu"], None))
+            .expect("v1");
+        let cache = CapabilitySetCache::new();
+        let before = cache.get_or_synthesize(&fold, 0xA);
+        let (keys_before, rev_before) =
+            fold.with_state(|s| (s.keys_for(0xA).map(<[_]>::to_vec), s.publisher_rev(0xA)));
+
+        // Index-equivalent refresh and index-changing replace: both
+        // keep membership and both advance the revision.
+        for (version, tags) in [(2, vec!["gpu"]), (3, vec!["gpu", "cuda"])] {
+            fold.apply(cache_member(&kp, 0xA, 0x100, version, tags, None))
+                .expect("replace");
+        }
+        let (keys_after, rev_after) =
+            fold.with_state(|s| (s.keys_for(0xA).map(<[_]>::to_vec), s.publisher_rev(0xA)));
+        assert_eq!(
+            keys_after, keys_before,
+            "same-key replace must not change membership"
+        );
+        assert!(
+            rev_after > rev_before,
+            "a replace must advance the revision"
+        );
+
+        let after = cache.get_or_synthesize(&fold, 0xA);
+        assert!(
+            !std::sync::Arc::ptr_eq(&before, &after),
+            "the cached set must miss"
+        );
+        assert!(has_tag(&after, "cuda"));
+        assert_eq!(cache.stats().stale_misses, 1, "exactly one miss");
+        assert!(std::sync::Arc::ptr_eq(
+            &after,
+            &cache.get_or_synthesize(&fold, 0xA)
+        ));
+    }
+
+    /// The pre-Slice-3 hardware summary, through the full sorted
+    /// `views()` projection. The single-pass translate must match it.
+    fn hardware_summary_via_views(ann: &CapabilityAnnouncement) -> Option<HardwareSummary> {
+        let views = ann.capabilities.views();
+        let hw_view = views.hardware();
+        let primary_gpu = hw_view.gpu.as_ref();
+        let gpu_count =
+            (primary_gpu.is_some() as u8).saturating_add(hw_view.additional_gpus.len() as u8);
+        let gpu_vendor = primary_gpu.map(|g| gpu_vendor_canonical(g.vendor).to_string());
+        let vram_gb = {
+            let mut total: u32 = 0;
+            if let Some(g) = primary_gpu {
+                total = total.saturating_add(g.vram_gb);
+            }
+            for g in &hw_view.additional_gpus {
+                total = total.saturating_add(g.vram_gb);
+            }
+            (gpu_count > 0).then_some(total)
+        };
+        let memory_gb = (hw_view.memory_gb > 0).then_some(hw_view.memory_gb);
+        (primary_gpu.is_some() || memory_gb.is_some()).then_some(HardwareSummary {
+            gpu_vendor,
+            gpu_count,
+            memory_gb,
+            vram_gb,
+        })
+    }
+
+    /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 3: the single-pass translate
+    /// (hardware decoded from the hardware-axis subset only) produces
+    /// the same hardware summary, tag set and region as the full
+    /// `views()` path, including multi-GPU sets whose decode depends on
+    /// tag order.
+    #[test]
+    fn single_pass_translate_matches_views_projection() {
+        use crate::adapter::net::behavior::capability::{
+            CapabilityAnnouncement, CapabilitySet, GpuInfo, GpuVendor as LegacyGpuVendor,
+            HardwareCapabilities,
+        };
+        use crate::adapter::net::identity::EntityId;
+
+        let gpu = |vendor, vram| GpuInfo::new(vendor, "card", vram);
+        let sets = vec![
+            CapabilitySet::new(),
+            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(128)),
+            CapabilitySet::new().with_hardware(
+                HardwareCapabilities::new().with_gpu(gpu(LegacyGpuVendor::Nvidia, 80)),
+            ),
+            CapabilitySet::new().with_hardware(
+                HardwareCapabilities::new()
+                    .with_cpu(16, 32)
+                    .with_memory(512)
+                    .with_gpu(gpu(LegacyGpuVendor::Nvidia, 80))
+                    .add_gpu(gpu(LegacyGpuVendor::Amd, 64))
+                    .add_gpu(gpu(LegacyGpuVendor::Nvidia, 24)),
+            ),
+            CapabilitySet::new()
+                .with_hardware(
+                    HardwareCapabilities::new()
+                        .with_memory(64)
+                        .with_gpu(gpu(LegacyGpuVendor::Amd, 16)),
+                )
+                .add_tag("inference")
+                .add_tag("scope:region:eu-west"),
+        ];
+        for (i, caps) in sets.into_iter().enumerate() {
+            let ann =
+                CapabilityAnnouncement::new(i as u64 + 1, EntityId::from_bytes([0u8; 32]), 1, caps);
+            let translated = translate_announcement(&ann, None);
+            assert_eq!(
+                translated.payload.hardware,
+                hardware_summary_via_views(&ann),
+                "hardware summary differs for set {i}"
+            );
+            let mut expected_tags: Vec<String> = ann
+                .capabilities
+                .tags
+                .iter()
+                .map(|t| t.to_string())
+                .collect();
+            let mut got_tags = translated.payload.tags.clone();
+            expected_tags.sort();
+            got_tags.sort();
+            assert_eq!(got_tags, expected_tags, "tag set differs for set {i}");
+            let expected_region = expected_tags
+                .iter()
+                .find_map(|t| t.strip_prefix("scope:region:").map(String::from));
+            assert_eq!(
+                translated.payload.region, expected_region,
+                "region differs for set {i}"
+            );
+        }
     }
 
     #[test]

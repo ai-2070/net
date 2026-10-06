@@ -62737,7 +62737,10 @@ mod scoped_discovery_ignores_peer_subnets_tests {
         node.test_inject_capability_announcement(second);
 
         let (entry_count, classes) = node.capability_fold.with_state(|state| {
-            let keys = state.keys_for(peer_id).cloned().unwrap_or_default();
+            let keys = state
+                .keys_for(peer_id)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
             let classes: Vec<u64> = keys.iter().map(|(class, _)| *class).collect();
             (keys.len(), classes)
         });

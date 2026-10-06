@@ -377,6 +377,9 @@ pub struct CapabilityIndexInner {
     by_region: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
     /// state → set of (class, node) keys.
     by_state: HashMap<NodeState, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    /// Reused buffer for building synthetic tag keys, so deriving them
+    /// on insert and remove allocates nothing once it has grown.
+    scratch: String,
 }
 
 /// Fast multiplicative `(u64, u64)` mixer for the inverted-index
@@ -393,55 +396,70 @@ pub struct CapabilityIndexInner {
 /// two copies that can drift apart.
 pub(crate) type BuildU64TupleHasher = std::hash::BuildHasherDefault<FxU64Hasher>;
 
+/// Add `key` to the bucket for `bucket`, allocating the bucket's
+/// owned `String` only when the bucket is new. Steady state, the bucket
+/// exists and nothing is allocated.
+fn bucket_insert(
+    map: &mut HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    bucket: &str,
+    key: (u64, NodeId),
+) {
+    if let Some(set) = map.get_mut(bucket) {
+        set.insert(key);
+    } else {
+        map.entry(bucket.to_owned()).or_default().insert(key);
+    }
+}
+
+/// Remove `key` from the bucket for `bucket`, dropping the bucket when
+/// it empties.
+fn bucket_remove(
+    map: &mut HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    bucket: &str,
+    key: &(u64, NodeId),
+) {
+    if let Some(set) = map.get_mut(bucket) {
+        set.remove(key);
+        if set.is_empty() {
+            map.remove(bucket);
+        }
+    }
+}
+
 impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
     fn on_insert(&mut self, key: &(u64, NodeId), payload: &CapabilityMembership) {
         for tag in &payload.tags {
-            self.by_tag.entry(tag.clone()).or_default().insert(*key);
+            bucket_insert(&mut self.by_tag, tag, *key);
         }
         // Index-only synthetic tags (model:/tool:/gpu:) live in
         // their own `by_synthetic` map so the model / tool / gpu
         // filter axes resolve without a per-query full scan and
         // without risking collision against a raw published tag of
-        // the same string. Parsed once here at insert, never per
-        // query.
-        for tag in derive_synthetic_index_tags(payload) {
-            self.by_synthetic.entry(tag).or_default().insert(*key);
-        }
+        // the same string. Derived here at insert, never per query.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        for_each_synthetic_index_tag(payload, &mut scratch, |tag| {
+            bucket_insert(&mut self.by_synthetic, tag, *key);
+        });
+        self.scratch = scratch;
         if let Some(region) = &payload.region {
-            self.by_region
-                .entry(region.clone())
-                .or_default()
-                .insert(*key);
+            bucket_insert(&mut self.by_region, region, *key);
         }
         self.by_state.entry(payload.state).or_default().insert(*key);
     }
 
     fn on_remove(&mut self, key: &(u64, NodeId), payload: &CapabilityMembership) {
         for tag in &payload.tags {
-            if let Some(set) = self.by_tag.get_mut(tag) {
-                set.remove(key);
-                if set.is_empty() {
-                    self.by_tag.remove(tag);
-                }
-            }
+            bucket_remove(&mut self.by_tag, tag, key);
         }
         // Mirror the synthetic tags added in `on_insert`. Derived
         // from the same payload, so the set is identical.
-        for tag in derive_synthetic_index_tags(payload) {
-            if let Some(set) = self.by_synthetic.get_mut(&tag) {
-                set.remove(key);
-                if set.is_empty() {
-                    self.by_synthetic.remove(&tag);
-                }
-            }
-        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        for_each_synthetic_index_tag(payload, &mut scratch, |tag| {
+            bucket_remove(&mut self.by_synthetic, tag, key);
+        });
+        self.scratch = scratch;
         if let Some(region) = &payload.region {
-            if let Some(set) = self.by_region.get_mut(region) {
-                set.remove(key);
-                if set.is_empty() {
-                    self.by_region.remove(region);
-                }
-            }
+            bucket_remove(&mut self.by_region, region, key);
         }
         if let Some(set) = self.by_state.get_mut(&payload.state) {
             set.remove(key);
@@ -508,7 +526,62 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
 /// the bulk index path and the single-target post-filter path —
 /// `target_matches_filter_agrees_with_find_nodes_matching` guards
 /// this.
+#[cfg(test)]
 fn derive_synthetic_index_tags(payload: &CapabilityMembership) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut scratch = String::new();
+    for_each_synthetic_index_tag(payload, &mut scratch, |tag| out.push(tag.to_owned()));
+    out
+}
+
+/// Visit each index-only synthetic tag of `payload`, in the order
+/// [`derive_synthetic_index_tags`] returns them, building each key in
+/// `scratch` instead of allocating. Tags are read with
+/// [`axis_value_ref`](super::super::tag::axis_value_ref), the borrowing
+/// form of `Tag::parse`, so the accepted grammar is `Tag::parse`'s
+/// exactly: both `=` and `:` separators, reserved prefixes excluded.
+/// `synthetic_derivation_matches_tag_parse` pins that equivalence.
+fn for_each_synthetic_index_tag(
+    payload: &CapabilityMembership,
+    scratch: &mut String,
+    mut visit: impl FnMut(&str),
+) {
+    use super::super::tag::{axis_value_ref, TaxonomyAxis};
+    let mut emit = |prefix: &str, value: &str| {
+        scratch.clear();
+        scratch.push_str(prefix);
+        scratch.push_str(value);
+        visit(scratch);
+    };
+    for s in &payload.tags {
+        let Some((TaxonomyAxis::Software, key, value)) = axis_value_ref(s) else {
+            continue;
+        };
+        if let Some(rest) = key.strip_prefix("model.") {
+            if matches!(rest.split_once('.'), Some((_, "id"))) {
+                emit("model:", value);
+            }
+        } else if let Some(rest) = key.strip_prefix("tool.") {
+            if matches!(rest.split_once('.'), Some((_, "tool_id"))) {
+                emit("tool:", value);
+            }
+        }
+    }
+    if let Some(h) = &payload.hardware {
+        if h.gpu_count > 0 || h.gpu_vendor.is_some() {
+            emit("gpu:present", "");
+        }
+        if let Some(vendor) = &h.gpu_vendor {
+            emit("gpu:vendor:", vendor);
+        }
+    }
+}
+
+/// The pre-Slice-3 derivation, through the owning `Tag::parse`: the
+/// oracle `synthetic_derivation_matches_tag_parse` compares the
+/// borrowing derivation against.
+#[cfg(test)]
+fn derive_synthetic_index_tags_via_parse(payload: &CapabilityMembership) -> Vec<String> {
     use super::super::tag::{Tag, TaxonomyAxis};
     let mut out = Vec::new();
     for s in &payload.tags {
@@ -1021,6 +1094,86 @@ pub fn reflex_addr_for(
 
 #[cfg(test)]
 mod tests {
+    /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 3: the borrowing synthetic
+    /// derivation must match the `Tag::parse` path it replaced, over
+    /// both separators, embedded delimiters, empty values, bundle-key
+    /// shapes, reserved prefixes and raw tags that look like synthetic
+    /// names. Grammar must not change in a performance slice.
+    #[test]
+    fn synthetic_derivation_matches_tag_parse() {
+        use std::collections::BTreeMap;
+        let tag_sets: Vec<Vec<&str>> = vec![
+            vec!["software.model.0.id=llama3", "software.tool.0.tool_id=repl"],
+            vec!["software.model.0.id:llama3", "software.tool.0.tool_id:repl"],
+            vec!["software.model.0.id=a:b", "software.model.1.id:a=b"],
+            vec!["software.model.0.id=", "software.model.1.id:"],
+            vec!["software.model.0.name=llama", "software.model.0.id.extra=x"],
+            vec!["software.model.id=no-index", "software.model.0.0.id=deep"],
+            vec![
+                "software.tool.0.id=not-a-tool-id",
+                "software.tool.0.tool_id=ok",
+            ],
+            vec![
+                "model:llama3",
+                "tool:repl",
+                "gpu:present",
+                "gpu:vendor:nvidia",
+            ],
+            vec!["scope:region:eu", "causal:software.model.0.id=x"],
+            vec!["hardware.gpu.vram_gb=80", "software.os=linux", "inference"],
+            vec!["software.model.0.id=dup", "software.model.1.id=dup"],
+            vec![],
+        ];
+        let hardware = [
+            None,
+            Some(HardwareSummary {
+                gpu_vendor: Some("nvidia".into()),
+                gpu_count: 1,
+                memory_gb: Some(64),
+                vram_gb: Some(24),
+            }),
+            Some(HardwareSummary {
+                gpu_vendor: None,
+                gpu_count: 2,
+                memory_gb: None,
+                vram_gb: None,
+            }),
+            Some(HardwareSummary {
+                gpu_vendor: None,
+                gpu_count: 0,
+                memory_gb: Some(16),
+                vram_gb: None,
+            }),
+        ];
+        for tags in &tag_sets {
+            for hw in &hardware {
+                let payload = CapabilityMembership {
+                    class_hash: 0,
+                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                    hardware: hw.clone(),
+                    state: NodeState::Idle,
+                    region: None,
+                    price_quote: None,
+                    reflex_addr: None,
+                    noise_pubkey: None,
+                    rtc_bootstrap: None,
+                    rtc_addr: None,
+                    rtc_stun_addr: None,
+                    allowed_nodes: Vec::new(),
+                    allowed_subnets: Vec::new(),
+                    allowed_groups: Vec::new(),
+                    metadata: BTreeMap::new(),
+                    owner: None,
+                };
+                assert_eq!(
+                    derive_synthetic_index_tags(&payload),
+                    derive_synthetic_index_tags_via_parse(&payload),
+                    "derivations differ for tags {tags:?}, hardware {hw:?}"
+                );
+            }
+        }
+    }
+
     use std::sync::Arc;
     use std::time::Duration;
 

@@ -384,33 +384,23 @@ impl<K: FoldKind> Fold<K> {
                 Ok(ApplyOutcome::Inserted)
             }
             MergeAction::Replace => {
-                // Drop the old entry's index + by_node attachments
-                // before installing the new one. The `replace`
-                // pattern is "remove then insert" rather than
-                // "in-place mutate" so the index hooks see two
-                // distinct events — keeps the index trait
-                // contract simple.
-                //
-                // `merge` only returns `Replace` when `existing`
-                // was `Some`, so `state.entries.remove(&key)` is
-                // guaranteed to return `Some` here. The
-                // let-else fallback to `Reject` keeps the runtime
-                // sound (no `unwrap`) if a future `merge` impl
-                // ever violates the contract — we'd undercount
-                // replaces in metrics, never silently lose data.
-                let Some(old_entry) = state.entries.remove(&key) else {
+                // `merge` only returns `Replace` when `existing` was
+                // `Some`. The let-else fallback to `Reject` keeps the
+                // runtime sound (no `unwrap`) if a future `merge` impl
+                // ever violates that contract: we'd undercount replaces
+                // in metrics, never silently lose data.
+                let new_entry = build_entry::<K>(ann);
+                let Some(old_entry) = state.entries.get(&key) else {
                     self.metrics.on_reject();
                     return Ok(ApplyOutcome::Rejected);
                 };
-                state.detach_key(old_entry.node_id, &key);
-                let new_entry = build_entry::<K>(ann);
+                let old_owner = old_entry.node_id;
                 // PERF_AUDIT §4.5 — steady-state refresh (same
-                // tags/region/state, new generation/TTL) skips
-                // the index churn. The default
-                // `index_payload_equivalent` returns `false`, so
-                // folds that don't implement a content-aware
-                // equality check fall through to the safe
-                // remove-then-insert pre-fix path.
+                // tags/region/state, new generation/TTL) skips the
+                // index churn. The default `index_payload_equivalent`
+                // returns `false`, so folds without a content-aware
+                // check fall through to remove-then-insert, which keeps
+                // the index hooks seeing two distinct events.
                 if !<K::Index as crate::adapter::net::behavior::fold::state::FoldIndex<K>>::index_payload_equivalent(
                     &old_entry.payload,
                     &new_entry.payload,
@@ -418,14 +408,28 @@ impl<K: FoldKind> Fold<K> {
                     index.on_remove(&key, &old_entry.payload);
                     index.on_insert(&key, &new_entry.payload);
                 }
-                state.attach_key(node_id, key.clone());
                 let audit = K::audit_event(EntryTransition::Replaced {
                     key: &key,
-                    old: &old_entry,
+                    old: old_entry,
                     new: &new_entry,
                 });
                 self.emit_audit(audit);
-                state.entries.insert(key, new_entry);
+                // Overwrite in place: no table churn, and the old
+                // entry's payload is dropped here.
+                if let Some(slot) = state.entries.get_mut(&key) {
+                    *slot = new_entry;
+                }
+                // Same owner (always, for a fold keyed on the
+                // publisher): the reverse-index membership is
+                // unchanged, so leave it and only advance the
+                // revision. A different owner (a fold keyed on payload
+                // alone) moves the key between records.
+                if old_owner == node_id {
+                    state.touch_node(node_id);
+                } else {
+                    state.detach_key(old_owner, &key);
+                    state.attach_key(node_id, key);
+                }
                 self.metrics.on_replace();
                 self.signal_changed();
                 Ok(ApplyOutcome::Replaced)

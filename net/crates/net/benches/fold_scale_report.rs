@@ -62,7 +62,7 @@ use parking_lot::Mutex;
 mod fold_scale_fixture;
 use fold_scale_fixture::*;
 
-const SECTIONS: [&str; 4] = ["footprint", "cache", "sweep", "mixed"];
+const SECTIONS: [&str; 5] = ["footprint", "cache", "sweep", "mixed", "alloc"];
 
 // ---------------------------------------------------------------------------
 // Counting allocator
@@ -79,6 +79,8 @@ static COUNTING: AtomicBool = AtomicBool::new(false);
 static LIVE: AtomicI64 = AtomicI64::new(0);
 /// Bytes allocated while counting was on.
 static CUMULATIVE: AtomicU64 = AtomicU64::new(0);
+/// Allocation calls (alloc + realloc) while counting was on.
+static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
 
 // SAFETY: every method forwards to `System` with the caller's own
 // arguments, so `System`'s guarantees carry over unchanged; the counters
@@ -88,6 +90,7 @@ unsafe impl GlobalAlloc for Counting {
         if COUNTING.load(Ordering::Relaxed) {
             LIVE.fetch_add(layout.size() as i64, Ordering::Relaxed);
             CUMULATIVE.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
         }
         // SAFETY: forwarded verbatim; the caller upholds `alloc`'s contract.
         unsafe { System.alloc(layout) }
@@ -106,6 +109,7 @@ unsafe impl GlobalAlloc for Counting {
         if COUNTING.load(Ordering::Relaxed) {
             LIVE.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
             CUMULATIVE.fetch_add(new_size as u64, Ordering::Relaxed);
+            ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
         }
         // SAFETY: forwarded verbatim; `ptr` came from this allocator,
         // which is `System`.
@@ -356,7 +360,8 @@ fn fold_tables(fold: &Fold<CapabilityFold>) -> (u64, u64) {
         let reverse_inner: u64 = s
             .by_node
             .values()
-            .map(|record| table_bytes::<Key>(record.keys.capacity()))
+            .filter(|record| record.keys.spilled())
+            .map(|record| (record.keys.capacity() * size_of::<Key>()) as u64)
             .sum();
         (primary, reverse_outer + reverse_inner)
     })
@@ -849,6 +854,111 @@ fn section_mixed(templates: &Templates) {
 }
 
 // ---------------------------------------------------------------------------
+// alloc
+// ---------------------------------------------------------------------------
+
+/// Allocation calls made by `op`, counted only while it runs.
+fn count_allocs<R>(op: impl FnOnce() -> R) -> (R, u64) {
+    let before = ALLOC_CALLS.load(Ordering::Relaxed);
+    COUNTING.store(true, Ordering::Relaxed);
+    let out = op();
+    COUNTING.store(false, Ordering::Relaxed);
+    (out, ALLOC_CALLS.load(Ordering::Relaxed) - before)
+}
+
+fn section_alloc(templates: &Templates) {
+    const N: u64 = 10_000;
+    const OPS: u64 = 1_000;
+
+    println!("\n## alloc: allocation calls inside the fold\n");
+    println!(
+        "Allocation calls (alloc + realloc) counted only around the measured \
+         calls; every envelope is built before counting starts. The warm \
+         index-equivalent refresh is the Slice 3 gate and is asserted to be 0. \
+         The other rows are reported, not gated: a changed index, a cold insert \
+         and a translate all allocate by definition.\n"
+    );
+    println!("| operation | calls | allocations | per call |");
+    println!("|---|---|---|---|");
+
+    let fold = live_fold(templates, N);
+    let targets: Vec<NodeId> = (0..OPS).map(|i| node_id(i * (N / OPS))).collect();
+    let row = |what: &str, allocs: u64| {
+        println!(
+            "| {what} | {OPS} | {allocs} | {:.2} |",
+            allocs as f64 / OPS as f64
+        );
+    };
+
+    // Warm, index-equivalent refresh: resident entries, same payload,
+    // newer generation, no table growth. Warm up first so any one-time
+    // growth (the cache-free index buckets already exist) is excluded.
+    let warmup: Vec<_> = targets
+        .iter()
+        .map(|&n| templates.envelope(n, 2, LIVE_TTL_SECS, 0))
+        .collect();
+    for ann in warmup {
+        apply_expect(&fold, ann, ApplyOutcome::Replaced, "warm-up refresh");
+    }
+    let refresh: Vec<_> = targets
+        .iter()
+        .map(|&n| templates.envelope(n, 3, LIVE_TTL_SECS, 0))
+        .collect();
+    let ((), allocs) = count_allocs(|| {
+        for ann in refresh {
+            apply_expect(&fold, ann, ApplyOutcome::Replaced, "warm refresh");
+        }
+    });
+    row("refresh, index-equivalent (warm)", allocs);
+    assert_eq!(allocs, 0, "a warm index-equivalent refresh allocated");
+
+    // Index-changing replace: variant 1 adds one tag, so every apply
+    // re-indexes. Its bucket exists after the first, but `on_insert`
+    // still writes ~31 set memberships, which may grow a set.
+    let changed: Vec<_> = targets
+        .iter()
+        .map(|&n| templates.envelope(n, 4, LIVE_TTL_SECS, 1))
+        .collect();
+    let ((), allocs) = count_allocs(|| {
+        for ann in changed {
+            apply_expect(&fold, ann, ApplyOutcome::Replaced, "changed replace");
+        }
+    });
+    row("replace, index changed", allocs);
+
+    // Removal through `evict_node`: frees the entry, allocates nothing
+    // it does not have to.
+    let ((), allocs) = count_allocs(|| {
+        for &n in &targets {
+            fold.evict_node(n, "alloc probe");
+        }
+    });
+    row("evict (removal path)", allocs);
+
+    // Cold insert of the evicted entries back.
+    let inserts: Vec<_> = targets
+        .iter()
+        .map(|&n| templates.envelope(n, 5, LIVE_TTL_SECS, 0))
+        .collect();
+    let ((), allocs) = count_allocs(|| {
+        for ann in inserts {
+            apply_expect(&fold, ann, ApplyOutcome::Inserted, "cold insert");
+        }
+    });
+    row("insert (cold)", allocs);
+
+    // Translate: builds the owned payload, so it allocates by design.
+    let anns: Vec<_> = (0..OPS).map(legacy_announcement).collect();
+    let (translated, allocs) = count_allocs(|| {
+        anns.iter()
+            .map(|a| capability_bridge::translate_announcement(a, None))
+            .collect::<Vec<_>>()
+    });
+    drop(translated);
+    row("translate_announcement", allocs);
+}
+
+// ---------------------------------------------------------------------------
 
 fn main() {
     let requested: Vec<String> = std::env::args()
@@ -879,5 +989,8 @@ fn main() {
     }
     if wants("mixed") {
         section_mixed(&templates);
+    }
+    if wants("alloc") {
+        section_alloc(&templates);
     }
 }

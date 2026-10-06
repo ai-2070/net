@@ -2,7 +2,7 @@
 
 ## Status
 
-**Slices 0 and 1 accepted; Slice 2 implemented, awaiting review.** Written 2026-10-06 against `LZL0/scaling` at
+**Slices 0 and 1 accepted; Slices 2–5 implemented, awaiting verification.** Written 2026-10-06 against `LZL0/scaling` at
 `806635756`. No slice has landed. The 2026-10-06 design review of revision
 `ad4225dee` returned HOLD: the optimization direction stands, but several
 selected mechanisms and acceptance gates either changed supported semantics
@@ -486,6 +486,133 @@ witnesses now fail:
 Restored, all three sweep witnesses and all 218 fold tests pass. The
 runtime factoring and every measurement above are unchanged; only the
 counter's source moved.
+
+### Slices 3–5: review cadence
+
+By the owner's decision, Slices 3–5 were implemented back to back,
+without waiting for exact-head CI or a per-slice review between them.
+They are verified together before merging. Slice 2's S2-1 repair is in
+`f6b90e500`. Its exact-head CI passed every job except C consumers
+(windows-latest), which timed out at 75 minutes, the problem since fixed
+on `master` (`7837be561`). `master` has not been merged into this branch.
+
+### Slice 3 (allocation-free apply; removal path)
+
+Implemented as Track C specifies, with the removal-path extension the
+Slice 0 review accepted.
+
+- **Grammar-exact borrowing tag reader.** `tag::axis_value_ref(s)`
+  returns `Some((axis, key, value))` exactly when `Tag::parse(s)` returns
+  `AxisValue`, without allocating. The separator rule (the first of `=`
+  and `:`) is factored into one `axis_separator` helper, which
+  `parse_axis_body` and the new reader share, so the two cannot disagree.
+- **Synthetic tags without allocation.** `for_each_synthetic_index_tag`
+  replaces the `Tag::parse`-based derivation on both insert and remove.
+  It builds each `model:` / `tool:` / `gpu:` key in a scratch `String`
+  that the index owns and reuses.
+- **Get-first index inserts.** `on_insert` probes the bucket with the
+  borrowed tag and allocates the owned `String` key only for a new
+  bucket. `on_remove` mirrors this through the same helpers.
+- **In-place replace.** `Fold::apply`'s Replace arm overwrites the entry
+  in place. A same-owner replace leaves the reverse-index membership alone
+  and calls `FoldState::touch_node`, so the revision still advances, as
+  pinned. A different-owner replace (folds keyed on payload alone) moves
+  the key between records.
+- **Reverse-index keys.** `NodeRecord::keys` is now
+  `SmallVec<[K::Key; 1]>`. The record and its `rev` are kept, as pinned.
+  `smallvec` becomes a direct dependency at the 1.16.2 already in
+  `Cargo.lock`. `FoldState::keys_for` returns `Option<&[K::Key]>`, and the
+  Slice 1 migration note's `keys_for` example still compiles.
+- **Single-pass translate.** `translate_announcement` renders tags into
+  pre-sized buffers, finds the region, and collects the hardware-axis
+  tags in one pass. It then decodes the hardware projection from that
+  sorted subset rather than from all tags sorted.
+  `single_pass_translate_matches_views_projection` pins the equivalence.
+
+**Allocation gate** (`fold_scale_report -- alloc`, counted). Allocation
+calls (alloc + realloc) are counted only around the measured calls, and
+every envelope is built before counting starts.
+
+| operation (1,000 calls) | allocations | per call |
+|---|---|---|
+| refresh, index-equivalent, warm (**gated at 0**) | **0** | 0.00 |
+| replace, index changed | 11 | 0.01 |
+| evict (removal path) | 0 | 0.00 |
+| insert (cold) | 70 | 0.07 |
+| `translate_announcement` | 63,369 | 63.4 (131.8 before pre-sizing) |
+
+The gate is live. Planting one `format!` in the same-owner replace arm
+makes the section count 1,000 allocations and panic. Restored, it reads
+0. Removal frees the entry's allocations by definition, and no
+"no deallocation" promise is made.
+
+**Timings** (Criterion; measured; same machine and fixture):
+
+| operation | 10k | 100k | 1M |
+|---|---|---|---|
+| `capability_fold_apply/insert` | 5.94 → **2.91 µs** | 6.29 → **2.84 µs** | 5.99 → **2.89 µs** |
+| `capability_fold_apply/refresh_equivalent` | 1.27 → **1.17 µs** | 1.35 → **1.21 µs** | 1.40 → **1.23 µs** |
+| `capability_fold_apply/replace_changed` | 12.9 → **7.4 µs** | 14.8 → **8.7 µs** | 16.4 → **10.5 µs** |
+| `capability_translate/announcement` | 9.79 → **3.68 µs** | | |
+
+Sweep: Criterion for steady and 10%, the reporter for whole fleet and
+evict-only.
+
+| entries | case | Slice 2 | Slice 3 | evict same set (diagnostic) |
+|---|---|---|---|---|
+| 100k | 10% expired | 89 ms | **66 ms** | 87 → 65 ms |
+| 100k | whole fleet | 918 ms | **692 ms** | 878 → 638 ms |
+| 1M | 10% expired | 1.18 s | **0.91 s** | 1.09 → 0.88 s |
+| 1M | whole fleet | 13.9 s | **11.4 s** | 11.7 → 9.6 s |
+
+Removal is now ~8.8 µs per entry at 1M (diagnostic), down from ~11. The
+rest is inherent to removal:
+
+- dropping the payload (~31 `String`s, the `Vec`, the metadata map);
+- ~31 `by_tag` lookups, SipHashed on publisher-chosen strings (kept by
+  design, per `CapabilityIndexInner`'s doc).
+
+**Mixed workload** (1M resident; same conditions as Slices 0 and 2):
+
+- Refresh apply p50 / p99 / p99.9 went from 21.6 / 53.0 / 187 µs to
+  **15.6 / 41.3 / 133 µs**.
+- Selective query p99 went from 251 to **190 µs**.
+- The expiry tick that reaped the 10k batch took 101.8 ms, down from
+  134.
+- Maxima are unchanged at ~37 ms (apply, selective query) and ~44 ms
+  (broad query). They are still set by the broad query's read hold
+  (inferred).
+
+**Witnesses:**
+
+- `synthetic_derivation_matches_tag_parse` (`fold/capability.rs`): the
+  differential test against the old `Tag::parse` derivation, kept as a
+  `#[cfg(test)]` oracle. It covers both separators, embedded delimiters,
+  empty values, bundle-key and index shapes, reserved prefixes, raw tags
+  that look like synthetic names, duplicates, and four hardware shapes.
+- `axis_value_ref_agrees_with_parse` (`tag.rs`): 23 strings, including
+  empty strings, bare `=`, reserved prefixes, unknown axes, and
+  `software.` with an empty body.
+- `same_key_replace_advances_rev_without_touching_membership`: pinned
+  in review. An index-equivalent and an index-changing replace both keep
+  `keys` unchanged and advance the revision, and the cached set misses
+  exactly once.
+- `single_pass_translate_matches_views_projection`: hardware summary,
+  tag set and region match the full `views()` path over five sets,
+  including a three-GPU mixed-vendor set.
+- `target_matches_filter_agrees_with_find_nodes_matching`,
+  `find_nodes_matching_dedupes_publisher_across_classes`, and every
+  Slice 1 cache witness and Slice 2 sweep witness pass.
+
+Also green:
+
+- fold and tag tests: 239;
+- the full library unit suite, `cargo tl`: 5,991 passed;
+- 23 capability-related integration binaries: 282 passed;
+- fmt; clippy across all targets and features; strict lib clippy at
+  all, default and no-default features;
+- rustdoc;
+- `cargo check --workspace --all-targets`.
 
 ### What Slice 0 changes about the later slices
 

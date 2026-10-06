@@ -17,6 +17,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use smallvec::SmallVec;
+
 use super::wire::SignedAnnouncement;
 use super::FoldKind;
 
@@ -200,8 +202,11 @@ pub struct FoldState<K: FoldKind> {
 /// One publisher's slice of [`FoldState::by_node`].
 #[derive(Debug, Clone)]
 pub struct NodeRecord<Q> {
-    /// Every key this publisher currently owns (one per class).
-    pub keys: HashSet<Q>,
+    /// Every key this publisher currently owns (one per class),
+    /// without duplicates. Inline for the common one-class publisher,
+    /// so a record costs no separate heap allocation; membership checks
+    /// are linear, which is cheaper than hashing at a handful of keys.
+    pub keys: SmallVec<[Q; 1]>,
     /// The publisher's mutation revision: receiver-local, drawn
     /// from one fold-wide counter, and advanced by every change to
     /// the set of entries the publisher owns or to any of their
@@ -225,8 +230,8 @@ impl<K: FoldKind> FoldState<K> {
     }
 
     /// The keys `node` currently owns, if it owns any.
-    pub fn keys_for(&self, node: NodeId) -> Option<&HashSet<K::Key>> {
-        self.by_node.get(&node).map(|record| &record.keys)
+    pub fn keys_for(&self, node: NodeId) -> Option<&[K::Key]> {
+        self.by_node.get(&node).map(|record| record.keys.as_slice())
     }
 
     /// `node`'s current mutation revision, or `0` when it owns no
@@ -252,11 +257,24 @@ impl<K: FoldKind> FoldState<K> {
     pub(super) fn attach_key(&mut self, node: NodeId, key: K::Key) {
         let rev = self.next_rev();
         let record = self.by_node.entry(node).or_insert_with(|| NodeRecord {
-            keys: HashSet::new(),
+            keys: SmallVec::new(),
             rev,
         });
-        record.keys.insert(key);
+        if !record.keys.contains(&key) {
+            record.keys.push(key);
+        }
         record.rev = rev;
+    }
+
+    /// Advance `node`'s revision without touching its keys: for a
+    /// replace that rewrites one of the publisher's entries under the
+    /// same key. The payload changed, so the revision must, but the
+    /// reverse-index membership did not.
+    pub(super) fn touch_node(&mut self, node: NodeId) {
+        let rev = self.next_rev();
+        if let Some(record) = self.by_node.get_mut(&node) {
+            record.rev = rev;
+        }
     }
 
     /// Record that `node` no longer owns `key`. Drops the record when
@@ -267,7 +285,7 @@ impl<K: FoldKind> FoldState<K> {
         let Some(record) = self.by_node.get_mut(&node) else {
             return;
         };
-        record.keys.remove(key);
+        record.keys.retain(|k| k != key);
         if record.keys.is_empty() {
             self.by_node.remove(&node);
             return;
@@ -279,7 +297,7 @@ impl<K: FoldKind> FoldState<K> {
     }
 
     /// Drop `node`'s record, returning the keys it owned.
-    pub(super) fn remove_node(&mut self, node: NodeId) -> Option<HashSet<K::Key>> {
+    pub(super) fn remove_node(&mut self, node: NodeId) -> Option<SmallVec<[K::Key; 1]>> {
         self.by_node.remove(&node).map(|record| record.keys)
     }
 

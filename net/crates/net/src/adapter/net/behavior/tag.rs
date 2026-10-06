@@ -424,27 +424,47 @@ impl Tag {
 /// (`gpu.vram_gb=80`), and `:`-keyed (`has_chain:<hex>`) shapes
 /// based on which separator (if any) appears first.
 fn parse_axis_body(axis: TaxonomyAxis, body: &str) -> Tag {
-    let eq_idx = body.find('=');
-    let colon_idx = body.find(':');
-    let (separator, sep_idx) = match (eq_idx, colon_idx) {
-        (Some(e), Some(c)) if e < c => (Some(AxisSeparator::Eq), Some(e)),
-        (Some(_), Some(c)) => (Some(AxisSeparator::Colon), Some(c)),
-        (Some(e), None) => (Some(AxisSeparator::Eq), Some(e)),
-        (None, Some(c)) => (Some(AxisSeparator::Colon), Some(c)),
-        (None, None) => (None, None),
-    };
-    match (separator, sep_idx) {
-        (Some(separator), Some(idx)) => Tag::AxisValue {
+    match axis_separator(body) {
+        Some((separator, idx)) => Tag::AxisValue {
             axis,
             key: body[..idx].to_string(),
             value: body[idx + 1..].to_string(),
             separator,
         },
-        _ => Tag::AxisPresent {
+        None => Tag::AxisPresent {
             axis,
             key: body.to_string(),
         },
     }
+}
+
+/// The separator rule for an axis body, shared by [`parse_axis_body`]
+/// and [`axis_value_ref`] so the owning and borrowing readers cannot
+/// disagree: whichever of `=` and `:` appears first splits key from
+/// value; neither means a presence tag.
+fn axis_separator(body: &str) -> Option<(AxisSeparator, usize)> {
+    match (body.find('='), body.find(':')) {
+        (Some(e), Some(c)) if e < c => Some((AxisSeparator::Eq, e)),
+        (Some(_), Some(c)) => Some((AxisSeparator::Colon, c)),
+        (Some(e), None) => Some((AxisSeparator::Eq, e)),
+        (None, Some(c)) => Some((AxisSeparator::Colon, c)),
+        (None, None) => None,
+    }
+}
+
+/// Borrowing equivalent of `Tag::parse(s)` returning
+/// `Ok(Tag::AxisValue { axis, key, value, .. })`: `Some((axis, key,
+/// value))` exactly when that parse would, without allocating. Follows
+/// the same three steps as [`Tag::parse`]: a reserved prefix wins, then
+/// an axis prefix before the first `.`, then [`axis_separator`].
+pub(crate) fn axis_value_ref(s: &str) -> Option<(TaxonomyAxis, &str, &str)> {
+    if s.is_empty() || starts_with_reserved_prefix(s).is_some() {
+        return None;
+    }
+    let (axis_prefix, body) = s.split_once('.')?;
+    let axis = TaxonomyAxis::from_prefix(axis_prefix)?;
+    let (_, idx) = axis_separator(body)?;
+    Some((axis, &body[..idx], &body[idx + 1..]))
 }
 
 impl Tag {
@@ -554,6 +574,52 @@ pub enum CapabilityTagError {
 
 #[cfg(test)]
 mod tests {
+    /// `axis_value_ref` is the borrowing form of `Tag::parse` for
+    /// keyed axis tags (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 3). It must
+    /// return `Some` exactly when `Tag::parse` returns `AxisValue`, with
+    /// the same axis, key and value.
+    #[test]
+    fn axis_value_ref_agrees_with_parse() {
+        let cases = [
+            "software.model.0.id=llama3",
+            "software.model.0.id:llama3",
+            "software.model.0.id=a:b",
+            "software.model.0.id:a=b",
+            "software.model.0.id=",
+            "software.model.0.id:",
+            "software.tool.2.tool_id=python_repl",
+            "software.os=linux",
+            "software.cuda",
+            "hardware.gpu.vram_gb=80",
+            "hardware.gpu",
+            "scope:region:eu",
+            "causal:abc.def=1",
+            "dataforts:x.y=z",
+            "model:llama3",
+            "inference",
+            "notanaxis.key=value",
+            "software",
+            "software.",
+            ".software=x",
+            "",
+            "=",
+            "software.=v",
+        ];
+        for s in cases {
+            let expected = match Tag::parse(s) {
+                Ok(Tag::AxisValue {
+                    axis, key, value, ..
+                }) => Some((axis, key, value)),
+                _ => None,
+            };
+            let got = axis_value_ref(s).map(|(a, k, v)| (a, k.to_string(), v.to_string()));
+            assert_eq!(
+                got, expected,
+                "axis_value_ref disagrees with Tag::parse on {s:?}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
