@@ -104,14 +104,19 @@ pub(super) fn collect_expired<K: FoldKind>(
     now: Instant,
 ) -> Vec<K::Key> {
     let state = state_lock.read();
+    // Count what the walk actually yields, before the expiry filter.
+    // Recording `entries.len()` instead would report the walk's
+    // expected cost, and a regression that visited entries twice
+    // would still report the right number.
+    let mut yielded = 0u64;
     let candidates: Vec<K::Key> = state
         .entries
         .iter()
+        .inspect(|_| yielded += 1)
         .filter(|(_, e)| e.expires_at <= now)
         .map(|(k, _)| k.clone())
         .collect();
-    // One walk visits every entry exactly once.
-    metrics.on_sweep_walk(state.entries.len() as u64);
+    metrics.on_sweep_walk(yielded);
     candidates
 }
 

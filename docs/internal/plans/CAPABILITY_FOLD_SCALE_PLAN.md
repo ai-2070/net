@@ -466,6 +466,27 @@ afterwards:
 Also green: the full library unit suite (`cargo tl`, 5,987 passed), fmt,
 all-targets/all-features clippy, strict lib clippy, and rustdoc.
 
+**S2-1 repair (review HOLD at `bd9716426`).** `collect_expired` recorded
+`state.entries.len()` as the walk's yield count. That is the walk's
+expected cost, not its observed one. A walk that visited live entries
+twice still reported the right number, and every witness stayed green.
+The review demonstrated this with an output-preserving extra traversal.
+
+The repair restores a local counter before the expiry filter and
+aggregates it into `FoldMetrics` once per walk, so there are still no
+per-entry atomics. With the review's inverse applied, an extra
+`.chain(...)` pass over the live entries placed before the filter, two
+witnesses now fail:
+
+- `sweep_metrics_count_walks_and_yielded_entries`: 200 yielded against
+  100 expected;
+- `mass_expiry_yields_each_entry_once`: "yielded 38000 entries, more than
+  the 20000 present before the sweep".
+
+Restored, all three sweep witnesses and all 218 fold tests pass. The
+runtime factoring and every measurement above are unchanged; only the
+counter's source moved.
+
 ### What Slice 0 changes about the later slices
 
 The Slice 0 review acknowledged items 1 and 2 and set their bounds.
