@@ -810,7 +810,8 @@ impl RtcReassembly {
     /// session is still live, so the NR3 schedule — a frame captured
     /// under an incarnation that is retired while the frame waits —
     /// is scheduled rather than hoped for. No lock is held while it
-    /// runs.
+    /// runs, and it may block: [`Self::run_dispatch_pause`] takes it
+    /// off the scheduler first.
     #[cfg(any(test, feature = "fixtures"))]
     pub fn set_dispatch_pause(&self, pause: Option<IngressPause>) {
         *self.dispatch_pause.lock() = pause;
@@ -820,10 +821,42 @@ impl RtcReassembly {
     /// under its lock first: the hook blocks by design, and blocking
     /// with the lock held would serialize the retirement this seam
     /// exists to let through.
+    ///
+    /// **The hook runs off the scheduler.** Its caller is the receive
+    /// loop, a task, so a hook that parks is parking a runtime
+    /// worker — and a parked worker takes more with it than its own
+    /// task. Whatever it last woke sits in its LIFO slot, which no
+    /// other worker steals from; and if it was the worker that came
+    /// off the I/O driver to run this packet, the rest are asleep on
+    /// condvars and nobody is left to turn the driver, so no timer
+    /// fires and no socket is read for as long as the hook holds.
+    /// The test that installed the hook is by then waiting on a
+    /// `sleep` to release it, so what it produces is a hang with no
+    /// output rather than a failure: the shape of the one CI
+    /// reported (`rtc_repairs`, killed at 180 s), and with a single
+    /// worker the outcome of every run.
+    /// `block_in_place` hands the worker's core — queue, LIFO slot
+    /// and its turn at the driver — to another thread first, so only
+    /// the receive loop is held, which is all the seam promises.
+    ///
+    /// Inverse: call the hook directly and give
+    /// `a_frame_captured_under_a_retired_incarnation_cannot_revive_its_reassembly`
+    /// `worker_threads = 1` — the only worker is the one that parks,
+    /// and the test never reaches its release.
     #[cfg(any(test, feature = "fixtures"))]
     pub fn run_dispatch_pause(&self) {
         let hook = self.dispatch_pause.lock().clone();
-        if let Some(hook) = hook {
+        let Some(hook) = hook else {
+            return;
+        };
+        // `block_in_place` panics on a current-thread runtime, where
+        // there is no second thread to hand the core to; off a runtime
+        // altogether there is no scheduler to protect.
+        let on_multi_thread_runtime = tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+        if on_multi_thread_runtime {
+            tokio::task::block_in_place(|| (hook.0)());
+        } else {
             (hook.0)();
         }
     }
