@@ -2,7 +2,7 @@
 
 ## Status
 
-**Slice 0 closed; Slice 1 implemented, awaiting review.** Written 2026-10-06 against `LZL0/scaling` at
+**Slices 0 and 1 accepted; Slice 2 implemented, awaiting review.** Written 2026-10-06 against `LZL0/scaling` at
 `806635756`. No slice has landed. The 2026-10-06 design review of revision
 `ad4225dee` returned HOLD: the optimization direction stands, but several
 selected mechanisms and acceptance gates either changed supported semantics
@@ -251,11 +251,11 @@ bindings) use only `by_node.contains_key`, which is unaffected.
 `cargo check --workspace --all-targets` is clean.
 
 **Trade-off.** A cache hit now takes one fold read lock as well as the
-cache mutex. It used to read an atomic generation without the fold lock.
-Under the old scheme most lookups at the operating point missed (33.8%
-hits) and took the same read lock to synthesize, so the lock was already
-on the common path. Hits are now subject to writer queueing (a fair
-`RwLock`), and that is not separately measured.
+cache mutex. It used to read the change generation through a
+`tokio::sync::watch` borrow, without the fold-state lock. Hits can now
+queue behind a fold writer (fair `RwLock`), even when the lookup itself
+needs no synthesis. The review accepted the trade on the measured
+comparison below. The old miss rate alone would not have justified it.
 
 **Proof** (`fold_scale_report -- cache`, same machine and fixture as
 Slice 0). The workload adds an "outside hot set" configuration in which
@@ -281,6 +281,56 @@ misses here are an upper bound.
 Apply cost is unchanged within noise: `capability_fold_apply` at 100k is
 6.17 µs insert, 1.38 µs refresh and 15.3 µs replace_changed, against
 6.29 / 1.35 / 14.8 µs before.
+
+**Release migration note (source-breaking).** The review classified the
+`by_node` change as a Rust source-breaking change for the intended
+breaking release, not a compatibility-preserving patch. This note
+carries into that release's notes:
+
+- `FoldState::by_node` values are `NodeRecord { keys, rev }`, no longer
+  `HashSet<K::Key>`. Code such as
+  `s.by_node.get(&node).map_or(0, |keys| keys.len())` fails with E0599.
+  Migrate to `s.keys_for(node)`, which returns `Option<&HashSet<K::Key>>`.
+  `by_node.contains_key` and `by_node.keys()` are unchanged.
+- `FoldState` has a new private field (`last_rev`), so external struct
+  literals no longer compile. Construct it with `FoldState::new()` or
+  `Default`.
+- New public API: `NodeRecord`, `FoldState::keys_for`,
+  `FoldState::publisher_rev`.
+
+Workspace compilation proves that the known consumers build: the Go,
+Node and Python placement bindings use only `contains_key`, and the
+`fold_scale_report` bench was migrated to `record.keys`. It does not
+prove that unknown downstream crates are unaffected. A parallel revision
+map that would preserve the old value type was rejected, because it
+would add another fleet-sized structure for a hypothetical reader.
+
+**Cache-hit latency (review-measured comparison).** The review linked the
+same fold library against both cache policies: the old global-generation
+cache from `5f5695b7` and the publisher-revision cache. This isolates the
+policy on one fold; it is not an old-release versus new-release benchmark.
+
+Conditions:
+
+- a warmed 200-node cache, with 100k lookups/s requested;
+- outside-hot-set mutations at ~6,667/s;
+- 3 s per case, with no counting allocator;
+- per-call service latency, with no coordinated-omission correction;
+- the large case at 1M resident, with broad queries at 2/s.
+
+| workload | old cache p50 / p99 | publisher cache p50 / p99 |
+|---|---|---|
+| quiet, 10k resident | 0.100 / 0.500 µs | 0.100 / 0.600 µs |
+| outside updates, 10k resident | 7.403 / 48.223 µs | 0.100 / 1.300 µs |
+| outside updates + broad reads, 1M resident | 7.003 / 64.031 µs | 0.100 / 1.100 µs |
+
+Worst-case coupling remains. In the short 1M sample the maxima were
+~56.6 ms (old) and ~71.6 ms (publisher cache). These are diagnostic, not
+evidence of a tail regression and not an SLO bound. Both policies still
+expose waits of tens of milliseconds behind the fold lock, and the new
+path can wait even on a hit. This comparison is kept through the expiry
+and query slices. 99.8% hits does not mean uniformly nanosecond-scale
+admission.
 
 **Witnesses** (`fold/capability_bridge.rs` tests; 216 fold tests pass):
 
@@ -312,6 +362,109 @@ Also green:
 - 23 capability-related integration binaries: 282 passed;
 - fmt, all-targets/all-features clippy, strict lib clippy, rustdoc, and
   `cargo check --workspace --all-targets`.
+
+### Slice 1 acceptance
+
+Accepted at `be8559246`. Exact-head CI run 37443056262 is green: 64
+successes and 2 skipped optional checks.
+
+Documentation corrections the review asked for, applied with Slice 2:
+
+- **The old generation read.** Its description is corrected: it was a
+  `watch` borrow without the fold-state lock, not a lock-free atomic.
+- **`publisher_rev`'s history statement** now applies only to nonzero
+  values. Two reads of `0` can bracket the publisher arriving and leaving
+  again.
+- **Obsolete wording removed.** `Fold::change_generation` no longer
+  describes the generation-keyed cache, and the cache's "out-of-order
+  store" narrative is replaced. Different revisions cannot cross an
+  intervening writer while synthesis and store share one state borrow.
+
+The release migration note and the review's cache-latency comparison are
+recorded under Slice 1 above.
+
+### Slice 2 (single-pass expiry sweep)
+
+Implemented as Track A1 specifies. `sweep_expired` is now two phases:
+
+- **`collect_expired`:** ONE walk of `entries` under the state read lock,
+  collecting every expired key.
+- **`evict_chunk`:** the collected keys in `SWEEP_CHUNK_SIZE` slices, each
+  under its own state + index write-lock acquisition. The per-key
+  `expires_at <= now` re-check is unchanged.
+
+The two phases are separate functions so a test can refresh or evict an
+entry between them. Every eviction still goes through
+`FoldState::detach_key`, so Slice 1's revisions advance on expiry exactly
+as before. Each sweep records one walk; `sweep_yielded` counts the walk's
+entries.
+
+**Proof.** Walks and yielded are counted; times are measured, the
+Criterion ones in `fold_scale`, the rest in the reporter. Same machine and
+fixture as Slice 0.
+
+| entries | case | walks (S0 → S2) | yielded (S0 → S2) | sweep (S0 → S2) |
+|---|---|---|---|---|
+| 100k | steady | 1 → 1 | 100,000 → 100,000 | 0.18 → 0.18 ms (Criterion) |
+| 100k | 10% expired | 11 → **1** | 608,455 → **100,000** | 92 → 89 ms (Criterion) |
+| 100k | whole fleet | 99 → **1** | 100,000 → 100,000 | 959 → 918 ms (reporter) |
+| 1M | steady | 1 → 1 | 1,000,000 → 1,000,000 | 5.47 → 5.31 ms (Criterion) |
+| 1M | 10% expired | 99 → **1** | 45,736,877 → **1,000,000** | 1.43 → **1.18 s** (Criterion) |
+| 1M | whole fleet | 978 → **1** | 1,000,000 → 1,000,000 | 14.1 → 13.9 s (reporter) |
+
+As Slice 0 predicted, removal dominates the remaining time. The 1M 10%
+sweep (1.18 s) is close to evicting the same set through `evict_node`
+(1.09 s, diagnostic), so Track C's removal path is where the rest of the
+time lives. Nothing here is a 10× wall-time claim.
+
+**Reader and writer tails** (mixed workload, 1M resident, measured, same
+conditions as the Slice 0 table):
+
+| stream | Slice 0 p50 / p99 / p99.9 / max | Slice 2 p50 / p99 / p99.9 / max |
+|---|---|---|
+| refresh apply | 21.7 µs / 52.6 µs / 202 µs / 37.1 ms | 21.6 µs / 53.0 µs / 187 µs / 37.9 ms |
+| selective query | 6.7 µs / 253 µs / 33.5 ms / 36.2 ms | 7.0 µs / 251 µs / 34.2 ms / 37.1 ms |
+| broad query (39 samples) | 40.5 ms p50 / 43.4 ms max | 41.2 ms p50 / 43.9 ms max |
+| expiry tick (10k reaped at 10.15 s) | 160 ms | 134 ms |
+
+The tails are unchanged within one run's variation. That is consistent
+with Slice 0's finding (inferred) that the ~37 ms maxima come from the
+broad query's ~40 ms read hold, not from the sweep. The single
+collection walk now holds the read lock for one full pass. At 1M that is
+the 5.3 ms `steady` sweep, and it did not show up as a new tail at this
+load. **Chunk holds are still not measured directly.** No hold-duration
+guarantee or `SWEEP_CHUNK_SIZE` retuning is made, per the Slice 0 review.
+
+**Witnesses** (`fold/tests.rs`; 218 fold tests pass):
+
+- `mass_expiry_yields_each_entry_once`: 20k entries, 2k expired (two
+  eviction chunks). Asserts one walk, yielded ≤ the entry count captured
+  before the sweep, exact eviction count and final residency.
+- `sweep_rechecks_entries_refreshed_or_removed_after_collection`: collect,
+  then refresh one entry and `evict_node` another, then evict. Only the
+  untouched entry goes, and the metrics count one expiry.
+- `sweep_metrics_count_walks_and_yielded_entries`: updated from Slice 0's
+  "one walk per chunk plus a final walk" to one walk per sweep, every
+  entry yielded exactly once.
+
+The three existing sweep tests (`fold/tests.rs`
+`sweep_expired_removes_entries_past_ttl`,
+`sweep_with_no_expired_entries_is_a_no_op`,
+`sweep_evicts_across_multiple_chunks_when_count_exceeds_chunk_size`) and
+`background_sweeper_evicts_expired_entries_on_tick` pass. So do all of
+Slice 1's cache witnesses, including `cache_misses_on_older_sibling_expiry`,
+which exercises expiry through the new path.
+
+Inverse checks, each caught by its witness, with the code restored
+afterwards:
+
+- Replacing the re-check with a bare presence check fails
+  `sweep_rechecks_entries_refreshed_or_removed_after_collection`.
+- Restoring the restart-per-chunk walk fails
+  `mass_expiry_yields_each_entry_once`.
+
+Also green: the full library unit suite (`cargo tl`, 5,987 passed), fmt,
+all-targets/all-features clippy, strict lib clippy, and rustdoc.
 
 ### What Slice 0 changes about the later slices
 

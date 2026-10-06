@@ -230,8 +230,12 @@ impl<K: FoldKind> FoldState<K> {
     }
 
     /// `node`'s current mutation revision, or `0` when it owns no
-    /// entries. Two reads that return the same value bracket no
-    /// change to the publisher's entries: see [`NodeRecord::rev`].
+    /// entries. Two reads that return the same NONZERO value bracket
+    /// no change to the publisher's entries: see [`NodeRecord::rev`].
+    /// `0` is not a history fence: two reads of `0` can bracket the
+    /// publisher arriving and leaving again. A value derived only from
+    /// absence (such as the empty capability set) is still correct at
+    /// the second read.
     pub fn publisher_rev(&self, node: NodeId) -> u64 {
         self.by_node.get(&node).map_or(0, |record| record.rev)
     }

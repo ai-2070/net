@@ -322,11 +322,12 @@ impl<K: FoldKind> Fold<K> {
         self.change_tx.subscribe()
     }
 
-    /// Read the current change-generation without subscribing.
-    /// Hot caches (e.g. `CapabilitySetCache`) check this against
-    /// their stored generation to detect staleness; cheaper than
-    /// `subscribe_changes().borrow()` because it skips minting a
-    /// receiver. Per PERF_AUDIT §4.1.
+    /// Read the current change-generation without subscribing;
+    /// cheaper than `subscribe_changes().borrow()` because it skips
+    /// minting a receiver. The generation moves on every fold change,
+    /// so it suits "has anything changed" checks. A per-publisher
+    /// cache wants [`FoldState::publisher_rev`] instead, which
+    /// `CapabilitySetCache` uses.
     #[inline]
     pub fn change_generation(&self) -> u64 {
         *self.change_tx.borrow()

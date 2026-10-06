@@ -109,13 +109,12 @@ pub struct FoldMetrics {
     snapshots_taken: AtomicU64,
     /// Snapshots applied via [`super::Fold::restore`].
     snapshots_restored: AtomicU64,
-    /// Read-locked candidate walks the expiry sweep has started.
-    /// One sweep runs one walk per eviction chunk, plus the final
-    /// walk that finds nothing.
+    /// Read-locked candidate walks the expiry sweep has run: one
+    /// per sweep.
     sweep_walks: AtomicU64,
     /// Entries the expiry sweep's candidate walks have yielded,
-    /// live and expired alike. Re-walking a prefix counts its live
-    /// entries again, so this is the sweep's entry-visit cost.
+    /// live and expired alike: the sweep's entry-visit cost. One walk
+    /// yields every entry once.
     sweep_yielded: AtomicU64,
 }
 
@@ -175,9 +174,9 @@ impl FoldMetrics {
     }
 
     /// Record one expiry-sweep candidate walk that yielded
-    /// `yielded` entries. Called by [`super::expiry::sweep_expired`]
-    /// once per read-locked pass, so the atomics are touched once
-    /// per walk, not once per entry.
+    /// `yielded` entries. Called once per sweep, by the sweep's
+    /// collection phase, so the atomics are touched once per walk,
+    /// not once per entry.
     #[inline]
     pub(super) fn on_sweep_walk(&self, yielded: u64) {
         self.sweep_walks.fetch_add(1, Ordering::Relaxed);

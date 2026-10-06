@@ -888,10 +888,12 @@ impl CapabilitySetCache {
     /// and a hit can never serve a set from before a mutation the
     /// same borrow observed. A concurrent apply that lands after the
     /// borrow advances the revision, and the next lookup misses once.
-    /// Two racing misses may store out of order; the older revision
-    /// then simply fails validation on the next lookup. Synthesis runs
-    /// outside the cache mutex so a slow synthesize does not serialize
-    /// other callers' hits.
+    /// Racing misses cannot store revisions out of order: a writer
+    /// needs every read borrow released, so two misses whose borrows
+    /// overlap read the same revision, and two that do not are
+    /// separated by any write between them. Synthesis runs outside the
+    /// cache mutex so a slow synthesize does not serialize other
+    /// callers' hits.
     pub fn get_or_synthesize(
         &self,
         fold: &Fold<CapabilityFold>,

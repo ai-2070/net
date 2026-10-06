@@ -1355,11 +1355,8 @@ fn sweep_evicts_across_multiple_chunks_when_count_exceeds_chunk_size() {
 #[test]
 fn sweep_metrics_count_walks_and_yielded_entries() {
     // Pins the counters CAPABILITY_FOLD_SCALE_PLAN.md's Slice 0
-    // reports and Slice 2's witness reads. A sweep that finds nothing
-    // makes one walk that yields every entry. A sweep over more
-    // expired entries than one chunk makes one walk per chunk plus
-    // the final walk that finds nothing, and re-walking the cleared
-    // prefix yields the surviving live entries again.
+    // reports. Since Slice 2 a sweep makes ONE walk that yields every
+    // entry once, however many eviction chunks follow it.
     let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
     let kp = EntityKeypair::generate();
     const LIVE: u64 = 100;
@@ -1387,14 +1384,94 @@ fn sweep_metrics_count_walks_and_yielded_entries() {
     assert_eq!(fold.sweep_expired_now(), EXPIRED as usize);
     assert_eq!(
         fold.metrics().sweep_walks() - walks_before,
-        3,
-        "two eviction chunks plus the final empty walk"
+        1,
+        "one walk, then two eviction chunks"
     );
+    assert_eq!(
+        fold.metrics().sweep_yielded() - yielded_before,
+        LIVE + EXPIRED,
+        "every entry yielded exactly once"
+    );
+}
+
+/// CAPABILITY_FOLD_SCALE_PLAN.md Slice 2 witness. A mass expiry
+/// yields at most the entry count captured BEFORE the sweep (not
+/// `entries.len()` after it, which the eviction has shrunk). Two
+/// eviction chunks are enough to discriminate: the old
+/// restart-per-chunk walk yielded ~48k entries here (two partial walks
+/// plus the final empty walk) against 20k present.
+#[test]
+fn mass_expiry_yields_each_entry_once() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    const N: u64 = 20_000; // 2,000 expired: two eviction chunks
+    for i in 0..N {
+        // Every 10th entry expires at once; the rest stay live.
+        let ttl = if i % 10 == 0 { 0 } else { 3600 };
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, ttl, vec!["t"]))
+            .expect("apply");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    let pre_sweep = fold.with_state(|s| s.entries.len()) as u64;
+    let walks_before = fold.metrics().sweep_walks();
+    let yielded_before = fold.metrics().sweep_yielded();
+    let evicted = fold.sweep_expired_now();
+
+    assert_eq!(
+        evicted as u64,
+        N / 10,
+        "exact eviction of the expired tenth"
+    );
+    assert_eq!(fold.metrics().entries(), N - N / 10);
+    assert_eq!(fold.metrics().sweep_walks() - walks_before, 1);
     let yielded = fold.metrics().sweep_yielded() - yielded_before;
     assert!(
-        yielded >= LIVE + EXPIRED,
-        "every entry is yielded at least once, got {yielded}"
+        yielded <= pre_sweep,
+        "yielded {yielded} entries, more than the {pre_sweep} present before the sweep"
     );
+}
+
+/// The per-key re-check survives the split into a collection walk
+/// and chunked eviction. An entry refreshed AFTER the walk collected
+/// it must not be evicted, and an entry evicted by `evict_node` in
+/// between must not be double-removed or counted.
+#[test]
+fn sweep_rechecks_entries_refreshed_or_removed_after_collection() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    for node in [0xA, 0xB, 0xC] {
+        fold.apply(sign_cap_ann_with_ttl(&kp, node, 0x100, 1, 0, vec!["t"]))
+            .expect("apply expiring");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    let now = std::time::Instant::now();
+    let collected = expiry::collect_expired(&fold.state, &fold.metrics, now);
+    assert_eq!(collected.len(), 3, "the walk collects all three");
+
+    // Between collection and eviction: A is refreshed with a long TTL,
+    // B is evicted by the operator path. C is untouched.
+    fold.apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 2, 3600, vec!["t"]))
+        .expect("refresh A");
+    fold.evict_node(0xB, "test");
+
+    let evicted = expiry::evict_chunk(
+        &fold.state,
+        &fold.index,
+        &fold.metrics,
+        None,
+        &collected,
+        now,
+    );
+    assert_eq!(evicted, 1, "only C is still present and expired");
+    fold.with_state(|s| {
+        assert!(s.by_node.contains_key(&0xA), "refreshed A survives");
+        assert!(!s.by_node.contains_key(&0xB));
+        assert!(!s.by_node.contains_key(&0xC));
+    });
+    assert_eq!(fold.metrics().expiries(), 1);
+    assert_eq!(fold.metrics().entries(), 1);
 }
 
 /// Audit-emitting `FoldKind` shim: identical to `CapFold` but
