@@ -1,0 +1,26 @@
+.github/workflows/ci.yml
+  s_3ddfe9bece20b7::t_8e878965647ed1 5256-5257,5263-5265
+  s_3ddfe9bece20b7::t_191b984d4d10cd 5246-5255,5258-5262
+  s_3ddfe9bece20b7::t_161c477a700009 5319-5323
+.github/scripts/run-c-consumers.py
+  s_3ddfe9bece20b7::t_423f2e8daff4ff 589-608
+  s_3ddfe9bece20b7::t_9cf511e1192789 626,628-629,637-641
+  s_3ddfe9bece20b7::t_0247194fdc53e2 59,981-984
+  s_3ddfe9bece20b7::t_5f06e03124dbd7 985
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7837be5618f97aa645fc238a593ee662b069c43c",
+  "prompts": {},
+  "sessions": {
+    "s_3ddfe9bece20b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24299a3f-d39b-43a8-8881-3b531da3196f",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
