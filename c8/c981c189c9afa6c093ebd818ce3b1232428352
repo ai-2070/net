@@ -1,0 +1,16 @@
+web/src/components/games/GamesHero.tsx
+  h_64425bc75e3f3d 407,428
+web/src/components/games/GamesSections.tsx
+  h_64425bc75e3f3d 26-37,42,44-49,63,69,71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c8c981c189c9afa6c093ebd818ce3b1232428352",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
