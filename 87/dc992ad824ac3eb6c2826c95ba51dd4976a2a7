@@ -1,0 +1,15 @@
+README.md
+  h_64425bc75e3f3d 355-364,366-368,372,374-378
+  h_64425bc75e3f3d 365,369-371,373
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "87dc992ad824ac3eb6c2826c95ba51dd4976a2a7",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
