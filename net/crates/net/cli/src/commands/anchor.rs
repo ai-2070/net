@@ -1569,6 +1569,7 @@ async fn run_serve(
         listener_config.credential_issuance = Some(issuance);
         if args.game_stats_secs > 0 {
             let every = std::time::Duration::from_secs(args.game_stats_secs);
+            let stats_node = std::sync::Arc::clone(mesh.node());
             _game_stats = Some(tokio::spawn(async move {
                 let mut tick = tokio::time::interval(every);
                 tick.tick().await;
@@ -1577,6 +1578,16 @@ async fn run_serve(
                     let mut line = serde_json::json!({ "game_stats": registry.stats() });
                     if let Some(open) = registry.open_stats() {
                         line["open_games"] = serde_json::json!(open);
+                    }
+                    // How full the anchor is, beside who it served: a
+                    // node at `max_sessions` refuses every new offer.
+                    if let Some((sessions, max_sessions)) = stats_node.rtc_session_load() {
+                        line["rtc"] = serde_json::json!({
+                            "sessions": sessions,
+                            "max_sessions": max_sessions,
+                            "provisional": stats_node.provisional_count(),
+                            "max_provisional": stats_node.rtc_max_provisional(),
+                        });
                     }
                     println!("{line}");
                 }

@@ -1846,6 +1846,18 @@ async fn post_offer(
         );
     }
 
+    // The same for the RTC session table: a full one refuses the offer
+    // in the driver, which reaches the page as `offer_refused` with no
+    // hint that capacity is the reason.
+    if let Some((live, max)) = state.node.rtc_session_load() {
+        if live >= max {
+            return refuse(
+                BootstrapRefusal::AtCapacity,
+                format!("this anchor holds {live} of its {max} RTC sessions"),
+            );
+        }
+    }
+
     let dialog = state.dialogs.fetch_add(1, Ordering::Relaxed);
     // The incarnation is this listener's own counter for the
     // attempt, so two attempts that reuse a dialog id are still
@@ -1883,7 +1895,15 @@ async fn post_offer(
         }
         Err(e) => {
             state.attempts.retire(&attempt_token);
-            refuse(BootstrapRefusal::OfferRefused, e.to_string())
+            let message = e.to_string();
+            // The check above can lose a race to another offer; the
+            // driver's own capacity refusal is the same answer.
+            let refusal = if message.contains(net::adapter::net::rtc::MAX_PEERS_REACHED) {
+                BootstrapRefusal::AtCapacity
+            } else {
+                BootstrapRefusal::OfferRefused
+            };
+            refuse(refusal, message)
         }
     }
 }
