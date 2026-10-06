@@ -16,6 +16,7 @@ export type {
   LeaderChangedEvent,
   LeaderLostEvent,
   NotLeaderEvent,
+  PromotionFailedEvent,
   SessionEvent,
   SessionEventOf,
   SessionLifecycleEvent,

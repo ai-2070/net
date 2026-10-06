@@ -96,3 +96,183 @@ export type { Hidden, Visibility, VisibilityPreset, VisibilityRule, VisibilityRu
 export { cellKey, cellsAround, sameCells, stickyCells } from './interest.js';
 export type { CellOptions } from './interest.js';
 export { MAX_INTEREST_KEYS, MAX_INTEREST_KEY_BYTES } from './wire.js';
+
+// The store's lower-level building blocks — wire codec, ledgers,
+// chunking, owner/replica cores — exported so callers can compose
+// their own transports and tooling.
+export {
+  Assembly,
+  ASSEMBLY_DEADLINE_MS,
+  AssemblyTable,
+  MAX_ASSEMBLY_BYTES_TOTAL,
+} from './assembly.js';
+export type {
+  AssemblyChunk,
+  AssemblyManifest,
+  AssemblyRefusal,
+  AssemblyRejected,
+  ChunkOutcome,
+} from './assembly.js';
+export {
+  assertChunkingFits,
+  base64,
+  chunkBytesFor,
+  chunkSnapshot,
+  fromBase64,
+  jsonByteLength,
+  LARGEST_FROZEN_ENVELOPE,
+  MIN_CHUNK_BYTES,
+  SNAP_ENVELOPE_RESERVE,
+} from './chunker.js';
+export type {
+  Chunked,
+} from './chunker.js';
+export {
+  isEntityMap,
+} from './definition.js';
+export {
+  isStaleStream,
+  STORE_ERROR_CODES,
+} from './errors.js';
+export {
+  FAREWELL_DEADLINE_MS,
+  hostInternals,
+  nodeHexOf,
+  peerHexOf,
+} from './host.js';
+export type {
+  HostInternals,
+} from './host.js';
+export {
+  TICK_INTERVAL_MS,
+  TRANSITION_DEADLINE_MS,
+} from './join.js';
+export {
+  MAX_JSON_DEPTH,
+  parseStoreJson,
+} from './json.js';
+export type {
+  JsonFailure,
+  JsonObject,
+  JsonRefusal,
+  JsonResult,
+  JsonValue,
+} from './json.js';
+export {
+  BINDING_INLINE_MAX_BYTES,
+  canonicalBytes,
+  canonicalRequest,
+  digestBinding,
+  HandleLedger,
+  inlineBinding,
+  InputSequences,
+  LEDGER_MAX_AGE_MS,
+  LEDGER_MAX_BYTES,
+  LEDGER_MAX_ENTRIES,
+  LedgerTable,
+  MAX_SEQUENCE,
+  needsDigest,
+} from './ledger.js';
+export type {
+  Disposition,
+  Outcome,
+  RequestBinding,
+} from './ledger.js';
+export {
+  HANDLE_LEASE_MS,
+  MAX_HANDLES,
+  MAX_PENDING_ACTIONS,
+  StoreOwner,
+} from './owner.js';
+export type {
+  ActionHandlers,
+  Dispatched,
+  InputHandlers,
+  Outbound,
+  OwnerDeps,
+  OwnerHandle,
+} from './owner.js';
+export {
+  applyPatch,
+  FORBIDDEN_SEGMENTS,
+} from './patch.js';
+export type {
+  PatchApplied,
+  PatchOutcome,
+  PatchRefusal,
+  PatchRejected,
+} from './patch.js';
+export {
+  MAX_JOIN_REASKS,
+  StoreReplica,
+} from './replica.js';
+export type {
+  Received,
+  ReplicaDeps,
+  ReplicaState,
+  Request,
+} from './replica.js';
+export {
+  applyVisibility,
+  compileVisibility,
+} from './visibility.js';
+export type {
+  CompiledVisibility,
+} from './visibility.js';
+export {
+  CALLER_KINDS,
+  decimalValue,
+  decodeMessage,
+  encodeMessage,
+  HANDLE_HEX_LENGTH,
+  inadmissibleValue,
+  INCARNATION_HEX_LENGTH,
+  isCanonicalBase64,
+  isCanonicalDecimal,
+  isCanonicalHex,
+  MAX_AUDIENCE_LABEL_BYTES,
+  MAX_AUDIENCE_LABELS,
+  MAX_DECIMAL,
+  MAX_DETAIL_BYTES,
+  MAX_PATCH_OPS,
+  MAX_PATH_SEGMENT_BYTES,
+  MAX_PATH_SEGMENTS,
+  MAX_SNAPSHOT_BYTES,
+  MAX_SNAPSHOT_CHUNKS,
+  OWNER_KINDS,
+  REQUEST_HEX_LENGTH,
+  utf8Length,
+  WIRE_VERSION,
+} from './wire.js';
+export type {
+  ActMessage,
+  AliveMessage,
+  AudienceMessage,
+  CallerKind,
+  CallerMessage,
+  Decimal,
+  DecodeOptions,
+  DecodeRefusal,
+  DecodeResult,
+  DecodeStage,
+  DeltaMessage,
+  Hex,
+  InputMessage,
+  InterestMessage,
+  JoinMessage,
+  LeaveMessage,
+  ManifestMessage,
+  MessageFor,
+  MessageKind,
+  NoMessage,
+  OkMessage,
+  OwnerKind,
+  OwnerMessage,
+  ResultMessage,
+  ResumeMessage,
+  ResyncMessage,
+  Side,
+  SnapMessage,
+  StoreMessage,
+  WireOp,
+} from './wire.js';

@@ -213,3 +213,67 @@ export type {
   CredentialRequestErrorKind,
   RequestCredentialOptions,
 } from './credential.js';
+
+// The rest of the public module surface: lower-level building blocks
+// the high-level verbs above are made of, exported so callers can
+// compose their own.
+export {
+  ORG_SINK_BUDGET_REFUSAL,
+  ORG_UPLOAD_SINK_BUDGET_REFUSAL,
+  ORG_UPLOAD_SINK_CLOSED_REFUSAL,
+} from './errors.js';
+export {
+  clientStreamOrgTrampoline,
+  duplexOrgTrampoline,
+  streamingOrgTrampoline,
+  unaryOrgTrampoline,
+} from './org.js';
+export {
+  acceptPeer,
+  connectPeer,
+  driveAttempt,
+  handshakePeer,
+  NO_ANNOUNCEMENT_PREFIX,
+  NO_LIVE_ATTEMPT_PREFIX,
+  NO_OFFER_PREFIX,
+  PEER_OFFER_WAIT_MS,
+  PEER_TICK_MS,
+  PeerAttempts,
+  REPLACED_ATTEMPT_MARKER,
+} from './peer-driver.js';
+export type {
+  HealthyDialog,
+  PeerPrimitives,
+} from './peer-driver.js';
+export {
+  StreamIdentityError,
+} from './stream.js';
+export type {
+  StreamIdentity,
+} from './stream.js';
+export {
+  STUN_NO_RESPONSE_CODE,
+} from './udp-probe.js';
+export {
+  idArg,
+} from './wasm.js';
+export type {
+  LeafWasmOrgAccess,
+  LeafWasmOrgByteItem,
+  LeafWasmOrgByteStreamHandle,
+  LeafWasmOrgCaller,
+  LeafWasmOrgCallOptions,
+  LeafWasmOrgClientStreamHandler,
+  LeafWasmOrgCredentials,
+  LeafWasmOrgDuplexCallHandle,
+  LeafWasmOrgDuplexHandler,
+  LeafWasmOrgRequestItem,
+  LeafWasmOrgRequestStreamHandle,
+  LeafWasmOrgResponseSinkHandle,
+  LeafWasmOrgServeHandle,
+  LeafWasmOrgServeOptions,
+  LeafWasmOrgStreamingHandler,
+  LeafWasmOrgTerminalError,
+  LeafWasmOrgUnaryHandler,
+  LeafWasmOrgUploadCallHandle,
+} from './wasm.js';
