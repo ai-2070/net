@@ -1,0 +1,23 @@
+.github/workflows/ci.yml
+  s_3ddfe9bece20b7::t_6568149d2e9b03 5257
+net/crates/net/src/adapter/net/rtc/fragment.rs
+  s_3ddfe9bece20b7::t_6568149d2e9b03 813-816,827,845-852,2255-2256
+  s_3ddfe9bece20b7::t_bd7c44fdd8a3ea 828-831
+  s_3ddfe9bece20b7::t_a1683ac65e174a 2250-2254,2257-2318
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c877070591525e4ff98b529a843ae8fc52104d6e",
+  "prompts": {},
+  "sessions": {
+    "s_3ddfe9bece20b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24299a3f-d39b-43a8-8881-3b531da3196f",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
