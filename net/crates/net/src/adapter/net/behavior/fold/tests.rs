@@ -70,6 +70,7 @@ impl FoldKind for CapFold {
     type Query = CapQuery;
     type Result = Vec<(u64, NodeId)>;
     type Index = CapIndex;
+    type KeyHasher = std::collections::hash_map::RandomState;
 
     fn key_for(node_id: NodeId, payload: &CapPayload) -> Self::Key {
         (payload.class_hash, node_id)
@@ -492,6 +493,7 @@ impl FoldKind for RoutingTestFold {
     type Query = NodeId;
     type Result = Option<RoutePayload>;
     type Index = NoIndex;
+    type KeyHasher = std::collections::hash_map::RandomState;
 
     fn key_for(_node_id: NodeId, payload: &RoutePayload) -> NodeId {
         payload.destination
@@ -1489,6 +1491,7 @@ impl FoldKind for AuditingCapFold {
     type Query = CapQuery;
     type Result = Vec<(u64, NodeId)>;
     type Index = NoIndex;
+    type KeyHasher = std::collections::hash_map::RandomState;
 
     fn key_for(node_id: NodeId, payload: &CapPayload) -> Self::Key {
         (payload.class_hash, node_id)
@@ -1976,6 +1979,7 @@ impl FoldKind for CountingFold {
     type Query = ();
     type Result = usize;
     type Index = NoIndex;
+    type KeyHasher = std::collections::hash_map::RandomState;
 
     fn key_for(_node_id: NodeId, payload: &CountingPayload) -> u64 {
         payload.id

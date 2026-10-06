@@ -118,6 +118,18 @@ pub trait FoldKind: Send + Sync + Sized + 'static {
     /// that don't maintain anything beyond the primary store.
     type Index: FoldIndex<Self>;
 
+    /// Hasher for this fold's primary map ([`FoldState::entries`]) and
+    /// reverse index ([`FoldState::by_node`]).
+    ///
+    /// Required, with no default: associated type defaults are unstable
+    /// on the pinned toolchain. Folds whose keys are not all digests use
+    /// `std::collections::hash_map::RandomState`, the keyed SipHash
+    /// default. A fold may choose a fast unkeyed hasher only if an
+    /// adversarial publisher cannot cheaply manufacture colliding keys,
+    /// or if that cost is accepted on purpose: an unkeyed hasher turns
+    /// chosen keys into chosen collisions.
+    type KeyHasher: std::hash::BuildHasher + Default + Send + Sync;
+
     /// Derive the indexing key from an announcement. The
     /// publisher's `node_id` is passed separately so folds
     /// keyed solely on the payload (like [`RoutingFold`]'s

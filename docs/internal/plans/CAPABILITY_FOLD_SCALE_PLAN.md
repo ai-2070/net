@@ -704,6 +704,135 @@ Also green:
   all, default and no-default features;
 - rustdoc.
 
+### Slice 5 (hasher seam)
+
+Implemented as Track E2 specifies.
+
+- **The seam.** `FoldKind` gains a **required** associated type,
+  `type KeyHasher: BuildHasher + Default + Send + Sync`. It has no
+  default, because associated type defaults are unstable (E0658) on
+  1.99.0.
+- **Where it applies.** `FoldState::entries` and `FoldState::by_node`
+  are now `HashMap<_, _, K::KeyHasher>`.
+- **Who uses which hasher.** `CapabilityFold` sets
+  `BuildU64TupleHasher`, the Fx mixer its index sets already use.
+  `RoutingFold`, `ReservationFold`, `IslandTopologyFold` and the four
+  test fold kinds set `RandomState` explicitly.
+
+**Release migration note (source-breaking).** This carries into the
+breaking release's notes alongside Slice 1's:
+
+- `FoldKind` has a new required associated type, `KeyHasher`. An
+  out-of-tree implementor must add, for example,
+  `type KeyHasher = std::collections::hash_map::RandomState;`.
+- `FoldState::entries` and `FoldState::by_node` gain a hasher type
+  parameter. Code that names their full types must add `K::KeyHasher`.
+  Code that only calls methods on them is unaffected.
+- `FoldState::keys_for` returns `Option<&[K::Key]>` since Slice 3, no
+  longer `Option<&HashSet<K::Key>>`. Slice 1's migration example
+  (`s.keys_for(node).map_or(0, |keys| keys.len())`) still compiles.
+
+Every implementor in the workspace is in this crate, and
+`cargo check --workspace --all-targets` is clean.
+
+**Security note for review: hash flooding.** Fx is unkeyed, and a
+capability key is `(class_hash, node_id)`, where `class_hash` is declared
+by the publisher. A publisher able to emit many classes could pick
+`class_hash` values that collide under Fx and degrade lookups in its
+receivers' primary map. The index's `(class, node)` sets have carried
+the same exposure since PERF_AUDIT §4.6, so this slice extends an
+accepted trade rather than introducing a new class of risk. It does put
+the primary map, which every apply and every query uses, on the same
+footing. Whether there is an effective per-publisher bound on distinct
+classes was not established here. The `KeyHasher` doc states the rule a
+fold must meet before choosing an unkeyed hasher. Reverting
+`CapabilityFold` to `RandomState` is a one-line change if the reviewers
+reject the trade.
+
+**Proof** (Criterion `net` bench, absolute times against the final
+Slice 4 run, same machine):
+
+| query | Slice 4 | Slice 5 |
+|---|---|---|
+| `capability_fold_scaling/query_tag_rare/*` | 1.65 µs | **0.76 µs** |
+| `capability_fold_scaling/query_tag/50000` | 744 µs | **334 µs** |
+| `capability_fold_scaling/query_complex/50000` | 1.02 ms | **584 µs** |
+| `capability_fold_query/query_single_tag` | 104 µs | **45 µs** |
+| `capability_fold_query/query_complex` | 147 µs | **103 µs** |
+| `capability_fold_query/query_model` | 46.9 µs | **22.0 µs** |
+| `capability_fold_query/query_require_gpu` / `query_tool` | 210 / 205 µs | **101 / 102 µs** |
+| `capability_fold_query/query_gpu_vendor` | 293 µs | **170 µs** |
+| `capability_fold_query/query_min_memory` | 318 µs | **181 µs** |
+| `capability_fold_find_best/find_best_simple` / `_with_prefs` | 207 / 132 µs | **101 / 79 µs** |
+| `capability_fold_query/query_no_results` | 91.3 ns | 91.8 ns (no lookups) |
+
+The saving is about 16 ns per materialized match: SipHash on the 16-byte
+key in every per-candidate `entries.get`. The percentages Criterion
+printed for this run compare against a stale default baseline from a
+clock-throttled run early in the session and are not used.
+
+Apply and sweep (Criterion; the reporter for whole fleet):
+
+| measure | Slice 4 | Slice 5 |
+|---|---|---|
+| insert, 10k / 100k / 1M | 2.91 / 2.84 / 2.89 µs | 2.87 / 2.78 / 2.86 µs |
+| refresh, 10k / 100k / 1M | 1.17 / 1.21 / 1.23 µs | 1.10 / 1.17 / 1.21 µs |
+| sweep, 100k / 1M, 10% expired | 66 ms / 0.91 s | **49 ms / 0.56 s** |
+| sweep, 1M whole fleet | 11.4 s | **7.0 s** |
+
+`capability_translate/announcement` read 4.76 µs in the full batch but
+3.75 and 3.79 µs on two isolated reruns. Translate does not touch the
+fold, so this is treated as noise; 3.7 µs is the steady value.
+
+**Mixed workload** (1M resident, same conditions). The broad query's
+service time fell from 40.9 ms to **13.5 ms** p50, and the worst-case
+latencies fell with it:
+
+- apply max went from 37.7 ms to **8.5 ms**;
+- selective query max went from 37.0 ms to **14.3 ms**;
+- apply p99 / p99.9 went from 41.3 / 133 µs to **34.5 / 115 µs**;
+- the expiry tick that reaped the 10k batch took 86.5 ms, down from
+  101.8.
+
+The maxima tracking the broad query's duration is direct support for
+the earlier inference that the broad query's read hold, not the sweep,
+sets the worst-case latencies.
+
+The Slice 1 cache gate and Slice 3 allocation gate re-ran unchanged:
+99.8% / 100% hits with 0 asserted stale misses, and 0 allocations on a
+warm refresh.
+
+Also green:
+
+- fold tests: 222;
+- the full library unit suite, `cargo tl`: 5,992 passed;
+- 23 capability-related integration binaries: 282 passed;
+- fmt; clippy across all targets and features; strict lib clippy at
+  all, default and no-default features;
+- rustdoc;
+- `cargo check --workspace --all-targets`.
+
+### Slices 0–5 at a glance (1M resident unless stated)
+
+| measure | Slice 0 baseline | after Slice 5 |
+|---|---|---|
+| cache hit rate, 200-node hot set, fleet announcing | 33.8% | 99.8% |
+| sweep, 10% expired | 1.43 s (99 walks, 45.7M yielded) | 0.56 s (1 walk, 1.0M yielded) |
+| sweep, whole fleet | 14.1 s | 7.0 s |
+| insert / refresh / changed replace | 5.99 / 1.40 / 16.4 µs | 2.86 / 1.21 / 10.4 µs |
+| translate | 9.79 µs | 3.7 µs |
+| allocations on a warm refresh | not measured | 0 (gated) |
+| `query_complex/50000` / `query_tag/50000` | 1.52 ms / 737 µs | 584 µs / 334 µs |
+| mixed: refresh apply p50 / p99 / max | 21.7 µs / 52.6 µs / 37.1 ms | 15.8 µs / 34.5 µs / 8.5 ms |
+| mixed: broad query p50 | 40.5 ms | 13.5 ms |
+
+Still open, outside Slices 0–5:
+
+- memory, 4.2 GB at 1M (interning and bitmaps, Slices 6–7, held);
+- cache capacity sizing (separate follow-up);
+- direct chunk-hold measurement;
+- the time-indexed expiry wheel (Slice 8, held, conditional).
+
 ### What Slice 0 changes about the later slices
 
 The Slice 0 review acknowledged items 1 and 2 and set their bounds.

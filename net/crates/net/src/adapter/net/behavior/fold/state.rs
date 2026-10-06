@@ -175,7 +175,7 @@ pub struct FoldState<K: FoldKind> {
     /// [`FoldKind::key_for`] function is the only sanctioned
     /// way to derive keys from announcements; the apply path
     /// uses it to look up + replace existing entries.
-    pub entries: HashMap<K::Key, FoldEntry<K>>,
+    pub entries: HashMap<K::Key, FoldEntry<K>, K::KeyHasher>,
     /// Reverse index: `node_id → keys it owns`. Populated on
     /// every accepted apply; consulted on
     /// [`super::Fold::evict_node`] to drop every entry attached
@@ -190,7 +190,7 @@ pub struct FoldState<K: FoldKind> {
     /// `detach_key` and `remove_node`, the one place the revision
     /// advances, so no mutation path can change a publisher's
     /// entries without moving its revision.
-    pub by_node: HashMap<NodeId, NodeRecord<K::Key>>,
+    pub by_node: HashMap<NodeId, NodeRecord<K::Key>, K::KeyHasher>,
     /// Last publisher revision handed out. Monotonic for the life
     /// of the state, and deliberately NOT reset by a restore: a
     /// revision issued before a restore must never be reissued
@@ -223,8 +223,8 @@ impl<K: FoldKind> FoldState<K> {
     /// Build an empty state.
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
-            by_node: HashMap::new(),
+            entries: HashMap::default(),
+            by_node: HashMap::default(),
             last_rev: 0,
         }
     }

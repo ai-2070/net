@@ -88,6 +88,7 @@ impl FoldKind for RoutingFold {
     type Query = RoutingQuery;
     type Result = Vec<RouteRow>;
     type Index = NoIndex;
+    type KeyHasher = std::collections::hash_map::RandomState;
 
     fn key_for(_publisher: NodeId, payload: &Self::Payload) -> Self::Key {
         payload.destination

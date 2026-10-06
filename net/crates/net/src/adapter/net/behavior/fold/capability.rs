@@ -635,6 +635,12 @@ impl FoldKind for CapabilityFold {
     type Query = CapabilityQuery;
     type Result = Vec<CapabilityMatch>;
     type Index = CapabilityIndexInner;
+    /// The same Fx mixer as the index's `(class, node)` sets (PERF_AUDIT
+    /// §4.6), so materialization's per-candidate `entries.get` stops
+    /// paying SipHash. The keys carry the same exposure the index sets
+    /// already accept: `node_id` is the publisher's routing id and
+    /// `class_hash` is publisher-declared.
+    type KeyHasher = BuildU64TupleHasher;
 
     fn key_for(node_id: NodeId, payload: &Self::Payload) -> Self::Key {
         (payload.class_hash, node_id)
