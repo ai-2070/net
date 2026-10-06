@@ -1,0 +1,52 @@
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_24d871c23f1085::t_cbd9aa2838abe6 1328-1333,1335-1336,1338,1342
+  s_24d871c23f1085::t_ce66777736fa79 3121-3165
+  s_24d871c23f1085::t_ad865df00636ef 838-844
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_24d871c23f1085::t_ad865df00636ef 537-539,639-646,1284-1313
+net/crates/net/benches/fold_scale_report.rs
+  s_24d871c23f1085::t_ad865df00636ef 4,24-26,499-500
+  s_24d871c23f1085::t_7730360b4a36f6 462-472
+net/crates/net/benches/net.rs
+  s_24d871c23f1085::t_ad865df00636ef 21-23,2104-2107
+  s_24d871c23f1085::t_9f553a02494af0 39-43
+docs/internal/plans/CAPABILITY_FOLD_SCALE_PLAN.md
+  s_24d871c23f1085::t_83eb0b6ab52663 821-822,887-949,960
+  s_24d871c23f1085::t_ad865df00636ef 1555
+net/crates/net/Cargo.toml
+  s_24d871c23f1085::t_ad865df00636ef 373
+net/crates/net/benches/fold_scale_fixture/mod.rs
+  s_24d871c23f1085::t_ad865df00636ef 32-34
+net/crates/net/Cargo.lock
+  s_24d871c23f1085::t_d84b69f2d69f20 3272
+net/crates/net/examples/browser-demo/host/Cargo.lock
+  s_24d871c23f1085::t_c29db8f36405de 1609
+net/crates/net/fuzz/Cargo.lock
+  s_24d871c23f1085::t_57f1d298dd5e73 1118
+net/crates/net/guards/fixtures_off_probe/Cargo.lock
+  s_24d871c23f1085::t_c3e58a2a4decba 794
+net/crates/net/guards/org_api_probe/Cargo.lock
+  s_24d871c23f1085::t_1bc9f654fbaa6f 834
+net/crates/net/tests/feature_consumer/Cargo.lock
+  s_24d871c23f1085::t_0961f2e6ddd63f 1191
+net/crates/net/tests/natsim/browser/Cargo.lock
+  s_24d871c23f1085::t_fdb3fd2fbae90c 1608
+net/crates/net/tests/rtc_browser/runner/Cargo.lock
+  s_24d871c23f1085::t_3f73bb93274684 1633
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0fec0a7be66264a40b69f5315e3231cf80684003",
+  "prompts": {},
+  "sessions": {
+    "s_24d871c23f1085": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e35c8197-0611-44d8-b124-600af36bf427",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
