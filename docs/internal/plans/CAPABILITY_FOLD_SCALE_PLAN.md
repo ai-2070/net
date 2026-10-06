@@ -2,13 +2,27 @@
 
 ## Status
 
-**On hold pending repairs.** Written 2026-10-06 against `LZL0/scaling` at
+**Slice 0 authorized.** Written 2026-10-06 against `LZL0/scaling` at
 `806635756`. No slice has landed. The 2026-10-06 design review of revision
 `ad4225dee` returned HOLD: the optimization direction stands, but several
 selected mechanisms and acceptance gates either changed supported semantics
-or could not pass their own proof. This revision applies that review's
-required repairs (R1–R9) and its targeted corrections; it needs a re-review
-before Slice 0 starts.
+or could not pass their own proof. Revision `01b18c5d5` applied that review's
+required repairs (R1–R9) and its targeted corrections. The re-review of
+`01b18c5d5` accepted them and cleared Slice 0 to start, with four
+implementation details pinned. This revision records them:
+
+1. Benches that reset a shared fixture run each reset immediately before its
+   measured operation (Slice 0).
+2. Slice 3's `SmallVec` change applies to the `keys` field of Slice 1's
+   per-node record, keeping `rev` (Track C).
+3. The expiry wheel removes each chunk from its bucket and from primary
+   state in the same critical section (Track A2; needed before Slice 8 can
+   be authorized).
+4. Slice 2's witness compares against the entry count captured before the
+   sweep.
+
+Slices 1–5 proceed in order on Slice 0's numbers. Slices 6–8 (interning,
+bitmaps, the expiry wheel) stay held, each pending its own decisions.
 
 What the repairs changed, in short:
 
@@ -322,9 +336,21 @@ unspecified:
 
 Bucket sets are `HashSet`s, not `SmallVec`s. At 1M entries over a 150 s
 cycle, a bucket holds ~6.7k keys, and the per-refresh move must not be a
-linear scan. The sweep pops every bucket whose second is at or below
-`floor(now)`. It drains them in `SWEEP_CHUNK_SIZE` slices with the write
-lock released between slices, so the chunked hold discipline stays.
+linear scan.
+
+The sweep drains, in order, every bucket whose second is at or below
+`floor(now)`. It does **not** pop a whole bucket and then drain it
+across unlocked chunks. That would leave undrained keys live in `entries`
+with no bucket placement, breaking the exact-sum invariant between chunks.
+Instead, each chunk does all of this in one write-locked critical section:
+
+- take up to `SWEEP_CHUNK_SIZE` keys out of the bucket;
+- remove those keys from `entries`, `by_node` and the index;
+- drop the bucket's map entry only when it is empty.
+
+Keys not yet drained stay in their bucket. The invariant therefore holds at
+every lock release, not only at the end of the sweep. The chunked hold
+discipline stays.
 
 Why not `BTreeMap<Instant, Key>` with exact instants: every apply pays a
 tree insert into a map as large as `entries`. Why not a heap: a refresh
@@ -418,10 +444,14 @@ Independent of B, and smaller:
   a miss.
 - **`by_node` on Replace:** when the same owner replaces the same key,
   leave the reverse-index membership in place instead of removing it,
-  dropping the empty set and recreating it. `by_node`'s value also becomes
-  `SmallVec<[K::Key; 1]>` with linear membership checks. That change is
-  pulled into this track from the old query-leftovers track, because
-  Slice 3's allocation gate cannot pass without it.
+  dropping the empty set and recreating it. The **`keys` field** of
+  Slice 1's per-node record becomes `SmallVec<[K::Key; 1]>` with linear
+  membership checks. The record itself, and its `rev`, stays. Replacing the
+  whole `by_node` value with a bare `SmallVec` would drop the publisher
+  revision. An accepted Replace still advances `rev` even when reverse-index
+  membership is left unchanged: the payload changed, so the cached set must
+  miss. This change is pulled into this track from the old query-leftovers
+  track, because Slice 3's allocation gate cannot pass without it.
 - **`derive_synthetic_index_tags`:** replace `Tag::parse` with a
   borrowing extraction that returns `&str` slices and **matches
   `parse_axis_body`'s grammar exactly**: split at the first of `=` or `:`,
@@ -527,8 +557,27 @@ the release notes, or `FoldKind` is confirmed crate-private first.
 Delivers the benches and probes every later slice reports against. The
 first draft's benches would have measured rejected applies, consumed state
 or fixture construction. Every bench below states its preparation and reset
-and asserts its outcome. Preparation runs outside timing (Criterion
-`iter_batched` setup); only the operation is timed.
+and asserts its outcome. Preparation runs outside timing; only the operation
+is timed.
+
+**Resets must interleave with measured operations.** `iter_batched` alone
+does not guarantee that: Criterion prepares every input in a batch before
+running any routine. On the locked Criterion 0.8.2, the review measured
+what happens with a four-input batch over one shared fixture:
+
+- insert resets produced `Inserted, Replaced, Replaced, Replaced`;
+- expiry resets produced eviction counts `10, 0, 0, 0`.
+
+So a bench whose setup resets a **shared** fixture uses one of three forms:
+
+- `BatchSize::PerIteration`, which gave four inserts and four ten-entry
+  sweeps in the same check;
+- a fully independent fixture per input;
+- controlled custom timing (`iter_custom`) that resets and then times each
+  operation in turn.
+
+The per-iteration outcome assertions below are what catch a regression to
+batched shared resets.
 
 - `capability_fold_apply/{insert,refresh_equivalent,replace_changed}` at
   10k, 100k and 1M resident entries.
@@ -629,7 +678,9 @@ tests at `fold/tests.rs:1248`, `:1315`, `:1328` and
 
 New witness `mass_expiry_yields_each_entry_once`: 100k entries, 10% expired.
 Assert the sweep's yielded-entry counter (exposed on `FoldMetrics` for this
-purpose) is at most `entries.len()`.
+purpose) is at most the entry count captured **before** the sweep. After
+eviction, `entries.len()` has shrunk by the evicted 10%, so it would be the
+wrong bound.
 
 The writer and reader tail during the single read hold is measured on
 `capability_fold_mixed` at 1M and recorded. If it is unacceptable, the fix
@@ -652,7 +703,11 @@ Proof:
 - The agreement test at `capability_bridge.rs:2457`, the
   synthetic-tags-stay-index-only test, and
   `find_nodes_matching_dedupes_publisher_across_classes`
-  (`capability_bridge.rs:2402`) stay green.
+  (`capability_bridge.rs:2402`) stay green, as do all of Slice 1's cache
+  witnesses.
+- New witness `same_key_replace_advances_rev_without_touching_membership`:
+  an accepted Replace from the same owner and key leaves the `keys` field
+  unchanged and makes the cached set miss once.
 - New differential test `synthetic_derivation_matches_tag_parse`. It
   compares the borrowing extraction with the `Tag::parse` path over: both
   separators (`id=x`, `id:x`); a value with embedded delimiters (`id=a:b`,
@@ -732,7 +787,11 @@ Proof:
 - `steady` drops from a full-map walk to microseconds, and `mass_expiry`
   holds Slice 2's number or better.
 - The `sum(bucket sizes) == entries.len()` assertion holds after every
-  mutation path in tests.
+  mutation path in tests, and at every lock release inside a multi-chunk
+  sweep, not only at its end.
+- New witness `multi_chunk_drain_keeps_placement_invariant`: one due bucket
+  larger than `SWEEP_CHUNK_SIZE`; assert the exact-sum invariant between
+  chunks, and that undrained keys remain in their bucket.
 - New witnesses:
   - `partial_second_deadline_is_never_lost`: a deadline at x.75 s and a
     sweep at x.5 s; the entry expires by the stated lag.
