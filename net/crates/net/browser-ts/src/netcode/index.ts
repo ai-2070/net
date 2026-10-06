@@ -18,3 +18,25 @@ export type { ClockEstimate, Millis } from './clock.js';
 export { SnapshotBuffer, lerpNumbers, SNAPSHOT_BUFFER } from './interpolate.js';
 export type { Interpolator, TimedSnapshot } from './interpolate.js';
 export type { NetcodeStream, NetcodeTransport } from './wire.js';
+
+// The netcode wire format and its helpers, exported so callers can
+// build their own transports and tooling on the same frames.
+export {
+  snapshotFrames,
+} from './host.js';
+export {
+  chunkOf,
+  decodeFrame,
+  defaultNow,
+  encodeFrame,
+  eventPeer,
+  MAX_NETCODE_INTEREST_KEY_LENGTH,
+  MAX_NETCODE_INTEREST_KEYS,
+  MAX_SNAPSHOT_CHUNKS,
+  peerHex,
+} from './wire.js';
+export type {
+  Frame,
+  Now,
+  WireInput,
+} from './wire.js';
