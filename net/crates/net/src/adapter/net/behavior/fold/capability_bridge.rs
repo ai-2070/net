@@ -2848,34 +2848,38 @@ mod tests {
         let (keys_before, rev_before) =
             fold.with_state(|s| (s.keys_for(0xA).map(<[_]>::to_vec), s.publisher_rev(0xA)));
 
-        // Index-equivalent refresh and index-changing replace: both
-        // keep membership and both advance the revision.
-        for (version, tags) in [(2, vec!["gpu"]), (3, vec!["gpu", "cuda"])] {
+        // Index-equivalent refresh, then index-changing replace. Each is
+        // checked on its own, so one case cannot mask the other: both
+        // must keep membership, advance the revision, and make the
+        // cached set miss exactly once.
+        let mut cached = before;
+        let mut rev_prev = rev_before;
+        for (case, (version, tags)) in [
+            ("index-equivalent", (2, vec!["gpu"])),
+            ("index-changing", (3, vec!["gpu", "cuda"])),
+        ] {
+            let misses_before = cache.stats().stale_misses;
             fold.apply(cache_member(&kp, 0xA, 0x100, version, tags, None))
                 .expect("replace");
+            let (keys_now, rev_now) =
+                fold.with_state(|s| (s.keys_for(0xA).map(<[_]>::to_vec), s.publisher_rev(0xA)));
+            assert_eq!(keys_now, keys_before, "{case}: membership changed");
+            assert!(rev_now > rev_prev, "{case}: revision did not advance");
+            let now = cache.get_or_synthesize(&fold, 0xA);
+            assert!(!std::sync::Arc::ptr_eq(&cached, &now), "{case}: no miss");
+            assert_eq!(
+                cache.stats().stale_misses,
+                misses_before + 1,
+                "{case}: not one miss"
+            );
+            assert!(
+                std::sync::Arc::ptr_eq(&now, &cache.get_or_synthesize(&fold, 0xA)),
+                "{case}: no hit after the miss"
+            );
+            cached = now;
+            rev_prev = rev_now;
         }
-        let (keys_after, rev_after) =
-            fold.with_state(|s| (s.keys_for(0xA).map(<[_]>::to_vec), s.publisher_rev(0xA)));
-        assert_eq!(
-            keys_after, keys_before,
-            "same-key replace must not change membership"
-        );
-        assert!(
-            rev_after > rev_before,
-            "a replace must advance the revision"
-        );
-
-        let after = cache.get_or_synthesize(&fold, 0xA);
-        assert!(
-            !std::sync::Arc::ptr_eq(&before, &after),
-            "the cached set must miss"
-        );
-        assert!(has_tag(&after, "cuda"));
-        assert_eq!(cache.stats().stale_misses, 1, "exactly one miss");
-        assert!(std::sync::Arc::ptr_eq(
-            &after,
-            &cache.get_or_synthesize(&fold, 0xA)
-        ));
+        assert!(has_tag(&cached, "cuda"));
     }
 
     /// The pre-Slice-3 hardware summary, through the full sorted
@@ -2909,49 +2913,191 @@ mod tests {
     /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 3: the single-pass translate
     /// (hardware decoded from the hardware-axis subset only) produces
     /// the same hardware summary, tag set and region as the full
-    /// `views()` path, including multi-GPU sets whose decode depends on
-    /// tag order.
+    /// `views()` path.
+    ///
+    /// Decode order is observable only when two tags set the same
+    /// hardware field, so the raw fixtures carry conflicting
+    /// `memory_gb` and GPU vendor values, plus malformed numbers,
+    /// presence-only, unknown-subkey and colon-separated tags. Regions
+    /// come from `with_region_scope` (an `add_tag("scope:...")` is
+    /// dropped by `parse_user`) and from raw multiple / empty region
+    /// tags. The expected region is the first `scope:region:` tag in the
+    /// set's own iteration order, which is what production selects; no
+    /// lexicographic precedence is imposed.
+    ///
+    /// The codec does not encode `additional_gpus` (`hardware_to_tags`),
+    /// so a multi-GPU `HardwareCapabilities` reaches translation as its
+    /// primary GPU only; that shape is asserted, not a multi-GPU decode.
     #[test]
     fn single_pass_translate_matches_views_projection() {
         use crate::adapter::net::behavior::capability::{
             CapabilityAnnouncement, CapabilitySet, GpuInfo, GpuVendor as LegacyGpuVendor,
             HardwareCapabilities,
         };
+        use crate::adapter::net::behavior::tag::Tag;
         use crate::adapter::net::identity::EntityId;
 
+        enum Region {
+            Absent,
+            Exact(&'static str),
+            OneOf(&'static [&'static str]),
+        }
+        let with_raw = |mut caps: CapabilitySet, raw: &[&str]| {
+            for t in raw {
+                caps.tags
+                    .insert(Tag::parse(t).expect("raw fixture tag parses"));
+            }
+            caps
+        };
         let gpu = |vendor, vram| GpuInfo::new(vendor, "card", vram);
-        let sets = vec![
-            CapabilitySet::new(),
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(128)),
-            CapabilitySet::new().with_hardware(
-                HardwareCapabilities::new().with_gpu(gpu(LegacyGpuVendor::Nvidia, 80)),
+        let fixtures: Vec<(&str, CapabilitySet, Region, Option<HardwareSummary>)> = vec![
+            ("empty", CapabilitySet::new(), Region::Absent, None),
+            (
+                "memory only",
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(128)),
+                Region::Absent,
+                Some(HardwareSummary {
+                    gpu_vendor: None,
+                    gpu_count: 0,
+                    memory_gb: Some(128),
+                    vram_gb: None,
+                }),
             ),
-            CapabilitySet::new().with_hardware(
-                HardwareCapabilities::new()
-                    .with_cpu(16, 32)
-                    .with_memory(512)
-                    .with_gpu(gpu(LegacyGpuVendor::Nvidia, 80))
-                    .add_gpu(gpu(LegacyGpuVendor::Amd, 64))
-                    .add_gpu(gpu(LegacyGpuVendor::Nvidia, 24)),
-            ),
-            CapabilitySet::new()
-                .with_hardware(
+            (
+                // additional_gpus are not encoded: one GPU survives.
+                "multi-gpu builder (primary only)",
+                CapabilitySet::new().with_hardware(
                     HardwareCapabilities::new()
-                        .with_memory(64)
-                        .with_gpu(gpu(LegacyGpuVendor::Amd, 16)),
-                )
-                .add_tag("inference")
-                .add_tag("scope:region:eu-west"),
+                        .with_cpu(16, 32)
+                        .with_memory(512)
+                        .with_gpu(gpu(LegacyGpuVendor::Nvidia, 80))
+                        .add_gpu(gpu(LegacyGpuVendor::Amd, 64)),
+                ),
+                Region::Absent,
+                Some(HardwareSummary {
+                    gpu_vendor: Some("nvidia".into()),
+                    gpu_count: 1,
+                    memory_gb: Some(512),
+                    vram_gb: Some(80),
+                }),
+            ),
+            (
+                "real region",
+                CapabilitySet::new()
+                    .with_hardware(
+                        HardwareCapabilities::new()
+                            .with_memory(64)
+                            .with_gpu(gpu(LegacyGpuVendor::Amd, 16)),
+                    )
+                    .add_tag("inference")
+                    .with_region_scope("eu-west"),
+                Region::Exact("eu-west"),
+                Some(HardwareSummary {
+                    gpu_vendor: Some("amd".into()),
+                    gpu_count: 1,
+                    memory_gb: Some(64),
+                    vram_gb: Some(16),
+                }),
+            ),
+            (
+                "multiple regions",
+                with_raw(
+                    CapabilitySet::new(),
+                    &[
+                        "scope:region:eu-west",
+                        "scope:region:us-east",
+                        "scope:region:ap-south",
+                    ],
+                ),
+                Region::OneOf(&["eu-west", "us-east", "ap-south"]),
+                None,
+            ),
+            (
+                "empty region",
+                with_raw(CapabilitySet::new(), &["scope:region:"]),
+                Region::Exact(""),
+                None,
+            ),
+            (
+                // Two values for the same field: the decoder's order
+                // decides which wins, in both paths.
+                "conflicting hardware",
+                with_raw(
+                    CapabilitySet::new(),
+                    &[
+                        "hardware.memory_gb=64",
+                        "hardware.memory_gb=128",
+                        "hardware.gpu",
+                        "hardware.gpu.vendor=nvidia",
+                        "hardware.gpu.vendor=amd",
+                        "hardware.gpu.vram_gb=24",
+                        "hardware.gpu.vram_gb=80",
+                    ],
+                ),
+                Region::Absent,
+                None,
+            ),
+            (
+                "malformed, presence-only, unknown, colon",
+                with_raw(
+                    CapabilitySet::new(),
+                    &[
+                        "hardware.memory_gb=abc",
+                        "hardware.memory_gb:96",
+                        "hardware.cpu_cores=",
+                        "hardware.gpu.vram_gb=lots",
+                        "hardware.gpu.vendor:intel",
+                        "hardware.frobnicator=7",
+                        "hardware.gpu.flux=1",
+                        "hardware.storage_gb",
+                    ],
+                ),
+                Region::Absent,
+                None,
+            ),
         ];
-        for (i, caps) in sets.into_iter().enumerate() {
+
+        for (i, (name, caps, region_shape, expected_hw)) in fixtures.into_iter().enumerate() {
             let ann =
                 CapabilityAnnouncement::new(i as u64 + 1, EntityId::from_bytes([0u8; 32]), 1, caps);
             let translated = translate_announcement(&ann, None);
+
             assert_eq!(
                 translated.payload.hardware,
                 hardware_summary_via_views(&ann),
-                "hardware summary differs for set {i}"
+                "hardware summary differs from the views() path for {name}"
             );
+            if let Some(expected) = expected_hw {
+                assert_eq!(
+                    translated.payload.hardware,
+                    Some(expected),
+                    "unexpected decoded shape for {name}"
+                );
+            }
+
+            // Region: the first match in the set's iteration order,
+            // taken BEFORE any sorting.
+            let first_region = ann
+                .capabilities
+                .tags
+                .iter()
+                .map(|t| t.to_string())
+                .find_map(|t| t.strip_prefix("scope:region:").map(String::from));
+            assert_eq!(
+                translated.payload.region, first_region,
+                "region differs for {name}"
+            );
+            match region_shape {
+                Region::Absent => assert_eq!(translated.payload.region, None, "{name}"),
+                Region::Exact(r) => {
+                    assert_eq!(translated.payload.region.as_deref(), Some(r), "{name}")
+                }
+                Region::OneOf(rs) => {
+                    let got = translated.payload.region.as_deref().expect("a region");
+                    assert!(rs.contains(&got), "{name}: region {got:?} not among {rs:?}");
+                }
+            }
+
             let mut expected_tags: Vec<String> = ann
                 .capabilities
                 .tags
@@ -2961,14 +3107,7 @@ mod tests {
             let mut got_tags = translated.payload.tags.clone();
             expected_tags.sort();
             got_tags.sort();
-            assert_eq!(got_tags, expected_tags, "tag set differs for set {i}");
-            let expected_region = expected_tags
-                .iter()
-                .find_map(|t| t.strip_prefix("scope:region:").map(String::from));
-            assert_eq!(
-                translated.payload.region, expected_region,
-                "region differs for set {i}"
-            );
+            assert_eq!(got_tags, expected_tags, "tag set differs for {name}");
         }
     }
 

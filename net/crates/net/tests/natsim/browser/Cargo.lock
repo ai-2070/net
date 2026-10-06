@@ -1619,6 +1619,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "smallvec",
  "snow",
  "socket2",
  "str0m",

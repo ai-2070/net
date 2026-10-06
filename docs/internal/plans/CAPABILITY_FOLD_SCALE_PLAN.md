@@ -290,8 +290,11 @@ carries into that release's notes:
 - `FoldState::by_node` values are `NodeRecord { keys, rev }`, no longer
   `HashSet<K::Key>`. Code such as
   `s.by_node.get(&node).map_or(0, |keys| keys.len())` fails with E0599.
-  Migrate to `s.keys_for(node)`, which returns `Option<&HashSet<K::Key>>`.
-  `by_node.contains_key` and `by_node.keys()` are unchanged.
+  Migrate to `s.keys_for(node)`, which returns `Option<&[K::Key]>` (as
+  of Slice 3; `NodeRecord::keys` is a `SmallVec<[K::Key; 1]>`). Code
+  that relied on `HashSet`-specific operations on a publisher's keys
+  must use the slice equivalents (`contains`, `iter`, `len`) or collect
+  into a set. `by_node.contains_key` and `by_node.keys()` are unchanged.
 - `FoldState` has a new private field (`last_rev`), so external struct
   literals no longer compile. Construct it with `FoldState::new()` or
   `Default`.
@@ -598,8 +601,10 @@ rest is inherent to removal:
   `keys` unchanged and advance the revision, and the cached set misses
   exactly once.
 - `single_pass_translate_matches_views_projection`: hardware summary,
-  tag set and region match the full `views()` path over five sets,
-  including a three-GPU mixed-vendor set.
+  tag set and region match the full `views()` path. Repaired after the
+  Slice 3 review (S3-2, S3-3); the coverage is described below. The
+  original version did not exercise a region or an order-sensitive
+  decode.
 - `target_matches_filter_agrees_with_find_nodes_matching`,
   `find_nodes_matching_dedupes_publisher_across_classes`, and every
   Slice 1 cache witness and Slice 2 sweep witness pass.
@@ -613,6 +618,72 @@ Also green:
   all, default and no-default features;
 - rustdoc;
 - `cargo check --workspace --all-targets`.
+
+### Slice 3 review repairs (HOLD at `7ae501e39`)
+
+The review found no production regression and independently confirmed
+the zero-allocation warm refresh. It held the slice for three bounded
+repairs.
+
+- **S3-1: stale standalone lockfiles.** Making `smallvec` a direct
+  dependency updated the main `Cargo.lock` but not the seven standalone
+  lockfiles that resolve the local `net-mesh` package:
+  `examples/browser-demo/host`, `fuzz`,
+  `guards/{fixtures_off_probe,org_api_probe}`, `tests/feature_consumer`,
+  `tests/natsim/browser` and `tests/rtc_browser/runner`. They failed
+  `cargo metadata --locked`, which broke the integration-guard job and
+  the WebRTC feature consumer. Each was refreshed with a non-locked
+  `cargo metadata --offline`. The diff is exactly one line per file (the
+  `smallvec` entry in `net-mesh`'s dependency list), with no other
+  resolver changes. All eight tracked lockfiles that resolve `net-mesh`
+  now pass `cargo metadata --locked --offline`.
+- **S3-2: the translate witness had no region.** Its region fixture used
+  `add_tag("scope:region:...")`, which `parse_user` drops, and its oracle
+  sorted the tags before picking the first region. The review showed the
+  witness passing with region extraction disabled. The repaired witness:
+  - builds a real region with `with_region_scope`;
+  - adds raw multiple-region and empty-region tags;
+  - takes the expected region from the set's own iteration order before
+    any sort, which is what production selects;
+  - checks the multiple-region case only for membership in the
+    candidate set, imposing no lexicographic precedence.
+- **S3-3: the multi-GPU and order claims were not representable.**
+  `hardware_to_tags` does not encode `additional_gpus`, so the
+  "three-GPU" fixture reached translation as its primary GPU, and no
+  fixture set one field twice. The repaired witness:
+  - asserts each fixture's actual decoded shape, including the
+    multi-GPU builder decoding to `gpu_count: 1`;
+  - adds raw fixtures with conflicting `memory_gb`, GPU vendor and VRAM
+    values, so decoder order is observable;
+  - adds raw malformed-number, presence-only, unknown-subkey and
+    colon-separated hardware tags.
+
+  Multi-GPU encoding stays out of this semantic-preserving slice.
+
+Inverse checks, each caught by the repaired witness, with the code
+restored afterwards:
+
+- **Region extraction disabled:** the witness fails on the real-region
+  fixture, `None` against `Some("eu-west")`.
+- **Hardware subset left unsorted:** the witness fails on the
+  conflicting-hardware fixture. The views path decodes nvidia/80 and the
+  unsorted subset amd/24.
+
+The migration note under Slice 1 now gives `keys_for`'s current
+`Option<&[K::Key]>` return type and covers code that used
+`HashSet`-specific operations.
+
+Also applied, the review's nonblocking suggestion:
+`same_key_replace_advances_rev_without_touching_membership` now asserts
+the index-equivalent and index-changing replaces separately. Each must
+keep membership, advance the revision, and miss exactly once, so one
+case cannot mask the other.
+
+Not done, kept as the review framed it, a bounded follow-up: a witness
+pinning reverse-index transfer on a different-owner replace. It would
+assert the old and new owners' key sets and revisions, then evict each
+owner, including the old owner's last-key case. The path is correct by
+inspection, and no fold in the tree is keyed on payload alone today.
 
 ### Slice 4 (cheap query fixes)
 
