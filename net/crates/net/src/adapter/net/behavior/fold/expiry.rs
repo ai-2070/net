@@ -77,13 +77,17 @@ pub(super) fn sweep_expired<K: FoldKind>(
         // locks below.
         let candidates: Vec<K::Key> = {
             let state = state_lock.read();
-            state
+            let mut yielded = 0u64;
+            let candidates = state
                 .entries
                 .iter()
+                .inspect(|_| yielded += 1)
                 .filter(|(_, e)| e.expires_at <= now)
                 .map(|(k, _)| k.clone())
                 .take(SWEEP_CHUNK_SIZE)
-                .collect()
+                .collect();
+            metrics.on_sweep_walk(yielded);
+            candidates
         };
         if candidates.is_empty() {
             return total_evicted;

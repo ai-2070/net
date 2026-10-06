@@ -1352,6 +1352,51 @@ fn sweep_evicts_across_multiple_chunks_when_count_exceeds_chunk_size() {
     assert_eq!(fold.metrics().expiries(), N);
 }
 
+#[test]
+fn sweep_metrics_count_walks_and_yielded_entries() {
+    // Pins the counters CAPABILITY_FOLD_SCALE_PLAN.md's Slice 0
+    // reports and Slice 2's witness reads. A sweep that finds nothing
+    // makes one walk that yields every entry. A sweep over more
+    // expired entries than one chunk makes one walk per chunk plus
+    // the final walk that finds nothing, and re-walking the cleared
+    // prefix yields the surviving live entries again.
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    const LIVE: u64 = 100;
+    const EXPIRED: u64 = 1500; // > SWEEP_CHUNK_SIZE: two eviction chunks
+    for i in 0..LIVE {
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 3600, vec!["t"]))
+            .expect("apply live");
+    }
+
+    assert_eq!(fold.sweep_expired_now(), 0);
+    assert_eq!(fold.metrics().sweep_walks(), 1, "empty sweep: one walk");
+    assert_eq!(
+        fold.metrics().sweep_yielded(),
+        LIVE,
+        "empty sweep yields every entry once"
+    );
+
+    for i in LIVE..LIVE + EXPIRED {
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 0, vec!["t"]))
+            .expect("apply expiring");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let walks_before = fold.metrics().sweep_walks();
+    let yielded_before = fold.metrics().sweep_yielded();
+    assert_eq!(fold.sweep_expired_now(), EXPIRED as usize);
+    assert_eq!(
+        fold.metrics().sweep_walks() - walks_before,
+        3,
+        "two eviction chunks plus the final empty walk"
+    );
+    let yielded = fold.metrics().sweep_yielded() - yielded_before;
+    assert!(
+        yielded >= LIVE + EXPIRED,
+        "every entry is yielded at least once, got {yielded}"
+    );
+}
+
 /// Audit-emitting `FoldKind` shim: identical to `CapFold` but
 /// `audit_event` returns `Some(AuditEvent)` for every transition.
 /// Audit emission is opt-in via the trait so folds that don't

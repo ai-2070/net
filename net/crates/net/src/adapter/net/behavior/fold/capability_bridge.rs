@@ -806,6 +806,29 @@ const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
 /// existing `synthesize_capability_set` cost plus one Arc alloc.
 pub struct CapabilitySetCache {
     inner: parking_lot::Mutex<lru::LruCache<NodeId, CachedCapabilitySetEntry>>,
+    hits: std::sync::atomic::AtomicU64,
+    stale_misses: std::sync::atomic::AtomicU64,
+    absent_misses: std::sync::atomic::AtomicU64,
+}
+
+/// Lookup outcome counters for a [`CapabilitySetCache`], from
+/// [`CapabilitySetCache::stats`].
+///
+/// The two miss kinds have different causes. A *stale* miss found an
+/// entry for the node but at an older fold generation: a coherence
+/// miss, caused by a fold mutation since it was cached. An *absent*
+/// miss found no entry: either the node's first lookup or a capacity
+/// eviction. The cache cannot tell those two apart; a caller that
+/// knows how many distinct nodes it looked up can (capacity misses =
+/// absent misses − distinct nodes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CapabilitySetCacheStats {
+    /// Lookups served from the cache.
+    pub hits: u64,
+    /// Lookups that found an entry at an older fold generation.
+    pub stale_misses: u64,
+    /// Lookups that found no entry for the node.
+    pub absent_misses: u64,
 }
 
 struct CachedCapabilitySetEntry {
@@ -829,6 +852,9 @@ impl CapabilitySetCache {
             std::num::NonZeroUsize::new(capacity.max(1)).unwrap_or(std::num::NonZeroUsize::MIN);
         Self {
             inner: parking_lot::Mutex::new(lru::LruCache::new(cap)),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            stale_misses: std::sync::atomic::AtomicU64::new(0),
+            absent_misses: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -845,12 +871,16 @@ impl CapabilitySetCache {
         let current_gen = fold.change_generation();
         // Fast path — cache hit at the current generation.
         {
+            use std::sync::atomic::Ordering::Relaxed;
             let mut lru = self.inner.lock();
-            if let Some(entry) = lru.get(&node_id) {
-                if entry.generation == current_gen {
+            match lru.get(&node_id) {
+                Some(entry) if entry.generation == current_gen => {
+                    self.hits.fetch_add(1, Relaxed);
                     return entry.caps.clone();
                 }
-            }
+                Some(_) => self.stale_misses.fetch_add(1, Relaxed),
+                None => self.absent_misses.fetch_add(1, Relaxed),
+            };
         }
         // Miss / stale. Synthesize outside the cache lock so we
         // don't serialize callers on a long synthesize (the fold's
@@ -885,6 +915,18 @@ impl CapabilitySetCache {
     /// relies on the change-generation invalidation.
     pub fn clear(&self) {
         self.inner.lock().clear();
+    }
+
+    /// Lookup outcome counters since construction. Relaxed loads,
+    /// so a snapshot taken during concurrent lookups may be off by
+    /// in-flight calls.
+    pub fn stats(&self) -> CapabilitySetCacheStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        CapabilitySetCacheStats {
+            hits: self.hits.load(Relaxed),
+            stale_misses: self.stale_misses.load(Relaxed),
+            absent_misses: self.absent_misses.load(Relaxed),
+        }
     }
 
     /// Number of currently-cached entries (any generation).
@@ -2936,6 +2978,42 @@ mod tests {
         assert!(
             v2.tags.len() > v1_tag_count,
             "post-mutation cache miss must reflect the new tag set"
+        );
+    }
+
+    /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 0 — the cache's outcome
+    /// counters tell an absent entry (first lookup or capacity
+    /// eviction) from a stale one (fold mutated since caching).
+    #[test]
+    fn capability_set_cache_stats_split_absent_and_stale_misses() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xCD, 0x100, vec!["gpu"], None))
+            .expect("apply CD");
+        let cache = CapabilitySetCache::new();
+
+        cache.get_or_synthesize(&fold, 0xCD);
+        cache.get_or_synthesize(&fold, 0xCD);
+        assert_eq!(
+            cache.stats(),
+            CapabilitySetCacheStats {
+                hits: 1,
+                stale_misses: 0,
+                absent_misses: 1,
+            }
+        );
+
+        // Any fold mutation moves the generation the cache keys on.
+        fold.apply(sign_member(&kp, 0xEF, 0x100, vec!["cpu"], None))
+            .expect("apply EF");
+        cache.get_or_synthesize(&fold, 0xCD);
+        assert_eq!(
+            cache.stats(),
+            CapabilitySetCacheStats {
+                hits: 1,
+                stale_misses: 1,
+                absent_misses: 1,
+            }
         );
     }
 

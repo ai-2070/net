@@ -611,6 +611,20 @@ name = "capability_burst"
 harness = false
 required-features = ["net", "tool"]
 
+# Capability-fold scale baseline (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 0).
+# Criterion timings: apply, translate, sweep.
+[[bench]]
+name = "fold_scale"
+harness = false
+required-features = ["net", "fixtures"]
+
+# Custom main + counting allocator: footprint, cache outcomes, sweep
+# visit counts, mixed 1M workload.
+[[bench]]
+name = "fold_scale_report"
+harness = false
+required-features = ["net", "fixtures"]
+
 # Cold start: keypair → node build → start → first peer visible; plus
 # cold-start → first nRPC reply and drop → reconnect → first nRPC.
 # Custom main + hdrhistogram (per-stage rows plus decomposed totals).
