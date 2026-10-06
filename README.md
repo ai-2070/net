@@ -354,9 +354,9 @@ behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/m
 
 ## WebRTC
 
-A browser cannot open a UDP socket, so a tab joins the mesh as a WebAssembly leaf over an
-`RTCPeerConnection` to a native **anchor** — a node built with the `webrtc` feature. Against the
-[binding coverage](#sdks) surface, a browser leaf gets:
+Net natively supports WebRTC: a browser tab becomes a real mesh node — same
+identity, channels, and RPC as anything else — by connecting to a native **anchor**, a node built
+with the `webrtc` feature. Against the [binding coverage](#sdks) surface, a browser leaf gets:
 
 - Event bus — ingest + poll
 - Mesh channels — subscribe / publish
