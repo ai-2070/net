@@ -53,7 +53,7 @@ use net::adapter::net::behavior::fold::capability_bridge::{
 };
 use net::adapter::net::behavior::fold::{
     ApplyOutcome, CapabilityFold, CapabilityMembership, Fold, FoldEntry, FoldKind, NodeId,
-    SignedAnnouncement,
+    NodeRecord, SignedAnnouncement,
 };
 use net::adapter::net::behavior::CapabilityFilter;
 use parking_lot::Mutex;
@@ -352,11 +352,11 @@ fn measure_fold(n: u64, make: &dyn Fn(u64) -> Envelope) -> (Fold<CapabilityFold>
 fn fold_tables(fold: &Fold<CapabilityFold>) -> (u64, u64) {
     fold.with_state(|s| {
         let primary = table_bytes::<(Key, FoldEntry<CapabilityFold>)>(s.entries.capacity());
-        let reverse_outer = table_bytes::<(NodeId, HashSet<Key>)>(s.by_node.capacity());
+        let reverse_outer = table_bytes::<(NodeId, NodeRecord<Key>)>(s.by_node.capacity());
         let reverse_inner: u64 = s
             .by_node
             .values()
-            .map(|set| table_bytes::<Key>(set.capacity()))
+            .map(|record| table_bytes::<Key>(record.keys.capacity()))
             .sum();
         (primary, reverse_outer + reverse_inner)
     })
@@ -481,15 +481,30 @@ fn section_cache(templates: &Templates) {
         RUN.as_secs()
     );
     println!(
-        "| hot set | target apply rate | accepted applies/s | lookups | hits | coherence misses | capacity misses | first-lookup misses | hit rate |"
+        "| hot set | announcing publishers | target apply rate | accepted applies/s | lookups | hits | coherence misses | capacity misses | first-lookup misses | hit rate |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
 
     let fold = Arc::new(live_fold(templates, PUBLISHERS));
     let generations = Arc::new(Mutex::new(vec![1u64; PUBLISHERS as usize]));
 
+    // Who announces under load: every publisher (the hot set's own
+    // refreshes legitimately invalidate it), or only publishers OUTSIDE
+    // the hot set. The second isolates coherence misses caused by
+    // other publishers, which per-publisher validity must reduce to 0.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Announcing {
+        All,
+        OutsideHotSet,
+    }
+    let configs = [
+        (0.0, Announcing::All),
+        (OPERATING_APPLY_RATE, Announcing::All),
+        (OPERATING_APPLY_RATE, Announcing::OutsideHotSet),
+    ];
+
     for hot in [200u64, 1000] {
-        for apply_rate in [0.0, OPERATING_APPLY_RATE] {
+        for (apply_rate, announcing) in configs {
             let cache = CapabilitySetCache::new();
             let stop = Arc::new(AtomicBool::new(false));
 
@@ -505,7 +520,10 @@ fn section_cache(templates: &Templates) {
                     let mut rng = Rng::new(7);
                     let start = Instant::now();
                     let accepted = paced(apply_rate, RUN + Duration::from_secs(1), &stop, || {
-                        let i = rng.below(PUBLISHERS);
+                        let i = match announcing {
+                            Announcing::All => rng.below(PUBLISHERS),
+                            Announcing::OutsideHotSet => hot + rng.below(PUBLISHERS - hot),
+                        };
                         let generation = {
                             let mut g = generations.lock();
                             g[i as usize] += 1;
@@ -547,9 +565,20 @@ fn section_cache(templates: &Templates) {
                 lookups,
                 "every lookup has exactly one outcome"
             );
+            if announcing == Announcing::OutsideHotSet {
+                assert_eq!(
+                    stale_misses, 0,
+                    "announcements outside the hot set invalidated it"
+                );
+            }
             let distinct = seen.len() as u64;
+            let who = match (apply_rate == 0.0, announcing) {
+                (true, _) => "none",
+                (false, Announcing::All) => "all",
+                (false, Announcing::OutsideHotSet) => "outside hot set",
+            };
             println!(
-                "| {hot} | {apply_rate:.0}/s | {achieved:.0} | {lookups} | {hits} | {stale_misses} | {} | {distinct} | {:.1}% |",
+                "| {hot} | {who} | {apply_rate:.0}/s | {achieved:.0} | {lookups} | {hits} | {stale_misses} | {} | {distinct} | {:.1}% |",
                 absent_misses.saturating_sub(distinct),
                 100.0 * hits as f64 / lookups.max(1) as f64,
             );

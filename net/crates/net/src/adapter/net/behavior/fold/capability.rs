@@ -969,7 +969,7 @@ pub fn nodes_with_capability_tag(
 /// entries. Non-allocating — walks the publisher's `by_node` reverse
 /// index and short-circuits on the first match.
 fn node_has_tag(state: &FoldState<CapabilityFold>, node_id: NodeId, tag: &str) -> bool {
-    let Some(keys) = state.by_node.get(&node_id) else {
+    let Some(keys) = state.keys_for(node_id) else {
         return false;
     };
     keys.iter().any(|key| {
@@ -981,7 +981,7 @@ fn node_has_tag(state: &FoldState<CapabilityFold>, node_id: NodeId, tag: &str) -
 }
 
 fn tags_union_for(state: &FoldState<CapabilityFold>, node_id: NodeId) -> Vec<String> {
-    let Some(keys) = state.by_node.get(&node_id) else {
+    let Some(keys) = state.keys_for(node_id) else {
         return Vec::new();
     };
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1007,7 +1007,7 @@ pub fn reflex_addr_for(
     node_id: NodeId,
 ) -> Option<std::net::SocketAddr> {
     fold.with_state(|state| {
-        let keys = state.by_node.get(&node_id)?;
+        let keys = state.keys_for(node_id)?;
         for key in keys {
             if let Some(entry) = state.entries.get(key) {
                 if let Some(addr) = entry.payload.reflex_addr {

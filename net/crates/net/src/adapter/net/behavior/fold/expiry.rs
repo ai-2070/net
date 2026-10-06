@@ -117,12 +117,7 @@ pub(super) fn sweep_expired<K: FoldKind>(
             let Some(old_entry) = state.entries.remove(&key) else {
                 continue;
             };
-            if let Some(keys) = state.by_node.get_mut(&old_entry.node_id) {
-                keys.remove(&key);
-                if keys.is_empty() {
-                    state.by_node.remove(&old_entry.node_id);
-                }
-            }
+            state.detach_key(old_entry.node_id, &key);
             index.on_remove(&key, &old_entry.payload);
             if let Some(sink) = audit_sink {
                 let transition = EntryTransition::Expired {

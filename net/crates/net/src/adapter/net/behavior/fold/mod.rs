@@ -60,7 +60,7 @@ pub use routing::{RouteAnnouncement, RouteRow, RoutingFold, RoutingQuery};
 pub use snapshot::{FoldSnapshot, FoldSnapshotEntry};
 pub use state::{
     ApplyOutcome, BuildU64Hasher, EntryTransition, FoldEntry, FoldError, FoldIndex, FoldState,
-    FxU64Hasher, MergeAction, NoIndex, NodeId, NodeIdSet,
+    FxU64Hasher, MergeAction, NoIndex, NodeId, NodeIdSet, NodeRecord,
 };
 pub use wire::{EnvelopeMeta, SignedAnnouncement, WireError};
 
@@ -371,11 +371,7 @@ impl<K: FoldKind> Fold<K> {
                 // No existing entry to evict; install fresh.
                 let entry = build_entry::<K>(ann);
                 index.on_insert(&key, &entry.payload);
-                state
-                    .by_node
-                    .entry(node_id)
-                    .or_default()
-                    .insert(key.clone());
+                state.attach_key(node_id, key.clone());
                 let audit = K::audit_event(EntryTransition::Created {
                     key: &key,
                     new: &entry,
@@ -405,12 +401,7 @@ impl<K: FoldKind> Fold<K> {
                     self.metrics.on_reject();
                     return Ok(ApplyOutcome::Rejected);
                 };
-                if let Some(keys) = state.by_node.get_mut(&old_entry.node_id) {
-                    keys.remove(&key);
-                    if keys.is_empty() {
-                        state.by_node.remove(&old_entry.node_id);
-                    }
-                }
+                state.detach_key(old_entry.node_id, &key);
                 let new_entry = build_entry::<K>(ann);
                 // PERF_AUDIT §4.5 — steady-state refresh (same
                 // tags/region/state, new generation/TTL) skips
@@ -426,11 +417,7 @@ impl<K: FoldKind> Fold<K> {
                     index.on_remove(&key, &old_entry.payload);
                     index.on_insert(&key, &new_entry.payload);
                 }
-                state
-                    .by_node
-                    .entry(node_id)
-                    .or_default()
-                    .insert(key.clone());
+                state.attach_key(node_id, key.clone());
                 let audit = K::audit_event(EntryTransition::Replaced {
                     key: &key,
                     old: &old_entry,
@@ -495,7 +482,7 @@ impl<K: FoldKind> Fold<K> {
         let mut state = self.state.write();
         let mut index = self.index.write();
 
-        let Some(keys) = state.by_node.remove(&node_id) else {
+        let Some(keys) = state.remove_node(node_id) else {
             return;
         };
         let mut removed = 0usize;
@@ -574,8 +561,7 @@ impl<K: FoldKind> Fold<K> {
             });
         }
 
-        state.entries.clear();
-        state.by_node.clear();
+        state.clear_for_restore();
         index.clear();
 
         let anchor = Instant::now();
@@ -600,11 +586,7 @@ impl<K: FoldKind> Fold<K> {
             };
             let key = snap_entry.key.clone();
             index.on_insert(&key, &entry.payload);
-            state
-                .by_node
-                .entry(entry.node_id)
-                .or_default()
-                .insert(key.clone());
+            state.attach_key(entry.node_id, key.clone());
             state.entries.insert(key, entry);
         }
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-**Slice 0 implemented; awaiting re-review after harness repairs.** Written 2026-10-06 against `LZL0/scaling` at
+**Slice 0 closed; Slice 1 implemented, awaiting review.** Written 2026-10-06 against `LZL0/scaling` at
 `806635756`. No slice has landed. The 2026-10-06 design review of revision
 `ad4225dee` returned HOLD: the optimization direction stands, but several
 selected mechanisms and acceptance gates either changed supported semantics
@@ -194,6 +194,124 @@ only p50 and max.
 The run before the S0-1 repair armed the batch during fixture
 construction. Its expiry was not a 10 s in-run event, and that row is
 withdrawn.
+
+### Slice 0 closure
+
+The re-review closed S0-1 to S0-3 at `5f5695b72`.
+
+- The repository gate was held on two exact-head CI failures:
+  - **WebRTC:** a 180 s hang in
+    `rtc_repairs::a_frame_captured_under_a_retired_incarnation_cannot_revive_its_reassembly`.
+  - **@net-mesh/browser:** a `lobby.test.ts` failure, "no local node … on
+    this mesh".
+- Both passed on attempt 2 of run 37427000792 at the same SHA: 225/225
+  and 964/964.
+- Neither is attributable to the range. `b76cfb445..5f5695b72` changes one
+  doc comment under `src/`, and the browser job builds only `leaf`, which
+  the branch does not touch.
+- Neither reproduces locally:
+  - the WebRTC test passed 30/30 alone, and the whole `rtc_repairs` binary
+    5/5;
+  - the lobby test passed 500/500, plus 8 pinned-id variants.
+- C consumers (windows-latest) hits its 75-minute limit on `master` itself:
+  5 of the last 6 runs, including the base commit `806635756`.
+
+Root causes of the two flakes are not established. They, and the Windows
+timeout, are handed off as separate issues.
+
+### Slice 1 (publisher-revision cache validity)
+
+Implemented as Track D specifies.
+
+- **The per-node revision.** `FoldState::by_node` values are now
+  `NodeRecord { keys, rev }`. `rev` comes from one fold-wide counter
+  (`FoldState::last_rev`) that is never reset, including by
+  `clear_for_restore`.
+- **One choke point.** Every write to the reverse index goes through
+  `attach_key`, `detach_key` or `remove_node` on `FoldState`, the only
+  code that moves a revision. That covers insert, replace (both halves),
+  `evict_node`, expiry and restore.
+- **Absent publishers.** A publisher with no record reads as revision `0`
+  through `publisher_rev`. A returning or restored publisher gets a
+  revision it never had before.
+- **The cache.** `CapabilitySetCache` keys entries on
+  `(node_id, publisher_rev)`. `get_or_synthesize` reads the revision,
+  checks validity, and on a miss synthesizes and stores, all inside one
+  fold read borrow.
+- **Owner-projection retraction** (`with_state_mut`) does not advance the
+  revision, because the cached set reads only tags and metadata. That
+  assumption is documented on the cache.
+- **Readers.** In-crate readers use `FoldState::keys_for(node)` instead
+  of `by_node.get(&node)`.
+
+**Source-compatibility note.** `FoldState::by_node` is a public field, and
+its value type changed from `HashSet<K::Key>` to `NodeRecord<K::Key>`.
+In-tree consumers outside the crate (the Go, Node and Python placement
+bindings) use only `by_node.contains_key`, which is unaffected.
+`cargo check --workspace --all-targets` is clean.
+
+**Trade-off.** A cache hit now takes one fold read lock as well as the
+cache mutex. It used to read an atomic generation without the fold lock.
+Under the old scheme most lookups at the operating point missed (33.8%
+hits) and took the same read lock to synthesize, so the lock was already
+on the common path. Hits are now subject to writer queueing (a fair
+`RwLock`), and that is not separately measured.
+
+**Proof** (`fold_scale_report -- cache`, same machine and fixture as
+Slice 0). The workload adds an "outside hot set" configuration in which
+only publishers outside the hot set announce, and **asserts zero stale
+misses** there.
+
+| hot set | announcing | apply rate | hit rate (Slice 0 → Slice 1) | coherence misses | capacity misses |
+|---|---|---|---|---|---|
+| 200 | none | 0 | 100.0% → 100.0% | 0 | 0 |
+| 200 | all | 6,667/s | 33.8% → **99.8%** | 330,565 → 651 | 0 |
+| 200 | outside hot set | 6,667/s | – → **100.0%** | – → **0** | 0 |
+| 1,000 | none | 0 | 25.7% → 25.7% | 0 | 370,590 → 370,611 |
+| 1,000 | all | 6,667/s | 7.2% → 25.6% | 92,069 → 116 | 370,470 → 370,636 |
+| 1,000 | outside hot set | 6,667/s | – → 25.7% | – → **0** | 370,514 |
+
+The 651 remaining misses at hot set 200 with everyone announcing are the
+hot set's own refreshes: 2% of 6,667/s × 5 s ≈ 667, as validity requires.
+Capacity misses are unchanged, as Slice 1 intends; capacity sizing remains
+the separate follow-up. As the Slice 0 review noted, this fixture gives
+each publisher ~100× a real 1M fleet's refresh rate, so own-publisher
+misses here are an upper bound.
+
+Apply cost is unchanged within noise: `capability_fold_apply` at 100k is
+6.17 µs insert, 1.38 µs refresh and 15.3 µs replace_changed, against
+6.29 / 1.35 / 14.8 µs before.
+
+**Witnesses** (`fold/capability_bridge.rs` tests; 216 fold tests pass):
+
+- `cache_survives_other_publishers_announcements`
+- `cache_misses_on_sibling_class_change`
+- `cache_misses_on_older_sibling_expiry`
+- `cache_unknown_to_known`
+- `cache_misses_after_eviction_and_reannouncement`
+- `cache_misses_after_forced_restore`
+- `cache_concurrent_miss_populate_never_serves_stale`: 3 readers against
+  2,000 writer applies. Every lookup must see at least the version
+  applied before it started.
+
+`capability_set_cache_stats_split_absent_and_stale_misses` now produces
+its stale miss from the publisher's own replace. Under the old cache it
+came from another publisher's apply.
+
+Inverse checks, each caught by its witness, with the code restored
+afterwards:
+
+- Not advancing the revision on a partial class removal fails
+  `cache_misses_on_older_sibling_expiry`.
+- Resetting the revision counter on restore fails
+  `cache_misses_after_forced_restore`.
+
+Also green:
+
+- the full library unit suite, `cargo tl`: 5,985 passed;
+- 23 capability-related integration binaries: 282 passed;
+- fmt, all-targets/all-features clippy, strict lib clippy, rustdoc, and
+  `cargo check --workspace --all-targets`.
 
 ### What Slice 0 changes about the later slices
 

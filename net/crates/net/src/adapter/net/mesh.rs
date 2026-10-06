@@ -41338,7 +41338,7 @@ impl MeshNode {
     #[cfg(feature = "webrtc")]
     fn peer_is_leaf(node_id: u64, ctx: &DispatchCtx) -> bool {
         ctx.capability_fold.with_state(|state| {
-            let Some(keys) = state.by_node.get(&node_id) else {
+            let Some(keys) = state.keys_for(node_id) else {
                 return false;
             };
             keys.iter()
@@ -47276,7 +47276,7 @@ impl MeshNode {
     #[cfg(feature = "webrtc")]
     fn peer_announces_rtc(&self, peer_node_id: u64) -> bool {
         self.capability_fold.with_state(|state| {
-            let Some(keys) = state.by_node.get(&peer_node_id) else {
+            let Some(keys) = state.keys_for(peer_node_id) else {
                 return false;
             };
             keys.iter()
@@ -47296,7 +47296,7 @@ impl MeshNode {
     /// browser has no out-of-band way to obtain.
     pub fn peer_announced_noise_pubkey(&self, peer_node_id: u64) -> Option<[u8; 32]> {
         self.capability_fold.with_state(|state| {
-            let keys = state.by_node.get(&peer_node_id)?;
+            let keys = state.keys_for(peer_node_id)?;
             keys.iter()
                 .filter_map(|key| state.entries.get(key))
                 .find_map(|entry| entry.payload.noise_pubkey)
@@ -47316,7 +47316,7 @@ impl MeshNode {
         use super::behavior::deck::RtcAnchorRow;
         let mut rows: Vec<RtcAnchorRow> = self.capability_fold.with_state(|state| {
             let mut rows = Vec::new();
-            for (node_id, keys) in state.by_node.iter() {
+            for (node_id, keys) in state.by_node.iter().map(|(n, r)| (n, &r.keys)) {
                 let mut row: Option<RtcAnchorRow> = None;
                 for entry in keys.iter().filter_map(|key| state.entries.get(key)) {
                     let is_anchor = entry.payload.tags.iter().any(|tag| tag == RTC_ANCHOR_TAG);
@@ -47406,7 +47406,7 @@ impl MeshNode {
     pub fn peer_nat_class(&self, peer_node_id: u64) -> super::traversal::classify::NatClass {
         use super::traversal::classify::NatClass;
         self.capability_fold.with_state(|state| {
-            let Some(keys) = state.by_node.get(&peer_node_id) else {
+            let Some(keys) = state.keys_for(peer_node_id) else {
                 return NatClass::Unknown;
             };
             for key in keys {
@@ -62737,7 +62737,7 @@ mod scoped_discovery_ignores_peer_subnets_tests {
         node.test_inject_capability_announcement(second);
 
         let (entry_count, classes) = node.capability_fold.with_state(|state| {
-            let keys = state.by_node.get(&peer_id).cloned().unwrap_or_default();
+            let keys = state.keys_for(peer_id).cloned().unwrap_or_default();
             let classes: Vec<u64> = keys.iter().map(|(class, _)| *class).collect();
             (keys.len(), classes)
         });

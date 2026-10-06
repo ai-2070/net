@@ -182,7 +182,36 @@ pub struct FoldState<K: FoldKind> {
     /// range), the average node owns a handful of keys; the
     /// reverse index is the difference between "evict in
     /// microseconds" and "evict in seconds."
-    pub by_node: HashMap<NodeId, HashSet<K::Key>>,
+    ///
+    /// Each record also carries the publisher's mutation revision
+    /// ([`NodeRecord::rev`]). Writes go through `attach_key`,
+    /// `detach_key` and `remove_node`, the one place the revision
+    /// advances, so no mutation path can change a publisher's
+    /// entries without moving its revision.
+    pub by_node: HashMap<NodeId, NodeRecord<K::Key>>,
+    /// Last publisher revision handed out. Monotonic for the life
+    /// of the state, and deliberately NOT reset by a restore: a
+    /// revision issued before a restore must never be reissued
+    /// after it, or a cache keyed on `(node, rev)` could validate
+    /// pre-restore contents against post-restore state.
+    last_rev: u64,
+}
+
+/// One publisher's slice of [`FoldState::by_node`].
+#[derive(Debug, Clone)]
+pub struct NodeRecord<Q> {
+    /// Every key this publisher currently owns (one per class).
+    pub keys: HashSet<Q>,
+    /// The publisher's mutation revision: receiver-local, drawn
+    /// from one fold-wide counter, and advanced by every change to
+    /// the set of entries the publisher owns or to any of their
+    /// payloads (insert or replace of any class, removal of any
+    /// class). Never `0` while the record exists; an absent
+    /// publisher reads as `0` through [`FoldState::publisher_rev`].
+    /// Because the counter is fold-wide and never reused, a
+    /// publisher that leaves and returns gets a revision it has
+    /// never had before.
+    pub rev: u64,
 }
 
 impl<K: FoldKind> FoldState<K> {
@@ -191,7 +220,71 @@ impl<K: FoldKind> FoldState<K> {
         Self {
             entries: HashMap::new(),
             by_node: HashMap::new(),
+            last_rev: 0,
         }
+    }
+
+    /// The keys `node` currently owns, if it owns any.
+    pub fn keys_for(&self, node: NodeId) -> Option<&HashSet<K::Key>> {
+        self.by_node.get(&node).map(|record| &record.keys)
+    }
+
+    /// `node`'s current mutation revision, or `0` when it owns no
+    /// entries. Two reads that return the same value bracket no
+    /// change to the publisher's entries: see [`NodeRecord::rev`].
+    pub fn publisher_rev(&self, node: NodeId) -> u64 {
+        self.by_node.get(&node).map_or(0, |record| record.rev)
+    }
+
+    fn next_rev(&mut self) -> u64 {
+        self.last_rev += 1;
+        self.last_rev
+    }
+
+    /// Record that `node` owns `key` after an accepted write of that
+    /// key's entry, and advance `node`'s revision. Called for every
+    /// insert and replace, including a replace that leaves the key
+    /// set unchanged: the payload changed, so the revision must.
+    pub(super) fn attach_key(&mut self, node: NodeId, key: K::Key) {
+        let rev = self.next_rev();
+        let record = self.by_node.entry(node).or_insert_with(|| NodeRecord {
+            keys: HashSet::new(),
+            rev,
+        });
+        record.keys.insert(key);
+        record.rev = rev;
+    }
+
+    /// Record that `node` no longer owns `key`. Drops the record when
+    /// it was the publisher's last key (the publisher then reads as
+    /// absent, revision `0`); otherwise advances the revision, since
+    /// one of its classes is gone.
+    pub(super) fn detach_key(&mut self, node: NodeId, key: &K::Key) {
+        let Some(record) = self.by_node.get_mut(&node) else {
+            return;
+        };
+        record.keys.remove(key);
+        if record.keys.is_empty() {
+            self.by_node.remove(&node);
+            return;
+        }
+        let rev = self.next_rev();
+        if let Some(record) = self.by_node.get_mut(&node) {
+            record.rev = rev;
+        }
+    }
+
+    /// Drop `node`'s record, returning the keys it owned.
+    pub(super) fn remove_node(&mut self, node: NodeId) -> Option<HashSet<K::Key>> {
+        self.by_node.remove(&node).map(|record| record.keys)
+    }
+
+    /// Empty the entries and the reverse index ahead of a restore,
+    /// keeping the revision counter so restored publishers get
+    /// revisions no earlier lookup has seen.
+    pub(super) fn clear_for_restore(&mut self) {
+        self.entries.clear();
+        self.by_node.clear();
     }
 
     /// Total entry count. Cheap O(1) read off the primary store.
