@@ -56,6 +56,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -585,6 +586,26 @@ def private_dir(path: Path) -> None:
         os.chmod(path, 0o700)
 
 
+def generator_env(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment the generators are BUILT in: this process's, without
+    the lane's `CC`.
+
+    `CC` names the compiler of the C PROGRAMS, and a lane sets it to choose
+    one. cargo's build scripts track it too (`ring`, `blake3`, `alloca`,
+    through the `cc` crate), so a lane whose `CC` differs from the last
+    one's re-runs them and rebuilds the generators' whole release graph from
+    there: `Dirty ring: the env variable CC changed`, then net-mesh-wire and
+    net-mesh. On the Windows leg that was three rebuilds of an unchanged
+    binary, about 10.5 minutes each (the UCRT lane, the MSVCRT lane, then
+    MSVC again), which is what took the leg past its 75 minutes. The
+    generators are not what a lane tests; they are built once, by the
+    toolchain cargo picks for itself."""
+    env = dict(os.environ if environ is None else environ)
+    for name in [n for n in env if n.upper() == "CC"]:
+        del env[name]
+    return env
+
+
 def scenario_env(src: Path, work: Path) -> dict[str, str]:
     """The environment variables naming the scenarios `src` needs,
     generating each the first time it is asked for."""
@@ -602,8 +623,10 @@ def scenario_env(src: Path, work: Path) -> dict[str, str]:
             cmd = ["cargo", "run", "-q", "--release", "--manifest-path",
                    str(ROOT / "net" / "crates" / "net" / "Cargo.toml"), "-p", "net-mesh-sdk",
                    "--features", "net,cortex,fixtures", "--example", example, "--", str(out)]
+            started = time.monotonic()
             try:
-                run = subprocess.run(cmd, capture_output=True, text=True, timeout=SCENARIO_TIMEOUT)
+                run = subprocess.run(cmd, capture_output=True, text=True, timeout=SCENARIO_TIMEOUT,
+                                     env=generator_env())
             except subprocess.TimeoutExpired:
                 print(f"✗ {src.stem}: generating {need} timed out after {SCENARIO_TIMEOUT}s")
                 raise SystemExit(1)
@@ -611,6 +634,11 @@ def scenario_env(src: Path, work: Path) -> dict[str, str]:
                 print(f"✗ {src.stem}: generating {need} failed")
                 sys.stdout.write(_indent(run.stdout + run.stderr))
                 raise SystemExit(1)
+            # Seconds when the generators are already built, minutes when
+            # this call built them. Printed because cargo runs quiet here: a
+            # lane that rebuilds them again is otherwise indistinguishable
+            # from a slow one.
+            print(f"  · {need}: generated in {time.monotonic() - started:.0f}s", flush=True)
             _scenario_dirs[need] = out
         env[var] = str(_scenario_dirs[need])
     return env
@@ -949,6 +977,11 @@ def self_test() -> int:
         failures += 0 if ok else 1
         ok = stray_libraries([str(good.parent)], good.parent) == []
         print(f"{'✓' if ok else '✗'} self-test: bundle/lib itself is not a stray")
+        failures += 0 if ok else 1
+
+        lane = {"CC": "C:/msys64/ucrt64/bin/gcc.exe", "PATH": "C:/msys64/ucrt64/bin", "CARGO_HOME": "h"}
+        ok = generator_env(lane) == {"PATH": "C:/msys64/ucrt64/bin", "CARGO_HOME": "h"} and "CC" in lane
+        print(f"{'✓' if ok else '✗'} self-test: a lane's CC does not reach the generators' build")
         failures += 0 if ok else 1
     return 1 if failures else 0
 
