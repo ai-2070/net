@@ -29,9 +29,9 @@ pub const TEMPLATE_PERIOD: u64 = 4800;
 /// TTL for entries that must stay live for the whole bench.
 pub const LIVE_TTL_SECS: u32 = 3600;
 
-/// The same capability set the existing `net` bench uses
-/// (`benches/net.rs`), so Slice 0's numbers are comparable with the
-/// recorded `capability_fold_*` rows.
+/// The bench workload's capability set: the single definition used by
+/// the `net` bench's `capability_fold_*` rows and by the fold-scale
+/// benches, so their numbers stay comparable.
 pub fn sample_capability_set(node_index: u64) -> CapabilitySet {
     let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24)
         .with_compute_units(128)

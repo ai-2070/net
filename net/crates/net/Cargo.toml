@@ -370,6 +370,7 @@ reed-solomon-erasure = { version = "6", optional = true, default-features = fals
 # already pulled transitively, no second copy in the resolver graph.
 lru = "0.18"
 smallvec = "1.16"
+foldhash = "0.2"
 ed25519-dalek = { version = "3", features = ["rand_core", "zeroize"], optional = true }
 # X25519 DH for the `IdentityEnvelope` sealed-box construction used
 # by daemon migration. We derive an ephemeral pubkey, DH against the

@@ -818,7 +818,8 @@ footing. Whether there is an effective per-publisher bound on distinct
 classes was not established here. The `KeyHasher` doc states the rule a
 fold must meet before choosing an unkeyed hasher. Reverting
 `CapabilityFold` to `RandomState` is a one-line change if the reviewers
-reject the trade.
+reject the trade. **Resolved after PR review:** `CapabilityFold` now uses
+the keyed `foldhash::fast::RandomState`; see "PR #1198 review fixes".
 
 **Proof** (Criterion `net` bench, absolute times against the final
 Slice 4 run, same machine):
@@ -883,6 +884,69 @@ Also green:
 - rustdoc;
 - `cargo check --workspace --all-targets`.
 
+### PR #1198 review fixes (cubic)
+
+The automated review on PR #1198 raised seven findings. All seven were
+valid and are fixed.
+
+- **Translate left spare capacity in stored tags (P2).** This was a real
+  memory regression. Slice 3 rendered each tag into a `String` pre-sized
+  to 48 bytes, and that capacity stayed resident in every payload. The
+  footprint bench could not see it: its template rows clone payloads,
+  and a clone allocates exactly the length. A new "translated per entry
+  (no clone)" row translates each entry directly.
+  - Before the fix it measured **3,822 retained and 2,264 payload-heap
+    B/entry**. After, it measures **3,199 and 1,641**, matching the
+    clone figure. That is about 620 B per entry, roughly 620 MB at 1M.
+  - Translate now renders into one reused scratch buffer and stores an
+    exact-length copy.
+  - Witness: `translate_stores_tags_without_spare_capacity`. Restoring a
+    48-byte pre-size fails it.
+- **The unkeyed Fx hasher on the primary map (P2).** A publisher chooses
+  `class_hash`, so it could manufacture colliding keys. That breaks the
+  precondition the `KeyHasher` doc states.
+  - `CapabilityFold::KeyHasher` is now `foldhash::fast::RandomState`.
+    It seeds each map at random, its folded multiply can't be inverted,
+    and it is hashbrown's default hasher. `foldhash` becomes a direct
+    dependency at the 0.2.0 already locked. All eight tracked lockfiles
+    that resolve `net-mesh` were refreshed, one line each, and pass
+    `--locked`.
+  - Cost against Fx is within about ±5% on every query bench:
+    `query_complex/50000` 584 → 613 µs, `query_tag/50000` 334 → 353 µs,
+    `query_tag_rare` 0.76 → 0.73 µs, `query_complex` 103 → 90 µs.
+    Nearly all of Slice 5's gain over SipHash survives
+    (`query_tag/50000` was 744 µs).
+  - Witness: `capability_fold_primary_map_hasher_is_keyed`. Two states
+    must hash the same keys differently. Restoring the unkeyed Fx alias
+    fails it.
+  - The index's `(class, node)` sets still use the unkeyed Fx mixer.
+    That exposure predates this PR (PERF_AUDIT §4.6) and is left for a
+    follow-up.
+- **The cache-stats capacity-miss arithmetic (P2).** The doc now says
+  absent misses also come from `clear()` and from racing cold lookups,
+  and that "absent − distinct" gives capacity evictions only over a
+  single-threaded interval with no clears. The report bench's use of it
+  meets that condition, and its header now says so.
+- **Doc fixes (P3):**
+  - `for_each_synthetic_index_tag`'s doc no longer intra-doc-links the
+    `#[cfg(test)]` `derive_synthetic_index_tags`.
+  - The Track E2 bound now includes `Send + Sync`.
+  - The report header lists all five sections.
+- **The duplicated bench workload (P3).** `sample_capability_set` now has
+  one definition, in `benches/fold_scale_fixture`. The `net` bench uses
+  it, so the recorded `capability_fold_*` rows and the scale baseline
+  cannot drift apart.
+
+Also green:
+
+- fold and tag tests: 242;
+- the full library unit suite, `cargo tl`: 5,994 passed;
+- 23 capability integration binaries: 282 passed;
+- fmt; clippy across all targets and features; strict lib clippy at all,
+  default and no-default features;
+- rustdoc;
+- `cargo check --workspace --all-targets`.
+
 ### Slices 0–5 at a glance (1M resident unless stated)
 
 | measure | Slice 0 baseline | after Slice 5 |
@@ -893,7 +957,7 @@ Also green:
 | insert / refresh / changed replace | 5.99 / 1.40 / 16.4 µs | 2.86 / 1.21 / 10.4 µs |
 | translate | 9.79 µs | 3.7 µs |
 | allocations on a warm refresh | not measured | 0 (gated) |
-| `query_complex/50000` / `query_tag/50000` | 1.52 ms / 737 µs | 584 µs / 334 µs |
+| `query_complex/50000` / `query_tag/50000` | 1.52 ms / 737 µs | 613 µs / 353 µs (keyed foldhash; 584 / 334 µs with Fx) |
 | mixed: refresh apply p50 / p99 / max | 21.7 µs / 52.6 µs / 37.1 ms | 15.8 µs / 34.5 µs / 8.5 ms |
 | mixed: broad query p50 | 40.5 ms | 13.5 ms |
 
@@ -1488,7 +1552,7 @@ Output order and content are unchanged: the final `NodeId` sort and dedup
 stay where they are.
 
 **E2: the hasher seam.** `FoldKind` gains a **required** associated type,
-`type KeyHasher: BuildHasher + Default`, used by `FoldState::entries` and
+`type KeyHasher: BuildHasher + Default + Send + Sync`, used by `FoldState::entries` and
 `by_node`. `CapabilityFold` sets it to `BuildU64TupleHasher`. Routing,
 reservation and every other existing `FoldKind` impl set `RandomState`
 explicitly. A defaulted associated type (`= RandomState`) is not an option:

@@ -18,6 +18,9 @@
 // primitive's cost.
 #![allow(deprecated)]
 
+#[path = "fold_scale_fixture/mod.rs"]
+mod fold_scale_fixture;
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use net::adapter::net::PeerAddr;
 use std::sync::Arc;
@@ -33,12 +36,11 @@ use net::adapter::net::{
         Action, AlertSeverity, ApiAnnouncement, ApiEndpoint, ApiMethod, ApiParameter, ApiQuery,
         ApiRegistry, ApiSchema, ApiVersion, Baggage, CapabilityAnnouncement, CapabilityFilter,
         CapabilityRequirement, CapabilitySet, CompareOp, Condition, ConditionExpr, Context,
-        ContextStore, Endpoint, GpuInfo, GpuVendor, HardwareCapabilities, HealthStatus,
-        LbRequestContext, LoadBalancer, LoadBalancerConfig, LoadMetrics, LocationInfo, LogLevel,
-        MetadataQuery, MetadataStore, Modality, ModelCapability, NatType, NetworkTier,
-        NodeMetadata, NodeStatus, Priority, PropagationContext, Region, ResourceLimits, Rule,
-        RuleContext, RuleEngine, RuleSet, SamplingStrategy, SchemaType, SoftwareCapabilities, Span,
-        SpanKind, Strategy, ToolCapability, TopologyHints, TraceId,
+        ContextStore, Endpoint, GpuVendor, HealthStatus, LbRequestContext, LoadBalancer,
+        LoadBalancerConfig, LoadMetrics, LocationInfo, LogLevel, MetadataQuery, MetadataStore,
+        Modality, NatType, NetworkTier, NodeMetadata, NodeStatus, Priority, PropagationContext,
+        Region, Rule, RuleContext, RuleEngine, RuleSet, SamplingStrategy, SchemaType, Span,
+        SpanKind, Strategy, TopologyHints, TraceId,
     },
     AdaptiveBatcher,
     Capabilities,
@@ -2099,59 +2101,10 @@ criterion_group!(
 // Phase 4A: Capability Announcements (CAP-ANN) Benchmarks
 // =============================================================================
 
-/// Helper to create a sample capability set for benchmarking
-fn sample_capability_set(node_index: u64) -> CapabilitySet {
-    let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24)
-        .with_compute_units(128)
-        .with_tensor_cores(512)
-        .with_fp16_tflops(82.5);
-
-    let hardware = HardwareCapabilities::new()
-        .with_cpu(16, 32)
-        .with_memory(64 + (node_index as u32 % 64))
-        .with_gpu(gpu)
-        .with_storage(2000)
-        .with_network(10);
-
-    let software = SoftwareCapabilities::new()
-        .with_os("linux", "6.1")
-        .add_runtime("python", "3.11")
-        .add_framework("pytorch", "2.1")
-        .with_cuda("12.1");
-
-    let model = ModelCapability::new(format!("llama-3.1-{}b", 7 + (node_index % 4) * 20), "llama")
-        .with_parameters(7.0 + (node_index % 4) as f32 * 20.0)
-        .with_context_length(128000)
-        .with_quantization("fp16")
-        .add_modality(Modality::Text)
-        .add_modality(Modality::Code)
-        .with_tokens_per_sec(50 + (node_index % 100) as u32)
-        .with_loaded(node_index.is_multiple_of(3));
-
-    let tool = ToolCapability::new("python_repl", "Python REPL")
-        .with_version("1.0.0")
-        .with_estimated_time(100);
-
-    let mut caps = CapabilitySet::new()
-        .with_hardware(hardware)
-        .with_software(software)
-        .add_model(model)
-        .add_tool(tool)
-        .with_limits(ResourceLimits::new().with_max_concurrent(10));
-
-    // Add varying tags based on node index
-    if node_index.is_multiple_of(2) {
-        caps = caps.add_tag("inference");
-    }
-    if node_index.is_multiple_of(3) {
-        caps = caps.add_tag("training");
-    }
-    if node_index.is_multiple_of(5) {
-        caps = caps.add_tag("gpu-cluster");
-    }
-
-    caps
-}
+// `sample_capability_set` is shared with the fold-scale benches
+// (`benches/fold_scale_fixture`), so the recorded `capability_fold_*` rows
+// and the scale baseline measure the same workload.
+use fold_scale_fixture::sample_capability_set;
 
 /// Benchmark: CapabilitySet creation and serialization
 fn bench_capability_set(c: &mut Criterion) {

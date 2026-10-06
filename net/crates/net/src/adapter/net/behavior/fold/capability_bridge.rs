@@ -835,10 +835,13 @@ pub struct CapabilitySetCache {
 /// The two miss kinds have different causes. A *stale* miss found an
 /// entry for the node but at an older revision of that node: a
 /// coherence miss, caused by a change to the node's own entries since
-/// it was cached. An *absent* miss found no entry: either the node's
-/// first lookup or a capacity eviction. The cache cannot tell those
-/// two apart; a caller that knows how many distinct nodes it looked
-/// up can (capacity misses = absent misses − distinct nodes).
+/// it was cached. An *absent* miss found no entry: the node's first
+/// lookup, a capacity eviction, a lookup after [`CapabilitySetCache::clear`],
+/// or a racing lookup of a node another caller is still populating.
+/// The cache cannot tell these apart. Only over a single-threaded
+/// interval with no `clear()` can a caller that knows how many distinct
+/// nodes it looked up derive capacity evictions, as absent misses minus
+/// distinct nodes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CapabilitySetCacheStats {
     /// Lookups served from the cache.
@@ -1322,17 +1325,21 @@ pub fn translate_announcement(
     let mut tags: Vec<String> = Vec::with_capacity(ann.capabilities.tags.len());
     let mut region: Option<String> = None;
     let mut hardware_tags: Vec<super::super::tag::Tag> = Vec::new();
+    // Each tag renders into one reused scratch buffer, then is stored as
+    // an exact-length copy. The stored strings live in the fold for the
+    // entry's lifetime, so they must carry no spare capacity: rendering
+    // straight into a per-tag `String` left growth or pre-sizing slack
+    // resident in every payload (~620 B per entry on the bench fixture).
+    let mut scratch = String::new();
     for tag in &ann.capabilities.tags {
-        // Pre-sized: rendering through `Display` into an empty String
-        // regrows it several times per tag.
-        let mut rendered = String::with_capacity(48);
-        let _ = std::fmt::Write::write_fmt(&mut rendered, format_args!("{tag}"));
+        scratch.clear();
+        let _ = std::fmt::Write::write_fmt(&mut scratch, format_args!("{tag}"));
         if region.is_none() {
-            if let Some(r) = rendered.strip_prefix("scope:region:") {
+            if let Some(r) = scratch.strip_prefix("scope:region:") {
                 region = Some(r.to_owned());
             }
         }
-        tags.push(rendered);
+        tags.push(scratch.as_str().to_owned());
         if matches!(
             tag.axis_key_ref(),
             Some((super::super::tag::TaxonomyAxis::Hardware, _))
@@ -3109,6 +3116,51 @@ mod tests {
             got_tags.sort();
             assert_eq!(got_tags, expected_tags, "tag set differs for {name}");
         }
+    }
+
+    /// The payload's tag strings stay resident in the fold for the
+    /// entry's lifetime, so translate must store them without spare
+    /// capacity (PR #1198 review). Rendering straight into a pre-sized
+    /// or growing per-tag `String` left ~620 B of slack per entry on the
+    /// bench fixture.
+    #[test]
+    fn translate_stores_tags_without_spare_capacity() {
+        use crate::adapter::net::behavior::capability::{
+            CapabilityAnnouncement, CapabilitySet, GpuInfo, GpuVendor as LegacyGpuVendor,
+            HardwareCapabilities,
+        };
+        use crate::adapter::net::identity::EntityId;
+
+        let caps = CapabilitySet::new()
+            .with_hardware(
+                HardwareCapabilities::new()
+                    .with_cpu(16, 32)
+                    .with_memory(64)
+                    .with_gpu(GpuInfo::new(LegacyGpuVendor::Nvidia, "h100", 80)),
+            )
+            .add_tag("a")
+            .add_tag("inference")
+            .add_tag("a-rather-long-custom-tag-well-past-forty-eight-bytes-in-length")
+            .with_region_scope("eu-west");
+        let ann = CapabilityAnnouncement::new(1, EntityId::from_bytes([0u8; 32]), 1, caps);
+        let translated = translate_announcement(&ann, None);
+        assert!(
+            translated.payload.tags.len() > 5,
+            "fixture renders several tags"
+        );
+        for tag in &translated.payload.tags {
+            assert_eq!(
+                tag.capacity(),
+                tag.len(),
+                "tag {tag:?} carries spare capacity"
+            );
+        }
+        let region = translated.payload.region.as_ref().expect("a region");
+        assert_eq!(
+            region.capacity(),
+            region.len(),
+            "region carries spare capacity"
+        );
     }
 
     #[test]

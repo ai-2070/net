@@ -1,7 +1,7 @@
 //! Capability-fold scale report: counts, bytes, hit rates, tails.
 //!
 //! Slice 0 of CAPABILITY_FOLD_SCALE_PLAN.md, the half of the baseline
-//! that Criterion cannot produce. Four sections, each printed as a
+//! that Criterion cannot produce. Five sections, each printed as a
 //! table:
 //!
 //! - `sweep`: how many entries the expiry sweep's candidate walks yield
@@ -21,6 +21,9 @@
 //!   operating point's rate, selective and broad queries, a batch of
 //!   entries armed at the workload's start to expire ten seconds later,
 //!   and a 500 ms sweeper, with per-call service-latency histograms.
+//! - `alloc`: allocation calls inside the fold for warm refreshes (gated
+//!   at zero), changed-index replaces, evictions, cold inserts and
+//!   translations.
 //!
 //! Every section asserts its outcomes: an apply that should replace must
 //! replace, a sweep must reap exactly the armed batch, query results must
@@ -456,6 +459,17 @@ fn section_footprint(templates: &Templates) {
         });
         print_footprint(&format!("mixed: +{UNIQUE} unique tags"), &fp);
         drop(fold);
+
+        // Translated per entry, NOT cloned from a template: production
+        // moves `translate_announcement`'s output straight into the fold,
+        // so any spare capacity in its strings stays resident. The
+        // template rows above clone payloads, and a clone allocates
+        // exactly the length, which hides that slack.
+        let (fold, fp) = measure_fold(N, &|i| {
+            capability_bridge::translate_announcement(&legacy_announcement(i), None)
+        });
+        print_footprint("translated per entry (no clone)", &fp);
+        drop(fold);
     }
 
     COUNTING.store(false, Ordering::Relaxed);
@@ -482,7 +496,8 @@ fn section_cache(templates: &Templates) {
         "Counting allocator off. {PUBLISHERS} resident publishers, default cache \
          capacity (256), uniform lookups over the hot set at {LOOKUP_RATE:.0}/s for \
          {}s. Every load apply is asserted to be an accepted Replace. Capacity misses \
-         = absent misses − distinct nodes looked up.\n",
+         = absent misses − distinct nodes looked up, which holds because a single \
+         thread looks up and nothing clears the cache.\n",
         RUN.as_secs()
     );
     println!(

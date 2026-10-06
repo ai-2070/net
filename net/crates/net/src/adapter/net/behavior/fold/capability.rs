@@ -534,8 +534,9 @@ fn derive_synthetic_index_tags(payload: &CapabilityMembership) -> Vec<String> {
     out
 }
 
-/// Visit each index-only synthetic tag of `payload`, in the order
-/// [`derive_synthetic_index_tags`] returns them, building each key in
+/// Visit each index-only synthetic tag of `payload`, in a fixed order
+/// (the test-only `derive_synthetic_index_tags` collects it), building
+/// each key in
 /// `scratch` instead of allocating. Tags are read with
 /// [`axis_value_ref`](super::super::tag::axis_value_ref), the borrowing
 /// form of `Tag::parse`, so the accepted grammar is `Tag::parse`'s
@@ -635,12 +636,14 @@ impl FoldKind for CapabilityFold {
     type Query = CapabilityQuery;
     type Result = Vec<CapabilityMatch>;
     type Index = CapabilityIndexInner;
-    /// The same Fx mixer as the index's `(class, node)` sets (PERF_AUDIT
-    /// §4.6), so materialization's per-candidate `entries.get` stops
-    /// paying SipHash. The keys carry the same exposure the index sets
-    /// already accept: `node_id` is the publisher's routing id and
-    /// `class_hash` is publisher-declared.
-    type KeyHasher = BuildU64TupleHasher;
+    /// A keyed fast hasher. The key's `class_hash` is publisher-declared,
+    /// so an unkeyed mixer would let a publisher manufacture colliding
+    /// keys and turn this map's lookups into probe-chain scans.
+    /// `foldhash::fast::RandomState` seeds every map instance at random
+    /// and uses a folded multiply, so collisions cannot be built without
+    /// the receiver's seed, at near-Fx speed (it is hashbrown's default
+    /// hasher). Pinned by `capability_fold_primary_map_hasher_is_keyed`.
+    type KeyHasher = foldhash::fast::RandomState;
 
     fn key_for(node_id: NodeId, payload: &Self::Payload) -> Self::Key {
         (payload.class_hash, node_id)
@@ -1278,6 +1281,36 @@ pub fn reflex_addr_for(
 
 #[cfg(test)]
 mod tests {
+    /// The capability fold's primary map and reverse index must use a
+    /// keyed hasher: `class_hash` is publisher-declared, so an unkeyed one
+    /// lets a publisher build colliding keys (PR #1198 review). Two
+    /// independently built states must hash the same key differently;
+    /// an unkeyed hasher hashes it identically in both.
+    #[test]
+    fn capability_fold_primary_map_hasher_is_keyed() {
+        use std::hash::BuildHasher;
+        let a = FoldState::<CapabilityFold>::new();
+        let b = FoldState::<CapabilityFold>::new();
+        let keys: [(u64, NodeId); 4] = [(0, 1), (0x100, 0xA), (u64::MAX, 7), (42, 42)];
+        let differs = |x: &dyn Fn(&(u64, NodeId)) -> u64, y: &dyn Fn(&(u64, NodeId)) -> u64| {
+            keys.iter().any(|k| x(k) != y(k))
+        };
+        assert!(
+            differs(&|k| a.entries.hasher().hash_one(k), &|k| b
+                .entries
+                .hasher()
+                .hash_one(k)),
+            "entries hasher is not seeded per instance"
+        );
+        assert!(
+            differs(&|k| a.by_node.hasher().hash_one(k.1), &|k| b
+                .by_node
+                .hasher()
+                .hash_one(k.1)),
+            "by_node hasher is not seeded per instance"
+        );
+    }
+
     /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 4, kept permanently: the
     /// streaming resolver returns exactly the pre-Slice-4 resolver's
     /// key set over a filter matrix on a 10k fixture. The fixture has
