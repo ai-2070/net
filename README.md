@@ -354,7 +354,7 @@ behind every gap — is [binding coverage](https://github.com/ai-2070/net/blob/m
 
 ## WebRTC
 
-WebRTC is a supported transport here, not a bolt-on. A browser tab becomes a real mesh node — same
+Net natively supports WebRTC: a browser tab becomes a real mesh node — same
 identity, channels, and RPC as anything else — by connecting to a native **anchor**, a node built
 with the `webrtc` feature. Against the [binding coverage](#sdks) surface, a browser leaf gets:
 
