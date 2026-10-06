@@ -1,0 +1,46 @@
+net/crates/net/src/adapter/net/behavior/fold/metrics.rs
+  s_24d871c23f1085::t_407928c6d28520 261-271
+  s_24d871c23f1085::t_b3946bc0c38328 177-186
+  s_24d871c23f1085::t_228d9e16d79691 112-119
+net/crates/net/Cargo.toml
+  s_24d871c23f1085::t_29df5d5301e4c3 614-627
+net/crates/net/benches/fold_scale_report.rs
+  s_24d871c23f1085::t_645b4ea148f5c6 180,182,203-219,221,225,228
+  s_24d871c23f1085::t_a594120f803edb 37-39,426
+  s_24d871c23f1085::t_8e864b47f92153 253-256,339
+  s_24d871c23f1085::t_f096279f0fea6d 1-36,40-47,49,51-160,162-179,181,183-202,220,222-224,226-227,229-252,257-320,322-338,340-425,427-592,594-597,599-603,605-608,610-643
+  s_24d871c23f1085::t_d7e88b2e616c4c 48,50
+  s_24d871c23f1085::t_29df5d5301e4c3 161,321,593,598,604,609
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_24d871c23f1085::t_bf386e40fb708b 1355-1399
+net/crates/net/src/adapter/net/behavior/fold/expiry.rs
+  s_24d871c23f1085::t_45083553981856 80-81,84,88-90
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_24d871c23f1085::t_bf386e40fb708b 930,2984-3019
+  s_24d871c23f1085::t_2b55d179137c22 809-831,855-857,874,876-878,881-883,920-929
+  s_24d871c23f1085::t_dc90fdfb3daf86 931
+net/crates/net/benches/fold_scale_fixture/mod.rs
+  s_24d871c23f1085::t_8e864b47f92153 90-95
+  s_24d871c23f1085::t_1110eda4cf84bd 1-89,96-200
+net/crates/net/benches/fold_scale.rs
+  s_24d871c23f1085::t_b545defecb3de0 1-140,146-223
+  s_24d871c23f1085::t_8e864b47f92153 141-145
+docs/internal/plans/CAPABILITY_FOLD_SCALE_PLAN.md
+  s_24d871c23f1085::t_4342043ff7c9f7 27-169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b76cfb4456a297cf99b373ab7d2edaf96efb5710",
+  "prompts": {},
+  "sessions": {
+    "s_24d871c23f1085": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e35c8197-0611-44d8-b124-600af36bf427",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

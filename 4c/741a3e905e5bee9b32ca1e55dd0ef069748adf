@@ -1,0 +1,20 @@
+docs/internal/plans/CAPABILITY_FOLD_SCALE_PLAN.md
+  s_2aed1b57a020ab::t_22686166807946 1-64,66-79,81-93,95-113,115-132,134-141,143-145,147-345,347-394,396-425
+  s_2aed1b57a020ab::t_1bc51e3a3f4957 65,80,94,114,133,142,146,346,395
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4c741a3e905e5bee9b32ca1e55dd0ef069748adf",
+  "prompts": {},
+  "sessions": {
+    "s_2aed1b57a020ab": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c609a853-d117-4c0b-9075-be555fb3bf57",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
