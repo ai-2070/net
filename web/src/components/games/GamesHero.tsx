@@ -363,10 +363,7 @@ export function GamesHero() {
             NEW
           </span>
           <span className="text-accent border border-accent-dim px-2 py-[3px]">
-            NET FOR GAMES
-          </span>
-          <span className="text-ink-dim">
-            ANY ENGINE · PLUG AND PLAY FOR THREE.JS
+            PLUG AND PLAY FOR THREE.JS
           </span>
         </div>
 
@@ -380,14 +377,13 @@ export function GamesHero() {
         </h1>
 
         <p className="font-sans text-[20px] md:text-[22px] text-ink max-w-[620px] leading-[1.45]">
-          Multiplayer for any game engine. Plug and play for Three.js: turn any
-          Three.js game into co-op, multiplayer or an MMO, even one an AI just
-          wrote for you.
+          Plug and play support for Three.js: turn any
+          Three.js game into a multiplayer, co-op, or an MMO.
         </p>
 
         <p className="font-sans text-[15px] text-ink-dim mt-4 max-w-[580px] leading-[1.6]">
-          One player hosts, everyone else joins. Players connect straight to
-          each other, so there is no game server to rent and no trip to one.
+          Players connect straight to
+          each other, there is no game server in the middle.
           Free and open source.
         </p>
 
@@ -396,7 +392,7 @@ export function GamesHero() {
             href="#demo"
             className="btn-primary game-btn inline-flex items-center gap-2.5 px-6 py-3.5 text-[12px] tracking-[0.14em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all"
           >
-            ▶ Play the demo
+            ▶ See the demos
           </a>
           <Link
             href="/docs/sdk/browser/quickstart"
