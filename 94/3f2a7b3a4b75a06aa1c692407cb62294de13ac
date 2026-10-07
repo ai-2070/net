@@ -1,0 +1,28 @@
+net/crates/net/cli/src/commands/anchor.rs
+  s_d8b00bedd146e9::t_ff4297b97cebdb 986-988
+  s_d8b00bedd146e9::t_3b18097ca13633 1531-1533,1574-1582,1584-1586,1591-1603
+net/crates/net/sdk/src/rtc_bootstrap.rs
+  s_d8b00bedd146e9::t_7fbcf62fcf251e 1900-1909,1911-1912
+net/crates/net/sdk/tests/rtc_bootstrap_listener.rs
+  s_d8b00bedd146e9::t_2e2a25742fcfbb 2640-2643
+net/crates/net/src/adapter/net/rtc/engine.rs
+  s_d8b00bedd146e9::t_776deb5c2e7d0d 241-257
+web/src/content/docs/reference/cli.md
+  s_d8b00bedd146e9::t_bd72f3b2643a15 184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "943f2a7b3a4b75a06aa1c692407cb62294de13ac",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
