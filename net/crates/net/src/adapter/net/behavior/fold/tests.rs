@@ -70,6 +70,7 @@ impl FoldKind for CapFold {
     type Query = CapQuery;
     type Result = Vec<(u64, NodeId)>;
     type Index = CapIndex;
+    type KeyHasher = std::collections::hash_map::RandomState;
 
     fn key_for(node_id: NodeId, payload: &CapPayload) -> Self::Key {
         (payload.class_hash, node_id)
@@ -492,6 +493,7 @@ impl FoldKind for RoutingTestFold {
     type Query = NodeId;
     type Result = Option<RoutePayload>;
     type Index = NoIndex;
+    type KeyHasher = std::collections::hash_map::RandomState;
 
     fn key_for(_node_id: NodeId, payload: &RoutePayload) -> NodeId {
         payload.destination
@@ -1352,6 +1354,207 @@ fn sweep_evicts_across_multiple_chunks_when_count_exceeds_chunk_size() {
     assert_eq!(fold.metrics().expiries(), N);
 }
 
+#[test]
+fn sweep_metrics_count_walks_and_yielded_entries() {
+    // Pins the counters CAPABILITY_FOLD_SCALE_PLAN.md's Slice 0
+    // reports. Since Slice 2 a sweep makes ONE walk that yields every
+    // entry once, however many eviction chunks follow it.
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    const LIVE: u64 = 100;
+    const EXPIRED: u64 = 1500; // > SWEEP_CHUNK_SIZE: two eviction chunks
+    for i in 0..LIVE {
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 3600, vec!["t"]))
+            .expect("apply live");
+    }
+
+    assert_eq!(fold.sweep_expired_now(), 0);
+    assert_eq!(fold.metrics().sweep_walks(), 1, "empty sweep: one walk");
+    assert_eq!(
+        fold.metrics().sweep_yielded(),
+        LIVE,
+        "empty sweep yields every entry once"
+    );
+
+    for i in LIVE..LIVE + EXPIRED {
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 0, vec!["t"]))
+            .expect("apply expiring");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let walks_before = fold.metrics().sweep_walks();
+    let yielded_before = fold.metrics().sweep_yielded();
+    assert_eq!(fold.sweep_expired_now(), EXPIRED as usize);
+    assert_eq!(
+        fold.metrics().sweep_walks() - walks_before,
+        1,
+        "one walk, then two eviction chunks"
+    );
+    assert_eq!(
+        fold.metrics().sweep_yielded() - yielded_before,
+        LIVE + EXPIRED,
+        "every entry yielded exactly once"
+    );
+}
+
+/// CAPABILITY_FOLD_SCALE_PLAN.md Slice 2 witness. A mass expiry
+/// yields at most the entry count captured BEFORE the sweep (not
+/// `entries.len()` after it, which the eviction has shrunk). Two
+/// eviction chunks are enough to discriminate: the old
+/// restart-per-chunk walk yielded ~48k entries here (two partial walks
+/// plus the final empty walk) against 20k present.
+#[test]
+fn mass_expiry_yields_each_entry_once() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    const N: u64 = 20_000; // 2,000 expired: two eviction chunks
+    for i in 0..N {
+        // Every 10th entry expires at once; the rest stay live.
+        let ttl = if i % 10 == 0 { 0 } else { 3600 };
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, ttl, vec!["t"]))
+            .expect("apply");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    let pre_sweep = fold.with_state(|s| s.entries.len()) as u64;
+    let walks_before = fold.metrics().sweep_walks();
+    let yielded_before = fold.metrics().sweep_yielded();
+    let evicted = fold.sweep_expired_now();
+
+    assert_eq!(
+        evicted as u64,
+        N / 10,
+        "exact eviction of the expired tenth"
+    );
+    assert_eq!(fold.metrics().entries(), N - N / 10);
+    assert_eq!(fold.metrics().sweep_walks() - walks_before, 1);
+    let yielded = fold.metrics().sweep_yielded() - yielded_before;
+    assert!(
+        yielded <= pre_sweep,
+        "yielded {yielded} entries, more than the {pre_sweep} present before the sweep"
+    );
+}
+
+/// The per-key re-check survives the split into a collection walk
+/// and chunked eviction. An entry refreshed AFTER the walk collected
+/// it must not be evicted, and an entry evicted by `evict_node` in
+/// between must not be double-removed or counted.
+#[test]
+fn sweep_rechecks_entries_refreshed_or_removed_after_collection() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    for node in [0xA, 0xB, 0xC] {
+        fold.apply(sign_cap_ann_with_ttl(&kp, node, 0x100, 1, 0, vec!["t"]))
+            .expect("apply expiring");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    let now = std::time::Instant::now();
+    let collected = expiry::collect_expired_segment(&fold.state, 0, usize::MAX, now).expired;
+    assert_eq!(collected.len(), 3, "the walk collects all three");
+
+    // Between collection and eviction: A is refreshed with a long TTL,
+    // B is evicted by the operator path. C is untouched.
+    fold.apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 2, 3600, vec!["t"]))
+        .expect("refresh A");
+    fold.evict_node(0xB, "test");
+
+    let evicted = expiry::evict_chunk(
+        &fold.state,
+        &fold.index,
+        &fold.metrics,
+        None,
+        &collected,
+        now,
+    );
+    assert_eq!(evicted, 1, "only C is still present and expired");
+    fold.with_state(|s| {
+        assert!(s.by_node.contains_key(&0xA), "refreshed A survives");
+        assert!(!s.by_node.contains_key(&0xB));
+        assert!(!s.by_node.contains_key(&0xC));
+    });
+    assert_eq!(fold.metrics().expiries(), 1);
+    assert_eq!(fold.metrics().entries(), 1);
+}
+
+/// The walk runs in segments, releasing the state lock between them,
+/// yet still examines each entry exactly once: the resume point is
+/// reduced by what the previous segments evicted, since each eviction
+/// took one occupied slot out of the walked prefix. A resume that
+/// ignored evictions would skip survivors (fewer examined, expired
+/// entries left behind); one that re-walked would count them twice.
+#[test]
+fn segmented_sweep_examines_each_entry_once_and_evicts_every_expired_one() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    const N: u64 = 1000;
+    for i in 0..N {
+        // Every third entry expires at once; the rest stay live.
+        let ttl = if i % 3 == 0 { 0 } else { 3600 };
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, ttl, vec!["t"]))
+            .expect("apply");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let expired = (0..N).filter(|i| i % 3 == 0).count();
+
+    let walks_before = fold.metrics().sweep_walks();
+    let yielded_before = fold.metrics().sweep_yielded();
+    // 64-entry segments: sixteen segments over 1,000 entries.
+    let evicted =
+        expiry::sweep_expired_in_segments(&fold.state, &fold.index, &fold.metrics, None, 64);
+
+    assert_eq!(evicted, expired, "every expired entry evicted");
+    assert_eq!(fold.metrics().entries(), N - expired as u64);
+    assert_eq!(
+        fold.metrics().sweep_walks() - walks_before,
+        1,
+        "one logical walk"
+    );
+    assert_eq!(
+        fold.metrics().sweep_yielded() - yielded_before,
+        N,
+        "each entry examined exactly once across segments"
+    );
+    let now = std::time::Instant::now();
+    fold.with_state(|s| {
+        assert!(
+            s.entries.values().all(|e| e.expires_at > now),
+            "no expired entry survives the sweep"
+        );
+    });
+}
+
+/// A same-owner Replace re-lists the key in the publisher's record, so
+/// a refresh repairs a reverse index that lost it. Without the repair
+/// the entry is unreachable by `evict_node` and its publisher reads as
+/// absent (revision 0) forever, which a revision-keyed cache would take
+/// as "nothing changed".
+#[test]
+fn same_owner_refresh_repairs_a_missing_reverse_index_record() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    fold.apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 1, 3600, vec!["t"]))
+        .expect("apply");
+    // Drift: the record is gone while the entry stays.
+    fold.state.write().by_node.remove(&0xA);
+    assert_eq!(fold.with_state(|s| s.publisher_rev(0xA)), 0);
+
+    let out = fold
+        .apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 2, 3600, vec!["t"]))
+        .expect("refresh");
+    assert_eq!(out, ApplyOutcome::Replaced);
+    fold.with_state(|s| {
+        assert_eq!(s.keys_for(0xA).map(<[_]>::len), Some(1), "key re-listed");
+        assert!(s.publisher_rev(0xA) > 0, "publisher present again");
+    });
+
+    fold.evict_node(0xA, "test");
+    assert_eq!(
+        fold.with_state(|s| s.entries.len()),
+        0,
+        "eviction reaches it"
+    );
+}
+
 /// Audit-emitting `FoldKind` shim: identical to `CapFold` but
 /// `audit_event` returns `Some(AuditEvent)` for every transition.
 /// Audit emission is opt-in via the trait so folds that don't
@@ -1367,6 +1570,7 @@ impl FoldKind for AuditingCapFold {
     type Query = CapQuery;
     type Result = Vec<(u64, NodeId)>;
     type Index = NoIndex;
+    type KeyHasher = std::collections::hash_map::RandomState;
 
     fn key_for(node_id: NodeId, payload: &CapPayload) -> Self::Key {
         (payload.class_hash, node_id)
@@ -1668,11 +1872,39 @@ fn fold_stats_round_trips_through_serde_json() {
         queries: 7,
         snapshots_taken: 1,
         snapshots_restored: 0,
+        sweep_walks: 4,
+        sweep_yielded: 40,
         has_audit_sink: true,
     };
     let json = serde_json::to_string(&stats).expect("serialize");
     let parsed: FoldStats = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(parsed, stats);
+}
+
+/// The sweep counters reach the operator surface (`FoldStats`), not
+/// only the in-process `FoldMetrics` accessors, and JSON written
+/// before they existed still parses.
+#[test]
+fn fold_stats_carry_the_sweep_counters() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    for i in 0..5 {
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 3600, vec!["t"]))
+            .expect("apply");
+    }
+    fold.sweep_expired_now();
+    fold.sweep_expired_now();
+    let stats = fold.stats();
+    assert_eq!(stats.sweep_walks, 2);
+    assert_eq!(stats.sweep_yielded, 10);
+
+    let mut legacy = serde_json::to_value(&stats).expect("serialize");
+    let obj = legacy.as_object_mut().expect("object");
+    obj.remove("sweep_walks");
+    obj.remove("sweep_yielded");
+    let parsed: FoldStats = serde_json::from_value(legacy).expect("legacy JSON parses");
+    assert_eq!(parsed.sweep_walks, 0);
+    assert_eq!(parsed.sweep_yielded, 0);
 }
 
 #[test]
@@ -1854,6 +2086,7 @@ impl FoldKind for CountingFold {
     type Query = ();
     type Result = usize;
     type Index = NoIndex;
+    type KeyHasher = std::collections::hash_map::RandomState;
 
     fn key_for(_node_id: NodeId, payload: &CountingPayload) -> u64 {
         payload.id

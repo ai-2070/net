@@ -483,7 +483,7 @@ pub(crate) fn recheck_projected_owner_floor(
 /// one-publisher-one-value shape).
 pub fn owner_org_for(fold: &Fold<CapabilityFold>, node_id: NodeId) -> Option<OrgId> {
     fold.with_state(|state| {
-        let keys = state.by_node.get(&node_id)?;
+        let keys = state.keys_for(node_id)?;
         keys.iter().find_map(|key| {
             state
                 .entries
@@ -573,7 +573,7 @@ pub fn public_owned_providers(fold: &Fold<CapabilityFold>, tag: &str) -> Vec<Own
         // carries a projection at all.
         let mut out: Vec<OwnedPublisher> = Vec::with_capacity(publishers.len());
         for node_id in publishers {
-            let Some(keys) = state.by_node.get(&node_id) else {
+            let Some(keys) = state.keys_for(node_id) else {
                 continue;
             };
             let mut agreed: Option<VerifiedOwner> = None;
@@ -639,7 +639,7 @@ pub fn retract_floored_ownership(
     floor: u32,
 ) -> usize {
     let node_id = member.node_id();
-    // §14: probe under a SHARED read first. `with_state_mut` takes an
+    // §14: probe under a SHARED read first. `update_payloads` takes an
     // exclusive write lock unconditionally, before it even checks whether this
     // node has any entries — and the install sweep calls this once per floor
     // in the persisted state, the overwhelming majority of which retract
@@ -655,23 +655,15 @@ pub fn retract_floored_ownership(
     if fold.with_state(|state| !state.by_node.contains_key(&node_id)) {
         return 0;
     }
-    let retracted = fold.with_state_mut(|state| {
-        let Some(keys) = state.by_node.get(&node_id) else {
-            return 0;
-        };
-        let keys: Vec<_> = keys.iter().copied().collect();
-        let mut retracted = 0;
-        for key in keys {
-            if let Some(entry) = state.entries.get_mut(&key) {
-                if let Some(owner) = entry.payload.owner {
-                    if owner.org() == org && owner.generation() < floor {
-                        entry.payload.owner = None;
-                        retracted += 1;
-                    }
-                }
-            }
+    // Advances the publisher's revision when anything is retracted, so
+    // a `CapabilitySetCache` entry for it misses even though synthesis
+    // reads no owner today.
+    let retracted = fold.update_payloads(node_id, |payload| match payload.owner {
+        Some(owner) if owner.org() == org && owner.generation() < floor => {
+            payload.owner = None;
+            true
         }
-        retracted
+        _ => false,
     });
     if retracted > 0 {
         // §15: on the AUDIT plane, not only `tracing`. This is the one
@@ -753,7 +745,7 @@ pub(crate) fn synthesize_capability_set_in_state(
     state: &FoldState<CapabilityFold>,
     node_id: NodeId,
 ) -> Option<super::super::capability::CapabilitySet> {
-    let keys = state.by_node.get(&node_id)?;
+    let keys = state.keys_for(node_id)?;
     let mut caps = super::super::capability::CapabilitySet::new();
     for k in keys {
         let Some(entry) = state.entries.get(k) else {
@@ -777,40 +769,131 @@ pub(crate) fn synthesize_capability_set_in_state(
 const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
 
 /// Bounded LRU cache of synthesized `Arc<CapabilitySet>` per node,
-/// invalidated by the fold's change-generation
-/// ([`Fold::change_generation`]). Eliminates the multi-µs
-/// re-parse + re-allocate that `synthesize_capability_set` does
-/// per call on the hot paths (per-packet greedy admission at
-/// mesh.rs:5181, per-candidate `placement_score`, per-call
+/// validated per publisher. Eliminates the multi-µs re-parse +
+/// re-allocate that `synthesize_capability_set` does per call on the
+/// cached consumers (per-packet greedy admission, per-call
 /// `may_execute` retain loops). Per
 /// PERF_AUDIT_2026_06_10_FULL_CRATE.md §4.1.
 ///
-/// `best_node_matching` deliberately does NOT come through here:
-/// a cache lookup re-enters the fold for its generation stamp, and
-/// that path synthesizes inside the snapshot that admitted its
-/// candidates. It pays the synthesis per candidate to keep
-/// membership and capabilities on one fold state — and pays it
-/// while holding both read guards, so fold writers queue behind it.
-/// See `candidates_for_selection` for why that is the accepted trade
-/// there and what would make it stop being one.
+/// Two consumers deliberately do NOT come through here.
+/// `StandardPlacement::placement_score` calls the uncached
+/// [`synthesize_capability_set_if_known`]. `best_node_matching`
+/// synthesizes inside the snapshot that admitted its candidates, to
+/// keep membership and capabilities on one fold state, and a cache
+/// lookup would re-enter the fold from an already-held snapshot. See
+/// `candidates_for_selection` for why that is the accepted trade.
 ///
-/// The generation is global to the fold — any fold change
-/// invalidates every cached entry. That's coarse but accurate:
-/// announcement rates are low relative to scoring/per-packet
-/// rates, so the cache stays warm in steady state. On a generation
-/// bump the next access re-synthesizes and re-caches under the new
-/// generation; entries for other nodes return stale results once,
-/// triggering their own re-synthesize on access.
+/// # Validity
 ///
-/// Cache hits return a refcount-bumped `Arc` (~ns); misses pay the
-/// existing `synthesize_capability_set` cost plus one Arc alloc.
+/// An entry is valid while its publisher's mutation revision
+/// ([`FoldState::publisher_rev`]) is unchanged. The revision advances
+/// on every change to the publisher's own entries (insert or replace
+/// of any class, removal of any class, eviction), so a cached set
+/// survives every OTHER publisher's announcements and misses once
+/// after its own publisher's. It replaced a fold-wide change
+/// generation, which every announcement in the fleet moved: at
+/// thousands of announcements per second that invalidated the whole
+/// cache continuously (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 1).
+///
+/// The revision covers in-place payload updates too: an ownership
+/// projection retraction goes through `Fold::update_payloads`, which
+/// advances it, so a cached set can never outlive any change to its
+/// publisher's payloads, including fields synthesis does not read today.
+///
+/// An absent publisher reads as revision `0` and synthesizes the
+/// empty set, so an entry cached for an absent node stays correct for
+/// as long as the node is absent. Revisions come from one fold-wide
+/// counter that a restore does not reset, so a publisher that leaves
+/// and returns, or is restored from a snapshot, gets a revision no
+/// cached entry carries.
+///
+/// Entries record which [`Fold`] they came from and validate against
+/// the publisher's record itself, not just its revision number, which
+/// is only unique within one fold. A cache used with several folds, or
+/// kept past its fold, misses rather than serve another fold's set.
+///
+/// Capacity is fixed at construction. Hot sets larger than the
+/// capacity lose lookups to LRU eviction, which validity does not
+/// change: see [`CapabilitySetCacheStats`].
+///
+/// A hit for a present publisher returns a refcount-bumped `Arc` after
+/// one cache mutex and one atomic load, WITHOUT the fold's state lock
+/// (see [`Self::get_or_synthesize`]), so the per-packet path does not
+/// queue behind apply or expiry-sweep write holds. Misses, and lookups
+/// of absent publishers, take the fold read lock and pay the
+/// `synthesize_capability_set` cost plus one Arc alloc.
 pub struct CapabilitySetCache {
     inner: parking_lot::Mutex<lru::LruCache<NodeId, CachedCapabilitySetEntry>>,
+    hits: std::sync::atomic::AtomicU64,
+    stale_misses: std::sync::atomic::AtomicU64,
+    absent_misses: std::sync::atomic::AtomicU64,
+}
+
+/// Lookup outcome counters for a [`CapabilitySetCache`], from
+/// [`CapabilitySetCache::stats`].
+///
+/// The two miss kinds have different causes. A *stale* miss found an
+/// entry for the node but at an older revision of that node: a
+/// coherence miss, caused by a change to the node's own entries since
+/// it was cached. An *absent* miss found no entry: the node's first
+/// lookup, a capacity eviction, a lookup after [`CapabilitySetCache::clear`],
+/// or a racing lookup of a node another caller is still populating.
+/// The cache cannot tell these apart. Only over a single-threaded
+/// interval with no `clear()` can a caller that knows how many distinct
+/// nodes it looked up derive capacity evictions, as absent misses minus
+/// distinct nodes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CapabilitySetCacheStats {
+    /// Lookups served from the cache.
+    pub hits: u64,
+    /// Lookups that found an entry at an older revision of the node.
+    pub stale_misses: u64,
+    /// Lookups that found no entry for the node.
+    pub absent_misses: u64,
 }
 
 struct CachedCapabilitySetEntry {
-    generation: u64,
+    /// [`Fold::instance_id`] of the fold the entry was synthesized from.
+    /// An entry from any other fold is a miss, on both paths.
+    fold: u64,
+    rev: u64,
+    /// Lock-free handle on the publisher record's revision, `None` for
+    /// an entry cached while the publisher was absent (revision `0`).
+    /// Such entries are validated under the fold read lock instead.
+    handle: Option<super::state::PublisherRevision>,
     caps: std::sync::Arc<super::super::capability::CapabilitySet>,
+}
+
+impl CachedCapabilitySetEntry {
+    /// Valid without the fold lock: the entry came from `fold`, and the
+    /// publisher record it was cached against still exists and has not
+    /// moved its revision.
+    fn valid_lock_free(&self, fold: u64) -> bool {
+        self.fold == fold
+            && self
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.current() == Some(self.rev))
+    }
+
+    /// Valid against the publisher's current record, read under the
+    /// fold lock: either the publisher was absent then and is absent
+    /// now (the empty set is still right), or it is the SAME record at
+    /// the same revision. Comparing records and not bare revision
+    /// numbers keeps a cache that outlives its fold, or is shared with
+    /// another, from accepting a number the other fold issued.
+    fn valid_against(&self, fold: u64, current: Option<&super::state::PublisherRevision>) -> bool {
+        if self.fold != fold {
+            return false;
+        }
+        match (&self.handle, current) {
+            (None, None) => true,
+            (Some(cached), Some(current)) => {
+                cached.same_record(current) && current.current() == Some(self.rev)
+            }
+            _ => false,
+        }
+    }
 }
 
 impl CapabilitySetCache {
@@ -829,62 +912,105 @@ impl CapabilitySetCache {
             std::num::NonZeroUsize::new(capacity.max(1)).unwrap_or(std::num::NonZeroUsize::MIN);
         Self {
             inner: parking_lot::Mutex::new(lru::LruCache::new(cap)),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            stale_misses: std::sync::atomic::AtomicU64::new(0),
+            absent_misses: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Return a refcount-shareable snapshot of `node_id`'s
-    /// capability set against the current fold generation. Cache
-    /// hit returns an `Arc::clone`; miss re-synthesizes via
-    /// [`synthesize_capability_set`] and stores against the
-    /// fold's current generation before returning.
+    /// Return a refcount-shareable snapshot of `node_id`'s capability
+    /// set as of the current fold state. A hit returns an
+    /// `Arc::clone`; a miss synthesizes and caches against the node's
+    /// revision.
+    ///
+    /// # Hit without the fold lock
+    ///
+    /// The first check reads the entry's
+    /// [`PublisherRevision`](super::state::PublisherRevision)
+    /// handle, an atomic the fold's writers store to while they hold
+    /// the state write lock. It matches only while the record the
+    /// entry was cached against still exists at the cached revision, so
+    /// a hit here is exactly a hit the locked check below would also
+    /// score; a write that is still in flight is ordered after it. Any
+    /// mismatch falls through to the locked path.
+    ///
+    /// # Locked path
+    ///
+    /// Everything runs inside ONE fold read borrow: the revision read,
+    /// the validity check, and on a miss the synthesis and the store.
+    /// No writer can change the node's entries inside that borrow, so
+    /// the set stored is exactly the state the stored revision names,
+    /// and a hit can never serve a set from before a mutation the
+    /// same borrow observed. A concurrent apply that lands after the
+    /// borrow advances the revision, and the next lookup misses once.
+    /// Racing misses cannot store revisions out of order: a writer
+    /// needs every read borrow released, so two misses whose borrows
+    /// overlap read the same revision, and two that do not are
+    /// separated by any write between them. Synthesis runs outside the
+    /// cache mutex so a slow synthesize does not serialize other
+    /// callers' hits.
     pub fn get_or_synthesize(
         &self,
         fold: &Fold<CapabilityFold>,
         node_id: NodeId,
     ) -> std::sync::Arc<super::super::capability::CapabilitySet> {
-        let current_gen = fold.change_generation();
-        // Fast path — cache hit at the current generation.
+        use std::sync::atomic::Ordering::Relaxed;
+        let fold_id = fold.instance_id();
         {
             let mut lru = self.inner.lock();
             if let Some(entry) = lru.get(&node_id) {
-                if entry.generation == current_gen {
+                if entry.valid_lock_free(fold_id) {
+                    self.hits.fetch_add(1, Relaxed);
                     return entry.caps.clone();
                 }
             }
         }
-        // Miss / stale. Synthesize outside the cache lock so we
-        // don't serialize callers on a long synthesize (the fold's
-        // own read lock still serializes the with_state body, but
-        // that's much cheaper).
-        let caps = std::sync::Arc::new(synthesize_capability_set(fold, node_id));
-        // Store against the generation captured BEFORE synthesize
-        // (`current_gen`). The fold bumps its generation under the
-        // state write lock AFTER mutating, so a set synthesized
-        // after we read gen G reflects state at gen >= G; if a
-        // concurrent apply/evict ran during synthesize the live
-        // generation is already > G and the entry misses on the
-        // next access (one wasted re-synthesize, never a stale
-        // hit). Stamping the generation read AFTER synthesize
-        // would invert that: a set built from pre-change state
-        // could be stored under the post-change generation and
-        // served stale until the next unrelated fold mutation.
-        {
-            let mut lru = self.inner.lock();
-            lru.put(
+        fold.with_state(|state| {
+            let handle = state.publisher_revision(node_id);
+            let rev = handle.as_ref().and_then(|h| h.current()).unwrap_or(0);
+            {
+                let mut lru = self.inner.lock();
+                match lru.get(&node_id) {
+                    Some(entry) if entry.valid_against(fold_id, handle.as_ref()) => {
+                        self.hits.fetch_add(1, Relaxed);
+                        return entry.caps.clone();
+                    }
+                    Some(_) => self.stale_misses.fetch_add(1, Relaxed),
+                    None => self.absent_misses.fetch_add(1, Relaxed),
+                };
+            }
+            let caps = std::sync::Arc::new(
+                synthesize_capability_set_in_state(state, node_id).unwrap_or_default(),
+            );
+            self.inner.lock().put(
                 node_id,
                 CachedCapabilitySetEntry {
-                    generation: current_gen,
+                    fold: fold_id,
+                    rev,
+                    handle,
                     caps: caps.clone(),
                 },
             );
-        }
-        caps
+            caps
+        })
     }
 
     /// Drop every cached entry. Useful in tests; production code
-    /// relies on the change-generation invalidation.
+    /// relies on per-publisher revision validity.
     pub fn clear(&self) {
         self.inner.lock().clear();
+    }
+
+    /// Lookup outcome counters since construction. Relaxed loads,
+    /// so a snapshot taken during concurrent lookups may be off by
+    /// in-flight calls.
+    pub fn stats(&self) -> CapabilitySetCacheStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        CapabilitySetCacheStats {
+            hits: self.hits.load(Relaxed),
+            stale_misses: self.stale_misses.load(Relaxed),
+            absent_misses: self.absent_misses.load(Relaxed),
+        }
     }
 
     /// Number of currently-cached entries (any generation).
@@ -982,7 +1108,7 @@ pub fn may_admit(
     caller_node: NodeId,
 ) -> bool {
     fold.with_state(|state| {
-        let Some(keys) = state.by_node.get(&target_node) else {
+        let Some(keys) = state.keys_for(target_node) else {
             return false;
         };
         let mut target_carries_tag = false;
@@ -1036,7 +1162,7 @@ pub fn has_local_capability(
     capability_tag: &str,
 ) -> bool {
     fold.with_state(|state| {
-        let Some(keys) = state.by_node.get(&target_node) else {
+        let Some(keys) = state.keys_for(target_node) else {
             return false;
         };
         keys.iter().any(|k| {
@@ -1116,7 +1242,7 @@ fn derive_caller_axes(
     Option<super::super::subnet::SubnetId>,
     Vec<super::super::group::GroupId>,
 ) {
-    let Some(caller_keys) = state.by_node.get(&caller_node) else {
+    let Some(caller_keys) = state.keys_for(caller_node) else {
         return (None, Vec::new());
     };
     let mut subnet_candidates: Vec<super::super::subnet::SubnetId> = Vec::new();
@@ -1159,7 +1285,7 @@ fn may_execute_with_caller(
     caller_subnet: Option<&super::super::subnet::SubnetId>,
     caller_groups: &[super::super::group::GroupId],
 ) -> bool {
-    let Some(keys) = state.by_node.get(&target_node) else {
+    let Some(keys) = state.keys_for(target_node) else {
         return false;
     };
     let mut target_carries_tag = false;
@@ -1229,6 +1355,56 @@ pub fn effective_ttl_secs(ann: &CapabilityAnnouncement) -> u32 {
         .min(u64::from(ann.ttl_secs)) as u32
 }
 
+/// The payload's tag strings, its region, and the hardware projection,
+/// from ONE pass over `tags`, which may arrive in any order (the caller
+/// passes a `HashSet`, whose order is unspecified).
+///
+/// The hardware projection decodes only the hardware-axis subset, sorted:
+/// `hardware_from_tags` skips every other axis, and the tags are distinct,
+/// so the sorted subset decodes exactly like the full sorted set the
+/// `views()` path used. The sort is what makes the result independent of
+/// arrival order when two tags set the same field (last one wins);
+/// `translate_projection_is_independent_of_tag_order` pins it with a
+/// deterministic adversarial order.
+///
+/// Each tag renders into one reused scratch buffer and is stored as an
+/// exact-length copy. The stored strings live in the fold for the entry's
+/// lifetime, so they carry no spare capacity: rendering straight into a
+/// per-tag `String` left growth or pre-sizing slack resident in every
+/// payload (~620 B per entry on the bench fixture).
+fn project_tags<'a>(
+    tags: impl IntoIterator<Item = &'a super::super::tag::Tag>,
+) -> (
+    Vec<String>,
+    Option<String>,
+    super::super::capability::HardwareCapabilities,
+) {
+    let tags = tags.into_iter();
+    let mut rendered: Vec<String> = Vec::with_capacity(tags.size_hint().0);
+    let mut region: Option<String> = None;
+    let mut hardware_tags: Vec<super::super::tag::Tag> = Vec::new();
+    let mut scratch = String::new();
+    for tag in tags {
+        scratch.clear();
+        let _ = std::fmt::Write::write_fmt(&mut scratch, format_args!("{tag}"));
+        if region.is_none() {
+            if let Some(r) = scratch.strip_prefix("scope:region:") {
+                region = Some(r.to_owned());
+            }
+        }
+        rendered.push(scratch.as_str().to_owned());
+        if matches!(
+            tag.axis_key_ref(),
+            Some((super::super::tag::TaxonomyAxis::Hardware, _))
+        ) {
+            hardware_tags.push(tag.clone());
+        }
+    }
+    hardware_tags.sort_unstable();
+    let hardware = super::super::tag_codec::hardware_from_tags(&hardware_tags);
+    (rendered, region, hardware)
+}
+
 /// Translate a legacy [`CapabilityAnnouncement`] into a
 /// fold-shaped [`SignedAnnouncement<CapabilityMembership>`]
 /// suitable for [`Fold::apply`] dual-population during the
@@ -1256,8 +1432,7 @@ pub fn translate_announcement(
     ann: &CapabilityAnnouncement,
     verified_owner: Option<VerifiedOwner>,
 ) -> SignedAnnouncement<CapabilityMembership> {
-    let views = ann.capabilities.views();
-    let hw_view = views.hardware();
+    let (tags, region, hw_view) = project_tags(&ann.capabilities.tags);
     let primary_gpu = hw_view.gpu.as_ref();
     let gpu_count =
         (primary_gpu.is_some() as u8).saturating_add(hw_view.additional_gpus.len() as u8);
@@ -1283,16 +1458,6 @@ pub fn translate_announcement(
     } else {
         None
     };
-
-    let tags: Vec<String> = ann
-        .capabilities
-        .tags
-        .iter()
-        .map(|t| t.to_string())
-        .collect();
-    let region = tags
-        .iter()
-        .find_map(|t| t.strip_prefix("scope:region:").map(String::from));
 
     SignedAnnouncement::placeholder(
         CapabilityFold::KIND_ID,
@@ -1402,7 +1567,7 @@ pub fn target_matches_filter(
     legacy: &LegacyFilter,
 ) -> bool {
     fold.with_state(|state| {
-        let Some(keys) = state.by_node.get(&node_id) else {
+        let Some(keys) = state.keys_for(node_id) else {
             return false;
         };
         for key in keys {
@@ -2759,6 +2924,389 @@ mod tests {
         assert_eq!(hw.vram_gb, Some(80));
     }
 
+    /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 3 (pinned in review): an
+    /// accepted Replace from the same owner and key leaves the reverse
+    /// index's `keys` untouched, yet still advances the publisher
+    /// revision, so the cached set misses exactly once.
+    #[test]
+    fn same_key_replace_advances_rev_without_touching_membership() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(cache_member(&kp, 0xA, 0x100, 1, vec!["gpu"], None))
+            .expect("v1");
+        let cache = CapabilitySetCache::new();
+        let before = cache.get_or_synthesize(&fold, 0xA);
+        let (keys_before, rev_before) =
+            fold.with_state(|s| (s.keys_for(0xA).map(<[_]>::to_vec), s.publisher_rev(0xA)));
+
+        // Index-equivalent refresh, then index-changing replace. Each is
+        // checked on its own, so one case cannot mask the other: both
+        // must keep membership, advance the revision, and make the
+        // cached set miss exactly once.
+        let mut cached = before;
+        let mut rev_prev = rev_before;
+        for (case, (version, tags)) in [
+            ("index-equivalent", (2, vec!["gpu"])),
+            ("index-changing", (3, vec!["gpu", "cuda"])),
+        ] {
+            let misses_before = cache.stats().stale_misses;
+            fold.apply(cache_member(&kp, 0xA, 0x100, version, tags, None))
+                .expect("replace");
+            let (keys_now, rev_now) =
+                fold.with_state(|s| (s.keys_for(0xA).map(<[_]>::to_vec), s.publisher_rev(0xA)));
+            assert_eq!(keys_now, keys_before, "{case}: membership changed");
+            assert!(rev_now > rev_prev, "{case}: revision did not advance");
+            let now = cache.get_or_synthesize(&fold, 0xA);
+            assert!(!std::sync::Arc::ptr_eq(&cached, &now), "{case}: no miss");
+            assert_eq!(
+                cache.stats().stale_misses,
+                misses_before + 1,
+                "{case}: not one miss"
+            );
+            assert!(
+                std::sync::Arc::ptr_eq(&now, &cache.get_or_synthesize(&fold, 0xA)),
+                "{case}: no hit after the miss"
+            );
+            cached = now;
+            rev_prev = rev_now;
+        }
+        assert!(has_tag(&cached, "cuda"));
+    }
+
+    /// The pre-Slice-3 hardware summary, through the full sorted
+    /// `views()` projection. The single-pass translate must match it.
+    fn hardware_summary_via_views(ann: &CapabilityAnnouncement) -> Option<HardwareSummary> {
+        let views = ann.capabilities.views();
+        let hw_view = views.hardware();
+        let primary_gpu = hw_view.gpu.as_ref();
+        let gpu_count =
+            (primary_gpu.is_some() as u8).saturating_add(hw_view.additional_gpus.len() as u8);
+        let gpu_vendor = primary_gpu.map(|g| gpu_vendor_canonical(g.vendor).to_string());
+        let vram_gb = {
+            let mut total: u32 = 0;
+            if let Some(g) = primary_gpu {
+                total = total.saturating_add(g.vram_gb);
+            }
+            for g in &hw_view.additional_gpus {
+                total = total.saturating_add(g.vram_gb);
+            }
+            (gpu_count > 0).then_some(total)
+        };
+        let memory_gb = (hw_view.memory_gb > 0).then_some(hw_view.memory_gb);
+        (primary_gpu.is_some() || memory_gb.is_some()).then_some(HardwareSummary {
+            gpu_vendor,
+            gpu_count,
+            memory_gb,
+            vram_gb,
+        })
+    }
+
+    /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 3: the single-pass translate
+    /// (hardware decoded from the hardware-axis subset only) produces
+    /// the same hardware summary, tag set and region as the full
+    /// `views()` path.
+    ///
+    /// Decode order is observable only when two tags set the same
+    /// hardware field, so the raw fixtures carry conflicting
+    /// `memory_gb` and GPU vendor values, plus malformed numbers,
+    /// presence-only, unknown-subkey and colon-separated tags. Regions
+    /// come from `with_region_scope` (an `add_tag("scope:...")` is
+    /// dropped by `parse_user`) and from raw multiple / empty region
+    /// tags. The expected region is the first `scope:region:` tag in the
+    /// set's own iteration order, which is what production selects; no
+    /// lexicographic precedence is imposed.
+    ///
+    /// The codec does not encode `additional_gpus` (`hardware_to_tags`),
+    /// so a multi-GPU `HardwareCapabilities` reaches translation as its
+    /// primary GPU only; that shape is asserted, not a multi-GPU decode.
+    #[test]
+    fn single_pass_translate_matches_views_projection() {
+        use crate::adapter::net::behavior::capability::{
+            CapabilityAnnouncement, CapabilitySet, GpuInfo, GpuVendor as LegacyGpuVendor,
+            HardwareCapabilities,
+        };
+        use crate::adapter::net::behavior::tag::Tag;
+        use crate::adapter::net::identity::EntityId;
+
+        enum Region {
+            Absent,
+            Exact(&'static str),
+            OneOf(&'static [&'static str]),
+        }
+        let with_raw = |mut caps: CapabilitySet, raw: &[&str]| {
+            for t in raw {
+                caps.tags
+                    .insert(Tag::parse(t).expect("raw fixture tag parses"));
+            }
+            caps
+        };
+        let gpu = |vendor, vram| GpuInfo::new(vendor, "card", vram);
+        let fixtures: Vec<(&str, CapabilitySet, Region, Option<HardwareSummary>)> = vec![
+            ("empty", CapabilitySet::new(), Region::Absent, None),
+            (
+                "memory only",
+                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(128)),
+                Region::Absent,
+                Some(HardwareSummary {
+                    gpu_vendor: None,
+                    gpu_count: 0,
+                    memory_gb: Some(128),
+                    vram_gb: None,
+                }),
+            ),
+            (
+                // additional_gpus are not encoded: one GPU survives.
+                "multi-gpu builder (primary only)",
+                CapabilitySet::new().with_hardware(
+                    HardwareCapabilities::new()
+                        .with_cpu(16, 32)
+                        .with_memory(512)
+                        .with_gpu(gpu(LegacyGpuVendor::Nvidia, 80))
+                        .add_gpu(gpu(LegacyGpuVendor::Amd, 64)),
+                ),
+                Region::Absent,
+                Some(HardwareSummary {
+                    gpu_vendor: Some("nvidia".into()),
+                    gpu_count: 1,
+                    memory_gb: Some(512),
+                    vram_gb: Some(80),
+                }),
+            ),
+            (
+                "real region",
+                CapabilitySet::new()
+                    .with_hardware(
+                        HardwareCapabilities::new()
+                            .with_memory(64)
+                            .with_gpu(gpu(LegacyGpuVendor::Amd, 16)),
+                    )
+                    .add_tag("inference")
+                    .with_region_scope("eu-west"),
+                Region::Exact("eu-west"),
+                Some(HardwareSummary {
+                    gpu_vendor: Some("amd".into()),
+                    gpu_count: 1,
+                    memory_gb: Some(64),
+                    vram_gb: Some(16),
+                }),
+            ),
+            (
+                "multiple regions",
+                with_raw(
+                    CapabilitySet::new(),
+                    &[
+                        "scope:region:eu-west",
+                        "scope:region:us-east",
+                        "scope:region:ap-south",
+                    ],
+                ),
+                Region::OneOf(&["eu-west", "us-east", "ap-south"]),
+                None,
+            ),
+            (
+                "empty region",
+                with_raw(CapabilitySet::new(), &["scope:region:"]),
+                Region::Exact(""),
+                None,
+            ),
+            (
+                // Two values for the same field: the decoder's order
+                // decides which wins, in both paths.
+                "conflicting hardware",
+                with_raw(
+                    CapabilitySet::new(),
+                    &[
+                        "hardware.memory_gb=64",
+                        "hardware.memory_gb=128",
+                        "hardware.gpu",
+                        "hardware.gpu.vendor=nvidia",
+                        "hardware.gpu.vendor=amd",
+                        "hardware.gpu.vram_gb=24",
+                        "hardware.gpu.vram_gb=80",
+                    ],
+                ),
+                Region::Absent,
+                None,
+            ),
+            (
+                "malformed, presence-only, unknown, colon",
+                with_raw(
+                    CapabilitySet::new(),
+                    &[
+                        "hardware.memory_gb=abc",
+                        "hardware.memory_gb:96",
+                        "hardware.cpu_cores=",
+                        "hardware.gpu.vram_gb=lots",
+                        "hardware.gpu.vendor:intel",
+                        "hardware.frobnicator=7",
+                        "hardware.gpu.flux=1",
+                        "hardware.storage_gb",
+                    ],
+                ),
+                Region::Absent,
+                None,
+            ),
+        ];
+
+        for (i, (name, caps, region_shape, expected_hw)) in fixtures.into_iter().enumerate() {
+            let ann =
+                CapabilityAnnouncement::new(i as u64 + 1, EntityId::from_bytes([0u8; 32]), 1, caps);
+            let translated = translate_announcement(&ann, None);
+
+            assert_eq!(
+                translated.payload.hardware,
+                hardware_summary_via_views(&ann),
+                "hardware summary differs from the views() path for {name}"
+            );
+            if let Some(expected) = expected_hw {
+                assert_eq!(
+                    translated.payload.hardware,
+                    Some(expected),
+                    "unexpected decoded shape for {name}"
+                );
+            }
+
+            // Region: the first match in the set's iteration order,
+            // taken BEFORE any sorting.
+            let first_region = ann
+                .capabilities
+                .tags
+                .iter()
+                .map(|t| t.to_string())
+                .find_map(|t| t.strip_prefix("scope:region:").map(String::from));
+            assert_eq!(
+                translated.payload.region, first_region,
+                "region differs for {name}"
+            );
+            match region_shape {
+                Region::Absent => assert_eq!(translated.payload.region, None, "{name}"),
+                Region::Exact(r) => {
+                    assert_eq!(translated.payload.region.as_deref(), Some(r), "{name}")
+                }
+                Region::OneOf(rs) => {
+                    let got = translated.payload.region.as_deref().expect("a region");
+                    assert!(rs.contains(&got), "{name}: region {got:?} not among {rs:?}");
+                }
+            }
+
+            let mut expected_tags: Vec<String> = ann
+                .capabilities
+                .tags
+                .iter()
+                .map(|t| t.to_string())
+                .collect();
+            let mut got_tags = translated.payload.tags.clone();
+            expected_tags.sort();
+            got_tags.sort();
+            assert_eq!(got_tags, expected_tags, "tag set differs for {name}");
+        }
+    }
+
+    /// The payload's tag strings stay resident in the fold for the
+    /// entry's lifetime, so translate must store them without spare
+    /// capacity (PR #1198 review). Rendering straight into a pre-sized
+    /// or growing per-tag `String` left ~620 B of slack per entry on the
+    /// bench fixture.
+    #[test]
+    fn translate_stores_tags_without_spare_capacity() {
+        use crate::adapter::net::behavior::capability::{
+            CapabilityAnnouncement, CapabilitySet, GpuInfo, GpuVendor as LegacyGpuVendor,
+            HardwareCapabilities,
+        };
+        use crate::adapter::net::identity::EntityId;
+
+        let caps = CapabilitySet::new()
+            .with_hardware(
+                HardwareCapabilities::new()
+                    .with_cpu(16, 32)
+                    .with_memory(64)
+                    .with_gpu(GpuInfo::new(LegacyGpuVendor::Nvidia, "h100", 80)),
+            )
+            .add_tag("a")
+            .add_tag("inference")
+            .add_tag("a-rather-long-custom-tag-well-past-forty-eight-bytes-in-length")
+            .with_region_scope("eu-west");
+        let ann = CapabilityAnnouncement::new(1, EntityId::from_bytes([0u8; 32]), 1, caps);
+        let translated = translate_announcement(&ann, None);
+        assert!(
+            translated.payload.tags.len() > 5,
+            "fixture renders several tags"
+        );
+        for tag in &translated.payload.tags {
+            assert_eq!(
+                tag.capacity(),
+                tag.len(),
+                "tag {tag:?} carries spare capacity"
+            );
+        }
+        let region = translated.payload.region.as_ref().expect("a region");
+        assert_eq!(
+            region.capacity(),
+            region.len(),
+            "region carries spare capacity"
+        );
+    }
+
+    /// The hardware projection must not depend on tag arrival order
+    /// (Slice 3 review, S3-3). A `HashSet` fixture only USUALLY arrives
+    /// in a discriminating order, so with the sort removed it can still
+    /// pass. This drives `project_tags` with deterministic orders,
+    /// including the adversarial one, reverse-sorted, in which last-wins
+    /// decoding of the conflicting fields picks the opposite value of
+    /// every pair. The setup proves that order discriminates before
+    /// relying on it.
+    #[test]
+    fn translate_projection_is_independent_of_tag_order() {
+        use crate::adapter::net::behavior::tag::Tag;
+        use crate::adapter::net::behavior::tag_codec::hardware_from_tags;
+
+        let raw = [
+            "hardware.memory_gb=64",
+            "hardware.memory_gb=128",
+            "hardware.gpu",
+            "hardware.gpu.vendor=amd",
+            "hardware.gpu.vendor=nvidia",
+            "hardware.gpu.vram_gb=24",
+            "hardware.gpu.vram_gb=80",
+            "inference",
+            "scope:region:eu-west",
+        ];
+        let mut sorted: Vec<Tag> = raw.iter().map(|t| Tag::parse(t).expect("parses")).collect();
+        sorted.sort_unstable();
+        let canonical = hardware_from_tags(&sorted);
+        let reversed: Vec<Tag> = sorted.iter().rev().cloned().collect();
+
+        // Precondition: decoded WITHOUT sorting, the adversarial order
+        // gives a different projection. If it did not, the witness below
+        // could not detect a missing sort, so fail setup instead.
+        assert_ne!(
+            hardware_from_tags(&reversed),
+            canonical,
+            "fixture is not order-sensitive; the witness would be vacuous"
+        );
+
+        let rotated: Vec<Tag> = sorted
+            .iter()
+            .cycle()
+            .skip(3)
+            .take(sorted.len())
+            .cloned()
+            .collect();
+        for (name, order) in [
+            ("sorted", &sorted),
+            ("reversed", &reversed),
+            ("rotated", &rotated),
+        ] {
+            let (tags, region, hardware) = project_tags(order.iter());
+            assert_eq!(
+                hardware, canonical,
+                "hardware projection depends on order ({name})"
+            );
+            assert_eq!(tags.len(), raw.len(), "{name}");
+            assert_eq!(region.as_deref(), Some("eu-west"), "{name}");
+        }
+    }
+
     #[test]
     fn translate_announcement_promotes_version_zero_to_generation_one() {
         // The fold rejects generation == 0 (wire sentinel). The
@@ -2937,6 +3485,406 @@ mod tests {
             v2.tags.len() > v1_tag_count,
             "post-mutation cache miss must reflect the new tag set"
         );
+    }
+
+    /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 0 — the cache's outcome
+    /// counters tell an absent entry (first lookup or capacity
+    /// eviction) from a stale one (the node's own entries changed
+    /// since caching).
+    #[test]
+    fn capability_set_cache_stats_split_absent_and_stale_misses() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xCD, 0x100, vec!["gpu"], None))
+            .expect("apply CD");
+        let cache = CapabilitySetCache::new();
+
+        cache.get_or_synthesize(&fold, 0xCD);
+        cache.get_or_synthesize(&fold, 0xCD);
+        assert_eq!(
+            cache.stats(),
+            CapabilitySetCacheStats {
+                hits: 1,
+                stale_misses: 0,
+                absent_misses: 1,
+            }
+        );
+
+        fold.apply(cache_member(&kp, 0xCD, 0x100, 2, vec!["gpu", "cuda"], None))
+            .expect("replace CD");
+        cache.get_or_synthesize(&fold, 0xCD);
+        assert_eq!(
+            cache.stats(),
+            CapabilitySetCacheStats {
+                hits: 1,
+                stale_misses: 1,
+                absent_misses: 1,
+            }
+        );
+    }
+
+    // --- Slice 1: publisher-revision validity ---------------------
+    //
+    // CAPABILITY_FOLD_SCALE_PLAN.md Track D. The cache is valid per
+    // publisher: every lifecycle transition of a publisher's OWN
+    // entries must miss exactly once, and nothing else may.
+
+    /// A member announcement with an explicit version and TTL.
+    /// `Fold::apply` trusts its caller, so the TTL override after
+    /// signing is fine for these direct-apply tests.
+    fn cache_member(
+        kp: &EntityKeypair,
+        node_id: NodeId,
+        class: u64,
+        version: u64,
+        tags: Vec<&str>,
+        ttl_secs: Option<u32>,
+    ) -> SignedAnnouncement<CapabilityMembership> {
+        let mut ann = sign_member_owned(kp, node_id, class, version, tags, None);
+        ann.ttl_secs = ttl_secs;
+        ann
+    }
+
+    fn has_tag(caps: &crate::adapter::net::behavior::capability::CapabilitySet, tag: &str) -> bool {
+        caps.tags.iter().any(|t| t.to_string() == tag)
+    }
+
+    fn rev(fold: &Fold<CapabilityFold>, node: NodeId) -> u64 {
+        fold.with_state(|s| s.publisher_rev(node))
+    }
+
+    /// A hit for a present publisher does not take the fold's state
+    /// lock: the per-packet admission path calls this and must not queue
+    /// behind an apply or a sweep. The lookup runs while this thread
+    /// holds the state WRITE lock; if the hit took the read lock it
+    /// would block until the timeout.
+    #[test]
+    fn cache_hit_does_not_wait_for_a_fold_writer() {
+        let fold = std::sync::Arc::new(new_fold());
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("apply A");
+        let cache = std::sync::Arc::new(CapabilitySetCache::new());
+        let first = cache.get_or_synthesize(&fold, 0xA);
+
+        let writer = fold.state.write();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lookup = {
+            let (fold, cache) = (fold.clone(), cache.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(cache.get_or_synthesize(&fold, 0xA));
+            })
+        };
+        let got = rx.recv_timeout(Duration::from_secs(10));
+        drop(writer);
+        lookup.join().expect("lookup thread");
+        let got = got.expect("a hit must complete while a writer holds the fold");
+        assert!(std::sync::Arc::ptr_eq(&first, &got));
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    /// A cache used with two folds, or kept past one, never serves one
+    /// fold's set for the other. Revision numbers are per fold, so A's
+    /// first revision is the same number in both; only the fold id and
+    /// the record identity tell the entries apart.
+    #[test]
+    fn a_cache_never_serves_one_folds_set_for_another() {
+        let kp = EntityKeypair::generate();
+        let cache = CapabilitySetCache::new();
+        let x = new_fold();
+        x.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("X");
+        let y = new_fold();
+        y.apply(sign_member(&kp, 0xA, 0x100, vec!["cpu"], None))
+            .expect("Y");
+        assert_eq!(rev(&x, 0xA), rev(&y, 0xA), "same number in both folds");
+
+        assert!(has_tag(&cache.get_or_synthesize(&x, 0xA), "gpu"));
+        let from_y = cache.get_or_synthesize(&y, 0xA);
+        assert!(
+            has_tag(&from_y, "cpu") && !has_tag(&from_y, "gpu"),
+            "both folds alive"
+        );
+
+        // Cache X's set again, then drop X.
+        assert!(has_tag(&cache.get_or_synthesize(&x, 0xA), "gpu"));
+        drop(x);
+        let after_drop = cache.get_or_synthesize(&y, 0xA);
+        assert!(
+            has_tag(&after_drop, "cpu") && !has_tag(&after_drop, "gpu"),
+            "the dropped fold's entry is not served for the live one"
+        );
+    }
+
+    /// Dropping a fold retires every outstanding revision handle: a
+    /// record that goes away with its state reads as gone, exactly like
+    /// one removed by eviction.
+    #[test]
+    fn dropping_a_fold_retires_its_publisher_revisions() {
+        let kp = EntityKeypair::generate();
+        let fold = new_fold();
+        fold.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("apply A");
+        let handle = fold
+            .with_state(|s| s.publisher_revision(0xA))
+            .expect("A present");
+        assert!(handle.current().is_some());
+        drop(fold);
+        assert_eq!(handle.current(), None);
+    }
+
+    /// The lock-free check never outlives the record it was cached
+    /// against: eviction, a return under a new record, and a restore
+    /// each make the next lookup miss and serve current state.
+    #[test]
+    fn lock_free_hit_misses_after_eviction_return_and_restore() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("apply A");
+        let cache = CapabilitySetCache::new();
+        let first = cache.get_or_synthesize(&fold, 0xA);
+        assert!(has_tag(&first, "gpu"));
+
+        fold.evict_node(0xA, "test");
+        let gone = cache.get_or_synthesize(&fold, 0xA);
+        assert!(gone.tags.is_empty(), "evicted publisher synthesizes empty");
+
+        fold.apply(cache_member(&kp, 0xA, 0x100, 1, vec!["cpu"], None))
+            .expect("A returns");
+        let back = cache.get_or_synthesize(&fold, 0xA);
+        assert!(has_tag(&back, "cpu") && !has_tag(&back, "gpu"));
+        let again = cache.get_or_synthesize(&fold, 0xA);
+        assert!(std::sync::Arc::ptr_eq(&back, &again));
+
+        fold.restore(fold.snapshot(), true).expect("restore");
+        let restored = cache.get_or_synthesize(&fold, 0xA);
+        assert!(
+            !std::sync::Arc::ptr_eq(&back, &restored),
+            "a restore retires every record the cache holds"
+        );
+        assert!(has_tag(&restored, "cpu"));
+    }
+
+    #[test]
+    fn cache_survives_other_publishers_announcements() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("apply A");
+        fold.apply(sign_member(&kp, 0xB, 0x100, vec!["cpu"], None))
+            .expect("apply B");
+        let cache = CapabilitySetCache::new();
+        let first = cache.get_or_synthesize(&fold, 0xA);
+
+        // B's refresh moves the fold's generation but not A's revision.
+        fold.apply(cache_member(&kp, 0xB, 0x100, 2, vec!["cpu"], None))
+            .expect("refresh B");
+        let after_b = cache.get_or_synthesize(&fold, 0xA);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &after_b),
+            "another publisher's announcement must not invalidate A"
+        );
+        assert_eq!(cache.stats().stale_misses, 0);
+
+        // A's own refresh misses once, then hits again.
+        fold.apply(cache_member(&kp, 0xA, 0x100, 2, vec!["gpu"], None))
+            .expect("refresh A");
+        let after_a = cache.get_or_synthesize(&fold, 0xA);
+        assert!(!std::sync::Arc::ptr_eq(&first, &after_a));
+        assert_eq!(cache.stats().stale_misses, 1);
+        let again = cache.get_or_synthesize(&fold, 0xA);
+        assert!(std::sync::Arc::ptr_eq(&after_a, &again));
+    }
+
+    #[test]
+    fn cache_misses_on_sibling_class_change() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(cache_member(&kp, 0xA, 0x1, 1, vec!["alpha"], None))
+            .expect("class 1");
+        fold.apply(cache_member(&kp, 0xA, 0x2, 1, vec!["beta"], None))
+            .expect("class 2");
+        let cache = CapabilitySetCache::new();
+        let before = cache.get_or_synthesize(&fold, 0xA);
+        assert!(has_tag(&before, "alpha") && has_tag(&before, "beta"));
+
+        // Change class 1 only; the cached set merges both classes.
+        fold.apply(cache_member(&kp, 0xA, 0x1, 2, vec!["gamma"], None))
+            .expect("replace class 1");
+        let after = cache.get_or_synthesize(&fold, 0xA);
+        assert!(has_tag(&after, "gamma") && has_tag(&after, "beta"));
+        assert!(!has_tag(&after, "alpha"), "served the pre-change set");
+    }
+
+    /// The counterexample a per-entry stamp fails: with classes
+    /// written at revisions 5 and 9, expiring the older one leaves
+    /// the maximum stamp at 9 while the merged set changes.
+    #[test]
+    fn cache_misses_on_older_sibling_expiry() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(cache_member(&kp, 0xA, 0x1, 1, vec!["old"], Some(0)))
+            .expect("expiring class, written first");
+        fold.apply(cache_member(&kp, 0xA, 0x2, 1, vec!["new"], Some(3600)))
+            .expect("live class, written second");
+        let cache = CapabilitySetCache::new();
+        let before = cache.get_or_synthesize(&fold, 0xA);
+        assert!(has_tag(&before, "old") && has_tag(&before, "new"));
+        let rev_before = rev(&fold, 0xA);
+
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(fold.sweep_expired_now(), 1, "only the older class expires");
+        assert!(
+            rev(&fold, 0xA) > rev_before,
+            "partial expiry advances the revision"
+        );
+        let after = cache.get_or_synthesize(&fold, 0xA);
+        assert!(has_tag(&after, "new"));
+        assert!(!has_tag(&after, "old"), "served the pre-expiry set");
+        assert_eq!(cache.stats().stale_misses, 1);
+    }
+
+    #[test]
+    fn cache_unknown_to_known() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let cache = CapabilitySetCache::new();
+        assert_eq!(
+            rev(&fold, 0xA),
+            0,
+            "an absent publisher reads as revision 0"
+        );
+        let absent = cache.get_or_synthesize(&fold, 0xA);
+        assert!(absent.tags.is_empty());
+        let absent_again = cache.get_or_synthesize(&fold, 0xA);
+        assert!(std::sync::Arc::ptr_eq(&absent, &absent_again));
+
+        fold.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("first announcement");
+        let known = cache.get_or_synthesize(&fold, 0xA);
+        assert!(has_tag(&known, "gpu"), "served the cached absent set");
+    }
+
+    #[test]
+    fn cache_misses_after_eviction_and_reannouncement() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("apply A");
+        let cache = CapabilitySetCache::new();
+        let first_rev = rev(&fold, 0xA);
+        assert!(has_tag(&cache.get_or_synthesize(&fold, 0xA), "gpu"));
+
+        fold.evict_node(0xA, "test");
+        assert_eq!(rev(&fold, 0xA), 0);
+        let evicted = cache.get_or_synthesize(&fold, 0xA);
+        assert!(evicted.tags.is_empty(), "served the pre-eviction set");
+
+        // Same version as before: the eviction removed the entry, so
+        // this is an Insert, and the revision must be new.
+        fold.apply(sign_member(&kp, 0xA, 0x100, vec!["cpu"], None))
+            .expect("reannounce A");
+        let second_rev = rev(&fold, 0xA);
+        assert!(
+            second_rev > first_rev,
+            "a returning publisher gets a fresh revision"
+        );
+        let back = cache.get_or_synthesize(&fold, 0xA);
+        assert!(has_tag(&back, "cpu") && !has_tag(&back, "gpu"));
+    }
+
+    #[test]
+    fn cache_misses_after_forced_restore() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("apply A");
+        let cache = CapabilitySetCache::new();
+        let before = cache.get_or_synthesize(&fold, 0xA);
+        let rev_before = rev(&fold, 0xA);
+
+        let snap = fold.snapshot();
+        fold.restore(snap, true).expect("forced restore");
+        assert!(
+            rev(&fold, 0xA) > rev_before,
+            "restore must allocate fresh revisions, not reuse old ones"
+        );
+        let after = cache.get_or_synthesize(&fold, 0xA);
+        assert!(
+            !std::sync::Arc::ptr_eq(&before, &after),
+            "the first lookup after a restore must miss"
+        );
+        assert!(has_tag(&after, "gpu"));
+    }
+
+    /// No lookup that starts after an apply returns may serve the
+    /// set from before that apply. The writer publishes the version
+    /// it has finished applying; every lookup reads that value first
+    /// and must see at least that version in the set it gets back.
+    #[test]
+    fn cache_concurrent_miss_populate_never_serves_stale() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        const ROUNDS: u64 = 2_000;
+
+        let fold = std::sync::Arc::new(new_fold());
+        let kp = std::sync::Arc::new(EntityKeypair::generate());
+        fold.apply(cache_member(&kp, 0xA, 0x100, 1, vec!["ver-1"], None))
+            .expect("seed");
+        let cache = std::sync::Arc::new(CapabilitySetCache::new());
+        let applied = std::sync::Arc::new(AtomicU64::new(1));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+
+        let version_in = |caps: &crate::adapter::net::behavior::capability::CapabilitySet| {
+            caps.tags
+                .iter()
+                .filter_map(|t| t.to_string().strip_prefix("ver-")?.parse::<u64>().ok())
+                .max()
+                .expect("a version tag")
+        };
+
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (fold, cache, applied, done) = (
+                    std::sync::Arc::clone(&fold),
+                    std::sync::Arc::clone(&cache),
+                    std::sync::Arc::clone(&applied),
+                    std::sync::Arc::clone(&done),
+                );
+                std::thread::spawn(move || {
+                    let mut lookups = 0u64;
+                    while !done.load(Ordering::Acquire) {
+                        let floor = applied.load(Ordering::Acquire);
+                        let caps = cache.get_or_synthesize(&fold, 0xA);
+                        let seen = version_in(&caps);
+                        assert!(
+                            seen >= floor,
+                            "served version {seen} after {floor} was applied"
+                        );
+                        lookups += 1;
+                    }
+                    lookups
+                })
+            })
+            .collect();
+
+        for version in 2..=ROUNDS {
+            let tag = format!("ver-{version}");
+            fold.apply(cache_member(
+                &kp,
+                0xA,
+                0x100,
+                version,
+                vec![tag.as_str()],
+                None,
+            ))
+            .expect("writer apply");
+            applied.store(version, Ordering::Release);
+        }
+        done.store(true, Ordering::Release);
+        let lookups: u64 = readers.into_iter().map(|r| r.join().expect("reader")).sum();
+        assert!(lookups > 0, "the readers ran");
+        assert_eq!(version_in(&cache.get_or_synthesize(&fold, 0xA)), ROUNDS);
     }
 
     /// PERF_AUDIT §4.1 — unknown node (no fold entry) returns an
@@ -3807,6 +4755,39 @@ mod tests {
         let retracted = retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5);
         assert_eq!(retracted, 0);
         assert_eq!(fold.change_generation(), before);
+    }
+
+    /// Retraction rewrites payloads in place, so it advances the
+    /// publisher's revision: a revision-keyed cache cannot serve a set
+    /// from before the rewrite, whatever fields synthesis reads. A
+    /// retraction that clears nothing leaves the revision alone.
+    #[test]
+    fn retraction_advances_the_publisher_revision() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let node_id = kp.entity_id().node_id();
+        let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
+            .expect("issue");
+        let ann = signed_announcement_with_cert(&kp, Some(cert));
+        apply_legacy_announcement(&fold, ann, None, 0).expect("apply");
+
+        let before = rev(&fold, node_id);
+        assert!(before > 0);
+        assert_eq!(
+            retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5),
+            1
+        );
+        assert!(
+            rev(&fold, node_id) > before,
+            "retraction advances the revision"
+        );
+
+        let before = rev(&fold, node_id);
+        assert_eq!(
+            retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5),
+            0
+        );
+        assert_eq!(rev(&fold, node_id), before, "a no-op retraction does not");
     }
 
     /// §15 — ownership retraction is recorded on the AUDIT plane.

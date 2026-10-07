@@ -134,7 +134,7 @@ where
     // generation, full tag union. Nothing else happens inside.
     let mut raw: Vec<(u64, u64, Vec<String>)> = fold.with_state(|state| {
         let mut out = Vec::new();
-        for (node_id, keys) in &state.by_node {
+        for (node_id, keys) in state.by_node.iter().map(|(n, r)| (n, r.keys())) {
             let mut generation: Option<u64> = None;
             let mut tags: BTreeSet<String> = BTreeSet::new();
             for key in keys {

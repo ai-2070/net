@@ -60,7 +60,7 @@ pub use routing::{RouteAnnouncement, RouteRow, RoutingFold, RoutingQuery};
 pub use snapshot::{FoldSnapshot, FoldSnapshotEntry};
 pub use state::{
     ApplyOutcome, BuildU64Hasher, EntryTransition, FoldEntry, FoldError, FoldIndex, FoldState,
-    FxU64Hasher, MergeAction, NoIndex, NodeId, NodeIdSet,
+    FxU64Hasher, MergeAction, NoIndex, NodeId, NodeIdSet, NodeRecord, PublisherRevision,
 };
 pub use wire::{EnvelopeMeta, SignedAnnouncement, WireError};
 
@@ -117,6 +117,18 @@ pub trait FoldKind: Send + Sync + Sized + 'static {
     /// Secondary index — [`NoIndex`] is the default for folds
     /// that don't maintain anything beyond the primary store.
     type Index: FoldIndex<Self>;
+
+    /// Hasher for this fold's primary map ([`FoldState::entries`]) and
+    /// reverse index ([`FoldState::by_node`]).
+    ///
+    /// Required, with no default: associated type defaults are unstable
+    /// on the pinned toolchain. Folds whose keys are not all digests use
+    /// `std::collections::hash_map::RandomState`, the keyed SipHash
+    /// default. A fold may choose a fast unkeyed hasher only if an
+    /// adversarial publisher cannot cheaply manufacture colliding keys,
+    /// or if that cost is accepted on purpose: an unkeyed hasher turns
+    /// chosen keys into chosen collisions.
+    type KeyHasher: std::hash::BuildHasher + Default + Send + Sync;
 
     /// Derive the indexing key from an announcement. The
     /// publisher's `node_id` is passed separately so folds
@@ -240,7 +252,17 @@ pub struct Fold<K: FoldKind> {
     /// expiry task holds a `Weak` and can signal reaps without
     /// keeping the fold alive.
     change_tx: Arc<watch::Sender<u64>>,
+    /// Process-unique identity of this fold instance, from
+    /// [`NEXT_FOLD_INSTANCE`]. Publisher revisions are numbered per fold,
+    /// so a consumer that caches against them (`CapabilitySetCache`)
+    /// records which fold an entry came from and never validates it
+    /// against another.
+    instance: u64,
 }
+
+/// Source of [`Fold`] instance ids. Starts at 1 and is never reused
+/// within a process.
+static NEXT_FOLD_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl<K: FoldKind> Fold<K> {
     /// Build a new fold instance with empty state and a fresh
@@ -295,6 +317,7 @@ impl<K: FoldKind> Fold<K> {
             audit_sink,
             sweep_handle,
             change_tx,
+            instance: NEXT_FOLD_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -322,11 +345,19 @@ impl<K: FoldKind> Fold<K> {
         self.change_tx.subscribe()
     }
 
-    /// Read the current change-generation without subscribing.
-    /// Hot caches (e.g. `CapabilitySetCache`) check this against
-    /// their stored generation to detect staleness; cheaper than
-    /// `subscribe_changes().borrow()` because it skips minting a
-    /// receiver. Per PERF_AUDIT §4.1.
+    /// This fold's process-unique instance id: distinct for every
+    /// [`Fold`] constructed in the process, live or dropped.
+    #[inline]
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance
+    }
+
+    /// Read the current change-generation without subscribing;
+    /// cheaper than `subscribe_changes().borrow()` because it skips
+    /// minting a receiver. The generation moves on every fold change,
+    /// so it suits "has anything changed" checks. A per-publisher
+    /// cache wants [`FoldState::publisher_rev`] instead, which
+    /// `CapabilitySetCache` uses.
     #[inline]
     pub fn change_generation(&self) -> u64 {
         *self.change_tx.borrow()
@@ -371,11 +402,7 @@ impl<K: FoldKind> Fold<K> {
                 // No existing entry to evict; install fresh.
                 let entry = build_entry::<K>(ann);
                 index.on_insert(&key, &entry.payload);
-                state
-                    .by_node
-                    .entry(node_id)
-                    .or_default()
-                    .insert(key.clone());
+                state.attach_key(node_id, key.clone());
                 let audit = K::audit_event(EntryTransition::Created {
                     key: &key,
                     new: &entry,
@@ -387,38 +414,23 @@ impl<K: FoldKind> Fold<K> {
                 Ok(ApplyOutcome::Inserted)
             }
             MergeAction::Replace => {
-                // Drop the old entry's index + by_node attachments
-                // before installing the new one. The `replace`
-                // pattern is "remove then insert" rather than
-                // "in-place mutate" so the index hooks see two
-                // distinct events — keeps the index trait
-                // contract simple.
-                //
-                // `merge` only returns `Replace` when `existing`
-                // was `Some`, so `state.entries.remove(&key)` is
-                // guaranteed to return `Some` here. The
-                // let-else fallback to `Reject` keeps the runtime
-                // sound (no `unwrap`) if a future `merge` impl
-                // ever violates the contract — we'd undercount
-                // replaces in metrics, never silently lose data.
-                let Some(old_entry) = state.entries.remove(&key) else {
+                // `merge` only returns `Replace` when `existing` was
+                // `Some`. The let-else fallback to `Reject` keeps the
+                // runtime sound (no `unwrap`) if a future `merge` impl
+                // ever violates that contract: we'd undercount replaces
+                // in metrics, never silently lose data.
+                let new_entry = build_entry::<K>(ann);
+                let Some(old_entry) = state.entries.get(&key) else {
                     self.metrics.on_reject();
                     return Ok(ApplyOutcome::Rejected);
                 };
-                if let Some(keys) = state.by_node.get_mut(&old_entry.node_id) {
-                    keys.remove(&key);
-                    if keys.is_empty() {
-                        state.by_node.remove(&old_entry.node_id);
-                    }
-                }
-                let new_entry = build_entry::<K>(ann);
+                let old_owner = old_entry.node_id;
                 // PERF_AUDIT §4.5 — steady-state refresh (same
-                // tags/region/state, new generation/TTL) skips
-                // the index churn. The default
-                // `index_payload_equivalent` returns `false`, so
-                // folds that don't implement a content-aware
-                // equality check fall through to the safe
-                // remove-then-insert pre-fix path.
+                // tags/region/state, new generation/TTL) skips the
+                // index churn. The default `index_payload_equivalent`
+                // returns `false`, so folds without a content-aware
+                // check fall through to remove-then-insert, which keeps
+                // the index hooks seeing two distinct events.
                 if !<K::Index as crate::adapter::net::behavior::fold::state::FoldIndex<K>>::index_payload_equivalent(
                     &old_entry.payload,
                     &new_entry.payload,
@@ -426,18 +438,28 @@ impl<K: FoldKind> Fold<K> {
                     index.on_remove(&key, &old_entry.payload);
                     index.on_insert(&key, &new_entry.payload);
                 }
-                state
-                    .by_node
-                    .entry(node_id)
-                    .or_default()
-                    .insert(key.clone());
                 let audit = K::audit_event(EntryTransition::Replaced {
                     key: &key,
-                    old: &old_entry,
+                    old: old_entry,
                     new: &new_entry,
                 });
                 self.emit_audit(audit);
-                state.entries.insert(key, new_entry);
+                // Overwrite in place: no table churn, and the old
+                // entry's payload is dropped here.
+                if let Some(slot) = state.entries.get_mut(&key) {
+                    *slot = new_entry;
+                }
+                // Same owner (always, for a fold keyed on the
+                // publisher): `attach_key` advances the revision and
+                // re-lists the key if the record lost it, so a refresh
+                // repairs a reverse index that drifted (the membership
+                // check is O(1) for large records, a short scan for
+                // small ones). A different owner (a fold keyed on
+                // payload alone) moves the key between records.
+                if old_owner != node_id {
+                    state.detach_key(old_owner, &key);
+                }
+                state.attach_key(node_id, key);
                 self.metrics.on_replace();
                 self.signal_changed();
                 Ok(ApplyOutcome::Replaced)
@@ -495,7 +517,7 @@ impl<K: FoldKind> Fold<K> {
         let mut state = self.state.write();
         let mut index = self.index.write();
 
-        let Some(keys) = state.by_node.remove(&node_id) else {
+        let Some(keys) = state.remove_node(node_id) else {
             return;
         };
         let mut removed = 0usize;
@@ -574,8 +596,7 @@ impl<K: FoldKind> Fold<K> {
             });
         }
 
-        state.entries.clear();
-        state.by_node.clear();
+        state.clear_for_restore();
         index.clear();
 
         let anchor = Instant::now();
@@ -599,12 +620,19 @@ impl<K: FoldKind> Fold<K> {
                 continue;
             };
             let key = snap_entry.key.clone();
+            // A snapshot can list one key twice (under two publishers,
+            // for a fold keyed on the payload). The later row wins, as
+            // `entries.insert` would have it, and the earlier one is
+            // unwound the way a cross-publisher Replace unwinds it:
+            // out of the index and out of its owner's record. Left in
+            // the record, `evict_node(earlier owner)` would remove the
+            // later owner's entry.
+            if let Some(earlier) = state.entries.remove(&key) {
+                index.on_remove(&key, &earlier.payload);
+                state.detach_key(earlier.node_id, &key);
+            }
             index.on_insert(&key, &entry.payload);
-            state
-                .by_node
-                .entry(entry.node_id)
-                .or_default()
-                .insert(key.clone());
+            state.attach_key(entry.node_id, key.clone());
             state.entries.insert(key, entry);
         }
 
@@ -640,6 +668,8 @@ impl<K: FoldKind> Fold<K> {
             queries: self.metrics.queries(),
             snapshots_taken: self.metrics.snapshots_taken(),
             snapshots_restored: self.metrics.snapshots_restored(),
+            sweep_walks: self.metrics.sweep_walks(),
+            sweep_yielded: self.metrics.sweep_yielded(),
             has_audit_sink: self.has_audit_sink(),
         }
     }
@@ -678,19 +708,33 @@ impl<K: FoldKind> Fold<K> {
         f(&state)
     }
 
-    /// Narrow in-place mutation escape hatch for RECEIVER-LOCAL
-    /// projection fields: `#[serde(skip)]` payload data that
+    /// Narrow in-place mutation path for RECEIVER-LOCAL projection
+    /// fields of one publisher's payloads: `#[serde(skip)]` data that
     /// participates in no secondary index, no wire form, and no
     /// signing transcript (OA-1's floor-raise ownership retraction
     /// clears `CapabilityMembership::owner` this way, review-8 §9).
     ///
-    /// Deliberately `pub(crate)` and deliberately NOT a general
-    /// mutation surface — anything that affects indexed, signed, or
-    /// wire-visible payload state must go through [`Self::apply`]
-    /// so generation ordering and index maintenance hold.
-    pub(crate) fn with_state_mut<R>(&self, f: impl FnOnce(&mut FoldState<K>) -> R) -> R {
-        let mut state = self.state.write();
-        f(&mut state)
+    /// `update` runs on each of `node_id`'s payloads under the state
+    /// write lock and returns whether it changed that payload. When
+    /// any changed, the publisher's revision advances
+    /// ([`FoldState::publisher_rev`]), so a cache keyed on it misses
+    /// whatever field the update touched. Returns how many changed.
+    /// The change generation is NOT bumped here; callers that change
+    /// query-visible state follow up with the matching notification
+    /// (see [`Self::notify_projection_retracted`]).
+    ///
+    /// This replaced a general `&mut FoldState` escape hatch, which
+    /// could rewrite entries without advancing any revision. It is
+    /// deliberately `pub(crate)` and deliberately NOT a general
+    /// mutation surface: anything that affects indexed, signed, or
+    /// wire-visible payload state must go through [`Self::apply`] so
+    /// generation ordering and index maintenance hold.
+    pub(crate) fn update_payloads(
+        &self,
+        node_id: NodeId,
+        update: impl FnMut(&mut K::Payload) -> bool,
+    ) -> usize {
+        self.state.write().update_payloads(node_id, update)
     }
 
     /// Record an ownership-projection retraction: bump the change generation

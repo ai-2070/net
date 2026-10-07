@@ -36,15 +36,47 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Maximum number of entries evicted per write-lock acquisition.
 /// Larger batches amortize the lock-acquire cost; smaller batches
-/// shorten the worst-case window during which applies + queries
-/// block. 1024 is a compromise that on a 100k-entry fold caps
-/// each write-lock hold to sub-millisecond while still finishing
-/// a full sweep in ~100 read-then-write cycles.
+/// shorten the window during which applies + queries block.
+///
+/// This bounds the entry count per hold, not the hold's duration:
+/// each eviction runs the fold's index removal and drops the
+/// entry's payload, so a hold costs `SWEEP_CHUNK_SIZE` times the
+/// per-entry removal cost of the fold's payload. For the
+/// capability fold that cost is several microseconds per entry
+/// (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 0), which puts a full
+/// chunk in the milliseconds, not below one. No hold-duration
+/// guarantee is made until chunk holds are measured directly.
 const SWEEP_CHUNK_SIZE: usize = 1024;
 
-/// Synchronous core of the expiry sweep. Walks the primary store
-/// in [`SWEEP_CHUNK_SIZE`]-bounded batches, evicting entries
-/// whose `expires_at <= now` from `entries` + `by_node`, calling
+/// How many segments one expiry walk is split into. The walk releases
+/// the state read lock between segments, so a writer queued behind the
+/// sweep (and every reader queued behind that writer, the read lock
+/// being fair) waits for at most one segment, not a walk of the whole
+/// map. Segmenting also bounds the candidate list to one segment's keys.
+///
+/// The count is small and fixed because resuming is not free: segment
+/// `k` re-skips the `k` before it, and a skip costs about a quarter of
+/// examining an entry (1.5 ns against 5.7 ns at 1M; it scans control
+/// bytes and touches no entry). Over `S` segments the skips total about
+/// `N·(S − 1)/2`, so 4 segments add roughly 40% to a steady-state walk
+/// and cut its longest hold to a quarter. Fixed 16k-entry segments made
+/// the skips quadratic: a 1M steady sweep went from 5.7 ms to 50 ms.
+const SWEEP_WALK_SEGMENTS: usize = 4;
+
+/// Smallest segment the walk uses. A fold this size or smaller walks in
+/// one hold, which is already short (about 0.4 ms at 64k entries).
+const SWEEP_WALK_SEGMENT_MIN: usize = 64 * 1024;
+
+/// Segment length for a fold holding about `entries` entries.
+fn walk_segment(entries: u64) -> usize {
+    let entries = usize::try_from(entries).unwrap_or(usize::MAX);
+    entries
+        .div_ceil(SWEEP_WALK_SEGMENTS)
+        .max(SWEEP_WALK_SEGMENT_MIN)
+}
+
+/// Synchronous core of the expiry sweep: evicts every entry whose
+/// `expires_at <= now` from `entries` + `by_node`, calling
 /// `K::Index::on_remove` for each, bumping
 /// [`FoldMetrics::expiries`], and surfacing an
 /// `EntryTransition::Expired` to the audit sink.
@@ -53,83 +85,169 @@ const SWEEP_CHUNK_SIZE: usize = 1024;
 /// background task (one call per wake) and tests (called
 /// directly via [`super::Fold::sweep_expired_now`]).
 ///
-/// Locking: each chunk acquires the state + index write locks in
-/// the fixed `state → index` order (matching the apply path),
-/// then releases them before the next chunk's read-lock pass.
-/// Concurrent applies / queries see a series of short pauses
-/// rather than one full-state stall. Between the read-lock pass
-/// that picks the candidates and the write-lock pass that
-/// removes them, a concurrent apply may refresh an entry's TTL —
-/// the write-lock pass re-checks `expires_at <= now` per key and
-/// skips refreshed entries.
+/// One logical walk of the primary store per sweep
+/// (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 2), in at most
+/// [`SWEEP_WALK_SEGMENTS`] segments (see there for the trade-off). For
+/// each segment:
+///
+/// 1. [`collect_expired_segment`]: under one state read-lock hold,
+///    skip the entries earlier segments examined and collect the
+///    expired keys among the next segment's worth.
+/// 2. [`evict_chunk`]: the collected keys in [`SWEEP_CHUNK_SIZE`]
+///    slices, each under its own state + index write-lock acquisition
+///    in the fixed `state → index` order (matching the apply path),
+///    released between slices.
+///
+/// Each entry is examined once per sweep. The previous design
+/// restarted the examining walk from the first bucket for every chunk,
+/// so a sweep over E expired entries among N re-examined the live
+/// prefix about E/1024 times (~(N − E)·E/2048 visits; 45.7M at N = 1M,
+/// E = 100k). Resuming a segment re-skips the earlier ones; a skip only
+/// scans the table's control bytes and touches no entry, and the
+/// segment count is capped so the skips stay linear in N.
+///
+/// The resume point is a count of occupied slots, which is exact
+/// against this sweep's own evictions (removal leaves every other slot
+/// where it was, and the count is reduced by what was evicted) but only
+/// approximate against concurrent writers between segments: an insert
+/// before the resume point, or a resize, shifts it. The cost of that is
+/// bounded and benign: an entry examined twice is evicted once (phase
+/// 2 re-checks), and an entry skipped is evicted by the next sweep.
+///
+/// Between a segment's walk and a key's eviction, a concurrent apply
+/// may refresh the entry's TTL, or `evict_node` may remove it. Phase 2
+/// re-checks `expires_at <= now` per key under the write lock and
+/// skips refreshed or vanished entries.
 pub(super) fn sweep_expired<K: FoldKind>(
     state_lock: &RwLock<FoldState<K>>,
     index_lock: &RwLock<K::Index>,
     metrics: &FoldMetrics,
     audit_sink: Option<&Arc<dyn FoldAuditSink>>,
 ) -> usize {
-    let now = Instant::now();
-    let mut total_evicted = 0usize;
-    loop {
-        // Phase 1: read-lock, collect a bounded batch of
-        // candidates whose expires_at is past `now`. Read lock is
-        // released at end of this scope before we take write
-        // locks below.
-        let candidates: Vec<K::Key> = {
-            let state = state_lock.read();
-            state
-                .entries
-                .iter()
-                .filter(|(_, e)| e.expires_at <= now)
-                .map(|(k, _)| k.clone())
-                .take(SWEEP_CHUNK_SIZE)
-                .collect()
-        };
-        if candidates.is_empty() {
-            return total_evicted;
-        }
+    sweep_expired_in_segments(
+        state_lock,
+        index_lock,
+        metrics,
+        audit_sink,
+        walk_segment(metrics.entries()),
+    )
+}
 
-        // Phase 2: write-lock, re-check + mutate. Re-check is
-        // load-bearing: between the read-lock release and write-
-        // lock acquire, a concurrent apply may have refreshed
-        // the entry's TTL (or evict_node may have removed it).
-        let mut state = state_lock.write();
-        let mut index = index_lock.write();
-        for key in candidates {
-            let still_expired = state
-                .entries
-                .get(&key)
-                .map(|e| e.expires_at <= now)
-                .unwrap_or(false);
-            if !still_expired {
-                continue;
-            }
-            let Some(old_entry) = state.entries.remove(&key) else {
-                continue;
-            };
-            if let Some(keys) = state.by_node.get_mut(&old_entry.node_id) {
-                keys.remove(&key);
-                if keys.is_empty() {
-                    state.by_node.remove(&old_entry.node_id);
-                }
-            }
-            index.on_remove(&key, &old_entry.payload);
-            if let Some(sink) = audit_sink {
-                let transition = EntryTransition::Expired {
-                    key: &key,
-                    old: &old_entry,
-                };
-                if let Some(event) = K::audit_event(transition) {
-                    sink.record(event);
-                }
-            }
-            metrics.on_expire();
-            total_evicted += 1;
+/// [`sweep_expired`] with an explicit segment size, so tests can drive
+/// a multi-segment walk over a small fold.
+pub(super) fn sweep_expired_in_segments<K: FoldKind>(
+    state_lock: &RwLock<FoldState<K>>,
+    index_lock: &RwLock<K::Index>,
+    metrics: &FoldMetrics,
+    audit_sink: Option<&Arc<dyn FoldAuditSink>>,
+    segment: usize,
+) -> usize {
+    let now = Instant::now();
+    let mut resume = 0usize;
+    let mut examined_total = 0u64;
+    let mut evicted_total = 0usize;
+    loop {
+        let walk = collect_expired_segment(state_lock, resume, segment, now);
+        examined_total += walk.examined as u64;
+        let evicted: usize = walk
+            .expired
+            .chunks(SWEEP_CHUNK_SIZE)
+            .map(|chunk| evict_chunk(state_lock, index_lock, metrics, audit_sink, chunk, now))
+            .sum();
+        evicted_total += evicted;
+        if walk.exhausted {
+            break;
         }
-        // Locks drop here. The next loop iteration re-reads to
-        // pick up the next chunk; if the read pass finds nothing,
-        // we return.
+        // Every key this segment evicted sat before the resume point,
+        // and each removal took one occupied slot out of that prefix.
+        resume = (resume + walk.examined).saturating_sub(evicted);
     }
+    metrics.on_sweep_walk(examined_total);
+    evicted_total
+}
+
+/// One segment of the expiry walk, from [`collect_expired_segment`].
+pub(super) struct WalkSegment<Q> {
+    /// Keys whose entries had `expires_at <= now` when examined.
+    pub(super) expired: Vec<Q>,
+    /// Entries examined (live and expired alike), excluding skipped.
+    pub(super) examined: usize,
+    /// The walk reached the end of the table.
+    pub(super) exhausted: bool,
+}
+
+/// Phase 1 of [`sweep_expired`]: under one state read-lock hold, skip
+/// `skip` entries of the primary store, then examine up to `limit`
+/// more and collect every key whose entry has `expires_at <= now`.
+pub(super) fn collect_expired_segment<K: FoldKind>(
+    state_lock: &RwLock<FoldState<K>>,
+    skip: usize,
+    limit: usize,
+    now: Instant,
+) -> WalkSegment<K::Key> {
+    let state = state_lock.read();
+    let mut walk = state.entries.iter().skip(skip);
+    let mut expired = Vec::new();
+    // Count what the walk actually yields, before the expiry filter.
+    // Recording a precomputed length instead would report the walk's
+    // expected cost, and a regression that visited entries twice
+    // would still report the right number.
+    let mut examined = 0usize;
+    for (key, entry) in walk.by_ref().take(limit) {
+        examined += 1;
+        if entry.expires_at <= now {
+            expired.push(key.clone());
+        }
+    }
+    let exhausted = examined < limit || walk.next().is_none();
+    WalkSegment {
+        expired,
+        examined,
+        exhausted,
+    }
+}
+
+/// Phase 2 of [`sweep_expired`]: under one state + index write-lock
+/// acquisition, evict each key of `chunk` whose entry is still
+/// present and still expired as of `now`. Returns the number evicted.
+///
+/// The re-check is load-bearing: the keys were collected under an
+/// earlier read lock, and a concurrent apply may have refreshed an
+/// entry's TTL (or `evict_node` removed it) since.
+pub(super) fn evict_chunk<K: FoldKind>(
+    state_lock: &RwLock<FoldState<K>>,
+    index_lock: &RwLock<K::Index>,
+    metrics: &FoldMetrics,
+    audit_sink: Option<&Arc<dyn FoldAuditSink>>,
+    chunk: &[K::Key],
+    now: Instant,
+) -> usize {
+    let mut state = state_lock.write();
+    let mut index = index_lock.write();
+    let mut evicted = 0usize;
+    for key in chunk {
+        let still_expired = state.entries.get(key).is_some_and(|e| e.expires_at <= now);
+        if !still_expired {
+            continue;
+        }
+        let Some(old_entry) = state.entries.remove(key) else {
+            continue;
+        };
+        state.detach_key(old_entry.node_id, key);
+        index.on_remove(key, &old_entry.payload);
+        if let Some(sink) = audit_sink {
+            let transition = EntryTransition::Expired {
+                key,
+                old: &old_entry,
+            };
+            if let Some(event) = K::audit_event(transition) {
+                sink.record(event);
+            }
+        }
+        metrics.on_expire();
+        evicted += 1;
+    }
+    evicted
 }
 
 /// Spawn the per-fold background sweep task onto the ambient

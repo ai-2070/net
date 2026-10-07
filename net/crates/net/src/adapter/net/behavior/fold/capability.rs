@@ -377,6 +377,9 @@ pub struct CapabilityIndexInner {
     by_region: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
     /// state → set of (class, node) keys.
     by_state: HashMap<NodeState, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    /// Reused buffer for building synthetic tag keys, so deriving them
+    /// on insert and remove allocates nothing once it has grown.
+    scratch: String,
 }
 
 /// Fast multiplicative `(u64, u64)` mixer for the inverted-index
@@ -393,55 +396,70 @@ pub struct CapabilityIndexInner {
 /// two copies that can drift apart.
 pub(crate) type BuildU64TupleHasher = std::hash::BuildHasherDefault<FxU64Hasher>;
 
+/// Add `key` to the bucket for `bucket`, allocating the bucket's
+/// owned `String` only when the bucket is new. Steady state, the bucket
+/// exists and nothing is allocated.
+fn bucket_insert(
+    map: &mut HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    bucket: &str,
+    key: (u64, NodeId),
+) {
+    if let Some(set) = map.get_mut(bucket) {
+        set.insert(key);
+    } else {
+        map.entry(bucket.to_owned()).or_default().insert(key);
+    }
+}
+
+/// Remove `key` from the bucket for `bucket`, dropping the bucket when
+/// it empties.
+fn bucket_remove(
+    map: &mut HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    bucket: &str,
+    key: &(u64, NodeId),
+) {
+    if let Some(set) = map.get_mut(bucket) {
+        set.remove(key);
+        if set.is_empty() {
+            map.remove(bucket);
+        }
+    }
+}
+
 impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
     fn on_insert(&mut self, key: &(u64, NodeId), payload: &CapabilityMembership) {
         for tag in &payload.tags {
-            self.by_tag.entry(tag.clone()).or_default().insert(*key);
+            bucket_insert(&mut self.by_tag, tag, *key);
         }
         // Index-only synthetic tags (model:/tool:/gpu:) live in
         // their own `by_synthetic` map so the model / tool / gpu
         // filter axes resolve without a per-query full scan and
         // without risking collision against a raw published tag of
-        // the same string. Parsed once here at insert, never per
-        // query.
-        for tag in derive_synthetic_index_tags(payload) {
-            self.by_synthetic.entry(tag).or_default().insert(*key);
-        }
+        // the same string. Derived here at insert, never per query.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        for_each_synthetic_index_tag(payload, &mut scratch, |tag| {
+            bucket_insert(&mut self.by_synthetic, tag, *key);
+        });
+        self.scratch = scratch;
         if let Some(region) = &payload.region {
-            self.by_region
-                .entry(region.clone())
-                .or_default()
-                .insert(*key);
+            bucket_insert(&mut self.by_region, region, *key);
         }
         self.by_state.entry(payload.state).or_default().insert(*key);
     }
 
     fn on_remove(&mut self, key: &(u64, NodeId), payload: &CapabilityMembership) {
         for tag in &payload.tags {
-            if let Some(set) = self.by_tag.get_mut(tag) {
-                set.remove(key);
-                if set.is_empty() {
-                    self.by_tag.remove(tag);
-                }
-            }
+            bucket_remove(&mut self.by_tag, tag, key);
         }
         // Mirror the synthetic tags added in `on_insert`. Derived
         // from the same payload, so the set is identical.
-        for tag in derive_synthetic_index_tags(payload) {
-            if let Some(set) = self.by_synthetic.get_mut(&tag) {
-                set.remove(key);
-                if set.is_empty() {
-                    self.by_synthetic.remove(&tag);
-                }
-            }
-        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        for_each_synthetic_index_tag(payload, &mut scratch, |tag| {
+            bucket_remove(&mut self.by_synthetic, tag, key);
+        });
+        self.scratch = scratch;
         if let Some(region) = &payload.region {
-            if let Some(set) = self.by_region.get_mut(region) {
-                set.remove(key);
-                if set.is_empty() {
-                    self.by_region.remove(region);
-                }
-            }
+            bucket_remove(&mut self.by_region, region, key);
         }
         if let Some(set) = self.by_state.get_mut(&payload.state) {
             set.remove(key);
@@ -508,7 +526,63 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
 /// the bulk index path and the single-target post-filter path —
 /// `target_matches_filter_agrees_with_find_nodes_matching` guards
 /// this.
+#[cfg(test)]
 fn derive_synthetic_index_tags(payload: &CapabilityMembership) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut scratch = String::new();
+    for_each_synthetic_index_tag(payload, &mut scratch, |tag| out.push(tag.to_owned()));
+    out
+}
+
+/// Visit each index-only synthetic tag of `payload`, in a fixed order
+/// (the test-only `derive_synthetic_index_tags` collects it), building
+/// each key in
+/// `scratch` instead of allocating. Tags are read with
+/// [`axis_value_ref`](super::super::tag::axis_value_ref), the borrowing
+/// form of `Tag::parse`, so the accepted grammar is `Tag::parse`'s
+/// exactly: both `=` and `:` separators, reserved prefixes excluded.
+/// `synthetic_derivation_matches_tag_parse` pins that equivalence.
+fn for_each_synthetic_index_tag(
+    payload: &CapabilityMembership,
+    scratch: &mut String,
+    mut visit: impl FnMut(&str),
+) {
+    use super::super::tag::{axis_value_ref, TaxonomyAxis};
+    let mut emit = |prefix: &str, value: &str| {
+        scratch.clear();
+        scratch.push_str(prefix);
+        scratch.push_str(value);
+        visit(scratch);
+    };
+    for s in &payload.tags {
+        let Some((TaxonomyAxis::Software, key, value)) = axis_value_ref(s) else {
+            continue;
+        };
+        if let Some(rest) = key.strip_prefix("model.") {
+            if matches!(rest.split_once('.'), Some((_, "id"))) {
+                emit("model:", value);
+            }
+        } else if let Some(rest) = key.strip_prefix("tool.") {
+            if matches!(rest.split_once('.'), Some((_, "tool_id"))) {
+                emit("tool:", value);
+            }
+        }
+    }
+    if let Some(h) = &payload.hardware {
+        if h.gpu_count > 0 || h.gpu_vendor.is_some() {
+            emit("gpu:present", "");
+        }
+        if let Some(vendor) = &h.gpu_vendor {
+            emit("gpu:vendor:", vendor);
+        }
+    }
+}
+
+/// The pre-Slice-3 derivation, through the owning `Tag::parse`: the
+/// oracle `synthetic_derivation_matches_tag_parse` compares the
+/// borrowing derivation against.
+#[cfg(test)]
+fn derive_synthetic_index_tags_via_parse(payload: &CapabilityMembership) -> Vec<String> {
     use super::super::tag::{Tag, TaxonomyAxis};
     let mut out = Vec::new();
     for s in &payload.tags {
@@ -562,6 +636,14 @@ impl FoldKind for CapabilityFold {
     type Query = CapabilityQuery;
     type Result = Vec<CapabilityMatch>;
     type Index = CapabilityIndexInner;
+    /// A keyed fast hasher. The key's `class_hash` is publisher-declared,
+    /// so an unkeyed mixer would let a publisher manufacture colliding
+    /// keys and turn this map's lookups into probe-chain scans.
+    /// `foldhash::fast::RandomState` seeds every map instance at random
+    /// and uses a folded multiply, so collisions cannot be built without
+    /// the receiver's seed, at near-Fx speed (it is hashbrown's default
+    /// hasher). Pinned by `capability_fold_primary_map_hasher_is_keyed`.
+    type KeyHasher = foldhash::fast::RandomState;
 
     fn key_for(node_id: NodeId, payload: &Self::Payload) -> Self::Key {
         (payload.class_hash, node_id)
@@ -740,6 +822,183 @@ pub(crate) fn resolve_candidate_keys<'a>(
         }
     }
 
+    // General path (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 4). Every
+    // indexed constraint becomes a key set: a borrowed index bucket
+    // wherever one exists (each `tags_all` tag, a single-tag group, the
+    // state, the region, a single `tags_any` tag), an owned union only
+    // for a multi-tag group or multi-tag `tags_any`. The smallest set
+    // seeds; the result is the seed's keys that every other set holds,
+    // collected once. Nothing is cloned and then narrowed.
+    let mut sets: Vec<KeySet<'a>> = Vec::new();
+    for tag in &filter.tags_all {
+        match index.by_tag.get(tag) {
+            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
+            None => return CandidateKeys::Owned(HashSet::default()),
+        }
+    }
+    // Empty groups carry no constraint and are skipped.
+    for group in filter.tag_groups_all.iter().filter(|g| !g.is_empty()) {
+        if let [tag] = &group[..] {
+            // Synthetic axes resolve against `by_synthetic` only; see
+            // `group_union`.
+            match index.by_synthetic.get(tag) {
+                Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
+                None => return CandidateKeys::Owned(HashSet::default()),
+            }
+        } else {
+            let union = group_union(index, group);
+            if union.is_empty() {
+                return CandidateKeys::Owned(HashSet::default());
+            }
+            sets.push(KeySet::Owned(union));
+        }
+    }
+    if let Some(state_filter) = filter.state {
+        match index.by_state.get(&state_filter) {
+            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
+            None => return CandidateKeys::Owned(HashSet::default()),
+        }
+    }
+    if let Some(region) = &filter.region {
+        match index.by_region.get(region) {
+            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
+            None => return CandidateKeys::Owned(HashSet::default()),
+        }
+    }
+    if let [tag] = &filter.tags_any[..] {
+        match index.by_tag.get(tag) {
+            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
+            None => return CandidateKeys::Owned(HashSet::default()),
+        }
+    } else if !filter.tags_any.is_empty() {
+        let mut union: HashSet<(u64, NodeId), BuildU64TupleHasher> = HashSet::default();
+        for tag in &filter.tags_any {
+            if let Some(bucket) = index.by_tag.get(tag) {
+                union.extend(bucket.iter().copied());
+            }
+        }
+        if union.is_empty() {
+            return CandidateKeys::Owned(HashSet::default());
+        }
+        sets.push(KeySet::Owned(union));
+    }
+
+    let Some(class) = filter.class else {
+        // Exactly one set constraint and no class predicate: that set
+        // IS the answer. Return it as is, borrowed when it is an index
+        // bucket, instead of copying it.
+        if sets.len() == 1 {
+            if let Some(only) = sets.pop() {
+                return match only {
+                    KeySet::Borrowed(bucket) => CandidateKeys::Borrowed(bucket),
+                    KeySet::Owned(set) => CandidateKeys::Owned(set),
+                };
+            }
+        }
+        if sets.is_empty() {
+            // No constraint at all: every key.
+            return CandidateKeys::Owned(state.entries.keys().copied().collect());
+        }
+        return CandidateKeys::Owned(intersect(sets, |_| true));
+    };
+    if sets.is_empty() {
+        // Only a class predicate: a class scan.
+        return CandidateKeys::Owned(
+            state
+                .entries
+                .keys()
+                .filter(|(c, _)| *c == class)
+                .copied()
+                .collect(),
+        );
+    }
+    CandidateKeys::Owned(intersect(sets, |k| k.0 == class))
+}
+
+/// The keys of the smallest set in `sets` that every other set holds
+/// and `keep` accepts. `sets` must be non-empty. The output is sized
+/// for the seed up front: collecting through a filter loses the size
+/// hint, and regrowing a set of up to M keys costs more than reserving
+/// it once.
+fn intersect(
+    mut sets: Vec<KeySet<'_>>,
+    keep: impl Fn(&(u64, NodeId)) -> bool,
+) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
+    let Some(seed_at) = (0..sets.len()).min_by_key(|&i| sets[i].set().len()) else {
+        return HashSet::default();
+    };
+    let seed = sets.swap_remove(seed_at);
+    let mut out =
+        HashSet::with_capacity_and_hasher(seed.set().len(), BuildU64TupleHasher::default());
+    out.extend(
+        seed.set()
+            .iter()
+            .filter(|k| keep(k) && sets.iter().all(|other| other.set().contains(*k)))
+            .copied(),
+    );
+    out
+}
+
+/// One indexed constraint of a [`CapabilityFilter`], as the key set a
+/// candidate must belong to: a borrowed index bucket, or a union built
+/// for a multi-tag group.
+enum KeySet<'a> {
+    Borrowed(&'a HashSet<(u64, NodeId), BuildU64TupleHasher>),
+    Owned(HashSet<(u64, NodeId), BuildU64TupleHasher>),
+}
+
+impl KeySet<'_> {
+    fn set(&self) -> &HashSet<(u64, NodeId), BuildU64TupleHasher> {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Owned(s) => s,
+        }
+    }
+}
+
+/// The resolver before Slice 4: clone the seed, then `retain` through
+/// every other constraint. Kept as the oracle for
+/// `resolve_candidate_keys_matches_pre_slice4_resolver`.
+#[cfg(test)]
+fn resolve_candidate_keys_pre_slice4<'a>(
+    state: &FoldState<CapabilityFold>,
+    index: &'a CapabilityIndexInner,
+    filter: &CapabilityFilter,
+) -> CandidateKeys<'a> {
+    // Single-constraint fast path (2026-06-11 service-discovery
+    // follow-up): when the filter constrains exactly one indexed
+    // dimension and nothing else would tighten the seed, the index
+    // bucket already IS the final candidate set. Borrow it instead
+    // of cloning every key into an owned set — and, for the state /
+    // region shapes, instead of also running the general path's
+    // redundant self-retain against the very bucket it seeded from.
+    // `tags_all` resolves against `by_tag` only (synthetic model /
+    // tool / gpu axes ride `tag_groups_all` → `by_synthetic`), so
+    // borrowing the raw-tag bucket cannot leak a synthetic match.
+    if filter.tag_groups_all.is_empty() && filter.tags_any.is_empty() && filter.class.is_none() {
+        match (&filter.tags_all[..], filter.state, &filter.region) {
+            ([tag], None, None) => {
+                return match index.by_tag.get(tag) {
+                    Some(bucket) => CandidateKeys::Borrowed(bucket),
+                    None => CandidateKeys::Owned(HashSet::default()),
+                };
+            }
+            ([], Some(state_filter), None) => {
+                return match index.by_state.get(&state_filter) {
+                    Some(bucket) => CandidateKeys::Borrowed(bucket),
+                    None => CandidateKeys::Owned(HashSet::default()),
+                };
+            }
+            ([], None, Some(region)) => {
+                return match index.by_region.get(region) {
+                    Some(bucket) => CandidateKeys::Borrowed(bucket),
+                    None => CandidateKeys::Owned(HashSet::default()),
+                };
+            }
+            _ => {}
+        }
+    }
+
     // Each group's union (OR within a group) is needed both to seed
     // (when no `tags_all` is present) and to tighten further down.
     // `group_unions` holds the ones that still need to be applied as
@@ -847,6 +1106,7 @@ pub(crate) fn resolve_candidate_keys<'a>(
 /// `tag_groups_all` (OR within a group). Empty groups carry no
 /// constraint, so they're skipped rather than producing an empty
 /// union that would wrongly clear every candidate.
+#[cfg(test)]
 fn build_group_unions(
     index: &CapabilityIndexInner,
     groups: &[Vec<String>],
@@ -969,7 +1229,7 @@ pub fn nodes_with_capability_tag(
 /// entries. Non-allocating — walks the publisher's `by_node` reverse
 /// index and short-circuits on the first match.
 fn node_has_tag(state: &FoldState<CapabilityFold>, node_id: NodeId, tag: &str) -> bool {
-    let Some(keys) = state.by_node.get(&node_id) else {
+    let Some(keys) = state.keys_for(node_id) else {
         return false;
     };
     keys.iter().any(|key| {
@@ -981,7 +1241,7 @@ fn node_has_tag(state: &FoldState<CapabilityFold>, node_id: NodeId, tag: &str) -
 }
 
 fn tags_union_for(state: &FoldState<CapabilityFold>, node_id: NodeId) -> Vec<String> {
-    let Some(keys) = state.by_node.get(&node_id) else {
+    let Some(keys) = state.keys_for(node_id) else {
         return Vec::new();
     };
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1007,7 +1267,7 @@ pub fn reflex_addr_for(
     node_id: NodeId,
 ) -> Option<std::net::SocketAddr> {
     fold.with_state(|state| {
-        let keys = state.by_node.get(&node_id)?;
+        let keys = state.keys_for(node_id)?;
         for key in keys {
             if let Some(entry) = state.entries.get(key) {
                 if let Some(addr) = entry.payload.reflex_addr {
@@ -1021,6 +1281,260 @@ pub fn reflex_addr_for(
 
 #[cfg(test)]
 mod tests {
+    /// The capability fold's primary map and reverse index must use a
+    /// keyed hasher: `class_hash` is publisher-declared, so an unkeyed one
+    /// lets a publisher build colliding keys (PR #1198 review). Two
+    /// independently built states must hash the same key differently;
+    /// an unkeyed hasher hashes it identically in both.
+    #[test]
+    fn capability_fold_primary_map_hasher_is_keyed() {
+        use std::hash::BuildHasher;
+        let a = FoldState::<CapabilityFold>::new();
+        let b = FoldState::<CapabilityFold>::new();
+        let keys: [(u64, NodeId); 4] = [(0, 1), (0x100, 0xA), (u64::MAX, 7), (42, 42)];
+        let differs = |x: &dyn Fn(&(u64, NodeId)) -> u64, y: &dyn Fn(&(u64, NodeId)) -> u64| {
+            keys.iter().any(|k| x(k) != y(k))
+        };
+        assert!(
+            differs(&|k| a.entries.hasher().hash_one(k), &|k| b
+                .entries
+                .hasher()
+                .hash_one(k)),
+            "entries hasher is not seeded per instance"
+        );
+        assert!(
+            differs(&|k| a.by_node.hasher().hash_one(k.1), &|k| b
+                .by_node
+                .hasher()
+                .hash_one(k.1)),
+            "by_node hasher is not seeded per instance"
+        );
+    }
+
+    /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 4, kept permanently: the
+    /// streaming resolver returns exactly the pre-Slice-4 resolver's
+    /// key set over a filter matrix on a 10k fixture. The fixture has
+    /// multi-class publishers (a second class whose tags differ, so an
+    /// entry-level split predicate is exercised), and is built in both
+    /// arrival orders, which must agree with each other too.
+    #[test]
+    fn resolve_candidate_keys_matches_pre_slice4_resolver() {
+        use std::collections::BTreeMap;
+        const N: u64 = 10_000;
+
+        let membership = |class: u64, i: u64| {
+            let mut tags = vec![format!("a{}", i % 4), format!("b{}", i % 7)];
+            if i.is_multiple_of(997) {
+                tags.push("rare".into());
+            }
+            tags.push(format!("software.model.0.id=m{}", i % 3));
+            tags.push(format!("software.tool.0.tool_id:x{}", i % 2));
+            if class == 0x200 {
+                tags = vec!["a0".into(), "cross".into(), "software.model.0.id=m9".into()];
+            }
+            CapabilityMembership {
+                class_hash: class,
+                tags,
+                hardware: (!i.is_multiple_of(3)).then(|| HardwareSummary {
+                    gpu_vendor: Some(if i.is_multiple_of(2) { "nvidia" } else { "amd" }.into()),
+                    gpu_count: 1,
+                    memory_gb: Some(64),
+                    vram_gb: Some(24),
+                }),
+                state: if i.is_multiple_of(2) {
+                    NodeState::Idle
+                } else {
+                    NodeState::Busy
+                },
+                region: (!i.is_multiple_of(11)).then(|| format!("r{}", i % 5)),
+                price_quote: None,
+                reflex_addr: None,
+                noise_pubkey: None,
+                rtc_bootstrap: None,
+                rtc_addr: None,
+                rtc_stun_addr: None,
+                allowed_nodes: Vec::new(),
+                allowed_subnets: Vec::new(),
+                allowed_groups: Vec::new(),
+                metadata: BTreeMap::new(),
+                owner: None,
+            }
+        };
+        let build = |order: &mut dyn Iterator<Item = u64>| {
+            let fold = new_fold();
+            for i in order {
+                let mut classes = vec![0x100];
+                if i.is_multiple_of(7) {
+                    classes.push(0x200);
+                }
+                for class in classes {
+                    fold.apply(SignedAnnouncement::placeholder(
+                        CapabilityFold::KIND_ID,
+                        class,
+                        i + 1,
+                        1,
+                        EnvelopeMeta::default(),
+                        membership(class, i),
+                    ))
+                    .expect("fixture apply");
+                }
+            }
+            fold
+        };
+        let forward = build(&mut (0..N));
+        let reverse = build(&mut (0..N).rev());
+
+        let tags_all: [&[&str]; 4] = [&[], &["a0"], &["a0", "b3"], &["a1", "rare"]];
+        let groups: [&[&[&str]]; 5] = [
+            &[],
+            &[&["model:m0"]],
+            &[&["model:m0", "model:m9"]],
+            &[&["model:m1"], &["tool:x1"]],
+            &[&["gpu:vendor:nvidia", "gpu:present"], &[]],
+        ];
+        let states = [None, Some(NodeState::Idle)];
+        let regions = [None, Some("r2")];
+        let tags_any: [&[&str]; 3] = [&[], &["b1"], &["b1", "cross"]];
+        let classes = [None, Some(0x100), Some(0x200)];
+        let to_vec = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let sorted = |keys: &HashSet<(u64, NodeId), BuildU64TupleHasher>| {
+            let mut v: Vec<_> = keys.iter().copied().collect();
+            v.sort_unstable();
+            v
+        };
+
+        let mut combos = 0usize;
+        let mut nonempty = 0usize;
+        for ta in tags_all {
+            for g in groups {
+                for st in states {
+                    for rg in regions {
+                        for tany in tags_any {
+                            for cl in classes {
+                                let filter = CapabilityFilter {
+                                    tags_all: to_vec(ta),
+                                    tag_groups_all: g.iter().map(|grp| to_vec(grp)).collect(),
+                                    state: st,
+                                    region: rg.map(String::from),
+                                    tags_any: to_vec(tany),
+                                    class: cl,
+                                    ..CapabilityFilter::default()
+                                };
+                                let mut results = Vec::new();
+                                for fold in [&forward, &reverse] {
+                                    fold.with_state_and_index(|state, index| {
+                                        let new = sorted(
+                                            resolve_candidate_keys(state, index, &filter).as_set(),
+                                        );
+                                        let old = sorted(
+                                            resolve_candidate_keys_pre_slice4(
+                                                state, index, &filter,
+                                            )
+                                            .as_set(),
+                                        );
+                                        assert_eq!(new, old, "resolvers differ for {filter:?}");
+                                        results.push(new);
+                                    });
+                                }
+                                assert_eq!(
+                                    results[0], results[1],
+                                    "arrival order changed {filter:?}"
+                                );
+                                combos += 1;
+                                nonempty += usize::from(!results[0].is_empty());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(combos, 4 * 5 * 2 * 2 * 3 * 3);
+        assert!(
+            nonempty > combos / 4,
+            "the matrix must exercise non-empty results"
+        );
+    }
+
+    /// CAPABILITY_FOLD_SCALE_PLAN.md Slice 3: the borrowing synthetic
+    /// derivation must match the `Tag::parse` path it replaced, over
+    /// both separators, embedded delimiters, empty values, bundle-key
+    /// shapes, reserved prefixes and raw tags that look like synthetic
+    /// names. Grammar must not change in a performance slice.
+    #[test]
+    fn synthetic_derivation_matches_tag_parse() {
+        use std::collections::BTreeMap;
+        let tag_sets: Vec<Vec<&str>> = vec![
+            vec!["software.model.0.id=llama3", "software.tool.0.tool_id=repl"],
+            vec!["software.model.0.id:llama3", "software.tool.0.tool_id:repl"],
+            vec!["software.model.0.id=a:b", "software.model.1.id:a=b"],
+            vec!["software.model.0.id=", "software.model.1.id:"],
+            vec!["software.model.0.name=llama", "software.model.0.id.extra=x"],
+            vec!["software.model.id=no-index", "software.model.0.0.id=deep"],
+            vec![
+                "software.tool.0.id=not-a-tool-id",
+                "software.tool.0.tool_id=ok",
+            ],
+            vec![
+                "model:llama3",
+                "tool:repl",
+                "gpu:present",
+                "gpu:vendor:nvidia",
+            ],
+            vec!["scope:region:eu", "causal:software.model.0.id=x"],
+            vec!["hardware.gpu.vram_gb=80", "software.os=linux", "inference"],
+            vec!["software.model.0.id=dup", "software.model.1.id=dup"],
+            vec![],
+        ];
+        let hardware = [
+            None,
+            Some(HardwareSummary {
+                gpu_vendor: Some("nvidia".into()),
+                gpu_count: 1,
+                memory_gb: Some(64),
+                vram_gb: Some(24),
+            }),
+            Some(HardwareSummary {
+                gpu_vendor: None,
+                gpu_count: 2,
+                memory_gb: None,
+                vram_gb: None,
+            }),
+            Some(HardwareSummary {
+                gpu_vendor: None,
+                gpu_count: 0,
+                memory_gb: Some(16),
+                vram_gb: None,
+            }),
+        ];
+        for tags in &tag_sets {
+            for hw in &hardware {
+                let payload = CapabilityMembership {
+                    class_hash: 0,
+                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                    hardware: hw.clone(),
+                    state: NodeState::Idle,
+                    region: None,
+                    price_quote: None,
+                    reflex_addr: None,
+                    noise_pubkey: None,
+                    rtc_bootstrap: None,
+                    rtc_addr: None,
+                    rtc_stun_addr: None,
+                    allowed_nodes: Vec::new(),
+                    allowed_subnets: Vec::new(),
+                    allowed_groups: Vec::new(),
+                    metadata: BTreeMap::new(),
+                    owner: None,
+                };
+                assert_eq!(
+                    derive_synthetic_index_tags(&payload),
+                    derive_synthetic_index_tags_via_parse(&payload),
+                    "derivations differ for tags {tags:?}, hardware {hw:?}"
+                );
+            }
+        }
+    }
+
     use std::sync::Arc;
     use std::time::Duration;
 

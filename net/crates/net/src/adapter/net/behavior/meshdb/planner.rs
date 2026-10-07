@@ -947,7 +947,7 @@ where
                 // CapabilitySet across all classes.
                 let mut hosts_child = false;
                 let mut fork_candidates: Vec<u64> = Vec::new();
-                if let Some(keys) = state.by_node.get(&node_id) {
+                if let Some(keys) = state.keys_for(node_id) {
                     for key in keys {
                         let Some(e) = state.entries.get(key) else {
                             continue;

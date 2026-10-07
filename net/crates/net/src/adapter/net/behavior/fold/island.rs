@@ -179,6 +179,7 @@ impl FoldKind for IslandTopologyFold {
     type Query = IslandQuery;
     type Result = Vec<IslandRow>;
     type Index = NoIndex;
+    type KeyHasher = std::collections::hash_map::RandomState;
 
     fn key_for(_publisher: NodeId, payload: &Self::Payload) -> IslandId {
         payload.id

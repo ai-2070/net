@@ -197,6 +197,7 @@ impl FoldKind for ReservationFold {
     type Query = ReservationQuery;
     type Result = Vec<ReservationRow>;
     type Index = NoIndex;
+    type KeyHasher = std::collections::hash_map::RandomState;
 
     fn key_for(_publisher: NodeId, payload: &Self::Payload) -> Self::Key {
         payload.resource_id
