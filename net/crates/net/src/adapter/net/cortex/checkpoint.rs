@@ -23,11 +23,25 @@ const MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// post-rename phase on this host: a parent-directory fsync failure
 /// cannot be forced from a test, and `MOVEFILE_WRITE_THROUGH` is
 /// indistinguishable from `std::fs::rename` in-process. Process-wide
-/// because [`store`] is a free function; the tests arm it immediately
-/// before their single forced call and [`publish`] consumes it
-/// one-shot.
+/// because [`store`] is a free function, so it is armed PER PATH:
+/// [`publish`] consumes an arming one-shot, and only when it is
+/// publishing that path. A plain flag was consumed by whichever
+/// checkpoint published next, and other unit tests (the tasks and
+/// memories adapters) publish checkpoints in parallel, so the armed test
+/// sometimes saw its own forced call succeed. A set, not one slot: two
+/// tests arming at once must not overwrite each other.
 #[cfg(test)]
-static FORCE_POST_RENAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FORCE_POST_RENAME: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Arm [`FORCE_POST_RENAME`] for the next [`publish`] of `path`.
+#[cfg(test)]
+fn force_post_rename(path: &Path) {
+    FORCE_POST_RENAME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(path.to_path_buf());
+}
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Checkpoint {
@@ -144,7 +158,18 @@ pub(super) fn store(
 /// unpublished file.
 fn publish(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     #[cfg(test)]
-    let forced = FORCE_POST_RENAME.swap(false, std::sync::atomic::Ordering::AcqRel);
+    let forced = {
+        let mut armed = FORCE_POST_RENAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match armed.iter().position(|p| p == path) {
+            Some(i) => {
+                armed.swap_remove(i);
+                true
+            }
+            None => false,
+        }
+    };
     let outcome = write_atomic_phased(path, bytes);
     #[cfg(test)]
     let outcome = match outcome {
@@ -220,6 +245,30 @@ mod tests {
     /// `rename_write_through` are identical in-process — the
     /// `MOVEFILE_WRITE_THROUGH` distinction is CI/Windows-kernel-level
     /// and was not executed here.
+    /// The forced failure belongs to the path it was armed for. A
+    /// publish of any other checkpoint (another test's, in parallel)
+    /// neither takes it nor disarms it.
+    ///
+    /// Inverse: arm with a plain process-wide flag again and the publish
+    /// of `other` takes the failure, so its `unwrap` panics.
+    #[test]
+    fn a_forced_post_rename_failure_is_armed_for_one_path_only() {
+        let (_dir, redex, name, config) = fixture("cortex/ckpt-armed-path");
+        let target = path(&redex, &name, &config).unwrap().unwrap();
+        let (_other_dir, other_redex, other_name, other_config) = fixture("cortex/ckpt-other-path");
+        let other = path(&other_redex, &other_name, &other_config)
+            .unwrap()
+            .unwrap();
+
+        force_post_rename(&target);
+        publish(&other, b"unarmed").unwrap();
+        assert!(
+            matches!(publish(&target, b"armed"), Err(StorageError::Uncertain)),
+            "the armed path still takes its forced failure"
+        );
+        publish(&target, b"again").unwrap();
+    }
+
     #[test]
     fn post_rename_publish_failure_is_durability_uncertain_on_a_published_checkpoint() {
         let (_dir, redex, name, config) = fixture("cortex/ckpt-post-rename");
@@ -233,7 +282,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"first");
 
         // Forced post-rename failure at the production publish site.
-        FORCE_POST_RENAME.store(true, std::sync::atomic::Ordering::Release);
+        force_post_rename(&path);
         let result = publish(&path, b"second");
         assert!(
             matches!(result, Err(StorageError::Uncertain)),
@@ -251,7 +300,7 @@ mod tests {
         // an unarmed control run establishes a valid envelope.
         std::fs::remove_file(&path).unwrap();
         store(&redex, &name, &config, ORIGIN, b"third", None).unwrap();
-        FORCE_POST_RENAME.store(true, std::sync::atomic::Ordering::Release);
+        force_post_rename(&path);
         let result = store(&redex, &name, &config, ORIGIN, b"fourth", None);
         let msg = match &result {
             Err(CortexAdapterError::Redex(RedexError::Encode(m))) => m.clone(),
