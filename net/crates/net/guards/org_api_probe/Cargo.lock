@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh-sdk"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh-wire"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "blake2 0.11.0",
  "bytes",
