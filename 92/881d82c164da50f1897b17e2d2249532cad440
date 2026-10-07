@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/fold/routing.rs
+  s_24d871c23f1085::t_e5ee8fcd79b0e5 213-296
+docs/internal/plans/CAPABILITY_FOLD_SCALE_PLAN.md
+  s_24d871c23f1085::t_182f2f4bdc626d 682-690,954-1007
+  s_24d871c23f1085::t_74eade5482cdc5 1008
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_24d871c23f1085::t_e5ee8fcd79b0e5 1293-1342,1370,3185-3243
+  s_24d871c23f1085::t_627c324e793167 3244
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "92881d82c164da50f1897b17e2d2249532cad440",
+  "prompts": {},
+  "sessions": {
+    "s_24d871c23f1085": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e35c8197-0611-44d8-b124-600af36bf427",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
