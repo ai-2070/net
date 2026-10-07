@@ -2,7 +2,7 @@
 #
 # The audit compares the shipped headers, header by header, with two kinds of
 # baseline:
-#   * the last release tag's headers (--baseline-ref, default v0.40.0);
+#   * the last release tag's headers (--baseline-ref, default v0.41.0);
 #   * pinned fixtures in tests/c_abi/fixtures/, `<header>.<label>.h`, which
 #     stand in for one header at a point between releases. The first one,
 #     net_cortex.pre1167.h, exists because v0.39.0 never declared the token

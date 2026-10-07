@@ -5348,14 +5348,14 @@ jobs:
       # moved field offset, ...) and requires each to be reported.
       #
       # It also compares the headers, header by header, with the last
-      # release's (v0.40.0) and with the pinned fixtures in
+      # release's (v0.41.0) and with the pinned fixtures in
       # tests/c_abi/fixtures/. A removed or changed declaration fails unless
       # tests/c_abi/breaks.toml authorizes exactly that change. The checkout
       # is shallow and tagless, so the release tag is fetched first.
       - name: Guard — headers, exports and Rust definitions agree (C1 audit)
         if: runner.os == 'Linux'
         run: |
-          git fetch --no-tags --depth=1 origin +refs/tags/v0.40.0:refs/tags/v0.40.0
+          git fetch --no-tags --depth=1 origin +refs/tags/v0.41.0:refs/tags/v0.41.0
           "$PY" -m pip install --quiet pycparser
           "$PY" .github/scripts/check-c-abi.py --self-test
           "$PY" .github/scripts/check-c-abi.py --bundle "$PROD_BUNDLE"
