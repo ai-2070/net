@@ -1,0 +1,32 @@
+.claude/skills/net-browser/concepts.md
+  s_297e9db2706ffd::t_403fa5f30c2920 100-104
+.claude/skills/net-browser/SKILL.md
+  s_297e9db2706ffd::t_403fa5f30c2920 36-37
+net/crates/net/browser-ts/test/node.test.ts
+  s_297e9db2706ffd::t_d81337a9e767ee 10,282-294
+  s_297e9db2706ffd::t_b395484b2d691c 295-296
+.claude/skills/net-browser/store.md
+  s_297e9db2706ffd::t_403fa5f30c2920 285-288
+net/crates/net/browser-ts/README.md
+  s_297e9db2706ffd::t_403fa5f30c2920 579-582
+web/src/content/docs/sdk/browser/session.md
+  s_297e9db2706ffd::t_403fa5f30c2920 27-29
+net/crates/net/browser-ts/src/node.ts
+  s_297e9db2706ffd::t_af81c4c8313825 1244-1248,1254-1263
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e3ed6be624d71e103c58866b6453f25a599f61e6",
+  "prompts": {},
+  "sessions": {
+    "s_297e9db2706ffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dab5b01d-0706-4dfe-98fa-eb10fb0b8d32",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
