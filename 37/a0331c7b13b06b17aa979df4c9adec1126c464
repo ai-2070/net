@@ -1,0 +1,46 @@
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_b4293f9d895548::t_168f471ae7de35 443,473,592,718,761-766
+net/crates/net/src/adapter/net/behavior/fold/audit.rs
+  s_b4293f9d895548::t_168f471ae7de35 31-36
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_b4293f9d895548::t_4673cd3c446b93 4912,5561,6088,6732,8892-8898
+  s_b4293f9d895548::t_5ad06b62e1adaa 4443-4466
+net/crates/net/src/adapter/net/mesh.rs
+  s_b4293f9d895548::t_1ef4c8ba87b3f7 45335-45336,45389,45611-45612,45617-45618,53401-53405,53419,53422-53424,53426,53445-53449
+  s_b4293f9d895548::t_5563f07199f051 45556-45563,45604-45610,45613-45616,45619-45625,45797-45812
+  s_b4293f9d895548::t_47a0895a8fca70 53475
+  s_b4293f9d895548::t_4673cd3c446b93 44993-44999,45001,45003-45005,45047-45051,45065
+  s_b4293f9d895548::t_43fa8b02e155ad 53291-53400,53406-53418,53420-53421,53425,53427-53444,53450-53458
+  s_b4293f9d895548::t_e6a8daf8beef68 45210-45334,45337-45388,45390-45494,45586-45588
+net/crates/net/src/adapter/net/behavior/fold/expiry.rs
+  s_b4293f9d895548::t_168f471ae7de35 158
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_b4293f9d895548::t_1ef4c8ba87b3f7 2201-2210,3431-3436,3465-3467,3482-3483,3488-3491
+  s_b4293f9d895548::t_c1bd069476ffc0 3419-3430,3437-3464,3468-3481,3484-3487,3492-3494
+  s_b4293f9d895548::t_fb4409bb91e8e2 1089-1100,2186-2200,2211-2236
+net/crates/net/src/adapter/net/behavior/fold/metrics.rs
+  s_b4293f9d895548::t_df597936ff2e15 250
+  s_b4293f9d895548::t_168f471ae7de35 153-158,238-249,251-257
+  s_b4293f9d895548::t_580670b7cc9daa 258
+net/crates/net/src/adapter/net/behavior/fold/tag_tests.rs
+  s_b4293f9d895548::t_494fef6bfb05c1 603-612,614-618,620-627,629-649,651-652
+  s_b4293f9d895548::t_df597936ff2e15 613,619,628,650
+docs/internal/plans/CAPABILITY_FOLD_SCALE_PLAN.md
+  s_b4293f9d895548::t_ddf2f27b5a1dfe 2436-2540
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "37a0331c7b13b06b17aa979df4c9adec1126c464",
+  "prompts": {},
+  "sessions": {
+    "s_b4293f9d895548": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8a49f9cc-58d8-4a8f-9aac-096640090b94",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
