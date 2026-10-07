@@ -1810,6 +1810,122 @@ table overhead.
 plan. B2 does not depend on B1. If review prefers, B2 can go first: it
 touches only the index.
 
+#### Owner rulings and corrected B1 contract (2026-10-07)
+
+The owner review of `0a343f6f1` resolved the four open questions. It also
+corrected the B1 proposal above. Where the two differ, **this section
+supersedes the "B1 decisions" above.** It also supersedes the Track B
+introduction's u32 tag ids and id-resolution seam: B1 stores
+string-bearing `TagStr` handles, and readers never resolve ids. The owner
+authorized Slice 6 under this contract. That is not acceptance and not
+permission to merge. Slice 7 starts only after Slice 6 is accepted. Slice
+8 has its own acceptance ledger and is not signed off here.
+
+**Rulings.**
+
+1. **Per-advertisement caps: 256 tags, 256 UTF-8 bytes per tag.**
+   - Count the original vector, duplicates included.
+   - Content and order are preserved. Nothing is truncated, normalized or
+     silently dropped.
+   - 257 tags, or any tag over 256 bytes, rejects the whole
+     advertisement.
+   - The caps are independent of the encoded-message and transport bound.
+   - The same rule applies to legacy, typed, local and restored entries.
+     Local publish entry points (`announce_capabilities*`,
+     `publish_capability_membership`) validate first, so a local producer
+     gets a meaningful error instead of a silent receiver drop.
+   - Tests: exactly 256 is accepted, 257 is rejected, and length is
+     measured in UTF-8 bytes (a multibyte tag at the boundary).
+2. **Budget: fail closed, whole-advertisement rejection.**
+   - Defaults: 1,000,000 canonical tags and 64 MiB of canonical UTF-8 tag
+     data. These are not a process-memory bound or a capacity guarantee.
+     A creation-time budget overrides them.
+   - Dictionary and container overhead is reported separately, not
+     counted against the budget.
+   - Budget arithmetic is **net**: a replacement that releases an old
+     last-use tag frees room for the new one.
+   - A refusal changes nothing: no live payload, index, expiry placement
+     or deadline, publisher revision or cache validity. It increments the
+     normal rejection count plus a typed interner reason and counter, and
+     emits one bounded structured audit record (counts, never tag
+     contents).
+   - Tags already canonical consume no new budget. Ordinary merge and
+     size rules still apply to them.
+   - No partial admission, no eviction of other publishers, no automatic
+     growth.
+3. **`roaring` is approved for Slice 7.**
+   - Use a compatible stable release (0.11.x was consulted), with narrow
+     features. The nightly SIMD feature stays off.
+   - Refresh every tracked lockfile that resolves the package, and
+     exercise the native and wasm feature graphs.
+   - Bitmap serialization is receiver-local, never a wire contract.
+4. **Order: Slice 6, then Slice 7,** each with its own implementation,
+   evidence and performance attribution.
+
+**Corrected B1 contract.**
+
+- **Commit only for accepted mutations.**
+  - Cheap size validation (ruling 1) runs before merge.
+  - Dictionary admission runs only after merge has decided Insert or
+    Replace, inside `Fold::apply`'s existing state + index write guards.
+    There is no second ingestion path.
+  - Admission is all-or-nothing. It computes the net budget effect first,
+    and on refusal nothing has been touched, so there is nothing to roll
+    back.
+  - A stale or rejected advertisement never reaches the dictionary.
+  - Content-based merge and index equivalence, and the warm
+    zero-allocation refresh gate, are preserved.
+- **Liveness is fold-owned, not `Arc`-owned.**
+  - The dictionary keeps an explicit use count per canonical tag,
+    incremented and decremented only by the fold's own stored entries:
+    admit, replace, evict, expire, restore unwind.
+  - Removing the last stored use retires the tag from the dictionary,
+    even if a caller still holds a `TagStr` from a query result or a
+    snapshot. Those handles keep their bytes alive outside the budget,
+    as public query outputs already do today.
+  - The budget therefore describes fold-owned canonical storage.
+  - `TagStr` keeps content-based `Eq` / `Hash` / `Borrow<str>` and
+    immutable data.
+- **Restore is complete or refused.**
+  - Restore first builds the effective restored state: expired rows are
+    dropped, and the later row of a duplicated key wins.
+  - It then validates every row (ruling 1) and preflights the budget over
+    that state.
+  - If anything fails, restore returns an error and **the old fold is left
+    as it was**. Only then does it clear and rebuild.
+  - A successful restore keeps publisher revisions monotonic, rebuilds the
+    indices and keeps the expiry-wheel conservation invariant.
+  - Snapshots are trusted local state. No authentication is added.
+- **Shared backing for raw-tag index keys.** `by_tag` is keyed by
+  `TagStr`, sharing the canonical allocation instead of holding its own
+  `String` per bucket, and is looked up by `&str` through `Borrow`.
+  Synthetic keys stay a separate map: distinct namespace, derived strings.
+  Neither change alters tag sequence or the signature transcript.
+- **Golden oracle.** The old `Vec<String>` encoding is kept in a test as
+  the oracle:
+  - byte equality of the encoded payload and signed envelope;
+  - a signature made over the old type verifies on the new one;
+  - an old snapshot round-trips without a format bump.
+
+  The new admission limits are tested separately from binary-format
+  compatibility.
+
+**B2 wording and invariants, carried into Slice 7.**
+
+- **The free list bounds slot space by the PEAK live entry count, not the
+  current one.** After 1,000 live entries shrink to 100, the table may
+  hold 1,000 positions with 900 free. No compaction is required.
+- Report occupied slots, table capacity and free slots separately. Reuse
+  before growth. Handle `u32` exhaustion without wrapping.
+- Every raw, synthetic, state and region membership of a slot is cleared
+  before the slot is reused, under the coherent state + index guards.
+  Test reuse across a different class and publisher, and through expiry,
+  eviction and restore.
+- Keep explicit `NodeId` sort + dedup and the permanent set-equivalence
+  oracle.
+- Measure bucket memory separately from slot maps, the free list and the
+  wheel, so the 60% bucket-saving target cannot hide new bookkeeping.
+
 ### Track C: allocation-free apply
 
 Independent of B, and smaller:
@@ -2130,8 +2246,9 @@ release notes, or the trait is confirmed crate-private.
 
 Not authorized until Track B1's four decisions (seam, reader access,
 compatibility, lifetime budget) are written into this plan and re-reviewed.
-They are now written: "Track B decisions (proposed 2026-10-07, awaiting
-review)". Review is pending.
+They are written, reviewed and corrected ("Owner rulings and corrected B1
+contract (2026-10-07)"). **Authorized** under that contract. Acceptance is
+separate.
 
 Proof, once authorized:
 
@@ -2150,8 +2267,8 @@ Proof, once authorized:
 
 Not authorized until Track B2's decisions (entry-level identity, ordering,
 slot reclamation) are written into this plan and re-reviewed.
-They are now written: "Track B decisions (proposed 2026-10-07, awaiting
-review)", including the `roaring` sign-off. Review is pending.
+Decisions reviewed: `roaring` and entry-slot identity are approved.
+Implementation stays gated on Slice 6's acceptance.
 
 Proof, once authorized:
 
