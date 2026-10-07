@@ -2637,6 +2637,10 @@ async fn a_full_anchor_refuses_an_offer_as_at_capacity() {
     let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), PSK);
     cfg.rtc = Some(RtcConfig {
         max_peers: 1,
+        // The first session never connects, so the driver reaps it once
+        // its ICE deadline passes. Long enough that the second offer is
+        // always made while the first still holds the slot.
+        ice_deadline: Duration::from_secs(60),
         ..rtc_config()
     });
     let anchor = Arc::new(

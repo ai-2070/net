@@ -983,8 +983,9 @@ pub struct ServeArgs {
     #[arg(long = "credentials-per-minute")]
     pub credentials_per_minute: Option<u32>,
 
-    /// Print every game's counters as a JSON line this often, in
-    /// seconds. 0 (the default) prints none.
+    /// Print the anchor's counters as a JSON line this often, in
+    /// seconds: every game's (when it admits games) and how full its
+    /// RTC session table is. 0 (the default) prints none.
     #[arg(long = "game-stats-secs", default_value_t = 0)]
     pub game_stats_secs: u64,
 
@@ -1527,6 +1528,9 @@ async fn run_serve(
     // game's visitors are rooted at that game) and anonymous credentials.
     let mut _enrollment = None;
     let mut _game_stats = None;
+    // Set when the anchor admits games; the stats loop below runs either
+    // way, because how full the anchor is matters without games too.
+    let mut stats_registry = None;
     let admits_games = !games.is_empty() || args.open_games.is_some();
     if let (true, Some(identity)) = (admits_games, &issuer_identity) {
         let mut registry = net_sdk::game_anchor::GameRegistry::from_identity(identity, games)
@@ -1567,32 +1571,36 @@ async fn run_serve(
             issuance.per_ip_per_minute = limit;
         }
         listener_config.credential_issuance = Some(issuance);
-        if args.game_stats_secs > 0 {
-            let every = std::time::Duration::from_secs(args.game_stats_secs);
-            let stats_node = std::sync::Arc::clone(mesh.node());
-            _game_stats = Some(tokio::spawn(async move {
-                let mut tick = tokio::time::interval(every);
+        stats_registry = Some(registry);
+    }
+    if args.game_stats_secs > 0 {
+        let every = std::time::Duration::from_secs(args.game_stats_secs);
+        let stats_node = std::sync::Arc::clone(mesh.node());
+        _game_stats = Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.tick().await;
+            loop {
                 tick.tick().await;
-                loop {
-                    tick.tick().await;
-                    let mut line = serde_json::json!({ "game_stats": registry.stats() });
+                let mut line = serde_json::json!({});
+                if let Some(registry) = &stats_registry {
+                    line["game_stats"] = serde_json::json!(registry.stats());
                     if let Some(open) = registry.open_stats() {
                         line["open_games"] = serde_json::json!(open);
                     }
-                    // How full the anchor is, beside who it served: a
-                    // node at `max_sessions` refuses every new offer.
-                    if let Some((sessions, max_sessions)) = stats_node.rtc_session_load() {
-                        line["rtc"] = serde_json::json!({
-                            "sessions": sessions,
-                            "max_sessions": max_sessions,
-                            "provisional": stats_node.provisional_count(),
-                            "max_provisional": stats_node.rtc_max_provisional(),
-                        });
-                    }
-                    println!("{line}");
                 }
-            }));
-        }
+                // How full the anchor is, beside who it served: a node
+                // at `max_sessions` refuses every new offer.
+                if let Some((sessions, max_sessions)) = stats_node.rtc_session_load() {
+                    line["rtc"] = serde_json::json!({
+                        "sessions": sessions,
+                        "max_sessions": max_sessions,
+                        "provisional": stats_node.provisional_count(),
+                        "max_provisional": stats_node.rtc_max_provisional(),
+                    });
+                }
+                println!("{line}");
+            }
+        }));
     }
 
     let node = std::sync::Arc::clone(mesh.node());

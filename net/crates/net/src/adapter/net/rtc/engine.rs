@@ -238,12 +238,23 @@ pub async fn handle_signal(
                     }
                 }
                 Err(detail) => {
-                    tracing::warn!(
-                        from_node = format!("{from_node:#x}"),
-                        dialog,
-                        reason = %detail,
-                        "rtc: refused an offer"
-                    );
+                    // A full node is a standing state under load, not an
+                    // anomaly: logged at warn, it would bury the refusals
+                    // that are.
+                    if detail == super::MAX_PEERS_REACHED {
+                        tracing::debug!(
+                            from_node = format!("{from_node:#x}"),
+                            dialog,
+                            "rtc: refused an offer (at capacity)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            from_node = format!("{from_node:#x}"),
+                            dialog,
+                            reason = %detail,
+                            "rtc: refused an offer"
+                        );
+                    }
                     SignalOutcome::Reject {
                         dialog,
                         reason: RtcRejectReason::Busy,

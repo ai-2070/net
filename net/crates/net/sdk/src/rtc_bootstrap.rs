@@ -1897,13 +1897,19 @@ async fn post_offer(
             state.attempts.retire(&attempt_token);
             let message = e.to_string();
             // The check above can lose a race to another offer; the
-            // driver's own capacity refusal is the same answer.
-            let refusal = if message.contains(net::adapter::net::rtc::MAX_PEERS_REACHED) {
-                BootstrapRefusal::AtCapacity
+            // driver's own capacity refusal is the same answer, with the
+            // same count, and the driver's words kept beside it.
+            if message.contains(net::adapter::net::rtc::MAX_PEERS_REACHED) {
+                let message = match state.node.rtc_session_load() {
+                    Some((live, max)) => {
+                        format!("this anchor holds {live} of its {max} RTC sessions ({message})")
+                    }
+                    None => message,
+                };
+                refuse(BootstrapRefusal::AtCapacity, message)
             } else {
-                BootstrapRefusal::OfferRefused
-            };
-            refuse(refusal, message)
+                refuse(BootstrapRefusal::OfferRefused, message)
+            }
         }
     }
 }
