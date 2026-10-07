@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use smallvec::SmallVec;
 
+use super::wheel::{Drain, ExpiryWheel};
 use super::wire::SignedAnnouncement;
 use super::FoldKind;
 
@@ -159,6 +160,10 @@ pub struct FoldEntry<K: FoldKind> {
     /// The background expiry sweeper removes entries past this
     /// time.
     pub expires_at: Instant,
+    /// Handle of this entry's node in the fold's expiry wheel, keyed on
+    /// `expires_at`: the entry's one active expiry placement. Set when
+    /// the entry is installed; `wheel::NIL` before that.
+    pub(super) expiry_node: u32,
 }
 
 /// In-memory store backing a single [`Fold<K>`](super::Fold).
@@ -206,6 +211,11 @@ pub struct FoldState<K: FoldKind> {
     /// after it, or a cache keyed on `(node, rev)` could validate
     /// pre-restore contents against post-restore state.
     last_rev: u64,
+    /// Every entry's deadline, ordered by time, so the expiry sweep
+    /// visits only what is due (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 8).
+    /// Holds exactly one node per entry: `wheel.len() == entries.len()`
+    /// whenever the state lock is released.
+    wheel: ExpiryWheel<K::Key>,
 }
 
 /// Above this many keys, a [`NodeRecord`] keeps a key → position map
@@ -402,7 +412,73 @@ impl<K: FoldKind> FoldState<K> {
             entries: HashMap::default(),
             by_node: HashMap::default(),
             last_rev: 0,
+            wheel: ExpiryWheel::new(Instant::now()),
         }
+    }
+
+    /// Schedule `entry` (about to be installed at `key`) in the expiry
+    /// wheel at its `expires_at`, recording the node on the entry.
+    pub(super) fn schedule(&mut self, key: &K::Key, entry: &mut FoldEntry<K>) {
+        entry.expiry_node = self.wheel.insert(key.clone(), entry.expires_at);
+    }
+
+    /// Move an installed entry's expiry placement to `deadline`. Never
+    /// allocates, so a warm refresh stays allocation-free.
+    pub(super) fn reschedule(&mut self, node: u32, deadline: Instant) {
+        self.wheel.reschedule(node, deadline);
+    }
+
+    /// Drop an entry's expiry placement as the entry leaves `entries`.
+    pub(super) fn unschedule(&mut self, node: u32) {
+        self.wheel.remove(node);
+    }
+
+    /// Whether any entry is due at `now`, and how many wheel nodes the
+    /// check visited. Read-only, so the sweep can decide under the read
+    /// lock that there is nothing to do.
+    pub(super) fn probe_due(&self, now: Instant) -> (bool, usize) {
+        self.wheel.probe_due(now)
+    }
+
+    /// Unschedule up to `max` keys due at `now` onto `out`. The caller
+    /// removes the matching entries before releasing the write lock.
+    pub(super) fn take_due(&mut self, now: Instant, max: usize, out: &mut Vec<K::Key>) -> Drain {
+        self.wheel.take_due(now, max, out)
+    }
+
+    /// Scheduled keys: equal to [`Self::len`] whenever the state lock is
+    /// released.
+    pub(super) fn scheduled_len(&self) -> usize {
+        self.wheel.len()
+    }
+
+    /// Full check of the expiry index against `entries`: one node per
+    /// entry, each recording that entry's key and deadline, with
+    /// consistent lists. O(entries); for tests.
+    #[cfg(test)]
+    pub(crate) fn assert_expiry_index(&self) {
+        self.wheel.assert_consistent();
+        assert_eq!(self.wheel.len(), self.entries.len(), "one node per entry");
+        let mut nodes: HashMap<u32, (&K::Key, Instant)> = HashMap::new();
+        for (at, key, deadline) in self.wheel.scheduled() {
+            nodes.insert(at, (key, deadline));
+        }
+        for (key, entry) in &self.entries {
+            let Some(&(node_key, deadline)) = nodes.get(&entry.expiry_node) else {
+                panic!("entry {key:?} has no expiry node");
+            };
+            assert_eq!(node_key, key, "node key");
+            assert_eq!(deadline, entry.expires_at, "node deadline for {key:?}");
+        }
+    }
+
+    /// The ring position an entry's node is linked into, and the one its
+    /// deadline maps to now. For placement witnesses.
+    #[cfg(test)]
+    pub(crate) fn expiry_position(&self, key: &K::Key) -> Option<(u32, u32)> {
+        let entry = self.entries.get(key)?;
+        let linked = self.wheel.position_of_node(entry.expiry_node)?;
+        Some((linked, self.wheel.position_for(entry.expires_at)))
     }
 
     /// The keys `node` currently owns, if it owns any.
@@ -491,6 +567,7 @@ impl<K: FoldKind> FoldState<K> {
     /// revisions no earlier lookup has seen.
     pub(super) fn clear_for_restore(&mut self) {
         // Dropping the records retires their revision cells.
+        self.wheel.clear(Instant::now());
         self.entries.clear();
         self.by_node.clear();
     }

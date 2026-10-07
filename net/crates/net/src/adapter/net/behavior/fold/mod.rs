@@ -31,6 +31,7 @@ pub mod reservation;
 pub mod routing;
 pub mod snapshot;
 pub mod state;
+mod wheel;
 pub mod wire;
 
 #[cfg(test)]
@@ -400,15 +401,17 @@ impl<K: FoldKind> Fold<K> {
         match action {
             MergeAction::Insert => {
                 // No existing entry to evict; install fresh.
-                let entry = build_entry::<K>(ann);
+                let mut entry = build_entry::<K>(ann);
                 index.on_insert(&key, &entry.payload);
                 state.attach_key(node_id, key.clone());
+                state.schedule(&key, &mut entry);
                 let audit = K::audit_event(EntryTransition::Created {
                     key: &key,
                     new: &entry,
                 });
                 self.emit_audit(audit);
                 state.entries.insert(key, entry);
+                debug_assert_eq!(state.scheduled_len(), state.entries.len());
                 self.metrics.on_insert();
                 self.signal_changed();
                 Ok(ApplyOutcome::Inserted)
@@ -419,12 +422,16 @@ impl<K: FoldKind> Fold<K> {
                 // runtime sound (no `unwrap`) if a future `merge` impl
                 // ever violates that contract: we'd undercount replaces
                 // in metrics, never silently lose data.
-                let new_entry = build_entry::<K>(ann);
+                let mut new_entry = build_entry::<K>(ann);
                 let Some(old_entry) = state.entries.get(&key) else {
                     self.metrics.on_reject();
                     return Ok(ApplyOutcome::Rejected);
                 };
                 let old_owner = old_entry.node_id;
+                // The replacement inherits the entry's one expiry
+                // placement, moved to the new deadline below.
+                new_entry.expiry_node = old_entry.expiry_node;
+                let (expiry_node, deadline) = (new_entry.expiry_node, new_entry.expires_at);
                 // PERF_AUDIT §4.5 — steady-state refresh (same
                 // tags/region/state, new generation/TTL) skips the
                 // index churn. The default `index_payload_equivalent`
@@ -449,6 +456,7 @@ impl<K: FoldKind> Fold<K> {
                 if let Some(slot) = state.entries.get_mut(&key) {
                     *slot = new_entry;
                 }
+                state.reschedule(expiry_node, deadline);
                 // Same owner (always, for a fold keyed on the
                 // publisher): `attach_key` advances the revision and
                 // re-lists the key if the record lost it, so a refresh
@@ -523,6 +531,7 @@ impl<K: FoldKind> Fold<K> {
         let mut removed = 0usize;
         for key in keys {
             if let Some(old_entry) = state.entries.remove(&key) {
+                state.unschedule(old_entry.expiry_node);
                 index.on_remove(&key, &old_entry.payload);
                 let audit = K::audit_event(EntryTransition::Evicted {
                     key: &key,
@@ -534,6 +543,7 @@ impl<K: FoldKind> Fold<K> {
                 removed += 1;
             }
         }
+        debug_assert_eq!(state.scheduled_len(), state.entries.len());
         if removed > 0 {
             self.signal_changed();
         }
@@ -628,14 +638,18 @@ impl<K: FoldKind> Fold<K> {
             // the record, `evict_node(earlier owner)` would remove the
             // later owner's entry.
             if let Some(earlier) = state.entries.remove(&key) {
+                state.unschedule(earlier.expiry_node);
                 index.on_remove(&key, &earlier.payload);
                 state.detach_key(earlier.node_id, &key);
             }
+            let mut entry = entry;
             index.on_insert(&key, &entry.payload);
             state.attach_key(entry.node_id, key.clone());
+            state.schedule(&key, &mut entry);
             state.entries.insert(key, entry);
         }
 
+        debug_assert_eq!(state.scheduled_len(), state.entries.len());
         let new_len = state.entries.len() as u64;
         self.metrics.on_snapshot_restored(new_len);
         // Restore replaced the entire entry set (cleared, then
@@ -864,5 +878,6 @@ fn build_entry<K: FoldKind>(ann: SignedAnnouncement<K::Payload>) -> FoldEntry<K>
         payload: ann.payload,
         received_at: now,
         expires_at: now.checked_add(ttl).unwrap_or(now),
+        expiry_node: wheel::NIL,
     }
 }

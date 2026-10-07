@@ -1154,6 +1154,9 @@ valid.
 
 ### Slices 0–5 at a glance (1M resident unless stated)
 
+Slice 8 (delivered after these) takes the steady sweep to 0.00 ms; see
+"Slice 8" below.
+
 | measure | Slice 0 baseline | after Slice 5 |
 |---|---|---|
 | cache hit rate, 200-node hot set, fleet announcing | 33.8% | 99.8% |
@@ -1988,38 +1991,111 @@ Proof, once authorized:
 - Slice 4's permanent comparison witness stays green.
 - Retained index bytes drop against a separate B1+B2 target.
 
-### Slice 8: time-ordered expiry (Track A2) — held, conditional
+### Slice 8: time-ordered expiry (Track A2) — delivered
 
-Built only if Slice 0's `capability_fold_sweep/steady` at 1M entries, or a
-profile of a production-sized fold, shows the twice-a-second empty walk
-costs more than the wheel's invariant is worth. Otherwise this slice is
-dropped.
+**Why it was built.** The condition was met. After the branch review fixes
+the steady 1M sweep cost **8.7 ms** every 500 ms tick and found nothing.
+Getting there had also taken an offset-resume over a recreated iterator,
+the traversal this plan rules out (see Risks). That was the segmented walk
+from "Branch review fixes", and Slice 8 removes it.
 
-Delivers the per-second buckets with ceiling placement (or the explicitly
-chosen partial-bucket alternative) and one active placement per key,
-maintained by apply, evict, restore and the sweep.
+**What changed from Track A2's draft shape.** The invariants are the plan's.
+The container is not `BTreeMap<u64, HashSet<Key>>`.
 
-Proof:
+- **A hashed timing wheel instead of a bucket map** (`fold/wheel.rs`).
+  - Time is cut into 125 ms slots in a 4,096-position ring (one lap is
+    512 s).
+  - Each position heads an intrusive doubly linked list of nodes. The
+    nodes live in one slab, recycled through a free list.
+  - Each `FoldEntry` holds its node's handle (`expiry_node`).
+  - Why not the draft shape: a refresh moves its key to a later bucket,
+    and a bucket that is new or must grow allocates. That breaks Slice 3's
+    gate (zero allocations on a warm index-equivalent refresh) for
+    whichever refresh lands first in a bucket. A wheel refresh only
+    relinks its node.
+- **Partial-bucket draining, not ceiling placement.** This is the
+  alternative the track allows, chosen explicitly.
+  - A node sits in the slot of its exact deadline. A sweep visits every
+    slot from the cursor through the current one and evicts exactly the
+    nodes with `expires_at <= now`.
+  - Not-yet-due nodes in the current slot stay, and so do nodes a lap
+    ahead.
+  - Expiry stays exact, as with the full walk. Ceiling placement would
+    have let an entry outlive its deadline by up to a slot plus a sweep
+    interval, which a reservation lease should not.
+- **One active placement per key, exactly as specified.**
+  - Insert schedules the node, Replace reschedules the same node, and
+    `evict_node`, restore's duplicate unwind and the sweep unschedule it.
+    Restore clears the wheel with the state and schedules every restored
+    entry.
+  - `wheel.len() == entries.len()` is `debug_assert`ed after every
+    mutation path. Each sweep chunk takes keys out of the wheel and
+    removes their entries in one write-locked critical section, so the
+    invariant also holds at every lock release.
+- **The sweep never walks the primary map.**
+  - A read-locked probe visits only the slots since the previous sweep.
+    An idle sweep stops there, without the write lock.
+  - A due sweep drains in `SWEEP_CHUNK_SIZE` chunks, each under its own
+    `state → index` write acquisition.
+  - The segmented walk, `collect_expired_segment`, `evict_chunk` and the
+    resume arithmetic are gone.
 
-- `steady` drops from a full-map walk to microseconds, and `mass_expiry`
-  holds Slice 2's number or better.
-- The `sum(bucket sizes) == entries.len()` assertion holds after every
-  mutation path in tests, and at every lock release inside a multi-chunk
-  sweep, not only at its end.
-- New witness `multi_chunk_drain_keeps_placement_invariant`: one due bucket
-  larger than `SWEEP_CHUNK_SIZE`; assert the exact-sum invariant between
-  chunks, and that undrained keys remain in their bucket.
-- New witnesses:
-  - `partial_second_deadline_is_never_lost`: a deadline at x.75 s and a
-    sweep at x.5 s; the entry expires by the stated lag.
-  - `refresh_before_old_deadline_moves_placement`: one slot before the
-    refresh, one slot after, in the new bucket.
-  - `evicted_entry_leaves_no_slot`.
-  - `first_sweep_after_restore_evicts_exactly_elapsed`.
-  - `idle_sweep_touches_no_live_entry`.
-  - `sweep_cost_is_independent_of_live_entry_count`: two folds, 1k and
-    100k live entries, the same 100 expired; the visit counter is equal.
-- Refresh bursts and long TTLs are exercised against the same invariant.
+**Measured** (`fold_scale_report`, same machine as "Branch review fixes"):
+
+| measure | before Slice 8 | Slice 8 |
+|---|---|---|
+| steady sweep, 1M | 8.7 ms (1M visited) | **0.00 ms (0 visited)** |
+| steady sweep, 100k | 0.62 ms | 0.00 ms |
+| mass 10%, 1M | 0.99 s | 0.91 s (Slice 2: 0.91 s) |
+| whole fleet, 1M | 12.1 s | 10.5 s |
+| warm index-equivalent refresh, allocations | 0 | **0** (gate holds) |
+| cold insert, allocations per call | — | 1.07 (slab growth, amortized) |
+| retained B/entry, 100k / 1M | 3,233 / 4,124 | 3,317 / 4,199 |
+
+The memory cost is about 80 B/entry. That is the wheel node (key,
+deadline, links), the entry's handle, and the slab `Vec`'s growth headroom.
+A sweep's visit count is the due entries plus one probe hit
+(`yielded / entry` 0.10 at 10% expired, against 1.00 before).
+
+**Witnesses** (fold unit tests unless noted). The plan's names are kept
+where the test is the one named:
+
+- `multi_chunk_drain_keeps_placement_invariant`: a due set of
+  2 × `SWEEP_CHUNK_SIZE` + 100. After each chunk it checks the full index
+  (one node per entry, each with its entry's key and deadline) and that
+  undrained keys stay resident and scheduled.
+- `partial_slot_deadline_is_never_lost` (wheel unit). This is the plan's
+  `partial_second_deadline_is_never_lost` at slot granularity: a deadline
+  at 0.75 of a slot, swept at its half, stays, and is taken at its
+  deadline.
+- `refresh_before_old_deadline_moves_placement`, `evicted_entry_leaves_no_slot`,
+  `first_sweep_after_restore_evicts_exactly_elapsed`,
+  `idle_sweep_touches_no_live_entry`.
+- `sweep_cost_is_independent_of_live_entry_count`. It uses 1k against 10k
+  live entries, not the plan's 100k, to keep a debug-build unit test fast.
+  The visit count is equal either way.
+- Wheel units: `lap_ahead_node_survives_its_shared_position`,
+  `take_due_resumes_across_calls`, `reschedule_moves_the_one_placement`
+  (same handle, no second node), `a_sweep_a_lap_late_takes_everything_due`,
+  `freed_nodes_are_reused`.
+- Checked RED with the fix reverted:
+  - dropping the Replace reschedule fails the refresh witness;
+  - dropping the eviction unschedule fails the eviction witness;
+  - an inexact due check fails both partial-slot witnesses.
+- `take_due_resumes_across_calls` also caught a real bug during
+  development. `max` was compared with `out`'s total length rather than
+  what the call took, so a caller that accumulates looped forever. The
+  sweep clears its buffer per chunk, so it was never exposed in
+  production.
+
+**Changed counters.** `sweep_yielded` now counts wheel nodes visited, not
+primary-map entries. An idle sweep reports 0. `sweep_walks` still counts
+one per sweep. Tests that pinned the old walk's costs
+(`sweep_metrics_count_walks_and_visited_entries`,
+`fold_stats_carry_the_sweep_counters`) pin the new ones.
+`sweep_rechecks_entries_refreshed_or_removed_after_collection` is gone with
+the collection walk it tested: a refresh now moves its node under the
+apply's write lock, so there is no stale candidate left to re-check.
 
 ## Risks
 

@@ -149,6 +149,7 @@ impl<K: FoldKind> FoldSnapshot<K> {
             generation: snap_entry.generation,
             received_at,
             expires_at,
+            expiry_node: super::wheel::NIL,
         })
     }
 }
