@@ -1290,6 +1290,56 @@ pub fn effective_ttl_secs(ann: &CapabilityAnnouncement) -> u32 {
         .min(u64::from(ann.ttl_secs)) as u32
 }
 
+/// The payload's tag strings, its region, and the hardware projection,
+/// from ONE pass over `tags`, which may arrive in any order (the caller
+/// passes a `HashSet`, whose order is unspecified).
+///
+/// The hardware projection decodes only the hardware-axis subset, sorted:
+/// `hardware_from_tags` skips every other axis, and the tags are distinct,
+/// so the sorted subset decodes exactly like the full sorted set the
+/// `views()` path used. The sort is what makes the result independent of
+/// arrival order when two tags set the same field (last one wins);
+/// `translate_projection_is_independent_of_tag_order` pins it with a
+/// deterministic adversarial order.
+///
+/// Each tag renders into one reused scratch buffer and is stored as an
+/// exact-length copy. The stored strings live in the fold for the entry's
+/// lifetime, so they carry no spare capacity: rendering straight into a
+/// per-tag `String` left growth or pre-sizing slack resident in every
+/// payload (~620 B per entry on the bench fixture).
+fn project_tags<'a>(
+    tags: impl IntoIterator<Item = &'a super::super::tag::Tag>,
+) -> (
+    Vec<String>,
+    Option<String>,
+    super::super::capability::HardwareCapabilities,
+) {
+    let tags = tags.into_iter();
+    let mut rendered: Vec<String> = Vec::with_capacity(tags.size_hint().0);
+    let mut region: Option<String> = None;
+    let mut hardware_tags: Vec<super::super::tag::Tag> = Vec::new();
+    let mut scratch = String::new();
+    for tag in tags {
+        scratch.clear();
+        let _ = std::fmt::Write::write_fmt(&mut scratch, format_args!("{tag}"));
+        if region.is_none() {
+            if let Some(r) = scratch.strip_prefix("scope:region:") {
+                region = Some(r.to_owned());
+            }
+        }
+        rendered.push(scratch.as_str().to_owned());
+        if matches!(
+            tag.axis_key_ref(),
+            Some((super::super::tag::TaxonomyAxis::Hardware, _))
+        ) {
+            hardware_tags.push(tag.clone());
+        }
+    }
+    hardware_tags.sort_unstable();
+    let hardware = super::super::tag_codec::hardware_from_tags(&hardware_tags);
+    (rendered, region, hardware)
+}
+
 /// Translate a legacy [`CapabilityAnnouncement`] into a
 /// fold-shaped [`SignedAnnouncement<CapabilityMembership>`]
 /// suitable for [`Fold::apply`] dual-population during the
@@ -1317,38 +1367,7 @@ pub fn translate_announcement(
     ann: &CapabilityAnnouncement,
     verified_owner: Option<VerifiedOwner>,
 ) -> SignedAnnouncement<CapabilityMembership> {
-    // One pass over the tag set builds the payload's tag strings, finds
-    // the region, and collects the hardware-axis tags. The hardware
-    // projection decodes only those: `hardware_from_tags` skips every
-    // other axis, and tags in a set are distinct, so sorting the
-    // hardware subset gives the same projection as sorting all of them.
-    let mut tags: Vec<String> = Vec::with_capacity(ann.capabilities.tags.len());
-    let mut region: Option<String> = None;
-    let mut hardware_tags: Vec<super::super::tag::Tag> = Vec::new();
-    // Each tag renders into one reused scratch buffer, then is stored as
-    // an exact-length copy. The stored strings live in the fold for the
-    // entry's lifetime, so they must carry no spare capacity: rendering
-    // straight into a per-tag `String` left growth or pre-sizing slack
-    // resident in every payload (~620 B per entry on the bench fixture).
-    let mut scratch = String::new();
-    for tag in &ann.capabilities.tags {
-        scratch.clear();
-        let _ = std::fmt::Write::write_fmt(&mut scratch, format_args!("{tag}"));
-        if region.is_none() {
-            if let Some(r) = scratch.strip_prefix("scope:region:") {
-                region = Some(r.to_owned());
-            }
-        }
-        tags.push(scratch.as_str().to_owned());
-        if matches!(
-            tag.axis_key_ref(),
-            Some((super::super::tag::TaxonomyAxis::Hardware, _))
-        ) {
-            hardware_tags.push(tag.clone());
-        }
-    }
-    hardware_tags.sort_unstable();
-    let hw_view = super::super::tag_codec::hardware_from_tags(&hardware_tags);
+    let (tags, region, hw_view) = project_tags(&ann.capabilities.tags);
     let primary_gpu = hw_view.gpu.as_ref();
     let gpu_count =
         (primary_gpu.is_some() as u8).saturating_add(hw_view.additional_gpus.len() as u8);
@@ -3161,6 +3180,66 @@ mod tests {
             region.len(),
             "region carries spare capacity"
         );
+    }
+
+    /// The hardware projection must not depend on tag arrival order
+    /// (Slice 3 review, S3-3). A `HashSet` fixture only USUALLY arrives
+    /// in a discriminating order, so with the sort removed it can still
+    /// pass. This drives `project_tags` with deterministic orders,
+    /// including the adversarial one, reverse-sorted, in which last-wins
+    /// decoding of the conflicting fields picks the opposite value of
+    /// every pair. The setup proves that order discriminates before
+    /// relying on it.
+    #[test]
+    fn translate_projection_is_independent_of_tag_order() {
+        use crate::adapter::net::behavior::tag::Tag;
+        use crate::adapter::net::behavior::tag_codec::hardware_from_tags;
+
+        let raw = [
+            "hardware.memory_gb=64",
+            "hardware.memory_gb=128",
+            "hardware.gpu",
+            "hardware.gpu.vendor=amd",
+            "hardware.gpu.vendor=nvidia",
+            "hardware.gpu.vram_gb=24",
+            "hardware.gpu.vram_gb=80",
+            "inference",
+            "scope:region:eu-west",
+        ];
+        let mut sorted: Vec<Tag> = raw.iter().map(|t| Tag::parse(t).expect("parses")).collect();
+        sorted.sort_unstable();
+        let canonical = hardware_from_tags(&sorted);
+        let reversed: Vec<Tag> = sorted.iter().rev().cloned().collect();
+
+        // Precondition: decoded WITHOUT sorting, the adversarial order
+        // gives a different projection. If it did not, the witness below
+        // could not detect a missing sort, so fail setup instead.
+        assert_ne!(
+            hardware_from_tags(&reversed),
+            canonical,
+            "fixture is not order-sensitive; the witness would be vacuous"
+        );
+
+        let rotated: Vec<Tag> = sorted
+            .iter()
+            .cycle()
+            .skip(3)
+            .take(sorted.len())
+            .cloned()
+            .collect();
+        for (name, order) in [
+            ("sorted", &sorted),
+            ("reversed", &reversed),
+            ("rotated", &rotated),
+        ] {
+            let (tags, region, hardware) = project_tags(order.iter());
+            assert_eq!(
+                hardware, canonical,
+                "hardware projection depends on order ({name})"
+            );
+            assert_eq!(tags.len(), raw.len(), "{name}");
+            assert_eq!(region.as_deref(), Some("eu-west"), "{name}");
+        }
     }
 
     #[test]

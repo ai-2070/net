@@ -679,11 +679,15 @@ the index-equivalent and index-changing replaces separately. Each must
 keep membership, advance the revision, and miss exactly once, so one
 case cannot mask the other.
 
-Not done, kept as the review framed it, a bounded follow-up: a witness
-pinning reverse-index transfer on a different-owner replace. It would
-assert the old and new owners' key sets and revisions, then evict each
-owner, including the old owner's last-key case. The path is correct by
-inspection, and no fold in the tree is keyed on payload alone today.
+The different-owner transfer is a live path, not a hypothetical one.
+`RoutingFold` keys on the destination and lets a better route from
+another publisher replace the entry. `ReservationFold` keys on the
+resource ID and allows legal cross-publisher claims. `IslandTopologyFold`
+keys on a payload ID too, though its merge rejects owner changes. An
+earlier version of this note claimed no fold was keyed on payload alone;
+that was wrong. The witness is now in place:
+`cross_publisher_replace_transfers_the_reverse_index_key` (`routing.rs`).
+See "Slices 2–5 review" below.
 
 ### Slice 4 (cheap query fixes)
 
@@ -946,6 +950,61 @@ Also green:
   default and no-default features;
 - rustdoc;
 - `cargo check --workspace --all-targets`.
+
+### Slices 2–5 review (HOLD at `c5bec507f`)
+
+The review covered `bd9716426..c5bec507f`, which includes Slices 4 and 5.
+
+- **Closed:** S2-1, S3-1 and S3-2, each re-executed by the reviewer.
+- **Passed:** Slice 4's entry-level semantics, Slice 5's associated-type
+  seam with its migration note, and Slice 3's production semantics,
+  including the zero-allocation warm refresh.
+- **Two holds remained, both resolved:**
+  - **S5-1, the unkeyed primary-map hasher.** Already closed by
+    `0fec0a7be` (see "PR #1198 review fixes"), which the reviewed SHA
+    predates. `CapabilityFold::KeyHasher` is the keyed
+    `foldhash::fast::RandomState`: per-map random seed, folded multiply,
+    and the security rationale on the impl.
+    `capability_fold_primary_map_hasher_is_keyed` fails if the unkeyed Fx
+    alias returns. The reviewer's executed witness was 4,096 chosen
+    classes from one authenticated publisher, colliding in the low 16
+    bits and the fingerprint, costing 4,097 equality checks per lookup.
+    It targets Fx's invertible mixer, which is no longer used. **The Fx
+    speedup is not retained.** The measurements under "PR #1198 review
+    fixes" are for foldhash, within about ±5% of Fx on every query bench,
+    and the at-a-glance table shows the foldhash figures.
+  - **S3-3, a non-deterministic order witness.** A conflicting fixture in
+    a randomly iterated `HashSet` only usually arrives in a
+    discriminating order. With the sort removed, the reviewer saw the
+    witness pass on the 7th fresh-process run. Two fixes:
+    - Translate's tag pass is factored into `project_tags`, which takes
+      tags in any order. Production passes the `HashSet` as before.
+    - New witness `translate_projection_is_independent_of_tag_order`
+      drives it with deterministic orders: sorted, rotated and
+      reverse-sorted. Reverse-sorted is the adversarial order, where
+      last-wins decoding picks the opposite value of every conflicting
+      pair. The setup asserts that the unsorted decode of that order
+      differs from the sorted one, so the witness fails setup rather
+      than pass vacuously.
+    - With `hardware_tags.sort_unstable()` removed, the witness failed
+      **10 of 10** fresh-process runs ("hardware projection depends on
+      order (reversed)"). Restored, it passed 5 of 5.
+- **The nonblocking correction is applied.** The payload-only-fold
+  sentence is fixed, above. The deferred transfer witness is added:
+  `cross_publisher_replace_transfers_the_reverse_index_key` (routing
+  fold).
+  - A cross-publisher replace moves the key between records. The old
+    owner keeps its surviving sibling, or drops to absent (revision 0)
+    on its last key, and both revisions advance.
+  - Evicting the old owners removes only what they still own; the
+    transferred entries survive.
+
+**Exact-head CI** at `c5bec507f` was not green. WebRTC timed out in
+`rtc_repairs::a_frame_captured_under_a_retired_incarnation_cannot_revive_its_reassembly`,
+and C consumers (windows-latest) was cancelled. Both are the issues fixed
+on `master` in `4ba25ced9` and `7837be561`, which this branch does not
+yet contain. A green exact-head run needs `master` merged into the
+branch.
 
 ### Slices 0–5 at a glance (1M resident unless stated)
 

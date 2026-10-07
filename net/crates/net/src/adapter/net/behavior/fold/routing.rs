@@ -210,6 +210,90 @@ mod tests {
         Fold::with_sweep_interval(Duration::ZERO)
     }
 
+    /// A cross-publisher replace (lower metric wins) moves the key between
+    /// publishers' reverse-index records. Pins the transfer the fold's
+    /// generic Replace arm performs (CAPABILITY_FOLD_SCALE_PLAN.md,
+    /// Slice 3 review): the old owner keeps only its surviving siblings
+    /// or drops to absent on its last key, the new owner gains the key,
+    /// both revisions move, and evicting the old owner cannot remove the
+    /// entry it lost.
+    #[test]
+    fn cross_publisher_replace_transfers_the_reverse_index_key() {
+        let fold = new_fold();
+        let (kp_a, kp_b, kp_c) = (
+            EntityKeypair::generate(),
+            EntityKeypair::generate(),
+            EntityKeypair::generate(),
+        );
+        let (a, b, c) = (0xA, 0xB, 0xC);
+        let (dest_d, dest_e, dest_f) = (0xD, 0xE, 0xF);
+        let keys = |fold: &Fold<RoutingFold>, node| {
+            fold.with_state(|s| {
+                let mut k = s.keys_for(node).map(<[_]>::to_vec).unwrap_or_default();
+                k.sort_unstable();
+                (k, s.publisher_rev(node))
+            })
+        };
+        let owner = |fold: &Fold<RoutingFold>, dest| {
+            fold.with_state(|s| s.entries.get(&dest).map(|e| e.node_id))
+        };
+
+        // A owns D and E; C owns only F.
+        fold.apply(sign_route(&kp_a, a, 1, dest_d, addr(1), 5, a))
+            .expect("A->D");
+        fold.apply(sign_route(&kp_a, a, 2, dest_e, addr(1), 5, a))
+            .expect("A->E");
+        fold.apply(sign_route(&kp_c, c, 1, dest_f, addr(3), 5, c))
+            .expect("C->F");
+        let (a_keys, a_rev) = keys(&fold, a);
+        assert_eq!(a_keys, vec![dest_d, dest_e]);
+
+        // B takes D from A with a better metric: A keeps its sibling E.
+        let out = fold
+            .apply(sign_route(&kp_b, b, 1, dest_d, addr(2), 3, b))
+            .expect("B->D");
+        assert_eq!(out, ApplyOutcome::Replaced);
+        assert_eq!(owner(&fold, dest_d), Some(b));
+        let (a_keys2, a_rev2) = keys(&fold, a);
+        assert_eq!(a_keys2, vec![dest_e], "A keeps only its surviving sibling");
+        assert!(a_rev2 > a_rev, "losing a key advances A's revision");
+        let (b_keys, b_rev) = keys(&fold, b);
+        assert_eq!(b_keys, vec![dest_d]);
+        assert!(b_rev > 0);
+
+        // B takes F, C's last key: C drops to absent.
+        fold.apply(sign_route(&kp_b, b, 2, dest_f, addr(2), 1, b))
+            .expect("B->F");
+        assert_eq!(owner(&fold, dest_f), Some(b));
+        assert_eq!(
+            keys(&fold, c),
+            (Vec::new(), 0),
+            "C's last key moved: C is absent"
+        );
+        let (b_keys2, b_rev2) = keys(&fold, b);
+        assert_eq!(b_keys2, vec![dest_d, dest_f]);
+        assert!(b_rev2 > b_rev);
+
+        // Evicting the old owners removes only what they still own.
+        fold.evict_node(a, "test");
+        fold.evict_node(c, "test");
+        assert_eq!(owner(&fold, dest_e), None, "A's own entry goes");
+        assert_eq!(
+            owner(&fold, dest_d),
+            Some(b),
+            "the entry A lost survives A's eviction"
+        );
+        assert_eq!(
+            owner(&fold, dest_f),
+            Some(b),
+            "the entry C lost survives C's eviction"
+        );
+
+        fold.evict_node(b, "test");
+        assert_eq!(fold.with_state(|s| s.entries.len()), 0);
+        assert_eq!(fold.with_state(|s| s.by_node.len()), 0);
+    }
+
     #[test]
     fn first_announcement_installs_the_route() {
         let fold = new_fold();
