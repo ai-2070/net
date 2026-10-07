@@ -14,7 +14,7 @@ import { connect } from '@net-mesh/browser';
 
 const node = await connect({
   credentialB64,                          // the anchor's bootstrap credential
-  bootstrapUrl: 'https://anchor.example', // overrides the credential's URL
+  bootstrapUrl: 'https://anchor.ai2070.net', // overrides the credential's URL
 });
 
 await node.subscribe('jobs');

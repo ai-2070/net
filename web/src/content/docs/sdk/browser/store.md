@@ -392,6 +392,26 @@ Capacity and kicks are enforced in front of the game's `authorize`, counted from
 the store's live subscriptions; `lobby.kick(peer)` re-checks every installed
 subscription at once. `lobby.self` is the host's own player (below).
 
+### What a real game runs into
+
+- **An empty list right after connecting is not real yet.** Announcements take
+  a moment to reach a node that just connected. Poll `listLobbies` every half
+  second for a few seconds before showing "no games".
+- **A closed tab's lobby stays listed for a moment.** The host re-announces
+  every 2 seconds and a tab killed outright withdraws nothing, so its listing
+  lasts until the announcement lapses, and joining it answers `not-found`.
+- **Close a joined lobby before creating one on the same node.** Leaving a
+  lobby announces the node's own `tags` again, which replaces the whole tag set
+  and wipes a listing created a moment before. When the host leaves and another
+  player takes over, `await joined.close()` first, then `createLobby`.
+- **Taking over.** A player sees the host go through `subscribeStatus`: an
+  `error.code` of `owner-lost`, or a `phase` of `closed` or `failed`. The player
+  taking over calls `createLobby` with the same `info`, so the others find the
+  same game again under a new code.
+- **Two different `game` names.** `requestCredential({ game })` names the anchor
+  game, which is the isolation boundary. `createLobby({ game })` and
+  `listLobbies({ game })` scope listings within it. They may differ.
+
 ## The host's own player
 
 `hostPlayer(host, { audience })` returns the same handle shape as `joinStore`,

@@ -53,6 +53,10 @@ three things a browser cannot do for itself:
 - **Forward.** Until a pair's ICE connects, the anchor relays their traffic — and
   it keeps relaying for pairs ICE never connects.
 
+NET runs a public anchor at `https://anchor.ai2070.net`. It admits any game id
+from any page, keeping each site's games apart, so a browser game can use it
+without running an anchor at all ([CLI: open games](/docs/reference/cli#a-public-anchor-open-games)).
+
 The feature is **off by default**, and that is a build-cost decision rather than
 a maturity one: `str0m`'s pinned crypto stack resolves `aws-lc-rs`, whose build
 script compiles C, so `--features webrtc` needs cmake and a C toolchain. The

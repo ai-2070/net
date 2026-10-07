@@ -15,7 +15,12 @@ Two things, and neither comes from the page:
 - **An anchor**, reachable over HTTPS.
 - **A bootstrap credential** per player, which that anchor issues.
 
-Run the anchor for your game with the CLI. It needs a certificate browsers
+NET runs a public anchor at `https://anchor.ai2070.net`. It admits any game id
+from any page, with no setup, and keeps each site's games apart: a game is keyed on the
+page's origin plus its id, so two sites that both call their game `chess` never
+meet. Use it and skip to *Connect* below.
+
+To run your own anchor instead, use the CLI. It needs a certificate browsers
 trust, your page's origin, a pre-shared key file and an issuer key file
 (`net-mesh identity generate --out issuer.toml`):
 
@@ -41,9 +46,9 @@ engine rather than disabling certificate checking.
 ```typescript
 import { connect, rememberedIdentity, requestCredential } from '@net-mesh/browser';
 
-// An anonymous credential for this player, from your game's anchor.
+// An anonymous credential for this player, from the public anchor (or your own).
 const { credentialB64, bootstrapUrl } = await requestCredential({
-  anchorUrl: 'https://anchor.example.com',
+  anchorUrl: 'https://anchor.ai2070.net',
   game: 'my-game',
 });
 ```
@@ -56,7 +61,7 @@ first player that uses it.
 const node = await connect({
   ...rememberedIdentity(),
   credentialB64,                          // the whole `net-bootstrap:…` string
-  bootstrapUrl: 'https://anchor.example', // optional; the credential carries one
+  bootstrapUrl: 'https://anchor.ai2070.net', // optional; the credential carries one
 });
 
 console.log(node.nodeIdHex(), node.anchorIdHex());

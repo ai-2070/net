@@ -13,7 +13,7 @@ const session = await openSession({
 });
 
 // A harness, or a page that is deliberately the one node: THIS TAB's node.
-const node = await connect({ credentialB64, bootstrapUrl: 'https://anchor.example' });
+const node = await connect({ credentialB64, bootstrapUrl: 'https://anchor.ai2070.net' });
 ```
 
 | | `connect()` | `openSession()` |
@@ -43,7 +43,7 @@ doing nothing — that is the point of the typed surface.
 ```typescript
 const node = await connect({
   credentialB64,                                    // minted by the anchor
-  bootstrapUrl: 'https://anchor.example',           // optional; the credential carries it
+  bootstrapUrl: 'https://anchor.ai2070.net',         // optional; the credential carries it
 });
 ```
 
@@ -80,6 +80,51 @@ anchor records which game admitted each session and neither floods, replays
 nor relays between games, so a player never discovers another game's lobbies.
 `examples/anchor-acceptance` runs the whole flow with real browsers, a rival
 game included.
+
+**`rememberedIdentity()` or a fresh identity per load.** Remembering keeps the
+player the same across visits, but a reloaded page then comes back as the node
+it was, while the host may still hold that node's old session. A game whose
+players needn't persist can leave `rememberedIdentity()` out: each load is a new
+player, and a reload never collides with itself (Rose & Blade does this). Two
+tabs that each call `connect()` without it are two separate nodes.
+
+**The public anchor, and overriding it.** Unless you need your own, use
+`https://anchor.ai2070.net` (`--open-games`: any game id, keyed on the page's
+origin). Read an override from the page URL so the same build can run against
+a local anchor:
+
+```typescript
+const anchorUrl = new URLSearchParams(location.search).get('anchor') ?? 'https://anchor.ai2070.net';
+```
+
+**A local anchor for development.** The full set of flags a dev script needs,
+from Rose & Blade's dev script:
+
+```sh
+net-mesh --output ndjson anchor serve \
+  --bind 127.0.0.1:0 --psk-file psk.hex \
+  --listen 127.0.0.1:8444 --url https://localhost:8444 \
+  --rtc-bind 127.0.0.1:0 \
+  --tls-cert cert.pem --tls-key key.pem \
+  --issuer-identity issuer.toml --insecure-permissions \
+  --game my-game --allow-origin https://localhost:8443 \
+  --game-stats-secs 5     # optional: per-game counters on stdout
+```
+
+- `psk.hex` is 32 random bytes as hex; `issuer.toml` comes from `net-mesh
+  identity generate --out issuer.toml`. Keep both private.
+- The certificate comes from **mkcert** (`mkcert -install` once, then `mkcert
+  -cert-file cert.pem -key-file key.pem localhost 127.0.0.1`), so the browser
+  trusts it. `localhost` counts as a secure context, so the page itself may be
+  served over plain HTTP on one machine; across a LAN both page and anchor
+  need HTTPS, and every machine must trust your mkcert CA.
+- `--insecure-permissions` accepts key files with loose permissions (Windows,
+  a checked-out dev folder). Never on a real anchor.
+- With `--output ndjson`, wait for the line carrying `credential_endpoint`
+  before opening the page: the anchor is ready then.
+- The binary needs the `rtc-bootstrap` feature: download the prebuilt
+  `net-mesh-anchor-v<version>-<platform>` archive from the GitHub release, or
+  `cargo install net-cli --features rtc-bootstrap`.
 
 **ICE configuration.** `iceServers` is optional with a working default: omitted,
 the leaf gathers against the `stun_addr` the anchor announces on `GET
@@ -139,7 +184,46 @@ Rules that bite:
   newer attempt), offering only after an inconclusive one. Every offer replaces
   the pair's link, so this is what lets a lobby, a store and netcode each reach
   the same host. This holds per node: another tab's node is outside the rule,
-  as it is outside the surface.
+  as it is outside the surface — and so is **the other page**. See the next
+  bullet.
+- **Two pages offering to each other at once is glare.** The idempotency above
+  stops a node cancelling *its own* attempt; nothing stops page A's offer
+  cancelling page B's. It bites after an attempt **ended** (`iceTimeout`,
+  `udpBlocked`, `failed`): if both pages offer again, each new offer cancels the
+  other's attempt, both run out their ICE deadline, and the pair stays relayed
+  for good. Give the pair one offerer: when the last attempt ended, only the page
+  whose node id is the **lower** (`myId < peerId`, hex strings compare
+  correctly) offers again, and the other answers. For a first contact, let the
+  page new to the group reach out and have the others wait a few seconds
+  before reaching it (Rose & Blade waits 3 s).
+- **Answer by state, not by memory.** The answering page calls `acceptPeer(id)`
+  whenever `peerAttempt(id)` shows the pair is neither direct nor connecting,
+  whoever offered before. With no offer waiting, `acceptPeer` gives up after a
+  few seconds and changes nothing, so polling it (e.g. once a second, per peer
+  you have a stream with) is safe. Gating it on sticky flags ("we offered once",
+  "it was direct once") leaves every later offer unanswered: each runs out its
+  ICE deadline. Read `peerAttempt` as:
+
+  | `peerAttempt(id)` | The pair is | Offer? Answer? |
+  |---|---|---|
+  | `direct: true` | direct | neither |
+  | `state` `gathering` or `open`, not direct | connecting | neither: a new offer cancels it |
+  | `state` `iceTimeout`, `udpBlocked` or `failed` | ended, relayed | lower id offers, higher id answers |
+  | throws | never attempted | the page reaching out offers |
+
+- **Don't wait for direct before playing.** The relayed session is up long
+  before ICE finishes, and most direct links land after the first second or so.
+  Race `connectPeer` against a short timer (Rose & Blade uses 1.5 s), open the
+  stream on the relayed session, and record the real outcome when the full
+  promise settles. The stream goes stale when the pair upgrades (see *Streams*),
+  so reopen it on the next send that fails:
+
+  ```typescript
+  const full = node.connectPeer(peer);
+  full.then((outcome) => { if (outcome.type === 'direct') markDirect(peer); }).catch(() => {});
+  await Promise.race([full, new Promise((r) => setTimeout(r, 1500))]);
+  const stream = node.openStream({ reliability: 'fireAndForget', peer, label, lossy: true });
+  ```
 - **ICE may fail.** `outcome` is a reading, not a promise of connectivity; see
   `errors.md` for what an ICE failure does and does not prove, and
   `refineIceFailure` (a `BrowserNode` method) for turning a raw failure into a
@@ -220,6 +304,50 @@ for await (const event of node.events()) { /* … */ }
   `channel_message` by hash. Byte payloads arrive decoded as `Uint8Array`.
 - A throwing listener is reported to the console and skipped — it neither takes
   down its siblings nor unwinds into the wasm frame that called it.
+
+## Staying connected: background tabs
+
+A page left in the background (another tab, another program in front) can lose
+its session with the anchor: the browser throttles or freezes it, and the
+anchor drops it. The node then neither sees other players' lobbies nor is seen
+hosting one, and nothing in the page's own state says so. Check before relying
+on the node, and when the page comes back to the front:
+
+- **`disconnected` events** (`node.onEvent`) catch the loss the leaf noticed.
+  Record it; don't rebuild from inside the listener.
+- **A probe catches the rest.** Call a service nobody serves:
+  `node.call('my-game.alive', new Uint8Array(0), 5000)`. The anchor itself
+  refuses it, so a rejection with `kind === 'rpc-refused'` **proves the session
+  is alive**; a timeout means it is gone. A `query` won't do: the node answers
+  it from what it last heard.
+- **Re-check on `visibilitychange`** to `visible`, and before showing a lobby
+  list or hosting if the last check is older than ~20 s. One check at a time;
+  everything that asks waits on it.
+- **Lost: close the node and `connect()` a new one**, as a reload would. With a
+  fresh identity per load (see *The anchor and the bootstrap credential*) the
+  new node never collides with the old session.
+- **Not mid-match.** A match keeps its node; a heartbeat (Rose & Blade sends
+  one a second from a background tab) keeps the other players from taking the
+  page for gone.
+
+```typescript
+async function alive(node: BrowserNode): Promise<boolean> {
+  return Promise.race([
+    node.call('my-game.alive', new Uint8Array(0), 5000).then(
+      () => true,
+      (error) => error?.kind === 'rpc-refused',
+    ),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5500)),
+  ]);
+}
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && !inMatch && !(await alive(node))) {
+    node.close();
+    const { credentialB64, bootstrapUrl } = await requestCredential({ anchorUrl, game });
+    node = await connect({ credentialB64, bootstrapUrl });
+  }
+});
+```
 
 ## Identity and the origin trust boundary
 

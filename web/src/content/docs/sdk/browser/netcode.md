@@ -144,6 +144,51 @@ lowest-RTT samples), `SnapshotBuffer` and `lerpNumbers`.
 - **The anchor must be the same release as the package.** An older anchor does
   not know the lossy channel and treats it as the page's only one.
 - **Frames are JSON.** Binary encoding is not built yet.
+- **`interpolationDelayMs` is fixed.** On bursty links, such as a relayed pair
+  or busy Wi-Fi, a fixed delay either stutters or adds lag everyone feels. If
+  remote entities stop and jump, raise it, or adapt it in a custom loop (below).
+
+## Without a host: a full mesh
+
+`hostNetcode` and `joinNetcode` assume one authoritative host. A game in which
+each page simulates what it owns (its own player, and shared objects for
+whichever page leads) can skip them and build on the same parts. Rose & Blade, a
+three.js melee game with physics ragdolls and up to 16 players, works this way:
+
+- **Transport.** One lossy stream from each page to every other, reopened when
+  it goes stale. Each pair goes direct with one offerer (see
+  [Two pages, one offerer](/docs/sdk/browser/session#two-pages-one-offerer)).
+- **Ownership.** Every page broadcasts its own entities. One page leads (shared
+  AI, props, the match clock); when it leaves, the next takes over, and re-opens
+  the lobby.
+- **Rate.** 120 broadcasts a second, at most one per rendered frame, dropping to
+  60 above 8 players, because each page uploads to every other: at 8 against 8,
+  120 a second is about 9 Mbit/s up. Rarely-changing fields ride a 60 Hz pulse,
+  so a higher send rate does not multiply their cost.
+- **An adaptive interpolation delay.** Each sender's frames are shown `delay`
+  in the past: the 95th percentile of how late its frames arrived over the last
+  3 seconds, plus 1.2 frame gaps, plus a few milliseconds, clamped to 12–400 ms.
+  The delay rises at once when frames come later and eases back down over about
+  a second. That is 30–45 ms on a good link, where a fixed 40 ms ran dry
+  whenever a frame came late.
+- **Events ride several broadcasts.** A hit or a cut is resent on the 1st, 2nd,
+  3rd, 5th, 9th, 17th… broadcast after it happens, for a bounded window, and the
+  receiver takes each once by its id. That survives a lost broadcast without
+  every frame carrying every event.
+- **Cold fields are sent when they change.** Fields that change every frame go
+  every time. The rest of each entity is a versioned part sent when it changes
+  (and again 1, 2, 4, 8… broadcasts later), in full twice a second, and to a page
+  that just joined. A receiver missing a version treats that entity as lost for
+  the broadcast rather than mixing old and new.
+- **Frames stay under the event bound.** Anything over 7000 bytes is split into
+  parts, below the leaf's 8104-byte events.
+- **Liveness.** A backgrounded page sends no frames, so it sends a heartbeat
+  once a second. A page silent for 4 seconds is taken for gone, and its entities
+  stay drawn 2.5 seconds longer for whoever takes them over.
+- **Measure each link.** A ping and pong on the same stream feeds one
+  `ClockEstimator` per peer (median round trip, jitter), and
+  `peerAttempt(peer).direct` says whether each pair is direct. Show both in a
+  debug overlay.
 
 ## A dedicated host in Node
 

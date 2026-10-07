@@ -349,6 +349,28 @@ writes.
   to `joinLobby` (a joiner announces a `seek` tag so the host can find it, and
   an announcement replaces the whole tag set). Unlisted lobbies are not secret —
   gate with `authorize`. Codes: `lobby.link()` / `lobbyCodeFromUrl()`.
+- **Lobby gotchas a real game hit** (Rose & Blade):
+  - **An empty `listLobbies` right after `connect()` is not real yet.**
+    Announcements take a moment to reach a node that just connected. Poll
+    every 500 ms for about 4 s before showing "no games".
+  - **A closed tab's lobby stays listed until its announcement lapses.** The
+    host re-announces every `LOBBY_ANNOUNCE_MS` (2 s); a tab killed outright
+    withdraws nothing. Expect a stale entry for a short while, and a
+    `joinLobby` that answers `not-found`.
+  - **Close a joined lobby before creating one on the same node.** Closing
+    the joiner announces the node's own `tags` again, and an announcement
+    replaces the whole tag set, so it wipes a listing created a moment before.
+    This matters when the host leaves and another player takes over: `await
+    joined.close()` first, then `createLobby`.
+  - **Taking over a lobby.** The joiner sees the host go as
+    `subscribeStatus` with `error.code === 'owner-lost'` or `phase` `closed` /
+    `failed`. The new host re-opens it with `createLobby` and the same `info`
+    (Rose & Blade carries its fight id there), so the others find the same
+    game under a new code.
+  - **The credential's `game` and the lobby's `game` are separate names.**
+    `requestCredential({ game })` picks the anchor game (the isolation
+    boundary); `createLobby({ game })` / `listLobbies({ game })` scope the
+    listings inside it. They may differ.
 - **Discovery before join** (without a lobby). Share the host's `node.nodeIdHex()` out of band (the
   demo uses a `?host=<hex>` link). The host announces a tag and **re-announces
   every ~2 s** — announcements are leases that expire. The joiner polls

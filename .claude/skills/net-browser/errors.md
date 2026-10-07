@@ -189,6 +189,13 @@ this build does not know to `'replaced'`. A proxied follower receives the
 **precise** retire reason across the leader proxy, so a byte-budget retirement
 is no longer reported as cancelled on a follower.
 
+## `rpc-refused` as a liveness answer
+
+`rpc-refused` is an answer, so it proves the far end is there. A page checking
+whether its session with the anchor survived a stay in the background calls a
+service nobody serves: `rpc-refused` means alive, a timeout means the session
+is gone. See `session.md` § *Staying connected: background tabs*.
+
 ## Store errors
 
 A refused store operation is a `StoreError` with its own `.code` — a closed set
