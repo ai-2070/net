@@ -68,13 +68,11 @@ pub type NodeId = u64;
 /// different hasher. This is the same trade `rustc-hash` makes, and
 /// the same caveat applies.
 ///
-/// **One implementation, two aliases.** [`BuildU64Hasher`] here and
-/// `capability::BuildU64TupleHasher` both build this type; the
-/// arity lives in the alias names, not in the mixer, which only ever
-/// sees a sequence of `write_u64` calls. They were briefly two
-/// byte-identical copies — same constant, same fallback — which meant
-/// a correction to one (this note being the obvious candidate) would
-/// silently miss the other. Per-site rationale belongs on the aliases.
+/// **One implementation.** [`BuildU64Hasher`] is its alias. The
+/// capability index's `(u64, u64)` alias went with Slice 7, when its
+/// buckets became bitmaps over entry slots
+/// (CAPABILITY_FOLD_SCALE_PLAN.md). Per-site rationale belongs on the
+/// alias.
 #[derive(Default, Clone)]
 pub struct FxU64Hasher(u64);
 
@@ -888,6 +886,13 @@ pub enum PayloadRejection {
         /// The cap.
         max: usize,
     },
+    /// The secondary index has no slot left for a new entry: every one
+    /// of its `slots` positions is occupied. Never wraps.
+    #[error("index full: all {slots} entry slots are occupied")]
+    IndexFull {
+        /// The slot-space size.
+        slots: usize,
+    },
     /// Admitting the payload's new tags would exceed the fold's
     /// canonical-tag budget, after counting what a replacement frees.
     #[error(
@@ -911,9 +916,10 @@ pub enum PayloadRejection {
 }
 
 impl PayloadRejection {
-    /// Whether this is a budget refusal rather than a size-limit one.
+    /// Whether this is a capacity refusal (the tag budget or the index's
+    /// slot space) rather than a size-limit one.
     pub fn is_budget(&self) -> bool {
-        matches!(self, Self::TagBudget { .. })
+        matches!(self, Self::TagBudget { .. } | Self::IndexFull { .. })
     }
 }
 

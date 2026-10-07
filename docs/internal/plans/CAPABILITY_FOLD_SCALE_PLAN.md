@@ -2555,6 +2555,134 @@ Proof, once authorized:
 - Slice 4's permanent comparison witness stays green.
 - Retained index bytes drop against a separate B1+B2 target.
 
+#### Slice 7 evidence packet (implemented; awaiting acceptance)
+
+Implemented under the B2 decisions and the owner's B2 wording and
+invariants, with the owner's go-ahead (2026-10-07). Slice 6 is not yet
+formally accepted.
+
+**What landed.**
+
+- **`roaring` 0.11.5**, a direct dependency of the core crate with
+  `default-features = false, features = ["std"]`. The nightly `simd`
+  feature is off: `cargo tree -e features -i roaring` shows no `simd`.
+  - All eight tracked lockfiles that resolve `net-mesh` were refreshed.
+    Each gains exactly `roaring`, `bytemuck` and `byteorder`; the root
+    lockfile already had the last two.
+  - The wire crate's host and `wasm32-unknown-unknown` graphs have no
+    `roaring` edge. `roaring` with these features builds for
+    `wasm32-unknown-unknown`. The bitmaps are receiver-local and never
+    serialized to the wire.
+- **`SlotTable`** (`fold/capability.rs`): one dense `u32` slot per indexed
+  `(class, node)` entry.
+  - `slot_of` uses a keyed hasher (`foldhash`), because `class_hash` is
+    publisher-chosen. `key_of` maps a slot back to its key.
+  - Freed slots go on a free list and are reused before the table grows.
+    The slot space is bounded by the PEAK live entry count; nothing is
+    compacted.
+  - It ends at `limit` (`u32::MAX` positions) and never wraps. An Insert
+    with no slot available is refused in `admit` (before the dictionary)
+    as the new `PayloadRejection::IndexFull`, counted as a capacity
+    refusal. Restore preflights the row count.
+- **Buckets are `RoaringBitmap`s of slots** in `by_tag`, `by_synthetic`,
+  `by_region` and `by_state`.
+  - `on_remove` clears every raw, synthetic, region and state bit of the
+    entry, then releases the slot, all under the index write lock. A
+    reused slot inherits nothing.
+  - Identity is the entry, so a class-A tag and a class-B tag of one node
+    never combine.
+- **The resolver works on bitmaps.**
+  - AND is `&=` seeded from the smallest set; OR is `|=`. A single
+    constraint borrows its bucket.
+  - The class predicate filters by the slot's key.
+  - `CandidateKeys` exposes `keys()` (slot order) and `len()`. Every
+    node-returning consumer still sorts and deduplicates explicitly, at
+    `capability_bridge.rs` 566, 1549, 1779 and 1976, unchanged.
+- **The permanent set-equivalence oracle is kept.**
+  `resolve_candidate_keys_pre_slice4` now computes on key sets read out
+  of the buckets, sharing no set algebra with the bitmap resolver.
+  - A second, fully independent oracle, `brute_force`, scans every
+    entry's payload with the same synthetic derivation.
+  - Both are asserted on all 720 filter combinations in both arrival
+    orders.
+- The capability-index `BuildU64TupleHasher` alias had no users left and
+  is removed. `fold_id_hasher_is_a_real_mixer` keeps the remaining
+  alias's check.
+- **`CapabilityIndexInner::memory_breakdown()` → `IndexMemory`.** Bucket
+  maps, sets and owned key strings are reported separately from the slot
+  table, the free list, and occupied, capacity and free slot counts. The
+  reporter prints it, so a bucket saving cannot hide bookkeeping.
+
+**Measured** (`fold_scale_report`, same machine; the Slice 6 numbers are
+from `37a0331c7`, re-run here):
+
+| measure | Slice 6 | Slice 7 |
+|---|---|---|
+| index buckets, B/entry, 100k (target ≤ 333, 60% under 832) | 832 | **12** |
+| index buckets, B/entry, 1M (target ≤ 512, 60% under 1,280) | 1,280 | **10** |
+| slot table, B/entry, 100k / 1M (new bookkeeping) | – | 64 / 78 |
+| buckets + slots, B/entry, 100k / 1M | 832 / 1,280 | 76 / 88 |
+| retained, B/entry, 100k | 2,184 | **1,431** |
+| retained, B/entry, 1M | 3,066 | **1,875** |
+| warm index-equivalent refresh, allocations (gate) | 0 | **0** |
+| evict, allocations per call | 0.00 | 0.01 (8 per 1,000) |
+| mixed: refresh apply p50 / p99 | 18.0 / 45.0 µs | 14.1 / 45.6 µs |
+| mixed: selective query p50 / p99 | 5.6 / 207 µs | 4.8 / 168 µs |
+| mixed: broad query p50 (~500k matches) | 15.75 ms | **17.68 ms** |
+| mixed: sweep tick p50 | 828 µs | 607 µs |
+
+- **The broad-query regression is real.** Slice 7 measured 17.68, 17.58
+  and 17.37 ms over three runs, about +11%. That is about 4 ns per match
+  over 500k matches: bitmap iteration plus a slot-to-key lookup per
+  match. It is the trade for −98% bucket memory. The baseline is one run
+  of 39 samples.
+- **Evict allocations.** A removal that shrinks a bitmap container below
+  its conversion threshold reallocates it, and the eviction path now
+  shows 8 allocations per 1,000 evictions. Only the warm refresh is
+  gated.
+- **Not run:** the Criterion `net` bench's `capability_fold_query` rows.
+
+**Witnesses**, all in `fold/capability.rs` tests:
+
+- `cross_class_split_predicate_does_not_match`: the plan's witness, plus
+  the `tags_all` / `tags_any` split.
+- `output_order_independent_of_arrival`: opposite arrival orders, churn
+  (evict and re-add) and a restore, with an identical, sorted
+  `find_nodes_matching` output and identical resolver key sets.
+- `reused_slot_inherits_no_membership`: a slot freed by eviction, expiry
+  or restore, reused by a different class and publisher. The raw,
+  synthetic, region and state buckets are all clean.
+- `slot_space_tracks_the_peak_and_reuses_before_growth`: 1,000 entries
+  shrink to 100, giving 100 occupied / 1,000 capacity / 900 free. Fifty
+  more reuse slots: 150 / 1,000 / 850.
+- `exhausted_slot_space_refuses_an_insert_and_never_wraps`: `IndexFull`
+  with nothing admitted, a Replace at the limit succeeds, and a freed
+  slot makes room.
+- `resolve_candidate_keys_matches_pre_slice4_resolver`: Slice 4's
+  permanent oracle plus the payload scan.
+- **RED-checked:**
+  - keeping a state bit on removal fails the reuse witness;
+  - node-keyed slots fail the class split;
+  - growing instead of reusing fails the reuse and peak witnesses;
+  - dropping the exhaustion check fails the exhaustion witness;
+  - an AND that skips a set fails the oracle.
+
+**Gates.** All of these pass:
+- the unit suite, 6,050 tests;
+- 53 capability, nRPC, RPC, gang, island, aggregator, sensing and
+  cross-language integration binaries, 360 tests;
+- `cargo check --workspace --all-targets`;
+- clippy, strict in three configurations and all-targets;
+- `RUSTDOCFLAGS=-D warnings cargo doc --all-features`;
+- fmt.
+
+**Release migration note, in addition to Slice 6's:**
+- `PayloadRejection` gains `IndexFull`, so an exhaustive `match` needs
+  an arm.
+- `CapabilityIndexInner` and the new `IndexMemory` are re-exported from
+  `fold`.
+- `roaring` is a new dependency.
+
 ### Slice 8: time-ordered expiry (Track A2) — delivered
 
 **Why it was built.** The condition was met. After the branch review fixes

@@ -2270,45 +2270,17 @@ fn apply_moves_the_payload_instead_of_cloning_it() {
 }
 
 // ---------------------------------------------------------------
-// Review §2 — one mixer behind both index aliases.
+// The fold-id mixer is not degenerate.
 // ---------------------------------------------------------------
 
-/// `state::BuildU64Hasher` (fold ids) and
-/// `capability::BuildU64TupleHasher` (capability index keys) were
-/// briefly two byte-identical `Hasher` impls — same rotate/xor/multiply
-/// step, same `FX_SEED`, same byte fallback — with nothing linking
-/// them, so a correction to either would silently miss the other.
-///
-/// They now alias one `FxU64Hasher`. This pins that behaviorally
-/// rather than structurally: feed both the SAME sequence of
-/// `write_u64` calls and require the same digest. A re-fork that
-/// changed the constant, the rotate, or the operation order in one
-/// copy fails here; a re-fork that copied it faithfully would not,
-/// which is fine — that one cannot drift by definition.
+/// `BuildU64Hasher` builds a real mixer: distinct inputs, distinct
+/// digests, and a non-zero digest for a non-zero input. (Its twin
+/// capability-index alias was removed with Slice 7's bitmap buckets.)
 #[test]
-fn both_index_hasher_aliases_are_the_same_mixer() {
+fn fold_id_hasher_is_a_real_mixer() {
     use std::hash::{BuildHasher, Hasher};
 
-    // A tuple key's own sequence, so the arity the alias names
-    // advertise is exercised rather than assumed away.
-    let writes: [u64; 3] = [0, 0xDEAD_BEEF_CAFE_F00D, u64::MAX];
-
-    let digest = |h: &mut dyn Hasher| {
-        for w in writes {
-            h.write_u64(w);
-        }
-        h.finish()
-    };
-
-    let mut ids = BuildU64Hasher::default().build_hasher();
-    let mut keys = super::capability::BuildU64TupleHasher::default().build_hasher();
-    assert_eq!(
-        digest(&mut ids),
-        digest(&mut keys),
-        "the fold-id and capability-index aliases must build one mixer",
-    );
-
-    // And the mixer is not the degenerate one an accidental
+    // The mixer is not the degenerate one an accidental
     // `write_u64` no-op would leave behind: distinct inputs, distinct
     // digests, and a non-zero digest for a non-zero input.
     let once = |v: u64| {

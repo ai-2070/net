@@ -371,6 +371,10 @@ reed-solomon-erasure = { version = "6", optional = true, default-features = fals
 lru = "0.18"
 smallvec = "1.16"
 foldhash = "0.2"
+# Capability-fold inverted-index buckets (CAPABILITY_FOLD_SCALE_PLAN.md
+# Slice 7): compressed bitmaps over dense per-entry slots. `std` only; the
+# nightly `simd` feature stays off. Receiver-local, never a wire format.
+roaring = { version = "0.11", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "3", features = ["rand_core", "zeroize"], optional = true }
 # X25519 DH for the `IdentityEnvelope` sealed-box construction used
 # by daemon migration. We derive an ephemeral pubkey, DH against the

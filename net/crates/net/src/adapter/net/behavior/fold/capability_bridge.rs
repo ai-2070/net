@@ -558,11 +558,10 @@ pub fn public_owned_providers(fold: &Fold<CapabilityFold>, tag: &str) -> Vec<Own
     let fold_filter = translate_filter(&legacy);
     fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
-        let candidates = candidates.as_set();
 
         // Phase 1 — which publishers advertise `tag` at all. Tag-filtered
         // by construction; ownership is NOT decided here.
-        let mut publishers: Vec<NodeId> = candidates.iter().map(|&(_, node)| node).collect();
+        let mut publishers: Vec<NodeId> = candidates.keys().map(|(_, node)| node).collect();
         publishers.sort_unstable();
         publishers.dedup();
 
@@ -1557,9 +1556,8 @@ pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -
     // every match before the caller can discard it.
     let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
-        let candidates = candidates.as_set();
         let mut ids: Vec<NodeId> = Vec::with_capacity(candidates.len());
-        for &key in candidates {
+        for key in candidates.keys() {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
             };
@@ -1779,9 +1777,8 @@ pub fn find_nodes_matching_scoped(
     let prepared = PreparedScope::new(scope);
     let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
-        let candidates = candidates.as_set();
         let mut acc: Vec<NodeId> = Vec::with_capacity(candidates.len());
-        for &key in candidates {
+        for key in candidates.keys() {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
             };
@@ -1976,9 +1973,8 @@ fn candidates_for_selection(
     let prepared = scope.map(PreparedScope::new);
     fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
-        let candidates = candidates.as_set();
         let mut admitted: Vec<NodeId> = Vec::with_capacity(candidates.len());
-        for &key in candidates {
+        for key in candidates.keys() {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
             };
