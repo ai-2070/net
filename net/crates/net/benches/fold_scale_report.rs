@@ -360,13 +360,20 @@ fn fold_tables(fold: &Fold<CapabilityFold>) -> (u64, u64) {
     fold.with_state(|s| {
         let primary = table_bytes::<(Key, FoldEntry<CapabilityFold>)>(s.entries.capacity());
         let reverse_outer = table_bytes::<(NodeId, NodeRecord<Key>)>(s.by_node.capacity());
+        // A record's key list is inline for one key and spills to the
+        // heap past that; the spilled capacity is not visible, so the
+        // estimate uses the length. Every record also owns its shared
+        // revision cell: an `Arc<AtomicU64>`, two refcounts plus the
+        // value.
         let reverse_inner: u64 = s
             .by_node
             .values()
-            .filter(|record| record.keys.spilled())
-            .map(|record| (record.keys.capacity() * size_of::<Key>()) as u64)
+            .map(|record| record.keys().len())
+            .filter(|&len| len > 1)
+            .map(|len| (len * size_of::<Key>()) as u64)
             .sum();
-        (primary, reverse_outer + reverse_inner)
+        let rev_cells = (s.by_node.len() * 3 * size_of::<u64>()) as u64;
+        (primary, reverse_outer + reverse_inner + rev_cells)
     })
 }
 

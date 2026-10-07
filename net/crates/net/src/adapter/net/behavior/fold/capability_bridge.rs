@@ -639,7 +639,7 @@ pub fn retract_floored_ownership(
     floor: u32,
 ) -> usize {
     let node_id = member.node_id();
-    // §14: probe under a SHARED read first. `with_state_mut` takes an
+    // §14: probe under a SHARED read first. `update_payloads` takes an
     // exclusive write lock unconditionally, before it even checks whether this
     // node has any entries — and the install sweep calls this once per floor
     // in the persisted state, the overwhelming majority of which retract
@@ -655,23 +655,15 @@ pub fn retract_floored_ownership(
     if fold.with_state(|state| !state.by_node.contains_key(&node_id)) {
         return 0;
     }
-    let retracted = fold.with_state_mut(|state| {
-        let Some(keys) = state.keys_for(node_id) else {
-            return 0;
-        };
-        let keys: Vec<_> = keys.to_vec();
-        let mut retracted = 0;
-        for key in keys {
-            if let Some(entry) = state.entries.get_mut(&key) {
-                if let Some(owner) = entry.payload.owner {
-                    if owner.org() == org && owner.generation() < floor {
-                        entry.payload.owner = None;
-                        retracted += 1;
-                    }
-                }
-            }
+    // Advances the publisher's revision when anything is retracted, so
+    // a `CapabilitySetCache` entry for it misses even though synthesis
+    // reads no owner today.
+    let retracted = fold.update_payloads(node_id, |payload| match payload.owner {
+        Some(owner) if owner.org() == org && owner.generation() < floor => {
+            payload.owner = None;
+            true
         }
-        retracted
+        _ => false,
     });
     if retracted > 0 {
         // §15: on the AUDIT plane, not only `tracing`. This is the one
@@ -803,10 +795,10 @@ const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
 /// thousands of announcements per second that invalidated the whole
 /// cache continuously (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 1).
 ///
-/// The cached value reads only tags and metadata. An ownership
-/// projection retraction (`Fold::with_state_mut`) changes neither, so
-/// it does not advance the revision. If synthesis ever reads the
-/// owner projection, those callers must advance it.
+/// The revision covers in-place payload updates too: an ownership
+/// projection retraction goes through `Fold::update_payloads`, which
+/// advances it, so a cached set can never outlive any change to its
+/// publisher's payloads, including fields synthesis does not read today.
 ///
 /// An absent publisher reads as revision `0` and synthesizes the
 /// empty set, so an entry cached for an absent node stays correct for
@@ -819,8 +811,11 @@ const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
 /// capacity lose lookups to LRU eviction, which validity does not
 /// change: see [`CapabilitySetCacheStats`].
 ///
-/// Cache hits return a refcount-bumped `Arc` (~ns) after one fold read
-/// lock and one cache mutex; misses pay the
+/// A hit for a present publisher returns a refcount-bumped `Arc` after
+/// one cache mutex and one atomic load, WITHOUT the fold's state lock
+/// (see [`Self::get_or_synthesize`]), so the per-packet path does not
+/// queue behind apply or expiry-sweep write holds. Misses, and lookups
+/// of absent publishers, take the fold read lock and pay the
 /// `synthesize_capability_set` cost plus one Arc alloc.
 pub struct CapabilitySetCache {
     inner: parking_lot::Mutex<lru::LruCache<NodeId, CachedCapabilitySetEntry>>,
@@ -854,7 +849,21 @@ pub struct CapabilitySetCacheStats {
 
 struct CachedCapabilitySetEntry {
     rev: u64,
+    /// Lock-free handle on the publisher record's revision, `None` for
+    /// an entry cached while the publisher was absent (revision `0`).
+    /// Such entries are validated under the fold read lock instead.
+    handle: Option<super::state::PublisherRevision>,
     caps: std::sync::Arc<super::super::capability::CapabilitySet>,
+}
+
+impl CachedCapabilitySetEntry {
+    /// Valid without the fold lock: the publisher record the entry was
+    /// cached against still exists and has not moved its revision.
+    fn valid_lock_free(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|handle| handle.current() == Some(self.rev))
+    }
 }
 
 impl CapabilitySetCache {
@@ -884,6 +893,19 @@ impl CapabilitySetCache {
     /// `Arc::clone`; a miss synthesizes and caches against the node's
     /// revision.
     ///
+    /// # Hit without the fold lock
+    ///
+    /// The first check reads the entry's
+    /// [`PublisherRevision`](super::state::PublisherRevision)
+    /// handle, an atomic the fold's writers store to while they hold
+    /// the state write lock. It matches only while the record the
+    /// entry was cached against still exists at the cached revision, so
+    /// a hit here is exactly a hit the locked check below would also
+    /// score; a write that is still in flight is ordered after it. Any
+    /// mismatch falls through to the locked path.
+    ///
+    /// # Locked path
+    ///
     /// Everything runs inside ONE fold read borrow: the revision read,
     /// the validity check, and on a miss the synthesis and the store.
     /// No writer can change the node's entries inside that borrow, so
@@ -903,6 +925,15 @@ impl CapabilitySetCache {
         node_id: NodeId,
     ) -> std::sync::Arc<super::super::capability::CapabilitySet> {
         use std::sync::atomic::Ordering::Relaxed;
+        {
+            let mut lru = self.inner.lock();
+            if let Some(entry) = lru.get(&node_id) {
+                if entry.valid_lock_free() {
+                    self.hits.fetch_add(1, Relaxed);
+                    return entry.caps.clone();
+                }
+            }
+        }
         fold.with_state(|state| {
             let rev = state.publisher_rev(node_id);
             {
@@ -923,6 +954,7 @@ impl CapabilitySetCache {
                 node_id,
                 CachedCapabilitySetEntry {
                     rev,
+                    handle: state.publisher_revision(node_id),
                     caps: caps.clone(),
                 },
             );
@@ -3488,6 +3520,69 @@ mod tests {
         fold.with_state(|s| s.publisher_rev(node))
     }
 
+    /// A hit for a present publisher does not take the fold's state
+    /// lock: the per-packet admission path calls this and must not queue
+    /// behind an apply or a sweep. The lookup runs while this thread
+    /// holds the state WRITE lock; if the hit took the read lock it
+    /// would block until the timeout.
+    #[test]
+    fn cache_hit_does_not_wait_for_a_fold_writer() {
+        let fold = std::sync::Arc::new(new_fold());
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("apply A");
+        let cache = std::sync::Arc::new(CapabilitySetCache::new());
+        let first = cache.get_or_synthesize(&fold, 0xA);
+
+        let writer = fold.state.write();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lookup = {
+            let (fold, cache) = (fold.clone(), cache.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(cache.get_or_synthesize(&fold, 0xA));
+            })
+        };
+        let got = rx.recv_timeout(Duration::from_secs(10));
+        drop(writer);
+        lookup.join().expect("lookup thread");
+        let got = got.expect("a hit must complete while a writer holds the fold");
+        assert!(std::sync::Arc::ptr_eq(&first, &got));
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    /// The lock-free check never outlives the record it was cached
+    /// against: eviction, a return under a new record, and a restore
+    /// each make the next lookup miss and serve current state.
+    #[test]
+    fn lock_free_hit_misses_after_eviction_return_and_restore() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("apply A");
+        let cache = CapabilitySetCache::new();
+        let first = cache.get_or_synthesize(&fold, 0xA);
+        assert!(has_tag(&first, "gpu"));
+
+        fold.evict_node(0xA, "test");
+        let gone = cache.get_or_synthesize(&fold, 0xA);
+        assert!(gone.tags.is_empty(), "evicted publisher synthesizes empty");
+
+        fold.apply(cache_member(&kp, 0xA, 0x100, 1, vec!["cpu"], None))
+            .expect("A returns");
+        let back = cache.get_or_synthesize(&fold, 0xA);
+        assert!(has_tag(&back, "cpu") && !has_tag(&back, "gpu"));
+        let again = cache.get_or_synthesize(&fold, 0xA);
+        assert!(std::sync::Arc::ptr_eq(&back, &again));
+
+        fold.restore(fold.snapshot(), true).expect("restore");
+        let restored = cache.get_or_synthesize(&fold, 0xA);
+        assert!(
+            !std::sync::Arc::ptr_eq(&back, &restored),
+            "a restore retires every record the cache holds"
+        );
+        assert!(has_tag(&restored, "cpu"));
+    }
+
     #[test]
     fn cache_survives_other_publishers_announcements() {
         let fold = new_fold();
@@ -4577,6 +4672,39 @@ mod tests {
         let retracted = retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5);
         assert_eq!(retracted, 0);
         assert_eq!(fold.change_generation(), before);
+    }
+
+    /// Retraction rewrites payloads in place, so it advances the
+    /// publisher's revision: a revision-keyed cache cannot serve a set
+    /// from before the rewrite, whatever fields synthesis reads. A
+    /// retraction that clears nothing leaves the revision alone.
+    #[test]
+    fn retraction_advances_the_publisher_revision() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let node_id = kp.entity_id().node_id();
+        let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 4, 3600)
+            .expect("issue");
+        let ann = signed_announcement_with_cert(&kp, Some(cert));
+        apply_legacy_announcement(&fold, ann, None, 0).expect("apply");
+
+        let before = rev(&fold, node_id);
+        assert!(before > 0);
+        assert_eq!(
+            retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5),
+            1
+        );
+        assert!(
+            rev(&fold, node_id) > before,
+            "retraction advances the revision"
+        );
+
+        let before = rev(&fold, node_id);
+        assert_eq!(
+            retract_floored_ownership(&fold, org_root().org_id(), kp.entity_id(), 5),
+            0
+        );
+        assert_eq!(rev(&fold, node_id), before, "a no-op retraction does not");
     }
 
     /// §15 — ownership retraction is recorded on the AUDIT plane.

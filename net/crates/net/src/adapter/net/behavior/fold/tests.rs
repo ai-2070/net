@@ -1476,6 +1476,38 @@ fn sweep_rechecks_entries_refreshed_or_removed_after_collection() {
     assert_eq!(fold.metrics().entries(), 1);
 }
 
+/// A same-owner Replace re-lists the key in the publisher's record, so
+/// a refresh repairs a reverse index that lost it. Without the repair
+/// the entry is unreachable by `evict_node` and its publisher reads as
+/// absent (revision 0) forever, which a revision-keyed cache would take
+/// as "nothing changed".
+#[test]
+fn same_owner_refresh_repairs_a_missing_reverse_index_record() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    fold.apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 1, 3600, vec!["t"]))
+        .expect("apply");
+    // Drift: the record is gone while the entry stays.
+    fold.state.write().by_node.remove(&0xA);
+    assert_eq!(fold.with_state(|s| s.publisher_rev(0xA)), 0);
+
+    let out = fold
+        .apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 2, 3600, vec!["t"]))
+        .expect("refresh");
+    assert_eq!(out, ApplyOutcome::Replaced);
+    fold.with_state(|s| {
+        assert_eq!(s.keys_for(0xA).map(<[_]>::len), Some(1), "key re-listed");
+        assert!(s.publisher_rev(0xA) > 0, "publisher present again");
+    });
+
+    fold.evict_node(0xA, "test");
+    assert_eq!(
+        fold.with_state(|s| s.entries.len()),
+        0,
+        "eviction reaches it"
+    );
+}
+
 /// Audit-emitting `FoldKind` shim: identical to `CapFold` but
 /// `audit_event` returns `Some(AuditEvent)` for every transition.
 /// Audit emission is opt-in via the trait so folds that don't

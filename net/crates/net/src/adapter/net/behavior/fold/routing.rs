@@ -172,7 +172,7 @@ mod tests {
 
     use super::*;
     use crate::adapter::net::behavior::fold::{
-        ApplyOutcome, EnvelopeMeta, Fold, FoldRegistry, SignedAnnouncement,
+        ApplyOutcome, EnvelopeMeta, Fold, FoldRegistry, FoldSnapshotEntry, SignedAnnouncement,
     };
     use crate::adapter::net::identity::EntityKeypair;
 
@@ -292,6 +292,119 @@ mod tests {
         fold.evict_node(b, "test");
         assert_eq!(fold.with_state(|s| s.entries.len()), 0);
         assert_eq!(fold.with_state(|s| s.by_node.len()), 0);
+    }
+
+    /// A snapshot that lists one destination under two publishers
+    /// restores to ONE owner: the later row wins, and the earlier owner's
+    /// record no longer lists the key. Left listed, evicting the earlier
+    /// owner would remove the later owner's live route.
+    #[test]
+    fn restore_with_a_key_under_two_publishers_leaves_one_owner() {
+        let source = new_fold();
+        let (kp_a, kp_b) = (EntityKeypair::generate(), EntityKeypair::generate());
+        let (a, b) = (0xA, 0xB);
+        let (dest_d, dest_e) = (0xD, 0xE);
+        source
+            .apply(sign_route(&kp_a, a, 1, dest_d, addr(1), 5, a))
+            .expect("A->D");
+        source
+            .apply(sign_route(&kp_b, b, 1, dest_e, addr(2), 5, b))
+            .expect("B->E");
+        let mut snap = source.snapshot();
+        // Append a second row for D, owned by B.
+        let d_row = snap
+            .entries
+            .iter()
+            .find(|e| e.key == dest_d)
+            .expect("D row");
+        let dup = FoldSnapshotEntry::<RoutingFold> {
+            key: d_row.key,
+            payload: RouteAnnouncement {
+                via: b,
+                ..d_row.payload.clone()
+            },
+            node_id: b,
+            generation: d_row.generation,
+            received_offset_ns: d_row.received_offset_ns,
+            expires_offset_ns: d_row.expires_offset_ns,
+        };
+        snap.entries.push(dup);
+
+        let fold = new_fold();
+        fold.restore(snap, false).expect("restore");
+        fold.with_state(|s| {
+            assert_eq!(s.entries.len(), 2);
+            assert_eq!(s.entries.get(&dest_d).map(|e| e.node_id), Some(b));
+            assert_eq!(s.keys_for(a), None, "A's only row was superseded");
+            assert_eq!(s.publisher_rev(a), 0);
+            let mut b_keys = s.keys_for(b).map(<[_]>::to_vec).unwrap_or_default();
+            b_keys.sort_unstable();
+            assert_eq!(b_keys, vec![dest_d, dest_e]);
+        });
+        assert_eq!(fold.metrics().entries(), 2);
+
+        fold.evict_node(a, "test");
+        assert_eq!(
+            fold.with_state(|s| s.entries.get(&dest_d).map(|e| e.node_id)),
+            Some(b),
+            "evicting A cannot remove B's route"
+        );
+    }
+
+    /// One gateway owning thousands of routes: the reverse-index record
+    /// past the indexed threshold stays exact through cross-publisher
+    /// transfers of half its keys and the eviction of the rest.
+    #[test]
+    fn a_gateway_owning_thousands_of_routes_keeps_an_exact_reverse_index() {
+        let fold = new_fold();
+        let (kp_a, kp_b) = (EntityKeypair::generate(), EntityKeypair::generate());
+        let (a, b) = (0xA, 0xB);
+        const ROUTES: u64 = 3000;
+        for (generation, dest) in (1..=ROUTES).enumerate() {
+            fold.apply(sign_route(
+                &kp_a,
+                a,
+                generation as u64 + 1,
+                0x1_0000 + dest,
+                addr(1),
+                5,
+                a,
+            ))
+            .expect("A route");
+        }
+        assert_eq!(
+            fold.with_state(|s| s.keys_for(a).map(<[_]>::len)),
+            Some(ROUTES as usize)
+        );
+
+        // B takes every even destination with a better metric.
+        for (generation, dest) in (2..=ROUTES).step_by(2).enumerate() {
+            let out = fold
+                .apply(sign_route(
+                    &kp_b,
+                    b,
+                    generation as u64 + 1,
+                    0x1_0000 + dest,
+                    addr(2),
+                    1,
+                    b,
+                ))
+                .expect("B route");
+            assert_eq!(out, ApplyOutcome::Replaced);
+        }
+        fold.with_state(|s| {
+            let mut a_keys = s.keys_for(a).map(<[_]>::to_vec).unwrap_or_default();
+            a_keys.sort_unstable();
+            let odd: Vec<_> = (1..=ROUTES).step_by(2).map(|d| 0x1_0000 + d).collect();
+            assert_eq!(a_keys, odd, "A keeps exactly the odd destinations");
+            assert_eq!(s.keys_for(b).map(<[_]>::len), Some((ROUTES / 2) as usize));
+        });
+
+        fold.evict_node(a, "test");
+        fold.with_state(|s| {
+            assert_eq!(s.entries.len(), (ROUTES / 2) as usize);
+            assert!(s.entries.values().all(|e| e.node_id == b));
+        });
     }
 
     #[test]

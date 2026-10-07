@@ -32208,13 +32208,18 @@ impl MeshNode {
         > = if greedy.is_some() {
             let origin_hash: u64 = parsed.header.origin_hash;
             let publisher_node = ctx.origin_hash_to_node.get(&origin_hash).map(|v| *v);
-            // Per PERF_AUDIT §4.1: route through the generation-keyed
+            // Per PERF_AUDIT §4.1: route through the capability-set
             // cache instead of re-synthesizing per packet. A 30-tag
             // capability set parses to ~3-5 µs + ~100 allocs per
-            // synthesize; a cache hit returns an Arc::clone (~ns).
-            // The cache is generation-invalidated by the fold's
-            // change_tx, so an inbound `SUBPROTOCOL_CAPABILITY_ANN`
-            // bumps it correctly.
+            // synthesize; a cache hit returns an Arc::clone (~ns),
+            // without the fold's state lock for a known publisher.
+            // Entries are valid per publisher, not per fold change: an
+            // entry stays valid until ITS publisher's revision
+            // (`FoldState::publisher_rev`) moves, which every write to
+            // that publisher's entries does (an inbound
+            // `SUBPROTOCOL_CAPABILITY_ANN` from it, eviction, expiry,
+            // an ownership retraction). Other publishers' announcements
+            // leave it valid.
             Some(match publisher_node {
                 Some(nid) => ctx
                     .capability_set_cache
@@ -47316,7 +47321,7 @@ impl MeshNode {
         use super::behavior::deck::RtcAnchorRow;
         let mut rows: Vec<RtcAnchorRow> = self.capability_fold.with_state(|state| {
             let mut rows = Vec::new();
-            for (node_id, keys) in state.by_node.iter().map(|(n, r)| (n, &r.keys)) {
+            for (node_id, keys) in state.by_node.iter().map(|(n, r)| (n, r.keys())) {
                 let mut row: Option<RtcAnchorRow> = None;
                 for entry in keys.iter().filter_map(|key| state.entries.get(key)) {
                     let is_anchor = entry.payload.tags.iter().any(|tag| tag == RTC_ANCHOR_TAG);

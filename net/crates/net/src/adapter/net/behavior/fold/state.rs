@@ -15,6 +15,9 @@
 //! ([`super`]).
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use smallvec::SmallVec;
@@ -163,8 +166,13 @@ pub struct FoldEntry<K: FoldKind> {
 /// Public fields are read by [`FoldKind::query`] (and by tests),
 /// but mutation flows exclusively through
 /// [`super::Fold::apply`] / [`super::Fold::evict_node`] /
-/// [`super::Fold::restore`] so the [`super::FoldMetrics`] counters
-/// and `by_node` reverse index stay coherent with `entries`.
+/// [`super::Fold::restore`] / the expiry sweep /
+/// `Fold::update_payloads` so the [`super::FoldMetrics`]
+/// counters, the `by_node` reverse index and the publisher revisions
+/// stay coherent with `entries`. The fields are `pub` for reading
+/// only: a [`super::Fold`] hands out shared borrows of its state and
+/// nothing else, so no caller outside those paths can reach them
+/// mutably.
 ///
 /// The container is held inside an `RwLock` on the
 /// [`Fold<K>`](super::Fold) struct; this type is purely the data
@@ -186,10 +194,11 @@ pub struct FoldState<K: FoldKind> {
     /// microseconds" and "evict in seconds."
     ///
     /// Each record also carries the publisher's mutation revision
-    /// ([`NodeRecord::rev`]). Writes go through `attach_key`,
-    /// `detach_key` and `remove_node`, the one place the revision
-    /// advances, so no mutation path can change a publisher's
-    /// entries without moving its revision.
+    /// ([`NodeRecord::rev`]). Every write to a publisher's entries
+    /// goes through the `FoldState` methods that advance it
+    /// (`attach_key`, `detach_key`, `remove_node`, `update_payloads`),
+    /// and the record's fields are private, so no mutation path can
+    /// change a publisher's entries without moving its revision.
     pub by_node: HashMap<NodeId, NodeRecord<K::Key>, K::KeyHasher>,
     /// Last publisher revision handed out. Monotonic for the life
     /// of the state, and deliberately NOT reset by a restore: a
@@ -199,24 +208,180 @@ pub struct FoldState<K: FoldKind> {
     last_rev: u64,
 }
 
+/// Above this many keys, a [`NodeRecord`] keeps a key → position map
+/// beside its key list, so membership checks and removals stay O(1)
+/// for publishers that own many keys. A capability publisher owns one
+/// key per class, but the routing, island and reservation folds key on
+/// the payload, so one gateway can own thousands (one per destination
+/// or resource). Below the threshold a linear scan of the inline list
+/// is cheaper than hashing, and the record carries no map.
+pub(super) const NODE_KEYS_INDEX_THRESHOLD: usize = 8;
+
+/// Value a [`NodeRecord`]'s revision cell takes when the record is
+/// dropped. Revisions come from a counter that starts at 1 and never
+/// approaches this value, so a retired cell can never match a revision
+/// a cache stored.
+const REV_RETIRED: u64 = u64::MAX;
+
+/// The keys one publisher owns, without duplicates.
+///
+/// Order is insertion order until a removal: a small list removes in
+/// place, an indexed one swap-removes. Nothing reads the order as
+/// meaningful (the reverse index was a `HashSet` before it was a list).
+#[derive(Debug)]
+struct NodeKeys<Q> {
+    list: SmallVec<[Q; 1]>,
+    /// `key → index into list`. Built when `list` grows past
+    /// [`NODE_KEYS_INDEX_THRESHOLD`] and dropped when it shrinks to
+    /// half of it; the hysteresis keeps a publisher hovering at the
+    /// threshold from rebuilding the map on every insert/remove pair.
+    ///
+    /// Boxed on purpose: every publisher's record carries this field,
+    /// almost always as `None`, and the box keeps that at one pointer
+    /// instead of an inline `HashMap` (48 bytes). Only records past the
+    /// threshold pay the extra allocation.
+    #[allow(clippy::box_collection)]
+    positions: Option<Box<HashMap<Q, usize>>>,
+}
+
+impl<Q: Hash + Eq + Clone> NodeKeys<Q> {
+    fn new() -> Self {
+        Self {
+            list: SmallVec::new(),
+            positions: None,
+        }
+    }
+
+    fn contains(&self, key: &Q) -> bool {
+        match &self.positions {
+            Some(positions) => positions.contains_key(key),
+            None => self.list.contains(key),
+        }
+    }
+
+    fn insert(&mut self, key: Q) {
+        if self.contains(&key) {
+            return;
+        }
+        if let Some(positions) = self.positions.as_mut() {
+            positions.insert(key.clone(), self.list.len());
+        }
+        self.list.push(key);
+        if self.positions.is_none() && self.list.len() > NODE_KEYS_INDEX_THRESHOLD {
+            let positions = self
+                .list
+                .iter()
+                .enumerate()
+                .map(|(at, k)| (k.clone(), at))
+                .collect();
+            self.positions = Some(Box::new(positions));
+        }
+    }
+
+    /// Remove `key`, returning whether it was present.
+    fn remove(&mut self, key: &Q) -> bool {
+        match self.positions.as_mut() {
+            Some(positions) => {
+                let Some(at) = positions.remove(key) else {
+                    return false;
+                };
+                self.list.swap_remove(at);
+                if let Some(moved) = self.list.get(at) {
+                    if let Some(slot) = positions.get_mut(moved) {
+                        *slot = at;
+                    }
+                }
+                if self.list.len() <= NODE_KEYS_INDEX_THRESHOLD / 2 {
+                    self.positions = None;
+                }
+            }
+            None => {
+                let Some(at) = self.list.iter().position(|k| k == key) else {
+                    return false;
+                };
+                self.list.remove(at);
+            }
+        }
+        true
+    }
+}
+
 /// One publisher's slice of [`FoldState::by_node`].
-#[derive(Debug, Clone)]
+///
+/// The fields are private. The record's revision lives in a shared
+/// atomic cell (see [`PublisherRevision`]), so a writable field would
+/// let any holder of a shared borrow move it; the keys are private so
+/// that membership changes only through the [`FoldState`] methods that
+/// advance the revision with them.
+#[derive(Debug)]
 pub struct NodeRecord<Q> {
-    /// Every key this publisher currently owns (one per class),
-    /// without duplicates. Inline for the common one-class publisher,
-    /// so a record costs no separate heap allocation; membership checks
-    /// are linear, which is cheaper than hashing at a handful of keys.
-    pub keys: SmallVec<[Q; 1]>,
-    /// The publisher's mutation revision: receiver-local, drawn
-    /// from one fold-wide counter, and advanced by every change to
-    /// the set of entries the publisher owns or to any of their
-    /// payloads (insert or replace of any class, removal of any
-    /// class). Never `0` while the record exists; an absent
-    /// publisher reads as `0` through [`FoldState::publisher_rev`].
-    /// Because the counter is fold-wide and never reused, a
-    /// publisher that leaves and returns gets a revision it has
-    /// never had before.
-    pub rev: u64,
+    keys: NodeKeys<Q>,
+    /// See [`Self::rev`]. Shared with [`PublisherRevision`] handles so
+    /// a cache can check validity without the fold's state lock. Set to
+    /// [`REV_RETIRED`] when the record is dropped.
+    rev: Arc<AtomicU64>,
+}
+
+impl<Q: Hash + Eq + Clone> NodeRecord<Q> {
+    fn new(rev: u64) -> Self {
+        Self {
+            keys: NodeKeys::new(),
+            rev: Arc::new(AtomicU64::new(rev)),
+        }
+    }
+
+    /// Every key this publisher currently owns, without duplicates.
+    pub fn keys(&self) -> &[Q] {
+        self.keys.list.as_slice()
+    }
+
+    /// The publisher's mutation revision: receiver-local, drawn from
+    /// one fold-wide counter, and advanced by every change to the set
+    /// of entries the publisher owns or to any of their payloads
+    /// (insert or replace of any class, removal of any class, an
+    /// in-place payload update). Never `0` while the record exists; an
+    /// absent publisher reads as `0` through
+    /// [`FoldState::publisher_rev`]. Because the counter is fold-wide
+    /// and never reused, a publisher that leaves and returns gets a
+    /// revision it has never had before.
+    pub fn rev(&self) -> u64 {
+        self.rev.load(Ordering::Acquire)
+    }
+
+    fn set_rev(&self, rev: u64) {
+        self.rev.store(rev, Ordering::Release);
+    }
+
+    /// Mark the record dropped, so every outstanding
+    /// [`PublisherRevision`] for it reads as gone.
+    fn retire(&self) {
+        self.rev.store(REV_RETIRED, Ordering::Release);
+    }
+}
+
+/// A lock-free handle on one publisher record's revision, from
+/// [`FoldState::publisher_revision`].
+///
+/// [`Self::current`] reads the revision without the fold's state lock.
+/// It returns the record's revision while the record exists and `None`
+/// once the record has been dropped, even if the publisher has since
+/// returned: a returning publisher gets a new record and a new cell. So
+/// a value cached against `(handle, rev)` is valid exactly while
+/// `handle.current() == Some(rev)`.
+///
+/// Writers store the new revision while they hold the state write
+/// lock. A reader that sees the old revision is ordered before that
+/// write commits, and a reader that observed the write complete sees
+/// the new one.
+#[derive(Debug, Clone)]
+pub struct PublisherRevision(Arc<AtomicU64>);
+
+impl PublisherRevision {
+    /// The record's current revision, or `None` once it was dropped.
+    pub fn current(&self) -> Option<u64> {
+        let rev = self.0.load(Ordering::Acquire);
+        (rev != REV_RETIRED).then_some(rev)
+    }
 }
 
 impl<K: FoldKind> FoldState<K> {
@@ -231,7 +396,7 @@ impl<K: FoldKind> FoldState<K> {
 
     /// The keys `node` currently owns, if it owns any.
     pub fn keys_for(&self, node: NodeId) -> Option<&[K::Key]> {
-        self.by_node.get(&node).map(|record| record.keys.as_slice())
+        self.by_node.get(&node).map(NodeRecord::keys)
     }
 
     /// `node`'s current mutation revision, or `0` when it owns no
@@ -242,7 +407,15 @@ impl<K: FoldKind> FoldState<K> {
     /// absence (such as the empty capability set) is still correct at
     /// the second read.
     pub fn publisher_rev(&self, node: NodeId) -> u64 {
-        self.by_node.get(&node).map_or(0, |record| record.rev)
+        self.by_node.get(&node).map_or(0, NodeRecord::rev)
+    }
+
+    /// A lock-free handle on `node`'s revision, or `None` when it owns
+    /// no entries. See [`PublisherRevision`].
+    pub fn publisher_revision(&self, node: NodeId) -> Option<PublisherRevision> {
+        self.by_node
+            .get(&node)
+            .map(|record| PublisherRevision(record.rev.clone()))
     }
 
     fn next_rev(&mut self) -> u64 {
@@ -253,60 +426,94 @@ impl<K: FoldKind> FoldState<K> {
     /// Record that `node` owns `key` after an accepted write of that
     /// key's entry, and advance `node`'s revision. Called for every
     /// insert and replace, including a replace that leaves the key
-    /// set unchanged: the payload changed, so the revision must.
+    /// set unchanged: the payload changed, so the revision must. A key
+    /// already listed is not listed twice, so this also repairs a
+    /// record that had lost the key.
     pub(super) fn attach_key(&mut self, node: NodeId, key: K::Key) {
         let rev = self.next_rev();
-        let record = self.by_node.entry(node).or_insert_with(|| NodeRecord {
-            keys: SmallVec::new(),
-            rev,
-        });
-        if !record.keys.contains(&key) {
-            record.keys.push(key);
-        }
-        record.rev = rev;
+        let record = self
+            .by_node
+            .entry(node)
+            .or_insert_with(|| NodeRecord::new(rev));
+        record.keys.insert(key);
+        record.set_rev(rev);
     }
 
-    /// Advance `node`'s revision without touching its keys: for a
-    /// replace that rewrites one of the publisher's entries under the
-    /// same key. The payload changed, so the revision must, but the
-    /// reverse-index membership did not.
-    pub(super) fn touch_node(&mut self, node: NodeId) {
+    /// Advance `node`'s revision without touching its keys. A no-op
+    /// on the records when `node` owns nothing.
+    fn touch_node(&mut self, node: NodeId) {
         let rev = self.next_rev();
-        if let Some(record) = self.by_node.get_mut(&node) {
-            record.rev = rev;
+        if let Some(record) = self.by_node.get(&node) {
+            record.set_rev(rev);
         }
     }
 
     /// Record that `node` no longer owns `key`. Drops the record when
     /// it was the publisher's last key (the publisher then reads as
     /// absent, revision `0`); otherwise advances the revision, since
-    /// one of its classes is gone.
+    /// one of its classes is gone. A no-op when `node` does not list
+    /// `key`.
     pub(super) fn detach_key(&mut self, node: NodeId, key: &K::Key) {
         let Some(record) = self.by_node.get_mut(&node) else {
             return;
         };
-        record.keys.retain(|k| k != key);
-        if record.keys.is_empty() {
-            self.by_node.remove(&node);
+        if !record.keys.remove(key) {
             return;
         }
-        let rev = self.next_rev();
-        if let Some(record) = self.by_node.get_mut(&node) {
-            record.rev = rev;
+        if record.keys.list.is_empty() {
+            if let Some(record) = self.by_node.remove(&node) {
+                record.retire();
+            }
+            return;
         }
+        self.touch_node(node);
     }
 
     /// Drop `node`'s record, returning the keys it owned.
     pub(super) fn remove_node(&mut self, node: NodeId) -> Option<SmallVec<[K::Key; 1]>> {
-        self.by_node.remove(&node).map(|record| record.keys)
+        let record = self.by_node.remove(&node)?;
+        record.retire();
+        Some(record.keys.list)
     }
 
     /// Empty the entries and the reverse index ahead of a restore,
     /// keeping the revision counter so restored publishers get
     /// revisions no earlier lookup has seen.
     pub(super) fn clear_for_restore(&mut self) {
+        for record in self.by_node.values() {
+            record.retire();
+        }
         self.entries.clear();
         self.by_node.clear();
+    }
+
+    /// Rewrite the payloads of `node`'s entries in place: `update`
+    /// runs on each and returns whether it changed that payload. When
+    /// any changed, `node`'s revision advances, so a cache keyed on it
+    /// misses. Returns how many payloads changed.
+    ///
+    /// The secondary index is NOT maintained, so `update` may only
+    /// touch fields no index reads; see [`super::Fold::update_payloads`].
+    pub(super) fn update_payloads(
+        &mut self,
+        node: NodeId,
+        mut update: impl FnMut(&mut K::Payload) -> bool,
+    ) -> usize {
+        let Some(record) = self.by_node.get(&node) else {
+            return 0;
+        };
+        let mut changed = 0;
+        for key in record.keys() {
+            if let Some(entry) = self.entries.get_mut(key) {
+                if update(&mut entry.payload) {
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.touch_node(node);
+        }
+        changed
     }
 
     /// Total entry count. Cheap O(1) read off the primary store.
@@ -519,4 +726,73 @@ pub enum FoldError {
         /// Current entry count of the live fold.
         current_len: usize,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{NodeKeys, NODE_KEYS_INDEX_THRESHOLD};
+
+    /// Every invariant `NodeKeys` keeps: no duplicates, the list and the
+    /// model hold the same keys, and the position map (when present)
+    /// names each key's actual index.
+    fn check(keys: &NodeKeys<u64>, model: &HashSet<u64>) {
+        let listed: HashSet<u64> = keys.list.iter().copied().collect();
+        assert_eq!(listed.len(), keys.list.len(), "no duplicates");
+        assert_eq!(&listed, model);
+        if let Some(positions) = &keys.positions {
+            assert_eq!(positions.len(), keys.list.len());
+            for (at, key) in keys.list.iter().enumerate() {
+                assert_eq!(positions.get(key), Some(&at), "position of {key}");
+            }
+        }
+        for key in model {
+            assert!(keys.contains(key));
+        }
+    }
+
+    /// Random inserts and removals over a key space wide enough to cross
+    /// the index threshold in both directions, checked against a
+    /// `HashSet` model after every operation.
+    #[test]
+    fn node_keys_match_a_set_model_across_the_index_threshold() {
+        let mut keys = NodeKeys::new();
+        let mut model = HashSet::new();
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut crossed_up = false;
+        let mut crossed_down = false;
+        for step in 0..20_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let key = seed % 40;
+            // Bias toward inserts for the first half, removals after, so
+            // the list grows past the threshold and drains below it.
+            let insert = !(seed >> 32).is_multiple_of(4);
+            let insert = if step < 10_000 { insert } else { !insert };
+            let had_index = keys.positions.is_some();
+            if insert {
+                keys.insert(key);
+                model.insert(key);
+            } else {
+                assert_eq!(keys.remove(&key), model.remove(&key));
+            }
+            crossed_up |= !had_index && keys.positions.is_some();
+            crossed_down |= had_index && keys.positions.is_none();
+            check(&keys, &model);
+        }
+        assert!(crossed_up && crossed_down, "both transitions exercised");
+    }
+
+    #[test]
+    fn small_node_keys_carry_no_index() {
+        let mut keys = NodeKeys::new();
+        for key in 0..NODE_KEYS_INDEX_THRESHOLD as u64 {
+            keys.insert(key);
+        }
+        assert!(keys.positions.is_none());
+        keys.insert(NODE_KEYS_INDEX_THRESHOLD as u64);
+        assert!(keys.positions.is_some(), "indexed past the threshold");
+    }
 }
