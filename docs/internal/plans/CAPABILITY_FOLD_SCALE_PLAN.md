@@ -1642,6 +1642,174 @@ breakdown. B1 alone cannot remove the index tuple sets: at the plan's own
 bytes-per-entry target is set for B1 alone without first subtracting the
 index bytes B1 does not touch.
 
+### Track B decisions (proposed 2026-10-07, awaiting review)
+
+This section answers the decisions Track B lists. Slices 6 and 7 stay held
+until it is reviewed. Facts are from the tree at `a44083765` (paths under
+`src/adapter/net/behavior/`).
+
+**Facts the decisions rest on.**
+
+- **Signing.** `CapabilityMembership.tags` is `Vec<String>`
+  (`fold/capability.rs:87`). The signature covers the payload's postcard
+  serde form, re-encoded at verify (`fold/wire.rs:230-273`, `:340-353`),
+  not its in-memory type. A type whose serde form is byte-identical to
+  `Vec<String>` changes neither the wire nor the signature.
+- **Intake converges on `Fold::apply`.**
+  - Legacy: `project_tags` → `translate_announcement`
+    (`capability_bridge.rs:1375`, `:1431`).
+  - Typed: `FoldDispatch::dispatch` → `decode_and_verify` → `apply`
+    (`fold/dispatch.rs:96-127`).
+  - Local publish signs a caller-built struct (`mesh.rs:44713`, `:44744`)
+    and also reaches `apply`.
+  - Only `Fold::restore` bypasses `apply` (`mod.rs:589`).
+- **Readers.** Production code reads `tags` at about 30 sites, as strings:
+  iteration, membership, `Tag::parse`, axis parsing, clone-out (survey list
+  in the PR).
+  - The one public borrowed surface is `find_nodes_matching_scoped`'s
+    `same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool`
+    (`capability_bridge.rs:1713-1718`). It is called only from `mesh.rs`
+    (`:47242`, `:48090`).
+  - No binding (Node, Python, Go/C) or SDK signature carries tags. They
+    receive node ids.
+- **No cap exists.** Nothing limits capability tag count or tag length.
+  The wire payload (8,108 bytes, `wire/src/protocol.rs:36`) is the only
+  bound, and `mesh.rs:~47226` says so.
+- **Snapshots.** They serialize the payload through serde, with no format
+  version. Nothing in production persists one (`snapshot`/`restore` are
+  called only from tests).
+- **The index.** `by_tag`, `by_synthetic` and `by_region` are
+  `HashMap<String, HashSet<(u64, NodeId)>>`, plus `by_state`
+  (`fold/capability.rs:362-383`).
+  - The evaluator has AND (`intersect`, seeded from the smallest set), OR
+    (`group_union`) and single-bucket fast paths. It has no NOT.
+  - Publisher dedup is by explicit sort + dedup at
+    `capability_bridge.rs:566`, `:1549`, `:1779` and `:1976`. `:1518`
+    sorts without a dedup. The plan's earlier `:1384` / `:1614` references
+    are stale.
+
+#### B1 decisions (Slice 6, tag interning)
+
+1. **Seam: a tag handle type inside the existing payload.**
+   - `tags: Vec<String>` becomes `tags: Vec<TagStr>`. `TagStr` is a
+     receiver-local shared string (`Arc<str>` inside) that derefs to
+     `str`.
+   - `TagStr` serializes and deserializes as a plain string, so the
+     postcard bytes, the signature transcript, the snapshot form and
+     every cross-language fixture are byte-identical.
+   - There is no second "stored payload" type, so `FoldKind::Payload`
+     keeps serving dispatch, storage, query output and snapshots
+     unchanged.
+   - Interning happens in one place for all intake: a new
+     `FoldKind::intern` hook with a no-op default. `Fold::apply` calls it
+     under the state write lock, before merge. `Fold::restore` calls it
+     per restored entry.
+   - The capability fold's hook swaps each decoded `TagStr` for the
+     dictionary's copy. Legacy translate, typed dispatch, local publish
+     and restore therefore produce identical entries, which is the
+     witness.
+   - Decode still allocates one `String` per tag, as it does today. The
+     dictionary keeps only one string per distinct tag.
+2. **Reader access: string borrows, no id resolution.** Because a `TagStr`
+   *is* the string, readers keep `&str` access under the state guard they
+   already hold. They pay no lookup and no `Arc` clone per read: `Deref`
+   borrows.
+   - The `&[String]` sites become `&[TagStr]`, or
+     `impl IntoIterator<Item = &str>` where that is simpler.
+   - **Public source change:** the `same_subnet_lookup` closure parameter
+     becomes `&[TagStr]`. `SubnetPolicy::assign_from_rendered_tags` and
+     `PreparedScope::matches` become generic over `AsRef<str>`.
+   - `capability_tags_for*` keep returning `Vec<String>`, with an owned
+     copy, as today.
+3. **Compatibility.**
+   - Wire: unchanged, pinned by a golden test. A `CapabilityMembership`
+     with N tags must encode to exactly the bytes of the same struct
+     declared with `Vec<String>`, and verify against a signature made
+     before the change.
+   - Snapshot: the same serde form, so no version bump. None are
+     persisted anyway.
+   - Source: constructing `tags` changes for every literal (tests,
+     benches, downstream). Mitigation: `From<String>`, `From<&str>` and
+     `FromIterator` for the vector. That keeps
+     `tags: vec!["gpu".into()]` compiling. The change goes into the
+     release migration note.
+   - Tag order and content are preserved. The raw and synthetic
+     namespaces stay separate, because only `tags` is interned and
+     synthetic keys are index-internal.
+4. **Lifetime budget: reference-counted, with defined exhaustion.**
+   - The dictionary is a per-fold `HashSet<TagStr>`, keyed by content. The
+     `Arc` count is the reference count.
+   - When an entry is removed or replaced, each of its tags whose count
+     drops to 1 (the dictionary's own copy) is released, so retained size
+     tracks live tags only.
+   - A per-fold budget (defaults: 1M distinct tags, 64 MiB of tag bytes)
+     is checked before anything is inserted. An announcement that would
+     add new tags past the budget is **rejected** as a whole: a new
+     `ApplyOutcome::Rejected` reason, a `FoldStats::interner_rejected`
+     counter, and an audit event.
+   - Tags already in the dictionary are always admitted. Rejection
+     allocates nothing in the dictionary.
+   - **Per-announcement cap, enforced in the hook before interning:**
+     `MAX_CAPABILITY_TAGS = 256` and `MAX_CAPABILITY_TAG_LEN = 256` bytes.
+     An oversize announcement is rejected.
+   - `FoldStats` gains `interned_tags` and `interned_bytes` gauges.
+   - The cap is a behavior change for any publisher sending more than 256
+     tags. None in the tree does; the fixture carries 31.
+
+**B1 target.** The payload heap is 1,641 B/entry with 31.4 tags (Slice 0).
+A tag costs a 24 B `String` plus its exact-length heap, about 53 B. As a
+`TagStr` it costs 16 B plus a share of one dictionary string. Target:
+payload heap **≤ 800 B/entry** at 100k on the fixture. Index bytes are
+measured separately (see B2).
+
+#### B2 decisions (Slice 7, bitmap buckets)
+
+1. **Identity: one dense `u32` slot per (class, node) entry.**
+   - The index keeps `slot_of: HashMap<Key, u32>` and
+     `key_of: Vec<Option<Key>>`.
+   - Bitmaps (`RoaringBitmap`) replace each `HashSet<(u64, NodeId)>`
+     bucket in `by_tag`, `by_synthetic`, `by_region` and `by_state`.
+   - Predicates evaluate per entry, so a class-A tag and a class-B tag of
+     one node never combine. Publishers are deduplicated afterwards,
+     exactly as now.
+2. **Ordering: keep the explicit sort + dedup at all four dedup sites,**
+   and the sort at `:1518`. Bitmaps yield slot order, which is arrival
+   order, not `NodeId` order. No site relies on index order today.
+3. **Slot reclamation: a free list.** A slot freed by expiry, eviction or
+   Replace-with-key-change goes on a free list and is reused before the
+   slot space grows. Live slots ≤ live entries, so the slot space is
+   bounded by the fold's peak entry count.
+   - Each bitmap clears the slot's bit in `on_remove`, so a reused slot
+     inherits nothing.
+   - Witness: `reused_slot_inherits_no_membership`.
+4. **Dependency: `roaring`.** A pure-Rust MIT/Apache crate, widely used.
+   It is a new direct dependency of the core crate, and every tracked
+   lockfile is refreshed the way the `foldhash` change refreshed them.
+   - Needs explicit sign-off; the risk is review bandwidth, as the plan
+     says.
+   - **Alternative if declined:** a fixed-width `Vec<u64>` bitset per
+     bucket. It is denser for hot tags but wastes space on sparse ones.
+     Not recommended at 1M slots.
+5. **Evaluator.**
+   - AND becomes bitmap `&`, seeded from the smallest bitmap, as now.
+   - OR becomes `|`.
+   - The single-bucket fast path iterates one bitmap.
+   - Candidate streaming (Slice 4) maps slots back to keys through
+     `key_of`.
+   - Slice 4's permanent comparison witness (`resolve_candidate_keys`
+     against the pre-Slice-4 resolver) must stay green unchanged.
+
+**B2 target.** Measure first. Slice 7 starts by splitting the footprint
+report's "index (remainder)" into bucket sets, wheel and rest. The
+remainder is 905 B/entry at 100k, and now includes the Slice 8 wheel.
+Target: index bucket bytes **at least 60% lower** than the measured
+bucket share. Bucket sets dominate it: 31 memberships × 16-byte keys plus
+table overhead.
+
+**Order.** B1 then B2, each its own PR with its own measurements, per the
+plan. B2 does not depend on B1. If review prefers, B2 can go first: it
+touches only the index.
+
 ### Track C: allocation-free apply
 
 Independent of B, and smaller:
@@ -1962,6 +2130,8 @@ release notes, or the trait is confirmed crate-private.
 
 Not authorized until Track B1's four decisions (seam, reader access,
 compatibility, lifetime budget) are written into this plan and re-reviewed.
+They are now written: "Track B decisions (proposed 2026-10-07, awaiting
+review)". Review is pending.
 
 Proof, once authorized:
 
@@ -1980,6 +2150,8 @@ Proof, once authorized:
 
 Not authorized until Track B2's decisions (entry-level identity, ordering,
 slot reclamation) are written into this plan and re-reviewed.
+They are now written: "Track B decisions (proposed 2026-10-07, awaiting
+review)", including the `roaring` sign-off. Review is pending.
 
 Proof, once authorized:
 
