@@ -1,0 +1,113 @@
+.claude/skills/net-browser/SKILL.md
+  s_d8b00bedd146e9::t_a055e20fc940c1 8
+.claude/skills/net-event-bus/SKILL.md
+  s_d8b00bedd146e9::t_f1525aec752400 8
+.claude/skills/net-payments/SKILL.md
+  s_d8b00bedd146e9::t_097cf510034ea7 8
+.github/workflows/release-crates.yml
+  s_d8b00bedd146e9::t_48312edb1f22b3 54
+net/crates/net/Cargo.lock
+  s_d8b00bedd146e9::t_5cfebd3f45b063 3122,3144,3180,3195,3215,3227,3242,3255,3311,3337,3386,3395,3420,3432,3443,3469,3483,3518,3544
+net/crates/net/Cargo.toml
+  s_d8b00bedd146e9::t_63457aa90f6de2 31,263,433
+net/crates/net/adapters/mcp/Cargo.toml
+  s_d8b00bedd146e9::t_ccafd774d08c95 51
+net/crates/net/aggregator-daemon/Cargo.toml
+  s_d8b00bedd146e9::t_c02a9675d83d3e 21,28
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_112a2bba192be0 54,58
+net/crates/net/bindings/go/deck-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_a36a72295de781 32
+net/crates/net/bindings/go/mcp-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_8b06ad81d454ba 35-36
+net/crates/net/bindings/go/meshdb-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_5a160d3437e49a 35
+net/crates/net/bindings/go/meshos-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_cf808f1a659c7e 31
+net/crates/net/bindings/go/net-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_1a12c36c1f6c4b 66,81-87
+net/crates/net/bindings/go/org-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_25995604e6f435 52,61,67,85
+net/crates/net/bindings/go/rpc-ffi/Cargo.toml
+  s_d8b00bedd146e9::t_21fd2b0abca09b 41
+net/crates/net/bindings/node/Cargo.toml
+  s_d8b00bedd146e9::t_b9fd22efb000b5 211-212,214,219
+net/crates/net/bindings/node/package.json
+  s_d8b00bedd146e9::t_fcf6c1c63c85d2 3
+net/crates/net/bindings/python/Cargo.toml
+  s_d8b00bedd146e9::t_2f9325cdb142d9 245-246,248,251
+net/crates/net/bindings/python/pyproject.toml
+  s_d8b00bedd146e9::t_3c795d186d5c27 10
+net/crates/net/bindings/python/python/net/__init__.py
+  s_d8b00bedd146e9::t_0d803dedec07f4 1042
+net/crates/net/bindings/python/uv.lock
+  s_d8b00bedd146e9::t_79243a60921e29 37
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_b44c235f58b939 17-46
+net/crates/net/browser-ts/package.json
+  s_d8b00bedd146e9::t_a03a8711f7f54e 3
+net/crates/net/cli/Cargo.toml
+  s_d8b00bedd146e9::t_56151f77a2e7d5 43,46,65
+net/crates/net/cli/npm/package.json
+  s_d8b00bedd146e9::t_4df036ede32401 3,32-39
+net/crates/net/cli/python/pyproject.toml
+  s_d8b00bedd146e9::t_1d4d7d2420e6d3 12
+net/crates/net/deck/Cargo.toml
+  s_d8b00bedd146e9::t_68ec380f6b8c61 19,85
+net/crates/net/deck/npm/package.json
+  s_d8b00bedd146e9::t_9e1133950c314a 3,32-39
+net/crates/net/deck/python/pyproject.toml
+  s_d8b00bedd146e9::t_d1cbdc2641b399 11
+net/crates/net/examples/browser-demo/host/Cargo.lock
+  s_d8b00bedd146e9::t_e875c32fc79451 1595,1640,1679
+net/crates/net/fuzz/Cargo.lock
+  s_d8b00bedd146e9::t_ce1452802bde1c 1104,1149
+net/crates/net/fuzz/Cargo.toml
+  s_d8b00bedd146e9::t_c14c568297ebc4 41
+net/crates/net/guards/fixtures_off_probe/Cargo.lock
+  s_d8b00bedd146e9::t_0252bf2b187f7c 780,831
+net/crates/net/guards/org_api_probe/Cargo.lock
+  s_d8b00bedd146e9::t_4fdd6b52da9d9f 820,873,895
+net/crates/net/integrations/hermes/requirements.txt
+  s_d8b00bedd146e9::t_e09572dbb5b302 4
+net/crates/net/integrations/hermes/tests/real_hermes_loader_check.py
+  s_d8b00bedd146e9::t_9d53e9712852e8 92
+net/crates/net/leaf/Cargo.lock
+  s_d8b00bedd146e9::t_751c2452f704b5 709,735
+net/crates/net/leaf/Cargo.toml
+  s_d8b00bedd146e9::t_785263572fd1f8 3
+net/crates/net/payments/Cargo.toml
+  s_d8b00bedd146e9::t_8cf6338ca7b7f6 38,42,47,177
+net/crates/net/sdk-py/pyproject.toml
+  s_d8b00bedd146e9::t_57b74b4d5f70be 10,31
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_d8b00bedd146e9::t_ca3bf82f3d487c 591
+net/crates/net/sdk-ts/package.json
+  s_d8b00bedd146e9::t_e5ee28ac06cfee 3,53
+net/crates/net/sdk/Cargo.toml
+  s_d8b00bedd146e9::t_40bd7701bc18b9 25,51,190
+net/crates/net/tests/feature_consumer/Cargo.lock
+  s_d8b00bedd146e9::t_fb1f65160a5267 1177,1230
+net/crates/net/tests/natsim/browser/Cargo.lock
+  s_d8b00bedd146e9::t_016eac299aaa93 1594,1639,1678
+net/crates/net/tests/rtc_browser/leaf/Cargo.lock
+  s_d8b00bedd146e9::t_44b02c1949ea30 483
+net/crates/net/tests/rtc_browser/runner/Cargo.lock
+  s_d8b00bedd146e9::t_463203582b8705 1619,1664,1688,1727
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0b292b9f0bcd42fa2f4619603ae33d1352f8136c",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
