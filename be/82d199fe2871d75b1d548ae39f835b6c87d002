@@ -1,0 +1,27 @@
+net/crates/net/docs/releases/RELEASE_v0.41_THUNDERSTRUCK.md
+  s_d8b00bedd146e9::t_7bcfcd6b0fa0d8 1-111
+docs/data/tiers.yaml
+  s_d8b00bedd146e9::t_5d211ced51cd26 89
+web/scripts/sync-releases.mjs
+  s_d8b00bedd146e9::t_fba0f99f497dc1 120
+web/src/content/docs/releases/RELEASE_v0.41_THUNDERSTRUCK.md
+  s_d8b00bedd146e9::t_f591703c157c11 1-115
+web/src/docs.order.ts
+  s_d8b00bedd146e9::t_627aea20c3f9fe 177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "be82d199fe2871d75b1d548ae39f835b6c87d002",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
