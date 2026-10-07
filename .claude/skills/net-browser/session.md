@@ -345,23 +345,27 @@ let node = await connect({ credentialB64, bootstrapUrl });
 let inMatch = false;                        // true while a match runs on this node
 let checking: Promise<void> | null = null;  // one check at a time
 
-// One probe: true when the anchor answered, false when nothing came back
-// in time (inconclusive on its own).
-function probe(): Promise<boolean> {
+type Heard = 'alive' | 'silent' | 'unsent';
+
+// One probe. 'alive': the anchor answered (a refusal is an answer).
+// 'silent': nothing came back in time, inconclusive on its own. 'unsent':
+// the leaf's own call table was full (status 4), so no probe left the page.
+function probe(): Promise<Heard> {
   return Promise.race([
     node.call('my-game.alive', new Uint8Array(0), 5000).then(
-      () => true,
-      // A refusal is an answer, unless it is the leaf's own backpressure
-      // (status 4: its call table is full), which never left the page.
-      (error) => error?.kind === 'rpc-refused' && error.failure?.status !== 4,
+      (): Heard => 'alive',
+      (error): Heard =>
+        error?.kind !== 'rpc-refused' ? 'silent' : error.failure?.status === 4 ? 'unsent' : 'alive',
     ),
-    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5500)),
+    new Promise<Heard>((resolve) => setTimeout(() => resolve('silent'), 5500)),
   ]);
 }
 
 async function recheck(): Promise<void> {
   if (inMatch) return;
-  if ((await probe()) || (await probe())) return;  // gone only after two misses in a row
+  // Gone only after two silent probes in a row; an unsent one proves nothing,
+  // so the check ends and runs again next time.
+  if ((await probe()) !== 'silent' || (await probe()) !== 'silent') return;
   try { node.close(); } catch { /* already gone */ }
   const { credentialB64, bootstrapUrl } = await requestCredential({ anchorUrl, game: 'my-game' });
   node = await connect({ credentialB64, bootstrapUrl });

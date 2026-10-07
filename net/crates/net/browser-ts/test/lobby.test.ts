@@ -341,12 +341,16 @@ describe('joining reaches a host that only accepts discovered peers', () => {
     const lobby = await lobbyOn(mesh, { node: hostNode });
     const { joiner } = strictJoiner(mesh, hostNode);
     let holding: PromiseWithResolvers<void> | null = null;
+    const held = Promise.withResolvers<void>();
     const order: string[] = [];
     const slow = {
       ...joiner,
       announce: async (tags: readonly string[]) => {
         const seeking = tags.length > 0;
-        if (seeking && holding !== null) await holding.promise;
+        if (seeking && holding !== null) {
+          held.resolve();
+          await holding.promise;
+        }
         order.push(seeking ? 'seek' : 'withdraw');
         return joiner.announce(tags);
       },
@@ -354,8 +358,9 @@ describe('joining reaches a host that only accepts discovered peers', () => {
     const world = await joinLobby({ node: slow, definition: room, game: 'lobby-test', code: lobby.code });
     await world.ready();
     holding = Promise.withResolvers<void>();
-    // The re-announce timer's next seeking announcement, held in flight.
-    await new Promise((resolve) => setTimeout(resolve, 2_100));
+    // The re-announce timer's next seeking announcement, held in flight:
+    // waited for by its arrival, not by a sleep the timer might outrun.
+    await held.promise;
     order.length = 0;
     const closing = world.close();
     await settle();

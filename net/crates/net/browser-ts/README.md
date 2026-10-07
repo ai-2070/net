@@ -577,8 +577,9 @@ audience })` (one per player). The declared rules still apply after it, so your
 code can hide more but never reveal a declared secret.
 
 **One tab per player.** With `rememberedIdentity()`, all tabs of the same site in
-one browser profile share a single identity once it is stored, so two tabs are the *same* player —
-and a player can't join itself. (Without it, every tab's `connect()` is a new
+one browser profile share a single identity once it is stored (two tabs that
+call it for the very first time at once can each create their own), so two tabs
+are the *same* player — and a player can't join itself. (Without it, every tab's `connect()` is a new
 player.) To test with two players on one machine, use two browser profiles, or
 two different browsers.
 

@@ -284,7 +284,8 @@ writes.
 - **Transport: `connect()`, one tab per player.** A store over `openSession` is
   not established. With `rememberedIdentity()`, all tabs of one origin in one
   browser profile load **one identity** once it is stored, so they are one
-  player: test two
+  player (two tabs calling it for the first time at once can each create
+  their own, so open the second tab after the first has connected): test two
   players with **two browser profiles** (or two browsers), not two tabs.
   Without it, each tab's `connect()` is a new node.
 - **`maxEventBytes` is required on both sides and must match** — use 8104.
