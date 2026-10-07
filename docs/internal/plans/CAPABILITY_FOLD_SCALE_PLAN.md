@@ -1006,6 +1006,126 @@ on `master` in `4ba25ced9` and `7837be561`, which this branch does not
 yet contain. A green exact-head run needs `master` merged into the
 branch.
 
+### Branch review fixes (2026-10-07)
+
+A review of the whole branch against `master` (`4c741a3e9..92881d82c`)
+raised ten findings. All ten are fixed. Each behavioral fix has a witness,
+and each witness was confirmed RED with its fix reverted.
+
+- **Reverse-index membership was linear per key** (`state.rs`).
+  `NodeRecord`'s `SmallVec` key list is cheap for the capability fold (one
+  key per class). But the routing, island and reservation folds key on the
+  payload, so a gateway announcing 10k routes paid an O(n) `contains` per
+  insert and an O(n) `retain` per removal. The removals ran inside
+  `evict_chunk`'s write hold.
+  - A record now builds a key → position map past 8 keys and drops it
+    again at 4. Insert, membership and swap-remove are O(1) at any size.
+    The map is boxed, so a small record carries one pointer and no map.
+  - Witnesses: `node_keys_match_a_set_model_across_the_index_threshold`
+    (20k random operations against a `HashSet` model, crossing the
+    threshold both ways) and
+    `a_gateway_owning_thousands_of_routes_keeps_an_exact_reverse_index`
+    (routing fold).
+- **A cache hit took the fold's state read lock** (`capability_bridge.rs`).
+  The per-packet greedy-admission path queued behind every apply and sweep
+  write hold, and parking_lot's fair lock made it wait behind queued
+  writers too.
+  - Each `NodeRecord` now keeps its revision in an `Arc<AtomicU64>`, which
+    writers store to under the write lock. A dropped record's cell is
+    retired to `u64::MAX`.
+  - `CapabilitySetCache` keeps a `PublisherRevision` handle beside each
+    entry. A hit for a present publisher is one atomic load and the cache
+    mutex. A mismatch, or an entry cached for an absent publisher, falls
+    through to the unchanged locked path.
+  - Cost: one 24-byte allocation per publisher record (the cell), plus
+    the 8-byte boxed-map pointer. The footprint report measures **3,233
+    retained B/entry** at 100k, against 3,199 before (the "PR #1198 review
+    fixes" figure). At 1M it measures 4,124.
+  - Witness: `cache_hit_does_not_wait_for_a_fold_writer` looks up while the
+    test holds the state write lock, and times out at 10 s without the
+    fast path. `lock_free_hit_misses_after_eviction_return_and_restore`
+    covers retirement.
+- **The revision invariant could be bypassed** (`state.rs`, `mod.rs`).
+  `Fold::with_state_mut` handed out `&mut FoldState`, and
+  `retract_floored_ownership` used it to rewrite payloads without moving
+  any revision.
+  - It is replaced by `Fold::update_payloads(node, f)`. That method
+    rewrites one publisher's payloads in place and advances the
+    publisher's revision when anything changed.
+  - `NodeRecord`'s fields are private, read through `keys()` and `rev()`.
+    With the escape hatch gone, a `Fold` hands out only shared borrows of
+    its state, so the remaining `pub` fields are read-only.
+  - Witness: `retraction_advances_the_publisher_revision`.
+- **A same-owner Replace no longer repaired a missing reverse-index
+  record** (`mod.rs`). It called `touch_node`, which does nothing when the
+  record is absent. It now calls `attach_key`, which re-lists the key.
+  Witness: `same_owner_refresh_repairs_a_missing_reverse_index_record`.
+- **Restore left a duplicated key listed under both owners** (`mod.rs`).
+  The later row wins. The earlier row is now unwound the way a
+  cross-publisher Replace unwinds it: out of the index and out of its
+  owner's record. Without that, `evict_node(earlier owner)` removed the
+  later owner's route, and the index saw two inserts for one key. Witness:
+  `restore_with_a_key_under_two_publishers_leaves_one_owner`.
+- **The expiry walk held one read lock across the whole map**
+  (`expiry.rs`). A writer queued during the walk blocked every later reader
+  for its full length, and the walk collected every expired key into one
+  `Vec`.
+  - The walk now runs in at most 4 segments, each at least 64k entries,
+    and releases the lock between them. It collects and evicts one segment
+    at a time. Resuming a segment re-skips the earlier ones by count,
+    scanning only control bytes.
+  - Resuming costs about 1.5 ns per skipped entry, against 5.7 ns to
+    examine one. The first cut used fixed 16k-entry segments, which made
+    the skips quadratic: a steady 1M sweep went from 5.7 ms to **50 ms**
+    (measured). Capping the segment count keeps the skips linear. The
+    steady 1M sweep measures **8.7 ms**, and its longest hold is a quarter
+    of the walk.
+  - Mass expiry is unchanged within noise. At 1M with 10% expired, the
+    sweep took 0.99 s against 0.94 s for evict-same-set. At the slice 3
+    measurement it was 0.91 s against 0.88 s.
+  - The resume point subtracts this sweep's own evictions, so each entry
+    is still examined exactly once. It is only approximate against
+    concurrent writers between segments. An entry examined twice is
+    evicted once (phase 2 re-checks), and one skipped goes on the next
+    sweep.
+  - Witness: `segmented_sweep_examines_each_entry_once_and_evicts_every_expired_one`
+    uses 64-entry segments, so 16 segments over 1,000 entries. With
+    the resume left uncorrected it fails.
+- **`sweep_walks` / `sweep_yielded` were invisible to operators**
+  (`metrics.rs`). They are now in `FoldStats`, the shape behind
+  `MeshNode::fold_stats` and the CLI/Deck/Prometheus surface. They are
+  `#[serde(default)]`, so older JSON still parses. Witness:
+  `fold_stats_carry_the_sweep_counters`.
+- **The hot call site's comment still said "generation-invalidated"**
+  (`mesh.rs`). Rewritten to describe per-publisher revision validity.
+- **The bench's counting allocator miscounted** (`fold_scale_report.rs`).
+  It subtracted frees of memory allocated before counting started, and
+  counted a failed `realloc`.
+  - `LIVE` is now tracked unconditionally, so its deltas are exact. The
+    cost is one relaxed add per allocation and free in every section.
+  - Only successful calls are counted.
+  - The reverse-index estimate reads `keys().len()` (the private fields
+    hide the spill) and adds the revision cell.
+- **The source-breaking API changes had no release-facing note.** Release
+  notes are drafted at release time (`RELEASE_STEPS.md` step 4), so the
+  consolidated note lives here for that draft. It supersedes the Slice 5
+  note above.
+
+**Release migration note (source-breaking), for the next release's notes.**
+
+- `FoldKind` has a new required associated type, `KeyHasher`. An
+  out-of-tree implementor must add, for example,
+  `type KeyHasher = std::collections::hash_map::RandomState;`.
+- `FoldState::entries` and `FoldState::by_node` gain a hasher type
+  parameter. Code that names their full types must add `K::KeyHasher`.
+- `FoldState::keys_for` returns `Option<&[K::Key]>`, not
+  `Option<&HashSet<K::Key>>`.
+- `FoldState::by_node`'s values are `NodeRecord`s with private fields. Read
+  `record.keys()` and `record.rev()` instead of the fields.
+- `FoldStats` has two new public fields, `sweep_walks` and
+  `sweep_yielded`. Code that builds a `FoldStats` with a struct literal
+  must set them. Deserializing older JSON is unaffected.
+
 ### Slices 0–5 at a glance (1M resident unless stated)
 
 | measure | Slice 0 baseline | after Slice 5 |
