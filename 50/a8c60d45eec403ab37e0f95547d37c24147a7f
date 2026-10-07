@@ -1,0 +1,101 @@
+net/crates/net/tests/gang_alloc_witness.rs
+  s_b4293f9d895548::t_e5dfa30da562d4 141
+net/crates/net/benches/island_claim_match.rs
+  s_b4293f9d895548::t_065d7ff16bca35 197
+net/crates/net/src/adapter/net/behavior/fold/tag_tests.rs
+  s_b4293f9d895548::t_9fdceebf4c2c62 17,192-214,231,233-248
+  s_b4293f9d895548::t_5e31bbe790b945 129-134,163-167,288-292,301-304,476-480,492-494
+  s_b4293f9d895548::t_d440ff67a4a1c8 149-150,155,161,310-312,315-317,320,339,383-385
+  s_b4293f9d895548::t_d04e88b5ca23ed 277-279,435-437
+  s_b4293f9d895548::t_0f191662b80a23 1-16,18-128,135-148,151-154,156-160,162,168-191,215-230,232,249-276,280-287,293-300,305-309,313-314,318-319,321-338,340-382,386-434,438-475,481-491,495-602
+net/crates/net/src/adapter/net/behavior/fold/tag_str.rs
+  s_b4293f9d895548::t_c3649c5cb77dcf 1-238
+net/crates/net/benches/island_claim_sensed.rs
+  s_b4293f9d895548::t_065d7ff16bca35 231
+net/crates/net/cli/src/commands/typegen/live.rs
+  s_b4293f9d895548::t_5e31bbe790b945 47
+  s_b4293f9d895548::t_c486a0992c7478 27
+net/crates/net/src/adapter/net/behavior/fold/capability_aggregation.rs
+  s_b4293f9d895548::t_8cec623ba7a8ae 273-274
+  s_b4293f9d895548::t_4ba0143ccb517a 895
+  s_b4293f9d895548::t_9d088e7450fe5f 178
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_b4293f9d895548::t_8cec623ba7a8ae 1350,1354,1358
+  s_b4293f9d895548::t_f2ceae5e6eba24 31-33,89-96,373-381,445-491,495,515,536,571-586,591-602,744-749
+  s_b4293f9d895548::t_5e31bbe790b945 587-590
+  s_b4293f9d895548::t_4ba0143ccb517a 1440,1616,1684
+  s_b4293f9d895548::t_2ffa1940a58318 778,827,832,839,907,937,972,979,1084,1184
+  s_b4293f9d895548::t_818ef1536ab9c4 750
+net/crates/net/tests/gang_claim_node.rs
+  s_b4293f9d895548::t_aa9f038a3191e4 68
+net/crates/net/benches/fold_scale_fixture/mod.rs
+  s_b4293f9d895548::t_e5dfa30da562d4 127,143
+net/crates/net/benches/island_claim_fallback.rs
+  s_b4293f9d895548::t_065d7ff16bca35 156
+docs/internal/plans/CAPABILITY_FOLD_SCALE_PLAN.md
+  s_b4293f9d895548::t_cf154be09a33da 1154-1176,2289-2434
+  s_b4293f9d895548::t_c0fd03db231833 2435
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_b4293f9d895548::t_7175725f440719 1958-1962
+net/crates/net/src/adapter/net/behavior/sensing/snapshot.rs
+  s_b4293f9d895548::t_60affb6f972b4a 92-93,149
+  s_b4293f9d895548::t_4ba0143ccb517a 349,491
+  s_b4293f9d895548::t_9d088e7450fe5f 89
+net/crates/net/src/adapter/net/behavior/fold/state.rs
+  s_b4293f9d895548::t_45ac4c4796abee 763-797,849-929
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_b4293f9d895548::t_bd6b546770141a 35-36,72-73,75,155-163,303-309,311,416-421,437-441,467-471,578,653-659,666-706,724-746,757,773-777
+  s_b4293f9d895548::t_51280ed6bf9b39 13
+  s_b4293f9d895548::t_d04e88b5ca23ed 41
+  s_b4293f9d895548::t_5e31bbe790b945 68-70
+  s_b4293f9d895548::t_9f4519fd952e3e 40,71
+net/crates/net/src/adapter/net/behavior/gang/mod.rs
+  s_b4293f9d895548::t_4ba0143ccb517a 309
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_b4293f9d895548::t_4ba0143ccb517a 13449
+net/crates/net/src/adapter/net/behavior/fold/tag_dictionary.rs
+  s_b4293f9d895548::t_bebac8e6c9cd10 154-160,162-165
+  s_b4293f9d895548::t_4a95f4ceaa9247 367-368
+  s_b4293f9d895548::t_15fe6e52fe4f8d 1-149,161,166-326,331-339,345-366,369-381,386-387,392-441
+  s_b4293f9d895548::t_5e31bbe790b945 150-153,327-330,340-344,382-385,388-391
+net/crates/net/src/adapter/net/behavior/gang/filter.rs
+  s_b4293f9d895548::t_4ba0143ccb517a 264
+net/crates/net/src/adapter/net/behavior/fold/expiry.rs
+  s_b4293f9d895548::t_bd6b546770141a 144
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_b4293f9d895548::t_9d088e7450fe5f 1425,1747,1865,1900,1968
+  s_b4293f9d895548::t_4ba0143ccb517a 2054,2098,3265-3266,3378
+  s_b4293f9d895548::t_48b605aa1b03ea 48,1408,1413
+  s_b4293f9d895548::t_18292c5cc9c712 618-647
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_b4293f9d895548::t_9d088e7450fe5f 953,958-962
+  s_b4293f9d895548::t_60affb6f972b4a 978
+net/crates/net/src/adapter/net/subnet/assignment.rs
+  s_b4293f9d895548::t_9d088e7450fe5f 232
+net/crates/net/src/adapter/net/behavior/fold/metrics.rs
+  s_b4293f9d895548::t_bd6b546770141a 75-93,149-152,220-231,307-315
+  s_b4293f9d895548::t_580646fd58576f 316
+net/crates/net/src/adapter/net/mesh.rs
+  s_b4293f9d895548::t_7ad8c742a3a9de 53212
+  s_b4293f9d895548::t_9d088e7450fe5f 46460
+  s_b4293f9d895548::t_bbd4a657445b75 45544-45555
+  s_b4293f9d895548::t_18292c5cc9c712 44722-44728,45258-45262
+  s_b4293f9d895548::t_a35b1f45119502 53207-53211,53213-53233,53237-53251,53256,53258-53262
+  s_b4293f9d895548::t_5e31bbe790b945 45263-45266,48137,53234-53236,53252-53255,53257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "50a8c60d45eec403ab37e0f95547d37c24147a7f",
+  "prompts": {},
+  "sessions": {
+    "s_b4293f9d895548": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8a49f9cc-58d8-4a8f-9aac-096640090b94",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
