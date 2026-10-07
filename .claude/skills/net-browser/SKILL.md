@@ -33,7 +33,8 @@ model that a client-prediction habit will get wrong.
    by `context.peer`, and `createLobby` / `listLobbies` / `joinLobby` for
    finding each other).
 2. **Use `connect()`, one tab per player** — a store over `openSession` is not
-   established. Test two players with two browser profiles, not two tabs.
+   established. Test two players with two browser profiles, not two tabs:
+   with `rememberedIdentity()` every tab of a profile is the same player.
 3. **Use the public anchor, `https://anchor.ai2070.net`**, unless you need
    your own. It admits any game id with no setup; to run your own, `net-mesh
    anchor serve --issuer-identity <key> --game <id>` (plus `--psk-file`,

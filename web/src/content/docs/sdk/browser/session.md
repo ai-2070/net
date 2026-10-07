@@ -24,8 +24,9 @@ session.generation();      // exact decimal, moves on every handoff
 ```
 
 Use `openSession` unless you know you want otherwise. Two tabs calling `connect()`
-on one origin are two nodes contending for one identity — which is what the
-election exists to prevent.
+with one identity (`rememberedIdentity()`, or the same injected secrets) are two
+nodes contending for it — which is what the election exists to prevent. Without
+one, each tab's `connect()` is a separate node.
 
 ## Declare what a new leader must restore
 

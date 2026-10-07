@@ -282,9 +282,10 @@ The path the package's own demo (`net/crates/net/browser-ts/demo/main.js`,
 writes.
 
 - **Transport: `connect()`, one tab per player.** A store over `openSession` is
-  not established. All tabs of one origin in one browser profile are **one
-  node**, so test two players with **two browser profiles** (or two browsers),
-  not two tabs.
+  not established. With `rememberedIdentity()`, all tabs of one origin in one
+  browser profile load **one identity**, so they are one player: test two
+  players with **two browser profiles** (or two browsers), not two tabs.
+  Without it, each tab's `connect()` is a new node.
 - **`maxEventBytes` is required on both sides and must match** — use 8104.
 - **The host player plays through `hostPlayer(host, { audience })`**, never
   `joinStore` on its own node (that throws `invalid-data` — a node has no session

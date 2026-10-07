@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { BrowserNode, connect, parseAttemptStatus, peerIdHex } from '../src/node.js';
+import { BrowserNode, connect, parseAttemptStatus, parseCounters, peerIdHex } from '../src/node.js';
 import {
   fromWasmError,
   IceServerConflictError,
@@ -277,6 +277,21 @@ describe('BrowserNode', () => {
     const node = await connected(new FakeNode({ anchorIdHex: '00000000000000aa' }));
     expect(node.anchorIdHex()).toBe('00000000000000aa');
     expect(node.counters()).toEqual({ packets_sent: '18446744073709551615', dropped_oversize: '2' });
+  });
+
+  // The leaf nests its per-reason drops (`counters.rs`'s `to_json`), and a
+  // nested group stringified whole read "[object Object]": every drop
+  // reason gone, behind a doc comment promising each one.
+  it('flattens the nested drop reasons into one counter each', () => {
+    const counters = parseCounters(
+      '{"packets_in":"3","drops":{"no_session":"18446744073709551615","replay":"0"}}',
+    );
+    expect(counters).toEqual({
+      packets_in: '3',
+      'drops.no_session': '18446744073709551615',
+      'drops.replay': '0',
+    });
+    expect(Object.values(counters)).not.toContain('[object Object]');
   });
 
   it('sends a session-independent signalling envelope', async () => {

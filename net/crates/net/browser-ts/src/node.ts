@@ -1241,14 +1241,26 @@ export function buildConnectRequest(options: ConnectOptions): LeafWasmConnectOpt
  * are `u64` on the Rust side and a JS number would round the large
  * ones. Exported for the session surface, whose `counters_json` is a
  * promise but whose payload is identical.
+ *
+ * A nested group is flattened into dotted keys: the leaf's per-reason
+ * `drops` object becomes `drops.<reason>`, one counter each. Stringified
+ * whole, it read `"[object Object]"` — every drop reason lost behind
+ * the doc comment's promise of "each drop reason".
  */
 export function parseCounters(json: string): Record<string, string> {
   const parsed: unknown = JSON.parse(json);
   if (parsed === null || typeof parsed !== 'object') return {};
   const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(parsed)) {
-    out[key] = typeof value === 'string' ? value : String(value);
-  }
+  const flatten = (group: object, prefix: string): void => {
+    for (const [key, value] of Object.entries(group)) {
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+        flatten(value, `${prefix}${key}.`);
+      } else {
+        out[`${prefix}${key}`] = typeof value === 'string' ? value : String(value);
+      }
+    }
+  };
+  flatten(parsed, '');
   return out;
 }
 
