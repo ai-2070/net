@@ -14,6 +14,36 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
+## 0.41.1 — two pages can connect to each other at once
+
+- **`connectPeer` from both sides no longer cancels both attempts.** When
+  two pages called `connectPeer` on each other at the same moment, each
+  answer retired the answerer's own offer, both ran out their ICE
+  deadline, and the pair stayed relayed. Every game had to hand-code a
+  tie-break. The SDK now does it, on `BrowserNode` and `MeshSession`
+  alike:
+  - the page with the **lower** node id offers;
+  - the higher one answers an offer from that peer that arrived within
+    the offerer's ICE deadline instead of offering back, and answers one
+    that crosses its own offer while that is under way. Once an answer
+    has started, its outcome is the call's;
+  - `acceptPeer` while this surface's own `connectPeer` for the peer is
+    in flight takes that call's outcome.
+
+  Offers are learned from the surface's verified signal events. With
+  none, or with the peer's node id unknown, `connectPeer` behaves as
+  before. One offerer per pair is an attempt at a direct link, not a
+  guarantee of one: read `peerAttempt()`.
+- **`joinLobby`'s `close()` resolves only once its withdrawal has
+  settled.** An announcement replaces a node's whole tag set, so a
+  withdrawal still in flight when the page went on to `createLobby`
+  could land after the new listing and erase it. The withdrawal also
+  waits for any seeking announcement still in flight.
+- **`counters()` reports each drop reason.** The leaf's nested `drops`
+  object came back as the string `"[object Object]"`; nested groups now
+  flatten to dotted keys (`drops.<reason>`), each still an exact decimal
+  string.
+
 ## 0.41.0 — the whole module surface is exported
 
 - **Every module-level export is reachable from an entry point.** Code

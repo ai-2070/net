@@ -1,6 +1,6 @@
 {
   "name": "@net-mesh/browser",
-  "version": "0.41.0",
+  "version": "0.41.1",
   "description": "Browser-native Net mesh leaf \u2014 idiomatic TypeScript over the net-mesh-leaf wasm node",
   "type": "module",
   "main": "dist/index.js",
