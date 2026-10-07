@@ -318,8 +318,17 @@ pub struct NodeRecord<Q> {
     keys: NodeKeys<Q>,
     /// See [`Self::rev`]. Shared with [`PublisherRevision`] handles so
     /// a cache can check validity without the fold's state lock. Set to
-    /// [`REV_RETIRED`] when the record is dropped.
+    /// [`REV_RETIRED`] when the record is dropped, by its `Drop`, so
+    /// every way a record goes away retires it: removal of its last
+    /// key, `evict_node`, a restore's clear, and the whole state being
+    /// dropped with its fold.
     rev: Arc<AtomicU64>,
+}
+
+impl<Q> Drop for NodeRecord<Q> {
+    fn drop(&mut self) {
+        self.rev.store(REV_RETIRED, Ordering::Release);
+    }
 }
 
 impl<Q: Hash + Eq + Clone> NodeRecord<Q> {
@@ -351,12 +360,6 @@ impl<Q: Hash + Eq + Clone> NodeRecord<Q> {
     fn set_rev(&self, rev: u64) {
         self.rev.store(rev, Ordering::Release);
     }
-
-    /// Mark the record dropped, so every outstanding
-    /// [`PublisherRevision`] for it reads as gone.
-    fn retire(&self) {
-        self.rev.store(REV_RETIRED, Ordering::Release);
-    }
 }
 
 /// A lock-free handle on one publisher record's revision, from
@@ -381,6 +384,14 @@ impl PublisherRevision {
     pub fn current(&self) -> Option<u64> {
         let rev = self.0.load(Ordering::Acquire);
         (rev != REV_RETIRED).then_some(rev)
+    }
+
+    /// Whether both handles name the same record. Revision NUMBERS are
+    /// only unique within one fold, so a validity check that may see
+    /// handles from another fold (a cache reused across folds) must
+    /// compare records, not numbers.
+    pub fn same_record(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -461,9 +472,8 @@ impl<K: FoldKind> FoldState<K> {
             return;
         }
         if record.keys.list.is_empty() {
-            if let Some(record) = self.by_node.remove(&node) {
-                record.retire();
-            }
+            // Dropping the record retires its revision cell.
+            self.by_node.remove(&node);
             return;
         }
         self.touch_node(node);
@@ -471,18 +481,16 @@ impl<K: FoldKind> FoldState<K> {
 
     /// Drop `node`'s record, returning the keys it owned.
     pub(super) fn remove_node(&mut self, node: NodeId) -> Option<SmallVec<[K::Key; 1]>> {
-        let record = self.by_node.remove(&node)?;
-        record.retire();
-        Some(record.keys.list)
+        // The record retires its revision cell as it drops here.
+        let mut record = self.by_node.remove(&node)?;
+        Some(std::mem::take(&mut record.keys.list))
     }
 
     /// Empty the entries and the reverse index ahead of a restore,
     /// keeping the revision counter so restored publishers get
     /// revisions no earlier lookup has seen.
     pub(super) fn clear_for_restore(&mut self) {
-        for record in self.by_node.values() {
-            record.retire();
-        }
+        // Dropping the records retires their revision cells.
         self.entries.clear();
         self.by_node.clear();
     }

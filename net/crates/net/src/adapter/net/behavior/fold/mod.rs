@@ -252,7 +252,17 @@ pub struct Fold<K: FoldKind> {
     /// expiry task holds a `Weak` and can signal reaps without
     /// keeping the fold alive.
     change_tx: Arc<watch::Sender<u64>>,
+    /// Process-unique identity of this fold instance, from
+    /// [`NEXT_FOLD_INSTANCE`]. Publisher revisions are numbered per fold,
+    /// so a consumer that caches against them (`CapabilitySetCache`)
+    /// records which fold an entry came from and never validates it
+    /// against another.
+    instance: u64,
 }
+
+/// Source of [`Fold`] instance ids. Starts at 1 and is never reused
+/// within a process.
+static NEXT_FOLD_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl<K: FoldKind> Fold<K> {
     /// Build a new fold instance with empty state and a fresh
@@ -307,6 +317,7 @@ impl<K: FoldKind> Fold<K> {
             audit_sink,
             sweep_handle,
             change_tx,
+            instance: NEXT_FOLD_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -332,6 +343,13 @@ impl<K: FoldKind> Fold<K> {
     /// (replaces interval polling).
     pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
         self.change_tx.subscribe()
+    }
+
+    /// This fold's process-unique instance id: distinct for every
+    /// [`Fold`] constructed in the process, live or dropped.
+    #[inline]
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance
     }
 
     /// Read the current change-generation without subscribing;

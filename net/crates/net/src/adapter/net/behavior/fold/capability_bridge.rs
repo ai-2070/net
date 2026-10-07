@@ -807,6 +807,11 @@ const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
 /// and returns, or is restored from a snapshot, gets a revision no
 /// cached entry carries.
 ///
+/// Entries record which [`Fold`] they came from and validate against
+/// the publisher's record itself, not just its revision number, which
+/// is only unique within one fold. A cache used with several folds, or
+/// kept past its fold, misses rather than serve another fold's set.
+///
 /// Capacity is fixed at construction. Hot sets larger than the
 /// capacity lose lookups to LRU eviction, which validity does not
 /// change: see [`CapabilitySetCacheStats`].
@@ -848,6 +853,9 @@ pub struct CapabilitySetCacheStats {
 }
 
 struct CachedCapabilitySetEntry {
+    /// [`Fold::instance_id`] of the fold the entry was synthesized from.
+    /// An entry from any other fold is a miss, on both paths.
+    fold: u64,
     rev: u64,
     /// Lock-free handle on the publisher record's revision, `None` for
     /// an entry cached while the publisher was absent (revision `0`).
@@ -857,12 +865,34 @@ struct CachedCapabilitySetEntry {
 }
 
 impl CachedCapabilitySetEntry {
-    /// Valid without the fold lock: the publisher record the entry was
-    /// cached against still exists and has not moved its revision.
-    fn valid_lock_free(&self) -> bool {
-        self.handle
-            .as_ref()
-            .is_some_and(|handle| handle.current() == Some(self.rev))
+    /// Valid without the fold lock: the entry came from `fold`, and the
+    /// publisher record it was cached against still exists and has not
+    /// moved its revision.
+    fn valid_lock_free(&self, fold: u64) -> bool {
+        self.fold == fold
+            && self
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.current() == Some(self.rev))
+    }
+
+    /// Valid against the publisher's current record, read under the
+    /// fold lock: either the publisher was absent then and is absent
+    /// now (the empty set is still right), or it is the SAME record at
+    /// the same revision. Comparing records and not bare revision
+    /// numbers keeps a cache that outlives its fold, or is shared with
+    /// another, from accepting a number the other fold issued.
+    fn valid_against(&self, fold: u64, current: Option<&super::state::PublisherRevision>) -> bool {
+        if self.fold != fold {
+            return false;
+        }
+        match (&self.handle, current) {
+            (None, None) => true,
+            (Some(cached), Some(current)) => {
+                cached.same_record(current) && current.current() == Some(self.rev)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -925,21 +955,23 @@ impl CapabilitySetCache {
         node_id: NodeId,
     ) -> std::sync::Arc<super::super::capability::CapabilitySet> {
         use std::sync::atomic::Ordering::Relaxed;
+        let fold_id = fold.instance_id();
         {
             let mut lru = self.inner.lock();
             if let Some(entry) = lru.get(&node_id) {
-                if entry.valid_lock_free() {
+                if entry.valid_lock_free(fold_id) {
                     self.hits.fetch_add(1, Relaxed);
                     return entry.caps.clone();
                 }
             }
         }
         fold.with_state(|state| {
-            let rev = state.publisher_rev(node_id);
+            let handle = state.publisher_revision(node_id);
+            let rev = handle.as_ref().and_then(|h| h.current()).unwrap_or(0);
             {
                 let mut lru = self.inner.lock();
                 match lru.get(&node_id) {
-                    Some(entry) if entry.rev == rev => {
+                    Some(entry) if entry.valid_against(fold_id, handle.as_ref()) => {
                         self.hits.fetch_add(1, Relaxed);
                         return entry.caps.clone();
                     }
@@ -953,8 +985,9 @@ impl CapabilitySetCache {
             self.inner.lock().put(
                 node_id,
                 CachedCapabilitySetEntry {
+                    fold: fold_id,
                     rev,
-                    handle: state.publisher_revision(node_id),
+                    handle,
                     caps: caps.clone(),
                 },
             );
@@ -3548,6 +3581,56 @@ mod tests {
         let got = got.expect("a hit must complete while a writer holds the fold");
         assert!(std::sync::Arc::ptr_eq(&first, &got));
         assert_eq!(cache.stats().hits, 1);
+    }
+
+    /// A cache used with two folds, or kept past one, never serves one
+    /// fold's set for the other. Revision numbers are per fold, so A's
+    /// first revision is the same number in both; only the fold id and
+    /// the record identity tell the entries apart.
+    #[test]
+    fn a_cache_never_serves_one_folds_set_for_another() {
+        let kp = EntityKeypair::generate();
+        let cache = CapabilitySetCache::new();
+        let x = new_fold();
+        x.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("X");
+        let y = new_fold();
+        y.apply(sign_member(&kp, 0xA, 0x100, vec!["cpu"], None))
+            .expect("Y");
+        assert_eq!(rev(&x, 0xA), rev(&y, 0xA), "same number in both folds");
+
+        assert!(has_tag(&cache.get_or_synthesize(&x, 0xA), "gpu"));
+        let from_y = cache.get_or_synthesize(&y, 0xA);
+        assert!(
+            has_tag(&from_y, "cpu") && !has_tag(&from_y, "gpu"),
+            "both folds alive"
+        );
+
+        // Cache X's set again, then drop X.
+        assert!(has_tag(&cache.get_or_synthesize(&x, 0xA), "gpu"));
+        drop(x);
+        let after_drop = cache.get_or_synthesize(&y, 0xA);
+        assert!(
+            has_tag(&after_drop, "cpu") && !has_tag(&after_drop, "gpu"),
+            "the dropped fold's entry is not served for the live one"
+        );
+    }
+
+    /// Dropping a fold retires every outstanding revision handle: a
+    /// record that goes away with its state reads as gone, exactly like
+    /// one removed by eviction.
+    #[test]
+    fn dropping_a_fold_retires_its_publisher_revisions() {
+        let kp = EntityKeypair::generate();
+        let fold = new_fold();
+        fold.apply(sign_member(&kp, 0xA, 0x100, vec!["gpu"], None))
+            .expect("apply A");
+        let handle = fold
+            .with_state(|s| s.publisher_revision(0xA))
+            .expect("A present");
+        assert!(handle.current().is_some());
+        drop(fold);
+        assert_eq!(handle.current(), None);
     }
 
     /// The lock-free check never outlives the record it was cached

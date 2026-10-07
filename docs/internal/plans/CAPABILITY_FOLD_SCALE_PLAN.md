@@ -995,7 +995,8 @@ The review covered `bd9716426..c5bec507f`, which includes Slices 4 and 5.
   fold).
   - A cross-publisher replace moves the key between records. The old
     owner keeps its surviving sibling, or drops to absent (revision 0)
-    on its last key, and both revisions advance.
+    on its last key. The new owner's revision always advances; the old
+    owner's advances only if it remains present.
   - Evicting the old owners removes only what they still own; the
     transferred entries survive.
 
@@ -1092,8 +1093,10 @@ and each witness was confirmed RED with its fix reverted.
     uses 64-entry segments, so 16 segments over 1,000 entries. With
     the resume left uncorrected it fails.
 - **`sweep_walks` / `sweep_yielded` were invisible to operators**
-  (`metrics.rs`). They are now in `FoldStats`, the shape behind
-  `MeshNode::fold_stats` and the CLI/Deck/Prometheus surface. They are
+  (`metrics.rs`). They are now in `FoldStats`, the shape
+  `MeshNode::fold_stats` returns. That is the only operator-facing read
+  today: no CLI command, Deck panel or Prometheus exporter consumes
+  `FoldStats` yet, so wiring one is follow-up work. The fields are
   `#[serde(default)]`, so older JSON still parses. Witness:
   `fold_stats_carry_the_sweep_counters`.
 - **The hot call site's comment still said "generation-invalidated"**
@@ -1110,6 +1113,29 @@ and each witness was confirmed RED with its fix reverted.
   notes are drafted at release time (`RELEASE_STEPS.md` step 4), so the
   consolidated note lives here for that draft. It supersedes the Slice 5
   note above.
+
+**cubic, second pass (2026-10-07).** Three new comments; all three were
+valid.
+
+- **A dropped fold left its revision cells live.** Records retired their
+  cell only on the explicit removal paths, so a record dropped with its
+  `FoldState` still read as current. A related gap turned up while
+  testing: revision numbers are per fold, so a `CapabilitySetCache` used
+  with two folds could serve one fold's set for the other. Both folds
+  number a publisher's first revision 1, and the lock-free path matched
+  on the number.
+  - `NodeRecord` now retires its cell in `Drop`, which covers every way a
+    record goes away.
+  - Each `Fold` gets a process-unique instance id. Cache entries record
+    it, and both validity checks require it.
+  - The locked check compares the publisher's record (`same_record`), not
+    the bare number.
+  - Witnesses: `dropping_a_fold_retires_its_publisher_revisions` and
+    `a_cache_never_serves_one_folds_set_for_another`. Each is RED with
+    its fix reverted.
+- **Two doc corrections, both applied above.** The transfer note now says
+  only a still-present old owner advances its revision. The sweep-counter
+  note no longer claims a CLI, Deck or Prometheus consumer.
 
 **Release migration note (source-breaking), for the next release's notes.**
 
