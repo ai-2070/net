@@ -1449,7 +1449,7 @@ fn sweep_rechecks_entries_refreshed_or_removed_after_collection() {
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     let now = std::time::Instant::now();
-    let collected = expiry::collect_expired(&fold.state, &fold.metrics, now);
+    let collected = expiry::collect_expired_segment(&fold.state, 0, usize::MAX, now).expired;
     assert_eq!(collected.len(), 3, "the walk collects all three");
 
     // Between collection and eviction: A is refreshed with a long TTL,
@@ -1474,6 +1474,53 @@ fn sweep_rechecks_entries_refreshed_or_removed_after_collection() {
     });
     assert_eq!(fold.metrics().expiries(), 1);
     assert_eq!(fold.metrics().entries(), 1);
+}
+
+/// The walk runs in segments, releasing the state lock between them,
+/// yet still examines each entry exactly once: the resume point is
+/// reduced by what the previous segments evicted, since each eviction
+/// took one occupied slot out of the walked prefix. A resume that
+/// ignored evictions would skip survivors (fewer examined, expired
+/// entries left behind); one that re-walked would count them twice.
+#[test]
+fn segmented_sweep_examines_each_entry_once_and_evicts_every_expired_one() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    const N: u64 = 1000;
+    for i in 0..N {
+        // Every third entry expires at once; the rest stay live.
+        let ttl = if i % 3 == 0 { 0 } else { 3600 };
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, ttl, vec!["t"]))
+            .expect("apply");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let expired = (0..N).filter(|i| i % 3 == 0).count();
+
+    let walks_before = fold.metrics().sweep_walks();
+    let yielded_before = fold.metrics().sweep_yielded();
+    // 64-entry segments: sixteen segments over 1,000 entries.
+    let evicted =
+        expiry::sweep_expired_in_segments(&fold.state, &fold.index, &fold.metrics, None, 64);
+
+    assert_eq!(evicted, expired, "every expired entry evicted");
+    assert_eq!(fold.metrics().entries(), N - expired as u64);
+    assert_eq!(
+        fold.metrics().sweep_walks() - walks_before,
+        1,
+        "one logical walk"
+    );
+    assert_eq!(
+        fold.metrics().sweep_yielded() - yielded_before,
+        N,
+        "each entry examined exactly once across segments"
+    );
+    let now = std::time::Instant::now();
+    fold.with_state(|s| {
+        assert!(
+            s.entries.values().all(|e| e.expires_at > now),
+            "no expired entry survives the sweep"
+        );
+    });
 }
 
 /// A same-owner Replace re-lists the key in the publisher's record, so
@@ -1825,11 +1872,39 @@ fn fold_stats_round_trips_through_serde_json() {
         queries: 7,
         snapshots_taken: 1,
         snapshots_restored: 0,
+        sweep_walks: 4,
+        sweep_yielded: 40,
         has_audit_sink: true,
     };
     let json = serde_json::to_string(&stats).expect("serialize");
     let parsed: FoldStats = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(parsed, stats);
+}
+
+/// The sweep counters reach the operator surface (`FoldStats`), not
+/// only the in-process `FoldMetrics` accessors, and JSON written
+/// before they existed still parses.
+#[test]
+fn fold_stats_carry_the_sweep_counters() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    for i in 0..5 {
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 3600, vec!["t"]))
+            .expect("apply");
+    }
+    fold.sweep_expired_now();
+    fold.sweep_expired_now();
+    let stats = fold.stats();
+    assert_eq!(stats.sweep_walks, 2);
+    assert_eq!(stats.sweep_yielded, 10);
+
+    let mut legacy = serde_json::to_value(&stats).expect("serialize");
+    let obj = legacy.as_object_mut().expect("object");
+    obj.remove("sweep_walks");
+    obj.remove("sweep_yielded");
+    let parsed: FoldStats = serde_json::from_value(legacy).expect("legacy JSON parses");
+    assert_eq!(parsed.sweep_walks, 0);
+    assert_eq!(parsed.sweep_yielded, 0);
 }
 
 #[test]

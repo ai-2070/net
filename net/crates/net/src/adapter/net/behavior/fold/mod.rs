@@ -650,6 +650,8 @@ impl<K: FoldKind> Fold<K> {
             queries: self.metrics.queries(),
             snapshots_taken: self.metrics.snapshots_taken(),
             snapshots_restored: self.metrics.snapshots_restored(),
+            sweep_walks: self.metrics.sweep_walks(),
+            sweep_yielded: self.metrics.sweep_yielded(),
             has_audit_sink: self.has_audit_sink(),
         }
     }

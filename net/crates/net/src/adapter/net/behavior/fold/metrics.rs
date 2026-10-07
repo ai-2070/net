@@ -61,6 +61,17 @@ pub struct FoldStats {
     pub snapshots_taken: u64,
     /// Snapshots restored via [`super::Fold::restore`].
     pub snapshots_restored: u64,
+    /// Expiry sweeps' candidate walks since fold construction: one per
+    /// sweep. `#[serde(default)]` so JSON from before the field existed
+    /// still deserializes.
+    #[serde(default)]
+    pub sweep_walks: u64,
+    /// Entries those walks examined, live and expired alike: the
+    /// sweep's entry-visit cost. Divided by `sweep_walks` it reads as
+    /// the average fold size per sweep; growing faster than that
+    /// means the sweep is re-walking entries.
+    #[serde(default)]
+    pub sweep_yielded: u64,
     /// Whether an [`super::FoldAuditSink`] is currently installed
     /// on the fold. Diagnostic — operators trying to figure
     /// out why their audit trail is empty want a quick
