@@ -44719,6 +44719,13 @@ impl MeshNode {
     where
         K: super::behavior::fold::FoldKind,
     {
+        // Payload limits first, before a generation is consumed: a
+        // receiver would refuse the advertisement whole.
+        K::validate(&payload).map_err(|reason| {
+            AdapterError::Connection(format!(
+                "fold: payload refused before publish, nothing was sent: {reason}"
+            ))
+        })?;
         let gen = self.next_fold_generation(K::KIND_ID, counter_class);
         let meta = super::behavior::fold::EnvelopeMeta {
             announced_at: super::current_timestamp_micros(),
@@ -45248,6 +45255,15 @@ impl MeshNode {
             // re-augmenting the nrpc / nat tags that follow.
             let caps = match new_baseline {
                 Some(caps) => {
+                    // Refuse an over-cap set before it becomes the baseline:
+                    // every receiver would drop it, and the keep-alive would
+                    // re-announce it forever.
+                    super::behavior::fold::capability_bridge::validate_capability_set_tags(&caps)
+                        .map_err(|reason| {
+                        AdapterError::Connection(format!(
+                            "announce: capability set refused, nothing was sent: {reason}"
+                        ))
+                    })?;
                     *self.user_caps.write() = Some(caps.clone());
                     caps
                 }
@@ -45525,6 +45541,18 @@ impl MeshNode {
             // Proximity pingwaves piggyback the CURRENT capability summary and
             // ride to peers, so they carry the PUBLIC set only (never an
             // owner-scoped tag).
+            // The fully augmented set (registered services and tools,
+            // transport and NAT tags) must fit the same caps. Checked
+            // before it is published anywhere, locally or to peers; only
+            // the announce version counter has moved, and a skipped
+            // version is harmless to receivers.
+            super::behavior::fold::capability_bridge::validate_capability_set_tags(&caps).map_err(
+                |reason| {
+                    AdapterError::Connection(format!(
+                        "announce: augmented capability set refused, nothing was sent: {reason}"
+                    ))
+                },
+            )?;
             self.proximity_graph.set_local_capabilities(caps.clone());
 
             // The PUBLIC broadcast announcement — the ONLY object every plaintext
@@ -46429,7 +46457,7 @@ impl MeshNode {
         let mut nodes: Vec<u64> = self.capability_fold.with_state(|state| {
             let mut seen = std::collections::BTreeSet::new();
             for entry in state.entries.values() {
-                if entry.payload.tags.contains(&tag) {
+                if entry.payload.tags.iter().any(|t| *t == tag) {
                     seen.insert(entry.node_id);
                 }
             }
@@ -48106,7 +48134,7 @@ impl MeshNode {
     /// guards. Shared by [`Self::find_nodes_by_filter_scoped`] and
     /// [`Self::find_best_node_scoped`] so list and single-winner
     /// discovery cannot drift on subnet membership.
-    fn same_subnet_resolver(&self) -> impl Fn(u64, &[String]) -> bool {
+    fn same_subnet_resolver(&self) -> impl Fn(u64, &[super::behavior::fold::TagStr]) -> bool {
         let my_subnet = self.local_subnet;
         let local_node_id = self.node_id;
         let policy = self.local_subnet_policy.clone();
@@ -53174,6 +53202,62 @@ mod fold_publisher_helpers_tests {
                 .await
                 .expect("MeshNode::new"),
         )
+    }
+
+    /// Slice 6: a local producer gets a meaningful refusal for an
+    /// advertisement every receiver would drop, and the refusal changes
+    /// nothing locally: no baseline adopted, no generation consumed.
+    #[tokio::test]
+    async fn local_publish_refuses_an_over_cap_advertisement() {
+        use super::super::behavior::fold::{CapabilityMembership, FoldKind, MAX_CAPABILITY_TAGS};
+        let node = build_node_for_test().await;
+
+        let mut caps = CapabilitySet::new();
+        for i in 0..=MAX_CAPABILITY_TAGS {
+            caps = caps.add_tag(format!("t{i}"));
+        }
+        let err = node
+            .announce_capabilities(caps)
+            .await
+            .expect_err("257 tags are refused");
+        assert!(err.to_string().contains("257 tags"), "{err}");
+        assert!(
+            node.user_caps_snapshot().tags.is_empty(),
+            "the refused set did not become the baseline"
+        );
+
+        let long = CapabilitySet::new().add_tag("x".repeat(257));
+        assert!(node.announce_capabilities(long).await.is_err());
+
+        let membership = CapabilityMembership {
+            class_hash: 0xC1,
+            tags: (0..=MAX_CAPABILITY_TAGS)
+                .map(|i| format!("t{i}").into())
+                .collect(),
+            hardware: None,
+            state: super::super::behavior::fold::NodeState::Idle,
+            region: None,
+            price_quote: None,
+            reflex_addr: None,
+            noise_pubkey: None,
+            rtc_bootstrap: None,
+            rtc_addr: None,
+            rtc_stun_addr: None,
+            allowed_nodes: Vec::new(),
+            allowed_subnets: Vec::new(),
+            allowed_groups: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            owner: None,
+        };
+        assert!(node
+            .publish_capability_membership(membership)
+            .await
+            .is_err());
+        assert_eq!(
+            node.next_fold_generation(super::super::behavior::fold::CapabilityFold::KIND_ID, 0xC1),
+            1,
+            "the refusal consumed no generation"
+        );
     }
 
     #[tokio::test]

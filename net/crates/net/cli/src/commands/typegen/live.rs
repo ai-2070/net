@@ -24,6 +24,7 @@ struct Advertisement {
 fn observe(mesh: &net_sdk::Mesh) -> Vec<Advertisement> {
     mesh.inner().capability_fold().with_state(|state| {
         let mut result = Vec::new();
+        let metadata_service_tag = format!("nrpc:{TOOL_METADATA_FETCH_SERVICE}");
         for ((_, provider), entry) in &state.entries {
             let membership = &entry.payload;
             let tags: Vec<_> = membership
@@ -43,9 +44,7 @@ fn observe(mesh: &net_sdk::Mesh) -> Vec<Advertisement> {
                 result.push(Advertisement {
                     provider: *provider,
                     descriptor: ToolDescriptor::from_capability(&cap, &membership.metadata),
-                    metadata_service: membership
-                        .tags
-                        .contains(&format!("nrpc:{TOOL_METADATA_FETCH_SERVICE}")),
+                    metadata_service: membership.tags.iter().any(|t| *t == metadata_service_tag),
                 });
             }
         }

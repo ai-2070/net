@@ -228,7 +228,7 @@ fn fixture_meta() -> EnvelopeMeta {
 fn seed_gang_capability(node: &Arc<MeshNode>, signer: &EntityKeypair, host_id: u64) {
     let membership = CapabilityMembership {
         class_hash: GANG_CLASS,
-        tags: vec![MATCH_TAG.to_string()],
+        tags: vec![MATCH_TAG.into()],
         hardware: None,
         state: NodeState::Idle,
         region: None,

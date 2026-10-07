@@ -229,7 +229,7 @@ impl SubnetPolicy {
     /// assignment — see contract point 1 on [`SubnetPolicy`], where
     /// same-level rules are later-rule-wins — and is what makes
     /// [`Self::can_assign_non_global`] exact rather than approximate.
-    pub fn assign_from_rendered_tags(&self, tags: &[String]) -> SubnetId {
+    pub fn assign_from_rendered_tags<S: AsRef<str>>(&self, tags: &[S]) -> SubnetId {
         self.assign_from_tag_strs(tags)
     }
 

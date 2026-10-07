@@ -950,12 +950,16 @@ impl<'a> PreparedScope<'a> {
     /// is retained as the readable reference definition;
     /// `tags_match_scope_agrees_with_materialized_scope` pins the two to
     /// the same verdict across the matrix.
-    pub(crate) fn matches(&self, tags: &[String], same_subnet: bool) -> bool {
+    pub(crate) fn matches<S: AsRef<str>>(&self, tags: &[S], same_subnet: bool) -> bool {
         tags_match_prepared(tags, self, same_subnet)
     }
 }
 
-fn tags_match_prepared(tags: &[String], prepared: &PreparedScope<'_>, same_subnet: bool) -> bool {
+fn tags_match_prepared<S: AsRef<str>>(
+    tags: &[S],
+    prepared: &PreparedScope<'_>,
+    same_subnet: bool,
+) -> bool {
     use ScopeFilter as F;
     let filter = prepared.filter;
 
@@ -971,7 +975,7 @@ fn tags_match_prepared(tags: &[String], prepared: &PreparedScope<'_>, same_subne
     let (mut has_tenant, mut has_region) = (false, false);
     let (mut tenant_hit, mut region_hit) = (false, false);
     for tag in tags {
-        let Some(body) = tag.strip_prefix("scope:") else {
+        let Some(body) = tag.as_ref().strip_prefix("scope:") else {
             continue;
         };
         if body == "subnet-local" {

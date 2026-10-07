@@ -124,7 +124,7 @@ impl Templates {
         ann.generation = generation;
         ann.ttl_secs = Some(ttl_secs);
         if variant == 1 {
-            ann.payload.tags.push("bench-variant-b".to_string());
+            ann.payload.tags.push("bench-variant-b".into());
         }
         ann
     }
@@ -140,7 +140,7 @@ impl Templates {
     ) -> SignedAnnouncement<CapabilityMembership> {
         let mut ann = self.envelope(node, generation, LIVE_TTL_SECS, 0);
         for k in 0..unique {
-            ann.payload.tags.push(format!("unique-{node}-{k}"));
+            ann.payload.tags.push(format!("unique-{node}-{k}").into());
         }
         ann
     }

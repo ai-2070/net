@@ -86,10 +86,11 @@ pub struct DeclaredProvider {
 /// Whether a folded tag set declares `capability_id` under the v1
 /// structural match (module doc: exact wire-form name equality, or
 /// the `software.tool.<id>.tool_id=<name>` tool bucket).
-pub fn declares_capability(tags: &[String], capability_id: &CapabilityId) -> bool {
+pub fn declares_capability<S: AsRef<str>>(tags: &[S], capability_id: &CapabilityId) -> bool {
     let name = capability_id.as_str();
     tags.iter().any(|tag| {
-        if tag.as_str() == name {
+        let tag = tag.as_ref();
+        if tag == name {
             return true;
         }
         let Ok(Tag::AxisValue {
@@ -145,7 +146,7 @@ where
                     generation =
                         Some(generation.map_or(entry.generation, |g| g.max(entry.generation)));
                 }
-                tags.extend(entry.payload.tags.iter().cloned());
+                tags.extend(entry.payload.tags.iter().map(|t| t.as_str().to_owned()));
             }
             if let Some(generation) = generation {
                 out.push((*node_id, generation, tags.into_iter().collect()));
@@ -345,7 +346,7 @@ mod tests {
         assert!(declares_capability(&by_name, &cap()));
         assert!(declares_capability(&by_tool, &cap()));
         assert!(!declares_capability(&neither, &cap()));
-        assert!(!declares_capability(&[], &cap()));
+        assert!(!declares_capability::<String>(&[], &cap()));
     }
 
     #[test]
@@ -487,7 +488,7 @@ mod tests {
             EnvelopeMeta::default(),
             CapabilityMembership {
                 class_hash: class,
-                tags: tags.iter().map(|t| t.to_string()).collect(),
+                tags: tags.iter().map(|t| t.to_string().into()).collect(),
                 hardware: None,
                 state: NodeState::Idle,
                 region: None,

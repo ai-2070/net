@@ -141,6 +141,7 @@ pub(super) fn evict_due_chunk<K: FoldKind>(
         };
         state.detach_key(old_entry.node_id, &key);
         index.on_remove(&key, &old_entry.payload);
+        index.release(&old_entry.payload);
         if let Some(sink) = audit_sink {
             let transition = EntryTransition::Expired {
                 key: &key,

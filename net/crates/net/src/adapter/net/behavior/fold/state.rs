@@ -760,6 +760,41 @@ pub trait FoldIndex<K: FoldKind>: Send + Sync {
     fn index_payload_equivalent(_old: &K::Payload, _new: &K::Payload) -> bool {
         false
     }
+
+    /// Admit an accepted mutation's payload into any receiver-local
+    /// storage the index shares with entries (the capability fold's tag
+    /// dictionary). Called after merge decided Insert (`outgoing` is
+    /// `None`) or Replace (`outgoing` is the payload being replaced),
+    /// under the state + index write guards, before any other change.
+    ///
+    /// All-or-nothing: on `Err` nothing in the index and nothing in
+    /// `incoming` may have changed, and the fold refuses the apply. On
+    /// `Ok` the index may have rewritten `incoming` to share storage, and
+    /// has released `outgoing`'s share. Default: admit everything.
+    fn admit(
+        &mut self,
+        _incoming: &mut K::Payload,
+        _outgoing: Option<&K::Payload>,
+    ) -> Result<(), PayloadRejection> {
+        Ok(())
+    }
+
+    /// Release a stored payload's share of admission storage as its
+    /// entry leaves the fold by eviction, expiry or a restore unwind.
+    /// (A Replace releases through [`Self::admit`].) Default: nothing.
+    fn release(&mut self, _payload: &K::Payload) {}
+
+    /// Whether a restore installing exactly `payloads` (the effective
+    /// restored state) into an emptied index would be admitted. Called
+    /// before the live fold is touched. Default: yes.
+    fn preflight_restore(&self, _payloads: &[&K::Payload]) -> Result<(), PayloadRejection> {
+        Ok(())
+    }
+
+    /// Admission storage counters. Default: zeros.
+    fn admission_stats(&self) -> AdmissionStats {
+        AdmissionStats::default()
+    }
 }
 
 /// Default no-op secondary index. Folds that don't need a
@@ -811,6 +846,87 @@ pub enum FoldError {
         /// Current entry count of the live fold.
         current_len: usize,
     },
+    /// The announcement's payload was refused whole: it broke a payload
+    /// limit ([`FoldKind::validate`]) or the fold's admission budget
+    /// ([`FoldIndex::admit`]). Nothing in the fold changed.
+    #[error("payload from publisher {node_id} refused: {reason}")]
+    PayloadRejected {
+        /// Publisher of the refused announcement.
+        node_id: NodeId,
+        /// Why.
+        reason: PayloadRejection,
+    },
+    /// A restore was refused before touching the live fold: a row of the
+    /// effective restored state broke a payload limit, or the state as a
+    /// whole does not fit the admission budget. The fold is unchanged.
+    #[error("restore refused, fold unchanged: {reason}")]
+    RestoreRefused {
+        /// Why.
+        reason: PayloadRejection,
+    },
+}
+
+/// Why a payload was refused whole. Typed so a caller (and the fold's
+/// counters) can tell a malformed advertisement from a full budget.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PayloadRejection {
+    /// More tags than the per-advertisement cap, duplicates counted.
+    #[error("{count} tags, over the cap of {max}")]
+    TooManyTags {
+        /// Tags carried.
+        count: usize,
+        /// The cap.
+        max: usize,
+    },
+    /// A tag longer than the per-tag cap, in UTF-8 bytes.
+    #[error("tag {index} is {len} bytes, over the cap of {max}")]
+    TagTooLong {
+        /// Position of the first overlong tag.
+        index: usize,
+        /// Its length in UTF-8 bytes.
+        len: usize,
+        /// The cap.
+        max: usize,
+    },
+    /// Admitting the payload's new tags would exceed the fold's
+    /// canonical-tag budget, after counting what a replacement frees.
+    #[error(
+        "tag budget: {new_tags} new tags / {new_bytes} bytes would exceed \
+         {max_tags} tags / {max_bytes} bytes (live {live_tags} / {live_bytes})"
+    )]
+    TagBudget {
+        /// New distinct tags the payload brings.
+        new_tags: usize,
+        /// Their UTF-8 bytes.
+        new_bytes: usize,
+        /// Distinct tags held when refused.
+        live_tags: usize,
+        /// Bytes held when refused.
+        live_bytes: usize,
+        /// The budget's tag ceiling.
+        max_tags: usize,
+        /// The budget's byte ceiling.
+        max_bytes: usize,
+    },
+}
+
+impl PayloadRejection {
+    /// Whether this is a budget refusal rather than a size-limit one.
+    pub fn is_budget(&self) -> bool {
+        matches!(self, Self::TagBudget { .. })
+    }
+}
+
+/// Counters an index's admission dictionary reports through
+/// [`FoldIndex::admission_stats`]. All zero for an index without one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdmissionStats {
+    /// Distinct canonical values held (tags, for the capability fold).
+    pub interned: u64,
+    /// Bytes of those values: what the budget counts.
+    pub interned_bytes: u64,
+    /// Estimated overhead beyond those bytes, not counted by the budget.
+    pub overhead_bytes: u64,
 }
 
 #[cfg(test)]

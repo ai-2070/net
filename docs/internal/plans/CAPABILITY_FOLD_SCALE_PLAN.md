@@ -1151,6 +1151,29 @@ valid.
 - `FoldStats` has two new public fields, `sweep_walks` and
   `sweep_yielded`. Code that builds a `FoldStats` with a struct literal
   must set them. Deserializing older JSON is unaffected.
+- **Slice 6, capability tags (source):**
+  - `CapabilityMembership::tags` is `Vec<TagStr>`, not `Vec<String>`.
+    `TagStr` converts from `String` / `&str` with `Into`, and derefs to
+    `str`. `tags.contains(&some_string)` no longer compiles: compare by
+    content (`tags.iter().any(|t| *t == some_string)`).
+  - `find_nodes_matching_scoped`'s `same_subnet_lookup` closure takes
+    `&[TagStr]`.
+  - `FoldStats` gains `interned`, `interned_bytes`,
+    `interned_overhead_bytes`, `limit_rejections` and `budget_rejections`.
+  - `FoldError` gains `PayloadRejected` and `RestoreRefused`, so an
+    exhaustive `match` on it needs two arms.
+  - `FoldKind` and `FoldIndex` gain methods with defaults; implementors
+    need nothing.
+  - The wire form, the signature transcript and the snapshot form are
+    unchanged.
+- **Slice 6, capability tags (behavior):**
+  - A capability advertisement carrying more than 256 tags (duplicates
+    counted), or any tag over 256 UTF-8 bytes, is refused whole by every
+    receiver. Local `announce_capabilities*` and `publish_fold` return an
+    error instead of sending it.
+  - A capability fold refuses, whole, an advertisement whose new distinct
+    tags would exceed its tag budget (default 1,000,000 tags / 64 MiB of
+    tag bytes, configurable at creation).
 
 ### Slices 0–5 at a glance (1M resident unless stated)
 
@@ -2262,6 +2285,153 @@ Proof, once authorized:
 - Local snapshot round trip preserves tag order, content and namespace.
 - The full fold unit surface, `org_routing_wiring_tests` and the
   `cross_lang_*` suites stay green.
+
+#### Slice 6 evidence packet (implemented; awaiting acceptance)
+
+Implemented under "Owner rulings and corrected B1 contract". This packet is
+for acceptance review. Slice 7 has not started.
+
+**What landed.**
+
+- **`TagStr`** (`fold/tag_str.rs`). An `Arc<str>` handle with content
+  `Eq` / `Ord` / `Hash`, `Borrow<str>`, `Deref<str>` and immutable text.
+  It serializes as a plain string.
+  - `CapabilityMembership::tags` is `Vec<TagStr>`.
+- **`TagDictionary`** (`fold/tag_dictionary.rs`), held in
+  `CapabilityIndexInner`:
+  - canonical tag → fold-owned occurrence count;
+  - net, all-or-nothing `admit`, and `release`;
+  - `preflight` for restore;
+  - a `TagBudget` (defaults 1,000,000 tags / 64 MiB, or
+    `CapabilityIndexInner::with_tag_budget` passed to the new
+    `Fold::with_sweep_interval_and_index`).
+- **Generic hooks, all default no-ops,** so no other fold changes:
+  - `FoldKind::validate`: the size caps, checked before merge and per
+    restore row;
+  - `FoldIndex::admit`: after merge decides Insert or Replace, inside
+    `apply`'s existing state + index guards, before any other mutation;
+  - `FoldIndex::release`: eviction, expiry;
+  - `FoldIndex::preflight_restore`, `FoldIndex::admission_stats`.
+- **Refusals.**
+  - Errors: `FoldError::PayloadRejected { node_id, reason }` and
+    `FoldError::RestoreRefused { reason }`, with a typed
+    `PayloadRejection` (`TooManyTags`, `TagTooLong`, `TagBudget`).
+  - Counters: the normal `applies_rejected` plus
+    `FoldStats::{limit_rejections, budget_rejections}`.
+  - Audit: one bounded record, `payload-limit-rejected` or
+    `payload-budget-rejected`, whose detail holds counts only and never
+    a tag.
+- **Restore is preflighted.** The effective state (expired rows dropped,
+  later duplicate wins) is built and size-checked before any lock is
+  taken. The budget is preflighted under the guards, before the clear. A
+  refusal returns `RestoreRefused` with the old fold untouched.
+- **`by_tag` keys are `TagStr`.** Buckets share the canonical allocation
+  and are looked up by `&str`. Synthetic keys stay in their own `String`
+  map.
+- **Local publish refuses first.**
+  - `announce_capabilities*` validates the caller's set before it becomes
+    the baseline, and the fully augmented set (services, tools,
+    transport, NAT) before it is published.
+  - `publish_fold` (so `publish_capability_membership`) validates before
+    a generation is consumed.
+- **Readers.**
+  - `&[String]` signatures became `&[TagStr]` or generic `AsRef<str>`:
+    `find_nodes_matching_scoped`'s closure, `PreparedScope::matches`,
+    `CapabilityMatcher::matches_any`, `declares_capability`,
+    `SubnetPolicy::assign_from_rendered_tags`.
+  - `capability_tags_for*` still return `Vec<String>`.
+  - `tags_union_for` now dedups on `&str` instead of cloning each tag
+    first.
+
+**Measured** (`fold_scale_report`, same machine, against Slice 8):
+
+| measure | Slice 8 | Slice 6 |
+|---|---|---|
+| payload heap, B/entry, 100k (target ≤ 800) | 1,641 | **508** |
+| retained, B/entry, 100k | 3,317 | **2,184** (−34%) |
+| retained, B/entry, 1M | 4,199 | **3,066** (−27%) |
+| retained after 3× 20% churn, 100k | 4,082 | 2,947 |
+| warm index-equivalent refresh, allocations (gate) | 0 | **0** |
+| cold insert, allocations per call | 1.07 | 1.06 |
+
+One reporter caveat. The "payload heap" column measures payloads built
+outside the fold, before interning. For the cloned-template rows those
+already share allocations. For "translated per entry" they do not (1,992
+B/entry), so that row's "index (remainder)" goes negative. Its meaningful
+figure is **retained**: 2,184, identical to the template row. That shows
+the real decode path interns to the same footprint. The dictionary's own
+overhead is reported separately (`FoldStats::interned_overhead_bytes`) and
+is not counted by the budget.
+
+**Witnesses.**
+
+- Golden oracle (`fold/tag_tests.rs`), with the old `Vec<String>` type
+  kept as `LegacyMembership`:
+  - `tag_str_encoding_matches_the_string_oracle`: payload bytes and the
+    whole signed envelope are byte-identical, and an old-type signature
+    verifies as the new type;
+  - `old_snapshot_restores_without_a_format_bump`: old snapshot bytes
+    decode and restore with order, content and duplicates kept.
+  - `FoldSnapshot<K>` itself is not deserializable for a concrete fold
+    (its derived serde bound asks `K: Deserialize`), and no production
+    path decodes one. The test decodes into a field-for-field mirror.
+- Caps:
+  - `tag_caps_apply_on_every_intake_path`: typed apply, typed signed
+    dispatch, legacy translation. 256 accepted, 257 by duplicates
+    refused, multibyte 258 bytes refused, counters checked.
+  - `caps_count_duplicates_and_measure_utf8_bytes` (unit): the exact-cap
+    and multibyte boundary.
+  - `local_publish_refuses_an_over_cap_advertisement` (mesh): announce and
+    typed publish refused, no baseline adopted, no generation consumed.
+- Budget:
+  - `a_budget_refusal_changes_nothing`: Insert and Replace refusals. It
+    checks payload, generation, deadline, expiry placement, publisher
+    revision, cache validity (`Arc::ptr_eq` hit), the index, the
+    dictionary, the counters, and an audit record that names no tag.
+  - `a_replacement_frees_its_last_use_tag_for_a_new_one`: net budget at
+    a full dictionary.
+  - Unit: `a_refused_admission_changes_nothing`,
+    `a_replacement_frees_its_last_use_for_the_new_tag`,
+    `duplicates_within_a_payload_are_one_new_tag`.
+- Liveness and admission point:
+  - `a_merge_rejected_advertisement_never_reaches_the_dictionary`;
+  - `a_pinned_reader_does_not_keep_a_tag_in_the_dictionary`: a cloned
+    payload and a snapshot both pin; eviction still retires the tag;
+  - unit `admit_canonicalizes_and_counts_fold_owned_uses`.
+- Intake identity: `intake_paths_share_one_canonical_allocation`. Legacy
+  and typed entries share one allocation per tag, and so do restored
+  entries.
+- Restore:
+  - `a_restore_over_a_limit_is_refused_and_leaves_the_fold`;
+  - `a_restore_over_the_budget_is_refused_and_leaves_the_fold`, which
+    also covers the in-budget success: monotonic revision, an exact
+    dictionary, the wheel invariant.
+
+**RED-checked** (each witness fails with the named piece removed):
+- eviction's `release` → `a_pinned_reader_does_not_keep_a_tag_in_the_dictionary`;
+- restore's budget preflight → `a_restore_over_the_budget_is_refused_and_leaves_the_fold`;
+- the budget comparison → `a_budget_refusal_changes_nothing`;
+- `apply`'s `validate` → `tag_caps_apply_on_every_intake_path`;
+- the net release credit → `a_replacement_frees_its_last_use_tag_for_a_new_one`.
+
+**Gates run.**
+- The unit suite: 6,038 pass.
+- Integration binaries:
+  - every capability-, gang-, aggregator- and sensing-related binary:
+    79 pass;
+  - both `cross_lang_*` suites: 23 pass.
+- `cargo check --workspace --all-targets` and
+  `cargo check --all-features --all-targets`.
+- Clippy: strict `--lib --bins` in all three feature configurations, and
+  all-targets.
+- `RUSTDOCFLAGS=-D warnings cargo doc --all-features`.
+- fmt.
+
+**Source changes found in-tree.** The CLI (`typegen/live.rs`) called
+`tags.contains(&String)`. It now compares by content.
+- Integration tests and benches that built `tags` from `Vec<String>`
+  now convert with `Into`.
+- The bindings and the SDK carry no tags and needed nothing.
 
 ### Slice 7: bitmap buckets (Track B2) — held
 

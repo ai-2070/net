@@ -28,7 +28,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::state::{FoldIndex, FoldState, FxU64Hasher, NodeId};
+use super::state::{AdmissionStats, FoldIndex, FoldState, FxU64Hasher, NodeId, PayloadRejection};
+use super::tag_dictionary::{validate_capability_tags, TagBudget, TagDictionary};
+use super::tag_str::TagStr;
 use super::FoldKind;
 
 /// Coarse-grained node state for capability matching. The
@@ -84,7 +86,14 @@ pub struct CapabilityMembership {
     /// (e.g. `"hardware.gpu"`, `"hardware.gpu.vram_gb=80"`,
     /// `"causal:<hex>"`). See the module doc on tag
     /// representation.
-    pub tags: Vec<String>,
+    ///
+    /// [`TagStr`] handles, which serialize exactly as `String`s (the wire
+    /// form and signature transcript are unchanged). Once stored in a
+    /// fold, each one shares its text with every other entry carrying
+    /// the same tag. At most [`super::MAX_CAPABILITY_TAGS`] tags of at
+    /// most [`super::MAX_CAPABILITY_TAG_LEN`] UTF-8 bytes each: a fold
+    /// refuses a larger advertisement whole.
+    pub tags: Vec<TagStr>,
     /// Optional hardware projection for fast filtering.
     pub hardware: Option<HardwareSummary>,
     /// Current state — the load-bearing filter for the
@@ -361,8 +370,15 @@ pub type CapabilityMatch = ((u64, NodeId), CapabilityMembership);
 /// legitimately relevant there.
 #[derive(Debug, Default)]
 pub struct CapabilityIndexInner {
-    /// tag → set of (class, node) keys carrying that tag.
-    by_tag: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    /// tag → set of (class, node) keys carrying that tag. Keyed by the
+    /// canonical [`TagStr`], so a bucket shares its tag's one allocation
+    /// with every entry instead of owning a copy; looked up by `&str`.
+    by_tag: HashMap<TagStr, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    /// One canonical [`TagStr`] per distinct published tag, with
+    /// fold-owned use counts and the fold's tag budget
+    /// (CAPABILITY_FOLD_SCALE_PLAN.md Slice 6). Synthetic keys are not in
+    /// it: they live in `by_synthetic`, a separate namespace.
+    dictionary: TagDictionary,
     /// Index-only synthetic tag (`model:`/`tool:`/`gpu:`) → set of
     /// (class, node) keys. Kept in a SEPARATE map from `by_tag` so a
     /// raw published tag string can never collide with a synthetic
@@ -426,10 +442,57 @@ fn bucket_remove(
     }
 }
 
+impl CapabilityIndexInner {
+    /// An empty index whose tag dictionary enforces `budget` instead of
+    /// [`TagBudget::default`]. Pass to
+    /// [`Fold::with_sweep_interval_and_index`](super::Fold::with_sweep_interval_and_index)
+    /// for a deployment that needs more distinct tags.
+    pub fn with_tag_budget(budget: TagBudget) -> Self {
+        Self {
+            dictionary: TagDictionary::with_budget(budget),
+            ..Self::default()
+        }
+    }
+
+    /// The tag dictionary, for tests.
+    #[cfg(test)]
+    pub(crate) fn dictionary(&self) -> &TagDictionary {
+        &self.dictionary
+    }
+}
+
+/// [`bucket_insert`] for the raw-tag map: a new bucket takes a clone of
+/// the canonical handle (a refcount bump, no copy of the text).
+fn tag_bucket_insert(
+    map: &mut HashMap<TagStr, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    tag: &TagStr,
+    key: (u64, NodeId),
+) {
+    if let Some(set) = map.get_mut(tag.as_str()) {
+        set.insert(key);
+    } else {
+        map.entry(tag.clone()).or_default().insert(key);
+    }
+}
+
+/// [`bucket_remove`] for the raw-tag map.
+fn tag_bucket_remove(
+    map: &mut HashMap<TagStr, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    tag: &str,
+    key: &(u64, NodeId),
+) {
+    if let Some(set) = map.get_mut(tag) {
+        set.remove(key);
+        if set.is_empty() {
+            map.remove(tag);
+        }
+    }
+}
+
 impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
     fn on_insert(&mut self, key: &(u64, NodeId), payload: &CapabilityMembership) {
         for tag in &payload.tags {
-            bucket_insert(&mut self.by_tag, tag, *key);
+            tag_bucket_insert(&mut self.by_tag, tag, *key);
         }
         // Index-only synthetic tags (model:/tool:/gpu:) live in
         // their own `by_synthetic` map so the model / tool / gpu
@@ -449,7 +512,7 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
 
     fn on_remove(&mut self, key: &(u64, NodeId), payload: &CapabilityMembership) {
         for tag in &payload.tags {
-            bucket_remove(&mut self.by_tag, tag, key);
+            tag_bucket_remove(&mut self.by_tag, tag, key);
         }
         // Mirror the synthetic tags added in `on_insert`. Derived
         // from the same payload, so the set is identical.
@@ -470,6 +533,7 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
     }
 
     fn clear(&mut self) {
+        self.dictionary.clear();
         self.by_tag.clear();
         self.by_synthetic.clear();
         self.by_region.clear();
@@ -503,6 +567,38 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
             && old.region == new.region
             && old.tags == new.tags
             && old.hardware == new.hardware
+    }
+
+    /// Canonicalize the incoming tags through the dictionary, net of the
+    /// outgoing payload's release. See [`TagDictionary::admit`].
+    fn admit(
+        &mut self,
+        incoming: &mut CapabilityMembership,
+        outgoing: Option<&CapabilityMembership>,
+    ) -> Result<(), PayloadRejection> {
+        self.dictionary
+            .admit(&mut incoming.tags, outgoing.map(|p| p.tags.as_slice()))
+    }
+
+    fn release(&mut self, payload: &CapabilityMembership) {
+        self.dictionary.release(&payload.tags);
+    }
+
+    fn preflight_restore(
+        &self,
+        payloads: &[&CapabilityMembership],
+    ) -> Result<(), PayloadRejection> {
+        self.dictionary
+            .preflight(payloads.iter().map(|p| p.tags.as_slice()))
+    }
+
+    fn admission_stats(&self) -> AdmissionStats {
+        let stats = self.dictionary.stats();
+        AdmissionStats {
+            interned: stats.tags,
+            interned_bytes: stats.bytes,
+            overhead_bytes: stats.overhead_bytes,
+        }
     }
 }
 
@@ -645,6 +741,13 @@ impl FoldKind for CapabilityFold {
     /// hasher). Pinned by `capability_fold_primary_map_hasher_is_keyed`.
     type KeyHasher = foldhash::fast::RandomState;
 
+    /// The per-advertisement tag caps (CAPABILITY_FOLD_SCALE_PLAN.md
+    /// Slice 6): at most [`super::MAX_CAPABILITY_TAGS`] tags, duplicates
+    /// counted, of at most [`super::MAX_CAPABILITY_TAG_LEN`] UTF-8 bytes.
+    fn validate(payload: &Self::Payload) -> Result<(), PayloadRejection> {
+        validate_capability_tags(&payload.tags)
+    }
+
     fn key_for(node_id: NodeId, payload: &Self::Payload) -> Self::Key {
         (payload.class_hash, node_id)
     }
@@ -672,7 +775,7 @@ impl FoldKind for CapabilityFold {
             CapabilityQuery::HasAnyTag(tags) => {
                 let mut seen: HashSet<(u64, NodeId)> = HashSet::new();
                 for tag in &tags {
-                    if let Some(keys) = index.by_tag.get(tag) {
+                    if let Some(keys) = index.by_tag.get(tag.as_str()) {
                         seen.extend(keys.iter().copied());
                     }
                 }
@@ -721,19 +824,19 @@ fn resolve_keys_all_tags(
     }
     // Pick the most-selective tag bucket as the candidate set.
     let mut tags_by_selectivity: Vec<&String> = tags.iter().collect();
-    tags_by_selectivity.sort_by_key(|t| index.by_tag.get(*t).map(|s| s.len()).unwrap_or(0));
+    tags_by_selectivity.sort_by_key(|t| index.by_tag.get(t.as_str()).map(|s| s.len()).unwrap_or(0));
 
     let Some(first) = tags_by_selectivity.first() else {
         return HashSet::default();
     };
-    let Some(initial) = index.by_tag.get(*first) else {
+    let Some(initial) = index.by_tag.get(first.as_str()) else {
         // First tag has no entries → intersection is empty.
         return HashSet::default();
     };
     let mut candidates: HashSet<(u64, NodeId), BuildU64TupleHasher> =
         initial.iter().copied().collect();
     for tag in tags_by_selectivity.iter().skip(1) {
-        let Some(bucket) = index.by_tag.get(*tag) else {
+        let Some(bucket) = index.by_tag.get(tag.as_str()) else {
             return HashSet::default();
         };
         candidates.retain(|k| bucket.contains(k));
@@ -801,7 +904,7 @@ pub(crate) fn resolve_candidate_keys<'a>(
     if filter.tag_groups_all.is_empty() && filter.tags_any.is_empty() && filter.class.is_none() {
         match (&filter.tags_all[..], filter.state, &filter.region) {
             ([tag], None, None) => {
-                return match index.by_tag.get(tag) {
+                return match index.by_tag.get(tag.as_str()) {
                     Some(bucket) => CandidateKeys::Borrowed(bucket),
                     None => CandidateKeys::Owned(HashSet::default()),
                 };
@@ -831,7 +934,7 @@ pub(crate) fn resolve_candidate_keys<'a>(
     // collected once. Nothing is cloned and then narrowed.
     let mut sets: Vec<KeySet<'a>> = Vec::new();
     for tag in &filter.tags_all {
-        match index.by_tag.get(tag) {
+        match index.by_tag.get(tag.as_str()) {
             Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
             None => return CandidateKeys::Owned(HashSet::default()),
         }
@@ -866,14 +969,14 @@ pub(crate) fn resolve_candidate_keys<'a>(
         }
     }
     if let [tag] = &filter.tags_any[..] {
-        match index.by_tag.get(tag) {
+        match index.by_tag.get(tag.as_str()) {
             Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
             None => return CandidateKeys::Owned(HashSet::default()),
         }
     } else if !filter.tags_any.is_empty() {
         let mut union: HashSet<(u64, NodeId), BuildU64TupleHasher> = HashSet::default();
         for tag in &filter.tags_any {
-            if let Some(bucket) = index.by_tag.get(tag) {
+            if let Some(bucket) = index.by_tag.get(tag.as_str()) {
                 union.extend(bucket.iter().copied());
             }
         }
@@ -978,7 +1081,7 @@ fn resolve_candidate_keys_pre_slice4<'a>(
     if filter.tag_groups_all.is_empty() && filter.tags_any.is_empty() && filter.class.is_none() {
         match (&filter.tags_all[..], filter.state, &filter.region) {
             ([tag], None, None) => {
-                return match index.by_tag.get(tag) {
+                return match index.by_tag.get(tag.as_str()) {
                     Some(bucket) => CandidateKeys::Borrowed(bucket),
                     None => CandidateKeys::Owned(HashSet::default()),
                 };
@@ -1078,7 +1181,7 @@ fn resolve_candidate_keys_pre_slice4<'a>(
         // the other `(u64, NodeId)` intermediates in this resolver.
         let mut tags_any_union: HashSet<(u64, NodeId), BuildU64TupleHasher> = HashSet::default();
         for tag in &filter.tags_any {
-            if let Some(bucket) = index.by_tag.get(tag) {
+            if let Some(bucket) = index.by_tag.get(tag.as_str()) {
                 tags_any_union.extend(bucket.iter().copied());
             }
         }
@@ -1244,15 +1347,15 @@ fn tags_union_for(state: &FoldState<CapabilityFold>, node_id: NodeId) -> Vec<Str
     let Some(keys) = state.keys_for(node_id) else {
         return Vec::new();
     };
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for key in keys {
         if let Some(entry) = state.entries.get(key) {
             for tag in &entry.payload.tags {
-                seen.insert(tag.clone());
+                seen.insert(tag.as_str());
             }
         }
     }
-    seen.into_iter().collect()
+    seen.into_iter().map(str::to_owned).collect()
 }
 
 /// Return `node_id`'s last-advertised reflex `SocketAddr`, or
@@ -1334,7 +1437,7 @@ mod tests {
             }
             CapabilityMembership {
                 class_hash: class,
-                tags,
+                tags: tags.into_iter().map(Into::into).collect(),
                 hardware: (!i.is_multiple_of(3)).then(|| HardwareSummary {
                     gpu_vendor: Some(if i.is_multiple_of(2) { "nvidia" } else { "amd" }.into()),
                     gpu_count: 1,
@@ -1510,7 +1613,7 @@ mod tests {
             for hw in &hardware {
                 let payload = CapabilityMembership {
                     class_hash: 0,
-                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                    tags: tags.iter().map(|t| t.to_string().into()).collect(),
                     hardware: hw.clone(),
                     state: NodeState::Idle,
                     region: None,
@@ -1578,7 +1681,7 @@ mod tests {
             EnvelopeMeta::default(),
             CapabilityMembership {
                 class_hash: class,
-                tags: tags.into_iter().map(String::from).collect(),
+                tags: tags.into_iter().map(Into::into).collect(),
                 hardware: None,
                 state,
                 region: region.map(String::from),

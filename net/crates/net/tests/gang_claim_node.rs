@@ -65,7 +65,7 @@ fn now_us() -> u64 {
 fn prime_capability(node: &MeshNode, kp: &EntityKeypair, node_id: u64, tags: Vec<String>) {
     let membership = CapabilityMembership {
         class_hash: 0x67_70_75,
-        tags,
+        tags: tags.into_iter().map(Into::into).collect(),
         hardware: None,
         state: NodeState::Idle,
         region: None,

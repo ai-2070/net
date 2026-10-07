@@ -13446,7 +13446,7 @@ mod roster_fallback_tests {
             EnvelopeMeta::default(),
             CapabilityMembership {
                 class_hash: 0xD00D,
-                tags: vec!["nrpc:d".to_string()],
+                tags: vec!["nrpc:d".into()],
                 hardware: None,
                 state: NodeState::Idle,
                 region: None,

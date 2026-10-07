@@ -1955,6 +1955,11 @@ fn fold_stats_round_trips_through_serde_json() {
         snapshots_restored: 0,
         sweep_walks: 4,
         sweep_yielded: 40,
+        interned: 9,
+        interned_bytes: 90,
+        interned_overhead_bytes: 900,
+        limit_rejections: 1,
+        budget_rejections: 2,
         has_audit_sink: true,
     };
     let json = serde_json::to_string(&stats).expect("serialize");

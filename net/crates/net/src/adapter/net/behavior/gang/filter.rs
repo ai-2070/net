@@ -261,7 +261,7 @@ mod tests {
         };
         let membership = CapabilityMembership {
             class_hash: class,
-            tags: tags.into_iter().map(String::from).collect(),
+            tags: tags.into_iter().map(Into::into).collect(),
             hardware: None,
             state,
             region: region.map(String::from),

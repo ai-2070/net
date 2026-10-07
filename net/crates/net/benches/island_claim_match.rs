@@ -194,7 +194,7 @@ fn seed_host(
         fixture_meta(),
         CapabilityMembership {
             class_hash: CLASS,
-            tags,
+            tags: tags.into_iter().map(Into::into).collect(),
             hardware: None,
             state: NodeState::Idle,
             region: None,
