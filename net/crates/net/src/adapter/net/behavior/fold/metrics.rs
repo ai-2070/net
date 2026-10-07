@@ -150,6 +150,12 @@ pub struct FoldMetrics {
     limit_rejections: AtomicU64,
     /// Announcements refused for the admission budget.
     budget_rejections: AtomicU64,
+    /// The index's admission storage counters, published under the
+    /// index lock after every operation that changes them, so
+    /// [`super::Fold::stats`] reads them without taking any fold lock.
+    admission_interned: AtomicU64,
+    admission_interned_bytes: AtomicU64,
+    admission_overhead_bytes: AtomicU64,
 }
 
 impl FoldMetrics {
@@ -227,6 +233,27 @@ impl FoldMetrics {
     #[inline]
     pub(super) fn on_budget_reject(&self) {
         self.budget_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publish the index's admission counters. Called with the index
+    /// lock held, after the operation that changed them.
+    #[inline]
+    pub(super) fn set_admission(&self, stats: super::state::AdmissionStats) {
+        self.admission_interned
+            .store(stats.interned, Ordering::Relaxed);
+        self.admission_interned_bytes
+            .store(stats.interned_bytes, Ordering::Relaxed);
+        self.admission_overhead_bytes
+            .store(stats.overhead_bytes, Ordering::Relaxed);
+    }
+
+    /// The admission counters last published under the index lock.
+    pub fn admission(&self) -> super::state::AdmissionStats {
+        super::state::AdmissionStats {
+            interned: self.admission_interned.load(Ordering::Relaxed),
+            interned_bytes: self.admission_interned_bytes.load(Ordering::Relaxed),
+            overhead_bytes: self.admission_overhead_bytes.load(Ordering::Relaxed),
+        }
     }
 
     /// Bump the query counter. Called by

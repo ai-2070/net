@@ -155,6 +155,7 @@ pub(super) fn evict_due_chunk<K: FoldKind>(
         evicted += 1;
     }
     debug_assert_eq!(state.scheduled_len(), state.entries.len());
+    metrics.set_admission(index.admission_stats());
     Chunk { drain, evicted }
 }
 

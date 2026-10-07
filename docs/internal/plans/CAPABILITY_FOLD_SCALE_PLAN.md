@@ -2433,6 +2433,111 @@ is not counted by the budget.
   now convert with `Into`.
 - The bindings and the SDK carry no tags and needed nothing.
 
+#### Slice 6 review HOLD at `50a8c60d4`: four defects, fixed
+
+Two source reviews found four production defects in Slice 6's
+integration code. The dictionary's admission, release, expiry and atomic
+restore passed. Each defect is fixed, each fix has a witness, and each
+witness was confirmed RED with its fix removed.
+
+1. **A refused augmented announce mutated the baseline and consumed a
+   version** (`mesh.rs`, `announce_attempt`).
+   - The caller's set was checked and installed as the baseline before the
+     automatic tags (services, tools, transport, NAT, ACK ranges) were
+     added. The augmented set was checked only afterwards, after
+     `capability_version` had moved.
+   - A refusal therefore left the rejected baseline for keep-alives to
+     re-send.
+   - **Fix:** the augmentation block moved into `augment_public_caps`, a
+     pure method. `announce_attempt` checks the augmented public set and
+     the self-fold set before anything is committed. The version advances
+     only after the checks pass. The baseline and the pingwave summary are
+     committed only after this node's own fold accepts the announcement.
+   - Witness: `a_refused_augmented_announce_changes_nothing`. It checks
+     that the baseline, the version, the published emission's version and
+     the self-fold tags are all unchanged, and that the previous baseline
+     still re-announces.
+2. **Private-service refusals were discarded.**
+   - The cap check covered only the public set. Owner-scoped and granted
+     `nrpc:` tags were added afterwards.
+   - The self-fold `apply` error was dropped, in `announce_attempt` and in
+     `index_self_with_local_services`.
+   - `serve_rpc*` therefore succeeded for a handler whose folded tag the
+     self-fold had refused, and protected dispatch requires that tag.
+   - **Fix, announce side:** `announce_attempt` also checks
+     `self_fold_caps` (public plus private services), and a self-fold
+     refusal returns an error with nothing committed.
+   - **Fix, registration side:** `index_self_with_local_services` returns
+     `Result`. It first checks the whole announceable state
+     (`check_announceable`: published and self-indexed) and propagates a
+     fold refusal.
+   - The four `serve_rpc*` paths register through `publish_local_service`.
+     On refusal it rolls back the registry entry and the inbound
+     dispatcher, then returns the new
+     `ServeError::CapabilityRefused`.
+   - Witnesses: `serve_rpc_rolls_back_a_service_whose_tag_cannot_be_announced`
+     (a retry is refused for the same reason, not as a duplicate; it
+     succeeds once room is made) and
+     `an_announce_whose_private_services_overflow_the_self_fold_is_refused`.
+3. **Legacy and live intake checked the caps after deduplicating and
+   filtering.**
+   - `CapabilitySet::tags` decoded straight into a `HashSet<Tag>`, so 257
+     identical tags became one.
+   - The live intake path strips unauthorized chain-heat tags and caps
+     blob-heat tags at 256. Both ran before any length or count check:
+     257 blob-heat tags were silently cut to 256, and an overlong
+     chain-heat tag was stripped instead of refused.
+   - **Fix:** `CapabilitySet::tags` decodes through
+     `deserialize_tags_capped`. It counts every encoded element,
+     duplicates included, and measures each tag's encoded UTF-8 length
+     before parsing or deduplication. A violation fails the decode, so
+     `CapabilityAnnouncement::from_bytes` refuses the whole announcement
+     before any filter runs.
+   - This applies to every `CapabilitySet` decode. A set that cannot be
+     announced does not decode.
+   - Witnesses (`behavior/capability.rs`):
+     - `decode_counts_duplicate_tags_against_the_cap`: 256 identical tags
+       decode, 257 refuse;
+     - `decode_refuses_257_blob_heat_tags_instead_of_truncating`;
+     - `decode_measures_encoded_tag_length_before_any_filter`: exact 256
+       bytes accepted, 257 with a multibyte character refused.
+4. **`Fold::stats()` could deadlock from an audit sink.**
+   - `stats()` took the index read lock, and a budget refusal records its
+     audit event while `apply` still holds the index write lock.
+   - **Fix:** the index's admission counters are published into
+     `FoldMetrics` atomics under the lock by every operation that changes
+     them (insert, replace, evict, expire, restore). `stats()` reads them
+     without taking any lock, as it did before Slice 6.
+   - The `FoldAuditSink` contract now says what `record` may call:
+     counters, yes; anything that takes the state or index lock, no.
+   - Witness: `an_audit_sink_can_read_stats_during_a_refusal`. Its sink
+     calls `fold.stats()` from `record`, and the apply runs on a thread
+     with a 10 s deadline. With `stats()` taking the index lock again it
+     times out.
+
+**Residual, stated.** The tag caps are checked before the announce
+version moves. A refusal by this node's own fold for its **budget** can
+only be found by the apply, which runs after the version moves. That
+refusal commits nothing (no baseline, no pingwave summary, no emission)
+but leaves a gap in announce versions, which receivers accept as
+monotonic.
+
+**Release migration note, in addition to Slice 6's:**
+- `ServeError` gains `CapabilityRefused`.
+- Every `CapabilitySet` decode, not only an announcement's, refuses more
+  than 256 encoded tags or a tag over 256 bytes.
+- `announce_capabilities*` refuses when the augmented or self-indexed set
+  would exceed the caps, with the previous baseline kept.
+
+**Gates.**
+- The unit suite: 6,045 pass.
+- 36 capability, nRPC, RPC, gang, aggregator, sensing and cross-language
+  integration binaries: 263 pass.
+- `cargo check --workspace --all-targets`.
+- Clippy, strict and all-targets.
+- `RUSTDOCFLAGS=-D warnings cargo doc --all-features`.
+- fmt.
+
 ### Slice 7: bitmap buckets (Track B2) — held
 
 Not authorized until Track B2's decisions (entry-level identity, ordering,

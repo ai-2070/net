@@ -600,3 +600,53 @@ fn a_restore_over_the_budget_is_refused_and_leaves_the_fold() {
     assert_eq!(interned(&fold), (2, 2));
     fold.with_state(|s| s.assert_expiry_index());
 }
+
+/// An audit sink may read the fold's counters from `record`. A budget
+/// refusal records its audit event while the apply still holds the index
+/// write lock, so a `stats()` that took the index lock would deadlock the
+/// apply (review defect 4 at `50a8c60d4`). The apply runs on its own
+/// thread with a deadline, so a regression fails instead of hanging.
+#[test]
+fn an_audit_sink_can_read_stats_during_a_refusal() {
+    struct StatsReadingSink {
+        fold: std::sync::OnceLock<std::sync::Weak<Fold<CapabilityFold>>>,
+        seen: parking_lot::Mutex<Vec<u64>>,
+    }
+    impl FoldAuditSink for StatsReadingSink {
+        fn record(&self, _event: super::AuditEvent) {
+            if let Some(fold) = self.fold.get().and_then(std::sync::Weak::upgrade) {
+                let stats = fold.stats();
+                self.seen.lock().push(stats.budget_rejections);
+            }
+        }
+    }
+
+    let kp = EntityKeypair::generate();
+    let fold = Arc::new(fold_with_budget(1));
+    let sink = Arc::new(StatsReadingSink {
+        fold: std::sync::OnceLock::new(),
+        seen: parking_lot::Mutex::new(Vec::new()),
+    });
+    let _ = sink.fold.set(Arc::downgrade(&fold));
+    fold.set_audit_sink(Some(sink.clone() as Arc<dyn FoldAuditSink>));
+    fold.apply(signed(&kp, 0xA, 1, membership(1, &["only"])))
+        .expect("fits");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let fold = Arc::clone(&fold);
+        std::thread::spawn(move || {
+            let refused = fold
+                .apply(signed(&kp, 0xB, 1, membership(1, &["second"])))
+                .is_err();
+            let _ = tx.send(refused);
+        })
+    };
+    let refused = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the refusal completed instead of deadlocking");
+    worker.join().expect("worker");
+    assert!(refused);
+    let seen = sink.seen.lock().clone();
+    assert!(!seen.is_empty(), "the sink read stats from record");
+}

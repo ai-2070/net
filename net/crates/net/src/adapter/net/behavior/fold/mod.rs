@@ -440,6 +440,7 @@ impl<K: FoldKind> Fold<K> {
                     return Err(self.refuse_payload(node_id, reason));
                 }
                 index.on_insert(&key, &entry.payload);
+                self.metrics.set_admission(index.admission_stats());
                 state.attach_key(node_id, key.clone());
                 state.schedule(&key, &mut entry);
                 let audit = K::audit_event(EntryTransition::Created {
@@ -469,6 +470,7 @@ impl<K: FoldKind> Fold<K> {
                 if let Err(reason) = index.admit(&mut new_entry.payload, Some(&old_entry.payload)) {
                     return Err(self.refuse_payload(node_id, reason));
                 }
+                self.metrics.set_admission(index.admission_stats());
                 let old_owner = old_entry.node_id;
                 // The replacement inherits the entry's one expiry
                 // placement, moved to the new deadline below.
@@ -587,6 +589,7 @@ impl<K: FoldKind> Fold<K> {
             }
         }
         debug_assert_eq!(state.scheduled_len(), state.entries.len());
+        self.metrics.set_admission(index.admission_stats());
         if removed > 0 {
             self.signal_changed();
         }
@@ -712,6 +715,7 @@ impl<K: FoldKind> Fold<K> {
         }
 
         debug_assert_eq!(state.scheduled_len(), state.entries.len());
+        self.metrics.set_admission(index.admission_stats());
         let new_len = state.entries.len() as u64;
         self.metrics.on_snapshot_restored(new_len);
         // Restore replaced the entire entry set (cleared, then
@@ -754,7 +758,12 @@ impl<K: FoldKind> Fold<K> {
     /// One atomic load per counter + one read lock on the
     /// audit-sink slot; cheap enough to call per-tick.
     pub fn stats(&self) -> metrics::FoldStats {
-        let admission = self.index.read().admission_stats();
+        // Lock-free, like every other counter here: the admission
+        // counters are published into `metrics` under the index lock by
+        // the operations that change them. Taking the index lock here
+        // would deadlock an audit sink that calls `stats()` from
+        // `record`, which runs while an apply still holds that lock.
+        let admission = self.metrics.admission();
         metrics::FoldStats {
             kind: K::KIND_ID,
             channel_prefix: K::CHANNEL_PREFIX.to_string(),
