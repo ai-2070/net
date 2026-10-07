@@ -15,21 +15,24 @@ use super::CortexAdapterError;
 
 const MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Test-only, one-shot: force the next [`publish`] to report a
-/// POST-rename durability failure AFTER the real phased publish has
-/// landed — the checkpoint is published, only its durability proof is
-/// missing. This is the seam shape `StoreCore::force_post_rename`
+/// Test-only, one-shot: force the next [`publish`] of an armed path to
+/// report a POST-rename durability failure AFTER the real phased publish
+/// has landed — the checkpoint is published, only its durability proof
+/// is missing. This is the seam shape `StoreCore::force_post_rename`
 /// gives the revocation store, and the only way to exercise the
 /// post-rename phase on this host: a parent-directory fsync failure
 /// cannot be forced from a test, and `MOVEFILE_WRITE_THROUGH` is
-/// indistinguishable from `std::fs::rename` in-process. Process-wide
-/// because [`store`] is a free function, so it is armed PER PATH:
-/// [`publish`] consumes an arming one-shot, and only when it is
-/// publishing that path. A plain flag was consumed by whichever
-/// checkpoint published next, and other unit tests (the tasks and
-/// memories adapters) publish checkpoints in parallel, so the armed test
-/// sometimes saw its own forced call succeed. A set, not one slot: two
-/// tests arming at once must not overwrite each other.
+/// indistinguishable from `std::fs::rename` in-process.
+///
+/// [`store`] is a free function, so the seam cannot live on an
+/// instance; it is armed PER PATH instead. [`publish`] consumes one
+/// arming, and only when it is publishing that path. A single
+/// process-wide flag was consumed by whichever checkpoint published
+/// next, and other unit tests (the tasks and memories adapters) publish
+/// checkpoints in parallel, so the armed test sometimes saw its own
+/// forced call succeed. A per-path list rather than one slot, so two
+/// tests arming at once cannot overwrite each other; arming one path
+/// twice forces its next two publishes.
 #[cfg(test)]
 static FORCE_POST_RENAME: parking_lot::Mutex<Vec<std::path::PathBuf>> =
     parking_lot::Mutex::new(Vec::new());
