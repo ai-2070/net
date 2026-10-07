@@ -76,7 +76,7 @@
     "fast-blurhash": "1.2.0",
     "fuse.js": "7.5.0",
     "immer": "11.1.21",
-    "keyv": "5.6.0",
+    "keyv": "6.1.0",
     "mailchecker": "6.0.21",
     "marked": "^18.0.4",
     "moment": "2.31.0",
