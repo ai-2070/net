@@ -404,8 +404,9 @@ subscription at once. `lobby.self` is the host's own player (below).
   lobby announces the node's own `tags` again, which replaces the whole tag set
   and wipes a listing created a moment before. When the host leaves and another
   player takes over, `await joined.close()` first, then `createLobby`. `close()`
-  resolves only once that withdrawal has been announced, so awaiting it is
-  enough.
+  resolves only once the withdrawal (after any announcement still in flight)
+  has settled, so awaiting it orders the two. A failed withdrawal is swallowed,
+  not thrown.
 - **Taking over.** A player sees the host go through `subscribeStatus`, as a
   `phase` of `closed` or `failed`. When the host said goodbye the status carries
   no error: `owner-lost` surfaces only from the next `ready()` or `act()` on the

@@ -24,8 +24,8 @@ session.generation();      // exact decimal, moves on every handoff
 ```
 
 Use `openSession` unless you know you want otherwise. Two tabs calling `connect()`
-with one identity (`rememberedIdentity()`, or the same injected secrets) are two
-nodes contending for it — which is what the election exists to prevent. Without
+with one identity (a `rememberedIdentity()` already persisted, or the same
+injected secrets) are two nodes contending for it — which is what the election exists to prevent. Without
 one, each tab's `connect()` is a separate node.
 
 ## Declare what a new leader must restore
@@ -124,7 +124,7 @@ and record the real outcome when it lands.
 ```typescript
 const attempt = node.connectPeer(peer);
 attempt.then((outcome) => { if (outcome.type === 'direct') markDirect(peer); }).catch(() => {});
-await Promise.race([attempt, new Promise((resolve) => setTimeout(resolve, 1500))]);
+await Promise.race([attempt.catch(() => undefined), new Promise((resolve) => setTimeout(resolve, 1500))]);
 const stream = node.openStream({ reliability: 'fireAndForget', peer, label, lossy: true });
 ```
 
@@ -175,7 +175,8 @@ state says so.
 
 - Record `disconnected` events from `node.onEvent`.
 - Probe the rest. Call a service nobody serves: the anchor refuses it, so an
-  `RpcError` with `kind === 'rpc-refused'` proves the session is alive. A
+  `RpcError` with `kind === 'rpc-refused'` proves the session is alive (except
+  status 4, backpressure, which is the leaf's own full call table). A
   timeout only means no answer came in time (a delayed packet does that too),
   so take the session for gone after two unanswered probes in a row. A `query`
   cannot tell you: the node answers it from what it last heard.
@@ -197,7 +198,9 @@ function probe(): Promise<boolean> {
   return Promise.race([
     node.call('my-game.alive', new Uint8Array(0), 5000).then(
       () => true,
-      (error) => error?.kind === 'rpc-refused',
+      // A refusal is an answer, unless it is the leaf's own backpressure
+      // (status 4: its call table is full), which never left the page.
+      (error) => error?.kind === 'rpc-refused' && error.failure?.status !== 4,
     ),
     new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5500)),
   ]);

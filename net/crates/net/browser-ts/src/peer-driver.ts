@@ -196,9 +196,17 @@ export class PeerAttempts {
     private readonly now: () => number = () => Date.now(),
   ) {}
 
-  /** A verified offer from `peer` (16 hex) arrived. */
+  /**
+   * A verified offer from `peer` (16 hex) arrived. Arrivals past
+   * {@link PEER_OFFER_FRESH_MS} are dropped here, so the map holds only
+   * peers heard from lately rather than every sender for the node's life.
+   */
   noteOffer(peer: string): void {
-    this.#offers.set(peer.toLowerCase(), this.now());
+    const now = this.now();
+    for (const [key, at] of this.#offers) {
+      if (at <= now - PEER_OFFER_FRESH_MS) this.#offers.delete(key);
+    }
+    this.#offers.set(peer.toLowerCase(), now);
   }
 
   /**
@@ -236,7 +244,8 @@ export class PeerAttempts {
       // The lower id already offered: answer it rather than cross it.
       if (this.#takeOffer(key, this.now() - PEER_OFFER_FRESH_MS)) {
         const answered = await answer();
-        if (answered !== null) return answered;
+        // Only an answer that settles the pair stands in for the offer.
+        if (answered !== null && answerSettles(answered)) return answered;
       }
       return this.#offerYielding(key, drive, answer);
     })();
@@ -277,6 +286,12 @@ export class PeerAttempts {
    * node is the higher id, so the crossing offer is the one the pair
    * keeps. The offer's own drive then ends `superseded` by the answer,
    * and is not the call's outcome.
+   *
+   * The answer, once started, is always awaited: answering retires this
+   * node's offer, so the offer's drive can settle `superseded` while the
+   * answer is still running, and racing the two returned that instead of
+   * the answer's result. With no answer started, the call's outcome is
+   * the offer's, within one tick of its settling.
    */
   async #offerYielding(
     key: string,
@@ -299,7 +314,7 @@ export class PeerAttempts {
       }
       return null;
     })();
-    return Promise.race([offering, crossed.then((answered) => answered ?? offering)]);
+    return crossed.then((answered) => answered ?? offering);
   }
 
   static #track(

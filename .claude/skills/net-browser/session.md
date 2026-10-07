@@ -120,7 +120,10 @@ net-mesh --output ndjson anchor serve \
   served over plain HTTP on one machine. Across a LAN both page and anchor
   need HTTPS on the LAN address: add it to the certificate (`mkcert …
   localhost 127.0.0.1 <lan-host-or-ip>`), use it in `--url` and
-  `--allow-origin`, and have every machine trust your mkcert CA.
+  `--allow-origin`, move `--bind`, `--listen` and `--rtc-bind` to it, and add
+  `--rtc-stun-bind <lan-ip>:0` (a data-only browser lists no interfaces, so it
+  needs a STUN endpoint for a candidate the others can reach, and the RTC
+  socket serves none). Every machine must trust your mkcert CA.
 - `--allow-origin` is matched exactly, scheme and port included: list the
   origin the page is really served from.
 - `--insecure-permissions` accepts key files with loose permissions (Windows,
@@ -226,7 +229,7 @@ Rules that bite:
   ```typescript
   const full = node.connectPeer(peer);
   full.then((outcome) => { if (outcome.type === 'direct') markDirect(peer); }).catch(() => {});
-  await Promise.race([full, new Promise((r) => setTimeout(r, 1500))]);
+  await Promise.race([full.catch(() => undefined), new Promise((r) => setTimeout(r, 1500))]);
   const stream = node.openStream({ reliability: 'fireAndForget', peer, label, lossy: true });
   ```
 - **ICE may fail.** `outcome` is a reading, not a promise of connectivity; see
@@ -323,7 +326,8 @@ on the node, and when the page comes back to the front:
 - **A probe catches the rest.** Call a service nobody serves:
   `node.call('my-game.alive', new Uint8Array(0), 5000)`. The anchor itself
   refuses it, so a rejection with `kind === 'rpc-refused'` **proves the session
-  is alive**. A timeout is inconclusive (a delayed packet, an unenrolled node):
+  is alive**, unless its `failure.status` is 4: that is the leaf's own call
+  table being full, refused before anything was sent. A timeout is inconclusive (a delayed packet, an unenrolled node):
   take the session for gone only after **two unanswered probes in a row**. A
   `query` won't do: the node answers it from what it last heard.
 - **Re-check on `visibilitychange`** to `visible`, and before showing a lobby
@@ -347,7 +351,9 @@ function probe(): Promise<boolean> {
   return Promise.race([
     node.call('my-game.alive', new Uint8Array(0), 5000).then(
       () => true,
-      (error) => error?.kind === 'rpc-refused',
+      // A refusal is an answer, unless it is the leaf's own backpressure
+      // (status 4: its call table is full), which never left the page.
+      (error) => error?.kind === 'rpc-refused' && error.failure?.status !== 4,
     ),
     new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5500)),
   ]);

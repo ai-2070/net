@@ -156,7 +156,7 @@ whichever page leads) can skip them and build on the same parts. Rose & Blade, a
 three.js melee game with physics ragdolls and up to 16 players, works this way:
 
 - **Transport.** One lossy stream from each page to every other, reopened when
-  it goes stale. Each pair goes direct with one offerer (see
+  it goes stale. Each pair attempts a direct link with one offerer (see
   [Two pages, one offerer](/docs/sdk/browser/session#two-pages-one-offerer)).
 - **Ownership.** Every page broadcasts its own entities. One page leads (shared
   AI, props, the match clock); when it leaves, the next takes over, and re-opens
@@ -187,7 +187,7 @@ three.js melee game with physics ragdolls and up to 16 players, works this way:
   stay drawn 2.5 seconds longer for whoever takes them over.
 - **Measure each link.** A ping and pong on the same stream feeds one
   `ClockEstimator` per peer (median round trip, jitter), and
-  `peerAttempt(peer).direct` says whether each pair is direct. Show both in a
+  `(await node.peerAttempt(peer)).direct` says whether each pair is direct. Show both in a
   debug overlay.
 
 ## A dedicated host in Node

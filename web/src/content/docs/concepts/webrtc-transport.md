@@ -130,7 +130,10 @@ Two deployment constraints are deliberate and have no override:
   certificate it does not accept, and a harness that ignored that would prove
   something no deployment can rely on.
 - **CORS is an explicit allow-list with no wildcard**, because the endpoint takes
-  a credential. Origin is validated on the trickle WebSocket too.
+  a credential. Origin is validated on the trickle WebSocket too. An anchor
+  serving open games (`--open-games`, as the public one does) admits every page
+  instead: it echoes the caller's own origin, never `*`, never with
+  credentials, and keys each open game on that origin.
 
 ### Credentials for games
 

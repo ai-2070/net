@@ -283,7 +283,8 @@ writes.
 
 - **Transport: `connect()`, one tab per player.** A store over `openSession` is
   not established. With `rememberedIdentity()`, all tabs of one origin in one
-  browser profile load **one identity**, so they are one player: test two
+  browser profile load **one identity** once it is stored, so they are one
+  player: test two
   players with **two browser profiles** (or two browsers), not two tabs.
   Without it, each tab's `connect()` is a new node.
 - **`maxEventBytes` is required on both sides and must match** — use 8104.
@@ -363,7 +364,9 @@ writes.
     replaces the whole tag set, so it wipes a listing created a moment before.
     This matters when the host leaves and another player takes over: `await
     joined.close()` first, then `createLobby`. `close()` resolves only once
-    that withdrawal has been announced, so awaiting it is enough.
+    the withdrawal (after any announcement still in flight) has settled,
+    so awaiting it orders the two. A failed withdrawal is swallowed, not
+    thrown.
   - **Taking over a lobby.** The joiner sees the host go as `subscribeStatus`
     reporting `phase` `closed` or `failed`. Its `error` is `null` when the
     host said goodbye: `owner-lost` surfaces only from the next `ready()` /

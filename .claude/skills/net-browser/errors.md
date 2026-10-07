@@ -191,9 +191,11 @@ is no longer reported as cancelled on a follower.
 
 ## `rpc-refused` as a liveness answer
 
-`rpc-refused` is an answer, so it proves the far end is there. A page checking
+`rpc-refused` is usually an answer, so it proves the far end is there. The
+exception is status 4 (backpressure) with "calls in flight" in the message:
+the leaf's own call table was full and nothing was sent. A page checking
 whether its session with the anchor survived a stay in the background calls a
-service nobody serves: `rpc-refused` means alive. A timeout means only that no
+service nobody serves: any other `rpc-refused` means alive. A timeout means only that no
 answer arrived before the deadline, which an unenrolled node or a delayed packet
 also produces, so it is inconclusive: treat the session as gone after a
 `disconnected` event or two unanswered probes in a row. See `session.md` §

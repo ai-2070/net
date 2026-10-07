@@ -135,8 +135,8 @@ with physics ragdolls and 2–16 players, works this way:
   no frames then); one silent for 4 s is taken for gone, and its entities stay
   drawn 2.5 s longer for whoever takes them over.
 - **Measuring links:** a small ping/pong on the same stream feeds a
-  `ClockEstimator` per peer (median RTT, jitter); `peerAttempt(peer).direct`
-  says whether each pair is direct. Show both in a debug overlay.
+  `ClockEstimator` per peer (median RTT, jitter); `(await
+  node.peerAttempt(peer)).direct` says whether each pair is direct. Show both in a debug overlay.
 
 ## Rules that bite
 

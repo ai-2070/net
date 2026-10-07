@@ -431,6 +431,34 @@ describe('one offerer per pair: the lower id (PeerAttempts glare)', () => {
     expect(answer).toHaveBeenCalledTimes(1);
   });
 
+  // Answering retires this node's own offer, so the offer's drive can settle
+  // `superseded` while the answer still runs: that is not the call's outcome.
+  it("takes the crossing answer's outcome even when its own offer settles first", async () => {
+    const attempts = new PeerAttempts(() => HIGHER);
+    const ownOffer = parked({ type: 'superseded', peer: PEER, dialog: D1, liveDialog: D2 });
+    const answering = Promise.withResolvers<PeerConnectOutcome>();
+    const answer = vi.fn(() => answering.promise);
+    const connecting = attempts.connect(PEER, notDirect, ownOffer.drive, answer);
+    await vi.waitFor(() => expect(ownOffer.drive).toHaveBeenCalled());
+    attempts.noteOffer(PEER);
+    await vi.waitFor(() => expect(answer).toHaveBeenCalled());
+    ownOffer.settle();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    answering.resolve(answered);
+    expect(await connecting).toBe(answered);
+  });
+
+  it('offers after a fresh answer that did not settle the pair', async () => {
+    const attempts = new PeerAttempts(() => HIGHER);
+    attempts.noteOffer(PEER);
+    const offer = vi.fn(async () => offered);
+    const answer = vi.fn(async (): Promise<PeerConnectOutcome> => (
+      { type: 'handshakeFailed', peer: PEER, dialog: D2, detail: 'no session' }
+    ));
+    expect(await attempts.connect(PEER, notDirect, offer, answer)).toBe(offered);
+    expect(offer).toHaveBeenCalledTimes(1);
+  });
+
   it('the lower id offers whatever the peer sent', async () => {
     const attempts = new PeerAttempts(() => LOWER);
     attempts.noteOffer(PEER);

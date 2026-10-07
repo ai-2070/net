@@ -580,20 +580,28 @@ export async function joinLobby<S extends object, A extends ActionSpec, I extend
   const keep = [...(options.tags ?? [])];
   const seeking = [...keep, seekTag(options.game, host)];
   let stopped: Promise<void> | null = null;
+  // The seeking announcements not yet settled: the withdrawal waits for
+  // them, or one landing after it would put the seek tag back — over a
+  // lobby this node created meanwhile.
+  const seekingInFlight = new Set<Promise<void>>();
   const announce = () => {
-    if (stopped === null) node.announce(seeking).catch(() => {});
+    if (stopped !== null) return;
+    const sent = node.announce(seeking).catch(() => {});
+    seekingInFlight.add(sent);
+    void sent.finally(() => seekingInFlight.delete(sent));
   };
   announce();
   const timer = setInterval(announce, LOBBY_ANNOUNCE_MS);
-  // Withdraws the seek tag. Settles once that announcement has, so a
-  // `close()` that awaits it is an ordering barrier: an announcement
-  // replaces the node's whole tag set, and a withdrawal still in flight
-  // when the page goes on to `createLobby` would land after the new
-  // listing and erase it.
+  // Withdraws the seek tag, after any seeking announcement still in
+  // flight. Settles once the withdrawal has been attempted (a failure is
+  // swallowed, as every announcement here is), so a `close()` that awaits
+  // it is an ordering barrier: an announcement replaces the node's whole
+  // tag set, and one still in flight when the page goes on to
+  // `createLobby` would land after the new listing and erase it.
   const stop = (): Promise<void> => {
     if (stopped !== null) return stopped;
     clearInterval(timer);
-    stopped = node.announce(keep).catch(() => {});
+    stopped = Promise.all(seekingInFlight).then(() => node.announce(keep)).catch(() => {});
     return stopped;
   };
 
